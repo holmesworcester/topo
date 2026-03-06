@@ -281,7 +281,7 @@ async fn connect_loop_inner(
         } {
             Ok(outcome) => outcome,
             Err(e) => {
-                warn!("Failed to connect to {}: {}", remote, e);
+                warn!("{}", describe_connect_failure(remote, &e));
                 if is_stale_dial_failure(&e) {
                     consecutive_stale_dial_failures += 1;
                     if consecutive_stale_dial_failures >= STALE_DIAL_FAILURE_THRESHOLD {
@@ -385,6 +385,67 @@ async fn connect_loop_inner(
     Ok(())
 }
 
+/// Produce a human-readable diagnosis for a connection failure.
+fn describe_connect_failure(remote: SocketAddr, err: &ConnectionLifecycleError) -> String {
+    match err {
+        ConnectionLifecycleError::DialTrustRejected(msg) => {
+            // Extract the fingerprint from "trust_rejected: peer fingerprint <hex> not in allowed set"
+            let fp = msg
+                .split("peer fingerprint ")
+                .nth(1)
+                .and_then(|s| s.split_whitespace().next())
+                .unwrap_or("unknown");
+            format!(
+                "Certificate mismatch connecting to {}: peer presented TLS fingerprint {} \
+                 which is not trusted by this workspace. This usually means: (1) the peer's \
+                 transport identity has not been derived yet (bootstrap in progress), (2) the \
+                 invite was created by a different peer, or (3) the peer rotated its certificate",
+                remote, fp
+            )
+        }
+        ConnectionLifecycleError::Dial(msg) => {
+            let m = msg.to_ascii_lowercase();
+            if m.contains("connection refused") {
+                format!(
+                    "Connection refused by {}: nothing is listening on that address. \
+                     Is the peer's daemon running? (start it with: topo start)",
+                    remote
+                )
+            } else if m.contains("timed out") || m.contains("timeout") {
+                format!(
+                    "Connection to {} timed out: the peer may be offline, \
+                     behind a firewall, or the address may be stale",
+                    remote
+                )
+            } else if m.contains("network is unreachable") || m.contains("no route to host") {
+                format!(
+                    "Cannot reach {}: network is unreachable. Check that the peer's \
+                     address is correct and that you have network connectivity to it",
+                    remote
+                )
+            } else if m.contains("host unreachable") || m.contains("unreachable") {
+                format!(
+                    "Host {} is unreachable. The address may be on a different network \
+                     or the peer may be offline",
+                    remote
+                )
+            } else {
+                format!("Failed to connect to {}: {}", remote, msg)
+            }
+        }
+        ConnectionLifecycleError::Accept(msg) => {
+            format!("Unexpected accept error during outbound dial to {}: {}", remote, msg)
+        }
+        ConnectionLifecycleError::MissingPeerIdentity => {
+            format!(
+                "Connected to {} but peer did not present a TLS certificate. \
+                 This should not happen with a topo peer — the remote may not be a topo node",
+                remote
+            )
+        }
+    }
+}
+
 fn is_stale_dial_failure(err: &ConnectionLifecycleError) -> bool {
     match err {
         ConnectionLifecycleError::Dial(msg) => {
@@ -440,10 +501,20 @@ async fn dial_provider_ongoing_first(
                     provider,
                     used_bootstrap_fallback: true,
                 }),
-                Err(fallback_err) => Err(ConnectionLifecycleError::Dial(format!(
-                    "primary and bootstrap-fallback dials failed to {}: primary={}, fallback={}",
-                    remote, primary_err, fallback_err
-                ))),
+                Err(fallback_err) => {
+                    // Return the more informative of the two errors. If the primary
+                    // was a trust rejection, keep it as DialTrustRejected so the
+                    // human-readable classifier can extract the fingerprint.
+                    if matches!(primary_err, ConnectionLifecycleError::DialTrustRejected(_)) {
+                        Err(primary_err)
+                    } else {
+                        Err(ConnectionLifecycleError::Dial(format!(
+                            "primary and bootstrap-fallback dials both failed to {}: \
+                             primary: {}, fallback: {}",
+                            remote, primary_err, fallback_err
+                        )))
+                    }
+                }
             }
         }
     }

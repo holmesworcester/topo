@@ -1355,8 +1355,33 @@ async fn reevaluate_runtime(
         let finished = active_runtime.take().unwrap();
         match finished.handle.await {
             Ok(Ok(())) => {}
-            Ok(Err(e)) => tracing::warn!("runtime exited unexpectedly: {}", e),
-            Err(e) => tracing::warn!("runtime task join error: {}", e),
+            Ok(Err(e)) => {
+                let msg = e.to_string();
+                let m = msg.to_ascii_lowercase();
+                if m.contains("address already in use") || m.contains("os error 98") || m.contains("os error 48") {
+                    tracing::error!(
+                        "Runtime cannot start: port {} is already in use by another process. \
+                         Stop the other process or use --bind to choose a different port. \
+                         (error: {})",
+                        bind.port(),
+                        msg,
+                    );
+                    // Non-retriable: return the error to stop the daemon.
+                    return Err(e);
+                } else if m.contains("permission denied") || m.contains("os error 13") {
+                    tracing::error!(
+                        "Runtime cannot start: permission denied binding to {}. \
+                         Try a port above 1024 or run with appropriate privileges. \
+                         (error: {})",
+                        bind,
+                        msg,
+                    );
+                    return Err(e);
+                } else {
+                    tracing::warn!("Runtime exited unexpectedly: {}. Will restart on next evaluation.", msg);
+                }
+            }
+            Err(e) => tracing::warn!("Runtime task join error: {}", e),
         }
         *state.runtime_net.write().unwrap() = None;
         clear_upnp_report(&state);

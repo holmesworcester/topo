@@ -105,15 +105,30 @@ impl PinnedCertVerifier {
             Ok(())
         } else {
             let count = self.rejections.fetch_add(1, Ordering::Relaxed) + 1;
-            warn!(
-                fingerprint = %hex::encode(fp),
-                total_rejections = count,
-                "rejected peer certificate: fingerprint not in allowed set"
-            );
+            let fp_hex = hex::encode(fp);
+            if count <= 3 {
+                warn!(
+                    fingerprint = %fp_hex,
+                    total_rejections = count,
+                    "Rejected peer certificate: TLS fingerprint {} is not trusted by any \
+                     local workspace. If this peer just accepted an invite, its transport \
+                     identity may still be bootstrapping.",
+                    &fp_hex[..16.min(fp_hex.len())]
+                );
+            } else if count == 4 {
+                warn!(
+                    fingerprint = %fp_hex,
+                    total_rejections = count,
+                    "Rejected peer certificate (repeated, suppressing further logs for \
+                     this fingerprint): {}",
+                    &fp_hex[..16.min(fp_hex.len())]
+                );
+            }
+            // count > 4: suppress repeated logs
             Err(rustls::Error::General(format!(
                 "{}: peer fingerprint {} not in allowed set",
                 TRUST_REJECTION_MARKER,
-                hex::encode(fp)
+                fp_hex
             )))
         }
     }

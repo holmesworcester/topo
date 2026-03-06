@@ -65,6 +65,10 @@ pub struct DaemonOptions {
     pub disable_placeholder_autodial: bool,
     /// Inherit stdout/stderr for debugging (instead of suppressing).
     pub inherit_stdio: bool,
+    /// Redirect stdout to a file path (takes precedence over inherit_stdio).
+    pub stdout_file: Option<std::path::PathBuf>,
+    /// Redirect stderr to a file path (takes precedence over inherit_stdio).
+    pub stderr_file: Option<std::path::PathBuf>,
 }
 
 impl Default for DaemonOptions {
@@ -73,6 +77,8 @@ impl Default for DaemonOptions {
             bind_port: None,
             disable_placeholder_autodial: false,
             inherit_stdio: false,
+            stdout_file: None,
+            stderr_file: None,
         }
     }
 }
@@ -112,10 +118,22 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
         cmd.env("P7_DISABLE_PLACEHOLDER_AUTODIAL", "1");
     }
 
-    if opts.inherit_stdio {
-        cmd.stdout(Stdio::inherit()).stderr(Stdio::inherit());
+    if let Some(ref path) = opts.stdout_file {
+        let f = std::fs::File::create(path).expect("create stdout log file");
+        cmd.stdout(f);
+    } else if opts.inherit_stdio {
+        cmd.stdout(Stdio::inherit());
     } else {
-        cmd.stdout(Stdio::null()).stderr(Stdio::null());
+        cmd.stdout(Stdio::null());
+    }
+
+    if let Some(ref path) = opts.stderr_file {
+        let f = std::fs::File::create(path).expect("create stderr log file");
+        cmd.stderr(f);
+    } else if opts.inherit_stdio {
+        cmd.stderr(Stdio::inherit());
+    } else {
+        cmd.stderr(Stdio::null());
     }
 
     let mut child = cmd.spawn().expect("failed to start topo daemon");

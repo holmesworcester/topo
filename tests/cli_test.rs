@@ -1624,3 +1624,195 @@ fn test_cli_event_commands_require_daemon() {
         tree_stderr
     );
 }
+
+// ---------------------------------------------------------------------------
+// Error-message quality tests
+// ---------------------------------------------------------------------------
+
+/// When a second daemon tries to bind the same port, it should exit with a
+/// clear error about the port being in use, not silently retry forever.
+#[test]
+fn test_cli_port_already_in_use_error() {
+    let _guard = cli_test_lock();
+    let (_tmpdir_a, db_a) = temp_db();
+    let (_tmpdir_b, db_b) = temp_db();
+
+    // Daemon A binds a specific port.
+    let port = random_port();
+    create_workspace(&db_a);
+    let _daemon_a = start_daemon_on_port(&db_a, port);
+
+    // Daemon B tries the same port — should fail with an informative error.
+    create_workspace(&db_b);
+    let output = Command::new(bin())
+        .arg("--db")
+        .arg(&db_b)
+        .arg("start")
+        .arg("--bind")
+        .arg(format!("127.0.0.1:{}", port))
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .output()
+        .expect("failed to run second daemon");
+
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        !output.status.success(),
+        "second daemon on same port should exit with error"
+    );
+    assert!(
+        stderr.contains("already in use") || stderr.contains("address already in use"),
+        "error should mention port already in use, got:\n{}",
+        stderr
+    );
+}
+
+/// Connecting to an address where nothing is listening should produce a
+/// human-readable diagnostic (timeout or connection refused), not raw errors.
+#[test]
+fn test_cli_connect_to_dead_address_error() {
+    let _guard = cli_test_lock();
+    let (_tmpdir_a, db_a) = temp_db();
+    let (_tmpdir_b, db_b) = temp_db();
+
+    // Alice creates workspace and generates an invite with a dead address.
+    create_workspace(&db_a);
+    let _daemon_a = start_daemon(&db_a);
+    let dead_port = random_port();
+    let invite = create_invite(&db_a, &format!("127.0.0.1:{}", dead_port));
+    drop(_daemon_a); // Kill Alice's daemon so the address is dead.
+
+    // Bob accepts the invite — daemon will try to connect to the dead address.
+    // Redirect daemon output to file so we can inspect logs after shutdown.
+    let log_dir = std::path::Path::new(&db_b).parent().unwrap();
+    let stdout_path = log_dir.join("daemon_stdout.log");
+
+    let _daemon_b = start_daemon_with_options(
+        &db_b,
+        &DaemonOptions {
+            stdout_file: Some(stdout_path.clone()),
+            ..Default::default()
+        },
+    );
+
+    // Accept invite (this triggers bootstrap connect attempts to the dead address).
+    let accept_out = Command::new(bin())
+        .args(["--db", &db_b, "accept", &invite])
+        .output()
+        .expect("accept command");
+    assert!(
+        accept_out.status.success(),
+        "accept should succeed: {}",
+        String::from_utf8_lossy(&accept_out.stderr)
+    );
+
+    // QUIC (UDP) has no TCP-style "connection refused" — dead addresses time out
+    // after ~30s. Wait long enough for at least one timeout.
+    std::thread::sleep(Duration::from_secs(35));
+
+    // Stop daemon.
+    let _ = Command::new(bin())
+        .args(["--db", &db_b, "stop"])
+        .output();
+    std::thread::sleep(Duration::from_millis(500));
+    drop(_daemon_b);
+
+    let output = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+
+    assert!(
+        output.contains("timed out")
+            || output.contains("connection refused")
+            || output.contains("nothing is listening")
+            || output.contains("unreachable"),
+        "connect-to-dead-address should produce a human-readable diagnostic \
+         (timed out / connection refused / unreachable), got:\n{}",
+        output
+    );
+    // Verify it includes our diagnostic text, not just raw error.
+    assert!(
+        output.contains("the peer may be offline")
+            || output.contains("nothing is listening")
+            || output.contains("unreachable"),
+        "error should include actionable guidance, got:\n{}",
+        output
+    );
+}
+
+/// When peers present untrusted certificates, the error should explain it's a
+/// certificate mismatch, not dump raw TLS internals.
+#[test]
+fn test_cli_untrusted_peer_certificate_error() {
+    let _guard = cli_test_lock();
+    let (_tmpdir_a, db_a) = temp_db();
+    let (_tmpdir_b, db_b) = temp_db();
+
+    // Alice creates workspace and runs daemon.
+    create_workspace(&db_a);
+    let port_a = random_port();
+    let _daemon_a = start_daemon_on_port(&db_a, port_a);
+
+    // Create an invite from Alice with a BOGUS SPKI fingerprint.
+    // Bob will connect to Alice's real address but his client-side TLS
+    // verifier will reject because Alice's real cert doesn't match the
+    // bogus fingerprint in the invite.
+    let bogus_spki = "aa".repeat(32); // 64 hex chars = 32 bytes of 0xaa
+    let invite =
+        create_invite_with_spki(&db_a, &format!("127.0.0.1:{}", port_a), Some(&bogus_spki));
+
+    // Bob's daemon — redirect stdout to file for log inspection.
+    create_workspace(&db_b);
+    let log_dir_b = std::path::Path::new(&db_b).parent().unwrap();
+    let bob_stdout = log_dir_b.join("daemon_stdout.log");
+
+    let _daemon_b = start_daemon_with_options(
+        &db_b,
+        &DaemonOptions {
+            stdout_file: Some(bob_stdout.clone()),
+            ..Default::default()
+        },
+    );
+
+    // Accept the invite — triggers bootstrap connect attempts.
+    // Bob will connect to Alice but reject her cert (wrong SPKI).
+    let accept_out = Command::new(bin())
+        .args(["--db", &db_b, "accept", &invite])
+        .output()
+        .expect("accept command");
+    assert!(
+        accept_out.status.success(),
+        "accept should succeed: {}",
+        String::from_utf8_lossy(&accept_out.stderr)
+    );
+
+    // Give time for runtime restart + TLS handshake attempts.
+    std::thread::sleep(Duration::from_secs(8));
+
+    // Stop daemons and read logs.
+    let _ = Command::new(bin())
+        .args(["--db", &db_b, "stop"])
+        .output();
+    std::thread::sleep(Duration::from_millis(500));
+    drop(_daemon_b);
+
+    let bob_log = std::fs::read_to_string(&bob_stdout).unwrap_or_default();
+
+    // Bob should see our improved error about certificate mismatch
+    // (his client-side TLS verifier rejects Alice's cert because the
+    // SPKI in the invite doesn't match Alice's real cert).
+    assert!(
+        bob_log.contains("Certificate mismatch")
+            || bob_log.contains("not trusted")
+            || bob_log.contains("trust_rejected"),
+        "untrusted peer error should mention certificate mismatch or \
+         trust rejection, got:\n{}",
+        bob_log
+    );
+    // Should include human-readable explanation.
+    assert!(
+        bob_log.contains("transport identity")
+            || bob_log.contains("not trusted by this workspace")
+            || bob_log.contains("Certificate mismatch"),
+        "error should include human-readable explanation, got:\n{}",
+        bob_log
+    );
+}

@@ -133,7 +133,7 @@ pub async fn accept_loop_with_ingest_until_cancel(
                 break;
             }
             Err(e) => {
-                warn!("Failed to accept connection: {}", e);
+                warn!("{}", describe_accept_failure(&e));
                 continue;
             }
         };
@@ -266,6 +266,30 @@ pub async fn accept_loop_with_ingest_until_cancel(
     }
 
     Ok(())
+}
+
+/// Produce a human-readable diagnosis for an inbound connection failure.
+fn describe_accept_failure(err: &crate::transport::ConnectionLifecycleError) -> String {
+    let msg = err.to_string();
+    let m = msg.to_ascii_lowercase();
+    if m.contains("trust_rejected") {
+        // Extract the fingerprint
+        let fp = msg
+            .split("peer fingerprint ")
+            .nth(1)
+            .and_then(|s| s.split_whitespace().next())
+            .unwrap_or("unknown");
+        format!(
+            "Rejected incoming connection: remote peer presented TLS fingerprint {} \
+             which is not trusted by any local workspace. This is normal during bootstrap \
+             when the remote peer's transport identity has not been derived yet",
+            fp
+        )
+    } else if m.contains("connection reset") {
+        "Incoming connection was reset by the remote peer before handshake completed".to_string()
+    } else {
+        format!("Failed to accept incoming connection: {}", msg)
+    }
 }
 
 /// Resolve which local tenant trusts a given remote peer.

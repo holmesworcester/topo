@@ -85,8 +85,12 @@ pub(crate) fn setup_endpoint_and_tenants(
         }
         if tenant.transport_peer_id != tenant.peer_id {
             warn!(
-                "Tenant {} using transitional transport identity {} (bootstrap pre-derive)",
-                tenant.peer_id, tenant.transport_peer_id
+                "Tenant {} using transitional transport identity {} — peer signer has \
+                 not been derived yet. Connections will fail TLS trust checks until \
+                 bootstrap sync completes and the permanent identity is materialized. \
+                 The inviting peer's daemon must be running for this to succeed.",
+                &tenant.peer_id[..16.min(tenant.peer_id.len())],
+                &tenant.transport_peer_id[..16.min(tenant.transport_peer_id.len())]
             );
         }
 
