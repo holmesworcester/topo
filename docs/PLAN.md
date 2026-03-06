@@ -1477,7 +1477,7 @@ Goal: establish a test suite where successful P2P bootstrap and sync cannot be f
 2. Include a passing baseline that proves invite bootstrap + daemon autodial transport path works, so failures are scoped to realism gaps, not broken transport.
 3. Include strict contract tests for desired behavior:
    - invite-only daemon autodial after invite acceptance,
-   - daemon CLI invite lifecycle surface (`topo invite` / `topo accept-invite`).
+   - daemon CLI invite lifecycle surface (`topo invite` / `topo accept`).
 4. Keep these tests as non-negotiable regression guards for future refactors.
 
 ### 18.3 Minimal implementation required to make these tests pass

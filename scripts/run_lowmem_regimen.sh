@@ -179,8 +179,8 @@ setup_two_peer_workspace() {
     return 1
   fi
 
-  run_topo --db "${bob_db}" accept-invite \
-    --invite "${invite_link}" \
+  run_topo --db "${bob_db}" accept \
+    "${invite_link}" \
     --username "bob" \
     --devicename "bob-dev" >/dev/null
   TRACKED_DBS+=("${bob_db}")

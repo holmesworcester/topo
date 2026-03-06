@@ -541,22 +541,21 @@ pub fn accept_invite(db: &str, invite_link: &str) {
 pub fn accept_invite_with_identity(db: &str, invite_link: &str, username: &str, devicename: &str) {
     let tmp_daemon = start_daemon(db);
     let output = Command::new(bin())
-        .arg("accept-invite")
+        .arg("accept")
         .arg("--db")
         .arg(db)
-        .arg("--invite")
         .arg(invite_link)
         .arg("--username")
         .arg(username)
         .arg("--devicename")
         .arg(devicename)
         .output()
-        .expect("failed to run accept-invite");
+        .expect("failed to run accept");
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
         output.status.success(),
-        "accept-invite failed:\n  stdout: {}\n  stderr: {}",
+        "accept failed:\n  stdout: {}\n  stderr: {}",
         stdout.trim(),
         stderr.trim()
     );

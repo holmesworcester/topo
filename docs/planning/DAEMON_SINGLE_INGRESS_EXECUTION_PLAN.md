@@ -10,7 +10,7 @@ Simplify bootstrap and runtime flow with one rule: commands enter through one da
 
 Primary outcomes:
 
-1. One command ingress route (`CLI -> RPC -> command`), including `create-workspace` and `accept-invite`.
+1. One command ingress route (`CLI -> RPC -> command`), including `create-workspace` and `accept`.
 2. Control daemon can start with zero tenants (no hard bootstrap prerequisite).
 3. Peering runtime is lifecycle-managed (`IdleNoTenants` -> `Active`) without daemon restart.
 4. Secret material remains event-sourced but local-only (`share_scope=local`) and never sent on sync.
@@ -36,7 +36,7 @@ Out of scope:
 
 ### R1. Single command ingress
 
-1. `create-workspace` and `accept-invite` must route through RPC, not direct command calls in `main.rs`.
+1. `create-workspace` and `accept` must route through RPC, not direct command calls in `main.rs`.
 2. `main.rs` must not invoke workspace command functions directly.
 3. CLI path behavior may change if needed; readability and single-route consistency take priority.
 
@@ -49,7 +49,7 @@ Out of scope:
 ### R3. Runtime activation from projection state
 
 1. Runtime enters active mode when discoverable tenants exist.
-2. Runtime re-check is triggered after commands that can create tenants (`create-workspace`, `accept-invite`, `accept-link`).
+2. Runtime re-check is triggered after commands that can create tenants (`create-workspace`, `accept`, `accept-link`).
 3. No manual daemon restart required to transition from bootstrap to active sync.
 
 ### R4. DB isolation is explicit
@@ -78,7 +78,7 @@ Out of scope:
 
 ### Phase 1: Remove direct bootstrap command path
 
-1. Delete direct-only command branch in `main.rs` for `create-workspace` and `accept-invite`.
+1. Delete direct-only command branch in `main.rs` for `create-workspace` and `accept`.
 2. Route both through existing RPC methods.
 3. Keep user-facing output compatibility where practical; do not preserve duplicate internals.
 
@@ -119,7 +119,7 @@ Out of scope:
 ### SC2. One ingress route in practice
 
 1. `topo create-workspace` succeeds via RPC when daemon absent (autostart or attach behavior).
-2. `topo accept-invite` succeeds via RPC when daemon absent (autostart or attach behavior).
+2. `topo accept` succeeds via RPC when daemon absent (autostart or attach behavior).
 
 ### SC3. Daemon can start with empty DB
 
@@ -128,7 +128,7 @@ Out of scope:
 
 ### SC4. Runtime transitions without restart
 
-1. After `create-workspace` or `accept-invite` against an already-running daemon, runtime activates automatically.
+1. After `create-workspace` or `accept` against an already-running daemon, runtime activates automatically.
 2. No manual `topo stop`/`topo start` needed.
 
 ### SC5. DB/socket isolation holds

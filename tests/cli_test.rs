@@ -177,7 +177,7 @@ fn test_cli_local_mdns_discovery_without_placeholder_autodial() {
     );
 
     // Validate bidirectional convergence using messages created after both
-    // daemons are running (avoids counting accept-invite bootstrap artifacts).
+    // daemons are running (avoids counting accept bootstrap artifacts).
     let alice_live_eid = send_message(&alice_db, "alice-via-mdns-localhost");
     assert_eventually(
         &bob_db,
@@ -299,10 +299,10 @@ fn test_cli_start_without_trust_starts_idle_runtime() {
     assert!(stop.status.success(), "stop should succeed");
 }
 
-/// Bootstrap trust test using production invite / accept-invite CLI flow.
+/// Bootstrap trust test using production invite / accept CLI flow.
 /// No direct SQL trust seeding — trust is materialized through CLI commands.
 ///
-/// Projection-first flow: accept-invite creates identity chain (events may
+/// Projection-first flow: accept creates identity chain (events may
 /// block pending prerequisites). The daemon's ongoing peering loop delivers
 /// the required events from Alice via bootstrap autodial, cascading the
 /// identity chain to completion.

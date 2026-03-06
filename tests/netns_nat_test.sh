@@ -267,15 +267,15 @@ PIDS+=($!)
 sleep 0.5
 
 # Accept invites from segmented peers (bootstrap over NAT to introducer).
-ip netns exec "${PREFIX}_a" "$BIN" accept-invite \
+ip netns exec "${PREFIX}_a" "$BIN" accept \
     --db "$DB_A" \
-    --invite "$INV_A" \
+    "$INV_A" \
     --username "peer-a" \
     --devicename "nat-a" \
     >/dev/null
-ip netns exec "${PREFIX}_b" "$BIN" accept-invite \
+ip netns exec "${PREFIX}_b" "$BIN" accept \
     --db "$DB_B" \
-    --invite "$INV_B" \
+    "$INV_B" \
     --username "peer-b" \
     --devicename "nat-b" \
     >/dev/null

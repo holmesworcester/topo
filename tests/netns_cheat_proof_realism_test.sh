@@ -293,11 +293,11 @@ INV_F="$(run_topo "$DB_A" "$SOCK_A" invite --public-addr "10.11.1.10:4433" | gre
 [[ "$INV_F" == topo://invite/* ]] || fail "invalid invite link format for F"
 
 log "Accepting invites from segmented peers (internet bootstrap mode)..."
-ip netns exec "$NS_B" "$BIN" accept-invite --db "$DB_B" --invite "$INV_B" --username "b" --devicename "dev-b" >/dev/null
-ip netns exec "$NS_C" "$BIN" accept-invite --db "$DB_C" --invite "$INV_C" --username "c" --devicename "dev-c" >/dev/null
-ip netns exec "$NS_D" "$BIN" accept-invite --db "$DB_D" --invite "$INV_D" --username "d" --devicename "dev-d" >/dev/null
-ip netns exec "$NS_E" "$BIN" accept-invite --db "$DB_E" --invite "$INV_E" --username "e" --devicename "dev-e" >/dev/null
-ip netns exec "$NS_F" "$BIN" accept-invite --db "$DB_F" --invite "$INV_F" --username "f" --devicename "dev-f" >/dev/null
+ip netns exec "$NS_B" "$BIN" accept --db "$DB_B" "$INV_B" --username "b" --devicename "dev-b" >/dev/null
+ip netns exec "$NS_C" "$BIN" accept --db "$DB_C" "$INV_C" --username "c" --devicename "dev-c" >/dev/null
+ip netns exec "$NS_D" "$BIN" accept --db "$DB_D" "$INV_D" --username "d" --devicename "dev-d" >/dev/null
+ip netns exec "$NS_E" "$BIN" accept --db "$DB_E" "$INV_E" --username "e" --devicename "dev-e" >/dev/null
+ip netns exec "$NS_F" "$BIN" accept --db "$DB_F" "$INV_F" --username "f" --devicename "dev-f" >/dev/null
 
 log "Starting peer daemons without manual --connect..."
 PID_B="$(start_daemon "$NS_B" "$DB_B" "$SOCK_B" "$TMPDIR/b.log")"

@@ -729,13 +729,12 @@ fn accept_invite_on_running_idle_daemon_activates_runtime_without_restart() {
     wait_for_socket(&bob_socket);
     let _ = wait_for_runtime_state(&bob_socket, "IdleNoTenants", Duration::from_secs(10));
 
-    // accept-invite must route through RPC and trigger runtime activation.
+    // accept must route through RPC and trigger runtime activation.
     let accept = Command::new(bin())
         .args([
-            "accept-invite",
+            "accept",
             "--db",
             &bob_db,
-            "--invite",
             &invite_link,
             "--username",
             "bob",
@@ -746,7 +745,7 @@ fn accept_invite_on_running_idle_daemon_activates_runtime_without_restart() {
         .unwrap();
     assert!(
         accept.status.success(),
-        "accept-invite failed: stdout={} stderr={}",
+        "accept failed: stdout={} stderr={}",
         String::from_utf8_lossy(&accept.stdout),
         String::from_utf8_lossy(&accept.stderr)
     );
@@ -1072,10 +1071,9 @@ fn peers_shows_remote_after_invite_accept() {
     wait_for_socket(&bob_socket);
     let accept = Command::new(bin())
         .args([
-            "accept-invite",
+            "accept",
             "--db",
             &bob_db,
-            "--invite",
             &invite_link,
             "--username",
             "bob",
@@ -1084,7 +1082,7 @@ fn peers_shows_remote_after_invite_accept() {
         .unwrap();
     assert!(
         accept.status.success(),
-        "accept-invite failed: {}",
+        "accept failed: {}",
         String::from_utf8_lossy(&accept.stderr)
     );
     let _ = wait_for_runtime_state(&bob_socket, "Active", Duration::from_secs(10));

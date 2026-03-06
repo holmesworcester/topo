@@ -30,7 +30,7 @@ Interactive commands today:
 5. `reactions`
 6. `delete`
 7. `invite`
-8. `accept-invite`
+8. `accept`
 9. `link`
 10. `accept-link`
 11. `accounts`
@@ -49,7 +49,7 @@ Interactive commands today:
 
 Preserve as-is (already present in non-interactive):
 
-1. `send`, `messages`, `react`, `reactions`, `delete` (`delete-message`), `users`, `keys`, `status`, `accept-invite`.
+1. `send`, `messages`, `react`, `reactions`, `delete` (`delete-message`), `users`, `keys`, `status`, `accept`.
 
 Preserve via existing daemon multi-tenant frontend semantics:
 
@@ -66,7 +66,7 @@ Add missing CLI/RPC commands:
 
 Add missing frontend affordances:
 
-1. Invite number aliases (for `accept-link`; `accept-invite` is pre-daemon bootstrap and takes raw links only)
+1. Invite number aliases (for `accept-link`; `accept` is pre-daemon bootstrap and takes raw links only)
 2. Message number aliases (for `react` and `delete-message`)
 3. User number aliases (for `ban`)
 4. Channel aliases (`channels`, `new-channel`, `channel`) as daemon frontend state over existing channel IDs
@@ -76,7 +76,7 @@ Invite/link I/O contract (required):
 
 1. `invite` and `link` must always emit the full real `topo://...` link.
 2. Alias/number references are optional frontend convenience only and must not replace real-link output.
-3. `accept-link` must accept either a real `topo://...` link or a daemon invite-ref selector. `accept-invite` is pre-daemon bootstrap and accepts raw links only (daemon state is not available).
+3. `accept-link` must accept either a real `topo://...` link or a daemon invite-ref selector. `accept` is pre-daemon bootstrap and accepts raw links only (daemon state is not available).
 4. Alias resolution for invite selectors always resolves to a stored full link, then parses bootstrap/workspace data from that link.
 5. Invite creation inputs:
    - `--public-addr <host:port>` (published bootstrap endpoint in the link),
@@ -199,7 +199,7 @@ Add/port tests to non-interactive suites:
 
 1. Port behavior from `tests/interactive_test.rs` into `tests/cli_test.rs` / `tests/rpc_test.rs` / dedicated daemon-frontend tests.
 2. Add selector/alias tests:
-   - invite number -> accept-invite/accept-link
+   - invite number -> accept/accept-link
    - message number -> react/delete
    - user number -> ban
    - channel alias selection

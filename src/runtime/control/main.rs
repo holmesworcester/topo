@@ -134,10 +134,9 @@ enum Commands {
     },
 
     /// Accept a user invite link (bootstrap sync + identity chain creation)
-    #[command(name = "accept-invite")]
+    #[command(name = "accept")]
     AcceptInvite {
         /// Invite link (topo://invite/...)
-        #[arg(long)]
         invite: String,
         /// Username for the new identity
         #[arg(long, default_value = "user")]

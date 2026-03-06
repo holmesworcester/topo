@@ -777,8 +777,8 @@ run_asymmetric_proxy() {
   LOW_MEM_WAL_CAP_MIB="${WAL_CAP_MIB}" \
   LOW_MEM_MEMTRACE="${LOWMEM_MEMTRACE_ENABLED}" \
   LOW_MEM_MEMTRACE_FILE="${memtrace_log}" \
-  run_topo --db "${bob_db}" accept-invite \
-    --invite "${invite_link}" \
+  run_topo --db "${bob_db}" accept \
+    "${invite_link}" \
     --username "bob" \
     --devicename "bob-dev" >/dev/null
   wait_for_socket "${bob_db}" 30
@@ -1109,8 +1109,8 @@ run_large_delta_proxy() {
     return 1
   fi
 
-  run_topo_retry 5 --db "${bob_db}" accept-invite \
-    --invite "${invite_link}" \
+  run_topo_retry 5 --db "${bob_db}" accept \
+    "${invite_link}" \
     --username "bob" \
     --devicename "bob-dev" >/dev/null
   wait_for_socket "${bob_db}" 30

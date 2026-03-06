@@ -79,11 +79,11 @@ fn test_daemon_cli_invite_lifecycle_works_without_restart() {
     // Bob accepts invite before starting daemon (daemon-routed CLI command).
     accept_invite_lightweight(&bob_db, &invite_link);
 
-    // Bob starts daemon after accept-invite — auto-selects the shared workspace peer.
+    // Bob starts daemon after accept — auto-selects the shared workspace peer.
     let _bob = start_daemon_on_port(&bob_db, bob_port);
 
     // Bob sends a message in the shared workspace via daemon RPC.
-    let bob_event_id = topo_send_retry(&bob_db, "runtime-accept-invite-no-restart");
+    let bob_event_id = topo_send_retry(&bob_db, "runtime-accept-no-restart");
     let out = topo_assert_eventually(
         &alice_db,
         &format!("has_event:{} >= 1", bob_event_id),
