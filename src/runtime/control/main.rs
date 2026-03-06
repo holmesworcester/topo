@@ -2408,8 +2408,13 @@ fn print_sync_log_config(cfg: &sync_log::SyncLogConfig) {
     );
 }
 
-fn short_peer_hex(peer: &str) -> &str {
-    &peer[..peer.len().min(16)]
+fn short_sync_id(raw: &str) -> String {
+    let prefix = &raw[..raw.len().min(4)];
+    if raw.len() > 4 {
+        format!("{}...", prefix)
+    } else {
+        prefix.to_string()
+    }
 }
 
 fn run_status(run: &sync_log::SyncRunRow) -> &'static str {
@@ -2422,15 +2427,11 @@ fn run_status(run: &sync_log::SyncRunRow) -> &'static str {
     }
 }
 
-fn short_hex_owned(hex: &str) -> String {
-    hex.chars().take(16).collect()
-}
-
 fn event_id_prefix_from_detail_json(detail_json: Option<&str>) -> Option<String> {
     let raw = detail_json?;
     let v = serde_json::from_str::<serde_json::Value>(raw).ok()?;
     let eid = v.get("event_id")?.as_str()?;
-    Some(short_hex_owned(eid))
+    Some(short_sync_id(eid))
 }
 
 fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> String {
@@ -2466,7 +2467,7 @@ fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> S
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|x| x.as_str())
-                        .map(|s| short_peer_hex(s).to_string())
+                        .map(short_sync_id)
                         .collect::<Vec<_>>()
                 })
                 .unwrap_or_default();
@@ -2498,7 +2499,7 @@ fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> S
             } else {
                 format!(
                     " detail=event(id={} blob_len={})",
-                    short_peer_hex(eid),
+                    short_sync_id(eid),
                     blob_len
                 )
             }
@@ -2576,10 +2577,6 @@ fn parse_neg_frame_view(detail_json: Option<&str>) -> Option<NegFrameView> {
     })
 }
 
-fn short_hex12(hex: &str) -> String {
-    hex.chars().take(12).collect()
-}
-
 fn neg_entry_depth_hint(prefix_hex: &str) -> usize {
     let bytes = prefix_hex.len() / 2;
     if bytes <= 1 {
@@ -2594,7 +2591,7 @@ fn neg_entry_depth_hint(prefix_hex: &str) -> usize {
 }
 
 fn neg_entry_readable_line(round_no: usize, entry_idx: usize, entry: &NegEntryView) -> String {
-    let bound_prefix = short_hex12(&entry.bound_id_prefix);
+    let bound_prefix = short_sync_id(&entry.bound_id_prefix);
     let bound = if bound_prefix.is_empty() {
         format!("({})", entry.bound_ts)
     } else {
@@ -2607,7 +2604,7 @@ fn neg_entry_readable_line(round_no: usize, entry_idx: usize, entry: &NegEntryVi
             let fp = entry
                 .fingerprint_hex
                 .as_deref()
-                .map(short_hex12)
+                .map(short_sync_id)
                 .unwrap_or_else(|| "?".to_string());
             format!(
                 "range={} HASH bound={} fp={} (await compare)",
@@ -2620,7 +2617,7 @@ fn neg_entry_readable_line(round_no: usize, entry_idx: usize, entry: &NegEntryVi
                 .ids
                 .iter()
                 .take(4)
-                .map(|id| short_hex12(id))
+                .map(|id| short_sync_id(id))
                 .collect::<Vec<_>>()
                 .join(",");
             if ids.is_empty() {
@@ -2792,8 +2789,8 @@ fn print_sync_trace_run(run: &sync_log::SyncRunRow, events: &[sync_log::SyncRunE
         run.run_id,
         status,
         run.session_id,
-        short_peer_hex(&run.tenant_id),
-        short_peer_hex(&run.peer_id),
+        short_sync_id(&run.tenant_id),
+        short_sync_id(&run.peer_id),
         run.direction,
         run.role,
         run.remote_addr,
@@ -2867,7 +2864,7 @@ fn print_sync_tree_groups(groups: &[PeerSyncTreeGroup]) {
             .count();
         println!(
             "peer={} runs={} changed={} errors={}",
-            short_peer_hex(&group.peer_id),
+            short_sync_id(&group.peer_id),
             group.runs.len(),
             changed,
             errors
