@@ -74,7 +74,7 @@ Add missing frontend affordances:
 
 Invite/link I/O contract (required):
 
-1. `create-invite` and `link` must always emit the full real `topo://...` link.
+1. `invite` and `link` must always emit the full real `topo://...` link.
 2. Alias/number references are optional frontend convenience only and must not replace real-link output.
 3. `accept-link` must accept either a real `topo://...` link or a daemon invite-ref selector. `accept-invite` is pre-daemon bootstrap and accepts raw links only (daemon state is not available).
 4. Alias resolution for invite selectors always resolves to a stored full link, then parses bootstrap/workspace data from that link.
@@ -83,7 +83,7 @@ Invite/link I/O contract (required):
    - `--public-spki <hex32>` (optional; defaults to local transport SPKI if omitted).
 6. If `--public-addr` points to a different always-on peer, caller must provide that peer's matching `--public-spki`.
 7. Accept flows must use the `public_addr` + `public_spki` carried by the resolved link payload; no out-of-band override in accept commands.
-8. Script-stable output: `create-invite` and `link` must print the full link in a predictable machine-readable line format before any optional alias/help text.
+8. Script-stable output: `invite` and `link` must print the full link in a predictable machine-readable line format before any optional alias/help text.
 
 Add missing DB registry commands:
 
@@ -174,14 +174,14 @@ Result: CLI only calls RPC; RPC only calls service APIs.
 
 Add/adjust commands in `src/main.rs`:
 
-1. `create-invite --public-addr <host:port> [--public-spki <hex32>]`
+1. `invite --public-addr <host:port> [--public-spki <hex32>]`
 2. `link --public-addr <host:port> [--public-spki <hex32>]`
 3. `accept-link --invite <n|link> --devicename <name>`
 4. `ban --user <n|id>`
 5. `identity`
 6. `workspaces` alias
 7. Selector grammar for message/user/invite args: accept `N`, `#N`, hex/base64/raw link forms as applicable.
-8. Output contract for `create-invite`/`link`: print full link in a machine-friendly form; optional alias metadata may be printed additionally.
+8. Output contract for `invite`/`link`: print full link in a machine-friendly form; optional alias metadata may be printed additionally.
 9. Add `topo completions <bash|zsh|fish|powershell|elvish>` (clap-generated static completion scripts).
 10. Add path hint for `--db` argument so shell path completion works for raw DB paths.
 11. Replace old invite-creation flag naming in one round:
@@ -210,7 +210,7 @@ Add/port tests to non-interactive suites:
    - `--db <alias>` and `--db <index>` resolution
    - omitted `--db` uses default registry entry
 6. Add published-endpoint tests:
-   - `create-invite`/`link` with default `public_spki` uses local transport SPKI,
+   - `invite`/`link` with default `public_spki` uses local transport SPKI,
    - explicit `--public-spki` is encoded in link and used by accept flow,
    - mismatch cases fail with clear transport/bootstrap diagnostics.
 7. Add completion smoke tests:

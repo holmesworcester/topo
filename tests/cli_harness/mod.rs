@@ -511,16 +511,16 @@ pub fn create_invite_with_spki(
     let mut cmd = Command::new(bin());
     cmd.arg("--db")
         .arg(db)
-        .arg("create-invite")
+        .arg("invite")
         .arg("--public-addr")
         .arg(bootstrap_addr);
     if let Some(spki) = public_spki {
         cmd.arg("--public-spki").arg(spki);
     }
-    let output = cmd.output().expect("failed to run create-invite");
+    let output = cmd.output().expect("failed to run invite");
     assert!(
         output.status.success(),
-        "create-invite failed: {}",
+        "invite failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
@@ -813,12 +813,12 @@ pub fn topo_send_retry(db: &str, content: &str) -> String {
 pub fn topo_create_invite_retry(db: &str, bootstrap_addr: &str) -> String {
     let out = topo_rpc_retry(
         db,
-        &["create-invite", "--public-addr", bootstrap_addr],
+        &["invite", "--public-addr", bootstrap_addr],
         Duration::from_secs(3),
     );
     assert!(
         out.status.success(),
-        "topo create-invite failed: stdout={} stderr={}",
+        "topo invite failed: stdout={} stderr={}",
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
@@ -826,7 +826,7 @@ pub fn topo_create_invite_retry(db: &str, bootstrap_addr: &str) -> String {
     stdout
         .lines()
         .find(|line| line.starts_with("topo://"))
-        .expect("create-invite output missing topo:// link")
+        .expect("invite output missing topo:// link")
         .to_string()
 }
 

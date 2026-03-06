@@ -332,7 +332,7 @@ enum Commands {
     },
 
     /// Create a user invite link for the active workspace
-    #[command(name = "create-invite")]
+    #[command(name = "invite")]
     CreateInvite {
         /// Public address (host:port) to embed in invite link
         #[arg(long, alias = "bootstrap")]

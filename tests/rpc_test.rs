@@ -700,7 +700,7 @@ fn accept_invite_on_running_idle_daemon_activates_runtime_without_restart() {
         .args([
             "--db",
             &alice_db,
-            "create-invite",
+            "invite",
             "--public-addr",
             &alice_listen,
         ])
@@ -708,14 +708,14 @@ fn accept_invite_on_running_idle_daemon_activates_runtime_without_restart() {
         .unwrap();
     assert!(
         invite_out.status.success(),
-        "create-invite failed: stdout={} stderr={}",
+        "invite failed: stdout={} stderr={}",
         String::from_utf8_lossy(&invite_out.stdout),
         String::from_utf8_lossy(&invite_out.stderr)
     );
     let invite_link = String::from_utf8_lossy(&invite_out.stdout)
         .lines()
         .find(|line| line.starts_with("topo://"))
-        .expect("create-invite output missing invite link")
+        .expect("invite output missing invite link")
         .to_string();
 
     // Bob: explicit daemon start on empty DB should stay idle first.
@@ -909,13 +909,13 @@ fn rpc_invite_ref_resolution() {
         .args([
             "--db",
             &db,
-            "create-invite",
+            "invite",
             "--public-addr",
             "127.0.0.1:4433",
         ])
         .output()
         .unwrap();
-    assert!(out.status.success(), "create-invite failed: {:?}", out);
+    assert!(out.status.success(), "invite failed: {:?}", out);
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
         stdout.contains("#1") || stdout.contains("topo://"),
@@ -1049,13 +1049,13 @@ fn peers_shows_remote_after_invite_accept() {
         .args([
             "--db",
             &alice_db,
-            "create-invite",
+            "invite",
             "--public-addr",
             &alice_listen,
         ])
         .output()
         .unwrap();
-    assert!(invite_out.status.success(), "create-invite failed");
+    assert!(invite_out.status.success(), "invite failed");
     let invite_link = String::from_utf8_lossy(&invite_out.stdout)
         .lines()
         .find(|line| line.starts_with("topo://"))

@@ -299,7 +299,7 @@ fn test_cli_start_without_trust_starts_idle_runtime() {
     assert!(stop.status.success(), "stop should succeed");
 }
 
-/// Bootstrap trust test using production create-invite / accept-invite CLI flow.
+/// Bootstrap trust test using production invite / accept-invite CLI flow.
 /// No direct SQL trust seeding — trust is materialized through CLI commands.
 ///
 /// Projection-first flow: accept-invite creates identity chain (events may

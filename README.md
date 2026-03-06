@@ -40,7 +40,7 @@ Alice creates a workspace and invites Bob, who then accepts:
 ```text
 $ topo --db alice.db start --bind 127.0.0.1:7443
 $ topo --db alice.db create-workspace --workspace-name "Activism" --username alice --device-name laptop
-$ topo --db alice.db create-invite --public-addr 127.0.0.1:7443
+$ topo --db alice.db invite --public-addr 127.0.0.1:7443
 $ topo --db bob.db start --bind 127.0.0.1:7444
 $ topo --db bob.db accept-invite --invite "topo://invite/eyJ2IjoxLCJ3b3Jrc3BhY2VfaWQiOiIyZjRhLi4uN2I5MSIsLi4ufQ==" --username bob --devicename phone
 ```

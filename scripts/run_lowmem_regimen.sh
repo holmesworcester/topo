@@ -171,11 +171,11 @@ setup_two_peer_workspace() {
   fi
 
   invite_out="$(
-    run_topo --db "${alice_db}" create-invite --public-addr "${addr}"
+    run_topo --db "${alice_db}" invite --public-addr "${addr}"
   )"
   invite_link="$(printf '%s\n' "${invite_out}" | awk '/^quiet:\/\/invite\// {print; exit}')"
   if [ -z "${invite_link}" ]; then
-    echo "error: create-invite did not emit invite link" >&2
+    echo "error: invite did not emit invite link" >&2
     return 1
   fi
 
