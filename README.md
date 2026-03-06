@@ -30,7 +30,11 @@ topo --help
 ### Shell Completions
 
 ```bash
+# Bash
 eval "$(topo completions bash)"
+
+# Zsh (macOS default)
+eval "$(topo completions zsh)"
 ```
 
 ### CLI Preview
