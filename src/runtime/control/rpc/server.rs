@@ -714,7 +714,16 @@ fn dispatch(
         RpcMethod::Upnp => {
             let net_info = state.runtime_net.read().unwrap().clone();
             match net_info {
-                None => RpcResponse::error("daemon not ready — listen address not yet known"),
+                None => {
+                    let runtime_state = *state.runtime_state.read().unwrap();
+                    if runtime_state == RuntimeState::IdleNoTenants {
+                        RpcResponse::error(
+                            "must join or create a workspace before running upnp",
+                        )
+                    } else {
+                        RpcResponse::error("daemon not ready — listen address not yet known")
+                    }
+                }
                 Some(info) => {
                     let listen_addr: std::net::SocketAddr = match info.listen_addr.parse() {
                         Ok(a) => a,

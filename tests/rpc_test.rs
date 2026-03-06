@@ -584,6 +584,35 @@ fn daemon_start_on_empty_db_reports_idle_runtime_state() {
 }
 
 #[test]
+fn upnp_on_empty_daemon_requires_workspace() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket);
+    let _ = wait_for_runtime_state(&socket, "IdleNoTenants", Duration::from_secs(10));
+
+    let out = Command::new(bin())
+        .args(["--db", &db, "upnp"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "upnp should fail on empty daemon");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("join or create a workspace before running upnp"),
+        "expected workspace guidance in stderr, got: {}",
+        stderr
+    );
+
+    stop_daemon(&db, &mut daemon);
+}
+
+#[test]
 fn create_workspace_on_running_daemon_activates_runtime() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
