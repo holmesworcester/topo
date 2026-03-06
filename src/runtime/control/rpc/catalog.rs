@@ -231,7 +231,7 @@ static CATALOG: &[MethodInfo] = &[
     },
     MethodInfo {
         name: "CreateWorkspace",
-        purpose: "Create a new workspace + identity chain",
+        purpose: "Create a new workspace + identity chain (auto-creates invite)",
         params: params![
             "workspace_name", "string", false, Some("\"workspace\"");
             "username", "string", false, Some("\"user\"");

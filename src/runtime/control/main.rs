@@ -1049,6 +1049,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 short_id(data["workspace_id"].as_str().unwrap_or(""))
             );
 
+            // Server auto-creates an invite with detected IPs
+            if let Some(link) = data["invite_link"].as_str() {
+                println!("invite:       {}", link);
+            } else if let Some(err) = data["invite_error"].as_str() {
+                eprintln!("warning: workspace created but auto-invite failed: {}", err);
+            }
+
+            // If --public-addr was given, create an additional invite with that address
             if let Some(addr) = public_addr {
                 let sock = target_socket_path(db, socket_override.as_deref());
                 match rpc_call(
@@ -1066,7 +1074,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         }
                     }
                     _ => {
-                        eprintln!("warning: workspace created but invite generation failed");
+                        eprintln!("warning: explicit-addr invite generation failed");
                     }
                 }
             }
