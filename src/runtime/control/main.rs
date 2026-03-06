@@ -1358,7 +1358,10 @@ async fn reevaluate_runtime(
             Ok(Err(e)) => {
                 let msg = e.to_string();
                 let m = msg.to_ascii_lowercase();
-                if m.contains("address already in use") || m.contains("os error 98") || m.contains("os error 48") {
+                if m.contains("address already in use")
+                    || m.contains("os error 98")
+                    || m.contains("os error 48")
+                {
                     tracing::error!(
                         "Runtime cannot start: port {} is already in use by another process. \
                          Stop the other process or use --bind to choose a different port. \
@@ -1378,7 +1381,10 @@ async fn reevaluate_runtime(
                     );
                     return Err(e);
                 } else {
-                    tracing::warn!("Runtime exited unexpectedly: {}. Will restart on next evaluation.", msg);
+                    tracing::warn!(
+                        "Runtime exited unexpectedly: {}. Will restart on next evaluation.",
+                        msg
+                    );
                 }
             }
             Err(e) => tracing::warn!("Runtime task join error: {}", e),
@@ -1576,6 +1582,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let manager_shutdown = shutdown_notify.clone();
             let manager_shutdown_flag = shutdown.clone();
             let manager_db = db.to_string();
+            let fatal_shutdown = shutdown_notify.clone();
             let runtime_manager = tokio::spawn(async move {
                 if let Err(e) = run_runtime_manager(
                     &manager_db,
@@ -1588,6 +1595,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .await
                 {
                     tracing::error!("runtime manager error: {}", e);
+                    // Non-retriable runtime failure — shut down the daemon.
+                    fatal_shutdown.notify_waiters();
                 }
             });
 

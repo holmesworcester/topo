@@ -396,10 +396,11 @@ fn describe_connect_failure(remote: SocketAddr, err: &ConnectionLifecycleError) 
                 .and_then(|s| s.split_whitespace().next())
                 .unwrap_or("unknown");
             format!(
-                "Certificate mismatch connecting to {}: peer presented TLS fingerprint {} \
-                 which is not trusted by this workspace. This usually means: (1) the peer's \
-                 transport identity has not been derived yet (bootstrap in progress), (2) the \
-                 invite was created by a different peer, or (3) the peer rotated its certificate",
+                "Certificate mismatch connecting to {}: TLS fingerprint {} is not trusted. \
+                 Either (a) the remote peer's certificate does not match the expected fingerprint, \
+                 or (b) the remote rejected our certificate. This usually means: (1) transport \
+                 identity has not been derived yet (bootstrap in progress), (2) the invite was \
+                 created by a different peer, or (3) a certificate was rotated",
                 remote, fp
             )
         }
@@ -434,7 +435,10 @@ fn describe_connect_failure(remote: SocketAddr, err: &ConnectionLifecycleError) 
             }
         }
         ConnectionLifecycleError::Accept(msg) => {
-            format!("Unexpected accept error during outbound dial to {}: {}", remote, msg)
+            format!(
+                "Unexpected accept error during outbound dial to {}: {}",
+                remote, msg
+            )
         }
         ConnectionLifecycleError::MissingPeerIdentity => {
             format!(

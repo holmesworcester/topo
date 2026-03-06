@@ -331,12 +331,27 @@ pub fn daemon_transport_fingerprint(db: &str) -> String {
 // Workspace / identity
 // ---------------------------------------------------------------------------
 
-/// Create a workspace via CLI, using a temporary daemon.
+/// Create a workspace via CLI with full control over visible identity fields.
 /// Waits for tenant discovery and stops the daemon cleanly afterward.
-pub fn create_workspace(db: &str) {
+pub fn create_workspace_with_details(
+    db: &str,
+    workspace_name: &str,
+    username: &str,
+    device_name: &str,
+) {
     let tmp_daemon = start_daemon(db);
     let out = Command::new(bin())
-        .args(["create-workspace", "--db", db])
+        .args([
+            "create-workspace",
+            "--db",
+            db,
+            "--workspace-name",
+            workspace_name,
+            "--username",
+            username,
+            "--device-name",
+            device_name,
+        ])
         .output()
         .expect("create-workspace");
     assert!(
@@ -368,38 +383,15 @@ pub fn create_workspace(db: &str) {
     wait_for_daemon_stopped(db, Duration::from_secs(10));
 }
 
+/// Create a workspace via CLI, using default names.
+/// Waits for tenant discovery and stops the daemon cleanly afterward.
+pub fn create_workspace(db: &str) {
+    create_workspace_with_details(db, "workspace", "user", "device");
+}
+
 /// Create a workspace with custom username via CLI.
 pub fn create_workspace_with_username(db: &str, username: &str) {
-    let tmp_daemon = start_daemon(db);
-    let out = Command::new(bin())
-        .args(["create-workspace", "--db", db, "--username", username])
-        .output()
-        .expect("create-workspace");
-    assert!(
-        out.status.success(),
-        "create-workspace failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
-        let peers = Command::new(bin())
-            .args(["--db", db, "tenants"])
-            .output()
-            .expect("peers probe");
-        if peers.status.success() {
-            let stdout = String::from_utf8_lossy(&peers.stdout);
-            if stdout
-                .lines()
-                .any(|line| line.trim_start().starts_with("1."))
-            {
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
-    drop(tmp_daemon);
-    wait_for_daemon_stopped(db, Duration::from_secs(10));
+    create_workspace_with_details(db, "workspace", username, "device");
 }
 
 // ---------------------------------------------------------------------------
@@ -550,6 +542,40 @@ pub fn create_invite_with_spki(
         .to_string()
 }
 
+/// Create a device-link invite via daemon RPC. Returns the `topo://link/` link.
+pub fn create_device_link(db: &str, bootstrap_addr: &str) -> String {
+    create_device_link_with_spki(db, bootstrap_addr, None)
+}
+
+/// Create a device-link invite with optional SPKI fingerprint.
+pub fn create_device_link_with_spki(
+    db: &str,
+    bootstrap_addr: &str,
+    public_spki: Option<&str>,
+) -> String {
+    let mut cmd = Command::new(bin());
+    cmd.arg("--db")
+        .arg(db)
+        .arg("link")
+        .arg("--public-addr")
+        .arg(bootstrap_addr);
+    if let Some(spki) = public_spki {
+        cmd.arg("--public-spki").arg(spki);
+    }
+    let output = cmd.output().expect("failed to run link");
+    assert!(
+        output.status.success(),
+        "link failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    stdout
+        .lines()
+        .find(|line| line.starts_with("topo://link/"))
+        .unwrap_or_else(|| stdout.trim())
+        .to_string()
+}
+
 /// Accept an invite via daemon RPC using a temporary daemon.
 /// Waits for tenant discovery and stops the daemon cleanly afterward.
 pub fn accept_invite(db: &str, invite_link: &str) {
@@ -603,6 +629,60 @@ pub fn accept_invite_with_identity(db: &str, invite_link: &str, username: &str, 
         );
     }
     // Stop temporary daemon; callers decide daemon lifecycle.
+    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
+    drop(tmp_daemon);
+    wait_for_daemon_stopped(db, Duration::from_secs(10));
+}
+
+/// Accept a device-link invite via daemon RPC using a temporary daemon.
+pub fn accept_device_link(db: &str, invite_link: &str) {
+    accept_device_link_with_name(db, invite_link, "device")
+}
+
+/// Accept a device-link invite with a custom device name.
+pub fn accept_device_link_with_name(db: &str, invite_link: &str, devicename: &str) {
+    let tmp_daemon = start_daemon(db);
+    let output = Command::new(bin())
+        .arg("accept-link")
+        .arg("--db")
+        .arg(db)
+        .arg("--invite")
+        .arg(invite_link)
+        .arg("--devicename")
+        .arg(devicename)
+        .output()
+        .expect("failed to run accept-link");
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    assert!(
+        output.status.success(),
+        "accept-link failed:\n  stdout: {}\n  stderr: {}",
+        stdout.trim(),
+        stderr.trim()
+    );
+    let start = Instant::now();
+    while start.elapsed() < Duration::from_secs(5) {
+        let peers = Command::new(bin())
+            .args(["--db", db, "tenants"])
+            .output()
+            .expect("peers probe");
+        if peers.status.success() {
+            let stdout = String::from_utf8_lossy(&peers.stdout);
+            if stdout
+                .lines()
+                .any(|line| line.trim_start().starts_with("1."))
+            {
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    if let Err(debug) = wait_for_local_peer_signer(db, Duration::from_secs(60)) {
+        eprintln!(
+            "accept_device_link: peer signer not materialized yet; continuing (db={}): {}",
+            db, debug
+        );
+    }
     let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
     drop(tmp_daemon);
     wait_for_daemon_stopped(db, Duration::from_secs(10));
@@ -766,6 +846,105 @@ pub fn get_messages(db: &str) -> Vec<String> {
             }
         })
         .collect()
+}
+
+/// Get raw `topo view` output.
+pub fn get_view_raw(db: &str) -> String {
+    ensure_active_peer(db, Duration::from_secs(10));
+    let output = Command::new(bin())
+        .arg("--db")
+        .arg(db)
+        .arg("view")
+        .output()
+        .expect("failed to run view");
+    assert!(
+        output.status.success(),
+        "view failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// Get raw `topo status` output.
+pub fn get_status_raw(db: &str) -> String {
+    let output = Command::new(bin())
+        .arg("--db")
+        .arg(db)
+        .arg("status")
+        .output()
+        .expect("failed to run status");
+    assert!(
+        output.status.success(),
+        "status failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// Get raw `topo users` output.
+pub fn get_users_raw(db: &str) -> String {
+    ensure_active_peer(db, Duration::from_secs(10));
+    let output = Command::new(bin())
+        .arg("--db")
+        .arg(db)
+        .arg("users")
+        .output()
+        .expect("failed to run users");
+    assert!(
+        output.status.success(),
+        "users failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// Get raw `topo tenants` output.
+pub fn get_tenants_raw(db: &str) -> String {
+    let output = Command::new(bin())
+        .arg("--db")
+        .arg(db)
+        .arg("tenants")
+        .output()
+        .expect("failed to run tenants");
+    assert!(
+        output.status.success(),
+        "tenants failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// Get raw `topo workspaces` output.
+pub fn get_workspaces_raw(db: &str) -> String {
+    let output = Command::new(bin())
+        .arg("--db")
+        .arg(db)
+        .arg("workspaces")
+        .output()
+        .expect("failed to run workspaces");
+    assert!(
+        output.status.success(),
+        "workspaces failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// Select the active tenant by CLI selector (index, #index, or peer id).
+pub fn use_tenant(db: &str, selector: &str) {
+    let output = Command::new(bin())
+        .arg("--db")
+        .arg(db)
+        .arg("use-tenant")
+        .arg(selector)
+        .output()
+        .expect("failed to run use-tenant");
+    assert!(
+        output.status.success(),
+        "use-tenant failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
 }
 
 // ---------------------------------------------------------------------------

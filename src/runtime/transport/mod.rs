@@ -34,9 +34,11 @@ pub use transport_session_io::{QuicTransportSessionIo, DEFAULT_SYNC_FRAME_MAX_BY
 
 use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
+use std::sync::Mutex;
 use tracing::warn;
 
 pub type DynamicAllowFn =
@@ -62,12 +64,19 @@ impl std::fmt::Debug for AllowPolicy {
 /// Verifies peer certificates by checking SPKI fingerprint against an allowed set.
 /// Implements both ServerCertVerifier (client verifies server) and
 /// ClientCertVerifier (server verifies client).
-/// Tracks rejection counts for observability.
-#[derive(Debug)]
+/// Tracks rejection counts per fingerprint for log suppression.
 pub struct PinnedCertVerifier {
     policy: AllowPolicy,
     crypto_provider: Arc<rustls::crypto::CryptoProvider>,
-    rejections: AtomicU64,
+    rejections: Mutex<HashMap<[u8; 32], u64>>,
+}
+
+impl std::fmt::Debug for PinnedCertVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("PinnedCertVerifier")
+            .field("policy", &self.policy)
+            .finish()
+    }
 }
 
 impl PinnedCertVerifier {
@@ -83,13 +92,17 @@ impl PinnedCertVerifier {
         Self {
             policy,
             crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
-            rejections: AtomicU64::new(0),
+            rejections: Mutex::new(HashMap::new()),
         }
     }
 
-    /// Number of certificate rejections since creation.
+    /// Total number of certificate rejections since creation.
     pub fn rejection_count(&self) -> u64 {
-        self.rejections.load(Ordering::Relaxed)
+        self.rejections
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .values()
+            .sum()
     }
 
     fn check_fingerprint(&self, cert_der: &CertificateDer<'_>) -> Result<(), rustls::Error> {
@@ -104,12 +117,17 @@ impl PinnedCertVerifier {
         if allowed {
             Ok(())
         } else {
-            let count = self.rejections.fetch_add(1, Ordering::Relaxed) + 1;
             let fp_hex = hex::encode(fp);
+            let count = {
+                let mut map = self.rejections.lock().unwrap_or_else(|p| p.into_inner());
+                let entry = map.entry(fp).or_insert(0);
+                *entry += 1;
+                *entry
+            };
             if count <= 3 {
                 warn!(
                     fingerprint = %fp_hex,
-                    total_rejections = count,
+                    rejections_for_fingerprint = count,
                     "Rejected peer certificate: TLS fingerprint {} is not trusted by any \
                      local workspace. If this peer just accepted an invite, its transport \
                      identity may still be bootstrapping.",
@@ -118,17 +136,16 @@ impl PinnedCertVerifier {
             } else if count == 4 {
                 warn!(
                     fingerprint = %fp_hex,
-                    total_rejections = count,
-                    "Rejected peer certificate (repeated, suppressing further logs for \
-                     this fingerprint): {}",
+                    rejections_for_fingerprint = count,
+                    "Rejected peer certificate (suppressing further logs for \
+                     fingerprint {})",
                     &fp_hex[..16.min(fp_hex.len())]
                 );
             }
-            // count > 4: suppress repeated logs
+            // count > 4: suppress repeated logs for this specific fingerprint
             Err(rustls::Error::General(format!(
                 "{}: peer fingerprint {} not in allowed set",
-                TRUST_REJECTION_MARKER,
-                fp_hex
+                TRUST_REJECTION_MARKER, fp_hex
             )))
         }
     }

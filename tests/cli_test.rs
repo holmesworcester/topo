@@ -23,7 +23,9 @@ use topo::db::open_connection;
 use topo::event_modules::workspace::commands::{
     accept_invite as accept_invite_without_sync, create_user_invite_raw,
 };
-use topo::event_modules::workspace::invite_link::{create_invite_link, parse_bootstrap_address};
+use topo::event_modules::workspace::invite_link::{
+    create_invite_link, parse_bootstrap_address, rewrite_bootstrap_addrs,
+};
 use topo::testutil::{DaemonGuard, Peer};
 
 fn cli_test_lock() -> std::sync::MutexGuard<'static, ()> {
@@ -90,6 +92,293 @@ fn tenant_index_for_peer_id(db_path: &str, peer_id: &str) -> usize {
         .position(|id| id == peer_id)
         .map(|idx| idx + 1)
         .expect("peer id should appear in tenant scopes")
+}
+
+struct StartedCliPeer {
+    db: String,
+    username: String,
+    device_name: String,
+    _daemon: DaemonGuard,
+}
+
+impl StartedCliPeer {
+    fn account_label(&self) -> String {
+        format!("{}/{}", self.username, self.device_name)
+    }
+}
+
+fn numbered_item_count(output: &str) -> usize {
+    output
+        .lines()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            let Some(dot_pos) = trimmed.find('.') else {
+                return false;
+            };
+            trimmed[..dot_pos].chars().all(|c| c.is_ascii_digit())
+        })
+        .count()
+}
+
+fn status_projected_count(output: &str, label: &str) -> usize {
+    let prefix = format!("{}:", label);
+    output
+        .lines()
+        .find_map(|line| {
+            line.trim()
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.split_whitespace().next())
+                .and_then(|num| num.parse::<usize>().ok())
+        })
+        .unwrap_or_else(|| panic!("missing status count for {} in:\n{}", label, output))
+}
+
+fn tenant_index_for_username(db_path: &str, username: &str) -> usize {
+    let conn = open_connection(db_path).expect("open db");
+    let peer_id: String = conn
+        .query_row(
+            "SELECT recorded_by
+             FROM users
+             WHERE username = ?1
+             LIMIT 1",
+            rusqlite::params![username],
+            |row| row.get(0),
+        )
+        .expect("username should map to a tenant");
+    tenant_index_for_peer_id(db_path, &peer_id)
+}
+
+fn use_tenant_for_username(db_path: &str, username: &str) {
+    let idx = tenant_index_for_username(db_path, username);
+    use_tenant(db_path, &idx.to_string());
+}
+
+fn rewrite_invite_addrs(invite_link: &str, addrs: &[&str]) -> String {
+    let parsed = addrs
+        .iter()
+        .map(|addr| parse_bootstrap_address(addr).expect("parse bootstrap address"))
+        .collect::<Vec<_>>();
+    rewrite_bootstrap_addrs(invite_link, &parsed).expect("rewrite invite bootstrap addrs")
+}
+
+fn start_joined_cli_peer(
+    tmpdir: &tempfile::TempDir,
+    db_name: &str,
+    invite_link: &str,
+    username: &str,
+    device_name: &str,
+) -> StartedCliPeer {
+    let db = tmpdir.path().join(db_name).to_str().unwrap().to_string();
+    accept_invite_with_identity(&db, invite_link, username, device_name);
+    let daemon = start_daemon(&db);
+    StartedCliPeer {
+        db,
+        username: username.to_string(),
+        device_name: device_name.to_string(),
+        _daemon: daemon,
+    }
+}
+
+fn start_linked_cli_peer(
+    tmpdir: &tempfile::TempDir,
+    db_name: &str,
+    invite_link: &str,
+    username: &str,
+    device_name: &str,
+) -> StartedCliPeer {
+    let db = tmpdir.path().join(db_name).to_str().unwrap().to_string();
+    accept_device_link_with_name(&db, invite_link, device_name);
+    let daemon = start_daemon(&db);
+    StartedCliPeer {
+        db,
+        username: username.to_string(),
+        device_name: device_name.to_string(),
+        _daemon: daemon,
+    }
+}
+
+fn send_message_as_username(db_path: &str, username: &str, content: &str) -> String {
+    use_tenant_for_username(db_path, username);
+    send_message(db_path, content)
+}
+
+fn assert_cli_state(
+    db_path: &str,
+    expected_workspace_names: &[&str],
+    expected_view_workspace_name: &str,
+    expected_tenant_count: usize,
+    expected_user_count: usize,
+    expected_users: &[&str],
+    expected_accounts: &[&str],
+    expected_messages: &[&str],
+) {
+    let active = topo_cmd(db_path, &["active-tenant"]);
+    assert!(
+        active.status.success(),
+        "active-tenant failed: {}",
+        String::from_utf8_lossy(&active.stderr)
+    );
+    let active_stdout = String::from_utf8_lossy(&active.stdout);
+    assert!(
+        !active_stdout.trim().is_empty() && active_stdout.trim() != "(no active peer)",
+        "active tenant should be selected: {}",
+        active_stdout
+    );
+
+    let status = get_status_raw(db_path);
+    assert!(
+        status.contains("Runtime:   Active"),
+        "status should show active runtime:\n{}",
+        status
+    );
+    assert_eq!(
+        status_projected_count(&status, "Messages"),
+        expected_messages.len(),
+        "status should report the expected projected message count:\n{}",
+        status
+    );
+
+    let workspaces = get_workspaces_raw(db_path);
+    assert!(
+        workspaces.contains("WORKSPACES"),
+        "workspaces should include the header:\n{}",
+        workspaces
+    );
+    assert_eq!(
+        numbered_item_count(&workspaces),
+        expected_workspace_names.len(),
+        "workspaces should have the expected count:\n{}",
+        workspaces
+    );
+
+    let tenants = get_tenants_raw(db_path);
+    assert_eq!(
+        numbered_item_count(&tenants),
+        expected_tenant_count,
+        "tenants should have the expected count:\n{}",
+        tenants
+    );
+
+    let users = get_users_raw(db_path);
+    assert_eq!(
+        numbered_item_count(&users),
+        expected_user_count,
+        "users should have the expected count:\n{}",
+        users
+    );
+    for username in expected_users {
+        assert!(
+            users.contains(username),
+            "users should contain {:?}:\n{}",
+            username,
+            users
+        );
+    }
+
+    let view = get_view_raw(db_path);
+    assert!(
+        view.contains(expected_view_workspace_name),
+        "view should show workspace {:?}:\n{}",
+        expected_view_workspace_name,
+        view
+    );
+    assert!(
+        view.contains("USERS:"),
+        "view should include USERS:\n{}",
+        view
+    );
+    assert!(
+        view.contains("ACCOUNTS:"),
+        "view should include ACCOUNTS:\n{}",
+        view
+    );
+    for username in expected_users {
+        assert!(
+            view.contains(username),
+            "view should contain user {:?}:\n{}",
+            username,
+            view
+        );
+    }
+    for account in expected_accounts {
+        assert!(
+            view.contains(account),
+            "view should contain account {:?}:\n{}",
+            account,
+            view
+        );
+    }
+    for message in expected_messages {
+        assert!(
+            view.contains(message),
+            "view should contain message {:?}:\n{}",
+            message,
+            view
+        );
+    }
+
+    let messages = get_messages_raw(db_path);
+    for message in expected_messages {
+        assert!(
+            messages.contains(message),
+            "messages should contain {:?}:\n{}",
+            message,
+            messages
+        );
+    }
+
+    let identity = topo_cmd(db_path, &["identity"]);
+    assert!(
+        identity.status.success(),
+        "identity failed: {}",
+        String::from_utf8_lossy(&identity.stderr)
+    );
+    let identity_stdout = String::from_utf8_lossy(&identity.stdout);
+    assert!(
+        identity_stdout.contains("Transport:"),
+        "identity should include transport fingerprint:\n{}",
+        identity_stdout
+    );
+    assert!(
+        !identity_stdout.contains("User:      (none)"),
+        "identity should have a materialized user:\n{}",
+        identity_stdout
+    );
+    assert!(
+        !identity_stdout.contains("Peer:      (none)"),
+        "identity should have a materialized peer:\n{}",
+        identity_stdout
+    );
+}
+
+fn assert_event_visible_on_all(db_paths: &[&str], event_id: &str, timeout_ms: u64) {
+    for db_path in db_paths {
+        assert_eventually(db_path, &format!("has_event:{} >= 1", event_id), timeout_ms);
+    }
+}
+
+fn assert_cli_state_for_username(
+    db_path: &str,
+    username: &str,
+    expected_workspace_names: &[&str],
+    expected_view_workspace_name: &str,
+    expected_tenant_count: usize,
+    expected_user_count: usize,
+    expected_users: &[&str],
+    expected_accounts: &[&str],
+    expected_messages: &[&str],
+) {
+    use_tenant_for_username(db_path, username);
+    assert_cli_state(
+        db_path,
+        expected_workspace_names,
+        expected_view_workspace_name,
+        expected_tenant_count,
+        expected_user_count,
+        expected_users,
+        expected_accounts,
+        expected_messages,
+    );
 }
 
 /// Functional sync test using invite-based shared workspace flow.
@@ -605,6 +894,549 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
         &alice_db,
         &format!("has_event:{} >= 1", bob_eid),
         timeout_ms,
+    );
+}
+
+/// Induction-style CLI test for a single multi-use user invite.
+/// Base case: Alice alone is healthy. Step case: if N peers are converged,
+/// reusing the same invite for the N+1th peer should preserve healthy CLI
+/// state for everyone.
+#[test]
+fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 30000;
+    let workspace_name = "reuse-user-induction";
+
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    create_workspace_with_details(&alice_db, workspace_name, "alice", "alice-root");
+    let alice = StartedCliPeer {
+        db: alice_db,
+        username: "alice".to_string(),
+        device_name: "alice-root".to_string(),
+        _daemon: start_daemon(
+            tmpdir
+                .path()
+                .join("alice.db")
+                .to_str()
+                .expect("alice db path"),
+        ),
+    };
+    let alice_account = alice.account_label();
+
+    let reused_invite = create_invite(&alice.db, &daemon_listen_addr(&alice.db));
+    let alice_base = "reuse-user/alice-step-1";
+    let alice_base_eid = send_message(&alice.db, alice_base);
+    assert_event_visible_on_all(&[&alice.db], &alice_base_eid, timeout_ms);
+    assert_cli_state(
+        &alice.db,
+        &[workspace_name],
+        workspace_name,
+        1,
+        1,
+        &["alice"],
+        &[&alice_account],
+        &[alice_base],
+    );
+
+    let bob = start_joined_cli_peer(&tmpdir, "bob.db", &reused_invite, "bob", "bob-box");
+    let bob_account = bob.account_label();
+    assert_eventually(&bob.db, "message_count >= 1", timeout_ms);
+    let bob_msg = "reuse-user/bob-step-2";
+    let bob_eid = send_message(&bob.db, bob_msg);
+    assert_event_visible_on_all(&[&alice.db, &bob.db], &bob_eid, timeout_ms);
+    for db in [&alice.db, &bob.db] {
+        assert_cli_state(
+            db,
+            &[workspace_name],
+            workspace_name,
+            1,
+            2,
+            &["alice", "bob"],
+            &[&alice_account, &bob_account],
+            &[alice_base, bob_msg],
+        );
+    }
+
+    let carol = start_joined_cli_peer(&tmpdir, "carol.db", &reused_invite, "carol", "carol-box");
+    let carol_account = carol.account_label();
+    assert_eventually(&carol.db, "message_count >= 2", timeout_ms);
+    let carol_msg = "reuse-user/carol-step-3";
+    let carol_eid = send_message(&carol.db, carol_msg);
+    assert_event_visible_on_all(&[&alice.db, &bob.db, &carol.db], &carol_eid, timeout_ms);
+    for db in [&alice.db, &bob.db, &carol.db] {
+        assert_cli_state(
+            db,
+            &[workspace_name],
+            workspace_name,
+            1,
+            3,
+            &["alice", "bob", "carol"],
+            &[&alice_account, &bob_account, &carol_account],
+            &[alice_base, bob_msg, carol_msg],
+        );
+    }
+
+    let dave = start_joined_cli_peer(&tmpdir, "dave.db", &reused_invite, "dave", "dave-box");
+    let dave_account = dave.account_label();
+    assert_eventually(&dave.db, "message_count >= 3", timeout_ms);
+    let dave_msg = "reuse-user/dave-step-4";
+    let dave_eid = send_message(&dave.db, dave_msg);
+    assert_event_visible_on_all(
+        &[&alice.db, &bob.db, &carol.db, &dave.db],
+        &dave_eid,
+        timeout_ms,
+    );
+    for db in [&alice.db, &bob.db, &carol.db, &dave.db] {
+        assert_cli_state(
+            db,
+            &[workspace_name],
+            workspace_name,
+            1,
+            4,
+            &["alice", "bob", "carol", "dave"],
+            &[&alice_account, &bob_account, &carol_account, &dave_account],
+            &[alice_base, bob_msg, carol_msg, dave_msg],
+        );
+    }
+}
+
+/// Mixed old-invite reuse and fresh invite creation for users.
+/// The old invite keeps working as the workspace grows and new invites are issued.
+#[test]
+fn test_cli_multi_use_user_invites_mix_reuse_and_new_creation() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 30000;
+    let workspace_name = "mixed-user-invites";
+
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    create_workspace_with_details(&alice_db, workspace_name, "alice", "alice-mac");
+    let alice = StartedCliPeer {
+        db: alice_db,
+        username: "alice".to_string(),
+        device_name: "alice-mac".to_string(),
+        _daemon: start_daemon(
+            tmpdir
+                .path()
+                .join("alice.db")
+                .to_str()
+                .expect("alice db path"),
+        ),
+    };
+    let alice_account = alice.account_label();
+
+    let old_invite = create_invite(&alice.db, &daemon_listen_addr(&alice.db));
+    let alice_base = "mixed-user/alice-step-1";
+    let alice_base_eid = send_message(&alice.db, alice_base);
+    assert_event_visible_on_all(&[&alice.db], &alice_base_eid, timeout_ms);
+
+    let bob = start_joined_cli_peer(&tmpdir, "bob.db", &old_invite, "bob", "bob-linux");
+    let bob_account = bob.account_label();
+    assert_eventually(&bob.db, "message_count >= 1", timeout_ms);
+    let bob_msg = "mixed-user/bob-step-2";
+    let bob_eid = send_message(&bob.db, bob_msg);
+    assert_event_visible_on_all(&[&alice.db, &bob.db], &bob_eid, timeout_ms);
+
+    let fresh_invite = create_invite(&alice.db, &daemon_listen_addr(&alice.db));
+    let carol = start_joined_cli_peer(&tmpdir, "carol.db", &fresh_invite, "carol", "carol-linux");
+    let carol_account = carol.account_label();
+    assert_eventually(&carol.db, "message_count >= 2", timeout_ms);
+    let carol_msg = "mixed-user/carol-step-3";
+    let carol_eid = send_message(&carol.db, carol_msg);
+    assert_event_visible_on_all(&[&alice.db, &bob.db, &carol.db], &carol_eid, timeout_ms);
+
+    let dave = start_joined_cli_peer(&tmpdir, "dave.db", &old_invite, "dave", "dave-linux");
+    let dave_account = dave.account_label();
+    assert_eventually(&dave.db, "message_count >= 3", timeout_ms);
+    let dave_msg = "mixed-user/dave-step-4";
+    let dave_eid = send_message(&dave.db, dave_msg);
+    assert_event_visible_on_all(
+        &[&alice.db, &bob.db, &carol.db, &dave.db],
+        &dave_eid,
+        timeout_ms,
+    );
+
+    for db in [&alice.db, &bob.db, &carol.db, &dave.db] {
+        assert_cli_state(
+            db,
+            &[workspace_name],
+            workspace_name,
+            1,
+            4,
+            &["alice", "bob", "carol", "dave"],
+            &[&alice_account, &bob_account, &carol_account, &dave_account],
+            &[alice_base, bob_msg, carol_msg, dave_msg],
+        );
+    }
+}
+
+/// Device-link induction with both fresh link creation and old-link reuse.
+/// A linked device issues the fresh link, and the original link still works
+/// later for another device.
+#[test]
+fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 30000;
+    let workspace_name = "device-link-induction";
+
+    let phone_db = tmpdir.path().join("phone.db").to_str().unwrap().to_string();
+    create_workspace_with_details(&phone_db, workspace_name, "alice", "phone");
+    let phone = StartedCliPeer {
+        db: phone_db,
+        username: "alice".to_string(),
+        device_name: "phone".to_string(),
+        _daemon: start_daemon(
+            tmpdir
+                .path()
+                .join("phone.db")
+                .to_str()
+                .expect("phone db path"),
+        ),
+    };
+    let phone_account = phone.account_label();
+
+    let link_a = create_device_link(&phone.db, &daemon_listen_addr(&phone.db));
+    let phone_base = "device-link/phone-step-1";
+    let phone_base_eid = send_message(&phone.db, phone_base);
+    assert_event_visible_on_all(&[&phone.db], &phone_base_eid, timeout_ms);
+
+    let laptop = start_linked_cli_peer(&tmpdir, "laptop.db", &link_a, "alice", "laptop");
+    let laptop_account = laptop.account_label();
+    assert_eventually(&laptop.db, "message_count >= 1", timeout_ms);
+    let laptop_msg = "device-link/laptop-step-2";
+    let laptop_eid = send_message(&laptop.db, laptop_msg);
+    assert_event_visible_on_all(&[&phone.db, &laptop.db], &laptop_eid, timeout_ms);
+
+    let link_b = create_device_link(&laptop.db, &daemon_listen_addr(&laptop.db));
+    let tablet = start_linked_cli_peer(&tmpdir, "tablet.db", &link_b, "alice", "tablet");
+    let tablet_account = tablet.account_label();
+    assert_eventually(&tablet.db, "message_count >= 2", timeout_ms);
+    let tablet_msg = "device-link/tablet-step-3";
+    let tablet_eid = send_message(&tablet.db, tablet_msg);
+    assert_event_visible_on_all(
+        &[&phone.db, &laptop.db, &tablet.db],
+        &tablet_eid,
+        timeout_ms,
+    );
+
+    let desktop = start_linked_cli_peer(&tmpdir, "desktop.db", &link_a, "alice", "desktop");
+    let desktop_account = desktop.account_label();
+    assert_eventually(&desktop.db, "message_count >= 3", timeout_ms);
+    let desktop_msg = "device-link/desktop-step-4";
+    let desktop_eid = send_message(&desktop.db, desktop_msg);
+    assert_event_visible_on_all(
+        &[&phone.db, &laptop.db, &tablet.db, &desktop.db],
+        &desktop_eid,
+        timeout_ms,
+    );
+
+    for db in [&phone.db, &laptop.db, &tablet.db, &desktop.db] {
+        assert_cli_state(
+            db,
+            &[workspace_name],
+            workspace_name,
+            1,
+            1,
+            &["alice"],
+            &[
+                &phone_account,
+                &laptop_account,
+                &tablet_account,
+                &desktop_account,
+            ],
+            &[phone_base, laptop_msg, tablet_msg, desktop_msg],
+        );
+    }
+}
+
+/// A rewritten invite with a dead first address and a live second address
+/// should still converge to the correct CLI-visible state.
+#[test]
+fn test_cli_invite_with_dead_first_and_live_second_address() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 30000;
+    let workspace_name = "dead-first-live-second";
+
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    create_workspace_with_details(&alice_db, workspace_name, "alice", "edge-host");
+    let alice = StartedCliPeer {
+        db: alice_db,
+        username: "alice".to_string(),
+        device_name: "edge-host".to_string(),
+        _daemon: start_daemon(
+            tmpdir
+                .path()
+                .join("alice.db")
+                .to_str()
+                .expect("alice db path"),
+        ),
+    };
+    let alice_account = alice.account_label();
+
+    let live_addr = daemon_listen_addr(&alice.db);
+    let live_port = live_addr
+        .rsplit_once(':')
+        .expect("listen addr should contain port")
+        .1
+        .to_string();
+    let rewritten_invite = rewrite_invite_addrs(
+        &create_invite(&alice.db, &live_addr),
+        &[
+            &format!("127.0.0.1:{}", random_port()),
+            &format!("localhost:{}", live_port),
+        ],
+    );
+
+    let alice_base = "dead-first/alice-step-1";
+    let alice_base_eid = send_message(&alice.db, alice_base);
+    assert_event_visible_on_all(&[&alice.db], &alice_base_eid, timeout_ms);
+
+    let bob = start_joined_cli_peer(&tmpdir, "bob.db", &rewritten_invite, "bob", "fallback-box");
+    let bob_account = bob.account_label();
+    assert_eventually(&bob.db, "message_count >= 1", timeout_ms);
+    let bob_msg = "dead-first/bob-step-2";
+    let bob_eid = send_message(&bob.db, bob_msg);
+    assert_event_visible_on_all(&[&alice.db, &bob.db], &bob_eid, timeout_ms);
+
+    for db in [&alice.db, &bob.db] {
+        assert_cli_state(
+            db,
+            &[workspace_name],
+            workspace_name,
+            1,
+            2,
+            &["alice", "bob"],
+            &[&alice_account, &bob_account],
+            &[alice_base, bob_msg],
+        );
+    }
+}
+
+/// Multitenant + multiworkspace progression:
+/// 1. one tenant in one workspace,
+/// 2. then one tenant in each of two workspaces,
+/// 3. then a reused old invite adds one more tenant to the first workspace.
+#[test]
+fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 30000;
+
+    let alpha_db = tmpdir.path().join("alpha.db").to_str().unwrap().to_string();
+    let zeta_db = tmpdir.path().join("zeta.db").to_str().unwrap().to_string();
+    let shared_db = tmpdir
+        .path()
+        .join("shared.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace_with_details(&alpha_db, "alpha-space", "alpha", "alpha-root");
+    let alpha = StartedCliPeer {
+        db: alpha_db,
+        username: "alpha".to_string(),
+        device_name: "alpha-root".to_string(),
+        _daemon: start_daemon(
+            tmpdir
+                .path()
+                .join("alpha.db")
+                .to_str()
+                .expect("alpha db path"),
+        ),
+    };
+    let alpha_account = alpha.account_label();
+    let alpha_invite_reused = create_invite(&alpha.db, &daemon_listen_addr(&alpha.db));
+    let alpha_base = "alpha-space/alpha-step-1";
+    let alpha_base_eid = send_message(&alpha.db, alpha_base);
+    assert_event_visible_on_all(&[&alpha.db], &alpha_base_eid, timeout_ms);
+
+    create_workspace_with_details(&zeta_db, "zeta-space", "zeta", "zeta-root");
+    let zeta = StartedCliPeer {
+        db: zeta_db,
+        username: "zeta".to_string(),
+        device_name: "zeta-root".to_string(),
+        _daemon: start_daemon(
+            tmpdir
+                .path()
+                .join("zeta.db")
+                .to_str()
+                .expect("zeta db path"),
+        ),
+    };
+    let zeta_account = zeta.account_label();
+    let zeta_invite_fresh = create_invite(&zeta.db, &daemon_listen_addr(&zeta.db));
+    let zeta_base = "zeta-space/zeta-step-1";
+    let zeta_base_eid = send_message(&zeta.db, zeta_base);
+    assert_event_visible_on_all(&[&zeta.db], &zeta_base_eid, timeout_ms);
+
+    accept_invite_with_identity(
+        &shared_db,
+        &alpha_invite_reused,
+        "bob-alpha",
+        "bob-terminal",
+    );
+    let mut shared_daemon = start_daemon(&shared_db);
+    let bob_alpha_account = "bob-alpha/bob-terminal";
+    use_tenant_for_username(&shared_db, "bob-alpha");
+    assert_eventually(&shared_db, "message_count >= 1", timeout_ms);
+    let bob_alpha_msg = send_message_as_username(&shared_db, "bob-alpha", "alpha-space/bob-step-2");
+    assert_event_visible_on_all(&[&alpha.db, &shared_db], &bob_alpha_msg, timeout_ms);
+    assert_cli_state(
+        &alpha.db,
+        &["alpha-space"],
+        "alpha-space",
+        1,
+        2,
+        &["alpha", "bob-alpha"],
+        &[&alpha_account, bob_alpha_account],
+        &[alpha_base, "alpha-space/bob-step-2"],
+    );
+    assert_cli_state_for_username(
+        &shared_db,
+        "bob-alpha",
+        &["alpha-space"],
+        "alpha-space",
+        1,
+        2,
+        &["alpha", "bob-alpha"],
+        &[&alpha_account, bob_alpha_account],
+        &[alpha_base, "alpha-space/bob-step-2"],
+    );
+    stop_daemon(&shared_db, &mut shared_daemon);
+    drop(shared_daemon);
+
+    accept_invite_with_identity(&shared_db, &zeta_invite_fresh, "yuki-zeta", "yuki-terminal");
+    let mut shared_daemon = start_daemon(&shared_db);
+    let yuki_zeta_account = "yuki-zeta/yuki-terminal";
+    use_tenant_for_username(&shared_db, "yuki-zeta");
+    assert_eventually(&shared_db, "message_count >= 1", timeout_ms);
+    let yuki_zeta_msg = send_message_as_username(&shared_db, "yuki-zeta", "zeta-space/yuki-step-2");
+    assert_event_visible_on_all(&[&zeta.db, &shared_db], &yuki_zeta_msg, timeout_ms);
+    assert_cli_state(
+        &zeta.db,
+        &["zeta-space"],
+        "zeta-space",
+        1,
+        2,
+        &["zeta", "yuki-zeta"],
+        &[&zeta_account, yuki_zeta_account],
+        &[zeta_base, "zeta-space/yuki-step-2"],
+    );
+    assert_cli_state_for_username(
+        &shared_db,
+        "bob-alpha",
+        &["alpha-space", "zeta-space"],
+        "alpha-space",
+        2,
+        2,
+        &["alpha", "bob-alpha"],
+        &[&alpha_account, bob_alpha_account],
+        &[alpha_base, "alpha-space/bob-step-2"],
+    );
+    assert_cli_state_for_username(
+        &shared_db,
+        "yuki-zeta",
+        &["alpha-space", "zeta-space"],
+        "zeta-space",
+        2,
+        2,
+        &["zeta", "yuki-zeta"],
+        &[&zeta_account, yuki_zeta_account],
+        &[zeta_base, "zeta-space/yuki-step-2"],
+    );
+    stop_daemon(&shared_db, &mut shared_daemon);
+    drop(shared_daemon);
+
+    accept_invite_with_identity(
+        &shared_db,
+        &alpha_invite_reused,
+        "carol-alpha",
+        "carol-terminal",
+    );
+    let _shared_daemon = start_daemon(&shared_db);
+    let carol_alpha_account = "carol-alpha/carol-terminal";
+    use_tenant_for_username(&shared_db, "carol-alpha");
+    assert_eventually(&shared_db, "message_count >= 2", timeout_ms);
+    let carol_alpha_msg =
+        send_message_as_username(&shared_db, "carol-alpha", "alpha-space/carol-step-3");
+    assert_event_visible_on_all(&[&alpha.db, &shared_db], &carol_alpha_msg, timeout_ms);
+
+    assert_cli_state(
+        &alpha.db,
+        &["alpha-space"],
+        "alpha-space",
+        1,
+        3,
+        &["alpha", "bob-alpha", "carol-alpha"],
+        &[&alpha_account, bob_alpha_account, carol_alpha_account],
+        &[
+            alpha_base,
+            "alpha-space/bob-step-2",
+            "alpha-space/carol-step-3",
+        ],
+    );
+    assert_cli_state(
+        &zeta.db,
+        &["zeta-space"],
+        "zeta-space",
+        1,
+        2,
+        &["zeta", "yuki-zeta"],
+        &[&zeta_account, yuki_zeta_account],
+        &[zeta_base, "zeta-space/yuki-step-2"],
+    );
+    assert_cli_state_for_username(
+        &shared_db,
+        "bob-alpha",
+        &["alpha-space", "zeta-space"],
+        "alpha-space",
+        3,
+        3,
+        &["alpha", "bob-alpha", "carol-alpha"],
+        &[&alpha_account, bob_alpha_account, carol_alpha_account],
+        &[
+            alpha_base,
+            "alpha-space/bob-step-2",
+            "alpha-space/carol-step-3",
+        ],
+    );
+    assert_cli_state_for_username(
+        &shared_db,
+        "carol-alpha",
+        &["alpha-space", "zeta-space"],
+        "alpha-space",
+        3,
+        3,
+        &["alpha", "bob-alpha", "carol-alpha"],
+        &[&alpha_account, bob_alpha_account, carol_alpha_account],
+        &[
+            alpha_base,
+            "alpha-space/bob-step-2",
+            "alpha-space/carol-step-3",
+        ],
+    );
+    assert_cli_state_for_username(
+        &shared_db,
+        "yuki-zeta",
+        &["alpha-space", "zeta-space"],
+        "zeta-space",
+        3,
+        2,
+        &["zeta", "yuki-zeta"],
+        &[&zeta_account, yuki_zeta_account],
+        &[zeta_base, "zeta-space/yuki-step-2"],
+    );
+
+    use_tenant_for_username(&shared_db, "yuki-zeta");
+    let yuki_view = get_view_raw(&shared_db);
+    assert!(
+        !yuki_view.contains("alpha-space/bob-step-2")
+            && !yuki_view.contains("alpha-space/carol-step-3"),
+        "zeta tenant view should not leak alpha workspace messages:\n{}",
+        yuki_view
     );
 }
 
@@ -1711,9 +2543,7 @@ fn test_cli_connect_to_dead_address_error() {
     std::thread::sleep(Duration::from_secs(35));
 
     // Stop daemon.
-    let _ = Command::new(bin())
-        .args(["--db", &db_b, "stop"])
-        .output();
+    let _ = Command::new(bin()).args(["--db", &db_b, "stop"]).output();
     std::thread::sleep(Duration::from_millis(500));
     drop(_daemon_b);
 
@@ -1788,9 +2618,7 @@ fn test_cli_untrusted_peer_certificate_error() {
     std::thread::sleep(Duration::from_secs(8));
 
     // Stop daemons and read logs.
-    let _ = Command::new(bin())
-        .args(["--db", &db_b, "stop"])
-        .output();
+    let _ = Command::new(bin()).args(["--db", &db_b, "stop"]).output();
     std::thread::sleep(Duration::from_millis(500));
     drop(_daemon_b);
 
