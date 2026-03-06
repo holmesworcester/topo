@@ -423,6 +423,7 @@ pub fn socket_path_for_db(db_path: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::transport_creds::{self, CRED_SOURCE_BOOTSTRAP};
     use crate::event_modules::{message, workspace};
 
     fn temp_db_path() -> (tempfile::TempDir, String) {
@@ -578,5 +579,46 @@ mod tests {
             resp.pass,
             "assert_eventually should read from the scoped peer"
         );
+    }
+
+    #[test]
+    fn test_open_db_load_resolves_scoped_peer_with_multiple_local_identities() {
+        let (_dir, db_path) = temp_db_path();
+        let scoped_peer_id = setup_workspace(&db_path);
+
+        let conn = crate::db::open_connection(&db_path).unwrap();
+        crate::db::schema::create_tables(&conn).unwrap();
+
+        // Mirror observed prod shape:
+        // - one scoped peershared identity (from workspace bootstrap)
+        // - one extra bootstrap identity row in local_transport_creds
+        // open_db_load should still resolve the scoped peer.
+        let bootstrap_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let (bootstrap_cert, bootstrap_priv) =
+            crate::transport::generate_self_signed_cert_from_signing_key(&bootstrap_key).unwrap();
+        let bootstrap_fp =
+            crate::transport::extract_spki_fingerprint(bootstrap_cert.as_ref()).unwrap();
+        let bootstrap_peer_id = hex::encode(bootstrap_fp);
+        transport_creds::store_local_creds_with_source(
+            &conn,
+            &bootstrap_peer_id,
+            bootstrap_cert.as_ref(),
+            bootstrap_priv.secret_pkcs8_der(),
+            CRED_SOURCE_BOOTSTRAP,
+        )
+        .unwrap();
+
+        let local_creds_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(local_creds_count, 2, "expected two local identities");
+
+        drop(conn);
+
+        let (resolved_peer_id, _db) = open_db_load(&db_path)
+            .expect("open_db_load should resolve scoped tenant with multiple local identities");
+        assert_eq!(resolved_peer_id, scoped_peer_id);
     }
 }
