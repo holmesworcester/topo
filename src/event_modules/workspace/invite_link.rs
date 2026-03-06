@@ -1,10 +1,9 @@
-use base64::Engine;
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr, SocketAddr, ToSocketAddrs};
 
 use super::identity_ops::{InviteData, InviteType};
-use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
+use crate::crypto::EventId;
 
 const INVITE_PREFIX: &str = "topo://invite/";
 const LINK_PREFIX: &str = "topo://link/";
@@ -71,6 +70,17 @@ impl BootstrapAddress {
                 })
             }
         }
+    }
+
+    /// Encode for the comma-separated addr segment. Uses the same display
+    /// format as `to_bootstrap_addr_string` (port omitted when default).
+    fn to_link_token(&self) -> String {
+        self.to_bootstrap_addr_string()
+    }
+
+    /// Parse one token from the comma-separated addr segment.
+    fn from_link_token(token: &str) -> Result<Self, InviteLinkError> {
+        parse_bootstrap_address(token)
     }
 }
 
@@ -196,17 +206,21 @@ pub enum InviteLinkError {
     Encode(String),
 }
 
-#[derive(Debug, Serialize, Deserialize)]
-struct InviteLinkPayload {
-    version: u8,
-    kind: String,
-    invite_event_id: String,
-    invite_private_key: String,
-    workspace_id: String,
-    user_event_id: Option<String>,
-    bootstrap: Vec<BootstrapAddress>,
-    bootstrap_spki: String,
-}
+// ---------------------------------------------------------------------------
+// Plaintext invite link format (v3)
+//
+// All fields are hex-encoded and slash-delimited with labels. No spaces,
+// no base64 — fully readable and continuously linkifiable.
+//
+// User invite:
+//   topo://invite/v3/user/eid.<hex64>/key.<hex64>/wid.<hex64>/spki.<hex64>/addr.<a1>,<a2>
+//
+// Device-link invite:
+//   topo://link/v3/device_link/eid.<hex64>/key.<hex64>/wid.<hex64>/uid.<hex64>/spki.<hex64>/addr.<a1>,<a2>
+//
+// Address tokens use the same display format as to_bootstrap_addr_string
+// (port omitted when default 4433, IPv6 bracketed).
+// ---------------------------------------------------------------------------
 
 pub fn create_invite_link(
     invite: &InviteData,
@@ -218,60 +232,54 @@ pub fn create_invite_link(
             "at least one bootstrap address is required".to_string(),
         ));
     }
-    let (kind, prefix, user_event_id) = match invite.invite_type {
-        InviteType::User => ("user".to_string(), INVITE_PREFIX, None),
-        InviteType::DeviceLink { user_event_id } => (
-            "device_link".to_string(),
-            LINK_PREFIX,
-            Some(event_id_to_base64(&user_event_id)),
-        ),
-    };
     for addr in bootstrap_addrs {
         addr.validate()?;
     }
 
-    let payload = InviteLinkPayload {
-        version: INVITE_LINK_VERSION,
-        kind,
-        invite_event_id: event_id_to_base64(&invite.invite_event_id),
-        invite_private_key: base64::engine::general_purpose::STANDARD
-            .encode(invite.invite_key.to_bytes()),
-        workspace_id: event_id_to_base64(&invite.workspace_id),
-        user_event_id,
-        bootstrap: bootstrap_addrs.to_vec(),
-        bootstrap_spki: hex::encode(bootstrap_spki),
+    let (prefix, kind_str, user_segment) = match &invite.invite_type {
+        InviteType::User => (INVITE_PREFIX, "user", None),
+        InviteType::DeviceLink { user_event_id } => (
+            LINK_PREFIX,
+            "device_link",
+            Some(format!("/uid.{}", hex::encode(user_event_id))),
+        ),
     };
 
-    let json = serde_json::to_vec(&payload).map_err(|e| InviteLinkError::Encode(e.to_string()))?;
-    let code = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
-    Ok(format!("{}{}", prefix, code))
+    let addr_tokens: Vec<String> = bootstrap_addrs.iter().map(|a| a.to_link_token()).collect();
+
+    Ok(format!(
+        "{prefix}v{ver}/{kind}/eid.{eid}/key.{key}/wid.{wid}{uid}/spki.{spki}/addr.{addrs}",
+        prefix = prefix,
+        ver = INVITE_LINK_VERSION,
+        kind = kind_str,
+        eid = hex::encode(invite.invite_event_id),
+        key = hex::encode(invite.invite_key.to_bytes()),
+        wid = hex::encode(invite.workspace_id),
+        uid = user_segment.as_deref().unwrap_or(""),
+        spki = hex::encode(bootstrap_spki),
+        addrs = addr_tokens.join(","),
+    ))
 }
 
 pub fn parse_invite_link(link: &str) -> Result<ParsedInviteLink, InviteLinkError> {
-    let (kind, code) = if let Some(code) = link.strip_prefix(INVITE_PREFIX) {
-        (InviteLinkKind::User, code)
-    } else if let Some(code) = link.strip_prefix(LINK_PREFIX) {
-        (InviteLinkKind::DeviceLink, code)
+    let (kind, rest) = if let Some(rest) = link.strip_prefix(INVITE_PREFIX) {
+        (InviteLinkKind::User, rest)
+    } else if let Some(rest) = link.strip_prefix(LINK_PREFIX) {
+        (InviteLinkKind::DeviceLink, rest)
     } else {
         return Err(InviteLinkError::InvalidPrefix);
     };
 
-    let payload_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(code)
-        .map_err(|e| InviteLinkError::Decode(e.to_string()))?;
-    let payload: InviteLinkPayload = serde_json::from_slice(&payload_json)
-        .map_err(|e| InviteLinkError::Decode(e.to_string()))?;
-    let InviteLinkPayload {
-        version,
-        kind: payload_kind,
-        invite_event_id: invite_event_id_b64,
-        invite_private_key: invite_private_key_b64,
-        workspace_id: workspace_id_b64,
-        user_event_id,
-        bootstrap,
-        bootstrap_spki,
-    } = payload;
+    let segments: Vec<&str> = rest.split('/').collect();
 
+    // First segment: version
+    let version_str = segments
+        .first()
+        .ok_or_else(|| InviteLinkError::Decode("missing version".to_string()))?;
+    let version: u8 = version_str
+        .strip_prefix('v')
+        .and_then(|v| v.parse().ok())
+        .ok_or_else(|| InviteLinkError::Decode(format!("bad version: {}", version_str)))?;
     if version != INVITE_LINK_VERSION {
         return Err(InviteLinkError::InvalidPayload(format!(
             "unsupported version {}",
@@ -279,51 +287,69 @@ pub fn parse_invite_link(link: &str) -> Result<ParsedInviteLink, InviteLinkError
         )));
     }
 
-    let invite_event_id = event_id_from_base64(&invite_event_id_b64)
-        .ok_or_else(|| InviteLinkError::InvalidPayload("bad invite_event_id".to_string()))?;
-    let workspace_id = event_id_from_base64(&workspace_id_b64)
-        .ok_or_else(|| InviteLinkError::InvalidPayload("bad workspace_id".to_string()))?;
+    // Second segment: kind
+    let payload_kind = segments
+        .get(1)
+        .ok_or_else(|| InviteLinkError::Decode("missing kind".to_string()))?;
 
-    let key_bytes = base64::engine::general_purpose::STANDARD
-        .decode(invite_private_key_b64.as_bytes())
-        .map_err(|e| InviteLinkError::Decode(e.to_string()))?;
-    if key_bytes.len() != 32 {
-        return Err(InviteLinkError::InvalidPayload(format!(
-            "invite_private_key must be 32 bytes, got {}",
-            key_bytes.len()
-        )));
-    }
-    let mut invite_private_key = [0u8; 32];
-    invite_private_key.copy_from_slice(&key_bytes);
+    // Remaining segments are labeled key.value pairs
+    let labeled: Vec<&str> = segments[2..].to_vec();
 
-    let spki_bytes =
-        hex::decode(bootstrap_spki).map_err(|e| InviteLinkError::Decode(e.to_string()))?;
-    if spki_bytes.len() != 32 {
-        return Err(InviteLinkError::InvalidPayload(format!(
-            "bootstrap_spki must be 32 bytes, got {}",
-            spki_bytes.len()
-        )));
-    }
-    let mut bootstrap_spki_fingerprint = [0u8; 32];
-    bootstrap_spki_fingerprint.copy_from_slice(&spki_bytes);
+    let find_field = |prefix: &str| -> Option<&str> {
+        labeled
+            .iter()
+            .find_map(|s| s.strip_prefix(prefix).map(|v| v))
+    };
 
-    if bootstrap.is_empty() {
+    let require_hex32 = |prefix: &str, label: &str| -> Result<[u8; 32], InviteLinkError> {
+        let hex_str = find_field(prefix).ok_or_else(|| {
+            InviteLinkError::Decode(format!("missing {}", label))
+        })?;
+        let bytes =
+            hex::decode(hex_str).map_err(|e| InviteLinkError::Decode(format!("{}: {}", label, e)))?;
+        if bytes.len() != 32 {
+            return Err(InviteLinkError::InvalidPayload(format!(
+                "{} must be 32 bytes, got {}",
+                label,
+                bytes.len()
+            )));
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&bytes);
+        Ok(arr)
+    };
+
+    let invite_event_id = require_hex32("eid.", "invite_event_id")?;
+    let invite_private_key = require_hex32("key.", "invite_private_key")?;
+    let workspace_id = require_hex32("wid.", "workspace_id")?;
+    let bootstrap_spki_fingerprint = require_hex32("spki.", "bootstrap_spki")?;
+
+    // Addresses
+    let addr_str = find_field("addr.").ok_or_else(|| {
+        InviteLinkError::Decode("missing addr".to_string())
+    })?;
+    if addr_str.is_empty() {
         return Err(InviteLinkError::InvalidPayload(
             "at least one bootstrap address is required".to_string(),
         ));
     }
-    for addr in &bootstrap {
+    let bootstrap_addrs: Vec<BootstrapAddress> = addr_str
+        .split(',')
+        .map(|t| BootstrapAddress::from_link_token(t))
+        .collect::<Result<Vec<_>, _>>()?;
+    if bootstrap_addrs.is_empty() {
+        return Err(InviteLinkError::InvalidPayload(
+            "at least one bootstrap address is required".to_string(),
+        ));
+    }
+    for addr in &bootstrap_addrs {
         addr.validate()?;
     }
 
-    let invite_type = match (kind, payload_kind.as_str()) {
+    let invite_type = match (kind, *payload_kind) {
         (InviteLinkKind::User, "user") => InviteType::User,
         (InviteLinkKind::DeviceLink, "device_link") => {
-            let user_event_b64 = user_event_id.ok_or_else(|| {
-                InviteLinkError::InvalidPayload("device_link missing user_event_id".to_string())
-            })?;
-            let user_event_id = event_id_from_base64(&user_event_b64)
-                .ok_or_else(|| InviteLinkError::InvalidPayload("bad user_event_id".to_string()))?;
+            let user_event_id = require_hex32("uid.", "user_event_id")?;
             InviteType::DeviceLink { user_event_id }
         }
         (InviteLinkKind::User, other) => {
@@ -346,7 +372,7 @@ pub fn parse_invite_link(link: &str) -> Result<ParsedInviteLink, InviteLinkError
         invite_private_key,
         workspace_id,
         invite_type,
-        bootstrap_addrs: bootstrap,
+        bootstrap_addrs,
         bootstrap_spki_fingerprint,
     })
 }
@@ -357,27 +383,17 @@ pub fn rewrite_bootstrap_addrs(
     link: &str,
     new_addrs: &[BootstrapAddress],
 ) -> Result<String, InviteLinkError> {
-    let (prefix, code) = if let Some(code) = link.strip_prefix(INVITE_PREFIX) {
-        (INVITE_PREFIX, code)
-    } else if let Some(code) = link.strip_prefix(LINK_PREFIX) {
-        (LINK_PREFIX, code)
-    } else {
-        return Err(InviteLinkError::InvalidPrefix);
-    };
-
-    let payload_json = base64::engine::general_purpose::URL_SAFE_NO_PAD
-        .decode(code)
-        .map_err(|e| InviteLinkError::Decode(e.to_string()))?;
-    let mut payload: InviteLinkPayload = serde_json::from_slice(&payload_json)
-        .map_err(|e| InviteLinkError::Decode(e.to_string()))?;
+    let parsed = parse_invite_link(link)?;
     for addr in new_addrs {
         addr.validate()?;
     }
-    payload.bootstrap = new_addrs.to_vec();
-
-    let json = serde_json::to_vec(&payload).map_err(|e| InviteLinkError::Encode(e.to_string()))?;
-    let new_code = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json);
-    Ok(format!("{}{}", prefix, new_code))
+    let invite_data = InviteData {
+        invite_event_id: parsed.invite_event_id,
+        invite_key: SigningKey::from_bytes(&parsed.invite_private_key),
+        workspace_id: parsed.workspace_id,
+        invite_type: parsed.invite_type,
+    };
+    create_invite_link(&invite_data, new_addrs, &parsed.bootstrap_spki_fingerprint)
 }
 
 /// Detect non-loopback IPv4/IPv6 addresses on this machine, suitable for
@@ -431,6 +447,13 @@ mod tests {
         let bootstrap_spki = [4u8; 32];
         let link = create_invite_link(&invite, &bootstrap_addrs, &bootstrap_spki).unwrap();
         assert!(link.starts_with(INVITE_PREFIX));
+        // Verify plaintext fields are visible
+        assert!(link.contains("/eid."));
+        assert!(link.contains("/key."));
+        assert!(link.contains("/wid."));
+        assert!(link.contains("/spki."));
+        assert!(link.contains("/addr."));
+        assert!(!link.contains(' '));
 
         let parsed = parse_invite_link(&link).unwrap();
         assert_eq!(parsed.kind, InviteLinkKind::User);
@@ -495,6 +518,7 @@ mod tests {
         let bootstrap_spki = [8u8; 32];
         let link = create_invite_link(&invite, &bootstrap_addrs, &bootstrap_spki).unwrap();
         assert!(link.starts_with(LINK_PREFIX));
+        assert!(link.contains("/uid."));
 
         let parsed = parse_invite_link(&link).unwrap();
         assert_eq!(parsed.kind, InviteLinkKind::DeviceLink);
@@ -678,5 +702,32 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn test_plaintext_link_is_readable() {
+        let invite = InviteData {
+            invite_event_id: [0xaa; 32],
+            invite_key: SigningKey::from_bytes(&[0xbb; 32]),
+            workspace_id: [0xcc; 32],
+            invite_type: InviteType::User,
+        };
+        let addrs = vec![BootstrapAddress::Ipv4 {
+            ip: "192.168.1.1".parse().unwrap(),
+            port: 4433,
+        }];
+        let spki = [0xdd; 32];
+        let link = create_invite_link(&invite, &addrs, &spki).unwrap();
+
+        // The link should contain readable hex for all fields
+        assert!(link.contains(&hex::encode([0xaa; 32])));
+        assert!(link.contains(&hex::encode([0xbb; 32])));
+        assert!(link.contains(&hex::encode([0xcc; 32])));
+        assert!(link.contains(&hex::encode([0xdd; 32])));
+        assert!(link.contains("192.168.1.1"));
+        // No spaces anywhere
+        assert!(!link.contains(' '));
+        // No base64 padding characters
+        assert!(!link.contains('='));
     }
 }

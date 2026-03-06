@@ -1153,7 +1153,7 @@ Self-invite bootstrap sequence must stay explicit:
 
 Use `poc-6` as reference behavior for end-to-end test setup:
 1. Alice creates workspace + identity chain via high-level bootstrap API.
-2. Alice creates invite link (contains bootstrap address + inviter SPKI fingerprint + invite event ID + invite private key + workspace ID). Wrapped content-key material is delivered via `key_shared` events during bootstrap sync, not embedded in the invite link payload.
+2. Alice creates invite link in plaintext format (all fields hex-encoded, slash-delimited, labeled — see DESIGN.md §9.2 "Invite link wire format"). Contains bootstrap address, inviter SPKI fingerprint, invite event ID, invite private key, and workspace ID. Wrapped content-key material is delivered via `key_shared` events during bootstrap sync, not embedded in the invite link payload.
 3. Bob accepts invite link via high-level accept API:
    - records local `invite_accepted`,
    - writes accepted-workspace binding (`workspace_id`),

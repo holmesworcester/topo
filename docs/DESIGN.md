@@ -1467,6 +1467,22 @@ We do not use multimodal `invite(mode=...)` type (even though it would be DRY) b
 Implementation uses shared invite helper logic with per-type policy tables.
 Interactive CLI keeps real invite links (`topo://invite/...`, `topo://link/...`) in frontend state; session-local invite numbers are aliases to those links.
 
+### Invite link wire format (v3, plaintext)
+
+Invite links use a plaintext, slash-delimited, hex-encoded format. All fields are labeled for readability and the link contains no spaces or characters that break URL selection (continuously linkifiable). This is intentional for debugging — all data (addresses, workspace ID, keys, SPKI fingerprint) is visible in the link itself.
+
+User invite:
+```
+topo://invite/v3/user/eid.<hex64>/key.<hex64>/wid.<hex64>/spki.<hex64>/addr.<a1>,<a2>
+```
+
+Device-link invite:
+```
+topo://link/v3/device_link/eid.<hex64>/key.<hex64>/wid.<hex64>/uid.<hex64>/spki.<hex64>/addr.<a1>,<a2>
+```
+
+Field labels: `eid` = invite event ID, `key` = invite private key, `wid` = workspace ID, `uid` = user event ID (device-link only), `spki` = bootstrap SPKI fingerprint. All ID/key fields are 32-byte hex (64 hex chars). Address tokens use the same display format as `to_bootstrap_addr_string` (port omitted when default 4433, IPv6 bracketed), comma-separated.
+
 ## 9.3 Accepted-workspace cascade
 
 `invite_accepted` records accepted-workspace binding rows for `workspace_id` in tenant scope (`invites_accepted`).
