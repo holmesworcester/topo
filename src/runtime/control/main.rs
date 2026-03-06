@@ -538,6 +538,9 @@ enum Commands {
     /// Attempt UPnP port forwarding for the daemon's QUIC listen port.
     /// Requires daemon listening on non-loopback (for example `--bind 0.0.0.0:...`).
     Upnp,
+
+    /// Reset all local state: stop daemon, delete DB and socket files
+    Reset,
 }
 
 #[derive(Subcommand)]
@@ -2340,6 +2343,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 other => {
                     println!("upnp: {}", other);
                 }
+            }
+        }
+
+        Commands::Reset => {
+            let socket_path = socket_override
+                .as_ref()
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| service::socket_path_for_db(db));
+
+            // Try to stop the daemon if running
+            if socket_path.exists() {
+                print!("stopping daemon... ");
+                let request_deadline = Instant::now() + Duration::from_secs(5);
+                loop {
+                    match rpc_call(&socket_path, RpcMethod::Shutdown) {
+                        Ok(_) => break,
+                        Err(RpcClientError::DaemonNotRunning(_)) if !socket_path.exists() => break,
+                        Err(RpcClientError::DaemonNotRunning(_)) => {}
+                        Err(RpcClientError::Protocol(msg))
+                            if msg.contains("Connection reset by peer")
+                                || msg.contains("Broken pipe") =>
+                        {
+                            break;
+                        }
+                        Err(RpcClientError::Io(e))
+                            if e.kind() == std::io::ErrorKind::ConnectionReset
+                                || e.kind() == std::io::ErrorKind::ConnectionRefused
+                                || e.kind() == std::io::ErrorKind::BrokenPipe =>
+                        {
+                            break;
+                        }
+                        Err(e) => {
+                            eprintln!("warning: error stopping daemon: {}", e);
+                            break;
+                        }
+                    }
+                    if Instant::now() >= request_deadline {
+                        eprintln!("warning: timed out stopping daemon");
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+
+                // Wait for daemon to fully exit
+                let down_deadline = Instant::now() + Duration::from_secs(5);
+                while socket_path.exists() && Instant::now() < down_deadline {
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                println!("done");
+            }
+
+            // Delete DB file and associated WAL/SHM files, plus socket
+            let db_path = Path::new(db);
+            let mut deleted = Vec::new();
+            for path in [
+                db_path.to_path_buf(),
+                db_path.with_extension("db-wal"),
+                db_path.with_extension("db-shm"),
+                socket_path.clone(),
+            ] {
+                if path.exists() {
+                    match std::fs::remove_file(&path) {
+                        Ok(_) => deleted.push(path.display().to_string()),
+                        Err(e) => eprintln!("warning: failed to delete {}: {}", path.display(), e),
+                    }
+                }
+            }
+
+            if deleted.is_empty() {
+                println!("nothing to clean up");
+            } else {
+                for f in &deleted {
+                    println!("deleted {}", f);
+                }
+                println!("reset complete");
             }
         }
     }
