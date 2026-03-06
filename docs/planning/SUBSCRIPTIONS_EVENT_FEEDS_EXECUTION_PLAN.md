@@ -159,13 +159,18 @@ Add RPC methods:
 7. `SubscribeState { subscription_id }` (for has_changed counters/cursor)
 
 CLI commands mirroring RPC (React-isomorphic pull model):
-1. `topo sub-create --name inbox --event-type message --delivery full --since-ms <ms>`
-2. `topo sub-create --name changed --event-type message --delivery has_changed --since-event-id <id>`
-3. `topo sub-list`
-4. `topo sub-poll --sub <id> --limit 50 --json`
-5. `topo sub-state --sub <id> --json`
-6. `topo sub-ack --sub <id> --through-seq <n>`
-7. `topo sub-disable --sub <id>` / `topo sub-enable --sub <id>`
+1. `topo sub create --name inbox --event-type message --delivery full --since-ms <ms>`
+2. `topo sub create --name changed --event-type message --delivery has_changed --since-event-id <id>`
+3. `topo sub list` (or `topo subs list`)
+4. `topo sub poll <selector> --limit 50 --json`
+5. `topo sub state <selector> --json`
+6. `topo sub ack <selector> --through-seq <n>`
+7. `topo sub disable <selector>` / `topo sub enable <selector>`
+
+Selector semantics:
+- `<selector>` can be subscription id, exact subscription name, or index (`N` / `#N` from `topo sub list`).
+- For `poll/state/ack/disable/enable`, selector may be omitted when exactly one subscription exists.
+- Legacy `sub-*` and `--sub` forms are still accepted but deprecated.
 
 React mapping:
 - frontend keeps local cursor per subscription,
@@ -239,8 +244,7 @@ Scenarios:
 ## Daemon log output for subscription matches
 
 When the daemon has active subscriptions, the projection hook emits `tracing::info!`
-lines for every subscription match — giving real-time visibility into the subscription
-engine directly in `topo start` output.
+lines for every subscription match.
 
 Format:
 ```
@@ -252,6 +256,9 @@ This fires at the same point the feed row / state update is written, so the log 
 exactly what a polling consumer would see, with no additional overhead. For `full`/`id`
 modes the log includes event type, subscription name, short event ID, and seq number.
 For `has_changed` mode it shows the updated pending count.
+
+Operational note: default `topo start` log level is WARN. Subscription match lines are
+`INFO`, so they appear only when running with `RUST_LOG=info` (or `debug`/`trace`).
 
 Implementation: a single `tracing::info!` call in the subscription hook's match-dispatch
 path, immediately after the feed/state write. No extra machinery required.
