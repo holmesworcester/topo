@@ -122,8 +122,8 @@ impl PinnedCertVerifier {
                 // Cap tracked fingerprints to prevent unbounded memory growth
                 // from unauthenticated traffic presenting novel certs.
                 if map.len() >= 1024 && !map.contains_key(&fp) {
-                    // At capacity with a new fingerprint — log without tracking.
-                    1
+                    // At capacity — suppress logging for untracked fingerprints.
+                    u64::MAX
                 } else {
                     let entry = map.entry(fp).or_insert(0);
                     *entry += 1;

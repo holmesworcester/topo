@@ -1584,6 +1584,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let manager_shutdown_flag = shutdown.clone();
             let manager_db = db.to_string();
             let fatal_shutdown = shutdown_notify.clone();
+            let fatal_error = Arc::new(AtomicBool::new(false));
+            let fatal_error_flag = fatal_error.clone();
             let runtime_manager = tokio::spawn(async move {
                 if let Err(e) = run_runtime_manager(
                     &manager_db,
@@ -1597,6 +1599,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 {
                     tracing::error!("runtime manager error: {}", e);
                     // Non-retriable runtime failure — shut down the daemon.
+                    fatal_error_flag.store(true, Ordering::Relaxed);
                     fatal_shutdown.notify_waiters();
                 }
             });
@@ -1609,6 +1612,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             shutdown_notify.notify_waiters();
             let _ = runtime_manager.await;
             let _ = rpc_handle.join();
+
+            if fatal_error.load(Ordering::Relaxed) {
+                return Err("daemon exiting due to non-retriable runtime error".into());
+            }
 
             info!("\u{1f42d} Topo daemon shut down cleanly");
         }
