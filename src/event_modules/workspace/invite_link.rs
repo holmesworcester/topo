@@ -7,7 +7,7 @@ use crate::crypto::EventId;
 
 const INVITE_PREFIX: &str = "topo://invite/";
 const LINK_PREFIX: &str = "topo://link/";
-const INVITE_LINK_VERSION: u8 = 3;
+const INVITE_LINK_VERSION: u8 = 4;
 
 /// Default QUIC sync port — omitted from display strings when matched.
 pub const DEFAULT_PORT: u16 = 4433;
@@ -207,16 +207,16 @@ pub enum InviteLinkError {
 }
 
 // ---------------------------------------------------------------------------
-// Plaintext invite link format (v3)
+// Plaintext invite link format (v4)
 //
-// All fields are hex-encoded and slash-delimited with labels. No spaces,
-// no base64 — fully readable and continuously linkifiable.
+// All fields are hex-encoded and slash-delimited with self-explanatory labels.
+// No spaces, no base64 — fully readable and continuously linkifiable.
 //
 // User invite:
-//   topo://invite/v3/user/eid.<hex64>/key.<hex64>/wid.<hex64>/spki.<hex64>/addr.<a1>,<a2>
+//   topo://invite/v4/user/INVITE_ID.<hex64>/INVITE_PRIVKEY.<hex64>/WORKSPACE.<hex64>/PEER_SPKI_PUBKEY.<hex64>/ADDRESS.<a1>,<a2>
 //
 // Device-link invite:
-//   topo://link/v3/device_link/eid.<hex64>/key.<hex64>/wid.<hex64>/uid.<hex64>/spki.<hex64>/addr.<a1>,<a2>
+//   topo://link/v4/device_link/INVITE_ID.<hex64>/INVITE_PRIVKEY.<hex64>/WORKSPACE.<hex64>/USER_ID.<hex64>/PEER_SPKI_PUBKEY.<hex64>/ADDRESS.<a1>,<a2>
 //
 // Address tokens use the same display format as to_bootstrap_addr_string
 // (port omitted when default 4433, IPv6 bracketed).
@@ -241,14 +241,14 @@ pub fn create_invite_link(
         InviteType::DeviceLink { user_event_id } => (
             LINK_PREFIX,
             "device_link",
-            Some(format!("/uid.{}", hex::encode(user_event_id))),
+            Some(format!("/USER_ID.{}", hex::encode(user_event_id))),
         ),
     };
 
     let addr_tokens: Vec<String> = bootstrap_addrs.iter().map(|a| a.to_link_token()).collect();
 
     Ok(format!(
-        "{prefix}v{ver}/{kind}/eid.{eid}/key.{key}/wid.{wid}{uid}/spki.{spki}/addr.{addrs}",
+        "{prefix}v{ver}/{kind}/INVITE_ID.{eid}/INVITE_PRIVKEY.{key}/WORKSPACE.{wid}{uid}/PEER_SPKI_PUBKEY.{spki}/ADDRESS.{addrs}",
         prefix = prefix,
         ver = INVITE_LINK_VERSION,
         kind = kind_str,
@@ -302,11 +302,10 @@ pub fn parse_invite_link(link: &str) -> Result<ParsedInviteLink, InviteLinkError
     };
 
     let require_hex32 = |prefix: &str, label: &str| -> Result<[u8; 32], InviteLinkError> {
-        let hex_str = find_field(prefix).ok_or_else(|| {
-            InviteLinkError::Decode(format!("missing {}", label))
-        })?;
-        let bytes =
-            hex::decode(hex_str).map_err(|e| InviteLinkError::Decode(format!("{}: {}", label, e)))?;
+        let hex_str = find_field(prefix)
+            .ok_or_else(|| InviteLinkError::Decode(format!("missing {}", label)))?;
+        let bytes = hex::decode(hex_str)
+            .map_err(|e| InviteLinkError::Decode(format!("{}: {}", label, e)))?;
         if bytes.len() != 32 {
             return Err(InviteLinkError::InvalidPayload(format!(
                 "{} must be 32 bytes, got {}",
@@ -319,15 +318,14 @@ pub fn parse_invite_link(link: &str) -> Result<ParsedInviteLink, InviteLinkError
         Ok(arr)
     };
 
-    let invite_event_id = require_hex32("eid.", "invite_event_id")?;
-    let invite_private_key = require_hex32("key.", "invite_private_key")?;
-    let workspace_id = require_hex32("wid.", "workspace_id")?;
-    let bootstrap_spki_fingerprint = require_hex32("spki.", "bootstrap_spki")?;
+    let invite_event_id = require_hex32("INVITE_ID.", "invite_event_id")?;
+    let invite_private_key = require_hex32("INVITE_PRIVKEY.", "invite_private_key")?;
+    let workspace_id = require_hex32("WORKSPACE.", "workspace_id")?;
+    let bootstrap_spki_fingerprint = require_hex32("PEER_SPKI_PUBKEY.", "bootstrap_spki")?;
 
     // Addresses
-    let addr_str = find_field("addr.").ok_or_else(|| {
-        InviteLinkError::Decode("missing addr".to_string())
-    })?;
+    let addr_str = find_field("ADDRESS.")
+        .ok_or_else(|| InviteLinkError::Decode("missing ADDRESS".to_string()))?;
     if addr_str.is_empty() {
         return Err(InviteLinkError::InvalidPayload(
             "at least one bootstrap address is required".to_string(),
@@ -349,7 +347,7 @@ pub fn parse_invite_link(link: &str) -> Result<ParsedInviteLink, InviteLinkError
     let invite_type = match (kind, *payload_kind) {
         (InviteLinkKind::User, "user") => InviteType::User,
         (InviteLinkKind::DeviceLink, "device_link") => {
-            let user_event_id = require_hex32("uid.", "user_event_id")?;
+            let user_event_id = require_hex32("USER_ID.", "user_event_id")?;
             InviteType::DeviceLink { user_event_id }
         }
         (InviteLinkKind::User, other) => {
@@ -448,11 +446,11 @@ mod tests {
         let link = create_invite_link(&invite, &bootstrap_addrs, &bootstrap_spki).unwrap();
         assert!(link.starts_with(INVITE_PREFIX));
         // Verify plaintext fields are visible
-        assert!(link.contains("/eid."));
-        assert!(link.contains("/key."));
-        assert!(link.contains("/wid."));
-        assert!(link.contains("/spki."));
-        assert!(link.contains("/addr."));
+        assert!(link.contains("/INVITE_ID."));
+        assert!(link.contains("/INVITE_PRIVKEY."));
+        assert!(link.contains("/WORKSPACE."));
+        assert!(link.contains("/PEER_SPKI_PUBKEY."));
+        assert!(link.contains("/ADDRESS."));
         assert!(!link.contains(' '));
 
         let parsed = parse_invite_link(&link).unwrap();
@@ -518,7 +516,7 @@ mod tests {
         let bootstrap_spki = [8u8; 32];
         let link = create_invite_link(&invite, &bootstrap_addrs, &bootstrap_spki).unwrap();
         assert!(link.starts_with(LINK_PREFIX));
-        assert!(link.contains("/uid."));
+        assert!(link.contains("/USER_ID."));
 
         let parsed = parse_invite_link(&link).unwrap();
         assert_eq!(parsed.kind, InviteLinkKind::DeviceLink);
@@ -553,7 +551,10 @@ mod tests {
         let link = create_invite_link(&invite, &addrs, &bootstrap_spki).unwrap();
         let parsed = parse_invite_link(&link).unwrap();
         assert_eq!(parsed.bootstrap_addrs, addrs);
-        assert_eq!(parsed.bootstrap_addr_strings(), vec!["[2001:4860:4860::8888]"]);
+        assert_eq!(
+            parsed.bootstrap_addr_strings(),
+            vec!["[2001:4860:4860::8888]"]
+        );
     }
 
     #[test]
