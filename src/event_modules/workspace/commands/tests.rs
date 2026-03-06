@@ -115,9 +115,11 @@ fn create_workspace_for_db_scopes_to_existing_transport_identity_when_workspace_
     );
     assert!(!resp.peer_id.is_empty(), "peer id should be populated");
 
-    // Resulting transport identity should be the active local identity after create.
+    // Resulting tenant scope should resolve to the created peer identity even
+    // when multiple local transport creds exist.
     let conn2 = crate::db::open_connection(&db_path).expect("re-open db");
-    let loaded_peer_id =
-        crate::transport::identity::load_transport_peer_id(&conn2).expect("load peer id");
-    assert_eq!(loaded_peer_id, resp.peer_id);
+    let tenants =
+        crate::db::transport_creds::discover_local_tenants(&conn2).expect("discover tenants");
+    assert_eq!(tenants.len(), 1, "exactly one tenant scope should resolve");
+    assert_eq!(tenants[0].peer_id, resp.peer_id);
 }

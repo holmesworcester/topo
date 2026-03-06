@@ -619,12 +619,15 @@ fn dispatch(
             }
             Err(e) => RpcResponse::error(e.to_string()),
         },
-        RpcMethod::Messages { limit } => match service::open_db_load(db_path) {
-            Ok((recorded_by, db)) => match message::list(&db, &recorded_by, limit) {
-                Ok(data) => RpcResponse::success(data),
+        RpcMethod::Messages { limit } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => match message::list(&db, &recorded_by, limit) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
                 Err(e) => RpcResponse::error(e.to_string()),
             },
-            Err(e) => RpcResponse::error(e.to_string()),
+            Err(e) => RpcResponse::error(e),
         },
         RpcMethod::Status => {
             let with_runtime_state = |data: workspace::StatusResponse| {

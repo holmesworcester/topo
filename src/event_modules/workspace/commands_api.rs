@@ -104,16 +104,35 @@ pub fn create_workspace_for_db(
     username: &str,
     device_name: &str,
 ) -> Result<CreateWorkspaceResponse, Box<dyn std::error::Error + Send + Sync>> {
-    use crate::db::{open_connection, schema::create_tables};
+    use crate::db::{
+        open_connection,
+        schema::create_tables,
+        transport_creds::discover_local_tenants,
+    };
     use crate::transport::identity::load_transport_peer_id;
 
     let conn = open_connection(db_path)?;
     create_tables(&conn)?;
 
+    let resolve_single_scoped_tenant =
+        |conn: &Connection| -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+            let tenants = discover_local_tenants(conn)?;
+            match tenants.len() {
+                0 => Ok(None),
+                1 => Ok(Some(tenants[0].peer_id.clone())),
+                n => Err(format!(
+                    "multiple tenant scopes found ({}); run `topo tenants` and `topo use-tenant <N>`",
+                    n
+                )
+                .into()),
+            }
+        };
+
     let mut create_scope: Option<String> = None;
 
-    // Check if identity already exists
-    if let Ok(peer_id) = load_transport_peer_id(&conn) {
+    // Preferred scope source: accepted tenant bindings + transport identity join.
+    // This remains stable even when local_transport_creds has >1 rows.
+    if let Some(peer_id) = resolve_single_scoped_tenant(&conn)? {
         create_scope = Some(peer_id.clone());
         // Already bootstrapped — return existing workspace info
         let workspaces = super::list_items(&conn, &peer_id)?;
@@ -123,6 +142,9 @@ pub fn create_workspace_for_db(
                 workspace_id: ws.event_id.clone(),
             });
         }
+    } else if let Ok(peer_id) = load_transport_peer_id(&conn) {
+        // Transitional pre-workspace fallback: exactly one local transport identity.
+        create_scope = Some(peer_id);
     }
 
     // Bootstrap new identity chain via workspace command API.
@@ -130,9 +152,13 @@ pub fn create_workspace_for_db(
     // all events under it, so no finalize_identity rewrite is needed.
     let recorded_by = create_scope.as_deref().unwrap_or("bootstrap");
     let _result = create_workspace(&conn, recorded_by, workspace_name, username, device_name)?;
-    let derived =
-        load_transport_peer_id(&conn).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("load transport peer id failed: {}", e).into()
+
+    // After create, prefer tenant-scoped resolution. This handles the normal
+    // bootstrap shape where both bootstrap + peershared creds may exist.
+    let derived = resolve_single_scoped_tenant(&conn)?
+        .or(create_scope)
+        .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
+            "failed to resolve tenant identity after create_workspace".into()
         })?;
 
     let workspaces = super::list_items(&conn, &derived)?;

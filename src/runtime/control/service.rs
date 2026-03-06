@@ -78,19 +78,10 @@ pub fn open_db_load(
 ) -> Result<(String, rusqlite::Connection), Box<dyn std::error::Error + Send + Sync>> {
     let conn = open_connection(db_path)?;
     create_tables(&conn)?;
-    let transport_peer_id = load_transport_peer_id(&conn)?;
 
-    let has_scope: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM invites_accepted WHERE recorded_by = ?1",
-        rusqlite::params![&transport_peer_id],
-        |row| row.get(0),
-    )?;
-    if has_scope {
-        return Ok((transport_peer_id, conn));
-    }
-
-    // POC fallback for non-finalized identity state: if exactly one scoped peer exists,
-    // use it as the event/projection tenant.
+    // Prefer tenant scope resolution from projection state. This remains stable
+    // even when local_transport_creds has multiple rows (bootstrap + peershared,
+    // or true multi-tenant).
     let scoped_peers: Vec<String> = {
         let mut stmt =
             conn.prepare("SELECT DISTINCT recorded_by FROM invites_accepted ORDER BY recorded_by")?;
@@ -103,17 +94,13 @@ pub fn open_db_load(
     if scoped_peers.len() == 1 {
         return Ok((scoped_peers[0].clone(), conn));
     }
-    if scoped_peers.is_empty() {
-        // Fresh DB / pre-workspace state: allow read paths to boot using
-        // transport identity even before tenant-scoped accepted bindings exist.
-        return Ok((transport_peer_id, conn));
+    if scoped_peers.len() > 1 {
+        return Err("no active tenant — run `topo use-tenant <N>`".into());
     }
 
-    Err(format!(
-        "No unambiguous scoped tenant for transport peer_id {}; run `topo use-peer <N>`",
-        transport_peer_id
-    )
-    .into())
+    // Fresh DB / pre-workspace state: fall back to singleton transport identity.
+    let transport_peer_id = load_transport_peer_id(&conn)?;
+    Ok((transport_peer_id, conn))
 }
 
 /// Open DB for a specific peer_id (used when daemon provides the active peer).

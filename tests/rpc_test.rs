@@ -289,6 +289,71 @@ fn daemon_and_cli_send_and_messages() {
 }
 
 #[test]
+fn daemon_messages_and_create_workspace_are_idempotent_with_multi_identity_rows() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    // First bootstrap workspace.
+    create_workspace(&db);
+
+    let conn = topo::db::open_connection(&db).unwrap();
+    let (extra_cert, extra_key) = topo::transport::generate_self_signed_cert().unwrap();
+    let extra_fp = topo::transport::extract_spki_fingerprint(extra_cert.as_ref()).unwrap();
+    let extra_peer_id = hex::encode(extra_fp);
+    topo::db::transport_creds::store_local_creds(
+        &conn,
+        &extra_peer_id,
+        extra_cert.as_ref(),
+        extra_key.secret_pkcs8_der(),
+    )
+    .unwrap();
+    let local_creds_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
+            row.get(0)
+        })
+        .unwrap();
+    assert!(
+        local_creds_count >= 2,
+        "expected multi-identity shape after inserting extra cred, got {}",
+        local_creds_count
+    );
+    drop(conn);
+
+    let _daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket);
+
+    // Regression 1: create-workspace should be idempotent, not fail on
+    // "Multiple local identities found".
+    let out = Command::new(bin())
+        .args(["--db", &db, "create-workspace"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "second create-workspace should succeed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Regression 2: messages should use active tenant scope and succeed.
+    let out = Command::new(bin())
+        .args(["--db", &db, "messages"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "messages should succeed in multi-identity DB: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+#[test]
 fn daemon_and_cli_assert_now() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);

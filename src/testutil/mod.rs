@@ -49,7 +49,7 @@ use crate::projection::create::{
     create_encrypted_event_synchronous, create_event_staged, create_event_synchronous,
     create_signed_event_staged, create_signed_event_synchronous, CreateEventError,
 };
-use crate::transport::identity::{ensure_transport_cert, ensure_transport_peer_id};
+use crate::transport::identity::{ensure_transport_peer_id, load_transport_cert};
 use crate::transport::{create_dual_endpoint_dynamic, extract_spki_fingerprint, AllowedPeers};
 use ed25519_dalek::SigningKey;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
@@ -203,10 +203,11 @@ impl Peer {
         )
         .expect("failed to bootstrap workspace");
 
-        // create_workspace pre-derives the PeerShared transport identity and writes
-        // all events under it, so no finalize_identity rewrite is needed.
-        let new_identity = crate::transport::identity::load_transport_peer_id(&db)
-            .expect("failed to load transport peer_id after create_workspace");
+        // Derive identity directly from the returned PeerShared signer key.
+        // This avoids singleton transport-identity assumptions in multi-tenant DBs.
+        let new_identity = hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
+            &result.peer_shared_key.verifying_key().to_bytes(),
+        ));
         self.identity = new_identity.clone();
 
         self.workspace_id = result.workspace_id;
@@ -382,7 +383,7 @@ impl Peer {
     /// Load (or generate) the transport certificate and private key for this peer.
     pub fn cert_and_key(&self) -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>) {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let (_, cert, key) = ensure_transport_cert(&db).expect("failed to load cert");
+        let (cert, key) = load_transport_cert(&db, &self.identity).expect("failed to load cert");
         (cert, key)
     }
 
