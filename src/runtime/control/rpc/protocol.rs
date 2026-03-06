@@ -33,6 +33,14 @@ pub enum RpcMethod {
         #[serde(default)]
         client_op_id: Option<String>,
     },
+    Files {
+        #[serde(default = "default_view_limit")]
+        limit: usize,
+    },
+    SaveFile {
+        target: String,
+        output_path: String,
+    },
     Generate {
         count: usize,
     },

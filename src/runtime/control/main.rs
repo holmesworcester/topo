@@ -182,6 +182,13 @@ enum Commands {
         limit: usize,
     },
 
+    /// List files available to save
+    Files {
+        /// Max files to show (0 = all)
+        #[arg(short, long, default_value = "50")]
+        limit: usize,
+    },
+
     /// Send a message (uses active peer's workspace)
     Send {
         /// Message content
@@ -202,6 +209,17 @@ enum Commands {
         /// Client operation ID for local-echo reconciliation
         #[arg(long)]
         client_op_id: Option<String>,
+    },
+
+    /// Save a received file to disk
+    #[command(name = "save-file")]
+    SaveFile {
+        /// File target: number (N or #N from `topo files`) or attachment event ID (hex)
+        #[arg(long)]
+        target: String,
+        /// Output path
+        #[arg(long)]
+        out: String,
     },
 
     /// Show database status
@@ -1136,6 +1154,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             show_messages_from_json(db, &data);
         }
 
+        Commands::Files { limit } => {
+            let data =
+                rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Files { limit })?;
+            show_files_from_json(&data);
+        }
+
         Commands::Send {
             content,
             client_op_id,
@@ -1182,6 +1206,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("Sent: {}", data["content"].as_str().unwrap_or(&content));
             println!("\u{1f4ce} {} ({})", filename, format_byte_size(file_size));
             println!("event_id:{}", event_id);
+        }
+
+        Commands::SaveFile { target, out } => {
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::SaveFile {
+                    target,
+                    output_path: out,
+                },
+            )?;
+            println!(
+                "saved {} bytes to {}",
+                data["bytes_written"].as_u64().unwrap_or(0),
+                data["output_path"].as_str().unwrap_or("")
+            );
+            println!(
+                "attachment_id:{}",
+                data["attachment_id"].as_str().unwrap_or("")
+            );
         }
 
         Commands::Status => {
@@ -2498,6 +2542,87 @@ fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> S
     }
 }
 
+fn neg_range_lines(frame_type: &str, detail_json: Option<&str>) -> Vec<String> {
+    if frame_type != "NegOpen" && frame_type != "NegMsg" {
+        return Vec::new();
+    }
+    let Some(raw) = detail_json else {
+        return Vec::new();
+    };
+    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
+        return vec!["range parse_error".to_string()];
+    };
+
+    let mut out = Vec::new();
+    if let Some(protocol) = v["protocol"].as_u64() {
+        out.push(format!("neg protocol={}", protocol));
+    }
+
+    let Some(entries) = v["entries"].as_array() else {
+        if let Some(err) = v["parse_error"].as_str() {
+            out.push(format!("parse_error={}", err));
+        }
+        return out;
+    };
+
+    for (idx, entry) in entries.iter().enumerate() {
+        let bound_ts = entry["bound_ts"].as_str().unwrap_or("?");
+        let bound_id = entry["bound_id_prefix"].as_str().unwrap_or("");
+        let mode = entry["mode"].as_str().unwrap_or("?");
+        let mut line = format!(
+            "range[{}] bound=({}, {}) mode={}",
+            idx + 1,
+            bound_ts,
+            short_peer_hex(bound_id),
+            mode
+        );
+
+        if mode == "Fingerprint" {
+            if let Some(fp) = entry["fingerprint_hex"].as_str() {
+                line.push_str(&format!(" fp={}", short_peer_hex(fp)));
+            }
+        } else if mode == "IdList" {
+            let id_count = entry["id_count"].as_u64().unwrap_or(0);
+            let ids_truncated = entry["ids_truncated"].as_bool().unwrap_or(false);
+            let ids = entry["ids"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str())
+                        .map(short_hex_owned)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            if ids.is_empty() {
+                line.push_str(&format!(
+                    " ids(count={} truncated={})",
+                    id_count, ids_truncated
+                ));
+            } else {
+                let more = if id_count as usize > ids.len() {
+                    ",..."
+                } else {
+                    ""
+                };
+                line.push_str(&format!(
+                    " ids(count={} truncated={} sample=[{}{}])",
+                    id_count,
+                    ids_truncated,
+                    ids.join(","),
+                    more
+                ));
+            }
+        }
+
+        out.push(line);
+    }
+
+    if let Some(err) = v["parse_error"].as_str() {
+        out.push(format!("parse_error={}", err));
+    }
+    out
+}
+
 #[derive(Debug, Clone)]
 struct RenderedFrameLine {
     seq_start: u64,
@@ -2509,6 +2634,7 @@ struct RenderedFrameLine {
     frame_type: String,
     len_label: String,
     detail: String,
+    range_lines: Vec<String>,
 }
 
 impl RenderedFrameLine {
@@ -2602,6 +2728,7 @@ fn render_frame_lines(
                         burst.len()
                     ),
                     detail,
+                    range_lines: Vec::new(),
                 });
                 i = j;
                 continue;
@@ -2618,6 +2745,7 @@ fn render_frame_lines(
             frame_type: ev.frame_type.clone(),
             len_label: ev.msg_len.to_string(),
             detail: summarize_sync_event_detail(&ev.frame_type, ev.detail_json.as_deref()),
+            range_lines: neg_range_lines(&ev.frame_type, ev.detail_json.as_deref()),
         });
         i += 1;
     }
@@ -2772,6 +2900,9 @@ fn print_sync_tree_groups(groups: &[PeerSyncTreeGroup]) {
                     line.len_label,
                     line.detail
                 );
+                for range in &line.range_lines {
+                    println!("{}  │    {}", run_pad, range);
+                }
             }
         }
 
@@ -2955,6 +3086,55 @@ fn show_messages_from_json(_db_path: &str, data: &serde_json::Value) {
                 }
             }
         }
+    }
+    println!();
+}
+
+fn show_files_from_json(data: &serde_json::Value) {
+    let files = match data["files"].as_array() {
+        Some(files) => files,
+        None => {
+            println!("  (no files)");
+            return;
+        }
+    };
+    if files.is_empty() {
+        println!("  (no files)");
+        return;
+    }
+
+    let total = data["total"].as_i64().unwrap_or(0);
+    println!("FILES ({} total):\n", total);
+
+    for (i, file) in files.iter().enumerate() {
+        let filename = file["filename"].as_str().unwrap_or("file");
+        let blob_bytes = file["blob_bytes"].as_i64().unwrap_or(0);
+        let total_slices = file["total_slices"].as_i64().unwrap_or(0);
+        let slices_received = file["slices_received"].as_i64().unwrap_or(0);
+        let created_at = file["created_at"].as_i64().unwrap_or(0);
+        let attachment_id = file["attachment_id"].as_str().unwrap_or("");
+        let message_id = file["message_id"].as_str().unwrap_or("");
+        let complete = file["complete"].as_bool().unwrap_or(false);
+
+        let status = if complete { "\u{2714}" } else { "\u{23f3}" };
+        let size = format_byte_size(blob_bytes);
+        let ts = format_timestamp(created_at);
+        let short_attachment = &attachment_id[..attachment_id.len().min(12)];
+        let short_message = &message_id[..message_id.len().min(12)];
+        println!(
+            "  {}. {}  {} ({})  [{}/{} slices]  {}",
+            i + 1,
+            status,
+            filename,
+            size,
+            slices_received,
+            total_slices,
+            ts
+        );
+        println!(
+            "     attachment:{}  message:{}",
+            short_attachment, short_message
+        );
     }
     println!();
 }

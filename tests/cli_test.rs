@@ -740,6 +740,123 @@ fn test_cli_send_file_and_messages_display() {
 }
 
 #[test]
+fn test_cli_files_and_save_file_roundtrip_after_sync() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir
+        .path()
+        .join("alice_files.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let bob_db = tmpdir
+        .path()
+        .join("bob_files.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let timeout_ms = 30000;
+
+    let source_path = tmpdir.path().join("payload.bin");
+    let mut expected = vec![0u8; 300_123];
+    for (i, b) in expected.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    std::fs::write(&source_path, &expected).unwrap();
+
+    create_workspace(&alice_db);
+    let _alice = start_daemon(&alice_db);
+
+    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
+    accept_invite(&bob_db, &invite_link);
+    let _bob = start_daemon(&bob_db);
+
+    let send_out = Command::new(bin())
+        .args([
+            "--db",
+            &alice_db,
+            "send-file",
+            "binary payload",
+            "--file",
+            source_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("send-file");
+    assert!(
+        send_out.status.success(),
+        "send-file failed: {}",
+        String::from_utf8_lossy(&send_out.stderr)
+    );
+    let send_stdout = String::from_utf8_lossy(&send_out.stdout);
+    let msg_eid = send_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("event_id:").map(|s| s.trim().to_string()))
+        .expect("send-file output missing event_id");
+
+    assert_eventually(&bob_db, &format!("has_event:{} >= 1", msg_eid), timeout_ms);
+
+    let files_deadline = Instant::now() + Duration::from_secs(20);
+    let _files_stdout = loop {
+        let files_out = Command::new(bin())
+            .args(["--db", &bob_db, "files"])
+            .output()
+            .expect("files command");
+        assert!(
+            files_out.status.success(),
+            "files command failed: {}",
+            String::from_utf8_lossy(&files_out.stderr)
+        );
+        let files_stdout = String::from_utf8_lossy(&files_out.stdout).to_string();
+        if files_stdout.contains("payload.bin") && files_stdout.contains("1.") {
+            break files_stdout;
+        }
+        if Instant::now() >= files_deadline {
+            panic!(
+                "timed out waiting for bob files list to include payload.bin:\n{}",
+                files_stdout
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+
+    let restored_path = tmpdir.path().join("restored.bin");
+    let save_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let save_out = Command::new(bin())
+            .args([
+                "--db",
+                &bob_db,
+                "save-file",
+                "--target",
+                "1",
+                "--out",
+                restored_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("save-file command");
+        if save_out.status.success() {
+            break;
+        }
+        let last_stderr = String::from_utf8_lossy(&save_out.stderr).to_string();
+        let retryable =
+            last_stderr.contains("file incomplete") || last_stderr.contains("invalid file number");
+        if !retryable {
+            panic!("save-file failed unexpectedly: {}", last_stderr);
+        }
+        if Instant::now() >= save_deadline {
+            panic!(
+                "timed out waiting for save-file success; last err={}",
+                last_stderr
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let restored = std::fs::read(&restored_path).unwrap();
+    assert_eq!(restored, expected, "saved file bytes should match source");
+}
+
+#[test]
 fn test_cli_generate_files_messages_display() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();

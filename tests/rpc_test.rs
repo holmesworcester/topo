@@ -106,6 +106,11 @@ fn rpc_all_methods_serialize() {
             content: "msg".into(),
             client_op_id: None,
         },
+        RpcMethod::Files { limit: 50 },
+        RpcMethod::SaveFile {
+            target: "1".into(),
+            output_path: "/tmp/out.bin".into(),
+        },
         RpcMethod::Generate { count: 10 },
         RpcMethod::AssertNow {
             predicate: "message_count == 0".into(),
@@ -1377,6 +1382,8 @@ fn catalog_drift_test_method_count_matches_protocol() {
         "Messages",
         "Send",
         "SendFile",
+        "Files",
+        "SaveFile",
         "Generate",
         "GenerateFiles",
         "AssertNow",

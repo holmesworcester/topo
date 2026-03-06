@@ -3,7 +3,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::EventId;
 use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
-use crate::projection::create::create_event_synchronous;
 use crate::projection::create::create_signed_event_synchronous;
 use crate::service::open_db_for_peer;
 use ed25519_dalek::SigningKey;
@@ -14,7 +13,7 @@ use super::super::message_deletion::MessageDeletionEvent;
 use super::super::peer_shared;
 use super::super::workspace;
 use super::super::ParsedEvent;
-use super::super::{FileSliceEvent, KeySecretEvent, MessageAttachmentEvent};
+use super::super::{FileSliceEvent, MessageAttachmentEvent};
 use super::wire::MessageEvent;
 
 fn current_timestamp_ms() -> u64 {
@@ -304,17 +303,10 @@ pub fn generate_files_for_peer(
             format!("create parent message error: {}", e).into()
         })?;
 
-        let key_event_id = create_event_synchronous(
-            &db,
-            &recorded_by,
-            &ParsedEvent::KeySecret(KeySecretEvent {
-                created_at_ms: current_timestamp_ms(),
-                key_bytes: rand::random::<[u8; 32]>(),
-            }),
-        )
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("create key_secret error: {}", e).into()
-        })?;
+        let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(&db, &recorded_by)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("resolve content key error: {}", e).into()
+            })?;
 
         let file_id = rand::random::<[u8; 32]>();
         let blob_bytes = (slices_per_file as u64)
@@ -456,14 +448,7 @@ pub fn send_file_for_peer(
         },
     )?;
 
-    let key_event_id = create_event_synchronous(
-        &db,
-        &recorded_by,
-        &ParsedEvent::KeySecret(KeySecretEvent {
-            created_at_ms: current_timestamp_ms(),
-            key_bytes: rand::random::<[u8; 32]>(),
-        }),
-    )?;
+    let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(&db, &recorded_by)?;
 
     let file_id = rand::random::<[u8; 32]>();
     let num_slices = if file_size == 0 {

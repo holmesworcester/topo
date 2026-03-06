@@ -13,7 +13,7 @@ use serde::Serialize;
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
-use crate::event_modules::{message, peer_shared, reaction, user, workspace};
+use crate::event_modules::{message, message_attachment, peer_shared, reaction, user, workspace};
 use crate::node::NodeRuntimeNetInfo;
 use crate::rpc::protocol::*;
 use crate::service;
@@ -495,6 +495,36 @@ fn dispatch(
             }
             Err(e) => RpcResponse::error(e),
         },
+        RpcMethod::Files { limit } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => {
+                    match message_attachment::queries::list_files(&db, &recorded_by, limit) {
+                        Ok(data) => RpcResponse::success(data),
+                        Err(e) => RpcResponse::error(e.to_string()),
+                    }
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::SaveFile {
+            target,
+            output_path,
+        } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => match message_attachment::queries::save_file_by_selector(
+                    &db,
+                    &recorded_by,
+                    &target,
+                    &output_path,
+                ) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
         RpcMethod::Generate { count } => match state.require_active_peer() {
             Ok(peer_id) => match message::generate_for_peer(db_path, &peer_id, count) {
                 Ok(data) => RpcResponse::success(data),
@@ -717,9 +747,7 @@ fn dispatch(
                 None => {
                     let runtime_state = *state.runtime_state.read().unwrap();
                     if runtime_state == RuntimeState::IdleNoTenants {
-                        RpcResponse::error(
-                            "must join or create a workspace before running upnp",
-                        )
+                        RpcResponse::error("must join or create a workspace before running upnp")
                     } else {
                         RpcResponse::error("daemon not ready — listen address not yet known")
                     }
