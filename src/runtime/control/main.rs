@@ -1,6 +1,8 @@
+use std::io::{self, IsTerminal};
 use std::net::SocketAddr;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::path::PathBuf;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 use std::process::Command;
@@ -204,7 +206,7 @@ enum Commands {
     SendFile {
         /// Message content
         content: String,
-        /// Path to file to attach (generates a placeholder if omitted)
+        /// Path to file to attach (reads from stdin or uses placeholder if omitted)
         #[arg(long)]
         file: Option<String>,
         /// Client operation ID for local-echo reconciliation
@@ -216,8 +218,11 @@ enum Commands {
     #[command(name = "save-file")]
     SaveFile {
         /// File target: number (N or #N from `topo files`) or file event ID (hex)
-        #[arg(long)]
-        target: String,
+        /// Defaults to "1" when omitted.
+        target: Option<String>,
+        /// Deprecated: use positional target instead.
+        #[arg(long = "target", hide = true)]
+        target_flag: Option<String>,
         /// Output path
         #[arg(long)]
         out: String,
@@ -266,8 +271,10 @@ enum Commands {
         /// Emoji to react with
         emoji: String,
         /// Target: message number (N or #N) or hex event ID
-        #[arg(long)]
-        target: String,
+        target: Option<String>,
+        /// Deprecated: use positional target instead.
+        #[arg(long = "target", hide = true)]
+        target_flag: Option<String>,
         /// Client operation ID for local-echo reconciliation
         #[arg(long)]
         client_op_id: Option<String>,
@@ -277,8 +284,10 @@ enum Commands {
     #[command(name = "delete-message")]
     DeleteMessage {
         /// Target: message number (N or #N) or hex event ID
-        #[arg(long)]
-        target: String,
+        target: Option<String>,
+        /// Deprecated: use positional target instead.
+        #[arg(long = "target", hide = true)]
+        target_flag: Option<String>,
     },
 
     /// List reactions
@@ -678,6 +687,85 @@ fn resolve_db_arg(raw: &str) -> Result<String, String> {
     }
     // For non-numeric selectors, resolve returns passthrough on miss, so this is fine.
     Ok(registry.resolve(raw).unwrap_or_else(|_| raw.to_string()))
+}
+
+fn resolve_send_file_path(
+    file: Option<String>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let mut candidate = file
+        .map(|path| path.trim().to_string())
+        .filter(|p| !p.is_empty());
+
+    // Optional convenience: when --file is omitted, accept a path from piped stdin.
+    if candidate.is_none() && !io::stdin().is_terminal() {
+        let mut buf = String::new();
+        io::stdin().read_line(&mut buf)?;
+        let trimmed = buf.trim();
+        if !trimmed.is_empty() {
+            candidate = Some(trimmed.to_string());
+        }
+    }
+
+    match candidate {
+        Some(path) => {
+            let input = Path::new(&path);
+            let abs = if input.is_absolute() {
+                input.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(input)
+            };
+            if !abs.exists() {
+                return Err(format!("file does not exist: {}", abs.display()).into());
+            }
+            if !abs.is_file() {
+                return Err(format!("path is not a file: {}", abs.display()).into());
+            }
+            Ok(abs.to_string_lossy().to_string())
+        }
+        None => {
+            let tmp = std::env::temp_dir().join("topo-placeholder.txt");
+            std::fs::write(&tmp, "placeholder file\n")
+                .map_err(|e| format!("failed to create placeholder: {}", e))?;
+            Ok(tmp.to_string_lossy().to_string())
+        }
+    }
+}
+
+fn resolve_target_selector(
+    positional: Option<String>,
+    deprecated_flag: Option<String>,
+    command_name: &str,
+    default_when_missing: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    match (positional, deprecated_flag) {
+        (Some(_), Some(_)) => Err(format!(
+            "conflicting target selectors for `{}`: pass either positional target or deprecated --target, not both",
+            command_name
+        )
+        .into()),
+        (Some(target), None) => Ok(target),
+        (None, Some(target)) => {
+            eprintln!(
+                "warning: `--target` is deprecated for `{}`; pass target positionally instead",
+                command_name
+            );
+            Ok(target)
+        }
+        (None, None) => match default_when_missing {
+            Some(default_target) => Ok(default_target.to_string()),
+            None => Err(format!(
+                "missing target for `{}`: pass it positionally (for example `{}`)",
+                command_name,
+                match command_name {
+                    "react" => "topo react thumbsup 1",
+                    "delete-message" => "topo delete-message 1",
+                    "save-file" => "topo save-file 1 --out /tmp/file.bin",
+                    _ => "topo <command> <target>",
+                }
+            )
+            .into()),
+        },
+    }
 }
 
 struct ManagedRuntime {
@@ -1216,15 +1304,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             file,
             client_op_id,
         } => {
-            let file_path = match file {
-                Some(f) => f,
-                None => {
-                    let tmp = std::env::temp_dir().join("topo-placeholder.txt");
-                    std::fs::write(&tmp, "placeholder file\n")
-                        .map_err(|e| format!("failed to create placeholder: {}", e))?;
-                    tmp.to_string_lossy().to_string()
-                }
-            };
+            let file_path = resolve_send_file_path(file)?;
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
@@ -1242,7 +1322,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("event_id:{}", event_id);
         }
 
-        Commands::SaveFile { target, out } => {
+        Commands::SaveFile {
+            target,
+            target_flag,
+            out,
+        } => {
+            let target = resolve_target_selector(target, target_flag, "save-file", Some("1"))?;
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
@@ -1416,8 +1501,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::React {
             emoji,
             target,
+            target_flag,
             client_op_id,
         } => {
+            let target = resolve_target_selector(target, target_flag, "react", None)?;
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
@@ -1436,7 +1523,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
         }
 
-        Commands::DeleteMessage { target } => {
+        Commands::DeleteMessage {
+            target,
+            target_flag,
+        } => {
+            let target = resolve_target_selector(target, target_flag, "delete-message", None)?;
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
