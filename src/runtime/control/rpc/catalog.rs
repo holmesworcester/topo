@@ -160,10 +160,10 @@ static CATALOG: &[MethodInfo] = &[
         name: "CreateInvite",
         purpose: "Create a user invite link for the active workspace",
         params: params![
-            "public_addr", "string", true, None;
+            "public_addr", "string?", false, Some("auto-detect");
             "public_spki", "string?", false, None
         ],
-        example_json: r#"{"type":"CreateInvite","public_addr":"127.0.0.1:4433"}"#,
+        example_json: r#"{"type":"CreateInvite"}"#,
     },
     MethodInfo {
         name: "AcceptInvite",
@@ -179,10 +179,10 @@ static CATALOG: &[MethodInfo] = &[
         name: "CreateDeviceLink",
         purpose: "Create a device link invite for the active peer's user",
         params: params![
-            "public_addr", "string", true, None;
+            "public_addr", "string?", false, Some("auto-detect");
             "public_spki", "string?", false, None
         ],
-        example_json: r#"{"type":"CreateDeviceLink","public_addr":"127.0.0.1:4433"}"#,
+        example_json: r#"{"type":"CreateDeviceLink"}"#,
     },
     MethodInfo {
         name: "AcceptLink",

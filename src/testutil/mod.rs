@@ -231,7 +231,7 @@ impl Peer {
         use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
         use crate::event_modules::workspace::commands::create_user_invite_raw;
         use crate::event_modules::workspace::identity_ops::expected_invite_bootstrap_spki_from_invite_key;
-        use crate::event_modules::workspace::invite_link::create_invite_link;
+        use crate::event_modules::workspace::invite_link::{create_invite_link, parse_bootstrap_address};
 
         // Create a bare peer with DB tables but NO transport identity.
         // svc_accept_invite will install the invite-derived identity.
@@ -309,7 +309,9 @@ impl Peer {
 
         // Build invite link with creator's bootstrap address and SPKI
         let creator_spki = creator.spki_fingerprint();
-        let invite_link = create_invite_link(&invite, &sync_addr.to_string(), &creator_spki)
+        let bootstrap_addr = parse_bootstrap_address(&sync_addr.to_string())
+            .expect("failed to parse bootstrap addr");
+        let invite_link = create_invite_link(&invite, &[bootstrap_addr], &creator_spki)
             .expect("failed to create invite link");
 
         // Step 1: Accept invite — stores events (may block), materializes bootstrap trust

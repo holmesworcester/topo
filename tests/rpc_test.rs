@@ -146,11 +146,11 @@ fn rpc_all_methods_serialize() {
             device_name: "device".into(),
         },
         RpcMethod::CreateInvite {
-            public_addr: "127.0.0.1:4433".into(),
+            public_addr: Some("127.0.0.1:4433".to_string()),
             public_spki: None,
         },
         RpcMethod::CreateDeviceLink {
-            public_addr: "127.0.0.1:4433".into(),
+            public_addr: Some("127.0.0.1:4433".to_string()),
             public_spki: None,
         },
         RpcMethod::AcceptLink {

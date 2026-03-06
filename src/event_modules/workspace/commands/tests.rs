@@ -26,6 +26,10 @@ fn create_user_invite_materializes_pending_bootstrap_trust_via_projection() {
         .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
         .expect("workspace bootstrap must create an admin event");
 
+    let bootstrap_addrs = vec![super::super::invite_link::BootstrapAddress::Ipv4 {
+        ip: "127.0.0.1".parse().unwrap(),
+        port: 4433,
+    }];
     let invite = create_user_invite(
         &conn,
         &recorded_by,
@@ -33,7 +37,7 @@ fn create_user_invite_materializes_pending_bootstrap_trust_via_projection() {
         &workspace.peer_shared_event_id,
         &admin_event_id,
         &workspace.workspace_id,
-        "127.0.0.1:4433",
+        &bootstrap_addrs,
         &bootstrap_spki,
     )
     .expect("create user invite");

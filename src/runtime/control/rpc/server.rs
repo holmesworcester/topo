@@ -784,11 +784,39 @@ fn dispatch(
             public_addr,
             public_spki,
         } => {
+            let listen_port = state
+                .runtime_net
+                .read()
+                .unwrap()
+                .as_ref()
+                .and_then(|ni| ni.listen_addr.parse::<std::net::SocketAddr>().ok())
+                .map(|sa| sa.port())
+                .unwrap_or(crate::event_modules::workspace::invite_link::DEFAULT_PORT);
+            let explicit_addrs: Vec<crate::event_modules::workspace::invite_link::BootstrapAddress> =
+                match public_addr {
+                    Some(ref addr) => {
+                        match crate::event_modules::workspace::invite_link::parse_bootstrap_address(addr) {
+                            Ok(a) => vec![a],
+                            Err(e) => return RpcResponse::error(format!("invalid public_addr: {}", e)),
+                        }
+                    }
+                    None => vec![],
+                };
+            // Auto-detect when no explicit addrs provided (applies to both SPKI and non-SPKI paths)
+            let bootstrap_addrs = if explicit_addrs.is_empty() {
+                let detected = crate::event_modules::workspace::invite_link::detect_bootstrap_addrs(listen_port);
+                if detected.is_empty() {
+                    return RpcResponse::error("No non-loopback addresses detected. Provide public_addr explicitly.".to_string());
+                }
+                detected
+            } else {
+                explicit_addrs
+            };
             let result = match public_spki {
                 Some(ref spki) => {
-                    workspace::commands::create_invite_with_spki(db_path, &public_addr, spki)
+                    workspace::commands::create_invite_with_spki(db_path, &bootstrap_addrs, spki)
                 }
-                None => workspace::commands::create_invite_for_db(db_path, &public_addr),
+                None => workspace::commands::create_invite_for_db(db_path, &bootstrap_addrs, listen_port),
             };
             match result {
                 Ok(data) => {
@@ -857,10 +885,38 @@ fn dispatch(
             public_spki,
         } => match state.require_active_peer() {
             Ok(peer_id) => {
+                let listen_port = state
+                    .runtime_net
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|ni| ni.listen_addr.parse::<std::net::SocketAddr>().ok())
+                    .map(|sa| sa.port())
+                    .unwrap_or(crate::event_modules::workspace::invite_link::DEFAULT_PORT);
+                let explicit_addrs: Vec<crate::event_modules::workspace::invite_link::BootstrapAddress> =
+                    match public_addr {
+                        Some(ref addr) => {
+                            match crate::event_modules::workspace::invite_link::parse_bootstrap_address(addr) {
+                                Ok(a) => vec![a],
+                                Err(e) => return RpcResponse::error(format!("invalid public_addr: {}", e)),
+                            }
+                        }
+                        None => vec![],
+                    };
+                let bootstrap_addrs = if explicit_addrs.is_empty() {
+                    let detected = crate::event_modules::workspace::invite_link::detect_bootstrap_addrs(listen_port);
+                    if detected.is_empty() {
+                        return RpcResponse::error("No non-loopback addresses detected. Provide public_addr explicitly.".to_string());
+                    }
+                    detected
+                } else {
+                    explicit_addrs
+                };
                 match workspace::commands::create_device_link_for_peer(
                     db_path,
                     &peer_id,
-                    &public_addr,
+                    &bootstrap_addrs,
+                    listen_port,
                     public_spki.as_deref(),
                 ) {
                     Ok(data) => {

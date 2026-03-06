@@ -5036,6 +5036,73 @@ fn test_invite_accepted_materializes_bootstrap_trust_from_projection() {
     );
 }
 
+/// Multiple bootstrap addresses produce multiple trust rows when projected.
+#[test]
+fn test_invite_accepted_materializes_multiple_bootstrap_trust_rows() {
+    let conn = setup();
+    let recorded_by = "peer1";
+
+    let workspace_id = [0xA1; 32];
+    let invite_eid = [0xC1; 32];
+    let bootstrap_spki: [u8; 32] = [0xD1; 32];
+
+    let invite_eid_b64 = event_id_to_base64(&invite_eid);
+    let ws_b64 = event_id_to_base64(&workspace_id);
+
+    // Append 3 bootstrap context rows (simulating multi-addr invite)
+    for addr in &["192.168.1.50:4433", "100.64.1.20:4433", "10.0.0.1:7443"] {
+        crate::db::transport_trust::append_bootstrap_context(
+            &conn,
+            recorded_by,
+            &invite_eid_b64,
+            &ws_b64,
+            addr,
+            &bootstrap_spki,
+        )
+        .unwrap();
+    }
+
+    // Create and project InviteAccepted
+    let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
+        created_at_ms: now_ms(),
+        tenant_event_id: setup_tenant_event(&conn, recorded_by),
+        invite_event_id: invite_eid,
+        workspace_id,
+    });
+    let ia_blob = events::encode_event(&ia_event).unwrap();
+    let ia_eid = insert_event_raw(&conn, recorded_by, &ia_blob);
+    let decision = project_one(&conn, recorded_by, &ia_eid).unwrap();
+    assert_eq!(decision, ProjectionDecision::Valid);
+
+    // invite_bootstrap_trust must have 3 rows
+    let trust_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM invite_bootstrap_trust WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        trust_count, 3,
+        "projection must materialize one trust row per bootstrap address"
+    );
+
+    // All 3 addresses must be queryable
+    let addrs =
+        crate::db::transport_trust::list_active_invite_bootstrap_addrs(&conn, recorded_by)
+            .unwrap();
+    assert_eq!(addrs.len(), 3, "must have three active bootstrap addrs");
+    assert!(addrs.contains(&"192.168.1.50:4433".to_string()));
+    assert!(addrs.contains(&"100.64.1.20:4433".to_string()));
+    assert!(addrs.contains(&"10.0.0.1:7443".to_string()));
+
+    // SPKI must be allowed
+    let allowed =
+        crate::db::transport_trust::is_peer_allowed(&conn, recorded_by, &bootstrap_spki)
+            .unwrap();
+    assert!(allowed, "bootstrap SPKI must be allowed");
+}
+
 /// Target semantics 3: Workspace guard unblock happens through normal
 /// retry/cascade path after InviteAccepted projects trust anchor.
 /// The workspace event can arrive AFTER invite acceptance and still

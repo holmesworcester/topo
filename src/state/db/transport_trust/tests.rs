@@ -437,7 +437,8 @@ fn test_invite_bootstrap_trust_insert_idempotent() {
     )
     .unwrap();
 
-    // Second insert with same PK but different values — should be ignored
+    // Second insert with same (recorded_by, invite_accepted_event_id, bootstrap_addr) —
+    // should be ignored (true idempotency).
     let spki2: [u8; 32] = [21u8; 32];
     record_invite_bootstrap_trust(
         &conn,
@@ -445,12 +446,12 @@ fn test_invite_bootstrap_trust_insert_idempotent() {
         "ia1",
         "invite2",
         "workspace2",
-        "10.0.0.1:4434",
+        "127.0.0.1:4433",
         &spki2,
     )
     .unwrap();
 
-    // Should be exactly 1 row
+    // Should be exactly 1 row — same PK means INSERT OR IGNORE
     let count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM invite_bootstrap_trust
@@ -472,6 +473,31 @@ fn test_invite_bootstrap_trust_insert_idempotent() {
         .unwrap();
     assert_eq!(addr, "127.0.0.1:4433", "original value preserved");
     assert_eq!(ws, "workspace1", "original value preserved");
+
+    // Third insert with different bootstrap_addr — creates a second row (multi-addr support)
+    record_invite_bootstrap_trust(
+        &conn,
+        recorded_by,
+        "ia1",
+        "invite1",
+        "workspace1",
+        "10.0.0.1:4434",
+        &spki,
+    )
+    .unwrap();
+
+    let count2: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM invite_bootstrap_trust
+             WHERE recorded_by = ?1 AND invite_accepted_event_id = ?2",
+            rusqlite::params![recorded_by, "ia1"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        count2, 2,
+        "different bootstrap_addr should create a second row"
+    );
 }
 
 #[test]
@@ -1269,7 +1295,7 @@ fn test_bootstrap_context_append_and_read() {
     let ctx = read_bootstrap_context(&conn, recorded_by, invite_eid)
         .unwrap()
         .unwrap();
-    assert_eq!(ctx.bootstrap_addr, addr);
+    assert_eq!(ctx.bootstrap_addrs, vec![addr.to_string()]);
     assert_eq!(ctx.bootstrap_spki_fingerprint, spki);
     assert_eq!(ctx.workspace_id, workspace_id);
 }
@@ -1300,9 +1326,11 @@ fn test_bootstrap_context_latest_wins() {
     let ctx = read_bootstrap_context(&conn, recorded_by, invite_eid)
         .unwrap()
         .unwrap();
+    // Both addresses returned, ordered by observed_at DESC
     assert_eq!(
-        ctx.bootstrap_addr, "10.0.0.2:4433",
-        "latest observed_at should win"
+        ctx.bootstrap_addrs,
+        vec!["10.0.0.2:4433".to_string(), "10.0.0.1:4433".to_string()],
+        "all addresses should be returned, newest first"
     );
 }
 
@@ -1320,4 +1348,50 @@ fn test_bootstrap_context_tenant_isolation() {
     assert!(read_bootstrap_context(&conn, "peer_b", "invite_1")
         .unwrap()
         .is_none());
+}
+
+#[test]
+fn test_bootstrap_context_multiple_addrs_same_invite() {
+    let conn = open_in_memory().unwrap();
+    create_tables(&conn).unwrap();
+
+    let recorded_by = "ctx_multi_1";
+    let invite_eid = "invite_multi_1";
+    let workspace_id = "ws_multi_1";
+    let spki: [u8; 32] = [0xDD; 32];
+
+    // Append multiple addresses for the same invite
+    append_bootstrap_context(&conn, recorded_by, invite_eid, workspace_id, "192.168.1.50:4433", &spki).unwrap();
+    append_bootstrap_context(&conn, recorded_by, invite_eid, workspace_id, "100.64.1.20:4433", &spki).unwrap();
+    append_bootstrap_context(&conn, recorded_by, invite_eid, workspace_id, "myhost.ts.net:4433", &spki).unwrap();
+
+    let ctx = read_bootstrap_context(&conn, recorded_by, invite_eid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ctx.bootstrap_addrs.len(), 3, "should return all 3 addresses");
+    assert!(ctx.bootstrap_addrs.contains(&"192.168.1.50:4433".to_string()));
+    assert!(ctx.bootstrap_addrs.contains(&"100.64.1.20:4433".to_string()));
+    assert!(ctx.bootstrap_addrs.contains(&"myhost.ts.net:4433".to_string()));
+    assert_eq!(ctx.bootstrap_spki_fingerprint, spki);
+    assert_eq!(ctx.workspace_id, workspace_id);
+}
+
+#[test]
+fn test_bootstrap_context_deduplicates_addrs() {
+    let conn = open_in_memory().unwrap();
+    create_tables(&conn).unwrap();
+
+    let recorded_by = "ctx_dedup_1";
+    let invite_eid = "invite_dedup_1";
+    let spki: [u8; 32] = [0xEE; 32];
+
+    // Append same address twice
+    append_bootstrap_context(&conn, recorded_by, invite_eid, "ws1", "10.0.0.1:4433", &spki).unwrap();
+    append_bootstrap_context(&conn, recorded_by, invite_eid, "ws1", "10.0.0.1:4433", &spki).unwrap();
+
+    let ctx = read_bootstrap_context(&conn, recorded_by, invite_eid)
+        .unwrap()
+        .unwrap();
+    assert_eq!(ctx.bootstrap_addrs.len(), 1, "duplicate addresses should be deduplicated");
+    assert_eq!(ctx.bootstrap_addrs[0], "10.0.0.1:4433");
 }

@@ -333,9 +333,9 @@ enum Commands {
     /// Create a user invite link for the active workspace
     #[command(name = "invite")]
     CreateInvite {
-        /// Public address (host:port) to embed in invite link
+        /// Public address (host:port) to embed in invite link. Auto-detects if omitted.
         #[arg(long, alias = "bootstrap")]
-        public_addr: String,
+        public_addr: Option<String>,
         /// Public SPKI fingerprint (hex) — defaults to local transport SPKI
         #[arg(long)]
         public_spki: Option<String>,
@@ -343,9 +343,9 @@ enum Commands {
 
     /// Create a device link invite for the active peer's user
     Link {
-        /// Public address (host:port) to embed in link
+        /// Public address (host:port) to embed in link. Auto-detects if omitted.
         #[arg(long, alias = "bootstrap")]
-        public_addr: String,
+        public_addr: Option<String>,
         /// Public SPKI fingerprint (hex) — defaults to local transport SPKI
         #[arg(long)]
         public_spki: Option<String>,
@@ -1054,7 +1054,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 match rpc_call(
                     &sock,
                     RpcMethod::CreateInvite {
-                        public_addr: addr,
+                        public_addr: Some(addr),
                         public_spki: None,
                     },
                 ) {

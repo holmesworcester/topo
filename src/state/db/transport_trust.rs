@@ -59,7 +59,7 @@ pub fn ensure_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
             bootstrap_spki_fingerprint BLOB NOT NULL,
             accepted_at INTEGER NOT NULL,
             expires_at INTEGER NOT NULL,
-            PRIMARY KEY (recorded_by, invite_accepted_event_id)
+            PRIMARY KEY (recorded_by, invite_accepted_event_id, bootstrap_addr)
         );
         CREATE INDEX IF NOT EXISTS idx_invite_bootstrap_spki
             ON invite_bootstrap_trust(recorded_by, bootstrap_spki_fingerprint);
@@ -555,7 +555,8 @@ pub struct InviteBootstrapTarget {
 
 /// List active invite bootstrap targets for a tenant, keyed by invite_event_id.
 ///
-/// The deterministic winner per invite_event_id is the newest accepted row.
+/// Returns all non-expired addresses. When multiple invite acceptances exist
+/// for the same invite_event_id, only addresses from the newest acceptance win.
 pub fn list_active_invite_bootstrap_targets(
     conn: &Connection,
     recorded_by: &str,
@@ -566,8 +567,8 @@ pub fn list_active_invite_bootstrap_targets(
            FROM invite_bootstrap_trust t
           WHERE t.recorded_by = ?1
             AND t.expires_at > ?2
-            AND t.rowid = (
-                SELECT t2.rowid
+            AND t.invite_accepted_event_id = (
+                SELECT t2.invite_accepted_event_id
                   FROM invite_bootstrap_trust t2
                  WHERE t2.recorded_by = t.recorded_by
                    AND t2.invite_event_id = t.invite_event_id

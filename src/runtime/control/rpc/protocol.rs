@@ -76,7 +76,9 @@ pub enum RpcMethod {
         peer: Option<String>,
     },
     CreateInvite {
-        public_addr: String,
+        #[serde(default)]
+        public_addr: Option<String>,
+        #[serde(default)]
         public_spki: Option<String>,
     },
     AcceptInvite {
@@ -86,7 +88,9 @@ pub enum RpcMethod {
     },
     /// Create a device link invite for the active peer's user.
     CreateDeviceLink {
-        public_addr: String,
+        #[serde(default)]
+        public_addr: Option<String>,
+        #[serde(default)]
         public_spki: Option<String>,
     },
     /// Accept a device link invite.

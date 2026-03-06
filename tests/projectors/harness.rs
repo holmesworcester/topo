@@ -60,7 +60,7 @@ pub mod fixtures {
         ContextSnapshot {
             bootstrap_context: Some(BootstrapContextSnapshot {
                 workspace_id: workspace_id.to_string(),
-                bootstrap_addr: "127.0.0.1:9000".to_string(),
+                bootstrap_addrs: vec!["127.0.0.1:9000".to_string()],
                 bootstrap_spki_fingerprint: [0xAA; 32],
             }),
             is_local_create: is_local,

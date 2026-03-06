@@ -51,7 +51,7 @@ pub fn build_projector_context(
         {
             ctx.bootstrap_context = Some(BootstrapContextSnapshot {
                 workspace_id: bc.workspace_id,
-                bootstrap_addr: bc.bootstrap_addr,
+                bootstrap_addrs: bc.bootstrap_addrs,
                 bootstrap_spki_fingerprint: bc.bootstrap_spki_fingerprint,
             });
         }
