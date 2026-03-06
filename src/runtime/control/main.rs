@@ -2593,15 +2593,16 @@ fn neg_entry_depth_hint(prefix_hex: &str) -> usize {
     }
 }
 
-fn neg_entry_readable_line(entry_idx: usize, entry: &NegEntryView) -> String {
+fn neg_entry_readable_line(round_no: usize, entry_idx: usize, entry: &NegEntryView) -> String {
     let bound_prefix = short_hex12(&entry.bound_id_prefix);
     let bound = if bound_prefix.is_empty() {
         format!("({})", entry.bound_ts)
     } else {
         format!("({}, {})", entry.bound_ts, bound_prefix)
     };
+    let range_label = format!("{}.{}", round_no, entry_idx + 1);
     match entry.mode.as_str() {
-        "Skip" => format!("range[{}] MATCH bound={}", entry_idx + 1, bound),
+        "Skip" => format!("range={} MATCH bound={}", range_label, bound),
         "Fingerprint" => {
             let fp = entry
                 .fingerprint_hex
@@ -2609,10 +2610,8 @@ fn neg_entry_readable_line(entry_idx: usize, entry: &NegEntryView) -> String {
                 .map(short_hex12)
                 .unwrap_or_else(|| "?".to_string());
             format!(
-                "range[{}] HASH bound={} fp={} (await compare)",
-                entry_idx + 1,
-                bound,
-                fp
+                "range={} HASH bound={} fp={} (await compare)",
+                range_label, bound, fp
             )
         }
         "IdList" => {
@@ -2626,10 +2625,8 @@ fn neg_entry_readable_line(entry_idx: usize, entry: &NegEntryView) -> String {
                 .join(",");
             if ids.is_empty() {
                 format!(
-                    "range[{}] MISMATCH -> IdList count={} truncated={}",
-                    entry_idx + 1,
-                    count,
-                    entry.ids_truncated
+                    "range={} MISMATCH -> IdList count={} truncated={}",
+                    range_label, count, entry.ids_truncated
                 )
             } else {
                 let shown = entry.ids.len().min(4) as u64;
@@ -2642,16 +2639,12 @@ fn neg_entry_readable_line(entry_idx: usize, entry: &NegEntryView) -> String {
                     String::new()
                 };
                 format!(
-                    "range[{}] MISMATCH -> IdList count={} ids=[{}]{} truncated={}",
-                    entry_idx + 1,
-                    count,
-                    ids,
-                    more,
-                    entry.ids_truncated
+                    "range={} MISMATCH -> IdList count={} ids=[{}]{} truncated={}",
+                    range_label, count, ids, more, entry.ids_truncated
                 )
             }
         }
-        other => format!("range[{}] {} bound={}", entry_idx + 1, other, bound),
+        other => format!("range={} {} bound={}", range_label, other, bound),
     }
 }
 
@@ -2873,7 +2866,7 @@ fn print_sync_tree_groups(groups: &[PeerSyncTreeGroup]) {
             .filter(|(run, _)| run_status(run) == "error")
             .count();
         println!(
-            "peer {} runs={} changed={} errors={}",
+            "peer={} runs={} changed={} errors={}",
             short_peer_hex(&group.peer_id),
             group.runs.len(),
             changed,
@@ -2895,12 +2888,13 @@ fn print_sync_tree_groups(groups: &[PeerSyncTreeGroup]) {
             let dt = run.ended_at_ms.saturating_sub(run.started_at_ms);
             let frame_lines = render_frame_lines(run, events);
             let mut prev_neg_entry_count: Option<u64> = None;
+            let mut neg_round_no: usize = 0;
             println!(
-            "{} run {} [{}] end={} dir={} role={} sync_rounds={} sync_events_tx={} sync_events_rx={} dur_ms={} raw_frames={} frame_lines={} outcome={}",
-            run_branch,
+            "{} run={} status={} ended_at={} direction={} role={} sync_rounds={} sync_events_tx={} sync_events_rx={} dur_ms={} raw_frames={} frame_lines={} outcome={}",
+                run_branch,
                 run.run_id,
                 status,
-                format_absolute(run.ended_at_ms),
+                format_compact_datetime(run.ended_at_ms),
                 run.direction,
                 run.role,
                 run.rounds,
@@ -2942,6 +2936,7 @@ fn print_sync_tree_groups(groups: &[PeerSyncTreeGroup]) {
                 if (line.frame_type == "NegOpen" || line.frame_type == "NegMsg")
                     && line.detail_json.is_some()
                 {
+                    neg_round_no += 1;
                     if let Some(neg) = parse_neg_frame_view(line.detail_json.as_deref()) {
                         let child_stem = if event_idx + 1 == frame_lines.len() {
                             "  "
@@ -2950,12 +2945,13 @@ fn print_sync_tree_groups(groups: &[PeerSyncTreeGroup]) {
                         };
                         let drilldown = prev_neg_entry_count
                             .filter(|prev| neg.entry_count > *prev)
-                            .map(|prev| format!(" drilldown={}→{}", prev, neg.entry_count))
+                            .map(|prev| format!(" drilldown={}->{}", prev, neg.entry_count))
                             .unwrap_or_default();
                         println!(
-                            "{}  {}    reconcile protocol={} ranges={} hash_match(skip)={} hash_probe(fp)={} idlists={}{}",
+                            "{}  {}    reconcile round={} protocol={} ranges={} hash_match(skip)={} hash_probe(fp)={} idlists={}{}",
                             run_pad,
                             child_stem,
+                            neg_round_no,
                             neg.protocol
                                 .map(|p| p.to_string())
                                 .unwrap_or_else(|| "?".to_string()),
@@ -2983,7 +2979,7 @@ fn print_sync_tree_groups(groups: &[PeerSyncTreeGroup]) {
                                 run_pad,
                                 child_stem,
                                 depth_pad,
-                                neg_entry_readable_line(entry_idx, entry)
+                                neg_entry_readable_line(neg_round_no, entry_idx, entry)
                             );
                         }
                         prev_neg_entry_count = Some(neg.entry_count);
@@ -3068,6 +3064,24 @@ fn format_absolute(ms: i64) -> String {
         _ => "???",
     };
     format!("{} {} {:02}:{:02}", month_name, day, hours, minutes)
+}
+
+fn format_compact_datetime(ms: i64) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+    let dt = UNIX_EPOCH + Duration::from_millis(ms as u64);
+    let total_secs = dt.duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let days_since_epoch = total_secs / 86_400;
+    let time_of_day = total_secs % 86_400;
+    let hours = time_of_day / 3_600;
+    let minutes = (time_of_day % 3_600) / 60;
+    let seconds = time_of_day % 60;
+    let millis = (ms.rem_euclid(1000)) as u32;
+
+    let (year, month, day) = days_to_ymd(days_since_epoch as i64);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        year, month, day, hours, minutes, seconds, millis
+    )
 }
 
 fn days_to_ymd(days: i64) -> (i64, u32, u32) {
