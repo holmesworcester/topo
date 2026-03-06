@@ -485,6 +485,7 @@ pub fn send_message(db: &str, content: &str) -> String {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let retryable = stderr.contains("no identity")
             || stderr.contains("no active tenant")
+            || stderr.contains("workspace has not completed initial sync yet")
             || stderr.contains("blocked on");
         if retryable && start.elapsed() < Duration::from_secs(20) {
             if stderr.contains("no active tenant") {
@@ -770,6 +771,7 @@ pub fn is_transient_rpc_startup_error(stderr: &str) -> bool {
     stderr.contains("daemon not running")
         || stderr.contains("Connection reset by peer")
         || stderr.contains("no identity — run `topo create-workspace` first")
+        || stderr.contains("workspace has not completed initial sync yet")
         || stderr.contains("no active tenant — run `topo use-tenant <N>`")
         || stderr.contains("blocked on")
 }
@@ -866,6 +868,7 @@ pub fn send_file(db: &str, content: &str, file_path: &str) -> String {
         let stderr = String::from_utf8_lossy(&output.stderr).to_string();
         let retryable = stderr.contains("no identity")
             || stderr.contains("no active tenant")
+            || stderr.contains("workspace has not completed initial sync yet")
             || stderr.contains("blocked on");
         if retryable && start.elapsed() < Duration::from_secs(20) {
             if stderr.contains("no active tenant") {

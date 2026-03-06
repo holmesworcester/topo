@@ -813,59 +813,75 @@ fn dispatch(
         RpcMethod::CreateInvite {
             public_addr,
             public_spki,
-        } => {
-            let listen_port = state
-                .runtime_net
-                .read()
-                .unwrap()
-                .as_ref()
-                .and_then(|ni| ni.listen_addr.parse::<std::net::SocketAddr>().ok())
-                .map(|sa| sa.port())
-                .unwrap_or(crate::event_modules::workspace::invite_link::DEFAULT_PORT);
-            let explicit_addrs: Vec<crate::event_modules::workspace::invite_link::BootstrapAddress> =
-                match public_addr {
+        } => match state.require_active_peer() {
+            Ok(peer_id) => {
+                let listen_port = state
+                    .runtime_net
+                    .read()
+                    .unwrap()
+                    .as_ref()
+                    .and_then(|ni| ni.listen_addr.parse::<std::net::SocketAddr>().ok())
+                    .map(|sa| sa.port())
+                    .unwrap_or(crate::event_modules::workspace::invite_link::DEFAULT_PORT);
+                let explicit_addrs: Vec<
+                    crate::event_modules::workspace::invite_link::BootstrapAddress,
+                > = match public_addr {
                     Some(ref addr) => {
-                        match crate::event_modules::workspace::invite_link::parse_bootstrap_address(addr) {
+                        match crate::event_modules::workspace::invite_link::parse_bootstrap_address(
+                            addr,
+                        ) {
                             Ok(a) => vec![a],
-                            Err(e) => return RpcResponse::error(format!("invalid public_addr: {}", e)),
+                            Err(e) => {
+                                return RpcResponse::error(format!("invalid public_addr: {}", e));
+                            }
                         }
                     }
                     None => vec![],
                 };
-            // Auto-detect when no explicit addrs provided (applies to both SPKI and non-SPKI paths)
-            let bootstrap_addrs = if explicit_addrs.is_empty() {
-                let detected = crate::event_modules::workspace::invite_link::detect_bootstrap_addrs(listen_port);
-                if detected.is_empty() {
-                    return RpcResponse::error("No non-loopback addresses detected. Provide public_addr explicitly.".to_string());
-                }
-                detected
-            } else {
-                explicit_addrs
-            };
-            let result = match public_spki {
-                Some(ref spki) => {
-                    workspace::commands::create_invite_with_spki(db_path, &bootstrap_addrs, spki)
-                }
-                None => workspace::commands::create_invite_for_db(db_path, &bootstrap_addrs, listen_port),
-            };
-            match result {
-                Ok(data) => {
-                    // Store invite ref
-                    if let Some(link) = serde_json::to_value(&data)
-                        .ok()
-                        .and_then(|v| v["invite_link"].as_str().map(|s| s.to_string()))
-                    {
-                        let num = state.add_invite_ref(link);
-                        let mut resp_data = serde_json::to_value(&data).unwrap();
-                        resp_data["invite_ref"] = serde_json::json!(num);
-                        RpcResponse::success(resp_data)
-                    } else {
-                        RpcResponse::success(data)
+                let bootstrap_addrs = if explicit_addrs.is_empty() {
+                    let detected =
+                        crate::event_modules::workspace::invite_link::detect_bootstrap_addrs(
+                            listen_port,
+                        );
+                    if detected.is_empty() {
+                        return RpcResponse::error(
+                            "No non-loopback addresses detected. Provide public_addr explicitly."
+                                .to_string(),
+                        );
                     }
+                    detected
+                } else {
+                    explicit_addrs
+                };
+                let result: Result<
+                    workspace::commands::CreateInviteResponse,
+                    Box<dyn std::error::Error + Send + Sync>,
+                > = workspace::commands::create_invite_for_peer(
+                    db_path,
+                    &peer_id,
+                    &bootstrap_addrs,
+                    listen_port,
+                    public_spki.as_deref(),
+                );
+                match result {
+                    Ok(data) => {
+                        if let Some(link) = serde_json::to_value(&data)
+                            .ok()
+                            .and_then(|v| v["invite_link"].as_str().map(|s| s.to_string()))
+                        {
+                            let num = state.add_invite_ref(link);
+                            let mut resp_data = serde_json::to_value(&data).unwrap();
+                            resp_data["invite_ref"] = serde_json::json!(num);
+                            RpcResponse::success(resp_data)
+                        } else {
+                            RpcResponse::success(data)
+                        }
+                    }
+                    Err(e) => RpcResponse::error(e.to_string()),
                 }
-                Err(e) => RpcResponse::error(e.to_string()),
             }
-        }
+            Err(e) => RpcResponse::error(e),
+        },
         RpcMethod::Upnp => {
             // UPnP only needs the listen address, not the full runtime.
             // Prefer runtime_net (actual bound address) when available;
@@ -887,9 +903,7 @@ fn dispatch(
                 .build()
             {
                 Ok(rt) => rt,
-                Err(e) => {
-                    return RpcResponse::error(format!("failed to start runtime: {}", e))
-                }
+                Err(e) => return RpcResponse::error(format!("failed to start runtime: {}", e)),
             };
             let report = rt.block_on(crate::peering::nat::upnp::attempt_udp_port_mapping(
                 listen_addr,
@@ -900,7 +914,8 @@ fn dispatch(
             // Propagate to runtime_net only if ports match (runtime may have
             // restarted on a different port since UPnP began).
             if let Some(ref mut ni) = *state.runtime_net.write().unwrap() {
-                let runtime_port = ni.listen_addr
+                let runtime_port = ni
+                    .listen_addr
                     .parse::<std::net::SocketAddr>()
                     .map(|a| a.port())
                     .unwrap_or(0);
@@ -913,17 +928,18 @@ fn dispatch(
         RpcMethod::CreateDeviceLink {
             public_addr,
             public_spki,
-        } => match state.require_active_peer() {
-            Ok(peer_id) => {
-                let listen_port = state
-                    .runtime_net
-                    .read()
-                    .unwrap()
-                    .as_ref()
-                    .and_then(|ni| ni.listen_addr.parse::<std::net::SocketAddr>().ok())
-                    .map(|sa| sa.port())
-                    .unwrap_or(crate::event_modules::workspace::invite_link::DEFAULT_PORT);
-                let explicit_addrs: Vec<crate::event_modules::workspace::invite_link::BootstrapAddress> =
+        } => {
+            match state.require_active_peer() {
+                Ok(peer_id) => {
+                    let listen_port = state
+                        .runtime_net
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|ni| ni.listen_addr.parse::<std::net::SocketAddr>().ok())
+                        .map(|sa| sa.port())
+                        .unwrap_or(crate::event_modules::workspace::invite_link::DEFAULT_PORT);
+                    let explicit_addrs: Vec<crate::event_modules::workspace::invite_link::BootstrapAddress> =
                     match public_addr {
                         Some(ref addr) => {
                             match crate::event_modules::workspace::invite_link::parse_bootstrap_address(addr) {
@@ -933,40 +949,44 @@ fn dispatch(
                         }
                         None => vec![],
                     };
-                let bootstrap_addrs = if explicit_addrs.is_empty() {
-                    let detected = crate::event_modules::workspace::invite_link::detect_bootstrap_addrs(listen_port);
-                    if detected.is_empty() {
-                        return RpcResponse::error("No non-loopback addresses detected. Provide public_addr explicitly.".to_string());
-                    }
-                    detected
-                } else {
-                    explicit_addrs
-                };
-                match workspace::commands::create_device_link_for_peer(
-                    db_path,
-                    &peer_id,
-                    &bootstrap_addrs,
-                    listen_port,
-                    public_spki.as_deref(),
-                ) {
-                    Ok(data) => {
-                        if let Some(link) = serde_json::to_value(&data)
-                            .ok()
-                            .and_then(|v| v["invite_link"].as_str().map(|s| s.to_string()))
-                        {
-                            let num = state.add_invite_ref(link);
-                            let mut resp_data = serde_json::to_value(&data).unwrap();
-                            resp_data["invite_ref"] = serde_json::json!(num);
-                            RpcResponse::success(resp_data)
-                        } else {
-                            RpcResponse::success(data)
+                    let bootstrap_addrs = if explicit_addrs.is_empty() {
+                        let detected =
+                            crate::event_modules::workspace::invite_link::detect_bootstrap_addrs(
+                                listen_port,
+                            );
+                        if detected.is_empty() {
+                            return RpcResponse::error("No non-loopback addresses detected. Provide public_addr explicitly.".to_string());
                         }
+                        detected
+                    } else {
+                        explicit_addrs
+                    };
+                    match workspace::commands::create_device_link_for_peer(
+                        db_path,
+                        &peer_id,
+                        &bootstrap_addrs,
+                        listen_port,
+                        public_spki.as_deref(),
+                    ) {
+                        Ok(data) => {
+                            if let Some(link) = serde_json::to_value(&data)
+                                .ok()
+                                .and_then(|v| v["invite_link"].as_str().map(|s| s.to_string()))
+                            {
+                                let num = state.add_invite_ref(link);
+                                let mut resp_data = serde_json::to_value(&data).unwrap();
+                                resp_data["invite_ref"] = serde_json::json!(num);
+                                RpcResponse::success(resp_data)
+                            } else {
+                                RpcResponse::success(data)
+                            }
+                        }
+                        Err(e) => RpcResponse::error(e.to_string()),
                     }
-                    Err(e) => RpcResponse::error(e.to_string()),
                 }
+                Err(e) => RpcResponse::error(e),
             }
-            Err(e) => RpcResponse::error(e),
-        },
+        }
         RpcMethod::AcceptLink { invite, devicename } => {
             let resolved = match state.resolve_invite_ref(&invite) {
                 Ok(link) => link,

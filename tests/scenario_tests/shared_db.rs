@@ -4,6 +4,37 @@ use topo::db::open_connection;
 use topo::testutil::{assert_eventually, start_peers_pinned, Peer, ScenarioHarness, SharedDbNode};
 use topo::transport::extract_spki_fingerprint;
 
+async fn assert_direct_message_exchange(
+    peer_a: &Peer,
+    peer_b: &Peer,
+    peer_a_marker: &str,
+    peer_b_marker: &str,
+    reason: &str,
+) {
+    let peer_a_event = peer_a.create_message(peer_a_marker);
+    let peer_a_event_b64 = event_id_to_base64(&peer_a_event);
+    let peer_b_event = peer_b.create_message(peer_b_marker);
+    let peer_b_event_b64 = event_id_to_base64(&peer_b_event);
+
+    let _sync = start_peers_pinned(peer_a, peer_b);
+    assert_eventually(
+        || peer_a.has_event(&peer_b_event_b64) && peer_b.has_event(&peer_a_event_b64),
+        Duration::from_secs(20),
+        reason,
+    )
+    .await;
+}
+
+fn has_valid_event(peer: &Peer, event_id_b64: &str) -> bool {
+    let db = open_connection(&peer.db_path).expect("open db");
+    db.query_row(
+        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![&peer.identity, event_id_b64],
+        |row| row.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
+}
+
 #[tokio::test]
 async fn test_shared_db_two_tenants_different_workspaces() {
     let node = SharedDbNode::new(2);
@@ -335,8 +366,14 @@ async fn test_shared_db_overlapping_workspace_groups_matrix() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(ws0_tenants, 2, "workspace 0 should be scoped to two tenants");
-    assert_eq!(ws1_tenants, 2, "workspace 1 should be scoped to two tenants");
+    assert_eq!(
+        ws0_tenants, 2,
+        "workspace 0 should be scoped to two tenants"
+    );
+    assert_eq!(
+        ws1_tenants, 2,
+        "workspace 1 should be scoped to two tenants"
+    );
 
     harness.finish();
 }
@@ -379,6 +416,126 @@ async fn test_shared_db_three_tenants_same_workspace_matrix() {
     assert_eq!(
         tenants_with_ws, 3,
         "shared workspace event should be present for all tenants"
+    );
+
+    harness.finish();
+}
+
+/// Real-network intersection test: a multitenant shared-DB node hosts two
+/// tenants in the same workspace, then an external peer joins that workspace
+/// via the production invite/bootstrap flow. The non-inviter shared-DB tenant
+/// and the external peer must converge through real sync and then communicate
+/// directly.
+#[tokio::test]
+async fn test_shared_db_three_peer_same_workspace_real_network_direct_sync() {
+    let mut node = SharedDbNode::new(1);
+    node.add_tenant_in_workspace("tenant-1-same-ws", 0);
+    let external = Peer::new_in_workspace("external", &node.tenants[0]).await;
+    let harness = ScenarioHarness::new();
+    harness.track_node(&node);
+    harness.track(&external);
+
+    let root = &node.tenants[0];
+    let sibling = &node.tenants[1];
+    let root_marker = root.create_message("shared-db-root-marker");
+    let root_marker_b64 = event_id_to_base64(&root_marker);
+    let sibling_marker = sibling.create_message("shared-db-sibling-marker");
+    let sibling_marker_b64 = event_id_to_base64(&sibling_marker);
+    let external_marker = external.create_message("shared-db-external-marker");
+    let external_marker_b64 = event_id_to_base64(&external_marker);
+
+    let _sync_root_external = start_peers_pinned(root, &external);
+    let _sync_sibling_external = start_peers_pinned(sibling, &external);
+
+    assert_eventually(
+        || {
+            external.has_event(&root_marker_b64)
+                && external.has_event(&sibling_marker_b64)
+                && root.has_event(&external_marker_b64)
+                && sibling.has_event(&external_marker_b64)
+        },
+        Duration::from_secs(20),
+        "both shared-db tenants and the external peer should exchange markers over real network sync",
+    )
+    .await;
+
+    assert_eq!(
+        external.user_count(),
+        3,
+        "external peer should see all three users"
+    );
+    assert!(
+        sibling.user_count() >= 2,
+        "sibling tenant should retain shared-workspace identities after external sync",
+    );
+
+    assert_direct_message_exchange(
+        sibling,
+        &external,
+        "shared-db-sibling-direct-to-external",
+        "external-direct-to-shared-db-sibling",
+        "shared-db sibling tenant and external peer should sync directly after relay convergence",
+    )
+    .await;
+
+    harness.finish();
+}
+
+/// Real-network isolation test: one tenant on a multitenant shared-DB node
+/// invites an external peer into its workspace, while another tenant on the
+/// same node stays on a different workspace. Direct sync with that foreign
+/// external peer must reject rather than leak state across tenant scopes.
+#[tokio::test]
+async fn test_shared_db_three_peer_cross_workspace_real_network_isolation() {
+    let node = SharedDbNode::new(2);
+    let external = Peer::new_in_workspace("external", &node.tenants[0]).await;
+    let harness = ScenarioHarness::skip(
+        "cross-workspace rejection in shared-db multitenant mode intentionally records foreign event ids before projection rejects them",
+    );
+    harness.track_node(&node);
+    harness.track(&external);
+
+    let workspace_a = &node.tenants[0];
+    let workspace_b = &node.tenants[1];
+
+    let external_marker = external.create_message("external-cross-workspace-marker");
+    let external_marker_b64 = event_id_to_base64(&external_marker);
+
+    let _sync_a_external = start_peers_pinned(workspace_a, &external);
+    assert_eventually(
+        || workspace_a.has_event(&external_marker_b64),
+        Duration::from_secs(20),
+        "workspace A tenant should receive the external peer's marker",
+    )
+    .await;
+
+    let rejected_before = workspace_b.rejected_event_count();
+    let _sync_b_external = start_peers_pinned(workspace_b, &external);
+    assert_eventually(
+        || workspace_b.rejected_event_count() > rejected_before,
+        Duration::from_secs(20),
+        "workspace B tenant should reject foreign workspace events from the external peer",
+    )
+    .await;
+
+    assert!(
+        !has_valid_event(workspace_b, &external_marker_b64),
+        "foreign external marker must not project valid for the other tenant"
+    );
+    assert_eq!(
+        workspace_b.scoped_message_count(),
+        0,
+        "isolated tenant should not project any foreign messages",
+    );
+    assert_eq!(
+        workspace_b.user_count(),
+        1,
+        "isolated tenant should retain only its own workspace user",
+    );
+    assert_eq!(
+        workspace_b.workspace_count(),
+        1,
+        "isolated tenant should retain only its own workspace binding",
     );
 
     harness.finish();

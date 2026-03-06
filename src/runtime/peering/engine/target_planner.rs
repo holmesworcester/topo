@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use tracing::warn;
 
 use crate::db::open_connection;
-use crate::db::transport_creds::list_local_peers;
+use crate::db::transport_creds::discover_local_tenants;
 use crate::db::transport_trust::list_active_invite_bootstrap_targets;
 use crate::event_modules::workspace::invite_link::parse_bootstrap_address;
 
@@ -142,7 +142,12 @@ pub(crate) fn collect_all_bootstrap_targets(
     db_path: &str,
 ) -> Result<Vec<(String, String, SocketAddr)>, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
-    let tenant_ids = list_local_peers(&db)?;
+    let mut tenant_ids: Vec<String> = discover_local_tenants(&db)?
+        .into_iter()
+        .map(|tenant| tenant.peer_id)
+        .collect();
+    tenant_ids.sort();
+    tenant_ids.dedup();
     drop(db);
     load_bootstrap_targets(db_path, &tenant_ids)
 }
@@ -199,7 +204,107 @@ mod tests {
     use crate::db::open_connection;
     use crate::db::open_in_memory;
     use crate::db::schema::create_tables;
-    use crate::db::transport_trust;
+    use crate::db::{transport_creds, transport_trust};
+
+    fn seed_direct_bootstrap_tenant(
+        conn: &rusqlite::Connection,
+        tenant_id: &str,
+        invite_event_id: &str,
+        bootstrap_addr: &str,
+    ) {
+        conn.execute(
+            "INSERT INTO invites_accepted
+             (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                tenant_id,
+                format!("ia-{tenant_id}"),
+                format!("tenant-event-{tenant_id}"),
+                invite_event_id,
+                format!("ws-{tenant_id}"),
+                1i64
+            ],
+        )
+        .unwrap();
+        transport_creds::store_local_creds_with_source(
+            conn,
+            tenant_id,
+            b"cert",
+            b"key",
+            transport_creds::CRED_SOURCE_PEER_SHARED,
+        )
+        .unwrap();
+        transport_trust::record_invite_bootstrap_trust(
+            conn,
+            tenant_id,
+            &format!("ia-{tenant_id}"),
+            invite_event_id,
+            &format!("ws-{tenant_id}"),
+            bootstrap_addr,
+            &[0xAA; 32],
+        )
+        .unwrap();
+    }
+
+    fn seed_transitional_bootstrap_tenant(
+        conn: &rusqlite::Connection,
+        tenant_id: &str,
+        invite_event_id: &str,
+        bootstrap_addr: &str,
+    ) -> String {
+        let invite_sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let bootstrap_peer_id = hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
+            &invite_sk.verifying_key().to_bytes(),
+        ));
+
+        conn.execute(
+            "INSERT INTO invites_accepted
+             (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                tenant_id,
+                format!("ia-{tenant_id}"),
+                format!("tenant-event-{tenant_id}"),
+                invite_event_id,
+                format!("ws-{tenant_id}"),
+                1i64
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO invite_secrets
+             (recorded_by, event_id, invite_event_id, private_key, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                tenant_id,
+                format!("is-{tenant_id}"),
+                invite_event_id,
+                invite_sk.to_bytes().to_vec(),
+                1i64
+            ],
+        )
+        .unwrap();
+        transport_creds::store_local_creds_with_source(
+            conn,
+            &bootstrap_peer_id,
+            b"cert",
+            b"key",
+            transport_creds::CRED_SOURCE_BOOTSTRAP,
+        )
+        .unwrap();
+        transport_trust::record_invite_bootstrap_trust(
+            conn,
+            tenant_id,
+            &format!("ia-{tenant_id}"),
+            invite_event_id,
+            &format!("ws-{tenant_id}"),
+            bootstrap_addr,
+            &[0xCC; 32],
+        )
+        .unwrap();
+
+        bootstrap_peer_id
+    }
 
     fn addr(port: u16) -> SocketAddr {
         SocketAddr::new("127.0.0.1".parse().unwrap(), port)
@@ -545,6 +650,73 @@ mod tests {
             .collect();
         assert!(invite_ids.contains("inv-1"));
         assert!(invite_ids.contains("inv-2"));
+    }
+
+    #[test]
+    fn test_collect_all_bootstrap_targets_uses_tenant_ids_for_transitional_bootstrap() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("transitional-bootstrap.db");
+        let conn = open_connection(&db_path).unwrap();
+        create_tables(&conn).unwrap();
+
+        let tenant_id = "tenant-transitional";
+        let invite_event_id = "inv-transitional";
+        let bootstrap_peer_id =
+            seed_transitional_bootstrap_tenant(&conn, tenant_id, invite_event_id, "10.0.0.1:4433");
+        drop(conn);
+
+        let wrong_namespace_targets = load_bootstrap_targets(
+            db_path.to_str().unwrap(),
+            std::slice::from_ref(&bootstrap_peer_id),
+        )
+        .unwrap();
+        assert!(
+            wrong_namespace_targets.is_empty(),
+            "transport peer ids must not be used as bootstrap trust scope"
+        );
+
+        let targets = collect_all_bootstrap_targets(db_path.to_str().unwrap()).unwrap();
+        assert_eq!(targets.len(), 1, "transitional tenant must still autodial");
+        assert_eq!(targets[0].0, tenant_id);
+        assert_eq!(targets[0].1, invite_event_id);
+        assert_eq!(targets[0].2, "10.0.0.1:4433".parse::<SocketAddr>().unwrap());
+    }
+
+    #[test]
+    fn test_collect_all_bootstrap_targets_handles_mixed_direct_and_transitional_tenants() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("mixed-bootstrap.db");
+        let conn = open_connection(&db_path).unwrap();
+        create_tables(&conn).unwrap();
+
+        seed_direct_bootstrap_tenant(&conn, "tenant-direct", "inv-direct", "10.0.0.10:4433");
+        seed_transitional_bootstrap_tenant(
+            &conn,
+            "tenant-transitional",
+            "inv-transitional",
+            "10.0.0.20:4433",
+        );
+        drop(conn);
+
+        let targets = collect_all_bootstrap_targets(db_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            targets.len(),
+            2,
+            "direct and transitional tenants must both autodial"
+        );
+
+        let by_tenant: std::collections::HashMap<String, SocketAddr> = targets
+            .into_iter()
+            .map(|(tenant_id, _invite_event_id, remote)| (tenant_id, remote))
+            .collect();
+        assert_eq!(
+            by_tenant.get("tenant-direct"),
+            Some(&"10.0.0.10:4433".parse::<SocketAddr>().unwrap())
+        );
+        assert_eq!(
+            by_tenant.get("tenant-transitional"),
+            Some(&"10.0.0.20:4433".parse::<SocketAddr>().unwrap())
+        );
     }
 
     // -- Bootstrap progression (new targets appearing after projection) --

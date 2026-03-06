@@ -4,8 +4,7 @@ use serde::{Deserialize, Serialize};
 
 use super::commands::{
     add_device_to_workspace, create_device_link_invite, create_user_invite, create_workspace,
-    join_workspace_as_new_user, load_local_peer_signer, persist_join_peer_secret,
-    persist_link_peer_secret,
+    join_workspace_as_new_user, persist_join_peer_secret, persist_link_peer_secret,
 };
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::service::{open_db_for_peer, open_db_load};
@@ -105,9 +104,7 @@ pub fn create_workspace_for_db(
     device_name: &str,
 ) -> Result<CreateWorkspaceResponse, Box<dyn std::error::Error + Send + Sync>> {
     use crate::db::{
-        open_connection,
-        schema::create_tables,
-        transport_creds::discover_local_tenants,
+        open_connection, schema::create_tables, transport_creds::discover_local_tenants,
     };
     use crate::transport::identity::load_transport_peer_id;
 
@@ -121,9 +118,9 @@ pub fn create_workspace_for_db(
                 0 => Ok(None),
                 1 => Ok(Some(tenants[0].peer_id.clone())),
                 n => Err(format!(
-                    "multiple tenant scopes found ({}); run `topo tenants` and `topo use-tenant <N>`",
-                    n
-                )
+                "multiple tenant scopes found ({}); run `topo tenants` and `topo use-tenant <N>`",
+                n
+            )
                 .into()),
             }
         };
@@ -176,38 +173,48 @@ pub fn create_workspace_for_db(
 /// Create a user invite for the active workspace.
 ///
 /// When `bootstrap_addrs` is empty, auto-detects non-loopback addresses.
-pub fn create_invite_for_db(
-    db_path: &str,
+fn create_invite_for_recorded_by(
+    db: &Connection,
+    recorded_by: &str,
     bootstrap_addrs: &[super::invite_link::BootstrapAddress],
     listen_port: u16,
+    public_spki_hex: Option<&str>,
 ) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let (recorded_by, db) =
-        open_db_load(db_path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("No transport identity: {}", e).into()
-        })?;
-
-    let ws_eid = super::resolve_workspace_for_peer(&db, &recorded_by)?;
-    let (sender_peer_eid, sender_peer_key) = load_local_peer_signer(&db, &recorded_by)?
-        .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-            "No local peer signer found for invite creation.".into()
-        })?;
-    if !signer_is_admin(&db, &recorded_by, &sender_peer_eid)? {
+    let ws_eid = super::resolve_workspace_for_peer(db, recorded_by)?;
+    let (sender_peer_eid, sender_peer_key) =
+        crate::event_modules::peer_shared::load_local_peer_signer_required(db, recorded_by)?;
+    if !signer_is_admin(db, recorded_by, &sender_peer_eid)? {
         return Err("Local peer signer is not admin for this workspace.".into());
     }
-    let admin_event_id = resolve_admin_event_for_signer(&db, &recorded_by, &sender_peer_eid)?
+    let admin_event_id = resolve_admin_event_for_signer(db, recorded_by, &sender_peer_eid)?
         .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
             "Could not resolve admin event for local peer signer.".into()
         })?;
 
-    // Get local SPKI for the bootstrap address
-    let spki_bytes = hex::decode(&recorded_by)?;
-    let mut bootstrap_spki = [0u8; 32];
-    bootstrap_spki.copy_from_slice(&spki_bytes);
+    let bootstrap_spki = if let Some(spki_hex) = public_spki_hex {
+        let spki_bytes = hex::decode(spki_hex)?;
+        if spki_bytes.len() != 32 {
+            return Err("SPKI must be 32 bytes hex".into());
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&spki_bytes);
+        arr
+    } else {
+        let spki_bytes = hex::decode(recorded_by)?;
+        if spki_bytes.len() != 32 {
+            return Err("peer_id is not valid 32-byte hex SPKI".into());
+        }
+        let mut arr = [0u8; 32];
+        arr.copy_from_slice(&spki_bytes);
+        arr
+    };
 
     let addrs = if bootstrap_addrs.is_empty() {
         let detected = super::invite_link::detect_bootstrap_addrs(listen_port);
         if detected.is_empty() {
-            return Err("No non-loopback addresses detected. Provide --public-addr explicitly.".into());
+            return Err(
+                "No non-loopback addresses detected. Provide --public-addr explicitly.".into(),
+            );
         }
         detected
     } else {
@@ -215,8 +222,8 @@ pub fn create_invite_for_db(
     };
 
     let result = create_user_invite(
-        &db,
-        &recorded_by,
+        db,
+        recorded_by,
         &sender_peer_key,
         &sender_peer_eid,
         &admin_event_id,
@@ -231,6 +238,18 @@ pub fn create_invite_for_db(
     })
 }
 
+pub fn create_invite_for_db(
+    db_path: &str,
+    bootstrap_addrs: &[super::invite_link::BootstrapAddress],
+    listen_port: u16,
+) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (recorded_by, db) =
+        open_db_load(db_path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("No transport identity: {}", e).into()
+        })?;
+    create_invite_for_recorded_by(&db, &recorded_by, bootstrap_addrs, listen_port, None)
+}
+
 /// Create invite with an explicit SPKI hex.
 pub fn create_invite_with_spki(
     db_path: &str,
@@ -241,42 +260,27 @@ pub fn create_invite_with_spki(
         open_db_load(db_path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("No transport identity: {}", e).into()
         })?;
-
-    let ws_eid = super::resolve_workspace_for_peer(&db, &recorded_by)?;
-    let (sender_peer_eid, sender_peer_key) = load_local_peer_signer(&db, &recorded_by)?
-        .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-            "No local peer signer found.".into()
-        })?;
-    if !signer_is_admin(&db, &recorded_by, &sender_peer_eid)? {
-        return Err("Local peer signer is not admin for this workspace.".into());
-    }
-    let admin_event_id = resolve_admin_event_for_signer(&db, &recorded_by, &sender_peer_eid)?
-        .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-            "Could not resolve admin event for local peer signer.".into()
-        })?;
-
-    let spki_bytes = hex::decode(public_spki_hex)?;
-    if spki_bytes.len() != 32 {
-        return Err("SPKI must be 32 bytes hex".into());
-    }
-    let mut bootstrap_spki = [0u8; 32];
-    bootstrap_spki.copy_from_slice(&spki_bytes);
-
-    let result = create_user_invite(
+    create_invite_for_recorded_by(
         &db,
         &recorded_by,
-        &sender_peer_key,
-        &sender_peer_eid,
-        &admin_event_id,
-        &ws_eid,
         bootstrap_addrs,
-        &bootstrap_spki,
-    )?;
+        crate::event_modules::workspace::invite_link::DEFAULT_PORT,
+        Some(public_spki_hex),
+    )
+}
 
-    Ok(CreateInviteResponse {
-        invite_link: result.invite_link,
-        invite_event_id: event_id_to_base64(&result.invite_event_id),
-    })
+/// Create a user invite for a specific peer (daemon provides the peer_id).
+///
+/// When `bootstrap_addrs` is empty, auto-detects non-loopback addresses.
+pub fn create_invite_for_peer(
+    db_path: &str,
+    peer_id: &str,
+    bootstrap_addrs: &[super::invite_link::BootstrapAddress],
+    listen_port: u16,
+    public_spki_hex: Option<&str>,
+) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
+    create_invite_for_recorded_by(&db, peer_id, bootstrap_addrs, listen_port, public_spki_hex)
 }
 
 struct PreparedInviteAcceptance {
@@ -466,9 +470,8 @@ pub fn create_device_link_for_peer(
 ) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
 
-    let (sender_peer_eid, sender_peer_key) = load_local_peer_signer(&db, peer_id)?.ok_or_else(
-        || -> Box<dyn std::error::Error + Send + Sync> { "No local peer signer found.".into() },
-    )?;
+    let (sender_peer_eid, sender_peer_key) =
+        crate::event_modules::peer_shared::load_local_peer_signer_required(&db, peer_id)?;
     if !signer_is_admin(&db, peer_id, &sender_peer_eid)? {
         return Err("Local peer signer is not admin for this workspace.".into());
     }
@@ -503,7 +506,9 @@ pub fn create_device_link_for_peer(
     let addrs = if bootstrap_addrs.is_empty() {
         let detected = super::invite_link::detect_bootstrap_addrs(listen_port);
         if detected.is_empty() {
-            return Err("No non-loopback addresses detected. Provide --public-addr explicitly.".into());
+            return Err(
+                "No non-loopback addresses detected. Provide --public-addr explicitly.".into(),
+            );
         }
         detected
     } else {

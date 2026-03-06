@@ -937,7 +937,10 @@ fn resolve_subscription_selector(
 
     let refs = list_subscription_refs(db, socket)?;
     if refs.is_empty() {
-        return Err("no subscriptions found — run `topo sub create --name ... --event-type message` first".into());
+        return Err(
+            "no subscriptions found — run `topo sub create --name ... --event-type message` first"
+                .into(),
+        );
     }
 
     let Some(selector) = selector else {
@@ -1254,10 +1257,12 @@ fn spawn_runtime(
             if info.upnp.is_none() {
                 let prior = state_for_net.upnp_result.read().unwrap().clone();
                 if let Some(ref report) = prior {
-                    if report.requested_external_port == info.listen_addr
-                        .parse::<std::net::SocketAddr>()
-                        .map(|a| a.port())
-                        .unwrap_or(0)
+                    if report.requested_external_port
+                        == info
+                            .listen_addr
+                            .parse::<std::net::SocketAddr>()
+                            .map(|a| a.port())
+                            .unwrap_or(0)
                     {
                         info.upnp = prior;
                     }
@@ -1420,11 +1425,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // Record the bind address early so UPnP can run before any tenants
             // exist.  Only useful for fixed ports — with port 0 the real port
             // is unknown until the QUIC runtime binds, so we leave it as None.
-            let resolved_bind: Option<SocketAddr> = if bind.port() != 0 {
-                Some(bind)
-            } else {
-                None
-            };
+            let resolved_bind: Option<SocketAddr> =
+                if bind.port() != 0 { Some(bind) } else { None };
 
             let shutdown = Arc::new(AtomicBool::new(false));
             let shutdown_notify = Arc::new(tokio::sync::Notify::new());
@@ -2360,7 +2362,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 },
             )?;
         }
-        Commands::SubState { sub, sub_flag, json } => {
+        Commands::SubState {
+            sub,
+            sub_flag,
+            json,
+        } => {
             eprintln!("warning: `topo sub-state` is deprecated; use `topo sub state`");
             run_sub_action(
                 db,

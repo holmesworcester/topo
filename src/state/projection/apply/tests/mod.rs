@@ -5089,8 +5089,7 @@ fn test_invite_accepted_materializes_multiple_bootstrap_trust_rows() {
 
     // All 3 addresses must be queryable
     let addrs =
-        crate::db::transport_trust::list_active_invite_bootstrap_addrs(&conn, recorded_by)
-            .unwrap();
+        crate::db::transport_trust::list_active_invite_bootstrap_addrs(&conn, recorded_by).unwrap();
     assert_eq!(addrs.len(), 3, "must have three active bootstrap addrs");
     assert!(addrs.contains(&"192.168.1.50:4433".to_string()));
     assert!(addrs.contains(&"100.64.1.20:4433".to_string()));
@@ -5098,8 +5097,7 @@ fn test_invite_accepted_materializes_multiple_bootstrap_trust_rows() {
 
     // SPKI must be allowed
     let allowed =
-        crate::db::transport_trust::is_peer_allowed(&conn, recorded_by, &bootstrap_spki)
-            .unwrap();
+        crate::db::transport_trust::is_peer_allowed(&conn, recorded_by, &bootstrap_spki).unwrap();
     assert!(allowed, "bootstrap SPKI must be allowed");
 }
 
@@ -5470,5 +5468,124 @@ fn test_bootstrap_trust_superseded_by_matching_peer_shared() {
     assert!(
         crate::db::transport_trust::is_peer_allowed(&conn, recorded_by, &bootstrap_spki).unwrap(),
         "PeerShared-derived SPKI must still be allowed via steady-state trust"
+    );
+}
+
+#[test]
+fn test_invite_accepted_same_workspace_binding_is_scoped_per_tenant() {
+    let conn = setup();
+    let shared_workspace_id = [0xA7; 32];
+    let shared_workspace_b64 = event_id_to_base64(&shared_workspace_id);
+
+    for (tenant, invite_event_id) in [("tenant_a", [0xC1; 32]), ("tenant_b", [0xC2; 32])] {
+        let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
+            created_at_ms: now_ms(),
+            tenant_event_id: setup_tenant_event(&conn, tenant),
+            invite_event_id,
+            workspace_id: shared_workspace_id,
+        });
+        let ia_blob = events::encode_event(&ia_event).unwrap();
+        let ia_eid = insert_event_raw(&conn, tenant, &ia_blob);
+        assert_eq!(
+            project_one(&conn, tenant, &ia_eid).unwrap(),
+            ProjectionDecision::Valid,
+            "invite_accepted should project for {}",
+            tenant
+        );
+    }
+
+    let tenant_a_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM invites_accepted WHERE recorded_by = ?1 AND workspace_id = ?2",
+            rusqlite::params!["tenant_a", &shared_workspace_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let tenant_b_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM invites_accepted WHERE recorded_by = ?1 AND workspace_id = ?2",
+            rusqlite::params!["tenant_b", &shared_workspace_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+
+    assert_eq!(
+        tenant_a_count, 1,
+        "tenant_a should keep its own workspace binding"
+    );
+    assert_eq!(
+        tenant_b_count, 1,
+        "tenant_b should keep its own workspace binding"
+    );
+}
+
+#[test]
+fn test_bootstrap_trust_consumption_is_tenant_scoped() {
+    let conn = setup();
+    let mut rng = rand::thread_rng();
+    let peer_shared_key = SigningKey::generate(&mut rng);
+    let peer_shared_pub = peer_shared_key.verifying_key().to_bytes();
+    let bootstrap_spki =
+        crate::transport::cert::spki_fingerprint_from_ed25519_pubkey(&peer_shared_pub);
+
+    for (tenant, invite_event_id, bootstrap_addr) in [
+        ("tenant_a", [0xD1; 32], "10.0.0.1:4433"),
+        ("tenant_b", [0xD2; 32], "10.0.0.2:4433"),
+    ] {
+        let workspace_id = [0xB4; 32];
+        let invite_event_id_b64 = event_id_to_base64(&invite_event_id);
+        let workspace_b64 = event_id_to_base64(&workspace_id);
+        crate::db::transport_trust::append_bootstrap_context(
+            &conn,
+            tenant,
+            &invite_event_id_b64,
+            &workspace_b64,
+            bootstrap_addr,
+            &bootstrap_spki,
+        )
+        .unwrap();
+
+        let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
+            created_at_ms: now_ms(),
+            tenant_event_id: setup_tenant_event(&conn, tenant),
+            invite_event_id,
+            workspace_id,
+        });
+        let ia_blob = events::encode_event(&ia_event).unwrap();
+        let ia_eid = insert_event_raw(&conn, tenant, &ia_blob);
+        assert_eq!(
+            project_one(&conn, tenant, &ia_eid).unwrap(),
+            ProjectionDecision::Valid,
+            "invite_accepted should materialize bootstrap trust for {}",
+            tenant
+        );
+    }
+
+    let addrs_a_before =
+        crate::db::transport_trust::list_active_invite_bootstrap_addrs(&conn, "tenant_a").unwrap();
+    let addrs_b_before =
+        crate::db::transport_trust::list_active_invite_bootstrap_addrs(&conn, "tenant_b").unwrap();
+    assert_eq!(addrs_a_before, vec!["10.0.0.1:4433".to_string()]);
+    assert_eq!(addrs_b_before, vec!["10.0.0.2:4433".to_string()]);
+
+    crate::db::transport_trust::consume_bootstrap_for_peer_shared(
+        &conn,
+        "tenant_a",
+        &peer_shared_pub,
+    )
+    .unwrap();
+
+    let addrs_a_after =
+        crate::db::transport_trust::list_active_invite_bootstrap_addrs(&conn, "tenant_a").unwrap();
+    let addrs_b_after =
+        crate::db::transport_trust::list_active_invite_bootstrap_addrs(&conn, "tenant_b").unwrap();
+    assert!(
+        addrs_a_after.is_empty(),
+        "tenant_a bootstrap trust should be consumed by matching peer_shared"
+    );
+    assert_eq!(
+        addrs_b_after,
+        vec!["10.0.0.2:4433".to_string()],
+        "tenant_b bootstrap trust must survive consumption under tenant_a"
     );
 }

@@ -232,7 +232,9 @@ impl Peer {
         use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
         use crate::event_modules::workspace::commands::create_user_invite_raw;
         use crate::event_modules::workspace::identity_ops::expected_invite_bootstrap_spki_from_invite_key;
-        use crate::event_modules::workspace::invite_link::{create_invite_link, parse_bootstrap_address};
+        use crate::event_modules::workspace::invite_link::{
+            create_invite_link, parse_bootstrap_address,
+        };
 
         // Create a bare peer with DB tables but NO transport identity.
         // svc_accept_invite will install the invite-derived identity.
@@ -356,6 +358,134 @@ impl Peer {
         let (eid, key) = crate::service::load_local_peer_signer_pub(&db, &scoped_peer_id)
             .expect("load_local_peer_signer_pub failed")
             .expect("accept_invite did not materialize local peer signer");
+        peer.peer_shared_event_id = Some(eid);
+        peer.peer_shared_signing_key = Some(key);
+        if let Ok(uid) =
+            crate::service::resolve_user_event_id_for_signer(&db, &scoped_peer_id, &eid)
+        {
+            peer.author_id = uid;
+        }
+
+        peer
+    }
+
+    /// Create a new device for an existing workspace user using the production
+    /// device-link flow with real QUIC bootstrap sync.
+    pub async fn new_device_in_workspace(name: &str, creator: &Peer) -> Self {
+        use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
+        use crate::event_modules::workspace::commands::create_device_link_invite_raw;
+        use crate::event_modules::workspace::identity_ops::expected_invite_bootstrap_spki_from_invite_key;
+        use crate::event_modules::workspace::invite_link::{
+            create_invite_link, parse_bootstrap_address,
+        };
+
+        let tempdir = tempfile::tempdir().expect("failed to create tempdir");
+        let db_path = tempdir
+            .path()
+            .join(format!("{}.db", name))
+            .to_str()
+            .unwrap()
+            .to_string();
+        {
+            let db = open_connection(&db_path).expect("failed to open db");
+            create_tables(&db).expect("failed to create tables");
+        }
+        let mut peer = Self {
+            name: name.to_string(),
+            db_path,
+            identity: String::new(),
+            author_id: rand::random(),
+            workspace_id: [0u8; 32],
+            peer_shared_event_id: None,
+            peer_shared_signing_key: None,
+            _tempdir: tempdir,
+        };
+
+        let creator_db = open_connection(&creator.db_path).expect("failed to open creator db");
+        let creator_peer_key = creator
+            .peer_shared_signing_key
+            .as_ref()
+            .expect("creator has no peer_shared_signing_key; use new_with_identity()");
+        let creator_peer_eid = creator
+            .peer_shared_event_id
+            .expect("creator has no peer_shared_event_id; use new_with_identity()");
+        let creator_admin_eid: EventId = creator_db
+            .query_row(
+                "SELECT event_id
+                 FROM admins
+                 WHERE recorded_by = ?1
+                 ORDER BY event_id ASC
+                 LIMIT 1",
+                rusqlite::params![&creator.identity],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+            .and_then(|b64| event_id_from_base64(&b64))
+            .expect("creator has no admin event; use new_with_identity()");
+
+        let invite = create_device_link_invite_raw(
+            &creator_db,
+            &creator.identity,
+            creator_peer_key,
+            &creator_peer_eid,
+            &creator_admin_eid,
+            &creator.author_id,
+            &creator.workspace_id,
+        )
+        .expect("failed to create device link invite");
+
+        let pending_spki = expected_invite_bootstrap_spki_from_invite_key(&invite.invite_key)
+            .expect("failed to derive invite SPKI");
+        record_pending_invite_bootstrap_trust(
+            &creator_db,
+            &creator.identity,
+            &event_id_to_base64(&invite.invite_event_id),
+            &event_id_to_base64(&creator.workspace_id),
+            &pending_spki,
+        )
+        .expect("failed to record pending bootstrap trust");
+        drop(creator_db);
+
+        let (sync_addr, sync_endpoint) =
+            start_test_sync_endpoint(&creator.db_path, &creator.identity, &invite.invite_key)
+                .expect("failed to start temp sync endpoint");
+
+        let creator_spki = creator.spki_fingerprint();
+        let bootstrap_addr = parse_bootstrap_address(&sync_addr.to_string())
+            .expect("failed to parse bootstrap addr");
+        let invite_link = create_invite_link(&invite, &[bootstrap_addr], &creator_spki)
+            .expect("failed to create device-link invite link");
+
+        let result = crate::event_modules::workspace::commands::accept_device_link(
+            &peer.db_path,
+            &invite_link,
+            name,
+        )
+        .expect("failed to accept device link");
+
+        crate::testutil::bootstrap::bootstrap_sync_from_invite(
+            &peer.db_path,
+            &result.peer_id,
+            sync_addr,
+            &creator_spki,
+            10,
+            crate::event_pipeline::batch_writer,
+        )
+        .await
+        .expect("failed bootstrap sync");
+
+        sync_endpoint.close(0u32.into(), b"bootstrap done");
+
+        let db = open_connection(&peer.db_path).expect("failed to open db");
+        let scoped_peer_id = result.peer_id.clone();
+        peer.identity = scoped_peer_id.clone();
+        peer.workspace_id = creator.workspace_id;
+
+        let _ = crate::event_pipeline::drain_project_queue(&peer.db_path, &scoped_peer_id, 1000);
+
+        let (eid, key) = crate::service::load_local_peer_signer_pub(&db, &scoped_peer_id)
+            .expect("load_local_peer_signer_pub failed")
+            .expect("accept_device_link did not materialize local peer signer");
         peer.peer_shared_event_id = Some(eid);
         peer.peer_shared_signing_key = Some(key);
         if let Ok(uid) =

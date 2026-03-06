@@ -113,4 +113,45 @@ mod tests {
         let result = project_pure(PEER, &event_id, &parsed, &empty_ctx());
         assert_reject(&result);
     }
+
+    #[test]
+    fn test_peer_shared_consumption_deletes_are_scoped_to_recorded_by() {
+        let recorded_by = "tenant_b";
+        let pk = [9u8; 32];
+        let transport_fingerprint = spki_fingerprint_from_ed25519_pubkey(&pk);
+        let parsed = make_peer_shared(pk, [8u8; 32]);
+        let event_id = b64(&[25u8; 32]);
+
+        let result = project_pure(recorded_by, &event_id, &parsed, &empty_ctx());
+        assert_valid(&result);
+
+        for table in ["pending_invite_bootstrap_trust", "invite_bootstrap_trust"] {
+            let delete = result
+                .write_ops
+                .iter()
+                .find(|op| matches!(op, WriteOp::Delete { table: t, .. } if *t == table));
+            let Some(WriteOp::Delete { where_clause, .. }) = delete else {
+                panic!("expected delete from {table}, got {:?}", result.write_ops);
+            };
+            assert!(
+                where_clause.contains(&("recorded_by", SqlVal::Text(recorded_by.to_string()))),
+                "delete for {table} must be tenant-scoped: {:?}",
+                where_clause
+            );
+
+            let expected_fp_column = if table == "pending_invite_bootstrap_trust" {
+                "expected_bootstrap_spki_fingerprint"
+            } else {
+                "bootstrap_spki_fingerprint"
+            };
+            assert!(
+                where_clause.contains(&(
+                    expected_fp_column,
+                    SqlVal::Blob(transport_fingerprint.to_vec())
+                )),
+                "delete for {table} must match the carried transport fingerprint: {:?}",
+                where_clause
+            );
+        }
+    }
 }

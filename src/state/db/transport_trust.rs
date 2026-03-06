@@ -167,8 +167,7 @@ pub fn read_bootstrap_context(
         if workspace_id.is_none() {
             workspace_id = Some(ws);
             spki = Some(
-                decode_32_byte_blob(blob)
-                    .ok_or("bootstrap_spki_fingerprint is not 32 bytes")?,
+                decode_32_byte_blob(blob).ok_or("bootstrap_spki_fingerprint is not 32 bytes")?,
             );
         }
         if seen.insert(addr.clone()) {

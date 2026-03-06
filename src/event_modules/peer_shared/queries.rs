@@ -16,6 +16,22 @@ fn decode_signing_key(key_bytes: Vec<u8>) -> Result<SigningKey, String> {
     Ok(SigningKey::from_bytes(&key_arr))
 }
 
+fn has_accepted_workspace_binding(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<bool, rusqlite::Error> {
+    db.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM invites_accepted
+             WHERE recorded_by = ?1
+             LIMIT 1
+         )",
+        rusqlite::params![recorded_by],
+        |row| row.get(0),
+    )
+}
+
 /// Load the local peer signer from peer_secrets.
 pub fn load_local_peer_signer(
     db: &Connection,
@@ -46,8 +62,18 @@ pub fn load_local_peer_signer_required(
     db: &Connection,
     recorded_by: &str,
 ) -> Result<(EventId, SigningKey), Box<dyn std::error::Error + Send + Sync>> {
-    load_local_peer_signer(db, recorded_by)?
-        .ok_or_else(|| "no identity — run `topo create-workspace` first".into())
+    if let Some(signer) = load_local_peer_signer(db, recorded_by)? {
+        return Ok(signer);
+    }
+
+    if has_accepted_workspace_binding(db, recorded_by)? {
+        return Err(
+            "workspace has not completed initial sync yet — invite accepted for this tenant, but the local peer identity is not available yet"
+                .into(),
+        );
+    }
+
+    Err("no identity — run `topo create-workspace` first".into())
 }
 
 /// Resolve the user_event_id for a specific signer from the peers_shared table.
@@ -299,6 +325,7 @@ pub fn identity(db: &Connection, recorded_by: &str) -> Result<IdentityResponse, 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::event_id_to_base64;
     use crate::crypto::spki_fingerprint_from_ed25519_pubkey;
     use crate::db::{open_in_memory, schema::create_tables};
 
@@ -464,5 +491,50 @@ mod tests {
         create_tables(&conn).expect("create tables");
         let peers = list_peers(&conn, "no-such-tenant").unwrap();
         assert!(peers.is_empty());
+    }
+
+    #[test]
+    fn load_local_peer_signer_required_reports_no_identity_for_fresh_db() {
+        let conn = open_in_memory().expect("open in-memory db");
+        create_tables(&conn).expect("create tables");
+
+        let err = load_local_peer_signer_required(&conn, "fresh-tenant")
+            .expect_err("fresh db should not have a local peer signer");
+        assert!(
+            err.to_string()
+                .contains("no identity — run `topo create-workspace` first"),
+            "unexpected error: {}",
+            err
+        );
+    }
+
+    #[test]
+    fn load_local_peer_signer_required_reports_initial_sync_for_partial_join() {
+        let conn = open_in_memory().expect("open in-memory db");
+        create_tables(&conn).expect("create tables");
+
+        conn.execute(
+            "INSERT INTO invites_accepted
+             (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "pending-tenant",
+                "ia-1",
+                "tenant-evt-1",
+                "invite-evt-1",
+                event_id_to_base64(&[0x55; 32]),
+                1i64
+            ],
+        )
+        .expect("insert invite_accepted");
+
+        let err = load_local_peer_signer_required(&conn, "pending-tenant")
+            .expect_err("partial join should not have a local peer signer yet");
+        assert!(
+            err.to_string()
+                .contains("workspace has not completed initial sync yet"),
+            "unexpected error: {}",
+            err
+        );
     }
 }

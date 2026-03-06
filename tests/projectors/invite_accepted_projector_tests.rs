@@ -10,7 +10,7 @@ mod tests {
     use topo::contracts::transport_identity_contract::TransportIdentityIntent;
     use topo::event_modules::invite_accepted::{project_pure, InviteAcceptedEvent};
     use topo::event_modules::ParsedEvent;
-    use topo::projection::contract::EmitCommand;
+    use topo::projection::contract::{EmitCommand, SqlVal, WriteOp};
 
     const PEER: &str = "peer_joiner";
 
@@ -104,5 +104,71 @@ mod tests {
                 }
             )
         });
+    }
+
+    #[test]
+    fn test_invite_accepted_writes_are_scoped_to_recorded_by() {
+        let recorded_by = "tenant_scope_a";
+        let ws_id = [10u8; 32];
+        let parsed = make_invite_accepted([5u8; 32], ws_id);
+        let mut ctx = ctx_with_bootstrap(&b64(&ws_id), false);
+        ctx.has_local_invite_secret = true;
+
+        let result = project_pure(recorded_by, "event_ia_scope", &parsed, &ctx);
+        assert_valid(&result);
+
+        let binding_insert = result.write_ops.iter().find(|op| {
+            matches!(
+                op,
+                WriteOp::InsertOrIgnore {
+                    table: "invites_accepted",
+                    ..
+                }
+            )
+        });
+        let Some(WriteOp::InsertOrIgnore {
+            columns, values, ..
+        }) = binding_insert
+        else {
+            panic!(
+                "expected invites_accepted insert, got {:?}",
+                result.write_ops
+            );
+        };
+        let recorded_by_idx = columns
+            .iter()
+            .position(|c| *c == "recorded_by")
+            .expect("invites_accepted insert should include recorded_by");
+        assert_eq!(
+            values[recorded_by_idx],
+            SqlVal::Text(recorded_by.to_string())
+        );
+
+        let trust_inserts: Vec<_> = result
+            .write_ops
+            .iter()
+            .filter_map(|op| match op {
+                WriteOp::InsertOrIgnore {
+                    table: "invite_bootstrap_trust",
+                    columns,
+                    values,
+                } => Some((columns, values)),
+                _ => None,
+            })
+            .collect();
+        assert!(
+            !trust_inserts.is_empty(),
+            "expected invite_bootstrap_trust insert ops"
+        );
+        for (columns, values) in trust_inserts {
+            let recorded_by_idx = columns
+                .iter()
+                .position(|c| *c == "recorded_by")
+                .expect("invite_bootstrap_trust insert should include recorded_by");
+            assert_eq!(
+                values[recorded_by_idx],
+                SqlVal::Text(recorded_by.to_string())
+            );
+        }
     }
 }

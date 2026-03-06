@@ -18,13 +18,78 @@ use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use topo::testutil::DaemonGuard;
+use topo::crypto::event_id_from_base64;
+use topo::db::open_connection;
+use topo::event_modules::workspace::commands::{
+    accept_invite as accept_invite_without_sync, create_user_invite_raw,
+};
+use topo::event_modules::workspace::invite_link::{create_invite_link, parse_bootstrap_address};
+use topo::testutil::{DaemonGuard, Peer};
 
 fn cli_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
+
+fn create_user_invite_link_for_test_peer(creator: &Peer, bootstrap_addr: &str) -> String {
+    let creator_db = open_connection(&creator.db_path).expect("open creator db");
+    let creator_peer_key = creator
+        .peer_shared_signing_key
+        .as_ref()
+        .expect("creator must have a peer_shared signer");
+    let creator_peer_eid = creator
+        .peer_shared_event_id
+        .expect("creator must have a peer_shared event");
+    let creator_admin_eid = creator_db
+        .query_row(
+            "SELECT event_id
+             FROM admins
+             WHERE recorded_by = ?1
+             ORDER BY event_id ASC
+             LIMIT 1",
+            rusqlite::params![&creator.identity],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|b64| event_id_from_base64(&b64))
+        .expect("creator must have an admin event");
+
+    let invite = create_user_invite_raw(
+        &creator_db,
+        &creator.identity,
+        creator_peer_key,
+        &creator_peer_eid,
+        &creator_admin_eid,
+        &creator.workspace_id,
+    )
+    .expect("create user invite");
+    let bootstrap_addr =
+        parse_bootstrap_address(bootstrap_addr).expect("parse bootstrap address for invite link");
+    create_invite_link(&invite, &[bootstrap_addr], &creator.spki_fingerprint())
+        .expect("create invite link")
+}
+
+fn tenant_index_for_peer_id(db_path: &str, peer_id: &str) -> usize {
+    let conn = open_connection(db_path).expect("open db");
+    let mut stmt = conn
+        .prepare(
+            "SELECT DISTINCT recorded_by
+             FROM invites_accepted
+             ORDER BY recorded_by",
+        )
+        .expect("prepare tenant scope query");
+    let peer_ids = stmt
+        .query_map([], |row| row.get::<_, String>(0))
+        .expect("query tenant scopes")
+        .collect::<Result<Vec<_>, _>>()
+        .expect("collect tenant scopes");
+    peer_ids
+        .iter()
+        .position(|id| id == peer_id)
+        .map(|idx| idx + 1)
+        .expect("peer id should appear in tenant scopes")
 }
 
 /// Functional sync test using invite-based shared workspace flow.
@@ -216,6 +281,98 @@ fn test_cli_send_and_messages() {
     assert!(messages.contains(&"Second message".to_string()));
 }
 
+#[test]
+fn test_cli_selected_partial_join_tenant_reports_initial_sync_errors() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+
+    create_workspace(&bob_db);
+
+    let alice = Peer::new_with_identity("alice-partial-source");
+    let unreachable_bootstrap = format!("127.0.0.1:{}", random_port());
+    let invite_link = create_user_invite_link_for_test_peer(&alice, &unreachable_bootstrap);
+    let partial_join = accept_invite_without_sync(&bob_db, &invite_link, "bob-join", "pending")
+        .expect("accept invite without bootstrap sync");
+    let partial_tenant_index = tenant_index_for_peer_id(&bob_db, &partial_join.peer_id);
+
+    let _daemon = start_daemon(&bob_db);
+
+    let select = topo_cmd(&bob_db, &["use-tenant", &partial_tenant_index.to_string()]);
+    assert!(
+        select.status.success(),
+        "use-tenant failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&select.stdout),
+        String::from_utf8_lossy(&select.stderr)
+    );
+
+    let active = topo_cmd(&bob_db, &["active-tenant"]);
+    assert!(active.status.success(), "active-tenant failed");
+    assert_eq!(
+        String::from_utf8_lossy(&active.stdout).trim(),
+        partial_join.peer_id,
+        "active tenant should match the selected partial-join peer"
+    );
+
+    let identity = topo_cmd(&bob_db, &["identity"]);
+    assert!(
+        identity.status.success(),
+        "identity should still succeed on a partial join tenant: stdout={} stderr={}",
+        String::from_utf8_lossy(&identity.stdout),
+        String::from_utf8_lossy(&identity.stderr)
+    );
+    let identity_stdout = String::from_utf8_lossy(&identity.stdout);
+    assert!(
+        identity_stdout.contains("Transport:"),
+        "identity output should include transport fingerprint: {}",
+        identity_stdout
+    );
+    assert!(
+        identity_stdout.contains("User:      (none)"),
+        "identity should show that user identity is not projected yet: {}",
+        identity_stdout
+    );
+
+    let send = topo_cmd(&bob_db, &["send", "still-waiting"]);
+    assert!(
+        !send.status.success(),
+        "send should fail for a tenant whose initial sync has not completed"
+    );
+    let send_stderr = String::from_utf8_lossy(&send.stderr);
+    assert!(
+        send_stderr.contains("workspace has not completed initial sync yet"),
+        "send should explain the partial-join state: {}",
+        send_stderr
+    );
+
+    let invite = topo_cmd(
+        &bob_db,
+        &["invite", "--public-addr", &unreachable_bootstrap],
+    );
+    assert!(
+        !invite.status.success(),
+        "invite should fail for a tenant whose initial sync has not completed"
+    );
+    let invite_stderr = String::from_utf8_lossy(&invite.stderr);
+    assert!(
+        invite_stderr.contains("workspace has not completed initial sync yet"),
+        "invite should explain the partial-join state: {}",
+        invite_stderr
+    );
+
+    let link = topo_cmd(&bob_db, &["link", "--public-addr", &unreachable_bootstrap]);
+    assert!(
+        !link.status.success(),
+        "device-link invite should fail for a tenant whose initial sync has not completed"
+    );
+    let link_stderr = String::from_utf8_lossy(&link.stderr);
+    assert!(
+        link_stderr.contains("workspace has not completed initial sync yet"),
+        "device-link invite should explain the partial-join state: {}",
+        link_stderr
+    );
+}
+
 /// TRUST POLICY TEST: untrusted peer is rejected.
 /// Alice bootstraps identity (PeerShared self-trust makes has_any_trusted_peer true).
 /// Bob has independent identity (not in Alice's workspace). Alice should reject Bob.
@@ -279,11 +436,7 @@ fn test_cli_file_upload_sync_and_save() {
     let _bob = start_daemon(&bob_db);
 
     // Wait for Bob to receive Alice's message event
-    assert_eventually(
-        &bob_db,
-        &format!("has_event:{} >= 1", file_eid),
-        timeout_ms,
-    );
+    assert_eventually(&bob_db, &format!("has_event:{} >= 1", file_eid), timeout_ms);
 
     // Wait for message projection and attachment completion
     assert_eventually(&bob_db, "message_count >= 1", timeout_ms);
@@ -764,12 +917,7 @@ fn test_cli_messages_include_reactions() {
 fn test_cli_sub_commands_accept_name_selector_and_nested_shape() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("subs.db")
-        .to_str()
-        .unwrap()
-        .to_string();
+    let db = tmpdir.path().join("subs.db").to_str().unwrap().to_string();
 
     create_workspace(&db);
     let _daemon = start_daemon(&db);

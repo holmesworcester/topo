@@ -770,13 +770,7 @@ fn accept_invite_on_running_idle_daemon_activates_runtime_without_restart() {
         .to_string();
 
     let invite_out = Command::new(bin())
-        .args([
-            "--db",
-            &alice_db,
-            "invite",
-            "--public-addr",
-            &alice_listen,
-        ])
+        .args(["--db", &alice_db, "invite", "--public-addr", &alice_listen])
         .output()
         .unwrap();
     assert!(
@@ -1197,13 +1191,7 @@ fn rpc_invite_ref_resolution() {
     wait_for_socket(&socket);
 
     let out = Command::new(bin())
-        .args([
-            "--db",
-            &db,
-            "invite",
-            "--public-addr",
-            "127.0.0.1:4433",
-        ])
+        .args(["--db", &db, "invite", "--public-addr", "127.0.0.1:4433"])
         .output()
         .unwrap();
     assert!(out.status.success(), "invite failed: {:?}", out);
@@ -1337,13 +1325,7 @@ fn peers_shows_remote_after_invite_accept() {
 
     // Alice creates invite.
     let invite_out = Command::new(bin())
-        .args([
-            "--db",
-            &alice_db,
-            "invite",
-            "--public-addr",
-            &alice_listen,
-        ])
+        .args(["--db", &alice_db, "invite", "--public-addr", &alice_listen])
         .output()
         .unwrap();
     assert!(invite_out.status.success(), "invite failed");
@@ -1362,14 +1344,7 @@ fn peers_shows_remote_after_invite_accept() {
     );
     wait_for_socket(&bob_socket);
     let accept = Command::new(bin())
-        .args([
-            "accept",
-            "--db",
-            &bob_db,
-            &invite_link,
-            "--username",
-            "bob",
-        ])
+        .args(["accept", "--db", &bob_db, &invite_link, "--username", "bob"])
         .output()
         .unwrap();
     assert!(
