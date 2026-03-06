@@ -2468,16 +2468,25 @@ fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> S
                         .filter_map(|x| x.as_str())
                         .map(|s| short_peer_hex(s).to_string())
                         .collect::<Vec<_>>()
-                        .join(",")
                 })
                 .unwrap_or_default();
             let truncated = v["ids_truncated"].as_bool().unwrap_or(false);
             if ids.is_empty() {
                 format!(" detail=ids(count={} truncated={})", count, truncated)
             } else {
+                let shown = ids.join(",");
+                let shown_count = ids.len() as u64;
+                let more = count.saturating_sub(shown_count);
+                let extra = if more > 0 {
+                    format!(" (+{} more)", more)
+                } else if truncated {
+                    " ...".to_string()
+                } else {
+                    String::new()
+                };
                 format!(
-                    " detail=ids(count={} truncated={} sample=[{}])",
-                    count, truncated, ids
+                    " detail=ids(count={} truncated={} ids=[{}]{})",
+                    count, truncated, shown, extra
                 )
             }
         }
@@ -2608,14 +2617,14 @@ fn neg_entry_readable_line(entry_idx: usize, entry: &NegEntryView) -> String {
         }
         "IdList" => {
             let count = entry.id_count.unwrap_or(0);
-            let sample = entry
+            let ids = entry
                 .ids
                 .iter()
                 .take(4)
                 .map(|id| short_hex12(id))
                 .collect::<Vec<_>>()
                 .join(",");
-            if sample.is_empty() {
+            if ids.is_empty() {
                 format!(
                     "range[{}] MISMATCH -> IdList count={} truncated={}",
                     entry_idx + 1,
@@ -2623,16 +2632,20 @@ fn neg_entry_readable_line(entry_idx: usize, entry: &NegEntryView) -> String {
                     entry.ids_truncated
                 )
             } else {
-                let more = if entry.ids.len() > 4 || entry.ids_truncated {
-                    ",..."
+                let shown = entry.ids.len().min(4) as u64;
+                let more_count = count.saturating_sub(shown);
+                let more = if more_count > 0 {
+                    format!(" (+{} more)", more_count)
+                } else if entry.ids_truncated {
+                    " ...".to_string()
                 } else {
-                    ""
+                    String::new()
                 };
                 format!(
-                    "range[{}] MISMATCH -> IdList count={} sample=[{}{}] truncated={}",
+                    "range[{}] MISMATCH -> IdList count={} ids=[{}]{} truncated={}",
                     entry_idx + 1,
                     count,
-                    sample,
+                    ids,
                     more,
                     entry.ids_truncated
                 )
@@ -2723,9 +2736,14 @@ fn render_frame_lines(
                 let detail = if ids.is_empty() {
                     format!(" detail=events(count={})", burst.len())
                 } else {
-                    let more = if burst.len() > ids.len() { ",..." } else { "" };
+                    let more_count = burst.len().saturating_sub(ids.len());
+                    let more = if more_count > 0 {
+                        format!(" (+{} more)", more_count)
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        " detail=events(count={} sample=[{}{}])",
+                        " detail=events(count={} ids=[{}]{})",
                         burst.len(),
                         ids.join(","),
                         more
