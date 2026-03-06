@@ -1,5 +1,5 @@
 use std::io::{self, IsTerminal};
-use std::net::SocketAddr;
+use std::net::{SocketAddr, UdpSocket};
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 use std::os::unix::process::CommandExt;
 use std::path::Path;
@@ -1245,6 +1245,14 @@ async fn stop_runtime(runtime: ManagedRuntime) {
     }
 }
 
+fn reserve_idle_bind(
+    bind: SocketAddr,
+) -> Result<(UdpSocket, SocketAddr), Box<dyn std::error::Error + Send + Sync>> {
+    let socket = UdpSocket::bind(bind)?;
+    let resolved = socket.local_addr()?;
+    Ok((socket, resolved))
+}
+
 fn clear_upnp_report(state: &DaemonState) {
     *state.upnp_result.write().unwrap() = None;
     if let Some(ref mut info) = *state.runtime_net.write().unwrap() {
@@ -1337,6 +1345,7 @@ async fn reevaluate_runtime(
     bind: SocketAddr,
     state: Arc<DaemonState>,
     active_runtime: &mut Option<ManagedRuntime>,
+    idle_bind_reservation: &mut Option<UdpSocket>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     if active_runtime
         .as_ref()
@@ -1359,6 +1368,11 @@ async fn reevaluate_runtime(
         if let Some(runtime) = active_runtime.take() {
             stop_runtime(runtime).await;
         }
+        if idle_bind_reservation.is_none() {
+            let (reservation, resolved_bind) = reserve_idle_bind(bind)?;
+            *state.bind_addr.write().unwrap() = Some(resolved_bind);
+            *idle_bind_reservation = Some(reservation);
+        }
         *state.runtime_state.write().unwrap() = RuntimeState::IdleNoTenants;
         *state.runtime_net.write().unwrap() = None;
         clear_upnp_report(&state);
@@ -1373,6 +1387,7 @@ async fn reevaluate_runtime(
         if let Some(runtime) = active_runtime.take() {
             stop_runtime(runtime).await;
         }
+        let _ = idle_bind_reservation.take();
         tracing::info!("activating peering runtime ({} tenant(s))", tenants.len());
         *active_runtime = Some(spawn_runtime(db_path, bind, state, tenants));
     }
@@ -1386,12 +1401,21 @@ async fn run_runtime_manager(
     state: Arc<DaemonState>,
     shutdown_flag: Arc<AtomicBool>,
     daemon_shutdown: Arc<tokio::sync::Notify>,
+    idle_bind_reservation: UdpSocket,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut active_runtime: Option<ManagedRuntime> = None;
+    let mut idle_bind_reservation = Some(idle_bind_reservation);
     let mut interval = tokio::time::interval(Duration::from_millis(500));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
 
-    reevaluate_runtime(db_path, bind, state.clone(), &mut active_runtime).await?;
+    reevaluate_runtime(
+        db_path,
+        bind,
+        state.clone(),
+        &mut active_runtime,
+        &mut idle_bind_reservation,
+    )
+    .await?;
 
     loop {
         if shutdown_flag.load(Ordering::Relaxed) {
@@ -1408,10 +1432,24 @@ async fn run_runtime_manager(
                 return Ok(());
             }
             _ = state.runtime_recheck.notified() => {
-                reevaluate_runtime(db_path, bind, state.clone(), &mut active_runtime).await?;
+                reevaluate_runtime(
+                    db_path,
+                    bind,
+                    state.clone(),
+                    &mut active_runtime,
+                    &mut idle_bind_reservation,
+                )
+                .await?;
             }
             _ = interval.tick() => {
-                reevaluate_runtime(db_path, bind, state.clone(), &mut active_runtime).await?;
+                reevaluate_runtime(
+                    db_path,
+                    bind,
+                    state.clone(),
+                    &mut active_runtime,
+                    &mut idle_bind_reservation,
+                )
+                .await?;
             }
         }
     }
@@ -1472,16 +1510,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 create_tables(&conn)?;
             }
 
-            // Record the bind address early so UPnP can run before any tenants
-            // exist.  Only useful for fixed ports — with port 0 the real port
-            // is unknown until the QUIC runtime binds, so we leave it as None.
-            let resolved_bind: Option<SocketAddr> =
-                if bind.port() != 0 { Some(bind) } else { None };
+            // Reserve the UDP bind immediately so startup fails fast on conflicts
+            // and the daemon keeps its chosen port even while idle.
+            let (idle_bind_reservation, resolved_bind) = reserve_idle_bind(bind)?;
 
             let shutdown = Arc::new(AtomicBool::new(false));
             let shutdown_notify = Arc::new(tokio::sync::Notify::new());
             let state = Arc::new(DaemonState::new(db));
-            *state.bind_addr.write().unwrap() = resolved_bind;
+            *state.bind_addr.write().unwrap() = Some(resolved_bind);
 
             // Start RPC server in a background thread
             let rpc_shutdown = shutdown.clone();
@@ -1518,10 +1554,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let runtime_manager = tokio::spawn(async move {
                 if let Err(e) = run_runtime_manager(
                     &manager_db,
-                    bind,
+                    resolved_bind,
                     manager_state,
                     manager_shutdown_flag,
                     manager_shutdown,
+                    idle_bind_reservation,
                 )
                 .await
                 {

@@ -15,6 +15,14 @@ use std::process::Command;
 use std::time::Duration;
 use topo::testutil::DaemonGuard;
 
+fn free_udp_bind_addr() -> String {
+    std::net::UdpSocket::bind("127.0.0.1:0")
+        .unwrap()
+        .local_addr()
+        .unwrap()
+        .to_string()
+}
+
 // ---------------------------------------------------------------------------
 // 1. RPC protocol unit tests
 // ---------------------------------------------------------------------------
@@ -656,15 +664,58 @@ fn daemon_start_on_empty_db_reports_idle_runtime_state() {
 }
 
 #[test]
+fn daemon_start_fails_fast_when_idle_bind_is_already_taken() {
+    let (_dir_a, db_a) = temp_db();
+    let (_dir_b, db_b) = temp_db();
+    let socket_a = socket_path_for_db(&db_a);
+    let bind = free_udp_bind_addr();
+
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db_a, "start", "--bind", &bind])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket_a);
+    let _ = wait_for_runtime_state(&socket_a, "IdleNoTenants", Duration::from_secs(10));
+
+    let mut child = Command::new(bin())
+        .args(["--db", &db_b, "start", "--bind", &bind])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if child.try_wait().unwrap().is_some() {
+            break;
+        }
+        if std::time::Instant::now() >= deadline {
+            let _ = child.kill();
+            panic!("second daemon should fail startup immediately on bind conflict");
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+    let output = child.wait_with_output().unwrap();
+    assert!(
+        !output.status.success(),
+        "second daemon unexpectedly started on conflicting bind: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+
+    stop_daemon(&db_a, &mut daemon);
+}
+
+#[test]
 fn upnp_on_empty_daemon_works_without_workspace() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
+    let bind = free_udp_bind_addr();
 
-    // Use a fixed port so bind_addr is resolved early (port 0 is deferred
-    // to the runtime since the OS-assigned port isn't known until bind).
     let mut daemon = DaemonGuard::new(
         Command::new(bin())
-            .args(["--db", &db, "start", "--bind", "127.0.0.1:14433"])
+            .args(["--db", &db, "start", "--bind", &bind])
             .spawn()
             .unwrap(),
     );
@@ -702,10 +753,11 @@ fn upnp_on_empty_daemon_works_without_workspace() {
 fn upnp_enabled_before_workspace_creation_refreshes_when_runtime_starts() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
+    let bind = free_udp_bind_addr();
 
     let mut daemon = DaemonGuard::new(
         Command::new(bin())
-            .args(["--db", &db, "start", "--bind", "127.0.0.1:14433"])
+            .args(["--db", &db, "start", "--bind", &bind])
             .spawn()
             .unwrap(),
     );
@@ -758,12 +810,13 @@ fn upnp_enabled_before_workspace_creation_refreshes_when_runtime_starts() {
 fn upnp_mode_resets_on_daemon_restart() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
+    let bind = free_udp_bind_addr();
 
     create_workspace(&db);
 
     let mut daemon = DaemonGuard::new(
         Command::new(bin())
-            .args(["--db", &db, "start", "--bind", "127.0.0.1:14433"])
+            .args(["--db", &db, "start", "--bind", &bind])
             .spawn()
             .unwrap(),
     );
@@ -786,7 +839,7 @@ fn upnp_mode_resets_on_daemon_restart() {
 
     let mut daemon = DaemonGuard::new(
         Command::new(bin())
-            .args(["--db", &db, "start", "--bind", "127.0.0.1:14433"])
+            .args(["--db", &db, "start", "--bind", &bind])
             .spawn()
             .unwrap(),
     );
