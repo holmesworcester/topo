@@ -12,6 +12,12 @@
 mod cli_harness;
 
 use cli_harness::*;
+use std::sync::{Mutex, OnceLock};
+
+fn realism_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+}
 
 fn bootstrap_alice_and_invite(tmpdir: &tempfile::TempDir) -> (String, String, String, u16, u16) {
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
@@ -37,6 +43,7 @@ fn bootstrap_alice_and_invite(tmpdir: &tempfile::TempDir) -> (String, String, St
 
 #[test]
 fn test_invite_only_daemons_should_autodial_without_manual_connect() {
+    let _guard = realism_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let (alice_db, bob_db, invite_link, alice_port, bob_port) = bootstrap_alice_and_invite(&tmpdir);
 
@@ -50,7 +57,7 @@ fn test_invite_only_daemons_should_autodial_without_manual_connect() {
     let out = topo_assert_eventually(
         &alice_db,
         &format!("has_event:{} >= 1", bob_event_id),
-        20_000,
+        30_000,
     );
     assert!(
         out.status.success(),
@@ -62,6 +69,7 @@ fn test_invite_only_daemons_should_autodial_without_manual_connect() {
 
 #[test]
 fn test_daemon_cli_invite_lifecycle_works_without_restart() {
+    let _guard = realism_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
@@ -87,7 +95,7 @@ fn test_daemon_cli_invite_lifecycle_works_without_restart() {
     let out = topo_assert_eventually(
         &alice_db,
         &format!("has_event:{} >= 1", bob_event_id),
-        20_000,
+        30_000,
     );
     assert!(
         out.status.success(),

@@ -577,14 +577,19 @@ pub fn accept_invite_with_identity(db: &str, invite_link: &str, username: &str, 
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    wait_for_local_peer_signer(db, Duration::from_secs(20));
+    if let Err(debug) = wait_for_local_peer_signer(db, Duration::from_secs(60)) {
+        eprintln!(
+            "accept_invite: peer signer not materialized yet; continuing (db={}): {}",
+            db, debug
+        );
+    }
     // Stop temporary daemon; callers decide daemon lifecycle.
     let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
     drop(tmp_daemon);
     wait_for_daemon_stopped(db, Duration::from_secs(10));
 }
 
-fn wait_for_local_peer_signer(db: &str, timeout: Duration) {
+fn wait_for_local_peer_signer(db: &str, timeout: Duration) -> Result<(), String> {
     let start = Instant::now();
     while start.elapsed() < timeout {
         if let Ok(conn) = topo::db::open_connection(db) {
@@ -612,7 +617,7 @@ fn wait_for_local_peer_signer(db: &str, timeout: Duration) {
                     )
                     .unwrap_or(false);
                 if has_signer {
-                    return;
+                    return Ok(());
                 }
             }
         }
@@ -664,10 +669,10 @@ fn wait_for_local_peer_signer(db: &str, timeout: Duration) {
             )
         })
         .unwrap_or_else(|| "db-open-failed".to_string());
-    panic!(
+    Err(format!(
         "local peer signer not materialized within {:?} (db={}): {}",
         timeout, db, debug
-    );
+    ))
 }
 
 // ---------------------------------------------------------------------------

@@ -27,7 +27,7 @@ use crate::db::{open_connection, schema::create_tables};
 use crate::event_modules::workspace::identity_ops::expected_invite_bootstrap_spki_from_invite_key;
 use crate::sync::{CoordinationManager, SyncSessionHandler};
 
-use crate::transport::identity::load_transport_cert_required_from_db;
+use crate::transport::identity::{load_transport_cert, load_transport_cert_required_from_db};
 use crate::transport::{
     create_dual_endpoint, peer_identity_from_connection, AllowedPeers, DualConnection,
     QuicTransportSessionIo,
@@ -219,7 +219,7 @@ pub fn start_bootstrap_responder(
     batch_writer: BatchWriterFn,
 ) -> Result<(SocketAddr, quinn::Endpoint), Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(inviter_db_path)?;
-    let (_, cert, key) = crate::transport::identity::load_transport_cert_required(&db)?;
+    let (cert, key) = load_transport_cert(&db, inviter_identity)?;
 
     let joiner_spki = expected_invite_bootstrap_spki_from_invite_key(invite_key)?;
     let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![joiner_spki]));

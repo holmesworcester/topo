@@ -149,16 +149,8 @@ pub fn query_field(
 fn resolve_assert_recorded_by(
     db: &rusqlite::Connection,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let transport_peer_id = load_transport_peer_id(db)?;
-    let has_scope: bool = db.query_row(
-        "SELECT COUNT(*) > 0 FROM invites_accepted WHERE recorded_by = ?1",
-        rusqlite::params![&transport_peer_id],
-        |row| row.get(0),
-    )?;
-    if has_scope {
-        return Ok(transport_peer_id);
-    }
-
+    // Prefer tenant scope resolution from invites_accepted. This stays stable
+    // when local_transport_creds contains multiple identities.
     let scoped_peers: Vec<String> = {
         let mut stmt =
             db.prepare("SELECT DISTINCT recorded_by FROM invites_accepted ORDER BY recorded_by")?;
@@ -170,7 +162,12 @@ fn resolve_assert_recorded_by(
     if scoped_peers.len() == 1 {
         return Ok(scoped_peers[0].clone());
     }
+    if scoped_peers.len() > 1 {
+        return Err("no active tenant — run `topo use-tenant <N>`".into());
+    }
 
+    // Pre-workspace fallback: singleton transport identity.
+    let transport_peer_id = load_transport_peer_id(db)?;
     Ok(transport_peer_id)
 }
 

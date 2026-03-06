@@ -856,10 +856,9 @@ fn accept_invite_when_already_in_workspace_adds_second_tenant() {
     // Accepting the new invite should succeed even with an existing tenant.
     let accept = Command::new(bin())
         .args([
-            "accept-invite",
+            "accept",
             "--db",
             &bob_db,
-            "--invite",
             &invite_link,
             "--username",
             "bob2",
@@ -870,7 +869,7 @@ fn accept_invite_when_already_in_workspace_adds_second_tenant() {
         .unwrap();
     assert!(
         accept.status.success(),
-        "accept-invite failed: stdout={} stderr={}",
+        "accept failed: stdout={} stderr={}",
         String::from_utf8_lossy(&accept.stdout),
         String::from_utf8_lossy(&accept.stderr)
     );
@@ -933,27 +932,7 @@ fn accept_invite_on_running_active_daemon_with_existing_workspace_succeeds() {
         .as_str()
         .expect("alice runtime.listen_addr")
         .to_string();
-    let invite_out = Command::new(bin())
-        .args([
-            "--db",
-            &alice_db,
-            "create-invite",
-            "--public-addr",
-            &alice_listen,
-        ])
-        .output()
-        .unwrap();
-    assert!(
-        invite_out.status.success(),
-        "create-invite failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&invite_out.stdout),
-        String::from_utf8_lossy(&invite_out.stderr)
-    );
-    let invite_link = String::from_utf8_lossy(&invite_out.stdout)
-        .lines()
-        .find(|line| line.starts_with("topo://"))
-        .expect("create-invite output missing invite link")
-        .to_string();
+    let invite_link = create_invite(&alice_db, &alice_listen);
 
     // Bob daemon: create first workspace (becomes Active), then accept second invite.
     let mut bob_daemon = DaemonGuard::new(
@@ -979,10 +958,9 @@ fn accept_invite_on_running_active_daemon_with_existing_workspace_succeeds() {
 
     let accept = Command::new(bin())
         .args([
-            "accept-invite",
+            "accept",
             "--db",
             &bob_db,
-            "--invite",
             &invite_link,
             "--username",
             "bob2",
@@ -993,7 +971,7 @@ fn accept_invite_on_running_active_daemon_with_existing_workspace_succeeds() {
         .unwrap();
     assert!(
         accept.status.success(),
-        "accept-invite failed: stdout={} stderr={}",
+        "accept failed: stdout={} stderr={}",
         String::from_utf8_lossy(&accept.stdout),
         String::from_utf8_lossy(&accept.stderr)
     );
@@ -1024,7 +1002,7 @@ fn accept_invite_on_running_active_daemon_with_existing_workspace_succeeds() {
         .count();
     assert!(
         tenant_count >= 2,
-        "expected at least 2 tenants after accept-invite, got {}:\n{}",
+        "expected at least 2 tenants after accept, got {}:\n{}",
         tenant_count,
         tenants_stdout
     );
