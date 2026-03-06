@@ -5,8 +5,9 @@ use super::{
     extract_spki_fingerprint, generate_self_signed_cert, generate_self_signed_cert_from_signing_key,
 };
 use crate::db::transport_creds::{
-    has_creds_with_source, load_local_creds, load_sole_local_creds, store_local_creds_with_source,
-    CRED_SOURCE_BOOTSTRAP, CRED_SOURCE_PEER_SHARED, CRED_SOURCE_RANDOM,
+    load_local_creds, load_sole_local_creds, peer_has_creds_with_source,
+    store_local_creds_with_source, CRED_SOURCE_BOOTSTRAP, CRED_SOURCE_PEER_SHARED,
+    CRED_SOURCE_RANDOM,
 };
 
 // ---------------------------------------------------------------------------
@@ -190,23 +191,21 @@ pub fn load_transport_cert_required_from_db(
 
 /// Install a deterministic transport cert/key derived from an invite signing key.
 ///
-/// This is only valid during bootstrap before a PeerShared-derived transport
-/// identity has been installed.
+/// This is only valid while the target peer_id has not already converged to
+/// a PeerShared-derived transport identity.
 pub fn install_invite_bootstrap_transport_identity(
     conn: &Connection,
     invite_signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    if has_creds_with_source(conn, CRED_SOURCE_PEER_SHARED)? {
-        return Err(
-            "bootstrap transport identity install denied: peershared identity already installed"
-                .into(),
-        );
-    }
-    conn.execute("DELETE FROM local_transport_creds", [])?;
-
     let (cert_der, key_der) = generate_self_signed_cert_from_signing_key(invite_signing_key)?;
     let fp = extract_spki_fingerprint(cert_der.as_ref())?;
     let peer_id = hex::encode(fp);
+    if peer_has_creds_with_source(conn, &peer_id, CRED_SOURCE_PEER_SHARED)? {
+        return Err(
+            "bootstrap transport identity install denied: peershared identity already installed for this peer"
+                .into(),
+        );
+    }
     store_local_creds_with_source(
         conn,
         &peer_id,
@@ -218,15 +217,11 @@ pub fn install_invite_bootstrap_transport_identity(
 }
 
 /// Install a deterministic transport cert/key derived from a PeerShared signing
-/// key. This replaces any prior transport identity (random or invite-derived)
-/// so that `recorded_by` (SPKI fingerprint) matches the event-layer peer identity.
+/// key for that peer_id. This does not delete credentials for other peers.
 pub fn install_peer_key_transport_identity(
     conn: &Connection,
     peer_signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    // Delete any pre-existing creds
-    conn.execute("DELETE FROM local_transport_creds", [])?;
-
     let (cert_der, key_der) = generate_self_signed_cert_from_signing_key(peer_signing_key)?;
     let fp = extract_spki_fingerprint(cert_der.as_ref())?;
     let peer_id = hex::encode(fp);

@@ -702,64 +702,83 @@ fn dispatch(
             Ok(data) => RpcResponse::success(data),
             Err(e) => RpcResponse::error(e.to_string()),
         },
-        RpcMethod::Reactions => match service::open_db_load(db_path) {
-            Ok((recorded_by, db)) => match reaction::list(&db, &recorded_by) {
-                Ok(data) => RpcResponse::success(data),
-                Err(e) => RpcResponse::error(e.to_string()),
-            },
-            Err(e) => RpcResponse::error(e.to_string()),
-        },
-        RpcMethod::Users => match service::open_db_load(db_path) {
-            Ok((recorded_by, db)) => match user::list_items(&db, &recorded_by) {
-                Ok(data) => RpcResponse::success(data),
-                Err(e) => RpcResponse::error(e.to_string()),
-            },
-            Err(e) => RpcResponse::error(e.to_string()),
-        },
-        RpcMethod::Keys { summary } => match service::open_db_load(db_path) {
-            Ok((recorded_by, db)) => match workspace::keys(&db, &recorded_by, summary) {
-                Ok(data) => RpcResponse::success(data),
-                Err(e) => RpcResponse::error(e.to_string()),
-            },
-            Err(e) => RpcResponse::error(e.to_string()),
-        },
-        RpcMethod::Peers => match service::open_db_load(db_path) {
-            Ok((recorded_by, db)) => match peer_shared::list_peers(&db, &recorded_by) {
-                Ok(data) => RpcResponse::success(data),
-                Err(e) => RpcResponse::error(e.to_string()),
-            },
-            Err(e) => RpcResponse::error(e.to_string()),
-        },
-        RpcMethod::Workspaces => match service::open_db_load(db_path) {
-            Ok((recorded_by, db)) => match workspace::list_items(&db, &recorded_by) {
-                Ok(data) => RpcResponse::success(data),
-                Err(e) => RpcResponse::error(e.to_string()),
-            },
-            Err(e) => RpcResponse::error(e.to_string()),
-        },
-        RpcMethod::IntroAttempts { peer } => match service::open_db_load(db_path) {
-            Ok((recorded_by, db)) => {
-                match crate::db::intro::list_intro_attempts(&db, &recorded_by, peer.as_deref()) {
-                    Ok(rows) => {
-                        let items: Vec<service::IntroAttemptItem> = rows
-                            .into_iter()
-                            .map(|r| service::IntroAttemptItem {
-                                intro_id: hex::encode(&r.intro_id),
-                                other_peer_id: r.other_peer_id,
-                                introduced_by_peer_id: r.introduced_by_peer_id,
-                                origin_ip: r.origin_ip,
-                                origin_port: r.origin_port,
-                                status: r.status,
-                                error: r.error,
-                                created_at: r.created_at,
-                            })
-                            .collect();
-                        RpcResponse::success(items)
-                    }
+        RpcMethod::Reactions => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => match reaction::list(&db, &recorded_by) {
+                    Ok(data) => RpcResponse::success(data),
                     Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::Users => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => match user::list_items(&db, &recorded_by) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::Keys { summary } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => match workspace::keys(&db, &recorded_by, summary) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::Peers => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => match peer_shared::list_peers(&db, &recorded_by) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::Workspaces => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => match workspace::list_items(&db, &recorded_by) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::IntroAttempts { peer } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => {
+                    match crate::db::intro::list_intro_attempts(&db, &recorded_by, peer.as_deref())
+                    {
+                        Ok(rows) => {
+                            let items: Vec<service::IntroAttemptItem> = rows
+                                .into_iter()
+                                .map(|r| service::IntroAttemptItem {
+                                    intro_id: hex::encode(&r.intro_id),
+                                    other_peer_id: r.other_peer_id,
+                                    introduced_by_peer_id: r.introduced_by_peer_id,
+                                    origin_ip: r.origin_ip,
+                                    origin_port: r.origin_port,
+                                    status: r.status,
+                                    error: r.error,
+                                    created_at: r.created_at,
+                                })
+                                .collect();
+                            RpcResponse::success(items)
+                        }
+                        Err(e) => RpcResponse::error(e.to_string()),
+                    }
                 }
-            }
-            Err(e) => RpcResponse::error(e.to_string()),
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
         },
         RpcMethod::CreateInvite {
             public_addr,

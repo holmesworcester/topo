@@ -773,6 +773,247 @@ fn accept_invite_on_running_idle_daemon_activates_runtime_without_restart() {
 }
 
 #[test]
+fn accept_invite_when_already_in_workspace_adds_second_tenant() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+
+    // Alice creates a workspace and publishes an invite from a running daemon.
+    create_workspace(&alice_db);
+    let mut alice_daemon = start_daemon(&alice_db);
+    let alice_listen = daemon_listen_addr(&alice_db);
+    let invite_link = create_invite(&alice_db, &alice_listen);
+
+    // Bob already has an existing workspace before accepting Alice's invite.
+    create_workspace(&bob_db);
+    let mut bob_daemon = start_daemon(&bob_db);
+
+    // Accepting the new invite should succeed even with an existing tenant.
+    let accept = Command::new(bin())
+        .args([
+            "accept-invite",
+            "--db",
+            &bob_db,
+            "--invite",
+            &invite_link,
+            "--username",
+            "bob2",
+            "--devicename",
+            "laptop2",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        accept.status.success(),
+        "accept-invite failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&accept.stdout),
+        String::from_utf8_lossy(&accept.stderr)
+    );
+
+    // Tenants list should now include both workspaces.
+    let tenants_out = Command::new(bin())
+        .args(["--db", &bob_db, "tenants"])
+        .output()
+        .unwrap();
+    assert!(
+        tenants_out.status.success(),
+        "tenants failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&tenants_out.stdout),
+        String::from_utf8_lossy(&tenants_out.stderr)
+    );
+    let tenants_stdout = String::from_utf8_lossy(&tenants_out.stdout);
+    let tenant_count = tenants_stdout
+        .lines()
+        .filter(|line| line.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+        .count();
+    assert!(
+        tenant_count >= 2,
+        "expected at least 2 tenants after second invite accept, got {}:\n{}",
+        tenant_count,
+        tenants_stdout
+    );
+
+    stop_daemon(&alice_db, &mut alice_daemon);
+    stop_daemon(&bob_db, &mut bob_daemon);
+}
+
+#[test]
+fn accept_invite_on_running_active_daemon_with_existing_workspace_succeeds() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+    let alice_socket = socket_path_for_db(&alice_db);
+    let bob_socket = socket_path_for_db(&bob_db);
+
+    // Alice daemon: create workspace and invite.
+    let mut alice_daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &alice_db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&alice_socket);
+    let _ = wait_for_runtime_state(&alice_socket, "IdleNoTenants", Duration::from_secs(10));
+    let alice_create = Command::new(bin())
+        .args(["create-workspace", "--db", &alice_db, "--username", "alice"])
+        .output()
+        .unwrap();
+    assert!(
+        alice_create.status.success(),
+        "alice create-workspace failed: {}",
+        String::from_utf8_lossy(&alice_create.stderr)
+    );
+    let alice_status = wait_for_runtime_state(&alice_socket, "Active", Duration::from_secs(10));
+    let alice_listen = alice_status["runtime"]["listen_addr"]
+        .as_str()
+        .expect("alice runtime.listen_addr")
+        .to_string();
+    let invite_out = Command::new(bin())
+        .args([
+            "--db",
+            &alice_db,
+            "create-invite",
+            "--public-addr",
+            &alice_listen,
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        invite_out.status.success(),
+        "create-invite failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&invite_out.stdout),
+        String::from_utf8_lossy(&invite_out.stderr)
+    );
+    let invite_link = String::from_utf8_lossy(&invite_out.stdout)
+        .lines()
+        .find(|line| line.starts_with("topo://"))
+        .expect("create-invite output missing invite link")
+        .to_string();
+
+    // Bob daemon: create first workspace (becomes Active), then accept second invite.
+    let mut bob_daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &bob_db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+    let bob_pid_before = bob_daemon.child().id();
+    wait_for_socket(&bob_socket);
+    let _ = wait_for_runtime_state(&bob_socket, "IdleNoTenants", Duration::from_secs(10));
+    let bob_create = Command::new(bin())
+        .args(["create-workspace", "--db", &bob_db, "--username", "bob"])
+        .output()
+        .unwrap();
+    assert!(
+        bob_create.status.success(),
+        "bob create-workspace failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&bob_create.stdout),
+        String::from_utf8_lossy(&bob_create.stderr)
+    );
+    let _ = wait_for_runtime_state(&bob_socket, "Active", Duration::from_secs(10));
+
+    let accept = Command::new(bin())
+        .args([
+            "accept-invite",
+            "--db",
+            &bob_db,
+            "--invite",
+            &invite_link,
+            "--username",
+            "bob2",
+            "--devicename",
+            "laptop2",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        accept.status.success(),
+        "accept-invite failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&accept.stdout),
+        String::from_utf8_lossy(&accept.stderr)
+    );
+    assert!(
+        bob_daemon.child().try_wait().unwrap().is_none(),
+        "bob daemon should stay running"
+    );
+    assert_eq!(
+        bob_daemon.child().id(),
+        bob_pid_before,
+        "bob daemon process should be unchanged"
+    );
+
+    let tenants_out = Command::new(bin())
+        .args(["--db", &bob_db, "tenants"])
+        .output()
+        .unwrap();
+    assert!(
+        tenants_out.status.success(),
+        "tenants failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&tenants_out.stdout),
+        String::from_utf8_lossy(&tenants_out.stderr)
+    );
+    let tenants_stdout = String::from_utf8_lossy(&tenants_out.stdout);
+    let tenant_count = tenants_stdout
+        .lines()
+        .filter(|line| line.trim_start().starts_with(|c: char| c.is_ascii_digit()))
+        .count();
+    assert!(
+        tenant_count >= 2,
+        "expected at least 2 tenants after accept-invite, got {}:\n{}",
+        tenant_count,
+        tenants_stdout
+    );
+
+    // The accepted tenant must become operational: it needs local transport creds.
+    let parsed_invite =
+        topo::event_modules::workspace::invite_link::parse_invite_link(&invite_link)
+            .expect("parse invite link");
+    let invited_ws_b64 = topo::crypto::event_id_to_base64(&parsed_invite.workspace_id);
+    let start = std::time::Instant::now();
+    let mut found_transport = false;
+    while start.elapsed() < Duration::from_secs(20) {
+        let conn = topo::db::open_connection(&bob_db).expect("open bob db");
+        let maybe_peer: Option<String> = conn
+            .query_row(
+                "SELECT recorded_by
+                 FROM invites_accepted
+                 WHERE workspace_id = ?1
+                 ORDER BY created_at DESC, event_id DESC
+                 LIMIT 1",
+                rusqlite::params![&invited_ws_b64],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(peer_id) = maybe_peer {
+            let has_transport: bool = conn
+                .query_row(
+                    "SELECT EXISTS(
+                         SELECT 1
+                         FROM local_transport_creds
+                         WHERE peer_id = ?1
+                         LIMIT 1
+                     )",
+                    rusqlite::params![&peer_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(false);
+            if has_transport {
+                found_transport = true;
+                break;
+            }
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+    assert!(
+        found_transport,
+        "accepted tenant never obtained local transport credentials"
+    );
+
+    stop_daemon(&alice_db, &mut alice_daemon);
+    stop_daemon(&bob_db, &mut bob_daemon);
+}
+
+#[test]
 fn db_scoped_commands_remain_isolated_between_daemons() {
     let tmpdir = tempfile::tempdir().unwrap();
     let db_a = tmpdir.path().join("a.db").to_str().unwrap().to_string();

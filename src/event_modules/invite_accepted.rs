@@ -91,7 +91,7 @@ pub fn encode_invite_accepted(event: &ParsedEvent) -> Result<Vec<u8>, EventError
 
 use crate::contracts::transport_identity_contract::TransportIdentityIntent;
 use crate::crypto::event_id_to_base64;
-use crate::db::transport_creds::{has_creds_with_source, CRED_SOURCE_PEER_SHARED};
+use crate::db::transport_creds::{peer_has_creds_with_source, CRED_SOURCE_PEER_SHARED};
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::Connection;
 
@@ -176,7 +176,7 @@ pub fn build_projector_context(
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
     ctx.has_local_invite_secret = has_local_invite_secret;
     ctx.peer_shared_transport_identity_active =
-        has_creds_with_source(conn, CRED_SOURCE_PEER_SHARED).unwrap_or(false);
+        peer_has_creds_with_source(conn, recorded_by, CRED_SOURCE_PEER_SHARED).unwrap_or(false);
 
     if let Some(bc) =
         crate::db::transport_trust::read_bootstrap_context(conn, recorded_by, &invite_event_id_b64)

@@ -84,6 +84,26 @@ pub fn has_creds_with_source(
     Ok(exists != 0)
 }
 
+/// Return true if a specific peer_id has a local credential row with `source`.
+pub fn peer_has_creds_with_source(
+    conn: &Connection,
+    peer_id: &str,
+    source: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let exists: i64 = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM local_transport_creds
+             WHERE peer_id = ?1
+               AND source = ?2
+             LIMIT 1
+         )",
+        rusqlite::params![peer_id, source],
+        |row| row.get(0),
+    )?;
+    Ok(exists != 0)
+}
+
 /// Load cert/key DER blobs for a specific peer identity.
 pub fn load_local_creds(
     conn: &Connection,
@@ -160,61 +180,133 @@ pub struct TenantInfo {
 pub fn discover_local_tenants(
     conn: &Connection,
 ) -> Result<Vec<TenantInfo>, Box<dyn std::error::Error + Send + Sync>> {
-    // Normal case: accepted-workspace binding and transport identity converged.
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT i.recorded_by, i.workspace_id, c.peer_id, c.cert_der, c.key_der
-         FROM invites_accepted i
-         JOIN local_transport_creds c ON i.recorded_by = c.peer_id",
-    )?;
-    let mut tenants = stmt
-        .query_map([], |row| {
-            Ok(TenantInfo {
-                peer_id: row.get(0)?,
-                workspace_id: row.get(1)?,
-                transport_peer_id: row.get(2)?,
-                cert_der: row.get(3)?,
-                key_der: row.get(4)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut tenants = Vec::new();
+    let mut seen_tenants = std::collections::HashSet::new();
 
-    if !tenants.is_empty() {
-        return Ok(tenants);
+    // Normal case: accepted-workspace binding and transport identity converged.
+    let mut direct_stmt = conn.prepare(
+        "SELECT i.recorded_by, i.workspace_id, c.peer_id, c.cert_der, c.key_der
+         FROM invites_accepted i
+         JOIN local_transport_creds c ON i.recorded_by = c.peer_id
+         ORDER BY i.created_at ASC, i.event_id ASC",
+    )?;
+    let direct_rows = direct_stmt.query_map([], |row| {
+        Ok(TenantInfo {
+            peer_id: row.get(0)?,
+            workspace_id: row.get(1)?,
+            transport_peer_id: row.get(2)?,
+            cert_der: row.get(3)?,
+            key_der: row.get(4)?,
+        })
+    })?;
+    for row in direct_rows {
+        let tenant = row?;
+        if seen_tenants.insert(tenant.peer_id.clone()) {
+            tenants.push(tenant);
+        }
     }
 
-    // Transitional bootstrap fallback:
-    // invite acceptance pre-derives tenant peer_id before bootstrap sync, while
-    // the local transport cert may still be invite-derived until projection
-    // installs the PeerShared-derived cert.
-    let accepted_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM invites_accepted", [], |row| {
-            row.get(0)
-        })?;
-    let creds_count: i64 =
-        conn.query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
-            row.get(0)
-        })?;
-    if accepted_count == 1 && creds_count == 1 {
-        let (tenant_peer_id, workspace_id): (String, String) = conn.query_row(
-            "SELECT recorded_by, workspace_id
-             FROM invites_accepted
-             ORDER BY created_at ASC, event_id ASC
-             LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let (transport_peer_id, cert_der, key_der): (String, Vec<u8>, Vec<u8>) = conn.query_row(
-            "SELECT peer_id, cert_der, key_der FROM local_transport_creds LIMIT 1",
-            [],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-        )?;
-        tenants.push(TenantInfo {
-            peer_id: tenant_peer_id,
-            workspace_id,
-            transport_peer_id,
-            cert_der,
-            key_der,
-        });
+    // Transitional bootstrap fallback (generalized):
+    // For each accepted tenant without direct peer_id transport creds,
+    // try resolving bootstrap transport identity from invite_secrets.
+    let mut accepted_stmt = conn.prepare(
+        "SELECT recorded_by, workspace_id, invite_event_id
+         FROM invites_accepted
+         ORDER BY created_at DESC, event_id DESC",
+    )?;
+    let accepted_rows = accepted_stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+        ))
+    })?;
+    for row in accepted_rows {
+        let (tenant_peer_id, workspace_id, invite_event_id) = row?;
+        if !seen_tenants.insert(tenant_peer_id.clone()) {
+            continue;
+        }
+
+        let invite_key_bytes: Option<Vec<u8>> = conn
+            .query_row(
+                "SELECT private_key
+                 FROM invite_secrets
+                 WHERE recorded_by = ?1
+                   AND invite_event_id = ?2
+                 ORDER BY created_at DESC, event_id DESC
+                 LIMIT 1",
+                rusqlite::params![&tenant_peer_id, &invite_event_id],
+                |row| row.get(0),
+            )
+            .ok();
+        let Some(invite_key_bytes) = invite_key_bytes else {
+            continue;
+        };
+        if invite_key_bytes.len() != 32 {
+            continue;
+        }
+        let mut sk_bytes = [0u8; 32];
+        sk_bytes.copy_from_slice(&invite_key_bytes);
+        let sk = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
+        let bootstrap_peer_id = hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
+            &sk.verifying_key().to_bytes(),
+        ));
+        let maybe_creds: Option<(Vec<u8>, Vec<u8>)> = conn
+            .query_row(
+                "SELECT cert_der, key_der
+                 FROM local_transport_creds
+                 WHERE peer_id = ?1
+                 LIMIT 1",
+                rusqlite::params![&bootstrap_peer_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .ok();
+        if let Some((cert_der, key_der)) = maybe_creds {
+            tenants.push(TenantInfo {
+                peer_id: tenant_peer_id,
+                workspace_id,
+                transport_peer_id: bootstrap_peer_id,
+                cert_der,
+                key_der,
+            });
+        }
+    }
+
+    // Back-compat singleton fallback:
+    // If there is exactly one accepted tenant and one transport credential but
+    // no deterministic mapping above, preserve previous behavior.
+    if tenants.is_empty() {
+        let accepted_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM invites_accepted", [], |row| {
+                row.get(0)
+            })?;
+        let creds_count: i64 =
+            conn.query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
+                row.get(0)
+            })?;
+        if accepted_count == 1 && creds_count == 1 {
+            let (tenant_peer_id, workspace_id): (String, String) = conn.query_row(
+                "SELECT recorded_by, workspace_id
+                 FROM invites_accepted
+                 ORDER BY created_at ASC, event_id ASC
+                 LIMIT 1",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let (transport_peer_id, cert_der, key_der): (String, Vec<u8>, Vec<u8>) = conn
+                .query_row(
+                    "SELECT peer_id, cert_der, key_der FROM local_transport_creds LIMIT 1",
+                    [],
+                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+                )?;
+            tenants.push(TenantInfo {
+                peer_id: tenant_peer_id,
+                workspace_id,
+                transport_peer_id,
+                cert_der,
+                key_der,
+            });
+        }
     }
 
     Ok(tenants)
@@ -373,6 +465,82 @@ mod tests {
 
         assert!(has_creds_with_source(&conn, CRED_SOURCE_BOOTSTRAP).unwrap());
         assert!(!has_creds_with_source(&conn, CRED_SOURCE_PEER_SHARED).unwrap());
+    }
+
+    #[test]
+    fn test_peer_has_creds_with_source() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        store_local_creds_with_source(&conn, "peer1", b"cert1", b"key1", CRED_SOURCE_BOOTSTRAP)
+            .unwrap();
+        store_local_creds_with_source(&conn, "peer2", b"cert2", b"key2", CRED_SOURCE_PEER_SHARED)
+            .unwrap();
+
+        assert!(peer_has_creds_with_source(&conn, "peer1", CRED_SOURCE_BOOTSTRAP).unwrap());
+        assert!(!peer_has_creds_with_source(&conn, "peer1", CRED_SOURCE_PEER_SHARED).unwrap());
+        assert!(peer_has_creds_with_source(&conn, "peer2", CRED_SOURCE_PEER_SHARED).unwrap());
+    }
+
+    #[test]
+    fn test_discover_local_tenants_multitenant_bootstrap_fallback() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        // Tenant A is fully converged.
+        conn.execute(
+            "INSERT INTO invites_accepted (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES ('tenant_a', 'ia_a', 't_a', 'inv_a', 'ws_a', 1)",
+            [],
+        )
+        .unwrap();
+        store_local_creds_with_source(
+            &conn,
+            "tenant_a",
+            b"cert_a",
+            b"key_a",
+            CRED_SOURCE_PEER_SHARED,
+        )
+        .unwrap();
+
+        // Tenant B is transitional: accepted invite + invite_secret + bootstrap creds.
+        let invite_sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
+        let invite_event_id = "inv_b";
+        conn.execute(
+            "INSERT INTO invites_accepted (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES ('tenant_b', 'ia_b', 't_b', ?1, 'ws_b', 2)",
+            rusqlite::params![invite_event_id],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO invite_secrets (recorded_by, event_id, invite_event_id, private_key, created_at)
+             VALUES ('tenant_b', 'is_b', ?1, ?2, 2)",
+            rusqlite::params![invite_event_id, invite_sk.to_bytes().to_vec()],
+        )
+        .unwrap();
+        let bootstrap_peer_id = hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
+            &invite_sk.verifying_key().to_bytes(),
+        ));
+        store_local_creds_with_source(
+            &conn,
+            &bootstrap_peer_id,
+            b"cert_b",
+            b"key_b",
+            CRED_SOURCE_BOOTSTRAP,
+        )
+        .unwrap();
+
+        let tenants = discover_local_tenants(&conn).unwrap();
+        assert_eq!(tenants.len(), 2);
+        let a = tenants
+            .iter()
+            .find(|t| t.peer_id == "tenant_a")
+            .expect("tenant_a");
+        assert_eq!(a.transport_peer_id, "tenant_a");
+        let b = tenants
+            .iter()
+            .find(|t| t.peer_id == "tenant_b")
+            .expect("tenant_b");
+        assert_eq!(b.transport_peer_id, bootstrap_peer_id);
     }
 
     #[test]
