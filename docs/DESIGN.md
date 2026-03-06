@@ -1481,7 +1481,7 @@ Device-link invite:
 topo://link/v3/device_link/eid.<hex64>/key.<hex64>/wid.<hex64>/uid.<hex64>/spki.<hex64>/addr.<a1>,<a2>
 ```
 
-Field labels: `eid` = invite event ID, `key` = invite private key, `wid` = workspace ID, `uid` = user event ID (device-link only), `spki` = bootstrap SPKI fingerprint. All ID/key fields are 32-byte hex (64 hex chars). Address tokens use the same display format as `to_bootstrap_addr_string` (port omitted when default 4433, IPv6 bracketed), comma-separated.
+Field labels: `eid` = invite event ID, `key` = invite private key, `wid` = workspace ID, `uid` = user event ID (device-link only), `spki` = bootstrap SPKI fingerprint. All ID/key fields are 32-byte hex (64 hex chars). Address tokens are comma-separated; port omitted when default 4433. IPv6 addresses are fully expanded as 8 dash-separated groups of 4 hex digits (no brackets) to avoid shell glob/escaping issues; non-default port uses `_port` suffix (e.g. `2601-0645-8881-1d40-0216-3eff-fe8c-0d03_7443`).
 
 ## 9.3 Accepted-workspace cascade
 
