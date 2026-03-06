@@ -289,3 +289,97 @@ async fn test_shared_db_same_workspace_two_tenants() {
     // workspace-aware check that allows overlap for same-workspace tenants.
     harness.finish();
 }
+
+/// Matrix case: two initial tenants (different workspaces), each invites one
+/// more tenant, resulting in two overlapping groups.
+#[tokio::test]
+async fn test_shared_db_overlapping_workspace_groups_matrix() {
+    let mut node = SharedDbNode::new(2);
+    node.add_tenant_in_workspace("tenant-2-join-ws0", 0);
+    node.add_tenant_in_workspace("tenant-3-join-ws1", 1);
+    let harness = ScenarioHarness::new();
+    harness.track_node(&node);
+
+    assert_eq!(node.tenants.len(), 4, "expected 4 tenants total");
+
+    let ws0 = node.tenants[0].workspace_id;
+    let ws1 = node.tenants[1].workspace_id;
+    assert_ne!(ws0, ws1, "base workspaces should differ");
+    assert_eq!(
+        node.tenants[2].workspace_id, ws0,
+        "tenant 2 should join workspace 0"
+    );
+    assert_eq!(
+        node.tenants[3].workspace_id, ws1,
+        "tenant 3 should join workspace 1"
+    );
+
+    for (idx, tenant) in node.tenants.iter().enumerate() {
+        tenant.create_message(&format!("matrix-overlap-marker-{}", idx));
+    }
+
+    let db = open_connection(&node.db_path).unwrap();
+    let ws0_b64 = event_id_to_base64(&ws0);
+    let ws1_b64 = event_id_to_base64(&ws1);
+    let ws0_tenants: i64 = db
+        .query_row(
+            "SELECT COUNT(DISTINCT peer_id) FROM recorded_events WHERE event_id = ?1",
+            rusqlite::params![&ws0_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let ws1_tenants: i64 = db
+        .query_row(
+            "SELECT COUNT(DISTINCT peer_id) FROM recorded_events WHERE event_id = ?1",
+            rusqlite::params![&ws1_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(ws0_tenants, 2, "workspace 0 should be scoped to two tenants");
+    assert_eq!(ws1_tenants, 2, "workspace 1 should be scoped to two tenants");
+
+    harness.finish();
+}
+
+/// Matrix case: one workspace fanout where multiple tenants join the same
+/// workspace on the same shared DB node.
+#[tokio::test]
+async fn test_shared_db_three_tenants_same_workspace_matrix() {
+    let mut node = SharedDbNode::new(1);
+    let workspace = node.tenants[0].workspace_id;
+    node.add_tenant_in_workspace("tenant-1-join-same", 0);
+    node.add_tenant_in_workspace("tenant-2-join-same", 0);
+    let harness = ScenarioHarness::new();
+    harness.track_node(&node);
+
+    assert_eq!(node.tenants.len(), 3, "expected 3 tenants");
+    for tenant in &node.tenants {
+        assert_eq!(
+            tenant.workspace_id, workspace,
+            "all tenants should share one workspace"
+        );
+    }
+    let ids: std::collections::HashSet<&str> =
+        node.tenants.iter().map(|t| t.identity.as_str()).collect();
+    assert_eq!(ids.len(), 3, "tenant identities must be unique");
+
+    for (idx, tenant) in node.tenants.iter().enumerate() {
+        tenant.create_message(&format!("matrix-same-ws-marker-{}", idx));
+    }
+
+    let db = open_connection(&node.db_path).unwrap();
+    let ws_b64 = event_id_to_base64(&workspace);
+    let tenants_with_ws: i64 = db
+        .query_row(
+            "SELECT COUNT(DISTINCT peer_id) FROM recorded_events WHERE event_id = ?1",
+            rusqlite::params![&ws_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        tenants_with_ws, 3,
+        "shared workspace event should be present for all tenants"
+    );
+
+    harness.finish();
+}

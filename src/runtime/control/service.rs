@@ -78,19 +78,10 @@ pub fn open_db_load(
 ) -> Result<(String, rusqlite::Connection), Box<dyn std::error::Error + Send + Sync>> {
     let conn = open_connection(db_path)?;
     create_tables(&conn)?;
-    let transport_peer_id = load_transport_peer_id(&conn)?;
 
-    let has_scope: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM invites_accepted WHERE recorded_by = ?1",
-        rusqlite::params![&transport_peer_id],
-        |row| row.get(0),
-    )?;
-    if has_scope {
-        return Ok((transport_peer_id, conn));
-    }
-
-    // POC fallback for non-finalized identity state: if exactly one scoped peer exists,
-    // use it as the event/projection tenant.
+    // Prefer tenant scope resolution from projection state. This remains stable
+    // even when local_transport_creds has multiple rows (bootstrap + peershared,
+    // or true multi-tenant).
     let scoped_peers: Vec<String> = {
         let mut stmt =
             conn.prepare("SELECT DISTINCT recorded_by FROM invites_accepted ORDER BY recorded_by")?;
@@ -103,17 +94,13 @@ pub fn open_db_load(
     if scoped_peers.len() == 1 {
         return Ok((scoped_peers[0].clone(), conn));
     }
-    if scoped_peers.is_empty() {
-        // Fresh DB / pre-workspace state: allow read paths to boot using
-        // transport identity even before tenant-scoped accepted bindings exist.
-        return Ok((transport_peer_id, conn));
+    if scoped_peers.len() > 1 {
+        return Err("no active tenant — run `topo use-tenant <N>`".into());
     }
 
-    Err(format!(
-        "No unambiguous scoped tenant for transport peer_id {}; run `topo use-peer <N>`",
-        transport_peer_id
-    )
-    .into())
+    // Fresh DB / pre-workspace state: fall back to singleton transport identity.
+    let transport_peer_id = load_transport_peer_id(&conn)?;
+    Ok((transport_peer_id, conn))
 }
 
 /// Open DB for a specific peer_id (used when daemon provides the active peer).
@@ -423,6 +410,7 @@ pub fn socket_path_for_db(db_path: &str) -> std::path::PathBuf {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::transport_creds::{self, CRED_SOURCE_BOOTSTRAP};
     use crate::event_modules::{message, workspace};
 
     fn temp_db_path() -> (tempfile::TempDir, String) {
@@ -578,5 +566,46 @@ mod tests {
             resp.pass,
             "assert_eventually should read from the scoped peer"
         );
+    }
+
+    #[test]
+    fn test_open_db_load_resolves_scoped_peer_with_multiple_local_identities() {
+        let (_dir, db_path) = temp_db_path();
+        let scoped_peer_id = setup_workspace(&db_path);
+
+        let conn = crate::db::open_connection(&db_path).unwrap();
+        crate::db::schema::create_tables(&conn).unwrap();
+
+        // Mirror observed prod shape:
+        // - one scoped peershared identity (from workspace bootstrap)
+        // - one extra bootstrap identity row in local_transport_creds
+        // open_db_load should still resolve the scoped peer.
+        let bootstrap_key = ed25519_dalek::SigningKey::from_bytes(&[7u8; 32]);
+        let (bootstrap_cert, bootstrap_priv) =
+            crate::transport::generate_self_signed_cert_from_signing_key(&bootstrap_key).unwrap();
+        let bootstrap_fp =
+            crate::transport::extract_spki_fingerprint(bootstrap_cert.as_ref()).unwrap();
+        let bootstrap_peer_id = hex::encode(bootstrap_fp);
+        transport_creds::store_local_creds_with_source(
+            &conn,
+            &bootstrap_peer_id,
+            bootstrap_cert.as_ref(),
+            bootstrap_priv.secret_pkcs8_der(),
+            CRED_SOURCE_BOOTSTRAP,
+        )
+        .unwrap();
+
+        let local_creds_count: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
+                row.get(0)
+            })
+            .unwrap();
+        assert_eq!(local_creds_count, 2, "expected two local identities");
+
+        drop(conn);
+
+        let (resolved_peer_id, _db) = open_db_load(&db_path)
+            .expect("open_db_load should resolve scoped tenant with multiple local identities");
+        assert_eq!(resolved_peer_id, scoped_peer_id);
     }
 }
