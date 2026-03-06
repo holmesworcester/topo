@@ -530,6 +530,9 @@ enum Commands {
     },
 
     /// Raw RPC demo surface: list methods, describe parameters, submit raw JSON calls
+    #[command(
+        after_help = "Examples:\n  # List all available RPC methods\n  topo rpc methods\n  topo rpc methods --json\n\n  # Describe a method and its parameters\n  topo rpc describe Status\n  topo rpc describe Send --json\n\n  # Call an RPC method (inline JSON)\n  topo rpc call --method-json '{\"type\":\"Status\"}'\n  topo rpc call --method-json '{\"type\":\"Send\",\"content\":\"hello\"}'\n  topo rpc call --method-json '{\"type\":\"Messages\",\"limit\":20}'\n  topo rpc call --method-json '{\"type\":\"View\",\"limit\":10}'\n\n  # Call with a full request envelope\n  topo rpc call --request-json '{\"version\":1,\"method\":{\"type\":\"Status\"}}'\n\n  # Call from a file or stdin\n  topo rpc call --file request.json\n  echo '{\"type\":\"Peers\"}' | topo rpc call --stdin"
+    )]
     Rpc {
         #[command(subcommand)]
         action: RpcAction,
