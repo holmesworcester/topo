@@ -43,7 +43,7 @@ pub fn project_pure(
     }
     if descriptor_signers.len() > 1 {
         return ProjectorResult::reject(format!(
-            "file_id {} maps to multiple attachment signers ({}), cannot authorize file_slice",
+            "file_id {} maps to multiple file signers ({}), cannot authorize file_slice",
             file_id_b64,
             descriptor_signers.len()
         ));
@@ -52,7 +52,7 @@ pub fn project_pure(
     let (descriptor_event_id, descriptor_signer) = ctx.file_descriptors[0].clone();
     if descriptor_signer != slice_signer_b64 {
         return ProjectorResult::reject(format!(
-            "file_slice signer {} does not match attachment descriptor signer {}",
+            "file_slice signer {} does not match file descriptor signer {}",
             slice_signer_b64, descriptor_signer
         ));
     }

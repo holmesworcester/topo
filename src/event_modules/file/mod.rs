@@ -2,19 +2,16 @@ pub mod projector;
 pub mod queries;
 pub mod wire;
 
-// Re-export stable public API so callers import from `event_modules::message_attachment`.
+// Re-export stable public API so callers import from `event_modules::file`.
 pub use projector::project_pure;
-pub use wire::{
-    attachment_offsets, encode_message_attachment, parse_message_attachment,
-    MessageAttachmentEvent, MESSAGE_ATTACHMENT_META, MESSAGE_ATTACHMENT_WIRE_SIZE,
-};
+pub use wire::{encode_file, file_offsets, parse_file, FileEvent, FILE_META, FILE_WIRE_SIZE};
 
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     conn.execute_batch(
         "
-        CREATE TABLE IF NOT EXISTS message_attachments (
+        CREATE TABLE IF NOT EXISTS files (
             recorded_by TEXT NOT NULL,
             event_id TEXT NOT NULL,
             message_id TEXT NOT NULL,
@@ -30,10 +27,10 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             signer_event_id TEXT NOT NULL DEFAULT '',
             PRIMARY KEY (recorded_by, event_id)
         );
-        CREATE INDEX IF NOT EXISTS idx_msg_att_message
-            ON message_attachments(recorded_by, message_id);
-        CREATE INDEX IF NOT EXISTS idx_msg_att_file
-            ON message_attachments(recorded_by, file_id);
+        CREATE INDEX IF NOT EXISTS idx_files_message
+            ON files(recorded_by, message_id);
+        CREATE INDEX IF NOT EXISTS idx_files_file_id
+            ON files(recorded_by, file_id);
         ",
     )?;
     Ok(())

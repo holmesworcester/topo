@@ -51,7 +51,7 @@ pub struct ReactionSummary {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct AttachmentSummary {
+pub struct FileSummary {
     pub filename: String,
     pub mime_type: String,
     pub blob_bytes: i64,
@@ -68,7 +68,7 @@ pub struct MessageItem {
     pub content: String,
     pub created_at: i64,
     pub reactions: Vec<ReactionSummary>,
-    pub attachments: Vec<AttachmentSummary>,
+    pub files: Vec<FileSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_op_id: Option<String>,
 }

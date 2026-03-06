@@ -198,7 +198,7 @@ enum Commands {
         client_op_id: Option<String>,
     },
 
-    /// Send a message with a file attachment
+    /// Send a message with a file
     #[command(name = "send-file")]
     SendFile {
         /// Message content
@@ -214,7 +214,7 @@ enum Commands {
     /// Save a received file to disk
     #[command(name = "save-file")]
     SaveFile {
-        /// File target: number (N or #N from `topo files`) or attachment event ID (hex)
+        /// File target: number (N or #N from `topo files`) or file event ID (hex)
         #[arg(long)]
         target: String,
         /// Output path
@@ -231,7 +231,7 @@ enum Commands {
         count: usize,
     },
 
-    /// Generate synthetic file events (message + attachment + file slices)
+    /// Generate synthetic file events (message + file + file slices)
     #[command(name = "generate-files")]
     GenerateFiles {
         /// Number of files to generate
@@ -1223,8 +1223,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 data["output_path"].as_str().unwrap_or("")
             );
             println!(
-                "attachment_id:{}",
-                data["attachment_id"].as_str().unwrap_or("")
+                "file_event_id:{}",
+                data["file_event_id"].as_str().unwrap_or("")
             );
         }
 
@@ -3065,9 +3065,9 @@ fn show_messages_from_json(_db_path: &str, data: &serde_json::Value) {
             }
         }
 
-        // Attachments: ✅ = complete, 🔄 = syncing
-        if let Some(attachments) = msg["attachments"].as_array() {
-            for att in attachments {
+        // Files: ✅ = complete, 🔄 = syncing
+        if let Some(files) = msg["files"].as_array() {
+            for att in files {
                 let filename = att["filename"].as_str().unwrap_or("file");
                 let blob_bytes = att["blob_bytes"].as_i64().unwrap_or(0);
                 let total = att["total_slices"].as_i64().unwrap_or(0);
@@ -3112,14 +3112,14 @@ fn show_files_from_json(data: &serde_json::Value) {
         let total_slices = file["total_slices"].as_i64().unwrap_or(0);
         let slices_received = file["slices_received"].as_i64().unwrap_or(0);
         let created_at = file["created_at"].as_i64().unwrap_or(0);
-        let attachment_id = file["attachment_id"].as_str().unwrap_or("");
+        let file_event_id = file["file_event_id"].as_str().unwrap_or("");
         let message_id = file["message_id"].as_str().unwrap_or("");
         let complete = file["complete"].as_bool().unwrap_or(false);
 
         let status = if complete { "\u{2714}" } else { "\u{23f3}" };
         let size = format_byte_size(blob_bytes);
         let ts = format_timestamp(created_at);
-        let short_attachment = &attachment_id[..attachment_id.len().min(12)];
+        let short_file = &file_event_id[..file_event_id.len().min(12)];
         let short_message = &message_id[..message_id.len().min(12)];
         println!(
             "  {}. {}  {} ({})  [{}/{} slices]  {}",
@@ -3131,10 +3131,7 @@ fn show_files_from_json(data: &serde_json::Value) {
             total_slices,
             ts
         );
-        println!(
-            "     attachment:{}  message:{}",
-            short_attachment, short_message
-        );
+        println!("     file_event:{}  message:{}", short_file, short_message);
     }
     println!();
 }

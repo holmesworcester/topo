@@ -51,10 +51,10 @@ pub const fn encrypted_wire_size(inner_wire_size: usize) -> usize {
 pub fn encrypted_inner_wire_size(inner_type_code: u8) -> Option<usize> {
     use super::super::admin::ADMIN_WIRE_SIZE;
     use super::super::bench_dep::BENCH_DEP_WIRE_SIZE;
+    use super::super::file::FILE_WIRE_SIZE;
     use super::super::file_slice::FILE_SLICE_WIRE_SIZE;
     use super::super::key_shared::KEY_SHARED_WIRE_SIZE;
     use super::super::message::wire::MESSAGE_WIRE_SIZE;
-    use super::super::message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE;
     use super::super::message_deletion::MESSAGE_DELETION_WIRE_SIZE;
     use super::super::peer_invite_shared::DEVICE_INVITE_WIRE_SIZE;
     use super::super::peer_shared::PEER_SHARED_WIRE_SIZE;
@@ -76,7 +76,7 @@ pub fn encrypted_inner_wire_size(inner_type_code: u8) -> Option<usize> {
         20 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // UserRemoved
         21 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // PeerRemoved
         22 => Some(KEY_SHARED_WIRE_SIZE),             // KeyShared
-        24 => Some(MESSAGE_ATTACHMENT_WIRE_SIZE),     // MessageAttachment
+        24 => Some(FILE_WIRE_SIZE),                   // File
         25 => Some(FILE_SLICE_WIRE_SIZE),             // FileSlice
         26 => Some(BENCH_DEP_WIRE_SIZE),              // BenchDep
         // Cannot encrypt: encrypted(5), key_secret(6), invite_accepted(9)
@@ -234,13 +234,13 @@ mod tests {
     fn test_per_event_wire_sizes() {
         use super::super::super::admin::ADMIN_WIRE_SIZE;
         use super::super::super::bench_dep::BENCH_DEP_WIRE_SIZE;
+        use super::super::super::file::FILE_WIRE_SIZE;
         use super::super::super::file_slice::FILE_SLICE_WIRE_SIZE;
         use super::super::super::invite_accepted::INVITE_ACCEPTED_WIRE_SIZE;
         use super::super::super::invite_secret::INVITE_SECRET_WIRE_SIZE;
         use super::super::super::key_secret::KEY_SECRET_WIRE_SIZE;
         use super::super::super::key_shared::KEY_SHARED_WIRE_SIZE;
         use super::super::super::message::MESSAGE_WIRE_SIZE;
-        use super::super::super::message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE;
         use super::super::super::message_deletion::MESSAGE_DELETION_WIRE_SIZE;
         use super::super::super::peer_invite_shared::DEVICE_INVITE_WIRE_SIZE;
         use super::super::super::peer_shared::PEER_SHARED_WIRE_SIZE;
@@ -252,7 +252,7 @@ mod tests {
 
         assert_eq!(MESSAGE_WIRE_SIZE, 1194);
         assert_eq!(REACTION_WIRE_SIZE, 234);
-        assert_eq!(MESSAGE_ATTACHMENT_WIRE_SIZE, 633);
+        assert_eq!(FILE_WIRE_SIZE, 633);
         assert_eq!(FILE_SLICE_WIRE_SIZE, 262286);
         assert_eq!(BENCH_DEP_WIRE_SIZE, 345);
         assert_eq!(WORKSPACE_WIRE_SIZE, 105);
@@ -275,17 +275,14 @@ mod tests {
     #[test]
     fn test_encrypted_inner_wire_size_known() {
         use super::super::super::bench_dep::BENCH_DEP_WIRE_SIZE;
+        use super::super::super::file::FILE_WIRE_SIZE;
         use super::super::super::file_slice::FILE_SLICE_WIRE_SIZE;
         use super::super::super::message::wire::MESSAGE_WIRE_SIZE;
-        use super::super::super::message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE;
         use super::super::super::reaction::REACTION_WIRE_SIZE;
 
         assert_eq!(encrypted_inner_wire_size(1), Some(MESSAGE_WIRE_SIZE));
         assert_eq!(encrypted_inner_wire_size(2), Some(REACTION_WIRE_SIZE));
-        assert_eq!(
-            encrypted_inner_wire_size(24),
-            Some(MESSAGE_ATTACHMENT_WIRE_SIZE)
-        );
+        assert_eq!(encrypted_inner_wire_size(24), Some(FILE_WIRE_SIZE));
         assert_eq!(encrypted_inner_wire_size(25), Some(FILE_SLICE_WIRE_SIZE));
         assert_eq!(encrypted_inner_wire_size(26), Some(BENCH_DEP_WIRE_SIZE));
     }

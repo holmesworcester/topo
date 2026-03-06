@@ -13,7 +13,7 @@ use serde::Serialize;
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
-use crate::event_modules::{message, message_attachment, peer_shared, reaction, user, workspace};
+use crate::event_modules::{file, message, peer_shared, reaction, user, workspace};
 use crate::node::NodeRuntimeNetInfo;
 use crate::rpc::protocol::*;
 use crate::service;
@@ -486,7 +486,7 @@ fn dispatch(
                             &peer_id,
                             client_op_id.as_deref(),
                             &data.event_id,
-                            "attachment",
+                            "file",
                         );
                         RpcResponse::success(data)
                     }
@@ -498,7 +498,7 @@ fn dispatch(
         RpcMethod::Files { limit } => match state.require_active_peer() {
             Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
                 Ok((recorded_by, db)) => {
-                    match message_attachment::queries::list_files(&db, &recorded_by, limit) {
+                    match file::queries::list_files(&db, &recorded_by, limit) {
                         Ok(data) => RpcResponse::success(data),
                         Err(e) => RpcResponse::error(e.to_string()),
                     }
@@ -512,7 +512,7 @@ fn dispatch(
             output_path,
         } => match state.require_active_peer() {
             Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
-                Ok((recorded_by, db)) => match message_attachment::queries::save_file_by_selector(
+                Ok((recorded_by, db)) => match file::queries::save_file_by_selector(
                     &db,
                     &recorded_by,
                     &target,

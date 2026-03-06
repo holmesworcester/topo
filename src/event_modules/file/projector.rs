@@ -2,7 +2,7 @@ use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 
-/// Pure projector: MessageAttachment → message_attachments table insert.
+/// Pure projector: File → files table insert.
 /// Emits RetryFileSliceGuards command so pending file_slices can unblock.
 pub fn project_pure(
     recorded_by: &str,
@@ -11,8 +11,8 @@ pub fn project_pure(
     _ctx: &ContextSnapshot,
 ) -> ProjectorResult {
     let att = match parsed {
-        ParsedEvent::MessageAttachment(a) => a,
-        _ => return ProjectorResult::reject("not a message_attachment event".to_string()),
+        ParsedEvent::File(a) => a,
+        _ => return ProjectorResult::reject("not a file event".to_string()),
     };
 
     let message_id_b64 = event_id_to_base64(&att.message_id);
@@ -21,7 +21,7 @@ pub fn project_pure(
     let signer_event_id_b64 = event_id_to_base64(&att.signed_by);
 
     let ops = vec![WriteOp::InsertOrIgnore {
-        table: "message_attachments",
+        table: "files",
         columns: vec![
             "recorded_by",
             "event_id",

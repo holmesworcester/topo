@@ -22,7 +22,7 @@ pub fn build_projector_context(
 
     let mut desc_stmt = conn.prepare(
         "SELECT event_id, signer_event_id
-         FROM message_attachments
+         FROM files
          WHERE recorded_by = ?1 AND file_id = ?2
          ORDER BY created_at ASC, event_id ASC",
     )?;

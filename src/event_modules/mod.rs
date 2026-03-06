@@ -1,6 +1,7 @@
 pub mod admin;
 pub mod bench_dep;
 pub mod encrypted;
+pub mod file;
 pub mod file_slice;
 pub mod invite_accepted;
 pub mod invite_secret;
@@ -8,7 +9,6 @@ pub mod key_secret;
 pub mod key_shared;
 pub mod layout;
 pub mod message;
-pub mod message_attachment;
 pub mod message_deletion;
 pub mod peer_invite_shared;
 pub mod peer_removed;
@@ -52,13 +52,13 @@ pub fn trunc_hex(bytes: &[u8], max_hex_chars: usize) -> String {
 pub use admin::AdminEvent;
 pub use bench_dep::BenchDepEvent;
 pub use encrypted::EncryptedEvent;
+pub use file::FileEvent;
 pub use file_slice::FileSliceEvent;
 pub use invite_accepted::InviteAcceptedEvent;
 pub use invite_secret::InviteSecretEvent;
 pub use key_secret::KeySecretEvent;
 pub use key_shared::KeySharedEvent;
 pub use message::MessageEvent;
-pub use message_attachment::MessageAttachmentEvent;
 pub use message_deletion::MessageDeletionEvent;
 pub use peer_invite_shared::DeviceInviteEvent;
 pub use peer_removed::PeerRemovedEvent;
@@ -88,7 +88,7 @@ pub const EVENT_TYPE_USER_REMOVED: u8 = 20;
 pub const EVENT_TYPE_PEER_REMOVED: u8 = 21;
 pub const EVENT_TYPE_KEY_SHARED: u8 = 22;
 pub const EVENT_TYPE_PEER: u8 = 23; // reserved (retired local peer event)
-pub const EVENT_TYPE_MESSAGE_ATTACHMENT: u8 = 24;
+pub const EVENT_TYPE_FILE: u8 = 24;
 pub const EVENT_TYPE_FILE_SLICE: u8 = 25;
 pub const EVENT_TYPE_BENCH_DEP: u8 = 26;
 pub const EVENT_TYPE_PEER_SECRET: u8 = 27;
@@ -110,7 +110,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     message::ensure_schema(conn)?;
     reaction::ensure_schema(conn)?;
     message_deletion::ensure_schema(conn)?;
-    message_attachment::ensure_schema(conn)?;
+    file::ensure_schema(conn)?;
     file_slice::ensure_schema(conn)?;
     key_secret::ensure_schema(conn)?;
     key_shared::ensure_schema(conn)?;
@@ -139,7 +139,7 @@ pub enum ParsedEvent {
     PeerRemoved(PeerRemovedEvent),
     KeyShared(KeySharedEvent),
     Tenant(TenantEvent),
-    MessageAttachment(MessageAttachmentEvent),
+    File(FileEvent),
     FileSlice(FileSliceEvent),
     BenchDep(BenchDepEvent),
     PeerSecret(PeerSecretEvent),
@@ -165,7 +165,7 @@ impl ParsedEvent {
             ParsedEvent::PeerRemoved(r) => r.created_at_ms,
             ParsedEvent::KeyShared(s) => s.created_at_ms,
             ParsedEvent::Tenant(t) => t.created_at_ms,
-            ParsedEvent::MessageAttachment(a) => a.created_at_ms,
+            ParsedEvent::File(a) => a.created_at_ms,
             ParsedEvent::FileSlice(f) => f.created_at_ms,
             ParsedEvent::BenchDep(b) => b.created_at_ms,
             ParsedEvent::PeerSecret(l) => l.created_at_ms,
@@ -235,7 +235,7 @@ impl ParsedEvent {
                 ]
             }
             ParsedEvent::Tenant(_) => vec![],
-            ParsedEvent::MessageAttachment(a) => vec![
+            ParsedEvent::File(a) => vec![
                 ("message_id", a.message_id),
                 ("key_event_id", a.key_event_id),
                 ("signed_by", a.signed_by),
@@ -265,7 +265,7 @@ impl ParsedEvent {
             ParsedEvent::PeerRemoved(_) => EVENT_TYPE_PEER_REMOVED,
             ParsedEvent::KeyShared(_) => EVENT_TYPE_KEY_SHARED,
             ParsedEvent::Tenant(_) => EVENT_TYPE_TENANT,
-            ParsedEvent::MessageAttachment(_) => EVENT_TYPE_MESSAGE_ATTACHMENT,
+            ParsedEvent::File(_) => EVENT_TYPE_FILE,
             ParsedEvent::FileSlice(_) => EVENT_TYPE_FILE_SLICE,
             ParsedEvent::BenchDep(_) => EVENT_TYPE_BENCH_DEP,
             ParsedEvent::PeerSecret(_) => EVENT_TYPE_PEER_SECRET,
@@ -289,7 +289,7 @@ impl ParsedEvent {
             ParsedEvent::Message(m) => Some((m.signed_by, m.signer_type)),
             ParsedEvent::Reaction(r) => Some((r.signed_by, r.signer_type)),
             ParsedEvent::MessageDeletion(d) => Some((d.signed_by, d.signer_type)),
-            ParsedEvent::MessageAttachment(a) => Some((a.signed_by, a.signer_type)),
+            ParsedEvent::File(a) => Some((a.signed_by, a.signer_type)),
             ParsedEvent::Encrypted(_)
             | ParsedEvent::KeySecret(_)
             | ParsedEvent::Workspace(_)
@@ -319,7 +319,7 @@ impl ParsedEvent {
             ParsedEvent::UserRemoved(e) => e.human_fields(),
             ParsedEvent::PeerRemoved(e) => e.human_fields(),
             ParsedEvent::KeyShared(e) => e.human_fields(),
-            ParsedEvent::MessageAttachment(e) => e.human_fields(),
+            ParsedEvent::File(e) => e.human_fields(),
             ParsedEvent::FileSlice(e) => e.human_fields(),
             ParsedEvent::BenchDep(e) => e.human_fields(),
             ParsedEvent::PeerSecret(e) => e.human_fields(),
@@ -411,7 +411,7 @@ pub fn registry() -> &'static EventRegistry {
             &peer_removed::PEER_REMOVED_META,
             &key_shared::KEY_SHARED_META,
             &tenant::TENANT_META,
-            &message_attachment::MESSAGE_ATTACHMENT_META,
+            &file::FILE_META,
             &file_slice::FILE_SLICE_META,
             &bench_dep::BENCH_DEP_META,
             &peer_secret::PEER_SECRET_META,

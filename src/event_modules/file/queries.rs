@@ -5,7 +5,7 @@ use serde::{Deserialize, Serialize};
 use std::path::Path;
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct AttachmentSummary {
+pub struct FileSummary {
     pub filename: String,
     pub mime_type: String,
     pub blob_bytes: i64,
@@ -15,7 +15,7 @@ pub struct AttachmentSummary {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct FileItem {
-    pub attachment_id: String,
+    pub file_event_id: String,
     pub message_id: String,
     pub file_id: String,
     pub filename: String,
@@ -35,7 +35,7 @@ pub struct FilesResponse {
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct SaveFileResponse {
-    pub attachment_id: String,
+    pub file_event_id: String,
     pub filename: String,
     pub output_path: String,
     pub bytes_written: u64,
@@ -46,17 +46,17 @@ pub fn list_for_message(
     db: &Connection,
     recorded_by: &str,
     message_id_b64: &str,
-) -> Result<Vec<AttachmentSummary>, rusqlite::Error> {
+) -> Result<Vec<FileSummary>, rusqlite::Error> {
     let mut stmt = db.prepare(
         "SELECT a.filename, a.mime_type, a.blob_bytes, a.total_slices,
                 (SELECT COUNT(*) FROM file_slices fs
                  WHERE fs.recorded_by = a.recorded_by AND fs.file_id = a.file_id) as slices_received
-         FROM message_attachments a
+         FROM files a
          WHERE a.recorded_by = ?1 AND a.message_id = ?2",
     )?;
     let rows = stmt
         .query_map(rusqlite::params![recorded_by, message_id_b64], |row| {
-            Ok(AttachmentSummary {
+            Ok(FileSummary {
                 filename: row.get(0)?,
                 mime_type: row.get(1)?,
                 blob_bytes: row.get(2)?,
@@ -84,7 +84,7 @@ pub fn list_files(
                 a.blob_bytes, a.total_slices, a.created_at,
                 (SELECT COUNT(*) FROM file_slices fs
                  WHERE fs.recorded_by = a.recorded_by AND fs.file_id = a.file_id) AS slices_received
-         FROM message_attachments a
+         FROM files a
          WHERE a.recorded_by = ?1
          ORDER BY a.created_at ASC, a.event_id ASC
          {}",
@@ -94,13 +94,13 @@ pub fn list_files(
     let mut stmt = db.prepare(&query)?;
     let files = stmt
         .query_map(rusqlite::params![recorded_by], |row| {
-            let attachment_id_b64: String = row.get(0)?;
+            let file_event_id_b64: String = row.get(0)?;
             let message_id_b64: String = row.get(1)?;
             let file_id_b64: String = row.get(2)?;
             let total_slices: i64 = row.get(6)?;
             let slices_received: i64 = row.get(8)?;
             Ok(FileItem {
-                attachment_id: b64_to_hex(&attachment_id_b64),
+                file_event_id: b64_to_hex(&file_event_id_b64),
                 message_id: b64_to_hex(&message_id_b64),
                 file_id: b64_to_hex(&file_id_b64),
                 filename: row.get(3)?,
@@ -115,7 +115,7 @@ pub fn list_files(
         .collect::<Result<Vec<_>, _>>()?;
 
     let total: i64 = db.query_row(
-        "SELECT COUNT(*) FROM message_attachments WHERE recorded_by = ?1",
+        "SELECT COUNT(*) FROM files WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],
         |row| row.get(0),
     )?;
@@ -123,7 +123,7 @@ pub fn list_files(
     Ok(FilesResponse { files, total })
 }
 
-fn resolve_attachment_selector_to_b64(
+fn resolve_file_selector_to_b64(
     db: &Connection,
     recorded_by: &str,
     selector: &str,
@@ -133,10 +133,10 @@ fn resolve_attachment_selector_to_b64(
         if num == 0 {
             return Err("file number must be >= 1".into());
         }
-        let attachment_id_b64: Option<String> = db
+        let file_event_id_b64: Option<String> = db
             .query_row(
                 "SELECT event_id
-                 FROM message_attachments
+                 FROM files
                  WHERE recorded_by = ?1
                  ORDER BY created_at ASC, event_id ASC
                  LIMIT 1 OFFSET ?2",
@@ -144,11 +144,11 @@ fn resolve_attachment_selector_to_b64(
                 |row| row.get(0),
             )
             .ok();
-        return match attachment_id_b64 {
+        return match file_event_id_b64 {
             Some(v) => Ok(v),
             None => {
                 let total: i64 = db.query_row(
-                    "SELECT COUNT(*) FROM message_attachments WHERE recorded_by = ?1",
+                    "SELECT COUNT(*) FROM files WHERE recorded_by = ?1",
                     rusqlite::params![recorded_by],
                     |row| row.get(0),
                 )?;
@@ -157,20 +157,20 @@ fn resolve_attachment_selector_to_b64(
         };
     }
 
-    let attachment_id = event_id_from_hex(selector)
+    let file_event_id = event_id_from_hex(selector)
         .ok_or_else(|| format!("invalid file selector: {}", selector))?;
-    let attachment_id_b64 = event_id_to_base64(&attachment_id);
+    let file_event_id_b64 = event_id_to_base64(&file_event_id);
     let exists: bool = db.query_row(
         "SELECT COUNT(*) > 0
-         FROM message_attachments
+         FROM files
          WHERE recorded_by = ?1 AND event_id = ?2",
-        rusqlite::params![recorded_by, &attachment_id_b64],
+        rusqlite::params![recorded_by, &file_event_id_b64],
         |row| row.get(0),
     )?;
     if !exists {
         return Err(format!("file not found for selector {}", selector).into());
     }
-    Ok(attachment_id_b64)
+    Ok(file_event_id_b64)
 }
 
 fn load_file_slice_payload(
@@ -247,8 +247,8 @@ pub fn save_file_by_selector(
     selector: &str,
     output_path: &str,
 ) -> Result<SaveFileResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let attachment_event_id_b64 = resolve_attachment_selector_to_b64(db, recorded_by, selector)?;
-    let attachment_event_id_hex = b64_to_hex(&attachment_event_id_b64);
+    let file_event_id_b64 = resolve_file_selector_to_b64(db, recorded_by, selector)?;
+    let file_event_id_hex = b64_to_hex(&file_event_id_b64);
 
     let (file_id_b64, blob_bytes, total_slices, slice_bytes, filename): (
         String,
@@ -258,10 +258,10 @@ pub fn save_file_by_selector(
         String,
     ) = db.query_row(
         "SELECT file_id, blob_bytes, total_slices, slice_bytes, filename
-         FROM message_attachments
+         FROM files
          WHERE recorded_by = ?1 AND event_id = ?2
          LIMIT 1",
-        rusqlite::params![recorded_by, &attachment_event_id_b64],
+        rusqlite::params![recorded_by, &file_event_id_b64],
         |row| {
             Ok((
                 row.get(0)?,
@@ -328,7 +328,7 @@ pub fn save_file_by_selector(
     std::fs::write(out_path, &data)?;
 
     Ok(SaveFileResponse {
-        attachment_id: attachment_event_id_hex,
+        file_event_id: file_event_id_hex,
         filename,
         output_path: out_path.to_string_lossy().to_string(),
         bytes_written: data.len() as u64,
@@ -342,7 +342,7 @@ mod tests {
 
     fn setup_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        crate::event_modules::message_attachment::ensure_schema(&db).unwrap();
+        crate::event_modules::file::ensure_schema(&db).unwrap();
         crate::event_modules::file_slice::ensure_schema(&db).unwrap();
         db
     }
@@ -355,23 +355,23 @@ mod tests {
     }
 
     #[test]
-    fn test_list_for_message_returns_attachments() {
+    fn test_list_for_message_returns_files() {
         let db = setup_db();
         db.execute(
-            "INSERT INTO message_attachments
+            "INSERT INTO files
              (recorded_by, event_id, message_id, file_id, blob_bytes, total_slices, slice_bytes, root_hash, key_event_id, filename, mime_type, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params!["peer1", "evt1", "msg1", "file1", 1234, 1, 1234, &[0u8; 32] as &[u8], "key1", "photo.jpg", "image/jpeg", 1000],
         ).unwrap();
         db.execute(
-            "INSERT INTO message_attachments
+            "INSERT INTO files
              (recorded_by, event_id, message_id, file_id, blob_bytes, total_slices, slice_bytes, root_hash, key_event_id, filename, mime_type, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params!["peer1", "evt2", "msg1", "file2", 5678, 1, 5678, &[0u8; 32] as &[u8], "key1", "doc.pdf", "application/pdf", 1001],
         ).unwrap();
         // Different message — should not appear
         db.execute(
-            "INSERT INTO message_attachments
+            "INSERT INTO files
              (recorded_by, event_id, message_id, file_id, blob_bytes, total_slices, slice_bytes, root_hash, key_event_id, filename, mime_type, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params!["peer1", "evt3", "msg2", "file3", 999, 1, 999, &[0u8; 32] as &[u8], "key1", "other.txt", "text/plain", 1002],
@@ -392,7 +392,7 @@ mod tests {
     fn test_slices_received_counts_correctly() {
         let db = setup_db();
         db.execute(
-            "INSERT INTO message_attachments
+            "INSERT INTO files
              (recorded_by, event_id, message_id, file_id, blob_bytes, total_slices, slice_bytes, root_hash, key_event_id, filename, mime_type, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params!["peer1", "evt1", "msg1", "file1", 524288, 2, 262144, &[0u8; 32] as &[u8], "key1", "big.bin", "application/octet-stream", 1000],

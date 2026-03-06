@@ -13,7 +13,7 @@ const CANONICAL_EVENT_FILES: &[&str] = &[
     "src/event_modules/reaction/wire.rs",
     "src/event_modules/encrypted.rs",
     "src/event_modules/file_slice/wire.rs",
-    "src/event_modules/message_attachment/wire.rs",
+    "src/event_modules/file/wire.rs",
     "src/event_modules/bench_dep.rs",
     "src/event_modules/message_deletion/wire.rs",
     "src/event_modules/key_secret.rs",

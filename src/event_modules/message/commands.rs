@@ -13,7 +13,7 @@ use super::super::message_deletion::MessageDeletionEvent;
 use super::super::peer_shared;
 use super::super::workspace;
 use super::super::ParsedEvent;
-use super::super::{FileSliceEvent, MessageAttachmentEvent};
+use super::super::{FileEvent, FileSliceEvent};
 use super::wire::MessageEvent;
 
 fn current_timestamp_ms() -> u64 {
@@ -263,7 +263,7 @@ pub fn generate_for_peer(
 /// Each generated file creates:
 /// - 1 parent `message`
 /// - 1 `key_secret`
-/// - 1 `message_attachment`
+/// - 1 `file`
 /// - `slices_per_file` `file_slice` events
 pub fn generate_files_for_peer(
     db_path: &str,
@@ -318,7 +318,7 @@ pub fn generate_files_for_peer(
         create_signed_event_synchronous(
             &db,
             &recorded_by,
-            &ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+            &ParsedEvent::File(FileEvent {
                 created_at_ms: current_timestamp_ms(),
                 message_id: message_event_id,
                 file_id,
@@ -336,7 +336,7 @@ pub fn generate_files_for_peer(
             &signing_key,
         )
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("create message_attachment error: {}", e).into()
+            format!("create file error: {}", e).into()
         })?;
 
         for slice_number in 0..slices_per_file {
@@ -370,7 +370,7 @@ pub fn generate_files_for_peer(
 }
 
 // ---------------------------------------------------------------------------
-// send-file: message + attachment from a real file on disk
+// send-file: message + file from a real file on disk
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -406,7 +406,7 @@ fn mime_from_extension(ext: &str) -> &'static str {
     }
 }
 
-/// Send a message with a file attachment as a specific peer.
+/// Send a message with a file as a specific peer.
 pub fn send_file_for_peer(
     db_path: &str,
     peer_id: &str,
@@ -460,7 +460,7 @@ pub fn send_file_for_peer(
     create_signed_event_synchronous(
         &db,
         &recorded_by,
-        &ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+        &ParsedEvent::File(FileEvent {
             created_at_ms: current_timestamp_ms(),
             message_id: message_event_id,
             file_id,

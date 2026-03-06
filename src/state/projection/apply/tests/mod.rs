@@ -6,10 +6,10 @@ use crate::db::{
     store::{insert_event, insert_neg_item_if_shared, insert_recorded_event},
 };
 use crate::event_modules::{
-    self as events, registry, BenchDepEvent, EncryptedEvent, FileSliceEvent, KeySecretEvent,
-    MessageAttachmentEvent, MessageDeletionEvent, MessageEvent, ParsedEvent, ReactionEvent,
-    WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_FILE_SLICE, EVENT_TYPE_MESSAGE,
-    EVENT_TYPE_MESSAGE_DELETION, EVENT_TYPE_REACTION,
+    self as events, registry, BenchDepEvent, EncryptedEvent, FileEvent, FileSliceEvent,
+    KeySecretEvent, MessageDeletionEvent, MessageEvent, ParsedEvent, ReactionEvent, WorkspaceEvent,
+    EVENT_TYPE_ENCRYPTED, EVENT_TYPE_FILE_SLICE, EVENT_TYPE_MESSAGE, EVENT_TYPE_MESSAGE_DELETION,
+    EVENT_TYPE_REACTION,
 };
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::encrypted::encrypt_event_blob;
@@ -480,7 +480,7 @@ fn make_attachment_signed(
     message_id: &EventId,
     key_event_id: &EventId,
 ) -> (ParsedEvent, Vec<u8>) {
-    let att = MessageAttachmentEvent {
+    let att = FileEvent {
         created_at_ms: now_ms(),
         message_id: *message_id,
         file_id: rand::random(),
@@ -495,7 +495,7 @@ fn make_attachment_signed(
         signer_type: 5,
         signature: [0u8; 64],
     };
-    let event = ParsedEvent::MessageAttachment(att);
+    let event = ParsedEvent::File(att);
     let mut blob = events::encode_event(&event).unwrap();
     sign_blob(signing_key, &mut blob);
     let parsed = events::parse_event(&blob).unwrap();
@@ -2924,14 +2924,14 @@ fn make_file_slice(
 }
 
 /// Convenience: create identity chain + signed attachment.
-fn make_message_attachment(
+fn make_file(
     conn: &Connection,
     recorded_by: &str,
     message_id: &EventId,
     key_event_id: &EventId,
 ) -> (ParsedEvent, Vec<u8>) {
     let (signer_eid, signing_key) = make_identity_chain(conn, recorded_by);
-    let att = MessageAttachmentEvent {
+    let att = FileEvent {
         created_at_ms: now_ms(),
         message_id: *message_id,
         file_id: [42u8; 32],
@@ -2946,14 +2946,14 @@ fn make_message_attachment(
         signer_type: 5,
         signature: [0u8; 64],
     };
-    let event = ParsedEvent::MessageAttachment(att);
+    let event = ParsedEvent::File(att);
     let mut blob = events::encode_event(&event).unwrap();
     sign_blob(&signing_key, &mut blob);
     let parsed = events::parse_event(&blob).unwrap();
     (parsed, blob)
 }
 
-/// Helper: create a MessageAttachment descriptor with a specific file_id and signer,
+/// Helper: create a File descriptor with a specific file_id and signer,
 /// along with its required deps (Message + KeySecret). Insert and project all of them.
 /// Returns the attachment event_id.
 fn setup_descriptor_for_file(
@@ -2978,8 +2978,8 @@ fn setup_descriptor_for_file(
     let sk_eid = insert_event_raw(conn, recorded_by, &sk_blob);
     project_one(conn, recorded_by, &sk_eid).unwrap();
 
-    // Create MessageAttachment descriptor with the specific file_id
-    let att = MessageAttachmentEvent {
+    // Create File descriptor with the specific file_id
+    let att = FileEvent {
         created_at_ms: now_ms(),
         message_id: msg_eid,
         file_id,
@@ -2994,7 +2994,7 @@ fn setup_descriptor_for_file(
         signer_type: 5,
         signature: [0u8; 64],
     };
-    let event = ParsedEvent::MessageAttachment(att);
+    let event = ParsedEvent::File(att);
     let mut blob = events::encode_event(&event).unwrap();
     sign_blob(signing_key, &mut blob);
     let att_blob = blob;
@@ -3016,7 +3016,7 @@ fn test_file_slice_valid() {
     // Create identity chain as signer
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
 
-    // Create descriptor (MessageAttachment) for this file_id
+    // Create descriptor (File) for this file_id
     let file_id = [99u8; 32];
     setup_descriptor_for_file(&conn, recorded_by, &signing_key, &signer_eid, file_id);
 
@@ -3222,7 +3222,7 @@ fn test_project_attachment_valid() {
     let att_b64 = event_id_to_base64(&att_eid);
     let count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM message_attachments WHERE recorded_by = ?1 AND event_id = ?2",
+            "SELECT COUNT(*) FROM files WHERE recorded_by = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, &att_b64],
             |row| row.get(0),
         )
@@ -3245,7 +3245,7 @@ fn test_attachment_blocks_on_missing_message() {
     project_one(&conn, recorded_by, &sk_eid).unwrap();
 
     let fake_msg_id = [88u8; 32];
-    let (_att, att_blob) = make_message_attachment(&conn, recorded_by, &fake_msg_id, &sk_eid);
+    let (_att, att_blob) = make_file(&conn, recorded_by, &fake_msg_id, &sk_eid);
     let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
     let result = project_one(&conn, recorded_by, &att_eid).unwrap();
     assert!(matches!(result, ProjectionDecision::Block { .. }));
@@ -3279,7 +3279,7 @@ fn test_attachment_blocks_on_both_missing() {
 
     let fake_msg_id = [88u8; 32];
     let fake_key_id = [77u8; 32];
-    let (_att, att_blob) = make_message_attachment(&conn, recorded_by, &fake_msg_id, &fake_key_id);
+    let (_att, att_blob) = make_file(&conn, recorded_by, &fake_msg_id, &fake_key_id);
     let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
     let result = project_one(&conn, recorded_by, &att_eid).unwrap();
     match result {
@@ -3842,8 +3842,8 @@ fn test_invite_accepted_guard_retry_on_workspace() {
 
 #[test]
 fn test_file_slice_guard_retry_after_cascaded_attachment() {
-    // FileSlice is guard-blocked waiting for descriptor (MessageAttachment).
-    // MessageAttachment is dep-blocked on a message. When the message projects,
+    // FileSlice is guard-blocked waiting for descriptor (File).
+    // File is dep-blocked on a message. When the message projects,
     // it cascades the attachment, which triggers guard retry on the file_slice.
     let conn = setup();
     let recorded_by = "peer1";
@@ -3865,7 +3865,7 @@ fn test_file_slice_guard_retry_after_cascaded_attachment() {
     project_one(&conn, recorded_by, &sk_eid).unwrap();
 
     // Create attachment (descriptor) — dep-blocked on message
-    let att = MessageAttachmentEvent {
+    let att = FileEvent {
         created_at_ms: now_ms(),
         message_id: msg_eid,
         file_id,
@@ -3880,7 +3880,7 @@ fn test_file_slice_guard_retry_after_cascaded_attachment() {
         signer_type: 5,
         signature: [0u8; 64],
     };
-    let att_event = ParsedEvent::MessageAttachment(att);
+    let att_event = ParsedEvent::File(att);
     let mut att_blob = events::encode_event(&att_event).unwrap();
     sign_blob(&signing_key, &mut att_blob);
     let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
