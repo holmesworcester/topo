@@ -1359,8 +1359,9 @@ async fn reevaluate_runtime(
                 let msg = e.to_string();
                 let m = msg.to_ascii_lowercase();
                 if m.contains("address already in use")
-                    || m.contains("os error 98")
-                    || m.contains("os error 48")
+                    || m.contains("os error 98")  // Linux EADDRINUSE
+                    || m.contains("os error 48")  // macOS EADDRINUSE
+                    || m.contains("os error 10048")  // Windows WSAEADDRINUSE
                 {
                     tracing::error!(
                         "Runtime cannot start: port {} is already in use by another process. \

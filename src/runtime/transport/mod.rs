@@ -36,7 +36,6 @@ use quinn::{ClientConfig, Endpoint, ServerConfig};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::warn;
@@ -120,9 +119,16 @@ impl PinnedCertVerifier {
             let fp_hex = hex::encode(fp);
             let count = {
                 let mut map = self.rejections.lock().unwrap_or_else(|p| p.into_inner());
-                let entry = map.entry(fp).or_insert(0);
-                *entry += 1;
-                *entry
+                // Cap tracked fingerprints to prevent unbounded memory growth
+                // from unauthenticated traffic presenting novel certs.
+                if map.len() >= 1024 && !map.contains_key(&fp) {
+                    // At capacity with a new fingerprint — log without tracking.
+                    1
+                } else {
+                    let entry = map.entry(fp).or_insert(0);
+                    *entry += 1;
+                    *entry
+                }
             };
             if count <= 3 {
                 warn!(
