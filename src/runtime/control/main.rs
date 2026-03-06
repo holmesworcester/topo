@@ -2499,6 +2499,150 @@ fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> S
 }
 
 #[derive(Debug, Clone)]
+struct NegEntryView {
+    bound_ts: String,
+    bound_id_prefix: String,
+    mode: String,
+    fingerprint_hex: Option<String>,
+    id_count: Option<u64>,
+    ids: Vec<String>,
+    ids_truncated: bool,
+}
+
+#[derive(Debug, Clone)]
+struct NegFrameView {
+    protocol: Option<u64>,
+    entry_count: u64,
+    skip_count: u64,
+    fingerprint_count: u64,
+    idlist_count: u64,
+    entries: Vec<NegEntryView>,
+    parse_error: Option<String>,
+}
+
+fn parse_neg_frame_view(detail_json: Option<&str>) -> Option<NegFrameView> {
+    let raw = detail_json?;
+    let v = serde_json::from_str::<serde_json::Value>(raw).ok()?;
+
+    let entries = v["entries"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|entry| {
+                    let ids = entry["ids"]
+                        .as_array()
+                        .map(|ids_arr| {
+                            ids_arr
+                                .iter()
+                                .filter_map(|x| x.as_str())
+                                .map(|s| s.to_string())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    NegEntryView {
+                        bound_ts: entry["bound_ts"].as_str().unwrap_or("?").to_string(),
+                        bound_id_prefix: entry["bound_id_prefix"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string(),
+                        mode: entry["mode"].as_str().unwrap_or("?").to_string(),
+                        fingerprint_hex: entry["fingerprint_hex"].as_str().map(|s| s.to_string()),
+                        id_count: entry["id_count"].as_u64(),
+                        ids,
+                        ids_truncated: entry["ids_truncated"].as_bool().unwrap_or(false),
+                    }
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Some(NegFrameView {
+        protocol: v["protocol"].as_u64(),
+        entry_count: v["entry_count"].as_u64().unwrap_or(0),
+        skip_count: v["skip_count"].as_u64().unwrap_or(0),
+        fingerprint_count: v["fingerprint_count"].as_u64().unwrap_or(0),
+        idlist_count: v["idlist_count"].as_u64().unwrap_or(0),
+        entries,
+        parse_error: v["parse_error"].as_str().map(|s| s.to_string()),
+    })
+}
+
+fn short_hex12(hex: &str) -> String {
+    hex.chars().take(12).collect()
+}
+
+fn neg_entry_depth_hint(prefix_hex: &str) -> usize {
+    let bytes = prefix_hex.len() / 2;
+    if bytes <= 1 {
+        0
+    } else if bytes <= 3 {
+        1
+    } else if bytes <= 7 {
+        2
+    } else {
+        3
+    }
+}
+
+fn neg_entry_readable_line(entry_idx: usize, entry: &NegEntryView) -> String {
+    let bound_prefix = short_hex12(&entry.bound_id_prefix);
+    let bound = if bound_prefix.is_empty() {
+        format!("({})", entry.bound_ts)
+    } else {
+        format!("({}, {})", entry.bound_ts, bound_prefix)
+    };
+    match entry.mode.as_str() {
+        "Skip" => format!("range[{}] MATCH bound={}", entry_idx + 1, bound),
+        "Fingerprint" => {
+            let fp = entry
+                .fingerprint_hex
+                .as_deref()
+                .map(short_hex12)
+                .unwrap_or_else(|| "?".to_string());
+            format!(
+                "range[{}] HASH bound={} fp={} (await compare)",
+                entry_idx + 1,
+                bound,
+                fp
+            )
+        }
+        "IdList" => {
+            let count = entry.id_count.unwrap_or(0);
+            let sample = entry
+                .ids
+                .iter()
+                .take(4)
+                .map(|id| short_hex12(id))
+                .collect::<Vec<_>>()
+                .join(",");
+            if sample.is_empty() {
+                format!(
+                    "range[{}] MISMATCH -> IdList count={} truncated={}",
+                    entry_idx + 1,
+                    count,
+                    entry.ids_truncated
+                )
+            } else {
+                let more = if entry.ids.len() > 4 || entry.ids_truncated {
+                    ",..."
+                } else {
+                    ""
+                };
+                format!(
+                    "range[{}] MISMATCH -> IdList count={} sample=[{}{}] truncated={}",
+                    entry_idx + 1,
+                    count,
+                    sample,
+                    more,
+                    entry.ids_truncated
+                )
+            }
+        }
+        other => format!("range[{}] {} bound={}", entry_idx + 1, other, bound),
+    }
+}
+
+#[derive(Debug, Clone)]
 struct RenderedFrameLine {
     seq_start: u64,
     seq_end: u64,
@@ -2509,6 +2653,7 @@ struct RenderedFrameLine {
     frame_type: String,
     len_label: String,
     detail: String,
+    detail_json: Option<String>,
 }
 
 impl RenderedFrameLine {
@@ -2602,6 +2747,7 @@ fn render_frame_lines(
                         burst.len()
                     ),
                     detail,
+                    detail_json: None,
                 });
                 i = j;
                 continue;
@@ -2618,6 +2764,7 @@ fn render_frame_lines(
             frame_type: ev.frame_type.clone(),
             len_label: ev.msg_len.to_string(),
             detail: summarize_sync_event_detail(&ev.frame_type, ev.detail_json.as_deref()),
+            detail_json: ev.detail_json.clone(),
         });
         i += 1;
     }
@@ -2729,9 +2876,10 @@ fn print_sync_tree_groups(groups: &[PeerSyncTreeGroup]) {
             let status = run_status(run);
             let dt = run.ended_at_ms.saturating_sub(run.started_at_ms);
             let frame_lines = render_frame_lines(run, events);
+            let mut prev_neg_entry_count: Option<u64> = None;
             println!(
-                "{} run {} [{}] end={} dir={} role={} sync_rounds={} sync_events_tx={} sync_events_rx={} dur_ms={} raw_frames={} frame_lines={} outcome={}",
-                run_branch,
+            "{} run {} [{}] end={} dir={} role={} sync_rounds={} sync_events_tx={} sync_events_rx={} dur_ms={} raw_frames={} frame_lines={} outcome={}",
+            run_branch,
                 run.run_id,
                 status,
                 format_absolute(run.ended_at_ms),
@@ -2772,6 +2920,57 @@ fn print_sync_tree_groups(groups: &[PeerSyncTreeGroup]) {
                     line.len_label,
                     line.detail
                 );
+
+                if (line.frame_type == "NegOpen" || line.frame_type == "NegMsg")
+                    && line.detail_json.is_some()
+                {
+                    if let Some(neg) = parse_neg_frame_view(line.detail_json.as_deref()) {
+                        let child_stem = if event_idx + 1 == frame_lines.len() {
+                            "  "
+                        } else {
+                            "│ "
+                        };
+                        let drilldown = prev_neg_entry_count
+                            .filter(|prev| neg.entry_count > *prev)
+                            .map(|prev| format!(" drilldown={}→{}", prev, neg.entry_count))
+                            .unwrap_or_default();
+                        println!(
+                            "{}  {}    reconcile protocol={} ranges={} hash_match(skip)={} hash_probe(fp)={} idlists={}{}",
+                            run_pad,
+                            child_stem,
+                            neg.protocol
+                                .map(|p| p.to_string())
+                                .unwrap_or_else(|| "?".to_string()),
+                            neg.entry_count,
+                            neg.skip_count,
+                            neg.fingerprint_count,
+                            neg.idlist_count,
+                            drilldown
+                        );
+                        if let Some(err) = &neg.parse_error {
+                            println!("{}  {}    parse_error={}", run_pad, child_stem, err);
+                        }
+
+                        const MAX_RANGE_LINES: usize = 10;
+                        for (entry_idx, entry) in neg.entries.iter().enumerate() {
+                            if entry_idx >= MAX_RANGE_LINES {
+                                let rem = neg.entries.len() - MAX_RANGE_LINES;
+                                println!("{}  {}    (+{} more ranges)", run_pad, child_stem, rem);
+                                break;
+                            }
+                            let depth = neg_entry_depth_hint(&entry.bound_id_prefix);
+                            let depth_pad = "  ".repeat(depth);
+                            println!(
+                                "{}  {}    {}{}",
+                                run_pad,
+                                child_stem,
+                                depth_pad,
+                                neg_entry_readable_line(entry_idx, entry)
+                            );
+                        }
+                        prev_neg_entry_count = Some(neg.entry_count);
+                    }
+                }
             }
         }
 
