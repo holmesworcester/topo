@@ -89,6 +89,8 @@ pub fn encode_invite_accepted(event: &ParsedEvent) -> Result<Vec<u8>, EventError
 
 // === Projector (event-module locality) ===
 
+use crate::contracts::transport_identity_contract::TransportIdentityIntent;
+use crate::db::transport_creds::{has_creds_with_source, CRED_SOURCE_PEER_SHARED};
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::Connection;
@@ -159,6 +161,23 @@ pub fn build_projector_context(
     let mut ctx = ContextSnapshot::default();
     let invite_event_id_b64 = event_id_to_base64(&ia.invite_event_id);
 
+    let has_local_invite_secret: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM invite_secrets
+                 WHERE recorded_by = ?1
+                   AND invite_event_id = ?2
+                   AND length(private_key) = 32
+             )",
+            rusqlite::params![recorded_by, &invite_event_id_b64],
+            |row| row.get(0),
+        )
+        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+    ctx.has_local_invite_secret = has_local_invite_secret;
+    ctx.peer_shared_transport_identity_active =
+        has_creds_with_source(conn, CRED_SOURCE_PEER_SHARED).unwrap_or(false);
+
     if let Some(bc) =
         crate::db::transport_trust::read_bootstrap_context(conn, recorded_by, &invite_event_id_b64)
             .map_err(|e| -> Box<dyn std::error::Error> { e })?
@@ -221,9 +240,18 @@ pub fn project_pure(
         },
     ];
 
-    let commands = vec![EmitCommand::RetryWorkspaceEvent {
+    let mut commands = vec![EmitCommand::RetryWorkspaceEvent {
         workspace_id: workspace_id_b64.clone(),
     }];
+
+    if ctx.has_local_invite_secret && !ctx.peer_shared_transport_identity_active {
+        commands.push(EmitCommand::ApplyTransportIdentityIntent {
+            intent: TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+                recorded_by: recorded_by.to_string(),
+                invite_event_id: ia.invite_event_id,
+            },
+        });
+    }
 
     // Materialize accepted bootstrap trust when local context exists (joiner side)
     // and no matching steady-state PeerShared trust has already projected.

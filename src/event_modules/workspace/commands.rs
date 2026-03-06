@@ -388,6 +388,10 @@ pub fn add_device_to_workspace(
 ) -> Result<LinkChain, Box<dyn std::error::Error + Send + Sync>> {
     let tenant_event_id = ops::ensure_local_tenant_event(db, recorded_by, &peer_shared_key)?;
 
+    // Persist deterministic invite_secret material so invite_accepted projection
+    // can install bootstrap transport identity through the normal command path.
+    let _ = ops::store_invite_secret(db, recorded_by, device_invite_event_id, device_invite_key)?;
+
     // 1. InviteAccepted (local event) — binds accepted workspace, triggers guard cascade
     let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),

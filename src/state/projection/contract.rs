@@ -196,6 +196,15 @@ pub struct ContextSnapshot {
     /// Used to avoid writing bootstrap trust rows that are already superseded by
     /// steady-state peer trust.
     pub bootstrap_spki_already_peer_shared: bool,
+
+    /// True when local invite_secret material exists for this invite event.
+    /// Used by invite_accepted projection to emit bootstrap identity install
+    /// intent through the normal command path.
+    pub has_local_invite_secret: bool,
+
+    /// True when peer_shared transport creds are already active for this tenant.
+    /// Used to prevent bootstrap-identity re-install attempts after convergence.
+    pub peer_shared_transport_identity_active: bool,
 }
 
 /// Unwrapped symmetric key material derived from KeyShared.

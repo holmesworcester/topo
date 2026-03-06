@@ -940,6 +940,80 @@ fn characterization_joiner_accepted_trust_allows_bootstrap_sync() {
     );
 }
 
+#[test]
+fn test_list_active_invite_bootstrap_targets_keeps_distinct_invites_same_addr() {
+    let conn = open_in_memory().unwrap();
+    create_tables(&conn).unwrap();
+
+    let recorded_by = "joiner_targets_1";
+    let addr = "10.0.0.1:4433";
+    let spki_a: [u8; 32] = [0x31; 32];
+    let spki_b: [u8; 32] = [0x32; 32];
+
+    record_invite_bootstrap_trust(
+        &conn,
+        recorded_by,
+        "ia-1",
+        "invite-1",
+        "ws-1",
+        addr,
+        &spki_a,
+    )
+    .unwrap();
+    record_invite_bootstrap_trust(
+        &conn,
+        recorded_by,
+        "ia-2",
+        "invite-2",
+        "ws-1",
+        addr,
+        &spki_b,
+    )
+    .unwrap();
+
+    let targets = list_active_invite_bootstrap_targets(&conn, recorded_by).unwrap();
+    assert_eq!(targets.len(), 2, "two invite ids must produce two targets");
+    let ids: std::collections::HashSet<String> =
+        targets.iter().map(|t| t.invite_event_id.clone()).collect();
+    assert!(ids.contains("invite-1"));
+    assert!(ids.contains("invite-2"));
+}
+
+#[test]
+fn test_list_active_invite_bootstrap_targets_latest_row_wins_per_invite() {
+    let conn = open_in_memory().unwrap();
+    create_tables(&conn).unwrap();
+
+    let recorded_by = "joiner_targets_2";
+    let spki: [u8; 32] = [0x41; 32];
+
+    record_invite_bootstrap_trust(
+        &conn,
+        recorded_by,
+        "ia-1",
+        "invite-1",
+        "ws-1",
+        "10.0.0.1:4433",
+        &spki,
+    )
+    .unwrap();
+    record_invite_bootstrap_trust(
+        &conn,
+        recorded_by,
+        "ia-2",
+        "invite-1",
+        "ws-1",
+        "10.0.0.2:4433",
+        &spki,
+    )
+    .unwrap();
+
+    let targets = list_active_invite_bootstrap_targets(&conn, recorded_by).unwrap();
+    assert_eq!(targets.len(), 1, "one deterministic winner per invite id");
+    assert_eq!(targets[0].invite_event_id, "invite-1");
+    assert_eq!(targets[0].bootstrap_addr, "10.0.0.2:4433");
+}
+
 /// Characterization: full trust lifecycle — pending → accepted → superseded.
 ///
 /// Covers the complete lifecycle:

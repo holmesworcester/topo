@@ -874,14 +874,15 @@ pub fn send_file(db: &str, content: &str, file_path: &str) -> String {
     }
 }
 
-/// Save a received file attachment to disk via daemon RPC.
-pub fn save_file(db: &str, message_selector: &str, output_path: &str) -> Output {
+/// Save a received file to disk via daemon RPC.
+pub fn save_file(db: &str, file_target: &str, output_path: &str) -> Output {
     Command::new(bin())
         .arg("--db")
         .arg(db)
         .arg("save-file")
-        .arg(message_selector)
-        .arg("--output")
+        .arg("--target")
+        .arg(file_target)
+        .arg("--out")
         .arg(output_path)
         .output()
         .expect("failed to run save-file")

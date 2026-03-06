@@ -71,7 +71,7 @@ mod tests {
         let ctx = ctx_with_file_descriptors(vec![("desc_1".to_string(), different_signer_b64)]);
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
-        assert_reject_contains(&result, "does not match attachment descriptor signer");
+        assert_reject_contains(&result, "does not match file descriptor signer");
     }
 
     // ── CHK_FS_SLOT_CONFLICT: break ──

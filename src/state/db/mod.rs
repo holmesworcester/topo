@@ -8,6 +8,7 @@ pub mod queue;
 pub mod removal_watch;
 pub mod schema;
 pub mod store;
+pub mod sync_log;
 pub mod transport_creds;
 pub mod transport_trust;
 pub mod wanted;
@@ -70,6 +71,7 @@ pub fn ensure_infra_schema(conn: &Connection) -> SqliteResult<()> {
     egress_queue::ensure_schema(conn)?;
     health::ensure_schema(conn)?;
     intro::ensure_schema(conn)?;
+    sync_log::ensure_schema(conn)?;
     transport_trust::ensure_schema(conn)?;
     transport_creds::ensure_schema(conn)?;
     need_queue::ensure_schema(conn)?;

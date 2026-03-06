@@ -13,7 +13,7 @@ use serde::Serialize;
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
-use crate::event_modules::{message, peer_shared, reaction, user, workspace};
+use crate::event_modules::{file, message, peer_shared, reaction, user, workspace};
 use crate::node::NodeRuntimeNetInfo;
 use crate::rpc::protocol::*;
 use crate::service;
@@ -486,7 +486,7 @@ fn dispatch(
                             &peer_id,
                             client_op_id.as_deref(),
                             &data.event_id,
-                            "attachment",
+                            "file",
                         );
                         RpcResponse::success(data)
                     }
@@ -495,16 +495,34 @@ fn dispatch(
             }
             Err(e) => RpcResponse::error(e),
         },
+        RpcMethod::Files { limit } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => {
+                    match file::queries::list_files(&db, &recorded_by, limit) {
+                        Ok(data) => RpcResponse::success(data),
+                        Err(e) => RpcResponse::error(e.to_string()),
+                    }
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
         RpcMethod::SaveFile {
-            message,
+            target,
             output_path,
         } => match state.require_active_peer() {
-            Ok(peer_id) => {
-                match message::save_file_for_peer(db_path, &peer_id, &message, &output_path) {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => match file::queries::save_file_by_selector(
+                    &db,
+                    &recorded_by,
+                    &target,
+                    &output_path,
+                ) {
                     Ok(data) => RpcResponse::success(data),
                     Err(e) => RpcResponse::error(e.to_string()),
-                }
-            }
+                },
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
             Err(e) => RpcResponse::error(e),
         },
         RpcMethod::Generate { count } => match state.require_active_peer() {
@@ -726,7 +744,14 @@ fn dispatch(
         RpcMethod::Upnp => {
             let net_info = state.runtime_net.read().unwrap().clone();
             match net_info {
-                None => RpcResponse::error("daemon not ready — listen address not yet known"),
+                None => {
+                    let runtime_state = *state.runtime_state.read().unwrap();
+                    if runtime_state == RuntimeState::IdleNoTenants {
+                        RpcResponse::error("must join or create a workspace before running upnp")
+                    } else {
+                        RpcResponse::error("daemon not ready — listen address not yet known")
+                    }
+                }
                 Some(info) => {
                     let listen_addr: std::net::SocketAddr = match info.listen_addr.parse() {
                         Ok(a) => a,

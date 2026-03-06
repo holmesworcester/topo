@@ -35,10 +35,10 @@ impl Drop for DaemonGuard {
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, store::insert_recorded_event};
 use crate::event_modules::{
-    AdminEvent, DeviceInviteEvent, FileSliceEvent, InviteAcceptedEvent, KeySecretEvent,
-    KeySharedEvent, MessageAttachmentEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
-    PeerRemovedEvent, PeerSharedEvent, ReactionEvent, TenantEvent, UserEvent, UserInviteEvent,
-    UserRemovedEvent, WorkspaceEvent,
+    AdminEvent, DeviceInviteEvent, FileEvent, FileSliceEvent, InviteAcceptedEvent, KeySecretEvent,
+    KeySharedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent, PeerRemovedEvent,
+    PeerSharedEvent, ReactionEvent, TenantEvent, UserEvent, UserInviteEvent, UserRemovedEvent,
+    WorkspaceEvent,
 };
 use crate::peering::loops::{
     accept_loop, connect_loop, connect_loop_with_shared_ingest,
@@ -884,7 +884,7 @@ impl Peer {
         let file_bytes = total_slices * slice_size;
 
         // Message attachment descriptor
-        let att = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+        let att = ParsedEvent::File(FileEvent {
             created_at_ms: current_timestamp_ms(),
             message_id: msg_eid,
             file_id,
@@ -900,7 +900,7 @@ impl Peer {
             signature: [0u8; 64],
         });
         let att_eid = create_signed_event_staged(&db, &self.identity, &att, self.signing_key())
-            .expect("failed to create message_attachment");
+            .expect("failed to create file");
         project_one(&db, &self.identity, &att_eid).expect("failed to project attachment");
 
         // Batch-create file slices inside a transaction
@@ -1399,7 +1399,7 @@ const FINGERPRINT_TABLES: &[FingerprintTable] = &[
         order: "ORDER BY message_id",
     },
     FingerprintTable {
-        name: "message_attachments",
+        name: "files",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
     },
@@ -1633,7 +1633,7 @@ fn clear_projection_tables(db: &rusqlite::Connection, recorded_by: &str) {
     )
     .expect("failed to clear deleted_messages");
     db.execute(
-        "DELETE FROM message_attachments WHERE recorded_by = ?1",
+        "DELETE FROM files WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],
     )
     .ok();
@@ -3632,7 +3632,7 @@ mod fingerprint_tests {
             "reactions",
             "key_secrets",
             "deleted_messages",
-            "message_attachments",
+            "files",
             "file_slices",
             "workspaces",
             "invites_accepted",

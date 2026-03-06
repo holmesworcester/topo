@@ -9,9 +9,9 @@ pub mod wire;
 // Re-export stable public API so callers import from `event_modules::message`.
 pub use commands::{
     create, create_deletion, delete_message, delete_message_for_peer, generate_files_for_peer,
-    generate_for_peer, save_file_for_peer, send, send_file_for_peer, send_for_peer,
-    CreateMessageCmd, CreateMessageDeletionCmd, DeleteResponse, GenerateFilesResponse,
-    GenerateResponse, SaveFileResponse, SendFileResponse,
+    generate_for_peer, send, send_file_for_peer, send_for_peer, CreateMessageCmd,
+    CreateMessageDeletionCmd, DeleteResponse, GenerateFilesResponse, GenerateResponse,
+    SendFileResponse,
 };
 pub use projector::project_pure;
 pub use queries::{count, list, list_deleted_ids, list_rows, resolve, resolve_number, MessageRow};
@@ -51,7 +51,7 @@ pub struct ReactionSummary {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct AttachmentSummary {
+pub struct FileSummary {
     pub filename: String,
     pub mime_type: String,
     pub blob_bytes: i64,
@@ -68,7 +68,7 @@ pub struct MessageItem {
     pub content: String,
     pub created_at: i64,
     pub reactions: Vec<ReactionSummary>,
-    pub attachments: Vec<AttachmentSummary>,
+    pub files: Vec<FileSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_op_id: Option<String>,
 }

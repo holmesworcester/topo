@@ -27,7 +27,7 @@ use file_slice_offsets as off;
 
 /// Maximum ciphertext size per file slice: canonical fixed 256 KiB.
 /// Final plaintext chunks are zero-padded before encryption.
-/// Receiver uses blob_bytes from MessageAttachment for final truncation.
+/// Receiver uses blob_bytes from File for final truncation.
 pub const FILE_SLICE_MAX_BYTES: usize = FILE_SLICE_CIPHERTEXT_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]

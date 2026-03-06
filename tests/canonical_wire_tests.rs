@@ -1,15 +1,15 @@
 //! Golden-byte, negative parse, and idempotent encode/decode tests
 //! for all canonical event types with fixed wire layouts.
 
+use topo::event_modules::file::file_offsets;
 use topo::event_modules::layout::common::{
     encrypted_inner_wire_size, encrypted_wire_size, ENCRYPTED_HEADER_BYTES,
 };
 use topo::event_modules::message::layout::offsets as message_offsets;
-use topo::event_modules::message_attachment::attachment_offsets;
 use topo::event_modules::reaction::offsets as reaction_offsets;
 use topo::event_modules::{
-    self as events, BenchDepEvent, EncryptedEvent, EventError, FileSliceEvent,
-    MessageAttachmentEvent, MessageEvent, ParsedEvent, ReactionEvent,
+    self as events, BenchDepEvent, EncryptedEvent, EventError, FileEvent, FileSliceEvent,
+    MessageEvent, ParsedEvent, ReactionEvent,
 };
 
 // ─── Golden-byte tests ───
@@ -100,8 +100,8 @@ fn golden_bytes_encrypted() {
 }
 
 #[test]
-fn golden_bytes_message_attachment() {
-    let att = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+fn golden_bytes_file() {
+    let att = ParsedEvent::File(FileEvent {
         created_at_ms: 4000,
         message_id: [0x01; 32],
         file_id: [0x02; 32],
@@ -117,10 +117,7 @@ fn golden_bytes_message_attachment() {
         signature: [0x06; 64],
     });
     let blob = events::encode_event(&att).unwrap();
-    assert_eq!(
-        blob.len(),
-        events::message_attachment::MESSAGE_ATTACHMENT_WIRE_SIZE
-    );
+    assert_eq!(blob.len(), events::file::FILE_WIRE_SIZE);
     assert_eq!(blob[0], 24);
     // filename at offset 153
     assert_eq!(&blob[153..161], b"test.bin");
@@ -215,8 +212,8 @@ fn truncation_bench_dep() {
 }
 
 #[test]
-fn truncation_message_attachment() {
-    let att = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+fn truncation_file() {
+    let att = ParsedEvent::File(FileEvent {
         created_at_ms: 100,
         message_id: [0u8; 32],
         file_id: [0u8; 32],
@@ -277,7 +274,7 @@ fn nonzero_padding_reaction_emoji() {
 
 #[test]
 fn nonzero_padding_attachment_filename() {
-    let att = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+    let att = ParsedEvent::File(FileEvent {
         created_at_ms: 100,
         message_id: [0u8; 32],
         file_id: [0u8; 32],
@@ -293,7 +290,7 @@ fn nonzero_padding_attachment_filename() {
         signature: [0u8; 64],
     });
     let mut blob = events::encode_event(&att).unwrap();
-    let fn_start = attachment_offsets::FILENAME;
+    let fn_start = file_offsets::FILENAME;
     blob[fn_start + 2] = 0xFF;
     let err = events::parse_event(&blob).unwrap_err();
     assert!(matches!(err, EventError::TextSlot(_)));
@@ -301,7 +298,7 @@ fn nonzero_padding_attachment_filename() {
 
 #[test]
 fn nonzero_padding_attachment_mime() {
-    let att = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+    let att = ParsedEvent::File(FileEvent {
         created_at_ms: 100,
         message_id: [0u8; 32],
         file_id: [0u8; 32],
@@ -317,7 +314,7 @@ fn nonzero_padding_attachment_mime() {
         signature: [0u8; 64],
     });
     let mut blob = events::encode_event(&att).unwrap();
-    let mime_start = attachment_offsets::MIME_TYPE;
+    let mime_start = file_offsets::MIME_TYPE;
     blob[mime_start + 2] = 0xFF;
     let err = events::parse_event(&blob).unwrap_err();
     assert!(matches!(err, EventError::TextSlot(_)));
@@ -473,7 +470,7 @@ fn reaction_emoji_too_long() {
 
 #[test]
 fn attachment_filename_too_long() {
-    let att = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+    let att = ParsedEvent::File(FileEvent {
         created_at_ms: 100,
         message_id: [0u8; 32],
         file_id: [0u8; 32],
@@ -493,7 +490,7 @@ fn attachment_filename_too_long() {
 
 #[test]
 fn attachment_mime_too_long() {
-    let att = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+    let att = ParsedEvent::File(FileEvent {
         created_at_ms: 100,
         message_id: [0u8; 32],
         file_id: [0u8; 32],
@@ -591,8 +588,8 @@ fn idempotent_encrypted() {
 }
 
 #[test]
-fn idempotent_message_attachment() {
-    assert_idempotent(&ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+fn idempotent_file() {
+    assert_idempotent(&ParsedEvent::File(FileEvent {
         created_at_ms: 500,
         message_id: [15u8; 32],
         file_id: [16u8; 32],

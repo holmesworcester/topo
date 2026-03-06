@@ -13,8 +13,8 @@ use tempfile::NamedTempFile;
 use topo::crypto::{event_id_to_base64, hash_event, EventId};
 use topo::db::{open_connection, schema::create_tables};
 use topo::event_modules::{
-    self as events, file_slice::FILE_SLICE_CIPHERTEXT_BYTES, DeviceInviteEvent, FileSliceEvent,
-    InviteAcceptedEvent, KeySecretEvent, MessageAttachmentEvent, MessageEvent, ParsedEvent,
+    self as events, file_slice::FILE_SLICE_CIPHERTEXT_BYTES, DeviceInviteEvent, FileEvent,
+    FileSliceEvent, InviteAcceptedEvent, KeySecretEvent, MessageEvent, ParsedEvent,
     PeerSharedEvent, TenantEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
 };
 use topo::projection::apply::project_one;
@@ -212,8 +212,8 @@ fn run_file_throughput(file_size_bytes: usize) {
     let total_slices = (file_size_bytes + slice_size - 1) / slice_size;
     let file_id = [0xF0; 32];
 
-    // Create and project signed message_attachment descriptor first (required for file_slice auth)
-    let att = ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+    // Create and project signed file descriptor first (required for file_slice auth)
+    let att = ParsedEvent::File(FileEvent {
         created_at_ms: now_ms(),
         message_id: msg_eid,
         file_id,
@@ -288,7 +288,7 @@ fn run_file_throughput(file_size_bytes: usize) {
     let att_b64 = event_id_to_base64(&att_eid);
     let att_count: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM message_attachments WHERE recorded_by = ?1 AND event_id = ?2",
+            "SELECT COUNT(*) FROM files WHERE recorded_by = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, &att_b64],
             |row| row.get(0),
         )

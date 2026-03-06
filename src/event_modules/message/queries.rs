@@ -1,5 +1,5 @@
 use crate::crypto::{self, b64_to_hex, event_id_from_base64, EventId};
-use crate::event_modules::{message_attachment, reaction};
+use crate::event_modules::{file, reaction};
 use rusqlite::Connection;
 
 pub struct MessageRow {
@@ -120,10 +120,10 @@ pub fn list(
                 })
                 .collect();
 
-        let attachments: Vec<super::AttachmentSummary> =
-            message_attachment::queries::list_for_message(db, recorded_by, &row.message_id_b64)?
+        let files: Vec<super::FileSummary> =
+            file::queries::list_for_message(db, recorded_by, &row.message_id_b64)?
                 .into_iter()
-                .map(|a| super::AttachmentSummary {
+                .map(|a| super::FileSummary {
                     filename: a.filename,
                     mime_type: a.mime_type,
                     blob_bytes: a.blob_bytes,
@@ -142,7 +142,7 @@ pub fn list(
             content: row.content,
             created_at: row.created_at,
             reactions,
-            attachments,
+            files,
             client_op_id,
         });
     }

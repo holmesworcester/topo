@@ -3,7 +3,6 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::EventId;
 use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
-use crate::projection::create::create_event_synchronous;
 use crate::projection::create::create_signed_event_synchronous;
 use crate::service::open_db_for_peer;
 use ed25519_dalek::SigningKey;
@@ -14,7 +13,7 @@ use super::super::message_deletion::MessageDeletionEvent;
 use super::super::peer_shared;
 use super::super::workspace;
 use super::super::ParsedEvent;
-use super::super::{FileSliceEvent, KeySecretEvent, MessageAttachmentEvent};
+use super::super::{FileEvent, FileSliceEvent};
 use super::wire::MessageEvent;
 
 fn current_timestamp_ms() -> u64 {
@@ -143,130 +142,6 @@ pub fn delete_message(
 }
 
 // ---------------------------------------------------------------------------
-// save-file: reassemble received file slices to disk
-// ---------------------------------------------------------------------------
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct SaveFileResponse {
-    pub filename: String,
-    pub file_size: u64,
-    pub output_path: String,
-}
-
-/// Save a received file attachment to disk.
-///
-/// Looks up the message's first attachment, reads all file_slice event blobs
-/// from the events table, extracts the ciphertext from each slice's wire format,
-/// concatenates in slice_number order, truncates to blob_bytes, and writes to
-/// the output path.
-pub fn save_file_for_peer(
-    db_path: &str,
-    peer_id: &str,
-    message_selector: &str,
-    output_path: &str,
-) -> Result<SaveFileResponse, Box<dyn std::error::Error + Send + Sync>> {
-    let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
-
-    // Resolve message selector (number or hex)
-    let message_eid = super::resolve(&db, &recorded_by, message_selector)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-    let message_id_b64 = crate::crypto::event_id_to_base64(&message_eid);
-
-    // Find the first attachment for this message
-    let (file_id_b64, blob_bytes, total_slices, filename): (String, i64, i64, String) = db
-        .query_row(
-            "SELECT file_id, blob_bytes, total_slices, filename
-             FROM message_attachments
-             WHERE recorded_by = ?1 AND message_id = ?2
-             ORDER BY created_at ASC, event_id ASC
-             LIMIT 1",
-            rusqlite::params![&recorded_by, &message_id_b64],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            match e {
-                rusqlite::Error::QueryReturnedNoRows => {
-                    "no attachment found for this message".into()
-                }
-                other => other.to_string().into(),
-            }
-        })?;
-
-    // Check all slices are received
-    let slices_received: i64 = db
-        .query_row(
-            "SELECT COUNT(*) FROM file_slices
-             WHERE recorded_by = ?1 AND file_id = ?2",
-            rusqlite::params![&recorded_by, &file_id_b64],
-            |row| row.get(0),
-        )
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
-
-    if slices_received < total_slices {
-        return Err(format!(
-            "file incomplete: {}/{} slices received",
-            slices_received, total_slices
-        )
-        .into());
-    }
-
-    // Read all slice event blobs in order
-    let mut stmt = db.prepare(
-        "SELECT e.blob FROM file_slices fs
-         JOIN events e ON e.event_id = fs.event_id
-         WHERE fs.recorded_by = ?1 AND fs.file_id = ?2
-         ORDER BY fs.slice_number ASC",
-    )?;
-    let blobs: Vec<Vec<u8>> = stmt
-        .query_map(rusqlite::params![&recorded_by, &file_id_b64], |row| {
-            row.get::<_, Vec<u8>>(0)
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    if blobs.len() != total_slices as usize {
-        return Err(format!(
-            "slice count mismatch: expected {}, got {}",
-            total_slices,
-            blobs.len()
-        )
-        .into());
-    }
-
-    // Extract ciphertext from each blob's wire format and concatenate
-    let ciphertext_offset = 45; // file_slice_offsets::CIPHERTEXT
-    let ciphertext_len = FILE_SLICE_CIPHERTEXT_BYTES;
-    let mut assembled = Vec::with_capacity(blob_bytes as usize);
-    for blob in &blobs {
-        if blob.len() < ciphertext_offset + ciphertext_len {
-            return Err("file_slice blob too short".into());
-        }
-        assembled.extend_from_slice(&blob[ciphertext_offset..ciphertext_offset + ciphertext_len]);
-    }
-
-    // Truncate to actual file size
-    assembled.truncate(blob_bytes as usize);
-
-    // Determine output path: if it's a directory, append the original filename
-    let out = Path::new(output_path);
-    let final_path = if out.is_dir() {
-        out.join(&filename)
-    } else {
-        out.to_path_buf()
-    };
-
-    std::fs::write(&final_path, &assembled)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("failed to write {}: {}", final_path.display(), e).into()
-        })?;
-
-    Ok(SaveFileResponse {
-        filename,
-        file_size: blob_bytes as u64,
-        output_path: final_path.to_string_lossy().to_string(),
-    })
-}
-
-// ---------------------------------------------------------------------------
 // Peer-level command wrappers (moved from service.rs)
 // ---------------------------------------------------------------------------
 
@@ -388,7 +263,7 @@ pub fn generate_for_peer(
 /// Each generated file creates:
 /// - 1 parent `message`
 /// - 1 `key_secret`
-/// - 1 `message_attachment`
+/// - 1 `file`
 /// - `slices_per_file` `file_slice` events
 pub fn generate_files_for_peer(
     db_path: &str,
@@ -428,17 +303,10 @@ pub fn generate_files_for_peer(
             format!("create parent message error: {}", e).into()
         })?;
 
-        let key_event_id = create_event_synchronous(
-            &db,
-            &recorded_by,
-            &ParsedEvent::KeySecret(KeySecretEvent {
-                created_at_ms: current_timestamp_ms(),
-                key_bytes: rand::random::<[u8; 32]>(),
-            }),
-        )
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("create key_secret error: {}", e).into()
-        })?;
+        let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(&db, &recorded_by)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("resolve content key error: {}", e).into()
+            })?;
 
         let file_id = rand::random::<[u8; 32]>();
         let blob_bytes = (slices_per_file as u64)
@@ -450,7 +318,7 @@ pub fn generate_files_for_peer(
         create_signed_event_synchronous(
             &db,
             &recorded_by,
-            &ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+            &ParsedEvent::File(FileEvent {
                 created_at_ms: current_timestamp_ms(),
                 message_id: message_event_id,
                 file_id,
@@ -468,7 +336,7 @@ pub fn generate_files_for_peer(
             &signing_key,
         )
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("create message_attachment error: {}", e).into()
+            format!("create file error: {}", e).into()
         })?;
 
         for slice_number in 0..slices_per_file {
@@ -502,7 +370,7 @@ pub fn generate_files_for_peer(
 }
 
 // ---------------------------------------------------------------------------
-// send-file: message + attachment from a real file on disk
+// send-file: message + file from a real file on disk
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -538,7 +406,7 @@ fn mime_from_extension(ext: &str) -> &'static str {
     }
 }
 
-/// Send a message with a file attachment as a specific peer.
+/// Send a message with a file as a specific peer.
 pub fn send_file_for_peer(
     db_path: &str,
     peer_id: &str,
@@ -580,11 +448,7 @@ pub fn send_file_for_peer(
         },
     )?;
 
-    // Reuse the workspace content key so it is available to peers via
-    // key_shared wrapping (created during invite flow).  Creating a fresh
-    // random key_secret would be LOCAL-only and never sync.
-    let key_event_id =
-        workspace::identity_ops::ensure_content_key_for_peer(&db, &recorded_by)?;
+    let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(&db, &recorded_by)?;
 
     let file_id = rand::random::<[u8; 32]>();
     let num_slices = if file_size == 0 {
@@ -596,7 +460,7 @@ pub fn send_file_for_peer(
     create_signed_event_synchronous(
         &db,
         &recorded_by,
-        &ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+        &ParsedEvent::File(FileEvent {
             created_at_ms: current_timestamp_ms(),
             message_id: message_event_id,
             file_id,

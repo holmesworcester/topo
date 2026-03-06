@@ -313,8 +313,8 @@ fn test_cli_file_upload_sync_and_save() {
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stdout.contains("testfile.txt"),
-        "save-file output should show filename, got: {}",
+        stdout.contains("saved") && stdout.contains("bytes"),
+        "save-file output should confirm bytes written, got: {}",
         stdout
     );
 
@@ -324,47 +324,6 @@ fn test_cli_file_upload_sync_and_save() {
         saved_content, test_content,
         "saved file content should match original"
     );
-}
-
-/// Save-file to a directory appends the original filename.
-#[test]
-fn test_cli_save_file_to_directory() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("savedir.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    let test_file = tmpdir.path().join("photo.png");
-    std::fs::write(&test_file, b"\x89PNG\r\n\x1a\n fake png data").unwrap();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-
-    send_file(&db, "my photo", test_file.to_str().unwrap());
-
-    // Save to a directory (should append original filename)
-    let save_dir = tmpdir.path().join("downloads");
-    std::fs::create_dir_all(&save_dir).unwrap();
-    let out = save_file(&db, "1", save_dir.to_str().unwrap());
-    assert!(
-        out.status.success(),
-        "save-file to dir failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let expected_path = save_dir.join("photo.png");
-    assert!(
-        expected_path.exists(),
-        "saved file should exist at {}",
-        expected_path.display()
-    );
-    let saved = std::fs::read(&expected_path).unwrap();
-    let original = std::fs::read(&test_file).unwrap();
-    assert_eq!(saved, original, "saved file should match original");
 }
 
 /// Daemon start on an empty DB should keep control plane up in IdleNoTenants state.
@@ -860,6 +819,123 @@ fn test_cli_send_file_and_messages_display() {
         "local attachment should show checkmark (complete), got:\n{}",
         raw
     );
+}
+
+#[test]
+fn test_cli_files_and_save_file_roundtrip_after_sync() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir
+        .path()
+        .join("alice_files.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let bob_db = tmpdir
+        .path()
+        .join("bob_files.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let timeout_ms = 30000;
+
+    let source_path = tmpdir.path().join("payload.bin");
+    let mut expected = vec![0u8; 300_123];
+    for (i, b) in expected.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    std::fs::write(&source_path, &expected).unwrap();
+
+    create_workspace(&alice_db);
+    let _alice = start_daemon(&alice_db);
+
+    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
+    accept_invite(&bob_db, &invite_link);
+    let _bob = start_daemon(&bob_db);
+
+    let send_out = Command::new(bin())
+        .args([
+            "--db",
+            &alice_db,
+            "send-file",
+            "binary payload",
+            "--file",
+            source_path.to_str().unwrap(),
+        ])
+        .output()
+        .expect("send-file");
+    assert!(
+        send_out.status.success(),
+        "send-file failed: {}",
+        String::from_utf8_lossy(&send_out.stderr)
+    );
+    let send_stdout = String::from_utf8_lossy(&send_out.stdout);
+    let msg_eid = send_stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("event_id:").map(|s| s.trim().to_string()))
+        .expect("send-file output missing event_id");
+
+    assert_eventually(&bob_db, &format!("has_event:{} >= 1", msg_eid), timeout_ms);
+
+    let files_deadline = Instant::now() + Duration::from_secs(20);
+    let _files_stdout = loop {
+        let files_out = Command::new(bin())
+            .args(["--db", &bob_db, "files"])
+            .output()
+            .expect("files command");
+        assert!(
+            files_out.status.success(),
+            "files command failed: {}",
+            String::from_utf8_lossy(&files_out.stderr)
+        );
+        let files_stdout = String::from_utf8_lossy(&files_out.stdout).to_string();
+        if files_stdout.contains("payload.bin") && files_stdout.contains("1.") {
+            break files_stdout;
+        }
+        if Instant::now() >= files_deadline {
+            panic!(
+                "timed out waiting for bob files list to include payload.bin:\n{}",
+                files_stdout
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    };
+
+    let restored_path = tmpdir.path().join("restored.bin");
+    let save_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let save_out = Command::new(bin())
+            .args([
+                "--db",
+                &bob_db,
+                "save-file",
+                "--target",
+                "1",
+                "--out",
+                restored_path.to_str().unwrap(),
+            ])
+            .output()
+            .expect("save-file command");
+        if save_out.status.success() {
+            break;
+        }
+        let last_stderr = String::from_utf8_lossy(&save_out.stderr).to_string();
+        let retryable =
+            last_stderr.contains("file incomplete") || last_stderr.contains("invalid file number");
+        if !retryable {
+            panic!("save-file failed unexpectedly: {}", last_stderr);
+        }
+        if Instant::now() >= save_deadline {
+            panic!(
+                "timed out waiting for save-file success; last err={}",
+                last_stderr
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    let restored = std::fs::read(&restored_path).unwrap();
+    assert_eq!(restored, expected, "saved file bytes should match source");
 }
 
 #[test]

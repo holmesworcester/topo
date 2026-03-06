@@ -5,7 +5,7 @@ use rusqlite::Connection;
 
 /// After projecting an event, cascade-unblock dependents using Kahn's algorithm.
 ///
-/// Guard retries (InviteAccepted → workspace retries, MessageAttachment →
+/// Guard retries (InviteAccepted → workspace retries, File →
 /// file_slice retries) are now handled by EmitCommand execution in the pure
 /// projector apply engine, so this cascade only handles dependency unblocking.
 pub(crate) fn cascade_unblocked(

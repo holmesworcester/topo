@@ -33,10 +33,12 @@ pub enum RpcMethod {
         #[serde(default)]
         client_op_id: Option<String>,
     },
+    Files {
+        #[serde(default = "default_view_limit")]
+        limit: usize,
+    },
     SaveFile {
-        /// Message selector: number (e.g. "1", "#2") or hex event ID.
-        message: String,
-        /// Output path: file path or directory (appends original filename).
+        target: String,
         output_path: String,
     },
     Generate {

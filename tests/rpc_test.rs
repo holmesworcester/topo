@@ -106,6 +106,11 @@ fn rpc_all_methods_serialize() {
             content: "msg".into(),
             client_op_id: None,
         },
+        RpcMethod::Files { limit: 50 },
+        RpcMethod::SaveFile {
+            target: "1".into(),
+            output_path: "/tmp/out.bin".into(),
+        },
         RpcMethod::Generate { count: 10 },
         RpcMethod::AssertNow {
             predicate: "message_count == 0".into(),
@@ -578,6 +583,35 @@ fn daemon_start_on_empty_db_reports_idle_runtime_state() {
         stdout.contains("Runtime:   IdleNoTenants"),
         "expected idle runtime state, got: {}",
         stdout
+    );
+
+    stop_daemon(&db, &mut daemon);
+}
+
+#[test]
+fn upnp_on_empty_daemon_requires_workspace() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket);
+    let _ = wait_for_runtime_state(&socket, "IdleNoTenants", Duration::from_secs(10));
+
+    let out = Command::new(bin())
+        .args(["--db", &db, "upnp"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success(), "upnp should fail on empty daemon");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("join or create a workspace before running upnp"),
+        "expected workspace guidance in stderr, got: {}",
+        stderr
     );
 
     stop_daemon(&db, &mut daemon);
@@ -1348,6 +1382,8 @@ fn catalog_drift_test_method_count_matches_protocol() {
         "Messages",
         "Send",
         "SendFile",
+        "Files",
+        "SaveFile",
         "Generate",
         "GenerateFiles",
         "AssertNow",

@@ -130,7 +130,7 @@ fn parsed_event_type_name(parsed: &ParsedEvent) -> &'static str {
         ParsedEvent::Message(_) => "message",
         ParsedEvent::Reaction(_) => "reaction",
         ParsedEvent::MessageDeletion(_) => "message_deletion",
-        ParsedEvent::MessageAttachment(_) => "message_attachment",
+        ParsedEvent::File(_) => "file",
         ParsedEvent::Workspace(_) => "workspace",
         ParsedEvent::InviteAccepted(_) => "invite_accepted",
         ParsedEvent::User(_) => "user",

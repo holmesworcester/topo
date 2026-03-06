@@ -50,7 +50,7 @@ static CATALOG: &[MethodInfo] = &[
     },
     MethodInfo {
         name: "SendFile",
-        purpose: "Send a message with a file attachment",
+        purpose: "Send a message with a file",
         params: params![
             "content", "string", true, None;
             "file_path", "string", true, None;
@@ -59,13 +59,19 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"SendFile","content":"see attached","file_path":"/tmp/notes.txt","client_op_id":"op-456"}"#,
     },
     MethodInfo {
+        name: "Files",
+        purpose: "List files available to save",
+        params: params!["limit", "usize", false, Some("50")],
+        example_json: r#"{"type":"Files","limit":50}"#,
+    },
+    MethodInfo {
         name: "SaveFile",
-        purpose: "Save a received file attachment to disk",
+        purpose: "Save a file to disk",
         params: params![
-            "message", "string", true, None;
+            "target", "string", true, None;
             "output_path", "string", true, None
         ],
-        example_json: r#"{"type":"SaveFile","message":"1","output_path":"/tmp/saved.bin"}"#,
+        example_json: r#"{"type":"SaveFile","target":"1","output_path":"/tmp/output.bin"}"#,
     },
     MethodInfo {
         name: "Generate",

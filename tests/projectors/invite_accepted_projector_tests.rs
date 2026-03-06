@@ -7,6 +7,7 @@
 #[cfg(test)]
 mod tests {
     use crate::harness::fixtures::*;
+    use topo::contracts::transport_identity_contract::TransportIdentityIntent;
     use topo::event_modules::invite_accepted::{project_pure, InviteAcceptedEvent};
     use topo::event_modules::ParsedEvent;
     use topo::projection::contract::EmitCommand;
@@ -41,13 +42,22 @@ mod tests {
     fn test_invite_accepted_writes_bootstrap_trust() {
         let ws_id = [10u8; 32];
         let parsed = make_invite_accepted([5u8; 32], ws_id);
-        let ctx = ctx_with_bootstrap(&b64(&ws_id), false); // bootstrap_context present
+        let mut ctx = ctx_with_bootstrap(&b64(&ws_id), false); // bootstrap_context present
+        ctx.has_local_invite_secret = true;
 
         let result = project_pure(PEER, "event_ia_2", &parsed, &ctx);
         assert_valid(&result);
         assert_writes_to_table(&result, "invite_bootstrap_trust");
         assert_emits_command(&result, "RetryWorkspaceEvent", |c| {
             matches!(c, EmitCommand::RetryWorkspaceEvent { .. })
+        });
+        assert_emits_command(&result, "InstallBootstrapIdentityFromInviteSecret", |c| {
+            matches!(
+                c,
+                EmitCommand::ApplyTransportIdentityIntent {
+                    intent: TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret { .. }
+                }
+            )
         });
     }
 
@@ -66,5 +76,33 @@ mod tests {
             matches!(c, EmitCommand::RetryWorkspaceEvent { .. })
         });
         assert_no_write_to_table(&result, "invite_bootstrap_trust");
+        assert_no_command(&result, |c| {
+            matches!(
+                c,
+                EmitCommand::ApplyTransportIdentityIntent {
+                    intent: TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret { .. }
+                }
+            )
+        });
+    }
+
+    #[test]
+    fn test_invite_accepted_no_bootstrap_install_when_peer_shared_active() {
+        let ws_id = [10u8; 32];
+        let parsed = make_invite_accepted([5u8; 32], ws_id);
+        let mut ctx = ctx_with_bootstrap(&b64(&ws_id), false);
+        ctx.has_local_invite_secret = true;
+        ctx.peer_shared_transport_identity_active = true;
+
+        let result = project_pure(PEER, "event_ia_4", &parsed, &ctx);
+        assert_valid(&result);
+        assert_no_command(&result, |c| {
+            matches!(
+                c,
+                EmitCommand::ApplyTransportIdentityIntent {
+                    intent: TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret { .. }
+                }
+            )
+        });
     }
 }

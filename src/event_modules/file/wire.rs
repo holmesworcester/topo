@@ -2,20 +2,20 @@ use super::super::layout::common::{
     read_text_slot, write_text_slot, COMMON_HEADER_BYTES, SIGNATURE_TRAILER_BYTES,
 };
 use super::super::registry::{EventTypeMeta, ShareScope};
-use super::super::{EventError, ParsedEvent, EVENT_TYPE_MESSAGE_ATTACHMENT};
+use super::super::{EventError, ParsedEvent, EVENT_TYPE_FILE};
 
 // ─── Layout (owned by this module) ───
 
-/// MessageAttachment filename: fixed UTF-8 slot (255 bytes, zero-padded)
-pub const ATTACHMENT_FILENAME_BYTES: usize = 255;
+/// File filename: fixed UTF-8 slot (255 bytes, zero-padded)
+pub const FILE_FILENAME_BYTES: usize = 255;
 
-/// MessageAttachment MIME type: fixed UTF-8 slot (128 bytes, zero-padded)
-pub const ATTACHMENT_MIME_BYTES: usize = 128;
+/// File MIME type: fixed UTF-8 slot (128 bytes, zero-padded)
+pub const FILE_MIME_BYTES: usize = 128;
 
-/// MessageAttachment (type 24): type(1) + created_at(8) + message_id(32) + file_id(32)
+/// File (type 24): type(1) + created_at(8) + message_id(32) + file_id(32)
 ///   + blob_bytes(8) + total_slices(4) + slice_bytes(4) + root_hash(32) + key_event_id(32)
 ///   + filename(255) + mime_type(128) + signed_by(32) + signer_type(1) + signature(64) = 633
-pub const MESSAGE_ATTACHMENT_WIRE_SIZE: usize = COMMON_HEADER_BYTES
+pub const FILE_WIRE_SIZE: usize = COMMON_HEADER_BYTES
     + 32
     + 32
     + 8
@@ -23,11 +23,11 @@ pub const MESSAGE_ATTACHMENT_WIRE_SIZE: usize = COMMON_HEADER_BYTES
     + 4
     + 32
     + 32
-    + ATTACHMENT_FILENAME_BYTES
-    + ATTACHMENT_MIME_BYTES
+    + FILE_FILENAME_BYTES
+    + FILE_MIME_BYTES
     + SIGNATURE_TRAILER_BYTES;
 
-pub mod attachment_offsets {
+pub mod file_offsets {
     pub const TYPE_CODE: usize = 0;
     pub const CREATED_AT: usize = 1;
     pub const MESSAGE_ID: usize = 9;
@@ -38,16 +38,16 @@ pub mod attachment_offsets {
     pub const ROOT_HASH: usize = 89;
     pub const KEY_EVENT_ID: usize = 121;
     pub const FILENAME: usize = 153;
-    pub const MIME_TYPE: usize = 153 + super::ATTACHMENT_FILENAME_BYTES; // 408
-    pub const SIGNED_BY: usize = MIME_TYPE + super::ATTACHMENT_MIME_BYTES; // 536
+    pub const MIME_TYPE: usize = 153 + super::FILE_FILENAME_BYTES; // 408
+    pub const SIGNED_BY: usize = MIME_TYPE + super::FILE_MIME_BYTES; // 536
     pub const SIGNER_TYPE: usize = SIGNED_BY + 32; // 568
     pub const SIGNATURE: usize = SIGNER_TYPE + 1; // 569
 }
 
-use attachment_offsets as off;
+use file_offsets as off;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct MessageAttachmentEvent {
+pub struct FileEvent {
     pub created_at_ms: u64,
     pub message_id: [u8; 32],
     pub file_id: [u8; 32],
@@ -63,7 +63,7 @@ pub struct MessageAttachmentEvent {
     pub signature: [u8; 64],
 }
 
-impl super::super::Describe for MessageAttachmentEvent {
+impl super::super::Describe for FileEvent {
     fn human_fields(&self) -> Vec<(&'static str, String)> {
         vec![
             ("filename", self.filename.clone()),
@@ -92,22 +92,22 @@ impl super::super::Describe for MessageAttachmentEvent {
 /// [536..568]     signed_by (32 bytes)
 /// [568]          signer_type (1 byte)
 /// [569..633]     signature (64 bytes)
-pub fn parse_message_attachment(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < MESSAGE_ATTACHMENT_WIRE_SIZE {
+pub fn parse_file(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    if blob.len() < FILE_WIRE_SIZE {
         return Err(EventError::TooShort {
-            expected: MESSAGE_ATTACHMENT_WIRE_SIZE,
+            expected: FILE_WIRE_SIZE,
             actual: blob.len(),
         });
     }
-    if blob.len() > MESSAGE_ATTACHMENT_WIRE_SIZE {
+    if blob.len() > FILE_WIRE_SIZE {
         return Err(EventError::TrailingData {
-            expected: MESSAGE_ATTACHMENT_WIRE_SIZE,
+            expected: FILE_WIRE_SIZE,
             actual: blob.len(),
         });
     }
-    if blob[0] != EVENT_TYPE_MESSAGE_ATTACHMENT {
+    if blob[0] != EVENT_TYPE_FILE {
         return Err(EventError::WrongType {
-            expected: EVENT_TYPE_MESSAGE_ATTACHMENT,
+            expected: EVENT_TYPE_FILE,
             actual: blob[0],
         });
     }
@@ -137,10 +137,10 @@ pub fn parse_message_attachment(blob: &[u8]) -> Result<ParsedEvent, EventError> 
     let mut key_event_id = [0u8; 32];
     key_event_id.copy_from_slice(&blob[off::KEY_EVENT_ID..off::FILENAME]);
 
-    let filename = read_text_slot(&blob[off::FILENAME..off::FILENAME + ATTACHMENT_FILENAME_BYTES])
+    let filename = read_text_slot(&blob[off::FILENAME..off::FILENAME + FILE_FILENAME_BYTES])
         .map_err(EventError::TextSlot)?;
 
-    let mime_type = read_text_slot(&blob[off::MIME_TYPE..off::MIME_TYPE + ATTACHMENT_MIME_BYTES])
+    let mime_type = read_text_slot(&blob[off::MIME_TYPE..off::MIME_TYPE + FILE_MIME_BYTES])
         .map_err(EventError::TextSlot)?;
 
     let mut signed_by = [0u8; 32];
@@ -151,9 +151,9 @@ pub fn parse_message_attachment(blob: &[u8]) -> Result<ParsedEvent, EventError> 
     let mut signature = [0u8; 64];
     signature.copy_from_slice(&blob[off::SIGNATURE..off::SIGNATURE + 64]);
 
-    validate_attachment_metadata(blob_bytes, total_slices, slice_bytes)?;
+    validate_file_metadata(blob_bytes, total_slices, slice_bytes)?;
 
-    Ok(ParsedEvent::MessageAttachment(MessageAttachmentEvent {
+    Ok(ParsedEvent::File(FileEvent {
         created_at_ms,
         message_id,
         file_id,
@@ -170,7 +170,7 @@ pub fn parse_message_attachment(blob: &[u8]) -> Result<ParsedEvent, EventError> 
     }))
 }
 
-fn validate_attachment_metadata(
+fn validate_file_metadata(
     blob_bytes: u64,
     total_slices: u32,
     slice_bytes: u32,
@@ -196,24 +196,24 @@ fn validate_attachment_metadata(
     Ok(())
 }
 
-pub fn encode_message_attachment(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
+pub fn encode_file(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let att = match event {
-        ParsedEvent::MessageAttachment(a) => a,
+        ParsedEvent::File(a) => a,
         _ => return Err(EventError::WrongVariant),
     };
 
-    validate_attachment_metadata(att.blob_bytes, att.total_slices, att.slice_bytes)?;
+    validate_file_metadata(att.blob_bytes, att.total_slices, att.slice_bytes)?;
 
-    if att.filename.as_bytes().len() > ATTACHMENT_FILENAME_BYTES {
+    if att.filename.as_bytes().len() > FILE_FILENAME_BYTES {
         return Err(EventError::ContentTooLong(att.filename.as_bytes().len()));
     }
-    if att.mime_type.as_bytes().len() > ATTACHMENT_MIME_BYTES {
+    if att.mime_type.as_bytes().len() > FILE_MIME_BYTES {
         return Err(EventError::ContentTooLong(att.mime_type.as_bytes().len()));
     }
 
-    let mut buf = vec![0u8; MESSAGE_ATTACHMENT_WIRE_SIZE];
+    let mut buf = vec![0u8; FILE_WIRE_SIZE];
 
-    buf[off::TYPE_CODE] = EVENT_TYPE_MESSAGE_ATTACHMENT;
+    buf[off::TYPE_CODE] = EVENT_TYPE_FILE;
     buf[off::CREATED_AT..off::MESSAGE_ID].copy_from_slice(&att.created_at_ms.to_le_bytes());
     buf[off::MESSAGE_ID..off::FILE_ID].copy_from_slice(&att.message_id);
     buf[off::FILE_ID..off::BLOB_BYTES].copy_from_slice(&att.file_id);
@@ -224,12 +224,12 @@ pub fn encode_message_attachment(event: &ParsedEvent) -> Result<Vec<u8>, EventEr
     buf[off::KEY_EVENT_ID..off::FILENAME].copy_from_slice(&att.key_event_id);
     write_text_slot(
         &att.filename,
-        &mut buf[off::FILENAME..off::FILENAME + ATTACHMENT_FILENAME_BYTES],
+        &mut buf[off::FILENAME..off::FILENAME + FILE_FILENAME_BYTES],
     )
     .map_err(EventError::TextSlot)?;
     write_text_slot(
         &att.mime_type,
-        &mut buf[off::MIME_TYPE..off::MIME_TYPE + ATTACHMENT_MIME_BYTES],
+        &mut buf[off::MIME_TYPE..off::MIME_TYPE + FILE_MIME_BYTES],
     )
     .map_err(EventError::TextSlot)?;
     buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&att.signed_by);
@@ -239,18 +239,18 @@ pub fn encode_message_attachment(event: &ParsedEvent) -> Result<Vec<u8>, EventEr
     Ok(buf)
 }
 
-pub static MESSAGE_ATTACHMENT_META: EventTypeMeta = EventTypeMeta {
-    type_code: EVENT_TYPE_MESSAGE_ATTACHMENT,
-    type_name: "message_attachment",
-    projection_table: "message_attachments",
+pub static FILE_META: EventTypeMeta = EventTypeMeta {
+    type_code: EVENT_TYPE_FILE,
+    type_name: "file",
+    projection_table: "files",
     share_scope: ShareScope::Shared,
     dep_fields: &["message_id", "key_event_id", "signed_by"],
     dep_field_type_codes: &[&[1], &[6], &[]],
     signer_required: true,
     signature_byte_len: 64,
     encryptable: true,
-    parse: parse_message_attachment,
-    encode: encode_message_attachment,
+    parse: parse_file,
+    encode: encode_file,
     projector: super::projector::project_pure,
     context_loader: crate::event_modules::registry::load_empty_context,
 };
@@ -260,9 +260,6 @@ mod layout_tests {
     use super::*;
     #[test]
     fn offsets_consistent() {
-        assert_eq!(
-            attachment_offsets::SIGNATURE + 64,
-            MESSAGE_ATTACHMENT_WIRE_SIZE
-        );
+        assert_eq!(file_offsets::SIGNATURE + 64, FILE_WIRE_SIZE);
     }
 }

@@ -78,6 +78,61 @@ fn concrete_adapter_install_peer_shared_from_signer() {
 }
 
 #[test]
+fn concrete_adapter_install_bootstrap_from_invite_secret() {
+    let conn = setup_db();
+    let adapter = ConcreteTransportIdentityAdapter;
+    let recorded_by = "test-peer";
+    let invite_event_id = [6u8; 32];
+    let invite_eid_b64 = topo::crypto::event_id_to_base64(&invite_event_id);
+    let secret_event_id = topo::crypto::event_id_to_base64(&[9u8; 32]);
+    let private_key = [17u8; 32];
+    conn.execute(
+        "INSERT INTO invite_secrets (recorded_by, event_id, invite_event_id, private_key, created_at)
+         VALUES (?1, ?2, ?3, ?4, 0)",
+        rusqlite::params![
+            recorded_by,
+            secret_event_id,
+            invite_eid_b64,
+            private_key.to_vec()
+        ],
+    )
+    .unwrap();
+
+    let peer_id = adapter
+        .apply_intent(
+            &conn,
+            TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+                recorded_by: recorded_by.to_string(),
+                invite_event_id,
+            },
+        )
+        .unwrap();
+    assert_eq!(peer_id.len(), 64, "peer_id should be 32-byte hex");
+}
+
+#[test]
+fn concrete_adapter_invite_secret_not_found_error() {
+    let conn = setup_db();
+    let adapter = ConcreteTransportIdentityAdapter;
+
+    let result = adapter.apply_intent(
+        &conn,
+        TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+            recorded_by: "nonexistent".to_string(),
+            invite_event_id: [4u8; 32],
+        },
+    );
+
+    assert!(result.is_err());
+    match result.unwrap_err() {
+        TransportIdentityError::InviteSecretNotFound { recorded_by, .. } => {
+            assert_eq!(recorded_by, "nonexistent");
+        }
+        other => panic!("expected InviteSecretNotFound, got {:?}", other),
+    }
+}
+
+#[test]
 fn concrete_adapter_signer_not_found_error() {
     let conn = setup_db();
     let adapter = ConcreteTransportIdentityAdapter;
@@ -169,8 +224,17 @@ fn fake_adapter_records_intents() {
     )
     .unwrap();
 
+    fake.apply_intent(
+        &conn,
+        TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+            recorded_by: "rb4".to_string(),
+            invite_event_id: [4u8; 32],
+        },
+    )
+    .unwrap();
+
     let intents = fake.applied_intents();
-    assert_eq!(intents.len(), 3);
+    assert_eq!(intents.len(), 4);
     assert_eq!(
         intents[0],
         TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
@@ -189,6 +253,13 @@ fn fake_adapter_records_intents() {
         TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
             recorded_by: "rb3".to_string(),
             signer_event_id: [3u8; 32],
+        }
+    );
+    assert_eq!(
+        intents[3],
+        TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+            recorded_by: "rb4".to_string(),
+            invite_event_id: [4u8; 32],
         }
     );
 }
