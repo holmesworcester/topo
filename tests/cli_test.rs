@@ -643,7 +643,7 @@ fn test_cli_react_by_message_number() {
 
     // React to message #1 by number.
     let out = Command::new(bin())
-        .args(["--db", &db, "react", "--target", "1", "thumbsup"])
+        .args(["--db", &db, "react", "thumbsup", "1"])
         .output()
         .expect("react by number");
     assert!(
@@ -660,7 +660,7 @@ fn test_cli_react_by_message_number() {
 
     // React to message #2 with # prefix.
     let out = Command::new(bin())
-        .args(["--db", &db, "react", "--target", "#2", "heart"])
+        .args(["--db", &db, "react", "heart", "#2"])
         .output()
         .expect("react by #N");
     assert!(
@@ -671,7 +671,7 @@ fn test_cli_react_by_message_number() {
 
     // Delete message #1 by number.
     let out = Command::new(bin())
-        .args(["--db", &db, "delete-message", "--target", "1"])
+        .args(["--db", &db, "delete-message", "1"])
         .output()
         .expect("delete by number");
     assert!(
@@ -688,7 +688,7 @@ fn test_cli_react_by_message_number() {
 
     // Invalid message number should error.
     let out = Command::new(bin())
-        .args(["--db", &db, "react", "--target", "99", "sad"])
+        .args(["--db", &db, "react", "sad", "99"])
         .output()
         .expect("react invalid number");
     assert!(
@@ -720,7 +720,7 @@ fn test_cli_messages_include_reactions() {
     // Send a message and react to it.
     send_message(&db, "hello world");
     let out = Command::new(bin())
-        .args(["--db", &db, "react", "--target", "1", "thumbsup"])
+        .args(["--db", &db, "react", "thumbsup", "1"])
         .output()
         .expect("react");
     assert!(
@@ -731,7 +731,7 @@ fn test_cli_messages_include_reactions() {
 
     // Add a second different reaction to the same message.
     let out = Command::new(bin())
-        .args(["--db", &db, "react", "--target", "1", "fire"])
+        .args(["--db", &db, "react", "fire", "1"])
         .output()
         .expect("react fire");
     assert!(
@@ -934,6 +934,11 @@ fn test_cli_send_file_without_path_uses_placeholder_and_save_file_defaults_targe
         "save-file --target failed: {}",
         String::from_utf8_lossy(&save_long_flag.stderr)
     );
+    assert!(
+        String::from_utf8_lossy(&save_long_flag.stderr).contains("deprecated"),
+        "save-file --target should emit deprecation warning, got: {}",
+        String::from_utf8_lossy(&save_long_flag.stderr)
+    );
 
     let default_out = tmpdir.path().join("placeholder-default.txt");
     let save_default = Command::new(bin())
@@ -1048,7 +1053,6 @@ fn test_cli_files_and_save_file_roundtrip_after_sync() {
                 "--db",
                 &bob_db,
                 "save-file",
-                "--target",
                 "1",
                 "--out",
                 restored_path.to_str().unwrap(),

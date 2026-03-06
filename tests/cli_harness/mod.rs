@@ -879,7 +879,6 @@ pub fn save_file(db: &str, file_target: &str, output_path: &str) -> Output {
         .arg("--db")
         .arg(db)
         .arg("save-file")
-        .arg("--target")
         .arg(file_target)
         .arg("--out")
         .arg(output_path)

@@ -220,8 +220,8 @@ enum Commands {
         /// File target: number (N or #N from `topo files`) or file event ID (hex)
         /// Defaults to "1" when omitted.
         target: Option<String>,
-        /// Explicit file target selector (same semantics as positional target)
-        #[arg(long = "target")]
+        /// Deprecated: use positional target instead.
+        #[arg(long = "target", hide = true)]
         target_flag: Option<String>,
         /// Output path
         #[arg(long)]
@@ -271,8 +271,10 @@ enum Commands {
         /// Emoji to react with
         emoji: String,
         /// Target: message number (N or #N) or hex event ID
-        #[arg(long)]
-        target: String,
+        target: Option<String>,
+        /// Deprecated: use positional target instead.
+        #[arg(long = "target", hide = true)]
+        target_flag: Option<String>,
         /// Client operation ID for local-echo reconciliation
         #[arg(long)]
         client_op_id: Option<String>,
@@ -282,8 +284,10 @@ enum Commands {
     #[command(name = "delete-message")]
     DeleteMessage {
         /// Target: message number (N or #N) or hex event ID
-        #[arg(long)]
-        target: String,
+        target: Option<String>,
+        /// Deprecated: use positional target instead.
+        #[arg(long = "target", hide = true)]
+        target_flag: Option<String>,
     },
 
     /// List reactions
@@ -724,6 +728,43 @@ fn resolve_send_file_path(
                 .map_err(|e| format!("failed to create placeholder: {}", e))?;
             Ok(tmp.to_string_lossy().to_string())
         }
+    }
+}
+
+fn resolve_target_selector(
+    positional: Option<String>,
+    deprecated_flag: Option<String>,
+    command_name: &str,
+    default_when_missing: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    match (positional, deprecated_flag) {
+        (Some(_), Some(_)) => Err(format!(
+            "conflicting target selectors for `{}`: pass either positional target or deprecated --target, not both",
+            command_name
+        )
+        .into()),
+        (Some(target), None) => Ok(target),
+        (None, Some(target)) => {
+            eprintln!(
+                "warning: `--target` is deprecated for `{}`; pass target positionally instead",
+                command_name
+            );
+            Ok(target)
+        }
+        (None, None) => match default_when_missing {
+            Some(default_target) => Ok(default_target.to_string()),
+            None => Err(format!(
+                "missing target for `{}`: pass it positionally (for example `{}`)",
+                command_name,
+                match command_name {
+                    "react" => "topo react thumbsup 1",
+                    "delete-message" => "topo delete-message 1",
+                    "save-file" => "topo save-file 1 --out /tmp/file.bin",
+                    _ => "topo <command> <target>",
+                }
+            )
+            .into()),
+        },
     }
 }
 
@@ -1286,7 +1327,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             target_flag,
             out,
         } => {
-            let target = target_flag.or(target).unwrap_or_else(|| "1".to_string());
+            let target = resolve_target_selector(target, target_flag, "save-file", Some("1"))?;
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
@@ -1460,8 +1501,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::React {
             emoji,
             target,
+            target_flag,
             client_op_id,
         } => {
+            let target = resolve_target_selector(target, target_flag, "react", None)?;
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
@@ -1480,7 +1523,11 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
         }
 
-        Commands::DeleteMessage { target } => {
+        Commands::DeleteMessage {
+            target,
+            target_flag,
+        } => {
+            let target = resolve_target_selector(target, target_flag, "delete-message", None)?;
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
