@@ -33,6 +33,12 @@ pub enum RpcMethod {
         #[serde(default)]
         client_op_id: Option<String>,
     },
+    SaveFile {
+        /// Message selector: number (e.g. "1", "#2") or hex event ID.
+        message: String,
+        /// Output path: file path or directory (appends original filename).
+        output_path: String,
+    },
     Generate {
         count: usize,
     },

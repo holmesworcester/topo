@@ -244,6 +244,129 @@ fn test_cli_unpinned_peer_rejected() {
     assert_now(&alice_db, &format!("has_event:{} == 0", bob_eid));
 }
 
+/// E2E file sync test: Alice sends a file, Bob receives all slices, saves to disk.
+#[test]
+fn test_cli_file_upload_sync_and_save() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+    let timeout_ms = 30000;
+
+    // Create a test file with known content
+    let test_file = tmpdir.path().join("testfile.txt");
+    let test_content = "Hello from the file system! This is a test file for e2e sync.\n";
+    std::fs::write(&test_file, test_content).unwrap();
+
+    // Alice creates workspace and starts daemon
+    create_workspace(&alice_db);
+    let _alice = start_daemon(&alice_db);
+
+    // Alice sends the file
+    let file_eid = send_file(
+        &alice_db,
+        "Check out this file",
+        test_file.to_str().unwrap(),
+    );
+    assert!(!file_eid.is_empty(), "send-file should return event_id");
+
+    // Alice creates invite
+    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
+
+    // Bob accepts invite and starts daemon
+    accept_invite(&bob_db, &invite_link);
+    let _bob = start_daemon(&bob_db);
+
+    // Wait for Bob to receive Alice's message event
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", file_eid),
+        timeout_ms,
+    );
+
+    // Wait for message projection and attachment completion
+    assert_eventually(&bob_db, "message_count >= 1", timeout_ms);
+
+    // Poll until Bob shows the attachment with checkmark (all slices projected)
+    let start = std::time::Instant::now();
+    loop {
+        let raw = get_messages_raw(&bob_db);
+        if raw.contains("\u{2714}") {
+            break;
+        }
+        if start.elapsed().as_secs() >= 30 {
+            panic!(
+                "Bob's file attachment never completed (no checkmark in messages output):\n{}",
+                raw
+            );
+        }
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // Save the file to disk
+    let saved_path = tmpdir.path().join("received_file.txt");
+    let out = save_file(&bob_db, "1", saved_path.to_str().unwrap());
+    assert!(
+        out.status.success(),
+        "save-file failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("testfile.txt"),
+        "save-file output should show filename, got: {}",
+        stdout
+    );
+
+    // Verify saved content matches original
+    let saved_content = std::fs::read_to_string(&saved_path).unwrap();
+    assert_eq!(
+        saved_content, test_content,
+        "saved file content should match original"
+    );
+}
+
+/// Save-file to a directory appends the original filename.
+#[test]
+fn test_cli_save_file_to_directory() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("savedir.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let test_file = tmpdir.path().join("photo.png");
+    std::fs::write(&test_file, b"\x89PNG\r\n\x1a\n fake png data").unwrap();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    send_file(&db, "my photo", test_file.to_str().unwrap());
+
+    // Save to a directory (should append original filename)
+    let save_dir = tmpdir.path().join("downloads");
+    std::fs::create_dir_all(&save_dir).unwrap();
+    let out = save_file(&db, "1", save_dir.to_str().unwrap());
+    assert!(
+        out.status.success(),
+        "save-file to dir failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let expected_path = save_dir.join("photo.png");
+    assert!(
+        expected_path.exists(),
+        "saved file should exist at {}",
+        expected_path.display()
+    );
+    let saved = std::fs::read(&expected_path).unwrap();
+    let original = std::fs::read(&test_file).unwrap();
+    assert_eq!(saved, original, "saved file should match original");
+}
+
 /// Daemon start on an empty DB should keep control plane up in IdleNoTenants state.
 #[test]
 fn test_cli_start_without_trust_starts_idle_runtime() {

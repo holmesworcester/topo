@@ -204,6 +204,16 @@ enum Commands {
         client_op_id: Option<String>,
     },
 
+    /// Save a received file attachment to disk
+    #[command(name = "save-file")]
+    SaveFile {
+        /// Message selector: number (e.g. "1", "#2") or hex event ID
+        message: String,
+        /// Output path: file path or directory (appends original filename)
+        #[arg(long, short)]
+        output: String,
+    },
+
     /// Show database status
     Status,
 
@@ -1129,6 +1139,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("Sent: {}", data["content"].as_str().unwrap_or(&content));
             println!("\u{1f4ce} {} ({})", filename, format_byte_size(file_size));
             println!("event_id:{}", event_id);
+        }
+
+        Commands::SaveFile { message, output } => {
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::SaveFile {
+                    message: message.clone(),
+                    output_path: output,
+                },
+            )?;
+            let filename = data["filename"].as_str().unwrap_or("");
+            let file_size = data["file_size"].as_i64().unwrap_or(0);
+            let out_path = data["output_path"].as_str().unwrap_or("");
+            println!(
+                "Saved: {} ({}) -> {}",
+                filename,
+                format_byte_size(file_size),
+                out_path
+            );
         }
 
         Commands::Status => {

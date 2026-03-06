@@ -59,6 +59,15 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"SendFile","content":"see attached","file_path":"/tmp/notes.txt","client_op_id":"op-456"}"#,
     },
     MethodInfo {
+        name: "SaveFile",
+        purpose: "Save a received file attachment to disk",
+        params: params![
+            "message", "string", true, None;
+            "output_path", "string", true, None
+        ],
+        example_json: r#"{"type":"SaveFile","message":"1","output_path":"/tmp/saved.bin"}"#,
+    },
+    MethodInfo {
         name: "Generate",
         purpose: "Generate synthetic test messages",
         params: params!["count", "usize", true, None],
