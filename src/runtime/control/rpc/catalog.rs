@@ -247,9 +247,9 @@ static CATALOG: &[MethodInfo] = &[
     },
     MethodInfo {
         name: "Upnp",
-        purpose: "Attempt UPnP port mapping for QUIC listen port",
-        params: PARAM_NONE,
-        example_json: r#"{"type":"Upnp"}"#,
+        purpose: "Enable, disable, or inspect runtime-managed UPnP port mapping",
+        params: params!["action", "string", false, Some("\"enable\"")],
+        example_json: r#"{"type":"Upnp","action":"status"}"#,
     },
     MethodInfo {
         name: "View",

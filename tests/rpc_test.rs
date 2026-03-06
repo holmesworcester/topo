@@ -165,7 +165,9 @@ fn rpc_all_methods_serialize() {
             devicename: "device".into(),
         },
         RpcMethod::Peers,
-        RpcMethod::Upnp,
+        RpcMethod::Upnp {
+            action: UpnpAction::Enable,
+        },
         RpcMethod::SubCreate {
             name: "inbox".into(),
             event_type: "message".into(),
@@ -669,8 +671,7 @@ fn upnp_on_empty_daemon_works_without_workspace() {
     wait_for_socket(&socket);
     let _ = wait_for_runtime_state(&socket, "IdleNoTenants", Duration::from_secs(10));
 
-    // UPnP should succeed (return ok) even without a workspace.
-    // On loopback it reports "not_attempted" but does not error.
+    // UPnP mode should enable successfully even without a workspace.
     let out = Command::new(bin())
         .args(["--db", &db, "upnp"])
         .output()
@@ -682,9 +683,120 @@ fn upnp_on_empty_daemon_works_without_workspace() {
         String::from_utf8_lossy(&out.stderr)
     );
     assert!(
-        stdout.contains("not attempted") || stdout.contains("success") || stdout.contains("failed"),
-        "expected a UPnP status report, got: {}",
+        stdout.contains("enabled"),
+        "expected upnp enable output, got: {}",
         stdout
+    );
+    let status = status_via_rpc(&socket);
+    assert_eq!(status["runtime"]["upnp_enabled"], true);
+    assert!(
+        status["runtime"].get("upnp").is_none() || status["runtime"]["upnp"].is_null(),
+        "idle daemon should not have a runtime mapping report yet: {}",
+        status
+    );
+
+    stop_daemon(&db, &mut daemon);
+}
+
+#[test]
+fn upnp_enabled_before_workspace_creation_refreshes_when_runtime_starts() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:14433"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket);
+    let _ = wait_for_runtime_state(&socket, "IdleNoTenants", Duration::from_secs(10));
+
+    let out = Command::new(bin())
+        .args(["--db", &db, "upnp"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "upnp enable should succeed before workspace creation: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = Command::new(bin())
+        .args(["create-workspace", "--db", &db])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "create-workspace failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let _ = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let status = loop {
+        let data = status_via_rpc(&socket);
+        if data["runtime"]["upnp_enabled"].as_bool() == Some(true)
+            && data["runtime"]["upnp"]["status"].as_str().is_some()
+        {
+            break data;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "timed out waiting for UPnP refresh after runtime activation: {}",
+            data
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    assert_eq!(status["runtime"]["upnp_enabled"], true);
+    assert_eq!(status["runtime"]["upnp"]["status"], "not_attempted");
+
+    stop_daemon(&db, &mut daemon);
+}
+
+#[test]
+fn upnp_mode_resets_on_daemon_restart() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    create_workspace(&db);
+
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:14433"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket);
+    let _ = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
+
+    let out = Command::new(bin())
+        .args(["--db", &db, "upnp"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "upnp enable should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let status = status_via_rpc(&socket);
+    assert_eq!(status["runtime"]["upnp_enabled"], true);
+
+    stop_daemon(&db, &mut daemon);
+
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:14433"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket);
+    let status = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
+    assert_eq!(status["runtime"]["upnp_enabled"], false);
+    assert!(
+        status["runtime"].get("upnp").is_none() || status["runtime"]["upnp"].is_null(),
+        "restart should clear prior UPnP report: {}",
+        status
     );
 
     stop_daemon(&db, &mut daemon);

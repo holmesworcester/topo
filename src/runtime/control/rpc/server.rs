@@ -3,6 +3,7 @@
 //! Connection count is bounded by a semaphore to prevent local connection-flood
 //! pressure (feedback item 2).
 
+use std::collections::HashSet;
 use std::io::Write;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
@@ -55,13 +56,14 @@ pub struct DaemonState {
     /// Runtime lifecycle state.
     pub runtime_state: RwLock<RuntimeState>,
     /// Runtime networking info (listen addr, UPnP result). Set once the
-    /// QUIC endpoint is bound; UPnP result is populated by `topo upnp`.
+    /// QUIC endpoint is bound; UPnP result is populated while UPnP mode is enabled.
     pub runtime_net: RwLock<Option<NodeRuntimeNetInfo>>,
     /// The daemon's resolved bind address, set early at daemon start before
-    /// any tenants exist. UPnP can use this without waiting for the runtime.
+    /// any tenants exist.
     pub bind_addr: RwLock<Option<std::net::SocketAddr>>,
-    /// UPnP result stored independently of the runtime so it survives runtime
-    /// restarts and can be populated before any tenant exists.
+    /// Whether runtime-managed UPnP mode is enabled for this daemon session.
+    pub upnp_enabled: RwLock<bool>,
+    /// Last UPnP mapping report for the active runtime session.
     pub upnp_result: RwLock<Option<crate::peering::nat::upnp::UpnpMappingReport>>,
     /// Wake-up trigger for runtime state reevaluation after tenant-changing commands.
     pub runtime_recheck: Notify,
@@ -105,6 +107,7 @@ impl DaemonState {
             runtime_state: RwLock::new(RuntimeState::IdleNoTenants),
             runtime_net: RwLock::new(None),
             bind_addr: RwLock::new(None),
+            upnp_enabled: RwLock::new(false),
             upnp_result: RwLock::new(None),
             runtime_recheck: Notify::new(),
             invite_refs: RwLock::new(Vec::new()),
@@ -288,7 +291,6 @@ fn handle_connection(
     Ok(())
 }
 
-#[allow(dead_code)] // used by tests; will be called when auto-UPnP bootstrap is re-enabled
 fn resolve_bootstrap_from_upnp(
     upnp: &crate::peering::nat::upnp::UpnpMappingReport,
 ) -> Result<String, String> {
@@ -328,6 +330,72 @@ fn resolve_bootstrap_from_upnp(
     }
 
     Ok(std::net::SocketAddr::new(parsed_ip, port).to_string())
+}
+
+fn upnp_response_data(
+    enabled: bool,
+    report: Option<&crate::peering::nat::upnp::UpnpMappingReport>,
+    fallback_error: &str,
+) -> serde_json::Value {
+    let mut data = serde_json::Map::new();
+    data.insert("enabled".into(), serde_json::Value::Bool(enabled));
+    if let Some(report) = report {
+        if let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(report) {
+            for (key, value) in fields {
+                data.insert(key, value);
+            }
+        }
+    } else {
+        data.insert("status".into(), serde_json::json!("not_attempted"));
+        data.insert("error".into(), serde_json::json!(fallback_error));
+    }
+    serde_json::Value::Object(data)
+}
+
+fn merge_upnp_bootstrap_addr(
+    mut addrs: Vec<crate::event_modules::workspace::invite_link::BootstrapAddress>,
+    upnp: Option<&crate::peering::nat::upnp::UpnpMappingReport>,
+) -> Vec<crate::event_modules::workspace::invite_link::BootstrapAddress> {
+    let mut seen: HashSet<String> = addrs
+        .iter()
+        .map(|addr| addr.to_bootstrap_addr_string())
+        .collect();
+    if let Some(report) = upnp {
+        match resolve_bootstrap_from_upnp(report) {
+            Ok(addr) => {
+                match crate::event_modules::workspace::invite_link::parse_bootstrap_address(&addr) {
+                    Ok(parsed) => {
+                        let key = parsed.to_bootstrap_addr_string();
+                        if seen.insert(key) {
+                            addrs.push(parsed);
+                        }
+                    }
+                    Err(e) => warn!("ignoring invalid UPnP bootstrap address {}: {}", addr, e),
+                }
+            }
+            Err(e) if report.status == crate::peering::nat::upnp::UpnpMappingStatus::Success => {
+                warn!("ignoring unusable UPnP mapping result: {}", e);
+            }
+            Err(_) => {}
+        }
+    }
+    addrs
+}
+
+fn autodetect_bootstrap_addrs(
+    state: &DaemonState,
+    listen_port: u16,
+) -> Result<Vec<crate::event_modules::workspace::invite_link::BootstrapAddress>, String> {
+    let detected =
+        crate::event_modules::workspace::invite_link::detect_bootstrap_addrs(listen_port);
+    let merged = merge_upnp_bootstrap_addr(detected, state.upnp_result.read().unwrap().as_ref());
+    if merged.is_empty() {
+        return Err(
+            "No non-loopback addresses detected and no active UPnP address available. Provide public_addr explicitly."
+                .to_string(),
+        );
+    }
+    Ok(merged)
 }
 
 /// Best-effort store of client_op_id → event_id mapping. Failures are logged but don't
@@ -467,7 +535,11 @@ fn dispatch(
                         .map(|sa| sa.port())
                         .unwrap_or(crate::event_modules::workspace::invite_link::DEFAULT_PORT);
                     let mut resp_json = serde_json::to_value(&resp).unwrap();
-                    match workspace::commands::create_invite_for_db(db_path, &[], listen_port) {
+                    let bootstrap_addrs = autodetect_bootstrap_addrs(state, listen_port);
+                    match bootstrap_addrs.and_then(|addrs| {
+                        workspace::commands::create_invite_for_db(db_path, &addrs, listen_port)
+                            .map_err(|e| e.to_string())
+                    }) {
                         Ok(invite) => {
                             if let Some(link) = serde_json::to_value(&invite)
                                 .ok()
@@ -479,7 +551,7 @@ fn dispatch(
                             }
                         }
                         Err(e) => {
-                            resp_json["invite_error"] = serde_json::json!(e.to_string());
+                            resp_json["invite_error"] = serde_json::json!(e);
                         }
                     }
                     RpcResponse::success(resp_json)
@@ -640,13 +712,14 @@ fn dispatch(
                         json["runtime"] = net_val;
                     }
                 }
+                let upnp_enabled = *state.upnp_enabled.read().unwrap();
                 // When the runtime isn't active, synthesize a minimal "runtime"
-                // block from early-bound listen addr and daemon-level UPnP result
-                // so that `topo status` always shows networking info.
+                // block from early-bound listen addr and UPnP mode state so that
+                // `topo status` always shows networking info.
                 if json.get("runtime").is_none() {
                     let bind = state.bind_addr.read().unwrap();
                     let upnp = state.upnp_result.read().unwrap();
-                    if bind.is_some() || upnp.is_some() {
+                    if bind.is_some() || upnp.is_some() || upnp_enabled {
                         let mut rt = serde_json::Map::new();
                         if let Some(addr) = *bind {
                             rt.insert(
@@ -654,6 +727,7 @@ fn dispatch(
                                 serde_json::Value::String(addr.to_string()),
                             );
                         }
+                        rt.insert("upnp_enabled".into(), serde_json::Value::Bool(upnp_enabled));
                         if let Some(ref report) = *upnp {
                             if let Ok(v) = serde_json::to_value(report) {
                                 rt.insert("upnp".into(), v);
@@ -662,8 +736,9 @@ fn dispatch(
                         json["runtime"] = serde_json::Value::Object(rt);
                     }
                 } else if let Some(rt) = json.get_mut("runtime") {
+                    rt["upnp_enabled"] = serde_json::Value::Bool(upnp_enabled);
                     // Runtime is active but UPnP might only be in daemon-level state
-                    // (e.g. if UPnP was run before the runtime started).
+                    // (e.g. while a refresh task is still writing the latest report).
                     // Only inject if the port matches the current listen address.
                     if rt.get("upnp").is_none() {
                         if let Some(ref report) = *state.upnp_result.read().unwrap() {
@@ -839,17 +914,10 @@ fn dispatch(
                     None => vec![],
                 };
                 let bootstrap_addrs = if explicit_addrs.is_empty() {
-                    let detected =
-                        crate::event_modules::workspace::invite_link::detect_bootstrap_addrs(
-                            listen_port,
-                        );
-                    if detected.is_empty() {
-                        return RpcResponse::error(
-                            "No non-loopback addresses detected. Provide public_addr explicitly."
-                                .to_string(),
-                        );
+                    match autodetect_bootstrap_addrs(state, listen_port) {
+                        Ok(addrs) => addrs,
+                        Err(e) => return RpcResponse::error(e),
                     }
-                    detected
                 } else {
                     explicit_addrs
                 };
@@ -882,49 +950,69 @@ fn dispatch(
             }
             Err(e) => RpcResponse::error(e),
         },
-        RpcMethod::Upnp => {
-            // UPnP only needs the listen address, not the full runtime.
-            // Prefer runtime_net (actual bound address) when available;
-            // fall back to bind_addr (early-resolved) when no runtime is active.
-            let listen_addr: std::net::SocketAddr = {
-                if let Some(ref info) = *state.runtime_net.read().unwrap() {
-                    match info.listen_addr.parse() {
-                        Ok(a) => a,
-                        Err(e) => return RpcResponse::error(format!("invalid listen addr: {}", e)),
-                    }
-                } else if let Some(addr) = *state.bind_addr.read().unwrap() {
-                    addr
-                } else {
-                    return RpcResponse::error("daemon not ready — listen address not yet known");
+        RpcMethod::Upnp { action } => match action {
+            UpnpAction::Disable => {
+                *state.upnp_enabled.write().unwrap() = false;
+                *state.upnp_result.write().unwrap() = None;
+                if let Some(ref mut info) = *state.runtime_net.write().unwrap() {
+                    info.upnp = None;
                 }
-            };
-            let rt = match tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-            {
-                Ok(rt) => rt,
-                Err(e) => return RpcResponse::error(format!("failed to start runtime: {}", e)),
-            };
-            let report = rt.block_on(crate::peering::nat::upnp::attempt_udp_port_mapping(
-                listen_addr,
-                std::time::Duration::from_secs(10),
-            ));
-            // Store result in daemon-level state.
-            *state.upnp_result.write().unwrap() = Some(report.clone());
-            // Propagate to runtime_net only if ports match (runtime may have
-            // restarted on a different port since UPnP began).
-            if let Some(ref mut ni) = *state.runtime_net.write().unwrap() {
-                let runtime_port = ni
-                    .listen_addr
-                    .parse::<std::net::SocketAddr>()
-                    .map(|a| a.port())
-                    .unwrap_or(0);
-                if runtime_port == listen_addr.port() {
-                    ni.upnp = Some(report.clone());
-                }
+                RpcResponse::success(upnp_response_data(false, None, "disabled"))
             }
-            RpcResponse::success(report)
-        }
+            UpnpAction::Status => {
+                let enabled = *state.upnp_enabled.read().unwrap();
+                let report = state.upnp_result.read().unwrap().clone();
+                let fallback = if enabled {
+                    "runtime not active yet; mapping will be attempted when runtime starts"
+                } else {
+                    "disabled"
+                };
+                RpcResponse::success(upnp_response_data(enabled, report.as_ref(), fallback))
+            }
+            UpnpAction::Enable => {
+                *state.upnp_enabled.write().unwrap() = true;
+                let listen_addr = match state.runtime_net.read().unwrap().as_ref() {
+                    Some(info) => match info.listen_addr.parse::<std::net::SocketAddr>() {
+                        Ok(addr) => Some(addr),
+                        Err(e) => {
+                            return RpcResponse::error(format!("invalid listen addr: {}", e));
+                        }
+                    },
+                    None => None,
+                };
+                let Some(listen_addr) = listen_addr else {
+                    *state.upnp_result.write().unwrap() = None;
+                    return RpcResponse::success(upnp_response_data(
+                        true,
+                        None,
+                        "runtime not active yet; mapping will be attempted when runtime starts",
+                    ));
+                };
+                let rt = match tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    Ok(rt) => rt,
+                    Err(e) => return RpcResponse::error(format!("failed to start runtime: {}", e)),
+                };
+                let report = rt.block_on(crate::peering::nat::upnp::attempt_udp_port_mapping(
+                    listen_addr,
+                    std::time::Duration::from_secs(10),
+                ));
+                *state.upnp_result.write().unwrap() = Some(report.clone());
+                if let Some(ref mut ni) = *state.runtime_net.write().unwrap() {
+                    let runtime_port = ni
+                        .listen_addr
+                        .parse::<std::net::SocketAddr>()
+                        .map(|a| a.port())
+                        .unwrap_or(0);
+                    if runtime_port == listen_addr.port() {
+                        ni.upnp = Some(report.clone());
+                    }
+                }
+                RpcResponse::success(upnp_response_data(true, Some(&report), "enabled"))
+            }
+        },
         RpcMethod::CreateDeviceLink {
             public_addr,
             public_spki,
@@ -950,14 +1038,10 @@ fn dispatch(
                         None => vec![],
                     };
                     let bootstrap_addrs = if explicit_addrs.is_empty() {
-                        let detected =
-                            crate::event_modules::workspace::invite_link::detect_bootstrap_addrs(
-                                listen_port,
-                            );
-                        if detected.is_empty() {
-                            return RpcResponse::error("No non-loopback addresses detected. Provide public_addr explicitly.".to_string());
+                        match autodetect_bootstrap_addrs(state, listen_port) {
+                            Ok(addrs) => addrs,
+                            Err(e) => return RpcResponse::error(e),
                         }
-                        detected
                     } else {
                         explicit_addrs
                     };
@@ -1288,7 +1372,8 @@ fn dispatch(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_bootstrap_from_upnp;
+    use super::{merge_upnp_bootstrap_addr, resolve_bootstrap_from_upnp};
+    use crate::event_modules::workspace::invite_link::parse_bootstrap_address;
     use crate::peering::nat::upnp::{UpnpMappingReport, UpnpMappingStatus};
 
     fn mk_report(
@@ -1344,5 +1429,35 @@ mod tests {
         );
         let err = resolve_bootstrap_from_upnp(&report).unwrap_err();
         assert!(err.contains("not publicly routable"));
+    }
+
+    #[test]
+    fn upnp_bootstrap_addr_is_appended_to_detected_addrs() {
+        let report = mk_report(
+            UpnpMappingStatus::Success,
+            Some("8.8.4.4"),
+            Some(55000),
+            None,
+        );
+        let detected = vec![parse_bootstrap_address("192.168.1.20:4433").unwrap()];
+        let merged = merge_upnp_bootstrap_addr(detected, Some(&report));
+        let addr_strings: Vec<String> = merged
+            .into_iter()
+            .map(|addr| addr.to_bootstrap_addr_string())
+            .collect();
+        assert_eq!(addr_strings, vec!["192.168.1.20", "8.8.4.4:55000"]);
+    }
+
+    #[test]
+    fn upnp_bootstrap_addr_is_deduplicated_against_detected_addrs() {
+        let report = mk_report(
+            UpnpMappingStatus::Success,
+            Some("8.8.4.4"),
+            Some(55000),
+            None,
+        );
+        let detected = vec![parse_bootstrap_address("8.8.4.4:55000").unwrap()];
+        let merged = merge_upnp_bootstrap_addr(detected, Some(&report));
+        assert_eq!(merged.len(), 1, "UPnP address should not be duplicated");
     }
 }

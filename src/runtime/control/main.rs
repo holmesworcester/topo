@@ -19,7 +19,7 @@ use topo::db::{open_connection, schema::create_tables, sync_log};
 use topo::db_registry::DbRegistry;
 use topo::rpc::catalog;
 use topo::rpc::client::{rpc_call, rpc_call_raw, RpcClientError};
-use topo::rpc::protocol::{RpcMethod, PROTOCOL_VERSION};
+use topo::rpc::protocol::{RpcMethod, UpnpAction, PROTOCOL_VERSION};
 use topo::rpc::server::{run_rpc_server, DaemonState, RuntimeState};
 use topo::service;
 use topo::tuning::apply_low_mem_allocator_tuning;
@@ -559,9 +559,12 @@ enum Commands {
         action: RpcAction,
     },
 
-    /// Attempt UPnP port forwarding for the daemon's QUIC listen port.
-    /// Requires daemon listening on non-loopback (for example `--bind 0.0.0.0:...`).
-    Upnp,
+    /// Enable, disable, or inspect runtime-managed UPnP port forwarding.
+    /// Mapping attempts are ephemeral daemon state and reset on restart.
+    Upnp {
+        #[command(subcommand)]
+        action: Option<UpnpCommand>,
+    },
 
     /// Reset all local state: stop daemon, delete DB and socket files
     Reset,
@@ -598,6 +601,16 @@ enum RpcAction {
         #[arg(long, group = "input")]
         stdin: bool,
     },
+}
+
+#[derive(Subcommand, Clone, Copy)]
+enum UpnpCommand {
+    /// Enable UPnP mode and refresh the active runtime mapping now.
+    Enable,
+    /// Disable UPnP mode and stop advertising any prior UPnP address.
+    Disable,
+    /// Show the current UPnP mode and last mapping result.
+    Status,
 }
 
 #[derive(Subcommand)]
@@ -1232,6 +1245,47 @@ async fn stop_runtime(runtime: ManagedRuntime) {
     }
 }
 
+fn clear_upnp_report(state: &DaemonState) {
+    *state.upnp_result.write().unwrap() = None;
+    if let Some(ref mut info) = *state.runtime_net.write().unwrap() {
+        info.upnp = None;
+    }
+}
+
+async fn refresh_upnp_mapping_for_runtime(state: Arc<DaemonState>, listen_addr: SocketAddr) {
+    let report =
+        topo::peering::nat::upnp::attempt_udp_port_mapping(listen_addr, Duration::from_secs(10))
+            .await;
+
+    if !*state.upnp_enabled.read().unwrap() {
+        return;
+    }
+
+    let runtime_port_matches = state
+        .runtime_net
+        .read()
+        .unwrap()
+        .as_ref()
+        .and_then(|info| info.listen_addr.parse::<SocketAddr>().ok())
+        .map(|addr| addr.port() == listen_addr.port())
+        .unwrap_or(false);
+    if !runtime_port_matches {
+        return;
+    }
+
+    *state.upnp_result.write().unwrap() = Some(report.clone());
+    if let Some(ref mut info) = *state.runtime_net.write().unwrap() {
+        let info_port_matches = info
+            .listen_addr
+            .parse::<SocketAddr>()
+            .map(|addr| addr.port() == listen_addr.port())
+            .unwrap_or(false);
+        if info_port_matches {
+            info.upnp = Some(report);
+        }
+    }
+}
+
 fn spawn_runtime(
     db_path: &str,
     bind: SocketAddr,
@@ -1242,7 +1296,7 @@ fn spawn_runtime(
     // Clear stale UPnP result — the port may change across restarts.
     *state.runtime_state.write().unwrap() = RuntimeState::IdleNoTenants;
     *state.runtime_net.write().unwrap() = None;
-    *state.upnp_result.write().unwrap() = None;
+    clear_upnp_report(&state);
 
     let runtime_shutdown = Arc::new(tokio::sync::Notify::new());
     let runtime_shutdown_for_task = runtime_shutdown.clone();
@@ -1251,25 +1305,19 @@ fn spawn_runtime(
     let (net_tx, net_rx) = tokio::sync::oneshot::channel::<topo::node::NodeRuntimeNetInfo>();
     let state_for_net = state.clone();
     tokio::spawn(async move {
-        if let Ok(mut info) = net_rx.await {
+        if let Ok(info) = net_rx.await {
             println!("listen: {}", info.listen_addr);
-            // Carry forward daemon-level UPnP result only if the port matches.
-            if info.upnp.is_none() {
-                let prior = state_for_net.upnp_result.read().unwrap().clone();
-                if let Some(ref report) = prior {
-                    if report.requested_external_port
-                        == info
-                            .listen_addr
-                            .parse::<std::net::SocketAddr>()
-                            .map(|a| a.port())
-                            .unwrap_or(0)
-                    {
-                        info.upnp = prior;
-                    }
-                }
-            }
+            let listen_addr = info.listen_addr.parse::<SocketAddr>().ok();
             *state_for_net.runtime_net.write().unwrap() = Some(info);
             *state_for_net.runtime_state.write().unwrap() = RuntimeState::Active;
+            if *state_for_net.upnp_enabled.read().unwrap() {
+                if let Some(listen_addr) = listen_addr {
+                    let refresh_state = state_for_net.clone();
+                    tokio::spawn(async move {
+                        refresh_upnp_mapping_for_runtime(refresh_state, listen_addr).await;
+                    });
+                }
+            }
         }
     });
 
@@ -1302,6 +1350,7 @@ async fn reevaluate_runtime(
             Err(e) => tracing::warn!("runtime task join error: {}", e),
         }
         *state.runtime_net.write().unwrap() = None;
+        clear_upnp_report(&state);
     }
 
     let tenants = discover_tenant_peer_ids(db_path)?;
@@ -1312,6 +1361,7 @@ async fn reevaluate_runtime(
         }
         *state.runtime_state.write().unwrap() = RuntimeState::IdleNoTenants;
         *state.runtime_net.write().unwrap() = None;
+        clear_upnp_report(&state);
         return Ok(());
     }
 
@@ -1798,6 +1848,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     "  Listen:    {}",
                     rt["listen_addr"].as_str().unwrap_or("unknown")
                 );
+                let upnp_enabled = rt["upnp_enabled"].as_bool().unwrap_or(false);
                 if let Some(upnp) = rt.get("upnp") {
                     let status = upnp["status"].as_str().unwrap_or("not_attempted");
                     match status {
@@ -1813,24 +1864,40 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                                 ""
                             };
                             println!(
-                                "  UPnP:      success udp external_port={} external_ip={}{}",
-                                ext_port, ext_ip, nat_tag
+                                "  UPnP:      {} success udp external_port={} external_ip={}{}",
+                                if upnp_enabled { "enabled" } else { "disabled" },
+                                ext_port,
+                                ext_ip,
+                                nat_tag
                             );
                         }
                         "failed" => {
                             let err = upnp["error"].as_str().unwrap_or("unknown");
-                            println!("  UPnP:      failed ({})", err);
+                            println!(
+                                "  UPnP:      {} failed ({})",
+                                if upnp_enabled { "enabled" } else { "disabled" },
+                                err
+                            );
                         }
                         "not_attempted" => {
                             let err = upnp["error"].as_str().unwrap_or("unknown");
-                            println!("  UPnP:      not attempted ({})", err);
+                            println!(
+                                "  UPnP:      {} not attempted ({})",
+                                if upnp_enabled { "enabled" } else { "disabled" },
+                                err
+                            );
                         }
                         _ => {
-                            println!("  UPnP:      not attempted");
+                            println!(
+                                "  UPnP:      {} not attempted",
+                                if upnp_enabled { "enabled" } else { "disabled" }
+                            );
                         }
                     }
+                } else if upnp_enabled {
+                    println!("  UPnP:      enabled (awaiting active runtime)");
                 } else {
-                    println!("  UPnP:      not attempted (run `topo upnp` to try)");
+                    println!("  UPnP:      disabled");
                 }
             }
             if data.get("runtime").is_none() {
@@ -2660,8 +2727,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         },
 
-        Commands::Upnp => {
-            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Upnp)?;
+        Commands::Upnp { action } => {
+            let action = match action.unwrap_or(UpnpCommand::Enable) {
+                UpnpCommand::Enable => UpnpAction::Enable,
+                UpnpCommand::Disable => UpnpAction::Disable,
+                UpnpCommand::Status => UpnpAction::Status,
+            };
+            let data =
+                rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Upnp { action })?;
+            let enabled = data["enabled"].as_bool().unwrap_or(false);
             let status = data["status"].as_str().unwrap_or("unknown");
             match status {
                 "success" => {
@@ -2671,8 +2745,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         .unwrap_or_else(|| "?".into());
                     let ext_ip = data["external_ip"].as_str().unwrap_or("unknown");
                     println!(
-                        "upnp: success udp external_port={} external_ip={}",
-                        ext_port, ext_ip
+                        "upnp: {} success udp external_port={} external_ip={}",
+                        if enabled { "enabled" } else { "disabled" },
+                        ext_port,
+                        ext_ip
                     );
                     if data["double_nat"].as_bool().unwrap_or(false) {
                         println!("warning: double-NAT detected \u{2014} external IP {} is not publicly routable; port forwarding may not be reachable from the internet", ext_ip);
@@ -2680,14 +2756,26 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 "failed" => {
                     let err = data["error"].as_str().unwrap_or("unknown reason");
-                    println!("upnp: failed ({})", err);
+                    println!(
+                        "upnp: {} failed ({})",
+                        if enabled { "enabled" } else { "disabled" },
+                        err
+                    );
                 }
                 "not_attempted" => {
                     let err = data["error"].as_str().unwrap_or("unknown reason");
-                    println!("upnp: not attempted ({})", err);
+                    if enabled {
+                        println!("upnp: enabled ({})", err);
+                    } else {
+                        println!("upnp: disabled");
+                    }
                 }
                 other => {
-                    println!("upnp: {}", other);
+                    println!(
+                        "upnp: {} {}",
+                        if enabled { "enabled" } else { "disabled" },
+                        other
+                    );
                 }
             }
         }

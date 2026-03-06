@@ -23,7 +23,7 @@ use startup::setup_endpoint_and_tenants;
 pub struct NodeRuntimeNetInfo {
     /// Actual bound listen address (after OS port assignment).
     pub listen_addr: String,
-    /// UPnP port mapping attempt result (None until `topo upnp` is run).
+    /// Last UPnP port mapping report for the active daemon runtime, if any.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub upnp: Option<crate::peering::nat::upnp::UpnpMappingReport>,
 }

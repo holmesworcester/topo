@@ -124,8 +124,11 @@ pub enum RpcMethod {
     },
     /// List all known peers with local/remote status and endpoint info.
     Peers,
-    /// Attempt UPnP port mapping for the QUIC listen port.
-    Upnp,
+    /// Enable, disable, or inspect runtime-managed UPnP port mapping.
+    Upnp {
+        #[serde(default = "default_upnp_action")]
+        action: UpnpAction,
+    },
     /// Combined view: sidebar (workspace, users, accounts) + messages with inline reactions.
     View {
         #[serde(default = "default_view_limit")]
@@ -177,6 +180,18 @@ pub enum RpcMethod {
         #[serde(default = "default_intro_attempt_window_ms")]
         attempt_window_ms: u32,
     },
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum UpnpAction {
+    Enable,
+    Disable,
+    Status,
+}
+
+fn default_upnp_action() -> UpnpAction {
+    UpnpAction::Enable
 }
 
 fn default_intro_ttl_ms() -> u64 {
