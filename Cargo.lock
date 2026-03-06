@@ -2194,6 +2194,7 @@ dependencies = [
  "curve25519-dalek",
  "ed25519-dalek",
  "hex",
+ "if-addrs",
  "igd-next",
  "libc",
  "mdns-sd",

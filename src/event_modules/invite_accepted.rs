@@ -90,8 +90,8 @@ pub fn encode_invite_accepted(event: &ParsedEvent) -> Result<Vec<u8>, EventError
 // === Projector (event-module locality) ===
 
 use crate::contracts::transport_identity_contract::TransportIdentityIntent;
-use crate::db::transport_creds::{has_creds_with_source, CRED_SOURCE_PEER_SHARED};
 use crate::crypto::event_id_to_base64;
+use crate::db::transport_creds::{has_creds_with_source, CRED_SOURCE_PEER_SHARED};
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::Connection;
 
@@ -186,7 +186,7 @@ pub fn build_projector_context(
             bootstrap_spki_already_peer_shared(conn, recorded_by, &bc.bootstrap_spki_fingerprint)?;
         ctx.bootstrap_context = Some(crate::projection::contract::BootstrapContextSnapshot {
             workspace_id: bc.workspace_id,
-            bootstrap_addr: bc.bootstrap_addr,
+            bootstrap_addrs: bc.bootstrap_addrs,
             bootstrap_spki_fingerprint: bc.bootstrap_spki_fingerprint,
         });
     }
@@ -258,31 +258,33 @@ pub fn project_pure(
     if !ctx.bootstrap_spki_already_peer_shared {
         if let Some(ref bc) = ctx.bootstrap_context {
             let accepted_at = ia.created_at_ms as i64;
-            ops.push(WriteOp::InsertOrIgnore {
-                table: "invite_bootstrap_trust",
-                columns: vec![
-                    "recorded_by",
-                    "invite_accepted_event_id",
-                    "invite_event_id",
-                    "workspace_id",
-                    "bootstrap_addr",
-                    "bootstrap_spki_fingerprint",
-                    "accepted_at",
-                    "expires_at",
-                ],
-                values: vec![
-                    SqlVal::Text(recorded_by.to_string()),
-                    SqlVal::Text(event_id_b64.to_string()),
-                    SqlVal::Text(invite_eid_b64),
-                    SqlVal::Text(workspace_id_b64),
-                    SqlVal::Text(bc.bootstrap_addr.clone()),
-                    SqlVal::Blob(bc.bootstrap_spki_fingerprint.to_vec()),
-                    SqlVal::Int(accepted_at),
-                    SqlVal::Int(
-                        accepted_at + crate::db::transport_trust::ACCEPTED_INVITE_BOOTSTRAP_TTL_MS,
-                    ),
-                ],
-            });
+            let expires_at =
+                accepted_at + crate::db::transport_trust::ACCEPTED_INVITE_BOOTSTRAP_TTL_MS;
+            for addr in &bc.bootstrap_addrs {
+                ops.push(WriteOp::InsertOrIgnore {
+                    table: "invite_bootstrap_trust",
+                    columns: vec![
+                        "recorded_by",
+                        "invite_accepted_event_id",
+                        "invite_event_id",
+                        "workspace_id",
+                        "bootstrap_addr",
+                        "bootstrap_spki_fingerprint",
+                        "accepted_at",
+                        "expires_at",
+                    ],
+                    values: vec![
+                        SqlVal::Text(recorded_by.to_string()),
+                        SqlVal::Text(event_id_b64.to_string()),
+                        SqlVal::Text(invite_eid_b64.clone()),
+                        SqlVal::Text(workspace_id_b64.clone()),
+                        SqlVal::Text(addr.clone()),
+                        SqlVal::Blob(bc.bootstrap_spki_fingerprint.to_vec()),
+                        SqlVal::Int(accepted_at),
+                        SqlVal::Int(expires_at),
+                    ],
+                });
+            }
         }
     }
 

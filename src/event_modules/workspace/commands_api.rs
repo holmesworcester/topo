@@ -148,9 +148,12 @@ pub fn create_workspace_for_db(
 }
 
 /// Create a user invite for the active workspace.
+///
+/// When `bootstrap_addrs` is empty, auto-detects non-loopback addresses.
 pub fn create_invite_for_db(
     db_path: &str,
-    bootstrap_addr: &str,
+    bootstrap_addrs: &[super::invite_link::BootstrapAddress],
+    listen_port: u16,
 ) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (recorded_by, db) =
         open_db_load(db_path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
@@ -175,6 +178,16 @@ pub fn create_invite_for_db(
     let mut bootstrap_spki = [0u8; 32];
     bootstrap_spki.copy_from_slice(&spki_bytes);
 
+    let addrs = if bootstrap_addrs.is_empty() {
+        let detected = super::invite_link::detect_bootstrap_addrs(listen_port);
+        if detected.is_empty() {
+            return Err("No non-loopback addresses detected. Provide --public-addr explicitly.".into());
+        }
+        detected
+    } else {
+        bootstrap_addrs.to_vec()
+    };
+
     let result = create_user_invite(
         &db,
         &recorded_by,
@@ -182,7 +195,7 @@ pub fn create_invite_for_db(
         &sender_peer_eid,
         &admin_event_id,
         &ws_eid,
-        bootstrap_addr,
+        &addrs,
         &bootstrap_spki,
     )?;
 
@@ -195,7 +208,7 @@ pub fn create_invite_for_db(
 /// Create invite with an explicit SPKI hex.
 pub fn create_invite_with_spki(
     db_path: &str,
-    public_addr: &str,
+    bootstrap_addrs: &[super::invite_link::BootstrapAddress],
     public_spki_hex: &str,
 ) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (recorded_by, db) =
@@ -230,7 +243,7 @@ pub fn create_invite_with_spki(
         &sender_peer_eid,
         &admin_event_id,
         &ws_eid,
-        public_addr,
+        bootstrap_addrs,
         &bootstrap_spki,
     )?;
 
@@ -289,14 +302,18 @@ fn prepare_invite_acceptance(
 
     // Record bootstrap context before accept so InviteAccepted projection can
     // materialize trust rows for this tenant.
-    crate::db::transport_trust::append_bootstrap_context(
-        &db,
-        &derived_peer_id,
-        &event_id_to_base64(&invite_event_id),
-        &event_id_to_base64(&workspace_id),
-        &invite.bootstrap_addr,
-        &invite.bootstrap_spki_fingerprint,
-    )?;
+    let invite_eid_b64 = event_id_to_base64(&invite_event_id);
+    let ws_b64 = event_id_to_base64(&workspace_id);
+    for addr in &invite.bootstrap_addrs {
+        crate::db::transport_trust::append_bootstrap_context(
+            &db,
+            &derived_peer_id,
+            &invite_eid_b64,
+            &ws_b64,
+            &addr.to_bootstrap_addr_string(),
+            &invite.bootstrap_spki_fingerprint,
+        )?;
+    }
 
     Ok(PreparedInviteAcceptance {
         db,
@@ -412,10 +429,13 @@ pub fn accept_device_link(
 }
 
 /// Create a device link for a specific peer (daemon provides the peer_id).
+///
+/// When `bootstrap_addrs` is empty, auto-detects non-loopback addresses.
 pub fn create_device_link_for_peer(
     db_path: &str,
     peer_id: &str,
-    public_addr: &str,
+    bootstrap_addrs: &[super::invite_link::BootstrapAddress],
+    listen_port: u16,
     public_spki_hex: Option<&str>,
 ) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
@@ -454,6 +474,16 @@ pub fn create_device_link_for_peer(
         arr
     };
 
+    let addrs = if bootstrap_addrs.is_empty() {
+        let detected = super::invite_link::detect_bootstrap_addrs(listen_port);
+        if detected.is_empty() {
+            return Err("No non-loopback addresses detected. Provide --public-addr explicitly.".into());
+        }
+        detected
+    } else {
+        bootstrap_addrs.to_vec()
+    };
+
     let result = create_device_link_invite(
         &db,
         peer_id,
@@ -462,7 +492,7 @@ pub fn create_device_link_for_peer(
         &admin_event_id,
         &user_event_id,
         &workspace_id,
-        public_addr,
+        &addrs,
         &bootstrap_spki,
     )?;
 

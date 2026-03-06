@@ -218,6 +218,6 @@ pub struct UnwrappedSecretMaterial {
 #[derive(Debug, Clone)]
 pub struct BootstrapContextSnapshot {
     pub workspace_id: String,
-    pub bootstrap_addr: String,
+    pub bootstrap_addrs: Vec<String>,
     pub bootstrap_spki_fingerprint: [u8; 32],
 }

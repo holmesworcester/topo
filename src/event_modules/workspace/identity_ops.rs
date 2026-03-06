@@ -112,7 +112,7 @@ pub enum InviteType {
 /// is written between event storage and projection so the projector can
 /// emit trust commands.
 pub struct InviteBootstrapContext<'a> {
-    pub bootstrap_addr: &'a str,
+    pub bootstrap_addrs: &'a [String],
     pub bootstrap_spki: &'a [u8; 32],
 }
 
@@ -253,14 +253,18 @@ fn create_invite_event_with_optional_bootstrap_context(
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(ctx) = bootstrap_ctx {
         let event_id = store_signed_event_only(conn, recorded_by, event, signer)?;
-        crate::db::transport_trust::append_bootstrap_context(
-            conn,
-            recorded_by,
-            &event_id_to_base64(&event_id),
-            &event_id_to_base64(workspace_id),
-            ctx.bootstrap_addr,
-            ctx.bootstrap_spki,
-        )?;
+        let eid_b64 = event_id_to_base64(&event_id);
+        let ws_b64 = event_id_to_base64(workspace_id);
+        for addr in ctx.bootstrap_addrs {
+            crate::db::transport_trust::append_bootstrap_context(
+                conn,
+                recorded_by,
+                &eid_b64,
+                &ws_b64,
+                addr,
+                ctx.bootstrap_spki,
+            )?;
+        }
         project_event(conn, recorded_by, &event_id)?;
         Ok(event_id)
     } else {

@@ -463,13 +463,17 @@ pub fn create_user_invite(
     admin_peer_shared_event_id: &EventId,
     admin_event_id: &EventId,
     workspace_id: &EventId,
-    bootstrap_addr: &str,
+    bootstrap_addrs: &[super::invite_link::BootstrapAddress],
     bootstrap_spki: &[u8; 32],
 ) -> Result<InviteResult, Box<dyn std::error::Error + Send + Sync>> {
     let _ = ops::ensure_content_key_for_peer(db, recorded_by)?;
 
+    let addr_strings: Vec<String> = bootstrap_addrs
+        .iter()
+        .map(|a| a.to_bootstrap_addr_string())
+        .collect();
     let ctx = InviteBootstrapContext {
-        bootstrap_addr,
+        bootstrap_addrs: &addr_strings,
         bootstrap_spki,
     };
     let invite = ops::create_user_invite_events_as_admin(
@@ -483,7 +487,7 @@ pub fn create_user_invite(
     )?;
 
     let invite_link =
-        super::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)?;
+        super::invite_link::create_invite_link(&invite, bootstrap_addrs, bootstrap_spki)?;
 
     Ok(InviteResult {
         invite_link,
@@ -505,11 +509,15 @@ pub fn create_device_link_invite(
     admin_event_id: &EventId,
     user_event_id: &EventId,
     workspace_id: &EventId,
-    bootstrap_addr: &str,
+    bootstrap_addrs: &[super::invite_link::BootstrapAddress],
     bootstrap_spki: &[u8; 32],
 ) -> Result<InviteResult, Box<dyn std::error::Error + Send + Sync>> {
+    let addr_strings: Vec<String> = bootstrap_addrs
+        .iter()
+        .map(|a| a.to_bootstrap_addr_string())
+        .collect();
     let ctx = InviteBootstrapContext {
-        bootstrap_addr,
+        bootstrap_addrs: &addr_strings,
         bootstrap_spki,
     };
     let invite = ops::create_device_link_invite_events_as_admin(
@@ -524,7 +532,7 @@ pub fn create_device_link_invite(
     )?;
 
     let invite_link =
-        super::invite_link::create_invite_link(&invite, bootstrap_addr, bootstrap_spki)?;
+        super::invite_link::create_invite_link(&invite, bootstrap_addrs, bootstrap_spki)?;
 
     Ok(InviteResult {
         invite_link,

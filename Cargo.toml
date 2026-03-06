@@ -34,6 +34,7 @@ serde_json = "1"
 libc = "0.2"
 mdns-sd = { version = "0.11", optional = true }
 igd-next = { version = "0.15", features = ["aio_tokio"] }
+if-addrs = "0.13"
 
 [features]
 default = ["discovery"]

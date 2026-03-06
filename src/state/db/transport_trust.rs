@@ -133,46 +133,55 @@ pub fn append_bootstrap_context(
     Ok(())
 }
 
-/// Bootstrap context read result.
+/// Bootstrap context read result — aggregated across all addresses for one invite.
 pub struct BootstrapContext {
     pub workspace_id: String,
-    pub bootstrap_addr: String,
+    pub bootstrap_addrs: Vec<String>,
     pub bootstrap_spki_fingerprint: [u8; 32],
 }
 
-/// Read the latest bootstrap context for a given invite event.
+/// Read all bootstrap context rows for a given invite event.
 ///
-/// Picks the winner from append-only rows by `observed_at DESC`.
+/// Returns all distinct addresses recorded. The SPKI and workspace_id are
+/// taken from the most recent row (by `observed_at DESC`).
 pub fn read_bootstrap_context(
     conn: &Connection,
     recorded_by: &str,
     invite_event_id: &str,
 ) -> Result<Option<BootstrapContext>, Box<dyn std::error::Error + Send + Sync>> {
-    match conn.query_row(
+    let mut stmt = conn.prepare(
         "SELECT workspace_id, bootstrap_addr, bootstrap_spki_fingerprint
          FROM bootstrap_context
          WHERE recorded_by = ?1 AND invite_event_id = ?2
-         ORDER BY observed_at DESC, rowid DESC
-         LIMIT 1",
-        rusqlite::params![recorded_by, invite_event_id],
-        |row| {
-            let ws: String = row.get(0)?;
-            let addr: String = row.get(1)?;
-            let blob: Vec<u8> = row.get(2)?;
-            Ok((ws, addr, blob))
-        },
-    ) {
-        Ok((ws, addr, blob)) => {
-            let fp =
-                decode_32_byte_blob(blob).ok_or("bootstrap_spki_fingerprint is not 32 bytes")?;
-            Ok(Some(BootstrapContext {
-                workspace_id: ws,
-                bootstrap_addr: addr,
-                bootstrap_spki_fingerprint: fp,
-            }))
+         ORDER BY observed_at DESC, rowid DESC",
+    )?;
+    let mut rows = stmt.query(rusqlite::params![recorded_by, invite_event_id])?;
+    let mut workspace_id: Option<String> = None;
+    let mut spki: Option<[u8; 32]> = None;
+    let mut addrs = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(row) = rows.next()? {
+        let ws: String = row.get(0)?;
+        let addr: String = row.get(1)?;
+        let blob: Vec<u8> = row.get(2)?;
+        if workspace_id.is_none() {
+            workspace_id = Some(ws);
+            spki = Some(
+                decode_32_byte_blob(blob)
+                    .ok_or("bootstrap_spki_fingerprint is not 32 bytes")?,
+            );
         }
-        Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
-        Err(e) => Err(e.into()),
+        if seen.insert(addr.clone()) {
+            addrs.push(addr);
+        }
+    }
+    match (workspace_id, spki) {
+        (Some(ws), Some(fp)) => Ok(Some(BootstrapContext {
+            workspace_id: ws,
+            bootstrap_addrs: addrs,
+            bootstrap_spki_fingerprint: fp,
+        })),
+        _ => Ok(None),
     }
 }
 
