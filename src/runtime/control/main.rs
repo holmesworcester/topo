@@ -20,7 +20,9 @@ use topo::rpc::client::{rpc_call, rpc_call_raw, RpcClientError};
 use topo::rpc::protocol::{RpcMethod, PROTOCOL_VERSION};
 use topo::rpc::server::{run_rpc_server, DaemonState, RuntimeState};
 use topo::service;
-use topo::tuning::{apply_low_mem_allocator_tuning, low_mem_mode};
+use topo::tuning::apply_low_mem_allocator_tuning;
+#[cfg(all(target_os = "linux", target_env = "gnu"))]
+use topo::tuning::low_mem_mode;
 
 #[derive(Parser)]
 #[command(name = "topo")]
