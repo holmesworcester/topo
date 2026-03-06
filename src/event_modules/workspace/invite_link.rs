@@ -72,15 +72,80 @@ impl BootstrapAddress {
         }
     }
 
-    /// Encode for the comma-separated addr segment. Uses the same display
-    /// format as `to_bootstrap_addr_string` (port omitted when default).
+    /// Encode for the comma-separated addr segment inside invite links.
+    ///
+    /// IPv6 addresses are fully expanded as 8 dash-separated groups of 4 hex
+    /// digits (no square brackets) so the resulting URL is safe for shells and
+    /// linkification.  Non-default ports use `_port` suffix.
     fn to_link_token(&self) -> String {
-        self.to_bootstrap_addr_string()
+        match self {
+            BootstrapAddress::Ipv4 { ip, port } if *port == DEFAULT_PORT => format!("{}", ip),
+            BootstrapAddress::Ipv4 { ip, port } => format!("{}:{}", ip, port),
+            BootstrapAddress::Ipv6 { ip, port } => {
+                let segs = ip.segments();
+                let expanded = format!(
+                    "{:04x}-{:04x}-{:04x}-{:04x}-{:04x}-{:04x}-{:04x}-{:04x}",
+                    segs[0], segs[1], segs[2], segs[3], segs[4], segs[5], segs[6], segs[7]
+                );
+                if *port == DEFAULT_PORT {
+                    expanded
+                } else {
+                    format!("{}_{}", expanded, port)
+                }
+            }
+            BootstrapAddress::Hostname { host, port } if *port == DEFAULT_PORT => host.clone(),
+            BootstrapAddress::Hostname { host, port } => format!("{}:{}", host, port),
+        }
     }
 
-    /// Parse one token from the comma-separated addr segment.
+    /// Parse one token from the comma-separated addr segment in an invite link.
     fn from_link_token(token: &str) -> Result<Self, InviteLinkError> {
+        // Try dash-separated fully-expanded IPv6, optionally with _port suffix.
+        if let Some(result) = Self::try_parse_dash_ipv6(token) {
+            return result;
+        }
+
+        // IPv4 (bare or with :port), hostname (bare or with :port).
         parse_bootstrap_address(token)
+    }
+}
+
+impl BootstrapAddress {
+    /// Try to parse a dash-separated fully-expanded IPv6 link token.
+    /// Returns `None` if the token doesn't match the pattern, or
+    /// `Some(Ok/Err)` if it does.
+    fn try_parse_dash_ipv6(token: &str) -> Option<Result<Self, InviteLinkError>> {
+        // Split off optional _port suffix
+        let (addr_part, port) = if let Some((a, p)) = token.rsplit_once('_') {
+            match p.parse::<u16>() {
+                Ok(port) => (a, port),
+                Err(_) => (token, DEFAULT_PORT),
+            }
+        } else {
+            (token, DEFAULT_PORT)
+        };
+
+        let groups: Vec<&str> = addr_part.split('-').collect();
+        if groups.len() != 8 {
+            return None;
+        }
+
+        let mut segments = [0u16; 8];
+        for (i, g) in groups.iter().enumerate() {
+            if g.len() != 4 {
+                return None;
+            }
+            match u16::from_str_radix(g, 16) {
+                Ok(v) => segments[i] = v,
+                Err(_) => return None,
+            }
+        }
+
+        let ip = Ipv6Addr::new(
+            segments[0], segments[1], segments[2], segments[3],
+            segments[4], segments[5], segments[6], segments[7],
+        );
+        Some(Ok(BootstrapAddress::Ipv6 { ip, port }))
     }
 }
 
@@ -218,8 +283,10 @@ pub enum InviteLinkError {
 // Device-link invite:
 //   topo://link/v4/device_link/INVITE_ID.<hex64>/INVITE_PRIVKEY.<hex64>/WORKSPACE.<hex64>/USER_ID.<hex64>/PEER_SPKI_PUBKEY.<hex64>/ADDRESS.<a1>,<a2>
 //
-// Address tokens use the same display format as to_bootstrap_addr_string
-// (port omitted when default 4433, IPv6 bracketed).
+// Address tokens: port omitted when default 4433.  IPv6 is fully expanded
+// as 8 dash-separated groups of 4 hex digits (no brackets) to stay
+// shell-safe and linkifiable.  Non-default port uses `_port` suffix.
+// Example: 2601-0645-8881-1d40-0216-3eff-fe8c-0d03_7443
 // ---------------------------------------------------------------------------
 
 pub fn create_invite_link(
@@ -549,12 +616,39 @@ mod tests {
             port: 4433,
         }];
         let link = create_invite_link(&invite, &addrs, &bootstrap_spki).unwrap();
+        // Link should NOT contain brackets
+        assert!(!link.contains('['));
+        assert!(!link.contains(']'));
+        // Should contain dash-separated expanded IPv6
+        assert!(link.contains("2001-4860-4860-0000-0000-0000-0000-8888"));
         let parsed = parse_invite_link(&link).unwrap();
         assert_eq!(parsed.bootstrap_addrs, addrs);
+        // Display strings still use standard bracket notation
         assert_eq!(
             parsed.bootstrap_addr_strings(),
             vec!["[2001:4860:4860::8888]"]
         );
+    }
+
+    #[test]
+    fn test_ipv6_non_default_port_roundtrip() {
+        let invite = InviteData {
+            invite_event_id: [15u8; 32],
+            invite_key: SigningKey::from_bytes(&[16u8; 32]),
+            workspace_id: [17u8; 32],
+            invite_type: InviteType::User,
+        };
+        let bootstrap_spki = [18u8; 32];
+        let addrs = vec![BootstrapAddress::Ipv6 {
+            ip: "::1".parse().unwrap(),
+            port: 7443,
+        }];
+        let link = create_invite_link(&invite, &addrs, &bootstrap_spki).unwrap();
+        assert!(!link.contains('['));
+        assert!(!link.contains(']'));
+        assert!(link.contains("0000-0000-0000-0000-0000-0000-0000-0001_7443"));
+        let parsed = parse_invite_link(&link).unwrap();
+        assert_eq!(parsed.bootstrap_addrs, addrs);
     }
 
     #[test]
@@ -730,5 +824,20 @@ mod tests {
         assert!(!link.contains(' '));
         // No base64 padding characters
         assert!(!link.contains('='));
+        // No shell-problematic characters
+        assert!(!link.contains('['));
+        assert!(!link.contains(']'));
+        assert!(!link.contains('('));
+        assert!(!link.contains(')'));
+        assert!(!link.contains('$'));
+        assert!(!link.contains('!'));
+        assert!(!link.contains('&'));
+        assert!(!link.contains('|'));
+        assert!(!link.contains(';'));
+        assert!(!link.contains('*'));
+        assert!(!link.contains('?'));
+        assert!(!link.contains('~'));
+        assert!(!link.contains('{'));
+        assert!(!link.contains('}'));
     }
 }
