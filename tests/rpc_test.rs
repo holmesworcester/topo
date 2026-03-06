@@ -589,29 +589,37 @@ fn daemon_start_on_empty_db_reports_idle_runtime_state() {
 }
 
 #[test]
-fn upnp_on_empty_daemon_requires_workspace() {
+fn upnp_on_empty_daemon_works_without_workspace() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
 
+    // Use a fixed port so bind_addr is resolved early (port 0 is deferred
+    // to the runtime since the OS-assigned port isn't known until bind).
     let mut daemon = DaemonGuard::new(
         Command::new(bin())
-            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:14433"])
             .spawn()
             .unwrap(),
     );
     wait_for_socket(&socket);
     let _ = wait_for_runtime_state(&socket, "IdleNoTenants", Duration::from_secs(10));
 
+    // UPnP should succeed (return ok) even without a workspace.
+    // On loopback it reports "not_attempted" but does not error.
     let out = Command::new(bin())
         .args(["--db", &db, "upnp"])
         .output()
         .unwrap();
-    assert!(!out.status.success(), "upnp should fail on empty daemon");
-    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
-        stderr.contains("join or create a workspace before running upnp"),
-        "expected workspace guidance in stderr, got: {}",
-        stderr
+        out.status.success(),
+        "upnp should succeed on empty daemon, got stderr: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(
+        stdout.contains("not attempted") || stdout.contains("success") || stdout.contains("failed"),
+        "expected a UPnP status report, got: {}",
+        stdout
     );
 
     stop_daemon(&db, &mut daemon);

@@ -57,6 +57,12 @@ pub struct DaemonState {
     /// Runtime networking info (listen addr, UPnP result). Set once the
     /// QUIC endpoint is bound; UPnP result is populated by `topo upnp`.
     pub runtime_net: RwLock<Option<NodeRuntimeNetInfo>>,
+    /// The daemon's resolved bind address, set early at daemon start before
+    /// any tenants exist. UPnP can use this without waiting for the runtime.
+    pub bind_addr: RwLock<Option<std::net::SocketAddr>>,
+    /// UPnP result stored independently of the runtime so it survives runtime
+    /// restarts and can be populated before any tenant exists.
+    pub upnp_result: RwLock<Option<crate::peering::nat::upnp::UpnpMappingReport>>,
     /// Wake-up trigger for runtime state reevaluation after tenant-changing commands.
     pub runtime_recheck: Notify,
     /// Invite/link strings stored by number (index+1 = invite ref number).
@@ -98,6 +104,8 @@ impl DaemonState {
             // Runtime manager owns lifecycle transitions.
             runtime_state: RwLock::new(RuntimeState::IdleNoTenants),
             runtime_net: RwLock::new(None),
+            bind_addr: RwLock::new(None),
+            upnp_result: RwLock::new(None),
             runtime_recheck: Notify::new(),
             invite_refs: RwLock::new(Vec::new()),
         }
@@ -602,6 +610,46 @@ fn dispatch(
                         json["runtime"] = net_val;
                     }
                 }
+                // When the runtime isn't active, synthesize a minimal "runtime"
+                // block from early-bound listen addr and daemon-level UPnP result
+                // so that `topo status` always shows networking info.
+                if json.get("runtime").is_none() {
+                    let bind = state.bind_addr.read().unwrap();
+                    let upnp = state.upnp_result.read().unwrap();
+                    if bind.is_some() || upnp.is_some() {
+                        let mut rt = serde_json::Map::new();
+                        if let Some(addr) = *bind {
+                            rt.insert(
+                                "listen_addr".into(),
+                                serde_json::Value::String(addr.to_string()),
+                            );
+                        }
+                        if let Some(ref report) = *upnp {
+                            if let Ok(v) = serde_json::to_value(report) {
+                                rt.insert("upnp".into(), v);
+                            }
+                        }
+                        json["runtime"] = serde_json::Value::Object(rt);
+                    }
+                } else if let Some(rt) = json.get_mut("runtime") {
+                    // Runtime is active but UPnP might only be in daemon-level state
+                    // (e.g. if UPnP was run before the runtime started).
+                    // Only inject if the port matches the current listen address.
+                    if rt.get("upnp").is_none() {
+                        if let Some(ref report) = *state.upnp_result.read().unwrap() {
+                            let port_matches = rt["listen_addr"]
+                                .as_str()
+                                .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
+                                .map(|a| a.port() == report.requested_external_port)
+                                .unwrap_or(false);
+                            if port_matches {
+                                if let Ok(v) = serde_json::to_value(report) {
+                                    rt["upnp"] = v;
+                                }
+                            }
+                        }
+                    }
+                }
                 RpcResponse {
                     version: crate::rpc::protocol::PROTOCOL_VERSION,
                     ok: true,
@@ -742,42 +790,48 @@ fn dispatch(
             }
         }
         RpcMethod::Upnp => {
-            let net_info = state.runtime_net.read().unwrap().clone();
-            match net_info {
-                None => {
-                    let runtime_state = *state.runtime_state.read().unwrap();
-                    if runtime_state == RuntimeState::IdleNoTenants {
-                        RpcResponse::error("must join or create a workspace before running upnp")
-                    } else {
-                        RpcResponse::error("daemon not ready — listen address not yet known")
-                    }
-                }
-                Some(info) => {
-                    let listen_addr: std::net::SocketAddr = match info.listen_addr.parse() {
+            // UPnP only needs the listen address, not the full runtime.
+            // Prefer runtime_net (actual bound address) when available;
+            // fall back to bind_addr (early-resolved) when no runtime is active.
+            let listen_addr: std::net::SocketAddr = {
+                if let Some(ref info) = *state.runtime_net.read().unwrap() {
+                    match info.listen_addr.parse() {
                         Ok(a) => a,
                         Err(e) => return RpcResponse::error(format!("invalid listen addr: {}", e)),
-                    };
-                    let rt = match tokio::runtime::Builder::new_current_thread()
-                        .enable_all()
-                        .build()
-                    {
-                        Ok(rt) => rt,
-                        Err(e) => {
-                            return RpcResponse::error(format!("failed to start runtime: {}", e))
-                        }
-                    };
-                    let report = rt.block_on(crate::peering::nat::upnp::attempt_udp_port_mapping(
-                        listen_addr,
-                        std::time::Duration::from_secs(10),
-                    ));
-                    // Store result in daemon state.
-                    let mut net = state.runtime_net.write().unwrap();
-                    if let Some(ref mut ni) = *net {
-                        ni.upnp = Some(report.clone());
                     }
-                    RpcResponse::success(report)
+                } else if let Some(addr) = *state.bind_addr.read().unwrap() {
+                    addr
+                } else {
+                    return RpcResponse::error("daemon not ready — listen address not yet known");
+                }
+            };
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => {
+                    return RpcResponse::error(format!("failed to start runtime: {}", e))
+                }
+            };
+            let report = rt.block_on(crate::peering::nat::upnp::attempt_udp_port_mapping(
+                listen_addr,
+                std::time::Duration::from_secs(10),
+            ));
+            // Store result in daemon-level state.
+            *state.upnp_result.write().unwrap() = Some(report.clone());
+            // Propagate to runtime_net only if ports match (runtime may have
+            // restarted on a different port since UPnP began).
+            if let Some(ref mut ni) = *state.runtime_net.write().unwrap() {
+                let runtime_port = ni.listen_addr
+                    .parse::<std::net::SocketAddr>()
+                    .map(|a| a.port())
+                    .unwrap_or(0);
+                if runtime_port == listen_addr.port() {
+                    ni.upnp = Some(report.clone());
                 }
             }
+            RpcResponse::success(report)
         }
         RpcMethod::CreateDeviceLink {
             public_addr,

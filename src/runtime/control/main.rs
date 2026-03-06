@@ -715,8 +715,10 @@ fn spawn_runtime(
     tenants: Vec<String>,
 ) -> ManagedRuntime {
     // Runtime is Active only after listen_addr is reported.
+    // Clear stale UPnP result — the port may change across restarts.
     *state.runtime_state.write().unwrap() = RuntimeState::IdleNoTenants;
     *state.runtime_net.write().unwrap() = None;
+    *state.upnp_result.write().unwrap() = None;
 
     let runtime_shutdown = Arc::new(tokio::sync::Notify::new());
     let runtime_shutdown_for_task = runtime_shutdown.clone();
@@ -725,8 +727,21 @@ fn spawn_runtime(
     let (net_tx, net_rx) = tokio::sync::oneshot::channel::<topo::node::NodeRuntimeNetInfo>();
     let state_for_net = state.clone();
     tokio::spawn(async move {
-        if let Ok(info) = net_rx.await {
+        if let Ok(mut info) = net_rx.await {
             println!("listen: {}", info.listen_addr);
+            // Carry forward daemon-level UPnP result only if the port matches.
+            if info.upnp.is_none() {
+                let prior = state_for_net.upnp_result.read().unwrap().clone();
+                if let Some(ref report) = prior {
+                    if report.requested_external_port == info.listen_addr
+                        .parse::<std::net::SocketAddr>()
+                        .map(|a| a.port())
+                        .unwrap_or(0)
+                    {
+                        info.upnp = prior;
+                    }
+                }
+            }
             *state_for_net.runtime_net.write().unwrap() = Some(info);
             *state_for_net.runtime_state.write().unwrap() = RuntimeState::Active;
         }
@@ -881,9 +896,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 create_tables(&conn)?;
             }
 
+            // Record the bind address early so UPnP can run before any tenants
+            // exist.  Only useful for fixed ports — with port 0 the real port
+            // is unknown until the QUIC runtime binds, so we leave it as None.
+            let resolved_bind: Option<SocketAddr> = if bind.port() != 0 {
+                Some(bind)
+            } else {
+                None
+            };
+
             let shutdown = Arc::new(AtomicBool::new(false));
             let shutdown_notify = Arc::new(tokio::sync::Notify::new());
             let state = Arc::new(DaemonState::new(db));
+            *state.bind_addr.write().unwrap() = resolved_bind;
 
             // Start RPC server in a background thread
             let rpc_shutdown = shutdown.clone();

@@ -835,6 +835,58 @@ pub fn accept_invite_lightweight(db: &str, invite_link: &str) {
     accept_invite_with_identity(db, invite_link, "user", "device");
 }
 
+/// Send a file via daemon RPC. Returns the event ID.
+pub fn send_file(db: &str, content: &str, file_path: &str) -> String {
+    ensure_active_peer(db, Duration::from_secs(10));
+    let start = Instant::now();
+    loop {
+        let output = Command::new(bin())
+            .arg("--db")
+            .arg(db)
+            .arg("send-file")
+            .arg(content)
+            .arg("--file")
+            .arg(file_path)
+            .output()
+            .expect("failed to run send-file");
+        if output.status.success() {
+            let stdout = String::from_utf8_lossy(&output.stdout);
+            return stdout
+                .lines()
+                .find_map(|line| line.strip_prefix("event_id:"))
+                .expect("send-file output missing event_id: line")
+                .to_string();
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+        let retryable = stderr.contains("no identity")
+            || stderr.contains("no active tenant")
+            || stderr.contains("blocked on");
+        if retryable && start.elapsed() < Duration::from_secs(20) {
+            if stderr.contains("no active tenant") {
+                ensure_active_peer(db, Duration::from_secs(5));
+            }
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        panic!("send-file failed for db={}: {}", db, stderr);
+    }
+}
+
+/// Save a received file to disk via daemon RPC.
+pub fn save_file(db: &str, file_target: &str, output_path: &str) -> Output {
+    Command::new(bin())
+        .arg("--db")
+        .arg(db)
+        .arg("save-file")
+        .arg("--target")
+        .arg(file_target)
+        .arg("--out")
+        .arg(output_path)
+        .output()
+        .expect("failed to run save-file")
+}
+
 /// Return `topo assert-eventually` output without asserting success.
 pub fn topo_assert_eventually(db: &str, predicate: &str, timeout_ms: u64) -> Output {
     topo_cmd(
