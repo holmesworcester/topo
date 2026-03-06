@@ -454,8 +454,35 @@ fn dispatch(
                     if ap.is_none() {
                         *ap = Some(resp.peer_id.clone());
                     }
+                    drop(ap);
                     state.notify_runtime_recheck();
-                    RpcResponse::success(resp)
+
+                    // Auto-create an invite with detected IPs
+                    let listen_port = state
+                        .runtime_net
+                        .read()
+                        .unwrap()
+                        .as_ref()
+                        .and_then(|ni| ni.listen_addr.parse::<std::net::SocketAddr>().ok())
+                        .map(|sa| sa.port())
+                        .unwrap_or(crate::event_modules::workspace::invite_link::DEFAULT_PORT);
+                    let mut resp_json = serde_json::to_value(&resp).unwrap();
+                    match workspace::commands::create_invite_for_db(db_path, &[], listen_port) {
+                        Ok(invite) => {
+                            if let Some(link) = serde_json::to_value(&invite)
+                                .ok()
+                                .and_then(|v| v["invite_link"].as_str().map(|s| s.to_string()))
+                            {
+                                let num = state.add_invite_ref(link);
+                                resp_json["invite_link"] = serde_json::json!(invite.invite_link);
+                                resp_json["invite_ref"] = serde_json::json!(num);
+                            }
+                        }
+                        Err(e) => {
+                            resp_json["invite_error"] = serde_json::json!(e.to_string());
+                        }
+                    }
+                    RpcResponse::success(resp_json)
                 }
                 Err(e) => RpcResponse::error(e.to_string()),
             }
