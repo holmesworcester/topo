@@ -2476,8 +2476,13 @@ fn print_sync_log_config(cfg: &sync_log::SyncLogConfig) {
     );
 }
 
-fn short_peer_hex(peer: &str) -> &str {
-    &peer[..peer.len().min(16)]
+fn short_sync_id(raw: &str) -> String {
+    let prefix = &raw[..raw.len().min(4)];
+    if raw.len() > 4 {
+        format!("{}...", prefix)
+    } else {
+        prefix.to_string()
+    }
 }
 
 fn run_status(run: &sync_log::SyncRunRow) -> &'static str {
@@ -2490,15 +2495,11 @@ fn run_status(run: &sync_log::SyncRunRow) -> &'static str {
     }
 }
 
-fn short_hex_owned(hex: &str) -> String {
-    hex.chars().take(16).collect()
-}
-
 fn event_id_prefix_from_detail_json(detail_json: Option<&str>) -> Option<String> {
     let raw = detail_json?;
     let v = serde_json::from_str::<serde_json::Value>(raw).ok()?;
     let eid = v.get("event_id")?.as_str()?;
-    Some(short_hex_owned(eid))
+    Some(short_sync_id(eid))
 }
 
 fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> String {
@@ -2534,18 +2535,27 @@ fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> S
                 .map(|arr| {
                     arr.iter()
                         .filter_map(|x| x.as_str())
-                        .map(|s| short_peer_hex(s).to_string())
+                        .map(short_sync_id)
                         .collect::<Vec<_>>()
-                        .join(",")
                 })
                 .unwrap_or_default();
             let truncated = v["ids_truncated"].as_bool().unwrap_or(false);
             if ids.is_empty() {
                 format!(" detail=ids(count={} truncated={})", count, truncated)
             } else {
+                let shown = ids.join(",");
+                let shown_count = ids.len() as u64;
+                let more = count.saturating_sub(shown_count);
+                let extra = if more > 0 {
+                    format!(" (+{} more)", more)
+                } else if truncated {
+                    " ...".to_string()
+                } else {
+                    String::new()
+                };
                 format!(
-                    " detail=ids(count={} truncated={} sample=[{}])",
-                    count, truncated, ids
+                    " detail=ids(count={} truncated={} ids=[{}]{})",
+                    count, truncated, shown, extra
                 )
             }
         }
@@ -2557,7 +2567,7 @@ fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> S
             } else {
                 format!(
                     " detail=event(id={} blob_len={})",
-                    short_peer_hex(eid),
+                    short_sync_id(eid),
                     blob_len
                 )
             }
@@ -2566,85 +2576,141 @@ fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> S
     }
 }
 
-fn neg_range_lines(frame_type: &str, detail_json: Option<&str>) -> Vec<String> {
-    if frame_type != "NegOpen" && frame_type != "NegMsg" {
-        return Vec::new();
-    }
-    let Some(raw) = detail_json else {
-        return Vec::new();
-    };
-    let Ok(v) = serde_json::from_str::<serde_json::Value>(raw) else {
-        return vec!["range parse_error".to_string()];
-    };
+#[derive(Debug, Clone)]
+struct NegEntryView {
+    bound_ts: String,
+    bound_id_prefix: String,
+    mode: String,
+    fingerprint_hex: Option<String>,
+    id_count: Option<u64>,
+    ids: Vec<String>,
+    ids_truncated: bool,
+}
 
-    let mut out = Vec::new();
-    if let Some(protocol) = v["protocol"].as_u64() {
-        out.push(format!("neg protocol={}", protocol));
-    }
+#[derive(Debug, Clone)]
+struct NegFrameView {
+    protocol: Option<u64>,
+    entry_count: u64,
+    skip_count: u64,
+    fingerprint_count: u64,
+    idlist_count: u64,
+    entries: Vec<NegEntryView>,
+    parse_error: Option<String>,
+}
 
-    let Some(entries) = v["entries"].as_array() else {
-        if let Some(err) = v["parse_error"].as_str() {
-            out.push(format!("parse_error={}", err));
-        }
-        return out;
-    };
+fn parse_neg_frame_view(detail_json: Option<&str>) -> Option<NegFrameView> {
+    let raw = detail_json?;
+    let v = serde_json::from_str::<serde_json::Value>(raw).ok()?;
 
-    for (idx, entry) in entries.iter().enumerate() {
-        let bound_ts = entry["bound_ts"].as_str().unwrap_or("?");
-        let bound_id = entry["bound_id_prefix"].as_str().unwrap_or("");
-        let mode = entry["mode"].as_str().unwrap_or("?");
-        let mut line = format!(
-            "range[{}] bound=({}, {}) mode={}",
-            idx + 1,
-            bound_ts,
-            short_peer_hex(bound_id),
-            mode
-        );
-
-        if mode == "Fingerprint" {
-            if let Some(fp) = entry["fingerprint_hex"].as_str() {
-                line.push_str(&format!(" fp={}", short_peer_hex(fp)));
-            }
-        } else if mode == "IdList" {
-            let id_count = entry["id_count"].as_u64().unwrap_or(0);
-            let ids_truncated = entry["ids_truncated"].as_bool().unwrap_or(false);
-            let ids = entry["ids"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|x| x.as_str())
-                        .map(short_hex_owned)
-                        .collect::<Vec<_>>()
+    let entries = v["entries"]
+        .as_array()
+        .map(|arr| {
+            arr.iter()
+                .map(|entry| {
+                    let ids = entry["ids"]
+                        .as_array()
+                        .map(|ids_arr| {
+                            ids_arr
+                                .iter()
+                                .filter_map(|x| x.as_str())
+                                .map(|s| s.to_string())
+                                .collect::<Vec<_>>()
+                        })
+                        .unwrap_or_default();
+                    NegEntryView {
+                        bound_ts: entry["bound_ts"].as_str().unwrap_or("?").to_string(),
+                        bound_id_prefix: entry["bound_id_prefix"]
+                            .as_str()
+                            .unwrap_or("")
+                            .to_string(),
+                        mode: entry["mode"].as_str().unwrap_or("?").to_string(),
+                        fingerprint_hex: entry["fingerprint_hex"].as_str().map(|s| s.to_string()),
+                        id_count: entry["id_count"].as_u64(),
+                        ids,
+                        ids_truncated: entry["ids_truncated"].as_bool().unwrap_or(false),
+                    }
                 })
-                .unwrap_or_default();
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+
+    Some(NegFrameView {
+        protocol: v["protocol"].as_u64(),
+        entry_count: v["entry_count"].as_u64().unwrap_or(0),
+        skip_count: v["skip_count"].as_u64().unwrap_or(0),
+        fingerprint_count: v["fingerprint_count"].as_u64().unwrap_or(0),
+        idlist_count: v["idlist_count"].as_u64().unwrap_or(0),
+        entries,
+        parse_error: v["parse_error"].as_str().map(|s| s.to_string()),
+    })
+}
+
+fn neg_entry_depth_hint(prefix_hex: &str) -> usize {
+    let bytes = prefix_hex.len() / 2;
+    if bytes <= 1 {
+        0
+    } else if bytes <= 3 {
+        1
+    } else if bytes <= 7 {
+        2
+    } else {
+        3
+    }
+}
+
+fn neg_entry_readable_line(round_no: usize, entry_idx: usize, entry: &NegEntryView) -> String {
+    let bound_prefix = short_sync_id(&entry.bound_id_prefix);
+    let bound = if bound_prefix.is_empty() {
+        format!("({})", entry.bound_ts)
+    } else {
+        format!("({}, {})", entry.bound_ts, bound_prefix)
+    };
+    let range_label = format!("{}.{}", round_no, entry_idx + 1);
+    match entry.mode.as_str() {
+        "Skip" => format!("range={} MATCH bound={}", range_label, bound),
+        "Fingerprint" => {
+            let fp = entry
+                .fingerprint_hex
+                .as_deref()
+                .map(short_sync_id)
+                .unwrap_or_else(|| "?".to_string());
+            format!(
+                "range={} HASH bound={} fp={} (await compare)",
+                range_label, bound, fp
+            )
+        }
+        "IdList" => {
+            let count = entry.id_count.unwrap_or(0);
+            let ids = entry
+                .ids
+                .iter()
+                .take(4)
+                .map(|id| short_sync_id(id))
+                .collect::<Vec<_>>()
+                .join(",");
             if ids.is_empty() {
-                line.push_str(&format!(
-                    " ids(count={} truncated={})",
-                    id_count, ids_truncated
-                ));
+                format!(
+                    "range={} MISMATCH -> IdList count={} truncated={}",
+                    range_label, count, entry.ids_truncated
+                )
             } else {
-                let more = if id_count as usize > ids.len() {
-                    ",..."
+                let shown = entry.ids.len().min(4) as u64;
+                let more_count = count.saturating_sub(shown);
+                let more = if more_count > 0 {
+                    format!(" (+{} more)", more_count)
+                } else if entry.ids_truncated {
+                    " ...".to_string()
                 } else {
-                    ""
+                    String::new()
                 };
-                line.push_str(&format!(
-                    " ids(count={} truncated={} sample=[{}{}])",
-                    id_count,
-                    ids_truncated,
-                    ids.join(","),
-                    more
-                ));
+                format!(
+                    "range={} MISMATCH -> IdList count={} ids=[{}]{} truncated={}",
+                    range_label, count, ids, more, entry.ids_truncated
+                )
             }
         }
-
-        out.push(line);
+        other => format!("range={} {} bound={}", range_label, other, bound),
     }
-
-    if let Some(err) = v["parse_error"].as_str() {
-        out.push(format!("parse_error={}", err));
-    }
-    out
 }
 
 #[derive(Debug, Clone)]
@@ -2658,7 +2724,7 @@ struct RenderedFrameLine {
     frame_type: String,
     len_label: String,
     detail: String,
-    range_lines: Vec<String>,
+    detail_json: Option<String>,
 }
 
 impl RenderedFrameLine {
@@ -2728,9 +2794,14 @@ fn render_frame_lines(
                 let detail = if ids.is_empty() {
                     format!(" detail=events(count={})", burst.len())
                 } else {
-                    let more = if burst.len() > ids.len() { ",..." } else { "" };
+                    let more_count = burst.len().saturating_sub(ids.len());
+                    let more = if more_count > 0 {
+                        format!(" (+{} more)", more_count)
+                    } else {
+                        String::new()
+                    };
                     format!(
-                        " detail=events(count={} sample=[{}{}])",
+                        " detail=events(count={} ids=[{}]{})",
                         burst.len(),
                         ids.join(","),
                         more
@@ -2752,7 +2823,7 @@ fn render_frame_lines(
                         burst.len()
                     ),
                     detail,
-                    range_lines: Vec::new(),
+                    detail_json: None,
                 });
                 i = j;
                 continue;
@@ -2769,7 +2840,7 @@ fn render_frame_lines(
             frame_type: ev.frame_type.clone(),
             len_label: ev.msg_len.to_string(),
             detail: summarize_sync_event_detail(&ev.frame_type, ev.detail_json.as_deref()),
-            range_lines: neg_range_lines(&ev.frame_type, ev.detail_json.as_deref()),
+            detail_json: ev.detail_json.clone(),
         });
         i += 1;
     }
@@ -2786,8 +2857,8 @@ fn print_sync_trace_run(run: &sync_log::SyncRunRow, events: &[sync_log::SyncRunE
         run.run_id,
         status,
         run.session_id,
-        short_peer_hex(&run.tenant_id),
-        short_peer_hex(&run.peer_id),
+        short_sync_id(&run.tenant_id),
+        short_sync_id(&run.peer_id),
         run.direction,
         run.role,
         run.remote_addr,
@@ -2860,8 +2931,8 @@ fn print_sync_tree_groups(groups: &[PeerSyncTreeGroup]) {
             .filter(|(run, _)| run_status(run) == "error")
             .count();
         println!(
-            "peer {} runs={} changed={} errors={}",
-            short_peer_hex(&group.peer_id),
+            "peer={} runs={} changed={} errors={}",
+            short_sync_id(&group.peer_id),
             group.runs.len(),
             changed,
             errors
@@ -2881,12 +2952,14 @@ fn print_sync_tree_groups(groups: &[PeerSyncTreeGroup]) {
             let status = run_status(run);
             let dt = run.ended_at_ms.saturating_sub(run.started_at_ms);
             let frame_lines = render_frame_lines(run, events);
+            let mut prev_neg_entry_count: Option<u64> = None;
+            let mut neg_round_no: usize = 0;
             println!(
-                "{} run {} [{}] end={} dir={} role={} sync_rounds={} sync_events_tx={} sync_events_rx={} dur_ms={} raw_frames={} frame_lines={} outcome={}",
+            "{} run={} status={} ended_at={} direction={} role={} sync_rounds={} sync_events_tx={} sync_events_rx={} dur_ms={} raw_frames={} frame_lines={} outcome={}",
                 run_branch,
                 run.run_id,
                 status,
-                format_absolute(run.ended_at_ms),
+                format_compact_datetime(run.ended_at_ms),
                 run.direction,
                 run.role,
                 run.rounds,
@@ -2924,8 +2997,58 @@ fn print_sync_tree_groups(groups: &[PeerSyncTreeGroup]) {
                     line.len_label,
                     line.detail
                 );
-                for range in &line.range_lines {
-                    println!("{}  │    {}", run_pad, range);
+
+                if (line.frame_type == "NegOpen" || line.frame_type == "NegMsg")
+                    && line.detail_json.is_some()
+                {
+                    neg_round_no += 1;
+                    if let Some(neg) = parse_neg_frame_view(line.detail_json.as_deref()) {
+                        let child_stem = if event_idx + 1 == frame_lines.len() {
+                            "  "
+                        } else {
+                            "│ "
+                        };
+                        let drilldown = prev_neg_entry_count
+                            .filter(|prev| neg.entry_count > *prev)
+                            .map(|prev| format!(" drilldown={}->{}", prev, neg.entry_count))
+                            .unwrap_or_default();
+                        println!(
+                            "{}  {}    reconcile round={} protocol={} ranges={} hash_match(skip)={} hash_probe(fp)={} idlists={}{}",
+                            run_pad,
+                            child_stem,
+                            neg_round_no,
+                            neg.protocol
+                                .map(|p| p.to_string())
+                                .unwrap_or_else(|| "?".to_string()),
+                            neg.entry_count,
+                            neg.skip_count,
+                            neg.fingerprint_count,
+                            neg.idlist_count,
+                            drilldown
+                        );
+                        if let Some(err) = &neg.parse_error {
+                            println!("{}  {}    parse_error={}", run_pad, child_stem, err);
+                        }
+
+                        const MAX_RANGE_LINES: usize = 10;
+                        for (entry_idx, entry) in neg.entries.iter().enumerate() {
+                            if entry_idx >= MAX_RANGE_LINES {
+                                let rem = neg.entries.len() - MAX_RANGE_LINES;
+                                println!("{}  {}    (+{} more ranges)", run_pad, child_stem, rem);
+                                break;
+                            }
+                            let depth = neg_entry_depth_hint(&entry.bound_id_prefix);
+                            let depth_pad = "  ".repeat(depth);
+                            println!(
+                                "{}  {}    {}{}",
+                                run_pad,
+                                child_stem,
+                                depth_pad,
+                                neg_entry_readable_line(neg_round_no, entry_idx, entry)
+                            );
+                        }
+                        prev_neg_entry_count = Some(neg.entry_count);
+                    }
                 }
             }
         }
@@ -3006,6 +3129,24 @@ fn format_absolute(ms: i64) -> String {
         _ => "???",
     };
     format!("{} {} {:02}:{:02}", month_name, day, hours, minutes)
+}
+
+fn format_compact_datetime(ms: i64) -> String {
+    use std::time::{Duration, UNIX_EPOCH};
+    let dt = UNIX_EPOCH + Duration::from_millis(ms as u64);
+    let total_secs = dt.duration_since(UNIX_EPOCH).unwrap().as_secs();
+    let days_since_epoch = total_secs / 86_400;
+    let time_of_day = total_secs % 86_400;
+    let hours = time_of_day / 3_600;
+    let minutes = (time_of_day % 3_600) / 60;
+    let seconds = time_of_day % 60;
+    let millis = (ms.rem_euclid(1000)) as u32;
+
+    let (year, month, day) = days_to_ymd(days_since_epoch as i64);
+    format!(
+        "{:04}-{:02}-{:02} {:02}:{:02}:{:02}.{:03}",
+        year, month, day, hours, minutes, seconds, millis
+    )
 }
 
 fn days_to_ymd(days: i64) -> (i64, u32, u32) {
