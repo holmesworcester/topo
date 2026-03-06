@@ -1,6 +1,8 @@
+use std::io::{self, IsTerminal};
 use std::net::SocketAddr;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 use std::os::unix::process::CommandExt;
+use std::path::Path;
 use std::path::PathBuf;
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 use std::process::Command;
@@ -204,7 +206,7 @@ enum Commands {
     SendFile {
         /// Message content
         content: String,
-        /// Path to file to attach (generates a placeholder if omitted)
+        /// Path to file to attach (reads from stdin or uses placeholder if omitted)
         #[arg(long)]
         file: Option<String>,
         /// Client operation ID for local-echo reconciliation
@@ -216,8 +218,11 @@ enum Commands {
     #[command(name = "save-file")]
     SaveFile {
         /// File target: number (N or #N from `topo files`) or file event ID (hex)
-        #[arg(long)]
-        target: String,
+        /// Defaults to "1" when omitted.
+        target: Option<String>,
+        /// Explicit file target selector (same semantics as positional target)
+        #[arg(long = "target")]
+        target_flag: Option<String>,
         /// Output path
         #[arg(long)]
         out: String,
@@ -678,6 +683,48 @@ fn resolve_db_arg(raw: &str) -> Result<String, String> {
     }
     // For non-numeric selectors, resolve returns passthrough on miss, so this is fine.
     Ok(registry.resolve(raw).unwrap_or_else(|_| raw.to_string()))
+}
+
+fn resolve_send_file_path(
+    file: Option<String>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let mut candidate = file
+        .map(|path| path.trim().to_string())
+        .filter(|p| !p.is_empty());
+
+    // Optional convenience: when --file is omitted, accept a path from piped stdin.
+    if candidate.is_none() && !io::stdin().is_terminal() {
+        let mut buf = String::new();
+        io::stdin().read_line(&mut buf)?;
+        let trimmed = buf.trim();
+        if !trimmed.is_empty() {
+            candidate = Some(trimmed.to_string());
+        }
+    }
+
+    match candidate {
+        Some(path) => {
+            let input = Path::new(&path);
+            let abs = if input.is_absolute() {
+                input.to_path_buf()
+            } else {
+                std::env::current_dir()?.join(input)
+            };
+            if !abs.exists() {
+                return Err(format!("file does not exist: {}", abs.display()).into());
+            }
+            if !abs.is_file() {
+                return Err(format!("path is not a file: {}", abs.display()).into());
+            }
+            Ok(abs.to_string_lossy().to_string())
+        }
+        None => {
+            let tmp = std::env::temp_dir().join("topo-placeholder.txt");
+            std::fs::write(&tmp, "placeholder file\n")
+                .map_err(|e| format!("failed to create placeholder: {}", e))?;
+            Ok(tmp.to_string_lossy().to_string())
+        }
+    }
 }
 
 struct ManagedRuntime {
@@ -1216,15 +1263,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             file,
             client_op_id,
         } => {
-            let file_path = match file {
-                Some(f) => f,
-                None => {
-                    let tmp = std::env::temp_dir().join("topo-placeholder.txt");
-                    std::fs::write(&tmp, "placeholder file\n")
-                        .map_err(|e| format!("failed to create placeholder: {}", e))?;
-                    tmp.to_string_lossy().to_string()
-                }
-            };
+            let file_path = resolve_send_file_path(file)?;
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),
@@ -1242,7 +1281,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("event_id:{}", event_id);
         }
 
-        Commands::SaveFile { target, out } => {
+        Commands::SaveFile {
+            target,
+            target_flag,
+            out,
+        } => {
+            let target = target_flag.or(target).unwrap_or_else(|| "1".to_string());
             let data = rpc_require_daemon(
                 db,
                 socket_override.as_deref(),

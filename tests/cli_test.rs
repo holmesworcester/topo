@@ -14,6 +14,7 @@
 mod cli_harness;
 
 use cli_harness::*;
+use std::io::Write;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -819,6 +820,144 @@ fn test_cli_send_file_and_messages_display() {
         "local attachment should show checkmark (complete), got:\n{}",
         raw
     );
+}
+
+#[test]
+fn test_cli_send_file_accepts_path_from_stdin_when_flag_omitted() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("sendfile_stdin.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let file_path = tmpdir.path().join("stdin-notes.txt");
+    std::fs::write(&file_path, "attachment via stdin path\n").unwrap();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    let mut child = Command::new(bin())
+        .args(["--db", &db, "send-file", "stdin attachment"])
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn send-file");
+    child
+        .stdin
+        .as_mut()
+        .expect("send-file stdin should be piped")
+        .write_all(format!("{}\n", file_path.display()).as_bytes())
+        .expect("write file path to send-file stdin");
+
+    let out = child.wait_with_output().expect("wait for send-file");
+    assert!(
+        out.status.success(),
+        "send-file failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("stdin-notes.txt"),
+        "send-file output should show filename, got: {}",
+        stdout
+    );
+}
+
+#[test]
+fn test_cli_send_file_without_path_uses_placeholder_and_save_file_defaults_target() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("sendfile_placeholder.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    let send_out = Command::new(bin())
+        .args(["--db", &db, "send-file", "missing path"])
+        .stdin(Stdio::null())
+        .output()
+        .expect("send-file");
+    assert!(
+        send_out.status.success(),
+        "send-file should fall back to placeholder when no file path is provided: {}",
+        String::from_utf8_lossy(&send_out.stderr)
+    );
+    let send_stdout = String::from_utf8_lossy(&send_out.stdout);
+    assert!(
+        send_stdout.contains("topo-placeholder.txt"),
+        "send-file should report placeholder filename, got: {}",
+        send_stdout
+    );
+
+    let positional_out = tmpdir.path().join("placeholder-positional.txt");
+    let save_positional = Command::new(bin())
+        .args([
+            "--db",
+            &db,
+            "save-file",
+            "1",
+            "--out",
+            positional_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("save-file positional target");
+    assert!(
+        save_positional.status.success(),
+        "save-file with positional target failed: {}",
+        String::from_utf8_lossy(&save_positional.stderr)
+    );
+
+    let long_flag_out = tmpdir.path().join("placeholder-long-flag.txt");
+    let save_long_flag = Command::new(bin())
+        .args([
+            "--db",
+            &db,
+            "save-file",
+            "--target",
+            "1",
+            "--out",
+            long_flag_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("save-file --target");
+    assert!(
+        save_long_flag.status.success(),
+        "save-file --target failed: {}",
+        String::from_utf8_lossy(&save_long_flag.stderr)
+    );
+
+    let default_out = tmpdir.path().join("placeholder-default.txt");
+    let save_default = Command::new(bin())
+        .args([
+            "--db",
+            &db,
+            "save-file",
+            "--out",
+            default_out.to_str().unwrap(),
+        ])
+        .output()
+        .expect("save-file default target");
+    assert!(
+        save_default.status.success(),
+        "save-file default target failed: {}",
+        String::from_utf8_lossy(&save_default.stderr)
+    );
+
+    let positional_content = std::fs::read_to_string(&positional_out).unwrap();
+    let long_flag_content = std::fs::read_to_string(&long_flag_out).unwrap();
+    let default_content = std::fs::read_to_string(&default_out).unwrap();
+    assert_eq!(positional_content, "placeholder file\n");
+    assert_eq!(long_flag_content, "placeholder file\n");
+    assert_eq!(default_content, "placeholder file\n");
 }
 
 #[test]
