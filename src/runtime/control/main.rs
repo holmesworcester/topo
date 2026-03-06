@@ -394,8 +394,19 @@ enum Commands {
         action: DbAction,
     },
 
-    /// Create a local subscription
-    #[command(name = "sub-create")]
+    /// Subscription commands
+    #[command(
+        name = "sub",
+        visible_alias = "subs",
+        after_help = "Examples:\n  topo sub create --name new-messages --event-type message\n  topo sub list\n  topo sub poll new-messages\n  topo sub state              # defaults to the only subscription\n  topo sub disable #1         # by index from `topo sub list`\n  topo sub enable <id>"
+    )]
+    Sub {
+        #[command(subcommand)]
+        action: Option<SubAction>,
+    },
+
+    /// Deprecated: use `topo sub create`
+    #[command(name = "sub-create", hide = true)]
     SubCreate {
         /// Subscription name
         #[arg(long)]
@@ -417,16 +428,18 @@ enum Commands {
         spec: Option<String>,
     },
 
-    /// List subscriptions
-    #[command(name = "sub-list")]
+    /// Deprecated: use `topo sub list`
+    #[command(name = "sub-list", hide = true)]
     SubList,
 
-    /// Poll subscription feed
-    #[command(name = "sub-poll")]
+    /// Deprecated: use `topo sub poll`
+    #[command(name = "sub-poll", hide = true)]
     SubPoll {
-        /// Subscription ID
-        #[arg(long)]
-        sub: String,
+        /// Subscription selector: id, name, or index (#N / N)
+        sub: Option<String>,
+        /// Deprecated: use positional selector instead.
+        #[arg(long = "sub", hide = true)]
+        sub_flag: Option<String>,
         /// Only return items after this seq (exclusive)
         #[arg(long, default_value = "0")]
         after_seq: i64,
@@ -438,42 +451,50 @@ enum Commands {
         json: bool,
     },
 
-    /// Get subscription state (pending count, dirty flag, cursors)
-    #[command(name = "sub-state")]
+    /// Deprecated: use `topo sub state`
+    #[command(name = "sub-state", hide = true)]
     SubState {
-        /// Subscription ID
-        #[arg(long)]
-        sub: String,
+        /// Subscription selector: id, name, or index (#N / N)
+        sub: Option<String>,
+        /// Deprecated: use positional selector instead.
+        #[arg(long = "sub", hide = true)]
+        sub_flag: Option<String>,
         /// Output as JSON
         #[arg(long)]
         json: bool,
     },
 
-    /// Acknowledge feed items through a given seq
-    #[command(name = "sub-ack")]
+    /// Deprecated: use `topo sub ack`
+    #[command(name = "sub-ack", hide = true)]
     SubAck {
-        /// Subscription ID
-        #[arg(long)]
-        sub: String,
+        /// Subscription selector: id, name, or index (#N / N)
+        sub: Option<String>,
+        /// Deprecated: use positional selector instead.
+        #[arg(long = "sub", hide = true)]
+        sub_flag: Option<String>,
         /// Acknowledge through this seq (inclusive)
         #[arg(long)]
         through_seq: i64,
     },
 
-    /// Disable a subscription
-    #[command(name = "sub-disable")]
+    /// Deprecated: use `topo sub disable`
+    #[command(name = "sub-disable", hide = true)]
     SubDisable {
-        /// Subscription ID
-        #[arg(long)]
-        sub: String,
+        /// Subscription selector: id, name, or index (#N / N)
+        sub: Option<String>,
+        /// Deprecated: use positional selector instead.
+        #[arg(long = "sub", hide = true)]
+        sub_flag: Option<String>,
     },
 
-    /// Enable a subscription
-    #[command(name = "sub-enable")]
+    /// Deprecated: use `topo sub enable`
+    #[command(name = "sub-enable", hide = true)]
     SubEnable {
-        /// Subscription ID
-        #[arg(long)]
-        sub: String,
+        /// Subscription selector: id, name, or index (#N / N)
+        sub: Option<String>,
+        /// Deprecated: use positional selector instead.
+        #[arg(long = "sub", hide = true)]
+        sub_flag: Option<String>,
     },
 
     /// Enable persistent sync logging (off by default)
@@ -573,6 +594,88 @@ enum RpcAction {
         /// Read full RpcRequest JSON from stdin
         #[arg(long, group = "input")]
         stdin: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SubAction {
+    /// Create a local subscription
+    Create {
+        /// Subscription name
+        #[arg(long)]
+        name: String,
+        /// Event type to subscribe to (e.g. "message")
+        #[arg(long)]
+        event_type: String,
+        /// Delivery mode: full|id|has_changed
+        #[arg(long, default_value = "full")]
+        delivery: String,
+        /// Since timestamp (ms) — only match events after this time
+        #[arg(long)]
+        since_ms: Option<u64>,
+        /// Since event ID — only match events after this cursor
+        #[arg(long)]
+        since_event_id: Option<String>,
+        /// JSON spec (overrides --since-ms/--since-event-id if provided)
+        #[arg(long)]
+        spec: Option<String>,
+    },
+    /// List subscriptions
+    List,
+    /// Poll subscription feed
+    Poll {
+        /// Subscription selector: id, name, or index (#N / N)
+        sub: Option<String>,
+        /// Deprecated: use positional selector instead.
+        #[arg(long = "sub", hide = true)]
+        sub_flag: Option<String>,
+        /// Only return items after this seq (exclusive)
+        #[arg(long, default_value = "0")]
+        after_seq: i64,
+        /// Max items to return
+        #[arg(long, default_value = "50")]
+        limit: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Get subscription state (pending count, dirty flag, cursors)
+    State {
+        /// Subscription selector: id, name, or index (#N / N)
+        sub: Option<String>,
+        /// Deprecated: use positional selector instead.
+        #[arg(long = "sub", hide = true)]
+        sub_flag: Option<String>,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Acknowledge feed items through a given seq
+    Ack {
+        /// Subscription selector: id, name, or index (#N / N)
+        sub: Option<String>,
+        /// Deprecated: use positional selector instead.
+        #[arg(long = "sub", hide = true)]
+        sub_flag: Option<String>,
+        /// Acknowledge through this seq (inclusive)
+        #[arg(long)]
+        through_seq: i64,
+    },
+    /// Disable a subscription
+    Disable {
+        /// Subscription selector: id, name, or index (#N / N)
+        sub: Option<String>,
+        /// Deprecated: use positional selector instead.
+        #[arg(long = "sub", hide = true)]
+        sub_flag: Option<String>,
+    },
+    /// Enable a subscription
+    Enable {
+        /// Subscription selector: id, name, or index (#N / N)
+        sub: Option<String>,
+        /// Deprecated: use positional selector instead.
+        #[arg(long = "sub", hide = true)]
+        sub_flag: Option<String>,
     },
 }
 
@@ -768,6 +871,328 @@ fn resolve_target_selector(
             )
             .into()),
         },
+    }
+}
+
+#[derive(Debug, Clone)]
+struct SubscriptionRef {
+    subscription_id: String,
+    name: String,
+}
+
+fn list_subscription_refs(
+    db: &str,
+    socket: Option<&str>,
+) -> Result<Vec<SubscriptionRef>, Box<dyn std::error::Error + Send + Sync>> {
+    let data = rpc_require_daemon(db, socket, RpcMethod::SubList)?;
+    let items = data
+        .as_array()
+        .ok_or_else(|| "unexpected sub-list response shape".to_string())?;
+    let mut refs = Vec::with_capacity(items.len());
+    for item in items {
+        let sub_id = item["subscription_id"].as_str().unwrap_or("").to_string();
+        if sub_id.is_empty() {
+            continue;
+        }
+        let name = item["name"].as_str().unwrap_or("").to_string();
+        refs.push(SubscriptionRef {
+            subscription_id: sub_id,
+            name,
+        });
+    }
+    Ok(refs)
+}
+
+fn resolve_subscription_selector(
+    db: &str,
+    socket: Option<&str>,
+    positional: Option<String>,
+    deprecated_flag: Option<String>,
+    command_name: &str,
+    default_if_single: bool,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let selector = match (positional, deprecated_flag) {
+        (Some(_), Some(_)) => {
+            return Err(format!(
+                "conflicting selectors for `{}`: pass either positional selector or deprecated --sub, not both",
+                command_name
+            )
+            .into())
+        }
+        (Some(s), None) => Some(s),
+        (None, Some(s)) => {
+            eprintln!(
+                "warning: `--sub` is deprecated for `{}`; pass selector positionally instead",
+                command_name
+            );
+            Some(s)
+        }
+        (None, None) => None,
+    }
+    .map(|s| s.trim().to_string())
+    .filter(|s| !s.is_empty());
+
+    let refs = list_subscription_refs(db, socket)?;
+    if refs.is_empty() {
+        return Err("no subscriptions found — run `topo sub create --name ... --event-type message` first".into());
+    }
+
+    let Some(selector) = selector else {
+        if default_if_single && refs.len() == 1 {
+            return Ok(refs[0].subscription_id.clone());
+        }
+        return Err(format!(
+            "missing subscription selector for `{}`; pass id/name/#N (run `topo sub list`)",
+            command_name
+        )
+        .into());
+    };
+
+    let selector_no_hash = selector.strip_prefix('#').unwrap_or(&selector);
+    if let Ok(index) = selector_no_hash.parse::<usize>() {
+        if index == 0 || index > refs.len() {
+            return Err(format!(
+                "invalid subscription index {}; available: 1-{}",
+                index,
+                refs.len()
+            )
+            .into());
+        }
+        return Ok(refs[index - 1].subscription_id.clone());
+    }
+
+    if let Some(found) = refs.iter().find(|r| r.subscription_id == selector) {
+        return Ok(found.subscription_id.clone());
+    }
+
+    let matches: Vec<&SubscriptionRef> = refs.iter().filter(|r| r.name == selector).collect();
+    match matches.len() {
+        1 => Ok(matches[0].subscription_id.clone()),
+        0 => Err(format!(
+            "subscription selector `{}` not found; run `topo sub list` for available ids/names",
+            selector
+        )
+        .into()),
+        _ => Err(format!(
+            "subscription name `{}` is ambiguous; use subscription id instead",
+            selector
+        )
+        .into()),
+    }
+}
+
+fn run_sub_action(
+    db: &str,
+    socket: Option<&str>,
+    action: SubAction,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match action {
+        SubAction::Create {
+            name,
+            event_type,
+            delivery,
+            since_ms,
+            since_event_id,
+            spec,
+        } => {
+            let spec_json = if let Some(raw) = spec {
+                raw
+            } else {
+                let since = if since_ms.is_some() || since_event_id.is_some() {
+                    Some(serde_json::json!({
+                        "created_at_ms": since_ms.unwrap_or(0),
+                        "event_id": since_event_id.unwrap_or_default(),
+                    }))
+                } else {
+                    None
+                };
+                let spec_obj = serde_json::json!({
+                    "event_type": event_type,
+                    "since": since,
+                    "filters": [],
+                });
+                serde_json::to_string(&spec_obj).unwrap()
+            };
+            let data = rpc_require_daemon(
+                db,
+                socket,
+                RpcMethod::SubCreate {
+                    name,
+                    event_type,
+                    delivery_mode: delivery,
+                    spec_json,
+                },
+            )?;
+            let sub_id = data["subscription_id"].as_str().unwrap_or("?");
+            let sub_name = data["name"].as_str().unwrap_or("?");
+            println!("Created subscription \"{}\" (id: {})", sub_name, sub_id);
+            Ok(())
+        }
+        SubAction::List => {
+            let data = rpc_require_daemon(db, socket, RpcMethod::SubList)?;
+            if let Some(items) = data.as_array() {
+                if items.is_empty() {
+                    println!("No subscriptions.");
+                } else {
+                    println!("SUBSCRIPTIONS:");
+                    for (idx, item) in items.iter().enumerate() {
+                        let enabled = if item["enabled"].as_bool().unwrap_or(false) {
+                            "on"
+                        } else {
+                            "off"
+                        };
+                        let name = item["name"].as_str().unwrap_or("?");
+                        let sub_id = item["subscription_id"].as_str().unwrap_or("?");
+                        let et = item["event_type"].as_str().unwrap_or("?");
+                        let dm = item["delivery_mode"].as_str().unwrap_or("?");
+                        println!(
+                            "  {}. [{}] \"{}\" type={} delivery={} id={}",
+                            idx + 1,
+                            enabled,
+                            name,
+                            et,
+                            dm,
+                            sub_id
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        SubAction::Poll {
+            sub,
+            sub_flag,
+            after_seq,
+            limit,
+            json,
+        } => {
+            let sub_id =
+                resolve_subscription_selector(db, socket, sub, sub_flag, "sub poll", true)?;
+            let data = rpc_require_daemon(
+                db,
+                socket,
+                RpcMethod::SubPoll {
+                    subscription_id: sub_id,
+                    after_seq,
+                    limit,
+                },
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data).unwrap_or_default()
+                );
+            } else if let Some(items) = data.as_array() {
+                if items.is_empty() {
+                    println!("(no new items)");
+                } else {
+                    for item in items {
+                        let seq = item["seq"].as_i64().unwrap_or(0);
+                        let etype = item["event_type"].as_str().unwrap_or("?");
+                        let eid = item["event_id"].as_str().unwrap_or("?");
+                        let payload = &item["payload"];
+                        if let Some(content) = payload["content"].as_str() {
+                            println!(
+                                "  seq={} {} event={} content={:?}",
+                                seq,
+                                etype,
+                                &eid[..eid.len().min(12)],
+                                content
+                            );
+                        } else {
+                            println!(
+                                "  seq={} {} event={}",
+                                seq,
+                                etype,
+                                &eid[..eid.len().min(12)]
+                            );
+                        }
+                    }
+                }
+            }
+            Ok(())
+        }
+        SubAction::State {
+            sub,
+            sub_flag,
+            json,
+        } => {
+            let sub_id =
+                resolve_subscription_selector(db, socket, sub, sub_flag, "sub state", true)?;
+            let data = rpc_require_daemon(
+                db,
+                socket,
+                RpcMethod::SubState {
+                    subscription_id: sub_id,
+                },
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data).unwrap_or_default()
+                );
+            } else {
+                let pending = data["pending_count"].as_i64().unwrap_or(0);
+                let dirty = data["dirty"].as_bool().unwrap_or(false);
+                let next_seq = data["next_seq"].as_i64().unwrap_or(0);
+                let latest = data["latest_event_id"].as_str().unwrap_or("");
+                println!(
+                    "pending={} dirty={} next_seq={} latest_event={}",
+                    pending,
+                    dirty,
+                    next_seq,
+                    if latest.is_empty() {
+                        "(none)"
+                    } else {
+                        &latest[..latest.len().min(12)]
+                    },
+                );
+            }
+            Ok(())
+        }
+        SubAction::Ack {
+            sub,
+            sub_flag,
+            through_seq,
+        } => {
+            let sub_id = resolve_subscription_selector(db, socket, sub, sub_flag, "sub ack", true)?;
+            let _data = rpc_require_daemon(
+                db,
+                socket,
+                RpcMethod::SubAck {
+                    subscription_id: sub_id,
+                    through_seq,
+                },
+            )?;
+            println!("Acked through seq {}", through_seq);
+            Ok(())
+        }
+        SubAction::Disable { sub, sub_flag } => {
+            let sub_id =
+                resolve_subscription_selector(db, socket, sub, sub_flag, "sub disable", true)?;
+            let _data = rpc_require_daemon(
+                db,
+                socket,
+                RpcMethod::SubDisable {
+                    subscription_id: sub_id,
+                },
+            )?;
+            println!("Subscription disabled.");
+            Ok(())
+        }
+        SubAction::Enable { sub, sub_flag } => {
+            let sub_id =
+                resolve_subscription_selector(db, socket, sub, sub_flag, "sub enable", true)?;
+            let _data = rpc_require_daemon(
+                db,
+                socket,
+                RpcMethod::SubEnable {
+                    subscription_id: sub_id,
+                },
+            )?;
+            println!("Subscription enabled.");
+            Ok(())
+        }
     }
 }
 
@@ -1882,6 +2307,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // ---------------------------------------------------------------
         // Subscription commands
         // ---------------------------------------------------------------
+        Commands::Sub { action } => {
+            let action = action.unwrap_or(SubAction::List);
+            run_sub_action(db, socket_override.as_deref(), action)?;
+        }
         Commands::SubCreate {
             name,
             event_type,
@@ -1890,179 +2319,87 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             since_event_id,
             spec,
         } => {
-            let spec_json = if let Some(raw) = spec {
-                raw
-            } else {
-                let since = if since_ms.is_some() || since_event_id.is_some() {
-                    Some(serde_json::json!({
-                        "created_at_ms": since_ms.unwrap_or(0),
-                        "event_id": since_event_id.unwrap_or_default(),
-                    }))
-                } else {
-                    None
-                };
-                let spec_obj = serde_json::json!({
-                    "event_type": event_type,
-                    "since": since,
-                    "filters": [],
-                });
-                serde_json::to_string(&spec_obj).unwrap()
-            };
-            let data = rpc_require_daemon(
+            eprintln!("warning: `topo sub-create` is deprecated; use `topo sub create`");
+            run_sub_action(
                 db,
                 socket_override.as_deref(),
-                RpcMethod::SubCreate {
+                SubAction::Create {
                     name,
                     event_type,
-                    delivery_mode: delivery,
-                    spec_json,
+                    delivery,
+                    since_ms,
+                    since_event_id,
+                    spec,
                 },
             )?;
-            let sub_id = data["subscription_id"].as_str().unwrap_or("?");
-            let sub_name = data["name"].as_str().unwrap_or("?");
-            println!("Created subscription \"{}\" (id: {})", sub_name, sub_id);
         }
-
         Commands::SubList => {
-            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::SubList)?;
-            if let Some(items) = data.as_array() {
-                if items.is_empty() {
-                    println!("No subscriptions.");
-                } else {
-                    println!("SUBSCRIPTIONS:");
-                    for item in items {
-                        let enabled = if item["enabled"].as_bool().unwrap_or(false) {
-                            "on"
-                        } else {
-                            "off"
-                        };
-                        let name = item["name"].as_str().unwrap_or("?");
-                        let sub_id = item["subscription_id"].as_str().unwrap_or("?");
-                        let et = item["event_type"].as_str().unwrap_or("?");
-                        let dm = item["delivery_mode"].as_str().unwrap_or("?");
-                        println!(
-                            "  [{}] \"{}\" type={} delivery={} id={}",
-                            enabled, name, et, dm, sub_id
-                        );
-                    }
-                }
-            }
+            eprintln!("warning: `topo sub-list` is deprecated; use `topo sub list`");
+            run_sub_action(db, socket_override.as_deref(), SubAction::List)?;
         }
-
         Commands::SubPoll {
             sub,
+            sub_flag,
             after_seq,
             limit,
             json,
         } => {
-            let data = rpc_require_daemon(
+            eprintln!("warning: `topo sub-poll` is deprecated; use `topo sub poll`");
+            run_sub_action(
                 db,
                 socket_override.as_deref(),
-                RpcMethod::SubPoll {
-                    subscription_id: sub,
+                SubAction::Poll {
+                    sub,
+                    sub_flag,
                     after_seq,
                     limit,
+                    json,
                 },
             )?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&data).unwrap_or_default()
-                );
-            } else if let Some(items) = data.as_array() {
-                if items.is_empty() {
-                    println!("(no new items)");
-                } else {
-                    for item in items {
-                        let seq = item["seq"].as_i64().unwrap_or(0);
-                        let etype = item["event_type"].as_str().unwrap_or("?");
-                        let eid = item["event_id"].as_str().unwrap_or("?");
-                        let payload = &item["payload"];
-                        if let Some(content) = payload["content"].as_str() {
-                            println!(
-                                "  seq={} {} event={} content={:?}",
-                                seq,
-                                etype,
-                                &eid[..eid.len().min(12)],
-                                content
-                            );
-                        } else {
-                            println!(
-                                "  seq={} {} event={}",
-                                seq,
-                                etype,
-                                &eid[..eid.len().min(12)]
-                            );
-                        }
-                    }
-                }
-            }
         }
-
-        Commands::SubState { sub, json } => {
-            let data = rpc_require_daemon(
+        Commands::SubState { sub, sub_flag, json } => {
+            eprintln!("warning: `topo sub-state` is deprecated; use `topo sub state`");
+            run_sub_action(
                 db,
                 socket_override.as_deref(),
-                RpcMethod::SubState {
-                    subscription_id: sub,
+                SubAction::State {
+                    sub,
+                    sub_flag,
+                    json,
                 },
             )?;
-            if json {
-                println!(
-                    "{}",
-                    serde_json::to_string_pretty(&data).unwrap_or_default()
-                );
-            } else {
-                let pending = data["pending_count"].as_i64().unwrap_or(0);
-                let dirty = data["dirty"].as_bool().unwrap_or(false);
-                let next_seq = data["next_seq"].as_i64().unwrap_or(0);
-                let latest = data["latest_event_id"].as_str().unwrap_or("");
-                println!(
-                    "pending={} dirty={} next_seq={} latest_event={}",
-                    pending,
-                    dirty,
-                    next_seq,
-                    if latest.is_empty() {
-                        "(none)"
-                    } else {
-                        &latest[..latest.len().min(12)]
-                    },
-                );
-            }
         }
-
-        Commands::SubAck { sub, through_seq } => {
-            let _data = rpc_require_daemon(
+        Commands::SubAck {
+            sub,
+            sub_flag,
+            through_seq,
+        } => {
+            eprintln!("warning: `topo sub-ack` is deprecated; use `topo sub ack`");
+            run_sub_action(
                 db,
                 socket_override.as_deref(),
-                RpcMethod::SubAck {
-                    subscription_id: sub,
+                SubAction::Ack {
+                    sub,
+                    sub_flag,
                     through_seq,
                 },
             )?;
-            println!("Acked through seq {}", through_seq);
         }
-
-        Commands::SubDisable { sub } => {
-            let _data = rpc_require_daemon(
+        Commands::SubDisable { sub, sub_flag } => {
+            eprintln!("warning: `topo sub-disable` is deprecated; use `topo sub disable`");
+            run_sub_action(
                 db,
                 socket_override.as_deref(),
-                RpcMethod::SubDisable {
-                    subscription_id: sub,
-                },
+                SubAction::Disable { sub, sub_flag },
             )?;
-            println!("Subscription disabled.");
         }
-
-        Commands::SubEnable { sub } => {
-            let _data = rpc_require_daemon(
+        Commands::SubEnable { sub, sub_flag } => {
+            eprintln!("warning: `topo sub-enable` is deprecated; use `topo sub enable`");
+            run_sub_action(
                 db,
                 socket_override.as_deref(),
-                RpcMethod::SubEnable {
-                    subscription_id: sub,
-                },
+                SubAction::Enable { sub, sub_flag },
             )?;
-            println!("Subscription enabled.");
         }
 
         Commands::SyncLogEnable {

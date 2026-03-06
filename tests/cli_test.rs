@@ -761,6 +761,112 @@ fn test_cli_messages_include_reactions() {
 }
 
 #[test]
+fn test_cli_sub_commands_accept_name_selector_and_nested_shape() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("subs.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    let create_out = Command::new(bin())
+        .args([
+            "--db",
+            &db,
+            "sub",
+            "create",
+            "--name",
+            "new-messages",
+            "--event-type",
+            "message",
+        ])
+        .output()
+        .expect("sub create");
+    assert!(
+        create_out.status.success(),
+        "sub create failed: {}",
+        String::from_utf8_lossy(&create_out.stderr)
+    );
+
+    let list_out = Command::new(bin())
+        .args(["--db", &db, "subs", "list"])
+        .output()
+        .expect("subs list");
+    assert!(
+        list_out.status.success(),
+        "subs list failed: {}",
+        String::from_utf8_lossy(&list_out.stderr)
+    );
+    let list_stdout = String::from_utf8_lossy(&list_out.stdout);
+    assert!(
+        list_stdout.contains("new-messages"),
+        "subs list should include subscription name, got: {}",
+        list_stdout
+    );
+
+    send_message(&db, "hello subscriptions");
+    let poll_deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        let poll_out = Command::new(bin())
+            .args(["--db", &db, "sub", "poll", "new-messages"])
+            .output()
+            .expect("sub poll by name");
+        assert!(
+            poll_out.status.success(),
+            "sub poll by name failed: {}",
+            String::from_utf8_lossy(&poll_out.stderr)
+        );
+        let poll_stdout = String::from_utf8_lossy(&poll_out.stdout).to_string();
+        if poll_stdout.contains("hello subscriptions") {
+            break;
+        }
+        if Instant::now() >= poll_deadline {
+            panic!(
+                "timed out waiting for subscription item by name selector:\n{}",
+                poll_stdout
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let state_out = Command::new(bin())
+        .args(["--db", &db, "sub", "state"])
+        .output()
+        .expect("sub state default selector");
+    assert!(
+        state_out.status.success(),
+        "sub state default selector failed: {}",
+        String::from_utf8_lossy(&state_out.stderr)
+    );
+    let state_stdout = String::from_utf8_lossy(&state_out.stdout);
+    assert!(
+        state_stdout.contains("pending="),
+        "sub state should print summary, got: {}",
+        state_stdout
+    );
+
+    let disable_out = Command::new(bin())
+        .args(["--db", &db, "sub", "disable", "--sub", "new-messages"])
+        .output()
+        .expect("sub disable --sub");
+    assert!(
+        disable_out.status.success(),
+        "sub disable --sub failed: {}",
+        String::from_utf8_lossy(&disable_out.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&disable_out.stderr).contains("deprecated"),
+        "sub disable --sub should emit deprecation warning, got: {}",
+        String::from_utf8_lossy(&disable_out.stderr)
+    );
+}
+
+#[test]
 fn test_cli_send_file_and_messages_display() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
