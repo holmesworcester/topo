@@ -1216,23 +1216,40 @@ fn run_sub_action(
 }
 
 struct ManagedRuntime {
-    tenants: Vec<String>,
+    tenant_states: Vec<RuntimeTenantState>,
     shutdown_notify: Arc<tokio::sync::Notify>,
     handle: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
 }
 
-fn discover_tenant_peer_ids(
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+struct RuntimeTenantState {
+    peer_id: String,
+    workspace_id: String,
+    transport_peer_id: String,
+}
+
+fn discover_runtime_tenant_states(
     db_path: &str,
-) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<RuntimeTenantState>, Box<dyn std::error::Error + Send + Sync>> {
     let conn = open_connection(db_path)?;
     create_tables(&conn)?;
-    let mut peers = discover_local_tenants(&conn)?
+    let mut tenants = discover_local_tenants(&conn)?
         .into_iter()
-        .map(|t| t.peer_id)
+        .map(|t| RuntimeTenantState {
+            peer_id: t.peer_id,
+            workspace_id: t.workspace_id,
+            transport_peer_id: t.transport_peer_id,
+        })
         .collect::<Vec<_>>();
-    peers.sort();
-    peers.dedup();
-    Ok(peers)
+    tenants.sort();
+    tenants.dedup();
+    Ok(tenants)
+}
+
+fn same_runtime_tenant_peer_ids(a: &[RuntimeTenantState], b: &[RuntimeTenantState]) -> bool {
+    a.iter()
+        .map(|tenant| &tenant.peer_id)
+        .eq(b.iter().map(|tenant| &tenant.peer_id))
 }
 
 async fn stop_runtime(runtime: ManagedRuntime) {
@@ -1298,7 +1315,7 @@ fn spawn_runtime(
     db_path: &str,
     bind: SocketAddr,
     state: Arc<DaemonState>,
-    tenants: Vec<String>,
+    tenant_states: Vec<RuntimeTenantState>,
 ) -> ManagedRuntime {
     // Runtime is Active only after listen_addr is reported.
     // Clear stale UPnP result — the port may change across restarts.
@@ -1334,7 +1351,7 @@ fn spawn_runtime(
     });
 
     ManagedRuntime {
-        tenants,
+        tenant_states,
         shutdown_notify: runtime_shutdown,
         handle,
     }
@@ -1395,9 +1412,9 @@ async fn reevaluate_runtime(
         clear_upnp_report(&state);
     }
 
-    let tenants = discover_tenant_peer_ids(db_path)?;
+    let tenant_states = discover_runtime_tenant_states(db_path)?;
 
-    if tenants.is_empty() {
+    if tenant_states.is_empty() {
         if let Some(runtime) = active_runtime.take() {
             stop_runtime(runtime).await;
         }
@@ -1413,16 +1430,33 @@ async fn reevaluate_runtime(
     }
 
     let restart_needed = match active_runtime.as_ref() {
-        Some(runtime) => runtime.tenants != tenants,
+        Some(runtime) => runtime.tenant_states != tenant_states,
         None => true,
     };
     if restart_needed {
+        let transport_state_changed = active_runtime
+            .as_ref()
+            .map(|runtime| {
+                same_runtime_tenant_peer_ids(&runtime.tenant_states, &tenant_states)
+                    && runtime.tenant_states != tenant_states
+            })
+            .unwrap_or(false);
         if let Some(runtime) = active_runtime.take() {
             stop_runtime(runtime).await;
         }
         let _ = idle_bind_reservation.take();
-        tracing::info!("activating peering runtime ({} tenant(s))", tenants.len());
-        *active_runtime = Some(spawn_runtime(db_path, bind, state, tenants));
+        if transport_state_changed {
+            tracing::info!(
+                "restarting peering runtime after tenant transport identity change ({} tenant(s))",
+                tenant_states.len()
+            );
+        } else {
+            tracing::info!(
+                "activating peering runtime ({} tenant(s))",
+                tenant_states.len()
+            );
+        }
+        *active_runtime = Some(spawn_runtime(db_path, bind, state, tenant_states));
     }
 
     Ok(())
@@ -3997,6 +4031,11 @@ fn show_files_from_json(data: &serde_json::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use ed25519_dalek::SigningKey;
+    use topo::crypto::spki_fingerprint_from_ed25519_pubkey;
+    use topo::db::transport_creds::{
+        store_local_creds_with_source, CRED_SOURCE_BOOTSTRAP, CRED_SOURCE_PEER_SHARED,
+    };
 
     #[test]
     fn test_emoji_shortcode_known() {
@@ -4022,6 +4061,85 @@ mod tests {
         assert_eq!(format_byte_size(1048576), "1.0 MiB");
         assert_eq!(format_byte_size(1258291), "1.2 MiB");
         assert_eq!(format_byte_size(1073741824), "1.0 GiB");
+    }
+
+    #[test]
+    fn runtime_tenant_states_switch_to_peershared_transport_identity_when_available() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tmpdir.path().join("runtime-tenant-state.db");
+        let db_path = db_path.to_str().expect("db path").to_string();
+
+        let conn = open_connection(&db_path).expect("open db");
+        create_tables(&conn).expect("create tables");
+
+        let tenant_peer_id = "tenant-final-peer".to_string();
+        let workspace_id = "workspace-1";
+        let invite_event_id = "invite-1";
+        let invite_key = SigningKey::from_bytes(&[0x44; 32]);
+        let bootstrap_peer_id = hex::encode(spki_fingerprint_from_ed25519_pubkey(
+            &invite_key.verifying_key().to_bytes(),
+        ));
+
+        conn.execute(
+            "INSERT INTO invites_accepted
+             (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                &tenant_peer_id,
+                "ia-1",
+                "tenant-evt-1",
+                invite_event_id,
+                workspace_id,
+                1i64
+            ],
+        )
+        .expect("insert invites_accepted");
+        conn.execute(
+            "INSERT INTO invite_secrets
+             (recorded_by, event_id, invite_event_id, private_key, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                &tenant_peer_id,
+                "is-1",
+                invite_event_id,
+                invite_key.to_bytes().to_vec(),
+                1i64
+            ],
+        )
+        .expect("insert invite_secret");
+        store_local_creds_with_source(
+            &conn,
+            &bootstrap_peer_id,
+            b"bootstrap-cert",
+            b"bootstrap-key",
+            CRED_SOURCE_BOOTSTRAP,
+        )
+        .expect("store bootstrap creds");
+
+        let states = discover_runtime_tenant_states(&db_path).expect("discover bootstrap state");
+        assert_eq!(states.len(), 1);
+        assert_eq!(states[0].peer_id, tenant_peer_id);
+        assert_eq!(states[0].workspace_id, workspace_id);
+        assert_eq!(
+            states[0].transport_peer_id, bootstrap_peer_id,
+            "runtime should initially track the invite-derived bootstrap transport identity"
+        );
+
+        store_local_creds_with_source(
+            &conn,
+            &tenant_peer_id,
+            b"peershared-cert",
+            b"peershared-key",
+            CRED_SOURCE_PEER_SHARED,
+        )
+        .expect("store peershared creds");
+
+        let states = discover_runtime_tenant_states(&db_path).expect("discover peershared state");
+        assert_eq!(states.len(), 1);
+        assert_eq!(
+            states[0].transport_peer_id, tenant_peer_id,
+            "runtime should switch to the final PeerShared transport identity once it exists"
+        );
     }
 }
 

@@ -2,6 +2,7 @@
 
 use std::net::SocketAddr;
 use std::sync::Arc;
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
@@ -12,6 +13,7 @@ use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
 use crate::db::store::lookup_workspace_id;
 use crate::db::transport_trust::record_transport_binding;
+use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::CoordinationManager;
 use crate::sync::SyncSessionHandler;
 use crate::transport::{
@@ -30,6 +32,7 @@ use super::{
 
 const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
 const STALE_DIAL_FAILURE_THRESHOLD: u32 = 8;
+const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
 // Connect loops
@@ -261,6 +264,7 @@ async fn connect_loop_inner(
         shared_ingest.clone(),
     );
     let mut consecutive_stale_dial_failures: u32 = 0;
+    let mut warning_gate = RepeatedWarningGate::new(REPEATED_WARNING_WINDOW);
     loop {
         if shutdown.is_cancelled() {
             break;
@@ -281,7 +285,12 @@ async fn connect_loop_inner(
         } {
             Ok(outcome) => outcome,
             Err(e) => {
-                warn!("{}", describe_connect_failure(remote, &e));
+                let message = describe_connect_failure(remote, &e);
+                if warning_gate.should_emit(message.clone())
+                    && should_emit_globally(format!("connect:{message}"))
+                {
+                    warn!("{}", message);
+                }
                 if is_stale_dial_failure(&e) {
                     consecutive_stale_dial_failures += 1;
                     if consecutive_stale_dial_failures >= STALE_DIAL_FAILURE_THRESHOLD {
@@ -302,6 +311,7 @@ async fn connect_loop_inner(
             }
         };
         consecutive_stale_dial_failures = 0;
+        warning_gate.clear();
         let provider = dial_outcome.provider;
         let used_bootstrap_fallback = dial_outcome.used_bootstrap_fallback;
         let connection = provider.connection();
@@ -309,10 +319,15 @@ async fn connect_loop_inner(
         let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
             Some(fp) => fp,
             None => {
-                warn!(
+                let message = format!(
                     "Could not decode peer fingerprint from identity {}, retrying...",
                     &peer_id[..16.min(peer_id.len())]
                 );
+                if warning_gate.should_emit(message.clone())
+                    && should_emit_globally(format!("connect:{message}"))
+                {
+                    warn!("{}", message);
+                }
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
                     _ = tokio::time::sleep(CONNECT_RETRY_DELAY) => {}

@@ -130,6 +130,7 @@ Every CLI instance is a real peer-to-peer device. All user-facing commands go th
 3. **Zeroconf discovery**: mDNS/DNS-SD discovers peers on the same workspace on the local machine or LAN (enabled by default via `discovery` feature).
 4. **Single-port QUIC endpoint**: one shared endpoint serves all tenants via multi-workspace cert resolver (SNI routing). Inbound trust is union-scoped; outbound dials use per-tenant client configs with tenant-scoped trust.
 5. **Shared batch writer**: all tenants on a device share one batch writer for projection, grouped by `recorded_by`.
+6. **Same-workspace shared-DB convergence**: if multiple local tenants share one DB and one workspace, shared events must fan out locally across sibling tenant scopes after local create or wire ingest, and newly accepted tenants/devices must replay already-present shared workspace history into their own scope.
 
 ---
 
@@ -408,6 +409,7 @@ Multitenant scoping in shared tables:
 2. Subjective/projected rows must include tenant scope key (`peer_id` / `recorded_by`).
 3. Use composite keys/indexes with tenant first (for example `(peer_id, event_id)`).
 4. For subjective autowrite tables, default uniqueness is exactly one row per `(peer_id, event_id)` unless the event spec explicitly defines a different shape.
+5. Shared canonical blobs in one DB may legitimately project into multiple tenant scopes only when those tenants share the same `workspace_id`; cross-workspace fanout is always a bug.
 
 Why this rule exists:
 - keeps schema ergonomic and queryable,
@@ -1451,7 +1453,10 @@ Detailed architecture and invariants are documented in [DESIGN.md](./DESIGN.md) 
 1. multi-tenant shared-DB scenario coverage,
 2. mDNS/discovery smoke coverage,
 3. cross-tenant leakage checks in scenario tests,
-4. application-level convergence/assertion style in tests.
+4. application-level convergence/assertion style in tests,
+5. same-workspace sibling fanout coverage for both local create and wire ingest,
+6. join/link replay coverage for historical shared events already present in one DB,
+7. real CLI coverage for reused invites, fresh invite creation, and mixed user/device-link growth patterns.
 
 ## 17.4 Same-host loopback normalization rule
 

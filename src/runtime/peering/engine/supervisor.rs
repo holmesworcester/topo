@@ -24,6 +24,7 @@ use crate::peering::loops::{
     accept_loop_with_ingest_until_cancel,
     connect_loop_with_coordination_until_cancel_with_fallback, IntroSpawnerFn,
 };
+use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::CoordinationManager;
 use crate::transport::{
     build_tenant_bootstrap_fallback_client_config_for_invite_from_db,
@@ -474,6 +475,7 @@ async fn run_bootstrap_refresher(
     ingress_tx: mpsc::UnboundedSender<TargetIngressEvent>,
     shutdown: CancellationToken,
 ) -> Result<(), String> {
+    let mut warning_gate = RepeatedWarningGate::new(Duration::from_secs(300));
     loop {
         if shutdown.is_cancelled() {
             break;
@@ -481,6 +483,7 @@ async fn run_bootstrap_refresher(
 
         match collect_all_bootstrap_targets(&db_path) {
             Ok(targets) => {
+                warning_gate.clear();
                 for (tenant_id, invite_event_id, remote) in targets {
                     if ingress_tx
                         .send(TargetIngressEvent {
@@ -494,7 +497,14 @@ async fn run_bootstrap_refresher(
                     }
                 }
             }
-            Err(e) => warn!("BOOTSTRAP AUTODIAL REFRESH failed: {}", e),
+            Err(e) => {
+                let message = format!("BOOTSTRAP AUTODIAL REFRESH failed: {}", e);
+                if warning_gate.should_emit(message.clone())
+                    && should_emit_globally(format!("engine:{message}"))
+                {
+                    warn!("{}", message);
+                }
+            }
         }
 
         tokio::select! {
@@ -733,6 +743,7 @@ async fn run_connect_worker(
     dispatch_key: String,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
 ) {
+    let mut warning_gate = RepeatedWarningGate::new(Duration::from_secs(300));
     loop {
         if shutdown.is_cancelled() {
             break;
@@ -758,22 +769,37 @@ async fn run_connect_worker(
 
         let stale_target = match &result {
             Ok(()) => {
-                warn!("connect worker {} exited unexpectedly", dispatch_key);
+                let message = format!("connect worker {} exited unexpectedly", dispatch_key);
+                if warning_gate.should_emit(message.clone())
+                    && should_emit_globally(format!("engine:{message}"))
+                {
+                    warn!("{}", message);
+                }
                 false
             }
             Err(e) => {
-                warn!(
+                let message = format!(
                     "connect worker {} failed: {}; restarting with backoff",
                     dispatch_key, e
                 );
+                if warning_gate.should_emit(message.clone())
+                    && should_emit_globally(format!("engine:{message}"))
+                {
+                    warn!("{}", message);
+                }
                 e.to_string().contains(STALE_DIAL_TARGET_MARKER)
             }
         };
         if stale_target {
-            warn!(
+            let message = format!(
                 "connect worker {} marked dial target stale; exiting for fresh target resolution",
                 dispatch_key
             );
+            if warning_gate.should_emit(message.clone())
+                && should_emit_globally(format!("engine:{message}"))
+            {
+                warn!("{}", message);
+            }
             break;
         }
 

@@ -68,11 +68,7 @@ impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
                 }
                 Ok(_) => {}
                 Err(e) => {
-                    tracing::warn!(
-                        "post-drain hooks failed for {}: {}",
-                        short_id(tenant_id),
-                        e
-                    )
+                    tracing::warn!("post-drain hooks failed for {}: {}", short_id(tenant_id), e)
                 }
             }
         }

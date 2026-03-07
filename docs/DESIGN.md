@@ -115,6 +115,7 @@ Negentropy reconciliation exchanges compact set summaries (`NegOpen`/`NegMsg`) o
 We use the Rust [`negentropy` library](https://crates.io/crates/negentropy) (`negentropy = "0.5"` in this repo), and this is the concrete engine behind our range-based set reconciliation approach ([Aljoscha Meyer, "Range-Based Set Reconciliation"](https://aljoscha-meyer.de/assets/landing/rbsr.pdf)). We modified our Negentropy integration to use a SQLite-backed store (`neg_items` + per-session `session_blocks`) instead of unbounded in-memory item sets, so reconciliation remains memory-bounded at large history sizes. (This is important for doing background sync in a memory-limited context on iOS). 
 
 We also modified the session flow for multi-source catchup: each source runs Negentropy independently, `need_ids` are deterministically split with fallback reassignment for source-unique/small sets, and all sources feed one shared batch writer to avoid duplicate pull storms and SQLite write contention. Inbound events are ingested through the same `project_one` path used by local creation and replay, which is why the system can enforce one convergence contract across source types: `local_create`, `wire_receive`, and replay all converge to the same projected state.
+For same-workspace sibling tenants sharing one DB, there is one extra local step after canonical persistence: shared events created locally or ingested from the network are fanned out to sibling tenant scopes with the same `workspace_id`, then projected through those tenants' normal queue/drain path. This is not a transport shortcut and it does not bypass projectors; it is local fanout of already-canonical shared blobs so one shared DB converges the same way multiple separate daemons would.
 
 ### Steady-State Repeats The Same Loop
 
@@ -564,9 +565,11 @@ Scope rule: `create_workspace` is tenant-scoped. If local transport credentials 
 InviteAccepted (accepted workspace binding) → User → DeviceInvite → PeerShared.
 Prerequisite: the joiner's DB must already contain the Workspace and UserInvite events (copied from the inviter before or during sync).
 The acceptance path also unwraps bootstrap content-key material received via `key_shared` events (wrapped to the invite public key at creation time) and materializes local `key_secret` events so that encrypted content received during bootstrap sync can be decrypted.
+On shared-DB multi-tenant nodes, acceptance also replays already-present shared events for the accepted workspace into the new tenant scope. Canonical blobs may already exist globally in `events` / `neg_items`, and negentropy will not refetch them just because a new local tenant accepted the workspace. That replay is therefore part of the correctness contract for same-DB joins, not just an optimization.
 Signer secrets (PeerSecret events) are NOT emitted here; `persist_join_peer_secret` is called separately after push-back sync completes.
 
 **Device link** (`workspace::commands::create_device_link_invite` / `add_device_to_workspace`): similar to user invite but creates a shorter chain (PeerShared only, skipping user/peer_invite_shared creation).
+The same replay rule applies to device linking: when a new local device joins a workspace whose shared history already exists in the DB, that history must be seeded into the new tenant scope immediately.
 
 **Retry** (`workspace::commands::retry_pending_invite_content_key_unwraps`): retries content-key unwrap for invites where `key_shared` prerequisites arrived late. Triggered via `event_modules::post_drain_hooks` from `state/pipeline/effects.rs` after each projection drain.
 
@@ -752,9 +755,10 @@ mDNS authenticity model (POC):
 4. authoritative peer identity for the session is the TLS/SPKI-derived peer fingerprint observed at handshake, not the mDNS TXT claim.
 
 Out-of-scope note (current POC):
-1. same-instance communication between two local tenants in the same workspace is not implemented as a special intra-daemon delivery path,
+1. there is still no transport/session-level intra-daemon peering path for two local tenants in the same workspace,
 2. because self-filtering excludes local peer IDs, local tenants do not discover/connect to each other through mDNS,
-3. adding explicit intra-instance delivery may be desirable future work, but it is out of scope for the current design baseline.
+3. same-workspace tenants that share one DB instead converge through projection-layer replay/fanout of shared canonical events,
+4. adding explicit intra-instance transport delivery may still be desirable future work, but it is not required for the current design baseline.
 
 DNS label constraint: peer IDs (64 hex chars) are truncated to 59 chars in the mDNS instance name (62 total with `p7-` prefix, under the 63-byte DNS label limit). The full peer ID is always in the TXT property for exact matching.
 
@@ -1327,6 +1331,11 @@ Daemon RPC state owns local UX/session aliases that are intentionally non-canoni
 3. channel aliases + active-channel selection per peer.
 
 These are operator ergonomics, not protocol facts; they do not project into canonical event state.
+
+Tenant-scoping rule:
+1. `Status`, `View`, `Messages`, `Users`, `Peers`, `Keys`, and similar workspace-facing RPCs are scoped to the active tenant,
+2. on a multi-tenant DB with no selected tenant, those RPCs should return `no active tenant` instead of misleading aggregate zeros,
+3. daemon readiness/liveness probes therefore need tenant-agnostic control-plane RPCs such as `ActiveTenant` or `Tenants`, not `Status`.
 
 ### Local-echo reconciliation (`client_op_id`)
 

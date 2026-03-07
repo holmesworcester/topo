@@ -1,6 +1,8 @@
 //! Accept-side connection loops: incoming QUIC connections and responder
 //! sync sessions.
 
+use std::time::Duration;
+
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -9,6 +11,7 @@ use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
 use crate::db::transport_trust::record_transport_binding;
+use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::SyncSessionHandler;
 use crate::transport::{
     accept_session_provider, resolve_trusting_tenant, TransportClientConfig, TransportEndpoint,
@@ -22,6 +25,8 @@ use super::{
     current_timestamp_ms, peer_fingerprint_from_hex, IntroSpawnerFn, ENDPOINT_TTL_MS,
     SYNC_SESSION_TIMEOUT_SECS,
 };
+
+const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
 // Accept loops
@@ -114,6 +119,7 @@ pub async fn accept_loop_with_ingest_until_cancel(
     run_startup_preflight(db_path, tenant_peer_ids, ingest)?;
 
     let mut connection_workers: Vec<ConnectionWorker> = Vec::new();
+    let mut warning_gate = RepeatedWarningGate::new(REPEATED_WARNING_WINDOW);
 
     loop {
         if shutdown.is_cancelled() {
@@ -133,7 +139,12 @@ pub async fn accept_loop_with_ingest_until_cancel(
                 break;
             }
             Err(e) => {
-                warn!("{}", describe_accept_failure(&e));
+                let message = describe_accept_failure(&e);
+                if warning_gate.should_emit(message.clone())
+                    && should_emit_globally(format!("accept:{message}"))
+                {
+                    warn!("{}", message);
+                }
                 continue;
             }
         };
@@ -151,10 +162,15 @@ pub async fn accept_loop_with_ingest_until_cancel(
             match resolve_tenant_for_peer(db_path, tenant_peer_ids, &peer_id) {
                 Some(rb) => rb,
                 None => {
-                    warn!(
+                    let message = format!(
                         "Rejected peer {}: no local tenant trusts this fingerprint",
                         &peer_id[..16.min(peer_id.len())]
                     );
+                    if warning_gate.should_emit(message.clone())
+                        && should_emit_globally(format!("accept:{message}"))
+                    {
+                        warn!("{}", message);
+                    }
                     connection.close(1u32.into(), b"no matching tenant");
                     continue;
                 }
@@ -203,6 +219,7 @@ pub async fn accept_loop_with_ingest_until_cancel(
                 .expect("accept connection worker runtime");
             let local = tokio::task::LocalSet::new();
             runtime.block_on(local.run_until(async move {
+                let mut worker_warning_gate = RepeatedWarningGate::new(REPEATED_WARNING_WINDOW);
                 // Spawn intro listener for uni-streams on this connection.
                 intro_spawner(
                     connection.clone(),
@@ -217,10 +234,15 @@ pub async fn accept_loop_with_ingest_until_cancel(
                 let peer_fp = match peer_fingerprint_from_hex(&peer_id_owned) {
                     Some(fp) => fp,
                     None => {
-                        warn!(
+                        let message = format!(
                             "Invalid peer fingerprint on accepted connection: {}",
                             &peer_id_owned[..16.min(peer_id_owned.len())]
                         );
+                        if worker_warning_gate.should_emit(message.clone())
+                            && should_emit_globally(format!("accept:{message}"))
+                        {
+                            warn!("{}", message);
+                        }
                         connection.close(1u32.into(), b"invalid peer fingerprint");
                         return;
                     }

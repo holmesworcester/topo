@@ -15,6 +15,7 @@ mod cli_harness;
 
 use cli_harness::*;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
@@ -24,7 +25,7 @@ use topo::event_modules::workspace::commands::{
     accept_invite as accept_invite_without_sync, create_user_invite_raw,
 };
 use topo::event_modules::workspace::invite_link::{
-    create_invite_link, parse_bootstrap_address, rewrite_bootstrap_addrs,
+    create_invite_link, parse_bootstrap_address, parse_invite_link, rewrite_bootstrap_addrs,
 };
 use topo::testutil::{DaemonGuard, Peer};
 
@@ -134,18 +135,21 @@ fn status_projected_count(output: &str, label: &str) -> usize {
 }
 
 fn tenant_index_for_username(db_path: &str, username: &str) -> usize {
-    let conn = open_connection(db_path).expect("open db");
-    let peer_id: String = conn
-        .query_row(
-            "SELECT recorded_by
-             FROM users
-             WHERE username = ?1
-             LIMIT 1",
-            rusqlite::params![username],
-            |row| row.get(0),
-        )
-        .expect("username should map to a tenant");
+    let peer_id = peer_id_for_username(db_path, username);
     tenant_index_for_peer_id(db_path, &peer_id)
+}
+
+fn peer_id_for_username(db_path: &str, username: &str) -> String {
+    let conn = open_connection(db_path).expect("open db");
+    conn.query_row(
+        "SELECT recorded_by
+         FROM users
+         WHERE username = ?1
+         LIMIT 1",
+        rusqlite::params![username],
+        |row| row.get(0),
+    )
+    .expect("username should map to a tenant")
 }
 
 fn use_tenant_for_username(db_path: &str, username: &str) {
@@ -159,6 +163,128 @@ fn rewrite_invite_addrs(invite_link: &str, addrs: &[&str]) -> String {
         .map(|addr| parse_bootstrap_address(addr).expect("parse bootstrap address"))
         .collect::<Vec<_>>();
     rewrite_bootstrap_addrs(invite_link, &parsed).expect("rewrite invite bootstrap addrs")
+}
+
+fn count_occurrences(haystack: &str, needle: &str) -> usize {
+    haystack.matches(needle).count()
+}
+
+fn invite_bootstrap_peer_id(invite_link: &str) -> String {
+    let parsed = parse_invite_link(invite_link).expect("parse invite link");
+    let invite_key = parsed.invite_signing_key();
+    hex::encode(topo::crypto::spki_fingerprint_from_ed25519_pubkey(
+        &invite_key.verifying_key().to_bytes(),
+    ))
+}
+
+fn query_workspace_id_for_peer(db_path: &str, peer_id: &str) -> String {
+    let conn = open_connection(db_path).expect("open db");
+    conn.query_row(
+        "SELECT workspace_id
+         FROM invites_accepted
+         WHERE recorded_by = ?1
+         ORDER BY created_at DESC, event_id DESC
+         LIMIT 1",
+        rusqlite::params![peer_id],
+        |row| row.get(0),
+    )
+    .expect("workspace id for peer")
+}
+
+fn local_transport_cred_source_exists(db_path: &str, peer_id: &str, source: &str) -> bool {
+    let conn = open_connection(db_path).expect("open db");
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM local_transport_creds
+             WHERE peer_id = ?1
+               AND source = ?2
+             LIMIT 1
+         )",
+        rusqlite::params![peer_id, source],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
+    .unwrap_or(false)
+}
+
+fn wait_for_transport_cred_source(db_path: &str, peer_id: &str, source: &str, timeout_ms: u64) {
+    let start = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+    loop {
+        if local_transport_cred_source_exists(db_path, peer_id, source) {
+            return;
+        }
+        if start.elapsed() >= timeout {
+            panic!(
+                "transport credential source {:?} for peer {} did not appear within {}ms (db={})",
+                source, peer_id, timeout_ms, db_path
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn dial_peer_for_tenant(
+    db_path: &str,
+    tenant_id: &str,
+    remote: SocketAddr,
+    workspace_id: &str,
+) -> Result<String, String> {
+    let client_config = topo::transport::build_tenant_client_config_from_db(db_path, tenant_id)
+        .map_err(|e| e.to_string())?;
+    let sni = topo::transport::multi_workspace::workspace_sni(workspace_id);
+
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+        .expect("dial runtime");
+    runtime.block_on(async {
+        let endpoint =
+            quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).map_err(|e| e.to_string())?;
+        topo::transport::dial_peer(&endpoint, remote, &sni, Some(&client_config))
+            .await
+            .map(|connected| {
+                let peer_id = connected.peer_id.clone();
+                connected.connection.close(0u32.into(), b"test done");
+                endpoint.close(0u32.into(), b"test done");
+                peer_id
+            })
+            .map_err(|e| e.to_string())
+    })
+}
+
+fn wait_for_direct_trust_dial(
+    db_path: &str,
+    tenant_id: &str,
+    remote: SocketAddr,
+    workspace_id: &str,
+    expected_peer_id: &str,
+    timeout_ms: u64,
+) {
+    let start = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+    let last_error = loop {
+        match dial_peer_for_tenant(db_path, tenant_id, remote, workspace_id) {
+            Ok(peer_id) => {
+                assert_eq!(
+                    peer_id, expected_peer_id,
+                    "direct dial presented unexpected transport fingerprint"
+                );
+                return;
+            }
+            Err(err) => {
+                if start.elapsed() >= timeout {
+                    break err;
+                }
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    };
+    panic!(
+        "direct dial to {} as tenant {} did not converge to {} within {}ms: {}",
+        remote, tenant_id, expected_peer_id, timeout_ms, last_error
+    );
 }
 
 fn start_joined_cli_peer(
@@ -1044,6 +1170,179 @@ fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
             &[alice_base, bob_msg, carol_msg, dave_msg],
         );
     }
+}
+
+/// Live-daemon regression: a reused invite joiner can start on the invite-derived
+/// bootstrap transport identity and must transition to the final PeerShared
+/// transport identity without requiring a manual `topo stop` / `topo start`.
+#[test]
+fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 45000;
+    let workspace_name = "reuse-live-reload";
+
+    let alice_db = tmpdir
+        .path()
+        .join("alice-reload.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let bob_db = tmpdir
+        .path()
+        .join("bob-reload.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let carol_db = tmpdir
+        .path()
+        .join("carol-reload.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace_with_details(&alice_db, workspace_name, "alice", "alice-root");
+    let alice_stdout = tmpdir.path().join("alice-reload.stdout.log");
+    let alice_stderr = tmpdir.path().join("alice-reload.stderr.log");
+    let bob_stdout = tmpdir.path().join("bob-reload.stdout.log");
+    let bob_stderr = tmpdir.path().join("bob-reload.stderr.log");
+    let carol_stdout = tmpdir.path().join("carol-reload.stdout.log");
+    let carol_stderr = tmpdir.path().join("carol-reload.stderr.log");
+
+    let mut alice_daemon = start_daemon_with_options(
+        &alice_db,
+        &DaemonOptions {
+            bind_port: Some(random_port()),
+            stdout_file: Some(alice_stdout.clone()),
+            stderr_file: Some(alice_stderr.clone()),
+            ..Default::default()
+        },
+    );
+
+    let reused_invite = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
+    let bootstrap_peer_id = invite_bootstrap_peer_id(&reused_invite);
+
+    let alice_msg = "reuse-live/alice-base";
+    let alice_eid = send_message(&alice_db, alice_msg);
+    assert_event_visible_on_all(&[&alice_db], &alice_eid, timeout_ms);
+
+    accept_invite_with_identity(&bob_db, &reused_invite, "bob", "bob-box");
+    let mut bob_daemon = start_daemon_with_options(
+        &bob_db,
+        &DaemonOptions {
+            bind_port: Some(random_port()),
+            stdout_file: Some(bob_stdout.clone()),
+            stderr_file: Some(bob_stderr.clone()),
+            ..Default::default()
+        },
+    );
+    assert_event_visible_on_all(&[&alice_db, &bob_db], &alice_eid, timeout_ms);
+
+    let bob_account = "bob/bob-box".to_string();
+    let alice_account = "alice/alice-root".to_string();
+
+    let carol_join = accept_invite_without_sync(&carol_db, &reused_invite, "carol", "carol-box")
+        .expect("accept reused invite without sync");
+    wait_for_transport_cred_source(
+        &carol_db,
+        &bootstrap_peer_id,
+        topo::db::transport_creds::CRED_SOURCE_BOOTSTRAP,
+        5000,
+    );
+    assert!(
+        !local_transport_cred_source_exists(
+            &carol_db,
+            &carol_join.peer_id,
+            topo::db::transport_creds::CRED_SOURCE_PEER_SHARED,
+        ),
+        "partial join should not have final transport credentials before bootstrap sync"
+    );
+
+    let mut carol_daemon = start_daemon_with_options(
+        &carol_db,
+        &DaemonOptions {
+            bind_port: Some(random_port()),
+            stdout_file: Some(carol_stdout.clone()),
+            stderr_file: Some(carol_stderr.clone()),
+            ..Default::default()
+        },
+    );
+
+    wait_for_transport_cred_source(
+        &carol_db,
+        &carol_join.peer_id,
+        topo::db::transport_creds::CRED_SOURCE_PEER_SHARED,
+        timeout_ms,
+    );
+
+    let bob_peer_id = peer_id_for_username(&bob_db, "bob");
+    let workspace_id = query_workspace_id_for_peer(&bob_db, &bob_peer_id);
+    let carol_addr: SocketAddr = daemon_listen_addr(&carol_db)
+        .parse()
+        .expect("carol listen addr");
+    wait_for_direct_trust_dial(
+        &bob_db,
+        &bob_peer_id,
+        carol_addr,
+        &workspace_id,
+        &carol_join.peer_id,
+        timeout_ms,
+    );
+
+    let carol_msg = "reuse-live/carol-final";
+    let carol_eid = send_message(&carol_db, carol_msg);
+    assert_event_visible_on_all(&[&alice_db, &bob_db, &carol_db], &carol_eid, timeout_ms);
+
+    for db in [&alice_db, &bob_db, &carol_db] {
+        assert_cli_state(
+            db,
+            &[workspace_name],
+            workspace_name,
+            1,
+            3,
+            &["alice", "bob", "carol"],
+            &[&alice_account, &bob_account, "carol/carol-box"],
+            &[alice_msg, carol_msg],
+        );
+    }
+
+    stop_daemon(&alice_db, &mut alice_daemon);
+    stop_daemon(&bob_db, &mut bob_daemon);
+    stop_daemon(&carol_db, &mut carol_daemon);
+    wait_for_daemon_stopped(&alice_db, Duration::from_secs(10));
+    wait_for_daemon_stopped(&bob_db, Duration::from_secs(10));
+    wait_for_daemon_stopped(&carol_db, Duration::from_secs(10));
+
+    let bob_log_text = format!(
+        "{}{}",
+        std::fs::read_to_string(&bob_stdout).unwrap_or_default(),
+        std::fs::read_to_string(&bob_stderr).unwrap_or_default()
+    );
+    let carol_log_text = format!(
+        "{}{}",
+        std::fs::read_to_string(&carol_stdout).unwrap_or_default(),
+        std::fs::read_to_string(&carol_stderr).unwrap_or_default()
+    );
+    assert!(
+        count_occurrences(&bob_log_text, "Certificate mismatch connecting to") <= 1,
+        "bob daemon log should suppress repeated outbound trust mismatch warnings:\n{}",
+        bob_log_text
+    );
+    assert!(
+        count_occurrences(&bob_log_text, "Rejected incoming connection:") <= 1,
+        "bob daemon log should suppress repeated inbound trust mismatch warnings:\n{}",
+        bob_log_text
+    );
+    assert!(
+        count_occurrences(&carol_log_text, "Certificate mismatch connecting to") <= 1,
+        "carol daemon log should suppress repeated outbound trust mismatch warnings:\n{}",
+        carol_log_text
+    );
+    assert!(
+        count_occurrences(&carol_log_text, "Rejected incoming connection:") <= 1,
+        "carol daemon log should suppress repeated inbound trust mismatch warnings:\n{}",
+        carol_log_text
+    );
 }
 
 /// Mixed old-invite reuse and fresh invite creation for users.
@@ -2502,11 +2801,13 @@ fn test_cli_connect_to_dead_address_error() {
     // Bob accepts the invite — daemon will try to connect to the dead address.
     // Redirect daemon output to file so we can inspect logs after shutdown.
     let log_dir = std::path::Path::new(&db_b).parent().unwrap();
+    let stdout_path = log_dir.join("daemon_stdout.log");
     let stderr_path = log_dir.join("daemon_stderr.log");
 
     let _daemon_b = start_daemon_with_options(
         &db_b,
         &DaemonOptions {
+            stdout_file: Some(stdout_path.clone()),
             stderr_file: Some(stderr_path.clone()),
             ..Default::default()
         },
@@ -2532,7 +2833,11 @@ fn test_cli_connect_to_dead_address_error() {
     std::thread::sleep(Duration::from_millis(500));
     drop(_daemon_b);
 
-    let output = std::fs::read_to_string(&stderr_path).unwrap_or_default();
+    let output = format!(
+        "{}{}",
+        std::fs::read_to_string(&stdout_path).unwrap_or_default(),
+        std::fs::read_to_string(&stderr_path).unwrap_or_default()
+    );
 
     assert!(
         output.contains("timed out")
@@ -2577,11 +2882,13 @@ fn test_cli_untrusted_peer_certificate_error() {
     // Bob's daemon — redirect stdout to file for log inspection.
     create_workspace(&db_b);
     let log_dir_b = std::path::Path::new(&db_b).parent().unwrap();
+    let bob_stdout = log_dir_b.join("daemon_stdout.log");
     let bob_stderr = log_dir_b.join("daemon_stderr.log");
 
     let _daemon_b = start_daemon_with_options(
         &db_b,
         &DaemonOptions {
+            stdout_file: Some(bob_stdout.clone()),
             stderr_file: Some(bob_stderr.clone()),
             ..Default::default()
         },
@@ -2607,7 +2914,11 @@ fn test_cli_untrusted_peer_certificate_error() {
     std::thread::sleep(Duration::from_millis(500));
     drop(_daemon_b);
 
-    let bob_log = std::fs::read_to_string(&bob_stderr).unwrap_or_default();
+    let bob_log = format!(
+        "{}{}",
+        std::fs::read_to_string(&bob_stdout).unwrap_or_default(),
+        std::fs::read_to_string(&bob_stderr).unwrap_or_default()
+    );
 
     // Bob should see our improved error about certificate mismatch
     // (his client-side TLS verifier rejects Alice's cert because the
@@ -2626,6 +2937,16 @@ fn test_cli_untrusted_peer_certificate_error() {
             || bob_log.contains("not trusted by this workspace")
             || bob_log.contains("Certificate mismatch"),
         "error should include human-readable explanation, got:\n{}",
+        bob_log
+    );
+    assert!(
+        count_occurrences(&bob_log, "Certificate mismatch connecting to") <= 1,
+        "default logging should suppress repeated identical outbound certificate mismatch warnings, got:\n{}",
+        bob_log
+    );
+    assert!(
+        count_occurrences(&bob_log, "Rejected incoming connection:") <= 1,
+        "default logging should suppress repeated identical inbound certificate mismatch warnings, got:\n{}",
         bob_log
     );
 }
