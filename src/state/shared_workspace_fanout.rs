@@ -39,7 +39,12 @@ fn fanout_source(origin_peer_id: &str) -> String {
 
 /// Check if a sibling tenant has been removed by looking up their local
 /// transport cert's SPKI fingerprint and checking removal_watch.
-fn is_sibling_removed(conn: &Connection, sibling_peer_id: &str) -> bool {
+///
+/// `check_scopes` lists all `recorded_by` scopes to check for removal.
+/// During fanout the origin tenant's scope is already projected (drained),
+/// so we check both the sibling's own scope AND the origin's scope to
+/// catch same-batch removal+message scenarios.
+fn is_sibling_removed(conn: &Connection, sibling_peer_id: &str, check_scopes: &[&str]) -> bool {
     // Load sibling's cert from local_transport_creds
     let cert_der: Option<Vec<u8>> = conn
         .query_row(
@@ -54,7 +59,12 @@ fn is_sibling_removed(conn: &Connection, sibling_peer_id: &str) -> bool {
     let Ok(spki) = extract_spki_fingerprint(&cert_der) else {
         return false;
     };
-    crate::state::db::removal_watch::is_peer_removed(conn, sibling_peer_id, &spki).unwrap_or(false)
+    for scope in check_scopes {
+        if crate::state::db::removal_watch::is_peer_removed(conn, scope, &spki).unwrap_or(false) {
+            return true;
+        }
+    }
+    false
 }
 
 pub(crate) fn fanout_stored_shared_event_immediate(
@@ -104,9 +114,14 @@ pub(crate) fn fanout_shared_event_immediate(
         .as_millis() as i64;
     let source = fanout_source(origin_peer_id);
 
+    let check_scopes: Vec<&str> = siblings
+        .iter()
+        .map(|s| s.as_str())
+        .chain(std::iter::once(origin_peer_id))
+        .collect();
     let active_siblings: Vec<&String> = siblings
         .iter()
-        .filter(|s| !is_sibling_removed(conn, s))
+        .filter(|s| !is_sibling_removed(conn, s, &check_scopes))
         .collect();
     for sibling in &active_siblings {
         insert_recorded_event(conn, sibling, event_id, now_ms, &source)?;
@@ -137,10 +152,15 @@ pub(crate) fn fanout_shared_event_enqueue(
     let source = fanout_source(&fanout.origin_peer_id);
 
     let mut fanned = Vec::new();
+    let check_scopes: Vec<&str> = siblings
+        .iter()
+        .map(|s| s.as_str())
+        .chain(std::iter::once(fanout.origin_peer_id.as_str()))
+        .collect();
     for sibling in &siblings {
-        // Skip removed tenants: look up their SPKI from local creds and
-        // check removal status to prevent leaking post-removal events.
-        if is_sibling_removed(conn, sibling) {
+        // Skip removed tenants: check removal in both sibling's and
+        // origin's scope to catch same-batch removal+message scenarios.
+        if is_sibling_removed(conn, sibling, &check_scopes) {
             continue;
         }
         insert_recorded_event(conn, sibling, &fanout.event_id, now_ms, &source)?;
