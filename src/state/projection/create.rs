@@ -117,10 +117,15 @@ fn store_blob_only(
     insert_recorded_event(conn, recorded_by, &event_id, now_ms, "local_create")
         .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
-    // Pre-write a pending fanout entry for shared events BEFORE projection.
-    // This ensures sibling fanout survives a crash between projection and
-    // the actual fanout call (startup recovery picks up pending entries).
+    // For shared events, ensure crash recovery can complete both the
+    // origin's own projection and sibling fanout:
+    // 1. Enqueue origin in project_queue so startup drain projects it.
+    // 2. Write a pending fanout entry so sibling fanout survives a crash.
     if meta.share_scope == crate::event_modules::registry::ShareScope::Shared {
+        let event_id_b64 = crate::crypto::event_id_to_base64(&event_id);
+        let pq = crate::state::db::project_queue::ProjectQueue::new(conn);
+        let _ = pq.enqueue(recorded_by, &event_id_b64);
+
         if let Some(ref ws_id) = ws_id_for_neg {
             let fanout_entry = crate::state::shared_workspace_fanout::SharedEventFanout {
                 origin_peer_id: recorded_by.to_string(),
@@ -148,6 +153,12 @@ fn project_stored_event(
 
     match decision {
         ProjectionDecision::Valid | ProjectionDecision::AlreadyProcessed => {
+            // Clean up the crash-recovery project_queue entry after
+            // successful inline projection so drain doesn't re-process.
+            let event_id_b64 = crate::crypto::event_id_to_base64(event_id);
+            let pq = crate::state::db::project_queue::ProjectQueue::new(conn);
+            let _ = pq.mark_done(recorded_by, &event_id_b64);
+
             fanout_stored_shared_event_immediate(conn, recorded_by, event_id)
                 .map_err(|e| CreateEventError::DbError(e.to_string()))?;
             Ok(*event_id)

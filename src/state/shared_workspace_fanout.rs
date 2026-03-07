@@ -238,6 +238,11 @@ pub(crate) fn fanout_shared_event_immediate(
     if is_origin_rejected(conn, origin_peer_id, event_id) {
         return Ok(());
     }
+    // Skip fanout from removed tenants — a removed local tenant must not
+    // inject new shared events into sibling scopes.
+    if is_sibling_removed(conn, origin_peer_id, &[origin_peer_id]) {
+        return Ok(());
+    }
     let siblings = sibling_tenants_in_workspace(conn, origin_peer_id, workspace_id)?;
     if siblings.is_empty() {
         return Ok(());
@@ -275,6 +280,10 @@ pub(crate) fn fanout_shared_event_enqueue(
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     // Skip fanout for events the origin tenant rejected (bad signature, etc.)
     if is_origin_rejected(conn, &fanout.origin_peer_id, &fanout.event_id) {
+        return Ok(Vec::new());
+    }
+    // Skip fanout from removed tenants.
+    if is_sibling_removed(conn, &fanout.origin_peer_id, &[&fanout.origin_peer_id]) {
         return Ok(Vec::new());
     }
     let siblings =
