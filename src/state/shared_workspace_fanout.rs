@@ -411,13 +411,24 @@ pub(crate) fn fanout_shared_event_enqueue(
     if is_origin_rejected(conn, &fanout.origin_peer_id, &fanout.event_id) {
         return Ok(Vec::new());
     }
-    // No origin-removal check here. For wire-ingested events,
-    // origin_peer_id is the local ingesting tenant, NOT the event author.
-    // For local-create entries, the immediate path already blocks removed
-    // tenants at creation time. If a pending entry survived a crash, the
-    // event was created while the tenant was still valid and must fan out.
+    // Check origin removal across all workspace scopes. For wire-ingested
+    // events origin_peer_id is the local ingesting tenant (should never be
+    // removed while actively ingesting). For local-create pending entries
+    // surviving a crash, the removal may have been projected after the
+    // pending entry was written — re-check here to prevent post-removal
+    // event leakage during startup recovery.
     let siblings =
         sibling_tenants_in_workspace(conn, &fanout.origin_peer_id, &fanout.workspace_id)?;
+    if !is_removal_event(conn, &fanout.event_id) {
+        let all_scopes: Vec<&str> = siblings
+            .iter()
+            .map(|s| s.as_str())
+            .chain(std::iter::once(fanout.origin_peer_id.as_str()))
+            .collect();
+        if is_sibling_removed(conn, &fanout.origin_peer_id, &all_scopes) {
+            return Ok(Vec::new());
+        }
+    }
     if siblings.is_empty() {
         return Ok(Vec::new());
     }
