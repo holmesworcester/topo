@@ -21,10 +21,15 @@ fn sibling_tenants_in_workspace(
     workspace_id: &str,
 ) -> Result<Vec<String>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT recorded_by
-         FROM invites_accepted
-         WHERE workspace_id = ?1 AND recorded_by <> ?2
-         ORDER BY recorded_by",
+        "SELECT DISTINCT ia.recorded_by
+         FROM invites_accepted ia
+         WHERE ia.workspace_id = ?1 AND ia.recorded_by <> ?2
+           AND NOT EXISTS (
+             SELECT 1 FROM removed_entities r
+             WHERE r.recorded_by = ia.recorded_by
+               AND r.removal_type IN ('user', 'peer')
+           )
+         ORDER BY ia.recorded_by",
     )?;
     let rows = stmt.query_map(rusqlite::params![workspace_id, origin_peer_id], |row| {
         row.get::<_, String>(0)

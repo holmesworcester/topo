@@ -785,8 +785,14 @@ fn dispatch(
                 },
             }
         }
-        RpcMethod::AssertNow { predicate } => match state.require_active_peer() {
-            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+        RpcMethod::AssertNow { predicate } => {
+            // Use active tenant if selected, otherwise fall back to
+            // transport-scope resolution so pre-workspace daemons work.
+            let resolve = match state.require_active_peer() {
+                Ok(peer_id) => service::open_db_for_peer(db_path, &peer_id),
+                Err(_) => service::open_db_load(db_path),
+            };
+            match resolve {
                 Ok((recorded_by, db)) => match crate::assert::parse_predicate(&predicate) {
                     Ok((field, op, expected)) => {
                         match crate::assert::query_field(&db, &field, &recorded_by) {
@@ -804,26 +810,39 @@ fn dispatch(
                     Err(e) => RpcResponse::error(e),
                 },
                 Err(e) => RpcResponse::error(e.to_string()),
-            },
-            Err(e) => RpcResponse::error(e),
-        },
+            }
+        }
         RpcMethod::AssertEventually {
             predicate,
             timeout_ms,
             interval_ms,
-        } => match state.require_active_peer() {
-            Ok(peer_id) => match crate::assert::assert_eventually_for_peer(
-                db_path,
-                &peer_id,
-                &predicate,
-                timeout_ms,
-                interval_ms,
-            ) {
-                Ok(data) => RpcResponse::success(data),
-                Err(e) => RpcResponse::error(e.to_string()),
-            },
-            Err(e) => RpcResponse::error(e),
-        },
+        } => {
+            // Use active tenant if selected, otherwise fall back to
+            // transport-scope resolution so pre-workspace daemons work.
+            match state.require_active_peer() {
+                Ok(peer_id) => match crate::assert::assert_eventually_for_peer(
+                    db_path,
+                    &peer_id,
+                    &predicate,
+                    timeout_ms,
+                    interval_ms,
+                ) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(_) => {
+                    match crate::assert::assert_eventually(
+                        db_path,
+                        &predicate,
+                        timeout_ms,
+                        interval_ms,
+                    ) {
+                        Ok(data) => RpcResponse::success(data),
+                        Err(e) => RpcResponse::error(e.to_string()),
+                    }
+                }
+            }
+        }
         RpcMethod::Reactions => match state.require_active_peer() {
             Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
                 Ok((recorded_by, db)) => match reaction::list(&db, &recorded_by) {
