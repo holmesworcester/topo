@@ -282,18 +282,32 @@ fn prepare_invite_acceptance(
     };
 
     // Record bootstrap context before accept so InviteAccepted projection can
-    // materialize trust rows for this tenant.
+    // materialize trust rows for this tenant. When the invite carries no
+    // bootstrap addresses, persist one empty-address marker row so discovery
+    // recovery can still use the invite SPKI without generating a bootstrap
+    // autodial target.
     let invite_eid_b64 = event_id_to_base64(&invite_event_id);
     let ws_b64 = event_id_to_base64(&workspace_id);
-    for addr in &invite.bootstrap_addrs {
+    if invite.bootstrap_addrs.is_empty() {
         crate::db::transport_trust::append_bootstrap_context(
             &db,
             &derived_peer_id,
             &invite_eid_b64,
             &ws_b64,
-            &addr.to_bootstrap_addr_string(),
+            "",
             &invite.bootstrap_spki_fingerprint,
         )?;
+    } else {
+        for addr in &invite.bootstrap_addrs {
+            crate::db::transport_trust::append_bootstrap_context(
+                &db,
+                &derived_peer_id,
+                &invite_eid_b64,
+                &ws_b64,
+                &addr.to_bootstrap_addr_string(),
+                &invite.bootstrap_spki_fingerprint,
+            )?;
+        }
     }
 
     Ok(PreparedInviteAcceptance {

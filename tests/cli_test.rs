@@ -483,6 +483,42 @@ fn assert_event_visible_on_all(db_paths: &[&str], event_id: &str, timeout_ms: u6
     }
 }
 
+fn assert_event_visible_for_username(
+    db_path: &str,
+    username: &str,
+    event_id: &str,
+    timeout_ms: u64,
+) {
+    use_tenant_for_username(db_path, username);
+    assert_eventually(db_path, &format!("has_event:{} >= 1", event_id), timeout_ms);
+}
+
+fn assert_identity_eventually_materialized(db_path: &str, timeout_ms: u64) {
+    let start = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+    loop {
+        let identity = topo_cmd(db_path, &["identity"]);
+        let stdout = String::from_utf8_lossy(&identity.stdout);
+        if identity.status.success()
+            && stdout.contains("Transport:")
+            && !stdout.contains("User:      (none)")
+            && !stdout.contains("Peer:      (none)")
+        {
+            return;
+        }
+        if start.elapsed() >= timeout {
+            panic!(
+                "identity did not materialize within {}ms for {}:\nstdout:\n{}\nstderr:\n{}",
+                timeout_ms,
+                db_path,
+                stdout,
+                String::from_utf8_lossy(&identity.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn assert_eventually_users_include(db_path: &str, expected_users: &[&str], timeout_ms: u64) {
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
@@ -668,50 +704,53 @@ fn test_cli_ongoing_sync() {
 }
 
 /// Two separate local daemons should discover and sync on the same machine
-/// even when invite-seeded placeholder autodial is disabled.
+/// even when the invite carries no bootstrap addresses.
 #[test]
 #[cfg(feature = "discovery")]
-fn test_cli_local_mdns_discovery_without_placeholder_autodial() {
+fn test_cli_local_mdns_discovery_without_bootstrap_addresses() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout_ms = 20000;
+    let timeout_ms = 30000;
 
     // Alice creates workspace and starts daemon
     create_workspace(&alice_db);
-    let _alice = start_daemon_with_options(
-        &alice_db,
-        &DaemonOptions {
-            disable_placeholder_autodial: true,
-            ..Default::default()
-        },
+    let _alice = start_daemon(&alice_db);
+    let _bootstrap_eid = send_message(&alice_db, "bootstrap");
+    assert_now(&alice_db, "message_count >= 1");
+
+    // Alice creates invite while daemon is running, then rewrites it to carry
+    // no bootstrap endpoints so Bob must recover via mDNS.
+    let invite_link = rewrite_invite_addrs(
+        &create_invite(&alice_db, &daemon_listen_addr(&alice_db)),
+        &[],
+    );
+    assert!(
+        parse_invite_link(&invite_link)
+            .expect("parse empty-address invite")
+            .bootstrap_addrs
+            .is_empty(),
+        "invite should carry no bootstrap addresses"
     );
 
-    // Alice creates invite while daemon is running.
-    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
-
-    // Bob accepts invite and starts daemon with placeholder autodial disabled.
-    // With placeholder autodial disabled, Bob discovers Alice via mDNS only.
+    // Bob accepts invite and starts daemon normally. With no bootstrap
+    // addresses persisted, runtime recovery must come from mDNS only.
     accept_invite(&bob_db, &invite_link);
-    let _bob = start_daemon_with_options(
-        &bob_db,
-        &DaemonOptions {
-            disable_placeholder_autodial: true,
-            ..Default::default()
-        },
-    );
+    let _bob = start_daemon(&bob_db);
+    assert_eventually(&bob_db, "message_count >= 1", timeout_ms);
+    assert_identity_eventually_materialized(&bob_db, timeout_ms);
 
     // Validate bidirectional convergence using messages created after both
-    // daemons are running (avoids counting accept bootstrap artifacts).
-    let alice_live_eid = send_message(&alice_db, "alice-via-mdns-localhost");
+    // daemons are running (avoids counting accept-time artifacts).
+    let alice_live_eid = send_message(&alice_db, "alice-via-mdns-empty-bootstrap");
     assert_eventually(
         &bob_db,
         &format!("has_event:{} >= 1", alice_live_eid),
         timeout_ms,
     );
 
-    let bob_msg_eid = send_message(&bob_db, "bob-via-mdns-localhost");
+    let bob_msg_eid = send_message(&bob_db, "bob-via-mdns-empty-bootstrap");
     assert_eventually(
         &alice_db,
         &format!("has_event:{} >= 1", bob_msg_eid),
@@ -1721,6 +1760,276 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
             && !yuki_view.contains("alpha-space/carol-step-3"),
         "zeta tenant view should not leak alpha workspace messages:\n{}",
         yuki_view
+    );
+}
+
+/// Mixed realistic topology:
+/// 1. a shared DB accepts empty-address invites into two workspaces and must
+///    recover via mDNS,
+/// 2. one additional alpha peer joins with explicit endpoint addresses
+///    (dead-first, live-second),
+/// 3. CLI state remains workspace-scoped with overlapping but non-identical
+///    membership across clients.
+#[test]
+#[cfg(feature = "discovery")]
+fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_endpoints() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 45000;
+
+    let alpha_db = tmpdir.path().join("alpha.db").to_str().unwrap().to_string();
+    let zeta_db = tmpdir.path().join("zeta.db").to_str().unwrap().to_string();
+    let shared_db = tmpdir
+        .path()
+        .join("shared.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let dave_db = tmpdir.path().join("dave.db").to_str().unwrap().to_string();
+
+    create_workspace_with_details(&alpha_db, "alpha-space", "alpha", "alpha-root");
+    let alpha = StartedCliPeer {
+        db: alpha_db,
+        username: "alpha".to_string(),
+        device_name: "alpha-root".to_string(),
+        _daemon: start_daemon(
+            tmpdir
+                .path()
+                .join("alpha.db")
+                .to_str()
+                .expect("alpha db path"),
+        ),
+    };
+    let alpha_account = alpha.account_label();
+    let alpha_empty_invite = rewrite_invite_addrs(
+        &create_invite(&alpha.db, &daemon_listen_addr(&alpha.db)),
+        &[],
+    );
+    assert!(
+        parse_invite_link(&alpha_empty_invite)
+            .expect("parse alpha empty-address invite")
+            .bootstrap_addrs
+            .is_empty(),
+        "alpha invite should carry no bootstrap addresses"
+    );
+
+    create_workspace_with_details(&zeta_db, "zeta-space", "zeta", "zeta-root");
+    let zeta = StartedCliPeer {
+        db: zeta_db,
+        username: "zeta".to_string(),
+        device_name: "zeta-root".to_string(),
+        _daemon: start_daemon(
+            tmpdir
+                .path()
+                .join("zeta.db")
+                .to_str()
+                .expect("zeta db path"),
+        ),
+    };
+    let zeta_account = zeta.account_label();
+    let zeta_empty_invite =
+        rewrite_invite_addrs(&create_invite(&zeta.db, &daemon_listen_addr(&zeta.db)), &[]);
+    assert!(
+        parse_invite_link(&zeta_empty_invite)
+            .expect("parse zeta empty-address invite")
+            .bootstrap_addrs
+            .is_empty(),
+        "zeta invite should carry no bootstrap addresses"
+    );
+
+    accept_invite_with_identity(&shared_db, &alpha_empty_invite, "bob-alpha", "bob-terminal");
+    accept_invite_with_identity(&shared_db, &zeta_empty_invite, "yuki-zeta", "yuki-terminal");
+    accept_invite_with_identity(
+        &shared_db,
+        &alpha_empty_invite,
+        "carol-alpha",
+        "carol-terminal",
+    );
+    let _shared_daemon = start_daemon(&shared_db);
+
+    assert_eventually_users_include(
+        &alpha.db,
+        &["alpha", "bob-alpha", "carol-alpha"],
+        timeout_ms,
+    );
+    assert_eventually_users_include(&zeta.db, &["zeta", "yuki-zeta"], timeout_ms);
+
+    let alpha_live_addr = daemon_listen_addr(&alpha.db);
+    let alpha_live_port = alpha_live_addr
+        .rsplit_once(':')
+        .expect("alpha listen addr should contain port")
+        .1
+        .to_string();
+    let alpha_explicit_invite = rewrite_invite_addrs(
+        &create_invite(&alpha.db, &alpha_live_addr),
+        &[
+            &format!("127.0.0.1:{}", random_port()),
+            &format!("localhost:{}", alpha_live_port),
+        ],
+    );
+    let dave = {
+        accept_invite_with_identity(
+            &dave_db,
+            &alpha_explicit_invite,
+            "dave-alpha",
+            "dave-laptop",
+        );
+        StartedCliPeer {
+            db: dave_db,
+            username: "dave-alpha".to_string(),
+            device_name: "dave-laptop".to_string(),
+            _daemon: start_daemon(
+                tmpdir
+                    .path()
+                    .join("dave.db")
+                    .to_str()
+                    .expect("dave db path"),
+            ),
+        }
+    };
+    let dave_account = dave.account_label();
+
+    assert_eventually_users_include(
+        &alpha.db,
+        &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
+        timeout_ms,
+    );
+
+    let alpha_live_msg = "alpha-space/alpha-via-empty-bootstrap-mdns";
+    let alpha_live_eid = send_message(&alpha.db, alpha_live_msg);
+    assert_event_visible_for_username(&shared_db, "bob-alpha", &alpha_live_eid, timeout_ms);
+    assert_event_visible_for_username(&shared_db, "carol-alpha", &alpha_live_eid, timeout_ms);
+    assert_event_visible_on_all(&[&dave.db], &alpha_live_eid, timeout_ms);
+
+    let zeta_live_msg = "zeta-space/zeta-via-empty-bootstrap-mdns";
+    let zeta_live_eid = send_message(&zeta.db, zeta_live_msg);
+    assert_event_visible_for_username(&shared_db, "yuki-zeta", &zeta_live_eid, timeout_ms);
+
+    let dave_live_msg = "alpha-space/dave-via-explicit-endpoints";
+    let dave_live_eid = send_message(&dave.db, dave_live_msg);
+    assert_event_visible_on_all(&[&alpha.db], &dave_live_eid, timeout_ms);
+    assert_event_visible_for_username(&shared_db, "bob-alpha", &dave_live_eid, timeout_ms);
+    assert_event_visible_for_username(&shared_db, "carol-alpha", &dave_live_eid, timeout_ms);
+
+    let bob_live_msg = "alpha-space/bob-from-shared-db";
+    let bob_live_eid = send_message_as_username(&shared_db, "bob-alpha", bob_live_msg);
+    assert_event_visible_on_all(&[&alpha.db, &dave.db], &bob_live_eid, timeout_ms);
+    assert_event_visible_for_username(&shared_db, "carol-alpha", &bob_live_eid, timeout_ms);
+
+    let yuki_live_msg = "zeta-space/yuki-from-shared-db";
+    let yuki_live_eid = send_message_as_username(&shared_db, "yuki-zeta", yuki_live_msg);
+    assert_event_visible_on_all(&[&zeta.db], &yuki_live_eid, timeout_ms);
+
+    let bob_alpha_account = "bob-alpha/bob-terminal";
+    let carol_alpha_account = "carol-alpha/carol-terminal";
+    let yuki_zeta_account = "yuki-zeta/yuki-terminal";
+
+    assert_eventually_users_include(
+        &dave.db,
+        &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
+        timeout_ms,
+    );
+
+    assert_cli_state(
+        &alpha.db,
+        &["alpha-space"],
+        "alpha-space",
+        1,
+        4,
+        &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
+        &[
+            alpha_account.as_str(),
+            bob_alpha_account,
+            carol_alpha_account,
+            dave_account.as_str(),
+        ],
+        &[alpha_live_msg, dave_live_msg, bob_live_msg],
+    );
+    assert_cli_state(
+        &zeta.db,
+        &["zeta-space"],
+        "zeta-space",
+        1,
+        2,
+        &["zeta", "yuki-zeta"],
+        &[zeta_account.as_str(), yuki_zeta_account],
+        &[zeta_live_msg, yuki_live_msg],
+    );
+    assert_cli_state(
+        &dave.db,
+        &["alpha-space"],
+        "alpha-space",
+        1,
+        4,
+        &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
+        &[
+            alpha_account.as_str(),
+            bob_alpha_account,
+            carol_alpha_account,
+            dave_account.as_str(),
+        ],
+        &[alpha_live_msg, dave_live_msg, bob_live_msg],
+    );
+    assert_cli_state_for_username(
+        &shared_db,
+        "bob-alpha",
+        &["alpha-space", "zeta-space"],
+        "alpha-space",
+        3,
+        4,
+        &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
+        &[
+            alpha_account.as_str(),
+            bob_alpha_account,
+            carol_alpha_account,
+            dave_account.as_str(),
+        ],
+        &[alpha_live_msg, dave_live_msg, bob_live_msg],
+    );
+    assert_cli_state_for_username(
+        &shared_db,
+        "carol-alpha",
+        &["alpha-space", "zeta-space"],
+        "alpha-space",
+        3,
+        4,
+        &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
+        &[
+            alpha_account.as_str(),
+            bob_alpha_account,
+            carol_alpha_account,
+            dave_account.as_str(),
+        ],
+        &[alpha_live_msg, dave_live_msg, bob_live_msg],
+    );
+    assert_cli_state_for_username(
+        &shared_db,
+        "yuki-zeta",
+        &["alpha-space", "zeta-space"],
+        "zeta-space",
+        3,
+        2,
+        &["zeta", "yuki-zeta"],
+        &[zeta_account.as_str(), yuki_zeta_account],
+        &[zeta_live_msg, yuki_live_msg],
+    );
+
+    use_tenant_for_username(&shared_db, "yuki-zeta");
+    let yuki_view = get_view_raw(&shared_db);
+    assert!(
+        !yuki_view.contains(alpha_live_msg)
+            && !yuki_view.contains(dave_live_msg)
+            && !yuki_view.contains(bob_live_msg),
+        "zeta tenant view should not leak alpha workspace messages:\n{}",
+        yuki_view
+    );
+
+    use_tenant_for_username(&shared_db, "bob-alpha");
+    let bob_view = get_view_raw(&shared_db);
+    assert!(
+        !bob_view.contains(zeta_live_msg) && !bob_view.contains(yuki_live_msg),
+        "alpha tenant view should not leak zeta workspace messages:\n{}",
+        bob_view
     );
 }
 

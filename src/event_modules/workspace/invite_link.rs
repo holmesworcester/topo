@@ -289,6 +289,9 @@ pub enum InviteLinkError {
 // Device-link invite:
 //   topo://link/v4/device_link/INVITE_ID.<hex64>/INVITE_PRIVKEY.<hex64>/WORKSPACE.<hex64>/USER_ID.<hex64>/PEER_SPKI_PUBKEY.<hex64>/ADDRESS.<a1>,<a2>
 //
+// `ADDRESS.` may be empty, representing an invite that relies entirely on
+// later discovery/recovery rather than embedded bootstrap endpoints.
+//
 // Address tokens: port omitted when default 4433.  IPv6 is fully expanded
 // as 8 dash-separated groups of 4 hex digits (no brackets) to stay
 // shell-safe and linkifiable.  Non-default port uses `_port` suffix.
@@ -300,11 +303,6 @@ pub fn create_invite_link(
     bootstrap_addrs: &[BootstrapAddress],
     bootstrap_spki: &[u8; 32],
 ) -> Result<String, InviteLinkError> {
-    if bootstrap_addrs.is_empty() {
-        return Err(InviteLinkError::InvalidPayload(
-            "at least one bootstrap address is required".to_string(),
-        ));
-    }
     for addr in bootstrap_addrs {
         addr.validate()?;
     }
@@ -399,20 +397,14 @@ pub fn parse_invite_link(link: &str) -> Result<ParsedInviteLink, InviteLinkError
     // Addresses
     let addr_str = find_field("ADDRESS.")
         .ok_or_else(|| InviteLinkError::Decode("missing ADDRESS".to_string()))?;
-    if addr_str.is_empty() {
-        return Err(InviteLinkError::InvalidPayload(
-            "at least one bootstrap address is required".to_string(),
-        ));
-    }
-    let bootstrap_addrs: Vec<BootstrapAddress> = addr_str
-        .split(',')
-        .map(|t| BootstrapAddress::from_link_token(t))
-        .collect::<Result<Vec<_>, _>>()?;
-    if bootstrap_addrs.is_empty() {
-        return Err(InviteLinkError::InvalidPayload(
-            "at least one bootstrap address is required".to_string(),
-        ));
-    }
+    let bootstrap_addrs: Vec<BootstrapAddress> = if addr_str.is_empty() {
+        Vec::new()
+    } else {
+        addr_str
+            .split(',')
+            .map(|t| BootstrapAddress::from_link_token(t))
+            .collect::<Result<Vec<_>, _>>()?
+    };
     for addr in &bootstrap_addrs {
         addr.validate()?;
     }
@@ -677,15 +669,19 @@ mod tests {
     }
 
     #[test]
-    fn test_empty_bootstrap_addrs_rejected() {
+    fn test_empty_bootstrap_addrs_roundtrip() {
         let invite = InviteData {
             invite_event_id: [1u8; 32],
             invite_key: SigningKey::from_bytes(&[2u8; 32]),
             workspace_id: [3u8; 32],
             invite_type: InviteType::User,
         };
-        let err = create_invite_link(&invite, &[], &[4u8; 32]).unwrap_err();
-        assert!(err.to_string().contains("at least one bootstrap address"));
+        let bootstrap_spki = [4u8; 32];
+        let link = create_invite_link(&invite, &[], &bootstrap_spki).unwrap();
+        assert!(link.ends_with("/ADDRESS."));
+        let parsed = parse_invite_link(&link).unwrap();
+        assert!(parsed.bootstrap_addrs.is_empty());
+        assert_eq!(parsed.bootstrap_spki_fingerprint, bootstrap_spki);
     }
 
     #[test]
@@ -777,6 +773,24 @@ mod tests {
         let rewritten = rewrite_bootstrap_addrs(&link, &new_addrs).unwrap();
         let parsed = parse_invite_link(&rewritten).unwrap();
         assert_eq!(parsed.bootstrap_addrs, new_addrs);
+    }
+
+    #[test]
+    fn test_rewrite_bootstrap_addrs_to_empty() {
+        let invite = InviteData {
+            invite_event_id: [1u8; 32],
+            invite_key: SigningKey::from_bytes(&[2u8; 32]),
+            workspace_id: [3u8; 32],
+            invite_type: InviteType::User,
+        };
+        let orig_addrs = vec![BootstrapAddress::Ipv4 {
+            ip: "127.0.0.1".parse().unwrap(),
+            port: 4433,
+        }];
+        let link = create_invite_link(&invite, &orig_addrs, &[4u8; 32]).unwrap();
+        let rewritten = rewrite_bootstrap_addrs(&link, &[]).unwrap();
+        let parsed = parse_invite_link(&rewritten).unwrap();
+        assert!(parsed.bootstrap_addrs.is_empty());
     }
 
     #[test]

@@ -584,6 +584,11 @@ pub fn accept_invite(db: &str, invite_link: &str) {
 
 /// Accept an invite with custom username and device name.
 pub fn accept_invite_with_identity(db: &str, invite_link: &str, username: &str, devicename: &str) {
+    let signer_wait_timeout =
+        match topo::event_modules::workspace::invite_link::parse_invite_link(invite_link) {
+            Ok(invite) if invite.bootstrap_addrs.is_empty() => Duration::from_secs(2),
+            _ => Duration::from_secs(60),
+        };
     let tmp_daemon = start_daemon(db);
     let output = Command::new(bin())
         .arg("accept")
@@ -622,7 +627,7 @@ pub fn accept_invite_with_identity(db: &str, invite_link: &str, username: &str, 
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    if let Err(debug) = wait_for_local_peer_signer(db, Duration::from_secs(60)) {
+    if let Err(debug) = wait_for_local_peer_signer(db, signer_wait_timeout) {
         eprintln!(
             "accept_invite: peer signer not materialized yet; continuing (db={}): {}",
             db, debug
