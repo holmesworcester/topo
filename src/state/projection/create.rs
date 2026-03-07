@@ -117,6 +117,19 @@ fn store_blob_only(
     insert_recorded_event(conn, recorded_by, &event_id, now_ms, "local_create")
         .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
+    // Enqueue the origin event in project_queue for crash recovery: if the
+    // process dies before project_one runs, the event can be replayed on
+    // startup via drain_project_queue.
+    {
+        let event_id_b64 = event_id_to_base64(&event_id);
+        let _ = conn.execute(
+            "INSERT OR IGNORE INTO project_queue (peer_id, event_id, available_at)
+             SELECT ?1, ?2, ?3
+             WHERE NOT EXISTS (SELECT 1 FROM valid_events WHERE peer_id=?1 AND event_id=?2)",
+            rusqlite::params![recorded_by, &event_id_b64, now_ms],
+        );
+    }
+
     // Pre-write a pending fanout entry for shared events BEFORE projection.
     // This ensures sibling fanout survives a crash between projection and
     // the actual fanout call (startup recovery picks up pending entries).
