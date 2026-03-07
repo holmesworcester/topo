@@ -282,10 +282,14 @@ pub(crate) fn fanout_shared_event_enqueue(
     if is_origin_rejected(conn, &fanout.origin_peer_id, &fanout.event_id) {
         return Ok(Vec::new());
     }
-    // Skip fanout from removed tenants.
-    if is_sibling_removed(conn, &fanout.origin_peer_id, &[&fanout.origin_peer_id]) {
-        return Ok(Vec::new());
-    }
+    // NOTE: No origin-removal or sibling-removal checks here.
+    // In the enqueue path, origin_peer_id is the local ingesting tenant,
+    // NOT the event author — a removed local tenant can still receive valid
+    // shared events from remote authors that siblings need.
+    // Sibling removal is also not checked here because batches can contain
+    // both pre-removal events and the removal itself; draining the origin
+    // first projects the removal before fanout runs, which would cause
+    // legitimate pre-removal events to be dropped.
     let siblings =
         sibling_tenants_in_workspace(conn, &fanout.origin_peer_id, &fanout.workspace_id)?;
     if siblings.is_empty() {
@@ -300,19 +304,7 @@ pub(crate) fn fanout_shared_event_enqueue(
     let source = fanout_source(&fanout.origin_peer_id);
 
     let mut fanned = Vec::new();
-    let removal = is_removal_event(conn, &fanout.event_id);
-    let check_scopes: Vec<&str> = siblings
-        .iter()
-        .map(|s| s.as_str())
-        .chain(std::iter::once(fanout.origin_peer_id.as_str()))
-        .collect();
     for sibling in &siblings {
-        // Skip removed tenants: check removal in both sibling's and
-        // origin's scope to catch same-batch removal+message scenarios.
-        // Always fan out removal events so the target projects its own removal.
-        if !removal && is_sibling_removed(conn, sibling, &check_scopes) {
-            continue;
-        }
         insert_recorded_event(conn, sibling, &fanout.event_id, now_ms, &source)?;
         let _ = pq.enqueue(sibling, &event_id_b64)?;
         fanned.push(sibling.clone());
