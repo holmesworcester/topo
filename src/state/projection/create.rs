@@ -103,8 +103,8 @@ fn store_blob_only(
         lookup_workspace_id(conn, recorded_by)
     };
 
-    if let Some(ws_id) = ws_id_for_neg {
-        insert_neg_item_if_shared(conn, meta.share_scope, created_at_ms, &event_id, &ws_id)
+    if let Some(ref ws_id) = ws_id_for_neg {
+        insert_neg_item_if_shared(conn, meta.share_scope, created_at_ms, &event_id, ws_id)
             .map_err(|e| CreateEventError::DbError(e.to_string()))?;
     } else if meta.share_scope == crate::event_modules::registry::ShareScope::Shared {
         tracing::warn!(
@@ -116,6 +116,23 @@ fn store_blob_only(
 
     insert_recorded_event(conn, recorded_by, &event_id, now_ms, "local_create")
         .map_err(|e| CreateEventError::DbError(e.to_string()))?;
+
+    // Pre-write a pending fanout entry for shared events BEFORE projection.
+    // This ensures sibling fanout survives a crash between projection and
+    // the actual fanout call (startup recovery picks up pending entries).
+    if meta.share_scope == crate::event_modules::registry::ShareScope::Shared {
+        if let Some(ref ws_id) = ws_id_for_neg {
+            let fanout_entry = crate::state::shared_workspace_fanout::SharedEventFanout {
+                origin_peer_id: recorded_by.to_string(),
+                workspace_id: ws_id.clone(),
+                event_id,
+            };
+            let _ = crate::state::shared_workspace_fanout::persist_pending_fanouts(
+                conn,
+                &[fanout_entry],
+            );
+        }
+    }
 
     Ok(event_id)
 }

@@ -88,6 +88,9 @@ fn replay_existing_workspace_shared_events_for_tenant(
         let _ = pq.enqueue(recorded_by, &event_id_b64);
         let _ = project_one(db, recorded_by, &event_id)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+        // Remove the queue entry after successful inline projection so the
+        // next drain doesn't redundantly walk already-processed events.
+        let _ = pq.mark_done(recorded_by, &event_id_b64);
         replayed += 1;
     }
 

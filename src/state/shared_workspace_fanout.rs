@@ -196,11 +196,14 @@ pub(crate) fn fanout_stored_shared_event_immediate(
 
     let result = fanout_shared_event_immediate(conn, recorded_by, &workspace_id, event_id);
 
-    // Clean up the pending entry on success (best-effort).
-    conn.execute(
-        "DELETE FROM pending_shared_fanouts WHERE origin_peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![recorded_by, event_id.as_slice()],
-    )?;
+    // Only clean up the pending entry on success so failed fanouts
+    // survive for retry on next startup.
+    if result.is_ok() {
+        let _ = conn.execute(
+            "DELETE FROM pending_shared_fanouts WHERE origin_peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, event_id.as_slice()],
+        );
+    }
 
     result
 }
