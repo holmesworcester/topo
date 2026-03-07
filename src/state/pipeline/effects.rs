@@ -1,6 +1,5 @@
 use crate::db::project_queue::ProjectQueue;
 use crate::db::wanted::WantedEvents;
-use crate::state::shared_workspace_fanout::fanout_shared_event_enqueue;
 
 use super::drain::drain_project_queue_on_connection;
 use super::phases::PersistPhaseOutput;
@@ -36,24 +35,9 @@ impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
             let _ = wanted.remove(event_id);
         }
 
-        let mut tenant_set = persist_output.tenants_seen.clone();
-        for fanout in &persist_output.shared_event_fanouts {
-            match fanout_shared_event_enqueue(self.db, fanout) {
-                Ok(siblings) => {
-                    tenant_set.extend(siblings);
-                }
-                Err(e) => {
-                    tracing::warn!(
-                        "same-workspace fanout enqueue failed for {}: {}",
-                        short_id(&fanout.origin_peer_id),
-                        e
-                    );
-                }
-            }
-        }
-
-        // Keep tenant ordering deterministic for readability and reproducible logs.
-        let mut tenants: Vec<String> = tenant_set.into_iter().collect();
+        // Fanout enqueue already happened inside the persist transaction
+        // (phases.rs) so sibling tenants are already in tenants_seen.
+        let mut tenants: Vec<String> = persist_output.tenants_seen.iter().cloned().collect();
         tenants.sort();
 
         for tenant_id in tenants {
@@ -253,14 +237,24 @@ mod tests {
         )
         .unwrap();
 
+        // Simulate what phases.rs does: enqueue fanout inside the transaction
+        // and add sibling tenants to tenants_seen.
+        let fanout = crate::state::shared_workspace_fanout::SharedEventFanout {
+            origin_peer_id: origin.identity.clone(),
+            workspace_id: event_id_to_base64(&origin.workspace_id),
+            event_id,
+        };
+        let sibling_tenants =
+            crate::state::shared_workspace_fanout::fanout_shared_event_enqueue(&conn, &fanout)
+                .unwrap();
+        let mut tenants_seen =
+            std::collections::HashSet::from([origin.identity.clone()]);
+        tenants_seen.extend(sibling_tenants);
+
         let persist_output = PersistPhaseOutput {
             persisted_event_ids: vec![event_id],
-            tenants_seen: std::collections::HashSet::from([origin.identity.clone()]),
-            shared_event_fanouts: vec![crate::state::shared_workspace_fanout::SharedEventFanout {
-                origin_peer_id: origin.identity.clone(),
-                workspace_id: event_id_to_base64(&origin.workspace_id),
-                event_id,
-            }],
+            tenants_seen,
+            shared_event_fanouts: vec![fanout],
         };
         let executor = SqlitePostCommitEffectsExecutor::new(&conn);
 

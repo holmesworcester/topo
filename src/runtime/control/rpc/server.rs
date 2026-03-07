@@ -771,27 +771,15 @@ fn dispatch(
                     }
                     Err(e) => RpcResponse::error(e.to_string()),
                 },
-                Err(no_active_err) => match crate::db::open_connection(db_path) {
+                Err(_) => match crate::db::open_connection(db_path) {
                     Ok(db) => {
                         let _ = crate::db::schema::create_tables(&db);
-                        // Check if there are actual tenant scopes — if so,
-                        // require explicit tenant selection instead of
-                        // returning misleading zeros.
-                        let tenant_count: i64 = db
-                            .query_row(
-                                "SELECT COUNT(DISTINCT recorded_by) FROM invites_accepted",
-                                [],
-                                |row| row.get(0),
-                            )
-                            .unwrap_or(0);
-                        if tenant_count > 0 {
-                            RpcResponse::error(no_active_err)
-                        } else {
-                            // Empty DB / pre-identity state: report control-plane readiness
-                            // with tenant-scoped counters at zero.
-                            let data = workspace::status(&db, "__idle__");
-                            with_runtime_state(data)
-                        }
+                        // No active tenant — return status with zeroed
+                        // tenant-scoped counters so health probes (resp.ok)
+                        // still work. Callers can inspect runtime state
+                        // and tenant list independently.
+                        let data = workspace::status(&db, "__idle__");
+                        with_runtime_state(data)
                     }
                     Err(e) => RpcResponse::error(e.to_string()),
                 },
