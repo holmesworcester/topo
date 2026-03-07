@@ -15,6 +15,8 @@ use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
 use super::identity_ops::{self as ops, InviteBootstrapContext, JoinChain, LinkChain};
+use std::collections::HashSet;
+
 use crate::crypto::{event_id_from_base64, event_id_to_base64};
 use crate::crypto::EventId;
 use crate::db::store::insert_recorded_event;
@@ -53,11 +55,9 @@ fn replay_existing_workspace_shared_events_for_tenant(
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let workspace_id_b64 = event_id_to_base64(workspace_id);
 
-    // Collect event IDs validated by at least one existing workspace sibling.
-    // For removed siblings, only include pre-removal events (created before
-    // the removal + clock-skew tolerance) so post-removal local creates
-    // don't leak, but legitimate pre-removal history is preserved even when
-    // the removed sibling was the only one that had projected those events.
+    // Source 1: Events validated by at least one existing workspace sibling.
+    // For removed siblings, only include pre-removal events (clock-skew
+    // tolerance) so post-removal local creates don't leak.
     let mut ve_stmt = db.prepare(
         "SELECT DISTINCT ve.event_id
          FROM valid_events ve
@@ -67,7 +67,6 @@ fn replay_existing_workspace_shared_events_for_tenant(
            ON e.event_id = ve.event_id AND e.share_scope = 'shared'
          WHERE ve.peer_id <> ?2
            AND (
-             -- Non-removed sibling: include all events
              NOT EXISTS (
                SELECT 1 FROM peers_shared p
                JOIN removed_entities r
@@ -79,7 +78,6 @@ fn replay_existing_workspace_shared_events_for_tenant(
                WHERE lower(hex(p.transport_fingerprint)) = ve.peer_id
              )
              OR
-             -- Removed sibling: include pre-removal events only (30s clock tolerance)
              e.created_at <= (
                SELECT MIN(re.created_at) + 30000
                FROM removed_entities r
@@ -95,13 +93,76 @@ fn replay_existing_workspace_shared_events_for_tenant(
            )
          ORDER BY e.created_at ASC, ve.event_id ASC",
     )?;
-    let event_ids: Vec<EventId> = ve_stmt
-        .query_map(rusqlite::params![&workspace_id_b64, recorded_by], |row| {
-            row.get::<_, String>(0)
-        })?
-        .filter_map(|r| r.ok())
-        .filter_map(|b64| event_id_from_base64(&b64))
-        .collect();
+    let mut seen: HashSet<EventId> = HashSet::new();
+    let mut event_ids: Vec<EventId> = Vec::new();
+    for row in ve_stmt.query_map(rusqlite::params![&workspace_id_b64, recorded_by], |row| {
+        row.get::<_, String>(0)
+    })? {
+        if let Some(eid) = row.ok().and_then(|b64| event_id_from_base64(&b64)) {
+            if seen.insert(eid) {
+                event_ids.push(eid);
+            }
+        }
+    }
+
+    // Source 2: Canonical shared blobs in neg_items that siblings haven't
+    // projected yet (e.g. blocked on key_secret). These are needed because
+    // the new tenant's projector may succeed where siblings are still
+    // waiting (e.g. key_secret materializes via cascade during this replay).
+    // Recorded-by filter ensures we only include events that at least one
+    // non-removed workspace sibling received (not post-removal local creates).
+    let mut ni_stmt = db.prepare(
+        "SELECT ni.id
+         FROM neg_items ni
+         WHERE ni.workspace_id = ?1
+         ORDER BY ni.ts ASC, ni.id ASC",
+    )?;
+    for row in ni_stmt.query_map(rusqlite::params![&workspace_id_b64], |row| {
+        row.get::<_, Vec<u8>>(0)
+    })? {
+        let blob = match row {
+            Ok(b) => b,
+            Err(_) => continue,
+        };
+        if blob.len() != 32 {
+            continue;
+        }
+        let mut eid = [0u8; 32];
+        eid.copy_from_slice(&blob);
+        if seen.contains(&eid) {
+            continue;
+        }
+        // Only include if recorded by at least one non-removed workspace
+        // sibling. This filters post-removal local creates.
+        let eid_b64 = event_id_to_base64(&eid);
+        let has_non_removed_recorder: bool = db
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM recorded_events re
+                    JOIN invites_accepted ia
+                      ON ia.recorded_by = re.peer_id AND ia.workspace_id = ?1
+                    WHERE re.event_id = ?2
+                      AND re.peer_id <> ?3
+                      AND NOT EXISTS (
+                        SELECT 1 FROM peers_shared p
+                        JOIN removed_entities r
+                          ON r.recorded_by = p.recorded_by
+                          AND (r.target_event_id = p.event_id
+                               OR (r.removal_type = 'user'
+                                   AND p.user_event_id IS NOT NULL
+                                   AND r.target_event_id = p.user_event_id))
+                        WHERE lower(hex(p.transport_fingerprint)) = re.peer_id
+                      )
+                )",
+                rusqlite::params![&workspace_id_b64, &eid_b64, recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if has_non_removed_recorder {
+            seen.insert(eid);
+            event_ids.push(eid);
+        }
+    }
 
     let pq = crate::state::db::project_queue::ProjectQueue::new(db);
     let recorded_at = now_ms() as i64;

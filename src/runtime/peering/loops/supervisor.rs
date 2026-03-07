@@ -67,6 +67,9 @@ pub(super) fn run_startup_preflight(
     let batch_sz = drain_batch_size();
     // Drain origin queues first so removals are projected before
     // we recover pending fanouts (which check removal status).
+    // Note: `tenant_ids` includes accepted tenants using bootstrap
+    // transport identity (via discover_local_tenants fallback), so
+    // seed replay work enqueued before a crash is recovered here.
     for tenant_id in tenant_ids {
         let drained = (ingest.drain_queue)(db_path, tenant_id, batch_sz);
         if drained > 0 {
