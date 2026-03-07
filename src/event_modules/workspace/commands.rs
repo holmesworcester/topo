@@ -52,8 +52,10 @@ fn decode_event_id_blob(blob: Vec<u8>) -> Option<EventId> {
 ///
 /// Note: events from peers that were later removed are included in the replay.
 /// This is consistent with the projector, which does not check removal status
-/// (pre-removal events are legitimate). Removal enforcement happens at the
-/// transport layer (connection teardown) and UI layer (display filtering).
+/// (pre-removal events are legitimate). Post-removal events cannot appear in
+/// `neg_items` because removed peers are blocked at the transport layer
+/// (connection teardown) and cannot sync new events. Removal enforcement
+/// also applies at the UI layer (display filtering).
 fn replay_existing_workspace_shared_events_for_tenant(
     db: &Connection,
     recorded_by: &str,

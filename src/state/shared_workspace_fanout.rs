@@ -184,6 +184,57 @@ fn is_removal_event(conn: &Connection, event_id: &EventId) -> bool {
     .unwrap_or(false)
 }
 
+/// Returns true if the event was created before the sibling was removed.
+/// Used to allow pre-removal events through even when the sibling is currently
+/// marked as removed — this handles out-of-order arrival where a removal is
+/// projected before older events that logically predate it.
+fn event_predates_sibling_removal(
+    conn: &Connection,
+    event_id: &EventId,
+    sibling_peer_id: &str,
+    check_scopes: &[&str],
+) -> bool {
+    let event_id_b64 = event_id_to_base64(event_id);
+    let event_ts: Option<i64> = conn
+        .query_row(
+            "SELECT created_at FROM events WHERE event_id = ?1",
+            rusqlite::params![&event_id_b64],
+            |row| row.get(0),
+        )
+        .ok();
+    let Some(event_ts) = event_ts else {
+        return false;
+    };
+
+    // Find the earliest removal timestamp targeting this sibling across all scopes.
+    for scope in check_scopes {
+        let removal_ts: Option<i64> = conn
+            .query_row(
+                "SELECT MIN(e.created_at)
+                 FROM removed_entities r
+                 JOIN peers_shared p
+                   ON r.recorded_by = p.recorded_by
+                   AND (r.target_event_id = p.event_id
+                        OR (r.removal_type = 'user'
+                            AND p.user_event_id IS NOT NULL
+                            AND r.target_event_id = p.user_event_id))
+                 JOIN events e ON e.event_id = r.event_id
+                 WHERE p.recorded_by = ?1
+                   AND lower(hex(p.transport_fingerprint)) = ?2",
+                rusqlite::params![scope, sibling_peer_id],
+                |row| row.get(0),
+            )
+            .ok()
+            .flatten();
+        if let Some(removal_created_at) = removal_ts {
+            if event_ts < removal_created_at {
+                return true;
+            }
+        }
+    }
+    false
+}
+
 /// Returns true if the removal event targets the given sibling's peer or user.
 /// Used to limit the removal exemption to only the tenant being removed.
 fn is_removal_targeting_sibling(
@@ -319,6 +370,10 @@ pub(crate) fn fanout_shared_event_immediate(
             if !is_sibling_removed(conn, s, &check_scopes) {
                 return true;
             }
+            // Allow pre-removal events that arrived out-of-order.
+            if event_predates_sibling_removal(conn, event_id, s, &check_scopes) {
+                return true;
+            }
             // Only exempt the specific sibling targeted by this removal event.
             removal && is_removal_targeting_sibling(conn, event_id, s, origin_peer_id)
         })
@@ -371,15 +426,18 @@ pub(crate) fn fanout_shared_event_enqueue(
     let mut fanned = Vec::new();
     for sibling in &siblings {
         if is_sibling_removed(conn, sibling, &check_scopes) {
+            // Allow pre-removal events that arrived out-of-order.
+            let predates =
+                event_predates_sibling_removal(conn, &fanout.event_id, sibling, &check_scopes);
             // Only exempt the specific sibling targeted by this removal.
-            if !removal
-                || !is_removal_targeting_sibling(
+            let targeted_removal = removal
+                && is_removal_targeting_sibling(
                     conn,
                     &fanout.event_id,
                     sibling,
                     &fanout.origin_peer_id,
-                )
-            {
+                );
+            if !predates && !targeted_removal {
                 continue;
             }
         }
