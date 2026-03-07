@@ -53,7 +53,11 @@ fn replay_existing_workspace_shared_events_for_tenant(
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let workspace_id_b64 = event_id_to_base64(workspace_id);
 
-    // Collect event IDs that at least one existing sibling has validated.
+    // Collect event IDs validated by at least one non-removed sibling.
+    // Removed siblings are excluded from the source set so post-removal
+    // local events that live fanout suppresses are not replayed.
+    // The removal check looks across all scopes (any recorded_by) because
+    // the removal may be projected in a different tenant's scope first.
     let mut ve_stmt = db.prepare(
         "SELECT DISTINCT ve.event_id
          FROM valid_events ve
@@ -62,6 +66,16 @@ fn replay_existing_workspace_shared_events_for_tenant(
          JOIN events e
            ON e.event_id = ve.event_id AND e.share_scope = 'shared'
          WHERE ve.peer_id <> ?2
+           AND NOT EXISTS (
+             SELECT 1 FROM peers_shared p
+             JOIN removed_entities r
+               ON r.recorded_by = p.recorded_by
+               AND (r.target_event_id = p.event_id
+                    OR (r.removal_type = 'user'
+                        AND p.user_event_id IS NOT NULL
+                        AND r.target_event_id = p.user_event_id))
+             WHERE lower(hex(p.transport_fingerprint)) = ve.peer_id
+           )
          ORDER BY e.created_at ASC, ve.event_id ASC",
     )?;
     let event_ids: Vec<EventId> = ve_stmt

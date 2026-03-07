@@ -347,15 +347,22 @@ pub(crate) fn fanout_shared_event_immediate(
     if is_origin_rejected(conn, origin_peer_id, event_id) {
         return Ok(());
     }
+    let siblings = sibling_tenants_in_workspace(conn, origin_peer_id, workspace_id)?;
     // Skip fanout from removed tenants — a removed local tenant must not
     // inject new shared events into sibling scopes. Removal events are
     // exempt so self-removal propagates to siblings.
-    if !is_removal_event(conn, event_id)
-        && is_sibling_removed(conn, origin_peer_id, &[origin_peer_id])
-    {
-        return Ok(());
+    // Check all workspace scopes (origin + siblings) because another tenant
+    // may have projected the removal before the origin scope has.
+    if !is_removal_event(conn, event_id) {
+        let all_scopes: Vec<&str> = siblings
+            .iter()
+            .map(|s| s.as_str())
+            .chain(std::iter::once(origin_peer_id))
+            .collect();
+        if is_sibling_removed(conn, origin_peer_id, &all_scopes) {
+            return Ok(());
+        }
     }
-    let siblings = sibling_tenants_in_workspace(conn, origin_peer_id, workspace_id)?;
     if siblings.is_empty() {
         return Ok(());
     }
