@@ -67,6 +67,20 @@ fn is_sibling_removed(conn: &Connection, sibling_peer_id: &str, check_scopes: &[
     false
 }
 
+/// Returns true if the event is a removal event (user_removed or peer_removed).
+/// Removal events must always fan out to siblings — including the removed
+/// sibling itself — so the target tenant projects its own removal.
+fn is_removal_event(conn: &Connection, event_id: &EventId) -> bool {
+    let event_id_b64 = event_id_to_base64(event_id);
+    conn.query_row(
+        "SELECT event_type FROM events WHERE event_id = ?1",
+        rusqlite::params![&event_id_b64],
+        |row| row.get::<_, String>(0),
+    )
+    .map(|t| t == "user_removed" || t == "peer_removed")
+    .unwrap_or(false)
+}
+
 pub(crate) fn fanout_stored_shared_event_immediate(
     conn: &Connection,
     recorded_by: &str,
@@ -114,6 +128,7 @@ pub(crate) fn fanout_shared_event_immediate(
         .as_millis() as i64;
     let source = fanout_source(origin_peer_id);
 
+    let removal = is_removal_event(conn, event_id);
     let check_scopes: Vec<&str> = siblings
         .iter()
         .map(|s| s.as_str())
@@ -121,7 +136,7 @@ pub(crate) fn fanout_shared_event_immediate(
         .collect();
     let active_siblings: Vec<&String> = siblings
         .iter()
-        .filter(|s| !is_sibling_removed(conn, s, &check_scopes))
+        .filter(|s| removal || !is_sibling_removed(conn, s, &check_scopes))
         .collect();
     for sibling in &active_siblings {
         insert_recorded_event(conn, sibling, event_id, now_ms, &source)?;
@@ -152,6 +167,7 @@ pub(crate) fn fanout_shared_event_enqueue(
     let source = fanout_source(&fanout.origin_peer_id);
 
     let mut fanned = Vec::new();
+    let removal = is_removal_event(conn, &fanout.event_id);
     let check_scopes: Vec<&str> = siblings
         .iter()
         .map(|s| s.as_str())
@@ -160,7 +176,8 @@ pub(crate) fn fanout_shared_event_enqueue(
     for sibling in &siblings {
         // Skip removed tenants: check removal in both sibling's and
         // origin's scope to catch same-batch removal+message scenarios.
-        if is_sibling_removed(conn, sibling, &check_scopes) {
+        // Always fan out removal events so the target projects its own removal.
+        if !removal && is_sibling_removed(conn, sibling, &check_scopes) {
             continue;
         }
         insert_recorded_event(conn, sibling, &fanout.event_id, now_ms, &source)?;
