@@ -64,27 +64,9 @@ pub(super) fn run_startup_preflight(
         info!("Recovered {} expired project_queue leases", recovered);
     }
 
-    // Recover any pending shared-event fanouts from a prior crash.
-    match crate::state::shared_workspace_fanout::take_pending_fanouts(&db) {
-        Ok(pending) if !pending.is_empty() => {
-            info!("Recovering {} pending shared-event fanouts", pending.len());
-            for fanout in &pending {
-                if let Err(e) =
-                    crate::state::shared_workspace_fanout::fanout_shared_event_enqueue(&db, fanout)
-                {
-                    tracing::warn!(
-                        "startup fanout recovery failed for {}: {}",
-                        short_peer_id(&fanout.origin_peer_id),
-                        e
-                    );
-                }
-            }
-        }
-        Ok(_) => {}
-        Err(e) => tracing::warn!("take_pending_fanouts at startup: {}", e),
-    }
-
     let batch_sz = drain_batch_size();
+    // Drain origin queues first so removals are projected before
+    // we recover pending fanouts (which check removal status).
     for tenant_id in tenant_ids {
         let drained = (ingest.drain_queue)(db_path, tenant_id, batch_sz);
         if drained > 0 {
@@ -94,6 +76,46 @@ pub(super) fn run_startup_preflight(
                 short_peer_id(tenant_id)
             );
         }
+    }
+
+    // Recover any pending shared-event fanouts from a prior crash.
+    // This runs AFTER draining origin queues so that removals are
+    // already projected and is_sibling_removed correctly filters.
+    match crate::state::shared_workspace_fanout::take_pending_fanouts(&db) {
+        Ok(pending) if !pending.is_empty() => {
+            info!("Recovering {} pending shared-event fanouts", pending.len());
+            for fanout in &pending {
+                match crate::state::shared_workspace_fanout::fanout_shared_event_enqueue(
+                    &db, fanout,
+                ) {
+                    Ok(_) => {
+                        let _ = crate::state::shared_workspace_fanout::delete_pending_fanout(
+                            &db, fanout,
+                        );
+                    }
+                    Err(e) => {
+                        tracing::warn!(
+                            "startup fanout recovery failed for {}: {}",
+                            short_peer_id(&fanout.origin_peer_id),
+                            e
+                        );
+                    }
+                }
+            }
+            // Drain sibling queues that were just enqueued by recovery.
+            for tenant_id in tenant_ids {
+                let drained = (ingest.drain_queue)(db_path, tenant_id, batch_sz);
+                if drained > 0 {
+                    info!(
+                        "Processed {} recovered fanout items for tenant {}",
+                        drained,
+                        short_peer_id(tenant_id)
+                    );
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("take_pending_fanouts at startup: {}", e),
     }
 
     Ok(())

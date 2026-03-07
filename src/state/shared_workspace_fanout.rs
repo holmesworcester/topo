@@ -41,8 +41,9 @@ pub(crate) fn persist_pending_fanouts(
     Ok(())
 }
 
-/// Load and delete all pending fanout entries, returning them as SharedEventFanout.
-/// Called in post-commit effects and on startup recovery.
+/// Load all pending fanout entries, returning them as SharedEventFanout.
+/// Callers must call `delete_pending_fanout` for each entry after
+/// successful processing to avoid losing concurrent inserts.
 pub(crate) fn take_pending_fanouts(
     conn: &Connection,
 ) -> Result<Vec<SharedEventFanout>, Box<dyn std::error::Error + Send + Sync>> {
@@ -70,8 +71,19 @@ pub(crate) fn take_pending_fanouts(
             })
         })
         .collect();
-    conn.execute("DELETE FROM pending_shared_fanouts", [])?;
     Ok(rows)
+}
+
+/// Delete a single pending fanout entry after successful processing.
+pub(crate) fn delete_pending_fanout(
+    conn: &Connection,
+    fanout: &SharedEventFanout,
+) -> Result<(), rusqlite::Error> {
+    conn.execute(
+        "DELETE FROM pending_shared_fanouts WHERE origin_peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![&fanout.origin_peer_id, fanout.event_id.as_slice()],
+    )?;
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

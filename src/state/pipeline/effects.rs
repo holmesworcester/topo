@@ -89,6 +89,11 @@ impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
             match fanout_shared_event_enqueue(self.db, fanout) {
                 Ok(siblings) => {
                     sibling_tenants.extend(siblings);
+                    // Delete only after successful enqueue so the entry
+                    // survives a crash and gets retried on next startup.
+                    let _ = crate::state::shared_workspace_fanout::delete_pending_fanout(
+                        self.db, fanout,
+                    );
                 }
                 Err(e) => {
                     tracing::warn!(
