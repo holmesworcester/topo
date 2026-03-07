@@ -76,25 +76,23 @@ fn replay_existing_workspace_shared_events_for_tenant(
         .collect::<Vec<_>>();
 
     let pq = crate::state::db::project_queue::ProjectQueue::new(db);
-    let mut replayed = 0usize;
     let recorded_at = now_ms() as i64;
-    for event_id in event_ids {
-        insert_recorded_event(
-            db,
-            recorded_by,
-            &event_id,
-            recorded_at,
-            "same_workspace_seed",
-        )?;
-        // Enqueue into project_queue for durable projection. If the process
-        // crashes before all events are projected, the remaining entries
-        // persist and will be drained on the next startup.
-        let event_id_b64 = event_id_to_base64(&event_id);
+
+    // Phase 1: Durably record and enqueue ALL events before projecting any.
+    // If the process crashes after this phase, startup will drain the
+    // project_queue and complete the seed without data loss.
+    for event_id in &event_ids {
+        insert_recorded_event(db, recorded_by, event_id, recorded_at, "same_workspace_seed")?;
+        let event_id_b64 = event_id_to_base64(event_id);
         let _ = pq.enqueue(recorded_by, &event_id_b64);
-        let _ = project_one(db, recorded_by, &event_id)
+    }
+
+    // Phase 2: Project inline and clean up queue entries.
+    let mut replayed = 0usize;
+    for event_id in &event_ids {
+        let _ = project_one(db, recorded_by, event_id)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
-        // Remove the queue entry after successful inline projection so the
-        // next drain doesn't redundantly walk already-processed events.
+        let event_id_b64 = event_id_to_base64(event_id);
         let _ = pq.mark_done(recorded_by, &event_id_b64);
         replayed += 1;
     }

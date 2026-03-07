@@ -187,8 +187,6 @@ fn is_origin_rejected(conn: &Connection, origin_peer_id: &str, event_id: &EventI
 }
 
 /// Returns true if the event is a removal event (user_removed or peer_removed).
-/// Removal events must always fan out to siblings — including the removed
-/// sibling itself — so the target tenant projects its own removal.
 fn is_removal_event(conn: &Connection, event_id: &EventId) -> bool {
     let event_id_b64 = event_id_to_base64(event_id);
     conn.query_row(
@@ -197,6 +195,51 @@ fn is_removal_event(conn: &Connection, event_id: &EventId) -> bool {
         |row| row.get::<_, String>(0),
     )
     .map(|t| t == "user_removed" || t == "peer_removed")
+    .unwrap_or(false)
+}
+
+/// Returns true if the removal event targets the given sibling's peer or user.
+/// Used to limit the removal exemption to only the tenant being removed.
+fn is_removal_targeting_sibling(
+    conn: &Connection,
+    event_id: &EventId,
+    sibling_peer_id: &str,
+    check_scope: &str,
+) -> bool {
+    let event_id_b64 = event_id_to_base64(event_id);
+    // Load the removal's target_event_id from the event blob.
+    // Both peer_removed and user_removed have target_event_id at blob[9..41].
+    let target: Option<[u8; 32]> = conn
+        .query_row(
+            "SELECT blob FROM events WHERE event_id = ?1",
+            rusqlite::params![&event_id_b64],
+            |row| row.get::<_, Vec<u8>>(0),
+        )
+        .ok()
+        .and_then(|blob| {
+            if blob.len() >= 41 {
+                let mut t = [0u8; 32];
+                t.copy_from_slice(&blob[9..41]);
+                Some(t)
+            } else {
+                None
+            }
+        });
+    let Some(target_eid) = target else {
+        return false;
+    };
+    let target_b64 = event_id_to_base64(&target_eid);
+    // Check if the target is the sibling's peer_shared event or user event.
+    conn.query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM peers_shared
+            WHERE recorded_by = ?1
+              AND lower(hex(transport_fingerprint)) = ?2
+              AND (event_id = ?3 OR user_event_id = ?3)
+        )",
+        rusqlite::params![check_scope, sibling_peer_id, &target_b64],
+        |row| row.get(0),
+    )
     .unwrap_or(false)
 }
 
@@ -286,7 +329,13 @@ pub(crate) fn fanout_shared_event_immediate(
         .collect();
     let active_siblings: Vec<&String> = siblings
         .iter()
-        .filter(|s| removal || !is_sibling_removed(conn, s, &check_scopes))
+        .filter(|s| {
+            if !is_sibling_removed(conn, s, &check_scopes) {
+                return true;
+            }
+            // Only exempt the specific sibling targeted by this removal event.
+            removal && is_removal_targeting_sibling(conn, event_id, s, origin_peer_id)
+        })
         .collect();
     for sibling in &active_siblings {
         insert_recorded_event(conn, sibling, event_id, now_ms, &source)?;
@@ -331,7 +380,7 @@ pub(crate) fn fanout_shared_event_enqueue(
         .as_millis() as i64;
     let source = fanout_source(&fanout.origin_peer_id);
 
-    // Removal events always fan out so the target projects its own removal.
+    // Removal events fan out only to the specific target sibling.
     let removal = is_removal_event(conn, &fanout.event_id);
     let check_scopes: Vec<&str> = siblings
         .iter()
@@ -341,8 +390,18 @@ pub(crate) fn fanout_shared_event_enqueue(
 
     let mut fanned = Vec::new();
     for sibling in &siblings {
-        if !removal && is_sibling_removed(conn, sibling, &check_scopes) {
-            continue;
+        if is_sibling_removed(conn, sibling, &check_scopes) {
+            // Only exempt the specific sibling targeted by this removal.
+            if !removal
+                || !is_removal_targeting_sibling(
+                    conn,
+                    &fanout.event_id,
+                    sibling,
+                    &fanout.origin_peer_id,
+                )
+            {
+                continue;
+            }
         }
         insert_recorded_event(conn, sibling, &fanout.event_id, now_ms, &source)?;
         let _ = pq.enqueue(sibling, &event_id_b64)?;
