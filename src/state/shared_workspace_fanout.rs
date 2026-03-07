@@ -104,10 +104,14 @@ pub(crate) fn fanout_shared_event_immediate(
         .as_millis() as i64;
     let source = fanout_source(origin_peer_id);
 
-    for sibling in &siblings {
+    let active_siblings: Vec<&String> = siblings
+        .iter()
+        .filter(|s| !is_sibling_removed(conn, s))
+        .collect();
+    for sibling in &active_siblings {
         insert_recorded_event(conn, sibling, event_id, now_ms, &source)?;
     }
-    for sibling in &siblings {
+    for sibling in &active_siblings {
         let _ = project_one(conn, sibling, event_id)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
     }

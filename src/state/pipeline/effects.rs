@@ -1,5 +1,6 @@
 use crate::db::project_queue::ProjectQueue;
 use crate::db::wanted::WantedEvents;
+use crate::state::shared_workspace_fanout::fanout_shared_event_enqueue;
 
 use super::drain::drain_project_queue_on_connection;
 use super::phases::PersistPhaseOutput;
@@ -35,13 +36,13 @@ impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
             let _ = wanted.remove(event_id);
         }
 
-        // Fanout enqueue already happened inside the persist transaction
-        // (phases.rs) so sibling tenants are already in tenants_seen.
+        // First drain the origin tenants so removals in this batch are
+        // projected before we fan out to siblings.
         let mut tenants: Vec<String> = persist_output.tenants_seen.iter().cloned().collect();
         tenants.sort();
 
-        for tenant_id in tenants {
-            if let Err(e) = drain_project_queue_on_connection(self.db, &tenant_id, batch_size) {
+        for tenant_id in &tenants {
+            if let Err(e) = drain_project_queue_on_connection(self.db, tenant_id, batch_size) {
                 tracing::warn!("project_queue drain error for {}: {}", tenant_id, e);
             }
 
@@ -57,11 +58,11 @@ impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
                 }
             }
 
-            match crate::event_modules::post_drain_hooks(self.db, &tenant_id) {
+            match crate::event_modules::post_drain_hooks(self.db, tenant_id) {
                 Ok(count) if count > 0 => {
                     tracing::info!(
                         "post-drain hooks: tenant {} resolved {} item(s)",
-                        short_id(&tenant_id),
+                        short_id(tenant_id),
                         count
                     );
                 }
@@ -69,10 +70,37 @@ impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
                 Err(e) => {
                     tracing::warn!(
                         "post-drain hooks failed for {}: {}",
-                        short_id(&tenant_id),
+                        short_id(tenant_id),
                         e
                     )
                 }
+            }
+        }
+
+        // Now fan out shared events to siblings — after projection so
+        // removals in this batch are already in removed_entities.
+        let mut sibling_tenants = std::collections::HashSet::new();
+        for fanout in &persist_output.shared_event_fanouts {
+            match fanout_shared_event_enqueue(self.db, fanout) {
+                Ok(siblings) => {
+                    sibling_tenants.extend(siblings);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "same-workspace fanout enqueue failed for {}: {}",
+                        short_id(&fanout.origin_peer_id),
+                        e
+                    );
+                }
+            }
+        }
+
+        // Drain newly enqueued sibling project_queue entries.
+        let mut sibling_list: Vec<String> = sibling_tenants.into_iter().collect();
+        sibling_list.sort();
+        for tenant_id in &sibling_list {
+            if let Err(e) = drain_project_queue_on_connection(self.db, tenant_id, batch_size) {
+                tracing::warn!("sibling project_queue drain error for {}: {}", tenant_id, e);
             }
         }
     }
@@ -237,23 +265,15 @@ mod tests {
         )
         .unwrap();
 
-        // Simulate what phases.rs does: enqueue fanout inside the transaction
-        // and add sibling tenants to tenants_seen.
         let fanout = crate::state::shared_workspace_fanout::SharedEventFanout {
             origin_peer_id: origin.identity.clone(),
             workspace_id: event_id_to_base64(&origin.workspace_id),
             event_id,
         };
-        let sibling_tenants =
-            crate::state::shared_workspace_fanout::fanout_shared_event_enqueue(&conn, &fanout)
-                .unwrap();
-        let mut tenants_seen =
-            std::collections::HashSet::from([origin.identity.clone()]);
-        tenants_seen.extend(sibling_tenants);
 
         let persist_output = PersistPhaseOutput {
             persisted_event_ids: vec![event_id],
-            tenants_seen,
+            tenants_seen: std::collections::HashSet::from([origin.identity.clone()]),
             shared_event_fanouts: vec![fanout],
         };
         let executor = SqlitePostCommitEffectsExecutor::new(&conn);

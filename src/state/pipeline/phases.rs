@@ -7,7 +7,7 @@ use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::store::lookup_workspace_id;
 use crate::event_modules::{self as events, registry::EventRegistry, ShareScope};
-use crate::state::shared_workspace_fanout::{fanout_shared_event_enqueue, SharedEventFanout};
+use crate::state::shared_workspace_fanout::SharedEventFanout;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct PersistPhaseOutput {
@@ -122,26 +122,11 @@ pub(super) fn run_persist_phase(
                         } else {
                             lookup_workspace_id(db, recorded_by)
                         } {
-                            let fanout = SharedEventFanout {
+                            persist_output.shared_event_fanouts.push(SharedEventFanout {
                                 origin_peer_id: recorded_by.clone(),
                                 workspace_id,
                                 event_id: *event_id,
-                            };
-                            // Enqueue sibling fanout inside the transaction so
-                            // it's atomic with the event insertion.
-                            match fanout_shared_event_enqueue(db, &fanout) {
-                                Ok(siblings) => {
-                                    persist_output.tenants_seen.extend(siblings);
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "same-workspace fanout enqueue failed for {}: {}",
-                                        &recorded_by[..16.min(recorded_by.len())],
-                                        e
-                                    );
-                                }
-                            }
-                            persist_output.shared_event_fanouts.push(fanout);
+                            });
                         }
                     }
                 } else {
