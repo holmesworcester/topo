@@ -771,15 +771,26 @@ fn dispatch(
                     }
                     Err(e) => RpcResponse::error(e.to_string()),
                 },
-                Err(_) => match crate::db::open_connection(db_path) {
+                Err(no_active_err) => match crate::db::open_connection(db_path) {
                     Ok(db) => {
                         let _ = crate::db::schema::create_tables(&db);
-                        // No active tenant — return status with zeroed
-                        // tenant-scoped counters so health probes (resp.ok)
-                        // still work. Callers can inspect runtime state
-                        // and tenant list independently.
-                        let data = workspace::status(&db, "__idle__");
-                        with_runtime_state(data)
+                        let tenant_count: i64 = db
+                            .query_row(
+                                "SELECT COUNT(DISTINCT recorded_by) FROM invites_accepted",
+                                [],
+                                |row| row.get(0),
+                            )
+                            .unwrap_or(0);
+                        if tenant_count > 1 {
+                            // Multiple tenants, none selected — return error so
+                            // operators know to run `topo use-tenant`.
+                            RpcResponse::error(no_active_err)
+                        } else {
+                            // Empty/pre-identity or single-tenant: return status
+                            // with zeroed counters so health probes work.
+                            let data = workspace::status(&db, "__idle__");
+                            with_runtime_state(data)
+                        }
                     }
                     Err(e) => RpcResponse::error(e.to_string()),
                 },

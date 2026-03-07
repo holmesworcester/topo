@@ -5,6 +5,7 @@ use crate::db::store::{insert_recorded_event, lookup_workspace_id};
 use crate::event_modules::ShareScope;
 use crate::projection::apply::project_one;
 use crate::state::db::project_queue::ProjectQueue;
+use crate::transport::cert::extract_spki_fingerprint;
 
 const FANOUT_SOURCE_PREFIX: &str = "same_workspace_fanout";
 
@@ -34,6 +35,26 @@ fn sibling_tenants_in_workspace(
 
 fn fanout_source(origin_peer_id: &str) -> String {
     format!("{FANOUT_SOURCE_PREFIX}:{origin_peer_id}")
+}
+
+/// Check if a sibling tenant has been removed by looking up their local
+/// transport cert's SPKI fingerprint and checking removal_watch.
+fn is_sibling_removed(conn: &Connection, sibling_peer_id: &str) -> bool {
+    // Load sibling's cert from local_transport_creds
+    let cert_der: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT cert_der FROM local_transport_creds WHERE peer_id = ?1",
+            rusqlite::params![sibling_peer_id],
+            |row| row.get(0),
+        )
+        .ok();
+    let Some(cert_der) = cert_der else {
+        return false;
+    };
+    let Ok(spki) = extract_spki_fingerprint(&cert_der) else {
+        return false;
+    };
+    crate::state::db::removal_watch::is_peer_removed(conn, sibling_peer_id, &spki).unwrap_or(false)
 }
 
 pub(crate) fn fanout_stored_shared_event_immediate(
@@ -111,12 +132,19 @@ pub(crate) fn fanout_shared_event_enqueue(
         .as_millis() as i64;
     let source = fanout_source(&fanout.origin_peer_id);
 
+    let mut fanned = Vec::new();
     for sibling in &siblings {
+        // Skip removed tenants: look up their SPKI from local creds and
+        // check removal status to prevent leaking post-removal events.
+        if is_sibling_removed(conn, sibling) {
+            continue;
+        }
         insert_recorded_event(conn, sibling, &fanout.event_id, now_ms, &source)?;
         let _ = pq.enqueue(sibling, &event_id_b64)?;
+        fanned.push(sibling.clone());
     }
 
-    Ok(siblings)
+    Ok(fanned)
 }
 
 #[cfg(test)]
