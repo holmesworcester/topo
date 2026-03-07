@@ -15,7 +15,9 @@ use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
 use super::identity_ops::{self as ops, InviteBootstrapContext, JoinChain, LinkChain};
+use crate::crypto::event_id_to_base64;
 use crate::crypto::EventId;
+use crate::db::store::insert_recorded_event;
 use crate::event_modules::{
     peer_secret::PeerSecretEvent, AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, ParsedEvent,
     PeerSharedEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
@@ -31,6 +33,59 @@ fn now_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+fn decode_event_id_blob(blob: Vec<u8>) -> Option<EventId> {
+    if blob.len() != 32 {
+        return None;
+    }
+    let mut event_id = [0u8; 32];
+    event_id.copy_from_slice(&blob);
+    Some(event_id)
+}
+
+/// In a shared DB, sibling tenants can already have the workspace's shared
+/// event history in `events`/`neg_items` even though this tenant has not yet
+/// projected it into its own `valid_events` scope. Replay those shared events
+/// locally so same-workspace joins converge without waiting for a redundant
+/// network fetch that negentropy will not request.
+fn replay_existing_workspace_shared_events_for_tenant(
+    db: &Connection,
+    recorded_by: &str,
+    workspace_id: &EventId,
+) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
+    let workspace_id_b64 = event_id_to_base64(workspace_id);
+    let mut stmt = db.prepare(
+        "SELECT id
+         FROM neg_items
+         WHERE workspace_id = ?1
+         ORDER BY ts ASC, id ASC",
+    )?;
+    let event_ids = stmt
+        .query_map(rusqlite::params![workspace_id_b64], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter_map(decode_event_id_blob)
+        .collect::<Vec<_>>();
+
+    let mut replayed = 0usize;
+    let recorded_at = now_ms() as i64;
+    for event_id in event_ids {
+        insert_recorded_event(
+            db,
+            recorded_by,
+            &event_id,
+            recorded_at,
+            "same_workspace_seed",
+        )?;
+        let _ = project_one(db, recorded_by, &event_id)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
+        replayed += 1;
+    }
+
+    Ok(replayed)
 }
 
 /// Emit a peer_secret event for the given signer identity.
@@ -274,6 +329,8 @@ pub fn join_workspace_as_new_user(
     });
     let invite_accepted_event_id = create_event_synchronous(db, recorded_by, &ia_evt)?;
 
+    let _ = replay_existing_workspace_shared_events_for_tenant(db, recorded_by, &workspace_id)?;
+
     // 2. User (signed by invite_key) — may block if invite event not yet synced.
     // Tolerates Blocked: the event is stored and will project via cascade when
     // the invite event arrives.
@@ -400,6 +457,8 @@ pub fn add_device_to_workspace(
         workspace_id,
     });
     let invite_accepted_event_id = create_event_synchronous(db, recorded_by, &ia_evt)?;
+
+    let _ = replay_existing_workspace_shared_events_for_tenant(db, recorded_by, &workspace_id)?;
 
     // 2. PeerShared (signed by device_invite_key) — may block if device invite
     // event not yet synced. Tolerates Blocked: the event is stored and will project

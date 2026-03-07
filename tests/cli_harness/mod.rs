@@ -758,13 +758,79 @@ fn wait_for_local_peer_signer(db: &str, timeout: Duration) -> Result<(), String>
                     |row| row.get(0),
                 )
                 .ok();
+            let (last_tenant_recorded, last_tenant_valid, last_tenant_blocked, last_tenant_queue) =
+                last_tenant
+                    .as_ref()
+                    .map(|tenant_id| {
+                        let recorded: i64 = conn
+                            .query_row(
+                                "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
+                                rusqlite::params![tenant_id],
+                                |row| row.get(0),
+                            )
+                            .unwrap_or(0);
+                        let valid: i64 = conn
+                            .query_row(
+                                "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
+                                rusqlite::params![tenant_id],
+                                |row| row.get(0),
+                            )
+                            .unwrap_or(0);
+                        let blocked: i64 = conn
+                            .query_row(
+                                "SELECT COUNT(*) FROM blocked_events WHERE peer_id = ?1",
+                                rusqlite::params![tenant_id],
+                                |row| row.get(0),
+                            )
+                            .unwrap_or(0);
+                        let queued: i64 = conn
+                            .query_row(
+                                "SELECT COUNT(*) FROM project_queue WHERE peer_id = ?1",
+                                rusqlite::params![tenant_id],
+                                |row| row.get(0),
+                            )
+                            .unwrap_or(0);
+                        (recorded, valid, blocked, queued)
+                    })
+                    .unwrap_or((0, 0, 0, 0));
+            let last_blockers = last_tenant
+                .as_ref()
+                .map(|tenant_id| {
+                    let mut stmt = conn
+                        .prepare(
+                            "SELECT bed.event_id, bed.blocker_event_id
+                             FROM blocked_event_deps bed
+                             WHERE bed.peer_id = ?1
+                             ORDER BY bed.event_id, bed.blocker_event_id
+                             LIMIT 6",
+                        )
+                        .ok()?;
+                    let rows = stmt
+                        .query_map(rusqlite::params![tenant_id], |row| {
+                            Ok((
+                                row.get::<_, String>(0)?,
+                                row.get::<_, String>(1)?,
+                            ))
+                        })
+                        .ok()?
+                        .collect::<Result<Vec<_>, _>>()
+                        .ok()?;
+                    Some(rows)
+                })
+                .flatten()
+                .unwrap_or_default();
             format!(
-                "invites_accepted={}, peer_secret_rows={}, signer_events={}, signer_rejects={}, last_tenant={}",
+                "invites_accepted={}, peer_secret_rows={}, signer_events={}, signer_rejects={}, last_tenant={}, last_tenant_recorded={}, last_tenant_valid={}, last_tenant_blocked={}, last_tenant_queue={}, last_blockers={:?}",
                 invites,
                 signer_rows,
                 signer_events,
                 signer_rejects,
-                last_tenant.unwrap_or_else(|| "<none>".to_string())
+                last_tenant.unwrap_or_else(|| "<none>".to_string()),
+                last_tenant_recorded,
+                last_tenant_valid,
+                last_tenant_blocked,
+                last_tenant_queue,
+                last_blockers
             )
         })
         .unwrap_or_else(|| "db-open-failed".to_string());

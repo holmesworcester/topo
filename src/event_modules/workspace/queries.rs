@@ -30,16 +30,22 @@ pub fn resolve_workspace_for_peer(
 pub struct WorkspaceRow {
     pub event_id: String,
     pub workspace_id: String,
+    pub name: String,
 }
 
 pub fn list(db: &Connection, recorded_by: &str) -> Result<Vec<WorkspaceRow>, rusqlite::Error> {
-    let mut stmt =
-        db.prepare("SELECT event_id, workspace_id FROM workspaces WHERE recorded_by = ?1")?;
+    let mut stmt = db.prepare(
+        "SELECT event_id, workspace_id, COALESCE(name, '')
+         FROM workspaces
+         WHERE recorded_by = ?1
+         ORDER BY event_id",
+    )?;
     let rows = stmt
         .query_map(rusqlite::params![recorded_by], |row| {
             Ok(WorkspaceRow {
                 event_id: row.get(0)?,
                 workspace_id: row.get(1)?,
+                name: row.get(2)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -75,19 +81,14 @@ pub fn list_items(
     db: &Connection,
     recorded_by: &str,
 ) -> Result<Vec<WorkspaceItem>, rusqlite::Error> {
-    use base64::Engine;
     let rows = list(db, recorded_by)?;
     Ok(rows
         .into_iter()
         .map(|row| {
-            let name = if let Ok(bytes) =
-                base64::engine::general_purpose::STANDARD.decode(&row.workspace_id)
-            {
-                String::from_utf8_lossy(&bytes)
-                    .trim_end_matches('\0')
-                    .to_string()
-            } else {
+            let name = if row.name.is_empty() {
                 row.workspace_id.clone()
+            } else {
+                row.name
             };
             WorkspaceItem {
                 event_id: row.event_id,
@@ -96,6 +97,25 @@ pub fn list_items(
             }
         })
         .collect())
+}
+
+pub fn list_all_items(db: &Connection) -> Result<Vec<WorkspaceItem>, rusqlite::Error> {
+    let mut stmt = db.prepare(
+        "SELECT MIN(event_id) AS event_id, workspace_id, COALESCE(MAX(name), '')
+         FROM workspaces
+         GROUP BY workspace_id
+         ORDER BY MIN(event_id)",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        let workspace_id: String = row.get(1)?;
+        let name: String = row.get(2)?;
+        Ok(WorkspaceItem {
+            event_id: row.get(0)?,
+            workspace_id: workspace_id.clone(),
+            name: if name.is_empty() { workspace_id } else { name },
+        })
+    })?;
+    rows.collect::<Result<Vec<_>, _>>()
 }
 
 #[derive(Debug, Serialize, Deserialize)]

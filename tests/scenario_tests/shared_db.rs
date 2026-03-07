@@ -269,6 +269,17 @@ async fn test_shared_db_same_workspace_two_tenants() {
     t0.batch_create_messages(2);
     t1.batch_create_messages(3);
 
+    assert_eq!(
+        t0.scoped_message_count(),
+        5,
+        "tenant 0 should project both its own and sibling messages"
+    );
+    assert_eq!(
+        t1.scoped_message_count(),
+        5,
+        "tenant 1 should project both its own and sibling messages"
+    );
+
     let db = open_connection(&node.db_path).unwrap();
 
     // Both tenants should have recorded the shared Workspace event

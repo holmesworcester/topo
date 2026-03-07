@@ -2,11 +2,13 @@ use rusqlite::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::apply::project_one;
+use super::decision::ProjectionDecision;
 use crate::crypto::{event_id_to_base64, hash_event, EventId};
 use crate::db::store::{
     insert_event, insert_neg_item_if_shared, insert_recorded_event, lookup_workspace_id,
 };
 use crate::event_modules::{self as events, registry, ParsedEvent};
+use crate::state::shared_workspace_fanout::fanout_stored_shared_event_immediate;
 
 /// Emit a deterministic event: compute blob, hash to event_id, check if already
 /// exists, if not: store in events/neg_items/recorded_events and project via project_one.
@@ -84,7 +86,20 @@ pub fn emit_deterministic_blob(
     // Always record for this tenant and project (even if event already existed globally)
     insert_recorded_event(conn, recorded_by, &event_id, now_ms, "emitted")?;
 
-    let _ = project_one(conn, recorded_by, &event_id);
+    match project_one(conn, recorded_by, &event_id) {
+        Ok(ProjectionDecision::Valid | ProjectionDecision::AlreadyProcessed) => {
+            fanout_stored_shared_event_immediate(conn, recorded_by, &event_id)
+                .map_err(|e| format!("same-workspace fanout failed: {}", e))?;
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                "emit_deterministic_blob projection error for {}: {}",
+                event_id_b64,
+                e
+            );
+        }
+    }
 
     Ok(event_id)
 }

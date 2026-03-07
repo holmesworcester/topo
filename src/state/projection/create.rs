@@ -11,6 +11,7 @@ use crate::event_modules::EncryptedEvent;
 use crate::event_modules::{self as events, registry, ParsedEvent};
 use crate::projection::encrypted::encrypt_event_blob;
 use crate::projection::signer::sign_event_bytes;
+use crate::state::shared_workspace_fanout::fanout_stored_shared_event_immediate;
 use ed25519_dalek::SigningKey;
 
 #[derive(Debug)]
@@ -129,7 +130,11 @@ fn project_stored_event(
         .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
     match decision {
-        ProjectionDecision::Valid | ProjectionDecision::AlreadyProcessed => Ok(*event_id),
+        ProjectionDecision::Valid | ProjectionDecision::AlreadyProcessed => {
+            fanout_stored_shared_event_immediate(conn, recorded_by, event_id)
+                .map_err(|e| CreateEventError::DbError(e.to_string()))?;
+            Ok(*event_id)
+        }
         ProjectionDecision::Block { missing } => Err(CreateEventError::Blocked {
             event_id: *event_id,
             missing,
@@ -391,6 +396,7 @@ mod tests {
         DeviceInviteEvent, InviteAcceptedEvent, MessageEvent, PeerSharedEvent, ReactionEvent,
         TenantEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
     };
+    use crate::testutil::SharedDbNode;
     use ed25519_dalek::SigningKey;
 
     fn now_ms() -> u64 {
@@ -868,5 +874,43 @@ mod tests {
             Ok(_) => panic!("PLAN §6.4: blocked event must NOT return Ok"),
             Err(e) => panic!("expected Blocked, got: {}", e),
         }
+    }
+
+    #[test]
+    fn test_local_shared_create_fanout_is_same_workspace_only() {
+        let mut node = SharedDbNode::new(2);
+        node.add_tenant_in_workspace("same-ws", 0);
+
+        let origin = &node.tenants[0];
+        let other_workspace = &node.tenants[1];
+        let sibling = &node.tenants[2];
+
+        let message_id = origin.create_message("local fanout marker");
+        let message_b64 = event_id_to_base64(&message_id);
+        let db = crate::db::open_connection(&node.db_path).unwrap();
+
+        let sibling_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
+                rusqlite::params![&sibling.identity, &message_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sibling_count, 1,
+            "same-workspace sibling should project message"
+        );
+
+        let other_count: i64 = db
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
+                rusqlite::params![&other_workspace.identity, &message_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            other_count, 0,
+            "different-workspace tenant must not receive same-workspace fanout"
+        );
     }
 }

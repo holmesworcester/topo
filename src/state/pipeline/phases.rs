@@ -7,11 +7,13 @@ use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::store::lookup_workspace_id;
 use crate::event_modules::{self as events, registry::EventRegistry, ShareScope};
+use crate::state::shared_workspace_fanout::SharedEventFanout;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct PersistPhaseOutput {
     pub persisted_event_ids: Vec<EventId>,
     pub tenants_seen: HashSet<String>,
+    pub shared_event_fanouts: Vec<SharedEventFanout>,
 }
 
 fn current_timestamp_ms() -> i64 {
@@ -34,6 +36,7 @@ pub(super) fn run_persist_phase(
     let mut persist_output = PersistPhaseOutput {
         persisted_event_ids: Vec::with_capacity(batch.len()),
         tenants_seen: HashSet::new(),
+        shared_event_fanouts: Vec::new(),
     };
 
     for (event_id, blob, recorded_by, source_tag) in batch {
@@ -113,6 +116,19 @@ pub(super) fn run_persist_phase(
 
                     persist_output.tenants_seen.insert(recorded_by.clone());
                     persist_output.persisted_event_ids.push(*event_id);
+                    if meta.share_scope == ShareScope::Shared {
+                        if let Some(workspace_id) = if meta.type_name == "workspace" {
+                            Some(event_id_b64.clone())
+                        } else {
+                            lookup_workspace_id(db, recorded_by)
+                        } {
+                            persist_output.shared_event_fanouts.push(SharedEventFanout {
+                                origin_peer_id: recorded_by.clone(),
+                                workspace_id,
+                                event_id: *event_id,
+                            });
+                        }
+                    }
                 } else {
                 }
             } else {

@@ -357,6 +357,27 @@ fn assert_event_visible_on_all(db_paths: &[&str], event_id: &str, timeout_ms: u6
     }
 }
 
+fn assert_eventually_users_include(db_path: &str, expected_users: &[&str], timeout_ms: u64) {
+    let start = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+    loop {
+        let users = get_users_raw(db_path);
+        if expected_users
+            .iter()
+            .all(|username| users.contains(username))
+        {
+            return;
+        }
+        if start.elapsed() >= timeout {
+            panic!(
+                "users did not converge within {}ms for {}: expected {:?}, got:\n{}",
+                timeout_ms, db_path, expected_users, users
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn assert_cli_state_for_username(
     db_path: &str,
     username: &str,
@@ -369,6 +390,30 @@ fn assert_cli_state_for_username(
     expected_messages: &[&str],
 ) {
     use_tenant_for_username(db_path, username);
+    let expected_peer_id = {
+        let conn = open_connection(db_path).expect("open db");
+        conn.query_row(
+            "SELECT recorded_by
+             FROM users
+             WHERE username = ?1
+             LIMIT 1",
+            rusqlite::params![username],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("username should map to a tenant")
+    };
+    let active = topo_cmd(db_path, &["active-tenant"]);
+    assert!(
+        active.status.success(),
+        "active-tenant failed after use-tenant: {}",
+        String::from_utf8_lossy(&active.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&active.stdout).trim(),
+        expected_peer_id,
+        "active tenant should match username {:?}",
+        username
+    );
     assert_cli_state(
         db_path,
         expected_workspace_names,
@@ -1278,91 +1323,31 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
         "bob-alpha",
         "bob-terminal",
     );
-    let mut shared_daemon = start_daemon(&shared_db);
-    let bob_alpha_account = "bob-alpha/bob-terminal";
-    use_tenant_for_username(&shared_db, "bob-alpha");
-    assert_eventually(&shared_db, "message_count >= 1", timeout_ms);
-    let bob_alpha_msg = send_message_as_username(&shared_db, "bob-alpha", "alpha-space/bob-step-2");
-    assert_event_visible_on_all(&[&alpha.db, &shared_db], &bob_alpha_msg, timeout_ms);
-    assert_cli_state(
-        &alpha.db,
-        &["alpha-space"],
-        "alpha-space",
-        1,
-        2,
-        &["alpha", "bob-alpha"],
-        &[&alpha_account, bob_alpha_account],
-        &[alpha_base, "alpha-space/bob-step-2"],
-    );
-    assert_cli_state_for_username(
-        &shared_db,
-        "bob-alpha",
-        &["alpha-space"],
-        "alpha-space",
-        1,
-        2,
-        &["alpha", "bob-alpha"],
-        &[&alpha_account, bob_alpha_account],
-        &[alpha_base, "alpha-space/bob-step-2"],
-    );
-    stop_daemon(&shared_db, &mut shared_daemon);
-    drop(shared_daemon);
-
     accept_invite_with_identity(&shared_db, &zeta_invite_fresh, "yuki-zeta", "yuki-terminal");
-    let mut shared_daemon = start_daemon(&shared_db);
-    let yuki_zeta_account = "yuki-zeta/yuki-terminal";
-    use_tenant_for_username(&shared_db, "yuki-zeta");
-    assert_eventually(&shared_db, "message_count >= 1", timeout_ms);
-    let yuki_zeta_msg = send_message_as_username(&shared_db, "yuki-zeta", "zeta-space/yuki-step-2");
-    assert_event_visible_on_all(&[&zeta.db, &shared_db], &yuki_zeta_msg, timeout_ms);
-    assert_cli_state(
-        &zeta.db,
-        &["zeta-space"],
-        "zeta-space",
-        1,
-        2,
-        &["zeta", "yuki-zeta"],
-        &[&zeta_account, yuki_zeta_account],
-        &[zeta_base, "zeta-space/yuki-step-2"],
-    );
-    assert_cli_state_for_username(
-        &shared_db,
-        "bob-alpha",
-        &["alpha-space", "zeta-space"],
-        "alpha-space",
-        2,
-        2,
-        &["alpha", "bob-alpha"],
-        &[&alpha_account, bob_alpha_account],
-        &[alpha_base, "alpha-space/bob-step-2"],
-    );
-    assert_cli_state_for_username(
-        &shared_db,
-        "yuki-zeta",
-        &["alpha-space", "zeta-space"],
-        "zeta-space",
-        2,
-        2,
-        &["zeta", "yuki-zeta"],
-        &[&zeta_account, yuki_zeta_account],
-        &[zeta_base, "zeta-space/yuki-step-2"],
-    );
-    stop_daemon(&shared_db, &mut shared_daemon);
-    drop(shared_daemon);
-
     accept_invite_with_identity(
         &shared_db,
         &alpha_invite_reused,
         "carol-alpha",
         "carol-terminal",
     );
+
     let _shared_daemon = start_daemon(&shared_db);
+    assert_eventually_users_include(
+        &alpha.db,
+        &["alpha", "bob-alpha", "carol-alpha"],
+        timeout_ms,
+    );
+    assert_eventually_users_include(&zeta.db, &["zeta", "yuki-zeta"], timeout_ms);
+    let bob_alpha_account = "bob-alpha/bob-terminal";
+    let bob_alpha_msg = send_message_as_username(&shared_db, "bob-alpha", "alpha-space/bob-step-2");
+    let yuki_zeta_account = "yuki-zeta/yuki-terminal";
+    let yuki_zeta_msg = send_message_as_username(&shared_db, "yuki-zeta", "zeta-space/yuki-step-2");
     let carol_alpha_account = "carol-alpha/carol-terminal";
-    use_tenant_for_username(&shared_db, "carol-alpha");
-    assert_eventually(&shared_db, "message_count >= 2", timeout_ms);
     let carol_alpha_msg =
         send_message_as_username(&shared_db, "carol-alpha", "alpha-space/carol-step-3");
-    assert_event_visible_on_all(&[&alpha.db, &shared_db], &carol_alpha_msg, timeout_ms);
+    assert_event_visible_on_all(&[&alpha.db], &bob_alpha_msg, timeout_ms);
+    assert_event_visible_on_all(&[&zeta.db], &yuki_zeta_msg, timeout_ms);
+    assert_event_visible_on_all(&[&alpha.db], &carol_alpha_msg, timeout_ms);
 
     assert_cli_state(
         &alpha.db,
@@ -1405,6 +1390,17 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
     );
     assert_cli_state_for_username(
         &shared_db,
+        "yuki-zeta",
+        &["alpha-space", "zeta-space"],
+        "zeta-space",
+        3,
+        2,
+        &["zeta", "yuki-zeta"],
+        &[&zeta_account, yuki_zeta_account],
+        &[zeta_base, "zeta-space/yuki-step-2"],
+    );
+    assert_cli_state_for_username(
+        &shared_db,
         "carol-alpha",
         &["alpha-space", "zeta-space"],
         "alpha-space",
@@ -1417,17 +1413,6 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
             "alpha-space/bob-step-2",
             "alpha-space/carol-step-3",
         ],
-    );
-    assert_cli_state_for_username(
-        &shared_db,
-        "yuki-zeta",
-        &["alpha-space", "zeta-space"],
-        "zeta-space",
-        3,
-        2,
-        &["zeta", "yuki-zeta"],
-        &[&zeta_account, yuki_zeta_account],
-        &[zeta_base, "zeta-space/yuki-step-2"],
     );
 
     use_tenant_for_username(&shared_db, "yuki-zeta");

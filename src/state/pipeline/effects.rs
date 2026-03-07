@@ -1,5 +1,6 @@
 use crate::db::project_queue::ProjectQueue;
 use crate::db::wanted::WantedEvents;
+use crate::state::shared_workspace_fanout::fanout_shared_event_enqueue;
 
 use super::drain::drain_project_queue_on_connection;
 use super::phases::PersistPhaseOutput;
@@ -35,8 +36,24 @@ impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
             let _ = wanted.remove(event_id);
         }
 
+        let mut tenant_set = persist_output.tenants_seen.clone();
+        for fanout in &persist_output.shared_event_fanouts {
+            match fanout_shared_event_enqueue(self.db, fanout) {
+                Ok(siblings) => {
+                    tenant_set.extend(siblings);
+                }
+                Err(e) => {
+                    tracing::warn!(
+                        "same-workspace fanout enqueue failed for {}: {}",
+                        short_id(&fanout.origin_peer_id),
+                        e
+                    );
+                }
+            }
+        }
+
         // Keep tenant ordering deterministic for readability and reproducible logs.
-        let mut tenants: Vec<String> = persist_output.tenants_seen.iter().cloned().collect();
+        let mut tenants: Vec<String> = tenant_set.into_iter().collect();
         tenants.sort();
 
         for tenant_id in tenants {
@@ -107,6 +124,7 @@ mod tests {
         let persist_output = PersistPhaseOutput {
             persisted_event_ids: vec![wanted_id],
             tenants_seen: std::collections::HashSet::from(["tenant-a".to_string()]),
+            shared_event_fanouts: Vec::new(),
         };
         let executor = SqlitePostCommitEffectsExecutor::new(&conn);
 
@@ -148,6 +166,7 @@ mod tests {
         let persist_output = PersistPhaseOutput {
             persisted_event_ids: vec![wanted_id],
             tenants_seen: std::collections::HashSet::from(["tenant-a".to_string()]),
+            shared_event_fanouts: Vec::new(),
         };
         let executor = SqlitePostCommitEffectsExecutor::new(&conn);
 
@@ -163,6 +182,112 @@ mod tests {
         assert_eq!(
             wanted_count, 0,
             "remove wanted should still run after prior command failure"
+        );
+    }
+
+    #[test]
+    fn event_pipeline_effects_fan_out_shared_events_to_same_workspace_siblings_only() {
+        use crate::crypto::{event_id_to_base64, hash_event};
+        use crate::db::{open_connection, schema::create_tables, store::insert_event};
+        use crate::event_modules::{encode_event, MessageEvent, ParsedEvent};
+        use crate::projection::signer::sign_event_bytes;
+        use crate::testutil::SharedDbNode;
+
+        let mut node = SharedDbNode::new(2);
+        node.add_tenant_in_workspace("same-ws", 0);
+
+        let origin = &node.tenants[0];
+        let other_workspace = &node.tenants[1];
+        let sibling = &node.tenants[2];
+
+        let conn = open_connection(&node.db_path).unwrap();
+        create_tables(&conn).unwrap();
+
+        let msg = ParsedEvent::Message(MessageEvent {
+            created_at_ms: 42,
+            workspace_id: origin.workspace_id,
+            author_id: origin.author_id,
+            content: "fanout-from-ingest".to_string(),
+            signed_by: origin.peer_shared_event_id.unwrap(),
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let mut blob = encode_event(&msg).unwrap();
+        let sig = sign_event_bytes(
+            origin.peer_shared_signing_key.as_ref().unwrap(),
+            &blob[..blob.len() - 64],
+        );
+        let blob_len = blob.len();
+        blob[blob_len - 64..].copy_from_slice(&sig);
+        let event_id = hash_event(&blob);
+        let event_id_b64 = event_id_to_base64(&event_id);
+
+        insert_event(
+            &conn,
+            &event_id,
+            "message",
+            &blob,
+            crate::event_modules::ShareScope::Shared,
+            42,
+            42,
+        )
+        .unwrap();
+        crate::db::store::insert_neg_item_if_shared(
+            &conn,
+            crate::event_modules::ShareScope::Shared,
+            42,
+            &event_id,
+            &event_id_to_base64(&origin.workspace_id),
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, 42, 'quic_recv:test')",
+            params![&origin.identity, &event_id_b64],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO project_queue (peer_id, event_id, available_at)
+             VALUES (?1, ?2, 42)",
+            params![&origin.identity, &event_id_b64],
+        )
+        .unwrap();
+
+        let persist_output = PersistPhaseOutput {
+            persisted_event_ids: vec![event_id],
+            tenants_seen: std::collections::HashSet::from([origin.identity.clone()]),
+            shared_event_fanouts: vec![crate::state::shared_workspace_fanout::SharedEventFanout {
+                origin_peer_id: origin.identity.clone(),
+                workspace_id: event_id_to_base64(&origin.workspace_id),
+                event_id,
+            }],
+        };
+        let executor = SqlitePostCommitEffectsExecutor::new(&conn);
+
+        run_post_commit_effects(&executor, &persist_output, 16);
+
+        let sibling_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
+                params![&sibling.identity, &event_id_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            sibling_count, 1,
+            "same-workspace sibling should project message"
+        );
+
+        let other_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
+                params![&other_workspace.identity, &event_id_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            other_count, 0,
+            "different-workspace tenant must not receive same-workspace fanout"
         );
     }
 }

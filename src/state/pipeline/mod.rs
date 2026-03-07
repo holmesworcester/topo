@@ -285,6 +285,7 @@ mod tests {
         PersistPhaseOutput {
             persisted_event_ids: vec![[1u8; 32], [2u8; 32]],
             tenants_seen: HashSet::from(["tenant-b".to_string(), "tenant-a".to_string()]),
+            shared_event_fanouts: Vec::new(),
         }
     }
 
