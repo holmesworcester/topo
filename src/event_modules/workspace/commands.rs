@@ -132,33 +132,49 @@ fn replay_existing_workspace_shared_events_for_tenant(
         if seen.contains(&eid) {
             continue;
         }
-        // Only include if recorded by at least one non-removed workspace
-        // sibling. This filters post-removal local creates.
+        // Include if recorded by at least one workspace sibling that is
+        // either non-removed OR was removed after the event was created
+        // (pre-removal legitimate history, with 30s clock tolerance).
         let eid_b64 = event_id_to_base64(&eid);
-        let has_non_removed_recorder: bool = db
+        let has_eligible_recorder: bool = db
             .query_row(
                 "SELECT EXISTS (
                     SELECT 1 FROM recorded_events re
                     JOIN invites_accepted ia
                       ON ia.recorded_by = re.peer_id AND ia.workspace_id = ?1
+                    JOIN events e ON e.event_id = re.event_id
                     WHERE re.event_id = ?2
                       AND re.peer_id <> ?3
-                      AND NOT EXISTS (
-                        SELECT 1 FROM peers_shared p
-                        JOIN removed_entities r
-                          ON r.recorded_by = p.recorded_by
-                          AND (r.target_event_id = p.event_id
-                               OR (r.removal_type = 'user'
-                                   AND p.user_event_id IS NOT NULL
-                                   AND r.target_event_id = p.user_event_id))
-                        WHERE lower(hex(p.transport_fingerprint)) = re.peer_id
+                      AND (
+                        NOT EXISTS (
+                          SELECT 1 FROM peers_shared p
+                          JOIN removed_entities r
+                            ON r.recorded_by = p.recorded_by
+                            AND (r.target_event_id = p.event_id
+                                 OR (r.removal_type = 'user'
+                                     AND p.user_event_id IS NOT NULL
+                                     AND r.target_event_id = p.user_event_id))
+                          WHERE lower(hex(p.transport_fingerprint)) = re.peer_id
+                        )
+                        OR e.created_at <= (
+                          SELECT MIN(rev.created_at) + 30000
+                          FROM removed_entities r
+                          JOIN peers_shared p
+                            ON r.recorded_by = p.recorded_by
+                            AND (r.target_event_id = p.event_id
+                                 OR (r.removal_type = 'user'
+                                     AND p.user_event_id IS NOT NULL
+                                     AND r.target_event_id = p.user_event_id))
+                          JOIN events rev ON rev.event_id = r.event_id
+                          WHERE lower(hex(p.transport_fingerprint)) = re.peer_id
+                        )
                       )
                 )",
                 rusqlite::params![&workspace_id_b64, &eid_b64, recorded_by],
                 |row| row.get(0),
             )
             .unwrap_or(false);
-        if has_non_removed_recorder {
+        if has_eligible_recorder {
             seen.insert(eid);
             event_ids.push(eid);
         }
@@ -168,13 +184,15 @@ fn replay_existing_workspace_shared_events_for_tenant(
     let recorded_at = now_ms() as i64;
 
     // Phase 1: Durably record and enqueue ALL events before projecting any.
-    // If the process crashes after this phase, startup will drain the
-    // project_queue and complete the seed without data loss.
+    // Wrapped in a transaction so a crash mid-loop cannot leave partial
+    // recorded_events without matching project_queue entries.
+    db.execute_batch("BEGIN")?;
     for event_id in &event_ids {
         insert_recorded_event(db, recorded_by, event_id, recorded_at, "same_workspace_seed")?;
         let event_id_b64 = event_id_to_base64(event_id);
         let _ = pq.enqueue(recorded_by, &event_id_b64);
     }
+    db.execute_batch("COMMIT")?;
 
     // Phase 2: Project inline and clean up queue entries.
     // Blocked events (e.g. encrypted events whose key_secret hasn't been

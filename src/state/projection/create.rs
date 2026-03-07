@@ -121,10 +121,13 @@ fn store_blob_only(
     // origin's own projection and sibling fanout:
     // 1. Enqueue origin in project_queue so startup drain projects it.
     // 2. Write a pending fanout entry so sibling fanout survives a crash.
+    // These must succeed atomically with the event storage above; errors
+    // are propagated to avoid silent data loss on crash.
     if meta.share_scope == crate::event_modules::registry::ShareScope::Shared {
         let event_id_b64 = crate::crypto::event_id_to_base64(&event_id);
         let pq = crate::state::db::project_queue::ProjectQueue::new(conn);
-        let _ = pq.enqueue(recorded_by, &event_id_b64);
+        pq.enqueue(recorded_by, &event_id_b64)
+            .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
         if let Some(ref ws_id) = ws_id_for_neg {
             let fanout_entry = crate::state::shared_workspace_fanout::SharedEventFanout {
@@ -132,10 +135,11 @@ fn store_blob_only(
                 workspace_id: ws_id.clone(),
                 event_id,
             };
-            let _ = crate::state::shared_workspace_fanout::persist_pending_fanouts(
+            crate::state::shared_workspace_fanout::persist_pending_fanouts(
                 conn,
                 &[fanout_entry],
-            );
+            )
+            .map_err(|e| CreateEventError::DbError(e.to_string()))?;
         }
     }
 
