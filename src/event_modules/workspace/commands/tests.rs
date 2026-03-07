@@ -65,7 +65,7 @@ fn create_user_invite_materializes_pending_bootstrap_trust_via_projection() {
 }
 
 #[test]
-fn create_workspace_rejects_unscoped_recorded_by_when_creds_exist() {
+fn create_workspace_allows_unscoped_recorded_by_when_creds_exist_and_creates_new_tenant() {
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");
 
@@ -81,20 +81,36 @@ fn create_workspace_rejects_unscoped_recorded_by_when_creds_exist() {
     )
     .expect("store transport creds");
 
-    let err = match create_workspace(&conn, "bootstrap", "ws", "alice", "laptop") {
-        Ok(_) => panic!("unscoped recorded_by should be rejected when creds exist"),
-        Err(e) => e,
-    };
-    assert!(
-        err.to_string()
-            .contains("create_workspace requires scoped tenant identity"),
-        "unexpected error: {}",
-        err
+    let created = create_workspace(&conn, "bootstrap", "ws", "alice", "laptop")
+        .expect("unscoped bootstrap should still create a new workspace tenant");
+    let created_peer_id = peer_id_for_signing_key(&created.peer_shared_key);
+    assert_ne!(
+        created_peer_id, tenant_peer_id,
+        "create_workspace should mint a new tenant instead of reusing existing transport creds"
     );
+
+    let local_creds_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
+            row.get(0)
+        })
+        .expect("count transport creds");
+    assert_eq!(
+        local_creds_count, 2,
+        "workspace creation should add a second local transport identity"
+    );
+
+    let tenants =
+        crate::db::transport_creds::discover_local_tenants(&conn).expect("discover tenants");
+    assert_eq!(
+        tenants.len(),
+        1,
+        "only the created workspace should resolve as a tenant"
+    );
+    assert_eq!(tenants[0].peer_id, created_peer_id);
 }
 
 #[test]
-fn create_workspace_for_db_scopes_to_existing_transport_identity_when_workspace_missing() {
+fn create_workspace_for_db_creates_new_tenant_when_workspace_missing() {
     let dir = tempfile::tempdir().expect("create tempdir");
     let db_path = dir.path().join("db.sqlite");
     let db_path = db_path.to_string_lossy().to_string();
@@ -115,12 +131,16 @@ fn create_workspace_for_db_scopes_to_existing_transport_identity_when_workspace_
     drop(conn);
 
     let resp = create_workspace_for_db(&db_path, "ws", "alice", "laptop")
-        .expect("create workspace should succeed with existing scoped transport identity");
+        .expect("create workspace should succeed with existing transport identity rows");
     assert!(
         !resp.workspace_id.is_empty(),
         "workspace id should be populated"
     );
     assert!(!resp.peer_id.is_empty(), "peer id should be populated");
+    assert_ne!(
+        resp.peer_id, seeded_peer_id,
+        "create_workspace_for_db should mint a new tenant instead of reusing the preexisting transport identity"
+    );
 
     // Resulting tenant scope should resolve to the created peer identity even
     // when multiple local transport creds exist.

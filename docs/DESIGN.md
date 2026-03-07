@@ -74,7 +74,7 @@ Every participant begins by starting a daemon (`topo ... start`) with a local da
 
 ### Workspace Creation And First User Creation
 
-A workspace creator starts from an empty store. The create workspace command emits the initial auth event graph (`workspace`, bootstrap `user_invite_shared`, `invite_accepted`, `user`, `peer_invite_shared`, `peer_shared`) plus local signer/key material. Tenant identity (`recorded_by`) is pre-derived from the final PeerShared identity before writes begin, so bootstrap rows are already in the same scope used later for normal operation. (There is no "temporary tenant identity" that must be migrated later.)
+A workspace creator can start from an empty store or from a DB that already hosts other local tenants. The create workspace command always emits a fresh auth event graph (`workspace`, bootstrap `user_invite_shared`, `invite_accepted`, `user`, `peer_invite_shared`, `peer_shared`) plus local signer/key material for a new tenant/workspace binding; it never reuses the daemon's currently active tenant. Tenant identity (`recorded_by`) is pre-derived from the final PeerShared identity before writes begin, so bootstrap rows are already in the same scope used later for normal operation. (There is no "temporary tenant identity" that must be migrated later.)
 
 ### Creation And Projection Share One Path
 
@@ -82,7 +82,7 @@ Local event creation is synchronous at the command boundary, and every event sti
 
 ### Inviting And Joining
 
-After workspace creation, an admin creates a `user_invite_shared` event (which is synced to all existing members, if any) and shares invite data. The joiner accepts via `invite_accepted` and writes the follow-on identity chain (including a signed proof of invitation which all existing members can verify) for that joiner's user/device/peer identity. Normal sync brings missing canonical events, and the blocked rows unblock through the same dependency mechanism. If join prerequisites (such as prior auth events) are not yet present locally, the join path does not fork into ad-hoc recovery logic.
+After workspace creation, an admin creates a `user_invite_shared` event (which is synced to all existing members, if any) and shares invite data. The joiner accepts via `invite_accepted` and writes the follow-on identity chain (including a signed proof of invitation which all existing members can verify) for that joiner's user/device/peer identity. Accepting a workspace invite follows the same control-plane boundary as `create-workspace`: it creates a fresh local tenant bound to the invited workspace instead of reusing whichever tenant is currently active in the daemon. Normal sync brings missing canonical events, and the blocked rows unblock through the same dependency mechanism. If join prerequisites (such as prior auth events) are not yet present locally, the join path does not fork into ad-hoc recovery logic.
 
 ### Auth Event Graph Drives Join-Window Connection Policy
 
@@ -90,7 +90,7 @@ To avoid a chicken/egg problem, peers need to establish sessions before full ste
 
 ### Device Linking Uses The Same Story
 
-Linking a second device follows the invite pattern with `peer_invite_shared` and acceptance, but extends an existing user instead of creating a new one. The runtime behavior is intentionally isomorphic to user join: bootstrap trust can bridge first contact, sync fills any missing canonical history, and PeerShared-derived trust becomes the long-term authority. Because this reuses the same event/projection/sync loop, multi-device behavior does not require a separate architecture: every subsequent device is recorded and validated in the same way as the first device.
+Linking a second device follows the invite pattern with `peer_invite_shared` and acceptance, but extends an existing user instead of creating a new one. Unlike workspace creation or workspace-invite acceptance, device-link accept is scoped to an existing workspace/account lineage carried by the link; it must not create a second workspace binding or reinterpret the daemon's active tenant as a different workspace. The runtime behavior is intentionally isomorphic to user join: bootstrap trust can bridge first contact, sync fills any missing canonical history, and PeerShared-derived trust becomes the long-term authority. Because this reuses the same event/projection/sync loop, multi-device behavior does not require a separate architecture: every subsequent device is recorded and validated in the same way as the first device.
 
 ### Peer Discovery Provides Candidates, Not Authority
 
@@ -557,18 +557,20 @@ High-level identity operations are owned by event-module commands (`event_module
 **Bootstrap** (`workspace::commands::create_workspace`): creates the identity chain for a new workspace owner:
 Workspace → InviteAccepted (accepted workspace binding) → UserInvite → User → DeviceInvite → PeerShared + PeerSecret (`peer_shared` signer) + content key seed.
 The `peer_secret` event for the local `peer_shared` signer triggers `ApplyTransportIdentityIntent` on projection, installing a PeerShared-derived transport identity.
-Scope rule: `create_workspace` is tenant-scoped. If local transport credentials already exist, `recorded_by` must match a known local tenant peer ID in `local_transport_creds`; unscoped aliases (for example `"bootstrap"`) are rejected. Fresh DB bootstrap (no local creds) is still allowed.
+Scope rule: `create_workspace` is tenant-agnostic at the CLI/RPC boundary. It always mints a fresh local tenant/workspace binding, even when the DB already has active tenants or transport credentials. Direct command internals may still pass an explicit `recorded_by` for tests or low-level idempotence, but operator-facing `topo create-workspace` must never collapse onto the active tenant.
 
 **Invite** (`workspace::commands::create_user_invite`): admin creates a UserInvite event and returns portable invite data (event ID + signing key + workspace ID). Wraps content key for invitee if sender keys are available.
 
 **Accept** (`workspace::commands::join_workspace_as_new_user`): joiner consumes invite data and creates:
 InviteAccepted (accepted workspace binding) → User → DeviceInvite → PeerShared.
 Prerequisite: the joiner's DB must already contain the Workspace and UserInvite events (copied from the inviter before or during sync).
+Scope rule: workspace invite acceptance is also tenant-agnostic at the CLI/RPC boundary. It creates a new local tenant bound to the invited workspace instead of reusing the active tenant.
 The acceptance path also unwraps bootstrap content-key material received via `key_shared` events (wrapped to the invite public key at creation time) and materializes local `key_secret` events so that encrypted content received during bootstrap sync can be decrypted.
 On shared-DB multi-tenant nodes, acceptance also replays already-present shared events for the accepted workspace into the new tenant scope. Canonical blobs may already exist globally in `events` / `neg_items`, and negentropy will not refetch them just because a new local tenant accepted the workspace. That replay is therefore part of the correctness contract for same-DB joins, not just an optimization.
 Signer secrets (PeerSecret events) are NOT emitted here; `persist_join_peer_secret` is called separately after push-back sync completes.
 
 **Device link** (`workspace::commands::create_device_link_invite` / `add_device_to_workspace`): similar to user invite but creates a shorter chain (PeerShared only, skipping user/peer_invite_shared creation).
+Scope rule: device-link commands remain workspace-scoped. They extend an existing workspace/account lineage and do not create a new workspace binding.
 The same replay rule applies to device linking: when a new local device joins a workspace whose shared history already exists in the DB, that history must be seeded into the new tenant scope immediately.
 
 **Retry** (`workspace::commands::retry_pending_invite_content_key_unwraps`): retries content-key unwrap for invites where `key_shared` prerequisites arrived late. Triggered via `event_modules::post_drain_hooks` from `state/pipeline/effects.rs` after each projection drain.
@@ -1303,7 +1305,7 @@ The CLI/daemon operational shape is primarily for operability, testing, and demo
 
 All CLI commands that read or mutate workspace state **must** go through RPC to the running daemon. The CLI binary should never open the database directly for queries or operations that the daemon can serve. This ensures:
 
-1. workspace scoping is always applied consistently (via the daemon's active tenant/peer),
+1. workspace scoping is applied consistently: workspace-facing RPCs use the daemon's active tenant, while workspace-creating RPCs (`CreateWorkspace`, `AcceptInvite`) are tenant-agnostic control-plane operations that mint fresh tenants,
 2. the daemon can coordinate side effects (runtime restarts, invite refs, connection management),
 3. there is a single authority for session-local state (active peer, invite aliases).
 
@@ -1334,8 +1336,10 @@ These are operator ergonomics, not protocol facts; they do not project into cano
 
 Tenant-scoping rule:
 1. `Status`, `View`, `Messages`, `Users`, `Peers`, `Keys`, and similar workspace-facing RPCs are scoped to the active tenant,
-2. on a multi-tenant DB with no selected tenant, those RPCs should return `no active tenant` instead of misleading aggregate zeros,
-3. daemon readiness/liveness probes therefore need tenant-agnostic control-plane RPCs such as `ActiveTenant` or `Tenants`, not `Status`.
+2. `CreateWorkspace` and `AcceptInvite` are tenant-agnostic control-plane RPCs: they always create a fresh local tenant/workspace binding and must not reuse the active tenant,
+3. `CreateInvite`, `CreateDeviceLink`, `AcceptLink`, and similar existing-workspace operations stay scoped to an already bound tenant/workspace lineage,
+4. on a multi-tenant DB with no selected tenant, workspace-facing RPCs should return `no active tenant` instead of misleading aggregate zeros,
+5. daemon readiness/liveness probes therefore need tenant-agnostic control-plane RPCs such as `ActiveTenant` or `Tenants`, not `Status`.
 
 ### Local-echo reconciliation (`client_op_id`)
 

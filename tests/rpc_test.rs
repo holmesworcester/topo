@@ -299,7 +299,7 @@ fn daemon_and_cli_send_and_messages() {
 }
 
 #[test]
-fn daemon_messages_and_create_workspace_are_idempotent_with_multi_identity_rows() {
+fn daemon_messages_and_create_workspace_add_new_tenants_with_multi_identity_rows() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
 
@@ -307,6 +307,14 @@ fn daemon_messages_and_create_workspace_are_idempotent_with_multi_identity_rows(
     create_workspace(&db);
 
     let conn = topo::db::open_connection(&db).unwrap();
+    let original_tenants = topo::db::transport_creds::discover_local_tenants(&conn).unwrap();
+    assert_eq!(
+        original_tenants.len(),
+        1,
+        "expected exactly one tenant after initial workspace bootstrap"
+    );
+    let original_peer_id = original_tenants[0].peer_id.clone();
+    let original_workspace_id = original_tenants[0].workspace_id.clone();
     let (extra_cert, extra_key) = topo::transport::generate_self_signed_cert().unwrap();
     let extra_fp = topo::transport::extract_spki_fingerprint(extra_cert.as_ref()).unwrap();
     let extra_peer_id = hex::encode(extra_fp);
@@ -337,8 +345,8 @@ fn daemon_messages_and_create_workspace_are_idempotent_with_multi_identity_rows(
     );
     wait_for_socket(&socket);
 
-    // Regression 1: create-workspace should be idempotent, not fail on
-    // "Multiple local identities found".
+    // Regression 1: create-workspace should still succeed, but it must create
+    // a distinct tenant/workspace instead of reusing the active one.
     let out = Command::new(bin())
         .args(["--db", &db, "create-workspace"])
         .output()
@@ -349,6 +357,29 @@ fn daemon_messages_and_create_workspace_are_idempotent_with_multi_identity_rows(
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+
+    let conn = topo::db::open_connection(&db).unwrap();
+    let tenants_after = topo::db::transport_creds::discover_local_tenants(&conn).unwrap();
+    assert_eq!(
+        tenants_after.len(),
+        2,
+        "second create-workspace should add a new tenant; got {:?}",
+        tenants_after
+            .iter()
+            .map(|tenant| (&tenant.peer_id, &tenant.workspace_id))
+            .collect::<Vec<_>>()
+    );
+    assert!(
+        tenants_after.iter().any(|tenant| {
+            tenant.peer_id != original_peer_id && tenant.workspace_id != original_workspace_id
+        }),
+        "second create-workspace should create a distinct tenant/workspace; got {:?}",
+        tenants_after
+            .iter()
+            .map(|tenant| (&tenant.peer_id, &tenant.workspace_id))
+            .collect::<Vec<_>>()
+    );
+    drop(conn);
 
     // Regression 2: messages should use active tenant scope and succeed.
     let out = Command::new(bin())

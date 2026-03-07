@@ -17,8 +17,8 @@ use rusqlite::Connection;
 use super::identity_ops::{self as ops, InviteBootstrapContext, JoinChain, LinkChain};
 use std::collections::HashSet;
 
-use crate::crypto::{event_id_from_base64, event_id_to_base64};
 use crate::crypto::EventId;
+use crate::crypto::{event_id_from_base64, event_id_to_base64};
 use crate::db::store::insert_recorded_event;
 use crate::event_modules::{
     peer_secret::PeerSecretEvent, AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, ParsedEvent,
@@ -188,7 +188,13 @@ fn replay_existing_workspace_shared_events_for_tenant(
     // recorded_events without matching project_queue entries.
     db.execute_batch("BEGIN")?;
     for event_id in &event_ids {
-        insert_recorded_event(db, recorded_by, event_id, recorded_at, "same_workspace_seed")?;
+        insert_recorded_event(
+            db,
+            recorded_by,
+            event_id,
+            recorded_at,
+            "same_workspace_seed",
+        )?;
         let event_id_b64 = event_id_to_base64(event_id);
         let _ = pq.enqueue(recorded_by, &event_id_b64);
     }
@@ -267,8 +273,9 @@ pub fn create_workspace(
     username: &str,
     device_name: &str,
 ) -> Result<CreateWorkspaceResult, Box<dyn std::error::Error + Send + Sync>> {
-    // Idempotent check: if this tenant identity already exists, return it.
-    // Strictly scoped by the provided recorded_by; no cross-tenant fallback.
+    // Idempotent check: direct callers can reuse an explicit tenant scope by
+    // passing its recorded_by. User-facing create-workspace paths pass an
+    // unbound bootstrap alias so they always mint a new tenant.
     if let Some((eid, signing_key)) = load_local_peer_signer(db, recorded_by)? {
         let workspace_id = db
             .query_row(
@@ -288,27 +295,6 @@ pub fn create_workspace(
             peer_shared_event_id: eid,
             peer_shared_key: signing_key,
         });
-    }
-    // Strict scope check:
-    // - Fresh DB (no local creds): allow bootstrap.
-    // - Existing DB with local creds: recorded_by must identify a known tenant.
-    // This prevents unscoped aliases (e.g. "bootstrap") from acting on an
-    // arbitrary tenant in multi-tenant databases.
-    let known_tenant: bool = db.query_row(
-        "SELECT EXISTS(SELECT 1 FROM local_transport_creds WHERE peer_id = ?1 LIMIT 1)",
-        rusqlite::params![recorded_by],
-        |row| row.get(0),
-    )?;
-    let creds_count: i64 =
-        db.query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
-            row.get(0)
-        })?;
-    if !known_tenant && creds_count > 0 {
-        return Err(format!(
-            "create_workspace requires scoped tenant identity; recorded_by {} has no local transport creds",
-            recorded_by
-        )
-        .into());
     }
 
     let mut rng = rand::thread_rng();

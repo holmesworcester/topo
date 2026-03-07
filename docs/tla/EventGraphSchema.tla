@@ -33,6 +33,10 @@ EXTENDS Naturals, FiniteSets
 \*   Guard checks that a workspace event's id matches the peer's binding.
 \*   This ensures only the invited workspace can become valid; foreign
 \*   workspace events are structurally excluded.
+\*   Control-plane consequence: create-workspace and user-invite acceptance
+\*   must allocate a fresh peer/tenant perspective for each distinct workspace.
+\*   Device-link acceptance stays inside an existing workspace binding instead
+\*   of rebinding a peer perspective to a different workspace.
 \*
 \* Key semantic: after a peer observes a removal, new key_shared events
 \*   must NOT wrap to the removed peer (InvRemovalExclusion).
@@ -538,6 +542,17 @@ InvSingleWorkspace ==
         \A n1, n2 \in Workspaces:
             (n1 \in valid[p] /\ n2 \in valid[p]) => n1 = n2
 
+\* Accepting a different workspace invite cannot reuse a peer perspective that
+\* is already bound elsewhere; a fresh local tenant is required for that join.
+InvDistinctWorkspaceInviteRequiresFreshPeer ==
+    IF InviteAccepted \in EVENTS
+    THEN \A p \in Peers:
+        (trustAnchor[p] /= "none"
+         /\ inviteCarriedWorkspace[p] /= "none"
+         /\ inviteCarriedWorkspace[p] /= trustAnchor[p]) =>
+            ~(InviteAccepted \in valid[p])
+    ELSE TRUE
+
 \* Legacy-compatible explicit name used by projector/runtime guard mappings.
 \* Equivalent to InvWorkspaceAnchor: any valid workspace event must be the
 \* workspace bound by invite_accepted trust-anchor materialization.
@@ -645,6 +660,13 @@ InvDeviceInviteChain ==
     IF DeviceInvite \in EVENTS
     THEN \A p \in Peers:
         (PeerShared \in valid[p]) => (DeviceInvite \in valid[p])
+    ELSE TRUE
+
+\* Device-link flow remains inside an already bound workspace perspective.
+InvDeviceLinkScopedToExistingWorkspace ==
+    IF DeviceInvite \in EVENTS
+    THEN \A p \in Peers:
+        (DeviceInvite \in valid[p]) => (trustAnchor[p] /= "none")
     ELSE TRUE
 
 \* Admin requires user identity chain.

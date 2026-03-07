@@ -524,7 +524,7 @@ mod tests {
     }
 
     #[test]
-    fn test_ensure_identity_chain_tolerates_workspace_blocked() {
+    fn test_create_workspace_for_db_creates_distinct_tenants_on_repeat_calls() {
         let (_dir, db_path) = temp_db_path();
         let resp = workspace::commands::create_workspace_for_db(
             &db_path,
@@ -536,7 +536,7 @@ mod tests {
         assert!(!resp.peer_id.is_empty());
         assert!(!resp.workspace_id.is_empty());
 
-        // Calling again should be idempotent (returns existing workspace).
+        // Repeating create-workspace should bootstrap a second local tenant.
         let resp2 = workspace::commands::create_workspace_for_db(
             &db_path,
             "test-workspace",
@@ -544,8 +544,16 @@ mod tests {
             "test-device",
         )
         .unwrap();
-        assert_eq!(resp.peer_id, resp2.peer_id);
-        assert_eq!(resp.workspace_id, resp2.workspace_id);
+        assert_ne!(resp.peer_id, resp2.peer_id);
+        assert_ne!(resp.workspace_id, resp2.workspace_id);
+
+        let conn = open_connection(&db_path).unwrap();
+        let tenants = transport_creds::discover_local_tenants(&conn).unwrap();
+        assert_eq!(
+            tenants.len(),
+            2,
+            "repeat create-workspace should add a tenant"
+        );
     }
 
     #[test]

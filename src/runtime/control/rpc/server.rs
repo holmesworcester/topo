@@ -537,8 +537,14 @@ fn dispatch(
                     let mut resp_json = serde_json::to_value(&resp).unwrap();
                     let bootstrap_addrs = autodetect_bootstrap_addrs(state, listen_port);
                     match bootstrap_addrs.and_then(|addrs| {
-                        workspace::commands::create_invite_for_db(db_path, &addrs, listen_port)
-                            .map_err(|e| e.to_string())
+                        workspace::commands::create_invite_for_peer(
+                            db_path,
+                            &resp.peer_id,
+                            &addrs,
+                            listen_port,
+                            None,
+                        )
+                        .map_err(|e| e.to_string())
                     }) {
                         Ok(invite) => {
                             if let Some(link) = serde_json::to_value(&invite)
