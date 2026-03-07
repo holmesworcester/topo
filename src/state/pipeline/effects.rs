@@ -89,8 +89,11 @@ impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
             match fanout_shared_event_enqueue(self.db, fanout) {
                 Ok(siblings) => {
                     sibling_tenants.extend(siblings);
-                    // Delete only after successful enqueue so the entry
-                    // survives a crash and gets retried on next startup.
+                    // Delete after successful enqueue. The pending entry only
+                    // needs to survive the persist→enqueue gap. Once enqueued,
+                    // the project_queue handles retry (exponential backoff) for
+                    // any sibling-local projection failures (e.g. blocked on
+                    // key_secret that arrives later via cascade).
                     let _ = crate::state::shared_workspace_fanout::delete_pending_fanout(
                         self.db, fanout,
                     );

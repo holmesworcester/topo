@@ -116,13 +116,27 @@ fn replay_existing_workspace_shared_events_for_tenant(
     }
 
     // Phase 2: Project inline and clean up queue entries.
+    // Blocked events (e.g. encrypted events whose key_secret hasn't been
+    // replayed yet) are tracked by the blocked_events/cascade system, so
+    // mark_done is safe — cascade will retry when the dependency arrives.
+    // Rejected events are left in the queue for startup drain retry to
+    // handle transient failures that may resolve with more context.
     let mut replayed = 0usize;
     for event_id in &event_ids {
-        let _ = project_one(db, recorded_by, event_id)
+        let decision = project_one(db, recorded_by, event_id)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
         let event_id_b64 = event_id_to_base64(event_id);
-        let _ = pq.mark_done(recorded_by, &event_id_b64);
-        replayed += 1;
+        match decision {
+            crate::projection::decision::ProjectionDecision::Valid
+            | crate::projection::decision::ProjectionDecision::AlreadyProcessed
+            | crate::projection::decision::ProjectionDecision::Block { .. } => {
+                let _ = pq.mark_done(recorded_by, &event_id_b64);
+                replayed += 1;
+            }
+            crate::projection::decision::ProjectionDecision::Reject { .. } => {
+                // Leave in project_queue for startup drain retry.
+            }
+        }
     }
 
     Ok(replayed)
