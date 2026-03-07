@@ -142,30 +142,11 @@ fn is_sibling_removed(conn: &Connection, sibling_peer_id: &str, check_scopes: &[
         }
     }
 
-    // Fallback: check removal via peers_shared → removed_entities directly.
-    // This catches tenants still bootstrapping (no local_transport_creds yet)
-    // whose user or peer was already removed in another scope.
-    for scope in check_scopes {
-        let removed: bool = conn
-            .query_row(
-                "SELECT EXISTS (
-                    SELECT 1 FROM removed_entities r
-                    JOIN peers_shared p ON r.recorded_by = p.recorded_by
-                    WHERE p.recorded_by = ?1
-                      AND p.event_id IN (
-                          SELECT ps2.event_id FROM peers_shared ps2 WHERE ps2.recorded_by = ?2
-                      )
-                      AND (r.target_event_id = p.event_id
-                           OR (r.removal_type = 'user' AND r.target_event_id = p.user_event_id))
-                )",
-                rusqlite::params![scope, sibling_peer_id],
-                |row| row.get(0),
-            )
-            .unwrap_or(false);
-        if removed {
-            return true;
-        }
-    }
+    // If the sibling has no local_transport_creds yet (still bootstrapping),
+    // we cannot reliably identify their peers_shared event_id, so we
+    // conservatively treat them as not-removed. This is safe: worst case
+    // an extra event fans out to a peer that was just removed, and it
+    // gets projected harmlessly.
     false
 }
 

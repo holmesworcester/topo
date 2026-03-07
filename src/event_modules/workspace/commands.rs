@@ -49,6 +49,11 @@ fn decode_event_id_blob(blob: Vec<u8>) -> Option<EventId> {
 /// projected it into its own `valid_events` scope. Replay those shared events
 /// locally so same-workspace joins converge without waiting for a redundant
 /// network fetch that negentropy will not request.
+///
+/// Note: events from peers that were later removed are included in the replay.
+/// This is consistent with the projector, which does not check removal status
+/// (pre-removal events are legitimate). Removal enforcement happens at the
+/// transport layer (connection teardown) and UI layer (display filtering).
 fn replay_existing_workspace_shared_events_for_tenant(
     db: &Connection,
     recorded_by: &str,
