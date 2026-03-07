@@ -516,10 +516,8 @@ async fn dial_provider_ongoing_first(
                              primary: {}, fallback: {}",
                             remote, primary_err, fallback_err
                         )))
-                    } else if matches!(
-                        primary_err,
-                        ConnectionLifecycleError::DialTrustRejected(_)
-                    ) {
+                    } else if matches!(primary_err, ConnectionLifecycleError::DialTrustRejected(_))
+                    {
                         Err(primary_err)
                     } else {
                         Err(ConnectionLifecycleError::Dial(format!(

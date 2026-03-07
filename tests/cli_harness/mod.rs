@@ -161,13 +161,13 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
 
     wait_for_daemon_ready(db, Duration::from_secs(15));
 
-    // Extra RPC readiness check via CLI status command.
+    // Extra RPC readiness check via a tenant-agnostic CLI call.
     let rpc_start = Instant::now();
     loop {
         let out = Command::new(bin())
-            .args(["--db", db, "status"])
+            .args(["--db", db, "active-tenant"])
             .output()
-            .expect("failed to probe daemon status");
+            .expect("failed to probe daemon active-tenant");
         if out.status.success() {
             break;
         }
@@ -204,7 +204,7 @@ pub fn wait_for_daemon_ready(db: &str, timeout: Duration) {
     while start.elapsed() < timeout {
         if socket.exists() {
             if let Ok(resp) =
-                topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
+                topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::ActiveTenant)
             {
                 if resp.ok {
                     return;
@@ -228,7 +228,7 @@ pub fn wait_for_daemon_stopped(db: &str, timeout: Duration) {
             return;
         }
         let rpc_alive =
-            topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
+            topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::ActiveTenant)
                 .map(|resp| resp.ok)
                 .unwrap_or(false);
         if !rpc_alive {
