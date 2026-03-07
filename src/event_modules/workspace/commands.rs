@@ -15,7 +15,7 @@ use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
 use super::identity_ops::{self as ops, InviteBootstrapContext, JoinChain, LinkChain};
-use crate::crypto::event_id_to_base64;
+use crate::crypto::{event_id_from_base64, event_id_to_base64};
 use crate::crypto::EventId;
 use crate::db::store::insert_recorded_event;
 use crate::event_modules::{
@@ -35,47 +35,42 @@ fn now_ms() -> u64 {
         .as_millis() as u64
 }
 
-fn decode_event_id_blob(blob: Vec<u8>) -> Option<EventId> {
-    if blob.len() != 32 {
-        return None;
-    }
-    let mut event_id = [0u8; 32];
-    event_id.copy_from_slice(&blob);
-    Some(event_id)
-}
-
 /// In a shared DB, sibling tenants can already have the workspace's shared
 /// event history in `events`/`neg_items` even though this tenant has not yet
 /// projected it into its own `valid_events` scope. Replay those shared events
 /// locally so same-workspace joins converge without waiting for a redundant
 /// network fetch that negentropy will not request.
 ///
-/// Note: events from peers that were later removed are included in the replay.
-/// This is consistent with the projector, which does not check removal status
-/// (pre-removal events are legitimate). Post-removal events cannot appear in
-/// `neg_items` because removed peers are blocked at the transport layer
-/// (connection teardown) and cannot sync new events. Removal enforcement
-/// also applies at the UI layer (display filtering).
+/// Only events already projected as valid by at least one existing workspace
+/// sibling are replayed. This prevents post-removal events (from a removed
+/// tenant that created local events after removal) from leaking to new
+/// joiners — live fanout suppresses such events for active siblings, so
+/// seed replay must be consistent.
 fn replay_existing_workspace_shared_events_for_tenant(
     db: &Connection,
     recorded_by: &str,
     workspace_id: &EventId,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let workspace_id_b64 = event_id_to_base64(workspace_id);
-    let mut stmt = db.prepare(
-        "SELECT id
-         FROM neg_items
-         WHERE workspace_id = ?1
-         ORDER BY ts ASC, id ASC",
+
+    // Collect event IDs that at least one existing sibling has validated.
+    let mut ve_stmt = db.prepare(
+        "SELECT DISTINCT ve.event_id
+         FROM valid_events ve
+         JOIN invites_accepted ia
+           ON ia.recorded_by = ve.peer_id AND ia.workspace_id = ?1
+         JOIN events e
+           ON e.event_id = ve.event_id AND e.share_scope = 'shared'
+         WHERE ve.peer_id <> ?2
+         ORDER BY e.created_at ASC, ve.event_id ASC",
     )?;
-    let event_ids = stmt
-        .query_map(rusqlite::params![workspace_id_b64], |row| {
-            row.get::<_, Vec<u8>>(0)
+    let event_ids: Vec<EventId> = ve_stmt
+        .query_map(rusqlite::params![&workspace_id_b64, recorded_by], |row| {
+            row.get::<_, String>(0)
         })?
-        .collect::<Result<Vec<_>, _>>()?
-        .into_iter()
-        .filter_map(decode_event_id_blob)
-        .collect::<Vec<_>>();
+        .filter_map(|r| r.ok())
+        .filter_map(|b64| event_id_from_base64(&b64))
+        .collect();
 
     let pq = crate::state::db::project_queue::ProjectQueue::new(db);
     let recorded_at = now_ms() as i64;

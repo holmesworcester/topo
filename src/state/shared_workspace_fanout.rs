@@ -184,10 +184,17 @@ fn is_removal_event(conn: &Connection, event_id: &EventId) -> bool {
     .unwrap_or(false)
 }
 
-/// Returns true if the event was created before the sibling was removed.
-/// Used to allow pre-removal events through even when the sibling is currently
-/// marked as removed — this handles out-of-order arrival where a removal is
-/// projected before older events that logically predate it.
+/// Clock-skew tolerance for cross-device timestamp comparisons (30 seconds).
+/// Timestamps come from different device clocks, so we allow a margin to
+/// avoid dropping events that were logically pre-removal but whose
+/// `created_at` compares as slightly newer due to clock drift.
+const CLOCK_SKEW_TOLERANCE_MS: i64 = 30_000;
+
+/// Returns true if the event was created before (or within clock-skew
+/// tolerance of) the sibling's removal. Used to allow pre-removal events
+/// through even when the sibling is currently marked as removed — this
+/// handles out-of-order arrival where a removal is projected before older
+/// events that logically predate it.
 fn event_predates_sibling_removal(
     conn: &Connection,
     event_id: &EventId,
@@ -227,7 +234,7 @@ fn event_predates_sibling_removal(
             .ok()
             .flatten();
         if let Some(removal_created_at) = removal_ts {
-            if event_ts < removal_created_at {
+            if event_ts <= removal_created_at + CLOCK_SKEW_TOLERANCE_MS {
                 return true;
             }
         }
