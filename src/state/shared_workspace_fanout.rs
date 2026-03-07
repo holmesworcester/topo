@@ -150,20 +150,6 @@ fn is_sibling_removed(conn: &Connection, sibling_peer_id: &str, check_scopes: &[
     false
 }
 
-/// Returns true if the event was locally created by this peer (source = 'local_create').
-fn is_locally_created(conn: &Connection, peer_id: &str, event_id: &EventId) -> bool {
-    let event_id_b64 = event_id_to_base64(event_id);
-    conn.query_row(
-        "SELECT EXISTS (
-            SELECT 1 FROM recorded_events
-            WHERE peer_id = ?1 AND event_id = ?2 AND source = 'local_create'
-        )",
-        rusqlite::params![peer_id, &event_id_b64],
-        |row| row.get(0),
-    )
-    .unwrap_or(false)
-}
-
 /// Returns true if the origin tenant rejected a non-encrypted event.
 /// Encrypted events are NOT treated as globally rejected because the
 /// rejection may be tenant-scoped (e.g. missing key_secret); a sibling
@@ -356,17 +342,11 @@ pub(crate) fn fanout_shared_event_enqueue(
     if is_origin_rejected(conn, &fanout.origin_peer_id, &fanout.event_id) {
         return Ok(Vec::new());
     }
-    // For wire-ingested events, origin_peer_id is the local ingesting
-    // tenant, NOT the event author, so we don't check origin removal for
-    // those. For local-create entries (persisted during store_blob_only),
-    // the origin IS the author and must be checked.
-    let is_local_create = is_locally_created(conn, &fanout.origin_peer_id, &fanout.event_id);
-    if is_local_create
-        && !is_removal_event(conn, &fanout.event_id)
-        && is_sibling_removed(conn, &fanout.origin_peer_id, &[&fanout.origin_peer_id])
-    {
-        return Ok(Vec::new());
-    }
+    // No origin-removal check here. For wire-ingested events,
+    // origin_peer_id is the local ingesting tenant, NOT the event author.
+    // For local-create entries, the immediate path already blocks removed
+    // tenants at creation time. If a pending entry survived a crash, the
+    // event was created while the tenant was still valid and must fan out.
     let siblings =
         sibling_tenants_in_workspace(conn, &fanout.origin_peer_id, &fanout.workspace_id)?;
     if siblings.is_empty() {
