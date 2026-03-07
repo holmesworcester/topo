@@ -5,7 +5,6 @@ use crate::db::store::{insert_recorded_event, lookup_workspace_id};
 use crate::event_modules::ShareScope;
 use crate::projection::apply::project_one;
 use crate::state::db::project_queue::ProjectQueue;
-use crate::transport::cert::extract_spki_fingerprint;
 
 const FANOUT_SOURCE_PREFIX: &str = "same_workspace_fanout";
 
@@ -122,32 +121,47 @@ fn fanout_source(origin_peer_id: &str) -> String {
 /// so we check both the sibling's own scope AND the origin's scope to
 /// catch same-batch removal+message scenarios.
 fn is_sibling_removed(conn: &Connection, sibling_peer_id: &str, check_scopes: &[&str]) -> bool {
-    // Load sibling's cert from local_transport_creds
-    let cert_der: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT cert_der FROM local_transport_creds WHERE peer_id = ?1",
-            rusqlite::params![sibling_peer_id],
-            |row| row.get(0),
-        )
-        .ok();
-    if let Some(cert_der) = cert_der {
-        if let Ok(spki) = extract_spki_fingerprint(&cert_der) {
-            for scope in check_scopes {
-                if crate::state::db::removal_watch::is_peer_removed(conn, scope, &spki)
-                    .unwrap_or(false)
-                {
-                    return true;
-                }
-            }
+    // The sibling's peer_id is lower(hex(spki_fingerprint)). We can look up
+    // their peers_shared row directly via transport_fingerprint without
+    // needing local_transport_creds. This covers both fully bootstrapped
+    // and still-bootstrapping tenants.
+    for scope in check_scopes {
+        let removed: bool = conn
+            .query_row(
+                "SELECT EXISTS (
+                    SELECT 1 FROM peers_shared p
+                    JOIN removed_entities r
+                      ON r.recorded_by = p.recorded_by
+                      AND (r.target_event_id = p.event_id
+                           OR (r.removal_type = 'user'
+                               AND p.user_event_id IS NOT NULL
+                               AND r.target_event_id = p.user_event_id))
+                    WHERE p.recorded_by = ?1
+                      AND lower(hex(p.transport_fingerprint)) = ?2
+                )",
+                rusqlite::params![scope, sibling_peer_id],
+                |row| row.get(0),
+            )
+            .unwrap_or(false);
+        if removed {
+            return true;
         }
     }
-
-    // If the sibling has no local_transport_creds yet (still bootstrapping),
-    // we cannot reliably identify their peers_shared event_id, so we
-    // conservatively treat them as not-removed. This is safe: worst case
-    // an extra event fans out to a peer that was just removed, and it
-    // gets projected harmlessly.
     false
+}
+
+/// Returns true if the origin tenant rejected the event during projection.
+/// Rejected events should not be fanned out to sibling tenants.
+fn is_origin_rejected(conn: &Connection, origin_peer_id: &str, event_id: &EventId) -> bool {
+    let event_id_b64 = event_id_to_base64(event_id);
+    conn.query_row(
+        "SELECT EXISTS (
+            SELECT 1 FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2
+        )",
+        rusqlite::params![origin_peer_id, &event_id_b64],
+        |row| row.get(0),
+    )
+    .unwrap_or(false)
 }
 
 /// Returns true if the event is a removal event (user_removed or peer_removed).
@@ -220,6 +234,10 @@ pub(crate) fn fanout_shared_event_immediate(
     workspace_id: &str,
     event_id: &EventId,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    // Skip fanout for events the origin tenant rejected (bad signature, etc.)
+    if is_origin_rejected(conn, origin_peer_id, event_id) {
+        return Ok(());
+    }
     let siblings = sibling_tenants_in_workspace(conn, origin_peer_id, workspace_id)?;
     if siblings.is_empty() {
         return Ok(());
@@ -255,6 +273,10 @@ pub(crate) fn fanout_shared_event_enqueue(
     conn: &Connection,
     fanout: &SharedEventFanout,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    // Skip fanout for events the origin tenant rejected (bad signature, etc.)
+    if is_origin_rejected(conn, &fanout.origin_peer_id, &fanout.event_id) {
+        return Ok(Vec::new());
+    }
     let siblings =
         sibling_tenants_in_workspace(conn, &fanout.origin_peer_id, &fanout.workspace_id)?;
     if siblings.is_empty() {
