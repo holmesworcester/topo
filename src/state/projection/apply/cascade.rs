@@ -1,6 +1,7 @@
 use super::super::decision::ProjectionDecision;
 use crate::crypto::event_id_from_base64;
 use crate::event_modules::ParsedEvent;
+use crate::state::shared_workspace_fanout::fanout_stored_shared_event_immediate;
 use rusqlite::Connection;
 
 /// After projecting an event, cascade-unblock dependents using Kahn's algorithm.
@@ -84,6 +85,8 @@ fn cascade_unblocked_inner(
                 let (decision, _parsed) =
                     super::project_one::project_one_step(conn, recorded_by, &event_id)?;
                 if matches!(decision, ProjectionDecision::Valid) {
+                    // Fan out newly valid shared events to same-workspace siblings
+                    let _ = fanout_stored_shared_event_immediate(conn, recorded_by, &event_id);
                     worklist.push(eid_b64.clone());
                 }
             }

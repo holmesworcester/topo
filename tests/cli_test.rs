@@ -2502,12 +2502,12 @@ fn test_cli_connect_to_dead_address_error() {
     // Bob accepts the invite — daemon will try to connect to the dead address.
     // Redirect daemon output to file so we can inspect logs after shutdown.
     let log_dir = std::path::Path::new(&db_b).parent().unwrap();
-    let stdout_path = log_dir.join("daemon_stdout.log");
+    let stderr_path = log_dir.join("daemon_stderr.log");
 
     let _daemon_b = start_daemon_with_options(
         &db_b,
         &DaemonOptions {
-            stdout_file: Some(stdout_path.clone()),
+            stderr_file: Some(stderr_path.clone()),
             ..Default::default()
         },
     );
@@ -2532,7 +2532,7 @@ fn test_cli_connect_to_dead_address_error() {
     std::thread::sleep(Duration::from_millis(500));
     drop(_daemon_b);
 
-    let output = std::fs::read_to_string(&stdout_path).unwrap_or_default();
+    let output = std::fs::read_to_string(&stderr_path).unwrap_or_default();
 
     assert!(
         output.contains("timed out")
@@ -2577,12 +2577,12 @@ fn test_cli_untrusted_peer_certificate_error() {
     // Bob's daemon — redirect stdout to file for log inspection.
     create_workspace(&db_b);
     let log_dir_b = std::path::Path::new(&db_b).parent().unwrap();
-    let bob_stdout = log_dir_b.join("daemon_stdout.log");
+    let bob_stderr = log_dir_b.join("daemon_stderr.log");
 
     let _daemon_b = start_daemon_with_options(
         &db_b,
         &DaemonOptions {
-            stdout_file: Some(bob_stdout.clone()),
+            stderr_file: Some(bob_stderr.clone()),
             ..Default::default()
         },
     );
@@ -2607,7 +2607,7 @@ fn test_cli_untrusted_peer_certificate_error() {
     std::thread::sleep(Duration::from_millis(500));
     drop(_daemon_b);
 
-    let bob_log = std::fs::read_to_string(&bob_stdout).unwrap_or_default();
+    let bob_log = std::fs::read_to_string(&bob_stderr).unwrap_or_default();
 
     // Bob should see our improved error about certificate mismatch
     // (his client-side TLS verifier rejects Alice's cert because the
