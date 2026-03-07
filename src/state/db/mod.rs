@@ -76,6 +76,7 @@ pub fn ensure_infra_schema(conn: &Connection) -> SqliteResult<()> {
     transport_creds::ensure_schema(conn)?;
     need_queue::ensure_schema(conn)?;
     local_client_ops::ensure_schema(conn)?;
+    crate::state::shared_workspace_fanout::ensure_schema(conn)?;
     Ok(())
 }
 

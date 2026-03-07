@@ -9,6 +9,71 @@ use crate::transport::cert::extract_spki_fingerprint;
 
 const FANOUT_SOURCE_PREFIX: &str = "same_workspace_fanout";
 
+// ---------------------------------------------------------------------------
+// Schema for durable pending fanout queue
+// ---------------------------------------------------------------------------
+
+pub(crate) fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "CREATE TABLE IF NOT EXISTS pending_shared_fanouts (
+            origin_peer_id TEXT NOT NULL,
+            workspace_id   TEXT NOT NULL,
+            event_id       BLOB NOT NULL,
+            PRIMARY KEY (origin_peer_id, event_id)
+        );",
+    )?;
+    Ok(())
+}
+
+/// Write fanout entries durably inside the current transaction.
+/// Called from the persist phase so entries survive a crash.
+pub(crate) fn persist_pending_fanouts(
+    conn: &Connection,
+    fanouts: &[SharedEventFanout],
+) -> Result<(), rusqlite::Error> {
+    let mut stmt = conn.prepare_cached(
+        "INSERT OR IGNORE INTO pending_shared_fanouts (origin_peer_id, workspace_id, event_id)
+         VALUES (?1, ?2, ?3)",
+    )?;
+    for f in fanouts {
+        stmt.execute(rusqlite::params![&f.origin_peer_id, &f.workspace_id, f.event_id.as_slice()])?;
+    }
+    Ok(())
+}
+
+/// Load and delete all pending fanout entries, returning them as SharedEventFanout.
+/// Called in post-commit effects and on startup recovery.
+pub(crate) fn take_pending_fanouts(
+    conn: &Connection,
+) -> Result<Vec<SharedEventFanout>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut stmt = conn.prepare(
+        "SELECT origin_peer_id, workspace_id, event_id FROM pending_shared_fanouts",
+    )?;
+    let rows: Vec<SharedEventFanout> = stmt
+        .query_map([], |row| {
+            let origin: String = row.get(0)?;
+            let ws: String = row.get(1)?;
+            let blob: Vec<u8> = row.get(2)?;
+            Ok((origin, ws, blob))
+        })?
+        .filter_map(|r| {
+            let (origin, ws, blob) = r.ok()?;
+            if blob.len() != 32 {
+                return None;
+            }
+            let mut eid = [0u8; 32];
+            eid.copy_from_slice(&blob);
+            Some(SharedEventFanout {
+                origin_peer_id: origin,
+                workspace_id: ws,
+                event_id: eid,
+            })
+        })
+        .collect();
+    conn.execute("DELETE FROM pending_shared_fanouts", [])?;
+    Ok(rows)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(crate) struct SharedEventFanout {
     pub origin_peer_id: String,
@@ -109,7 +174,23 @@ pub(crate) fn fanout_stored_shared_event_immediate(
         return Ok(());
     };
 
-    fanout_shared_event_immediate(conn, recorded_by, &workspace_id, event_id)
+    // Write a durable pending entry so the fanout survives a crash.
+    let fanout_entry = SharedEventFanout {
+        origin_peer_id: recorded_by.to_string(),
+        workspace_id: workspace_id.clone(),
+        event_id: *event_id,
+    };
+    let _ = persist_pending_fanouts(conn, &[fanout_entry]);
+
+    let result = fanout_shared_event_immediate(conn, recorded_by, &workspace_id, event_id);
+
+    // Clean up the pending entry on success (best-effort).
+    conn.execute(
+        "DELETE FROM pending_shared_fanouts WHERE origin_peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, event_id.as_slice()],
+    )?;
+
+    result
 }
 
 pub(crate) fn fanout_shared_event_immediate(

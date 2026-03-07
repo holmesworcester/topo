@@ -137,5 +137,16 @@ pub(super) fn run_persist_phase(
         }
     }
 
+    // Persist fanout entries durably inside this transaction so they
+    // survive a crash between COMMIT and post-commit effects.
+    if !persist_output.shared_event_fanouts.is_empty() {
+        if let Err(e) = crate::state::shared_workspace_fanout::persist_pending_fanouts(
+            db,
+            &persist_output.shared_event_fanouts,
+        ) {
+            tracing::warn!("persist_pending_fanouts error: {}", e);
+        }
+    }
+
     persist_output
 }

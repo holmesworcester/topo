@@ -64,6 +64,26 @@ pub(super) fn run_startup_preflight(
         info!("Recovered {} expired project_queue leases", recovered);
     }
 
+    // Recover any pending shared-event fanouts from a prior crash.
+    match crate::state::shared_workspace_fanout::take_pending_fanouts(&db) {
+        Ok(pending) if !pending.is_empty() => {
+            info!("Recovering {} pending shared-event fanouts", pending.len());
+            for fanout in &pending {
+                if let Err(e) =
+                    crate::state::shared_workspace_fanout::fanout_shared_event_enqueue(&db, fanout)
+                {
+                    tracing::warn!(
+                        "startup fanout recovery failed for {}: {}",
+                        short_peer_id(&fanout.origin_peer_id),
+                        e
+                    );
+                }
+            }
+        }
+        Ok(_) => {}
+        Err(e) => tracing::warn!("take_pending_fanouts at startup: {}", e),
+    }
+
     let batch_sz = drain_batch_size();
     for tenant_id in tenant_ids {
         let drained = (ingest.drain_queue)(db_path, tenant_id, batch_sz);

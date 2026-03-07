@@ -70,6 +70,7 @@ fn replay_existing_workspace_shared_events_for_tenant(
         .filter_map(decode_event_id_blob)
         .collect::<Vec<_>>();
 
+    let pq = crate::state::db::project_queue::ProjectQueue::new(db);
     let mut replayed = 0usize;
     let recorded_at = now_ms() as i64;
     for event_id in event_ids {
@@ -80,6 +81,11 @@ fn replay_existing_workspace_shared_events_for_tenant(
             recorded_at,
             "same_workspace_seed",
         )?;
+        // Enqueue into project_queue for durable projection. If the process
+        // crashes before all events are projected, the remaining entries
+        // persist and will be drained on the next startup.
+        let event_id_b64 = event_id_to_base64(&event_id);
+        let _ = pq.enqueue(recorded_by, &event_id_b64);
         let _ = project_one(db, recorded_by, &event_id)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
         replayed += 1;

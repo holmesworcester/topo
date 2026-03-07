@@ -73,10 +73,19 @@ impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
             }
         }
 
-        // Now fan out shared events to siblings — after projection so
-        // removals in this batch are already in removed_entities.
+        // Load durably persisted fanout entries (written inside the
+        // transaction by persist phase) and process them. This also
+        // handles recovery after a crash: any leftover entries from a
+        // prior run are picked up here.
+        let pending = match crate::state::shared_workspace_fanout::take_pending_fanouts(self.db) {
+            Ok(p) => p,
+            Err(e) => {
+                tracing::warn!("take_pending_fanouts failed: {}", e);
+                Vec::new()
+            }
+        };
         let mut sibling_tenants = std::collections::HashSet::new();
-        for fanout in &persist_output.shared_event_fanouts {
+        for fanout in &pending {
             match fanout_shared_event_enqueue(self.db, fanout) {
                 Ok(siblings) => {
                     sibling_tenants.extend(siblings);
@@ -267,10 +276,14 @@ mod tests {
             event_id,
         };
 
+        // Persist pending fanout entries (simulates what persist phase does
+        // inside the transaction).
+        crate::state::shared_workspace_fanout::persist_pending_fanouts(&conn, &[fanout]).unwrap();
+
         let persist_output = PersistPhaseOutput {
             persisted_event_ids: vec![event_id],
             tenants_seen: std::collections::HashSet::from([origin.identity.clone()]),
-            shared_event_fanouts: vec![fanout],
+            shared_event_fanouts: Vec::new(),
         };
         let executor = SqlitePostCommitEffectsExecutor::new(&conn);
 
