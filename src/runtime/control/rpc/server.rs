@@ -763,49 +763,78 @@ fn dispatch(
                 }
             };
 
-            match service::open_db_load(db_path) {
-                Ok((recorded_by, db)) => {
-                    let data = workspace::status(&db, &recorded_by);
-                    with_runtime_state(data)
-                }
-                Err(_) => match crate::db::open_connection(db_path) {
+            match state.require_active_peer() {
+                Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                    Ok((recorded_by, db)) => {
+                        let data = workspace::status(&db, &recorded_by);
+                        with_runtime_state(data)
+                    }
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+                Err(no_active_err) => match crate::db::open_connection(db_path) {
                     Ok(db) => {
                         let _ = crate::db::schema::create_tables(&db);
-                        // Empty DB / pre-identity state: report control-plane readiness
-                        // with tenant-scoped counters at zero.
-                        let data = workspace::status(&db, "__idle__");
-                        with_runtime_state(data)
+                        // Check if there are actual tenant scopes — if so,
+                        // require explicit tenant selection instead of
+                        // returning misleading zeros.
+                        let tenant_count: i64 = db
+                            .query_row(
+                                "SELECT COUNT(DISTINCT recorded_by) FROM invites_accepted",
+                                [],
+                                |row| row.get(0),
+                            )
+                            .unwrap_or(0);
+                        if tenant_count > 0 {
+                            RpcResponse::error(no_active_err)
+                        } else {
+                            // Empty DB / pre-identity state: report control-plane readiness
+                            // with tenant-scoped counters at zero.
+                            let data = workspace::status(&db, "__idle__");
+                            with_runtime_state(data)
+                        }
                     }
                     Err(e) => RpcResponse::error(e.to_string()),
                 },
             }
         }
-        RpcMethod::AssertNow { predicate } => match service::open_db_load(db_path) {
-            Ok((recorded_by, db)) => match crate::assert::parse_predicate(&predicate) {
-                Ok((field, op, expected)) => {
-                    match crate::assert::query_field(&db, &field, &recorded_by) {
-                        Ok(actual) => RpcResponse::success(crate::assert::AssertResponse {
-                            pass: op.eval(actual, expected),
-                            field,
-                            actual,
-                            op: op.symbol().to_string(),
-                            expected,
-                            timed_out: false,
-                        }),
-                        Err(e) => RpcResponse::error(e),
+        RpcMethod::AssertNow { predicate } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => match crate::assert::parse_predicate(&predicate) {
+                    Ok((field, op, expected)) => {
+                        match crate::assert::query_field(&db, &field, &recorded_by) {
+                            Ok(actual) => RpcResponse::success(crate::assert::AssertResponse {
+                                pass: op.eval(actual, expected),
+                                field,
+                                actual,
+                                op: op.symbol().to_string(),
+                                expected,
+                                timed_out: false,
+                            }),
+                            Err(e) => RpcResponse::error(e),
+                        }
                     }
-                }
-                Err(e) => RpcResponse::error(e),
+                    Err(e) => RpcResponse::error(e),
+                },
+                Err(e) => RpcResponse::error(e.to_string()),
             },
-            Err(e) => RpcResponse::error(e.to_string()),
+            Err(e) => RpcResponse::error(e),
         },
         RpcMethod::AssertEventually {
             predicate,
             timeout_ms,
             interval_ms,
-        } => match crate::assert::assert_eventually(db_path, &predicate, timeout_ms, interval_ms) {
-            Ok(data) => RpcResponse::success(data),
-            Err(e) => RpcResponse::error(e.to_string()),
+        } => match state.require_active_peer() {
+            Ok(peer_id) => match crate::assert::assert_eventually_for_peer(
+                db_path,
+                &peer_id,
+                &predicate,
+                timeout_ms,
+                interval_ms,
+            ) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
         },
         RpcMethod::Reactions => match state.require_active_peer() {
             Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
@@ -847,15 +876,15 @@ fn dispatch(
             },
             Err(e) => RpcResponse::error(e),
         },
-        RpcMethod::Workspaces => match state.require_active_peer() {
-            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
-                Ok((recorded_by, db)) => match workspace::list_items(&db, &recorded_by) {
+        RpcMethod::Workspaces => match crate::db::open_connection(db_path) {
+            Ok(db) => {
+                let _ = crate::db::schema::create_tables(&db);
+                match workspace::list_all_items(&db) {
                     Ok(data) => RpcResponse::success(data),
                     Err(e) => RpcResponse::error(e.to_string()),
-                },
-                Err(e) => RpcResponse::error(e.to_string()),
-            },
-            Err(e) => RpcResponse::error(e),
+                }
+            }
+            Err(e) => RpcResponse::error(e.to_string()),
         },
         RpcMethod::IntroAttempts { peer } => match state.require_active_peer() {
             Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {

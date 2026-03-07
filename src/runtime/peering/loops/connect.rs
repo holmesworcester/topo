@@ -506,10 +506,20 @@ async fn dial_provider_ongoing_first(
                     used_bootstrap_fallback: true,
                 }),
                 Err(fallback_err) => {
-                    // Return the more informative of the two errors. If the primary
-                    // was a trust rejection, keep it as DialTrustRejected so the
-                    // human-readable classifier can extract the fingerprint.
-                    if matches!(primary_err, ConnectionLifecycleError::DialTrustRejected(_)) {
+                    // If the fallback error is a stale-dial indicator (timeout,
+                    // unreachable, etc.), return it so is_stale_dial_failure()
+                    // can count it toward the threshold.  Otherwise prefer the
+                    // primary trust-rejection for human-readable diagnostics.
+                    if is_stale_dial_failure(&fallback_err) {
+                        Err(ConnectionLifecycleError::Dial(format!(
+                            "primary and bootstrap-fallback dials both failed to {}: \
+                             primary: {}, fallback: {}",
+                            remote, primary_err, fallback_err
+                        )))
+                    } else if matches!(
+                        primary_err,
+                        ConnectionLifecycleError::DialTrustRejected(_)
+                    ) {
                         Err(primary_err)
                     } else {
                         Err(ConnectionLifecycleError::Dial(format!(

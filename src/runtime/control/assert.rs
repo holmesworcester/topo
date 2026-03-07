@@ -171,12 +171,51 @@ fn resolve_assert_recorded_by(
     Ok(transport_peer_id)
 }
 
+fn assert_eventually_inner(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    predicate_str: &str,
+    timeout_ms: u64,
+    interval_ms: u64,
+) -> Result<AssertResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (field, op, expected) = parse_predicate(predicate_str)?;
+    let start = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+    let interval = Duration::from_millis(interval_ms);
+
+    loop {
+        let actual = query_field(db, &field, recorded_by)?;
+        if op.eval(actual, expected) {
+            return Ok(AssertResponse {
+                pass: true,
+                field,
+                actual,
+                op: op.symbol().to_string(),
+                expected,
+                timed_out: false,
+            });
+        }
+        if start.elapsed() >= timeout {
+            return Ok(AssertResponse {
+                pass: false,
+                field,
+                actual,
+                op: op.symbol().to_string(),
+                expected,
+                timed_out: true,
+            });
+        }
+        std::thread::sleep(interval);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Polling assertion
 // ---------------------------------------------------------------------------
 
 /// Poll a predicate until it passes or times out.
-/// Re-resolves tenant scope each iteration.
+/// Re-resolves tenant scope each iteration so bootstrap identity
+/// transitions (e.g. invite acceptance creating a final peer) are picked up.
 pub fn assert_eventually(
     db_path: &str,
     predicate_str: &str,
@@ -215,4 +254,16 @@ pub fn assert_eventually(
         }
         std::thread::sleep(interval);
     }
+}
+
+pub fn assert_eventually_for_peer(
+    db_path: &str,
+    recorded_by: &str,
+    predicate_str: &str,
+    timeout_ms: u64,
+    interval_ms: u64,
+) -> Result<AssertResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    create_tables(&db)?;
+    assert_eventually_inner(&db, recorded_by, predicate_str, timeout_ms, interval_ms)
 }
