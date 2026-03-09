@@ -989,6 +989,50 @@ fn test_cli_selected_partial_join_tenant_reports_initial_sync_errors() {
     );
 }
 
+#[test]
+fn test_cli_partial_join_startup_suppresses_stale_bootstrap_warnings() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+    let stderr_path = tmpdir.path().join("daemon.stderr");
+
+    create_workspace(&bob_db);
+
+    let alice = Peer::new_with_identity("alice-startup-noise-source");
+    let unreachable_bootstrap = format!("127.0.0.1:{}", random_port());
+    let invite_link = create_user_invite_link_for_test_peer(&alice, &unreachable_bootstrap);
+    accept_invite_without_sync(&bob_db, &invite_link, "bob-join", "pending")
+        .expect("accept invite without bootstrap sync");
+
+    let daemon = start_daemon_with_options(
+        &bob_db,
+        &DaemonOptions {
+            stderr_file: Some(stderr_path.clone()),
+            ..Default::default()
+        },
+    );
+
+    std::thread::sleep(Duration::from_secs(10));
+    drop(daemon);
+
+    let stderr = std::fs::read_to_string(&stderr_path).expect("read daemon stderr");
+    assert!(
+        !stderr.contains("Connection refused by"),
+        "startup stderr should not show stale bootstrap dial failures:\n{}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("connect worker"),
+        "startup stderr should not show stale connect worker warnings:\n{}",
+        stderr
+    );
+    assert!(
+        !stderr.contains("marked dial target stale"),
+        "startup stderr should not show stale-target warnings:\n{}",
+        stderr
+    );
+}
+
 /// TRUST POLICY TEST: untrusted peer is rejected.
 /// Alice bootstraps identity (PeerShared self-trust makes has_any_trusted_peer true).
 /// Bob has independent identity (not in Alice's workspace). Alice should reject Bob.

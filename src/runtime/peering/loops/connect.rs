@@ -263,6 +263,8 @@ async fn connect_loop_inner(
         coordination,
         shared_ingest.clone(),
     );
+    let mut has_connected_once = false;
+    let mut announced_connecting = false;
     let mut consecutive_stale_dial_failures: u32 = 0;
     let mut warning_gate = RepeatedWarningGate::new(REPEATED_WARNING_WINDOW);
     loop {
@@ -270,7 +272,10 @@ async fn connect_loop_inner(
             break;
         }
 
-        info!("Connecting to {}...", remote);
+        if !announced_connecting {
+            info!("Connecting to {}...", remote);
+            announced_connecting = true;
+        }
         let dial_outcome = match tokio::select! {
             _ = shutdown.cancelled() => {
                 break;
@@ -286,7 +291,8 @@ async fn connect_loop_inner(
             Ok(outcome) => outcome,
             Err(e) => {
                 let message = describe_connect_failure(remote, &e);
-                if warning_gate.should_emit(message.clone())
+                if should_warn_for_connect_failure(has_connected_once, &e)
+                    && warning_gate.should_emit(message.clone())
                     && should_emit_globally(format!("connect:{message}"))
                 {
                     warn!("{}", message);
@@ -310,6 +316,8 @@ async fn connect_loop_inner(
                 continue;
             }
         };
+        has_connected_once = true;
+        announced_connecting = false;
         consecutive_stale_dial_failures = 0;
         warning_gate.clear();
         let provider = dial_outcome.provider;
@@ -483,6 +491,13 @@ fn is_stale_dial_failure(err: &ConnectionLifecycleError) -> bool {
     }
 }
 
+fn should_warn_for_connect_failure(
+    has_connected_once: bool,
+    err: &ConnectionLifecycleError,
+) -> bool {
+    has_connected_once || !is_stale_dial_failure(err)
+}
+
 struct DialOutcome {
     provider: SessionProvider,
     used_bootstrap_fallback: bool,
@@ -591,5 +606,29 @@ mod tests {
             "handshake to 127.0.0.1:4433: trust_rejected".to_string(),
         );
         assert!(!is_stale_dial_failure(&err));
+    }
+
+    #[test]
+    fn startup_stale_dial_failures_do_not_warn_before_first_connection() {
+        let err = ConnectionLifecycleError::Dial(
+            "handshake to 127.0.0.1:4433: connection refused".to_string(),
+        );
+        assert!(!should_warn_for_connect_failure(false, &err));
+    }
+
+    #[test]
+    fn post_connect_stale_dial_failures_warn() {
+        let err = ConnectionLifecycleError::Dial(
+            "handshake to 127.0.0.1:4433: connection refused".to_string(),
+        );
+        assert!(should_warn_for_connect_failure(true, &err));
+    }
+
+    #[test]
+    fn non_stale_connect_failures_still_warn_at_startup() {
+        let err = ConnectionLifecycleError::DialTrustRejected(
+            "handshake to 127.0.0.1:4433: trust_rejected".to_string(),
+        );
+        assert!(should_warn_for_connect_failure(false, &err));
     }
 }

@@ -778,28 +778,26 @@ async fn run_connect_worker(
                 false
             }
             Err(e) => {
-                let message = format!(
-                    "connect worker {} failed: {}; restarting with backoff",
-                    dispatch_key, e
-                );
-                if warning_gate.should_emit(message.clone())
-                    && should_emit_globally(format!("engine:{message}"))
-                {
-                    warn!("{}", message);
+                let stale_target = e.to_string().contains(STALE_DIAL_TARGET_MARKER);
+                if !stale_target {
+                    let message = format!(
+                        "connect worker {} failed: {}; restarting with backoff",
+                        dispatch_key, e
+                    );
+                    if warning_gate.should_emit(message.clone())
+                        && should_emit_globally(format!("engine:{message}"))
+                    {
+                        warn!("{}", message);
+                    }
                 }
-                e.to_string().contains(STALE_DIAL_TARGET_MARKER)
+                stale_target
             }
         };
         if stale_target {
-            let message = format!(
+            info!(
                 "connect worker {} marked dial target stale; exiting for fresh target resolution",
                 dispatch_key
             );
-            if warning_gate.should_emit(message.clone())
-                && should_emit_globally(format!("engine:{message}"))
-            {
-                warn!("{}", message);
-            }
             break;
         }
 
