@@ -10,6 +10,16 @@ pub enum ShareScope {
     Local,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportPrivacy {
+    /// Must be wrapped in outer encrypted event for transport
+    RequireEncrypted,
+    /// May travel as plaintext
+    MayPlaintext,
+    /// Always plaintext (identity/admin events, encrypted wrapper itself)
+    PlaintextOnly,
+}
+
 impl ShareScope {
     pub fn as_str(&self) -> &'static str {
         match self {
@@ -33,6 +43,8 @@ pub struct EventTypeMeta {
     /// Whether this event type is admissible as inner payload of an encrypted wrapper.
     /// Identity events, encrypted (nested), and bench_dep_perf_testing are not permitted.
     pub encryptable: bool,
+    /// Transport privacy policy for this event type.
+    pub transport_privacy: TransportPrivacy,
     pub parse: fn(&[u8]) -> Result<ParsedEvent, EventError>,
     pub encode: fn(&ParsedEvent) -> Result<Vec<u8>, EventError>,
     /// Module-owned pure projector function. The pipeline dispatches to this
@@ -74,5 +86,53 @@ impl EventRegistry {
 
     pub fn lookup(&self, type_code: u8) -> Option<&'static EventTypeMeta> {
         self.by_code.get(&type_code).copied()
+    }
+
+    /// Returns all registered type codes.
+    pub fn all_type_codes(&self) -> Vec<u8> {
+        self.by_code.keys().copied().collect()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event_modules;
+
+    #[test]
+    fn test_transport_privacy_file_slice_require_encrypted() {
+        let reg = event_modules::registry();
+        let meta = reg.lookup(event_modules::EVENT_TYPE_FILE_SLICE).unwrap();
+        assert_eq!(meta.transport_privacy, TransportPrivacy::RequireEncrypted);
+    }
+
+    #[test]
+    fn test_transport_privacy_encrypted_plaintext_only() {
+        let reg = event_modules::registry();
+        let meta = reg.lookup(event_modules::EVENT_TYPE_ENCRYPTED).unwrap();
+        assert_eq!(meta.transport_privacy, TransportPrivacy::PlaintextOnly);
+    }
+
+    #[test]
+    fn test_transport_privacy_message_require_encrypted() {
+        let reg = event_modules::registry();
+        let meta = reg.lookup(event_modules::EVENT_TYPE_MESSAGE).unwrap();
+        assert_eq!(meta.transport_privacy, TransportPrivacy::RequireEncrypted);
+    }
+
+    #[test]
+    fn test_transport_privacy_all_types_have_value() {
+        let reg = event_modules::registry();
+        let codes = reg.all_type_codes();
+        assert!(!codes.is_empty());
+        for code in codes {
+            let meta = reg.lookup(code).unwrap();
+            // Just accessing transport_privacy ensures it's set; match to prove no panic.
+            let _ = match meta.transport_privacy {
+                TransportPrivacy::RequireEncrypted => "encrypted",
+                TransportPrivacy::MayPlaintext => "may_plaintext",
+                TransportPrivacy::PlaintextOnly => "plaintext_only",
+            };
+        }
     }
 }

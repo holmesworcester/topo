@@ -300,6 +300,7 @@ pub static INVITE_ACCEPTED_META: EventTypeMeta = EventTypeMeta {
     signer_required: false,
     signature_byte_len: 0,
     encryptable: false,
+    transport_privacy: crate::event_modules::registry::TransportPrivacy::PlaintextOnly,
     parse: parse_invite_accepted,
     encode: encode_invite_accepted,
     projector: project_pure,

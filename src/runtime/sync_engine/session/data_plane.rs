@@ -30,7 +30,15 @@ pub struct DataPlaneSendStats {
 }
 
 fn should_capture_rx_event_link(blob: &[u8]) -> bool {
-    blob.first().copied() == Some(crate::event_modules::EVENT_TYPE_FILE_SLICE)
+    match blob.first().copied() {
+        Some(crate::event_modules::EVENT_TYPE_FILE_SLICE) => true,
+        Some(crate::event_modules::EVENT_TYPE_ENCRYPTED) => {
+            // Encrypted events store inner_type_code at byte offset 41
+            // (1 type + 8 created_at + 32 key_event_id = 41)
+            blob.get(41).copied() == Some(crate::event_modules::EVENT_TYPE_FILE_SLICE)
+        }
+        _ => false,
+    }
 }
 
 pub fn enqueue_pending_have_to_egress(
@@ -217,6 +225,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::should_capture_rx_event_link;
+    use crate::event_modules::{EVENT_TYPE_ENCRYPTED, EVENT_TYPE_FILE_SLICE};
 
     #[test]
     fn should_capture_only_file_slice_events() {
@@ -235,6 +244,48 @@ mod tests {
             0,
             1,
         ]));
+        assert!(!should_capture_rx_event_link(&[]));
+    }
+
+    #[test]
+    fn test_capture_plaintext_file_slice() {
+        let mut blob = vec![0u8; 100];
+        blob[0] = EVENT_TYPE_FILE_SLICE;
+        assert!(should_capture_rx_event_link(&blob));
+    }
+
+    #[test]
+    fn test_capture_encrypted_file_slice() {
+        let mut blob = vec![0u8; 100];
+        blob[0] = EVENT_TYPE_ENCRYPTED;
+        blob[41] = EVENT_TYPE_FILE_SLICE;
+        assert!(should_capture_rx_event_link(&blob));
+    }
+
+    #[test]
+    fn test_no_capture_encrypted_message() {
+        let mut blob = vec![0u8; 100];
+        blob[0] = EVENT_TYPE_ENCRYPTED;
+        blob[41] = 1; // message type code
+        assert!(!should_capture_rx_event_link(&blob));
+    }
+
+    #[test]
+    fn test_no_capture_plaintext_message() {
+        let mut blob = vec![0u8; 100];
+        blob[0] = 1; // message
+        assert!(!should_capture_rx_event_link(&blob));
+    }
+
+    #[test]
+    fn test_no_capture_plaintext_file() {
+        let mut blob = vec![0u8; 100];
+        blob[0] = 24; // EVENT_TYPE_FILE
+        assert!(!should_capture_rx_event_link(&blob));
+    }
+
+    #[test]
+    fn test_no_capture_empty_blob() {
         assert!(!should_capture_rx_event_link(&[]));
     }
 }

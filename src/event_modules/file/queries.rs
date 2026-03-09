@@ -46,6 +46,7 @@ pub struct SaveFileResponse {
     pub output_path: String,
     pub bytes_written: u64,
     pub total_slices: i64,
+    pub elapsed_ms: u64,
 }
 
 fn calculate_download_rate_mib_s(
@@ -331,10 +332,14 @@ pub fn save_file_by_selector(
     selector: &str,
     output_path: &str,
 ) -> Result<SaveFileResponse, Box<dyn std::error::Error + Send + Sync>> {
+    use std::io::Write;
+    use std::time::Instant;
+
+    let start = Instant::now();
     let file_event_id_b64 = resolve_file_selector_to_b64(db, recorded_by, selector)?;
     let file_event_id_hex = b64_to_hex(&file_event_id_b64);
 
-    let (file_id_b64, blob_bytes, total_slices, slice_bytes, filename): (
+    let (file_id_b64, blob_bytes, total_slices, _slice_bytes, filename): (
         String,
         i64,
         i64,
@@ -378,8 +383,14 @@ pub fn save_file_by_selector(
         .into());
     }
 
-    let mut data =
-        Vec::with_capacity((total_slices.max(0) as usize) * (slice_bytes.max(0) as usize));
+    let out_path = Path::new(output_path);
+    if let Some(parent) = out_path.parent() {
+        if !parent.as_os_str().is_empty() {
+            std::fs::create_dir_all(parent)?;
+        }
+    }
+    let mut file = std::fs::File::create(out_path)?;
+
     for (idx, (slice_number, slice_event_id_b64)) in slices.iter().enumerate() {
         if *slice_number != idx as i64 {
             return Err(format!(
@@ -389,34 +400,23 @@ pub fn save_file_by_selector(
             .into());
         }
         let payload = load_file_slice_payload(db, recorded_by, slice_event_id_b64)?;
-        data.extend_from_slice(&payload);
+        file.write_all(&payload)?;
     }
+    file.flush()?;
 
-    let expected_len = blob_bytes.max(0) as usize;
-    if data.len() < expected_len {
-        return Err(format!(
-            "file data shorter than expected: {} < {}",
-            data.len(),
-            expected_len
-        )
-        .into());
-    }
-    data.truncate(expected_len);
+    let expected_len = blob_bytes.max(0) as u64;
+    file.set_len(expected_len)?;
+    drop(file);
 
-    let out_path = Path::new(output_path);
-    if let Some(parent) = out_path.parent() {
-        if !parent.as_os_str().is_empty() {
-            std::fs::create_dir_all(parent)?;
-        }
-    }
-    std::fs::write(out_path, &data)?;
+    let elapsed_ms = start.elapsed().as_millis() as u64;
 
     Ok(SaveFileResponse {
         file_event_id: file_event_id_hex,
         filename,
         output_path: out_path.to_string_lossy().to_string(),
-        bytes_written: data.len() as u64,
+        bytes_written: expected_len,
         total_slices,
+        elapsed_ms,
     })
 }
 

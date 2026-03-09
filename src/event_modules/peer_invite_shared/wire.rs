@@ -102,6 +102,7 @@ pub static DEVICE_INVITE_META: EventTypeMeta = EventTypeMeta {
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,
+    transport_privacy: crate::event_modules::registry::TransportPrivacy::PlaintextOnly,
     parse: parse_device_invite,
     encode: encode_device_invite,
     projector: super::projector::project_pure,

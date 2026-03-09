@@ -100,6 +100,7 @@ pub static WORKSPACE_META: EventTypeMeta = EventTypeMeta {
     signer_required: false,
     signature_byte_len: 0,
     encryptable: false,
+    transport_privacy: crate::event_modules::registry::TransportPrivacy::PlaintextOnly,
     parse: parse_workspace,
     encode: encode_workspace,
     projector: super::projector::project_pure,

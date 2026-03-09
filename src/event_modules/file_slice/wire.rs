@@ -135,6 +135,7 @@ pub static FILE_SLICE_META: EventTypeMeta = EventTypeMeta {
     signer_required: true,
     signature_byte_len: 64,
     encryptable: true,
+    transport_privacy: crate::event_modules::registry::TransportPrivacy::RequireEncrypted,
     parse: parse_file_slice,
     encode: encode_file_slice,
     projector: super::projector::project_pure,

@@ -3,7 +3,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::EventId;
 use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
-use crate::projection::create::create_signed_event_synchronous;
+use crate::projection::create::{create_encrypted_event_synchronous, create_signed_event_synchronous};
 use crate::service::open_db_for_peer;
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
@@ -340,9 +340,10 @@ pub fn generate_files_for_peer(
         })?;
 
         for slice_number in 0..slices_per_file {
-            create_signed_event_synchronous(
+            create_encrypted_event_synchronous(
                 &db,
                 &recorded_by,
+                &key_event_id,
                 &ParsedEvent::FileSlice(FileSliceEvent {
                     created_at_ms: current_timestamp_ms(),
                     file_id,
@@ -352,7 +353,7 @@ pub fn generate_files_for_peer(
                     signer_type: 5,
                     signature: [0u8; 64],
                 }),
-                &signing_key,
+                Some(&signing_key),
             )
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("create file_slice error: {}", e).into()
@@ -486,9 +487,10 @@ pub fn send_file_for_peer(
             ciphertext[..end - start].copy_from_slice(&file_data[start..end]);
         }
 
-        create_signed_event_synchronous(
+        create_encrypted_event_synchronous(
             &db,
             &recorded_by,
+            &key_event_id,
             &ParsedEvent::FileSlice(FileSliceEvent {
                 created_at_ms: current_timestamp_ms(),
                 file_id,
@@ -498,7 +500,7 @@ pub fn send_file_for_peer(
                 signer_type: 5,
                 signature: [0u8; 64],
             }),
-            &signing_key,
+            Some(&signing_key),
         )?;
     }
 

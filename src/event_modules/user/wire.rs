@@ -115,6 +115,7 @@ pub static USER_META: EventTypeMeta = EventTypeMeta {
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,
+    transport_privacy: crate::event_modules::registry::TransportPrivacy::PlaintextOnly,
     parse: parse_user,
     encode: encode_user,
     projector: super::projector::project_pure,

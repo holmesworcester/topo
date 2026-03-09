@@ -120,6 +120,7 @@ pub static MESSAGE_META: EventTypeMeta = EventTypeMeta {
     signer_required: true,
     signature_byte_len: 64,
     encryptable: true,
+    transport_privacy: crate::event_modules::registry::TransportPrivacy::RequireEncrypted,
     parse: parse_message,
     encode: encode_message,
     projector: super::projector::project_pure,

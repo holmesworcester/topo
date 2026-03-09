@@ -150,6 +150,7 @@ pub static PEER_SECRET_META: EventTypeMeta = EventTypeMeta {
     signer_required: false,
     signature_byte_len: 0,
     encryptable: false,
+    transport_privacy: crate::event_modules::registry::TransportPrivacy::PlaintextOnly,
     parse: parse_peer_secret,
     encode: encode_peer_secret,
     projector: project_pure,

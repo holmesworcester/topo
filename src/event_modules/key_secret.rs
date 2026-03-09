@@ -151,6 +151,7 @@ pub static KEY_SECRET_META: EventTypeMeta = EventTypeMeta {
     signer_required: false,
     signature_byte_len: 0,
     encryptable: true,
+    transport_privacy: crate::event_modules::registry::TransportPrivacy::PlaintextOnly,
     parse: parse_key_secret,
     encode: encode_key_secret,
     projector: project_pure,

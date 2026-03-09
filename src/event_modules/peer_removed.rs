@@ -138,6 +138,7 @@ pub static PEER_REMOVED_META: EventTypeMeta = EventTypeMeta {
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,
+    transport_privacy: crate::event_modules::registry::TransportPrivacy::PlaintextOnly,
     parse: parse_peer_removed,
     encode: encode_peer_removed,
     projector: project_pure,

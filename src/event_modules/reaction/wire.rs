@@ -137,6 +137,7 @@ pub static REACTION_TYPE_META: EventTypeMeta = EventTypeMeta {
     signer_required: true,
     signature_byte_len: 64,
     encryptable: true,
+    transport_privacy: crate::event_modules::registry::TransportPrivacy::RequireEncrypted,
     parse: parse_reaction,
     encode: encode_reaction,
     projector: super::projector::project_pure,
