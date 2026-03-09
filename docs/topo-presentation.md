@@ -147,7 +147,7 @@ Is p2p just intrinsically #$%@ing hard? Or is there a way out of the slog?
 
 ---
 
-# Some specific gripes 😡
+# Specific gripes 😡
 
 <!-- pt:incremental_lists: true -->
 
@@ -158,49 +158,33 @@ Is p2p just intrinsically #$%@ing hard? Or is there a way out of the slog?
 
 ---
 
-# An observation 💡
+# Topo 🐭 - a better way?
 
-Given that:
-
-<!-- pt:incremental_lists: true -->
-
-* data, auth, syncing, and peering must be tailored to product needs
-* all p2p libraries (except perhaps libp2p) are at very early stages of maturity
-* this stuff is hard
-
-...Maybe p2p library features are ~useless?
-
-Instead, maybe what you need is a **concurrency approach** covering the whole problem.
-
----
-
-# This is Topo 🐭
-
-Topo covers:
+Instead of providing lots of features for *parts* of the problem, it focuses on covering:
 
 <!-- pt:incremental_lists: true -->
 
 - **All layers**: everything from networking to the local app API.
 - **Most contexts**: everything from iOS notification fetching to multi-tenant servers. (Soon the web, too.)
 
+...and covering them in a principled solution to the hard problem, **concurrency**.
+
 ---
 
-# How Topo 🐭 manages concurrency
+# Topo 🐭 manages concurrency
 
 <!-- pt:incremental_lists: true -->
 
-- All data (including files, who to connect to) is events
-- All state derived from the set of events
-- Minimal state duplication (one event set, one DB file)
-- Peer connection is an ongoing process controlled by the event set.
-- Event set controls auth too
-- Events sync efficiently, get decrypted, validated, and turned into SQLite rows.
-- These can be queried in complex ways.
-- Keys are stored as events and work just like any other dependency, blocking decryption until they arrive.
+- **Data** including files, who to connect to, is represented as a set of events
+- **State and auth** is derived deterministically from the event set (think: Redux but with dependencies)
+- **Peer connection** is an ongoing behaviors determined by this set
+- **Sync** is a process that ensures all peers converge on the same event set
+- **Event pipeline** decrypts, validates, and writes events into SQLite tables that can queried however frontends need
+- **Key material** is stored, sealed, and unsealed as events and, just like any other dependency, block dependents until it arrives.
 
 ---
 
-#  How Topo 🐭 makes backends simpler 
+#  Topo 🐭 makes backends simple
 
 <!-- pt:incremental_lists: true -->
 
@@ -212,7 +196,7 @@ Topo covers:
 
 ---
 
-# How Topo 🐭 makes frontends simpler
+# Topo 🐭 makes frontends simple
 
 <!-- pt:incremental_lists: true -->
 
@@ -227,7 +211,7 @@ Topo covers:
 
 And hard stuff stays possible.
 
-Now, the demo 🐭
+Next, a demo 🐭
 
 <!-- Scraps
 
@@ -236,6 +220,21 @@ Now, the demo 🐭
 **Most p2p stacks** offer lots of features that aren't what you need; you're on your own in a hard battle with concurrency.
 
 **Topo 🐭** covers the concurrency problem; features are up to you.
+
+
+# An observation 💡
+
+Given that:
+
+<!-- pt:incremental_lists: true 
+
+* data, auth, syncing, and peering must be tailored to product needs
+* all p2p libraries (except perhaps libp2p) are at very early stages of maturity
+* this stuff is hard
+
+...Maybe p2p library features are ~useless?
+
+Instead, maybe what you need is a **concurrency approach** covering the whole problem.
 
 -->
 
