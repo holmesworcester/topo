@@ -589,6 +589,22 @@ pub fn accept_invite_with_identity(db: &str, invite_link: &str, username: &str, 
             Ok(invite) if invite.bootstrap_addrs.is_empty() => Duration::from_secs(2),
             _ => Duration::from_secs(60),
         };
+    accept_invite_with_identity_and_timeout(
+        db,
+        invite_link,
+        username,
+        devicename,
+        signer_wait_timeout,
+    );
+}
+
+pub fn accept_invite_with_identity_and_timeout(
+    db: &str,
+    invite_link: &str,
+    username: &str,
+    devicename: &str,
+    signer_wait_timeout: Duration,
+) {
     let tmp_daemon = start_daemon(db);
     let output = Command::new(bin())
         .arg("accept")
@@ -646,6 +662,20 @@ pub fn accept_device_link(db: &str, invite_link: &str) {
 
 /// Accept a device-link invite with a custom device name.
 pub fn accept_device_link_with_name(db: &str, invite_link: &str, devicename: &str) {
+    let signer_wait_timeout =
+        match topo::event_modules::workspace::invite_link::parse_invite_link(invite_link) {
+            Ok(invite) if invite.bootstrap_addrs.is_empty() => Duration::from_secs(2),
+            _ => Duration::from_secs(60),
+        };
+    accept_device_link_with_name_and_timeout(db, invite_link, devicename, signer_wait_timeout);
+}
+
+pub fn accept_device_link_with_name_and_timeout(
+    db: &str,
+    invite_link: &str,
+    devicename: &str,
+    signer_wait_timeout: Duration,
+) {
     let tmp_daemon = start_daemon(db);
     let output = Command::new(bin())
         .arg("accept-link")
@@ -682,7 +712,7 @@ pub fn accept_device_link_with_name(db: &str, invite_link: &str, devicename: &st
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    if let Err(debug) = wait_for_local_peer_signer(db, Duration::from_secs(60)) {
+    if let Err(debug) = wait_for_local_peer_signer(db, signer_wait_timeout) {
         eprintln!(
             "accept_device_link: peer signer not materialized yet; continuing (db={}): {}",
             db, debug
@@ -996,6 +1026,23 @@ pub fn get_workspaces_raw(db: &str) -> String {
     assert!(
         output.status.success(),
         "workspaces failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+/// Get raw `topo peers` output.
+pub fn get_peers_raw(db: &str) -> String {
+    ensure_active_peer(db, Duration::from_secs(10));
+    let output = Command::new(bin())
+        .arg("--db")
+        .arg(db)
+        .arg("peers")
+        .output()
+        .expect("failed to run peers");
+    assert!(
+        output.status.success(),
+        "peers failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).to_string()
