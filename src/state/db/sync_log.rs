@@ -684,6 +684,38 @@ mod tests {
     use super::*;
     use crate::db::schema::create_tables;
 
+    fn sample_run(session_id: u64, changed: bool, outcome: &str) -> NewSyncRun {
+        NewSyncRun {
+            started_at_ms: now_ms() - 5,
+            ended_at_ms: now_ms(),
+            session_id,
+            tenant_id: "tenant-a".to_string(),
+            peer_id: "peer-a".to_string(),
+            direction: "outbound".to_string(),
+            remote_addr: "127.0.0.1:4433".to_string(),
+            role: "initiator".to_string(),
+            rounds: 1,
+            events_sent: if changed { 1 } else { 0 },
+            events_received: if changed { 1 } else { 0 },
+            bytes_sent: if changed { 120 } else { 0 },
+            bytes_received: if changed { 60 } else { 0 },
+            changed,
+            outcome: outcome.to_string(),
+            error: if outcome == "error" {
+                Some("timeout".to_string())
+            } else {
+                None
+            },
+        }
+    }
+
+    fn rx_event_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM sync_run_rx_events", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
     #[test]
     fn sync_log_defaults_disabled() {
         let conn = crate::db::open_in_memory().unwrap();
@@ -752,6 +784,7 @@ mod tests {
             &conn,
             SyncLogConfigPatch {
                 enabled: Some(true),
+                changed_only: Some(false),
                 max_runs: Some(2),
                 ..Default::default()
             },
@@ -778,13 +811,16 @@ mod tests {
                 outcome: "ok".to_string(),
                 error: None,
             };
-            append_run_with_events(&conn, &run, &[], &cfg).unwrap();
+            let run_id = append_run_with_events(&conn, &run, &[], &cfg).unwrap();
+            insert_run_received_event(&conn, run_id, &format!("event-{i}")).unwrap();
+            finalize_run(&conn, run_id, &run, &cfg).unwrap();
         }
 
         let rows = list_runs(&conn, 10, true, None, None).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].session_id, 4);
         assert_eq!(rows[1].session_id, 3);
+        assert_eq!(rx_event_count(&conn), 2);
     }
 
     #[test]
@@ -825,5 +861,48 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].session_id, 99);
         assert_eq!(rows[0].outcome, "error");
+    }
+
+    #[test]
+    fn sync_log_finalize_keeps_received_event_links_for_changed_runs() {
+        let conn = crate::db::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let cfg = load_config(&conn).unwrap();
+
+        let initial = sample_run(7, false, "in_progress");
+        let run_id = insert_run_start(&conn, &initial).unwrap();
+        insert_run_received_event(&conn, run_id, "evt-a").unwrap();
+        insert_run_received_event(&conn, run_id, "evt-a").unwrap();
+
+        let final_run = sample_run(7, true, "ok");
+        let kept = finalize_run(&conn, run_id, &final_run, &cfg).unwrap();
+        assert_eq!(kept, Some(run_id));
+        assert_eq!(rx_event_count(&conn), 1);
+
+        let runs = list_runs(&conn, 10, true, Some(run_id), None).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].session_id, 7);
+        assert!(runs[0].changed);
+    }
+
+    #[test]
+    fn sync_log_finalize_drops_received_event_links_for_unchanged_runs_when_changed_only() {
+        let conn = crate::db::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let cfg = load_config(&conn).unwrap();
+
+        let initial = sample_run(8, false, "in_progress");
+        let run_id = insert_run_start(&conn, &initial).unwrap();
+        insert_run_received_event(&conn, run_id, "evt-a").unwrap();
+
+        let final_run = sample_run(8, false, "ok");
+        let kept = finalize_run(&conn, run_id, &final_run, &cfg).unwrap();
+        assert_eq!(kept, None);
+        assert_eq!(rx_event_count(&conn), 0);
+
+        let remaining_runs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining_runs, 0);
     }
 }

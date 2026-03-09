@@ -642,6 +642,53 @@ mod tests {
     }
 
     #[test]
+    fn test_downloaded_bytes_uses_actual_last_slice_size() {
+        let db = setup_db();
+        db.execute(
+            "INSERT INTO files
+             (recorded_by, event_id, message_id, file_id, blob_bytes, total_slices, slice_bytes, root_hash, key_event_id, filename, mime_type, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                "peer1",
+                "evt1",
+                "msg1",
+                "file1",
+                300000i64,
+                2i64,
+                262144i64,
+                &[0u8; 32] as &[u8],
+                "key1",
+                "odd.bin",
+                "application/octet-stream",
+                1000i64
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["peer1", "file1", 0i64, "slice_evt1", 1001i64],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["peer1", "file1", 1i64, "slice_evt2", 1002i64],
+        )
+        .unwrap();
+
+        let by_message = list_for_message(&db, "peer1", "msg1").unwrap();
+        assert_eq!(by_message.len(), 1);
+        assert_eq!(by_message[0].downloaded_bytes, 300000);
+        assert_eq!(by_message[0].download_rate_mib_s, None);
+
+        let files = list_files(&db, "peer1", 10).unwrap();
+        assert_eq!(files.total, 1);
+        assert_eq!(files.files[0].downloaded_bytes, 300000);
+        assert!(files.files[0].complete);
+    }
+
+    #[test]
     fn test_list_files_empty() {
         let db = setup_db();
         let result = list_files(&db, "peer1", 50).unwrap();
