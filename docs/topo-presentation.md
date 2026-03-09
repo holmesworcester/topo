@@ -86,27 +86,30 @@ style: |
 
 <!-- _class: lead -->
 
-# Introducing Topo 🐭  
-## A proposal to make peer-to-peer apps practical & painless
+# Could building p2p collaboration tools be easier?
 
-(Or, at least, to provoke better ideas.)
+Ideally *much* easier?
+
+Please?? 🥹
+
+
 
 ---
 
-# Why make p2p apps practical and painless? 🤔
+# Background ⛅
 
 <!-- pt:incremental_lists: true -->
 
 - A FOSS p2p Slack or Discord would be awesome
 - It would provide safety and resiliency to orgs we care about
 - We've spent years building one (**tryquiet.org**)
-- It has been a real slog
+- This has been a real slog
 
 ---
 
-# The question that haunts us 👻 
+# A question haunts us 👻 
 
-Could this slog be much easier, or not a slog at all? Or is p2p just really #$%@ing hard?
+Is p2p just intrinsically #$%@ing hard? Or is there a way out of the slog?
 
 ---
 
@@ -114,7 +117,7 @@ Could this slog be much easier, or not a slog at all? Or is p2p just really #$%@
 
 <!-- pt:incremental_lists: true -->
 
-- Big laundry list of problems to solve (p2p, e2ee, sync, files, push etc.)
+- Many problems to solve: p2p, e2ee, sync, files, push etc.
 - Solutions aren't generic; must fit product needs
 - Concurrency is hard to reason through
 
@@ -132,7 +135,7 @@ Could this slog be much easier, or not a slog at all? Or is p2p just really #$%@
 
 ---
 
-# Our experience with existing p2p tools 🫤
+# Existing p2p tools are meh 🫤
 
 <!-- pt:incremental_lists: true -->
 
@@ -144,15 +147,14 @@ Could this slog be much easier, or not a slog at all? Or is p2p just really #$%@
 
 ---
 
-# Some concrete gripes with existing tools 😡
+# Some specific gripes 😡
 
 <!-- pt:incremental_lists: true -->
 
-- Arbitrary dependencies block when you don't want to, not when you do
-- Mobile push notifications (e.g. the iOS NSE memory limit) not considered
-- Multi-tenant cloud and multi-account clients are usually not covered
-- You must build a middle layer to cover all the queries your frontend needs
-- Lots of state duplication (another concurrency problem)
+- **Arbitrary dependency linkages** - these are the opposite of what you want: they block content when you *don't* need that and not when you do
+- **Mobile notifications rarely considered** - especially the 24MB iOS NSE memory limit
+- **Neither are multi-tenant / multi-account** - so you'll need to roll a lot of your own infra to support e.g. notifications
+- **Neither are frontend needs** - you must build a middle layer to cover all the queries your frontend needs
 
 ---
 
@@ -382,25 +384,6 @@ tests/                    projector, sync, CLI/e2e checks
 
 ---
 
-# Walkthrough: Runtime Main Loop
-
-```text
-Control --> Setup --> Supervisor --> Transport --> Sync Engine
-   |           |                        ^             |
-   |           +------> Event Pipeline -+-------------+
-   |                        |
-   +------------------------+
-                            v
-                      Projection State
-                            |
-                            +--> trust rows --> Transport
-```
-
-- Same loop for local creates and synced events: everything converges on the event pipeline
-- This is the presenterm-safe version of the high-level Mermaid runtime/data-flow view
-
----
-
 # Walkthrough: Local Send Path
 
 - `src/runtime/control/main.rs`: `topo send` turns into `RpcMethod::Send`
@@ -460,3 +443,18 @@ peer session
 - `tests/projectors/message_projector_tests.rs`
 - `tests/cli_test.rs`
 - `tests/two_process_test.rs`
+
+# Walkthrough: Runtime Main Loop
+
+```text
+Control --> Setup --> Supervisor --> Transport --> Sync Engine
+   |           |                        ^             |
+   |           +------> Event Pipeline -+-------------+
+   |                        |
+   +------------------------+
+                            v
+                      Projection State
+                            |
+                            +--> trust rows --> Transport
+```
+---
