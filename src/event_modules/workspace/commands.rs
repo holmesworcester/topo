@@ -27,7 +27,7 @@ use crate::event_modules::{
 use crate::projection::apply::project_one;
 use crate::projection::create::{
     create_event_staged, create_event_synchronous, create_signed_event_synchronous,
-    event_id_or_blocked,
+    event_id_or_blocked, project_event,
 };
 
 fn now_ms() -> u64 {
@@ -334,7 +334,7 @@ pub fn create_workspace(
         workspace_id: ws_eid,
     });
     let _ia_eid = create_event_synchronous(db, &derived_peer_id, &ia)?;
-    project_one(db, &derived_peer_id, &ws_eid)
+    project_event(db, &derived_peer_id, &ws_eid)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
 
     // 5. UserInvite (signed by workspace_key)

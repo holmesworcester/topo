@@ -180,6 +180,11 @@ async fn test_project_queue_drain_after_batch() {
         .unwrap();
 
     let refs: Vec<&str> = event_ids.iter().map(|s| s.as_str()).collect();
+    assert_eq!(
+        pq.count_pending(&alice.identity).unwrap(),
+        0,
+        "inline bootstrap and message projection should leave project_queue empty"
+    );
     let inserted = pq.enqueue_batch(&alice.identity, &refs).unwrap();
     assert_eq!(
         inserted, 0,
