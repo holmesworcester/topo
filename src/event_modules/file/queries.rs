@@ -389,24 +389,41 @@ pub fn save_file_by_selector(
             std::fs::create_dir_all(parent)?;
         }
     }
-    let mut file = std::fs::File::create(out_path)?;
 
-    for (idx, (slice_number, slice_event_id_b64)) in slices.iter().enumerate() {
-        if *slice_number != idx as i64 {
-            return Err(format!(
-                "file has missing/out-of-order slices: expected {}, got {}",
-                idx, slice_number
-            )
-            .into());
+    // Write to a temp file in the same directory, then rename on success.
+    // This preserves all-or-nothing semantics: a failure mid-decrypt will
+    // not clobber an existing file at output_path.
+    let parent_dir = out_path.parent().unwrap_or_else(|| Path::new("."));
+    let tmp_path = parent_dir.join(format!(
+        ".topo-save-{}.tmp",
+        std::process::id()
+    ));
+    let write_result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+        let mut file = std::fs::File::create(&tmp_path)?;
+        for (idx, (slice_number, slice_event_id_b64)) in slices.iter().enumerate() {
+            if *slice_number != idx as i64 {
+                return Err(format!(
+                    "file has missing/out-of-order slices: expected {}, got {}",
+                    idx, slice_number
+                )
+                .into());
+            }
+            let payload = load_file_slice_payload(db, recorded_by, slice_event_id_b64)?;
+            file.write_all(&payload)?;
         }
-        let payload = load_file_slice_payload(db, recorded_by, slice_event_id_b64)?;
-        file.write_all(&payload)?;
+        file.flush()?;
+        let expected_len = blob_bytes.max(0) as u64;
+        file.set_len(expected_len)?;
+        Ok(())
+    })();
+
+    if let Err(e) = write_result {
+        let _ = std::fs::remove_file(&tmp_path);
+        return Err(e);
     }
-    file.flush()?;
+    std::fs::rename(&tmp_path, out_path)?;
 
     let expected_len = blob_bytes.max(0) as u64;
-    file.set_len(expected_len)?;
-    drop(file);
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
