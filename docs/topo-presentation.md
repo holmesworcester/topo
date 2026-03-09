@@ -372,13 +372,32 @@ src/runtime/control/      CLI entrypoint + daemon RPC
 src/runtime/peering/      runtime worker graph
 src/runtime/transport/    QUIC + trust boundary
 src/runtime/sync_engine/  reconciliation + session loops
-src/event_modules/        per-event commands / projectors / queries
+src/event_modules/        commands / projectors / queries
 src/state/projection/     create + apply pipeline
-tests/                    projector, CLI, sync, and end-to-end checks
+tests/                    projector, sync, CLI/e2e checks
 ```
 
 - Read order for this walkthrough: `runtime/control` -> `event_modules` -> `state/projection` -> `runtime/sync_engine`
 - `docs/DESIGN_DIAGRAMS.md` mirrors the same boundaries at a higher level
+
+---
+
+# Walkthrough: Runtime Main Loop
+
+```text
+Control --> Setup --> Supervisor --> Transport --> Sync Engine
+   |           |                        ^             |
+   |           +------> Event Pipeline -+-------------+
+   |                        |
+   +------------------------+
+                            v
+                      Projection State
+                            |
+                            +--> trust rows --> Transport
+```
+
+- Same loop for local creates and synced events: everything converges on the event pipeline
+- This is the presenterm-safe version of the high-level Mermaid runtime/data-flow view
 
 ---
 
