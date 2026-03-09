@@ -176,8 +176,8 @@ Topo covers:
 - No separate backend for iOS (uses SQLite to stay memory-bounded)
 - No separate backend for cloud: one endpoint can host many tenants
 - Dependencies can match product needs
-* End-to-end testing is cheap and easy
-* Gives you a flexible, concurrency-safe way to do encryption and auth
+- End-to-end testing is cheap and easy
+- Gives you a flexible, concurrency-safe way to do encryption and auth
 
 ---
 
