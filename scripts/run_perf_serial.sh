@@ -247,6 +247,8 @@ case "$MODE" in
     run "File Throughput (file_throughput, include ignored)" cargo +stable test --release --test file_throughput -- --nocapture --include-ignored --test-threads=1
     run "Sync Graph (all, include ignored)" cargo +stable test --release --test sync_graph_test -- --nocapture --include-ignored --test-threads=1
     run "Topo Cascade (topo_cascade_10k)" cargo +stable test --release --test topo_cascade_test topo_cascade_10k -- --nocapture --test-threads=1
+    run "Topo Cascade (topo_cascade_50k)" cargo +stable test --release --test topo_cascade_test topo_cascade_50k -- --nocapture --ignored --test-threads=1
+    run "Topo Cascade (topo_cascade_500k)" cargo +stable test --release --test topo_cascade_test topo_cascade_500k -- --nocapture --ignored --test-threads=1
     run "Low-Memory (low_mem_test, include ignored)" cargo +stable test --release --test low_mem_test -- --nocapture --include-ignored --test-threads=1
     if [[ "${PERF_LOWMEM_FULL_ENABLE}" == "1" ]]; then
       run_lowmem_matrix

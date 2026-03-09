@@ -14,6 +14,7 @@
 ```bash
 # Preferred: strict serial runner (prevents cross-test interference)
 # Also auto-updates this doc's "Auto-Generated Latest Serial Run" section.
+# `full` includes topo cascade at 10k, 50k, and 500k.
 scripts/run_perf_serial.sh core
 scripts/run_perf_serial.sh lowmem
 scripts/run_perf_serial.sh full
@@ -61,6 +62,8 @@ cargo test --release --test file_throughput -- --nocapture --include-ignored
 
 # Topo-sort cascade benchmark
 cargo test --release --test topo_cascade_test topo_cascade_10k -- --nocapture --test-threads=1
+cargo test --release --test topo_cascade_test topo_cascade_50k -- --nocapture --ignored --test-threads=1
+cargo test --release --test topo_cascade_test topo_cascade_500k -- --nocapture --ignored --test-threads=1
 cargo test --release --test topo_cascade_test -- --nocapture --include-ignored --test-threads=1
 
 # Sync graph (chain + catchup) — requires --test-threads=1
@@ -184,6 +187,9 @@ Single-threaded, no sync — pure local write path.
 Worst-case projector cascade benchmark using `bench_dep` events:
 each event depends on up to 10 prior events, inserted in reverse order to maximize block/unblock depth.
 
+Available sizes in [tests/topo_cascade_test.rs](/home/holmes/poc-7/tests/topo_cascade_test.rs): `10k`, `50k`, `200k`, `500k`.
+The serial perf runner's `full` mode executes `10k`, `50k`, and `500k`.
+
 #### 10k cascade (`topo_cascade_10k`, 2026-03-01)
 
 | Metric | Value |
@@ -194,6 +200,28 @@ each event depends on up to 10 prior events, inserted in reverse order to maximi
 | Cascade rate | 6,930 events/s |
 | Total | 3.729s |
 | Peak RSS | 59.2 MiB |
+
+#### 50k cascade (`topo_cascade_50k`, 2026-03-09)
+
+| Metric | Value |
+|--------|-------|
+| Setup | 0.407s |
+| Blocking phase | 10.311s |
+| Cascade phase | 6.511s |
+| Cascade rate | 7,678 events/s |
+| Total | 17.229s |
+| Peak RSS | 106.1 MiB |
+
+#### 500k cascade (`topo_cascade_500k`, 2026-03-09)
+
+| Metric | Value |
+|--------|-------|
+| Setup | 4.658s |
+| Blocking phase | 91.158s |
+| Cascade phase | 69.782s |
+| Cascade rate | 7,165 events/s |
+| Total | 165.598s |
+| Peak RSS | 399.6 MiB |
 
 ### Sync Graph (`sync_graph_test.rs`)
 
@@ -230,41 +258,26 @@ Why this appears much faster than 10k:
 2. Fixed setup/connection costs are amortized more at 50k, so apparent throughput improves with larger batches.
 3. Treat chain results as topology behavior (hop-delay + memory) rather than canonical bulk-throughput numbers.
 
-#### Multi-source catchup: 4 sources, 100k events
+#### Multi-source catchup: 100k events at sink
 
 Quick note: coordinated sink-driven catchup over pre-seeded identical source datasets with sink-side per-source ingest attribution (`recorded_events.source`).
 
-| Metric | Value |
-|--------|-------|
-| Catchup wall | 6,083 ms |
-| Events/s | 16,439 |
-| MB/s | 1.64 |
-| MiB/s (same estimator) | 1.56 |
-| Sink store | 100,000 |
-| Peak RSS | 689.4 MiB |
-
-#### Multi-source catchup: 8 sources, 100k events
-
-| Metric | Value |
-|--------|-------|
-| Catchup wall | 9,604 ms |
-| Events/s | 10,412 |
-| MB/s | 1.04 |
-| MiB/s (same estimator) | 0.99 |
-| Sink store | 100,000 |
-| Peak RSS | 1,370.3 MiB |
+| Sources | Wall | Events/s | MiB/s | Sink | RSS |
+|---|---:|---:|---:|---:|---:|
+| 4 | 6,083 ms | 16,439 | 1.56 | 100k | 689.4 MiB |
+| 8 | 9,604 ms | 10,412 | 0.99 | 100k | 1,370.3 MiB |
 
 ### Multi-Source Large-File Catchup
 
 Validates sink exact `file_slice` convergence and per-source fairness floor in multi-source file catchup using `recorded_events.source` attribution.
 
-Latest large-file multi-source snapshot (2026-03-04, Linux, `--ignored --nocapture --test-threads=1`):
+Latest large-file multi-source snapshot (2026-03-04, Linux, `--ignored --nocapture --test-threads=1`). All cases passed:
 
-| Test | Result | Catchup wall | Events/s | MB/s | Peak RSS |
-|---|---|---:|---:|---:|---:|
-| `catchup_large_file_4x_400_slices` | PASS | `416 ms` | `962` | `240.5` | `1111.0 MiB` |
-| `catchup_large_file_4x_1024_slices` | PASS | `630 ms` | `1625` | `406.6` | `1111.0 MiB` |
-| `catchup_large_file_8x_1024_slices` | PASS | `833 ms` | `1229` | `307.5` | `1363.4 MiB` |
+| Case | Wall | Events/s | MB/s | RSS |
+|---|---:|---:|---:|---:|
+| 4x400 slices | 416 ms | 962 | 240.5 | 1,111.0 MiB |
+| 4x1024 slices | 630 ms | 1,625 | 406.6 | 1,111.0 MiB |
+| 8x1024 slices | 833 ms | 1,229 | 307.5 | 1,363.4 MiB |
 
 Run:
 `cargo +stable test --release --test sync_graph_test catchup_large_file_ -- --ignored --nocapture --test-threads=1`
@@ -275,10 +288,10 @@ Linux-only constrained-runtime gate for iOS background Notification Service Exte
 
 Latest cgroup-enforced snapshot (2026-03-03):
 
-| Scenario | Result | Receiver Peak (`MAX_BOB_TOTAL_KB`) | 24 MiB Gate | 22 MiB cgroup |
-|---|---:|---:|---:|---:|
-| Message realism: `500,000 + 10,000` | `10,000/10,000` msgs synced | `18,764` KB | PASS | PASS (`CGROUP_OOM_KILL=0`) |
-| File realism: `500,000 + 100 x 1MiB` | `400/400` slices synced | `14,088` KB | PASS | PASS (`CGROUP_OOM_KILL=0`) |
+| Case | Synced | Peak KB | 24 MiB | 22 MiB cgroup |
+|---|---|---:|---:|---:|
+| Msg realism 500k+10k | all 10k msgs | 18,764 | PASS | PASS |
+| File realism 500k+100x1MiB | all 400 slices | 14,088 | PASS | PASS |
 
 Receiver peak stayed flat across sampled baselines; transfer size and ingest backpressure (`wanted` watermark + DB-backed `need_queue`) dominated memory shape.
 
