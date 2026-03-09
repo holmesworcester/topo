@@ -1062,6 +1062,11 @@ fn test_cli_file_upload_sync_and_save() {
     loop {
         let raw = get_messages_raw(&bob_db);
         if raw.contains("\u{2714}") {
+            assert!(
+                raw.contains("MiB/s"),
+                "messages output should include download MiB/s once complete:\n{}",
+                raw
+            );
             break;
         }
         if start.elapsed().as_secs() >= 30 {
@@ -1072,6 +1077,20 @@ fn test_cli_file_upload_sync_and_save() {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
+
+    let files_out = topo_cmd(&bob_db, &["files"]);
+    assert!(
+        files_out.status.success(),
+        "files failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&files_out.stdout),
+        String::from_utf8_lossy(&files_out.stderr)
+    );
+    let files_stdout = String::from_utf8_lossy(&files_out.stdout);
+    assert!(
+        files_stdout.contains("MiB/s"),
+        "files output should include download MiB/s:\n{}",
+        files_stdout
+    );
 
     // Save the file to disk
     let saved_path = tmpdir.path().join("received_file.txt");
@@ -1094,6 +1113,56 @@ fn test_cli_file_upload_sync_and_save() {
         saved_content, test_content,
         "saved file content should match original"
     );
+}
+
+#[test]
+fn test_cli_sync_log_reports_download_mib_s() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+
+    create_workspace(&alice_db);
+    let _alice = start_daemon(&alice_db);
+    send_message(&alice_db, "hello before sync-log");
+
+    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
+    accept_invite(&bob_db, &invite_link);
+
+    let enable = topo_cmd(&bob_db, &["sync-log-enable", "--all-runs"]);
+    assert!(
+        enable.status.success(),
+        "sync-log-enable failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&enable.stdout),
+        String::from_utf8_lossy(&enable.stderr)
+    );
+
+    let _bob = start_daemon(&bob_db);
+    assert_eventually(&bob_db, "message_count >= 1", 30000);
+
+    let start = Instant::now();
+    loop {
+        let out = topo_cmd(&bob_db, &["sync-log", "--all", "--limit", "10"]);
+        assert!(
+            out.status.success(),
+            "sync-log failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        if stdout.contains("download_mib_s=") {
+            assert!(
+                stdout.contains("bytes_rx="),
+                "sync-log output should still include received bytes:\n{}",
+                stdout
+            );
+            return;
+        }
+        if start.elapsed().as_secs() >= 30 {
+            panic!("sync-log never reported download MiB/s:\n{}", stdout);
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
 }
 
 /// Daemon start on an empty DB should keep control plane up in IdleNoTenants state.
