@@ -207,6 +207,15 @@ pub struct ViewReaction {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ViewFileSummary {
+    pub filename: String,
+    pub mime_type: String,
+    pub blob_bytes: i64,
+    pub total_slices: i64,
+    pub slices_received: i64,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ViewMessage {
     pub id: String,
     pub author_id: String,
@@ -214,6 +223,7 @@ pub struct ViewMessage {
     pub content: String,
     pub created_at: i64,
     pub reactions: Vec<ViewReaction>,
+    pub files: Vec<ViewFileSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub client_op_id: Option<String>,
 }
@@ -260,36 +270,41 @@ pub fn view(
         })
         .collect();
 
-    // Messages with author names
+    // Messages with author names, reactions, files, and client_op_ids
+    // (message::list already loads all of these per message)
     let msg_resp = message::list(db, recorded_by, limit)?;
 
-    // Load client_op_id mappings for annotation
-    let client_ops = crate::db::local_client_ops::all_mappings(db, recorded_by).unwrap_or_default();
-
-    // Reactions per message
-    let mut view_messages = Vec::with_capacity(msg_resp.messages.len());
-    for msg in msg_resp.messages {
-        let reactions: Vec<ViewReaction> =
-            reaction::list_for_message_with_authors(db, recorded_by, &msg.id_b64)?
-                .into_iter()
-                .map(|r| ViewReaction {
-                    emoji: r.emoji,
-                    reactor_name: r.reactor_name,
-                })
-                .collect();
-
-        let client_op_id = client_ops.get(&msg.id_b64).cloned();
-
-        view_messages.push(ViewMessage {
+    let view_messages: Vec<ViewMessage> = msg_resp
+        .messages
+        .into_iter()
+        .map(|msg| ViewMessage {
             id: msg.id_b64,
             author_id: msg.author_id,
             author_name: msg.author_name,
             content: msg.content,
             created_at: msg.created_at,
-            reactions,
-            client_op_id,
-        });
-    }
+            reactions: msg
+                .reactions
+                .into_iter()
+                .map(|r| ViewReaction {
+                    emoji: r.emoji,
+                    reactor_name: r.reactor_name,
+                })
+                .collect(),
+            files: msg
+                .files
+                .into_iter()
+                .map(|f| ViewFileSummary {
+                    filename: f.filename,
+                    mime_type: f.mime_type,
+                    blob_bytes: f.blob_bytes,
+                    total_slices: f.total_slices,
+                    slices_received: f.slices_received,
+                })
+                .collect(),
+            client_op_id: msg.client_op_id,
+        })
+        .collect();
 
     Ok(ViewResponse {
         workspace_name,

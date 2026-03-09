@@ -4339,6 +4339,28 @@ fn show_view(data: &serde_json::Value) {
                         }
                     }
                 }
+
+                // Inline file attachments
+                if let Some(files) = msg["files"].as_array() {
+                    for att in files {
+                        let filename = att["filename"].as_str().unwrap_or("file");
+                        let blob_bytes = att["blob_bytes"].as_i64().unwrap_or(0);
+                        let total = att["total_slices"].as_i64().unwrap_or(0);
+                        let received = att["slices_received"].as_i64().unwrap_or(0);
+                        let size = format_byte_size(blob_bytes);
+                        let status = if total > 0 && received >= total {
+                            "\u{2714}" // checkmark
+                        } else {
+                            "\u{23f3}" // hourglass
+                        };
+                        if total > 0 && received < total {
+                            let pct = (received as f64 / total as f64 * 100.0) as u32;
+                            println!("         {}  {} ({}, {}%)", status, filename, size, pct);
+                        } else {
+                            println!("         {}  {} ({})", status, filename, size);
+                        }
+                    }
+                }
             }
         }
     }
