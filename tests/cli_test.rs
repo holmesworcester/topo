@@ -3417,6 +3417,32 @@ fn test_cli_event_tree_shows_structure() {
         "event-tree should show parenthesized IDs, got:\n{}",
         stdout
     );
+
+    // Annotations: every identity-chain event type from create-workspace
+    // must appear on the same line as its em-dash annotation.
+    let expected_annotations = [
+        ("workspace", "workspace \u{2014} creates the workspace"),
+        ("user_invite_shared", "user_invite_shared \u{2014} invites a user"),
+        ("user", "user \u{2014} registers the user"),
+        ("peer_shared", "peer_shared \u{2014} registers a device"),
+        ("peer_invite_shared", "peer_invite_shared \u{2014} invites a device"),
+        ("admin", "admin \u{2014} grants admin rights"),
+        ("tenant", "tenant \u{2014} creates local tenant identity"),
+        ("invite_accepted", "invite_accepted \u{2014} joins the workspace"),
+        ("key_secret", "key_secret \u{2014} stores a local encryption key"),
+        ("peer_secret", "peer_secret \u{2014} stores a local signing key"),
+        ("invite_secret", "invite_secret \u{2014} stores a local invite key"),
+        ("key_shared", "key_shared \u{2014} shares an encryption key"),
+    ];
+    for (label, pattern) in &expected_annotations {
+        assert!(
+            stdout.lines().any(|line| line.contains(pattern)),
+            "event-tree missing annotation for {}: no line contains '{}', got:\n{}",
+            label,
+            pattern,
+            stdout
+        );
+    }
 }
 
 #[test]
@@ -3468,6 +3494,32 @@ fn test_cli_event_list_shows_all_events() {
         "event-list should show event count, got:\n{}",
         stdout
     );
+
+    // Annotations: every identity-chain event type from create-workspace
+    // must appear on the same line as its em-dash annotation.
+    let expected_annotations = [
+        ("workspace", "workspace \u{2014} creates the workspace"),
+        ("user_invite_shared", "user_invite_shared \u{2014} invites a user"),
+        ("user", "user \u{2014} registers the user"),
+        ("peer_shared", "peer_shared \u{2014} registers a device"),
+        ("peer_invite_shared", "peer_invite_shared \u{2014} invites a device"),
+        ("admin", "admin \u{2014} grants admin rights"),
+        ("tenant", "tenant \u{2014} creates local tenant identity"),
+        ("invite_accepted", "invite_accepted \u{2014} joins the workspace"),
+        ("key_secret", "key_secret \u{2014} stores a local encryption key"),
+        ("peer_secret", "peer_secret \u{2014} stores a local signing key"),
+        ("invite_secret", "invite_secret \u{2014} stores a local invite key"),
+        ("key_shared", "key_shared \u{2014} shares an encryption key"),
+    ];
+    for (label, pattern) in &expected_annotations {
+        assert!(
+            stdout.lines().any(|line| line.contains(pattern)),
+            "event-list missing annotation for {}: no line contains '{}', got:\n{}",
+            label,
+            pattern,
+            stdout
+        );
+    }
 }
 
 #[test]
