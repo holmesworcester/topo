@@ -31,6 +31,12 @@ pub fn temp_db() -> (tempfile::TempDir, String) {
     (dir, db)
 }
 
+pub struct LocalTenantInfo {
+    pub peer_id: String,
+    pub workspace_id: String,
+    pub transport_peer_id: String,
+}
+
 pub fn socket_path_for_db(db: &str) -> PathBuf {
     topo::service::socket_path_for_db(db)
 }
@@ -107,81 +113,102 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
         None => "127.0.0.1:0".to_string(),
     };
 
-    let mut cmd = Command::new(bin());
-    cmd.arg("--db")
-        .arg(db)
-        .arg("start")
-        .arg("--bind")
-        .arg(&bind_addr);
+    for attempt in 0..3 {
+        let mut cmd = Command::new(bin());
+        cmd.arg("--db")
+            .arg(db)
+            .arg("start")
+            .arg("--bind")
+            .arg(&bind_addr);
 
-    if opts.disable_placeholder_autodial {
-        cmd.env("P7_DISABLE_PLACEHOLDER_AUTODIAL", "1");
-    }
+        if opts.disable_placeholder_autodial {
+            cmd.env("P7_DISABLE_PLACEHOLDER_AUTODIAL", "1");
+        }
 
-    if let Some(ref path) = opts.stdout_file {
-        let f = std::fs::File::create(path).expect("create stdout log file");
-        cmd.stdout(f);
-    } else if opts.inherit_stdio {
-        cmd.stdout(Stdio::inherit());
-    } else {
-        cmd.stdout(Stdio::null());
-    }
+        if let Some(ref path) = opts.stdout_file {
+            let f = std::fs::File::create(path).expect("create stdout log file");
+            cmd.stdout(f);
+        } else if opts.inherit_stdio {
+            cmd.stdout(Stdio::inherit());
+        } else {
+            cmd.stdout(Stdio::null());
+        }
 
-    if let Some(ref path) = opts.stderr_file {
-        let f = std::fs::File::create(path).expect("create stderr log file");
-        cmd.stderr(f);
-    } else if opts.inherit_stdio {
-        cmd.stderr(Stdio::inherit());
-    } else {
-        cmd.stderr(Stdio::null());
-    }
+        if let Some(ref path) = opts.stderr_file {
+            let f = std::fs::File::create(path).expect("create stderr log file");
+            cmd.stderr(f);
+        } else if opts.inherit_stdio {
+            cmd.stderr(Stdio::inherit());
+        } else {
+            cmd.stderr(Stdio::null());
+        }
 
-    let mut child = cmd.spawn().expect("failed to start topo daemon");
+        let mut child = cmd.spawn().expect("failed to start topo daemon");
 
-    // Wait for socket to appear, checking that daemon hasn't exited early.
-    let start = Instant::now();
-    loop {
-        if let Some(status) = child.try_wait().expect("failed to check daemon status") {
+        let start = Instant::now();
+        let mut exited_early = None;
+        loop {
+            if let Some(status) = child.try_wait().expect("failed to check daemon status") {
+                exited_early = Some(status);
+                break;
+            }
+            if socket.exists() || start.elapsed().as_secs() >= 5 {
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+
+        if let Some(status) = exited_early {
+            if attempt < 2 {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
             panic!("daemon exited immediately with {} (db={})", status, db);
         }
-        if socket.exists() {
-            break;
-        }
-        if start.elapsed().as_secs() >= 5 {
-            break;
-        }
-        std::thread::sleep(Duration::from_millis(50));
-    }
-    assert!(
-        socket.exists(),
-        "daemon socket did not appear at {} within 5s (db={})",
-        socket.display(),
-        db
-    );
 
-    wait_for_daemon_ready(db, Duration::from_secs(15));
-
-    // Extra RPC readiness check via a tenant-agnostic CLI call.
-    let rpc_start = Instant::now();
-    loop {
-        let out = Command::new(bin())
-            .args(["--db", db, "active-tenant"])
-            .output()
-            .expect("failed to probe daemon active-tenant");
-        if out.status.success() {
-            break;
-        }
-        if rpc_start.elapsed().as_secs() >= 5 {
+        if !socket.exists() {
+            let _ = child.kill();
+            let _ = child.wait();
+            if attempt < 2 {
+                std::thread::sleep(Duration::from_millis(100));
+                continue;
+            }
             panic!(
-                "daemon socket exists but RPC not responding after 5s (db={}): {}",
-                db,
-                String::from_utf8_lossy(&out.stderr)
+                "daemon socket did not appear at {} within 5s (db={})",
+                socket.display(),
+                db
             );
         }
-        std::thread::sleep(Duration::from_millis(100));
+
+        wait_for_daemon_ready(db, Duration::from_secs(15));
+
+        let rpc_start = Instant::now();
+        loop {
+            let out = Command::new(bin())
+                .args(["--db", db, "active-tenant"])
+                .output()
+                .expect("failed to probe daemon active-tenant");
+            if out.status.success() {
+                return DaemonGuard::new(child);
+            }
+            if rpc_start.elapsed().as_secs() >= 5 {
+                let _ = child.kill();
+                let _ = child.wait();
+                if attempt < 2 {
+                    std::thread::sleep(Duration::from_millis(100));
+                    break;
+                }
+                panic!(
+                    "daemon socket exists but RPC not responding after 5s (db={}): {}",
+                    db,
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
     }
 
-    DaemonGuard::new(child)
+    panic!("daemon failed to start after retries (db={})", db);
 }
 
 /// Wait for the daemon's RPC socket to appear.
@@ -875,6 +902,12 @@ fn wait_for_local_peer_signer(db: &str, timeout: Duration) -> Result<(), String>
     ))
 }
 
+pub fn wait_for_local_peer_signer_ready(db: &str, timeout: Duration) {
+    if let Err(debug) = wait_for_local_peer_signer(db, timeout) {
+        panic!("{}", debug);
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Assertion helpers
 // ---------------------------------------------------------------------------
@@ -1075,6 +1108,103 @@ pub fn count_rows(db: &str, table: &str) -> i64 {
     let sql = format!("SELECT COUNT(*) FROM {}", table);
     conn.query_row(&sql, [], |row| row.get(0))
         .expect("failed to query row count")
+}
+
+pub fn event_count_sql(db: &str, event_type: &str) -> i64 {
+    let conn = rusqlite::Connection::open(db).expect("failed to open db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE event_type = ?1",
+        rusqlite::params![event_type],
+        |row| row.get(0),
+    )
+    .expect("failed to query event count")
+}
+
+pub fn message_count_sql(db: &str) -> i64 {
+    let conn = rusqlite::Connection::open(db).expect("failed to open db");
+    conn.query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+        .expect("failed to query message count")
+}
+
+pub fn stored_message_event_count_sql(db: &str) -> i64 {
+    let conn = rusqlite::Connection::open(db).expect("failed to open db");
+    conn.query_row(
+        "SELECT COUNT(*) FROM events WHERE event_type = 'message'",
+        [],
+        |row| row.get(0),
+    )
+    .expect("failed to query stored message event count")
+}
+
+pub fn read_local_tenant_info(db: &str) -> LocalTenantInfo {
+    let conn = topo::db::open_connection(db).expect("failed to open db");
+    let mut tenants =
+        topo::db::transport_creds::discover_local_tenants(&conn).expect("discover_local_tenants");
+    assert_eq!(
+        tenants.len(),
+        1,
+        "expected exactly one local tenant for benchmark db={}",
+        db
+    );
+    let tenant = tenants.remove(0);
+    LocalTenantInfo {
+        peer_id: tenant.peer_id,
+        workspace_id: tenant.workspace_id,
+        transport_peer_id: tenant.transport_peer_id,
+    }
+}
+
+pub fn seed_invite_bootstrap_trust(
+    db: &str,
+    invite_event_id: &str,
+    bootstrap_addr: &str,
+    bootstrap_spki_hex: &str,
+) {
+    let tenant = read_local_tenant_info(db);
+    let spki_bytes = hex::decode(bootstrap_spki_hex).expect("decode bootstrap SPKI hex");
+    assert_eq!(
+        spki_bytes.len(),
+        32,
+        "expected 32-byte bootstrap SPKI fingerprint, got {} bytes",
+        spki_bytes.len()
+    );
+    let mut spki = [0u8; 32];
+    spki.copy_from_slice(&spki_bytes);
+
+    let conn = topo::db::open_connection(db).expect("failed to open db");
+    topo::db::transport_trust::record_invite_bootstrap_trust(
+        &conn,
+        &tenant.peer_id,
+        &format!("ia-{invite_event_id}"),
+        invite_event_id,
+        &tenant.workspace_id,
+        bootstrap_addr,
+        &spki,
+    )
+    .expect("record_invite_bootstrap_trust");
+}
+
+pub fn generate_messages(db: &str, count: usize) {
+    ensure_active_peer(db, Duration::from_secs(10));
+    let output = topo_cmd(db, &["generate", "--count", &count.to_string()]);
+    assert!(
+        output.status.success(),
+        "generate failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+pub fn peak_rss_mib_for_pid(pid: u32) -> Option<f64> {
+    let status_path = format!("/proc/{pid}/status");
+    let status = std::fs::read_to_string(status_path).ok()?;
+    for line in status.lines() {
+        if line.starts_with("VmHWM:") {
+            let kb: f64 = line.split_whitespace().nth(1)?.parse().ok()?;
+            return Some(kb / 1024.0);
+        }
+    }
+    None
 }
 
 // ---------------------------------------------------------------------------

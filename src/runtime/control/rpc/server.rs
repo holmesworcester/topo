@@ -591,6 +591,7 @@ fn dispatch(
                         &data.event_id,
                         "message",
                     );
+                    state.notify_runtime_recheck();
                     RpcResponse::success(data)
                 }
                 Err(e) => RpcResponse::error(e.to_string()),
@@ -612,6 +613,7 @@ fn dispatch(
                             &data.event_id,
                             "file",
                         );
+                        state.notify_runtime_recheck();
                         RpcResponse::success(data)
                     }
                     Err(e) => RpcResponse::error(e.to_string()),
@@ -651,7 +653,10 @@ fn dispatch(
         },
         RpcMethod::Generate { count } => match state.require_active_peer() {
             Ok(peer_id) => match message::generate_for_peer(db_path, &peer_id, count) {
-                Ok(data) => RpcResponse::success(data),
+                Ok(data) => {
+                    state.notify_runtime_recheck();
+                    RpcResponse::success(data)
+                }
                 Err(e) => RpcResponse::error(e.to_string()),
             },
             Err(e) => RpcResponse::error(e),
@@ -659,7 +664,10 @@ fn dispatch(
         RpcMethod::GenerateFiles { count, size_mib } => match state.require_active_peer() {
             Ok(peer_id) => {
                 match message::generate_files_for_peer(db_path, &peer_id, count, size_mib) {
-                    Ok(data) => RpcResponse::success(data),
+                    Ok(data) => {
+                        state.notify_runtime_recheck();
+                        RpcResponse::success(data)
+                    }
                     Err(e) => RpcResponse::error(e.to_string()),
                 }
             }
@@ -679,6 +687,7 @@ fn dispatch(
                         &data.event_id,
                         "reaction",
                     );
+                    state.notify_runtime_recheck();
                     RpcResponse::success(data)
                 }
                 Err(e) => RpcResponse::error(e.to_string()),
@@ -687,7 +696,10 @@ fn dispatch(
         },
         RpcMethod::DeleteMessage { target } => match state.require_active_peer() {
             Ok(peer_id) => match message::delete_message_for_peer(db_path, &peer_id, &target) {
-                Ok(data) => RpcResponse::success(data),
+                Ok(data) => {
+                    state.notify_runtime_recheck();
+                    RpcResponse::success(data)
+                }
                 Err(e) => RpcResponse::error(e.to_string()),
             },
             Err(e) => RpcResponse::error(e),
@@ -1147,7 +1159,10 @@ fn dispatch(
         }
         RpcMethod::Ban { target } => match state.require_active_peer() {
             Ok(peer_id) => match user::ban_for_peer(db_path, &peer_id, &target) {
-                Ok(data) => RpcResponse::success(data),
+                Ok(data) => {
+                    state.notify_runtime_recheck();
+                    RpcResponse::success(data)
+                }
                 Err(e) => RpcResponse::error(e.to_string()),
             },
             Err(e) => RpcResponse::error(e),

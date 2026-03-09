@@ -102,6 +102,15 @@ async fn low_mem_ios_functional_smoke_2k() {
 
     assert_eq!(alice.message_count(), 1_000);
     assert_eq!(bob.message_count(), 1_000);
+
+    eprintln!();
+    eprintln!("=== Low-mem functional smoke (2k) ===");
+    eprintln!("  Alice messages: {}", alice.message_count());
+    eprintln!("  Bob messages:   {}", bob.message_count());
+    if let Some(current) = current_rss_mib() {
+        eprintln!("  Current RSS:    {:.2} MiB", current);
+    }
+    eprintln!();
 }
 
 #[tokio::test]
@@ -147,6 +156,13 @@ async fn low_mem_ios_budget_smoke_10k() {
         peak,
         budget
     );
+
+    eprintln!();
+    eprintln!("=== Low-mem budget smoke (10k) ===");
+    eprintln!("  Messages/peer:  {}", 5_000);
+    eprintln!("  Current RSS:    {:.2} MiB", peak);
+    eprintln!("  Budget:         {:.2} MiB", budget);
+    eprintln!();
 }
 
 #[tokio::test]
@@ -188,4 +204,10 @@ async fn low_mem_ios_budget_soak_million() {
         budget,
         events
     );
+
+    eprintln!();
+    eprintln!("=== Low-mem soak ({events}) ===");
+    eprintln!("  Peak RSS:       {:.2} MiB", peak);
+    eprintln!("  Budget:         {:.2} MiB", budget);
+    eprintln!();
 }

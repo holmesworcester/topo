@@ -751,11 +751,12 @@ run_asymmetric_proxy() {
   }
   trap cleanup_asym RETURN
 
+  run_topo --db "${alice_db}" start >/dev/null
+  wait_for_socket "${alice_db}" 30
   run_topo --db "${alice_db}" create-workspace \
     --workspace-name "lowmem-proxy" \
     --username "alice" \
     --device-name "alice-dev" >/dev/null
-  wait_for_socket "${alice_db}" 30
 
   local addr invite_out invite_link
   addr="$(read_listen_addr "${alice_db}")"
@@ -777,11 +778,16 @@ run_asymmetric_proxy() {
   LOW_MEM_WAL_CAP_MIB="${WAL_CAP_MIB}" \
   LOW_MEM_MEMTRACE="${LOWMEM_MEMTRACE_ENABLED}" \
   LOW_MEM_MEMTRACE_FILE="${memtrace_log}" \
+  run_topo --db "${bob_db}" start >/dev/null
+  wait_for_socket "${bob_db}" 30
+  LOW_MEM_IOS=1 \
+  LOW_MEM_WAL_CAP_MIB="${WAL_CAP_MIB}" \
+  LOW_MEM_MEMTRACE="${LOWMEM_MEMTRACE_ENABLED}" \
+  LOW_MEM_MEMTRACE_FILE="${memtrace_log}" \
   run_topo --db "${bob_db}" accept \
     "${invite_link}" \
     --username "bob" \
     --devicename "bob-dev" >/dev/null
-  wait_for_socket "${bob_db}" 30
 
   alice_pid="$(daemon_pid_for_db "${alice_db}")"
   bob_pid="$(daemon_pid_for_db "${bob_db}")"
@@ -1087,11 +1093,12 @@ run_large_delta_proxy() {
   }
   trap cleanup_delta RETURN
 
+  run_topo_retry 5 --db "${alice_db}" start >/dev/null
+  wait_for_socket "${alice_db}" 30
   run_topo_retry 5 --db "${alice_db}" create-workspace \
     --workspace-name "lowmem-delta" \
     --username "alice" \
     --device-name "alice-dev" >/dev/null
-  wait_for_socket "${alice_db}" 30
 
   local addr invite_out invite_link
   addr="$(read_listen_addr "${alice_db}")"
@@ -1109,11 +1116,12 @@ run_large_delta_proxy() {
     return 1
   fi
 
+  run_topo_retry 5 --db "${bob_db}" start >/dev/null
+  wait_for_socket "${bob_db}" 30
   run_topo_retry 5 --db "${bob_db}" accept \
     "${invite_link}" \
     --username "bob" \
     --devicename "bob-dev" >/dev/null
-  wait_for_socket "${bob_db}" 30
 
   echo "Seeding baseline events on sender: ${LARGE_BASE_EVENTS}"
   run_topo_long_retry 3 --db "${alice_db}" generate --count "${LARGE_BASE_EVENTS}" >/dev/null
@@ -1133,7 +1141,7 @@ run_large_delta_proxy() {
   LOW_MEM_WAL_CAP_MIB="${WAL_CAP_MIB}" \
   LOW_MEM_MEMTRACE="${LOWMEM_MEMTRACE_ENABLED}" \
   LOW_MEM_MEMTRACE_FILE="${memtrace_log}" \
-  run_topo_retry 5 --db "${bob_db}" status >/dev/null
+  run_topo_retry 5 --db "${bob_db}" start >/dev/null
   wait_for_socket "${bob_db}" 30
 
   alice_pid="$(daemon_pid_for_db "${alice_db}")"

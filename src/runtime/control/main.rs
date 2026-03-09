@@ -1432,7 +1432,17 @@ async fn reevaluate_runtime(
         clear_upnp_report(&state);
     }
 
-    let tenant_states = discover_runtime_tenant_states(db_path)?;
+    let tenant_states = match discover_runtime_tenant_states(db_path) {
+        Ok(states) => states,
+        Err(e) => {
+            let msg = e.to_string();
+            if msg.contains("database is locked") || msg.contains("SQLITE_BUSY") {
+                tracing::debug!("database busy during tenant discovery, will retry");
+                return Ok(());
+            }
+            return Err(e);
+        }
+    };
 
     if tenant_states.is_empty() {
         if let Some(runtime) = active_runtime.take() {

@@ -2,8 +2,8 @@
 //!
 //! Measures encode + store + project throughput for file slices.
 //!
-//! Run default tests: cargo test --release --test file_throughput -- --nocapture
-//! Run all (incl. ignored): cargo test --release --test file_throughput -- --nocapture --include-ignored
+//! Run default tests: cargo test --release --test file_throughput_test -- --nocapture
+//! Run all (incl. ignored): cargo test --release --test file_throughput_test -- --nocapture --include-ignored
 
 use std::time::Instant;
 
