@@ -1062,6 +1062,11 @@ fn test_cli_file_upload_sync_and_save() {
     loop {
         let raw = get_messages_raw(&bob_db);
         if raw.contains("\u{2714}") {
+            assert!(
+                raw.contains("MiB/s"),
+                "messages output should include file download MiB/s once complete:\n{}",
+                raw
+            );
             break;
         }
         if start.elapsed().as_secs() >= 30 {
@@ -1072,6 +1077,20 @@ fn test_cli_file_upload_sync_and_save() {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
+
+    let files_out = topo_cmd(&bob_db, &["files"]);
+    assert!(
+        files_out.status.success(),
+        "files failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&files_out.stdout),
+        String::from_utf8_lossy(&files_out.stderr)
+    );
+    let files_stdout = String::from_utf8_lossy(&files_out.stdout);
+    assert!(
+        files_stdout.contains("MiB/s"),
+        "files output should include file download MiB/s:\n{}",
+        files_stdout
+    );
 
     // Save the file to disk
     let saved_path = tmpdir.path().join("received_file.txt");

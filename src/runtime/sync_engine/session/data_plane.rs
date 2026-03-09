@@ -21,6 +21,7 @@ use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
 use crate::tuning::low_mem_memtrace;
 
+use super::logging::SyncRunRxCapture;
 use super::{egress_claim_count, enqueue_batch, have_chunk};
 
 pub struct DataPlaneSendStats {
@@ -124,6 +125,7 @@ pub fn spawn_data_receiver<R>(
     bytes_received: Arc<AtomicU64>,
     recorded_by: String,
     source_tag: String,
+    rx_capture: Option<SyncRunRxCapture>,
 ) -> (
     oneshot::Sender<()>,
     oneshot::Receiver<()>,
@@ -153,6 +155,9 @@ where
                             bytes_received.fetch_add(blob.len() as u64, Ordering::Relaxed);
                             max_blob_size = max_blob_size.max(blob.len());
                             let event_id = hash_event(&blob);
+                            if let Some(capture) = &rx_capture {
+                                capture.record_event_id_b64(crate::crypto::event_id_to_base64(&event_id));
+                            }
                             if ingest_tx
                                 .send((event_id, blob, recorded_by.clone(), source_tag.clone()))
                                 .await

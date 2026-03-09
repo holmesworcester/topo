@@ -129,6 +129,8 @@ pub fn list(
                     blob_bytes: a.blob_bytes,
                     total_slices: a.total_slices,
                     slices_received: a.slices_received,
+                    downloaded_bytes: a.downloaded_bytes,
+                    download_rate_mib_s: a.download_rate_mib_s,
                 })
                 .collect();
 

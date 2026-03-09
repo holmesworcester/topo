@@ -3992,18 +3992,23 @@ fn show_messages_from_json(_db_path: &str, data: &serde_json::Value) {
                 let blob_bytes = att["blob_bytes"].as_i64().unwrap_or(0);
                 let total = att["total_slices"].as_i64().unwrap_or(0);
                 let received = att["slices_received"].as_i64().unwrap_or(0);
+                let downloaded_bytes = att["downloaded_bytes"].as_i64().unwrap_or(0);
+                let download_rate_mib_s = att["download_rate_mib_s"].as_f64();
                 let size = format_byte_size(blob_bytes);
                 let status = if total > 0 && received >= total {
                     "\u{2714}" // ✔
                 } else {
                     "\u{23f3}" // ⏳
                 };
+                let mut details = vec![size];
                 if total > 0 && received < total {
                     let pct = (received as f64 / total as f64 * 100.0) as u32;
-                    println!("        {}  {} ({}, {}%)", status, filename, size, pct);
-                } else {
-                    println!("        {}  {} ({})", status, filename, size);
+                    details.push(format!("{}%", pct));
                 }
+                if let Some(perf) = format_download_perf(downloaded_bytes, download_rate_mib_s) {
+                    details.push(perf);
+                }
+                println!("        {}  {} ({})", status, filename, details.join(", "));
             }
         }
     }
@@ -4031,6 +4036,8 @@ fn show_files_from_json(data: &serde_json::Value) {
         let blob_bytes = file["blob_bytes"].as_i64().unwrap_or(0);
         let total_slices = file["total_slices"].as_i64().unwrap_or(0);
         let slices_received = file["slices_received"].as_i64().unwrap_or(0);
+        let downloaded_bytes = file["downloaded_bytes"].as_i64().unwrap_or(0);
+        let download_rate_mib_s = file["download_rate_mib_s"].as_f64();
         let created_at = file["created_at"].as_i64().unwrap_or(0);
         let file_event_id = file["file_event_id"].as_str().unwrap_or("");
         let message_id = file["message_id"].as_str().unwrap_or("");
@@ -4041,14 +4048,17 @@ fn show_files_from_json(data: &serde_json::Value) {
         let ts = format_timestamp(created_at);
         let short_file = &file_event_id[..file_event_id.len().min(12)];
         let short_message = &message_id[..message_id.len().min(12)];
+        let mut progress = vec![format!("{}/{} slices", slices_received, total_slices)];
+        if let Some(perf) = format_download_perf(downloaded_bytes, download_rate_mib_s) {
+            progress.push(perf);
+        }
         println!(
-            "  {}. {}  {} ({})  [{}/{} slices]  {}",
+            "  {}. {}  {} ({})  [{}]  {}",
             i + 1,
             status,
             filename,
             size,
-            slices_received,
-            total_slices,
+            progress.join(", "),
             ts
         );
         println!("     file_event:{}  message:{}", short_file, short_message);
@@ -4089,6 +4099,16 @@ mod tests {
         assert_eq!(format_byte_size(1048576), "1.0 MiB");
         assert_eq!(format_byte_size(1258291), "1.2 MiB");
         assert_eq!(format_byte_size(1073741824), "1.0 GiB");
+    }
+
+    #[test]
+    fn test_format_download_perf() {
+        assert_eq!(
+            format_download_perf(393216, Some(0.1875)).as_deref(),
+            Some("384.0 KiB @ 0.19 MiB/s")
+        );
+        assert_eq!(format_download_perf(393216, None), None);
+        assert_eq!(format_download_perf(0, Some(1.0)), None);
     }
 
     #[test]
@@ -4235,6 +4255,21 @@ fn format_byte_size(bytes: i64) -> String {
     } else {
         format!("{} B", bytes)
     }
+}
+
+fn format_mib_per_sec(rate: f64) -> String {
+    format!("{rate:.2} MiB/s")
+}
+
+fn format_download_perf(downloaded_bytes: i64, download_rate_mib_s: Option<f64>) -> Option<String> {
+    if downloaded_bytes <= 0 {
+        return None;
+    }
+    Some(format!(
+        "{} @ {}",
+        format_byte_size(downloaded_bytes),
+        format_mib_per_sec(download_rate_mib_s?)
+    ))
 }
 
 fn show_view(data: &serde_json::Value) {

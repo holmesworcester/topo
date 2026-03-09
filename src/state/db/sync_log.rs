@@ -203,6 +203,14 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_sync_run_events_run
             ON sync_run_events(run_id, seq);
+
+        CREATE TABLE IF NOT EXISTS sync_run_rx_events (
+            run_id INTEGER NOT NULL,
+            event_id TEXT NOT NULL,
+            PRIMARY KEY (run_id, event_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_sync_run_rx_events_event
+            ON sync_run_rx_events(event_id, run_id);
         ",
     )?;
 
@@ -290,6 +298,134 @@ pub fn update_config(conn: &Connection, patch: SyncLogConfigPatch) -> SqliteResu
     Ok(cfg)
 }
 
+pub fn insert_run_start(conn: &Connection, run: &NewSyncRun) -> SqliteResult<i64> {
+    conn.execute(
+        "INSERT INTO sync_runs
+         (started_at_ms, ended_at_ms, session_id, tenant_id, peer_id, direction, remote_addr, role,
+          rounds, events_sent, events_received, bytes_sent, bytes_received, changed, outcome, error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        params![
+            run.started_at_ms,
+            run.ended_at_ms,
+            u64_to_i64(run.session_id),
+            &run.tenant_id,
+            &run.peer_id,
+            &run.direction,
+            &run.remote_addr,
+            &run.role,
+            u64_to_i64(run.rounds),
+            u64_to_i64(run.events_sent),
+            u64_to_i64(run.events_received),
+            u64_to_i64(run.bytes_sent),
+            u64_to_i64(run.bytes_received),
+            bool_to_i64(run.changed),
+            &run.outcome,
+            run.error.as_deref(),
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn insert_run_event(
+    conn: &Connection,
+    run_id: i64,
+    event: &NewSyncRunEvent,
+) -> SqliteResult<()> {
+    conn.execute(
+        "INSERT INTO sync_run_events
+         (run_id, seq, ts_ms, lane, direction, frame_type, msg_len, detail_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            run_id,
+            u64_to_i64(event.seq),
+            event.ts_ms,
+            &event.lane,
+            &event.direction,
+            &event.frame_type,
+            usize_to_i64(event.msg_len),
+            event.detail_json.as_deref(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn insert_run_received_event(
+    conn: &Connection,
+    run_id: i64,
+    event_id: &str,
+) -> SqliteResult<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO sync_run_rx_events (run_id, event_id)
+         VALUES (?1, ?2)",
+        params![run_id, event_id],
+    )?;
+    Ok(())
+}
+
+pub fn finalize_run(
+    conn: &Connection,
+    run_id: i64,
+    run: &NewSyncRun,
+    cfg: &SyncLogConfig,
+) -> SqliteResult<Option<i64>> {
+    conn.execute("BEGIN IMMEDIATE", [])?;
+
+    let finalize_result = (|| -> SqliteResult<Option<i64>> {
+        if cfg.changed_only && !run.changed && run.outcome == "ok" && run.error.is_none() {
+            conn.execute(
+                "DELETE FROM sync_run_rx_events WHERE run_id = ?1",
+                params![run_id],
+            )?;
+            conn.execute(
+                "DELETE FROM sync_run_events WHERE run_id = ?1",
+                params![run_id],
+            )?;
+            conn.execute("DELETE FROM sync_runs WHERE run_id = ?1", params![run_id])?;
+            return Ok(None);
+        }
+
+        conn.execute(
+            "UPDATE sync_runs
+             SET ended_at_ms = ?1,
+                 rounds = ?2,
+                 events_sent = ?3,
+                 events_received = ?4,
+                 bytes_sent = ?5,
+                 bytes_received = ?6,
+                 changed = ?7,
+                 outcome = ?8,
+                 error = ?9
+             WHERE run_id = ?10",
+            params![
+                run.ended_at_ms,
+                u64_to_i64(run.rounds),
+                u64_to_i64(run.events_sent),
+                u64_to_i64(run.events_received),
+                u64_to_i64(run.bytes_sent),
+                u64_to_i64(run.bytes_received),
+                bool_to_i64(run.changed),
+                &run.outcome,
+                run.error.as_deref(),
+                run_id,
+            ],
+        )?;
+
+        prune_locked(conn, cfg)?;
+        Ok(Some(run_id))
+    })();
+
+    match finalize_result {
+        Ok(result) => {
+            conn.execute("COMMIT", [])?;
+            Ok(result)
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", []);
+            Err(e)
+        }
+    }
+}
+
 pub fn append_run_with_events(
     conn: &Connection,
     run: &NewSyncRun,
@@ -364,6 +500,11 @@ pub fn append_run_with_events(
 fn prune_locked(conn: &Connection, cfg: &SyncLogConfig) -> SqliteResult<()> {
     let cutoff = now_ms().saturating_sub(cfg.max_age_days.saturating_mul(DAY_MS));
     conn.execute(
+        "DELETE FROM sync_run_rx_events
+         WHERE run_id IN (SELECT run_id FROM sync_runs WHERE ended_at_ms < ?1)",
+        params![cutoff],
+    )?;
+    conn.execute(
         "DELETE FROM sync_run_events
          WHERE run_id IN (SELECT run_id FROM sync_runs WHERE ended_at_ms < ?1)",
         params![cutoff],
@@ -373,6 +514,15 @@ fn prune_locked(conn: &Connection, cfg: &SyncLogConfig) -> SqliteResult<()> {
         params![cutoff],
     )?;
 
+    conn.execute(
+        "DELETE FROM sync_run_rx_events
+         WHERE run_id IN (
+            SELECT run_id FROM sync_runs
+            ORDER BY ended_at_ms DESC, run_id DESC
+            LIMIT -1 OFFSET ?1
+         )",
+        params![cfg.max_runs],
+    )?;
     conn.execute(
         "DELETE FROM sync_run_events
          WHERE run_id IN (

@@ -30,6 +30,7 @@ use crate::tuning::{low_mem_memtrace, low_mem_mode};
 
 use super::control_plane::send_done_ack;
 use super::data_plane::{drain_egress_to_data_stream, send_data_done, spawn_data_receiver};
+use super::logging::SyncRunRxCapture;
 use super::{negentropy_frame_size, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS};
 
 /// Run sync as the responder (server role) with dual streams.
@@ -46,6 +47,7 @@ pub async fn run_sync_responder<C, S, R>(
     recorded_by: &str,
     ingress_source_tag: &str,
     shared_ingest: mpsc::Sender<IngestItem>,
+    rx_capture: Option<SyncRunRxCapture>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
     C: StreamConn,
@@ -129,6 +131,7 @@ where
         bytes_received.clone(),
         recorded_by.to_string(),
         ingress_source_tag.to_string(),
+        rx_capture,
     );
 
     let mut events_sent: u64 = 0;
