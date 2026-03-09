@@ -1,0 +1,7 @@
+---
+defaults:
+  theme: dark
+
+options:
+  strict_front_matter_parsing: false
+  end_slide_shorthand: true

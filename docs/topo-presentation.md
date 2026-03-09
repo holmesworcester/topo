@@ -81,20 +81,20 @@ style: |
 
 # Why make p2p apps practical and painless? 🤔
 
-- A FOSS p2p Slack would be awesome
+- A FOSS p2p Slack or Discord would be awesome
 - It would provide safety and resiliency to orgs we care about
 - We've spent years building one (**tryquiet.org**)
-- It has been a real slog; could it have been much easier?
+- It has been a real slog
 
 ---
 
-# These questions haunt us 👻 
+# The question that haunts us 👻 
 
-If there was a way all this slog could be much easier, and we aren't pursuing it, that would be really dumb. Or is the slog unavoidable?
+Could this slog be much easier, or not a slog at all? Or is p2p just really #$%@ing hard?
 
 ---
 
-# So what makes p2p so #$%@ing hard? 😡
+# What makes p2p so #$%@ing hard? 😡
 
 - Big laundry list of problems to solve (p2p, e2ee, sync, files, push etc.)
 - Solutions aren't generic; must fit product needs
@@ -108,10 +108,11 @@ If there was a way all this slog could be much easier, and we aren't pursuing it
 * Right?
 * ...right?
 * ...
+* 
 
 ---
 
-# Our experience with existing p2p tools  
+# Our experience with existing p2p tools 🫤
 
 - They cover *some* of our laundry list / stack
 - But what they *do* cover is costly to adapt to product goals
@@ -123,16 +124,15 @@ If there was a way all this slog could be much easier, and we aren't pursuing it
 
 # Some concrete gripes with existing tools 😡
 
-- Arbitrary dependencies (last sent/seen) block when you don't want to, not when you do
-- Dependencies are often used for deciding what to fetch
-- Nobody considers mobile push notifications (e.g. the iOS NSE memory limit)
+- Arbitrary dependencies block when you don't want to, not when you do
+- Mobile push notifications (e.g. the iOS NSE memory limit) not considered
 - Multi-tenant cloud and multi-account clients are usually not covered by the model
 - You must build a middle layer to cover all the queries your frontend needs want
-- Identity and app state gets duplicated across layers
+- Lots of state duplication (another concurrency problem)
 
 ---
 
-# An idea 💡
+# An observation 💡
 
 Given that:
 
@@ -140,76 +140,61 @@ Given that:
 * all p2p libraries (except perhaps libp2p) are at very early stages of maturity
 * this stuff is hard
 
-...Maybe you don't *want* to trust some library?
+...Maybe p2p library features are ~useless?
 
-Maybe what you need is more like **a plan for battling concurrency and... winning!** ⚔
-
----
-
-# This is the Topo 🐭 philosophy 
-
-Don't provide features covering *parts* of the problem.
-
-Provide a **concurrency solution** across the *whole* problem.
-
-Then devs can safely build the features *their users need* without getting devoured by the concurrency beast!
+Instead, maybe what you need is a **concurrency approach** covering the whole problem.
 
 ---
 
-# Topo 🐭 covers the whole problem
+# This is Topo 🐭
+
+Topo covers:
 
 - **All layers**: everything from networking to the local app API.
-- **Most contexts**: everything from iOS notification fetching to multi-tenant servers. 
-
-(The current POC omits the web context, but this is tractable too.)
+- **Most contexts**: everything from iOS notification fetching to multi-tenant servers. (Soon the web, too.)
 
 ---
 
-# Topo 🐭 solves the hard (concurrency) parts
+# How Topo 🐭 manages concurrency
 
-- Expressing all data (including files, who to connect to) as events
-- Minimizing state duplication (one event set, one DB file)
-- Connecting to and authenticating peers 
-- Syncing all events (including files) efficiently
-- Decrypting and validating them in the correct order
-- Converging on the correct state
-- Managing deletion
-- Providing a useful API for frontends
-
-It also provides a basic sketch for multi-device syncing and group key agreement 
-
---- 
-
-# ...Then it lets devs build what their users want 🌈
-
-- API will do whatever a modern frontend needs it to
-- Sync is never blocked by missing events
-- Events can block on prior events or not, as you wish
-- Modify encryption, auth to match product needs 
+- All data (including files, who to connect to) is events
+- All state derived from the set of events
+- Minimal state duplication (one event set, one DB file)
+- Peer connection is an ongoig process controlled by the event set.
+- Event set controls auth too
+- Events sync efficiently, get decrypted, validated, and turned into SQLite rows.
+- These can be queried in complex ways.
+- Keys are stored as events and work just like any other dependency, blocking decryption until they arrive.
 
 ---
 
 
-#  Why backend dev is easier 
+#  How Topo 🐭 makes backends simpler 
 
-- SQLite-backed reconciliation stays memory-bounded for e.g. iOS NSE.
-- One instance and one QUIC port can host many tenants, for cloud.
-- Easy to define dependencies to match product needs
-- Framework for reasoning about concurrency/causality makes advanced crypto, forward secrecy, TreeKEM-style designs easier to build.
-* End-to-end testing is cheap and easy. 
+- No separate backend for iOS (uses SQLite to stay memory-bounded)
+- No separate backend for cloud: one endpoint can host many tenants
+- Dependencies can match product needs
+* End-to-end testing is cheap and easy
+* Gives you a flexible, concurrency-safe way to do encryption and auth
 
 ---
 
-# Why frontend dev is easier:
+# How Topo 🐭 makes frontends simpler
 
 - Projected SQLite tables give the data the shape it actually wants.
 - The API can answer complex queries like "give me a paginated message list with usernames, reactions, attachments, and download progress".
 - Optimistic UI just append a local `client_op_id`; no need for a custom sync state machine.
 - Frontends can poll or get subscription feeds of what changed.
 
-<span class="answer">Easy stuff gets easy again. Hard stuff stays possible.</span>
-
 ---
+
+# Result: easy stuff gets easy again. 
+
+And hard stuff stays possible.
+
+Now, the demo 🐭
+
+<!-- Scraps
 
 # TL;DR:
 
@@ -217,3 +202,4 @@ It also provides a basic sketch for multi-device syncing and group key agreement
 
 **Topo 🐭** covers the concurrency problem; features are up to you.
  
+-->
