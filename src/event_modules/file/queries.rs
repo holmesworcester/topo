@@ -262,6 +262,7 @@ fn load_file_slice_payload(
     db: &Connection,
     recorded_by: &str,
     slice_event_id_b64: &str,
+    expected_key_event_id_b64: &str,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let blob: Vec<u8> = db.query_row(
         "SELECT blob FROM events WHERE event_id = ?1",
@@ -275,6 +276,13 @@ fn load_file_slice_payload(
         ParsedEvent::FileSlice(fs) => Ok(fs.ciphertext),
         ParsedEvent::Encrypted(enc) => {
             let key_event_id_b64 = event_id_to_base64(&enc.key_event_id);
+            if key_event_id_b64 != expected_key_event_id_b64 {
+                return Err(format!(
+                    "slice {} key mismatch: wrapper uses {} but file descriptor expects {}",
+                    slice_event_id_b64, key_event_id_b64, expected_key_event_id_b64
+                )
+                .into());
+            }
             let key_bytes: Vec<u8> = db.query_row(
                 "SELECT key_bytes
                  FROM key_secrets
@@ -339,14 +347,15 @@ pub fn save_file_by_selector(
     let file_event_id_b64 = resolve_file_selector_to_b64(db, recorded_by, selector)?;
     let file_event_id_hex = b64_to_hex(&file_event_id_b64);
 
-    let (file_id_b64, blob_bytes, total_slices, _slice_bytes, filename): (
+    let (file_id_b64, blob_bytes, total_slices, _slice_bytes, filename, key_event_id_b64): (
         String,
         i64,
         i64,
         i64,
+        String,
         String,
     ) = db.query_row(
-        "SELECT file_id, blob_bytes, total_slices, slice_bytes, filename
+        "SELECT file_id, blob_bytes, total_slices, slice_bytes, filename, key_event_id
          FROM files
          WHERE recorded_by = ?1 AND event_id = ?2
          LIMIT 1",
@@ -358,6 +367,7 @@ pub fn save_file_by_selector(
                 row.get(2)?,
                 row.get(3)?,
                 row.get(4)?,
+                row.get(5)?,
             ))
         },
     )?;
@@ -410,7 +420,7 @@ pub fn save_file_by_selector(
                 )
                 .into());
             }
-            let payload = load_file_slice_payload(db, recorded_by, slice_event_id_b64)?;
+            let payload = load_file_slice_payload(db, recorded_by, slice_event_id_b64, &key_event_id_b64)?;
             file.write_all(&payload)?;
             bytes_written += payload.len() as u64;
         }
