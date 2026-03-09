@@ -121,8 +121,8 @@ Could this slog be much easier, or not a slog at all? Or is p2p just really #$%@
 
 - Arbitrary dependencies block when you don't want to, not when you do
 - Mobile push notifications (e.g. the iOS NSE memory limit) not considered
-- Multi-tenant cloud and multi-account clients are usually not covered by the model
-- You must build a middle layer to cover all the queries your frontend needs want
+- Multi-tenant cloud and multi-account clients are usually not covered
+- You must build a middle layer to cover all the queries your frontend needs
 - Lots of state duplication (another concurrency problem)
 
 ---
@@ -161,7 +161,7 @@ Topo covers:
 - All data (including files, who to connect to) is events
 - All state derived from the set of events
 - Minimal state duplication (one event set, one DB file)
-- Peer connection is an ongoig process controlled by the event set.
+- Peer connection is an ongoing process controlled by the event set.
 - Event set controls auth too
 - Events sync efficiently, get decrypted, validated, and turned into SQLite rows.
 - These can be queried in complex ways.
@@ -187,7 +187,7 @@ Topo covers:
 
 - Projected SQLite tables give the data the shape it actually wants.
 - The API can answer complex queries like "give me a paginated message list with usernames, reactions, attachments, and download progress".
-- Optimistic UI just append a local `client_op_id`; no need for a custom sync state machine.
+- Optimistic UI just appends a local `client_op_id`; no need for a custom sync state machine.
 - Frontends can poll or get subscription feeds of what changed.
 
 ---
@@ -202,7 +202,7 @@ Now, the demo 🐭
 
 # TL;DR:
 
-**Most p2p stacks** offer lots of features that aren't what you need; you're your own in a hard battle with concurrency.
+**Most p2p stacks** offer lots of features that aren't what you need; you're on your own in a hard battle with concurrency.
 
 **Topo 🐭** covers the concurrency problem; features are up to you.
  
