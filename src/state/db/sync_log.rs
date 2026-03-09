@@ -203,6 +203,14 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_sync_run_events_run
             ON sync_run_events(run_id, seq);
+
+        CREATE TABLE IF NOT EXISTS sync_run_rx_events (
+            run_id INTEGER NOT NULL,
+            event_id TEXT NOT NULL,
+            PRIMARY KEY (run_id, event_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_sync_run_rx_events_event
+            ON sync_run_rx_events(event_id, run_id);
         ",
     )?;
 
@@ -290,6 +298,134 @@ pub fn update_config(conn: &Connection, patch: SyncLogConfigPatch) -> SqliteResu
     Ok(cfg)
 }
 
+pub fn insert_run_start(conn: &Connection, run: &NewSyncRun) -> SqliteResult<i64> {
+    conn.execute(
+        "INSERT INTO sync_runs
+         (started_at_ms, ended_at_ms, session_id, tenant_id, peer_id, direction, remote_addr, role,
+          rounds, events_sent, events_received, bytes_sent, bytes_received, changed, outcome, error)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        params![
+            run.started_at_ms,
+            run.ended_at_ms,
+            u64_to_i64(run.session_id),
+            &run.tenant_id,
+            &run.peer_id,
+            &run.direction,
+            &run.remote_addr,
+            &run.role,
+            u64_to_i64(run.rounds),
+            u64_to_i64(run.events_sent),
+            u64_to_i64(run.events_received),
+            u64_to_i64(run.bytes_sent),
+            u64_to_i64(run.bytes_received),
+            bool_to_i64(run.changed),
+            &run.outcome,
+            run.error.as_deref(),
+        ],
+    )?;
+    Ok(conn.last_insert_rowid())
+}
+
+pub fn insert_run_event(
+    conn: &Connection,
+    run_id: i64,
+    event: &NewSyncRunEvent,
+) -> SqliteResult<()> {
+    conn.execute(
+        "INSERT INTO sync_run_events
+         (run_id, seq, ts_ms, lane, direction, frame_type, msg_len, detail_json)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+        params![
+            run_id,
+            u64_to_i64(event.seq),
+            event.ts_ms,
+            &event.lane,
+            &event.direction,
+            &event.frame_type,
+            usize_to_i64(event.msg_len),
+            event.detail_json.as_deref(),
+        ],
+    )?;
+    Ok(())
+}
+
+pub fn insert_run_received_event(
+    conn: &Connection,
+    run_id: i64,
+    event_id: &str,
+) -> SqliteResult<()> {
+    conn.execute(
+        "INSERT OR IGNORE INTO sync_run_rx_events (run_id, event_id)
+         VALUES (?1, ?2)",
+        params![run_id, event_id],
+    )?;
+    Ok(())
+}
+
+pub fn finalize_run(
+    conn: &Connection,
+    run_id: i64,
+    run: &NewSyncRun,
+    cfg: &SyncLogConfig,
+) -> SqliteResult<Option<i64>> {
+    conn.execute("BEGIN IMMEDIATE", [])?;
+
+    let finalize_result = (|| -> SqliteResult<Option<i64>> {
+        if cfg.changed_only && !run.changed && run.outcome == "ok" && run.error.is_none() {
+            conn.execute(
+                "DELETE FROM sync_run_rx_events WHERE run_id = ?1",
+                params![run_id],
+            )?;
+            conn.execute(
+                "DELETE FROM sync_run_events WHERE run_id = ?1",
+                params![run_id],
+            )?;
+            conn.execute("DELETE FROM sync_runs WHERE run_id = ?1", params![run_id])?;
+            return Ok(None);
+        }
+
+        conn.execute(
+            "UPDATE sync_runs
+             SET ended_at_ms = ?1,
+                 rounds = ?2,
+                 events_sent = ?3,
+                 events_received = ?4,
+                 bytes_sent = ?5,
+                 bytes_received = ?6,
+                 changed = ?7,
+                 outcome = ?8,
+                 error = ?9
+             WHERE run_id = ?10",
+            params![
+                run.ended_at_ms,
+                u64_to_i64(run.rounds),
+                u64_to_i64(run.events_sent),
+                u64_to_i64(run.events_received),
+                u64_to_i64(run.bytes_sent),
+                u64_to_i64(run.bytes_received),
+                bool_to_i64(run.changed),
+                &run.outcome,
+                run.error.as_deref(),
+                run_id,
+            ],
+        )?;
+
+        prune_locked(conn, cfg)?;
+        Ok(Some(run_id))
+    })();
+
+    match finalize_result {
+        Ok(result) => {
+            conn.execute("COMMIT", [])?;
+            Ok(result)
+        }
+        Err(e) => {
+            let _ = conn.execute("ROLLBACK", []);
+            Err(e)
+        }
+    }
+}
+
 pub fn append_run_with_events(
     conn: &Connection,
     run: &NewSyncRun,
@@ -364,6 +500,11 @@ pub fn append_run_with_events(
 fn prune_locked(conn: &Connection, cfg: &SyncLogConfig) -> SqliteResult<()> {
     let cutoff = now_ms().saturating_sub(cfg.max_age_days.saturating_mul(DAY_MS));
     conn.execute(
+        "DELETE FROM sync_run_rx_events
+         WHERE run_id IN (SELECT run_id FROM sync_runs WHERE ended_at_ms < ?1)",
+        params![cutoff],
+    )?;
+    conn.execute(
         "DELETE FROM sync_run_events
          WHERE run_id IN (SELECT run_id FROM sync_runs WHERE ended_at_ms < ?1)",
         params![cutoff],
@@ -373,6 +514,15 @@ fn prune_locked(conn: &Connection, cfg: &SyncLogConfig) -> SqliteResult<()> {
         params![cutoff],
     )?;
 
+    conn.execute(
+        "DELETE FROM sync_run_rx_events
+         WHERE run_id IN (
+            SELECT run_id FROM sync_runs
+            ORDER BY ended_at_ms DESC, run_id DESC
+            LIMIT -1 OFFSET ?1
+         )",
+        params![cfg.max_runs],
+    )?;
     conn.execute(
         "DELETE FROM sync_run_events
          WHERE run_id IN (
@@ -534,6 +684,38 @@ mod tests {
     use super::*;
     use crate::db::schema::create_tables;
 
+    fn sample_run(session_id: u64, changed: bool, outcome: &str) -> NewSyncRun {
+        NewSyncRun {
+            started_at_ms: now_ms() - 5,
+            ended_at_ms: now_ms(),
+            session_id,
+            tenant_id: "tenant-a".to_string(),
+            peer_id: "peer-a".to_string(),
+            direction: "outbound".to_string(),
+            remote_addr: "127.0.0.1:4433".to_string(),
+            role: "initiator".to_string(),
+            rounds: 1,
+            events_sent: if changed { 1 } else { 0 },
+            events_received: if changed { 1 } else { 0 },
+            bytes_sent: if changed { 120 } else { 0 },
+            bytes_received: if changed { 60 } else { 0 },
+            changed,
+            outcome: outcome.to_string(),
+            error: if outcome == "error" {
+                Some("timeout".to_string())
+            } else {
+                None
+            },
+        }
+    }
+
+    fn rx_event_count(conn: &Connection) -> i64 {
+        conn.query_row("SELECT COUNT(*) FROM sync_run_rx_events", [], |row| {
+            row.get(0)
+        })
+        .unwrap()
+    }
+
     #[test]
     fn sync_log_defaults_disabled() {
         let conn = crate::db::open_in_memory().unwrap();
@@ -602,6 +784,7 @@ mod tests {
             &conn,
             SyncLogConfigPatch {
                 enabled: Some(true),
+                changed_only: Some(false),
                 max_runs: Some(2),
                 ..Default::default()
             },
@@ -628,13 +811,16 @@ mod tests {
                 outcome: "ok".to_string(),
                 error: None,
             };
-            append_run_with_events(&conn, &run, &[], &cfg).unwrap();
+            let run_id = append_run_with_events(&conn, &run, &[], &cfg).unwrap();
+            insert_run_received_event(&conn, run_id, &format!("event-{i}")).unwrap();
+            finalize_run(&conn, run_id, &run, &cfg).unwrap();
         }
 
         let rows = list_runs(&conn, 10, true, None, None).unwrap();
         assert_eq!(rows.len(), 2);
         assert_eq!(rows[0].session_id, 4);
         assert_eq!(rows[1].session_id, 3);
+        assert_eq!(rx_event_count(&conn), 2);
     }
 
     #[test]
@@ -675,5 +861,48 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].session_id, 99);
         assert_eq!(rows[0].outcome, "error");
+    }
+
+    #[test]
+    fn sync_log_finalize_keeps_received_event_links_for_changed_runs() {
+        let conn = crate::db::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let cfg = load_config(&conn).unwrap();
+
+        let initial = sample_run(7, false, "in_progress");
+        let run_id = insert_run_start(&conn, &initial).unwrap();
+        insert_run_received_event(&conn, run_id, "evt-a").unwrap();
+        insert_run_received_event(&conn, run_id, "evt-a").unwrap();
+
+        let final_run = sample_run(7, true, "ok");
+        let kept = finalize_run(&conn, run_id, &final_run, &cfg).unwrap();
+        assert_eq!(kept, Some(run_id));
+        assert_eq!(rx_event_count(&conn), 1);
+
+        let runs = list_runs(&conn, 10, true, Some(run_id), None).unwrap();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].session_id, 7);
+        assert!(runs[0].changed);
+    }
+
+    #[test]
+    fn sync_log_finalize_drops_received_event_links_for_unchanged_runs_when_changed_only() {
+        let conn = crate::db::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let cfg = load_config(&conn).unwrap();
+
+        let initial = sample_run(8, false, "in_progress");
+        let run_id = insert_run_start(&conn, &initial).unwrap();
+        insert_run_received_event(&conn, run_id, "evt-a").unwrap();
+
+        let final_run = sample_run(8, false, "ok");
+        let kept = finalize_run(&conn, run_id, &final_run, &cfg).unwrap();
+        assert_eq!(kept, None);
+        assert_eq!(rx_event_count(&conn), 0);
+
+        let remaining_runs: i64 = conn
+            .query_row("SELECT COUNT(*) FROM sync_runs", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(remaining_runs, 0);
     }
 }

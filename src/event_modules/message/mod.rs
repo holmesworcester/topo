@@ -57,6 +57,9 @@ pub struct FileSummary {
     pub blob_bytes: i64,
     pub total_slices: i64,
     pub slices_received: i64,
+    pub downloaded_bytes: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_rate_mib_s: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]

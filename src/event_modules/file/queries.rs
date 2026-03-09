@@ -11,6 +11,9 @@ pub struct FileSummary {
     pub blob_bytes: i64,
     pub total_slices: i64,
     pub slices_received: i64,
+    pub downloaded_bytes: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_rate_mib_s: Option<f64>,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -23,6 +26,9 @@ pub struct FileItem {
     pub blob_bytes: i64,
     pub total_slices: i64,
     pub slices_received: i64,
+    pub downloaded_bytes: i64,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub download_rate_mib_s: Option<f64>,
     pub complete: bool,
     pub created_at: i64,
 }
@@ -42,6 +48,20 @@ pub struct SaveFileResponse {
     pub total_slices: i64,
 }
 
+fn calculate_download_rate_mib_s(
+    downloaded_bytes: i64,
+    earliest_sync_start_ms: Option<i64>,
+    last_slice_recorded_at_ms: Option<i64>,
+) -> Option<f64> {
+    if downloaded_bytes <= 0 {
+        return None;
+    }
+    let start_ms = earliest_sync_start_ms?;
+    let end_ms = last_slice_recorded_at_ms?;
+    let elapsed_ms = end_ms.saturating_sub(start_ms).max(1) as f64;
+    Some((downloaded_bytes as f64 / (1024.0 * 1024.0)) / (elapsed_ms / 1000.0))
+}
+
 pub fn list_for_message(
     db: &Connection,
     recorded_by: &str,
@@ -50,18 +70,50 @@ pub fn list_for_message(
     let mut stmt = db.prepare(
         "SELECT a.filename, a.mime_type, a.blob_bytes, a.total_slices,
                 (SELECT COUNT(*) FROM file_slices fs
-                 WHERE fs.recorded_by = a.recorded_by AND fs.file_id = a.file_id) as slices_received
+                 WHERE fs.recorded_by = a.recorded_by AND fs.file_id = a.file_id) AS slices_received,
+                COALESCE(
+                    (SELECT SUM(
+                        CASE
+                            WHEN fs.slice_number = a.total_slices - 1
+                                THEN a.blob_bytes - (a.slice_bytes * (a.total_slices - 1))
+                            ELSE a.slice_bytes
+                        END
+                    )
+                     FROM file_slices fs
+                     WHERE fs.recorded_by = a.recorded_by AND fs.file_id = a.file_id),
+                    0
+                ) AS downloaded_bytes,
+                (SELECT MIN(sr.started_at_ms)
+                 FROM file_slices fs
+                 JOIN sync_run_rx_events sre ON sre.event_id = fs.event_id
+                 JOIN sync_runs sr
+                   ON sr.run_id = sre.run_id AND sr.tenant_id = fs.recorded_by
+                 WHERE fs.recorded_by = a.recorded_by AND fs.file_id = a.file_id) AS earliest_sync_start_ms,
+                (SELECT MAX(re.recorded_at)
+                 FROM file_slices fs
+                 JOIN recorded_events re
+                   ON re.peer_id = fs.recorded_by AND re.event_id = fs.event_id
+                 WHERE fs.recorded_by = a.recorded_by AND fs.file_id = a.file_id) AS last_slice_recorded_at_ms
          FROM files a
          WHERE a.recorded_by = ?1 AND a.message_id = ?2",
     )?;
     let rows = stmt
         .query_map(rusqlite::params![recorded_by, message_id_b64], |row| {
+            let downloaded_bytes: i64 = row.get(5)?;
+            let earliest_sync_start_ms: Option<i64> = row.get(6)?;
+            let last_slice_recorded_at_ms: Option<i64> = row.get(7)?;
             Ok(FileSummary {
                 filename: row.get(0)?,
                 mime_type: row.get(1)?,
                 blob_bytes: row.get(2)?,
                 total_slices: row.get(3)?,
                 slices_received: row.get(4)?,
+                downloaded_bytes,
+                download_rate_mib_s: calculate_download_rate_mib_s(
+                    downloaded_bytes,
+                    earliest_sync_start_ms,
+                    last_slice_recorded_at_ms,
+                ),
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -83,7 +135,30 @@ pub fn list_files(
         "SELECT a.event_id, a.message_id, a.file_id, a.filename, a.mime_type,
                 a.blob_bytes, a.total_slices, a.created_at,
                 (SELECT COUNT(*) FROM file_slices fs
-                 WHERE fs.recorded_by = a.recorded_by AND fs.file_id = a.file_id) AS slices_received
+                 WHERE fs.recorded_by = a.recorded_by AND fs.file_id = a.file_id) AS slices_received,
+                COALESCE(
+                    (SELECT SUM(
+                        CASE
+                            WHEN fs.slice_number = a.total_slices - 1
+                                THEN a.blob_bytes - (a.slice_bytes * (a.total_slices - 1))
+                            ELSE a.slice_bytes
+                        END
+                    )
+                     FROM file_slices fs
+                     WHERE fs.recorded_by = a.recorded_by AND fs.file_id = a.file_id),
+                    0
+                ) AS downloaded_bytes,
+                (SELECT MIN(sr.started_at_ms)
+                 FROM file_slices fs
+                 JOIN sync_run_rx_events sre ON sre.event_id = fs.event_id
+                 JOIN sync_runs sr
+                   ON sr.run_id = sre.run_id AND sr.tenant_id = fs.recorded_by
+                 WHERE fs.recorded_by = a.recorded_by AND fs.file_id = a.file_id) AS earliest_sync_start_ms,
+                (SELECT MAX(re.recorded_at)
+                 FROM file_slices fs
+                 JOIN recorded_events re
+                   ON re.peer_id = fs.recorded_by AND re.event_id = fs.event_id
+                 WHERE fs.recorded_by = a.recorded_by AND fs.file_id = a.file_id) AS last_slice_recorded_at_ms
          FROM files a
          WHERE a.recorded_by = ?1
          ORDER BY a.created_at ASC, a.event_id ASC
@@ -99,6 +174,9 @@ pub fn list_files(
             let file_id_b64: String = row.get(2)?;
             let total_slices: i64 = row.get(6)?;
             let slices_received: i64 = row.get(8)?;
+            let downloaded_bytes: i64 = row.get(9)?;
+            let earliest_sync_start_ms: Option<i64> = row.get(10)?;
+            let last_slice_recorded_at_ms: Option<i64> = row.get(11)?;
             Ok(FileItem {
                 file_event_id: b64_to_hex(&file_event_id_b64),
                 message_id: b64_to_hex(&message_id_b64),
@@ -108,6 +186,12 @@ pub fn list_files(
                 blob_bytes: row.get(5)?,
                 total_slices,
                 slices_received,
+                downloaded_bytes,
+                download_rate_mib_s: calculate_download_rate_mib_s(
+                    downloaded_bytes,
+                    earliest_sync_start_ms,
+                    last_slice_recorded_at_ms,
+                ),
                 complete: total_slices > 0 && slices_received >= total_slices,
                 created_at: row.get(7)?,
             })
@@ -339,11 +423,19 @@ pub fn save_file_by_selector(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::schema::create_tables;
+
+    fn approx_eq(left: f64, right: f64) {
+        let delta = (left - right).abs();
+        assert!(
+            delta < 0.000_001,
+            "expected {left} ~= {right} (delta={delta})"
+        );
+    }
 
     fn setup_db() -> Connection {
         let db = Connection::open_in_memory().unwrap();
-        crate::event_modules::file::ensure_schema(&db).unwrap();
-        crate::event_modules::file_slice::ensure_schema(&db).unwrap();
+        create_tables(&db).unwrap();
         db
     }
 
@@ -384,6 +476,8 @@ mod tests {
         assert_eq!(result[0].blob_bytes, 1234);
         assert_eq!(result[0].total_slices, 1);
         assert_eq!(result[0].slices_received, 0); // no file_slices inserted
+        assert_eq!(result[0].downloaded_bytes, 0);
+        assert_eq!(result[0].download_rate_mib_s, None);
         assert_eq!(result[1].filename, "doc.pdf");
         assert_eq!(result[1].blob_bytes, 5678);
     }
@@ -409,6 +503,8 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].total_slices, 2);
         assert_eq!(result[0].slices_received, 1);
+        assert_eq!(result[0].downloaded_bytes, 262144);
+        assert_eq!(result[0].download_rate_mib_s, None);
 
         // Insert second slice
         db.execute(
@@ -420,6 +516,176 @@ mod tests {
 
         let result = list_for_message(&db, "peer1", "msg1").unwrap();
         assert_eq!(result[0].slices_received, 2);
+        assert_eq!(result[0].downloaded_bytes, 524288);
+        assert_eq!(result[0].download_rate_mib_s, None);
+    }
+
+    #[test]
+    fn test_download_rate_uses_earliest_contributing_sync_start() {
+        let db = setup_db();
+        db.execute(
+            "INSERT INTO files
+             (recorded_by, event_id, message_id, file_id, blob_bytes, total_slices, slice_bytes, root_hash, key_event_id, filename, mime_type, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                "peer1",
+                "evt1",
+                "msg1",
+                "file1",
+                524288i64,
+                2i64,
+                262144i64,
+                &[0u8; 32] as &[u8],
+                "key1",
+                "big.bin",
+                "application/octet-stream",
+                1000i64
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["peer1", "file1", 0i64, "slice_evt1", 3000i64],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["peer1", "file1", 1i64, "slice_evt2", 4000i64],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["peer1", "slice_evt1", 3000i64, "quic_recv:alice"],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params!["peer1", "slice_evt2", 4000i64, "quic_recv:bob"],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO sync_runs
+             (run_id, started_at_ms, ended_at_ms, session_id, tenant_id, peer_id, direction, remote_addr, role,
+              rounds, events_sent, events_received, bytes_sent, bytes_received, changed, outcome, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            rusqlite::params![
+                11i64,
+                1000i64,
+                4500i64,
+                11i64,
+                "peer1",
+                "remote-a",
+                "inbound",
+                "127.0.0.1:4444",
+                "responder",
+                2i64,
+                0i64,
+                1i64,
+                0i64,
+                262144i64,
+                1i64,
+                "ok",
+                Option::<String>::None
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO sync_runs
+             (run_id, started_at_ms, ended_at_ms, session_id, tenant_id, peer_id, direction, remote_addr, role,
+              rounds, events_sent, events_received, bytes_sent, bytes_received, changed, outcome, error)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
+            rusqlite::params![
+                12i64,
+                2500i64,
+                4200i64,
+                12i64,
+                "peer1",
+                "remote-b",
+                "inbound",
+                "127.0.0.1:5555",
+                "responder",
+                2i64,
+                0i64,
+                1i64,
+                0i64,
+                262144i64,
+                1i64,
+                "ok",
+                Option::<String>::None
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO sync_run_rx_events (run_id, event_id) VALUES (?1, ?2)",
+            rusqlite::params![11i64, "slice_evt1"],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO sync_run_rx_events (run_id, event_id) VALUES (?1, ?2)",
+            rusqlite::params![12i64, "slice_evt2"],
+        )
+        .unwrap();
+
+        let by_message = list_for_message(&db, "peer1", "msg1").unwrap();
+        assert_eq!(by_message.len(), 1);
+        assert_eq!(by_message[0].downloaded_bytes, 524288);
+        approx_eq(by_message[0].download_rate_mib_s.unwrap(), 1.0 / 6.0);
+
+        let files = list_files(&db, "peer1", 10).unwrap();
+        assert_eq!(files.total, 1);
+        assert_eq!(files.files[0].downloaded_bytes, 524288);
+        approx_eq(files.files[0].download_rate_mib_s.unwrap(), 1.0 / 6.0);
+    }
+
+    #[test]
+    fn test_downloaded_bytes_uses_actual_last_slice_size() {
+        let db = setup_db();
+        db.execute(
+            "INSERT INTO files
+             (recorded_by, event_id, message_id, file_id, blob_bytes, total_slices, slice_bytes, root_hash, key_event_id, filename, mime_type, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                "peer1",
+                "evt1",
+                "msg1",
+                "file1",
+                300000i64,
+                2i64,
+                262144i64,
+                &[0u8; 32] as &[u8],
+                "key1",
+                "odd.bin",
+                "application/octet-stream",
+                1000i64
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["peer1", "file1", 0i64, "slice_evt1", 1001i64],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params!["peer1", "file1", 1i64, "slice_evt2", 1002i64],
+        )
+        .unwrap();
+
+        let by_message = list_for_message(&db, "peer1", "msg1").unwrap();
+        assert_eq!(by_message.len(), 1);
+        assert_eq!(by_message[0].downloaded_bytes, 300000);
+        assert_eq!(by_message[0].download_rate_mib_s, None);
+
+        let files = list_files(&db, "peer1", 10).unwrap();
+        assert_eq!(files.total, 1);
+        assert_eq!(files.files[0].downloaded_bytes, 300000);
+        assert!(files.files[0].complete);
     }
 
     #[test]

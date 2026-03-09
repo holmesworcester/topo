@@ -1095,6 +1095,19 @@ fn test_cli_file_upload_sync_and_save() {
     accept_invite(&bob_db, &invite_link);
     let _bob = start_daemon(&bob_db);
 
+    let sync_log_cfg = topo_cmd(&bob_db, &["sync-log-config"]);
+    assert!(
+        sync_log_cfg.status.success(),
+        "sync-log-config failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&sync_log_cfg.stdout),
+        String::from_utf8_lossy(&sync_log_cfg.stderr)
+    );
+    assert!(
+        String::from_utf8_lossy(&sync_log_cfg.stdout).contains("enabled=false"),
+        "sync-log should remain disabled by default, got: {}",
+        String::from_utf8_lossy(&sync_log_cfg.stdout)
+    );
+
     // Wait for Bob to receive Alice's message event
     assert_eventually(&bob_db, &format!("has_event:{} >= 1", file_eid), timeout_ms);
 
@@ -1106,6 +1119,11 @@ fn test_cli_file_upload_sync_and_save() {
     loop {
         let raw = get_messages_raw(&bob_db);
         if raw.contains("\u{2714}") {
+            assert!(
+                raw.contains("MiB/s"),
+                "messages output should include file download MiB/s once complete:\n{}",
+                raw
+            );
             break;
         }
         if start.elapsed().as_secs() >= 30 {
@@ -1116,6 +1134,20 @@ fn test_cli_file_upload_sync_and_save() {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
+
+    let files_out = topo_cmd(&bob_db, &["files"]);
+    assert!(
+        files_out.status.success(),
+        "files failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&files_out.stdout),
+        String::from_utf8_lossy(&files_out.stderr)
+    );
+    let files_stdout = String::from_utf8_lossy(&files_out.stdout);
+    assert!(
+        files_stdout.contains("MiB/s"),
+        "files output should include file download MiB/s:\n{}",
+        files_stdout
+    );
 
     // Save the file to disk
     let saved_path = tmpdir.path().join("received_file.txt");
@@ -3094,6 +3126,24 @@ fn test_cli_send_file_and_messages_display() {
         raw.contains("\u{2714}"),
         "local attachment should show checkmark (complete), got:\n{}",
         raw
+    );
+    assert!(
+        !raw.contains("MiB/s"),
+        "local attachment should not show download MiB/s, got:\n{}",
+        raw
+    );
+
+    let files_out = topo_cmd(&db, &["files"]);
+    assert!(
+        files_out.status.success(),
+        "files failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&files_out.stdout),
+        String::from_utf8_lossy(&files_out.stderr)
+    );
+    assert!(
+        !String::from_utf8_lossy(&files_out.stdout).contains("MiB/s"),
+        "local files view should not show download MiB/s, got:\n{}",
+        String::from_utf8_lossy(&files_out.stdout)
     );
 }
 

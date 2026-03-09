@@ -9,7 +9,8 @@ use crate::contracts::peering_contract::{SessionDirection, SessionMeta};
 use crate::crypto::hash_event;
 use crate::db::open_connection;
 use crate::db::sync_log::{
-    append_run_with_events, load_config, NewSyncRun, NewSyncRunEvent, SyncLogConfig,
+    ensure_schema, finalize_run, insert_run_event, insert_run_received_event, insert_run_start,
+    load_config, NewSyncRun, NewSyncRunEvent,
 };
 use crate::protocol::Frame;
 use crate::runtime::SyncStats;
@@ -315,16 +316,22 @@ fn frame_type(frame: &Frame) -> &'static str {
     }
 }
 
+enum WorkerMsg {
+    Trace(NewSyncRunEvent),
+    ReceivedEvent(String),
+    Finalize(NewSyncRun),
+}
+
 #[derive(Clone)]
 pub struct SyncRunCapture {
-    tx: std::sync::mpsc::Sender<NewSyncRunEvent>,
+    tx: std::sync::mpsc::Sender<WorkerMsg>,
     seq: Arc<AtomicU64>,
     capture_full_ids: bool,
 }
 
 impl SyncRunCapture {
     fn new(
-        tx: std::sync::mpsc::Sender<NewSyncRunEvent>,
+        tx: std::sync::mpsc::Sender<WorkerMsg>,
         seq: Arc<AtomicU64>,
         capture_full_ids: bool,
     ) -> Self {
@@ -347,13 +354,26 @@ impl SyncRunCapture {
             msg_len,
             detail_json,
         };
-        let _ = self.tx.send(event);
+        let _ = self.tx.send(WorkerMsg::Trace(event));
+    }
+}
+
+#[derive(Clone)]
+pub struct SyncRunRxCapture {
+    tx: std::sync::mpsc::Sender<WorkerMsg>,
+}
+
+impl SyncRunRxCapture {
+    fn new(tx: std::sync::mpsc::Sender<WorkerMsg>) -> Self {
+        Self { tx }
+    }
+
+    pub fn record_event_id_b64(&self, event_id_b64: String) {
+        let _ = self.tx.send(WorkerMsg::ReceivedEvent(event_id_b64));
     }
 }
 
 pub struct SessionRunLogger {
-    db_path: String,
-    cfg: SyncLogConfig,
     started_at_ms: i64,
     session_id: u64,
     tenant_id: String,
@@ -361,45 +381,111 @@ pub struct SessionRunLogger {
     direction: String,
     remote_addr: String,
     role: String,
+    tx: Option<std::sync::mpsc::Sender<WorkerMsg>>,
     capture: Option<SyncRunCapture>,
-    worker: Option<std::thread::JoinHandle<Vec<NewSyncRunEvent>>>,
+    rx_capture: SyncRunRxCapture,
+    worker: Option<std::thread::JoinHandle<Option<i64>>>,
 }
 
 impl SessionRunLogger {
     pub fn maybe_new(db_path: &str, meta: &SessionMeta, role: &str) -> Option<Self> {
         let db = open_connection(db_path).ok()?;
+        ensure_schema(&db).ok()?;
         let cfg = load_config(&db).ok()?;
-        if !cfg.enabled {
-            return None;
-        }
-
-        let (tx, rx) = std::sync::mpsc::channel::<NewSyncRunEvent>();
-        let seq = Arc::new(AtomicU64::new(0));
-        let capture = SyncRunCapture::new(tx, seq, cfg.capture_full_ids);
-        let worker = std::thread::spawn(move || {
-            let mut out = Vec::new();
-            while let Ok(ev) = rx.recv() {
-                out.push(ev);
-            }
-            out
-        });
 
         let direction = match meta.direction {
             SessionDirection::Inbound => "inbound",
             SessionDirection::Outbound => "outbound",
         };
 
-        Some(Self {
-            db_path: db_path.to_string(),
-            cfg,
-            started_at_ms: now_ms(),
+        let started_at_ms = now_ms();
+        let initial_run = NewSyncRun {
+            started_at_ms,
+            ended_at_ms: started_at_ms,
             session_id: meta.session_id,
             tenant_id: meta.tenant.0.clone(),
             peer_id: hex::encode(meta.peer.0),
             direction: direction.to_string(),
             remote_addr: meta.remote_addr.to_string(),
             role: role.to_string(),
-            capture: Some(capture),
+            rounds: 0,
+            events_sent: 0,
+            events_received: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            changed: false,
+            outcome: "in_progress".to_string(),
+            error: None,
+        };
+        let run_id = insert_run_start(&db, &initial_run).ok()?;
+
+        let (tx, rx) = std::sync::mpsc::channel::<WorkerMsg>();
+        let seq = Arc::new(AtomicU64::new(0));
+        let capture = if cfg.enabled {
+            Some(SyncRunCapture::new(tx.clone(), seq, cfg.capture_full_ids))
+        } else {
+            None
+        };
+        let rx_capture = SyncRunRxCapture::new(tx.clone());
+        let db_path = db_path.to_string();
+        let worker = std::thread::spawn(move || {
+            let db = match open_connection(&db_path) {
+                Ok(db) => db,
+                Err(e) => {
+                    warn!("sync_log: failed to open db for run {}: {}", run_id, e);
+                    return None;
+                }
+            };
+
+            while let Ok(msg) = rx.recv() {
+                match msg {
+                    WorkerMsg::Trace(event) => {
+                        if let Err(e) = insert_run_event(&db, run_id, &event) {
+                            warn!(
+                                "sync_log: failed to persist trace event for run {}: {}",
+                                run_id, e
+                            );
+                        }
+                    }
+                    WorkerMsg::ReceivedEvent(event_id) => {
+                        if let Err(e) = insert_run_received_event(&db, run_id, &event_id) {
+                            warn!(
+                                "sync_log: failed to persist received event for run {}: {}",
+                                run_id, e
+                            );
+                        }
+                    }
+                    WorkerMsg::Finalize(run) => {
+                        return match finalize_run(&db, run_id, &run, &cfg) {
+                            Ok(id) => id,
+                            Err(e) => {
+                                warn!(
+                                    "sync_log: failed to finalize run {} (peer={}): {}",
+                                    run.session_id,
+                                    short_peer(&run.peer_id),
+                                    e
+                                );
+                                None
+                            }
+                        };
+                    }
+                }
+            }
+
+            None
+        });
+
+        Some(Self {
+            started_at_ms,
+            session_id: meta.session_id,
+            tenant_id: meta.tenant.0.clone(),
+            peer_id: initial_run.peer_id,
+            direction: direction.to_string(),
+            remote_addr: meta.remote_addr.to_string(),
+            role: role.to_string(),
+            tx: Some(tx),
+            capture,
+            rx_capture,
             worker: Some(worker),
         })
     }
@@ -408,29 +494,22 @@ impl SessionRunLogger {
         self.capture.clone()
     }
 
+    pub fn rx_capture(&self) -> SyncRunRxCapture {
+        self.rx_capture.clone()
+    }
+
     pub fn finalize(
         mut self,
         stats: Option<&SyncStats>,
         outcome: &str,
         error: Option<String>,
     ) -> Option<i64> {
-        self.capture.take();
-        let events = self
-            .worker
-            .take()
-            .and_then(|h| h.join().ok())
-            .unwrap_or_default();
-
         let rounds = stats.map(|s| s.neg_rounds).unwrap_or(0);
         let events_sent = stats.map(|s| s.events_sent).unwrap_or(0);
         let events_received = stats.map(|s| s.events_received).unwrap_or(0);
         let bytes_sent = stats.map(|s| s.bytes_sent).unwrap_or(0);
         let bytes_received = stats.map(|s| s.bytes_received).unwrap_or(0);
         let changed = events_sent > 0 || events_received > 0;
-
-        if self.cfg.changed_only && !changed && outcome == "ok" && error.is_none() {
-            return None;
-        }
 
         let run = NewSyncRun {
             started_at_ms: self.started_at_ms,
@@ -451,30 +530,11 @@ impl SessionRunLogger {
             error,
         };
 
-        let db = match open_connection(&self.db_path) {
-            Ok(db) => db,
-            Err(e) => {
-                warn!(
-                    "sync_log: failed to open db for run {} (peer={}): {}",
-                    run.session_id,
-                    short_peer(&run.peer_id),
-                    e
-                );
-                return None;
-            }
-        };
+        self.capture.take();
+        let tx = self.tx.take()?;
+        let _ = tx.send(WorkerMsg::Finalize(run));
+        drop(tx);
 
-        match append_run_with_events(&db, &run, &events, &self.cfg) {
-            Ok(run_id) => Some(run_id),
-            Err(e) => {
-                warn!(
-                    "sync_log: failed to persist run {} (peer={}): {}",
-                    run.session_id,
-                    short_peer(&run.peer_id),
-                    e
-                );
-                None
-            }
-        }
+        self.worker.take().and_then(|h| h.join().ok()).flatten()
     }
 }
