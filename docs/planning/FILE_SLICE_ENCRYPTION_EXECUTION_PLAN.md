@@ -13,7 +13,8 @@ inner event is `file_slice`, while preserving:
 
 1. correct file sync and `save-file` behavior,
 2. correct attachment/file MiB/s display,
-3. acceptable sync performance.
+3. acceptable sync performance,
+4. efficient streaming decrypt/save behavior for large files.
 
 This plan intentionally does not preserve backward compatibility for plain outer
 `file_slice` transfer in the normal send-file path.
@@ -39,6 +40,10 @@ This plan intentionally does not preserve backward compatibility for plain outer
    encrypted should be encoded in metadata/registry policy and tested, not left
    as convention.
 
+6. **`save-file` must become streaming and timed**.
+   The CLI result should report how long decrypt+save took, and the
+   implementation must not require the whole file plaintext in memory.
+
 ## Problem
 
 Today normal file uploads create outer `file_slice` events. The current
@@ -57,21 +62,26 @@ updated together.
 5. Local-only files still do not show fake download MiB/s.
 6. The refactor has a stable end-to-end CLI acceptance test.
 7. Transport privacy policy for event types is explicit and tested.
+8. `save-file` reports elapsed decrypt/save time.
+9. `save-file` decrypts and writes incrementally so large files can fit within
+   the iOS NSE memory target.
 
 ## Non-goals
 
 1. No file metadata encryption in this change.
 2. No per-file bespoke AEAD format.
 3. No backward compatibility requirement for normal plaintext slice transfer.
+4. No acceptance of whole-file plaintext buffering during `save-file`.
 
 ## Required execution order
 
 1. Add or tighten the high-level black-box CLI acceptance test first.
 2. Implement outer `encrypted(file_slice)` transport.
 3. Update receive-side MiB/s linkage logic for `encrypted(file_slice)`.
-4. Add transport/privacy policy checks and tests.
-5. Run targeted tests and perf spot checks.
-6. Commit the completed work on `codex/file-slice-encryption`.
+4. Refactor `save-file` to stream decrypt/write and report elapsed time.
+5. Add transport/privacy policy checks and tests.
+6. Run targeted tests and perf spot checks.
+7. Commit the completed work on `codex/file-slice-encryption`.
 
 ## Black-box CLI acceptance target
 
@@ -118,7 +128,24 @@ capture predicate must record `(run_id, event_id)` links for outer
 `encrypted(file_slice)` traffic. If this is missed, file downloads may still
 work, but the MiB/s display will silently disappear.
 
-### 4. Explicit transport privacy policy
+### 4. Streaming save-file requirement
+
+Current `save-file` behavior accumulates the entire file plaintext in memory
+before writing it to disk. That is not acceptable for this work.
+
+Refactor `save-file` so it:
+
+1. reads slices in order,
+2. decrypts each slice independently,
+3. writes each slice directly to the output stream/file,
+4. truncates the final slice to the real file length,
+5. avoids building the whole plaintext file in memory,
+6. reports total elapsed decrypt+save time in the CLI output/result.
+
+The implementation should be viable for large files under the iOS NSE memory
+target (`24 MiB` operational budget).
+
+### 5. Explicit transport privacy policy
 
 Introduce or reuse explicit metadata describing whether an event type:
 
@@ -150,7 +177,13 @@ Update the receive-side capture predicate so it recognizes outer
 ### `src/event_modules/file/queries.rs`
 
 Ensure save/load behavior continues to work with `encrypted(file_slice)` as the
-normal transfer format.
+normal transfer format, and refactor `save-file` to stream decrypted slice
+output instead of buffering the whole file in memory.
+
+### `src/runtime/control/main.rs` and related response structs
+
+Update CLI-visible `save-file` output so the command reports elapsed
+decrypt+save time in addition to bytes written.
 
 ### Registry / metadata
 
@@ -165,6 +198,8 @@ transport posture of event types is encoded and testable.
    transport refactor.
 2. Keep or update the local-file CLI test proving local files do not show fake
    download MiB/s.
+3. Add or update black-box CLI coverage so `save-file` output includes elapsed
+   decrypt/save time.
 
 ### Unit / integration tests
 
@@ -179,10 +214,17 @@ transport posture of event types is encoded and testable.
 2. File roundtrip:
    - prove `save-file` restores exact bytes when slices are outer
      `encrypted(file_slice)`
+   - prove `save-file` streams correctly for multi-slice files without relying
+     on whole-file plaintext accumulation
 
 3. Transport/privacy policy:
    - every relevant event type is explicitly classified
    - `file_slice` is not left implicitly plaintext
+
+4. Large-file save behavior:
+   - add realistic coverage for large multi-slice save/decrypt behavior
+   - if practical, include a low-memory test or explicit bounded-memory helper
+     assertion so the path stays viable for the iOS target
 
 ## Verification
 
@@ -192,12 +234,15 @@ Run targeted tests for:
 2. capture-predicate behavior,
 3. file save/decrypt behavior,
 4. local-file no-rate behavior,
-5. transport/privacy policy coverage.
+5. transport/privacy policy coverage,
+6. `save-file` elapsed-time output.
 
 Then run these perf spot checks and report the numbers:
 
 1. `cargo test --release --test perf_test perf_sync_10k -- --nocapture`
 2. `cargo test --release --test sync_graph_test catchup_large_file_4x_400_slices -- --ignored --nocapture --test-threads=1`
+3. large-file save/decrypt perf measurements for at least `100 MB` and `1 GB`
+   and record them in `docs/PERF.md`
 
 ## Success criteria
 
@@ -209,4 +254,7 @@ Then run these perf spot checks and report the numbers:
 6. Transport privacy policy is explicit and tested.
 7. Perf spot checks remain acceptable relative to the current post-file-rate
    `master` baseline.
-8. The completed work is committed on `codex/file-slice-encryption`.
+8. `save-file` reports elapsed decrypt/save time.
+9. `save-file` no longer buffers whole-file plaintext in memory.
+10. Large-file save/decrypt perf numbers are recorded in `docs/PERF.md`.
+11. The completed work is committed on `codex/file-slice-encryption`.

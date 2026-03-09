@@ -175,12 +175,24 @@ round takes disproportionately longer.
 Measures encode + store + project throughput for file slices (256 KiB ciphertext per slice).
 Single-threaded, no sync — pure local write path.
 
+Latest large-file rerun on `2026-03-09` in `/home/holmes/poc-7-file-slice-encryption`:
+- `100 MB`: `0.475s`, `210.7 MB/s`, `843 slices/s`
+- `1 GB`: `4.893s`, `209.3 MB/s`, `837 slices/s`
+
+These are local encode+store+project numbers only. They are not `save-file`
+decrypt/write timings. Current `save-file` still buffers full plaintext in
+memory and needs a streaming refactor before it can serve as an iOS-safe large
+file decrypt baseline.
+
+The benchmark harness currently prints binary MiB-based throughput while
+labeling it as `MB/s`; the table below preserves the existing doc format.
+
 | Size | Slices | Wall time | Throughput (MB/s) | Throughput (MiB/s) | Slices/s |
 |------|--------|-----------|-------------------|--------------------|----------|
 | 256 KiB | 1 | 0.003s | 83.7 | 79.82 | 335 |
 | 10 MB | 40 | 0.057s | 175.1 | 166.99 | 701 |
-| 100 MB | 400 | 0.531s | 188.4 | 179.67 | 754 |
-| 1 GB | 4,096 | 5.167s | 198.2 | 189.02 | 793 |
+| 100 MB | 400 | 0.475s | 210.7 | 200.94 | 843 |
+| 1 GB | 4,096 | 4.893s | 209.3 | 199.60 | 837 |
 
 ### Topo Cascade (`topo_cascade_test.rs`)
 
