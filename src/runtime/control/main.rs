@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use clap::{CommandFactory, Parser, Subcommand};
+use clap::{parser::ValueSource, CommandFactory, FromArgMatches, Parser, Subcommand};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -1264,10 +1264,30 @@ async fn stop_runtime(runtime: ManagedRuntime) {
 
 fn reserve_idle_bind(
     bind: SocketAddr,
+    allow_default_port_fallback: bool,
 ) -> Result<(UdpSocket, SocketAddr), Box<dyn std::error::Error + Send + Sync>> {
-    let socket = UdpSocket::bind(bind)?;
-    let resolved = socket.local_addr()?;
-    Ok((socket, resolved))
+    match UdpSocket::bind(bind) {
+        Ok(socket) => {
+            let resolved = socket.local_addr()?;
+            Ok((socket, resolved))
+        }
+        Err(err)
+            if allow_default_port_fallback
+                && err.kind() == std::io::ErrorKind::AddrInUse
+                && bind.port() != 0 =>
+        {
+            let fallback_bind = SocketAddr::new(bind.ip(), 0);
+            let socket = UdpSocket::bind(fallback_bind)?;
+            let resolved = socket.local_addr()?;
+            tracing::warn!(
+                "default listen address {} is already in use; falling back to {}",
+                bind,
+                resolved
+            );
+            Ok((socket, resolved))
+        }
+        Err(err) => Err(err.into()),
+    }
 }
 
 fn clear_upnp_report(state: &DaemonState) {
@@ -1419,7 +1439,7 @@ async fn reevaluate_runtime(
             stop_runtime(runtime).await;
         }
         if idle_bind_reservation.is_none() {
-            let (reservation, resolved_bind) = reserve_idle_bind(bind)?;
+            let (reservation, resolved_bind) = reserve_idle_bind(bind, false)?;
             *state.bind_addr.write().unwrap() = Some(resolved_bind);
             *idle_bind_reservation = Some(reservation);
         }
@@ -1526,7 +1546,14 @@ async fn run_runtime_manager(
 async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     maybe_reexec_low_mem_with_allocator_env()?;
     apply_low_mem_allocator_tuning();
-    let cli = Cli::parse();
+    let matches = Cli::command().get_matches();
+    let start_uses_default_bind = matches
+        .subcommand()
+        .map(|(name, sub)| {
+            name == "start" && matches!(sub.value_source("bind"), Some(ValueSource::DefaultValue))
+        })
+        .unwrap_or(false);
+    let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
     let db = &resolve_db_arg(&cli.db)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let socket_override = cli.socket.clone();
@@ -1579,7 +1606,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             // Reserve the UDP bind immediately so startup fails fast on conflicts
             // and the daemon keeps its chosen port even while idle.
-            let (idle_bind_reservation, resolved_bind) = reserve_idle_bind(bind)?;
+            let (idle_bind_reservation, resolved_bind) =
+                reserve_idle_bind(bind, start_uses_default_bind)?;
 
             let shutdown = Arc::new(AtomicBool::new(false));
             let shutdown_notify = Arc::new(tokio::sync::Notify::new());

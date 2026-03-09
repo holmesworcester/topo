@@ -23,6 +23,14 @@ fn free_udp_bind_addr() -> String {
         .to_string()
 }
 
+fn occupy_default_start_port() -> Option<std::net::UdpSocket> {
+    match std::net::UdpSocket::bind("0.0.0.0:4433") {
+        Ok(socket) => Some(socket),
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => None,
+        Err(err) => panic!("failed to occupy default topo start port: {err}"),
+    }
+}
+
 // ---------------------------------------------------------------------------
 // 1. RPC protocol unit tests
 // ---------------------------------------------------------------------------
@@ -736,6 +744,38 @@ fn daemon_start_fails_fast_when_idle_bind_is_already_taken() {
     );
 
     stop_daemon(&db_a, &mut daemon);
+}
+
+#[test]
+fn daemon_start_falls_back_when_default_port_is_already_taken() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+    create_workspace(&db);
+    let _default_port_guard = occupy_default_start_port();
+
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket);
+
+    let active_status = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
+    let active_listen = active_status["runtime"]["listen_addr"]
+        .as_str()
+        .expect("active status should expose runtime.listen_addr")
+        .to_string();
+    let active_addr = active_listen
+        .parse::<std::net::SocketAddr>()
+        .expect("active listen addr should parse");
+    assert_ne!(
+        active_addr.port(),
+        4433,
+        "daemon should avoid the default port when it is already taken"
+    );
+
+    stop_daemon(&db, &mut daemon);
 }
 
 #[test]
