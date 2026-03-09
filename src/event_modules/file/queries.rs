@@ -395,11 +395,13 @@ pub fn save_file_by_selector(
     // not clobber an existing file at output_path.
     let parent_dir = out_path.parent().unwrap_or_else(|| Path::new("."));
     let tmp_path = parent_dir.join(format!(
-        ".topo-save-{}.tmp",
-        std::process::id()
+        ".topo-save-{}-{}.tmp",
+        std::process::id(),
+        rand::random::<u32>()
     ));
-    let write_result = (|| -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let write_result = (|| -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
         let mut file = std::fs::File::create(&tmp_path)?;
+        let mut bytes_written: u64 = 0;
         for (idx, (slice_number, slice_event_id_b64)) in slices.iter().enumerate() {
             if *slice_number != idx as i64 {
                 return Err(format!(
@@ -410,20 +412,29 @@ pub fn save_file_by_selector(
             }
             let payload = load_file_slice_payload(db, recorded_by, slice_event_id_b64)?;
             file.write_all(&payload)?;
+            bytes_written += payload.len() as u64;
         }
         file.flush()?;
         let expected_len = blob_bytes.max(0) as u64;
+        if bytes_written < expected_len {
+            return Err(format!(
+                "file data shorter than expected: {} < {}",
+                bytes_written, expected_len
+            )
+            .into());
+        }
         file.set_len(expected_len)?;
-        Ok(())
+        Ok(expected_len)
     })();
 
-    if let Err(e) = write_result {
-        let _ = std::fs::remove_file(&tmp_path);
-        return Err(e);
-    }
+    let expected_len = match write_result {
+        Ok(len) => len,
+        Err(e) => {
+            let _ = std::fs::remove_file(&tmp_path);
+            return Err(e);
+        }
+    };
     std::fs::rename(&tmp_path, out_path)?;
-
-    let expected_len = blob_bytes.max(0) as u64;
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 
