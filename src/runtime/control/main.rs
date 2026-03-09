@@ -1440,7 +1440,7 @@ async fn reevaluate_runtime(
         }
         if idle_bind_reservation.is_none() {
             let (reservation, resolved_bind) = reserve_idle_bind(bind, false)?;
-            *state.bind_addr.write().unwrap() = Some(resolved_bind);
+            *state.resolved_bind_addr.write().unwrap() = Some(resolved_bind);
             *idle_bind_reservation = Some(reservation);
         }
         *state.runtime_state.write().unwrap() = RuntimeState::IdleNoTenants;
@@ -1612,7 +1612,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let shutdown = Arc::new(AtomicBool::new(false));
             let shutdown_notify = Arc::new(tokio::sync::Notify::new());
             let state = Arc::new(DaemonState::new(db));
-            *state.bind_addr.write().unwrap() = Some(resolved_bind);
+            *state.resolved_bind_addr.write().unwrap() = Some(resolved_bind);
 
             // Start RPC server in a background thread
             let rpc_shutdown = shutdown.clone();
