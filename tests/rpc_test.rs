@@ -23,6 +23,23 @@ fn free_udp_bind_addr() -> String {
         .to_string()
 }
 
+fn occupy_default_start_port() -> Option<std::net::UdpSocket> {
+    match std::net::UdpSocket::bind("0.0.0.0:4433") {
+        Ok(socket) => Some(socket),
+        Err(err) if err.kind() == std::io::ErrorKind::AddrInUse => None,
+        Err(err) => panic!("failed to occupy default topo start port: {err}"),
+    }
+}
+
+fn extract_invite_link(stdout: &str) -> String {
+    stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("invite:").map(str::trim))
+        .filter(|link| !link.is_empty())
+        .map(str::to_string)
+        .expect("expected invite line in command output")
+}
+
 // ---------------------------------------------------------------------------
 // 1. RPC protocol unit tests
 // ---------------------------------------------------------------------------
@@ -739,6 +756,38 @@ fn daemon_start_fails_fast_when_idle_bind_is_already_taken() {
 }
 
 #[test]
+fn daemon_start_falls_back_when_default_port_is_already_taken() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+    create_workspace(&db);
+    let _default_port_guard = occupy_default_start_port();
+
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket);
+
+    let active_status = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
+    let active_listen = active_status["runtime"]["listen_addr"]
+        .as_str()
+        .expect("active status should expose runtime.listen_addr")
+        .to_string();
+    let active_addr = active_listen
+        .parse::<std::net::SocketAddr>()
+        .expect("active listen addr should parse");
+    assert_ne!(
+        active_addr.port(),
+        4433,
+        "daemon should avoid the default port when it is already taken"
+    );
+
+    stop_daemon(&db, &mut daemon);
+}
+
+#[test]
 fn upnp_on_empty_daemon_works_without_workspace() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
@@ -931,6 +980,79 @@ fn create_workspace_on_running_daemon_activates_runtime() {
             .is_some(),
         "expected runtime.listen_addr in active state: {}",
         data
+    );
+
+    stop_daemon(&db, &mut daemon);
+}
+
+#[test]
+fn create_workspace_on_idle_daemon_uses_resolved_fallback_port_in_auto_invite() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+    let _default_port_guard = occupy_default_start_port();
+
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket);
+    let idle_status = wait_for_runtime_state(&socket, "IdleNoTenants", Duration::from_secs(10));
+    let idle_listen = idle_status["runtime"]["listen_addr"]
+        .as_str()
+        .expect("idle status should expose runtime.listen_addr")
+        .parse::<std::net::SocketAddr>()
+        .expect("idle listen addr should parse");
+    assert_ne!(
+        idle_listen.port(),
+        4433,
+        "daemon should select a non-default fallback port when 4433 is busy"
+    );
+
+    let out = Command::new(bin())
+        .args(["create-workspace", "--db", &db])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "create-workspace failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let invite_link = extract_invite_link(&String::from_utf8_lossy(&out.stdout));
+    let parsed =
+        topo::event_modules::workspace::invite_link::parse_invite_link(&invite_link).unwrap();
+    assert!(
+        !parsed.bootstrap_addrs.is_empty(),
+        "auto-invite should include bootstrap addresses"
+    );
+    let invite_ports: Vec<u16> = parsed
+        .bootstrap_addrs
+        .iter()
+        .map(|addr| {
+            addr.to_socket_addr()
+                .expect("bootstrap addr should resolve")
+                .port()
+        })
+        .collect();
+    assert!(
+        invite_ports.iter().all(|port| *port == idle_listen.port()),
+        "auto-invite should use resolved listen port {}; got {:?}",
+        idle_listen.port(),
+        invite_ports
+    );
+
+    let active_status = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
+    let active_listen = active_status["runtime"]["listen_addr"]
+        .as_str()
+        .expect("active status should expose runtime.listen_addr")
+        .parse::<std::net::SocketAddr>()
+        .expect("active listen addr should parse");
+    assert_eq!(
+        active_listen.port(),
+        idle_listen.port(),
+        "runtime activation should preserve the pre-resolved fallback port"
     );
 
     stop_daemon(&db, &mut daemon);

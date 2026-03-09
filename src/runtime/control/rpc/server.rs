@@ -5,6 +5,7 @@
 
 use std::collections::HashSet;
 use std::io::Write;
+use std::net::SocketAddr;
 use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
@@ -58,9 +59,10 @@ pub struct DaemonState {
     /// Runtime networking info (listen addr, UPnP result). Set once the
     /// QUIC endpoint is bound; UPnP result is populated while UPnP mode is enabled.
     pub runtime_net: RwLock<Option<NodeRuntimeNetInfo>>,
-    /// The daemon's resolved bind address, set early at daemon start before
-    /// any tenants exist.
-    pub bind_addr: RwLock<Option<std::net::SocketAddr>>,
+    /// The daemon's resolved bind address, set as soon as startup reserves the
+    /// UDP socket. This survives the idle-no-tenants phase before runtime
+    /// activation reports `runtime_net.listen_addr`.
+    pub resolved_bind_addr: RwLock<Option<SocketAddr>>,
     /// Whether runtime-managed UPnP mode is enabled for this daemon session.
     pub upnp_enabled: RwLock<bool>,
     /// Last UPnP mapping report for the active runtime session.
@@ -106,7 +108,7 @@ impl DaemonState {
             // Runtime manager owns lifecycle transitions.
             runtime_state: RwLock::new(RuntimeState::IdleNoTenants),
             runtime_net: RwLock::new(None),
-            bind_addr: RwLock::new(None),
+            resolved_bind_addr: RwLock::new(None),
             upnp_enabled: RwLock::new(false),
             upnp_result: RwLock::new(None),
             runtime_recheck: Notify::new(),
@@ -116,6 +118,19 @@ impl DaemonState {
 
     pub fn notify_runtime_recheck(&self) {
         self.runtime_recheck.notify_waiters();
+    }
+
+    fn runtime_listen_addr(&self) -> Option<SocketAddr> {
+        self.runtime_net
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|info| info.listen_addr.parse::<SocketAddr>().ok())
+    }
+
+    fn effective_listen_addr(&self) -> Option<SocketAddr> {
+        self.runtime_listen_addr()
+            .or_else(|| *self.resolved_bind_addr.read().unwrap())
     }
 
     fn require_active_peer(&self) -> Result<String, String> {
@@ -527,12 +542,8 @@ fn dispatch(
 
                     // Auto-create an invite with detected IPs
                     let listen_port = state
-                        .runtime_net
-                        .read()
-                        .unwrap()
-                        .as_ref()
-                        .and_then(|ni| ni.listen_addr.parse::<std::net::SocketAddr>().ok())
-                        .map(|sa| sa.port())
+                        .effective_listen_addr()
+                        .map(|addr| addr.port())
                         .unwrap_or(crate::event_modules::workspace::invite_link::DEFAULT_PORT);
                     let mut resp_json = serde_json::to_value(&resp).unwrap();
                     let bootstrap_addrs = autodetect_bootstrap_addrs(state, listen_port);
@@ -723,11 +734,11 @@ fn dispatch(
                 // block from early-bound listen addr and UPnP mode state so that
                 // `topo status` always shows networking info.
                 if json.get("runtime").is_none() {
-                    let bind = state.bind_addr.read().unwrap();
+                    let resolved_bind = state.resolved_bind_addr.read().unwrap();
                     let upnp = state.upnp_result.read().unwrap();
-                    if bind.is_some() || upnp.is_some() || upnp_enabled {
+                    if resolved_bind.is_some() || upnp.is_some() || upnp_enabled {
                         let mut rt = serde_json::Map::new();
-                        if let Some(addr) = *bind {
+                        if let Some(addr) = *resolved_bind {
                             rt.insert(
                                 "listen_addr".into(),
                                 serde_json::Value::String(addr.to_string()),
@@ -944,12 +955,8 @@ fn dispatch(
         } => match state.require_active_peer() {
             Ok(peer_id) => {
                 let listen_port = state
-                    .runtime_net
-                    .read()
-                    .unwrap()
-                    .as_ref()
-                    .and_then(|ni| ni.listen_addr.parse::<std::net::SocketAddr>().ok())
-                    .map(|sa| sa.port())
+                    .effective_listen_addr()
+                    .map(|addr| addr.port())
                     .unwrap_or(crate::event_modules::workspace::invite_link::DEFAULT_PORT);
                 let explicit_addrs: Vec<
                     crate::event_modules::workspace::invite_link::BootstrapAddress,
@@ -1073,12 +1080,8 @@ fn dispatch(
             match state.require_active_peer() {
                 Ok(peer_id) => {
                     let listen_port = state
-                        .runtime_net
-                        .read()
-                        .unwrap()
-                        .as_ref()
-                        .and_then(|ni| ni.listen_addr.parse::<std::net::SocketAddr>().ok())
-                        .map(|sa| sa.port())
+                        .effective_listen_addr()
+                        .map(|addr| addr.port())
                         .unwrap_or(crate::event_modules::workspace::invite_link::DEFAULT_PORT);
                     let explicit_addrs: Vec<crate::event_modules::workspace::invite_link::BootstrapAddress> =
                     match public_addr {
