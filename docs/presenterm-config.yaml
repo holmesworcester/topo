@@ -5,3 +5,4 @@ defaults:
 options:
   strict_front_matter_parsing: false
   end_slide_shorthand: true
+  command_prefix: "pt:"

@@ -1,6 +1,5 @@
 ---
 marp: true
-theme: default
 paginate: true
 size: 16:9
 title: Topo demo presentation
@@ -54,20 +53,6 @@ style: |
     background: transparent;
     color: #f2efe5;
   }
-
-  .drawback {
-    color: #fb4934;
-    font-weight: 700;
-  }
-
-  .answer {
-    color: #83a598;
-    font-weight: 700;
-  }
-
-  .muted {
-    color: #b8c0cc;
-  }
 ---
 
 <!-- _class: lead -->
@@ -80,6 +65,8 @@ style: |
 ---
 
 # Why make p2p apps practical and painless? 🤔
+
+<!-- pt:incremental_lists: true -->
 
 - A FOSS p2p Slack or Discord would be awesome
 - It would provide safety and resiliency to orgs we care about
@@ -96,6 +83,8 @@ Could this slog be much easier, or not a slog at all? Or is p2p just really #$%@
 
 # What makes p2p so #$%@ing hard? 😡
 
+<!-- pt:incremental_lists: true -->
+
 - Big laundry list of problems to solve (p2p, e2ee, sync, files, push etc.)
 - Solutions aren't generic; must fit product needs
 - Concurrency is hard to reason through
@@ -103,6 +92,8 @@ Could this slog be much easier, or not a slog at all? Or is p2p just really #$%@
 ---
 
 # Can't we just build on existing work? 😥
+
+<!-- pt:incremental_lists: true -->
 
 * There's BitTorrent, Git, libp2p, IPFS, SSB, Briar, Nostr, Signal, Tor...*Somebody* must have figured this stuff out! 
 * Right?
@@ -114,15 +105,19 @@ Could this slog be much easier, or not a slog at all? Or is p2p just really #$%@
 
 # Our experience with existing p2p tools 🫤
 
+<!-- pt:incremental_lists: true -->
+
 - They cover *some* of our laundry list / stack
 - But what they *do* cover is costly to adapt to product goals
 - And *uncovered* areas sprout concurrency problems, heisenbugs
 
-<span class="drawback">Result: easy features are super hard, hard features are out of reach.</span>
+<span style="color: #fb4934">Result: easy features are super hard, hard features are out of reach.</span>
 
 ---
 
 # Some concrete gripes with existing tools 😡
+
+<!-- pt:incremental_lists: true -->
 
 - Arbitrary dependencies block when you don't want to, not when you do
 - Mobile push notifications (e.g. the iOS NSE memory limit) not considered
@@ -135,6 +130,8 @@ Could this slog be much easier, or not a slog at all? Or is p2p just really #$%@
 # An observation 💡
 
 Given that:
+
+<!-- pt:incremental_lists: true -->
 
 * data, auth, syncing, and peering must be tailored to product needs
 * all p2p libraries (except perhaps libp2p) are at very early stages of maturity
@@ -150,12 +147,16 @@ Instead, maybe what you need is a **concurrency approach** covering the whole pr
 
 Topo covers:
 
+<!-- pt:incremental_lists: true -->
+
 - **All layers**: everything from networking to the local app API.
 - **Most contexts**: everything from iOS notification fetching to multi-tenant servers. (Soon the web, too.)
 
 ---
 
 # How Topo 🐭 manages concurrency
+
+<!-- pt:incremental_lists: true -->
 
 - All data (including files, who to connect to) is events
 - All state derived from the set of events
@@ -168,8 +169,9 @@ Topo covers:
 
 ---
 
-
 #  How Topo 🐭 makes backends simpler 
+
+<!-- pt:incremental_lists: true -->
 
 - No separate backend for iOS (uses SQLite to stay memory-bounded)
 - No separate backend for cloud: one endpoint can host many tenants
@@ -180,6 +182,8 @@ Topo covers:
 ---
 
 # How Topo 🐭 makes frontends simpler
+
+<!-- pt:incremental_lists: true -->
 
 - Projected SQLite tables give the data the shape it actually wants.
 - The API can answer complex queries like "give me a paginated message list with usernames, reactions, attachments, and download progress".
