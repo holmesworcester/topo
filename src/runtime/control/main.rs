@@ -3013,6 +3013,33 @@ fn short_id(b64: &str) -> &str {
 // event-tree / event-list helpers
 // ---------------------------------------------------------------------------
 
+fn event_type_note(type_name: &str) -> Option<&'static str> {
+    match type_name {
+        "workspace" => Some("creates the workspace"),
+        "invite_accepted" => Some("joins the workspace"),
+        "user_invite_shared" => Some("invites a user"),
+        "peer_invite_shared" => Some("invites a device"),
+        "user" => Some("registers the user"),
+        "peer_shared" => Some("registers a device"),
+        "admin" => Some("grants admin rights"),
+        "user_removed" => Some("removes a user"),
+        "peer_removed" => Some("removes a device"),
+        "key_secret" => Some("stores a local encryption key"),
+        "key_shared" => Some("shares an encryption key"),
+        "encrypted" => Some("encrypts an inner event"),
+        "message" => Some("sends a message"),
+        "reaction" => Some("reacts to a message"),
+        "message_deletion" => Some("deletes a message"),
+        "file" => Some("attaches a file"),
+        "file_slice" => Some("stores a file chunk"),
+        "tenant" => Some("creates local tenant identity"),
+        "peer_secret" => Some("stores a local signing key"),
+        "invite_secret" => Some("stores a local invite key"),
+        "bench_dep_perf_testing" => Some("perf test event"),
+        _ => None,
+    }
+}
+
 fn print_event_tree(events: &[service::EventListItem]) {
     use std::collections::{HashMap, HashSet};
 
@@ -3109,9 +3136,12 @@ fn print_tree_node(
         String::new()
     };
 
+    let note = event_type_note(&info.event_type)
+        .map(|n| format!(" \u{2014} {}", n))
+        .unwrap_or_default();
     println!(
-        "{}{}({}) {}{}",
-        prefix, connector, short, info.event_type, suffix
+        "{}{}({}) {}{}{}",
+        prefix, connector, short, info.event_type, note, suffix
     );
 
     if let Some(kids) = children.get(id) {
@@ -3202,7 +3232,10 @@ fn print_event_list(events: &[service::EventListItem]) {
             format!("  deps: {}", d)
         };
 
-        println!("{} {} {}  [{} bytes]", short, e.event_type, ts, e.blob_len);
+        let note = event_type_note(&e.event_type)
+            .map(|n| format!(" \u{2014} {}", n))
+            .unwrap_or_default();
+        println!("{} {}{} {}  [{} bytes]", short, e.event_type, note, ts, e.blob_len);
         if !deps_str.is_empty() {
             println!("{}", deps_str);
         }
@@ -3211,7 +3244,10 @@ fn print_event_list(events: &[service::EventListItem]) {
         }
 
         if let Some(dec) = &e.decrypted_inner {
-            println!("  --- decrypted: {} ---", dec.inner_type);
+            let inner_note = event_type_note(&dec.inner_type)
+                .map(|n| format!(" \u{2014} {}", n))
+                .unwrap_or_default();
+            println!("  --- decrypted: {}{} ---", dec.inner_type, inner_note);
             for (k, v) in &dec.fields {
                 println!("    {}: {}", k, v);
             }
