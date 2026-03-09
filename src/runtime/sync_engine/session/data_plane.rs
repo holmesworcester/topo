@@ -29,6 +29,10 @@ pub struct DataPlaneSendStats {
     pub bytes_sent_delta: u64,
 }
 
+fn should_capture_rx_event_link(blob: &[u8]) -> bool {
+    blob.first().copied() == Some(crate::event_modules::EVENT_TYPE_FILE_SLICE)
+}
+
 pub fn enqueue_pending_have_to_egress(
     egress: &EgressQueue<'_>,
     peer_id: &str,
@@ -155,8 +159,10 @@ where
                             bytes_received.fetch_add(blob.len() as u64, Ordering::Relaxed);
                             max_blob_size = max_blob_size.max(blob.len());
                             let event_id = hash_event(&blob);
-                            if let Some(capture) = &rx_capture {
-                                capture.record_event_id_b64(crate::crypto::event_id_to_base64(&event_id));
+                            if should_capture_rx_event_link(&blob) {
+                                if let Some(capture) = &rx_capture {
+                                    capture.record_event_id_b64(crate::crypto::event_id_to_base64(&event_id));
+                                }
                             }
                             if ingest_tx
                                 .send((event_id, blob, recorded_by.clone(), source_tag.clone()))
@@ -206,4 +212,29 @@ where
     });
 
     (shutdown_tx, data_done_rx, handle)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_capture_rx_event_link;
+
+    #[test]
+    fn should_capture_only_file_slice_events() {
+        assert!(should_capture_rx_event_link(&[
+            crate::event_modules::EVENT_TYPE_FILE_SLICE,
+            0,
+            1,
+        ]));
+        assert!(!should_capture_rx_event_link(&[
+            crate::event_modules::EVENT_TYPE_MESSAGE,
+            0,
+            1,
+        ]));
+        assert!(!should_capture_rx_event_link(&[
+            crate::event_modules::EVENT_TYPE_FILE,
+            0,
+            1,
+        ]));
+        assert!(!should_capture_rx_event_link(&[]));
+    }
 }
