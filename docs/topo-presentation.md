@@ -155,7 +155,7 @@ Is p2p just intrinsically #$%@ing hard? Or is all this slog totally avoidable an
 
 ---
 
-# Topo 🐭 is maybe a better way
+# Topo 🐭 proposes a better way
 
 Instead of providing lots of features for *parts* of the problem, it focuses on covering
 
