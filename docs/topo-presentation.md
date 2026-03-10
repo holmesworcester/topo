@@ -233,6 +233,16 @@ And hard stuff stays possible.
 
 Next, a demo 🐭
 
+---
+
+# Demo
+
+* Create, invite, message, react, attach a file
+* Link a device
+* Show event and sync logs
+* Show multitenancy in action
+
+
 <!-- Scraps
 
 # TL;DR:
