@@ -962,6 +962,28 @@ impl Peer {
             .expect("failed to create key_shared")
     }
 
+    /// Wrap this peer's content encryption key for an invite recipient.
+    ///
+    /// Must be called after the inviter has created at least one encrypted
+    /// message (so `ensure_content_key_for_peer` has run). Creates a KeyShared
+    /// event that the recipient can unwrap after syncing the invite_secret.
+    pub fn wrap_content_key_for_invite(
+        &self,
+        invite_key: &ed25519_dalek::SigningKey,
+        invite_event_id: &EventId,
+    ) {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        crate::event_modules::workspace::identity_ops::wrap_content_key_for_invite(
+            &db,
+            &self.identity,
+            self.signing_key(),
+            &self.signer_eid(),
+            invite_key,
+            invite_event_id,
+        )
+        .expect("failed to wrap content key for invite");
+    }
+
     /// Create multiple messages. Uses a transaction for speed at scale.
     /// Requires identity chain.
     pub fn batch_create_messages(&self, count: usize) {
@@ -1206,13 +1228,16 @@ impl Peer {
 
     /// Count stored message events from canonical `events` by event_type.
     /// Includes local and synced remote message events.
+    /// Counts both plaintext messages and encrypted(message) wrappers.
     pub fn stored_message_event_count(&self) -> i64 {
         let db = match open_count_connection(&self.db_path) {
             Some(db) => db,
             None => return -1,
         };
         db.query_row(
-            "SELECT COUNT(*) FROM events WHERE event_type = 'message'",
+            "SELECT COUNT(*) FROM events
+             WHERE event_type = 'message'
+                OR (event_type = 'encrypted' AND length(blob) > 41 AND substr(blob, 42, 1) = X'01')",
             [],
             |row| row.get(0),
         )
@@ -1293,6 +1318,7 @@ impl Peer {
 
     /// Count recorded events by `source` for a given event type.
     ///
+    /// Also counts encrypted wrappers whose inner_type_code matches.
     /// Uses `source LIKE '<prefix>%'` so callers can isolate transport-ingest
     /// rows (e.g. `quic_recv:`) from local-created rows.
     pub fn recorded_event_type_counts_by_source(
@@ -1302,24 +1328,42 @@ impl Peer {
     ) -> std::collections::BTreeMap<String, i64> {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let like = format!("{}%", source_prefix);
+        // Look up the type code for the requested event type so we can also
+        // match encrypted wrappers with a matching inner_type_code (byte 42).
+        let type_code_blob: Vec<u8> = {
+            let reg = crate::event_modules::registry();
+            let code = reg
+                .all_type_codes()
+                .into_iter()
+                .find(|&c| reg.lookup(c).map_or(false, |m| m.type_name == event_type));
+            match code {
+                Some(c) => vec![c],
+                None => vec![],
+            }
+        };
         let mut stmt = db
             .prepare(
                 "SELECT re.source, COUNT(*)
                    FROM recorded_events re
                    JOIN events e ON e.event_id = re.event_id
                   WHERE re.peer_id = ?1
-                    AND e.event_type = ?2
+                    AND (e.event_type = ?2
+                         OR (e.event_type = 'encrypted' AND length(e.blob) > 41
+                             AND substr(e.blob, 42, 1) = ?4))
                     AND re.source LIKE ?3
                GROUP BY re.source
                ORDER BY re.source",
             )
             .expect("prepare source histogram query");
 
-        stmt.query_map(rusqlite::params![&self.identity, event_type, like], |row| {
-            let source: String = row.get(0)?;
-            let count: i64 = row.get(1)?;
-            Ok((source, count))
-        })
+        stmt.query_map(
+            rusqlite::params![&self.identity, event_type, like, type_code_blob],
+            |row| {
+                let source: String = row.get(0)?;
+                let count: i64 = row.get(1)?;
+                Ok((source, count))
+            },
+        )
         .expect("query source histogram")
         .collect::<Result<std::collections::BTreeMap<_, _>, _>>()
         .expect("collect source histogram")

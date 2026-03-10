@@ -69,6 +69,7 @@ pub fn file_slice_event_counts_by_source(
              JOIN recorded_events re
                ON e.event_id = re.event_id AND re.peer_id = ?1
              WHERE e.event_type = 'file_slice'
+                OR (e.event_type = 'encrypted' AND length(e.blob) > 41 AND substr(e.blob, 42, 1) = X'19')
              GROUP BY re.source",
         )
         .expect("failed to prepare file_slice_event_counts_by_source");
@@ -85,7 +86,8 @@ pub fn file_slice_event_count(conn: &Connection, recorded_by: &str) -> i64 {
     conn.query_row(
         "SELECT COUNT(*) FROM events e
          JOIN recorded_events re ON e.event_id = re.event_id AND re.peer_id = ?1
-         WHERE e.event_type = 'file_slice'",
+         WHERE e.event_type = 'file_slice'
+            OR (e.event_type = 'encrypted' AND length(e.blob) > 41 AND substr(e.blob, 42, 1) = X'19')",
         rusqlite::params![recorded_by],
         |row| row.get(0),
     )
