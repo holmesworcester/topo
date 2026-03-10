@@ -162,21 +162,6 @@ enum Commands {
         action: Option<TenantAction>,
     },
 
-    /// Deprecated: use `topo tenant list`
-    #[command(name = "tenants", hide = true)]
-    DeprecatedTenants,
-
-    /// Deprecated: use `topo tenant use <N>`
-    #[command(name = "use-tenant", hide = true)]
-    DeprecatedUseTenant {
-        /// Tenant number (1-based)
-        index: usize,
-    },
-
-    /// Deprecated: use `topo tenant active`
-    #[command(name = "active-tenant", hide = true)]
-    DeprecatedActiveTenant,
-
     /// Print local transport identity — SPKI fingerprint from TLS cert
     #[command(name = "transport-identity")]
     TransportIdentity,
@@ -328,14 +313,6 @@ enum Commands {
         action: EventAction,
     },
 
-    /// Deprecated: use `topo event tree`
-    #[command(name = "event-tree", hide = true)]
-    DeprecatedEventTree,
-
-    /// Deprecated: use `topo event list`
-    #[command(name = "event-list", hide = true)]
-    DeprecatedEventList,
-
     /// Send intro offers to two peers so they can hole-punch a direct connection
     Intro {
         /// Peer A hex SPKI fingerprint
@@ -424,98 +401,6 @@ enum Commands {
         action: Option<SubAction>,
     },
 
-    /// Deprecated: use `topo sub create`
-    #[command(name = "sub-create", hide = true)]
-    SubCreate {
-        /// Subscription name
-        #[arg(long)]
-        name: String,
-        /// Event type to subscribe to (e.g. "message")
-        #[arg(long)]
-        event_type: String,
-        /// Delivery mode: full|id|has_changed
-        #[arg(long, default_value = "full")]
-        delivery: String,
-        /// Since timestamp (ms) — only match events after this time
-        #[arg(long)]
-        since_ms: Option<u64>,
-        /// Since event ID — only match events after this cursor
-        #[arg(long)]
-        since_event_id: Option<String>,
-        /// JSON spec (overrides --since-ms/--since-event-id if provided)
-        #[arg(long)]
-        spec: Option<String>,
-    },
-
-    /// Deprecated: use `topo sub list`
-    #[command(name = "sub-list", hide = true)]
-    SubList,
-
-    /// Deprecated: use `topo sub poll`
-    #[command(name = "sub-poll", hide = true)]
-    SubPoll {
-        /// Subscription selector: id, name, or index (#N / N)
-        sub: Option<String>,
-        /// Deprecated: use positional selector instead.
-        #[arg(long = "sub", hide = true)]
-        sub_flag: Option<String>,
-        /// Only return items after this seq (exclusive)
-        #[arg(long, default_value = "0")]
-        after_seq: i64,
-        /// Max items to return
-        #[arg(long, default_value = "50")]
-        limit: usize,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Deprecated: use `topo sub state`
-    #[command(name = "sub-state", hide = true)]
-    SubState {
-        /// Subscription selector: id, name, or index (#N / N)
-        sub: Option<String>,
-        /// Deprecated: use positional selector instead.
-        #[arg(long = "sub", hide = true)]
-        sub_flag: Option<String>,
-        /// Output as JSON
-        #[arg(long)]
-        json: bool,
-    },
-
-    /// Deprecated: use `topo sub ack`
-    #[command(name = "sub-ack", hide = true)]
-    SubAck {
-        /// Subscription selector: id, name, or index (#N / N)
-        sub: Option<String>,
-        /// Deprecated: use positional selector instead.
-        #[arg(long = "sub", hide = true)]
-        sub_flag: Option<String>,
-        /// Acknowledge through this seq (inclusive)
-        #[arg(long)]
-        through_seq: i64,
-    },
-
-    /// Deprecated: use `topo sub disable`
-    #[command(name = "sub-disable", hide = true)]
-    SubDisable {
-        /// Subscription selector: id, name, or index (#N / N)
-        sub: Option<String>,
-        /// Deprecated: use positional selector instead.
-        #[arg(long = "sub", hide = true)]
-        sub_flag: Option<String>,
-    },
-
-    /// Deprecated: use `topo sub enable`
-    #[command(name = "sub-enable", hide = true)]
-    SubEnable {
-        /// Subscription selector: id, name, or index (#N / N)
-        sub: Option<String>,
-        /// Deprecated: use positional selector instead.
-        #[arg(long = "sub", hide = true)]
-        sub_flag: Option<String>,
-    },
-
     /// Sync log management (show, tree, enable, disable, config)
     #[command(
         name = "sync-log",
@@ -536,36 +421,6 @@ enum Commands {
         all: bool,
         #[command(subcommand)]
         action: Option<SyncLogAction>,
-    },
-
-    /// Deprecated: use `topo sync-log enable`
-    #[command(name = "sync-log-enable", hide = true)]
-    DeprecatedSyncLogEnable {
-        #[arg(long, default_value_t = false)]
-        all_runs: bool,
-        #[arg(long, default_value_t = false)]
-        capture_full_ids: bool,
-    },
-
-    /// Deprecated: use `topo sync-log disable`
-    #[command(name = "sync-log-disable", hide = true)]
-    DeprecatedSyncLogDisable,
-
-    /// Deprecated: use `topo sync-log config`
-    #[command(name = "sync-log-config", hide = true)]
-    DeprecatedSyncLogConfig,
-
-    /// Deprecated: use `topo sync-log tree`
-    #[command(name = "sync-log-tree", hide = true)]
-    DeprecatedSyncLogTree {
-        #[arg(long, default_value = "5")]
-        limit: usize,
-        #[arg(long)]
-        run: Option<i64>,
-        #[arg(long)]
-        peer: Option<String>,
-        #[arg(long)]
-        all: bool,
     },
 
     /// Raw RPC demo surface: list methods, describe parameters, submit raw JSON calls
@@ -2250,21 +2105,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             run_tenant_action(db, socket_override.as_deref(), action)?;
         }
 
-        Commands::DeprecatedTenants => {
-            eprintln!("warning: `topo tenants` is deprecated; use `topo tenant list`");
-            run_tenant_action(db, socket_override.as_deref(), TenantAction::List)?;
-        }
-
-        Commands::DeprecatedUseTenant { index } => {
-            eprintln!("warning: `topo use-tenant` is deprecated; use `topo tenant use <N>`");
-            run_tenant_action(db, socket_override.as_deref(), TenantAction::Use { index })?;
-        }
-
-        Commands::DeprecatedActiveTenant => {
-            eprintln!("warning: `topo active-tenant` is deprecated; use `topo tenant active`");
-            run_tenant_action(db, socket_override.as_deref(), TenantAction::Active)?;
-        }
-
         Commands::TransportIdentity => {
             let data =
                 rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::TransportIdentity)?;
@@ -2708,16 +2548,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             run_event_action(db, socket_override.as_deref(), action)?;
         }
 
-        Commands::DeprecatedEventTree => {
-            eprintln!("warning: `topo event-tree` is deprecated; use `topo event tree`");
-            run_event_action(db, socket_override.as_deref(), EventAction::Tree)?;
-        }
-
-        Commands::DeprecatedEventList => {
-            eprintln!("warning: `topo event-list` is deprecated; use `topo event list`");
-            run_event_action(db, socket_override.as_deref(), EventAction::List)?;
-        }
-
         Commands::Intro {
             peer_a,
             peer_b,
@@ -2913,100 +2743,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let action = action.unwrap_or(SubAction::List);
             run_sub_action(db, socket_override.as_deref(), action)?;
         }
-        Commands::SubCreate {
-            name,
-            event_type,
-            delivery,
-            since_ms,
-            since_event_id,
-            spec,
-        } => {
-            eprintln!("warning: `topo sub-create` is deprecated; use `topo sub create`");
-            run_sub_action(
-                db,
-                socket_override.as_deref(),
-                SubAction::Create {
-                    name,
-                    event_type,
-                    delivery,
-                    since_ms,
-                    since_event_id,
-                    spec,
-                },
-            )?;
-        }
-        Commands::SubList => {
-            eprintln!("warning: `topo sub-list` is deprecated; use `topo sub list`");
-            run_sub_action(db, socket_override.as_deref(), SubAction::List)?;
-        }
-        Commands::SubPoll {
-            sub,
-            sub_flag,
-            after_seq,
-            limit,
-            json,
-        } => {
-            eprintln!("warning: `topo sub-poll` is deprecated; use `topo sub poll`");
-            run_sub_action(
-                db,
-                socket_override.as_deref(),
-                SubAction::Poll {
-                    sub,
-                    sub_flag,
-                    after_seq,
-                    limit,
-                    json,
-                },
-            )?;
-        }
-        Commands::SubState {
-            sub,
-            sub_flag,
-            json,
-        } => {
-            eprintln!("warning: `topo sub-state` is deprecated; use `topo sub state`");
-            run_sub_action(
-                db,
-                socket_override.as_deref(),
-                SubAction::State {
-                    sub,
-                    sub_flag,
-                    json,
-                },
-            )?;
-        }
-        Commands::SubAck {
-            sub,
-            sub_flag,
-            through_seq,
-        } => {
-            eprintln!("warning: `topo sub-ack` is deprecated; use `topo sub ack`");
-            run_sub_action(
-                db,
-                socket_override.as_deref(),
-                SubAction::Ack {
-                    sub,
-                    sub_flag,
-                    through_seq,
-                },
-            )?;
-        }
-        Commands::SubDisable { sub, sub_flag } => {
-            eprintln!("warning: `topo sub-disable` is deprecated; use `topo sub disable`");
-            run_sub_action(
-                db,
-                socket_override.as_deref(),
-                SubAction::Disable { sub, sub_flag },
-            )?;
-        }
-        Commands::SubEnable { sub, sub_flag } => {
-            eprintln!("warning: `topo sub-enable` is deprecated; use `topo sub enable`");
-            run_sub_action(
-                db,
-                socket_override.as_deref(),
-                SubAction::Enable { sub, sub_flag },
-            )?;
-        }
 
         Commands::SyncLog {
             limit,
@@ -3022,50 +2758,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 all,
             });
             run_sync_log_action(db, action)?;
-        }
-
-        Commands::DeprecatedSyncLogEnable {
-            all_runs,
-            capture_full_ids,
-        } => {
-            eprintln!("warning: `topo sync-log-enable` is deprecated; use `topo sync-log enable`");
-            run_sync_log_action(
-                db,
-                SyncLogAction::Enable {
-                    all_runs,
-                    capture_full_ids,
-                },
-            )?;
-        }
-
-        Commands::DeprecatedSyncLogDisable => {
-            eprintln!(
-                "warning: `topo sync-log-disable` is deprecated; use `topo sync-log disable`"
-            );
-            run_sync_log_action(db, SyncLogAction::Disable)?;
-        }
-
-        Commands::DeprecatedSyncLogConfig => {
-            eprintln!("warning: `topo sync-log-config` is deprecated; use `topo sync-log config`");
-            run_sync_log_action(db, SyncLogAction::Config)?;
-        }
-
-        Commands::DeprecatedSyncLogTree {
-            limit,
-            run,
-            peer,
-            all,
-        } => {
-            eprintln!("warning: `topo sync-log-tree` is deprecated; use `topo sync-log tree`");
-            run_sync_log_action(
-                db,
-                SyncLogAction::Tree {
-                    limit,
-                    run,
-                    peer,
-                    all,
-                },
-            )?;
         }
 
         // ---------------------------------------------------------------
