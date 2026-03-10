@@ -2146,7 +2146,8 @@ fn test_encrypted_identity_event_rejects() {
     match result {
         ProjectionDecision::Reject { reason } => {
             assert!(
-                reason.contains("not admissible inside encrypted wrappers"),
+                reason.contains("not admissible inside encrypted wrappers")
+                    || reason.contains("plaintext-only"),
                 "reason: {}",
                 reason
             );

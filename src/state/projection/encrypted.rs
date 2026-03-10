@@ -6,6 +6,7 @@ use crate::crypto::event_id_to_base64;
 pub use crate::crypto::{
     decrypt_event_blob, encrypt_event_blob, unwrap_key_from_sender, wrap_key_for_recipient,
 };
+use crate::event_modules::registry::TransportPrivacy;
 use crate::event_modules::{
     self as events, EncryptedEvent, ParsedEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_FILE_SLICE,
 };
@@ -111,7 +112,18 @@ pub fn project_encrypted(
     let inner_code = inner_parsed.event_type_code();
     let inner_meta = events::registry().lookup(inner_code);
     match inner_meta {
-        Some(m) if m.encryptable => {}
+        Some(m) if m.encryptable && m.transport_privacy != TransportPrivacy::PlaintextOnly => {}
+        Some(m) if m.transport_privacy == TransportPrivacy::PlaintextOnly => {
+            return Ok((
+                ProjectionDecision::Reject {
+                    reason: format!(
+                        "event type {} is plaintext-only and must not be wrapped in encrypted",
+                        inner_code
+                    ),
+                },
+                None,
+            ));
+        }
         _ => {
             return Ok((
                 ProjectionDecision::Reject {
