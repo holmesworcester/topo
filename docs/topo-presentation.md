@@ -191,7 +191,7 @@ Instead of providing lots of features for *parts* of the problem, it focuses on 
 
 ---
 
-# How Topo 🐭 manages concurrency
+# Topo 🐭 tames concurrency
 
 <!-- pt:incremental_lists: true -->
 
