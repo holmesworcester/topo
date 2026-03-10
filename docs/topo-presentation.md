@@ -264,7 +264,7 @@ Instead, maybe what you need is a **concurrency approach** covering the whole pr
 
 # Performance Benchmarks
 
-** Scores are from a fast desktop (AMD Ryzen AI MAX+ 395 (16c/32t) · 122 GiB RAM · SQLite WAL · Rust `--release`)
+(All scores are from a fast desktop: AMD Ryzen AI MAX+ 395 (16c/32t) · 122 GiB RAM · SQLite WAL · Rust `--release`)
 
 ---
 
@@ -315,7 +315,7 @@ What happens when each event depends on a max (10) prior events and they are pro
 
 ---
 
-# Low-Memory Topo Cascade (10k, `LOW_MEM_IOS=1`)
+# Low-Memory Topo Cascade (10k)
 
 Same worst-case cascade as above, but with iOS NSE memory pragmas (256 KiB SQLite cache, `temp_store=FILE`, `mmap_size=0`).
 
@@ -325,7 +325,6 @@ Same worst-case cascade as above, but with iOS NSE memory pragmas (256 KiB SQLit
 
 - Same throughput as normal mode (~7-8k ev/s) — cascade is CPU-bound, not cache-bound
 - Peak RSS 9.6 MiB — well under the 24 MiB iOS NSE budget
-- Worst-case projection workload is iOS-safe without further tuning
 
 ---
 
@@ -347,13 +346,11 @@ Per-daemon VmHWM measured via lowmem delta harness.
 
 <!-- _class: lead -->
 
-# Appendix: Code Walkthrough
-
-Follow one message from CLI command to sync, projection, and query output.
+# Code Walkthrough
 
 ---
 
-# Walkthrough: Repo Layout
+# Repo Layout
 
 ```text
 src/runtime/control/      CLI entrypoint + daemon RPC
@@ -370,7 +367,7 @@ tests/                    projector, sync, CLI/e2e checks
 
 ---
 
-# Walkthrough: Local Send Path
+# Local Send Path
 
 - `src/runtime/control/main.rs`: `topo send` turns into `RpcMethod::Send`
 - `src/runtime/control/rpc/server.rs`: daemon dispatch calls `message::send_for_peer`
@@ -389,7 +386,7 @@ topo send "hello"
 
 ---
 
-# Walkthrough: Projection + Query Path
+# Projection + Query Path
 
 - `src/state/projection/apply/project_one.rs`: single canonical projection entrypoint
 - `src/event_modules/registry.rs`: lookup parser, projector, share scope, and context loader by event type
@@ -409,7 +406,7 @@ events blob
 
 ---
 
-# Walkthrough: Runtime + Sync Path
+# Runtime + Sync Path
 
 - `src/runtime/peering/engine/supervisor.rs`: owns accept loop, target dispatcher, and shared ingest writer
 - `src/runtime/transport/peering_boundary.rs`: transport boundary around QUIC sessions and trust checks
