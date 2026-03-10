@@ -233,6 +233,17 @@ And hard stuff stays possible.
 
 Next, a demo 🐭
 
+---
+
+# Demo
+
+* Create, invite, message, react, attach a file 
+* Show how events and sync work
+* 
+* Send messages
+* React
+* Send a file
+
 <!-- Scraps
 
 # TL;DR:
