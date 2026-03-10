@@ -98,14 +98,18 @@ pub fn create_runtime_endpoint_for_tenants(
     bind_addr: SocketAddr,
     cert_resolver: Arc<WorkspaceCertResolver>,
     db_path: &str,
-    tenant_peer_ids: Vec<String>,
     default_client_cert: CertificateDer<'static>,
     default_client_key: PrivatePkcs8KeyDer<'static>,
 ) -> Result<TransportEndpoint, Box<dyn std::error::Error + Send + Sync>> {
     let db_path = db_path.to_string();
+    // Dynamic allow: queries DB for current tenant set on every TLS handshake.
+    // No frozen tenant list — new tenants are picked up automatically after
+    // their transport creds and invite_accepted rows are projected.
     let dynamic_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
-        for tenant_id in &tenant_peer_ids {
-            if tenant_trusts_peer(&db_path, tenant_id, *peer_fp)? {
+        let db = open_connection(&db_path)?;
+        let tenants = discover_local_tenants(&db)?;
+        for tenant in &tenants {
+            if is_peer_allowed(&db, &tenant.peer_id, peer_fp)? {
                 return Ok(true);
             }
         }

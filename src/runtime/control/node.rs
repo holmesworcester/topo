@@ -7,6 +7,8 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::transport::multi_workspace::WorkspaceCertResolver;
+
 pub use crate::peering::runtime::NodeRuntimeNetInfo;
 
 pub async fn run_node(
@@ -14,6 +16,7 @@ pub async fn run_node(
     bind: SocketAddr,
     net_info_tx: tokio::sync::oneshot::Sender<NodeRuntimeNetInfo>,
     shutdown_notify: Arc<tokio::sync::Notify>,
+    cert_resolver: Arc<WorkspaceCertResolver>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     use crate::contracts::event_pipeline_contract::IngestFns;
     crate::peering::runtime::run_node(
@@ -26,6 +29,7 @@ pub async fn run_node(
             batch_writer: crate::event_pipeline::batch_writer,
             drain_queue: crate::event_pipeline::drain_project_queue,
         },
+        cert_resolver,
     )
     .await
 }

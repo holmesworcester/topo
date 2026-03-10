@@ -8,23 +8,27 @@ use rustls::server::{ClientHello, ResolvesServerCert};
 use rustls::sign::CertifiedKey;
 use std::collections::HashMap;
 use std::fmt;
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 use crate::crypto::event_id_from_base64;
 
 /// Map workspace SNI → CertifiedKey for per-connection cert selection.
+///
+/// Uses interior mutability (`RwLock`) so new tenants can be registered
+/// at runtime without recreating the QUIC endpoint or rebinding the socket.
 pub struct WorkspaceCertResolver {
     /// SNI hostname → CertifiedKey
-    certs: HashMap<String, Arc<CertifiedKey>>,
+    certs: RwLock<HashMap<String, Arc<CertifiedKey>>>,
     /// Fallback cert when no SNI is provided.
-    fallback: Option<Arc<CertifiedKey>>,
+    fallback: RwLock<Option<Arc<CertifiedKey>>>,
 }
 
 impl fmt::Debug for WorkspaceCertResolver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let certs = self.certs.read().unwrap();
         f.debug_struct("WorkspaceCertResolver")
-            .field("workspaces", &self.certs.keys().collect::<Vec<_>>())
-            .field("has_fallback", &self.fallback.is_some())
+            .field("workspaces", &certs.keys().collect::<Vec<_>>())
+            .field("has_fallback", &self.fallback.read().unwrap().is_some())
             .finish()
     }
 }
@@ -33,38 +37,43 @@ impl WorkspaceCertResolver {
     /// Create a new resolver.
     pub fn new() -> Self {
         Self {
-            certs: HashMap::new(),
-            fallback: None,
+            certs: RwLock::new(HashMap::new()),
+            fallback: RwLock::new(None),
         }
     }
 
     /// Register a workspace's cert+key for the given SNI hostname.
-    pub fn add(&mut self, sni: String, certified_key: Arc<CertifiedKey>) {
-        if self.fallback.is_none() {
-            self.fallback = Some(certified_key.clone());
+    ///
+    /// Safe to call while the endpoint is running — takes a write lock
+    /// for the duration of the insert (sub-microsecond).
+    pub fn add(&self, sni: String, certified_key: Arc<CertifiedKey>) {
+        let mut fallback = self.fallback.write().unwrap();
+        if fallback.is_none() {
+            *fallback = Some(certified_key.clone());
         }
-        self.certs.insert(sni, certified_key);
+        drop(fallback);
+        self.certs.write().unwrap().insert(sni, certified_key);
     }
 
     /// Number of registered workspaces.
     pub fn len(&self) -> usize {
-        self.certs.len()
+        self.certs.read().unwrap().len()
     }
 
     pub fn is_empty(&self) -> bool {
-        self.certs.is_empty()
+        self.certs.read().unwrap().is_empty()
     }
 }
 
 impl ResolvesServerCert for WorkspaceCertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         if let Some(sni) = client_hello.server_name() {
-            if let Some(ck) = self.certs.get(sni) {
+            if let Some(ck) = self.certs.read().unwrap().get(sni) {
                 return Some(ck.clone());
             }
         }
         // Fallback for clients that do not send workspace-specific SNI.
-        self.fallback.clone()
+        self.fallback.read().unwrap().clone()
     }
 }
 
@@ -110,7 +119,7 @@ mod tests {
     fn test_resolver_selects_by_sni() {
         let provider = rustls::crypto::ring::default_provider();
 
-        let mut resolver = WorkspaceCertResolver::new();
+        let resolver = WorkspaceCertResolver::new();
 
         // Generate two workspace certs
         let (cert1, key1) = crate::transport::generate_self_signed_cert().unwrap();

@@ -207,15 +207,30 @@ Instead of providing lots of features for *parts* of the problem, it focuses on 
 # Walkthrough: Runtime Main Loop
 
 ```text
-Control --> Setup --> Supervisor --> Transport --> Sync Engine
-   |           |                        ^             |
-   |           +------> Event Pipeline -+-------------+
-   |                        |
-   +------------------------+
-                            v
-                      Projection State
-                            |
-                            +--> trust rows --> Transport
+                    +----------------------+
+                    |   CLI / RPC Control  |
+                    +----+------------+----+
+                         |            |
+             local cmds / queries     | start daemon
+                         |            v
+                         |      +-----------+
+                         |      |  Startup  |
+                         |      +-----+-----+
+                         |            |
+                         |            v
+                         |      +-----------+
+                         |      |Supervisor |
+                         |      +--+-----+--+
+                         |         |     |
+                         |         |     +------> Transport
+                         |         |                ^
+                         |         v                |
+                         |    Sync Sessions --------+
+                         |         |
+                         |         v
+                         +--> Event Pipeline --> Projection / DB State
+                                                    |
+                                                    +--> trust / tenant SQL --> Transport
 ```
 ---
 

@@ -1219,6 +1219,8 @@ struct ManagedRuntime {
     tenant_states: Vec<RuntimeTenantState>,
     shutdown_notify: Arc<tokio::sync::Notify>,
     handle: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    /// Shared cert resolver — new tenants can be registered without restart.
+    cert_resolver: Arc<topo::transport::multi_workspace::WorkspaceCertResolver>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -1246,10 +1248,82 @@ fn discover_runtime_tenant_states(
     Ok(tenants)
 }
 
-fn same_runtime_tenant_peer_ids(a: &[RuntimeTenantState], b: &[RuntimeTenantState]) -> bool {
-    a.iter()
-        .map(|tenant| &tenant.peer_id)
-        .eq(b.iter().map(|tenant| &tenant.peer_id))
+enum TenantChangeKind {
+    NoChange,
+    NeedsFreshStart,
+    /// New tenants added but all existing tenants unchanged — can register
+    /// new certs on the live endpoint without restart.
+    NewTenantsAdded {
+        new_tenants: Vec<RuntimeTenantState>,
+    },
+    /// An existing tenant's transport identity changed — must restart.
+    TransportIdentityChanged,
+}
+
+fn classify_tenant_change(
+    old: &[RuntimeTenantState],
+    new: &[RuntimeTenantState],
+) -> TenantChangeKind {
+    use std::collections::HashMap;
+    let old_map: HashMap<&str, &RuntimeTenantState> =
+        old.iter().map(|t| (t.peer_id.as_str(), t)).collect();
+
+    let mut new_tenants = Vec::new();
+    for t in new {
+        match old_map.get(t.peer_id.as_str()) {
+            Some(old_t) => {
+                if old_t.transport_peer_id != t.transport_peer_id {
+                    return TenantChangeKind::TransportIdentityChanged;
+                }
+            }
+            None => new_tenants.push(t.clone()),
+        }
+    }
+
+    if new_tenants.is_empty() {
+        // Tenants were removed (old has entries not in new).
+        // Treat as needing restart for safety.
+        if old.len() != new.len() {
+            TenantChangeKind::TransportIdentityChanged
+        } else {
+            TenantChangeKind::NoChange
+        }
+    } else {
+        TenantChangeKind::NewTenantsAdded { new_tenants }
+    }
+}
+
+fn register_new_tenant_certs(
+    db_path: &str,
+    new_tenants: &[RuntimeTenantState],
+    resolver: &topo::transport::multi_workspace::WorkspaceCertResolver,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let conn = open_connection(db_path)?;
+    let all_tenants = discover_local_tenants(&conn)?;
+    let provider = rustls::crypto::ring::default_provider();
+
+    for new_state in new_tenants {
+        let tenant = all_tenants
+            .iter()
+            .find(|t| t.peer_id == new_state.peer_id)
+            .ok_or_else(|| format!("new tenant {} not found in DB", new_state.peer_id))?;
+
+        let cert_der = rustls::pki_types::CertificateDer::from(tenant.cert_der.clone());
+        let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(tenant.key_der.clone());
+        let ck = rustls::sign::CertifiedKey::from_der(
+            vec![cert_der],
+            key_der.into(),
+            &provider,
+        )?;
+        let sni = topo::transport::multi_workspace::workspace_sni(&tenant.workspace_id);
+        resolver.add(sni.clone(), std::sync::Arc::new(ck));
+        tracing::info!(
+            "registered new tenant {} cert on live endpoint (sni={})",
+            &new_state.peer_id[..16.min(new_state.peer_id.len())],
+            sni,
+        );
+    }
+    Ok(())
 }
 
 async fn stop_runtime(runtime: ManagedRuntime) {
@@ -1347,6 +1421,11 @@ fn spawn_runtime(
     let runtime_shutdown_for_task = runtime_shutdown.clone();
     let db_for_task = db_path.to_string();
 
+    // Create resolver here so the runtime manager retains a handle for
+    // incremental tenant registration (no restart needed for new tenants).
+    let cert_resolver = Arc::new(topo::transport::multi_workspace::WorkspaceCertResolver::new());
+    let resolver_for_task = cert_resolver.clone();
+
     let (net_tx, net_rx) = tokio::sync::oneshot::channel::<topo::node::NodeRuntimeNetInfo>();
     let state_for_net = state.clone();
     tokio::spawn(async move {
@@ -1367,13 +1446,14 @@ fn spawn_runtime(
     });
 
     let handle = tokio::spawn(async move {
-        topo::node::run_node(&db_for_task, bind, net_tx, runtime_shutdown_for_task).await
+        topo::node::run_node(&db_for_task, bind, net_tx, runtime_shutdown_for_task, resolver_for_task).await
     });
 
     ManagedRuntime {
         tenant_states,
         shutdown_notify: runtime_shutdown,
         handle,
+        cert_resolver,
     }
 }
 
@@ -1449,34 +1529,58 @@ async fn reevaluate_runtime(
         return Ok(());
     }
 
-    let restart_needed = match active_runtime.as_ref() {
-        Some(runtime) => runtime.tenant_states != tenant_states,
-        None => true,
+    let change_kind = match active_runtime.as_ref() {
+        None => TenantChangeKind::NeedsFreshStart,
+        Some(runtime) if runtime.tenant_states == tenant_states => TenantChangeKind::NoChange,
+        Some(runtime) => classify_tenant_change(&runtime.tenant_states, &tenant_states),
     };
-    if restart_needed {
-        let transport_state_changed = active_runtime
-            .as_ref()
-            .map(|runtime| {
-                same_runtime_tenant_peer_ids(&runtime.tenant_states, &tenant_states)
-                    && runtime.tenant_states != tenant_states
-            })
-            .unwrap_or(false);
-        if let Some(runtime) = active_runtime.take() {
-            stop_runtime(runtime).await;
-        }
-        let _ = idle_bind_reservation.take();
-        if transport_state_changed {
-            tracing::info!(
-                "restarting peering runtime after tenant transport identity change ({} tenant(s))",
-                tenant_states.len()
-            );
-        } else {
+
+    match change_kind {
+        TenantChangeKind::NoChange => {}
+        TenantChangeKind::NeedsFreshStart => {
+            if let Some(runtime) = active_runtime.take() {
+                stop_runtime(runtime).await;
+            }
+            let _ = idle_bind_reservation.take();
             tracing::info!(
                 "activating peering runtime ({} tenant(s))",
                 tenant_states.len()
             );
+            *active_runtime = Some(spawn_runtime(db_path, bind, state, tenant_states));
         }
-        *active_runtime = Some(spawn_runtime(db_path, bind, state, tenant_states));
+        TenantChangeKind::NewTenantsAdded { new_tenants } => {
+            // Register new tenant certs with the live resolver — no restart.
+            let runtime = active_runtime.as_mut().unwrap();
+            if let Err(e) = register_new_tenant_certs(db_path, &new_tenants, &runtime.cert_resolver)
+            {
+                tracing::warn!(
+                    "failed to register new tenant certs, falling back to restart: {}",
+                    e
+                );
+                let runtime = active_runtime.take().unwrap();
+                stop_runtime(runtime).await;
+                let _ = idle_bind_reservation.take();
+                *active_runtime = Some(spawn_runtime(db_path, bind, state, tenant_states));
+                return Ok(());
+            }
+            tracing::info!(
+                "registered {} new tenant(s) on live endpoint (now {} total)",
+                new_tenants.len(),
+                tenant_states.len()
+            );
+            runtime.tenant_states = tenant_states;
+        }
+        TenantChangeKind::TransportIdentityChanged => {
+            if let Some(runtime) = active_runtime.take() {
+                stop_runtime(runtime).await;
+            }
+            let _ = idle_bind_reservation.take();
+            tracing::info!(
+                "restarting peering runtime after tenant transport identity change ({} tenant(s))",
+                tenant_states.len()
+            );
+            *active_runtime = Some(spawn_runtime(db_path, bind, state, tenant_states));
+        }
     }
 
     Ok(())

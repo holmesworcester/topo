@@ -2099,3 +2099,280 @@ fn rpc_call_stdin_input() {
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
     assert!(parsed["ok"].as_bool().unwrap_or(false), "should be ok=true");
 }
+
+// ---------------------------------------------------------------------------
+// Dynamic tenant registration (no-restart) tests
+// ---------------------------------------------------------------------------
+
+/// Regression test: creating a second workspace on a running daemon must not
+/// crash with EADDRINUSE. Before the fix, `reevaluate_runtime` tore down the
+/// entire QUIC runtime and raced to rebind the same UDP port.
+#[test]
+fn create_second_workspace_on_running_daemon_does_not_crash() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    // Start daemon idle, create first workspace, wait for Active.
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket);
+    let _ = wait_for_runtime_state(&socket, "IdleNoTenants", Duration::from_secs(10));
+
+    let out1 = Command::new(bin())
+        .args(["create-workspace", "--db", &db])
+        .output()
+        .unwrap();
+    assert!(
+        out1.status.success(),
+        "first create-workspace failed: {}",
+        String::from_utf8_lossy(&out1.stderr)
+    );
+    let _ = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
+
+    // Create second workspace — this used to crash with EADDRINUSE.
+    let out2 = Command::new(bin())
+        .args(["create-workspace", "--db", &db])
+        .output()
+        .unwrap();
+    assert!(
+        out2.status.success(),
+        "second create-workspace should not crash: stdout={} stderr={}",
+        String::from_utf8_lossy(&out2.stdout),
+        String::from_utf8_lossy(&out2.stderr)
+    );
+
+    // Daemon must still be alive and Active (no restart).
+    let data = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
+    assert!(
+        data.get("runtime")
+            .and_then(|rt| rt.get("listen_addr"))
+            .and_then(|v| v.as_str())
+            .is_some(),
+        "daemon should still be Active after second create-workspace: {}",
+        data
+    );
+
+    // Verify daemon process didn't exit.
+    assert!(
+        daemon.child().try_wait().unwrap().is_none(),
+        "daemon should not have exited"
+    );
+
+    stop_daemon(&db, &mut daemon);
+}
+
+/// Creating three workspaces in sequence on a running daemon: each should
+/// succeed without restart, and the daemon should remain Active throughout.
+#[test]
+fn create_three_workspaces_sequentially_on_running_daemon() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket);
+    let _ = wait_for_runtime_state(&socket, "IdleNoTenants", Duration::from_secs(10));
+
+    for i in 1..=3 {
+        let out = Command::new(bin())
+            .args([
+                "create-workspace",
+                "--db",
+                &db,
+                "--workspace-name",
+                &format!("ws-{}", i),
+            ])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "create-workspace #{} failed: stdout={} stderr={}",
+            i,
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let _ = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
+    }
+
+    // Should have 3 tenants.
+    let conn = topo::db::open_connection(&db).unwrap();
+    let tenants = topo::db::transport_creds::discover_local_tenants(&conn).unwrap();
+    assert_eq!(tenants.len(), 3, "expected 3 tenants, got {}", tenants.len());
+
+    assert!(
+        daemon.child().try_wait().unwrap().is_none(),
+        "daemon should still be running"
+    );
+
+    stop_daemon(&db, &mut daemon);
+}
+
+/// After adding a second workspace, the listen port must not change —
+/// proving the endpoint was NOT restarted.
+#[test]
+fn listen_port_stable_after_adding_tenant() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket);
+    let _ = wait_for_runtime_state(&socket, "IdleNoTenants", Duration::from_secs(10));
+
+    // Create first workspace and record the listen address.
+    let out = Command::new(bin())
+        .args(["create-workspace", "--db", &db])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let data1 = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
+    let addr1 = data1["runtime"]["listen_addr"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    // Create second workspace.
+    let out = Command::new(bin())
+        .args(["create-workspace", "--db", &db])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+
+    // Give the runtime manager a moment to process the recheck.
+    std::thread::sleep(Duration::from_millis(500));
+
+    let data2 = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
+    let addr2 = data2["runtime"]["listen_addr"]
+        .as_str()
+        .unwrap()
+        .to_string();
+
+    assert_eq!(
+        addr1, addr2,
+        "listen address should be stable (no endpoint restart): {} vs {}",
+        addr1, addr2
+    );
+
+    stop_daemon(&db, &mut daemon);
+}
+
+/// Messages can be sent on both tenants after creating a second workspace
+/// on a running daemon, proving that both tenants are functional.
+#[test]
+fn both_tenants_functional_after_adding_second_workspace() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket);
+    let _ = wait_for_runtime_state(&socket, "IdleNoTenants", Duration::from_secs(10));
+
+    // Create first workspace.
+    let out = Command::new(bin())
+        .args(["create-workspace", "--db", &db, "--workspace-name", "ws1"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let _ = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
+
+    // Send message on the active tenant (tenant 1).
+    let out = Command::new(bin())
+        .args(["--db", &db, "send", "hello from tenant 1"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "send on tenant 1 failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Verify message is visible.
+    let out = Command::new(bin())
+        .args(["--db", &db, "messages"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("hello from tenant 1"),
+        "tenant 1 message should be visible before adding second workspace: {}",
+        stdout
+    );
+
+    // Create second workspace.
+    let out = Command::new(bin())
+        .args(["create-workspace", "--db", &db, "--workspace-name", "ws2"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "second create-workspace failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Verify 2 tenants exist.
+    let out = Command::new(bin())
+        .args(["--db", &db, "tenants"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let tenants_stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        tenants_stdout.contains("2."),
+        "should show 2 tenants: {}",
+        tenants_stdout
+    );
+
+    // Switch to tenant 2 and send a message.
+    let out = Command::new(bin())
+        .args(["--db", &db, "use-tenant", "2"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "use-tenant 2 failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let out = Command::new(bin())
+        .args(["--db", &db, "send", "hello from tenant 2"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "send on tenant 2 failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Verify tenant 2's message is visible.
+    let out = Command::new(bin())
+        .args(["--db", &db, "messages"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("hello from tenant 2"),
+        "tenant 2 message should be visible: {}",
+        stdout
+    );
+
+    stop_daemon(&db, &mut daemon);
+}

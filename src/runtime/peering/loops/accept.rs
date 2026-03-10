@@ -154,11 +154,9 @@ pub async fn accept_loop_with_ingest_until_cancel(
         info!("Accepted connection from {}", peer_id);
 
         // Resolve which local tenant owns this connection.
-        // Single-tenant: TLS already verified trust; only one routing choice.
-        // Multi-tenant: check SQL trust tables to determine which tenant.
-        let recorded_by = if tenant_peer_ids.len() == 1 {
-            tenant_peer_ids[0].clone()
-        } else {
+        // Always resolve via trust tables — new tenants may have been
+        // registered on the live endpoint since the accept loop started.
+        let recorded_by = {
             match resolve_tenant_for_peer(db_path, tenant_peer_ids, &peer_id) {
                 Some(rb) => rb,
                 None => {
@@ -316,15 +314,30 @@ fn describe_accept_failure(err: &crate::transport::ConnectionLifecycleError) -> 
 
 /// Resolve which local tenant trusts a given remote peer.
 ///
-/// Checks `is_peer_allowed` for each tenant. Returns the first tenant that
-/// trusts the peer, or `None` if no tenant matches.
+/// First checks the cached tenant list (fast path), then falls back to
+/// querying the DB for the current tenant set. This handles tenants that
+/// were registered on the live endpoint after the accept loop started.
 fn resolve_tenant_for_peer(
     db_path: &str,
     tenant_peer_ids: &[String],
     remote_peer_id: &str,
 ) -> Option<String> {
     let fp = peer_fingerprint_from_hex(remote_peer_id)?;
-    resolve_trusting_tenant(db_path, tenant_peer_ids, fp)
+    // Fast path: check cached tenant list
+    if let Some(tenant) = resolve_trusting_tenant(db_path, tenant_peer_ids, fp)
+        .ok()
+        .flatten()
+    {
+        return Some(tenant);
+    }
+    // Slow path: query DB for dynamically added tenants
+    let db = crate::db::open_connection(db_path).ok()?;
+    let current_tenants = crate::db::transport_creds::discover_local_tenants(&db).ok()?;
+    if current_tenants.len() <= tenant_peer_ids.len() {
+        return None; // No new tenants, fast path was definitive
+    }
+    let current_ids: Vec<String> = current_tenants.iter().map(|t| t.peer_id.clone()).collect();
+    resolve_trusting_tenant(db_path, &current_ids, fp)
         .ok()
         .flatten()
 }

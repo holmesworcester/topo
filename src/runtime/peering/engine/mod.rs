@@ -15,6 +15,7 @@ use tracing::info;
 
 use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::peering::loops::IntroSpawnerFn;
+use crate::transport::multi_workspace::WorkspaceCertResolver;
 
 use startup::setup_endpoint_and_tenants;
 
@@ -32,6 +33,9 @@ pub struct NodeRuntimeNetInfo {
 ///
 /// Discovers local tenants, creates a shared endpoint + ingest path, then
 /// delegates long-lived task ownership to `RuntimeSupervisor`.
+///
+/// The caller provides a `WorkspaceCertResolver` so new tenants can be
+/// registered on the live endpoint without restarting.
 pub async fn run_node(
     db_path: &str,
     bind: SocketAddr,
@@ -39,6 +43,7 @@ pub async fn run_node(
     shutdown_notify: Arc<tokio::sync::Notify>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
+    cert_resolver: Arc<WorkspaceCertResolver>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let startup::StartupResult {
         endpoint,
@@ -46,7 +51,7 @@ pub async fn run_node(
         tenants,
         tenant_client_configs,
         local_peer_ids,
-    } = setup_endpoint_and_tenants(db_path, bind, net_info_tx)?;
+    } = setup_endpoint_and_tenants(db_path, bind, net_info_tx, cert_resolver)?;
 
     let mut runtime_supervisor = supervisor::RuntimeSupervisor::new(
         db_path.to_string(),
