@@ -142,7 +142,7 @@ Is p2p just intrinsically #$%@ing hard? Or is all this slog totally avoidable an
 
 ---
 
-# Specific gripes 😡
+# Specific gripes with existing p2p tools 😡
 
 <!-- pt:incremental_lists: true -->
 
@@ -157,14 +157,14 @@ Is p2p just intrinsically #$%@ing hard? Or is all this slog totally avoidable an
 
 # Topo 🐭 is maybe a better way
 
-Instead of providing lots of features for *parts* of the problem, it focuses on covering:
+Instead of providing lots of features for *parts* of the problem, it focuses on covering
 
 <!-- pt:incremental_lists: true -->
 
 - **All layers**: everything from networking to the local app API.
 - **Most contexts**: everything from iOS notification fetching to multi-tenant servers. (Soon the web, too.)
 
-...and covering them in a principled solution to the hard problem, **concurrency**.
+...in a principled solution to the hard problem, **concurrency**.
 
 ---
 
