@@ -315,9 +315,15 @@ What happens when each event depends on a max (10) prior events and they are pro
 
 ---
 
-# Low-Memory Topo Cascade (10k)
+# Low-Memory Performance
 
-Same worst-case cascade as above, but with iOS NSE memory pragmas (256 KiB SQLite cache, `temp_store=FILE`, `mmap_size=0`).
+iOS background fetch is under a 24Mb memory limit, so we have a `lowmem` mode and tests for that.
+
+---
+
+# Low-Memory Topo-sort Cascade (10k)
+
+Same worst-case cascade as above, but with `lowmem` enabled.
 
 | Scale | Blocking | Cascade | Cascade Rate | Total | Peak RSS |
 |------:|---------:|--------:|-------------:|------:|---------:|
@@ -328,19 +334,18 @@ Same worst-case cascade as above, but with iOS NSE memory pragmas (256 KiB SQLit
 
 ---
 
-# Low-Memory: iOS NSE Target (24 MiB)
+# Low-Memory Sync
 
-Constrained-runtime gate for iOS background push (24 MiB target, 22 MiB enforced via cgroup v2).
-Per-daemon VmHWM measured via lowmem delta harness.
 
 | Case | Synced | Peak KB | 24 MiB? | 22 MiB cgroup? |
 |------|--------|--------:|:-------:|:--------------:|
 | 50k+10k messages | all 10k msgs | 7,356 | PASS | PASS |
 | 50k+20x1MiB files | all 80 slices | 7,016 | PASS | PASS |
 
-- SQLite cache ~1 MiB, `temp_store=FILE`, `mmap_size=0`
-- Ingest channel capacity reduced to 1000
-- Peak VmHWM ~7 MiB per daemon; memory shape dominated by `wanted` watermark + DB-backed `need_queue`
+
+- Memory increase varies with number of new events synced and (to a lesser extent) total number of events. 
+- Files pass easily because the number of events is small
+- Full sync of 100k+ events is not possible in background, but expecting background-fetched diffs to be <10k events seems reasonable.
 
 ---
 
