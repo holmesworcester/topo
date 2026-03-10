@@ -46,7 +46,7 @@ use crate::peering::loops::{
 };
 use crate::projection::apply::project_one;
 use crate::projection::create::{
-    create_encrypted_event_synchronous, event_id_or_blocked, create_event_staged, create_event_synchronous,
+    create_encrypted_event_synchronous, create_event_staged, create_event_synchronous,
     create_signed_event_staged, create_signed_event_synchronous, CreateEventError,
 };
 use crate::transport::identity::{ensure_transport_peer_id, load_transport_cert};
@@ -536,12 +536,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let key_eid = crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
-            &db,
-            &self.identity,
-        )
-        .expect("failed to resolve content key");
-        create_encrypted_event_synchronous(&db, &self.identity, &key_eid, &msg, Some(self.signing_key()))
+        create_signed_event_synchronous(&db, &self.identity, &msg, self.signing_key())
             .expect("failed to create message")
     }
 
@@ -558,14 +553,8 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let key_eid = crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
-            &db,
-            &self.identity,
-        )
-        .expect("failed to resolve content key");
-        event_id_or_blocked(
-            create_encrypted_event_synchronous(&db, &self.identity, &key_eid, &rxn, Some(self.signing_key()))
-        ).expect("failed to create reaction")
+        create_signed_event_staged(&db, &self.identity, &rxn, self.signing_key())
+            .expect("failed to create reaction")
     }
 
     /// Create a KeySecret event with the given key bytes.
@@ -641,12 +630,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let key_eid = crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
-            &db,
-            &self.identity,
-        )
-        .expect("failed to resolve content key");
-        create_encrypted_event_synchronous(&db, &self.identity, &key_eid, &del, Some(self.signing_key()))
+        create_signed_event_synchronous(&db, &self.identity, &del, self.signing_key())
             .expect("failed to create message_deletion")
     }
 
@@ -988,11 +972,6 @@ impl Peer {
     /// Requires identity chain.
     pub fn batch_create_messages(&self, count: usize) {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let key_eid = crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
-            &db,
-            &self.identity,
-        )
-        .expect("failed to resolve content key");
         db.execute("BEGIN", []).expect("failed to begin");
         for i in 0..count {
             let msg = ParsedEvent::Message(MessageEvent {
@@ -1004,7 +983,7 @@ impl Peer {
                 signer_type: 5,
                 signature: [0u8; 64],
             });
-            create_encrypted_event_synchronous(&db, &self.identity, &key_eid, &msg, Some(self.signing_key()))
+            create_signed_event_synchronous(&db, &self.identity, &msg, self.signing_key())
                 .expect("failed to create message");
         }
         db.execute("COMMIT", []).expect("failed to commit");
@@ -1025,14 +1004,7 @@ impl Peer {
         let workspace_id = crate::db::store::lookup_workspace_id(&db, &self.identity)
             .expect("missing trust anchor workspace_id for file-slice benchmark");
 
-        // Content encryption key (for RequireEncrypted events)
-        let content_key_eid = crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
-            &db,
-            &self.identity,
-        )
-        .expect("failed to resolve content key");
-
-        // Parent message (RequireEncrypted — must wrap in encrypted envelope)
+        // Parent message (MayPlaintext — signed is fine)
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: current_timestamp_ms(),
             workspace_id: self.workspace_id,
@@ -1042,9 +1014,8 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let msg_eid = event_id_or_blocked(
-            create_encrypted_event_synchronous(&db, &self.identity, &content_key_eid, &msg, Some(self.signing_key()))
-        ).expect("failed to create parent message");
+        let msg_eid = create_signed_event_staged(&db, &self.identity, &msg, self.signing_key())
+            .expect("failed to create parent message");
 
         // Secret key for attachment
         let sk = ParsedEvent::KeySecret(KeySecretEvent {
@@ -1228,16 +1199,13 @@ impl Peer {
 
     /// Count stored message events from canonical `events` by event_type.
     /// Includes local and synced remote message events.
-    /// Counts both plaintext messages and encrypted(message) wrappers.
     pub fn stored_message_event_count(&self) -> i64 {
         let db = match open_count_connection(&self.db_path) {
             Some(db) => db,
             None => return -1,
         };
         db.query_row(
-            "SELECT COUNT(*) FROM events
-             WHERE event_type = 'message'
-                OR (event_type = 'encrypted' AND length(blob) > 41 AND substr(blob, 42, 1) = X'01')",
+            "SELECT COUNT(*) FROM events WHERE event_type = 'message'",
             [],
             |row| row.get(0),
         )

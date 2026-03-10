@@ -1,13 +1,13 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::EventId;
-use crate::projection::create::create_encrypted_event_synchronous;
+use crate::projection::create::create_signed_event_synchronous;
 use crate::service::open_db_for_peer;
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
 use super::super::ParsedEvent;
-use super::super::{message, peer_shared, workspace};
+use super::super::{message, peer_shared};
 use super::wire::ReactionEvent;
 
 use serde::{Deserialize, Serialize};
@@ -42,11 +42,7 @@ pub fn create(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("resolve content key for reaction: {}", e).into()
-        })?;
-    let eid = create_encrypted_event_synchronous(db, recorded_by, &key_event_id, &rxn, Some(signing_key))?;
+    let eid = create_signed_event_synchronous(db, recorded_by, &rxn, signing_key)?;
     Ok(eid)
 }
 

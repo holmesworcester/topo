@@ -342,13 +342,6 @@ async fn test_identity_then_messaging() {
     bob.peer_shared_signing_key = Some(bob_join.peer_shared_key.clone());
     bob.author_id = bob_join.user_eid;
 
-    // Share content encryption keys so encrypted messages can be decrypted.
-    // Alice wraps her content key for Bob's invite. Bob stores the invite_secret
-    // so that key_shared unwrap projection can materialize the shared key_secret.
-    // After sync, both peers use the same content key for message encryption.
-    alice.wrap_content_key_for_invite(&bob_join.invite_key, &bob_join.user_invite_eid);
-    bob.create_invite_secret(&bob_join.user_invite_eid, bob_join.invite_key.to_bytes());
-
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);

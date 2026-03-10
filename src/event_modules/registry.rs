@@ -114,10 +114,10 @@ mod tests {
     }
 
     #[test]
-    fn test_transport_privacy_message_require_encrypted() {
+    fn test_transport_privacy_message_may_plaintext() {
         let reg = event_modules::registry();
         let meta = reg.lookup(event_modules::EVENT_TYPE_MESSAGE).unwrap();
-        assert_eq!(meta.transport_privacy, TransportPrivacy::RequireEncrypted);
+        assert_eq!(meta.transport_privacy, TransportPrivacy::MayPlaintext);
     }
 
     #[test]

@@ -171,21 +171,11 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     (psf_eid, peer_shared_key, ub_eid)
 }
 
-/// Create prerequisite events (identity chain, encrypted message, secret key) and return IDs + signing key.
+/// Create prerequisite events (identity chain, signed message, secret key) and return IDs + signing key.
 fn create_prereqs(conn: &Connection, recorded_by: &str) -> (EventId, EventId, EventId, SigningKey) {
     let (signer_eid, signing_key, user_event_id) = make_identity_chain(conn, recorded_by);
 
-    // Content encryption key (for RequireEncrypted events)
-    let content_key_bytes = [0xCC; 32];
-    let content_sk = ParsedEvent::KeySecret(KeySecretEvent {
-        created_at_ms: now_ms(),
-        key_bytes: content_key_bytes,
-    });
-    let content_sk_blob = events::encode_event(&content_sk).unwrap();
-    let content_key_eid = insert_event_raw(conn, recorded_by, &content_sk_blob);
-    project_one(conn, recorded_by, &content_key_eid).unwrap();
-
-    // Message (RequireEncrypted — must wrap in encrypted envelope)
+    // Signed message
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: now_ms(),
         workspace_id: [1u8; 32],
@@ -197,19 +187,7 @@ fn create_prereqs(conn: &Connection, recorded_by: &str) -> (EventId, EventId, Ev
     });
     let mut msg_blob = events::encode_event(&msg).unwrap();
     sign_blob(&signing_key, &mut msg_blob);
-
-    // Wrap message in encrypted envelope
-    let (nonce, ct, auth_tag) = encrypt_event_blob(&content_key_bytes, &msg_blob).unwrap();
-    let enc_msg = ParsedEvent::Encrypted(EncryptedEvent {
-        created_at_ms: now_ms(),
-        key_event_id: content_key_eid,
-        inner_type_code: topo::event_modules::EVENT_TYPE_MESSAGE,
-        nonce,
-        ciphertext: ct,
-        auth_tag,
-    });
-    let enc_msg_blob = events::encode_event(&enc_msg).unwrap();
-    let msg_eid = insert_event_raw(conn, recorded_by, &enc_msg_blob);
+    let msg_eid = insert_event_raw(conn, recorded_by, &msg_blob);
     project_one(conn, recorded_by, &msg_eid).unwrap();
 
     // Secret key (for attachment key_event_id dep — also used to encrypt file slices)

@@ -107,7 +107,7 @@ pub static MESSAGE_DELETION_META: EventTypeMeta = EventTypeMeta {
     signer_required: true,
     signature_byte_len: 64,
     encryptable: true,
-    transport_privacy: crate::event_modules::registry::TransportPrivacy::RequireEncrypted,
+    transport_privacy: crate::event_modules::registry::TransportPrivacy::MayPlaintext,
     parse: parse_message_deletion,
     encode: encode_message_deletion,
     projector: super::projector::project_pure,
