@@ -354,6 +354,9 @@ class PerfRunner:
                     "--test-threads=1",
                 ],
             )
+            self.run_topo_cascade(
+                "topo_cascade_lowmem_10k", extra_env={"LOW_MEM_IOS": "1"},
+            )
             return
 
         if self.mode == "lowmem":
@@ -432,6 +435,9 @@ class PerfRunner:
                 "--test-threads=1",
             ],
         )
+        self.run_topo_cascade(
+            "topo_cascade_lowmem_10k", extra_env={"LOW_MEM_IOS": "1"},
+        )
 
     def run_daemon_perf_test(
         self,
@@ -461,7 +467,9 @@ class PerfRunner:
             summary_path=self.repo_root / f"target/perf-results/daemon_perf_test.{test_name}.summary",
         )
 
-    def run_topo_cascade(self, test_name: str, ignored: bool = False) -> None:
+    def run_topo_cascade(
+        self, test_name: str, ignored: bool = False, extra_env: dict[str, str] | None = None,
+    ) -> None:
         args = [
             "cargo",
             "+stable",
@@ -476,7 +484,7 @@ class PerfRunner:
         if ignored:
             args.append("--ignored")
         args.append("--test-threads=1")
-        self.run(f"Topo Cascade ({test_name})", args)
+        self.run(f"Topo Cascade ({test_name})", args, extra_env=extra_env)
 
     def run_low_mem_tests(self) -> None:
         self.run(

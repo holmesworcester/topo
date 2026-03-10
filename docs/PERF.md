@@ -66,6 +66,9 @@ cargo test --release --test topo_cascade_test topo_cascade_50k -- --nocapture --
 cargo test --release --test topo_cascade_test topo_cascade_500k -- --nocapture --ignored --test-threads=1
 cargo test --release --test topo_cascade_test -- --nocapture --include-ignored --test-threads=1
 
+# Topo-sort cascade (low-memory, iOS NSE budget)
+LOW_MEM_IOS=1 cargo test --release --test topo_cascade_test topo_cascade_lowmem_10k -- --nocapture --test-threads=1
+
 # Low-memory budget tests
 cargo test --release --test low_mem_test -- --nocapture
 

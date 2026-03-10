@@ -119,6 +119,7 @@ fn run_topo_cascade(n: usize) {
         insert_event_raw(&conn, recorded_by, &blobs[i]);
     }
     conn.execute_batch("COMMIT").unwrap();
+    drop(blobs); // Free ~172 bytes × N of heap after insertion; data lives in SQLite now.
 
     let dep_rows_total: usize = (0..n)
         .map(|i| {
@@ -237,8 +238,37 @@ fn run_topo_cascade(n: usize) {
     eprintln!();
 }
 
+struct EnvGuard {
+    prev: Option<String>,
+}
+
+impl EnvGuard {
+    fn enable_low_mem_ios() -> Self {
+        let prev = std::env::var("LOW_MEM_IOS").ok();
+        std::env::set_var("LOW_MEM_IOS", "1");
+        Self { prev }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prev {
+            Some(v) => std::env::set_var("LOW_MEM_IOS", v),
+            None => std::env::remove_var("LOW_MEM_IOS"),
+        }
+    }
+}
+
 #[test]
 fn topo_cascade_10k() {
+    run_topo_cascade(10_000);
+}
+
+/// Low-memory variant: runs 10k cascade with LOW_MEM_IOS=1.
+/// SQLite cache drops to 256 KiB; verifies cascade fits in iOS NSE budget.
+#[test]
+fn topo_cascade_lowmem_10k() {
+    let _env = EnvGuard::enable_low_mem_ios();
     run_topo_cascade(10_000);
 }
 

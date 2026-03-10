@@ -315,13 +315,17 @@ What happens when each event depends on a max (10) prior events and they are pro
 
 ---
 
-Low memory tests we need (placeholder/TODO):
+# Low-Memory Topo Cascade (10k, `LOW_MEM_IOS=1`)
 
-- low-memory topo cascade on 10k messages (we're close already at 60MB but still high -- could include a note that it's not proven but seems in range and worst case is not the regime we'll usually be in.)
-- low-memory sync (we have this)
-- low-memory large-file receive (proves streaming)
+Same worst-case cascade as above, but with iOS NSE memory pragmas (256 KiB SQLite cache, `temp_store=FILE`, `mmap_size=0`).
 
+| Scale | Blocking | Cascade | Cascade Rate | Total | Peak RSS |
+|------:|---------:|--------:|-------------:|------:|---------:|
+| 10k | 1.36s | 1.30s | 7,710 ev/s | 2.75s | 9.6 MiB |
 
+- Same throughput as normal mode (~7-8k ev/s) — cascade is CPU-bound, not cache-bound
+- Peak RSS 9.6 MiB — well under the 24 MiB iOS NSE budget
+- Worst-case projection workload is iOS-safe without further tuning
 
 ---
 
