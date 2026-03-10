@@ -147,7 +147,8 @@ pub fn project_encrypted(
             .query_row(
                 "SELECT f.key_event_id
                  FROM file_slices fs
-                 JOIN files f ON f.recorded_by = fs.recorded_by AND f.file_id = fs.file_id
+                 JOIN files f ON f.recorded_by = fs.recorded_by
+                                 AND f.event_id = fs.descriptor_event_id
                  WHERE fs.recorded_by = ?1 AND fs.event_id = ?2
                  LIMIT 1",
                 rusqlite::params![recorded_by, event_id_b64],
