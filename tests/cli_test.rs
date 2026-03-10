@@ -326,6 +326,34 @@ fn peer_id_for_username(db_path: &str, username: &str) -> String {
     .expect("username should map to a tenant")
 }
 
+fn wait_for_username_peer_id(db_path: &str, username: &str, timeout_ms: u64) -> String {
+    let start = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+    loop {
+        let conn = open_connection(db_path).expect("open db");
+        let found = conn
+            .query_row(
+                "SELECT recorded_by
+                 FROM users
+                 WHERE username = ?1
+                 LIMIT 1",
+                rusqlite::params![username],
+                |row| row.get::<_, String>(0),
+            )
+            .ok();
+        if let Some(peer_id) = found {
+            return peer_id;
+        }
+        if start.elapsed() >= timeout {
+            panic!(
+                "username {} did not materialize within {}ms in {}",
+                username, timeout_ms, db_path
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn use_tenant_for_username(db_path: &str, username: &str) {
     let idx = tenant_index_for_username(db_path, username);
     use_tenant(db_path, &idx.to_string());
@@ -2322,6 +2350,683 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
         "zeta tenant view should not leak alpha workspace messages:\n{}",
         yuki_view
     );
+}
+
+/// Live-daemon multitenant regression: accepting a second workspace on a
+/// running daemon with an existing tenant must switch the active tenant to the
+/// newly joined workspace so immediate sends land in the correct workspace.
+#[test]
+fn test_cli_live_daemon_accept_second_workspace_switches_active_tenant() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 30000;
+
+    let home_db = tmpdir.path().join("home.db").to_str().unwrap().to_string();
+    let zeta_db = tmpdir.path().join("zeta.db").to_str().unwrap().to_string();
+
+    create_workspace_with_details(&home_db, "home-space", "home", "home-root");
+    let mut home_daemon = start_daemon(&home_db);
+    let home_tenant = "home/home-root".to_string();
+
+    create_workspace_with_details(&zeta_db, "zeta-space", "zeta", "zeta-root");
+    let mut zeta_daemon = start_daemon(&zeta_db);
+    let zeta_tenant = "zeta/zeta-root".to_string();
+
+    let zeta_bootstrap = "zeta-space/bootstrap";
+    let zeta_bootstrap_eid = send_message(&zeta_db, zeta_bootstrap);
+    assert_event_visible_on_all(&[&zeta_db], &zeta_bootstrap_eid, timeout_ms);
+
+    let zeta_invite = create_invite(&zeta_db, &daemon_listen_addr(&zeta_db));
+    let accept = Command::new(bin())
+        .args([
+            "accept",
+            "--db",
+            &home_db,
+            &zeta_invite,
+            "--username",
+            "yuki-zeta",
+            "--devicename",
+            "yuki-terminal",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        accept.status.success(),
+        "accept failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&accept.stdout),
+        String::from_utf8_lossy(&accept.stderr)
+    );
+
+    let yuki_peer_id = {
+        let start = Instant::now();
+        let timeout = Duration::from_millis(timeout_ms);
+        loop {
+            let conn = open_connection(&home_db).expect("open home db");
+            let found = conn
+                .query_row(
+                    "SELECT recorded_by
+                     FROM users
+                     WHERE username = ?1
+                     LIMIT 1",
+                    rusqlite::params!["yuki-zeta"],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok();
+            if let Some(peer_id) = found {
+                break peer_id;
+            }
+            if start.elapsed() >= timeout {
+                panic!(
+                    "accepted tenant did not materialize within {}ms",
+                    timeout_ms
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    let active = topo_cmd(&home_db, &["tenant", "active"]);
+    assert!(
+        active.status.success(),
+        "tenant active failed after accept: {}",
+        String::from_utf8_lossy(&active.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&active.stdout).trim(),
+        yuki_peer_id,
+        "accepting a second workspace on a running daemon should switch the active tenant"
+    );
+
+    assert_event_visible_for_username(&home_db, "yuki-zeta", &zeta_bootstrap_eid, timeout_ms);
+
+    let yuki_msg = "zeta-space/yuki-live";
+    let yuki_eid = send_message(&home_db, yuki_msg);
+    assert_event_visible_on_all(&[&zeta_db], &yuki_eid, timeout_ms);
+
+    assert_cli_state_for_username(
+        &home_db,
+        "home",
+        &["home-space", "zeta-space"],
+        "home-space",
+        2,
+        1,
+        &["home"],
+        &[home_tenant.as_str()],
+        &[],
+    );
+    assert_cli_state_for_username(
+        &home_db,
+        "yuki-zeta",
+        &["home-space", "zeta-space"],
+        "zeta-space",
+        2,
+        2,
+        &["zeta", "yuki-zeta"],
+        &[zeta_tenant.as_str(), "yuki-zeta/yuki-terminal"],
+        &[zeta_bootstrap, yuki_msg],
+    );
+    assert_cli_state(
+        &zeta_db,
+        &["zeta-space"],
+        "zeta-space",
+        1,
+        2,
+        &["zeta", "yuki-zeta"],
+        &[&zeta_tenant, "yuki-zeta/yuki-terminal"],
+        &[zeta_bootstrap, yuki_msg],
+    );
+
+    stop_daemon(&home_db, &mut home_daemon);
+    stop_daemon(&zeta_db, &mut zeta_daemon);
+}
+
+/// Live-daemon multitenant regression: creating a second workspace on a
+/// running daemon must switch the active tenant to the new workspace so
+/// follow-up sends do not stay pinned to the original tenant.
+#[test]
+fn test_cli_live_daemon_create_second_workspace_switches_active_tenant() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 30000;
+
+    let db = tmpdir.path().join("multi.db").to_str().unwrap().to_string();
+    create_workspace_with_details(&db, "home-space", "home", "home-root");
+    let mut daemon = start_daemon(&db);
+
+    let home_tenant = "home/home-root".to_string();
+    let home_bootstrap = "home-space/bootstrap";
+    let home_bootstrap_eid = send_message(&db, home_bootstrap);
+    assert_event_visible_on_all(&[&db], &home_bootstrap_eid, timeout_ms);
+
+    let create = Command::new(bin())
+        .args([
+            "create-workspace",
+            "--db",
+            &db,
+            "--workspace-name",
+            "zeta-space",
+            "--username",
+            "zeta",
+            "--device-name",
+            "zeta-root",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        create.status.success(),
+        "create-workspace failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&create.stdout),
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let zeta_peer_id = {
+        let start = Instant::now();
+        let timeout = Duration::from_millis(timeout_ms);
+        loop {
+            let conn = open_connection(&db).expect("open multi db");
+            let found = conn
+                .query_row(
+                    "SELECT recorded_by
+                     FROM users
+                     WHERE username = ?1
+                     LIMIT 1",
+                    rusqlite::params!["zeta"],
+                    |row| row.get::<_, String>(0),
+                )
+                .ok();
+            if let Some(peer_id) = found {
+                break peer_id;
+            }
+            if start.elapsed() >= timeout {
+                panic!(
+                    "new workspace tenant did not materialize within {}ms",
+                    timeout_ms
+                );
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+    };
+
+    let active = topo_cmd(&db, &["tenant", "active"]);
+    assert!(
+        active.status.success(),
+        "tenant active failed after create-workspace: {}",
+        String::from_utf8_lossy(&active.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&active.stdout).trim(),
+        zeta_peer_id,
+        "creating a second workspace on a running daemon should switch the active tenant"
+    );
+
+    let zeta_tenant = "zeta/zeta-root".to_string();
+    let zeta_msg = "zeta-space/live-create";
+    let zeta_eid = send_message(&db, zeta_msg);
+    assert_event_visible_for_username(&db, "zeta", &zeta_eid, timeout_ms);
+
+    assert_cli_state_for_username(
+        &db,
+        "home",
+        &["home-space", "zeta-space"],
+        "home-space",
+        2,
+        1,
+        &["home"],
+        &[home_tenant.as_str()],
+        &[home_bootstrap],
+    );
+    assert_cli_state_for_username(
+        &db,
+        "zeta",
+        &["home-space", "zeta-space"],
+        "zeta-space",
+        2,
+        1,
+        &["zeta"],
+        &[zeta_tenant.as_str()],
+        &[zeta_msg],
+    );
+
+    stop_daemon(&db, &mut daemon);
+}
+
+/// Live-daemon multitenant regression mirroring the reported user flow:
+/// after creating a second workspace on a running daemon, inviting a new peer
+/// into that workspace must support bidirectional ongoing sync in the second
+/// workspace without leaking into the first workspace's view.
+#[test]
+fn test_cli_live_daemon_second_workspace_invite_syncs_bidirectionally() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 30000;
+
+    let owner_db = tmpdir.path().join("owner.db").to_str().unwrap().to_string();
+    let guest_db = tmpdir.path().join("guest.db").to_str().unwrap().to_string();
+
+    create_workspace_with_details(&owner_db, "alpha-space", "alpha", "alpha-root");
+    let mut owner_daemon = start_daemon(&owner_db);
+    let alpha_tenant = "alpha/alpha-root".to_string();
+
+    let create = Command::new(bin())
+        .args([
+            "create-workspace",
+            "--db",
+            &owner_db,
+            "--workspace-name",
+            "beta-space",
+            "--username",
+            "beta-owner",
+            "--device-name",
+            "beta-root",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        create.status.success(),
+        "create-workspace failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&create.stdout),
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let beta_tenant = "beta-owner/beta-root".to_string();
+    let beta_bootstrap = "beta-space/bootstrap";
+    let beta_bootstrap_eid = send_message(&owner_db, beta_bootstrap);
+    let beta_invite = create_invite(&owner_db, &daemon_listen_addr(&owner_db));
+
+    accept_invite_with_identity(&guest_db, &beta_invite, "guest-beta", "guest-laptop");
+    let mut guest_daemon = start_daemon(&guest_db);
+
+    assert_event_visible_on_all(&[&guest_db], &beta_bootstrap_eid, timeout_ms);
+
+    let guest_msg = "beta-space/guest-reply";
+    let guest_eid = send_message(&guest_db, guest_msg);
+    assert_event_visible_for_username(&owner_db, "beta-owner", &guest_eid, timeout_ms);
+
+    assert_cli_state_for_username(
+        &owner_db,
+        "alpha",
+        &["alpha-space", "beta-space"],
+        "alpha-space",
+        2,
+        1,
+        &["alpha"],
+        &[alpha_tenant.as_str()],
+        &[],
+    );
+    assert_cli_state_for_username(
+        &owner_db,
+        "beta-owner",
+        &["alpha-space", "beta-space"],
+        "beta-space",
+        2,
+        2,
+        &["beta-owner", "guest-beta"],
+        &[beta_tenant.as_str(), "guest-beta/guest-laptop"],
+        &[beta_bootstrap, guest_msg],
+    );
+    assert_cli_state(
+        &guest_db,
+        &["beta-space"],
+        "beta-space",
+        1,
+        2,
+        &["beta-owner", "guest-beta"],
+        &[&beta_tenant, "guest-beta/guest-laptop"],
+        &[beta_bootstrap, guest_msg],
+    );
+
+    use_tenant_for_username(&owner_db, "alpha");
+    let alpha_view = get_view_raw(&owner_db);
+    assert!(
+        !alpha_view.contains(beta_bootstrap) && !alpha_view.contains(guest_msg),
+        "first workspace view should not leak second-workspace messages:\n{}",
+        alpha_view
+    );
+
+    stop_daemon(&owner_db, &mut owner_daemon);
+    stop_daemon(&guest_db, &mut guest_daemon);
+}
+
+/// Live-daemon multitenant regression: after accepting a second workspace on a
+/// running daemon, switching back to the original tenant must route sends back
+/// to the original workspace instead of leaving them pinned to the newly
+/// accepted tenant.
+#[test]
+fn test_cli_live_daemon_accept_second_workspace_can_switch_back_and_sync_original_tenant() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 30000;
+
+    let owner_db = tmpdir.path().join("owner.db").to_str().unwrap().to_string();
+    let zeta_db = tmpdir.path().join("zeta.db").to_str().unwrap().to_string();
+
+    create_workspace_with_details(&owner_db, "home-space", "home", "home-root");
+    let mut owner_daemon = start_daemon(&owner_db);
+    let home_tenant = "home/home-root".to_string();
+
+    let home_bootstrap = "home-space/bootstrap";
+    let home_bootstrap_eid = send_message(&owner_db, home_bootstrap);
+    let home_invite = create_invite(&owner_db, &daemon_listen_addr(&owner_db));
+    let home_guest = start_joined_cli_peer(
+        &tmpdir,
+        "home-guest.db",
+        &home_invite,
+        "home-guest",
+        "guest-laptop",
+    );
+    assert_event_visible_on_all(&[&home_guest.db], &home_bootstrap_eid, timeout_ms);
+
+    create_workspace_with_details(&zeta_db, "zeta-space", "zeta", "zeta-root");
+    let mut zeta_daemon = start_daemon(&zeta_db);
+    let zeta_tenant = "zeta/zeta-root".to_string();
+
+    let zeta_bootstrap = "zeta-space/bootstrap";
+    let zeta_bootstrap_eid = send_message(&zeta_db, zeta_bootstrap);
+    let zeta_invite = create_invite(&zeta_db, &daemon_listen_addr(&zeta_db));
+
+    let accept = Command::new(bin())
+        .args([
+            "accept",
+            "--db",
+            &owner_db,
+            &zeta_invite,
+            "--username",
+            "yuki-zeta",
+            "--devicename",
+            "yuki-terminal",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        accept.status.success(),
+        "accept failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&accept.stdout),
+        String::from_utf8_lossy(&accept.stderr)
+    );
+
+    wait_for_username_peer_id(&owner_db, "yuki-zeta", timeout_ms);
+    assert_event_visible_for_username(&owner_db, "yuki-zeta", &zeta_bootstrap_eid, timeout_ms);
+
+    let zeta_msg = "zeta-space/yuki-live";
+    let zeta_eid = send_message_as_username(&owner_db, "yuki-zeta", zeta_msg);
+    assert_event_visible_on_all(&[&zeta_db], &zeta_eid, timeout_ms);
+
+    let home_msg = "home-space/home-followup";
+    let home_eid = send_message_as_username(&owner_db, "home", home_msg);
+    assert_event_visible_on_all(&[&home_guest.db], &home_eid, timeout_ms);
+
+    let home_guest_view = get_view_raw(&home_guest.db);
+    assert!(
+        !home_guest_view.contains(zeta_msg),
+        "original workspace peer should not see second-workspace messages:\n{}",
+        home_guest_view
+    );
+    let zeta_view = get_view_raw(&zeta_db);
+    assert!(
+        !zeta_view.contains(home_msg),
+        "second workspace peer should not see original-workspace messages:\n{}",
+        zeta_view
+    );
+
+    assert_cli_state_for_username(
+        &owner_db,
+        "home",
+        &["home-space", "zeta-space"],
+        "home-space",
+        2,
+        2,
+        &["home", "home-guest"],
+        &[home_tenant.as_str(), "home-guest/guest-laptop"],
+        &[home_bootstrap, home_msg],
+    );
+    assert_cli_state_for_username(
+        &owner_db,
+        "yuki-zeta",
+        &["home-space", "zeta-space"],
+        "zeta-space",
+        2,
+        2,
+        &["zeta", "yuki-zeta"],
+        &[zeta_tenant.as_str(), "yuki-zeta/yuki-terminal"],
+        &[zeta_bootstrap, zeta_msg],
+    );
+
+    stop_daemon(&owner_db, &mut owner_daemon);
+    stop_daemon(&zeta_db, &mut zeta_daemon);
+}
+
+/// Live-daemon multitenant regression: after creating a second workspace on a
+/// running daemon, explicit tenant switches must keep routing sends to the
+/// selected workspace even after follow-up sync is active in both tenants.
+#[test]
+fn test_cli_live_daemon_create_second_workspace_can_switch_between_tenants_and_sync_both() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 30000;
+
+    let owner_db = tmpdir.path().join("owner.db").to_str().unwrap().to_string();
+    create_workspace_with_details(&owner_db, "alpha-space", "alpha", "alpha-root");
+    let mut owner_daemon = start_daemon(&owner_db);
+    let alpha_tenant = "alpha/alpha-root".to_string();
+
+    let alpha_bootstrap = "alpha-space/bootstrap";
+    let alpha_bootstrap_eid = send_message(&owner_db, alpha_bootstrap);
+    let alpha_invite = create_invite(&owner_db, &daemon_listen_addr(&owner_db));
+    let alpha_guest = start_joined_cli_peer(
+        &tmpdir,
+        "alpha-guest.db",
+        &alpha_invite,
+        "alpha-guest",
+        "guest-alpha",
+    );
+    assert_event_visible_on_all(&[&alpha_guest.db], &alpha_bootstrap_eid, timeout_ms);
+
+    let create = Command::new(bin())
+        .args([
+            "create-workspace",
+            "--db",
+            &owner_db,
+            "--workspace-name",
+            "beta-space",
+            "--username",
+            "beta-owner",
+            "--device-name",
+            "beta-root",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        create.status.success(),
+        "create-workspace failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&create.stdout),
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    wait_for_username_peer_id(&owner_db, "beta-owner", timeout_ms);
+    let beta_tenant = "beta-owner/beta-root".to_string();
+    let beta_bootstrap = "beta-space/bootstrap";
+    let beta_bootstrap_eid = send_message(&owner_db, beta_bootstrap);
+    let beta_invite = create_invite(&owner_db, &daemon_listen_addr(&owner_db));
+    let beta_guest = start_joined_cli_peer(
+        &tmpdir,
+        "beta-guest.db",
+        &beta_invite,
+        "beta-guest",
+        "guest-beta",
+    );
+    assert_event_visible_on_all(&[&beta_guest.db], &beta_bootstrap_eid, timeout_ms);
+
+    let beta_reply = "beta-space/guest-reply";
+    let beta_reply_eid = send_message(&beta_guest.db, beta_reply);
+    assert_event_visible_for_username(&owner_db, "beta-owner", &beta_reply_eid, timeout_ms);
+
+    let alpha_followup = "alpha-space/owner-followup";
+    let alpha_followup_eid = send_message_as_username(&owner_db, "alpha", alpha_followup);
+    assert_event_visible_on_all(&[&alpha_guest.db], &alpha_followup_eid, timeout_ms);
+
+    let beta_followup = "beta-space/owner-second";
+    let beta_followup_eid = send_message_as_username(&owner_db, "beta-owner", beta_followup);
+    assert_event_visible_on_all(&[&beta_guest.db], &beta_followup_eid, timeout_ms);
+
+    let alpha_view = get_view_raw(&alpha_guest.db);
+    assert!(
+        !alpha_view.contains(beta_bootstrap)
+            && !alpha_view.contains(beta_reply)
+            && !alpha_view.contains(beta_followup),
+        "alpha tenant peer should not see beta-space messages:\n{}",
+        alpha_view
+    );
+    let beta_view = get_view_raw(&beta_guest.db);
+    assert!(
+        !beta_view.contains(alpha_bootstrap) && !beta_view.contains(alpha_followup),
+        "beta tenant peer should not see alpha-space messages:\n{}",
+        beta_view
+    );
+
+    assert_cli_state_for_username(
+        &owner_db,
+        "alpha",
+        &["alpha-space", "beta-space"],
+        "alpha-space",
+        2,
+        2,
+        &["alpha", "alpha-guest"],
+        &[alpha_tenant.as_str(), "alpha-guest/guest-alpha"],
+        &[alpha_bootstrap, alpha_followup],
+    );
+    assert_cli_state_for_username(
+        &owner_db,
+        "beta-owner",
+        &["alpha-space", "beta-space"],
+        "beta-space",
+        2,
+        2,
+        &["beta-owner", "beta-guest"],
+        &[beta_tenant.as_str(), "beta-guest/guest-beta"],
+        &[beta_bootstrap, beta_reply, beta_followup],
+    );
+
+    stop_daemon(&owner_db, &mut owner_daemon);
+}
+
+/// Live-daemon multitenant regression: creating an additional workspace on a
+/// hot daemon must not disrupt ongoing sync in an already-active second
+/// workspace, and the newly created workspace must remain isolated.
+#[test]
+fn test_cli_live_daemon_creating_third_workspace_preserves_existing_second_workspace_sync() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 30000;
+
+    let owner_db = tmpdir.path().join("owner.db").to_str().unwrap().to_string();
+    create_workspace_with_details(&owner_db, "alpha-space", "alpha", "alpha-root");
+    let mut owner_daemon = start_daemon(&owner_db);
+
+    let create_beta = Command::new(bin())
+        .args([
+            "create-workspace",
+            "--db",
+            &owner_db,
+            "--workspace-name",
+            "beta-space",
+            "--username",
+            "beta-owner",
+            "--device-name",
+            "beta-root",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        create_beta.status.success(),
+        "create-workspace beta failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&create_beta.stdout),
+        String::from_utf8_lossy(&create_beta.stderr)
+    );
+    wait_for_username_peer_id(&owner_db, "beta-owner", timeout_ms);
+
+    let beta_tenant = "beta-owner/beta-root".to_string();
+    let beta_bootstrap = "beta-space/bootstrap";
+    let beta_bootstrap_eid = send_message(&owner_db, beta_bootstrap);
+    let beta_invite = create_invite(&owner_db, &daemon_listen_addr(&owner_db));
+    let beta_guest = start_joined_cli_peer(
+        &tmpdir,
+        "beta-guest.db",
+        &beta_invite,
+        "beta-guest",
+        "guest-beta",
+    );
+    assert_event_visible_on_all(&[&beta_guest.db], &beta_bootstrap_eid, timeout_ms);
+
+    let beta_first = "beta-space/guest-first";
+    let beta_first_eid = send_message(&beta_guest.db, beta_first);
+    assert_event_visible_for_username(&owner_db, "beta-owner", &beta_first_eid, timeout_ms);
+
+    let create_gamma = Command::new(bin())
+        .args([
+            "create-workspace",
+            "--db",
+            &owner_db,
+            "--workspace-name",
+            "gamma-space",
+            "--username",
+            "gamma-owner",
+            "--device-name",
+            "gamma-root",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        create_gamma.status.success(),
+        "create-workspace gamma failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&create_gamma.stdout),
+        String::from_utf8_lossy(&create_gamma.stderr)
+    );
+    wait_for_username_peer_id(&owner_db, "gamma-owner", timeout_ms);
+
+    let gamma_tenant = "gamma-owner/gamma-root".to_string();
+    let gamma_msg = "gamma-space/local-only";
+    let gamma_eid = send_message(&owner_db, gamma_msg);
+    assert_event_visible_for_username(&owner_db, "gamma-owner", &gamma_eid, timeout_ms);
+
+    let beta_second = "beta-space/guest-second";
+    let beta_second_eid = send_message(&beta_guest.db, beta_second);
+    assert_event_visible_for_username(&owner_db, "beta-owner", &beta_second_eid, timeout_ms);
+
+    let beta_owner_reply = "beta-space/owner-reply";
+    let beta_owner_reply_eid = send_message_as_username(&owner_db, "beta-owner", beta_owner_reply);
+    assert_event_visible_on_all(&[&beta_guest.db], &beta_owner_reply_eid, timeout_ms);
+
+    let beta_view = get_view_raw(&beta_guest.db);
+    assert!(
+        !beta_view.contains(gamma_msg),
+        "existing second workspace peer should not see third-workspace messages:\n{}",
+        beta_view
+    );
+
+    assert_cli_state_for_username(
+        &owner_db,
+        "beta-owner",
+        &["alpha-space", "beta-space", "gamma-space"],
+        "beta-space",
+        3,
+        2,
+        &["beta-owner", "beta-guest"],
+        &[beta_tenant.as_str(), "beta-guest/guest-beta"],
+        &[beta_bootstrap, beta_first, beta_second, beta_owner_reply],
+    );
+    assert_cli_state_for_username(
+        &owner_db,
+        "gamma-owner",
+        &["alpha-space", "beta-space", "gamma-space"],
+        "gamma-space",
+        3,
+        1,
+        &["gamma-owner"],
+        &[gamma_tenant.as_str()],
+        &[gamma_msg],
+    );
+
+    stop_daemon(&owner_db, &mut owner_daemon);
 }
 
 /// Mixed realistic topology:

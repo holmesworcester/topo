@@ -527,10 +527,10 @@ fn dispatch(
                 &device_name,
             ) {
                 Ok(resp) => {
-                    // Newly created workspaces become the active tenant.
-                    let mut ap = state.active_peer.write().unwrap();
-                    *ap = Some(resp.peer_id.clone());
-                    drop(ap);
+                    // Creating a workspace establishes a new local tenant.
+                    // Make it active immediately so follow-up CLI commands
+                    // target the workspace the operator just created.
+                    *state.active_peer.write().unwrap() = Some(resp.peer_id.clone());
                     state.notify_runtime_recheck();
 
                     // Auto-create an invite with detected IPs
@@ -1139,11 +1139,7 @@ fn dispatch(
             };
             match workspace::commands::accept_device_link(db_path, &resolved, &devicename) {
                 Ok(data) => {
-                    // Auto-select if no active peer
-                    let mut ap = state.active_peer.write().unwrap();
-                    if ap.is_none() {
-                        *ap = Some(data.peer_id.clone());
-                    }
+                    *state.active_peer.write().unwrap() = Some(data.peer_id.clone());
                     state.notify_runtime_recheck();
                     RpcResponse::success(data)
                 }
@@ -1176,9 +1172,7 @@ fn dispatch(
             devicename,
         } => match workspace::commands::accept_invite(db_path, &invite, &username, &devicename) {
             Ok(data) => {
-                let mut ap = state.active_peer.write().unwrap();
-                *ap = Some(data.peer_id.clone());
-                drop(ap);
+                *state.active_peer.write().unwrap() = Some(data.peer_id.clone());
                 state.notify_runtime_recheck();
                 RpcResponse::success(data)
             }
