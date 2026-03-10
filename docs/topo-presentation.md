@@ -146,12 +146,12 @@ Is p2p just intrinsically #$%@ing hard? Or is all this slog totally avoidable an
 
 <!-- pt:incremental_lists: true -->
 
-- **Arbitrary dependency linkages** - these are the opposite of what you want: they block content when you *don't* need that and not when you do
-- **No iOS support** - especially for push & the iOS NSE memory limit
-- **No multi-tenant/account support** - so you'll need to roll a lot of your own infra to support mobile devices and notifications
-- **No simple API for frontends** - you must build a complex middle layer to cover all the queries your frontend 
+- **Arbitrary dependency linkages** - these are the opposite of what you want: they block content when you *don't* need that and not when you do 
+- **No iOS support** - especially for push & the iOS NSE memory limit 🐼
+- **No multi-tenant/account support** - so you'll need to roll a lot of your own infra to support mobile devices and notifications 🐼
+- **No simple API for frontends** - you must build a complex middle layer to cover all the queries your frontend 🐼
 
-(**p2panda** is a lot better than others, but I think all but the first apply to it too)
+(**p2panda** is a lot better than others, but all gripes marked 🐼 apply to it too)
 
 ---
 
@@ -176,7 +176,7 @@ Instead of providing lots of features for *parts* of the problem, it focuses on 
 - No separate backend for cloud: one endpoint can host many tenants
 - Dependencies can match product needs
 - End-to-end testing is cheap and easy
-- Gives you a flexible, concurrency-safe way to do encryption and auth
+- You get a flexible, concurrency-safe way to do encryption and auth
 
 ---
 
