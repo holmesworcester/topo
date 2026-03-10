@@ -1907,9 +1907,17 @@ fn test_encrypted_parity_file_slice_valid() {
     let _ws = setup_workspace_event(&conn, recorded_by);
     let (signer_eid, signing_key, key_bytes, sk_eid) = setup_encryption_ctx(&conn, recorded_by);
 
-    // Create descriptor (required for file_slice projection)
+    // Create descriptor (required for file_slice projection) — use same key
+    // as the encrypted wrapper so the key consistency check passes.
     let file_id = [99u8; 32];
-    setup_descriptor_for_file(&conn, recorded_by, &signing_key, &signer_eid, file_id);
+    setup_descriptor_for_file_with_key(
+        &conn,
+        recorded_by,
+        &signing_key,
+        &signer_eid,
+        file_id,
+        Some(&sk_eid),
+    );
 
     // Create and encrypt file_slice
     let (_fs, fs_blob) = make_file_slice(
@@ -2963,20 +2971,36 @@ fn setup_descriptor_for_file(
     signer_eid: &EventId,
     file_id: [u8; 32],
 ) -> EventId {
+    setup_descriptor_for_file_with_key(conn, recorded_by, signing_key, signer_eid, file_id, None)
+}
+
+fn setup_descriptor_for_file_with_key(
+    conn: &Connection,
+    recorded_by: &str,
+    signing_key: &SigningKey,
+    signer_eid: &EventId,
+    file_id: [u8; 32],
+    use_key_event_id: Option<&EventId>,
+) -> EventId {
     // Create message (dep for attachment)
     let (_msg, msg_blob) =
         make_message_signed(signing_key, signer_eid, "parent msg for descriptor");
     let msg_eid = insert_event_raw(conn, recorded_by, &msg_blob);
     project_one(conn, recorded_by, &msg_eid).unwrap();
 
-    // Create KeySecret (dep for attachment)
-    let sk = ParsedEvent::KeySecret(KeySecretEvent {
-        created_at_ms: now_ms(),
-        key_bytes: [0xBB; 32],
-    });
-    let sk_blob = events::encode_event(&sk).unwrap();
-    let sk_eid = insert_event_raw(conn, recorded_by, &sk_blob);
-    project_one(conn, recorded_by, &sk_eid).unwrap();
+    // Create or reuse KeySecret (dep for attachment)
+    let sk_eid = if let Some(existing) = use_key_event_id {
+        *existing
+    } else {
+        let sk = ParsedEvent::KeySecret(KeySecretEvent {
+            created_at_ms: now_ms(),
+            key_bytes: [0xBB; 32],
+        });
+        let sk_blob = events::encode_event(&sk).unwrap();
+        let eid = insert_event_raw(conn, recorded_by, &sk_blob);
+        project_one(conn, recorded_by, &eid).unwrap();
+        eid
+    };
 
     // Create File descriptor with the specific file_id
     let att = FileEvent {

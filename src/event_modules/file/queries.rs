@@ -444,10 +444,13 @@ pub fn save_file_by_selector(
             return Err(e);
         }
     };
-    // Remove destination first so rename works on platforms where it
-    // cannot atomically replace an existing file (e.g. Windows).
-    let _ = std::fs::remove_file(out_path);
-    std::fs::rename(&tmp_path, out_path)?;
+    // On Unix, rename atomically replaces the destination — no window
+    // where the path is absent. On Windows, rename fails if the
+    // destination exists, so fall back to remove + rename.
+    if let Err(_) = std::fs::rename(&tmp_path, out_path) {
+        let _ = std::fs::remove_file(out_path);
+        std::fs::rename(&tmp_path, out_path)?;
+    }
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 

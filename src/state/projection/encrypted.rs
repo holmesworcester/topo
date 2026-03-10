@@ -6,7 +6,9 @@ use crate::crypto::event_id_to_base64;
 pub use crate::crypto::{
     decrypt_event_blob, encrypt_event_blob, unwrap_key_from_sender, wrap_key_for_recipient,
 };
-use crate::event_modules::{self as events, EncryptedEvent, ParsedEvent, EVENT_TYPE_ENCRYPTED};
+use crate::event_modules::{
+    self as events, EncryptedEvent, ParsedEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_FILE_SLICE,
+};
 
 /// Project an encrypted event: decrypt, parse inner, verify admissibility,
 /// then hand off to shared pipeline stages (dep check, signer verify,
@@ -134,6 +136,43 @@ pub fn project_encrypted(
         &inner_parsed,
         false,
     )?;
+
+    // For encrypted file_slice: verify wrapper key matches descriptor key.
+    // This prevents a malicious peer from wrapping slices under a different
+    // content key than the file descriptor declares.
+    if matches!(decision, ProjectionDecision::Valid) && enc.inner_type_code == EVENT_TYPE_FILE_SLICE
+    {
+        let wrapper_key_b64 = event_id_to_base64(&enc.key_event_id);
+        let descriptor_key_b64: Option<String> = conn
+            .query_row(
+                "SELECT f.key_event_id
+                 FROM file_slices fs
+                 JOIN files f ON f.recorded_by = fs.recorded_by AND f.file_id = fs.file_id
+                 WHERE fs.recorded_by = ?1 AND fs.event_id = ?2
+                 LIMIT 1",
+                rusqlite::params![recorded_by, event_id_b64],
+                |row| row.get(0),
+            )
+            .ok();
+        if let Some(ref desc_key) = descriptor_key_b64 {
+            if *desc_key != wrapper_key_b64 {
+                // Roll back: remove the file_slices row that was just inserted
+                let _ = conn.execute(
+                    "DELETE FROM file_slices WHERE recorded_by = ?1 AND event_id = ?2",
+                    rusqlite::params![recorded_by, event_id_b64],
+                );
+                return Ok((
+                    ProjectionDecision::Reject {
+                        reason: format!(
+                            "encrypted file_slice wrapper key {} does not match descriptor key {}",
+                            wrapper_key_b64, desc_key
+                        ),
+                    },
+                    None,
+                ));
+            }
+        }
+    }
 
     // Return the inner parsed event so the caller (project_one_step) can fire
     // the subscription hook after the valid_events write, avoiding duplicate
