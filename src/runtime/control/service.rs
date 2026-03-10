@@ -95,7 +95,7 @@ pub fn open_db_load(
         return Ok((scoped_peers[0].clone(), conn));
     }
     if scoped_peers.len() > 1 {
-        return Err("no active tenant — run `topo use-tenant <N>`".into());
+        return Err("no active tenant — run `topo tenant use <N>`".into());
     }
 
     // Fresh DB / pre-workspace state: fall back to singleton transport identity.
@@ -149,7 +149,7 @@ pub use crate::event_modules::message::GenerateResponse;
 pub use crate::event_modules::message::{
     DeleteResponse, MessageItem, MessagesResponse, SendResponse,
 };
-pub use crate::event_modules::peer_shared::{AccountItem, IdentityResponse};
+pub use crate::event_modules::peer_shared::{IdentityResponse, TenantItem};
 pub use crate::event_modules::reaction::{ReactResponse, ReactionItem};
 pub use crate::event_modules::user::{BanResponse, UserItem};
 pub use crate::event_modules::workspace::commands::{

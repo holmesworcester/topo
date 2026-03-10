@@ -93,7 +93,7 @@ pub struct LinkChain {
     pub invite_accepted_event_id: EventId,
 }
 
-/// Data needed to transfer an invite between accounts.
+/// Data needed to transfer an invite between tenants.
 #[derive(Clone)]
 pub struct InviteData {
     pub invite_event_id: EventId,

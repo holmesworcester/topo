@@ -168,7 +168,7 @@ impl DaemonState {
             }
         }
 
-        Err("no active tenant — run `topo use-tenant <N>`".to_string())
+        Err("no active tenant — run `topo tenant use <N>`".to_string())
     }
 
     /// Store an invite/link string and return its 1-based reference number.
@@ -800,7 +800,7 @@ fn dispatch(
                             .unwrap_or(0);
                         if tenant_count > 1 {
                             // Multiple tenants, none selected — return error so
-                            // operators know to run `topo use-tenant`.
+                            // operators know to run `topo tenant use`.
                             RpcResponse::error(no_active_err)
                         } else {
                             // Empty/pre-identity or single-tenant: return status

@@ -165,9 +165,9 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
     let rpc_start = Instant::now();
     loop {
         let out = Command::new(bin())
-            .args(["--db", db, "active-tenant"])
+            .args(["--db", db, "tenant", "active"])
             .output()
-            .expect("failed to probe daemon active-tenant");
+            .expect("failed to probe daemon tenant active");
         if out.status.success() {
             break;
         }
@@ -363,7 +363,7 @@ pub fn create_workspace_with_details(
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
         let peers = Command::new(bin())
-            .args(["--db", db, "tenants"])
+            .args(["--db", db, "tenant", "list"])
             .output()
             .expect("peers probe");
         if peers.status.success() {
@@ -421,12 +421,12 @@ pub fn ensure_active_peer(db: &str, timeout: Duration) {
 
     while start.elapsed() < timeout {
         let active = Command::new(bin())
-            .args(["--db", db, "active-tenant"])
+            .args(["--db", db, "tenant", "active"])
             .output()
-            .expect("failed to run active-tenant");
+            .expect("failed to run tenant active");
         if active.status.success() {
             let active_stdout = String::from_utf8_lossy(&active.stdout).trim().to_string();
-            if !active_stdout.is_empty() && active_stdout != "(no active peer)" {
+            if !active_stdout.is_empty() && active_stdout != "(no active tenant)" {
                 return;
             }
             last_active = active_stdout;
@@ -435,19 +435,19 @@ pub fn ensure_active_peer(db: &str, timeout: Duration) {
         }
 
         let peers = Command::new(bin())
-            .args(["--db", db, "tenants"])
+            .args(["--db", db, "tenant", "list"])
             .output()
-            .expect("failed to run tenants");
+            .expect("failed to run tenant list");
         if peers.status.success() {
             let peers_stdout = String::from_utf8_lossy(&peers.stdout).to_string();
             if let Some(index) = first_peer_index(&peers_stdout) {
                 let use_peer = Command::new(bin())
                     .arg("--db")
                     .arg(db)
-                    .arg("use-tenant")
+                    .args(["tenant", "use"])
                     .arg(index.to_string())
                     .output()
-                    .expect("failed to run use-tenant");
+                    .expect("failed to run tenant use");
                 if use_peer.status.success() {
                     return;
                 }
@@ -462,7 +462,7 @@ pub fn ensure_active_peer(db: &str, timeout: Duration) {
     }
 
     panic!(
-        "failed to establish active tenant within {:?} (db={}): active={}, tenants={}, use-tenant-error={}",
+        "failed to establish active tenant within {:?} (db={}): active={}, tenants={}, tenant-use-error={}",
         timeout,
         db,
         last_active,
@@ -629,7 +629,7 @@ pub fn accept_invite_with_identity_and_timeout(
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
         let peers = Command::new(bin())
-            .args(["--db", db, "tenants"])
+            .args(["--db", db, "tenant", "list"])
             .output()
             .expect("peers probe");
         if peers.status.success() {
@@ -698,7 +698,7 @@ pub fn accept_device_link_with_name_and_timeout(
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
         let peers = Command::new(bin())
-            .args(["--db", db, "tenants"])
+            .args(["--db", db, "tenant", "list"])
             .output()
             .expect("peers probe");
         if peers.status.success() {
@@ -999,17 +999,17 @@ pub fn get_users_raw(db: &str) -> String {
     String::from_utf8_lossy(&output.stdout).to_string()
 }
 
-/// Get raw `topo tenants` output.
+/// Get raw `topo tenant list` output.
 pub fn get_tenants_raw(db: &str) -> String {
     let output = Command::new(bin())
         .arg("--db")
         .arg(db)
-        .arg("tenants")
+        .args(["tenant", "list"])
         .output()
-        .expect("failed to run tenants");
+        .expect("failed to run tenant list");
     assert!(
         output.status.success(),
-        "tenants failed: {}",
+        "tenant list failed: {}",
         String::from_utf8_lossy(&output.stderr)
     );
     String::from_utf8_lossy(&output.stdout).to_string()
@@ -1053,13 +1053,13 @@ pub fn use_tenant(db: &str, selector: &str) {
     let output = Command::new(bin())
         .arg("--db")
         .arg(db)
-        .arg("use-tenant")
+        .args(["tenant", "use"])
         .arg(selector)
         .output()
-        .expect("failed to run use-tenant");
+        .expect("failed to run tenant use");
     assert!(
         output.status.success(),
-        "use-tenant failed: stdout={} stderr={}",
+        "tenant use failed: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
@@ -1087,7 +1087,7 @@ pub fn is_transient_rpc_startup_error(stderr: &str) -> bool {
         || stderr.contains("Connection reset by peer")
         || stderr.contains("no identity — run `topo create-workspace` first")
         || stderr.contains("workspace has not completed initial sync yet")
-        || stderr.contains("no active tenant — run `topo use-tenant <N>`")
+        || stderr.contains("no active tenant — run `topo tenant use <N>`")
         || stderr.contains("blocked on")
 }
 
@@ -1102,7 +1102,7 @@ pub fn topo_rpc_retry(db: &str, args: &[&str], timeout: Duration) -> Output {
         }
         let stderr = String::from_utf8_lossy(&out.stderr);
         if stderr.contains("no active tenant") {
-            let _ = topo_cmd(db, &["use-tenant", "1"]);
+            let _ = topo_cmd(db, &["tenant", "use", "1"]);
         }
         if start.elapsed() >= timeout || !is_transient_rpc_startup_error(&stderr) {
             return out;

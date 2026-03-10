@@ -163,7 +163,7 @@ fn resolve_assert_recorded_by(
         return Ok(scoped_peers[0].clone());
     }
     if scoped_peers.len() > 1 {
-        return Err("no active tenant — run `topo use-tenant <N>`".into());
+        return Err("no active tenant — run `topo tenant use <N>`".into());
     }
 
     // Pre-workspace fallback: singleton transport identity.

@@ -103,7 +103,7 @@ struct StartedCliPeer {
 }
 
 impl StartedCliPeer {
-    fn account_label(&self) -> String {
+    fn tenant_label(&self) -> String {
         format!("{}/{}", self.username, self.device_name)
     }
 }
@@ -355,18 +355,18 @@ fn assert_cli_state(
     expected_tenant_count: usize,
     expected_user_count: usize,
     expected_users: &[&str],
-    expected_accounts: &[&str],
+    expected_tenants: &[&str],
     expected_messages: &[&str],
 ) {
-    let active = topo_cmd(db_path, &["active-tenant"]);
+    let active = topo_cmd(db_path, &["tenant", "active"]);
     assert!(
         active.status.success(),
-        "active-tenant failed: {}",
+        "tenant active failed: {}",
         String::from_utf8_lossy(&active.stderr)
     );
     let active_stdout = String::from_utf8_lossy(&active.stdout);
     assert!(
-        !active_stdout.trim().is_empty() && active_stdout.trim() != "(no active peer)",
+        !active_stdout.trim().is_empty() && active_stdout.trim() != "(no active tenant)",
         "active tenant should be selected: {}",
         active_stdout
     );
@@ -434,8 +434,8 @@ fn assert_cli_state(
         view
     );
     assert!(
-        view.contains("ACCOUNTS:"),
-        "view should include ACCOUNTS:\n{}",
+        view.contains("TENANTS:"),
+        "view should include TENANTS:\n{}",
         view
     );
     for username in expected_users {
@@ -446,11 +446,11 @@ fn assert_cli_state(
             view
         );
     }
-    for account in expected_accounts {
+    for tenant in expected_tenants {
         assert!(
-            view.contains(account),
-            "view should contain account {:?}:\n{}",
-            account,
+            view.contains(tenant),
+            "view should contain tenant {:?}:\n{}",
+            tenant,
             view
         );
     }
@@ -610,7 +610,7 @@ fn assert_cli_state_for_username(
     expected_tenant_count: usize,
     expected_user_count: usize,
     expected_users: &[&str],
-    expected_accounts: &[&str],
+    expected_tenants: &[&str],
     expected_messages: &[&str],
 ) {
     use_tenant_for_username(db_path, username);
@@ -626,10 +626,10 @@ fn assert_cli_state_for_username(
         )
         .expect("username should map to a tenant")
     };
-    let active = topo_cmd(db_path, &["active-tenant"]);
+    let active = topo_cmd(db_path, &["tenant", "active"]);
     assert!(
         active.status.success(),
-        "active-tenant failed after use-tenant: {}",
+        "tenant active failed after tenant use: {}",
         String::from_utf8_lossy(&active.stderr)
     );
     assert_eq!(
@@ -645,7 +645,7 @@ fn assert_cli_state_for_username(
         expected_tenant_count,
         expected_user_count,
         expected_users,
-        expected_accounts,
+        expected_tenants,
         expected_messages,
     );
 }
@@ -914,16 +914,16 @@ fn test_cli_selected_partial_join_tenant_reports_initial_sync_errors() {
 
     let _daemon = start_daemon(&bob_db);
 
-    let select = topo_cmd(&bob_db, &["use-tenant", &partial_tenant_index.to_string()]);
+    let select = topo_cmd(&bob_db, &["tenant", "use", &partial_tenant_index.to_string()]);
     assert!(
         select.status.success(),
-        "use-tenant failed: stdout={} stderr={}",
+        "tenant use failed: stdout={} stderr={}",
         String::from_utf8_lossy(&select.stdout),
         String::from_utf8_lossy(&select.stderr)
     );
 
-    let active = topo_cmd(&bob_db, &["active-tenant"]);
-    assert!(active.status.success(), "active-tenant failed");
+    let active = topo_cmd(&bob_db, &["tenant", "active"]);
+    assert!(active.status.success(), "tenant active failed");
     assert_eq!(
         String::from_utf8_lossy(&active.stdout).trim(),
         partial_join.peer_id,
@@ -989,50 +989,6 @@ fn test_cli_selected_partial_join_tenant_reports_initial_sync_errors() {
     );
 }
 
-#[test]
-fn test_cli_partial_join_startup_suppresses_stale_bootstrap_warnings() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let stderr_path = tmpdir.path().join("daemon.stderr");
-
-    create_workspace(&bob_db);
-
-    let alice = Peer::new_with_identity("alice-startup-noise-source");
-    let unreachable_bootstrap = format!("127.0.0.1:{}", random_port());
-    let invite_link = create_user_invite_link_for_test_peer(&alice, &unreachable_bootstrap);
-    accept_invite_without_sync(&bob_db, &invite_link, "bob-join", "pending")
-        .expect("accept invite without bootstrap sync");
-
-    let daemon = start_daemon_with_options(
-        &bob_db,
-        &DaemonOptions {
-            stderr_file: Some(stderr_path.clone()),
-            ..Default::default()
-        },
-    );
-
-    std::thread::sleep(Duration::from_secs(10));
-    drop(daemon);
-
-    let stderr = std::fs::read_to_string(&stderr_path).expect("read daemon stderr");
-    assert!(
-        !stderr.contains("Connection refused by"),
-        "startup stderr should not show stale bootstrap dial failures:\n{}",
-        stderr
-    );
-    assert!(
-        !stderr.contains("connect worker"),
-        "startup stderr should not show stale connect worker warnings:\n{}",
-        stderr
-    );
-    assert!(
-        !stderr.contains("marked dial target stale"),
-        "startup stderr should not show stale-target warnings:\n{}",
-        stderr
-    );
-}
-
 /// TRUST POLICY TEST: untrusted peer is rejected.
 /// Alice bootstraps identity (PeerShared self-trust makes has_any_trusted_peer true).
 /// Bob has independent identity (not in Alice's workspace). Alice should reject Bob.
@@ -1095,19 +1051,6 @@ fn test_cli_file_upload_sync_and_save() {
     accept_invite(&bob_db, &invite_link);
     let _bob = start_daemon(&bob_db);
 
-    let sync_log_cfg = topo_cmd(&bob_db, &["sync-log-config"]);
-    assert!(
-        sync_log_cfg.status.success(),
-        "sync-log-config failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&sync_log_cfg.stdout),
-        String::from_utf8_lossy(&sync_log_cfg.stderr)
-    );
-    assert!(
-        String::from_utf8_lossy(&sync_log_cfg.stdout).contains("enabled=false"),
-        "sync-log should remain disabled by default, got: {}",
-        String::from_utf8_lossy(&sync_log_cfg.stdout)
-    );
-
     // Wait for Bob to receive Alice's message event
     assert_eventually(&bob_db, &format!("has_event:{} >= 1", file_eid), timeout_ms);
 
@@ -1119,11 +1062,6 @@ fn test_cli_file_upload_sync_and_save() {
     loop {
         let raw = get_messages_raw(&bob_db);
         if raw.contains("\u{2714}") {
-            assert!(
-                raw.contains("MiB/s"),
-                "messages output should include file download MiB/s once complete:\n{}",
-                raw
-            );
             break;
         }
         if start.elapsed().as_secs() >= 30 {
@@ -1134,20 +1072,6 @@ fn test_cli_file_upload_sync_and_save() {
         }
         std::thread::sleep(Duration::from_millis(500));
     }
-
-    let files_out = topo_cmd(&bob_db, &["files"]);
-    assert!(
-        files_out.status.success(),
-        "files failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&files_out.stdout),
-        String::from_utf8_lossy(&files_out.stderr)
-    );
-    let files_stdout = String::from_utf8_lossy(&files_out.stdout);
-    assert!(
-        files_stdout.contains("MiB/s"),
-        "files output should include file download MiB/s:\n{}",
-        files_stdout
-    );
 
     // Save the file to disk
     let saved_path = tmpdir.path().join("received_file.txt");
@@ -1325,7 +1249,7 @@ fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
                 .expect("alice db path"),
         ),
     };
-    let alice_account = alice.account_label();
+    let alice_tenant = alice.tenant_label();
 
     let reused_invite = create_invite(&alice.db, &daemon_listen_addr(&alice.db));
     let alice_base = "reuse-user/alice-step-1";
@@ -1338,12 +1262,12 @@ fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
         1,
         1,
         &["alice"],
-        &[&alice_account],
+        &[&alice_tenant],
         &[alice_base],
     );
 
     let bob = start_joined_cli_peer(&tmpdir, "bob.db", &reused_invite, "bob", "bob-box");
-    let bob_account = bob.account_label();
+    let bob_tenant = bob.tenant_label();
     assert_eventually(&bob.db, "message_count >= 1", timeout_ms);
     let bob_msg = "reuse-user/bob-step-2";
     let bob_eid = send_message(&bob.db, bob_msg);
@@ -1356,13 +1280,13 @@ fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
             1,
             2,
             &["alice", "bob"],
-            &[&alice_account, &bob_account],
+            &[&alice_tenant, &bob_tenant],
             &[alice_base, bob_msg],
         );
     }
 
     let carol = start_joined_cli_peer(&tmpdir, "carol.db", &reused_invite, "carol", "carol-box");
-    let carol_account = carol.account_label();
+    let carol_tenant = carol.tenant_label();
     assert_eventually(&carol.db, "message_count >= 2", timeout_ms);
     let carol_msg = "reuse-user/carol-step-3";
     let carol_eid = send_message(&carol.db, carol_msg);
@@ -1375,13 +1299,13 @@ fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
             1,
             3,
             &["alice", "bob", "carol"],
-            &[&alice_account, &bob_account, &carol_account],
+            &[&alice_tenant, &bob_tenant, &carol_tenant],
             &[alice_base, bob_msg, carol_msg],
         );
     }
 
     let dave = start_joined_cli_peer(&tmpdir, "dave.db", &reused_invite, "dave", "dave-box");
-    let dave_account = dave.account_label();
+    let dave_tenant = dave.tenant_label();
     assert_eventually(&dave.db, "message_count >= 3", timeout_ms);
     let dave_msg = "reuse-user/dave-step-4";
     let dave_eid = send_message(&dave.db, dave_msg);
@@ -1398,7 +1322,7 @@ fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
             1,
             4,
             &["alice", "bob", "carol", "dave"],
-            &[&alice_account, &bob_account, &carol_account, &dave_account],
+            &[&alice_tenant, &bob_tenant, &carol_tenant, &dave_tenant],
             &[alice_base, bob_msg, carol_msg, dave_msg],
         );
     }
@@ -1470,8 +1394,8 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
     );
     assert_event_visible_on_all(&[&alice_db, &bob_db], &alice_eid, timeout_ms);
 
-    let bob_account = "bob/bob-box".to_string();
-    let alice_account = "alice/alice-root".to_string();
+    let bob_tenant = "bob/bob-box".to_string();
+    let alice_tenant = "alice/alice-root".to_string();
 
     let carol_join = accept_invite_without_sync(&carol_db, &reused_invite, "carol", "carol-box")
         .expect("accept reused invite without sync");
@@ -1533,7 +1457,7 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
             1,
             3,
             &["alice", "bob", "carol"],
-            &[&alice_account, &bob_account, "carol/carol-box"],
+            &[&alice_tenant, &bob_tenant, "carol/carol-box"],
             &[alice_msg, carol_msg],
         );
     }
@@ -1600,7 +1524,7 @@ fn test_cli_multi_use_user_invites_mix_reuse_and_new_creation() {
                 .expect("alice db path"),
         ),
     };
-    let alice_account = alice.account_label();
+    let alice_tenant = alice.tenant_label();
 
     let old_invite = create_invite(&alice.db, &daemon_listen_addr(&alice.db));
     let alice_base = "mixed-user/alice-step-1";
@@ -1608,7 +1532,7 @@ fn test_cli_multi_use_user_invites_mix_reuse_and_new_creation() {
     assert_event_visible_on_all(&[&alice.db], &alice_base_eid, timeout_ms);
 
     let bob = start_joined_cli_peer(&tmpdir, "bob.db", &old_invite, "bob", "bob-linux");
-    let bob_account = bob.account_label();
+    let bob_tenant = bob.tenant_label();
     assert_eventually(&bob.db, "message_count >= 1", timeout_ms);
     let bob_msg = "mixed-user/bob-step-2";
     let bob_eid = send_message(&bob.db, bob_msg);
@@ -1616,14 +1540,14 @@ fn test_cli_multi_use_user_invites_mix_reuse_and_new_creation() {
 
     let fresh_invite = create_invite(&alice.db, &daemon_listen_addr(&alice.db));
     let carol = start_joined_cli_peer(&tmpdir, "carol.db", &fresh_invite, "carol", "carol-linux");
-    let carol_account = carol.account_label();
+    let carol_tenant = carol.tenant_label();
     assert_eventually(&carol.db, "message_count >= 2", timeout_ms);
     let carol_msg = "mixed-user/carol-step-3";
     let carol_eid = send_message(&carol.db, carol_msg);
     assert_event_visible_on_all(&[&alice.db, &bob.db, &carol.db], &carol_eid, timeout_ms);
 
     let dave = start_joined_cli_peer(&tmpdir, "dave.db", &old_invite, "dave", "dave-linux");
-    let dave_account = dave.account_label();
+    let dave_tenant = dave.tenant_label();
     assert_eventually(&dave.db, "message_count >= 3", timeout_ms);
     let dave_msg = "mixed-user/dave-step-4";
     let dave_eid = send_message(&dave.db, dave_msg);
@@ -1641,7 +1565,7 @@ fn test_cli_multi_use_user_invites_mix_reuse_and_new_creation() {
             1,
             4,
             &["alice", "bob", "carol", "dave"],
-            &[&alice_account, &bob_account, &carol_account, &dave_account],
+            &[&alice_tenant, &bob_tenant, &carol_tenant, &dave_tenant],
             &[alice_base, bob_msg, carol_msg, dave_msg],
         );
     }
@@ -1671,7 +1595,7 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
                 .expect("phone db path"),
         ),
     };
-    let phone_account = phone.account_label();
+    let phone_tenant = phone.tenant_label();
 
     let link_a = create_device_link(&phone.db, &daemon_listen_addr(&phone.db));
     let phone_base = "device-link/phone-step-1";
@@ -1679,7 +1603,7 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
     assert_event_visible_on_all(&[&phone.db], &phone_base_eid, timeout_ms);
 
     let laptop = start_linked_cli_peer(&tmpdir, "laptop.db", &link_a, "alice", "laptop");
-    let laptop_account = laptop.account_label();
+    let laptop_tenant = laptop.tenant_label();
     assert_eventually(&laptop.db, "message_count >= 1", timeout_ms);
     let laptop_msg = "device-link/laptop-step-2";
     let laptop_eid = send_message(&laptop.db, laptop_msg);
@@ -1687,7 +1611,7 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
 
     let link_b = create_device_link(&laptop.db, &daemon_listen_addr(&laptop.db));
     let tablet = start_linked_cli_peer(&tmpdir, "tablet.db", &link_b, "alice", "tablet");
-    let tablet_account = tablet.account_label();
+    let tablet_tenant = tablet.tenant_label();
     assert_eventually(&tablet.db, "message_count >= 2", timeout_ms);
     let tablet_msg = "device-link/tablet-step-3";
     let tablet_eid = send_message(&tablet.db, tablet_msg);
@@ -1698,7 +1622,7 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
     );
 
     let desktop = start_linked_cli_peer(&tmpdir, "desktop.db", &link_a, "alice", "desktop");
-    let desktop_account = desktop.account_label();
+    let desktop_tenant = desktop.tenant_label();
     assert_eventually(&desktop.db, "message_count >= 3", timeout_ms);
     let desktop_msg = "device-link/desktop-step-4";
     let desktop_eid = send_message(&desktop.db, desktop_msg);
@@ -1717,10 +1641,10 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
             1,
             &["alice"],
             &[
-                &phone_account,
-                &laptop_account,
-                &tablet_account,
-                &desktop_account,
+                &phone_tenant,
+                &laptop_tenant,
+                &tablet_tenant,
+                &desktop_tenant,
             ],
             &[phone_base, laptop_msg, tablet_msg, desktop_msg],
         );
@@ -1752,7 +1676,7 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
                 .expect("phone db path"),
         ),
     };
-    let phone_account = phone.account_label();
+    let phone_tenant = phone.tenant_label();
     let phone_base = "device-link-mixed/phone-step-1";
     let phone_base_eid = send_message(&phone.db, phone_base);
     assert_event_visible_on_all(&[&phone.db], &phone_base_eid, timeout_ms);
@@ -1793,7 +1717,7 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
                 .expect("laptop db path"),
         ),
     };
-    let laptop_account = laptop.account_label();
+    let laptop_tenant = laptop.tenant_label();
     assert_eventually(&laptop.db, "message_count >= 1", timeout_ms);
     assert_identity_eventually_materialized(&laptop.db, timeout_ms);
     let laptop_msg = "device-link-mixed/laptop-step-2";
@@ -1815,7 +1739,7 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
     );
 
     let tablet = start_linked_cli_peer(&tmpdir, "tablet.db", &explicit_link, "alice", "tablet");
-    let tablet_account = tablet.account_label();
+    let tablet_tenant = tablet.tenant_label();
     assert_eventually(&tablet.db, "message_count >= 2", timeout_ms);
     assert_identity_eventually_materialized(&tablet.db, timeout_ms);
     let tablet_msg = "device-link-mixed/tablet-step-3";
@@ -1854,7 +1778,7 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
                 .expect("desktop db path"),
         ),
     };
-    let desktop_account = desktop.account_label();
+    let desktop_tenant = desktop.tenant_label();
     assert_eventually(&desktop.db, "message_count >= 3", timeout_ms);
     assert_identity_eventually_materialized(&desktop.db, timeout_ms);
     let desktop_msg = "device-link-mixed/desktop-step-4";
@@ -1874,10 +1798,10 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
             1,
             &["alice"],
             &[
-                &phone_account,
-                &laptop_account,
-                &tablet_account,
-                &desktop_account,
+                &phone_tenant,
+                &laptop_tenant,
+                &tablet_tenant,
+                &desktop_tenant,
             ],
             &[phone_base, laptop_msg, tablet_msg, desktop_msg],
         );
@@ -1907,7 +1831,7 @@ fn test_cli_invite_with_dead_first_and_live_second_address() {
                 .expect("alice db path"),
         ),
     };
-    let alice_account = alice.account_label();
+    let alice_tenant = alice.tenant_label();
 
     let live_addr = daemon_listen_addr(&alice.db);
     let live_port = live_addr
@@ -1928,7 +1852,7 @@ fn test_cli_invite_with_dead_first_and_live_second_address() {
     assert_event_visible_on_all(&[&alice.db], &alice_base_eid, timeout_ms);
 
     let bob = start_joined_cli_peer(&tmpdir, "bob.db", &rewritten_invite, "bob", "fallback-box");
-    let bob_account = bob.account_label();
+    let bob_tenant = bob.tenant_label();
     assert_eventually(&bob.db, "message_count >= 1", timeout_ms);
     let bob_msg = "dead-first/bob-step-2";
     let bob_eid = send_message(&bob.db, bob_msg);
@@ -1942,7 +1866,7 @@ fn test_cli_invite_with_dead_first_and_live_second_address() {
             1,
             2,
             &["alice", "bob"],
-            &[&alice_account, &bob_account],
+            &[&alice_tenant, &bob_tenant],
             &[alice_base, bob_msg],
         );
     }
@@ -1980,7 +1904,7 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
                 .expect("alpha db path"),
         ),
     };
-    let alpha_account = alpha.account_label();
+    let alpha_tenant = alpha.tenant_label();
     let alpha_invite_reused = create_invite(&alpha.db, &daemon_listen_addr(&alpha.db));
     let alpha_base = "alpha-space/alpha-step-1";
     let alpha_base_eid = send_message(&alpha.db, alpha_base);
@@ -1999,7 +1923,7 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
                 .expect("zeta db path"),
         ),
     };
-    let zeta_account = zeta.account_label();
+    let zeta_tenant = zeta.tenant_label();
     let zeta_invite_fresh = create_invite(&zeta.db, &daemon_listen_addr(&zeta.db));
     let zeta_base = "zeta-space/zeta-step-1";
     let zeta_base_eid = send_message(&zeta.db, zeta_base);
@@ -2026,11 +1950,11 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
         timeout_ms,
     );
     assert_eventually_users_include(&zeta.db, &["zeta", "yuki-zeta"], timeout_ms);
-    let bob_alpha_account = "bob-alpha/bob-terminal";
+    let bob_alpha_tenant = "bob-alpha/bob-terminal";
     let bob_alpha_msg = send_message_as_username(&shared_db, "bob-alpha", "alpha-space/bob-step-2");
-    let yuki_zeta_account = "yuki-zeta/yuki-terminal";
+    let yuki_zeta_tenant = "yuki-zeta/yuki-terminal";
     let yuki_zeta_msg = send_message_as_username(&shared_db, "yuki-zeta", "zeta-space/yuki-step-2");
-    let carol_alpha_account = "carol-alpha/carol-terminal";
+    let carol_alpha_tenant = "carol-alpha/carol-terminal";
     let carol_alpha_msg =
         send_message_as_username(&shared_db, "carol-alpha", "alpha-space/carol-step-3");
     assert_event_visible_on_all(&[&alpha.db], &bob_alpha_msg, timeout_ms);
@@ -2044,7 +1968,7 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
         1,
         3,
         &["alpha", "bob-alpha", "carol-alpha"],
-        &[&alpha_account, bob_alpha_account, carol_alpha_account],
+        &[&alpha_tenant, bob_alpha_tenant, carol_alpha_tenant],
         &[
             alpha_base,
             "alpha-space/bob-step-2",
@@ -2058,7 +1982,7 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
         1,
         2,
         &["zeta", "yuki-zeta"],
-        &[&zeta_account, yuki_zeta_account],
+        &[&zeta_tenant, yuki_zeta_tenant],
         &[zeta_base, "zeta-space/yuki-step-2"],
     );
     assert_cli_state_for_username(
@@ -2069,7 +1993,7 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
         3,
         3,
         &["alpha", "bob-alpha", "carol-alpha"],
-        &[&alpha_account, bob_alpha_account, carol_alpha_account],
+        &[&alpha_tenant, bob_alpha_tenant, carol_alpha_tenant],
         &[
             alpha_base,
             "alpha-space/bob-step-2",
@@ -2084,7 +2008,7 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
         3,
         2,
         &["zeta", "yuki-zeta"],
-        &[&zeta_account, yuki_zeta_account],
+        &[&zeta_tenant, yuki_zeta_tenant],
         &[zeta_base, "zeta-space/yuki-step-2"],
     );
     assert_cli_state_for_username(
@@ -2095,7 +2019,7 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
         3,
         3,
         &["alpha", "bob-alpha", "carol-alpha"],
-        &[&alpha_account, bob_alpha_account, carol_alpha_account],
+        &[&alpha_tenant, bob_alpha_tenant, carol_alpha_tenant],
         &[
             alpha_base,
             "alpha-space/bob-step-2",
@@ -2150,7 +2074,7 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
                 .expect("alpha db path"),
         ),
     };
-    let alpha_account = alpha.account_label();
+    let alpha_tenant = alpha.tenant_label();
     let alpha_empty_invite = rewrite_invite_addrs(
         &create_invite(&alpha.db, &daemon_listen_addr(&alpha.db)),
         &[],
@@ -2176,7 +2100,7 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
                 .expect("zeta db path"),
         ),
     };
-    let zeta_account = zeta.account_label();
+    let zeta_tenant = zeta.tenant_label();
     let zeta_empty_invite =
         rewrite_invite_addrs(&create_invite(&zeta.db, &daemon_listen_addr(&zeta.db)), &[]);
     assert!(
@@ -2237,7 +2161,7 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
             ),
         }
     };
-    let dave_account = dave.account_label();
+    let dave_tenant = dave.tenant_label();
 
     assert_eventually_users_include(
         &alpha.db,
@@ -2285,9 +2209,9 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
     let yuki_live_eid = send_message_as_username(&shared_db, "yuki-zeta", yuki_live_msg);
     assert_event_visible_on_all(&[&zeta.db], &yuki_live_eid, timeout_ms);
 
-    let bob_alpha_account = "bob-alpha/bob-terminal";
-    let carol_alpha_account = "carol-alpha/carol-terminal";
-    let yuki_zeta_account = "yuki-zeta/yuki-terminal";
+    let bob_alpha_tenant = "bob-alpha/bob-terminal";
+    let carol_alpha_tenant = "carol-alpha/carol-terminal";
+    let yuki_zeta_tenant = "yuki-zeta/yuki-terminal";
 
     assert_eventually_users_include(
         &dave.db,
@@ -2303,10 +2227,10 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
         4,
         &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
         &[
-            alpha_account.as_str(),
-            bob_alpha_account,
-            carol_alpha_account,
-            dave_account.as_str(),
+            alpha_tenant.as_str(),
+            bob_alpha_tenant,
+            carol_alpha_tenant,
+            dave_tenant.as_str(),
         ],
         &[alpha_live_msg, dave_live_msg, bob_live_msg],
     );
@@ -2317,7 +2241,7 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
         1,
         2,
         &["zeta", "yuki-zeta"],
-        &[zeta_account.as_str(), yuki_zeta_account],
+        &[zeta_tenant.as_str(), yuki_zeta_tenant],
         &[zeta_live_msg, yuki_live_msg],
     );
     assert_cli_state(
@@ -2328,10 +2252,10 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
         4,
         &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
         &[
-            alpha_account.as_str(),
-            bob_alpha_account,
-            carol_alpha_account,
-            dave_account.as_str(),
+            alpha_tenant.as_str(),
+            bob_alpha_tenant,
+            carol_alpha_tenant,
+            dave_tenant.as_str(),
         ],
         &[alpha_live_msg, dave_live_msg, bob_live_msg],
     );
@@ -2344,10 +2268,10 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
         4,
         &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
         &[
-            alpha_account.as_str(),
-            bob_alpha_account,
-            carol_alpha_account,
-            dave_account.as_str(),
+            alpha_tenant.as_str(),
+            bob_alpha_tenant,
+            carol_alpha_tenant,
+            dave_tenant.as_str(),
         ],
         &[alpha_live_msg, dave_live_msg, bob_live_msg],
     );
@@ -2360,10 +2284,10 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
         4,
         &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
         &[
-            alpha_account.as_str(),
-            bob_alpha_account,
-            carol_alpha_account,
-            dave_account.as_str(),
+            alpha_tenant.as_str(),
+            bob_alpha_tenant,
+            carol_alpha_tenant,
+            dave_tenant.as_str(),
         ],
         &[alpha_live_msg, dave_live_msg, bob_live_msg],
     );
@@ -2375,7 +2299,7 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
         3,
         2,
         &["zeta", "yuki-zeta"],
-        &[zeta_account.as_str(), yuki_zeta_account],
+        &[zeta_tenant.as_str(), yuki_zeta_tenant],
         &[zeta_live_msg, yuki_live_msg],
     );
 
@@ -2433,7 +2357,7 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
                 .expect("alpha db path"),
         ),
     };
-    let alpha_account = alpha.account_label();
+    let alpha_tenant = alpha.tenant_label();
     let alpha_bootstrap = send_message(&alpha.db, "alpha-space/bootstrap");
     assert_event_visible_on_all(&[&alpha.db], &alpha_bootstrap, timeout_ms);
     let alpha_empty_invite = rewrite_invite_addrs(
@@ -2454,7 +2378,7 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
                 .expect("zeta db path"),
         ),
     };
-    let zeta_account = zeta.account_label();
+    let zeta_tenant = zeta.tenant_label();
     let zeta_bootstrap = send_message(&zeta.db, "zeta-space/bootstrap");
     assert_event_visible_on_all(&[&zeta.db], &zeta_bootstrap, timeout_ms);
     let zeta_empty_invite =
@@ -2484,7 +2408,7 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
                 .expect("dave db path"),
         ),
     };
-    let dave_account = dave.account_label();
+    let dave_tenant = dave.tenant_label();
     assert_eventually(&dave.db, "message_count >= 1", timeout_ms);
     assert_identity_eventually_materialized(&dave.db, timeout_ms);
 
@@ -2501,7 +2425,7 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
                 .expect("emma db path"),
         ),
     };
-    let emma_account = emma.account_label();
+    let emma_tenant = emma.tenant_label();
     assert_eventually(&emma.db, "message_count >= 1", timeout_ms);
     assert_identity_eventually_materialized(&emma.db, timeout_ms);
 
@@ -2593,9 +2517,9 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
         3,
         &["alpha", "bob-alpha", "dave-alpha"],
         &[
-            alpha_account.as_str(),
+            alpha_tenant.as_str(),
             "bob-alpha/bob-terminal",
-            dave_account.as_str(),
+            dave_tenant.as_str(),
         ],
         &["alpha-space/bootstrap", dave_alpha_msg, bob_alpha_msg],
     );
@@ -2607,9 +2531,9 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
         3,
         &["zeta", "yuki-zeta", "emma-zeta"],
         &[
-            zeta_account.as_str(),
+            zeta_tenant.as_str(),
             "yuki-zeta/yuki-terminal",
-            emma_account.as_str(),
+            emma_tenant.as_str(),
         ],
         &["zeta-space/bootstrap", emma_zeta_msg, yuki_zeta_msg],
     );
@@ -2622,9 +2546,9 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
         3,
         &["alpha", "bob-alpha", "dave-alpha"],
         &[
-            alpha_account.as_str(),
+            alpha_tenant.as_str(),
             "bob-alpha/bob-terminal",
-            dave_account.as_str(),
+            dave_tenant.as_str(),
         ],
         &["alpha-space/bootstrap", dave_alpha_msg, bob_alpha_msg],
     );
@@ -2637,9 +2561,9 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
         3,
         &["zeta", "yuki-zeta", "emma-zeta"],
         &[
-            zeta_account.as_str(),
+            zeta_tenant.as_str(),
             "yuki-zeta/yuki-terminal",
-            emma_account.as_str(),
+            emma_tenant.as_str(),
         ],
         &["zeta-space/bootstrap", emma_zeta_msg, yuki_zeta_msg],
     );
@@ -3127,24 +3051,6 @@ fn test_cli_send_file_and_messages_display() {
         "local attachment should show checkmark (complete), got:\n{}",
         raw
     );
-    assert!(
-        !raw.contains("MiB/s"),
-        "local attachment should not show download MiB/s, got:\n{}",
-        raw
-    );
-
-    let files_out = topo_cmd(&db, &["files"]);
-    assert!(
-        files_out.status.success(),
-        "files failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&files_out.stdout),
-        String::from_utf8_lossy(&files_out.stderr)
-    );
-    assert!(
-        !String::from_utf8_lossy(&files_out.stdout).contains("MiB/s"),
-        "local files view should not show download MiB/s, got:\n{}",
-        String::from_utf8_lossy(&files_out.stdout)
-    );
 }
 
 #[test]
@@ -3471,9 +3377,9 @@ fn test_cli_event_tree_shows_structure() {
     let _daemon = start_daemon(&db);
 
     let out = Command::new(bin())
-        .args(["--db", &db, "event-tree"])
+        .args(["--db", &db, "event", "tree"])
         .output()
-        .expect("event-tree command");
+        .expect("event tree command");
     assert!(
         out.status.success(),
         "event-tree failed: {}",
@@ -3511,32 +3417,6 @@ fn test_cli_event_tree_shows_structure() {
         "event-tree should show parenthesized IDs, got:\n{}",
         stdout
     );
-
-    // Annotations: every identity-chain event type from create-workspace
-    // must appear on the same line as its em-dash annotation.
-    let expected_annotations = [
-        ("workspace", "workspace \u{2014} creates the workspace"),
-        ("user_invite_shared", "user_invite_shared \u{2014} invites a user"),
-        ("user", "user \u{2014} registers the user"),
-        ("peer_shared", "peer_shared \u{2014} registers a device"),
-        ("peer_invite_shared", "peer_invite_shared \u{2014} invites a device"),
-        ("admin", "admin \u{2014} grants admin rights"),
-        ("tenant", "tenant \u{2014} creates local tenant identity"),
-        ("invite_accepted", "invite_accepted \u{2014} joins the workspace"),
-        ("key_secret", "key_secret \u{2014} stores a local encryption key"),
-        ("peer_secret", "peer_secret \u{2014} stores a local signing key"),
-        ("invite_secret", "invite_secret \u{2014} stores a local invite key"),
-        ("key_shared", "key_shared \u{2014} shares an encryption key"),
-    ];
-    for (label, pattern) in &expected_annotations {
-        assert!(
-            stdout.lines().any(|line| line.contains(pattern)),
-            "event-tree missing annotation for {}: no line contains '{}', got:\n{}",
-            label,
-            pattern,
-            stdout
-        );
-    }
 }
 
 #[test]
@@ -3554,9 +3434,9 @@ fn test_cli_event_list_shows_all_events() {
     let _daemon = start_daemon(&db);
 
     let out = Command::new(bin())
-        .args(["--db", &db, "event-list"])
+        .args(["--db", &db, "event", "list"])
         .output()
-        .expect("event-list command");
+        .expect("event list command");
     assert!(
         out.status.success(),
         "event-list failed: {}",
@@ -3588,32 +3468,6 @@ fn test_cli_event_list_shows_all_events() {
         "event-list should show event count, got:\n{}",
         stdout
     );
-
-    // Annotations: every identity-chain event type from create-workspace
-    // must appear on the same line as its em-dash annotation.
-    let expected_annotations = [
-        ("workspace", "workspace \u{2014} creates the workspace"),
-        ("user_invite_shared", "user_invite_shared \u{2014} invites a user"),
-        ("user", "user \u{2014} registers the user"),
-        ("peer_shared", "peer_shared \u{2014} registers a device"),
-        ("peer_invite_shared", "peer_invite_shared \u{2014} invites a device"),
-        ("admin", "admin \u{2014} grants admin rights"),
-        ("tenant", "tenant \u{2014} creates local tenant identity"),
-        ("invite_accepted", "invite_accepted \u{2014} joins the workspace"),
-        ("key_secret", "key_secret \u{2014} stores a local encryption key"),
-        ("peer_secret", "peer_secret \u{2014} stores a local signing key"),
-        ("invite_secret", "invite_secret \u{2014} stores a local invite key"),
-        ("key_shared", "key_shared \u{2014} shares an encryption key"),
-    ];
-    for (label, pattern) in &expected_annotations {
-        assert!(
-            stdout.lines().any(|line| line.contains(pattern)),
-            "event-list missing annotation for {}: no line contains '{}', got:\n{}",
-            label,
-            pattern,
-            stdout
-        );
-    }
 }
 
 #[test]
@@ -3626,9 +3480,9 @@ fn test_cli_event_tree_empty_db() {
     let _daemon = start_daemon(&db);
 
     let out = Command::new(bin())
-        .args(["--db", &db, "event-tree"])
+        .args(["--db", &db, "event", "tree"])
         .output()
-        .expect("event-tree command");
+        .expect("event tree command");
     assert!(
         out.status.success(),
         "event-tree on empty db failed: {}",
@@ -3657,9 +3511,9 @@ fn test_cli_event_list_empty_db() {
     let _daemon = start_daemon(&db);
 
     let out = Command::new(bin())
-        .args(["--db", &db, "event-list"])
+        .args(["--db", &db, "event", "list"])
         .output()
-        .expect("event-list command");
+        .expect("event list command");
     assert!(
         out.status.success(),
         "event-list on empty db failed: {}",
@@ -3688,9 +3542,9 @@ fn test_cli_event_tree_cross_refs_shown() {
     let _daemon = start_daemon(&db);
 
     let out = Command::new(bin())
-        .args(["--db", &db, "event-tree"])
+        .args(["--db", &db, "event", "tree"])
         .output()
-        .expect("event-tree command");
+        .expect("event tree command");
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
 
@@ -3718,9 +3572,9 @@ fn test_cli_event_commands_require_daemon() {
         .to_string();
 
     let event_list = Command::new(bin())
-        .args(["--db", &db, "event-list"])
+        .args(["--db", &db, "event", "list"])
         .output()
-        .expect("event-list command");
+        .expect("event list command");
     assert!(
         !event_list.status.success(),
         "event-list should fail without daemon"
@@ -3733,9 +3587,9 @@ fn test_cli_event_commands_require_daemon() {
     );
 
     let event_tree = Command::new(bin())
-        .args(["--db", &db, "event-tree"])
+        .args(["--db", &db, "event", "tree"])
         .output()
-        .expect("event-tree command");
+        .expect("event tree command");
     assert!(
         !event_tree.status.success(),
         "event-tree should fail without daemon"

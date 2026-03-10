@@ -176,18 +176,18 @@ pub fn resolve_event_id_by_transport_fingerprint(
     .optional()
 }
 
-pub struct AccountRow {
+pub struct TenantRow {
     pub event_id: String,
     pub device_name: String,
     pub user_event_id: String,
     pub username: String,
 }
 
-/// List peer accounts with joined username from users table.
-pub fn list_accounts(
+/// List peer tenants with joined username from users table.
+pub fn list_tenants(
     db: &Connection,
     recorded_by: &str,
-) -> Result<Vec<AccountRow>, rusqlite::Error> {
+) -> Result<Vec<TenantRow>, rusqlite::Error> {
     let mut stmt = db.prepare(
         "SELECT ps.event_id, COALESCE(ps.device_name, ''), COALESCE(ps.user_event_id, ''),
                 COALESCE(u.username, '')
@@ -197,7 +197,7 @@ pub fn list_accounts(
     )?;
     let rows = stmt
         .query_map(rusqlite::params![recorded_by], |row| {
-            Ok(AccountRow {
+            Ok(TenantRow {
                 event_id: row.get(0)?,
                 device_name: row.get(1)?,
                 user_event_id: row.get(2)?,
@@ -213,22 +213,22 @@ pub fn list_accounts(
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct AccountItem {
+pub struct TenantItem {
     pub event_id: String,
     pub device_name: String,
     pub user_event_id: String,
     pub username: String,
 }
 
-/// List account items (response type) from the database.
-pub fn list_account_items(
+/// List tenant items (response type) from the database.
+pub fn list_tenant_items(
     db: &Connection,
     recorded_by: &str,
-) -> Result<Vec<AccountItem>, rusqlite::Error> {
-    let rows = list_accounts(db, recorded_by)?;
+) -> Result<Vec<TenantItem>, rusqlite::Error> {
+    let rows = list_tenants(db, recorded_by)?;
     Ok(rows
         .into_iter()
-        .map(|row| AccountItem {
+        .map(|row| TenantItem {
             event_id: row.event_id,
             device_name: row.device_name,
             user_event_id: row.user_event_id,

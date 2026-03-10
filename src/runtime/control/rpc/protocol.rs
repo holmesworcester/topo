@@ -129,7 +129,7 @@ pub enum RpcMethod {
         #[serde(default = "default_upnp_action")]
         action: UpnpAction,
     },
-    /// Combined view: sidebar (workspace, users, accounts) + messages with inline reactions.
+    /// Combined view: sidebar (workspace, users, tenants) + messages with inline reactions.
     View {
         #[serde(default = "default_view_limit")]
         limit: usize,

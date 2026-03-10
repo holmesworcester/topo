@@ -295,7 +295,7 @@ fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
         .expect("linked device signer should materialize without network");
     assert_eq!(signer.0, link.peer_shared_event_id);
 
-    let account_count: i64 = conn
+    let tenant_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
             rusqlite::params![&phone_peer_id],
@@ -303,8 +303,8 @@ fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
         )
         .expect("query peers_shared");
     assert_eq!(
-        account_count, 2,
-        "linked device should project both the existing account and its own peer_shared row"
+        tenant_count, 2,
+        "linked device should project both the existing tenant and its own peer_shared row"
     );
 
     let blocked_count: i64 = conn

@@ -232,12 +232,13 @@ pub struct ViewMessage {
 pub struct ViewResponse {
     pub workspace_name: String,
     pub users: Vec<user::UserItem>,
-    pub accounts: Vec<peer_shared::AccountItem>,
+    #[serde(alias = "accounts")]
+    pub tenants: Vec<peer_shared::TenantItem>,
     pub own_user_event_id: String,
     pub messages: Vec<ViewMessage>,
 }
 
-/// Build a full workspace view: workspace name, users, accounts, messages with reactions.
+/// Build a full workspace view: workspace name, users, tenants, messages with reactions.
 pub fn view(
     db: &Connection,
     recorded_by: &str,
@@ -259,10 +260,10 @@ pub fn view(
             String::new()
         };
 
-    // Accounts (peers)
-    let accounts: Vec<peer_shared::AccountItem> = peer_shared::list_accounts(db, recorded_by)?
+    // Tenants (peers)
+    let tenants: Vec<peer_shared::TenantItem> = peer_shared::list_tenants(db, recorded_by)?
         .into_iter()
-        .map(|row| peer_shared::AccountItem {
+        .map(|row| peer_shared::TenantItem {
             event_id: row.event_id,
             device_name: row.device_name,
             user_event_id: row.user_event_id,
@@ -309,7 +310,7 @@ pub fn view(
     Ok(ViewResponse {
         workspace_name,
         users,
-        accounts,
+        tenants,
         own_user_event_id: own_user_eid,
         messages: view_messages,
     })
