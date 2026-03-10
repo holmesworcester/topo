@@ -57,8 +57,8 @@ Library-level integration tests using `Peer` + `ScenarioHarness` (no CLI binary)
 | `sync_contract_tests/` | Sync protocol correctness via `FakeSessionIo` (no QUIC) |
 | `identity_transport_contract_tests/` | Transport identity adapter conformance |
 | `holepunch_test.rs` | QUIC holepunch intro flow |
-| `perf_test.rs` | Sync throughput benchmarks |
-| `sync_graph_test.rs` | Chain propagation performance |
+| `daemon_perf_test.rs` | Daemon-based sync throughput benchmarks (warm-start timing, per-daemon VmHWM) |
+| `sync_graph_test.rs` | Legacy in-process chain and catchup benchmarks |
 | `topo_cascade_test.rs` | SQLite topo-sort cascade performance |
 | `file_throughput_test.rs` | File-slice insertion throughput |
 | `low_mem_test.rs` | RSS budget tests |

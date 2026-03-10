@@ -266,33 +266,16 @@ AMD Ryzen AI MAX+ 395 (16c/32t) · 122 GiB RAM · SQLite WAL · Rust `--release`
 
 # Core Sync Throughput
 
-Peer-to-peer QUIC sync over localhost with negentropy reconciliation.
+Peer-to-peer QUIC sync over localhost with negentropy reconciliation (daemon-based, warm start).
 
-| Test | Events | Wall Time | Msgs/s | MiB/s | Peak RSS |
-|------|-------:|----------:|-------:|------:|--------:|
-| 10k bidirectional (5k each) | 10,000 | 1.02s | 9,783 | 11.14 | 134.8 MiB |
-| 50k one-way | 50,000 | 6.73s | 7,431 | 8.46 | 230.4 MiB |
-| 500k one-way | 500,000 | 116s | 4,300 | 4.90 | 488.5 MiB |
-| 10k continuous inject | 10,000 | 3.60s | 2,775 | 3.16 | 176.3 MiB |
+| Test | Events | Wall Time | Msgs/s | Peak VmHWM |
+|------|-------:|----------:|-------:|-----------:|
+| 10k bidirectional (5k each) | 10,000 | 2.37s | 4,211 | 70.4 MiB |
+| 50k one-way | 50,000 | 16.13s | 3,100 | 131.2 MiB |
+| 10k continuous inject | 10,000 | 1.85s | 5,412 | 66.6 MiB |
 
-- 500k tail-phase slowdown gated by receiver-side SQLite insert rate
-- Continuous inject: events injected in 100-event batches while sync is running
-
----
-
-# Negentropy Frame Size Tuning
-
-500k one-way sync — per-round reconciliation cost is super-linear in frame size.
-
-| Frame Size | Rounds | Reconcile | Wall Time | Msgs/s | MiB/s |
-|:----------:|-------:|----------:|----------:|-------:|------:|
-| 64 KB | 245 | 295s | 303s | 1,648 | 1.88 |
-| 128 KB | 123 | 152s | 162s | 3,087 | 3.52 |
-| **256 KB** | **62** | **131s** | **141s** | **3,555** | **4.05** |
-| 512 KB | 31 | 105s | 117s | 4,267 | 4.86 |
-| 1 MB | 16 | 543s | killed | - | - |
-
-- **256 KB** is the sweet spot; 1 MB is catastrophic (34s/round)
+- Peak VmHWM is per-daemon (max of sender/receiver), not shared-process RSS
+- Continuous inject: events injected while sync is running
 
 ---
 
@@ -300,14 +283,14 @@ Peer-to-peer QUIC sync over localhost with negentropy reconciliation.
 
 Local encode + store + project for 256 KiB ciphertext slices (no sync).
 
-| Size | Slices | Wall Time | MB/s | MiB/s | Slices/s |
-|-----:|-------:|----------:|-----:|------:|---------:|
-| 256 KiB | 1 | 0.003s | 83.7 | 79.8 | 335 |
-| 10 MB | 40 | 0.057s | 175.1 | 167.0 | 701 |
-| 100 MB | 400 | 0.531s | 188.4 | 179.7 | 754 |
-| 1 GB | 4,096 | 5.167s | 198.2 | 189.0 | 793 |
+| Size | Slices | Wall Time | MB/s | Slices/s |
+|-----:|-------:|----------:|-----:|---------:|
+| 256 KiB | 1 | 0.001s | 185.6 | 742 |
+| 10 MB | 40 | 0.049s | 206.0 | 824 |
+| 100 MB | 400 | 0.489s | 204.6 | 818 |
+| 1 GB | 4,096 | 4.995s | 205.0 | 820 |
 
-- Throughput scales to ~200 MB/s; CPU-bound on encryption + SQLite writes
+- Throughput ~205 MB/s across all sizes; CPU-bound on encryption + SQLite writes
 
 ---
 
@@ -317,60 +300,28 @@ Worst-case dependency cascade: each event depends on up to 10 prior events, inse
 
 | Scale | Blocking | Cascade | Cascade Rate | Total | Peak RSS |
 |------:|---------:|--------:|-------------:|------:|---------:|
-| 10k | 2.22s | 1.44s | 6,930 ev/s | 3.73s | 59.2 MiB |
-| 50k | 10.31s | 6.51s | 7,678 ev/s | 17.23s | 106.1 MiB |
-| 500k | 91.16s | 69.78s | 7,165 ev/s | 165.60s | 399.6 MiB |
+| 10k | 1.614s | 1.168s | 8,555 ev/s | 2.850s | 59.0 MiB |
+| 50k | 10.633s | 6.786s | 7,366 ev/s | 17.797s | 106.0 MiB |
+| 500k | 92.460s | 71.961s | 6,948 ev/s | 169.185s | 399.6 MiB |
 
-- Cascade rate ~7k ev/s across all scales (linear scaling)
+- Cascade rate ~7-8.5k ev/s across all scales (linear scaling)
 - Memory grows sub-linearly: 50x events = ~7x RSS
-
----
-
-# Sync Graph: 10-Hop Chain
-
-Events injected at P0, propagate through P0 → P1 → ... → P9.
-
-| Scale | Tail Converge | Events/s | MiB/s | Hop P50 | Hop P95 | Peak RSS |
-|------:|--------------:|---------:|------:|--------:|--------:|---------:|
-| 10k | 7,127 ms | 1,403 | 1.60 | 1,021 ms | 6,329 ms | 1,363 MiB |
-| 50k | 3,668 ms | 13,631 | 15.52 | 2,929 ms | 7,777 ms | 1,755 MiB |
-
-- 50k appears faster due to amortized fixed setup/connection costs
-- Chain results show topology behavior (hop delay + memory), not raw throughput
-
----
-
-# Sync Graph: Multi-Source Catchup
-
-Sink-driven catchup from pre-seeded identical source datasets (100k events at sink).
-
-| Sources | Wall | Events/s | MiB/s | Peak RSS |
-|--------:|-----:|---------:|------:|---------:|
-| 4 | 6,083 ms | 16,439 | 1.56 | 689 MiB |
-| 8 | 9,604 ms | 10,412 | 0.99 | 1,370 MiB |
-
-Large-file catchup (256 KiB slices per file):
-
-| Case | Wall | Events/s | MB/s | Peak RSS |
-|------|-----:|---------:|-----:|---------:|
-| 4x400 slices | 416 ms | 962 | 240.5 | 1,111 MiB |
-| 4x1024 slices | 630 ms | 1,625 | 406.6 | 1,111 MiB |
-| 8x1024 slices | 833 ms | 1,229 | 307.5 | 1,363 MiB |
 
 ---
 
 # Low-Memory: iOS NSE Target (24 MiB)
 
 Constrained-runtime gate for iOS background push (24 MiB target, 22 MiB enforced via cgroup v2).
+Per-daemon VmHWM measured via lowmem proxy delta harness.
 
 | Case | Synced | Peak KB | 24 MiB? | 22 MiB cgroup? |
 |------|--------|--------:|:-------:|:--------------:|
-| 500k+10k messages | all 10k msgs | 18,764 | PASS | PASS |
-| 500k+100x1MiB files | all 400 slices | 14,088 | PASS | PASS |
+| 50k+10k messages | all 10k msgs | 7,356 | PASS | PASS |
+| 50k+20x1MiB files | all 80 slices | 7,016 | PASS | PASS |
 
 - SQLite cache ~1 MiB, `temp_store=FILE`, `mmap_size=0`
 - Ingest channel capacity reduced to 1000
-- Peak RSS flat across baselines; memory shape dominated by `wanted` watermark + DB-backed `need_queue`
+- Peak VmHWM ~7 MiB per daemon; memory shape dominated by `wanted` watermark + DB-backed `need_queue`
 
 ---
 

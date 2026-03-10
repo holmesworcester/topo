@@ -235,25 +235,34 @@ pub fn generate_for_peer(
     let workspace_id = workspace::resolve_workspace_for_peer(&db, &recorded_by)?;
     let author_id = peer_shared::resolve_user_event_id(&db, &recorded_by, &signer_eid)?;
 
-    db.execute("BEGIN", [])?;
-    for i in 0..count {
-        create(
-            &db,
-            &recorded_by,
-            &signer_eid,
-            &signing_key,
-            current_timestamp_ms(),
-            CreateMessageCmd {
-                workspace_id,
-                author_id,
-                content: format!("Message {}", i),
-            },
-        )
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("create event error: {}", e).into()
-        })?;
+    // Break into smaller batches to avoid holding the write lock too long.
+    // A single long transaction causes SQLITE_BUSY for the sync engine's
+    // runtime manager, which treats it as a fatal error.
+    const BATCH_SIZE: usize = 1000;
+    let mut i = 0;
+    while i < count {
+        let batch_end = (i + BATCH_SIZE).min(count);
+        db.execute("BEGIN", [])?;
+        for j in i..batch_end {
+            create(
+                &db,
+                &recorded_by,
+                &signer_eid,
+                &signing_key,
+                current_timestamp_ms(),
+                CreateMessageCmd {
+                    workspace_id,
+                    author_id,
+                    content: format!("Message {}", j),
+                },
+            )
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("create event error: {}", e).into()
+            })?;
+        }
+        db.execute("COMMIT", [])?;
+        i = batch_end;
     }
-    db.execute("COMMIT", [])?;
 
     Ok(GenerateResponse { count })
 }
@@ -285,8 +294,10 @@ pub fn generate_files_for_peer(
     let slice_bytes_u32 = FILE_SLICE_CIPHERTEXT_BYTES as u32;
     let ciphertext: Vec<u8> = vec![0xAB; FILE_SLICE_CIPHERTEXT_BYTES];
 
-    db.execute("BEGIN", [])?;
+    // Each file is its own transaction to avoid holding the write lock
+    // too long and causing SQLITE_BUSY for the sync engine.
     for i in 0..files {
+        db.execute("BEGIN", [])?;
         let message_event_id = create(
             &db,
             &recorded_by,
@@ -358,8 +369,8 @@ pub fn generate_files_for_peer(
                 format!("create file_slice error: {}", e).into()
             })?;
         }
+        db.execute("COMMIT", [])?;
     }
-    db.execute("COMMIT", [])?;
 
     Ok(GenerateFilesResponse {
         files,

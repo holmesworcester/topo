@@ -66,6 +66,15 @@ fn large_trustset_allow_deny_correctness() {
         !is_peer_allowed(&db, &alice.identity, &unknown).expect("is_peer_allowed"),
         "expected denied for unknown key"
     );
+
+    eprintln!();
+    eprintln!("=== Large trust-set correctness ===");
+    eprintln!("  Seeded keys:    {}", fps.len());
+    eprintln!("  Lookups:        {}", 4);
+    if let Some(current) = current_rss_mib() {
+        eprintln!("  Current RSS:    {:.2} MiB", current);
+    }
+    eprintln!();
 }
 
 /// Memory budget test: seed 100K pending bootstrap trust entries, then perform lookups and verify
@@ -115,4 +124,14 @@ fn low_mem_large_trustset_budget() {
         rss_after,
         budget
     );
+
+    eprintln!();
+    eprintln!("=== Large trust-set budget ===");
+    eprintln!("  Seeded keys:    {}", fps.len());
+    eprintln!("  Lookups:        {}", 1001);
+    eprintln!("  RSS before:     {:.2} MiB", rss_before);
+    eprintln!("  RSS after:      {:.2} MiB", rss_after);
+    eprintln!("  RSS delta:      {:.2} MiB", delta);
+    eprintln!("  Budget:         {:.2} MiB", budget);
+    eprintln!();
 }
