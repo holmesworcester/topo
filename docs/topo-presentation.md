@@ -130,11 +130,11 @@ Is p2p just intrinsically #$%@ing hard? Or is all this slog totally avoidable an
 
 ---
 
-# Existing p2p tools have been meh 🫤
+# Our experience with existing p2p tools has been meh 🫤
 
 <!-- pt:incremental_lists: true -->
 
-- Our experience: they cover *some* of our needed stack
+- They cover *some* of our needed stack
 - But what they *do* cover is costly to adapt to product goals
 - And *uncovered* areas sprout concurrency problems, heisenbugs
 
@@ -142,29 +142,29 @@ Is p2p just intrinsically #$%@ing hard? Or is all this slog totally avoidable an
 
 ---
 
-# Specific gripes 😡
+# Specific gripes with existing p2p tools 😡
 
 <!-- pt:incremental_lists: true -->
 
-- **Arbitrary dependency linkages** - these are the opposite of what you want: they block content when you *don't* need that and not when you do
-- **No iOS support** - especially for push & the iOS NSE memory limit
-- **No multi-tenant/account support** - so you'll need to roll a lot of your own infra to support mobile devices and notifications
-- **No simple API for frontends** - you must build a complex middle layer to cover all the queries your frontend 
+- **Arbitrary dependency linkages** - these are the opposite of what you want: they block content when you *don't* need that and not when you do 
+- **No iOS support** - especially for push & the iOS NSE memory limit 🐼
+- **No multi-tenant/account support** - so you'll need to roll a lot of your own infra to support mobile devices and notifications 🐼
+- **No simple API for frontends** - you must build a complex middle layer to cover all the queries your frontend 🐼
 
-(**p2panda** is a lot better than others, but I think all but the first apply to it too)
+(**p2panda** is a lot better than others, but all gripes marked 🐼 apply to it too)
 
 ---
 
 # Topo 🐭 is maybe a better way
 
-Instead of providing lots of features for *parts* of the problem, it focuses on covering:
+Instead of providing lots of features for *parts* of the problem, it focuses on covering
 
 <!-- pt:incremental_lists: true -->
 
 - **All layers**: everything from networking to the local app API.
 - **Most contexts**: everything from iOS notification fetching to multi-tenant servers. (Soon the web, too.)
 
-...and covering them in a principled solution to the hard problem, **concurrency**.
+...in a principled solution to the hard problem, **concurrency**.
 
 ---
 
@@ -172,11 +172,11 @@ Instead of providing lots of features for *parts* of the problem, it focuses on 
 
 <!-- pt:incremental_lists: true -->
 
-- No separate backend for iOS (uses SQLite to stay memory-bounded)
-- No separate backend for cloud: one endpoint can host many tenants
+- Uses SQLite to stay memory-bounded so **no separate backend for iOS**
+- One endpoint can host many tenants so **no separate infra for cloud** 
 - Dependencies can match product needs
 - End-to-end testing is cheap and easy
-- Gives you a flexible, concurrency-safe way to do encryption and auth
+- You get a flexible, concurrency-safe way to do encryption and auth
 
 ---
 
@@ -184,10 +184,10 @@ Instead of providing lots of features for *parts* of the problem, it focuses on 
 
 <!-- pt:incremental_lists: true -->
 
-- Projected SQLite tables give the data the shape it actually wants.
-- The API can answer complex queries like "give me a paginated message list with usernames, reactions, attachments, and download progress".
-- Optimistic UI just appends a local `client_op_id`; no need for a custom sync state machine.
-- Frontends can poll or get subscription feeds of what changed.
+- Events turn into SQLite tables so **data can have whatever shape it wants**
+- The API can answer complex queries like "give me a paginated message list with usernames, reactions, attachments, and download progress" so **you don't need a middle layer**
+- A local `client_op_id` can return with eventually-updated events, so **you don't need for a custom sync state machine for optimistic updates**
+- Frontends can get subscription feeds of changes and poll for the latest state, so **frontend state management is easy.**
 
 ---
 
@@ -204,7 +204,7 @@ Instead of providing lots of features for *parts* of the problem, it focuses on 
 
 ---
 
-# Walkthrough: Runtime Main Loop
+# Runtime Loop
 
 ```text
 CLI / RPC Control
