@@ -130,11 +130,11 @@ Is p2p just intrinsically #$%@ing hard? Or is all this slog totally avoidable an
 
 ---
 
-# Existing p2p tools have been meh 🫤
+# Our experience with existing p2p tools has been meh 🫤
 
 <!-- pt:incremental_lists: true -->
 
-- Our experience: they cover *some* of our needed stack
+- They cover *some* of our needed stack
 - But what they *do* cover is costly to adapt to product goals
 - And *uncovered* areas sprout concurrency problems, heisenbugs
 
