@@ -2,7 +2,7 @@
 //!
 //! These tests enforce bounded memory behavior under `LOW_MEM_IOS=1`.
 //! RSS-sampling tests are ignored by default because authoritative
-//! hard-cap validation comes from the daemon + cgroup proxy harness.
+//! hard-cap validation comes from the daemon + cgroup harness.
 
 use std::time::Duration;
 
@@ -115,7 +115,7 @@ async fn low_mem_ios_functional_smoke_2k() {
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
-#[ignore = "RSS-sampling sanity only; use lowmem proxy/cgroup for hard gates"]
+#[ignore = "RSS-sampling sanity only; use lowmem cgroup for hard gates"]
 async fn low_mem_ios_budget_smoke_10k() {
     let _env = EnvGuard::enable_low_mem_ios();
 

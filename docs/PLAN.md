@@ -975,7 +975,7 @@ Note: wrapping all projection writes in a single transaction was attempted first
 - validate at scale (`>= 1_000_000` canonical events on disk) with stable memory.
 - include large-identity-set validation (for example `>= 100_000` peer trust keys) while preserving memory ceiling.
 - Linux realism gate for this phase:
-  - lowmem proxy/regimen perf harnesses are Linux-only (`/proc` + cgroup v2 dependencies),
+  - lowmem harness perf scripts are Linux-only (`/proc` + cgroup v2 dependencies),
   - hard-cap validation should run receiver (`bob`) with cgroup v2 `memory.max=22528 KiB` and `memory.swap.max=0`,
   - passing runs must show both `PASS_UNDER_24MB=1` and `CGROUP_OOM_KILL=0`,
   - RSS-sampling budget tests in `low_mem_test.rs` are sanity-only and ignored by default.
@@ -1341,9 +1341,9 @@ Topology reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) section `4` (thre
    - `scripts/run_perf_serial.sh lowmem` (fast cgroup-enforced matrix).
 2. RSS-sampling sanity lane (ignored by default):
    - `cargo test --release --test low_mem_test -- --ignored --nocapture --test-threads=1`
-3. Run lowmem realism through daemon-based proxy harness, not in-process unit tests:
-   - `scripts/run_lowmem_proxy.sh delta10k`
-   - `scripts/run_lowmem_proxy.sh deltafiles`
+3. Run lowmem realism through daemon-based harness, not in-process unit tests:
+   - `scripts/run_lowmem.sh delta10k`
+   - `scripts/run_lowmem.sh deltafiles`
 4. For release/perf evidence at larger scales, enable optional serial lowmem POC matrix:
    - `PERF_LOWMEM_POC_ENABLE=1 PERF_LOWMEM_RUN_LARGE_TARGET=1 PERF_LOWMEM_RUN_SMALL_BRACKET=1 scripts/run_perf_serial.sh lowmem`
 5. Linux-only contract for these runs:

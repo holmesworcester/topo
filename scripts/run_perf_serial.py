@@ -39,7 +39,7 @@ class PerfRunner:
         self.script_dir = Path(__file__).resolve().parent
         self.repo_root = self.script_dir.parent
         self.perf_md = self.repo_root / "docs" / "PERF.md"
-        self.lowmem_proxy_script = self.repo_root / "scripts" / "run_lowmem_proxy.sh"
+        self.lowmem_script = self.repo_root / "scripts" / "run_lowmem.sh"
         self.auto_results: list[str] = []
         self.tmpdir = tempfile.TemporaryDirectory()
         self.tmp_path = Path(self.tmpdir.name)
@@ -174,13 +174,13 @@ class PerfRunner:
         if self.env_value("PERF_LOWMEM_RUN_SMALL_TARGET", "1") == "1":
             self.run(
                 f"Lowmem Delta ({base_small}+{delta_target} messages)",
-                [str(self.lowmem_proxy_script), "delta10k"],
+                [str(self.lowmem_script), "delta10k"],
                 extra_env={
-                    "LOWMEM_PROXY_BASE_EVENTS": base_small,
-                    "LOWMEM_PROXY_DELTA_EVENTS": delta_target,
-                    "LOWMEM_PROXY_BUDGET_KB": budget_kb,
-                    "LOWMEM_PROXY_CGROUP_ENFORCE": cgroup_enforce,
-                    "LOWMEM_PROXY_CGROUP_LIMIT_KB": cgroup_limit_kb,
+                    "LOWMEM_BASE_EVENTS": base_small,
+                    "LOWMEM_DELTA_EVENTS": delta_target,
+                    "LOWMEM_BUDGET_KB": budget_kb,
+                    "LOWMEM_CGROUP_ENFORCE": cgroup_enforce,
+                    "LOWMEM_CGROUP_LIMIT_KB": cgroup_limit_kb,
                 },
                 allow_failure=True,
             )
@@ -188,13 +188,13 @@ class PerfRunner:
         if self.env_value("PERF_LOWMEM_RUN_SMALL_BRACKET", "0") == "1":
             self.run(
                 f"Lowmem Delta ({base_small}+{delta_bracket} messages)",
-                [str(self.lowmem_proxy_script), "delta10k"],
+                [str(self.lowmem_script), "delta10k"],
                 extra_env={
-                    "LOWMEM_PROXY_BASE_EVENTS": base_small,
-                    "LOWMEM_PROXY_DELTA_EVENTS": delta_bracket,
-                    "LOWMEM_PROXY_BUDGET_KB": budget_kb,
-                    "LOWMEM_PROXY_CGROUP_ENFORCE": cgroup_enforce,
-                    "LOWMEM_PROXY_CGROUP_LIMIT_KB": cgroup_limit_kb,
+                    "LOWMEM_BASE_EVENTS": base_small,
+                    "LOWMEM_DELTA_EVENTS": delta_bracket,
+                    "LOWMEM_BUDGET_KB": budget_kb,
+                    "LOWMEM_CGROUP_ENFORCE": cgroup_enforce,
+                    "LOWMEM_CGROUP_LIMIT_KB": cgroup_limit_kb,
                 },
                 allow_failure=True,
             )
@@ -202,28 +202,28 @@ class PerfRunner:
         if self.env_value("PERF_LOWMEM_RUN_LARGE_TARGET", "0") == "1":
             self.run(
                 f"Lowmem Delta ({base_large}+{delta_target} messages)",
-                [str(self.lowmem_proxy_script), "delta10k"],
+                [str(self.lowmem_script), "delta10k"],
                 extra_env={
-                    "LOWMEM_PROXY_BASE_EVENTS": base_large,
-                    "LOWMEM_PROXY_DELTA_EVENTS": delta_target,
-                    "LOWMEM_PROXY_BUDGET_KB": budget_kb,
-                    "LOWMEM_PROXY_CGROUP_ENFORCE": cgroup_enforce,
-                    "LOWMEM_PROXY_CGROUP_LIMIT_KB": cgroup_limit_kb,
+                    "LOWMEM_BASE_EVENTS": base_large,
+                    "LOWMEM_DELTA_EVENTS": delta_target,
+                    "LOWMEM_BUDGET_KB": budget_kb,
+                    "LOWMEM_CGROUP_ENFORCE": cgroup_enforce,
+                    "LOWMEM_CGROUP_LIMIT_KB": cgroup_limit_kb,
                 },
                 allow_failure=True,
             )
 
-        if self.env_value("PERF_LOWMEM_RUN_FILE_PROXY", "1") == "1":
+        if self.env_value("PERF_LOWMEM_RUN_FILES", "1") == "1":
             self.run(
                 f"Lowmem Delta Files ({file_baseline}+{file_count}x{file_size_mib}MiB)",
-                [str(self.lowmem_proxy_script), "deltafiles"],
+                [str(self.lowmem_script), "deltafiles"],
                 extra_env={
-                    "LOWMEM_PROXY_BASE_EVENTS": file_baseline,
-                    "LOWMEM_PROXY_DELTA_FILES": file_count,
-                    "LOWMEM_PROXY_DELTA_FILE_MIB": file_size_mib,
-                    "LOWMEM_PROXY_BUDGET_KB": budget_kb,
-                    "LOWMEM_PROXY_CGROUP_ENFORCE": cgroup_enforce,
-                    "LOWMEM_PROXY_CGROUP_LIMIT_KB": cgroup_limit_kb,
+                    "LOWMEM_BASE_EVENTS": file_baseline,
+                    "LOWMEM_DELTA_FILES": file_count,
+                    "LOWMEM_DELTA_FILE_MIB": file_size_mib,
+                    "LOWMEM_BUDGET_KB": budget_kb,
+                    "LOWMEM_CGROUP_ENFORCE": cgroup_enforce,
+                    "LOWMEM_CGROUP_LIMIT_KB": cgroup_limit_kb,
                 },
                 allow_failure=True,
             )
@@ -238,53 +238,53 @@ class PerfRunner:
 
         self.run(
             "Lowmem POC Messages (1M+10k, 24MB gate)",
-            [str(self.lowmem_proxy_script), "delta10k"],
+            [str(self.lowmem_script), "delta10k"],
             extra_env={
-                "LOWMEM_PROXY_BASE_EVENTS": self.env_value("PERF_LOWMEM_POC_MSG_BASELINE", "1000000"),
-                "LOWMEM_PROXY_DELTA_EVENTS": self.env_value("PERF_LOWMEM_POC_MSG_DELTA", "10000"),
-                "LOWMEM_PROXY_BUDGET_KB": budget_kb,
-                "LOWMEM_PROXY_CGROUP_ENFORCE": cgroup_enforce,
-                "LOWMEM_PROXY_CGROUP_LIMIT_KB": cgroup_limit_kb,
+                "LOWMEM_BASE_EVENTS": self.env_value("PERF_LOWMEM_POC_MSG_BASELINE", "1000000"),
+                "LOWMEM_DELTA_EVENTS": self.env_value("PERF_LOWMEM_POC_MSG_DELTA", "10000"),
+                "LOWMEM_BUDGET_KB": budget_kb,
+                "LOWMEM_CGROUP_ENFORCE": cgroup_enforce,
+                "LOWMEM_CGROUP_LIMIT_KB": cgroup_limit_kb,
             },
             allow_failure=True,
         )
 
         self.run(
             "Lowmem POC Files Realism (500k+100x1MiB, 24MB gate)",
-            [str(self.lowmem_proxy_script), "deltafiles"],
+            [str(self.lowmem_script), "deltafiles"],
             extra_env={
-                "LOWMEM_PROXY_BASE_EVENTS": self.env_value(
+                "LOWMEM_BASE_EVENTS": self.env_value(
                     "PERF_LOWMEM_POC_REALISM_FILE_BASELINE", "500000"
                 ),
-                "LOWMEM_PROXY_DELTA_FILES": self.env_value(
+                "LOWMEM_DELTA_FILES": self.env_value(
                     "PERF_LOWMEM_POC_REALISM_FILE_COUNT", "100"
                 ),
-                "LOWMEM_PROXY_DELTA_FILE_MIB": self.env_value(
+                "LOWMEM_DELTA_FILE_MIB": self.env_value(
                     "PERF_LOWMEM_POC_REALISM_FILE_SIZE_MIB", "1"
                 ),
-                "LOWMEM_PROXY_BUDGET_KB": budget_kb,
-                "LOWMEM_PROXY_CGROUP_ENFORCE": cgroup_enforce,
-                "LOWMEM_PROXY_CGROUP_LIMIT_KB": cgroup_limit_kb,
+                "LOWMEM_BUDGET_KB": budget_kb,
+                "LOWMEM_CGROUP_ENFORCE": cgroup_enforce,
+                "LOWMEM_CGROUP_LIMIT_KB": cgroup_limit_kb,
             },
             allow_failure=True,
         )
 
         self.run(
             "Lowmem POC Files Extreme (0+10k x1MiB, 24MB gate)",
-            [str(self.lowmem_proxy_script), "deltafilesquick"],
+            [str(self.lowmem_script), "deltafilesquick"],
             extra_env={
-                "LOWMEM_PROXY_QUICK_DELTA_FILES": self.env_value(
+                "LOWMEM_QUICK_DELTA_FILES": self.env_value(
                     "PERF_LOWMEM_POC_FILE_COUNT", "10000"
                 ),
-                "LOWMEM_PROXY_QUICK_DELTA_FILE_MIB": self.env_value(
+                "LOWMEM_QUICK_DELTA_FILE_MIB": self.env_value(
                     "PERF_LOWMEM_POC_FILE_SIZE_MIB", "1"
                 ),
-                "LOWMEM_PROXY_QUICK_TIMEOUT_SECS": self.env_value(
+                "LOWMEM_QUICK_TIMEOUT_SECS": self.env_value(
                     "PERF_LOWMEM_POC_FILE_TIMEOUT_SECS", "3600"
                 ),
-                "LOWMEM_PROXY_BUDGET_KB": budget_kb,
-                "LOWMEM_PROXY_CGROUP_ENFORCE": cgroup_enforce,
-                "LOWMEM_PROXY_CGROUP_LIMIT_KB": cgroup_limit_kb,
+                "LOWMEM_BUDGET_KB": budget_kb,
+                "LOWMEM_CGROUP_ENFORCE": cgroup_enforce,
+                "LOWMEM_CGROUP_LIMIT_KB": cgroup_limit_kb,
             },
             allow_failure=True,
         )

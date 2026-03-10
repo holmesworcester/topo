@@ -72,9 +72,9 @@ cargo test --release --test low_mem_test -- --nocapture
 # Low-memory RSS-sampling tests (ignored by default)
 cargo test --release --test low_mem_test -- --ignored --nocapture --test-threads=1
 
-# Dedicated lowmem proxy delta harness (direct, Linux-only)
+# Dedicated lowmem delta harness (direct, Linux-only)
 # Requires /proc/<pid>/{status,smaps}; cgroup-enforced mode also requires cgroup v2.
-scripts/run_lowmem_proxy.sh delta10k
+scripts/run_lowmem.sh delta10k
 ```
 
 ## Latest Results
@@ -259,11 +259,11 @@ cargo +stable test --release --test low_mem_large_trustset_test -- --nocapture -
 ### Lowmem Delta (50000+10000 messages)
 
 ```bash
-/tmp/poc-7-claude-perf-followup/scripts/run_lowmem_proxy.sh delta10k
+/tmp/poc-7-claude-perf-followup/scripts/run_lowmem.sh delta10k
 ```
 
 ```text
-RUN_DIR=/tmp/poc-7-claude-perf-followup/target/lowmem-proxy/delta-1264486_1773108289
+RUN_DIR=/tmp/poc-7-claude-perf-followup/target/lowmem/delta-1264486_1773108289
 SCENARIO=large_delta
 DELTA_KIND=messages
 BASE_EVENTS=50000
@@ -308,11 +308,11 @@ MAX_MALL_MMAP=3514368
 ### Lowmem Delta Files (50000+20x1MiB)
 
 ```bash
-/tmp/poc-7-claude-perf-followup/scripts/run_lowmem_proxy.sh deltafiles
+/tmp/poc-7-claude-perf-followup/scripts/run_lowmem.sh deltafiles
 ```
 
 ```text
-RUN_DIR=/tmp/poc-7-claude-perf-followup/target/lowmem-proxy/delta-1268525_1773108319
+RUN_DIR=/tmp/poc-7-claude-perf-followup/target/lowmem/delta-1268525_1773108319
 SCENARIO=large_delta
 DELTA_KIND=files
 BASE_EVENTS=50000

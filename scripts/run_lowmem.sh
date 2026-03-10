@@ -1,47 +1,47 @@
 #!/usr/bin/env bash
 set -euo pipefail
 
-# Fast proxy regimen for low-memory iteration:
+# Low-memory sync harness:
 # 1) 10k smoke (both peers lowmem, realistic two-daemon harness)
 # 2) 50k asymmetric soak (sender normal, receiver lowmem)
 # 3) Large-baseline delta sync (baseline normal, delta in lowmem)
 #
 # Outputs:
-# - per-run artifacts under target/lowmem-proxy
+# - per-run artifacts under target/lowmem
 # - receiver RSS/smaps maxima
 # - LOW_MEM_MEMTRACE-derived queue/backpressure maxima
 # - "big users" summary for quick bottleneck diagnosis
 
-MODE="${1:-proxy}"
+MODE="${1:-all}"
 
 if [ "$(uname -s)" != "Linux" ]; then
-  echo "error: low-memory proxy requires Linux (/proc/<pid>/status + smaps)"
+  echo "error: low-memory harness requires Linux (/proc/<pid>/status + smaps)"
   exit 2
 fi
 
 SCRIPT_ROOT="$(cd "$(dirname "$0")/.." && pwd)"
-RUN_ROOT="${LOWMEM_PROXY_RUN_DIR:-${SCRIPT_ROOT}/target/lowmem-proxy}"
+RUN_ROOT="${LOWMEM_RUN_DIR:-${SCRIPT_ROOT}/target/lowmem}"
 TOPO_BIN="${TOPO_BIN:-${SCRIPT_ROOT}/target/release/topo}"
 TOPO_CMD_TIMEOUT_SECS="${TOPO_CMD_TIMEOUT_SECS:-600}"
-SAMPLE_INTERVAL_SECS="${LOWMEM_PROXY_SAMPLE_INTERVAL_SECS:-10}"
+SAMPLE_INTERVAL_SECS="${LOWMEM_SAMPLE_INTERVAL_SECS:-10}"
 
-SMOKE_EVENTS_PER_PEER="${LOWMEM_PROXY_SMOKE_EVENTS_PER_PEER:-5000}"
-SMOKE_BUDGET_MIB="${LOWMEM_PROXY_SMOKE_BUDGET_MIB:-2000}"
-ASYM_EVENTS="${LOWMEM_PROXY_EVENTS:-50000}"
+SMOKE_EVENTS_PER_PEER="${LOWMEM_SMOKE_EVENTS_PER_PEER:-5000}"
+SMOKE_BUDGET_MIB="${LOWMEM_SMOKE_BUDGET_MIB:-2000}"
+ASYM_EVENTS="${LOWMEM_EVENTS:-50000}"
 WAL_CAP_MIB="${LOW_MEM_WAL_CAP_MIB:-12}"
-LARGE_BASE_EVENTS="${LOWMEM_PROXY_BASE_EVENTS:-500000}"
-LARGE_DELTA_EVENTS="${LOWMEM_PROXY_DELTA_EVENTS:-10000}"
-LARGE_DELTA_KIND="${LOWMEM_PROXY_DELTA_KIND:-messages}"
-LARGE_DELTA_FILES="${LOWMEM_PROXY_DELTA_FILES:-100}"
-LARGE_DELTA_FILE_MIB="${LOWMEM_PROXY_DELTA_FILE_MIB:-1}"
-LARGE_TIMEOUT_SECS="${LOWMEM_PROXY_LARGE_TIMEOUT_SECS:-3600}"
-LARGE_MARKER_MESSAGES="${LOWMEM_PROXY_DELTA_MARKER_MESSAGES:-3}"
+LARGE_BASE_EVENTS="${LOWMEM_BASE_EVENTS:-500000}"
+LARGE_DELTA_EVENTS="${LOWMEM_DELTA_EVENTS:-10000}"
+LARGE_DELTA_KIND="${LOWMEM_DELTA_KIND:-messages}"
+LARGE_DELTA_FILES="${LOWMEM_DELTA_FILES:-100}"
+LARGE_DELTA_FILE_MIB="${LOWMEM_DELTA_FILE_MIB:-1}"
+LARGE_TIMEOUT_SECS="${LOWMEM_LARGE_TIMEOUT_SECS:-3600}"
+LARGE_MARKER_MESSAGES="${LOWMEM_DELTA_MARKER_MESSAGES:-3}"
 
 LOWMEM_MEMTRACE_ENABLED="${LOW_MEM_MEMTRACE:-1}"
-LOWMEM_BUDGET_KB="${LOWMEM_PROXY_BUDGET_KB:-24576}"
-LOWMEM_CGROUP_ENFORCE="${LOWMEM_PROXY_CGROUP_ENFORCE:-0}"
-LOWMEM_CGROUP_LIMIT_KB="${LOWMEM_PROXY_CGROUP_LIMIT_KB:-22528}"
-LOWMEM_CGROUP_PARENT="${LOWMEM_PROXY_CGROUP_PARENT:-}"
+LOWMEM_BUDGET_KB="${LOWMEM_BUDGET_KB:-24576}"
+LOWMEM_CGROUP_ENFORCE="${LOWMEM_CGROUP_ENFORCE:-0}"
+LOWMEM_CGROUP_LIMIT_KB="${LOWMEM_CGROUP_LIMIT_KB:-22528}"
+LOWMEM_CGROUP_PARENT="${LOWMEM_CGROUP_PARENT:-}"
 
 export TMPDIR="${TMPDIR:-${SCRIPT_ROOT}/target/tmp}"
 mkdir -p "${RUN_ROOT}" "${TMPDIR}"
@@ -531,8 +531,8 @@ wait_for_file_slice_count() {
   done
 }
 
-run_smoke_proxy() {
-  banner "Proxy Stage 1 - Smoke (10k total)"
+run_smoke() {
+  banner "Stage 1 - Smoke (10k total)"
   LOW_MEM_MEMTRACE="${LOWMEM_MEMTRACE_ENABLED}" \
   LOW_MEM_IOS_SMOKE_EVENTS_PER_PEER="${SMOKE_EVENTS_PER_PEER}" \
   LOW_MEM_IOS_BUDGET_MIB="${SMOKE_BUDGET_MIB}" \
@@ -730,8 +730,8 @@ EOF
   ' "${memtrace_log}" > "${out_file}"
 }
 
-run_asymmetric_proxy() {
-  banner "Proxy Stage 2 - Asymmetric 50k (sender normal, receiver lowmem)"
+run_asymmetric() {
+  banner "Stage 2 - Asymmetric 50k (sender normal, receiver lowmem)"
 
   local run_dir="${RUN_ROOT}/asym-$$_$(date +%s)"
   local alice_db="${run_dir}/alice.db"
@@ -771,7 +771,7 @@ run_asymmetric_proxy() {
   start_daemon --db "${alice_db}"
   wait_for_socket "${alice_db}" 30
   run_topo --db "${alice_db}" create-workspace \
-    --workspace-name "lowmem-proxy" \
+    --workspace-name "lowmem" \
     --username "alice" \
     --device-name "alice-dev" >/dev/null
 
@@ -814,7 +814,7 @@ run_asymmetric_proxy() {
   fi
 
   if [ "${LOWMEM_CGROUP_ENFORCE}" = "1" ]; then
-    bob_cgroup="$(create_limited_cgroup "lowmem-proxy-asym-bob-$$_$(date +%s)" "${LOWMEM_CGROUP_LIMIT_KB}")"
+    bob_cgroup="$(create_limited_cgroup "lowmem-asym-bob-$$_$(date +%s)" "${LOWMEM_CGROUP_LIMIT_KB}")"
     attach_pid_to_cgroup "${bob_pid}" "${bob_cgroup}"
   fi
 
@@ -1004,7 +1004,7 @@ EOF
     echo "MAX_BOB_ANON_MINUS_SQLITE_KB=${anon_minus_sqlite_kb}"
   } > "${summary_file}"
 
-  banner "Proxy Summary"
+  banner "Summary"
   cat "${summary_file}"
 
   echo
@@ -1042,8 +1042,8 @@ EOF
   fi
 }
 
-run_large_delta_proxy() {
-  banner "Proxy Stage 3 - Large Baseline + Delta (baseline normal, receiver lowmem)"
+run_large_delta() {
+  banner "Stage 3 - Large Baseline + Delta (baseline normal, receiver lowmem)"
 
   local run_dir="${RUN_ROOT}/delta-$$_$(date +%s)"
   local alice_db="${run_dir}/alice.db"
@@ -1087,7 +1087,7 @@ run_large_delta_proxy() {
       expected_file_slices=$((file_delta_files * slices_per_file))
       ;;
     *)
-      echo "error: unsupported LOWMEM_PROXY_DELTA_KIND=${delta_kind} (expected messages|files)" >&2
+      echo "error: unsupported LOWMEM_DELTA_KIND=${delta_kind} (expected messages|files)" >&2
       return 1
       ;;
   esac
@@ -1169,7 +1169,7 @@ run_large_delta_proxy() {
   fi
 
   if [ "${LOWMEM_CGROUP_ENFORCE}" = "1" ]; then
-    bob_cgroup="$(create_limited_cgroup "lowmem-proxy-delta-bob-$$_$(date +%s)" "${LOWMEM_CGROUP_LIMIT_KB}")"
+    bob_cgroup="$(create_limited_cgroup "lowmem-delta-bob-$$_$(date +%s)" "${LOWMEM_CGROUP_LIMIT_KB}")"
     attach_pid_to_cgroup "${bob_pid}" "${bob_cgroup}"
   fi
 
@@ -1408,7 +1408,7 @@ EOF
     echo "MAX_BOB_ANON_MINUS_SQLITE_KB=${anon_minus_sqlite_kb}"
   } > "${summary_file}"
 
-  banner "Proxy Summary"
+  banner "Summary"
   cat "${summary_file}"
 
   echo
@@ -1458,10 +1458,10 @@ case "${MODE}" in
     LARGE_BASE_EVENTS=0
     # Keep one small marker to reliably trigger a sync round for file-only deltas.
     LARGE_MARKER_MESSAGES=1
-    if [ -z "${LOWMEM_PROXY_DELTA_FILES+x}" ]; then
+    if [ -z "${LOWMEM_DELTA_FILES+x}" ]; then
       LARGE_DELTA_FILES=10
     fi
-    if [ -z "${LOWMEM_PROXY_DELTA_FILE_MIB+x}" ]; then
+    if [ -z "${LOWMEM_DELTA_FILE_MIB+x}" ]; then
       LARGE_DELTA_FILE_MIB=1
     fi
     ;;
@@ -1469,60 +1469,60 @@ case "${MODE}" in
     LARGE_DELTA_KIND="files"
     LARGE_BASE_EVENTS=0
     LARGE_MARKER_MESSAGES=1
-    LARGE_DELTA_FILES="${LOWMEM_PROXY_QUICK_DELTA_FILES:-10}"
-    LARGE_DELTA_FILE_MIB="${LOWMEM_PROXY_QUICK_DELTA_FILE_MIB:-1}"
-    LARGE_TIMEOUT_SECS="${LOWMEM_PROXY_QUICK_TIMEOUT_SECS:-180}"
+    LARGE_DELTA_FILES="${LOWMEM_QUICK_DELTA_FILES:-10}"
+    LARGE_DELTA_FILE_MIB="${LOWMEM_QUICK_DELTA_FILE_MIB:-1}"
+    LARGE_TIMEOUT_SECS="${LOWMEM_QUICK_TIMEOUT_SECS:-180}"
     ;;
 esac
 
-banner "Low-Memory Proxy"
+banner "Low-Memory Harness"
 echo "  MODE=${MODE}"
 echo "  TOPO_BIN=${TOPO_BIN}"
 echo "  RUN_ROOT=${RUN_ROOT}"
 echo "  TMPDIR=${TMPDIR}"
 echo "  TOPO_CMD_TIMEOUT_SECS=${TOPO_CMD_TIMEOUT_SECS}"
-echo "  LOWMEM_PROXY_SMOKE_EVENTS_PER_PEER=${SMOKE_EVENTS_PER_PEER}"
-echo "  LOWMEM_PROXY_SMOKE_BUDGET_MIB=${SMOKE_BUDGET_MIB}"
-echo "  LOWMEM_PROXY_EVENTS=${ASYM_EVENTS}"
-echo "  LOWMEM_PROXY_BASE_EVENTS=${LARGE_BASE_EVENTS}"
-echo "  LOWMEM_PROXY_DELTA_KIND=${LARGE_DELTA_KIND}"
-echo "  LOWMEM_PROXY_DELTA_EVENTS=${LARGE_DELTA_EVENTS}"
-echo "  LOWMEM_PROXY_DELTA_FILES=${LARGE_DELTA_FILES}"
-echo "  LOWMEM_PROXY_DELTA_FILE_MIB=${LARGE_DELTA_FILE_MIB}"
-echo "  LOWMEM_PROXY_LARGE_TIMEOUT_SECS=${LARGE_TIMEOUT_SECS}"
-echo "  LOWMEM_PROXY_DELTA_MARKER_MESSAGES=${LARGE_MARKER_MESSAGES}"
+echo "  LOWMEM_SMOKE_EVENTS_PER_PEER=${SMOKE_EVENTS_PER_PEER}"
+echo "  LOWMEM_SMOKE_BUDGET_MIB=${SMOKE_BUDGET_MIB}"
+echo "  LOWMEM_EVENTS=${ASYM_EVENTS}"
+echo "  LOWMEM_BASE_EVENTS=${LARGE_BASE_EVENTS}"
+echo "  LOWMEM_DELTA_KIND=${LARGE_DELTA_KIND}"
+echo "  LOWMEM_DELTA_EVENTS=${LARGE_DELTA_EVENTS}"
+echo "  LOWMEM_DELTA_FILES=${LARGE_DELTA_FILES}"
+echo "  LOWMEM_DELTA_FILE_MIB=${LARGE_DELTA_FILE_MIB}"
+echo "  LOWMEM_LARGE_TIMEOUT_SECS=${LARGE_TIMEOUT_SECS}"
+echo "  LOWMEM_DELTA_MARKER_MESSAGES=${LARGE_MARKER_MESSAGES}"
 echo "  LOW_MEM_WAL_CAP_MIB=${WAL_CAP_MIB}"
 echo "  LOW_MEM_MEMTRACE=${LOWMEM_MEMTRACE_ENABLED}"
-echo "  LOWMEM_PROXY_BUDGET_KB=${LOWMEM_BUDGET_KB}"
-echo "  LOWMEM_PROXY_CGROUP_ENFORCE=${LOWMEM_CGROUP_ENFORCE}"
-echo "  LOWMEM_PROXY_CGROUP_LIMIT_KB=${LOWMEM_CGROUP_LIMIT_KB}"
-echo "  LOWMEM_PROXY_CGROUP_PARENT=${LOWMEM_CGROUP_PARENT:-auto}"
+echo "  LOWMEM_BUDGET_KB=${LOWMEM_BUDGET_KB}"
+echo "  LOWMEM_CGROUP_ENFORCE=${LOWMEM_CGROUP_ENFORCE}"
+echo "  LOWMEM_CGROUP_LIMIT_KB=${LOWMEM_CGROUP_LIMIT_KB}"
+echo "  LOWMEM_CGROUP_PARENT=${LOWMEM_CGROUP_PARENT:-auto}"
 
 case "${MODE}" in
   smoke)
-    run_smoke_proxy
+    run_smoke
     ;;
   asym50k)
-    run_asymmetric_proxy
+    run_asymmetric
     ;;
   delta10k)
-    run_large_delta_proxy
+    run_large_delta
     ;;
   deltafiles)
-    run_large_delta_proxy
+    run_large_delta
     ;;
   deltafilesfast)
-    run_large_delta_proxy
+    run_large_delta
     ;;
   deltafilesquick)
-    run_large_delta_proxy
+    run_large_delta
     ;;
-  proxy)
-    run_smoke_proxy
-    run_asymmetric_proxy
+  all)
+    run_smoke
+    run_asymmetric
     ;;
   *)
-    echo "usage: scripts/run_lowmem_proxy.sh [smoke|asym50k|delta10k|deltafiles|deltafilesfast|deltafilesquick|proxy]"
+    echo "usage: scripts/run_lowmem.sh [smoke|asym50k|delta10k|deltafiles|deltafilesfast|deltafilesquick|all]"
     exit 2
     ;;
 esac

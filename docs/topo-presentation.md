@@ -312,7 +312,7 @@ Worst-case dependency cascade: each event depends on up to 10 prior events, inse
 # Low-Memory: iOS NSE Target (24 MiB)
 
 Constrained-runtime gate for iOS background push (24 MiB target, 22 MiB enforced via cgroup v2).
-Per-daemon VmHWM measured via lowmem proxy delta harness.
+Per-daemon VmHWM measured via lowmem delta harness.
 
 | Case | Synced | Peak KB | 24 MiB? | 22 MiB cgroup? |
 |------|--------|--------:|:-------:|:--------------:|

@@ -514,7 +514,7 @@ async fn catchup_large_file_4x_1024_slices() {
 
 /// Multi-source file: 4 sources, 400 slices (100 MiB).
 ///
-/// Proxy for "100 files x 1 MiB" delta volume, represented in canonical
+/// Stand-in for "100 files x 1 MiB" delta volume, represented in canonical
 /// 256 KiB file-slice events (4 slices per MiB file).
 #[tokio::test]
 #[ignore]

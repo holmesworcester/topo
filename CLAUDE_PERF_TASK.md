@@ -21,7 +21,7 @@ Track down the current perf/regression issues, fix them, rerun the maintained pe
 1. A real two-daemon repro exists in `scripts/repro_generate_sync.sh`.
 2. On the branch I was working in (`/tmp/poc-7-perf-suite-fixes`), `scripts/repro_generate_sync.sh 50000` initially failed with `alice_count=50001, bob_count=1`.
 3. The most plausible current fix is to notify the runtime after successful local write RPCs (`send`, `generate`, `generate-files`, `send-file`, `react`, `delete`, `ban`). That change was made only in the other worktree, not here.
-4. `scripts/run_lowmem_proxy.sh` still assumes `create-workspace` and `accept` auto-start daemons. That is no longer true and breaks the proxy perf paths.
+4. `scripts/run_lowmem.sh` still assumes `create-workspace` and `accept` auto-start daemons. That is no longer true and breaks the lowmem perf paths.
 5. `sync_graph_test.rs` in this worktree is still the old in-process `Peer` harness.
 6. I ran a git bisect in another worktree with the external repro. It pointed at `7811a613f739b39fe58358ea303ac8354b8223e4` (`fix: don't drop pre-removal pending fanouts during recovery`) as the first bad commit, but confirmation around that boundary was noisy enough that you should treat it as a lead, not a final proof.
 
@@ -35,10 +35,10 @@ Proof:
 Proof:
 `cargo +stable test --release --test daemon_perf_test perf_sync_50k -- --nocapture --ignored --test-threads=1`
 
-3. Low-memory proxy perf paths run successfully with the current daemon lifecycle.
+3. Low-memory perf paths run successfully with the current daemon lifecycle.
 Proof:
-`env LOWMEM_PROXY_BASE_EVENTS=50000 LOWMEM_PROXY_DELTA_EVENTS=10000 LOWMEM_PROXY_LARGE_TIMEOUT_SECS=600 scripts/run_lowmem_proxy.sh delta10k`
-`env LOWMEM_PROXY_BASE_EVENTS=50000 LOWMEM_PROXY_DELTA_FILES=20 LOWMEM_PROXY_DELTA_FILE_MIB=1 LOWMEM_PROXY_LARGE_TIMEOUT_SECS=600 scripts/run_lowmem_proxy.sh deltafiles`
+`env LOWMEM_BASE_EVENTS=50000 LOWMEM_DELTA_EVENTS=10000 LOWMEM_LARGE_TIMEOUT_SECS=600 scripts/run_lowmem.sh delta10k`
+`env LOWMEM_BASE_EVENTS=50000 LOWMEM_DELTA_FILES=20 LOWMEM_DELTA_FILE_MIB=1 LOWMEM_LARGE_TIMEOUT_SECS=600 scripts/run_lowmem.sh deltafiles`
 
 4. `sync_graph_test.rs` is no longer using the old in-process methodology for the maintained perf cases.
 Proof:
@@ -58,8 +58,8 @@ scripts/repro_generate_sync.sh 50000
 cargo +stable test --release --test daemon_perf_test perf_sync_10k -- --nocapture --test-threads=1
 cargo +stable test --release --test daemon_perf_test perf_continuous_10k -- --nocapture --test-threads=1
 cargo +stable test --release --test daemon_perf_test perf_sync_50k -- --nocapture --ignored --test-threads=1
-env LOWMEM_PROXY_BASE_EVENTS=50000 LOWMEM_PROXY_DELTA_EVENTS=10000 LOWMEM_PROXY_LARGE_TIMEOUT_SECS=600 scripts/run_lowmem_proxy.sh delta10k
-env LOWMEM_PROXY_BASE_EVENTS=50000 LOWMEM_PROXY_DELTA_FILES=20 LOWMEM_PROXY_DELTA_FILE_MIB=1 LOWMEM_PROXY_LARGE_TIMEOUT_SECS=600 scripts/run_lowmem_proxy.sh deltafiles
+env LOWMEM_BASE_EVENTS=50000 LOWMEM_DELTA_EVENTS=10000 LOWMEM_LARGE_TIMEOUT_SECS=600 scripts/run_lowmem.sh delta10k
+env LOWMEM_BASE_EVENTS=50000 LOWMEM_DELTA_FILES=20 LOWMEM_DELTA_FILE_MIB=1 LOWMEM_LARGE_TIMEOUT_SECS=600 scripts/run_lowmem.sh deltafiles
 python3 scripts/run_perf_serial.py full
 ```
 
@@ -69,11 +69,11 @@ If `sync_graph_test.rs` remains part of the maintained perf set, also run the re
 
 1. Start with `scripts/repro_generate_sync.sh 50000`.
 2. Inspect `src/runtime/control/rpc/server.rs` and any runtime wakeup path after successful local write RPCs.
-3. Fix `scripts/run_lowmem_proxy.sh` to use the current daemon-first lifecycle consistently.
+3. Fix `scripts/run_lowmem.sh` to use the current daemon-first lifecycle consistently.
 4. Convert the maintained `sync_graph_test.rs` cases to daemon/CLI methodology or replace them with a new daemon-based topology perf file if that is cleaner.
 5. Refresh `scripts/run_perf_serial.py` if needed so it includes the maintained perf tests only.
 6. Rerun the suite and update `docs/PERF.md`.
 
 ## Notes
 
-The other worktree with in-progress edits is `/tmp/poc-7-perf-suite-fixes`. It has an uncommitted runtime-recheck patch and lowmem proxy edits if you want to inspect them, but this branch is intentionally clean so you can land a coherent fix here.
+The other worktree with in-progress edits is `/tmp/poc-7-perf-suite-fixes`. It has an uncommitted runtime-recheck patch and lowmem harness edits if you want to inspect them, but this branch is intentionally clean so you can land a coherent fix here.

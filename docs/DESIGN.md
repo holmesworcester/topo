@@ -1370,15 +1370,15 @@ Assertion-first commands are first-class:
 
 1. `assert-now`,
 2. `assert-eventually`,
-3. low-memory realism/perf harnesses: `scripts/run_lowmem_proxy.sh`, `scripts/run_perf_serial.sh lowmem` (Linux-only).
+3. low-memory realism/perf harnesses: `scripts/run_lowmem.sh`, `scripts/run_perf_serial.sh lowmem` (Linux-only).
 
 `assert-eventually` is preferred over ad-hoc sleeps for both deterministic tests and agent self-play loops.
 
 Low-memory Linux-only note:
-1. proxy/regimen harnesses sample `/proc/<pid>/status` and `/proc/<pid>/smaps`,
+1. harness scripts sample `/proc/<pid>/status` and `/proc/<pid>/smaps`,
 2. hard-ceiling validation uses cgroup v2 (`memory.max`, `memory.events`),
 3. RSS-sampling tests in `tests/low_mem_test.rs` are sanity checks (ignored by default for budget assertions),
-4. non-Linux platforms should use functional low-memory tests and device-native profiling instead of the Linux proxy gate.
+4. non-Linux platforms should use functional low-memory tests and device-native profiling instead of the Linux harness gate.
 
 ### Multi-source large-file catchup perf methodology
 
@@ -1396,7 +1396,7 @@ Current smoke fairness floor uses `min_fair_share_fraction = 10%` of `(total_sli
 
 Low-memory coverage is split into two lanes:
 1. **Functional lane** (`tests/low_mem_test.rs`) for fast correctness checks in low-memory mode.
-2. **Realism lane** (`scripts/run_lowmem_proxy.sh`) for process-isolated Linux memory accounting and optional cgroup hard caps.
+2. **Realism lane** (`scripts/run_lowmem.sh`) for process-isolated Linux memory accounting and optional cgroup hard caps.
 
 Functional lane defaults:
 1. runs by default: `low_mem_ios_functional_smoke_2k`,
@@ -1405,14 +1405,14 @@ Functional lane defaults:
 Realism lane defaults:
 1. driven through `scripts/run_perf_serial.sh lowmem`,
 2. default scenarios: `50k+10k` message delta and `50k+20x1MiB` file delta,
-3. default enforcement: `LOWMEM_PROXY_CGROUP_ENFORCE=1`, `LOWMEM_PROXY_CGROUP_LIMIT_KB=22528`.
+3. default enforcement: `LOWMEM_CGROUP_ENFORCE=1`, `LOWMEM_CGROUP_LIMIT_KB=22528`.
 
 Optional low-memory hardening scenarios:
 1. enable with `PERF_LOWMEM_POC_ENABLE=1`,
 2. optionally add `PERF_LOWMEM_RUN_LARGE_TARGET=1` and `PERF_LOWMEM_RUN_SMALL_BRACKET=1`,
 3. available scenarios include `1M+10k` messages, `500k+100x1MiB` realism files, and `0+10k x1MiB` extreme files.
 
-Low-memory proxy output fields used by perf reporting:
+Low-memory harness output fields used by perf reporting:
 1. `LOWMEM_BUDGET_KB` and `PASS_UNDER_24MB`,
 2. `CGROUP_ENFORCED`, `CGROUP_LIMIT_KB`, `CGROUP_OOM`, `CGROUP_OOM_KILL`,
 3. `MAX_BOB_TOTAL_KB` (receiver working-set peak from smaps categories).
@@ -1688,7 +1688,7 @@ Validation scale requirements: the low-memory path must remain stable at >= 1,00
 Caveat: `24 MiB` is an operational target validated by representative low-memory tests and tuning profiles, not a universal guarantee across all kernels/devices/workloads.
 
 Validation harness platform scope:
-1. low-memory proxy/regimen perf gates are Linux-only (`/proc` + cgroup v2),
+1. low-memory harness perf gates are Linux-only (`/proc` + cgroup v2),
 2. Linux proof runs use a stricter receiver hard cap (`22 MiB`) as margin against iOS `24 MiB` operational target differences in memory accounting.
 3. default serial lowmem perf lane is fast (`50k+10k` message delta + moderate file delta) and cgroup-enforced,
 4. 1M-scale and extreme file-volume lowmem scenarios remain available but opt-in for hardening cycles.
