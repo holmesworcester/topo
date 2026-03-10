@@ -13,12 +13,14 @@ use tempfile::NamedTempFile;
 use topo::crypto::{event_id_to_base64, hash_event, EventId};
 use topo::db::{open_connection, schema::create_tables};
 use topo::event_modules::{
-    self as events, file_slice::FILE_SLICE_CIPHERTEXT_BYTES, DeviceInviteEvent, FileEvent,
-    FileSliceEvent, InviteAcceptedEvent, KeySecretEvent, MessageEvent, ParsedEvent,
-    PeerSharedEvent, TenantEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
+    self as events, encrypted::EncryptedEvent, file_slice::FILE_SLICE_CIPHERTEXT_BYTES,
+    DeviceInviteEvent, FileEvent, FileSliceEvent, InviteAcceptedEvent, KeySecretEvent,
+    MessageEvent, ParsedEvent, PeerSharedEvent, TenantEvent, UserEvent, UserInviteEvent,
+    WorkspaceEvent,
 };
 use topo::projection::apply::project_one;
 use topo::projection::signer::sign_event_bytes;
+use topo::shared::crypto::encrypt_event_blob;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -169,11 +171,21 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     (psf_eid, peer_shared_key, ub_eid)
 }
 
-/// Create prerequisite events (identity chain, signed message, secret key) and return IDs + signing key.
+/// Create prerequisite events (identity chain, encrypted message, secret key) and return IDs + signing key.
 fn create_prereqs(conn: &Connection, recorded_by: &str) -> (EventId, EventId, EventId, SigningKey) {
     let (signer_eid, signing_key, user_event_id) = make_identity_chain(conn, recorded_by);
 
-    // Signed message
+    // Content encryption key (for RequireEncrypted events)
+    let content_key_bytes = [0xCC; 32];
+    let content_sk = ParsedEvent::KeySecret(KeySecretEvent {
+        created_at_ms: now_ms(),
+        key_bytes: content_key_bytes,
+    });
+    let content_sk_blob = events::encode_event(&content_sk).unwrap();
+    let content_key_eid = insert_event_raw(conn, recorded_by, &content_sk_blob);
+    project_one(conn, recorded_by, &content_key_eid).unwrap();
+
+    // Message (RequireEncrypted — must wrap in encrypted envelope)
     let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: now_ms(),
         workspace_id: [1u8; 32],
@@ -185,10 +197,22 @@ fn create_prereqs(conn: &Connection, recorded_by: &str) -> (EventId, EventId, Ev
     });
     let mut msg_blob = events::encode_event(&msg).unwrap();
     sign_blob(&signing_key, &mut msg_blob);
-    let msg_eid = insert_event_raw(conn, recorded_by, &msg_blob);
+
+    // Wrap message in encrypted envelope
+    let (nonce, ct, auth_tag) = encrypt_event_blob(&content_key_bytes, &msg_blob).unwrap();
+    let enc_msg = ParsedEvent::Encrypted(EncryptedEvent {
+        created_at_ms: now_ms(),
+        key_event_id: content_key_eid,
+        inner_type_code: topo::event_modules::EVENT_TYPE_MESSAGE,
+        nonce,
+        ciphertext: ct,
+        auth_tag,
+    });
+    let enc_msg_blob = events::encode_event(&enc_msg).unwrap();
+    let msg_eid = insert_event_raw(conn, recorded_by, &enc_msg_blob);
     project_one(conn, recorded_by, &msg_eid).unwrap();
 
-    // Secret key (for attachment key_event_id dep)
+    // Secret key (for attachment key_event_id dep — also used to encrypt file slices)
     let sk = ParsedEvent::KeySecret(KeySecretEvent {
         created_at_ms: now_ms(),
         key_bytes: [0xBB; 32],
@@ -235,10 +259,13 @@ fn run_file_throughput(file_size_bytes: usize) {
 
     // Pre-generate ciphertext for slices (canonical fixed size)
     let ciphertext_template: Vec<u8> = vec![0xAB; FILE_SLICE_CIPHERTEXT_BYTES];
+    let file_slice_type_code = topo::event_modules::EVENT_TYPE_FILE_SLICE;
+    // File slices must be encrypted with the same key the descriptor references (sk_eid / 0xBB key).
+    let slice_enc_key: [u8; 32] = [0xBB; 32];
 
     let start = Instant::now();
 
-    // Encode + store + project all file slices
+    // Encode + sign + encrypt + store + project all file slices
     for i in 0..total_slices as u32 {
         let fs = FileSliceEvent {
             created_at_ms: now_ms(),
@@ -250,16 +277,29 @@ fn run_file_throughput(file_size_bytes: usize) {
             signature: [0u8; 64],
         };
         let event = ParsedEvent::FileSlice(fs);
-        let mut blob = events::encode_event(&event).unwrap();
+        let mut inner_blob = events::encode_event(&event).unwrap();
 
-        // Sign
+        // Sign the inner blob
         let sig_len = 64;
-        let blob_len = blob.len();
-        let signing_bytes = &blob[..blob_len - sig_len];
+        let blob_len = inner_blob.len();
+        let signing_bytes = &inner_blob[..blob_len - sig_len];
         let sig = sign_event_bytes(&signing_key, signing_bytes);
-        blob[blob_len - sig_len..].copy_from_slice(&sig);
+        inner_blob[blob_len - sig_len..].copy_from_slice(&sig);
 
-        let eid = insert_event_raw(&conn, recorded_by, &blob);
+        // Wrap in encrypted envelope (RequireEncrypted enforcement).
+        // key_event_id must match the file descriptor's key_event_id (sk_eid).
+        let (nonce, ct, auth_tag) = encrypt_event_blob(&slice_enc_key, &inner_blob).unwrap();
+        let wrapper = ParsedEvent::Encrypted(EncryptedEvent {
+            created_at_ms: now_ms(),
+            key_event_id: sk_eid,
+            inner_type_code: file_slice_type_code,
+            nonce,
+            ciphertext: ct,
+            auth_tag,
+        });
+        let enc_blob = events::encode_event(&wrapper).unwrap();
+
+        let eid = insert_event_raw(&conn, recorded_by, &enc_blob);
         let result = project_one(&conn, recorded_by, &eid).unwrap();
         assert!(
             matches!(

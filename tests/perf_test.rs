@@ -399,7 +399,7 @@ async fn perf_sync_500k() {
 }
 
 /// Insert messages in small batches, yielding between batches so sync can interleave.
-/// Messages are signed with the given PeerShared key for proper identity chain verification.
+/// Messages are signed and encrypted with the given PeerShared key for proper identity chain verification.
 fn inject_messages_batched(
     db_path: &str,
     workspace_id: [u8; 32],
@@ -414,9 +414,21 @@ fn inject_messages_batched(
     use std::time::{SystemTime, UNIX_EPOCH};
     use topo::db::open_connection;
     use topo::event_modules::{MessageEvent, ParsedEvent};
-    use topo::projection::create::create_signed_event_synchronous;
+    use topo::projection::create::create_encrypted_event_synchronous;
 
     let db = open_connection(db_path).expect("failed to open db");
+
+    // Resolve the content encryption key once outside the loop.
+    // ensure_content_key_for_peer is pub(crate), so query key_secrets directly.
+    let key_eid_b64: String = db
+        .query_row(
+            "SELECT event_id FROM key_secrets WHERE recorded_by = ?1 ORDER BY rowid ASC LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .expect("no content key found — identity chain must create one");
+    let key_eid = topo::crypto::event_id_from_base64(&key_eid_b64)
+        .expect("invalid content key event_id");
 
     let mut i = 0;
     while i < total {
@@ -436,8 +448,8 @@ fn inject_messages_batched(
                 signer_type: 5,
                 signature: [0u8; 64],
             });
-            create_signed_event_synchronous(&db, recorded_by, &msg, signing_key)
-                .expect("create_signed_event_synchronous failed");
+            create_encrypted_event_synchronous(&db, recorded_by, &key_eid, &msg, Some(signing_key))
+                .expect("create_encrypted_event_synchronous failed");
         }
         db.execute("COMMIT", []).expect("failed to commit");
         i = end;

@@ -641,7 +641,12 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        create_signed_event_synchronous(&db, &self.identity, &del, self.signing_key())
+        let key_eid = crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+            &db,
+            &self.identity,
+        )
+        .expect("failed to resolve content key");
+        create_encrypted_event_synchronous(&db, &self.identity, &key_eid, &del, Some(self.signing_key()))
             .expect("failed to create message_deletion")
     }
 
@@ -961,6 +966,11 @@ impl Peer {
     /// Requires identity chain.
     pub fn batch_create_messages(&self, count: usize) {
         let db = open_connection(&self.db_path).expect("failed to open db");
+        let key_eid = crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+            &db,
+            &self.identity,
+        )
+        .expect("failed to resolve content key");
         db.execute("BEGIN", []).expect("failed to begin");
         for i in 0..count {
             let msg = ParsedEvent::Message(MessageEvent {
@@ -972,7 +982,7 @@ impl Peer {
                 signer_type: 5,
                 signature: [0u8; 64],
             });
-            create_signed_event_synchronous(&db, &self.identity, &msg, self.signing_key())
+            create_encrypted_event_synchronous(&db, &self.identity, &key_eid, &msg, Some(self.signing_key()))
                 .expect("failed to create message");
         }
         db.execute("COMMIT", []).expect("failed to commit");
@@ -985,13 +995,22 @@ impl Peer {
     /// used for all slices. Requires identity chain (use new_with_identity).
     pub fn batch_create_file_slices(&self, total_slices: usize) -> [u8; 32] {
         use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
+        use crate::event_modules::encrypted::EncryptedEvent;
         use crate::projection::signer::sign_event_bytes;
+        use crate::shared::crypto::encrypt_event_blob;
 
         let db = open_connection(&self.db_path).expect("failed to open db");
         let workspace_id = crate::db::store::lookup_workspace_id(&db, &self.identity)
             .expect("missing trust anchor workspace_id for file-slice benchmark");
 
-        // Parent message
+        // Content encryption key (for RequireEncrypted events)
+        let content_key_eid = crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+            &db,
+            &self.identity,
+        )
+        .expect("failed to resolve content key");
+
+        // Parent message (RequireEncrypted — must wrap in encrypted envelope)
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: current_timestamp_ms(),
             workspace_id: self.workspace_id,
@@ -1001,8 +1020,9 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let msg_eid = create_signed_event_staged(&db, &self.identity, &msg, self.signing_key())
-            .expect("failed to create parent message");
+        let msg_eid = event_id_or_blocked(
+            create_encrypted_event_synchronous(&db, &self.identity, &content_key_eid, &msg, Some(self.signing_key()))
+        ).expect("failed to create parent message");
 
         // Secret key for attachment
         let sk = ParsedEvent::KeySecret(KeySecretEvent {
@@ -1027,7 +1047,7 @@ impl Peer {
         let slice_size = FILE_SLICE_CIPHERTEXT_BYTES;
         let file_bytes = total_slices * slice_size;
 
-        // Message attachment descriptor
+        // Message attachment descriptor (MayPlaintext — signed is fine)
         let att = ParsedEvent::File(FileEvent {
             created_at_ms: current_timestamp_ms(),
             message_id: msg_eid,
@@ -1047,9 +1067,22 @@ impl Peer {
             .expect("failed to create file");
         project_one(&db, &self.identity, &att_eid).expect("failed to project attachment");
 
+        // File slices must be encrypted with the same key the descriptor references (sk_eid).
+        let sk_key_b64 = event_id_to_base64(&sk_eid);
+        let sk_key_bytes_vec: Vec<u8> = db
+            .query_row(
+                "SELECT key_bytes FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
+                rusqlite::params![&self.identity, &sk_key_b64],
+                |row| row.get(0),
+            )
+            .expect("failed to lookup attachment key bytes");
+        let mut slice_enc_key = [0u8; 32];
+        slice_enc_key.copy_from_slice(&sk_key_bytes_vec);
+
         // Batch-create file slices inside a transaction
         let ciphertext: Vec<u8> = vec![0xAB; FILE_SLICE_CIPHERTEXT_BYTES];
         let signing_key = self.signing_key().clone();
+        let file_slice_type_code = crate::event_modules::EVENT_TYPE_FILE_SLICE;
 
         db.execute("BEGIN", []).expect("failed to begin");
         for i in 0..total_slices as u32 {
@@ -1067,13 +1100,28 @@ impl Peer {
                 signer_type: 5,
                 signature: [0u8; 64],
             });
-            let mut blob =
+            let mut inner_blob =
                 crate::event_modules::encode_event(&fs).expect("failed to encode file_slice");
-            let blob_len = blob.len();
-            let sig = sign_event_bytes(&signing_key, &blob[..blob_len - 64]);
-            blob[blob_len - 64..].copy_from_slice(&sig);
+            let blob_len = inner_blob.len();
+            let sig = sign_event_bytes(&signing_key, &inner_blob[..blob_len - 64]);
+            inner_blob[blob_len - 64..].copy_from_slice(&sig);
 
-            let event_id = crate::crypto::hash_event(&blob);
+            // Wrap in encrypted envelope (RequireEncrypted enforcement).
+            // key_event_id must match the file descriptor's key_event_id (sk_eid).
+            let (nonce, ct, auth_tag) = encrypt_event_blob(&slice_enc_key, &inner_blob)
+                .expect("failed to encrypt file_slice");
+            let wrapper = ParsedEvent::Encrypted(EncryptedEvent {
+                created_at_ms: created_at,
+                key_event_id: sk_eid,
+                inner_type_code: file_slice_type_code,
+                nonce,
+                ciphertext: ct,
+                auth_tag,
+            });
+            let enc_blob = crate::event_modules::encode_event(&wrapper)
+                .expect("failed to encode encrypted wrapper");
+
+            let event_id = crate::crypto::hash_event(&enc_blob);
             let event_id_b64 = event_id_to_base64(&event_id);
 
             // Insert into events, neg_items, recorded_events — all use the
@@ -1083,8 +1131,8 @@ impl Peer {
             db.execute(
                 "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
                  VALUES (?1, ?2, ?3, 'shared', ?4, ?5)",
-                rusqlite::params![&event_id_b64, "file_slice", blob.as_slice(), created_at as i64, created_at as i64],
-            ).expect("failed to insert file_slice event");
+                rusqlite::params![&event_id_b64, "encrypted", enc_blob.as_slice(), created_at as i64, created_at as i64],
+            ).expect("failed to insert encrypted file_slice event");
             db.execute(
                 "INSERT OR IGNORE INTO neg_items (workspace_id, ts, id) VALUES (?1, ?2, ?3)",
                 rusqlite::params![&workspace_id, created_at as i64, event_id.as_slice()],
@@ -1097,7 +1145,7 @@ impl Peer {
             )
             .expect("failed to insert recorded_event");
 
-            // Project (validates the signature + authorization chain)
+            // Project (decrypts, validates the signature + authorization chain)
             project_one(&db, &self.identity, &event_id).expect("failed to project file_slice");
         }
         db.execute("COMMIT", []).expect("failed to commit");
