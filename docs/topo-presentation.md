@@ -151,7 +151,7 @@ Is p2p just intrinsically #$%@ing hard? Or is all this slog totally avoidable an
 - **No multi-tenant/account support** - so you'll need to roll a lot of your own infra to support mobile devices and notifications
 - **No simple API for frontends** - you must build a complex middle layer to cover all the queries your frontend 
 
-(**p2panda** is a lot better than others, but I think all of these gripes apply to them too)
+(**p2panda** is a lot better than others, but I think all but the first apply to it too)
 
 ---
 
