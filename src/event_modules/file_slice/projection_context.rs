@@ -53,6 +53,11 @@ pub fn build_projector_context(
 /// attribute each received slice event back to the remote peer that sent it.
 /// This works without projection (no trust anchor required at the sink).
 /// Returns a map of source_peer → event_count.
+///
+/// NOTE: This counts only outer `file_slice` events. Encrypted-wrapped
+/// file slices (outer `encrypted` with inner file_slice) are not counted
+/// here. The test helpers that use this function create plain file_slice
+/// events, so this is correct for current test use.
 pub fn file_slice_event_counts_by_source(
     conn: &Connection,
     recorded_by: &str,
