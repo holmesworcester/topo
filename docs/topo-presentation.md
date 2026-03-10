@@ -149,7 +149,7 @@ Is p2p just intrinsically #$%@ing hard? Or is all this slog totally avoidable an
 - **Arbitrary dependency linkages** - these are the opposite of what you want: they block content when you *don't* need that and not when you do 
 - **No iOS support** - especially for push & the iOS NSE memory limit 🐼
 - **No multi-tenant/account support** - so you'll need to roll a lot of your own infra to support mobile devices and notifications 🐼
-- **No simple API for frontends** - you must build a complex middle layer to cover all the queries your frontend 🐼
+- **No simple API for frontends** - you must build a complex middle layer to cover all the queries your frontend needs 🐼
 
 (**p2panda** is a lot better than others, but all gripes marked 🐼 apply to it too)
 
@@ -186,7 +186,7 @@ Instead of providing lots of features for *parts* of the problem, it focuses on 
 
 - Events turn into SQLite tables so **data can have whatever shape it wants**
 - The API can answer complex queries like "give me a paginated message list with usernames, reactions, attachments, and download progress" so **you don't need a middle layer**
-- A local `client_op_id` can return with eventually-updated events, so **you don't need for a custom sync state machine for optimistic updates**
+- A local `client_op_id` can return with eventually-updated events, so **you don't need a custom sync state machine for optimistic updates**
 - Frontends can get subscription feeds of changes and poll for the latest state, so **frontend state management is easy.**
 
 ---
@@ -197,10 +197,10 @@ Instead of providing lots of features for *parts* of the problem, it focuses on 
 
 - **Data** including files, who to connect to, is represented as a set of events
 - **State and auth** is derived deterministically from the event set (think: Redux but with dependencies)
-- **Peer connection** is an ongoing behaviors determined by this set
+- **Peer connection** is ongoing behavior determined by this set
 - **Sync** is a process that ensures all peers converge on the same event set
-- **Event pipeline** decrypts, validates, and writes events into SQLite tables that can queried however frontends need
-- **Key material** is stored, sealed, and unsealed as events and, just like any other dependency, block dependents until it arrives.
+- **Event pipeline** decrypts, validates, and writes events into SQLite tables that can be queried however frontends need
+- **Key material** is stored, sealed, and unsealed as events and, just like any other dependency, blocks dependents until it arrives.
 
 ---
 
@@ -208,19 +208,23 @@ Instead of providing lots of features for *parts* of the problem, it focuses on 
 
 ```text
 CLI / RPC Control
-   |\
-   | +--> Local create/query ------> Projection / DB State
-   |
-   +--> Daemon startup --> Runtime supervisor --> Transport <--> Sync sessions
-                                                         |
-                                                         v
-                                                   Event pipeline
-                                                         |
-                                                         v
-                                                  Projection / DB State
-                                                         |
-                                                         +--> trust / tenant SQL --> Transport
+  |\
+  | +--> Local create/query --> Projection / DB
+  |
+  +--> Daemon --> Supervisor --> Transport <--> Sync
+                                    |
+                                    v
+                              Event pipeline
+                                    |
+                                    v
+                             Projection / DB
+                                    |
+                              trust/tenant SQL
+                                    |
+                                    v
+                                Transport
 ```
+
 ---
 
 # Result: easy stuff gets easy again. 
@@ -258,13 +262,13 @@ Instead, maybe what you need is a **concurrency approach** covering the whole pr
 
 <!-- _class: lead -->
 
-# Appendix: Performance Benchmarks
+# Performance Benchmarks
 
-AMD Ryzen AI MAX+ 395 (16c/32t) · 122 GiB RAM · SQLite WAL · Rust `--release`
+** Scores are from a fast desktop (AMD Ryzen AI MAX+ 395 (16c/32t) · 122 GiB RAM · SQLite WAL · Rust `--release`)
 
 ---
 
-# Core Sync Throughput
+# Event Sync Throughput
 
 Peer-to-peer QUIC sync over localhost with negentropy reconciliation (daemon-based, warm start).
 
@@ -274,8 +278,9 @@ Peer-to-peer QUIC sync over localhost with negentropy reconciliation (daemon-bas
 | 50k one-way | 50,000 | 16.13s | 3,100 | 131.2 MiB |
 | 10k continuous inject | 10,000 | 1.85s | 5,412 | 66.6 MiB |
 
-- Peak VmHWM is per-daemon (max of sender/receiver), not shared-process RSS
-- Continuous inject: events injected while sync is running
+
+* *continuous inject* means events injected while sync is running
+* Maybe not network-bound on a fast network and slow device, but fast enough
 
 ---
 
@@ -290,13 +295,14 @@ Local encode + store + project for 256 KiB ciphertext slices (no sync).
 | 100 MB | 400 | 0.489s | 204.6 | 818 |
 | 1 GB | 4,096 | 4.995s | 205.0 | 820 |
 
-- Throughput ~205 MB/s across all sizes; CPU-bound on encryption + SQLite writes
+- Seems network-bound, even on a slow device.
+- Easy optimization: make slice sizes bigger for bigger files. 
 
 ---
 
-# Topo Cascade (Projector Stress)
+# Topo-sort Cascade
 
-Worst-case dependency cascade: each event depends on up to 10 prior events, inserted in reverse order to maximize block/unblock depth.
+What happens when each event depends on a max (10) prior events and they are processed in reverse order to maximize block/unblock workload?
 
 | Scale | Blocking | Cascade | Cascade Rate | Total | Peak RSS |
 |------:|---------:|--------:|-------------:|------:|---------:|
@@ -306,6 +312,16 @@ Worst-case dependency cascade: each event depends on up to 10 prior events, inse
 
 - Cascade rate ~7-8.5k ev/s across all scales (linear scaling)
 - Memory grows sub-linearly: 50x events = ~7x RSS
+
+---
+
+Low memory tests we need (placeholder/TODO):
+
+- low-memory topo cascade on 10k messages (we're close already at 60MB but still high -- could include a note that it's not proven but seems in range and worst case is not the regime we'll usually be in.)
+- low-memory sync (we have this)
+- low-memory large-file receive (proves streaming)
+
+
 
 ---
 
