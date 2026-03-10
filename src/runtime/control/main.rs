@@ -1517,7 +1517,9 @@ enum TenantChangeKind {
     /// No runtime exists yet — need a fresh start.
     NeedsFreshStart,
     /// New tenants added but existing ones unchanged — register certs only.
-    NewTenantsAdded { new_tenants: Vec<RuntimeTenantState> },
+    NewTenantsAdded {
+        new_tenants: Vec<RuntimeTenantState>,
+    },
     /// Existing tenant changed transport identity — must restart.
     TransportIdentityChanged,
 }
@@ -1595,25 +1597,20 @@ fn register_new_tenant_certs(
         let Some(tenant_info) = all_tenants.iter().find(|t| t.peer_id == new_t.peer_id) else {
             continue;
         };
-        let cert_der =
-            rustls::pki_types::CertificateDer::from(tenant_info.cert_der.clone());
-        let key_der =
-            rustls::pki_types::PrivatePkcs8KeyDer::from(tenant_info.key_der.clone());
-        let ck = match rustls::sign::CertifiedKey::from_der(
-            vec![cert_der],
-            key_der.into(),
-            &provider,
-        ) {
-            Ok(ck) => Arc::new(ck),
-            Err(e) => {
-                tracing::warn!(
-                    "Failed to build CertifiedKey for new tenant {}: {}",
-                    &new_t.peer_id[..16.min(new_t.peer_id.len())],
-                    e
-                );
-                continue;
-            }
-        };
+        let cert_der = rustls::pki_types::CertificateDer::from(tenant_info.cert_der.clone());
+        let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(tenant_info.key_der.clone());
+        let ck =
+            match rustls::sign::CertifiedKey::from_der(vec![cert_der], key_der.into(), &provider) {
+                Ok(ck) => Arc::new(ck),
+                Err(e) => {
+                    tracing::warn!(
+                        "Failed to build CertifiedKey for new tenant {}: {}",
+                        &new_t.peer_id[..16.min(new_t.peer_id.len())],
+                        e
+                    );
+                    continue;
+                }
+            };
         let sni = topo::transport::multi_workspace::workspace_sni(&tenant_info.workspace_id);
         cert_resolver.add(sni.clone(), ck);
         registered.push(new_t.peer_id.clone());
@@ -3018,7 +3015,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             all,
             action,
         } => {
-            let action = action.unwrap_or(SyncLogAction::Show { limit, run, peer, all });
+            let action = action.unwrap_or(SyncLogAction::Show {
+                limit,
+                run,
+                peer,
+                all,
+            });
             run_sync_log_action(db, action)?;
         }
 
@@ -3027,11 +3029,19 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             capture_full_ids,
         } => {
             eprintln!("warning: `topo sync-log-enable` is deprecated; use `topo sync-log enable`");
-            run_sync_log_action(db, SyncLogAction::Enable { all_runs, capture_full_ids })?;
+            run_sync_log_action(
+                db,
+                SyncLogAction::Enable {
+                    all_runs,
+                    capture_full_ids,
+                },
+            )?;
         }
 
         Commands::DeprecatedSyncLogDisable => {
-            eprintln!("warning: `topo sync-log-disable` is deprecated; use `topo sync-log disable`");
+            eprintln!(
+                "warning: `topo sync-log-disable` is deprecated; use `topo sync-log disable`"
+            );
             run_sync_log_action(db, SyncLogAction::Disable)?;
         }
 
@@ -3047,7 +3057,15 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             all,
         } => {
             eprintln!("warning: `topo sync-log-tree` is deprecated; use `topo sync-log tree`");
-            run_sync_log_action(db, SyncLogAction::Tree { limit, run, peer, all })?;
+            run_sync_log_action(
+                db,
+                SyncLogAction::Tree {
+                    limit,
+                    run,
+                    peer,
+                    all,
+                },
+            )?;
         }
 
         // ---------------------------------------------------------------
@@ -4578,42 +4596,62 @@ fn format_byte_size(bytes: i64) -> String {
 }
 
 fn show_view(data: &serde_json::Value) {
-    // Sidebar: workspace name
     let workspace_name = data["workspace_name"].as_str().unwrap_or("(unnamed)");
     let own_user_eid = data["own_user_event_id"].as_str().unwrap_or("");
 
-    println!("  {}", workspace_name);
-
-    // Users list
-    if let Some(users) = data["users"].as_array() {
-        let user_names: Vec<String> = users
-            .iter()
-            .map(|u| {
-                let name = u["username"].as_str().unwrap_or("");
-                let eid = u["event_id"].as_str().unwrap_or("");
-                let display = if name.is_empty() {
-                    short_id(eid).to_string()
+    println!("TENANTS:");
+    if let Some(tenants) = data["tenants"]
+        .as_array()
+        .or_else(|| data["accounts"].as_array())
+    {
+        if tenants.is_empty() {
+            println!("  (none)");
+        } else {
+            for tenant in tenants {
+                let marker = if tenant["active"].as_bool().unwrap_or(false) {
+                    "*"
                 } else {
-                    name.to_string()
+                    " "
                 };
-                if eid == own_user_eid {
-                    format!("{} (you)", display)
+                let tenant_eid = tenant["event_id"].as_str().unwrap_or("");
+                let username = tenant["username"].as_str().unwrap_or("");
+                let workspace_name = tenant["workspace_name"].as_str().unwrap_or("");
+                let workspace_id = tenant["workspace_id"].as_str().unwrap_or("");
+                let user_display = if username.is_empty() {
+                    short_id(tenant["peer_id"].as_str().unwrap_or("")).to_string()
                 } else {
-                    display
-                }
-            })
-            .collect();
-        println!("    USERS: {}", user_names.join(", "));
+                    username.to_string()
+                };
+                let workspace_display = if workspace_name.is_empty() {
+                    short_id(workspace_id).to_string()
+                } else {
+                    workspace_name.to_string()
+                };
+                println!(
+                    "  {} {} {}@{}",
+                    marker,
+                    short_id(tenant_eid),
+                    user_display,
+                    workspace_display
+                );
+            }
+        }
     }
 
-    // Tenants list
-    if let Some(tenants) = data["tenants"].as_array().or_else(|| data["accounts"].as_array()) {
-        let acct_names: Vec<String> = tenants
-            .iter()
-            .map(|a| {
-                let username = a["username"].as_str().unwrap_or("");
-                let device_name = a["device_name"].as_str().unwrap_or("");
-                let user_eid = a["user_event_id"].as_str().unwrap_or("");
+    println!();
+    println!("WORKSPACE:");
+    println!("  {}", workspace_name);
+    println!();
+    println!("  USERS:");
+
+    if let Some(users) = data["users"].as_array() {
+        if users.is_empty() {
+            println!("    (none)");
+        } else {
+            for user in users {
+                let username = user["username"].as_str().unwrap_or("");
+                let device_name = user["device_name"].as_str().unwrap_or("");
+                let user_eid = user["event_id"].as_str().unwrap_or("");
                 let user_display = if username.is_empty() {
                     short_id(user_eid).to_string()
                 } else {
@@ -4625,13 +4663,12 @@ fn show_view(data: &serde_json::Value) {
                     format!("{}/{}", user_display, device_name)
                 };
                 if user_eid == own_user_eid {
-                    format!("{} (you)", label)
+                    println!("    {} (you)", label);
                 } else {
-                    label
+                    println!("    {}", label);
                 }
-            })
-            .collect();
-        println!("    TENANTS: {}", acct_names.join(", "));
+            }
+        }
     }
 
     println!();

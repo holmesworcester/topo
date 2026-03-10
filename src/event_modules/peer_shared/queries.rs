@@ -184,10 +184,7 @@ pub struct TenantRow {
 }
 
 /// List peer tenants with joined username from users table.
-pub fn list_tenants(
-    db: &Connection,
-    recorded_by: &str,
-) -> Result<Vec<TenantRow>, rusqlite::Error> {
+pub fn list_tenants(db: &Connection, recorded_by: &str) -> Result<Vec<TenantRow>, rusqlite::Error> {
     let mut stmt = db.prepare(
         "SELECT ps.event_id, COALESCE(ps.device_name, ''), COALESCE(ps.user_event_id, ''),
                 COALESCE(u.username, '')

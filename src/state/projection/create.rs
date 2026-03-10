@@ -135,11 +135,8 @@ fn store_blob_only(
                 workspace_id: ws_id.clone(),
                 event_id,
             };
-            crate::state::shared_workspace_fanout::persist_pending_fanouts(
-                conn,
-                &[fanout_entry],
-            )
-            .map_err(|e| CreateEventError::DbError(e.to_string()))?;
+            crate::state::shared_workspace_fanout::persist_pending_fanouts(conn, &[fanout_entry])
+                .map_err(|e| CreateEventError::DbError(e.to_string()))?;
         }
     }
 

@@ -47,7 +47,7 @@ pub async fn accept_loop(
     let shared_ingest_tx = spawn_shared_ingest_writer(db_path, ingest);
 
     let tenant_ids = vec![recorded_by.to_string()];
-    accept_loop_with_ingest_until_cancel(
+    accept_loop_with_ingest_until_cancel_inner(
         db_path,
         &tenant_ids,
         endpoint,
@@ -57,6 +57,7 @@ pub async fn accept_loop(
         std::collections::HashMap::new(),
         intro_spawner,
         ingest,
+        Some(recorded_by.to_string()),
     )
     .await
 }
@@ -82,7 +83,7 @@ pub async fn accept_loop_with_ingest(
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    accept_loop_with_ingest_until_cancel(
+    accept_loop_with_ingest_until_cancel_inner(
         db_path,
         tenant_peer_ids,
         endpoint,
@@ -92,6 +93,7 @@ pub async fn accept_loop_with_ingest(
         tenant_client_configs,
         intro_spawner,
         ingest,
+        None,
     )
     .await
 }
@@ -110,6 +112,35 @@ pub async fn accept_loop_with_ingest_until_cancel(
     tenant_client_configs: std::collections::HashMap<String, TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    accept_loop_with_ingest_until_cancel_inner(
+        db_path,
+        tenant_peer_ids,
+        endpoint,
+        shutdown,
+        _allowed_peers,
+        shared_ingest_tx,
+        tenant_client_configs,
+        intro_spawner,
+        ingest,
+        None,
+    )
+    .await
+}
+
+async fn accept_loop_with_ingest_until_cancel_inner(
+    db_path: &str,
+    tenant_peer_ids: &[String],
+    endpoint: TransportEndpoint,
+    shutdown: CancellationToken,
+    _allowed_peers: Option<crate::transport::AllowedPeers>,
+    shared_ingest_tx: tokio::sync::mpsc::Sender<
+        crate::contracts::event_pipeline_contract::IngestItem,
+    >,
+    tenant_client_configs: std::collections::HashMap<String, TransportClientConfig>,
+    intro_spawner: IntroSpawnerFn,
+    ingest: IngestFns,
+    fixed_recorded_by: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     struct ConnectionWorker {
         cancel: CancellationToken,
@@ -156,7 +187,13 @@ pub async fn accept_loop_with_ingest_until_cancel(
         // Resolve which local tenant owns this connection.
         // Always resolve via trust tables — new tenants may have been
         // registered on the live endpoint since the accept loop started.
-        let recorded_by = {
+        let recorded_by = if let Some(recorded_by) = fixed_recorded_by.as_ref() {
+            // Single-tenant callers already selected the local tenant up front.
+            // Transport admission may come from static pinning rather than DB
+            // trust rows, so re-resolving here would incorrectly drop the
+            // connection before intro handling can record it.
+            recorded_by.clone()
+        } else {
             match resolve_tenant_for_peer(db_path, tenant_peer_ids, &peer_id) {
                 Some(rb) => rb,
                 None => {
@@ -210,11 +247,8 @@ pub async fn accept_loop_with_ingest_until_cancel(
             .or_else(|| {
                 // Fallback: build config from DB for dynamically added tenants
                 // whose client config wasn't in the startup-time map.
-                crate::transport::build_tenant_client_config_from_db(
-                    db_path,
-                    &recorded_by_owned,
-                )
-                .ok()
+                crate::transport::build_tenant_client_config_from_db(db_path, &recorded_by_owned)
+                    .ok()
             });
         let provider_owned = provider.clone();
         let peer_id_owned = peer_id.clone();

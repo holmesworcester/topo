@@ -132,7 +132,8 @@ impl PinnedCertVerifier {
                     *entry
                 }
             };
-            let should_warn = count != u64::MAX && should_emit_globally(format!("transport-reject:{fp_hex}"));
+            let should_warn =
+                count != u64::MAX && should_emit_globally(format!("transport-reject:{fp_hex}"));
             if should_warn {
                 warn!(
                     fingerprint = %fp_hex,

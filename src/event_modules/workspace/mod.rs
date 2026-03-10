@@ -12,8 +12,7 @@ pub use projector::project_pure;
 pub use queries::{
     keys, list, list_all_items, list_items, name, resolve_workspace_for_peer, status, view,
     view_for_peer, KeysResponse, StatusResponse, ViewFileSummary, ViewMessage, ViewReaction,
-    ViewResponse,
-    WorkspaceItem, WorkspaceRow,
+    ViewResponse, WorkspaceItem, WorkspaceRow,
 };
 pub use wire::{
     encode_workspace, parse_workspace, WorkspaceEvent, WORKSPACE_META, WORKSPACE_WIRE_SIZE,

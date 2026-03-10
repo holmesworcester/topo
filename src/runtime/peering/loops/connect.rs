@@ -291,7 +291,9 @@ async fn connect_loop_inner(
             Ok(outcome) => outcome,
             Err(e) => {
                 let message = describe_connect_failure(remote, &e);
-                if should_warn_for_connect_failure(has_connected_once, &e)
+                let warn_on_startup_stale_failure = bootstrap_fallback_client_config.is_some();
+                if (should_warn_for_connect_failure(has_connected_once, &e)
+                    || warn_on_startup_stale_failure)
                     && warning_gate.should_emit(message.clone())
                     && should_emit_globally(format!("connect:{message}"))
                 {
@@ -300,6 +302,14 @@ async fn connect_loop_inner(
                 if is_stale_dial_failure(&e) {
                     consecutive_stale_dial_failures += 1;
                     if consecutive_stale_dial_failures >= STALE_DIAL_FAILURE_THRESHOLD {
+                        // Startup dials suppress noisy one-off stale-target warnings before the
+                        // first successful connection, but once we decide the target is stale we
+                        // still need to emit the human-readable diagnosis once.
+                        if warning_gate.should_emit(message.clone())
+                            && should_emit_globally(format!("connect:{message}"))
+                        {
+                            warn!("{}", message);
+                        }
                         return Err(std::io::Error::other(format!(
                             "{} remote={} failures={} last_error={}",
                             STALE_DIAL_TARGET_MARKER, remote, consecutive_stale_dial_failures, e

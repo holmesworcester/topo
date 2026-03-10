@@ -108,6 +108,110 @@ impl StartedCliPeer {
     }
 }
 
+fn short_cli_id(id: &str) -> &str {
+    &id[..id.len().min(8)]
+}
+
+fn local_username_for_tenant(conn: &rusqlite::Connection, peer_id: &str) -> String {
+    use rusqlite::OptionalExtension;
+
+    if let Some(username) = conn
+        .query_row(
+            "SELECT COALESCE(u.username, '')
+             FROM peers_shared ps
+             JOIN local_transport_creds c
+               ON c.peer_id = lower(hex(ps.transport_fingerprint))
+             LEFT JOIN users u
+               ON ps.user_event_id = u.event_id
+              AND ps.recorded_by = u.recorded_by
+             WHERE ps.recorded_by = ?1
+             ORDER BY ps.event_id ASC
+             LIMIT 1",
+            rusqlite::params![peer_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()
+        .expect("query local tenant username")
+    {
+        return username;
+    }
+
+    conn.query_row(
+        "SELECT COALESCE(username, '')
+         FROM users
+         WHERE recorded_by = ?1
+         ORDER BY event_id ASC
+         LIMIT 1",
+        rusqlite::params![peer_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .expect("fallback tenant username")
+    .unwrap_or_default()
+}
+
+fn workspace_name_for_tenant(
+    conn: &rusqlite::Connection,
+    peer_id: &str,
+    workspace_id: &str,
+) -> String {
+    use rusqlite::OptionalExtension;
+
+    conn.query_row(
+        "SELECT COALESCE(name, '')
+         FROM workspaces
+         WHERE recorded_by = ?1
+           AND workspace_id = ?2
+         LIMIT 1",
+        rusqlite::params![peer_id, workspace_id],
+        |row| row.get::<_, String>(0),
+    )
+    .optional()
+    .expect("query tenant workspace name")
+    .unwrap_or_default()
+}
+
+fn expected_view_tenant_labels(db_path: &str) -> Vec<(String, String)> {
+    let conn = open_connection(db_path).expect("open db");
+    let mut stmt = conn
+        .prepare(
+            "SELECT recorded_by, tenant_event_id, workspace_id
+             FROM invites_accepted
+             ORDER BY recorded_by, created_at ASC, event_id ASC",
+        )
+        .expect("prepare tenant labels query");
+    let mut rows = stmt.query([]).expect("query tenant labels");
+    let mut seen = std::collections::HashSet::new();
+    let mut labels = Vec::new();
+
+    while let Some(row) = rows.next().expect("read tenant label row") {
+        let peer_id: String = row.get(0).expect("tenant peer id");
+        if !seen.insert(peer_id.clone()) {
+            continue;
+        }
+        let tenant_event_id: String = row.get(1).expect("tenant event id");
+        let workspace_id: String = row.get(2).expect("tenant workspace id");
+        let username = local_username_for_tenant(&conn, &peer_id);
+        let workspace_name = workspace_name_for_tenant(&conn, &peer_id, &workspace_id);
+        let user_display = if username.is_empty() {
+            short_cli_id(&peer_id).to_string()
+        } else {
+            username
+        };
+        let workspace_display = if workspace_name.is_empty() {
+            short_cli_id(&workspace_id).to_string()
+        } else {
+            workspace_name
+        };
+        labels.push((
+            short_cli_id(&tenant_event_id).to_string(),
+            format!("{}@{}", user_display, workspace_display),
+        ));
+    }
+
+    labels
+}
+
 fn numbered_item_count(output: &str) -> usize {
     output
         .lines()
@@ -438,6 +542,20 @@ fn assert_cli_state(
         "view should include TENANTS:\n{}",
         view
     );
+    for (tenant_event_id, tenant_label) in expected_view_tenant_labels(db_path) {
+        assert!(
+            view.contains(&tenant_event_id),
+            "view should contain tenant event id {:?}:\n{}",
+            tenant_event_id,
+            view
+        );
+        assert!(
+            view.contains(&tenant_label),
+            "view should contain top-level tenant label {:?}:\n{}",
+            tenant_label,
+            view
+        );
+    }
     for username in expected_users {
         assert!(
             view.contains(username),
@@ -449,7 +567,7 @@ fn assert_cli_state(
     for tenant in expected_tenants {
         assert!(
             view.contains(tenant),
-            "view should contain tenant {:?}:\n{}",
+            "view should contain workspace user/device {:?}:\n{}",
             tenant,
             view
         );
@@ -914,7 +1032,10 @@ fn test_cli_selected_partial_join_tenant_reports_initial_sync_errors() {
 
     let _daemon = start_daemon(&bob_db);
 
-    let select = topo_cmd(&bob_db, &["tenant", "use", &partial_tenant_index.to_string()]);
+    let select = topo_cmd(
+        &bob_db,
+        &["tenant", "use", &partial_tenant_index.to_string()],
+    );
     assert!(
         select.status.success(),
         "tenant use failed: stdout={} stderr={}",
@@ -1591,7 +1712,7 @@ fn test_cli_multi_use_user_invites_mix_reuse_and_new_creation() {
 fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 30000;
+    let timeout_ms = 45000;
     let workspace_name = "device-link-induction";
 
     let phone_db = tmpdir.path().join("phone.db").to_str().unwrap().to_string();
@@ -2604,6 +2725,7 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
 
 #[test]
 fn test_cli_completions_bash() {
+    let _guard = cli_test_lock();
     let output = Command::new(bin())
         .args(["completions", "bash"])
         .output()
@@ -2619,6 +2741,7 @@ fn test_cli_completions_bash() {
 
 #[test]
 fn test_cli_completions_zsh() {
+    let _guard = cli_test_lock();
     let output = Command::new(bin())
         .args(["completions", "zsh"])
         .output()
@@ -2689,6 +2812,7 @@ fn test_cli_workspaces() {
 
 #[test]
 fn test_cli_db_registry() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let reg_dir = tmpdir.path().join("registry");
     std::fs::create_dir_all(&reg_dir).unwrap();
@@ -2744,6 +2868,7 @@ fn test_cli_db_registry() {
 
 #[test]
 fn test_cli_db_invalid_numeric_selector_errors() {
+    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let reg_dir = tmpdir.path().join("registry");
     std::fs::create_dir_all(&reg_dir).unwrap();

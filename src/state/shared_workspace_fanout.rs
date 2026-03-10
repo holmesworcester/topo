@@ -35,7 +35,11 @@ pub(crate) fn persist_pending_fanouts(
          VALUES (?1, ?2, ?3)",
     )?;
     for f in fanouts {
-        stmt.execute(rusqlite::params![&f.origin_peer_id, &f.workspace_id, f.event_id.as_slice()])?;
+        stmt.execute(rusqlite::params![
+            &f.origin_peer_id,
+            &f.workspace_id,
+            f.event_id.as_slice()
+        ])?;
     }
     Ok(())
 }
@@ -46,9 +50,8 @@ pub(crate) fn persist_pending_fanouts(
 pub(crate) fn take_pending_fanouts(
     conn: &Connection,
 ) -> Result<Vec<SharedEventFanout>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut stmt = conn.prepare(
-        "SELECT origin_peer_id, workspace_id, event_id FROM pending_shared_fanouts",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT origin_peer_id, workspace_id, event_id FROM pending_shared_fanouts")?;
     let rows: Vec<SharedEventFanout> = stmt
         .query_map([], |row| {
             let origin: String = row.get(0)?;

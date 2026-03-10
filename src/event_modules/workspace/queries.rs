@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::event_id_from_base64;
@@ -229,16 +229,178 @@ pub struct ViewMessage {
 }
 
 #[derive(Debug, Serialize, Deserialize)]
+pub struct ViewUser {
+    pub event_id: String,
+    pub peer_event_id: String,
+    pub username: String,
+    pub device_name: String,
+}
+
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ViewTenant {
+    pub event_id: String,
+    pub peer_id: String,
+    pub username: String,
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub active: bool,
+}
+
+#[derive(Debug)]
+struct ViewTenantScopeRow {
+    peer_id: String,
+    tenant_event_id: String,
+    workspace_id: String,
+}
+
+fn list_view_users(db: &Connection, recorded_by: &str) -> Result<Vec<ViewUser>, rusqlite::Error> {
+    let mut stmt = db.prepare(
+        "SELECT COALESCE(ps.user_event_id, ''),
+                ps.event_id,
+                COALESCE(u.username, ''),
+                COALESCE(ps.device_name, '')
+         FROM peers_shared ps
+         LEFT JOIN users u
+           ON ps.user_event_id = u.event_id
+          AND ps.recorded_by = u.recorded_by
+         WHERE ps.recorded_by = ?1
+         ORDER BY LOWER(COALESCE(u.username, '')),
+                  LOWER(COALESCE(ps.device_name, '')),
+                  ps.event_id",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![recorded_by], |row| {
+            Ok(ViewUser {
+                event_id: row.get(0)?,
+                peer_event_id: row.get(1)?,
+                username: row.get(2)?,
+                device_name: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+fn list_view_tenant_scopes(db: &Connection) -> Result<Vec<ViewTenantScopeRow>, rusqlite::Error> {
+    let mut stmt = db.prepare(
+        "SELECT recorded_by, tenant_event_id, workspace_id
+         FROM invites_accepted
+         ORDER BY recorded_by, created_at ASC, event_id ASC",
+    )?;
+    let mut rows = stmt.query([])?;
+    let mut scopes = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    while let Some(row) = rows.next()? {
+        let peer_id: String = row.get(0)?;
+        if !seen.insert(peer_id.clone()) {
+            continue;
+        }
+        scopes.push(ViewTenantScopeRow {
+            peer_id,
+            tenant_event_id: row.get(1)?,
+            workspace_id: row.get(2)?,
+        });
+    }
+    Ok(scopes)
+}
+
+fn tenant_workspace_name(
+    db: &Connection,
+    recorded_by: &str,
+    workspace_id: &str,
+) -> Result<String, rusqlite::Error> {
+    Ok(db
+        .query_row(
+            "SELECT COALESCE(name, '')
+             FROM workspaces
+             WHERE recorded_by = ?1
+               AND workspace_id = ?2
+             LIMIT 1",
+            rusqlite::params![recorded_by, workspace_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_default())
+}
+
+fn tenant_local_username(db: &Connection, recorded_by: &str) -> Result<String, rusqlite::Error> {
+    if let Some(username) = db
+        .query_row(
+            "SELECT COALESCE(u.username, '')
+             FROM peers_shared ps
+             JOIN local_transport_creds c
+               ON c.peer_id = lower(hex(ps.transport_fingerprint))
+             LEFT JOIN users u
+               ON ps.user_event_id = u.event_id
+              AND ps.recorded_by = u.recorded_by
+             WHERE ps.recorded_by = ?1
+             ORDER BY ps.event_id ASC
+             LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+    {
+        return Ok(username);
+    }
+
+    Ok(db
+        .query_row(
+            "SELECT COALESCE(username, '')
+             FROM users
+             WHERE recorded_by = ?1
+             ORDER BY event_id ASC
+             LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?
+        .unwrap_or_default())
+}
+
+fn list_view_tenants(
+    db: &Connection,
+    active_recorded_by: &str,
+) -> Result<Vec<ViewTenant>, rusqlite::Error> {
+    let mut tenants = list_view_tenant_scopes(db)?
+        .into_iter()
+        .map(|scope| {
+            let workspace_name = tenant_workspace_name(db, &scope.peer_id, &scope.workspace_id)?;
+            let username = tenant_local_username(db, &scope.peer_id)?;
+            Ok(ViewTenant {
+                event_id: scope.tenant_event_id,
+                peer_id: scope.peer_id.clone(),
+                username,
+                workspace_id: scope.workspace_id,
+                workspace_name,
+                active: scope.peer_id == active_recorded_by,
+            })
+        })
+        .collect::<Result<Vec<_>, rusqlite::Error>>()?;
+
+    tenants.sort_by(|a, b| {
+        b.active
+            .cmp(&a.active)
+            .then_with(|| a.workspace_name.cmp(&b.workspace_name))
+            .then_with(|| a.username.cmp(&b.username))
+            .then_with(|| a.event_id.cmp(&b.event_id))
+    });
+
+    Ok(tenants)
+}
+
+#[derive(Debug, Serialize, Deserialize)]
 pub struct ViewResponse {
     pub workspace_name: String,
-    pub users: Vec<user::UserItem>,
+    pub users: Vec<ViewUser>,
     #[serde(alias = "accounts")]
-    pub tenants: Vec<peer_shared::TenantItem>,
+    pub tenants: Vec<ViewTenant>,
     pub own_user_event_id: String,
     pub messages: Vec<ViewMessage>,
 }
 
-/// Build a full workspace view: workspace name, users, tenants, messages with reactions.
+/// Build the combined view: DB-global local tenants, active-workspace user/devices,
+/// and messages with reactions/files.
 pub fn view(
     db: &Connection,
     recorded_by: &str,
@@ -247,8 +409,8 @@ pub fn view(
     // Workspace name
     let workspace_name = name(db, recorded_by).unwrap_or_default();
 
-    // Users
-    let users = user::list_items(db, recorded_by)?;
+    // Workspace users/devices
+    let users = list_view_users(db, recorded_by)?;
 
     // Own user_event_id (for marking "you")
     let own_user_eid: String =
@@ -260,16 +422,8 @@ pub fn view(
             String::new()
         };
 
-    // Tenants (peers)
-    let tenants: Vec<peer_shared::TenantItem> = peer_shared::list_tenants(db, recorded_by)?
-        .into_iter()
-        .map(|row| peer_shared::TenantItem {
-            event_id: row.event_id,
-            device_name: row.device_name,
-            user_event_id: row.user_event_id,
-            username: row.username,
-        })
-        .collect();
+    // Top-level local tenants (DB-global, not workspace peers)
+    let tenants = list_view_tenants(db, recorded_by)?;
 
     // Messages with author names, reactions, files, and client_op_ids
     // (message::list already loads all of these per message)
@@ -324,4 +478,108 @@ pub fn view_for_peer(
 ) -> Result<ViewResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
     view(&db, &recorded_by, limit)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{open_in_memory, schema::create_tables};
+
+    fn insert_local_transport_cred(conn: &Connection, peer_id: &str, tf_byte: u8) {
+        let tf_hex = hex::encode([tf_byte; 32]);
+        conn.execute(
+            "INSERT INTO local_transport_creds (peer_id, cert_der, key_der, created_at, source)
+             VALUES (?1, X'AA', X'BB', 1, 'test')",
+            rusqlite::params![if peer_id.is_empty() {
+                tf_hex
+            } else {
+                peer_id.to_string()
+            }],
+        )
+        .expect("insert local transport creds");
+    }
+
+    #[test]
+    fn view_separates_top_level_tenants_from_workspace_user_devices() {
+        let conn = open_in_memory().expect("open in-memory db");
+        create_tables(&conn).expect("create tables");
+
+        conn.execute(
+            "INSERT INTO invites_accepted
+             (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES
+             ('tenant-a', 'ia-a', 'tenant-event-a', 'invite-a', 'ws-design', 1),
+             ('tenant-b', 'ia-b', 'tenant-event-b', 'invite-b', 'ws-ops', 2)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO workspaces
+             (recorded_by, event_id, workspace_id, public_key, name)
+             VALUES
+             ('tenant-a', 'ws-a', 'ws-design', X'AA', 'design'),
+             ('tenant-b', 'ws-b', 'ws-ops', X'BB', 'ops')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO users (recorded_by, event_id, public_key, username)
+             VALUES
+             ('tenant-a', 'user-alice', X'01', 'alice'),
+             ('tenant-a', 'user-carol', X'02', 'carol'),
+             ('tenant-b', 'user-remote', X'03', 'remote-first'),
+             ('tenant-b', 'user-bob', X'04', 'bob')",
+            [],
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO peers_shared
+             (recorded_by, event_id, public_key, transport_fingerprint, user_event_id, device_name)
+             VALUES
+             ('tenant-a', 'peer-alice-phone', X'11', ?1, 'user-alice', 'phone'),
+             ('tenant-a', 'peer-carol-workstation', X'12', ?2, 'user-carol', 'workstation'),
+             ('tenant-b', 'peer-remote', X'13', ?3, 'user-remote', 'shared-box'),
+             ('tenant-b', 'peer-bob-laptop', X'14', ?4, 'user-bob', 'laptop')",
+            rusqlite::params![
+                vec![0x01u8; 32],
+                vec![0x09u8; 32],
+                vec![0x08u8; 32],
+                vec![0x02u8; 32],
+            ],
+        )
+        .unwrap();
+
+        insert_local_transport_cred(&conn, "", 0x01);
+        insert_local_transport_cred(&conn, "", 0x02);
+
+        let resp = view(&conn, "tenant-a", 50).expect("view query");
+
+        assert_eq!(resp.workspace_name, "design");
+        assert_eq!(resp.users.len(), 2);
+        assert_eq!(resp.users[0].username, "alice");
+        assert_eq!(resp.users[0].device_name, "phone");
+        assert_eq!(resp.users[0].event_id, "user-alice");
+        assert_eq!(resp.users[1].username, "carol");
+        assert_eq!(resp.users[1].device_name, "workstation");
+
+        assert_eq!(resp.tenants.len(), 2);
+        assert!(resp.tenants[0].active, "active tenant should sort first");
+        assert_eq!(resp.tenants[0].event_id, "tenant-event-a");
+        assert_eq!(resp.tenants[0].username, "alice");
+        assert_eq!(resp.tenants[0].workspace_name, "design");
+
+        let tenant_b = resp
+            .tenants
+            .iter()
+            .find(|tenant| tenant.peer_id == "tenant-b")
+            .expect("tenant-b present");
+        assert_eq!(tenant_b.event_id, "tenant-event-b");
+        assert_eq!(
+            tenant_b.username, "bob",
+            "top-level tenant label should use the tenant's local user, not an arbitrary workspace user"
+        );
+        assert_eq!(tenant_b.workspace_name, "ops");
+    }
 }
