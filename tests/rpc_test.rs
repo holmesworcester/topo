@@ -1188,12 +1188,12 @@ fn accept_invite_when_already_in_workspace_adds_second_tenant() {
 
     // Tenants list should now include both workspaces.
     let tenants_out = Command::new(bin())
-        .args(["--db", &bob_db, "tenants"])
+        .args(["--db", &bob_db, "tenant", "list"])
         .output()
         .unwrap();
     assert!(
         tenants_out.status.success(),
-        "tenants failed: stdout={} stderr={}",
+        "tenant list failed: stdout={} stderr={}",
         String::from_utf8_lossy(&tenants_out.stdout),
         String::from_utf8_lossy(&tenants_out.stderr)
     );
@@ -1298,12 +1298,12 @@ fn accept_invite_on_running_active_daemon_with_existing_workspace_succeeds() {
     );
 
     let tenants_out = Command::new(bin())
-        .args(["--db", &bob_db, "tenants"])
+        .args(["--db", &bob_db, "tenant", "list"])
         .output()
         .unwrap();
     assert!(
         tenants_out.status.success(),
-        "tenants failed: stdout={} stderr={}",
+        "tenant list failed: stdout={} stderr={}",
         String::from_utf8_lossy(&tenants_out.stdout),
         String::from_utf8_lossy(&tenants_out.stderr)
     );
@@ -2098,4 +2098,203 @@ fn rpc_call_stdin_input() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
     assert!(parsed["ok"].as_bool().unwrap_or(false), "should be ok=true");
+}
+
+// ---------------------------------------------------------------------------
+// Dynamic tenant registration tests (no-restart on new workspace)
+// ---------------------------------------------------------------------------
+
+/// Regression test: creating a second workspace on a running daemon must NOT
+/// crash the daemon. Previously, reevaluate_runtime would tear down and rebind
+/// the QUIC endpoint, racing with port release → EADDRINUSE.
+#[test]
+fn create_second_workspace_on_running_daemon_does_not_crash() {
+    let (_dir, db) = temp_db();
+
+    create_workspace(&db);
+    let mut daemon = start_daemon(&db);
+
+    // Create a second workspace while the daemon is running.
+    let out = Command::new(bin())
+        .args(["--db", &db, "create-workspace"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "second create-workspace should succeed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    // Daemon must still be alive and responsive.
+    std::thread::sleep(Duration::from_secs(2));
+    let status = Command::new(bin())
+        .args(["--db", &db, "status"])
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "daemon should still be responsive after second workspace: stderr={}",
+        String::from_utf8_lossy(&status.stderr)
+    );
+
+    stop_daemon(&db, &mut daemon);
+}
+
+/// Creating three workspaces sequentially on a running daemon must not crash.
+#[test]
+fn create_three_workspaces_sequentially_on_running_daemon() {
+    let (_dir, db) = temp_db();
+
+    create_workspace(&db);
+    let mut daemon = start_daemon(&db);
+
+    for i in 2..=3 {
+        let out = Command::new(bin())
+            .args(["--db", &db, "create-workspace"])
+            .output()
+            .unwrap();
+        assert!(
+            out.status.success(),
+            "workspace {} creation failed: stderr={}",
+            i,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        // Brief pause for reevaluation cycle.
+        std::thread::sleep(Duration::from_millis(500));
+    }
+
+    // Verify daemon is alive and all 3 tenants exist.
+    std::thread::sleep(Duration::from_secs(1));
+    let status = Command::new(bin())
+        .args(["--db", &db, "status"])
+        .output()
+        .unwrap();
+    assert!(
+        status.status.success(),
+        "daemon should still be responsive after 3 workspaces"
+    );
+
+    let conn = topo::db::open_connection(&db).unwrap();
+    let tenants = topo::db::transport_creds::discover_local_tenants(&conn).unwrap();
+    assert_eq!(
+        tenants.len(),
+        3,
+        "expected 3 tenants, got {}",
+        tenants.len()
+    );
+
+    stop_daemon(&db, &mut daemon);
+}
+
+/// The UDP listen port must remain stable after adding a new tenant — proving
+/// the endpoint is NOT restarted.
+#[test]
+fn listen_port_stable_after_adding_tenant() {
+    let (_dir, db) = temp_db();
+
+    create_workspace(&db);
+    let mut daemon = start_daemon(&db);
+
+    // Capture listen port before.
+    let port_before = get_listen_port(&db);
+    assert!(
+        port_before.is_some(),
+        "daemon should report a listen port in status"
+    );
+
+    // Create a second workspace.
+    let out = Command::new(bin())
+        .args(["--db", &db, "create-workspace"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "second workspace should succeed");
+
+    // Wait for reevaluation cycle to pick up the new tenant.
+    std::thread::sleep(Duration::from_secs(3));
+
+    // Capture listen port after.
+    let port_after = get_listen_port(&db);
+    assert_eq!(
+        port_before, port_after,
+        "listen port should be stable (no endpoint restart): before={:?}, after={:?}",
+        port_before, port_after
+    );
+
+    stop_daemon(&db, &mut daemon);
+}
+
+/// Helper: extract the listen port from `topo status` text output.
+///
+/// Looks for a line like `  Listen:    127.0.0.1:12345` and extracts the port.
+fn get_listen_port(db: &str) -> Option<u16> {
+    let out = Command::new(bin())
+        .args(["--db", db, "status"])
+        .output()
+        .ok()?;
+    if !out.status.success() {
+        return None;
+    }
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        let trimmed = line.trim();
+        if let Some(rest) = trimmed.strip_prefix("Listen:") {
+            let addr = rest.trim();
+            return addr.rsplit(':').next().and_then(|p| p.parse().ok());
+        }
+    }
+    None
+}
+
+/// After adding a second workspace, both tenants should be functional:
+/// each can send and read messages independently.
+#[test]
+fn both_tenants_functional_after_adding_second_workspace() {
+    let (_dir, db) = temp_db();
+
+    create_workspace(&db);
+    let mut daemon = start_daemon(&db);
+
+    // Send a message on tenant 1.
+    let send1 = Command::new(bin())
+        .args(["--db", &db, "send", "hello from tenant 1"])
+        .output()
+        .unwrap();
+    assert!(
+        send1.status.success(),
+        "send on tenant 1 should succeed: stderr={}",
+        String::from_utf8_lossy(&send1.stderr)
+    );
+
+    // Create second workspace.
+    let out = Command::new(bin())
+        .args(["--db", &db, "create-workspace"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "second workspace should succeed");
+
+    // Wait for reevaluation.
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Verify tenant 2 exists.
+    let conn = topo::db::open_connection(&db).unwrap();
+    let tenants_after = topo::db::transport_creds::discover_local_tenants(&conn).unwrap();
+    assert_eq!(
+        tenants_after.len(),
+        2,
+        "expected 2 tenants after second workspace"
+    );
+    drop(conn);
+
+    // Messages command should still work (uses active tenant).
+    let msgs = Command::new(bin())
+        .args(["--db", &db, "messages"])
+        .output()
+        .unwrap();
+    assert!(
+        msgs.status.success(),
+        "messages should succeed after adding second tenant: stderr={}",
+        String::from_utf8_lossy(&msgs.stderr)
+    );
+
+    stop_daemon(&db, &mut daemon);
 }

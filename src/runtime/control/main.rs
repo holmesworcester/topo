@@ -153,19 +153,29 @@ enum Commands {
     // -------------------------------------------------------------------
     // Daemon-only commands (require a running daemon)
     // -------------------------------------------------------------------
-    /// List local tenants (peer identities) in this DB with active marker
-    Tenants,
+    /// Manage tenants (list, use, active)
+    #[command(
+        after_help = "Examples:\n  topo tenant          # list tenants (default)\n  topo tenant list     # list tenants\n  topo tenant use 2    # switch to tenant 2\n  topo tenant active   # show active tenant"
+    )]
+    Tenant {
+        #[command(subcommand)]
+        action: Option<TenantAction>,
+    },
 
-    /// Switch active tenant by number from the tenants list
-    #[command(name = "use-tenant")]
-    UseTenant {
-        /// Tenant number (1-based, from `topo tenants`)
+    /// Deprecated: use `topo tenant list`
+    #[command(name = "tenants", hide = true)]
+    DeprecatedTenants,
+
+    /// Deprecated: use `topo tenant use <N>`
+    #[command(name = "use-tenant", hide = true)]
+    DeprecatedUseTenant {
+        /// Tenant number (1-based)
         index: usize,
     },
 
-    /// Show currently active tenant
-    #[command(name = "active-tenant")]
-    ActiveTenant,
+    /// Deprecated: use `topo tenant active`
+    #[command(name = "active-tenant", hide = true)]
+    DeprecatedActiveTenant,
 
     /// Print local transport identity — SPKI fingerprint from TLS cert
     #[command(name = "transport-identity")]
@@ -309,13 +319,22 @@ enum Commands {
     /// List all known peers (local + remote) with connection endpoint info
     Peers,
 
-    /// Show event dependency tree (requires running daemon)
-    #[command(name = "event-tree")]
-    EventTree,
+    /// Event inspection commands (tree, list)
+    #[command(
+        after_help = "Examples:\n  topo event tree     # show event dependency tree\n  topo event list     # list all events with dependencies"
+    )]
+    Event {
+        #[command(subcommand)]
+        action: EventAction,
+    },
 
-    /// List all events with their dependencies (requires running daemon)
-    #[command(name = "event-list")]
-    EventList,
+    /// Deprecated: use `topo event tree`
+    #[command(name = "event-tree", hide = true)]
+    DeprecatedEventTree,
+
+    /// Deprecated: use `topo event list`
+    #[command(name = "event-list", hide = true)]
+    DeprecatedEventList,
 
     /// Send intro offers to two peers so they can hole-punch a direct connection
     Intro {
@@ -497,55 +516,54 @@ enum Commands {
         sub_flag: Option<String>,
     },
 
-    /// Enable persistent sync logging (off by default)
-    #[command(name = "sync-log-enable")]
-    SyncLogEnable {
-        /// Include match-only runs (default stores changed runs only)
+    /// Sync log management (show, tree, enable, disable, config)
+    #[command(
+        name = "sync-log",
+        after_help = "Examples:\n  topo sync-log              # show recent sync runs (default)\n  topo sync-log show --all   # show all runs including match-only\n  topo sync-log tree          # tree view of sync history\n  topo sync-log enable        # enable persistent sync logging\n  topo sync-log disable       # disable sync logging\n  topo sync-log config        # show current config"
+    )]
+    SyncLog {
+        /// Max runs to show (shorthand for `sync-log show --limit`)
+        #[arg(long, default_value = "5")]
+        limit: usize,
+        /// Show one specific run id (shorthand for `sync-log show --run`)
+        #[arg(long)]
+        run: Option<i64>,
+        /// Filter by peer id prefix (shorthand for `sync-log show --peer`)
+        #[arg(long)]
+        peer: Option<String>,
+        /// Include runs that matched with no data transfer (shorthand for `sync-log show --all`)
+        #[arg(long)]
+        all: bool,
+        #[command(subcommand)]
+        action: Option<SyncLogAction>,
+    },
+
+    /// Deprecated: use `topo sync-log enable`
+    #[command(name = "sync-log-enable", hide = true)]
+    DeprecatedSyncLogEnable {
         #[arg(long, default_value_t = false)]
         all_runs: bool,
-        /// Capture full ID lists in log details (larger DB growth)
         #[arg(long, default_value_t = false)]
         capture_full_ids: bool,
     },
 
-    /// Disable persistent sync logging
-    #[command(name = "sync-log-disable")]
-    SyncLogDisable,
+    /// Deprecated: use `topo sync-log disable`
+    #[command(name = "sync-log-disable", hide = true)]
+    DeprecatedSyncLogDisable,
 
-    /// Show sync logging configuration
-    #[command(name = "sync-log-config")]
-    SyncLogConfig,
+    /// Deprecated: use `topo sync-log config`
+    #[command(name = "sync-log-config", hide = true)]
+    DeprecatedSyncLogConfig,
 
-    /// Show sync log trace history
-    #[command(name = "sync-log")]
-    SyncLog {
-        /// Max runs to show
+    /// Deprecated: use `topo sync-log tree`
+    #[command(name = "sync-log-tree", hide = true)]
+    DeprecatedSyncLogTree {
         #[arg(long, default_value = "5")]
         limit: usize,
-        /// Show one specific run id
         #[arg(long)]
         run: Option<i64>,
-        /// Filter by peer id prefix
         #[arg(long)]
         peer: Option<String>,
-        /// Include runs that matched with no data transfer
-        #[arg(long)]
-        all: bool,
-    },
-
-    /// Show sync history in tree form
-    #[command(name = "sync-log-tree")]
-    SyncLogTree {
-        /// Max runs to show
-        #[arg(long, default_value = "5")]
-        limit: usize,
-        /// Show one specific run id
-        #[arg(long)]
-        run: Option<i64>,
-        /// Filter by peer id prefix
-        #[arg(long)]
-        peer: Option<String>,
-        /// Include runs that matched with no data transfer
         #[arg(long)]
         all: bool,
     },
@@ -724,6 +742,74 @@ enum DbAction {
         /// Alias name, index, or path
         selector: String,
     },
+}
+
+#[derive(Subcommand)]
+enum TenantAction {
+    /// List local tenants (peer identities) in this DB with active marker
+    List,
+    /// Switch active tenant by number from the tenants list
+    Use {
+        /// Tenant number (1-based, from `topo tenant list`)
+        index: usize,
+    },
+    /// Show currently active tenant
+    Active,
+}
+
+#[derive(Subcommand)]
+enum EventAction {
+    /// Show event dependency tree (requires running daemon)
+    Tree,
+    /// List all events with their dependencies (requires running daemon)
+    List,
+}
+
+#[derive(Subcommand)]
+enum SyncLogAction {
+    /// Show sync log trace history
+    Show {
+        /// Max runs to show
+        #[arg(long, default_value = "5")]
+        limit: usize,
+        /// Show one specific run id
+        #[arg(long)]
+        run: Option<i64>,
+        /// Filter by peer id prefix
+        #[arg(long)]
+        peer: Option<String>,
+        /// Include runs that matched with no data transfer
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show sync history in tree form
+    Tree {
+        /// Max runs to show
+        #[arg(long, default_value = "5")]
+        limit: usize,
+        /// Show one specific run id
+        #[arg(long)]
+        run: Option<i64>,
+        /// Filter by peer id prefix
+        #[arg(long)]
+        peer: Option<String>,
+        /// Include runs that matched with no data transfer
+        #[arg(long)]
+        all: bool,
+    },
+    /// Enable persistent sync logging
+    Enable {
+        /// Include match-only runs (default stores changed runs only)
+        #[arg(long, default_value_t = false)]
+        all_runs: bool,
+        /// Capture full ID lists in log details (larger DB growth)
+        #[arg(long, default_value_t = false)]
+        capture_full_ids: bool,
+    },
+    /// Disable persistent sync logging
+    Disable,
+    /// Show sync logging configuration
+    Config,
 }
 
 // ---------------------------------------------------------------------------
@@ -1215,10 +1301,188 @@ fn run_sub_action(
     }
 }
 
+fn run_tenant_action(
+    db: &str,
+    socket: Option<&str>,
+    action: TenantAction,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match action {
+        TenantAction::List => {
+            let data = rpc_require_daemon(db, socket, RpcMethod::Tenants)?;
+            println!("TENANTS ({}):", db);
+            if let Some(items) = data.as_array() {
+                if items.is_empty() {
+                    println!("  (none)");
+                } else {
+                    for item in items {
+                        let marker = if item["active"].as_bool().unwrap_or(false) {
+                            "*"
+                        } else {
+                            " "
+                        };
+                        let peer_id = item["peer_id"].as_str().unwrap_or("");
+                        let ws_id = item["workspace_id"].as_str().unwrap_or("");
+                        let idx = item["index"].as_u64().unwrap_or(0);
+                        println!(
+                            "  {}. {} {} (workspace: {})",
+                            idx,
+                            marker,
+                            short_id(peer_id),
+                            short_id(ws_id)
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        TenantAction::Use { index } => {
+            let data = rpc_require_daemon(db, socket, RpcMethod::UseTenant { index })?;
+            let peer_id = data["peer_id"].as_str().unwrap_or("");
+            let ws_id = data["workspace_id"].as_str().unwrap_or("");
+            println!(
+                "Switched to tenant {} (workspace: {})",
+                short_id(peer_id),
+                short_id(ws_id)
+            );
+            Ok(())
+        }
+        TenantAction::Active => {
+            let data = rpc_require_daemon(db, socket, RpcMethod::ActiveTenant)?;
+            match data["peer_id"].as_str() {
+                Some(peer_id) => println!("{}", peer_id),
+                None => println!("(no active tenant)"),
+            }
+            Ok(())
+        }
+    }
+}
+
+fn run_event_action(
+    db: &str,
+    socket: Option<&str>,
+    action: EventAction,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match action {
+        EventAction::Tree => {
+            let data = rpc_require_daemon(db, socket, RpcMethod::EventList)?;
+            let resp: service::EventListResponse = serde_json::from_value(data)?;
+            print_event_tree(&resp.events);
+            Ok(())
+        }
+        EventAction::List => {
+            let data = rpc_require_daemon(db, socket, RpcMethod::EventList)?;
+            let resp: service::EventListResponse = serde_json::from_value(data)?;
+            print_event_list(&resp.events);
+            Ok(())
+        }
+    }
+}
+
+fn run_sync_log_action(
+    db: &str,
+    action: SyncLogAction,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    match action {
+        SyncLogAction::Show {
+            limit,
+            run,
+            peer,
+            all,
+        } => {
+            let conn = open_connection(db)?;
+            create_tables(&conn)?;
+            let runs = sync_log::list_runs(&conn, limit, all, run, peer.as_deref())?;
+            if runs.is_empty() {
+                println!("No sync runs logged.");
+            } else {
+                if !all {
+                    println!("Showing changed/error runs only (use --all for full history).");
+                    println!();
+                }
+                for (idx, r) in runs.iter().enumerate() {
+                    let events = sync_log::list_run_events(&conn, r.run_id)?;
+                    print_sync_trace_run(r, &events);
+                    if idx + 1 < runs.len() {
+                        println!();
+                    }
+                }
+            }
+            Ok(())
+        }
+        SyncLogAction::Tree {
+            limit,
+            run,
+            peer,
+            all,
+        } => {
+            let conn = open_connection(db)?;
+            create_tables(&conn)?;
+            let runs = sync_log::list_runs(&conn, limit, all, run, peer.as_deref())?;
+            if runs.is_empty() {
+                println!("No sync runs logged.");
+            } else {
+                if !all {
+                    println!("Showing changed/error runs only (use --all for full history).");
+                    println!();
+                }
+                let mut run_events = Vec::with_capacity(runs.len());
+                for r in runs {
+                    let events = sync_log::list_run_events(&conn, r.run_id)?;
+                    run_events.push((r, events));
+                }
+                let groups = group_runs_by_peer(run_events);
+                print_sync_tree_groups(&groups);
+            }
+            Ok(())
+        }
+        SyncLogAction::Enable {
+            all_runs,
+            capture_full_ids,
+        } => {
+            let conn = open_connection(db)?;
+            create_tables(&conn)?;
+            let cfg = sync_log::update_config(
+                &conn,
+                sync_log::SyncLogConfigPatch {
+                    enabled: Some(true),
+                    changed_only: Some(!all_runs),
+                    capture_full_ids: Some(capture_full_ids),
+                    ..Default::default()
+                },
+            )?;
+            print_sync_log_config(&cfg);
+            Ok(())
+        }
+        SyncLogAction::Disable => {
+            let conn = open_connection(db)?;
+            create_tables(&conn)?;
+            let cfg = sync_log::update_config(
+                &conn,
+                sync_log::SyncLogConfigPatch {
+                    enabled: Some(false),
+                    ..Default::default()
+                },
+            )?;
+            print_sync_log_config(&cfg);
+            Ok(())
+        }
+        SyncLogAction::Config => {
+            let conn = open_connection(db)?;
+            create_tables(&conn)?;
+            let cfg = sync_log::load_config(&conn)?;
+            print_sync_log_config(&cfg);
+            Ok(())
+        }
+    }
+}
+
 struct ManagedRuntime {
     tenant_states: Vec<RuntimeTenantState>,
     shutdown_notify: Arc<tokio::sync::Notify>,
     handle: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
+    /// Shared cert resolver — kept so new tenants can register certs
+    /// on the live endpoint without restarting.
+    cert_resolver: Arc<topo::transport::multi_workspace::WorkspaceCertResolver>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -1246,10 +1510,120 @@ fn discover_runtime_tenant_states(
     Ok(tenants)
 }
 
-fn same_runtime_tenant_peer_ids(a: &[RuntimeTenantState], b: &[RuntimeTenantState]) -> bool {
-    a.iter()
-        .map(|tenant| &tenant.peer_id)
-        .eq(b.iter().map(|tenant| &tenant.peer_id))
+/// Classifies what changed between the current and new tenant sets.
+enum TenantChangeKind {
+    /// No change at all.
+    NoChange,
+    /// No runtime exists yet — need a fresh start.
+    NeedsFreshStart,
+    /// New tenants added but existing ones unchanged — register certs only.
+    NewTenantsAdded { new_tenants: Vec<RuntimeTenantState> },
+    /// Existing tenant changed transport identity — must restart.
+    TransportIdentityChanged,
+}
+
+fn classify_tenant_change(
+    current: &[RuntimeTenantState],
+    discovered: &[RuntimeTenantState],
+) -> TenantChangeKind {
+    if current == discovered {
+        return TenantChangeKind::NoChange;
+    }
+
+    let current_set: std::collections::HashSet<&str> =
+        current.iter().map(|t| t.peer_id.as_str()).collect();
+
+    // Check if any existing tenant changed transport identity.
+    for new_t in discovered {
+        if let Some(old_t) = current.iter().find(|t| t.peer_id == new_t.peer_id) {
+            if old_t.transport_peer_id != new_t.transport_peer_id {
+                return TenantChangeKind::TransportIdentityChanged;
+            }
+        }
+    }
+
+    // Check if any existing tenants were removed.
+    for old_t in current {
+        if !discovered.iter().any(|t| t.peer_id == old_t.peer_id) {
+            // Tenant removed — for now, restart. (Removal is rare.)
+            return TenantChangeKind::TransportIdentityChanged;
+        }
+    }
+
+    // Pure additions.
+    let new_tenants: Vec<RuntimeTenantState> = discovered
+        .iter()
+        .filter(|t| !current_set.contains(t.peer_id.as_str()))
+        .cloned()
+        .collect();
+    if new_tenants.is_empty() {
+        TenantChangeKind::NoChange
+    } else {
+        TenantChangeKind::NewTenantsAdded { new_tenants }
+    }
+}
+
+/// Register certs for newly added tenants on the live cert resolver.
+///
+/// Returns the peer_ids of tenants that were successfully registered.
+/// Callers should only mark these as "known" in their tenant state so
+/// that failed registrations are retried on the next reevaluation.
+fn register_new_tenant_certs(
+    db_path: &str,
+    new_tenants: &[RuntimeTenantState],
+    cert_resolver: &topo::transport::multi_workspace::WorkspaceCertResolver,
+) -> Vec<String> {
+    let mut registered = Vec::new();
+    let provider = rustls::crypto::ring::default_provider();
+    let db = match open_connection(db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            tracing::warn!("Failed to open DB for new tenant cert registration: {}", e);
+            return registered;
+        }
+    };
+    let all_tenants = match discover_local_tenants(&db) {
+        Ok(t) => t,
+        Err(e) => {
+            tracing::warn!("Failed to discover tenants for cert registration: {}", e);
+            return registered;
+        }
+    };
+    drop(db);
+
+    for new_t in new_tenants {
+        let Some(tenant_info) = all_tenants.iter().find(|t| t.peer_id == new_t.peer_id) else {
+            continue;
+        };
+        let cert_der =
+            rustls::pki_types::CertificateDer::from(tenant_info.cert_der.clone());
+        let key_der =
+            rustls::pki_types::PrivatePkcs8KeyDer::from(tenant_info.key_der.clone());
+        let ck = match rustls::sign::CertifiedKey::from_der(
+            vec![cert_der],
+            key_der.into(),
+            &provider,
+        ) {
+            Ok(ck) => Arc::new(ck),
+            Err(e) => {
+                tracing::warn!(
+                    "Failed to build CertifiedKey for new tenant {}: {}",
+                    &new_t.peer_id[..16.min(new_t.peer_id.len())],
+                    e
+                );
+                continue;
+            }
+        };
+        let sni = topo::transport::multi_workspace::workspace_sni(&tenant_info.workspace_id);
+        cert_resolver.add(sni.clone(), ck);
+        registered.push(new_t.peer_id.clone());
+        tracing::info!(
+            "Registered new tenant {} on live endpoint (sni={})",
+            &new_t.peer_id[..16.min(new_t.peer_id.len())],
+            sni
+        );
+    }
+    registered
 }
 
 async fn stop_runtime(runtime: ManagedRuntime) {
@@ -1343,6 +1717,9 @@ fn spawn_runtime(
     *state.runtime_net.write().unwrap() = None;
     clear_upnp_report(&state);
 
+    let cert_resolver = Arc::new(topo::transport::multi_workspace::WorkspaceCertResolver::new());
+    let cert_resolver_for_task = cert_resolver.clone();
+
     let runtime_shutdown = Arc::new(tokio::sync::Notify::new());
     let runtime_shutdown_for_task = runtime_shutdown.clone();
     let db_for_task = db_path.to_string();
@@ -1367,13 +1744,21 @@ fn spawn_runtime(
     });
 
     let handle = tokio::spawn(async move {
-        topo::node::run_node(&db_for_task, bind, net_tx, runtime_shutdown_for_task).await
+        topo::node::run_node(
+            &db_for_task,
+            bind,
+            net_tx,
+            runtime_shutdown_for_task,
+            cert_resolver_for_task,
+        )
+        .await
     });
 
     ManagedRuntime {
         tenant_states,
         shutdown_notify: runtime_shutdown,
         handle,
+        cert_resolver,
     }
 }
 
@@ -1449,34 +1834,60 @@ async fn reevaluate_runtime(
         return Ok(());
     }
 
-    let restart_needed = match active_runtime.as_ref() {
-        Some(runtime) => runtime.tenant_states != tenant_states,
-        None => true,
+    let change = match active_runtime.as_ref() {
+        Some(runtime) => classify_tenant_change(&runtime.tenant_states, &tenant_states),
+        None => TenantChangeKind::NeedsFreshStart,
     };
-    if restart_needed {
-        let transport_state_changed = active_runtime
-            .as_ref()
-            .map(|runtime| {
-                same_runtime_tenant_peer_ids(&runtime.tenant_states, &tenant_states)
-                    && runtime.tenant_states != tenant_states
-            })
-            .unwrap_or(false);
-        if let Some(runtime) = active_runtime.take() {
-            stop_runtime(runtime).await;
-        }
-        let _ = idle_bind_reservation.take();
-        if transport_state_changed {
-            tracing::info!(
-                "restarting peering runtime after tenant transport identity change ({} tenant(s))",
-                tenant_states.len()
-            );
-        } else {
+
+    match change {
+        TenantChangeKind::NoChange => {}
+        TenantChangeKind::NeedsFreshStart => {
+            if let Some(runtime) = active_runtime.take() {
+                stop_runtime(runtime).await;
+            }
+            let _ = idle_bind_reservation.take();
             tracing::info!(
                 "activating peering runtime ({} tenant(s))",
                 tenant_states.len()
             );
+            *active_runtime = Some(spawn_runtime(db_path, bind, state, tenant_states));
         }
-        *active_runtime = Some(spawn_runtime(db_path, bind, state, tenant_states));
+        TenantChangeKind::NewTenantsAdded { new_tenants } => {
+            // Register new tenant certs on the live endpoint — no restart needed.
+            if let Some(runtime) = active_runtime.as_mut() {
+                let registered =
+                    register_new_tenant_certs(db_path, &new_tenants, &runtime.cert_resolver);
+                // Only add successfully registered tenants to the known set.
+                // Failed ones remain "new" so the next reevaluation retries them.
+                for r in &registered {
+                    if let Some(ts) = tenant_states.iter().find(|t| t.peer_id == *r) {
+                        if !runtime.tenant_states.iter().any(|t| t.peer_id == *r) {
+                            runtime.tenant_states.push(ts.clone());
+                        }
+                    }
+                }
+                runtime.tenant_states.sort();
+                runtime.tenant_states.dedup();
+                if !registered.is_empty() {
+                    tracing::info!(
+                        "registered {} new tenant(s) on live endpoint ({} total)",
+                        registered.len(),
+                        runtime.tenant_states.len()
+                    );
+                }
+            }
+        }
+        TenantChangeKind::TransportIdentityChanged => {
+            if let Some(runtime) = active_runtime.take() {
+                stop_runtime(runtime).await;
+            }
+            let _ = idle_bind_reservation.take();
+            tracing::info!(
+                "restarting peering runtime after tenant transport identity change ({} tenant(s))",
+                tenant_states.len()
+            );
+            *active_runtime = Some(spawn_runtime(db_path, bind, state, tenant_states));
+        }
     }
 
     Ok(())
@@ -1828,55 +2239,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // ---------------------------------------------------------------
         // Daemon-only commands (require running daemon)
         // ---------------------------------------------------------------
-        Commands::Tenants => {
-            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Tenants)?;
-            println!("TENANTS ({}):", db);
-            if let Some(items) = data.as_array() {
-                if items.is_empty() {
-                    println!("  (none)");
-                } else {
-                    for item in items {
-                        let marker = if item["active"].as_bool().unwrap_or(false) {
-                            "*"
-                        } else {
-                            " "
-                        };
-                        let peer_id = item["peer_id"].as_str().unwrap_or("");
-                        let ws_id = item["workspace_id"].as_str().unwrap_or("");
-                        let idx = item["index"].as_u64().unwrap_or(0);
-                        println!(
-                            "  {}. {} {} (workspace: {})",
-                            idx,
-                            marker,
-                            short_id(peer_id),
-                            short_id(ws_id)
-                        );
-                    }
-                }
-            }
+        Commands::Tenant { action } => {
+            let action = action.unwrap_or(TenantAction::List);
+            run_tenant_action(db, socket_override.as_deref(), action)?;
         }
 
-        Commands::UseTenant { index } => {
-            let data = rpc_require_daemon(
-                db,
-                socket_override.as_deref(),
-                RpcMethod::UseTenant { index },
-            )?;
-            let peer_id = data["peer_id"].as_str().unwrap_or("");
-            let ws_id = data["workspace_id"].as_str().unwrap_or("");
-            println!(
-                "Switched to tenant {} (workspace: {})",
-                short_id(peer_id),
-                short_id(ws_id)
-            );
+        Commands::DeprecatedTenants => {
+            eprintln!("warning: `topo tenants` is deprecated; use `topo tenant list`");
+            run_tenant_action(db, socket_override.as_deref(), TenantAction::List)?;
         }
 
-        Commands::ActiveTenant => {
-            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::ActiveTenant)?;
-            match data["peer_id"].as_str() {
-                Some(peer_id) => println!("{}", peer_id),
-                None => println!("(no active tenant)"),
-            }
+        Commands::DeprecatedUseTenant { index } => {
+            eprintln!("warning: `topo use-tenant` is deprecated; use `topo tenant use <N>`");
+            run_tenant_action(db, socket_override.as_deref(), TenantAction::Use { index })?;
+        }
+
+        Commands::DeprecatedActiveTenant => {
+            eprintln!("warning: `topo active-tenant` is deprecated; use `topo tenant active`");
+            run_tenant_action(db, socket_override.as_deref(), TenantAction::Active)?;
         }
 
         Commands::TransportIdentity => {
@@ -2318,16 +2698,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        Commands::EventTree => {
-            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::EventList)?;
-            let resp: service::EventListResponse = serde_json::from_value(data)?;
-            print_event_tree(&resp.events);
+        Commands::Event { action } => {
+            run_event_action(db, socket_override.as_deref(), action)?;
         }
 
-        Commands::EventList => {
-            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::EventList)?;
-            let resp: service::EventListResponse = serde_json::from_value(data)?;
-            print_event_list(&resp.events);
+        Commands::DeprecatedEventTree => {
+            eprintln!("warning: `topo event-tree` is deprecated; use `topo event tree`");
+            run_event_action(db, socket_override.as_deref(), EventAction::Tree)?;
+        }
+
+        Commands::DeprecatedEventList => {
+            eprintln!("warning: `topo event-list` is deprecated; use `topo event list`");
+            run_event_action(db, socket_override.as_deref(), EventAction::List)?;
         }
 
         Commands::Intro {
@@ -2620,94 +3002,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             )?;
         }
 
-        Commands::SyncLogEnable {
-            all_runs,
-            capture_full_ids,
-        } => {
-            let conn = open_connection(db)?;
-            create_tables(&conn)?;
-            let cfg = sync_log::update_config(
-                &conn,
-                sync_log::SyncLogConfigPatch {
-                    enabled: Some(true),
-                    changed_only: Some(!all_runs),
-                    capture_full_ids: Some(capture_full_ids),
-                    ..Default::default()
-                },
-            )?;
-            print_sync_log_config(&cfg);
-        }
-
-        Commands::SyncLogDisable => {
-            let conn = open_connection(db)?;
-            create_tables(&conn)?;
-            let cfg = sync_log::update_config(
-                &conn,
-                sync_log::SyncLogConfigPatch {
-                    enabled: Some(false),
-                    ..Default::default()
-                },
-            )?;
-            print_sync_log_config(&cfg);
-        }
-
-        Commands::SyncLogConfig => {
-            let conn = open_connection(db)?;
-            create_tables(&conn)?;
-            let cfg = sync_log::load_config(&conn)?;
-            print_sync_log_config(&cfg);
-        }
-
         Commands::SyncLog {
             limit,
             run,
             peer,
             all,
+            action,
         } => {
-            let conn = open_connection(db)?;
-            create_tables(&conn)?;
-            let runs = sync_log::list_runs(&conn, limit, all, run, peer.as_deref())?;
-            if runs.is_empty() {
-                println!("No sync runs logged.");
-            } else {
-                if !all {
-                    println!("Showing changed/error runs only (use --all for full history).");
-                    println!();
-                }
-                for (idx, r) in runs.iter().enumerate() {
-                    let events = sync_log::list_run_events(&conn, r.run_id)?;
-                    print_sync_trace_run(r, &events);
-                    if idx + 1 < runs.len() {
-                        println!();
-                    }
-                }
-            }
+            let action = action.unwrap_or(SyncLogAction::Show { limit, run, peer, all });
+            run_sync_log_action(db, action)?;
         }
 
-        Commands::SyncLogTree {
+        Commands::DeprecatedSyncLogEnable {
+            all_runs,
+            capture_full_ids,
+        } => {
+            eprintln!("warning: `topo sync-log-enable` is deprecated; use `topo sync-log enable`");
+            run_sync_log_action(db, SyncLogAction::Enable { all_runs, capture_full_ids })?;
+        }
+
+        Commands::DeprecatedSyncLogDisable => {
+            eprintln!("warning: `topo sync-log-disable` is deprecated; use `topo sync-log disable`");
+            run_sync_log_action(db, SyncLogAction::Disable)?;
+        }
+
+        Commands::DeprecatedSyncLogConfig => {
+            eprintln!("warning: `topo sync-log-config` is deprecated; use `topo sync-log config`");
+            run_sync_log_action(db, SyncLogAction::Config)?;
+        }
+
+        Commands::DeprecatedSyncLogTree {
             limit,
             run,
             peer,
             all,
         } => {
-            let conn = open_connection(db)?;
-            create_tables(&conn)?;
-            let runs = sync_log::list_runs(&conn, limit, all, run, peer.as_deref())?;
-            if runs.is_empty() {
-                println!("No sync runs logged.");
-            } else {
-                if !all {
-                    println!("Showing changed/error runs only (use --all for full history).");
-                    println!();
-                }
-                let mut run_events = Vec::with_capacity(runs.len());
-                for r in runs {
-                    let events = sync_log::list_run_events(&conn, r.run_id)?;
-                    run_events.push((r, events));
-                }
-                let groups = group_runs_by_peer(run_events);
-                print_sync_tree_groups(&groups);
-            }
+            eprintln!("warning: `topo sync-log-tree` is deprecated; use `topo sync-log tree`");
+            run_sync_log_action(db, SyncLogAction::Tree { limit, run, peer, all })?;
         }
 
         // ---------------------------------------------------------------
@@ -3013,33 +3344,6 @@ fn short_id(b64: &str) -> &str {
 // event-tree / event-list helpers
 // ---------------------------------------------------------------------------
 
-fn event_type_note(type_name: &str) -> Option<&'static str> {
-    match type_name {
-        "workspace" => Some("creates the workspace"),
-        "invite_accepted" => Some("joins the workspace"),
-        "user_invite_shared" => Some("invites a user"),
-        "peer_invite_shared" => Some("invites a device"),
-        "user" => Some("registers the user"),
-        "peer_shared" => Some("registers a device"),
-        "admin" => Some("grants admin rights"),
-        "user_removed" => Some("removes a user"),
-        "peer_removed" => Some("removes a device"),
-        "key_secret" => Some("stores a local encryption key"),
-        "key_shared" => Some("shares an encryption key"),
-        "encrypted" => Some("encrypts an inner event"),
-        "message" => Some("sends a message"),
-        "reaction" => Some("reacts to a message"),
-        "message_deletion" => Some("deletes a message"),
-        "file" => Some("attaches a file"),
-        "file_slice" => Some("stores a file chunk"),
-        "tenant" => Some("creates local tenant identity"),
-        "peer_secret" => Some("stores a local signing key"),
-        "invite_secret" => Some("stores a local invite key"),
-        "bench_dep_perf_testing" => Some("perf test event"),
-        _ => None,
-    }
-}
-
 fn print_event_tree(events: &[service::EventListItem]) {
     use std::collections::{HashMap, HashSet};
 
@@ -3136,12 +3440,9 @@ fn print_tree_node(
         String::new()
     };
 
-    let note = event_type_note(&info.event_type)
-        .map(|n| format!(" \u{2014} {}", n))
-        .unwrap_or_default();
     println!(
-        "{}{}({}) {}{}{}",
-        prefix, connector, short, info.event_type, note, suffix
+        "{}{}({}) {}{}",
+        prefix, connector, short, info.event_type, suffix
     );
 
     if let Some(kids) = children.get(id) {
@@ -3232,10 +3533,7 @@ fn print_event_list(events: &[service::EventListItem]) {
             format!("  deps: {}", d)
         };
 
-        let note = event_type_note(&e.event_type)
-            .map(|n| format!(" \u{2014} {}", n))
-            .unwrap_or_default();
-        println!("{} {}{} {}  [{} bytes]", short, e.event_type, note, ts, e.blob_len);
+        println!("{} {} {}  [{} bytes]", short, e.event_type, ts, e.blob_len);
         if !deps_str.is_empty() {
             println!("{}", deps_str);
         }
@@ -3244,10 +3542,7 @@ fn print_event_list(events: &[service::EventListItem]) {
         }
 
         if let Some(dec) = &e.decrypted_inner {
-            let inner_note = event_type_note(&dec.inner_type)
-                .map(|n| format!(" \u{2014} {}", n))
-                .unwrap_or_default();
-            println!("  --- decrypted: {}{} ---", dec.inner_type, inner_note);
+            println!("  --- decrypted: {} ---", dec.inner_type);
             for (k, v) in &dec.fields {
                 println!("    {}: {}", k, v);
             }
@@ -4028,23 +4323,18 @@ fn show_messages_from_json(_db_path: &str, data: &serde_json::Value) {
                 let blob_bytes = att["blob_bytes"].as_i64().unwrap_or(0);
                 let total = att["total_slices"].as_i64().unwrap_or(0);
                 let received = att["slices_received"].as_i64().unwrap_or(0);
-                let downloaded_bytes = att["downloaded_bytes"].as_i64().unwrap_or(0);
-                let download_rate_mib_s = att["download_rate_mib_s"].as_f64();
                 let size = format_byte_size(blob_bytes);
                 let status = if total > 0 && received >= total {
                     "\u{2714}" // ✔
                 } else {
                     "\u{23f3}" // ⏳
                 };
-                let mut details = vec![size];
                 if total > 0 && received < total {
                     let pct = (received as f64 / total as f64 * 100.0) as u32;
-                    details.push(format!("{}%", pct));
+                    println!("        {}  {} ({}, {}%)", status, filename, size, pct);
+                } else {
+                    println!("        {}  {} ({})", status, filename, size);
                 }
-                if let Some(perf) = format_download_perf(downloaded_bytes, download_rate_mib_s) {
-                    details.push(perf);
-                }
-                println!("        {}  {} ({})", status, filename, details.join(", "));
             }
         }
     }
@@ -4072,8 +4362,6 @@ fn show_files_from_json(data: &serde_json::Value) {
         let blob_bytes = file["blob_bytes"].as_i64().unwrap_or(0);
         let total_slices = file["total_slices"].as_i64().unwrap_or(0);
         let slices_received = file["slices_received"].as_i64().unwrap_or(0);
-        let downloaded_bytes = file["downloaded_bytes"].as_i64().unwrap_or(0);
-        let download_rate_mib_s = file["download_rate_mib_s"].as_f64();
         let created_at = file["created_at"].as_i64().unwrap_or(0);
         let file_event_id = file["file_event_id"].as_str().unwrap_or("");
         let message_id = file["message_id"].as_str().unwrap_or("");
@@ -4084,17 +4372,14 @@ fn show_files_from_json(data: &serde_json::Value) {
         let ts = format_timestamp(created_at);
         let short_file = &file_event_id[..file_event_id.len().min(12)];
         let short_message = &message_id[..message_id.len().min(12)];
-        let mut progress = vec![format!("{}/{} slices", slices_received, total_slices)];
-        if let Some(perf) = format_download_perf(downloaded_bytes, download_rate_mib_s) {
-            progress.push(perf);
-        }
         println!(
-            "  {}. {}  {} ({})  [{}]  {}",
+            "  {}. {}  {} ({})  [{}/{} slices]  {}",
             i + 1,
             status,
             filename,
             size,
-            progress.join(", "),
+            slices_received,
+            total_slices,
             ts
         );
         println!("     file_event:{}  message:{}", short_file, short_message);
@@ -4135,16 +4420,6 @@ mod tests {
         assert_eq!(format_byte_size(1048576), "1.0 MiB");
         assert_eq!(format_byte_size(1258291), "1.2 MiB");
         assert_eq!(format_byte_size(1073741824), "1.0 GiB");
-    }
-
-    #[test]
-    fn test_format_download_perf() {
-        assert_eq!(
-            format_download_perf(393216, Some(0.1875)).as_deref(),
-            Some("384.0 KiB @ 0.19 MiB/s")
-        );
-        assert_eq!(format_download_perf(393216, None), None);
-        assert_eq!(format_download_perf(0, Some(1.0)), None);
     }
 
     #[test]
@@ -4293,21 +4568,6 @@ fn format_byte_size(bytes: i64) -> String {
     }
 }
 
-fn format_mib_per_sec(rate: f64) -> String {
-    format!("{rate:.2} MiB/s")
-}
-
-fn format_download_perf(downloaded_bytes: i64, download_rate_mib_s: Option<f64>) -> Option<String> {
-    if downloaded_bytes <= 0 {
-        return None;
-    }
-    Some(format!(
-        "{} @ {}",
-        format_byte_size(downloaded_bytes),
-        format_mib_per_sec(download_rate_mib_s?)
-    ))
-}
-
 fn show_view(data: &serde_json::Value) {
     // Sidebar: workspace name
     let workspace_name = data["workspace_name"].as_str().unwrap_or("(unnamed)");
@@ -4337,9 +4597,9 @@ fn show_view(data: &serde_json::Value) {
         println!("    USERS: {}", user_names.join(", "));
     }
 
-    // Accounts list
-    if let Some(accounts) = data["accounts"].as_array() {
-        let acct_names: Vec<String> = accounts
+    // Tenants list
+    if let Some(tenants) = data["tenants"].as_array().or_else(|| data["accounts"].as_array()) {
+        let acct_names: Vec<String> = tenants
             .iter()
             .map(|a| {
                 let username = a["username"].as_str().unwrap_or("");
@@ -4362,7 +4622,7 @@ fn show_view(data: &serde_json::Value) {
                 }
             })
             .collect();
-        println!("    ACCOUNTS: {}", acct_names.join(", "));
+        println!("    TENANTS: {}", acct_names.join(", "));
     }
 
     println!();

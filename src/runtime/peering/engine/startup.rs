@@ -38,6 +38,7 @@ pub(crate) fn setup_endpoint_and_tenants(
     db_path: &str,
     bind: SocketAddr,
     net_info_tx: tokio::sync::oneshot::Sender<NodeRuntimeNetInfo>,
+    cert_resolver: Arc<WorkspaceCertResolver>,
 ) -> Result<StartupResult, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
     create_tables(&db)?;
@@ -56,7 +57,6 @@ pub(crate) fn setup_endpoint_and_tenants(
 
     // Build multi-workspace cert resolver + tenant metadata
     let provider = rustls::crypto::ring::default_provider();
-    let mut cert_resolver = WorkspaceCertResolver::new();
     let mut peer_to_workspace: HashMap<String, String> = HashMap::new();
     let mut default_cert: Option<(
         rustls::pki_types::CertificateDer<'static>,
@@ -131,12 +131,10 @@ pub(crate) fn setup_endpoint_and_tenants(
 
     let (default_cert_der, default_key_der) = default_cert.ok_or("No valid tenant certs found")?;
 
-    let tenant_peer_ids: Vec<String> = tenants.iter().map(|t| t.peer_id.clone()).collect();
     let endpoint = create_runtime_endpoint_for_tenants(
         bind,
-        Arc::new(cert_resolver),
+        cert_resolver,
         db_path,
-        tenant_peer_ids,
         default_cert_der,
         default_key_der,
     )?;
