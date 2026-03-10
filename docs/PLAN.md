@@ -738,7 +738,7 @@ Rule:
 8. If inner type is encrypted wrapper: reject.
 9. Extract inner deps from inner schema metadata.
 10. If inner deps missing: write `blocked_event_deps` + `blocked_events` using outer `event_id` and return `Block`.
-11. For decrypted inner events, skip dep type-code enforcement (inner deps may target encrypted wrappers that carry admissible plaintext).
+11. For decrypted inner events, enforce dep type checks against tenant-scoped `valid_events.semantic_type_code`, so inner deps may target encrypted wrappers while still validating by semantic inner type.
 12. Run the normal shared signer+projector stage for the inner type.
 13. Mark outer event `valid` only after inner projection succeeds.
 

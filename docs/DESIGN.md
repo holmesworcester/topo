@@ -153,7 +153,7 @@ src/event_modules/message_unfurl/
   queries.rs
 ```
 
-Model and wire format in [wire.rs](/home/holmes/poc-7/src/event_modules/message_attachment/wire.rs)-style:
+Model and wire format in [wire.rs](/home/holmes/poc-7/src/event_modules/file/wire.rs)-style:
 
 ```rust
 pub struct MessageUnfurlEvent {
@@ -223,7 +223,7 @@ If encryptable, also add wire size mapping in [common.rs](/home/holmes/poc-7/src
 
 ### 4. Add Queries And Include In Message View
 
-Create `message_unfurl::queries::list_for_message(...)` (same pattern as [queries.rs](/home/holmes/poc-7/src/event_modules/message_attachment/queries.rs)).
+Create `message_unfurl::queries::list_for_message(...)` (same pattern as [queries.rs](/home/holmes/poc-7/src/event_modules/file/queries.rs)).
 
 Then update [queries.rs](/home/holmes/poc-7/src/event_modules/message/queries.rs):
 
