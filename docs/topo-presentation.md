@@ -172,8 +172,8 @@ Instead of providing lots of features for *parts* of the problem, it focuses on 
 
 <!-- pt:incremental_lists: true -->
 
-- No separate backend for iOS (uses SQLite to stay memory-bounded)
-- No separate backend for cloud: one endpoint can host many tenants
+- Uses SQLite to stay memory-bounded so **no separate backend for iOS**
+- One endpoint can host many tenants so **no separate infra for cloud** 
 - Dependencies can match product needs
 - End-to-end testing is cheap and easy
 - You get a flexible, concurrency-safe way to do encryption and auth
@@ -184,10 +184,10 @@ Instead of providing lots of features for *parts* of the problem, it focuses on 
 
 <!-- pt:incremental_lists: true -->
 
-- Projected SQLite tables give the data the shape it actually wants.
-- The API can answer complex queries like "give me a paginated message list with usernames, reactions, attachments, and download progress".
-- Optimistic UI just appends a local `client_op_id`; no need for a custom sync state machine.
-- Frontends can poll or get subscription feeds of what changed.
+- Events turn into SQLite tables so **data can have whatever shape it wants**
+- The API can answer complex queries like "give me a paginated message list with usernames, reactions, attachments, and download progress" so **you don't need a middle layer**
+- A local `client_op_id` can return with eventually-updated events, so **you don't need for a custom sync state machine for optimistic updates**
+- Frontends can get subscription feeds of changes and poll for the latest state, so **frontend state management is easy.**
 
 ---
 
