@@ -3243,6 +3243,23 @@ fn test_cli_send_file_and_messages_display() {
         "local attachment should show checkmark (complete), got:\n{}",
         raw
     );
+    assert!(
+        !raw.contains("MiB/s"),
+        "local attachment should not show a sync-derived rate, got:\n{}",
+        raw
+    );
+
+    let files_raw = get_files_raw(&db);
+    assert!(
+        files_raw.contains("notes.txt"),
+        "files should contain filename, got:\n{}",
+        files_raw
+    );
+    assert!(
+        !files_raw.contains("MiB/s"),
+        "local files list should not show a sync-derived rate, got:\n{}",
+        files_raw
+    );
 }
 
 #[test]
@@ -3445,28 +3462,37 @@ fn test_cli_files_and_save_file_roundtrip_after_sync() {
     assert_eventually(&bob_db, &format!("has_event:{} >= 1", msg_eid), timeout_ms);
 
     let files_deadline = Instant::now() + Duration::from_secs(20);
-    let _files_stdout = loop {
-        let files_out = Command::new(bin())
-            .args(["--db", &bob_db, "files"])
-            .output()
-            .expect("files command");
-        assert!(
-            files_out.status.success(),
-            "files command failed: {}",
-            String::from_utf8_lossy(&files_out.stderr)
-        );
-        let files_stdout = String::from_utf8_lossy(&files_out.stdout).to_string();
-        if files_stdout.contains("payload.bin") && files_stdout.contains("1.") {
-            break files_stdout;
+    loop {
+        let files_stdout = get_files_raw(&bob_db);
+        if files_stdout.contains("payload.bin")
+            && files_stdout.contains("1.")
+            && files_stdout.contains("MiB/s")
+        {
+            break;
         }
         if Instant::now() >= files_deadline {
             panic!(
-                "timed out waiting for bob files list to include payload.bin:\n{}",
+                "timed out waiting for bob files list to show payload.bin with MiB/s:\n{}",
                 files_stdout
             );
         }
         std::thread::sleep(Duration::from_millis(200));
-    };
+    }
+
+    let messages_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let messages_stdout = get_messages_raw(&bob_db);
+        if messages_stdout.contains("payload.bin") && messages_stdout.contains("MiB/s") {
+            break;
+        }
+        if Instant::now() >= messages_deadline {
+            panic!(
+                "timed out waiting for bob messages to show payload.bin with MiB/s:\n{}",
+                messages_stdout
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 
     let restored_path = tmpdir.path().join("restored.bin");
     let save_deadline = Instant::now() + Duration::from_secs(20);

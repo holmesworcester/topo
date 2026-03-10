@@ -4350,18 +4350,19 @@ fn show_messages_from_json(_db_path: &str, data: &serde_json::Value) {
                 let blob_bytes = att["blob_bytes"].as_i64().unwrap_or(0);
                 let total = att["total_slices"].as_i64().unwrap_or(0);
                 let received = att["slices_received"].as_i64().unwrap_or(0);
-                let size = format_byte_size(blob_bytes);
-                let status = if total > 0 && received >= total {
-                    "\u{2714}" // ✔
-                } else {
-                    "\u{23f3}" // ⏳
-                };
-                if total > 0 && received < total {
-                    let pct = (received as f64 / total as f64 * 100.0) as u32;
-                    println!("        {}  {} ({}, {}%)", status, filename, size, pct);
-                } else {
-                    println!("        {}  {} ({})", status, filename, size);
-                }
+                let complete = total > 0 && received >= total;
+                let download_rate_mib_s = att["download_rate_mib_s"].as_f64();
+                println!(
+                    "        {}",
+                    format_file_display(
+                        filename,
+                        blob_bytes,
+                        complete,
+                        total,
+                        received,
+                        download_rate_mib_s,
+                    )
+                );
             }
         }
     }
@@ -4389,27 +4390,20 @@ fn show_files_from_json(data: &serde_json::Value) {
         let blob_bytes = file["blob_bytes"].as_i64().unwrap_or(0);
         let total_slices = file["total_slices"].as_i64().unwrap_or(0);
         let slices_received = file["slices_received"].as_i64().unwrap_or(0);
-        let created_at = file["created_at"].as_i64().unwrap_or(0);
-        let file_event_id = file["file_event_id"].as_str().unwrap_or("");
-        let message_id = file["message_id"].as_str().unwrap_or("");
         let complete = file["complete"].as_bool().unwrap_or(false);
-
-        let status = if complete { "\u{2714}" } else { "\u{23f3}" };
-        let size = format_byte_size(blob_bytes);
-        let ts = format_timestamp(created_at);
-        let short_file = &file_event_id[..file_event_id.len().min(12)];
-        let short_message = &message_id[..message_id.len().min(12)];
+        let download_rate_mib_s = file["download_rate_mib_s"].as_f64();
         println!(
-            "  {}. {}  {} ({})  [{}/{} slices]  {}",
+            "  {}. {}",
             i + 1,
-            status,
-            filename,
-            size,
-            slices_received,
-            total_slices,
-            ts
+            format_file_display(
+                filename,
+                blob_bytes,
+                complete,
+                total_slices,
+                slices_received,
+                download_rate_mib_s,
+            )
         );
-        println!("     file_event:{}  message:{}", short_file, short_message);
     }
     println!();
 }
@@ -4447,6 +4441,30 @@ mod tests {
         assert_eq!(format_byte_size(1048576), "1.0 MiB");
         assert_eq!(format_byte_size(1258291), "1.2 MiB");
         assert_eq!(format_byte_size(1073741824), "1.0 GiB");
+    }
+
+    #[test]
+    fn test_format_file_display_complete_with_rate() {
+        assert_eq!(
+            format_file_display("payload.bin", 12 * 1024 * 1024, true, 48, 48, Some(3.42)),
+            "\u{2714}  payload.bin (12.0 MiB, 3.42 MiB/s)"
+        );
+    }
+
+    #[test]
+    fn test_format_file_display_complete_without_rate() {
+        assert_eq!(
+            format_file_display("payload.bin", 12 * 1024 * 1024, true, 48, 48, None),
+            "\u{2714}  payload.bin (12.0 MiB)"
+        );
+    }
+
+    #[test]
+    fn test_format_file_display_incomplete_uses_percentage_only() {
+        assert_eq!(
+            format_file_display("payload.bin", 12 * 1024 * 1024, false, 48, 36, Some(3.42)),
+            "\u{23f3}  payload.bin (12.0 MiB, 75%)"
+        );
     }
 
     #[test]
@@ -4592,6 +4610,39 @@ fn format_byte_size(bytes: i64) -> String {
         format!("{:.1} KiB", bytes as f64 / KIB as f64)
     } else {
         format!("{} B", bytes)
+    }
+}
+
+fn format_download_rate_mib_s(download_rate_mib_s: Option<f64>) -> Option<String> {
+    let rate = download_rate_mib_s?;
+    if !rate.is_finite() || rate <= 0.0 {
+        return None;
+    }
+    Some(format!("{rate:.2} MiB/s"))
+}
+
+fn format_file_display(
+    filename: &str,
+    blob_bytes: i64,
+    complete: bool,
+    total_slices: i64,
+    slices_received: i64,
+    download_rate_mib_s: Option<f64>,
+) -> String {
+    let status = if complete { "\u{2714}" } else { "\u{23f3}" };
+    let size = format_byte_size(blob_bytes);
+
+    if !complete {
+        if total_slices > 0 {
+            let pct = (slices_received as f64 / total_slices as f64 * 100.0) as u32;
+            return format!("{status}  {filename} ({size}, {pct}%)");
+        }
+        return format!("{status}  {filename} ({size})");
+    }
+
+    match format_download_rate_mib_s(download_rate_mib_s) {
+        Some(rate) => format!("{status}  {filename} ({size}, {rate})"),
+        None => format!("{status}  {filename} ({size})"),
     }
 }
 

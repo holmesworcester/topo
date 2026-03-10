@@ -979,6 +979,22 @@ pub fn get_messages(db: &str) -> Vec<String> {
         .collect()
 }
 
+/// Get raw `topo files` output.
+pub fn get_files_raw(db: &str) -> String {
+    let output = Command::new(bin())
+        .arg("--db")
+        .arg(db)
+        .arg("files")
+        .output()
+        .expect("failed to run files");
+    assert!(
+        output.status.success(),
+        "files failed: {}",
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
 /// Get raw `topo view` output.
 pub fn get_view_raw(db: &str) -> String {
     ensure_active_peer(db, Duration::from_secs(10));

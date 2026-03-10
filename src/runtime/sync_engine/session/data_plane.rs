@@ -127,6 +127,7 @@ where
 pub fn spawn_data_receiver<R>(
     mut data_recv: R,
     ingest_tx: mpsc::Sender<IngestItem>,
+    events_received: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
     recorded_by: String,
     source_tag: String,
@@ -157,6 +158,7 @@ where
                 msg = data_recv.recv() => {
                     match msg {
                         Ok(Frame::Event { blob }) => {
+                            events_received.fetch_add(1, Ordering::Relaxed);
                             bytes_received.fetch_add(blob.len() as u64, Ordering::Relaxed);
                             max_blob_size = max_blob_size.max(blob.len());
                             let event_id = hash_event(&blob);
@@ -217,7 +219,17 @@ where
 
 #[cfg(test)]
 mod tests {
+    use std::collections::VecDeque;
+    use std::sync::atomic::AtomicU64;
+    use std::sync::Arc;
+
+    use async_trait::async_trait;
+    use tokio::sync::mpsc;
+
     use super::should_capture_rx_event_link;
+    use super::spawn_data_receiver;
+    use crate::protocol::Frame;
+    use crate::transport::connection::{ConnectionError, StreamRecv};
 
     #[test]
     fn should_capture_only_file_slice_events() {
@@ -237,5 +249,53 @@ mod tests {
             1,
         ]));
         assert!(!should_capture_rx_event_link(&[]));
+    }
+
+    struct FakeRecv {
+        frames: VecDeque<Frame>,
+    }
+
+    #[async_trait]
+    impl StreamRecv for FakeRecv {
+        async fn recv(&mut self) -> Result<Frame, ConnectionError> {
+            self.frames.pop_front().ok_or(ConnectionError::Closed)
+        }
+    }
+
+    #[tokio::test]
+    async fn data_receiver_counts_received_events() {
+        let blob = vec![crate::event_modules::EVENT_TYPE_FILE_SLICE, 7, 9];
+        let (ingest_tx, mut ingest_rx) = mpsc::channel(4);
+        let events_received = Arc::new(AtomicU64::new(0));
+        let bytes_received = Arc::new(AtomicU64::new(0));
+        let recv = FakeRecv {
+            frames: VecDeque::from(vec![Frame::Event { blob: blob.clone() }, Frame::DataDone]),
+        };
+
+        let (_shutdown_tx, data_done_rx, handle) = spawn_data_receiver(
+            recv,
+            ingest_tx,
+            events_received.clone(),
+            bytes_received.clone(),
+            "peer1".to_string(),
+            "sync:test".to_string(),
+            None,
+        );
+
+        data_done_rx.await.expect("data done");
+        let (_, received_blob, recorded_by, source_tag) = ingest_rx.recv().await.expect("ingest");
+        handle.await.expect("receiver task");
+
+        assert_eq!(received_blob, blob);
+        assert_eq!(recorded_by, "peer1");
+        assert_eq!(source_tag, "sync:test");
+        assert_eq!(
+            events_received.load(std::sync::atomic::Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            bytes_received.load(std::sync::atomic::Ordering::Relaxed),
+            blob.len() as u64
+        );
     }
 }

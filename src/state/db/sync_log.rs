@@ -1,6 +1,30 @@
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
+use std::thread;
+use std::time::Duration;
 
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 8;
+
+fn is_busy_error(err: &rusqlite::Error) -> bool {
+    let msg = err.to_string();
+    msg.contains("database is locked") || msg.contains("SQLITE_BUSY")
+}
+
+fn retry_on_busy<T, F>(mut op: F) -> SqliteResult<T>
+where
+    F: FnMut() -> SqliteResult<T>,
+{
+    for attempt in 0..SQLITE_BUSY_RETRY_ATTEMPTS {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) if is_busy_error(&err) && attempt + 1 < SQLITE_BUSY_RETRY_ATTEMPTS => {
+                thread::sleep(Duration::from_millis(10u64 << attempt));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+    unreachable!("retry loop should always return or error");
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SyncLogConfig {
@@ -331,21 +355,24 @@ pub fn insert_run_event(
     run_id: i64,
     event: &NewSyncRunEvent,
 ) -> SqliteResult<()> {
-    conn.execute(
-        "INSERT INTO sync_run_events
-         (run_id, seq, ts_ms, lane, direction, frame_type, msg_len, detail_json)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-        params![
-            run_id,
-            u64_to_i64(event.seq),
-            event.ts_ms,
-            &event.lane,
-            &event.direction,
-            &event.frame_type,
-            usize_to_i64(event.msg_len),
-            event.detail_json.as_deref(),
-        ],
-    )?;
+    retry_on_busy(|| {
+        conn.execute(
+            "INSERT INTO sync_run_events
+             (run_id, seq, ts_ms, lane, direction, frame_type, msg_len, detail_json)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            params![
+                run_id,
+                u64_to_i64(event.seq),
+                event.ts_ms,
+                &event.lane,
+                &event.direction,
+                &event.frame_type,
+                usize_to_i64(event.msg_len),
+                event.detail_json.as_deref(),
+            ],
+        )?;
+        Ok(())
+    })?;
     Ok(())
 }
 
@@ -354,11 +381,14 @@ pub fn insert_run_received_event(
     run_id: i64,
     event_id: &str,
 ) -> SqliteResult<()> {
-    conn.execute(
-        "INSERT OR IGNORE INTO sync_run_rx_events (run_id, event_id)
-         VALUES (?1, ?2)",
-        params![run_id, event_id],
-    )?;
+    retry_on_busy(|| {
+        conn.execute(
+            "INSERT OR IGNORE INTO sync_run_rx_events (run_id, event_id)
+             VALUES (?1, ?2)",
+            params![run_id, event_id],
+        )?;
+        Ok(())
+    })?;
     Ok(())
 }
 

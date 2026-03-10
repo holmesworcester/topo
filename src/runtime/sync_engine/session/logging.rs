@@ -14,6 +14,7 @@ use crate::db::sync_log::{
 };
 use crate::protocol::Frame;
 use crate::runtime::SyncStats;
+use crate::tuning::low_mem_mode;
 
 const NEG_FINGERPRINT_SIZE: usize = 16;
 const NEG_ID_SIZE: usize = 32;
@@ -373,6 +374,10 @@ impl SyncRunRxCapture {
     }
 }
 
+fn should_enable_rx_capture(low_mem: bool) -> bool {
+    !low_mem
+}
+
 pub struct SessionRunLogger {
     started_at_ms: i64,
     session_id: u64,
@@ -383,7 +388,7 @@ pub struct SessionRunLogger {
     role: String,
     tx: Option<std::sync::mpsc::Sender<WorkerMsg>>,
     capture: Option<SyncRunCapture>,
-    rx_capture: SyncRunRxCapture,
+    rx_capture: Option<SyncRunRxCapture>,
     worker: Option<std::thread::JoinHandle<Option<i64>>>,
 }
 
@@ -426,7 +431,13 @@ impl SessionRunLogger {
         } else {
             None
         };
-        let rx_capture = SyncRunRxCapture::new(tx.clone());
+        // Low-memory mode keeps sync summary logging but skips the unbounded
+        // file-slice receive-link queue used for effective download-rate math.
+        let rx_capture = if should_enable_rx_capture(low_mem_mode()) {
+            Some(SyncRunRxCapture::new(tx.clone()))
+        } else {
+            None
+        };
         let db_path = db_path.to_string();
         let worker = std::thread::spawn(move || {
             let db = match open_connection(&db_path) {
@@ -494,7 +505,7 @@ impl SessionRunLogger {
         self.capture.clone()
     }
 
-    pub fn rx_capture(&self) -> SyncRunRxCapture {
+    pub fn rx_capture(&self) -> Option<SyncRunRxCapture> {
         self.rx_capture.clone()
     }
 
@@ -536,5 +547,20 @@ impl SessionRunLogger {
         drop(tx);
 
         self.worker.take().and_then(|h| h.join().ok()).flatten()
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::should_enable_rx_capture;
+
+    #[test]
+    fn rx_capture_enabled_outside_lowmem() {
+        assert!(should_enable_rx_capture(false));
+    }
+
+    #[test]
+    fn rx_capture_disabled_in_lowmem() {
+        assert!(!should_enable_rx_capture(true));
     }
 }

@@ -126,6 +126,7 @@ where
     let (shutdown_tx, data_drained_rx, recv_handle) = spawn_data_receiver(
         data_recv,
         ingest_tx.clone(),
+        events_received.clone(),
         bytes_received.clone(),
         recorded_by.to_string(),
         ingress_source_tag.to_string(),

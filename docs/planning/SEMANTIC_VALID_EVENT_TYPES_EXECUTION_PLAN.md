@@ -210,6 +210,12 @@ Checks:
 3. CLI acceptance test showing MiB/s for synced files,
 4. CLI test proving no fake MiB/s for local-only files.
 
+Status on `master` after merge:
+
+1. backend/query support is done,
+2. `download_rate_mib_s` is populated in file query responses,
+3. CLI renderers do not yet print the rate in inline attachments or `topo files`.
+
 ## Required implementation order
 
 1. Add `semantic_type_code` to `valid_events`, migration/backfill, and writer path.
@@ -236,6 +242,90 @@ The delivered work is complete only if all of the following pass:
    - Bob `save-file`s exact bytes
 4. Cross-tenant dep isolation test proving tenant A valid rows do not satisfy
    tenant B deps.
+
+## Follow-up TODO: Surface effective download rate in CLI output
+
+Current state:
+
+1. `topo messages` inline attachments compute and carry `download_rate_mib_s`
+   but do not render it,
+2. `topo files` items compute and carry `download_rate_mib_s` but do not
+   render it,
+3. `save-file` does not report effective download rate today,
+4. low-memory sync mode should skip file-slice receive-rate capture entirely so
+   `sync_run_rx_events` does not accumulate even event-id queue pressure there.
+
+Success criteria:
+
+1. synced attachments show MiB/s in `topo messages`,
+2. synced files show MiB/s in `topo files`,
+3. local-only files and incomplete files do not show a fake rate,
+4. rate formatting is consistent across both views.
+
+Checks:
+
+1. CLI test for synced attachment output in `topo messages`,
+2. CLI test for synced file output in `topo files`,
+3. CLI test proving local-only file output omits MiB/s,
+4. CLI test proving incomplete file output omits MiB/s.
+
+Approved output mockup:
+
+`topo messages`
+
+```text
+         ✔  payload.bin (12.0 MiB, 3.42 MiB/s)
+```
+
+Incomplete attachment:
+
+```text
+         ⏳  payload.bin (12.0 MiB, 75%)
+```
+
+Local complete attachment with no sync-derived rate:
+
+```text
+         ✔  payload.bin (12.0 MiB)
+```
+
+`topo files`
+
+```text
+  1. ✔  payload.bin (12.0 MiB, 3.42 MiB/s)
+```
+
+Incomplete file:
+
+```text
+  1. ⏳  payload.bin (12.0 MiB, 75%)
+```
+
+Local complete file with no sync-derived rate:
+
+```text
+  1. ✔  payload.bin (12.0 MiB)
+```
+
+## Follow-up TODO: Align file behavior docs in `docs/DESIGN.md` and `docs/PLAN.md`
+
+Current mismatch to resolve:
+
+1. file behavior documentation does not fully match the shipped transport and
+   projection model for encrypted `file` and `file_slice` events,
+2. file download/save flow documentation should describe the current streaming
+   behavior and clarify that bounded memory means "no file-sized buffering on
+   create/save", not a stricter background lowmem guarantee,
+3. effective download-rate documentation should note that rate capture is
+   disabled in `LOW_MEM_IOS` mode.
+
+Success criteria:
+
+1. `docs/DESIGN.md` matches current file descriptor, slice encryption, and
+   save-file behavior,
+2. `docs/PLAN.md` matches the active implementation and remaining follow-up
+   work for file flows,
+3. both docs describe the lowmem rate-capture exception consistently.
 
 ## Merge strategy
 

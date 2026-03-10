@@ -228,7 +228,7 @@ impl SessionHandler for SyncSessionHandler {
                     &ingress_source_tag,
                     coordination.as_ref(),
                     self.shared_ingest.clone(),
-                    run_logger.as_ref().map(|l| l.rx_capture()),
+                    run_logger.as_ref().and_then(|l| l.rx_capture()),
                 );
                 tokio::pin!(run);
                 let run_result: Result<crate::runtime::SyncStats, String> = tokio::select! {
@@ -254,7 +254,7 @@ impl SessionHandler for SyncSessionHandler {
                     &tenant_id,
                     &ingress_source_tag,
                     self.shared_ingest.clone(),
-                    run_logger.as_ref().map(|l| l.rx_capture()),
+                    run_logger.as_ref().and_then(|l| l.rx_capture()),
                 );
                 tokio::pin!(run);
                 let run_result: Result<crate::runtime::SyncStats, String> = tokio::select! {
