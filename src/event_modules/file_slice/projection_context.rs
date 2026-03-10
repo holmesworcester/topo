@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::ContextSnapshot;
+use crate::projection::contract::{ContextSnapshot, FileDescriptorInfo};
 use rusqlite::Connection;
 
 fn is_file_slice_transport_blob(blob: &[u8]) -> bool {
@@ -26,14 +26,18 @@ pub fn build_projector_context(
     let file_id_b64 = event_id_to_base64(&fs.file_id);
 
     let mut desc_stmt = conn.prepare(
-        "SELECT event_id, signer_event_id
+        "SELECT event_id, signer_event_id, key_event_id
          FROM files
          WHERE recorded_by = ?1 AND file_id = ?2
          ORDER BY created_at ASC, event_id ASC",
     )?;
     ctx.file_descriptors = desc_stmt
         .query_map(rusqlite::params![recorded_by, &file_id_b64], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok(FileDescriptorInfo {
+                event_id: row.get::<_, String>(0)?,
+                signer_event_id: row.get::<_, String>(1)?,
+                key_event_id: row.get::<_, String>(2)?,
+            })
         })?
         .collect::<Result<Vec<_>, _>>()?;
 

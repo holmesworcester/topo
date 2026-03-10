@@ -127,6 +127,7 @@ pub fn project_encrypted(
     // Dep type checking now uses tenant-scoped valid_events.semantic_type_code,
     // so encrypted deps are validated by semantic inner type rather than outer
     // wrapper type code.
+    let transport_key_event_id_b64 = event_id_to_base64(&enc.key_event_id);
     let (decision, _) = run_dep_and_projection_stages(
         conn,
         recorded_by,
@@ -135,6 +136,7 @@ pub fn project_encrypted(
         &inner_parsed,
         true,
         true,
+        Some(&transport_key_event_id_b64),
     )?;
 
     // Return the inner parsed event so the caller (project_one_step) can fire

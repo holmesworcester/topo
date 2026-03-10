@@ -12,7 +12,7 @@ mod tests {
     use topo::event_modules::file_slice::project_pure;
     use topo::event_modules::file_slice::FileSliceEvent;
     use topo::event_modules::ParsedEvent;
-    use topo::projection::contract::EmitCommand;
+    use topo::projection::contract::{EmitCommand, FileDescriptorInfo};
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "fs_event_1";
@@ -54,7 +54,11 @@ mod tests {
         let signer = [3u8; 32];
         let signer_b64 = b64(&signer);
         let parsed = make_file_slice([1u8; 32], signer);
-        let ctx = ctx_with_file_descriptors(vec![("desc_1".to_string(), signer_b64)]);
+        let ctx = ctx_with_file_descriptors(vec![FileDescriptorInfo {
+            event_id: "desc_1".to_string(),
+            signer_event_id: signer_b64,
+            key_event_id: "key_1".to_string(),
+        }]);
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
@@ -68,10 +72,33 @@ mod tests {
         let signer = [3u8; 32];
         let different_signer_b64 = b64(&[99u8; 32]);
         let parsed = make_file_slice([1u8; 32], signer);
-        let ctx = ctx_with_file_descriptors(vec![("desc_1".to_string(), different_signer_b64)]);
+        let ctx = ctx_with_file_descriptors(vec![FileDescriptorInfo {
+            event_id: "desc_1".to_string(),
+            signer_event_id: different_signer_b64,
+            key_event_id: "key_1".to_string(),
+        }]);
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_reject_contains(&result, "does not match file descriptor signer");
+    }
+
+    #[test]
+    fn test_file_slice_rejects_wrapper_key_mismatch() {
+        let signer = [3u8; 32];
+        let signer_b64 = b64(&signer);
+        let parsed = make_file_slice([1u8; 32], signer);
+        let ctx = topo::projection::contract::ContextSnapshot {
+            file_descriptors: vec![FileDescriptorInfo {
+                event_id: "desc_1".to_string(),
+                signer_event_id: signer_b64,
+                key_event_id: "key_expected".to_string(),
+            }],
+            current_transport_key_event_id: Some("key_other".to_string()),
+            ..Default::default()
+        };
+
+        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        assert_reject_contains(&result, "wrapper key");
     }
 
     // ── CHK_FS_SLOT_CONFLICT: break ──
@@ -82,7 +109,11 @@ mod tests {
         let signer_b64 = b64(&signer);
         let parsed = make_file_slice([1u8; 32], signer);
         let ctx = topo::projection::contract::ContextSnapshot {
-            file_descriptors: vec![("desc_1".to_string(), signer_b64)],
+            file_descriptors: vec![FileDescriptorInfo {
+                event_id: "desc_1".to_string(),
+                signer_event_id: signer_b64,
+                key_event_id: "key_1".to_string(),
+            }],
             existing_file_slice: Some(("other_event".to_string(), "desc_1".to_string())),
             ..Default::default()
         };
@@ -99,7 +130,11 @@ mod tests {
         let signer_b64 = b64(&signer);
         let parsed = make_file_slice([1u8; 32], signer);
         let ctx = topo::projection::contract::ContextSnapshot {
-            file_descriptors: vec![("desc_1".to_string(), signer_b64)],
+            file_descriptors: vec![FileDescriptorInfo {
+                event_id: "desc_1".to_string(),
+                signer_event_id: signer_b64,
+                key_event_id: "key_1".to_string(),
+            }],
             existing_file_slice: Some((EVENT_ID.to_string(), "desc_1".to_string())),
             ..Default::default()
         };

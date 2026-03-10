@@ -1,3 +1,4 @@
+use std::io::{BufReader, Read};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -458,6 +459,17 @@ fn mime_from_extension(ext: &str) -> &'static str {
     }
 }
 
+fn read_padded_file_slice<R: Read>(
+    reader: &mut R,
+    bytes_this_slice: usize,
+) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut ciphertext = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
+    if bytes_this_slice > 0 {
+        reader.read_exact(&mut ciphertext[..bytes_this_slice])?;
+    }
+    Ok(ciphertext)
+}
+
 /// Send a message with a file as a specific peer.
 pub fn send_file_for_peer(
     db_path: &str,
@@ -466,11 +478,16 @@ pub fn send_file_for_peer(
     file_path: &str,
 ) -> Result<SendFileResponse, Box<dyn std::error::Error + Send + Sync>> {
     let path = Path::new(file_path);
-    let file_data =
-        std::fs::read(path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("failed to read {}: {}", file_path, e).into()
+    let file =
+        std::fs::File::open(path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("failed to open {}: {}", file_path, e).into()
         })?;
-    let file_size = file_data.len() as u64;
+    let file_size = file
+        .metadata()
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("failed to stat {}: {}", file_path, e).into()
+        })?
+        .len();
     let filename = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -504,10 +521,18 @@ pub fn send_file_for_peer(
 
     let file_id = rand::random::<[u8; 32]>();
     let num_slices = if file_size == 0 {
-        1
+        1usize
     } else {
-        (file_size as usize).div_ceil(FILE_SLICE_CIPHERTEXT_BYTES)
+        usize::try_from(file_size.div_ceil(FILE_SLICE_CIPHERTEXT_BYTES as u64)).map_err(
+            |_| -> Box<dyn std::error::Error + Send + Sync> {
+                "file too large: slice count exceeds usize".into()
+            },
+        )?
     };
+    let total_slices_u32 =
+        u32::try_from(num_slices).map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+            "file too large: slice count exceeds u32".into()
+        })?;
 
     create_encrypted_event_synchronous(
         &db,
@@ -518,7 +543,7 @@ pub fn send_file_for_peer(
             message_id: message_event_id,
             file_id,
             blob_bytes: file_size,
-            total_slices: num_slices as u32,
+            total_slices: total_slices_u32,
             slice_bytes: FILE_SLICE_CIPHERTEXT_BYTES as u32,
             root_hash: [0u8; 32],
             key_event_id,
@@ -531,13 +556,12 @@ pub fn send_file_for_peer(
         Some(&signing_key),
     )?;
 
+    let mut reader = BufReader::new(file);
+    let mut remaining_bytes = file_size;
     for slice_number in 0..num_slices {
-        let start = slice_number * FILE_SLICE_CIPHERTEXT_BYTES;
-        let mut ciphertext = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
-        let end = (start + FILE_SLICE_CIPHERTEXT_BYTES).min(file_data.len());
-        if start < file_data.len() {
-            ciphertext[..end - start].copy_from_slice(&file_data[start..end]);
-        }
+        let bytes_this_slice = remaining_bytes.min(FILE_SLICE_CIPHERTEXT_BYTES as u64) as usize;
+        let ciphertext = read_padded_file_slice(&mut reader, bytes_this_slice)?;
+        remaining_bytes = remaining_bytes.saturating_sub(bytes_this_slice as u64);
 
         create_encrypted_event_synchronous(
             &db,
@@ -554,6 +578,13 @@ pub fn send_file_for_peer(
             }),
             Some(&signing_key),
         )?;
+    }
+    if remaining_bytes != 0 {
+        return Err(format!(
+            "file read incomplete: {} bytes remained unread for {}",
+            remaining_bytes, file_path
+        )
+        .into());
     }
 
     Ok(SendFileResponse {

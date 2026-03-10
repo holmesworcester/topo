@@ -2017,7 +2017,14 @@ fn test_encrypted_parity_file_slice_valid() {
 
     // Create descriptor (required for file_slice projection)
     let file_id = [99u8; 32];
-    setup_descriptor_for_file(&conn, recorded_by, &signing_key, &signer_eid, file_id);
+    setup_descriptor_for_file(
+        &conn,
+        recorded_by,
+        &signing_key,
+        &signer_eid,
+        file_id,
+        &sk_eid,
+    );
 
     // Create and encrypt file_slice
     let (_fs, fs_blob) = make_file_slice(
@@ -2056,6 +2063,83 @@ fn test_encrypted_parity_file_slice_valid() {
         )
         .unwrap();
     assert!(enc_valid, "encrypted wrapper should be in valid_events");
+}
+
+#[test]
+fn test_encrypted_file_slice_rejects_wrapper_key_mismatch() {
+    let conn = setup();
+    let recorded_by = "peer1";
+    let _ws = setup_workspace_event(&conn, recorded_by);
+    let (signer_eid, signing_key, _key_a_bytes, sk_a_eid) =
+        setup_encryption_ctx(&conn, recorded_by);
+
+    let key_b_bytes: [u8; 32] = rand::random();
+    let (_sk_b, sk_b_blob) = make_key_secret(key_b_bytes);
+    let sk_b_eid = insert_event_raw(&conn, recorded_by, &sk_b_blob);
+    assert_eq!(
+        project_one(&conn, recorded_by, &sk_b_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "parent for mismatch");
+    let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+    assert_eq!(
+        project_one(&conn, recorded_by, &msg_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let file_id = [77u8; 32];
+    let file = FileEvent {
+        created_at_ms: now_ms(),
+        message_id: msg_eid,
+        file_id,
+        blob_bytes: crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES as u64,
+        total_slices: 1,
+        slice_bytes: crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES as u32,
+        root_hash: [0u8; 32],
+        key_event_id: sk_a_eid,
+        filename: "mismatch.bin".to_string(),
+        mime_type: "application/octet-stream".to_string(),
+        signed_by: signer_eid,
+        signer_type: 5,
+        signature: [0u8; 64],
+    };
+    let mut file_blob = events::encode_event(&ParsedEvent::File(file)).unwrap();
+    sign_blob(&signing_key, &mut file_blob);
+    let file_eid = insert_event_raw(&conn, recorded_by, &file_blob);
+    assert_eq!(
+        project_one(&conn, recorded_by, &file_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let (_fs, fs_blob) = make_file_slice(&signing_key, &signer_eid, file_id, 0, b"wrong key");
+    let (_enc, enc_blob) =
+        make_encrypted_event(&key_b_bytes, &fs_blob, EVENT_TYPE_FILE_SLICE, &sk_b_eid);
+    let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
+
+    match project_one(&conn, recorded_by, &enc_eid).unwrap() {
+        ProjectionDecision::Reject { reason } => {
+            assert!(
+                reason.contains("wrapper key"),
+                "expected wrapper-key rejection, got {}",
+                reason
+            );
+        }
+        other => panic!("expected Reject for wrapper-key mismatch, got {:?}", other),
+    }
+
+    let enc_b64 = event_id_to_base64(&enc_eid);
+    let slice_written: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM file_slices WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &enc_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !slice_written,
+        "wrapper-key mismatch should not project a file_slices row"
+    );
 }
 
 #[test]
@@ -3061,21 +3145,13 @@ fn setup_descriptor_for_file(
     signing_key: &SigningKey,
     signer_eid: &EventId,
     file_id: [u8; 32],
+    file_key_event_id: &EventId,
 ) -> EventId {
     // Create message (dep for attachment)
     let (_msg, msg_blob) =
         make_message_signed(signing_key, signer_eid, "parent msg for descriptor");
     let msg_eid = insert_event_raw(conn, recorded_by, &msg_blob);
     project_one(conn, recorded_by, &msg_eid).unwrap();
-
-    // Create KeySecret (dep for attachment)
-    let sk = ParsedEvent::KeySecret(KeySecretEvent {
-        created_at_ms: now_ms(),
-        key_bytes: [0xBB; 32],
-    });
-    let sk_blob = events::encode_event(&sk).unwrap();
-    let sk_eid = insert_event_raw(conn, recorded_by, &sk_blob);
-    project_one(conn, recorded_by, &sk_eid).unwrap();
 
     // Create File descriptor with the specific file_id
     let att = FileEvent {
@@ -3086,7 +3162,7 @@ fn setup_descriptor_for_file(
         total_slices: 4,
         slice_bytes: 65536,
         root_hash: [12u8; 32],
-        key_event_id: sk_eid,
+        key_event_id: *file_key_event_id,
         filename: "test.bin".to_string(),
         mime_type: "application/octet-stream".to_string(),
         signed_by: *signer_eid,
@@ -3111,13 +3187,21 @@ fn setup_descriptor_for_file(
 fn test_file_slice_valid() {
     let conn = setup();
     let recorded_by = "peer1";
+    let file_key_event_id = ensure_test_content_key(&conn, recorded_by);
 
     // Create identity chain as signer
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
 
     // Create descriptor (File) for this file_id
     let file_id = [99u8; 32];
-    setup_descriptor_for_file(&conn, recorded_by, &signing_key, &signer_eid, file_id);
+    setup_descriptor_for_file(
+        &conn,
+        recorded_by,
+        &signing_key,
+        &signer_eid,
+        file_id,
+        &file_key_event_id,
+    );
 
     // Create FileSlice
     let (_fs, fs_blob) = make_file_slice(&signing_key, &signer_eid, file_id, 0, b"encrypted data");
@@ -3157,6 +3241,7 @@ fn test_file_slice_blocks_on_missing_signer() {
 fn test_file_slice_unblocks_when_signer_arrives() {
     let conn = setup();
     let recorded_by = "peer1";
+    let file_key_event_id = ensure_test_content_key(&conn, recorded_by);
 
     // Build identity chain without inserting (deferred)
     let (signer_eid, signing_key, chain_blobs) = build_identity_chain_deferred(recorded_by);
@@ -3189,7 +3274,14 @@ fn test_file_slice_unblocks_when_signer_arrives() {
     );
 
     // Now create the descriptor — this should cascade-unblock the file_slice
-    setup_descriptor_for_file(&conn, recorded_by, &signing_key, &signer_eid, file_id);
+    setup_descriptor_for_file(
+        &conn,
+        recorded_by,
+        &signing_key,
+        &signer_eid,
+        file_id,
+        &file_key_event_id,
+    );
 
     // FileSlice should now be cascade-unblocked
     let valid: bool = conn
@@ -3209,6 +3301,7 @@ fn test_file_slice_unblocks_when_signer_arrives() {
 fn test_file_slice_invalid_signature_rejects() {
     let conn = setup();
     let recorded_by = "peer1";
+    let file_key_event_id = ensure_test_content_key(&conn, recorded_by);
     let mut rng = rand::thread_rng();
     let wrong_key = SigningKey::generate(&mut rng);
     let (signer_eid, signer_key) = make_identity_chain(&conn, recorded_by);
@@ -3216,7 +3309,14 @@ fn test_file_slice_invalid_signature_rejects() {
     // Sign file_slice with the WRONG key
     let file_id = [99u8; 32];
     let (_fs, fs_blob) = make_file_slice(&wrong_key, &signer_eid, file_id, 0, b"data");
-    setup_descriptor_for_file(&conn, recorded_by, &signer_key, &signer_eid, file_id);
+    setup_descriptor_for_file(
+        &conn,
+        recorded_by,
+        &signer_key,
+        &signer_eid,
+        file_id,
+        &file_key_event_id,
+    );
     let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
     let result = project_one(&conn, recorded_by, &fs_eid).unwrap();
     assert!(matches!(result, ProjectionDecision::Reject { .. }));
@@ -3226,13 +3326,21 @@ fn test_file_slice_invalid_signature_rejects() {
 fn test_multiple_slices_same_file() {
     let conn = setup();
     let recorded_by = "peer1";
+    let file_key_event_id = ensure_test_content_key(&conn, recorded_by);
 
     // Create identity chain as signer
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
 
     // Create descriptor for this file_id
     let file_id = [99u8; 32];
-    setup_descriptor_for_file(&conn, recorded_by, &signing_key, &signer_eid, file_id);
+    setup_descriptor_for_file(
+        &conn,
+        recorded_by,
+        &signing_key,
+        &signer_eid,
+        file_id,
+        &file_key_event_id,
+    );
 
     for i in 0..5u32 {
         let (_fs, fs_blob) = make_file_slice(
@@ -3267,11 +3375,19 @@ fn test_multiple_slices_same_file() {
 #[test]
 fn test_file_slice_tenant_isolation() {
     let conn = setup();
+    let file_key_event_id = ensure_test_content_key(&conn, "tenant_a");
     let (signer_eid_a, signing_key_a) = make_identity_chain(&conn, "tenant_a");
     let (_signer_eid_b, _signing_key_b) = make_identity_chain(&conn, "tenant_b");
 
     let file_id = [99u8; 32];
-    setup_descriptor_for_file(&conn, "tenant_a", &signing_key_a, &signer_eid_a, file_id);
+    setup_descriptor_for_file(
+        &conn,
+        "tenant_a",
+        &signing_key_a,
+        &signer_eid_a,
+        file_id,
+        &file_key_event_id,
+    );
     let (_fs, fs_blob) = make_file_slice(&signing_key_a, &signer_eid_a, file_id, 0, b"data");
     let fs_eid = insert_event_raw(&conn, "tenant_a", &fs_blob);
     project_one(&conn, "tenant_a", &fs_eid).unwrap();
@@ -3459,13 +3575,21 @@ fn test_attachment_cascade_unblock() {
 fn test_file_slice_idempotent_replay() {
     let conn = setup();
     let recorded_by = "peer1";
+    let file_key_event_id = ensure_test_content_key(&conn, recorded_by);
 
     // Create identity chain as signer
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
 
     // Create descriptor for this file_id
     let file_id = [99u8; 32];
-    setup_descriptor_for_file(&conn, recorded_by, &signing_key, &signer_eid, file_id);
+    setup_descriptor_for_file(
+        &conn,
+        recorded_by,
+        &signing_key,
+        &signer_eid,
+        file_id,
+        &file_key_event_id,
+    );
 
     let (_fs, fs_blob) = make_file_slice(&signing_key, &signer_eid, file_id, 0, b"data");
     let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
@@ -3483,13 +3607,21 @@ fn test_file_slice_idempotent_replay() {
 fn test_file_slice_duplicate_slot_conflict_rejects() {
     let conn = setup();
     let recorded_by = "peer1";
+    let file_key_event_id = ensure_test_content_key(&conn, recorded_by);
 
     // Create identity chain as signer
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
 
     // Create descriptor for this file_id
     let file_id = [99u8; 32];
-    setup_descriptor_for_file(&conn, recorded_by, &signing_key, &signer_eid, file_id);
+    setup_descriptor_for_file(
+        &conn,
+        recorded_by,
+        &signing_key,
+        &signer_eid,
+        file_id,
+        &file_key_event_id,
+    );
 
     // First slice at slot 0
     let (_fs1, fs1_blob) = make_file_slice(&signing_key, &signer_eid, file_id, 0, b"first");
@@ -3649,7 +3781,15 @@ fn test_file_slice_wrong_signer_rejected() {
 
     // Create descriptor with signer A
     let file_id = [99u8; 32];
-    setup_descriptor_for_file(&conn, recorded_by, &signer_key_a, &signer_a_eid, file_id);
+    let file_key_event_id = ensure_test_content_key(&conn, recorded_by);
+    setup_descriptor_for_file(
+        &conn,
+        recorded_by,
+        &signer_key_a,
+        &signer_a_eid,
+        file_id,
+        &file_key_event_id,
+    );
 
     // Create file_slice signed by signer B (different from descriptor's signer A)
     let (_fs, fs_blob) = make_file_slice(
@@ -3947,21 +4087,13 @@ fn test_file_slice_guard_retry_after_cascaded_attachment() {
     let conn = setup();
     let recorded_by = "peer1";
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+    let file_key_event_id = ensure_test_content_key(&conn, recorded_by);
 
     let file_id = [77u8; 32];
 
     // Create message (dep for attachment) but DON'T project yet
     let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "parent msg");
     let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
-
-    // Create KeySecret (dep for attachment) and project it
-    let sk = ParsedEvent::KeySecret(KeySecretEvent {
-        created_at_ms: now_ms(),
-        key_bytes: [0xDD; 32],
-    });
-    let sk_blob = events::encode_event(&sk).unwrap();
-    let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
-    project_one(&conn, recorded_by, &sk_eid).unwrap();
 
     // Create attachment (descriptor) — dep-blocked on message
     let att = FileEvent {
@@ -3972,7 +4104,7 @@ fn test_file_slice_guard_retry_after_cascaded_attachment() {
         total_slices: 4,
         slice_bytes: 65536,
         root_hash: [12u8; 32],
-        key_event_id: sk_eid,
+        key_event_id: file_key_event_id,
         filename: "test.bin".to_string(),
         mime_type: "application/octet-stream".to_string(),
         signed_by: signer_eid,

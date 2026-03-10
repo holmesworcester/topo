@@ -885,7 +885,7 @@ Fields include:
 - `deletion_intents` — pre-existing deletion intents (for delete-before-create convergence)
 - `target_message_deleted` — for reaction skip-on-delete
 - `recipient_removed` — for `key_shared` removal exclusion
-- `file_descriptors` / `existing_file_slice` — for FileSlice authorization
+- `file_descriptors` / `existing_file_slice` / `current_transport_key_event_id` — for FileSlice authorization, duplicate detection, and wrapper-key matching
 - `bootstrap_context` — local bootstrap context (addr + SPKI) for invite trust materialization
 - `is_local_create` — whether the event was locally created (from `recorded_events.source`); gates pending bootstrap trust `InsertOrIgnore` writes so only the invite creator materializes pending trust
 
@@ -1100,10 +1100,9 @@ Projection flow:
 6. decode inner event using normal registry,
 7. verify `inner_type_code` matches decoded inner event type (mismatch -> reject),
 8. reject nested encrypted wrapper,
-9. resolve inner deps via same schema dependency engine (presence check uses the same blocker tables and outer-event anchoring),
-10. skip inner dep type-code enforcement for decrypted inners because inner deps may legitimately target encrypted wrapper events that carry admissible plaintext,
-11. run normal inner signer + projector stages,
-12. mark outer event valid only if inner projection succeeds.
+9. resolve inner deps via the same schema dependency engine (presence uses tenant-scoped `valid_events` and semantic dep typing reads tenant-scoped `valid_events.semantic_type_code`),
+10. run normal inner signer + projector stages, passing the outer wrapper `key_event_id` into projector context when a projector needs transport-level authorization checks,
+11. mark outer event valid only if inner projection succeeds.
 
 Decryption is an adapter stage inside the same projection pipeline, not a second projection system.
 
@@ -1116,7 +1115,9 @@ Decryption is an adapter stage inside the same projection pipeline, not a second
 Current canonical plaintext families:
 1. identity/auth chain events (`workspace`, `invite_accepted`, `user_invite_shared`, `peer_invite_shared`, `user`, `peer_shared`, `admin`, removals),
 2. local identity/support events (`peer_secret`, `key_secret`, bootstrap helper events),
-3. content metadata events that are intentionally cleartext in this POC (`message_attachment`, `file_slice`, `reaction`, `message_deletion`, `bench_dep`).
+3. test/support-only content such as `bench_dep` when intentionally left outside normal privacy policy.
+
+Normal user content families (`message`, `reaction`, `message_deletion`, `file`, `file_slice`) are required-encrypted. Canonical persisted rows for those events therefore normally have outer type `encrypted`, while `valid_events.semantic_type_code` records the inner semantic type for dep checking and projector dispatch.
 
 Encrypted wrapper events remain canonical but carry ciphertext payloads whose inner event type is validated by `inner_type_code` before inner projection.
 
@@ -1383,7 +1384,7 @@ Low-memory Linux-only note:
 ### Multi-source large-file catchup perf methodology
 
 The dedicated large-file catchup harness in `sync_graph_test.rs` validates both correctness and source-distribution behavior:
-1. seed source `S0` with signed `message_attachment + file_slice` events,
+1. seed source `S0` with encrypted `file` descriptor + `file_slice` events,
 2. clone that exact dataset to all non-sink sources,
 3. run sink-driven multi-source catchup,
 4. assert sink `file_slice` event-id set exactly equals the seeded set,
@@ -1665,8 +1666,8 @@ Operational payload caps for this prototype (wire-format specifics in section 1.
 2. `FILE_SLICE_TARGET_BYTES = 256 KiB`,
 3. `FILE_SLICE_CIPHERTEXT_BYTES = 262_144` (fixed canonical ciphertext payload per file-slice event).
 
-`file_slice` events (type 25, signed) are signed and validated like other canonical events.
-`message_attachment` events (type 24, signed) are file descriptors with deps on `message_id`, `key_event_id`, and `signed_by`.
+`file_slice` events (type 25, signed) are signed and validated like other canonical events, but in normal operation they are carried inside `encrypted` wrappers whose `key_event_id` must match the parent file descriptor's `key_event_id`.
+`file` events (type 24, signed) are encrypted file descriptors with deps on `message_id`, `key_event_id`, and `signed_by`.
 Retired event type 4 is rejected by unknown-type dispatch in this epoch.
 
 ### Low-memory strategy (`low_mem_ios`)
@@ -1681,7 +1682,8 @@ Runtime low-memory mode is enabled by env var `LOW_MEM_IOS` (truthy except `0`/`
 1. projection drain/write batch sizing,
 2. shared ingest channel caps,
 3. session ingest caps,
-4. transport receive-buffer limits.
+4. transport receive-buffer limits,
+5. disabling file-slice receive-rate capture so `sync_run_rx_events` does not accumulate even event-id queue pressure in lowmem mode.
 
 Validation scale requirements: the low-memory path must remain stable at >= 1,000,000 canonical events on disk and >= 100,000 peer trust keys, for sync deltas > 10,000 events or files while targeting a 24 MiB steady-state RSS envelope on representative constrained devices. Throughput may degrade to preserve bounded memory. For very large message histories and trust sets, the design favors bounded memory (smaller in-flight windows and SQL point lookups) over peak throughput.
 
@@ -1711,9 +1713,13 @@ Current baseline already includes reactions, message deletion, attachments, and 
 
 Attachments and slice streaming fit naturally:
 
-1. large payload events remain canonical typed events with fixed wire sizes,
-2. file slices use a canonical fixed ciphertext size; final plaintext chunks are zero-padded before encryption,
-3. deps and signatures continue to gate integrity and ordering (wire/layout details in section 1.2; queue transfer behavior in section 7.6).
+1. `file` descriptors and `file_slice` payload events are normal content events and therefore travel inside `encrypted` wrappers in steady state,
+2. `file.key_event_id` is the required wrapper/decryption key for every slice in that file; file-slice projection and `save-file` both reject wrapper-key mismatches,
+3. file slices use a canonical fixed ciphertext size; final plaintext chunks are zero-padded before encryption,
+4. `send-file` and synthetic file generation stream slices one at a time instead of reading the whole file into memory,
+5. `save-file` streams decrypt/write into a temp file in the destination directory, truncates to the descriptor byte length, and atomically renames on success,
+6. effective download rate is derived from synced `file_slice` events only; low-memory mode disables that capture so completed files may legitimately show no MiB/s there,
+7. deps and signatures continue to gate integrity and ordering (wire/layout details in section 1.2; queue transfer behavior in section 7.6).
 
 ## 12.3 Proactive 1-hop gossip on send
 

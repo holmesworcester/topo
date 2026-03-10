@@ -6,7 +6,8 @@
 #[cfg(test)]
 pub mod fixtures {
     use topo::projection::contract::{
-        BootstrapContextSnapshot, ContextSnapshot, EmitCommand, ProjectorResult, WriteOp,
+        BootstrapContextSnapshot, ContextSnapshot, EmitCommand, FileDescriptorInfo,
+        ProjectorResult, WriteOp,
     };
     use topo::projection::decision::ProjectionDecision;
 
@@ -48,7 +49,7 @@ pub mod fixtures {
     }
 
     /// ContextSnapshot with file descriptors.
-    pub fn ctx_with_file_descriptors(descriptors: Vec<(String, String)>) -> ContextSnapshot {
+    pub fn ctx_with_file_descriptors(descriptors: Vec<FileDescriptorInfo>) -> ContextSnapshot {
         ContextSnapshot {
             file_descriptors: descriptors,
             ..Default::default()

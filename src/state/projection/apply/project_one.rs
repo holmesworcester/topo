@@ -85,6 +85,7 @@ pub(crate) fn project_one_step(
         &parsed,
         false,
         true, // canonical cleartext flow enforces dep type constraints
+        None,
     )?;
     match &decision {
         ProjectionDecision::Reject { ref reason } => {

@@ -993,18 +993,24 @@ The `FILE_SLICE_MAX_BYTES` constant is derived so that the maximum encoded `file
 ### 10.1 File attachment event types
 
 Two new event types (migration 13):
-- `message_attachment` (type 24, signed): Descriptor linking a file to a message.
+- `file` (type 24, signed): Descriptor linking a file to a message.
   Deps: `message_id`, `key_event_id`, `signed_by`. Fields include `blob_bytes`, `total_slices`, `slice_bytes`,
   `root_hash`, `filename`, `mime_type`.
 - `file_slice` (type 25, signed): Individual encrypted chunk of a file.
   Dep: `signed_by`. Fields include `file_id`, `slice_number`, `ciphertext`.
+
+Both event families are normal content and therefore require outer `encrypted`
+wrappers in steady state. `valid_events.semantic_type_code` records their inner
+semantic type for dep checks, and file-slice authorization additionally requires
+the wrapper `key_event_id` to match the parent file descriptor's
+`key_event_id`.
 
 Primary key for `file_slices`: `(recorded_by, file_id, slice_number)` — optimized for
 sequential IO locality when reassembling files.
 
 ### 10.2 Metadata validation
 
-`message_attachment` events are validated at parse time:
+`file` events are validated at parse time:
 - `blob_bytes > 0` requires `total_slices > 0`
 - `total_slices > 0` requires `slice_bytes > 0`
 - `total_slices` must equal `ceil(blob_bytes / slice_bytes)`
@@ -1019,13 +1025,23 @@ sequential IO locality when reassembling files.
   - Same `event_id`: idempotent replay → `Valid`
   - Different `event_id`: conflict → `Reject` with durable rejection record
 
-### 10.4 Future Work: Integrity and Conflict Resolution
+Projection authorization also rejects when:
+- the file descriptor signer does not match the file-slice signer,
+- the file-slice outer wrapper `key_event_id` does not match the file descriptor `key_event_id`.
+
+### 10.4 Save-file and rate behavior
+
+- `send-file` and synthetic file generation stream slices one at a time instead of buffering the entire file in memory.
+- `save-file` streams decrypt/write into a temp file in the destination directory, truncates to the descriptor byte length, and atomically renames on success.
+- Effective download rate is derived from synced `file_slice` events only. It is available in attachment/file query output, but `LOW_MEM_IOS` disables receive-side capture so completed files may legitimately have no MiB/s there.
+
+### 10.5 Future Work: Integrity and Conflict Resolution
 
 1. **Merkle-proof extension**: Attachment carries `merkle_root`, each `file_slice` carries proof path,
    projector verifies proof against descriptor root. Overhead ~`log2(N) * 32` bytes per slice proof.
 2. **Full DAG encoding**: Deferred unless needed. Too heavy for current phase.
 
-### 10.5 Multi-source download
+### 10.6 Multi-source download
 
 Multi-source download allows a sink to pull events from N sources concurrently.
 

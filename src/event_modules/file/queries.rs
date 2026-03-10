@@ -2,6 +2,7 @@ use crate::crypto::{b64_to_hex, decrypt_event_blob, event_id_from_hex, event_id_
 use crate::event_modules::{parse_event, ParsedEvent};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
+use std::io::{BufWriter, Write};
 use std::path::Path;
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -261,6 +262,7 @@ fn load_file_slice_payload(
     db: &Connection,
     recorded_by: &str,
     slice_event_id_b64: &str,
+    expected_key_event_id_b64: &str,
 ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
     let blob: Vec<u8> = db.query_row(
         "SELECT blob FROM events WHERE event_id = ?1",
@@ -274,6 +276,13 @@ fn load_file_slice_payload(
         ParsedEvent::FileSlice(fs) => Ok(fs.ciphertext),
         ParsedEvent::Encrypted(enc) => {
             let key_event_id_b64 = event_id_to_base64(&enc.key_event_id);
+            if key_event_id_b64 != expected_key_event_id_b64 {
+                return Err(format!(
+                    "slice {} key mismatch: wrapper uses {} but file descriptor expects {}",
+                    slice_event_id_b64, key_event_id_b64, expected_key_event_id_b64
+                )
+                .into());
+            }
             let key_bytes: Vec<u8> = db.query_row(
                 "SELECT key_bytes
                  FROM key_secrets
@@ -325,6 +334,63 @@ fn load_file_slice_payload(
     }
 }
 
+fn write_matching_file_slices<W: Write>(
+    db: &Connection,
+    recorded_by: &str,
+    file_id_b64: &str,
+    descriptor_event_id_b64: Option<&str>,
+    expected_key_event_id_b64: &str,
+    writer: &mut W,
+) -> Result<(i64, u64), Box<dyn std::error::Error + Send + Sync>> {
+    let sql = if descriptor_event_id_b64.is_some() {
+        "SELECT slice_number, event_id
+         FROM file_slices
+         WHERE recorded_by = ?1 AND file_id = ?2 AND descriptor_event_id = ?3
+         ORDER BY slice_number ASC, created_at ASC, event_id ASC"
+    } else {
+        "SELECT slice_number, event_id
+         FROM file_slices
+         WHERE recorded_by = ?1 AND file_id = ?2 AND descriptor_event_id = ''
+         ORDER BY slice_number ASC, created_at ASC, event_id ASC"
+    };
+
+    let mut stmt = db.prepare(sql)?;
+    let mut rows = if let Some(descriptor_event_id_b64) = descriptor_event_id_b64 {
+        stmt.query(rusqlite::params![
+            recorded_by,
+            file_id_b64,
+            descriptor_event_id_b64
+        ])?
+    } else {
+        stmt.query(rusqlite::params![recorded_by, file_id_b64])?
+    };
+
+    let mut slices_seen = 0i64;
+    let mut bytes_written = 0u64;
+    while let Some(row) = rows.next()? {
+        let slice_number: i64 = row.get(0)?;
+        let slice_event_id_b64: String = row.get(1)?;
+        if slice_number != slices_seen {
+            return Err(format!(
+                "file has missing/out-of-order slices: expected {}, got {}",
+                slices_seen, slice_number
+            )
+            .into());
+        }
+        let payload = load_file_slice_payload(
+            db,
+            recorded_by,
+            &slice_event_id_b64,
+            expected_key_event_id_b64,
+        )?;
+        writer.write_all(&payload)?;
+        bytes_written += payload.len() as u64;
+        slices_seen += 1;
+    }
+
+    Ok((slices_seen, bytes_written))
+}
+
 pub fn save_file_by_selector(
     db: &Connection,
     recorded_by: &str,
@@ -334,14 +400,14 @@ pub fn save_file_by_selector(
     let file_event_id_b64 = resolve_file_selector_to_b64(db, recorded_by, selector)?;
     let file_event_id_hex = b64_to_hex(&file_event_id_b64);
 
-    let (file_id_b64, blob_bytes, total_slices, slice_bytes, filename): (
+    let (file_id_b64, blob_bytes, total_slices, filename, key_event_id_b64): (
         String,
         i64,
         i64,
-        i64,
+        String,
         String,
     ) = db.query_row(
-        "SELECT file_id, blob_bytes, total_slices, slice_bytes, filename
+        "SELECT file_id, blob_bytes, total_slices, filename, key_event_id
          FROM files
          WHERE recorded_by = ?1 AND event_id = ?2
          LIMIT 1",
@@ -357,65 +423,68 @@ pub fn save_file_by_selector(
         },
     )?;
 
-    let mut stmt = db.prepare(
-        "SELECT slice_number, event_id
-         FROM file_slices
-         WHERE recorded_by = ?1 AND file_id = ?2
-         ORDER BY slice_number ASC, created_at ASC, event_id ASC",
-    )?;
-    let slices = stmt
-        .query_map(rusqlite::params![recorded_by, &file_id_b64], |row| {
-            Ok((row.get::<_, i64>(0)?, row.get::<_, String>(1)?))
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    if slices.len() as i64 != total_slices {
-        return Err(format!(
-            "file incomplete: have {}/{} slices",
-            slices.len(),
-            total_slices
-        )
-        .into());
-    }
-
-    let mut data =
-        Vec::with_capacity((total_slices.max(0) as usize) * (slice_bytes.max(0) as usize));
-    for (idx, (slice_number, slice_event_id_b64)) in slices.iter().enumerate() {
-        if *slice_number != idx as i64 {
-            return Err(format!(
-                "file has missing/out-of-order slices: expected {}, got {}",
-                idx, slice_number
-            )
-            .into());
-        }
-        let payload = load_file_slice_payload(db, recorded_by, slice_event_id_b64)?;
-        data.extend_from_slice(&payload);
-    }
-
-    let expected_len = blob_bytes.max(0) as usize;
-    if data.len() < expected_len {
-        return Err(format!(
-            "file data shorter than expected: {} < {}",
-            data.len(),
-            expected_len
-        )
-        .into());
-    }
-    data.truncate(expected_len);
-
     let out_path = Path::new(output_path);
     if let Some(parent) = out_path.parent() {
         if !parent.as_os_str().is_empty() {
             std::fs::create_dir_all(parent)?;
         }
     }
-    std::fs::write(out_path, &data)?;
+    let parent_dir = out_path.parent().unwrap_or_else(|| Path::new("."));
+    let mut temp_file = tempfile::Builder::new()
+        .prefix(".topo-save-")
+        .suffix(".tmp")
+        .tempfile_in(parent_dir)?;
+
+    let (slices_written, bytes_written) = {
+        let mut writer = BufWriter::new(temp_file.as_file_mut());
+        let (mut slices_written, mut bytes_written) = write_matching_file_slices(
+            db,
+            recorded_by,
+            &file_id_b64,
+            Some(&file_event_id_b64),
+            &key_event_id_b64,
+            &mut writer,
+        )?;
+        if slices_written == 0 {
+            (slices_written, bytes_written) = write_matching_file_slices(
+                db,
+                recorded_by,
+                &file_id_b64,
+                None,
+                &key_event_id_b64,
+                &mut writer,
+            )?;
+        }
+        writer.flush()?;
+        (slices_written, bytes_written)
+    };
+    if slices_written != total_slices {
+        return Err(format!(
+            "file incomplete: have {}/{} slices",
+            slices_written, total_slices
+        )
+        .into());
+    }
+
+    let expected_len = blob_bytes.max(0) as u64;
+    if bytes_written < expected_len {
+        return Err(format!(
+            "file data shorter than expected: {} < {}",
+            bytes_written, expected_len
+        )
+        .into());
+    }
+    temp_file.as_file_mut().set_len(expected_len)?;
+    temp_file.as_file_mut().sync_all()?;
+    temp_file
+        .persist(out_path)
+        .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { err.error.into() })?;
 
     Ok(SaveFileResponse {
         file_event_id: file_event_id_hex,
         filename,
         output_path: out_path.to_string_lossy().to_string(),
-        bytes_written: data.len() as u64,
+        bytes_written: expected_len,
         total_slices,
     })
 }
@@ -423,7 +492,10 @@ pub fn save_file_by_selector(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::{hash_event, EventId};
     use crate::db::schema::create_tables;
+    use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
+    use crate::event_modules::{encode_event, EncryptedEvent, FileSliceEvent, ParsedEvent};
 
     fn approx_eq(left: f64, right: f64) {
         let delta = (left - right).abs();
@@ -437,6 +509,62 @@ mod tests {
         let db = Connection::open_in_memory().unwrap();
         create_tables(&db).unwrap();
         db
+    }
+
+    fn insert_key_secret_row(
+        db: &Connection,
+        recorded_by: &str,
+        key_event_id: EventId,
+        key_bytes: [u8; 32],
+    ) -> String {
+        let key_event_id_b64 = event_id_to_base64(&key_event_id);
+        db.execute(
+            "INSERT INTO key_secrets (event_id, key_bytes, created_at, recorded_by)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![&key_event_id_b64, key_bytes.to_vec(), 1000i64, recorded_by],
+        )
+        .unwrap();
+        key_event_id_b64
+    }
+
+    fn insert_encrypted_slice_event(
+        db: &Connection,
+        wrapper_key_event_id: EventId,
+        key_bytes: [u8; 32],
+        file_id: EventId,
+        payload: &[u8],
+    ) -> String {
+        let mut ciphertext = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
+        ciphertext[..payload.len()].copy_from_slice(payload);
+        let inner = ParsedEvent::FileSlice(FileSliceEvent {
+            created_at_ms: 1000,
+            file_id,
+            slice_number: 0,
+            ciphertext,
+            signed_by: [8u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let inner_blob = encode_event(&inner).unwrap();
+        let (nonce, ciphertext, auth_tag) =
+            crate::crypto::encrypt_event_blob(&key_bytes, &inner_blob).unwrap();
+        let outer = ParsedEvent::Encrypted(EncryptedEvent {
+            created_at_ms: 1001,
+            key_event_id: wrapper_key_event_id,
+            inner_type_code: crate::event_modules::EVENT_TYPE_FILE_SLICE,
+            nonce,
+            ciphertext,
+            auth_tag,
+        });
+        let blob = encode_event(&outer).unwrap();
+        let event_id_b64 = event_id_to_base64(&hash_event(&blob));
+        db.execute(
+            "INSERT INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![&event_id_b64, "encrypted", blob, "shared", 1001i64, 1001i64],
+        )
+        .unwrap();
+        event_id_b64
     }
 
     #[test]
@@ -694,5 +822,152 @@ mod tests {
         let result = list_files(&db, "peer1", 50).unwrap();
         assert_eq!(result.total, 0);
         assert!(result.files.is_empty());
+    }
+
+    #[test]
+    fn test_save_file_by_selector_writes_encrypted_slices_exact_bytes() {
+        let db = setup_db();
+        let recorded_by = "peer1";
+        let file_event_id = [1u8; 32];
+        let file_event_id_b64 = event_id_to_base64(&file_event_id);
+        let file_id = [2u8; 32];
+        let file_id_b64 = event_id_to_base64(&file_id);
+        let key_event_id = [3u8; 32];
+        let key_bytes = [9u8; 32];
+        let key_event_id_b64 = insert_key_secret_row(&db, recorded_by, key_event_id, key_bytes);
+        let payload = b"hello encrypted world";
+        let slice_event_id_b64 =
+            insert_encrypted_slice_event(&db, key_event_id, key_bytes, file_id, payload);
+
+        db.execute(
+            "INSERT INTO files
+             (recorded_by, event_id, message_id, file_id, blob_bytes, total_slices, slice_bytes, root_hash, key_event_id, filename, mime_type, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                recorded_by,
+                &file_event_id_b64,
+                "msg1",
+                &file_id_b64,
+                payload.len() as i64,
+                1i64,
+                FILE_SLICE_CIPHERTEXT_BYTES as i64,
+                &[0u8; 32] as &[u8],
+                &key_event_id_b64,
+                "payload.bin",
+                "application/octet-stream",
+                1000i64
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO file_slices
+             (recorded_by, file_id, slice_number, event_id, created_at, descriptor_event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                recorded_by,
+                &file_id_b64,
+                0i64,
+                &slice_event_id_b64,
+                1001i64,
+                &file_event_id_b64
+            ],
+        )
+        .unwrap();
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let output_path = tmpdir.path().join("payload.bin");
+        let response = save_file_by_selector(
+            &db,
+            recorded_by,
+            &hex::encode(file_event_id),
+            output_path.to_str().unwrap(),
+        )
+        .unwrap();
+
+        assert_eq!(response.bytes_written, payload.len() as u64);
+        assert_eq!(std::fs::read(&output_path).unwrap(), payload);
+    }
+
+    #[test]
+    fn test_save_file_by_selector_rejects_wrapper_key_mismatch() {
+        let db = setup_db();
+        let recorded_by = "peer1";
+        let file_event_id = [4u8; 32];
+        let file_event_id_b64 = event_id_to_base64(&file_event_id);
+        let file_id = [5u8; 32];
+        let file_id_b64 = event_id_to_base64(&file_id);
+        let descriptor_key_event_id = [6u8; 32];
+        let descriptor_key_bytes = [7u8; 32];
+        let wrapper_key_event_id = [8u8; 32];
+        let wrapper_key_bytes = [10u8; 32];
+        let descriptor_key_event_id_b64 = insert_key_secret_row(
+            &db,
+            recorded_by,
+            descriptor_key_event_id,
+            descriptor_key_bytes,
+        );
+        insert_key_secret_row(&db, recorded_by, wrapper_key_event_id, wrapper_key_bytes);
+        let slice_event_id_b64 = insert_encrypted_slice_event(
+            &db,
+            wrapper_key_event_id,
+            wrapper_key_bytes,
+            file_id,
+            b"mismatch",
+        );
+
+        db.execute(
+            "INSERT INTO files
+             (recorded_by, event_id, message_id, file_id, blob_bytes, total_slices, slice_bytes, root_hash, key_event_id, filename, mime_type, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            rusqlite::params![
+                recorded_by,
+                &file_event_id_b64,
+                "msg1",
+                &file_id_b64,
+                8i64,
+                1i64,
+                FILE_SLICE_CIPHERTEXT_BYTES as i64,
+                &[0u8; 32] as &[u8],
+                &descriptor_key_event_id_b64,
+                "payload.bin",
+                "application/octet-stream",
+                1000i64
+            ],
+        )
+        .unwrap();
+        db.execute(
+            "INSERT INTO file_slices
+             (recorded_by, file_id, slice_number, event_id, created_at, descriptor_event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                recorded_by,
+                &file_id_b64,
+                0i64,
+                &slice_event_id_b64,
+                1001i64,
+                &file_event_id_b64
+            ],
+        )
+        .unwrap();
+
+        let tmpdir = tempfile::tempdir().unwrap();
+        let output_path = tmpdir.path().join("payload.bin");
+        let err = save_file_by_selector(
+            &db,
+            recorded_by,
+            &hex::encode(file_event_id),
+            output_path.to_str().unwrap(),
+        )
+        .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("key mismatch"),
+            "expected key mismatch error, got {}",
+            msg
+        );
+        assert!(
+            !output_path.exists(),
+            "failed save should not leave output behind"
+        );
     }
 }

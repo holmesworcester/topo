@@ -243,24 +243,17 @@ The delivered work is complete only if all of the following pass:
 4. Cross-tenant dep isolation test proving tenant A valid rows do not satisfy
    tenant B deps.
 
-## Follow-up TODO: Surface effective download rate in CLI output
+## Completed follow-up: Surface effective download rate in CLI output
 
-Current state:
+Delivered state:
 
-1. `topo messages` inline attachments compute and carry `download_rate_mib_s`
-   but do not render it,
-2. `topo files` items compute and carry `download_rate_mib_s` but do not
-   render it,
-3. `save-file` does not report effective download rate today,
-4. low-memory sync mode should skip file-slice receive-rate capture entirely so
-   `sync_run_rx_events` does not accumulate even event-id queue pressure there.
-
-Success criteria:
-
-1. synced attachments show MiB/s in `topo messages`,
-2. synced files show MiB/s in `topo files`,
-3. local-only files and incomplete files do not show a fake rate,
-4. rate formatting is consistent across both views.
+1. synced attachments render MiB/s in `topo messages`,
+2. synced files render MiB/s in `topo files`,
+3. local-only complete files omit MiB/s,
+4. incomplete files show percentage instead of a fake rate,
+5. `save-file` still does not print effective download rate,
+6. `LOW_MEM_IOS` disables file-slice receive-rate capture entirely so
+   `sync_run_rx_events` does not accumulate event-id queue pressure there.
 
 Checks:
 
@@ -307,25 +300,15 @@ Local complete file with no sync-derived rate:
   1. ✔  payload.bin (12.0 MiB)
 ```
 
-## Follow-up TODO: Align file behavior docs in `docs/DESIGN.md` and `docs/PLAN.md`
+## Completed follow-up: Align file behavior docs in `docs/DESIGN.md` and `docs/PLAN.md`
 
-Current mismatch to resolve:
+Delivered state:
 
-1. file behavior documentation does not fully match the shipped transport and
-   projection model for encrypted `file` and `file_slice` events,
-2. file download/save flow documentation should describe the current streaming
-   behavior and clarify that bounded memory means "no file-sized buffering on
-   create/save", not a stricter background lowmem guarantee,
-3. effective download-rate documentation should note that rate capture is
-   disabled in `LOW_MEM_IOS` mode.
-
-Success criteria:
-
-1. `docs/DESIGN.md` matches current file descriptor, slice encryption, and
-   save-file behavior,
-2. `docs/PLAN.md` matches the active implementation and remaining follow-up
-   work for file flows,
-3. both docs describe the lowmem rate-capture exception consistently.
+1. `docs/DESIGN.md` now matches encrypted `file` / `file_slice` transport,
+   semantic dep typing, wrapper-key enforcement, streaming save behavior, and
+   the `LOW_MEM_IOS` rate-capture exception,
+2. `docs/PLAN.md` now matches the active `file` / `file_slice` implementation,
+   including streaming create/save behavior and lowmem rate semantics.
 
 ## Merge strategy
 

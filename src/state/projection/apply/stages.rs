@@ -208,6 +208,7 @@ pub(crate) fn apply_projection(
     event_id_b64: &str,
     blob: &[u8],
     parsed: &ParsedEvent,
+    current_transport_key_event_id: Option<&str>,
 ) -> Result<(ProjectionDecision, Option<ParsedEvent>), Box<dyn std::error::Error>> {
     let meta = registry()
         .lookup(parsed.event_type_code())
@@ -271,7 +272,8 @@ pub(crate) fn apply_projection(
     }
 
     // Build projector context via event-module-owned loader.
-    let ctx = (meta.context_loader)(conn, recorded_by, event_id_b64, parsed)?;
+    let mut ctx = (meta.context_loader)(conn, recorded_by, event_id_b64, parsed)?;
+    ctx.current_transport_key_event_id = current_transport_key_event_id.map(ToOwned::to_owned);
 
     // Dispatch to pure projector
     let result = dispatch_pure_projector(recorded_by, event_id_b64, parsed, &ctx);
@@ -313,6 +315,7 @@ pub(crate) fn run_dep_and_projection_stages(
     parsed: &ParsedEvent,
     is_encrypted_transport: bool,
     enforce_dep_types: bool,
+    current_transport_key_event_id: Option<&str>,
 ) -> Result<(ProjectionDecision, Option<ParsedEvent>), Box<dyn std::error::Error>> {
     if let Err(reason) = check_transport_privacy(parsed, is_encrypted_transport) {
         return Ok((ProjectionDecision::Reject { reason }, None));
@@ -336,5 +339,12 @@ pub(crate) fn run_dep_and_projection_stages(
         }
     }
 
-    apply_projection(conn, recorded_by, event_id_b64, blob, parsed)
+    apply_projection(
+        conn,
+        recorded_by,
+        event_id_b64,
+        blob,
+        parsed,
+        current_transport_key_event_id,
+    )
 }
