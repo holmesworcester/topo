@@ -358,7 +358,7 @@ fn tenant_local_username(db: &Connection, recorded_by: &str) -> Result<String, r
         .unwrap_or_default())
 }
 
-fn list_view_tenants(
+pub fn list_tenants_for_display(
     db: &Connection,
     active_recorded_by: &str,
 ) -> Result<Vec<ViewTenant>, rusqlite::Error> {
@@ -423,7 +423,7 @@ pub fn view(
         };
 
     // Top-level local tenants (DB-global, not workspace peers)
-    let tenants = list_view_tenants(db, recorded_by)?;
+    let tenants = list_tenants_for_display(db, recorded_by)?;
 
     // Messages with author names, reactions, files, and client_op_ids
     // (message::list already loads all of these per message)

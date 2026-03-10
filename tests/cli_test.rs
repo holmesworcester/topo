@@ -75,22 +75,9 @@ fn create_user_invite_link_for_test_peer(creator: &Peer, bootstrap_addr: &str) -
 }
 
 fn tenant_index_for_peer_id(db_path: &str, peer_id: &str) -> usize {
-    let conn = open_connection(db_path).expect("open db");
-    let mut stmt = conn
-        .prepare(
-            "SELECT DISTINCT recorded_by
-             FROM invites_accepted
-             ORDER BY recorded_by",
-        )
-        .expect("prepare tenant scope query");
-    let peer_ids = stmt
-        .query_map([], |row| row.get::<_, String>(0))
-        .expect("query tenant scopes")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("collect tenant scopes");
-    peer_ids
+    expected_tenant_display_rows(db_path)
         .iter()
-        .position(|id| id == peer_id)
+        .position(|row| row.peer_id == peer_id)
         .map(|idx| idx + 1)
         .expect("peer id should appear in tenant scopes")
 }
@@ -171,8 +158,36 @@ fn workspace_name_for_tenant(
     .unwrap_or_default()
 }
 
-fn expected_view_tenant_labels(db_path: &str) -> Vec<(String, String)> {
+#[derive(Debug)]
+struct ExpectedTenantDisplayRow {
+    peer_id: String,
+    tenant_event_id: String,
+    workspace_id: String,
+    username: String,
+    workspace_name: String,
+    active: bool,
+}
+
+fn active_tenant_peer_id(db_path: &str) -> Option<String> {
+    let output = topo_cmd(db_path, &["tenant", "active"]);
+    assert!(
+        output.status.success(),
+        "tenant active failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() || trimmed == "(no active tenant)" {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+fn expected_tenant_display_rows(db_path: &str) -> Vec<ExpectedTenantDisplayRow> {
     let conn = open_connection(db_path).expect("open db");
+    let active_peer_id = active_tenant_peer_id(db_path);
     let mut stmt = conn
         .prepare(
             "SELECT recorded_by, tenant_event_id, workspace_id
@@ -193,23 +208,78 @@ fn expected_view_tenant_labels(db_path: &str) -> Vec<(String, String)> {
         let workspace_id: String = row.get(2).expect("tenant workspace id");
         let username = local_username_for_tenant(&conn, &peer_id);
         let workspace_name = workspace_name_for_tenant(&conn, &peer_id, &workspace_id);
-        let user_display = if username.is_empty() {
-            short_cli_id(&peer_id).to_string()
-        } else {
-            username
-        };
-        let workspace_display = if workspace_name.is_empty() {
-            short_cli_id(&workspace_id).to_string()
-        } else {
-            workspace_name
-        };
-        labels.push((
-            short_cli_id(&tenant_event_id).to_string(),
-            format!("{}@{}", user_display, workspace_display),
-        ));
+        labels.push(ExpectedTenantDisplayRow {
+            active: active_peer_id.as_deref() == Some(peer_id.as_str()),
+            peer_id,
+            tenant_event_id,
+            workspace_id,
+            username,
+            workspace_name,
+        });
     }
 
+    labels.sort_by(|a, b| {
+        b.active
+            .cmp(&a.active)
+            .then_with(|| a.workspace_name.cmp(&b.workspace_name))
+            .then_with(|| a.username.cmp(&b.username))
+            .then_with(|| a.tenant_event_id.cmp(&b.tenant_event_id))
+    });
+
     labels
+}
+
+fn expected_view_tenant_labels(db_path: &str) -> Vec<(String, String)> {
+    expected_tenant_display_rows(db_path)
+        .into_iter()
+        .map(|row| {
+            let user_display = if row.username.is_empty() {
+                short_cli_id(&row.peer_id).to_string()
+            } else {
+                row.username
+            };
+            let workspace_display = if row.workspace_name.is_empty() {
+                short_cli_id(&row.workspace_id).to_string()
+            } else {
+                row.workspace_name
+            };
+            (
+                short_cli_id(&row.tenant_event_id).to_string(),
+                format!("{}@{}", user_display, workspace_display),
+            )
+        })
+        .collect()
+}
+
+fn view_tenant_section_lines(output: &str) -> Vec<&str> {
+    let mut in_tenants = false;
+    let mut lines = Vec::new();
+    for line in output.lines() {
+        if !in_tenants {
+            if line.trim() == "TENANTS:" {
+                in_tenants = true;
+            }
+            continue;
+        }
+        if line.trim().is_empty() {
+            break;
+        }
+        lines.push(line);
+    }
+    lines
+}
+
+fn numbered_tenant_section_count(output: &str) -> usize {
+    view_tenant_section_lines(output)
+        .into_iter()
+        .filter(|line| {
+            let trimmed = line.trim_start();
+            let Some(dot_pos) = trimmed.find('.') else {
+                return false;
+            };
+            trimmed[..dot_pos].chars().all(|c| c.is_ascii_digit())
+        })
+        .count()
 }
 
 fn numbered_item_count(output: &str) -> usize {
@@ -562,6 +632,14 @@ fn assert_cli_state(
         "tenants should have the expected count:\n{}",
         tenants
     );
+    for workspace_name in expected_workspace_names {
+        assert!(
+            tenants.contains(workspace_name),
+            "tenant list should include workspace name {:?}:\n{}",
+            workspace_name,
+            tenants
+        );
+    }
 
     let users = get_users_raw(db_path);
     assert_eq!(
@@ -596,7 +674,16 @@ fn assert_cli_state(
         "view should include TENANTS:\n{}",
         view
     );
-    for (tenant_event_id, tenant_label) in expected_view_tenant_labels(db_path) {
+    assert_eq!(
+        numbered_tenant_section_count(&view),
+        expected_tenant_count,
+        "view tenant section should number each tenant:\n{}",
+        view
+    );
+    let tenant_lines = view_tenant_section_lines(&view);
+    for (idx, (tenant_event_id, tenant_label)) in
+        expected_view_tenant_labels(db_path).into_iter().enumerate()
+    {
         assert!(
             view.contains(&tenant_event_id),
             "view should contain tenant event id {:?}:\n{}",
@@ -606,6 +693,18 @@ fn assert_cli_state(
         assert!(
             view.contains(&tenant_label),
             "view should contain top-level tenant label {:?}:\n{}",
+            tenant_label,
+            view
+        );
+        let expected_prefix = format!("{}.", idx + 1);
+        assert!(
+            tenant_lines.iter().any(|line| {
+                let trimmed = line.trim_start();
+                trimmed.starts_with(&expected_prefix)
+                    && line.contains(&tenant_event_id)
+                    && line.contains(&tenant_label)
+            }),
+            "view tenant line should be numbered consistently for {:?}:\n{}",
             tenant_label,
             view
         );

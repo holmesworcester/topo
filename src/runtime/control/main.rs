@@ -1322,13 +1322,19 @@ fn run_tenant_action(
                         };
                         let peer_id = item["peer_id"].as_str().unwrap_or("");
                         let ws_id = item["workspace_id"].as_str().unwrap_or("");
+                        let ws_name = item["workspace_name"].as_str().unwrap_or("");
                         let idx = item["index"].as_u64().unwrap_or(0);
+                        let workspace_display = if ws_name.is_empty() {
+                            short_id(ws_id).to_string()
+                        } else {
+                            ws_name.to_string()
+                        };
                         println!(
                             "  {}. {} {} (workspace: {})",
                             idx,
                             marker,
                             short_id(peer_id),
-                            short_id(ws_id)
+                            workspace_display
                         );
                     }
                 }
@@ -1339,10 +1345,16 @@ fn run_tenant_action(
             let data = rpc_require_daemon(db, socket, RpcMethod::UseTenant { index })?;
             let peer_id = data["peer_id"].as_str().unwrap_or("");
             let ws_id = data["workspace_id"].as_str().unwrap_or("");
+            let ws_name = data["workspace_name"].as_str().unwrap_or("");
+            let workspace_display = if ws_name.is_empty() {
+                short_id(ws_id).to_string()
+            } else {
+                ws_name.to_string()
+            };
             println!(
                 "Switched to tenant {} (workspace: {})",
                 short_id(peer_id),
-                short_id(ws_id)
+                workspace_display
             );
             Ok(())
         }
@@ -4658,7 +4670,7 @@ fn show_view(data: &serde_json::Value) {
         if tenants.is_empty() {
             println!("  (none)");
         } else {
-            for tenant in tenants {
+            for (idx, tenant) in tenants.iter().enumerate() {
                 let marker = if tenant["active"].as_bool().unwrap_or(false) {
                     "*"
                 } else {
@@ -4679,7 +4691,8 @@ fn show_view(data: &serde_json::Value) {
                     workspace_name.to_string()
                 };
                 println!(
-                    "  {} {} {}@{}",
+                    "  {}. {} {} {}@{}",
+                    idx + 1,
                     marker,
                     short_id(tenant_eid),
                     user_display,

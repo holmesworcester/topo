@@ -986,6 +986,91 @@ fn create_workspace_on_running_daemon_activates_runtime() {
 }
 
 #[test]
+fn create_workspace_on_running_active_daemon_switches_active_tenant() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+    wait_for_socket(&socket);
+    let _ = wait_for_runtime_state(&socket, "IdleNoTenants", Duration::from_secs(10));
+
+    let first = Command::new(bin())
+        .args([
+            "create-workspace",
+            "--db",
+            &db,
+            "--workspace-name",
+            "alpha-space",
+            "--username",
+            "alpha",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        first.status.success(),
+        "first create-workspace failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&first.stdout),
+        String::from_utf8_lossy(&first.stderr)
+    );
+    let _ = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
+
+    let second = Command::new(bin())
+        .args([
+            "create-workspace",
+            "--db",
+            &db,
+            "--workspace-name",
+            "beta-space",
+            "--username",
+            "beta",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        second.status.success(),
+        "second create-workspace failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&second.stdout),
+        String::from_utf8_lossy(&second.stderr)
+    );
+
+    let conn = topo::db::open_connection(&db).expect("open db");
+    let beta_peer_id: String = conn
+        .query_row(
+            "SELECT recorded_by
+             FROM workspaces
+             WHERE name = ?1
+             ORDER BY event_id DESC
+             LIMIT 1",
+            rusqlite::params!["beta-space"],
+            |row| row.get(0),
+        )
+        .expect("query beta workspace peer");
+
+    let active = Command::new(bin())
+        .args(["--db", &db, "tenant", "active"])
+        .output()
+        .unwrap();
+    assert!(
+        active.status.success(),
+        "tenant active failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&active.stdout),
+        String::from_utf8_lossy(&active.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&active.stdout).trim(),
+        beta_peer_id,
+        "newly created workspace should become the active tenant"
+    );
+
+    stop_daemon(&db, &mut daemon);
+}
+
+#[test]
 fn create_workspace_on_idle_daemon_uses_resolved_fallback_port_in_auto_invite() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
@@ -1326,6 +1411,7 @@ fn accept_invite_on_running_active_daemon_with_existing_workspace_succeeds() {
     let invited_ws_b64 = topo::crypto::event_id_to_base64(&parsed_invite.workspace_id);
     let start = std::time::Instant::now();
     let mut found_transport = false;
+    let mut accepted_peer_id = None;
     while start.elapsed() < Duration::from_secs(20) {
         let conn = topo::db::open_connection(&bob_db).expect("open bob db");
         let maybe_peer: Option<String> = conn
@@ -1340,6 +1426,7 @@ fn accept_invite_on_running_active_daemon_with_existing_workspace_succeeds() {
             )
             .ok();
         if let Some(peer_id) = maybe_peer {
+            accepted_peer_id = Some(peer_id.clone());
             let has_transport: bool = conn
                 .query_row(
                     "SELECT EXISTS(
@@ -1362,6 +1449,23 @@ fn accept_invite_on_running_active_daemon_with_existing_workspace_succeeds() {
     assert!(
         found_transport,
         "accepted tenant never obtained local transport credentials"
+    );
+    let accepted_peer_id = accepted_peer_id.expect("accepted peer id should be recorded");
+
+    let active = Command::new(bin())
+        .args(["--db", &bob_db, "tenant", "active"])
+        .output()
+        .unwrap();
+    assert!(
+        active.status.success(),
+        "tenant active failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&active.stdout),
+        String::from_utf8_lossy(&active.stderr)
+    );
+    assert_eq!(
+        String::from_utf8_lossy(&active.stdout).trim(),
+        accepted_peer_id,
+        "accepted invite should become the active tenant"
     );
 
     stop_daemon(&alice_db, &mut alice_daemon);

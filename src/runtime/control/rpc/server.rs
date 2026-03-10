@@ -28,14 +28,13 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 #[derive(Debug, Clone)]
 struct TenantScope {
     peer_id: String,
-    workspace_id: String,
 }
 
 fn discover_tenant_scopes(
     conn: &rusqlite::Connection,
 ) -> Result<Vec<TenantScope>, rusqlite::Error> {
     let mut stmt = conn.prepare(
-        "SELECT DISTINCT recorded_by, workspace_id
+        "SELECT DISTINCT recorded_by
          FROM invites_accepted
          ORDER BY recorded_by",
     )?;
@@ -43,7 +42,6 @@ fn discover_tenant_scopes(
         .query_map([], |row| {
             Ok(TenantScope {
                 peer_id: row.get(0)?,
-                workspace_id: row.get(1)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -202,6 +200,7 @@ struct TenantItem {
     index: usize,
     peer_id: String,
     workspace_id: String,
+    workspace_name: String,
     active: bool,
 }
 
@@ -456,54 +455,50 @@ fn dispatch(
         }
 
         // ----- Tenant management (daemon state) -----
-        RpcMethod::Tenants => {
-            match crate::db::open_connection(db_path) {
-                Ok(conn) => {
-                    let _ = crate::db::schema::create_tables(&conn);
-                    match discover_tenant_scopes(&conn) {
-                        Ok(scopes) => {
-                            let active = state.active_peer.read().unwrap().clone();
-                            let mut items: Vec<TenantItem> = scopes
-                                .iter()
-                                .enumerate()
-                                .map(|(i, t)| TenantItem {
-                                    index: i + 1,
-                                    peer_id: t.peer_id.clone(),
-                                    workspace_id: t.workspace_id.clone(),
-                                    active: active.as_deref() == Some(&t.peer_id),
-                                })
-                                .collect();
-                            items.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
-                            // Re-number after sort
-                            for (i, item) in items.iter_mut().enumerate() {
-                                item.index = i + 1;
-                            }
-                            RpcResponse::success(serde_json::json!(items))
-                        }
-                        Err(e) => RpcResponse::error(e.to_string()),
+        RpcMethod::Tenants => match crate::db::open_connection(db_path) {
+            Ok(conn) => {
+                let _ = crate::db::schema::create_tables(&conn);
+                let active = state.active_peer.read().unwrap().clone();
+                match workspace::list_tenants_for_display(&conn, active.as_deref().unwrap_or("")) {
+                    Ok(tenants) => {
+                        let items: Vec<TenantItem> = tenants
+                            .into_iter()
+                            .enumerate()
+                            .map(|(i, tenant)| TenantItem {
+                                index: i + 1,
+                                peer_id: tenant.peer_id,
+                                workspace_id: tenant.workspace_id,
+                                workspace_name: tenant.workspace_name,
+                                active: tenant.active,
+                            })
+                            .collect();
+                        RpcResponse::success(serde_json::json!(items))
                     }
+                    Err(e) => RpcResponse::error(e.to_string()),
                 }
-                Err(e) => RpcResponse::error(e.to_string()),
             }
-        }
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
 
         RpcMethod::UseTenant { index } => match crate::db::open_connection(db_path) {
             Ok(conn) => {
                 let _ = crate::db::schema::create_tables(&conn);
-                match discover_tenant_scopes(&conn) {
-                    Ok(scopes) => {
-                        if index == 0 || index > scopes.len() {
+                let active = state.active_peer.read().unwrap().clone();
+                match workspace::list_tenants_for_display(&conn, active.as_deref().unwrap_or("")) {
+                    Ok(tenants) => {
+                        if index == 0 || index > tenants.len() {
                             return RpcResponse::error(format!(
                                 "invalid tenant number {}; available: 1-{}",
                                 index,
-                                scopes.len()
+                                tenants.len()
                             ));
                         }
-                        let tenant = &scopes[index - 1];
+                        let tenant = &tenants[index - 1];
                         *state.active_peer.write().unwrap() = Some(tenant.peer_id.clone());
                         RpcResponse::success(serde_json::json!({
                             "peer_id": tenant.peer_id,
                             "workspace_id": tenant.workspace_id,
+                            "workspace_name": tenant.workspace_name,
                         }))
                     }
                     Err(e) => RpcResponse::error(e.to_string()),
@@ -532,11 +527,9 @@ fn dispatch(
                 &device_name,
             ) {
                 Ok(resp) => {
-                    // Auto-select newly created peer if none active
+                    // Newly created workspaces become the active tenant.
                     let mut ap = state.active_peer.write().unwrap();
-                    if ap.is_none() {
-                        *ap = Some(resp.peer_id.clone());
-                    }
+                    *ap = Some(resp.peer_id.clone());
                     drop(ap);
                     state.notify_runtime_recheck();
 
@@ -1184,9 +1177,8 @@ fn dispatch(
         } => match workspace::commands::accept_invite(db_path, &invite, &username, &devicename) {
             Ok(data) => {
                 let mut ap = state.active_peer.write().unwrap();
-                if ap.is_none() {
-                    *ap = Some(data.peer_id.clone());
-                }
+                *ap = Some(data.peer_id.clone());
+                drop(ap);
                 state.notify_runtime_recheck();
                 RpcResponse::success(data)
             }
