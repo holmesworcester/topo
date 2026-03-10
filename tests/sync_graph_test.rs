@@ -1,4 +1,9 @@
-//! Sync graph performance benchmarks
+//! Legacy in-process sync graph benchmarks (NOT maintained perf suite).
+//!
+//! These tests use the in-process `Peer` harness and measure shared-process RSS,
+//! which is not representative of real daemon performance. The maintained perf
+//! benchmarks are in `daemon_perf_test.rs` (real daemon processes, warm-start
+//! timing, per-daemon VmHWM).
 //!
 //! Family A: Chain propagation (P0 <-> P1 <-> ... <-> Pn)
 //! Family B: Multi-source catchup (S1..Sn feed lagging sink via coordinated download)
