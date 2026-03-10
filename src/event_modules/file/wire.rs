@@ -245,7 +245,7 @@ pub static FILE_META: EventTypeMeta = EventTypeMeta {
     projection_table: "files",
     share_scope: ShareScope::Shared,
     dep_fields: &["message_id", "key_event_id", "signed_by"],
-    dep_field_type_codes: &[&[1], &[6], &[]],
+    dep_field_type_codes: &[&[1, 5], &[6], &[]],
     signer_required: true,
     signature_byte_len: 64,
     encryptable: true,

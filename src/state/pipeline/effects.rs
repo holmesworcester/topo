@@ -214,7 +214,12 @@ mod tests {
     fn event_pipeline_effects_fan_out_shared_events_to_same_workspace_siblings_only() {
         use crate::crypto::{event_id_to_base64, hash_event};
         use crate::db::{open_connection, schema::create_tables, store::insert_event};
-        use crate::event_modules::{encode_event, MessageEvent, ParsedEvent};
+        use crate::event_modules::{
+            encode_event, EncryptedEvent, KeySecretEvent, MessageEvent, ParsedEvent,
+            ShareScope, EVENT_TYPE_MESSAGE,
+        };
+        use crate::projection::apply::project_one::project_one;
+        use crate::shared::crypto::encrypt_event_blob;
         use crate::projection::signer::sign_event_bytes;
         use crate::testutil::SharedDbNode;
 
@@ -228,6 +233,36 @@ mod tests {
         let conn = open_connection(&node.db_path).unwrap();
         create_tables(&conn).unwrap();
 
+        // Create a KeySecret so encrypted events can be decrypted.
+        let key_bytes: [u8; 32] = rand::random();
+        let sk_evt = ParsedEvent::KeySecret(KeySecretEvent {
+            created_at_ms: 42,
+            key_bytes,
+        });
+        let sk_blob = encode_event(&sk_evt).unwrap();
+        let sk_eid = hash_event(&sk_blob);
+        let sk_eid_b64 = event_id_to_base64(&sk_eid);
+        insert_event(&conn, &sk_eid, "key_secret", &sk_blob, ShareScope::Local, 42, 42).unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, 42, 'test')",
+            params![&origin.identity, &sk_eid_b64],
+        )
+        .unwrap();
+        project_one(&conn, &origin.identity, &sk_eid).unwrap();
+        // Sibling also needs the key to decrypt fanned-out encrypted events.
+        conn.execute(
+            "INSERT OR IGNORE INTO key_secrets (recorded_by, event_id, key_bytes, created_at) VALUES (?1, ?2, ?3, 42)",
+            params![&sibling.identity, &sk_eid_b64, &key_bytes[..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
+            params![&sibling.identity, &sk_eid_b64],
+        )
+        .unwrap();
+
+        // Build signed message blob.
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: 42,
             workspace_id: origin.workspace_id,
@@ -237,22 +272,34 @@ mod tests {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let mut blob = encode_event(&msg).unwrap();
+        let mut msg_blob = encode_event(&msg).unwrap();
         let sig = sign_event_bytes(
             origin.peer_shared_signing_key.as_ref().unwrap(),
-            &blob[..blob.len() - 64],
+            &msg_blob[..msg_blob.len() - 64],
         );
-        let blob_len = blob.len();
-        blob[blob_len - 64..].copy_from_slice(&sig);
-        let event_id = hash_event(&blob);
+        let blob_len = msg_blob.len();
+        msg_blob[blob_len - 64..].copy_from_slice(&sig);
+
+        // Wrap message in encrypted envelope (RequireEncrypted enforcement).
+        let (nonce, ciphertext, auth_tag) = encrypt_event_blob(&key_bytes, &msg_blob).unwrap();
+        let enc_evt = ParsedEvent::Encrypted(EncryptedEvent {
+            created_at_ms: 42,
+            key_event_id: sk_eid,
+            inner_type_code: EVENT_TYPE_MESSAGE,
+            nonce,
+            ciphertext,
+            auth_tag,
+        });
+        let enc_blob = encode_event(&enc_evt).unwrap();
+        let event_id = hash_event(&enc_blob);
         let event_id_b64 = event_id_to_base64(&event_id);
 
         insert_event(
             &conn,
             &event_id,
-            "message",
-            &blob,
-            crate::event_modules::ShareScope::Shared,
+            "encrypted",
+            &enc_blob,
+            ShareScope::Shared,
             42,
             42,
         )

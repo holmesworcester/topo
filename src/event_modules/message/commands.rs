@@ -51,7 +51,11 @@ pub fn create(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let eid = create_signed_event_synchronous(db, recorded_by, &msg, signing_key)?;
+    let key_event_id = super::super::workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("resolve content key for message: {}", e).into()
+        })?;
+    let eid = create_encrypted_event_synchronous(db, recorded_by, &key_event_id, &msg, Some(signing_key))?;
     Ok(eid)
 }
 
@@ -111,7 +115,11 @@ pub fn create_deletion(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let eid = create_signed_event_synchronous(db, recorded_by, &del, signing_key)?;
+    let key_event_id = super::super::workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("resolve content key for deletion: {}", e).into()
+        })?;
+    let eid = create_encrypted_event_synchronous(db, recorded_by, &key_event_id, &del, Some(signing_key))?;
     Ok(eid)
 }
 

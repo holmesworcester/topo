@@ -425,11 +425,20 @@ mod tests {
     use super::*;
     use crate::db::{open_in_memory, schema::create_tables};
     use crate::event_modules::{
-        DeviceInviteEvent, InviteAcceptedEvent, MessageEvent, PeerSharedEvent, ReactionEvent,
-        TenantEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
+        DeviceInviteEvent, InviteAcceptedEvent, MessageEvent, PeerSharedEvent,
+        ReactionEvent, TenantEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
     };
     use crate::testutil::SharedDbNode;
     use ed25519_dalek::SigningKey;
+
+    /// Ensure a content key exists for this tenant, returning its event_id.
+    fn ensure_enc_key(conn: &Connection, recorded_by: &str) -> EventId {
+        crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+            conn,
+            recorded_by,
+        )
+        .unwrap()
+    }
 
     fn now_ms() -> u64 {
         SystemTime::now()
@@ -555,7 +564,8 @@ mod tests {
             signature: [0u8; 64],
         });
 
-        let eid = create_signed_event_synchronous(&conn, recorded_by, &msg, &signing_key).unwrap();
+        let key_eid = ensure_enc_key(&conn, recorded_by);
+        let eid = create_encrypted_event_synchronous(&conn, recorded_by, &key_eid, &msg, Some(&signing_key)).unwrap();
         let eid_b64 = event_id_to_base64(&eid);
 
         // events table
@@ -606,8 +616,9 @@ mod tests {
             signer_type: 5,
             signature: [0u8; 64],
         });
+        let key_eid = ensure_enc_key(&conn, recorded_by);
         let msg_eid =
-            create_signed_event_synchronous(&conn, recorded_by, &msg, &signing_key).unwrap();
+            create_encrypted_event_synchronous(&conn, recorded_by, &key_eid, &msg, Some(&signing_key)).unwrap();
 
         let rxn = ParsedEvent::Reaction(ReactionEvent {
             created_at_ms: now_ms(),
@@ -619,7 +630,7 @@ mod tests {
             signature: [0u8; 64],
         });
         let rxn_eid =
-            create_signed_event_synchronous(&conn, recorded_by, &rxn, &signing_key).unwrap();
+            create_encrypted_event_synchronous(&conn, recorded_by, &key_eid, &rxn, Some(&signing_key)).unwrap();
 
         // Both valid
         let msg_b64 = event_id_to_base64(&msg_eid);
@@ -655,8 +666,9 @@ mod tests {
         });
 
         // Event is stored but blocked — returns Blocked error with event_id
+        let key_eid = ensure_enc_key(&conn, recorded_by);
         let err =
-            create_signed_event_synchronous(&conn, recorded_by, &rxn, &signing_key).unwrap_err();
+            create_encrypted_event_synchronous(&conn, recorded_by, &key_eid, &rxn, Some(&signing_key)).unwrap_err();
         let (eid, missing) = match err {
             CreateEventError::Blocked { event_id, missing } => (event_id, missing),
             other => panic!("expected Blocked, got: {}", other),
@@ -713,8 +725,9 @@ mod tests {
             signature: [0u8; 64], // placeholder, will be overwritten
         });
 
+        let key_eid = ensure_enc_key(&conn, recorded_by);
         let msg_eid =
-            create_signed_event_synchronous(&conn, recorded_by, &msg, &signing_key).unwrap();
+            create_encrypted_event_synchronous(&conn, recorded_by, &key_eid, &msg, Some(&signing_key)).unwrap();
         let msg_b64 = event_id_to_base64(&msg_eid);
 
         // Should be valid
@@ -758,7 +771,8 @@ mod tests {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let result = create_signed_event_synchronous(&conn, recorded_by, &rxn, &signing_key);
+        let key_eid = ensure_enc_key(&conn, recorded_by);
+        let result = create_encrypted_event_synchronous(&conn, recorded_by, &key_eid, &rxn, Some(&signing_key));
         match result {
             Err(CreateEventError::Blocked { event_id, missing }) => {
                 assert_eq!(missing.len(), 1);
@@ -798,8 +812,10 @@ mod tests {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let eid = create_signed_event_staged(&conn, recorded_by, &rxn, &signing_key)
-            .expect("staged API should return Ok even for blocked events");
+        let key_eid = ensure_enc_key(&conn, recorded_by);
+        let eid = event_id_or_blocked(
+            create_encrypted_event_synchronous(&conn, recorded_by, &key_eid, &rxn, Some(&signing_key))
+        ).expect("staged API should return Ok even for blocked events");
 
         let eid_b64 = event_id_to_base64(&eid);
         let in_events: bool = conn
@@ -840,7 +856,8 @@ mod tests {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let result = create_signed_event_synchronous(&conn, recorded_by, &msg, &signing_key);
+        let key_eid = ensure_enc_key(&conn, recorded_by);
+        let result = create_encrypted_event_synchronous(&conn, recorded_by, &key_eid, &msg, Some(&signing_key));
         assert!(
             result.is_ok(),
             "PLAN §6.4: valid event must return Ok, got: {:?}",
@@ -880,7 +897,8 @@ mod tests {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let result = create_signed_event_synchronous(&conn, recorded_by, &rxn, &signing_key);
+        let key_eid = ensure_enc_key(&conn, recorded_by);
+        let result = create_encrypted_event_synchronous(&conn, recorded_by, &key_eid, &rxn, Some(&signing_key));
 
         match result {
             Err(CreateEventError::Blocked { event_id, missing }) => {

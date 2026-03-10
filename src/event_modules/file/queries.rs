@@ -444,13 +444,8 @@ pub fn save_file_by_selector(
             return Err(e);
         }
     };
-    // On Unix, rename atomically replaces the destination.
-    // On Windows, rename may fail if the destination exists — fall back
-    // to copy + remove-tmp so we never delete the original destination.
-    if let Err(_) = std::fs::rename(&tmp_path, out_path) {
-        std::fs::copy(&tmp_path, out_path)?;
-        let _ = std::fs::remove_file(&tmp_path);
-    }
+    // Atomic replace: on Unix, rename atomically replaces the destination.
+    std::fs::rename(&tmp_path, out_path)?;
 
     let elapsed_ms = start.elapsed().as_millis() as u64;
 

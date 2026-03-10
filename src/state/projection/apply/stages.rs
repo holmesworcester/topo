@@ -2,6 +2,7 @@ use super::super::decision::ProjectionDecision;
 use super::super::encrypted::project_encrypted;
 use super::super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
 use crate::crypto::{event_id_to_base64, EventId};
+use crate::event_modules::registry::TransportPrivacy;
 use crate::event_modules::{registry, ParsedEvent};
 use rusqlite::Connection;
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -230,14 +231,28 @@ pub(crate) fn run_dep_and_projection_stages(
         return Ok((block, None));
     }
 
-    if enforce_dep_types {
-        let meta = registry()
-            .lookup(parsed.event_type_code())
-            .ok_or_else(|| format!("unknown type code {}", parsed.event_type_code()))?;
-        if !meta.dep_field_type_codes.is_empty() {
-            if let Some(reason) = check_dep_types(conn, &deps, meta.dep_field_type_codes)? {
-                return Ok((ProjectionDecision::Reject { reason }, None));
-            }
+    let meta = registry()
+        .lookup(parsed.event_type_code())
+        .ok_or_else(|| format!("unknown type code {}", parsed.event_type_code()))?;
+
+    // Enforce transport privacy: RequireEncrypted events must arrive inside an
+    // encrypted wrapper, never as bare cleartext on the outer path.
+    // The inner-from-encrypted path passes enforce_dep_types=false and skips this.
+    if enforce_dep_types && meta.transport_privacy == TransportPrivacy::RequireEncrypted {
+        return Ok((
+            ProjectionDecision::Reject {
+                reason: format!(
+                    "event type {} requires encrypted transport but arrived as plaintext",
+                    parsed.event_type_code()
+                ),
+            },
+            None,
+        ));
+    }
+
+    if enforce_dep_types && !meta.dep_field_type_codes.is_empty() {
+        if let Some(reason) = check_dep_types(conn, &deps, meta.dep_field_type_codes)? {
+            return Ok((ProjectionDecision::Reject { reason }, None));
         }
     }
 

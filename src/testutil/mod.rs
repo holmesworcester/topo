@@ -46,7 +46,7 @@ use crate::peering::loops::{
 };
 use crate::projection::apply::project_one;
 use crate::projection::create::{
-    create_encrypted_event_synchronous, create_event_staged, create_event_synchronous,
+    create_encrypted_event_synchronous, event_id_or_blocked, create_event_staged, create_event_synchronous,
     create_signed_event_staged, create_signed_event_synchronous, CreateEventError,
 };
 use crate::transport::identity::{ensure_transport_peer_id, load_transport_cert};
@@ -536,7 +536,12 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        create_signed_event_synchronous(&db, &self.identity, &msg, self.signing_key())
+        let key_eid = crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+            &db,
+            &self.identity,
+        )
+        .expect("failed to resolve content key");
+        create_encrypted_event_synchronous(&db, &self.identity, &key_eid, &msg, Some(self.signing_key()))
             .expect("failed to create message")
     }
 
@@ -553,8 +558,14 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        create_signed_event_staged(&db, &self.identity, &rxn, self.signing_key())
-            .expect("failed to create reaction")
+        let key_eid = crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+            &db,
+            &self.identity,
+        )
+        .expect("failed to resolve content key");
+        event_id_or_blocked(
+            create_encrypted_event_synchronous(&db, &self.identity, &key_eid, &rxn, Some(self.signing_key()))
+        ).expect("failed to create reaction")
     }
 
     /// Create a KeySecret event with the given key bytes.
