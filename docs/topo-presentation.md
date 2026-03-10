@@ -86,60 +86,55 @@ style: |
 
 <!-- _class: lead -->
 
-# Could building p2p collaboration tools be easier?
+# Topo 🐭
 
-Ideally *much* easier?
-
-Please?? 🥹
-
-
+## Can building p2p collaboration tools be made easier? 🥹
 
 ---
 
-# Background ⛅
+# Why does this matter? 🤔
 
 <!-- pt:incremental_lists: true -->
 
 - A FOSS p2p Slack or Discord would be awesome
-- It would provide safety and resiliency to orgs we care about
-- We've spent years building one (**tryquiet.org**)
+- It would provide safety🛡 and resiliency🛟 to orgs we care about 
+- We've spent years building one (**Quiet - tryquiet.org**)
 - This has been a real slog
 
 ---
 
-# A question haunts us 👻 
+# This question haunts our team 👻 
 
-Is p2p just intrinsically #$%@ing hard? Or is there a way out of the slog?
+Is p2p just intrinsically #$%@ing hard? Or is all this slog totally avoidable and pointless?
 
 ---
 
-# What makes p2p so #$%@ing hard? 😡
+# Why has this been such a slog? 😡
 
 <!-- pt:incremental_lists: true -->
 
 - Many problems to solve: p2p, e2ee, sync, files, push etc.
 - Solutions aren't generic; must fit product needs
-- Concurrency is hard to reason through
+- Concurrency is a minefield 💥, time bomb 💣, quagmire 🐊, rat's nest 🐀, death march 💀 — choose your favorite metaphor!
 
 ---
 
-# Can't we just build on existing work? 😥
+# Can't we build on existing work? 😥
 
 <!-- pt:incremental_lists: true -->
 
 * There's BitTorrent, Git, libp2p, IPFS, SSB, Briar, Nostr, Signal, Tor...*Somebody* must have figured this stuff out! 
 * Right?
 * ...right?
-* ...
-* 
+* ... 
 
 ---
 
-# Existing p2p tools are meh 🫤
+# Existing p2p tools have been meh 🫤
 
 <!-- pt:incremental_lists: true -->
 
-- They cover *some* of our laundry list / stack
+- Our experience: they cover *some* of our needed stack
 - But what they *do* cover is costly to adapt to product goals
 - And *uncovered* areas sprout concurrency problems, heisenbugs
 
@@ -152,13 +147,15 @@ Is p2p just intrinsically #$%@ing hard? Or is there a way out of the slog?
 <!-- pt:incremental_lists: true -->
 
 - **Arbitrary dependency linkages** - these are the opposite of what you want: they block content when you *don't* need that and not when you do
-- **Mobile notifications rarely considered** - especially the 24MB iOS NSE memory limit
-- **Neither are multi-tenant / multi-account** - so you'll need to roll a lot of your own infra to support e.g. notifications
-- **Neither are frontend needs** - you must build a middle layer to cover all the queries your frontend needs
+- **No iOS support** - especially for push & the iOS NSE memory limit
+- **No multi-tenant/account support** - so you'll need to roll a lot of your own infra to support mobile devices and notifications
+- **No simple API for frontends** - you must build a complex middle layer to cover all the queries your frontend 
+
+(**p2panda** is a lot better than others, but I think all of these gripes apply to them too)
 
 ---
 
-# Topo 🐭 - a better way?
+# Topo 🐭 is maybe a better way
 
 Instead of providing lots of features for *parts* of the problem, it focuses on covering:
 
@@ -168,19 +165,6 @@ Instead of providing lots of features for *parts* of the problem, it focuses on 
 - **Most contexts**: everything from iOS notification fetching to multi-tenant servers. (Soon the web, too.)
 
 ...and covering them in a principled solution to the hard problem, **concurrency**.
-
----
-
-# Topo 🐭 manages concurrency
-
-<!-- pt:incremental_lists: true -->
-
-- **Data** including files, who to connect to, is represented as a set of events
-- **State and auth** is derived deterministically from the event set (think: Redux but with dependencies)
-- **Peer connection** is an ongoing behaviors determined by this set
-- **Sync** is a process that ensures all peers converge on the same event set
-- **Event pipeline** decrypts, validates, and writes events into SQLite tables that can queried however frontends need
-- **Key material** is stored, sealed, and unsealed as events and, just like any other dependency, block dependents until it arrives.
 
 ---
 
@@ -205,6 +189,34 @@ Instead of providing lots of features for *parts* of the problem, it focuses on 
 - Optimistic UI just appends a local `client_op_id`; no need for a custom sync state machine.
 - Frontends can poll or get subscription feeds of what changed.
 
+---
+
+# How Topo 🐭 manages concurrency
+
+<!-- pt:incremental_lists: true -->
+
+- **Data** including files, who to connect to, is represented as a set of events
+- **State and auth** is derived deterministically from the event set (think: Redux but with dependencies)
+- **Peer connection** is an ongoing behaviors determined by this set
+- **Sync** is a process that ensures all peers converge on the same event set
+- **Event pipeline** decrypts, validates, and writes events into SQLite tables that can queried however frontends need
+- **Key material** is stored, sealed, and unsealed as events and, just like any other dependency, block dependents until it arrives.
+
+---
+
+# Walkthrough: Runtime Main Loop
+
+```text
+Control --> Setup --> Supervisor --> Transport --> Sync Engine
+   |           |                        ^             |
+   |           +------> Event Pipeline -+-------------+
+   |                        |
+   +------------------------+
+                            v
+                      Projection State
+                            |
+                            +--> trust rows --> Transport
+```
 ---
 
 # Result: easy stuff gets easy again. 
@@ -442,18 +454,3 @@ peer session
 - `tests/projectors/message_projector_tests.rs`
 - `tests/cli_test.rs`
 - `tests/two_process_test.rs`
-
-# Walkthrough: Runtime Main Loop
-
-```text
-Control --> Setup --> Supervisor --> Transport --> Sync Engine
-   |           |                        ^             |
-   |           +------> Event Pipeline -+-------------+
-   |                        |
-   +------------------------+
-                            v
-                      Projection State
-                            |
-                            +--> trust rows --> Transport
-```
----
