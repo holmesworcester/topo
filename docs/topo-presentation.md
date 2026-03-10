@@ -237,12 +237,11 @@ Next, a demo 🐭
 
 # Demo
 
-* Create, invite, message, react, attach a file 
-* Show how events and sync work
-* 
-* Send messages
-* React
-* Send a file
+* Create, invite, message, react, attach a file
+* Link a device
+* Show event and sync logs
+* Show multitenancy in action
+
 
 <!-- Scraps
 
