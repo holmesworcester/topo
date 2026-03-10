@@ -1,5 +1,54 @@
 use rusqlite::{params, Connection, Result as SqliteResult};
 
+fn valid_events_has_semantic_type_column(conn: &Connection) -> SqliteResult<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(valid_events)")?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(names.iter().any(|name| name == "semantic_type_code"))
+}
+
+fn derive_semantic_type_code_from_blob(blob: &[u8]) -> Option<i64> {
+    let parsed = crate::event_modules::parse_event(blob).ok()?;
+    let semantic_type = match parsed {
+        crate::event_modules::ParsedEvent::Encrypted(enc) => enc.inner_type_code,
+        _ => parsed.event_type_code(),
+    };
+    Some(i64::from(semantic_type))
+}
+
+fn backfill_valid_event_semantic_types(conn: &Connection) -> SqliteResult<()> {
+    let mut stmt = conn.prepare(
+        "SELECT v.peer_id, v.event_id, e.blob
+         FROM valid_events v
+         JOIN events e ON e.event_id = v.event_id
+         WHERE v.semantic_type_code IS NULL",
+    )?;
+    let rows = stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Vec<u8>>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for (peer_id, event_id, blob) in rows {
+        let Some(semantic_type_code) = derive_semantic_type_code_from_blob(&blob) else {
+            continue;
+        };
+        conn.execute(
+            "UPDATE valid_events
+             SET semantic_type_code = ?3
+             WHERE peer_id = ?1 AND event_id = ?2 AND semantic_type_code IS NULL",
+            params![peer_id, event_id, semantic_type_code],
+        )?;
+    }
+
+    Ok(())
+}
+
 use super::queue::{backoff_ms, current_timestamp_ms, recover_expired_leases, QueueHealth};
 
 pub struct ProjectQueue<'a> {
@@ -12,6 +61,7 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         CREATE TABLE IF NOT EXISTS valid_events (
             peer_id TEXT NOT NULL,
             event_id TEXT NOT NULL,
+            semantic_type_code INTEGER,
             PRIMARY KEY (peer_id, event_id)
         );
 
@@ -49,6 +99,13 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         );
         ",
     )?;
+    if !valid_events_has_semantic_type_column(conn)? {
+        conn.execute(
+            "ALTER TABLE valid_events ADD COLUMN semantic_type_code INTEGER",
+            [],
+        )?;
+    }
+    backfill_valid_event_semantic_types(conn)?;
     Ok(())
 }
 

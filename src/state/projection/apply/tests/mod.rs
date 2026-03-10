@@ -14,6 +14,8 @@ use crate::event_modules::{
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::encrypted::encrypt_event_blob;
 use crate::projection::signer::sign_event_bytes;
+use aes_gcm::aead::Aead;
+use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 use std::collections::HashMap;
@@ -47,10 +49,108 @@ fn user_for_signer(signer_eid: &EventId) -> EventId {
         .expect("missing signer->user mapping for test identity chain")
 }
 
+const TEST_CONTENT_KEY_CREATED_AT_MS: u64 = 4242;
+
+fn test_content_key_bytes() -> [u8; 32] {
+    [0xA5; 32]
+}
+
+fn encrypt_test_content_blob(plaintext: &[u8]) -> ([u8; 12], Vec<u8>, [u8; 16]) {
+    let cipher = Aes256Gcm::new_from_slice(&test_content_key_bytes()).unwrap();
+    let event_hash = hash_event(plaintext);
+    let mut nonce = [0u8; 12];
+    nonce.copy_from_slice(&event_hash[..12]);
+    let ciphertext_with_tag = cipher
+        .encrypt(Nonce::from_slice(&nonce), plaintext)
+        .unwrap();
+    let tag_start = ciphertext_with_tag.len() - 16;
+    let ciphertext = ciphertext_with_tag[..tag_start].to_vec();
+    let mut auth_tag = [0u8; 16];
+    auth_tag.copy_from_slice(&ciphertext_with_tag[tag_start..]);
+    (nonce, ciphertext, auth_tag)
+}
+
+fn test_content_key_event() -> ParsedEvent {
+    ParsedEvent::KeySecret(KeySecretEvent {
+        created_at_ms: TEST_CONTENT_KEY_CREATED_AT_MS,
+        key_bytes: test_content_key_bytes(),
+    })
+}
+
+fn test_content_key_event_id() -> EventId {
+    hash_event(&events::encode_event(&test_content_key_event()).unwrap())
+}
+
+fn ensure_test_content_key(conn: &Connection, recorded_by: &str) -> EventId {
+    let key_event_id = test_content_key_event_id();
+    let key_event_id_b64 = event_id_to_base64(&key_event_id);
+    let already_valid: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &key_event_id_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    if already_valid {
+        return key_event_id;
+    }
+
+    let key_event = test_content_key_event();
+    let key_blob = events::encode_event(&key_event).unwrap();
+    let ts = now_ms() as i64;
+    insert_event(
+        conn,
+        &key_event_id,
+        "key_secret",
+        &key_blob,
+        crate::event_modules::ShareScope::Local,
+        key_event.created_at_ms() as i64,
+        ts,
+    )
+    .unwrap();
+    insert_recorded_event(conn, recorded_by, &key_event_id, ts, "test").unwrap();
+    let decision = project_one(conn, recorded_by, &key_event_id).unwrap();
+    assert_eq!(decision, ProjectionDecision::Valid);
+    key_event_id
+}
+
+fn wrap_test_content_blob(conn: &Connection, recorded_by: &str, blob: &[u8]) -> Vec<u8> {
+    let type_code = match blob.first().copied() {
+        Some(type_code) => type_code,
+        None => return blob.to_vec(),
+    };
+    let Some(meta) = registry().lookup(type_code) else {
+        return blob.to_vec();
+    };
+    if meta.transport_privacy() != crate::event_modules::TransportPrivacy::RequireEncrypted {
+        return blob.to_vec();
+    }
+
+    let key_event_id = ensure_test_content_key(conn, recorded_by);
+    let (nonce, ciphertext, auth_tag) = encrypt_test_content_blob(blob);
+    let created_at_ms = events::parse_event(blob)
+        .map(|event| event.created_at_ms())
+        .unwrap_or_else(|_| now_ms());
+    let wrapper = ParsedEvent::Encrypted(EncryptedEvent {
+        created_at_ms,
+        key_event_id,
+        inner_type_code: type_code,
+        nonce,
+        ciphertext,
+        auth_tag,
+    });
+    events::encode_event(&wrapper).unwrap()
+}
+
+fn canonical_test_event_id(conn: &Connection, recorded_by: &str, blob: &[u8]) -> EventId {
+    hash_event(&wrap_test_content_blob(conn, recorded_by, blob))
+}
+
 /// Insert a blob into events + neg_items + recorded_events (simulating what
 /// batch_writer or create_event_synchronous does before calling project_one).
 fn insert_event_raw(conn: &Connection, recorded_by: &str, blob: &[u8]) -> EventId {
-    let event_id = hash_event(blob);
+    let blob = wrap_test_content_blob(conn, recorded_by, blob);
+    let event_id = hash_event(&blob);
     let ts = now_ms();
     let type_code = blob[0];
     let type_name = registry()
@@ -62,7 +162,7 @@ fn insert_event_raw(conn: &Connection, recorded_by: &str, blob: &[u8]) -> EventI
         conn,
         &event_id,
         type_name,
-        blob,
+        &blob,
         crate::event_modules::ShareScope::Shared,
         ts as i64,
         ts as i64,
@@ -81,6 +181,21 @@ fn insert_event_raw(conn: &Connection, recorded_by: &str, blob: &[u8]) -> EventI
     event_id
 }
 
+fn mark_valid_for_test(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id: &EventId,
+    semantic_type_code: u8,
+) {
+    let eid_b64 = event_id_to_base64(event_id);
+    conn.execute(
+        "INSERT OR IGNORE INTO valid_events (peer_id, event_id, semantic_type_code)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![recorded_by, &eid_b64, i64::from(semantic_type_code)],
+    )
+    .unwrap();
+}
+
 use crate::event_modules::{
     DeviceInviteEvent, InviteAcceptedEvent, PeerSharedEvent, TenantEvent, UserEvent,
     UserInviteEvent,
@@ -96,12 +211,7 @@ fn setup_workspace_event(conn: &Connection, recorded_by: &str) -> EventId {
     });
     let blob = events::encode_event(&ws).unwrap();
     let eid = insert_event_raw(conn, recorded_by, &blob);
-    let eid_b64 = event_id_to_base64(&eid);
-    conn.execute(
-        "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
-        rusqlite::params![recorded_by, &eid_b64],
-    )
-    .unwrap();
+    mark_valid_for_test(conn, recorded_by, &eid, ws.event_type_code());
     eid
 }
 
@@ -624,7 +734,7 @@ fn test_project_unblock_cascade() {
 
     // Create message blob but don't insert yet
     let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "target");
-    let msg_eid = hash_event(&msg_blob);
+    let msg_eid = canonical_test_event_id(&conn, recorded_by, &msg_blob);
 
     // Create reaction targeting it — insert reaction first (out of order)
     let (_rxn, rxn_blob) =
@@ -764,9 +874,9 @@ fn test_multi_blocker() {
 
     // Create two messages (targets) — pre-compute hashes
     let (_msg1, msg1_blob) = make_message_signed(&signing_key, &signer_eid, "target1");
-    let msg1_eid = hash_event(&msg1_blob);
+    let msg1_eid = canonical_test_event_id(&conn, recorded_by, &msg1_blob);
     let (_msg2, msg2_blob) = make_message_signed(&signing_key, &signer_eid, "target2");
-    let msg2_eid = hash_event(&msg2_blob);
+    let msg2_eid = canonical_test_event_id(&conn, recorded_by, &msg2_blob);
 
     // Create reaction targeting msg1 — insert without msg1 in events
     let (_rxn1, rxn1_blob) =
@@ -789,7 +899,8 @@ fn test_multi_blocker() {
     ));
 
     // Insert msg1 — rxn1 unblocks, rxn2 stays blocked
-    insert_event_raw(&conn, recorded_by, &msg1_blob);
+    let msg1_inserted = insert_event_raw(&conn, recorded_by, &msg1_blob);
+    assert_eq!(msg1_inserted, msg1_eid);
     project_one(&conn, recorded_by, &msg1_eid).unwrap();
 
     let rxn1_b64 = event_id_to_base64(&rxn1_eid);
@@ -813,7 +924,8 @@ fn test_multi_blocker() {
     assert!(!r2_valid);
 
     // Insert msg2 — rxn2 unblocks
-    insert_event_raw(&conn, recorded_by, &msg2_blob);
+    let msg2_inserted = insert_event_raw(&conn, recorded_by, &msg2_blob);
+    assert_eq!(msg2_inserted, msg2_eid);
     project_one(&conn, recorded_by, &msg2_eid).unwrap();
 
     let r2_valid2: bool = conn
@@ -914,13 +1026,8 @@ fn test_cross_tenant_projection_isolation() {
     // But we need the SAME workspace_id in both tenants' valid_events.
     // Since setup_workspace_event creates different workspace events per tenant,
     // we must manually mark tenant_a's workspace event valid for tenant_b too.
-    let net_b64 = event_id_to_base64(&net_eid_a);
     insert_recorded_event(&conn, tenant_b, &net_eid_a, now_ms() as i64, "test").unwrap();
-    conn.execute(
-        "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
-        rusqlite::params![tenant_b, &net_b64],
-    )
-    .unwrap();
+    mark_valid_for_test(&conn, tenant_b, &net_eid_a, events::EVENT_TYPE_WORKSPACE);
 
     // Create identity chain for tenant_a, then replicate identity events for tenant_b
     let (signer_eid, signing_key) = make_identity_chain(&conn, tenant_a);
@@ -1528,7 +1635,7 @@ fn test_encrypted_inner_dep_unblocks() {
     // Create target message (pre-compute but don't insert yet)
     let (_msg, msg_blob) =
         make_message_signed(&signing_key, &signer_eid, "target for encrypted rxn");
-    let msg_eid = hash_event(&msg_blob);
+    let msg_eid = canonical_test_event_id(&conn, recorded_by, &msg_blob);
 
     // Create encrypted reaction targeting the message
     let (_rxn, rxn_blob) =
@@ -1541,7 +1648,8 @@ fn test_encrypted_inner_dep_unblocks() {
     assert!(matches!(result, ProjectionDecision::Block { .. }));
 
     // Now insert and project the message
-    insert_event_raw(&conn, recorded_by, &msg_blob);
+    let inserted_msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+    assert_eq!(inserted_msg_eid, msg_eid);
     let r = project_one(&conn, recorded_by, &msg_eid).unwrap();
     assert_eq!(r, ProjectionDecision::Valid);
 
@@ -2331,7 +2439,7 @@ fn test_deletion_intent_then_target_arrives() {
 
     // Pre-compute message blob and eid
     let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "will arrive later");
-    let msg_eid = hash_event(&msg_blob);
+    let msg_eid = canonical_test_event_id(&conn, recorded_by, &msg_blob);
 
     // Create deletion first (before message exists) — writes intent, returns Valid
     let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
@@ -2355,7 +2463,8 @@ fn test_deletion_intent_then_target_arrives() {
     assert!(valid, "deletion should be valid after intent write");
 
     // Now insert and project the message — should be tombstoned immediately
-    insert_event_raw(&conn, recorded_by, &msg_blob);
+    let inserted_msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+    assert_eq!(inserted_msg_eid, msg_eid);
     let r = project_one(&conn, recorded_by, &msg_eid).unwrap();
     assert_eq!(r, ProjectionDecision::Valid);
 
@@ -2589,12 +2698,7 @@ fn test_deletion_convergence() {
     .unwrap();
 
     // Re-insert workspace event as valid (it was cleared above)
-    let net_b64 = event_id_to_base64(&net_eid);
-    conn.execute(
-        "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
-        rusqlite::params![recorded_by, &net_b64],
-    )
-    .unwrap();
+    mark_valid_for_test(&conn, recorded_by, &net_eid, events::EVENT_TYPE_WORKSPACE);
 
     // Project in reverse order: del first (intent-only), then rxn (dep-blocks on msg), then msg (tombstones + unblocks rxn)
     project_one(&conn, recorded_by, &del_eid).unwrap();
@@ -2692,13 +2796,8 @@ fn test_emit_cross_tenant_records_and_projects() {
     let tenant_b = "tenant_b";
     let net_eid = setup_workspace_event(&conn, tenant_a);
     // Also mark valid for tenant_b
-    let net_b64 = event_id_to_base64(&net_eid);
     insert_recorded_event(&conn, tenant_b, &net_eid, now_ms() as i64, "test").unwrap();
-    conn.execute(
-        "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
-        rusqlite::params![tenant_b, &net_b64],
-    )
-    .unwrap();
+    mark_valid_for_test(&conn, tenant_b, &net_eid, events::EVENT_TYPE_WORKSPACE);
 
     // Use a KeySecret event (unsigned, no signer_required) for the cross-tenant
     // emit test. This avoids needing to set up identity chains for emit_deterministic_event.
@@ -3309,7 +3408,7 @@ fn test_attachment_cascade_unblock() {
 
     // Pre-compute the message and key event IDs
     let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "hello cascade");
-    let msg_eid = crate::crypto::hash_event(&msg_blob);
+    let msg_eid = canonical_test_event_id(&conn, recorded_by, &msg_blob);
 
     let sk = ParsedEvent::KeySecret(KeySecretEvent {
         created_at_ms: now_ms(),
@@ -4536,14 +4635,16 @@ fn test_deletion_invariant_order_convergence_identical_state() {
 
     // Pre-compute message and deletion blobs
     let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "order convergence");
-    let msg_eid = hash_event(&msg_blob);
+    let msg_eid = canonical_test_event_id(&conn, recorded_by, &msg_blob);
     let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
-    let del_eid = hash_event(&del_blob);
+    let del_eid = canonical_test_event_id(&conn, recorded_by, &del_blob);
 
     // === Order A: create → delete ===
-    insert_event_raw(&conn, recorded_by, &msg_blob);
+    let inserted_msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+    assert_eq!(inserted_msg_eid, msg_eid);
     project_one(&conn, recorded_by, &msg_eid).unwrap();
-    insert_event_raw(&conn, recorded_by, &del_blob);
+    let inserted_del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
+    assert_eq!(inserted_del_eid, del_eid);
     project_one(&conn, recorded_by, &del_eid).unwrap();
 
     // Capture state A
@@ -4826,7 +4927,7 @@ fn test_deletion_invariant_monotonic() {
 
     // Pre-compute message
     let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "monotonic test");
-    let msg_eid = hash_event(&msg_blob);
+    let msg_eid = canonical_test_event_id(&conn, recorded_by, &msg_blob);
 
     // Delete first (intent-only)
     let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
@@ -4834,7 +4935,8 @@ fn test_deletion_invariant_monotonic() {
     project_one(&conn, recorded_by, &del_eid).unwrap();
 
     // Insert message — should be tombstoned immediately
-    insert_event_raw(&conn, recorded_by, &msg_blob);
+    let inserted_msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+    assert_eq!(inserted_msg_eid, msg_eid);
     project_one(&conn, recorded_by, &msg_eid).unwrap();
 
     // Message must NOT be in messages table (active state)
@@ -4887,12 +4989,7 @@ fn test_dep_type_mismatch_rejects() {
     let wrong_target_eid = insert_event_raw(&conn, recorded_by, &ws_blob);
 
     // Make the wrong-type target valid so dep-presence passes but dep-type fails.
-    let wrong_target_b64 = event_id_to_base64(&wrong_target_eid);
-    conn.execute(
-        "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
-        rusqlite::params![recorded_by, &wrong_target_b64],
-    )
-    .unwrap();
+    mark_valid_for_test(&conn, recorded_by, &wrong_target_eid, ws.event_type_code());
 
     // Build a reaction targeting the workspace event
     let (_rxn, rxn_blob) =

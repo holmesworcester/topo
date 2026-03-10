@@ -214,7 +214,10 @@ mod tests {
     fn event_pipeline_effects_fan_out_shared_events_to_same_workspace_siblings_only() {
         use crate::crypto::{event_id_to_base64, hash_event};
         use crate::db::{open_connection, schema::create_tables, store::insert_event};
-        use crate::event_modules::{encode_event, MessageEvent, ParsedEvent};
+        use crate::event_modules::{
+            encode_event, EncryptedEvent, MessageEvent, ParsedEvent, EVENT_TYPE_MESSAGE,
+        };
+        use crate::projection::encrypted::encrypt_event_blob;
         use crate::projection::signer::sign_event_bytes;
         use crate::testutil::SharedDbNode;
 
@@ -244,13 +247,43 @@ mod tests {
         );
         let blob_len = blob.len();
         blob[blob_len - 64..].copy_from_slice(&sig);
+
+        let key_event_id =
+            crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+                &conn,
+                &origin.identity,
+            )
+            .unwrap();
+        let key_event_id_b64 = event_id_to_base64(&key_event_id);
+        let key_bytes: Vec<u8> = conn
+            .query_row(
+                "SELECT key_bytes
+                 FROM key_secrets
+                 WHERE recorded_by = ?1 AND event_id = ?2
+                 LIMIT 1",
+                params![&origin.identity, &key_event_id_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let mut key_arr = [0u8; 32];
+        key_arr.copy_from_slice(&key_bytes);
+        let (nonce, ciphertext, auth_tag) = encrypt_event_blob(&key_arr, &blob).unwrap();
+        let wrapper = ParsedEvent::Encrypted(EncryptedEvent {
+            created_at_ms: 42,
+            key_event_id,
+            inner_type_code: EVENT_TYPE_MESSAGE,
+            nonce,
+            ciphertext,
+            auth_tag,
+        });
+        let blob = encode_event(&wrapper).unwrap();
         let event_id = hash_event(&blob);
         let event_id_b64 = event_id_to_base64(&event_id);
 
         insert_event(
             &conn,
             &event_id,
-            "message",
+            "encrypted",
             &blob,
             crate::event_modules::ShareScope::Shared,
             42,

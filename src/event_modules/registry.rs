@@ -19,6 +19,13 @@ impl ShareScope {
     }
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TransportPrivacy {
+    PlaintextOnly,
+    Optional,
+    RequireEncrypted,
+}
+
 pub struct EventTypeMeta {
     pub type_code: u8,
     pub type_name: &'static str,
@@ -74,5 +81,26 @@ impl EventRegistry {
 
     pub fn lookup(&self, type_code: u8) -> Option<&'static EventTypeMeta> {
         self.by_code.get(&type_code).copied()
+    }
+
+    pub fn lookup_by_name(&self, type_name: &str) -> Option<&'static EventTypeMeta> {
+        self.by_code
+            .values()
+            .copied()
+            .find(|meta| meta.type_name == type_name)
+    }
+}
+
+impl EventTypeMeta {
+    pub fn transport_privacy(&self) -> TransportPrivacy {
+        match self.type_code {
+            super::EVENT_TYPE_MESSAGE
+            | super::EVENT_TYPE_REACTION
+            | super::EVENT_TYPE_MESSAGE_DELETION
+            | super::EVENT_TYPE_FILE
+            | super::EVENT_TYPE_FILE_SLICE => TransportPrivacy::RequireEncrypted,
+            super::EVENT_TYPE_KEY_SECRET => TransportPrivacy::Optional,
+            _ => TransportPrivacy::PlaintextOnly,
+        }
     }
 }

@@ -1,5 +1,5 @@
 use crate::crypto::EventId;
-use crate::projection::create::create_signed_event_synchronous;
+use crate::projection::create::create_encrypted_event_synchronous;
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
@@ -27,7 +27,15 @@ pub fn create(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let eid = create_signed_event_synchronous(db, recorded_by, &del, signing_key)?;
+    let key_event_id =
+        super::super::workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)?;
+    let eid = create_encrypted_event_synchronous(
+        db,
+        recorded_by,
+        &key_event_id,
+        &del,
+        Some(signing_key),
+    )?;
     Ok(eid)
 }
 

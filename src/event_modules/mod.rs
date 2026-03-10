@@ -65,7 +65,7 @@ pub use peer_removed::PeerRemovedEvent;
 pub use peer_secret::PeerSecretEvent;
 pub use peer_shared::PeerSharedEvent;
 pub use reaction::ReactionEvent;
-pub use registry::{EventRegistry, EventTypeMeta, ShareScope};
+pub use registry::{EventRegistry, EventTypeMeta, ShareScope, TransportPrivacy};
 pub use tenant::TenantEvent;
 pub use user::UserEvent;
 pub use user_invite_shared::UserInviteEvent;
@@ -97,6 +97,14 @@ pub const EVENT_TYPE_TENANT: u8 = 29;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
+
+pub fn outer_semantic_type_code(blob: &[u8]) -> Option<u8> {
+    match blob.first().copied() {
+        Some(EVENT_TYPE_ENCRYPTED) => encrypted::outer_inner_type_code(blob),
+        Some(type_code) => Some(type_code),
+        None => None,
+    }
+}
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     workspace::ensure_schema(conn)?;
@@ -489,6 +497,36 @@ mod tests {
 
         for removed in [11, 13, 15, 17, 19, 23] {
             assert!(reg.lookup(removed).is_none());
+        }
+    }
+
+    #[test]
+    fn test_registry_transport_privacy_coverage() {
+        let reg = registry();
+        let required_codes: Vec<u8> = (1..=29u8)
+            .filter(|c| {
+                reg.lookup(*c)
+                    .is_some_and(|m| m.transport_privacy() == TransportPrivacy::RequireEncrypted)
+            })
+            .collect();
+        assert_eq!(required_codes, vec![1, 2, 7, 24, 25]);
+
+        assert_eq!(
+            reg.lookup(EVENT_TYPE_KEY_SECRET)
+                .unwrap()
+                .transport_privacy(),
+            TransportPrivacy::Optional
+        );
+
+        for code in [5, 8, 9, 10, 12, 14, 16, 18, 20, 21, 22, 26, 27, 28, 29] {
+            let meta = reg.lookup(code).unwrap();
+            assert_eq!(
+                meta.transport_privacy(),
+                TransportPrivacy::PlaintextOnly,
+                "type {} ({}) should remain plaintext-only",
+                code,
+                meta.type_name
+            );
         }
     }
 

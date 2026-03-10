@@ -111,6 +111,7 @@ mod tests {
             .map(|m| m.type_name)
             .unwrap_or("unknown");
         let ts = now_ms() as i64;
+        let semantic_type_code = i64::from(type_code);
         insert_event(
             conn,
             &event_id,
@@ -122,8 +123,9 @@ mod tests {
         )
         .unwrap();
         conn.execute(
-            "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
-            rusqlite::params![recorded_by, &event_id_b64],
+            "INSERT OR IGNORE INTO valid_events (peer_id, event_id, semantic_type_code)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![recorded_by, &event_id_b64, semantic_type_code],
         )
         .unwrap();
         insert_recorded_event(conn, recorded_by, &event_id, ts, "test").unwrap();

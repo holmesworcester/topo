@@ -124,15 +124,17 @@ pub fn project_encrypted(
     }
 
     // Shared dep/signer/projection stages (outer event_id anchors block/reject rows).
-    // Dep type checking remains disabled for decrypted inners because their deps may
-    // intentionally target encrypted wrapper type-codes.
+    // Dep type checking now uses tenant-scoped valid_events.semantic_type_code,
+    // so encrypted deps are validated by semantic inner type rather than outer
+    // wrapper type code.
     let (decision, _) = run_dep_and_projection_stages(
         conn,
         recorded_by,
         event_id_b64,
         &plaintext,
         &inner_parsed,
-        false,
+        true,
+        true,
     )?;
 
     // Return the inner parsed event so the caller (project_one_step) can fire

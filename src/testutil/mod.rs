@@ -527,7 +527,7 @@ impl Peer {
     /// Returns the event ID. Requires identity chain (use new_with_identity).
     pub fn create_message(&self, content: &str) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let msg = ParsedEvent::Message(MessageEvent {
+        let inner = ParsedEvent::Message(MessageEvent {
             created_at_ms: current_timestamp_ms(),
             workspace_id: self.workspace_id,
             author_id: self.author_id,
@@ -536,15 +536,14 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        create_signed_event_synchronous(&db, &self.identity, &msg, self.signing_key())
-            .expect("failed to create message")
+        self.create_encrypted_signed_event_synchronous(&db, &self.content_key_event_id(&db), &inner)
     }
 
     /// Create a reaction targeting a message event.
     /// Returns the reaction event ID. Requires identity chain.
     pub fn create_reaction(&self, target_event_id: &EventId, emoji: &str) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let rxn = ParsedEvent::Reaction(ReactionEvent {
+        let inner = ParsedEvent::Reaction(ReactionEvent {
             created_at_ms: current_timestamp_ms(),
             target_event_id: *target_event_id,
             author_id: self.author_id,
@@ -553,8 +552,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        create_signed_event_staged(&db, &self.identity, &rxn, self.signing_key())
-            .expect("failed to create reaction")
+        self.create_encrypted_signed_event_synchronous(&db, &self.content_key_event_id(&db), &inner)
     }
 
     /// Create a KeySecret event with the given key bytes.
@@ -618,11 +616,19 @@ impl Peer {
         .expect("failed to create encrypted signed event")
     }
 
+    fn content_key_event_id(&self, db: &rusqlite::Connection) -> EventId {
+        crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+            db,
+            &self.identity,
+        )
+        .expect("failed to ensure content key")
+    }
+
     /// Create a MessageDeletion event targeting the given message event.
     /// Returns the deletion event ID. Requires identity chain.
     pub fn create_message_deletion(&self, target_event_id: &EventId) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let del = ParsedEvent::MessageDeletion(MessageDeletionEvent {
+        let inner = ParsedEvent::MessageDeletion(MessageDeletionEvent {
             created_at_ms: current_timestamp_ms(),
             target_event_id: *target_event_id,
             author_id: self.author_id,
@@ -630,8 +636,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        create_signed_event_synchronous(&db, &self.identity, &del, self.signing_key())
-            .expect("failed to create message_deletion")
+        self.create_encrypted_signed_event_synchronous(&db, &self.content_key_event_id(&db), &inner)
     }
 
     /// Create an encrypted MessageDeletion event.
@@ -950,9 +955,10 @@ impl Peer {
     /// Requires identity chain.
     pub fn batch_create_messages(&self, count: usize) {
         let db = open_connection(&self.db_path).expect("failed to open db");
+        let key_event_id = self.content_key_event_id(&db);
         db.execute("BEGIN", []).expect("failed to begin");
         for i in 0..count {
-            let msg = ParsedEvent::Message(MessageEvent {
+            let inner = ParsedEvent::Message(MessageEvent {
                 created_at_ms: current_timestamp_ms(),
                 workspace_id: self.workspace_id,
                 author_id: self.author_id,
@@ -961,8 +967,7 @@ impl Peer {
                 signer_type: 5,
                 signature: [0u8; 64],
             });
-            create_signed_event_synchronous(&db, &self.identity, &msg, self.signing_key())
-                .expect("failed to create message");
+            self.create_encrypted_signed_event_synchronous(&db, &key_event_id, &inner);
         }
         db.execute("COMMIT", []).expect("failed to commit");
     }
@@ -981,6 +986,8 @@ impl Peer {
             .expect("missing trust anchor workspace_id for file-slice benchmark");
 
         // Parent message
+        let key_event_id = self.content_key_event_id(&db);
+
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: current_timestamp_ms(),
             workspace_id: self.workspace_id,
@@ -990,16 +997,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let msg_eid = create_signed_event_staged(&db, &self.identity, &msg, self.signing_key())
-            .expect("failed to create parent message");
-
-        // Secret key for attachment
-        let sk = ParsedEvent::KeySecret(KeySecretEvent {
-            created_at_ms: current_timestamp_ms(),
-            key_bytes: [0xBB; 32],
-        });
-        let sk_eid =
-            create_event_staged(&db, &self.identity, &sk).expect("failed to create key_secret");
+        let msg_eid = self.create_encrypted_signed_event_synchronous(&db, &key_event_id, &msg);
 
         let file_id: [u8; 32] = {
             use std::hash::{Hash, Hasher};
@@ -1025,16 +1023,14 @@ impl Peer {
             total_slices: total_slices as u32,
             slice_bytes: slice_size as u32,
             root_hash: [0xAA; 32],
-            key_event_id: sk_eid,
+            key_event_id,
             filename: format!("bench-{}.bin", self.name),
             mime_type: "application/octet-stream".to_string(),
             signed_by: self.signer_eid(),
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let att_eid = create_signed_event_staged(&db, &self.identity, &att, self.signing_key())
-            .expect("failed to create file");
-        project_one(&db, &self.identity, &att_eid).expect("failed to project attachment");
+        let _att_eid = self.create_encrypted_signed_event_synchronous(&db, &key_event_id, &att);
 
         // Batch-create file slices inside a transaction
         let ciphertext: Vec<u8> = vec![0xAB; FILE_SLICE_CIPHERTEXT_BYTES];
@@ -1056,11 +1052,34 @@ impl Peer {
                 signer_type: 5,
                 signature: [0u8; 64],
             });
-            let mut blob =
+            let mut inner_blob =
                 crate::event_modules::encode_event(&fs).expect("failed to encode file_slice");
-            let blob_len = blob.len();
-            let sig = sign_event_bytes(&signing_key, &blob[..blob_len - 64]);
-            blob[blob_len - 64..].copy_from_slice(&sig);
+            let blob_len = inner_blob.len();
+            let sig = sign_event_bytes(&signing_key, &inner_blob[..blob_len - 64]);
+            inner_blob[blob_len - 64..].copy_from_slice(&sig);
+
+            let key_bytes: Vec<u8> = db
+                .query_row(
+                    "SELECT key_bytes FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
+                    rusqlite::params![&self.identity, event_id_to_base64(&key_event_id)],
+                    |row| row.get(0),
+                )
+                .expect("failed to load content key bytes");
+            let mut key_arr = [0u8; 32];
+            key_arr.copy_from_slice(&key_bytes);
+            let (nonce, ciphertext, auth_tag) =
+                crate::projection::encrypted::encrypt_event_blob(&key_arr, &inner_blob)
+                    .expect("failed to encrypt file_slice");
+            let enc = ParsedEvent::Encrypted(crate::event_modules::EncryptedEvent {
+                created_at_ms: current_timestamp_ms(),
+                key_event_id,
+                inner_type_code: crate::event_modules::EVENT_TYPE_FILE_SLICE,
+                nonce,
+                ciphertext,
+                auth_tag,
+            });
+            let blob =
+                crate::event_modules::encode_event(&enc).expect("failed to encode encrypted");
 
             let event_id = crate::crypto::hash_event(&blob);
             let event_id_b64 = event_id_to_base64(&event_id);
@@ -1072,7 +1091,7 @@ impl Peer {
             db.execute(
                 "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
                  VALUES (?1, ?2, ?3, 'shared', ?4, ?5)",
-                rusqlite::params![&event_id_b64, "file_slice", blob.as_slice(), created_at as i64, created_at as i64],
+                rusqlite::params![&event_id_b64, "encrypted", blob.as_slice(), created_at as i64, created_at as i64],
             ).expect("failed to insert file_slice event");
             db.execute(
                 "INSERT OR IGNORE INTO neg_items (workspace_id, ts, id) VALUES (?1, ?2, ?3)",
@@ -1086,7 +1105,7 @@ impl Peer {
             )
             .expect("failed to insert recorded_event");
 
-            // Project (validates the signature + authorization chain)
+            // Project (validates decryption, signature, and authorization chain)
             project_one(&db, &self.identity, &event_id).expect("failed to project file_slice");
         }
         db.execute("COMMIT", []).expect("failed to commit");
@@ -1153,8 +1172,11 @@ impl Peer {
             None => return -1,
         };
         db.query_row(
-            "SELECT COUNT(*) FROM events WHERE event_type = 'message'",
-            [],
+            "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1 AND semantic_type_code = ?2",
+            rusqlite::params![
+                &self.identity,
+                i64::from(crate::event_modules::EVENT_TYPE_MESSAGE)
+            ],
             |row| row.get(0),
         )
         .unwrap_or(0)
@@ -1295,6 +1317,25 @@ impl Peer {
     /// Return sorted set of event IDs for a specific `event_type`.
     pub fn event_ids_by_type(&self, event_type: &str) -> std::collections::BTreeSet<String> {
         let db = open_connection(&self.db_path).expect("failed to open db");
+        if let Some(meta) = crate::event_modules::registry().lookup_by_name(event_type) {
+            let mut stmt = db
+                .prepare(
+                    "SELECT event_id
+                     FROM valid_events
+                     WHERE peer_id = ?1 AND semantic_type_code = ?2
+                     ORDER BY event_id",
+                )
+                .expect("prepare");
+            return stmt
+                .query_map(
+                    rusqlite::params![&self.identity, i64::from(meta.type_code)],
+                    |row| row.get::<_, String>(0),
+                )
+                .expect("query")
+                .collect::<Result<std::collections::BTreeSet<_>, _>>()
+                .expect("collect");
+        }
+
         let mut stmt = db
             .prepare("SELECT event_id FROM events WHERE event_type = ?1 ORDER BY event_id")
             .expect("prepare");

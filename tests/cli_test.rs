@@ -329,6 +329,52 @@ fn wait_for_transport_cred_source(db_path: &str, peer_id: &str, source: &str, ti
     }
 }
 
+fn projected_transport_peer_exists(db_path: &str, recorded_by: &str, peer_id: &str) -> bool {
+    let Ok(transport_fingerprint) = hex::decode(peer_id) else {
+        return false;
+    };
+    if transport_fingerprint.len() != 32 {
+        return false;
+    }
+
+    let conn = open_connection(db_path).expect("open db");
+    conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM peers_shared
+             WHERE recorded_by = ?1
+               AND transport_fingerprint = ?2
+             LIMIT 1
+         )",
+        rusqlite::params![recorded_by, transport_fingerprint],
+        |row| row.get::<_, i64>(0),
+    )
+    .map(|exists| exists != 0)
+    .unwrap_or(false)
+}
+
+fn wait_for_projected_transport_peer(
+    db_path: &str,
+    recorded_by: &str,
+    peer_id: &str,
+    timeout_ms: u64,
+) {
+    let start = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+    loop {
+        if projected_transport_peer_exists(db_path, recorded_by, peer_id) {
+            return;
+        }
+        if start.elapsed() >= timeout {
+            panic!(
+                "projected transport peer {} did not appear within {}ms for tenant {} (db={})",
+                peer_id, timeout_ms, recorded_by, db_path
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 fn dial_peer_for_tenant(
     db_path: &str,
     tenant_id: &str,
@@ -366,6 +412,8 @@ fn wait_for_direct_trust_dial(
     expected_peer_id: &str,
     timeout_ms: u64,
 ) {
+    wait_for_projected_transport_peer(db_path, tenant_id, expected_peer_id, timeout_ms);
+
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     let last_error = loop {
@@ -473,6 +521,12 @@ fn assert_cli_state(
         !active_stdout.trim().is_empty() && active_stdout.trim() != "(no active tenant)",
         "active tenant should be selected: {}",
         active_stdout
+    );
+
+    assert_eventually(
+        db_path,
+        &format!("message_count >= {}", expected_messages.len()),
+        30_000,
     );
 
     let status = get_status_raw(db_path);

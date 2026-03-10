@@ -1,9 +1,11 @@
 use std::path::Path;
+use std::thread;
+use std::time::Duration;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::crypto::EventId;
 use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
-use crate::projection::create::create_signed_event_synchronous;
+use crate::projection::create::create_encrypted_event_synchronous;
 use crate::service::open_db_for_peer;
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
@@ -21,6 +23,29 @@ fn current_timestamp_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+fn begin_immediate_with_retry(
+    db: &Connection,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    const MAX_ATTEMPTS: usize = 8;
+
+    for attempt in 0..MAX_ATTEMPTS {
+        match db.execute("BEGIN IMMEDIATE", []) {
+            Ok(_) => return Ok(()),
+            Err(err) => {
+                let msg = err.to_string();
+                let is_busy = msg.contains("database is locked") || msg.contains("SQLITE_BUSY");
+                if is_busy && attempt + 1 < MAX_ATTEMPTS {
+                    thread::sleep(Duration::from_millis(25u64 << attempt));
+                    continue;
+                }
+                return Err(err.into());
+            }
+        }
+    }
+
+    Err("BEGIN IMMEDIATE retry exhausted".into())
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -51,7 +76,14 @@ pub fn create(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let eid = create_signed_event_synchronous(db, recorded_by, &msg, signing_key)?;
+    let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)?;
+    let eid = create_encrypted_event_synchronous(
+        db,
+        recorded_by,
+        &key_event_id,
+        &msg,
+        Some(signing_key),
+    )?;
     Ok(eid)
 }
 
@@ -111,7 +143,14 @@ pub fn create_deletion(
         signer_type: 5,
         signature: [0u8; 64],
     });
-    let eid = create_signed_event_synchronous(db, recorded_by, &del, signing_key)?;
+    let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)?;
+    let eid = create_encrypted_event_synchronous(
+        db,
+        recorded_by,
+        &key_event_id,
+        &del,
+        Some(signing_key),
+    )?;
     Ok(eid)
 }
 
@@ -242,7 +281,7 @@ pub fn generate_for_peer(
     let mut i = 0;
     while i < count {
         let batch_end = (i + BATCH_SIZE).min(count);
-        db.execute("BEGIN", [])?;
+        begin_immediate_with_retry(&db)?;
         for j in i..batch_end {
             create(
                 &db,
@@ -297,7 +336,7 @@ pub fn generate_files_for_peer(
     // Each file is its own transaction to avoid holding the write lock
     // too long and causing SQLITE_BUSY for the sync engine.
     for i in 0..files {
-        db.execute("BEGIN", [])?;
+        begin_immediate_with_retry(&db)?;
         let message_event_id = create(
             &db,
             &recorded_by,
@@ -326,9 +365,10 @@ pub fn generate_files_for_peer(
                 "blob_bytes overflow".into()
             })?;
 
-        create_signed_event_synchronous(
+        create_encrypted_event_synchronous(
             &db,
             &recorded_by,
+            &key_event_id,
             &ParsedEvent::File(FileEvent {
                 created_at_ms: current_timestamp_ms(),
                 message_id: message_event_id,
@@ -344,16 +384,17 @@ pub fn generate_files_for_peer(
                 signer_type: 5,
                 signature: [0u8; 64],
             }),
-            &signing_key,
+            Some(&signing_key),
         )
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("create file error: {}", e).into()
         })?;
 
         for slice_number in 0..slices_per_file {
-            create_signed_event_synchronous(
+            create_encrypted_event_synchronous(
                 &db,
                 &recorded_by,
+                &key_event_id,
                 &ParsedEvent::FileSlice(FileSliceEvent {
                     created_at_ms: current_timestamp_ms(),
                     file_id,
@@ -363,7 +404,7 @@ pub fn generate_files_for_peer(
                     signer_type: 5,
                     signature: [0u8; 64],
                 }),
-                &signing_key,
+                Some(&signing_key),
             )
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("create file_slice error: {}", e).into()
@@ -468,9 +509,10 @@ pub fn send_file_for_peer(
         (file_size as usize).div_ceil(FILE_SLICE_CIPHERTEXT_BYTES)
     };
 
-    create_signed_event_synchronous(
+    create_encrypted_event_synchronous(
         &db,
         &recorded_by,
+        &key_event_id,
         &ParsedEvent::File(FileEvent {
             created_at_ms: current_timestamp_ms(),
             message_id: message_event_id,
@@ -486,7 +528,7 @@ pub fn send_file_for_peer(
             signer_type: 5,
             signature: [0u8; 64],
         }),
-        &signing_key,
+        Some(&signing_key),
     )?;
 
     for slice_number in 0..num_slices {
@@ -497,9 +539,10 @@ pub fn send_file_for_peer(
             ciphertext[..end - start].copy_from_slice(&file_data[start..end]);
         }
 
-        create_signed_event_synchronous(
+        create_encrypted_event_synchronous(
             &db,
             &recorded_by,
+            &key_event_id,
             &ParsedEvent::FileSlice(FileSliceEvent {
                 created_at_ms: current_timestamp_ms(),
                 file_id,
@@ -509,7 +552,7 @@ pub fn send_file_for_peer(
                 signer_type: 5,
                 signature: [0u8; 64],
             }),
-            &signing_key,
+            Some(&signing_key),
         )?;
     }
 

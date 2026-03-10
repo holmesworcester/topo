@@ -263,6 +263,25 @@ fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
         .ok()
         .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
         .expect("creator user event");
+    let content_key_event_id =
+        crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+            &conn,
+            &creator_peer_id,
+        )
+        .expect("content key for creator");
+    let seeded_message_id = crate::event_modules::message::commands::create(
+        &conn,
+        &creator_peer_id,
+        &workspace.peer_shared_event_id,
+        &workspace.peer_shared_key,
+        42,
+        crate::event_modules::message::commands::CreateMessageCmd {
+            workspace_id: workspace.workspace_id,
+            author_id: creator_user_eid,
+            content: "seeded-before-link".to_string(),
+        },
+    )
+    .expect("create seeded encrypted message");
 
     let invite = create_device_link_invite_raw(
         &conn,
@@ -294,6 +313,30 @@ fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
         .expect("load peer signer")
         .expect("linked device signer should materialize without network");
     assert_eq!(signer.0, link.peer_shared_event_id);
+
+    let linked_key_present: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![&phone_peer_id, event_id_to_base64(&content_key_event_id)],
+            |row| row.get(0),
+        )
+        .expect("query linked device content key");
+    assert!(
+        linked_key_present,
+        "device link should replay/wrap the workspace content key for the new device"
+    );
+
+    let seeded_message_visible: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![&phone_peer_id, event_id_to_base64(&seeded_message_id)],
+            |row| row.get(0),
+        )
+        .expect("query seeded message on linked device");
+    assert!(
+        seeded_message_visible,
+        "linked device should decrypt and project preexisting encrypted messages"
+    );
 
     let tenant_count: i64 = conn
         .query_row(

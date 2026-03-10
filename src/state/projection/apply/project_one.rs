@@ -83,6 +83,7 @@ pub(crate) fn project_one_step(
         &event_id_b64,
         &blob,
         &parsed,
+        false,
         true, // canonical cleartext flow enforces dep type constraints
     )?;
     match &decision {
@@ -105,14 +106,16 @@ pub(crate) fn project_one_step(
     //    where an event is marked valid but subscriptions never receive it.
     conn.execute_batch("SAVEPOINT project_valid")?;
     let commit_result = (|| -> Result<(), Box<dyn std::error::Error>> {
+        let sub_event = inner_parsed.as_ref().unwrap_or(&parsed);
+        let semantic_type_code = i64::from(sub_event.event_type_code());
         conn.execute(
-            "INSERT OR IGNORE INTO valid_events (peer_id, event_id) VALUES (?1, ?2)",
-            rusqlite::params![recorded_by, &event_id_b64],
+            "INSERT OR IGNORE INTO valid_events (peer_id, event_id, semantic_type_code)
+             VALUES (?1, ?2, ?3)",
+            rusqlite::params![recorded_by, &event_id_b64, semantic_type_code],
         )?;
 
         // 8. Subscription hook: evaluate active subscriptions for this event.
         //    For encrypted events, use the decrypted inner event for matching.
-        let sub_event = inner_parsed.as_ref().unwrap_or(&parsed);
         crate::state::subscriptions::on_projected_event(
             conn,
             recorded_by,

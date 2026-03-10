@@ -18,6 +18,13 @@ mod encrypted_offsets {
 
 use encrypted_offsets as off;
 
+pub fn outer_inner_type_code(blob: &[u8]) -> Option<u8> {
+    if blob.first().copied() != Some(EVENT_TYPE_ENCRYPTED) {
+        return None;
+    }
+    blob.get(off::INNER_TYPE_CODE).copied()
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptedEvent {
     pub created_at_ms: u64,

@@ -8,7 +8,7 @@ use crate::db::store::{
     insert_event, insert_neg_item_if_shared, insert_recorded_event, lookup_workspace_id,
 };
 use crate::event_modules::EncryptedEvent;
-use crate::event_modules::{self as events, registry, ParsedEvent};
+use crate::event_modules::{self as events, registry, ParsedEvent, TransportPrivacy};
 use crate::projection::encrypted::encrypt_event_blob;
 use crate::projection::signer::sign_event_bytes;
 use crate::state::shared_workspace_fanout::fanout_stored_shared_event_immediate;
@@ -328,16 +328,29 @@ pub fn create_encrypted_event_synchronous(
     inner_event: &ParsedEvent,
     signing_key: Option<&SigningKey>,
 ) -> Result<EventId, CreateEventError> {
+    let inner_meta = events::registry()
+        .lookup(inner_event.event_type_code())
+        .ok_or_else(|| CreateEventError::EncodeError("unknown event type".to_string()))?;
+    if !inner_meta.encryptable {
+        return Err(CreateEventError::EncodeError(format!(
+            "{} events cannot be encrypted",
+            inner_meta.type_name
+        )));
+    }
+    if inner_meta.transport_privacy() == TransportPrivacy::PlaintextOnly {
+        return Err(CreateEventError::EncodeError(format!(
+            "{} events may not be carried inside encrypted wrappers",
+            inner_meta.type_name
+        )));
+    }
+
     // 1. Encode inner event
     let mut inner_blob = events::encode_event(inner_event)
         .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
 
     // 2. Sign inner blob if signing_key provided
     if let Some(key) = signing_key {
-        let meta = events::registry()
-            .lookup(inner_event.event_type_code())
-            .ok_or_else(|| CreateEventError::EncodeError("unknown event type".to_string()))?;
-        let sig_len = meta.signature_byte_len;
+        let sig_len = inner_meta.signature_byte_len;
         if sig_len > 0 {
             let blob_len = inner_blob.len();
             let sig = sign_event_bytes(key, &inner_blob[..blob_len - sig_len]);
@@ -385,6 +398,25 @@ pub fn create_encrypted_event_synchronous(
 
     // 6. Use existing create_event_synchronous for the wrapper
     create_event_synchronous(conn, recorded_by, &wrapper)
+}
+
+/// Staged encrypted create: persist and enqueue an encrypted event even if its
+/// inner event is Blocked. Returns the outer wrapper event_id on both Valid and
+/// Blocked outcomes.
+pub fn create_encrypted_event_staged(
+    conn: &Connection,
+    recorded_by: &str,
+    key_event_id: &EventId,
+    inner_event: &ParsedEvent,
+    signing_key: Option<&SigningKey>,
+) -> Result<EventId, CreateEventError> {
+    event_id_or_blocked(create_encrypted_event_synchronous(
+        conn,
+        recorded_by,
+        key_event_id,
+        inner_event,
+        signing_key,
+    ))
 }
 
 /// Staged create: persist and enqueue an event even if it is Blocked.
@@ -541,6 +573,12 @@ mod tests {
         let net_eid = setup_workspace_event(&conn, recorded_by);
 
         let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
+        let key_event_id =
+            crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+                &conn,
+                recorded_by,
+            )
+            .unwrap();
 
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: now_ms(),
@@ -552,7 +590,14 @@ mod tests {
             signature: [0u8; 64],
         });
 
-        let eid = create_signed_event_synchronous(&conn, recorded_by, &msg, &signing_key).unwrap();
+        let eid = create_encrypted_event_synchronous(
+            &conn,
+            recorded_by,
+            &key_event_id,
+            &msg,
+            Some(&signing_key),
+        )
+        .unwrap();
         let eid_b64 = event_id_to_base64(&eid);
 
         // events table
@@ -593,6 +638,12 @@ mod tests {
         let net_eid = setup_workspace_event(&conn, recorded_by);
 
         let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
+        let key_event_id =
+            crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+                &conn,
+                recorded_by,
+            )
+            .unwrap();
 
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: now_ms(),
@@ -603,8 +654,14 @@ mod tests {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let msg_eid =
-            create_signed_event_synchronous(&conn, recorded_by, &msg, &signing_key).unwrap();
+        let msg_eid = create_encrypted_event_synchronous(
+            &conn,
+            recorded_by,
+            &key_event_id,
+            &msg,
+            Some(&signing_key),
+        )
+        .unwrap();
 
         let rxn = ParsedEvent::Reaction(ReactionEvent {
             created_at_ms: now_ms(),
@@ -615,8 +672,14 @@ mod tests {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let rxn_eid =
-            create_signed_event_synchronous(&conn, recorded_by, &rxn, &signing_key).unwrap();
+        let rxn_eid = create_encrypted_event_synchronous(
+            &conn,
+            recorded_by,
+            &key_event_id,
+            &rxn,
+            Some(&signing_key),
+        )
+        .unwrap();
 
         // Both valid
         let msg_b64 = event_id_to_base64(&msg_eid);
@@ -639,6 +702,12 @@ mod tests {
         let recorded_by = "peer1";
 
         let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
+        let key_event_id =
+            crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+                &conn,
+                recorded_by,
+            )
+            .unwrap();
 
         let fake_target = [99u8; 32];
         let rxn = ParsedEvent::Reaction(ReactionEvent {
@@ -652,8 +721,14 @@ mod tests {
         });
 
         // Event is stored but blocked — returns Blocked error with event_id
-        let err =
-            create_signed_event_synchronous(&conn, recorded_by, &rxn, &signing_key).unwrap_err();
+        let err = create_encrypted_event_synchronous(
+            &conn,
+            recorded_by,
+            &key_event_id,
+            &rxn,
+            Some(&signing_key),
+        )
+        .unwrap_err();
         let (eid, missing) = match err {
             CreateEventError::Blocked { event_id, missing } => (event_id, missing),
             other => panic!("expected Blocked, got: {}", other),
@@ -693,7 +768,7 @@ mod tests {
     }
 
     #[test]
-    fn test_create_signed_event_synchronous() {
+    fn test_create_signed_event_synchronous_rejects_plaintext_content() {
         let conn = setup();
         let recorded_by = "peer1";
 
@@ -710,39 +785,30 @@ mod tests {
             signature: [0u8; 64], // placeholder, will be overwritten
         });
 
-        let msg_eid =
-            create_signed_event_synchronous(&conn, recorded_by, &msg, &signing_key).unwrap();
-        let msg_b64 = event_id_to_base64(&msg_eid);
-
-        // Should be valid
-        let valid: bool = conn
-            .query_row(
-                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-                rusqlite::params![recorded_by, &msg_b64],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert!(valid);
-
-        // Should be in messages table
-        let count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM messages WHERE message_id = ?1 AND recorded_by = ?2",
-                rusqlite::params![&msg_b64, recorded_by],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(count, 1);
+        let err = create_signed_event_synchronous(&conn, recorded_by, &msg, &signing_key)
+            .expect_err("plaintext content should be rejected");
+        match err {
+            CreateEventError::Rejected { reason, .. } => {
+                assert!(reason.contains("must be carried inside encrypted wrappers"));
+            }
+            other => panic!("expected plaintext rejection, got {other:?}"),
+        }
     }
 
     #[test]
-    fn test_create_signed_event_synchronous_returns_blocked_error() {
+    fn test_create_encrypted_event_synchronous_returns_blocked_error() {
         // Verify strict API: create_signed_event_synchronous returns Err(Blocked) for
         // events with missing dependencies.
         let conn = setup();
         let recorded_by = "peer1";
 
         let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
+        let key_event_id =
+            crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+                &conn,
+                recorded_by,
+            )
+            .unwrap();
 
         // Reaction targeting a non-existent event → blocked on missing dep
         let fake_target = [0xDD; 32];
@@ -755,7 +821,13 @@ mod tests {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let result = create_signed_event_synchronous(&conn, recorded_by, &rxn, &signing_key);
+        let result = create_encrypted_event_synchronous(
+            &conn,
+            recorded_by,
+            &key_event_id,
+            &rxn,
+            Some(&signing_key),
+        );
         match result {
             Err(CreateEventError::Blocked { event_id, missing }) => {
                 assert_eq!(missing.len(), 1);
@@ -784,6 +856,12 @@ mod tests {
         let recorded_by = "peer1";
 
         let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
+        let key_event_id =
+            crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+                &conn,
+                recorded_by,
+            )
+            .unwrap();
 
         let fake_target = [0xEE; 32];
         let rxn = ParsedEvent::Reaction(ReactionEvent {
@@ -795,8 +873,14 @@ mod tests {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let eid = create_signed_event_staged(&conn, recorded_by, &rxn, &signing_key)
-            .expect("staged API should return Ok even for blocked events");
+        let eid = create_encrypted_event_staged(
+            &conn,
+            recorded_by,
+            &key_event_id,
+            &rxn,
+            Some(&signing_key),
+        )
+        .expect("staged API should return Ok even for blocked events");
 
         let eid_b64 = event_id_to_base64(&eid);
         let in_events: bool = conn
@@ -827,6 +911,12 @@ mod tests {
         let recorded_by = "peer1";
         let net_eid = setup_workspace_event(&conn, recorded_by);
         let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
+        let key_event_id =
+            crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+                &conn,
+                recorded_by,
+            )
+            .unwrap();
 
         let msg = ParsedEvent::Message(MessageEvent {
             created_at_ms: now_ms(),
@@ -837,7 +927,13 @@ mod tests {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let result = create_signed_event_synchronous(&conn, recorded_by, &msg, &signing_key);
+        let result = create_encrypted_event_synchronous(
+            &conn,
+            recorded_by,
+            &key_event_id,
+            &msg,
+            Some(&signing_key),
+        );
         assert!(
             result.is_ok(),
             "PLAN §6.4: valid event must return Ok, got: {:?}",
@@ -866,6 +962,12 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
         let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
+        let key_event_id =
+            crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+                &conn,
+                recorded_by,
+            )
+            .unwrap();
 
         let fake_target = [0xCC; 32];
         let rxn = ParsedEvent::Reaction(ReactionEvent {
@@ -877,7 +979,13 @@ mod tests {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let result = create_signed_event_synchronous(&conn, recorded_by, &rxn, &signing_key);
+        let result = create_encrypted_event_synchronous(
+            &conn,
+            recorded_by,
+            &key_event_id,
+            &rxn,
+            Some(&signing_key),
+        );
 
         match result {
             Err(CreateEventError::Blocked { event_id, missing }) => {

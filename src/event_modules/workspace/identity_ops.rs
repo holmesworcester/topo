@@ -412,6 +412,17 @@ fn create_device_link_invite_events_with_signer(
         bootstrap_ctx,
     )?;
 
+    // Linked devices need the same workspace content key as user invitees so
+    // they can decrypt preexisting encrypted content immediately after replay.
+    wrap_content_key_for_invite(
+        conn,
+        recorded_by,
+        signer_key,
+        signer_event_id,
+        &device_invite_key,
+        &invite_event_id,
+    )?;
+
     Ok(InviteData {
         invite_event_id,
         invite_key: device_invite_key,

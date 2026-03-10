@@ -30,7 +30,8 @@ pub struct DataPlaneSendStats {
 }
 
 fn should_capture_rx_event_link(blob: &[u8]) -> bool {
-    blob.first().copied() == Some(crate::event_modules::EVENT_TYPE_FILE_SLICE)
+    crate::event_modules::outer_semantic_type_code(blob)
+        == Some(crate::event_modules::EVENT_TYPE_FILE_SLICE)
 }
 
 pub fn enqueue_pending_have_to_egress(

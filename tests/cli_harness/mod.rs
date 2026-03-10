@@ -1125,8 +1125,8 @@ pub fn message_count_sql(db: &str) -> i64 {
 pub fn stored_message_event_count_sql(db: &str) -> i64 {
     let conn = rusqlite::Connection::open(db).expect("failed to open db");
     conn.query_row(
-        "SELECT COUNT(*) FROM events WHERE event_type = 'message'",
-        [],
+        "SELECT COUNT(*) FROM valid_events WHERE semantic_type_code = ?1",
+        rusqlite::params![i64::from(topo::event_modules::EVENT_TYPE_MESSAGE)],
         |row| row.get(0),
     )
     .expect("failed to query stored message event count")
