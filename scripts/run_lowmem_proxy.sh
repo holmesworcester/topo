@@ -61,6 +61,20 @@ run_topo_long() {
   timeout "${LARGE_TIMEOUT_SECS}" "${TOPO_BIN}" "$@"
 }
 
+# Launch `topo start` in the background (daemon is long-lived).
+# Usage: start_daemon --db <path> [extra flags...]
+# Uses --bind 127.0.0.1:0 to avoid port conflicts between co-located daemons.
+start_daemon() {
+  local _db_path=""
+  local _prev=""
+  for _arg in "$@"; do
+    if [ "${_prev}" = "--db" ]; then _db_path="${_arg}"; break; fi
+    _prev="${_arg}"
+  done
+  local _log="${_db_path%.db}.daemon.log"
+  timeout "${TOPO_CMD_TIMEOUT_SECS}" "${TOPO_BIN}" "$@" start --bind 127.0.0.1:0 >"${_log}" 2>&1 &
+}
+
 default_cgroup_parent() {
   local rel parent
   rel="$(awk -F: 'NR==1{print $3}' /proc/self/cgroup)"
@@ -247,7 +261,10 @@ wait_for_socket() {
 
 read_listen_addr() {
   local db="$1"
-  run_topo --db "${db}" status | awk '/Listen:/ {print $2; exit}'
+  local addr
+  addr="$(run_topo --db "${db}" status | awk '/Listen:/ {print $2; exit}')"
+  # Replace wildcard 0.0.0.0 with loopback for local connections
+  printf '%s\n' "${addr}" | sed 's/^0\.0\.0\.0:/127.0.0.1:/'
 }
 
 daemon_pid_for_db() {
@@ -751,7 +768,7 @@ run_asymmetric_proxy() {
   }
   trap cleanup_asym RETURN
 
-  run_topo --db "${alice_db}" start >/dev/null
+  start_daemon --db "${alice_db}"
   wait_for_socket "${alice_db}" 30
   run_topo --db "${alice_db}" create-workspace \
     --workspace-name "lowmem-proxy" \
@@ -768,7 +785,7 @@ run_asymmetric_proxy() {
   invite_out="$(
     run_topo --db "${alice_db}" invite --public-addr "${addr}"
   )"
-  invite_link="$(printf '%s\n' "${invite_out}" | awk '/^quiet:\/\/invite\// {print; exit}')"
+  invite_link="$(printf '%s\n' "${invite_out}" | awk '/^(quiet|topo):\/\/invite\// {print; exit}')"
   if [ -z "${invite_link}" ]; then
     echo "error: invite did not emit invite link" >&2
     return 1
@@ -778,7 +795,7 @@ run_asymmetric_proxy() {
   LOW_MEM_WAL_CAP_MIB="${WAL_CAP_MIB}" \
   LOW_MEM_MEMTRACE="${LOWMEM_MEMTRACE_ENABLED}" \
   LOW_MEM_MEMTRACE_FILE="${memtrace_log}" \
-  run_topo --db "${bob_db}" start >/dev/null
+  start_daemon --db "${bob_db}"
   wait_for_socket "${bob_db}" 30
   LOW_MEM_IOS=1 \
   LOW_MEM_WAL_CAP_MIB="${WAL_CAP_MIB}" \
@@ -1093,7 +1110,7 @@ run_large_delta_proxy() {
   }
   trap cleanup_delta RETURN
 
-  run_topo_retry 5 --db "${alice_db}" start >/dev/null
+  start_daemon --db "${alice_db}"
   wait_for_socket "${alice_db}" 30
   run_topo_retry 5 --db "${alice_db}" create-workspace \
     --workspace-name "lowmem-delta" \
@@ -1110,13 +1127,13 @@ run_large_delta_proxy() {
   invite_out="$(
     run_topo_retry 5 --db "${alice_db}" invite --public-addr "${addr}"
   )"
-  invite_link="$(printf '%s\n' "${invite_out}" | awk '/^quiet:\/\/invite\// {print; exit}')"
+  invite_link="$(printf '%s\n' "${invite_out}" | awk '/^(quiet|topo):\/\/invite\// {print; exit}')"
   if [ -z "${invite_link}" ]; then
     echo "error: invite did not emit invite link" >&2
     return 1
   fi
 
-  run_topo_retry 5 --db "${bob_db}" start >/dev/null
+  start_daemon --db "${bob_db}"
   wait_for_socket "${bob_db}" 30
   run_topo_retry 5 --db "${bob_db}" accept \
     "${invite_link}" \
@@ -1141,7 +1158,7 @@ run_large_delta_proxy() {
   LOW_MEM_WAL_CAP_MIB="${WAL_CAP_MIB}" \
   LOW_MEM_MEMTRACE="${LOWMEM_MEMTRACE_ENABLED}" \
   LOW_MEM_MEMTRACE_FILE="${memtrace_log}" \
-  run_topo_retry 5 --db "${bob_db}" start >/dev/null
+  start_daemon --db "${bob_db}"
   wait_for_socket "${bob_db}" 30
 
   alice_pid="$(daemon_pid_for_db "${alice_db}")"

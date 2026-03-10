@@ -1401,15 +1401,14 @@ async fn reevaluate_runtime(
                     || m.contains("os error 10048")
                 // Windows WSAEADDRINUSE
                 {
-                    tracing::error!(
-                        "Runtime cannot start: port {} is already in use by another process. \
-                         Stop the other process or use --bind to choose a different port. \
-                         (error: {})",
+                    tracing::warn!(
+                        "Runtime bind failed (port {} in use), will retry on next evaluation. (error: {})",
                         bind.port(),
                         msg,
                     );
-                    // Non-retriable: return the error to stop the daemon.
-                    return Err(e);
+                    // Treat as retriable — the port may be transiently held
+                    // during a runtime restart (transport identity change).
+                    return Ok(());
                 } else if m.contains("permission denied") || m.contains("os error 13") {
                     tracing::error!(
                         "Runtime cannot start: permission denied binding to {}. \
