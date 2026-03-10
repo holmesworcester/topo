@@ -442,10 +442,7 @@ pub fn ensure_active_peer(db: &str, timeout: Duration) {
             let peers_stdout = String::from_utf8_lossy(&peers.stdout).to_string();
             if let Some(index) = first_peer_index(&peers_stdout) {
                 let use_peer = Command::new(bin())
-                    .arg("--db")
-                    .arg(db)
-                    .args(["tenant", "use"])
-                    .arg(index.to_string())
+                    .args(["--db", db, "tenant", "use", &index.to_string()])
                     .output()
                     .expect("failed to run tenant use");
                 if use_peer.status.success() {
@@ -1053,8 +1050,7 @@ pub fn use_tenant(db: &str, selector: &str) {
     let output = Command::new(bin())
         .arg("--db")
         .arg(db)
-        .args(["tenant", "use"])
-        .arg(selector)
+        .args(["tenant", "use", selector])
         .output()
         .expect("failed to run tenant use");
     assert!(
