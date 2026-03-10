@@ -204,7 +204,7 @@ Instead of providing lots of features for *parts* of the problem, it focuses on 
 
 ---
 
-# Walkthrough: Runtime Main Loop
+# Runtime Loop
 
 ```text
 CLI / RPC Control
