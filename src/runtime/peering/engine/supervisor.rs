@@ -34,9 +34,9 @@ use crate::transport::{
 use crate::tuning::shared_ingest_cap;
 
 use super::target_planner::{
-    bootstrap_dispatch_key, collect_all_bootstrap_targets, discovery_dispatch_key,
-    dispatch_bootstrap_target, dispatch_discovery_target, normalize_discovered_addr_for_local_bind,
-    PeerDispatcher,
+    bootstrap_dispatch_key, collect_all_bootstrap_targets, collect_all_observed_endpoint_targets,
+    discovery_dispatch_key, dispatch_bootstrap_target, dispatch_discovery_target,
+    normalize_discovered_addr_for_local_bind, PeerDispatcher,
 };
 
 const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
@@ -91,6 +91,7 @@ struct TenantDispatchContext {
 #[derive(Clone, Debug)]
 enum TargetIngressSource {
     Bootstrap { invite_event_id: String },
+    Observed { peer_id: String },
     Discovery { peer_id: String },
 }
 
@@ -507,6 +508,32 @@ async fn run_bootstrap_refresher(
             }
         }
 
+        match collect_all_observed_endpoint_targets(&db_path) {
+            Ok(targets) => {
+                warning_gate.clear();
+                for (tenant_id, peer_id, remote) in targets {
+                    if ingress_tx
+                        .send(TargetIngressEvent {
+                            tenant_id,
+                            remote,
+                            source: TargetIngressSource::Observed { peer_id },
+                        })
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e) => {
+                let message = format!("OBSERVED ENDPOINT REFRESH failed: {}", e);
+                if warning_gate.should_emit(message.clone())
+                    && should_emit_globally(format!("engine:{message}"))
+                {
+                    warn!("{}", message);
+                }
+            }
+        }
+
         tokio::select! {
             _ = shutdown.cancelled() => break,
             _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
@@ -587,7 +614,8 @@ async fn run_target_dispatcher(
             TargetIngressSource::Bootstrap { invite_event_id } => {
                 bootstrap_dispatch_key(&event.tenant_id, invite_event_id)
             }
-            TargetIngressSource::Discovery { peer_id } => {
+            TargetIngressSource::Observed { peer_id }
+            | TargetIngressSource::Discovery { peer_id } => {
                 discovery_dispatch_key(&event.tenant_id, peer_id)
             }
         };
@@ -599,7 +627,8 @@ async fn run_target_dispatcher(
                 invite_event_id,
                 event.remote,
             ),
-            TargetIngressSource::Discovery { peer_id } => {
+            TargetIngressSource::Observed { peer_id }
+            | TargetIngressSource::Discovery { peer_id } => {
                 dispatch_discovery_target(&mut dispatcher, &event.tenant_id, peer_id, event.remote)
             }
         };
@@ -655,7 +684,7 @@ async fn run_target_dispatcher(
                     }
                 }
             }
-            TargetIngressSource::Discovery { .. } => None,
+            TargetIngressSource::Observed { .. } | TargetIngressSource::Discovery { .. } => None,
         };
 
         let worker_cancel = shutdown.child_token();

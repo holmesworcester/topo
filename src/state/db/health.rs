@@ -64,6 +64,47 @@ pub fn record_endpoint_observation(
     Ok(())
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EndpointTarget {
+    pub via_peer_id: String,
+    pub origin_ip: String,
+    pub origin_port: u16,
+}
+
+/// Return the latest non-expired observed endpoint for each remote peer.
+pub fn list_live_endpoint_targets(
+    conn: &Connection,
+    recorded_by: &str,
+    now_ms: i64,
+) -> SqliteResult<Vec<EndpointTarget>> {
+    let mut stmt = conn.prepare(
+        "SELECT via_peer_id, origin_ip, origin_port
+         FROM peer_endpoint_observations
+         WHERE recorded_by = ?1
+           AND expires_at > ?2
+         ORDER BY via_peer_id ASC, observed_at DESC, rowid DESC",
+    )?;
+    let mut rows = stmt.query(params![recorded_by, now_ms])?;
+    let mut seen = std::collections::HashSet::new();
+    let mut out = Vec::new();
+    while let Some(row) = rows.next()? {
+        let via_peer_id: String = row.get(0)?;
+        if !seen.insert(via_peer_id.clone()) {
+            continue;
+        }
+        let origin_port: i64 = row.get(2)?;
+        if !(0..=u16::MAX as i64).contains(&origin_port) {
+            continue;
+        }
+        out.push(EndpointTarget {
+            via_peer_id,
+            origin_ip: row.get(1)?,
+            origin_port: origin_port as u16,
+        });
+    }
+    Ok(out)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -213,5 +254,81 @@ mod tests {
             )
             .unwrap();
         assert_eq!(expires_at, 5000 + 86400000);
+    }
+
+    #[test]
+    fn test_list_live_endpoint_targets_picks_latest_per_peer() {
+        let conn = setup();
+
+        conn.execute(
+            "INSERT INTO peer_endpoint_observations
+             (recorded_by, via_peer_id, origin_ip, origin_port, observed_at, expires_at)
+             VALUES ('me', 'peer1', '10.0.0.1', 4433, 1000, 999999999)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peer_endpoint_observations
+             (recorded_by, via_peer_id, origin_ip, origin_port, observed_at, expires_at)
+             VALUES ('me', 'peer1', '10.0.0.2', 4434, 2000, 999999999)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peer_endpoint_observations
+             (recorded_by, via_peer_id, origin_ip, origin_port, observed_at, expires_at)
+             VALUES ('me', 'peer2', '10.0.0.3', 4435, 1500, 999999999)",
+            [],
+        )
+        .unwrap();
+
+        let targets = list_live_endpoint_targets(&conn, "me", 5000).unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(
+            targets[0],
+            EndpointTarget {
+                via_peer_id: "peer1".to_string(),
+                origin_ip: "10.0.0.2".to_string(),
+                origin_port: 4434,
+            }
+        );
+        assert_eq!(
+            targets[1],
+            EndpointTarget {
+                via_peer_id: "peer2".to_string(),
+                origin_ip: "10.0.0.3".to_string(),
+                origin_port: 4435,
+            }
+        );
+    }
+
+    #[test]
+    fn test_list_live_endpoint_targets_filters_expired_rows() {
+        let conn = setup();
+
+        conn.execute(
+            "INSERT INTO peer_endpoint_observations
+             (recorded_by, via_peer_id, origin_ip, origin_port, observed_at, expires_at)
+             VALUES ('me', 'peer1', '10.0.0.1', 4433, 1000, 1500)",
+            [],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peer_endpoint_observations
+             (recorded_by, via_peer_id, origin_ip, origin_port, observed_at, expires_at)
+             VALUES ('me', 'peer2', '10.0.0.2', 4434, 1000, 999999999)",
+            [],
+        )
+        .unwrap();
+
+        let targets = list_live_endpoint_targets(&conn, "me", 2000).unwrap();
+        assert_eq!(
+            targets,
+            vec![EndpointTarget {
+                via_peer_id: "peer2".to_string(),
+                origin_ip: "10.0.0.2".to_string(),
+                origin_port: 4434,
+            }]
+        );
     }
 }
