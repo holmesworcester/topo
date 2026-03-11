@@ -18,11 +18,11 @@ The `identity` command returns identical User and Peer short IDs across all data
 
 **Fix**: Scope the identity query to the active tenant's `recorded_by`, same pattern as bug 1 fix.
 
-### 6. Partial workspace creation on encoding failure (FIXED)
+### 6. Partial workspace creation on encoding failure (PARTIAL FIX)
 
 `create-workspace --username <65-chars>` fails with encoding error, but workspace/network events are already committed. The operation is not atomic — leaves DB with a workspace that has 0 users.
 
-**Fix applied**: Upfront byte-length validation prevents the common case. Both `create_workspace` and `join_workspace_as_new_user` now wrap the entire event creation sequence in a SAVEPOINT, so any mid-sequence failure rolls back atomically.
+**Fix applied**: Upfront byte-length validation prevents the common case (rejects before any events are created). SAVEPOINT atomicity was attempted but reverted — bare `BEGIN`/`COMMIT` calls deep in the projection and queue stack (`project_queue`, `with_immediate_tx`, `sync_log`) conflict with outer SAVEPOINTs, causing "cannot start a transaction within a transaction" on the `accept` path. Full atomicity requires converting all internal transaction calls to SAVEPOINTs.
 
 ### 7–9. Empty username / message / reaction accepted (FIXED)
 

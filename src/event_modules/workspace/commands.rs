@@ -267,20 +267,7 @@ pub fn create_workspace(
         .into());
     }
 
-    // Wrap the entire creation sequence in a savepoint so partial failures
-    // roll back all events atomically (fixes bug #6).
-    db.execute_batch("SAVEPOINT create_workspace")?;
-    match create_workspace_inner(db, workspace_name, username, device_name) {
-        Ok(result) => {
-            db.execute_batch("RELEASE create_workspace")?;
-            Ok(result)
-        }
-        Err(e) => {
-            let _ = db.execute_batch("ROLLBACK TO create_workspace");
-            let _ = db.execute_batch("RELEASE create_workspace");
-            Err(e)
-        }
-    }
+    create_workspace_inner(db, workspace_name, username, device_name)
 }
 
 fn create_workspace_inner(
@@ -443,10 +430,7 @@ pub fn join_workspace_as_new_user(
         .into());
     }
 
-    // Wrap the entire join sequence in a savepoint so partial failures
-    // roll back all events atomically (fixes bug #6).
-    db.execute_batch("SAVEPOINT join_workspace")?;
-    match join_workspace_inner(
+    join_workspace_inner(
         db,
         recorded_by,
         invite_key,
@@ -455,17 +439,7 @@ pub fn join_workspace_as_new_user(
         username,
         device_name,
         peer_shared_key,
-    ) {
-        Ok(result) => {
-            db.execute_batch("RELEASE join_workspace")?;
-            Ok(result)
-        }
-        Err(e) => {
-            let _ = db.execute_batch("ROLLBACK TO join_workspace");
-            let _ = db.execute_batch("RELEASE join_workspace");
-            Err(e)
-        }
-    }
+    )
 }
 
 fn join_workspace_inner(
