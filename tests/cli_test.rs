@@ -5651,3 +5651,56 @@ fn test_cli_sub_watch_exits_on_tenant_switch() {
         }
     }
 }
+
+#[test]
+fn test_cli_sub_watch_drains_backlog_on_startup() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir.path().join("backlog.db").to_str().unwrap().to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    create_subscription(&db, "backlog-feed", "full");
+
+    // Send messages BEFORE starting watch — these form the backlog
+    send_message(&db, "backlog-one");
+    send_message(&db, "backlog-two");
+    send_message(&db, "backlog-three");
+    wait_for_sub_items(&db, "backlog-feed", "backlog-", 3, Duration::from_secs(5));
+
+    // Start watch — it should drain the backlog (cursor starts at 0)
+    let mut watch = Command::new(bin())
+        .args([
+            "--db", &db, "sub", "watch", "backlog-feed",
+            "--interval-ms", "100",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sub watch");
+
+    // Give watch time to drain backlog
+    std::thread::sleep(Duration::from_secs(2));
+
+    let _ = watch.kill();
+    let output = watch.wait_with_output().expect("wait for watch");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    // All three backlog messages must appear in output
+    assert!(
+        stdout.contains("backlog-one"),
+        "watch should drain backlog item 'backlog-one', got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("backlog-two"),
+        "watch should drain backlog item 'backlog-two', got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("backlog-three"),
+        "watch should drain backlog item 'backlog-three', got:\n{}",
+        stdout
+    );
+}

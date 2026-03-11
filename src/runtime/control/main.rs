@@ -1195,16 +1195,9 @@ fn run_sub_action(
             }
 
             eprintln!("Watching subscription {} (poll every {}ms, Ctrl-C to stop)", &sub_id[..sub_id.len().min(12)], interval_ms);
+            // Start from seq 0: drain any pending backlog first, then follow
+            // new items. This avoids silent data loss when --ack is used.
             let mut cursor: i64 = 0;
-            // Catch up: fetch current state to start from latest seq
-            if let Ok(state_data) = rpc_require_daemon(db, socket, RpcMethod::SubState { subscription_id: sub_id.clone() }) {
-                let next_seq = state_data["next_seq"].as_i64().unwrap_or(1);
-                if next_seq > 1 {
-                    // Start watching from where the feed currently ends
-                    cursor = next_seq - 1;
-                    eprintln!("Resuming from seq {}", cursor);
-                }
-            }
             let mut consecutive_not_found = 0u32;
             loop {
                 match rpc_require_daemon(
