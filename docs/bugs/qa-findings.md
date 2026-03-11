@@ -38,11 +38,13 @@ The `identity` command returns identical User and Peer short IDs across all data
 
 **Fix applied**: Renamed parameter help text from "Emoji" to "Reaction text". Arbitrary short strings are accepted by design.
 
-### 11. Daemon spontaneous death (intermittent)
+### 11. Daemon spontaneous death (intermittent, NOT REPRODUCED)
 
 Observed twice during same-DB multi-tenant testing. After some sequence of operations the daemon silently dies. Could not reliably reproduce.
 
-**Fix**: Needs repro first. Add a panic hook that logs to a file before exit so the cause is captured next time it happens.
+**Repro attempt**: Extensive stress testing across 3 peers (2 machines via tailscale), 350+ events, 90 concurrent triple-peer sends, 60 concurrent reactions, deletions, daemon kill/restart cycles, rapid send/view/react interleaving. No daemon death observed. May have been caused by the SAVEPOINT nesting bug (now reverted) or a transient OS-level issue.
+
+**Fix**: Low priority. Add a panic hook that logs to a file before exit so the cause is captured if it recurs.
 
 ### 12. Raw SQLite error exposed to user (FIXED)
 
