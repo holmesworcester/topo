@@ -4,12 +4,172 @@ use std::time::Duration;
 use topo::crypto::event_id_to_base64;
 use topo::db::open_connection;
 use topo::testutil::{
-    assert_eventually, noop_intro_spawner, test_ingest_fns, Peer, ScenarioHarness, SharedDbNode,
+    assert_eventually, create_dynamic_endpoint_for_peer, noop_intro_spawner, test_ingest_fns, Peer,
+    ScenarioHarness, SharedDbNode,
 };
 use topo::transport::{
     create_client_endpoint, create_server_endpoint, extract_spki_fingerprint,
     peer_identity_from_connection, AllowedPeers,
 };
+
+#[tokio::test]
+async fn test_bidirectional_connect_loops_do_not_deadlock_peer_session_gate() {
+    use std::thread;
+    use tokio_util::sync::CancellationToken;
+    use topo::db::transport_trust::import_cli_pins_to_sql;
+    use topo::peering::loops::{accept_loop, connect_loop_with_coordination_until_cancel};
+    use topo::sync::CoordinationManager;
+
+    let alice = Peer::new_with_identity("transport-bidir-alice");
+    let bob = Peer::new_with_identity("transport-bidir-bob");
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
+
+    {
+        let db = open_connection(&alice.db_path).expect("open alice db");
+        import_cli_pins_to_sql(
+            &db,
+            &alice.identity,
+            &AllowedPeers::from_fingerprints(vec![bob.spki_fingerprint()]),
+        )
+        .expect("seed alice trust");
+    }
+    {
+        let db = open_connection(&bob.db_path).expect("open bob db");
+        import_cli_pins_to_sql(
+            &db,
+            &bob.identity,
+            &AllowedPeers::from_fingerprints(vec![alice.spki_fingerprint()]),
+        )
+        .expect("seed bob trust");
+    }
+
+    let alice_accept_ep = create_dynamic_endpoint_for_peer(&alice);
+    let alice_accept_ep_guard = alice_accept_ep.clone();
+    let alice_connect_ep = create_dynamic_endpoint_for_peer(&alice);
+    let alice_connect_ep_guard = alice_connect_ep.clone();
+    let bob_accept_ep = create_dynamic_endpoint_for_peer(&bob);
+    let bob_accept_ep_guard = bob_accept_ep.clone();
+    let bob_connect_ep = create_dynamic_endpoint_for_peer(&bob);
+    let bob_connect_ep_guard = bob_connect_ep.clone();
+
+    let alice_addr = alice_accept_ep.local_addr().expect("alice listen addr");
+    let bob_addr = bob_accept_ep.local_addr().expect("bob listen addr");
+    let alice_cancel = CancellationToken::new();
+    let bob_cancel = CancellationToken::new();
+
+    let alice_accept_db = alice.db_path.clone();
+    let alice_accept_id = alice.identity.clone();
+    let alice_accept = thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let _ = accept_loop(
+                &alice_accept_db,
+                &alice_accept_id,
+                alice_accept_ep,
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await;
+        });
+    });
+
+    let bob_accept_db = bob.db_path.clone();
+    let bob_accept_id = bob.identity.clone();
+    let bob_accept = thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let _ = accept_loop(
+                &bob_accept_db,
+                &bob_accept_id,
+                bob_accept_ep,
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await;
+        });
+    });
+
+    let alice_connect_db = alice.db_path.clone();
+    let alice_connect_id = alice.identity.clone();
+    let alice_connect_cancel = alice_cancel.clone();
+    let alice_connect = thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let _ = connect_loop_with_coordination_until_cancel(
+                &alice_connect_db,
+                &alice_connect_id,
+                alice_connect_ep,
+                bob_addr,
+                None,
+                noop_intro_spawner,
+                test_ingest_fns(),
+                std::sync::Arc::new(CoordinationManager::new()),
+                alice_connect_cancel,
+            )
+            .await;
+        });
+    });
+
+    let bob_connect_db = bob.db_path.clone();
+    let bob_connect_id = bob.identity.clone();
+    let bob_connect_cancel = bob_cancel.clone();
+    let bob_connect = thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let _ = connect_loop_with_coordination_until_cancel(
+                &bob_connect_db,
+                &bob_connect_id,
+                bob_connect_ep,
+                alice_addr,
+                None,
+                noop_intro_spawner,
+                test_ingest_fns(),
+                std::sync::Arc::new(CoordinationManager::new()),
+                bob_connect_cancel,
+            )
+            .await;
+        });
+    });
+
+    tokio::time::sleep(Duration::from_millis(750)).await;
+
+    let alice_marker = alice.create_message("bidirectional-connect-regression");
+    let alice_marker_b64 = event_id_to_base64(&alice_marker);
+    assert_eventually(
+        || bob.has_event(&alice_marker_b64),
+        Duration::from_secs(8),
+        "bidirectional connect loops should deliver fresh events without a 30s session deadlock",
+    )
+    .await;
+
+    alice_cancel.cancel();
+    bob_cancel.cancel();
+    alice_accept_ep_guard.close(0u32.into(), b"test shutdown");
+    alice_connect_ep_guard.close(0u32.into(), b"test shutdown");
+    bob_accept_ep_guard.close(0u32.into(), b"test shutdown");
+    bob_connect_ep_guard.close(0u32.into(), b"test shutdown");
+
+    alice_accept.join().expect("join alice accept");
+    bob_accept.join().expect("join bob accept");
+    alice_connect.join().expect("join alice connect");
+    bob_connect.join().expect("join bob connect");
+
+    harness.finish();
+}
 
 /// STATIC PINNING (intentional): this test validates TLS identity extraction
 /// mechanics, not transport trust resolution. Static AllowedPeers is the

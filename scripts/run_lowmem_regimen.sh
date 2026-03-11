@@ -5,6 +5,8 @@ set -euo pipefail
 #
 # Runs realistic low-memory checks with one daemon process per peer and
 # evaluates per-peer peak RSS (VmHWM), not process-shared in-test memory.
+# For realism, the sender stays in normal mode and only the receiver runs
+# with LOW_MEM_IOS enabled.
 #
 # Usage:
 #   scripts/run_lowmem_regimen.sh              # smoke only (10k total)
@@ -37,10 +39,8 @@ SMOKE_EVENTS_PER_PEER="${LOW_MEM_IOS_SMOKE_EVENTS_PER_PEER:-5000}"
 SMOKE_BUDGET_MIB="${LOW_MEM_IOS_BUDGET_MIB:-24}"
 SOAK_EVENTS="${LOW_MEM_IOS_SOAK_EVENTS:-100000}"
 SOAK_BUDGET_MIB="${LOW_MEM_IOS_SOAK_BUDGET_MIB:-24}"
-
-export LOW_MEM_IOS=1
-export LOW_MEM_IOS_SOAK_EVENTS="${SOAK_EVENTS}"
-export LOW_MEM_IOS_SOAK_BUDGET_MIB="${SOAK_BUDGET_MIB}"
+WAL_CAP_MIB="${LOW_MEM_WAL_CAP_MIB:-12}"
+PREFLIGHT_EVENTS="${LOW_MEM_IOS_PREFLIGHT_EVENTS:-1000}"
 
 mkdir -p "${RUN_ROOT}" "${TMPDIR}"
 
@@ -78,9 +78,36 @@ run_topo() {
   timeout "${TOPO_CMD_TIMEOUT_SECS}" "${TOPO_BIN}" "$@"
 }
 
+start_daemon() {
+  local db="$1"
+  "${TOPO_BIN}" --db "${db}" start --bind 127.0.0.1:0 >/dev/null 2>&1 &
+}
+
+restart_receiver_lowmem() {
+  local db="$1"
+  stop_db_daemon "${db}"
+  LOW_MEM_IOS=1 \
+  LOW_MEM_WAL_CAP_MIB="${WAL_CAP_MIB}" \
+  start_daemon "${db}"
+  wait_for_socket "${db}" 30
+}
+
 stop_db_daemon() {
   local db="$1"
   run_topo --db "${db}" stop >/dev/null 2>&1 || true
+  local deadline=$(( $(date +%s) + 20 ))
+  while true; do
+    local pids
+    pids="$(ps -eo pid=,args= | awk -v db="${db}" 'index($0, "--db " db " start") {print $1}')"
+    if [ -z "${pids}" ]; then
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "${deadline}" ]; then
+      kill ${pids} >/dev/null 2>&1 || true
+      return 0
+    fi
+    sleep 0.2
+  done
 }
 
 cleanup() {
@@ -157,12 +184,13 @@ setup_two_peer_workspace() {
   local bob_db="${run_dir}/bob.db"
   local invite_out invite_link addr
 
+  TRACKED_DBS+=("${alice_db}")
+  start_daemon "${alice_db}"
+  wait_for_socket "${alice_db}" 30
   run_topo --db "${alice_db}" create-workspace \
     --workspace-name "lowmem" \
     --username "alice" \
     --device-name "alice-dev" >/dev/null
-  TRACKED_DBS+=("${alice_db}")
-  wait_for_socket "${alice_db}" 30
 
   addr="$(read_listen_addr "${alice_db}")"
   if [ -z "${addr}" ]; then
@@ -173,18 +201,19 @@ setup_two_peer_workspace() {
   invite_out="$(
     run_topo --db "${alice_db}" invite --public-addr "${addr}"
   )"
-  invite_link="$(printf '%s\n' "${invite_out}" | awk '/^quiet:\/\/invite\// {print; exit}')"
+  invite_link="$(printf '%s\n' "${invite_out}" | awk '/^(quiet|topo):\/\/invite\// {print; exit}')"
   if [ -z "${invite_link}" ]; then
     echo "error: invite did not emit invite link" >&2
     return 1
   fi
 
+  TRACKED_DBS+=("${bob_db}")
+  start_daemon "${bob_db}"
+  wait_for_socket "${bob_db}" 30
   run_topo --db "${bob_db}" accept \
     "${invite_link}" \
     --username "bob" \
     --devicename "bob-dev" >/dev/null
-  TRACKED_DBS+=("${bob_db}")
-  wait_for_socket "${bob_db}" 30
 
   local alice_pid bob_pid
   alice_pid="$(daemon_pid_for_db "${alice_db}")"
@@ -213,37 +242,48 @@ scenario_smoke_two_daemons() {
 
   local total_messages
   total_messages=$((SMOKE_EVENTS_PER_PEER * 2))
+  local final_messages=$((PREFLIGHT_EVENTS + total_messages))
   local timeout_ms
-  timeout_ms=$(( (total_messages / 1000) * 6000 ))
+  timeout_ms=$(( (final_messages / 1000) * 6000 ))
   if [ "${timeout_ms}" -lt 120000 ]; then
     timeout_ms=120000
   fi
 
-  run_topo --db "${alice_db}" generate --count "${SMOKE_EVENTS_PER_PEER}" >/dev/null
-  run_topo --db "${bob_db}" generate --count "${SMOKE_EVENTS_PER_PEER}" >/dev/null
+  if [ "${PREFLIGHT_EVENTS}" -gt 0 ]; then
+    run_topo --db "${alice_db}" generate --count "${PREFLIGHT_EVENTS}" >/dev/null
+    run_topo --db "${alice_db}" assert-eventually "message_count >= ${PREFLIGHT_EVENTS}" \
+      --timeout-ms "${timeout_ms}" --interval-ms 200 >/dev/null
+    run_topo --db "${bob_db}" assert-eventually "message_count >= ${PREFLIGHT_EVENTS}" \
+      --timeout-ms "${timeout_ms}" --interval-ms 200 >/dev/null
+  fi
 
-  run_topo --db "${alice_db}" assert-eventually "message_count >= ${total_messages}" \
+  restart_receiver_lowmem "${bob_db}"
+  bob_pid="$(daemon_pid_for_db "${bob_db}")"
+  if [ -z "${bob_pid}" ]; then
+    echo "error: failed to resolve restarted bob pid" >&2
+    return 1
+  fi
+
+  run_topo --db "${alice_db}" generate --count "${total_messages}" >/dev/null
+
+  run_topo --db "${alice_db}" assert-eventually "message_count >= ${final_messages}" \
     --timeout-ms "${timeout_ms}" --interval-ms 200 >/dev/null
-  run_topo --db "${bob_db}" assert-eventually "message_count >= ${total_messages}" \
+  run_topo --db "${bob_db}" assert-eventually "message_count >= ${final_messages}" \
     --timeout-ms "${timeout_ms}" --interval-ms 200 >/dev/null
 
   local alice_peak bob_peak
   alice_peak="$(peak_rss_mib_for_pid "${alice_pid}")"
   bob_peak="$(peak_rss_mib_for_pid "${bob_pid}")"
 
-  echo "[lowmem-smoke] events_per_peer=${SMOKE_EVENTS_PER_PEER} total=${total_messages}"
-  echo "[lowmem-smoke] alice pid=${alice_pid} peak_rss=${alice_peak} MiB budget=${SMOKE_BUDGET_MIB} MiB"
-  echo "[lowmem-smoke] bob   pid=${bob_pid} peak_rss=${bob_peak} MiB budget=${SMOKE_BUDGET_MIB} MiB"
+  echo "[lowmem-smoke] preflight_events=${PREFLIGHT_EVENTS} sender_events=${total_messages} total=${final_messages}"
+  echo "[lowmem-smoke] alice(normal) pid=${alice_pid} peak_rss=${alice_peak} MiB budget=${SMOKE_BUDGET_MIB} MiB"
+  echo "[lowmem-smoke] bob(lowmem)   pid=${bob_pid} peak_rss=${bob_peak} MiB budget=${SMOKE_BUDGET_MIB} MiB"
 
   stop_db_daemon "${alice_db}"
   stop_db_daemon "${bob_db}"
 
-  if ! mib_leq "${alice_peak}" "${SMOKE_BUDGET_MIB}"; then
-    echo "low_mem smoke budget exceeded for alice: ${alice_peak} MiB > ${SMOKE_BUDGET_MIB} MiB" >&2
-    return 1
-  fi
   if ! mib_leq "${bob_peak}" "${SMOKE_BUDGET_MIB}"; then
-    echo "low_mem smoke budget exceeded for bob: ${bob_peak} MiB > ${SMOKE_BUDGET_MIB} MiB" >&2
+    echo "low_mem smoke budget exceeded for bob (receiver): ${bob_peak} MiB > ${SMOKE_BUDGET_MIB} MiB" >&2
     return 1
   fi
 }
@@ -258,37 +298,49 @@ scenario_soak_two_daemons() {
   local bob_db="${SETUP_BOB_DB}"
   local alice_pid="${SETUP_ALICE_PID}"
   local bob_pid="${SETUP_BOB_PID}"
+  local final_messages=$((PREFLIGHT_EVENTS + SOAK_EVENTS))
 
   local timeout_ms
-  timeout_ms=$(( (SOAK_EVENTS / 1000) * 6000 ))
+  timeout_ms=$(( (final_messages / 1000) * 6000 ))
   if [ "${timeout_ms}" -lt 300000 ]; then
     timeout_ms=300000
   fi
 
+  if [ "${PREFLIGHT_EVENTS}" -gt 0 ]; then
+    run_topo --db "${alice_db}" generate --count "${PREFLIGHT_EVENTS}" >/dev/null
+    run_topo --db "${alice_db}" assert-eventually "message_count >= ${PREFLIGHT_EVENTS}" \
+      --timeout-ms "${timeout_ms}" --interval-ms 200 >/dev/null
+    run_topo --db "${bob_db}" assert-eventually "message_count >= ${PREFLIGHT_EVENTS}" \
+      --timeout-ms "${timeout_ms}" --interval-ms 200 >/dev/null
+  fi
+
+  restart_receiver_lowmem "${bob_db}"
+  bob_pid="$(daemon_pid_for_db "${bob_db}")"
+  if [ -z "${bob_pid}" ]; then
+    echo "error: failed to resolve restarted bob pid" >&2
+    return 1
+  fi
+
   run_topo --db "${alice_db}" generate --count "${SOAK_EVENTS}" >/dev/null
 
-  run_topo --db "${alice_db}" assert-eventually "message_count >= ${SOAK_EVENTS}" \
+  run_topo --db "${alice_db}" assert-eventually "message_count >= ${final_messages}" \
     --timeout-ms "${timeout_ms}" --interval-ms 200 >/dev/null
-  run_topo --db "${bob_db}" assert-eventually "message_count >= ${SOAK_EVENTS}" \
+  run_topo --db "${bob_db}" assert-eventually "message_count >= ${final_messages}" \
     --timeout-ms "${timeout_ms}" --interval-ms 200 >/dev/null
 
   local alice_peak bob_peak
   alice_peak="$(peak_rss_mib_for_pid "${alice_pid}")"
   bob_peak="$(peak_rss_mib_for_pid "${bob_pid}")"
 
-  echo "[lowmem-soak] events=${SOAK_EVENTS}"
-  echo "[lowmem-soak] alice pid=${alice_pid} peak_rss=${alice_peak} MiB budget=${SOAK_BUDGET_MIB} MiB"
-  echo "[lowmem-soak] bob   pid=${bob_pid} peak_rss=${bob_peak} MiB budget=${SOAK_BUDGET_MIB} MiB"
+  echo "[lowmem-soak] preflight_events=${PREFLIGHT_EVENTS} sender_events=${SOAK_EVENTS} total=${final_messages}"
+  echo "[lowmem-soak] alice(normal) pid=${alice_pid} peak_rss=${alice_peak} MiB budget=${SOAK_BUDGET_MIB} MiB"
+  echo "[lowmem-soak] bob(lowmem)   pid=${bob_pid} peak_rss=${bob_peak} MiB budget=${SOAK_BUDGET_MIB} MiB"
 
   stop_db_daemon "${alice_db}"
   stop_db_daemon "${bob_db}"
 
-  if ! mib_leq "${alice_peak}" "${SOAK_BUDGET_MIB}"; then
-    echo "low_mem soak budget exceeded for alice: ${alice_peak} MiB > ${SOAK_BUDGET_MIB} MiB" >&2
-    return 1
-  fi
   if ! mib_leq "${bob_peak}" "${SOAK_BUDGET_MIB}"; then
-    echo "low_mem soak budget exceeded for bob: ${bob_peak} MiB > ${SOAK_BUDGET_MIB} MiB" >&2
+    echo "low_mem soak budget exceeded for bob (receiver): ${bob_peak} MiB > ${SOAK_BUDGET_MIB} MiB" >&2
     return 1
   fi
 }
@@ -304,11 +356,12 @@ build_release_binary() {
 banner "Low-Memory Regimen - mode: ${MODE}"
 echo
 echo "  TOPO_BIN=${TOPO_BIN}"
-echo "  LOW_MEM_IOS=1"
 echo "  LOW_MEM_IOS_SMOKE_EVENTS_PER_PEER=${SMOKE_EVENTS_PER_PEER}"
 echo "  LOW_MEM_IOS_BUDGET_MIB=${SMOKE_BUDGET_MIB}"
 echo "  LOW_MEM_IOS_SOAK_EVENTS=${SOAK_EVENTS}"
 echo "  LOW_MEM_IOS_SOAK_BUDGET_MIB=${SOAK_BUDGET_MIB}"
+echo "  LOW_MEM_WAL_CAP_MIB=${WAL_CAP_MIB}"
+echo "  LOW_MEM_IOS_PREFLIGHT_EVENTS=${PREFLIGHT_EVENTS}"
 echo "  TOPO_CMD_TIMEOUT_SECS=${TOPO_CMD_TIMEOUT_SECS}"
 echo "  RUN_ROOT=${RUN_ROOT}"
 echo "  TMPDIR=${TMPDIR}"

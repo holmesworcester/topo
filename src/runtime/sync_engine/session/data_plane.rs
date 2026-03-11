@@ -13,7 +13,7 @@ use tokio::sync::{mpsc, oneshot};
 use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::IngestItem;
-use crate::crypto::{hash_event, EventId};
+use crate::crypto::{event_id_to_base64, hash_event, EventId};
 use crate::db::{egress_queue::EgressQueue, store::Store};
 use crate::protocol::Frame;
 use crate::runtime::memtrace;
@@ -22,7 +22,7 @@ use crate::transport::{StreamRecv, StreamSend};
 use crate::tuning::low_mem_memtrace;
 
 use super::logging::SyncRunRxCapture;
-use super::{egress_claim_count, enqueue_batch, have_chunk};
+use super::{egress_claim_count, enqueue_batch, have_chunk, DATA_SEND_STALL_TIMEOUT};
 
 pub struct DataPlaneSendStats {
     pub events_sent_delta: u64,
@@ -35,27 +35,40 @@ fn should_capture_rx_event_link(blob: &[u8]) -> bool {
 }
 
 pub fn enqueue_pending_have_to_egress(
+    session_id: u64,
     egress: &EgressQueue<'_>,
     peer_id: &str,
     pending_have: &mut Vec<EventId>,
-) {
+) -> Result<usize, rusqlite::Error> {
     if pending_have.is_empty() {
-        return;
+        return Ok(0);
     }
 
     let drain_count = pending_have.len().min(enqueue_batch());
     let to_enqueue: Vec<EventId> = pending_have.drain(..drain_count).collect();
+    let mut inserted = 0usize;
     for chunk in to_enqueue.chunks(have_chunk()) {
-        let _ = egress.enqueue_events(peer_id, chunk);
+        inserted += egress.enqueue_events(peer_id, chunk)?;
     }
+    if inserted > 0 {
+        info!(
+            "Session {} queued {} data events for peer={} (remaining_pending_have={})",
+            session_id,
+            inserted,
+            peer_id,
+            pending_have.len()
+        );
+    }
+    Ok(inserted)
 }
 
 pub async fn drain_egress_to_data_stream<S>(
+    session_id: u64,
     egress: &EgressQueue<'_>,
     store: &Store<'_>,
     peer_id: &str,
     data_send: &mut S,
-) -> DataPlaneSendStats
+) -> Result<DataPlaneSendStats, Box<dyn std::error::Error + Send + Sync>>
 where
     S: StreamSend,
 {
@@ -65,9 +78,7 @@ where
     let mut blocked = false;
 
     while !blocked {
-        let batch = egress
-            .claim_batch(peer_id, egress_claim_count())
-            .unwrap_or_default();
+        let batch = egress.claim_batch(peer_id, egress_claim_count())?;
         if batch.is_empty() {
             break;
         }
@@ -77,14 +88,40 @@ where
         for (rowid, event_id) in batch {
             if let Ok(Some(blob)) = store.get_shared(&event_id) {
                 let blob_len = blob.len() as u64;
-                if data_send.send(&Frame::Event { blob }).await.is_ok() {
-                    events_sent_delta += 1;
-                    bytes_sent_delta += blob_len;
-                    sent_any = true;
-                    sent_rowids.push(rowid);
-                } else {
-                    blocked = true;
-                    break;
+                match tokio::time::timeout(
+                    DATA_SEND_STALL_TIMEOUT,
+                    data_send.send(&Frame::Event { blob }),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        events_sent_delta += 1;
+                        bytes_sent_delta += blob_len;
+                        sent_any = true;
+                        sent_rowids.push(rowid);
+                    }
+                    Ok(Err(err)) => {
+                        warn!(
+                            "Session {} data send failed peer={} event={} error={}",
+                            session_id,
+                            peer_id,
+                            event_id_to_base64(&event_id),
+                            err
+                        );
+                        blocked = true;
+                        break;
+                    }
+                    Err(_) => {
+                        warn!(
+                            "Session {} data send stalled peer={} event={} timeout_ms={}",
+                            session_id,
+                            peer_id,
+                            event_id_to_base64(&event_id),
+                            DATA_SEND_STALL_TIMEOUT.as_millis()
+                        );
+                        blocked = true;
+                        break;
+                    }
                 }
             } else {
                 missing_count += 1;
@@ -92,19 +129,34 @@ where
             }
         }
         if missing_count > 0 {
-            tracing::debug!("{} events missing from store (not shared?)", missing_count);
+            warn!(
+                "Session {} dropped {} queued data events missing from shared store peer={}",
+                session_id, missing_count, peer_id
+            );
         }
-        let _ = egress.mark_sent(&sent_rowids);
+        egress.mark_sent(&sent_rowids)?;
     }
 
     if sent_any {
-        let _ = data_send.flush().await;
+        match tokio::time::timeout(DATA_SEND_STALL_TIMEOUT, data_send.flush()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => warn!(
+                "Session {} data flush failed peer={} error={}",
+                session_id, peer_id, err
+            ),
+            Err(_) => warn!(
+                "Session {} data flush stalled peer={} timeout_ms={}",
+                session_id,
+                peer_id,
+                DATA_SEND_STALL_TIMEOUT.as_millis()
+            ),
+        }
     }
 
-    DataPlaneSendStats {
+    Ok(DataPlaneSendStats {
         events_sent_delta,
         bytes_sent_delta,
-    }
+    })
 }
 
 pub async fn send_data_done<S>(data_send: &mut S) -> Result<(), ConnectionError>
@@ -127,7 +179,6 @@ where
 pub fn spawn_data_receiver<R>(
     mut data_recv: R,
     ingest_tx: mpsc::Sender<IngestItem>,
-    events_received: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
     recorded_by: String,
     source_tag: String,
@@ -158,7 +209,6 @@ where
                 msg = data_recv.recv() => {
                     match msg {
                         Ok(Frame::Event { blob }) => {
-                            events_received.fetch_add(1, Ordering::Relaxed);
                             bytes_received.fetch_add(blob.len() as u64, Ordering::Relaxed);
                             max_blob_size = max_blob_size.max(blob.len());
                             let event_id = hash_event(&blob);
@@ -219,17 +269,46 @@ where
 
 #[cfg(test)]
 mod tests {
-    use std::collections::VecDeque;
-    use std::sync::atomic::AtomicU64;
-    use std::sync::Arc;
-
-    use async_trait::async_trait;
-    use tokio::sync::mpsc;
-
-    use super::should_capture_rx_event_link;
-    use super::spawn_data_receiver;
+    use super::{drain_egress_to_data_stream, should_capture_rx_event_link};
+    use crate::crypto::hash_event;
+    use crate::db::{
+        egress_queue::EgressQueue, open_connection, schema::create_tables, store::insert_event,
+        store::Store,
+    };
+    use crate::event_modules::ShareScope;
     use crate::protocol::Frame;
-    use crate::transport::connection::{ConnectionError, StreamRecv};
+    use crate::transport::connection::ConnectionError;
+    use crate::transport::StreamSend;
+    use async_trait::async_trait;
+    use rusqlite::Connection;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    #[derive(Clone, Default)]
+    struct RecordingSend {
+        frames: Arc<Mutex<Vec<Frame>>>,
+    }
+
+    #[async_trait]
+    impl StreamSend for RecordingSend {
+        async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
+            self.frames.lock().unwrap().push(msg.clone());
+            Ok(())
+        }
+
+        async fn flush(&mut self) -> Result<(), ConnectionError> {
+            Ok(())
+        }
+    }
+
+    fn setup_file_db() -> (tempfile::TempDir, std::path::PathBuf, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("data-plane.db");
+        let conn = open_connection(&path).unwrap();
+        conn.busy_timeout(Duration::from_millis(20)).unwrap();
+        create_tables(&conn).unwrap();
+        (dir, path, conn)
+    }
 
     #[test]
     fn should_capture_only_file_slice_events() {
@@ -251,51 +330,60 @@ mod tests {
         assert!(!should_capture_rx_event_link(&[]));
     }
 
-    struct FakeRecv {
-        frames: VecDeque<Frame>,
-    }
-
-    #[async_trait]
-    impl StreamRecv for FakeRecv {
-        async fn recv(&mut self) -> Result<Frame, ConnectionError> {
-            self.frames.pop_front().ok_or(ConnectionError::Closed)
-        }
-    }
-
     #[tokio::test]
-    async fn data_receiver_counts_received_events() {
-        let blob = vec![crate::event_modules::EVENT_TYPE_FILE_SLICE, 7, 9];
-        let (ingest_tx, mut ingest_rx) = mpsc::channel(4);
-        let events_received = Arc::new(AtomicU64::new(0));
-        let bytes_received = Arc::new(AtomicU64::new(0));
-        let recv = FakeRecv {
-            frames: VecDeque::from(vec![Frame::Event { blob: blob.clone() }, Frame::DataDone]),
-        };
+    async fn drain_egress_to_data_stream_retries_transient_mark_sent_busy() {
+        let (_dir, path, conn) = setup_file_db();
+        let blob = b"hello busy retry".to_vec();
+        let event_id = hash_event(&blob);
+        let now_ms = 1_700_000_000_000i64;
 
-        let (_shutdown_tx, data_done_rx, handle) = spawn_data_receiver(
-            recv,
-            ingest_tx,
-            events_received.clone(),
-            bytes_received.clone(),
-            "peer1".to_string(),
-            "sync:test".to_string(),
-            None,
-        );
+        insert_event(
+            &conn,
+            &event_id,
+            "message",
+            &blob,
+            ShareScope::Shared,
+            now_ms,
+            now_ms,
+        )
+        .unwrap();
+        let egress = EgressQueue::new(&conn);
+        egress.enqueue_events("peer-a", &[event_id]).unwrap();
+        drop(conn);
 
-        data_done_rx.await.expect("data done");
-        let (_, received_blob, recorded_by, source_tag) = ingest_rx.recv().await.expect("ingest");
-        handle.await.expect("receiver task");
+        let path_for_lock = path.clone();
+        let (lock_ready_tx, lock_ready_rx) = std::sync::mpsc::channel();
+        let lock_thread = std::thread::spawn(move || {
+            let lock_conn = open_connection(&path_for_lock).unwrap();
+            lock_conn.busy_timeout(Duration::from_millis(20)).unwrap();
+            lock_conn.execute("BEGIN IMMEDIATE", []).unwrap();
+            lock_ready_tx.send(()).unwrap();
+            std::thread::sleep(Duration::from_millis(80));
+            lock_conn.execute("COMMIT", []).unwrap();
+        });
+        lock_ready_rx.recv().unwrap();
 
-        assert_eq!(received_blob, blob);
-        assert_eq!(recorded_by, "peer1");
-        assert_eq!(source_tag, "sync:test");
+        let path_for_task = path.clone();
+        let sender = RecordingSend::default();
+        let sender_state = sender.frames.clone();
+        let conn = open_connection(&path_for_task).unwrap();
+        conn.busy_timeout(Duration::from_millis(20)).unwrap();
+        let egress = EgressQueue::new(&conn);
+        let store = Store::new(&conn);
+        let mut send = sender;
+        let stats = drain_egress_to_data_stream(77, &egress, &store, "peer-a", &mut send)
+            .await
+            .unwrap();
+        lock_thread.join().unwrap();
+        assert_eq!(stats.events_sent_delta, 1);
         assert_eq!(
-            events_received.load(std::sync::atomic::Ordering::Relaxed),
-            1
+            sender_state.lock().unwrap().as_slice(),
+            &[Frame::Event { blob }]
         );
-        assert_eq!(
-            bytes_received.load(std::sync::atomic::Ordering::Relaxed),
-            blob.len() as u64
-        );
+
+        let verify = open_connection(&path).unwrap();
+        verify.busy_timeout(Duration::from_millis(20)).unwrap();
+        let egress = EgressQueue::new(&verify);
+        assert_eq!(egress.count_pending("peer-a").unwrap(), 0);
     }
 }

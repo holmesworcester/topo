@@ -1,12 +1,12 @@
 //! Unified dial-target planning: the single owner of "what should we connect to."
 //!
-//! Both bootstrap trust autodial and mDNS discovery route their targets through
+//! Both bootstrap trust autodial and known-peer reconnect routes through
 //! this module. It owns:
 //!
 //! - **Bootstrap target collection**: polls SQL invite_bootstrap_trust rows
 //!   (materialized by InviteAccepted projection) and yields dial targets.
-//! - **Observed target collection**: reuses non-expired peer endpoint
-//!   observations learned from prior successful sessions.
+//! - **Observed endpoint collection**: polls projected peers + fresh endpoint
+//!   observations so known peers remain dialable after bootstrap supersession.
 //! - **Discovery dispatch**: deduplicates mDNS-discovered peers and computes
 //!   connect/reconnect/skip actions (`PeerDispatcher`).
 //! - **Dispatch-key helpers**: deterministic keying for bootstrap + discovery
@@ -16,11 +16,11 @@
 //! one module is the source of truth for dial target planning.
 
 use std::collections::{HashMap, HashSet};
-use std::net::{IpAddr, SocketAddr};
+use std::net::SocketAddr;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use tracing::warn;
 
-use crate::db::health::list_live_endpoint_targets;
 use crate::db::open_connection;
 use crate::db::transport_creds::discover_local_tenants;
 use crate::db::transport_trust::list_active_invite_bootstrap_targets;
@@ -100,8 +100,12 @@ pub(crate) fn bootstrap_dispatch_key(tenant_id: &str, invite_event_id: &str) -> 
     format!("{}@bootstrap:{}", tenant_id, invite_event_id)
 }
 
+pub(crate) fn known_peer_dispatch_key(tenant_id: &str, peer_id: &str) -> String {
+    format!("{}@peer:{}", tenant_id, peer_id)
+}
+
 pub(crate) fn discovery_dispatch_key(tenant_id: &str, peer_id: &str) -> String {
-    format!("{}@mdns:{}", tenant_id, peer_id)
+    known_peer_dispatch_key(tenant_id, peer_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -140,42 +144,6 @@ pub(crate) fn load_bootstrap_targets(
     Ok(out)
 }
 
-/// Load dial targets from non-expired observed peer endpoints.
-pub(crate) fn load_observed_endpoint_targets(
-    db_path: &str,
-    tenant_ids: &[String],
-) -> Result<Vec<(String, String, SocketAddr)>, Box<dyn std::error::Error + Send + Sync>> {
-    let db = open_connection(db_path)?;
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis() as i64;
-    let mut seen: HashSet<(String, String, SocketAddr)> = HashSet::new();
-    let mut out = Vec::new();
-    for tenant_id in tenant_ids {
-        for target in list_live_endpoint_targets(&db, tenant_id, now_ms)? {
-            let ip = match target.origin_ip.parse::<IpAddr>() {
-                Ok(ip) => ip,
-                Err(e) => {
-                    warn!(
-                        "Skipping invalid observed endpoint '{}' for tenant {} peer {}: {}",
-                        target.origin_ip,
-                        &tenant_id[..16.min(tenant_id.len())],
-                        &target.via_peer_id[..16.min(target.via_peer_id.len())],
-                        e
-                    );
-                    continue;
-                }
-            };
-            let remote = SocketAddr::new(ip, target.origin_port);
-            let key = (tenant_id.clone(), target.via_peer_id, remote);
-            if seen.insert(key.clone()) {
-                out.push(key);
-            }
-        }
-    }
-    Ok(out)
-}
-
 /// Collect all bootstrap autodial targets across all local tenants.
 pub(crate) fn collect_all_bootstrap_targets(
     db_path: &str,
@@ -191,7 +159,80 @@ pub(crate) fn collect_all_bootstrap_targets(
     load_bootstrap_targets(db_path, &tenant_ids)
 }
 
-/// Collect all observed endpoint dial targets across all local tenants.
+/// Load steady-state reconnect targets from projected peers with fresh endpoint
+/// observations.
+pub(crate) fn load_observed_endpoint_targets(
+    db_path: &str,
+    tenant_ids: &[String],
+) -> Result<Vec<(String, String, SocketAddr)>, Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
+    let mut seen: HashSet<(String, String, SocketAddr)> = HashSet::new();
+    let mut out = Vec::new();
+
+    let mut stmt = db.prepare(
+        "SELECT
+             lower(hex(ps.transport_fingerprint)) AS peer_id,
+             (
+                 SELECT e.origin_ip
+                 FROM peer_endpoint_observations e
+                 WHERE e.recorded_by = ps.recorded_by
+                   AND e.via_peer_id = lower(hex(ps.transport_fingerprint))
+                   AND e.expires_at > ?2
+                 ORDER BY e.observed_at DESC, e.rowid DESC
+                 LIMIT 1
+             ) AS origin_ip,
+             (
+                 SELECT e.origin_port
+                 FROM peer_endpoint_observations e
+                 WHERE e.recorded_by = ps.recorded_by
+                   AND e.via_peer_id = lower(hex(ps.transport_fingerprint))
+                   AND e.expires_at > ?2
+                 ORDER BY e.observed_at DESC, e.rowid DESC
+                 LIMIT 1
+             ) AS origin_port
+         FROM peers_shared ps
+         WHERE ps.recorded_by = ?1
+           AND length(ps.transport_fingerprint) = 32
+           AND NOT EXISTS(
+               SELECT 1
+               FROM local_transport_creds c
+               WHERE c.peer_id = lower(hex(ps.transport_fingerprint))
+           )
+           AND EXISTS(
+               SELECT 1
+               FROM peer_endpoint_observations e
+               WHERE e.recorded_by = ps.recorded_by
+                 AND e.via_peer_id = lower(hex(ps.transport_fingerprint))
+                 AND e.expires_at > ?2
+           )
+         ORDER BY peer_id",
+    )?;
+
+    for tenant_id in tenant_ids {
+        let rows = stmt.query_map(rusqlite::params![tenant_id, now_ms], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)? as u16,
+            ))
+        })?;
+
+        for row in rows {
+            let (peer_id, origin_ip, origin_port) = row?;
+            let ip: std::net::IpAddr = origin_ip.parse()?;
+            let remote = SocketAddr::new(ip, origin_port);
+            let key = (tenant_id.clone(), peer_id, remote);
+            if seen.insert(key.clone()) {
+                out.push(key);
+            }
+        }
+    }
+
+    Ok(out)
+}
+
+/// Collect all observed-endpoint reconnect targets across all local tenants.
 pub(crate) fn collect_all_observed_endpoint_targets(
     db_path: &str,
 ) -> Result<Vec<(String, String, SocketAddr)>, Box<dyn std::error::Error + Send + Sync>> {
@@ -229,23 +270,46 @@ pub(crate) fn dispatch_bootstrap_target(
     )
 }
 
+/// Dispatch a known-peer dial target through `PeerDispatcher`.
+///
+/// Known peers share one tenant-scoped dispatch key regardless of whether the
+/// target came from discovery or a persisted endpoint observation.
+pub(crate) fn dispatch_known_peer_target(
+    dispatcher: &mut PeerDispatcher,
+    tenant_id: &str,
+    peer_id: &str,
+    remote: SocketAddr,
+) -> bool {
+    let key = known_peer_dispatch_key(tenant_id, peer_id);
+    let (action, _cancel_rx) = dispatcher.dispatch(&key, remote);
+    matches!(
+        action,
+        DiscoveryAction::Connect | DiscoveryAction::Reconnect
+    )
+}
+
 /// Dispatch a discovery dial target through `PeerDispatcher`.
 ///
-/// Discovery keys are tenant-scoped (`{tenant}@mdns:{peer}`) so one runtime
-/// dispatcher can safely handle multi-tenant streams without cross-tenant
-/// collisions.
+/// Discovery keys are tenant-scoped and peer-stable so one runtime dispatcher
+/// can safely handle multi-tenant streams without duplicate workers for the
+/// same remote peer.
 pub(crate) fn dispatch_discovery_target(
     dispatcher: &mut PeerDispatcher,
     tenant_id: &str,
     peer_id: &str,
     remote: SocketAddr,
 ) -> bool {
-    let key = discovery_dispatch_key(tenant_id, peer_id);
-    let (action, _cancel_rx) = dispatcher.dispatch(&key, remote);
-    matches!(
-        action,
-        DiscoveryAction::Connect | DiscoveryAction::Reconnect
-    )
+    dispatch_known_peer_target(dispatcher, tenant_id, peer_id, remote)
+}
+
+/// Dispatch a persisted-observation dial target through `PeerDispatcher`.
+pub(crate) fn dispatch_observed_endpoint_target(
+    dispatcher: &mut PeerDispatcher,
+    tenant_id: &str,
+    peer_id: &str,
+    remote: SocketAddr,
+) -> bool {
+    dispatch_known_peer_target(dispatcher, tenant_id, peer_id, remote)
 }
 
 // ---------------------------------------------------------------------------
@@ -255,10 +319,11 @@ pub(crate) fn dispatch_discovery_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::spki_fingerprint_from_ed25519_pubkey;
     use crate::db::open_connection;
     use crate::db::open_in_memory;
     use crate::db::schema::create_tables;
-    use crate::db::{health, transport_creds, transport_trust};
+    use crate::db::{transport_creds, transport_trust};
 
     fn seed_direct_bootstrap_tenant(
         conn: &rusqlite::Connection,
@@ -575,6 +640,114 @@ mod tests {
     }
 
     #[test]
+    fn test_observed_endpoint_targets_survive_bootstrap_supersession() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("observed-endpoints.db");
+        let conn = open_connection(&db_path).unwrap();
+        create_tables(&conn).unwrap();
+        let now_ms = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64;
+
+        let tenant_id = "tenant-observed";
+        let invite_event_id = "inv-observed";
+        conn.execute(
+            "INSERT INTO invites_accepted
+             (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                tenant_id,
+                format!("ia-{tenant_id}"),
+                format!("tenant-event-{tenant_id}"),
+                invite_event_id,
+                format!("ws-{tenant_id}"),
+                1i64
+            ],
+        )
+        .unwrap();
+        transport_creds::store_local_creds_with_source(
+            &conn,
+            tenant_id,
+            b"cert",
+            b"key",
+            transport_creds::CRED_SOURCE_PEER_SHARED,
+        )
+        .unwrap();
+
+        let remote_pubkey = [0x44; 32];
+        let remote_transport_fingerprint = spki_fingerprint_from_ed25519_pubkey(&remote_pubkey);
+        let remote_peer_id = hex::encode(remote_transport_fingerprint);
+        transport_trust::record_invite_bootstrap_trust(
+            &conn,
+            tenant_id,
+            &format!("ia-{tenant_id}"),
+            invite_event_id,
+            &format!("ws-{tenant_id}"),
+            "10.0.0.1:4433",
+            &remote_transport_fingerprint,
+        )
+        .unwrap();
+
+        conn.execute(
+            "INSERT INTO peers_shared
+             (recorded_by, event_id, public_key, transport_fingerprint, device_name)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                tenant_id,
+                "ps-remote-observed",
+                remote_pubkey.as_slice(),
+                remote_transport_fingerprint.as_slice(),
+                "remote-device",
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peer_endpoint_observations
+             (recorded_by, via_peer_id, origin_ip, origin_port, observed_at, expires_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                tenant_id,
+                remote_peer_id,
+                "127.0.0.1",
+                4455i64,
+                now_ms,
+                now_ms + 60_000i64
+            ],
+        )
+        .unwrap();
+
+        transport_trust::consume_bootstrap_for_transport_fingerprint(
+            &conn,
+            tenant_id,
+            &remote_transport_fingerprint,
+        )
+        .unwrap();
+        drop(conn);
+
+        let bootstrap_targets =
+            load_bootstrap_targets(db_path.to_str().unwrap(), &[tenant_id.to_string()]).unwrap();
+        assert!(
+            bootstrap_targets.is_empty(),
+            "bootstrap targets should be cleared after peer_shared supersession"
+        );
+
+        let observed_targets =
+            collect_all_observed_endpoint_targets(db_path.to_str().unwrap()).unwrap();
+        assert_eq!(
+            observed_targets.len(),
+            1,
+            "known peer should remain dialable"
+        );
+        assert_eq!(observed_targets[0].0, tenant_id);
+        assert_eq!(observed_targets[0].1, remote_peer_id);
+        assert_eq!(
+            observed_targets[0].2,
+            "127.0.0.1:4455".parse::<SocketAddr>().unwrap()
+        );
+    }
+
+    #[test]
     fn test_bootstrap_targets_resolve_hostname() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("autodial-hostname.db");
@@ -770,67 +943,6 @@ mod tests {
         assert_eq!(
             by_tenant.get("tenant-transitional"),
             Some(&"10.0.0.20:4433".parse::<SocketAddr>().unwrap())
-        );
-    }
-
-    #[test]
-    fn test_collect_all_observed_endpoint_targets_uses_latest_live_endpoint_per_peer() {
-        let tmp = tempfile::tempdir().unwrap();
-        let db_path = tmp.path().join("observed-targets.db");
-        let conn = open_connection(&db_path).unwrap();
-        create_tables(&conn).unwrap();
-        let now_ms = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as i64;
-
-        seed_direct_bootstrap_tenant(&conn, "tenant-a", "inv-a", "10.0.0.1:4433");
-        health::record_endpoint_observation(
-            &conn,
-            "tenant-a",
-            "peer-x",
-            "10.0.0.9",
-            4433,
-            now_ms - 2_000,
-            86_400_000,
-        )
-        .unwrap();
-        health::record_endpoint_observation(
-            &conn,
-            "tenant-a",
-            "peer-x",
-            "10.0.0.10",
-            4434,
-            now_ms - 1_000,
-            86_400_000,
-        )
-        .unwrap();
-        health::record_endpoint_observation(
-            &conn,
-            "tenant-a",
-            "peer-y",
-            "10.0.0.11",
-            4435,
-            now_ms - 1_500,
-            86_400_000,
-        )
-        .unwrap();
-        drop(conn);
-
-        let targets = collect_all_observed_endpoint_targets(db_path.to_str().unwrap()).unwrap();
-        assert_eq!(targets.len(), 2);
-
-        let by_peer: std::collections::HashMap<String, SocketAddr> = targets
-            .into_iter()
-            .map(|(_tenant_id, peer_id, remote)| (peer_id, remote))
-            .collect();
-        assert_eq!(
-            by_peer.get("peer-x"),
-            Some(&"10.0.0.10:4434".parse::<SocketAddr>().unwrap())
-        );
-        assert_eq!(
-            by_peer.get("peer-y"),
-            Some(&"10.0.0.11:4435".parse::<SocketAddr>().unwrap())
         );
     }
 

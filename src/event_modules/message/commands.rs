@@ -2,7 +2,7 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use crate::crypto::EventId;
 use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
@@ -26,10 +26,16 @@ fn current_timestamp_ms() -> u64 {
         .as_millis() as u64
 }
 
+fn generate_progress_logging_enabled() -> bool {
+    std::env::var_os("TOPO_GENERATE_PROGRESS_LOG").is_some()
+}
+
 fn begin_immediate_with_retry(
     db: &Connection,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     const MAX_ATTEMPTS: usize = 8;
+    let log_progress = generate_progress_logging_enabled();
+    let retry_start = Instant::now();
 
     for attempt in 0..MAX_ATTEMPTS {
         match db.execute("BEGIN IMMEDIATE", []) {
@@ -38,8 +44,26 @@ fn begin_immediate_with_retry(
                 let msg = err.to_string();
                 let is_busy = msg.contains("database is locked") || msg.contains("SQLITE_BUSY");
                 if is_busy && attempt + 1 < MAX_ATTEMPTS {
-                    thread::sleep(Duration::from_millis(25u64 << attempt));
+                    let backoff_ms = 25u64 << attempt;
+                    if log_progress {
+                        eprintln!(
+                            "[generate] BEGIN IMMEDIATE busy attempt={} elapsed_ms={} backoff_ms={} err={}",
+                            attempt + 1,
+                            retry_start.elapsed().as_millis(),
+                            backoff_ms,
+                            msg
+                        );
+                    }
+                    thread::sleep(Duration::from_millis(backoff_ms));
                     continue;
+                }
+                if log_progress {
+                    eprintln!(
+                        "[generate] BEGIN IMMEDIATE failed attempts={} elapsed_ms={} err={}",
+                        attempt + 1,
+                        retry_start.elapsed().as_millis(),
+                        msg
+                    );
                 }
                 return Err(err.into());
             }
@@ -269,6 +293,8 @@ pub fn generate_for_peer(
     count: usize,
 ) -> Result<GenerateResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
+    let log_progress = generate_progress_logging_enabled();
+    let generate_start = Instant::now();
 
     let (signer_eid, signing_key) =
         peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
@@ -279,9 +305,16 @@ pub fn generate_for_peer(
     // A single long transaction causes SQLITE_BUSY for the sync engine's
     // runtime manager, which treats it as a fatal error.
     const BATCH_SIZE: usize = 1000;
+    if log_progress {
+        eprintln!(
+            "[generate] start kind=messages count={} batch_size={} db={} peer={}",
+            count, BATCH_SIZE, db_path, peer_id
+        );
+    }
     let mut i = 0;
     while i < count {
         let batch_end = (i + BATCH_SIZE).min(count);
+        let batch_start = Instant::now();
         begin_immediate_with_retry(&db)?;
         for j in i..batch_end {
             create(
@@ -302,6 +335,22 @@ pub fn generate_for_peer(
         }
         db.execute("COMMIT", [])?;
         i = batch_end;
+        if log_progress && (i == count || i % 10_000 == 0 || i == BATCH_SIZE) {
+            eprintln!(
+                "[generate] progress kind=messages committed={} remaining={} batch_ms={} total_ms={}",
+                i,
+                count.saturating_sub(i),
+                batch_start.elapsed().as_millis(),
+                generate_start.elapsed().as_millis()
+            );
+        }
+    }
+    if log_progress {
+        eprintln!(
+            "[generate] done kind=messages count={} total_ms={}",
+            count,
+            generate_start.elapsed().as_millis()
+        );
     }
 
     Ok(GenerateResponse { count })
@@ -327,6 +376,8 @@ pub fn generate_files_for_peer(
     )?;
 
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
+    let log_progress = generate_progress_logging_enabled();
+    let generate_start = Instant::now();
     let (signer_eid, signing_key) =
         peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
     let workspace_id = workspace::resolve_workspace_for_peer(&db, &recorded_by)?;
@@ -336,7 +387,14 @@ pub fn generate_files_for_peer(
 
     // Each file is its own transaction to avoid holding the write lock
     // too long and causing SQLITE_BUSY for the sync engine.
+    if log_progress {
+        eprintln!(
+            "[generate] start kind=files files={} size_mib={} db={} peer={}",
+            files, file_size_mib, db_path, peer_id
+        );
+    }
     for i in 0..files {
+        let file_start = Instant::now();
         begin_immediate_with_retry(&db)?;
         let message_event_id = create(
             &db,
@@ -412,6 +470,22 @@ pub fn generate_files_for_peer(
             })?;
         }
         db.execute("COMMIT", [])?;
+        if log_progress && (i + 1 == files || (i + 1) % 10 == 0 || i == 0) {
+            eprintln!(
+                "[generate] progress kind=files committed={} remaining={} file_ms={} total_ms={}",
+                i + 1,
+                files.saturating_sub(i + 1),
+                file_start.elapsed().as_millis(),
+                generate_start.elapsed().as_millis()
+            );
+        }
+    }
+    if log_progress {
+        eprintln!(
+            "[generate] done kind=files files={} total_ms={}",
+            files,
+            generate_start.elapsed().as_millis()
+        );
     }
 
     Ok(GenerateFilesResponse {

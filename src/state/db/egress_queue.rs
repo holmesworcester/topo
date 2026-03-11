@@ -1,6 +1,6 @@
 use rusqlite::{params, Connection, Result as SqliteResult};
 
-use super::queue::current_timestamp_ms;
+use super::queue::{current_timestamp_ms, with_immediate_tx, with_sqlite_busy_retry};
 use crate::crypto::EventId;
 
 pub struct EgressQueue<'a> {
@@ -54,18 +54,18 @@ impl<'a> EgressQueue<'a> {
             return Ok(0);
         }
         let now = current_timestamp_ms();
-        self.conn.execute("BEGIN", [])?;
-        let mut stmt = self.conn.prepare(
-            "INSERT OR IGNORE INTO egress_queue
-             (connection_id, frame_type, event_id, enqueued_at, available_at)
-             VALUES (?1, 'event', ?2, ?3, ?3)",
-        )?;
-        let mut inserted = 0usize;
-        for id in event_ids {
-            inserted += stmt.execute(params![connection_id, &id[..], now])?;
-        }
-        self.conn.execute("COMMIT", [])?;
-        Ok(inserted)
+        with_immediate_tx(self.conn, || {
+            let mut stmt = self.conn.prepare(
+                "INSERT OR IGNORE INTO egress_queue
+                 (connection_id, frame_type, event_id, enqueued_at, available_at)
+                 VALUES (?1, 'event', ?2, ?3, ?3)",
+            )?;
+            let mut inserted = 0usize;
+            for id in event_ids {
+                inserted += stmt.execute(params![connection_id, &id[..], now])?;
+            }
+            Ok(inserted)
+        })
     }
 
     /// Claim a batch of unsent items for sending.
@@ -82,29 +82,30 @@ impl<'a> EgressQueue<'a> {
             return Ok(Vec::new());
         }
 
-        let mut stmt = self.conn.prepare(
-            "SELECT id, event_id FROM egress_queue
-             WHERE connection_id = ?1
-             AND sent_at IS NULL
-             ORDER BY id
-             LIMIT ?2",
-        )?;
-        let rows: Vec<(i64, Vec<u8>)> = stmt
-            .query_map(params![connection_id, limit as i64], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })?
-            .collect::<Result<Vec<_>, _>>()?;
+        with_sqlite_busy_retry(|| {
+            let mut stmt = self.conn.prepare(
+                "SELECT id, event_id FROM egress_queue
+                 WHERE connection_id = ?1
+                 AND sent_at IS NULL
+                 ORDER BY id
+                 LIMIT ?2",
+            )?;
+            let rows: Vec<(i64, Vec<u8>)> = stmt
+                .query_map(params![connection_id, limit as i64], |row| {
+                    Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                })?
+                .collect::<Result<Vec<_>, _>>()?;
 
-        let mut result = Vec::with_capacity(rows.len());
-        for (rowid, blob) in rows {
-            if blob.len() == 32 {
-                let mut id = [0u8; 32];
-                id.copy_from_slice(&blob);
-                result.push((rowid, id));
+            let mut result = Vec::with_capacity(rows.len());
+            for (rowid, blob) in rows {
+                if blob.len() == 32 {
+                    let mut id = [0u8; 32];
+                    id.copy_from_slice(&blob);
+                    result.push((rowid, id));
+                }
             }
-        }
-
-        Ok(result)
+            Ok(result)
+        })
     }
 
     /// Mark items as sent by deleting them from the queue.
@@ -117,55 +118,72 @@ impl<'a> EgressQueue<'a> {
         if rowids.is_empty() {
             return Ok(());
         }
-        self.conn.execute("BEGIN", [])?;
-        let mut stmt = self
-            .conn
-            .prepare("DELETE FROM egress_queue WHERE id = ?1")?;
-        for rowid in rowids {
-            stmt.execute(params![rowid])?;
-        }
-        self.conn.execute("COMMIT", [])?;
-        Ok(())
+        with_immediate_tx(self.conn, || {
+            let mut stmt = self
+                .conn
+                .prepare("DELETE FROM egress_queue WHERE id = ?1")?;
+            for rowid in rowids {
+                stmt.execute(params![rowid])?;
+            }
+            Ok(())
+        })
     }
 
     /// Count pending (unsent) items for a connection.
     pub fn count_pending(&self, connection_id: &str) -> SqliteResult<i64> {
-        self.conn.query_row(
-            "SELECT COUNT(*) FROM egress_queue
-             WHERE connection_id = ?1 AND sent_at IS NULL",
-            params![connection_id],
-            |row| row.get(0),
-        )
+        with_sqlite_busy_retry(|| {
+            self.conn.query_row(
+                "SELECT COUNT(*) FROM egress_queue
+                 WHERE connection_id = ?1 AND sent_at IS NULL",
+                params![connection_id],
+                |row| row.get(0),
+            )
+        })
     }
 
     /// Delete sent items older than the given threshold.
     pub fn cleanup_sent(&self, older_than_ms: i64) -> SqliteResult<usize> {
         let cutoff = current_timestamp_ms() - older_than_ms;
-        self.conn.execute(
-            "DELETE FROM egress_queue WHERE sent_at IS NOT NULL AND sent_at < ?1",
-            params![cutoff],
-        )
+        with_sqlite_busy_retry(|| {
+            self.conn.execute(
+                "DELETE FROM egress_queue WHERE sent_at IS NOT NULL AND sent_at < ?1",
+                params![cutoff],
+            )
+        })
     }
 
     /// Delete all items for a connection.
     pub fn clear_connection(&self, connection_id: &str) -> SqliteResult<()> {
-        self.conn.execute(
-            "DELETE FROM egress_queue WHERE connection_id = ?1",
-            params![connection_id],
-        )?;
-        Ok(())
+        with_sqlite_busy_retry(|| {
+            self.conn.execute(
+                "DELETE FROM egress_queue WHERE connection_id = ?1",
+                params![connection_id],
+            )?;
+            Ok(())
+        })
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{open_in_memory, schema::create_tables};
+    use crate::db::{open_connection, open_in_memory, schema::create_tables};
+    use std::time::Duration;
 
     fn setup() -> Connection {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         conn
+    }
+
+    fn setup_file_db() -> (tempfile::TempDir, std::path::PathBuf) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("egress.db");
+        let conn = open_connection(&path).unwrap();
+        conn.busy_timeout(Duration::from_millis(20)).unwrap();
+        create_tables(&conn).unwrap();
+        drop(conn);
+        (dir, path)
     }
 
     fn make_event_id(byte: u8) -> EventId {
@@ -273,5 +291,65 @@ mod tests {
         let count2 = eq.count_pending("conn2").unwrap();
         assert_eq!(count1, 0);
         assert_eq!(count2, 1, "conn2's items should be unaffected");
+    }
+
+    #[test]
+    fn test_enqueue_events_retries_transient_busy_lock() {
+        let (_dir, path) = setup_file_db();
+
+        let lock_conn = open_connection(&path).unwrap();
+        lock_conn.busy_timeout(Duration::from_millis(20)).unwrap();
+        lock_conn.execute("BEGIN IMMEDIATE", []).unwrap();
+
+        let path_for_thread = path.clone();
+        let worker = std::thread::spawn(move || {
+            let conn = open_connection(&path_for_thread).unwrap();
+            conn.busy_timeout(Duration::from_millis(20)).unwrap();
+            let eq = EgressQueue::new(&conn);
+            eq.enqueue_events("conn1", &[make_event_id(1)]).unwrap()
+        });
+
+        std::thread::sleep(Duration::from_millis(80));
+        lock_conn.execute("COMMIT", []).unwrap();
+
+        let inserted = worker.join().unwrap();
+        assert_eq!(inserted, 1);
+
+        let verify = open_connection(&path).unwrap();
+        let eq = EgressQueue::new(&verify);
+        assert_eq!(eq.count_pending("conn1").unwrap(), 1);
+    }
+
+    #[test]
+    fn test_mark_sent_retries_transient_busy_lock() {
+        let (_dir, path) = setup_file_db();
+
+        let conn = open_connection(&path).unwrap();
+        conn.busy_timeout(Duration::from_millis(20)).unwrap();
+        let eq = EgressQueue::new(&conn);
+        eq.enqueue_events("conn1", &[make_event_id(1)]).unwrap();
+        let claimed = eq.claim_batch("conn1", 1).unwrap();
+        let rowids: Vec<i64> = claimed.iter().map(|(rowid, _)| *rowid).collect();
+        drop(conn);
+
+        let lock_conn = open_connection(&path).unwrap();
+        lock_conn.busy_timeout(Duration::from_millis(20)).unwrap();
+        lock_conn.execute("BEGIN IMMEDIATE", []).unwrap();
+
+        let path_for_thread = path.clone();
+        let worker = std::thread::spawn(move || {
+            let conn = open_connection(&path_for_thread).unwrap();
+            conn.busy_timeout(Duration::from_millis(20)).unwrap();
+            let eq = EgressQueue::new(&conn);
+            eq.mark_sent(&rowids).unwrap();
+        });
+
+        std::thread::sleep(Duration::from_millis(80));
+        lock_conn.execute("COMMIT", []).unwrap();
+        worker.join().unwrap();
+
+        let verify = open_connection(&path).unwrap();
+        let eq = EgressQueue::new(&verify);
+        assert_eq!(eq.count_pending("conn1").unwrap(), 0);
     }
 }

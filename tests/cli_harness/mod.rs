@@ -69,12 +69,16 @@ pub struct DaemonOptions {
     pub bind_port: Option<u16>,
     /// Disable placeholder autodial via environment variable.
     pub disable_placeholder_autodial: bool,
+    /// Disable mDNS discovery via environment variable.
+    pub disable_discovery: bool,
     /// Inherit stdout/stderr for debugging (instead of suppressing).
     pub inherit_stdio: bool,
     /// Redirect stdout to a file path (takes precedence over inherit_stdio).
     pub stdout_file: Option<std::path::PathBuf>,
     /// Redirect stderr to a file path (takes precedence over inherit_stdio).
     pub stderr_file: Option<std::path::PathBuf>,
+    /// Extra environment variables for the daemon process only.
+    pub extra_env: Vec<(String, String)>,
 }
 
 impl Default for DaemonOptions {
@@ -82,9 +86,11 @@ impl Default for DaemonOptions {
         Self {
             bind_port: None,
             disable_placeholder_autodial: false,
+            disable_discovery: false,
             inherit_stdio: false,
             stdout_file: None,
             stderr_file: None,
+            extra_env: Vec::new(),
         }
     }
 }
@@ -123,6 +129,12 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
 
         if opts.disable_placeholder_autodial {
             cmd.env("P7_DISABLE_PLACEHOLDER_AUTODIAL", "1");
+        }
+        if opts.disable_discovery {
+            cmd.env("P7_DISABLE_DISCOVERY", "1");
+        }
+        for (key, value) in &opts.extra_env {
+            cmd.env(key, value);
         }
 
         if let Some(ref path) = opts.stdout_file {
