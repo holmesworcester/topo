@@ -64,29 +64,21 @@ When the derived socket path exceeds ~108 chars (SUN_LEN), the daemon starts its
 
 The same invite link can be accepted by multiple peers or the same peer multiple times. Each acceptance creates a new local tenant with a fresh user+peer identity. This is intentional — documented in DESIGN.md §9.2.
 
-### `transport-identity` errors on multi-tenant DB
+### `transport-identity` errors on multi-tenant DB (FIXED)
 
-`transport-identity` is a pre-workspace bootstrap command. Once multiple tenants exist there is no single transport identity to return. The error message is correct behavior. Being replaced by `transport-keys` (see planned changes below).
+Replaced with `transport-keys` which lists all local transport keys with peer_id and source. Works for both single and multi-tenant DBs.
 
----
+### Reactions should be idempotent (FIXED)
 
-## Planned changes
+Display queries now GROUP BY (author_id, emoji) per message, picking the earliest by created_at. Event layer still accepts duplicates; deduplication is query-side only.
 
-### Rename `transport-identity` to `transport-keys`
+### Messages: show 50 newest with overflow note (FIXED)
 
-Replace the single-identity-only `transport-identity` command with `transport-keys` that lists all rows from `local_transport_creds` with peer_id and source. Works for both single and multi-tenant DBs.
+Now selects the 50 newest messages (subquery picks newest, re-sorted ascending). Shows "(N older messages not shown)" when total exceeds displayed count. Message numbers reflect global position.
 
-### Reactions should be idempotent
+### ~~"Content too long" error should state the limit~~ (NOT A BUG)
 
-Duplicate reactions (same user, same message, same emoji) are currently allowed as separate events. Queries should pick the winning reaction per user per message per emoji (winner by timestamp). The event layer can accept duplicates but the display layer should deduplicate.
-
-### Messages: show 50 newest with overflow note
-
-`messages` currently shows 50 items with no indication of truncation. Change to show the 50 newest messages. When there are more than 50, display a note like "(25 older messages not shown)". Pagination is out of scope for now.
-
-### "Content too long" error should state the limit
-
-Error says `"content too long: 1025 bytes"` but doesn't tell the user the max is 1024. Should match the username error pattern which says "max 64".
+The error already reads `"text too long for slot: 1025 bytes, max 1024"` — the QA agent misquoted it. No change needed.
 
 ---
 
