@@ -13,6 +13,10 @@ pub fn project_pure(
         _ => return ProjectorResult::reject("not a user event".to_string()),
     };
 
+    if username.trim().is_empty() {
+        return ProjectorResult::reject("username must not be empty".to_string());
+    }
+
     let ops = vec![WriteOp::InsertOrIgnore {
         table: "users",
         columns: vec!["recorded_by", "event_id", "public_key", "username"],

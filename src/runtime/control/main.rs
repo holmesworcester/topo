@@ -15,7 +15,7 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use topo::db::transport_creds::discover_local_tenants;
-use topo::db::{open_connection, schema::create_tables, sync_log};
+use topo::db::{friendly_db_error, open_connection, schema::create_tables, sync_log};
 use topo::db_registry::DbRegistry;
 use topo::rpc::catalog;
 use topo::rpc::client::{rpc_call, rpc_call_raw, RpcClientError};
@@ -263,7 +263,7 @@ enum Commands {
 
     /// Create a reaction to a message
     React {
-        /// Emoji to react with
+        /// Reaction text (emoji shortcode or unicode)
         emoji: String,
         /// Target: message number (N or #N) or hex event ID
         target: Option<String>,
@@ -1257,7 +1257,7 @@ fn run_sync_log_action(
             peer,
             all,
         } => {
-            let conn = open_connection(db)?;
+            let conn = open_connection(db).map_err(|e| friendly_db_error(db, e))?;
             create_tables(&conn)?;
             let runs = sync_log::list_runs(&conn, limit, all, run, peer.as_deref())?;
             if runs.is_empty() {
@@ -1283,7 +1283,7 @@ fn run_sync_log_action(
             peer,
             all,
         } => {
-            let conn = open_connection(db)?;
+            let conn = open_connection(db).map_err(|e| friendly_db_error(db, e))?;
             create_tables(&conn)?;
             let runs = sync_log::list_runs(&conn, limit, all, run, peer.as_deref())?;
             if runs.is_empty() {
@@ -1307,7 +1307,7 @@ fn run_sync_log_action(
             all_runs,
             capture_full_ids,
         } => {
-            let conn = open_connection(db)?;
+            let conn = open_connection(db).map_err(|e| friendly_db_error(db, e))?;
             create_tables(&conn)?;
             let cfg = sync_log::update_config(
                 &conn,
@@ -1322,7 +1322,7 @@ fn run_sync_log_action(
             Ok(())
         }
         SyncLogAction::Disable => {
-            let conn = open_connection(db)?;
+            let conn = open_connection(db).map_err(|e| friendly_db_error(db, e))?;
             create_tables(&conn)?;
             let cfg = sync_log::update_config(
                 &conn,
@@ -1335,7 +1335,7 @@ fn run_sync_log_action(
             Ok(())
         }
         SyncLogAction::Config => {
-            let conn = open_connection(db)?;
+            let conn = open_connection(db).map_err(|e| friendly_db_error(db, e))?;
             create_tables(&conn)?;
             let cfg = sync_log::load_config(&conn)?;
             print_sync_log_config(&cfg);
@@ -1885,7 +1885,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
             // Initialize DB eagerly
             {
-                let conn = open_connection(db)?;
+                let conn = open_connection(db).map_err(|e| friendly_db_error(db, e))?;
                 create_tables(&conn)?;
             }
 

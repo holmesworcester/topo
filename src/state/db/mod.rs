@@ -23,6 +23,39 @@ pub fn open_connection<P: AsRef<Path>>(path: P) -> SqliteResult<Connection> {
     Ok(conn)
 }
 
+/// Wrap a SQLite open error into a user-friendly message.
+pub fn friendly_db_error<P: AsRef<Path>>(path: P, e: rusqlite::Error) -> String {
+    let p = path.as_ref();
+    match e {
+        rusqlite::Error::SqliteFailure(ref err, _)
+            if err.code == rusqlite::ffi::ErrorCode::CannotOpen =>
+        {
+            if let Some(parent) = p.parent() {
+                if !parent.exists() {
+                    return format!(
+                        "cannot open database: directory does not exist: {}",
+                        parent.display()
+                    );
+                }
+            }
+            format!("cannot open database: {}", p.display())
+        }
+        rusqlite::Error::SqliteFailure(ref err, ref msg) => {
+            let detail = msg.as_deref().unwrap_or("unknown error");
+            match err.code {
+                rusqlite::ffi::ErrorCode::NotADatabase => {
+                    format!("cannot open database: file is not a database: {}", p.display())
+                }
+                rusqlite::ffi::ErrorCode::ReadOnly => {
+                    format!("cannot open database: read-only: {}", p.display())
+                }
+                _ => format!("cannot open database: {} ({})", detail, p.display()),
+            }
+        }
+        other => format!("cannot open database: {} ({})", other, p.display()),
+    }
+}
+
 /// Open in-memory database (for testing)
 #[cfg(test)]
 pub fn open_in_memory() -> SqliteResult<Connection> {
