@@ -5518,3 +5518,136 @@ fn test_cli_sub_watch_multi_tenant() {
         state
     );
 }
+
+#[test]
+fn test_cli_sub_watch_rejects_has_changed_mode() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir.path().join("hcwatch.db").to_str().unwrap().to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    create_subscription(&db, "hc-sub", "has_changed");
+
+    let output = Command::new(bin())
+        .args([
+            "--db", &db, "sub", "watch", "hc-sub",
+            "--interval-ms", "100",
+        ])
+        .output()
+        .expect("sub watch has_changed");
+
+    // Should fail with a clear error
+    assert!(
+        !output.status.success(),
+        "watch on has_changed subscription should fail"
+    );
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    assert!(
+        stderr.contains("has_changed") && stderr.contains("no feed items"),
+        "error should explain has_changed produces no feed items: {}",
+        stderr
+    );
+}
+
+#[test]
+fn test_cli_sub_watch_exits_on_tenant_switch() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir.path().join("tswitch.db").to_str().unwrap().to_string();
+    let timeout = Duration::from_secs(10);
+
+    create_workspace_with_details(&db, "alpha-space", "alice", "laptop");
+    let _daemon = start_daemon(&db);
+
+    create_subscription(&db, "alice-watch", "full");
+
+    // Create second workspace (auto-switches to tenant 2)
+    let create = Command::new(bin())
+        .args([
+            "create-workspace", "--db", &db,
+            "--workspace-name", "beta-space",
+            "--username", "charlie",
+            "--device-name", "tablet",
+        ])
+        .output()
+        .unwrap();
+    assert!(create.status.success());
+
+    // Wait for both tenants
+    let start = Instant::now();
+    loop {
+        let tenants = Command::new(bin())
+            .args(["--db", &db, "tenant", "list"])
+            .output()
+            .expect("tenant list");
+        let stdout = String::from_utf8_lossy(&tenants.stdout);
+        if stdout.contains("alice") && stdout.contains("charlie") {
+            break;
+        }
+        if start.elapsed() >= timeout {
+            panic!("tenants did not appear");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // Switch back to tenant 1 (alice) and start watch
+    let _ = Command::new(bin())
+        .args(["--db", &db, "tenant", "use", "1"])
+        .output();
+
+    let mut watch = Command::new(bin())
+        .args([
+            "--db", &db, "sub", "watch", "alice-watch",
+            "--interval-ms", "100",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn watch");
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Switch to tenant 2 from another "terminal"
+    let _ = Command::new(bin())
+        .args(["--db", &db, "tenant", "use", "2"])
+        .output();
+
+    // Watch should exit within a few seconds after repeated "not found" errors
+    let start = Instant::now();
+    loop {
+        match watch.try_wait() {
+            Ok(Some(status)) => {
+                // Watch exited — verify it's a non-zero exit (error)
+                assert!(
+                    !status.success(),
+                    "watch should exit with error after tenant switch"
+                );
+                let output = watch.wait_with_output().unwrap_or_else(|_| {
+                    // Already consumed, build from what we have
+                    std::process::Output {
+                        status,
+                        stdout: vec![],
+                        stderr: vec![],
+                    }
+                });
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    stderr.contains("no longer accessible") || stderr.contains("tenant"),
+                    "error should mention tenant switch: {}",
+                    stderr
+                );
+                return;
+            }
+            Ok(None) => {
+                if start.elapsed() >= Duration::from_secs(5) {
+                    let _ = watch.kill();
+                    panic!("watch did not exit after tenant switch within 5s");
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => panic!("try_wait failed: {}", e),
+        }
+    }
+}

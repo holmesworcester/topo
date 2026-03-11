@@ -1172,6 +1172,28 @@ fn run_sub_action(
         } => {
             let sub_id =
                 resolve_subscription_selector(db, socket, sub, sub_flag, "sub watch", true)?;
+
+            // Reject has_changed subscriptions: they produce no feed rows,
+            // so watch would never output anything.
+            let subs = list_subscription_refs(db, socket)?;
+            if let Some(sub_ref) = subs.iter().find(|r| r.subscription_id == sub_id) {
+                // Fetch the full sub list to check delivery mode
+                let list_data = rpc_require_daemon(db, socket, RpcMethod::SubList)?;
+                if let Some(items) = list_data.as_array() {
+                    for item in items {
+                        if item["subscription_id"].as_str() == Some(&sub_id) {
+                            if item["delivery_mode"].as_str() == Some("has_changed") {
+                                return Err(format!(
+                                    "subscription {:?} uses has_changed delivery mode which produces no feed items; \
+                                     use `topo sub state {}` to check dirty/pending instead",
+                                    sub_ref.name, sub_ref.name,
+                                ).into());
+                            }
+                        }
+                    }
+                }
+            }
+
             eprintln!("Watching subscription {} (poll every {}ms, Ctrl-C to stop)", &sub_id[..sub_id.len().min(12)], interval_ms);
             let mut cursor: i64 = 0;
             // Catch up: fetch current state to start from latest seq
@@ -1183,6 +1205,7 @@ fn run_sub_action(
                     eprintln!("Resuming from seq {}", cursor);
                 }
             }
+            let mut consecutive_not_found = 0u32;
             loop {
                 match rpc_require_daemon(
                     db,
@@ -1194,6 +1217,7 @@ fn run_sub_action(
                     },
                 ) {
                     Ok(data) => {
+                        consecutive_not_found = 0;
                         if let Some(items) = data.as_array() {
                             let mut max_seq = cursor;
                             for item in items {
@@ -1226,21 +1250,43 @@ fn run_sub_action(
                             }
                             if max_seq > cursor {
                                 if ack {
-                                    let _ = rpc_require_daemon(
+                                    match rpc_require_daemon(
                                         db,
                                         socket,
                                         RpcMethod::SubAck {
                                             subscription_id: sub_id.clone(),
                                             through_seq: max_seq,
                                         },
-                                    );
+                                    ) {
+                                        Ok(_) => {
+                                            cursor = max_seq;
+                                        }
+                                        Err(e) => {
+                                            eprintln!("ack error (items will be re-delivered): {}", e);
+                                            // Don't advance cursor — items will be re-polled
+                                        }
+                                    }
+                                } else {
+                                    cursor = max_seq;
                                 }
-                                cursor = max_seq;
                             }
                         }
                     }
                     Err(e) => {
-                        eprintln!("poll error: {}", e);
+                        let msg = e.to_string();
+                        if msg.contains("not found") {
+                            consecutive_not_found += 1;
+                            if consecutive_not_found >= 3 {
+                                return Err(format!(
+                                    "subscription {} no longer accessible — \
+                                     the active tenant may have changed (use `topo tenant use` to switch back)",
+                                    &sub_id[..sub_id.len().min(12)],
+                                ).into());
+                            }
+                        } else {
+                            consecutive_not_found = 0;
+                        }
+                        eprintln!("poll error: {}", msg);
                     }
                 }
                 std::thread::sleep(std::time::Duration::from_millis(interval_ms));
