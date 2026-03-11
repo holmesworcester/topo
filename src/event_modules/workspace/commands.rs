@@ -297,6 +297,34 @@ pub fn create_workspace(
         });
     }
 
+    // Validate text field lengths upfront, before any events are created,
+    // to prevent partial workspace creation if encoding would fail later.
+    use super::super::layout::common::NAME_BYTES;
+    if workspace_name.as_bytes().len() > NAME_BYTES {
+        return Err(format!(
+            "workspace name too long: {} bytes, max {}",
+            workspace_name.as_bytes().len(),
+            NAME_BYTES
+        )
+        .into());
+    }
+    if username.as_bytes().len() > NAME_BYTES {
+        return Err(format!(
+            "username too long: {} bytes, max {}",
+            username.as_bytes().len(),
+            NAME_BYTES
+        )
+        .into());
+    }
+    if device_name.as_bytes().len() > NAME_BYTES {
+        return Err(format!(
+            "device name too long: {} bytes, max {}",
+            device_name.as_bytes().len(),
+            NAME_BYTES
+        )
+        .into());
+    }
+
     let mut rng = rand::thread_rng();
 
     // Pre-derive peer_id from PeerShared key so all events are written under
@@ -432,6 +460,25 @@ pub fn join_workspace_as_new_user(
     device_name: &str,
     peer_shared_key: SigningKey,
 ) -> Result<JoinChain, Box<dyn std::error::Error + Send + Sync>> {
+    // Validate text field lengths upfront to prevent partial creation.
+    use super::super::layout::common::NAME_BYTES;
+    if username.as_bytes().len() > NAME_BYTES {
+        return Err(format!(
+            "username too long: {} bytes, max {}",
+            username.as_bytes().len(),
+            NAME_BYTES
+        )
+        .into());
+    }
+    if device_name.as_bytes().len() > NAME_BYTES {
+        return Err(format!(
+            "device name too long: {} bytes, max {}",
+            device_name.as_bytes().len(),
+            NAME_BYTES
+        )
+        .into());
+    }
+
     let mut rng = rand::thread_rng();
     let tenant_event_id = ops::ensure_local_tenant_event(db, recorded_by, &peer_shared_key)?;
 
