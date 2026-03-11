@@ -18,6 +18,10 @@ pub fn project_pure(
         _ => return ProjectorResult::reject("not a message event".to_string()),
     };
 
+    if msg.content.trim().is_empty() {
+        return ProjectorResult::reject("message content must not be empty".to_string());
+    }
+
     if let Some(reason) = &ctx.signer_user_mismatch_reason {
         return ProjectorResult::reject(reason.clone());
     }
