@@ -239,8 +239,8 @@ Next, a demo 🐭
 
 * Create, invite, message, react, attach a file
 * Link a device
-* Show event and sync logs
-* Show multitenancy in action
+* Event and sync logs
+* Multitenancy in action
 
 
 <!-- Scraps
