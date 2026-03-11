@@ -380,9 +380,8 @@ pub fn list_tenants_for_display(
         .collect::<Result<Vec<_>, rusqlite::Error>>()?;
 
     tenants.sort_by(|a, b| {
-        b.active
-            .cmp(&a.active)
-            .then_with(|| a.workspace_name.cmp(&b.workspace_name))
+        a.workspace_name
+            .cmp(&b.workspace_name)
             .then_with(|| a.username.cmp(&b.username))
             .then_with(|| a.event_id.cmp(&b.event_id))
     });
@@ -566,7 +565,7 @@ mod tests {
         assert_eq!(resp.users[1].device_name, "workstation");
 
         assert_eq!(resp.tenants.len(), 2);
-        assert!(resp.tenants[0].active, "active tenant should sort first");
+        assert!(resp.tenants[0].active, "tenant-a (workspace 'design') should sort first alphabetically and happens to be active");
         assert_eq!(resp.tenants[0].event_id, "tenant-event-a");
         assert_eq!(resp.tenants[0].username, "alice");
         assert_eq!(resp.tenants[0].workspace_name, "design");
