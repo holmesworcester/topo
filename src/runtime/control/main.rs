@@ -1212,6 +1212,7 @@ fn run_sub_action(
                     Ok(data) => {
                         consecutive_not_found = 0;
                         let mut page_full = false;
+                        let prev_cursor = cursor;
                         if let Some(items) = data.as_array() {
                             page_full = items.len() >= 100;
                             let mut max_seq = cursor;
@@ -1277,8 +1278,10 @@ fn run_sub_action(
                                 }
                             }
                         }
-                        // If page was full, immediately re-poll to drain backlog
-                        if page_full {
+                        // If page was full and cursor advanced, immediately re-poll
+                        // to drain backlog. If cursor didn't advance (e.g. ack
+                        // failed), sleep to avoid a busy-loop of duplicates.
+                        if page_full && cursor > prev_cursor {
                             continue;
                         }
                     }
