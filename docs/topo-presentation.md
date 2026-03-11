@@ -360,9 +360,6 @@ Per-daemon VmHWM is measured via the lowmem delta harness.
 | 50k+20x1MiB files | all 80 slices | 7,016 | PASS | PASS |
 
 
-- Maintained lowmem daemon lanes run sender normal; only the receiver runs in lowmem, and the large message-delta lane restarts the receiver into lowmem after baseline sync.
-- Default maintained lanes stay around ~7 MiB per daemon; the validated `500k+10k` slow lane peaked at 17.28 MiB and still passed the 24 MiB target.
-- Optional slow lowmem message-delta lanes in the perf suite: `100k+50k` and `500k+10k` (off by default).
 - Memory increase varies with number of new events synced and (to a lesser extent) total number of events. 
 - Files pass easily because the number of events is small
 - Full sync of 100k+ events is not possible in background, but expecting background-fetched diffs to be <10k events seems reasonable.
