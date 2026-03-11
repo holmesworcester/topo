@@ -1,8 +1,7 @@
 //! Pure projector conformance tests for simple projectors that do straight inserts
 //! with no guards beyond type matching.
 //!
-//! Covers: User, Admin, UserRemoved, PeerRemoved, KeySecret,
-//!         File, BenchDep.
+//! Covers: User, Admin, KeySecret, File, BenchDep.
 
 #[cfg(test)]
 mod tests {
@@ -87,42 +86,6 @@ mod tests {
         use topo::event_modules::admin::project_pure;
         let result = project_pure(PEER, EVENT_ID, &unrelated_event(), &empty_ctx());
         assert_reject(&result);
-    }
-
-    // ── UserRemoved ──
-
-    #[test]
-    fn test_user_removed_writes_row() {
-        use topo::event_modules::user_removed::{project_pure, UserRemovedEvent};
-        let parsed = ParsedEvent::UserRemoved(UserRemovedEvent {
-            created_at_ms: 3000,
-            target_event_id: [1u8; 32],
-            signed_by: [2u8; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
-        });
-        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
-        assert_valid(&result);
-        assert_writes_to_table(&result, "removed_entities");
-        assert_no_commands(&result);
-    }
-
-    // ── PeerRemoved ──
-
-    #[test]
-    fn test_peer_removed_writes_row() {
-        use topo::event_modules::peer_removed::{project_pure, PeerRemovedEvent};
-        let parsed = ParsedEvent::PeerRemoved(PeerRemovedEvent {
-            created_at_ms: 4000,
-            target_event_id: [1u8; 32],
-            signed_by: [2u8; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
-        });
-        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
-        assert_valid(&result);
-        assert_writes_to_table(&result, "removed_entities");
-        assert_no_commands(&result);
     }
 
     // ── KeySecret ──

@@ -15,7 +15,7 @@ Primary target:
 1. Keep strict mTLS behavior unchanged (`is_peer_allowed` remains authoritative at handshake).
 2. Preserve inviter-side pre-accept trust (invitee first dial must still pass).
 3. Preserve joiner-side accepted bootstrap trust until steady-state PeerShared trust supersedes it.
-4. No weakening of removal semantics (`UserRemoved`/`PeerRemoved` must still deny trust).
+4. Do not reintroduce user-removal semantics in this branch; user removal is out of scope in this PoC.
 5. Avoid broad redesign of sync protocol framing.
 6. Maintain model coherence: update TLA first when behavior changes require it, then implement code to match the model closely.
 
@@ -53,7 +53,7 @@ Mapping:
 - inviter pre-accept pending trust allows first dial
 - joiner accepted trust after `InviteAccepted`
 - supersession when PeerShared-derived trust appears
-- removal-driven deny remains intact
+- strict trust gating remains intact without adding user-removal state
 
 ### Phase 2: Add projection input context
 1. Add `bootstrap_context` table migration.
@@ -102,8 +102,8 @@ Rule of thumb:
 1. Service layer no longer writes trust rows directly.
 2. Trust rows converge via projection.
 3. Existing invite/bootstrap/connect flows still pass.
-4. No regression in strict trust checks and removal semantics.
-5. Tests explicitly cover pre-accept, post-accept, supersession, and removal.
+4. No regression in strict trust checks.
+5. Tests explicitly cover pre-accept, post-accept, and supersession behavior.
 
 ## Follow-up TODOs
 1. Update `docs/PLAN.md` to include this structure explicitly:

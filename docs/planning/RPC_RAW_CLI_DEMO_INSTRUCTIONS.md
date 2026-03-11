@@ -68,16 +68,15 @@ Current method names to expose in `topo rpc methods`:
 18. `AcceptInvite`
 19. `CreateDeviceLink`
 20. `AcceptLink`
-21. `Ban`
-22. `Identity`
-23. `Shutdown`
-24. `Tenants`
-25. `UseTenant`
-26. `ActiveTenant`
-27. `CreateWorkspace`
-28. `Peers`
-29. `Upnp`
-30. `View`
+21. `Identity`
+22. `Shutdown`
+23. `Tenants`
+24. `UseTenant`
+25. `ActiveTenant`
+26. `CreateWorkspace`
+27. `Peers`
+28. `Upnp`
+29. `View`
 
 ## Implementation Plan (Staged)
 

@@ -56,11 +56,6 @@ both `pass` and `break` polarity unless waived.
 | SPEC_DEVICE_CHAIN_01 | InvDeviceInviteChain | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::test_project_reaction_blocked | break |
 | SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
 | SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::test_project_reaction_blocked | break |
-| SPEC_REMOVAL_ADMIN_01 | InvRemovalAdmin | CHK_UR_INSERT | projector_unit | simple_projector_tests::tests::test_user_removed_writes_row | pass |
-| SPEC_REMOVAL_ADMIN_01 | InvRemovalAdmin | CHK_PR_INSERT | projector_unit | simple_projector_tests::tests::test_peer_removed_writes_row | pass |
-| SPEC_REMOVAL_ADMIN_01 | InvRemovalAdmin | CHK_SIGNER_VERIFY | pipeline_integration | apply::tests::test_file_slice_invalid_signature_rejects | break |
-| SPEC_REMOVAL_EXCLUSION_01 | InvRemovalExclusion | CHK_SS_RECIPIENT_REMOVED | projector_unit | secret_shared_projector_tests::tests::test_secret_shared_rejects_removed_recipient | break |
-| SPEC_REMOVAL_EXCLUSION_01 | InvRemovalExclusion | CHK_SS_RECIPIENT_REMOVED | projector_unit | secret_shared_projector_tests::tests::test_secret_shared_valid | pass |
 | SPEC_MSG_WORKSPACE_01 | InvMessageWorkspace | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::test_project_message_valid | pass |
 | SPEC_MSG_WORKSPACE_01 | InvMessageWorkspace | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::test_project_reaction_blocked | break |
 | SPEC_MSG_SIGNER_01 | InvSigner (message) | CHK_MSG_SIGNER_USER_MISMATCH | projector_unit | message_projector_tests::tests::test_message_rejects_signer_user_mismatch | break |
@@ -76,13 +71,12 @@ both `pass` and `break` polarity unless waived.
 | SPEC_ENCRYPTED_ADMISSIBLE_01 | (admissibility) | CHK_ENCRYPTED_ADMISSIBLE | pipeline_integration | apply::tests::test_encrypted_identity_event_rejects | break |
 | SPEC_ENCRYPTED_ADMISSIBLE_01 | (admissibility) | CHK_ENCRYPTED_ADMISSIBLE | pipeline_integration | apply::tests::test_encrypted_message_valid | pass |
 | SPEC_SECRET_SHARED_KEY_01 | InvSecretSharedKey | CHK_SS_INSERT | projector_unit | secret_shared_projector_tests::tests::test_secret_shared_valid | pass |
-| SPEC_SECRET_SHARED_KEY_01 | InvSecretSharedKey | CHK_SS_RECIPIENT_REMOVED | projector_unit | secret_shared_projector_tests::tests::test_secret_shared_rejects_removed_recipient | break |
 | SPEC_FILE_AUTH_01 | InvFileSliceAuth | CHK_FS_GUARD_BLOCK | projector_unit | file_slice_projector_tests::tests::test_file_slice_blocks_no_descriptor | break |
 | SPEC_FILE_AUTH_01 | InvFileSliceAuth | CHK_FS_INSERT | projector_unit | file_slice_projector_tests::tests::test_file_slice_valid | pass |
 | SPEC_FILE_AUTH_02 | InvFileSliceAuth | CHK_FS_SIGNER_MISMATCH | projector_unit | file_slice_projector_tests::tests::test_file_slice_rejects_signer_mismatch | break |
 | SPEC_FILE_AUTH_02 | InvFileSliceAuth | CHK_FS_INSERT | projector_unit | file_slice_projector_tests::tests::test_file_slice_valid | pass |
-| SPEC_DEL_AUTHOR_01 | InvRemovalAdmin (deletion) | CHK_DEL_WRONG_AUTHOR | projector_unit | message_deletion_projector_tests::tests::test_deletion_rejects_wrong_author | break |
-| SPEC_DEL_AUTHOR_01 | InvRemovalAdmin (deletion) | CHK_DEL_TOMBSTONE | projector_unit | message_deletion_projector_tests::tests::test_deletion_valid | pass |
+| SPEC_DEL_AUTHOR_01 | NON_MODELED::author_constraint | CHK_DEL_WRONG_AUTHOR | projector_unit | message_deletion_projector_tests::tests::test_deletion_rejects_wrong_author | break |
+| SPEC_DEL_AUTHOR_01 | NON_MODELED::author_constraint | CHK_DEL_TOMBSTONE | projector_unit | message_deletion_projector_tests::tests::test_deletion_valid | pass |
 | SPEC_RXN_SIGNER_01 | InvSigner (reaction) | CHK_RXN_SIGNER_USER_MISMATCH | projector_unit | reaction_projector_tests::tests::test_reaction_rejects_signer_user_mismatch | break |
 | SPEC_RXN_SIGNER_01 | InvSigner (reaction) | CHK_RXN_INSERT | projector_unit | reaction_projector_tests::tests::test_reaction_valid | pass |
 | SPEC_RXN_SKIP_DEL_01 | (post-tombstone) | CHK_RXN_SKIP_DELETED | projector_unit | reaction_projector_tests::tests::test_reaction_skips_when_target_deleted | pass |
@@ -137,8 +131,6 @@ both `pass` and `break` polarity unless waived.
 | SPEC_PENDING_BOOTSTRAP_CONSUME_01 | InvPendingBootstrapTrustConsumedByPeerShared | CHK_PS_PENDING_BOOTSTRAP_CONSUME | projector_unit | peer_shared_projector_tests::tests::test_peer_shared_rejects_non_peer_shared_event | break |
 | SPEC_PENDING_SOURCE_01 | InvPendingBootstrapTrustSource | CHK_UI_PENDING_SOURCE | projector_unit | user_invite_projector_tests::tests::test_user_invite_writes_pending_trust | pass |
 | SPEC_PENDING_SOURCE_01 | InvPendingBootstrapTrustSource | CHK_UI_PENDING_SOURCE | projector_unit | user_invite_projector_tests::tests::test_user_invite_no_pending_when_not_local | break |
-| SPEC_TRANSITIVE_DENY_01 | InvUserRemovalTransitiveDeny | CHK_SS_TRANSITIVE_DENY | projector_unit | secret_shared_projector_tests::tests::test_secret_shared_rejects_removed_recipient | pass |
-| SPEC_TRANSITIVE_DENY_01 | InvUserRemovalTransitiveDeny | CHK_SS_TRANSITIVE_DENY | projector_unit | secret_shared_projector_tests::tests::test_secret_shared_valid | break |
 | SPEC_WS_DEP_01 | InvAllValidRequireWorkspace | CHK_WS_DEP_REQUIRED | pipeline_integration | apply::tests::test_project_message_valid | pass |
 | SPEC_WS_DEP_01 | InvAllValidRequireWorkspace | CHK_WS_DEP_REQUIRED | pipeline_integration | apply::tests::test_project_reaction_blocked | break |
 
@@ -201,9 +193,6 @@ both `pass` and `break` polarity unless waived.
 | SPEC_BR_SEC_BIND_01 | BrSec_SourceBindingConsistency | CHK_BRIDGE_SEC_SOURCE_BINDING | bridge_integration | tlc::UnifiedBridge::unified_bridge_fix_repro.cfg | pass |
 | SPEC_BR_SEC_BIND_01 | BrSec_SourceBindingConsistency | CHK_BRIDGE_SEC_SOURCE_BINDING | runtime_unit | state::db::transport_trust::tests::test_peer_shared_derived_in_allowlist | pass |
 | SPEC_BR_SEC_BIND_01 | BrSec_SourceBindingConsistency | CHK_BRIDGE_SEC_SOURCE_BINDING | runtime_unit | state::db::transport_trust::tests::test_malformed_peer_shared_pubkey_skipped | break |
-| SPEC_BR_SEC_REMOVE_01 | BrSec_RemovalDeniesConnectivity | CHK_BRIDGE_SEC_REMOVAL_DENY | bridge_integration | tlc::UnifiedBridge::unified_bridge_progress_fast.cfg | pass |
-| SPEC_BR_SEC_REMOVE_01 | BrSec_RemovalDeniesConnectivity | CHK_BRIDGE_SEC_REMOVAL_DENY | runtime_unit | state::db::transport_trust::tests::test_removed_peer_excluded_from_trust | pass |
-| SPEC_BR_SEC_REMOVE_01 | BrSec_RemovalDeniesConnectivity | CHK_BRIDGE_SEC_REMOVAL_DENY | runtime_unit | state::db::transport_trust::tests::test_peer_shared_derived_in_allowlist | break |
 | SPEC_BR_SEC_COLLIDE_01 | BrSec_NoIdentityCollisionInAuthPath | CHK_BRIDGE_SEC_IDENTITY_COLLISION | bridge_integration | tlc::UnifiedBridge::unified_bridge_fix_repro.cfg | pass |
 | SPEC_BR_SEC_COLLIDE_01 | BrSec_NoIdentityCollisionInAuthPath | CHK_BRIDGE_SEC_IDENTITY_COLLISION | runtime_unit | runtime::transport::cert::tests::test_spki_fingerprint_different_certs | pass |
 | SPEC_BR_SEC_COLLIDE_01 | BrSec_NoIdentityCollisionInAuthPath | CHK_BRIDGE_SEC_IDENTITY_COLLISION | runtime_unit | runtime::transport::cert::tests::test_validate_cert_key_match_detects_mismatch | break |

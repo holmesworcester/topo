@@ -5,7 +5,7 @@ EXTENDS FiniteSets, TLC, Integers
 \* TransportCredentialLifecycle-style runtime trust/connection behavior.
 \*
 \* Surfaces:
-\* 1) Event facts (EF_*): invite ownership, bootstrap facts, peer_shared facts, removal facts.
+\* 1) Event facts (EF_*): invite ownership, bootstrap facts, peer_shared facts.
 \* 2) Projection write intents (PW_*): abstract rows for trust and connection state.
 \* 3) Runtime decisions (RT_*): derived trust/auth/dial operators from projected rows.
 \*
@@ -23,7 +23,6 @@ VARIABLES
     efInviteCreator,
     efBootstrapFacts,
     efPeerSharedFacts,
-    efRemovedFacts,
     efPendingFacts,
     pwPeerSharedRows,
     pwBootstrapRows,
@@ -38,7 +37,6 @@ vars ==
        efInviteCreator,
        efBootstrapFacts,
        efPeerSharedFacts,
-       efRemovedFacts,
        efPendingFacts,
        pwPeerSharedRows,
        pwBootstrapRows,
@@ -58,7 +56,6 @@ ASSUME /\ NonePeer \notin Peers
        /\ NoneSPKI \notin SPKIs
 
 Pair(p, s) == <<p, s>>
-Removed(p, s) == Pair(p, s) \in efRemovedFacts
 ActiveCreds == {localCred[p] : p \in Peers} \ {NoneSPKI}
 
 \* ---- Runtime reduction (rows -> decisions) ----
@@ -72,13 +69,11 @@ RT_TrustedSPKIs(p) ==
 CanDialOngoing(p, q) ==
     /\ localCred[q] # NoneSPKI
     /\ localCred[q] \in RT_PeerSharedTrust(p)
-    /\ ~Removed(p, localCred[q])
 
 CanDialFallback(p, q) ==
     /\ localCred[q] # NoneSPKI
     /\ ~CanDialOngoing(p, q)
     /\ localCred[q] \in (RT_BootstrapTrust(p) \union RT_PendingTrust(p))
-    /\ ~Removed(p, localCred[q])
 
 CanAuthorize(p, q) == CanDialOngoing(p, q) \/ CanDialFallback(p, q)
 
@@ -97,10 +92,6 @@ PendingEventCause(p, s) ==
     /\ efInviteCreator[s] = p
     /\ Pair(p, s) \notin pwPeerSharedRows
 
-BlockedByRemoval(p, q) ==
-    /\ localCred[q] # NoneSPKI
-    /\ Removed(p, localCred[q])
-
 BuggyPendingSuppressionEnabled(p, s) ==
     /\ UseBuggyPendingGate
     /\ localCred[p] # NoneSPKI
@@ -115,7 +106,6 @@ TypeOK ==
     /\ efInviteCreator \in [SPKIs -> Peers \union {NonePeer}]
     /\ efBootstrapFacts \subseteq PeerSPKIPairs
     /\ efPeerSharedFacts \subseteq PeerSPKIPairs
-    /\ efRemovedFacts \subseteq PeerSPKIPairs
     /\ efPendingFacts \subseteq PeerSPKIPairs
     /\ pwPeerSharedRows \subseteq PeerSPKIPairs
     /\ pwBootstrapRows \subseteq PeerSPKIPairs
@@ -132,7 +122,6 @@ Init ==
     /\ efInviteCreator = [s \in SPKIs |-> NonePeer]
     /\ efBootstrapFacts = {}
     /\ efPeerSharedFacts = {}
-    /\ efRemovedFacts = {}
     /\ efPendingFacts = {}
     /\ pwPeerSharedRows = {}
     /\ pwBootstrapRows = {}
@@ -148,7 +137,7 @@ InstallLocalCred(p, s) ==
     /\ localCred[p] = NoneSPKI
     /\ s \notin ActiveCreds
     /\ localCred' = [localCred EXCEPT ![p] = s]
-    /\ UNCHANGED <<efInviteCreator, efBootstrapFacts, efPeerSharedFacts, efRemovedFacts, efPendingFacts,
+    /\ UNCHANGED <<efInviteCreator, efBootstrapFacts, efPeerSharedFacts, efPendingFacts,
                   pwPeerSharedRows, pwBootstrapRows, pwPendingRows, pwConnState,
                   syncComplete, fallbackAttempted, pendingProjectionViolation>>
 
@@ -158,7 +147,7 @@ EF_CreateInviteLocal(p, s) ==
     /\ efInviteCreator[s] = NonePeer
     /\ efInviteCreator' = [efInviteCreator EXCEPT ![s] = p]
     /\ efPendingFacts' = efPendingFacts \union {Pair(p, s)}
-    /\ UNCHANGED <<localCred, efBootstrapFacts, efPeerSharedFacts, efRemovedFacts,
+    /\ UNCHANGED <<localCred, efBootstrapFacts, efPeerSharedFacts,
                   pwPeerSharedRows, pwBootstrapRows, pwPendingRows, pwConnState,
                   syncComplete, fallbackAttempted, pendingProjectionViolation>>
 
@@ -166,27 +155,14 @@ EF_AcceptInvite(p, s) ==
     /\ efInviteCreator[s] # NonePeer
     /\ Pair(p, s) \notin efBootstrapFacts
     /\ efBootstrapFacts' = efBootstrapFacts \union {Pair(p, s)}
-    /\ UNCHANGED <<localCred, efInviteCreator, efPeerSharedFacts, efRemovedFacts, efPendingFacts,
+    /\ UNCHANGED <<localCred, efInviteCreator, efPeerSharedFacts, efPendingFacts,
                   pwPeerSharedRows, pwBootstrapRows, pwPendingRows, pwConnState,
                   syncComplete, fallbackAttempted, pendingProjectionViolation>>
 
 EF_AddPeerShared(p, s) ==
     /\ Pair(p, s) \notin efPeerSharedFacts
     /\ efPeerSharedFacts' = efPeerSharedFacts \union {Pair(p, s)}
-    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efRemovedFacts, efPendingFacts,
-                  pwPeerSharedRows, pwBootstrapRows, pwPendingRows, pwConnState,
-                  syncComplete, fallbackAttempted, pendingProjectionViolation>>
-
-EF_RemoveRelation(p, s) ==
-    /\ Pair(p, s) \notin efRemovedFacts
-    /\ efRemovedFacts' = efRemovedFacts \union {Pair(p, s)}
-    /\ pwConnState' =
-        [pwConnState EXCEPT
-            ![p] = [q \in Peers |->
-                IF localCred[q] = s THEN "deny" ELSE pwConnState[p][q]
-            ]
-        ]
-    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPeerSharedFacts, efPendingFacts,
+    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPendingFacts,
                   pwPeerSharedRows, pwBootstrapRows, pwPendingRows,
                   syncComplete, fallbackAttempted, pendingProjectionViolation>>
 
@@ -198,7 +174,7 @@ PW_ProjectPendingWrite(p, s) ==
     /\ ~BuggyPendingSuppressionEnabled(p, s)
     /\ efPendingFacts' = efPendingFacts \ {Pair(p, s)}
     /\ pwPendingRows' = pwPendingRows \union {Pair(p, s)}
-    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPeerSharedFacts, efRemovedFacts,
+    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPeerSharedFacts,
                   pwPeerSharedRows, pwBootstrapRows, pwConnState,
                   syncComplete, fallbackAttempted, pendingProjectionViolation>>
 
@@ -208,7 +184,7 @@ PW_ProjectPendingSuppressed(p, s) ==
     /\ BuggyPendingSuppressionEnabled(p, s)
     /\ efPendingFacts' = efPendingFacts \ {Pair(p, s)}
     /\ pendingProjectionViolation' = TRUE
-    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPeerSharedFacts, efRemovedFacts,
+    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPeerSharedFacts,
                   pwPeerSharedRows, pwBootstrapRows, pwPendingRows, pwConnState,
                   syncComplete, fallbackAttempted>>
 
@@ -217,7 +193,7 @@ PW_ProjectBootstrap(p, s) ==
     /\ Pair(p, s) \notin pwPeerSharedRows
     /\ Pair(p, s) \notin pwBootstrapRows
     /\ pwBootstrapRows' = pwBootstrapRows \union {Pair(p, s)}
-    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPeerSharedFacts, efRemovedFacts, efPendingFacts,
+    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPeerSharedFacts, efPendingFacts,
                   pwPeerSharedRows, pwPendingRows, pwConnState,
                   syncComplete, fallbackAttempted, pendingProjectionViolation>>
 
@@ -234,7 +210,7 @@ PW_ProjectPeerShared(p, s) ==
                 IF localCred[q] = s /\ pwConnState[p][q] = "invite" THEN "peer" ELSE pwConnState[p][q]
             ]
         ]
-    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPeerSharedFacts, efRemovedFacts, efPendingFacts,
+    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPeerSharedFacts, efPendingFacts,
                   syncComplete, fallbackAttempted, pendingProjectionViolation>>
 
 \* ---- Connection-state actions ----
@@ -244,7 +220,7 @@ PW_DialOngoing(p, q) ==
     /\ CanDialOngoing(p, q)
     /\ pwConnState[p][q] # "peer"
     /\ pwConnState' = [pwConnState EXCEPT ![p][q] = "peer"]
-    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPeerSharedFacts, efRemovedFacts, efPendingFacts,
+    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPeerSharedFacts, efPendingFacts,
                   pwPeerSharedRows, pwBootstrapRows, pwPendingRows,
                   syncComplete, fallbackAttempted, pendingProjectionViolation>>
 
@@ -254,7 +230,7 @@ PW_DialBootstrapFallback(p, q) ==
     /\ pwConnState[p][q] # "invite"
     /\ pwConnState' = [pwConnState EXCEPT ![p][q] = "invite"]
     /\ fallbackAttempted' = [fallbackAttempted EXCEPT ![p][q] = TRUE]
-    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPeerSharedFacts, efRemovedFacts, efPendingFacts,
+    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPeerSharedFacts, efPendingFacts,
                   pwPeerSharedRows, pwBootstrapRows, pwPendingRows,
                   syncComplete, pendingProjectionViolation>>
 
@@ -263,17 +239,7 @@ PW_UpgradeConn(p, q) ==
     /\ pwConnState[p][q] = "invite"
     /\ CanDialOngoing(p, q)
     /\ pwConnState' = [pwConnState EXCEPT ![p][q] = "peer"]
-    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPeerSharedFacts, efRemovedFacts, efPendingFacts,
-                  pwPeerSharedRows, pwBootstrapRows, pwPendingRows,
-                  syncComplete, fallbackAttempted, pendingProjectionViolation>>
-
-PW_Deny(p, q) ==
-    /\ p # q
-    /\ localCred[q] # NoneSPKI
-    /\ Removed(p, localCred[q])
-    /\ pwConnState[p][q] # "deny"
-    /\ pwConnState' = [pwConnState EXCEPT ![p][q] = "deny"]
-    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPeerSharedFacts, efRemovedFacts, efPendingFacts,
+    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPeerSharedFacts, efPendingFacts,
                   pwPeerSharedRows, pwBootstrapRows, pwPendingRows,
                   syncComplete, fallbackAttempted, pendingProjectionViolation>>
 
@@ -281,10 +247,9 @@ MarkSyncComplete(p, q) ==
     /\ p # q
     /\ pwConnState[p][q] \in {"invite", "peer"}
     /\ localCred[q] # NoneSPKI
-    /\ ~Removed(p, localCred[q])
     /\ ~syncComplete[p][q]
     /\ syncComplete' = [syncComplete EXCEPT ![p][q] = TRUE]
-    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPeerSharedFacts, efRemovedFacts, efPendingFacts,
+    /\ UNCHANGED <<localCred, efInviteCreator, efBootstrapFacts, efPeerSharedFacts, efPendingFacts,
                   pwPeerSharedRows, pwBootstrapRows, pwPendingRows, pwConnState,
                   fallbackAttempted, pendingProjectionViolation>>
 
@@ -296,7 +261,6 @@ Next ==
         \/ EF_CreateInviteLocal(p, s)
         \/ EF_AcceptInvite(p, s)
         \/ EF_AddPeerShared(p, s)
-        \/ EF_RemoveRelation(p, s)
         \/ PW_ProjectPendingWrite(p, s)
         \/ PW_ProjectPendingSuppressed(p, s)
         \/ PW_ProjectBootstrap(p, s)
@@ -305,7 +269,6 @@ Next ==
         \/ PW_DialOngoing(p, q)
         \/ PW_DialBootstrapFallback(p, q)
         \/ PW_UpgradeConn(p, q)
-        \/ PW_Deny(p, q)
         \/ MarkSyncComplete(p, q)
 
 FairProjection ==
@@ -321,7 +284,6 @@ FairConnection ==
         WF_vars(PW_DialOngoing(p, q)
                 \/ PW_DialBootstrapFallback(p, q)
                 \/ PW_UpgradeConn(p, q)
-                \/ PW_Deny(p, q)
                 \/ MarkSyncComplete(p, q))
 
 Spec == Init /\ [][Next]_vars /\ FairProjection /\ FairConnection
@@ -329,7 +291,6 @@ Spec == Init /\ [][Next]_vars /\ FairProjection /\ FairConnection
 \* ---- Config constraints (named for .cfg usage) ----
 
 CfgFixConstraint ==
-    /\ Cardinality(efRemovedFacts) <= 1
     /\ Cardinality(efPeerSharedFacts) <= 2
     /\ Cardinality(efBootstrapFacts) <= 2
     /\ Cardinality(efPendingFacts) <= 1
@@ -338,7 +299,6 @@ CfgFixConstraint ==
     /\ fallbackAttempted["bob"]["alice"] = FALSE
 
 CfgProgressFastConstraint ==
-    /\ Cardinality(efRemovedFacts) <= 1
     /\ Cardinality(efPeerSharedFacts) <= 3
     /\ Cardinality(efBootstrapFacts) <= 2
     /\ Cardinality(efPendingFacts) <= 2
@@ -347,7 +307,6 @@ CfgProgressFastConstraint ==
     /\ fallbackAttempted["bob"]["alice"] = FALSE
 
 CfgProgressDeepConstraint ==
-    /\ Cardinality(efRemovedFacts) <= 2
     /\ Cardinality(efPeerSharedFacts) <= 3
     /\ Cardinality(efBootstrapFacts) <= 2
     /\ Cardinality(efPendingFacts) <= 2
@@ -417,12 +376,6 @@ BrSec_SourceBindingConsistency ==
         /\ (pwConnState[p][q] = "peer" => CanDialOngoing(p, q))
         /\ (pwConnState[p][q] = "invite" => CanDialFallback(p, q))
 
-BrSec_RemovalDeniesConnectivity ==
-    \A p \in Peers, q \in Peers :
-        /\ localCred[q] # NoneSPKI
-        /\ Removed(p, localCred[q])
-        => ~(pwConnState[p][q] \in {"invite", "peer"})
-
 BrSec_NoIdentityCollisionInAuthPath ==
     \A p \in Peers, q \in Peers :
         /\ p # q
@@ -435,26 +388,21 @@ BrSec_NoIdentityCollisionInAuthPath ==
 BrLive_BootstrapConnectEventually ==
     \A p \in Peers, q \in Peers :
         (p # q /\ (CanDialFallback(p, q) \/ CanDialOngoing(p, q)))
-        ~> (pwConnState[p][q] \in {"invite", "peer"} \/ BlockedByRemoval(p, q))
+        ~> (pwConnState[p][q] \in {"invite", "peer"})
 
 BrLive_PeerUpgradeEventually ==
     \A p \in Peers, q \in Peers :
         (p # q /\ pwConnState[p][q] = "invite" /\ CanDialOngoing(p, q))
-        ~> (pwConnState[p][q] = "peer" \/ BlockedByRemoval(p, q))
+        ~> (pwConnState[p][q] = "peer")
 
 BrLive_BootstrapCompletionSyncEventually ==
     \A p \in Peers, q \in Peers :
         (p # q /\ pwConnState[p][q] \in {"invite", "peer"} /\ ~syncComplete[p][q])
-        ~> (syncComplete[p][q] \/ BlockedByRemoval(p, q))
+        ~> syncComplete[p][q]
 
 BrLive_FallbackAttemptEventually ==
     \A p \in Peers, q \in Peers :
         (p # q /\ CanDialFallback(p, q))
-        ~> (fallbackAttempted[p][q] \/ CanDialOngoing(p, q) \/ BlockedByRemoval(p, q))
-
-BrLive_RemovalConvergesToDeny ==
-    \A p \in Peers, q \in Peers :
-        (p # q /\ localCred[q] # NoneSPKI /\ Removed(p, localCred[q]))
-        ~> (pwConnState[p][q] = "deny")
+        ~> (fallbackAttempted[p][q] \/ CanDialOngoing(p, q))
 
 ====

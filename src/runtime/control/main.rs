@@ -369,12 +369,6 @@ enum Commands {
         devicename: Option<String>,
     },
 
-    /// Ban (remove) a user from the workspace
-    Ban {
-        /// User number (from `topo users`), #N, or hex event ID
-        user: String,
-    },
-
     /// Show combined identity info (transport + user + peer)
     Identity,
 
@@ -2669,16 +2663,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let peer_id = data["peer_id"].as_str().unwrap_or("");
             println!("Accepted device link");
             println!("  peer_id: {}", short_id(peer_id));
-        }
-
-        Commands::Ban { user } => {
-            let data = rpc_require_daemon(
-                db,
-                socket_override.as_deref(),
-                RpcMethod::Ban { target: user },
-            )?;
-            let target = data["target"].as_str().unwrap_or("");
-            println!("Banned user {}", &target[..target.len().min(16)]);
         }
 
         Commands::Identity => {

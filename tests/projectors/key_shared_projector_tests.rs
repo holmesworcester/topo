@@ -1,7 +1,6 @@
 //! Pure projector conformance tests for KeyShared (type 22).
 //!
 //! TLA+ guards tested:
-//!   SPEC_REMOVAL_EXCLUSION_01 — InvRemovalExclusion (recipient removed reject + pass)
 //!   SPEC_SECRET_SHARED_KEY_01 — InvKeySharedKey (valid insert)
 
 #[cfg(test)]
@@ -25,8 +24,6 @@ mod tests {
         })
     }
 
-    // ── SPEC_REMOVAL_EXCLUSION_01: pass ──
-
     #[test]
     fn test_key_shared_valid() {
         let key_bytes = [42u8; 32];
@@ -45,18 +42,6 @@ mod tests {
         assert_emits_command(&result, "EmitDeterministicBlob", |cmd| {
             matches!(cmd, EmitCommand::EmitDeterministicBlob { .. })
         });
-    }
-
-    // ── SPEC_REMOVAL_EXCLUSION_01: break ──
-
-    #[test]
-    fn test_key_shared_rejects_removed_recipient() {
-        let parsed = make_key_shared([9u8; 32]);
-        let ctx = ctx_with_recipient_removed();
-        let event_id = b64(&[9u8; 32]);
-
-        let result = project_pure(PEER, &event_id, &parsed, &ctx);
-        assert_reject_contains(&result, "has been removed");
     }
 
     #[test]

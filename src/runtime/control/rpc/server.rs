@@ -1146,16 +1146,6 @@ fn dispatch(
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }
-        RpcMethod::Ban { target } => match state.require_active_peer() {
-            Ok(peer_id) => match user::ban_for_peer(db_path, &peer_id, &target) {
-                Ok(data) => {
-                    state.notify_runtime_recheck();
-                    RpcResponse::success(data)
-                }
-                Err(e) => RpcResponse::error(e.to_string()),
-            },
-            Err(e) => RpcResponse::error(e),
-        },
         RpcMethod::Identity => match state.require_active_peer() {
             Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
                 Ok((_recorded_by, db)) => match peer_shared::identity(&db, &peer_id) {

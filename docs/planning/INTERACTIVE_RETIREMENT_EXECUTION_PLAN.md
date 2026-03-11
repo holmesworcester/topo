@@ -10,6 +10,8 @@ Move all useful interactive command functionality and UX affordances into the da
 
 Also add CLI DB-alias affordances so `--db` can resolve registry aliases/indexes (for example `--db 1`) in addition to raw paths.
 
+User removal / banning is out of scope in this PoC. The interactive `ban` command should be retired, not migrated, because safe removal requires key rotation and group key agreement that are not implemented here.
+
 Constraints:
 
 1. Preserve user-facing behavior unless explicitly marked suspect.
@@ -43,7 +45,6 @@ Interactive commands today:
 18. `workspaces`
 19. `status`
 20. `identity`
-21. `ban`
 
 ## Parity Matrix
 
@@ -60,7 +61,6 @@ Add missing CLI/RPC commands:
 
 1. `link` (create device-link invite)
 2. `accept-link`
-3. `ban`
 4. `identity` (combined view for transport + active user/peer)
 5. `workspaces` alias (keep `networks` as compatibility alias during cutover round, then remove old name in same round per POC replacement policy).
 
@@ -68,7 +68,6 @@ Add missing frontend affordances:
 
 1. Invite number aliases (for `accept-link`; `accept` is pre-daemon bootstrap and takes raw links only)
 2. Message number aliases (for `react` and `delete-message`)
-3. User number aliases (for `ban`)
 4. Channel aliases (`channels`, `new-channel`, `channel`) as daemon frontend state over existing channel IDs
 5. DB selector aliases for all registered DBs: `--db <path|name|index>`
 
@@ -152,9 +151,8 @@ Extend `RpcMethod` and server dispatch with:
 1. `CreateInvite { public_addr, public_spki? }` (replace bootstrap-named field)
 2. `CreateDeviceLink { public_addr, public_spki? }`
 3. `AcceptLink { invite, devicename }`
-4. `Ban { target }` (`target` supports raw ID or alias selector)
-5. `Identity`
-6. Optional explicit alias endpoints if needed (`Invites`, `Channels`, `UseChannel`, `NewChannel`), or encode aliases directly in command methods.
+4. `Identity`
+5. Optional explicit alias endpoints if needed (`Invites`, `Channels`, `UseChannel`, `NewChannel`), or encode aliases directly in command methods.
 
 Keep all alias resolution daemon-side (not process-local CLI-side).
 
@@ -164,7 +162,7 @@ Promote existing conn-only helpers to daemon-usable wrappers where needed:
 
 1. Create user/device-link invite for active peer from persisted key material with explicit published endpoint inputs (`public_addr`, `public_spki?`).
 2. Accept device-link invite via existing async service path.
-3. Ban by user selector (resolve selector -> event ID -> `UserRemoved` emission).
+3. Remove the old interactive `ban` surface rather than migrating it.
 4. Message selector wrappers for `react`/`delete`.
 5. Identity summary response.
 
@@ -177,14 +175,13 @@ Add/adjust commands in `src/main.rs`:
 1. `invite --public-addr <host:port> [--public-spki <hex32>]`
 2. `link --public-addr <host:port> [--public-spki <hex32>]`
 3. `accept-link --invite <n|link> --devicename <name>`
-4. `ban --user <n|id>`
-5. `identity`
-6. `workspaces` alias
-7. Selector grammar for message/user/invite args: accept `N`, `#N`, hex/base64/raw link forms as applicable.
-8. Output contract for `invite`/`link`: print full link in a machine-friendly form; optional alias metadata may be printed additionally.
-9. Add `topo completions <bash|zsh|fish|powershell|elvish>` (clap-generated static completion scripts).
-10. Add path hint for `--db` argument so shell path completion works for raw DB paths.
-11. Replace old invite-creation flag naming in one round:
+4. `identity`
+5. `workspaces` alias
+6. Selector grammar for message/invite args: accept `N`, `#N`, hex/base64/raw link forms as applicable.
+7. Output contract for `invite`/`link`: print full link in a machine-friendly form; optional alias metadata may be printed additionally.
+8. Add `topo completions <bash|zsh|fish|powershell|elvish>` (clap-generated static completion scripts).
+9. Add path hint for `--db` argument so shell path completion works for raw DB paths.
+10. Replace old invite-creation flag naming in one round:
    - remove `--bootstrap` from user-facing invite/link creation commands,
    - use `--public-addr` consistently in help, docs, and tests.
 
@@ -201,7 +198,6 @@ Add/port tests to non-interactive suites:
 2. Add selector/alias tests:
    - invite number -> accept/accept-link
    - message number -> react/delete
-   - user number -> ban
    - channel alias selection
 3. Add link/accept-link end-to-end tests.
 4. Add identity/workspaces alias tests.

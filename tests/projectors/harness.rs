@@ -40,14 +40,6 @@ pub mod fixtures {
         }
     }
 
-    /// ContextSnapshot with recipient_removed flag set.
-    pub fn ctx_with_recipient_removed() -> ContextSnapshot {
-        ContextSnapshot {
-            recipient_removed: true,
-            ..Default::default()
-        }
-    }
-
     /// ContextSnapshot with file descriptors.
     pub fn ctx_with_file_descriptors(descriptors: Vec<FileDescriptorInfo>) -> ContextSnapshot {
         ContextSnapshot {

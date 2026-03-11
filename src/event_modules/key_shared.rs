@@ -144,11 +144,6 @@ pub fn build_projector_context(
 
     let recipient_b64 = event_id_to_base64(&ss.recipient_event_id);
     let unwrap_key_b64 = event_id_to_base64(&ss.unwrap_key_event_id);
-    let recipient_removed = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM removed_entities WHERE recorded_by = ?1 AND target_event_id = ?2",
-        rusqlite::params![recorded_by, &recipient_b64],
-        |row| row.get(0),
-    )?;
 
     let invite_secret_row: Option<Vec<u8>> = conn
         .query_row(
@@ -165,18 +160,10 @@ pub fn build_projector_context(
 
     let private_key_bytes = match invite_secret_row {
         Some(v) => v,
-        None => {
-            return Ok(ContextSnapshot {
-                recipient_removed,
-                ..ContextSnapshot::default()
-            });
-        }
+        None => return Ok(ContextSnapshot::default()),
     };
     if private_key_bytes.len() != 32 {
-        return Ok(ContextSnapshot {
-            recipient_removed,
-            ..ContextSnapshot::default()
-        });
+        return Ok(ContextSnapshot::default());
     }
 
     let mut key_arr = [0u8; 32];
@@ -185,27 +172,16 @@ pub fn build_projector_context(
 
     let sender_key = match resolve_signer_key(conn, recorded_by, ss.signer_type, &ss.signed_by) {
         Ok(SignerResolution::Found(k)) => k,
-        _ => {
-            return Ok(ContextSnapshot {
-                recipient_removed,
-                ..ContextSnapshot::default()
-            });
-        }
+        _ => return Ok(ContextSnapshot::default()),
     };
     let sender_pub = match ed25519_dalek::VerifyingKey::from_bytes(&sender_key) {
         Ok(vk) => vk,
-        Err(_) => {
-            return Ok(ContextSnapshot {
-                recipient_removed,
-                ..ContextSnapshot::default()
-            });
-        }
+        Err(_) => return Ok(ContextSnapshot::default()),
     };
 
     let plaintext_key = unwrap_key_from_sender(&local_signing_key, &sender_pub, &ss.wrapped_key);
 
     Ok(ContextSnapshot {
-        recipient_removed,
         unwrapped_secret_material: Some(crate::projection::contract::UnwrappedSecretMaterial {
             key_bytes: plaintext_key,
         }),
@@ -214,7 +190,6 @@ pub fn build_projector_context(
 }
 
 /// Pure projector: KeyShared → key_shared table.
-/// Rejects if recipient has been removed (InvRemovalExclusion).
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
@@ -228,10 +203,6 @@ pub fn project_pure(
 
     let key_b64 = event_id_to_base64(&ss.key_event_id);
     let recipient_b64 = event_id_to_base64(&ss.recipient_event_id);
-
-    if ctx.recipient_removed {
-        return ProjectorResult::reject(format!("recipient {} has been removed", recipient_b64));
-    }
 
     let ops = vec![WriteOp::InsertOrIgnore {
         table: "key_shared",

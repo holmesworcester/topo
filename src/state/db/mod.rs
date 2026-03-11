@@ -5,7 +5,6 @@ pub mod local_client_ops;
 pub mod need_queue;
 pub mod project_queue;
 pub mod queue;
-pub mod removal_watch;
 pub mod schema;
 pub mod store;
 pub mod sync_log;

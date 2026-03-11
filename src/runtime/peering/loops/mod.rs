@@ -36,8 +36,6 @@ use tracing::warn;
 use crate::contracts::peering_contract::{
     PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId, TransportSessionIo,
 };
-use crate::db::open_connection;
-use crate::db::removal_watch::is_peer_removed;
 use crate::sync::SyncSessionHandler;
 
 // ---------------------------------------------------------------------------
@@ -97,28 +95,6 @@ pub(crate) fn peer_fingerprint_from_hex(peer_id: &str) -> Option<[u8; 32]> {
     Some(fp)
 }
 
-pub(super) fn spawn_peer_removal_cancellation_watch(
-    db_path: String,
-    recorded_by: String,
-    peer_fp: [u8; 32],
-    cancel: CancellationToken,
-) -> tokio::task::JoinHandle<()> {
-    tokio::task::spawn_local(async move {
-        loop {
-            if cancel.is_cancelled() {
-                break;
-            }
-            if let Ok(db) = open_connection(&db_path) {
-                if is_peer_removed(&db, &recorded_by, &peer_fp).unwrap_or(false) {
-                    cancel.cancel();
-                    break;
-                }
-            }
-            tokio::time::sleep(Duration::from_millis(250)).await;
-        }
-    })
-}
-
 // ---------------------------------------------------------------------------
 // Transport↔peering session seam
 // ---------------------------------------------------------------------------
@@ -126,7 +102,7 @@ pub(super) fn spawn_peer_removal_cancellation_watch(
 /// Run a single sync session using a pre-built `TransportSessionIo`.
 ///
 /// This is the peering orchestration seam: it wires session metadata,
-/// peer-removal cancellation, and the session handler together. Transport
+/// cancellation, and the session handler together. Transport
 /// details (stream opening, `DualConnection`, `QuicTransportSessionIo`)
 /// are handled by `transport::session_factory` before this is called.
 pub(super) async fn run_session(
@@ -137,7 +113,7 @@ pub(super) async fn run_session(
     peer_fp: [u8; 32],
     remote_addr: SocketAddr,
     direction: SessionDirection,
-    db_path: &str,
+    _db_path: &str,
 ) {
     let meta = SessionMeta {
         session_id,
@@ -147,12 +123,6 @@ pub(super) async fn run_session(
         direction,
     };
     let cancel = CancellationToken::new();
-    let watch = spawn_peer_removal_cancellation_watch(
-        db_path.to_string(),
-        tenant_id.to_string(),
-        peer_fp,
-        cancel.clone(),
-    );
 
     if let Err(e) = handler.on_session(meta, io, cancel.clone()).await {
         let label = match direction {
@@ -162,7 +132,6 @@ pub(super) async fn run_session(
         warn!("{} session error: {}", label, e);
     }
     cancel.cancel();
-    let _ = watch.await;
 }
 
 pub(super) use crate::tuning::drain_batch_size;

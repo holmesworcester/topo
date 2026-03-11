@@ -17,10 +17,6 @@ EXTENDS Naturals, FiniteSets
 \* event IDs (BLAKE2b of key bytes → created_at_ms), ensuring both parties agree
 \* on key_event_id values without out-of-band coordination.
 \*
-\* Adds removal modeling:
-\*   user_removed    — removes a user (and transitively excludes peers)
-\*   peer_removed    — removes a specific peer device
-\*
 \* Workspace binding refinement:
 \*   Workspace events are parameterized by workspace id.
 \*   invite_accepted binds trustAnchor directly from its own workspace_id field.
@@ -38,9 +34,6 @@ EXTENDS Naturals, FiniteSets
 \*   Device-link acceptance stays inside an existing workspace binding instead
 \*   of rebinding a peer perspective to a different workspace.
 \*
-\* Key semantic: after a peer observes a removal, new key_shared events
-\*   must NOT wrap to the removed peer (InvRemovalExclusion).
-\*
 \* Ongoing identity variants were removed from protocol state. Legacy
 \* identifiers below are aliased to their surviving event kinds so existing
 \* invariants remain comparable without changing check names.
@@ -53,7 +46,7 @@ EXTENDS Naturals, FiniteSets
 
 CONSTANTS ActiveEvents, Peers, Workspaces
 
-VARIABLES recorded, valid, trustAnchor, removed,
+VARIABLES recorded, valid, trustAnchor,
           inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
           inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
           peerPrivkeyCarriedSigner,
@@ -105,10 +98,6 @@ Secret == "key_secret"
 SecretShared == "key_shared"
 Encrypted == "encrypted"
 
-\* Removal
-UserRemoved == "user_removed"
-PeerRemoved == "peer_removed"
-
 \* ---- Workspace events (parameterized by workspace id) ----
 \* Workspace events are the workspace id strings themselves.
 \* Workspaces must not overlap with FullEventTypes (checked by ASSUME below).
@@ -133,8 +122,7 @@ FullEventTypes == {
     InvitePrivkey,
     Channel, Message, MessageReaction, MessageDeletion,
     MessageAttachment, FileSlice,
-    Secret, SecretShared, Encrypted,
-    UserRemoved, PeerRemoved
+    Secret, SecretShared, Encrypted
 }
 
 \* Full event universe (singleton types + parameterized workspace events)
@@ -170,8 +158,7 @@ IdentityEvents == {
     PeerShared,
     Admin,
     PeerPrivkey,
-    InvitePrivkey,
-    UserRemoved, PeerRemoved
+    InvitePrivkey
 } \cup AllWorkspaceEvents
 
 ContentEvents == {Channel, Message, MessageReaction, MessageDeletion, MessageAttachment, FileSlice}
@@ -231,10 +218,6 @@ RawDeps(e) ==
        [] e = SecretShared -> InviteEvents \cup {InvitePrivkey}
        [] e = Encrypted -> {Secret}
 
-       \* Removal: depends on the entity being removed
-       [] e = UserRemoved -> {User}
-       [] e = PeerRemoved -> {PeerShared}
-
        [] OTHER -> {}
 
 \* SignerDep: whose public key must be valid to verify the event's signature.
@@ -265,10 +248,6 @@ SignerDep(e) ==
 
        \* Encryption: key_shared signed by sender peer
        [] e = SecretShared -> PeerSharedSignerEvents
-
-       \* Removal: signed by admin peer
-       [] e = UserRemoved -> PeerSharedSignerEvents
-       [] e = PeerRemoved -> PeerSharedSignerEvents
 
        [] OTHER -> {}
 
@@ -317,7 +296,6 @@ Init ==
     /\ recorded = [p \in Peers |-> {}]
     /\ valid = [p \in Peers |-> {}]
     /\ trustAnchor = [p \in Peers |-> "none"]
-    /\ removed = [p \in Peers |-> {}]
     /\ inviteCarriedWorkspace = [p \in Peers |-> "none"]
     /\ inviteCarriedBootstrapPeer = [p \in Peers |-> "none"]
     /\ bootstrapTrustPeer = [p \in Peers |-> "none"]
@@ -368,7 +346,7 @@ Record(p, e) ==
        THEN \E dp \in Peers:
             peerSharedDerivedPeer' = [peerSharedDerivedPeer EXCEPT ![p] = dp]
        ELSE UNCHANGED peerSharedDerivedPeer
-    /\ UNCHANGED <<valid, trustAnchor, removed, bootstrapTrustPeer, peerSharedTrustPeer, connState>>
+    /\ UNCHANGED <<valid, trustAnchor, bootstrapTrustPeer, peerSharedTrustPeer, connState>>
 
 \* invite_accepted binds the trust anchor from its event-carried workspace_id.
 \* First-write-wins: if trust anchor is already set to a different workspace,
@@ -408,12 +386,6 @@ Project(p, e) ==
         IF e = InviteAccepted /\ trustAnchor[p] = "none"
         THEN [trustAnchor EXCEPT ![p] = inviteCarriedWorkspace[p]]
         ELSE trustAnchor
-    /\ removed' =
-        IF e = UserRemoved
-        THEN [removed EXCEPT ![p] = @ \cup {"user_target"}]
-        ELSE IF e = PeerRemoved
-        THEN [removed EXCEPT ![p] = @ \cup {"peer_target"}]
-        ELSE removed
     /\ bootstrapTrustPeer' =
         IF e = InviteAccepted /\ bootstrapTrustPeer[p] = "none"
         THEN [bootstrapTrustPeer EXCEPT ![p] = inviteCarriedBootstrapPeer[p]]
@@ -434,7 +406,7 @@ Project(p, e) ==
                   secretSharedCarriedInvite, peerSharedDerivedPeer, connState>>
 
 Stutter ==
-    UNCHANGED <<recorded, valid, trustAnchor, removed,
+    UNCHANGED <<recorded, valid, trustAnchor,
                 inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
                 inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
                 peerPrivkeyCarriedSigner,
@@ -446,14 +418,14 @@ Stutter ==
 \* Models the upgrade from invite-labeled to peer-labeled connection.
 \* Only active when InviteAccepted is in EVENTS.
 
-allVars == <<recorded, valid, trustAnchor, removed,
+allVars == <<recorded, valid, trustAnchor,
              inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
              inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
              peerPrivkeyCarriedSigner,
              invitePrivkeyCarriedInvite, secretSharedCarriedInvite,
              peerSharedDerivedPeer, peerSharedTrustPeer, connState>>
 
-nonConnVars == <<recorded, valid, trustAnchor, removed,
+nonConnVars == <<recorded, valid, trustAnchor,
                  inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
                  inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
                  peerPrivkeyCarriedSigner,
@@ -507,7 +479,6 @@ TypeOK ==
     /\ valid \in [Peers -> SUBSET EVENTS]
     /\ \A p \in Peers: valid[p] \subseteq recorded[p]
     /\ trustAnchor \in [Peers -> Workspaces \cup {"none"}]
-    /\ removed \in [Peers -> SUBSET {"user_target", "peer_target"}]
     /\ inviteCarriedWorkspace \in [Peers -> Workspaces \cup {"none"}]
     /\ inviteCarriedBootstrapPeer \in [Peers -> Peers \cup {"none"}]
     /\ bootstrapTrustPeer \in [Peers -> Peers \cup {"none"}]
@@ -673,31 +644,6 @@ InvDeviceLinkScopedToExistingWorkspace ==
 InvAdminChain ==
     IF Admin \in EVENTS
     THEN \A p \in Peers: (Admin \in valid[p]) => (User \in valid[p])
-    ELSE TRUE
-
-\* Removal events require peer-shared signer context.
-InvRemovalAdmin ==
-    IF (UserRemoved \in EVENTS \/ PeerRemoved \in EVENTS) /\ (PeerSharedSignerEvents \cap EVENTS) /= {}
-    THEN \A p \in Peers:
-        ((UserRemoved \in valid[p]) =>
-            (\E ps \in (PeerSharedSignerEvents \cap EVENTS): ps \in valid[p]))
-        /\ ((PeerRemoved \in valid[p]) =>
-            (\E ps \in (PeerSharedSignerEvents \cap EVENTS): ps \in valid[p]))
-    ELSE TRUE
-
-\* Sender-subjective key wrap exclusion:
-\* After a peer has projected a removal, key_shared must not co-exist
-\* with the removal without the removal being observed first.
-\* Modeled abstractly: if both SecretShared and a removal are valid,
-\* the removal must be valid (the sender saw it).
-InvRemovalExclusion ==
-    IF SecretShared \in EVENTS /\ (UserRemoved \in EVENTS \/ PeerRemoved \in EVENTS)
-    THEN \A p \in Peers:
-        (SecretShared \in valid[p] /\ (UserRemoved \in EVENTS => UserRemoved \in recorded[p]))
-            => TRUE  \* In this abstract model, the invariant is structural:
-                      \* the dep on PeerShared ensures wraps only go to
-                      \* peers that were valid at projection time.
-                      \* A more refined model would track per-wrap recipients.
     ELSE TRUE
 
 \* Message requires workspace (network event).

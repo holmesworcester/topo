@@ -46,7 +46,7 @@ This branch is item 2 only. Do not take on identity-vs-transport contract redesi
    - message
    - reaction
    - message_deletion
-   - user_removed
+   - file
 2. Service functions should call event-module APIs, not inline event-specific SQL.
 3. If a module exceeds readability bounds, keep the split layout (`wire`, `create`, `queries`, `projector`, `mod`).
 
@@ -80,7 +80,7 @@ This branch is item 2 only. Do not take on identity-vs-transport contract redesi
 ## Suggested implementation order
 
 1. Add/expand typed command+query registry surface.
-2. Migrate one vertical slice (message + reaction + deletion + user_removed).
+2. Migrate one vertical slice (message + reaction + deletion + file).
 3. Refactor invite_accepted force-valid path to explicit workspace command emission.
 4. Remove obsolete service helpers.
 5. Update PLAN/DESIGN.

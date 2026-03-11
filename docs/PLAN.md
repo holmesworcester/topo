@@ -25,7 +25,7 @@ This document is ordered exactly as we should build it.
 9. `Phase 9`: Durable queue architecture (`ingress`, `project`, `egress`) and workers.
 10. `Phase 10`: Non-identity special-case projector logic (deletion/emitted-events).
 11. `Phase 11`: Performance hardening, observability, scaling, and low-memory iOS mode.
-12. `Phase 12`: TLA-first minimal identity layer for accepted-workspace cascade, removal, and sender-subjective encryption.
+12. `Phase 12`: TLA-first minimal identity layer for accepted-workspace cascade and sender-subjective encryption.
 13. `Phase 13`: Functional multitenancy — one node hosting N tenant identities in a shared DB with one shared QUIC endpoint and per-tenant routing/discovery.
 
 Scheduling note:
@@ -112,7 +112,7 @@ These are required, not optional:
    - `create_workspace` is strictly tenant-scoped once local creds exist: `recorded_by` must match a known local tenant peer ID in `local_transport_creds`; unscoped aliases are rejected. Fresh DB bootstrap (no local creds) remains allowed.
 12. Transport fingerprint bridge.
    - `peer_shared` projection materializes deterministic `peers_shared.transport_fingerprint` and indexes `(recorded_by, transport_fingerprint)`.
-   - trust/removal lookup paths use projected `transport_fingerprint` rows and do not fallback to runtime scan+derive over `peers_shared.public_key`.
+   - trust lookup paths use projected `transport_fingerprint` rows and do not fallback to runtime scan+derive over `peers_shared.public_key`.
 
 ## 2.2 CLI Architecture Principle
 
@@ -230,7 +230,7 @@ Initiator completion is `DoneAck`-gated.
 For any transport-affecting PR, require:
 1. positive/negative handshake tests,
 2. reconnect/retry tests across daemon restarts,
-3. removal-policy tests (new handshakes denied; active sessions torn down).
+3. transport trust policy tests (new handshakes follow current SQL trust state; no user-removal teardown behavior is in scope).
 
 ## 4.4 Anti-regression constraints
 
@@ -521,7 +521,7 @@ Deterministic emitted-event exception (still under this rule):
 
 - `message_deletion` uses the two-stage deletion intent + tombstone model (see Phase 10).
 - deterministic emitted-event patterns (for example key material derivations) using the unsigned deterministic exception above.
-- identity-specific exceptions (`invite_accepted` accepted-workspace binding via `RetryWorkspaceEvent { workspace_id }`, removal enforcement, transport identity intent application) implemented via explicit projector decisions + `WriteOp`/`EmitCommand` handling.
+- identity-specific exceptions (`invite_accepted` accepted-workspace binding via `RetryWorkspaceEvent { workspace_id }`, transport identity intent application) implemented via explicit projector decisions + `WriteOp`/`EmitCommand` handling.
 
 ### Deletion intent + tombstone contract (Phase 10)
 
@@ -1094,7 +1094,7 @@ Prerequisite: Phase 6 signer substrate is complete before identity projector imp
 
 ## 11.1 Phase gate: TLA+ causal model first
 
-Before writing identity/removal/encryption projectors in Rust:
+Before writing identity/encryption projectors in Rust:
 1. Confirm signer pipeline from Phase 6 is active:
    - missing `signed_by` dependency blocks,
    - unblocked signer enables signature verification,
@@ -1107,7 +1107,7 @@ Before writing identity/removal/encryption projectors in Rust:
    - accepted-workspace guard applies to root workspace events,
    - `invite_accepted` is local binding from carried `workspace_id` (no invite-presence dep gate),
    - downstream identity admission (`user`/`device`/`peer`) still requires signer/dependency chain validity in the same peer scope.
-7. Verify bootstrap/self-invite, join, device-link, and removal safety invariants.
+7. Verify bootstrap/self-invite, join, and device-link safety invariants.
 8. Freeze a projector-spec mapping table: each projector predicate/check maps to a named TLA guard.
 9. Record TLA scope boundary for this phase:
    - current identity-causality models may abstract away transport TLS credential/session-key lifecycle.
@@ -1121,10 +1121,11 @@ Only include identity and policy needed for:
 - accepted-workspace bootstrap/join cascade
 - self-invite bootstrap flow
 - device linking
-- removal enforcement
 - recipient selection for encrypted message key wraps
 - transport mTLS trust policy derived from identity-backed SQL trust state
   (PeerShared-derived SPKIs + accepted-invite bootstrap trust), not static CLI/file pin sources
+
+User removal is out of scope in this phase because safe removal requires key rotation and group key agreement beyond this PoC.
 
 ## 11.3 Split invite event types (no mode switch)
 
@@ -1211,11 +1212,11 @@ Not in scope yet:
 - optimized tree cover (TreeKEM update paths),
 - advanced healing policies.
 
-## 11.6 Minimal removal rule in this phase
+## 11.6 User removal is out of scope in this phase
 
-- `user_removed` / `peer_removed` projection updates eligibility state.
-- from first message after observing removal, sender must exclude removed peers from key wraps.
-- no historical re-encryption; only forward behavior is required in this phase.
+- The PoC does not implement `user_removed`, `peer_removed`, or `ban`.
+- Safe removal requires key rotation and group key agreement, which are deferred beyond this phase.
+- Sender-subjective encryption in this phase wraps to the currently known peer set only.
 
 ## 11.7 TLA-to-projector conformance rule
 
@@ -1248,7 +1249,7 @@ Previous gap: TLA models were identity/event-causality models that did not encod
 - PeerShared trust source is represented as projected `peers_shared.transport_fingerprint` values (indexed by `(recorded_by, transport_fingerprint)`), matching runtime lookup shape.
 - Consumption: PeerShared projector emits deterministic `WriteOp::Delete` rows at projection time, removing matching bootstrap/pending entries. Trust check reads are pure (no write side-effects).
 - TTL expiry of bootstrap trust sources.
-- Trust removal (peer_removed cascading, user_removed transitive denial via `peers_shared.user_event_id`).
+- Trust state is the union of PeerShared-derived SPKIs plus bootstrap trust rows; user-removal deny state is intentionally absent in this PoC.
 - Invite ownership: `inviteCreator` variable tracks which peer created each invite SPKI. The `CreateInvite` action establishes ownership; `AddPendingBootstrapTrust` is guarded by `inviteCreator[s] = p` so only the invite creator can materialize pending trust.
 - 7 invariants verified by TLC (11.5M states, 771K distinct at 2-peer/3-SPKI), mapped to Rust checks in `docs/tla/projector_spec.md`. The `InvPendingTrustOnlyOnInviter` invariant catches the joiner-side pending trust emission bug (verified: buggy model violates in 5 steps).
 
@@ -1330,7 +1331,7 @@ Use deterministic table-state fingerprints for comparisons.
 
 TLA-led acceptance:
 1. Model invariants pass for split-invite causal graph before projector implementation is finalized.
-2. Rust projector predicates map 1:1 to TLA guard conditions for identity/removal/encryption gate checks.
+2. Rust projector predicates map 1:1 to TLA guard conditions for identity/encryption gate checks.
 
 Behavior tests:
 1. Self-invite bootstrap: accepted-workspace binding recorded, then normal cascade to first `peer_shared`.

@@ -442,51 +442,6 @@ fn test_foreign_workspace_excluded() {
 }
 
 #[test]
-fn test_removal_enforcement() {
-    let alice = Peer::new("alice");
-    let harness = ScenarioHarness::new();
-    harness.track(&alice);
-    let chain = bootstrap_peer(&alice);
-
-    // Create a "Bob" user event to be removed
-    // For simplicity, create a second user (as if Bob joined)
-    let bob_user_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
-    let _bob_user_pubkey = bob_user_key.verifying_key().to_bytes();
-    // We'll create a second UserInvite for Bob, signed by Alice's PeerShared
-    let db = open_connection(&alice.db_path).unwrap();
-
-    // Alice removes her own user (target = user_eid, signed by peer_shared)
-    let removal_eid = alice.create_user_removed(
-        &chain.peer_shared_key,
-        &chain.user_eid,
-        &chain.peer_shared_eid,
-    );
-
-    let removal_b64 = event_id_to_base64(&removal_eid);
-    let valid: bool = db
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![&alice.identity, &removal_b64],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(valid, "user_removed should be valid");
-
-    // Verify removed_entities table updated
-    let removed_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM removed_entities WHERE recorded_by = ?1 AND removal_type = 'user'",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert_eq!(
-        removed_count, 1,
-        "removed_entities should have one user removal"
-    );
-
-    harness.finish();
-}
-
-#[test]
 fn test_key_shared_key_wrap() {
     use topo::projection::encrypted::wrap_key_for_recipient;
 
