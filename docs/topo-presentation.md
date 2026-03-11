@@ -242,6 +242,9 @@ Next, a demo 🐭
 * Event and sync logs
 * Multitenancy in action
 
+**Won't demo:** subscriptions, holepunching, mDNS discovery, multi-source sync.
+
+
 
 <!-- Scraps
 
@@ -352,8 +355,8 @@ Per-daemon VmHWM is measured via the lowmem delta harness.
 
 | Case | Synced | Peak KB | 24 MiB? | 22 MiB cgroup? |
 |------|--------|--------:|:-------:|:--------------:|
-| 50k+10k messages | all 10k msgs | 7,356 | PASS | PASS |
-| 500k+10k messages (slow opt-in) | all 10k msgs | 17,695 | PASS | not run |
+| 50k+10k messages | all 10k msgs | 7,364 | PASS | PASS |
+| 500k+10k messages | all 10k msgs | 17,768 | PASS | not run |
 | 50k+20x1MiB files | all 80 slices | 7,016 | PASS | PASS |
 
 
