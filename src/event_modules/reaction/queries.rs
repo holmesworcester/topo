@@ -28,8 +28,11 @@ pub fn list_for_message(
     recorded_by: &str,
     target_event_id_b64: &str,
 ) -> Result<Vec<String>, rusqlite::Error> {
-    let mut stmt =
-        db.prepare("SELECT emoji FROM reactions WHERE recorded_by = ?1 AND target_event_id = ?2")?;
+    let mut stmt = db.prepare(
+        "SELECT emoji FROM reactions WHERE recorded_by = ?1 AND target_event_id = ?2
+         GROUP BY author_id, emoji
+         ORDER BY MIN(created_at) ASC",
+    )?;
     let emojis = stmt
         .query_map(rusqlite::params![recorded_by, target_event_id_b64], |row| {
             row.get::<_, String>(0)
@@ -81,7 +84,9 @@ pub fn list_for_message_with_authors(
         "SELECT r.emoji, COALESCE(u.username, '') as reactor_name
          FROM reactions r
          LEFT JOIN users u ON r.author_id = u.event_id AND r.recorded_by = u.recorded_by
-         WHERE r.target_event_id = ?1 AND r.recorded_by = ?2",
+         WHERE r.target_event_id = ?1 AND r.recorded_by = ?2
+         GROUP BY r.author_id, r.emoji
+         ORDER BY MIN(r.created_at) ASC",
     )?;
     let rows = stmt
         .query_map(rusqlite::params![target_event_id_b64, recorded_by], |row| {
