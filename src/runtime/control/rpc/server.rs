@@ -199,6 +199,7 @@ impl DaemonState {
 struct TenantItem {
     index: usize,
     peer_id: String,
+    username: String,
     workspace_id: String,
     workspace_name: String,
     active: bool,
@@ -467,6 +468,7 @@ fn dispatch(
                             .map(|(i, tenant)| TenantItem {
                                 index: i + 1,
                                 peer_id: tenant.peer_id,
+                                username: tenant.username,
                                 workspace_id: tenant.workspace_id,
                                 workspace_name: tenant.workspace_name,
                                 active: tenant.active,
