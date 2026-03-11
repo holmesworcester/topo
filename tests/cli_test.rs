@@ -4995,3 +4995,526 @@ fn test_cli_untrusted_peer_certificate_error() {
         bob_log
     );
 }
+
+// ---------------------------------------------------------------------------
+// Subscription watch tests
+// ---------------------------------------------------------------------------
+
+/// Helper: create a subscription via CLI, return subscription id.
+fn create_subscription(db: &str, name: &str, delivery: &str) -> String {
+    let out = Command::new(bin())
+        .args([
+            "--db", db, "sub", "create",
+            "--name", name,
+            "--event-type", "message",
+            "--delivery", delivery,
+        ])
+        .output()
+        .expect("sub create");
+    assert!(
+        out.status.success(),
+        "sub create failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    // Parse subscription id from: Created subscription "name" (id: <uuid>)
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .split("id: ")
+        .nth(1)
+        .and_then(|s| s.split(')').next())
+        .expect("sub create should return id")
+        .trim()
+        .to_string()
+}
+
+/// Helper: poll a subscription by name and return stdout.
+fn poll_subscription(db: &str, name: &str) -> String {
+    let out = Command::new(bin())
+        .args(["--db", db, "sub", "poll", name])
+        .output()
+        .expect("sub poll");
+    assert!(
+        out.status.success(),
+        "sub poll failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Helper: get subscription state by name, return stdout.
+fn sub_state(db: &str, name: &str) -> String {
+    let out = Command::new(bin())
+        .args(["--db", db, "sub", "state", name])
+        .output()
+        .expect("sub state");
+    assert!(
+        out.status.success(),
+        "sub state failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Helper: wait for subscription feed to contain at least `min_count` items
+/// matching `pattern`, with a timeout.
+fn wait_for_sub_items(db: &str, name: &str, pattern: &str, min_count: usize, timeout: Duration) {
+    let start = Instant::now();
+    loop {
+        let stdout = poll_subscription(db, name);
+        let matches = stdout.matches(pattern).count();
+        if matches >= min_count {
+            return;
+        }
+        if start.elapsed() >= timeout {
+            panic!(
+                "timed out waiting for {} items matching {:?} in sub {:?}, got {}:\n{}",
+                min_count, pattern, name, matches, stdout
+            );
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+#[test]
+fn test_cli_sub_watch_streams_events_to_stdout() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir.path().join("watch.db").to_str().unwrap().to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    create_subscription(&db, "inbox", "full");
+
+    // Send initial messages so watch has something to catch up on
+    send_message(&db, "before-watch");
+    wait_for_sub_items(&db, "inbox", "before-watch", 1, Duration::from_secs(5));
+
+    // Ack existing items so watch starts clean
+    let _ = Command::new(bin())
+        .args(["--db", &db, "sub", "ack", "inbox", "--through-seq", "100"])
+        .output();
+
+    // Start watch as a child process
+    let mut watch = Command::new(bin())
+        .args([
+            "--db", &db, "sub", "watch", "inbox",
+            "--interval-ms", "100",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sub watch");
+
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Send messages while watch is running
+    send_message(&db, "live-alpha");
+    send_message(&db, "live-beta");
+    send_message(&db, "live-gamma");
+
+    // Wait for watch to pick them up
+    std::thread::sleep(Duration::from_secs(2));
+
+    // Kill watch and read stdout
+    let _ = watch.kill();
+    let output = watch.wait_with_output().expect("wait for watch");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert!(
+        stdout.contains("live-alpha"),
+        "watch stdout should contain 'live-alpha', got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("live-beta"),
+        "watch stdout should contain 'live-beta', got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("live-gamma"),
+        "watch stdout should contain 'live-gamma', got:\n{}",
+        stdout
+    );
+
+    // Verify output format: [seq=N] message event=... ts=... author=... | content
+    assert!(
+        stdout.contains("[seq="),
+        "watch output should use [seq=N] format, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_cli_sub_watch_json_output() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir.path().join("watchjson.db").to_str().unwrap().to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    create_subscription(&db, "json-feed", "full");
+
+    let mut watch = Command::new(bin())
+        .args([
+            "--db", &db, "sub", "watch", "json-feed",
+            "--interval-ms", "100", "--json",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sub watch --json");
+
+    std::thread::sleep(Duration::from_millis(300));
+
+    send_message(&db, "json-test-msg");
+
+    std::thread::sleep(Duration::from_secs(2));
+
+    let _ = watch.kill();
+    let output = watch.wait_with_output().expect("wait for watch");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    // Each non-empty line should be valid JSON
+    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    assert!(
+        !lines.is_empty(),
+        "watch --json should produce at least one line of output"
+    );
+
+    for line in &lines {
+        let parsed: Result<serde_json::Value, _> = serde_json::from_str(line);
+        assert!(
+            parsed.is_ok(),
+            "each watch --json line should be valid JSON, got: {}",
+            line
+        );
+        let val = parsed.unwrap();
+        assert!(
+            val.get("seq").is_some(),
+            "JSON output should have 'seq' field: {}",
+            line
+        );
+        assert!(
+            val.get("event_type").is_some(),
+            "JSON output should have 'event_type' field: {}",
+            line
+        );
+    }
+
+    assert!(
+        stdout.contains("json-test-msg"),
+        "watch --json output should contain message content, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_cli_sub_watch_ack_clears_pending() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir.path().join("watchack.db").to_str().unwrap().to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    create_subscription(&db, "ack-feed", "full");
+
+    let mut watch = Command::new(bin())
+        .args([
+            "--db", &db, "sub", "watch", "ack-feed",
+            "--interval-ms", "100", "--ack",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn sub watch --ack");
+
+    std::thread::sleep(Duration::from_millis(300));
+
+    send_message(&db, "ack-msg-1");
+    send_message(&db, "ack-msg-2");
+
+    std::thread::sleep(Duration::from_secs(2));
+
+    let _ = watch.kill();
+    let output = watch.wait_with_output().expect("wait for watch");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert!(
+        stdout.contains("ack-msg-1"),
+        "watch should have printed ack-msg-1: {}",
+        stdout
+    );
+
+    // After watch with --ack exits, pending should be 0
+    let state = sub_state(&db, "ack-feed");
+    assert!(
+        state.contains("pending=0"),
+        "watch --ack should clear pending items, got: {}",
+        state
+    );
+}
+
+#[test]
+fn test_cli_sub_multiple_delivery_modes() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir.path().join("modes.db").to_str().unwrap().to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    create_subscription(&db, "full-sub", "full");
+    create_subscription(&db, "id-sub", "id");
+    create_subscription(&db, "changed-sub", "has_changed");
+
+    send_message(&db, "delivery-mode-test");
+    wait_for_sub_items(&db, "full-sub", "delivery-mode-test", 1, Duration::from_secs(5));
+
+    // Full mode: should contain content
+    let full_poll = Command::new(bin())
+        .args(["--db", &db, "sub", "poll", "full-sub", "--json"])
+        .output()
+        .expect("poll full-sub");
+    let full_stdout = String::from_utf8_lossy(&full_poll.stdout);
+    assert!(
+        full_stdout.contains("\"content\""),
+        "full delivery should include content: {}",
+        full_stdout
+    );
+
+    // Id mode: should have event_id but no content
+    let id_poll = Command::new(bin())
+        .args(["--db", &db, "sub", "poll", "id-sub", "--json"])
+        .output()
+        .expect("poll id-sub");
+    let id_stdout = String::from_utf8_lossy(&id_poll.stdout);
+    assert!(
+        id_stdout.contains("\"event_id\""),
+        "id delivery should include event_id: {}",
+        id_stdout
+    );
+
+    // has_changed mode: state should show dirty
+    let hc_state = sub_state(&db, "changed-sub");
+    assert!(
+        hc_state.contains("dirty=true"),
+        "has_changed should show dirty=true: {}",
+        hc_state
+    );
+}
+
+#[test]
+fn test_cli_sub_disable_enable() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir.path().join("disena.db").to_str().unwrap().to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    create_subscription(&db, "toggle-sub", "full");
+
+    // Disable
+    let disable = Command::new(bin())
+        .args(["--db", &db, "sub", "disable", "toggle-sub"])
+        .output()
+        .expect("sub disable");
+    assert!(disable.status.success());
+
+    // Send while disabled
+    send_message(&db, "while-disabled");
+    std::thread::sleep(Duration::from_millis(500));
+
+    let poll = poll_subscription(&db, "toggle-sub");
+    assert!(
+        poll.contains("no new items"),
+        "disabled sub should have no items: {}",
+        poll
+    );
+
+    // Re-enable
+    let enable = Command::new(bin())
+        .args(["--db", &db, "sub", "enable", "toggle-sub"])
+        .output()
+        .expect("sub enable");
+    assert!(enable.status.success());
+
+    // Send after re-enable
+    send_message(&db, "after-reenable");
+    wait_for_sub_items(&db, "toggle-sub", "after-reenable", 1, Duration::from_secs(5));
+}
+
+#[test]
+fn test_cli_sub_multi_tenant_isolation() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir.path().join("mt.db").to_str().unwrap().to_string();
+    let timeout = Duration::from_secs(10);
+
+    // Create first workspace and start daemon
+    create_workspace_with_details(&db, "alpha-space", "alice", "laptop");
+    let _daemon = start_daemon(&db);
+
+    // Create subscription for tenant 1
+    create_subscription(&db, "alice-inbox", "full");
+
+    // Send a message as tenant 1
+    send_message(&db, "alice-only-msg");
+    wait_for_sub_items(&db, "alice-inbox", "alice-only-msg", 1, timeout);
+
+    // Create second workspace on the live daemon
+    let create = Command::new(bin())
+        .args([
+            "create-workspace", "--db", &db,
+            "--workspace-name", "beta-space",
+            "--username", "charlie",
+            "--device-name", "tablet",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        create.status.success(),
+        "create second workspace failed: {}",
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    // Wait for new tenant to become available
+    let start = Instant::now();
+    loop {
+        let tenants = Command::new(bin())
+            .args(["--db", &db, "tenant", "list"])
+            .output()
+            .expect("tenant list");
+        let stdout = String::from_utf8_lossy(&tenants.stdout);
+        if stdout.contains("alice") && stdout.contains("charlie") {
+            break;
+        }
+        if start.elapsed() >= timeout {
+            panic!("second tenant did not appear: {}", stdout);
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // Daemon auto-switched to tenant 2 after create; create subscription there
+    create_subscription(&db, "charlie-inbox", "full");
+
+    // Send a message as tenant 2
+    send_message(&db, "charlie-only-msg");
+    wait_for_sub_items(&db, "charlie-inbox", "charlie-only-msg", 1, timeout);
+
+    // Verify tenant 2's sub has charlie's msg
+    let t2_poll = poll_subscription(&db, "charlie-inbox");
+    assert!(
+        t2_poll.contains("charlie-only-msg"),
+        "tenant 2 should see its own message: {}",
+        t2_poll
+    );
+
+    // Switch back to tenant 1
+    let switch = Command::new(bin())
+        .args(["--db", &db, "tenant", "use", "1"])
+        .output()
+        .expect("tenant use 1");
+    assert!(
+        switch.status.success(),
+        "tenant use 1 failed: {}",
+        String::from_utf8_lossy(&switch.stderr)
+    );
+
+    // Tenant 1's sub should NOT have tenant 2's message
+    let t1_poll = Command::new(bin())
+        .args(["--db", &db, "sub", "poll", "alice-inbox", "--json"])
+        .output()
+        .expect("poll alice-inbox json");
+    let t1_stdout = String::from_utf8_lossy(&t1_poll.stdout);
+    assert!(
+        !t1_stdout.contains("charlie-only-msg"),
+        "tenant 1 should NOT see tenant 2's message: {}",
+        t1_stdout
+    );
+    assert!(
+        t1_stdout.contains("alice-only-msg"),
+        "tenant 1 should still see its own message: {}",
+        t1_stdout
+    );
+}
+
+#[test]
+fn test_cli_sub_watch_multi_tenant() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir.path().join("mtwat.db").to_str().unwrap().to_string();
+    let timeout = Duration::from_secs(10);
+
+    create_workspace_with_details(&db, "alpha-space", "alice", "laptop");
+    let _daemon = start_daemon(&db);
+
+    // Create second workspace on live daemon
+    let create = Command::new(bin())
+        .args([
+            "create-workspace", "--db", &db,
+            "--workspace-name", "beta-space",
+            "--username", "charlie",
+            "--device-name", "tablet",
+        ])
+        .output()
+        .unwrap();
+    assert!(create.status.success());
+
+    // Wait for both tenants
+    let start = Instant::now();
+    loop {
+        let tenants = Command::new(bin())
+            .args(["--db", &db, "tenant", "list"])
+            .output()
+            .expect("tenant list");
+        let stdout = String::from_utf8_lossy(&tenants.stdout);
+        if stdout.contains("alice") && stdout.contains("charlie") {
+            break;
+        }
+        if start.elapsed() >= timeout {
+            panic!("tenants did not appear");
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
+
+    // Active tenant is now charlie (auto-switched). Create sub and start watch.
+    create_subscription(&db, "charlie-watch", "full");
+
+    let mut watch = Command::new(bin())
+        .args([
+            "--db", &db, "sub", "watch", "charlie-watch",
+            "--interval-ms", "100", "--ack",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn watch for charlie");
+
+    std::thread::sleep(Duration::from_millis(300));
+
+    send_message(&db, "charlie-watched-msg");
+
+    std::thread::sleep(Duration::from_secs(2));
+
+    let _ = watch.kill();
+    let output = watch.wait_with_output().expect("wait for watch");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    assert!(
+        stdout.contains("charlie-watched-msg"),
+        "multi-tenant watch should capture message: {}",
+        stdout
+    );
+
+    // After watch with --ack, pending should be 0
+    let state = sub_state(&db, "charlie-watch");
+    assert!(
+        state.contains("pending=0"),
+        "watch --ack should clear pending: {}",
+        state
+    );
+}

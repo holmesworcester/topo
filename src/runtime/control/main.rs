@@ -559,6 +559,23 @@ enum SubAction {
         #[arg(long = "sub", hide = true)]
         sub_flag: Option<String>,
     },
+    /// Watch a subscription: continuously poll and print new events to stdout
+    Watch {
+        /// Subscription selector: id, name, or index (#N / N)
+        sub: Option<String>,
+        /// Deprecated: use positional selector instead.
+        #[arg(long = "sub", hide = true)]
+        sub_flag: Option<String>,
+        /// Poll interval in milliseconds
+        #[arg(long, default_value = "500")]
+        interval_ms: u64,
+        /// Output as JSON (one JSON object per line)
+        #[arg(long)]
+        json: bool,
+        /// Auto-acknowledge items after printing
+        #[arg(long)]
+        ack: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1145,6 +1162,89 @@ fn run_sub_action(
             )?;
             println!("Subscription enabled.");
             Ok(())
+        }
+        SubAction::Watch {
+            sub,
+            sub_flag,
+            interval_ms,
+            json,
+            ack,
+        } => {
+            let sub_id =
+                resolve_subscription_selector(db, socket, sub, sub_flag, "sub watch", true)?;
+            eprintln!("Watching subscription {} (poll every {}ms, Ctrl-C to stop)", &sub_id[..sub_id.len().min(12)], interval_ms);
+            let mut cursor: i64 = 0;
+            // Catch up: fetch current state to start from latest seq
+            if let Ok(state_data) = rpc_require_daemon(db, socket, RpcMethod::SubState { subscription_id: sub_id.clone() }) {
+                let next_seq = state_data["next_seq"].as_i64().unwrap_or(1);
+                if next_seq > 1 {
+                    // Start watching from where the feed currently ends
+                    cursor = next_seq - 1;
+                    eprintln!("Resuming from seq {}", cursor);
+                }
+            }
+            loop {
+                match rpc_require_daemon(
+                    db,
+                    socket,
+                    RpcMethod::SubPoll {
+                        subscription_id: sub_id.clone(),
+                        after_seq: cursor,
+                        limit: 100,
+                    },
+                ) {
+                    Ok(data) => {
+                        if let Some(items) = data.as_array() {
+                            let mut max_seq = cursor;
+                            for item in items {
+                                let seq = item["seq"].as_i64().unwrap_or(0);
+                                if seq > max_seq {
+                                    max_seq = seq;
+                                }
+                                if json {
+                                    println!("{}", serde_json::to_string(item).unwrap_or_default());
+                                } else {
+                                    let etype = item["event_type"].as_str().unwrap_or("?");
+                                    let eid = item["event_id"].as_str().unwrap_or("?");
+                                    let eid_short = &eid[..eid.len().min(12)];
+                                    let ts = item["created_at_ms"].as_u64().unwrap_or(0);
+                                    let payload = &item["payload"];
+                                    if let Some(content) = payload["content"].as_str() {
+                                        let author = payload["author_id"].as_str().unwrap_or("?");
+                                        let author_short = &author[..author.len().min(8)];
+                                        println!(
+                                            "[seq={}] {} event={} ts={} author={} | {}",
+                                            seq, etype, eid_short, ts, author_short, content,
+                                        );
+                                    } else {
+                                        println!(
+                                            "[seq={}] {} event={} ts={}",
+                                            seq, etype, eid_short, ts,
+                                        );
+                                    }
+                                }
+                            }
+                            if max_seq > cursor {
+                                if ack {
+                                    let _ = rpc_require_daemon(
+                                        db,
+                                        socket,
+                                        RpcMethod::SubAck {
+                                            subscription_id: sub_id.clone(),
+                                            through_seq: max_seq,
+                                        },
+                                    );
+                                }
+                                cursor = max_seq;
+                            }
+                        }
+                    }
+                    Err(e) => {
+                        eprintln!("poll error: {}", e);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+            }
         }
     }
 }
