@@ -399,10 +399,29 @@ fn merge_upnp_bootstrap_addr(
 
 fn autodetect_bootstrap_addrs(
     state: &DaemonState,
-    listen_port: u16,
+    listen_addr: SocketAddr,
 ) -> Result<Vec<crate::event_modules::workspace::invite_link::BootstrapAddress>, String> {
-    let detected =
-        crate::event_modules::workspace::invite_link::detect_bootstrap_addrs(listen_port);
+    let detected = if listen_addr.ip().is_unspecified() {
+        // Wildcard bind (0.0.0.0 / ::) — enumerate all non-loopback interfaces.
+        crate::event_modules::workspace::invite_link::detect_bootstrap_addrs(listen_addr.port())
+    } else {
+        // Specific bind — use only the address we're actually listening on.
+        let addr = match listen_addr.ip() {
+            std::net::IpAddr::V4(v4) => {
+                crate::event_modules::workspace::invite_link::BootstrapAddress::Ipv4 {
+                    ip: v4,
+                    port: listen_addr.port(),
+                }
+            }
+            std::net::IpAddr::V6(v6) => {
+                crate::event_modules::workspace::invite_link::BootstrapAddress::Ipv6 {
+                    ip: v6,
+                    port: listen_addr.port(),
+                }
+            }
+        };
+        vec![addr]
+    };
     let merged = merge_upnp_bootstrap_addr(detected, state.upnp_result.read().unwrap().as_ref());
     if merged.is_empty() {
         return Err(
@@ -536,18 +555,17 @@ fn dispatch(
                     state.notify_runtime_recheck();
 
                     // Auto-create an invite with detected IPs
-                    let listen_port = state
+                    let listen_addr = state
                         .effective_listen_addr()
-                        .map(|addr| addr.port())
-                        .unwrap_or(crate::event_modules::workspace::invite_link::DEFAULT_PORT);
+                        .unwrap_or_else(|| SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), crate::event_modules::workspace::invite_link::DEFAULT_PORT));
                     let mut resp_json = serde_json::to_value(&resp).unwrap();
-                    let bootstrap_addrs = autodetect_bootstrap_addrs(state, listen_port);
+                    let bootstrap_addrs = autodetect_bootstrap_addrs(state, listen_addr);
                     match bootstrap_addrs.and_then(|addrs| {
                         workspace::commands::create_invite_for_peer(
                             db_path,
                             &resp.peer_id,
                             &addrs,
-                            listen_port,
+                            listen_addr.port(),
                             None,
                         )
                         .map_err(|e| e.to_string())
@@ -959,10 +977,9 @@ fn dispatch(
             public_spki,
         } => match state.require_active_peer() {
             Ok(peer_id) => {
-                let listen_port = state
+                let listen_addr = state
                     .effective_listen_addr()
-                    .map(|addr| addr.port())
-                    .unwrap_or(crate::event_modules::workspace::invite_link::DEFAULT_PORT);
+                    .unwrap_or_else(|| SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), crate::event_modules::workspace::invite_link::DEFAULT_PORT));
                 let explicit_addrs: Vec<
                     crate::event_modules::workspace::invite_link::BootstrapAddress,
                 > = match public_addr {
@@ -979,7 +996,7 @@ fn dispatch(
                     None => vec![],
                 };
                 let bootstrap_addrs = if explicit_addrs.is_empty() {
-                    match autodetect_bootstrap_addrs(state, listen_port) {
+                    match autodetect_bootstrap_addrs(state, listen_addr) {
                         Ok(addrs) => addrs,
                         Err(e) => return RpcResponse::error(e),
                     }
@@ -993,7 +1010,7 @@ fn dispatch(
                     db_path,
                     &peer_id,
                     &bootstrap_addrs,
-                    listen_port,
+                    listen_addr.port(),
                     public_spki.as_deref(),
                 );
                 match result {
@@ -1084,10 +1101,9 @@ fn dispatch(
         } => {
             match state.require_active_peer() {
                 Ok(peer_id) => {
-                    let listen_port = state
+                    let listen_addr = state
                         .effective_listen_addr()
-                        .map(|addr| addr.port())
-                        .unwrap_or(crate::event_modules::workspace::invite_link::DEFAULT_PORT);
+                        .unwrap_or_else(|| SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), crate::event_modules::workspace::invite_link::DEFAULT_PORT));
                     let explicit_addrs: Vec<crate::event_modules::workspace::invite_link::BootstrapAddress> =
                     match public_addr {
                         Some(ref addr) => {
@@ -1099,7 +1115,7 @@ fn dispatch(
                         None => vec![],
                     };
                     let bootstrap_addrs = if explicit_addrs.is_empty() {
-                        match autodetect_bootstrap_addrs(state, listen_port) {
+                        match autodetect_bootstrap_addrs(state, listen_addr) {
                             Ok(addrs) => addrs,
                             Err(e) => return RpcResponse::error(e),
                         }
@@ -1110,7 +1126,7 @@ fn dispatch(
                         db_path,
                         &peer_id,
                         &bootstrap_addrs,
-                        listen_port,
+                        listen_addr.port(),
                         public_spki.as_deref(),
                     ) {
                         Ok(data) => {

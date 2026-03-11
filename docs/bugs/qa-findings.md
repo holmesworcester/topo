@@ -50,6 +50,12 @@ Starting with a non-existent parent directory shows `SqliteFailure(Error { code:
 
 **Fix**: Catch `CannotOpen` in the DB open path and return a human-readable error like `"cannot open database: directory does not exist: <path>"`.
 
+### 14. Invite link includes unreachable addresses when using specific `--bind`
+
+`detect_bootstrap_addrs(port)` in `invite_link.rs:464` always enumerates all non-loopback network interfaces regardless of what the daemon is actually bound to. When `--bind 192.168.6.177:4433` is used, the invite embeds addresses like `100.67.2.56:4433` (tailscale) and various IPv6 addresses that the daemon is not listening on. When `--bind 127.0.0.1:4433`, the invite contains only unreachable addresses (loopback is skipped by the detector). Works by accident in the default `0.0.0.0` case because wildcard bind does listen on all interfaces.
+
+**Fix**: In `autodetect_bootstrap_addrs` (`server.rs:400`), check the bind address. If it's a wildcard (`0.0.0.0` or `::`), enumerate all interfaces (current behavior). If it's a specific IP, use only that IP+port — don't enumerate interfaces.
+
 ### 13. Long DB path causes silent RPC failure
 
 When the derived socket path exceeds ~108 chars (SUN_LEN), the daemon starts its QUIC listener but the RPC server silently fails. Daemon runs but is unreachable. Should detect this upfront and suggest `--socket`.
