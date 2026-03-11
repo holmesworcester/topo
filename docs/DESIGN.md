@@ -1481,6 +1481,8 @@ We do not use multimodal `invite(mode=...)` type (even though it would be DRY) b
 Implementation uses shared invite helper logic with per-type policy tables.
 Interactive CLI keeps real invite links (`topo://invite/...`, `topo://link/...`) in frontend state; session-local invite numbers are aliases to those links.
 
+Invites are **multi-use by design**. The same invite link can be accepted by multiple peers (or the same peer multiple times). Each acceptance creates a new local tenant with a fresh user+peer identity bound to the invited workspace. This is intentional — invite links are portable, shareable tokens analogous to Signal group invite links rather than single-use authorization codes.
+
 ### Invite link wire format (v3, plaintext)
 
 Invite links use a plaintext, slash-delimited, hex-encoded format. All fields are labeled for readability and the link contains no spaces or characters that break URL selection (continuously linkifiable). This is intentional for debugging — all data (addresses, workspace ID, keys, SPKI fingerprint) is visible in the link itself.
