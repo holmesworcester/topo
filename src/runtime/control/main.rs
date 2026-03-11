@@ -1229,9 +1229,14 @@ fn run_sub_action(
                                     if let Some(content) = payload["content"].as_str() {
                                         let author = payload["author_id"].as_str().unwrap_or("?");
                                         let author_short = &author[..author.len().min(8)];
+                                        // Escape newlines/tabs so each event is exactly one line
+                                        let escaped = content.replace('\\', "\\\\")
+                                            .replace('\n', "\\n")
+                                            .replace('\r', "\\r")
+                                            .replace('\t', "\\t");
                                         println!(
                                             "[seq={}] {} event={} ts={} author={} | {}",
-                                            seq, etype, eid_short, ts, author_short, content,
+                                            seq, etype, eid_short, ts, author_short, escaped,
                                         );
                                     } else {
                                         println!(
@@ -1276,6 +1281,11 @@ fn run_sub_action(
                                     &sub_id[..sub_id.len().min(12)],
                                 ).into());
                             }
+                        } else if msg.contains("daemon is not running") || msg.contains("connection refused") {
+                            return Err(format!(
+                                "daemon stopped — watch exiting ({})",
+                                msg,
+                            ).into());
                         } else {
                             consecutive_not_found = 0;
                         }

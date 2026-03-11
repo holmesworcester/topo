@@ -5704,3 +5704,118 @@ fn test_cli_sub_watch_drains_backlog_on_startup() {
         stdout
     );
 }
+
+#[test]
+fn test_cli_sub_watch_exits_on_daemon_stop() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir.path().join("daemonstop.db").to_str().unwrap().to_string();
+
+    create_workspace(&db);
+    let daemon = start_daemon(&db);
+
+    create_subscription(&db, "ephemeral", "full");
+
+    // Start watch
+    let mut watch = Command::new(bin())
+        .args([
+            "--db", &db, "sub", "watch", "ephemeral",
+            "--interval-ms", "100",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn watch");
+
+    std::thread::sleep(Duration::from_millis(500));
+
+    // Stop the daemon
+    drop(daemon);
+    wait_for_daemon_stopped(&db, Duration::from_secs(5));
+
+    // Watch should exit on its own (non-zero) within a few seconds
+    let start = Instant::now();
+    loop {
+        match watch.try_wait() {
+            Ok(Some(status)) => {
+                assert!(
+                    !status.success(),
+                    "watch should exit with error when daemon stops"
+                );
+                let output = watch.wait_with_output().unwrap_or_else(|_| {
+                    std::process::Output {
+                        status,
+                        stdout: vec![],
+                        stderr: vec![],
+                    }
+                });
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                assert!(
+                    stderr.contains("daemon stopped") || stderr.contains("daemon is not running"),
+                    "error should mention daemon stopped: {}",
+                    stderr
+                );
+                return;
+            }
+            Ok(None) => {
+                if start.elapsed() >= Duration::from_secs(5) {
+                    let _ = watch.kill();
+                    panic!("watch did not exit after daemon stop within 5s");
+                }
+                std::thread::sleep(Duration::from_millis(200));
+            }
+            Err(e) => panic!("try_wait failed: {}", e),
+        }
+    }
+}
+
+#[test]
+fn test_cli_sub_watch_escapes_multiline_content() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir.path().join("multiline.db").to_str().unwrap().to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    create_subscription(&db, "ml-feed", "full");
+
+    // Start watch
+    let mut watch = Command::new(bin())
+        .args([
+            "--db", &db, "sub", "watch", "ml-feed",
+            "--interval-ms", "100",
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+        .expect("spawn watch");
+
+    std::thread::sleep(Duration::from_millis(300));
+
+    // Send a message containing a newline
+    send_message(&db, "line1\nline2");
+
+    std::thread::sleep(Duration::from_secs(2));
+
+    let _ = watch.kill();
+    let output = watch.wait_with_output().expect("wait for watch");
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+
+    // The output should have the newline escaped, so "line1\nline2" appears literally
+    // and the event is on a single line
+    let event_lines: Vec<&str> = stdout.lines().filter(|l| l.starts_with("[seq=")).collect();
+    assert!(
+        !event_lines.is_empty(),
+        "watch should produce at least one event line, got:\n{}",
+        stdout
+    );
+    // Each event line should be self-contained (the newline in content is escaped)
+    for line in &event_lines {
+        assert!(
+            line.contains("line1\\nline2"),
+            "multiline content should be escaped as 'line1\\nline2', got: {}",
+            line
+        );
+    }
+}
