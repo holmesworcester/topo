@@ -168,7 +168,7 @@ Instead of providing lots of features for *parts* of the problem, it focuses on 
 
 ---
 
-#  Topo 🐭 makes backends simple
+#  Topo 🐭 makes your backend simpler
 
 <!-- pt:incremental_lists: true -->
 
@@ -178,9 +178,11 @@ Instead of providing lots of features for *parts* of the problem, it focuses on 
 - End-to-end testing is cheap and easy
 - You get a flexible, concurrency-safe way to do encryption and auth
 
+You have to model causal order as dependency graphs, but this is inevitable in a p2p world (unless you have a really fast blockchain?) so we embrace it!
+
 ---
 
-# Topo 🐭 makes frontends simple
+# Topo 🐭 makes your frontend simpler
 
 <!-- pt:incremental_lists: true -->
 
@@ -189,18 +191,23 @@ Instead of providing lots of features for *parts* of the problem, it focuses on 
 - A local `client_op_id` can return with eventually-updated events, so **you don't need a custom sync state machine for optimistic updates**
 - Frontends can get subscription feeds of changes and poll for the latest state, so **frontend state management is easy.**
 
+This makes P2P frontend development *easier* than centralized apps (less frontend state)
+
 ---
 
 # Topo 🐭 tames concurrency
 
 <!-- pt:incremental_lists: true -->
 
-- **Data** including files, who to connect to, is represented as a set of events
-- **State and auth** is derived deterministically from the event set (think: Redux but with dependencies)
+- **Data** including files, who to connect to, is represented as a set of events with dependencies
 - **Peer connection** is ongoing behavior determined by this set
 - **Sync** is a process that ensures all peers converge on the same event set
-- **Event pipeline** decrypts, validates, and writes events into SQLite tables that can be queried however frontends need
-- **Key material** is stored, sealed, and unsealed as events and, just like any other dependency, blocks dependents until it arrives.
+- **Event pipeline** decrypts, validates, and writes events into easily-queried tables
+- **Topo sort** blocks action on events until their dependencies arrive
+- **State and auth** is derived deterministically from the event set (think: Redux but with dependencies)
+- **Secrets** are stored as events and block dependent encrypted events until known
+
+This way, devs can think about dependency & converging sets, **not concurrency**.
 
 ---
 
