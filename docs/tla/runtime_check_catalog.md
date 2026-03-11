@@ -23,11 +23,10 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_RXN_INSERT | event_modules/reaction::project_pure | InvDeps | projector_local |
 | CHK_DEL_SIGNER_USER_MISMATCH | event_modules/message_deletion::project_pure | InvSigner | projector_local |
 | CHK_DEL_NON_MESSAGE | event_modules/message_deletion::project_pure | NON_MODELED::type_constraint | projector_local |
-| CHK_DEL_WRONG_AUTHOR | event_modules/message_deletion::project_pure | InvRemovalAdmin | projector_local |
+| CHK_DEL_WRONG_AUTHOR | event_modules/message_deletion::project_pure | NON_MODELED::author_constraint | projector_local |
 | CHK_DEL_INTENT | event_modules/message_deletion::project_pure | NON_MODELED::convergence_intent | projector_local |
 | CHK_DEL_TOMBSTONE | event_modules/message_deletion::project_pure | NON_MODELED::convergence_tombstone | projector_local |
 | CHK_DEL_IDEMPOTENT | event_modules/message_deletion::project_pure | NON_MODELED::idempotent_replay | projector_local |
-| CHK_SS_RECIPIENT_REMOVED | event_modules/secret_shared::project_pure | InvRemovalExclusion | projector_local |
 | CHK_SS_INSERT | event_modules/secret_shared::project_pure | InvSecretSharedKey | projector_local |
 | CHK_FS_GUARD_BLOCK | event_modules/file_slice::project_pure | InvFileSliceAuth | projector_local |
 | CHK_FS_SIGNER_MISMATCH | event_modules/file_slice::project_pure | InvFileSliceAuth | projector_local |
@@ -47,8 +46,6 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_PS_MATCH_CARRIED | event_modules/peer_shared::project_pure | InvPeerSharedTrustMatchesCarried | projector_local |
 | CHK_PS_SUPERSEDE | event_modules/peer_shared::project_pure | InvBootstrapConsumedByPeerShared | projector_local |
 | CHK_ADM_INSERT | event_modules/admin::project_pure | InvAdminChain | projector_local |
-| CHK_UR_INSERT | event_modules/user_removed::project_pure | InvRemovalAdmin | projector_local |
-| CHK_PR_INSERT | event_modules/peer_removed::project_pure | InvRemovalAdmin | projector_local |
 | CHK_SK_INSERT | event_modules/secret_key::project_pure | InvEncryptedKey | projector_local |
 | CHK_BD_NOOP | event_modules/bench_dep::project_pure | NON_MODELED::benchmark_only | projector_local |
 | CHK_IA_INVITE_RECORDED | event_modules/invite_accepted::project_pure | NON_MODELED::no_prior_invite_required | projector_local |
@@ -57,7 +54,6 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_PS_PENDING_CONSUME | event_modules/peer_shared::project_pure | InvPendingConsumedByPeerShared | projector_local |
 | CHK_PS_PENDING_BOOTSTRAP_CONSUME | event_modules/peer_shared::project_pure | InvPendingBootstrapTrustConsumedByPeerShared | projector_local |
 | CHK_UI_PENDING_SOURCE | event_modules/user_invite::project_pure | InvPendingBootstrapTrustSource | projector_local |
-| CHK_SS_TRANSITIVE_DENY | event_modules/secret_shared::project_pure | InvUserRemovalTransitiveDeny | projector_local |
 
 ## Pipeline-Shared Checks
 
@@ -108,7 +104,6 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_BRIDGE_SEC_TRUST_PROVENANCE | projection/trust_store | BrSec_NoTrustWithoutProvenance | unified_bridge |
 | CHK_BRIDGE_SEC_PENDING_INVITER_ONLY | event_modules/user_invite + event_modules/device_invite | BrSec_NoPendingTrustOnJoiner | unified_bridge |
 | CHK_BRIDGE_SEC_SOURCE_BINDING | runtime/transport + projection/trust_store | BrSec_SourceBindingConsistency | unified_bridge |
-| CHK_BRIDGE_SEC_REMOVAL_DENY | event_modules/peer_removed + runtime/transport/authz | BrSec_RemovalDeniesConnectivity | unified_bridge |
 | CHK_BRIDGE_SEC_IDENTITY_COLLISION | transport/identity_adapter + transport_creds | BrSec_NoIdentityCollisionInAuthPath | unified_bridge |
 
 ## Replay/Order Checks

@@ -182,7 +182,6 @@ fn rpc_all_methods_serialize() {
             invite: "topo://link/test".into(),
             devicename: "device".into(),
         },
-        RpcMethod::Ban { target: "1".into() },
         RpcMethod::Identity,
         RpcMethod::AcceptInvite {
             invite: "topo://invite/test".into(),
@@ -2087,7 +2086,6 @@ fn catalog_drift_test_method_count_matches_protocol() {
         "AcceptInvite",
         "CreateDeviceLink",
         "AcceptLink",
-        "Ban",
         "Identity",
         "Shutdown",
         "Tenants",

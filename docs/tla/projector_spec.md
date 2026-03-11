@@ -109,8 +109,8 @@ Changes to this document require TLA+ model re-verification.
 | 17 | retired (code reserved) | — | rejected as unknown type |
 | 18 | project_admin | admins | — |
 | 19 | retired (code reserved) | — | rejected as unknown type |
-| 20 | project_user_removed | removed_entities | — |
-| 21 | project_peer_removed | removed_entities | — |
+| 20 | retired (unused) | — | rejected as unknown type |
+| 21 | retired (unused) | — | rejected as unknown type |
 | 22 | project_secret_shared | secret_shared | wraps to invite recipient; emits deterministic local `key_secret` on successful unwrap |
 | 23 | project_peer | peers_local | local tenant-bound peer identity |
 | 24 | project_message_attachment | message_attachments | — |
@@ -295,14 +295,12 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 | InvDeviceInviteChain | test_bootstrap_sequence: PeerShared requires DeviceInvite valid |
 | InvAdminChain | test_bootstrap_sequence: Admin requires User valid |
 | InvForeignWorkspaceExcluded | test_foreign_workspace_excluded |
-| InvRemovalAdmin | test_removal_enforcement: removal requires admin context |
+| NON_MODELED::author_constraint | message deletion rejects non-author tombstones |
 | InvAllValidRequireWorkspace | test_bootstrap_sequence: non-local events require workspace valid |
 | InvMessageWorkspace | Message projection requires workspace (workspace_event_id dep) |
 | InvEncryptedKey | Encrypted content requires valid secret dependency |
 | InvSecretSharedKey | SecretShared key_event_id must match deterministic unwrapped key_secret event id |
 | InvFileSliceAuth | FileSlice and MessageAttachment for the same file must share the same signer |
-| InvRemovalExclusion | project_secret_shared: reject if recipient removed |
-| InvUserRemovalTransitiveDeny | user_removed transitively denies all peers linked via peers_shared.user_event_id |
 
 ### Bootstrap key materialization
 
@@ -353,7 +351,6 @@ progress properties over bootstrap/upgrade/fallback behavior.
 | BrSec_NoTrustWithoutProvenance | CHK_BRIDGE_SEC_TRUST_PROVENANCE |
 | BrSec_NoPendingTrustOnJoiner | CHK_BRIDGE_SEC_PENDING_INVITER_ONLY |
 | BrSec_SourceBindingConsistency | CHK_BRIDGE_SEC_SOURCE_BINDING |
-| BrSec_RemovalDeniesConnectivity | CHK_BRIDGE_SEC_REMOVAL_DENY |
 | BrSec_NoIdentityCollisionInAuthPath | CHK_BRIDGE_SEC_IDENTITY_COLLISION |
 | BrLive_BootstrapConnectEventually | CHK_BRIDGE_BOOTSTRAP_PROGRESS |
 | BrLive_PeerUpgradeEventually | CHK_BRIDGE_UPGRADE_PROGRESS |

@@ -11,14 +11,13 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::info;
 
 use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
 use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::purge_expired_endpoints;
 use crate::db::open_connection;
 use crate::db::project_queue::ProjectQueue;
-use crate::db::removal_watch::is_peer_removed;
 use crate::db::schema::create_tables;
 use crate::runtime::memtrace;
 use crate::sync::SyncSessionHandler;
@@ -83,8 +82,7 @@ pub(super) fn run_startup_preflight(
     }
 
     let batch_sz = drain_batch_size();
-    // Drain origin queues first so removals are projected before
-    // we recover pending fanouts (which check removal status).
+    // Drain origin queues first before we recover pending fanouts.
     // Note: `tenant_ids` includes accepted tenants using bootstrap
     // transport identity (via discover_local_tenants fallback), so
     // seed replay work enqueued before a crash is recovered here.
@@ -100,8 +98,8 @@ pub(super) fn run_startup_preflight(
     }
 
     // Recover any pending shared-event fanouts from a prior crash.
-    // This runs AFTER draining origin queues so that removals are
-    // already projected and is_sibling_removed correctly filters.
+    // This runs after draining origin queues so fanout recovery sees
+    // the latest projection state.
     match crate::state::shared_workspace_fanout::take_pending_fanouts(&db) {
         Ok(pending) if !pending.is_empty() => {
             info!("Recovering {} pending shared-event fanouts", pending.len());
@@ -210,19 +208,6 @@ pub(super) async fn supervise_connection_sessions(
         if shutdown.is_cancelled() {
             connection.close(0u32.into(), b"runtime shutdown");
             break;
-        }
-
-        // Check if peer has been removed -- deny further sessions and close
-        // the underlying connection.
-        if let Ok(db) = open_connection(db_path) {
-            if is_peer_removed(&db, &recorded_by, &peer_fp).unwrap_or(false) {
-                warn!(
-                    "Peer {} has been removed -- closing connection",
-                    short_peer_id(peer_id)
-                );
-                connection.close(2u32.into(), b"peer removed");
-                break;
-            }
         }
 
         let session = match tokio::select! {

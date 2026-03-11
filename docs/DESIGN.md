@@ -12,7 +12,7 @@ Terminology note:
 
 ## Requirements
 
-1. **Encryption & Auth** - it should be straightforward to implement and validate modern, scalable, high-usability group encryption schemes with user removal (DCKGA, TreeKEM, etc.) from the ground up, so they can be tailored to product needs
+1. **Encryption & Auth** - it should be straightforward to implement and validate modern, scalable, high-usability group encryption schemes (DCKGA, TreeKEM, etc.) from the ground up, so they can be tailored to product needs
 1. **Deletion & Disappearing Messages** - deletion and disappearing messages should be straightforward (lots of p2p and local-first protocols make deletion hard 🤦)
 1. **P2P Networking** - peer discovery, STUN-like connection across NATs, and TURN-like relay should be straightforward without additional dependencies, and adaptable to product needs
 1. **Files** - multi-source file downloads (for images and attachments) should be performant (network-bound) and flexible
@@ -24,6 +24,8 @@ Terminology note:
 1. **Testing & Simulation** - It should be trivial to test interactions between multiple accounts on the same machine, with a toy interface that mimics the requirements of a production Slack Electron or React Native app, and to test robustness against concurrency and reordering. It should also be low-cost for an LLM to "self-QA" its work.
 1. **Ergonomic Feature Development** - once complex features like auth, deletion, encryption, and forward secrecy are in place, it should be possible to build user-facing, Slack-like features (reactions, channels, threads, user profiles, etc.) with minimal friction
 1. **Boring API for Frontends** - the backend should fully contain the complexity of the p2p stack and provide a boring API that keeps frontend development highly conventional (e.g., letting frontends fetch a paginated message list with attachments, reactions, usernames, and avatars should be easy)
+
+Out-of-scope note: user removal / banning is not implemented in this PoC. Safe removal requires coordinated group key agreement and key rotation, which this prototype intentionally does not attempt yet.
 
 ## Motivation
 
@@ -42,7 +44,7 @@ This PoC exists to prove the practicality of a principled approach that uses [ev
 
 * **SQLite for everything** - You can simplify state management by using SQLite for everything, even file slices, for GBs of messages/files.
 * **Everything can be an event** - You can model all data, even file slices, as events, encrypt them, and store them all in SQLite.
-* **DAG for auth, invites, multi-device, historical key provision** - Complex relationships such as team auth, admin promotion, multi-use Signal-like invite links, signed events, multi-device support, and group key agreement with removal and history-provision can be modeled as events that depend on prior events. (MLS-like TreeKEM schemes can be too, as a complexity-costly enhancement if needed.)
+* **DAG for auth, invites, multi-device, historical key provision** - Complex relationships such as team auth, admin promotion, multi-use Signal-like invite links, signed events, multi-device support, and group key agreement with history-provision can be modeled as events that depend on prior events. (MLS-like TreeKEM schemes can be too, as a complexity-costly enhancement if needed.)
 * **Negentropy sync is fast enough for everything** - You can use range-based set reconcilation ("Negentropy") for syncing all events, whether files, messages, auth, whatever. Large event sets sync fast enough. File downloads are likely network-bound, not IO or CPU-bound.
 * **Topological sort makes order not matter** - We can receive data in any order we want because topological sort over large amounts of SQLite events is fast enough that we can block events with missing dependencies and unblock events when their dependencies come in. 
 * **Dependency and blocking can fit product needs** - The dependency graph can be whatever it needs to, to fit features like "don't display messages until you know their username" or "display messages immediately with a placeholder username". Dependency is **NOT** hard-wired into the syncing protocol or document store, as with OrtbitDB or Automerge.
@@ -50,7 +52,7 @@ This PoC exists to prove the practicality of a principled approach that uses [ev
 * **It works in an iOS NSE** - At least, it works on Linux under the same 24MB memory limit imposed by iOS on background-wakeup Notification Service Extensions. TODO: real proof on iOS.
 * **We can use conventional networking primitives** - We can control standard QUIC libraries (e.g. quinn in Rust) sufficiently to initiate mTLS sessions based on peer identity established by our event graph, and route to different workspaces on the same endpoint. We can even do mDNS local discovery and holepunching!
 * **No separate STUN/TURN required** - If we need to for product reasons (unclear still, as it may make more sense to rely on cloud nodes or user-community-furnished high availability non-NAT nodes) we can holepunch by aiming QUIC attempts at each other after an in-band introduction signal from a mutually available peer, as opposed to using separate protocols/infra for ICE/STUN/TURN.
-* **Multitenancy can be built-in** - We can use event sourcing and workspace differentiation via mTLS to make multitenancy a first-class thing, serve many Slack-like workspaces at the same cloud endpoint, and offer multi-account UIs out-of-the-box. Tenant creation and removal is event-based and deterministic like everything else.
+* **Multitenancy can be built-in** - We can use event sourcing and workspace differentiation via mTLS to make multitenancy a first-class thing, serve many Slack-like workspaces at the same cloud endpoint, and offer multi-account UIs out-of-the-box. Tenant creation and lifecycle management are event-based and deterministic like everything else.
 * **Regular (fixed-length) wire formats** - [Langsec](https://langsec.org/) counsels that parsers can be made much more secure when data type complexity is limited, with regular (fixed-length-field) wire formats being the most tractable for secure parsing and formal verification. We keep our wire formats fixed-length.
 * **Keys can just be dependencies** - There are no special queues for events with missing signer or decryption keys: these are just declared dependencies (key material is stored in events with id's) and block/unblock accordingly.
 * **Canonical event naming** - For local/shared pairs, use `*_secret` / `*_shared` names (`peer_secret`/`peer_shared`, `invite_secret` + invite shared events, `key_secret`/`key_shared`). Avoid ad-hoc aliases.
@@ -412,7 +414,7 @@ Transport peer identity is SPKI-derived:
    (PeerShared projector issues deterministic `Delete` write-ops for matching SPKIs)
    when steady-state PeerShared-derived trust appears. Trust check reads are pure
    (no write side-effects).
-7. trust/removal lookups use projected `transport_fingerprint` rows and do not scan/derive fallback from `peers_shared.public_key`.
+7. trust lookups use projected `transport_fingerprint` rows and do not scan/derive fallback from `peers_shared.public_key`.
 
 Runtime rule: handshake verification queries SQL trust state per connection creation; projected peer keys are not treated as in-memory authority.
 
@@ -705,11 +707,9 @@ The single QUIC endpoint uses a union trust closure that accepts connections tru
 
 Trust checks are **tenant-scoped** (`recorded_by`-partitioned). Value-level trust-set overlap is allowed (the same SPKI may appear in multiple tenants' trust rows), and the union closure permits the shared endpoint to accept connections for any local tenant. `invites_accepted` is read during startup tenant discovery (to enumerate local tenant/workspace bindings), but per-connection authorization uses `is_peer_allowed` over PeerShared/bootstrap trust tables, not `invites_accepted`.
 
-### Removal-driven session teardown
+### User removal is out of scope
 
-When a `PeerRemoved` event is projected, trust lookups and removal-watch checks use indexed `(recorded_by, transport_fingerprint)` projection rows plus `removed_entities` predicates to deny the removed peer. When a `UserRemoved` event is projected, all peers linked to that user via `peers_shared.user_event_id` are transitively denied. Additionally:
-- New TLS handshakes are denied: `is_peer_allowed` returns false for removed peers and for peers whose owning user has been removed.
-- Active sessions are torn down: between sync sessions, both `accept_loop` and `connect_loop` check `is_peer_removed` for the connected peer's SPKI. If the peer has been directly removed or its user has been removed, the QUIC connection is closed with error code 2 ("peer removed").
+This PoC does not implement `PeerRemoved`, `UserRemoved`, or a `ban` command. Safe user/device removal requires coordinated group key agreement plus key rotation so future ciphertext is no longer available to the removed member. We intentionally defer that work here and keep transport trust/session logic limited to invite/bootstrap trust and steady-state `PeerShared` trust.
 
 ### Shared batch writer with tenant routing
 
@@ -786,12 +786,12 @@ The production peering runtime follows a single conceptual loop:
 - **Transport connection lifecycle**: `src/runtime/transport/connection_lifecycle.rs` — sole owner of QUIC `connect/accept` and TLS peer identity extraction for peering paths (`dial_peer`, `accept_peer`).
 - **Transport session factory**: `src/runtime/transport/session_factory.rs` — sole owner of QUIC stream opening and `DualConnection` / `QuicTransportSessionIo` construction. Provides `open_session_io()` and `accept_session_io()` that return `(session_id, Box<dyn TransportSessionIo>)`.
 - **Transport session I/O adapter**: `src/runtime/transport/transport_session_io.rs` — sole owner of frame boundary validation (`parse_frame` exact-consumption), max-frame-size enforcement, and mapping between QUIC stream errors and `TransportSessionIoError`.
-- **Peering orchestration seam**: `src/runtime/peering/loops/mod.rs::run_session` — wires session metadata, peer-removal cancellation, and the session handler together. Receives pre-built `TransportSessionIo` from the transport session factory.
+- **Peering orchestration seam**: `src/runtime/peering/loops/mod.rs::run_session` — wires session metadata, cancellation, and the session handler together. Receives pre-built `TransportSessionIo` from the transport session factory.
 - **Bootstrap test helpers**: `src/testutil/bootstrap.rs` — test-only. Production runtime never depends on these; bootstrap progression is driven by the autodial loop polling projected SQL state.
 
 ### Event-sourced authority boundary (peering)
 
-Durable trust/identity authority transitions are event-sourced (InviteAccepted, PeerShared, PeerRemoved). Transport runtime mechanics are not canonical facts: retry cadence, discovery timing, session lifecycle, and endpoint observations are ephemeral operational state managed by the peering runtime directly.
+Durable trust/identity authority transitions are event-sourced (InviteAccepted, PeerShared). Transport runtime mechanics are not canonical facts: retry cadence, discovery timing, session lifecycle, and endpoint observations are ephemeral operational state managed by the peering runtime directly.
 
 ## 3.3 Table lifecycle and naming
 
@@ -884,7 +884,6 @@ Fields include:
 - `target_message_author` / `target_tombstone_author` — for deletion auth
 - `deletion_intents` — pre-existing deletion intents (for delete-before-create convergence)
 - `target_message_deleted` — for reaction skip-on-delete
-- `recipient_removed` — for `key_shared` removal exclusion
 - `file_descriptors` / `existing_file_slice` / `current_transport_key_event_id` — for FileSlice authorization, duplicate detection, and wrapper-key matching
 - `bootstrap_context` — local bootstrap context (addr + SPKI) for invite trust materialization
 - `is_local_create` — whether the event was locally created (from `recorded_events.source`); gates pending bootstrap trust `InsertOrIgnore` writes so only the invite creator materializes pending trust
@@ -950,7 +949,7 @@ Some behavior stays explicit by design:
 
 1. deletion/tombstone cascades (`message_deletion` and related checks),
 2. accepted-workspace binding handling in `invite_accepted` (`invites_accepted` write + explicit `RetryWorkspaceEvent` replay trigger),
-3. identity/removal policy checks from TLA guards.
+3. identity/auth policy checks from TLA guards.
 
 ### Deletion intent + tombstone lifecycle
 
@@ -1113,7 +1112,7 @@ Decryption is an adapter stage inside the same projection pipeline, not a second
 3. optional short-lived cache can be added later for performance.
 
 Current canonical plaintext families:
-1. identity/auth chain events (`workspace`, `invite_accepted`, `user_invite_shared`, `peer_invite_shared`, `user`, `peer_shared`, `admin`, removals),
+1. identity/auth chain events (`workspace`, `invite_accepted`, `user_invite_shared`, `peer_invite_shared`, `user`, `peer_shared`, `admin`),
 2. local identity/support events (`peer_secret`, `key_secret`, bootstrap helper events),
 3. test/support-only content such as `bench_dep` when intentionally left outside normal privacy policy.
 
@@ -1549,7 +1548,7 @@ For each encrypted message in the prototype:
 2. sender emits one key-wrap event per currently eligible recipient peer pubkey,
 3. encrypted content references key dependency via normal event refs.
 
-After observing `user_removed` or `peer_removed`, sender excludes removed recipients from subsequent wraps.
+User removal is out of scope in this proof-of-concept, so sender key-wrap selection is based on the currently known peer set rather than a removal policy.
 Historical re-encryption or key history request/response mechanism is out of scope for the proof-of-concept.
 
 ### 9.4.1 Bootstrap key distribution via invite-key wrap/unwrap
@@ -1574,11 +1573,11 @@ Credential transition model: invite acceptance may install a bootstrap transport
 
 Consumption: when a PeerShared event is projected, the PeerShared projector deletes matching `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` entries for that SPKI in the same projection apply transaction. This happens at projection time, not on trust check reads — trust check reads (`is_peer_allowed`, `allowed_peers_from_db`) are pure queries with no write side-effects.
 
-Lookup shape: trust and removal queries resolve peers via projected `peers_shared.transport_fingerprint` (indexed by `(recorded_by, transport_fingerprint)`), not by runtime fallback scans over `peers_shared.public_key`.
+Lookup shape: trust queries resolve peers via projected `peers_shared.transport_fingerprint` (indexed by `(recorded_by, transport_fingerprint)`), not by runtime fallback scans over `peers_shared.public_key`.
 
 TTL expiry: bootstrap trust rows are time-bounded. Unconsumed entries expire and are purged.
 
-Removal cascade: `peer_removed` cascades trust removal across all three sources for the affected peer.
+User removal is out of scope in this transport model; trust derives only from bootstrap trust rows and steady-state `PeerShared` projection state.
 
 Invite ownership: `inviteCreator` tracks which peer created each invite SPKI. Only the invite creator (inviter) may materialize pending bootstrap trust — the joiner must not write pending bootstrap trust when syncing the invite event. This is enforced by the `is_local_create` flag in `ContextSnapshot`, populated from `recorded_events.source`. The TLA+ model captures this via the `inviteCreator[s] = p` guard on `AddPendingBootstrapTrust` and the `InvPendingTrustOnlyOnInviter` invariant.
 
@@ -1830,7 +1829,6 @@ RPC command handlers (`src/runtime/control/rpc/server.rs`) call owner-module com
 - `RpcMethod::Send` -> `message::send_for_peer`
 - `RpcMethod::React` -> `reaction::react_for_peer`
 - `RpcMethod::DeleteMessage` -> `message::delete_message_for_peer`
-- `RpcMethod::Ban` -> `user::ban_for_peer`
 - `RpcMethod::CreateWorkspace` -> `workspace::commands::create_workspace_for_db`
 - `RpcMethod::AcceptInvite` -> `workspace::commands::accept_invite`
 - `RpcMethod::AcceptLink` -> `workspace::commands::accept_device_link`

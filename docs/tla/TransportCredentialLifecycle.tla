@@ -235,8 +235,8 @@ ExpirePendingBootstrapTrust(p, s) ==
     /\ UNCHANGED <<localCred, credSource, peerSharedTrust, bootstrapTrust, inviteCreator, peerSharedEventForSPKI, pendingProjectionViolation>>
 
 \* 8. RemovePeerSharedTrust(p, s)
-\*    Removal of steady-state trust (e.g. peer_removed projection).
-\*    Rust: cascading from removal projection (PeerShared excluded via removed_entities).
+\*    Manual withdrawal of steady-state trust for a projected peer relation.
+\*    Rust: no automatic user-removal cascade is modeled in the current PoC.
 RemovePeerSharedTrust(p, s) ==
     /\ s \in peerSharedTrust[p]
     /\ peerSharedTrust' = [peerSharedTrust EXCEPT ![p] = @ \ {s}]

@@ -36,9 +36,8 @@ use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::db::{open_connection, schema::create_tables, store::insert_recorded_event};
 use crate::event_modules::{
     AdminEvent, DeviceInviteEvent, FileEvent, FileSliceEvent, InviteAcceptedEvent, KeySecretEvent,
-    KeySharedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent, PeerRemovedEvent,
-    PeerSharedEvent, ReactionEvent, TenantEvent, UserEvent, UserInviteEvent, UserRemovedEvent,
-    WorkspaceEvent,
+    KeySharedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent, PeerSharedEvent,
+    ReactionEvent, TenantEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
 };
 use crate::peering::loops::{
     accept_loop, connect_loop, connect_loop_with_shared_ingest,
@@ -888,44 +887,6 @@ impl Peer {
             .expect("failed to create admin")
     }
 
-    /// Create a UserRemoved event (signed by PeerShared key — admin). Returns the event ID.
-    pub fn create_user_removed(
-        &self,
-        signing_key: &ed25519_dalek::SigningKey,
-        target_event_id: &EventId,
-        peer_shared_event_id: &EventId,
-    ) -> EventId {
-        let db = open_connection(&self.db_path).expect("failed to open db");
-        let evt = ParsedEvent::UserRemoved(UserRemovedEvent {
-            created_at_ms: current_timestamp_ms(),
-            target_event_id: *target_event_id,
-            signed_by: *peer_shared_event_id,
-            signer_type: 5,
-            signature: [0u8; 64],
-        });
-        create_signed_event_synchronous(&db, &self.identity, &evt, signing_key)
-            .expect("failed to create user_removed")
-    }
-
-    /// Create a PeerRemoved event (signed by PeerShared key — admin). Returns the event ID.
-    pub fn create_peer_removed(
-        &self,
-        signing_key: &ed25519_dalek::SigningKey,
-        target_event_id: &EventId,
-        peer_shared_event_id: &EventId,
-    ) -> EventId {
-        let db = open_connection(&self.db_path).expect("failed to open db");
-        let evt = ParsedEvent::PeerRemoved(PeerRemovedEvent {
-            created_at_ms: current_timestamp_ms(),
-            target_event_id: *target_event_id,
-            signed_by: *peer_shared_event_id,
-            signer_type: 5,
-            signature: [0u8; 64],
-        });
-        create_signed_event_synchronous(&db, &self.identity, &evt, signing_key)
-            .expect("failed to create peer_removed")
-    }
-
     /// Create a KeyShared event (signed by PeerShared key). Returns the event ID.
     pub fn create_key_shared(
         &self,
@@ -1619,11 +1580,6 @@ const FINGERPRINT_TABLES: &[FingerprintTable] = &[
         order: "ORDER BY event_id",
     },
     FingerprintTable {
-        name: "removed_entities",
-        scope: Scope::RecordedBy,
-        order: "ORDER BY event_id",
-    },
-    FingerprintTable {
         name: "key_shared",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
@@ -1844,11 +1800,6 @@ fn clear_projection_tables(db: &rusqlite::Connection, recorded_by: &str) {
     .ok();
     db.execute(
         "DELETE FROM admins WHERE recorded_by = ?1",
-        rusqlite::params![recorded_by],
-    )
-    .ok();
-    db.execute(
-        "DELETE FROM removed_entities WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],
     )
     .ok();
@@ -3815,7 +3766,6 @@ mod fingerprint_tests {
             "users",
             "peers_shared",
             "admins",
-            "removed_entities",
             "key_shared",
         ];
         let excluded_tables = [

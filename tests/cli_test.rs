@@ -2,7 +2,7 @@
 //!
 //! Tests the `topo` binary end-to-end: multi-peer sync flows via invite,
 //! CLI command output formatting (event-tree, event-list, reactions, files,
-//! completions), and workspace management (ban, workspaces, db registry).
+//! completions), and workspace management (workspaces, db registry).
 //!
 //! **Boundary**: tests that exercise the CLI binary's user-facing behavior —
 //! command output, multi-peer sync scenarios, and trust policy enforcement.
@@ -223,11 +223,15 @@ struct ExpectedTenantDisplayRow {
 
 fn active_tenant_peer_id(db_path: &str) -> Option<String> {
     let output = topo_cmd(db_path, &["tenant", "active"]);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    if !output.status.success() && stderr.contains("daemon is not running") {
+        return None;
+    }
     assert!(
         output.status.success(),
         "tenant active failed: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        stderr
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let trimmed = stdout.trim();
@@ -3798,39 +3802,6 @@ fn test_cli_completions_zsh() {
     assert!(output.status.success(), "completions zsh failed");
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(!stdout.is_empty(), "zsh completions should produce output");
-}
-
-#[test]
-fn test_cli_ban_user() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("ban.db").to_str().unwrap().to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-
-    // There should be 1 user (the workspace creator)
-    let out = Command::new(bin())
-        .args(["--db", &db, "users"])
-        .output()
-        .expect("users command");
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("1."), "should have at least 1 user");
-
-    // Ban user #1
-    let out = Command::new(bin())
-        .args(["--db", &db, "ban", "1"])
-        .output()
-        .expect("ban command");
-    assert!(
-        out.status.success(),
-        "ban failed: {} {}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(stdout.contains("Banned"), "should confirm ban");
 }
 
 #[test]

@@ -342,7 +342,7 @@ pub fn import_cli_pins_to_sql(
     Ok(imported)
 }
 
-/// Compute SPKI fingerprints for all non-removed PeerShared public keys belonging to a peer.
+/// Compute SPKI fingerprints for all PeerShared public keys belonging to a peer.
 fn peer_shared_spki_fingerprints(
     conn: &Connection,
     recorded_by: &str,
@@ -353,19 +353,7 @@ fn peer_shared_spki_fingerprints(
     let mut stmt = conn.prepare(
         "SELECT p.transport_fingerprint FROM peers_shared p
          WHERE p.recorded_by = ?1
-           AND length(p.transport_fingerprint) = 32
-           AND NOT EXISTS (
-             SELECT 1 FROM removed_entities r
-             WHERE r.recorded_by = p.recorded_by
-               AND r.target_event_id = p.event_id
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM removed_entities r
-             WHERE r.recorded_by = p.recorded_by
-               AND p.user_event_id IS NOT NULL
-               AND r.target_event_id = p.user_event_id
-               AND r.removal_type = 'user'
-           )",
+           AND length(p.transport_fingerprint) = 32",
     )?;
     let direct_fps: Vec<[u8; 32]> = stmt
         .query_map(rusqlite::params![recorded_by], |row| {
@@ -389,18 +377,6 @@ fn is_peer_shared_spki(
             SELECT 1 FROM peers_shared p
             WHERE p.recorded_by = ?1
               AND p.transport_fingerprint = ?2
-              AND NOT EXISTS (
-                SELECT 1 FROM removed_entities r
-                WHERE r.recorded_by = p.recorded_by
-                  AND r.target_event_id = p.event_id
-              )
-              AND NOT EXISTS (
-                SELECT 1 FROM removed_entities r
-                WHERE r.recorded_by = p.recorded_by
-                  AND p.user_event_id IS NOT NULL
-                  AND r.target_event_id = p.user_event_id
-                  AND r.removal_type = 'user'
-              )
         )",
         rusqlite::params![recorded_by, spki_fingerprint.as_slice()],
         |row| row.get(0),
@@ -509,18 +485,6 @@ pub fn has_any_trusted_peer(
                 SELECT 1 FROM peers_shared
                 WHERE recorded_by = ?1
                   AND length(transport_fingerprint) = 32
-                  AND NOT EXISTS (
-                    SELECT 1 FROM removed_entities r
-                    WHERE r.recorded_by = peers_shared.recorded_by
-                      AND r.target_event_id = peers_shared.event_id
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM removed_entities r
-                    WHERE r.recorded_by = peers_shared.recorded_by
-                      AND peers_shared.user_event_id IS NOT NULL
-                      AND r.target_event_id = peers_shared.user_event_id
-                      AND r.removal_type = 'user'
-                  )
             )",
         rusqlite::params![recorded_by, now],
         |row| row.get(0),

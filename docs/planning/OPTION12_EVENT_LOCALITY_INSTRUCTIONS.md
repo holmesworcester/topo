@@ -33,7 +33,7 @@ Do not attempt Option 3 (pure functional projector conversion) in this branch.
 
 ## Suggested implementation sequence
 
-1. Pick one vertical slice first: `message` + `reaction` + `message_deletion` + `user_removed`.
+1. Pick one vertical slice first: `message` + `reaction` + `message_deletion` + `file`.
 2. Move create/query helpers from `service.rs` into event-owned modules.
 3. Introduce typed registry dispatch (commands and queries) in `events` layer.
 4. Convert service methods to call registry/event-module APIs.

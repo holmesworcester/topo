@@ -25,8 +25,6 @@ const CANONICAL_EVENT_FILES: &[&str] = &[
     "src/event_modules/peer_invite_shared/wire.rs",
     "src/event_modules/peer_shared/wire.rs",
     "src/event_modules/admin/wire.rs",
-    "src/event_modules/user_removed.rs",
-    "src/event_modules/peer_removed.rs",
     "src/event_modules/invite_secret.rs",
 ];
 

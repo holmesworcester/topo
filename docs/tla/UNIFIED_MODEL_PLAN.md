@@ -75,8 +75,6 @@ Each write intent must map to a Rust projection path in a table in this file.
    pending bootstrap trust must never materialize for non-inviter contexts (anti-privilege-escalation property).
 4. `BrSec_SourceBindingConsistency`:
    credential source and trust-source labels cannot disagree with their event/row provenance.
-5. `BrSec_RemovalDeniesConnectivity`:
-   once removal/exclusion cause is projected for a peer relation, ongoing authorization for that relation is denied (or forced to fallback/deny, based on policy).
 6. `BrSec_NoIdentityCollisionInAuthPath`:
    identity used for authorization is unique and cannot authenticate as multiple peers in the same state.
 
@@ -84,16 +82,13 @@ Each write intent must map to a Rust projection path in a table in this file.
 Use explicit fairness assumptions over projection and connection transition families.
 
 1. `BrLive_BootstrapConnectEventually`:
-   if invite acceptance preconditions hold and no exclusion/removal blockers, eventually invite connectivity is established.
+   if invite acceptance preconditions hold, eventually invite connectivity is established.
 2. `BrLive_PeerUpgradeEventually`:
    if invite connectivity active and PeerShared prerequisites hold, eventually peer/ongoing connectivity is established.
 3. `BrLive_BootstrapCompletionSyncEventually`:
    once connected and admissible, eventually required bootstrap-completion facts are projected/materialized.
 4. `BrLive_FallbackAttemptEventually`:
    if ongoing unavailable and bootstrap trust available, eventually fallback dial path is chosen/attempted.
-5. `BrLive_RemovalConvergesToDeny`:
-   once removal/exclusion is established, eventual auth outcome converges to deny for the removed relation.
-
 ## Fairness assumptions
 Document and encode at minimum:
 1. Projection fairness: enabled projection/write-intent actions are not perpetually postponed.
@@ -171,13 +166,11 @@ Drift controls (required):
 | Bridge surface | Rust/runtime concept |
 |---|---|
 | `EF_InviteCreator` | `recorded_events.source` / `is_local_create` |
-| `EF_RemovalOrExclusion` | `user_removed` / `peer_removed` projection effects |
 | `PW_ProjectPendingWrite` | projector `WritePendingBootstrapTrust` |
 | `PW_ProjectBootstrap` | `record_invite_bootstrap_trust()` path |
 | `PW_ProjectPeerShared` | `peer_shared_spki_fingerprints()` materialization + supersession of bootstrap/pending trust rows |
 | `PW_DialBootstrapFallback` | `runtime/peering/loops/connect` fallback branch |
 | `PW_DialOngoing` / `PW_UpgradeConn` | ongoing-first dial/upgrade behavior in `runtime/peering/loops/connect` |
-| `PW_Deny` | removal/exclusion deny path in transport authz + connect lifecycle |
 | `RT_TrustedSPKIs` | `allowed_peers_from_db()` trust union |
 | `RT_CanAuthorize` | `is_peer_allowed()` and transport trust check |
 | `RT_DialPreference` | connect-loop ongoing-first with bootstrap fallback |
@@ -199,8 +192,7 @@ Bridge check ids are now listed in `docs/tla/runtime_check_catalog.md` under
 11. `CHK_BRIDGE_SEC_TRUST_PROVENANCE`
 12. `CHK_BRIDGE_SEC_PENDING_INVITER_ONLY`
 13. `CHK_BRIDGE_SEC_SOURCE_BINDING`
-14. `CHK_BRIDGE_SEC_REMOVAL_DENY`
-15. `CHK_BRIDGE_SEC_IDENTITY_COLLISION`
+14. `CHK_BRIDGE_SEC_IDENTITY_COLLISION`
 
 ## Product-goal coverage table
 | Product goal | UnifiedBridge property/invariant | Runtime check id(s) | Validation config |
@@ -209,7 +201,6 @@ Bridge check ids are now listed in `docs/tla/runtime_check_catalog.md` under
 | Bootstrap completion sync sufficiency | `BrLive_BootstrapCompletionSyncEventually` | `CHK_BRIDGE_SYNC_COMPLETION_PROGRESS` | `unified_bridge_progress_fast.cfg` |
 | Ongoing upgrade viability | `BrLive_PeerUpgradeEventually` | `CHK_BRIDGE_UPGRADE_PROGRESS`, `CHK_BRIDGE_ONGOING_PREFERENCE` | `unified_bridge_progress_fast.cfg` |
 | Fallback path behavior | `BrInv_BootstrapFallbackOnlyWhenNeeded`, `BrLive_FallbackAttemptEventually` | `CHK_BRIDGE_BOOTSTRAP_FALLBACK`, `CHK_BRIDGE_BOOTSTRAP_CTX_DETERMINISM` | `unified_bridge_fix_repro.cfg`, `unified_bridge_progress_fast.cfg` |
-| Removal deny convergence | `BrSec_RemovalDeniesConnectivity`, `BrLive_RemovalConvergesToDeny` | `CHK_BRIDGE_SEC_REMOVAL_DENY` | `unified_bridge_progress_fast.cfg` |
 
 ## TLC execution notes template
 1. `cd docs/tla`
