@@ -12,11 +12,11 @@ From exploratory CLI testing across three connectivity modes: same-DB multi-tena
 
 **Fix applied**: Added `AND c.peer_id = ?1` to the JOIN condition in both `queries.rs` and `tests/cli_test.rs`.
 
-### 2. `identity` command shows wrong User/Peer IDs
+### 2. `identity` command shows wrong User/Peer IDs (FIXED)
 
 The `identity` command returns identical User and Peer short IDs across all databases in a multi-DB setup — it picks the first record found rather than matching against the local transport key. The `keys` command and `accept` output correctly show distinct identities. Same root-cause family as bug 1 (query doesn't scope to the active tenant's identity).
 
-**Fix**: Scope the identity query to the active tenant's `recorded_by`, same pattern as bug 1 fix.
+**Fix**: Already resolved. The current query in `peer_shared/queries.rs:identity()` correctly scopes via `recorded_by = ?1` and transport fingerprint JOIN. Verified with multi-DB test — distinct identities returned for each peer.
 
 ### 6. Partial workspace creation on encoding failure (PARTIAL FIX)
 
