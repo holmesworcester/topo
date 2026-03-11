@@ -309,9 +309,34 @@ pub struct IdentityResponse {
 }
 
 /// Get combined identity info for a specific peer.
+///
+/// Finds the local peer's own peers_shared entry by matching
+/// transport_fingerprint to the recorded_by peer_id, then resolves
+/// the user via that entry's user_event_id.
 pub fn identity(db: &Connection, recorded_by: &str) -> Result<IdentityResponse, rusqlite::Error> {
-    let user_event_id = super::super::user::first_event_id(db, recorded_by)?;
-    let peer_shared_event_id = first_event_id(db, recorded_by)?;
+    use rusqlite::OptionalExtension;
+
+    // Find the peers_shared row whose transport fingerprint matches recorded_by
+    // (i.e., the local peer's own entry, not a remote peer's).
+    let own_peer: Option<(String, Option<String>)> = db
+        .query_row(
+            "SELECT ps.event_id, ps.user_event_id
+             FROM peers_shared ps
+             JOIN local_transport_creds c
+               ON c.peer_id = lower(hex(ps.transport_fingerprint))
+              AND c.peer_id = ?1
+             WHERE ps.recorded_by = ?1
+             LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+        )
+        .optional()?;
+
+    let (peer_shared_event_id, user_event_id) = match own_peer {
+        Some((ps_eid, u_eid)) => (Some(ps_eid), u_eid),
+        None => (None, None),
+    };
+
     Ok(IdentityResponse {
         transport_fingerprint: recorded_by.to_string(),
         user_event_id,
