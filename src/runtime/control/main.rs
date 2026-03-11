@@ -362,7 +362,6 @@ enum Commands {
     #[command(name = "accept-link")]
     AcceptLink {
         /// Device link (topo://link/...)
-        #[arg(long)]
         invite: String,
         /// Device name for the new identity (defaults to system hostname)
         #[arg(long)]
@@ -1175,7 +1174,7 @@ fn run_tenant_action(
                         } else {
                             " "
                         };
-                        let peer_id = item["peer_id"].as_str().unwrap_or("");
+                        let username = item["username"].as_str().unwrap_or("");
                         let ws_id = item["workspace_id"].as_str().unwrap_or("");
                         let ws_name = item["workspace_name"].as_str().unwrap_or("");
                         let idx = item["index"].as_u64().unwrap_or(0);
@@ -1184,12 +1183,14 @@ fn run_tenant_action(
                         } else {
                             ws_name.to_string()
                         };
+                        let user_display = if username.is_empty() {
+                            "(no username)".to_string()
+                        } else {
+                            username.to_string()
+                        };
                         println!(
-                            "  {}. {} {} (workspace: {})",
-                            idx,
-                            marker,
-                            short_id(peer_id),
-                            workspace_display
+                            "  {}. {} {}@{}",
+                            idx, marker, user_display, workspace_display
                         );
                     }
                 }
