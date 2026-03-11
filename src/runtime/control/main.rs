@@ -162,9 +162,9 @@ enum Commands {
         action: Option<TenantAction>,
     },
 
-    /// Print local transport identity — SPKI fingerprint from TLS cert
-    #[command(name = "transport-identity")]
-    TransportIdentity,
+    /// List local transport keys (SPKI fingerprints from TLS certs)
+    #[command(name = "transport-keys")]
+    TransportKeys,
 
     /// Combined view: sidebar + messages with inline reactions
     View {
@@ -2118,11 +2118,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             run_tenant_action(db, socket_override.as_deref(), action)?;
         }
 
-        Commands::TransportIdentity => {
+        Commands::TransportKeys => {
             let data =
-                rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::TransportIdentity)?;
-            let fingerprint = data["fingerprint"].as_str().unwrap_or("");
-            println!("{}", fingerprint);
+                rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::TransportKeys)?;
+            if let Some(keys) = data.as_array() {
+                if keys.is_empty() {
+                    println!("(no transport keys)");
+                } else {
+                    println!("TRANSPORT KEYS ({}):", keys.len());
+                    for key in keys {
+                        let peer_id = key["peer_id"].as_str().unwrap_or("");
+                        let source = key["source"].as_str().unwrap_or("unknown");
+                        println!("  {} ({})", peer_id, source);
+                    }
+                }
+            }
         }
 
         Commands::View { limit } => {

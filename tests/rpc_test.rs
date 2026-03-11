@@ -145,7 +145,7 @@ fn rpc_all_methods_serialize() {
             timeout_ms: 10000,
             interval_ms: 200,
         },
-        RpcMethod::TransportIdentity,
+        RpcMethod::TransportKeys,
         RpcMethod::React {
             target: "abc".into(),
             emoji: "thumbs_up".into(),
@@ -2075,7 +2075,7 @@ fn catalog_drift_test_method_count_matches_protocol() {
         "GenerateFiles",
         "AssertNow",
         "AssertEventually",
-        "TransportIdentity",
+        "TransportKeys",
         "React",
         "DeleteMessage",
         "Reactions",

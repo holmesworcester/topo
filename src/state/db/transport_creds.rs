@@ -167,6 +167,24 @@ pub fn list_local_peers(
     Ok(peers)
 }
 
+/// List all local transport keys with their source (e.g. "random", "peershared", "bootstrap").
+pub fn list_local_peers_with_source(
+    conn: &Connection,
+) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut stmt = conn.prepare(
+        "SELECT peer_id, source FROM local_transport_creds ORDER BY created_at",
+    )?;
+    let keys = stmt
+        .query_map([], |row| {
+            Ok(serde_json::json!({
+                "peer_id": row.get::<_, String>(0)?,
+                "source": row.get::<_, String>(1)?,
+            }))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(keys)
+}
+
 /// Tenant discovery: join invites_accepted with local_transport_creds to find
 /// all local identities that have both a workspace binding and TLS material.
 pub struct TenantInfo {

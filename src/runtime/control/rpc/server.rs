@@ -701,15 +701,13 @@ fn dispatch(
         },
 
         // ----- Read-only commands (call event modules directly) -----
-        RpcMethod::TransportIdentity => match crate::db::open_connection(db_path) {
+        RpcMethod::TransportKeys => match crate::db::open_connection(db_path) {
             Ok(db) => {
                 if let Err(e) = crate::db::schema::create_tables(&db) {
                     return RpcResponse::error(e.to_string());
                 }
-                match crate::transport::identity::ensure_transport_peer_id(&db) {
-                    Ok(fingerprint) => {
-                        RpcResponse::success(service::TransportIdentityResponse { fingerprint })
-                    }
+                match crate::state::db::transport_creds::list_local_peers_with_source(&db) {
+                    Ok(keys) => RpcResponse::success(serde_json::json!(keys)),
                     Err(e) => RpcResponse::error(e.to_string()),
                 }
             }

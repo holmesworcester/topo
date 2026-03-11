@@ -56,7 +56,7 @@ pub enum RpcMethod {
         timeout_ms: u64,
         interval_ms: u64,
     },
-    TransportIdentity,
+    TransportKeys,
     React {
         target: String,
         emoji: String,

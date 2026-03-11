@@ -118,11 +118,6 @@ pub fn open_db_for_peer(
 // ---------------------------------------------------------------------------
 
 #[derive(Debug, Serialize, Deserialize)]
-pub struct TransportIdentityResponse {
-    pub fingerprint: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
 pub struct NodeTenantItem {
     pub peer_id: String,
     pub workspace_id: String,

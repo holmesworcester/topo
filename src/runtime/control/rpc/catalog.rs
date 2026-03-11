@@ -105,10 +105,10 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"AssertEventually","predicate":"message_count == 10","timeout_ms":10000,"interval_ms":200}"#,
     },
     MethodInfo {
-        name: "TransportIdentity",
-        purpose: "Print local transport SPKI fingerprint",
+        name: "TransportKeys",
+        purpose: "List all local transport keys (SPKI fingerprints)",
         params: PARAM_NONE,
-        example_json: r#"{"type":"TransportIdentity"}"#,
+        example_json: r#"{"type":"TransportKeys"}"#,
     },
     MethodInfo {
         name: "React",
