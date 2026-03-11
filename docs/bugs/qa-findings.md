@@ -18,11 +18,11 @@ The `identity` command returns identical User and Peer short IDs across all data
 
 **Fix**: Scope the identity query to the active tenant's `recorded_by`, same pattern as bug 1 fix.
 
-### 6. Partial workspace creation on encoding failure
+### 6. Partial workspace creation on encoding failure (FIXED)
 
 `create-workspace --username <65-chars>` fails with encoding error, but workspace/network events are already committed. The operation is not atomic — leaves DB with a workspace that has 0 users.
 
-**Fix**: The encoding length check already exists in the event encoder but fires too late (after workspace/network events are committed). Move validation into the User projector so it returns `Reject` for oversized usernames. For locally created events, `create_event_sync` already propagates `Reject` back as `CreateEventError::Rejected`, so the command will fail before workspace events are committed if the user event is created first — or the whole sequence needs to be wrapped in a transaction.
+**Fix applied**: Upfront byte-length validation prevents the common case. Both `create_workspace` and `join_workspace_as_new_user` now wrap the entire event creation sequence in a SAVEPOINT, so any mid-sequence failure rolls back atomically.
 
 ### 7–9. Empty username / message / reaction accepted (FIXED)
 
@@ -56,17 +56,17 @@ Starting with a non-existent parent directory shows `SqliteFailure(Error { code:
 
 **Fix applied**: `autodetect_bootstrap_addrs` now checks if the bind IP is a wildcard (`0.0.0.0`/`::`). If wildcard, enumerates all interfaces (unchanged). If specific IP, uses only that IP+port.
 
-### 15. No version negotiation — mismatched builds cause endless connection errors
+### 15. No version negotiation — mismatched builds cause endless connection errors (FIXED)
 
 Two peers running different builds (e.g. `ae72119` vs `89d8d56`) produce endless "Data stream error: connection lost" at ~2/s with no indication the cause is a version mismatch. Protocol-breaking changes between commits have no graceful degradation.
 
-**Fix**: Embed the git commit hash in the build (via `env!` or build script). On sync session handshake, exchange commit hashes. If they don't match, abort with a clear error: `"version mismatch: local=<hash> remote=<hash>. Version negotiation is out of scope; both peers must run the same build."` Be strict — fail immediately rather than retrying.
+**Fix applied**: `build.rs` embeds the git commit hash via `TOPO_GIT_HASH` env var. Session stream header bumped to v2 (22 bytes) with 8-byte commit hash field. Peers with mismatched hashes get a clear error and abort immediately.
 
-### 13. Long DB path causes silent RPC failure
+### 13. Long DB path causes silent RPC failure (FIXED)
 
 When the derived socket path exceeds ~108 chars (SUN_LEN), the daemon starts its QUIC listener but the RPC server silently fails. Daemon runs but is unreachable. Should detect this upfront and suggest `--socket`.
 
-**Fix**: Check derived socket path length at daemon startup before binding. If it exceeds the platform limit, fail with a clear error suggesting `--socket <shorter-path>`.
+**Fix applied**: Socket path length validated at daemon startup before any binding. Fails with `"socket path too long (N chars, max 107): <path>"` and suggests `--socket`.
 
 ---
 
