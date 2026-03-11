@@ -125,9 +125,10 @@ fn replay_existing_workspace_shared_events_for_tenant(
     let recorded_at = now_ms() as i64;
 
     // Phase 1: Durably record and enqueue ALL events before projecting any.
-    // Wrapped in a transaction so a crash mid-loop cannot leave partial
+    // Wrapped in a savepoint so a crash mid-loop cannot leave partial
     // recorded_events without matching project_queue entries.
-    db.execute_batch("BEGIN")?;
+    // Uses SAVEPOINT (not BEGIN) to nest safely inside caller transactions.
+    db.execute_batch("SAVEPOINT replay_seed")?;
     for event_id in &event_ids {
         insert_recorded_event(
             db,
@@ -139,7 +140,7 @@ fn replay_existing_workspace_shared_events_for_tenant(
         let event_id_b64 = event_id_to_base64(event_id);
         let _ = pq.enqueue(recorded_by, &event_id_b64);
     }
-    db.execute_batch("COMMIT")?;
+    db.execute_batch("RELEASE replay_seed")?;
 
     // Phase 2: Project inline and clean up queue entries.
     // Blocked events (e.g. encrypted events whose key_secret hasn't been
@@ -266,6 +267,28 @@ pub fn create_workspace(
         .into());
     }
 
+    // Wrap the entire creation sequence in a savepoint so partial failures
+    // roll back all events atomically (fixes bug #6).
+    db.execute_batch("SAVEPOINT create_workspace")?;
+    match create_workspace_inner(db, workspace_name, username, device_name) {
+        Ok(result) => {
+            db.execute_batch("RELEASE create_workspace")?;
+            Ok(result)
+        }
+        Err(e) => {
+            let _ = db.execute_batch("ROLLBACK TO create_workspace");
+            let _ = db.execute_batch("RELEASE create_workspace");
+            Err(e)
+        }
+    }
+}
+
+fn create_workspace_inner(
+    db: &Connection,
+    workspace_name: &str,
+    username: &str,
+    device_name: &str,
+) -> Result<CreateWorkspaceResult, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
 
     // Pre-derive peer_id from PeerShared key so all events are written under
@@ -420,6 +443,41 @@ pub fn join_workspace_as_new_user(
         .into());
     }
 
+    // Wrap the entire join sequence in a savepoint so partial failures
+    // roll back all events atomically (fixes bug #6).
+    db.execute_batch("SAVEPOINT join_workspace")?;
+    match join_workspace_inner(
+        db,
+        recorded_by,
+        invite_key,
+        invite_event_id,
+        workspace_id,
+        username,
+        device_name,
+        peer_shared_key,
+    ) {
+        Ok(result) => {
+            db.execute_batch("RELEASE join_workspace")?;
+            Ok(result)
+        }
+        Err(e) => {
+            let _ = db.execute_batch("ROLLBACK TO join_workspace");
+            let _ = db.execute_batch("RELEASE join_workspace");
+            Err(e)
+        }
+    }
+}
+
+fn join_workspace_inner(
+    db: &Connection,
+    recorded_by: &str,
+    invite_key: &SigningKey,
+    invite_event_id: &EventId,
+    workspace_id: EventId,
+    username: &str,
+    device_name: &str,
+    peer_shared_key: SigningKey,
+) -> Result<JoinChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
     let tenant_event_id = ops::ensure_local_tenant_event(db, recorded_by, &peer_shared_key)?;
 
