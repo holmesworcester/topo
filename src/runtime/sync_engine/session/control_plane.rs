@@ -126,7 +126,7 @@ where
                 break;
             }
             for event_id in &queued {
-                let _ = wanted.insert(event_id);
+                wanted.insert(event_id)?;
             }
             let queued_len = queued.len();
             control
@@ -135,7 +135,7 @@ where
                 })
                 .await?;
             control.flush().await?;
-            let _ = need_queue.remove_many(peer_id, &queued)?;
+            need_queue.remove_many(peer_id, &queued)?;
             queued_dispatched += queued_len;
             remaining_credit = remaining_credit.saturating_sub(queued_len);
             if remaining_credit == 0 {
@@ -161,7 +161,7 @@ where
         let event_id = neg_id_to_event_id(&neg_id);
         if claim_all || is_event_owned(&event_id, peer_idx, total_peers) {
             if owned_sent_now < remaining_credit {
-                let _ = wanted.insert(&event_id);
+                wanted.insert(&event_id)?;
                 batch.push(event_id);
                 owned_sent_now += 1;
                 if batch.len() >= need_chunk {
@@ -189,7 +189,7 @@ where
 
     if low_mem_mode() {
         if !deferred_to_queue.is_empty() {
-            let _ = need_queue.insert_many(peer_id, &deferred_to_queue)?;
+            need_queue.insert_many(peer_id, &deferred_to_queue)?;
         }
         need_ids.clear();
         // Reconciliation can transiently expand this buffer to very large
@@ -275,7 +275,7 @@ where
     let need_chunk = need_chunk();
     let mut batch: Vec<EventId> = Vec::with_capacity(need_chunk);
     for event_id in assigned {
-        let _ = wanted.insert(&event_id);
+        wanted.insert(&event_id)?;
         batch.push(event_id);
         if batch.len() >= need_chunk {
             control.send(&Frame::HaveList { ids: batch }).await?;

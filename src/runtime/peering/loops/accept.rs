@@ -182,7 +182,11 @@ async fn accept_loop_with_ingest_until_cancel_inner(
 
         let connection = provider.connection();
         let peer_id = provider.peer_id().to_string();
-        info!("Accepted connection from {}", peer_id);
+        info!(
+            "Accepted connection from {} on connection {}",
+            peer_id,
+            connection.stable_id()
+        );
 
         // Resolve which local tenant owns this connection.
         // Always resolve via trust tables — new tenants may have been

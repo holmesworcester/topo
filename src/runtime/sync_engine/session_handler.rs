@@ -6,8 +6,10 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
+use std::time::Duration;
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
+use tracing::info;
 
 use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::contracts::peering_contract::{
@@ -150,6 +152,46 @@ impl SyncSessionHandler {
     }
 }
 
+const STARTUP_MARKER_TIMEOUT_SECS: u64 = 10;
+
+async fn send_outbound_startup_markers<C, S, R>(
+    conn: &mut DualConnection<C, S, R>,
+    session_id: u64,
+    timeout_secs: u64,
+) -> Result<(), String>
+where
+    C: StreamConn,
+    S: StreamSend,
+    R: StreamRecv,
+{
+    let marker_timeout_secs = timeout_secs.min(STARTUP_MARKER_TIMEOUT_SECS).max(1);
+    let marker_timeout = Duration::from_secs(marker_timeout_secs);
+    tokio::time::timeout(marker_timeout, async {
+        conn.control
+            .send(&Frame::HaveList { ids: vec![] })
+            .await
+            .map_err(|e| format!("failed to send control marker: {e}"))?;
+        conn.data_send
+            .send(&Frame::HaveList { ids: vec![] })
+            .await
+            .map_err(|e| format!("failed to send data marker: {e}"))?;
+        conn.flush_control()
+            .await
+            .map_err(|e| format!("failed to flush control marker: {e}"))?;
+        conn.flush_data()
+            .await
+            .map_err(|e| format!("failed to flush data marker: {e}"))?;
+        Ok::<(), String>(())
+    })
+    .await
+    .map_err(|_| {
+        format!(
+            "session {} startup markers timed out after {}s",
+            session_id, marker_timeout_secs
+        )
+    })?
+}
+
 #[async_trait(?Send)]
 impl SessionHandler for SyncSessionHandler {
     async fn on_session(
@@ -200,27 +242,33 @@ impl SessionHandler for SyncSessionHandler {
         // starting the sync protocol. These empty HaveList messages force
         // lazy QUIC streams to open on the receiver side.
         if meta.direction == SessionDirection::Outbound {
-            conn.control
-                .send(&Frame::HaveList { ids: vec![] })
-                .await
-                .map_err(|e| format!("failed to send control marker: {e}"))?;
-            conn.data_send
-                .send(&Frame::HaveList { ids: vec![] })
-                .await
-                .map_err(|e| format!("failed to send data marker: {e}"))?;
-            conn.flush_control()
-                .await
-                .map_err(|e| format!("failed to flush control marker: {e}"))?;
-            conn.flush_data()
-                .await
-                .map_err(|e| format!("failed to flush data marker: {e}"))?;
+            info!(
+                "Session {} outbound startup markers begin peer={} remote={}",
+                meta.session_id,
+                &peer_id[..16.min(peer_id.len())],
+                meta.remote_addr
+            );
+            send_outbound_startup_markers(&mut conn, meta.session_id, self.timeout_secs).await?;
+            info!(
+                "Session {} outbound startup markers complete peer={} remote={}",
+                meta.session_id,
+                &peer_id[..16.min(peer_id.len())],
+                meta.remote_addr
+            );
         }
 
         let mut stats: Option<crate::runtime::SyncStats> = None;
         let result = match (&self.role, meta.direction) {
             (SessionRole::Initiator { coordination }, SessionDirection::Outbound) => {
+                info!(
+                    "Session {} entering initiator sync peer={} remote={}",
+                    meta.session_id,
+                    &peer_id[..16.min(peer_id.len())],
+                    meta.remote_addr
+                );
                 let run = run_sync_initiator(
                     conn,
+                    meta.session_id,
                     &self.db_path,
                     self.timeout_secs,
                     &peer_id,
@@ -246,8 +294,15 @@ impl SessionHandler for SyncSessionHandler {
                 }
             }
             (SessionRole::Responder, SessionDirection::Inbound) => {
+                info!(
+                    "Session {} entering responder sync peer={} remote={}",
+                    meta.session_id,
+                    &peer_id[..16.min(peer_id.len())],
+                    meta.remote_addr
+                );
                 let run = run_sync_responder(
                     conn,
+                    meta.session_id,
                     &self.db_path,
                     self.timeout_secs,
                     &peer_id,
@@ -284,5 +339,108 @@ impl SessionHandler for SyncSessionHandler {
             let _ = logger.finalize(stats.as_ref(), outcome, error_msg);
         }
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contracts::peering_contract::{PeerFingerprint, TenantId, TransportSessionIoParts};
+    use crate::sync::session::coordinator::CoordinationManager;
+    use std::future::pending;
+
+    struct StaticControl;
+
+    #[async_trait]
+    impl ControlIo for StaticControl {
+        async fn recv(&mut self) -> Result<Vec<u8>, TransportSessionIoError> {
+            pending::<Result<Vec<u8>, TransportSessionIoError>>().await
+        }
+
+        async fn send(&mut self, _frame: &[u8]) -> Result<(), TransportSessionIoError> {
+            Ok(())
+        }
+
+        async fn flush(&mut self) -> Result<(), TransportSessionIoError> {
+            Ok(())
+        }
+    }
+
+    struct StalledDataSend;
+
+    #[async_trait]
+    impl DataSendIo for StalledDataSend {
+        async fn send(&mut self, _frame: &[u8]) -> Result<(), TransportSessionIoError> {
+            Ok(())
+        }
+
+        async fn flush(&mut self) -> Result<(), TransportSessionIoError> {
+            pending::<Result<(), TransportSessionIoError>>().await
+        }
+    }
+
+    struct IdleDataRecv;
+
+    #[async_trait]
+    impl DataRecvIo for IdleDataRecv {
+        async fn recv(&mut self) -> Result<Vec<u8>, TransportSessionIoError> {
+            pending::<Result<Vec<u8>, TransportSessionIoError>>().await
+        }
+    }
+
+    struct StalledStartupIo;
+
+    #[async_trait]
+    impl TransportSessionIo for StalledStartupIo {
+        fn session_id(&self) -> u64 {
+            42
+        }
+
+        fn max_frame_size(&self) -> usize {
+            1024
+        }
+
+        fn split(self: Box<Self>) -> TransportSessionIoParts {
+            TransportSessionIoParts {
+                control: Box::new(StaticControl),
+                data_send: Box::new(StalledDataSend),
+                data_recv: Box::new(IdleDataRecv),
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn outbound_startup_markers_timeout_when_data_flush_stalls() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("startup-marker-timeout.db");
+        let (shared_ingest_tx, _shared_ingest_rx) = mpsc::channel::<IngestItem>(1);
+        let coordination = CoordinationManager::new().register_peer();
+        let handler = SyncSessionHandler::outbound(
+            db_path.to_str().unwrap().to_string(),
+            1,
+            coordination,
+            shared_ingest_tx,
+        );
+        let meta = SessionMeta {
+            session_id: 42,
+            tenant: TenantId("tenant-a".to_string()),
+            peer: PeerFingerprint([0x11; 32]),
+            remote_addr: "127.0.0.1:4000".parse().unwrap(),
+            direction: SessionDirection::Outbound,
+        };
+
+        let started = std::time::Instant::now();
+        let err = handler
+            .on_session(meta, Box::new(StalledStartupIo), CancellationToken::new())
+            .await
+            .expect_err("startup markers should time out instead of hanging");
+        assert!(
+            err.contains("startup markers timed out"),
+            "unexpected error: {err}"
+        );
+        assert!(
+            started.elapsed() < Duration::from_secs(3),
+            "startup marker timeout should fail quickly, not hang"
+        );
     }
 }

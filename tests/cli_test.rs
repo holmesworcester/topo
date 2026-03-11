@@ -95,6 +95,59 @@ fn tenant_index_for_peer_id(db_path: &str, peer_id: &str) -> usize {
         .expect("peer id should appear in tenant scopes")
 }
 
+fn wait_for_bootstrap_supersession_and_endpoint_observation(
+    db_path: &str,
+    remote_peer_id: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_millis() as i64;
+        let conn = open_connection(db_path).expect("open db");
+        let bootstrap_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM invite_bootstrap_trust", [], |row| {
+                row.get(0)
+            })
+            .expect("count invite_bootstrap_trust");
+        let pending_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_invite_bootstrap_trust",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count pending_invite_bootstrap_trust");
+        let observed_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM peer_endpoint_observations
+                 WHERE via_peer_id = ?1
+                   AND expires_at > ?2",
+                rusqlite::params![remote_peer_id, now_ms],
+                |row| row.get(0),
+            )
+            .expect("count peer_endpoint_observations");
+        drop(conn);
+
+        if bootstrap_rows == 0 && pending_rows == 0 && observed_rows > 0 {
+            return;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "bootstrap trust did not supersede into observed-endpoint state for db={} remote={} within {:?} (bootstrap_rows={}, pending_rows={}, observed_rows={})",
+            db_path,
+            remote_peer_id,
+            timeout,
+            bootstrap_rows,
+            pending_rows,
+            observed_rows
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
 struct StartedCliPeer {
     db: String,
     username: String,
@@ -935,6 +988,144 @@ fn test_cli_ongoing_sync() {
         &format!("has_event:{} >= 1", alice_last_eid),
         timeout_ms,
     );
+}
+
+#[test]
+fn test_cli_reconnects_after_bootstrap_supersession_using_observed_endpoint() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+    let timeout_ms = 30000;
+    let alice_port = random_port();
+
+    create_workspace(&alice_db);
+    let mut alice_daemon = start_daemon_with_options(
+        &alice_db,
+        &DaemonOptions {
+            bind_port: Some(alice_port),
+            disable_discovery: true,
+            ..Default::default()
+        },
+    );
+    let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
+
+    accept_invite(&bob_db, &invite_link);
+    let mut bob_daemon = start_daemon_with_options(
+        &bob_db,
+        &DaemonOptions {
+            disable_discovery: true,
+            ..Default::default()
+        },
+    );
+
+    let steady_state_eid = send_message(&alice_db, "steady-state before reconnect");
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", steady_state_eid),
+        timeout_ms,
+    );
+
+    let alice_transport_peer_id = daemon_transport_fingerprint(&alice_db);
+    wait_for_bootstrap_supersession_and_endpoint_observation(
+        &bob_db,
+        &alice_transport_peer_id,
+        Duration::from_secs(15),
+    );
+
+    stop_daemon(&bob_db, &mut bob_daemon);
+
+    let after_restart_eid = send_message(&alice_db, "delta after bob restart");
+    bob_daemon = start_daemon_with_options(
+        &bob_db,
+        &DaemonOptions {
+            disable_discovery: true,
+            ..Default::default()
+        },
+    );
+
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", after_restart_eid),
+        timeout_ms,
+    );
+
+    stop_daemon(&bob_db, &mut bob_daemon);
+    stop_daemon(&alice_db, &mut alice_daemon);
+}
+
+#[test]
+fn test_cli_lowmem_receiver_restart_catches_offline_delta_and_resumes_sync() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+    let timeout_ms = 30000;
+    let alice_port = random_port();
+
+    create_workspace(&alice_db);
+    let mut alice_daemon = start_daemon_with_options(
+        &alice_db,
+        &DaemonOptions {
+            bind_port: Some(alice_port),
+            disable_discovery: true,
+            ..Default::default()
+        },
+    );
+    let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
+
+    accept_invite(&bob_db, &invite_link);
+    let mut bob_daemon = start_daemon_with_options(
+        &bob_db,
+        &DaemonOptions {
+            disable_discovery: true,
+            ..Default::default()
+        },
+    );
+
+    generate_messages(&alice_db, 2_000);
+    assert_eventually(&bob_db, "message_count >= 2000", timeout_ms);
+
+    let alice_transport_peer_id = daemon_transport_fingerprint(&alice_db);
+    wait_for_bootstrap_supersession_and_endpoint_observation(
+        &bob_db,
+        &alice_transport_peer_id,
+        Duration::from_secs(15),
+    );
+
+    stop_daemon(&bob_db, &mut bob_daemon);
+
+    generate_messages(&alice_db, 200);
+    let offline_delta_eid = send_message(&alice_db, "delta after bob lowmem restart");
+
+    bob_daemon = start_daemon_with_options(
+        &bob_db,
+        &DaemonOptions {
+            disable_discovery: true,
+            extra_env: vec![
+                ("LOW_MEM_IOS".to_string(), "1".to_string()),
+                ("LOW_MEM_WAL_CAP_MIB".to_string(), "12".to_string()),
+            ],
+            ..Default::default()
+        },
+    );
+
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", offline_delta_eid),
+        timeout_ms,
+    );
+    assert_eventually(&bob_db, "message_count >= 2201", timeout_ms);
+
+    let steady_state_eid = send_message(&bob_db, "steady after bob lowmem catch-up");
+    assert_eventually(
+        &alice_db,
+        &format!("has_event:{} >= 1", steady_state_eid),
+        timeout_ms,
+    );
+
+    stop_daemon(&bob_db, &mut bob_daemon);
+    stop_daemon(&alice_db, &mut alice_daemon);
 }
 
 /// Two separate local daemons should discover and sync on the same machine

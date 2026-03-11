@@ -7,10 +7,13 @@
 //! Keeping these helpers here ensures retry timing and queue-health reporting
 //! stay consistent when multiple queues evolve.
 
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::thread;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 pub const BACKOFF_BASE_MS: i64 = 1000;
 pub const BACKOFF_MAX_ATTEMPTS: u32 = 10;
+pub const SQLITE_BUSY_RETRY_BASE_MS: u64 = 10;
+pub const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 8;
 
 /// Queue health snapshot for observability.
 #[derive(Debug, Clone)]
@@ -25,6 +28,55 @@ pub fn current_timestamp_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
+}
+
+pub fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
+    match err {
+        rusqlite::Error::SqliteFailure(_, Some(msg)) => {
+            msg.contains("database is locked") || msg.contains("SQLITE_BUSY")
+        }
+        rusqlite::Error::SqliteFailure(_, None) => false,
+        _ => {
+            let msg = err.to_string();
+            msg.contains("database is locked") || msg.contains("SQLITE_BUSY")
+        }
+    }
+}
+
+pub fn with_sqlite_busy_retry<T, F>(mut op: F) -> rusqlite::Result<T>
+where
+    F: FnMut() -> rusqlite::Result<T>,
+{
+    for attempt in 0..SQLITE_BUSY_RETRY_ATTEMPTS {
+        match op() {
+            Ok(value) => return Ok(value),
+            Err(err) if is_sqlite_busy(&err) && attempt + 1 < SQLITE_BUSY_RETRY_ATTEMPTS => {
+                thread::sleep(Duration::from_millis(SQLITE_BUSY_RETRY_BASE_MS << attempt));
+            }
+            Err(err) => return Err(err),
+        }
+    }
+
+    unreachable!("loop returns on success or final error");
+}
+
+pub fn with_immediate_tx<T, F>(conn: &rusqlite::Connection, mut op: F) -> rusqlite::Result<T>
+where
+    F: FnMut() -> rusqlite::Result<T>,
+{
+    with_sqlite_busy_retry(|| {
+        conn.execute("BEGIN IMMEDIATE", [])?;
+        match op() {
+            Ok(value) => {
+                conn.execute("COMMIT", [])?;
+                Ok(value)
+            }
+            Err(err) => {
+                let _ = conn.execute("ROLLBACK", []);
+                Err(err)
+            }
+        }
+    })
 }
 
 /// Calculate backoff delay: base_ms * 2^min(attempts, max_attempts)

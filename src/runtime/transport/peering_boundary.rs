@@ -21,7 +21,9 @@ use super::connection_lifecycle::{
     accept_peer, dial_peer, ConnectedPeer, ConnectionLifecycleError,
 };
 use super::multi_workspace::WorkspaceCertResolver;
-use super::session_factory::{accept_session_io, open_session_io, SessionOpenError};
+use super::session_factory::{
+    accept_session_io, open_session_io, InboundSessionState, SessionOpenError,
+};
 use super::{create_single_port_endpoint, workspace_client_config, DynamicAllowFn};
 
 pub type TransportEndpoint = quinn::Endpoint;
@@ -44,6 +46,7 @@ pub struct SessionProvider {
     /// Hex-encoded peer certificate SPKI fingerprint.
     peer_id: String,
     mode: SessionOpenMode,
+    inbound_state: InboundSessionState,
 }
 
 /// One ready-to-run sync session from a [`SessionProvider`].
@@ -61,6 +64,7 @@ impl SessionProvider {
             connection: connected.connection,
             peer_id: connected.peer_id,
             mode,
+            inbound_state: InboundSessionState::default(),
         }
     }
 
@@ -83,7 +87,9 @@ impl SessionProvider {
     pub async fn next_session(&self) -> Result<SessionEnvelope, SessionOpenError> {
         let (session_id, io) = match self.mode {
             SessionOpenMode::Outbound => open_session_io(&self.connection).await?,
-            SessionOpenMode::Inbound => accept_session_io(&self.connection).await?,
+            SessionOpenMode::Inbound => {
+                accept_session_io(&self.connection, &self.inbound_state).await?
+            }
         };
         Ok(SessionEnvelope {
             peer_id: self.peer_id.clone(),
@@ -318,6 +324,7 @@ pub fn outbound_session_provider_for_connection(
         connection,
         peer_id,
         mode: SessionOpenMode::Outbound,
+        inbound_state: InboundSessionState::default(),
     }
 }
 
@@ -330,7 +337,7 @@ pub async fn open_outbound_session(
 pub async fn open_inbound_session(
     conn: &TransportConnection,
 ) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError> {
-    accept_session_io(conn).await
+    accept_session_io(conn, &InboundSessionState::default()).await
 }
 
 pub async fn read_intro_offer_frame(

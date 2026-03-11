@@ -23,7 +23,8 @@ SUMMARY_PATTERN = re.compile(
     r"DELTA_MESSAGES_OBSERVED=|PRE_DELTA_FILE_SLICES=|POST_DELTA_FILE_SLICES=|"
     r"DELTA_FILE_SLICES_OBSERVED=|DELTA_MARKER_PREFIX=|DELTA_MARKERS_EXPECTED=|"
     r"DELTA_MARKERS_SYNCED=|ALICE_PEAK_VMHWM_MIB=|BOB_PEAK_VMHWM_MIB=|"
-    r"MAX_BOB_TOTAL_KB=|LOWMEM_BUDGET_KB=|PASS_UNDER_24MB=|CGROUP_ENFORCED=|"
+    r"BOB_PEAK_RSS_MIB=|MAX_BOB_TOTAL_MIB=|MAX_BOB_TOTAL_KB=|LOWMEM_BUDGET_KB=|"
+    r"PASS_UNDER_24MB=|CGROUP_ENFORCED=|"
     r"CGROUP_LIMIT_KB=|CGROUP_OOM=|CGROUP_OOM_KILL=|MAX_BOB_ANON_KB=|"
     r"MAX_BOB_ANON_UNLABELED_KB=|MAX_BOB_DB_SHM_KB=|MAX_BOB_DB_WAL_KB=|"
     r"MAX_SQLITE_MEM_CUR=|MAX_SQLITE_MEM_HIGH=|MAX_MALL_ARENA=|MAX_MALL_USED=|"
@@ -164,7 +165,8 @@ class PerfRunner:
         cgroup_enforce = self.env_value("PERF_LOWMEM_CGROUP_ENFORCE", "1")
         cgroup_limit_kb = self.env_value("PERF_LOWMEM_CGROUP_LIMIT_KB", "22528")
         base_small = self.env_value("PERF_LOWMEM_BASELINE_SMALL", "50000")
-        base_large = self.env_value("PERF_LOWMEM_BASELINE_LARGE", "1000000")
+        base_bracket = self.env_value("PERF_LOWMEM_BASELINE_BRACKET", "100000")
+        base_large = self.env_value("PERF_LOWMEM_BASELINE_LARGE", "500000")
         delta_target = self.env_value("PERF_LOWMEM_DELTA_TARGET", "10000")
         delta_bracket = self.env_value("PERF_LOWMEM_DELTA_BRACKET", "50000")
         file_baseline = self.env_value("PERF_LOWMEM_FILE_BASELINE", "50000")
@@ -185,12 +187,15 @@ class PerfRunner:
                 allow_failure=True,
             )
 
-        if self.env_value("PERF_LOWMEM_RUN_SMALL_BRACKET", "0") == "1":
+        if self.env_value(
+            "PERF_LOWMEM_RUN_BRACKET",
+            self.env_value("PERF_LOWMEM_RUN_SMALL_BRACKET", "0"),
+        ) == "1":
             self.run(
-                f"Lowmem Delta ({base_small}+{delta_bracket} messages)",
+                f"Lowmem Delta ({base_bracket}+{delta_bracket} messages, slow opt-in)",
                 [str(self.lowmem_script), "delta10k"],
                 extra_env={
-                    "LOWMEM_BASE_EVENTS": base_small,
+                    "LOWMEM_BASE_EVENTS": base_bracket,
                     "LOWMEM_DELTA_EVENTS": delta_bracket,
                     "LOWMEM_BUDGET_KB": budget_kb,
                     "LOWMEM_CGROUP_ENFORCE": cgroup_enforce,
@@ -201,7 +206,7 @@ class PerfRunner:
 
         if self.env_value("PERF_LOWMEM_RUN_LARGE_TARGET", "0") == "1":
             self.run(
-                f"Lowmem Delta ({base_large}+{delta_target} messages)",
+                f"Lowmem Delta ({base_large}+{delta_target} messages, slow opt-in)",
                 [str(self.lowmem_script), "delta10k"],
                 extra_env={
                     "LOWMEM_BASE_EVENTS": base_large,

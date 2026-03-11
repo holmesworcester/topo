@@ -353,7 +353,11 @@ async fn connect_loop_inner(
                 continue;
             }
         };
-        info!("Connected to {}", peer_id);
+        info!(
+            "Connected to {} on connection {}",
+            peer_id,
+            connection.stable_id()
+        );
 
         // Record endpoint observation, transport binding, and purge expired
         {

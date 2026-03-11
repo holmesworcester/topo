@@ -1,6 +1,7 @@
 use rusqlite::{params, Connection, Result as SqliteResult};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::queue::{with_immediate_tx, with_sqlite_busy_retry};
 use crate::crypto::EventId;
 
 /// Deferred need-id queue for low-memory pull backpressure.
@@ -37,18 +38,20 @@ impl<'a> NeedQueue<'a> {
             return Ok(0);
         }
         let now = current_timestamp_ms();
-        let mut stmt = self.conn.prepare(
-            "INSERT OR IGNORE INTO deferred_need_events (peer_id, id, first_seen_at)
-             VALUES (?1, ?2, ?3)",
-        )?;
-        let mut inserted = 0usize;
-        for id in ids {
-            let rows = stmt.execute(params![peer_id, &id[..], now])?;
-            if rows > 0 {
-                inserted += 1;
+        with_immediate_tx(self.conn, || {
+            let mut stmt = self.conn.prepare(
+                "INSERT OR IGNORE INTO deferred_need_events (peer_id, id, first_seen_at)
+                 VALUES (?1, ?2, ?3)",
+            )?;
+            let mut inserted = 0usize;
+            for id in ids {
+                let rows = stmt.execute(params![peer_id, &id[..], now])?;
+                if rows > 0 {
+                    inserted += 1;
+                }
             }
-        }
-        Ok(inserted)
+            Ok(inserted)
+        })
     }
 
     pub fn peek_batch(&self, peer_id: &str, limit: usize) -> SqliteResult<Vec<EventId>> {
@@ -56,57 +59,66 @@ impl<'a> NeedQueue<'a> {
             return Ok(Vec::new());
         }
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-        let mut stmt = self.conn.prepare(
-            "SELECT id
-             FROM deferred_need_events
-             WHERE peer_id = ?1
-             ORDER BY first_seen_at, rowid
-             LIMIT ?2",
-        )?;
-        let mut rows = stmt.query(params![peer_id, limit_i64])?;
-        let mut out = Vec::new();
-        while let Some(row) = rows.next()? {
-            let blob: Vec<u8> = row.get(0)?;
-            if blob.len() != 32 {
-                continue;
+        with_sqlite_busy_retry(|| {
+            let mut stmt = self.conn.prepare(
+                "SELECT id
+                 FROM deferred_need_events
+                 WHERE peer_id = ?1
+                 ORDER BY first_seen_at, rowid
+                 LIMIT ?2",
+            )?;
+            let mut rows = stmt.query(params![peer_id, limit_i64])?;
+            let mut out = Vec::new();
+            while let Some(row) = rows.next()? {
+                let blob: Vec<u8> = row.get(0)?;
+                if blob.len() != 32 {
+                    continue;
+                }
+                let mut id = [0u8; 32];
+                id.copy_from_slice(&blob);
+                out.push(id);
             }
-            let mut id = [0u8; 32];
-            id.copy_from_slice(&blob);
-            out.push(id);
-        }
-        Ok(out)
+            Ok(out)
+        })
     }
 
     pub fn remove_many(&self, peer_id: &str, ids: &[EventId]) -> SqliteResult<usize> {
         if ids.is_empty() {
             return Ok(0);
         }
-        let mut stmt = self
-            .conn
-            .prepare("DELETE FROM deferred_need_events WHERE peer_id = ?1 AND id = ?2")?;
-        let mut removed = 0usize;
-        for id in ids {
-            let rows = stmt.execute(params![peer_id, &id[..]])?;
-            if rows > 0 {
-                removed += 1;
+        with_immediate_tx(self.conn, || {
+            let mut stmt = self
+                .conn
+                .prepare("DELETE FROM deferred_need_events WHERE peer_id = ?1 AND id = ?2")?;
+            let mut removed = 0usize;
+            for id in ids {
+                let rows = stmt.execute(params![peer_id, &id[..]])?;
+                if rows > 0 {
+                    removed += 1;
+                }
             }
-        }
-        Ok(removed)
+            Ok(removed)
+        })
     }
 
     pub fn count(&self, peer_id: &str) -> SqliteResult<i64> {
-        self.conn.query_row(
-            "SELECT COUNT(*) FROM deferred_need_events WHERE peer_id = ?1",
-            params![peer_id],
-            |row| row.get(0),
-        )
+        with_sqlite_busy_retry(|| {
+            self.conn.query_row(
+                "SELECT COUNT(*) FROM deferred_need_events WHERE peer_id = ?1",
+                params![peer_id],
+                |row| row.get(0),
+            )
+        })
     }
 
     pub fn clear(&self, peer_id: &str) -> SqliteResult<()> {
-        self.conn.execute(
-            "DELETE FROM deferred_need_events WHERE peer_id = ?1",
-            params![peer_id],
-        )?;
+        with_sqlite_busy_retry(|| {
+            self.conn.execute(
+                "DELETE FROM deferred_need_events WHERE peer_id = ?1",
+                params![peer_id],
+            )?;
+            Ok(())
+        })?;
         Ok(())
     }
 }
@@ -116,4 +128,51 @@ fn current_timestamp_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{open_connection, schema::create_tables};
+    use std::time::Duration;
+
+    fn make_event_id(byte: u8) -> EventId {
+        let mut id = [0u8; 32];
+        id[0] = byte;
+        id
+    }
+
+    #[test]
+    fn test_insert_many_retries_transient_busy_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("need.db");
+
+        let setup = open_connection(&path).unwrap();
+        setup.busy_timeout(Duration::from_millis(20)).unwrap();
+        create_tables(&setup).unwrap();
+        drop(setup);
+
+        let lock_conn = open_connection(&path).unwrap();
+        lock_conn.busy_timeout(Duration::from_millis(20)).unwrap();
+        lock_conn.execute("BEGIN IMMEDIATE", []).unwrap();
+
+        let path_for_thread = path.clone();
+        let worker = std::thread::spawn(move || {
+            let conn = open_connection(&path_for_thread).unwrap();
+            conn.busy_timeout(Duration::from_millis(20)).unwrap();
+            let need_queue = NeedQueue::new(&conn);
+            need_queue
+                .insert_many("peer-a", &[make_event_id(1), make_event_id(2)])
+                .unwrap()
+        });
+
+        std::thread::sleep(Duration::from_millis(80));
+        lock_conn.execute("COMMIT", []).unwrap();
+
+        assert_eq!(worker.join().unwrap(), 2);
+
+        let verify = open_connection(&path).unwrap();
+        let need_queue = NeedQueue::new(&verify);
+        assert_eq!(need_queue.count("peer-a").unwrap(), 2);
+    }
 }

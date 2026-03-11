@@ -54,6 +54,7 @@ use super::{negentropy_frame_size, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGR
 /// batch_writer. The session never spawns its own writer thread.
 pub async fn run_sync_initiator<C, S, R>(
     conn: DualConnection<C, S, R>,
+    session_id: u64,
     db_path: &str,
     timeout_secs: u64,
     peer_id: &str,
@@ -89,9 +90,37 @@ where
     let egress = EgressQueue::new(&db);
     let wanted = WantedEvents::new(&db);
     let need_queue = NeedQueue::new(&db);
-    let _ = egress.clear_connection(peer_id);
-    let _ = wanted.clear();
-    let _ = need_queue.clear(peer_id);
+    let stale_egress = egress.count_pending(peer_id).unwrap_or(0);
+    let stale_wanted = wanted.count().unwrap_or(0);
+    let stale_need_queue = need_queue.count(peer_id).unwrap_or(0);
+    if stale_egress > 0 || stale_wanted > 0 || stale_need_queue > 0 {
+        warn!(
+            "Session {} initiator clearing peer-scoped state peer={} stale_egress={} stale_wanted={} stale_need_queue={}",
+            session_id,
+            peer_id,
+            stale_egress,
+            stale_wanted,
+            stale_need_queue
+        );
+    }
+    if let Err(err) = egress.clear_connection(peer_id) {
+        warn!(
+            "Session {} initiator failed to clear peer-scoped egress peer={} error={}",
+            session_id, peer_id, err
+        );
+    }
+    if let Err(err) = wanted.clear() {
+        warn!(
+            "Session {} initiator failed to clear wanted set peer={} error={}",
+            session_id, peer_id, err
+        );
+    }
+    if let Err(err) = need_queue.clear(peer_id) {
+        warn!(
+            "Session {} initiator failed to clear deferred need queue peer={} error={}",
+            session_id, peer_id, err
+        );
+    }
 
     let ws_id = lookup_workspace_id(&db, recorded_by).ok_or_else(|| {
         format!(
@@ -140,6 +169,10 @@ where
 
     let initial_msg = neg.initiate()?;
     send_initial_neg_open(&mut control, initial_msg).await?;
+    info!(
+        "Initiator sent initial NegOpen to peer={} remote_source={}",
+        peer_id, ingress_source_tag
+    );
 
     let mut reconciliation_done = false;
     let mut rounds = 0;
@@ -265,9 +298,12 @@ where
             }
         }
 
-        enqueue_pending_have_to_egress(&egress, peer_id, &mut pending_have);
+        enqueue_pending_have_to_egress(session_id, &egress, peer_id, &mut pending_have)
+            .map_err(|e| format!("failed to enqueue pending have events: {e}"))?;
         let send_stats =
-            drain_egress_to_data_stream(&egress, &store, peer_id, &mut data_send).await;
+            drain_egress_to_data_stream(session_id, &egress, &store, peer_id, &mut data_send)
+                .await
+                .map_err(|e| format!("failed to drain egress: {e}"))?;
         events_sent += send_stats.events_sent_delta;
         bytes_sent += send_stats.bytes_sent_delta;
         if send_stats.events_sent_delta > 0 {
@@ -333,7 +369,16 @@ where
 
         // Once reconciliation is done, fallback is dispatched, pending_have
         // is drained, and egress queue is empty, send DataDone+Done.
-        let pending_need_queue = need_queue.count(peer_id).unwrap_or(0);
+        let pending_need_queue = match need_queue.count(peer_id) {
+            Ok(count) => count,
+            Err(err) => {
+                warn!(
+                    "Session {} failed to count deferred need queue for peer {}: {}",
+                    session_id, peer_id, err
+                );
+                continue;
+            }
+        };
         if reconciliation_done
             && need_ids.is_empty()
             && pending_need_queue == 0
@@ -341,7 +386,16 @@ where
             && pending_have.is_empty()
             && !done_sent
         {
-            let pending_out = egress.count_pending(peer_id).unwrap_or(0);
+            let pending_out = match egress.count_pending(peer_id) {
+                Ok(count) => count,
+                Err(err) => {
+                    warn!(
+                        "Session {} failed to count egress queue for peer {}: {}",
+                        session_id, peer_id, err
+                    );
+                    continue;
+                }
+            };
             if pending_out > 0 && last_egress_log.elapsed() >= Duration::from_secs(5) {
                 info!(
                     "Draining egress: {} pending, {} sent so far",
@@ -363,10 +417,43 @@ where
     }
 
     if completed {
-        let _ = egress.clear_connection(peer_id);
-        let _ = wanted.clear();
-        let _ = need_queue.clear(peer_id);
-        let _ = egress.cleanup_sent(EGRESS_SENT_TTL_MS);
+        let stale_egress = egress.count_pending(peer_id).unwrap_or(0);
+        let stale_wanted = wanted.count().unwrap_or(0);
+        let stale_need_queue = need_queue.count(peer_id).unwrap_or(0);
+        if stale_egress > 0 || stale_wanted > 0 || stale_need_queue > 0 {
+            warn!(
+                "Session {} initiator cleanup dropping peer-scoped state peer={} stale_egress={} stale_wanted={} stale_need_queue={}",
+                session_id,
+                peer_id,
+                stale_egress,
+                stale_wanted,
+                stale_need_queue
+            );
+        }
+        if let Err(err) = egress.clear_connection(peer_id) {
+            warn!(
+                "Session {} initiator cleanup failed to clear peer-scoped egress peer={} error={}",
+                session_id, peer_id, err
+            );
+        }
+        if let Err(err) = wanted.clear() {
+            warn!(
+                "Session {} initiator cleanup failed to clear wanted set peer={} error={}",
+                session_id, peer_id, err
+            );
+        }
+        if let Err(err) = need_queue.clear(peer_id) {
+            warn!(
+                "Session {} initiator cleanup failed to clear deferred need queue peer={} error={}",
+                session_id, peer_id, err
+            );
+        }
+        if let Err(err) = egress.cleanup_sent(EGRESS_SENT_TTL_MS) {
+            warn!(
+                "Session {} initiator cleanup failed to prune sent egress peer={} error={}",
+                session_id, peer_id, err
+            );
+        }
     }
     if use_snapshot {
         let _ = neg_db.execute("COMMIT", []);

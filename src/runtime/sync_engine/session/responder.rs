@@ -41,6 +41,7 @@ use super::{negentropy_frame_size, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGR
 /// concurrently.
 pub async fn run_sync_responder<C, S, R>(
     conn: DualConnection<C, S, R>,
+    session_id: u64,
     db_path: &str,
     timeout_secs: u64,
     peer_id: &str,
@@ -72,7 +73,19 @@ where
     let use_snapshot = !low_mem_mode();
 
     let egress = EgressQueue::new(&db);
-    let _ = egress.clear_connection(peer_id);
+    let stale_egress = egress.count_pending(peer_id).unwrap_or(0);
+    if stale_egress > 0 {
+        warn!(
+            "Session {} responder clearing peer-scoped state peer={} stale_egress={}",
+            session_id, peer_id, stale_egress
+        );
+    }
+    if let Err(err) = egress.clear_connection(peer_id) {
+        warn!(
+            "Session {} responder failed to clear peer-scoped egress peer={} error={}",
+            session_id, peer_id, err
+        );
+    }
 
     let ws_id = lookup_workspace_id(&db, recorded_by).ok_or_else(|| {
         format!(
@@ -209,7 +222,9 @@ where
                 if ids.is_empty() {
                     continue;
                 }
-                let _ = egress.enqueue_events(peer_id, &ids);
+                egress
+                    .enqueue_events(peer_id, &ids)
+                    .map_err(|e| format!("failed to enqueue HaveList ids: {e}"))?;
             }
             Ok(Ok(Frame::Done)) => {
                 last_activity = Instant::now();
@@ -230,7 +245,9 @@ where
 
         // Drain egress to data stream — runs even while worker is reconciling
         let send_stats =
-            drain_egress_to_data_stream(&egress, &store, peer_id, &mut data_send).await;
+            drain_egress_to_data_stream(session_id, &egress, &store, peer_id, &mut data_send)
+                .await
+                .map_err(|e| format!("failed to drain egress: {e}"))?;
         events_sent += send_stats.events_sent_delta;
         bytes_sent += send_stats.bytes_sent_delta;
         if send_stats.events_sent_delta > 0 {
@@ -285,7 +302,16 @@ where
         // 2. Wait for peer's DataDone to be consumed by our data receiver
         // 3. Only then send DoneAck on control
         if peer_done && !reconciling {
-            let pending_out = egress.count_pending(peer_id).unwrap_or(0);
+            let pending_out = match egress.count_pending(peer_id) {
+                Ok(count) => count,
+                Err(err) => {
+                    warn!(
+                        "Session {} failed to count responder egress queue for peer {}: {}",
+                        session_id, peer_id, err
+                    );
+                    continue;
+                }
+            };
             if pending_out == 0 {
                 send_data_done(&mut data_send).await?;
 
@@ -309,8 +335,25 @@ where
     }
 
     if completed {
-        let _ = egress.clear_connection(peer_id);
-        let _ = egress.cleanup_sent(EGRESS_SENT_TTL_MS);
+        let stale_egress = egress.count_pending(peer_id).unwrap_or(0);
+        if stale_egress > 0 {
+            warn!(
+                "Session {} responder cleanup dropping peer-scoped state peer={} stale_egress={}",
+                session_id, peer_id, stale_egress
+            );
+        }
+        if let Err(err) = egress.clear_connection(peer_id) {
+            warn!(
+                "Session {} responder cleanup failed to clear peer-scoped egress peer={} error={}",
+                session_id, peer_id, err
+            );
+        }
+        if let Err(err) = egress.cleanup_sent(EGRESS_SENT_TTL_MS) {
+            warn!(
+                "Session {} responder cleanup failed to prune sent egress peer={} error={}",
+                session_id, peer_id, err
+            );
+        }
     }
     // Drop the request channel to signal the worker to exit
     drop(neg_req_tx);

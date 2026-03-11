@@ -5,6 +5,7 @@
 //! - accept loop
 //! - unified target ingress/dispatch
 //! - bootstrap refresher
+//! - observed-endpoint refresher
 //! - discovery ingress workers (feature-gated)
 
 use std::collections::{HashMap, HashSet};
@@ -34,9 +35,9 @@ use crate::transport::{
 use crate::tuning::shared_ingest_cap;
 
 use super::target_planner::{
-    bootstrap_dispatch_key, collect_all_bootstrap_targets, discovery_dispatch_key,
-    dispatch_bootstrap_target, dispatch_discovery_target, normalize_discovered_addr_for_local_bind,
-    PeerDispatcher,
+    bootstrap_dispatch_key, collect_all_bootstrap_targets, collect_all_observed_endpoint_targets,
+    discovery_dispatch_key, dispatch_bootstrap_target, dispatch_discovery_target,
+    dispatch_observed_endpoint_target, normalize_discovered_addr_for_local_bind, PeerDispatcher,
 };
 
 const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
@@ -59,6 +60,7 @@ enum WorkerKind {
     AcceptLoop,
     TargetDispatcher,
     BootstrapRefresher,
+    ObservedEndpointRefresher,
     #[cfg(feature = "discovery")]
     DiscoveryIngress,
 }
@@ -91,6 +93,7 @@ struct TenantDispatchContext {
 #[derive(Clone, Debug)]
 enum TargetIngressSource {
     Bootstrap { invite_event_id: String },
+    ObservedPeer { peer_id: String },
     Discovery { peer_id: String },
 }
 
@@ -247,6 +250,19 @@ impl RuntimeSupervisor {
                 "bootstrap-refresher",
                 cancel.clone(),
                 async move { run_bootstrap_refresher(db_path, ingress, cancel).await },
+            );
+        }
+
+        {
+            let db_path = self.db_path.clone();
+            let ingress = target_tx.clone();
+            let cancel = root_cancel.child_token();
+            spawn_worker(
+                &mut workers,
+                WorkerKind::ObservedEndpointRefresher,
+                "observed-endpoint-refresher",
+                cancel.clone(),
+                async move { run_observed_endpoint_refresher(db_path, ingress, cancel).await },
             );
         }
 
@@ -439,7 +455,8 @@ fn worker_failure_policy(kind: WorkerKind) -> WorkerFailurePolicy {
         WorkerKind::BatchWriter
         | WorkerKind::AcceptLoop
         | WorkerKind::TargetDispatcher
-        | WorkerKind::BootstrapRefresher => WorkerFailurePolicy::FailRuntime,
+        | WorkerKind::BootstrapRefresher
+        | WorkerKind::ObservedEndpointRefresher => WorkerFailurePolicy::FailRuntime,
         #[cfg(feature = "discovery")]
         WorkerKind::DiscoveryIngress => WorkerFailurePolicy::FailRuntime,
     }
@@ -499,6 +516,52 @@ async fn run_bootstrap_refresher(
             }
             Err(e) => {
                 let message = format!("BOOTSTRAP AUTODIAL REFRESH failed: {}", e);
+                if warning_gate.should_emit(message.clone())
+                    && should_emit_globally(format!("engine:{message}"))
+                {
+                    warn!("{}", message);
+                }
+            }
+        }
+
+        tokio::select! {
+            _ = shutdown.cancelled() => break,
+            _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
+        }
+    }
+
+    Ok(())
+}
+
+async fn run_observed_endpoint_refresher(
+    db_path: String,
+    ingress_tx: mpsc::UnboundedSender<TargetIngressEvent>,
+    shutdown: CancellationToken,
+) -> Result<(), String> {
+    let mut warning_gate = RepeatedWarningGate::new(Duration::from_secs(300));
+    loop {
+        if shutdown.is_cancelled() {
+            break;
+        }
+
+        match collect_all_observed_endpoint_targets(&db_path) {
+            Ok(targets) => {
+                warning_gate.clear();
+                for (tenant_id, peer_id, remote) in targets {
+                    if ingress_tx
+                        .send(TargetIngressEvent {
+                            tenant_id,
+                            remote,
+                            source: TargetIngressSource::ObservedPeer { peer_id },
+                        })
+                        .is_err()
+                    {
+                        return Ok(());
+                    }
+                }
+            }
+            Err(e) => {
+                let message = format!("OBSERVED ENDPOINT REFRESH failed: {}", e);
                 if warning_gate.should_emit(message.clone())
                     && should_emit_globally(format!("engine:{message}"))
                 {
@@ -587,6 +650,9 @@ async fn run_target_dispatcher(
             TargetIngressSource::Bootstrap { invite_event_id } => {
                 bootstrap_dispatch_key(&event.tenant_id, invite_event_id)
             }
+            TargetIngressSource::ObservedPeer { peer_id } => {
+                discovery_dispatch_key(&event.tenant_id, peer_id)
+            }
             TargetIngressSource::Discovery { peer_id } => {
                 discovery_dispatch_key(&event.tenant_id, peer_id)
             }
@@ -599,6 +665,12 @@ async fn run_target_dispatcher(
                 invite_event_id,
                 event.remote,
             ),
+            TargetIngressSource::ObservedPeer { peer_id } => dispatch_observed_endpoint_target(
+                &mut dispatcher,
+                &event.tenant_id,
+                peer_id,
+                event.remote,
+            ),
             TargetIngressSource::Discovery { peer_id } => {
                 dispatch_discovery_target(&mut dispatcher, &event.tenant_id, peer_id, event.remote)
             }
@@ -609,6 +681,13 @@ async fn run_target_dispatcher(
         }
 
         if let Some(existing) = active_workers.remove(&dispatch_key) {
+            info!(
+                "Cancelling existing connect worker key={} tenant={} remote={} source={:?}",
+                dispatch_key,
+                short_peer_id(&event.tenant_id),
+                event.remote,
+                event.source
+            );
             existing.cancel.cancel();
             join_connect_worker(existing).await;
         }
@@ -655,10 +734,18 @@ async fn run_target_dispatcher(
                     }
                 }
             }
+            TargetIngressSource::ObservedPeer { .. } => None,
             TargetIngressSource::Discovery { .. } => None,
         };
 
         let worker_cancel = shutdown.child_token();
+        info!(
+            "Spawning connect worker key={} tenant={} remote={} source={:?}",
+            dispatch_key,
+            short_peer_id(&event.tenant_id),
+            event.remote,
+            event.source
+        );
         let worker = std::thread::spawn({
             let db_path = db_path.clone();
             let tenant_id = event.tenant_id.clone();
@@ -881,6 +968,10 @@ mod tests {
         );
         assert_eq!(
             worker_failure_policy(WorkerKind::BootstrapRefresher),
+            WorkerFailurePolicy::FailRuntime
+        );
+        assert_eq!(
+            worker_failure_policy(WorkerKind::ObservedEndpointRefresher),
             WorkerFailurePolicy::FailRuntime
         );
     }

@@ -32,7 +32,7 @@ pub use peering_boundary::{
 };
 pub use transport_session_io::{QuicTransportSessionIo, DEFAULT_SYNC_FRAME_MAX_BYTES};
 
-use quinn::{ClientConfig, Endpoint, ServerConfig};
+use quinn::{ClientConfig, Endpoint, ServerConfig, TransportConfig, VarInt};
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use std::collections::HashMap;
 use std::net::SocketAddr;
@@ -41,11 +41,31 @@ use std::sync::Mutex;
 use tracing::warn;
 
 use crate::runtime::repeated_warning::should_emit_globally;
+use crate::tuning::{low_mem_mode, max_recv_buffer};
 
 pub type DynamicAllowFn =
     dyn Fn(&[u8; 32]) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> + Send + Sync;
 
 pub(crate) const TRUST_REJECTION_MARKER: &str = "trust_rejected";
+
+fn low_mem_transport_config() -> Option<Arc<TransportConfig>> {
+    if !low_mem_mode() {
+        return None;
+    }
+
+    // Keep transport-level buffering aligned with the lowmem app-level queue
+    // caps so Quinn cannot hide large amounts of in-flight data underneath the
+    // DB-backed receiver.
+    let base_window = max_recv_buffer().max(256 * 1024);
+    let stream_window = base_window.saturating_mul(2).min(u32::MAX as usize) as u32;
+    let receive_window = stream_window.saturating_mul(2);
+
+    let mut transport = TransportConfig::default();
+    transport.stream_receive_window(VarInt::from_u32(stream_window));
+    transport.receive_window(VarInt::from_u32(receive_window));
+    transport.send_window(u64::from(receive_window));
+    Some(Arc::new(transport))
+}
 
 #[derive(Clone)]
 enum AllowPolicy {
@@ -264,9 +284,12 @@ pub fn create_server_endpoint(
         .with_client_cert_verifier(verifier)
         .with_single_cert(vec![cert_der], key_der.into())?;
 
-    let server_config = ServerConfig::with_crypto(Arc::new(
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
     ));
+    if let Some(transport) = low_mem_transport_config() {
+        server_config.transport_config(transport);
+    }
 
     let endpoint = Endpoint::server(server_config, bind_addr)?;
     Ok(endpoint)
@@ -286,9 +309,12 @@ pub fn create_client_endpoint(
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(vec![cert_der], key_der.into())?;
 
-    let client_config = ClientConfig::new(Arc::new(
+    let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
     ));
+    if let Some(transport) = low_mem_transport_config() {
+        client_config.transport_config(transport);
+    }
 
     let mut endpoint = Endpoint::client(bind_addr)?;
     endpoint.set_default_client_config(client_config);
@@ -310,9 +336,12 @@ pub fn create_dual_endpoint(
     let server_crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(server_verifier)
         .with_single_cert(vec![cert_der.clone()], key_der.clone_key().into())?;
-    let server_config = ServerConfig::with_crypto(Arc::new(
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
     ));
+    if let Some(transport) = low_mem_transport_config() {
+        server_config.transport_config(transport.clone());
+    }
 
     // Client-side config (for outbound connections)
     let client_verifier = Arc::new(PinnedCertVerifier::new(allowed_peers));
@@ -320,9 +349,12 @@ pub fn create_dual_endpoint(
         .dangerous()
         .with_custom_certificate_verifier(client_verifier)
         .with_client_auth_cert(vec![cert_der], key_der.into())?;
-    let client_config = ClientConfig::new(Arc::new(
+    let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
     ));
+    if let Some(transport) = low_mem_transport_config() {
+        client_config.transport_config(transport);
+    }
 
     // Create server endpoint (binds the socket), then add client config
     let mut endpoint = Endpoint::server(server_config, bind_addr)?;
@@ -343,9 +375,12 @@ pub fn create_dual_endpoint_dynamic(
     let server_crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(server_verifier)
         .with_single_cert(vec![cert_der.clone()], key_der.clone_key().into())?;
-    let server_config = ServerConfig::with_crypto(Arc::new(
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
     ));
+    if let Some(transport) = low_mem_transport_config() {
+        server_config.transport_config(transport.clone());
+    }
 
     // Client-side config (for outbound connections)
     let client_verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn));
@@ -353,9 +388,12 @@ pub fn create_dual_endpoint_dynamic(
         .dangerous()
         .with_custom_certificate_verifier(client_verifier)
         .with_client_auth_cert(vec![cert_der], key_der.into())?;
-    let client_config = ClientConfig::new(Arc::new(
+    let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
     ));
+    if let Some(transport) = low_mem_transport_config() {
+        client_config.transport_config(transport);
+    }
 
     // Create server endpoint (binds the socket), then add client config
     let mut endpoint = Endpoint::server(server_config, bind_addr)?;
@@ -394,9 +432,12 @@ pub fn create_single_port_endpoint(
     let server_crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(server_verifier)
         .with_cert_resolver(cert_resolver);
-    let server_config = ServerConfig::with_crypto(Arc::new(
+    let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
     ));
+    if let Some(transport) = low_mem_transport_config() {
+        server_config.transport_config(transport.clone());
+    }
 
     // Default client config (for outbound connections that don't use connect_with)
     let client_verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn));
@@ -404,9 +445,12 @@ pub fn create_single_port_endpoint(
         .dangerous()
         .with_custom_certificate_verifier(client_verifier)
         .with_client_auth_cert(vec![default_client_cert], default_client_key.into())?;
-    let client_config = ClientConfig::new(Arc::new(
+    let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
     ));
+    if let Some(transport) = low_mem_transport_config() {
+        client_config.transport_config(transport);
+    }
 
     let mut endpoint = Endpoint::server(server_config, bind_addr)?;
     endpoint.set_default_client_config(client_config);
@@ -427,9 +471,13 @@ pub fn workspace_client_config(
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(vec![cert_der], key_der.into())?;
-    Ok(ClientConfig::new(Arc::new(
+    let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
-    )))
+    ));
+    if let Some(transport) = low_mem_transport_config() {
+        client_config.transport_config(transport);
+    }
+    Ok(client_config)
 }
 
 #[cfg(test)]

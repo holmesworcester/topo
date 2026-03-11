@@ -2,7 +2,7 @@
 set -euo pipefail
 
 # Low-memory sync harness:
-# 1) 10k smoke (both peers lowmem, realistic two-daemon harness)
+# 1) 10k smoke (sender normal, receiver lowmem, realistic two-daemon harness)
 # 2) 50k asymmetric soak (sender normal, receiver lowmem)
 # 3) Large-baseline delta sync (baseline normal, delta in lowmem)
 #
@@ -36,8 +36,10 @@ LARGE_DELTA_FILES="${LOWMEM_DELTA_FILES:-100}"
 LARGE_DELTA_FILE_MIB="${LOWMEM_DELTA_FILE_MIB:-1}"
 LARGE_TIMEOUT_SECS="${LOWMEM_LARGE_TIMEOUT_SECS:-3600}"
 LARGE_MARKER_MESSAGES="${LOWMEM_DELTA_MARKER_MESSAGES:-3}"
+LARGE_PREFLIGHT_EVENTS="${LOWMEM_BASELINE_PREFLIGHT_EVENTS:-1000}"
 
 LOWMEM_MEMTRACE_ENABLED="${LOW_MEM_MEMTRACE:-1}"
+LOWMEM_DAEMON_RUST_LOG="${LOWMEM_DAEMON_RUST_LOG:-info}"
 LOWMEM_BUDGET_KB="${LOWMEM_BUDGET_KB:-24576}"
 LOWMEM_CGROUP_ENFORCE="${LOWMEM_CGROUP_ENFORCE:-0}"
 LOWMEM_CGROUP_LIMIT_KB="${LOWMEM_CGROUP_LIMIT_KB:-22528}"
@@ -51,6 +53,12 @@ banner() {
   echo "================================================================"
   echo "  $*"
   echo "================================================================"
+}
+
+log_note() {
+  local log_file="$1"
+  shift
+  printf '[%s] %s\n' "$(date --iso-8601=seconds)" "$*" >> "${log_file}"
 }
 
 run_topo() {
@@ -72,7 +80,10 @@ start_daemon() {
     _prev="${_arg}"
   done
   local _log="${_db_path%.db}.daemon.log"
-  timeout "${TOPO_CMD_TIMEOUT_SECS}" "${TOPO_BIN}" "$@" start --bind 127.0.0.1:0 >"${_log}" 2>&1 &
+  {
+    printf '\n[%s] start_daemon RUST_LOG=%s %s start --bind 127.0.0.1:0\n' "$(date --iso-8601=seconds)" "${LOWMEM_DAEMON_RUST_LOG}" "${TOPO_BIN}"
+  } >> "${_log}"
+  RUST_LOG="${LOWMEM_DAEMON_RUST_LOG}" "${TOPO_BIN}" "$@" start --bind 127.0.0.1:0 >>"${_log}" 2>&1 &
 }
 
 default_cgroup_parent() {
@@ -432,6 +443,28 @@ finally:
 PY
 }
 
+events_count_for_db() {
+  local db="$1"
+  python3 - "${db}" <<'PY'
+import sqlite3
+import sys
+db = sys.argv[1]
+try:
+    conn = sqlite3.connect(db, timeout=5)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    cur = conn.execute("SELECT COUNT(*) FROM events")
+    row = cur.fetchone()
+    print(int(row[0] if row else 0))
+except sqlite3.Error:
+    print(-1)
+finally:
+    try:
+        conn.close()
+    except Exception:
+        pass
+PY
+}
+
 messages_with_prefix_for_db() {
   local db="$1"
   local prefix="$2"
@@ -481,6 +514,67 @@ finally:
 PY
 }
 
+queue_count_for_db() {
+  local db="$1"
+  local table="$2"
+  python3 - "${db}" "${table}" <<'PY'
+import sqlite3
+import sys
+db = sys.argv[1]
+table = sys.argv[2]
+allowed = {"project_queue", "wanted_events"}
+if table not in allowed:
+    print(-1)
+    raise SystemExit(0)
+try:
+    conn = sqlite3.connect(db, timeout=5)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    cur = conn.execute(f"SELECT COUNT(*) FROM {table}")
+    row = cur.fetchone()
+    print(int(row[0] if row else 0))
+except sqlite3.Error:
+    print(-1)
+finally:
+    try:
+        conn.close()
+    except Exception:
+        pass
+PY
+}
+
+transport_converged_for_db() {
+  local db="$1"
+  python3 - "${db}" <<'PY'
+import sqlite3
+import sys
+db = sys.argv[1]
+try:
+    conn = sqlite3.connect(db, timeout=5)
+    conn.execute("PRAGMA busy_timeout = 5000")
+    accepted = conn.execute(
+        "SELECT COUNT(DISTINCT recorded_by) FROM invites_accepted"
+    ).fetchone()[0]
+    direct = conn.execute(
+        """
+        SELECT COUNT(*)
+        FROM (
+            SELECT DISTINCT i.recorded_by
+            FROM invites_accepted i
+            JOIN local_transport_creds c ON i.recorded_by = c.peer_id
+        )
+        """
+    ).fetchone()[0]
+    print(1 if accepted > 0 and accepted == direct else 0)
+except sqlite3.Error:
+    print(-1)
+finally:
+    try:
+        conn.close()
+    except Exception:
+        pass
+PY
+}
+
 wait_for_message_count() {
   local db="$1"
   local min_count="$2"
@@ -500,6 +594,55 @@ wait_for_message_count() {
     now="$(date +%s)"
     if [ $((now - start)) -ge "${timeout_secs}" ]; then
       echo "error: timed out waiting for message_count >= ${min_count} in ${db} (last=${count})" >&2
+      return 1
+    fi
+    sleep "${interval_secs}"
+  done
+}
+
+wait_for_queue_empty() {
+  local db="$1"
+  local table="$2"
+  local timeout_secs="$3"
+  local interval_secs="${4:-1}"
+  local watch_pid="${5:-}"
+  local watch_cgroup="${6:-}"
+  local watch_label="${7:-receiver}"
+  local start now count
+  start="$(date +%s)"
+  while true; do
+    check_process_and_cgroup_health "${watch_pid}" "${watch_cgroup}" "${watch_label}" || return 1
+    count="$(queue_count_for_db "${db}" "${table}")"
+    if [ "${count}" -eq 0 ]; then
+      return 0
+    fi
+    now="$(date +%s)"
+    if [ $((now - start)) -ge "${timeout_secs}" ]; then
+      echo "error: timed out waiting for ${table} to drain in ${db} (last=${count})" >&2
+      return 1
+    fi
+    sleep "${interval_secs}"
+  done
+}
+
+wait_for_transport_convergence() {
+  local db="$1"
+  local timeout_secs="$2"
+  local interval_secs="${3:-1}"
+  local watch_pid="${4:-}"
+  local watch_cgroup="${5:-}"
+  local watch_label="${6:-receiver}"
+  local start now converged
+  start="$(date +%s)"
+  while true; do
+    check_process_and_cgroup_health "${watch_pid}" "${watch_cgroup}" "${watch_label}" || return 1
+    converged="$(transport_converged_for_db "${db}")"
+    if [ "${converged}" -eq 1 ]; then
+      return 0
+    fi
+    now="$(date +%s)"
+    if [ $((now - start)) -ge "${timeout_secs}" ]; then
+      echo "error: timed out waiting for transport convergence in ${db} (last=${converged})" >&2
       return 1
     fi
     sleep "${interval_secs}"
@@ -797,6 +940,7 @@ run_asymmetric() {
   LOW_MEM_MEMTRACE_FILE="${memtrace_log}" \
   start_daemon --db "${bob_db}"
   wait_for_socket "${bob_db}" 30
+  log_note "${harness_log}" "bob restarted in lowmem mode"
   LOW_MEM_IOS=1 \
   LOW_MEM_WAL_CAP_MIB="${WAL_CAP_MIB}" \
   LOW_MEM_MEMTRACE="${LOWMEM_MEMTRACE_ENABLED}" \
@@ -927,7 +1071,7 @@ EOF
     cgroup_path="${bob_cgroup}"
   fi
 
-  local sqlite_mem_kb mall_arena_kb mall_used_kb mall_free_kb mall_mmap_kb anon_minus_sqlite_kb
+  local sqlite_mem_kb mall_arena_kb mall_used_kb mall_free_kb mall_mmap_kb anon_minus_sqlite_kb max_total_mib
   sqlite_mem_kb=$(( (MAX_SQLITE_MEM_CUR + 1023) / 1024 ))
   mall_arena_kb=$(( (MAX_MALL_ARENA + 1023) / 1024 ))
   mall_used_kb=$(( (MAX_MALL_USED + 1023) / 1024 ))
@@ -937,6 +1081,7 @@ EOF
   if [ "${anon_minus_sqlite_kb}" -lt 0 ]; then
     anon_minus_sqlite_kb=0
   fi
+  max_total_mib="$(awk -v kb="${max_total}" 'BEGIN { printf "%.2f", kb / 1024.0 }')"
 
   {
     echo "RUN_DIR=${run_dir}"
@@ -944,6 +1089,7 @@ EOF
     echo "BOB_PID=${bob_pid}"
     echo "ALICE_PEAK_VMHWM_MIB=${alice_vmhwm}"
     echo "BOB_PEAK_VMHWM_MIB=${bob_vmhwm}"
+    echo "BOB_PEAK_RSS_MIB=${bob_vmhwm}"
     echo "MAX_ALICE_RSS_KB=${max_alice_rss}"
     echo "MAX_BOB_RSS_KB=${max_bob_rss}"
     echo "MAX_ALICE_SHM_KB=${max_alice_shm}"
@@ -958,6 +1104,7 @@ EOF
     echo "MAX_BOB_DB_SHM_KB=${max_db_shm}"
     echo "MAX_BOB_DB_WAL_KB=${max_db_wal}"
     echo "MAX_BOB_FILE_OTHER_KB=${max_file_other}"
+    echo "MAX_BOB_TOTAL_MIB=${max_total_mib}"
     echo "MAX_BOB_TOTAL_KB=${max_total}"
     echo "LOWMEM_BUDGET_KB=${LOWMEM_BUDGET_KB}"
     echo "PASS_UNDER_24MB=${pass_under_budget}"
@@ -1048,6 +1195,7 @@ run_large_delta() {
   local run_dir="${RUN_ROOT}/delta-$$_$(date +%s)"
   local alice_db="${run_dir}/alice.db"
   local bob_db="${run_dir}/bob.db"
+  local harness_log="${run_dir}/harness.log"
   local samples_log="${run_dir}/samples.log"
   local bob_smaps_log="${run_dir}/bob_smaps.log"
   local bob_anon_regions="${run_dir}/bob_anon_regions.txt"
@@ -1061,6 +1209,7 @@ run_large_delta() {
   local smaps_pid=""
 
   mkdir -p "${run_dir}"
+  : > "${harness_log}"
   : > "${samples_log}"
   : > "${bob_smaps_log}"
 
@@ -1093,6 +1242,8 @@ run_large_delta() {
   esac
 
   local marker_prefix="delta-notify-$$-$(date +%s)"
+  log_note "${harness_log}" \
+    "run_dir=${run_dir} delta_kind=${delta_kind} base_events=${LARGE_BASE_EVENTS} delta_events=${LARGE_DELTA_EVENTS} marker_messages=${marker_messages} preflight_events=${LARGE_PREFLIGHT_EVENTS}"
 
   cleanup_delta() {
     set +e
@@ -1140,10 +1291,55 @@ run_large_delta() {
     --username "bob" \
     --devicename "bob-dev" >/dev/null
 
-  echo "Seeding baseline events on sender: ${LARGE_BASE_EVENTS}"
-  run_topo_long_retry 3 --db "${alice_db}" generate --count "${LARGE_BASE_EVENTS}" >/dev/null
+  echo "Waiting for invite bootstrap to converge before seeding baseline"
+  log_note "${harness_log}" "waiting for invite bootstrap convergence"
+  wait_for_transport_convergence "${alice_db}" 120 1
+  wait_for_transport_convergence "${bob_db}" 120 1
+  wait_for_queue_empty "${alice_db}" "project_queue" 120 1
+  wait_for_queue_empty "${bob_db}" "project_queue" 120 1
+  wait_for_queue_empty "${bob_db}" "wanted_events" 120 1
+
+  local preflight_events="${LARGE_PREFLIGHT_EVENTS}"
+  if [ "${preflight_events}" -gt "${LARGE_BASE_EVENTS}" ]; then
+    preflight_events="${LARGE_BASE_EVENTS}"
+  fi
+  if [ "${preflight_events}" -gt 0 ]; then
+    echo "Running baseline preflight sync: ${preflight_events} messages"
+    log_note "${harness_log}" \
+      "baseline preflight start count=${preflight_events} alice_messages=$(messages_count_for_db "${alice_db}") bob_messages=$(messages_count_for_db "${bob_db}")"
+    TOPO_GENERATE_PROGRESS_LOG=1 run_topo_long_retry 3 --db "${alice_db}" generate --count "${preflight_events}" >> "${harness_log}" 2>&1
+    log_note "${harness_log}" \
+      "baseline preflight generate complete alice_messages=$(messages_count_for_db "${alice_db}") bob_messages=$(messages_count_for_db "${bob_db}")"
+    wait_for_message_count "${alice_db}" "${preflight_events}" "${LARGE_TIMEOUT_SECS}" 1
+    wait_for_message_count "${bob_db}" "${preflight_events}" "${LARGE_TIMEOUT_SECS}" 1
+    wait_for_queue_empty "${bob_db}" "project_queue" 120 1
+    wait_for_queue_empty "${bob_db}" "wanted_events" 120 1
+    wait_for_transport_convergence "${bob_db}" 120 1
+    log_note "${harness_log}" \
+      "baseline preflight converged alice_messages=$(messages_count_for_db "${alice_db}") bob_messages=$(messages_count_for_db "${bob_db}") bob_wanted=$(queue_count_for_db "${bob_db}" "wanted_events")"
+  fi
+
+  local remaining_baseline_events=$((LARGE_BASE_EVENTS - preflight_events))
+  if [ "${remaining_baseline_events}" -gt 0 ]; then
+    echo "Seeding remaining baseline events on sender: ${remaining_baseline_events}"
+    log_note "${harness_log}" \
+      "baseline remaining start count=${remaining_baseline_events} alice_messages=$(messages_count_for_db "${alice_db}") bob_messages=$(messages_count_for_db "${bob_db}")"
+    TOPO_GENERATE_PROGRESS_LOG=1 run_topo_long_retry 3 --db "${alice_db}" generate --count "${remaining_baseline_events}" >> "${harness_log}" 2>&1
+    log_note "${harness_log}" \
+      "baseline remaining generate complete alice_messages=$(messages_count_for_db "${alice_db}") bob_messages=$(messages_count_for_db "${bob_db}") alice_project_queue=$(queue_count_for_db "${alice_db}" "project_queue") bob_wanted=$(queue_count_for_db "${bob_db}" "wanted_events")"
+  fi
+  log_note "${harness_log}" \
+    "waiting for baseline convergence alice_target=${LARGE_BASE_EVENTS} bob_target=${LARGE_BASE_EVENTS}"
   wait_for_message_count "${alice_db}" "${LARGE_BASE_EVENTS}" "${LARGE_TIMEOUT_SECS}" 1
   wait_for_message_count "${bob_db}" "${LARGE_BASE_EVENTS}" "${LARGE_TIMEOUT_SECS}" 1
+
+  wait_for_queue_empty "${bob_db}" "project_queue" "${LARGE_TIMEOUT_SECS}" 1
+  wait_for_queue_empty "${bob_db}" "wanted_events" "${LARGE_TIMEOUT_SECS}" 1
+  wait_for_transport_convergence "${bob_db}" 120 1
+
+  echo "Baseline converged: alice_events=$(events_count_for_db "${alice_db}") bob_events=$(events_count_for_db "${bob_db}") bob_messages=$(messages_count_for_db "${bob_db}")"
+  log_note "${harness_log}" \
+    "baseline converged alice_events=$(events_count_for_db "${alice_db}") bob_events=$(events_count_for_db "${bob_db}") bob_messages=$(messages_count_for_db "${bob_db}")"
 
   local pre_delta_count
   pre_delta_count="$(messages_count_for_db "${bob_db}")"
@@ -1200,13 +1396,21 @@ run_large_delta() {
   done
   if [ "${delta_kind}" = "messages" ]; then
     if [ "${generated_delta_events}" -gt 0 ]; then
-      run_topo_long_retry 3 --db "${alice_db}" generate --count "${generated_delta_events}" >/dev/null
+      log_note "${harness_log}" \
+        "delta message generate start count=${generated_delta_events} alice_messages=$(messages_count_for_db "${alice_db}") bob_messages=$(messages_count_for_db "${bob_db}")"
+      TOPO_GENERATE_PROGRESS_LOG=1 run_topo_long_retry 3 --db "${alice_db}" generate --count "${generated_delta_events}" >> "${harness_log}" 2>&1
+      log_note "${harness_log}" \
+        "delta message generate complete alice_messages=$(messages_count_for_db "${alice_db}") bob_messages=$(messages_count_for_db "${bob_db}") alice_project_queue=$(queue_count_for_db "${alice_db}" "project_queue") bob_wanted=$(queue_count_for_db "${bob_db}" "wanted_events")"
     fi
   else
     if [ "${file_delta_files}" -gt 0 ]; then
+      log_note "${harness_log}" \
+        "delta file generate start files=${file_delta_files} size_mib=${file_delta_size_mib} alice_messages=$(messages_count_for_db "${alice_db}") bob_messages=$(messages_count_for_db "${bob_db}")"
       run_topo_long_retry 3 --db "${alice_db}" generate-files \
         --count "${file_delta_files}" \
-        --size-mib "${file_delta_size_mib}" >/dev/null
+        --size-mib "${file_delta_size_mib}" >> "${harness_log}" 2>&1
+      log_note "${harness_log}" \
+        "delta file generate complete alice_messages=$(messages_count_for_db "${alice_db}") bob_messages=$(messages_count_for_db "${bob_db}")"
     fi
   fi
 
@@ -1315,7 +1519,7 @@ EOF
     cgroup_path="${bob_cgroup}"
   fi
 
-  local sqlite_mem_kb mall_arena_kb mall_used_kb mall_free_kb mall_mmap_kb anon_minus_sqlite_kb
+  local sqlite_mem_kb mall_arena_kb mall_used_kb mall_free_kb mall_mmap_kb anon_minus_sqlite_kb max_total_mib
   sqlite_mem_kb=$(( (MAX_SQLITE_MEM_CUR + 1023) / 1024 ))
   mall_arena_kb=$(( (MAX_MALL_ARENA + 1023) / 1024 ))
   mall_used_kb=$(( (MAX_MALL_USED + 1023) / 1024 ))
@@ -1325,6 +1529,7 @@ EOF
   if [ "${anon_minus_sqlite_kb}" -lt 0 ]; then
     anon_minus_sqlite_kb=0
   fi
+  max_total_mib="$(awk -v kb="${max_total}" 'BEGIN { printf "%.2f", kb / 1024.0 }')"
 
   {
     echo "RUN_DIR=${run_dir}"
@@ -1348,6 +1553,7 @@ EOF
     echo "BOB_PID=${bob_pid}"
     echo "ALICE_PEAK_VMHWM_MIB=${alice_vmhwm}"
     echo "BOB_PEAK_VMHWM_MIB=${bob_vmhwm}"
+    echo "BOB_PEAK_RSS_MIB=${bob_vmhwm}"
     echo "MAX_ALICE_RSS_KB=${max_alice_rss}"
     echo "MAX_BOB_RSS_KB=${max_bob_rss}"
     echo "MAX_ALICE_SHM_KB=${max_alice_shm}"
@@ -1362,6 +1568,7 @@ EOF
     echo "MAX_BOB_DB_SHM_KB=${max_db_shm}"
     echo "MAX_BOB_DB_WAL_KB=${max_db_wal}"
     echo "MAX_BOB_FILE_OTHER_KB=${max_file_other}"
+    echo "MAX_BOB_TOTAL_MIB=${max_total_mib}"
     echo "MAX_BOB_TOTAL_KB=${max_total}"
     echo "LOWMEM_BUDGET_KB=${LOWMEM_BUDGET_KB}"
     echo "PASS_UNDER_24MB=${pass_under_budget}"
@@ -1493,6 +1700,7 @@ echo "  LOWMEM_LARGE_TIMEOUT_SECS=${LARGE_TIMEOUT_SECS}"
 echo "  LOWMEM_DELTA_MARKER_MESSAGES=${LARGE_MARKER_MESSAGES}"
 echo "  LOW_MEM_WAL_CAP_MIB=${WAL_CAP_MIB}"
 echo "  LOW_MEM_MEMTRACE=${LOWMEM_MEMTRACE_ENABLED}"
+echo "  LOWMEM_DAEMON_RUST_LOG=${LOWMEM_DAEMON_RUST_LOG}"
 echo "  LOWMEM_BUDGET_KB=${LOWMEM_BUDGET_KB}"
 echo "  LOWMEM_CGROUP_ENFORCE=${LOWMEM_CGROUP_ENFORCE}"
 echo "  LOWMEM_CGROUP_LIMIT_KB=${LOWMEM_CGROUP_LIMIT_KB}"

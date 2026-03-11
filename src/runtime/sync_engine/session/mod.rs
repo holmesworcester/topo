@@ -85,6 +85,9 @@ pub(super) const EGRESS_SENT_TTL_MS: i64 = 300_000;
 /// Time to wait for inbound data stream drain at session end.
 pub(super) const DATA_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Time to wait for a single data-stream send/flush before treating it as stalled.
+pub(super) const DATA_SEND_STALL_TIMEOUT: Duration = Duration::from_secs(10);
+
 /// Non-blocking poll timeout for the control stream receive.
 pub(super) const CONTROL_POLL_TIMEOUT: Duration = Duration::from_millis(1);
 
