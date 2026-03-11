@@ -24,19 +24,19 @@ The `identity` command returns identical User and Peer short IDs across all data
 
 **Fix**: The encoding length check already exists in the event encoder but fires too late (after workspace/network events are committed). Move validation into the User projector so it returns `Reject` for oversized usernames. For locally created events, `create_event_sync` already propagates `Reject` back as `CreateEventError::Rejected`, so the command will fail before workspace events are committed if the user event is created first — or the whole sequence needs to be wrapped in a transaction.
 
-### 7–9. Empty username / message / reaction accepted
+### 7–9. Empty username / message / reaction accepted (FIXED)
 
 - `create-workspace --username ""` succeeds with blank display name.
 - `send ""` creates an empty message (blank line in `view`).
 - `react "" 1` creates a reaction with empty content.
 
-**Fix**: Add non-empty content validation in the respective projectors (`project_user`, `project_message`, `project_reaction`), returning `ProjectionDecision::Reject` for empty/whitespace-only content. The `create_event_sync` → `CreateEventError::Rejected` path already surfaces projector rejections to commands, so no separate CLI-layer validation is needed. Projector strictness and local strictness match exactly because the projector *is* the single validation authority — both local creates and remote synced events go through the same path.
+**Fix applied**: Added non-empty/whitespace validation in projectors (`project_user`, `project_message`, `project_reaction`), returning `Reject` for empty/whitespace-only content.
 
-### 10. Non-emoji text accepted as reaction
+### 10. Non-emoji text accepted as reaction (FIXED)
 
 `react "not-an-emoji" 1` succeeds despite the parameter being named `<EMOJI>`. Arbitrary strings accepted.
 
-**Fix**: Accept for now — enforcing emoji-only is fragile across Unicode versions. Rename the parameter from `<EMOJI>` to `<TEXT>` or document that arbitrary short strings are allowed.
+**Fix applied**: Renamed parameter help text from "Emoji" to "Reaction text". Arbitrary short strings are accepted by design.
 
 ### 11. Daemon spontaneous death (intermittent)
 
@@ -44,17 +44,23 @@ Observed twice during same-DB multi-tenant testing. After some sequence of opera
 
 **Fix**: Needs repro first. Add a panic hook that logs to a file before exit so the cause is captured next time it happens.
 
-### 12. Raw SQLite error exposed to user
+### 12. Raw SQLite error exposed to user (FIXED)
 
 Starting with a non-existent parent directory shows `SqliteFailure(Error { code: CannotOpen, extended_code: 14 }, ...)` — internal Rust struct dump rather than a user-friendly message.
 
-**Fix**: Catch `CannotOpen` in the DB open path and return a human-readable error like `"cannot open database: directory does not exist: <path>"`.
+**Fix applied**: Added `friendly_db_error()` wrapper at all CLI entry points. Now shows e.g. `"cannot open database: directory does not exist: /foo/bar"`.
 
-### 14. Invite link includes unreachable addresses when using specific `--bind`
+### 14. Invite link includes unreachable addresses when using specific `--bind` (FIXED)
 
 `detect_bootstrap_addrs(port)` in `invite_link.rs:464` always enumerates all non-loopback network interfaces regardless of what the daemon is actually bound to. When `--bind 192.168.6.177:4433` is used, the invite embeds addresses like `100.67.2.56:4433` (tailscale) and various IPv6 addresses that the daemon is not listening on. When `--bind 127.0.0.1:4433`, the invite contains only unreachable addresses (loopback is skipped by the detector). Works by accident in the default `0.0.0.0` case because wildcard bind does listen on all interfaces.
 
-**Fix**: In `autodetect_bootstrap_addrs` (`server.rs:400`), check the bind address. If it's a wildcard (`0.0.0.0` or `::`), enumerate all interfaces (current behavior). If it's a specific IP, use only that IP+port — don't enumerate interfaces.
+**Fix applied**: `autodetect_bootstrap_addrs` now checks if the bind IP is a wildcard (`0.0.0.0`/`::`). If wildcard, enumerates all interfaces (unchanged). If specific IP, uses only that IP+port.
+
+### 15. No version negotiation — mismatched builds cause endless connection errors
+
+Two peers running different builds (e.g. `ae72119` vs `89d8d56`) produce endless "Data stream error: connection lost" at ~2/s with no indication the cause is a version mismatch. Protocol-breaking changes between commits have no graceful degradation.
+
+**Fix**: Embed the git commit hash in the build (via `env!` or build script). On sync session handshake, exchange commit hashes. If they don't match, abort with a clear error: `"version mismatch: local=<hash> remote=<hash>. Version negotiation is out of scope; both peers must run the same build."` Be strict — fail immediately rather than retrying.
 
 ### 13. Long DB path causes silent RPC failure
 
