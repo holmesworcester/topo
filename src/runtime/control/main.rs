@@ -1869,6 +1869,20 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| service::socket_path_for_db(db));
 
+            // Validate socket path length before doing anything else.
+            // Unix domain sockets are limited to 107 bytes (108 including NUL).
+            // Failing late leaves an orphaned QUIC listener (bug #13).
+            let socket_path_str = socket_path.to_string_lossy();
+            if socket_path_str.len() > 107 {
+                return Err(format!(
+                    "socket path too long ({} chars, max 107): {}\n\
+                     Use --socket <shorter-path> to specify a shorter path.",
+                    socket_path_str.len(),
+                    socket_path_str
+                )
+                .into());
+            }
+
             // Idempotent: check if daemon is already running
             if socket_path.exists() {
                 match rpc_call(&socket_path, RpcMethod::Status) {

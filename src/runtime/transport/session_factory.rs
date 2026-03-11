@@ -12,8 +12,19 @@ use crate::contracts::peering_contract::{next_session_id, TransportSessionIo};
 use super::{DualConnection, QuicTransportSessionIo};
 
 const SESSION_STREAM_HEADER_MAGIC: [u8; 4] = *b"P7SS";
-const SESSION_STREAM_HEADER_VERSION: u8 = 1;
-const SESSION_STREAM_HEADER_LEN: usize = 14;
+const SESSION_STREAM_HEADER_VERSION: u8 = 2;
+// v2 header: [4 magic][1 version][1 kind][8 session_id][8 commit_hash] = 22 bytes
+const SESSION_STREAM_HEADER_LEN: usize = 22;
+
+/// Build commit hash embedded at compile time (8 ASCII hex chars, zero-padded).
+fn local_commit_hash() -> [u8; 8] {
+    let hash_str = env!("TOPO_GIT_HASH");
+    let mut buf = [0u8; 8];
+    let bytes = hash_str.as_bytes();
+    let len = bytes.len().min(8);
+    buf[..len].copy_from_slice(&bytes[..len]);
+    buf
+}
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionStreamKind {
@@ -82,7 +93,8 @@ async fn write_session_stream_header(
     header[..4].copy_from_slice(&SESSION_STREAM_HEADER_MAGIC);
     header[4] = SESSION_STREAM_HEADER_VERSION;
     header[5] = kind.to_byte();
-    header[6..].copy_from_slice(&session_id.to_be_bytes());
+    header[6..14].copy_from_slice(&session_id.to_be_bytes());
+    header[14..22].copy_from_slice(&local_commit_hash());
     send.write_all(&header)
         .await
         .map_err(|e| SessionOpenError::ConnectionLost(format!("write session header: {e}")))?;
@@ -95,24 +107,53 @@ async fn write_session_stream_header(
 async fn read_session_stream_header(
     recv: &mut quinn::RecvStream,
 ) -> Result<(u64, SessionStreamKind), SessionOpenError> {
-    let mut header = [0u8; SESSION_STREAM_HEADER_LEN];
-    recv.read_exact(&mut header)
+    // Read first 6 bytes to check magic + version before committing to full read.
+    let mut prefix = [0u8; 6];
+    recv.read_exact(&mut prefix)
         .await
         .map_err(|e| SessionOpenError::ConnectionLost(format!("read session header: {e}")))?;
-    if header[..4] != SESSION_STREAM_HEADER_MAGIC {
+    if prefix[..4] != SESSION_STREAM_HEADER_MAGIC {
         return Err(SessionOpenError::Protocol(
             "missing session stream magic".to_string(),
         ));
     }
-    if header[4] != SESSION_STREAM_HEADER_VERSION {
+    let remote_version = prefix[4];
+    if remote_version != SESSION_STREAM_HEADER_VERSION {
+        // Version 1 peers send 14-byte headers without commit hash.
+        // Provide a clear error instead of a cryptic stream read failure.
+        let hash_bytes = local_commit_hash();
+        let local_hash = String::from_utf8_lossy(&hash_bytes);
         return Err(SessionOpenError::Protocol(format!(
-            "unsupported session stream version {}",
-            header[4]
+            "build version mismatch: remote peer is running a different build \
+             (protocol v{}, local v{}). Version negotiation is out of scope; \
+             both peers must run the same build (local={}). Aborting.",
+            remote_version, SESSION_STREAM_HEADER_VERSION, local_hash.trim_end_matches('\0')
         )));
     }
-    let kind = SessionStreamKind::from_byte(header[5])?;
+    let kind = SessionStreamKind::from_byte(prefix[5])?;
+
+    // Read remaining 16 bytes: [8 session_id][8 commit_hash]
+    let mut rest = [0u8; 16];
+    recv.read_exact(&mut rest)
+        .await
+        .map_err(|e| SessionOpenError::ConnectionLost(format!("read session header: {e}")))?;
     let mut session_id_bytes = [0u8; 8];
-    session_id_bytes.copy_from_slice(&header[6..]);
+    session_id_bytes.copy_from_slice(&rest[..8]);
+
+    // Check commit hash match
+    let local_hash = local_commit_hash();
+    let remote_hash = &rest[8..16];
+    if remote_hash != &local_hash {
+        let local_str = String::from_utf8_lossy(&local_hash);
+        let remote_str = String::from_utf8_lossy(remote_hash);
+        return Err(SessionOpenError::Protocol(format!(
+            "build version mismatch: local={} remote={}. \
+             Version negotiation is out of scope; both peers must run the same build. Aborting.",
+            local_str.trim_end_matches('\0'),
+            remote_str.trim_end_matches('\0')
+        )));
+    }
+
     Ok((u64::from_be_bytes(session_id_bytes), kind))
 }
 
