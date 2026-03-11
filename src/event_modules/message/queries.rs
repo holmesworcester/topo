@@ -16,21 +16,30 @@ pub fn list_rows(
     recorded_by: &str,
     limit: usize,
 ) -> Result<Vec<MessageRow>, rusqlite::Error> {
-    let limit_clause = if limit > 0 {
-        format!("LIMIT {}", limit)
+    // When limit > 0, select the newest N messages (subquery picks newest,
+    // outer query re-sorts ascending for display order).
+    let query = if limit > 0 {
+        format!(
+            "SELECT * FROM (
+                SELECT m.message_id, m.author_id, m.content, m.created_at,
+                       COALESCE(u.username, '') as author_name
+                FROM messages m
+                LEFT JOIN users u ON m.author_id = u.event_id AND m.recorded_by = u.recorded_by
+                WHERE m.recorded_by = ?1
+                ORDER BY m.created_at DESC, m.message_id DESC
+                LIMIT {}
+            ) ORDER BY created_at ASC, message_id ASC",
+            limit
+        )
     } else {
-        String::new()
-    };
-
-    let query = format!(
         "SELECT m.message_id, m.author_id, m.content, m.created_at,
                 COALESCE(u.username, '') as author_name
          FROM messages m
          LEFT JOIN users u ON m.author_id = u.event_id AND m.recorded_by = u.recorded_by
          WHERE m.recorded_by = ?1
-         ORDER BY m.created_at ASC, m.rowid ASC {}",
-        limit_clause
-    );
+         ORDER BY m.created_at ASC, m.message_id ASC"
+            .to_string()
+    };
 
     let mut stmt = db.prepare(&query)?;
     let rows = stmt

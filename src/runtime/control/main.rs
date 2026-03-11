@@ -3999,8 +3999,17 @@ fn show_messages_from_json(_db_path: &str, data: &serde_json::Value) {
         return;
     }
 
-    let total = data["total"].as_i64().unwrap_or(0);
+    let total = data["total"].as_i64().unwrap_or(0) as usize;
     println!("MESSAGES ({} total):\n", total);
+
+    let skipped = if total > messages.len() {
+        total - messages.len()
+    } else {
+        0
+    };
+    if skipped > 0 {
+        println!("  ({} older messages not shown)\n", skipped);
+    }
 
     let mut last_author = String::new();
     for (i, msg) in messages.iter().enumerate() {
@@ -4022,7 +4031,7 @@ fn show_messages_from_json(_db_path: &str, data: &serde_json::Value) {
             println!("  {} [{}]", display_name, ts);
             last_author = author_id.to_string();
         }
-        println!("    {}. {}", i + 1, content);
+        println!("    {}. {}", skipped + i + 1, content);
 
         // Reactions: Slack-style grouped counts on one line
         if let Some(reactions) = msg["reactions"].as_array() {
