@@ -1211,7 +1211,9 @@ fn run_sub_action(
                 ) {
                     Ok(data) => {
                         consecutive_not_found = 0;
+                        let mut page_full = false;
                         if let Some(items) = data.as_array() {
+                            page_full = items.len() >= 100;
                             let mut max_seq = cursor;
                             for item in items {
                                 let seq = item["seq"].as_i64().unwrap_or(0);
@@ -1229,11 +1231,17 @@ fn run_sub_action(
                                     if let Some(content) = payload["content"].as_str() {
                                         let author = payload["author_id"].as_str().unwrap_or("?");
                                         let author_short = &author[..author.len().min(8)];
-                                        // Escape newlines/tabs so each event is exactly one line
-                                        let escaped = content.replace('\\', "\\\\")
-                                            .replace('\n', "\\n")
-                                            .replace('\r', "\\r")
-                                            .replace('\t', "\\t");
+                                        // Escape control chars so each event is one safe terminal line
+                                        let escaped: String = content.chars().map(|c| {
+                                            match c {
+                                                '\\' => "\\\\".to_string(),
+                                                '\n' => "\\n".to_string(),
+                                                '\r' => "\\r".to_string(),
+                                                '\t' => "\\t".to_string(),
+                                                c if c.is_control() => format!("\\x{:02x}", c as u32),
+                                                c => c.to_string(),
+                                            }
+                                        }).collect();
                                         println!(
                                             "[seq={}] {} event={} ts={} author={} | {}",
                                             seq, etype, eid_short, ts, author_short, escaped,
@@ -1268,6 +1276,10 @@ fn run_sub_action(
                                     cursor = max_seq;
                                 }
                             }
+                        }
+                        // If page was full, immediately re-poll to drain backlog
+                        if page_full {
+                            continue;
                         }
                     }
                     Err(e) => {
