@@ -25,7 +25,6 @@ pub const NAME_BYTES: usize = 64;
 
 /// Identity-pubkey-with-signer layout: type(1) + created_at(8) + public_key(32)
 ///   + signed_by(32) + signer_type(1) + signature(64) = 138
-/// Used by: UserRemoved(20), PeerRemoved(21)
 pub const IDENTITY_PUBKEY_SIGNED_WIRE_SIZE: usize =
     COMMON_HEADER_BYTES + 32 + SIGNATURE_TRAILER_BYTES;
 
@@ -73,8 +72,6 @@ pub fn encrypted_inner_wire_size(inner_type_code: u8) -> Option<usize> {
         14 => Some(USER_WIRE_SIZE),                   // User
         16 => Some(PEER_SHARED_WIRE_SIZE),            // PeerShared
         18 => Some(ADMIN_WIRE_SIZE),                  // Admin
-        20 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // UserRemoved
-        21 => Some(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE), // PeerRemoved
         22 => Some(KEY_SHARED_WIRE_SIZE),             // KeyShared
         24 => Some(FILE_WIRE_SIZE),                   // File
         25 => Some(FILE_SLICE_WIRE_SIZE),             // FileSlice

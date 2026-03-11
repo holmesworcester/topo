@@ -108,6 +108,7 @@ fn local_username_for_tenant(conn: &rusqlite::Connection, peer_id: &str) -> Stri
              FROM peers_shared ps
              JOIN local_transport_creds c
                ON c.peer_id = lower(hex(ps.transport_fingerprint))
+              AND c.peer_id = ?1
              LEFT JOIN users u
                ON ps.user_event_id = u.event_id
               AND ps.recorded_by = u.recorded_by

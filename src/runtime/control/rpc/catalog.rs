@@ -194,12 +194,6 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"AcceptLink","invite":"topo://link/...","devicename":"device"}"#,
     },
     MethodInfo {
-        name: "Ban",
-        purpose: "Ban (remove) a user by number or hex event ID",
-        params: params!["target", "string", true, None],
-        example_json: r#"{"type":"Ban","target":"1"}"#,
-    },
-    MethodInfo {
         name: "Identity",
         purpose: "Show combined identity info for the active peer",
         params: PARAM_NONE,

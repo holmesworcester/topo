@@ -151,7 +151,7 @@ pub use crate::event_modules::message::{
 };
 pub use crate::event_modules::peer_shared::{IdentityResponse, TenantItem};
 pub use crate::event_modules::reaction::{ReactResponse, ReactionItem};
-pub use crate::event_modules::user::{BanResponse, UserItem};
+pub use crate::event_modules::user::UserItem;
 pub use crate::event_modules::workspace::commands::{
     AcceptDeviceLinkResponse, AcceptInviteResponse, CreateInviteResponse, CreateWorkspaceResponse,
 };

@@ -11,7 +11,6 @@ pub mod layout;
 pub mod message;
 pub mod message_deletion;
 pub mod peer_invite_shared;
-pub mod peer_removed;
 pub mod peer_secret;
 pub mod peer_shared;
 pub mod reaction;
@@ -19,7 +18,6 @@ pub mod registry;
 pub mod tenant;
 pub mod user;
 pub mod user_invite_shared;
-pub mod user_removed;
 pub mod workspace;
 
 use rusqlite::Connection;
@@ -61,7 +59,6 @@ pub use key_shared::KeySharedEvent;
 pub use message::MessageEvent;
 pub use message_deletion::MessageDeletionEvent;
 pub use peer_invite_shared::DeviceInviteEvent;
-pub use peer_removed::PeerRemovedEvent;
 pub use peer_secret::PeerSecretEvent;
 pub use peer_shared::PeerSharedEvent;
 pub use reaction::ReactionEvent;
@@ -69,7 +66,6 @@ pub use registry::{EventRegistry, EventTypeMeta, ShareScope, TransportPrivacy};
 pub use tenant::TenantEvent;
 pub use user::UserEvent;
 pub use user_invite_shared::UserInviteEvent;
-pub use user_removed::UserRemovedEvent;
 pub use workspace::WorkspaceEvent;
 
 pub const EVENT_TYPE_MESSAGE: u8 = 1;
@@ -84,8 +80,8 @@ pub const EVENT_TYPE_DEVICE_INVITE: u8 = 12;
 pub const EVENT_TYPE_USER: u8 = 14;
 pub const EVENT_TYPE_PEER_SHARED: u8 = 16;
 pub const EVENT_TYPE_ADMIN: u8 = 18;
-pub const EVENT_TYPE_USER_REMOVED: u8 = 20;
-pub const EVENT_TYPE_PEER_REMOVED: u8 = 21;
+pub const EVENT_TYPE_USER_REMOVED: u8 = 20; // reserved (retired removal event)
+pub const EVENT_TYPE_PEER_REMOVED: u8 = 21; // reserved (retired removal event)
 pub const EVENT_TYPE_KEY_SHARED: u8 = 22;
 pub const EVENT_TYPE_PEER: u8 = 23; // reserved (retired local peer event)
 pub const EVENT_TYPE_FILE: u8 = 24;
@@ -114,7 +110,6 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     user::ensure_schema(conn)?;
     peer_shared::ensure_schema(conn)?;
     admin::ensure_schema(conn)?;
-    peer_removed::ensure_schema(conn)?;
     message::ensure_schema(conn)?;
     reaction::ensure_schema(conn)?;
     message_deletion::ensure_schema(conn)?;
@@ -143,8 +138,6 @@ pub enum ParsedEvent {
     User(UserEvent),
     PeerShared(PeerSharedEvent),
     Admin(AdminEvent),
-    UserRemoved(UserRemovedEvent),
-    PeerRemoved(PeerRemovedEvent),
     KeyShared(KeySharedEvent),
     Tenant(TenantEvent),
     File(FileEvent),
@@ -169,8 +162,6 @@ impl ParsedEvent {
             ParsedEvent::User(u) => u.created_at_ms,
             ParsedEvent::PeerShared(p) => p.created_at_ms,
             ParsedEvent::Admin(a) => a.created_at_ms,
-            ParsedEvent::UserRemoved(r) => r.created_at_ms,
-            ParsedEvent::PeerRemoved(r) => r.created_at_ms,
             ParsedEvent::KeyShared(s) => s.created_at_ms,
             ParsedEvent::Tenant(t) => t.created_at_ms,
             ParsedEvent::File(a) => a.created_at_ms,
@@ -223,18 +214,6 @@ impl ParsedEvent {
                     ("signed_by", a.signed_by),
                 ]
             }
-            ParsedEvent::UserRemoved(r) => {
-                vec![
-                    ("target_event_id", r.target_event_id),
-                    ("signed_by", r.signed_by),
-                ]
-            }
-            ParsedEvent::PeerRemoved(r) => {
-                vec![
-                    ("target_event_id", r.target_event_id),
-                    ("signed_by", r.signed_by),
-                ]
-            }
             ParsedEvent::KeyShared(s) => {
                 vec![
                     ("recipient_event_id", s.recipient_event_id),
@@ -269,8 +248,6 @@ impl ParsedEvent {
             ParsedEvent::User(_) => EVENT_TYPE_USER,
             ParsedEvent::PeerShared(_) => EVENT_TYPE_PEER_SHARED,
             ParsedEvent::Admin(_) => EVENT_TYPE_ADMIN,
-            ParsedEvent::UserRemoved(_) => EVENT_TYPE_USER_REMOVED,
-            ParsedEvent::PeerRemoved(_) => EVENT_TYPE_PEER_REMOVED,
             ParsedEvent::KeyShared(_) => EVENT_TYPE_KEY_SHARED,
             ParsedEvent::Tenant(_) => EVENT_TYPE_TENANT,
             ParsedEvent::File(_) => EVENT_TYPE_FILE,
@@ -290,8 +267,6 @@ impl ParsedEvent {
             ParsedEvent::User(u) => Some((u.signed_by, u.signer_type)),
             ParsedEvent::PeerShared(p) => Some((p.signed_by, p.signer_type)),
             ParsedEvent::Admin(a) => Some((a.signed_by, a.signer_type)),
-            ParsedEvent::UserRemoved(r) => Some((r.signed_by, r.signer_type)),
-            ParsedEvent::PeerRemoved(r) => Some((r.signed_by, r.signer_type)),
             ParsedEvent::KeyShared(s) => Some((s.signed_by, s.signer_type)),
             ParsedEvent::FileSlice(f) => Some((f.signed_by, f.signer_type)),
             ParsedEvent::Message(m) => Some((m.signed_by, m.signer_type)),
@@ -324,8 +299,6 @@ impl ParsedEvent {
             ParsedEvent::User(e) => e.human_fields(),
             ParsedEvent::PeerShared(e) => e.human_fields(),
             ParsedEvent::Admin(e) => e.human_fields(),
-            ParsedEvent::UserRemoved(e) => e.human_fields(),
-            ParsedEvent::PeerRemoved(e) => e.human_fields(),
             ParsedEvent::KeyShared(e) => e.human_fields(),
             ParsedEvent::File(e) => e.human_fields(),
             ParsedEvent::FileSlice(e) => e.human_fields(),
@@ -415,8 +388,6 @@ pub fn registry() -> &'static EventRegistry {
             &user::USER_META,
             &peer_shared::PEER_SHARED_META,
             &admin::ADMIN_META,
-            &user_removed::USER_REMOVED_META,
-            &peer_removed::PEER_REMOVED_META,
             &key_shared::KEY_SHARED_META,
             &tenant::TENANT_META,
             &file::FILE_META,

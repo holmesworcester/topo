@@ -172,8 +172,6 @@ pub struct ContextSnapshot {
     /// included — an unverified intent does not mean the message is deleted.
     pub target_message_deleted: bool,
 
-    /// For KeyShared: whether the recipient has been removed.
-    pub recipient_removed: bool,
     /// For KeyShared: DH-unwrapped key material, if available.
     pub unwrapped_secret_material: Option<UnwrappedSecretMaterial>,
 

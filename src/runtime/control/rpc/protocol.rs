@@ -98,10 +98,6 @@ pub enum RpcMethod {
         invite: String,
         devicename: String,
     },
-    /// Ban (remove) a user by number or hex event ID.
-    Ban {
-        target: String,
-    },
     /// Show combined identity info for the active peer.
     Identity,
     Shutdown,

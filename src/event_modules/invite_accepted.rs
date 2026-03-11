@@ -105,18 +105,6 @@ fn bootstrap_spki_already_peer_shared(
             SELECT 1 FROM peers_shared p
             WHERE p.recorded_by = ?1
               AND p.transport_fingerprint = ?2
-              AND NOT EXISTS (
-                SELECT 1 FROM removed_entities r
-                WHERE r.recorded_by = p.recorded_by
-                  AND r.target_event_id = p.event_id
-              )
-              AND NOT EXISTS (
-                SELECT 1 FROM removed_entities r
-                WHERE r.recorded_by = p.recorded_by
-                  AND p.user_event_id IS NOT NULL
-                  AND r.target_event_id = p.user_event_id
-                  AND r.removal_type = 'user'
-              )
         )",
         rusqlite::params![recorded_by, spki_fingerprint.as_slice()],
         |row| row.get(0),

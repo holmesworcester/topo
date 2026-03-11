@@ -44,10 +44,8 @@ fn now_ms() -> u64 {
 /// network fetch that negentropy will not request.
 ///
 /// Only events already projected as valid by at least one existing workspace
-/// sibling are replayed. This prevents post-removal events (from a removed
-/// tenant that created local events after removal) from leaking to new
-/// joiners — live fanout suppresses such events for active siblings, so
-/// seed replay must be consistent.
+/// sibling are replayed. This keeps seed replay aligned with normal same-DB
+/// fanout behavior without needing a redundant network fetch.
 fn replay_existing_workspace_shared_events_for_tenant(
     db: &Connection,
     recorded_by: &str,
@@ -56,8 +54,6 @@ fn replay_existing_workspace_shared_events_for_tenant(
     let workspace_id_b64 = event_id_to_base64(workspace_id);
 
     // Source 1: Events validated by at least one existing workspace sibling.
-    // For removed siblings, only include pre-removal events (clock-skew
-    // tolerance) so post-removal local creates don't leak.
     let mut ve_stmt = db.prepare(
         "SELECT DISTINCT ve.event_id
          FROM valid_events ve
@@ -66,31 +62,6 @@ fn replay_existing_workspace_shared_events_for_tenant(
          JOIN events e
            ON e.event_id = ve.event_id AND e.share_scope = 'shared'
          WHERE ve.peer_id <> ?2
-           AND (
-             NOT EXISTS (
-               SELECT 1 FROM peers_shared p
-               JOIN removed_entities r
-                 ON r.recorded_by = p.recorded_by
-                 AND (r.target_event_id = p.event_id
-                      OR (r.removal_type = 'user'
-                          AND p.user_event_id IS NOT NULL
-                          AND r.target_event_id = p.user_event_id))
-               WHERE lower(hex(p.transport_fingerprint)) = ve.peer_id
-             )
-             OR
-             e.created_at <= (
-               SELECT MIN(re.created_at) + 30000
-               FROM removed_entities r
-               JOIN peers_shared p
-                 ON r.recorded_by = p.recorded_by
-                 AND (r.target_event_id = p.event_id
-                      OR (r.removal_type = 'user'
-                          AND p.user_event_id IS NOT NULL
-                          AND r.target_event_id = p.user_event_id))
-               JOIN events re ON re.event_id = r.event_id
-               WHERE lower(hex(p.transport_fingerprint)) = ve.peer_id
-             )
-           )
          ORDER BY e.created_at ASC, ve.event_id ASC",
     )?;
     let mut seen: HashSet<EventId> = HashSet::new();
@@ -109,8 +80,6 @@ fn replay_existing_workspace_shared_events_for_tenant(
     // projected yet (e.g. blocked on key_secret). These are needed because
     // the new tenant's projector may succeed where siblings are still
     // waiting (e.g. key_secret materializes via cascade during this replay).
-    // Recorded-by filter ensures we only include events that at least one
-    // non-removed workspace sibling received (not post-removal local creates).
     let mut ni_stmt = db.prepare(
         "SELECT ni.id
          FROM neg_items ni
@@ -132,9 +101,6 @@ fn replay_existing_workspace_shared_events_for_tenant(
         if seen.contains(&eid) {
             continue;
         }
-        // Include if recorded by at least one workspace sibling that is
-        // either non-removed OR was removed after the event was created
-        // (pre-removal legitimate history, with 30s clock tolerance).
         let eid_b64 = event_id_to_base64(&eid);
         let has_eligible_recorder: bool = db
             .query_row(
@@ -142,33 +108,8 @@ fn replay_existing_workspace_shared_events_for_tenant(
                     SELECT 1 FROM recorded_events re
                     JOIN invites_accepted ia
                       ON ia.recorded_by = re.peer_id AND ia.workspace_id = ?1
-                    JOIN events e ON e.event_id = re.event_id
                     WHERE re.event_id = ?2
                       AND re.peer_id <> ?3
-                      AND (
-                        NOT EXISTS (
-                          SELECT 1 FROM peers_shared p
-                          JOIN removed_entities r
-                            ON r.recorded_by = p.recorded_by
-                            AND (r.target_event_id = p.event_id
-                                 OR (r.removal_type = 'user'
-                                     AND p.user_event_id IS NOT NULL
-                                     AND r.target_event_id = p.user_event_id))
-                          WHERE lower(hex(p.transport_fingerprint)) = re.peer_id
-                        )
-                        OR e.created_at <= (
-                          SELECT MIN(rev.created_at) + 30000
-                          FROM removed_entities r
-                          JOIN peers_shared p
-                            ON r.recorded_by = p.recorded_by
-                            AND (r.target_event_id = p.event_id
-                                 OR (r.removal_type = 'user'
-                                     AND p.user_event_id IS NOT NULL
-                                     AND r.target_event_id = p.user_event_id))
-                          JOIN events rev ON rev.event_id = r.event_id
-                          WHERE lower(hex(p.transport_fingerprint)) = re.peer_id
-                        )
-                      )
                 )",
                 rusqlite::params![&workspace_id_b64, &eid_b64, recorded_by],
                 |row| row.get(0),

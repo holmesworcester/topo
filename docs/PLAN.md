@@ -1551,7 +1551,27 @@ UPnP response contract:
 3. loopback-bound listeners return `not_attempted`,
 4. when mapping succeeds but external IP is not publicly routable, report `double_nat = true` and warn.
 
-## 19. Event-module locality
+## 19. QA bug fixes and CLI polish
+
+Tracked in `docs/bugs/qa-findings.md`. Key items:
+
+### 19.1 Rename `transport-identity` to `transport-keys`
+
+Replace the single-identity-only `transport-identity` command with `transport-keys` that lists all rows from `local_transport_creds` with peer_id and source. Works for both single and multi-tenant DBs.
+
+### 19.2 Reaction idempotency
+
+Duplicate reactions (same user, same message, same emoji) are accepted as separate events. Display queries should deduplicate by picking the winning reaction per (user, message, emoji) tuple — winner by earliest timestamp. The event layer continues to accept duplicates; deduplication is query-side only.
+
+### 19.3 Messages: 50 newest with overflow note
+
+`messages` currently renders up to 50 items with no truncation indicator. Change to show the 50 newest messages, and when more exist, display a note like "(25 older messages not shown)". Pagination is out of scope for now.
+
+### 19.4 Remaining bugs
+
+See `docs/bugs/qa-findings.md` for the full list: identity command wrong IDs, banned user visibility, self-ban guard, workspace creation atomicity, input validation (empty username/message/reaction), error message improvements.
+
+## 20. Event-module locality
 
 Normative locality/layering rules are defined in [DESIGN.md](./DESIGN.md) §14.
 Plan-level enforcement remains:

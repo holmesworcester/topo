@@ -330,6 +330,7 @@ fn tenant_local_username(db: &Connection, recorded_by: &str) -> Result<String, r
              FROM peers_shared ps
              JOIN local_transport_creds c
                ON c.peer_id = lower(hex(ps.transport_fingerprint))
+              AND c.peer_id = ?1
              LEFT JOIN users u
                ON ps.user_event_id = u.event_id
               AND ps.recorded_by = u.recorded_by
