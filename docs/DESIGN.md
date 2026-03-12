@@ -1056,7 +1056,7 @@ Design note:
 
 ## 5.3 Event creation API
 
-Three creation entry points exist:
+Three synchronous creation entry points exist:
 
 1. `create_event_synchronous(...) -> event_id` (current Rust symbol: `create_event_synchronous`),
 2. `create_signed_event_synchronous(...) -> event_id` (current Rust symbol: `create_signed_event_synchronous`),
@@ -1072,6 +1072,18 @@ This preserves imperative orchestration ergonomics:
 
 1. create event A synchronously,
 2. create dependent event B in the next line with no ad-hoc waits.
+
+Rare bootstrap-context flows use one explicit second mode:
+
+1. store the canonical event so the event id is known,
+2. write event-id-dependent context,
+3. project in the same transaction,
+4. return only after that projection outcome commits.
+
+Local create does not rely on create-side origin `project_queue` rows for crash
+safety. The durable recovery path for blocked local create is the blocked-state
+tables, while the ordinary synchronous path commits canonical store and first
+projection attempt together.
 
 ## 5.4 Signer pipeline
 

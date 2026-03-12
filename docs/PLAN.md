@@ -645,15 +645,17 @@ Implementation note:
   - `persist_and_enqueue` -> `project_one` loop (same code as worker mode)
 - do not add a separate "local fast-path" projector.
 
-### Two-API design decision (investigated and confirmed)
+### Two-mode create model (investigated and confirmed)
 
-The codebase provides two create-and-project entry points reflecting distinct caller needs:
+Product code should prefer two real create modes:
 
 1. **`create_event_synchronous`** (strict, PLAN-normative): returns `Ok(event_id)` only when projection reaches `Valid` or `AlreadyProcessed`. Returns `Err(Blocked { event_id, missing })` or `Err(Rejected { event_id, reason })` otherwise. All user-facing service commands (`svc_send`, `svc_react`, `svc_delete_message`, `svc_generate`) use this API.
 
-2. **`create_event_staged`** (lenient, bootstrap-only): wraps `Blocked` errors into `Ok(event_id)` via `event_id_or_blocked`. Used in identity bootstrap command paths (for example `create_workspace`, `join_workspace_as_new_user`, `add_device_to_workspace`) where events like `Workspace` can be created before their accepted-workspace dependency exists and are expected to block until the binding arrives.
+2. **`store_*_then_project(...)`** (rare, explicit): used only when projection needs event-id-dependent context to be written after canonical store but before the first projection attempt. Current example: bootstrap-context invite creation writes transport bootstrap context keyed by the stored invite event id, then projects in the same transaction.
 
-This split is intentional and correct: it preserves the strict contract for user-facing orchestration while allowing bootstrap chains to store pre-dependency events without aborting.
+`event_id_or_blocked(...)` and the `create_*_staged(...)` helpers are bootstrap/test conveniences layered on top of those two modes. They do not represent a separate storage model.
+
+Local synchronous create no longer depends on create-side origin `project_queue` rows or create-side pending fanout rows for crash safety. Atomicity comes from committing canonical store plus the first projection attempt together; blocked rows are the durable recovery path for blocked outcomes.
 
 Test index for this contract:
 - `test_create_signed_event_synchronous_returns_blocked_error` — strict API blocked→Err

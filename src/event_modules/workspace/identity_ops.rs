@@ -10,8 +10,8 @@ use rusqlite::Connection;
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::event_modules::*;
 use crate::projection::create::{
-    create_event_synchronous, create_signed_event_synchronous, event_id_or_blocked, project_event,
-    store_signed_event_only,
+    create_event_synchronous, create_signed_event_synchronous, event_id_or_blocked,
+    store_signed_event_then_project,
 };
 use crate::projection::encrypted::wrap_key_for_recipient;
 use crate::transport::{extract_spki_fingerprint, generate_self_signed_cert_from_signing_key};
@@ -252,21 +252,27 @@ fn create_invite_event_with_optional_bootstrap_context(
     bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
     if let Some(ctx) = bootstrap_ctx {
-        let event_id = store_signed_event_only(conn, recorded_by, event, signer)?;
-        let eid_b64 = event_id_to_base64(&event_id);
-        let ws_b64 = event_id_to_base64(workspace_id);
-        for addr in ctx.bootstrap_addrs {
-            crate::db::transport_trust::append_bootstrap_context(
-                conn,
-                recorded_by,
-                &eid_b64,
-                &ws_b64,
-                addr,
-                ctx.bootstrap_spki,
-            )?;
-        }
-        project_event(conn, recorded_by, &event_id)?;
-        Ok(event_id)
+        Ok(store_signed_event_then_project(
+            conn,
+            recorded_by,
+            event,
+            signer,
+            |conn, event_id| {
+                let eid_b64 = event_id_to_base64(event_id);
+                let ws_b64 = event_id_to_base64(workspace_id);
+                for addr in ctx.bootstrap_addrs {
+                    crate::db::transport_trust::append_bootstrap_context(
+                        conn,
+                        recorded_by,
+                        &eid_b64,
+                        &ws_b64,
+                        addr,
+                        ctx.bootstrap_spki,
+                    )?;
+                }
+                Ok(())
+            },
+        )?)
     } else {
         Ok(create_signed_event_synchronous(
             conn,

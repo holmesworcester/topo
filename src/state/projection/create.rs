@@ -11,7 +11,7 @@ use crate::event_modules::EncryptedEvent;
 use crate::event_modules::{self as events, registry, ParsedEvent, TransportPrivacy};
 use crate::projection::encrypted::encrypt_event_blob;
 use crate::projection::signer::sign_event_bytes;
-use crate::state::shared_workspace_fanout::fanout_stored_shared_event_immediate;
+use crate::state::shared_workspace_fanout::fanout_stored_shared_event_inline;
 use ed25519_dalek::SigningKey;
 
 #[derive(Debug)]
@@ -55,6 +55,39 @@ impl std::fmt::Display for CreateEventError {
 
 impl std::error::Error for CreateEventError {}
 
+impl From<rusqlite::Error> for CreateEventError {
+    fn from(value: rusqlite::Error) -> Self {
+        CreateEventError::DbError(value.to_string())
+    }
+}
+
+#[derive(Debug)]
+enum CreateAttemptOutcome {
+    Success(EventId),
+    Blocked {
+        event_id: EventId,
+        missing: Vec<[u8; 32]>,
+    },
+    Rejected {
+        event_id: EventId,
+        reason: String,
+    },
+}
+
+impl CreateAttemptOutcome {
+    fn into_result(self) -> Result<EventId, CreateEventError> {
+        match self {
+            Self::Success(event_id) => Ok(event_id),
+            Self::Blocked { event_id, missing } => {
+                Err(CreateEventError::Blocked { event_id, missing })
+            }
+            Self::Rejected { event_id, reason } => {
+                Err(CreateEventError::Rejected { event_id, reason })
+            }
+        }
+    }
+}
+
 /// Extract event_id from Ok or Blocked (event is stored in both cases).
 /// Returns Err only for true failures (encode, db, rejected).
 ///
@@ -78,7 +111,6 @@ fn store_blob_only(
     blob: &[u8],
     meta: &events::EventTypeMeta,
     created_at_ms: i64,
-    queue_priority: (i64, i64),
 ) -> Result<EventId, CreateEventError> {
     let event_id = hash_event(blob);
 
@@ -118,56 +150,22 @@ fn store_blob_only(
     insert_recorded_event(conn, recorded_by, &event_id, now_ms, "local_create")
         .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
-    // For shared events, ensure crash recovery can complete both the
-    // origin's own projection and sibling fanout:
-    // 1. Enqueue origin in project_queue so startup drain projects it.
-    // 2. Write a pending fanout entry so sibling fanout survives a crash.
-    // These must succeed atomically with the event storage above; errors
-    // are propagated to avoid silent data loss on crash.
-    if meta.share_scope == crate::event_modules::registry::ShareScope::Shared {
-        let event_id_b64 = crate::crypto::event_id_to_base64(&event_id);
-        let pq = crate::state::db::project_queue::ProjectQueue::new(conn);
-        pq.enqueue_classified(
-            recorded_by,
-            &event_id_b64,
-            queue_priority.0,
-            queue_priority.1,
-        )
-        .map_err(|e| CreateEventError::DbError(e.to_string()))?;
-
-        if let Some(ref ws_id) = ws_id_for_neg {
-            let fanout_entry = crate::state::shared_workspace_fanout::SharedEventFanout {
-                origin_peer_id: recorded_by.to_string(),
-                workspace_id: ws_id.clone(),
-                event_id,
-            };
-            crate::state::shared_workspace_fanout::persist_pending_fanouts(conn, &[fanout_entry])
-                .map_err(|e| CreateEventError::DbError(e.to_string()))?;
-        }
-    }
-
     Ok(event_id)
 }
 
-/// Project a stored event and return the result.
-fn project_stored_event(
+/// Project a stored event and return the committed projection outcome.
+fn project_stored_event_with_priority_outcome(
     conn: &Connection,
     recorded_by: &str,
     event_id: &EventId,
     queue_priority: Option<(i64, i64)>,
-) -> Result<EventId, CreateEventError> {
+) -> Result<CreateAttemptOutcome, CreateEventError> {
     let decision = project_one(conn, recorded_by, event_id)
         .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
     match decision {
         ProjectionDecision::Valid | ProjectionDecision::AlreadyProcessed => {
-            // Clean up the crash-recovery project_queue entry after
-            // successful inline projection so drain doesn't re-process.
-            let event_id_b64 = crate::crypto::event_id_to_base64(event_id);
-            let pq = crate::state::db::project_queue::ProjectQueue::new(conn);
-            let _ = pq.mark_done(recorded_by, &event_id_b64);
-
-            fanout_stored_shared_event_immediate(conn, recorded_by, event_id)
+            fanout_stored_shared_event_inline(conn, recorded_by, event_id)
                 .map_err(|e| CreateEventError::DbError(e.to_string()))?;
             match queue_priority {
                 Some((priority_lane, priority_ts)) => {
@@ -186,17 +184,54 @@ fn project_stored_event(
                 ),
             }
             .map_err(|e| CreateEventError::DbError(e.to_string()))?;
-            Ok(*event_id)
+            Ok(CreateAttemptOutcome::Success(*event_id))
         }
-        ProjectionDecision::Block { missing } => Err(CreateEventError::Blocked {
+        ProjectionDecision::Block { missing } => Ok(CreateAttemptOutcome::Blocked {
             event_id: *event_id,
             missing,
         }),
-        ProjectionDecision::Reject { reason } => Err(CreateEventError::Rejected {
+        ProjectionDecision::Reject { reason } => Ok(CreateAttemptOutcome::Rejected {
             event_id: *event_id,
             reason,
         }),
     }
+}
+
+fn project_event_outcome(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id: &EventId,
+) -> Result<CreateAttemptOutcome, CreateEventError> {
+    project_stored_event_with_priority_outcome(conn, recorded_by, event_id, None)
+}
+
+fn store_blob_then_project_with<F>(
+    conn: &Connection,
+    recorded_by: &str,
+    blob: &[u8],
+    meta: &events::EventTypeMeta,
+    created_at_ms: i64,
+    post_store: F,
+) -> Result<EventId, CreateEventError>
+where
+    F: FnOnce(&Connection, &EventId) -> Result<(), CreateEventError>,
+{
+    let queue_priority = crate::state::db::queue::classify_priority_from_blob(blob, created_at_ms);
+    let mut post_store = Some(post_store);
+    let outcome = crate::state::db::queue::with_immediate_tx_result(conn, || {
+        let event_id = store_blob_only(conn, recorded_by, blob, meta, created_at_ms)?;
+        let post_store = post_store
+            .take()
+            .expect("store_blob_then_project_with closure invoked more than once");
+        post_store(conn, &event_id)?;
+        project_stored_event_with_priority_outcome(
+            conn,
+            recorded_by,
+            &event_id,
+            Some(queue_priority),
+        )
+    })?;
+    outcome.into_result()
 }
 
 /// Shared helper: hash blob, write to events/neg_items/recorded_events, project via project_one.
@@ -207,9 +242,7 @@ fn store_blob_and_project(
     meta: &events::EventTypeMeta,
     created_at_ms: i64,
 ) -> Result<EventId, CreateEventError> {
-    let queue_priority = crate::state::db::queue::classify_priority_from_blob(blob, created_at_ms);
-    let event_id = store_blob_only(conn, recorded_by, blob, meta, created_at_ms, queue_priority)?;
-    project_stored_event(conn, recorded_by, &event_id, Some(queue_priority))
+    store_blob_then_project_with(conn, recorded_by, blob, meta, created_at_ms, |_, _| Ok(()))
 }
 
 /// Create a new event: encode, hash, write to events/neg_items/recorded_events,
@@ -297,15 +330,49 @@ pub fn store_signed_event_only(
     blob[blob_len - sig_len..].copy_from_slice(&sig);
 
     let created_at_ms = event.created_at_ms() as i64;
-    let queue_priority = crate::state::db::queue::classify_priority_from_blob(&blob, created_at_ms);
-    store_blob_only(
-        conn,
-        recorded_by,
-        &blob,
-        meta,
-        created_at_ms,
-        queue_priority,
-    )
+    store_blob_only(conn, recorded_by, &blob, meta, created_at_ms)
+}
+
+/// Rare explicit two-phase create path:
+/// 1. store the signed event so the event_id is known,
+/// 2. write any event-id-dependent context,
+/// 3. project in the same transaction and return only after the outcome commits.
+///
+/// Use this instead of open-coding a local create transaction when projection
+/// depends on context derived from the stored event id.
+pub fn store_signed_event_then_project<F>(
+    conn: &Connection,
+    recorded_by: &str,
+    event: &ParsedEvent,
+    signing_key: &ed25519_dalek::SigningKey,
+    post_store: F,
+) -> Result<EventId, CreateEventError>
+where
+    F: FnOnce(&Connection, &EventId) -> Result<(), CreateEventError>,
+{
+    let mut blob =
+        events::encode_event(event).map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
+
+    let type_code = event.event_type_code();
+    let reg = registry();
+    let meta = reg
+        .lookup(type_code)
+        .ok_or_else(|| CreateEventError::EncodeError(format!("unknown type code {}", type_code)))?;
+
+    if meta.signature_byte_len == 0 {
+        return Err(CreateEventError::EncodeError(
+            "store_signed_event_then_project called for unsigned type".to_string(),
+        ));
+    }
+
+    let sig_len = meta.signature_byte_len;
+    let blob_len = blob.len();
+    let signing_bytes = &blob[..blob_len - sig_len];
+    let sig = sign_event_bytes(signing_key, signing_bytes);
+    blob[blob_len - sig_len..].copy_from_slice(&sig);
+
+    let created_at_ms = event.created_at_ms() as i64;
+    store_blob_then_project_with(conn, recorded_by, &blob, meta, created_at_ms, post_store)
 }
 
 /// Store an unsigned event without projecting. Returns the event_id.
@@ -325,15 +392,7 @@ pub fn store_event_only(
         .ok_or_else(|| CreateEventError::EncodeError(format!("unknown type code {}", type_code)))?;
 
     let created_at_ms = event.created_at_ms() as i64;
-    let queue_priority = crate::state::db::queue::classify_priority_from_blob(&blob, created_at_ms);
-    store_blob_only(
-        conn,
-        recorded_by,
-        &blob,
-        meta,
-        created_at_ms,
-        queue_priority,
-    )
+    store_blob_only(conn, recorded_by, &blob, meta, created_at_ms)
 }
 
 /// Project a previously-stored event. Returns event_id on Valid/AlreadyProcessed,
@@ -343,7 +402,7 @@ pub fn project_event(
     recorded_by: &str,
     event_id: &EventId,
 ) -> Result<EventId, CreateEventError> {
-    project_stored_event(conn, recorded_by, event_id, None)
+    project_event_outcome(conn, recorded_by, event_id)?.into_result()
 }
 
 /// Project a previously-stored event, tolerating Block results (staged flow).
@@ -353,7 +412,7 @@ pub fn project_event_staged(
     recorded_by: &str,
     event_id: &EventId,
 ) -> Result<EventId, CreateEventError> {
-    event_id_or_blocked(project_stored_event(conn, recorded_by, event_id, None))
+    event_id_or_blocked(project_event(conn, recorded_by, event_id))
 }
 
 /// Create an encrypted event: encode inner event, optionally sign it,
@@ -512,6 +571,30 @@ mod tests {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         conn
+    }
+
+    fn origin_recovery_counts(
+        conn: &Connection,
+        recorded_by: &str,
+        event_id: &EventId,
+    ) -> (i64, i64) {
+        let event_id_b64 = event_id_to_base64(event_id);
+        let project_queue_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_queue WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &event_id_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let pending_fanout_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_shared_fanouts
+                 WHERE origin_peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, event_id.as_slice()],
+                |row| row.get(0),
+            )
+            .unwrap();
+        (project_queue_count, pending_fanout_count)
     }
 
     fn setup_workspace_event(conn: &Connection, recorded_by: &str) -> EventId {
@@ -1052,6 +1135,111 @@ mod tests {
             Ok(_) => panic!("PLAN §6.4: blocked event must NOT return Ok"),
             Err(e) => panic!("expected Blocked, got: {}", e),
         }
+    }
+
+    #[test]
+    fn test_valid_sync_create_leaves_no_origin_recovery_rows() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let net_eid = setup_workspace_event(&conn, recorded_by);
+        let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
+        let key_event_id =
+            crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+                &conn,
+                recorded_by,
+            )
+            .unwrap();
+
+        let msg = ParsedEvent::Message(MessageEvent {
+            created_at_ms: now_ms(),
+            workspace_id: net_eid,
+            author_id: user_event_id,
+            content: "no origin recovery rows".to_string(),
+            signed_by: signer_eid,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+
+        let event_id = create_encrypted_event_synchronous(
+            &conn,
+            recorded_by,
+            &key_event_id,
+            &msg,
+            Some(&signing_key),
+        )
+        .unwrap();
+
+        let (project_queue_count, pending_fanout_count) =
+            origin_recovery_counts(&conn, recorded_by, &event_id);
+        assert_eq!(
+            project_queue_count, 0,
+            "synchronous local create should not leave an origin project_queue row behind"
+        );
+        assert_eq!(
+            pending_fanout_count, 0,
+            "synchronous local create should not rely on pending shared fanout recovery rows"
+        );
+    }
+
+    #[test]
+    fn test_blocked_sync_create_commits_block_state_without_origin_recovery_rows() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
+        let key_event_id =
+            crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+                &conn,
+                recorded_by,
+            )
+            .unwrap();
+
+        let fake_target = [0xEF; 32];
+        let rxn = ParsedEvent::Reaction(ReactionEvent {
+            created_at_ms: now_ms(),
+            target_event_id: fake_target,
+            author_id: user_event_id,
+            emoji: "!".to_string(),
+            signed_by: signer_eid,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+
+        let event_id = match create_encrypted_event_synchronous(
+            &conn,
+            recorded_by,
+            &key_event_id,
+            &rxn,
+            Some(&signing_key),
+        ) {
+            Err(CreateEventError::Blocked { event_id, missing }) => {
+                assert_eq!(missing, vec![fake_target]);
+                event_id
+            }
+            other => panic!("expected blocked result, got {other:?}"),
+        };
+
+        let blocked_header: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, event_id_to_base64(&event_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            blocked_header, 1,
+            "blocked row must be durable before return"
+        );
+
+        let (project_queue_count, pending_fanout_count) =
+            origin_recovery_counts(&conn, recorded_by, &event_id);
+        assert_eq!(
+            project_queue_count, 0,
+            "blocked synchronous create should use blocked state, not origin project_queue recovery"
+        );
+        assert_eq!(
+            pending_fanout_count, 0,
+            "blocked synchronous create should not leave pending shared fanout recovery rows"
+        );
     }
 
     #[test]

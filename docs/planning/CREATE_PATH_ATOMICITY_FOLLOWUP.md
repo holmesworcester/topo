@@ -1,9 +1,9 @@
 # Create-Path Atomicity Follow-Up
 
-Date: 2026-03-11
+Date: 2026-03-12
 Branch: `codex/hot-cold-sync-plan`
 Worktree: `/tmp/poc-7-hot-cold-sync`
-Status: proposed cleanup after review of the implemented branch
+Status: implemented atomicity baseline plus remaining API cleanup
 
 ## Goal
 
@@ -12,9 +12,9 @@ principled:
 
 1. one atomic durable-store phase,
 2. one projection-attempt phase,
-3. one recovery story,
-4. one live-sync wakeup story,
-5. no local-create-only fast path that later hops do not share.
+3. one blocked/rejected durability story,
+4. one explicit event-id-dependent context hook,
+5. no create-side origin recovery rows.
 
 ## Universals
 
@@ -26,11 +26,11 @@ one transaction or not at all:
 1. `events`
 2. `neg_items` when the event is shared
 3. `recorded_events`
-4. origin-tenant `project_queue`
-5. pending same-workspace sibling fanout row, when applicable
 
-This closes the fatal crash window where the canonical event exists but no
-generic recovery row exists to re-attempt projection.
+Local create no longer relies on create-side origin `project_queue` rows or
+create-side pending sibling fanout rows. Crash safety comes from making the
+store and first projection attempt one transaction boundary, not from writing
+extra create-specific recovery rows.
 
 ### U2. Synchronous create returns `Ok(event_id)` only after projection succeeds
 
@@ -54,111 +54,97 @@ blocked state must already be durable before the function returns:
 The caller may choose to tolerate this through `event_id_or_blocked`, but that
 should only be possible once the recovery state is committed.
 
-### U4. Recovery rows are for repair, not latency shortcuts
+### U4. Explicit context injection is a narrow second mode
 
-The create path should not directly enqueue newly-valid local shared events to
-peer egress queues as a special first-hop bypass.
+Some flows genuinely need the event id before projection can succeed. The only
+principled exception is:
 
-That shortcut improves only the origin hop. It does not apply to later hops in
-a graph, so it can hide poor hot-sync tuning and make local-origin latency look
-better than transit latency.
+1. store event atomically,
+2. write event-id-dependent context,
+3. project in the same transaction,
+4. return only after the projection outcome commits.
 
-### U5. Live propagation uses the same mechanism on every hop
-
-When a shared event becomes valid, whether from:
-
-1. local create,
-2. wire ingest,
-3. replay, or
-4. cascade-unblock,
-
-the runtime should use the same peer-dirty / hot-sync wakeup mechanism to move
-it onward. The chain case should not depend on a local-create-only shortcut.
+This is now exposed as an explicit helper (`store_signed_event_then_project`)
+instead of each caller open-coding its own create transaction.
 
 ## Proposed Create-Side Shape
 
-## Phase A. Atomic durable store
+## Phase A. Atomic durable store + first projection attempt
 
-Wrap the durable store in `with_immediate_tx(...)` and commit:
+Wrap the durable store and the first projection attempt in
+`with_immediate_tx_result(...)` and commit one terminal outcome:
 
 1. canonical event row,
 2. negentropy row,
 3. recorded row,
-4. origin recovery row in `project_queue`,
-5. pending sibling fanout row.
-
-This phase does not decide success vs blocked. Its job is only to make the
-event and its repair path durable.
-
-## Phase B. Projection attempt
-
-After Phase A commits, attempt inline projection.
+4. projection side effects for one attempt (`valid`, `blocked`, or `rejected`).
 
 Possible results:
 
 1. `Valid` or `AlreadyProcessed`
-   - remove the origin recovery row,
    - run same-workspace fanout,
-   - mark the relevant peer slots dirty so hot sync runs promptly,
    - return `Ok(event_id)`.
 
 2. `Blocked`
    - ensure blocked state is durably recorded before return,
-   - keep the origin recovery row,
    - return `Err(Blocked { event_id, missing })`.
 
 3. `Rejected`
    - ensure rejection state is durable before return,
-   - remove or keep the origin recovery row according to retry policy,
    - return `Err(Rejected { event_id, reason })`.
+
+For rare bootstrap-context flows, the transaction shape is:
+
+1. store canonical rows,
+2. write event-id-dependent context,
+3. attempt projection,
+4. commit the resulting outcome.
 
 ## Why this is smaller and cleaner
 
 This removes the ad hoc distinction between:
 
-1. local create gets direct egress enqueue,
-2. remote ingest waits for hot/cold reconciliation.
+1. normal local create needing create-specific recovery rows,
+2. special bootstrap flows open-coding their own storage/projection contract.
 
 Instead:
 
-1. all ingestion sources share one projection/recovery model,
-2. all newly-valid shared events use one onward-propagation trigger,
-3. sync responsiveness is solved in sync scheduling, not by a first-hop bypass.
+1. strict synchronous create is the default,
+2. event-id-dependent context injection is the only explicit exception,
+3. blocked state is the durable repair path for blocked events.
 
 ## Concrete Changes To Make
 
-1. Wrap `store_blob_only(...)` in an explicit transaction using
-   `with_immediate_tx(...)`.
-2. Treat `project_queue` insert and pending sibling-fanout insert as part of
-   that transaction.
-3. Add an explicit projection-attempt boundary so the blocked path can commit
-   its own durable bookkeeping before returning.
-4. Keep `Ok(event_id)` only for successfully projected synchronous creates.
-5. Keep blocked-tolerant chaining only behind `event_id_or_blocked(...)`.
-6. Remove the local-create direct-to-egress enqueue in
-   `projection/create.rs`.
-7. Add a uniform peer-dirty / hot-session wakeup path for any newly-valid
-   shared event, regardless of source.
+Done on this branch:
+
+1. local synchronous create commits canonical store plus first projection
+   attempt in one transaction,
+2. local create no longer writes origin `project_queue` rows,
+3. local create no longer writes create-side pending sibling fanout rows,
+4. blocked synchronous create returns only after blocked rows are durable,
+5. bootstrap-context invite creation now uses a shared
+   `store_signed_event_then_project(...)` helper.
+
+Still worth cleaning up before/after merge:
+
+1. narrow generic staged helpers so product code prefers strict synchronous
+   create or the explicit `store_*_then_project(...)` path,
+2. remove stale documentation that still describes create-side recovery rows as
+   the local-create safety mechanism,
+3. keep pressure on chain-latency tests so direct first-hop enqueue is not
+   mistaken for the long-term solution.
 
 ## Required Tests
 
-1. crash-safety unit/integration test:
-   a locally-created shared event must never be durable without either an
-   origin `project_queue` row or terminal projection state.
-2. blocked-return test:
-   synchronous create returning `Err(Blocked { event_id, .. })` must already
-   have durable blocked rows before the return is observed.
-3. chaining contract test:
-   synchronous `Ok(event_id)` must imply the subsequent dependent create can
-   observe the required projector context immediately.
-4. chain-latency test:
-   live events should advance across a multi-hop chain because each hop's hot
-   sync reacts to newly-valid shared events, not because the first hop used a
-   special shortcut.
+1. synchronous create leaves no origin `project_queue` or create-side pending
+   fanout rows,
+2. blocked synchronous create commits blocked rows before return,
+3. bootstrap-context invite creation works via the explicit
+   `store -> context -> project` path without origin recovery rows,
+4. chaining contract still holds for strict synchronous create.
 
 ## Non-Goals
 
 1. Do not introduce a separate event universe for "live" traffic.
-2. Do not add a local-create-only push plane.
-3. Do not weaken the blocked-event contract by returning success before
+2. Do not weaken the blocked-event contract by returning success before
    projector-owned context exists.
