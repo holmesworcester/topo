@@ -52,7 +52,7 @@ pub fn enqueue_pending_have_to_egress(
     let to_enqueue: Vec<EventId> = pending_have.drain(..drain_count).collect();
     let mut inserted = 0usize;
     for chunk in to_enqueue.chunks(have_chunk()) {
-        inserted += egress.enqueue_events(peer_id, chunk)?;
+        inserted += egress.enqueue_events_with_priority(peer_id, chunk)?;
     }
     if inserted > 0 {
         info!(

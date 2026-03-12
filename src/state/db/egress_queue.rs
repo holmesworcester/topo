@@ -1,7 +1,23 @@
 use rusqlite::{params, Connection, Result as SqliteResult};
 
 use super::queue::{current_timestamp_ms, with_immediate_tx, with_sqlite_busy_retry};
-use crate::crypto::EventId;
+use crate::crypto::{event_id_to_base64, EventId};
+
+/// Priority for high-importance events (messages, reactions, identity, keys).
+pub const PRIORITY_HIGH: i64 = 0;
+/// Priority for bulk/background events (file, file_slice, bench_dep).
+pub const PRIORITY_LOW: i64 = 1;
+
+/// Classify an event type code into an egress priority.
+///
+/// LOW priority: file (24), file_slice (25), bench_dep (26).
+/// Everything else is HIGH (messages, reactions, identity, keys, unknown).
+pub fn priority_for_type_code(type_code: u8) -> i64 {
+    match type_code {
+        24 | 25 | 26 => PRIORITY_LOW,
+        _ => PRIORITY_HIGH,
+    }
+}
 
 pub struct EgressQueue<'a> {
     conn: &'a Connection,
@@ -21,7 +37,8 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
             attempts INTEGER NOT NULL DEFAULT 0,
             lease_until INTEGER,
             sent_at INTEGER,
-            dedupe_key TEXT
+            dedupe_key TEXT,
+            priority INTEGER NOT NULL DEFAULT 0
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_egress_pending_event
             ON egress_queue(connection_id, event_id)
@@ -29,8 +46,8 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_egress_dedupe
             ON egress_queue(dedupe_key)
             WHERE dedupe_key IS NOT NULL AND sent_at IS NULL;
-        CREATE INDEX IF NOT EXISTS idx_egress_claim
-            ON egress_queue(connection_id, id)
+        CREATE INDEX IF NOT EXISTS idx_egress_priority_claim
+            ON egress_queue(connection_id, priority, id)
             WHERE sent_at IS NULL;
         ",
     )?;
@@ -42,8 +59,9 @@ impl<'a> EgressQueue<'a> {
         Self { conn }
     }
 
-    /// Enqueue a batch of events for a connection. Deduped by partial unique index
-    /// on (connection_id, event_id) WHERE frame_type='event' AND sent_at IS NULL.
+    /// Enqueue a batch of events for a connection at default (HIGH) priority.
+    /// Deduped by partial unique index on (connection_id, event_id) WHERE
+    /// frame_type='event' AND sent_at IS NULL.
     /// Returns number inserted.
     pub fn enqueue_events(
         &self,
@@ -57,12 +75,58 @@ impl<'a> EgressQueue<'a> {
         with_immediate_tx(self.conn, || {
             let mut stmt = self.conn.prepare(
                 "INSERT OR IGNORE INTO egress_queue
-                 (connection_id, frame_type, event_id, enqueued_at, available_at)
-                 VALUES (?1, 'event', ?2, ?3, ?3)",
+                 (connection_id, frame_type, event_id, enqueued_at, available_at, priority)
+                 VALUES (?1, 'event', ?2, ?3, ?3, ?4)",
             )?;
             let mut inserted = 0usize;
             for id in event_ids {
-                inserted += stmt.execute(params![connection_id, &id[..], now])?;
+                inserted += stmt.execute(params![connection_id, &id[..], now, PRIORITY_HIGH])?;
+            }
+            Ok(inserted)
+        })
+    }
+
+    /// Enqueue a batch of events with priority derived from the store.
+    ///
+    /// For each event_id, reads the first byte of the blob from the events
+    /// table to determine the type code, then classifies priority. If the
+    /// blob is not found, defaults to HIGH priority (safe fallback: don't
+    /// delay unknown events).
+    pub fn enqueue_events_with_priority(
+        &self,
+        connection_id: &str,
+        event_ids: &[EventId],
+    ) -> SqliteResult<usize> {
+        if event_ids.is_empty() {
+            return Ok(0);
+        }
+        let now = current_timestamp_ms();
+        with_immediate_tx(self.conn, || {
+            // Prepare a statement to read just the first byte of the blob.
+            // substr(blob,1,1) returns the first byte efficiently without
+            // reading the entire blob into memory.
+            let mut type_stmt = self.conn.prepare(
+                "SELECT substr(blob, 1, 1) FROM events
+                 WHERE event_id = ?1 AND share_scope = 'shared'",
+            )?;
+            let mut insert_stmt = self.conn.prepare(
+                "INSERT OR IGNORE INTO egress_queue
+                 (connection_id, frame_type, event_id, enqueued_at, available_at, priority)
+                 VALUES (?1, 'event', ?2, ?3, ?3, ?4)",
+            )?;
+            let mut inserted = 0usize;
+            for id in event_ids {
+                let id_b64 = event_id_to_base64(id);
+                let priority = match type_stmt.query_row(params![id_b64], |row| {
+                    row.get::<_, Vec<u8>>(0)
+                }) {
+                    Ok(first_byte) if !first_byte.is_empty() => {
+                        priority_for_type_code(first_byte[0])
+                    }
+                    _ => PRIORITY_HIGH, // fallback: don't delay unknown events
+                };
+                inserted +=
+                    insert_stmt.execute(params![connection_id, &id[..], now, priority])?;
             }
             Ok(inserted)
         })
@@ -87,7 +151,7 @@ impl<'a> EgressQueue<'a> {
                 "SELECT id, event_id FROM egress_queue
                  WHERE connection_id = ?1
                  AND sent_at IS NULL
-                 ORDER BY id
+                 ORDER BY priority, id
                  LIMIT ?2",
             )?;
             let rows: Vec<(i64, Vec<u8>)> = stmt
@@ -351,5 +415,165 @@ mod tests {
         let verify = open_connection(&path).unwrap();
         let eq = EgressQueue::new(&verify);
         assert_eq!(eq.count_pending("conn1").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_priority_for_type_code() {
+        // Messages, reactions, identity events -> HIGH
+        assert_eq!(priority_for_type_code(1), PRIORITY_HIGH); // message
+        assert_eq!(priority_for_type_code(2), PRIORITY_HIGH); // reaction
+        assert_eq!(priority_for_type_code(7), PRIORITY_HIGH); // message_deletion
+        assert_eq!(priority_for_type_code(8), PRIORITY_HIGH); // workspace
+        assert_eq!(priority_for_type_code(14), PRIORITY_HIGH); // user
+        assert_eq!(priority_for_type_code(22), PRIORITY_HIGH); // key_shared
+
+        // Bulk/background events -> LOW
+        assert_eq!(priority_for_type_code(24), PRIORITY_LOW); // file
+        assert_eq!(priority_for_type_code(25), PRIORITY_LOW); // file_slice
+        assert_eq!(priority_for_type_code(26), PRIORITY_LOW); // bench_dep
+
+        // Unknown -> HIGH (safe fallback)
+        assert_eq!(priority_for_type_code(99), PRIORITY_HIGH);
+        assert_eq!(priority_for_type_code(0), PRIORITY_HIGH);
+    }
+
+    #[test]
+    fn test_claim_batch_respects_priority_ordering() {
+        let conn = setup();
+        let eq = EgressQueue::new(&conn);
+
+        // Enqueue three LOW-priority events first (they get lower rowids)
+        let now = super::current_timestamp_ms();
+        conn.execute(
+            "INSERT INTO egress_queue (connection_id, frame_type, event_id, enqueued_at, available_at, priority)
+             VALUES ('peer1', 'event', ?1, ?2, ?2, ?3)",
+            params![&make_event_id(10)[..], now, PRIORITY_LOW],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO egress_queue (connection_id, frame_type, event_id, enqueued_at, available_at, priority)
+             VALUES ('peer1', 'event', ?1, ?2, ?2, ?3)",
+            params![&make_event_id(11)[..], now, PRIORITY_LOW],
+        ).unwrap();
+        conn.execute(
+            "INSERT INTO egress_queue (connection_id, frame_type, event_id, enqueued_at, available_at, priority)
+             VALUES ('peer1', 'event', ?1, ?2, ?2, ?3)",
+            params![&make_event_id(12)[..], now, PRIORITY_LOW],
+        ).unwrap();
+
+        // Now enqueue one HIGH-priority event (higher rowid, but should come first)
+        conn.execute(
+            "INSERT INTO egress_queue (connection_id, frame_type, event_id, enqueued_at, available_at, priority)
+             VALUES ('peer1', 'event', ?1, ?2, ?2, ?3)",
+            params![&make_event_id(1)[..], now, PRIORITY_HIGH],
+        ).unwrap();
+
+        // Claim all 4 — HIGH should come first despite having the highest rowid
+        let claimed = eq.claim_batch("peer1", 10).unwrap();
+        assert_eq!(claimed.len(), 4);
+
+        // First event should be the HIGH-priority one (event_id byte 1)
+        assert_eq!(
+            claimed[0].1[0], 1,
+            "HIGH-priority message should be claimed before LOW-priority file slices"
+        );
+        // Remaining three should be the LOW-priority events in id order
+        assert_eq!(claimed[1].1[0], 10);
+        assert_eq!(claimed[2].1[0], 11);
+        assert_eq!(claimed[3].1[0], 12);
+    }
+
+    #[test]
+    fn test_claim_batch_priority_with_limit() {
+        let conn = setup();
+        let eq = EgressQueue::new(&conn);
+
+        let now = super::current_timestamp_ms();
+        // Enqueue 3 LOW first, then 2 HIGH
+        for byte in [10u8, 11, 12] {
+            conn.execute(
+                "INSERT INTO egress_queue (connection_id, frame_type, event_id, enqueued_at, available_at, priority)
+                 VALUES ('peer1', 'event', ?1, ?2, ?2, ?3)",
+                params![&make_event_id(byte)[..], now, PRIORITY_LOW],
+            ).unwrap();
+        }
+        for byte in [1u8, 2] {
+            conn.execute(
+                "INSERT INTO egress_queue (connection_id, frame_type, event_id, enqueued_at, available_at, priority)
+                 VALUES ('peer1', 'event', ?1, ?2, ?2, ?3)",
+                params![&make_event_id(byte)[..], now, PRIORITY_HIGH],
+            ).unwrap();
+        }
+
+        // Claim only 2 — should get both HIGH-priority events
+        let claimed = eq.claim_batch("peer1", 2).unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(claimed[0].1[0], 1, "first claimed should be HIGH message");
+        assert_eq!(claimed[1].1[0], 2, "second claimed should be HIGH reaction");
+    }
+
+    #[test]
+    fn test_enqueue_events_with_priority_classifies_from_store() {
+        use crate::crypto::hash_event;
+        use crate::db::store::insert_event;
+        use crate::event_modules::ShareScope;
+
+        let conn = setup();
+        let eq = EgressQueue::new(&conn);
+
+        // Create a message blob (type=1) and a file_slice blob (type=25)
+        let msg_blob = vec![1u8, 0, 0, 0, 0, 0, 0, 0, 0]; // type=1, minimal
+        let fs_blob = vec![25u8, 0, 0, 0, 0, 0, 0, 0, 0]; // type=25, minimal
+
+        let msg_id = hash_event(&msg_blob);
+        let fs_id = hash_event(&fs_blob);
+        let now = 1_700_000_000_000i64;
+
+        insert_event(&conn, &msg_id, "message", &msg_blob, ShareScope::Shared, now, now).unwrap();
+        insert_event(&conn, &fs_id, "file_slice", &fs_blob, ShareScope::Shared, now, now).unwrap();
+
+        // Enqueue file_slice first, then message
+        let inserted = eq
+            .enqueue_events_with_priority("peer1", &[fs_id, msg_id])
+            .unwrap();
+        assert_eq!(inserted, 2);
+
+        // Claim — message should come first due to HIGH priority
+        let claimed = eq.claim_batch("peer1", 10).unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(
+            claimed[0].1, msg_id,
+            "message (HIGH priority) should be claimed before file_slice (LOW)"
+        );
+        assert_eq!(
+            claimed[1].1, fs_id,
+            "file_slice (LOW priority) should come second"
+        );
+    }
+
+    #[test]
+    fn test_enqueue_events_with_priority_unknown_defaults_high() {
+        let conn = setup();
+        let eq = EgressQueue::new(&conn);
+
+        // Event ID that does not exist in the events table
+        let unknown_id = make_event_id(99);
+
+        let inserted = eq
+            .enqueue_events_with_priority("peer1", &[unknown_id])
+            .unwrap();
+        assert_eq!(inserted, 1);
+
+        // Verify it was classified as HIGH priority
+        let priority: i64 = conn
+            .query_row(
+                "SELECT priority FROM egress_queue WHERE connection_id = 'peer1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            priority, PRIORITY_HIGH,
+            "unknown events should default to HIGH priority"
+        );
     }
 }

@@ -231,7 +231,7 @@ where
                     continue;
                 }
                 egress
-                    .enqueue_events(peer_id, &ids)
+                    .enqueue_events_with_priority(peer_id, &ids)
                     .map_err(|e| format!("failed to enqueue HaveList ids: {e}"))?;
             }
             Ok(Ok(Frame::Done)) => {
