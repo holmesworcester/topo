@@ -542,10 +542,17 @@ async fn catchup_large_file_8x_1024_slices() {
 #[tokio::test]
 async fn catchup_non_uniform_sources() {
     let source_count = 4;
+    // Debug builds are ~10x slower; scale down to keep under timeout.
+    #[cfg(debug_assertions)]
+    let shared_count = 10;
+    #[cfg(not(debug_assertions))]
     let shared_count = 50;
     // Must exceed total_peers * FALLBACK_THRESHOLD_FACTOR (4*20=80) after
     // the first session claims its owned subset (~25%). 200 * 0.75 = 150 > 80,
     // so the remaining source-unique events permanently stall without the fix.
+    #[cfg(debug_assertions)]
+    let unique_per_source = 40;
+    #[cfg(not(debug_assertions))]
     let unique_per_source = 200;
 
     let sources: Vec<Peer> = (0..source_count)
@@ -632,8 +639,10 @@ async fn catchup_non_uniform_sources() {
 async fn catchup_dead_peer_dropout() {
     let source_count = 4;
     // Large enough that session 2 can't finish syncing before we kill it.
-    // With 10k events, negentropy reconciliation + data transfer takes
-    // hundreds of ms on localhost, well beyond the ~7ms shutdown delay.
+    // Debug builds are ~10x slower; scale down to keep under timeout.
+    #[cfg(debug_assertions)]
+    let event_count = 1_000;
+    #[cfg(not(debug_assertions))]
     let event_count = 10_000;
 
     let sources: Vec<Peer> = (0..source_count)

@@ -4,7 +4,7 @@ pub mod shared;
 pub mod state;
 pub mod testutil;
 
-pub use runtime::control::{assert, node, rpc, service};
+pub use runtime::control::{assert, display, node, rpc, service};
 pub use runtime::peering;
 pub use runtime::sync_engine as sync;
 pub use runtime::transport;

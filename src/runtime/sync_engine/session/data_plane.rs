@@ -214,6 +214,7 @@ where
                 msg = data_recv.recv() => {
                     match msg {
                         Ok(Frame::Event { blob }) => {
+                            events_received.fetch_add(1, Ordering::Relaxed);
                             bytes_received.fetch_add(blob.len() as u64, Ordering::Relaxed);
                             events_received.fetch_add(1, Ordering::Relaxed);
                             max_blob_size = max_blob_size.max(blob.len());

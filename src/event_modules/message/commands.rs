@@ -75,6 +75,7 @@ fn begin_immediate_with_retry(
 
 #[derive(Debug, Serialize, Deserialize)]
 pub struct DeleteResponse {
+    pub event_id: String,
     pub target: String,
 }
 
@@ -179,7 +180,7 @@ pub fn create_deletion(
     Ok(eid)
 }
 
-/// High-level delete command: creates a message_deletion event and returns target hex.
+/// High-level delete command: creates a message_deletion event and returns (event_id_hex, target_hex).
 pub fn delete_message(
     db: &Connection,
     recorded_by: &str,
@@ -188,8 +189,8 @@ pub fn delete_message(
     created_at_ms: u64,
     author_id: [u8; 32],
     target_event_id: [u8; 32],
-) -> Result<String, String> {
-    create_deletion(
+) -> Result<(String, String), String> {
+    let event_id = create_deletion(
         db,
         recorded_by,
         signer_eid,
@@ -202,7 +203,7 @@ pub fn delete_message(
     )
     .map_err(|e| format!("{}", e))?;
 
-    Ok(hex::encode(target_event_id))
+    Ok((hex::encode(event_id), hex::encode(target_event_id)))
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +273,7 @@ pub fn delete_message_for_peer(
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
     let author_id = peer_shared::resolve_user_event_id(&db, &recorded_by, &signer_eid)?;
 
-    let target = delete_message(
+    let (event_id, target) = delete_message(
         &db,
         &recorded_by,
         &signer_eid,
@@ -283,7 +284,7 @@ pub fn delete_message_for_peer(
     )
     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
 
-    Ok(DeleteResponse { target })
+    Ok(DeleteResponse { event_id, target })
 }
 
 /// Generate N test messages as a specific peer.
