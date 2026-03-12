@@ -92,31 +92,17 @@ style: |
 
 ---
 
-<!-- _class: lead -->
-
-"I have worked for ~6 years trying to build a p2p Slack-alternative. It is #$%@ing brutal."
-
--- me
-
----
-
-# This question haunts me 👻 
-
-Is p2p intrinsically #$%@ing brutal? Or is all this carnage avoidable and pointless?
-
----
-
-# Why has it been such a slog?
+# Why is building useful p2p apps so hard?
 
 <!-- pt:incremental_lists: true -->
 
 - Many problems to solve: p2p, e2ee, sync, files, push etc.
 - Solutions aren't generic; must fit product needs
-- Concurrency is a minefield 💥, time bomb 💣, quagmire 🐊, rat's nest 🐀, death march 💀 — choose your favorite metaphor!
+- Concurrency is a minefield 💥, time bomb 💣, quagmire 🐊, rat's nest 🐀, death march 💀 — choose your favorite metaphor, it is *the* hard part!
 
 ---
 
-# Can't we build on existing work? 😥
+# Can't we just use existing approaches? 😥
 
 <!-- pt:incremental_lists: true -->
 
@@ -143,7 +129,7 @@ Is p2p intrinsically #$%@ing brutal? Or is all this carnage avoidable and pointl
 
 <!-- pt:incremental_lists: true -->
 
-- **Arbitrary dependency linkages** - these are the opposite of what you want: they block content when you *don't* need that and not when you do 
+- **Arbitrary dependencies in data** - these are the opposite of what you want: they block content when you *don't* need that and not when you do 
 - **No iOS support** - especially for push & the iOS NSE memory limit 🐼
 - **No multi-tenant/account support** - so you'll need to roll a lot of your own infra to support mobile devices and notifications 🐼
 - **No simple API for frontends** - you must build a complex middle layer to cover all the queries your frontend needs 🐼
