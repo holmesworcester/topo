@@ -46,7 +46,8 @@ use crate::peering::loops::{
 use crate::projection::apply::project_one;
 use crate::projection::create::{
     create_encrypted_event_synchronous, create_event_staged, create_event_synchronous,
-    create_signed_event_staged, create_signed_event_synchronous, CreateEventError,
+    create_signed_event_staged, create_signed_event_synchronous, event_id_or_blocked,
+    CreateEventError,
 };
 use crate::transport::identity::{ensure_transport_peer_id, load_transport_cert};
 use crate::transport::{create_dual_endpoint_dynamic, extract_spki_fingerprint, AllowedPeers};
@@ -599,19 +600,21 @@ impl Peer {
     }
 
     /// Sign an inner event, encrypt the signed blob, wrap in EncryptedEvent, store + project.
+    /// Uses event_id_or_blocked so events whose deps are missing are stored in blocked
+    /// state rather than panicking, mirroring real ingestion behaviour.
     fn create_encrypted_signed_event_synchronous(
         &self,
         db: &rusqlite::Connection,
         key_event_id: &EventId,
         inner_event: &ParsedEvent,
     ) -> EventId {
-        create_encrypted_event_synchronous(
+        event_id_or_blocked(create_encrypted_event_synchronous(
             db,
             &self.identity,
             key_event_id,
             inner_event,
             Some(self.signing_key()),
-        )
+        ))
         .expect("failed to create encrypted signed event")
     }
 

@@ -459,6 +459,46 @@ fn store_client_op(
     }
 }
 
+/// Best-effort: inject created_events into an existing RpcResponse JSON.
+/// Takes hex event IDs, converts to base64, fetches EventListItems, and
+/// merges them into the response data under "created_events".
+fn inject_created_events(
+    resp: &mut RpcResponse,
+    db_path: &str,
+    peer_id: &str,
+    hex_event_ids: &[&str],
+) {
+    if hex_event_ids.is_empty() {
+        return;
+    }
+    // Convert hex event IDs to base64 (DB format).
+    let b64_ids: Vec<String> = hex_event_ids
+        .iter()
+        .filter_map(|hex_id| {
+            let bytes = hex::decode(hex_id).ok()?;
+            if bytes.len() != 32 {
+                return None;
+            }
+            let eid: [u8; 32] = bytes.try_into().ok()?;
+            Some(crate::crypto::event_id_to_base64(&eid))
+        })
+        .collect();
+    if b64_ids.is_empty() {
+        return;
+    }
+    let Ok((recorded_by, db)) = service::open_db_for_peer(db_path, peer_id) else {
+        return;
+    };
+    let Ok(list_resp) = service::svc_event_list_by_ids(&db, &recorded_by, &b64_ids) else {
+        return;
+    };
+    if let Some(ref mut data) = resp.data {
+        if let Ok(events_json) = serde_json::to_value(&list_resp.events) {
+            data["created_events"] = events_json;
+        }
+    }
+}
+
 fn dispatch(
     state: &DaemonState,
     method: RpcMethod,
@@ -584,7 +624,22 @@ fn dispatch(
                             resp_json["invite_error"] = serde_json::json!(e);
                         }
                     }
-                    RpcResponse::success(resp_json)
+                    let mut rpc_resp = RpcResponse::success(resp_json);
+                    // Inject all created identity chain events for the new peer.
+                    if let Ok((recorded_by, db)) =
+                        service::open_db_for_peer(db_path, &resp.peer_id)
+                    {
+                        if let Ok(list_resp) = service::svc_event_list(&db, &recorded_by) {
+                            if let Some(ref mut data) = rpc_resp.data {
+                                if let Ok(events_json) =
+                                    serde_json::to_value(&list_resp.events)
+                                {
+                                    data["created_events"] = events_json;
+                                }
+                            }
+                        }
+                    }
+                    rpc_resp
                 }
                 Err(e) => RpcResponse::error(e.to_string()),
             }
@@ -605,7 +660,10 @@ fn dispatch(
                         "message",
                     );
                     state.notify_runtime_recheck();
-                    RpcResponse::success(data)
+                    let eid = data.event_id.clone();
+                    let mut resp = RpcResponse::success(data);
+                    inject_created_events(&mut resp, db_path, &peer_id, &[&eid]);
+                    resp
                 }
                 Err(e) => RpcResponse::error(e.to_string()),
             },
@@ -627,7 +685,10 @@ fn dispatch(
                             "file",
                         );
                         state.notify_runtime_recheck();
-                        RpcResponse::success(data)
+                        let eid = data.event_id.clone();
+                        let mut resp = RpcResponse::success(data);
+                        inject_created_events(&mut resp, db_path, &peer_id, &[&eid]);
+                        resp
                     }
                     Err(e) => RpcResponse::error(e.to_string()),
                 }
@@ -701,7 +762,10 @@ fn dispatch(
                         "reaction",
                     );
                     state.notify_runtime_recheck();
-                    RpcResponse::success(data)
+                    let eid = data.event_id.clone();
+                    let mut resp = RpcResponse::success(data);
+                    inject_created_events(&mut resp, db_path, &peer_id, &[&eid]);
+                    resp
                 }
                 Err(e) => RpcResponse::error(e.to_string()),
             },
@@ -1015,7 +1079,8 @@ fn dispatch(
                 );
                 match result {
                     Ok(data) => {
-                        if let Some(link) = serde_json::to_value(&data)
+                        let invite_eid_b64 = data.invite_event_id.clone();
+                        let mut resp = if let Some(link) = serde_json::to_value(&data)
                             .ok()
                             .and_then(|v| v["invite_link"].as_str().map(|s| s.to_string()))
                         {
@@ -1025,7 +1090,20 @@ fn dispatch(
                             RpcResponse::success(resp_data)
                         } else {
                             RpcResponse::success(data)
+                        };
+                        // Inject created_events for the invite event.
+                        if let Ok((rb, db)) = service::open_db_for_peer(db_path, &peer_id) {
+                            if let Ok(lr) =
+                                service::svc_event_list_by_ids(&db, &rb, &[invite_eid_b64])
+                            {
+                                if let Some(ref mut d) = resp.data {
+                                    if let Ok(v) = serde_json::to_value(&lr.events) {
+                                        d["created_events"] = v;
+                                    }
+                                }
+                            }
                         }
+                        resp
                     }
                     Err(e) => RpcResponse::error(e.to_string()),
                 }
@@ -1130,7 +1208,8 @@ fn dispatch(
                         public_spki.as_deref(),
                     ) {
                         Ok(data) => {
-                            if let Some(link) = serde_json::to_value(&data)
+                            let invite_eid_b64 = data.invite_event_id.clone();
+                            let mut resp = if let Some(link) = serde_json::to_value(&data)
                                 .ok()
                                 .and_then(|v| v["invite_link"].as_str().map(|s| s.to_string()))
                             {
@@ -1140,7 +1219,23 @@ fn dispatch(
                                 RpcResponse::success(resp_data)
                             } else {
                                 RpcResponse::success(data)
+                            };
+                            if let Ok((rb, db)) =
+                                service::open_db_for_peer(db_path, &peer_id)
+                            {
+                                if let Ok(lr) = service::svc_event_list_by_ids(
+                                    &db,
+                                    &rb,
+                                    &[invite_eid_b64],
+                                ) {
+                                    if let Some(ref mut d) = resp.data {
+                                        if let Ok(v) = serde_json::to_value(&lr.events) {
+                                            d["created_events"] = v;
+                                        }
+                                    }
+                                }
                             }
+                            resp
                         }
                         Err(e) => RpcResponse::error(e.to_string()),
                     }
@@ -1155,9 +1250,20 @@ fn dispatch(
             };
             match workspace::commands::accept_device_link(db_path, &resolved, &devicename) {
                 Ok(data) => {
-                    *state.active_peer.write().unwrap() = Some(data.peer_id.clone());
+                    let pid = data.peer_id.clone();
+                    *state.active_peer.write().unwrap() = Some(pid.clone());
                     state.notify_runtime_recheck();
-                    RpcResponse::success(data)
+                    let mut resp = RpcResponse::success(data);
+                    if let Ok((recorded_by, db)) = service::open_db_for_peer(db_path, &pid) {
+                        if let Ok(list_resp) = service::svc_event_list(&db, &recorded_by) {
+                            if let Some(ref mut d) = resp.data {
+                                if let Ok(v) = serde_json::to_value(&list_resp.events) {
+                                    d["created_events"] = v;
+                                }
+                            }
+                        }
+                    }
+                    resp
                 }
                 Err(e) => RpcResponse::error(e.to_string()),
             }
@@ -1178,9 +1284,20 @@ fn dispatch(
             devicename,
         } => match workspace::commands::accept_invite(db_path, &invite, &username, &devicename) {
             Ok(data) => {
-                *state.active_peer.write().unwrap() = Some(data.peer_id.clone());
+                let pid = data.peer_id.clone();
+                *state.active_peer.write().unwrap() = Some(pid.clone());
                 state.notify_runtime_recheck();
-                RpcResponse::success(data)
+                let mut resp = RpcResponse::success(data);
+                if let Ok((recorded_by, db)) = service::open_db_for_peer(db_path, &pid) {
+                    if let Ok(list_resp) = service::svc_event_list(&db, &recorded_by) {
+                        if let Some(ref mut d) = resp.data {
+                            if let Ok(v) = serde_json::to_value(&list_resp.events) {
+                                d["created_events"] = v;
+                            }
+                        }
+                    }
+                }
+                resp
             }
             Err(e) => RpcResponse::error(e.to_string()),
         },
@@ -1236,6 +1353,42 @@ fn dispatch(
                 }
             }
             Err(e) => RpcResponse::error(e.to_string()),
+        },
+        RpcMethod::EventListByIds { ids } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => {
+                    match service::svc_event_list_by_ids(&db, &recorded_by, &ids) {
+                        Ok(data) => RpcResponse::success(data),
+                        Err(e) => RpcResponse::error(e.to_string()),
+                    }
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::EventShow { prefix } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => {
+                    match service::svc_event_show(&db, &recorded_by, &prefix) {
+                        Ok(data) => RpcResponse::success(data),
+                        Err(e) => RpcResponse::error(e.to_string()),
+                    }
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::EventDeps { prefix, depth } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => {
+                    match service::svc_event_deps(&db, &recorded_by, &prefix, depth) {
+                        Ok(data) => RpcResponse::success(data),
+                        Err(e) => RpcResponse::error(e.to_string()),
+                    }
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
         },
 
         // ----- Subscription commands -----

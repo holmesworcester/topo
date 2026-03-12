@@ -123,7 +123,7 @@ fn all_registered_types_have_fixed_wire_size() {
     // and encoding produces a deterministic-length blob.
     let reg = registry();
     for code in 1u8..=29 {
-        if matches!(code, 3 | 4 | 11 | 13 | 15 | 17 | 19 | 23 | 29) {
+        if matches!(code, 3 | 4 | 11 | 13 | 15 | 17 | 19 | 20 | 21 | 23 | 29) {
             continue; // removed/unused gaps in type code allocation
         }
         let meta = reg.lookup(code);

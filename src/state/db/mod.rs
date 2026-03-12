@@ -1,4 +1,5 @@
 pub mod egress_queue;
+pub mod event_display;
 pub mod health;
 pub mod intro;
 pub mod local_client_ops;
@@ -99,6 +100,7 @@ use crate::tuning::low_mem_mode;
 pub fn ensure_infra_schema(conn: &Connection) -> SqliteResult<()> {
     wanted::ensure_schema(conn)?;
     store::ensure_schema(conn)?;
+    event_display::ensure_schema(conn)?;
     project_queue::ensure_schema(conn)?;
     egress_queue::ensure_schema(conn)?;
     health::ensure_schema(conn)?;

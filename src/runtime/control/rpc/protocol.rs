@@ -167,6 +167,19 @@ pub enum RpcMethod {
     },
     /// List all events for the active workspace with parsed fields and decryption.
     EventList,
+    /// List specific events by their IDs.
+    EventListByIds {
+        ids: Vec<String>,
+    },
+    /// Show events matching an ID prefix.
+    EventShow {
+        prefix: String,
+    },
+    /// Reverse dependency tree for an event matching prefix.
+    EventDeps {
+        prefix: String,
+        depth: usize,
+    },
     /// Run intro: connect peer_a and peer_b via this node.
     Intro {
         peer_a: String,

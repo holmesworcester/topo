@@ -183,6 +183,7 @@ where
 pub fn spawn_data_receiver<R>(
     mut data_recv: R,
     ingest_tx: mpsc::Sender<IngestItem>,
+    events_received: Arc<AtomicU64>,
     bytes_received: Arc<AtomicU64>,
     recorded_by: String,
     source_tag: String,
@@ -213,6 +214,7 @@ where
                 msg = data_recv.recv() => {
                     match msg {
                         Ok(Frame::Event { blob }) => {
+                            events_received.fetch_add(1, Ordering::Relaxed);
                             bytes_received.fetch_add(blob.len() as u64, Ordering::Relaxed);
                             max_blob_size = max_blob_size.max(blob.len());
                             let event_id = hash_event(&blob);

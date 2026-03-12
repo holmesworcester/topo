@@ -573,6 +573,24 @@ enum EventAction {
     Tree,
     /// List all events with their dependencies (requires running daemon)
     List,
+    /// Show or set event display mode (tree, list, off)
+    Display {
+        /// Mode to set (tree, list, off). Omit to show current mode.
+        mode: Option<String>,
+    },
+    /// Show details for events matching an ID prefix
+    Show {
+        /// Event ID prefix (first few characters of base64 ID)
+        prefix: String,
+    },
+    /// Show reverse dependency tree for an event
+    Deps {
+        /// Event ID prefix (first few characters of base64 ID)
+        prefix: String,
+        /// Maximum traversal depth
+        #[arg(long, default_value = "5")]
+        depth: usize,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1173,13 +1191,73 @@ fn run_event_action(
         EventAction::Tree => {
             let data = rpc_require_daemon(db, socket, RpcMethod::EventList)?;
             let resp: service::EventListResponse = serde_json::from_value(data)?;
-            print_event_tree(&resp.events);
+            topo::display::print_event_tree(&resp.events);
             Ok(())
         }
         EventAction::List => {
             let data = rpc_require_daemon(db, socket, RpcMethod::EventList)?;
             let resp: service::EventListResponse = serde_json::from_value(data)?;
-            print_event_list(&resp.events);
+            topo::display::print_event_list(&resp.events);
+            Ok(())
+        }
+        EventAction::Display { mode } => {
+            let conn = open_connection(db).map_err(|e| friendly_db_error(db, e))?;
+            topo::db::event_display::ensure_schema(&conn)?;
+            match mode {
+                None => {
+                    let current = topo::db::event_display::load_mode(&conn)?;
+                    println!("{}", current.as_str());
+                }
+                Some(m) => match topo::db::event_display::EventDisplayMode::from_str(&m) {
+                    Some(mode) => {
+                        topo::db::event_display::save_mode(&conn, mode)?;
+                        println!("Event display mode set to: {}", mode.as_str());
+                    }
+                    None => {
+                        return Err(format!(
+                            "Invalid display mode '{}'. Use: tree, list, off",
+                            m
+                        )
+                        .into());
+                    }
+                },
+            }
+            Ok(())
+        }
+        EventAction::Show { prefix } => {
+            let data = rpc_require_daemon(
+                db,
+                socket,
+                RpcMethod::EventShow { prefix },
+            )?;
+            let resp: service::EventListResponse = serde_json::from_value(data)?;
+            if resp.events.is_empty() {
+                println!("No events matching that prefix.");
+            } else {
+                if resp.events.len() > 1 {
+                    println!("({} matches)\n", resp.events.len());
+                }
+                topo::display::print_event_list(&resp.events);
+            }
+            Ok(())
+        }
+        EventAction::Deps { prefix, depth } => {
+            let data = rpc_require_daemon(
+                db,
+                socket,
+                RpcMethod::EventDeps { prefix, depth },
+            )?;
+            let root_id = data["root_id"]
+                .as_str()
+                .unwrap_or("")
+                .to_string();
+            let items: Vec<service::EventListItem> =
+                serde_json::from_value(data["events"].clone()).unwrap_or_default();
+            if items.is_empty() {
+                println!("No events matching that prefix.");
+            } else {
+                topo::display::print_deps_tree(&root_id, &items, depth);
+            }
             Ok(())
         }
     }
@@ -2011,6 +2089,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 eprintln!("warning: workspace created but auto-invite failed: {}", err);
             }
 
+            maybe_show_created_events(db, &data);
+
             // If --public-addr was given, create an additional invite with that address
             if let Some(addr) = public_addr {
                 let sock = target_socket_path(db, socket_override.as_deref());
@@ -2063,6 +2143,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 "  peer:    {}",
                 short_id(data["peer_shared_event_id"].as_str().unwrap_or(""))
             );
+            maybe_show_created_events(db, &data);
         }
 
         // ---------------------------------------------------------------
@@ -2126,6 +2207,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let event_id = data["event_id"].as_str().unwrap_or("");
             println!("Sent: {}", data["content"].as_str().unwrap_or(&content));
             println!("event_id:{}", event_id);
+            maybe_show_created_events(db, &data);
         }
 
         Commands::SendFile {
@@ -2149,6 +2231,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("Sent: {}", data["content"].as_str().unwrap_or(&content));
             println!("\u{1f4ce} {} ({})", filename, format_byte_size(file_size));
             println!("event_id:{}", event_id);
+            maybe_show_created_events(db, &data);
         }
 
         Commands::SaveFile {
@@ -2367,6 +2450,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 data["emoji"].as_str().unwrap_or(&emoji),
                 short
             );
+            maybe_show_created_events(db, &data);
         }
 
         Commands::DeleteMessage {
@@ -2605,6 +2689,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if let Some(num) = data["invite_ref"].as_u64() {
                 eprintln!("Created invite #{}", num);
             }
+            maybe_show_created_events(db, &data);
         }
 
         Commands::Link {
@@ -2623,6 +2708,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             if let Some(num) = data["invite_ref"].as_u64() {
                 eprintln!("Created device link #{}", num);
             }
+            maybe_show_created_events(db, &data);
         }
 
         Commands::AcceptLink { invite, devicename } => {
@@ -2635,6 +2721,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let peer_id = data["peer_id"].as_str().unwrap_or("");
             println!("Accepted device link");
             println!("  peer_id: {}", short_id(peer_id));
+            maybe_show_created_events(db, &data);
         }
 
         Commands::Identity => {
@@ -2975,226 +3062,43 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 }
 
 // ---------------------------------------------------------------------------
-// Display helpers (CLI-only formatting, not business logic)
+// Display helpers — delegated to display module
 // ---------------------------------------------------------------------------
 
 fn short_id(b64: &str) -> &str {
-    &b64[..b64.len().min(8)]
+    topo::display::short_id(b64)
 }
 
-// ---------------------------------------------------------------------------
-// event-tree / event-list helpers
-// ---------------------------------------------------------------------------
+/// Show created events from a server response, respecting the display mode setting.
+fn maybe_show_created_events(db: &str, data: &serde_json::Value) {
+    use topo::db::event_display::{self, EventDisplayMode};
 
-fn print_event_tree(events: &[service::EventListItem]) {
-    use std::collections::{HashMap, HashSet};
-
+    let Some(events_json) = data.get("created_events") else {
+        return;
+    };
+    let Ok(events): Result<Vec<service::EventListItem>, _> =
+        serde_json::from_value(events_json.clone())
+    else {
+        return;
+    };
     if events.is_empty() {
-        println!("(no events)");
         return;
     }
 
-    let id_set: HashSet<&str> = events.iter().map(|e| e.id.as_str()).collect();
-
-    // For each event, pick the first dep as tree parent (if it exists in the db).
-    // Events with no valid tree parent are roots.
-    let mut parent_of: HashMap<&str, &str> = HashMap::new();
-    for e in events {
-        for (_, dep_id) in &e.deps {
-            if id_set.contains(dep_id.as_str()) {
-                parent_of.insert(&e.id, dep_id.as_str());
-                break;
-            }
+    // Load display mode from infra DB (direct read, no RPC).
+    let mode = match open_connection(db) {
+        Ok(conn) => {
+            let _ = event_display::ensure_schema(&conn);
+            event_display::load_mode(&conn).unwrap_or(EventDisplayMode::Tree)
         }
-    }
-
-    // Build children map.
-    let mut children: HashMap<&str, Vec<&str>> = HashMap::new();
-    for e in events {
-        if let Some(&parent) = parent_of.get(e.id.as_str()) {
-            children.entry(parent).or_default().push(&e.id);
-        }
-    }
-
-    // Roots: events with no tree parent.
-    let roots: Vec<&str> = events
-        .iter()
-        .filter(|e| !parent_of.contains_key(e.id.as_str()))
-        .map(|e| e.id.as_str())
-        .collect();
-
-    let event_map: HashMap<&str, &service::EventListItem> =
-        events.iter().map(|e| (e.id.as_str(), e)).collect();
-
-    // Print each root tree, then lone roots.
-    let mut first = true;
-    for root in &roots {
-        let has_children = children.contains_key(root);
-        if !first && has_children {
-            println!();
-        }
-        print_tree_node(root, "", true, true, &children, &event_map, &parent_of);
-        if has_children {
-            first = false;
-        }
-    }
-
-    println!(
-        "\n{} events. Tree parent = first dependency; siblings in insertion order.",
-        events.len()
-    );
-}
-
-fn print_tree_node(
-    id: &str,
-    prefix: &str,
-    is_last: bool,
-    is_root: bool,
-    children: &std::collections::HashMap<&str, Vec<&str>>,
-    event_map: &std::collections::HashMap<&str, &service::EventListItem>,
-    parent_of: &std::collections::HashMap<&str, &str>,
-) {
-    let info = event_map[id];
-    let connector = if is_root {
-        ""
-    } else if is_last {
-        "└── "
-    } else {
-        "├── "
+        Err(_) => EventDisplayMode::Tree,
     };
 
-    let short = short_id(&info.id);
-
-    // Collect cross-ref deps (deps that aren't the tree parent).
-    let tree_parent = parent_of.get(id).copied();
-    let cross_refs: Vec<String> = info
-        .deps
-        .iter()
-        .filter(|(_, dep_id)| Some(dep_id.as_str()) != tree_parent)
-        .map(|(field, dep_id)| format!("{}: {}", field, short_id(dep_id)))
-        .collect();
-
-    let suffix = if !cross_refs.is_empty() {
-        format!("  [{}]", cross_refs.join(", "))
-    } else if tree_parent.is_none() {
-        " \u{2190} root".to_string()
-    } else {
-        String::new()
-    };
-
-    println!(
-        "{}{}({}) {}{}",
-        prefix, connector, short, info.event_type, suffix
-    );
-
-    if let Some(kids) = children.get(id) {
-        let new_prefix = if is_root {
-            String::new()
-        } else if is_last {
-            format!("{}    ", prefix)
-        } else {
-            format!("{}\u{2502}   ", prefix)
-        };
-        for (i, kid) in kids.iter().enumerate() {
-            let kid_is_last = i == kids.len() - 1;
-            print_tree_node(
-                kid,
-                &new_prefix,
-                kid_is_last,
-                false,
-                children,
-                event_map,
-                parent_of,
-            );
-        }
+    match mode {
+        EventDisplayMode::Tree => topo::display::print_event_tree(&events),
+        EventDisplayMode::List => topo::display::print_event_list(&events),
+        EventDisplayMode::Off => {}
     }
-}
-
-fn format_timestamp_ms(ms: u64) -> String {
-    // Reject zero or clearly bogus timestamps (before 2020 or after 2100).
-    if ms == 0 || ms < 1_577_836_800_000 || ms > 4_102_444_800_000 {
-        return "\u{2014}".to_string(); // em-dash
-    }
-    let secs = (ms / 1000) as i64;
-    let now_secs = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs() as i64;
-
-    // Use libc localtime_r for formatting without pulling in chrono.
-    let mut tm = std::mem::MaybeUninit::<libc::tm>::uninit();
-    let tm = unsafe {
-        libc::localtime_r(&secs as *const i64, tm.as_mut_ptr());
-        tm.assume_init()
-    };
-
-    let mut buf = [0u8; 64];
-    let now_year = {
-        let mut now_tm = std::mem::MaybeUninit::<libc::tm>::uninit();
-        unsafe {
-            libc::localtime_r(&now_secs as *const i64, now_tm.as_mut_ptr());
-            now_tm.assume_init().tm_year
-        }
-    };
-    let same_year = tm.tm_year == now_year;
-    let fmt: &[u8] = if same_year {
-        b"%b %d %H:%M:%S\0"
-    } else {
-        b"%Y %b %d %H:%M:%S\0"
-    };
-    let len = unsafe {
-        libc::strftime(
-            buf.as_mut_ptr() as *mut libc::c_char,
-            buf.len(),
-            fmt.as_ptr() as *const libc::c_char,
-            &tm,
-        )
-    };
-    String::from_utf8_lossy(&buf[..len]).to_string()
-}
-
-fn print_event_list(events: &[service::EventListItem]) {
-    if events.is_empty() {
-        println!("(no events)");
-        return;
-    }
-
-    for e in events {
-        let short = format!("({})", short_id(&e.id));
-        let ts = format_timestamp_ms(e.created_at_ms);
-
-        let deps_str = if e.deps.is_empty() {
-            String::new()
-        } else {
-            let d = e
-                .deps
-                .iter()
-                .map(|(field, dep_id)| format!("{}: ({})", field, short_id(dep_id)))
-                .collect::<Vec<_>>()
-                .join(", ");
-            format!("  deps: {}", d)
-        };
-
-        println!("{} {} {}  [{} bytes]", short, e.event_type, ts, e.blob_len);
-        if !deps_str.is_empty() {
-            println!("{}", deps_str);
-        }
-        for (k, v) in &e.fields {
-            println!("  {}: {}", k, v);
-        }
-
-        if let Some(dec) = &e.decrypted_inner {
-            println!("  --- decrypted: {} ---", dec.inner_type);
-            for (k, v) in &dec.fields {
-                println!("    {}: {}", k, v);
-            }
-        } else if e.event_type == "encrypted" {
-            println!("  (key not available)");
-        }
-
-        println!();
-    }
-    println!("{} events. Sorted by insertion order.", events.len());
 }
 
 fn print_sync_log_config(cfg: &sync_log::SyncLogConfig) {

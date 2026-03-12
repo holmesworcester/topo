@@ -5753,3 +5753,486 @@ fn test_cli_sub_watch_escapes_multiline_content() {
         );
     }
 }
+
+// ---------------------------------------------------------------------------
+// Event display enhancements
+// ---------------------------------------------------------------------------
+
+#[test]
+fn test_cli_event_display_default_is_tree() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("display_default.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+
+    // event display (no args) reads directly from DB — no daemon needed.
+    let out = Command::new(bin())
+        .args(["--db", &db, "event", "display"])
+        .output()
+        .expect("event display command");
+    assert!(
+        out.status.success(),
+        "event display failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("tree"),
+        "default display mode should be 'tree', got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_cli_event_display_set_and_get() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("display_set.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+
+    // Set to list
+    let set_list = Command::new(bin())
+        .args(["--db", &db, "event", "display", "list"])
+        .output()
+        .expect("event display list");
+    assert!(set_list.status.success());
+    let stdout = String::from_utf8_lossy(&set_list.stdout);
+    assert!(stdout.contains("list"), "should confirm 'list', got:\n{}", stdout);
+
+    // Get should now return list
+    let get = Command::new(bin())
+        .args(["--db", &db, "event", "display"])
+        .output()
+        .expect("event display get");
+    assert!(get.status.success());
+    let stdout = String::from_utf8_lossy(&get.stdout);
+    assert!(stdout.contains("list"), "should return 'list', got:\n{}", stdout);
+
+    // Set to off
+    let set_off = Command::new(bin())
+        .args(["--db", &db, "event", "display", "off"])
+        .output()
+        .expect("event display off");
+    assert!(set_off.status.success());
+
+    // Set back to tree
+    let set_tree = Command::new(bin())
+        .args(["--db", &db, "event", "display", "tree"])
+        .output()
+        .expect("event display tree");
+    assert!(set_tree.status.success());
+    let stdout = String::from_utf8_lossy(&set_tree.stdout);
+    assert!(stdout.contains("tree"), "should confirm 'tree', got:\n{}", stdout);
+}
+
+#[test]
+fn test_cli_event_show_by_prefix() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("event_show.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    // Get event list to find a prefix
+    let list_out = Command::new(bin())
+        .args(["--db", &db, "event", "list"])
+        .output()
+        .expect("event list");
+    assert!(list_out.status.success());
+    let list_stdout = String::from_utf8_lossy(&list_out.stdout);
+
+    // Extract a short ID from the first event line: "(XXXXXXXX) type ..."
+    let first_id = list_stdout
+        .lines()
+        .find_map(|line| {
+            let start = line.find('(')?;
+            let end = line.find(')')?;
+            Some(line[start + 1..end].to_string())
+        })
+        .expect("should have at least one event in list output");
+
+    // Use first 4 chars as prefix
+    let prefix = &first_id[..4.min(first_id.len())];
+    let show_out = Command::new(bin())
+        .args(["--db", &db, "event", "show", prefix])
+        .output()
+        .expect("event show command");
+    assert!(
+        show_out.status.success(),
+        "event show failed: {}",
+        String::from_utf8_lossy(&show_out.stderr)
+    );
+    let show_stdout = String::from_utf8_lossy(&show_out.stdout);
+    assert!(
+        show_stdout.contains(prefix),
+        "event show output should contain the prefix '{}', got:\n{}",
+        prefix,
+        show_stdout
+    );
+}
+
+#[test]
+fn test_cli_event_show_no_match() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("event_show_none.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    let out = Command::new(bin())
+        .args(["--db", &db, "event", "show", "ZZZZZZZ_no_match"])
+        .output()
+        .expect("event show command");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("No events matching"),
+        "event show should report no match, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_cli_event_deps_shows_reverse_tree() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("event_deps.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    // Get event list to find a peer_shared event (has deps)
+    let list_out = Command::new(bin())
+        .args(["--db", &db, "event", "list"])
+        .output()
+        .expect("event list");
+    let list_stdout = String::from_utf8_lossy(&list_out.stdout);
+
+    // Find a peer_shared event and its ID
+    let peer_shared_id = list_stdout
+        .lines()
+        .find_map(|line| {
+            if line.contains("peer_shared") && line.contains("(") {
+                let start = line.find('(')?;
+                let end = line.find(')')?;
+                Some(line[start + 1..end].to_string())
+            } else {
+                None
+            }
+        })
+        .expect("should have a peer_shared event");
+
+    let deps_out = Command::new(bin())
+        .args(["--db", &db, "event", "deps", &peer_shared_id])
+        .output()
+        .expect("event deps command");
+    assert!(
+        deps_out.status.success(),
+        "event deps failed: {}",
+        String::from_utf8_lossy(&deps_out.stderr)
+    );
+    let deps_stdout = String::from_utf8_lossy(&deps_out.stdout);
+
+    // Should contain the root event type
+    assert!(
+        deps_stdout.contains("peer_shared"),
+        "deps output should contain peer_shared, got:\n{}",
+        deps_stdout
+    );
+    // Should show dependency relationships
+    assert!(
+        deps_stdout.contains("├──") || deps_stdout.contains("└──"),
+        "deps output should show tree connectors, got:\n{}",
+        deps_stdout
+    );
+    // Should contain 'root' markers for root events
+    assert!(
+        deps_stdout.contains("root"),
+        "deps output should mark root events, got:\n{}",
+        deps_stdout
+    );
+    // Should show unique events footer
+    assert!(
+        deps_stdout.contains("unique events"),
+        "deps output should show unique events count, got:\n{}",
+        deps_stdout
+    );
+}
+
+#[test]
+fn test_cli_event_deps_depth_limit() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("event_deps_depth.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    // Find a peer_shared event
+    let list_out = Command::new(bin())
+        .args(["--db", &db, "event", "list"])
+        .output()
+        .expect("event list");
+    let list_stdout = String::from_utf8_lossy(&list_out.stdout);
+
+    let peer_shared_id = list_stdout
+        .lines()
+        .find_map(|line| {
+            if line.contains("peer_shared") && line.contains("(") {
+                let start = line.find('(')?;
+                let end = line.find(')')?;
+                Some(line[start + 1..end].to_string())
+            } else {
+                None
+            }
+        })
+        .expect("should have a peer_shared event");
+
+    // depth=1 should truncate
+    let d1 = Command::new(bin())
+        .args([
+            "--db", &db, "event", "deps", &peer_shared_id, "--depth", "1",
+        ])
+        .output()
+        .expect("event deps --depth 1");
+    assert!(d1.status.success());
+    let d1_stdout = String::from_utf8_lossy(&d1.stdout);
+
+    // depth=5 should show more
+    let d5 = Command::new(bin())
+        .args([
+            "--db", &db, "event", "deps", &peer_shared_id, "--depth", "5",
+        ])
+        .output()
+        .expect("event deps --depth 5");
+    assert!(d5.status.success());
+    let d5_stdout = String::from_utf8_lossy(&d5.stdout);
+
+    // depth=5 output should be at least as long as depth=1
+    assert!(
+        d5_stdout.lines().count() >= d1_stdout.lines().count(),
+        "depth=5 ({} lines) should be >= depth=1 ({} lines)",
+        d5_stdout.lines().count(),
+        d1_stdout.lines().count()
+    );
+}
+
+#[test]
+fn test_cli_send_shows_created_events_with_display_tree() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("send_display.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+    ensure_active_peer(&db, Duration::from_secs(10));
+
+    // Ensure display mode is tree (default)
+    let _ = Command::new(bin())
+        .args(["--db", &db, "event", "display", "tree"])
+        .output();
+
+    let send_out = Command::new(bin())
+        .args(["--db", &db, "send", "display-test-msg"])
+        .output()
+        .expect("send command");
+    assert!(
+        send_out.status.success(),
+        "send failed: {}",
+        String::from_utf8_lossy(&send_out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&send_out.stdout);
+
+    // Should contain the standard "Sent:" line
+    assert!(stdout.contains("Sent:"), "should show Sent:, got:\n{}", stdout);
+    // Should show the event_id line
+    assert!(
+        stdout.contains("event_id:"),
+        "should show event_id:, got:\n{}",
+        stdout
+    );
+    // Should show the created event with decrypted content
+    assert!(
+        stdout.contains("encrypted") || stdout.contains("display-test-msg"),
+        "should show created event tree or message content, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_cli_send_suppressed_with_display_off() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("send_display_off.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+    ensure_active_peer(&db, Duration::from_secs(10));
+
+    // Set display mode to off
+    let _ = Command::new(bin())
+        .args(["--db", &db, "event", "display", "off"])
+        .output();
+
+    let send_out = Command::new(bin())
+        .args(["--db", &db, "send", "quiet-msg"])
+        .output()
+        .expect("send command");
+    assert!(send_out.status.success());
+    let stdout = String::from_utf8_lossy(&send_out.stdout);
+
+    // Should contain the standard output
+    assert!(stdout.contains("Sent:"), "should show Sent:, got:\n{}", stdout);
+    // Should NOT contain tree connectors or event count footer
+    assert!(
+        !stdout.contains("events."),
+        "display=off should suppress event display, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_cli_event_tree_shows_annotations() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("annotations.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    let out = Command::new(bin())
+        .args(["--db", &db, "event", "tree"])
+        .output()
+        .expect("event tree command");
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Check that annotations (em-dash phrases) are present
+    assert!(
+        stdout.contains("creates the workspace"),
+        "should show workspace annotation, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("registers the user"),
+        "should show user annotation, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("registers a device"),
+        "should show peer_shared annotation, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("grants admin rights"),
+        "should show admin annotation, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("stores a local signing key"),
+        "should show peer_secret annotation, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_cli_create_workspace_shows_created_events() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("cw_display.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let _daemon = start_daemon(&db);
+
+    let out = Command::new(bin())
+        .args([
+            "--db", &db, "create-workspace",
+            "--workspace-name", "test",
+            "--username", "alice",
+            "--device-name", "dev",
+        ])
+        .output()
+        .expect("create-workspace command");
+    assert!(
+        out.status.success(),
+        "create-workspace failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+
+    // Should show the standard output
+    assert!(
+        stdout.contains("peer_id:"),
+        "should show peer_id, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("workspace_id:"),
+        "should show workspace_id, got:\n{}",
+        stdout
+    );
+    // Should show created events tree with annotations
+    assert!(
+        stdout.contains("creates the workspace"),
+        "should show workspace event annotation, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("events."),
+        "should show event count footer, got:\n{}",
+        stdout
+    );
+}

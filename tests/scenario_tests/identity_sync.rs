@@ -334,10 +334,12 @@ async fn test_identity_then_messaging() {
     let alice_chain = bootstrap_peer(&alice);
     let bob_join = join_workspace(&bob, &alice_chain, &alice);
 
-    // Set signing keys and author_id so create_message works
+    // Set signing keys, author_id, and workspace_id so create_message works
+    alice.workspace_id = alice_chain.workspace_id;
     alice.peer_shared_event_id = Some(alice_chain.peer_shared_eid);
     alice.peer_shared_signing_key = Some(alice_chain.peer_shared_key.clone());
     alice.author_id = alice_chain.user_eid;
+    bob.workspace_id = alice_chain.workspace_id;
     bob.peer_shared_event_id = Some(bob_join.peer_shared_eid);
     bob.peer_shared_signing_key = Some(bob_join.peer_shared_key.clone());
     bob.author_id = bob_join.user_eid;
@@ -355,6 +357,12 @@ async fn test_identity_then_messaging() {
     )
     .await;
     drop(sync);
+
+    // Both peers need the same content key to decrypt each other's messages.
+    let shared_key_bytes: [u8; 32] = [42u8; 32];
+    let shared_ts = 1_000_000_000_000u64;
+    alice.create_key_secret_deterministic(shared_key_bytes, shared_ts);
+    bob.create_key_secret_deterministic(shared_key_bytes, shared_ts);
 
     // Now both peers send messages
     alice.create_message("Hello from Alice");
