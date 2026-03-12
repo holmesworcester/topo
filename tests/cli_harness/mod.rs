@@ -8,8 +8,12 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use topo::testutil::DaemonGuard;
+
+const DAEMON_START_MAX_ATTEMPTS: usize = 8;
+const DAEMON_START_RETRY_BASE_MS: u64 = 100;
 
 // ---------------------------------------------------------------------------
 // Core utilities
@@ -29,6 +33,40 @@ pub fn temp_db() -> (tempfile::TempDir, String) {
     let dir = tempfile::tempdir().unwrap();
     let db = dir.path().join("test.db").to_str().unwrap().to_string();
     (dir, db)
+}
+
+fn hold_network_test_binary_lock() {
+    static LOCK_HELD: OnceLock<()> = OnceLock::new();
+    LOCK_HELD.get_or_init(|| {
+        let lock_path = std::env::temp_dir().join("topo-network-tests.lock");
+        let file = std::fs::OpenOptions::new()
+            .create(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap_or_else(|err| {
+                panic!(
+                    "failed to open cross-process network test lock {}: {}",
+                    lock_path.display(),
+                    err
+                )
+            });
+        let rc = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
+        if rc != 0 {
+            let err = std::io::Error::last_os_error();
+            panic!(
+                "failed to acquire cross-process network test lock {}: {}",
+                lock_path.display(),
+                err
+            );
+        }
+
+        // Intentionally leak the locked file so the advisory lock is held for
+        // the lifetime of this test binary. This prevents other daemon-heavy
+        // test binaries from running concurrently under the default cargo test
+        // scheduler and creating spurious transport timeouts.
+        let _ = Box::leak(Box::new(file));
+    });
 }
 
 pub struct LocalTenantInfo {
@@ -120,6 +158,12 @@ fn read_daemon_log(path: &Option<std::path::PathBuf>) -> String {
         .unwrap_or_default()
 }
 
+fn daemon_inherit_stdio_env() -> bool {
+    std::env::var("P7_TEST_DAEMON_INHERIT_STDIO")
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(false)
+}
+
 /// Start a daemon with default options (random port, suppressed I/O).
 pub fn start_daemon(db: &str) -> DaemonGuard {
     start_daemon_with_options(db, &DaemonOptions::default())
@@ -138,6 +182,7 @@ pub fn start_daemon_on_port(db: &str, port: u16) -> DaemonGuard {
 
 /// Start a daemon with full control over options.
 pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard {
+    hold_network_test_binary_lock();
     let socket = socket_path_for_db(db);
     let requested_bind_addr = match opts.bind_port {
         Some(port) => format!("127.0.0.1:{}", port),
@@ -145,12 +190,13 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
     };
     let mut retry_with_ephemeral_bind = false;
 
-    for attempt in 0..8 {
+    for attempt in 0..DAEMON_START_MAX_ATTEMPTS {
         let bind_addr = if retry_with_ephemeral_bind {
             "127.0.0.1:0".to_string()
         } else {
             requested_bind_addr.clone()
         };
+        let inherit_stdio = opts.inherit_stdio || daemon_inherit_stdio_env();
         let mut cmd = Command::new(bin());
         cmd.arg("--db")
             .arg(db)
@@ -171,7 +217,7 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
         if let Some(ref path) = opts.stdout_file {
             let f = std::fs::File::create(path).expect("create stdout log file");
             cmd.stdout(f);
-        } else if opts.inherit_stdio {
+        } else if inherit_stdio {
             cmd.stdout(Stdio::inherit());
         } else {
             cmd.stdout(Stdio::null());
@@ -180,7 +226,7 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
         if let Some(ref path) = opts.stderr_file {
             let f = std::fs::File::create(path).expect("create stderr log file");
             cmd.stderr(f);
-        } else if opts.inherit_stdio {
+        } else if inherit_stdio {
             cmd.stderr(Stdio::inherit());
         } else {
             cmd.stderr(Stdio::null());
@@ -205,9 +251,11 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
             if socket.exists() {
                 wait_for_daemon_stopped(db, Duration::from_secs(2));
             }
-            if attempt < 7 {
+            if attempt + 1 < DAEMON_START_MAX_ATTEMPTS {
                 retry_with_ephemeral_bind |= opts.bind_port.is_some();
-                std::thread::sleep(Duration::from_millis(100));
+                let backoff_ms =
+                    DAEMON_START_RETRY_BASE_MS.saturating_mul((attempt as u64).saturating_add(1));
+                std::thread::sleep(Duration::from_millis(backoff_ms));
                 continue;
             }
             panic!(
@@ -225,9 +273,11 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
             if socket.exists() {
                 wait_for_daemon_stopped(db, Duration::from_secs(2));
             }
-            if attempt < 7 {
+            if attempt + 1 < DAEMON_START_MAX_ATTEMPTS {
                 retry_with_ephemeral_bind |= opts.bind_port.is_some();
-                std::thread::sleep(Duration::from_millis(100));
+                let backoff_ms =
+                    DAEMON_START_RETRY_BASE_MS.saturating_mul((attempt as u64).saturating_add(1));
+                std::thread::sleep(Duration::from_millis(backoff_ms));
                 continue;
             }
             panic!(
@@ -1510,36 +1560,4 @@ pub fn save_file(db: &str, file_target: &str, output_path: &str) -> Output {
         .expect("failed to run save-file")
 }
 
-pub fn save_file_eventually(db: &str, file_target: &str, output_path: &str, timeout: Duration) {
-    let start = Instant::now();
-    loop {
-        let output = save_file(db, file_target, output_path);
-        if output.status.success() {
-            return;
-        }
-
-        let stderr = String::from_utf8_lossy(&output.stderr);
-        let retryable =
-            stderr.contains("file incomplete") || stderr.contains("invalid file number");
-        assert!(
-            retryable && start.elapsed() < timeout,
-            "save-file failed before {:?}: {}",
-            timeout,
-            stderr.trim()
-        );
-        std::thread::sleep(Duration::from_millis(200));
-    }
-}
-
-/// Return `topo assert-eventually` output without asserting success.
-pub fn topo_assert_eventually(db: &str, predicate: &str, timeout_ms: u64) -> Output {
-    topo_cmd(
-        db,
-        &[
-            "assert-eventually",
-            predicate,
-            "--timeout-ms",
-            &timeout_ms.to_string(),
-        ],
-    )
-}
+pub fn save_file_eventually(db: &str, file

@@ -11,6 +11,7 @@ use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
+use crate::db::store::lookup_workspace_id;
 use crate::db::transport_trust::record_transport_binding;
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::session::windowing::reset_outbound_window_state;
@@ -26,8 +27,8 @@ use super::supervisor::{
     SessionTenantResolver,
 };
 use super::{
-    current_timestamp_ms, peer_fingerprint_from_hex, IntroSpawnerFn, CONNECT_RETRY_DELAY,
-    ENDPOINT_TTL_MS, SYNC_SESSION_TIMEOUT_SECS,
+    claim_live_connection_slot, current_timestamp_ms, peer_fingerprint_from_hex, IntroSpawnerFn,
+    CONNECT_RETRY_DELAY, ENDPOINT_TTL_MS, SYNC_SESSION_TIMEOUT_SECS,
 };
 
 const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
@@ -46,16 +47,15 @@ const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
 /// When `client_config` is `Some`, outbound dials present the correct per-tenant
 /// cert and tenant-scoped trust.
 ///
-/// The initiator participates in coordinated multi-source download: need_ids
-/// are reported to a coordinator thread that assigns events via greedy load
-/// balancing across all peers sharing the same coordinator. For single-peer
-/// scenarios the coordinator degenerates to pass-through assignment.
+/// The initiator participates in tenant-scoped coordinated multi-source pull:
+/// discovery persists durable `wanted` state, and a shared in-memory
+/// coordinator assigns pull requests across all peers sharing this connect
+/// context.
 pub async fn connect_loop(
     db_path: &str,
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
-    target_remote_transport_fingerprint: &str,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
@@ -69,7 +69,6 @@ pub async fn connect_loop(
         recorded_by,
         endpoint,
         remote,
-        target_remote_transport_fingerprint,
         client_config,
         intro_spawner,
         ingest,
@@ -84,7 +83,6 @@ pub async fn connect_loop_with_coordination(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
-    target_remote_transport_fingerprint: &str,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
@@ -95,7 +93,6 @@ pub async fn connect_loop_with_coordination(
         recorded_by,
         endpoint,
         remote,
-        target_remote_transport_fingerprint,
         client_config,
         intro_spawner,
         ingest,
@@ -111,19 +108,17 @@ pub async fn connect_loop_with_coordination_until_cancel(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
-    target_remote_transport_fingerprint: &str,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     coordination_manager: Arc<CoordinationManager>,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    connect_loop_with_coordination_until_cancel_with_target_fingerprint_and_fallback(
+    connect_loop_with_coordination_until_cancel_with_fallback(
         db_path,
         recorded_by,
         endpoint,
         remote,
-        target_remote_transport_fingerprint.to_string(),
         client_config,
         intro_spawner,
         ingest,
@@ -141,36 +136,6 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
-    target_remote_transport_fingerprint: &str,
-    client_config: Option<TransportClientConfig>,
-    intro_spawner: IntroSpawnerFn,
-    ingest: IngestFns,
-    coordination_manager: Arc<CoordinationManager>,
-    shutdown: CancellationToken,
-    bootstrap_fallback_client_config: Option<TransportClientConfig>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    connect_loop_with_coordination_until_cancel_with_target_fingerprint_and_fallback(
-        db_path,
-        recorded_by,
-        endpoint,
-        remote,
-        target_remote_transport_fingerprint.to_string(),
-        client_config,
-        intro_spawner,
-        ingest,
-        coordination_manager,
-        shutdown,
-        bootstrap_fallback_client_config,
-    )
-    .await
-}
-
-pub(crate) async fn connect_loop_with_coordination_until_cancel_with_target_fingerprint_and_fallback(
-    db_path: &str,
-    recorded_by: &str,
-    endpoint: TransportEndpoint,
-    remote: SocketAddr,
-    target_remote_transport_fingerprint: String,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
@@ -185,10 +150,9 @@ pub(crate) async fn connect_loop_with_coordination_until_cancel_with_target_fing
     // sessions on this connect loop.
     let shared_ingest = spawn_shared_ingest_writer(db_path, ingest);
 
-    // Register this connect loop's peer before starting sessions.
-    // The PeerCoord is reused across reconnect sessions — in the streaming
-    // ownership model, only peer_idx and total_peers matter (no coordinator
-    // channels), so reuse is safe.
+    // Register this connect loop's peer before starting sessions. The handle
+    // is reused across reconnect sessions and carries the bounded in-memory
+    // request state used by the shared pull coordinator.
     let coordination = coordination_manager.register_peer();
 
     // Use LocalSet so the intro listener (spawn_intro_listener uses spawn_local)
@@ -205,7 +169,6 @@ pub(crate) async fn connect_loop_with_coordination_until_cancel_with_target_fing
             shared_ingest,
             coordination,
             shutdown,
-            target_remote_transport_fingerprint,
             bootstrap_fallback_client_config,
         ))
         .await
@@ -222,7 +185,6 @@ pub async fn connect_loop_with_shared_ingest(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
-    target_remote_transport_fingerprint: &str,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     coordination: Arc<crate::sync::session::coordinator::PeerCoord>,
@@ -233,7 +195,6 @@ pub async fn connect_loop_with_shared_ingest(
         recorded_by,
         endpoint,
         remote,
-        target_remote_transport_fingerprint,
         intro_spawner,
         ingest,
         coordination,
@@ -250,7 +211,6 @@ pub async fn connect_loop_with_shared_ingest_until_cancel(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
-    target_remote_transport_fingerprint: &str,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     coordination: Arc<crate::sync::session::coordinator::PeerCoord>,
@@ -272,7 +232,6 @@ pub async fn connect_loop_with_shared_ingest_until_cancel(
             shared_ingest,
             coordination,
             shutdown,
-            target_remote_transport_fingerprint.to_string(),
             None,
         ))
         .await
@@ -288,16 +247,16 @@ async fn connect_loop_inner(
     shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
     coordination: Arc<crate::sync::session::coordinator::PeerCoord>,
     shutdown: CancellationToken,
-    target_remote_transport_fingerprint: String,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let sni = outbound_sni_for_target(&target_remote_transport_fingerprint);
-    let initiator_handler = SyncSessionHandler::outbound(
-        db_path.to_string(),
-        SYNC_SESSION_TIMEOUT_SECS,
-        coordination,
-        shared_ingest.clone(),
-    );
+    // Look up workspace SNI for this tenant
+    let sni = {
+        let db = open_connection(db_path)?;
+        match lookup_workspace_id(&db, recorded_by) {
+            Some(ws_id) => crate::transport::multi_workspace::workspace_sni(&ws_id),
+            None => "localhost".to_string(),
+        }
+    };
     let mut has_connected_once = false;
     let mut announced_connecting = false;
     let mut consecutive_stale_dial_failures: u32 = 0;
@@ -367,17 +326,6 @@ async fn connect_loop_inner(
         warning_gate.clear();
         let provider = dial_outcome.provider;
         let used_bootstrap_fallback = dial_outcome.used_bootstrap_fallback;
-        let actual_remote_transport_fingerprint = provider.peer_id().to_string();
-        if actual_remote_transport_fingerprint != target_remote_transport_fingerprint {
-            provider
-                .connection()
-                .close(1u32.into(), b"wrong remote transport fingerprint");
-            return Err(ConnectionLifecycleError::DialTrustRejected(format!(
-                "target fingerprint mismatch for {remote}: expected {} got {}",
-                target_remote_transport_fingerprint, actual_remote_transport_fingerprint
-            ))
-            .into());
-        }
         let connection = provider.connection();
         let peer_id = provider.peer_id().to_string();
         let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
@@ -399,10 +347,42 @@ async fn connect_loop_inner(
                 continue;
             }
         };
+        let connection_lease = match claim_live_connection_slot(
+            db_path,
+            recorded_by,
+            &peer_id,
+            SessionDirection::Outbound,
+            connection.clone(),
+        ) {
+            super::LiveConnectionClaim::Acquired(lease) => Some(lease),
+            super::LiveConnectionClaim::Occupied(occupied) => {
+                info!(
+                    "Closing duplicate outbound connection to {} (active_direction={:?}, preferred_direction={:?})",
+                    peer_id,
+                    occupied.active_direction,
+                    occupied.preferred_direction
+                );
+                connection.close(0u32.into(), b"duplicate peer connection");
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = occupied.released.notified() => {}
+                    _ = tokio::time::sleep(CONNECT_RETRY_DELAY) => {}
+                }
+                continue;
+            }
+        };
         info!(
             "Connected to {} on connection {}",
             peer_id,
             connection.stable_id()
+        );
+        // Handler state is scoped to this authenticated connection so any
+        // connection-lifetime sync state is dropped when the connection is.
+        let initiator_handler = SyncSessionHandler::outbound(
+            db_path.to_string(),
+            SYNC_SESSION_TIMEOUT_SECS,
+            coordination.clone(),
+            shared_ingest.clone(),
         );
         reset_outbound_window_state(db_path, &peer_id);
 
@@ -444,14 +424,9 @@ async fn connect_loop_inner(
             shared_ingest.clone(),
         );
 
-        // Keep session scope fixed to the planner-assigned tenant.
+        // Keep session scope pinned to the planner-assigned tenant.
         // Transport cert rotation can lag tenant scoping during bootstrap.
         let tenant_resolver = SessionTenantResolver::Fixed(recorded_by.to_string());
-        let max_sessions = if used_bootstrap_fallback {
-            Some(1usize)
-        } else {
-            None
-        };
         supervise_connection_sessions(
             db_path,
             &peer_id,
@@ -461,16 +436,13 @@ async fn connect_loop_inner(
             SessionDirection::Outbound,
             &tenant_resolver,
             shutdown.clone(),
-            max_sessions,
+            None,
         )
         .await;
+        drop(connection_lease);
     }
 
     Ok(())
-}
-
-fn outbound_sni_for_target(target_remote_transport_fingerprint: &str) -> String {
-    crate::transport::multi_workspace::transport_sni(target_remote_transport_fingerprint)
 }
 
 /// Produce a human-readable diagnosis for a connection failure.
@@ -631,17 +603,6 @@ async fn dial_provider_ongoing_first(
 mod tests {
     use super::*;
 
-    use crate::db::schema::create_tables;
-
-    fn setup_db() -> (tempfile::TempDir, String) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("connect-loop-test.db");
-        let db_path = db_path.to_string_lossy().to_string();
-        let conn = open_connection(&db_path).unwrap();
-        create_tables(&conn).unwrap();
-        (dir, db_path)
-    }
-
     #[test]
     fn fallback_policy_allows_typed_trust_rejection_with_fallback_cfg() {
         let err = ConnectionLifecycleError::DialTrustRejected(
@@ -706,17 +667,5 @@ mod tests {
             "handshake to 127.0.0.1:4433: trust_rejected".to_string(),
         );
         assert!(should_warn_for_connect_failure(false, &err));
-    }
-
-    #[test]
-    fn outbound_sni_uses_target_transport_fingerprint_when_present() {
-        let (_dir, _db_path) = setup_db();
-        let target_peer =
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
-        let sni = outbound_sni_for_target(&target_peer);
-        assert_eq!(
-            sni,
-            crate::transport::multi_workspace::transport_sni(&target_peer)
-        );
     }
 }

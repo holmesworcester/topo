@@ -9,8 +9,9 @@
 //!   observations so known peers remain dialable after bootstrap supersession.
 //! - **Discovery dispatch**: deduplicates mDNS-discovered peers and computes
 //!   connect/reconnect/skip actions (`PeerDispatcher`).
-//! - **Dispatch-key helpers**: deterministic keying for bootstrap + discovery
-//!   target streams so one runtime dispatcher can own lifecycle decisions.
+//! - **Dispatch-key helpers**: deterministic peer-keying for bootstrap +
+//!   discovery target streams so one runtime dispatcher can own lifecycle
+//!   decisions once the authenticated peer fingerprint is known.
 //!
 //! This consolidation satisfies R3/SC3 of the peering readability plan:
 //! one module is the source of truth for dial target planning.
@@ -81,10 +82,19 @@ impl PeerDispatcher {
     }
 }
 
-pub(crate) fn normalize_discovered_addr_for_local_bind(
+fn normalize_discovered_addr_for_local_bind_with_options(
     local_listen_ip: std::net::IpAddr,
     discovered: SocketAddr,
+    force_loopback: bool,
 ) -> SocketAddr {
+    if force_loopback && (local_listen_ip.is_unspecified() || local_listen_ip.is_loopback()) {
+        let loopback_ip = match local_listen_ip {
+            std::net::IpAddr::V6(_) => std::net::IpAddr::V6(std::net::Ipv6Addr::LOCALHOST),
+            _ => std::net::IpAddr::V4(std::net::Ipv4Addr::LOCALHOST),
+        };
+        return SocketAddr::new(loopback_ip, discovered.port());
+    }
+
     if local_listen_ip.is_loopback() && !discovered.ip().is_loopback() {
         SocketAddr::new(local_listen_ip, discovered.port())
     } else {
@@ -92,12 +102,26 @@ pub(crate) fn normalize_discovered_addr_for_local_bind(
     }
 }
 
+pub(crate) fn normalize_discovered_addr_for_local_bind(
+    local_listen_ip: std::net::IpAddr,
+    discovered: SocketAddr,
+) -> SocketAddr {
+    let force_loopback = std::env::var("P7_TEST_DISCOVERY_LOOPBACK")
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(false);
+    normalize_discovered_addr_for_local_bind_with_options(
+        local_listen_ip,
+        discovered,
+        force_loopback,
+    )
+}
+
 // ---------------------------------------------------------------------------
 // Unified dispatch-keying for bootstrap + discovery ingestion
 // ---------------------------------------------------------------------------
 
-pub(crate) fn bootstrap_dispatch_key(tenant_id: &str, invite_event_id: &str) -> String {
-    format!("{}@bootstrap:{}", tenant_id, invite_event_id)
+pub(crate) fn bootstrap_dispatch_key(tenant_id: &str, peer_id: &str) -> String {
+    discovery_dispatch_key(tenant_id, peer_id)
 }
 
 pub(crate) fn known_peer_dispatch_key(tenant_id: &str, peer_id: &str) -> String {
@@ -118,21 +142,21 @@ pub(crate) fn load_bootstrap_targets(
     tenant_ids: &[String],
 ) -> Result<Vec<(String, String, String, SocketAddr)>, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
-    let mut seen: HashSet<(String, String, String, SocketAddr)> = HashSet::new();
+    let mut seen: HashSet<(String, String, SocketAddr)> = HashSet::new();
     let mut out = Vec::new();
     for tenant_id in tenant_ids {
         for target in list_active_invite_bootstrap_targets(&db, tenant_id)? {
             let addr_text = target.bootstrap_addr;
             match parse_bootstrap_address(&addr_text).and_then(|addr| addr.to_socket_addr()) {
                 Ok(addr) => {
-                    let key = (
-                        tenant_id.clone(),
-                        target.invite_event_id,
-                        target.bootstrap_transport_peer_id,
-                        addr,
-                    );
+                    let key = (tenant_id.clone(), target.peer_id.clone(), addr);
                     if seen.insert(key.clone()) {
-                        out.push(key);
+                        out.push((
+                            tenant_id.clone(),
+                            target.peer_id,
+                            target.invite_event_id,
+                            addr,
+                        ));
                     }
                 }
                 Err(e) => {
@@ -258,16 +282,17 @@ pub(crate) fn collect_all_observed_endpoint_targets(
 
 /// Dispatch a bootstrap dial target through `PeerDispatcher`.
 ///
-/// Uses `"{tenant_id}@bootstrap"` as the dispatch key so bootstrap targets
-/// share the same dedup/reconnect mechanism as mDNS discovery targets.
-/// Returns `true` if a new connect loop should be spawned.
+/// Bootstrap targets are keyed by authenticated peer fingerprint, not invite
+/// event id, so invite bootstrap, observed endpoints, and discovery all
+/// converge on one peer-scoped connect worker once the peer fingerprint is
+/// known. Returns `true` if a new connect loop should be spawned.
 pub(crate) fn dispatch_bootstrap_target(
     dispatcher: &mut PeerDispatcher,
     tenant_id: &str,
-    invite_event_id: &str,
+    peer_id: &str,
     remote: SocketAddr,
 ) -> bool {
-    let key = bootstrap_dispatch_key(tenant_id, invite_event_id);
+    let key = bootstrap_dispatch_key(tenant_id, peer_id);
     let (action, _cancel_rx) = dispatcher.dispatch(&key, remote);
     matches!(
         action,
@@ -571,6 +596,14 @@ mod tests {
         assert_eq!(out, "[::1]:4455".parse::<SocketAddr>().unwrap());
     }
 
+    #[test]
+    fn test_normalize_discovered_addr_for_unspecified_bind_can_force_loopback() {
+        let local_ip: std::net::IpAddr = "0.0.0.0".parse().unwrap();
+        let discovered: SocketAddr = "192.168.10.42:4455".parse().unwrap();
+        let out = normalize_discovered_addr_for_local_bind_with_options(local_ip, discovered, true);
+        assert_eq!(out, "127.0.0.1:4455".parse::<SocketAddr>().unwrap());
+    }
+
     // -- Bootstrap target collection tests --
 
     #[test]
@@ -778,8 +811,8 @@ mod tests {
 
         assert_eq!(targets.len(), 1, "hostname bootstrap should resolve");
         assert_eq!(targets[0].0, recorded_by);
-        assert_eq!(targets[0].1, "inv-host");
-        assert_eq!(targets[0].2, hex::encode(bootstrap_spki));
+        assert_eq!(targets[0].1, hex::encode(bootstrap_spki));
+        assert_eq!(targets[0].2, "inv-host");
         assert_eq!(targets[0].3.port(), 4433);
     }
 
@@ -796,7 +829,7 @@ mod tests {
         let bootstrap_addr = "10.0.0.1:4433";
 
         // Same bootstrap addr for two different tenants → should yield 2 targets
-        // (dedup is per (tenant, invite_event_id, addr), not per addr alone)
+        // (dedup is per (tenant, peer_id, addr), not per addr alone)
         transport_trust::record_invite_bootstrap_trust(
             &conn,
             "tenant-a",
@@ -837,16 +870,17 @@ mod tests {
     }
 
     #[test]
-    fn test_bootstrap_targets_keep_distinct_invites_same_tenant_same_addr() {
+    fn test_bootstrap_targets_collapse_distinct_invites_for_same_peer_same_addr() {
         let tmp = tempfile::tempdir().unwrap();
         let db_path = tmp.path().join("dedup2.db");
         let conn = open_connection(&db_path).unwrap();
         create_tables(&conn).unwrap();
 
         let bootstrap_addr = "10.0.0.1:4433";
+        let bootstrap_spki = [0xAA; 32];
 
-        // Two bootstrap trust rows for same tenant + same addr but different
-        // invite_event_id should produce two targets (invite-specific fallback).
+        // Two bootstrap trust rows for the same tenant + peer + addr but
+        // different invite_event_id collapse to one peer-scoped target.
         transport_trust::record_invite_bootstrap_trust(
             &conn,
             "tenant-a",
@@ -854,7 +888,7 @@ mod tests {
             "inv-1",
             "ws-1",
             bootstrap_addr,
-            &[0xAA; 32],
+            &bootstrap_spki,
         )
         .unwrap();
         transport_trust::record_invite_bootstrap_trust(
@@ -864,7 +898,7 @@ mod tests {
             "inv-2",
             "ws-2",
             bootstrap_addr,
-            &[0xBB; 32],
+            &bootstrap_spki,
         )
         .unwrap();
         drop(conn);
@@ -874,15 +908,10 @@ mod tests {
 
         assert_eq!(
             targets.len(),
-            2,
-            "same tenant + same addr + two invites = 2 targets"
+            1,
+            "same tenant + same peer + same addr collapses to one target"
         );
-        let invite_ids: std::collections::HashSet<String> = targets
-            .iter()
-            .map(|(_, invite_id, _, _)| invite_id.clone())
-            .collect();
-        assert!(invite_ids.contains("inv-1"));
-        assert!(invite_ids.contains("inv-2"));
+        assert_eq!(targets[0].1, hex::encode(bootstrap_spki));
     }
 
     #[test]
@@ -911,8 +940,8 @@ mod tests {
         let targets = collect_all_bootstrap_targets(db_path.to_str().unwrap()).unwrap();
         assert_eq!(targets.len(), 1, "transitional tenant must still autodial");
         assert_eq!(targets[0].0, tenant_id);
-        assert_eq!(targets[0].1, invite_event_id);
-        assert_eq!(targets[0].2, hex::encode([0xCC; 32]));
+        assert_eq!(targets[0].1, hex::encode([0xCC; 32]));
+        assert_eq!(targets[0].2, invite_event_id);
         assert_eq!(targets[0].3, "10.0.0.1:4433".parse::<SocketAddr>().unwrap());
     }
 
@@ -941,7 +970,7 @@ mod tests {
 
         let by_tenant: std::collections::HashMap<String, SocketAddr> = targets
             .into_iter()
-            .map(|(tenant_id, _invite_event_id, _transport_peer_id, remote)| (tenant_id, remote))
+            .map(|(tenant_id, _peer_id, _invite_event_id, remote)| (tenant_id, remote))
             .collect();
         assert_eq!(
             by_tenant.get("tenant-direct"),
@@ -1010,12 +1039,13 @@ mod tests {
     }
 
     #[test]
-    fn test_bootstrap_dispatch_key_includes_invite_event_id() {
-        let a = bootstrap_dispatch_key("tenant-a", "invite-1");
-        let b = bootstrap_dispatch_key("tenant-a", "invite-2");
-        assert_ne!(
-            a, b,
-            "different invites must produce distinct dispatch keys"
+    fn test_bootstrap_dispatch_key_matches_discovery_key_for_same_peer() {
+        let peer_id = format!("{:064x}", 7);
+        let bootstrap = bootstrap_dispatch_key("tenant-a", &peer_id);
+        let discovery = discovery_dispatch_key("tenant-a", &peer_id);
+        assert_eq!(
+            bootstrap, discovery,
+            "bootstrap and discovery must share one peer-scoped dispatch key"
         );
     }
 
@@ -1025,8 +1055,8 @@ mod tests {
     fn test_dispatcher_handles_both_bootstrap_and_discovery_targets() {
         let mut d = PeerDispatcher::new();
 
-        // Bootstrap target (remote peer_id not known yet, use bootstrap addr as key)
-        let (action, _) = d.dispatch("bootstrap-peer-1", addr(4433));
+        // Bootstrap target for a known authenticated peer
+        let (action, _) = d.dispatch("tenant-a@mdns:peer-1", addr(4433));
         assert_eq!(
             action,
             DiscoveryAction::Connect,
@@ -1041,12 +1071,12 @@ mod tests {
             "discovery target dispatches as Connect"
         );
 
-        // Same bootstrap target again → skip
-        let (action, _) = d.dispatch("bootstrap-peer-1", addr(4433));
+        // Same peer again via another source → skip
+        let (action, _) = d.dispatch("tenant-a@mdns:peer-1", addr(4433));
         assert_eq!(
             action,
             DiscoveryAction::Skip,
-            "duplicate bootstrap target skipped"
+            "duplicate peer target skipped"
         );
 
         // mDNS peer moves address → reconnect
@@ -1055,6 +1085,23 @@ mod tests {
             action,
             DiscoveryAction::Reconnect,
             "discovery peer addr change reconnects"
+        );
+    }
+
+    #[test]
+    fn test_bootstrap_dispatch_collapses_with_discovery_for_same_peer() {
+        let mut dispatcher = PeerDispatcher::new();
+        let peer_id = format!("{:064x}", 9);
+
+        assert!(dispatch_bootstrap_target(
+            &mut dispatcher,
+            "tenant-a",
+            &peer_id,
+            addr(4433)
+        ));
+        assert!(
+            !dispatch_discovery_target(&mut dispatcher, "tenant-a", &peer_id, addr(4433)),
+            "discovery target for an already-tracked bootstrap peer should not spawn a second worker"
         );
     }
 }

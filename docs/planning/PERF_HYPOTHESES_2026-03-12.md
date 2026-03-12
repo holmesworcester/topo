@@ -134,3 +134,42 @@ Conclusion:
    egress quanta.
 3. Re-test the duplicate-fanout-write reduction once the warm-sync benchmark is
    stable again.
+
+## Follow-up: timeout fix and sync-log findings
+
+After the first round above, the branch grew two debugging aids:
+
+- a short `INITIAL_CONTROL_PROGRESS_TIMEOUT` so dead sessions do not block the
+  warm-sync benchmarks for the full `60s` activity timeout
+- env-gated `SendIdle` / `InitialControlTimeout` markers in `sync_run_events`
+
+Current reruns with those changes:
+
+- `perf_sync_10k` now passes reliably again on repeated local runs
+- `perf_continuous_10k` also passes on repeated local runs
+
+Most important finding from a preserved `perf_sync_10k` run with
+`PERF_KEEP_TMPDIR=1 PERF_ENABLE_SYNC_LOG=1 SYNC_SEND_IDLE_LOG=1`:
+
+- the sender still goes idle for about `1.0-1.1s` while thousands of egress
+  rows are already ready (`SendIdle state=queued_not_sending`)
+- the same peer shows overlapping sync runs on the same remote address during
+  that stall window
+- `supervise_connection_sessions()` only runs one session at a time per
+  connection, so overlapping initiator/responder runs for the same peer imply
+  duplicate live connections, not just repeated sessions on one connection
+
+That points the next perf investigation away from "leased egress is too strict"
+and toward "duplicate peer connections are still fragmenting progress and
+creating long post-negentropy stalls".
+
+Working conclusion:
+
+1. The `120s` benchmark timeout was a real dead-session problem and the new
+   initial-control timeout fixes it.
+2. The remaining warm-sync throughput loss is more likely caused by duplicate
+   live connections / overlapping peer sessions than by conservative egress
+   dedupe alone.
+3. Relaxing duplicate-send avoidance should not be the first move until
+   connection-level idempotency is tightened enough that one peer does not keep
+   several sessions alive at once.

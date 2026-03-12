@@ -28,7 +28,10 @@ pub use connect::{
     connect_loop_with_shared_ingest_until_cancel,
 };
 
+use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use tokio_util::sync::CancellationToken;
@@ -98,57 +101,134 @@ pub(crate) fn peer_fingerprint_from_hex(peer_id: &str) -> Option<[u8; 32]> {
     Some(fp)
 }
 
-// ---------------------------------------------------------------------------
-// Transport↔peering session seam
-// ---------------------------------------------------------------------------
-
-/// Run a single sync session using a pre-built `TransportSessionIo`.
-///
-/// This is the peering orchestration seam: it wires session metadata,
-/// cancellation, and the session handler together. Transport
-/// details (stream opening, `DualConnection`, `QuicTransportSessionIo`)
-/// are handled by `transport::session_factory` before this is called.
-pub(super) async fn run_session(
-    handler: &SyncSessionHandler,
-    session_id: u64,
-    io: Box<dyn TransportSessionIo>,
-    tenant_id: &str,
-    peer_fp: [u8; 32],
-    remote_addr: SocketAddr,
-    direction: SessionDirection,
-    _db_path: &str,
-) {
-    let meta = SessionMeta {
-        session_id,
-        tenant: TenantId(tenant_id.to_string()),
-        peer: PeerFingerprint(peer_fp),
-        remote_addr,
-        direction,
-    };
-    let cancel = CancellationToken::new();
-
-    if let Err(e) = handler.on_session(meta, io, cancel.clone()).await {
-        let label = match direction {
-            SessionDirection::Outbound => "Initiator",
-            SessionDirection::Inbound => "Responder",
-        };
-        if let Some(reason) = extract_build_mismatch_reason(&e) {
-            let peer_id = hex::encode(peer_fp);
-            let key = format!("session-build-mismatch:{label}:{peer_id}:{direction:?}");
-            if should_emit_globally(key) {
-                warn!(
-                    "{} session rejected by peer {}: {}",
-                    label,
-                    &peer_id[..16.min(peer_id.len())],
-                    reason
-                );
-            }
-        } else {
-            warn!("{} session error: {}", label, e);
-        }
-    }
-    cancel.cancel();
+<<<<<<< HEAD
+=======
+pub(crate) fn preferred_connection_direction(
+    local_peer_id: &str,
+    remote_peer_id: &str,
+) -> Option<SessionDirection> {
+    let local = peer_fingerprint_from_hex(local_peer_id)?;
+    let remote = peer_fingerprint_from_hex(remote_peer_id)?;
+    Some(match local.cmp(&remote) {
+        std::cmp::Ordering::Less | std::cmp::Ordering::Equal => SessionDirection::Outbound,
+        std::cmp::Ordering::Greater => SessionDirection::Inbound,
+    })
 }
 
-pub(super) use crate::tuning::drain_batch_size;
-pub(super) use crate::tuning::shared_ingest_cap;
+fn connection_direction_rank(
+    local_peer_id: &str,
+    remote_peer_id: &str,
+    direction: SessionDirection,
+) -> u8 {
+    match preferred_connection_direction(local_peer_id, remote_peer_id) {
+        Some(preferred) if preferred == direction => 2,
+        Some(_) => 0,
+        None => 1,
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct LiveConnectionKey {
+    db_path: String,
+    recorded_by: String,
+    peer_id: String,
+}
+
+struct LiveConnectionSlot {
+    claim_id: u64,
+    direction: SessionDirection,
+    direction_rank: u8,
+    connection: crate::transport::TransportConnection,
+    released: Arc<tokio::sync::Notify>,
+}
+
+fn live_connection_slots() -> &'static Mutex<HashMap<LiveConnectionKey, LiveConnectionSlot>> {
+    static LIVE_CONNECTION_SLOTS: OnceLock<Mutex<HashMap<LiveConnectionKey, LiveConnectionSlot>>> =
+        OnceLock::new();
+    LIVE_CONNECTION_SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn next_live_connection_claim_id() -> u64 {
+    static NEXT_CLAIM_ID: AtomicU64 = AtomicU64::new(1);
+    NEXT_CLAIM_ID.fetch_add(1, Ordering::Relaxed)
+}
+
+pub(crate) struct LiveConnectionLease {
+    key: LiveConnectionKey,
+    claim_id: u64,
+}
+
+impl Drop for LiveConnectionLease {
+    fn drop(&mut self) {
+        let released = {
+            let mut slots = live_connection_slots()
+                .lock()
+                .unwrap_or_else(|poison| poison.into_inner());
+            match slots.get(&self.key) {
+                Some(slot) if slot.claim_id == self.claim_id => {
+                    let slot = slots
+                        .remove(&self.key)
+                        .expect("live connection slot missing");
+                    Some(slot.released)
+                }
+                _ => None,
+            }
+        };
+        if let Some(released) = released {
+            released.notify_waiters();
+        }
+    }
+}
+
+pub(crate) struct LiveConnectionOccupied {
+    pub preferred_direction: Option<SessionDirection>,
+    pub active_direction: SessionDirection,
+    pub released: Arc<tokio::sync::Notify>,
+}
+
+pub(crate) enum LiveConnectionClaim {
+    Acquired(LiveConnectionLease),
+    Occupied(LiveConnectionOccupied),
+}
+
+pub(crate) fn claim_live_connection_slot(
+    db_path: &str,
+    recorded_by: &str,
+    peer_id: &str,
+    direction: SessionDirection,
+    connection: crate::transport::TransportConnection,
+) -> LiveConnectionClaim {
+    let key = LiveConnectionKey {
+        db_path: db_path.to_string(),
+        recorded_by: recorded_by.to_string(),
+        peer_id: peer_id.to_string(),
+    };
+    let direction_rank = connection_direction_rank(recorded_by, peer_id, direction);
+    let preferred_direction = preferred_connection_direction(recorded_by, peer_id);
+    let claim_id = next_live_connection_claim_id();
+
+    let mut replaced: Option<(
+        crate::transport::TransportConnection,
+        Arc<tokio::sync::Notify>,
+    )> = None;
+    let claim = {
+        let mut slots = live_connection_slots()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        match slots.get_mut(&key) {
+            None => {
+                let released = Arc::new(tokio::sync::Notify::new());
+                slots.insert(
+                    key.clone(),
+                    LiveConnectionSlot {
+                        claim_id,
+                        direction,
+                        direction_rank,
+                        connection,
+                        released,
+                    },
+                );
+                LiveConnectionClaim::Acquired(LiveConnectionLease { key, claim_id })
+            }
+            Some(existing) if direction_rank > existing.direction_rank => {
+  

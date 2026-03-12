@@ -357,6 +357,26 @@ impl SyncRunCapture {
         };
         let _ = self.tx.send(WorkerMsg::Trace(event));
     }
+
+    pub fn record_marker(
+        &self,
+        lane: &str,
+        direction: &str,
+        frame_type: &str,
+        detail_json: Option<String>,
+    ) {
+        let seq = self.seq.fetch_add(1, Ordering::Relaxed).saturating_add(1);
+        let event = NewSyncRunEvent {
+            seq,
+            ts_ms: now_ms(),
+            lane: lane.to_string(),
+            direction: direction.to_string(),
+            frame_type: frame_type.to_string(),
+            msg_len: 0,
+            detail_json,
+        };
+        let _ = self.tx.send(WorkerMsg::Trace(event));
+    }
 }
 
 #[derive(Clone)]

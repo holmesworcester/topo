@@ -786,12 +786,13 @@ Runtime flow reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) sections `1` 
 The production peering runtime follows a single conceptual loop:
 
 1. **Projected SQLite state**: invite_bootstrap_trust rows, PeerShared-derived trust, endpoint observations.
-2. **Target planner** (`runtime::peering::engine::target_planner`): single-owner module for all dial target planning. Collects bootstrap trust targets from SQL and mDNS discovery candidates. Routes both through `PeerDispatcher` for deduplication and reconnect management.
-3. **Supervisor layer**: startup preflight + loop orchestration live in the peering supervisor.
+2. **Target planner** (`runtime::peering::engine::target_planner`): single-owner module for all dial target planning. Bootstrap trust rows now surface the authenticated bootstrap peer fingerprint, so bootstrap, observed endpoints, and mDNS discovery all collapse onto one peer-scoped dispatch key per `(tenant_id, peer_id)`.
+3. **Supervisor layer**: startup preflight + loop orchestration live in the peering supervisor. Connectivity inputs are hints to `ensure_connected(peer)`, not independent long-lived owners.
 4. **Dial/accept loops**: `connect_loop` (outbound) and `accept_loop` (inbound) are separate long-running loops coordinated by shared projected state and cancellation/watch channels. QUIC dial/accept + peer identity extraction flows through `transport::connection_lifecycle`, and stream wiring flows through `transport::session_factory`.
-5. **Sync session runner** (`SyncSessionHandler`): protocol-agnostic session handler invoked via the `SessionHandler` contract.
-6. **Ingest writer** (`batch_writer`): single shared thread consuming `IngestItem` tuples from all concurrent sessions.
-7. **Projected SQLite state**: projection cascade updates trust rows, completing the loop.
+5. **Live peer slot**: after mTLS identity extraction, if the remote fingerprint is already backed by projected `peers_shared` state for this tenant, the runtime claims one local live-connection slot per `(db_path, recorded_by, peer_id)`. Duplicates are closed instead of starting overlapping sync ownership. If both directions appear, the deterministic preferred direction is the lexicographically lower peer dialing outbound and the higher peer retaining inbound; a preferred-direction connection replaces a non-preferred one. Bootstrap-only invite aliases are exempt so reused invites/device links can still bootstrap multiple eventual peers concurrently.
+6. **Sync session runner** (`SyncSessionHandler`): protocol-agnostic session handler invoked via the `SessionHandler` contract.
+7. **Ingest writer** (`batch_writer`): single shared thread consuming `IngestItem` tuples from all concurrent sessions.
+8. **Projected SQLite state**: projection cascade updates trust rows, completing the loop.
 
 ### Module ownership
 
@@ -799,7 +800,12 @@ The production peering runtime follows a single conceptual loop:
 - **Transport connection lifecycle**: `src/runtime/transport/connection_lifecycle.rs` — sole owner of QUIC `connect/accept` and TLS peer identity extraction for peering paths (`dial_peer`, `accept_peer`).
 - **Transport session factory**: `src/runtime/transport/session_factory.rs` — sole owner of QUIC stream opening and `DualConnection` / `QuicTransportSessionIo` construction. Provides `open_session_io()` and `accept_session_io()` that return `(session_id, Box<dyn TransportSessionIo>)`.
 - **Transport session I/O adapter**: `src/runtime/transport/transport_session_io.rs` — sole owner of frame boundary validation (`parse_frame` exact-consumption), max-frame-size enforcement, and mapping between QUIC stream errors and `TransportSessionIoError`.
+<<<<<<< HEAD
 - **Peering orchestration seam**: `src/runtime/peering/loops/mod.rs::run_session` — wires session metadata, cancellation, and the session handler together. Receives pre-built `TransportSessionIo` from the transport session factory.
+=======
+- **Live connection ownership**: `src/runtime/peering/loops/mod.rs` — owns the per-peer live connection slot registry and deterministic preferred-direction rule used by both outbound and inbound loops.
+- **Peering orchestration seam**: `src/runtime/peering/loops/mod.rs::run_session` — wires session metadata, peer-removal cancellation, and the session handler together. Receives pre-built `TransportSessionIo` from the transport session factory.
+>>>>>>> 0017b2b (Add steady-state peer connection idempotency)
 - **Bootstrap test helpers**: `src/testutil/bootstrap.rs` — test-only. Production runtime never depends on these; bootstrap progression is driven by the autodial loop polling projected SQL state.
 
 ### Event-sourced authority boundary (peering)
@@ -1239,6 +1245,25 @@ All `PeerCoord` handles must be registered before spawning connect loop threads.
 This ensures `total_peers` is correct from the first session. Without
 pre-registration, early threads see `total_peers=1` and claim all events,
 defeating the ownership split.
+
+### Connection idempotency
+
+All connectivity producers are allowed to be "hungry" and keep emitting dial
+hints, but the runtime remains peer-idempotent after authentication:
+
+1. bootstrap rows, observed endpoints, and discovery advertisements are all
+   inputs to `ensure_connected(tenant, peer)`,
+2. once the authenticated peer fingerprint is known, all such inputs share the
+   same peer-scoped dispatch key,
+3. locally there is at most one live QUIC connection owner per
+   `(db_path, recorded_by, peer_id)` once that remote fingerprint is a
+   steady-state PeerShared identity for the tenant,
+4. a preferred-direction connection replaces a non-preferred duplicate, while
+   equal-or-worse duplicates are closed immediately.
+
+This keeps bootstrap as an ongoing process instead of a brittle state machine
+while preventing the dual-session/double-send failure mode caused by redundant
+live connections to the same peer.
 
 ### Implementation decisions
 

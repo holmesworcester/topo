@@ -1094,26 +1094,36 @@ Required changes from the 1:1 sync model:
 2. **Thread-per-connection.** Each connection spawns a `std::thread` with a dedicated
    single-threaded tokio runtime. Isolates connection failures and allows sharing the
    `mpsc::Sender` to the batch_writer across connections.
-3. **Deterministic per-event ownership for pull splitting.** Each need_id is routed
+3. **Connection idempotency after auth.** Bootstrap trust targets, observed endpoints,
+   and mDNS discovery are all hint sources for `ensure_connected(peer)`, not separate
+   owners. Once the peer fingerprint is known, they share one peer-scoped dispatch key.
+   Locally the runtime keeps at most one live connection slot per
+   `(db_path, recorded_by, peer_id)` only when that remote fingerprint is already backed
+   by projected `peers_shared` state for the tenant. Bootstrap-only invite aliases stay
+   exempt so reused invites/device links can bootstrap multiple eventual peers. The
+   deterministic preferred direction is the lexicographically lower peer dialing
+   outbound; if a preferred-direction duplicate arrives it replaces the non-preferred
+   live connection.
+4. **Deterministic per-event ownership for pull splitting.** Each need_id is routed
    through `hash(event_id[0..8]) % total_peers == peer_idx`. Owned events get
    HaveList immediately during reconciliation (streaming pull). Non-owned events
    are buffered for fallback discard. No coordinator barrier on the hot path.
-4. **Push uncoordinated, pull streams with ownership.** Have_ids (outbound) stream
+5. **Push uncoordinated, pull streams with ownership.** Have_ids (outbound) stream
    immediately. Need_ids (inbound) are dispatched as HaveList during reconciliation
    rounds based on ownership. The `wanted` table deduplicates.
    **Do not defer HaveList until after reconciliation** — this creates a pipeline stall
    that serializes ~1s of overhead on the critical path.
-5. **Threshold-based claim-all for source-unique events.** When `need_ids.len() <=
+6. **Threshold-based claim-all for source-unique events.** When `need_ids.len() <=
    total_peers * 20`, the session claims ALL need_ids regardless of ownership.
    Handles source-unique events (identity chains, markers) that only exist at one
    source and cannot be downloaded by their deterministic "owner" peer.
-6. **Pre-registration of peers.** All PeerCoord handles registered before spawning
+7. **Pre-registration of peers.** All PeerCoord handles registered before spawning
    connect loop threads. Ensures `total_peers` is correct from the first session.
-7. **Incremental egress enqueue.** Have_ids buffered and drained in batches per main loop
+8. **Incremental egress enqueue.** Have_ids buffered and drained in batches per main loop
    iteration so event streaming is not starved by large reconciliation results.
-8. **Negentropy snapshot ordering.** `BEGIN` must precede `rebuild_blocks()` so the storage
+9. **Negentropy snapshot ordering.** `BEGIN` must precede `rebuild_blocks()` so the storage
    sees a consistent read snapshot while concurrent writes proceed in the batch_writer.
-9. **Windowed reconciliation on the same event universe.** The first outbound round to a peer is `Full`; subsequent rounds are usually `Hot` (`ts >= cutoff`) with periodic `Cold` (`ts < cutoff`) refreshes. The window is carried in the initial `NegOpen` header and does not create a second protocol or separate dependency universe.
+10. **Windowed reconciliation on the same event universe.** The first outbound round to a peer is `Full`; subsequent rounds are usually `Hot` (`ts >= cutoff`) with periodic `Cold` (`ts < cutoff`) refreshes. The window is carried in the initial `NegOpen` header and does not create a second protocol or separate dependency universe.
 
 Test families (in `sync_graph_test.rs`):
 - **Family A (chain):** N-peer chain propagation (tail convergence, per-hop latency).
@@ -1500,7 +1510,8 @@ Detailed architecture and invariants are documented in [DESIGN.md](./DESIGN.md) 
 1. no filesystem cert authority regression,
 2. no cross-tenant projection/query leakage regression,
 3. no reintroduction of event-count-based convergence assertions,
-4. no bypass of workspace command ownership boundaries.
+4. no bypass of workspace command ownership boundaries,
+5. no reintroduction of duplicate live peer connections/workers for the same authenticated peer.
 
 ## 17.3 Validation suite expectations
 
