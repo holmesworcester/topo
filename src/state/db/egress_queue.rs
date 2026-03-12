@@ -588,7 +588,15 @@ mod tests {
         let bulk_a = make_event_id(0x11);
         let bulk_b = make_event_id(0x12);
         let bulk_c = make_event_id(0x13);
-        for (id, created_at) in [(bulk_a, 10i64), (bulk_b, 20i64), (bulk_c, 30i64)] {
+        let bulk_d = make_event_id(0x14);
+        let bulk_e = make_event_id(0x15);
+        for (id, created_at) in [
+            (bulk_a, 10i64),
+            (bulk_b, 20i64),
+            (bulk_c, 30i64),
+            (bulk_d, 40i64),
+            (bulk_e, 50i64),
+        ] {
             conn.execute(
                 "INSERT INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
                  VALUES (?1, 'file_slice', x'01', 'shared', ?2, ?2)",
@@ -597,7 +605,7 @@ mod tests {
             .unwrap();
         }
 
-        eq.enqueue_events("conn1", &[bulk_a, bulk_b, bulk_c])
+        eq.enqueue_events("conn1", &[bulk_a, bulk_b, bulk_c, bulk_d, bulk_e])
             .unwrap();
         let claimed = eq.claim_batch("conn1", "sess-1", 10, 30_000).unwrap();
 
