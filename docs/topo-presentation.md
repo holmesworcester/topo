@@ -92,6 +92,8 @@ style: |
 
 ---
 
+<!-- _class: lead -->
+
 "I have worked for ~6 years trying to build a p2p Slack-alternative. It is #$%@ing brutal."
 
 -- me
