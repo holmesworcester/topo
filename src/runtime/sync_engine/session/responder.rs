@@ -11,6 +11,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use negentropy::{Negentropy, NegentropyStorageBase, Storage};
+use serde_json::json;
 use tokio::sync::mpsc;
 use tracing::{info, warn};
 
@@ -30,11 +31,11 @@ use crate::tuning::{low_mem_memtrace, low_mem_mode};
 
 use super::control_plane::send_done_ack;
 use super::data_plane::{drain_egress_to_data_stream, send_data_done, spawn_data_receiver};
-use super::logging::SyncRunRxCapture;
+use super::logging::{SyncRunCapture, SyncRunRxCapture};
 use super::windowing::{decode_initial_neg_open, SyncWindow, SyncWindowKind};
 use super::{
-    negentropy_frame_size, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_QUIET_WINDOW,
-    EGRESS_SENT_TTL_MS,
+    negentropy_frame_size, send_idle_capture_enabled, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT,
+    EGRESS_QUIET_WINDOW, EGRESS_SENT_TTL_MS, INITIAL_CONTROL_PROGRESS_TIMEOUT,
 };
 
 /// Run sync as the responder (server role) with dual streams.
@@ -52,6 +53,7 @@ pub async fn run_sync_responder<C, S, R>(
     recorded_by: &str,
     ingress_source_tag: &str,
     shared_ingest: mpsc::Sender<IngestItem>,
+    capture: Option<SyncRunCapture>,
     rx_capture: Option<SyncRunRxCapture>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
@@ -165,6 +167,9 @@ where
     let mut last_memtrace = Instant::now();
     let mut last_alloc_trim = Instant::now();
     let mut egress_quiet_since: Option<Instant> = None;
+    let idle_capture_enabled = send_idle_capture_enabled() && capture.is_some();
+    let mut last_send_progress = Instant::now();
+    let mut last_idle_marker = Instant::now();
 
     loop {
         // Data receiver runs in a separate task — check if it received data
@@ -179,6 +184,28 @@ where
                 activity_timeout.as_secs(),
                 start.elapsed().as_secs()
             );
+            break;
+        }
+        if rounds == 0 && sync_start.elapsed() >= INITIAL_CONTROL_PROGRESS_TIMEOUT {
+            warn!(
+                "Initial control progress timeout after {}ms (peer={})",
+                sync_start.elapsed().as_millis(),
+                peer_id
+            );
+            if let Some(capture) = capture.as_ref() {
+                capture.record_marker(
+                    "meta",
+                    "state",
+                    "InitialControlTimeout",
+                    serde_json::to_string(&json!({
+                        "peer_id": peer_id,
+                        "elapsed_ms": sync_start.elapsed().as_millis(),
+                        "reconciling": reconciling,
+                        "peer_done": peer_done,
+                    }))
+                    .ok(),
+                );
+            }
             break;
         }
 
@@ -276,6 +303,7 @@ where
         bytes_sent += send_stats.bytes_sent_delta;
         if send_stats.events_sent_delta > 0 {
             last_activity = Instant::now();
+            last_send_progress = Instant::now();
         }
 
         if low_mem_mode() && last_alloc_trim.elapsed() >= Duration::from_millis(100) {
@@ -321,13 +349,45 @@ where
             last_memtrace = Instant::now();
         }
 
+        let egress_pending = egress.count_pending(peer_id).unwrap_or(0);
+
+        if idle_capture_enabled
+            && !completed
+            && last_send_progress.elapsed() >= Duration::from_secs(1)
+            && last_idle_marker.elapsed() >= Duration::from_secs(1)
+        {
+            if let Some(capture) = capture.as_ref() {
+                let idle_state = if egress_pending > 0 {
+                    "queued_not_sending"
+                } else if reconciling || !peer_done {
+                    "waiting_on_control"
+                } else {
+                    "no_ready_work"
+                };
+                capture.record_marker(
+                    "meta",
+                    "state",
+                    "SendIdle",
+                    serde_json::to_string(&json!({
+                        "peer_id": peer_id,
+                        "state": idle_state,
+                        "idle_ms": last_send_progress.elapsed().as_millis(),
+                        "reconciling": reconciling,
+                        "peer_done": peer_done,
+                        "egress_pending": egress_pending,
+                    }))
+                    .ok(),
+                );
+            }
+            last_idle_marker = Instant::now();
+        }
+
         // After peer signalled Done and our egress queue is drained:
         // 1. Send DataDone on data stream (signals peer's data receiver)
         // 2. Wait for peer's DataDone to be consumed by our data receiver
         // 3. Only then send DoneAck on control
         if peer_done && !reconciling {
-            let pending_out = egress.count_pending(peer_id).unwrap_or(0);
-            if pending_out == 0 {
+            if egress_pending == 0 {
                 let quiet_since = egress_quiet_since.get_or_insert_with(Instant::now);
                 if quiet_since.elapsed() >= EGRESS_QUIET_WINDOW {
                     send_data_done(&mut data_send).await?;

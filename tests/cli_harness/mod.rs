@@ -11,6 +11,9 @@ use std::process::{Command, Output, Stdio};
 use std::time::{Duration, Instant};
 use topo::testutil::DaemonGuard;
 
+const DAEMON_START_MAX_ATTEMPTS: usize = 8;
+const DAEMON_START_RETRY_BASE_MS: u64 = 100;
+
 // ---------------------------------------------------------------------------
 // Core utilities
 // ---------------------------------------------------------------------------
@@ -114,6 +117,12 @@ fn read_daemon_log(path: &Option<std::path::PathBuf>) -> String {
         .unwrap_or_default()
 }
 
+fn daemon_inherit_stdio_env() -> bool {
+    std::env::var("P7_TEST_DAEMON_INHERIT_STDIO")
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(false)
+}
+
 /// Start a daemon with default options (random port, suppressed I/O).
 pub fn start_daemon(db: &str) -> DaemonGuard {
     start_daemon_with_options(db, &DaemonOptions::default())
@@ -139,12 +148,13 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
     };
     let mut retry_with_ephemeral_bind = false;
 
-    for attempt in 0..8 {
+    for attempt in 0..DAEMON_START_MAX_ATTEMPTS {
         let bind_addr = if retry_with_ephemeral_bind {
             "127.0.0.1:0".to_string()
         } else {
             requested_bind_addr.clone()
         };
+        let inherit_stdio = opts.inherit_stdio || daemon_inherit_stdio_env();
         let mut cmd = Command::new(bin());
         cmd.arg("--db")
             .arg(db)
@@ -159,7 +169,7 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
         if let Some(ref path) = opts.stdout_file {
             let f = std::fs::File::create(path).expect("create stdout log file");
             cmd.stdout(f);
-        } else if opts.inherit_stdio {
+        } else if inherit_stdio {
             cmd.stdout(Stdio::inherit());
         } else {
             cmd.stdout(Stdio::null());
@@ -168,7 +178,7 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
         if let Some(ref path) = opts.stderr_file {
             let f = std::fs::File::create(path).expect("create stderr log file");
             cmd.stderr(f);
-        } else if opts.inherit_stdio {
+        } else if inherit_stdio {
             cmd.stderr(Stdio::inherit());
         } else {
             cmd.stderr(Stdio::null());
@@ -193,9 +203,11 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
             if socket.exists() {
                 wait_for_daemon_stopped(db, Duration::from_secs(2));
             }
-            if attempt < 7 {
+            if attempt + 1 < DAEMON_START_MAX_ATTEMPTS {
                 retry_with_ephemeral_bind |= opts.bind_port.is_some();
-                std::thread::sleep(Duration::from_millis(100));
+                let backoff_ms =
+                    DAEMON_START_RETRY_BASE_MS.saturating_mul((attempt as u64).saturating_add(1));
+                std::thread::sleep(Duration::from_millis(backoff_ms));
                 continue;
             }
             panic!(
@@ -213,9 +225,11 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
             if socket.exists() {
                 wait_for_daemon_stopped(db, Duration::from_secs(2));
             }
-            if attempt < 7 {
+            if attempt + 1 < DAEMON_START_MAX_ATTEMPTS {
                 retry_with_ephemeral_bind |= opts.bind_port.is_some();
-                std::thread::sleep(Duration::from_millis(100));
+                let backoff_ms =
+                    DAEMON_START_RETRY_BASE_MS.saturating_mul((attempt as u64).saturating_add(1));
+                std::thread::sleep(Duration::from_millis(backoff_ms));
                 continue;
             }
             panic!(

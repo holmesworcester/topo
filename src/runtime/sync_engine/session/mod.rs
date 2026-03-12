@@ -90,8 +90,19 @@ pub(super) const EGRESS_QUIET_WINDOW: Duration = Duration::from_millis(500);
 /// Time to wait for inbound data stream drain at session end.
 pub(super) const DATA_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Maximum time a session may sit without any initial control-round progress.
+/// If a session never gets past the first negentropy exchange, restarting it is
+/// better than blocking the connection supervisor for the full activity timeout.
+pub(super) const INITIAL_CONTROL_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
+
 /// Non-blocking poll timeout for the control stream receive.
 pub(super) const CONTROL_POLL_TIMEOUT: Duration = Duration::from_millis(1);
+
+pub(super) fn send_idle_capture_enabled() -> bool {
+    std::env::var("SYNC_SEND_IDLE_LOG")
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(false)
+}
 
 // -- Coordinator timing (advisory, not on pull-dispatch hot path) --
 // The coordinator thread still runs for health/metrics but does not gate

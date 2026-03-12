@@ -230,6 +230,7 @@ impl SessionHandler for SyncSessionHandler {
                     &ingress_source_tag,
                     coordination.as_ref(),
                     self.shared_ingest.clone(),
+                    run_logger.as_ref().and_then(|l| l.capture()),
                     run_logger.as_ref().and_then(|l| l.rx_capture()),
                 );
                 tokio::pin!(run);
@@ -257,6 +258,7 @@ impl SessionHandler for SyncSessionHandler {
                     &tenant_id,
                     &ingress_source_tag,
                     self.shared_ingest.clone(),
+                    run_logger.as_ref().and_then(|l| l.capture()),
                     run_logger.as_ref().and_then(|l| l.rx_capture()),
                 );
                 tokio::pin!(run);
