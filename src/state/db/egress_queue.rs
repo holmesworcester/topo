@@ -1,7 +1,7 @@
 use rusqlite::{params, Connection, Result as SqliteResult};
 
 use super::queue::{current_timestamp_ms, with_immediate_tx, with_sqlite_busy_retry};
-use crate::crypto::EventId;
+use crate::crypto::{event_id_to_base64, EventId};
 
 pub struct EgressQueue<'a> {
     conn: &'a Connection,
@@ -21,7 +21,8 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
             attempts INTEGER NOT NULL DEFAULT 0,
             lease_until INTEGER,
             sent_at INTEGER,
-            dedupe_key TEXT
+            dedupe_key TEXT,
+            event_ts INTEGER
         );
         CREATE UNIQUE INDEX IF NOT EXISTS idx_egress_pending_event
             ON egress_queue(connection_id, event_id)
@@ -32,8 +33,23 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         CREATE INDEX IF NOT EXISTS idx_egress_claim
             ON egress_queue(connection_id, id)
             WHERE sent_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_egress_ts_claim
+            ON egress_queue(connection_id, event_ts DESC, id DESC)
+            WHERE sent_at IS NULL;
         ",
     )?;
+    // Add event_ts column to existing DBs that lack it (idempotent).
+    let has_event_ts: bool = conn
+        .prepare("SELECT event_ts FROM egress_queue LIMIT 0")
+        .is_ok();
+    if !has_event_ts {
+        conn.execute_batch("ALTER TABLE egress_queue ADD COLUMN event_ts INTEGER")?;
+        conn.execute_batch(
+            "CREATE INDEX IF NOT EXISTS idx_egress_ts_claim
+             ON egress_queue(connection_id, event_ts DESC, id DESC)
+             WHERE sent_at IS NULL",
+        )?;
+    }
     Ok(())
 }
 
@@ -44,6 +60,10 @@ impl<'a> EgressQueue<'a> {
 
     /// Enqueue a batch of events for a connection. Deduped by partial unique index
     /// on (connection_id, event_id) WHERE frame_type='event' AND sent_at IS NULL.
+    ///
+    /// Looks up the event's `created_at` timestamp from the events table so that
+    /// `claim_batch` can prioritize newer events over older ones. Events not found
+    /// in the events table get `event_ts = NULL` and sort last.
     /// Returns number inserted.
     pub fn enqueue_events(
         &self,
@@ -55,21 +75,33 @@ impl<'a> EgressQueue<'a> {
         }
         let now = current_timestamp_ms();
         with_immediate_tx(self.conn, || {
-            let mut stmt = self.conn.prepare(
+            let mut ts_stmt = self.conn.prepare(
+                "SELECT created_at FROM events WHERE event_id = ?1",
+            )?;
+            let mut insert_stmt = self.conn.prepare(
                 "INSERT OR IGNORE INTO egress_queue
-                 (connection_id, frame_type, event_id, enqueued_at, available_at)
-                 VALUES (?1, 'event', ?2, ?3, ?3)",
+                 (connection_id, frame_type, event_id, enqueued_at, available_at, event_ts)
+                 VALUES (?1, 'event', ?2, ?3, ?3, ?4)",
             )?;
             let mut inserted = 0usize;
             for id in event_ids {
-                inserted += stmt.execute(params![connection_id, &id[..], now])?;
+                let id_b64 = event_id_to_base64(id);
+                let event_ts: Option<i64> = ts_stmt
+                    .query_row(params![id_b64], |row| row.get(0))
+                    .ok();
+                inserted += insert_stmt.execute(params![connection_id, &id[..], now, event_ts])?;
             }
             Ok(inserted)
         })
     }
 
     /// Claim a batch of unsent items for sending.
-    /// Returns (rowid, event_id) pairs.
+    /// Returns (rowid, event_id) pairs ordered newest-event-first.
+    ///
+    /// Events are sorted by their original creation timestamp (`event_ts`) in
+    /// descending order so that recently-created events (e.g. new messages) are
+    /// sent before older backlog (e.g. bulk file slices). Events with unknown
+    /// timestamps sort last. Ties are broken by rowid descending.
     ///
     /// Single-consumer-per-connection makes leases unnecessary — the connection
     /// is cleared at session start and end, so no other consumer races.
@@ -87,7 +119,7 @@ impl<'a> EgressQueue<'a> {
                 "SELECT id, event_id FROM egress_queue
                  WHERE connection_id = ?1
                  AND sent_at IS NULL
-                 ORDER BY id
+                 ORDER BY event_ts IS NULL, event_ts DESC, id DESC
                  LIMIT ?2",
             )?;
             let rows: Vec<(i64, Vec<u8>)> = stmt
@@ -351,5 +383,156 @@ mod tests {
         let verify = open_connection(&path).unwrap();
         let eq = EgressQueue::new(&verify);
         assert_eq!(eq.count_pending("conn1").unwrap(), 0);
+    }
+
+    /// Helper: insert a synthetic event row directly into the events table so
+    /// that `enqueue_events` can look up its `created_at` timestamp.
+    fn insert_synthetic_event(conn: &Connection, event_id: &EventId, created_at_ms: i64) {
+        use crate::crypto::event_id_to_base64;
+        let id_b64 = event_id_to_base64(event_id);
+        conn.execute(
+            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, 'message', X'00', 'shared', ?2, ?2)",
+            params![id_b64, created_at_ms],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn test_claim_batch_returns_newest_first() {
+        let conn = setup();
+
+        // Create three events with distinct timestamps:
+        // old (ts=1000), medium (ts=2000), new (ts=3000)
+        let old_id = make_event_id(1);
+        let mid_id = make_event_id(2);
+        let new_id = make_event_id(3);
+
+        insert_synthetic_event(&conn, &old_id, 1000);
+        insert_synthetic_event(&conn, &mid_id, 2000);
+        insert_synthetic_event(&conn, &new_id, 3000);
+
+        // Enqueue in old-to-new order (simulating bulk discovery)
+        let eq = EgressQueue::new(&conn);
+        eq.enqueue_events("conn1", &[old_id, mid_id, new_id])
+            .unwrap();
+
+        // claim_batch should return newest first
+        let claimed = eq.claim_batch("conn1", 10).unwrap();
+        assert_eq!(claimed.len(), 3);
+        assert_eq!(claimed[0].1, new_id, "newest event should be first");
+        assert_eq!(claimed[1].1, mid_id, "middle event should be second");
+        assert_eq!(claimed[2].1, old_id, "oldest event should be last");
+    }
+
+    #[test]
+    fn test_claim_batch_newest_first_regardless_of_enqueue_order() {
+        let conn = setup();
+
+        // New message created now, old backlog created yesterday
+        let new_msg = make_event_id(10);
+        let old_backlog_1 = make_event_id(20);
+        let old_backlog_2 = make_event_id(30);
+
+        let yesterday = 1_700_000_000_000i64;
+        let now = 1_700_100_000_000i64;
+
+        insert_synthetic_event(&conn, &old_backlog_1, yesterday);
+        insert_synthetic_event(&conn, &old_backlog_2, yesterday + 1);
+        insert_synthetic_event(&conn, &new_msg, now);
+
+        let eq = EgressQueue::new(&conn);
+
+        // Enqueue old backlog first (as would happen in reconciliation),
+        // then the new message
+        eq.enqueue_events("peer1", &[old_backlog_1, old_backlog_2])
+            .unwrap();
+        eq.enqueue_events("peer1", &[new_msg]).unwrap();
+
+        // New message should come first despite being enqueued last
+        let claimed = eq.claim_batch("peer1", 10).unwrap();
+        assert_eq!(claimed.len(), 3);
+        assert_eq!(
+            claimed[0].1, new_msg,
+            "new message should be sent before old backlog"
+        );
+    }
+
+    #[test]
+    fn test_claim_batch_null_ts_sorts_last() {
+        let conn = setup();
+
+        // Event with known timestamp
+        let known_id = make_event_id(1);
+        insert_synthetic_event(&conn, &known_id, 5000);
+
+        // Event without a row in events table (unknown timestamp)
+        let unknown_id = make_event_id(2);
+
+        let eq = EgressQueue::new(&conn);
+        eq.enqueue_events("conn1", &[unknown_id, known_id])
+            .unwrap();
+
+        let claimed = eq.claim_batch("conn1", 10).unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(
+            claimed[0].1, known_id,
+            "event with known timestamp should come first"
+        );
+        assert_eq!(
+            claimed[1].1, unknown_id,
+            "event with NULL timestamp should sort last"
+        );
+    }
+
+    #[test]
+    fn test_enqueue_stores_event_ts_from_events_table() {
+        let conn = setup();
+
+        let id = make_event_id(42);
+        let expected_ts = 1_700_050_000_000i64;
+        insert_synthetic_event(&conn, &id, expected_ts);
+
+        let eq = EgressQueue::new(&conn);
+        eq.enqueue_events("conn1", &[id]).unwrap();
+
+        // Verify the stored event_ts matches
+        let stored_ts: Option<i64> = conn
+            .query_row(
+                "SELECT event_ts FROM egress_queue WHERE connection_id = 'conn1' LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_ts, Some(expected_ts));
+    }
+
+    #[test]
+    fn test_claim_batch_interleaved_timestamps() {
+        let conn = setup();
+
+        // Simulate a realistic scenario: 5 old file slices and 1 new message
+        let mut old_slices = Vec::new();
+        for i in 0..5u8 {
+            let id = make_event_id(i + 1);
+            insert_synthetic_event(&conn, &id, 1_000_000 + i as i64);
+            old_slices.push(id);
+        }
+        let new_message = make_event_id(99);
+        insert_synthetic_event(&conn, &new_message, 9_000_000);
+
+        let eq = EgressQueue::new(&conn);
+
+        // Enqueue slices first, then message (as would happen in reconciliation)
+        eq.enqueue_events("peer1", &old_slices).unwrap();
+        eq.enqueue_events("peer1", &[new_message]).unwrap();
+
+        // Claim just 2 — new message should be in this first batch
+        let claimed = eq.claim_batch("peer1", 2).unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(
+            claimed[0].1, new_message,
+            "new message should be claimed first, ahead of 5 old file slices"
+        );
     }
 }
