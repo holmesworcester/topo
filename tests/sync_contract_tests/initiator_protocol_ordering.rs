@@ -9,6 +9,7 @@ use tokio_util::sync::CancellationToken;
 
 use topo::contracts::peering_contract::{SessionDirection, SessionHandler};
 use topo::protocol::Frame;
+use topo::sync::session::windowing::decode_initial_neg_open;
 use topo::sync::session_handler::SyncSessionHandler;
 
 use crate::fake_session_io::{
@@ -52,10 +53,11 @@ async fn drive_empty_responder(peer: &mut FakePeerSide) {
 
     // 3. Respond with NegMsg to complete reconciliation.
     if let Frame::NegOpen { msg } = neg_open {
+        let (_window, msg) = decode_initial_neg_open(&msg).expect("decode NegOpen header");
         let storage = empty_negentropy_storage();
         let mut neg =
             negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
-        let response = neg.reconcile(&msg).unwrap();
+        let response = neg.reconcile(msg).unwrap();
         peer.send_control_msg(&Frame::NegMsg { msg: response })
             .await;
     }
@@ -186,10 +188,11 @@ async fn anticheat_datadone_before_done() {
             .await
             .unwrap();
         if let Frame::NegOpen { msg } = neg_open {
+            let (_window, msg) = decode_initial_neg_open(&msg).expect("decode NegOpen header");
             let storage = empty_negentropy_storage();
             let mut neg =
                 negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
-            let response = neg.reconcile(&msg).unwrap();
+            let response = neg.reconcile(msg).unwrap();
             peer.send_control_msg(&Frame::NegMsg { msg: response })
                 .await;
         }

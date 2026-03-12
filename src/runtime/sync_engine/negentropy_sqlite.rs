@@ -25,6 +25,8 @@ pub struct NegentropyStorageSqlite<'a> {
     conn: &'a Connection,
     /// Workspace scope for neg_items queries
     workspace_id: String,
+    ts_min: Option<i64>,
+    ts_max_exclusive: Option<i64>,
     /// Cached size (computed once per sync)
     cached_size: RefCell<Option<usize>>,
 }
@@ -32,9 +34,20 @@ pub struct NegentropyStorageSqlite<'a> {
 impl<'a> NegentropyStorageSqlite<'a> {
     /// Create a new SQLite storage adapter scoped to the given workspace.
     pub fn new(conn: &'a Connection, workspace_id: &str) -> Self {
+        Self::new_with_range(conn, workspace_id, None, None)
+    }
+
+    pub fn new_with_range(
+        conn: &'a Connection,
+        workspace_id: &str,
+        ts_min: Option<i64>,
+        ts_max_exclusive: Option<i64>,
+    ) -> Self {
         Self {
             conn,
             workspace_id: workspace_id.to_string(),
+            ts_min,
+            ts_max_exclusive,
             cached_size: RefCell::new(None),
         }
     }
@@ -68,9 +81,14 @@ impl<'a> NegentropyStorageSqlite<'a> {
         // before any events are stored, so no empty-workspace_id fallback
         // is needed. This uses the (workspace_id, ts, id) primary key
         // directly — no temp B-tree sort.
-        let mut stmt = self
-            .conn
-            .prepare("SELECT ts, id FROM neg_items WHERE workspace_id = ?1 ORDER BY ts, id")?;
+        let mut stmt = self.conn.prepare(
+            "SELECT ts, id
+                 FROM neg_items
+                 WHERE workspace_id = :workspace_id
+                   AND (:ts_min IS NULL OR ts >= :ts_min)
+                   AND (:ts_max IS NULL OR ts < :ts_max)
+                 ORDER BY ts, id",
+        )?;
 
         let mut insert_stmt = self.conn.prepare(
             "INSERT INTO session_blocks (block_idx, ts, id, count) VALUES (?1, ?2, ?3, ?4)",
@@ -79,7 +97,11 @@ impl<'a> NegentropyStorageSqlite<'a> {
         let mut row_idx: usize = 0;
         let mut block_idx: usize = 0;
 
-        let mut rows = stmt.query(rusqlite::params![&self.workspace_id])?;
+        let mut rows = stmt.query(rusqlite::named_params! {
+            ":workspace_id": &self.workspace_id,
+            ":ts_min": self.ts_min,
+            ":ts_max": self.ts_max_exclusive,
+        })?;
         while let Some(row) = rows.next()? {
             if row_idx % BLOCK_SIZE == 0 {
                 let ts: i64 = row.get(0)?;
@@ -140,8 +162,16 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
         let count: i64 = self
             .conn
             .query_row(
-                "SELECT COUNT(*) FROM neg_items WHERE workspace_id = ?1",
-                rusqlite::params![&self.workspace_id],
+                "SELECT COUNT(*)
+                 FROM neg_items
+                 WHERE workspace_id = :workspace_id
+                   AND (:ts_min IS NULL OR ts >= :ts_min)
+                   AND (:ts_max IS NULL OR ts < :ts_max)",
+                rusqlite::named_params! {
+                    ":workspace_id": &self.workspace_id,
+                    ":ts_min": self.ts_min,
+                    ":ts_max": self.ts_max_exclusive,
+                },
                 |row| row.get(0),
             )
             .map_err(|e| sql_err(e))?;
@@ -162,12 +192,29 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
         };
 
         // Fetch item at offset within block
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT ts, id FROM neg_items WHERE workspace_id = ?1 AND (ts, id) >= (?2, ?3) ORDER BY ts, id LIMIT 1 OFFSET ?4"
-        ).map_err(|e| sql_err(e))?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ts, id
+                 FROM neg_items
+                 WHERE workspace_id = :workspace_id
+                   AND (:ts_min IS NULL OR ts >= :ts_min)
+                   AND (:ts_max IS NULL OR ts < :ts_max)
+                   AND (ts, id) >= (:block_ts, :block_id)
+                 ORDER BY ts, id
+                 LIMIT 1 OFFSET :offset",
+            )
+            .map_err(|e| sql_err(e))?;
 
         let result = stmt.query_row(
-            rusqlite::params![&self.workspace_id, block_ts, block_id, offset as i64],
+            rusqlite::named_params! {
+                ":workspace_id": &self.workspace_id,
+                ":ts_min": self.ts_min,
+                ":ts_max": self.ts_max_exclusive,
+                ":block_ts": block_ts,
+                ":block_id": block_id,
+                ":offset": offset as i64,
+            },
             |row| {
                 let ts: i64 = row.get(0)?;
                 let id: Vec<u8> = row.get(1)?;
@@ -203,18 +250,30 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
         };
 
         // Query items starting from begin position
-        let mut stmt = self.conn.prepare_cached(
-            "SELECT ts, id FROM neg_items WHERE workspace_id = ?1 AND (ts, id) >= (?2, ?3) ORDER BY ts, id LIMIT ?4 OFFSET ?5"
-        ).map_err(|e| sql_err(e))?;
+        let mut stmt = self
+            .conn
+            .prepare(
+                "SELECT ts, id
+                 FROM neg_items
+                 WHERE workspace_id = :workspace_id
+                   AND (:ts_min IS NULL OR ts >= :ts_min)
+                   AND (:ts_max IS NULL OR ts < :ts_max)
+                   AND (ts, id) >= (:block_ts, :block_id)
+                 ORDER BY ts, id
+                 LIMIT :limit OFFSET :offset",
+            )
+            .map_err(|e| sql_err(e))?;
 
         let mut rows = stmt
-            .query(rusqlite::params![
-                &self.workspace_id,
-                block_ts,
-                block_id,
-                count as i64,
-                offset_in_block as i64
-            ])
+            .query(rusqlite::named_params! {
+                ":workspace_id": &self.workspace_id,
+                ":ts_min": self.ts_min,
+                ":ts_max": self.ts_max_exclusive,
+                ":block_ts": block_ts,
+                ":block_id": block_id,
+                ":limit": count as i64,
+                ":offset": offset_in_block as i64,
+            })
             .map_err(|e| sql_err(e))?;
 
         let mut idx = begin;
@@ -260,17 +319,26 @@ impl NegentropyStorageBase for NegentropyStorageSqlite<'_> {
                 .get_block_start(block_idx as usize)?
                 .unwrap_or((0, vec![0u8; 32]));
 
-            let mut scan_stmt = self.conn.prepare_cached(
-                "SELECT ts, id FROM neg_items WHERE workspace_id = ?1 AND (ts, id) >= (?2, ?3) ORDER BY ts, id LIMIT ?4"
+            let mut scan_stmt = self.conn.prepare(
+                "SELECT ts, id
+                 FROM neg_items
+                 WHERE workspace_id = :workspace_id
+                   AND (:ts_min IS NULL OR ts >= :ts_min)
+                   AND (:ts_max IS NULL OR ts < :ts_max)
+                   AND (ts, id) >= (:block_ts, :block_id)
+                 ORDER BY ts, id
+                 LIMIT :limit",
             )?;
 
             let limit = BLOCK_SIZE + 1; // Scan at most one block plus one
-            let mut rows = scan_stmt.query(rusqlite::params![
-                &self.workspace_id,
-                block_start.0,
-                block_start.1,
-                limit as i64
-            ])?;
+            let mut rows = scan_stmt.query(rusqlite::named_params! {
+                ":workspace_id": &self.workspace_id,
+                ":ts_min": self.ts_min,
+                ":ts_max": self.ts_max_exclusive,
+                ":block_ts": block_start.0,
+                ":block_id": block_start.1,
+                ":limit": limit as i64,
+            })?;
 
             let mut position = block_start_count as usize;
             while let Some(row) = rows.next()? {
@@ -474,6 +542,24 @@ mod tests {
         };
         let pos = storage.find_lower_bound(0, 100, &bound);
         assert_eq!(pos, 50, "Should find item 50 at position 50");
+    }
+
+    #[test]
+    fn test_range_filtered_storage_hot_and_cold() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        insert_test_items(&conn, 10);
+
+        let hot = NegentropyStorageSqlite::new_with_range(&conn, "", Some(5_000), None);
+        hot.rebuild_blocks().unwrap();
+        assert_eq!(hot.size().unwrap(), 5);
+        assert_eq!(hot.get_item(0).unwrap().unwrap().timestamp, 5_000);
+
+        let cold = NegentropyStorageSqlite::new_with_range(&conn, "", None, Some(5_000));
+        cold.rebuild_blocks().unwrap();
+        assert_eq!(cold.size().unwrap(), 5);
+        assert_eq!(cold.get_item(4).unwrap().unwrap().timestamp, 4_000);
     }
 
     /// Test that compares SQLite storage with in-memory storage

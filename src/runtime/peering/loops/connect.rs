@@ -14,6 +14,7 @@ use crate::db::open_connection;
 use crate::db::store::lookup_workspace_id;
 use crate::db::transport_trust::record_transport_binding;
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
+use crate::sync::session::windowing::reset_outbound_window_state;
 use crate::sync::CoordinationManager;
 use crate::sync::SyncSessionHandler;
 use crate::transport::{
@@ -354,6 +355,7 @@ async fn connect_loop_inner(
             }
         };
         info!("Connected to {}", peer_id);
+        reset_outbound_window_state(db_path, &peer_id);
 
         // Record endpoint observation, transport binding, and purge expired
         {

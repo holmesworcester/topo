@@ -237,12 +237,14 @@ async fn test_egress_queue_lifecycle() {
     assert_eq!(pending, 3);
 
     // Claim batch
-    let claimed = eq.claim_batch(conn_id, 10).unwrap();
+    let claimed = eq
+        .claim_batch(conn_id, "scenario-test", 10, 30_000)
+        .unwrap();
     assert_eq!(claimed.len(), 3);
 
     // Mark sent
     let rowids: Vec<i64> = claimed.iter().map(|(rowid, _)| *rowid).collect();
-    eq.mark_sent(&rowids).unwrap();
+    eq.mark_sent("scenario-test", &rowids).unwrap();
 
     // Count pending after sending
     let pending = eq.count_pending(conn_id).unwrap();

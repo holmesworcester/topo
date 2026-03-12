@@ -177,8 +177,8 @@ async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
     // signed_by references an existing PeerShared signer event, but signer_type is invalid
     let inner = ParsedEvent::Message(MessageEvent {
         created_at_ms: 999999u64,
-        workspace_id: [0u8; 32],
-        author_id: alice.peer_shared_event_id.unwrap(),
+        workspace_id: alice.workspace_id,
+        author_id: alice.author_id,
         content: "bad signer type".to_string(),
         signed_by: alice.peer_shared_event_id.unwrap(),
         signer_type: 255, // unsupported

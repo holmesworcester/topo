@@ -22,7 +22,7 @@ use crate::transport::{StreamRecv, StreamSend};
 use crate::tuning::low_mem_memtrace;
 
 use super::logging::SyncRunRxCapture;
-use super::{egress_claim_count, enqueue_batch, have_chunk};
+use super::{egress_claim_count, enqueue_batch, have_chunk, EGRESS_LEASE_MS};
 
 pub struct DataPlaneSendStats {
     pub events_sent_delta: u64,
@@ -54,6 +54,7 @@ pub async fn drain_egress_to_data_stream<S>(
     egress: &EgressQueue<'_>,
     store: &Store<'_>,
     peer_id: &str,
+    lease_owner: &str,
     data_send: &mut S,
 ) -> DataPlaneSendStats
 where
@@ -62,40 +63,40 @@ where
     let mut events_sent_delta = 0u64;
     let mut bytes_sent_delta = 0u64;
     let mut sent_any = false;
-    let mut blocked = false;
-
-    while !blocked {
-        let batch = egress
-            .claim_batch(peer_id, egress_claim_count())
-            .unwrap_or_default();
-        if batch.is_empty() {
-            break;
-        }
-
-        let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
-        let mut missing_count = 0u64;
-        for (rowid, event_id) in batch {
-            if let Ok(Some(blob)) = store.get_shared(&event_id) {
-                let blob_len = blob.len() as u64;
-                if data_send.send(&Frame::Event { blob }).await.is_ok() {
-                    events_sent_delta += 1;
-                    bytes_sent_delta += blob_len;
-                    sent_any = true;
-                    sent_rowids.push(rowid);
-                } else {
-                    blocked = true;
-                    break;
-                }
-            } else {
-                missing_count += 1;
-                sent_rowids.push(rowid);
+    let batch =
+        match egress.claim_batch(peer_id, lease_owner, egress_claim_count(), EGRESS_LEASE_MS) {
+            Ok(batch) => batch,
+            Err(err) => {
+                warn!(
+                    "failed to claim egress batch peer={} owner={} error={}",
+                    peer_id, lease_owner, err
+                );
+                Vec::new()
             }
+        };
+
+    let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
+    let mut missing_count = 0u64;
+    for (rowid, event_id) in batch {
+        if let Ok(Some(blob)) = store.get_shared(&event_id) {
+            let blob_len = blob.len() as u64;
+            if data_send.send(&Frame::Event { blob }).await.is_ok() {
+                events_sent_delta += 1;
+                bytes_sent_delta += blob_len;
+                sent_any = true;
+                sent_rowids.push(rowid);
+            } else {
+                break;
+            }
+        } else {
+            missing_count += 1;
+            sent_rowids.push(rowid);
         }
-        if missing_count > 0 {
-            tracing::debug!("{} events missing from store (not shared?)", missing_count);
-        }
-        let _ = egress.mark_sent(&sent_rowids);
     }
+    if missing_count > 0 {
+        tracing::debug!("{} events missing from store (not shared?)", missing_count);
+    }
+    let _ = egress.mark_sent(lease_owner, &sent_rowids);
 
     if sent_any {
         let _ = data_send.flush().await;

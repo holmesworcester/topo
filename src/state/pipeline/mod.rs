@@ -15,8 +15,8 @@ use crate::db::open_connection;
 use crate::db::store::{
     lookup_workspace_id, SQL_INSERT_EVENT, SQL_INSERT_NEG_ITEM, SQL_INSERT_RECORDED_EVENT,
 };
-use crate::event_modules::registry;
-use crate::tuning::{drain_batch_size, low_mem_mode, write_batch_cap};
+use crate::event_modules::{self as events, registry};
+use crate::tuning::{bulk_write_batch_cap, drain_batch_size, low_mem_mode, write_batch_cap};
 
 use self::effects::{
     run_post_commit_effects, PostCommitEffectsExecutor, SqlitePostCommitEffectsExecutor,
@@ -24,6 +24,32 @@ use self::effects::{
 use self::phases::{run_persist_phase, PersistPhaseOutput};
 
 pub use self::drain::drain_project_queue;
+
+fn ingest_is_bulk(item: &IngestItem) -> bool {
+    events::outer_semantic_type_code(&item.1) == Some(events::EVENT_TYPE_FILE_SLICE)
+}
+
+fn sort_ingest_batch(batch: &mut [IngestItem]) {
+    let mut foreground = Vec::with_capacity(batch.len());
+    let mut bulk = Vec::new();
+    for item in batch.iter().cloned() {
+        if ingest_is_bulk(&item) {
+            bulk.push(item);
+        } else {
+            foreground.push(item);
+        }
+    }
+    foreground.extend(bulk);
+    batch.clone_from_slice(&foreground);
+}
+
+fn ingest_batch_cap(first: &IngestItem) -> usize {
+    if ingest_is_bulk(first) {
+        bulk_write_batch_cap()
+    } else {
+        write_batch_cap()
+    }
+}
 
 fn prewarm_workspace_cache(
     db: &rusqlite::Connection,
@@ -47,9 +73,25 @@ fn commit_and_run_post_commit_effects<E: PostCommitEffectsExecutor>(
     batch_size: usize,
 ) -> rusqlite::Result<()> {
     db.execute("COMMIT", [])?;
-    enforce_low_mem_wal_cap(db)?;
-    run_post_commit_effects(effects_executor, persist_output, batch_size);
+    run_post_commit_tail(persist_output, effects_executor, batch_size, || {
+        enforce_low_mem_wal_cap(db)
+    });
     Ok(())
+}
+
+fn run_post_commit_tail<E, F>(
+    persist_output: &PersistPhaseOutput,
+    effects_executor: &E,
+    batch_size: usize,
+    wal_cap_check: F,
+) where
+    E: PostCommitEffectsExecutor,
+    F: FnOnce() -> rusqlite::Result<()>,
+{
+    if let Err(e) = wal_cap_check() {
+        tracing::warn!("post-commit WAL cap check failed: {}", e);
+    }
+    run_post_commit_effects(effects_executor, persist_output, batch_size);
 }
 
 fn low_mem_wal_cap_bytes() -> i64 {
@@ -150,8 +192,9 @@ pub fn batch_writer(
     };
 
     let mut enqueue_stmt = match db.prepare(
-        "INSERT OR IGNORE INTO project_queue (peer_id, event_id, available_at)
-         SELECT ?1, ?2, ?3
+        "INSERT OR IGNORE INTO project_queue
+         (peer_id, event_id, available_at, priority_lane, priority_ts)
+         SELECT ?1, ?2, ?3, ?4, ?5
          WHERE NOT EXISTS (SELECT 1 FROM valid_events WHERE peer_id=?1 AND event_id=?2)
          AND NOT EXISTS (SELECT 1 FROM rejected_events WHERE peer_id=?1 AND event_id=?2)
          AND NOT EXISTS (SELECT 1 FROM blocked_event_deps WHERE peer_id=?1 AND event_id=?2)",
@@ -175,14 +218,15 @@ pub fn batch_writer(
             None => break,
         };
 
-        let cap = write_batch_cap();
         let mut batch = vec![first];
+        let cap = ingest_batch_cap(&batch[0]);
         while let Ok(item) = rx.try_recv() {
             batch.push(item);
             if batch.len() >= cap {
                 break;
             }
         }
+        sort_ingest_batch(&mut batch);
 
         let batch_len = batch.len();
 
@@ -267,6 +311,7 @@ mod tests {
     use super::effects::PostCommitEffectsExecutor;
     use super::phases::PersistPhaseOutput;
     use super::*;
+    use crate::event_modules::{EVENT_TYPE_FILE_SLICE, EVENT_TYPE_MESSAGE};
 
     #[derive(Default)]
     struct RecordingExecutor {
@@ -287,6 +332,17 @@ mod tests {
             tenants_seen: HashSet::from(["tenant-b".to_string(), "tenant-a".to_string()]),
             shared_event_fanouts: Vec::new(),
         }
+    }
+
+    fn make_ingest_item(type_code: u8, created_at: u64, marker: u8) -> IngestItem {
+        let mut blob = vec![type_code];
+        blob.extend_from_slice(&created_at.to_le_bytes());
+        (
+            [marker; 32],
+            blob,
+            "tenant-a".to_string(),
+            "sync".to_string(),
+        )
     }
 
     #[test]
@@ -327,5 +383,49 @@ mod tests {
             *recorded_batch_size, 16,
             "effects should receive batch size"
         );
+    }
+
+    #[test]
+    fn event_pipeline_wal_cap_failure_does_not_skip_effects() {
+        let executor = RecordingExecutor::default();
+        let persist_output = sample_persist_output();
+
+        run_post_commit_tail(&persist_output, &executor, 8, || {
+            Err(rusqlite::Error::InvalidQuery)
+        });
+
+        let invocations = executor.invocations.borrow();
+        assert_eq!(
+            invocations.len(),
+            1,
+            "effects should still run after advisory WAL-cap failure"
+        );
+        let (recorded_output, recorded_batch_size) = &invocations[0];
+        assert_eq!(recorded_output, &persist_output);
+        assert_eq!(*recorded_batch_size, 8);
+    }
+
+    #[test]
+    fn ingest_sort_prefers_foreground_while_preserving_arrival_order() {
+        let mut batch = vec![
+            make_ingest_item(EVENT_TYPE_FILE_SLICE, 10, 1),
+            make_ingest_item(EVENT_TYPE_MESSAGE, 20, 2),
+            make_ingest_item(EVENT_TYPE_MESSAGE, 30, 3),
+        ];
+
+        sort_ingest_batch(&mut batch);
+
+        assert_eq!(batch[0].0, [2u8; 32]);
+        assert_eq!(batch[1].0, [3u8; 32]);
+        assert_eq!(batch[2].0, [1u8; 32]);
+    }
+
+    #[test]
+    fn ingest_batch_cap_micro_batches_bulk_first_items() {
+        let bulk = make_ingest_item(EVENT_TYPE_FILE_SLICE, 10, 1);
+        let message = make_ingest_item(EVENT_TYPE_MESSAGE, 10, 2);
+
+        assert_eq!(ingest_batch_cap(&bulk), bulk_write_batch_cap());
+        assert_eq!(ingest_batch_cap(&message), write_batch_cap());
     }
 }

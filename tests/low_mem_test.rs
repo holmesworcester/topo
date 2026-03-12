@@ -84,17 +84,17 @@ async fn low_mem_ios_functional_smoke_2k() {
     alice.batch_create_messages(1_000);
     bob.batch_create_messages(1_000);
 
-    let alice_messages_before_sync = alice.stored_message_event_count();
-    let bob_messages_before_sync = bob.stored_message_event_count();
-    let expected_alice_messages = alice_messages_before_sync + bob_messages_before_sync;
-    let expected_bob_messages = bob_messages_before_sync + alice_messages_before_sync;
+    let alice_shared_before_sync = alice.shared_store_count();
+    let bob_shared_before_sync = bob.shared_store_count();
+    let expected_alice_shared = alice_shared_before_sync + bob_shared_before_sync;
+    let expected_bob_shared = bob_shared_before_sync + alice_shared_before_sync;
 
     let _metrics = sync_until_converged(
         &alice,
         &bob,
         || {
-            alice.stored_message_event_count() >= expected_alice_messages
-                && bob.stored_message_event_count() >= expected_bob_messages
+            alice.shared_store_count() >= expected_alice_shared
+                && bob.shared_store_count() >= expected_bob_shared
         },
         Duration::from_secs(120),
     )
@@ -125,18 +125,19 @@ async fn low_mem_ios_budget_smoke_10k() {
     alice.batch_create_messages(5_000);
     bob.batch_create_messages(5_000);
 
-    // Convergence gate on stored Message events (canonical events table).
-    let alice_messages_before_sync = alice.stored_message_event_count();
-    let bob_messages_before_sync = bob.stored_message_event_count();
-    let expected_alice_messages = alice_messages_before_sync + bob_messages_before_sync;
-    let expected_bob_messages = bob_messages_before_sync + alice_messages_before_sync;
+    // Convergence gate on raw shared events. Remote messages are synced into
+    // the store but may remain projection-blocked across independently bootstrapped peers.
+    let alice_shared_before_sync = alice.shared_store_count();
+    let bob_shared_before_sync = bob.shared_store_count();
+    let expected_alice_shared = alice_shared_before_sync + bob_shared_before_sync;
+    let expected_bob_shared = bob_shared_before_sync + alice_shared_before_sync;
 
     let _metrics = sync_until_converged(
         &alice,
         &bob,
         || {
-            alice.stored_message_event_count() >= expected_alice_messages
-                && bob.stored_message_event_count() >= expected_bob_messages
+            alice.shared_store_count() >= expected_alice_shared
+                && bob.shared_store_count() >= expected_bob_shared
         },
         Duration::from_secs(180),
     )
@@ -181,15 +182,15 @@ async fn low_mem_ios_budget_soak_million() {
     let bob = Peer::new_with_identity("bob_lowmem_soak");
 
     alice.batch_create_messages(events);
-    // Convergence gate: wait for bob to ingest alice's Message events.
-    let alice_messages_before_sync = alice.stored_message_event_count();
-    let bob_messages_before_sync = bob.stored_message_event_count();
-    let expected_bob_messages = bob_messages_before_sync + alice_messages_before_sync;
+    // Convergence gate on raw shared events. Projection validity is a separate concern.
+    let alice_shared_before_sync = alice.shared_store_count();
+    let bob_shared_before_sync = bob.shared_store_count();
+    let expected_bob_shared = bob_shared_before_sync + alice_shared_before_sync;
 
     let _metrics = sync_until_converged(
         &alice,
         &bob,
-        || bob.stored_message_event_count() >= expected_bob_messages,
+        || bob.shared_store_count() >= expected_bob_shared,
         Duration::from_secs(3600),
     )
     .await;

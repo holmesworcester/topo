@@ -369,7 +369,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
     let fallback_marker_b64 = event_id_to_base64(&fallback_marker);
 
     let provider = rustls::crypto::ring::default_provider();
-    let mut cert_resolver_a = WorkspaceCertResolver::new();
+    let cert_resolver_a = WorkspaceCertResolver::new();
     let mut default_cert_a: Option<(CertificateDer<'static>, PrivatePkcs8KeyDer<'static>)> = None;
 
     for t in &tenants_a {
@@ -466,7 +466,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
     }
 
     // Node B endpoint (for outbound connect_loop calls)
-    let mut cert_resolver_b = WorkspaceCertResolver::new();
+    let cert_resolver_b = WorkspaceCertResolver::new();
     let mut default_cert_b: Option<(CertificateDer<'static>, PrivatePkcs8KeyDer<'static>)> = None;
     for t in &tenants_b {
         let cert_der = CertificateDer::from(t.cert_der.clone());

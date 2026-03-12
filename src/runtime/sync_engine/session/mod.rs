@@ -16,6 +16,7 @@ pub mod data_plane;
 pub mod initiator;
 pub mod logging;
 pub mod responder;
+pub mod windowing;
 
 use std::time::Duration;
 
@@ -75,12 +76,16 @@ pub(super) fn egress_claim_count() -> usize {
     if low_mem_mode() {
         2
     } else {
-        500
+        8
     }
 }
 
 /// Max age (ms) for sent egress entries before cleanup.
 pub(super) const EGRESS_SENT_TTL_MS: i64 = 300_000;
+/// Lease duration for one egress claim batch.
+pub(super) const EGRESS_LEASE_MS: i64 = 30_000;
+/// Small quiet period before declaring a session's outbound egress drained.
+pub(super) const EGRESS_QUIET_WINDOW: Duration = Duration::from_millis(500);
 
 /// Time to wait for inbound data stream drain at session end.
 pub(super) const DATA_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);

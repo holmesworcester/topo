@@ -106,10 +106,19 @@ pub(super) fn run_persist_phase(
                     }
 
                     // Enqueue for durable projection (atomicity boundary 1)
+                    let priority_lane = if events::outer_semantic_type_code(blob)
+                        == Some(events::EVENT_TYPE_FILE_SLICE)
+                    {
+                        2
+                    } else {
+                        1
+                    };
                     if let Err(e) = enqueue_stmt.execute(rusqlite::params![
                         recorded_by,
                         &event_id_b64,
-                        current_timestamp_ms()
+                        current_timestamp_ms(),
+                        priority_lane,
+                        created_at_ms as i64
                     ]) {
                         tracing::warn!("project_queue enqueue error for {}: {}", event_id_b64, e);
                     }
@@ -149,4 +158,73 @@ pub(super) fn run_persist_phase(
     }
 
     persist_output
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use super::*;
+    use crate::crypto::{event_id_to_base64, hash_event};
+    use crate::db::{
+        open_in_memory,
+        schema::create_tables,
+        store::{SQL_INSERT_EVENT, SQL_INSERT_NEG_ITEM, SQL_INSERT_RECORDED_EVENT},
+    };
+    use crate::event_modules::{self, EncryptedEvent, ParsedEvent, EVENT_TYPE_FILE_SLICE};
+
+    #[test]
+    fn run_persist_phase_enqueues_encrypted_file_slice_as_bulk() {
+        let db = open_in_memory().unwrap();
+        create_tables(&db).unwrap();
+
+        let mut neg_items_stmt = db.prepare(SQL_INSERT_NEG_ITEM).unwrap();
+        let mut recorded_stmt = db.prepare(SQL_INSERT_RECORDED_EVENT).unwrap();
+        let mut events_stmt = db.prepare(SQL_INSERT_EVENT).unwrap();
+        let mut enqueue_stmt = db
+            .prepare(
+                "INSERT OR IGNORE INTO project_queue
+                 (peer_id, event_id, available_at, priority_lane, priority_ts)
+                 SELECT ?1, ?2, ?3, ?4, ?5
+                 WHERE NOT EXISTS (SELECT 1 FROM valid_events WHERE peer_id=?1 AND event_id=?2)
+                 AND NOT EXISTS (SELECT 1 FROM rejected_events WHERE peer_id=?1 AND event_id=?2)
+                 AND NOT EXISTS (SELECT 1 FROM blocked_event_deps WHERE peer_id=?1 AND event_id=?2)",
+            )
+            .unwrap();
+        let mut workspace_cache = HashMap::new();
+        let blob = event_modules::encode_event(&ParsedEvent::Encrypted(EncryptedEvent {
+            created_at_ms: 123,
+            key_event_id: [7u8; 32],
+            inner_type_code: EVENT_TYPE_FILE_SLICE,
+            nonce: [8u8; 12],
+            ciphertext: vec![0u8; event_modules::file_slice::FILE_SLICE_WIRE_SIZE],
+            auth_tag: [9u8; 16],
+        }))
+        .unwrap();
+        let event_id = hash_event(&blob);
+        let batch = vec![(event_id, blob, "peer-alpha".to_string(), "sync".to_string())];
+
+        let output = run_persist_phase(
+            &db,
+            &batch,
+            event_modules::registry(),
+            &mut workspace_cache,
+            &mut neg_items_stmt,
+            &mut recorded_stmt,
+            &mut events_stmt,
+            &mut enqueue_stmt,
+        );
+
+        assert_eq!(output.persisted_event_ids, vec![event_id]);
+        let priority_lane: i64 = db
+            .query_row(
+                "SELECT priority_lane
+                 FROM project_queue
+                 WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params!["peer-alpha", event_id_to_base64(&event_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(priority_lane, 2);
+    }
 }

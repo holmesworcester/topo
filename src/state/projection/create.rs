@@ -78,6 +78,7 @@ fn store_blob_only(
     blob: &[u8],
     meta: &events::EventTypeMeta,
     created_at_ms: i64,
+    queue_priority: (i64, i64),
 ) -> Result<EventId, CreateEventError> {
     let event_id = hash_event(blob);
 
@@ -126,8 +127,13 @@ fn store_blob_only(
     if meta.share_scope == crate::event_modules::registry::ShareScope::Shared {
         let event_id_b64 = crate::crypto::event_id_to_base64(&event_id);
         let pq = crate::state::db::project_queue::ProjectQueue::new(conn);
-        pq.enqueue(recorded_by, &event_id_b64)
-            .map_err(|e| CreateEventError::DbError(e.to_string()))?;
+        pq.enqueue_classified(
+            recorded_by,
+            &event_id_b64,
+            queue_priority.0,
+            queue_priority.1,
+        )
+        .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
         if let Some(ref ws_id) = ws_id_for_neg {
             let fanout_entry = crate::state::shared_workspace_fanout::SharedEventFanout {
@@ -148,6 +154,7 @@ fn project_stored_event(
     conn: &Connection,
     recorded_by: &str,
     event_id: &EventId,
+    queue_priority: Option<(i64, i64)>,
 ) -> Result<EventId, CreateEventError> {
     let decision = project_one(conn, recorded_by, event_id)
         .map_err(|e| CreateEventError::DbError(e.to_string()))?;
@@ -162,6 +169,23 @@ fn project_stored_event(
 
             fanout_stored_shared_event_immediate(conn, recorded_by, event_id)
                 .map_err(|e| CreateEventError::DbError(e.to_string()))?;
+            match queue_priority {
+                Some((priority_lane, priority_ts)) => {
+                    crate::state::db::egress_queue::enqueue_local_shared_event_to_remote_peers_with_priority(
+                        conn,
+                        recorded_by,
+                        event_id,
+                        priority_lane,
+                        priority_ts,
+                    )
+                }
+                None => crate::state::db::egress_queue::enqueue_local_shared_event_to_remote_peers(
+                    conn,
+                    recorded_by,
+                    event_id,
+                ),
+            }
+            .map_err(|e| CreateEventError::DbError(e.to_string()))?;
             Ok(*event_id)
         }
         ProjectionDecision::Block { missing } => Err(CreateEventError::Blocked {
@@ -183,8 +207,9 @@ fn store_blob_and_project(
     meta: &events::EventTypeMeta,
     created_at_ms: i64,
 ) -> Result<EventId, CreateEventError> {
-    let event_id = store_blob_only(conn, recorded_by, blob, meta, created_at_ms)?;
-    project_stored_event(conn, recorded_by, &event_id)
+    let queue_priority = crate::state::db::queue::classify_priority_from_blob(blob, created_at_ms);
+    let event_id = store_blob_only(conn, recorded_by, blob, meta, created_at_ms, queue_priority)?;
+    project_stored_event(conn, recorded_by, &event_id, Some(queue_priority))
 }
 
 /// Create a new event: encode, hash, write to events/neg_items/recorded_events,
@@ -272,7 +297,15 @@ pub fn store_signed_event_only(
     blob[blob_len - sig_len..].copy_from_slice(&sig);
 
     let created_at_ms = event.created_at_ms() as i64;
-    store_blob_only(conn, recorded_by, &blob, meta, created_at_ms)
+    let queue_priority = crate::state::db::queue::classify_priority_from_blob(&blob, created_at_ms);
+    store_blob_only(
+        conn,
+        recorded_by,
+        &blob,
+        meta,
+        created_at_ms,
+        queue_priority,
+    )
 }
 
 /// Store an unsigned event without projecting. Returns the event_id.
@@ -292,7 +325,15 @@ pub fn store_event_only(
         .ok_or_else(|| CreateEventError::EncodeError(format!("unknown type code {}", type_code)))?;
 
     let created_at_ms = event.created_at_ms() as i64;
-    store_blob_only(conn, recorded_by, &blob, meta, created_at_ms)
+    let queue_priority = crate::state::db::queue::classify_priority_from_blob(&blob, created_at_ms);
+    store_blob_only(
+        conn,
+        recorded_by,
+        &blob,
+        meta,
+        created_at_ms,
+        queue_priority,
+    )
 }
 
 /// Project a previously-stored event. Returns event_id on Valid/AlreadyProcessed,
@@ -302,7 +343,7 @@ pub fn project_event(
     recorded_by: &str,
     event_id: &EventId,
 ) -> Result<EventId, CreateEventError> {
-    project_stored_event(conn, recorded_by, event_id)
+    project_stored_event(conn, recorded_by, event_id, None)
 }
 
 /// Project a previously-stored event, tolerating Block results (staged flow).
@@ -312,7 +353,7 @@ pub fn project_event_staged(
     recorded_by: &str,
     event_id: &EventId,
 ) -> Result<EventId, CreateEventError> {
-    event_id_or_blocked(project_stored_event(conn, recorded_by, event_id))
+    event_id_or_blocked(project_stored_event(conn, recorded_by, event_id, None))
 }
 
 /// Create an encrypted event: encode inner event, optionally sign it,

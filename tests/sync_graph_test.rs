@@ -48,20 +48,23 @@ fn compute_hop_delays(reach_ms: &[u64]) -> Vec<f64> {
     hop_delays
 }
 
-/// Wait until each peer reaches full convergence on stored Message events and
+/// Wait until each peer reaches full convergence on recorded Message events and
 /// return per-peer convergence timestamps (ms since `start`) in peer order.
-async fn wait_for_full_stored_message_convergence_times(
+async fn wait_for_full_message_convergence_times(
     peers: &[Peer],
-    expected_stored_message_count: i64,
+    expected_message_count: i64,
     timeout: Duration,
     start: Instant,
 ) -> Vec<u64> {
     let mut reached: Vec<Option<u64>> = vec![None; peers.len()];
     loop {
         let elapsed_ms = start.elapsed().as_millis() as u64;
-        let counts: Vec<i64> = peers.iter().map(Peer::stored_message_event_count).collect();
+        let counts: Vec<i64> = peers
+            .iter()
+            .map(Peer::recorded_message_event_count)
+            .collect();
         for (i, count) in counts.iter().enumerate() {
-            if reached[i].is_none() && *count == expected_stored_message_count {
+            if reached[i].is_none() && *count == expected_message_count {
                 reached[i] = Some(elapsed_ms);
             }
         }
@@ -75,10 +78,10 @@ async fn wait_for_full_stored_message_convergence_times(
 
         assert!(
             start.elapsed() < timeout,
-            "chain stored-message convergence timed out after {:?}: stored_message_counts={:?}, expected={}",
+            "chain message convergence timed out after {:?}: message_counts={:?}, expected={}",
             timeout,
             counts,
-            expected_stored_message_count
+            expected_message_count
         );
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
@@ -96,9 +99,9 @@ fn percentile(sorted: &[f64], pct: f64) -> f64 {
 fn print_chain_message_counts(peers: &[Peer]) {
     for (i, peer) in peers.iter().enumerate() {
         eprintln!(
-            "  P{} stored messages: {}",
+            "  P{} recorded message events: {}",
             i,
-            peer.stored_message_event_count()
+            peer.recorded_message_event_count()
         );
     }
 }
@@ -119,20 +122,21 @@ async fn run_chain_bench(n: usize, event_count: usize) {
     let gen_secs = gen_start.elapsed().as_secs_f64();
     eprintln!("Generated {} events at P0 in {:.2}s", event_count, gen_secs);
 
-    // Convergence target on canonical stored Message events: all peers should
-    // eventually store the same message event set from P0.
-    let expected_stored_message_count = event_count as i64;
+    // Convergence target on recorded message events: all peers should
+    // eventually record the same message event set from P0 even though the
+    // local tenant may not be able to decrypt another workspace's content.
+    let expected_message_count = event_count as i64;
 
     let rss_before = peak_rss_mib();
     let start = Instant::now();
 
     let handles = start_chain(&peers);
 
-    // Count-only timing: convergence is measured from per-peer stored Message
-    // event counts (canonical events table, not local-scoped projection rows).
-    let convergence_ms = wait_for_full_stored_message_convergence_times(
+    // Count-only timing: convergence is measured from per-peer recorded
+    // message-event counts using the encrypted wrapper's outer semantic type.
+    let convergence_ms = wait_for_full_message_convergence_times(
         &peers,
-        expected_stored_message_count,
+        expected_message_count,
         Duration::from_secs(600),
         start,
     )
@@ -242,10 +246,11 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
         expected_owner_counts
     );
 
-    // Convergence target: union of all source Message event IDs.
+    // Convergence target: union of all source message event IDs, using the
+    // encrypted wrapper's outer semantic type instead of decrypted validity.
     let expected_sink_message_ids: BTreeSet<String> = sources
         .iter()
-        .flat_map(|s| s.event_ids_by_type("message").into_iter())
+        .flat_map(|s| s.recorded_message_event_ids().into_iter())
         .collect();
     let expected_sink_message_count = expected_sink_message_ids.len() as i64;
 
@@ -261,10 +266,10 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
         120
     };
     assert_eventually(
-        || sink.stored_message_event_count() == expected_sink_message_count,
+        || sink.recorded_message_event_count() == expected_sink_message_count,
         Duration::from_secs(timeout_secs),
         &format!(
-            "sink reaches expected stored_message_event_count={}",
+            "sink reaches expected recorded_message_event_count={}",
             expected_sink_message_count
         ),
     )
@@ -278,7 +283,7 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
     let mb_per_sec = events_per_sec * msg_bytes as f64 / (1024.0 * 1024.0);
 
     // Exact set equality validates full message dataset catchup.
-    let sink_ids = sink.event_ids_by_type("message");
+    let sink_ids = sink.recorded_message_event_ids();
     assert_eq!(
         sink_ids, expected_sink_message_ids,
         "sink message IDs must match union of source message IDs"
@@ -295,7 +300,10 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
     eprintln!("  Catchup wall:     {} ms", wall_ms);
     eprintln!("  Events/s:         {:.0}", events_per_sec);
     eprintln!("  MB/s:             {:.2}", mb_per_sec);
-    eprintln!("  Sink stored msgs: {}", sink.stored_message_event_count());
+    eprintln!(
+        "  Sink recorded msgs: {}",
+        sink.recorded_message_event_count()
+    );
     eprintln!(
         "  Peak RSS:         {:.1} MiB (before: {:.1})",
         rss_after, rss_before
@@ -378,7 +386,7 @@ async fn run_catchup_large_file(
             .map(|b| format!("{:02x}", b))
             .collect();
         let file_slice_count = source.event_ids_by_type("file_slice").len();
-        let message_count = source.event_ids_by_type("message").len();
+        let message_count = source.recorded_message_event_count();
         eprintln!("  Source map: S{} -> {}", idx, fp_hex);
         eprintln!(
             "    Source counts: file_slice={} message={}",
@@ -582,12 +590,12 @@ async fn catchup_non_uniform_sources() {
 
     // Wait for all messages to arrive
     assert_eventually(
-        || sink.stored_message_event_count() >= total_expected,
+        || sink.recorded_message_event_count() >= total_expected,
         Duration::from_secs(120),
         &format!(
             "sink receives all {} messages (current: {})",
             total_expected,
-            sink.stored_message_event_count()
+            sink.recorded_message_event_count()
         ),
     )
     .await;
@@ -617,7 +625,7 @@ async fn catchup_non_uniform_sources() {
         source_count, shared_count, unique_per_source
     );
     eprintln!("  Total expected: {}", total_expected);
-    eprintln!("  Sink received:  {}", sink.stored_message_event_count());
+    eprintln!("  Sink received:  {}", sink.recorded_message_event_count());
     eprintln!("  Wall time:      {} ms", wall_ms);
     eprintln!();
 }
@@ -661,12 +669,12 @@ async fn catchup_dead_peer_dropout() {
 
     // Wait for convergence: sink must get ALL events despite dead source.
     assert_eventually(
-        || sink.stored_message_event_count() >= expected_count,
+        || sink.recorded_message_event_count() >= expected_count,
         Duration::from_secs(120),
         &format!(
             "sink receives all {} messages despite dead source (current: {})",
             expected_count,
-            sink.stored_message_event_count()
+            sink.recorded_message_event_count()
         ),
     )
     .await;
@@ -680,15 +688,15 @@ async fn catchup_dead_peer_dropout() {
         source_count, event_count
     );
     eprintln!("  Expected: {}", expected_count);
-    eprintln!("  Sink received: {}", sink.stored_message_event_count());
+    eprintln!("  Sink received: {}", sink.recorded_message_event_count());
     eprintln!("  Wall time: {} ms", wall_ms);
     eprintln!();
 
     assert_eq!(
-        sink.stored_message_event_count(),
+        sink.recorded_message_event_count(),
         expected_count,
         "sink must have all {} messages even with dead source (got {})",
         expected_count,
-        sink.stored_message_event_count(),
+        sink.recorded_message_event_count(),
     );
 }

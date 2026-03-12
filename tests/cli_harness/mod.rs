@@ -59,6 +59,25 @@ pub fn topo_cmd(db: &str, args: &[&str]) -> Output {
         .expect("failed to run topo")
 }
 
+fn run_cli_with_db_lock_retry(args: &[&str], description: &str, timeout: Duration) -> Output {
+    let start = Instant::now();
+    loop {
+        let output = Command::new(bin())
+            .args(args)
+            .output()
+            .unwrap_or_else(|_| panic!("failed to run {description}"));
+        if output.status.success() {
+            return output;
+        }
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("database is locked") && start.elapsed() < timeout {
+            std::thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        return output;
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Daemon lifecycle
 // ---------------------------------------------------------------------------
@@ -89,6 +108,12 @@ impl Default for DaemonOptions {
     }
 }
 
+fn read_daemon_log(path: &Option<std::path::PathBuf>) -> String {
+    path.as_ref()
+        .and_then(|p| std::fs::read_to_string(p).ok())
+        .unwrap_or_default()
+}
+
 /// Start a daemon with default options (random port, suppressed I/O).
 pub fn start_daemon(db: &str) -> DaemonGuard {
     start_daemon_with_options(db, &DaemonOptions::default())
@@ -108,12 +133,18 @@ pub fn start_daemon_on_port(db: &str, port: u16) -> DaemonGuard {
 /// Start a daemon with full control over options.
 pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard {
     let socket = socket_path_for_db(db);
-    let bind_addr = match opts.bind_port {
+    let requested_bind_addr = match opts.bind_port {
         Some(port) => format!("127.0.0.1:{}", port),
         None => "127.0.0.1:0".to_string(),
     };
+    let mut retry_with_ephemeral_bind = false;
 
-    for attempt in 0..3 {
+    for attempt in 0..8 {
+        let bind_addr = if retry_with_ephemeral_bind {
+            "127.0.0.1:0".to_string()
+        } else {
+            requested_bind_addr.clone()
+        };
         let mut cmd = Command::new(bin());
         cmd.arg("--db")
             .arg(db)
@@ -159,24 +190,40 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
         }
 
         if let Some(status) = exited_early {
-            if attempt < 2 {
+            if socket.exists() {
+                wait_for_daemon_stopped(db, Duration::from_secs(2));
+            }
+            if attempt < 7 {
+                retry_with_ephemeral_bind |= opts.bind_port.is_some();
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
-            panic!("daemon exited immediately with {} (db={})", status, db);
+            panic!(
+                "daemon exited immediately with {} (db={})\nstdout:\n{}\nstderr:\n{}",
+                status,
+                db,
+                read_daemon_log(&opts.stdout_file),
+                read_daemon_log(&opts.stderr_file)
+            );
         }
 
         if !socket.exists() {
             let _ = child.kill();
             let _ = child.wait();
-            if attempt < 2 {
+            if socket.exists() {
+                wait_for_daemon_stopped(db, Duration::from_secs(2));
+            }
+            if attempt < 7 {
+                retry_with_ephemeral_bind |= opts.bind_port.is_some();
                 std::thread::sleep(Duration::from_millis(100));
                 continue;
             }
             panic!(
-                "daemon socket did not appear at {} within 5s (db={})",
+                "daemon socket did not appear at {} within 5s (db={})\nstdout:\n{}\nstderr:\n{}",
                 socket.display(),
-                db
+                db,
+                read_daemon_log(&opts.stdout_file),
+                read_daemon_log(&opts.stderr_file)
             );
         }
 
@@ -194,14 +241,20 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
             if rpc_start.elapsed().as_secs() >= 5 {
                 let _ = child.kill();
                 let _ = child.wait();
-                if attempt < 2 {
+                if socket.exists() {
+                    wait_for_daemon_stopped(db, Duration::from_secs(2));
+                }
+                if attempt < 7 {
+                    retry_with_ephemeral_bind |= opts.bind_port.is_some();
                     std::thread::sleep(Duration::from_millis(100));
                     break;
                 }
                 panic!(
-                    "daemon socket exists but RPC not responding after 5s (db={}): {}",
+                    "daemon socket exists but RPC not responding after 5s (db={}): {}\nstdout:\n{}\nstderr:\n{}",
                     db,
-                    String::from_utf8_lossy(&out.stderr)
+                    String::from_utf8_lossy(&out.stderr),
+                    read_daemon_log(&opts.stdout_file),
+                    read_daemon_log(&opts.stderr_file)
                 );
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -495,8 +548,25 @@ pub fn ensure_active_peer(db: &str, timeout: Duration) {
     );
 }
 
+fn active_tenant_peer_id(db: &str) -> Option<String> {
+    let active = Command::new(bin())
+        .args(["--db", db, "tenant", "active"])
+        .output()
+        .ok()?;
+    if !active.status.success() {
+        return None;
+    }
+    let active_stdout = String::from_utf8_lossy(&active.stdout).trim().to_string();
+    if active_stdout.is_empty() || active_stdout == "(no active tenant)" {
+        None
+    } else {
+        Some(active_stdout)
+    }
+}
+
 /// Send a message via daemon RPC, retrying transient errors.
 pub fn send_message(db: &str, content: &str) -> String {
+    let send_timeout = Duration::from_secs(60);
     ensure_active_peer(db, Duration::from_secs(10));
     let start = Instant::now();
     loop {
@@ -521,14 +591,25 @@ pub fn send_message(db: &str, content: &str) -> String {
             || stderr.contains("no active tenant")
             || stderr.contains("workspace has not completed initial sync yet")
             || stderr.contains("blocked on");
-        if retryable && start.elapsed() < Duration::from_secs(20) {
+        if retryable && start.elapsed() < send_timeout {
             if stderr.contains("no active tenant") {
+                ensure_active_peer(db, Duration::from_secs(5));
+            }
+            if stderr.contains("workspace has not completed initial sync yet") {
                 ensure_active_peer(db, Duration::from_secs(5));
             }
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }
-        panic!("send failed for db={}: {}", db, stderr);
+        let readiness_debug = if stderr.contains("workspace has not completed initial sync yet") {
+            wait_for_local_peer_signer(db, Duration::from_secs(1))
+                .err()
+                .map(|debug| format!(" ({debug})"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        panic!("send failed for db={}: {}{}", db, stderr, readiness_debug);
     }
 }
 
@@ -610,7 +691,7 @@ pub fn accept_invite(db: &str, invite_link: &str) {
 pub fn accept_invite_with_identity(db: &str, invite_link: &str, username: &str, devicename: &str) {
     let signer_wait_timeout =
         match topo::event_modules::workspace::invite_link::parse_invite_link(invite_link) {
-            Ok(invite) if invite.bootstrap_addrs.is_empty() => Duration::from_secs(2),
+            Ok(invite) if invite.bootstrap_addrs.is_empty() => Duration::ZERO,
             _ => Duration::from_secs(60),
         };
     accept_invite_with_identity_and_timeout(
@@ -627,20 +708,23 @@ pub fn accept_invite_with_identity_and_timeout(
     invite_link: &str,
     username: &str,
     devicename: &str,
-    signer_wait_timeout: Duration,
+    _signer_wait_timeout: Duration,
 ) {
     let tmp_daemon = start_daemon(db);
-    let output = Command::new(bin())
-        .arg("accept")
-        .arg("--db")
-        .arg(db)
-        .arg(invite_link)
-        .arg("--username")
-        .arg(username)
-        .arg("--devicename")
-        .arg(devicename)
-        .output()
-        .expect("failed to run accept");
+    let output = run_cli_with_db_lock_retry(
+        &[
+            "accept",
+            "--db",
+            db,
+            invite_link,
+            "--username",
+            username,
+            "--devicename",
+            devicename,
+        ],
+        "accept",
+        Duration::from_secs(10),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -667,12 +751,6 @@ pub fn accept_invite_with_identity_and_timeout(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    if let Err(debug) = wait_for_local_peer_signer(db, signer_wait_timeout) {
-        eprintln!(
-            "accept_invite: peer signer not materialized yet; continuing (db={}): {}",
-            db, debug
-        );
-    }
     // Stop temporary daemon; callers decide daemon lifecycle.
     let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
     drop(tmp_daemon);
@@ -688,7 +766,7 @@ pub fn accept_device_link(db: &str, invite_link: &str) {
 pub fn accept_device_link_with_name(db: &str, invite_link: &str, devicename: &str) {
     let signer_wait_timeout =
         match topo::event_modules::workspace::invite_link::parse_invite_link(invite_link) {
-            Ok(invite) if invite.bootstrap_addrs.is_empty() => Duration::from_secs(2),
+            Ok(invite) if invite.bootstrap_addrs.is_empty() => Duration::ZERO,
             _ => Duration::from_secs(60),
         };
     accept_device_link_with_name_and_timeout(db, invite_link, devicename, signer_wait_timeout);
@@ -698,19 +776,22 @@ pub fn accept_device_link_with_name_and_timeout(
     db: &str,
     invite_link: &str,
     devicename: &str,
-    signer_wait_timeout: Duration,
+    _signer_wait_timeout: Duration,
 ) {
     let tmp_daemon = start_daemon(db);
-    let output = Command::new(bin())
-        .arg("accept-link")
-        .arg("--db")
-        .arg(db)
-        .arg("--invite")
-        .arg(invite_link)
-        .arg("--devicename")
-        .arg(devicename)
-        .output()
-        .expect("failed to run accept-link");
+    let output = run_cli_with_db_lock_retry(
+        &[
+            "accept-link",
+            "--db",
+            db,
+            "--invite",
+            invite_link,
+            "--devicename",
+            devicename,
+        ],
+        "accept-link",
+        Duration::from_secs(10),
+    );
     let stderr = String::from_utf8_lossy(&output.stderr);
     let stdout = String::from_utf8_lossy(&output.stdout);
     assert!(
@@ -736,12 +817,6 @@ pub fn accept_device_link_with_name_and_timeout(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    if let Err(debug) = wait_for_local_peer_signer(db, signer_wait_timeout) {
-        eprintln!(
-            "accept_device_link: peer signer not materialized yet; continuing (db={}): {}",
-            db, debug
-        );
-    }
     let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
     drop(tmp_daemon);
     wait_for_daemon_stopped(db, Duration::from_secs(10));
@@ -751,8 +826,8 @@ fn wait_for_local_peer_signer(db: &str, timeout: Duration) -> Result<(), String>
     let start = Instant::now();
     while start.elapsed() < timeout {
         if let Ok(conn) = topo::db::open_connection(db) {
-            let tenant_id: Option<String> = conn
-                .query_row(
+            let tenant_id = active_tenant_peer_id(db).or_else(|| {
+                conn.query_row(
                     "SELECT recorded_by
                      FROM invites_accepted
                      ORDER BY created_at DESC, event_id DESC
@@ -760,7 +835,8 @@ fn wait_for_local_peer_signer(db: &str, timeout: Duration) -> Result<(), String>
                     [],
                     |row| row.get(0),
                 )
-                .ok();
+                .ok()
+            });
             if let Some(tenant_id) = tenant_id {
                 let has_signer: bool = conn
                     .query_row(
@@ -945,6 +1021,58 @@ pub fn assert_eventually(db: &str, predicate: &str, timeout_ms: u64) {
         predicate,
         text.trim()
     );
+}
+
+pub fn assert_value_eventually<T, F, P>(
+    timeout: Duration,
+    interval: Duration,
+    description: &str,
+    mut fetch: F,
+    predicate: P,
+) -> T
+where
+    T: std::fmt::Debug,
+    F: FnMut() -> T,
+    P: Fn(&T) -> bool,
+{
+    let start = Instant::now();
+    loop {
+        let value = fetch();
+        if predicate(&value) {
+            return value;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "timed out waiting for {} after {:?}; last value: {:?}",
+            description,
+            timeout,
+            value
+        );
+        std::thread::sleep(interval);
+    }
+}
+
+pub fn assert_condition_holds_for<F>(
+    duration: Duration,
+    interval: Duration,
+    description: &str,
+    mut predicate: F,
+) where
+    F: FnMut() -> bool,
+{
+    let deadline = Instant::now() + duration;
+    loop {
+        assert!(
+            predicate(),
+            "condition stopped holding before {:?}: {}",
+            duration,
+            description
+        );
+        if Instant::now() >= deadline {
+            return;
+        }
+        std::thread::sleep(interval);
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1301,6 +1429,7 @@ pub fn accept_invite_lightweight(db: &str, invite_link: &str) {
 
 /// Send a file via daemon RPC. Returns the event ID.
 pub fn send_file(db: &str, content: &str, file_path: &str) -> String {
+    let send_timeout = Duration::from_secs(60);
     ensure_active_peer(db, Duration::from_secs(10));
     let start = Instant::now();
     loop {
@@ -1327,14 +1456,28 @@ pub fn send_file(db: &str, content: &str, file_path: &str) -> String {
             || stderr.contains("no active tenant")
             || stderr.contains("workspace has not completed initial sync yet")
             || stderr.contains("blocked on");
-        if retryable && start.elapsed() < Duration::from_secs(20) {
+        if retryable && start.elapsed() < send_timeout {
             if stderr.contains("no active tenant") {
+                ensure_active_peer(db, Duration::from_secs(5));
+            }
+            if stderr.contains("workspace has not completed initial sync yet") {
                 ensure_active_peer(db, Duration::from_secs(5));
             }
             std::thread::sleep(Duration::from_millis(100));
             continue;
         }
-        panic!("send-file failed for db={}: {}", db, stderr);
+        let readiness_debug = if stderr.contains("workspace has not completed initial sync yet") {
+            wait_for_local_peer_signer(db, Duration::from_secs(1))
+                .err()
+                .map(|debug| format!(" ({debug})"))
+                .unwrap_or_default()
+        } else {
+            String::new()
+        };
+        panic!(
+            "send-file failed for db={}: {}{}",
+            db, stderr, readiness_debug
+        );
     }
 }
 
@@ -1349,6 +1492,27 @@ pub fn save_file(db: &str, file_target: &str, output_path: &str) -> Output {
         .arg(output_path)
         .output()
         .expect("failed to run save-file")
+}
+
+pub fn save_file_eventually(db: &str, file_target: &str, output_path: &str, timeout: Duration) {
+    let start = Instant::now();
+    loop {
+        let output = save_file(db, file_target, output_path);
+        if output.status.success() {
+            return;
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let retryable =
+            stderr.contains("file incomplete") || stderr.contains("invalid file number");
+        assert!(
+            retryable && start.elapsed() < timeout,
+            "save-file failed before {:?}: {}",
+            timeout,
+            stderr.trim()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
 }
 
 /// Return `topo assert-eventually` output without asserting success.

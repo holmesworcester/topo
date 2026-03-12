@@ -17,6 +17,7 @@ use crate::db::{
     egress_queue::EgressQueue,
     need_queue::NeedQueue,
     open_connection,
+    queue::current_timestamp_ms,
     store::{lookup_workspace_id, Store},
     wanted::WantedEvents,
 };
@@ -38,7 +39,13 @@ use super::data_plane::{
     spawn_data_receiver,
 };
 use super::logging::SyncRunRxCapture;
-use super::{negentropy_frame_size, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS};
+use super::windowing::{
+    encode_initial_neg_open, mark_outbound_full_completed, select_outbound_window, SyncWindowKind,
+};
+use super::{
+    negentropy_frame_size, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_QUIET_WINDOW,
+    EGRESS_SENT_TTL_MS,
+};
 
 /// Run sync as the initiator (client role) with dual streams.
 /// Control stream: NegOpen, NegMsg, HaveList
@@ -56,6 +63,7 @@ pub async fn run_sync_initiator<C, S, R>(
     conn: DualConnection<C, S, R>,
     db_path: &str,
     timeout_secs: u64,
+    session_owner: &str,
     peer_id: &str,
     recorded_by: &str,
     ingress_source_tag: &str,
@@ -89,8 +97,6 @@ where
     let egress = EgressQueue::new(&db);
     let wanted = WantedEvents::new(&db);
     let need_queue = NeedQueue::new(&db);
-    let _ = egress.clear_connection(peer_id);
-    let _ = wanted.clear();
     let _ = need_queue.clear(peer_id);
 
     let ws_id = lookup_workspace_id(&db, recorded_by).ok_or_else(|| {
@@ -99,7 +105,13 @@ where
             recorded_by
         )
     })?;
-    let neg_storage = NegentropyStorageSqlite::new(&neg_db, &ws_id);
+    let sync_window = select_outbound_window(db_path, peer_id, current_timestamp_ms());
+    let neg_storage = NegentropyStorageSqlite::new_with_range(
+        &neg_db,
+        &ws_id,
+        sync_window.ts_min(),
+        sync_window.ts_max_exclusive(),
+    );
 
     if use_snapshot {
         neg_db
@@ -140,6 +152,7 @@ where
     );
 
     let initial_msg = neg.initiate()?;
+    let initial_msg = encode_initial_neg_open(sync_window, initial_msg);
     send_initial_neg_open(&mut control, initial_msg).await?;
 
     let mut reconciliation_done = false;
@@ -166,6 +179,7 @@ where
     let memtrace_file = std::env::var("LOW_MEM_MEMTRACE_FILE").ok();
     let mut last_memtrace = Instant::now();
     let mut last_alloc_trim = Instant::now();
+    let mut egress_quiet_since: Option<Instant> = None;
 
     loop {
         // Data receiver runs in a separate task — check if it received data
@@ -268,7 +282,8 @@ where
 
         enqueue_pending_have_to_egress(&egress, peer_id, &mut pending_have);
         let send_stats =
-            drain_egress_to_data_stream(&egress, &store, peer_id, &mut data_send).await;
+            drain_egress_to_data_stream(&egress, &store, peer_id, session_owner, &mut data_send)
+                .await;
         events_sent += send_stats.events_sent_delta;
         bytes_sent += send_stats.bytes_sent_delta;
         if send_stats.events_sent_delta > 0 {
@@ -351,21 +366,28 @@ where
                 last_egress_log = Instant::now();
             }
             if pending_out == 0 {
-                send_data_done(&mut data_send).await?;
-                send_done(&mut control).await?;
-                done_sent = true;
-                info!(
-                    "Sent DataDone+Done, waiting for DoneAck (sent {}, received {})",
-                    events_sent,
-                    events_received.load(Ordering::Relaxed)
-                );
+                let quiet_since = egress_quiet_since.get_or_insert_with(Instant::now);
+                if quiet_since.elapsed() >= EGRESS_QUIET_WINDOW {
+                    send_data_done(&mut data_send).await?;
+                    send_done(&mut control).await?;
+                    done_sent = true;
+                    info!(
+                        "Sent DataDone+Done, waiting for DoneAck (sent {}, received {})",
+                        events_sent,
+                        events_received.load(Ordering::Relaxed)
+                    );
+                }
+            } else {
+                egress_quiet_since = None;
             }
         }
     }
 
+    let _ = egress.release_leases(peer_id, session_owner);
     if completed {
-        let _ = egress.clear_connection(peer_id);
-        let _ = wanted.clear();
+        if sync_window.kind == SyncWindowKind::Full {
+            mark_outbound_full_completed(db_path, peer_id, current_timestamp_ms());
+        }
         let _ = need_queue.clear(peer_id);
         let _ = egress.cleanup_sent(EGRESS_SENT_TTL_MS);
     }
