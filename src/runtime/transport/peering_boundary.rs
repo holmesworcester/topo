@@ -247,6 +247,51 @@ pub fn build_tenant_bootstrap_fallback_client_config_from_db(
     )
 }
 
+/// Build an optional bootstrap-fallback client config for a tenant + peer.
+///
+/// Finds any active invite_bootstrap_trust row whose bootstrap_spki_fingerprint
+/// matches the given peer fingerprint, then resolves matching invite_secret key
+/// material from that invite.
+pub fn build_tenant_bootstrap_fallback_client_config_for_peer_from_db(
+    db_path: &str,
+    tenant_id: &str,
+    peer_spki_hex: &str,
+) -> Result<Option<TransportClientConfig>, Box<dyn std::error::Error + Send + Sync>> {
+    let peer_spki = hex::decode(peer_spki_hex)?;
+    if peer_spki.len() != 32 {
+        return Ok(None);
+    }
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)?
+        .as_millis() as i64;
+    let db = open_connection(db_path)?;
+    let key_bytes: Option<Vec<u8>> = db
+        .query_row(
+            "SELECT s.private_key
+             FROM invite_secrets s
+             WHERE s.recorded_by = ?1
+               AND length(s.private_key) = 32
+               AND EXISTS (
+                   SELECT 1
+                   FROM invite_bootstrap_trust t
+                   WHERE t.recorded_by = s.recorded_by
+                     AND t.invite_event_id = s.invite_event_id
+                     AND t.bootstrap_spki_fingerprint = ?2
+                     AND t.expires_at > ?3
+               )
+             ORDER BY s.created_at DESC, s.event_id DESC
+             LIMIT 1",
+            rusqlite::params![tenant_id, peer_spki, now_ms],
+            |row| row.get(0),
+        )
+        .optional()?;
+    drop(db);
+    let Some(key_bytes) = key_bytes else {
+        return Ok(None);
+    };
+    build_bootstrap_fallback_config_from_key_bytes(db_path, tenant_id, key_bytes)
+}
+
 pub fn tenant_trusts_peer(
     db_path: &str,
     tenant_id: &str,

@@ -23,6 +23,7 @@ pub use connection_lifecycle::{accept_peer, dial_peer, ConnectedPeer, Connection
 pub use peering_boundary::{
     accept_session_peer, accept_session_provider,
     build_tenant_bootstrap_fallback_client_config_for_invite_from_db,
+    build_tenant_bootstrap_fallback_client_config_for_peer_from_db,
     build_tenant_bootstrap_fallback_client_config_from_db, build_tenant_client_config_from_creds,
     build_tenant_client_config_from_db, create_runtime_endpoint_for_tenants, dial_session_peer,
     dial_session_provider, open_inbound_session, open_outbound_session,

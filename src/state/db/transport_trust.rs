@@ -549,6 +549,7 @@ pub fn list_active_invite_bootstrap_addrs(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InviteBootstrapTarget {
     pub invite_event_id: String,
+    pub peer_id: String,
     pub bootstrap_addr: String,
 }
 
@@ -562,7 +563,7 @@ pub fn list_active_invite_bootstrap_targets(
 ) -> Result<Vec<InviteBootstrapTarget>, Box<dyn std::error::Error + Send + Sync>> {
     let now = now_ms_i64();
     let mut stmt = conn.prepare(
-        "SELECT t.invite_event_id, t.bootstrap_addr
+        "SELECT t.invite_event_id, t.bootstrap_spki_fingerprint, t.bootstrap_addr
            FROM invite_bootstrap_trust t
           WHERE t.recorded_by = ?1
             AND t.expires_at > ?2
@@ -579,9 +580,20 @@ pub fn list_active_invite_bootstrap_targets(
     )?;
     let rows = stmt
         .query_map(rusqlite::params![recorded_by, now], |row| {
+            let bootstrap_spki_fingerprint: Vec<u8> = row.get(1)?;
+            let peer_id = decode_32_byte_blob(bootstrap_spki_fingerprint)
+                .map(hex::encode)
+                .ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        1,
+                        rusqlite::types::Type::Blob,
+                        "bootstrap_spki_fingerprint is not 32 bytes".into(),
+                    )
+                })?;
             Ok(InviteBootstrapTarget {
                 invite_event_id: row.get(0)?,
-                bootstrap_addr: row.get(1)?,
+                peer_id,
+                bootstrap_addr: row.get(2)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

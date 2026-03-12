@@ -28,6 +28,7 @@ use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate
 use crate::sync::CoordinationManager;
 use crate::transport::{
     build_tenant_bootstrap_fallback_client_config_for_invite_from_db,
+    build_tenant_bootstrap_fallback_client_config_for_peer_from_db,
     build_tenant_client_config_from_db, TenantClientConfigs, TransportClientConfig,
     TransportEndpoint,
 };
@@ -90,7 +91,10 @@ struct TenantDispatchContext {
 
 #[derive(Clone, Debug)]
 enum TargetIngressSource {
-    Bootstrap { invite_event_id: String },
+    Bootstrap {
+        peer_id: String,
+        invite_event_id: String,
+    },
     Observed { peer_id: String },
     Discovery { peer_id: String },
 }
@@ -485,12 +489,15 @@ async fn run_bootstrap_refresher(
         match collect_all_bootstrap_targets(&db_path) {
             Ok(targets) => {
                 warning_gate.clear();
-                for (tenant_id, invite_event_id, remote) in targets {
+                for (tenant_id, peer_id, invite_event_id, remote) in targets {
                     if ingress_tx
                         .send(TargetIngressEvent {
                             tenant_id,
                             remote,
-                            source: TargetIngressSource::Bootstrap { invite_event_id },
+                            source: TargetIngressSource::Bootstrap {
+                                peer_id,
+                                invite_event_id,
+                            },
                         })
                         .is_err()
                     {
@@ -611,8 +618,8 @@ async fn run_target_dispatcher(
         reap_finished_connect_workers(&mut active_workers, &mut dispatcher).await;
 
         let dispatch_key = match &event.source {
-            TargetIngressSource::Bootstrap { invite_event_id } => {
-                bootstrap_dispatch_key(&event.tenant_id, invite_event_id)
+            TargetIngressSource::Bootstrap { peer_id, .. } => {
+                bootstrap_dispatch_key(&event.tenant_id, peer_id)
             }
             TargetIngressSource::Observed { peer_id }
             | TargetIngressSource::Discovery { peer_id } => {
@@ -621,10 +628,10 @@ async fn run_target_dispatcher(
         };
 
         let should_spawn = match &event.source {
-            TargetIngressSource::Bootstrap { invite_event_id } => dispatch_bootstrap_target(
+            TargetIngressSource::Bootstrap { peer_id, .. } => dispatch_bootstrap_target(
                 &mut dispatcher,
                 &event.tenant_id,
-                invite_event_id,
+                peer_id,
                 event.remote,
             ),
             TargetIngressSource::Observed { peer_id }
@@ -666,21 +673,35 @@ async fn run_target_dispatcher(
         };
 
         let bootstrap_fallback_client_config = match &event.source {
-            TargetIngressSource::Bootstrap { invite_event_id } => {
+            TargetIngressSource::Bootstrap {
+                peer_id,
+                invite_event_id,
+            } => {
                 match build_tenant_bootstrap_fallback_client_config_for_invite_from_db(
                     &db_path,
                     &event.tenant_id,
                     invite_event_id,
                 ) {
-                    Ok(cfg) => cfg,
-                    Err(err) => {
-                        warn!(
-                            "Bootstrap fallback config unavailable for tenant {} invite {}: {}",
-                            short_peer_id(&event.tenant_id),
-                            short_peer_id(invite_event_id),
-                            err
-                        );
-                        None
+                    Ok(Some(cfg)) => Some(cfg),
+                    Ok(None) | Err(_) => {
+                        // The specific invite may have been deduped or expired;
+                        // try any active invite for this peer.
+                        match build_tenant_bootstrap_fallback_client_config_for_peer_from_db(
+                            &db_path,
+                            &event.tenant_id,
+                            peer_id,
+                        ) {
+                            Ok(cfg) => cfg,
+                            Err(err) => {
+                                warn!(
+                                    "Bootstrap fallback config unavailable for tenant {} peer {}: {}",
+                                    short_peer_id(&event.tenant_id),
+                                    short_peer_id(peer_id),
+                                    err
+                                );
+                                None
+                            }
+                        }
                     }
                 }
             }
