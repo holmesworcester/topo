@@ -650,7 +650,22 @@ mod tests {
 
     #[test]
     fn test_download_rate_uses_earliest_contributing_sync_start() {
+        use crate::db::sync_log::{
+            finalize_run, insert_run_received_event, insert_run_start, load_config, NewSyncRun,
+        };
+
         let db = setup_db();
+
+        // Use a recent base timestamp so prune_locked (max_age_days) doesn't
+        // discard the runs — the old hardcoded-1970 timestamps were silently
+        // pruned, masking the bug where finalize_run deletes rx_events for
+        // unchanged runs.
+        let base: i64 = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            - 10_000;
+
         db.execute(
             "INSERT INTO files
              (recorded_by, event_id, message_id, file_id, blob_bytes, total_slices, slice_bytes, root_hash, key_event_id, filename, mime_type, created_at)
@@ -667,97 +682,99 @@ mod tests {
                 "key1",
                 "big.bin",
                 "application/octet-stream",
-                1000i64
+                base
             ],
         )
         .unwrap();
         db.execute(
             "INSERT INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["peer1", "file1", 0i64, "slice_evt1", 3000i64],
+            rusqlite::params!["peer1", "file1", 0i64, "slice_evt1", base + 2000],
         )
         .unwrap();
         db.execute(
             "INSERT INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["peer1", "file1", 1i64, "slice_evt2", 4000i64],
+            rusqlite::params!["peer1", "file1", 1i64, "slice_evt2", base + 3000],
         )
         .unwrap();
         db.execute(
             "INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params!["peer1", "slice_evt1", 3000i64, "quic_recv:alice"],
+            rusqlite::params!["peer1", "slice_evt1", base + 2000, "quic_recv:alice"],
         )
         .unwrap();
         db.execute(
             "INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params!["peer1", "slice_evt2", 4000i64, "quic_recv:bob"],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sync_runs
-             (run_id, started_at_ms, ended_at_ms, session_id, tenant_id, peer_id, direction, remote_addr, role,
-              rounds, events_sent, events_received, bytes_sent, bytes_received, changed, outcome, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-            rusqlite::params![
-                11i64,
-                1000i64,
-                4500i64,
-                11i64,
-                "peer1",
-                "remote-a",
-                "inbound",
-                "127.0.0.1:4444",
-                "responder",
-                2i64,
-                0i64,
-                1i64,
-                0i64,
-                262144i64,
-                1i64,
-                "ok",
-                Option::<String>::None
-            ],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sync_runs
-             (run_id, started_at_ms, ended_at_ms, session_id, tenant_id, peer_id, direction, remote_addr, role,
-              rounds, events_sent, events_received, bytes_sent, bytes_received, changed, outcome, error)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17)",
-            rusqlite::params![
-                12i64,
-                2500i64,
-                4200i64,
-                12i64,
-                "peer1",
-                "remote-b",
-                "inbound",
-                "127.0.0.1:5555",
-                "responder",
-                2i64,
-                0i64,
-                1i64,
-                0i64,
-                262144i64,
-                1i64,
-                "ok",
-                Option::<String>::None
-            ],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sync_run_rx_events (run_id, event_id) VALUES (?1, ?2)",
-            rusqlite::params![11i64, "slice_evt1"],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO sync_run_rx_events (run_id, event_id) VALUES (?1, ?2)",
-            rusqlite::params![12i64, "slice_evt2"],
+            rusqlite::params!["peer1", "slice_evt2", base + 3000, "quic_recv:bob"],
         )
         .unwrap();
 
+        let cfg = load_config(&db).unwrap();
+
+        // First sync run (started_at = base, i.e. offset 0)
+        let run1 = NewSyncRun {
+            started_at_ms: base,
+            ended_at_ms: base + 3500,
+            session_id: 11,
+            tenant_id: "peer1".to_string(),
+            peer_id: "remote-a".to_string(),
+            direction: "inbound".to_string(),
+            remote_addr: "127.0.0.1:4444".to_string(),
+            role: "responder".to_string(),
+            rounds: 2,
+            events_sent: 0,
+            events_received: 1,
+            bytes_sent: 0,
+            bytes_received: 262144,
+            changed: true,
+            outcome: "in_progress".to_string(),
+            error: None,
+        };
+        let run_id_1 = insert_run_start(&db, &run1).unwrap();
+        insert_run_received_event(&db, run_id_1, "slice_evt1").unwrap();
+
+        let final_run1 = NewSyncRun {
+            outcome: "ok".to_string(),
+            ..run1.clone()
+        };
+        let kept1 = finalize_run(&db, run_id_1, &final_run1, &cfg).unwrap();
+        assert!(kept1.is_some(), "changed run should be preserved");
+
+        // Second sync run (started_at = base+1500)
+        let run2 = NewSyncRun {
+            started_at_ms: base + 1500,
+            ended_at_ms: base + 3200,
+            session_id: 12,
+            tenant_id: "peer1".to_string(),
+            peer_id: "remote-b".to_string(),
+            direction: "inbound".to_string(),
+            remote_addr: "127.0.0.1:5555".to_string(),
+            role: "responder".to_string(),
+            rounds: 2,
+            events_sent: 0,
+            events_received: 1,
+            bytes_sent: 0,
+            bytes_received: 262144,
+            changed: true,
+            outcome: "in_progress".to_string(),
+            error: None,
+        };
+        let run_id_2 = insert_run_start(&db, &run2).unwrap();
+        insert_run_received_event(&db, run_id_2, "slice_evt2").unwrap();
+
+        let final_run2 = NewSyncRun {
+            outcome: "ok".to_string(),
+            ..run2.clone()
+        };
+        let kept2 = finalize_run(&db, run_id_2, &final_run2, &cfg).unwrap();
+        assert!(kept2.is_some(), "changed run should be preserved");
+
+        // earliest_sync_start_ms = base (from run1)
+        // last_slice_recorded_at_ms = base+3000 (from recorded_events)
+        // elapsed = 3000ms, downloaded = 524288 bytes = 0.5 MiB
+        // rate = 0.5 / 3.0 = 1/6 MiB/s
         let by_message = list_for_message(&db, "peer1", "msg1").unwrap();
         assert_eq!(by_message.len(), 1);
         assert_eq!(by_message[0].downloaded_bytes, 524288);

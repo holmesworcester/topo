@@ -916,6 +916,23 @@ mod tests {
     }
 
     #[test]
+    fn sync_log_finalize_preserves_received_event_links_for_changed_runs() {
+        let conn = crate::db::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let cfg = load_config(&conn).unwrap();
+
+        let initial = sample_run(9, false, "in_progress");
+        let run_id = insert_run_start(&conn, &initial).unwrap();
+        insert_run_received_event(&conn, run_id, "evt-b").unwrap();
+        assert_eq!(rx_event_count(&conn), 1);
+
+        let final_run = sample_run(9, true, "ok");
+        let kept = finalize_run(&conn, run_id, &final_run, &cfg).unwrap();
+        assert!(kept.is_some());
+        assert_eq!(rx_event_count(&conn), 1);
+    }
+
+    #[test]
     fn sync_log_finalize_drops_received_event_links_for_unchanged_runs_when_changed_only() {
         let conn = crate::db::open_in_memory().unwrap();
         create_tables(&conn).unwrap();

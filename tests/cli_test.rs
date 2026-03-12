@@ -4349,16 +4349,15 @@ fn test_cli_files_and_save_file_roundtrip_after_sync() {
     let files_deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let files_stdout = get_files_raw(&bob_db);
-        // Check for completed file: checkmark + filename + size display
         if files_stdout.contains("payload.bin")
-            && files_stdout.contains("\u{2714}")
-            && files_stdout.contains("KiB")
+            && files_stdout.contains("1.")
+            && files_stdout.contains("MiB/s")
         {
             break;
         }
         if Instant::now() >= files_deadline {
             panic!(
-                "timed out waiting for bob files list to show completed payload.bin:\n{}",
+                "timed out waiting for bob files list to show payload.bin with MiB/s:\n{}",
                 files_stdout
             );
         }
@@ -4368,12 +4367,12 @@ fn test_cli_files_and_save_file_roundtrip_after_sync() {
     let messages_deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let messages_stdout = get_messages_raw(&bob_db);
-        if messages_stdout.contains("payload.bin") {
+        if messages_stdout.contains("payload.bin") && messages_stdout.contains("MiB/s") {
             break;
         }
         if Instant::now() >= messages_deadline {
             panic!(
-                "timed out waiting for bob messages to show payload.bin:\n{}",
+                "timed out waiting for bob messages to show payload.bin with MiB/s:\n{}",
                 messages_stdout
             );
         }
