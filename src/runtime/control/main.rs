@@ -16,7 +16,6 @@ use tracing_subscriber::FmtSubscriber;
 
 use topo::db::transport_creds::discover_local_tenants;
 use topo::db::{friendly_db_error, open_connection, schema::create_tables, sync_log};
-use topo::db_registry::DbRegistry;
 use topo::rpc::catalog;
 use topo::rpc::client::{rpc_call, rpc_call_raw, RpcClientError};
 use topo::rpc::protocol::{RpcMethod, UpnpAction, PROTOCOL_VERSION};
@@ -377,12 +376,6 @@ enum Commands {
         shell: clap_complete::Shell,
     },
 
-    /// Manage the database registry (aliases, default DB)
-    Db {
-        #[command(subcommand)]
-        action: DbAction,
-    },
-
     /// Subscription commands
     #[command(
         name = "sub",
@@ -559,54 +552,6 @@ enum SubAction {
         #[arg(long = "sub", hide = true)]
         sub_flag: Option<String>,
     },
-    /// Watch a subscription: continuously poll and print new events to stdout
-    Watch {
-        /// Subscription selector: id, name, or index (#N / N)
-        sub: Option<String>,
-        /// Deprecated: use positional selector instead.
-        #[arg(long = "sub", hide = true)]
-        sub_flag: Option<String>,
-        /// Poll interval in milliseconds
-        #[arg(long, default_value = "500")]
-        interval_ms: u64,
-        /// Output as JSON (one JSON object per line)
-        #[arg(long)]
-        json: bool,
-        /// Auto-acknowledge items after printing
-        #[arg(long)]
-        ack: bool,
-    },
-}
-
-#[derive(Subcommand)]
-enum DbAction {
-    /// Add a database to the registry
-    Add {
-        /// Path to the database file
-        path: String,
-        /// Alias name
-        #[arg(long)]
-        name: Option<String>,
-    },
-    /// List registered databases
-    List,
-    /// Remove a database from the registry
-    Remove {
-        /// Alias name, index, or path
-        selector: String,
-    },
-    /// Rename a database alias
-    Rename {
-        /// Current alias name, index, or path
-        selector: String,
-        /// New alias name
-        new_name: String,
-    },
-    /// Set the default database
-    Default {
-        /// Alias name, index, or path
-        selector: String,
-    },
 }
 
 #[derive(Subcommand)]
@@ -744,23 +689,6 @@ fn rpc_require_daemon(
     }
 }
 
-/// Resolve the --db argument using the registry:
-/// - If --db is the clap default "topo.db" and a registry default exists, use it
-/// - Otherwise run selector resolution (existing path → alias → index → passthrough)
-fn resolve_db_arg(raw: &str) -> Result<String, String> {
-    let registry = DbRegistry::load();
-    if raw == "topo.db" {
-        if let Some(default_path) = registry.default_path() {
-            return Ok(default_path.to_string());
-        }
-    }
-    // If it parses as a number, it must be a valid registry index — don't fall back.
-    if raw.parse::<usize>().is_ok() {
-        return registry.resolve(raw);
-    }
-    // For non-numeric selectors, resolve returns passthrough on miss, so this is fine.
-    Ok(registry.resolve(raw).unwrap_or_else(|_| raw.to_string()))
-}
 
 fn resolve_send_file_path(
     file: Option<String>,
@@ -1162,153 +1090,6 @@ fn run_sub_action(
             )?;
             println!("Subscription enabled.");
             Ok(())
-        }
-        SubAction::Watch {
-            sub,
-            sub_flag,
-            interval_ms,
-            json,
-            ack,
-        } => {
-            let sub_id =
-                resolve_subscription_selector(db, socket, sub, sub_flag, "sub watch", true)?;
-
-            // Reject has_changed subscriptions: they produce no feed rows,
-            // so watch would never output anything.
-            let subs = list_subscription_refs(db, socket)?;
-            if let Some(sub_ref) = subs.iter().find(|r| r.subscription_id == sub_id) {
-                // Fetch the full sub list to check delivery mode
-                let list_data = rpc_require_daemon(db, socket, RpcMethod::SubList)?;
-                if let Some(items) = list_data.as_array() {
-                    for item in items {
-                        if item["subscription_id"].as_str() == Some(&sub_id) {
-                            if item["delivery_mode"].as_str() == Some("has_changed") {
-                                return Err(format!(
-                                    "subscription {:?} uses has_changed delivery mode which produces no feed items; \
-                                     use `topo sub state {}` to check dirty/pending instead",
-                                    sub_ref.name, sub_ref.name,
-                                ).into());
-                            }
-                        }
-                    }
-                }
-            }
-
-            eprintln!("Watching subscription {} (poll every {}ms, Ctrl-C to stop)", &sub_id[..sub_id.len().min(12)], interval_ms);
-            // Start from seq 0: drain any pending backlog first, then follow
-            // new items. This avoids silent data loss when --ack is used.
-            let mut cursor: i64 = 0;
-            let mut consecutive_not_found = 0u32;
-            loop {
-                match rpc_require_daemon(
-                    db,
-                    socket,
-                    RpcMethod::SubPoll {
-                        subscription_id: sub_id.clone(),
-                        after_seq: cursor,
-                        limit: 100,
-                    },
-                ) {
-                    Ok(data) => {
-                        consecutive_not_found = 0;
-                        let mut page_full = false;
-                        let prev_cursor = cursor;
-                        if let Some(items) = data.as_array() {
-                            page_full = items.len() >= 100;
-                            let mut max_seq = cursor;
-                            for item in items {
-                                let seq = item["seq"].as_i64().unwrap_or(0);
-                                if seq > max_seq {
-                                    max_seq = seq;
-                                }
-                                if json {
-                                    println!("{}", serde_json::to_string(item).unwrap_or_default());
-                                } else {
-                                    let etype = item["event_type"].as_str().unwrap_or("?");
-                                    let eid = item["event_id"].as_str().unwrap_or("?");
-                                    let eid_short = &eid[..eid.len().min(12)];
-                                    let ts = item["created_at_ms"].as_u64().unwrap_or(0);
-                                    let payload = &item["payload"];
-                                    if let Some(content) = payload["content"].as_str() {
-                                        let author = payload["author_id"].as_str().unwrap_or("?");
-                                        let author_short = &author[..author.len().min(8)];
-                                        // Escape control chars so each event is one safe terminal line
-                                        let escaped: String = content.chars().map(|c| {
-                                            match c {
-                                                '\\' => "\\\\".to_string(),
-                                                '\n' => "\\n".to_string(),
-                                                '\r' => "\\r".to_string(),
-                                                '\t' => "\\t".to_string(),
-                                                c if c.is_control() => format!("\\x{:02x}", c as u32),
-                                                c => c.to_string(),
-                                            }
-                                        }).collect();
-                                        println!(
-                                            "[seq={}] {} event={} ts={} author={} | {}",
-                                            seq, etype, eid_short, ts, author_short, escaped,
-                                        );
-                                    } else {
-                                        println!(
-                                            "[seq={}] {} event={} ts={}",
-                                            seq, etype, eid_short, ts,
-                                        );
-                                    }
-                                }
-                            }
-                            if max_seq > cursor {
-                                if ack {
-                                    match rpc_require_daemon(
-                                        db,
-                                        socket,
-                                        RpcMethod::SubAck {
-                                            subscription_id: sub_id.clone(),
-                                            through_seq: max_seq,
-                                        },
-                                    ) {
-                                        Ok(_) => {
-                                            cursor = max_seq;
-                                        }
-                                        Err(e) => {
-                                            eprintln!("ack error (items will be re-delivered): {}", e);
-                                            // Don't advance cursor — items will be re-polled
-                                        }
-                                    }
-                                } else {
-                                    cursor = max_seq;
-                                }
-                            }
-                        }
-                        // If page was full and cursor advanced, immediately re-poll
-                        // to drain backlog. If cursor didn't advance (e.g. ack
-                        // failed), sleep to avoid a busy-loop of duplicates.
-                        if page_full && cursor > prev_cursor {
-                            continue;
-                        }
-                    }
-                    Err(e) => {
-                        let msg = e.to_string();
-                        if msg.contains("not found") {
-                            consecutive_not_found += 1;
-                            if consecutive_not_found >= 3 {
-                                return Err(format!(
-                                    "subscription {} no longer accessible — \
-                                     the active tenant may have changed (use `topo tenant use` to switch back)",
-                                    &sub_id[..sub_id.len().min(12)],
-                                ).into());
-                            }
-                        } else if msg.contains("daemon is not running") || msg.contains("connection refused") {
-                            return Err(format!(
-                                "daemon stopped — watch exiting ({})",
-                                msg,
-                            ).into());
-                        } else {
-                            consecutive_not_found = 0;
-                        }
-                        eprintln!("poll error: {}", msg);
-                    }
-                }
-                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
-            }
         }
     }
 }
@@ -1998,9 +1779,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         })
         .unwrap_or(false);
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
-    let db = &resolve_db_arg(&cli.db)
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
+    let db = &cli.db;
     let socket_override = cli.socket.clone();
+
 
     // Init tracing for commands that need it
     match &cli.command {
@@ -2877,51 +2658,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let mut cmd = Cli::command();
             clap_complete::generate(shell, &mut cmd, "topo", &mut std::io::stdout());
         }
-
-        // ---------------------------------------------------------------
-        // DB registry management (no daemon needed)
-        // ---------------------------------------------------------------
-        Commands::Db { action } => match action {
-            DbAction::Add { path, name } => {
-                let mut registry = DbRegistry::load();
-                registry.add(&path, name.as_deref())?;
-                registry.save()?;
-                let display_name = name.as_deref().unwrap_or("(none)");
-                println!("Added {} (alias: {})", path, display_name);
-            }
-            DbAction::List => {
-                let registry = DbRegistry::load();
-                if registry.entries.is_empty() {
-                    println!("No databases registered.");
-                    println!("  Use `topo db add <path> --name <alias>` to register one.");
-                } else {
-                    println!("DATABASES:");
-                    for (i, entry) in registry.entries.iter().enumerate() {
-                        let marker = if entry.is_default { "*" } else { " " };
-                        let name = entry.name.as_deref().unwrap_or("-");
-                        println!("  {}{}. {} ({})", marker, i + 1, name, entry.path);
-                    }
-                }
-            }
-            DbAction::Remove { selector } => {
-                let mut registry = DbRegistry::load();
-                let removed = registry.remove(&selector)?;
-                registry.save()?;
-                println!("Removed {}", removed.path);
-            }
-            DbAction::Rename { selector, new_name } => {
-                let mut registry = DbRegistry::load();
-                registry.rename(&selector, &new_name)?;
-                registry.save()?;
-                println!("Renamed to {}", new_name);
-            }
-            DbAction::Default { selector } => {
-                let mut registry = DbRegistry::load();
-                registry.set_default(&selector)?;
-                registry.save()?;
-                println!("Default set to {}", selector);
-            }
-        },
 
         // ---------------------------------------------------------------
         // Subscription commands

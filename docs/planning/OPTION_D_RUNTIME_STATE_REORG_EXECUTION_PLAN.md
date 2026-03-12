@@ -66,7 +66,7 @@ src/
 - `src/node.rs` -> `src/runtime/control/node.rs`
 - `src/service.rs` -> `src/runtime/control/service.rs`
 - `src/assert.rs` -> `src/runtime/control/assert.rs`
-- `src/db_registry.rs` -> `src/runtime/control/db_registry.rs`
+- ~~`src/db_registry.rs` -> `src/runtime/control/db_registry.rs`~~ *(removed)*
 - `src/peering/*` -> `src/runtime/peering/*`
 - `src/runtime/*` (old tiny module) -> `src/runtime/sync_engine/runtime.rs` (or delete if obsolete)
 - `src/transport/*` -> `src/runtime/transport/*`

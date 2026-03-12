@@ -8,7 +8,7 @@ Scope: retire `topo interactive` while preserving user-facing behavior through d
 
 Move all useful interactive command functionality and UX affordances into the daemon-backed CLI path, then remove interactive mode and its dedicated code/tests/dependencies.
 
-Also add CLI DB-alias affordances so `--db` can resolve registry aliases/indexes (for example `--db 1`) in addition to raw paths.
+~~Also add CLI DB-alias affordances~~ — *DB registry removed. `--db` takes a literal file path (default: `topo.db`).*
 
 User removal / banning is out of scope in this PoC. The interactive `ban` command should be retired, not migrated, because safe removal requires key rotation and group key agreement that are not implemented here.
 
@@ -84,13 +84,7 @@ Invite/link I/O contract (required):
 7. Accept flows must use the `public_addr` + `public_spki` carried by the resolved link payload; no out-of-band override in accept commands.
 8. Script-stable output: `invite` and `link` must print the full link in a predictable machine-readable line format before any optional alias/help text.
 
-Add missing DB registry commands:
-
-1. `db add <path> [--name <alias>]`
-2. `db list`
-3. `db remove <selector>`
-4. `db rename <selector> <name>`
-5. `db default <selector>`
+~~DB registry commands removed. `--db` takes a literal file path (default: `topo.db`).~~
 
 Suspect functionality (explicit decision required):
 
@@ -101,29 +95,9 @@ Plan default: preserve these as frontend-only affordances, but document clearly 
 
 ## Implementation Plan
 
-### Phase 0: DB Registry and `--db` Alias Resolution
+### ~~Phase 0: DB Registry and `--db` Alias Resolution~~ — *Removed*
 
-Add a local CLI DB registry (frontend-only, not protocol state):
-
-1. Registry entries: `{name?, path, is_default, created_at}`
-2. Stable storage file (for example `${HOME}/.topo/db_registry.json`; allow override by env for tests).
-3. New command group:
-   - `topo db add <path> [--name <alias>]`
-   - `topo db list`
-   - `topo db remove <selector>`
-   - `topo db rename <selector> <name>`
-   - `topo db default <selector>`
-4. `--db` selector resolution:
-   - if value looks like a path and exists, use path directly,
-   - else resolve exact alias match,
-   - else resolve numeric index from `db list`,
-   - else fail with clear selector error.
-5. If `--db` is omitted, use default entry when set; otherwise keep current fallback behavior.
-
-Rules:
-
-1. Alias/index resolution is CLI frontend behavior only.
-2. Raw path always remains valid and script-safe.
+*DB registry was removed as a bug-prone abstraction. `--db` now takes a literal file path (default: `topo.db` in CWD).*
 3. Indexes are convenience only; alias names are the stable automation target.
 4. Registry ownership boundary: DB registry is CLI-frontend persistent state and must not be moved into protocol/event state.
 
@@ -201,10 +175,7 @@ Add/port tests to non-interactive suites:
    - channel alias selection
 3. Add link/accept-link end-to-end tests.
 4. Add identity/workspaces alias tests.
-5. Add DB registry/selector tests:
-   - `db add/list/remove/rename/default`
-   - `--db <alias>` and `--db <index>` resolution
-   - omitted `--db` uses default registry entry
+5. ~~DB registry/selector tests~~ — *Removed with DB registry.*
 6. Add published-endpoint tests:
    - `invite`/`link` with default `public_spki` uses local transport SPKI,
    - explicit `--public-spki` is encoded in link and used by accept flow,

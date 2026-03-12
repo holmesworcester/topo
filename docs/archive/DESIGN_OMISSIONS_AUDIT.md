@@ -48,10 +48,7 @@ Status:
    - Initiator/responder logic depends on strict ordering for session completion and drain guarantees [initiator.rs](/home/holmes/poc-7/src/sync/session/initiator.rs:213), [responder.rs](/home/holmes/poc-7/src/sync/session/responder.rs:147).
    - `DESIGN.md` discusses queue/coordination and frame delimiting, but not this end-of-session control protocol [DESIGN.md](/home/holmes/poc-7/docs/DESIGN.md:84), [DESIGN.md](/home/holmes/poc-7/docs/DESIGN.md:769).
 
-5. **Database registry behavior is undocumented**
-   - CLI supports a persistent DB alias/default registry (`topo db add/list/remove/rename/default`) [main.rs](/home/holmes/poc-7/src/main.rs:980).
-   - Backed by `~/.topo/db_registry.json` with selector-resolution semantics [db_registry.rs](/home/holmes/poc-7/src/db_registry.rs:1), [db_registry.rs](/home/holmes/poc-7/src/db_registry.rs:123).
-   - `DESIGN.md` does not document this operational contract in section 8 [DESIGN.md](/home/holmes/poc-7/docs/DESIGN.md:854).
+5. ~~**Database registry behavior is undocumented**~~ — *Resolved: DB registry removed. `--db` now takes a literal file path (default: `topo.db`).*
 
 6. **Retired event type 4 status was omitted from design narrative**
    - Canonical event type 4 existed historically in earlier parser/projector stacks.

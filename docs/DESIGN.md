@@ -1311,7 +1311,6 @@ All CLI commands that read or mutate workspace state **must** go through RPC to 
 
 Exceptions where direct DB access is acceptable:
 - **daemon startup** (`topo start`): the daemon itself opens the DB to initialize schema and discover tenants,
-- **DB registry management** (`topo db add/list/remove`): operates on a local JSON config file, not the SQLite DB,
 - **shell completions** (`topo completions`): pure CLI metadata, no DB involved.
 
 When adding a new CLI command, always add a corresponding `RpcMethod` variant, catalog entry, and server dispatch handler. The CLI handler should call `rpc_require_daemon()` and format the response for display.
@@ -1355,14 +1354,9 @@ The frontend reconciliation is a single selector: `visible = canonical âˆª {o âˆ
 
 The `local_client_ops` table is pruned periodically (entries older than 24h). It is local UX state only.
 
-### DB registry selector contract
+### DB selection
 
-CLI database selection supports a local registry (`~/.topo/db_registry.json`, overridable by `TOPO_REGISTRY_DIR`) with:
-1. alias names,
-2. 1-based numeric selectors,
-3. default DB selection for the implicit `--db topo.db` case.
-
-Selectors resolve in priority order: existing path -> alias -> index -> passthrough path.
+The `--db` flag takes a literal file path. Default: `topo.db` in the current directory. No aliases, indices, or global registry.
 
 ## 8.2 Testing and agent ergonomics
 

@@ -174,8 +174,7 @@ Phase 1 CLI/daemon shape must preserve:
 
 1. versioned request/response envelopes and bounded frame size (`<= 16 MiB`) over length-prefixed JSON RPC framing,
 2. bounded concurrent RPC connection handling in daemon,
-3. selector-registry behavior (`~/.topo/db_registry.json` / `TOPO_REGISTRY_DIR`) with resolution order:
-   - existing path -> alias -> numeric index -> passthrough path.
+3. `--db` takes a literal file path (default: `topo.db` in CWD). No registry or alias resolution.
 
 ---
 
