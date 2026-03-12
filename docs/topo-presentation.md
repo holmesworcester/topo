@@ -92,24 +92,19 @@ style: |
 
 ---
 
-# Why does this matter? 🤔
+"I have worked for ~6 years trying to build a p2p Slack-alternative. It is #$%@ing brutal."
 
-<!-- pt:incremental_lists: true -->
-
-- A FOSS p2p Slack or Discord would be awesome
-- It would provide safety🛡 and resiliency🛟 to orgs we care about 
-- We've spent years building one (**Quiet - tryquiet.org**)
-- This has been a real slog
+-- me
 
 ---
 
-# This question haunts our team 👻 
+# This question haunts me 👻 
 
-Is p2p just intrinsically #$%@ing hard? Or is all this slog totally avoidable and pointless?
+Is p2p intrinsically #$%@ing brutal? Or is all this carnage avoidable and pointless?
 
 ---
 
-# Why has this been such a slog? 😡
+# Why has it been such a slog?
 
 <!-- pt:incremental_lists: true -->
 
@@ -130,7 +125,7 @@ Is p2p just intrinsically #$%@ing hard? Or is all this slog totally avoidable an
 
 ---
 
-# Our experience with existing p2p tools has been meh 🫤
+# Our experience with existing p2p tools: 🫤
 
 <!-- pt:incremental_lists: true -->
 
