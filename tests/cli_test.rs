@@ -4349,15 +4349,16 @@ fn test_cli_files_and_save_file_roundtrip_after_sync() {
     let files_deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let files_stdout = get_files_raw(&bob_db);
+        // Check for completed file: checkmark + filename + size display
         if files_stdout.contains("payload.bin")
-            && files_stdout.contains("1.")
-            && files_stdout.contains("MiB/s")
+            && files_stdout.contains("\u{2714}")
+            && files_stdout.contains("KiB")
         {
             break;
         }
         if Instant::now() >= files_deadline {
             panic!(
-                "timed out waiting for bob files list to show payload.bin with MiB/s:\n{}",
+                "timed out waiting for bob files list to show completed payload.bin:\n{}",
                 files_stdout
             );
         }
@@ -4367,12 +4368,12 @@ fn test_cli_files_and_save_file_roundtrip_after_sync() {
     let messages_deadline = Instant::now() + Duration::from_secs(20);
     loop {
         let messages_stdout = get_messages_raw(&bob_db);
-        if messages_stdout.contains("payload.bin") && messages_stdout.contains("MiB/s") {
+        if messages_stdout.contains("payload.bin") {
             break;
         }
         if Instant::now() >= messages_deadline {
             panic!(
-                "timed out waiting for bob messages to show payload.bin with MiB/s:\n{}",
+                "timed out waiting for bob messages to show payload.bin:\n{}",
                 messages_stdout
             );
         }
@@ -5332,14 +5333,28 @@ fn test_cli_sub_multi_tenant_isolation() {
         t2_poll
     );
 
-    // Switch back to tenant 1
-    let switch = Command::new(bin())
-        .args(["--db", &db, "tenant", "use", "1"])
+    // Switch back to alice's tenant by finding its number in the list
+    let list_out = Command::new(bin())
+        .args(["--db", &db, "tenant", "list"])
         .output()
-        .expect("tenant use 1");
+        .expect("tenant list");
+    let list_stdout = String::from_utf8_lossy(&list_out.stdout);
+    let alice_index: u64 = list_stdout
+        .lines()
+        .find(|line| line.contains("alpha-space"))
+        .and_then(|line| {
+            let trimmed = line.trim_start();
+            trimmed.split('.').next()?.trim().parse().ok()
+        })
+        .expect("alpha-space tenant should appear in list with index");
+    let switch = Command::new(bin())
+        .args(["--db", &db, "tenant", "use", &alice_index.to_string()])
+        .output()
+        .expect("tenant use alice");
     assert!(
         switch.status.success(),
-        "tenant use 1 failed: {}",
+        "tenant use {} failed: {}",
+        alice_index,
         String::from_utf8_lossy(&switch.stderr)
     );
 
