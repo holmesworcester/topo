@@ -5,6 +5,11 @@ Branch: `codex/hot-cold-sync-plan`
 Worktree: `/tmp/poc-7-hot-cold-sync`
 Status: implemented; correctness verification complete; performance follow-up still required
 
+Review follow-up:
+`docs/planning/CREATE_PATH_ATOMICITY_FOLLOWUP.md` captures the proposed
+create-side simplification discussed after implementation review. It is a
+follow-up design note, not a description of the current branch behavior.
+
 ## Objective
 
 Preserve the current sync and bootstrap behavior while removing duplicate
