@@ -157,6 +157,7 @@ Instead of providing lots of features for *parts* of the problem, it focuses on 
 
 - Uses SQLite to stay memory-bounded so **no separate backend for iOS**
 - One endpoint can host many tenants so **no separate infra for cloud** 
+- SQLite contains all state including files; **no OS filesystem quirks**
 - Dependencies can match product needs
 - End-to-end testing is cheap and easy
 - You get a flexible, concurrency-safe way to do encryption and auth
