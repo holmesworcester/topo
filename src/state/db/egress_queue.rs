@@ -87,7 +87,7 @@ impl<'a> EgressQueue<'a> {
                 "SELECT id, event_id FROM egress_queue
                  WHERE connection_id = ?1
                  AND sent_at IS NULL
-                 ORDER BY id
+                 ORDER BY id DESC
                  LIMIT ?2",
             )?;
             let rows: Vec<(i64, Vec<u8>)> = stmt
@@ -351,5 +351,72 @@ mod tests {
         let verify = open_connection(&path).unwrap();
         let eq = EgressQueue::new(&verify);
         assert_eq!(eq.count_pending("conn1").unwrap(), 0);
+    }
+
+    #[test]
+    fn test_claim_batch_returns_newest_first() {
+        let conn = setup();
+        let eq = EgressQueue::new(&conn);
+
+        // Enqueue 100 "old" events
+        let old_ids: Vec<EventId> = (0u8..100).map(make_event_id).collect();
+        eq.enqueue_events("conn1", &old_ids).unwrap();
+
+        // Enqueue 1 "new" event with a distinct byte
+        let new_id = make_event_id(200);
+        eq.enqueue_events("conn1", &[new_id]).unwrap();
+
+        // Claim a small batch — newest should come first
+        let claimed = eq.claim_batch("conn1", 5).unwrap();
+        assert_eq!(claimed.len(), 5);
+
+        // The very first claimed event should be the newest (byte 200)
+        assert_eq!(
+            claimed[0].1, new_id,
+            "newest event should be returned first by claim_batch"
+        );
+
+        // The remaining 4 should be the next-most-recent old events (99, 98, 97, 96)
+        assert_eq!(claimed[1].1, make_event_id(99));
+        assert_eq!(claimed[2].1, make_event_id(98));
+        assert_eq!(claimed[3].1, make_event_id(97));
+        assert_eq!(claimed[4].1, make_event_id(96));
+    }
+
+    #[test]
+    fn test_claim_batch_newest_first_survives_mark_sent() {
+        let conn = setup();
+        let eq = EgressQueue::new(&conn);
+
+        // Enqueue old backlog
+        let old_ids: Vec<EventId> = (0u8..50).map(make_event_id).collect();
+        eq.enqueue_events("conn1", &old_ids).unwrap();
+
+        // Enqueue new priority event
+        let priority_id = make_event_id(255);
+        eq.enqueue_events("conn1", &[priority_id]).unwrap();
+
+        // First claim: should get priority + 4 newest old
+        let batch1 = eq.claim_batch("conn1", 5).unwrap();
+        assert_eq!(batch1[0].1, priority_id);
+
+        // Mark first batch as sent
+        let rowids: Vec<i64> = batch1.iter().map(|(r, _)| *r).collect();
+        eq.mark_sent(&rowids).unwrap();
+
+        // Second claim: should get next batch of old events in descending order
+        let batch2 = eq.claim_batch("conn1", 5).unwrap();
+        assert_eq!(batch2.len(), 5);
+        // After removing priority(255), 49, 48, 47, 46 from the first batch,
+        // the next batch should be 45, 44, 43, 42, 41
+        assert_eq!(batch2[0].1, make_event_id(45));
+        assert_eq!(batch2[1].1, make_event_id(44));
+
+        // Mark second batch as sent
+        let rowids2: Vec<i64> = batch2.iter().map(|(r, _)| *r).collect();
+        eq.mark_sent(&rowids2).unwrap();
+
+        // Total remaining should be 51 - 5 - 5 = 41
+        assert_eq!(eq.count_pending("conn1").unwrap(), 41);
     }
 }
