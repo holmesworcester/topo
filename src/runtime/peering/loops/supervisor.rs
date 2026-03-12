@@ -24,7 +24,7 @@ use crate::runtime::memtrace;
 use crate::runtime::repeated_warning::should_emit_globally;
 use crate::sync::SyncSessionHandler;
 use crate::transport::session_factory::extract_build_mismatch_reason;
-use crate::transport::SessionProvider;
+use crate::transport::{SessionProvider, TransportConnection};
 use crate::tuning::{low_mem_memtrace, low_mem_mode};
 
 use super::{current_timestamp_ms, drain_batch_size, run_session, shared_ingest_cap, SESSION_GAP};
@@ -36,7 +36,7 @@ static PEER_CONNECTIONS: OnceLock<Mutex<HashMap<String, ActivePeerConnection>>> 
 struct ActivePeerConnection {
     direction: SessionDirection,
     connection_id: usize,
-    connection: quinn::Connection,
+    connection: TransportConnection,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -371,7 +371,7 @@ fn register_peer_connection(
     tenant_id: &str,
     peer_id: &str,
     direction: SessionDirection,
-    connection: &quinn::Connection,
+    connection: &TransportConnection,
 ) -> PeerConnectionAction {
     let key = peer_connection_key(db_path, tenant_id, peer_id);
     let registry = PEER_CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()));
