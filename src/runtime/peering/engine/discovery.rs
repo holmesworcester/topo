@@ -35,9 +35,35 @@ pub(crate) struct DiscoveryRuntimeSetup {
 ///
 /// No workers are spawned here; caller owns runtime worker lifecycle.
 #[cfg(feature = "discovery")]
+pub(crate) fn resolve_mdns_advertise_ip(
+    local_addr: SocketAddr,
+    allow_autodetect: bool,
+) -> Option<String> {
+    if !local_addr.ip().is_unspecified() && !local_addr.ip().is_loopback() {
+        return Some(local_addr.ip().to_string());
+    }
+    if allow_autodetect {
+        return crate::peering::discovery::local_non_loopback_ipv4();
+    }
+    None
+}
+
+#[cfg(not(feature = "discovery"))]
+pub(crate) fn resolve_mdns_advertise_ip(
+    _local_addr: SocketAddr,
+    _allow_autodetect: bool,
+) -> Option<String> {
+    None
+}
+
+/// Prepare mDNS advertisement + browse receivers for all eligible tenants.
+///
+/// No workers are spawned here; caller owns runtime worker lifecycle.
+#[cfg(feature = "discovery")]
 pub(crate) fn prepare_mdns_discovery(
     tenants: &[crate::db::transport_creds::TenantInfo],
     local_addr: SocketAddr,
+    advertise_ip: Option<String>,
     local_peer_ids: &HashSet<String>,
     tenant_client_configs: &TenantClientConfigs,
 ) -> DiscoveryRuntimeSetup {
@@ -45,10 +71,14 @@ pub(crate) fn prepare_mdns_discovery(
     let mut ingress_sources: Vec<DiscoveryIngressSource> = Vec::new();
 
     let actual_port = local_addr.port();
-    let advertise_ip = if local_addr.ip().is_unspecified() || local_addr.ip().is_loopback() {
-        crate::peering::discovery::local_non_loopback_ipv4().unwrap_or_else(|| "0.0.0.0".into())
-    } else {
-        local_addr.ip().to_string()
+    let Some(advertise_ip) = advertise_ip else {
+        warn!(
+            "mDNS discovery disabled: no explicit advertise address and autodetection is disabled"
+        );
+        return DiscoveryRuntimeSetup {
+            handles,
+            ingress_sources,
+        };
     };
     let local_listen_ip = local_addr.ip();
 
@@ -96,5 +126,29 @@ pub(crate) fn prepare_mdns_discovery(
     DiscoveryRuntimeSetup {
         handles,
         ingress_sources,
+    }
+}
+
+#[cfg(all(test, feature = "discovery"))]
+mod tests {
+    use super::resolve_mdns_advertise_ip;
+    use std::net::{IpAddr, Ipv4Addr, SocketAddr};
+
+    #[test]
+    fn explicit_bind_without_autodetect_suppresses_loopback_discovery() {
+        let advertise_ip = resolve_mdns_advertise_ip(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::LOCALHOST), 4433),
+            false,
+        );
+        assert_eq!(advertise_ip, None);
+    }
+
+    #[test]
+    fn explicit_non_loopback_bind_stays_discoverable_without_autodetect() {
+        let advertise_ip = resolve_mdns_advertise_ip(
+            SocketAddr::new(IpAddr::V4(Ipv4Addr::new(192, 168, 1, 44)), 4433),
+            false,
+        );
+        assert_eq!(advertise_ip.as_deref(), Some("192.168.1.44"));
     }
 }

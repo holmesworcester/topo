@@ -22,8 +22,8 @@ use crate::transport::{
 };
 
 use super::supervisor::{
-    run_startup_preflight, spawn_shared_ingest_writer, supervise_connection_sessions,
-    SessionTenantResolver,
+    build_session_tenant_resolver, run_startup_preflight, spawn_shared_ingest_writer,
+    supervise_connection_sessions,
 };
 use super::{
     current_timestamp_ms, peer_fingerprint_from_hex, IntroSpawnerFn, CONNECT_RETRY_DELAY,
@@ -399,9 +399,9 @@ async fn connect_loop_inner(
 
         // Keep session scope pinned to the planner-assigned tenant.
         // Transport cert rotation can lag tenant scoping during bootstrap.
-        let tenant_resolver = SessionTenantResolver::Fixed(recorded_by.to_string());
+        let tenant_resolver = build_session_tenant_resolver(db_path, recorded_by);
         let max_sessions = if used_bootstrap_fallback {
-            Some(1usize)
+            Some(tenant_resolver.bootstrap_session_budget())
         } else {
             None
         };

@@ -1,5 +1,8 @@
 //! Quick smoke test: does TenantDiscovery actually discover on this machine?
 
+#[path = "support/discovery_lock.rs"]
+mod discovery_lock;
+
 /// Helper: get a routable (non-loopback) IP for mDNS advertisement.
 #[cfg(feature = "discovery")]
 fn routable_ip() -> String {
@@ -14,6 +17,7 @@ fn mdns_smoke_tenant_discovery() {
     use std::time::{Duration, Instant};
     use topo::peering::discovery::TenantDiscovery;
 
+    let _guard = discovery_lock::discovery_test_lock();
     let ip = routable_ip();
     let local_ids: HashSet<String> = ["self-id".to_string()].into_iter().collect();
 
@@ -62,6 +66,7 @@ fn mdns_smoke_explicit_advertise_ip() {
     use std::time::{Duration, Instant};
     use topo::peering::discovery::TenantDiscovery;
 
+    let _guard = discovery_lock::discovery_test_lock();
     let ip = routable_ip();
 
     let local_a: HashSet<String> = ["exp-peer-a".to_string()].into_iter().collect();

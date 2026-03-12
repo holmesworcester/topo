@@ -7,6 +7,7 @@
 use std::net::SocketAddr;
 use std::sync::Arc;
 
+use crate::peering::runtime::DiscoveryRuntimePolicy;
 use crate::transport::multi_workspace::WorkspaceCertResolver;
 
 pub use crate::peering::runtime::NodeRuntimeNetInfo;
@@ -14,6 +15,7 @@ pub use crate::peering::runtime::NodeRuntimeNetInfo;
 pub async fn run_node(
     db_path: &str,
     bind: SocketAddr,
+    discovery_policy: DiscoveryRuntimePolicy,
     net_info_tx: tokio::sync::oneshot::Sender<NodeRuntimeNetInfo>,
     shutdown_notify: Arc<tokio::sync::Notify>,
     cert_resolver: Arc<WorkspaceCertResolver>,
@@ -22,6 +24,7 @@ pub async fn run_node(
     crate::peering::runtime::run_node(
         db_path,
         bind,
+        discovery_policy,
         net_info_tx,
         shutdown_notify,
         crate::peering::workflows::punch::spawn_intro_listener,

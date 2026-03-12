@@ -1,3 +1,6 @@
+#[path = "../support/discovery_lock.rs"]
+mod discovery_lock;
+
 use std::time::Duration;
 use std::time::Instant;
 use topo::crypto::event_id_to_base64;
@@ -19,6 +22,7 @@ async fn test_mdns_two_peers_discover_and_sync() {
     use topo::peering::discovery::{local_non_loopback_ipv4, TenantDiscovery};
     use topo::testutil::create_dynamic_endpoint_for_peer_bind;
 
+    let _guard = discovery_lock::discovery_test_lock();
     let advertise_ip = local_non_loopback_ipv4().expect("no routable IP");
     let alice = Peer::new_with_identity("mdns-alice");
     let bob = Peer::new_in_workspace("mdns-bob", &alice).await;
@@ -144,6 +148,7 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
     use topo::peering::discovery::{local_non_loopback_ipv4, TenantDiscovery};
     use topo::testutil::create_dynamic_endpoint_for_peer_bind;
 
+    let _guard = discovery_lock::discovery_test_lock();
     let advertise_ip = local_non_loopback_ipv4().expect("no routable IP");
     // Three peers: t0 and t1 are "co-located" (share local_peer_ids), ext is external
     let t0 = Peer::new_with_identity("mdns-t0");

@@ -17,7 +17,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tracing::warn;
 
@@ -41,15 +41,46 @@ pub(crate) enum DiscoveryAction {
     Reconnect,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum DialTargetSource {
+    Bootstrap,
+    ObservedEndpoint,
+    Discovery,
+}
+
+impl DialTargetSource {
+    fn priority(self) -> u8 {
+        match self {
+            Self::Bootstrap => 0,
+            Self::ObservedEndpoint => 1,
+            Self::Discovery => 2,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct DialTarget {
+    addr: SocketAddr,
+    source: DialTargetSource,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SuppressedDialTarget {
+    target: DialTarget,
+    until: Instant,
+}
+
 /// Tracks discovered peers and manages cancellation of stale connect_loops.
 pub(crate) struct PeerDispatcher {
-    pub(crate) known: HashMap<String, (SocketAddr, tokio::sync::watch::Sender<()>)>,
+    known: HashMap<String, (DialTarget, tokio::sync::watch::Sender<()>)>,
+    suppressed: HashMap<String, Vec<SuppressedDialTarget>>,
 }
 
 impl PeerDispatcher {
     pub(crate) fn new() -> Self {
         Self {
             known: HashMap::new(),
+            suppressed: HashMap::new(),
         }
     }
 
@@ -59,9 +90,30 @@ impl PeerDispatcher {
         &mut self,
         peer_id: &str,
         addr: SocketAddr,
+        source: DialTargetSource,
     ) -> (DiscoveryAction, Option<tokio::sync::watch::Receiver<()>>) {
-        if let Some((prev_addr, _)) = self.known.get(peer_id) {
-            if *prev_addr == addr {
+        self.dispatch_at(peer_id, addr, source, Instant::now())
+    }
+
+    fn dispatch_at(
+        &mut self,
+        peer_id: &str,
+        addr: SocketAddr,
+        source: DialTargetSource,
+        now: Instant,
+    ) -> (DiscoveryAction, Option<tokio::sync::watch::Receiver<()>>) {
+        self.prune_expired_suppressions(now);
+        if self.is_suppressed_at(peer_id, addr, source, now) {
+            return (DiscoveryAction::Skip, None);
+        }
+        if let Some((current, _)) = self.known.get_mut(peer_id) {
+            if current.addr == addr {
+                if source.priority() > current.source.priority() {
+                    current.source = source;
+                }
+                return (DiscoveryAction::Skip, None);
+            }
+            if source.priority() < current.source.priority() {
                 return (DiscoveryAction::Skip, None);
             }
         }
@@ -72,12 +124,58 @@ impl PeerDispatcher {
         };
         // Drop old sender (if any) to cancel the old connect_loop
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(());
-        self.known.insert(peer_id.to_string(), (addr, cancel_tx));
+        self.known.insert(
+            peer_id.to_string(),
+            (DialTarget { addr, source }, cancel_tx),
+        );
         (action, Some(cancel_rx))
     }
 
     pub(crate) fn forget(&mut self, peer_id: &str) {
         self.known.remove(peer_id);
+    }
+
+    pub(crate) fn suppress_for(
+        &mut self,
+        peer_id: &str,
+        addr: SocketAddr,
+        source: DialTargetSource,
+        duration: Duration,
+    ) {
+        self.prune_expired_suppressions(Instant::now());
+        if duration.is_zero() {
+            return;
+        }
+        let entries = self.suppressed.entry(peer_id.to_string()).or_default();
+        entries.retain(|entry| !(entry.target.addr == addr && entry.target.source == source));
+        entries.push(SuppressedDialTarget {
+            target: DialTarget { addr, source },
+            until: Instant::now() + duration,
+        });
+    }
+
+    fn is_suppressed_at(
+        &self,
+        peer_id: &str,
+        addr: SocketAddr,
+        source: DialTargetSource,
+        now: Instant,
+    ) -> bool {
+        self.suppressed
+            .get(peer_id)
+            .map(|entries| {
+                entries.iter().any(|entry| {
+                    entry.until > now && entry.target.addr == addr && entry.target.source == source
+                })
+            })
+            .unwrap_or(false)
+    }
+
+    fn prune_expired_suppressions(&mut self, now: Instant) {
+        self.suppressed.retain(|_, entries| {
+            entries.retain(|entry| entry.until > now);
+            !entries.is_empty()
+        });
     }
 }
 
@@ -96,8 +194,12 @@ pub(crate) fn normalize_discovered_addr_for_local_bind(
 // Unified dispatch-keying for bootstrap + discovery ingestion
 // ---------------------------------------------------------------------------
 
-pub(crate) fn bootstrap_dispatch_key(tenant_id: &str, invite_event_id: &str) -> String {
-    format!("{}@bootstrap:{}", tenant_id, invite_event_id)
+pub(crate) fn bootstrap_dispatch_key(
+    tenant_id: &str,
+    invite_event_id: &str,
+    remote: SocketAddr,
+) -> String {
+    format!("{}@bootstrap:{}@{}", tenant_id, invite_event_id, remote)
 }
 
 pub(crate) fn known_peer_dispatch_key(tenant_id: &str, peer_id: &str) -> String {
@@ -262,8 +364,8 @@ pub(crate) fn dispatch_bootstrap_target(
     invite_event_id: &str,
     remote: SocketAddr,
 ) -> bool {
-    let key = bootstrap_dispatch_key(tenant_id, invite_event_id);
-    let (action, _cancel_rx) = dispatcher.dispatch(&key, remote);
+    let key = bootstrap_dispatch_key(tenant_id, invite_event_id, remote);
+    let (action, _cancel_rx) = dispatcher.dispatch(&key, remote, DialTargetSource::Bootstrap);
     matches!(
         action,
         DiscoveryAction::Connect | DiscoveryAction::Reconnect
@@ -279,9 +381,10 @@ pub(crate) fn dispatch_known_peer_target(
     tenant_id: &str,
     peer_id: &str,
     remote: SocketAddr,
+    source: DialTargetSource,
 ) -> bool {
     let key = known_peer_dispatch_key(tenant_id, peer_id);
-    let (action, _cancel_rx) = dispatcher.dispatch(&key, remote);
+    let (action, _cancel_rx) = dispatcher.dispatch(&key, remote, source);
     matches!(
         action,
         DiscoveryAction::Connect | DiscoveryAction::Reconnect
@@ -299,7 +402,13 @@ pub(crate) fn dispatch_discovery_target(
     peer_id: &str,
     remote: SocketAddr,
 ) -> bool {
-    dispatch_known_peer_target(dispatcher, tenant_id, peer_id, remote)
+    dispatch_known_peer_target(
+        dispatcher,
+        tenant_id,
+        peer_id,
+        remote,
+        DialTargetSource::Discovery,
+    )
 }
 
 /// Dispatch a persisted-observation dial target through `PeerDispatcher`.
@@ -309,7 +418,13 @@ pub(crate) fn dispatch_observed_endpoint_target(
     peer_id: &str,
     remote: SocketAddr,
 ) -> bool {
-    dispatch_known_peer_target(dispatcher, tenant_id, peer_id, remote)
+    dispatch_known_peer_target(
+        dispatcher,
+        tenant_id,
+        peer_id,
+        remote,
+        DialTargetSource::ObservedEndpoint,
+    )
 }
 
 // ---------------------------------------------------------------------------
@@ -434,7 +549,7 @@ mod tests {
     #[test]
     fn test_dispatch_new_peer_returns_connect() {
         let mut d = PeerDispatcher::new();
-        let (action, rx) = d.dispatch("peer-a", addr(1000));
+        let (action, rx) = d.dispatch("peer-a", addr(1000), DialTargetSource::Discovery);
         assert_eq!(action, DiscoveryAction::Connect);
         assert!(rx.is_some(), "should return cancel receiver");
     }
@@ -442,9 +557,9 @@ mod tests {
     #[test]
     fn test_dispatch_same_addr_returns_skip() {
         let mut d = PeerDispatcher::new();
-        d.dispatch("peer-a", addr(1000));
+        d.dispatch("peer-a", addr(1000), DialTargetSource::Discovery);
 
-        let (action, rx) = d.dispatch("peer-a", addr(1000));
+        let (action, rx) = d.dispatch("peer-a", addr(1000), DialTargetSource::Discovery);
         assert_eq!(action, DiscoveryAction::Skip);
         assert!(rx.is_none());
     }
@@ -452,9 +567,9 @@ mod tests {
     #[test]
     fn test_dispatch_different_addr_returns_reconnect() {
         let mut d = PeerDispatcher::new();
-        d.dispatch("peer-a", addr(1000));
+        d.dispatch("peer-a", addr(1000), DialTargetSource::Discovery);
 
-        let (action, rx) = d.dispatch("peer-a", addr(2000));
+        let (action, rx) = d.dispatch("peer-a", addr(2000), DialTargetSource::Discovery);
         assert_eq!(action, DiscoveryAction::Reconnect);
         assert!(rx.is_some());
     }
@@ -462,10 +577,10 @@ mod tests {
     #[test]
     fn test_dispatch_addr_change_cancels_old_receiver() {
         let mut d = PeerDispatcher::new();
-        let (_, old_rx) = d.dispatch("peer-a", addr(1000));
+        let (_, old_rx) = d.dispatch("peer-a", addr(1000), DialTargetSource::Discovery);
         let mut old_rx = old_rx.unwrap();
 
-        let (action, _new_rx) = d.dispatch("peer-a", addr(2000));
+        let (action, _new_rx) = d.dispatch("peer-a", addr(2000), DialTargetSource::Discovery);
         assert_eq!(action, DiscoveryAction::Reconnect);
 
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -484,7 +599,7 @@ mod tests {
         let mut receivers = Vec::new();
 
         for port in 1000..1010 {
-            let (action, rx) = d.dispatch("peer-a", addr(port));
+            let (action, rx) = d.dispatch("peer-a", addr(port), DialTargetSource::Discovery);
             assert_ne!(action, DiscoveryAction::Skip);
             if let Some(rx) = rx {
                 receivers.push(rx);
@@ -503,20 +618,20 @@ mod tests {
         });
 
         assert_eq!(d.known.len(), 1);
-        assert_eq!(d.known.get("peer-a").unwrap().0, addr(1009));
+        assert_eq!(d.known.get("peer-a").unwrap().0.addr, addr(1009));
     }
 
     #[test]
     fn test_dispatch_multiple_peers_independent() {
         let mut d = PeerDispatcher::new();
 
-        let (a1, _) = d.dispatch("peer-a", addr(1000));
-        let (b1, _) = d.dispatch("peer-b", addr(2000));
+        let (a1, _) = d.dispatch("peer-a", addr(1000), DialTargetSource::Discovery);
+        let (b1, _) = d.dispatch("peer-b", addr(2000), DialTargetSource::Discovery);
         assert_eq!(a1, DiscoveryAction::Connect);
         assert_eq!(b1, DiscoveryAction::Connect);
 
-        let (a2, _) = d.dispatch("peer-a", addr(1001));
-        let (b2, _) = d.dispatch("peer-b", addr(2000));
+        let (a2, _) = d.dispatch("peer-a", addr(1001), DialTargetSource::Discovery);
+        let (b2, _) = d.dispatch("peer-b", addr(2000), DialTargetSource::Discovery);
         assert_eq!(a2, DiscoveryAction::Reconnect);
         assert_eq!(b2, DiscoveryAction::Skip);
     }
@@ -524,10 +639,10 @@ mod tests {
     #[test]
     fn test_forget_clears_dispatch_slot() {
         let mut d = PeerDispatcher::new();
-        d.dispatch("peer-a", addr(1000));
+        d.dispatch("peer-a", addr(1000), DialTargetSource::Discovery);
         d.forget("peer-a");
 
-        let (action, rx) = d.dispatch("peer-a", addr(1000));
+        let (action, rx) = d.dispatch("peer-a", addr(1000), DialTargetSource::Discovery);
         assert_eq!(action, DiscoveryAction::Connect);
         assert!(rx.is_some(), "forgotten peer should be connectable again");
     }
@@ -1003,12 +1118,44 @@ mod tests {
     }
 
     #[test]
-    fn test_bootstrap_dispatch_key_includes_invite_event_id() {
-        let a = bootstrap_dispatch_key("tenant-a", "invite-1");
-        let b = bootstrap_dispatch_key("tenant-a", "invite-2");
+    fn test_bootstrap_dispatch_key_includes_invite_event_id_and_address() {
+        let a = bootstrap_dispatch_key("tenant-a", "invite-1", addr(4433));
+        let b = bootstrap_dispatch_key("tenant-a", "invite-2", addr(4433));
+        let c = bootstrap_dispatch_key("tenant-a", "invite-1", addr(5544));
         assert_ne!(
             a, b,
             "different invites must produce distinct dispatch keys"
+        );
+        assert_ne!(
+            a, c,
+            "different bootstrap addresses for the same invite must not share a dispatch slot"
+        );
+    }
+
+    #[test]
+    fn test_dispatch_bootstrap_target_keeps_independent_slots_per_address() {
+        let mut d = PeerDispatcher::new();
+
+        assert!(dispatch_bootstrap_target(
+            &mut d,
+            "tenant-a",
+            "invite-1",
+            addr(4433)
+        ));
+        assert!(dispatch_bootstrap_target(
+            &mut d,
+            "tenant-a",
+            "invite-1",
+            addr(5544)
+        ));
+        assert!(
+            !dispatch_bootstrap_target(&mut d, "tenant-a", "invite-1", addr(4433)),
+            "same invite/address pair should still dedupe"
+        );
+        assert_eq!(
+            d.known.len(),
+            2,
+            "dead-first/live-second bootstrap addresses must not cancel each other"
         );
     }
 
@@ -1019,7 +1166,7 @@ mod tests {
         let mut d = PeerDispatcher::new();
 
         // Bootstrap target (remote peer_id not known yet, use bootstrap addr as key)
-        let (action, _) = d.dispatch("bootstrap-peer-1", addr(4433));
+        let (action, _) = d.dispatch("bootstrap-peer-1", addr(4433), DialTargetSource::Bootstrap);
         assert_eq!(
             action,
             DiscoveryAction::Connect,
@@ -1027,7 +1174,7 @@ mod tests {
         );
 
         // mDNS discovery target for a different peer
-        let (action, _) = d.dispatch("mdns-peer-2", addr(5000));
+        let (action, _) = d.dispatch("mdns-peer-2", addr(5000), DialTargetSource::Discovery);
         assert_eq!(
             action,
             DiscoveryAction::Connect,
@@ -1035,7 +1182,7 @@ mod tests {
         );
 
         // Same bootstrap target again → skip
-        let (action, _) = d.dispatch("bootstrap-peer-1", addr(4433));
+        let (action, _) = d.dispatch("bootstrap-peer-1", addr(4433), DialTargetSource::Bootstrap);
         assert_eq!(
             action,
             DiscoveryAction::Skip,
@@ -1043,11 +1190,116 @@ mod tests {
         );
 
         // mDNS peer moves address → reconnect
-        let (action, _) = d.dispatch("mdns-peer-2", addr(5001));
+        let (action, _) = d.dispatch("mdns-peer-2", addr(5001), DialTargetSource::Discovery);
         assert_eq!(
             action,
             DiscoveryAction::Reconnect,
             "discovery peer addr change reconnects"
+        );
+    }
+
+    #[test]
+    fn test_discovery_target_outranks_observed_target_for_same_peer() {
+        let mut d = PeerDispatcher::new();
+
+        let (action, _) = d.dispatch("peer-1", addr(4433), DialTargetSource::ObservedEndpoint);
+        assert_eq!(action, DiscoveryAction::Connect);
+
+        let (action, _) = d.dispatch("peer-1", addr(5000), DialTargetSource::Discovery);
+        assert_eq!(action, DiscoveryAction::Reconnect);
+
+        let (action, _) = d.dispatch("peer-1", addr(6000), DialTargetSource::ObservedEndpoint);
+        assert_eq!(
+            action,
+            DiscoveryAction::Skip,
+            "lower-priority observed endpoint must not displace discovery"
+        );
+    }
+
+    #[test]
+    fn test_same_addr_discovery_upgrades_priority_without_reconnect() {
+        let mut d = PeerDispatcher::new();
+
+        let (action, _) = d.dispatch("peer-1", addr(4433), DialTargetSource::ObservedEndpoint);
+        assert_eq!(action, DiscoveryAction::Connect);
+
+        let (action, _) = d.dispatch("peer-1", addr(4433), DialTargetSource::Discovery);
+        assert_eq!(
+            action,
+            DiscoveryAction::Skip,
+            "same-address discovery should upgrade priority without restarting the worker"
+        );
+
+        let (action, _) = d.dispatch("peer-1", addr(5000), DialTargetSource::ObservedEndpoint);
+        assert_eq!(
+            action,
+            DiscoveryAction::Skip,
+            "upgraded discovery priority must continue to shield against observed fallbacks"
+        );
+    }
+
+    #[test]
+    fn test_suppressed_discovery_target_allows_observed_fallback() {
+        let now = Instant::now();
+        let mut d = PeerDispatcher::new();
+
+        let (action, _) = d.dispatch_at("peer-1", addr(4433), DialTargetSource::Discovery, now);
+        assert_eq!(action, DiscoveryAction::Connect);
+        d.forget("peer-1");
+        d.suppress_for(
+            "peer-1",
+            addr(4433),
+            DialTargetSource::Discovery,
+            Duration::from_secs(5),
+        );
+
+        let (action, _) = d.dispatch_at(
+            "peer-1",
+            addr(4433),
+            DialTargetSource::Discovery,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(
+            action,
+            DiscoveryAction::Skip,
+            "suppressed discovery target should not immediately redial"
+        );
+
+        let (action, _) = d.dispatch_at(
+            "peer-1",
+            addr(5544),
+            DialTargetSource::ObservedEndpoint,
+            now + Duration::from_secs(1),
+        );
+        assert_eq!(
+            action,
+            DiscoveryAction::Connect,
+            "observed endpoint should be able to take over during discovery suppression"
+        );
+    }
+
+    #[test]
+    fn test_suppressed_target_expires() {
+        let now = Instant::now();
+        let mut d = PeerDispatcher::new();
+
+        d.suppress_for(
+            "peer-1",
+            addr(4433),
+            DialTargetSource::Discovery,
+            Duration::from_secs(1),
+        );
+
+        let (action, _) = d.dispatch_at(
+            "peer-1",
+            addr(4433),
+            DialTargetSource::Discovery,
+            now + Duration::from_secs(2),
+        );
+        assert_eq!(
+            action,
+            DiscoveryAction::Connect,
+            "suppression should expire and allow rediscovery"
         );
     }
 }

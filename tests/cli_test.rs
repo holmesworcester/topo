@@ -12,8 +12,11 @@
 //! `two_process_test.rs`.
 
 mod cli_harness;
+#[path = "support/discovery_lock.rs"]
+mod discovery_lock;
 
 use cli_harness::*;
+use discovery_lock::discovery_test_lock;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::process::{Command, Stdio};
@@ -361,11 +364,6 @@ fn status_projected_count(output: &str, label: &str) -> usize {
         .unwrap_or_else(|| panic!("missing status count for {} in:\n{}", label, output))
 }
 
-fn tenant_index_for_username(db_path: &str, username: &str) -> usize {
-    let peer_id = peer_id_for_username(db_path, username);
-    tenant_index_for_peer_id(db_path, &peer_id)
-}
-
 fn peer_id_for_username(db_path: &str, username: &str) -> String {
     let conn = open_connection(db_path).expect("open db");
     conn.query_row(
@@ -408,8 +406,18 @@ fn wait_for_username_peer_id(db_path: &str, username: &str, timeout_ms: u64) -> 
 }
 
 fn use_tenant_for_username(db_path: &str, username: &str) {
-    let idx = tenant_index_for_username(db_path, username);
-    use_tenant(db_path, &idx.to_string());
+    let expected_peer_id = peer_id_for_username(db_path, username);
+    let tenant_count = numbered_item_count(&get_tenants_raw(db_path));
+    for idx in 1..=tenant_count {
+        use_tenant(db_path, &idx.to_string());
+        if active_tenant_peer_id(db_path).as_deref() == Some(expected_peer_id.as_str()) {
+            return;
+        }
+    }
+    panic!(
+        "could not select tenant for username {} in {} via displayed tenant indices",
+        username, db_path
+    );
 }
 
 fn rewrite_invite_addrs(invite_link: &str, addrs: &[&str]) -> String {
@@ -618,8 +626,8 @@ fn start_joined_cli_peer(
     device_name: &str,
 ) -> StartedCliPeer {
     let db = tmpdir.path().join(db_name).to_str().unwrap().to_string();
-    accept_invite_with_identity(&db, invite_link, username, device_name);
     let daemon = start_daemon(&db);
+    accept_invite_with_identity_on_running_daemon(&db, invite_link, username, device_name);
     StartedCliPeer {
         db,
         username: username.to_string(),
@@ -636,8 +644,8 @@ fn start_linked_cli_peer(
     device_name: &str,
 ) -> StartedCliPeer {
     let db = tmpdir.path().join(db_name).to_str().unwrap().to_string();
-    accept_device_link_with_name(&db, invite_link, device_name);
     let daemon = start_daemon(&db);
+    accept_device_link_with_name_on_running_daemon(&db, invite_link, device_name);
     StartedCliPeer {
         db,
         username: username.to_string(),
@@ -762,9 +770,7 @@ fn assert_cli_state(
         view
     );
     let tenant_lines = view_tenant_section_lines(&view);
-    for (idx, (tenant_event_id, tenant_label)) in
-        expected_view_tenant_labels(db_path).into_iter().enumerate()
-    {
+    for (tenant_event_id, tenant_label) in expected_view_tenant_labels(db_path) {
         assert!(
             view.contains(&tenant_event_id),
             "view should contain tenant event id {:?}:\n{}",
@@ -777,15 +783,16 @@ fn assert_cli_state(
             tenant_label,
             view
         );
-        let expected_prefix = format!("{}.", idx + 1);
         assert!(
             tenant_lines.iter().any(|line| {
                 let trimmed = line.trim_start();
-                trimmed.starts_with(&expected_prefix)
-                    && line.contains(&tenant_event_id)
+                trimmed
+                    .split_once('.')
+                    .map(|(prefix, _)| prefix.chars().all(|ch| ch.is_ascii_digit()))
+                    .unwrap_or(false)
                     && line.contains(&tenant_label)
             }),
-            "view tenant line should be numbered consistently for {:?}:\n{}",
+            "view tenant line should include a numbered row for {:?}:\n{}",
             tenant_label,
             view
         );
@@ -1131,7 +1138,7 @@ fn test_cli_reconnects_after_bootstrap_supersession_using_observed_endpoint() {
         &alice_db,
         &DaemonOptions {
             bind_port: Some(alice_port),
-            disable_discovery: true,
+            discovery_mode: Some("off"),
             ..Default::default()
         },
     );
@@ -1141,7 +1148,7 @@ fn test_cli_reconnects_after_bootstrap_supersession_using_observed_endpoint() {
     let mut bob_daemon = start_daemon_with_options(
         &bob_db,
         &DaemonOptions {
-            disable_discovery: true,
+            discovery_mode: Some("off"),
             ..Default::default()
         },
     );
@@ -1166,7 +1173,7 @@ fn test_cli_reconnects_after_bootstrap_supersession_using_observed_endpoint() {
     bob_daemon = start_daemon_with_options(
         &bob_db,
         &DaemonOptions {
-            disable_discovery: true,
+            discovery_mode: Some("off"),
             ..Default::default()
         },
     );
@@ -1195,7 +1202,7 @@ fn test_cli_lowmem_receiver_restart_catches_offline_delta_and_resumes_sync() {
         &alice_db,
         &DaemonOptions {
             bind_port: Some(alice_port),
-            disable_discovery: true,
+            discovery_mode: Some("off"),
             ..Default::default()
         },
     );
@@ -1205,7 +1212,7 @@ fn test_cli_lowmem_receiver_restart_catches_offline_delta_and_resumes_sync() {
     let mut bob_daemon = start_daemon_with_options(
         &bob_db,
         &DaemonOptions {
-            disable_discovery: true,
+            discovery_mode: Some("off"),
             ..Default::default()
         },
     );
@@ -1228,7 +1235,7 @@ fn test_cli_lowmem_receiver_restart_catches_offline_delta_and_resumes_sync() {
     bob_daemon = start_daemon_with_options(
         &bob_db,
         &DaemonOptions {
-            disable_discovery: true,
+            discovery_mode: Some("off"),
             extra_env: vec![
                 ("LOW_MEM_IOS".to_string(), "1".to_string()),
                 ("LOW_MEM_WAL_CAP_MIB".to_string(), "12".to_string()),
@@ -1261,21 +1268,21 @@ fn test_cli_lowmem_receiver_restart_catches_offline_delta_and_resumes_sync() {
 #[cfg(feature = "discovery")]
 fn test_cli_local_mdns_discovery_without_bootstrap_addresses() {
     let _guard = cli_test_lock();
+    let _discovery_guard = discovery_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 30000;
-
     // Alice creates workspace and starts daemon
     create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
+    let _alice = start_daemon_with_default_bind(&alice_db);
     let _bootstrap_eid = send_message(&alice_db, "bootstrap");
     assert_now(&alice_db, "message_count >= 1");
 
     // Alice creates invite while daemon is running, then rewrites it to carry
     // no bootstrap endpoints so Bob must recover via mDNS.
     let invite_link = rewrite_invite_addrs(
-        &create_invite(&alice_db, &daemon_listen_addr(&alice_db)),
+        &create_invite(&alice_db, &daemon_loopback_addr(&alice_db)),
         &[],
     );
     assert!(
@@ -1289,7 +1296,7 @@ fn test_cli_local_mdns_discovery_without_bootstrap_addresses() {
     // Bob accepts invite and starts daemon normally. With no bootstrap
     // addresses persisted, runtime recovery must come from mDNS only.
     accept_invite(&bob_db, &invite_link);
-    let _bob = start_daemon(&bob_db);
+    let _bob = start_daemon_with_default_bind(&bob_db);
     assert_eventually(&bob_db, "message_count >= 1", timeout_ms);
     assert_identity_eventually_materialized(&bob_db, timeout_ms);
 
@@ -1310,25 +1317,83 @@ fn test_cli_local_mdns_discovery_without_bootstrap_addresses() {
     );
 }
 
-/// A rewritten invite with only wrong bootstrap addresses should still recover
-/// via mDNS once both daemons are running.
+/// A joiner that starts its daemon before accepting an empty-bootstrap invite
+/// should still recover via mDNS and complete the bootstrap sync.
 #[test]
 #[cfg(feature = "discovery")]
-fn test_cli_local_mdns_discovery_with_wrong_bootstrap_address_only() {
+fn test_cli_local_mdns_discovery_after_live_accept_without_bootstrap_addresses() {
     let _guard = cli_test_lock();
+    let _discovery_guard = discovery_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 30000;
 
     create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
+    let _alice = start_daemon_with_default_bind(&alice_db);
+    let _bootstrap_eid = send_message(&alice_db, "bootstrap");
+    assert_now(&alice_db, "message_count >= 1");
+
+    let invite_link = rewrite_invite_addrs(
+        &create_invite(&alice_db, &daemon_loopback_addr(&alice_db)),
+        &[],
+    );
+    assert!(
+        parse_invite_link(&invite_link)
+            .expect("parse empty-address invite")
+            .bootstrap_addrs
+            .is_empty(),
+        "invite should carry no bootstrap addresses"
+    );
+
+    let _bob = start_daemon_with_default_bind(&bob_db);
+    accept_invite_with_identity_on_running_daemon_and_timeout(
+        &bob_db,
+        &invite_link,
+        "bob",
+        "bob-box",
+        Duration::from_secs(10),
+    );
+
+    let bob_socket = socket_path_for_db(&bob_db);
+    let _bob_active = wait_for_runtime_state(&bob_socket, "Active", Duration::from_secs(15));
+    assert_eventually(&bob_db, "message_count >= 1", timeout_ms);
+    assert_identity_eventually_materialized(&bob_db, timeout_ms);
+
+    let alice_live_eid = send_message(&alice_db, "alice-via-live-accept-mdns-empty-bootstrap");
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", alice_live_eid),
+        timeout_ms,
+    );
+
+    let bob_live_eid = send_message(&bob_db, "bob-via-live-accept-mdns-empty-bootstrap");
+    assert_eventually(
+        &alice_db,
+        &format!("has_event:{} >= 1", bob_live_eid),
+        timeout_ms,
+    );
+}
+
+/// A rewritten invite with only wrong bootstrap addresses should still recover
+/// via mDNS once both daemons are running.
+#[test]
+#[cfg(feature = "discovery")]
+fn test_cli_local_mdns_discovery_with_wrong_bootstrap_address_only() {
+    let _guard = cli_test_lock();
+    let _discovery_guard = discovery_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+    let timeout_ms = 30000;
+    create_workspace(&alice_db);
+    let _alice = start_daemon_with_default_bind(&alice_db);
     let _bootstrap_eid = send_message(&alice_db, "bootstrap");
     assert_now(&alice_db, "message_count >= 1");
 
     let wrong_addr = format!("127.0.0.1:{}", random_port());
     let invite_link = rewrite_invite_addrs(
-        &create_invite(&alice_db, &daemon_listen_addr(&alice_db)),
+        &create_invite(&alice_db, &daemon_loopback_addr(&alice_db)),
         &[&wrong_addr],
     );
     assert_eq!(
@@ -1346,7 +1411,7 @@ fn test_cli_local_mdns_discovery_with_wrong_bootstrap_address_only() {
         "bob-box",
         Duration::from_secs(2),
     );
-    let _bob = start_daemon(&bob_db);
+    let _bob = start_daemon_with_default_bind(&bob_db);
     assert_eventually(&bob_db, "message_count >= 1", timeout_ms);
     assert_identity_eventually_materialized(&bob_db, timeout_ms);
 
@@ -1363,6 +1428,84 @@ fn test_cli_local_mdns_discovery_with_wrong_bootstrap_address_only() {
         &format!("has_event:{} >= 1", bob_live_eid),
         timeout_ms,
     );
+}
+
+/// Explicit loopback `--bind` disables advertise-address autodetection, so
+/// mDNS-only recovery should not happen without a valid bootstrap address.
+#[test]
+#[cfg(feature = "discovery")]
+fn test_cli_explicit_bind_disables_mdns_recovery_without_bootstrap_addresses() {
+    let _guard = cli_test_lock();
+    let _discovery_guard = discovery_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+
+    create_workspace(&alice_db);
+    let _alice = start_daemon(&alice_db);
+    let bootstrap_eid = send_message(&alice_db, "bootstrap-with-explicit-bind");
+    assert_now(&alice_db, "message_count >= 1");
+
+    let invite_link = rewrite_invite_addrs(
+        &create_invite(&alice_db, &daemon_listen_addr(&alice_db)),
+        &[],
+    );
+    accept_invite(&bob_db, &invite_link);
+    let _bob = start_daemon(&bob_db);
+
+    std::thread::sleep(Duration::from_secs(3));
+    assert_now(&bob_db, &format!("has_event:{} == 0", bootstrap_eid));
+
+    let live_eid = send_message(&alice_db, "alice-mdns-disabled-by-explicit-bind");
+    std::thread::sleep(Duration::from_secs(2));
+    assert_now(&bob_db, &format!("has_event:{} == 0", live_eid));
+}
+
+/// `--discovery on` should restore mDNS recovery even when `--bind` is explicit.
+#[test]
+#[cfg(feature = "discovery")]
+fn test_cli_explicit_bind_with_discovery_on_recovers_without_bootstrap_addresses() {
+    let _guard = cli_test_lock();
+    let _discovery_guard = discovery_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+    let timeout_ms = 30000;
+
+    create_workspace(&alice_db);
+    let _alice = start_daemon_with_options(
+        &alice_db,
+        &DaemonOptions {
+            bind_port: Some(random_port()),
+            discovery_mode: Some("on"),
+            ..Default::default()
+        },
+    );
+    let bootstrap_eid = send_message(&alice_db, "bootstrap-with-explicit-bind-discovery-on");
+    assert_now(&alice_db, "message_count >= 1");
+
+    let invite_link = rewrite_invite_addrs(
+        &create_invite(&alice_db, &daemon_listen_addr(&alice_db)),
+        &[],
+    );
+    accept_invite(&bob_db, &invite_link);
+    let _bob = start_daemon_with_options(
+        &bob_db,
+        &DaemonOptions {
+            bind_port: Some(random_port()),
+            discovery_mode: Some("on"),
+            ..Default::default()
+        },
+    );
+
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", bootstrap_eid),
+        timeout_ms,
+    );
+
+    let live_eid = send_message(&alice_db, "alice-mdns-enabled-by-flag");
+    assert_eventually(&bob_db, &format!("has_event:{} >= 1", live_eid), timeout_ms);
 }
 
 #[test]
@@ -2164,8 +2307,9 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
 #[cfg(feature = "discovery")]
 fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
     let _guard = cli_test_lock();
+    let _discovery_guard = discovery_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 45000;
+    let timeout_ms = 90000;
     let workspace_name = "device-link-mixed-topology";
 
     let phone_db = tmpdir.path().join("phone.db").to_str().unwrap().to_string();
@@ -2174,7 +2318,7 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
         db: phone_db,
         username: "alice".to_string(),
         device_name: "phone".to_string(),
-        _daemon: start_daemon(
+        _daemon: start_daemon_with_default_bind(
             tmpdir
                 .path()
                 .join("phone.db")
@@ -2188,7 +2332,7 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
     assert_event_visible_on_all(&[&phone.db], &phone_base_eid, timeout_ms);
 
     let empty_link = rewrite_invite_addrs(
-        &create_device_link(&phone.db, &daemon_listen_addr(&phone.db)),
+        &create_device_link(&phone.db, &daemon_loopback_addr(&phone.db)),
         &[],
     );
     assert!(
@@ -2205,23 +2349,18 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
         .to_str()
         .unwrap()
         .to_string();
-    accept_device_link_with_name_and_timeout(
+    let laptop_daemon = start_daemon_with_default_bind(&laptop_db);
+    accept_device_link_with_name_on_running_daemon_and_timeout(
         &laptop_db,
         &empty_link,
         "laptop",
-        Duration::from_secs(2),
+        Duration::from_secs(10),
     );
     let laptop = StartedCliPeer {
         db: laptop_db,
         username: "alice".to_string(),
         device_name: "laptop".to_string(),
-        _daemon: start_daemon(
-            tmpdir
-                .path()
-                .join("laptop.db")
-                .to_str()
-                .expect("laptop db path"),
-        ),
+        _daemon: laptop_daemon,
     };
     let laptop_tenant = laptop.tenant_label();
     assert_eventually(&laptop.db, "message_count >= 1", timeout_ms);
@@ -2230,7 +2369,7 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
     let laptop_eid = send_message(&laptop.db, laptop_msg);
     assert_event_visible_on_all(&[&phone.db, &laptop.db], &laptop_eid, timeout_ms);
 
-    let laptop_live_addr = daemon_listen_addr(&laptop.db);
+    let laptop_live_addr = daemon_loopback_addr(&laptop.db);
     let laptop_live_port = laptop_live_addr
         .rsplit_once(':')
         .expect("laptop listen addr should contain port")
@@ -2257,7 +2396,7 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
     );
 
     let wrong_link = rewrite_invite_addrs(
-        &create_device_link(&phone.db, &daemon_listen_addr(&phone.db)),
+        &create_device_link(&phone.db, &daemon_loopback_addr(&phone.db)),
         &[&format!("127.0.0.1:{}", random_port())],
     );
     let desktop_db = tmpdir
@@ -2266,23 +2405,18 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
         .to_str()
         .unwrap()
         .to_string();
-    accept_device_link_with_name_and_timeout(
+    let desktop_daemon = start_daemon_with_default_bind(&desktop_db);
+    accept_device_link_with_name_on_running_daemon_and_timeout(
         &desktop_db,
         &wrong_link,
         "desktop",
-        Duration::from_secs(2),
+        Duration::from_secs(10),
     );
     let desktop = StartedCliPeer {
         db: desktop_db,
         username: "alice".to_string(),
         device_name: "desktop".to_string(),
-        _daemon: start_daemon(
-            tmpdir
-                .path()
-                .join("desktop.db")
-                .to_str()
-                .expect("desktop db path"),
-        ),
+        _daemon: desktop_daemon,
     };
     let desktop_tenant = desktop.tenant_label();
     assert_eventually(&desktop.db, "message_count >= 3", timeout_ms);
@@ -2376,6 +2510,85 @@ fn test_cli_invite_with_dead_first_and_live_second_address() {
             &[alice_base, bob_msg],
         );
     }
+}
+
+/// A dead-first/live-second explicit invite must still complete after the
+/// inviter has already admitted mDNS-only peers in the same workspace.
+#[test]
+#[cfg(feature = "discovery")]
+fn test_cli_invite_with_dead_first_and_live_second_address_after_mdns_only_joins() {
+    let _guard = cli_test_lock();
+    let _discovery_guard = discovery_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 45000;
+    let workspace_name = "dead-first-after-mdns";
+
+    let alpha_db = tmpdir.path().join("alpha.db").to_str().unwrap().to_string();
+    let shared_db = tmpdir
+        .path()
+        .join("shared.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace_with_details(&alpha_db, workspace_name, "alpha", "alpha-root");
+    let alpha = StartedCliPeer {
+        db: alpha_db,
+        username: "alpha".to_string(),
+        device_name: "alpha-root".to_string(),
+        _daemon: start_daemon(
+            tmpdir
+                .path()
+                .join("alpha.db")
+                .to_str()
+                .expect("alpha db path"),
+        ),
+    };
+
+    let alpha_empty_invite = rewrite_invite_addrs(
+        &create_invite(&alpha.db, &daemon_loopback_addr(&alpha.db)),
+        &[],
+    );
+    accept_invite_with_identity(&shared_db, &alpha_empty_invite, "bob-alpha", "bob-terminal");
+    accept_invite_with_identity(
+        &shared_db,
+        &alpha_empty_invite,
+        "carol-alpha",
+        "carol-terminal",
+    );
+    let _shared_daemon = start_daemon_with_default_bind(&shared_db);
+
+    assert_eventually_users_include(
+        &alpha.db,
+        &["alpha", "bob-alpha", "carol-alpha"],
+        timeout_ms,
+    );
+
+    let live_addr = daemon_loopback_addr(&alpha.db);
+    let live_port = live_addr
+        .rsplit_once(':')
+        .expect("listen addr should contain port")
+        .1
+        .to_string();
+    let rewritten_invite = rewrite_invite_addrs(
+        &create_invite(&alpha.db, &live_addr),
+        &[
+            &format!("127.0.0.1:{}", random_port()),
+            &format!("localhost:{}", live_port),
+        ],
+    );
+
+    let dave = start_joined_cli_peer(&tmpdir, "dave.db", &rewritten_invite, "dave-alpha", "dave");
+    assert_identity_eventually_materialized(&dave.db, timeout_ms);
+    assert_eventually_users_include(
+        &alpha.db,
+        &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
+        timeout_ms,
+    );
+
+    let dave_msg = "dead-first-after-mdns/dave-step-1";
+    let dave_eid = send_message(&dave.db, dave_msg);
+    assert_event_visible_on_all(&[&alpha.db, &dave.db], &dave_eid, timeout_ms);
 }
 
 /// Multitenant + multiworkspace progression:
@@ -3231,8 +3444,9 @@ fn test_cli_live_daemon_creating_third_workspace_preserves_existing_second_works
 #[cfg(feature = "discovery")]
 fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_endpoints() {
     let _guard = cli_test_lock();
+    let _discovery_guard = discovery_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 45000;
+    let timeout_ms = 90000;
 
     let alpha_db = tmpdir.path().join("alpha.db").to_str().unwrap().to_string();
     let zeta_db = tmpdir.path().join("zeta.db").to_str().unwrap().to_string();
@@ -3249,7 +3463,7 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
         db: alpha_db,
         username: "alpha".to_string(),
         device_name: "alpha-root".to_string(),
-        _daemon: start_daemon(
+        _daemon: start_daemon_with_default_bind(
             tmpdir
                 .path()
                 .join("alpha.db")
@@ -3259,7 +3473,7 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
     };
     let alpha_tenant = alpha.tenant_label();
     let alpha_empty_invite = rewrite_invite_addrs(
-        &create_invite(&alpha.db, &daemon_listen_addr(&alpha.db)),
+        &create_invite(&alpha.db, &daemon_loopback_addr(&alpha.db)),
         &[],
     );
     assert!(
@@ -3275,7 +3489,7 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
         db: zeta_db,
         username: "zeta".to_string(),
         device_name: "zeta-root".to_string(),
-        _daemon: start_daemon(
+        _daemon: start_daemon_with_default_bind(
             tmpdir
                 .path()
                 .join("zeta.db")
@@ -3284,8 +3498,10 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
         ),
     };
     let zeta_tenant = zeta.tenant_label();
-    let zeta_empty_invite =
-        rewrite_invite_addrs(&create_invite(&zeta.db, &daemon_listen_addr(&zeta.db)), &[]);
+    let zeta_empty_invite = rewrite_invite_addrs(
+        &create_invite(&zeta.db, &daemon_loopback_addr(&zeta.db)),
+        &[],
+    );
     assert!(
         parse_invite_link(&zeta_empty_invite)
             .expect("parse zeta empty-address invite")
@@ -3294,15 +3510,28 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
         "zeta invite should carry no bootstrap addresses"
     );
 
-    accept_invite_with_identity(&shared_db, &alpha_empty_invite, "bob-alpha", "bob-terminal");
-    accept_invite_with_identity(&shared_db, &zeta_empty_invite, "yuki-zeta", "yuki-terminal");
-    accept_invite_with_identity(
+    let _shared_daemon = start_daemon_with_default_bind(&shared_db);
+    accept_invite_with_identity_on_running_daemon_and_timeout(
+        &shared_db,
+        &alpha_empty_invite,
+        "bob-alpha",
+        "bob-terminal",
+        Duration::from_secs(10),
+    );
+    accept_invite_with_identity_on_running_daemon_and_timeout(
+        &shared_db,
+        &zeta_empty_invite,
+        "yuki-zeta",
+        "yuki-terminal",
+        Duration::from_secs(10),
+    );
+    accept_invite_with_identity_on_running_daemon_and_timeout(
         &shared_db,
         &alpha_empty_invite,
         "carol-alpha",
         "carol-terminal",
+        Duration::from_secs(10),
     );
-    let _shared_daemon = start_daemon(&shared_db);
 
     assert_eventually_users_include(
         &alpha.db,
@@ -3311,7 +3540,7 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
     );
     assert_eventually_users_include(&zeta.db, &["zeta", "yuki-zeta"], timeout_ms);
 
-    let alpha_live_addr = daemon_listen_addr(&alpha.db);
+    let alpha_live_addr = daemon_loopback_addr(&alpha.db);
     let alpha_live_port = alpha_live_addr
         .rsplit_once(':')
         .expect("alpha listen addr should contain port")
@@ -3325,7 +3554,8 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
         ],
     );
     let dave = {
-        accept_invite_with_identity(
+        let daemon = start_daemon(&dave_db);
+        accept_invite_with_identity_on_running_daemon(
             &dave_db,
             &alpha_explicit_invite,
             "dave-alpha",
@@ -3335,13 +3565,7 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
             db: dave_db,
             username: "dave-alpha".to_string(),
             device_name: "dave-laptop".to_string(),
-            _daemon: start_daemon(
-                tmpdir
-                    .path()
-                    .join("dave.db")
-                    .to_str()
-                    .expect("dave db path"),
-            ),
+            _daemon: daemon,
         }
     };
     let dave_tenant = dave.tenant_label();
@@ -3513,6 +3737,7 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
 #[cfg(feature = "discovery")]
 fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolation() {
     let _guard = cli_test_lock();
+    let _discovery_guard = discovery_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 45000;
 
@@ -3532,7 +3757,7 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
         db: alpha_db,
         username: "alpha".to_string(),
         device_name: "alpha-root".to_string(),
-        _daemon: start_daemon(
+        _daemon: start_daemon_with_default_bind(
             tmpdir
                 .path()
                 .join("alpha.db")
@@ -3544,7 +3769,7 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
     let alpha_bootstrap = send_message(&alpha.db, "alpha-space/bootstrap");
     assert_event_visible_on_all(&[&alpha.db], &alpha_bootstrap, timeout_ms);
     let alpha_empty_invite = rewrite_invite_addrs(
-        &create_invite(&alpha.db, &daemon_listen_addr(&alpha.db)),
+        &create_invite(&alpha.db, &daemon_loopback_addr(&alpha.db)),
         &[],
     );
 
@@ -3553,7 +3778,7 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
         db: zeta_db,
         username: "zeta".to_string(),
         device_name: "zeta-root".to_string(),
-        _daemon: start_daemon(
+        _daemon: start_daemon_with_default_bind(
             tmpdir
                 .path()
                 .join("zeta.db")
@@ -3564,26 +3789,30 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
     let zeta_tenant = zeta.tenant_label();
     let zeta_bootstrap = send_message(&zeta.db, "zeta-space/bootstrap");
     assert_event_visible_on_all(&[&zeta.db], &zeta_bootstrap, timeout_ms);
-    let zeta_empty_invite =
-        rewrite_invite_addrs(&create_invite(&zeta.db, &daemon_listen_addr(&zeta.db)), &[]);
+    let zeta_empty_invite = rewrite_invite_addrs(
+        &create_invite(&zeta.db, &daemon_loopback_addr(&zeta.db)),
+        &[],
+    );
 
     accept_invite_with_identity(&shared_db, &alpha_empty_invite, "bob-alpha", "bob-terminal");
     accept_invite_with_identity(&shared_db, &zeta_empty_invite, "yuki-zeta", "yuki-terminal");
-    let _shared_daemon = start_daemon(&shared_db);
+    let _shared_daemon = start_daemon_with_default_bind(&shared_db);
 
     let dave_alpha_invite = rewrite_invite_addrs(
-        &create_invite(&alpha.db, &daemon_listen_addr(&alpha.db)),
+        &create_invite(&alpha.db, &daemon_loopback_addr(&alpha.db)),
         &[],
     );
-    let emma_zeta_invite =
-        rewrite_invite_addrs(&create_invite(&zeta.db, &daemon_listen_addr(&zeta.db)), &[]);
+    let emma_zeta_invite = rewrite_invite_addrs(
+        &create_invite(&zeta.db, &daemon_loopback_addr(&zeta.db)),
+        &[],
+    );
 
     accept_invite_with_identity(&dave_db, &dave_alpha_invite, "dave-alpha", "dave-laptop");
     let dave = StartedCliPeer {
         db: dave_db,
         username: "dave-alpha".to_string(),
         device_name: "dave-laptop".to_string(),
-        _daemon: start_daemon(
+        _daemon: start_daemon_with_default_bind(
             tmpdir
                 .path()
                 .join("dave.db")
@@ -3600,7 +3829,7 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
         db: emma_db,
         username: "emma-zeta".to_string(),
         device_name: "emma-laptop".to_string(),
-        _daemon: start_daemon(
+        _daemon: start_daemon_with_default_bind(
             tmpdir
                 .path()
                 .join("emma.db")

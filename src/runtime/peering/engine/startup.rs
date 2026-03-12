@@ -20,12 +20,13 @@ use crate::transport::{
 };
 use rustls::sign::CertifiedKey;
 
-use super::NodeRuntimeNetInfo;
+use super::{DiscoveryRuntimePolicy, NodeRuntimeNetInfo};
 
 /// Result of the startup phase: everything needed to run accept/connect loops.
 pub(crate) struct StartupResult {
     pub(crate) endpoint: TransportEndpoint,
     pub(crate) local_addr: SocketAddr,
+    pub(crate) discovery_advertise_ip: Option<String>,
     pub(crate) tenants: Vec<crate::db::transport_creds::TenantInfo>,
     pub(crate) tenant_client_configs: TenantClientConfigs,
     /// Peer IDs of all local tenants (for mDNS self-filtering).
@@ -37,6 +38,7 @@ pub(crate) struct StartupResult {
 pub(crate) fn setup_endpoint_and_tenants(
     db_path: &str,
     bind: SocketAddr,
+    discovery_policy: DiscoveryRuntimePolicy,
     net_info_tx: tokio::sync::oneshot::Sender<NodeRuntimeNetInfo>,
     cert_resolver: Arc<WorkspaceCertResolver>,
 ) -> Result<StartupResult, Box<dyn std::error::Error + Send + Sync>> {
@@ -146,6 +148,27 @@ pub(crate) fn setup_endpoint_and_tenants(
         tenants.len()
     );
 
+    let discovery_advertise_ip = if discovery_policy.enabled {
+        let advertise_ip = super::discovery::resolve_mdns_advertise_ip(
+            local_addr,
+            discovery_policy.allow_advertise_addr_autodetect,
+        );
+        if advertise_ip.is_none() {
+            if discovery_policy.allow_advertise_addr_autodetect {
+                warn!("mDNS discovery unavailable: no non-loopback advertise address detected");
+            } else {
+                info!(
+                    "mDNS discovery disabled for explicit bind {} because advertise-address autodetection is off",
+                    bind
+                );
+            }
+        }
+        advertise_ip
+    } else {
+        info!("mDNS discovery disabled by start policy");
+        None
+    };
+
     // Send runtime networking info back to caller (e.g. DaemonState in main.rs).
     let info = NodeRuntimeNetInfo {
         listen_addr: local_addr.to_string(),
@@ -176,6 +199,7 @@ pub(crate) fn setup_endpoint_and_tenants(
     Ok(StartupResult {
         endpoint,
         local_addr,
+        discovery_advertise_ip,
         tenants,
         tenant_client_configs,
         local_peer_ids,

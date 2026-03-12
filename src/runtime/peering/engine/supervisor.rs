@@ -37,10 +37,12 @@ use crate::tuning::shared_ingest_cap;
 use super::target_planner::{
     bootstrap_dispatch_key, collect_all_bootstrap_targets, collect_all_observed_endpoint_targets,
     discovery_dispatch_key, dispatch_bootstrap_target, dispatch_discovery_target,
-    dispatch_observed_endpoint_target, normalize_discovered_addr_for_local_bind, PeerDispatcher,
+    dispatch_observed_endpoint_target, normalize_discovered_addr_for_local_bind, DialTargetSource,
+    PeerDispatcher,
 };
 
 const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
+const STALE_TARGET_SUPPRESSION_WINDOW: Duration = Duration::from_secs(5);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeState {
@@ -106,13 +108,23 @@ struct TargetIngressEvent {
 
 struct ActiveConnectWorker {
     cancel: CancellationToken,
-    join: std::thread::JoinHandle<()>,
+    remote: SocketAddr,
+    source: DialTargetSource,
+    join: std::thread::JoinHandle<ConnectWorkerExitReason>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ConnectWorkerExitReason {
+    Cancelled,
+    StaleTarget,
 }
 
 pub(crate) struct RuntimeSupervisor {
     db_path: String,
     endpoint: TransportEndpoint,
     local_addr: SocketAddr,
+    discovery_enabled: bool,
+    discovery_advertise_ip: Option<String>,
     tenants: Vec<TenantInfo>,
     tenant_client_configs: TenantClientConfigs,
     local_peer_ids: HashSet<String>,
@@ -127,6 +139,8 @@ impl RuntimeSupervisor {
         db_path: String,
         endpoint: TransportEndpoint,
         local_addr: SocketAddr,
+        discovery_enabled: bool,
+        discovery_advertise_ip: Option<String>,
         tenants: Vec<TenantInfo>,
         tenant_client_configs: TenantClientConfigs,
         local_peer_ids: HashSet<String>,
@@ -137,6 +151,8 @@ impl RuntimeSupervisor {
             db_path,
             endpoint,
             local_addr,
+            discovery_enabled,
+            discovery_advertise_ip,
             tenants,
             tenant_client_configs,
             local_peer_ids,
@@ -270,12 +286,13 @@ impl RuntimeSupervisor {
         let mut discovery_handles = Vec::new();
 
         #[cfg(feature = "discovery")]
-        if env_flag("P7_DISABLE_DISCOVERY") {
-            warn!("mDNS discovery disabled by P7_DISABLE_DISCOVERY");
+        if !self.discovery_enabled {
+            warn!("mDNS discovery disabled by start policy");
         } else {
             let setup = super::discovery::prepare_mdns_discovery(
                 &self.tenants,
                 self.local_addr,
+                self.discovery_advertise_ip.clone(),
                 &self.local_peer_ids,
                 &self.tenant_client_configs,
             );
@@ -362,6 +379,14 @@ impl RuntimeSupervisor {
         }
 
         Ok(events_received.load(Ordering::Relaxed))
+    }
+}
+
+fn dial_target_source(source: &TargetIngressSource) -> DialTargetSource {
+    match source {
+        TargetIngressSource::Bootstrap { .. } => DialTargetSource::Bootstrap,
+        TargetIngressSource::ObservedPeer { .. } => DialTargetSource::ObservedEndpoint,
+        TargetIngressSource::Discovery { .. } => DialTargetSource::Discovery,
     }
 }
 
@@ -648,7 +673,7 @@ async fn run_target_dispatcher(
 
         let dispatch_key = match &event.source {
             TargetIngressSource::Bootstrap { invite_event_id } => {
-                bootstrap_dispatch_key(&event.tenant_id, invite_event_id)
+                bootstrap_dispatch_key(&event.tenant_id, invite_event_id, event.remote)
             }
             TargetIngressSource::ObservedPeer { peer_id } => {
                 discovery_dispatch_key(&event.tenant_id, peer_id)
@@ -739,6 +764,7 @@ async fn run_target_dispatcher(
         };
 
         let worker_cancel = shutdown.child_token();
+        let worker_source = dial_target_source(&event.source);
         info!(
             "Spawning connect worker key={} tenant={} remote={} source={:?}",
             dispatch_key,
@@ -762,6 +788,7 @@ async fn run_target_dispatcher(
                     db_path,
                     tenant_id,
                     event.remote,
+                    worker_source,
                     endpoint,
                     context,
                     intro_spawner,
@@ -769,7 +796,7 @@ async fn run_target_dispatcher(
                     worker_cancel,
                     dispatch_key,
                     bootstrap_fallback_client_config,
-                ));
+                ))
             }
         });
 
@@ -777,6 +804,8 @@ async fn run_target_dispatcher(
             dispatch_key,
             ActiveConnectWorker {
                 cancel: worker_cancel,
+                remote: event.remote,
+                source: worker_source,
                 join: worker,
             },
         );
@@ -790,11 +819,11 @@ async fn run_target_dispatcher(
     Ok(())
 }
 
-async fn join_connect_worker(worker: ActiveConnectWorker) {
-    let _ = tokio::task::spawn_blocking(move || {
-        let _ = worker.join.join();
-    })
-    .await;
+async fn join_connect_worker(worker: ActiveConnectWorker) -> ConnectWorkerExitReason {
+    match tokio::task::spawn_blocking(move || worker.join.join()).await {
+        Ok(Ok(reason)) => reason,
+        Ok(Err(_)) | Err(_) => ConnectWorkerExitReason::Cancelled,
+    }
 }
 
 async fn reap_finished_connect_workers(
@@ -808,8 +837,17 @@ async fn reap_finished_connect_workers(
 
     for key in finished_keys {
         if let Some(worker) = active_workers.remove(&key) {
-            join_connect_worker(worker).await;
+            let remote = worker.remote;
+            let source = worker.source;
+            let exit_reason = join_connect_worker(worker).await;
             dispatcher.forget(&key);
+            if exit_reason == ConnectWorkerExitReason::StaleTarget {
+                dispatcher.suppress_for(&key, remote, source, STALE_TARGET_SUPPRESSION_WINDOW);
+                info!(
+                    "connect worker {} suppressed stale target remote={} source={:?} for {:?}",
+                    key, remote, source, STALE_TARGET_SUPPRESSION_WINDOW
+                );
+            }
             warn!(
                 "connect worker {} exited; cleared dispatch slot for fresh target ingress",
                 key
@@ -822,6 +860,7 @@ async fn run_connect_worker(
     db_path: String,
     tenant_id: String,
     remote: SocketAddr,
+    source: DialTargetSource,
     endpoint: TransportEndpoint,
     context: TenantDispatchContext,
     intro_spawner: IntroSpawnerFn,
@@ -829,11 +868,11 @@ async fn run_connect_worker(
     shutdown: CancellationToken,
     dispatch_key: String,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
-) {
+) -> ConnectWorkerExitReason {
     let mut warning_gate = RepeatedWarningGate::new(Duration::from_secs(300));
     loop {
         if shutdown.is_cancelled() {
-            break;
+            return ConnectWorkerExitReason::Cancelled;
         }
 
         let result = connect_loop_with_coordination_until_cancel_with_fallback(
@@ -851,7 +890,7 @@ async fn run_connect_worker(
         .await;
 
         if shutdown.is_cancelled() {
-            break;
+            return ConnectWorkerExitReason::Cancelled;
         }
 
         let stale_target = match &result {
@@ -882,14 +921,16 @@ async fn run_connect_worker(
         };
         if stale_target {
             info!(
-                "connect worker {} marked dial target stale; exiting for fresh target resolution",
-                dispatch_key
+                "connect worker {} marked dial target stale; exiting for fresh target resolution (source={:?}, remote={})",
+                dispatch_key,
+                source,
+                remote
             );
-            break;
+            return ConnectWorkerExitReason::StaleTarget;
         }
 
         tokio::select! {
-            _ = shutdown.cancelled() => break,
+            _ = shutdown.cancelled() => return ConnectWorkerExitReason::Cancelled,
             _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
         }
     }

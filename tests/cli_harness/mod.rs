@@ -65,12 +65,14 @@ pub fn topo_cmd(db: &str, args: &[&str]) -> Output {
 
 /// Options for starting a daemon.
 pub struct DaemonOptions {
+    /// Start without `--bind`, letting the daemon use its built-in default bind policy.
+    pub use_default_bind: bool,
     /// Specific port to bind to. None = random (127.0.0.1:0).
     pub bind_port: Option<u16>,
     /// Disable placeholder autodial via environment variable.
     pub disable_placeholder_autodial: bool,
-    /// Disable mDNS discovery via environment variable.
-    pub disable_discovery: bool,
+    /// Optional explicit discovery mode passed to `topo start --discovery`.
+    pub discovery_mode: Option<&'static str>,
     /// Inherit stdout/stderr for debugging (instead of suppressing).
     pub inherit_stdio: bool,
     /// Redirect stdout to a file path (takes precedence over inherit_stdio).
@@ -84,9 +86,10 @@ pub struct DaemonOptions {
 impl Default for DaemonOptions {
     fn default() -> Self {
         Self {
+            use_default_bind: false,
             bind_port: None,
             disable_placeholder_autodial: false,
-            disable_discovery: false,
+            discovery_mode: None,
             inherit_stdio: false,
             stdout_file: None,
             stderr_file: None,
@@ -98,6 +101,17 @@ impl Default for DaemonOptions {
 /// Start a daemon with default options (random port, suppressed I/O).
 pub fn start_daemon(db: &str) -> DaemonGuard {
     start_daemon_with_options(db, &DaemonOptions::default())
+}
+
+/// Start a daemon without an explicit `--bind`, exercising the default bind/discovery policy.
+pub fn start_daemon_with_default_bind(db: &str) -> DaemonGuard {
+    start_daemon_with_options(
+        db,
+        &DaemonOptions {
+            use_default_bind: true,
+            ..Default::default()
+        },
+    )
 }
 
 /// Start a daemon on a specific port with suppressed I/O.
@@ -121,17 +135,16 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
 
     for attempt in 0..3 {
         let mut cmd = Command::new(bin());
-        cmd.arg("--db")
-            .arg(db)
-            .arg("start")
-            .arg("--bind")
-            .arg(&bind_addr);
+        cmd.arg("--db").arg(db).arg("start");
+        if !opts.use_default_bind {
+            cmd.arg("--bind").arg(&bind_addr);
+        }
 
         if opts.disable_placeholder_autodial {
             cmd.env("P7_DISABLE_PLACEHOLDER_AUTODIAL", "1");
         }
-        if opts.disable_discovery {
-            cmd.env("P7_DISABLE_DISCOVERY", "1");
+        if let Some(mode) = opts.discovery_mode {
+            cmd.arg("--discovery").arg(mode);
         }
         for (key, value) in &opts.extra_env {
             cmd.env(key, value);
@@ -341,10 +354,7 @@ pub fn wait_for_runtime_state(
 /// Get the daemon's listen address from status RPC.
 pub fn daemon_listen_addr(db: &str) -> String {
     let socket = socket_path_for_db(db);
-    let resp = topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
-        .expect("status RPC for listen addr");
-    assert!(resp.ok, "status RPC returned error");
-    let data = resp.data.expect("status response missing data");
+    let data = wait_for_runtime_state(&socket, "Active", Duration::from_secs(15));
     data.get("runtime")
         .and_then(|r| r.get("listen_addr"))
         .and_then(|v| v.as_str())
@@ -352,15 +362,30 @@ pub fn daemon_listen_addr(db: &str) -> String {
         .expect("status response missing runtime.listen_addr")
 }
 
+/// Return a concrete same-host bootstrap address for the daemon's current port.
+///
+/// This is useful for daemons started with the default wildcard bind, where the
+/// reported listen address may be `0.0.0.0:PORT` but tests still need a
+/// reachable bootstrap endpoint.
+pub fn daemon_loopback_addr(db: &str) -> String {
+    let listen_addr = daemon_listen_addr(db);
+    let port = listen_addr
+        .rsplit_once(':')
+        .expect("listen addr should contain port")
+        .1;
+    format!("127.0.0.1:{port}")
+}
+
 /// Get the daemon's transport SPKI fingerprint (first key from transport-keys).
 pub fn daemon_transport_fingerprint(db: &str) -> String {
     let socket = socket_path_for_db(db);
-    let resp =
-        topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::TransportKeys)
-            .expect("transport-keys RPC");
+    let resp = topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::TransportKeys)
+        .expect("transport-keys RPC");
     assert!(resp.ok, "transport-keys RPC returned error");
     let data = resp.data.expect("transport-keys response missing data");
-    let keys = data.as_array().expect("transport-keys response should be array");
+    let keys = data
+        .as_array()
+        .expect("transport-keys response should be array");
     assert!(!keys.is_empty(), "transport-keys returned empty list");
     keys[0]
         .get("peer_id")
@@ -626,7 +651,7 @@ pub fn accept_invite_with_identity(db: &str, invite_link: &str, username: &str, 
     let signer_wait_timeout =
         match topo::event_modules::workspace::invite_link::parse_invite_link(invite_link) {
             Ok(invite) if invite.bootstrap_addrs.is_empty() => Duration::from_secs(2),
-            _ => Duration::from_secs(60),
+            _ => Duration::from_secs(5),
         };
     accept_invite_with_identity_and_timeout(
         db,
@@ -645,6 +670,46 @@ pub fn accept_invite_with_identity_and_timeout(
     signer_wait_timeout: Duration,
 ) {
     let tmp_daemon = start_daemon(db);
+    accept_invite_with_identity_on_running_daemon_and_timeout(
+        db,
+        invite_link,
+        username,
+        devicename,
+        signer_wait_timeout,
+    );
+    // Stop temporary daemon; callers decide daemon lifecycle.
+    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
+    drop(tmp_daemon);
+    wait_for_daemon_stopped(db, Duration::from_secs(10));
+}
+
+pub fn accept_invite_with_identity_on_running_daemon(
+    db: &str,
+    invite_link: &str,
+    username: &str,
+    devicename: &str,
+) {
+    let signer_wait_timeout =
+        match topo::event_modules::workspace::invite_link::parse_invite_link(invite_link) {
+            Ok(invite) if invite.bootstrap_addrs.is_empty() => Duration::from_secs(10),
+            _ => Duration::from_secs(5),
+        };
+    accept_invite_with_identity_on_running_daemon_and_timeout(
+        db,
+        invite_link,
+        username,
+        devicename,
+        signer_wait_timeout,
+    );
+}
+
+pub fn accept_invite_with_identity_on_running_daemon_and_timeout(
+    db: &str,
+    invite_link: &str,
+    username: &str,
+    devicename: &str,
+    signer_wait_timeout: Duration,
+) {
     let output = Command::new(bin())
         .arg("accept")
         .arg("--db")
@@ -682,16 +747,7 @@ pub fn accept_invite_with_identity_and_timeout(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    if let Err(debug) = wait_for_local_peer_signer(db, signer_wait_timeout) {
-        eprintln!(
-            "accept_invite: peer signer not materialized yet; continuing (db={}): {}",
-            db, debug
-        );
-    }
-    // Stop temporary daemon; callers decide daemon lifecycle.
-    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
-    drop(tmp_daemon);
-    wait_for_daemon_stopped(db, Duration::from_secs(10));
+    wait_for_local_peer_signer_best_effort(db, signer_wait_timeout, "accept_invite");
 }
 
 /// Accept a device-link invite via daemon RPC using a temporary daemon.
@@ -704,7 +760,7 @@ pub fn accept_device_link_with_name(db: &str, invite_link: &str, devicename: &st
     let signer_wait_timeout =
         match topo::event_modules::workspace::invite_link::parse_invite_link(invite_link) {
             Ok(invite) if invite.bootstrap_addrs.is_empty() => Duration::from_secs(2),
-            _ => Duration::from_secs(60),
+            _ => Duration::from_secs(5),
         };
     accept_device_link_with_name_and_timeout(db, invite_link, devicename, signer_wait_timeout);
 }
@@ -716,11 +772,45 @@ pub fn accept_device_link_with_name_and_timeout(
     signer_wait_timeout: Duration,
 ) {
     let tmp_daemon = start_daemon(db);
+    accept_device_link_with_name_on_running_daemon_and_timeout(
+        db,
+        invite_link,
+        devicename,
+        signer_wait_timeout,
+    );
+    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
+    drop(tmp_daemon);
+    wait_for_daemon_stopped(db, Duration::from_secs(10));
+}
+
+pub fn accept_device_link_with_name_on_running_daemon(
+    db: &str,
+    invite_link: &str,
+    devicename: &str,
+) {
+    let signer_wait_timeout =
+        match topo::event_modules::workspace::invite_link::parse_invite_link(invite_link) {
+            Ok(invite) if invite.bootstrap_addrs.is_empty() => Duration::from_secs(10),
+            _ => Duration::from_secs(5),
+        };
+    accept_device_link_with_name_on_running_daemon_and_timeout(
+        db,
+        invite_link,
+        devicename,
+        signer_wait_timeout,
+    );
+}
+
+pub fn accept_device_link_with_name_on_running_daemon_and_timeout(
+    db: &str,
+    invite_link: &str,
+    devicename: &str,
+    signer_wait_timeout: Duration,
+) {
     let output = Command::new(bin())
         .arg("accept-link")
         .arg("--db")
         .arg(db)
-        .arg("--invite")
         .arg(invite_link)
         .arg("--devicename")
         .arg(devicename)
@@ -751,15 +841,16 @@ pub fn accept_device_link_with_name_and_timeout(
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    if let Err(debug) = wait_for_local_peer_signer(db, signer_wait_timeout) {
+    wait_for_local_peer_signer_best_effort(db, signer_wait_timeout, "accept_device_link");
+}
+
+fn wait_for_local_peer_signer_best_effort(db: &str, timeout: Duration, context: &str) {
+    if let Err(debug) = wait_for_local_peer_signer(db, timeout) {
         eprintln!(
-            "accept_device_link: peer signer not materialized yet; continuing (db={}): {}",
+            "{context}: peer signer not materialized yet; continuing (db={}): {}",
             db, debug
         );
     }
-    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
-    drop(tmp_daemon);
-    wait_for_daemon_stopped(db, Duration::from_secs(10));
 }
 
 fn wait_for_local_peer_signer(db: &str, timeout: Duration) -> Result<(), String> {

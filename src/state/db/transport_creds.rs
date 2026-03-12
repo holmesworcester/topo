@@ -171,9 +171,8 @@ pub fn list_local_peers(
 pub fn list_local_peers_with_source(
     conn: &Connection,
 ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut stmt = conn.prepare(
-        "SELECT peer_id, source FROM local_transport_creds ORDER BY created_at",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT peer_id, source FROM local_transport_creds ORDER BY created_at")?;
     let keys = stmt
         .query_map([], |row| {
             Ok(serde_json::json!({

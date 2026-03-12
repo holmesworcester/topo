@@ -6,7 +6,7 @@
 //! - repeated per-connection sync session supervision
 
 use std::collections::HashMap;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
@@ -20,6 +20,7 @@ use crate::db::open_connection;
 use crate::db::project_queue::ProjectQueue;
 use crate::db::removal_watch::is_peer_removed;
 use crate::db::schema::create_tables;
+use crate::db::transport_creds::discover_local_tenants;
 use crate::runtime::memtrace;
 use crate::sync::SyncSessionHandler;
 use crate::transport::SessionProvider;
@@ -47,14 +48,111 @@ enum PeerConnectionAction {
 /// How a session loop resolves the tenant (`recorded_by`) for each session.
 pub(super) enum SessionTenantResolver {
     /// Use a fixed tenant for all sessions on this connection.
-    Fixed(String),
+    Fixed {
+        tenant_id: String,
+        transport_peer_id: String,
+    },
+    /// Rotate sessions across all tenants that currently share one bootstrap
+    /// transport identity so reused invites do not starve later accepts.
+    SharedTransportGroup {
+        connection_key: String,
+        transport_peer_id: String,
+        tenant_ids: Arc<Vec<String>>,
+        cursor: Arc<AtomicUsize>,
+    },
 }
 
 impl SessionTenantResolver {
     fn resolve(&self, _db_path: &str) -> String {
         match self {
-            Self::Fixed(tenant_id) => tenant_id.clone(),
+            Self::Fixed { tenant_id, .. } => tenant_id.clone(),
+            Self::SharedTransportGroup {
+                tenant_ids, cursor, ..
+            } => {
+                let idx = cursor.fetch_add(1, Ordering::Relaxed);
+                tenant_ids[idx % tenant_ids.len()].clone()
+            }
         }
+    }
+
+    fn connection_key(&self) -> &str {
+        match self {
+            Self::Fixed { tenant_id, .. } => tenant_id.as_str(),
+            Self::SharedTransportGroup { connection_key, .. } => connection_key.as_str(),
+        }
+    }
+
+    fn transport_peer_id(&self) -> &str {
+        match self {
+            Self::Fixed {
+                transport_peer_id, ..
+            } => transport_peer_id.as_str(),
+            Self::SharedTransportGroup {
+                transport_peer_id, ..
+            } => transport_peer_id.as_str(),
+        }
+    }
+
+    pub(super) fn bootstrap_session_budget(&self) -> usize {
+        match self {
+            Self::Fixed { .. } => 1,
+            Self::SharedTransportGroup { tenant_ids, .. } => tenant_ids.len(),
+        }
+    }
+}
+
+pub(super) fn build_session_tenant_resolver(
+    db_path: &str,
+    seed_tenant_id: &str,
+) -> SessionTenantResolver {
+    let Ok(db) = open_connection(db_path) else {
+        return SessionTenantResolver::Fixed {
+            tenant_id: seed_tenant_id.to_string(),
+            transport_peer_id: seed_tenant_id.to_string(),
+        };
+    };
+    let Ok(tenants) = discover_local_tenants(&db) else {
+        return SessionTenantResolver::Fixed {
+            tenant_id: seed_tenant_id.to_string(),
+            transport_peer_id: seed_tenant_id.to_string(),
+        };
+    };
+    let Some(seed) = tenants
+        .iter()
+        .find(|tenant| tenant.peer_id == seed_tenant_id)
+    else {
+        return SessionTenantResolver::Fixed {
+            tenant_id: seed_tenant_id.to_string(),
+            transport_peer_id: seed_tenant_id.to_string(),
+        };
+    };
+
+    let mut group: Vec<String> = tenants
+        .iter()
+        .filter(|tenant| {
+            tenant.transport_peer_id == seed.transport_peer_id
+                && tenant.workspace_id == seed.workspace_id
+        })
+        .map(|tenant| tenant.peer_id.clone())
+        .collect();
+    group.sort();
+    group.dedup();
+    if group.len() <= 1 {
+        return SessionTenantResolver::Fixed {
+            tenant_id: seed_tenant_id.to_string(),
+            transport_peer_id: seed.transport_peer_id.clone(),
+        };
+    }
+
+    let start_idx = group
+        .iter()
+        .position(|tenant_id| tenant_id == seed_tenant_id)
+        .unwrap_or(0);
+    SessionTenantResolver::SharedTransportGroup {
+        connection_key: format!("transport-group:{}", seed.transport_peer_id),
+        transport_peer_id: seed.transport_peer_id.clone(),
+        tenant_ids: Arc::new(group),
+        cursor: Arc::new(AtomicUsize::new(start_idx)),
     }
 }
 
@@ -180,15 +278,22 @@ pub(super) async fn supervise_connection_sessions(
     max_sessions: Option<usize>,
 ) {
     let connection = provider.connection();
-    let recorded_by = tenant_resolver.resolve(db_path);
-    match register_peer_connection(db_path, &recorded_by, peer_id, direction, &connection) {
+    let connection_key = tenant_resolver.connection_key().to_string();
+    match register_peer_connection(
+        db_path,
+        &connection_key,
+        tenant_resolver.transport_peer_id(),
+        peer_id,
+        direction,
+        &connection,
+    ) {
         PeerConnectionAction::KeepNew => {}
         PeerConnectionAction::ReplaceExisting => {
             info!(
                 "Connection {} ({:?}) became canonical for tenant={} peer={}",
                 connection.stable_id(),
                 direction,
-                short_peer_id(&recorded_by),
+                short_peer_id(&connection_key),
                 short_peer_id(peer_id)
             );
         }
@@ -197,7 +302,7 @@ pub(super) async fn supervise_connection_sessions(
                 "Closing non-canonical connection {} ({:?}) tenant={} peer={}",
                 connection.stable_id(),
                 direction,
-                short_peer_id(&recorded_by),
+                short_peer_id(&connection_key),
                 short_peer_id(peer_id)
             );
             connection.close(0u32.into(), b"non-canonical peer connection");
@@ -211,6 +316,8 @@ pub(super) async fn supervise_connection_sessions(
             connection.close(0u32.into(), b"runtime shutdown");
             break;
         }
+
+        let recorded_by = tenant_resolver.resolve(db_path);
 
         // Check if peer has been removed -- deny further sessions and close
         // the underlying connection.
@@ -318,7 +425,7 @@ pub(super) async fn supervise_connection_sessions(
         }
     }
 
-    release_peer_connection(db_path, &recorded_by, peer_id, connection.stable_id());
+    release_peer_connection(db_path, &connection_key, peer_id, connection.stable_id());
 }
 
 fn short_peer_id(peer_id: &str) -> &str {
@@ -339,8 +446,11 @@ fn peer_connection_key(db_path: &str, tenant_id: &str, peer_id: &str) -> String 
     format!("{db_path}|{tenant_id}|{peer_id}")
 }
 
-fn preferred_peer_connection_direction(tenant_id: &str, peer_id: &str) -> SessionDirection {
-    if tenant_id <= peer_id {
+fn preferred_peer_connection_direction(
+    local_transport_peer_id: &str,
+    remote_transport_peer_id: &str,
+) -> SessionDirection {
+    if local_transport_peer_id <= remote_transport_peer_id {
         SessionDirection::Outbound
     } else {
         SessionDirection::Inbound
@@ -364,6 +474,7 @@ fn choose_peer_connection_action(
 fn register_peer_connection(
     db_path: &str,
     tenant_id: &str,
+    local_transport_peer_id: &str,
     peer_id: &str,
     direction: SessionDirection,
     connection: &quinn::Connection,
@@ -387,7 +498,8 @@ fn register_peer_connection(
         }
         Some(existing) if existing.connection_id == connection_id => PeerConnectionAction::KeepNew,
         Some(existing) => {
-            let preferred_direction = preferred_peer_connection_direction(tenant_id, peer_id);
+            let preferred_direction =
+                preferred_peer_connection_direction(local_transport_peer_id, peer_id);
             let action =
                 choose_peer_connection_action(existing.direction, direction, preferred_direction);
             match action {
@@ -473,8 +585,29 @@ mod tests {
 
     #[test]
     fn fixed_tenant_resolver_always_returns_same_value() {
-        let resolver = SessionTenantResolver::Fixed("tenant-fixed".to_string());
+        let resolver = SessionTenantResolver::Fixed {
+            tenant_id: "tenant-fixed".to_string(),
+            transport_peer_id: "transport-fixed".to_string(),
+        };
         assert_eq!(resolver.resolve("/tmp/does-not-matter"), "tenant-fixed");
+        assert_eq!(resolver.connection_key(), "tenant-fixed");
+        assert_eq!(resolver.transport_peer_id(), "transport-fixed");
+    }
+
+    #[test]
+    fn shared_transport_group_resolver_round_robins_across_tenants() {
+        let resolver = SessionTenantResolver::SharedTransportGroup {
+            connection_key: "transport-group:bootstrap".to_string(),
+            transport_peer_id: "bootstrap".to_string(),
+            tenant_ids: Arc::new(vec!["tenant-a".to_string(), "tenant-b".to_string()]),
+            cursor: Arc::new(AtomicUsize::new(0)),
+        };
+        assert_eq!(resolver.bootstrap_session_budget(), 2);
+        assert_eq!(resolver.resolve("/tmp/does-not-matter"), "tenant-a");
+        assert_eq!(resolver.resolve("/tmp/does-not-matter"), "tenant-b");
+        assert_eq!(resolver.resolve("/tmp/does-not-matter"), "tenant-a");
+        assert_eq!(resolver.connection_key(), "transport-group:bootstrap");
+        assert_eq!(resolver.transport_peer_id(), "bootstrap");
     }
 
     #[test]
@@ -495,6 +628,18 @@ mod tests {
         assert_eq!(
             preferred_peer_connection_direction("bob", "alice"),
             SessionDirection::Inbound
+        );
+    }
+
+    #[test]
+    fn preferred_connection_direction_uses_transport_ids_during_bootstrap() {
+        assert_eq!(
+            preferred_peer_connection_direction("fcf687-bootstrap", "f6ddbc-final"),
+            SessionDirection::Inbound
+        );
+        assert_eq!(
+            preferred_peer_connection_direction("f6ddbc-final", "fcf687-bootstrap"),
+            SessionDirection::Outbound
         );
     }
 

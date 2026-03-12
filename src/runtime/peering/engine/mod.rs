@@ -19,6 +19,12 @@ use crate::transport::multi_workspace::WorkspaceCertResolver;
 
 use startup::setup_endpoint_and_tenants;
 
+#[derive(Debug, Clone, Copy)]
+pub struct DiscoveryRuntimePolicy {
+    pub enabled: bool,
+    pub allow_advertise_addr_autodetect: bool,
+}
+
 /// Runtime networking information collected during node startup.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct NodeRuntimeNetInfo {
@@ -36,6 +42,7 @@ pub struct NodeRuntimeNetInfo {
 pub async fn run_node(
     db_path: &str,
     bind: SocketAddr,
+    discovery_policy: DiscoveryRuntimePolicy,
     net_info_tx: tokio::sync::oneshot::Sender<NodeRuntimeNetInfo>,
     shutdown_notify: Arc<tokio::sync::Notify>,
     intro_spawner: IntroSpawnerFn,
@@ -48,12 +55,15 @@ pub async fn run_node(
         tenants,
         tenant_client_configs,
         local_peer_ids,
-    } = setup_endpoint_and_tenants(db_path, bind, net_info_tx, cert_resolver)?;
+        discovery_advertise_ip,
+    } = setup_endpoint_and_tenants(db_path, bind, discovery_policy, net_info_tx, cert_resolver)?;
 
     let mut runtime_supervisor = supervisor::RuntimeSupervisor::new(
         db_path.to_string(),
         endpoint,
         local_addr,
+        discovery_policy.enabled,
+        discovery_advertise_ip,
         tenants,
         tenant_client_configs,
         local_peer_ids,

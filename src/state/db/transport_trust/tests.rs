@@ -1129,7 +1129,8 @@ fn characterization_full_trust_lifecycle() {
         is_peer_allowed(&conn, inviter, &matching_spki).unwrap(),
         "Stage 3b: SPKI still allowed after PeerShared (via PeerShared path)"
     );
-    // Pending trust should now be consumed (PeerShared SPKI matches).
+    // Pending invite trust remains so the reusable invite can still admit
+    // later peers that share the same bootstrap transport identity.
     let remaining_rows: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM pending_invite_bootstrap_trust
@@ -1138,8 +1139,8 @@ fn characterization_full_trust_lifecycle() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(remaining_rows, 0);
-    // But the SPKI is still allowed (via PeerShared path)
+    assert_eq!(remaining_rows, 1);
+    // The SPKI is still allowed via the steady-state PeerShared path.
     assert!(
         is_peer_allowed(&conn, inviter, &matching_spki).unwrap(),
         "Stage 3b: SPKI still allowed via PeerShared after supersession"
@@ -1257,7 +1258,8 @@ fn characterization_trust_check_reads_are_pure() {
         .unwrap();
     assert_eq!(before_consume_rows, 1);
 
-    // Explicit projection-time consumption works.
+    // Explicit projection-time consumption only affects accepted bootstrap
+    // trust; pending inviter-side bootstrap trust remains until expiry.
     consume_bootstrap_for_peer_shared(&conn, recorded_by, &pubkey).unwrap();
     let after_consume_rows: i64 = conn
         .query_row(
@@ -1267,7 +1269,41 @@ fn characterization_trust_check_reads_are_pure() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(after_consume_rows, 0);
+    assert_eq!(after_consume_rows, 1);
+}
+
+#[test]
+fn accepted_bootstrap_trust_is_consumed_when_peer_shared_arrives() {
+    let conn = open_in_memory().unwrap();
+    create_tables(&conn).unwrap();
+
+    let recorded_by = "joiner_peer";
+    let pubkey: [u8; 32] = [0x55; 32];
+    let spki = spki_fingerprint_from_ed25519_pubkey(&pubkey);
+
+    record_invite_bootstrap_trust(
+        &conn,
+        recorded_by,
+        "ia_consume",
+        "invite_consume",
+        "ws_consume",
+        "127.0.0.1:4433",
+        &spki,
+    )
+    .unwrap();
+    insert_peer_shared(&conn, recorded_by, "ps_consume", &pubkey);
+
+    consume_bootstrap_for_peer_shared(&conn, recorded_by, &pubkey).unwrap();
+
+    let remaining_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM invite_bootstrap_trust
+             WHERE recorded_by = ?1 AND invite_event_id = ?2",
+            rusqlite::params![recorded_by, "invite_consume"],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(remaining_rows, 0);
 }
 
 // ---------------------------------------------------------------

@@ -18,8 +18,8 @@ use crate::transport::{
 };
 
 use super::supervisor::{
-    run_startup_preflight, spawn_shared_ingest_writer, supervise_connection_sessions,
-    SessionTenantResolver,
+    build_session_tenant_resolver, run_startup_preflight, spawn_shared_ingest_writer,
+    supervise_connection_sessions,
 };
 use super::{
     current_timestamp_ms, peer_fingerprint_from_hex, IntroSpawnerFn, ENDPOINT_TTL_MS,
@@ -300,7 +300,8 @@ async fn accept_loop_with_ingest_until_cancel_inner(
                     SYNC_SESSION_TIMEOUT_SECS,
                     ingest_clone.clone(),
                 );
-                let tenant_resolver = SessionTenantResolver::Fixed(recorded_by_owned.clone());
+                let tenant_resolver =
+                    build_session_tenant_resolver(&db_path_owned, &recorded_by_owned);
 
                 supervise_connection_sessions(
                     &db_path_owned,

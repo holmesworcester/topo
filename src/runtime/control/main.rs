@@ -10,7 +10,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use clap::{parser::ValueSource, CommandFactory, FromArgMatches, Parser, Subcommand};
+use clap::{parser::ValueSource, CommandFactory, FromArgMatches, Parser, Subcommand, ValueEnum};
 use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
@@ -115,6 +115,11 @@ enum Commands {
         /// Listen address for QUIC sync
         #[arg(short, long, default_value = "0.0.0.0:4433")]
         bind: SocketAddr,
+        /// Local discovery policy. `auto` keeps discovery on for the default bind,
+        /// disables advertise autodetect for explicit binds, `on` forces discovery
+        /// with autodetect, and `off` disables discovery entirely.
+        #[arg(long, value_enum, default_value_t = DiscoveryModeArg::Auto)]
+        discovery: DiscoveryModeArg,
     },
 
     /// Stop a running daemon
@@ -440,6 +445,13 @@ enum Commands {
 
     /// Reset all local state: stop daemon, delete DB and socket files
     Reset,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq, ValueEnum)]
+enum DiscoveryModeArg {
+    Auto,
+    On,
+    Off,
 }
 
 #[derive(Subcommand)]
@@ -1392,6 +1404,12 @@ enum TenantChangeKind {
     TransportIdentityChanged,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NewTenantRuntimeAction {
+    RegisterLiveCerts,
+    RestartRuntime,
+}
+
 fn classify_tenant_change(
     current: &[RuntimeTenantState],
     discovered: &[RuntimeTenantState],
@@ -1402,11 +1420,18 @@ fn classify_tenant_change(
 
     let current_set: std::collections::HashSet<&str> =
         current.iter().map(|t| t.peer_id.as_str()).collect();
-
     // Check if any existing tenant changed transport identity.
     for new_t in discovered {
         if let Some(old_t) = current.iter().find(|t| t.peer_id == new_t.peer_id) {
             if old_t.transport_peer_id != new_t.transport_peer_id {
+                let sibling_still_on_old_transport = discovered.iter().any(|tenant| {
+                    tenant.peer_id != new_t.peer_id
+                        && tenant.workspace_id == old_t.workspace_id
+                        && tenant.transport_peer_id == old_t.transport_peer_id
+                });
+                if sibling_still_on_old_transport {
+                    continue;
+                }
                 return TenantChangeKind::TransportIdentityChanged;
             }
         }
@@ -1430,6 +1455,20 @@ fn classify_tenant_change(
         TenantChangeKind::NoChange
     } else {
         TenantChangeKind::NewTenantsAdded { new_tenants }
+    }
+}
+
+fn new_tenant_runtime_action(
+    discovery_policy: topo::peering::runtime::DiscoveryRuntimePolicy,
+) -> NewTenantRuntimeAction {
+    if discovery_policy.enabled {
+        // Discovery setup is frozen when the peering runtime starts: advertiser
+        // handles, browse receivers, and local self-filter sets are all built
+        // from the startup tenant snapshot. Live tenant additions therefore need
+        // a runtime refresh before "more time" can help discovery-only joins.
+        NewTenantRuntimeAction::RestartRuntime
+    } else {
+        NewTenantRuntimeAction::RegisterLiveCerts
     }
 }
 
@@ -1573,6 +1612,7 @@ async fn refresh_upnp_mapping_for_runtime(state: Arc<DaemonState>, listen_addr: 
 fn spawn_runtime(
     db_path: &str,
     bind: SocketAddr,
+    discovery_policy: topo::peering::runtime::DiscoveryRuntimePolicy,
     state: Arc<DaemonState>,
     tenant_states: Vec<RuntimeTenantState>,
 ) -> ManagedRuntime {
@@ -1612,6 +1652,7 @@ fn spawn_runtime(
         topo::node::run_node(
             &db_for_task,
             bind,
+            discovery_policy,
             net_tx,
             runtime_shutdown_for_task,
             cert_resolver_for_task,
@@ -1630,6 +1671,7 @@ fn spawn_runtime(
 async fn reevaluate_runtime(
     db_path: &str,
     bind: SocketAddr,
+    discovery_policy: topo::peering::runtime::DiscoveryRuntimePolicy,
     state: Arc<DaemonState>,
     active_runtime: &mut Option<ManagedRuntime>,
     idle_bind_reservation: &mut Option<UdpSocket>,
@@ -1724,30 +1766,61 @@ async fn reevaluate_runtime(
                 "activating peering runtime ({} tenant(s))",
                 tenant_states.len()
             );
-            *active_runtime = Some(spawn_runtime(db_path, bind, state, tenant_states));
+            *active_runtime = Some(spawn_runtime(
+                db_path,
+                bind,
+                discovery_policy,
+                state,
+                tenant_states,
+            ));
         }
         TenantChangeKind::NewTenantsAdded { new_tenants } => {
-            // Register new tenant certs on the live endpoint — no restart needed.
-            if let Some(runtime) = active_runtime.as_mut() {
-                let registered =
-                    register_new_tenant_certs(db_path, &new_tenants, &runtime.cert_resolver);
-                // Only add successfully registered tenants to the known set.
-                // Failed ones remain "new" so the next reevaluation retries them.
-                for r in &registered {
-                    if let Some(ts) = tenant_states.iter().find(|t| t.peer_id == *r) {
-                        if !runtime.tenant_states.iter().any(|t| t.peer_id == *r) {
-                            runtime.tenant_states.push(ts.clone());
+            match new_tenant_runtime_action(discovery_policy) {
+                NewTenantRuntimeAction::RestartRuntime => {
+                    if let Some(runtime) = active_runtime.take() {
+                        stop_runtime(runtime).await;
+                    }
+                    let _ = idle_bind_reservation.take();
+                    tracing::info!(
+                        "restarting peering runtime after {} new tenant(s) to refresh discovery state ({} total)",
+                        new_tenants.len(),
+                        tenant_states.len()
+                    );
+                    *active_runtime = Some(spawn_runtime(
+                        db_path,
+                        bind,
+                        discovery_policy,
+                        state,
+                        tenant_states,
+                    ));
+                }
+                NewTenantRuntimeAction::RegisterLiveCerts => {
+                    // Register new tenant certs on the live endpoint — no restart needed.
+                    if let Some(runtime) = active_runtime.as_mut() {
+                        let registered = register_new_tenant_certs(
+                            db_path,
+                            &new_tenants,
+                            &runtime.cert_resolver,
+                        );
+                        // Only add successfully registered tenants to the known set.
+                        // Failed ones remain "new" so the next reevaluation retries them.
+                        for r in &registered {
+                            if let Some(ts) = tenant_states.iter().find(|t| t.peer_id == *r) {
+                                if !runtime.tenant_states.iter().any(|t| t.peer_id == *r) {
+                                    runtime.tenant_states.push(ts.clone());
+                                }
+                            }
+                        }
+                        runtime.tenant_states.sort();
+                        runtime.tenant_states.dedup();
+                        if !registered.is_empty() {
+                            tracing::info!(
+                                "registered {} new tenant(s) on live endpoint ({} total)",
+                                registered.len(),
+                                runtime.tenant_states.len()
+                            );
                         }
                     }
-                }
-                runtime.tenant_states.sort();
-                runtime.tenant_states.dedup();
-                if !registered.is_empty() {
-                    tracing::info!(
-                        "registered {} new tenant(s) on live endpoint ({} total)",
-                        registered.len(),
-                        runtime.tenant_states.len()
-                    );
                 }
             }
         }
@@ -1760,7 +1833,13 @@ async fn reevaluate_runtime(
                 "restarting peering runtime after tenant transport identity change ({} tenant(s))",
                 tenant_states.len()
             );
-            *active_runtime = Some(spawn_runtime(db_path, bind, state, tenant_states));
+            *active_runtime = Some(spawn_runtime(
+                db_path,
+                bind,
+                discovery_policy,
+                state,
+                tenant_states,
+            ));
         }
     }
 
@@ -1770,6 +1849,7 @@ async fn reevaluate_runtime(
 async fn run_runtime_manager(
     db_path: &str,
     bind: SocketAddr,
+    discovery_policy: topo::peering::runtime::DiscoveryRuntimePolicy,
     state: Arc<DaemonState>,
     shutdown_flag: Arc<AtomicBool>,
     daemon_shutdown: Arc<tokio::sync::Notify>,
@@ -1783,6 +1863,7 @@ async fn run_runtime_manager(
     reevaluate_runtime(
         db_path,
         bind,
+        discovery_policy,
         state.clone(),
         &mut active_runtime,
         &mut idle_bind_reservation,
@@ -1807,6 +1888,7 @@ async fn run_runtime_manager(
                 reevaluate_runtime(
                     db_path,
                     bind,
+                    discovery_policy,
                     state.clone(),
                     &mut active_runtime,
                     &mut idle_bind_reservation,
@@ -1817,6 +1899,7 @@ async fn run_runtime_manager(
                 reevaluate_runtime(
                     db_path,
                     bind,
+                    discovery_policy,
                     state.clone(),
                     &mut active_runtime,
                     &mut idle_bind_reservation,
@@ -1824,6 +1907,26 @@ async fn run_runtime_manager(
                 .await?;
             }
         }
+    }
+}
+
+fn resolve_discovery_policy(
+    discovery: DiscoveryModeArg,
+    start_uses_default_bind: bool,
+) -> topo::peering::runtime::DiscoveryRuntimePolicy {
+    match discovery {
+        DiscoveryModeArg::Auto => topo::peering::runtime::DiscoveryRuntimePolicy {
+            enabled: true,
+            allow_advertise_addr_autodetect: start_uses_default_bind,
+        },
+        DiscoveryModeArg::On => topo::peering::runtime::DiscoveryRuntimePolicy {
+            enabled: true,
+            allow_advertise_addr_autodetect: true,
+        },
+        DiscoveryModeArg::Off => topo::peering::runtime::DiscoveryRuntimePolicy {
+            enabled: false,
+            allow_advertise_addr_autodetect: false,
+        },
     }
 }
 
@@ -1863,11 +1966,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         // ---------------------------------------------------------------
         // Daemon lifecycle
         // ---------------------------------------------------------------
-        Commands::Start { bind } => {
+        Commands::Start { bind, discovery } => {
             let socket_path = socket_override
                 .as_ref()
                 .map(std::path::PathBuf::from)
                 .unwrap_or_else(|| service::socket_path_for_db(db));
+            let discovery_policy = resolve_discovery_policy(discovery, start_uses_default_bind);
 
             // Idempotent: check if daemon is already running
             if socket_path.exists() {
@@ -1938,6 +2042,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 if let Err(e) = run_runtime_manager(
                     &manager_db,
                     resolved_bind,
+                    discovery_policy,
                     manager_state,
                     manager_shutdown_flag,
                     manager_shutdown,
@@ -4267,6 +4372,78 @@ mod tests {
         assert_eq!(
             states[0].transport_peer_id, tenant_peer_id,
             "runtime should switch to the final PeerShared transport identity once it exists"
+        );
+    }
+
+    fn tenant_state(
+        peer_id: &str,
+        workspace_id: &str,
+        transport_peer_id: &str,
+    ) -> RuntimeTenantState {
+        RuntimeTenantState {
+            peer_id: peer_id.to_string(),
+            workspace_id: workspace_id.to_string(),
+            transport_peer_id: transport_peer_id.to_string(),
+        }
+    }
+
+    #[test]
+    fn classify_tenant_change_defers_restart_while_workspace_sibling_keeps_old_transport() {
+        let current = vec![
+            tenant_state("bob", "ws-alpha", "bootstrap-shared"),
+            tenant_state("carol", "ws-alpha", "bootstrap-shared"),
+        ];
+        let discovered = vec![
+            tenant_state("bob", "ws-alpha", "bob-direct"),
+            tenant_state("carol", "ws-alpha", "bootstrap-shared"),
+        ];
+
+        assert!(matches!(
+            classify_tenant_change(&current, &discovered),
+            TenantChangeKind::NoChange
+        ));
+    }
+
+    #[test]
+    fn classify_tenant_change_restarts_once_old_workspace_transport_is_gone() {
+        let current = vec![
+            tenant_state("bob", "ws-alpha", "bootstrap-shared"),
+            tenant_state("carol", "ws-alpha", "bootstrap-shared"),
+        ];
+        let discovered = vec![
+            tenant_state("bob", "ws-alpha", "bob-direct"),
+            tenant_state("carol", "ws-alpha", "carol-direct"),
+        ];
+
+        assert!(matches!(
+            classify_tenant_change(&current, &discovered),
+            TenantChangeKind::TransportIdentityChanged
+        ));
+    }
+
+    #[test]
+    fn new_tenants_restart_runtime_when_discovery_is_enabled() {
+        let policy = topo::peering::runtime::DiscoveryRuntimePolicy {
+            enabled: true,
+            allow_advertise_addr_autodetect: true,
+        };
+
+        assert_eq!(
+            new_tenant_runtime_action(policy),
+            NewTenantRuntimeAction::RestartRuntime
+        );
+    }
+
+    #[test]
+    fn new_tenants_reuse_live_runtime_when_discovery_is_disabled() {
+        let policy = topo::peering::runtime::DiscoveryRuntimePolicy {
+            enabled: false,
+            allow_advertise_addr_autodetect: false,
+        };
+
+        assert_eq!(
+            new_tenant_runtime_action(policy),
+            NewTenantRuntimeAction::RegisterLiveCerts
         );
     }
 }

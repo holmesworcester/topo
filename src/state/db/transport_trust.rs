@@ -197,18 +197,16 @@ pub fn consume_bootstrap_for_peer_shared(
     consume_bootstrap_for_transport_fingerprint(conn, recorded_by, &spki)
 }
 
-/// Consume bootstrap trust rows by transport fingerprint directly.
+/// Consume accepted bootstrap trust rows by transport fingerprint directly.
+///
+/// Pending invite trust on the inviter side is intentionally retained until
+/// expiry so a reusable invite can admit multiple peers that still share the
+/// same bootstrap transport identity.
 pub fn consume_bootstrap_for_transport_fingerprint(
     conn: &Connection,
     recorded_by: &str,
     transport_fingerprint: &[u8; 32],
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    conn.execute(
-        "DELETE FROM pending_invite_bootstrap_trust
-          WHERE recorded_by = ?1
-            AND expected_bootstrap_spki_fingerprint = ?2",
-        rusqlite::params![recorded_by, transport_fingerprint.as_slice()],
-    )?;
     conn.execute(
         "DELETE FROM invite_bootstrap_trust
           WHERE recorded_by = ?1
