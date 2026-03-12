@@ -380,8 +380,9 @@ pub fn list_tenants_for_display(
         .collect::<Result<Vec<_>, rusqlite::Error>>()?;
 
     tenants.sort_by(|a, b| {
-        a.workspace_name
-            .cmp(&b.workspace_name)
+        b.active
+            .cmp(&a.active)
+            .then_with(|| a.workspace_name.cmp(&b.workspace_name))
             .then_with(|| a.username.cmp(&b.username))
             .then_with(|| a.event_id.cmp(&b.event_id))
     });
