@@ -455,7 +455,7 @@ mod tests {
             .collect();
         assert_eq!(encryptable_codes, vec![1, 2, 6, 7, 24, 25]);
 
-        for code in [5, 8, 9, 10, 12, 14, 16, 18, 20, 21, 22, 26, 27, 28, 29] {
+        for code in [5, 8, 9, 10, 12, 14, 16, 18, 22, 26, 27, 28, 29] {
             let meta = reg.lookup(code).unwrap();
             assert!(
                 !meta.encryptable,
@@ -464,7 +464,7 @@ mod tests {
             );
         }
 
-        for removed in [11, 13, 15, 17, 19, 23] {
+        for removed in [11, 13, 15, 17, 19, 20, 21, 23] {
             assert!(reg.lookup(removed).is_none());
         }
     }
@@ -487,7 +487,7 @@ mod tests {
             TransportPrivacy::Optional
         );
 
-        for code in [5, 8, 9, 10, 12, 14, 16, 18, 20, 21, 22, 26, 27, 28, 29] {
+        for code in [5, 8, 9, 10, 12, 14, 16, 18, 22, 26, 27, 28, 29] {
             let meta = reg.lookup(code).unwrap();
             assert_eq!(
                 meta.transport_privacy(),
