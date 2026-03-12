@@ -4381,15 +4381,24 @@ fn show_view(data: &serde_json::Value) {
                 // Inline reactions
                 if let Some(reactions) = msg["reactions"].as_array() {
                     if !reactions.is_empty() {
-                        for rxn in reactions {
-                            let emoji = rxn["emoji"].as_str().unwrap_or("");
-                            let reactor = rxn["reactor_name"].as_str().unwrap_or("");
-                            if reactor.is_empty() {
-                                println!("         {}", emoji);
-                            } else {
-                                println!("         {} {}", emoji, reactor);
-                            }
+                        let mut counts: std::collections::BTreeMap<String, usize> =
+                            std::collections::BTreeMap::new();
+                        for r in reactions {
+                            let emoji = r["emoji"].as_str().unwrap_or("?").to_string();
+                            *counts.entry(emoji).or_default() += 1;
                         }
+                        let parts: Vec<String> = counts
+                            .iter()
+                            .map(|(name, count)| {
+                                let glyph = emoji_shortcode_to_unicode(name);
+                                if *count > 1 {
+                                    format!("{} ({})", glyph, count)
+                                } else {
+                                    glyph.to_string()
+                                }
+                            })
+                            .collect();
+                        println!("         {}", parts.join("  "));
                     }
                 }
 
