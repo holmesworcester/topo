@@ -743,12 +743,18 @@ Transport cert/key **DER** (ASN.1 Distinguished Encoding Rules) blobs live exclu
 
 ## 3.2.2 LAN peer discovery (mDNS/DNS-SD)
 
-Multi-tenant nodes advertise each tenant on the local network under the `_topo._udp.local.` service type. Each tenant registers a separate mDNS service instance with its actual bound port and full transport `peer_id` (SPKI-derived fingerprint) in a TXT property.
+Multi-tenant nodes advertise each tenant on the local network under the fixed `_topo._udp.local.` service type. Each tenant registers a separate mDNS service instance with its actual bound port and full transport `peer_id` (SPKI-derived fingerprint) in a TXT property.
 
 Discovery rules:
 1. **Self-filtering**: the browser receives the full set of local tenant transport peer IDs and filters them out, preventing unnecessary local connections.
 2. **Trust gating**: discovered peers are only dialed if they pass the tenant's dynamic trust check.
 3. **Address churn**: when a previously-discovered peer re-advertises at a different address, the old `connect_loop` is cancelled via a `watch` channel and a new one is spawned.
+
+Discovery control and target-selection rules:
+1. **Fixed protocol surface**: `_topo._udp.local.` is a protocol constant, not a test knob. Discovery tests must not namespace or rename the service type; doing so partitions real peers from each other and can hide runtime bugs. Shared-host discovery tests should serialize instead.
+2. **Start policy**: daemon start exposes `--discovery auto|on|off`. `auto` is the default: it keeps discovery enabled for the default bind, but disables advertise-address autodetect for explicit `--bind`.
+3. **Explicit bind semantics**: with advertise autodetect disabled, an explicit concrete non-loopback bind remains discoverable at exactly that address. An explicit loopback or wildcard bind suppresses discovery instead of inferring some other interface.
+4. **Same-peer target priority**: for one peer, dial-target priority is `Discovery > ObservedEndpoint > Bootstrap`. A fresh discovery target can replace a lower-priority remote/overlay target for the same peer, while observed/bootstrap addresses remain fallback paths once discovery is absent or suppressed.
 
 mDNS authenticity model (POC):
 1. mDNS advertisements are treated as unauthenticated discovery hints (address + claimed peer_id),
@@ -764,7 +770,7 @@ Out-of-scope note (current POC):
 
 DNS label constraint: peer IDs (64 hex chars) are truncated to 59 chars in the mDNS instance name (62 total with `p7-` prefix, under the 63-byte DNS label limit). The full peer ID is always in the TXT property for exact matching.
 
-Same-host daemon discovery: when two daemons run on the same machine bound to `127.0.0.1`, they advertise a routable (non-loopback) IP via mDNS because multicast DNS does not discover services advertised on loopback addresses. The browse side compensates with `normalize_discovered_addr_for_local_bind`, which rewrites discovered non-loopback addresses back to loopback when the local daemon is bound to loopback. The advertise IP is always provided explicitly by the caller (`run_node`); discovery internals perform no implicit address inference.
+Same-host daemon discovery: if discovery is forced on for a loopback-bound daemon, it may advertise a routable (non-loopback) IP because multicast DNS does not discover services advertised on loopback addresses. The browse side compensates with `normalize_discovered_addr_for_local_bind`, which rewrites discovered non-loopback addresses back to loopback when the local daemon is loopback-bound. Discovery internals never invent an advertise address on their own; startup either supplies an explicit non-loopback address or enables autodetect through the start policy.
 
 ## 3.2.3 Peering runtime loop model
 
@@ -779,6 +785,11 @@ The production peering runtime follows a single conceptual loop:
 5. **Sync session runner** (`SyncSessionHandler`): protocol-agnostic session handler invoked via the `SessionHandler` contract.
 6. **Ingest writer** (`batch_writer`): single shared thread consuming `IngestItem` tuples from all concurrent sessions.
 7. **Projected SQLite state**: projection cascade updates trust rows, completing the loop.
+
+Runtime refresh and connection-arbitration invariants:
+1. **Discovery state is runtime-owned**: mDNS advertisement handles and browse receivers are derived from the runtime's current tenant set at startup. If discovery is enabled and local tenants are added to a running daemon, the peering runtime must rebuild/restart discovery state; patching cert resolvers or trust tables alone is insufficient.
+2. **Canonical direction uses transport identity**: when duplicate opposite-direction peer connections exist, the stable survivor is chosen from the local and remote transport `peer_id`s, not from logical tenant IDs. Bootstrap and PeerShared transitions can make tenant identity views temporarily asymmetric; transport identity remains the only symmetric ordering key.
+3. **Bootstrap symmetry requirement**: any connection-arbitration logic must preserve the rule that both peers derive the same winner from the same transport identities. Using workspace-local aliases, tenant row order, or partially-projected logical IDs is incorrect and causes reconnect churn.
 
 ### Module ownership
 

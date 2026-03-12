@@ -1462,7 +1462,10 @@ Detailed architecture and invariants are documented in [DESIGN.md](./DESIGN.md) 
 1. no filesystem cert authority regression,
 2. no cross-tenant projection/query leakage regression,
 3. no reintroduction of event-count-based convergence assertions,
-4. no bypass of workspace command ownership boundaries.
+4. no bypass of workspace command ownership boundaries,
+5. no mDNS service-type namespacing/renaming regression (`_topo._udp.local.` stays fixed),
+6. no stale discovery-runtime-on-live-tenant-addition regression,
+7. no logical-tenant-id-based canonical peer-connection arbitration regression during bootstrap.
 
 ## 17.3 Validation suite expectations
 
@@ -1472,13 +1475,28 @@ Detailed architecture and invariants are documented in [DESIGN.md](./DESIGN.md) 
 4. application-level convergence/assertion style in tests,
 5. same-workspace sibling fanout coverage for both local create and wire ingest,
 6. join/link replay coverage for historical shared events already present in one DB,
-7. real CLI coverage for reused invites, fresh invite creation, and mixed user/device-link growth patterns.
+7. real CLI coverage for reused invites, fresh invite creation, and mixed user/device-link growth patterns,
+8. discovery coverage for both cold-start tenants and tenants accepted into an already-running daemon with discovery-only recovery,
+9. explicit regression coverage that canonical bootstrap connection choice is derived from transport peer IDs, not logical tenant IDs,
+10. discovery-heavy tests serialized at the process level, while ordinary networking tests stay parallel by using explicit `127.0.0.1:0` binds and concrete loopback bootstrap addresses.
 
-## 17.4 Same-host loopback normalization rule
+## 17.4 Discovery bind and loopback normalization rule
 
-1. loopback-bound daemons may advertise non-loopback IPs for mDNS reachability,
-2. browse-side must normalize discovered non-loopback addresses back to loopback when local daemon is loopback-bound,
-3. advertised IP must be explicit runtime input, not inferred implicitly by discovery internals.
+1. daemon start exposes `--discovery auto|on|off`; `auto` is the default,
+2. in `auto`, the default bind may autodetect a non-loopback advertise address, but an explicit `--bind` disables advertise-address autodetect,
+3. with autodetect disabled, an explicit concrete non-loopback bind remains discoverable at exactly that address,
+4. with autodetect disabled, an explicit loopback or wildcard bind suppresses discovery instead of inferring some other interface,
+5. if discovery is forced on for a loopback-bound daemon, it may advertise a non-loopback IP for mDNS reachability,
+6. browse-side must normalize discovered non-loopback addresses back to loopback when local daemon is loopback-bound,
+7. advertised IP resolution belongs to runtime startup policy, not to ad hoc inference inside discovery internals.
+
+## 17.5 Runtime refresh and bootstrap connection invariants
+
+1. mDNS advertisement handles and browse receivers are derived from the peering runtime's current tenant set,
+2. if discovery is enabled and local tenants are added to a running daemon, the peering runtime must rebuild/restart discovery state; refreshing cert resolvers or trust tables alone is insufficient,
+3. canonical duplicate-connection arbitration must use local and remote transport `peer_id`s,
+4. bootstrap and PeerShared transitions can leave logical tenant IDs temporarily asymmetric across the two peers, so tenant IDs, alias order, or row order must not be used for canonical connection choice,
+5. target-planner priority for one peer is `Discovery > ObservedEndpoint > Bootstrap`; a fresh discovery address may replace a lower-priority remote/overlay target, while observed/bootstrap paths remain the fallback when discovery is absent or suppressed.
 
 ---
 ## 18. Cheat-Proof Realism Tests (`cheat-proof-tests` branch)
