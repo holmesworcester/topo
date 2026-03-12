@@ -81,7 +81,11 @@ impl SharedWorkspaceBench {
     fn total_events_sent(&self, db: &str) -> u64 {
         let conn = rusqlite::Connection::open(db).expect("failed to open db");
         conn.query_row(
-            "SELECT COALESCE(SUM(events_sent), 0) FROM sync_runs",
+            "SELECT COUNT(*)
+             FROM sync_run_events
+             WHERE lane = 'data'
+               AND direction = 'tx'
+               AND frame_type = 'Event'",
             [],
             |row| row.get::<_, i64>(0),
         )
@@ -95,18 +99,22 @@ impl SharedWorkspaceBench {
         )
     }
 
-    fn count_runs_by_direction(&self, db: &str) -> (i64, i64) {
+    fn count_changed_runs_by_direction(&self, db: &str) -> (i64, i64) {
         let conn = rusqlite::Connection::open(db).expect("failed to open db");
         let outbound: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sync_runs WHERE direction = 'outbound'",
+                "SELECT COUNT(*) FROM sync_runs
+                 WHERE direction = 'outbound'
+                   AND (rounds > 0 OR events_sent > 0 OR events_received > 0)",
                 [],
                 |row| row.get(0),
             )
             .unwrap_or(0);
         let inbound: i64 = conn
             .query_row(
-                "SELECT COUNT(*) FROM sync_runs WHERE direction = 'inbound'",
+                "SELECT COUNT(*) FROM sync_runs
+                 WHERE direction = 'inbound'
+                   AND (rounds > 0 OR events_sent > 0 OR events_received > 0)",
                 [],
                 |row| row.get(0),
             )
@@ -188,8 +196,9 @@ fn duplicate_sends_stay_below_regression_threshold() {
     );
     let (alice_events_sent_before, bob_events_sent_before) = bench.events_sent_totals();
     let (alice_outbound_before, alice_inbound_before) =
-        bench.count_runs_by_direction(&bench.alice_db);
-    let (bob_outbound_before, bob_inbound_before) = bench.count_runs_by_direction(&bench.bob_db);
+        bench.count_changed_runs_by_direction(&bench.alice_db);
+    let (bob_outbound_before, bob_inbound_before) =
+        bench.count_changed_runs_by_direction(&bench.bob_db);
 
     let start = Instant::now();
     generate_messages(&bench.alice_db, N as usize);
@@ -206,8 +215,9 @@ fn duplicate_sends_stay_below_regression_threshold() {
     let total_events_sent = alice_events_sent + bob_events_sent;
 
     let (alice_outbound_total, alice_inbound_total) =
-        bench.count_runs_by_direction(&bench.alice_db);
-    let (bob_outbound_total, bob_inbound_total) = bench.count_runs_by_direction(&bench.bob_db);
+        bench.count_changed_runs_by_direction(&bench.alice_db);
+    let (bob_outbound_total, bob_inbound_total) =
+        bench.count_changed_runs_by_direction(&bench.bob_db);
     let alice_outbound_runs = alice_outbound_total - alice_outbound_before;
     let alice_inbound_runs = alice_inbound_total - alice_inbound_before;
     let bob_outbound_runs = bob_outbound_total - bob_outbound_before;
@@ -229,5 +239,15 @@ fn duplicate_sends_stay_below_regression_threshold() {
     assert!(
         duplication_ratio < 1.50,
         "duplicate sends regressed: ratio {duplication_ratio:.2}x for {N} messages"
+    );
+    assert_eq!(
+        alice_outbound_runs + bob_outbound_runs,
+        1,
+        "exactly one outbound sync run should carry the measured burst"
+    );
+    assert_eq!(
+        alice_inbound_runs + bob_inbound_runs,
+        1,
+        "exactly one inbound sync run should carry the measured burst"
     );
 }
