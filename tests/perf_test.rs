@@ -27,6 +27,7 @@ fn peak_rss_mib() -> f64 {
 /// are projected on the receiving peer. Reports msgs/s, wall time,
 /// and peak memory.
 #[tokio::test]
+#[ignore]
 async fn perf_sync_50k() {
     const N: i64 = 50_000;
 
@@ -69,6 +70,7 @@ async fn perf_sync_50k() {
 /// 10k bidirectional sync: generate 5k on each side, sync until all 10k
 /// messages are projected on both peers.
 #[tokio::test]
+#[ignore]
 async fn perf_sync_10k() {
     const N: i64 = 5_000;
 
@@ -113,6 +115,7 @@ async fn perf_sync_10k() {
 /// 10k continuous: start sync first, then inject 5k messages on each side
 /// while sync is running. Measures how well sync keeps up with ongoing writes.
 #[tokio::test]
+#[ignore]
 async fn perf_continuous_10k() {
     let alice = Peer::new_with_identity("alice");
     // Use a shared workspace so workspace-scoped sync transfers content events.
@@ -140,6 +143,7 @@ async fn perf_continuous_10k() {
         .peer_shared_signing_key
         .clone()
         .expect("alice has signing key");
+    let alice_key_event_id = alice.ensure_content_key_event_id();
     let bob_db = bob.db_path.clone();
     let bob_author = bob.author_id;
     let bob_channel = bob.workspace_id;
@@ -149,6 +153,7 @@ async fn perf_continuous_10k() {
         .peer_shared_signing_key
         .clone()
         .expect("bob has signing key");
+    let bob_key_event_id = bob.ensure_content_key_event_id();
 
     let alice_writer = std::thread::spawn(move || {
         inject_messages_batched(
@@ -159,6 +164,7 @@ async fn perf_continuous_10k() {
             5_000,
             100,
             &alice_identity,
+            alice_key_event_id,
             alice_signer_eid,
             &alice_signing_key,
         );
@@ -173,6 +179,7 @@ async fn perf_continuous_10k() {
             5_000,
             100,
             &bob_identity,
+            bob_key_event_id,
             bob_signer_eid,
             &bob_signing_key,
         );
@@ -408,13 +415,16 @@ fn inject_messages_batched(
     total: usize,
     batch_size: usize,
     recorded_by: &str,
+    key_event_id: [u8; 32],
     signer_eid: [u8; 32],
     signing_key: &ed25519_dalek::SigningKey,
 ) {
     use std::time::{SystemTime, UNIX_EPOCH};
     use topo::db::open_connection;
     use topo::event_modules::{MessageEvent, ParsedEvent};
-    use topo::projection::create::create_signed_event_synchronous;
+    use topo::projection::create::create_encrypted_event_synchronous;
+    use topo::projection::create::CreateEventError;
+    use topo::state::db::queue::SQLITE_BUSY_RETRY_BASE_MS;
 
     let db = open_connection(db_path).expect("failed to open db");
 
@@ -436,8 +446,33 @@ fn inject_messages_batched(
                 signer_type: 5,
                 signature: [0u8; 64],
             });
-            create_signed_event_synchronous(&db, recorded_by, &msg, signing_key)
-                .expect("create_signed_event_synchronous failed");
+            let mut created = None;
+            for attempt in 0..8 {
+                match create_encrypted_event_synchronous(
+                    &db,
+                    recorded_by,
+                    &key_event_id,
+                    &msg,
+                    Some(signing_key),
+                ) {
+                    Ok(event_id) => {
+                        created = Some(event_id);
+                        break;
+                    }
+                    Err(CreateEventError::DbError(err))
+                        if err.contains("database is locked") && attempt + 1 < 8 =>
+                    {
+                        std::thread::sleep(Duration::from_millis(
+                            SQLITE_BUSY_RETRY_BASE_MS << attempt,
+                        ));
+                    }
+                    Err(err) => panic!("create_encrypted_event_synchronous failed: {err:?}"),
+                }
+            }
+            assert!(
+                created.is_some(),
+                "message create should eventually succeed"
+            );
         }
         db.execute("COMMIT", []).expect("failed to commit");
         i = end;

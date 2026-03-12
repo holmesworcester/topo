@@ -13,6 +13,7 @@ use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
 use crate::db::transport_trust::record_transport_binding;
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
+use crate::sync::session::windowing::reset_outbound_window_state;
 use crate::sync::CoordinationManager;
 use crate::sync::SyncSessionHandler;
 use crate::transport::{
@@ -403,6 +404,7 @@ async fn connect_loop_inner(
             peer_id,
             connection.stable_id()
         );
+        reset_outbound_window_state(db_path, &peer_id);
 
         // Record endpoint observation, transport binding, and purge expired
         {

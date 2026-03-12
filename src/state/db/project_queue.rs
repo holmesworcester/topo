@@ -8,6 +8,52 @@ fn valid_events_has_semantic_type_column(conn: &Connection) -> SqliteResult<bool
     Ok(names.iter().any(|name| name == "semantic_type_code"))
 }
 
+fn project_queue_has_column(conn: &Connection, column: &str) -> SqliteResult<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(project_queue)")?;
+    let names = stmt
+        .query_map([], |row| row.get::<_, String>(1))?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(names.iter().any(|name| name == column))
+}
+
+fn load_project_priority(
+    conn: &Connection,
+    event_id_b64: &str,
+    default_created_at: i64,
+) -> (i64, i64) {
+    let (event_type, created_at, encrypted_inner_type) = conn
+        .query_row(
+            "SELECT event_type,
+                    created_at,
+                    CASE
+                        WHEN event_type = 'encrypted' THEN substr(blob, 42, 1)
+                        ELSE NULL
+                    END
+             FROM events
+             WHERE event_id = ?1",
+            params![event_id_b64],
+            |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, i64>(1)?,
+                    row.get::<_, Option<Vec<u8>>>(2)?,
+                ))
+            },
+        )
+        .unwrap_or_else(|_| ("unknown".to_string(), default_created_at, None));
+    let lane = match event_type.as_str() {
+        "file_slice" => super::queue::PRIORITY_LANE_BULK,
+        "encrypted"
+            if encrypted_inner_type.and_then(|bytes| bytes.first().copied())
+                == Some(crate::event_modules::EVENT_TYPE_FILE_SLICE) =>
+        {
+            super::queue::PRIORITY_LANE_BULK
+        }
+        _ => super::queue::PRIORITY_LANE_FOREGROUND,
+    };
+    (lane, created_at)
+}
+
 fn derive_semantic_type_code_from_blob(blob: &[u8]) -> Option<i64> {
     let parsed = crate::event_modules::parse_event(blob).ok()?;
     let semantic_type = match parsed {
@@ -95,13 +141,29 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
             available_at INTEGER NOT NULL,
             attempts INTEGER NOT NULL DEFAULT 0,
             lease_until INTEGER,
+            priority_lane INTEGER NOT NULL DEFAULT 1,
+            priority_ts INTEGER NOT NULL DEFAULT 0,
             PRIMARY KEY (peer_id, event_id)
         );
+        CREATE INDEX IF NOT EXISTS idx_project_queue_claim
+            ON project_queue(peer_id, priority_lane, priority_ts DESC, available_at, event_id);
         ",
     )?;
     if !valid_events_has_semantic_type_column(conn)? {
         conn.execute(
             "ALTER TABLE valid_events ADD COLUMN semantic_type_code INTEGER",
+            [],
+        )?;
+    }
+    if !project_queue_has_column(conn, "priority_lane")? {
+        conn.execute(
+            "ALTER TABLE project_queue ADD COLUMN priority_lane INTEGER NOT NULL DEFAULT 1",
+            [],
+        )?;
+    }
+    if !project_queue_has_column(conn, "priority_ts")? {
+        conn.execute(
+            "ALTER TABLE project_queue ADD COLUMN priority_ts INTEGER NOT NULL DEFAULT 0",
             [],
         )?;
     }
@@ -119,13 +181,28 @@ impl<'a> ProjectQueue<'a> {
     /// Returns true if inserted.
     pub fn enqueue(&self, peer_id: &str, event_id_b64: &str) -> SqliteResult<bool> {
         let now = current_timestamp_ms();
+        let (priority_lane, priority_ts) = load_project_priority(self.conn, event_id_b64, now);
+        self.enqueue_classified(peer_id, event_id_b64, priority_lane, priority_ts)
+    }
+
+    /// Enqueue an event for projection using already-classified priority.
+    /// This lets local-create paths avoid re-reading the just-written event row.
+    pub fn enqueue_classified(
+        &self,
+        peer_id: &str,
+        event_id_b64: &str,
+        priority_lane: i64,
+        priority_ts: i64,
+    ) -> SqliteResult<bool> {
+        let now = current_timestamp_ms();
         let rows = self.conn.execute(
-            "INSERT OR IGNORE INTO project_queue (peer_id, event_id, available_at)
-             SELECT ?1, ?2, ?3
+            "INSERT OR IGNORE INTO project_queue
+             (peer_id, event_id, available_at, priority_lane, priority_ts)
+             SELECT ?1, ?2, ?3, ?4, ?5
              WHERE NOT EXISTS (SELECT 1 FROM valid_events WHERE peer_id=?1 AND event_id=?2)
              AND NOT EXISTS (SELECT 1 FROM rejected_events WHERE peer_id=?1 AND event_id=?2)
              AND NOT EXISTS (SELECT 1 FROM blocked_event_deps WHERE peer_id=?1 AND event_id=?2)",
-            params![peer_id, event_id_b64, now],
+            params![peer_id, event_id_b64, now, priority_lane, priority_ts],
         )?;
         Ok(rows > 0)
     }
@@ -138,15 +215,17 @@ impl<'a> ProjectQueue<'a> {
         let now = current_timestamp_ms();
         self.conn.execute("BEGIN", [])?;
         let mut stmt = self.conn.prepare(
-            "INSERT OR IGNORE INTO project_queue (peer_id, event_id, available_at)
-             SELECT ?1, ?2, ?3
+            "INSERT OR IGNORE INTO project_queue
+             (peer_id, event_id, available_at, priority_lane, priority_ts)
+             SELECT ?1, ?2, ?3, ?4, ?5
              WHERE NOT EXISTS (SELECT 1 FROM valid_events WHERE peer_id=?1 AND event_id=?2)
              AND NOT EXISTS (SELECT 1 FROM rejected_events WHERE peer_id=?1 AND event_id=?2)
              AND NOT EXISTS (SELECT 1 FROM blocked_event_deps WHERE peer_id=?1 AND event_id=?2)",
         )?;
         let mut inserted = 0usize;
         for eid in event_ids {
-            inserted += stmt.execute(params![peer_id, eid, now])?;
+            let (priority_lane, priority_ts) = load_project_priority(self.conn, eid, now);
+            inserted += stmt.execute(params![peer_id, eid, now, priority_lane, priority_ts])?;
         }
         self.conn.execute("COMMIT", [])?;
         Ok(inserted)
@@ -165,18 +244,36 @@ impl<'a> ProjectQueue<'a> {
         }
         let now = current_timestamp_ms();
         let lease_until = now + lease_ms;
+        let head_lane: Option<i64> = self
+            .conn
+            .query_row(
+                "SELECT priority_lane
+                 FROM project_queue
+                 WHERE peer_id = ?1
+                   AND available_at <= ?2
+                   AND (lease_until IS NULL OR lease_until <= ?2)
+                 ORDER BY priority_lane ASC, available_at ASC, rowid ASC
+                 LIMIT 1",
+                params![peer_id, now],
+                |row| row.get(0),
+            )
+            .ok();
+        let Some(head_lane) = head_lane else {
+            return Ok(Vec::new());
+        };
 
         // Select available items
         let mut select_stmt = self.conn.prepare(
             "SELECT event_id FROM project_queue
              WHERE peer_id = ?1
-             AND available_at <= ?2
-             AND (lease_until IS NULL OR lease_until <= ?2)
-             ORDER BY available_at
-             LIMIT ?3",
+             AND priority_lane = ?2
+             AND available_at <= ?3
+             AND (lease_until IS NULL OR lease_until <= ?3)
+             ORDER BY available_at ASC, rowid ASC
+             LIMIT ?4",
         )?;
         let event_ids: Vec<String> = select_stmt
-            .query_map(params![peer_id, now, limit as i64], |row| {
+            .query_map(params![peer_id, head_lane, now, limit as i64], |row| {
                 row.get::<_, String>(0)
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -350,11 +447,36 @@ mod tests {
     use super::super::queue::current_timestamp_ms;
     use super::*;
     use crate::db::{open_in_memory, schema::create_tables};
+    use crate::event_modules::EVENT_TYPE_FILE_SLICE;
 
     fn setup() -> Connection {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         conn
+    }
+
+    fn insert_event(conn: &Connection, event_id_b64: &str, event_type: &str, created_at: i64) {
+        conn.execute(
+            "INSERT INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, ?2, x'01', 'shared', ?3, ?3)",
+            params![event_id_b64, event_type, created_at],
+        )
+        .unwrap();
+    }
+
+    fn insert_event_blob(
+        conn: &Connection,
+        event_id_b64: &str,
+        event_type: &str,
+        blob: Vec<u8>,
+        created_at: i64,
+    ) {
+        conn.execute(
+            "INSERT INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, ?2, ?3, 'shared', ?4, ?4)",
+            params![event_id_b64, event_type, blob, created_at],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -836,5 +958,58 @@ mod tests {
         let h = pq.health("peer1").unwrap();
         assert_eq!(h.pending, 2); // both still in queue
         assert_eq!(h.max_attempts, 1); // event_a retried once
+    }
+
+    #[test]
+    fn test_claim_batch_prefers_foreground_without_reordering_foreground_arrival() {
+        let conn = setup();
+        insert_event(&conn, "message_new", "message", 300);
+        insert_event(&conn, "message_old", "message", 100);
+        insert_event(&conn, "bulk_new", "file_slice", 500);
+
+        let pq = ProjectQueue::new(&conn);
+        pq.enqueue_batch("peer1", &["bulk_new", "message_old", "message_new"])
+            .unwrap();
+
+        let claimed = pq.claim_batch("peer1", 10, 30_000).unwrap();
+        assert_eq!(
+            claimed,
+            vec!["message_old".to_string(), "message_new".to_string()]
+        );
+
+        let claimed_bulk = pq.claim_batch("peer1", 10, 30_000).unwrap();
+        assert_eq!(claimed_bulk, vec!["bulk_new".to_string()]);
+    }
+
+    #[test]
+    fn test_claim_batch_treats_encrypted_file_slice_as_bulk() {
+        let conn = setup();
+        let encrypted_blob = crate::event_modules::encode_event(
+            &crate::event_modules::ParsedEvent::Encrypted(crate::event_modules::EncryptedEvent {
+                created_at_ms: 200,
+                key_event_id: [7u8; 32],
+                inner_type_code: EVENT_TYPE_FILE_SLICE,
+                nonce: [8u8; 12],
+                ciphertext: vec![0u8; crate::event_modules::file_slice::FILE_SLICE_WIRE_SIZE],
+                auth_tag: [9u8; 16],
+            }),
+        )
+        .unwrap();
+        insert_event_blob(&conn, "encrypted_bulk", "encrypted", encrypted_blob, 200);
+        insert_event(&conn, "message_midflight", "message", 100);
+
+        let pq = ProjectQueue::new(&conn);
+        pq.enqueue_batch("peer1", &["encrypted_bulk", "message_midflight"])
+            .unwrap();
+
+        let claimed = pq.claim_batch("peer1", 10, 30_000).unwrap();
+        assert_eq!(
+            claimed,
+            vec!["message_midflight".to_string()],
+            "encrypted file slices should be demoted into the bulk lane"
+        );
+
+        let claimed_bulk = pq.claim_batch("peer1", 10, 30_000).unwrap();
+        assert_eq!(claimed_bulk, vec!["encrypted_bulk".to_string()]);
     }
 }

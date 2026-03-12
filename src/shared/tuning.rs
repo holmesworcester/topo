@@ -47,6 +47,18 @@ pub fn write_batch_cap() -> usize {
     }
 }
 
+pub fn bulk_write_batch_cap() -> usize {
+    if low_mem_mode() {
+        4
+    } else {
+        16
+    }
+}
+
+pub fn bulk_egress_claim_count() -> usize {
+    1
+}
+
 // -- Peering --
 pub fn shared_ingest_cap() -> usize {
     if low_mem_mode() {

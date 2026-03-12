@@ -793,8 +793,12 @@ CREATE TABLE project_queue (
     available_at INTEGER NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     lease_until INTEGER,
+    priority_lane INTEGER NOT NULL DEFAULT 1,
+    priority_ts INTEGER NOT NULL DEFAULT 0,
     PRIMARY KEY (peer_id, event_id)
 );
+CREATE INDEX idx_project_queue_claim
+    ON project_queue(peer_id, priority_lane, priority_ts DESC, available_at, event_id);
 
 CREATE TABLE egress_queue (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -806,8 +810,11 @@ CREATE TABLE egress_queue (
     available_at INTEGER NOT NULL,
     attempts INTEGER NOT NULL DEFAULT 0,
     lease_until INTEGER,
+    lease_owner TEXT,
     sent_at INTEGER,
-    dedupe_key TEXT
+    dedupe_key TEXT,
+    priority_lane INTEGER NOT NULL DEFAULT 1,
+    priority_ts INTEGER NOT NULL DEFAULT 0
 );
 CREATE UNIQUE INDEX idx_egress_pending_event
     ON egress_queue(connection_id, event_id)
@@ -815,6 +822,9 @@ CREATE UNIQUE INDEX idx_egress_pending_event
 CREATE UNIQUE INDEX idx_egress_dedupe
     ON egress_queue(dedupe_key)
     WHERE dedupe_key IS NOT NULL AND sent_at IS NULL;
+CREATE INDEX idx_egress_claim
+    ON egress_queue(connection_id, priority_lane, priority_ts DESC, id)
+    WHERE sent_at IS NULL;
 ```
 
 Keep canonical and queue data separate:
@@ -837,7 +847,7 @@ Runtime flow reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) sections `1`,
 
 1. `ingest receiver path` (current runtime): QUIC frame -> ingest channel -> transactional canonical insert -> record by tenant -> enqueue project.
 2. `project worker`: claim row -> project path (`valid`/`block`/`reject`) -> dequeue.
-3. `egress worker`: dequeue by `connection_id` -> send frame -> mark `sent_at`/retry.
+3. `egress worker`: claim a leased batch by `connection_id` + `lease_owner` -> send frame -> mark `sent`/retry -> release only that session's leases on teardown.
 4. `cleanup worker`: purge sent egress rows, reclaim expired leases, TTL-purge old endpoint observations.
 
 Queue DRY requirement:
@@ -850,6 +860,7 @@ Create rows from:
 1. Negentropy reconciliation producer (`have_ids` we can send).
 2. Incoming `HaveList` request producer.
 3. Local protocol producers for control frames.
+4. Local shared-event creation directly into known remote peer queues.
 
 For event transfer, queue `event_id` only and fetch canonical blob at send time.
 
@@ -859,6 +870,17 @@ For event transfer, queue `event_id` only and fetch canonical blob at send time.
 - Do not enqueue if already terminal or currently blocked.
 - If duplicate enqueue races happen, worker should fast-drop after terminal check.
 - On terminal decision (`valid`, `reject`, `block`), remove row from `project_queue` in the same transaction as state write.
+- Queue classification uses outer semantic type. For encrypted wrappers the runtime reads the wrapper-exposed `inner_type_code`, so encrypted `file_slice` rows still enter the bulk lane without waiting for decryption.
+- `project_queue` stores `priority_ts` for policy metadata, but current claim order is lane-first and FIFO within the lane so large `file_slice` bursts cannot monopolize projection while dependency-heavy foreground chains retain arrival order.
+- `egress_queue` claim order is lane-first with recency inside the lane (`priority_ts DESC`) so new foreground events are sent ahead of older bulk backlog.
+
+## 8.5.1 Test harness cleanup TODO
+
+Outstanding follow-up debt for CLI/integration tests:
+
+1. continue replacing bespoke polling/retry helpers with shared `assert_eventually`/value-eventually helpers over explicit ready predicates,
+2. keep sleeps only as poll intervals inside those eventual assertions or when intentionally stretching a race to reproduce a bug,
+3. do not use fixed waits as protection against correctness failures.
 
 Recommended enqueue guard:
 
@@ -1091,6 +1113,7 @@ Required changes from the 1:1 sync model:
    iteration so event streaming is not starved by large reconciliation results.
 8. **Negentropy snapshot ordering.** `BEGIN` must precede `rebuild_blocks()` so the storage
    sees a consistent read snapshot while concurrent writes proceed in the batch_writer.
+9. **Windowed reconciliation on the same event universe.** The first outbound round to a peer is `Full`; subsequent rounds are usually `Hot` (`ts >= cutoff`) with periodic `Cold` (`ts < cutoff`) refreshes. The window is carried in the initial `NegOpen` header and does not create a second protocol or separate dependency universe.
 
 Test families (in `sync_graph_test.rs`):
 - **Family A (chain):** N-peer chain propagation (tail convergence, per-hop latency).

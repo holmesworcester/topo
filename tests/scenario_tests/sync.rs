@@ -127,17 +127,15 @@ async fn test_sync_10k() {
     let gen_secs = gen_start.elapsed().as_secs_f64();
     eprintln!("Generated {} events in {:.2}s", EVENT_COUNT, gen_secs);
 
-    // Convergence gate on shared-scope events in the events table (store level).
-    // Cross-workspace messages can't be projected (foreign signer), so we check
-    // raw storage instead of the valid_events projection table.
-    let alice_shared_before = alice.shared_store_count();
-    let bob_shared_before = bob.shared_store_count();
-    let expected_bob_shared = bob_shared_before + (alice_shared_before - bob_shared_before);
+    // Convergence gate on recorded message events using outer semantic type.
+    let alice_messages_before_sync = alice.recorded_message_event_count();
+    let bob_messages_before_sync = bob.recorded_message_event_count();
+    let expected_bob_messages = bob_messages_before_sync + alice_messages_before_sync;
 
     let metrics = sync_until_converged(
         &alice,
         &bob,
-        || bob.shared_store_count() >= expected_bob_shared,
+        || bob.recorded_message_event_count() >= expected_bob_messages,
         Duration::from_secs(120),
     )
     .await;
@@ -203,8 +201,8 @@ async fn test_reaction_sync() {
     let msg1 = alice.create_message("Hello!");
     let msg2 = alice.create_message("World!");
     let msg2_b64 = event_id_to_base64(&msg2);
-    bob.create_reaction(&msg1, "\u{1f44d}");
-    let bob_rxn2 = bob.create_reaction(&msg2, "\u{2764}\u{fe0f}");
+    bob.create_reaction_staged(&msg1, "\u{1f44d}");
+    let bob_rxn2 = bob.create_reaction_staged(&msg2, "\u{2764}\u{fe0f}");
     let bob_rxn2_b64 = event_id_to_base64(&bob_rxn2);
 
     assert_eq!(alice.message_count(), 2);
@@ -557,17 +555,15 @@ async fn test_sync_50k() {
     let gen_secs = gen_start.elapsed().as_secs_f64();
     eprintln!("Generated {} events in {:.2}s", EVENT_COUNT, gen_secs);
 
-    // Convergence gate on shared-scope events in the events table (store level).
-    // Cross-workspace messages can't be projected (foreign signer), so we check
-    // raw storage instead of the valid_events projection table.
-    let alice_shared_before = alice.shared_store_count();
-    let bob_shared_before = bob.shared_store_count();
-    let expected_bob_shared = bob_shared_before + (alice_shared_before - bob_shared_before);
+    // Convergence gate on recorded message events using outer semantic type.
+    let alice_messages_before_sync = alice.recorded_message_event_count();
+    let bob_messages_before_sync = bob.recorded_message_event_count();
+    let expected_bob_messages = bob_messages_before_sync + alice_messages_before_sync;
 
     let metrics = sync_until_converged(
         &alice,
         &bob,
-        || bob.shared_store_count() >= expected_bob_shared,
+        || bob.recorded_message_event_count() >= expected_bob_messages,
         Duration::from_secs(300),
     )
     .await;
@@ -595,7 +591,7 @@ async fn test_out_of_order_reaction_sync() {
     let msg_id_b64 = event_id_to_base64(&msg_id);
 
     // Bob creates a reaction targeting Alice's message (Bob doesn't have the message yet)
-    let rxn_id = bob.create_reaction(&msg_id, "\u{1f44d}");
+    let rxn_id = bob.create_reaction_staged(&msg_id, "\u{1f44d}");
     let rxn_id_b64 = event_id_to_base64(&rxn_id);
 
     assert_eq!(bob.reaction_count(), 0); // blocked
@@ -637,9 +633,9 @@ async fn test_multi_dep_blocking_sync() {
     let msg3 = alice.create_message("Third");
 
     // Bob creates reactions targeting all 3 (none of which are in his DB)
-    bob.create_reaction(&msg1, "\u{1f44d}");
-    bob.create_reaction(&msg2, "\u{2764}\u{fe0f}");
-    let bob_rxn3 = bob.create_reaction(&msg3, "\u{1f525}");
+    bob.create_reaction_staged(&msg1, "\u{1f44d}");
+    bob.create_reaction_staged(&msg2, "\u{2764}\u{fe0f}");
+    let bob_rxn3 = bob.create_reaction_staged(&msg3, "\u{1f525}");
     let bob_rxn3_b64 = event_id_to_base64(&bob_rxn3);
     let msg3_b64 = event_id_to_base64(&msg3);
 

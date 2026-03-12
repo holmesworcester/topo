@@ -22,7 +22,9 @@ use crate::transport::{StreamRecv, StreamSend};
 use crate::tuning::low_mem_memtrace;
 
 use super::logging::SyncRunRxCapture;
-use super::{egress_claim_count, enqueue_batch, have_chunk, DATA_SEND_STALL_TIMEOUT};
+use super::{
+    egress_claim_count, enqueue_batch, have_chunk, DATA_SEND_STALL_TIMEOUT, EGRESS_LEASE_MS,
+};
 
 pub struct DataPlaneSendStats {
     pub events_sent_delta: u64,
@@ -67,100 +69,89 @@ pub fn enqueue_pending_have_to_egress(
 }
 
 pub async fn drain_egress_to_data_stream<S>(
-    session_id: u64,
     egress: &EgressQueue<'_>,
     store: &Store<'_>,
     peer_id: &str,
+    lease_owner: &str,
     data_send: &mut S,
-) -> Result<DataPlaneSendStats, Box<dyn std::error::Error + Send + Sync>>
+) -> DataPlaneSendStats
 where
     S: StreamSend,
 {
     let mut events_sent_delta = 0u64;
     let mut bytes_sent_delta = 0u64;
     let mut sent_any = false;
-    let mut blocked = false;
-
-    while !blocked {
-        let batch = egress.claim_batch(peer_id, egress_claim_count())?;
-        if batch.is_empty() {
-            break;
-        }
-
-        let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
-        let mut missing_count = 0u64;
-        for (rowid, event_id) in batch {
-            if let Ok(Some(blob)) = store.get_shared(&event_id) {
-                let blob_len = blob.len() as u64;
-                match tokio::time::timeout(
-                    DATA_SEND_STALL_TIMEOUT,
-                    data_send.send(&Frame::Event { blob }),
-                )
-                .await
-                {
-                    Ok(Ok(())) => {
-                        events_sent_delta += 1;
-                        bytes_sent_delta += blob_len;
-                        sent_any = true;
-                        sent_rowids.push(rowid);
-                    }
-                    Ok(Err(err)) => {
-                        warn!(
-                            "Session {} data send failed peer={} event={} error={}",
-                            session_id,
-                            peer_id,
-                            event_id_to_base64(&event_id),
-                            err
-                        );
-                        blocked = true;
-                        break;
-                    }
-                    Err(_) => {
-                        warn!(
-                            "Session {} data send stalled peer={} event={} timeout_ms={}",
-                            session_id,
-                            peer_id,
-                            event_id_to_base64(&event_id),
-                            DATA_SEND_STALL_TIMEOUT.as_millis()
-                        );
-                        blocked = true;
-                        break;
-                    }
-                }
-            } else {
-                missing_count += 1;
-                sent_rowids.push(rowid);
+    let batch =
+        match egress.claim_batch(peer_id, lease_owner, egress_claim_count(), EGRESS_LEASE_MS) {
+            Ok(batch) => batch,
+            Err(err) => {
+                warn!(
+                    "failed to claim egress batch peer={} owner={} error={}",
+                    peer_id, lease_owner, err
+                );
+                Vec::new()
             }
+        };
+
+    let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
+    let mut missing_count = 0u64;
+    for (rowid, event_id) in batch {
+        if let Ok(Some(blob)) = store.get_shared(&event_id) {
+            let blob_len = blob.len() as u64;
+            match tokio::time::timeout(DATA_SEND_STALL_TIMEOUT, data_send.send(&Frame::Event { blob }))
+                .await
+            {
+                Ok(Ok(())) => {
+                    events_sent_delta += 1;
+                    bytes_sent_delta += blob_len;
+                    sent_any = true;
+                    sent_rowids.push(rowid);
+                }
+                Ok(Err(err)) => {
+                    warn!(
+                        "data send failed peer={} event={} error={}",
+                        peer_id,
+                        event_id_to_base64(&event_id),
+                        err
+                    );
+                    break;
+                }
+                Err(_) => {
+                    warn!(
+                        "data send stalled peer={} event={} timeout_ms={}",
+                        peer_id,
+                        event_id_to_base64(&event_id),
+                        DATA_SEND_STALL_TIMEOUT.as_millis()
+                    );
+                    break;
+                }
+            }
+        } else {
+            missing_count += 1;
+            sent_rowids.push(rowid);
         }
-        if missing_count > 0 {
-            warn!(
-                "Session {} dropped {} queued data events missing from shared store peer={}",
-                session_id, missing_count, peer_id
-            );
-        }
-        egress.mark_sent(&sent_rowids)?;
     }
+    if missing_count > 0 {
+        tracing::debug!("{} events missing from store (not shared?)", missing_count);
+    }
+    let _ = egress.mark_sent(lease_owner, &sent_rowids);
 
     if sent_any {
         match tokio::time::timeout(DATA_SEND_STALL_TIMEOUT, data_send.flush()).await {
             Ok(Ok(())) => {}
-            Ok(Err(err)) => warn!(
-                "Session {} data flush failed peer={} error={}",
-                session_id, peer_id, err
-            ),
+            Ok(Err(err)) => warn!("data flush failed peer={} error={}", peer_id, err),
             Err(_) => warn!(
-                "Session {} data flush stalled peer={} timeout_ms={}",
-                session_id,
+                "data flush stalled peer={} timeout_ms={}",
                 peer_id,
                 DATA_SEND_STALL_TIMEOUT.as_millis()
             ),
         }
     }
 
-    Ok(DataPlaneSendStats {
+    DataPlaneSendStats {
         events_sent_delta,
         bytes_sent_delta,
-    })
+    }
 }
 
 pub async fn send_data_done<S>(data_send: &mut S) -> Result<(), ConnectionError>

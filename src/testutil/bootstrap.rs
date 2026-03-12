@@ -98,6 +98,7 @@ pub async fn bootstrap_sync_from_invite(
 
     let peer_id = peer_identity_from_connection(&connection)
         .ok_or("Bootstrap sync: could not extract peer identity")?;
+    crate::sync::session::windowing::reset_outbound_window_state(db_path, &peer_id);
 
     info!("Bootstrap sync: connected to peer {}", &peer_id[..16]);
 

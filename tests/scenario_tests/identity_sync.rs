@@ -169,17 +169,28 @@ async fn test_identity_then_messaging() {
     )
     .await;
 
-    let shared_key_bytes: [u8; 32] = [42u8; 32];
-    let shared_ts = 1_000_000_000_000u64;
-    alice.create_key_secret_deterministic(shared_key_bytes, shared_ts);
-    bob.create_key_secret_deterministic(shared_key_bytes, shared_ts);
+    // Materialize the same content key on both peers so the encrypted message
+    // helpers produce cross-decryptable payloads in this handcrafted identity test.
+    let shared_key_bytes: [u8; 32] = [0x5Au8; 32];
+    let shared_key_ts = 6_000_000u64;
+    let alice_key = alice.create_key_secret_deterministic(shared_key_bytes, shared_key_ts);
+    let bob_key = bob.create_key_secret_deterministic(shared_key_bytes, shared_key_ts);
+    assert_eq!(alice_key, bob_key, "shared content key ids should match");
 
-    alice.create_message("Hello from Alice");
-    bob.create_message("Hello from Bob");
+    // Now both peers send decryptable encrypted messages.
+    let alice_msg = alice.create_encrypted_message(&alice_key, "Hello from Alice");
+    let bob_msg = bob.create_encrypted_message(&bob_key, "Hello from Bob");
+    let alice_msg_b64 = event_id_to_base64(&alice_msg);
+    let bob_msg_b64 = event_id_to_base64(&bob_msg);
 
     let _sync = start_peers(&alice, &bob);
     assert_eventually(
-        || alice.scoped_message_count() == 2 && bob.scoped_message_count() == 2,
+        || {
+            alice.has_event(&bob_msg_b64)
+                && bob.has_event(&alice_msg_b64)
+                && alice.scoped_message_count() == 2
+                && bob.scoped_message_count() == 2
+        },
         Duration::from_secs(20),
         "messages should converge after identity sync",
     )

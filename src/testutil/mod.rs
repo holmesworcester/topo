@@ -45,12 +45,17 @@ use crate::peering::loops::{
 };
 use crate::projection::apply::project_one;
 use crate::projection::create::{
-    create_encrypted_event_synchronous, create_event_staged, create_event_synchronous,
-    create_signed_event_staged, create_signed_event_synchronous, event_id_or_blocked,
-    CreateEventError,
+    create_encrypted_event_staged, create_encrypted_event_synchronous, create_event_staged,
+    create_event_synchronous, create_signed_event_staged, create_signed_event_synchronous,
+    event_id_or_blocked, CreateEventError,
 };
-use crate::transport::identity::{ensure_transport_peer_id, load_transport_cert};
-use crate::transport::{create_dual_endpoint_dynamic, extract_spki_fingerprint};
+use crate::state::db::queue::SQLITE_BUSY_RETRY_BASE_MS;
+use crate::transport::identity::{
+    ensure_transport_peer_id, load_transport_cert, load_transport_cert_required_from_db,
+};
+use crate::transport::{
+    create_dual_endpoint, create_dual_endpoint_dynamic, extract_spki_fingerprint, AllowedPeers,
+};
 use ed25519_dalek::SigningKey;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
@@ -82,6 +87,109 @@ fn current_timestamp_ms() -> u64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as u64
+}
+
+async fn poll_for_materialized_local_peer_signer(
+    db_path: &str,
+    scoped_peer_id: &str,
+    timeout: Duration,
+) -> Option<(EventId, SigningKey)> {
+    let start = Instant::now();
+    loop {
+        let _ = crate::event_pipeline::drain_project_queue(db_path, scoped_peer_id, 1000);
+        if let Ok(db) = open_connection(db_path) {
+            if let Ok(Some((eid, key))) =
+                crate::service::load_local_peer_signer_pub(&db, scoped_peer_id)
+            {
+                return Some((eid, key));
+            }
+        }
+        if start.elapsed() >= timeout {
+            return None;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_materialized_local_peer_signer(
+    db_path: &str,
+    scoped_peer_id: &str,
+    timeout: Duration,
+) -> (EventId, SigningKey) {
+    if let Some(signer) =
+        poll_for_materialized_local_peer_signer(db_path, scoped_peer_id, timeout).await
+    {
+        return signer;
+    }
+    let debug = open_connection(db_path)
+        .ok()
+        .map(|db| {
+            let peer_secrets: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM peer_secrets WHERE recorded_by = ?1",
+                    rusqlite::params![scoped_peer_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let blocked: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM blocked_events WHERE peer_id = ?1",
+                    rusqlite::params![scoped_peer_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let queued: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM project_queue WHERE peer_id = ?1",
+                    rusqlite::params![scoped_peer_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let peer_secret_events: i64 = db
+                .query_row(
+                    "SELECT COUNT(*)
+                     FROM recorded_events re
+                     JOIN events e ON e.event_id = re.event_id
+                     WHERE re.peer_id = ?1
+                       AND e.event_type = 'peer_secret'",
+                    rusqlite::params![scoped_peer_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let blocked_details = db
+                .prepare(
+                    "SELECT e.event_type,
+                            hex(b.blocker_event_id),
+                            COALESCE(be.event_type, 'missing')
+                     FROM blocked_event_deps b
+                     JOIN events e
+                       ON e.event_id = b.event_id
+                     LEFT JOIN events be
+                       ON be.event_id = b.blocker_event_id
+                     WHERE b.peer_id = ?1
+                     ORDER BY e.created_at ASC, e.event_id ASC, b.blocker_event_id ASC",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map(rusqlite::params![scoped_peer_id], |row| {
+                        Ok((
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, String>(2)?,
+                        ))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap_or_default();
+            format!(
+                "peer_secrets={}, blocked_events={}, project_queue={}, recorded_peer_secret_events={}, blocked_details={:?}",
+                peer_secrets, blocked, queued, peer_secret_events, blocked_details
+            )
+        })
+        .unwrap_or_else(|| "failed to open db for debug".to_string());
+    panic!(
+        "local peer signer not materialized for {} within {:?}: {}",
+        scoped_peer_id, timeout, debug
+    );
 }
 
 /// Open a lightweight connection for polling counts during active sync.
@@ -133,20 +241,6 @@ pub struct Peer {
     /// PeerShared signing key for signing content events.
     pub peer_shared_signing_key: Option<SigningKey>,
     _tempdir: tempfile::TempDir,
-}
-
-/// Delegate to the test bootstrap responder.
-fn start_test_sync_endpoint(
-    inviter_db_path: &str,
-    inviter_identity: &str,
-    invite_key: &SigningKey,
-) -> Result<(SocketAddr, quinn::Endpoint), Box<dyn std::error::Error + Send + Sync>> {
-    bootstrap::start_bootstrap_responder(
-        inviter_db_path,
-        inviter_identity,
-        invite_key,
-        crate::event_pipeline::batch_writer,
-    )
 }
 
 impl Peer {
@@ -305,10 +399,11 @@ impl Peer {
         .expect("failed to record pending bootstrap trust");
         drop(creator_db);
 
-        // Start a temp sync endpoint for the creator
-        let (sync_addr, sync_endpoint) =
-            start_test_sync_endpoint(&creator.db_path, &creator.identity, &invite.invite_key)
-                .expect("failed to start temp sync endpoint");
+        // Start a real dynamic-trust sync endpoint for the creator and use its
+        // address in the invite link. The same endpoint then serves the
+        // bootstrap sync loops below.
+        let sync_endpoint = create_dynamic_endpoint_for_peer(creator);
+        let sync_addr = sync_endpoint.local_addr().expect("failed to get sync addr");
 
         // Build invite link with creator's bootstrap address and SPKI
         let creator_spki = creator.spki_fingerprint();
@@ -326,38 +421,76 @@ impl Peer {
         )
         .expect("failed to accept invite");
 
-        // Step 2: Bootstrap sync — fetches prerequisites from creator.
-        // In production this is done by the autodial loop; in tests we trigger
-        // it directly. The batch_writer handles projection cascade.
-        crate::testutil::bootstrap::bootstrap_sync_from_invite(
-            &peer.db_path,
-            &result.peer_id,
-            sync_addr,
-            &creator_spki,
-            10,
-            crate::event_pipeline::batch_writer,
-        )
-        .await
-        .expect("failed bootstrap sync");
-
-        // Clean up sync endpoint
-        sync_endpoint.close(0u32.into(), b"bootstrap done");
-
-        // Step 3: With pre-derive, the peer_id is already the final
-        // PeerShared-derived identity — no finalize_identity needed.
-        let db = open_connection(&peer.db_path).expect("failed to open db");
         let scoped_peer_id = result.peer_id.clone();
         peer.identity = scoped_peer_id.clone();
         peer.workspace_id = creator.workspace_id;
+        let db = open_connection(&peer.db_path).expect("failed to open db");
 
-        // Deterministically drain projection queue after bootstrap sync so
-        // peer signer materialization is visible in the same call chain.
-        let _ = crate::event_pipeline::drain_project_queue(&peer.db_path, &scoped_peer_id, 1000);
+        // Step 2: Run the same ongoing sync loops the runtime would use until
+        // the bootstrap chain materializes the joiner's local signer.
+        let creator_ep = sync_endpoint.clone();
+        let creator_db = creator.db_path.clone();
+        let creator_id = creator.identity.clone();
+        let _creator_handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let _ = accept_loop(
+                    &creator_db,
+                    &creator_id,
+                    creator_ep,
+                    noop_intro_spawner,
+                    test_ingest_fns(),
+                )
+                .await;
+            });
+        });
+
+        let (_bootstrap_peer_id, peer_cert, peer_key) =
+            load_transport_cert_required_from_db(&peer.db_path)
+                .expect("failed to load bootstrap transport cert");
+        let peer_allowed = Arc::new(AllowedPeers::from_fingerprints(vec![creator_spki]));
+        let peer_endpoint = create_dual_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            peer_cert,
+            peer_key,
+            peer_allowed,
+        )
+        .expect("failed to create bootstrap connect endpoint");
+        let peer_ep = peer_endpoint.clone();
+        let peer_db = peer.db_path.clone();
+        let peer_id = scoped_peer_id.clone();
+        let _connector_handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let _ = connect_loop(
+                    &peer_db,
+                    &peer_id,
+                    peer_ep,
+                    sync_addr,
+                    None,
+                    noop_intro_spawner,
+                    test_ingest_fns(),
+                )
+                .await;
+            });
+        });
 
         // Load signing key and user_event_id from DB in a read-your-writes step.
-        let (eid, key) = crate::service::load_local_peer_signer_pub(&db, &scoped_peer_id)
-            .expect("load_local_peer_signer_pub failed")
-            .expect("accept_invite did not materialize local peer signer");
+        let (eid, key) = wait_for_materialized_local_peer_signer(
+            &peer.db_path,
+            &scoped_peer_id,
+            Duration::from_secs(10),
+        )
+        .await;
+        peer_endpoint.close(0u32.into(), b"bootstrap done");
+        sync_endpoint.close(0u32.into(), b"bootstrap done");
+
         peer.peer_shared_event_id = Some(eid);
         peer.peer_shared_signing_key = Some(key);
         if let Ok(uid) =
@@ -446,9 +579,8 @@ impl Peer {
         .expect("failed to record pending bootstrap trust");
         drop(creator_db);
 
-        let (sync_addr, sync_endpoint) =
-            start_test_sync_endpoint(&creator.db_path, &creator.identity, &invite.invite_key)
-                .expect("failed to start temp sync endpoint");
+        let sync_endpoint = create_dynamic_endpoint_for_peer(creator);
+        let sync_addr = sync_endpoint.local_addr().expect("failed to get sync addr");
 
         let creator_spki = creator.spki_fingerprint();
         let bootstrap_addr = parse_bootstrap_address(&sync_addr.to_string())
@@ -463,29 +595,73 @@ impl Peer {
         )
         .expect("failed to accept device link");
 
-        crate::testutil::bootstrap::bootstrap_sync_from_invite(
-            &peer.db_path,
-            &result.peer_id,
-            sync_addr,
-            &creator_spki,
-            10,
-            crate::event_pipeline::batch_writer,
-        )
-        .await
-        .expect("failed bootstrap sync");
-
-        sync_endpoint.close(0u32.into(), b"bootstrap done");
-
-        let db = open_connection(&peer.db_path).expect("failed to open db");
         let scoped_peer_id = result.peer_id.clone();
         peer.identity = scoped_peer_id.clone();
         peer.workspace_id = creator.workspace_id;
+        let db = open_connection(&peer.db_path).expect("failed to open db");
 
-        let _ = crate::event_pipeline::drain_project_queue(&peer.db_path, &scoped_peer_id, 1000);
+        let creator_ep = sync_endpoint.clone();
+        let creator_db = creator.db_path.clone();
+        let creator_id = creator.identity.clone();
+        let _creator_handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let _ = accept_loop(
+                    &creator_db,
+                    &creator_id,
+                    creator_ep,
+                    noop_intro_spawner,
+                    test_ingest_fns(),
+                )
+                .await;
+            });
+        });
 
-        let (eid, key) = crate::service::load_local_peer_signer_pub(&db, &scoped_peer_id)
-            .expect("load_local_peer_signer_pub failed")
-            .expect("accept_device_link did not materialize local peer signer");
+        let (_bootstrap_peer_id, peer_cert, peer_key) =
+            load_transport_cert_required_from_db(&peer.db_path)
+                .expect("failed to load bootstrap transport cert");
+        let peer_allowed = Arc::new(AllowedPeers::from_fingerprints(vec![creator_spki]));
+        let peer_endpoint = create_dual_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            peer_cert,
+            peer_key,
+            peer_allowed,
+        )
+        .expect("failed to create bootstrap connect endpoint");
+        let peer_ep = peer_endpoint.clone();
+        let peer_db = peer.db_path.clone();
+        let peer_id = scoped_peer_id.clone();
+        let _connector_handle = std::thread::spawn(move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .unwrap();
+            rt.block_on(async move {
+                let _ = connect_loop(
+                    &peer_db,
+                    &peer_id,
+                    peer_ep,
+                    sync_addr,
+                    None,
+                    noop_intro_spawner,
+                    test_ingest_fns(),
+                )
+                .await;
+            });
+        });
+
+        let (eid, key) = wait_for_materialized_local_peer_signer(
+            &peer.db_path,
+            &scoped_peer_id,
+            Duration::from_secs(10),
+        )
+        .await;
+        peer_endpoint.close(0u32.into(), b"bootstrap done");
+        sync_endpoint.close(0u32.into(), b"bootstrap done");
+
         peer.peer_shared_event_id = Some(eid);
         peer.peer_shared_signing_key = Some(key);
         if let Ok(uid) =
@@ -555,6 +731,29 @@ impl Peer {
         self.create_encrypted_signed_event_synchronous(&db, &self.content_key_event_id(&db), &inner)
     }
 
+    /// Create a reaction, tolerating blocked projection when the target message
+    /// is not valid locally yet. Returns the encrypted wrapper event_id.
+    pub fn create_reaction_staged(&self, target_event_id: &EventId, emoji: &str) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let inner = ParsedEvent::Reaction(ReactionEvent {
+            created_at_ms: current_timestamp_ms(),
+            target_event_id: *target_event_id,
+            author_id: self.author_id,
+            emoji: emoji.to_string(),
+            signed_by: self.signer_eid(),
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        create_encrypted_event_staged(
+            &db,
+            &self.identity,
+            &self.content_key_event_id(&db),
+            &inner,
+            Some(self.signing_key()),
+        )
+        .expect("failed to create staged encrypted reaction")
+    }
+
     /// Create a KeySecret event with the given key bytes.
     /// Returns the event ID.
     pub fn create_key_secret(&self, key_bytes: [u8; 32]) -> EventId {
@@ -608,14 +807,25 @@ impl Peer {
         key_event_id: &EventId,
         inner_event: &ParsedEvent,
     ) -> EventId {
-        event_id_or_blocked(create_encrypted_event_synchronous(
-            db,
-            &self.identity,
-            key_event_id,
-            inner_event,
-            Some(self.signing_key()),
-        ))
-        .expect("failed to create encrypted signed event")
+        for attempt in 0..8 {
+            match event_id_or_blocked(create_encrypted_event_synchronous(
+                db,
+                &self.identity,
+                key_event_id,
+                inner_event,
+                Some(self.signing_key()),
+            )) {
+                Ok(event_id) => return event_id,
+                Err(CreateEventError::DbError(err))
+                    if err.contains("database is locked") && attempt + 1 < 8 =>
+                {
+                    std::thread::sleep(Duration::from_millis(SQLITE_BUSY_RETRY_BASE_MS << attempt));
+                }
+                Err(err) => panic!("failed to create encrypted signed event: {err}"),
+            }
+        }
+
+        unreachable!("loop returns on success or final error")
     }
 
     fn content_key_event_id(&self, db: &rusqlite::Connection) -> EventId {
@@ -624,6 +834,11 @@ impl Peer {
             &self.identity,
         )
         .expect("failed to ensure content key")
+    }
+
+    pub fn ensure_content_key_event_id(&self) -> EventId {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        self.content_key_event_id(&db)
     }
 
     /// Create a MessageDeletion event targeting the given message event.
@@ -1146,6 +1361,35 @@ impl Peer {
         .unwrap_or(0)
     }
 
+    /// Count recorded message events using the encrypted wrapper's exposed
+    /// inner semantic type. This works even when the local tenant cannot
+    /// decrypt or validate another workspace's message payloads.
+    pub fn recorded_message_event_count(&self) -> i64 {
+        let db = match open_count_connection(&self.db_path) {
+            Some(db) => db,
+            None => return -1,
+        };
+        db.query_row(
+            "SELECT COUNT(*)
+             FROM recorded_events re
+             JOIN events e ON e.event_id = re.event_id
+             WHERE re.peer_id = ?1
+               AND (
+                    e.event_type = 'message'
+                    OR (
+                        e.event_type = 'encrypted'
+                        AND substr(e.blob, 42, 1) = ?2
+                    )
+               )",
+            rusqlite::params![
+                &self.identity,
+                vec![crate::event_modules::EVENT_TYPE_MESSAGE]
+            ],
+            |row| row.get(0),
+        )
+        .unwrap_or(0)
+    }
+
     /// Count rows in the reactions projection table scoped to this peer.
     pub fn reaction_count(&self) -> i64 {
         let db = open_connection(&self.db_path).expect("failed to open db");
@@ -1307,6 +1551,38 @@ impl Peer {
             .expect("query")
             .collect::<Result<std::collections::BTreeSet<_>, _>>()
             .expect("collect")
+    }
+
+    /// Return recorded message event IDs using the encrypted wrapper's
+    /// inner semantic type rather than decrypted validity.
+    pub fn recorded_message_event_ids(&self) -> std::collections::BTreeSet<String> {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let mut stmt = db
+            .prepare(
+                "SELECT re.event_id
+                 FROM recorded_events re
+                 JOIN events e ON e.event_id = re.event_id
+                 WHERE re.peer_id = ?1
+                   AND (
+                        e.event_type = 'message'
+                        OR (
+                            e.event_type = 'encrypted'
+                            AND substr(e.blob, 42, 1) = ?2
+                        )
+                   )
+                 ORDER BY re.event_id",
+            )
+            .expect("prepare");
+        stmt.query_map(
+            rusqlite::params![
+                &self.identity,
+                vec![crate::event_modules::EVENT_TYPE_MESSAGE]
+            ],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("query")
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()
+        .expect("collect")
     }
 
     /// Count messages scoped to this peer's recorded_by identity.

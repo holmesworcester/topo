@@ -1141,8 +1141,8 @@ Encrypted wrapper events remain canonical but carry ciphertext payloads whose in
 
 Operational queues:
 
-1. `project_queue(peer_id, event_id, available_at, attempts, lease_until)`,
-2. `egress_queue(connection_id, frame_type, event_id, payload, attempts, lease_until, sent_at, dedupe_key)`.
+1. `project_queue(peer_id, event_id, available_at, attempts, lease_until, priority_lane, priority_ts)`,
+2. `egress_queue(connection_id, frame_type, event_id, payload, attempts, lease_until, lease_owner, sent_at, dedupe_key, priority_lane, priority_ts)`.
 
 Canonical tables and queue tables stay separate.
 
@@ -1154,9 +1154,9 @@ Current runtime ingest/worker shape:
    - decode + canonical insert (`events`, `neg_items`, `recorded_events`) + `project_queue` enqueue in one transaction,
    - commit, then drain `project_queue`.
 2. project worker/drain:
-   - claim batch, project each event in autocommit (`valid|block|reject`), batch-dequeue successes, mark retry on failure. WAL autocheckpoint deferred during drain (skipped in low_mem mode).
+   - claim batch, project each event in autocommit (`valid|block|reject`), batch-dequeue successes, mark retry on failure. `project_queue` stores priority metadata but currently only uses lane priority at claim time: foreground before bulk, then FIFO within the lane (`priority_lane`, then `available_at`, then `rowid`) so dependency-heavy foreground chains are not recency-reordered. WAL autocheckpoint deferred during drain (skipped in low_mem mode).
 3. egress worker:
-   - claim per connection, send frame, mark sent or retry.
+   - claim a leased batch per connection/session-owner, send frame, mark sent or retry. `egress_queue` prioritizes foreground over bulk and can use recency ordering within the lane (`priority_lane`, then `priority_ts DESC`) because send scheduling does not have the same dependency-order constraint as projection.
 4. cleanup worker:
    - reclaim expired leases, purge stale/sent operational rows, TTL endpoint cleanup.
 
@@ -1169,7 +1169,8 @@ Egress rows are produced by:
 1. negentropy reconciliation decisions (`runtime/sync_engine/session/control_plane.rs`),
 2. incoming `HaveList` responses and need buffering (`runtime/sync_engine/session/initiator.rs`),
 3. control protocol producers (`Frame::NegOpen`, `Frame::NegMsg`, `Frame::HaveList`, `Frame::Done`, `Frame::DataDone`, `Frame::DoneAck`, `Frame::IntroOffer`) in `shared/protocol.rs`,
-4. optional proactive send pathways (future optimization hooks in this queue model).
+4. direct local enqueue of newly-created shared events to all currently-known remote peers for the tenant,
+5. optional proactive send pathways (future optimization hooks in this queue model).
 
 For canonical event transfer, egress rows carry `event_id`; canonical blob is read at send time.
 
@@ -1178,7 +1179,10 @@ For canonical event transfer, egress rows carry `event_id`; canonical blob is re
 1. `project_queue` is transient and purged on terminal decision (`Valid`, `Reject`, or `AlreadyProcessed` for the `(peer_id, event_id)` projection target),
 2. enqueue uses dedupe guards and skips terminal/blocked states,
 3. duplicate enqueue races are safe via `INSERT OR IGNORE` plus terminal fast-drop checks,
-4. `attempts` is retry bookkeeping (backoff, lease recovery, alert thresholds), not business truth.
+4. queue lane classification uses outer semantic type, not decrypted projector output; for encrypted wrappers the runtime reads the wrapper-exposed `inner_type_code`, so encrypted `file_slice` rows are still lane `bulk` without needing decryption,
+5. bulk must not monopolize projection or send scheduling, but foreground order is preserved within a lane,
+6. concurrent sessions release only their own `egress_queue` leases; they do not wipe the peer queue,
+7. `attempts` is retry bookkeeping (backoff, lease recovery, alert thresholds), not business truth.
 
 ## 7.5 Atomicity boundaries
 
@@ -1293,9 +1297,14 @@ inconsistent view during block rebuilding.
 Baseline implementation:
 1. `neg_items` stores shared-event membership tuples (`workspace_id`, timestamp, event id bytes).
 2. Per-session block indexes are rebuilt into `session_blocks` for reconciliation rounds.
-3. Control-plane reconciliation uses `NegOpen` and `NegMsg` frames; results drive `HaveList`.
-4. Data-plane transfer streams `Event` frames while reconciliation can continue in parallel.
-5. Multi-source coordination does not replace negentropy; it consumes per-peer `need_ids` discovered by negentropy.
+3. Control-plane reconciliation uses `NegOpen` and `NegMsg` frames; the first `NegOpen` may carry a small `P7SW` window envelope that selects one of three ranges over the same event universe:
+   - `Full`: no timestamp filter,
+   - `Hot`: `ts >= cutoff_ms`,
+   - `Cold`: `ts < cutoff_ms`.
+4. The first outbound session to a `(db_path, peer_id)` pair is `Full`; later sessions are usually `Hot`, with a `Cold` sweep injected on a slower cadence. Legacy raw `NegOpen` payloads are interpreted as `Full`.
+5. Data-plane transfer streams `Event` frames while reconciliation can continue in parallel.
+6. Multi-source coordination does not replace negentropy; it consumes per-peer `need_ids` discovered by negentropy.
+7. Hot/cold windows are a cadence optimization only. They do not create separate event universes, separate dependency graphs, or separate completion protocols.
 
 Primary code references:
 1. `src/runtime/sync_engine/negentropy_sqlite.rs`

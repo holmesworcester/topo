@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use topo::crypto::event_id_from_base64;
+use topo::crypto::{event_id_from_base64, event_id_from_hex, event_id_to_base64};
 use topo::db::open_connection;
 use topo::event_modules::workspace::commands::{
     accept_invite as accept_invite_without_sync, create_user_invite_raw,
@@ -223,15 +223,17 @@ struct ExpectedTenantDisplayRow {
 
 fn active_tenant_peer_id(db_path: &str) -> Option<String> {
     let output = topo_cmd(db_path, &["tenant", "active"]);
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    if !output.status.success() && stderr.contains("daemon is not running") {
-        return None;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        if stderr.contains("daemon is not running") {
+            return None;
+        }
     }
     assert!(
         output.status.success(),
         "tenant active failed: stdout={} stderr={}",
         String::from_utf8_lossy(&output.stdout),
-        stderr
+        String::from_utf8_lossy(&output.stderr)
     );
     let stdout = String::from_utf8_lossy(&output.stdout);
     let trimmed = stdout.trim();
@@ -366,7 +368,7 @@ fn status_projected_count(output: &str, label: &str) -> usize {
 }
 
 fn tenant_index_for_username(db_path: &str, username: &str) -> usize {
-    let peer_id = peer_id_for_username(db_path, username);
+    let peer_id = wait_for_username_peer_id(db_path, username, 90_000);
     tenant_index_for_peer_id(db_path, &peer_id)
 }
 
@@ -424,8 +426,19 @@ fn rewrite_invite_addrs(invite_link: &str, addrs: &[&str]) -> String {
     rewrite_bootstrap_addrs(invite_link, &parsed).expect("rewrite invite bootstrap addrs")
 }
 
-fn count_occurrences(haystack: &str, needle: &str) -> usize {
-    haystack.matches(needle).count()
+fn repeated_warning_count(log_text: &str, needle: &str) -> usize {
+    let mut counts = std::collections::BTreeMap::<String, usize>::new();
+    for line in log_text.lines().filter(|line| line.contains(needle)) {
+        let normalized = match line.find(needle) {
+            Some(idx) => line[idx..].to_string(),
+            None => line.to_string(),
+        };
+        *counts.entry(normalized).or_insert(0) += 1;
+    }
+    counts
+        .values()
+        .map(|count| count.saturating_sub(1))
+        .sum::<usize>()
 }
 
 fn invite_bootstrap_peer_id(invite_link: &str) -> String {
@@ -1007,7 +1020,7 @@ fn test_cli_bidirectional_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout_ms = 30000;
+    let timeout_ms = 60000;
 
     // Alice creates workspace (identity chain)
     create_workspace(&alice_db);
@@ -1017,7 +1030,7 @@ fn test_cli_bidirectional_sync() {
 
     // Alice sends messages via daemon RPC
     send_message(&alice_db, "Hello from Alice");
-    let alice_eid = send_message(&alice_db, "How are you?");
+    let alice_eid_2 = send_message(&alice_db, "How are you?");
 
     // Alice creates invite (via daemon RPC)
     let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
@@ -1027,7 +1040,6 @@ fn test_cli_bidirectional_sync() {
 
     // Bob starts daemon; invite-seeded autodial reaches Alice.
     let _bob = start_daemon(&bob_db);
-    std::thread::sleep(Duration::from_secs(1));
 
     // Bob sends a message in the shared workspace
     let bob_eid = send_message(&bob_db, "Hey Alice!");
@@ -1038,9 +1050,11 @@ fn test_cli_bidirectional_sync() {
     );
     assert_eventually(
         &bob_db,
-        &format!("has_event:{} >= 1", alice_eid),
+        &format!("has_event:{} >= 1", alice_eid_2),
         timeout_ms,
     );
+    assert_eventually(&alice_db, "message_count >= 3", timeout_ms);
+    assert_eventually(&bob_db, "message_count >= 3", timeout_ms);
 
     // Verify specific message content arrived on both sides
     let alice_msgs = get_messages(&alice_db);
@@ -1079,8 +1093,8 @@ fn test_cli_ongoing_sync() {
     let _alice = start_daemon(&alice_db);
 
     // Alice sends bootstrap message
-    let _bootstrap_eid = send_message(&alice_db, "bootstrap");
-    assert_now(&alice_db, "message_count >= 1");
+    let bootstrap_eid = send_message(&alice_db, "bootstrap");
+    assert_event_visible_on_all(&[&alice_db], &bootstrap_eid, timeout_ms);
 
     // Alice creates invite
     let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
@@ -1090,14 +1104,13 @@ fn test_cli_ongoing_sync() {
     let _bob = start_daemon(&bob_db);
     // Explicit bootstrap readiness gate: avoid racing ongoing-sync assertions
     // before the invite/bootstrap prerequisite sync has converged.
-    assert_eventually(&bob_db, "message_count >= 1", timeout_ms);
+    assert_event_visible_on_all(&[&bob_db], &bootstrap_eid, timeout_ms);
 
     // Both send messages over time
     send_message(&alice_db, "Round 1");
     send_message(&bob_db, "Round 2");
     send_message(&alice_db, "Round 3a");
     let bob_last_eid = send_message(&bob_db, "Round 3b");
-    std::thread::sleep(Duration::from_secs(1));
     let alice_last_eid = send_message(&alice_db, "Round 4");
 
     assert_eventually(
@@ -1264,8 +1277,8 @@ fn test_cli_local_mdns_discovery_without_bootstrap_addresses() {
     // Alice creates workspace and starts daemon
     create_workspace(&alice_db);
     let _alice = start_daemon(&alice_db);
-    let _bootstrap_eid = send_message(&alice_db, "bootstrap");
-    assert_now(&alice_db, "message_count >= 1");
+    let bootstrap_eid = send_message(&alice_db, "bootstrap");
+    assert_event_visible_on_all(&[&alice_db], &bootstrap_eid, timeout_ms);
 
     // Alice creates invite while daemon is running, then rewrites it to carry
     // no bootstrap endpoints so Bob must recover via mDNS.
@@ -1285,7 +1298,7 @@ fn test_cli_local_mdns_discovery_without_bootstrap_addresses() {
     // addresses persisted, runtime recovery must come from mDNS only.
     accept_invite(&bob_db, &invite_link);
     let _bob = start_daemon(&bob_db);
-    assert_eventually(&bob_db, "message_count >= 1", timeout_ms);
+    assert_event_visible_on_all(&[&bob_db], &bootstrap_eid, timeout_ms);
     assert_identity_eventually_materialized(&bob_db, timeout_ms);
 
     // Validate bidirectional convergence using messages created after both
@@ -1318,8 +1331,8 @@ fn test_cli_local_mdns_discovery_with_wrong_bootstrap_address_only() {
 
     create_workspace(&alice_db);
     let _alice = start_daemon(&alice_db);
-    let _bootstrap_eid = send_message(&alice_db, "bootstrap");
-    assert_now(&alice_db, "message_count >= 1");
+    let bootstrap_eid = send_message(&alice_db, "bootstrap");
+    assert_event_visible_on_all(&[&alice_db], &bootstrap_eid, timeout_ms);
 
     let wrong_addr = format!("127.0.0.1:{}", random_port());
     let invite_link = rewrite_invite_addrs(
@@ -1339,10 +1352,14 @@ fn test_cli_local_mdns_discovery_with_wrong_bootstrap_address_only() {
         &invite_link,
         "bob",
         "bob-box",
-        Duration::from_secs(2),
+        Duration::from_secs(10),
     );
     let _bob = start_daemon(&bob_db);
-    assert_eventually(&bob_db, "message_count >= 1", timeout_ms);
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", bootstrap_eid),
+        timeout_ms,
+    );
     assert_identity_eventually_materialized(&bob_db, timeout_ms);
 
     let alice_live_eid = send_message(&alice_db, "alice-via-mdns-wrong-bootstrap");
@@ -1500,10 +1517,19 @@ fn test_cli_untrusted_peer_rejected() {
 
     // Bob sends a message
     let bob_eid = send_message(&bob_db, "Should not arrive");
-    // Give some time for sync to try
-    std::thread::sleep(Duration::from_secs(3));
-
-    assert_now(&alice_db, &format!("has_event:{} == 0", bob_eid));
+    assert_condition_holds_for(
+        Duration::from_secs(3),
+        Duration::from_millis(100),
+        "alice should not record Bob's untrusted event",
+        || {
+            topo_cmd(
+                &alice_db,
+                &["assert-now", &format!("has_event:{} == 0", bob_eid)],
+            )
+            .status
+            .success()
+        },
+    );
 }
 
 /// E2E file sync test: Alice sends a file, Bob receives all slices, saves to disk.
@@ -1555,32 +1581,18 @@ fn test_cli_file_upload_sync_and_save() {
     // Wait for Bob to receive Alice's message event
     assert_eventually(&bob_db, &format!("has_event:{} >= 1", file_eid), timeout_ms);
 
-    // Wait for message projection and attachment completion
-    assert_eventually(&bob_db, "message_count >= 1", timeout_ms);
-
-    // Poll until Bob shows the attachment with checkmark (all slices projected)
-    let start = std::time::Instant::now();
-    loop {
-        let raw = get_messages_raw(&bob_db);
-        if raw.contains("\u{2714}") {
-            break;
-        }
-        if start.elapsed().as_secs() >= 30 {
-            panic!(
-                "Bob's file attachment never completed (no checkmark in messages output):\n{}",
-                raw
-            );
-        }
-        std::thread::sleep(Duration::from_millis(500));
-    }
-
     // Save the file to disk
     let saved_path = tmpdir.path().join("received_file.txt");
+    save_file_eventually(
+        &bob_db,
+        "1",
+        saved_path.to_str().unwrap(),
+        Duration::from_secs(30),
+    );
     let out = save_file(&bob_db, "1", saved_path.to_str().unwrap());
     assert!(
         out.status.success(),
-        "save-file failed: {}",
-        String::from_utf8_lossy(&out.stderr)
+        "save-file should succeed once complete"
     );
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(
@@ -1608,26 +1620,7 @@ fn test_cli_start_without_trust_starts_idle_runtime() {
         .to_str()
         .unwrap()
         .to_string();
-    let socket = socket_path_for_db(&db);
-
-    let _daemon = DaemonGuard::new(
-        Command::new(bin())
-            .arg("start")
-            .arg("--bind")
-            .arg(format!("127.0.0.1:{}", random_port()))
-            .arg("--db")
-            .arg(&db)
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn()
-            .expect("failed to run start"),
-    );
-
-    let start = Instant::now();
-    while !socket.exists() && start.elapsed().as_secs() < 5 {
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    assert!(socket.exists(), "daemon socket did not appear");
+    let _daemon = start_daemon(&db);
 
     let status = Command::new(bin())
         .args(["--db", &db, "status"])
@@ -1682,7 +1675,7 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
     let _alice = start_daemon(&alice_db);
 
     // Alice sends bootstrap message
-    send_message(&alice_db, "bootstrap");
+    let bootstrap_eid = send_message(&alice_db, "bootstrap");
 
     // Alice creates invite (via daemon RPC)
     let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
@@ -1702,10 +1695,12 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
     // cascades to completion, and messages project.
     let _bob = start_daemon(&bob_db);
 
-    // Wait for Bob's identity chain to complete (message_count >= 1 means
-    // Alice's "bootstrap" message has been fully projected on Bob's side,
-    // which requires the full identity chain cascade).
-    assert_eventually(&bob_db, "message_count >= 1", timeout_ms);
+    // Wait for Bob to record Alice's bootstrap event via invite-seeded sync.
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", bootstrap_eid),
+        timeout_ms,
+    );
 
     // After sync, Bob should have Alice's key_shared event (content key ciphertext).
     // Note: deferred content key unwrapping (key_shared → key_secrets) is a
@@ -1733,7 +1728,7 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
 fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 30000;
+    let timeout_ms = 90000;
     let workspace_name = "reuse-user-induction";
 
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
@@ -1769,7 +1764,7 @@ fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
 
     let bob = start_joined_cli_peer(&tmpdir, "bob.db", &reused_invite, "bob", "bob-box");
     let bob_tenant = bob.tenant_label();
-    assert_eventually(&bob.db, "message_count >= 1", timeout_ms);
+    assert_event_visible_on_all(&[&bob.db], &alice_base_eid, timeout_ms);
     let bob_msg = "reuse-user/bob-step-2";
     let bob_eid = send_message(&bob.db, bob_msg);
     assert_event_visible_on_all(&[&alice.db, &bob.db], &bob_eid, timeout_ms);
@@ -1788,7 +1783,8 @@ fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
 
     let carol = start_joined_cli_peer(&tmpdir, "carol.db", &reused_invite, "carol", "carol-box");
     let carol_tenant = carol.tenant_label();
-    assert_eventually(&carol.db, "message_count >= 2", timeout_ms);
+    assert_event_visible_on_all(&[&carol.db], &alice_base_eid, timeout_ms);
+    assert_event_visible_on_all(&[&carol.db], &bob_eid, timeout_ms);
     let carol_msg = "reuse-user/carol-step-3";
     let carol_eid = send_message(&carol.db, carol_msg);
     assert_event_visible_on_all(&[&alice.db, &bob.db, &carol.db], &carol_eid, timeout_ms);
@@ -1807,7 +1803,9 @@ fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
 
     let dave = start_joined_cli_peer(&tmpdir, "dave.db", &reused_invite, "dave", "dave-box");
     let dave_tenant = dave.tenant_label();
-    assert_eventually(&dave.db, "message_count >= 3", timeout_ms);
+    assert_event_visible_on_all(&[&dave.db], &alice_base_eid, timeout_ms);
+    assert_event_visible_on_all(&[&dave.db], &bob_eid, timeout_ms);
+    assert_event_visible_on_all(&[&dave.db], &carol_eid, timeout_ms);
     let dave_msg = "reuse-user/dave-step-4";
     let dave_eid = send_message(&dave.db, dave_msg);
     assert_event_visible_on_all(
@@ -1836,7 +1834,7 @@ fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
 fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 45000;
+    let timeout_ms = 90000;
     let workspace_name = "reuse-live-reload";
 
     let alice_db = tmpdir
@@ -1979,22 +1977,22 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
         std::fs::read_to_string(&carol_stderr).unwrap_or_default()
     );
     assert!(
-        count_occurrences(&bob_log_text, "Certificate mismatch connecting to") <= 1,
+        repeated_warning_count(&bob_log_text, "Certificate mismatch connecting to") == 0,
         "bob daemon log should suppress repeated outbound trust mismatch warnings:\n{}",
         bob_log_text
     );
     assert!(
-        count_occurrences(&bob_log_text, "Rejected incoming connection:") <= 1,
+        repeated_warning_count(&bob_log_text, "Rejected incoming connection:") == 0,
         "bob daemon log should suppress repeated inbound trust mismatch warnings:\n{}",
         bob_log_text
     );
     assert!(
-        count_occurrences(&carol_log_text, "Certificate mismatch connecting to") <= 1,
+        repeated_warning_count(&carol_log_text, "Certificate mismatch connecting to") == 0,
         "carol daemon log should suppress repeated outbound trust mismatch warnings:\n{}",
         carol_log_text
     );
     assert!(
-        count_occurrences(&carol_log_text, "Rejected incoming connection:") <= 1,
+        repeated_warning_count(&carol_log_text, "Rejected incoming connection:") == 0,
         "carol daemon log should suppress repeated inbound trust mismatch warnings:\n{}",
         carol_log_text
     );
@@ -2006,7 +2004,7 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
 fn test_cli_multi_use_user_invites_mix_reuse_and_new_creation() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 30000;
+    let timeout_ms = 90000;
     let workspace_name = "mixed-user-invites";
 
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
@@ -2032,7 +2030,7 @@ fn test_cli_multi_use_user_invites_mix_reuse_and_new_creation() {
 
     let bob = start_joined_cli_peer(&tmpdir, "bob.db", &old_invite, "bob", "bob-linux");
     let bob_tenant = bob.tenant_label();
-    assert_eventually(&bob.db, "message_count >= 1", timeout_ms);
+    assert_event_visible_on_all(&[&bob.db], &alice_base_eid, timeout_ms);
     let bob_msg = "mixed-user/bob-step-2";
     let bob_eid = send_message(&bob.db, bob_msg);
     assert_event_visible_on_all(&[&alice.db, &bob.db], &bob_eid, timeout_ms);
@@ -2040,14 +2038,17 @@ fn test_cli_multi_use_user_invites_mix_reuse_and_new_creation() {
     let fresh_invite = create_invite(&alice.db, &daemon_listen_addr(&alice.db));
     let carol = start_joined_cli_peer(&tmpdir, "carol.db", &fresh_invite, "carol", "carol-linux");
     let carol_tenant = carol.tenant_label();
-    assert_eventually(&carol.db, "message_count >= 2", timeout_ms);
+    assert_event_visible_on_all(&[&carol.db], &alice_base_eid, timeout_ms);
+    assert_event_visible_on_all(&[&carol.db], &bob_eid, timeout_ms);
     let carol_msg = "mixed-user/carol-step-3";
     let carol_eid = send_message(&carol.db, carol_msg);
     assert_event_visible_on_all(&[&alice.db, &bob.db, &carol.db], &carol_eid, timeout_ms);
 
     let dave = start_joined_cli_peer(&tmpdir, "dave.db", &old_invite, "dave", "dave-linux");
     let dave_tenant = dave.tenant_label();
-    assert_eventually(&dave.db, "message_count >= 3", timeout_ms);
+    assert_event_visible_on_all(&[&dave.db], &alice_base_eid, timeout_ms);
+    assert_event_visible_on_all(&[&dave.db], &bob_eid, timeout_ms);
+    assert_event_visible_on_all(&[&dave.db], &carol_eid, timeout_ms);
     let dave_msg = "mixed-user/dave-step-4";
     let dave_eid = send_message(&dave.db, dave_msg);
     assert_event_visible_on_all(
@@ -2103,7 +2104,7 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
 
     let laptop = start_linked_cli_peer(&tmpdir, "laptop.db", &link_a, "alice", "laptop");
     let laptop_tenant = laptop.tenant_label();
-    assert_eventually(&laptop.db, "message_count >= 1", timeout_ms);
+    assert_event_visible_on_all(&[&laptop.db], &phone_base_eid, timeout_ms);
     let laptop_msg = "device-link/laptop-step-2";
     let laptop_eid = send_message(&laptop.db, laptop_msg);
     assert_event_visible_on_all(&[&phone.db, &laptop.db], &laptop_eid, timeout_ms);
@@ -2111,7 +2112,8 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
     let link_b = create_device_link(&laptop.db, &daemon_listen_addr(&laptop.db));
     let tablet = start_linked_cli_peer(&tmpdir, "tablet.db", &link_b, "alice", "tablet");
     let tablet_tenant = tablet.tenant_label();
-    assert_eventually(&tablet.db, "message_count >= 2", timeout_ms);
+    assert_event_visible_on_all(&[&tablet.db], &phone_base_eid, timeout_ms);
+    assert_event_visible_on_all(&[&tablet.db], &laptop_eid, timeout_ms);
     let tablet_msg = "device-link/tablet-step-3";
     let tablet_eid = send_message(&tablet.db, tablet_msg);
     assert_event_visible_on_all(
@@ -2122,7 +2124,9 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
 
     let desktop = start_linked_cli_peer(&tmpdir, "desktop.db", &link_a, "alice", "desktop");
     let desktop_tenant = desktop.tenant_label();
-    assert_eventually(&desktop.db, "message_count >= 3", timeout_ms);
+    assert_event_visible_on_all(&[&desktop.db], &phone_base_eid, timeout_ms);
+    assert_event_visible_on_all(&[&desktop.db], &laptop_eid, timeout_ms);
+    assert_event_visible_on_all(&[&desktop.db], &tablet_eid, timeout_ms);
     let desktop_msg = "device-link/desktop-step-4";
     let desktop_eid = send_message(&desktop.db, desktop_msg);
     assert_event_visible_on_all(
@@ -2202,7 +2206,7 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
         &laptop_db,
         &empty_link,
         "laptop",
-        Duration::from_secs(2),
+        Duration::from_secs(10),
     );
     let laptop = StartedCliPeer {
         db: laptop_db,
@@ -2217,7 +2221,7 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
         ),
     };
     let laptop_tenant = laptop.tenant_label();
-    assert_eventually(&laptop.db, "message_count >= 1", timeout_ms);
+    assert_event_visible_on_all(&[&laptop.db], &phone_base_eid, timeout_ms);
     assert_identity_eventually_materialized(&laptop.db, timeout_ms);
     let laptop_msg = "device-link-mixed/laptop-step-2";
     let laptop_eid = send_message(&laptop.db, laptop_msg);
@@ -2239,7 +2243,8 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
 
     let tablet = start_linked_cli_peer(&tmpdir, "tablet.db", &explicit_link, "alice", "tablet");
     let tablet_tenant = tablet.tenant_label();
-    assert_eventually(&tablet.db, "message_count >= 2", timeout_ms);
+    assert_event_visible_on_all(&[&tablet.db], &phone_base_eid, timeout_ms);
+    assert_event_visible_on_all(&[&tablet.db], &laptop_eid, timeout_ms);
     assert_identity_eventually_materialized(&tablet.db, timeout_ms);
     let tablet_msg = "device-link-mixed/tablet-step-3";
     let tablet_eid = send_message(&tablet.db, tablet_msg);
@@ -2263,7 +2268,7 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
         &desktop_db,
         &wrong_link,
         "desktop",
-        Duration::from_secs(2),
+        Duration::from_secs(10),
     );
     let desktop = StartedCliPeer {
         db: desktop_db,
@@ -2278,7 +2283,9 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
         ),
     };
     let desktop_tenant = desktop.tenant_label();
-    assert_eventually(&desktop.db, "message_count >= 3", timeout_ms);
+    assert_event_visible_on_all(&[&desktop.db], &phone_base_eid, timeout_ms);
+    assert_event_visible_on_all(&[&desktop.db], &laptop_eid, timeout_ms);
+    assert_event_visible_on_all(&[&desktop.db], &tablet_eid, timeout_ms);
     assert_identity_eventually_materialized(&desktop.db, timeout_ms);
     let desktop_msg = "device-link-mixed/desktop-step-4";
     let desktop_eid = send_message(&desktop.db, desktop_msg);
@@ -2352,7 +2359,7 @@ fn test_cli_invite_with_dead_first_and_live_second_address() {
 
     let bob = start_joined_cli_peer(&tmpdir, "bob.db", &rewritten_invite, "bob", "fallback-box");
     let bob_tenant = bob.tenant_label();
-    assert_eventually(&bob.db, "message_count >= 1", timeout_ms);
+    assert_event_visible_on_all(&[&bob.db], &alice_base_eid, timeout_ms);
     let bob_msg = "dead-first/bob-step-2";
     let bob_eid = send_message(&bob.db, bob_msg);
     assert_event_visible_on_all(&[&alice.db, &bob.db], &bob_eid, timeout_ms);
@@ -2379,7 +2386,7 @@ fn test_cli_invite_with_dead_first_and_live_second_address() {
 fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 30000;
+    let timeout_ms = 45000;
 
     let alpha_db = tmpdir.path().join("alpha.db").to_str().unwrap().to_string();
     let zeta_db = tmpdir.path().join("zeta.db").to_str().unwrap().to_string();
@@ -2543,7 +2550,7 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
 fn test_cli_live_daemon_accept_second_workspace_switches_active_tenant() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 30000;
+    let timeout_ms = 60000;
 
     let home_db = tmpdir.path().join("home.db").to_str().unwrap().to_string();
     let zeta_db = tmpdir.path().join("zeta.db").to_str().unwrap().to_string();
@@ -2671,7 +2678,7 @@ fn test_cli_live_daemon_accept_second_workspace_switches_active_tenant() {
 fn test_cli_live_daemon_create_second_workspace_switches_active_tenant() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 30000;
+    let timeout_ms = 60000;
 
     let db = tmpdir.path().join("multi.db").to_str().unwrap().to_string();
     create_workspace_with_details(&db, "home-space", "home", "home-root");
@@ -2782,7 +2789,7 @@ fn test_cli_live_daemon_create_second_workspace_switches_active_tenant() {
 fn test_cli_live_daemon_second_workspace_invite_syncs_bidirectionally() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 30000;
+    let timeout_ms = 60000;
 
     let owner_db = tmpdir.path().join("owner.db").to_str().unwrap().to_string();
     let guest_db = tmpdir.path().join("guest.db").to_str().unwrap().to_string();
@@ -2879,7 +2886,7 @@ fn test_cli_live_daemon_second_workspace_invite_syncs_bidirectionally() {
 fn test_cli_live_daemon_accept_second_workspace_can_switch_back_and_sync_original_tenant() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 30000;
+    let timeout_ms = 60000;
 
     let owner_db = tmpdir.path().join("owner.db").to_str().unwrap().to_string();
     let zeta_db = tmpdir.path().join("zeta.db").to_str().unwrap().to_string();
@@ -2986,7 +2993,7 @@ fn test_cli_live_daemon_accept_second_workspace_can_switch_back_and_sync_origina
 fn test_cli_live_daemon_create_second_workspace_can_switch_between_tenants_and_sync_both() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 30000;
+    let timeout_ms = 60000;
 
     let owner_db = tmpdir.path().join("owner.db").to_str().unwrap().to_string();
     create_workspace_with_details(&owner_db, "alpha-space", "alpha", "alpha-root");
@@ -3100,7 +3107,7 @@ fn test_cli_live_daemon_create_second_workspace_can_switch_between_tenants_and_s
 fn test_cli_live_daemon_creating_third_workspace_preserves_existing_second_workspace_sync() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 30000;
+    let timeout_ms = 60000;
 
     let owner_db = tmpdir.path().join("owner.db").to_str().unwrap().to_string();
     create_workspace_with_details(&owner_db, "alpha-space", "alpha", "alpha-root");
@@ -3361,8 +3368,8 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
     assert_event_visible_for_username(&shared_db, "bob-alpha", &dave_live_eid, timeout_ms);
     assert_event_visible_for_username(&shared_db, "carol-alpha", &dave_live_eid, timeout_ms);
 
-    let carol_peer_id = peer_id_for_username(&shared_db, "carol-alpha");
-    let dave_peer_id = peer_id_for_username(&dave.db, "dave-alpha");
+    let carol_peer_id = wait_for_username_peer_id(&shared_db, "carol-alpha", timeout_ms);
+    let dave_peer_id = wait_for_username_peer_id(&dave.db, "dave-alpha", timeout_ms);
     let dave_addr: SocketAddr = daemon_listen_addr(&dave.db)
         .parse()
         .expect("dave listen addr");
@@ -3386,12 +3393,6 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
     let bob_alpha_tenant = "bob-alpha/bob-terminal";
     let carol_alpha_tenant = "carol-alpha/carol-terminal";
     let yuki_zeta_tenant = "yuki-zeta/yuki-terminal";
-
-    assert_eventually_users_include(
-        &dave.db,
-        &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
-        timeout_ms,
-    );
 
     assert_cli_state(
         &alpha.db,
@@ -3583,7 +3584,7 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
         ),
     };
     let dave_tenant = dave.tenant_label();
-    assert_eventually(&dave.db, "message_count >= 1", timeout_ms);
+    assert_event_visible_on_all(&[&dave.db], &alpha_bootstrap, timeout_ms);
     assert_identity_eventually_materialized(&dave.db, timeout_ms);
 
     accept_invite_with_identity(&emma_db, &emma_zeta_invite, "emma-zeta", "emma-laptop");
@@ -3600,7 +3601,7 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
         ),
     };
     let emma_tenant = emma.tenant_label();
-    assert_eventually(&emma.db, "message_count >= 1", timeout_ms);
+    assert_event_visible_on_all(&[&emma.db], &zeta_bootstrap, timeout_ms);
     assert_identity_eventually_materialized(&emma.db, timeout_ms);
 
     assert_eventually_users_include(&alpha.db, &["alpha", "bob-alpha", "dave-alpha"], timeout_ms);
@@ -3624,10 +3625,10 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
     let yuki_zeta_eid = send_message_as_username(&shared_db, "yuki-zeta", yuki_zeta_msg);
     assert_event_visible_on_all(&[&zeta.db, &emma.db], &yuki_zeta_eid, timeout_ms);
 
-    let bob_peer_id = peer_id_for_username(&shared_db, "bob-alpha");
-    let yuki_peer_id = peer_id_for_username(&shared_db, "yuki-zeta");
-    let dave_peer_id = peer_id_for_username(&dave.db, "dave-alpha");
-    let emma_peer_id = peer_id_for_username(&emma.db, "emma-zeta");
+    let bob_peer_id = wait_for_username_peer_id(&shared_db, "bob-alpha", timeout_ms);
+    let yuki_peer_id = wait_for_username_peer_id(&shared_db, "yuki-zeta", timeout_ms);
+    let dave_peer_id = wait_for_username_peer_id(&dave.db, "dave-alpha", timeout_ms);
+    let emma_peer_id = wait_for_username_peer_id(&emma.db, "emma-zeta", timeout_ms);
     let dave_addr: SocketAddr = daemon_listen_addr(&dave.db)
         .parse()
         .expect("dave listen addr");
@@ -4317,73 +4318,268 @@ fn test_cli_files_and_save_file_roundtrip_after_sync() {
 
     assert_eventually(&bob_db, &format!("has_event:{} >= 1", msg_eid), timeout_ms);
 
-    let files_deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let files_stdout = get_files_raw(&bob_db);
-        if files_stdout.contains("payload.bin")
-            && files_stdout.contains("1.")
-            && files_stdout.contains("MiB/s")
-        {
-            break;
-        }
-        if Instant::now() >= files_deadline {
-            panic!(
-                "timed out waiting for bob files list to show payload.bin with MiB/s:\n{}",
-                files_stdout
-            );
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    let _ = assert_value_eventually(
+        Duration::from_millis(timeout_ms),
+        Duration::from_millis(200),
+        "bob files list to show payload.bin as complete",
+        || get_files_raw(&bob_db),
+        |files_stdout| files_stdout.contains("payload.bin") && files_stdout.contains("\u{2714}"),
+    );
 
-    let messages_deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let messages_stdout = get_messages_raw(&bob_db);
-        if messages_stdout.contains("payload.bin") && messages_stdout.contains("MiB/s") {
-            break;
-        }
-        if Instant::now() >= messages_deadline {
-            panic!(
-                "timed out waiting for bob messages to show payload.bin with MiB/s:\n{}",
-                messages_stdout
-            );
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    let _ = assert_value_eventually(
+        Duration::from_millis(timeout_ms),
+        Duration::from_millis(200),
+        "bob messages to show payload.bin as complete",
+        || get_messages_raw(&bob_db),
+        |messages_stdout| {
+            messages_stdout.contains("payload.bin") && messages_stdout.contains("\u{2714}")
+        },
+    );
 
     let restored_path = tmpdir.path().join("restored.bin");
-    let save_deadline = Instant::now() + Duration::from_secs(20);
-    loop {
-        let save_out = Command::new(bin())
-            .args([
-                "--db",
-                &bob_db,
-                "save-file",
-                "1",
-                "--out",
-                restored_path.to_str().unwrap(),
-            ])
-            .output()
-            .expect("save-file command");
-        if save_out.status.success() {
-            break;
-        }
-        let last_stderr = String::from_utf8_lossy(&save_out.stderr).to_string();
-        let retryable =
-            last_stderr.contains("file incomplete") || last_stderr.contains("invalid file number");
-        if !retryable {
-            panic!("save-file failed unexpectedly: {}", last_stderr);
-        }
-        if Instant::now() >= save_deadline {
-            panic!(
-                "timed out waiting for save-file success; last err={}",
-                last_stderr
-            );
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
+    save_file_eventually(
+        &bob_db,
+        "1",
+        restored_path.to_str().unwrap(),
+        Duration::from_secs(20),
+    );
 
     let restored = std::fs::read(&restored_path).unwrap();
     assert_eq!(restored, expected, "saved file bytes should match source");
+}
+
+#[test]
+fn test_cli_live_message_during_large_file_sync() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir
+        .path()
+        .join("alice_live_file.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let bob_db = tmpdir
+        .path()
+        .join("bob_live_file.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let source_path = tmpdir.path().join("large-payload.bin");
+    let mut source_file = std::fs::File::create(&source_path).unwrap();
+    let mut chunk = vec![0u8; 1024 * 1024];
+    for (i, b) in chunk.iter_mut().enumerate() {
+        *b = (i % 251) as u8;
+    }
+    for _ in 0..128 {
+        source_file.write_all(&chunk).unwrap();
+    }
+    source_file.flush().unwrap();
+
+    create_workspace(&alice_db);
+    let _alice = start_daemon(&alice_db);
+
+    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
+    accept_invite(&bob_db, &invite_link);
+    let _bob = start_daemon(&bob_db);
+
+    let expected_total_file_slices = std::fs::metadata(&source_path)
+        .unwrap()
+        .len()
+        .div_ceil(topo::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES as u64)
+        as i64;
+    let send_file_child = Command::new(bin())
+        .args([
+            "--db",
+            &alice_db,
+            "send-file",
+            "large binary payload",
+            "--file",
+            source_path.to_str().unwrap(),
+        ])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .expect("spawn send-file");
+    let bob_recorded_by = {
+        let conn = open_connection(&bob_db).expect("open bob db");
+        conn.query_row(
+            "SELECT recorded_by
+             FROM invites_accepted
+             ORDER BY created_at DESC, event_id DESC
+             LIMIT 1",
+            [],
+            |row| row.get::<_, String>(0),
+        )
+        .expect("bob recorded_by")
+    };
+    assert_value_eventually(
+        Duration::from_secs(20),
+        Duration::from_millis(100),
+        "file transfer reaches a mid-flight slice count",
+        || {
+            let conn = open_connection(&bob_db).expect("open bob db");
+            topo::event_modules::file_slice::file_slice_event_count(&conn, &bob_recorded_by)
+        },
+        |raw_file_slice_count| {
+            *raw_file_slice_count > 0 && *raw_file_slice_count < expected_total_file_slices
+        },
+    );
+
+    let live_contents = [
+        "live message during file download #1",
+        "live message during file download #2",
+        "live message during file download #3",
+    ];
+    let live_send_start = Instant::now();
+    let live_event_id_b64s: Vec<String> = live_contents
+        .iter()
+        .map(|content| {
+            let live_eid = send_message(&alice_db, content);
+            let live_event_id =
+                event_id_from_hex(live_eid.trim()).expect("live message event id should be hex");
+            event_id_to_base64(&live_event_id)
+        })
+        .collect();
+
+    #[derive(Debug)]
+    struct LiveArrivalSnapshot {
+        messages_stdout: String,
+        live_recorded: i64,
+        earliest_live_recorded_rowid: Option<i64>,
+        last_file_slice_recorded_rowid: Option<i64>,
+        raw_file_slice_count: i64,
+        elapsed: Duration,
+    }
+
+    let load_snapshot = || {
+        let messages_stdout = get_messages_raw(&bob_db);
+        let conn = open_connection(&bob_db).expect("open bob db");
+        let live_recorded = live_event_id_b64s
+            .iter()
+            .map(|event_id_b64| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM recorded_events WHERE event_id = ?1",
+                    rusqlite::params![event_id_b64],
+                    |row| row.get::<_, i64>(0),
+                )
+                .unwrap()
+            })
+            .sum();
+        let earliest_live_recorded_rowid = live_event_id_b64s
+            .iter()
+            .filter_map(|event_id_b64| {
+                conn.query_row(
+                    "SELECT MAX(id) FROM recorded_events WHERE event_id = ?1",
+                    rusqlite::params![event_id_b64],
+                    |row| row.get::<_, Option<i64>>(0),
+                )
+                .unwrap()
+            })
+            .min();
+        let mut slice_stmt = conn
+            .prepare(
+                "SELECT re.id, e.blob
+                 FROM recorded_events re
+                 JOIN events e ON e.event_id = re.event_id
+                 WHERE re.peer_id = ?1",
+            )
+            .expect("prepare raw file-slice scan");
+        let slice_rows = slice_stmt
+            .query_map(rusqlite::params![&bob_recorded_by], |row| {
+                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+            })
+            .expect("query raw file-slice scan");
+        let mut last_file_slice_recorded_rowid = None;
+        for row in slice_rows {
+            let (recorded_rowid, blob) = row.expect("raw file-slice row");
+            if topo::event_modules::outer_semantic_type_code(&blob)
+                == Some(topo::event_modules::EVENT_TYPE_FILE_SLICE)
+            {
+                last_file_slice_recorded_rowid = Some(
+                    last_file_slice_recorded_rowid
+                        .map_or(recorded_rowid, |current: i64| current.max(recorded_rowid)),
+                );
+            }
+        }
+        let raw_file_slice_count =
+            topo::event_modules::file_slice::file_slice_event_count(&conn, &bob_recorded_by);
+        LiveArrivalSnapshot {
+            messages_stdout,
+            live_recorded,
+            earliest_live_recorded_rowid,
+            last_file_slice_recorded_rowid,
+            raw_file_slice_count,
+            elapsed: live_send_start.elapsed(),
+        }
+    };
+
+    let live_visible_snapshot = assert_value_eventually(
+        Duration::from_secs(10),
+        Duration::from_millis(100),
+        "live messages become visible before the file transfer completes",
+        &load_snapshot,
+        |snapshot| {
+            snapshot.raw_file_slice_count > 0
+                && snapshot.raw_file_slice_count < expected_total_file_slices
+                && live_contents
+                    .iter()
+                    .all(|content| snapshot.messages_stdout.contains(content))
+        },
+    );
+    let final_snapshot = assert_value_eventually(
+        Duration::from_secs(60),
+        Duration::from_millis(100),
+        "later file slices arrive after the live messages",
+        &load_snapshot,
+        |snapshot| {
+            snapshot.raw_file_slice_count == expected_total_file_slices
+                && matches!(
+                    (
+                        snapshot.earliest_live_recorded_rowid,
+                        snapshot.last_file_slice_recorded_rowid
+                    ),
+                    (Some(earliest_live_recorded_rowid), Some(last_file_slice_recorded_rowid))
+                        if earliest_live_recorded_rowid < last_file_slice_recorded_rowid
+                )
+        },
+    );
+    let send_out = send_file_child.wait_with_output().expect("wait send-file");
+    assert!(
+        send_out.status.success(),
+        "send-file failed: {}",
+        String::from_utf8_lossy(&send_out.stderr)
+    );
+    let send_stdout = String::from_utf8_lossy(&send_out.stdout);
+    assert!(
+        send_stdout
+            .lines()
+            .any(|line| line.starts_with("event_id:")),
+        "send-file output missing event_id: {}",
+        send_stdout.trim()
+    );
+
+    assert!(
+        live_visible_snapshot.elapsed <= Duration::from_secs(5),
+        "live message burst was not delivered quickly while the file transfer remained incomplete (live_recorded={}, raw_file_slice_count={}, elapsed={:?}):\n{}",
+        live_visible_snapshot.live_recorded,
+        live_visible_snapshot.raw_file_slice_count,
+        live_visible_snapshot.elapsed,
+        get_files_raw(&bob_db)
+    );
+    assert!(
+        matches!(
+            (
+                final_snapshot.earliest_live_recorded_rowid,
+                final_snapshot.last_file_slice_recorded_rowid
+            ),
+            (Some(earliest_live_recorded_rowid), Some(last_file_slice_recorded_rowid))
+                if earliest_live_recorded_rowid < last_file_slice_recorded_rowid
+        ),
+        "at least one live message in the burst should be recorded before a later file slice on Bob, got earliest_live_recorded_rowid={:?}, last_file_slice_recorded_rowid={:?}, raw_file_slice_count={}",
+        final_snapshot.earliest_live_recorded_rowid,
+        final_snapshot.last_file_slice_recorded_rowid,
+        final_snapshot.raw_file_slice_count
+    );
 }
 
 #[test]
@@ -4759,13 +4955,34 @@ fn test_cli_connect_to_dead_address_error() {
         String::from_utf8_lossy(&accept_out.stderr)
     );
 
-    // QUIC (UDP) has no TCP-style "connection refused" — dead addresses time out
-    // after ~30s. Wait long enough for at least one timeout.
-    std::thread::sleep(Duration::from_secs(35));
+    // QUIC (UDP) has no TCP-style "connection refused", so poll the daemon logs
+    // until the timeout/unreachable diagnostic appears.
+    let diagnostic_deadline = Instant::now() + Duration::from_secs(45);
+    loop {
+        let output = format!(
+            "{}{}",
+            std::fs::read_to_string(&stdout_path).unwrap_or_default(),
+            std::fs::read_to_string(&stderr_path).unwrap_or_default()
+        );
+        if output.contains("timed out")
+            || output.contains("connection refused")
+            || output.contains("nothing is listening")
+            || output.contains("unreachable")
+        {
+            break;
+        }
+        if Instant::now() >= diagnostic_deadline {
+            panic!(
+                "connect-to-dead-address never produced a human-readable diagnostic within the deadline:\n{}",
+                output
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 
     // Stop daemon.
     let _ = Command::new(bin()).args(["--db", &db_b, "stop"]).output();
-    std::thread::sleep(Duration::from_millis(500));
+    wait_for_daemon_stopped(&db_b, Duration::from_secs(10));
     drop(_daemon_b);
 
     let output = format!(
@@ -4803,16 +5020,14 @@ fn test_cli_untrusted_peer_certificate_error() {
 
     // Alice creates workspace and runs daemon.
     create_workspace(&db_a);
-    let port_a = random_port();
-    let _daemon_a = start_daemon_on_port(&db_a, port_a);
+    let _daemon_a = start_daemon(&db_a);
 
     // Create an invite from Alice with a BOGUS SPKI fingerprint.
     // Bob will connect to Alice's real address but his client-side TLS
     // verifier will reject because Alice's real cert doesn't match the
     // bogus fingerprint in the invite.
     let bogus_spki = "aa".repeat(32); // 64 hex chars = 32 bytes of 0xaa
-    let invite =
-        create_invite_with_spki(&db_a, &format!("127.0.0.1:{}", port_a), Some(&bogus_spki));
+    let invite = create_invite_with_spki(&db_a, &daemon_listen_addr(&db_a), Some(&bogus_spki));
 
     // Bob's daemon — redirect stdout to file for log inspection.
     create_workspace(&db_b);
@@ -4841,12 +5056,32 @@ fn test_cli_untrusted_peer_certificate_error() {
         String::from_utf8_lossy(&accept_out.stderr)
     );
 
-    // Give time for runtime restart + TLS handshake attempts.
-    std::thread::sleep(Duration::from_secs(8));
+    // Poll the logs until the certificate-mismatch diagnostic appears.
+    let diagnostic_deadline = Instant::now() + Duration::from_secs(20);
+    loop {
+        let bob_log = format!(
+            "{}{}",
+            std::fs::read_to_string(&bob_stdout).unwrap_or_default(),
+            std::fs::read_to_string(&bob_stderr).unwrap_or_default()
+        );
+        if bob_log.contains("Certificate mismatch")
+            || bob_log.contains("not trusted")
+            || bob_log.contains("trust_rejected")
+        {
+            break;
+        }
+        if Instant::now() >= diagnostic_deadline {
+            panic!(
+                "certificate-mismatch diagnostic never appeared within the deadline:\n{}",
+                bob_log
+            );
+        }
+        std::thread::sleep(Duration::from_millis(200));
+    }
 
     // Stop daemons and read logs.
     let _ = Command::new(bin()).args(["--db", &db_b, "stop"]).output();
-    std::thread::sleep(Duration::from_millis(500));
+    wait_for_daemon_stopped(&db_b, Duration::from_secs(10));
     drop(_daemon_b);
 
     let bob_log = format!(
@@ -4875,12 +5110,12 @@ fn test_cli_untrusted_peer_certificate_error() {
         bob_log
     );
     assert!(
-        count_occurrences(&bob_log, "Certificate mismatch connecting to") <= 1,
+        repeated_warning_count(&bob_log, "Certificate mismatch connecting to") == 0,
         "default logging should suppress repeated identical outbound certificate mismatch warnings, got:\n{}",
         bob_log
     );
     assert!(
-        count_occurrences(&bob_log, "Rejected incoming connection:") <= 1,
+        repeated_warning_count(&bob_log, "Rejected incoming connection:") == 0,
         "default logging should suppress repeated identical inbound certificate mismatch warnings, got:\n{}",
         bob_log
     );

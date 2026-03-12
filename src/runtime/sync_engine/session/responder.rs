@@ -31,7 +31,11 @@ use crate::tuning::{low_mem_memtrace, low_mem_mode};
 use super::control_plane::send_done_ack;
 use super::data_plane::{drain_egress_to_data_stream, send_data_done, spawn_data_receiver};
 use super::logging::SyncRunRxCapture;
-use super::{negentropy_frame_size, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS};
+use super::windowing::{decode_initial_neg_open, SyncWindow, SyncWindowKind};
+use super::{
+    negentropy_frame_size, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_QUIET_WINDOW,
+    EGRESS_SENT_TTL_MS,
+};
 
 fn should_treat_as_startup_control_abort(
     rounds: u64,
@@ -52,6 +56,7 @@ pub async fn run_sync_responder<C, S, R>(
     session_id: u64,
     db_path: &str,
     timeout_secs: u64,
+    session_owner: &str,
     peer_id: &str,
     recorded_by: &str,
     ingress_source_tag: &str,
@@ -81,19 +86,6 @@ where
     let use_snapshot = !low_mem_mode();
 
     let egress = EgressQueue::new(&db);
-    let stale_egress = egress.count_pending(peer_id).unwrap_or(0);
-    if stale_egress > 0 {
-        warn!(
-            "Session {} responder clearing peer-scoped state peer={} stale_egress={}",
-            session_id, peer_id, stale_egress
-        );
-    }
-    if let Err(err) = egress.clear_connection(peer_id) {
-        warn!(
-            "Session {} responder failed to clear peer-scoped egress peer={} error={}",
-            session_id, peer_id, err
-        );
-    }
 
     let ws_id = lookup_workspace_id(&db, recorded_by).ok_or_else(|| {
         format!(
@@ -102,42 +94,53 @@ where
         )
     })?;
 
-    // Spawn reconciliation on a dedicated OS thread.
-    // neg_db, neg_storage, neg are !Send (SQLite + RefCell) so they must
-    // live entirely on one thread. The worker receives NegMsg bytes, runs
-    // reconcile(), and sends the response bytes back.
     let db_path_for_neg = db_path.to_string();
     let ws_id_for_neg = ws_id.clone();
-    let (neg_req_tx, neg_req_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-    let (neg_resp_tx, neg_resp_rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
-
-    let neg_worker = std::thread::spawn(move || {
-        let neg_db = open_connection(&db_path_for_neg).expect("neg worker: open_connection");
-        let neg_storage = NegentropyStorageSqlite::new(&neg_db, &ws_id_for_neg);
-        if use_snapshot {
-            neg_db.execute("BEGIN", []).expect("neg worker: BEGIN");
-        }
-        neg_storage
-            .rebuild_blocks()
-            .expect("neg worker: rebuild_blocks");
-
-        let item_count = neg_storage.size().unwrap_or(0);
-        info!("Negentropy storage has {} items (responder)", item_count);
-
-        let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), negentropy_frame_size())
-            .expect("neg worker: Negentropy::new");
-
-        while let Ok(msg) = neg_req_rx.recv() {
-            let result = neg.reconcile(&msg).map_err(|e| format!("{}", e));
-            if neg_resp_tx.send(result).is_err() {
-                break;
+    let mut neg_req_tx: Option<std::sync::mpsc::Sender<Vec<u8>>> = None;
+    let mut neg_resp_rx: Option<std::sync::mpsc::Receiver<Result<Vec<u8>, String>>> = None;
+    let mut neg_worker: Option<std::thread::JoinHandle<()>> = None;
+    let spawn_neg_worker = |window: SyncWindow| {
+        let (req_tx, req_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
+        let db_path = db_path_for_neg.clone();
+        let ws_id = ws_id_for_neg.clone();
+        let handle = std::thread::spawn(move || {
+            let neg_db = open_connection(&db_path).expect("neg worker: open_connection");
+            let neg_storage = match window.kind {
+                SyncWindowKind::Full => NegentropyStorageSqlite::new(&neg_db, &ws_id),
+                _ => NegentropyStorageSqlite::new_with_range(
+                    &neg_db,
+                    &ws_id,
+                    window.ts_min(),
+                    window.ts_max_exclusive(),
+                ),
+            };
+            if use_snapshot {
+                neg_db.execute("BEGIN", []).expect("neg worker: BEGIN");
             }
-        }
+            neg_storage
+                .rebuild_blocks()
+                .expect("neg worker: rebuild_blocks");
 
-        if use_snapshot {
-            let _ = neg_db.execute("COMMIT", []);
-        }
-    });
+            let item_count = neg_storage.size().unwrap_or(0);
+            info!("Negentropy storage has {} items (responder)", item_count);
+
+            let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), negentropy_frame_size())
+                .expect("neg worker: Negentropy::new");
+
+            while let Ok(msg) = req_rx.recv() {
+                let result = neg.reconcile(&msg).map_err(|e| format!("{}", e));
+                if resp_tx.send(result).is_err() {
+                    break;
+                }
+            }
+
+            if use_snapshot {
+                let _ = neg_db.execute("COMMIT", []);
+            }
+        });
+        (req_tx, resp_rx, handle)
+    };
 
     let store = Store::new(&db);
 
@@ -170,6 +173,7 @@ where
     let memtrace_file = std::env::var("LOW_MEM_MEMTRACE_FILE").ok();
     let mut last_memtrace = Instant::now();
     let mut last_alloc_trim = Instant::now();
+    let mut egress_quiet_since: Option<Instant> = None;
 
     loop {
         // Data receiver runs in a separate task — check if it received data
@@ -189,7 +193,11 @@ where
 
         // Check for reconciliation response from worker thread
         if reconciling {
-            match neg_resp_rx.try_recv() {
+            match neg_resp_rx
+                .as_ref()
+                .expect("neg responder worker missing")
+                .try_recv()
+            {
                 Ok(Ok(response)) => {
                     reconciling = false;
                     last_activity = Instant::now();
@@ -217,11 +225,30 @@ where
         }
 
         match tokio::time::timeout(CONTROL_POLL_TIMEOUT, control.recv()).await {
-            Ok(Ok(Frame::NegOpen { msg })) | Ok(Ok(Frame::NegMsg { msg })) => {
+            Ok(Ok(Frame::NegOpen { msg })) => {
                 last_activity = Instant::now();
                 rounds += 1;
-                // Hand off to worker thread — non-blocking
+                let (window, inner_msg) =
+                    decode_initial_neg_open(&msg).map_err(|e| format!("bad NegOpen: {e}"))?;
+                if neg_req_tx.is_none() {
+                    let (req_tx, resp_rx, handle) = spawn_neg_worker(window);
+                    neg_req_tx = Some(req_tx);
+                    neg_resp_rx = Some(resp_rx);
+                    neg_worker = Some(handle);
+                }
                 neg_req_tx
+                    .as_ref()
+                    .expect("neg worker sender missing")
+                    .send(inner_msg.to_vec())
+                    .map_err(|_| "neg worker channel closed".to_string())?;
+                reconciling = true;
+            }
+            Ok(Ok(Frame::NegMsg { msg })) => {
+                last_activity = Instant::now();
+                rounds += 1;
+                neg_req_tx
+                    .as_ref()
+                    .ok_or_else(|| "received NegMsg before NegOpen".to_string())?
                     .send(msg)
                     .map_err(|_| "neg worker channel closed".to_string())?;
                 reconciling = true;
@@ -262,9 +289,8 @@ where
 
         // Drain egress to data stream — runs even while worker is reconciling
         let send_stats =
-            drain_egress_to_data_stream(session_id, &egress, &store, peer_id, &mut data_send)
-                .await
-                .map_err(|e| format!("failed to drain egress: {e}"))?;
+            drain_egress_to_data_stream(&egress, &store, peer_id, session_owner, &mut data_send)
+                .await;
         events_sent += send_stats.events_sent_delta;
         bytes_sent += send_stats.bytes_sent_delta;
         if send_stats.events_sent_delta > 0 {
@@ -330,51 +356,41 @@ where
                 }
             };
             if pending_out == 0 {
-                send_data_done(&mut data_send).await?;
+                let quiet_since = egress_quiet_since.get_or_insert_with(Instant::now);
+                if quiet_since.elapsed() >= EGRESS_QUIET_WINDOW {
+                    send_data_done(&mut data_send).await?;
 
-                let drain_timeout = DATA_DRAIN_TIMEOUT;
-                match tokio::time::timeout(drain_timeout, data_drained_rx).await {
-                    Ok(Ok(())) => info!("Inbound data fully drained"),
-                    Ok(Err(_)) => info!("Data drain channel dropped (receiver already exited)"),
-                    Err(_) => warn!("Timed out waiting for inbound data drain"),
+                    let drain_timeout = DATA_DRAIN_TIMEOUT;
+                    match tokio::time::timeout(drain_timeout, data_drained_rx).await {
+                        Ok(Ok(())) => info!("Inbound data fully drained"),
+                        Ok(Err(_)) => info!("Data drain channel dropped (receiver already exited)"),
+                        Err(_) => warn!("Timed out waiting for inbound data drain"),
+                    }
+
+                    send_done_ack(&mut control).await?;
+                    info!(
+                        "Sent DoneAck (sent {}, received {})",
+                        events_sent,
+                        events_received.load(Ordering::Relaxed)
+                    );
+                    completed = true;
+                    break;
                 }
-
-                send_done_ack(&mut control).await?;
-                info!(
-                    "Sent DoneAck (sent {}, received {})",
-                    events_sent,
-                    events_received.load(Ordering::Relaxed)
-                );
-                completed = true;
-                break;
+            } else {
+                egress_quiet_since = None;
             }
         }
     }
 
+    let _ = egress.release_leases(peer_id, session_owner);
     if completed {
-        let stale_egress = egress.count_pending(peer_id).unwrap_or(0);
-        if stale_egress > 0 {
-            warn!(
-                "Session {} responder cleanup dropping peer-scoped state peer={} stale_egress={}",
-                session_id, peer_id, stale_egress
-            );
-        }
-        if let Err(err) = egress.clear_connection(peer_id) {
-            warn!(
-                "Session {} responder cleanup failed to clear peer-scoped egress peer={} error={}",
-                session_id, peer_id, err
-            );
-        }
-        if let Err(err) = egress.cleanup_sent(EGRESS_SENT_TTL_MS) {
-            warn!(
-                "Session {} responder cleanup failed to prune sent egress peer={} error={}",
-                session_id, peer_id, err
-            );
-        }
+        let _ = egress.cleanup_sent(EGRESS_SENT_TTL_MS);
     }
     // Drop the request channel to signal the worker to exit
     drop(neg_req_tx);
-    let _ = neg_worker.join();
+    if let Some(handle) = neg_worker {
+        let _ = handle.join();
+    }
     let _ = shutdown_tx.send(());
     let _ = recv_handle.await;
     drop(ingest_tx);
