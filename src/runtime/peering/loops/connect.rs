@@ -27,8 +27,8 @@ use super::supervisor::{
     SessionTenantResolver,
 };
 use super::{
-    current_timestamp_ms, peer_fingerprint_from_hex, IntroSpawnerFn, CONNECT_RETRY_DELAY,
-    ENDPOINT_TTL_MS, SYNC_SESSION_TIMEOUT_SECS,
+    claim_live_connection_slot, current_timestamp_ms, peer_fingerprint_from_hex, IntroSpawnerFn,
+    CONNECT_RETRY_DELAY, ENDPOINT_TTL_MS, SYNC_SESSION_TIMEOUT_SECS,
 };
 
 const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
@@ -354,6 +354,30 @@ async fn connect_loop_inner(
                 continue;
             }
         };
+        let connection_lease = match claim_live_connection_slot(
+            db_path,
+            recorded_by,
+            &peer_id,
+            SessionDirection::Outbound,
+            connection.clone(),
+        ) {
+            super::LiveConnectionClaim::Acquired(lease) => lease,
+            super::LiveConnectionClaim::Occupied(occupied) => {
+                info!(
+                    "Closing duplicate outbound connection to {} (active_direction={:?}, preferred_direction={:?})",
+                    peer_id,
+                    occupied.active_direction,
+                    occupied.preferred_direction
+                );
+                connection.close(0u32.into(), b"duplicate peer connection");
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = occupied.released.notified() => {}
+                    _ = tokio::time::sleep(CONNECT_RETRY_DELAY) => {}
+                }
+                continue;
+            }
+        };
         info!("Connected to {}", peer_id);
         reset_outbound_window_state(db_path, &peer_id);
 
@@ -415,6 +439,7 @@ async fn connect_loop_inner(
             max_sessions,
         )
         .await;
+        drop(connection_lease);
     }
 
     Ok(())

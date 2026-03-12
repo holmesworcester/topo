@@ -22,8 +22,8 @@ use super::supervisor::{
     SessionTenantResolver,
 };
 use super::{
-    current_timestamp_ms, peer_fingerprint_from_hex, IntroSpawnerFn, ENDPOINT_TTL_MS,
-    SYNC_SESSION_TIMEOUT_SECS,
+    claim_live_connection_slot, current_timestamp_ms, peer_fingerprint_from_hex, IntroSpawnerFn,
+    ENDPOINT_TTL_MS, SYNC_SESSION_TIMEOUT_SECS,
 };
 
 const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
@@ -213,6 +213,27 @@ async fn accept_loop_with_ingest_until_cancel_inner(
         };
 
         // Record endpoint observation, transport binding, and purge expired
+        let connection_lease = match claim_live_connection_slot(
+            db_path,
+            &recorded_by,
+            &peer_id,
+            SessionDirection::Inbound,
+            connection.clone(),
+        ) {
+            super::LiveConnectionClaim::Acquired(lease) => lease,
+            super::LiveConnectionClaim::Occupied(occupied) => {
+                info!(
+                    "Closing duplicate inbound connection from {} (active_direction={:?}, preferred_direction={:?})",
+                    peer_id,
+                    occupied.active_direction,
+                    occupied.preferred_direction
+                );
+                connection.close(0u32.into(), b"duplicate peer connection");
+                continue;
+            }
+        };
+
+        // Record endpoint observation, transport binding, and purge expired
         {
             let remote = connection.remote_address();
             let now = current_timestamp_ms();
@@ -256,6 +277,7 @@ async fn accept_loop_with_ingest_until_cancel_inner(
         let worker_cancel = worker_shutdown.clone();
 
         let join = std::thread::spawn(move || {
+            let _connection_lease = connection_lease;
             let runtime = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
