@@ -11,7 +11,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use tokio::sync::{mpsc, Mutex as AsyncMutex};
 use tokio_util::sync::CancellationToken;
-use tracing::info;
+use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
 use crate::contracts::peering_contract::SessionDirection;
@@ -19,8 +19,11 @@ use crate::db::health::purge_expired_endpoints;
 use crate::db::open_connection;
 use crate::db::project_queue::ProjectQueue;
 use crate::db::schema::create_tables;
+use crate::runtime::build_mismatch::note_build_mismatch;
 use crate::runtime::memtrace;
+use crate::runtime::repeated_warning::should_emit_globally;
 use crate::sync::SyncSessionHandler;
+use crate::transport::session_factory::extract_build_mismatch_reason;
 use crate::transport::SessionProvider;
 use crate::tuning::{low_mem_memtrace, low_mem_mode};
 
@@ -219,6 +222,23 @@ pub(super) async fn supervise_connection_sessions(
         } {
             Ok(session) => session,
             Err(e) => {
+                if let Some(reason) = extract_build_mismatch_reason(&e.to_string()) {
+                    note_build_mismatch(peer_id, reason);
+                    let key = format!(
+                        "session-build-mismatch:{:?}:{}:{}",
+                        direction, recorded_by, peer_id
+                    );
+                    if should_emit_globally(key) {
+                        warn!(
+                            "Peer {} rejected {:?} session on connection {}: {}",
+                            short_peer_id(peer_id),
+                            direction,
+                            connection.stable_id(),
+                            reason
+                        );
+                    }
+                    break;
+                }
                 info!(
                     "Connection {} dropped while opening next {:?} session: {}",
                     connection.stable_id(),

@@ -21,7 +21,9 @@ use crate::db::{
     wanted::WantedEvents,
 };
 use crate::protocol::Frame;
+use crate::runtime::build_mismatch::recent_build_mismatch_reason;
 use crate::runtime::memtrace;
+use crate::runtime::repeated_warning::should_emit_globally;
 use crate::runtime::SyncStats;
 use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
@@ -39,6 +41,14 @@ use super::data_plane::{
 };
 use super::logging::SyncRunRxCapture;
 use super::{negentropy_frame_size, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS};
+
+fn should_treat_as_startup_control_abort(
+    rounds: u64,
+    events_sent: u64,
+    bytes_received: &AtomicU64,
+) -> bool {
+    rounds == 0 && events_sent == 0 && bytes_received.load(Ordering::Relaxed) == 0
+}
 
 /// Run sync as the initiator (client role) with dual streams.
 /// Control stream: NegOpen, NegMsg, HaveList
@@ -245,11 +255,41 @@ where
             }
             Ok(Ok(_)) => {}
             Ok(Err(ConnectionError::Closed)) => {
-                info!("Control stream closed by peer");
+                if should_treat_as_startup_control_abort(rounds, events_sent, &bytes_received) {
+                    if let Some(reason) = recent_build_mismatch_reason(peer_id) {
+                        let key = format!("outbound-build-mismatch:{peer_id}");
+                        if should_emit_globally(key) {
+                            warn!(
+                                "Outbound sync to peer {} rejected: {}",
+                                &peer_id[..16.min(peer_id.len())],
+                                reason
+                            );
+                        }
+                    } else {
+                        info!("Control stream closed before sync started by peer");
+                    }
+                } else {
+                    info!("Control stream closed by peer");
+                }
                 break;
             }
             Ok(Err(e)) => {
-                warn!("Control stream error: {}", e);
+                if should_treat_as_startup_control_abort(rounds, events_sent, &bytes_received) {
+                    if let Some(reason) = recent_build_mismatch_reason(peer_id) {
+                        let key = format!("outbound-build-mismatch:{peer_id}");
+                        if should_emit_globally(key) {
+                            warn!(
+                                "Outbound sync to peer {} rejected: {}",
+                                &peer_id[..16.min(peer_id.len())],
+                                reason
+                            );
+                        }
+                    } else {
+                        info!("Control stream closed before sync started: {}", e);
+                    }
+                } else {
+                    warn!("Control stream error: {}", e);
+                }
                 break;
             }
             Err(_) => {}

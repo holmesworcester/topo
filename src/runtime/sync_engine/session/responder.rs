@@ -33,6 +33,14 @@ use super::data_plane::{drain_egress_to_data_stream, send_data_done, spawn_data_
 use super::logging::SyncRunRxCapture;
 use super::{negentropy_frame_size, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT, EGRESS_SENT_TTL_MS};
 
+fn should_treat_as_startup_control_abort(
+    rounds: u64,
+    events_sent: u64,
+    bytes_received: &AtomicU64,
+) -> bool {
+    rounds == 0 && events_sent == 0 && bytes_received.load(Ordering::Relaxed) == 0
+}
+
 /// Run sync as the responder (server role) with dual streams.
 ///
 /// Callers must provide a `shared_ingest` sender connected to a shared
@@ -233,11 +241,19 @@ where
             }
             Ok(Ok(_)) => {}
             Ok(Err(ConnectionError::Closed)) => {
-                info!("Control stream closed by peer");
+                if should_treat_as_startup_control_abort(rounds, events_sent, &bytes_received) {
+                    info!("Control stream closed before sync started by peer");
+                } else {
+                    info!("Control stream closed by peer");
+                }
                 break;
             }
             Ok(Err(e)) => {
-                warn!("Control stream error: {}", e);
+                if should_treat_as_startup_control_abort(rounds, events_sent, &bytes_received) {
+                    info!("Control stream closed before sync started: {}", e);
+                } else {
+                    warn!("Control stream error: {}", e);
+                }
                 break;
             }
             Err(_) => {}

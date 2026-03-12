@@ -1587,6 +1587,7 @@ fn spawn_runtime(
     let state_for_net = state.clone();
     tokio::spawn(async move {
         if let Ok(info) = net_rx.await {
+            println!("Build: {}", env!("TOPO_GIT_HASH"));
             println!("listen: {}", info.listen_addr);
             let listen_addr = info.listen_addr.parse::<SocketAddr>().ok();
             *state_for_net.runtime_net.write().unwrap() = Some(info);
@@ -1923,6 +1924,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 db,
                 socket_path.display()
             );
+            info!("Build: {}", env!("TOPO_GIT_HASH"));
 
             // Foreground Ctrl-C uses the same daemon shutdown path as RPC Shutdown.
             let ctrlc_notify = shutdown_notify.clone();

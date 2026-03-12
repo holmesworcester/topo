@@ -1,3 +1,4 @@
+pub(crate) mod build_mismatch;
 pub mod control;
 pub mod memtrace;
 pub mod peering;

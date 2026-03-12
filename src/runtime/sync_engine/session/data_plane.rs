@@ -29,6 +29,10 @@ pub struct DataPlaneSendStats {
     pub bytes_sent_delta: u64,
 }
 
+fn should_treat_as_startup_data_abort(events_ingested: u64, bytes_received: &AtomicU64) -> bool {
+    events_ingested == 0 && bytes_received.load(Ordering::Relaxed) == 0
+}
+
 fn should_capture_rx_event_link(blob: &[u8]) -> bool {
     crate::event_modules::outer_semantic_type_code(blob)
         == Some(crate::event_modules::EVENT_TYPE_FILE_SLICE)
@@ -255,7 +259,15 @@ where
                             break;
                         }
                         Err(e) => {
-                            warn!("Data stream error: {}", e);
+                            if should_treat_as_startup_data_abort(events_ingested, &bytes_received)
+                            {
+                                info!(
+                                    "Data stream closed before sync started source={} error={}",
+                                    source_tag, e
+                                );
+                            } else {
+                                warn!("Data stream error: {}", e);
+                            }
                             break;
                         }
                     }

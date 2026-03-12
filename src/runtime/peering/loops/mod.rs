@@ -36,7 +36,9 @@ use tracing::warn;
 use crate::contracts::peering_contract::{
     PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId, TransportSessionIo,
 };
+use crate::runtime::repeated_warning::should_emit_globally;
 use crate::sync::SyncSessionHandler;
+use crate::transport::session_factory::extract_build_mismatch_reason;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -129,7 +131,20 @@ pub(super) async fn run_session(
             SessionDirection::Outbound => "Initiator",
             SessionDirection::Inbound => "Responder",
         };
-        warn!("{} session error: {}", label, e);
+        if let Some(reason) = extract_build_mismatch_reason(&e) {
+            let peer_id = hex::encode(peer_fp);
+            let key = format!("session-build-mismatch:{label}:{peer_id}:{direction:?}");
+            if should_emit_globally(key) {
+                warn!(
+                    "{} session rejected by peer {}: {}",
+                    label,
+                    &peer_id[..16.min(peer_id.len())],
+                    reason
+                );
+            }
+        } else {
+            warn!("{} session error: {}", label, e);
+        }
     }
     cancel.cancel();
 }

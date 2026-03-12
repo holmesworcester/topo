@@ -15,15 +15,75 @@ const SESSION_STREAM_HEADER_MAGIC: [u8; 4] = *b"P7SS";
 const SESSION_STREAM_HEADER_VERSION: u8 = 2;
 // v2 header: [4 magic][1 version][1 kind][8 session_id][8 commit_hash] = 22 bytes
 const SESSION_STREAM_HEADER_LEN: usize = 22;
+const BUILD_MISMATCH_PREFIX: &str =
+    "Version negotiation is out of scope for this PoC -- builds must be from the same commit.";
+const CONNECTION_CLOSE_REASON_LIMIT: usize = 900;
 
 /// Build commit hash embedded at compile time (8 ASCII hex chars, zero-padded).
 fn local_commit_hash() -> [u8; 8] {
-    let hash_str = env!("TOPO_GIT_HASH");
+    let hash_str = local_commit_hash_str();
     let mut buf = [0u8; 8];
     let bytes = hash_str.as_bytes();
     let len = bytes.len().min(8);
     buf[..len].copy_from_slice(&bytes[..len]);
     buf
+}
+
+pub(crate) fn local_commit_hash_str() -> &'static str {
+    env!("TOPO_GIT_HASH")
+}
+
+pub(crate) fn local_commit_subject() -> &'static str {
+    env!("TOPO_GIT_SUBJECT")
+}
+
+fn format_build_label(hash: &str, subject: &str) -> String {
+    if subject.is_empty() || subject == "unknown" {
+        hash.to_string()
+    } else {
+        format!(r#"{hash} "{subject}""#)
+    }
+}
+
+fn local_build_label() -> String {
+    format_build_label(local_commit_hash_str(), local_commit_subject())
+}
+
+fn build_mismatch_reason_remote_protocol(remote_version: u8) -> String {
+    format!(
+        "{BUILD_MISMATCH_PREFIX} Local build: {}. Remote protocol version: v{}.",
+        local_build_label(),
+        remote_version
+    )
+}
+
+fn build_mismatch_reason_remote_hash(remote_hash: &str) -> String {
+    format!(
+        "{BUILD_MISMATCH_PREFIX} Local build: {}. Remote build: {}.",
+        local_build_label(),
+        remote_hash
+    )
+}
+
+pub(crate) fn extract_build_mismatch_reason(message: &str) -> Option<&str> {
+    message
+        .find(BUILD_MISMATCH_PREFIX)
+        .map(|idx| &message[idx..])
+}
+
+fn connection_close_reason(reason: &str) -> Vec<u8> {
+    let bytes = reason.as_bytes();
+    if bytes.len() <= CONNECTION_CLOSE_REASON_LIMIT {
+        return bytes.to_vec();
+    }
+
+    let mut end = CONNECTION_CLOSE_REASON_LIMIT.saturating_sub(3);
+    while !reason.is_char_boundary(end) && end > 0 {
+        end -= 1;
+    }
+    let mut truncated = reason[..end].to_string();
+    truncated.push_str("...");
+    truncated.into_bytes()
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,16 +179,9 @@ async fn read_session_stream_header(
     }
     let remote_version = prefix[4];
     if remote_version != SESSION_STREAM_HEADER_VERSION {
-        // Version 1 peers send 14-byte headers without commit hash.
-        // Provide a clear error instead of a cryptic stream read failure.
-        let hash_bytes = local_commit_hash();
-        let local_hash = String::from_utf8_lossy(&hash_bytes);
-        return Err(SessionOpenError::Protocol(format!(
-            "build version mismatch: remote peer is running a different build \
-             (protocol v{}, local v{}). Version negotiation is out of scope; \
-             both peers must run the same build (local={}). Aborting.",
-            remote_version, SESSION_STREAM_HEADER_VERSION, local_hash.trim_end_matches('\0')
-        )));
+        return Err(SessionOpenError::Protocol(
+            build_mismatch_reason_remote_protocol(remote_version),
+        ));
     }
     let kind = SessionStreamKind::from_byte(prefix[5])?;
 
@@ -144,14 +197,10 @@ async fn read_session_stream_header(
     let local_hash = local_commit_hash();
     let remote_hash = &rest[8..16];
     if remote_hash != &local_hash {
-        let local_str = String::from_utf8_lossy(&local_hash);
         let remote_str = String::from_utf8_lossy(remote_hash);
-        return Err(SessionOpenError::Protocol(format!(
-            "build version mismatch: local={} remote={}. \
-             Version negotiation is out of scope; both peers must run the same build. Aborting.",
-            local_str.trim_end_matches('\0'),
-            remote_str.trim_end_matches('\0')
-        )));
+        return Err(SessionOpenError::Protocol(
+            build_mismatch_reason_remote_hash(remote_str.trim_end_matches('\0')),
+        ));
     }
 
     Ok((u64::from_be_bytes(session_id_bytes), kind))
@@ -231,7 +280,17 @@ pub async fn accept_session_io(
             .accept_bi()
             .await
             .map_err(|e| SessionOpenError::ConnectionLost(format!("stream accept: {e}")))?;
-        let (session_id, kind) = read_session_stream_header(&mut recv).await?;
+        let (session_id, kind) = match read_session_stream_header(&mut recv).await {
+            Ok(header) => header,
+            Err(SessionOpenError::Protocol(message))
+                if extract_build_mismatch_reason(&message).is_some() =>
+            {
+                let reason = connection_close_reason(&message);
+                conn.close(1u32.into(), &reason);
+                return Err(SessionOpenError::Protocol(message));
+            }
+            Err(err) => return Err(err),
+        };
         if let Some(complete) = insert_pending_stream(state, session_id, kind, send, recv)? {
             let dual = DualConnection::new(
                 complete.control.0,
@@ -257,8 +316,10 @@ mod tests {
     };
 
     use super::{
-        accept_session_io, open_session_io, write_session_stream_header, InboundSessionState,
-        SessionStreamKind,
+        accept_session_io, local_commit_hash_str, local_commit_subject, open_session_io,
+        write_session_stream_header, InboundSessionState, SessionOpenError, SessionStreamKind,
+        BUILD_MISMATCH_PREFIX, SESSION_STREAM_HEADER_LEN, SESSION_STREAM_HEADER_MAGIC,
+        SESSION_STREAM_HEADER_VERSION,
     };
 
     async fn connected_pair() -> Result<
@@ -509,6 +570,78 @@ mod tests {
             super::SessionOpenError::Protocol(msg) => {
                 panic!("expected connection-lost error after close, got protocol error: {msg}");
             }
+        }
+    }
+
+    #[tokio::test]
+    async fn accept_session_io_reports_build_mismatch_and_closes_with_reason() {
+        let (_server_ep, server_conn, _client_ep, client_conn) =
+            connected_pair().await.expect("connected pair");
+        let inbound_state = InboundSessionState::default();
+
+        let remote_hash = if local_commit_hash_str() == "deadbeef" {
+            *b"badc0ffe"
+        } else {
+            *b"deadbeef"
+        };
+
+        let (mut ctrl_send, _ctrl_recv) = client_conn.open_bi().await.expect("open control bi");
+        let mut header = [0u8; SESSION_STREAM_HEADER_LEN];
+        header[..4].copy_from_slice(&SESSION_STREAM_HEADER_MAGIC);
+        header[4] = SESSION_STREAM_HEADER_VERSION;
+        header[5] = SessionStreamKind::Control.to_byte();
+        header[6..14].copy_from_slice(&77u64.to_be_bytes());
+        header[14..22].copy_from_slice(&remote_hash);
+        ctrl_send
+            .write_all(&header)
+            .await
+            .expect("write mismatched control header");
+        ctrl_send
+            .flush()
+            .await
+            .expect("flush mismatched control header");
+
+        let err = match accept_session_io(&server_conn, &inbound_state).await {
+            Ok(_) => panic!("accept should reject mismatched build"),
+            Err(err) => err,
+        };
+        let message = match err {
+            SessionOpenError::Protocol(message) => message,
+            other => panic!("expected protocol error, got {other}"),
+        };
+        assert!(
+            message.contains(BUILD_MISMATCH_PREFIX),
+            "expected human-readable build mismatch message: {message}"
+        );
+        assert!(
+            message.contains(local_commit_hash_str()),
+            "expected local commit hash in mismatch message: {message}"
+        );
+        assert!(
+            message.contains(local_commit_subject()),
+            "expected local commit subject in mismatch message: {message}"
+        );
+        assert!(
+            message.contains("deadbeef") || message.contains("badc0ffe"),
+            "expected remote hash in mismatch message: {message}"
+        );
+
+        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), client_conn.closed())
+            .await
+            .expect("client should observe connection close");
+        match closed {
+            quinn::ConnectionError::ApplicationClosed(close) => {
+                let reason = String::from_utf8_lossy(close.reason.as_ref());
+                assert!(
+                    reason.contains(BUILD_MISMATCH_PREFIX),
+                    "expected propagated close reason, got {reason}"
+                );
+                assert!(
+                    reason.contains(local_commit_hash_str()),
+                    "expected local build hash in close reason, got {reason}"
+                );
+            }
+            other => panic!("expected application close, got {other}"),
         }
     }
 }
