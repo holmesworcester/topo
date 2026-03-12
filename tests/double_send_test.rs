@@ -233,4 +233,20 @@ fn duplicate_sends_stay_below_regression_threshold() {
     eprintln!("  Total events_sent:  {total_events_sent}");
     eprintln!("  Duplication ratio:  {duplication_ratio:.2}x");
     eprintln!("  Alice runs:         {alice_outbound_runs} outbound, {alice_inbound_runs} inbound");
-    eprintln!("  Bob runs:           {bob_outbound_
+    eprintln!("  Bob runs:           {bob_outbound_runs} outbound, {bob_inbound_runs} inbound");
+    eprintln!();
+
+    assert!(
+        duplication_ratio < 1.50,
+        "duplicate sends regressed: ratio {duplication_ratio:.2}x for {N} messages"
+    );
+    assert_eq!(
+        alice_outbound_runs + bob_outbound_runs,
+        1,
+        "exactly one outbound sync run should carry the measured burst"
+    );
+    assert!(
+        alice_inbound_runs + bob_inbound_runs <= 1,
+        "the measured burst should not require more than one inbound sync run"
+    );
+}

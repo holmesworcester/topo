@@ -98,8 +98,11 @@ where
     for (rowid, event_id) in batch {
         if let Ok(Some(blob)) = store.get_shared(&event_id) {
             let blob_len = blob.len() as u64;
-            match tokio::time::timeout(DATA_SEND_STALL_TIMEOUT, data_send.send(&Frame::Event { blob }))
-                .await
+            match tokio::time::timeout(
+                DATA_SEND_STALL_TIMEOUT,
+                data_send.send(&Frame::Event { blob }),
+            )
+            .await
             {
                 Ok(Ok(())) => {
                     events_sent_delta += 1;
@@ -377,9 +380,8 @@ mod tests {
         let egress = EgressQueue::new(&conn);
         let store = Store::new(&conn);
         let mut send = sender;
-        let stats = drain_egress_to_data_stream(77, &egress, &store, "peer-a", &mut send)
-            .await
-            .unwrap();
+        let stats =
+            drain_egress_to_data_stream(&egress, &store, "peer-a", "sess-a", &mut send).await;
         lock_thread.join().unwrap();
         assert_eq!(stats.events_sent_delta, 1);
         assert_eq!(

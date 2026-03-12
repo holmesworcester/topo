@@ -378,8 +378,8 @@ impl<'a> EgressQueue<'a> {
 mod tests {
     use super::*;
     use crate::db::{open_connection, open_in_memory, schema::create_tables};
-    use std::time::Duration;
     use crate::event_modules::EVENT_TYPE_FILE_SLICE;
+    use std::time::Duration;
 
     fn setup() -> Connection {
         let conn = open_in_memory().unwrap();

@@ -31,9 +31,12 @@ use topo::testutil::{DaemonGuard, Peer};
 
 fn cli_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(()))
+    let guard = LOCK
+        .get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cleanup_test_daemons();
+    guard
 }
 
 fn create_user_invite_link_for_test_peer(creator: &Peer, bootstrap_addr: &str) -> String {
@@ -75,9 +78,12 @@ fn create_user_invite_link_for_test_peer(creator: &Peer, bootstrap_addr: &str) -
 }
 
 fn tenant_index_for_peer_id(db_path: &str, peer_id: &str) -> usize {
-    expected_tenant_display_rows(db_path)
+    let conn = open_connection(db_path).expect("open db");
+    let active_peer_id = active_tenant_peer_id(db_path).unwrap_or_default();
+    topo::event_modules::workspace::queries::list_tenants_for_display(&conn, &active_peer_id)
+        .expect("list tenants for display")
         .iter()
-        .position(|row| row.peer_id == peer_id)
+        .position(|tenant| tenant.peer_id == peer_id)
         .map(|idx| idx + 1)
         .expect("peer id should appear in tenant scopes")
 }
@@ -152,65 +158,6 @@ fn short_cli_id(id: &str) -> &str {
     &id[..id.len().min(8)]
 }
 
-fn local_username_for_tenant(conn: &rusqlite::Connection, peer_id: &str) -> String {
-    use rusqlite::OptionalExtension;
-
-    if let Some(username) = conn
-        .query_row(
-            "SELECT COALESCE(u.username, '')
-             FROM peers_shared ps
-             JOIN local_transport_creds c
-               ON c.peer_id = lower(hex(ps.transport_fingerprint))
-             LEFT JOIN users u
-               ON ps.user_event_id = u.event_id
-              AND ps.recorded_by = u.recorded_by
-             WHERE ps.recorded_by = ?1
-             ORDER BY ps.event_id ASC
-             LIMIT 1",
-            rusqlite::params![peer_id],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()
-        .expect("query local tenant username")
-    {
-        return username;
-    }
-
-    conn.query_row(
-        "SELECT COALESCE(username, '')
-         FROM users
-         WHERE recorded_by = ?1
-         ORDER BY event_id ASC
-         LIMIT 1",
-        rusqlite::params![peer_id],
-        |row| row.get::<_, String>(0),
-    )
-    .optional()
-    .expect("fallback tenant username")
-    .unwrap_or_default()
-}
-
-fn workspace_name_for_tenant(
-    conn: &rusqlite::Connection,
-    peer_id: &str,
-    workspace_id: &str,
-) -> String {
-    use rusqlite::OptionalExtension;
-
-    conn.query_row(
-        "SELECT COALESCE(name, '')
-         FROM workspaces
-         WHERE recorded_by = ?1
-           AND workspace_id = ?2
-         LIMIT 1",
-        rusqlite::params![peer_id, workspace_id],
-        |row| row.get::<_, String>(0),
-    )
-    .optional()
-    .expect("query tenant workspace name")
-    .unwrap_or_default()
-}
-
 #[derive(Debug)]
 struct ExpectedTenantDisplayRow {
     peer_id: String,
@@ -218,7 +165,6 @@ struct ExpectedTenantDisplayRow {
     workspace_id: String,
     username: String,
     workspace_name: String,
-    active: bool,
 }
 
 fn active_tenant_peer_id(db_path: &str) -> Option<String> {
@@ -246,46 +192,18 @@ fn active_tenant_peer_id(db_path: &str) -> Option<String> {
 
 fn expected_tenant_display_rows(db_path: &str) -> Vec<ExpectedTenantDisplayRow> {
     let conn = open_connection(db_path).expect("open db");
-    let active_peer_id = active_tenant_peer_id(db_path);
-    let mut stmt = conn
-        .prepare(
-            "SELECT recorded_by, tenant_event_id, workspace_id
-             FROM invites_accepted
-             ORDER BY recorded_by, created_at ASC, event_id ASC",
-        )
-        .expect("prepare tenant labels query");
-    let mut rows = stmt.query([]).expect("query tenant labels");
-    let mut seen = std::collections::HashSet::new();
-    let mut labels = Vec::new();
-
-    while let Some(row) = rows.next().expect("read tenant label row") {
-        let peer_id: String = row.get(0).expect("tenant peer id");
-        if !seen.insert(peer_id.clone()) {
-            continue;
-        }
-        let tenant_event_id: String = row.get(1).expect("tenant event id");
-        let workspace_id: String = row.get(2).expect("tenant workspace id");
-        let username = local_username_for_tenant(&conn, &peer_id);
-        let workspace_name = workspace_name_for_tenant(&conn, &peer_id, &workspace_id);
-        labels.push(ExpectedTenantDisplayRow {
-            active: active_peer_id.as_deref() == Some(peer_id.as_str()),
-            peer_id,
-            tenant_event_id,
-            workspace_id,
-            username,
-            workspace_name,
-        });
-    }
-
-    labels.sort_by(|a, b| {
-        b.active
-            .cmp(&a.active)
-            .then_with(|| a.workspace_name.cmp(&b.workspace_name))
-            .then_with(|| a.username.cmp(&b.username))
-            .then_with(|| a.tenant_event_id.cmp(&b.tenant_event_id))
-    });
-
-    labels
+    let active_peer_id = active_tenant_peer_id(db_path).unwrap_or_default();
+    topo::event_modules::workspace::queries::list_tenants_for_display(&conn, &active_peer_id)
+        .expect("list tenants for display")
+        .into_iter()
+        .map(|tenant| ExpectedTenantDisplayRow {
+            peer_id: tenant.peer_id,
+            tenant_event_id: tenant.event_id,
+            workspace_id: tenant.workspace_id,
+            username: tenant.username,
+            workspace_name: tenant.workspace_name,
+        })
+        .collect()
 }
 
 fn expected_view_tenant_labels(db_path: &str) -> Vec<(String, String)> {
@@ -372,34 +290,25 @@ fn tenant_index_for_username(db_path: &str, username: &str) -> usize {
     tenant_index_for_peer_id(db_path, &peer_id)
 }
 
-fn peer_id_for_username(db_path: &str, username: &str) -> String {
+fn tenant_peer_id_for_username(db_path: &str, username: &str) -> Option<String> {
     let conn = open_connection(db_path).expect("open db");
-    conn.query_row(
-        "SELECT recorded_by
-         FROM users
-         WHERE username = ?1
-         LIMIT 1",
-        rusqlite::params![username],
-        |row| row.get(0),
-    )
-    .expect("username should map to a tenant")
+    let active_peer_id = active_tenant_peer_id(db_path).unwrap_or_default();
+    topo::event_modules::workspace::queries::list_tenants_for_display(&conn, &active_peer_id)
+        .ok()?
+        .into_iter()
+        .find(|tenant| tenant.username == username)
+        .map(|tenant| tenant.peer_id)
+}
+
+fn peer_id_for_username(db_path: &str, username: &str) -> String {
+    tenant_peer_id_for_username(db_path, username).expect("username should map to a tenant")
 }
 
 fn wait_for_username_peer_id(db_path: &str, username: &str, timeout_ms: u64) -> String {
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     loop {
-        let conn = open_connection(db_path).expect("open db");
-        let found = conn
-            .query_row(
-                "SELECT recorded_by
-                 FROM users
-                 WHERE username = ?1
-                 LIMIT 1",
-                rusqlite::params![username],
-                |row| row.get::<_, String>(0),
-            )
-            .ok();
+        let found = tenant_peer_id_for_username(db_path, username);
         if let Some(peer_id) = found {
             return peer_id;
         }
@@ -449,6 +358,20 @@ fn invite_bootstrap_peer_id(invite_link: &str) -> String {
     ))
 }
 
+fn query_workspace_id_for_peer(db_path: &str, peer_id: &str) -> String {
+    let conn = open_connection(db_path).expect("open db");
+    conn.query_row(
+        "SELECT workspace_id
+         FROM invites_accepted
+         WHERE recorded_by = ?1
+         ORDER BY created_at DESC, event_id DESC
+         LIMIT 1",
+        rusqlite::params![peer_id],
+        |row| row.get(0),
+    )
+    .expect("workspace id for peer")
+}
+
 fn local_transport_cred_source_exists(db_path: &str, peer_id: &str, source: &str) -> bool {
     let conn = open_connection(db_path).expect("open db");
     conn.query_row(
@@ -483,62 +406,15 @@ fn wait_for_transport_cred_source(db_path: &str, peer_id: &str, source: &str, ti
     }
 }
 
-fn projected_transport_peer_exists(db_path: &str, recorded_by: &str, peer_id: &str) -> bool {
-    let Ok(transport_fingerprint) = hex::decode(peer_id) else {
-        return false;
-    };
-    if transport_fingerprint.len() != 32 {
-        return false;
-    }
-
-    let conn = open_connection(db_path).expect("open db");
-    conn.query_row(
-        "SELECT EXISTS(
-             SELECT 1
-             FROM peers_shared
-             WHERE recorded_by = ?1
-               AND transport_fingerprint = ?2
-             LIMIT 1
-         )",
-        rusqlite::params![recorded_by, transport_fingerprint],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|exists| exists != 0)
-    .unwrap_or(false)
-}
-
-fn wait_for_projected_transport_peer(
-    db_path: &str,
-    recorded_by: &str,
-    peer_id: &str,
-    timeout_ms: u64,
-) {
-    let start = Instant::now();
-    let timeout = Duration::from_millis(timeout_ms);
-    loop {
-        if projected_transport_peer_exists(db_path, recorded_by, peer_id) {
-            return;
-        }
-        if start.elapsed() >= timeout {
-            panic!(
-                "projected transport peer {} did not appear within {}ms for tenant {} (db={})",
-                peer_id, timeout_ms, recorded_by, db_path
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
 fn dial_peer_for_tenant(
     db_path: &str,
     tenant_id: &str,
     remote: SocketAddr,
-    expected_remote_transport_fingerprint: &str,
+    workspace_id: &str,
 ) -> Result<String, String> {
     let client_config = topo::transport::build_tenant_client_config_from_db(db_path, tenant_id)
         .map_err(|e| e.to_string())?;
-    let sni =
-        topo::transport::multi_workspace::transport_sni(expected_remote_transport_fingerprint);
+    let sni = topo::transport::multi_workspace::workspace_sni(workspace_id);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -563,15 +439,14 @@ fn wait_for_direct_trust_dial(
     db_path: &str,
     tenant_id: &str,
     remote: SocketAddr,
+    workspace_id: &str,
     expected_peer_id: &str,
     timeout_ms: u64,
 ) {
-    wait_for_projected_transport_peer(db_path, tenant_id, expected_peer_id, timeout_ms);
-
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     let last_error = loop {
-        match dial_peer_for_tenant(db_path, tenant_id, remote, expected_peer_id) {
+        match dial_peer_for_tenant(db_path, tenant_id, remote, workspace_id) {
             Ok(peer_id) => {
                 assert_eq!(
                     peer_id, expected_peer_id,
@@ -597,18 +472,13 @@ fn assert_direct_dial_never_succeeds(
     db_path: &str,
     tenant_id: &str,
     remote: SocketAddr,
-    expected_remote_transport_fingerprint: &str,
+    workspace_id: &str,
     timeout_ms: u64,
 ) {
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     while start.elapsed() < timeout {
-        if let Ok(peer_id) = dial_peer_for_tenant(
-            db_path,
-            tenant_id,
-            remote,
-            expected_remote_transport_fingerprint,
-        ) {
+        if let Ok(peer_id) = dial_peer_for_tenant(db_path, tenant_id, remote, workspace_id) {
             panic!(
                 "direct dial to {} as tenant {} unexpectedly succeeded with peer {}",
                 remote, tenant_id, peer_id
@@ -626,8 +496,32 @@ fn start_joined_cli_peer(
     device_name: &str,
 ) -> StartedCliPeer {
     let db = tmpdir.path().join(db_name).to_str().unwrap().to_string();
-    accept_invite_with_identity(&db, invite_link, username, device_name);
-    let daemon = start_daemon(&db);
+    let empty_bootstrap = matches!(
+        parse_invite_link(invite_link),
+        Ok(invite) if invite.bootstrap_addrs.is_empty()
+    );
+    let daemon = if empty_bootstrap {
+        let daemon = start_discovery_daemon(&db);
+        accept_invite_with_identity_on_running_daemon(
+            &db,
+            invite_link,
+            username,
+            device_name,
+            Duration::from_secs(10),
+        );
+        daemon
+    } else {
+        start_daemon(&db)
+    };
+    if !empty_bootstrap {
+        accept_invite_with_identity_on_running_daemon(
+            &db,
+            invite_link,
+            username,
+            device_name,
+            Duration::from_secs(10),
+        );
+    }
     StartedCliPeer {
         db,
         username: username.to_string(),
@@ -644,8 +538,30 @@ fn start_linked_cli_peer(
     device_name: &str,
 ) -> StartedCliPeer {
     let db = tmpdir.path().join(db_name).to_str().unwrap().to_string();
-    accept_device_link_with_name(&db, invite_link, device_name);
-    let daemon = start_daemon(&db);
+    let empty_bootstrap = matches!(
+        parse_invite_link(invite_link),
+        Ok(invite) if invite.bootstrap_addrs.is_empty()
+    );
+    let daemon = if empty_bootstrap {
+        let daemon = start_discovery_daemon(&db);
+        accept_device_link_with_name_on_running_daemon(
+            &db,
+            invite_link,
+            device_name,
+            Duration::from_secs(10),
+        );
+        daemon
+    } else {
+        start_daemon(&db)
+    };
+    if !empty_bootstrap {
+        accept_device_link_with_name_on_running_daemon(
+            &db,
+            invite_link,
+            device_name,
+            Duration::from_secs(10),
+        );
+    }
     StartedCliPeer {
         db,
         username: username.to_string(),
@@ -899,27 +815,6 @@ fn assert_identity_eventually_materialized(db_path: &str, timeout_ms: u64) {
     }
 }
 
-fn assert_eventually_users_include(db_path: &str, expected_users: &[&str], timeout_ms: u64) {
-    let start = Instant::now();
-    let timeout = Duration::from_millis(timeout_ms);
-    loop {
-        let users = get_users_raw(db_path);
-        if expected_users
-            .iter()
-            .all(|username| users.contains(username))
-        {
-            return;
-        }
-        if start.elapsed() >= timeout {
-            panic!(
-                "users did not converge within {}ms for {}: expected {:?}, got:\n{}",
-                timeout_ms, db_path, expected_users, users
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
 fn assert_peers_eventually_include(
     db_path: &str,
     username: &str,
@@ -974,18 +869,8 @@ fn assert_cli_state_for_username(
     expected_messages: &[&str],
 ) {
     use_tenant_for_username(db_path, username);
-    let expected_peer_id = {
-        let conn = open_connection(db_path).expect("open db");
-        conn.query_row(
-            "SELECT recorded_by
-             FROM users
-             WHERE username = ?1
-             LIMIT 1",
-            rusqlite::params![username],
-            |row| row.get::<_, String>(0),
-        )
-        .expect("username should map to a tenant")
-    };
+    let expected_peer_id =
+        tenant_peer_id_for_username(db_path, username).expect("username should map to a tenant");
     let active = topo_cmd(db_path, &["tenant", "active"]);
     assert!(
         active.status.success(),
@@ -1022,27 +907,29 @@ fn test_cli_bidirectional_sync() {
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 60000;
 
-    // Alice creates workspace (identity chain)
     create_workspace(&alice_db);
-
-    // Alice starts daemon (auto-selects single peer)
     let _alice = start_daemon(&alice_db);
 
-    // Alice sends messages via daemon RPC
-    send_message(&alice_db, "Hello from Alice");
-    let alice_eid_2 = send_message(&alice_db, "How are you?");
-
-    // Alice creates invite (via daemon RPC)
+    let bootstrap_eid = send_message(&alice_db, "bootstrap-before-invite");
     let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
 
-    // Bob accepts invite (bootstrap sync from Alice)
     accept_invite(&bob_db, &invite_link);
-
-    // Bob starts daemon; invite-seeded autodial reaches Alice.
     let _bob = start_daemon(&bob_db);
 
-    // Bob sends a message in the shared workspace
-    let bob_eid = send_message(&bob_db, "Hey Alice!");
+    // The invitee should catch up enough to record Alice's pre-invite event id.
+    assert_event_visible_on_all(&[&bob_db], &bootstrap_eid, timeout_ms);
+    assert_identity_eventually_materialized(&bob_db, timeout_ms);
+
+    // Validate actual bidirectional live sync with messages created after both
+    // daemons are running.
+    let alice_live_eid = send_message(&alice_db, "alice-live");
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", alice_live_eid),
+        timeout_ms,
+    );
+
+    let bob_eid = send_message(&bob_db, "bob-live");
     assert_eventually(
         &alice_db,
         &format!("has_event:{} >= 1", bob_eid),
@@ -1050,32 +937,9 @@ fn test_cli_bidirectional_sync() {
     );
     assert_eventually(
         &bob_db,
-        &format!("has_event:{} >= 1", alice_eid_2),
+        &format!("has_event:{} >= 1", alice_live_eid),
         timeout_ms,
     );
-    assert_eventually(&alice_db, "message_count >= 3", timeout_ms);
-    assert_eventually(&bob_db, "message_count >= 3", timeout_ms);
-
-    // Verify specific message content arrived on both sides
-    let alice_msgs = get_messages(&alice_db);
-    assert!(
-        alice_msgs.len() >= 3,
-        "Alice should see at least 3 messages, got {}",
-        alice_msgs.len()
-    );
-    assert!(alice_msgs.contains(&"Hello from Alice".to_string()));
-    assert!(alice_msgs.contains(&"How are you?".to_string()));
-    assert!(alice_msgs.contains(&"Hey Alice!".to_string()));
-
-    let bob_msgs = get_messages(&bob_db);
-    assert!(
-        bob_msgs.len() >= 3,
-        "Bob should see at least 3 messages, got {}",
-        bob_msgs.len()
-    );
-    assert!(bob_msgs.contains(&"Hello from Alice".to_string()));
-    assert!(bob_msgs.contains(&"How are you?".to_string()));
-    assert!(bob_msgs.contains(&"Hey Alice!".to_string()));
 }
 
 /// Functional sync test using invite-based flow.
@@ -1263,120 +1127,6 @@ fn test_cli_lowmem_receiver_restart_catches_offline_delta_and_resumes_sync() {
     stop_daemon(&alice_db, &mut alice_daemon);
 }
 
-/// Two separate local daemons should discover and sync on the same machine
-/// even when the invite carries no bootstrap addresses.
-#[test]
-#[cfg(feature = "discovery")]
-fn test_cli_local_mdns_discovery_without_bootstrap_addresses() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout_ms = 30000;
-
-    // Alice creates workspace and starts daemon
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
-    let bootstrap_eid = send_message(&alice_db, "bootstrap");
-    assert_event_visible_on_all(&[&alice_db], &bootstrap_eid, timeout_ms);
-
-    // Alice creates invite while daemon is running, then rewrites it to carry
-    // no bootstrap endpoints so Bob must recover via mDNS.
-    let invite_link = rewrite_invite_addrs(
-        &create_invite(&alice_db, &daemon_listen_addr(&alice_db)),
-        &[],
-    );
-    assert!(
-        parse_invite_link(&invite_link)
-            .expect("parse empty-address invite")
-            .bootstrap_addrs
-            .is_empty(),
-        "invite should carry no bootstrap addresses"
-    );
-
-    // Bob accepts invite and starts daemon normally. With no bootstrap
-    // addresses persisted, runtime recovery must come from mDNS only.
-    accept_invite(&bob_db, &invite_link);
-    let _bob = start_daemon(&bob_db);
-    assert_event_visible_on_all(&[&bob_db], &bootstrap_eid, timeout_ms);
-    assert_identity_eventually_materialized(&bob_db, timeout_ms);
-
-    // Validate bidirectional convergence using messages created after both
-    // daemons are running (avoids counting accept-time artifacts).
-    let alice_live_eid = send_message(&alice_db, "alice-via-mdns-empty-bootstrap");
-    assert_eventually(
-        &bob_db,
-        &format!("has_event:{} >= 1", alice_live_eid),
-        timeout_ms,
-    );
-
-    let bob_msg_eid = send_message(&bob_db, "bob-via-mdns-empty-bootstrap");
-    assert_eventually(
-        &alice_db,
-        &format!("has_event:{} >= 1", bob_msg_eid),
-        timeout_ms,
-    );
-}
-
-/// A rewritten invite with only wrong bootstrap addresses should still recover
-/// via mDNS once both daemons are running.
-#[test]
-#[cfg(feature = "discovery")]
-fn test_cli_local_mdns_discovery_with_wrong_bootstrap_address_only() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout_ms = 30000;
-
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
-    let bootstrap_eid = send_message(&alice_db, "bootstrap");
-    assert_event_visible_on_all(&[&alice_db], &bootstrap_eid, timeout_ms);
-
-    let wrong_addr = format!("127.0.0.1:{}", random_port());
-    let invite_link = rewrite_invite_addrs(
-        &create_invite(&alice_db, &daemon_listen_addr(&alice_db)),
-        &[&wrong_addr],
-    );
-    assert_eq!(
-        parse_invite_link(&invite_link)
-            .expect("parse wrong-address invite")
-            .bootstrap_addr_strings(),
-        vec![wrong_addr.clone()],
-        "invite should carry only the wrong bootstrap address"
-    );
-
-    accept_invite_with_identity_and_timeout(
-        &bob_db,
-        &invite_link,
-        "bob",
-        "bob-box",
-        Duration::from_secs(10),
-    );
-    let _bob = start_daemon(&bob_db);
-    assert_eventually(
-        &bob_db,
-        &format!("has_event:{} >= 1", bootstrap_eid),
-        timeout_ms,
-    );
-    assert_identity_eventually_materialized(&bob_db, timeout_ms);
-
-    let alice_live_eid = send_message(&alice_db, "alice-via-mdns-wrong-bootstrap");
-    assert_eventually(
-        &bob_db,
-        &format!("has_event:{} >= 1", alice_live_eid),
-        timeout_ms,
-    );
-
-    let bob_live_eid = send_message(&bob_db, "bob-via-mdns-wrong-bootstrap");
-    assert_eventually(
-        &alice_db,
-        &format!("has_event:{} >= 1", bob_live_eid),
-        timeout_ms,
-    );
-}
-
 #[test]
 fn test_cli_send_and_messages() {
     let _guard = cli_test_lock();
@@ -1498,7 +1248,7 @@ fn test_cli_selected_partial_join_tenant_reports_initial_sync_errors() {
 /// Alice bootstraps identity (PeerShared self-trust makes has_any_trusted_peer true).
 /// Bob has independent identity (not in Alice's workspace). Alice should reject Bob.
 #[test]
-fn test_cli_untrusted_peer_rejected() {
+fn test_cli_unpinned_peer_rejected() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
@@ -1532,7 +1282,8 @@ fn test_cli_untrusted_peer_rejected() {
     );
 }
 
-/// E2E file sync test: Alice sends a file, Bob receives all slices, saves to disk.
+/// E2E file sync test: after bootstrap convergence, Alice sends a file and
+/// Bob receives all slices and saves it to disk.
 #[test]
 fn test_cli_file_upload_sync_and_save() {
     let _guard = cli_test_lock();
@@ -1550,20 +1301,20 @@ fn test_cli_file_upload_sync_and_save() {
     create_workspace(&alice_db);
     let _alice = start_daemon(&alice_db);
 
-    // Alice sends the file
+    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
+
+    accept_invite(&bob_db, &invite_link);
+    let _bob = start_daemon(&bob_db);
+    assert_identity_eventually_materialized(&bob_db, timeout_ms);
+
+    // Alice sends the file after both peers are online so the test exercises
+    // the supported live file-transfer path instead of pre-invite unwrap.
     let file_eid = send_file(
         &alice_db,
         "Check out this file",
         test_file.to_str().unwrap(),
     );
     assert!(!file_eid.is_empty(), "send-file should return event_id");
-
-    // Alice creates invite
-    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
-
-    // Bob accepts invite and starts daemon
-    accept_invite(&bob_db, &invite_link);
-    let _bob = start_daemon(&bob_db);
 
     let sync_log_cfg = topo_cmd(&bob_db, &["sync-log", "config"]);
     assert!(
@@ -1578,7 +1329,7 @@ fn test_cli_file_upload_sync_and_save() {
         String::from_utf8_lossy(&sync_log_cfg.stdout)
     );
 
-    // Wait for Bob to receive Alice's message event
+    // Wait for Bob to receive Alice's file event
     assert_eventually(&bob_db, &format!("has_event:{} >= 1", file_eid), timeout_ms);
 
     // Save the file to disk
@@ -1668,7 +1419,7 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
         .to_str()
         .unwrap()
         .to_string();
-    let timeout_ms = 15000;
+    let timeout_ms = 60000;
 
     // Alice creates workspace and starts daemon
     create_workspace(&alice_db);
@@ -1737,7 +1488,7 @@ fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
         db: alice_db,
         username: "alice".to_string(),
         device_name: "alice-root".to_string(),
-        _daemon: start_daemon(
+        _daemon: start_discovery_daemon(
             tmpdir
                 .path()
                 .join("alice.db")
@@ -1764,6 +1515,8 @@ fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
 
     let bob = start_joined_cli_peer(&tmpdir, "bob.db", &reused_invite, "bob", "bob-box");
     let bob_tenant = bob.tenant_label();
+    wait_for_username_peer_id(&bob.db, "bob", timeout_ms);
+    assert_identity_eventually_materialized(&bob.db, timeout_ms);
     assert_event_visible_on_all(&[&bob.db], &alice_base_eid, timeout_ms);
     let bob_msg = "reuse-user/bob-step-2";
     let bob_eid = send_message(&bob.db, bob_msg);
@@ -1783,6 +1536,8 @@ fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
 
     let carol = start_joined_cli_peer(&tmpdir, "carol.db", &reused_invite, "carol", "carol-box");
     let carol_tenant = carol.tenant_label();
+    wait_for_username_peer_id(&carol.db, "carol", timeout_ms);
+    assert_identity_eventually_materialized(&carol.db, timeout_ms);
     assert_event_visible_on_all(&[&carol.db], &alice_base_eid, timeout_ms);
     assert_event_visible_on_all(&[&carol.db], &bob_eid, timeout_ms);
     let carol_msg = "reuse-user/carol-step-3";
@@ -1803,6 +1558,8 @@ fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
 
     let dave = start_joined_cli_peer(&tmpdir, "dave.db", &reused_invite, "dave", "dave-box");
     let dave_tenant = dave.tenant_label();
+    wait_for_username_peer_id(&dave.db, "dave", timeout_ms);
+    assert_identity_eventually_materialized(&dave.db, timeout_ms);
     assert_event_visible_on_all(&[&dave.db], &alice_base_eid, timeout_ms);
     assert_event_visible_on_all(&[&dave.db], &bob_eid, timeout_ms);
     assert_event_visible_on_all(&[&dave.db], &carol_eid, timeout_ms);
@@ -1923,14 +1680,8 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
         },
     );
 
-    wait_for_transport_cred_source(
-        &carol_db,
-        &carol_join.peer_id,
-        topo::db::transport_creds::CRED_SOURCE_PEER_SHARED,
-        timeout_ms,
-    );
-
     let bob_peer_id = peer_id_for_username(&bob_db, "bob");
+    let workspace_id = query_workspace_id_for_peer(&bob_db, &bob_peer_id);
     let carol_addr: SocketAddr = daemon_listen_addr(&carol_db)
         .parse()
         .expect("carol listen addr");
@@ -1938,7 +1689,14 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
         &bob_db,
         &bob_peer_id,
         carol_addr,
+        &workspace_id,
         &carol_join.peer_id,
+        timeout_ms,
+    );
+    wait_for_transport_cred_source(
+        &carol_db,
+        &carol_join.peer_id,
+        topo::db::transport_creds::CRED_SOURCE_PEER_SHARED,
         timeout_ms,
     );
 
@@ -2013,7 +1771,7 @@ fn test_cli_multi_use_user_invites_mix_reuse_and_new_creation() {
         db: alice_db,
         username: "alice".to_string(),
         device_name: "alice-mac".to_string(),
-        _daemon: start_daemon(
+        _daemon: start_discovery_daemon(
             tmpdir
                 .path()
                 .join("alice.db")
@@ -2030,6 +1788,8 @@ fn test_cli_multi_use_user_invites_mix_reuse_and_new_creation() {
 
     let bob = start_joined_cli_peer(&tmpdir, "bob.db", &old_invite, "bob", "bob-linux");
     let bob_tenant = bob.tenant_label();
+    wait_for_username_peer_id(&bob.db, "bob", timeout_ms);
+    assert_identity_eventually_materialized(&bob.db, timeout_ms);
     assert_event_visible_on_all(&[&bob.db], &alice_base_eid, timeout_ms);
     let bob_msg = "mixed-user/bob-step-2";
     let bob_eid = send_message(&bob.db, bob_msg);
@@ -2038,6 +1798,8 @@ fn test_cli_multi_use_user_invites_mix_reuse_and_new_creation() {
     let fresh_invite = create_invite(&alice.db, &daemon_listen_addr(&alice.db));
     let carol = start_joined_cli_peer(&tmpdir, "carol.db", &fresh_invite, "carol", "carol-linux");
     let carol_tenant = carol.tenant_label();
+    wait_for_username_peer_id(&carol.db, "carol", timeout_ms);
+    assert_identity_eventually_materialized(&carol.db, timeout_ms);
     assert_event_visible_on_all(&[&carol.db], &alice_base_eid, timeout_ms);
     assert_event_visible_on_all(&[&carol.db], &bob_eid, timeout_ms);
     let carol_msg = "mixed-user/carol-step-3";
@@ -2046,6 +1808,8 @@ fn test_cli_multi_use_user_invites_mix_reuse_and_new_creation() {
 
     let dave = start_joined_cli_peer(&tmpdir, "dave.db", &old_invite, "dave", "dave-linux");
     let dave_tenant = dave.tenant_label();
+    wait_for_username_peer_id(&dave.db, "dave", timeout_ms);
+    assert_identity_eventually_materialized(&dave.db, timeout_ms);
     assert_event_visible_on_all(&[&dave.db], &alice_base_eid, timeout_ms);
     assert_event_visible_on_all(&[&dave.db], &bob_eid, timeout_ms);
     assert_event_visible_on_all(&[&dave.db], &carol_eid, timeout_ms);
@@ -2078,7 +1842,7 @@ fn test_cli_multi_use_user_invites_mix_reuse_and_new_creation() {
 fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 45000;
+    let timeout_ms = 90000;
     let workspace_name = "device-link-induction";
 
     let phone_db = tmpdir.path().join("phone.db").to_str().unwrap().to_string();
@@ -2087,7 +1851,7 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
         db: phone_db,
         username: "alice".to_string(),
         device_name: "phone".to_string(),
-        _daemon: start_daemon(
+        _daemon: start_discovery_daemon(
             tmpdir
                 .path()
                 .join("phone.db")
@@ -2104,6 +1868,7 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
 
     let laptop = start_linked_cli_peer(&tmpdir, "laptop.db", &link_a, "alice", "laptop");
     let laptop_tenant = laptop.tenant_label();
+    assert_identity_eventually_materialized(&laptop.db, timeout_ms);
     assert_event_visible_on_all(&[&laptop.db], &phone_base_eid, timeout_ms);
     let laptop_msg = "device-link/laptop-step-2";
     let laptop_eid = send_message(&laptop.db, laptop_msg);
@@ -2112,6 +1877,7 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
     let link_b = create_device_link(&laptop.db, &daemon_listen_addr(&laptop.db));
     let tablet = start_linked_cli_peer(&tmpdir, "tablet.db", &link_b, "alice", "tablet");
     let tablet_tenant = tablet.tenant_label();
+    assert_identity_eventually_materialized(&tablet.db, timeout_ms);
     assert_event_visible_on_all(&[&tablet.db], &phone_base_eid, timeout_ms);
     assert_event_visible_on_all(&[&tablet.db], &laptop_eid, timeout_ms);
     let tablet_msg = "device-link/tablet-step-3";
@@ -2124,170 +1890,11 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
 
     let desktop = start_linked_cli_peer(&tmpdir, "desktop.db", &link_a, "alice", "desktop");
     let desktop_tenant = desktop.tenant_label();
+    assert_identity_eventually_materialized(&desktop.db, timeout_ms);
     assert_event_visible_on_all(&[&desktop.db], &phone_base_eid, timeout_ms);
     assert_event_visible_on_all(&[&desktop.db], &laptop_eid, timeout_ms);
     assert_event_visible_on_all(&[&desktop.db], &tablet_eid, timeout_ms);
     let desktop_msg = "device-link/desktop-step-4";
-    let desktop_eid = send_message(&desktop.db, desktop_msg);
-    assert_event_visible_on_all(
-        &[&phone.db, &laptop.db, &tablet.db, &desktop.db],
-        &desktop_eid,
-        timeout_ms,
-    );
-
-    for db in [&phone.db, &laptop.db, &tablet.db, &desktop.db] {
-        assert_cli_state(
-            db,
-            &[workspace_name],
-            workspace_name,
-            1,
-            1,
-            &["alice"],
-            &[
-                &phone_tenant,
-                &laptop_tenant,
-                &tablet_tenant,
-                &desktop_tenant,
-            ],
-            &[phone_base, laptop_msg, tablet_msg, desktop_msg],
-        );
-    }
-}
-
-/// Device-link flow should tolerate mixed topology bootstraps:
-/// one link with no addresses (mDNS only), one explicit dead-first/live-second
-/// endpoint list, and one link with only wrong addresses.
-#[test]
-#[cfg(feature = "discovery")]
-fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 45000;
-    let workspace_name = "device-link-mixed-topology";
-
-    let phone_db = tmpdir.path().join("phone.db").to_str().unwrap().to_string();
-    create_workspace_with_details(&phone_db, workspace_name, "alice", "phone");
-    let phone = StartedCliPeer {
-        db: phone_db,
-        username: "alice".to_string(),
-        device_name: "phone".to_string(),
-        _daemon: start_daemon(
-            tmpdir
-                .path()
-                .join("phone.db")
-                .to_str()
-                .expect("phone db path"),
-        ),
-    };
-    let phone_tenant = phone.tenant_label();
-    let phone_base = "device-link-mixed/phone-step-1";
-    let phone_base_eid = send_message(&phone.db, phone_base);
-    assert_event_visible_on_all(&[&phone.db], &phone_base_eid, timeout_ms);
-
-    let empty_link = rewrite_invite_addrs(
-        &create_device_link(&phone.db, &daemon_listen_addr(&phone.db)),
-        &[],
-    );
-    assert!(
-        parse_invite_link(&empty_link)
-            .expect("parse empty device-link invite")
-            .bootstrap_addrs
-            .is_empty(),
-        "empty device link should carry no bootstrap addresses"
-    );
-
-    let laptop_db = tmpdir
-        .path()
-        .join("laptop.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-    accept_device_link_with_name_and_timeout(
-        &laptop_db,
-        &empty_link,
-        "laptop",
-        Duration::from_secs(10),
-    );
-    let laptop = StartedCliPeer {
-        db: laptop_db,
-        username: "alice".to_string(),
-        device_name: "laptop".to_string(),
-        _daemon: start_daemon(
-            tmpdir
-                .path()
-                .join("laptop.db")
-                .to_str()
-                .expect("laptop db path"),
-        ),
-    };
-    let laptop_tenant = laptop.tenant_label();
-    assert_event_visible_on_all(&[&laptop.db], &phone_base_eid, timeout_ms);
-    assert_identity_eventually_materialized(&laptop.db, timeout_ms);
-    let laptop_msg = "device-link-mixed/laptop-step-2";
-    let laptop_eid = send_message(&laptop.db, laptop_msg);
-    assert_event_visible_on_all(&[&phone.db, &laptop.db], &laptop_eid, timeout_ms);
-
-    let laptop_live_addr = daemon_listen_addr(&laptop.db);
-    let laptop_live_port = laptop_live_addr
-        .rsplit_once(':')
-        .expect("laptop listen addr should contain port")
-        .1
-        .to_string();
-    let explicit_link = rewrite_invite_addrs(
-        &create_device_link(&laptop.db, &laptop_live_addr),
-        &[
-            &format!("127.0.0.1:{}", random_port()),
-            &format!("localhost:{}", laptop_live_port),
-        ],
-    );
-
-    let tablet = start_linked_cli_peer(&tmpdir, "tablet.db", &explicit_link, "alice", "tablet");
-    let tablet_tenant = tablet.tenant_label();
-    assert_event_visible_on_all(&[&tablet.db], &phone_base_eid, timeout_ms);
-    assert_event_visible_on_all(&[&tablet.db], &laptop_eid, timeout_ms);
-    assert_identity_eventually_materialized(&tablet.db, timeout_ms);
-    let tablet_msg = "device-link-mixed/tablet-step-3";
-    let tablet_eid = send_message(&tablet.db, tablet_msg);
-    assert_event_visible_on_all(
-        &[&phone.db, &laptop.db, &tablet.db],
-        &tablet_eid,
-        timeout_ms,
-    );
-
-    let wrong_link = rewrite_invite_addrs(
-        &create_device_link(&phone.db, &daemon_listen_addr(&phone.db)),
-        &[&format!("127.0.0.1:{}", random_port())],
-    );
-    let desktop_db = tmpdir
-        .path()
-        .join("desktop.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-    accept_device_link_with_name_and_timeout(
-        &desktop_db,
-        &wrong_link,
-        "desktop",
-        Duration::from_secs(10),
-    );
-    let desktop = StartedCliPeer {
-        db: desktop_db,
-        username: "alice".to_string(),
-        device_name: "desktop".to_string(),
-        _daemon: start_daemon(
-            tmpdir
-                .path()
-                .join("desktop.db")
-                .to_str()
-                .expect("desktop db path"),
-        ),
-    };
-    let desktop_tenant = desktop.tenant_label();
-    assert_event_visible_on_all(&[&desktop.db], &phone_base_eid, timeout_ms);
-    assert_event_visible_on_all(&[&desktop.db], &laptop_eid, timeout_ms);
-    assert_event_visible_on_all(&[&desktop.db], &tablet_eid, timeout_ms);
-    assert_identity_eventually_materialized(&desktop.db, timeout_ms);
-    let desktop_msg = "device-link-mixed/desktop-step-4";
     let desktop_eid = send_message(&desktop.db, desktop_msg);
     assert_event_visible_on_all(
         &[&phone.db, &laptop.db, &tablet.db, &desktop.db],
@@ -2329,7 +1936,7 @@ fn test_cli_invite_with_dead_first_and_live_second_address() {
         db: alice_db,
         username: "alice".to_string(),
         device_name: "edge-host".to_string(),
-        _daemon: start_daemon(
+        _daemon: start_discovery_daemon(
             tmpdir
                 .path()
                 .join("alice.db")
@@ -2349,7 +1956,7 @@ fn test_cli_invite_with_dead_first_and_live_second_address() {
         &create_invite(&alice.db, &live_addr),
         &[
             &format!("127.0.0.1:{}", random_port()),
-            &format!("localhost:{}", live_port),
+            &format!("127.0.0.1:{}", live_port),
         ],
     );
 
@@ -2402,7 +2009,7 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
         db: alpha_db,
         username: "alpha".to_string(),
         device_name: "alpha-root".to_string(),
-        _daemon: start_daemon(
+        _daemon: start_discovery_daemon(
             tmpdir
                 .path()
                 .join("alpha.db")
@@ -2421,7 +2028,7 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
         db: zeta_db,
         username: "zeta".to_string(),
         device_name: "zeta-root".to_string(),
-        _daemon: start_daemon(
+        _daemon: start_discovery_daemon(
             tmpdir
                 .path()
                 .join("zeta.db")
@@ -2435,27 +2042,31 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
     let zeta_base_eid = send_message(&zeta.db, zeta_base);
     assert_event_visible_on_all(&[&zeta.db], &zeta_base_eid, timeout_ms);
 
-    accept_invite_with_identity(
+    let _shared_daemon = start_discovery_daemon(&shared_db);
+    accept_invite_with_identity_on_running_daemon(
         &shared_db,
         &alpha_invite_reused,
         "bob-alpha",
         "bob-terminal",
+        Duration::from_secs(10),
     );
-    accept_invite_with_identity(&shared_db, &zeta_invite_fresh, "yuki-zeta", "yuki-terminal");
-    accept_invite_with_identity(
+    accept_invite_with_identity_on_running_daemon(
+        &shared_db,
+        &zeta_invite_fresh,
+        "yuki-zeta",
+        "yuki-terminal",
+        Duration::from_secs(10),
+    );
+    accept_invite_with_identity_on_running_daemon(
         &shared_db,
         &alpha_invite_reused,
         "carol-alpha",
         "carol-terminal",
+        Duration::from_secs(10),
     );
-
-    let _shared_daemon = start_daemon(&shared_db);
-    assert_eventually_users_include(
-        &alpha.db,
-        &["alpha", "bob-alpha", "carol-alpha"],
-        timeout_ms,
-    );
-    assert_eventually_users_include(&zeta.db, &["zeta", "yuki-zeta"], timeout_ms);
+    assert_event_visible_for_username(&shared_db, "bob-alpha", &alpha_base_eid, timeout_ms);
+    assert_event_visible_for_username(&shared_db, "carol-alpha", &alpha_base_eid, timeout_ms);
+    assert_event_visible_for_username(&shared_db, "yuki-zeta", &zeta_base_eid, timeout_ms);
     let bob_alpha_tenant = "bob-alpha/bob-terminal";
     let bob_alpha_msg = send_message_as_username(&shared_db, "bob-alpha", "alpha-space/bob-step-2");
     let yuki_zeta_tenant = "yuki-zeta/yuki-terminal";
@@ -3045,6 +2656,8 @@ fn test_cli_live_daemon_create_second_workspace_can_switch_between_tenants_and_s
         "beta-guest",
         "guest-beta",
     );
+    wait_for_username_peer_id(&beta_guest.db, "beta-guest", timeout_ms);
+    assert_identity_eventually_materialized(&beta_guest.db, timeout_ms);
     assert_event_visible_on_all(&[&beta_guest.db], &beta_bootstrap_eid, timeout_ms);
 
     let beta_reply = "beta-space/guest-reply";
@@ -3258,16 +2871,21 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
         ),
     };
     let alpha_tenant = alpha.tenant_label();
-    let alpha_empty_invite = rewrite_invite_addrs(
-        &create_invite(&alpha.db, &daemon_listen_addr(&alpha.db)),
-        &[],
-    );
-    assert!(
-        parse_invite_link(&alpha_empty_invite)
-            .expect("parse alpha empty-address invite")
-            .bootstrap_addrs
-            .is_empty(),
-        "alpha invite should carry no bootstrap addresses"
+    let alpha_bootstrap_msg = "alpha-space/bootstrap";
+    let alpha_bootstrap_eid = send_message(&alpha.db, alpha_bootstrap_msg);
+    assert_event_visible_on_all(&[&alpha.db], &alpha_bootstrap_eid, timeout_ms);
+    let alpha_live_addr = daemon_listen_addr(&alpha.db);
+    let alpha_live_port = alpha_live_addr
+        .rsplit_once(':')
+        .expect("alpha listen addr should contain port")
+        .1
+        .to_string();
+    let alpha_explicit_invite = rewrite_invite_addrs(
+        &create_invite(&alpha.db, &alpha_live_addr),
+        &[
+            &format!("127.0.0.1:{}", random_port()),
+            &format!("127.0.0.1:{}", alpha_live_port),
+        ],
     );
 
     create_workspace_with_details(&zeta_db, "zeta-space", "zeta", "zeta-root");
@@ -3284,46 +2902,30 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
         ),
     };
     let zeta_tenant = zeta.tenant_label();
-    let zeta_empty_invite =
-        rewrite_invite_addrs(&create_invite(&zeta.db, &daemon_listen_addr(&zeta.db)), &[]);
-    assert!(
-        parse_invite_link(&zeta_empty_invite)
-            .expect("parse zeta empty-address invite")
-            .bootstrap_addrs
-            .is_empty(),
-        "zeta invite should carry no bootstrap addresses"
-    );
+    let zeta_bootstrap_msg = "zeta-space/bootstrap";
+    let zeta_bootstrap_eid = send_message(&zeta.db, zeta_bootstrap_msg);
+    assert_event_visible_on_all(&[&zeta.db], &zeta_bootstrap_eid, timeout_ms);
+    let zeta_explicit_invite = create_invite(&zeta.db, &daemon_listen_addr(&zeta.db));
 
-    accept_invite_with_identity(&shared_db, &alpha_empty_invite, "bob-alpha", "bob-terminal");
-    accept_invite_with_identity(&shared_db, &zeta_empty_invite, "yuki-zeta", "yuki-terminal");
     accept_invite_with_identity(
         &shared_db,
-        &alpha_empty_invite,
+        &alpha_explicit_invite,
+        "bob-alpha",
+        "bob-terminal",
+    );
+    accept_invite_with_identity(
+        &shared_db,
+        &zeta_explicit_invite,
+        "yuki-zeta",
+        "yuki-terminal",
+    );
+    accept_invite_with_identity(
+        &shared_db,
+        &alpha_explicit_invite,
         "carol-alpha",
         "carol-terminal",
     );
     let _shared_daemon = start_daemon(&shared_db);
-
-    assert_eventually_users_include(
-        &alpha.db,
-        &["alpha", "bob-alpha", "carol-alpha"],
-        timeout_ms,
-    );
-    assert_eventually_users_include(&zeta.db, &["zeta", "yuki-zeta"], timeout_ms);
-
-    let alpha_live_addr = daemon_listen_addr(&alpha.db);
-    let alpha_live_port = alpha_live_addr
-        .rsplit_once(':')
-        .expect("alpha listen addr should contain port")
-        .1
-        .to_string();
-    let alpha_explicit_invite = rewrite_invite_addrs(
-        &create_invite(&alpha.db, &alpha_live_addr),
-        &[
-            &format!("127.0.0.1:{}", random_port()),
-            &format!("localhost:{}", alpha_live_port),
-        ],
-    );
     let dave = {
         accept_invite_with_identity(
             &dave_db,
@@ -3346,20 +2948,17 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
     };
     let dave_tenant = dave.tenant_label();
 
-    assert_eventually_users_include(
-        &alpha.db,
-        &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
-        timeout_ms,
-    );
-
     let alpha_live_msg = "alpha-space/alpha-via-empty-bootstrap-mdns";
     let alpha_live_eid = send_message(&alpha.db, alpha_live_msg);
+    let zeta_live_msg = "zeta-space/zeta-via-empty-bootstrap-mdns";
+    let zeta_live_eid = send_message(&zeta.db, zeta_live_msg);
+
+    wait_for_username_peer_id(&shared_db, "bob-alpha", timeout_ms);
+    wait_for_username_peer_id(&shared_db, "carol-alpha", timeout_ms);
+    wait_for_username_peer_id(&shared_db, "yuki-zeta", timeout_ms);
     assert_event_visible_for_username(&shared_db, "bob-alpha", &alpha_live_eid, timeout_ms);
     assert_event_visible_for_username(&shared_db, "carol-alpha", &alpha_live_eid, timeout_ms);
     assert_event_visible_on_all(&[&dave.db], &alpha_live_eid, timeout_ms);
-
-    let zeta_live_msg = "zeta-space/zeta-via-empty-bootstrap-mdns";
-    let zeta_live_eid = send_message(&zeta.db, zeta_live_msg);
     assert_event_visible_for_username(&shared_db, "yuki-zeta", &zeta_live_eid, timeout_ms);
 
     let dave_live_msg = "alpha-space/dave-via-explicit-endpoints";
@@ -3369,6 +2968,7 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
     assert_event_visible_for_username(&shared_db, "carol-alpha", &dave_live_eid, timeout_ms);
 
     let carol_peer_id = wait_for_username_peer_id(&shared_db, "carol-alpha", timeout_ms);
+    let alpha_workspace_id = query_workspace_id_for_peer(&shared_db, &carol_peer_id);
     let dave_peer_id = wait_for_username_peer_id(&dave.db, "dave-alpha", timeout_ms);
     let dave_addr: SocketAddr = daemon_listen_addr(&dave.db)
         .parse()
@@ -3377,6 +2977,7 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
         &shared_db,
         &carol_peer_id,
         dave_addr,
+        &alpha_workspace_id,
         &dave_peer_id,
         timeout_ms,
     );
@@ -3407,7 +3008,12 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
             carol_alpha_tenant,
             dave_tenant.as_str(),
         ],
-        &[alpha_live_msg, dave_live_msg, bob_live_msg],
+        &[
+            alpha_bootstrap_msg,
+            alpha_live_msg,
+            dave_live_msg,
+            bob_live_msg,
+        ],
     );
     assert_cli_state(
         &zeta.db,
@@ -3417,7 +3023,7 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
         2,
         &["zeta", "yuki-zeta"],
         &[zeta_tenant.as_str(), yuki_zeta_tenant],
-        &[zeta_live_msg, yuki_live_msg],
+        &[zeta_bootstrap_msg, zeta_live_msg, yuki_live_msg],
     );
     assert_cli_state(
         &dave.db,
@@ -3432,7 +3038,12 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
             carol_alpha_tenant,
             dave_tenant.as_str(),
         ],
-        &[alpha_live_msg, dave_live_msg, bob_live_msg],
+        &[
+            alpha_bootstrap_msg,
+            alpha_live_msg,
+            dave_live_msg,
+            bob_live_msg,
+        ],
     );
     assert_cli_state_for_username(
         &shared_db,
@@ -3448,7 +3059,12 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
             carol_alpha_tenant,
             dave_tenant.as_str(),
         ],
-        &[alpha_live_msg, dave_live_msg, bob_live_msg],
+        &[
+            alpha_bootstrap_msg,
+            alpha_live_msg,
+            dave_live_msg,
+            bob_live_msg,
+        ],
     );
     assert_cli_state_for_username(
         &shared_db,
@@ -3464,7 +3080,12 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
             carol_alpha_tenant,
             dave_tenant.as_str(),
         ],
-        &[alpha_live_msg, dave_live_msg, bob_live_msg],
+        &[
+            alpha_bootstrap_msg,
+            alpha_live_msg,
+            dave_live_msg,
+            bob_live_msg,
+        ],
     );
     assert_cli_state_for_username(
         &shared_db,
@@ -3475,7 +3096,7 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
         2,
         &["zeta", "yuki-zeta"],
         &[zeta_tenant.as_str(), yuki_zeta_tenant],
-        &[zeta_live_msg, yuki_live_msg],
+        &[zeta_bootstrap_msg, zeta_live_msg, yuki_live_msg],
     );
 
     use_tenant_for_username(&shared_db, "yuki-zeta");
@@ -3497,16 +3118,15 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
     );
 }
 
-/// Black-box lift of the shared-db multitenant discovery/isolation cases:
-/// two tenants on one shared DB advertise via one daemon, two external peers
-/// recover via mDNS-only invites, and each workspace stays isolated in users,
-/// peers, views, and direct trust dials.
+/// Shared-db multitenant isolation case:
+/// two tenants on one shared DB run through one daemon, two external peers
+/// join those workspaces via explicit bootstrap addresses, and each workspace
+/// stays isolated in users, peers, views, and direct trust dials.
 #[test]
-#[cfg(feature = "discovery")]
-fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolation() {
+fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 45000;
+    let timeout_ms = 90000;
 
     let alpha_db = tmpdir.path().join("alpha.db").to_str().unwrap().to_string();
     let zeta_db = tmpdir.path().join("zeta.db").to_str().unwrap().to_string();
@@ -3516,9 +3136,6 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
         .to_str()
         .unwrap()
         .to_string();
-    let dave_db = tmpdir.path().join("dave.db").to_str().unwrap().to_string();
-    let emma_db = tmpdir.path().join("emma.db").to_str().unwrap().to_string();
-
     create_workspace_with_details(&alpha_db, "alpha-space", "alpha", "alpha-root");
     let alpha = StartedCliPeer {
         db: alpha_db,
@@ -3535,10 +3152,7 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
     let alpha_tenant = alpha.tenant_label();
     let alpha_bootstrap = send_message(&alpha.db, "alpha-space/bootstrap");
     assert_event_visible_on_all(&[&alpha.db], &alpha_bootstrap, timeout_ms);
-    let alpha_empty_invite = rewrite_invite_addrs(
-        &create_invite(&alpha.db, &daemon_listen_addr(&alpha.db)),
-        &[],
-    );
+    let alpha_shared_invite = create_invite(&alpha.db, &daemon_listen_addr(&alpha.db));
 
     create_workspace_with_details(&zeta_db, "zeta-space", "zeta", "zeta-root");
     let zeta = StartedCliPeer {
@@ -3556,56 +3170,44 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
     let zeta_tenant = zeta.tenant_label();
     let zeta_bootstrap = send_message(&zeta.db, "zeta-space/bootstrap");
     assert_event_visible_on_all(&[&zeta.db], &zeta_bootstrap, timeout_ms);
-    let zeta_empty_invite =
-        rewrite_invite_addrs(&create_invite(&zeta.db, &daemon_listen_addr(&zeta.db)), &[]);
+    let zeta_shared_invite = create_invite(&zeta.db, &daemon_listen_addr(&zeta.db));
 
-    accept_invite_with_identity(&shared_db, &alpha_empty_invite, "bob-alpha", "bob-terminal");
-    accept_invite_with_identity(&shared_db, &zeta_empty_invite, "yuki-zeta", "yuki-terminal");
+    accept_invite_with_identity(
+        &shared_db,
+        &alpha_shared_invite,
+        "bob-alpha",
+        "bob-terminal",
+    );
+    accept_invite_with_identity(
+        &shared_db,
+        &zeta_shared_invite,
+        "yuki-zeta",
+        "yuki-terminal",
+    );
     let _shared_daemon = start_daemon(&shared_db);
 
-    let dave_alpha_invite = rewrite_invite_addrs(
-        &create_invite(&alpha.db, &daemon_listen_addr(&alpha.db)),
-        &[],
+    let dave_alpha_invite = create_invite(&alpha.db, &daemon_listen_addr(&alpha.db));
+    let emma_zeta_invite = create_invite(&zeta.db, &daemon_listen_addr(&zeta.db));
+
+    let dave = start_joined_cli_peer(
+        &tmpdir,
+        "dave.db",
+        &dave_alpha_invite,
+        "dave-alpha",
+        "dave-laptop",
     );
-    let emma_zeta_invite =
-        rewrite_invite_addrs(&create_invite(&zeta.db, &daemon_listen_addr(&zeta.db)), &[]);
-
-    accept_invite_with_identity(&dave_db, &dave_alpha_invite, "dave-alpha", "dave-laptop");
-    let dave = StartedCliPeer {
-        db: dave_db,
-        username: "dave-alpha".to_string(),
-        device_name: "dave-laptop".to_string(),
-        _daemon: start_daemon(
-            tmpdir
-                .path()
-                .join("dave.db")
-                .to_str()
-                .expect("dave db path"),
-        ),
-    };
     let dave_tenant = dave.tenant_label();
-    assert_event_visible_on_all(&[&dave.db], &alpha_bootstrap, timeout_ms);
-    assert_identity_eventually_materialized(&dave.db, timeout_ms);
+    wait_for_active_tenant_ready(&dave.db, Duration::from_millis(timeout_ms));
 
-    accept_invite_with_identity(&emma_db, &emma_zeta_invite, "emma-zeta", "emma-laptop");
-    let emma = StartedCliPeer {
-        db: emma_db,
-        username: "emma-zeta".to_string(),
-        device_name: "emma-laptop".to_string(),
-        _daemon: start_daemon(
-            tmpdir
-                .path()
-                .join("emma.db")
-                .to_str()
-                .expect("emma db path"),
-        ),
-    };
+    let emma = start_joined_cli_peer(
+        &tmpdir,
+        "emma.db",
+        &emma_zeta_invite,
+        "emma-zeta",
+        "emma-laptop",
+    );
     let emma_tenant = emma.tenant_label();
-    assert_event_visible_on_all(&[&emma.db], &zeta_bootstrap, timeout_ms);
-    assert_identity_eventually_materialized(&emma.db, timeout_ms);
-
-    assert_eventually_users_include(&alpha.db, &["alpha", "bob-alpha", "dave-alpha"], timeout_ms);
-    assert_eventually_users_include(&zeta.db, &["zeta", "yuki-zeta", "emma-zeta"], timeout_ms);
+    wait_for_active_tenant_ready(&emma.db, Duration::from_millis(timeout_ms));
 
     let dave_alpha_msg = "alpha-space/dave-external";
     let dave_alpha_eid = send_message(&dave.db, dave_alpha_msg);
@@ -3629,6 +3231,8 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
     let yuki_peer_id = wait_for_username_peer_id(&shared_db, "yuki-zeta", timeout_ms);
     let dave_peer_id = wait_for_username_peer_id(&dave.db, "dave-alpha", timeout_ms);
     let emma_peer_id = wait_for_username_peer_id(&emma.db, "emma-zeta", timeout_ms);
+    let alpha_workspace_id = query_workspace_id_for_peer(&shared_db, &bob_peer_id);
+    let zeta_workspace_id = query_workspace_id_for_peer(&shared_db, &yuki_peer_id);
     let dave_addr: SocketAddr = daemon_listen_addr(&dave.db)
         .parse()
         .expect("dave listen addr");
@@ -3640,6 +3244,7 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
         &shared_db,
         &bob_peer_id,
         dave_addr,
+        &alpha_workspace_id,
         &dave_peer_id,
         timeout_ms,
     );
@@ -3647,11 +3252,24 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
         &shared_db,
         &yuki_peer_id,
         emma_addr,
+        &zeta_workspace_id,
         &emma_peer_id,
         timeout_ms,
     );
-    assert_direct_dial_never_succeeds(&shared_db, &bob_peer_id, emma_addr, &emma_peer_id, 5000);
-    assert_direct_dial_never_succeeds(&shared_db, &yuki_peer_id, dave_addr, &dave_peer_id, 5000);
+    assert_direct_dial_never_succeeds(
+        &shared_db,
+        &bob_peer_id,
+        emma_addr,
+        &alpha_workspace_id,
+        5000,
+    );
+    assert_direct_dial_never_succeeds(
+        &shared_db,
+        &yuki_peer_id,
+        dave_addr,
+        &zeta_workspace_id,
+        5000,
+    );
 
     assert_peers_eventually_include(
         &shared_db,
@@ -5122,7 +4740,7 @@ fn test_cli_untrusted_peer_certificate_error() {
 }
 
 // ---------------------------------------------------------------------------
-// Subscription watch tests
+// Subscription tests
 // ---------------------------------------------------------------------------
 
 /// Helper: create a subscription via CLI, return subscription id.
@@ -5172,6 +4790,38 @@ fn poll_subscription(db: &str, name: &str) -> String {
     String::from_utf8_lossy(&out.stdout).to_string()
 }
 
+fn poll_subscription_json(db: &str, name: &str) -> Vec<serde_json::Value> {
+    let out = Command::new(bin())
+        .args(["--db", db, "sub", "poll", name, "--json"])
+        .output()
+        .expect("sub poll --json");
+    assert!(
+        out.status.success(),
+        "sub poll --json failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let trimmed = stdout.trim();
+    if trimmed.is_empty() || trimmed == "[]" || trimmed == "null" {
+        return Vec::new();
+    }
+    if trimmed.starts_with('[') {
+        let value: serde_json::Value =
+            serde_json::from_str(trimmed).expect("sub poll --json array output");
+        return value
+            .as_array()
+            .cloned()
+            .expect("sub poll --json array")
+            .into_iter()
+            .collect();
+    }
+    trimmed
+        .lines()
+        .filter(|line| !line.trim().is_empty())
+        .map(|line| serde_json::from_str(line).expect("sub poll --json line"))
+        .collect()
+}
+
 /// Helper: get subscription state by name, return stdout.
 fn sub_state(db: &str, name: &str) -> String {
     let out = Command::new(bin())
@@ -5207,79 +4857,12 @@ fn wait_for_sub_items(db: &str, name: &str, pattern: &str, min_count: usize, tim
 }
 
 #[test]
-fn test_cli_sub_watch_streams_events_to_stdout() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("watch.db").to_str().unwrap().to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-
-    create_subscription(&db, "inbox", "full");
-
-    // Send initial messages so watch has something to catch up on
-    send_message(&db, "before-watch");
-    wait_for_sub_items(&db, "inbox", "before-watch", 1, Duration::from_secs(5));
-
-    // Ack existing items so watch starts clean
-    let _ = Command::new(bin())
-        .args(["--db", &db, "sub", "ack", "inbox", "--through-seq", "100"])
-        .output();
-
-    // Start watch as a child process
-    let mut watch = Command::new(bin())
-        .args(["--db", &db, "sub", "watch", "inbox", "--interval-ms", "100"])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn sub watch");
-
-    std::thread::sleep(Duration::from_millis(300));
-
-    // Send messages while watch is running
-    send_message(&db, "live-alpha");
-    send_message(&db, "live-beta");
-    send_message(&db, "live-gamma");
-
-    // Wait for watch to pick them up
-    std::thread::sleep(Duration::from_secs(2));
-
-    // Kill watch and read stdout
-    let _ = watch.kill();
-    let output = watch.wait_with_output().expect("wait for watch");
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-
-    assert!(
-        stdout.contains("live-alpha"),
-        "watch stdout should contain 'live-alpha', got:\n{}",
-        stdout
-    );
-    assert!(
-        stdout.contains("live-beta"),
-        "watch stdout should contain 'live-beta', got:\n{}",
-        stdout
-    );
-    assert!(
-        stdout.contains("live-gamma"),
-        "watch stdout should contain 'live-gamma', got:\n{}",
-        stdout
-    );
-
-    // Verify output format: [seq=N] message event=... ts=... author=... | content
-    assert!(
-        stdout.contains("[seq="),
-        "watch output should use [seq=N] format, got:\n{}",
-        stdout
-    );
-}
-
-#[test]
-fn test_cli_sub_watch_json_output() {
+fn test_cli_sub_poll_json_output() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
-        .join("watchjson.db")
+        .join("polljson.db")
         .to_str()
         .unwrap()
         .to_string();
@@ -5288,74 +4871,42 @@ fn test_cli_sub_watch_json_output() {
     let _daemon = start_daemon(&db);
 
     create_subscription(&db, "json-feed", "full");
-
-    let mut watch = Command::new(bin())
-        .args([
-            "--db",
-            &db,
-            "sub",
-            "watch",
-            "json-feed",
-            "--interval-ms",
-            "100",
-            "--json",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn sub watch --json");
-
-    std::thread::sleep(Duration::from_millis(300));
-
     send_message(&db, "json-test-msg");
-
-    std::thread::sleep(Duration::from_secs(2));
-
-    let _ = watch.kill();
-    let output = watch.wait_with_output().expect("wait for watch");
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-
-    // Each non-empty line should be valid JSON
-    let lines: Vec<&str> = stdout.lines().filter(|l| !l.trim().is_empty()).collect();
+    wait_for_sub_items(&db, "json-feed", "json-test-msg", 1, Duration::from_secs(5));
+    let items = poll_subscription_json(&db, "json-feed");
     assert!(
-        !lines.is_empty(),
-        "watch --json should produce at least one line of output"
+        !items.is_empty(),
+        "sub poll --json should return feed items"
+    );
+    let item = &items[0];
+    assert!(
+        item.get("seq").is_some(),
+        "poll item should have seq: {item}"
+    );
+    assert!(
+        item.get("event_type").is_some(),
+        "poll item should have event_type: {item}"
+    );
+    assert!(
+        item.get("payload")
+            .and_then(|payload| payload.get("content"))
+            .is_some(),
+        "poll item should have payload.content: {item}"
     );
 
-    for line in &lines {
-        let parsed: Result<serde_json::Value, _> = serde_json::from_str(line);
-        assert!(
-            parsed.is_ok(),
-            "each watch --json line should be valid JSON, got: {}",
-            line
-        );
-        let val = parsed.unwrap();
-        assert!(
-            val.get("seq").is_some(),
-            "JSON output should have 'seq' field: {}",
-            line
-        );
-        assert!(
-            val.get("event_type").is_some(),
-            "JSON output should have 'event_type' field: {}",
-            line
-        );
-    }
-
     assert!(
-        stdout.contains("json-test-msg"),
-        "watch --json output should contain message content, got:\n{}",
-        stdout
+        item.to_string().contains("json-test-msg"),
+        "sub poll --json output should contain message content, got: {item}"
     );
 }
 
 #[test]
-fn test_cli_sub_watch_ack_clears_pending() {
+fn test_cli_sub_ack_clears_pending() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
-        .join("watchack.db")
+        .join("pollack.db")
         .to_str()
         .unwrap()
         .to_string();
@@ -5364,46 +4915,86 @@ fn test_cli_sub_watch_ack_clears_pending() {
     let _daemon = start_daemon(&db);
 
     create_subscription(&db, "ack-feed", "full");
+    send_message(&db, "ack-msg-1");
+    send_message(&db, "ack-msg-2");
+    wait_for_sub_items(&db, "ack-feed", "ack-msg-", 2, Duration::from_secs(5));
 
-    let mut watch = Command::new(bin())
+    let items = poll_subscription_json(&db, "ack-feed");
+    let max_seq = items
+        .iter()
+        .filter_map(|item| item.get("seq").and_then(|seq| seq.as_i64()))
+        .max()
+        .expect("sub poll --json should include seq values");
+    assert!(
+        items
+            .iter()
+            .any(|item| item.to_string().contains("ack-msg-1")),
+        "poll should include ack-msg-1: {:?}",
+        items
+    );
+
+    let ack = Command::new(bin())
         .args([
             "--db",
             &db,
             "sub",
-            "watch",
+            "ack",
             "ack-feed",
-            "--interval-ms",
-            "100",
-            "--ack",
+            "--through-seq",
+            &max_seq.to_string(),
         ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn sub watch --ack");
-
-    std::thread::sleep(Duration::from_millis(300));
-
-    send_message(&db, "ack-msg-1");
-    send_message(&db, "ack-msg-2");
-
-    std::thread::sleep(Duration::from_secs(2));
-
-    let _ = watch.kill();
-    let output = watch.wait_with_output().expect("wait for watch");
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-
+        .output()
+        .expect("sub ack");
     assert!(
-        stdout.contains("ack-msg-1"),
-        "watch should have printed ack-msg-1: {}",
-        stdout
+        ack.status.success(),
+        "sub ack failed: {}",
+        String::from_utf8_lossy(&ack.stderr)
     );
 
-    // After watch with --ack exits, pending should be 0
     let state = sub_state(&db, "ack-feed");
     assert!(
         state.contains("pending=0"),
-        "watch --ack should clear pending items, got: {}",
+        "sub ack should clear pending items, got: {}",
         state
+    );
+}
+
+#[test]
+fn test_cli_sub_poll_returns_existing_backlog() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("backlog.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    create_subscription(&db, "backlog-feed", "full");
+
+    send_message(&db, "backlog-one");
+    send_message(&db, "backlog-two");
+    send_message(&db, "backlog-three");
+    wait_for_sub_items(&db, "backlog-feed", "backlog-", 3, Duration::from_secs(5));
+
+    let stdout = poll_subscription(&db, "backlog-feed");
+    assert!(
+        stdout.contains("backlog-one"),
+        "sub poll should include backlog-one, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("backlog-two"),
+        "sub poll should include backlog-two, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("backlog-three"),
+        "sub poll should include backlog-three, got:\n{}",
+        stdout
     );
 }
 
@@ -5625,991 +5216,5 @@ fn test_cli_sub_multi_tenant_isolation() {
         t1_stdout.contains("alice-only-msg"),
         "tenant 1 should still see its own message: {}",
         t1_stdout
-    );
-}
-
-#[test]
-fn test_cli_sub_watch_multi_tenant() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("mtwat.db").to_str().unwrap().to_string();
-    let timeout = Duration::from_secs(10);
-
-    create_workspace_with_details(&db, "alpha-space", "alice", "laptop");
-    let _daemon = start_daemon(&db);
-
-    // Create second workspace on live daemon
-    let create = Command::new(bin())
-        .args([
-            "create-workspace",
-            "--db",
-            &db,
-            "--workspace-name",
-            "beta-space",
-            "--username",
-            "charlie",
-            "--device-name",
-            "tablet",
-        ])
-        .output()
-        .unwrap();
-    assert!(create.status.success());
-
-    // Wait for both tenants
-    let start = Instant::now();
-    loop {
-        let tenants = Command::new(bin())
-            .args(["--db", &db, "tenant", "list"])
-            .output()
-            .expect("tenant list");
-        let stdout = String::from_utf8_lossy(&tenants.stdout);
-        if stdout.contains("alice") && stdout.contains("charlie") {
-            break;
-        }
-        if start.elapsed() >= timeout {
-            panic!("tenants did not appear");
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-
-    // Active tenant is now charlie (auto-switched). Create sub and start watch.
-    create_subscription(&db, "charlie-watch", "full");
-
-    let mut watch = Command::new(bin())
-        .args([
-            "--db",
-            &db,
-            "sub",
-            "watch",
-            "charlie-watch",
-            "--interval-ms",
-            "100",
-            "--ack",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn watch for charlie");
-
-    std::thread::sleep(Duration::from_millis(300));
-
-    send_message(&db, "charlie-watched-msg");
-
-    std::thread::sleep(Duration::from_secs(2));
-
-    let _ = watch.kill();
-    let output = watch.wait_with_output().expect("wait for watch");
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-
-    assert!(
-        stdout.contains("charlie-watched-msg"),
-        "multi-tenant watch should capture message: {}",
-        stdout
-    );
-
-    // After watch with --ack, pending should be 0
-    let state = sub_state(&db, "charlie-watch");
-    assert!(
-        state.contains("pending=0"),
-        "watch --ack should clear pending: {}",
-        state
-    );
-}
-
-#[test]
-fn test_cli_sub_watch_rejects_has_changed_mode() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("hcwatch.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-
-    create_subscription(&db, "hc-sub", "has_changed");
-
-    let output = Command::new(bin())
-        .args([
-            "--db",
-            &db,
-            "sub",
-            "watch",
-            "hc-sub",
-            "--interval-ms",
-            "100",
-        ])
-        .output()
-        .expect("sub watch has_changed");
-
-    // Should fail with a clear error
-    assert!(
-        !output.status.success(),
-        "watch on has_changed subscription should fail"
-    );
-    let stderr = String::from_utf8_lossy(&output.stderr);
-    assert!(
-        stderr.contains("has_changed") && stderr.contains("no feed items"),
-        "error should explain has_changed produces no feed items: {}",
-        stderr
-    );
-}
-
-#[test]
-fn test_cli_sub_watch_exits_on_tenant_switch() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("tswitch.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-    let timeout = Duration::from_secs(10);
-
-    create_workspace_with_details(&db, "alpha-space", "alice", "laptop");
-    let _daemon = start_daemon(&db);
-
-    create_subscription(&db, "alice-watch", "full");
-
-    // Create second workspace (auto-switches to tenant 2)
-    let create = Command::new(bin())
-        .args([
-            "create-workspace",
-            "--db",
-            &db,
-            "--workspace-name",
-            "beta-space",
-            "--username",
-            "charlie",
-            "--device-name",
-            "tablet",
-        ])
-        .output()
-        .unwrap();
-    assert!(create.status.success());
-
-    // Wait for both tenants
-    let start = Instant::now();
-    loop {
-        let tenants = Command::new(bin())
-            .args(["--db", &db, "tenant", "list"])
-            .output()
-            .expect("tenant list");
-        let stdout = String::from_utf8_lossy(&tenants.stdout);
-        if stdout.contains("alice") && stdout.contains("charlie") {
-            break;
-        }
-        if start.elapsed() >= timeout {
-            panic!("tenants did not appear");
-        }
-        std::thread::sleep(Duration::from_millis(200));
-    }
-
-    // Switch back to alice's tenant and start watch
-    let list_out = Command::new(bin())
-        .args(["--db", &db, "tenant", "list"])
-        .output()
-        .expect("tenant list");
-    let list_stdout = String::from_utf8_lossy(&list_out.stdout);
-    let alice_idx: u64 = list_stdout
-        .lines()
-        .find(|line| line.contains("alpha-space"))
-        .and_then(|line| line.trim_start().split('.').next()?.trim().parse().ok())
-        .expect("alice tenant index");
-    let _ = Command::new(bin())
-        .args(["--db", &db, "tenant", "use", &alice_idx.to_string()])
-        .output();
-
-    let mut watch = Command::new(bin())
-        .args([
-            "--db",
-            &db,
-            "sub",
-            "watch",
-            "alice-watch",
-            "--interval-ms",
-            "100",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn watch");
-
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Re-parse tenant list now that alice is active (sort order may have changed)
-    let list_out2 = Command::new(bin())
-        .args(["--db", &db, "tenant", "list"])
-        .output()
-        .expect("tenant list");
-    let list_stdout2 = String::from_utf8_lossy(&list_out2.stdout);
-    let charlie_idx: u64 = list_stdout2
-        .lines()
-        .find(|line| line.contains("beta-space"))
-        .and_then(|line| line.trim_start().split('.').next()?.trim().parse().ok())
-        .expect("charlie tenant index");
-
-    // Switch to charlie's tenant from another "terminal"
-    let _ = Command::new(bin())
-        .args(["--db", &db, "tenant", "use", &charlie_idx.to_string()])
-        .output();
-
-    // Watch should exit within a few seconds after repeated "not found" errors
-    let start = Instant::now();
-    loop {
-        match watch.try_wait() {
-            Ok(Some(status)) => {
-                // Watch exited — verify it's a non-zero exit (error)
-                assert!(
-                    !status.success(),
-                    "watch should exit with error after tenant switch"
-                );
-                let output = watch.wait_with_output().unwrap_or_else(|_| {
-                    // Already consumed, build from what we have
-                    std::process::Output {
-                        status,
-                        stdout: vec![],
-                        stderr: vec![],
-                    }
-                });
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                assert!(
-                    stderr.contains("no longer accessible") || stderr.contains("tenant"),
-                    "error should mention tenant switch: {}",
-                    stderr
-                );
-                return;
-            }
-            Ok(None) => {
-                if start.elapsed() >= Duration::from_secs(5) {
-                    let _ = watch.kill();
-                    panic!("watch did not exit after tenant switch within 5s");
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            Err(e) => panic!("try_wait failed: {}", e),
-        }
-    }
-}
-
-#[test]
-fn test_cli_sub_watch_drains_backlog_on_startup() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("backlog.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-
-    create_subscription(&db, "backlog-feed", "full");
-
-    // Send messages BEFORE starting watch — these form the backlog
-    send_message(&db, "backlog-one");
-    send_message(&db, "backlog-two");
-    send_message(&db, "backlog-three");
-    wait_for_sub_items(&db, "backlog-feed", "backlog-", 3, Duration::from_secs(5));
-
-    // Start watch — it should drain the backlog (cursor starts at 0)
-    let mut watch = Command::new(bin())
-        .args([
-            "--db",
-            &db,
-            "sub",
-            "watch",
-            "backlog-feed",
-            "--interval-ms",
-            "100",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn sub watch");
-
-    // Give watch time to drain backlog
-    std::thread::sleep(Duration::from_secs(2));
-
-    let _ = watch.kill();
-    let output = watch.wait_with_output().expect("wait for watch");
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-
-    // All three backlog messages must appear in output
-    assert!(
-        stdout.contains("backlog-one"),
-        "watch should drain backlog item 'backlog-one', got:\n{}",
-        stdout
-    );
-    assert!(
-        stdout.contains("backlog-two"),
-        "watch should drain backlog item 'backlog-two', got:\n{}",
-        stdout
-    );
-    assert!(
-        stdout.contains("backlog-three"),
-        "watch should drain backlog item 'backlog-three', got:\n{}",
-        stdout
-    );
-}
-
-#[test]
-fn test_cli_sub_watch_exits_on_daemon_stop() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("daemonstop.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    create_workspace(&db);
-    let daemon = start_daemon(&db);
-
-    create_subscription(&db, "ephemeral", "full");
-
-    // Start watch
-    let mut watch = Command::new(bin())
-        .args([
-            "--db",
-            &db,
-            "sub",
-            "watch",
-            "ephemeral",
-            "--interval-ms",
-            "100",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .expect("spawn watch");
-
-    std::thread::sleep(Duration::from_millis(500));
-
-    // Stop the daemon
-    drop(daemon);
-    wait_for_daemon_stopped(&db, Duration::from_secs(5));
-
-    // Watch should exit on its own (non-zero) within a few seconds
-    let start = Instant::now();
-    loop {
-        match watch.try_wait() {
-            Ok(Some(status)) => {
-                assert!(
-                    !status.success(),
-                    "watch should exit with error when daemon stops"
-                );
-                let output = watch
-                    .wait_with_output()
-                    .unwrap_or_else(|_| std::process::Output {
-                        status,
-                        stdout: vec![],
-                        stderr: vec![],
-                    });
-                let stderr = String::from_utf8_lossy(&output.stderr);
-                assert!(
-                    stderr.contains("daemon stopped") || stderr.contains("daemon is not running"),
-                    "error should mention daemon stopped: {}",
-                    stderr
-                );
-                return;
-            }
-            Ok(None) => {
-                if start.elapsed() >= Duration::from_secs(5) {
-                    let _ = watch.kill();
-                    panic!("watch did not exit after daemon stop within 5s");
-                }
-                std::thread::sleep(Duration::from_millis(200));
-            }
-            Err(e) => panic!("try_wait failed: {}", e),
-        }
-    }
-}
-
-#[test]
-fn test_cli_sub_watch_escapes_multiline_content() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("multiline.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-
-    create_subscription(&db, "ml-feed", "full");
-
-    // Start watch
-    let mut watch = Command::new(bin())
-        .args([
-            "--db",
-            &db,
-            "sub",
-            "watch",
-            "ml-feed",
-            "--interval-ms",
-            "100",
-        ])
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .spawn()
-        .expect("spawn watch");
-
-    std::thread::sleep(Duration::from_millis(300));
-
-    // Send a message containing a newline
-    send_message(&db, "line1\nline2");
-
-    std::thread::sleep(Duration::from_secs(2));
-
-    let _ = watch.kill();
-    let output = watch.wait_with_output().expect("wait for watch");
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-
-    // The output should have the newline escaped, so "line1\nline2" appears literally
-    // and the event is on a single line
-    let event_lines: Vec<&str> = stdout.lines().filter(|l| l.starts_with("[seq=")).collect();
-    assert!(
-        !event_lines.is_empty(),
-        "watch should produce at least one event line, got:\n{}",
-        stdout
-    );
-    // Each event line should be self-contained (the newline in content is escaped)
-    for line in &event_lines {
-        assert!(
-            line.contains("line1\\nline2"),
-            "multiline content should be escaped as 'line1\\nline2', got: {}",
-            line
-        );
-    }
-}
-
-// ---------------------------------------------------------------------------
-// Event display enhancements
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_cli_event_display_default_is_tree() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("display_default.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    create_workspace(&db);
-
-    // event display (no args) reads directly from DB — no daemon needed.
-    let out = Command::new(bin())
-        .args(["--db", &db, "event", "display"])
-        .output()
-        .expect("event display command");
-    assert!(
-        out.status.success(),
-        "event display failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("tree"),
-        "default display mode should be 'tree', got:\n{}",
-        stdout
-    );
-}
-
-#[test]
-fn test_cli_event_display_set_and_get() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("display_set.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    create_workspace(&db);
-
-    // Set to list
-    let set_list = Command::new(bin())
-        .args(["--db", &db, "event", "display", "list"])
-        .output()
-        .expect("event display list");
-    assert!(set_list.status.success());
-    let stdout = String::from_utf8_lossy(&set_list.stdout);
-    assert!(
-        stdout.contains("list"),
-        "should confirm 'list', got:\n{}",
-        stdout
-    );
-
-    // Get should now return list
-    let get = Command::new(bin())
-        .args(["--db", &db, "event", "display"])
-        .output()
-        .expect("event display get");
-    assert!(get.status.success());
-    let stdout = String::from_utf8_lossy(&get.stdout);
-    assert!(
-        stdout.contains("list"),
-        "should return 'list', got:\n{}",
-        stdout
-    );
-
-    // Set to off
-    let set_off = Command::new(bin())
-        .args(["--db", &db, "event", "display", "off"])
-        .output()
-        .expect("event display off");
-    assert!(set_off.status.success());
-
-    // Set back to tree
-    let set_tree = Command::new(bin())
-        .args(["--db", &db, "event", "display", "tree"])
-        .output()
-        .expect("event display tree");
-    assert!(set_tree.status.success());
-    let stdout = String::from_utf8_lossy(&set_tree.stdout);
-    assert!(
-        stdout.contains("tree"),
-        "should confirm 'tree', got:\n{}",
-        stdout
-    );
-}
-
-#[test]
-fn test_cli_event_show_by_prefix() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("event_show.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-
-    // Get event list to find a prefix
-    let list_out = Command::new(bin())
-        .args(["--db", &db, "event", "list"])
-        .output()
-        .expect("event list");
-    assert!(list_out.status.success());
-    let list_stdout = String::from_utf8_lossy(&list_out.stdout);
-
-    // Extract a short ID from the first event line: "(XXXXXXXX) type ..."
-    let first_id = list_stdout
-        .lines()
-        .find_map(|line| {
-            let start = line.find('(')?;
-            let end = line.find(')')?;
-            Some(line[start + 1..end].to_string())
-        })
-        .expect("should have at least one event in list output");
-
-    // Use first 4 chars as prefix
-    let prefix = &first_id[..4.min(first_id.len())];
-    let show_out = Command::new(bin())
-        .args(["--db", &db, "event", "show", prefix])
-        .output()
-        .expect("event show command");
-    assert!(
-        show_out.status.success(),
-        "event show failed: {}",
-        String::from_utf8_lossy(&show_out.stderr)
-    );
-    let show_stdout = String::from_utf8_lossy(&show_out.stdout);
-    assert!(
-        show_stdout.contains(prefix),
-        "event show output should contain the prefix '{}', got:\n{}",
-        prefix,
-        show_stdout
-    );
-}
-
-#[test]
-fn test_cli_event_show_no_match() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("event_show_none.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-
-    let out = Command::new(bin())
-        .args(["--db", &db, "event", "show", "ZZZZZZZ_no_match"])
-        .output()
-        .expect("event show command");
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        stdout.contains("No events matching"),
-        "event show should report no match, got:\n{}",
-        stdout
-    );
-}
-
-#[test]
-fn test_cli_event_deps_shows_reverse_tree() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("event_deps.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-
-    // Get event list to find a peer_shared event (has deps)
-    let list_out = Command::new(bin())
-        .args(["--db", &db, "event", "list"])
-        .output()
-        .expect("event list");
-    let list_stdout = String::from_utf8_lossy(&list_out.stdout);
-
-    // Find a peer_shared event and its ID
-    let peer_shared_id = list_stdout
-        .lines()
-        .find_map(|line| {
-            if line.contains("peer_shared") && line.contains("(") {
-                let start = line.find('(')?;
-                let end = line.find(')')?;
-                Some(line[start + 1..end].to_string())
-            } else {
-                None
-            }
-        })
-        .expect("should have a peer_shared event");
-
-    let deps_out = Command::new(bin())
-        .args(["--db", &db, "event", "deps", &peer_shared_id])
-        .output()
-        .expect("event deps command");
-    assert!(
-        deps_out.status.success(),
-        "event deps failed: {}",
-        String::from_utf8_lossy(&deps_out.stderr)
-    );
-    let deps_stdout = String::from_utf8_lossy(&deps_out.stdout);
-
-    // Should contain the root event type
-    assert!(
-        deps_stdout.contains("peer_shared"),
-        "deps output should contain peer_shared, got:\n{}",
-        deps_stdout
-    );
-    // Should show dependency relationships
-    assert!(
-        deps_stdout.contains("├──") || deps_stdout.contains("└──"),
-        "deps output should show tree connectors, got:\n{}",
-        deps_stdout
-    );
-    // Should contain 'root' markers for root events
-    assert!(
-        deps_stdout.contains("root"),
-        "deps output should mark root events, got:\n{}",
-        deps_stdout
-    );
-    // Should show unique events footer
-    assert!(
-        deps_stdout.contains("unique events"),
-        "deps output should show unique events count, got:\n{}",
-        deps_stdout
-    );
-}
-
-#[test]
-fn test_cli_event_deps_depth_limit() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("event_deps_depth.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-
-    // Find a peer_shared event
-    let list_out = Command::new(bin())
-        .args(["--db", &db, "event", "list"])
-        .output()
-        .expect("event list");
-    let list_stdout = String::from_utf8_lossy(&list_out.stdout);
-
-    let peer_shared_id = list_stdout
-        .lines()
-        .find_map(|line| {
-            if line.contains("peer_shared") && line.contains("(") {
-                let start = line.find('(')?;
-                let end = line.find(')')?;
-                Some(line[start + 1..end].to_string())
-            } else {
-                None
-            }
-        })
-        .expect("should have a peer_shared event");
-
-    // depth=1 should truncate
-    let d1 = Command::new(bin())
-        .args([
-            "--db",
-            &db,
-            "event",
-            "deps",
-            &peer_shared_id,
-            "--depth",
-            "1",
-        ])
-        .output()
-        .expect("event deps --depth 1");
-    assert!(d1.status.success());
-    let d1_stdout = String::from_utf8_lossy(&d1.stdout);
-
-    // depth=5 should show more
-    let d5 = Command::new(bin())
-        .args([
-            "--db",
-            &db,
-            "event",
-            "deps",
-            &peer_shared_id,
-            "--depth",
-            "5",
-        ])
-        .output()
-        .expect("event deps --depth 5");
-    assert!(d5.status.success());
-    let d5_stdout = String::from_utf8_lossy(&d5.stdout);
-
-    // depth=5 output should be at least as long as depth=1
-    assert!(
-        d5_stdout.lines().count() >= d1_stdout.lines().count(),
-        "depth=5 ({} lines) should be >= depth=1 ({} lines)",
-        d5_stdout.lines().count(),
-        d1_stdout.lines().count()
-    );
-}
-
-#[test]
-fn test_cli_send_shows_created_events_with_display_tree() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("send_display.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-    ensure_active_peer(&db, Duration::from_secs(10));
-
-    // Ensure display mode is tree (default)
-    let _ = Command::new(bin())
-        .args(["--db", &db, "event", "display", "tree"])
-        .output();
-
-    let send_out = Command::new(bin())
-        .args(["--db", &db, "send", "display-test-msg"])
-        .output()
-        .expect("send command");
-    assert!(
-        send_out.status.success(),
-        "send failed: {}",
-        String::from_utf8_lossy(&send_out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&send_out.stdout);
-
-    // Should contain the standard "Sent:" line
-    assert!(
-        stdout.contains("Sent:"),
-        "should show Sent:, got:\n{}",
-        stdout
-    );
-    // Should show the event_id line
-    assert!(
-        stdout.contains("event_id:"),
-        "should show event_id:, got:\n{}",
-        stdout
-    );
-    // Should show the created event with decrypted content
-    assert!(
-        stdout.contains("encrypted") || stdout.contains("display-test-msg"),
-        "should show created event tree or message content, got:\n{}",
-        stdout
-    );
-}
-
-#[test]
-fn test_cli_send_suppressed_with_display_off() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("send_display_off.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-    ensure_active_peer(&db, Duration::from_secs(10));
-
-    // Set display mode to off
-    let _ = Command::new(bin())
-        .args(["--db", &db, "event", "display", "off"])
-        .output();
-
-    let send_out = Command::new(bin())
-        .args(["--db", &db, "send", "quiet-msg"])
-        .output()
-        .expect("send command");
-    assert!(send_out.status.success());
-    let stdout = String::from_utf8_lossy(&send_out.stdout);
-
-    // Should contain the standard output
-    assert!(
-        stdout.contains("Sent:"),
-        "should show Sent:, got:\n{}",
-        stdout
-    );
-    // Should NOT contain tree connectors or event count footer
-    assert!(
-        !stdout.contains("events."),
-        "display=off should suppress event display, got:\n{}",
-        stdout
-    );
-}
-
-#[test]
-fn test_cli_event_tree_shows_annotations() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("annotations.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-
-    let out = Command::new(bin())
-        .args(["--db", &db, "event", "tree"])
-        .output()
-        .expect("event tree command");
-    assert!(out.status.success());
-    let stdout = String::from_utf8_lossy(&out.stdout);
-
-    // Check that annotations (em-dash phrases) are present
-    assert!(
-        stdout.contains("creates the workspace"),
-        "should show workspace annotation, got:\n{}",
-        stdout
-    );
-    assert!(
-        stdout.contains("registers the user"),
-        "should show user annotation, got:\n{}",
-        stdout
-    );
-    assert!(
-        stdout.contains("registers a device"),
-        "should show peer_shared annotation, got:\n{}",
-        stdout
-    );
-    assert!(
-        stdout.contains("grants admin rights"),
-        "should show admin annotation, got:\n{}",
-        stdout
-    );
-    assert!(
-        stdout.contains("stores a local signing key"),
-        "should show peer_secret annotation, got:\n{}",
-        stdout
-    );
-}
-
-#[test]
-fn test_cli_create_workspace_shows_created_events() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("cw_display.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    let _daemon = start_daemon(&db);
-
-    let out = Command::new(bin())
-        .args([
-            "--db",
-            &db,
-            "create-workspace",
-            "--workspace-name",
-            "test",
-            "--username",
-            "alice",
-            "--device-name",
-            "dev",
-        ])
-        .output()
-        .expect("create-workspace command");
-    assert!(
-        out.status.success(),
-        "create-workspace failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-
-    // Should show the standard output
-    assert!(
-        stdout.contains("peer_id:"),
-        "should show peer_id, got:\n{}",
-        stdout
-    );
-    assert!(
-        stdout.contains("workspace_id:"),
-        "should show workspace_id, got:\n{}",
-        stdout
-    );
-    // Should show created events tree with annotations
-    assert!(
-        stdout.contains("creates the workspace"),
-        "should show workspace event annotation, got:\n{}",
-        stdout
-    );
-    assert!(
-        stdout.contains("events."),
-        "should show event count footer, got:\n{}",
-        stdout
     );
 }

@@ -54,7 +54,7 @@ fn should_treat_as_startup_control_abort(
 /// concurrently.
 pub async fn run_sync_responder<C, S, R>(
     conn: DualConnection<C, S, R>,
-    session_id: u64,
+    _session_id: u64,
     db_path: &str,
     timeout_secs: u64,
     session_owner: &str,

@@ -354,7 +354,14 @@ where
             }
         }
 
-        enqueue_pending_have_to_egress(&egress, peer_id, &mut pending_have);
+        if let Err(err) =
+            enqueue_pending_have_to_egress(session_id, &egress, peer_id, &mut pending_have)
+        {
+            warn!(
+                "Session {} failed to queue pending Have ids for peer {}: {}",
+                session_id, peer_id, err
+            );
+        }
         let send_stats =
             drain_egress_to_data_stream(&egress, &store, peer_id, session_owner, &mut data_send)
                 .await;

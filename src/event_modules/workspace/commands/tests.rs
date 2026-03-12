@@ -62,6 +62,31 @@ fn create_user_invite_materializes_pending_bootstrap_trust_via_projection() {
         pending_rows, 1,
         "pending trust row should be materialized by projection path"
     );
+
+    let origin_project_queue_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM project_queue WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&recorded_by, &invite_event_b64],
+            |row| row.get(0),
+        )
+        .expect("query origin project_queue rows");
+    assert_eq!(
+        origin_project_queue_rows, 0,
+        "bootstrap-context local create should not rely on origin project_queue recovery rows"
+    );
+
+    let pending_fanout_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pending_shared_fanouts
+             WHERE origin_peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&recorded_by, invite.invite_event_id.as_slice()],
+            |row| row.get(0),
+        )
+        .expect("query pending fanout rows");
+    assert_eq!(
+        pending_fanout_rows, 0,
+        "bootstrap-context local create should not leave create-side pending fanout recovery rows"
+    );
 }
 
 #[test]

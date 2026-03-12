@@ -101,8 +101,6 @@ pub(crate) fn peer_fingerprint_from_hex(peer_id: &str) -> Option<[u8; 32]> {
     Some(fp)
 }
 
-<<<<<<< HEAD
-=======
 pub(crate) fn preferred_connection_direction(
     local_peer_id: &str,
     remote_peer_id: &str,
@@ -231,4 +229,118 @@ pub(crate) fn claim_live_connection_slot(
                 LiveConnectionClaim::Acquired(LiveConnectionLease { key, claim_id })
             }
             Some(existing) if direction_rank > existing.direction_rank => {
-  
+                let released = Arc::new(tokio::sync::Notify::new());
+                replaced = Some((existing.connection.clone(), existing.released.clone()));
+                *existing = LiveConnectionSlot {
+                    claim_id,
+                    direction,
+                    direction_rank,
+                    connection,
+                    released,
+                };
+                LiveConnectionClaim::Acquired(LiveConnectionLease { key, claim_id })
+            }
+            Some(existing) => LiveConnectionClaim::Occupied(LiveConnectionOccupied {
+                preferred_direction,
+                active_direction: existing.direction,
+                released: existing.released.clone(),
+            }),
+        }
+    };
+
+    if let Some((existing_connection, released)) = replaced {
+        existing_connection.close(0u32.into(), b"replaced by preferred peer connection");
+        released.notify_waiters();
+    }
+
+    claim
+}
+
+// ---------------------------------------------------------------------------
+// Transport↔peering session seam
+// ---------------------------------------------------------------------------
+
+/// Run a single sync session using a pre-built `TransportSessionIo`.
+///
+/// This is the peering orchestration seam: it wires session metadata,
+/// cancellation, and the session handler together. Transport
+/// details (stream opening, `DualConnection`, `QuicTransportSessionIo`)
+/// are handled by `transport::session_factory` before this is called.
+pub(super) async fn run_session(
+    handler: &SyncSessionHandler,
+    session_id: u64,
+    io: Box<dyn TransportSessionIo>,
+    tenant_id: &str,
+    peer_fp: [u8; 32],
+    remote_addr: SocketAddr,
+    direction: SessionDirection,
+    _db_path: &str,
+) {
+    let meta = SessionMeta {
+        session_id,
+        tenant: TenantId(tenant_id.to_string()),
+        peer: PeerFingerprint(peer_fp),
+        remote_addr,
+        direction,
+    };
+    let cancel = CancellationToken::new();
+
+    if let Err(e) = handler.on_session(meta, io, cancel.clone()).await {
+        let label = match direction {
+            SessionDirection::Outbound => "Initiator",
+            SessionDirection::Inbound => "Responder",
+        };
+        if let Some(reason) = extract_build_mismatch_reason(&e) {
+            let peer_id = hex::encode(peer_fp);
+            let key = format!("session-build-mismatch:{label}:{peer_id}:{direction:?}");
+            if should_emit_globally(key) {
+                warn!(
+                    "{} session rejected by peer {}: {}",
+                    label,
+                    &peer_id[..16.min(peer_id.len())],
+                    reason
+                );
+            }
+        } else {
+            warn!("{} session error: {}", label, e);
+        }
+    }
+    cancel.cancel();
+}
+
+pub(super) use crate::tuning::drain_batch_size;
+pub(super) use crate::tuning::shared_ingest_cap;
+
+#[cfg(test)]
+mod tests {
+    use super::{preferred_connection_direction, SessionDirection};
+
+    #[test]
+    fn preferred_connection_direction_is_symmetric() {
+        let lower = format!("{:064x}", 1);
+        let higher = format!("{:064x}", 2);
+
+        assert_eq!(
+            preferred_connection_direction(&lower, &higher),
+            Some(SessionDirection::Outbound)
+        );
+        assert_eq!(
+            preferred_connection_direction(&higher, &lower),
+            Some(SessionDirection::Inbound)
+        );
+    }
+
+    #[test]
+    fn preferred_connection_direction_defaults_to_outbound_for_equal_ids() {
+        let peer = format!("{:064x}", 9);
+        assert_eq!(
+            preferred_connection_direction(&peer, &peer),
+            Some(SessionDirection::Outbound)
+        );
+    }
+
+    #[test]
+    fn preferred_connection_direction_returns_none_for_invalid_peer_ids() {
+        assert_eq!(preferred_connection_direction("not-hex", "also-bad"), None);
+    }
+}

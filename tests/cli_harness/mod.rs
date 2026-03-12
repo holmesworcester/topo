@@ -8,12 +8,36 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use topo::testutil::DaemonGuard;
 
 const DAEMON_START_MAX_ATTEMPTS: usize = 8;
 const DAEMON_START_RETRY_BASE_MS: u64 = 100;
+
+fn test_daemon_pids() -> &'static Mutex<Vec<u32>> {
+    static PIDS: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
+    PIDS.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn record_test_daemon_pid(pid: u32) {
+    let mut pids = test_daemon_pids()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    pids.push(pid);
+}
+
+pub fn cleanup_test_daemons() {
+    let mut pids = test_daemon_pids()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    for pid in pids.drain(..) {
+        unsafe {
+            libc::kill(pid as i32, libc::SIGKILL);
+            libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG);
+        }
+    }
+}
 
 // ---------------------------------------------------------------------------
 // Core utilities
@@ -38,7 +62,12 @@ pub fn temp_db() -> (tempfile::TempDir, String) {
 fn hold_network_test_binary_lock() {
     static LOCK_HELD: OnceLock<()> = OnceLock::new();
     LOCK_HELD.get_or_init(|| {
-        let lock_path = std::env::temp_dir().join("topo-network-tests.lock");
+        let mut hasher = std::collections::hash_map::DefaultHasher::new();
+        use std::hash::Hash;
+        use std::hash::Hasher;
+        env!("CARGO_MANIFEST_DIR").hash(&mut hasher);
+        let lock_path =
+            std::env::temp_dir().join(format!("topo-network-tests-{:016x}.lock", hasher.finish()));
         let file = std::fs::OpenOptions::new()
             .create(true)
             .read(true)
@@ -298,6 +327,8 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
                 .output()
                 .expect("failed to probe daemon tenant active");
             if out.status.success() {
+                wait_for_accepted_local_peer_signers_ready(db, Duration::from_secs(60));
+                record_test_daemon_pid(child.id());
                 return DaemonGuard::new(child);
             }
             if rpc_start.elapsed().as_secs() >= 5 {
@@ -324,6 +355,78 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
     }
 
     panic!("daemon failed to start after retries (db={})", db);
+}
+
+fn wait_for_accepted_local_peer_signers(db: &str, timeout: Duration) -> Result<(), String> {
+    let start = Instant::now();
+    while start.elapsed() < timeout {
+        if let Ok(conn) = topo::db::open_connection(db) {
+            let invites_accepted: i64 = conn
+                .query_row("SELECT COUNT(*) FROM invites_accepted", [], |row| {
+                    row.get(0)
+                })
+                .unwrap_or(0);
+            if invites_accepted == 0 {
+                return Ok(());
+            }
+            let peer_signers: i64 = conn
+                .query_row(
+                    "SELECT COUNT(DISTINCT recorded_by) FROM peer_secrets",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            if peer_signers >= invites_accepted {
+                return Ok(());
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+
+    let debug = topo::db::open_connection(db)
+        .ok()
+        .map(|conn| {
+            let invites: i64 = conn
+                .query_row("SELECT COUNT(*) FROM invites_accepted", [], |row| {
+                    row.get(0)
+                })
+                .unwrap_or(0);
+            let peer_signers: i64 = conn
+                .query_row(
+                    "SELECT COUNT(DISTINCT recorded_by) FROM peer_secrets",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let accepted = conn
+                .prepare(
+                    "SELECT recorded_by, created_at
+                     FROM invites_accepted
+                     ORDER BY created_at ASC, event_id ASC",
+                )
+                .and_then(|mut stmt| {
+                    stmt.query_map([], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+                    })?
+                    .collect::<Result<Vec<_>, _>>()
+                })
+                .unwrap_or_default();
+            format!(
+                "invites_accepted={}, peer_signers={}, accepted={:?}",
+                invites, peer_signers, accepted
+            )
+        })
+        .unwrap_or_else(|| "db-open-failed".to_string());
+    Err(format!(
+        "accepted local peer signers not materialized within {:?} (db={}): {}",
+        timeout, db, debug
+    ))
+}
+
+fn wait_for_accepted_local_peer_signers_ready(db: &str, timeout: Duration) {
+    if let Err(debug) = wait_for_accepted_local_peer_signers(db, timeout) {
+        panic!("{}", debug);
+    }
 }
 
 /// Wait for the daemon's RPC socket to appear.
@@ -850,7 +953,6 @@ pub fn accept_device_link_with_name_and_timeout(
             "accept-link",
             "--db",
             db,
-            "--invite",
             invite_link,
             "--devicename",
             devicename,
@@ -1069,6 +1171,36 @@ pub fn assert_now(db: &str, predicate: &str) {
     );
 }
 
+fn assert_eventually_debug_context(db: &str) -> String {
+    fn run(db: &str, args: &[&str]) -> String {
+        let output = Command::new(bin())
+            .arg("--db")
+            .arg(db)
+            .args(args)
+            .output()
+            .ok();
+        match output {
+            Some(output) if output.status.success() => {
+                String::from_utf8_lossy(&output.stdout).trim().to_string()
+            }
+            Some(output) => format!(
+                "ERR: {}",
+                String::from_utf8_lossy(&output.stderr).trim().to_string()
+            ),
+            None => "ERR: command failed to spawn".to_string(),
+        }
+    }
+
+    format!(
+        "active={}\ntenants=\n{}\nusers=\n{}\nmessages=\n{}\nstatus=\n{}",
+        run(db, &["tenant", "active"]),
+        run(db, &["tenant", "list"]),
+        run(db, &["users"]),
+        run(db, &["messages"]),
+        run(db, &["status"]),
+    )
+}
+
 /// Assert a predicate eventually holds (via `topo assert-eventually`).
 pub fn assert_eventually(db: &str, predicate: &str, timeout_ms: u64) {
     let output = Command::new(bin())
@@ -1081,11 +1213,13 @@ pub fn assert_eventually(db: &str, predicate: &str, timeout_ms: u64) {
         .output()
         .expect("failed to run assert-eventually");
     let text = String::from_utf8_lossy(&output.stdout);
+    let debug = assert_eventually_debug_context(db);
     assert!(
         output.status.success(),
-        "assert-eventually timed out: {} ({})",
+        "assert-eventually timed out: {} ({})\n{}",
         predicate,
-        text.trim()
+        text.trim(),
+        debug
     );
 }
 
@@ -1560,4 +1694,36 @@ pub fn save_file(db: &str, file_target: &str, output_path: &str) -> Output {
         .expect("failed to run save-file")
 }
 
-pub fn save_file_eventually(db: &str, file
+pub fn save_file_eventually(db: &str, file_target: &str, output_path: &str, timeout: Duration) {
+    let start = Instant::now();
+    loop {
+        let output = save_file(db, file_target, output_path);
+        if output.status.success() {
+            return;
+        }
+
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let retryable =
+            stderr.contains("file incomplete") || stderr.contains("invalid file number");
+        assert!(
+            retryable && start.elapsed() < timeout,
+            "save-file failed before {:?}: {}",
+            timeout,
+            stderr.trim()
+        );
+        std::thread::sleep(Duration::from_millis(200));
+    }
+}
+
+/// Return `topo assert-eventually` output without asserting success.
+pub fn topo_assert_eventually(db: &str, predicate: &str, timeout_ms: u64) -> Output {
+    topo_cmd(
+        db,
+        &[
+            "assert-eventually",
+            predicate,
+            "--timeout-ms",
+            &timeout_ms.to_string(),
+        ],
+    )
+}

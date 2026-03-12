@@ -48,6 +48,7 @@ fn test_invite_only_daemons_should_autodial_without_manual_connect() {
     let _alice = start_daemon(&alice_db);
     accept_invite_lightweight(&bob_db, &invite_link);
     let _bob = start_daemon(&bob_db);
+    wait_for_local_peer_signer_ready(&bob_db, std::time::Duration::from_secs(60));
 
     // Desired behavior: after invite acceptance, daemons should autodial based on
     // persisted bootstrap/discovery state, with no manual connect flag.
@@ -84,6 +85,7 @@ fn test_daemon_cli_invite_lifecycle_works_without_restart() {
 
     // Bob starts daemon after accept — auto-selects the shared workspace peer.
     let _bob = start_daemon(&bob_db);
+    wait_for_local_peer_signer_ready(&bob_db, std::time::Duration::from_secs(60));
 
     // Bob sends a message in the shared workspace via daemon RPC.
     let bob_event_id = topo_send_retry(&bob_db, "runtime-accept-no-restart");
