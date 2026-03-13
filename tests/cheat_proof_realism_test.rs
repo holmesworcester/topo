@@ -16,7 +16,12 @@ use std::sync::{Mutex, OnceLock};
 
 fn realism_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    let guard = LOCK
+        .get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    cleanup_test_daemons();
+    guard
 }
 
 fn bootstrap_alice_and_invite(tmpdir: &tempfile::TempDir) -> (String, String, String) {
@@ -27,7 +32,7 @@ fn bootstrap_alice_and_invite(tmpdir: &tempfile::TempDir) -> (String, String, St
     create_workspace(&alice_db);
 
     // Start Alice's daemon so we can create invites via RPC
-    let _alice_daemon = start_daemon(&alice_db);
+    let _alice_daemon = start_discovery_daemon(&alice_db);
 
     // Create invite via daemon RPC
     let invite_link = topo_create_invite_retry(&alice_db, &daemon_listen_addr(&alice_db));
@@ -45,10 +50,9 @@ fn test_invite_only_daemons_should_autodial_without_manual_connect() {
     let tmpdir = tempfile::tempdir().unwrap();
     let (alice_db, bob_db, invite_link) = bootstrap_alice_and_invite(&tmpdir);
 
-    let _alice = start_daemon(&alice_db);
+    let _alice = start_discovery_daemon(&alice_db);
     accept_invite_lightweight(&bob_db, &invite_link);
-    let _bob = start_daemon(&bob_db);
-    wait_for_local_peer_signer_ready(&bob_db, std::time::Duration::from_secs(60));
+    let _bob = start_discovery_daemon(&bob_db);
 
     // Desired behavior: after invite acceptance, daemons should autodial based on
     // persisted bootstrap/discovery state, with no manual connect flag.
@@ -75,7 +79,7 @@ fn test_daemon_cli_invite_lifecycle_works_without_restart() {
 
     // Create workspace for Alice and start her daemon.
     create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
+    let _alice = start_discovery_daemon(&alice_db);
 
     // Create invite while Alice's daemon is running (via RPC).
     let invite_link = topo_create_invite_retry(&alice_db, &daemon_listen_addr(&alice_db));
@@ -83,9 +87,9 @@ fn test_daemon_cli_invite_lifecycle_works_without_restart() {
     // Bob accepts invite before starting daemon (daemon-routed CLI command).
     accept_invite_lightweight(&bob_db, &invite_link);
 
-    // Bob starts daemon after accept — auto-selects the shared workspace peer.
+    // Bob starts daemon after accept — the persisted invite bootstrap should
+    // be enough here because Alice stayed on the same running daemon/path.
     let _bob = start_daemon(&bob_db);
-    wait_for_local_peer_signer_ready(&bob_db, std::time::Duration::from_secs(60));
 
     // Bob sends a message in the shared workspace via daemon RPC.
     let bob_event_id = topo_send_retry(&bob_db, "runtime-accept-no-restart");

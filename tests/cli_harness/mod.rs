@@ -8,33 +8,69 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
-use std::sync::{Mutex, OnceLock};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use topo::testutil::DaemonGuard;
 
 const DAEMON_START_MAX_ATTEMPTS: usize = 8;
 const DAEMON_START_RETRY_BASE_MS: u64 = 100;
 
-fn test_daemon_pids() -> &'static Mutex<Vec<u32>> {
-    static PIDS: OnceLock<Mutex<Vec<u32>>> = OnceLock::new();
-    PIDS.get_or_init(|| Mutex::new(Vec::new()))
-}
-
-fn record_test_daemon_pid(pid: u32) {
-    let mut pids = test_daemon_pids()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    pids.push(pid);
-}
-
 pub fn cleanup_test_daemons() {
-    let mut pids = test_daemon_pids()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    for pid in pids.drain(..) {
+    hold_network_test_binary_lock();
+    let repo_prefixes = repo_test_binary_prefixes();
+    let self_pid = std::process::id();
+    let children_path = format!("/proc/{self_pid}/task/{self_pid}/children");
+    let direct_children: std::collections::HashSet<i32> = std::fs::read_to_string(children_path)
+        .ok()
+        .map(|children| {
+            children
+                .split_whitespace()
+                .filter_map(|pid| pid.parse::<i32>().ok())
+                .collect()
+        })
+        .unwrap_or_default();
+    let mut candidate_pids = direct_children.clone();
+    let proc_entries = match std::fs::read_dir("/proc") {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in proc_entries.flatten() {
+        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
+            continue;
+        };
+        if pid <= 0 || pid == self_pid as i32 {
+            continue;
+        }
+        let cmdline_path = format!("/proc/{pid}/cmdline");
+        let Ok(cmdline) = std::fs::read(&cmdline_path) else {
+            continue;
+        };
+        let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
+        let is_repo_daemon = repo_prefixes
+            .iter()
+            .any(|prefix| cmdline.starts_with(prefix))
+            && cmdline.contains(" start ")
+            && cmdline.contains(" --db ");
+        if is_repo_daemon {
+            candidate_pids.insert(pid);
+        }
+    }
+    let mut candidate_pids: Vec<i32> = candidate_pids.into_iter().collect();
+    candidate_pids.sort_unstable();
+    for pid in candidate_pids {
         unsafe {
-            libc::kill(pid as i32, libc::SIGKILL);
-            libc::waitpid(pid as i32, std::ptr::null_mut(), libc::WNOHANG);
+            libc::kill(pid, libc::SIGKILL);
+        }
+        if direct_children.contains(&pid) {
+            unsafe {
+                let _ = libc::waitpid(pid, std::ptr::null_mut(), 0);
+            }
+            continue;
+        }
+        let proc_pid = format!("/proc/{pid}");
+        let start = Instant::now();
+        while start.elapsed() < Duration::from_secs(2) && std::path::Path::new(&proc_pid).exists() {
+            std::thread::sleep(Duration::from_millis(20));
         }
     }
 }
@@ -45,6 +81,65 @@ pub fn cleanup_test_daemons() {
 
 pub fn bin() -> String {
     env!("CARGO_BIN_EXE_topo").to_string()
+}
+
+fn git_common_dir() -> String {
+    static COMMON_DIR: OnceLock<String> = OnceLock::new();
+    COMMON_DIR
+        .get_or_init(|| {
+            let out = Command::new("git")
+                .args([
+                    "-C",
+                    env!("CARGO_MANIFEST_DIR"),
+                    "rev-parse",
+                    "--git-common-dir",
+                ])
+                .output()
+                .expect("run git rev-parse --git-common-dir");
+            if !out.status.success() {
+                panic!(
+                    "git rev-parse --git-common-dir failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            String::from_utf8_lossy(&out.stdout).trim().to_string()
+        })
+        .clone()
+}
+
+fn repo_test_binary_prefixes() -> Vec<String> {
+    static PREFIXES: OnceLock<Vec<String>> = OnceLock::new();
+    PREFIXES
+        .get_or_init(|| {
+            let mut prefixes = vec![format!("{} ", bin())];
+            let out = Command::new("git")
+                .args([
+                    "-C",
+                    env!("CARGO_MANIFEST_DIR"),
+                    "worktree",
+                    "list",
+                    "--porcelain",
+                ])
+                .output()
+                .expect("run git worktree list --porcelain");
+            if !out.status.success() {
+                panic!(
+                    "git worktree list --porcelain failed: {}",
+                    String::from_utf8_lossy(&out.stderr)
+                );
+            }
+            for line in String::from_utf8_lossy(&out.stdout).lines() {
+                let Some(path) = line.strip_prefix("worktree ") else {
+                    continue;
+                };
+                prefixes.push(format!("{path}/target/debug/topo "));
+                prefixes.push(format!("{path}/target/release/topo "));
+            }
+            prefixes.sort();
+            prefixes.dedup();
+            prefixes
+        })
+        .clone()
 }
 
 /// Pick a random port in the ephemeral range to avoid conflicts.
@@ -65,7 +160,7 @@ fn hold_network_test_binary_lock() {
         let mut hasher = std::collections::hash_map::DefaultHasher::new();
         use std::hash::Hash;
         use std::hash::Hasher;
-        env!("CARGO_MANIFEST_DIR").hash(&mut hasher);
+        git_common_dir().hash(&mut hasher);
         let lock_path =
             std::env::temp_dir().join(format!("topo-network-tests-{:016x}.lock", hasher.finish()));
         let file = std::fs::OpenOptions::new()
@@ -151,6 +246,8 @@ fn run_cli_with_db_lock_retry(args: &[&str], description: &str, timeout: Duratio
 
 /// Options for starting a daemon.
 pub struct DaemonOptions {
+    /// IP address to bind to. None = 127.0.0.1 for deterministic local tests.
+    pub bind_ip: Option<String>,
     /// Specific port to bind to. None = random (127.0.0.1:0).
     pub bind_port: Option<u16>,
     /// Disable placeholder autodial via environment variable.
@@ -170,6 +267,7 @@ pub struct DaemonOptions {
 impl Default for DaemonOptions {
     fn default() -> Self {
         Self {
+            bind_ip: None,
             bind_port: None,
             disable_placeholder_autodial: false,
             disable_discovery: false,
@@ -195,7 +293,13 @@ fn daemon_inherit_stdio_env() -> bool {
 
 /// Start a daemon with default options (random port, suppressed I/O).
 pub fn start_daemon(db: &str) -> DaemonGuard {
-    start_daemon_with_options(db, &DaemonOptions::default())
+    start_daemon_with_options(
+        db,
+        &DaemonOptions {
+            disable_discovery: true,
+            ..Default::default()
+        },
+    )
 }
 
 /// Start a daemon on a specific port with suppressed I/O.
@@ -204,6 +308,32 @@ pub fn start_daemon_on_port(db: &str, port: u16) -> DaemonGuard {
         db,
         &DaemonOptions {
             bind_port: Some(port),
+            disable_discovery: true,
+            ..Default::default()
+        },
+    )
+}
+
+/// Start a daemon with mDNS discovery enabled.
+pub fn start_discovery_daemon(db: &str) -> DaemonGuard {
+    start_daemon_with_options(
+        db,
+        &DaemonOptions {
+            bind_ip: Some("0.0.0.0".to_string()),
+            extra_env: vec![("P7_TEST_DISCOVERY_LOOPBACK".to_string(), "1".to_string())],
+            ..Default::default()
+        },
+    )
+}
+
+/// Start a discovery-enabled daemon on a specific port.
+pub fn start_discovery_daemon_on_port(db: &str, port: u16) -> DaemonGuard {
+    start_daemon_with_options(
+        db,
+        &DaemonOptions {
+            bind_ip: Some("0.0.0.0".to_string()),
+            bind_port: Some(port),
+            extra_env: vec![("P7_TEST_DISCOVERY_LOOPBACK".to_string(), "1".to_string())],
             ..Default::default()
         },
     )
@@ -213,15 +343,16 @@ pub fn start_daemon_on_port(db: &str, port: u16) -> DaemonGuard {
 pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard {
     hold_network_test_binary_lock();
     let socket = socket_path_for_db(db);
+    let bind_ip = opts.bind_ip.as_deref().unwrap_or("127.0.0.1");
     let requested_bind_addr = match opts.bind_port {
-        Some(port) => format!("127.0.0.1:{}", port),
-        None => "127.0.0.1:0".to_string(),
+        Some(port) => format!("{bind_ip}:{port}"),
+        None => format!("{bind_ip}:0"),
     };
     let mut retry_with_ephemeral_bind = false;
 
     for attempt in 0..DAEMON_START_MAX_ATTEMPTS {
         let bind_addr = if retry_with_ephemeral_bind {
-            "127.0.0.1:0".to_string()
+            format!("{bind_ip}:0")
         } else {
             requested_bind_addr.clone()
         };
@@ -327,8 +458,6 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
                 .output()
                 .expect("failed to probe daemon tenant active");
             if out.status.success() {
-                wait_for_accepted_local_peer_signers_ready(db, Duration::from_secs(60));
-                record_test_daemon_pid(child.id());
                 return DaemonGuard::new(child);
             }
             if rpc_start.elapsed().as_secs() >= 5 {
@@ -355,78 +484,6 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
     }
 
     panic!("daemon failed to start after retries (db={})", db);
-}
-
-fn wait_for_accepted_local_peer_signers(db: &str, timeout: Duration) -> Result<(), String> {
-    let start = Instant::now();
-    while start.elapsed() < timeout {
-        if let Ok(conn) = topo::db::open_connection(db) {
-            let invites_accepted: i64 = conn
-                .query_row("SELECT COUNT(*) FROM invites_accepted", [], |row| {
-                    row.get(0)
-                })
-                .unwrap_or(0);
-            if invites_accepted == 0 {
-                return Ok(());
-            }
-            let peer_signers: i64 = conn
-                .query_row(
-                    "SELECT COUNT(DISTINCT recorded_by) FROM peer_secrets",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-            if peer_signers >= invites_accepted {
-                return Ok(());
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-
-    let debug = topo::db::open_connection(db)
-        .ok()
-        .map(|conn| {
-            let invites: i64 = conn
-                .query_row("SELECT COUNT(*) FROM invites_accepted", [], |row| {
-                    row.get(0)
-                })
-                .unwrap_or(0);
-            let peer_signers: i64 = conn
-                .query_row(
-                    "SELECT COUNT(DISTINCT recorded_by) FROM peer_secrets",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-            let accepted = conn
-                .prepare(
-                    "SELECT recorded_by, created_at
-                     FROM invites_accepted
-                     ORDER BY created_at ASC, event_id ASC",
-                )
-                .and_then(|mut stmt| {
-                    stmt.query_map([], |row| {
-                        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-                    })?
-                    .collect::<Result<Vec<_>, _>>()
-                })
-                .unwrap_or_default();
-            format!(
-                "invites_accepted={}, peer_signers={}, accepted={:?}",
-                invites, peer_signers, accepted
-            )
-        })
-        .unwrap_or_else(|| "db-open-failed".to_string());
-    Err(format!(
-        "accepted local peer signers not materialized within {:?} (db={}): {}",
-        timeout, db, debug
-    ))
-}
-
-fn wait_for_accepted_local_peer_signers_ready(db: &str, timeout: Duration) {
-    if let Err(debug) = wait_for_accepted_local_peer_signers(db, timeout) {
-        panic!("{}", debug);
-    }
 }
 
 /// Wait for the daemon's RPC socket to appear.
@@ -522,6 +579,97 @@ pub fn status_via_rpc(socket: &PathBuf) -> serde_json::Value {
     resp.data.expect("status response missing data")
 }
 
+fn try_status_via_rpc_for_db(db: &str) -> Result<serde_json::Value, String> {
+    let socket = socket_path_for_db(db);
+    let resp = topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::Status)
+        .map_err(|err| err.to_string())?;
+    if !resp.ok {
+        return Err(resp
+            .error
+            .unwrap_or_else(|| "status RPC returned error".to_string()));
+    }
+    resp.data
+        .ok_or_else(|| "status response missing data".to_string())
+}
+
+fn status_tenant_count(data: &serde_json::Value) -> usize {
+    data.get("tenants")
+        .and_then(|tenants| tenants.as_array())
+        .map(|tenants| tenants.len())
+        .unwrap_or(0)
+}
+
+pub fn wait_for_tenant_count(db: &str, min_count: usize, timeout: Duration) -> serde_json::Value {
+    let result = assert_value_eventually(
+        timeout,
+        Duration::from_millis(100),
+        &format!("tenant count >= {min_count}"),
+        || try_status_via_rpc_for_db(db),
+        |result| match result {
+            Ok(data) => status_tenant_count(data) >= min_count,
+            Err(_) => false,
+        },
+    );
+    match result {
+        Ok(data) => data,
+        Err(err) => panic!("status RPC did not become available for {}: {}", db, err),
+    }
+}
+
+pub fn wait_for_active_tenant_ready(db: &str, timeout: Duration) -> serde_json::Value {
+    let result = assert_value_eventually(
+        timeout,
+        Duration::from_millis(100),
+        "active tenant ready",
+        || try_status_via_rpc_for_db(db),
+        |result| match result {
+            Ok(data) => data["tenants"]
+                .as_array()
+                .map(|tenants| {
+                    tenants.iter().any(|tenant| {
+                        tenant["active"].as_bool().unwrap_or(false)
+                            && tenant["ready"].as_bool().unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false),
+            Err(_) => false,
+        },
+    );
+    match result {
+        Ok(data) => data,
+        Err(err) => panic!("status RPC did not become available for {}: {}", db, err),
+    }
+}
+
+pub fn wait_for_tenant_ready_by_username(
+    db: &str,
+    username: &str,
+    timeout: Duration,
+) -> serde_json::Value {
+    let result = assert_value_eventually(
+        timeout,
+        Duration::from_millis(100),
+        &format!("tenant `{username}` ready"),
+        || try_status_via_rpc_for_db(db),
+        |result| match result {
+            Ok(data) => data["tenants"]
+                .as_array()
+                .map(|tenants| {
+                    tenants.iter().any(|tenant| {
+                        tenant["username"].as_str() == Some(username)
+                            && tenant["ready"].as_bool().unwrap_or(false)
+                    })
+                })
+                .unwrap_or(false),
+            Err(_) => false,
+        },
+    );
+    match result {
+        Ok(data) => data,
+        Err(err) => panic!("status RPC did not become available for {}: {}", db, err),
+    }
+}
+
 /// Poll the daemon until runtime_state reaches `expected`, returning status data.
 pub fn wait_for_runtime_state(
     socket: &PathBuf,
@@ -551,11 +699,22 @@ pub fn daemon_listen_addr(db: &str) -> String {
         .expect("status RPC for listen addr");
     assert!(resp.ok, "status RPC returned error");
     let data = resp.data.expect("status response missing data");
-    data.get("runtime")
+    let listen_addr = data
+        .get("runtime")
         .and_then(|r| r.get("listen_addr"))
         .and_then(|v| v.as_str())
         .map(str::to_string)
-        .expect("status response missing runtime.listen_addr")
+        .expect("status response missing runtime.listen_addr");
+    listen_addr
+        .parse::<std::net::SocketAddr>()
+        .map(|addr| {
+            if addr.ip().is_unspecified() {
+                std::net::SocketAddr::from((std::net::Ipv4Addr::LOCALHOST, addr.port())).to_string()
+            } else {
+                addr.to_string()
+            }
+        })
+        .unwrap_or(listen_addr)
 }
 
 /// Get the daemon's transport SPKI fingerprint (first key from transport-keys).
@@ -771,7 +930,7 @@ pub fn send_message(db: &str, content: &str) -> String {
             continue;
         }
         let readiness_debug = if stderr.contains("workspace has not completed initial sync yet") {
-            wait_for_local_peer_signer(db, Duration::from_secs(1))
+            wait_for_active_tenant_ready_debug(db, Duration::from_secs(1))
                 .err()
                 .map(|debug| format!(" ({debug})"))
                 .unwrap_or_default()
@@ -850,6 +1009,13 @@ pub fn create_device_link_with_spki(
         .to_string()
 }
 
+fn invite_has_empty_bootstrap_addrs(invite_link: &str) -> bool {
+    matches!(
+        topo::event_modules::workspace::invite_link::parse_invite_link(invite_link),
+        Ok(invite) if invite.bootstrap_addrs.is_empty()
+    )
+}
+
 /// Accept an invite via daemon RPC using a temporary daemon.
 /// Waits for tenant discovery and stops the daemon cleanly afterward.
 pub fn accept_invite(db: &str, invite_link: &str) {
@@ -858,17 +1024,12 @@ pub fn accept_invite(db: &str, invite_link: &str) {
 
 /// Accept an invite with custom username and device name.
 pub fn accept_invite_with_identity(db: &str, invite_link: &str, username: &str, devicename: &str) {
-    let signer_wait_timeout =
-        match topo::event_modules::workspace::invite_link::parse_invite_link(invite_link) {
-            Ok(invite) if invite.bootstrap_addrs.is_empty() => Duration::ZERO,
-            _ => Duration::from_secs(60),
-        };
     accept_invite_with_identity_and_timeout(
         db,
         invite_link,
         username,
         devicename,
-        signer_wait_timeout,
+        Duration::from_secs(10),
     );
 }
 
@@ -877,9 +1038,37 @@ pub fn accept_invite_with_identity_and_timeout(
     invite_link: &str,
     username: &str,
     devicename: &str,
-    _signer_wait_timeout: Duration,
+    accept_timeout: Duration,
 ) {
-    let tmp_daemon = start_daemon(db);
+    let tmp_daemon = if invite_has_empty_bootstrap_addrs(invite_link) {
+        start_discovery_daemon(db)
+    } else {
+        start_daemon(db)
+    };
+    accept_invite_with_identity_on_running_daemon(
+        db,
+        invite_link,
+        username,
+        devicename,
+        accept_timeout,
+    );
+    // Stop temporary daemon; callers decide daemon lifecycle.
+    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
+    drop(tmp_daemon);
+    wait_for_daemon_stopped(db, Duration::from_secs(10));
+}
+
+pub fn accept_invite_with_identity_on_running_daemon(
+    db: &str,
+    invite_link: &str,
+    username: &str,
+    devicename: &str,
+    accept_timeout: Duration,
+) {
+    let before_count = try_status_via_rpc_for_db(db)
+        .ok()
+        .map(|data| status_tenant_count(&data))
+        .unwrap_or(0);
     let output = run_cli_with_db_lock_retry(
         &[
             "accept",
@@ -902,28 +1091,7 @@ pub fn accept_invite_with_identity_and_timeout(
         stdout.trim(),
         stderr.trim()
     );
-    // Ensure tenant discovery is persisted before stopping.
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
-        let peers = Command::new(bin())
-            .args(["--db", db, "tenant", "list"])
-            .output()
-            .expect("peers probe");
-        if peers.status.success() {
-            let stdout = String::from_utf8_lossy(&peers.stdout);
-            if stdout
-                .lines()
-                .any(|line| line.trim_start().starts_with("1."))
-            {
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    // Stop temporary daemon; callers decide daemon lifecycle.
-    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
-    drop(tmp_daemon);
-    wait_for_daemon_stopped(db, Duration::from_secs(10));
+    wait_for_tenant_count(db, before_count.saturating_add(1), accept_timeout);
 }
 
 /// Accept a device-link invite via daemon RPC using a temporary daemon.
@@ -933,21 +1101,36 @@ pub fn accept_device_link(db: &str, invite_link: &str) {
 
 /// Accept a device-link invite with a custom device name.
 pub fn accept_device_link_with_name(db: &str, invite_link: &str, devicename: &str) {
-    let signer_wait_timeout =
-        match topo::event_modules::workspace::invite_link::parse_invite_link(invite_link) {
-            Ok(invite) if invite.bootstrap_addrs.is_empty() => Duration::ZERO,
-            _ => Duration::from_secs(60),
-        };
-    accept_device_link_with_name_and_timeout(db, invite_link, devicename, signer_wait_timeout);
+    accept_device_link_with_name_and_timeout(db, invite_link, devicename, Duration::from_secs(10));
 }
 
 pub fn accept_device_link_with_name_and_timeout(
     db: &str,
     invite_link: &str,
     devicename: &str,
-    _signer_wait_timeout: Duration,
+    accept_timeout: Duration,
 ) {
-    let tmp_daemon = start_daemon(db);
+    let tmp_daemon = if invite_has_empty_bootstrap_addrs(invite_link) {
+        start_discovery_daemon(db)
+    } else {
+        start_daemon(db)
+    };
+    accept_device_link_with_name_on_running_daemon(db, invite_link, devicename, accept_timeout);
+    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
+    drop(tmp_daemon);
+    wait_for_daemon_stopped(db, Duration::from_secs(10));
+}
+
+pub fn accept_device_link_with_name_on_running_daemon(
+    db: &str,
+    invite_link: &str,
+    devicename: &str,
+    accept_timeout: Duration,
+) {
+    let before_count = try_status_via_rpc_for_db(db)
+        .ok()
+        .map(|data| status_tenant_count(&data))
+        .unwrap_or(0);
     let output = run_cli_with_db_lock_retry(
         &[
             "accept-link",
@@ -968,185 +1151,39 @@ pub fn accept_device_link_with_name_and_timeout(
         stdout.trim(),
         stderr.trim()
     );
-    let start = Instant::now();
-    while start.elapsed() < Duration::from_secs(5) {
-        let peers = Command::new(bin())
-            .args(["--db", db, "tenant", "list"])
-            .output()
-            .expect("peers probe");
-        if peers.status.success() {
-            let stdout = String::from_utf8_lossy(&peers.stdout);
-            if stdout
-                .lines()
-                .any(|line| line.trim_start().starts_with("1."))
-            {
-                break;
-            }
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
-    drop(tmp_daemon);
-    wait_for_daemon_stopped(db, Duration::from_secs(10));
+    wait_for_tenant_count(db, before_count.saturating_add(1), accept_timeout);
 }
 
-fn wait_for_local_peer_signer(db: &str, timeout: Duration) -> Result<(), String> {
+fn wait_for_active_tenant_ready_debug(db: &str, timeout: Duration) -> Result<(), String> {
     let start = Instant::now();
+    let mut last = String::from("status unavailable");
     while start.elapsed() < timeout {
-        if let Ok(conn) = topo::db::open_connection(db) {
-            let tenant_id = active_tenant_peer_id(db).or_else(|| {
-                conn.query_row(
-                    "SELECT recorded_by
-                     FROM invites_accepted
-                     ORDER BY created_at DESC, event_id DESC
-                     LIMIT 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .ok()
-            });
-            if let Some(tenant_id) = tenant_id {
-                let has_signer: bool = conn
-                    .query_row(
-                        "SELECT EXISTS(
-                             SELECT 1
-                             FROM peer_secrets
-                             WHERE recorded_by = ?1
-                             LIMIT 1
-                         )",
-                        rusqlite::params![tenant_id],
-                        |row| row.get(0),
-                    )
-                    .unwrap_or(false);
-                if has_signer {
+        match try_status_via_rpc_for_db(db) {
+            Ok(data) => {
+                if data["tenants"]
+                    .as_array()
+                    .map(|tenants| {
+                        tenants.iter().any(|tenant| {
+                            tenant["active"].as_bool().unwrap_or(false)
+                                && tenant["ready"].as_bool().unwrap_or(false)
+                        })
+                    })
+                    .unwrap_or(false)
+                {
                     return Ok(());
                 }
+                last = data.to_string();
+            }
+            Err(err) => {
+                last = err;
             }
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    let debug = topo::db::open_connection(db)
-        .ok()
-        .map(|conn| {
-            let invites: i64 = conn
-                .query_row("SELECT COUNT(*) FROM invites_accepted", [], |row| row.get(0))
-                .unwrap_or(0);
-            let signer_rows: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM peer_secrets",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-            let signer_events: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM events WHERE type_name = 'peer_secret'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-            let signer_rejects: i64 = conn
-                .query_row(
-                    "SELECT COUNT(*) FROM rejected_events r
-                     JOIN events e ON e.event_id = r.event_id
-                     WHERE e.type_name = 'peer_secret'",
-                    [],
-                    |row| row.get(0),
-                )
-                .unwrap_or(0);
-            let last_tenant: Option<String> = conn
-                .query_row(
-                    "SELECT recorded_by FROM invites_accepted ORDER BY created_at DESC, event_id DESC LIMIT 1",
-                    [],
-                    |row| row.get(0),
-                )
-                .ok();
-            let (last_tenant_recorded, last_tenant_valid, last_tenant_blocked, last_tenant_queue) =
-                last_tenant
-                    .as_ref()
-                    .map(|tenant_id| {
-                        let recorded: i64 = conn
-                            .query_row(
-                                "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
-                                rusqlite::params![tenant_id],
-                                |row| row.get(0),
-                            )
-                            .unwrap_or(0);
-                        let valid: i64 = conn
-                            .query_row(
-                                "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
-                                rusqlite::params![tenant_id],
-                                |row| row.get(0),
-                            )
-                            .unwrap_or(0);
-                        let blocked: i64 = conn
-                            .query_row(
-                                "SELECT COUNT(*) FROM blocked_events WHERE peer_id = ?1",
-                                rusqlite::params![tenant_id],
-                                |row| row.get(0),
-                            )
-                            .unwrap_or(0);
-                        let queued: i64 = conn
-                            .query_row(
-                                "SELECT COUNT(*) FROM project_queue WHERE peer_id = ?1",
-                                rusqlite::params![tenant_id],
-                                |row| row.get(0),
-                            )
-                            .unwrap_or(0);
-                        (recorded, valid, blocked, queued)
-                    })
-                    .unwrap_or((0, 0, 0, 0));
-            let last_blockers = last_tenant
-                .as_ref()
-                .map(|tenant_id| {
-                    let mut stmt = conn
-                        .prepare(
-                            "SELECT bed.event_id, bed.blocker_event_id
-                             FROM blocked_event_deps bed
-                             WHERE bed.peer_id = ?1
-                             ORDER BY bed.event_id, bed.blocker_event_id
-                             LIMIT 6",
-                        )
-                        .ok()?;
-                    let rows = stmt
-                        .query_map(rusqlite::params![tenant_id], |row| {
-                            Ok((
-                                row.get::<_, String>(0)?,
-                                row.get::<_, String>(1)?,
-                            ))
-                        })
-                        .ok()?
-                        .collect::<Result<Vec<_>, _>>()
-                        .ok()?;
-                    Some(rows)
-                })
-                .flatten()
-                .unwrap_or_default();
-            format!(
-                "invites_accepted={}, peer_secret_rows={}, signer_events={}, signer_rejects={}, last_tenant={}, last_tenant_recorded={}, last_tenant_valid={}, last_tenant_blocked={}, last_tenant_queue={}, last_blockers={:?}",
-                invites,
-                signer_rows,
-                signer_events,
-                signer_rejects,
-                last_tenant.unwrap_or_else(|| "<none>".to_string()),
-                last_tenant_recorded,
-                last_tenant_valid,
-                last_tenant_blocked,
-                last_tenant_queue,
-                last_blockers
-            )
-        })
-        .unwrap_or_else(|| "db-open-failed".to_string());
     Err(format!(
-        "local peer signer not materialized within {:?} (db={}): {}",
-        timeout, db, debug
+        "active tenant not ready within {:?} (db={}): {}",
+        timeout, db, last
     ))
-}
-
-pub fn wait_for_local_peer_signer_ready(db: &str, timeout: Duration) {
-    if let Err(debug) = wait_for_local_peer_signer(db, timeout) {
-        panic!("{}", debug);
-    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1191,13 +1228,121 @@ fn assert_eventually_debug_context(db: &str) -> String {
         }
     }
 
+    fn db_debug(db: &str) -> String {
+        let Ok(conn) = topo::db::open_connection(db) else {
+            return "db=ERR: open failed".to_string();
+        };
+        let active_peer_id = run(db, &["tenant", "active"]);
+        let active_peer_id = if active_peer_id.is_empty() || active_peer_id == "(no active tenant)"
+        {
+            conn.query_row(
+                "SELECT recorded_by
+                 FROM invites_accepted
+                 ORDER BY created_at DESC, event_id DESC
+                 LIMIT 1",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .ok()
+        } else {
+            Some(active_peer_id)
+        };
+
+        let local_transport_creds: i64 = conn
+            .query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
+                row.get(0)
+            })
+            .unwrap_or(0);
+        let blocked_events: i64 = active_peer_id
+            .as_ref()
+            .and_then(|peer_id| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM blocked_events WHERE peer_id = ?1",
+                    rusqlite::params![peer_id],
+                    |row| row.get(0),
+                )
+                .ok()
+            })
+            .unwrap_or(0);
+        let pending_bootstrap_trust: i64 = active_peer_id
+            .as_ref()
+            .and_then(|peer_id| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pending_invite_bootstrap_trust WHERE recorded_by = ?1",
+                    rusqlite::params![peer_id],
+                    |row| row.get(0),
+                )
+                .ok()
+            })
+            .unwrap_or(0);
+        let bootstrap_context_rows: i64 = active_peer_id
+            .as_ref()
+            .and_then(|peer_id| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM bootstrap_context WHERE recorded_by = ?1",
+                    rusqlite::params![peer_id],
+                    |row| row.get(0),
+                )
+                .ok()
+            })
+            .unwrap_or(0);
+        let endpoint_observations: i64 = active_peer_id
+            .as_ref()
+            .and_then(|peer_id| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM peer_endpoint_observations WHERE recorded_by = ?1",
+                    rusqlite::params![peer_id],
+                    |row| row.get(0),
+                )
+                .ok()
+            })
+            .unwrap_or(0);
+        let latest_endpoints: Vec<String> = active_peer_id
+            .as_ref()
+            .and_then(|peer_id| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT via_peer_id, origin_ip, origin_port
+                         FROM peer_endpoint_observations
+                         WHERE recorded_by = ?1
+                         ORDER BY observed_at DESC
+                         LIMIT 3",
+                    )
+                    .ok()?;
+                let rows = stmt
+                    .query_map(rusqlite::params![peer_id], |row| {
+                        Ok(format!(
+                            "{}@{}:{}",
+                            row.get::<_, String>(0)?,
+                            row.get::<_, String>(1)?,
+                            row.get::<_, i64>(2)?,
+                        ))
+                    })
+                    .ok()?;
+                Some(rows.filter_map(Result::ok).collect())
+            })
+            .unwrap_or_default();
+
+        format!(
+            "db=\n  active_peer={}\n  local_transport_creds={}\n  blocked_events={}\n  pending_bootstrap_trust={}\n  bootstrap_context_rows={}\n  endpoint_observations={}\n  latest_endpoints={:?}",
+            active_peer_id.unwrap_or_else(|| "<none>".to_string()),
+            local_transport_creds,
+            blocked_events,
+            pending_bootstrap_trust,
+            bootstrap_context_rows,
+            endpoint_observations,
+            latest_endpoints
+        )
+    }
+
     format!(
-        "active={}\ntenants=\n{}\nusers=\n{}\nmessages=\n{}\nstatus=\n{}",
+        "active={}\ntenants=\n{}\nusers=\n{}\nmessages=\n{}\nstatus=\n{}\n{}",
         run(db, &["tenant", "active"]),
         run(db, &["tenant", "list"]),
         run(db, &["users"]),
         run(db, &["messages"]),
         run(db, &["status"]),
+        db_debug(db),
     )
 }
 
@@ -1621,10 +1766,21 @@ pub fn topo_create_invite_retry(db: &str, bootstrap_addr: &str) -> String {
         .to_string()
 }
 
-/// Accept an invite via a temporary daemon.
-/// Uses the same readiness gates as `accept_invite_with_identity`.
+/// Accept an invite via a temporary daemon and persist the resulting tenant.
+/// Realism tests use this when acceptance happens before the long-lived daemon
+/// starts; writability is asserted later through normal runtime behavior.
 pub fn accept_invite_lightweight(db: &str, invite_link: &str) {
-    accept_invite_with_identity(db, invite_link, "user", "device");
+    let tmp_daemon = start_discovery_daemon(db);
+    accept_invite_with_identity_on_running_daemon(
+        db,
+        invite_link,
+        "user",
+        "device",
+        Duration::from_secs(10),
+    );
+    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
+    drop(tmp_daemon);
+    wait_for_daemon_stopped(db, Duration::from_secs(10));
 }
 
 /// Send a file via daemon RPC. Returns the event ID.
@@ -1667,7 +1823,7 @@ pub fn send_file(db: &str, content: &str, file_path: &str) -> String {
             continue;
         }
         let readiness_debug = if stderr.contains("workspace has not completed initial sync yet") {
-            wait_for_local_peer_signer(db, Duration::from_secs(1))
+            wait_for_active_tenant_ready_debug(db, Duration::from_secs(1))
                 .err()
                 .map(|debug| format!(" ({debug})"))
                 .unwrap_or_default()
