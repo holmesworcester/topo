@@ -5525,9 +5525,19 @@ fn test_cli_sub_watch_exits_on_tenant_switch() {
         std::thread::sleep(Duration::from_millis(200));
     }
 
-    // Switch back to tenant 1 (alice) and start watch
+    // Switch back to alice's tenant and start watch
+    let list_out = Command::new(bin())
+        .args(["--db", &db, "tenant", "list"])
+        .output()
+        .expect("tenant list");
+    let list_stdout = String::from_utf8_lossy(&list_out.stdout);
+    let alice_idx: u64 = list_stdout
+        .lines()
+        .find(|line| line.contains("alpha-space"))
+        .and_then(|line| line.trim_start().split('.').next()?.trim().parse().ok())
+        .expect("alice tenant index");
     let _ = Command::new(bin())
-        .args(["--db", &db, "tenant", "use", "1"])
+        .args(["--db", &db, "tenant", "use", &alice_idx.to_string()])
         .output();
 
     let mut watch = Command::new(bin())
@@ -5542,9 +5552,21 @@ fn test_cli_sub_watch_exits_on_tenant_switch() {
 
     std::thread::sleep(Duration::from_millis(500));
 
-    // Switch to tenant 2 from another "terminal"
+    // Re-parse tenant list now that alice is active (sort order may have changed)
+    let list_out2 = Command::new(bin())
+        .args(["--db", &db, "tenant", "list"])
+        .output()
+        .expect("tenant list");
+    let list_stdout2 = String::from_utf8_lossy(&list_out2.stdout);
+    let charlie_idx: u64 = list_stdout2
+        .lines()
+        .find(|line| line.contains("beta-space"))
+        .and_then(|line| line.trim_start().split('.').next()?.trim().parse().ok())
+        .expect("charlie tenant index");
+
+    // Switch to charlie's tenant from another "terminal"
     let _ = Command::new(bin())
-        .args(["--db", &db, "tenant", "use", "2"])
+        .args(["--db", &db, "tenant", "use", &charlie_idx.to_string()])
         .output();
 
     // Watch should exit within a few seconds after repeated "not found" errors
