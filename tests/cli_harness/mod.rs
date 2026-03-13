@@ -80,6 +80,7 @@ pub fn cleanup_test_daemons() {
 // ---------------------------------------------------------------------------
 
 pub fn bin() -> String {
+    hold_network_test_binary_lock();
     env!("CARGO_BIN_EXE_topo").to_string()
 }
 
