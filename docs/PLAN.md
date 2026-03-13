@@ -880,9 +880,18 @@ For event transfer, queue `event_id` only and fetch canonical blob at send time.
 
 Outstanding follow-up debt for CLI/integration tests:
 
-1. continue replacing bespoke polling/retry helpers with shared `assert_eventually`/value-eventually helpers over explicit ready predicates,
-2. keep sleeps only as poll intervals inside those eventual assertions or when intentionally stretching a race to reproduce a bug,
-3. do not use fixed waits as protection against correctness failures.
+1. use one explicit product-visible readiness predicate for local authoring: `ready`.
+2. define tenant visibility as the acceptance signal; do not add a second public `accepted` predicate when the tenant already appears in `view`/tenant lists.
+3. make `ready` mean only "writable now on this device", derived from the same authoring-context helper used by write commands.
+4. continue replacing bespoke polling/retry helpers with shared `assert_eventually`/value-eventually helpers over explicit invariants:
+   - tenant visible, when the test cares about acceptance,
+   - `ready == true`, when the test cares about sending/chaining,
+   - specific event/message presence, when the test cares about sync.
+5. split deterministic bootstrap coverage from discovery-enabled coverage:
+   - deterministic tests use fixed bind + discovery disabled + explicit public address,
+   - discovery-enabled tests exist specifically to exercise duplicate-connection/idempotency pressure.
+6. keep sleeps only as poll intervals inside eventual assertions or when intentionally stretching a race to reproduce a bug.
+7. do not use fixed waits as protection against correctness failures.
 
 Recommended enqueue guard:
 

@@ -2487,6 +2487,45 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
                 println!("  UPnP:      not attempted");
             }
+            if let Some(tenants) = data["tenants"].as_array() {
+                if !tenants.is_empty() {
+                    println!("  Tenants:");
+                    for (idx, tenant) in tenants.iter().enumerate() {
+                        let marker = if tenant["active"].as_bool().unwrap_or(false) {
+                            "*"
+                        } else {
+                            " "
+                        };
+                        let username = tenant["username"].as_str().unwrap_or("");
+                        let workspace_name = tenant["workspace_name"].as_str().unwrap_or("");
+                        let peer_id = tenant["peer_id"].as_str().unwrap_or("");
+                        let workspace_id = tenant["workspace_id"].as_str().unwrap_or("");
+                        let user_display = if username.is_empty() {
+                            short_id(peer_id).to_string()
+                        } else {
+                            username.to_string()
+                        };
+                        let workspace_display = if workspace_name.is_empty() {
+                            short_id(workspace_id).to_string()
+                        } else {
+                            workspace_name.to_string()
+                        };
+                        let joining_tag = if tenant["ready"].as_bool().unwrap_or(false) {
+                            ""
+                        } else {
+                            " [still joining]"
+                        };
+                        println!(
+                            "    {}. {} {}@{}{}",
+                            idx + 1,
+                            marker,
+                            user_display,
+                            workspace_display,
+                            joining_tag
+                        );
+                    }
+                }
+            }
         }
 
         Commands::Generate { count } => {
@@ -4355,13 +4394,19 @@ fn show_view(data: &serde_json::Value) {
                 } else {
                     workspace_name.to_string()
                 };
+                let joining_tag = if tenant["ready"].as_bool().unwrap_or(false) {
+                    ""
+                } else {
+                    " [still joining]"
+                };
                 println!(
-                    "  {}. {} {} {}@{}",
+                    "  {}. {} {} {}@{}{}",
                     idx + 1,
                     marker,
                     short_id(tenant_eid),
                     user_display,
-                    workspace_display
+                    workspace_display,
+                    joining_tag
                 );
             }
         }

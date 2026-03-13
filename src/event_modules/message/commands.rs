@@ -13,7 +13,6 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use super::super::message_deletion::MessageDeletionEvent;
-use super::super::peer_shared;
 use super::super::workspace;
 use super::super::ParsedEvent;
 use super::super::{FileEvent, FileSliceEvent};
@@ -240,20 +239,16 @@ pub fn send_for_peer(
     content: &str,
 ) -> Result<super::SendResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
-
-    let (signer_eid, signing_key) =
-        peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
-    let workspace_id = workspace::resolve_workspace_for_peer(&db, &recorded_by)?;
-    let author_id = peer_shared::resolve_user_event_id(&db, &recorded_by, &signer_eid)?;
+    let ctx = workspace::load_local_authoring_context(&db, &recorded_by)?;
 
     send(
         &db,
         &recorded_by,
-        &signer_eid,
-        &signing_key,
+        &ctx.signer_event_id,
+        &ctx.signing_key,
         current_timestamp_ms(),
-        workspace_id,
-        author_id,
+        ctx.workspace_id,
+        ctx.author_id,
         content,
     )
     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })
@@ -266,20 +261,17 @@ pub fn delete_message_for_peer(
     target_hex: &str,
 ) -> Result<DeleteResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
-
-    let (signer_eid, signing_key) =
-        peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
+    let ctx = workspace::load_local_authoring_context(&db, &recorded_by)?;
     let target_event_id = super::resolve(&db, &recorded_by, target_hex)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-    let author_id = peer_shared::resolve_user_event_id(&db, &recorded_by, &signer_eid)?;
 
     let (event_id, target) = delete_message(
         &db,
         &recorded_by,
-        &signer_eid,
-        &signing_key,
+        &ctx.signer_event_id,
+        &ctx.signing_key,
         current_timestamp_ms(),
-        author_id,
+        ctx.author_id,
         target_event_id,
     )
     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
@@ -296,11 +288,7 @@ pub fn generate_for_peer(
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
     let log_progress = generate_progress_logging_enabled();
     let generate_start = Instant::now();
-
-    let (signer_eid, signing_key) =
-        peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
-    let workspace_id = workspace::resolve_workspace_for_peer(&db, &recorded_by)?;
-    let author_id = peer_shared::resolve_user_event_id(&db, &recorded_by, &signer_eid)?;
+    let ctx = workspace::load_local_authoring_context(&db, &recorded_by)?;
 
     // Break into smaller batches to avoid holding the write lock too long.
     // A single long transaction causes SQLITE_BUSY for the sync engine's
@@ -321,12 +309,12 @@ pub fn generate_for_peer(
             create(
                 &db,
                 &recorded_by,
-                &signer_eid,
-                &signing_key,
+                &ctx.signer_event_id,
+                &ctx.signing_key,
                 current_timestamp_ms(),
                 CreateMessageCmd {
-                    workspace_id,
-                    author_id,
+                    workspace_id: ctx.workspace_id,
+                    author_id: ctx.author_id,
                     content: format!("Message {}", j),
                 },
             )
@@ -379,10 +367,7 @@ pub fn generate_files_for_peer(
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
     let log_progress = generate_progress_logging_enabled();
     let generate_start = Instant::now();
-    let (signer_eid, signing_key) =
-        peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
-    let workspace_id = workspace::resolve_workspace_for_peer(&db, &recorded_by)?;
-    let author_id = peer_shared::resolve_user_event_id(&db, &recorded_by, &signer_eid)?;
+    let ctx = workspace::load_local_authoring_context(&db, &recorded_by)?;
     let slice_bytes_u32 = FILE_SLICE_CIPHERTEXT_BYTES as u32;
     let ciphertext: Vec<u8> = vec![0xAB; FILE_SLICE_CIPHERTEXT_BYTES];
 
@@ -400,12 +385,12 @@ pub fn generate_files_for_peer(
         let message_event_id = create(
             &db,
             &recorded_by,
-            &signer_eid,
-            &signing_key,
+            &ctx.signer_event_id,
+            &ctx.signing_key,
             current_timestamp_ms(),
             CreateMessageCmd {
-                workspace_id,
-                author_id,
+                workspace_id: ctx.workspace_id,
+                author_id: ctx.author_id,
                 content: format!("File {}", i),
             },
         )
@@ -440,11 +425,11 @@ pub fn generate_files_for_peer(
                 key_event_id,
                 filename: format!("file-{}.bin", i),
                 mime_type: "application/octet-stream".to_string(),
-                signed_by: signer_eid,
+                signed_by: ctx.signer_event_id,
                 signer_type: 5,
                 signature: [0u8; 64],
             }),
-            Some(&signing_key),
+            Some(&ctx.signing_key),
         )
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("create file error: {}", e).into()
@@ -460,11 +445,11 @@ pub fn generate_files_for_peer(
                     file_id,
                     slice_number: slice_number as u32,
                     ciphertext: ciphertext.clone(),
-                    signed_by: signer_eid,
+                    signed_by: ctx.signer_event_id,
                     signer_type: 5,
                     signature: [0u8; 64],
                 }),
-                Some(&signing_key),
+                Some(&ctx.signing_key),
             )
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("create file_slice error: {}", e).into()
@@ -574,20 +559,17 @@ pub fn send_file_for_peer(
     let mime_type = mime_from_extension(&ext).to_string();
 
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
-    let (signer_eid, signing_key) =
-        peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
-    let workspace_id = workspace::resolve_workspace_for_peer(&db, &recorded_by)?;
-    let author_id = peer_shared::resolve_user_event_id(&db, &recorded_by, &signer_eid)?;
+    let ctx = workspace::load_local_authoring_context(&db, &recorded_by)?;
 
     let message_event_id = create(
         &db,
         &recorded_by,
-        &signer_eid,
-        &signing_key,
+        &ctx.signer_event_id,
+        &ctx.signing_key,
         current_timestamp_ms(),
         CreateMessageCmd {
-            workspace_id,
-            author_id,
+            workspace_id: ctx.workspace_id,
+            author_id: ctx.author_id,
             content: content.to_string(),
         },
     )?;
@@ -624,11 +606,11 @@ pub fn send_file_for_peer(
             key_event_id,
             filename: filename.clone(),
             mime_type,
-            signed_by: signer_eid,
+            signed_by: ctx.signer_event_id,
             signer_type: 5,
             signature: [0u8; 64],
         }),
-        Some(&signing_key),
+        Some(&ctx.signing_key),
     )?;
 
     let mut reader = BufReader::new(file);
@@ -647,11 +629,11 @@ pub fn send_file_for_peer(
                 file_id,
                 slice_number: slice_number as u32,
                 ciphertext,
-                signed_by: signer_eid,
+                signed_by: ctx.signer_event_id,
                 signer_type: 5,
                 signature: [0u8; 64],
             }),
-            Some(&signing_key),
+            Some(&ctx.signing_key),
         )?;
     }
     if remaining_bytes != 0 {

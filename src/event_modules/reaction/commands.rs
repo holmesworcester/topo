@@ -6,8 +6,8 @@ use crate::service::open_db_for_peer;
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
+use super::super::message;
 use super::super::ParsedEvent;
-use super::super::{message, peer_shared};
 use super::wire::ReactionEvent;
 
 use serde::{Deserialize, Serialize};
@@ -103,20 +103,17 @@ pub fn react_for_peer(
     emoji: &str,
 ) -> Result<ReactResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
-
-    let (signer_eid, signing_key) =
-        peer_shared::load_local_peer_signer_required(&db, &recorded_by)?;
+    let ctx = super::super::workspace::load_local_authoring_context(&db, &recorded_by)?;
     let target_event_id = message::resolve(&db, &recorded_by, target_hex)
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;
-    let author_id = peer_shared::resolve_user_event_id(&db, &recorded_by, &signer_eid)?;
 
     react(
         &db,
         &recorded_by,
-        &signer_eid,
-        &signing_key,
+        &ctx.signer_event_id,
+        &ctx.signing_key,
         current_timestamp_ms(),
-        author_id,
+        ctx.author_id,
         target_event_id,
         emoji,
     )

@@ -76,6 +76,17 @@ pub struct WorkspaceItem {
     pub name: String,
 }
 
+#[derive(Debug, Serialize, Deserialize, Clone)]
+pub struct ViewTenant {
+    pub event_id: String,
+    pub peer_id: String,
+    pub username: String,
+    pub workspace_id: String,
+    pub workspace_name: String,
+    pub active: bool,
+    pub ready: bool,
+}
+
 /// List workspace items (response type) from the database.
 pub fn list_items(
     db: &Connection,
@@ -125,6 +136,7 @@ pub struct StatusResponse {
     pub reactions_count: i64,
     pub recorded_events_count: i64,
     pub neg_items_count: i64,
+    pub tenants: Vec<ViewTenant>,
 }
 
 /// Query workspace status counts.
@@ -144,6 +156,7 @@ pub fn status(db: &Connection, recorded_by: &str) -> StatusResponse {
             |row| row.get(0),
         )
         .unwrap_or(0);
+    let tenants = list_tenants_for_display(db, recorded_by).unwrap_or_default();
 
     StatusResponse {
         events_count,
@@ -151,6 +164,7 @@ pub fn status(db: &Connection, recorded_by: &str) -> StatusResponse {
         reactions_count,
         recorded_events_count,
         neg_items_count,
+        tenants,
     }
 }
 
@@ -234,16 +248,6 @@ pub struct ViewUser {
     pub peer_event_id: String,
     pub username: String,
     pub device_name: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct ViewTenant {
-    pub event_id: String,
-    pub peer_id: String,
-    pub username: String,
-    pub workspace_id: String,
-    pub workspace_name: String,
-    pub active: bool,
 }
 
 #[derive(Debug)]
@@ -375,6 +379,7 @@ pub fn list_tenants_for_display(
                 workspace_id: scope.workspace_id,
                 workspace_name,
                 active: scope.peer_id == active_recorded_by,
+                ready: super::load_local_authoring_context(db, &scope.peer_id).is_ok(),
             })
         })
         .collect::<Result<Vec<_>, rusqlite::Error>>()?;
@@ -484,6 +489,7 @@ pub fn view_for_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::event_id_to_base64;
     use crate::db::{open_in_memory, schema::create_tables};
 
     fn insert_local_transport_cred(conn: &Connection, peer_id: &str, tf_byte: u8) {
@@ -498,6 +504,90 @@ mod tests {
             }],
         )
         .expect("insert local transport creds");
+    }
+
+    fn insert_ready_fixture(
+        conn: &Connection,
+        recorded_by: &str,
+        tf_byte: u8,
+        workspace_name: &str,
+        username: &str,
+        ready: bool,
+    ) {
+        let tenant_event_id = event_id_to_base64(&[tf_byte.wrapping_add(1); 32]);
+        let invite_event_id = event_id_to_base64(&[tf_byte.wrapping_add(2); 32]);
+        let workspace_id = event_id_to_base64(&[tf_byte.wrapping_add(3); 32]);
+        let workspace_event_id = event_id_to_base64(&[tf_byte.wrapping_add(4); 32]);
+        let user_event_id = event_id_to_base64(&[tf_byte.wrapping_add(5); 32]);
+        let signer_event_id = event_id_to_base64(&[tf_byte.wrapping_add(6); 32]);
+
+        conn.execute(
+            "INSERT INTO invites_accepted
+             (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                recorded_by,
+                event_id_to_base64(&[tf_byte; 32]),
+                tenant_event_id,
+                invite_event_id,
+                workspace_id,
+                i64::from(tf_byte),
+            ],
+        )
+        .expect("insert invites_accepted");
+        conn.execute(
+            "INSERT INTO workspaces
+             (recorded_by, event_id, workspace_id, public_key, name)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                recorded_by,
+                workspace_event_id,
+                workspace_id,
+                vec![tf_byte; 32],
+                workspace_name,
+            ],
+        )
+        .expect("insert workspace");
+        conn.execute(
+            "INSERT INTO users (recorded_by, event_id, public_key, username)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![
+                recorded_by,
+                user_event_id,
+                vec![tf_byte.wrapping_add(1); 32],
+                username
+            ],
+        )
+        .expect("insert user");
+        conn.execute(
+            "INSERT INTO peers_shared
+             (recorded_by, event_id, public_key, transport_fingerprint, user_event_id, device_name)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                recorded_by,
+                signer_event_id.clone(),
+                vec![tf_byte.wrapping_add(2); 32],
+                vec![tf_byte; 32],
+                user_event_id,
+                "device",
+            ],
+        )
+        .expect("insert peer_shared");
+        insert_local_transport_cred(conn, recorded_by, tf_byte);
+        if ready {
+            conn.execute(
+                "INSERT INTO peer_secrets
+                 (recorded_by, event_id, signer_event_id, private_key, created_at)
+                 VALUES (?1, ?2, ?3, ?4, 1)",
+                rusqlite::params![
+                    recorded_by,
+                    signer_event_id.clone(),
+                    signer_event_id,
+                    vec![tf_byte; 32],
+                ],
+            )
+            .expect("insert peer secret");
+        }
     }
 
     #[test]
@@ -582,5 +672,54 @@ mod tests {
             "top-level tenant label should use the tenant's local user, not an arbitrary workspace user"
         );
         assert_eq!(tenant_b.workspace_name, "ops");
+        assert!(
+            !tenant_b.ready,
+            "without a local signer, accepted tenants should still render as joining"
+        );
+    }
+
+    #[test]
+    fn list_tenants_for_display_marks_ready_from_authoring_context() {
+        let conn = open_in_memory().expect("open in-memory db");
+        create_tables(&conn).expect("create tables");
+
+        let joining_peer = hex::encode([0x21u8; 32]);
+        let ready_peer = hex::encode([0x42u8; 32]);
+        insert_ready_fixture(&conn, &joining_peer, 0x21, "alpha", "alice", false);
+        insert_ready_fixture(&conn, &ready_peer, 0x42, "beta", "bob", true);
+
+        let tenants = list_tenants_for_display(&conn, &joining_peer).expect("tenant list");
+        let joining = tenants
+            .iter()
+            .find(|tenant| tenant.peer_id == joining_peer)
+            .expect("joining tenant");
+        let ready = tenants
+            .iter()
+            .find(|tenant| tenant.peer_id == ready_peer)
+            .expect("ready tenant");
+
+        assert!(joining.active, "active tenant should be marked");
+        assert!(!joining.ready, "missing signer should keep tenant joining");
+        assert!(
+            ready.ready,
+            "complete authoring context should mark tenant ready"
+        );
+    }
+
+    #[test]
+    fn status_includes_tenant_readiness() {
+        let conn = open_in_memory().expect("open in-memory db");
+        create_tables(&conn).expect("create tables");
+
+        let joining_peer = hex::encode([0x31u8; 32]);
+        insert_ready_fixture(&conn, &joining_peer, 0x31, "alpha", "alice", false);
+
+        let status = status(&conn, &joining_peer);
+        assert_eq!(status.tenants.len(), 1);
+        assert_eq!(status.tenants[0].username, "alice");
+        assert!(
+            !status.tenants[0].ready,
+            "status should surface the same joining state as the tenant list"
+        );
     }
 }

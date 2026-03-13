@@ -15,6 +15,73 @@ use std::process::Command;
 use std::time::Duration;
 use topo::testutil::DaemonGuard;
 
+fn seed_joining_tenant(db_path: &str) {
+    let conn = topo::db::open_connection(db_path).expect("open db");
+    topo::db::schema::create_tables(&conn).expect("create tables");
+
+    let recorded_by = hex::encode([0x55u8; 32]);
+    let tenant_event_id = topo::crypto::event_id_to_base64(&[0x56; 32]);
+    let invite_event_id = topo::crypto::event_id_to_base64(&[0x57; 32]);
+    let workspace_id = topo::crypto::event_id_to_base64(&[0x58; 32]);
+    let workspace_event_id = topo::crypto::event_id_to_base64(&[0x59; 32]);
+    let user_event_id = topo::crypto::event_id_to_base64(&[0x5A; 32]);
+    let signer_event_id = topo::crypto::event_id_to_base64(&[0x5B; 32]);
+
+    conn.execute(
+        "INSERT INTO invites_accepted
+         (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, 1)",
+        rusqlite::params![
+            &recorded_by,
+            topo::crypto::event_id_to_base64(&[0x54; 32]),
+            &tenant_event_id,
+            &invite_event_id,
+            &workspace_id,
+        ],
+    )
+    .expect("insert invites_accepted");
+    conn.execute(
+        "INSERT INTO workspaces
+         (recorded_by, event_id, workspace_id, public_key, name)
+         VALUES (?1, ?2, ?3, ?4, 'alpha')",
+        rusqlite::params![
+            &recorded_by,
+            &workspace_event_id,
+            &workspace_id,
+            vec![0x55u8; 32]
+        ],
+    )
+    .expect("insert workspace");
+    conn.execute(
+        "INSERT INTO users (recorded_by, event_id, public_key, username)
+         VALUES (?1, ?2, ?3, 'alice')",
+        rusqlite::params![&recorded_by, &user_event_id, vec![0x56u8; 32]],
+    )
+    .expect("insert user");
+    conn.execute(
+        "INSERT INTO peers_shared
+         (recorded_by, event_id, public_key, transport_fingerprint, user_event_id, device_name)
+         VALUES (?1, ?2, ?3, ?4, ?5, 'laptop')",
+        rusqlite::params![
+            &recorded_by,
+            &signer_event_id,
+            vec![0x57u8; 32],
+            vec![0x55u8; 32],
+            &user_event_id,
+        ],
+    )
+    .expect("insert peer_shared");
+    let (cert, key) = topo::transport::generate_self_signed_cert().expect("generate transport key");
+    topo::db::transport_creds::store_local_creds_with_source(
+        &conn,
+        &recorded_by,
+        cert.as_ref(),
+        key.secret_pkcs8_der(),
+        "test",
+    )
+    .expect("insert local transport creds");
+}
+
 fn free_udp_bind_addr() -> String {
     std::net::UdpSocket::bind("127.0.0.1:0")
         .unwrap()
@@ -97,6 +164,7 @@ fn rpc_response_success_roundtrip() {
         reactions_count: 3,
         recorded_events_count: 42,
         neg_items_count: 42,
+        tenants: Vec::new(),
     };
     let resp = RpcResponse::success(data);
     let frame = encode_frame(&resp).unwrap();
@@ -312,6 +380,62 @@ fn daemon_and_cli_send_and_messages() {
         "should find message in list, got: {}",
         stdout
     );
+}
+
+#[test]
+fn joining_tenant_view_and_status_show_tag_and_send_fails() {
+    let (dir, db) = temp_db();
+    seed_joining_tenant(&db);
+
+    let mut daemon = start_daemon_with_options(
+        &db,
+        &DaemonOptions {
+            disable_discovery: true,
+            stderr_file: Some(dir.path().join("daemon.stderr")),
+            ..Default::default()
+        },
+    );
+
+    let view = Command::new(bin())
+        .args(["--db", &db, "view"])
+        .output()
+        .unwrap();
+    assert!(view.status.success(), "view failed: {:?}", view);
+    let view_stdout = String::from_utf8_lossy(&view.stdout);
+    assert!(
+        view_stdout.contains("[still joining]"),
+        "view should tag non-ready tenants:\n{}",
+        view_stdout
+    );
+
+    let status = Command::new(bin())
+        .args(["--db", &db, "status"])
+        .output()
+        .unwrap();
+    assert!(status.status.success(), "status failed: {:?}", status);
+    let status_stdout = String::from_utf8_lossy(&status.stdout);
+    assert!(
+        status_stdout.contains("[still joining]"),
+        "status should tag non-ready tenants:\n{}",
+        status_stdout
+    );
+
+    let send = Command::new(bin())
+        .args(["--db", &db, "send", "hello"])
+        .output()
+        .unwrap();
+    assert!(
+        !send.status.success(),
+        "send should fail while still joining"
+    );
+    let send_stderr = String::from_utf8_lossy(&send.stderr);
+    assert!(
+        send_stderr.contains("workspace has not completed initial sync yet"),
+        "send should fail for the same authoring-readiness reason:\n{}",
+        send_stderr
+    );
+
+    stop_daemon(&db, &mut daemon);
 }
 
 #[test]

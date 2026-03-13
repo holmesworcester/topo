@@ -153,7 +153,8 @@ pub use crate::event_modules::workspace::commands::{
     AcceptDeviceLinkResponse, AcceptInviteResponse, CreateInviteResponse, CreateWorkspaceResponse,
 };
 pub use crate::event_modules::workspace::{
-    KeysResponse, StatusResponse, ViewMessage, ViewReaction, ViewResponse, WorkspaceItem,
+    KeysResponse, StatusResponse, ViewMessage, ViewReaction, ViewResponse, ViewTenant,
+    WorkspaceItem,
 };
 
 // ---------------------------------------------------------------------------
