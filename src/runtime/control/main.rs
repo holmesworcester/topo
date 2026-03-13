@@ -552,6 +552,23 @@ enum SubAction {
         #[arg(long = "sub", hide = true)]
         sub_flag: Option<String>,
     },
+    /// Watch a subscription: continuously poll and print new events to stdout
+    Watch {
+        /// Subscription selector: id, name, or index (#N / N)
+        sub: Option<String>,
+        /// Deprecated: use positional selector instead.
+        #[arg(long = "sub", hide = true)]
+        sub_flag: Option<String>,
+        /// Poll interval in milliseconds
+        #[arg(long, default_value = "500")]
+        interval_ms: u64,
+        /// Output as JSON (one JSON object per line)
+        #[arg(long)]
+        json: bool,
+        /// Auto-acknowledge items after printing
+        #[arg(long)]
+        ack: bool,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1108,6 +1125,144 @@ fn run_sub_action(
             )?;
             println!("Subscription enabled.");
             Ok(())
+        }
+        SubAction::Watch {
+            sub,
+            sub_flag,
+            interval_ms,
+            json,
+            ack,
+        } => {
+            let sub_id =
+                resolve_subscription_selector(db, socket, sub, sub_flag, "sub watch", true)?;
+
+            // Reject has_changed subscriptions: they produce no feed rows,
+            // so watch would never output anything.
+            let list_data = rpc_require_daemon(db, socket, RpcMethod::SubList)?;
+            if let Some(items) = list_data.as_array() {
+                for item in items {
+                    if item["subscription_id"].as_str() == Some(&sub_id) {
+                        if item["delivery_mode"].as_str() == Some("has_changed") {
+                            return Err(format!(
+                                "subscription uses has_changed delivery mode which produces no feed items; \
+                                 use `topo sub state` to check dirty/pending instead",
+                            ).into());
+                        }
+                    }
+                }
+            }
+
+            eprintln!("Watching subscription {} (poll every {}ms, Ctrl-C to stop)", &sub_id[..sub_id.len().min(12)], interval_ms);
+            // Start from seq 0: drain any pending backlog first, then follow
+            // new items. This avoids silent data loss when --ack is used.
+            let mut cursor: i64 = 0;
+            let mut consecutive_not_found = 0u32;
+            loop {
+                match rpc_require_daemon(
+                    db,
+                    socket,
+                    RpcMethod::SubPoll {
+                        subscription_id: sub_id.clone(),
+                        after_seq: cursor,
+                        limit: 100,
+                    },
+                ) {
+                    Ok(data) => {
+                        consecutive_not_found = 0;
+                        let mut page_full = false;
+                        if let Some(items) = data.as_array() {
+                            page_full = items.len() >= 100;
+                            let mut max_seq = cursor;
+                            for item in items {
+                                let seq = item["seq"].as_i64().unwrap_or(0);
+                                if seq > max_seq {
+                                    max_seq = seq;
+                                }
+                                if json {
+                                    println!("{}", serde_json::to_string(item).unwrap_or_default());
+                                } else {
+                                    let etype = item["event_type"].as_str().unwrap_or("?");
+                                    let eid = item["event_id"].as_str().unwrap_or("?");
+                                    let eid_short = &eid[..eid.len().min(12)];
+                                    let ts = item["created_at_ms"].as_u64().unwrap_or(0);
+                                    let payload = &item["payload"];
+                                    if let Some(content) = payload["content"].as_str() {
+                                        let author = payload["author_id"].as_str().unwrap_or("?");
+                                        let author_short = &author[..author.len().min(8)];
+                                        // Escape control chars so each event is one safe terminal line
+                                        let escaped: String = content.chars().map(|c| {
+                                            match c {
+                                                '\\' => "\\\\".to_string(),
+                                                '\n' => "\\n".to_string(),
+                                                '\r' => "\\r".to_string(),
+                                                '\t' => "\\t".to_string(),
+                                                c if c.is_control() => format!("\\x{:02x}", c as u32),
+                                                c => c.to_string(),
+                                            }
+                                        }).collect();
+                                        println!(
+                                            "[seq={}] {} event={} ts={} author={} | {}",
+                                            seq, etype, eid_short, ts, author_short, escaped,
+                                        );
+                                    } else {
+                                        println!(
+                                            "[seq={}] {} event={} ts={}",
+                                            seq, etype, eid_short, ts,
+                                        );
+                                    }
+                                }
+                            }
+                            if max_seq > cursor {
+                                if ack {
+                                    match rpc_require_daemon(
+                                        db,
+                                        socket,
+                                        RpcMethod::SubAck {
+                                            subscription_id: sub_id.clone(),
+                                            through_seq: max_seq,
+                                        },
+                                    ) {
+                                        Ok(_) => {
+                                            cursor = max_seq;
+                                        }
+                                        Err(e) => {
+                                            eprintln!("ack error (items will be re-delivered): {}", e);
+                                        }
+                                    }
+                                } else {
+                                    cursor = max_seq;
+                                }
+                            }
+                        }
+                        // If page was full, immediately re-poll to drain backlog
+                        if page_full {
+                            continue;
+                        }
+                    }
+                    Err(e) => {
+                        let msg = e.to_string();
+                        if msg.contains("not found") {
+                            consecutive_not_found += 1;
+                            if consecutive_not_found >= 3 {
+                                return Err(format!(
+                                    "subscription {} no longer accessible — \
+                                     the active tenant may have changed (use `topo tenant use` to switch back)",
+                                    &sub_id[..sub_id.len().min(12)],
+                                ).into());
+                            }
+                        } else if msg.contains("daemon is not running") || msg.contains("connection refused") {
+                            return Err(format!(
+                                "daemon stopped — watch exiting ({})",
+                                msg,
+                            ).into());
+                        } else {
+                            consecutive_not_found = 0;
+                        }
+                        eprintln!("poll error: {}", msg);
+                    }
+                }
+                std::thread::sleep(std::time::Duration::from_millis(interval_ms));
+            }
         }
     }
 }
