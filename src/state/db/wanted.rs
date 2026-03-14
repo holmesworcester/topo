@@ -1,9 +1,9 @@
-use rusqlite::{params, Connection, Result as SqliteResult};
+use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 
 use super::queue::{
     current_timestamp_ms, with_immediate_tx, with_sqlite_busy_retry, PRIORITY_LANE_FOREGROUND,
 };
-use crate::crypto::EventId;
+use crate::crypto::{event_id_to_base64, EventId};
 
 /// Wanted events - events the sink still needs to fetch.
 ///
@@ -55,13 +55,19 @@ impl<'a> WantedEvents<'a> {
     /// they know which peer can satisfy it.
     pub fn insert(&self, id: &EventId) -> SqliteResult<bool> {
         let now = current_timestamp_ms();
-        let rows = with_sqlite_busy_retry(|| {
-            self.conn.execute(
+        let id_b64 = event_id_to_base64(id);
+        with_immediate_tx(self.conn, || {
+            if local_event_exists(self.conn, &id_b64)? {
+                delete_wanted_row(self.conn, id)?;
+                return Ok(false);
+            }
+
+            let rows = self.conn.execute(
                 "INSERT OR IGNORE INTO wanted_events (id, first_seen_at) VALUES (?1, ?2)",
                 params![&id[..], now],
-            )
-        })?;
-        Ok(rows > 0)
+            )?;
+            Ok(rows > 0)
+        })
     }
 
     /// Observe that `peer_id` appears to have each event in `ids`.
@@ -73,6 +79,9 @@ impl<'a> WantedEvents<'a> {
         }
         let now = current_timestamp_ms();
         with_immediate_tx(self.conn, || {
+            let mut local_exists = self
+                .conn
+                .prepare("SELECT 1 FROM events WHERE event_id = ?1 LIMIT 1")?;
             let mut insert_wanted = self.conn.prepare(
                 "INSERT OR IGNORE INTO wanted_events (id, first_seen_at)
                  VALUES (?1, ?2)",
@@ -89,6 +98,15 @@ impl<'a> WantedEvents<'a> {
 
             let mut observed = 0usize;
             for id in ids {
+                let id_b64 = event_id_to_base64(id);
+                let already_local = local_exists
+                    .query_row(params![&id_b64], |_| Ok(()))
+                    .optional()?
+                    .is_some();
+                if already_local {
+                    delete_wanted_row(self.conn, id)?;
+                    continue;
+                }
                 let _ = insert_wanted.execute(params![&id[..], now])?;
                 upsert_source.execute(params![
                     &id[..],
@@ -257,16 +275,42 @@ impl<'a> WantedEvents<'a> {
     }
 }
 
+fn local_event_exists(conn: &Connection, event_id_b64: &str) -> SqliteResult<bool> {
+    conn.query_row(
+        "SELECT 1 FROM events WHERE event_id = ?1 LIMIT 1",
+        params![event_id_b64],
+        |_| Ok(()),
+    )
+    .optional()
+    .map(|row| row.is_some())
+}
+
+fn delete_wanted_row(conn: &Connection, id: &EventId) -> SqliteResult<()> {
+    conn.execute("DELETE FROM wanted_sources WHERE event_id = ?1", params![&id[..]])?;
+    conn.execute("DELETE FROM wanted_events WHERE id = ?1", params![&id[..]])?;
+    Ok(())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::db::{open_connection, schema::create_tables};
+    use crate::crypto::event_id_to_base64;
     use std::time::Duration;
 
     fn make_event_id(byte: u8) -> EventId {
         let mut id = [0u8; 32];
         id[0] = byte;
         id
+    }
+
+    fn insert_local_event(conn: &Connection, id: &EventId) {
+        conn.execute(
+            "INSERT INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, 'encrypted', x'00', 'shared', 1, 1)",
+            params![event_id_to_base64(id)],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -353,6 +397,39 @@ mod tests {
         wanted.observe_many_for_peer("peer-a", &[id]).unwrap();
         wanted.observe_many_for_peer("peer-b", &[id]).unwrap();
         wanted.remove(&id).unwrap();
+
+        let wanted_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM wanted_events WHERE id = ?1",
+                params![&id[..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let source_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM wanted_sources WHERE event_id = ?1",
+                params![&id[..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wanted_count, 0);
+        assert_eq!(source_count, 0);
+    }
+
+    #[test]
+    fn test_local_event_cannot_be_reobserved_as_wanted() {
+        let conn = crate::db::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let wanted = WantedEvents::new(&conn);
+        let id = make_event_id(11);
+
+        wanted.observe_many_for_peer("peer-a", &[id]).unwrap();
+        assert_eq!(wanted.count().unwrap(), 1);
+
+        insert_local_event(&conn, &id);
+        wanted.remove(&id).unwrap();
+
+        assert_eq!(wanted.observe_many_for_peer("peer-a", &[id]).unwrap(), 0);
 
         let wanted_count: i64 = conn
             .query_row(
