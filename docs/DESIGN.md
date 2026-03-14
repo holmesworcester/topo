@@ -1251,13 +1251,13 @@ Negentropy does discovery only:
 
 The sink-side sender/request loop does balancing:
 1. `wanted(event_id, ...)` records that the sink still needs an event,
-2. `wanted_sources(event_id, peer_id, last_seen_at, in_flight, backoff_until, priority_lane, priority_ts)` records which peers appear to have it,
-3. the request scheduler keeps each peer's request window full by choosing the next wanted rows from SQL,
-4. source selection uses live backpressure and fairness, not deterministic hash ownership:
-   - prefer idle peers over saturated peers,
+2. `wanted_sources(event_id, peer_id, first_seen_at, last_seen_at, priority_lane, priority_ts)` records which peers appear to have it,
+3. request-lease fields on `wanted` record which peer currently owns the in-flight request,
+4. the request scheduler keeps each peer's request window full by choosing the next wanted rows from SQL,
+5. source selection uses live lease state and per-peer watermarks, not deterministic hash ownership:
    - cap in-flight requests per peer,
-   - back off a slow or failed peer,
-   - allow another candidate peer to take the same wanted event if the first stalls,
+   - only claim rows that are currently unleased or expired,
+   - allow another candidate peer to take the same wanted event after release or lease expiry,
    - preserve lane priority (foreground before bulk, newest first within lane).
 
 This means:

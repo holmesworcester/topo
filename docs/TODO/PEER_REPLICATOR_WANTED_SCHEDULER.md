@@ -11,7 +11,7 @@ Implementation follow-up:
 
 1. Add durable sink demand state:
    - `wanted(event_id, ...)`
-   - `wanted_sources(event_id, peer_id, last_seen_at, in_flight, backoff_until, priority_lane, priority_ts)`
+   - `wanted_sources(event_id, peer_id, first_seen_at, last_seen_at, priority_lane, priority_ts)`
 2. Move multi-source pull balancing out of negentropy/session control code and into a peer-scoped request scheduler.
 3. Keep one sender owner per peer slot with leased push windows and batch completion acks.
 4. Keep blob residency low-memory-friendly by leasing IDs more aggressively than blobs.
@@ -25,3 +25,8 @@ Implementation follow-up:
    - chain propagation,
    - low-memory catchup and low-memory file delta,
    - duplicate-send regression.
+8. Feed causal blockers into the same demand graph:
+   - when projection blocks on missing deps, insert those missing event IDs into `wanted`,
+   - once candidate suppliers are observed, let the same request scheduler prioritize them,
+   - preserve a way to rank blockers above ordinary catchup once the lane/priority story is implemented end-to-end.
+9. If the initial lease-based scheduler still needs better fairness under source stalls, add explicit per-peer backoff / retry metadata on top of the current `wanted` lease fields rather than moving balancing back into negentropy.

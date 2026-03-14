@@ -111,10 +111,10 @@ pub(super) fn send_idle_capture_enabled() -> bool {
         .unwrap_or(false)
 }
 
-// -- Coordinator timing (advisory, not on pull-dispatch hot path) --
-// The coordinator thread still runs for health/metrics but does not gate
-// HaveList dispatch.  Pull work division uses deterministic ownership
-// (hash-based split in control_plane::is_event_owned).
+// -- Coordinator timing (legacy/advisory) --
+// The coordinator implementation still exists in-tree, but the hot pull path
+// no longer depends on it. Sink-driven wanted scheduling is now the active
+// request-dispatch model.
 
 /// How long the coordinator waits (after the first peer reports) for
 /// remaining peers to finish reconciliation and report their need_ids.
@@ -125,7 +125,3 @@ pub(super) const COORDINATOR_POLL_INTERVAL: Duration = Duration::from_millis(10)
 
 /// Coordinator poll interval within the collection window.
 pub(super) const COORDINATOR_COLLECTION_POLL: Duration = Duration::from_millis(2);
-
-/// Timeout for waiting on coordinator assignment of fallback events.
-/// After this duration, the session proceeds without the fallback subset.
-pub(super) const FALLBACK_ASSIGNMENT_TIMEOUT: Duration = Duration::from_secs(5);

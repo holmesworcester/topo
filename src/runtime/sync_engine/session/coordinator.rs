@@ -1,11 +1,9 @@
-//! Multi-source download coordinator and greedy event assignment.
+//! Legacy multi-source coordination helper.
 //!
-//! The coordinator thread collects need_ids from all peers after
-//! reconciliation, then uses greedy load-balanced assignment to distribute
-//! download work across peers.
-//!
-//! `CoordinationManager` spawns a dynamic coordinator thread where peers
-//! register at runtime as bootstrap/mDNS targets are discovered.
+//! The active pull scheduler is now sink-driven `wanted` + `wanted_sources`
+//! state in SQLite. This module remains in-tree as compatibility scaffolding
+//! around peer registration and for any future health/metrics uses, but it is
+//! no longer on the hot request-dispatch path.
 
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
@@ -25,7 +23,8 @@ use super::{
 pub struct PeerCoord {
     pub peer_idx: usize,
     /// Snapshot of total registered peers at the time this peer was created.
-    /// Used for deterministic ownership: `hash(event_id) % total_peers == peer_idx`.
+    /// Still useful for metrics/debugging even though pull balancing no longer
+    /// hashes by `(peer_idx, total_peers)` on the hot path.
     pub total_peers: Arc<AtomicUsize>,
     pub report_tx: std::sync::mpsc::Sender<Vec<EventId>>,
     pub assign_rx: std::sync::Mutex<std::sync::mpsc::Receiver<Vec<EventId>>>,

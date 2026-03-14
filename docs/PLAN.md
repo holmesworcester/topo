@@ -1126,15 +1126,14 @@ Required changes from the 1:1 sync model:
      SQL truth using leased windows.
 5. **Receiver-driven wanted scheduling.** Pull balancing happens at the sink, not
    inside Negentropy. `wanted(event_id, ...)` records demand, and
-   `wanted_sources(event_id, peer_id, last_seen_at, in_flight, backoff_until,
+   `wanted_sources(event_id, peer_id, first_seen_at, last_seen_at,
    priority_lane, priority_ts)` records candidate suppliers discovered by the
    observer loop.
 6. **Per-peer request windows.** The sender/request loop continuously chooses the
    next wanted rows for each peer from SQL so active peers stay busy:
-   - prefer idle peers over saturated peers,
    - cap in-flight requests per peer,
-   - back off slow or failed peers,
-   - allow another candidate to take a wanted event if the first stalls,
+   - only claim rows that are currently unleased or expired,
+   - allow another candidate to take a wanted event after release or lease expiry,
    - preserve lane priority (foreground before bulk, newest first within lane).
    This keeps QUIC full without embedding balancing policy in Negentropy.
 7. **Push and pull share one scheduling model.** Push traffic drains peer egress

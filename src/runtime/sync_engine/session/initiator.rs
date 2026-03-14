@@ -1,7 +1,7 @@
 //! Sync initiator (client role) with dual-stream transport.
 //!
 //! Drives negentropy reconciliation, pushes events the peer needs, and
-//! uses deterministic ownership for multi-source pull work division.
+//! uses sink-driven `wanted` scheduling for multi-source pull work division.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -16,7 +16,6 @@ use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::crypto::EventId;
 use crate::db::{
     egress_queue::EgressQueue,
-    need_queue::NeedQueue,
     open_connection,
     queue::current_timestamp_ms,
     store::{lookup_workspace_id, Store},
@@ -33,8 +32,8 @@ use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 use crate::tuning::{low_mem_memtrace, low_mem_mode};
 
 use super::control_plane::{
-    append_have_ids_to_pending, dispatch_assigned_events, dispatch_owned_need_ids,
-    report_fallback_need_ids, send_done, send_initial_neg_open, try_poll_coordinator_assignment,
+    append_have_ids_to_pending, observe_need_ids_for_peer, refill_wanted_requests, send_done,
+    send_initial_neg_open,
 };
 use super::coordinator::PeerCoord;
 use super::data_plane::{
@@ -63,10 +62,10 @@ fn should_treat_as_startup_control_abort(
 /// Data stream: Event blobs
 ///
 /// Push (have_ids): always sends everything the peer needs.
-/// Pull (need_ids): dispatched immediately during reconciliation using
-/// deterministic ownership. Each event is owned by exactly one peer
-/// (hash-based split), so multi-source sessions naturally divide work
-/// without a coordinator barrier.
+/// Pull (need_ids): recorded into sink-side SQL `wanted` state during
+/// reconciliation. A per-peer request window then drains that durable state
+/// into `HaveList` requests, so balancing happens at the sink instead of
+/// inside negentropy.
 ///
 /// Callers must provide a `shared_ingest` sender connected to a shared
 /// batch_writer. The session never spawns its own writer thread.
@@ -79,7 +78,7 @@ pub async fn run_sync_initiator<C, S, R>(
     peer_id: &str,
     recorded_by: &str,
     ingress_source_tag: &str,
-    coordination: &PeerCoord,
+    _coordination: &PeerCoord,
     shared_ingest: mpsc::Sender<IngestItem>,
     capture: Option<SyncRunCapture>,
     rx_capture: Option<SyncRunRxCapture>,
@@ -109,9 +108,6 @@ where
 
     let egress = EgressQueue::new(&db);
     let wanted = WantedEvents::new(&db);
-    let need_queue = NeedQueue::new(&db);
-    let _ = need_queue.clear(peer_id);
-
     let ws_id = lookup_workspace_id(&db, recorded_by).ok_or_else(|| {
         format!(
             "no accepted workspace binding for peer_id={}, cannot start sync",
@@ -182,13 +178,6 @@ where
     // Pending have_ids buffer: populated by reconciliation, drained incrementally
     let mut pending_have: Vec<EventId> = Vec::new();
 
-    // Fallback buffer: non-owned need_ids reported to coordinator after reconciliation
-    let mut fallback_need_ids: Vec<EventId> = Vec::new();
-    let mut fallback_reported = false;
-    let mut fallback_dispatched = false;
-    let mut fallback_report_time: Option<Instant> = None;
-    let mut wanted_backpressure_active = false;
-
     let mut last_bytes_received = 0u64;
     let mut last_egress_log = Instant::now();
     let memtrace_enabled = low_mem_memtrace();
@@ -233,7 +222,6 @@ where
                         "elapsed_ms": sync_start.elapsed().as_millis(),
                         "pending_have": pending_have.len(),
                         "need_ids": need_ids.len(),
-                        "fallback_need_ids": fallback_need_ids.len(),
                     }))
                     .ok(),
                 );
@@ -311,47 +299,18 @@ where
             Err(_) => {}
         }
 
-        // Streaming ownership dispatch: in low-mem mode, owned IDs that exceed
-        // current credit are queued in SQLite and retried from there.
-        dispatch_owned_need_ids(
-            &mut control,
-            &wanted,
-            &need_queue,
-            peer_id,
-            &mut need_ids,
-            &mut fallback_need_ids,
-            coordination,
-            &mut wanted_backpressure_active,
-        )
-        .await?;
-
-        // After reconciliation, report non-owned events to coordinator for
-        // reassignment instead of discarding them.
-        if reconciliation_done && !fallback_reported {
-            if fallback_need_ids.is_empty() {
-                // No fallback events — nothing to report or wait for.
-                fallback_reported = true;
-                fallback_dispatched = true;
-            } else {
-                report_fallback_need_ids(&mut fallback_need_ids, coordination);
-                fallback_reported = true;
-                fallback_report_time = Some(Instant::now());
-            }
+        let observed_need_ids =
+            observe_need_ids_for_peer(&wanted, peer_id, &mut need_ids)?;
+        if observed_need_ids > 0 {
+            info!(
+                "Observed {} wanted IDs from peer {} during reconciliation",
+                observed_need_ids, peer_id
+            );
         }
-
-        // Poll for coordinator assignment (non-blocking)
-        if fallback_reported && !fallback_dispatched {
-            if let Some(assigned) = try_poll_coordinator_assignment(coordination) {
-                let dispatched = dispatch_assigned_events(&mut control, &wanted, assigned).await?;
-                info!("Coordinator assigned {} events to this session", dispatched);
-                fallback_dispatched = true;
-            } else if fallback_report_time
-                .map(|t| t.elapsed() > super::FALLBACK_ASSIGNMENT_TIMEOUT)
-                .unwrap_or(false)
-            {
-                info!("Coordinator assignment timeout, proceeding without fallback");
-                fallback_dispatched = true;
-            }
+        let requested_now =
+            refill_wanted_requests(&mut control, &wanted, peer_id, session_owner).await?;
+        if requested_now > 0 {
+            last_activity = Instant::now();
         }
 
         if let Err(err) =
@@ -382,7 +341,12 @@ where
                 .count_outstanding(peer_id, session_owner)
                 .unwrap_or(-1);
             let wanted_pending = wanted.count().unwrap_or(-1);
-            let need_queue_pending = need_queue.count(peer_id).unwrap_or(-1);
+            let wanted_peer_backlog = wanted
+                .count_backlog_for_peer(peer_id, session_owner)
+                .unwrap_or(-1);
+            let wanted_peer_outstanding = wanted
+                .count_outstanding_for_peer(peer_id, session_owner)
+                .unwrap_or(-1);
             let ingest_cap = ingest_tx.max_capacity();
             let ingest_used = ingest_cap.saturating_sub(ingest_tx.capacity());
             let sqlite_global = memtrace::sqlite_global_memory();
@@ -390,7 +354,7 @@ where
             let sqlite_neg = memtrace::sqlite_db_memory(&neg_db);
             let allocator = memtrace::allocator_memory();
             let line = format!(
-                "LOWMEM_MEMTRACE initiator peer={} rounds={} have={} need={} have_cap={} need_cap={} pending_have={} pending_have_cap={} fallback_need={} fallback_cap={} wanted={} need_queue={} egress_pending={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_main_cache={} db_main_schema={} db_main_stmt={} db_neg_cache={} db_neg_schema={} db_neg_stmt={} mall_arena={} mall_used={} mall_free={} mall_mmap={} bytes_rx={} bytes_tx={}",
+                "LOWMEM_MEMTRACE initiator peer={} rounds={} have={} need={} have_cap={} need_cap={} pending_have={} pending_have_cap={} wanted_total={} wanted_peer_backlog={} wanted_peer_outstanding={} egress_pending={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_main_cache={} db_main_schema={} db_main_stmt={} db_neg_cache={} db_neg_schema={} db_neg_stmt={} mall_arena={} mall_used={} mall_free={} mall_mmap={} bytes_rx={} bytes_tx={}",
                 peer_id,
                 rounds,
                 have_ids.len(),
@@ -399,10 +363,9 @@ where
                 need_ids.capacity(),
                 pending_have.len(),
                 pending_have.capacity(),
-                fallback_need_ids.len(),
-                fallback_need_ids.capacity(),
                 wanted_pending,
-                need_queue_pending,
+                wanted_peer_backlog,
+                wanted_peer_outstanding,
                 egress_pending,
                 ingest_used,
                 ingest_cap,
@@ -431,7 +394,9 @@ where
             last_memtrace = Instant::now();
         }
 
-        let pending_need_queue = need_queue.count(peer_id).unwrap_or(0);
+        let pending_wanted_backlog = wanted
+            .count_backlog_for_peer(peer_id, session_owner)
+            .unwrap_or(0);
         let egress_pending = egress
             .count_outstanding(peer_id, session_owner)
             .unwrap_or(0);
@@ -444,7 +409,8 @@ where
             if let Some(capture) = capture.as_ref() {
                 let idle_state = if egress_pending > 0 || !pending_have.is_empty() {
                     "queued_not_sending"
-                } else if !reconciliation_done || !need_ids.is_empty() || pending_need_queue > 0 {
+                } else if !reconciliation_done || !need_ids.is_empty() || pending_wanted_backlog > 0
+                {
                     "waiting_on_control"
                 } else {
                     "no_ready_work"
@@ -458,11 +424,9 @@ where
                         "state": idle_state,
                         "idle_ms": last_send_progress.elapsed().as_millis(),
                         "reconciliation_done": reconciliation_done,
-                        "fallback_dispatched": fallback_dispatched,
                         "pending_have": pending_have.len(),
                         "need_ids": need_ids.len(),
-                        "fallback_need_ids": fallback_need_ids.len(),
-                        "pending_need_queue": pending_need_queue,
+                        "wanted_peer_backlog": pending_wanted_backlog,
                         "egress_pending": egress_pending,
                         "wanted_pending": wanted.count().unwrap_or(-1),
                     }))
@@ -472,12 +436,12 @@ where
             last_idle_marker = Instant::now();
         }
 
-        // Once reconciliation is done, fallback is dispatched, pending_have
-        // is drained, and egress queue is empty, send DataDone+Done.
+        // Once reconciliation is done, this peer has no remaining wanted
+        // backlog, pending_have is drained, and egress queue is empty, send
+        // DataDone+Done.
         if reconciliation_done
             && need_ids.is_empty()
-            && pending_need_queue == 0
-            && fallback_dispatched
+            && pending_wanted_backlog == 0
             && pending_have.is_empty()
             && !done_sent
         {
@@ -506,13 +470,13 @@ where
         }
     }
 
+    let _ = wanted.release_peer_leases(peer_id, session_owner);
     let _ = egress.release_leases(peer_id, session_owner);
     let _ = egress.cleanup_sent_for_connection(peer_id, 0);
     if completed {
         if sync_window.kind == SyncWindowKind::Full {
             mark_outbound_full_completed(db_path, peer_id, current_timestamp_ms());
         }
-        let _ = need_queue.clear(peer_id);
         let _ = egress.cleanup_sent(EGRESS_SENT_TTL_MS);
     }
     if use_snapshot {

@@ -114,6 +114,30 @@ pub fn low_mem_wanted_low_watermark() -> usize {
     read_usize_env("LOW_MEM_WANTED_LOW_WATERMARK").unwrap_or(6)
 }
 
+pub fn wanted_high_watermark() -> usize {
+    if low_mem_mode() {
+        low_mem_wanted_high_watermark()
+    } else {
+        read_usize_env("P7_WANTED_HIGH_WATERMARK").unwrap_or(512)
+    }
+}
+
+pub fn wanted_low_watermark() -> usize {
+    if low_mem_mode() {
+        low_mem_wanted_low_watermark()
+    } else {
+        read_usize_env("P7_WANTED_LOW_WATERMARK").unwrap_or(128)
+    }
+}
+
+pub fn wanted_refill_quantum() -> usize {
+    if low_mem_mode() {
+        read_usize_env("LOW_MEM_WANTED_REFILL_QUANTUM").unwrap_or(4)
+    } else {
+        read_usize_env("P7_WANTED_REFILL_QUANTUM").unwrap_or(64)
+    }
+}
+
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn apply_low_mem_allocator_tuning() {
     if !low_mem_mode() {
