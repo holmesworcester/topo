@@ -501,7 +501,15 @@ db = sys.argv[1]
 try:
     conn = sqlite3.connect(db, timeout=5)
     conn.execute("PRAGMA busy_timeout = 5000")
-    cur = conn.execute("SELECT COUNT(*) FROM events WHERE event_type = 'file_slice'")
+    # File slices are tracked by the projector in `file_slices`; the raw
+    # `events.event_type` remains the encrypted wrapper on current schema.
+    table_exists = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type = 'table' AND name = 'file_slices'"
+    ).fetchone()
+    if table_exists:
+        cur = conn.execute("SELECT COUNT(*) FROM file_slices")
+    else:
+        cur = conn.execute("SELECT COUNT(*) FROM events WHERE event_type = 'file_slice'")
     row = cur.fetchone()
     print(int(row[0] if row else 0))
 except sqlite3.Error:
