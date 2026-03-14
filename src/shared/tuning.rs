@@ -56,7 +56,25 @@ pub fn bulk_write_batch_cap() -> usize {
 }
 
 pub fn bulk_egress_claim_count() -> usize {
-    1
+    if let Some(v) = read_usize_env("P7_BULK_EGRESS_CLAIM_COUNT") {
+        return v.max(1);
+    }
+    if low_mem_mode() {
+        2
+    } else {
+        4
+    }
+}
+
+pub fn egress_send_quantum_bytes() -> usize {
+    if let Some(v) = read_usize_env("P7_EGRESS_SEND_QUANTUM_BYTES") {
+        return v.max(1);
+    }
+    if low_mem_mode() {
+        512 * 1024
+    } else {
+        1024 * 1024
+    }
 }
 
 // -- Peering --

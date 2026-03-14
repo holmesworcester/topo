@@ -1,4 +1,4 @@
-use rusqlite::{params, Connection, Result as SqliteResult};
+use rusqlite::{params, params_from_iter, types::Value, Connection, Result as SqliteResult};
 
 use super::queue::{
     current_timestamp_ms, with_immediate_tx, with_sqlite_busy_retry, PRIORITY_LANE_BULK,
@@ -114,9 +114,16 @@ pub fn enqueue_local_shared_event_to_remote_peers_with_priority(
 
     let now = current_timestamp_ms();
     let mut stmt = conn.prepare(
-        "INSERT OR IGNORE INTO egress_queue
+        "INSERT INTO egress_queue
          (connection_id, frame_type, event_id, enqueued_at, available_at, priority_lane, priority_ts)
-         VALUES (?1, 'event', ?2, ?3, ?3, ?4, ?5)",
+         SELECT ?1, 'event', ?2, ?3, ?3, ?4, ?5
+         WHERE NOT EXISTS (
+           SELECT 1
+           FROM egress_queue
+           WHERE connection_id = ?1
+             AND frame_type = 'event'
+             AND event_id = ?2
+         )",
     )?;
     let mut inserted = 0usize;
     for peer_id in peer_ids {
@@ -157,6 +164,9 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         CREATE UNIQUE INDEX IF NOT EXISTS idx_egress_pending_event
             ON egress_queue(connection_id, event_id)
             WHERE frame_type = 'event' AND sent_at IS NULL;
+        CREATE INDEX IF NOT EXISTS idx_egress_event_lookup
+            ON egress_queue(connection_id, event_id)
+            WHERE frame_type = 'event';
         CREATE UNIQUE INDEX IF NOT EXISTS idx_egress_dedupe
             ON egress_queue(dedupe_key)
             WHERE dedupe_key IS NOT NULL AND sent_at IS NULL;
@@ -202,9 +212,16 @@ impl<'a> EgressQueue<'a> {
         let now = current_timestamp_ms();
         with_immediate_tx(self.conn, || {
             let mut stmt = self.conn.prepare(
-                "INSERT OR IGNORE INTO egress_queue
+                "INSERT INTO egress_queue
                  (connection_id, frame_type, event_id, enqueued_at, available_at, priority_lane, priority_ts)
-                 VALUES (?1, 'event', ?2, ?3, ?3, ?4, ?5)",
+                 SELECT ?1, 'event', ?2, ?3, ?3, ?4, ?5
+                 WHERE NOT EXISTS (
+                   SELECT 1
+                   FROM egress_queue
+                   WHERE connection_id = ?1
+                     AND frame_type = 'event'
+                     AND event_id = ?2
+                 )",
             )?;
             let mut inserted = 0usize;
             for id in event_ids {
@@ -303,19 +320,59 @@ impl<'a> EgressQueue<'a> {
         })
     }
 
-    /// Mark items as sent by deleting them from the queue, scoped to the
-    /// claiming session lease owner.
+    /// Mark items as sent by turning them into short-lived sent tombstones.
+    /// Keeping the row until session-end cleanup prevents same-session
+    /// re-enqueue of the same event after a fast send drains it.
     pub fn mark_sent(&self, lease_owner: &str, rowids: &[i64]) -> SqliteResult<()> {
         if rowids.is_empty() {
             return Ok(());
         }
+        let sent_at = current_timestamp_ms();
         with_immediate_tx(self.conn, || {
-            let mut stmt = self.conn.prepare(
-                "DELETE FROM egress_queue
-                 WHERE id = ?1 AND lease_owner = ?2",
-            )?;
-            for rowid in rowids {
-                stmt.execute(params![rowid, lease_owner])?;
+            for chunk in rowids.chunks(256) {
+                let placeholders = (3..chunk.len() + 3)
+                    .map(|idx| format!("?{}", idx))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "UPDATE egress_queue
+                     SET sent_at = ?1, lease_until = NULL
+                     WHERE lease_owner = ?2
+                       AND id IN ({placeholders})"
+                );
+                let mut params: Vec<Value> = Vec::with_capacity(chunk.len() + 2);
+                params.push(Value::from(sent_at));
+                params.push(Value::from(lease_owner.to_string()));
+                params.extend(chunk.iter().copied().map(Value::from));
+                self.conn.execute(&sql, params_from_iter(params))?;
+            }
+            Ok(())
+        })
+    }
+
+    /// Release a subset of rows currently leased by a session owner so they
+    /// can be claimed again immediately.
+    pub fn release_rows(&self, lease_owner: &str, rowids: &[i64]) -> SqliteResult<()> {
+        if rowids.is_empty() {
+            return Ok(());
+        }
+        with_immediate_tx(self.conn, || {
+            for chunk in rowids.chunks(256) {
+                let placeholders = (2..chunk.len() + 2)
+                    .map(|idx| format!("?{}", idx))
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                let sql = format!(
+                    "UPDATE egress_queue
+                     SET lease_owner = NULL, lease_until = NULL
+                     WHERE lease_owner = ?1
+                       AND sent_at IS NULL
+                       AND id IN ({placeholders})"
+                );
+                let mut params: Vec<Value> = Vec::with_capacity(chunk.len() + 1);
+                params.push(Value::from(lease_owner.to_string()));
+                params.extend(chunk.iter().copied().map(Value::from));
+                self.conn.execute(&sql, params_from_iter(params))?;
             }
             Ok(())
         })
@@ -332,6 +389,27 @@ impl<'a> EgressQueue<'a> {
                    AND sent_at IS NULL
                    AND (lease_until IS NULL OR lease_until <= ?2)",
                 params![connection_id, now],
+                |row| row.get(0),
+            )
+        })
+    }
+
+    /// Count rows that still represent outstanding send work for a session:
+    /// either generally claimable rows, or rows already leased by this owner.
+    pub fn count_outstanding(&self, connection_id: &str, lease_owner: &str) -> SqliteResult<i64> {
+        let now = current_timestamp_ms();
+        with_sqlite_busy_retry(|| {
+            self.conn.query_row(
+                "SELECT COUNT(*) FROM egress_queue
+                 WHERE connection_id = ?1
+                   AND sent_at IS NULL
+                   AND available_at <= ?2
+                   AND (
+                     lease_owner = ?3
+                     OR lease_until IS NULL
+                     OR lease_until <= ?2
+                   )",
+                params![connection_id, now, lease_owner],
                 |row| row.get(0),
             )
         })
@@ -356,8 +434,26 @@ impl<'a> EgressQueue<'a> {
         let cutoff = current_timestamp_ms() - older_than_ms;
         with_sqlite_busy_retry(|| {
             self.conn.execute(
-                "DELETE FROM egress_queue WHERE sent_at IS NOT NULL AND sent_at < ?1",
+                "DELETE FROM egress_queue WHERE sent_at IS NOT NULL AND sent_at <= ?1",
                 params![cutoff],
+            )
+        })
+    }
+
+    /// Delete sent tombstones for one connection after its session has ended.
+    pub fn cleanup_sent_for_connection(
+        &self,
+        connection_id: &str,
+        older_than_ms: i64,
+    ) -> SqliteResult<usize> {
+        let cutoff = current_timestamp_ms() - older_than_ms;
+        with_sqlite_busy_retry(|| {
+            self.conn.execute(
+                "DELETE FROM egress_queue
+                 WHERE connection_id = ?1
+                   AND sent_at IS NOT NULL
+                   AND sent_at <= ?2",
+                params![connection_id, cutoff],
             )
         })
     }
@@ -472,6 +568,41 @@ mod tests {
     }
 
     #[test]
+    fn test_count_outstanding_includes_rows_leased_by_owner() {
+        let conn = setup();
+        let eq = EgressQueue::new(&conn);
+
+        let ids = vec![make_event_id(1), make_event_id(2), make_event_id(3)];
+        for (idx, id) in ids.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+                 VALUES (?1, 'message', ?2, 'shared', ?3, ?3)",
+                params![event_id_to_base64(id), vec![idx as u8], idx as i64],
+            )
+            .unwrap();
+        }
+        eq.enqueue_events("conn1", &ids).unwrap();
+
+        let claimed = eq.claim_batch("conn1", "sess-1", 2, 30_000).unwrap();
+        assert_eq!(claimed.len(), 2);
+        assert_eq!(
+            eq.count_pending("conn1").unwrap(),
+            1,
+            "only the unleased row should count as generally pending"
+        );
+        assert_eq!(
+            eq.count_outstanding("conn1", "sess-1").unwrap(),
+            3,
+            "owner-aware outstanding count should include rows leased by this session"
+        );
+        assert_eq!(
+            eq.count_outstanding("conn1", "sess-2").unwrap(),
+            1,
+            "other sessions should only see generally claimable work"
+        );
+    }
+
+    #[test]
     fn test_claim_skips_sent() {
         let conn = setup();
         let eq = EgressQueue::new(&conn);
@@ -495,7 +626,7 @@ mod tests {
     }
 
     #[test]
-    fn test_mark_sent_deletes() {
+    fn test_mark_sent_keeps_tombstones_until_cleanup() {
         let conn = setup();
         let eq = EgressQueue::new(&conn);
 
@@ -514,11 +645,83 @@ mod tests {
         let rowids: Vec<i64> = claimed.iter().map(|(r, _)| *r).collect();
         eq.mark_sent("sess-1", &rowids).unwrap();
 
-        // mark_sent now deletes rows — total count should be 0
+        // mark_sent keeps sent tombstones until session-end cleanup
         let total: i64 = conn
             .query_row("SELECT COUNT(*) FROM egress_queue", [], |row| row.get(0))
             .unwrap();
-        assert_eq!(total, 0);
+        assert_eq!(total, 2);
+
+        eq.cleanup_sent_for_connection("conn1", 0).unwrap();
+        let total_after_cleanup: i64 = conn
+            .query_row("SELECT COUNT(*) FROM egress_queue", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(total_after_cleanup, 0);
+    }
+
+    #[test]
+    fn test_mark_sent_tombstone_blocks_same_session_reenqueue() {
+        let conn = setup();
+        let eq = EgressQueue::new(&conn);
+
+        let id = make_event_id(9);
+        conn.execute(
+            "INSERT INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, 'message', x'01', 'shared', 10, 10)",
+            params![event_id_to_base64(&id)],
+        )
+        .unwrap();
+        eq.enqueue_events("conn1", &[id]).unwrap();
+
+        let claimed = eq.claim_batch("conn1", "sess-1", 10, 30_000).unwrap();
+        let rowids: Vec<i64> = claimed.iter().map(|(r, _)| *r).collect();
+        eq.mark_sent("sess-1", &rowids).unwrap();
+
+        let inserted = eq.enqueue_events("conn1", &[id]).unwrap();
+        assert_eq!(
+            inserted, 0,
+            "same-session tombstone should suppress immediate re-enqueue"
+        );
+
+        eq.cleanup_sent_for_connection("conn1", 0).unwrap();
+        let inserted_after_cleanup = eq.enqueue_events("conn1", &[id]).unwrap();
+        assert_eq!(
+            inserted_after_cleanup, 1,
+            "cleanup should make the event claimable again in a later session"
+        );
+    }
+
+    #[test]
+    fn test_release_rows_clears_selected_leases_only() {
+        let conn = setup();
+        let eq = EgressQueue::new(&conn);
+
+        let ids = vec![make_event_id(1), make_event_id(2), make_event_id(3)];
+        for (idx, id) in ids.iter().enumerate() {
+            conn.execute(
+                "INSERT INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+                 VALUES (?1, 'message', ?2, 'shared', ?3, ?3)",
+                params![event_id_to_base64(id), vec![idx as u8], idx as i64],
+            )
+            .unwrap();
+        }
+        eq.enqueue_events("conn1", &ids).unwrap();
+
+        let claimed = eq.claim_batch("conn1", "sess-1", 3, 30_000).unwrap();
+        let rowids: Vec<i64> = claimed.iter().map(|(rowid, _)| *rowid).collect();
+        eq.release_rows("sess-1", &rowids[..2]).unwrap();
+
+        let released = eq.claim_batch("conn1", "sess-2", 3, 30_000).unwrap();
+        assert_eq!(
+            released.len(),
+            2,
+            "released rows should become immediately claimable again"
+        );
+
+        let still_owned = eq.count_outstanding("conn1", "sess-1").unwrap();
+        assert_eq!(
+            still_owned, 1,
+            "only the still-leased row should remain outstanding for the original owner"
+        );
     }
 
     #[test]

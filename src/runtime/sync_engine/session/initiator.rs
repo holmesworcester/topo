@@ -378,7 +378,9 @@ where
         }
 
         if memtrace_enabled && last_memtrace.elapsed() >= memtrace_interval {
-            let egress_pending = egress.count_pending(peer_id).unwrap_or(-1);
+            let egress_pending = egress
+                .count_outstanding(peer_id, session_owner)
+                .unwrap_or(-1);
             let wanted_pending = wanted.count().unwrap_or(-1);
             let need_queue_pending = need_queue.count(peer_id).unwrap_or(-1);
             let ingest_cap = ingest_tx.max_capacity();
@@ -430,7 +432,9 @@ where
         }
 
         let pending_need_queue = need_queue.count(peer_id).unwrap_or(0);
-        let egress_pending = egress.count_pending(peer_id).unwrap_or(0);
+        let egress_pending = egress
+            .count_outstanding(peer_id, session_owner)
+            .unwrap_or(0);
 
         if idle_capture_enabled
             && !done_sent
@@ -503,6 +507,7 @@ where
     }
 
     let _ = egress.release_leases(peer_id, session_owner);
+    let _ = egress.cleanup_sent_for_connection(peer_id, 0);
     if completed {
         if sync_window.kind == SyncWindowKind::Full {
             mark_outbound_full_completed(db_path, peer_id, current_timestamp_ms());

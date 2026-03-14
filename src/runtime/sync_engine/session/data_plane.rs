@@ -19,7 +19,7 @@ use crate::protocol::Frame;
 use crate::runtime::memtrace;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
-use crate::tuning::low_mem_memtrace;
+use crate::tuning::{egress_send_quantum_bytes, low_mem_memtrace};
 
 use super::logging::SyncRunRxCapture;
 use super::{
@@ -81,57 +81,83 @@ where
     let mut events_sent_delta = 0u64;
     let mut bytes_sent_delta = 0u64;
     let mut sent_any = false;
-    let batch =
-        match egress.claim_batch(peer_id, lease_owner, egress_claim_count(), EGRESS_LEASE_MS) {
-            Ok(batch) => batch,
-            Err(err) => {
-                warn!(
-                    "failed to claim egress batch peer={} owner={} error={}",
-                    peer_id, lease_owner, err
-                );
-                Vec::new()
-            }
-        };
-
-    let mut sent_rowids: Vec<i64> = Vec::with_capacity(batch.len());
     let mut missing_count = 0u64;
-    for (rowid, event_id) in batch {
-        if let Ok(Some(blob)) = store.get_shared(&event_id) {
-            let blob_len = blob.len() as u64;
-            match tokio::time::timeout(
-                DATA_SEND_STALL_TIMEOUT,
-                data_send.send(&Frame::Event { blob }),
-            )
-            .await
-            {
-                Ok(Ok(())) => {
-                    events_sent_delta += 1;
-                    bytes_sent_delta += blob_len;
-                    sent_any = true;
-                    sent_rowids.push(rowid);
-                }
-                Ok(Err(err)) => {
+    let send_quantum_bytes = egress_send_quantum_bytes() as u64;
+    let mut sent_rowids: Vec<i64> = Vec::new();
+    let mut stop_after_flush = false;
+
+    while bytes_sent_delta < send_quantum_bytes {
+        let batch =
+            match egress.claim_batch(peer_id, lease_owner, egress_claim_count(), EGRESS_LEASE_MS) {
+                Ok(batch) => batch,
+                Err(err) => {
                     warn!(
-                        "data send failed peer={} event={} error={}",
-                        peer_id,
-                        event_id_to_base64(&event_id),
-                        err
+                        "failed to claim egress batch peer={} owner={} error={}",
+                        peer_id, lease_owner, err
                     );
-                    break;
+                    Vec::new()
                 }
-                Err(_) => {
-                    warn!(
-                        "data send stalled peer={} event={} timeout_ms={}",
-                        peer_id,
-                        event_id_to_base64(&event_id),
-                        DATA_SEND_STALL_TIMEOUT.as_millis()
-                    );
-                    break;
+            };
+        if batch.is_empty() {
+            break;
+        }
+
+        let mut unsent_rowids: Vec<i64> = Vec::new();
+        let mut batch_made_progress = false;
+        for (idx, (rowid, event_id)) in batch.iter().enumerate() {
+            if let Ok(Some(blob)) = store.get_shared(event_id) {
+                let blob_len = blob.len() as u64;
+                match tokio::time::timeout(
+                    DATA_SEND_STALL_TIMEOUT,
+                    data_send.send(&Frame::Event { blob }),
+                )
+                .await
+                {
+                    Ok(Ok(())) => {
+                        events_sent_delta += 1;
+                        bytes_sent_delta += blob_len;
+                        sent_any = true;
+                        batch_made_progress = true;
+                        sent_rowids.push(*rowid);
+                    }
+                    Ok(Err(err)) => {
+                        warn!(
+                            "data send failed peer={} event={} error={}",
+                            peer_id,
+                            event_id_to_base64(event_id),
+                            err
+                        );
+                        unsent_rowids
+                            .extend(batch[idx..].iter().map(|(pending_rowid, _)| *pending_rowid));
+                        stop_after_flush = true;
+                        break;
+                    }
+                    Err(_) => {
+                        warn!(
+                            "data send stalled peer={} event={} timeout_ms={}",
+                            peer_id,
+                            event_id_to_base64(event_id),
+                            DATA_SEND_STALL_TIMEOUT.as_millis()
+                        );
+                        unsent_rowids
+                            .extend(batch[idx..].iter().map(|(pending_rowid, _)| *pending_rowid));
+                        stop_after_flush = true;
+                        break;
+                    }
                 }
+            } else {
+                missing_count += 1;
+                batch_made_progress = true;
+                sent_rowids.push(*rowid);
             }
-        } else {
-            missing_count += 1;
-            sent_rowids.push(rowid);
+        }
+
+        if !unsent_rowids.is_empty() {
+            let _ = egress.release_rows(lease_owner, &unsent_rowids);
+        }
+
+        if stop_after_flush || !batch_made_progress {
+            break;
         }
     }
     if missing_count > 0 {
@@ -393,5 +419,45 @@ mod tests {
         verify.busy_timeout(Duration::from_millis(20)).unwrap();
         let egress = EgressQueue::new(&verify);
         assert_eq!(egress.count_pending("peer-a").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_egress_to_data_stream_claims_multiple_batches_per_quantum() {
+        let (_dir, _path, conn) = setup_file_db();
+        let now_ms = 1_700_000_000_000i64;
+        let mut event_ids = Vec::new();
+        for idx in 0..80u8 {
+            let blob = format!("msg-{idx:03}").into_bytes();
+            let event_id = hash_event(&blob);
+            insert_event(
+                &conn,
+                &event_id,
+                "message",
+                &blob,
+                ShareScope::Shared,
+                now_ms + idx as i64,
+                now_ms + idx as i64,
+            )
+            .unwrap();
+            event_ids.push(event_id);
+        }
+
+        let egress = EgressQueue::new(&conn);
+        egress.enqueue_events("peer-a", &event_ids).unwrap();
+
+        let store = Store::new(&conn);
+        let sender = RecordingSend::default();
+        let sender_state = sender.frames.clone();
+        let mut send = sender;
+        let stats =
+            drain_egress_to_data_stream(&egress, &store, "peer-a", "sess-a", &mut send).await;
+
+        assert_eq!(
+            stats.events_sent_delta, 80,
+            "one drain quantum should span multiple queue claims"
+        );
+        assert_eq!(sender_state.lock().unwrap().len(), 80);
+        assert_eq!(egress.count_pending("peer-a").unwrap(), 0);
+        assert_eq!(egress.count_outstanding("peer-a", "sess-a").unwrap(), 0);
     }
 }

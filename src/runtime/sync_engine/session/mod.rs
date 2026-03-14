@@ -73,10 +73,15 @@ pub(super) fn enqueue_batch() -> usize {
 
 /// Max events per egress claim (one send batch to the data stream).
 pub(super) fn egress_claim_count() -> usize {
+    if let Ok(v) = std::env::var("P7_EGRESS_CLAIM_COUNT") {
+        if let Ok(parsed) = v.parse::<usize>() {
+            return parsed.max(1);
+        }
+    }
     if low_mem_mode() {
-        2
-    } else {
         8
+    } else {
+        32
     }
 }
 

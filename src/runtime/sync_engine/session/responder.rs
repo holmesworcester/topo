@@ -331,7 +331,9 @@ where
         }
 
         if memtrace_enabled && last_memtrace.elapsed() >= memtrace_interval {
-            let egress_pending = egress.count_pending(peer_id).unwrap_or(-1);
+            let egress_pending = egress
+                .count_outstanding(peer_id, session_owner)
+                .unwrap_or(-1);
             let ingest_cap = ingest_tx.max_capacity();
             let ingest_used = ingest_cap.saturating_sub(ingest_tx.capacity());
             let sqlite_global = memtrace::sqlite_global_memory();
@@ -368,7 +370,9 @@ where
             last_memtrace = Instant::now();
         }
 
-        let egress_pending = egress.count_pending(peer_id).unwrap_or(0);
+        let egress_pending = egress
+            .count_outstanding(peer_id, session_owner)
+            .unwrap_or(0);
 
         if idle_capture_enabled
             && !completed
@@ -434,6 +438,7 @@ where
     }
 
     let _ = egress.release_leases(peer_id, session_owner);
+    let _ = egress.cleanup_sent_for_connection(peer_id, 0);
     if completed {
         let _ = egress.cleanup_sent(EGRESS_SENT_TTL_MS);
     }
