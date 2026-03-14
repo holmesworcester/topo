@@ -1093,8 +1093,10 @@ Projection authorization also rejects when:
 Multi-source download allows a sink to pull events from N sources concurrently.
 
 A naive approach — running N independent negentropy sessions, each with its own
-`batch_writer` — fails at scale: N writers contend on SQLite WAL locks, overlapping
-need_ids cause redundant downloads, and a slow source blocks its events until timeout.
+`batch_writer` and letting each session decide for itself which `need_ids` it
+will serve — fails at scale: N writers contend on SQLite WAL locks, overlapping
+need_ids cause redundant downloads, and transport fill depends on whichever
+session most recently finished reconciliation.
 
 Required changes from the 1:1 sync model:
 
@@ -1115,26 +1117,41 @@ Required changes from the 1:1 sync model:
    deterministic preferred direction is the lexicographically lower peer dialing
    outbound; if a preferred-direction duplicate arrives it replaces the non-preferred
    live connection.
-4. **Deterministic per-event ownership for pull splitting.** Each need_id is routed
-   through `hash(event_id[0..8]) % total_peers == peer_idx`. Owned events get
-   HaveList immediately during reconciliation (streaming pull). Non-owned events
-   are buffered for fallback discard. No coordinator barrier on the hot path.
-5. **Push uncoordinated, pull streams with ownership.** Have_ids (outbound) stream
-   immediately. Need_ids (inbound) are dispatched as HaveList during reconciliation
-   rounds based on ownership. The `wanted` table deduplicates.
-   **Do not defer HaveList until after reconciliation** — this creates a pipeline stall
-   that serializes ~1s of overhead on the critical path.
-6. **Threshold-based claim-all for source-unique events.** When `need_ids.len() <=
-   total_peers * 20`, the session claims ALL need_ids regardless of ownership.
-   Handles source-unique events (identity chains, markers) that only exist at one
-   source and cannot be downloaded by their deterministic "owner" peer.
-7. **Pre-registration of peers.** All PeerCoord handles registered before spawning
-   connect loop threads. Ensures `total_peers` is correct from the first session.
-8. **Incremental egress enqueue.** Have_ids buffered and drained in batches per main loop
-   iteration so event streaming is not starved by large reconciliation results.
+4. **PeerReplicator split per authenticated peer slot.** Each peer slot owns two
+   internal loops:
+   - an **observer loop** (lower-rate) that runs Negentropy on connect/full-sync,
+     `dirty_hot`, cold-timer, backlog-exhaustion, or source-set-change triggers and
+     updates SQL truth (`wanted`, candidate sources, peer egress),
+   - a **sender/request loop** (higher-rate) that keeps QUIC streams full from that
+     SQL truth using leased windows.
+5. **Receiver-driven wanted scheduling.** Pull balancing happens at the sink, not
+   inside Negentropy. `wanted(event_id, ...)` records demand, and
+   `wanted_sources(event_id, peer_id, last_seen_at, in_flight, backoff_until,
+   priority_lane, priority_ts)` records candidate suppliers discovered by the
+   observer loop.
+6. **Per-peer request windows.** The sender/request loop continuously chooses the
+   next wanted rows for each peer from SQL so active peers stay busy:
+   - prefer idle peers over saturated peers,
+   - cap in-flight requests per peer,
+   - back off slow or failed peers,
+   - allow another candidate to take a wanted event if the first stalls,
+   - preserve lane priority (foreground before bulk, newest first within lane).
+   This keeps QUIC full without embedding balancing policy in Negentropy.
+7. **Push and pull share one scheduling model.** Push traffic drains peer egress
+   from leased SQL-backed send windows. Pull traffic fills per-peer wanted request
+   windows from SQL-backed demand state. Both loops are peer-scoped, priority-aware,
+   and low-memory because they lease IDs, not bulk blobs.
+8. **Incremental leased windows, not tiny claim/send cycles.** Once work is known,
+   the sender should not round-trip to SQLite on every 1-8 events. It keeps bounded
+   in-memory windows of leased row IDs/event IDs, refills below a low-water mark,
+   and batch-acks completions so SQLite is not the wire-pacing mechanism.
 9. **Negentropy snapshot ordering.** `BEGIN` must precede `rebuild_blocks()` so the storage
    sees a consistent read snapshot while concurrent writes proceed in the batch_writer.
 10. **Windowed reconciliation on the same event universe.** The first outbound round to a peer is `Full`; subsequent rounds are usually `Hot` (`ts >= cutoff`) with periodic `Cold` (`ts < cutoff`) refreshes. The window is carried in the initial `NegOpen` header and does not create a second protocol or separate dependency universe.
+11. **New valid shared events wake the hot observer loop.** A newly valid shared
+    event, whether locally created or newly ingested from the network, marks the
+    relevant peer slots `dirty_hot`. That gives the same fast path on every hop of a
+    chain; no special first-hop local gossip shortcut is required.
 
 Test families (in `sync_graph_test.rs`):
 - **Family A (chain):** N-peer chain propagation (tail convergence, per-hop latency).
@@ -1142,6 +1159,16 @@ Test families (in `sync_graph_test.rs`):
 - **Family C (multi-source large-file):** all non-sink sources seeded with identical
   file-slice sets; sink asserts exact file-slice ID set and substantial per-source
   ingest share from `recorded_events.source` attribution (>=5% per source).
+
+Invariants this model is meant to preserve:
+- at most one steady-state live connection slot per authenticated peer,
+- at most one sender owner drains a peer slot's egress at a time,
+- no balancing logic is embedded in Negentropy,
+- the sink can keep active peers busy whenever candidate supply exists,
+- a slow source does not own events by fiat; another candidate can take over,
+- multi-source fairness is across distinct peers, not multiplied by duplicate connections,
+- low-memory mode bounds blob residency while still allowing larger leased-ID windows,
+- hot/cold cadence does not split the event universe or completion protocol.
 
 ---
 

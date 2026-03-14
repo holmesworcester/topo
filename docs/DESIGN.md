@@ -129,7 +129,7 @@ Negentropy reconciliation exchanges compact set summaries (`NegOpen`/`NegMsg`) o
 
 We use the Rust [`negentropy` library](https://crates.io/crates/negentropy) (`negentropy = "0.5"` in this repo), and this is the concrete engine behind our range-based set reconciliation approach ([Aljoscha Meyer, "Range-Based Set Reconciliation"](https://aljoscha-meyer.de/assets/landing/rbsr.pdf)). We modified our Negentropy integration to use a SQLite-backed store (`neg_items` + per-session `session_blocks`) instead of unbounded in-memory item sets, so reconciliation remains memory-bounded at large history sizes. (This is important for doing background sync in a memory-limited context on iOS). 
 
-We also modified the session flow for multi-source catchup: each source runs Negentropy independently, `need_ids` are deterministically split with fallback reassignment for source-unique/small sets, and all sources feed one shared batch writer to avoid duplicate pull storms and SQLite write contention. Inbound events are ingested through the same `project_one` path used by local creation and replay, which is why the system can enforce one convergence contract across source types: `local_create`, `wire_receive`, and replay all converge to the same projected state.
+We also modified the session flow for multi-source catchup: each source still runs Negentropy independently, but Negentropy is now only responsible for discovering candidate supply (`need_ids`, `have_ids`, and which peers appear to have which events). Balancing is sink-driven through SQL-backed `wanted` state and per-peer request windows, while all sources still feed one shared batch writer to avoid duplicate pull storms and SQLite write contention. Inbound events are ingested through the same `project_one` path used by local creation and replay, which is why the system can enforce one convergence contract across source types: `local_create`, `wire_receive`, and replay all converge to the same projected state.
 For same-workspace sibling tenants sharing one DB, there is one extra local step after canonical persistence: shared events created locally or ingested from the network are fanned out to sibling tenant scopes with the same `workspace_id`, then projected through those tenants' normal queue/drain path. This is not a transport shortcut and it does not bypass projectors; it is local fanout of already-canonical shared blobs so one shared DB converges the same way multiple separate daemons would.
 
 ### Steady-State Repeats The Same Loop
@@ -1180,17 +1180,22 @@ Operational queues:
 
 Canonical tables and queue tables stay separate.
 
+`egress_queue.connection_id` is a legacy column name. The logical owner is the
+authenticated peer slot, not a raw transport connection. In steady state the
+runtime passes peer-id/peer-slot identity through this column.
+
 ## 7.2 Workers
 
-Current runtime ingest/worker shape:
+Peer runtime worker shape:
 1. sync ingest receiver path:
    - receive `Frame::Event` blobs,
    - decode + canonical insert (`events`, `neg_items`, `recorded_events`) + `project_queue` enqueue in one transaction,
    - commit, then drain `project_queue`.
 2. project worker/drain:
    - claim batch, project each event in autocommit (`valid|block|reject`), batch-dequeue successes, mark retry on failure. `project_queue` stores priority metadata but currently only uses lane priority at claim time: foreground before bulk, then FIFO within the lane (`priority_lane`, then `available_at`, then `rowid`) so dependency-heavy foreground chains are not recency-reordered. WAL autocheckpoint deferred during drain (skipped in low_mem mode).
-3. egress worker:
-   - claim a leased batch per connection/session-owner, send frame, mark sent or retry. `egress_queue` prioritizes foreground over bulk and can use recency ordering within the lane (`priority_lane`, then `priority_ts DESC`) because send scheduling does not have the same dependency-order constraint as projection.
+3. `PeerReplicator` per authenticated peer slot:
+   - **observer loop** (lower-rate): connect/full-sync start, `dirty_hot`, cold timer, backlog exhaustion, or source-set change trigger negentropy observation; the observer updates SQL truth (`wanted`, candidate sources, peer egress rows) but does not attempt to keep the wire full itself.
+   - **sender/request loop** (higher-rate): continuously keeps per-peer QUIC streams fed from leased SQL-backed windows. It drains peer egress for push traffic and maintains sink-side wanted request windows for pull traffic.
 4. cleanup worker:
    - reclaim expired leases, purge stale/sent operational rows, TTL endpoint cleanup.
 
@@ -1200,10 +1205,10 @@ Queue claim/lease/retry/backoff logic is DRY and shared across `project_queue` a
 
 Egress rows are produced by:
 
-1. negentropy reconciliation decisions (`runtime/sync_engine/session/control_plane.rs`),
-2. incoming `HaveList` responses and need buffering (`runtime/sync_engine/session/initiator.rs`),
+1. observer-loop reconciliation decisions (`runtime/sync_engine/session/control_plane.rs`),
+2. sink-side wanted scheduling decisions (candidate source selection + request windows),
 3. control protocol producers (`Frame::NegOpen`, `Frame::NegMsg`, `Frame::HaveList`, `Frame::Done`, `Frame::DataDone`, `Frame::DoneAck`, `Frame::IntroOffer`) in `shared/protocol.rs`,
-4. direct local enqueue of newly-created shared events to all currently-known remote peers for the tenant,
+4. hot-observer wakeups from newly valid shared events, which cause the next peer observation pass to populate the relevant peer egress rows,
 5. optional proactive send pathways (future optimization hooks in this queue model).
 
 For canonical event transfer, egress rows carry `event_id`; canonical blob is read at send time.
@@ -1234,45 +1239,38 @@ Can be eventual:
 
 ## 7.6 Multi-source download coordination
 
-Multi-source download uses deterministic per-event ownership to split work
-across concurrent sessions without a central coordinator barrier:
+Multi-source download is receiver-driven.
 
-1. **Discovery**: each session runs negentropy with its source, discovering
-   need_ids (events the sink needs). Push (have_ids) proceeds immediately.
-2. **Streaming ownership dispatch**: as need_ids are discovered during
-   reconciliation, each is routed through an ownership predicate:
-   `hash(event_id[0..8]) % total_peers == peer_idx`. Owned events get
-   HaveList immediately (pipelining data transfer with reconciliation).
-   Non-owned events are buffered for fallback.
-3. **Threshold-based claim-all**: when need_ids count is small (below
-   `total_peers * 20`), the session claims ALL need_ids regardless of
-   ownership. This handles source-unique events (identity chains, markers)
-   that only exist at one source and cannot be downloaded by their
-   deterministic "owner" peer which connects to a different source.
-4. **Fallback discard**: after reconciliation, buffered non-owned events
-   are discarded. Their deterministic owners handle them from their
-   respective sources (or the threshold rule claims them when counts are
-   small enough).
+Negentropy does discovery only:
+1. per source peer, the observer loop discovers:
+   - sink `need_ids` (events we still lack),
+   - source `have_ids` (events we can push),
+   - candidate source membership ("peer P appears to have event E").
+2. this discovery is written into SQL-backed wanted state rather than being
+   balanced inline inside the negentropy round.
 
-**Critical invariant — streaming pull dispatch.** HaveList frames MUST be sent
-during reconciliation rounds, not deferred until after reconciliation completes.
-The `wanted` table provides natural dedup so streaming dispatch is safe.
+The sink-side sender/request loop does balancing:
+1. `wanted(event_id, ...)` records that the sink still needs an event,
+2. `wanted_sources(event_id, peer_id, last_seen_at, in_flight, backoff_until, priority_lane, priority_ts)` records which peers appear to have it,
+3. the request scheduler keeps each peer's request window full by choosing the next wanted rows from SQL,
+4. source selection uses live backpressure and fairness, not deterministic hash ownership:
+   - prefer idle peers over saturated peers,
+   - cap in-flight requests per peer,
+   - back off a slow or failed peer,
+   - allow another candidate peer to take the same wanted event if the first stalls,
+   - preserve lane priority (foreground before bulk, newest first within lane).
+
+This means:
+- negentropy discovers supply,
+- `wanted` models demand,
+- the sender/request loop is the actuator that balances traffic and keeps QUIC full.
 
 Key properties:
-- Single-peer degenerates naturally: `total_peers <= 1` means all events owned.
-- Work division is deterministic — no coordinator barrier, no collection window.
-- Source-unique events handled by threshold fallback without cross-source state.
-- Undelivered events re-appear as need_ids in the next session cycle.
-- Push path (egress streaming) runs independently during pull dispatch.
-- Sink-side transfer accounting can be audited via `recorded_events.source`
-  tags (`quic_recv:<peer_id>@<ip:port>`) and grouped by source peer.
-
-### Pre-registration of peers
-
-All `PeerCoord` handles must be registered before spawning connect loop threads.
-This ensures `total_peers` is correct from the first session. Without
-pre-registration, early threads see `total_peers=1` and claim all events,
-defeating the ownership split.
+- no balancing logic is embedded in negentropy,
+- the sink can always keep active peers busy if candidate supply exists,
+- a slow source does not own events by fiat; another candidate can be chosen,
+- multi-source fairness is across distinct peers, not multiplied by duplicate connections,
+- push traffic and pull traffic share one scheduling model instead of two different balancing stories.
 
 ### Connection idempotency
 
@@ -1295,55 +1293,25 @@ live connections to the same peer.
 
 ### Implementation decisions
 
-A naive negentropy implementation runs one session per peer pair: each session
-has its own `batch_writer` thread for persistence, and after reconciliation it
-sends HaveList for all need_ids and streams all have_ids directly. This works
-for 1:1 sync but breaks down when a sink pulls from N sources concurrently:
+The old "deterministic ownership in negentropy" approach was a transitional
+shortcut: it reduced duplicate downloads without introducing a durable sink-side
+scheduler, but it coupled balancing to reconciliation and made transport fill
+depend on fresh session rounds.
 
-1. N independent `batch_writer` threads all write to the same SQLite DB,
-   causing WAL contention and lock timeouts.
-2. Multiple sources discover the same need_ids. Without coordination each
-   source sends the full set, wasting bandwidth proportional to overlap.
-3. If one source is slow, its events are delayed until its session completes.
-   No other source can pick up the slack.
+`PeerReplicator` replaces that with a cleaner split:
 
-The multi-source design addresses each of these:
-
-**Shared batch_writer.** All concurrent sessions feed events into a single
-shared `mpsc` channel consumed by one `batch_writer` thread. This eliminates
-write contention entirely — only one thread ever holds the SQLite write lock.
-Do not add an in-memory dedup set in front of the shared writer:
-- Pre-writer dedup causes data loss if the writer transaction rolls back
-  (event marked "seen" but never persisted; peer retransmissions silently dropped).
-- A global in-memory "seen set" grows without bound for long-running daemons (~90 bytes per EventId), which conflicts with low-memory goals.
-- `INSERT OR IGNORE` in `batch_writer` handles duplicates correctly and cheaply.
-
-**Deterministic ownership for pull splitting.** Each peer pushes all have_ids
-without coordination — the push path runs at full speed. The pull path uses
-`hash(event_id) % total_peers` to split need_ids across sessions, so each
-source sends roughly `1/N` of the shared events. For single-peer sync,
-ownership degenerates naturally (all events owned).
-
-**Session-cycle reassignment.** Each session starts fresh with a new negentropy
-snapshot. If a peer fails to deliver its owned events (slow, disconnected),
-those events re-appear as need_ids in the next session cycle and get claimed
-by the next session connecting to a source that has them.
-
-**Thread-per-connection.** Each incoming connection spawns a `std::thread`
-with a dedicated single-threaded tokio runtime. This isolates connection
-failures, avoids `!Send` constraints from `rusqlite` leaking into the async
-task graph, and allows each connection to share the `mpsc::Sender` to the
-shared batch_writer.
-
-**Incremental egress enqueue.** Have_ids from reconciliation are buffered and
-drained incrementally per main loop iteration rather than enqueued in one burst.
-This interleaves egress enqueue with event streaming so the data stream is not
-starved while processing large reconciliation results.
-
-**Negentropy snapshot ordering.** `BEGIN` must precede `rebuild_blocks()` so
-the negentropy storage sees a consistent read snapshot of the events table.
-Without this, concurrent writes from the batch_writer can produce an
-inconsistent view during block rebuilding.
+1. **Shared batch_writer.** All concurrent sessions still feed one shared
+   SQLite writer. This remains the correct way to avoid WAL contention.
+2. **Observer loop.** Per-peer negentropy rounds discover candidate supply and
+   keep the wanted graph fresh.
+3. **Sender/request loop.** The sink keeps per-peer request windows full from
+   `wanted` SQL state; the sender keeps per-peer push windows full from
+   `egress_queue`.
+4. **Incremental leased windows.** Both push and pull use leased SQL-backed
+   windows with tiny blob residency and larger ID residency, so SQLite does not
+   pace the wire.
+5. **Negentropy snapshot ordering.** `BEGIN` still must precede
+   `rebuild_blocks()` so the observer sees a consistent read snapshot.
 
 ## 7.7 Negentropy implementation notes
 
@@ -1356,7 +1324,7 @@ Baseline implementation:
    - `Cold`: `ts < cutoff_ms`.
 4. The first outbound session to a `(db_path, peer_id)` pair is `Full`; later sessions are usually `Hot`, with a `Cold` sweep injected on a slower cadence. Legacy raw `NegOpen` payloads are interpreted as `Full`.
 5. Data-plane transfer streams `Event` frames while reconciliation can continue in parallel.
-6. Multi-source coordination does not replace negentropy; it consumes per-peer `need_ids` discovered by negentropy.
+6. Multi-source coordination does not replace negentropy; it consumes per-peer `need_ids` plus candidate-source observations discovered by negentropy.
 7. Hot/cold windows are a cadence optimization only. They do not create separate event universes, separate dependency graphs, or separate completion protocols.
 
 Primary code references:
