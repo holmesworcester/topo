@@ -1,5 +1,11 @@
 # AGENTS Instructions (poc-7)
 
+## Worktree Discipline
+
+Never do implementation work in the main worktree at `/home/holmes/poc-7`.
+Before editing code, running task validation, or committing, create or switch to
+a dedicated git worktree for the task.
+
 ## Instruction Quality Gate
 
 When creating instructions for an assistant in this repo:
