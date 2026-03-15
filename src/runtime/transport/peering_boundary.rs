@@ -14,7 +14,9 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use crate::contracts::peering_contract::TransportSessionIo;
 use crate::db::open_connection;
 use crate::db::transport_creds::discover_local_tenants;
-use crate::db::transport_trust::is_authorized_for_tenant;
+use crate::db::transport_trust::{
+    is_authorized_for_node, is_authorized_for_tenant, resolve_authorizing_tenant,
+};
 use crate::protocol::{encode_frame, Frame};
 
 use super::connection_lifecycle::{
@@ -107,21 +109,14 @@ pub fn create_runtime_endpoint_for_tenants(
     default_client_cert: CertificateDer<'static>,
     default_client_key: PrivatePkcs8KeyDer<'static>,
 ) -> Result<TransportEndpoint, Box<dyn std::error::Error + Send + Sync>> {
-    // Dynamic allow: queries DB for all local tenants on each TLS handshake.
-    // No frozen tenant list — new tenants are recognized immediately.
-    // Tenant-scoped auth is one SQL query (`is_authorized_for_tenant`), but
-    // node-scoped auth still loops because local-tenant discovery is not yet
-    // exposed as one projected SQL relation.
+    // Dynamic allow: queries projected trust rows on each TLS handshake.
+    // No frozen tenant list, and no local-tenant discovery on the auth path.
+    // Inbound auth is now the node-scoped SQL predicate:
+    // "does any local tenant currently authorize this fingerprint?"
     let db_path = db_path.to_string();
     let dynamic_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
         let db = open_connection(&db_path)?;
-        let tenants = discover_local_tenants(&db)?;
-        for tenant in &tenants {
-            if is_authorized_for_tenant(&db, &tenant.peer_id, peer_fp)? {
-                return Ok(true);
-            }
-        }
-        Ok(false)
+        is_authorized_for_node(&db, peer_fp)
     });
 
     create_single_port_endpoint(
@@ -265,6 +260,14 @@ pub fn tenant_trusts_peer(
     is_authorized_for_tenant(&db, tenant_id, &peer_fp)
 }
 
+pub fn node_trusts_peer(
+    db_path: &str,
+    peer_fp: [u8; 32],
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    is_authorized_for_node(&db, &peer_fp)
+}
+
 pub fn resolve_trusting_tenant(
     db_path: &str,
     tenant_ids: &[String],
@@ -276,6 +279,14 @@ pub fn resolve_trusting_tenant(
         }
     }
     Ok(None)
+}
+
+pub fn resolve_authorizing_tenant_from_db(
+    db_path: &str,
+    peer_fp: [u8; 32],
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    resolve_authorizing_tenant(&db, &peer_fp)
 }
 
 pub async fn dial_session_peer(
@@ -430,14 +441,25 @@ mod tests {
             "tenant-a should trust pending bootstrap spki"
         );
         assert!(
+            node_trusts_peer(db_path.to_str().unwrap(), allowed).unwrap(),
+            "node should trust pending bootstrap spki via projected trust rows"
+        );
+        assert!(
             !tenant_trusts_peer(db_path.to_str().unwrap(), "tenant-a", [0xCD; 32]).unwrap(),
             "unlisted peer must be denied"
+        );
+        assert!(
+            !node_trusts_peer(db_path.to_str().unwrap(), [0xCD; 32]).unwrap(),
+            "node must deny unlisted peer"
         );
 
         let tenants = vec!["tenant-x".to_string(), "tenant-a".to_string()];
         let resolved =
             resolve_trusting_tenant(db_path.to_str().unwrap(), &tenants, allowed).unwrap();
         assert_eq!(resolved, Some("tenant-a".to_string()));
+        let resolved_node =
+            resolve_authorizing_tenant_from_db(db_path.to_str().unwrap(), allowed).unwrap();
+        assert_eq!(resolved_node, Some("tenant-a".to_string()));
     }
 
     #[test]

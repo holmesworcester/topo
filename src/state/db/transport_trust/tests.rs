@@ -253,6 +253,71 @@ fn test_is_peer_allowed_checks_all_sources() {
 }
 
 #[test]
+fn test_node_auth_and_tenant_resolution_use_projected_trust_union() {
+    let conn = open_in_memory().unwrap();
+    create_tables(&conn).unwrap();
+
+    let peer_shared_tenant = "tenant-peershared";
+    let bootstrap_tenant = "tenant-bootstrap";
+    let pending_tenant = "tenant-pending";
+    let denied: [u8; 32] = [0xDD; 32];
+    let binding_only: [u8; 32] = [0xEE; 32];
+
+    let peer_shared_pubkey: [u8; 32] = [0xA1; 32];
+    let peer_shared_spki =
+        insert_peer_shared(&conn, peer_shared_tenant, "ps-node", &peer_shared_pubkey);
+    let bootstrap_spki: [u8; 32] = [0xB2; 32];
+    let pending_spki: [u8; 32] = [0xC3; 32];
+
+    record_invite_bootstrap_trust(
+        &conn,
+        bootstrap_tenant,
+        "ia-node",
+        "invite-node",
+        "ws-node",
+        "127.0.0.1:4433",
+        &bootstrap_spki,
+    )
+    .unwrap();
+    record_pending_invite_bootstrap_trust(
+        &conn,
+        pending_tenant,
+        "invite-node-pending",
+        "ws-node-pending",
+        &pending_spki,
+    )
+    .unwrap();
+    record_transport_binding(&conn, "binding-only-tenant", "peer-observed", &binding_only).unwrap();
+
+    assert!(is_authorized_for_node(&conn, &peer_shared_spki).unwrap());
+    assert_eq!(
+        resolve_authorizing_tenant(&conn, &peer_shared_spki).unwrap(),
+        Some(peer_shared_tenant.to_string())
+    );
+
+    assert!(is_authorized_for_node(&conn, &bootstrap_spki).unwrap());
+    assert_eq!(
+        resolve_authorizing_tenant(&conn, &bootstrap_spki).unwrap(),
+        Some(bootstrap_tenant.to_string())
+    );
+
+    assert!(is_authorized_for_node(&conn, &pending_spki).unwrap());
+    assert_eq!(
+        resolve_authorizing_tenant(&conn, &pending_spki).unwrap(),
+        Some(pending_tenant.to_string())
+    );
+
+    assert!(!is_authorized_for_node(&conn, &binding_only).unwrap());
+    assert_eq!(
+        resolve_authorizing_tenant(&conn, &binding_only).unwrap(),
+        None
+    );
+
+    assert!(!is_authorized_for_node(&conn, &denied).unwrap());
+    assert_eq!(resolve_authorizing_tenant(&conn, &denied).unwrap(), None);
+}
+
+#[test]
 fn test_mutual_trust_requires_both_sides() {
     let conn = open_in_memory().unwrap();
     create_tables(&conn).unwrap();
@@ -1010,9 +1075,9 @@ fn characterization_full_trust_lifecycle() {
 
 /// Characterization: trust check reads are pure (no side effects).
 ///
-/// After eventization (Phase 5), is_peer_allowed and allowed_peers_from_db
-/// are pure read-only queries. Supersession is handled at projection time
-/// by PeerShared projection writes.
+/// After eventization (Phase 5), the tenant- and node-scoped auth queries are
+/// pure read-only queries. Supersession is handled at projection time by
+/// PeerShared projection writes.
 /// This test verifies that reads do NOT mutate the database.
 #[test]
 fn characterization_trust_check_reads_are_pure() {
@@ -1029,6 +1094,8 @@ fn characterization_trust_check_reads_are_pure() {
 
     // Trust checks should NOT trigger supersession as a side effect
     let _ = is_authorized_for_tenant(&conn, recorded_by, &spki).unwrap();
+    let _ = is_authorized_for_node(&conn, &spki).unwrap();
+    let _ = resolve_authorizing_tenant(&conn, &spki).unwrap();
     let _ = allowed_peers_from_db(&conn, recorded_by).unwrap();
 
     let before_consume_rows: i64 = conn

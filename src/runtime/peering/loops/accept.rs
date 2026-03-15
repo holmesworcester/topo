@@ -14,7 +14,8 @@ use crate::db::transport_trust::record_transport_binding;
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::SyncSessionHandler;
 use crate::transport::{
-    accept_session_provider, resolve_trusting_tenant, TransportClientConfig, TransportEndpoint,
+    accept_session_provider, resolve_authorizing_tenant_from_db, TransportClientConfig,
+    TransportEndpoint,
 };
 
 use super::supervisor::{
@@ -68,9 +69,9 @@ pub async fn accept_loop(
 /// of spawning its own batch_writer. Used by the multi-tenant node daemon so
 /// all tenants share a single writer thread.
 ///
-/// `tenant_peer_ids` lists local tenants. After TLS handshake, the remote
-/// peer's SPKI fingerprint is checked against each tenant's trust set to
-/// determine the `recorded_by` for that connection.
+/// `tenant_peer_ids` lists local tenants for startup preflight. After TLS
+/// handshake, the remote peer's SPKI fingerprint is resolved against the
+/// projected trust union to determine the `recorded_by` for that connection.
 pub async fn accept_loop_with_ingest(
     db_path: &str,
     tenant_peer_ids: &[String],
@@ -198,7 +199,7 @@ async fn accept_loop_with_ingest_until_cancel_inner(
             // connection before intro handling can record it.
             recorded_by.clone()
         } else {
-            match resolve_tenant_for_peer(db_path, tenant_peer_ids, &peer_id) {
+            match resolve_tenant_for_peer(db_path, &peer_id) {
                 Some(rb) => rb,
                 None => {
                     let message = format!(
@@ -363,29 +364,11 @@ fn describe_accept_failure(err: &crate::transport::ConnectionLifecycleError) -> 
 
 /// Resolve which local tenant trusts a given remote peer.
 ///
-/// Checks `is_peer_allowed` for each tenant. Returns the first tenant that
-/// trusts the peer, or `None` if no tenant matches.
-fn resolve_tenant_for_peer(
-    db_path: &str,
-    tenant_peer_ids: &[String],
-    remote_peer_id: &str,
-) -> Option<String> {
+/// Queries the projected trust union directly and returns one tenant that
+/// currently authorizes the peer, or `None` if no tenant matches.
+fn resolve_tenant_for_peer(db_path: &str, remote_peer_id: &str) -> Option<String> {
     let fp = peer_fingerprint_from_hex(remote_peer_id)?;
-    // Fast path: check cached tenant list
-    if let Some(tenant) = resolve_trusting_tenant(db_path, tenant_peer_ids, fp)
-        .ok()
-        .flatten()
-    {
-        return Some(tenant);
-    }
-    // Slow path: query DB for dynamically added tenants
-    let db = crate::db::open_connection(db_path).ok()?;
-    let current_tenants = crate::db::transport_creds::discover_local_tenants(&db).ok()?;
-    if current_tenants.len() <= tenant_peer_ids.len() {
-        return None;
-    }
-    let current_ids: Vec<String> = current_tenants.iter().map(|t| t.peer_id.clone()).collect();
-    resolve_trusting_tenant(db_path, &current_ids, fp)
+    resolve_authorizing_tenant_from_db(db_path, fp)
         .ok()
         .flatten()
 }

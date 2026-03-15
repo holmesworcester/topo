@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
 
@@ -123,6 +123,82 @@ const TENANT_HAS_ANY_AUTHORIZED_FINGERPRINT_SQL: &str = "
         FROM authorized_transport_rows
         WHERE expires_at IS NULL OR expires_at > ?2
     )
+";
+
+// Canonical node-scoped transport authorization over projected trust rows.
+//
+// This is the inbound TLS admission query: a remote fingerprint is authorized
+// for the node iff any local tenant currently authorizes it in projected trust
+// state. The result is intentionally derived from the same three projected
+// trust sources as the tenant-scoped query.
+const NODE_AUTHORIZATION_EXISTS_SQL: &str = "
+    WITH authorized_transport_rows AS (
+        SELECT
+            p.recorded_by AS tenant_id,
+            p.transport_fingerprint AS spki_fingerprint,
+            NULL AS expires_at
+        FROM peers_shared p
+        WHERE length(p.transport_fingerprint) = 32
+
+        UNION
+
+        SELECT
+            t.recorded_by AS tenant_id,
+            t.bootstrap_spki_fingerprint AS spki_fingerprint,
+            t.expires_at AS expires_at
+        FROM invite_bootstrap_trust t
+        WHERE length(t.bootstrap_spki_fingerprint) = 32
+
+        UNION
+
+        SELECT
+            t.recorded_by AS tenant_id,
+            t.expected_bootstrap_spki_fingerprint AS spki_fingerprint,
+            t.expires_at AS expires_at
+        FROM pending_invite_bootstrap_trust t
+        WHERE length(t.expected_bootstrap_spki_fingerprint) = 32
+    )
+    SELECT EXISTS(
+        SELECT 1
+        FROM authorized_transport_rows
+        WHERE spki_fingerprint = ?1
+          AND (expires_at IS NULL OR expires_at > ?2)
+    )
+";
+
+const NODE_AUTHORIZING_TENANT_SQL: &str = "
+    WITH authorized_transport_rows AS (
+        SELECT
+            p.recorded_by AS tenant_id,
+            p.transport_fingerprint AS spki_fingerprint,
+            NULL AS expires_at
+        FROM peers_shared p
+        WHERE length(p.transport_fingerprint) = 32
+
+        UNION
+
+        SELECT
+            t.recorded_by AS tenant_id,
+            t.bootstrap_spki_fingerprint AS spki_fingerprint,
+            t.expires_at AS expires_at
+        FROM invite_bootstrap_trust t
+        WHERE length(t.bootstrap_spki_fingerprint) = 32
+
+        UNION
+
+        SELECT
+            t.recorded_by AS tenant_id,
+            t.expected_bootstrap_spki_fingerprint AS spki_fingerprint,
+            t.expires_at AS expires_at
+        FROM pending_invite_bootstrap_trust t
+        WHERE length(t.expected_bootstrap_spki_fingerprint) = 32
+    )
+    SELECT tenant_id
+    FROM authorized_transport_rows
+    WHERE spki_fingerprint = ?1
+      AND (expires_at IS NULL OR expires_at > ?2)
+    ORDER BY tenant_id ASC
+    LIMIT 1
 ";
 
 /// Build the deterministic `invite_event_id` for a CLI-pin import.
@@ -488,6 +564,40 @@ pub fn is_authorized_for_tenant(
         |row| row.get(0),
     )?;
     Ok(allowed != 0)
+}
+
+/// Canonical node-scoped inbound transport authorization over projected trust
+/// rows only.
+pub fn is_authorized_for_node(
+    conn: &Connection,
+    spki_fingerprint: &[u8; 32],
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let now = now_ms_i64();
+    let allowed: i64 = conn.query_row(
+        NODE_AUTHORIZATION_EXISTS_SQL,
+        rusqlite::params![spki_fingerprint.as_slice(), now],
+        |row| row.get(0),
+    )?;
+    Ok(allowed != 0)
+}
+
+/// Resolve one tenant that currently authorizes `spki_fingerprint`.
+///
+/// This is the node-scoped counterpart to [`is_authorized_for_node`], used
+/// after inbound handshake admission to bind the connection to a tenant.
+pub fn resolve_authorizing_tenant(
+    conn: &Connection,
+    spki_fingerprint: &[u8; 32],
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let now = now_ms_i64();
+    let tenant_id = conn
+        .query_row(
+            NODE_AUTHORIZING_TENANT_SQL,
+            rusqlite::params![spki_fingerprint.as_slice(), now],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(tenant_id)
 }
 
 /// Backward-compatible alias for the canonical tenant-scoped authorization

@@ -25,10 +25,11 @@ pub use peering_boundary::{
     build_tenant_bootstrap_fallback_client_config_for_invite_from_db,
     build_tenant_bootstrap_fallback_client_config_from_db, build_tenant_client_config_from_creds,
     build_tenant_client_config_from_db, create_runtime_endpoint_for_tenants, dial_session_peer,
-    dial_session_provider, open_inbound_session, open_outbound_session,
-    outbound_session_provider_for_connection, read_intro_offer_frame, resolve_trusting_tenant,
-    send_intro_offer_frame, tenant_trusts_peer, SessionEnvelope, SessionProvider,
-    TenantClientConfigs, TransportClientConfig, TransportConnection, TransportEndpoint,
+    dial_session_provider, node_trusts_peer, open_inbound_session, open_outbound_session,
+    outbound_session_provider_for_connection, read_intro_offer_frame,
+    resolve_authorizing_tenant_from_db, resolve_trusting_tenant, send_intro_offer_frame,
+    tenant_trusts_peer, SessionEnvelope, SessionProvider, TenantClientConfigs,
+    TransportClientConfig, TransportConnection, TransportEndpoint,
 };
 pub use transport_session_io::{QuicTransportSessionIo, DEFAULT_SYNC_FRAME_MAX_BYTES};
 
