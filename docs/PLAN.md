@@ -12,28 +12,31 @@ This project is a POC and prioritizes clarity/simplicity over backward compatibi
 
 ## 1. Implementation Order (Authoritative)
 
-This document is ordered exactly as we should build it.
+This document preserves historical phase labels, but the build order from a fresh base is authority-first. Build the canonical event graph, invite/accept flow, and projected trust graph before hardening transit security.
 
 1. `Phase 1`: CLI + daemon around the current simple prototype.
-2. `Phase 2`: mTLS + QUIC transport baseline finalized.
-3. `Phase 3`: Provisional multi-workspace/tenant routing smoke test (CLI-supplied key material).
-4. `Phase 4`: Event schema, recording semantics, and multitenancy foundation.
-5. `Phase 5`: Projector core and dependency blocking (without full queue complexity).
-6. `Phase 6`: Shared signer substrate (`signed_by` dependency blocking + signature verification ordering).
-7. `Phase 7`: Multitenancy scoped-projection/query gate (with signer substrate active).
-8. `Phase 8`: Encrypted events using the same dependency/projector model, tested first with per-instance PSK.
-9. `Phase 9`: Durable queue architecture (`ingress`, `project`, `egress`) and workers.
-10. `Phase 10`: Non-identity special-case projector logic (deletion/emitted-events).
-11. `Phase 11`: Performance hardening, observability, scaling, and low-memory iOS mode.
-12. `Phase 12`: TLA-first minimal identity layer for accepted-workspace cascade and sender-subjective encryption.
-13. `Phase 13`: Functional multitenancy — one node hosting N tenant identities in a shared DB with one shared QUIC endpoint and per-tenant routing/discovery.
+2. `Phase 4`: Event schema, recording semantics, and multitenancy foundation.
+3. `Phase 5`: Projector core and dependency blocking (without full queue complexity).
+4. `Phase 6`: Shared signer substrate (`signed_by` dependency blocking + signature verification ordering).
+5. Pull forward the minimal identity slice of `Phase 12`: accepted-workspace binding, invite cascade, `peer_shared`, and projected trust rows.
+6. `Phase 7`: Multitenancy scoped-projection/query gate (with signer substrate active).
+7. `Phase 13`: Functional multitenancy — one node hosting N tenant identities in a shared DB with one shared QUIC endpoint and per-tenant routing/discovery.
+8. `Phase 2`: mTLS + QUIC transport hardening on top of the real identity/trust graph.
+9. `Phase 3`: Multi-workspace/tenant routing smoke on top of real tenant identities, not CLI-supplied placeholder trust.
+10. `Phase 8`: Encrypted events using the same dependency/projector model, tested first with per-instance PSK.
+11. `Phase 9`: Durable queue architecture (`ingress`, `project`, `egress`) and workers.
+12. `Phase 10`: Non-identity special-case projector logic (deletion/emitted-events).
+13. `Phase 11`: Performance hardening, observability, scaling, and low-memory iOS mode.
 
 Scheduling note:
+- transport work is downstream of identity work:
+  - do not start Phase 2 or Phase 3 with manual pinning, static allowlists, or test-only trust seeding,
+  - start them only after invite/bootstrap and steady-state trust are projected from real events.
 - two-tier multitenancy plan:
-  - Phase 3 proves provisional transport/workspace separation and CLI workspace views.
   - Phase 7 proves scoped projection/query separation once projector + signer substrate exist.
+  - Phase 3 is a later transport/routing smoke over those real tenant identities.
 - `signed_by` dependency blocking + signature verification ordering is tackled in Phase 6.
-- Phase 6 and Phase 7 must be complete before starting identity projectors in Phase 12.
+- Phase 6 and Phase 7 must be complete before the full identity projector surface in Phase 12, but the minimal invite/accepted-workspace/PeerShared trust slice must be pulled forward before Phase 2.
 - Phase 13 depends on Phase 12 identity flows (`create_workspace`, `join_workspace_as_new_user`, `add_device_to_workspace`) being stable.
 
 ## 1.1 Historical gap audit note
@@ -185,12 +188,19 @@ Phase 1 CLI/daemon shape must preserve:
 - Peer-authenticated QUIC sessions with exact transport-fingerprint validation against projected trust rows.
 - Runtime protocol messages (sync/intros/holepunch negotiation) handled outside canonical events.
 
+### Prerequisites
+
+- Accepted-workspace binding, invite acceptance, and `peer_shared` projection already exist.
+- Bootstrap and steady-state trust rows are projection-owned SQL state.
+- At least one realistic flow proves `create_workspace -> invite/link -> accept -> bootstrap sync -> steady-state direct sync` without manual trust seeding.
+
 ### Invariants
 
 - No transit event wrapping layer in this model.
-- Phase 2 does not require event signature/dependency implementation.
+- Phase 2 is not a substitute for identity bootstrap; it consumes the projected trust graph built earlier.
 - Event signature/dependency enforcement is delivered in Phase 6 (`signed_by` blocking + signature verification ordering).
 - Transport authentication must remain separate from event authorization semantics.
+- No placeholder pinning or ad-hoc transport authority is permitted in this phase.
 
 ### Exit criteria
 
@@ -246,7 +256,7 @@ For any transport-affecting PR, require:
 
 ## 4.5 Phase 3: Provisional Multi-Workspace Routing Smoke
 
-Goal: validate basic workspace/tenant separation early, before deep projector/identity complexity.
+Goal: validate basic workspace/tenant separation on top of real tenant identity and trust state.
 
 ### Deliverables
 
@@ -257,7 +267,7 @@ Goal: validate basic workspace/tenant separation early, before deep projector/id
 
 ### Scope boundaries
 
-- This is a routing/scope smoke phase, not full identity semantics.
+- This is a routing/scope smoke phase, not a placeholder-trust phase.
 - It uses the active transport trust policy from [DESIGN.md](./DESIGN.md) §2.1-§2.2 and does not introduce a parallel trust path.
 - Signature/dependency enforcement is still deferred to Phase 6.
 
