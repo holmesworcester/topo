@@ -71,7 +71,8 @@ This separates three concerns cleanly:
 2. **Request selection** is cheap and high-rate.
    - Fill source-advertised request credit from `wanted + wanted_sources`.
 3. **Data send** is cheap and high-rate.
-   - Drain leased windows and keep QUIC streams fed.
+   - Drain leased push windows or bounded in-memory pull-response queues and
+     keep QUIC streams fed.
 
 Without this split, the wire ends up paced by SQLite claim cadence or by fresh
 negentropy rounds instead of by transport availability.
@@ -96,7 +97,8 @@ The current code is an incremental form of this model rather than the final
 `PeerReplicator` actor:
 
 - initiator session still contains both the observer and request-refill loops,
-- responder session still contains the send loop for pull responses,
+- responder session now serves pull responses from a bounded in-memory queue
+  rather than SQLite egress,
 - `wanted` + `wanted_sources` are already the durable sink-side discovery truth,
 - request credit and in-flight request suppression are already memory-only.
 

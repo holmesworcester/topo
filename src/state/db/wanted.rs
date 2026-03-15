@@ -234,7 +234,8 @@ impl<'a> WantedEvents<'a> {
                    AND (lease_expires_at IS NULL OR lease_expires_at <= ?5)",
             )?;
             for id in selected {
-                let rows = update.execute(params![peer_id, lease_owner, lease_until, &id[..], now])?;
+                let rows =
+                    update.execute(params![peer_id, lease_owner, lease_until, &id[..], now])?;
                 if rows > 0 {
                     claimed.push(id);
                 }
@@ -245,7 +246,11 @@ impl<'a> WantedEvents<'a> {
 
     /// Legacy transitional API: count durable wanted-request leases currently
     /// held by `(peer_id, lease_owner)`.
-    pub fn count_outstanding_for_peer(&self, peer_id: &str, lease_owner: &str) -> SqliteResult<i64> {
+    pub fn count_outstanding_for_peer(
+        &self,
+        peer_id: &str,
+        lease_owner: &str,
+    ) -> SqliteResult<i64> {
         let now = current_timestamp_ms();
         with_sqlite_busy_retry(|| {
             self.conn.query_row(
@@ -297,8 +302,10 @@ impl<'a> WantedEvents<'a> {
     /// Remove a wanted event and all candidate-source rows.
     pub fn remove(&self, id: &EventId) -> SqliteResult<()> {
         with_immediate_tx(self.conn, || {
-            self.conn
-                .execute("DELETE FROM wanted_sources WHERE event_id = ?1", params![&id[..]])?;
+            self.conn.execute(
+                "DELETE FROM wanted_sources WHERE event_id = ?1",
+                params![&id[..]],
+            )?;
             self.conn
                 .execute("DELETE FROM wanted_events WHERE id = ?1", params![&id[..]])?;
             Ok(())
@@ -336,7 +343,10 @@ fn local_event_exists(conn: &Connection, event_id_b64: &str) -> SqliteResult<boo
 }
 
 fn delete_wanted_row(conn: &Connection, id: &EventId) -> SqliteResult<()> {
-    conn.execute("DELETE FROM wanted_sources WHERE event_id = ?1", params![&id[..]])?;
+    conn.execute(
+        "DELETE FROM wanted_sources WHERE event_id = ?1",
+        params![&id[..]],
+    )?;
     conn.execute("DELETE FROM wanted_events WHERE id = ?1", params![&id[..]])?;
     Ok(())
 }
@@ -344,8 +354,8 @@ fn delete_wanted_row(conn: &Connection, id: &EventId) -> SqliteResult<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{open_connection, schema::create_tables};
     use crate::crypto::event_id_to_base64;
+    use crate::db::{open_connection, schema::create_tables};
     use std::time::Duration;
 
     fn make_event_id(byte: u8) -> EventId {
@@ -407,10 +417,14 @@ mod tests {
         wanted.observe_many_for_peer("peer-a", &ids).unwrap();
         wanted.observe_many_for_peer("peer-b", &ids).unwrap();
 
-        let claimed_a = wanted.claim_for_peer("peer-a", "owner-a", 1, 30_000).unwrap();
+        let claimed_a = wanted
+            .claim_for_peer("peer-a", "owner-a", 1, 30_000)
+            .unwrap();
         assert_eq!(claimed_a.len(), 1);
 
-        let claimed_b = wanted.claim_for_peer("peer-b", "owner-b", 2, 30_000).unwrap();
+        let claimed_b = wanted
+            .claim_for_peer("peer-b", "owner-b", 2, 30_000)
+            .unwrap();
         assert_eq!(
             claimed_b.len(),
             1,
@@ -429,11 +443,15 @@ mod tests {
         wanted.observe_many_for_peer("peer-a", &[id]).unwrap();
         wanted.observe_many_for_peer("peer-b", &[id]).unwrap();
 
-        let claimed_a = wanted.claim_for_peer("peer-a", "owner-a", 1, 30_000).unwrap();
+        let claimed_a = wanted
+            .claim_for_peer("peer-a", "owner-a", 1, 30_000)
+            .unwrap();
         assert_eq!(claimed_a, vec![id]);
         assert_eq!(wanted.release_peer_leases("peer-a", "owner-a").unwrap(), 1);
 
-        let claimed_b = wanted.claim_for_peer("peer-b", "owner-b", 1, 30_000).unwrap();
+        let claimed_b = wanted
+            .claim_for_peer("peer-b", "owner-b", 1, 30_000)
+            .unwrap();
         assert_eq!(claimed_b, vec![id]);
     }
 

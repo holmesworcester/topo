@@ -245,7 +245,11 @@ mod tests {
         let mut inflight = HashMap::new();
         let id = candidate(2, 1, 20).event_id;
         inflight.insert(id, 1);
-        let candidates = vec![candidate(1, 1, 30), candidate(2, 1, 20), candidate(3, 1, 10)];
+        let candidates = vec![
+            candidate(1, 1, 30),
+            candidate(2, 1, 20),
+            candidate(3, 1, 10),
+        ];
 
         let selected = select_request_ids(&candidates, &inflight, 3);
         assert_eq!(selected.len(), 2);
@@ -256,7 +260,11 @@ mod tests {
     #[test]
     fn select_request_ids_respects_credit_and_order() {
         let inflight = HashMap::new();
-        let candidates = vec![candidate(9, 1, 50), candidate(8, 1, 40), candidate(7, 2, 30)];
+        let candidates = vec![
+            candidate(9, 1, 50),
+            candidate(8, 1, 40),
+            candidate(7, 2, 30),
+        ];
 
         let selected = select_request_ids(&candidates, &inflight, 2);
         assert_eq!(selected.len(), 2);

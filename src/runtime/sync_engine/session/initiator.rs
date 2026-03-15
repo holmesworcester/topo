@@ -304,8 +304,7 @@ where
             Err(_) => {}
         }
 
-        let observed_need_ids =
-            observe_need_ids_for_peer(&wanted, peer_id, &mut need_ids)?;
+        let observed_need_ids = observe_need_ids_for_peer(&wanted, peer_id, &mut need_ids)?;
         if observed_need_ids > 0 {
             info!(
                 "Observed {} wanted IDs from peer {} during reconciliation",

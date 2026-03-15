@@ -1,10 +1,10 @@
 //! Sync responder (server role) with dual-stream transport.
 //!
-//! Handles incoming negentropy reconciliation, serves requested events
-//! from the egress queue, and follows the shutdown protocol (DataDone / DoneAck).
+//! Handles incoming negentropy reconciliation, serves requested events from a
+//! bounded in-memory queue, and follows the shutdown protocol (DataDone / DoneAck).
 //!
 //! Reconciliation runs on a dedicated OS thread so the main loop can
-//! continue draining the egress queue during the 100-400ms reconcile() calls.
+//! continue draining requested responses during the 100-400ms reconcile() calls.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -17,7 +17,6 @@ use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::db::{
-    egress_queue::EgressQueue,
     open_connection,
     store::{lookup_workspace_id, Store},
 };
@@ -32,12 +31,15 @@ use crate::tuning::{
 };
 
 use super::control_plane::{send_done_ack, send_request_credit};
-use super::data_plane::{drain_egress_to_data_stream, send_data_done, spawn_data_receiver};
+use super::data_plane::{
+    drain_pending_responses_to_data_stream, send_data_done, spawn_data_receiver,
+    PendingResponseQueue,
+};
 use super::logging::{SyncRunCapture, SyncRunRxCapture};
 use super::windowing::{decode_initial_neg_open, SyncWindow, SyncWindowKind};
 use super::{
     negentropy_frame_size, send_idle_capture_enabled, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT,
-    EGRESS_QUIET_WINDOW, EGRESS_SENT_TTL_MS, INITIAL_CONTROL_PROGRESS_TIMEOUT,
+    EGRESS_QUIET_WINDOW, INITIAL_CONTROL_PROGRESS_TIMEOUT,
 };
 
 fn should_treat_as_startup_control_abort(
@@ -59,7 +61,7 @@ pub async fn run_sync_responder<C, S, R>(
     _session_id: u64,
     db_path: &str,
     timeout_secs: u64,
-    session_owner: &str,
+    _session_owner: &str,
     peer_id: &str,
     recorded_by: &str,
     ingress_source_tag: &str,
@@ -88,8 +90,6 @@ where
 
     let db = open_connection(db_path)?;
     let use_snapshot = !low_mem_mode();
-
-    let egress = EgressQueue::new(&db);
 
     let ws_id = lookup_workspace_id(&db, recorded_by).ok_or_else(|| {
         format!(
@@ -167,12 +167,12 @@ where
     let mut bytes_sent: u64 = 0;
     let mut rounds = 0;
     let mut peer_done = false;
-    let mut completed = false;
     let sync_start = Instant::now();
     let reconcile_start = Instant::now();
     let mut last_bytes_received = 0u64;
     let mut reconciling = false;
     let mut request_credit_available: usize = 0;
+    let mut pending_responses = PendingResponseQueue::default();
     let memtrace_enabled = low_mem_memtrace();
     let memtrace_interval = Duration::from_secs(2);
     let memtrace_file = std::env::var("LOW_MEM_MEMTRACE_FILE").ok();
@@ -298,9 +298,7 @@ where
                     continue;
                 }
                 request_credit_available = request_credit_available.saturating_sub(ids.len());
-                egress
-                    .enqueue_events(peer_id, &ids)
-                    .map_err(|e| format!("failed to enqueue HaveList ids: {e}"))?;
+                pending_responses.enqueue_many(&ids);
             }
             Ok(Ok(Frame::Done)) => {
                 last_activity = Instant::now();
@@ -327,9 +325,9 @@ where
             Err(_) => {}
         }
 
-        // Drain egress to data stream — runs even while worker is reconciling
+        // Drain requested responses to data stream — runs even while worker is reconciling
         let send_stats =
-            drain_egress_to_data_stream(&egress, &store, peer_id, session_owner, &mut data_send)
+            drain_pending_responses_to_data_stream(&mut pending_responses, &store, &mut data_send)
                 .await;
         events_sent += send_stats.events_sent_delta;
         bytes_sent += send_stats.bytes_sent_delta;
@@ -338,12 +336,10 @@ where
             last_send_progress = Instant::now();
         }
 
-        let egress_pending = egress
-            .count_outstanding(peer_id, session_owner)
-            .unwrap_or(0);
         if neg_req_tx.is_some() && !peer_done {
-            let egress_pending_usize = usize::try_from(egress_pending).unwrap_or(usize::MAX);
-            let outstanding_or_reserved = egress_pending_usize.saturating_add(request_credit_available);
+            let outstanding_or_reserved = pending_responses
+                .len()
+                .saturating_add(request_credit_available);
             if outstanding_or_reserved <= credit_low {
                 let grant = credit_high.saturating_sub(outstanding_or_reserved);
                 if grant > 0 {
@@ -365,12 +361,12 @@ where
             let sqlite_db = memtrace::sqlite_db_memory(&db);
             let allocator = memtrace::allocator_memory();
             let line = format!(
-                "LOWMEM_MEMTRACE responder peer={} rounds={} reconciling={} peer_done={} egress_pending={} request_credit_available={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_cache={} db_schema={} db_stmt={} mall_arena={} mall_used={} mall_free={} mall_mmap={} bytes_rx={} bytes_tx={}",
+                "LOWMEM_MEMTRACE responder peer={} rounds={} reconciling={} peer_done={} pending_responses={} request_credit_available={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_cache={} db_schema={} db_stmt={} mall_arena={} mall_used={} mall_free={} mall_mmap={} bytes_rx={} bytes_tx={}",
                 peer_id,
                 rounds,
                 reconciling,
                 peer_done,
-                egress_pending,
+                pending_responses.len(),
                 request_credit_available,
                 ingest_used,
                 ingest_cap,
@@ -397,12 +393,11 @@ where
         }
 
         if idle_capture_enabled
-            && !completed
             && last_send_progress.elapsed() >= Duration::from_secs(1)
             && last_idle_marker.elapsed() >= Duration::from_secs(1)
         {
             if let Some(capture) = capture.as_ref() {
-                let idle_state = if egress_pending > 0 {
+                let idle_state = if !pending_responses.is_empty() {
                     "queued_not_sending"
                 } else if reconciling || !peer_done {
                     "waiting_on_control"
@@ -419,7 +414,7 @@ where
                         "idle_ms": last_send_progress.elapsed().as_millis(),
                         "reconciling": reconciling,
                         "peer_done": peer_done,
-                        "egress_pending": egress_pending,
+                        "pending_responses": pending_responses.len(),
                         "request_credit_available": request_credit_available,
                     }))
                     .ok(),
@@ -428,12 +423,12 @@ where
             last_idle_marker = Instant::now();
         }
 
-        // After peer signalled Done and our egress queue is drained:
+        // After peer signalled Done and our requested-response queue is drained:
         // 1. Send DataDone on data stream (signals peer's data receiver)
         // 2. Wait for peer's DataDone to be consumed by our data receiver
         // 3. Only then send DoneAck on control
         if peer_done && !reconciling {
-            if egress_pending == 0 {
+            if pending_responses.is_empty() {
                 let quiet_since = egress_quiet_since.get_or_insert_with(Instant::now);
                 if quiet_since.elapsed() >= EGRESS_QUIET_WINDOW {
                     send_data_done(&mut data_send).await?;
@@ -451,19 +446,12 @@ where
                         events_sent,
                         events_received.load(Ordering::Relaxed)
                     );
-                    completed = true;
                     break;
                 }
             } else {
                 egress_quiet_since = None;
             }
         }
-    }
-
-    let _ = egress.release_leases(peer_id, session_owner);
-    let _ = egress.cleanup_sent_for_connection(peer_id, 0);
-    if completed {
-        let _ = egress.cleanup_sent(EGRESS_SENT_TTL_MS);
     }
     // Drop the request channel to signal the worker to exit
     drop(neg_req_tx);

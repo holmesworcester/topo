@@ -5,6 +5,7 @@
 //! - egress queue draining to data stream (`Event`)
 //! - completion marker emission on data stream (`DataDone`)
 
+use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -29,6 +30,26 @@ use super::{
 pub struct DataPlaneSendStats {
     pub events_sent_delta: u64,
     pub bytes_sent_delta: u64,
+}
+
+#[derive(Debug, Default)]
+pub struct PendingResponseQueue {
+    ids: VecDeque<EventId>,
+}
+
+impl PendingResponseQueue {
+    pub fn enqueue_many(&mut self, ids: &[EventId]) -> usize {
+        self.ids.extend(ids.iter().copied());
+        ids.len()
+    }
+
+    pub fn len(&self) -> usize {
+        self.ids.len()
+    }
+
+    pub fn is_empty(&self) -> bool {
+        self.ids.is_empty()
+    }
 }
 
 fn should_treat_as_startup_data_abort(events_ingested: u64, bytes_received: &AtomicU64) -> bool {
@@ -183,6 +204,77 @@ where
     }
 }
 
+pub async fn drain_pending_responses_to_data_stream<S>(
+    pending: &mut PendingResponseQueue,
+    store: &Store<'_>,
+    data_send: &mut S,
+) -> DataPlaneSendStats
+where
+    S: StreamSend,
+{
+    let mut events_sent_delta = 0u64;
+    let mut bytes_sent_delta = 0u64;
+    let send_quantum_bytes = egress_send_quantum_bytes() as u64;
+    let mut sent_any = false;
+
+    while bytes_sent_delta < send_quantum_bytes {
+        let Some(event_id) = pending.ids.pop_front() else {
+            break;
+        };
+
+        let Ok(Some(blob)) = store.get_shared(&event_id) else {
+            continue;
+        };
+        let blob_len = blob.len() as u64;
+        match tokio::time::timeout(
+            DATA_SEND_STALL_TIMEOUT,
+            data_send.send(&Frame::Event { blob }),
+        )
+        .await
+        {
+            Ok(Ok(())) => {
+                events_sent_delta += 1;
+                bytes_sent_delta += blob_len;
+                sent_any = true;
+            }
+            Ok(Err(err)) => {
+                warn!(
+                    "data send failed for requested response event={} error={}",
+                    event_id_to_base64(&event_id),
+                    err
+                );
+                pending.ids.push_front(event_id);
+                break;
+            }
+            Err(_) => {
+                warn!(
+                    "data send stalled for requested response event={} timeout_ms={}",
+                    event_id_to_base64(&event_id),
+                    DATA_SEND_STALL_TIMEOUT.as_millis()
+                );
+                pending.ids.push_front(event_id);
+                break;
+            }
+        }
+    }
+
+    if sent_any {
+        match tokio::time::timeout(DATA_SEND_STALL_TIMEOUT, data_send.flush()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(err)) => warn!("data flush failed for requested responses: {}", err),
+            Err(_) => warn!(
+                "data flush stalled for requested responses timeout_ms={}",
+                DATA_SEND_STALL_TIMEOUT.as_millis()
+            ),
+        }
+    }
+
+    DataPlaneSendStats {
+        events_sent_delta,
+        bytes_sent_delta,
+    }
+}
+
 pub async fn send_data_done<S>(data_send: &mut S) -> Result<(), ConnectionError>
 where
     S: StreamSend,
@@ -304,7 +396,10 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{drain_egress_to_data_stream, should_capture_rx_event_link};
+    use super::{
+        drain_egress_to_data_stream, drain_pending_responses_to_data_stream,
+        should_capture_rx_event_link, PendingResponseQueue,
+    };
     use crate::crypto::hash_event;
     use crate::db::{
         egress_queue::EgressQueue, open_connection, schema::create_tables, store::insert_event,
@@ -459,5 +554,38 @@ mod tests {
         assert_eq!(sender_state.lock().unwrap().len(), 80);
         assert_eq!(egress.count_pending("peer-a").unwrap(), 0);
         assert_eq!(egress.count_outstanding("peer-a", "sess-a").unwrap(), 0);
+    }
+
+    #[tokio::test]
+    async fn drain_pending_responses_to_data_stream_sends_from_memory_queue() {
+        let (_dir, _path, conn) = setup_file_db();
+        let blob = b"memory queue payload".to_vec();
+        let event_id = hash_event(&blob);
+        let now_ms = 1_700_000_000_000i64;
+        insert_event(
+            &conn,
+            &event_id,
+            "message",
+            &blob,
+            ShareScope::Shared,
+            now_ms,
+            now_ms,
+        )
+        .unwrap();
+
+        let store = Store::new(&conn);
+        let sender = RecordingSend::default();
+        let sender_state = sender.frames.clone();
+        let mut send = sender;
+        let mut pending = PendingResponseQueue::default();
+        pending.enqueue_many(&[event_id]);
+
+        let stats = drain_pending_responses_to_data_stream(&mut pending, &store, &mut send).await;
+        assert_eq!(stats.events_sent_delta, 1);
+        assert!(pending.is_empty());
+        assert_eq!(
+            sender_state.lock().unwrap().as_slice(),
+            &[Frame::Event { blob }]
+        );
     }
 }

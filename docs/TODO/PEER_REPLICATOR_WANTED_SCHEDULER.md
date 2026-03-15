@@ -55,3 +55,12 @@ Implementation follow-up:
      cost,
    - end-to-end file transfer and catchup benchmarks that report request
      utilization, durable receive completion, and projection lag separately.
+12. Finish the structural split implied by the credit model:
+   - keep session semantics only for Negentropy discovery rounds,
+   - make request/response serving connection-scoped rather than session-scoped,
+   - remove remaining sync-time dependence on durable SQLite egress where credit
+     already bounds memory,
+   - move from per-peer request refill toward a global sink scheduler over peer
+     slots, keyed by authenticated `(tenant, peer)` identity rather than bare
+     transport fingerprint, so multi-workspace/multi-tenant demand can be
+     allocated across all credited peers in one testable planning step.

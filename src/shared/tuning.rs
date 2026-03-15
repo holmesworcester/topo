@@ -153,7 +153,7 @@ pub fn request_inflight_ttl_ms() -> i64 {
             .max(1) as i64
     } else {
         read_usize_env("P7_REQUEST_INFLIGHT_TTL_MS")
-            .unwrap_or(5_000)
+            .unwrap_or(60_000)
             .max(1) as i64
     }
 }
