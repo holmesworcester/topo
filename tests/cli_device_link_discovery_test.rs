@@ -55,10 +55,28 @@ fn start_linked_cli_peer(
     device_name: &str,
 ) -> StartedCliPeer {
     let db = tmpdir.path().join(db_name).to_str().unwrap().to_string();
-    accept_device_link_with_name(&db, invite_link, device_name);
-    let daemon = match parse_invite_link(invite_link) {
-        Ok(invite) if invite.bootstrap_addrs.is_empty() => start_discovery_daemon(&db),
-        _ => start_daemon(&db),
+    let empty_bootstrap = matches!(
+        parse_invite_link(invite_link),
+        Ok(invite) if invite.bootstrap_addrs.is_empty()
+    );
+    let daemon = if empty_bootstrap {
+        let daemon = start_discovery_daemon(&db);
+        accept_device_link_with_name_on_running_daemon(
+            &db,
+            invite_link,
+            device_name,
+            std::time::Duration::from_secs(10),
+        );
+        daemon
+    } else {
+        let daemon = start_daemon(&db);
+        accept_device_link_with_name_on_running_daemon(
+            &db,
+            invite_link,
+            device_name,
+            std::time::Duration::from_secs(10),
+        );
+        daemon
     };
     StartedCliPeer {
         db,
@@ -76,8 +94,13 @@ fn start_linked_cli_peer_via_discovery(
     device_name: &str,
 ) -> StartedCliPeer {
     let db = tmpdir.path().join(db_name).to_str().unwrap().to_string();
-    accept_device_link_with_name(&db, invite_link, device_name);
     let daemon = start_discovery_daemon(&db);
+    accept_device_link_with_name_on_running_daemon(
+        &db,
+        invite_link,
+        device_name,
+        std::time::Duration::from_secs(10),
+    );
     StartedCliPeer {
         db,
         username: username.to_string(),
