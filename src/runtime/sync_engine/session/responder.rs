@@ -30,10 +30,10 @@ use crate::tuning::{
     low_mem_memtrace, low_mem_mode, request_credit_high_watermark, request_credit_low_watermark,
 };
 
+use super::connection_scope::ConnectionResponseState;
 use super::control_plane::{send_done_ack, send_request_credit};
 use super::data_plane::{
     drain_pending_responses_to_data_stream, send_data_done, spawn_data_receiver,
-    PendingResponseQueue,
 };
 use super::logging::{SyncRunCapture, SyncRunRxCapture};
 use super::windowing::{decode_initial_neg_open, SyncWindow, SyncWindowKind};
@@ -65,6 +65,7 @@ pub async fn run_sync_responder<C, S, R>(
     peer_id: &str,
     recorded_by: &str,
     ingress_source_tag: &str,
+    response_state: &ConnectionResponseState,
     shared_ingest: mpsc::Sender<IngestItem>,
     capture: Option<SyncRunCapture>,
     rx_capture: Option<SyncRunRxCapture>,
@@ -171,8 +172,6 @@ where
     let reconcile_start = Instant::now();
     let mut last_bytes_received = 0u64;
     let mut reconciling = false;
-    let mut request_credit_available: usize = 0;
-    let mut pending_responses = PendingResponseQueue::default();
     let memtrace_enabled = low_mem_memtrace();
     let memtrace_interval = Duration::from_secs(2);
     let memtrace_file = std::env::var("LOW_MEM_MEMTRACE_FILE").ok();
@@ -297,8 +296,7 @@ where
                 if ids.is_empty() {
                     continue;
                 }
-                request_credit_available = request_credit_available.saturating_sub(ids.len());
-                pending_responses.enqueue_many(&ids);
+                response_state.consume_requests(&ids);
             }
             Ok(Ok(Frame::Done)) => {
                 last_activity = Instant::now();
@@ -327,8 +325,7 @@ where
 
         // Drain requested responses to data stream — runs even while worker is reconciling
         let send_stats =
-            drain_pending_responses_to_data_stream(&mut pending_responses, &store, &mut data_send)
-                .await;
+            drain_pending_responses_to_data_stream(response_state, &store, &mut data_send).await;
         events_sent += send_stats.events_sent_delta;
         bytes_sent += send_stats.bytes_sent_delta;
         if send_stats.events_sent_delta > 0 {
@@ -337,15 +334,10 @@ where
         }
 
         if neg_req_tx.is_some() && !peer_done {
-            let outstanding_or_reserved = pending_responses
-                .len()
-                .saturating_add(request_credit_available);
-            if outstanding_or_reserved <= credit_low {
-                let grant = credit_high.saturating_sub(outstanding_or_reserved);
-                if grant > 0 {
-                    send_request_credit(&mut control, grant).await?;
-                    request_credit_available = request_credit_available.saturating_add(grant);
-                }
+            let grant = response_state.desired_credit_grant(credit_high, credit_low);
+            if grant > 0 {
+                send_request_credit(&mut control, grant).await?;
+                response_state.note_granted(grant);
             }
         }
 
@@ -355,6 +347,7 @@ where
         }
 
         if memtrace_enabled && last_memtrace.elapsed() >= memtrace_interval {
+            let response_stats = response_state.stats();
             let ingest_cap = ingest_tx.max_capacity();
             let ingest_used = ingest_cap.saturating_sub(ingest_tx.capacity());
             let sqlite_global = memtrace::sqlite_global_memory();
@@ -366,8 +359,8 @@ where
                 rounds,
                 reconciling,
                 peer_done,
-                pending_responses.len(),
-                request_credit_available,
+                response_stats.pending_len,
+                response_stats.available_credit,
                 ingest_used,
                 ingest_cap,
                 sqlite_global.map(|s| s.memory_used_bytes).unwrap_or(-1),
@@ -396,8 +389,9 @@ where
             && last_send_progress.elapsed() >= Duration::from_secs(1)
             && last_idle_marker.elapsed() >= Duration::from_secs(1)
         {
+            let response_stats = response_state.stats();
             if let Some(capture) = capture.as_ref() {
-                let idle_state = if !pending_responses.is_empty() {
+                let idle_state = if response_stats.pending_len > 0 {
                     "queued_not_sending"
                 } else if reconciling || !peer_done {
                     "waiting_on_control"
@@ -414,8 +408,8 @@ where
                         "idle_ms": last_send_progress.elapsed().as_millis(),
                         "reconciling": reconciling,
                         "peer_done": peer_done,
-                        "pending_responses": pending_responses.len(),
-                        "request_credit_available": request_credit_available,
+                        "pending_responses": response_stats.pending_len,
+                        "request_credit_available": response_stats.available_credit,
                     }))
                     .ok(),
                 );
@@ -428,7 +422,7 @@ where
         // 2. Wait for peer's DataDone to be consumed by our data receiver
         // 3. Only then send DoneAck on control
         if peer_done && !reconciling {
-            if pending_responses.is_empty() {
+            if response_state.is_empty() {
                 let quiet_since = egress_quiet_since.get_or_insert_with(Instant::now);
                 if quiet_since.elapsed() >= EGRESS_QUIET_WINDOW {
                     send_data_done(&mut data_send).await?;

@@ -21,6 +21,7 @@ use crate::protocol::{encode_frame, parse_frame};
 use crate::sync::session::coordinator::PeerCoord;
 use crate::sync::session::logging::{LogDir, LogLane, SessionRunLogger, SyncRunCapture};
 use crate::sync::session::{run_sync_initiator, run_sync_responder};
+use crate::sync::session::{ConnectionRequestState, ConnectionResponseState};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
@@ -111,8 +112,13 @@ fn map_io_error(err: TransportSessionIoError) -> ConnectionError {
 
 #[derive(Clone)]
 pub enum SessionRole {
-    Initiator { coordination: Arc<PeerCoord> },
-    Responder,
+    Initiator {
+        coordination: Arc<PeerCoord>,
+        request_state: Arc<ConnectionRequestState>,
+    },
+    Responder {
+        response_state: Arc<ConnectionResponseState>,
+    },
 }
 
 #[derive(Clone)]
@@ -133,7 +139,10 @@ impl SyncSessionHandler {
         Self {
             db_path,
             timeout_secs,
-            role: SessionRole::Initiator { coordination },
+            role: SessionRole::Initiator {
+                coordination,
+                request_state: Arc::new(ConnectionRequestState::default()),
+            },
             shared_ingest,
         }
     }
@@ -146,8 +155,27 @@ impl SyncSessionHandler {
         Self {
             db_path,
             timeout_secs,
-            role: SessionRole::Responder,
+            role: SessionRole::Responder {
+                response_state: Arc::new(ConnectionResponseState::default()),
+            },
             shared_ingest,
+        }
+    }
+}
+
+impl Drop for SyncSessionHandler {
+    fn drop(&mut self) {
+        match &self.role {
+            SessionRole::Initiator {
+                coordination,
+                request_state,
+            } => {
+                request_state.clear();
+                coordination.clear_request_state();
+            }
+            SessionRole::Responder { response_state } => {
+                response_state.clear();
+            }
         }
     }
 }
@@ -212,7 +240,7 @@ impl SessionHandler for SyncSessionHandler {
         // existing session functions work without QUIC-specific types.
         let role_name = match &self.role {
             SessionRole::Initiator { .. } => "initiator",
-            SessionRole::Responder => "responder",
+            SessionRole::Responder { .. } => "responder",
         };
         let run_logger = SessionRunLogger::maybe_new(&self.db_path, &meta, role_name);
         let capture = run_logger.as_ref().and_then(|l| l.capture());
@@ -260,7 +288,13 @@ impl SessionHandler for SyncSessionHandler {
 
         let mut stats: Option<crate::runtime::SyncStats> = None;
         let result = match (&self.role, meta.direction) {
-            (SessionRole::Initiator { coordination }, SessionDirection::Outbound) => {
+            (
+                SessionRole::Initiator {
+                    coordination,
+                    request_state,
+                },
+                SessionDirection::Outbound,
+            ) => {
                 info!(
                     "Session {} entering initiator sync peer={} remote={}",
                     meta.session_id,
@@ -277,6 +311,7 @@ impl SessionHandler for SyncSessionHandler {
                     &tenant_id,
                     &ingress_source_tag,
                     coordination.as_ref(),
+                    request_state.as_ref(),
                     self.shared_ingest.clone(),
                     run_logger.as_ref().and_then(|l| l.capture()),
                     run_logger.as_ref().and_then(|l| l.rx_capture()),
@@ -296,7 +331,7 @@ impl SessionHandler for SyncSessionHandler {
                     Err(e) => Err(e),
                 }
             }
-            (SessionRole::Responder, SessionDirection::Inbound) => {
+            (SessionRole::Responder { response_state }, SessionDirection::Inbound) => {
                 info!(
                     "Session {} entering responder sync peer={} remote={}",
                     meta.session_id,
@@ -312,6 +347,7 @@ impl SessionHandler for SyncSessionHandler {
                     &peer_id,
                     &tenant_id,
                     &ingress_source_tag,
+                    response_state.as_ref(),
                     self.shared_ingest.clone(),
                     run_logger.as_ref().and_then(|l| l.capture()),
                     run_logger.as_ref().and_then(|l| l.rx_capture()),
@@ -333,7 +369,7 @@ impl SessionHandler for SyncSessionHandler {
             (SessionRole::Initiator { .. }, SessionDirection::Inbound) => {
                 Err("initiator handler cannot run inbound sessions".to_string())
             }
-            (SessionRole::Responder, SessionDirection::Outbound) => {
+            (SessionRole::Responder { .. }, SessionDirection::Outbound) => {
                 Err("responder handler cannot run outbound sessions".to_string())
             }
         };

@@ -58,9 +58,11 @@ Implementation follow-up:
      utilization, durable receive completion, and projection lag separately.
 12. Finish the structural split implied by the credit model:
    - keep session semantics only for Negentropy discovery rounds,
-   - sync handlers are already scoped to authenticated connection lifetime, but sink request credit, in-flight suppression, and source pending responses still need real connection-scoped request lanes instead of riding per-round session streams,
-   - remove remaining sync-time dependence on durable SQLite egress where credit
-     already bounds memory,
+   - keep evolving request/response transport toward true dedicated
+     connection-scoped lanes; the state is now connection-scoped even though
+     current requests still ride the active discovery round's streams,
+   - remove remaining sync-time dependence on durable SQLite egress where
+     credit already bounds memory,
    - extend the current tenant-scoped shared coordinator to a true global sink
      scheduler over authenticated `(tenant, peer)` slots, so multi-workspace /
      multi-tenant demand can be allocated across all credited peers in one

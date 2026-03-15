@@ -22,6 +22,7 @@ use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
 use crate::tuning::{egress_send_quantum_bytes, low_mem_memtrace};
 
+use super::connection_scope::ConnectionResponseState;
 use super::logging::SyncRunRxCapture;
 use super::{
     egress_claim_count, enqueue_batch, have_chunk, DATA_SEND_STALL_TIMEOUT, EGRESS_LEASE_MS,
@@ -49,6 +50,14 @@ impl PendingResponseQueue {
 
     pub fn is_empty(&self) -> bool {
         self.ids.is_empty()
+    }
+
+    pub fn pop_front(&mut self) -> Option<EventId> {
+        self.ids.pop_front()
+    }
+
+    pub fn push_front(&mut self, event_id: EventId) {
+        self.ids.push_front(event_id);
     }
 }
 
@@ -205,7 +214,7 @@ where
 }
 
 pub async fn drain_pending_responses_to_data_stream<S>(
-    pending: &mut PendingResponseQueue,
+    response_state: &ConnectionResponseState,
     store: &Store<'_>,
     data_send: &mut S,
 ) -> DataPlaneSendStats
@@ -218,7 +227,7 @@ where
     let mut sent_any = false;
 
     while bytes_sent_delta < send_quantum_bytes {
-        let Some(event_id) = pending.ids.pop_front() else {
+        let Some(event_id) = response_state.pop_next_response() else {
             break;
         };
 
@@ -243,7 +252,7 @@ where
                     event_id_to_base64(&event_id),
                     err
                 );
-                pending.ids.push_front(event_id);
+                response_state.requeue_front(event_id);
                 break;
             }
             Err(_) => {
@@ -252,7 +261,7 @@ where
                     event_id_to_base64(&event_id),
                     DATA_SEND_STALL_TIMEOUT.as_millis()
                 );
-                pending.ids.push_front(event_id);
+                response_state.requeue_front(event_id);
                 break;
             }
         }
@@ -398,7 +407,7 @@ where
 mod tests {
     use super::{
         drain_egress_to_data_stream, drain_pending_responses_to_data_stream,
-        should_capture_rx_event_link, PendingResponseQueue,
+        should_capture_rx_event_link,
     };
     use crate::crypto::hash_event;
     use crate::db::{
@@ -407,6 +416,7 @@ mod tests {
     };
     use crate::event_modules::ShareScope;
     use crate::protocol::Frame;
+    use crate::sync::session::ConnectionResponseState;
     use crate::transport::connection::ConnectionError;
     use crate::transport::StreamSend;
     use async_trait::async_trait;
@@ -577,10 +587,10 @@ mod tests {
         let sender = RecordingSend::default();
         let sender_state = sender.frames.clone();
         let mut send = sender;
-        let mut pending = PendingResponseQueue::default();
-        pending.enqueue_many(&[event_id]);
+        let pending = ConnectionResponseState::default();
+        pending.consume_requests(&[event_id]);
 
-        let stats = drain_pending_responses_to_data_stream(&mut pending, &store, &mut send).await;
+        let stats = drain_pending_responses_to_data_stream(&pending, &store, &mut send).await;
         assert_eq!(stats.events_sent_delta, 1);
         assert!(pending.is_empty());
         assert_eq!(

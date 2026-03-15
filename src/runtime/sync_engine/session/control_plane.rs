@@ -7,55 +7,16 @@
 //! - Session completion control markers (`Done` / `DoneAck`)
 
 use negentropy::Id;
-use std::collections::HashMap;
 use tracing::info;
 
 use crate::crypto::EventId;
 use crate::db::wanted::WantedEvents;
 use crate::protocol::{neg_id_to_event_id, Frame};
 use crate::transport::StreamConn;
-use crate::tuning::request_inflight_ttl_ms;
 
-use super::{coordinator::PeerCoord, need_chunk};
+use super::{connection_scope::ConnectionRequestState, coordinator::PeerCoord, need_chunk};
 
 pub type SyncError = Box<dyn std::error::Error + Send + Sync>;
-
-#[derive(Debug, Default)]
-pub struct PeerRequestWindow {
-    remote_credit: usize,
-    inflight_requested: HashMap<EventId, i64>,
-}
-
-impl PeerRequestWindow {
-    pub fn add_credit(&mut self, credits: usize) {
-        self.remote_credit = self.remote_credit.saturating_add(credits);
-    }
-
-    pub fn inflight_len(&self) -> usize {
-        self.inflight_requested.len()
-    }
-
-    pub fn available_credit(&self) -> usize {
-        self.remote_credit
-    }
-
-    pub fn inflight_requested(&self) -> &HashMap<EventId, i64> {
-        &self.inflight_requested
-    }
-
-    fn expire_stale(&mut self, now_ms: i64) {
-        let ttl_ms = request_inflight_ttl_ms();
-        self.inflight_requested
-            .retain(|_, requested_at| now_ms.saturating_sub(*requested_at) < ttl_ms);
-    }
-
-    fn note_requested(&mut self, ids: &[EventId], now_ms: i64) {
-        for event_id in ids {
-            self.inflight_requested.insert(*event_id, now_ms);
-        }
-        self.remote_credit = self.remote_credit.saturating_sub(ids.len());
-    }
-}
 
 pub async fn send_initial_neg_open<C>(
     control: &mut C,
@@ -120,31 +81,30 @@ pub async fn refill_wanted_requests<C>(
     wanted: &WantedEvents<'_>,
     coordination: &PeerCoord,
     peer_id: &str,
-    request_window: &mut PeerRequestWindow,
+    request_state: &ConnectionRequestState,
 ) -> Result<usize, SyncError>
 where
     C: StreamConn,
 {
-    if request_window.available_credit() == 0 {
+    let now_ms = crate::db::queue::current_timestamp_ms();
+    let snapshot = request_state.snapshot(now_ms);
+    if snapshot.remote_credit == 0 {
         return Ok(0);
     }
 
-    let now_ms = crate::db::queue::current_timestamp_ms();
-    request_window.expire_stale(now_ms);
-
-    let credit = request_window.available_credit();
+    let credit = snapshot.remote_credit;
     if credit == 0 {
         return Ok(0);
     }
 
     let candidate_limit = credit
-        .saturating_add(request_window.inflight_len())
+        .saturating_add(snapshot.inflight_requested.len())
         .saturating_add(need_chunk());
     let selected = coordination.plan_requests(
         wanted,
         peer_id,
         credit,
-        request_window.inflight_requested(),
+        &snapshot.inflight_requested,
         candidate_limit,
         now_ms,
     )?;
@@ -169,14 +129,15 @@ where
         control.send(&Frame::HaveList { ids: batch }).await?;
     }
     control.flush().await?;
-    request_window.note_requested(&selected, now_ms);
+    request_state.note_requested(&selected, now_ms);
+    let stats = request_state.stats(now_ms);
 
     info!(
         "Requested more wanted IDs from peer {} (requested_now={}, inflight={}, remaining_credit={}, candidate_limit={})",
         peer_id,
         selected.len(),
-        request_window.inflight_len(),
-        request_window.available_credit(),
+        stats.inflight_len,
+        stats.remote_credit,
         candidate_limit
     );
     Ok(selected.len())
@@ -215,15 +176,16 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
+    use super::super::connection_scope::ConnectionRequestState;
+    use crate::tuning::request_inflight_ttl_ms;
 
     #[test]
-    fn peer_request_window_expires_stale_entries() {
-        let mut window = PeerRequestWindow::default();
+    fn connection_request_state_expires_stale_entries() {
+        let state = ConnectionRequestState::default();
         let mut id = [0u8; 32];
         id[0] = 7;
-        window.inflight_requested.insert(id, 0);
-        window.expire_stale(request_inflight_ttl_ms() + 1);
-        assert_eq!(window.inflight_len(), 0);
+        state.add_credit(1);
+        state.note_requested(&[id], 0);
+        assert_eq!(state.stats(request_inflight_ttl_ms() + 1).inflight_len, 0);
     }
 }

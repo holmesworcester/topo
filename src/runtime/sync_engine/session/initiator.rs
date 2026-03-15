@@ -31,9 +31,10 @@ use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 use crate::tuning::{low_mem_memtrace, low_mem_mode};
 
+use super::connection_scope::ConnectionRequestState;
 use super::control_plane::{
     append_have_ids_to_pending, observe_need_ids_for_peer, refill_wanted_requests, send_done,
-    send_initial_neg_open, PeerRequestWindow,
+    send_initial_neg_open,
 };
 use super::coordinator::PeerCoord;
 use super::data_plane::{
@@ -48,22 +49,6 @@ use super::{
     negentropy_frame_size, send_idle_capture_enabled, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT,
     EGRESS_QUIET_WINDOW, EGRESS_SENT_TTL_MS, INITIAL_CONTROL_PROGRESS_TIMEOUT,
 };
-
-struct CoordinationCleanupGuard<'a> {
-    coordination: &'a PeerCoord,
-}
-
-impl<'a> CoordinationCleanupGuard<'a> {
-    fn new(coordination: &'a PeerCoord) -> Self {
-        Self { coordination }
-    }
-}
-
-impl Drop for CoordinationCleanupGuard<'_> {
-    fn drop(&mut self) {
-        self.coordination.clear_request_state();
-    }
-}
 
 fn should_treat_as_startup_control_abort(
     rounds: u64,
@@ -95,6 +80,7 @@ pub async fn run_sync_initiator<C, S, R>(
     recorded_by: &str,
     ingress_source_tag: &str,
     coordination: &PeerCoord,
+    request_state: &ConnectionRequestState,
     shared_ingest: mpsc::Sender<IngestItem>,
     capture: Option<SyncRunCapture>,
     rx_capture: Option<SyncRunRxCapture>,
@@ -104,7 +90,6 @@ where
     S: StreamSend,
     R: StreamRecv + Send + 'static,
 {
-    let _coordination_cleanup = CoordinationCleanupGuard::new(coordination);
     let DualConnection {
         mut control,
         mut data_send,
@@ -194,8 +179,6 @@ where
     let reconcile_start = Instant::now();
     // Pending have_ids buffer: populated by reconciliation, drained incrementally
     let mut pending_have: Vec<EventId> = Vec::new();
-    let mut request_window = PeerRequestWindow::default();
-
     let mut last_bytes_received = 0u64;
     let mut last_egress_log = Instant::now();
     let memtrace_enabled = low_mem_memtrace();
@@ -277,7 +260,7 @@ where
             }
             Ok(Ok(Frame::RequestCredit { credits })) => {
                 last_activity = Instant::now();
-                request_window.add_credit(credits as usize);
+                request_state.add_credit(credits as usize);
             }
             Ok(Ok(_)) => {}
             Ok(Err(ConnectionError::Closed)) => {
@@ -328,14 +311,9 @@ where
                 observed_need_ids, peer_id
             );
         }
-        let requested_now = refill_wanted_requests(
-            &mut control,
-            &wanted,
-            coordination,
-            peer_id,
-            &mut request_window,
-        )
-        .await?;
+        let requested_now =
+            refill_wanted_requests(&mut control, &wanted, coordination, peer_id, request_state)
+                .await?;
         if requested_now > 0 {
             last_activity = Instant::now();
         }
@@ -369,6 +347,7 @@ where
                 .unwrap_or(-1);
             let wanted_pending = wanted.count().unwrap_or(-1);
             let wanted_peer_backlog = wanted.count_backlog_for_peer(peer_id).unwrap_or(-1);
+            let request_stats = request_state.stats(current_timestamp_ms());
             let ingest_cap = ingest_tx.max_capacity();
             let ingest_used = ingest_cap.saturating_sub(ingest_tx.capacity());
             let sqlite_global = memtrace::sqlite_global_memory();
@@ -387,8 +366,8 @@ where
                 pending_have.capacity(),
                 wanted_pending,
                 wanted_peer_backlog,
-                request_window.inflight_len(),
-                request_window.available_credit(),
+                request_stats.inflight_len,
+                request_stats.remote_credit,
                 egress_pending,
                 ingest_used,
                 ingest_cap,
@@ -421,6 +400,7 @@ where
         let egress_pending = egress
             .count_outstanding(peer_id, session_owner)
             .unwrap_or(0);
+        let request_stats = request_state.stats(current_timestamp_ms());
 
         if idle_capture_enabled
             && !done_sent
@@ -448,8 +428,8 @@ where
                         "pending_have": pending_have.len(),
                         "need_ids": need_ids.len(),
                         "wanted_peer_backlog": pending_wanted_backlog,
-                        "request_inflight": request_window.inflight_len(),
-                        "request_credit": request_window.available_credit(),
+                        "request_inflight": request_stats.inflight_len,
+                        "request_credit": request_stats.remote_credit,
                         "egress_pending": egress_pending,
                         "wanted_pending": wanted.count().unwrap_or(-1),
                     }))

@@ -1322,10 +1322,12 @@ depend on fresh session rounds.
    stays small in both cases, so SQLite does not pace the wire and memory does
    not scale with total workspace size.
 5. **Connection-scoped scaffolding.** Sync handlers now belong to one
-   authenticated connection lifetime, which is where future connection-scoped
-   request/response state will live. Sink request credit, in-flight request
-   suppression, and source pending-response queues remain round-scoped until
-   request transport itself stops riding per-round control streams.
+   authenticated connection lifetime, and the sink's request credit,
+   in-flight request suppression, and the source's pending-response queue now
+   survive discovery-round boundaries on that connection. Discovery rounds
+   still own Negentropy snapshot semantics; request/response state simply
+   borrows the current round's streams while the authenticated connection is
+   alive.
 6. **Negentropy snapshot ordering.** `BEGIN` still must precede
    `rebuild_blocks()` so the observer sees a consistent read snapshot.
 

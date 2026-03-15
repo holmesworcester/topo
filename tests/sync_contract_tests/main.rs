@@ -4,6 +4,7 @@
 //! Workstream E of the Option B Phase 6 hardening plan.
 
 mod cancellation_semantics;
+mod connection_scoping;
 mod error_mapping;
 mod fake_session_io;
 mod initiator_protocol_ordering;

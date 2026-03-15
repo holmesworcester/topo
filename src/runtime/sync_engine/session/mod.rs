@@ -10,6 +10,7 @@
 //!    waits for initiator's DataDone to be consumed, then sends DoneAck.
 //! 4. Initiator receives DoneAck, waits for responder's DataDone, exits.
 
+pub mod connection_scope;
 pub mod control_plane;
 pub mod coordinator;
 pub mod data_plane;
@@ -25,6 +26,10 @@ use crate::tuning::low_mem_mode;
 // ---------------------------------------------------------------------------
 // Re-exports — preserve the existing public API surface
 // ---------------------------------------------------------------------------
+pub use connection_scope::{
+    ConnectionRequestState, ConnectionResponseState, RequestWindowSnapshot, RequestWindowStats,
+    ResponseQueueStats,
+};
 pub use coordinator::{CoordinationManager, PeerCoord};
 pub use data_plane::spawn_data_receiver;
 pub use initiator::run_sync_initiator;
