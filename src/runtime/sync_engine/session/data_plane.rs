@@ -15,7 +15,8 @@ use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::crypto::{event_id_to_base64, hash_event, EventId};
-use crate::db::{egress_queue::EgressQueue, store::Store};
+use crate::db::timeline::EventTimeline;
+use crate::db::{egress_queue::EgressQueue, queue::current_timestamp_ms, store::Store};
 use crate::protocol::Frame;
 use crate::runtime::memtrace;
 use crate::transport::connection::ConnectionError;
@@ -215,6 +216,7 @@ where
 
 pub async fn drain_pending_responses_to_data_stream<S>(
     response_state: &ConnectionResponseState,
+    timeline: &EventTimeline<'_>,
     store: &Store<'_>,
     data_send: &mut S,
 ) -> DataPlaneSendStats
@@ -245,6 +247,7 @@ where
                 events_sent_delta += 1;
                 bytes_sent_delta += blob_len;
                 sent_any = true;
+                let _ = timeline.mark_response_sent(&event_id, current_timestamp_ms());
             }
             Ok(Err(err)) => {
                 warn!(
@@ -346,7 +349,13 @@ where
                                 }
                             }
                             if ingest_tx
-                                .send((event_id, blob, recorded_by.clone(), source_tag.clone()))
+                                .send((
+                                    event_id,
+                                    blob,
+                                    recorded_by.clone(),
+                                    source_tag.clone(),
+                                    current_timestamp_ms(),
+                                ))
                                 .await
                                 .is_err()
                             {
@@ -409,7 +418,8 @@ mod tests {
         drain_egress_to_data_stream, drain_pending_responses_to_data_stream,
         should_capture_rx_event_link,
     };
-    use crate::crypto::hash_event;
+    use crate::crypto::{event_id_to_base64, hash_event};
+    use crate::db::timeline::EventTimeline;
     use crate::db::{
         egress_queue::EgressQueue, open_connection, schema::create_tables, store::insert_event,
         store::Store,
@@ -588,14 +598,21 @@ mod tests {
         let sender_state = sender.frames.clone();
         let mut send = sender;
         let pending = ConnectionResponseState::default();
+        let timeline = EventTimeline::new(&conn);
         pending.consume_requests(&[event_id]);
 
-        let stats = drain_pending_responses_to_data_stream(&pending, &store, &mut send).await;
+        let stats =
+            drain_pending_responses_to_data_stream(&pending, &timeline, &store, &mut send).await;
         assert_eq!(stats.events_sent_delta, 1);
         assert!(pending.is_empty());
         assert_eq!(
             sender_state.lock().unwrap().as_slice(),
             &[Frame::Event { blob }]
         );
+        let row = timeline
+            .load(&event_id_to_base64(&event_id))
+            .unwrap()
+            .unwrap();
+        assert!(row.response_sent_at.is_some());
     }
 }

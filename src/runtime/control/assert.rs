@@ -5,7 +5,7 @@ use std::time::{Duration, Instant};
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::event_id_to_base64;
-use crate::db::{open_connection, schema::create_tables};
+use crate::db::{open_connection, schema::create_tables, timeline::EventTimeline};
 use crate::event_modules::{message, reaction};
 use crate::transport::identity::load_transport_peer_id;
 
@@ -55,6 +55,7 @@ pub struct AssertResponse {
     pub op: String,
     pub expected: i64,
     pub timed_out: bool,
+    pub debug: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -171,6 +172,22 @@ fn resolve_assert_recorded_by(
     Ok(transport_peer_id)
 }
 
+fn timeline_debug_for_field(db: &rusqlite::Connection, field: &str) -> Option<String> {
+    let event_id = field.strip_prefix("has_event:")?;
+    let event_id_b64 = if event_id.len() == 64 {
+        let bytes = hex::decode(event_id).ok()?;
+        if bytes.len() != 32 {
+            return None;
+        }
+        let mut eid = [0u8; 32];
+        eid.copy_from_slice(&bytes);
+        event_id_to_base64(&eid)
+    } else {
+        event_id.to_string()
+    };
+    EventTimeline::new(db).summary(&event_id_b64).ok().flatten()
+}
+
 fn assert_eventually_inner(
     db: &rusqlite::Connection,
     recorded_by: &str,
@@ -193,9 +210,11 @@ fn assert_eventually_inner(
                 op: op.symbol().to_string(),
                 expected,
                 timed_out: false,
+                debug: None,
             });
         }
         if start.elapsed() >= timeout {
+            let debug = timeline_debug_for_field(db, &field);
             return Ok(AssertResponse {
                 pass: false,
                 field,
@@ -203,6 +222,7 @@ fn assert_eventually_inner(
                 op: op.symbol().to_string(),
                 expected,
                 timed_out: true,
+                debug,
             });
         }
         std::thread::sleep(interval);
@@ -240,9 +260,11 @@ pub fn assert_eventually(
                 op: op.symbol().to_string(),
                 expected,
                 timed_out: false,
+                debug: None,
             });
         }
         if start.elapsed() >= timeout {
+            let debug = timeline_debug_for_field(&db, &field);
             return Ok(AssertResponse {
                 pass: false,
                 field,
@@ -250,6 +272,7 @@ pub fn assert_eventually(
                 op: op.symbol().to_string(),
                 expected,
                 timed_out: true,
+                debug,
             });
         }
         std::thread::sleep(interval);

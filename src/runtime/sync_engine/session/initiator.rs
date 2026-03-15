@@ -19,6 +19,7 @@ use crate::db::{
     open_connection,
     queue::current_timestamp_ms,
     store::{lookup_workspace_id, Store},
+    timeline::EventTimeline,
     wanted::WantedEvents,
 };
 use crate::protocol::Frame;
@@ -110,6 +111,7 @@ where
 
     let egress = EgressQueue::new(&db);
     let wanted = WantedEvents::new(&db);
+    let timeline = EventTimeline::new(&db);
     let ws_id = lookup_workspace_id(&db, recorded_by).ok_or_else(|| {
         format!(
             "no accepted workspace binding for peer_id={}, cannot start sync",
@@ -177,6 +179,7 @@ where
     let mut done_sent = false;
     let sync_start = Instant::now();
     let reconcile_start = Instant::now();
+    let reconcile_started_at_ms = current_timestamp_ms();
     // Pending have_ids buffer: populated by reconciliation, drained incrementally
     let mut pending_have: Vec<EventId> = Vec::new();
     let mut last_bytes_received = 0u64;
@@ -304,16 +307,28 @@ where
             Err(_) => {}
         }
 
-        let observed_need_ids = observe_need_ids_for_peer(&wanted, peer_id, &mut need_ids)?;
+        let observed_need_ids = observe_need_ids_for_peer(
+            &wanted,
+            &timeline,
+            peer_id,
+            reconcile_started_at_ms,
+            &mut need_ids,
+        )?;
         if observed_need_ids > 0 {
             info!(
                 "Observed {} wanted IDs from peer {} during reconciliation",
                 observed_need_ids, peer_id
             );
         }
-        let requested_now =
-            refill_wanted_requests(&mut control, &wanted, coordination, peer_id, request_state)
-                .await?;
+        let requested_now = refill_wanted_requests(
+            &mut control,
+            &wanted,
+            &timeline,
+            coordination,
+            peer_id,
+            request_state,
+        )
+        .await?;
         if requested_now > 0 {
             last_activity = Instant::now();
         }

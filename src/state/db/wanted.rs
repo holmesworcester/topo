@@ -3,6 +3,7 @@ use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 use super::queue::{
     current_timestamp_ms, with_immediate_tx, with_sqlite_busy_retry, PRIORITY_LANE_FOREGROUND,
 };
+use super::timeline::EventTimeline;
 use crate::crypto::{event_id_to_base64, EventId};
 
 /// Wanted events - events the sink still needs to fetch.
@@ -81,7 +82,13 @@ impl<'a> WantedEvents<'a> {
     /// Observe that `peer_id` appears to have each event in `ids`.
     ///
     /// This records event demand once and candidate source membership per peer.
-    pub fn observe_many_for_peer(&self, peer_id: &str, ids: &[EventId]) -> SqliteResult<usize> {
+    pub fn observe_many_for_peer(
+        &self,
+        peer_id: &str,
+        ids: &[EventId],
+        discovery_round_started_at: i64,
+        timeline: &EventTimeline<'_>,
+    ) -> SqliteResult<usize> {
         if ids.is_empty() {
             return Ok(0);
         }
@@ -105,6 +112,7 @@ impl<'a> WantedEvents<'a> {
             )?;
 
             let mut observed = 0usize;
+            let mut discovered_ids = Vec::with_capacity(ids.len());
             for id in ids {
                 let id_b64 = event_id_to_base64(id);
                 let already_local = local_exists
@@ -124,6 +132,14 @@ impl<'a> WantedEvents<'a> {
                     now,
                 ])?;
                 observed += 1;
+                discovered_ids.push(*id);
+            }
+            if !discovered_ids.is_empty() {
+                let _ = timeline.mark_discovered_many_with_round_start(
+                    &discovered_ids,
+                    discovery_round_started_at,
+                    now,
+                );
             }
             Ok(observed)
         })
@@ -355,7 +371,7 @@ fn delete_wanted_row(conn: &Connection, id: &EventId) -> SqliteResult<()> {
 mod tests {
     use super::*;
     use crate::crypto::event_id_to_base64;
-    use crate::db::{open_connection, schema::create_tables};
+    use crate::db::{open_connection, schema::create_tables, timeline::EventTimeline};
     use std::time::Duration;
 
     fn make_event_id(byte: u8) -> EventId {
@@ -392,8 +408,9 @@ mod tests {
             let conn = open_connection(&path_for_thread).unwrap();
             conn.busy_timeout(Duration::from_millis(20)).unwrap();
             let wanted = WantedEvents::new(&conn);
+            let timeline = EventTimeline::new(&conn);
             wanted
-                .observe_many_for_peer("peer-a", &[make_event_id(7)])
+                .observe_many_for_peer("peer-a", &[make_event_id(7)], 1, &timeline)
                 .unwrap()
         });
 
@@ -412,10 +429,15 @@ mod tests {
         let conn = crate::db::open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let wanted = WantedEvents::new(&conn);
+        let timeline = EventTimeline::new(&conn);
         let ids = [make_event_id(1), make_event_id(2)];
 
-        wanted.observe_many_for_peer("peer-a", &ids).unwrap();
-        wanted.observe_many_for_peer("peer-b", &ids).unwrap();
+        wanted
+            .observe_many_for_peer("peer-a", &ids, 1, &timeline)
+            .unwrap();
+        wanted
+            .observe_many_for_peer("peer-b", &ids, 1, &timeline)
+            .unwrap();
 
         let claimed_a = wanted
             .claim_for_peer("peer-a", "owner-a", 1, 30_000)
@@ -438,10 +460,15 @@ mod tests {
         let conn = crate::db::open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let wanted = WantedEvents::new(&conn);
+        let timeline = EventTimeline::new(&conn);
         let id = make_event_id(9);
 
-        wanted.observe_many_for_peer("peer-a", &[id]).unwrap();
-        wanted.observe_many_for_peer("peer-b", &[id]).unwrap();
+        wanted
+            .observe_many_for_peer("peer-a", &[id], 1, &timeline)
+            .unwrap();
+        wanted
+            .observe_many_for_peer("peer-b", &[id], 1, &timeline)
+            .unwrap();
 
         let claimed_a = wanted
             .claim_for_peer("peer-a", "owner-a", 1, 30_000)
@@ -460,10 +487,15 @@ mod tests {
         let conn = crate::db::open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let wanted = WantedEvents::new(&conn);
+        let timeline = EventTimeline::new(&conn);
         let id = make_event_id(5);
 
-        wanted.observe_many_for_peer("peer-a", &[id]).unwrap();
-        wanted.observe_many_for_peer("peer-b", &[id]).unwrap();
+        wanted
+            .observe_many_for_peer("peer-a", &[id], 1, &timeline)
+            .unwrap();
+        wanted
+            .observe_many_for_peer("peer-b", &[id], 1, &timeline)
+            .unwrap();
         wanted.remove(&id).unwrap();
 
         let wanted_count: i64 = conn
@@ -489,15 +521,23 @@ mod tests {
         let conn = crate::db::open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let wanted = WantedEvents::new(&conn);
+        let timeline = EventTimeline::new(&conn);
         let id = make_event_id(11);
 
-        wanted.observe_many_for_peer("peer-a", &[id]).unwrap();
+        wanted
+            .observe_many_for_peer("peer-a", &[id], 1, &timeline)
+            .unwrap();
         assert_eq!(wanted.count().unwrap(), 1);
 
         insert_local_event(&conn, &id);
         wanted.remove(&id).unwrap();
 
-        assert_eq!(wanted.observe_many_for_peer("peer-a", &[id]).unwrap(), 0);
+        assert_eq!(
+            wanted
+                .observe_many_for_peer("peer-a", &[id], 1, &timeline)
+                .unwrap(),
+            0
+        );
 
         let wanted_count: i64 = conn
             .query_row(

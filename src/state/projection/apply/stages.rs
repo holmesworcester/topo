@@ -2,6 +2,7 @@ use super::super::decision::ProjectionDecision;
 use super::super::encrypted::project_encrypted;
 use super::super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
 use crate::crypto::{event_id_to_base64, EventId};
+use crate::db::timeline::EventTimeline;
 use crate::event_modules::{registry, ParsedEvent, TransportPrivacy};
 use rusqlite::{Connection, OptionalExtension};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -14,6 +15,13 @@ fn semantic_type_code_for_parsed(parsed: &ParsedEvent) -> u8 {
         ParsedEvent::Encrypted(enc) => enc.inner_type_code,
         _ => parsed.event_type_code(),
     }
+}
+
+fn current_timestamp_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
 }
 
 fn derive_semantic_type_code_from_blob(
@@ -139,10 +147,7 @@ pub(crate) fn record_rejection(
     event_id_b64: &str,
     reason: &str,
 ) {
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64;
+    let now_ms = current_timestamp_ms();
     let _ = conn.execute(
         "INSERT OR IGNORE INTO rejected_events (peer_id, event_id, reason, rejected_at)
          VALUES (?1, ?2, ?3, ?4)",
@@ -192,6 +197,7 @@ pub(crate) fn check_deps_and_block(
          VALUES (?1, ?2, ?3)",
         rusqlite::params![recorded_by, event_id_b64, missing.len() as i64],
     )?;
+    let _ = EventTimeline::new(conn).mark_blocked_b64(event_id_b64, current_timestamp_ms());
 
     Ok(Some(ProjectionDecision::Block { missing }))
 }

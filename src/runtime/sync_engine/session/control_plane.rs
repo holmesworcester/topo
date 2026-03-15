@@ -10,6 +10,7 @@ use negentropy::Id;
 use tracing::info;
 
 use crate::crypto::EventId;
+use crate::db::timeline::EventTimeline;
 use crate::db::wanted::WantedEvents;
 use crate::protocol::{neg_id_to_event_id, Frame};
 use crate::transport::StreamConn;
@@ -44,7 +45,9 @@ pub fn append_have_ids_to_pending(have_ids: &mut Vec<Id>, pending_have: &mut Vec
 /// source membership for this peer.
 pub fn observe_need_ids_for_peer(
     wanted: &WantedEvents<'_>,
+    timeline: &EventTimeline<'_>,
     peer_id: &str,
+    discovery_round_started_at: i64,
     need_ids: &mut Vec<Id>,
 ) -> Result<usize, SyncError> {
     if need_ids.is_empty() {
@@ -57,12 +60,18 @@ pub fn observe_need_ids_for_peer(
     for neg_id in need_ids.drain(..) {
         batch.push(neg_id_to_event_id(&neg_id));
         if batch.len() >= batch_cap {
-            observed_total += wanted.observe_many_for_peer(peer_id, &batch)?;
+            observed_total += wanted.observe_many_for_peer(
+                peer_id,
+                &batch,
+                discovery_round_started_at,
+                timeline,
+            )?;
             batch.clear();
         }
     }
     if !batch.is_empty() {
-        observed_total += wanted.observe_many_for_peer(peer_id, &batch)?;
+        observed_total +=
+            wanted.observe_many_for_peer(peer_id, &batch, discovery_round_started_at, timeline)?;
     }
     if need_ids.capacity() > (batch_cap * 16) {
         need_ids.shrink_to(0);
@@ -79,6 +88,7 @@ pub fn observe_need_ids_for_peer(
 pub async fn refill_wanted_requests<C>(
     control: &mut C,
     wanted: &WantedEvents<'_>,
+    timeline: &EventTimeline<'_>,
     coordination: &PeerCoord,
     peer_id: &str,
     request_state: &ConnectionRequestState,
@@ -130,6 +140,7 @@ where
     }
     control.flush().await?;
     request_state.note_requested(&selected, now_ms);
+    let _ = timeline.mark_request_sent_many(&selected, now_ms);
     let stats = request_state.stats(now_ms);
 
     info!(

@@ -16,8 +16,10 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::IngestItem;
+use crate::db::timeline::EventTimeline;
 use crate::db::{
     open_connection,
+    queue::current_timestamp_ms,
     store::{lookup_workspace_id, Store},
 };
 use crate::protocol::Frame;
@@ -148,6 +150,7 @@ where
     };
 
     let store = Store::new(&db);
+    let timeline = EventTimeline::new(&db);
 
     let events_received = Arc::new(AtomicU64::new(0));
     let bytes_received = Arc::new(AtomicU64::new(0));
@@ -296,6 +299,7 @@ where
                 if ids.is_empty() {
                     continue;
                 }
+                let _ = timeline.mark_request_received_many(&ids, current_timestamp_ms());
                 response_state.consume_requests(&ids);
             }
             Ok(Ok(Frame::Done)) => {
@@ -324,8 +328,13 @@ where
         }
 
         // Drain requested responses to data stream — runs even while worker is reconciling
-        let send_stats =
-            drain_pending_responses_to_data_stream(response_state, &store, &mut data_send).await;
+        let send_stats = drain_pending_responses_to_data_stream(
+            response_state,
+            &timeline,
+            &store,
+            &mut data_send,
+        )
+        .await;
         events_sent += send_stats.events_sent_delta;
         bytes_sent += send_stats.bytes_sent_delta;
         if send_stats.events_sent_delta > 0 {

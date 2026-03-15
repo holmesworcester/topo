@@ -4,7 +4,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use topo::contracts::peering_contract::{SessionDirection, SessionHandler};
-use topo::db::{open_connection, wanted::WantedEvents};
+use topo::db::{open_connection, timeline::EventTimeline, wanted::WantedEvents};
 use topo::protocol::Frame;
 use topo::sync::session::windowing::decode_initial_neg_open;
 use topo::sync::session_handler::SyncSessionHandler;
@@ -101,9 +101,10 @@ async fn initiator_reuses_connection_scoped_credit_across_rounds() {
         // After round 1, the sink now learns about a wanted event from the same peer.
         let conn = open_connection(&db_path).expect("open test db");
         let wanted = WantedEvents::new(&conn);
+        let timeline = EventTimeline::new(&conn);
         assert_eq!(
             wanted
-                .observe_many_for_peer(&peer_hex, &[requested_event])
+                .observe_many_for_peer(&peer_hex, &[requested_event], 1_000, &timeline)
                 .expect("observe wanted"),
             1
         );

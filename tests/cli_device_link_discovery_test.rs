@@ -60,10 +60,16 @@ fn start_linked_cli_peer(
         Ok(invite) if invite.bootstrap_addrs.is_empty()
     );
     let daemon = if empty_bootstrap {
-        // Discovery-only device-link cases are specifically about whether a
-        // fresh long-lived daemon can recover bootstrap via mDNS after accept.
-        accept_device_link_with_name(&db, invite_link, device_name);
-        start_discovery_daemon(&db)
+        // Discovery-only device-link cases still need the long-lived daemon's
+        // observer/runtime active while the accept installs bootstrap state.
+        let daemon = start_discovery_daemon(&db);
+        accept_device_link_with_name_on_running_daemon(
+            &db,
+            invite_link,
+            device_name,
+            std::time::Duration::from_secs(20),
+        );
+        daemon
     } else {
         let daemon = start_daemon(&db);
         accept_device_link_with_name_on_running_daemon(
@@ -90,8 +96,13 @@ fn start_linked_cli_peer_via_discovery(
     device_name: &str,
 ) -> StartedCliPeer {
     let db = tmpdir.path().join(db_name).to_str().unwrap().to_string();
-    accept_device_link_with_name(&db, invite_link, device_name);
     let daemon = start_discovery_daemon(&db);
+    accept_device_link_with_name_on_running_daemon(
+        &db,
+        invite_link,
+        device_name,
+        std::time::Duration::from_secs(20),
+    );
     StartedCliPeer {
         db,
         username: username.to_string(),

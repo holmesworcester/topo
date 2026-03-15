@@ -6,6 +6,7 @@ use rusqlite::Connection;
 use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::store::lookup_workspace_id;
+use crate::db::timeline::EventTimeline;
 use crate::event_modules::{self as events, registry::EventRegistry, ShareScope};
 use crate::state::shared_workspace_fanout::SharedEventFanout;
 
@@ -33,14 +34,16 @@ pub(super) fn run_persist_phase(
     events_stmt: &mut rusqlite::Statement<'_>,
     enqueue_stmt: &mut rusqlite::Statement<'_>,
 ) -> PersistPhaseOutput {
+    let timeline = EventTimeline::new(db);
     let mut persist_output = PersistPhaseOutput {
         persisted_event_ids: Vec::with_capacity(batch.len()),
         tenants_seen: HashSet::new(),
         shared_event_fanouts: Vec::new(),
     };
 
-    for (event_id, blob, recorded_by, source_tag) in batch {
+    for (event_id, blob, recorded_by, source_tag, received_at_ms) in batch {
         let event_id_b64 = event_id_to_base64(event_id);
+        let _ = timeline.mark_response_received_b64(&event_id_b64, *received_at_ms);
 
         if let Some(created_at_ms) = events::extract_created_at_ms(blob) {
             if let Some(type_code) = events::extract_event_type(blob) {
@@ -104,6 +107,7 @@ pub(super) fn run_persist_phase(
                         tracing::warn!("recorded_events insert error for {}: {}", event_id_b64, e);
                         continue;
                     }
+                    let _ = timeline.mark_persisted_b64(&event_id_b64, recorded_at);
 
                     // Enqueue for durable projection (atomicity boundary 1)
                     let priority_lane = if events::outer_semantic_type_code(blob)
@@ -202,7 +206,13 @@ mod tests {
         }))
         .unwrap();
         let event_id = hash_event(&blob);
-        let batch = vec![(event_id, blob, "peer-alpha".to_string(), "sync".to_string())];
+        let batch = vec![(
+            event_id,
+            blob,
+            "peer-alpha".to_string(),
+            "sync".to_string(),
+            0,
+        )];
 
         let output = run_persist_phase(
             &db,

@@ -1,5 +1,7 @@
 use super::super::decision::ProjectionDecision;
 use crate::crypto::event_id_from_base64;
+use crate::db::queue::current_timestamp_ms;
+use crate::db::timeline::EventTimeline;
 use crate::event_modules::ParsedEvent;
 use crate::state::shared_workspace_fanout::fanout_stored_shared_event_immediate;
 use rusqlite::Connection;
@@ -77,6 +79,7 @@ fn cascade_unblocked_inner(
             did_unblock = true;
             conn.prepare_cached("DELETE FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2")?
                 .execute(rusqlite::params![recorded_by, eid_b64])?;
+            let _ = EventTimeline::new(conn).mark_unblocked_b64(eid_b64, current_timestamp_ms());
 
             // 4. Project this event via project_one_step (no recursive cascade).
             //    apply_projection (called by project_one_step) executes emit_commands,

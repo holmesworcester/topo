@@ -1,5 +1,7 @@
 use super::super::decision::ProjectionDecision;
 use crate::crypto::{event_id_to_base64, EventId};
+use crate::db::queue::current_timestamp_ms;
+use crate::db::timeline::EventTimeline;
 use crate::event_modules::{self as events, ParsedEvent};
 use rusqlite::Connection;
 
@@ -95,6 +97,8 @@ pub(crate) fn project_one_step(
         ProjectionDecision::Block { ref missing } => {
             // Dependency-stage block rows are written in check_deps_and_block().
             // Projector-level guard blocks (missing == []) rely on emitted commands.
+            let _ =
+                EventTimeline::new(conn).mark_blocked_b64(&event_id_b64, current_timestamp_ms());
             let _ = missing;
             return Ok((decision, Some(parsed)));
         }
@@ -124,6 +128,7 @@ pub(crate) fn project_one_step(
             sub_event,
         )
         .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+        let _ = EventTimeline::new(conn).mark_projected_b64(&event_id_b64, current_timestamp_ms());
 
         Ok(())
     })();

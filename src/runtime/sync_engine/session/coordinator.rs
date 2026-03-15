@@ -290,7 +290,7 @@ fn next_assignment(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::db::{open_in_memory, schema::create_tables};
+    use crate::db::{open_in_memory, schema::create_tables, timeline::EventTimeline};
     use std::collections::HashMap;
 
     fn candidate(byte: u8, lane: i64, ts: i64) -> WantedCandidate {
@@ -372,6 +372,7 @@ mod tests {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let wanted = WantedEvents::new(&conn);
+        let timeline = EventTimeline::new(&conn);
 
         let mut a = [0u8; 32];
         let mut b = [0u8; 32];
@@ -380,8 +381,12 @@ mod tests {
         b[0] = 2;
         c[0] = 3;
 
-        wanted.observe_many_for_peer("peer-a", &[a, b]).unwrap();
-        wanted.observe_many_for_peer("peer-b", &[a, c]).unwrap();
+        wanted
+            .observe_many_for_peer("peer-a", &[a, b], now_ms_placeholder(), &timeline)
+            .unwrap();
+        wanted
+            .observe_many_for_peer("peer-b", &[a, c], now_ms_placeholder(), &timeline)
+            .unwrap();
 
         let manager = CoordinationManager::new();
         let coord_a = manager.register_peer();
@@ -400,5 +405,9 @@ mod tests {
             second[0], c,
             "peer-b should consume the still-unrequested unique candidate first"
         );
+    }
+
+    fn now_ms_placeholder() -> i64 {
+        1_000
     }
 }

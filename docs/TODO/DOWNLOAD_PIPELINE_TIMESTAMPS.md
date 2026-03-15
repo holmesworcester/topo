@@ -4,6 +4,25 @@ We now have enough separation between discovery, request selection, request
 transport, data receipt, and projection to record useful per-event timing in
 the DB and surface it in test diagnostics.
 
+## Current status
+
+Implemented on the branch:
+
+- durable `event_timeline(event_id, ...)` rows in infra schema
+- discovery / wanted observation timestamps
+- request sent / request received timestamps
+- response sent / response received timestamps
+- persisted / blocked / unblocked / projected timestamps
+- `assert-eventually has_event:...` timeout output now includes any available
+  event timeline summary
+- one realistic sync test proves source-side and sink-side rows populate across
+  a real requested download
+
+Current defaults:
+
+- enabled automatically in debug/test builds
+- enabled in release only when `TOPO_EVENT_TIMELINE=1`
+
 ## Goal
 
 When a sync assertion times out, report where time was actually spent for the
@@ -19,7 +38,7 @@ This should let us distinguish:
 - projection delay,
 - blocked-dependency delay.
 
-## Candidate timestamps
+## Implemented timestamps
 
 For each `event_id`, record nullable timestamps such as:
 
@@ -27,17 +46,13 @@ For each `event_id`, record nullable timestamps such as:
 - `wanted_discovered_at`
 - `request_sent_at`
 - `request_received_at`
-- `response_started_at` or `response_first_byte_at`
-- `response_completed_at` or `data_received_at`
+- `response_sent_at`
+- `response_received_at`
 - `persisted_at`
 - `projected_at`
 
-Optional blocked/projection-specific fields:
-
 - `blocked_at`
 - `unblocked_at`
-- `project_attempted_at`
-- `project_succeeded_at`
 
 ## Design constraints
 
@@ -50,32 +65,17 @@ Optional blocked/projection-specific fields:
   - derived spans such as `request_latency_ms`, `receive_to_project_ms`, or
     `blocked_duration_ms`.
 
-## Likely shape
-
-The most direct implementation is a small DB table keyed by `event_id`, for
-example:
-
-- `event_timeline(event_id PRIMARY KEY, ...nullable timestamps...)`
-
-Each stage does an upsert only when it is already touching durable state:
-
-- discovery updates when `wanted` / `wanted_sources` are written,
-- request timestamps update when requests are emitted or received,
-- receipt timestamps update in the ingest/persist path,
-- projection timestamps update when projector state commits.
-
-This avoids storing large queues in memory and keeps observability aligned with
-the durable truth the runtime already uses.
-
 ## Test/reporting follow-up
 
-Once the timeline exists:
-
-- `assert_eventually` should print any available timeline rows for the asserted
-  event on timeout,
-- count-based assertions should print timeline info for the earliest and latest
-  matched event,
-- perf/debug helpers should be able to dump aggregated stage latencies.
+- `assert_eventually` now prints any available timeline row for timed-out
+  `has_event:...` assertions.
+- still missing:
+  - count-based assertions reporting first/last-event timelines
+  - aggregate perf/debug dumps over many rows
+  - optional blocker-specific filtering so guard/dependency waits can be
+    separated from pure receive/project latency
+  - explicit projection-attempt timestamps if we want to distinguish
+    "first try blocked" from "first successful project"
 
 That should make sync bottlenecks explainable without guessing from ad hoc
 daemon logs.

@@ -918,6 +918,7 @@ fn dispatch(
                                 op: op.symbol().to_string(),
                                 expected,
                                 timed_out: false,
+                                debug: None,
                             }),
                             Err(e) => RpcResponse::error(e),
                         }
