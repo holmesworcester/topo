@@ -5,7 +5,6 @@ EXTENDS FiniteSets, TLC
 \* specs. This module does not model where authorization comes from; it models
 \* how exact local-target routing and exact outbound remote matching consume a
 \* tenant-scoped authorization predicate.
-\
 \* Rust mapping:
 \*   localTarget[t]        → replay-derived local_transport_targets[t]
 \*   authorized[t]         → is_authorized_for_tenant(t, remote_fp)
@@ -34,10 +33,14 @@ VARIABLES
     requestedLocalFP,
     presentedRemoteFP,
     inboundTenant,
+    inboundAuthorizedAtAdmission,
+    inboundTargetResolvedAtAdmission,
+    inboundUniqueAtAdmission,
     inboundAdmitted,
     outboundTenant,
     expectedRemoteFP,
     outboundPresentedFP,
+    outboundAuthorizedAtConnect,
     outboundConnected
 
 Vars ==
@@ -47,10 +50,14 @@ Vars ==
        requestedLocalFP,
        presentedRemoteFP,
        inboundTenant,
+       inboundAuthorizedAtAdmission,
+       inboundTargetResolvedAtAdmission,
+       inboundUniqueAtAdmission,
        inboundAdmitted,
        outboundTenant,
        expectedRemoteFP,
        outboundPresentedFP,
+       outboundAuthorizedAtConnect,
        outboundConnected >>
 
 TypeOK ==
@@ -60,10 +67,14 @@ TypeOK ==
     /\ requestedLocalFP \in LocalFPs \union {NoLocalFP}
     /\ presentedRemoteFP \in RemoteFPs \union {NoRemoteFP}
     /\ inboundTenant \in Tenants \union {NoTenant}
+    /\ inboundAuthorizedAtAdmission \in BOOLEAN
+    /\ inboundTargetResolvedAtAdmission \in BOOLEAN
+    /\ inboundUniqueAtAdmission \in BOOLEAN
     /\ inboundAdmitted \in BOOLEAN
     /\ outboundTenant \in Tenants \union {NoTenant}
     /\ expectedRemoteFP \in RemoteFPs \union {NoRemoteFP}
     /\ outboundPresentedFP \in RemoteFPs \union {NoRemoteFP}
+    /\ outboundAuthorizedAtConnect \in BOOLEAN
     /\ outboundConnected \in BOOLEAN
 
 Init ==
@@ -73,10 +84,14 @@ Init ==
     /\ requestedLocalFP = NoLocalFP
     /\ presentedRemoteFP = NoRemoteFP
     /\ inboundTenant = NoTenant
+    /\ inboundAuthorizedAtAdmission = FALSE
+    /\ inboundTargetResolvedAtAdmission = FALSE
+    /\ inboundUniqueAtAdmission = FALSE
     /\ inboundAdmitted = FALSE
     /\ outboundTenant = NoTenant
     /\ expectedRemoteFP = NoRemoteFP
     /\ outboundPresentedFP = NoRemoteFP
+    /\ outboundAuthorizedAtConnect = FALSE
     /\ outboundConnected = FALSE
 
 NodeAuthorizes(fp) ==
@@ -94,10 +109,14 @@ InstallBootstrapTarget(t, fp) ==
             requestedLocalFP,
             presentedRemoteFP,
             inboundTenant,
+            inboundAuthorizedAtAdmission,
+            inboundTargetResolvedAtAdmission,
+            inboundUniqueAtAdmission,
             inboundAdmitted,
             outboundTenant,
             expectedRemoteFP,
             outboundPresentedFP,
+            outboundAuthorizedAtConnect,
             outboundConnected >>
 
 InstallPeerSharedTarget(t, fp) ==
@@ -111,10 +130,14 @@ InstallPeerSharedTarget(t, fp) ==
             requestedLocalFP,
             presentedRemoteFP,
             inboundTenant,
+            inboundAuthorizedAtAdmission,
+            inboundTargetResolvedAtAdmission,
+            inboundUniqueAtAdmission,
             inboundAdmitted,
             outboundTenant,
             expectedRemoteFP,
             outboundPresentedFP,
+            outboundAuthorizedAtConnect,
             outboundConnected >>
 
 GrantAuth(t, fp) ==
@@ -127,10 +150,14 @@ GrantAuth(t, fp) ==
             requestedLocalFP,
             presentedRemoteFP,
             inboundTenant,
+            inboundAuthorizedAtAdmission,
+            inboundTargetResolvedAtAdmission,
+            inboundUniqueAtAdmission,
             inboundAdmitted,
             outboundTenant,
             expectedRemoteFP,
             outboundPresentedFP,
+            outboundAuthorizedAtConnect,
             outboundConnected >>
 
 RevokeAuth(t, fp) ==
@@ -143,10 +170,14 @@ RevokeAuth(t, fp) ==
             requestedLocalFP,
             presentedRemoteFP,
             inboundTenant,
+            inboundAuthorizedAtAdmission,
+            inboundTargetResolvedAtAdmission,
+            inboundUniqueAtAdmission,
             inboundAdmitted,
             outboundTenant,
             expectedRemoteFP,
             outboundPresentedFP,
+            outboundAuthorizedAtConnect,
             outboundConnected >>
 
 StartInbound(req, remote) ==
@@ -155,6 +186,9 @@ StartInbound(req, remote) ==
     /\ requestedLocalFP' = req
     /\ presentedRemoteFP' = remote
     /\ inboundTenant' = NoTenant
+    /\ inboundAuthorizedAtAdmission' = FALSE
+    /\ inboundTargetResolvedAtAdmission' = FALSE
+    /\ inboundUniqueAtAdmission' = FALSE
     /\ inboundAdmitted' = FALSE
     /\ UNCHANGED
          << localTarget,
@@ -163,6 +197,7 @@ StartInbound(req, remote) ==
             outboundTenant,
             expectedRemoteFP,
             outboundPresentedFP,
+            outboundAuthorizedAtConnect,
             outboundConnected >>
 
 AdmitInbound(t) ==
@@ -171,7 +206,11 @@ AdmitInbound(t) ==
     /\ presentedRemoteFP # NoRemoteFP
     /\ requestedLocalFP = localTarget[t]
     /\ presentedRemoteFP \in authorized[t]
+    /\ \A other \in Tenants \ {t}: requestedLocalFP # localTarget[other]
     /\ inboundTenant' = t
+    /\ inboundAuthorizedAtAdmission' = TRUE
+    /\ inboundTargetResolvedAtAdmission' = TRUE
+    /\ inboundUniqueAtAdmission' = TRUE
     /\ inboundAdmitted' = TRUE
     /\ UNCHANGED
          << localTarget,
@@ -182,12 +221,16 @@ AdmitInbound(t) ==
             outboundTenant,
             expectedRemoteFP,
             outboundPresentedFP,
+            outboundAuthorizedAtConnect,
             outboundConnected >>
 
 ClearInbound ==
     /\ requestedLocalFP' = NoLocalFP
     /\ presentedRemoteFP' = NoRemoteFP
     /\ inboundTenant' = NoTenant
+    /\ inboundAuthorizedAtAdmission' = FALSE
+    /\ inboundTargetResolvedAtAdmission' = FALSE
+    /\ inboundUniqueAtAdmission' = FALSE
     /\ inboundAdmitted' = FALSE
     /\ UNCHANGED
          << localTarget,
@@ -196,6 +239,7 @@ ClearInbound ==
             outboundTenant,
             expectedRemoteFP,
             outboundPresentedFP,
+            outboundAuthorizedAtConnect,
             outboundConnected >>
 
 StartOutbound(t, expected, presented) ==
@@ -205,6 +249,7 @@ StartOutbound(t, expected, presented) ==
     /\ outboundTenant' = t
     /\ expectedRemoteFP' = expected
     /\ outboundPresentedFP' = presented
+    /\ outboundAuthorizedAtConnect' = FALSE
     /\ outboundConnected' = FALSE
     /\ UNCHANGED
          << localTarget,
@@ -213,6 +258,9 @@ StartOutbound(t, expected, presented) ==
             requestedLocalFP,
             presentedRemoteFP,
             inboundTenant,
+            inboundAuthorizedAtAdmission,
+            inboundTargetResolvedAtAdmission,
+            inboundUniqueAtAdmission,
             inboundAdmitted >>
 
 CompleteOutbound ==
@@ -221,6 +269,7 @@ CompleteOutbound ==
     /\ outboundPresentedFP # NoRemoteFP
     /\ expectedRemoteFP = outboundPresentedFP
     /\ outboundPresentedFP \in authorized[outboundTenant]
+    /\ outboundAuthorizedAtConnect' = TRUE
     /\ outboundConnected' = TRUE
     /\ UNCHANGED
          << localTarget,
@@ -229,6 +278,9 @@ CompleteOutbound ==
             requestedLocalFP,
             presentedRemoteFP,
             inboundTenant,
+            inboundAuthorizedAtAdmission,
+            inboundTargetResolvedAtAdmission,
+            inboundUniqueAtAdmission,
             inboundAdmitted,
             outboundTenant,
             expectedRemoteFP,
@@ -238,6 +290,7 @@ ClearOutbound ==
     /\ outboundTenant' = NoTenant
     /\ expectedRemoteFP' = NoRemoteFP
     /\ outboundPresentedFP' = NoRemoteFP
+    /\ outboundAuthorizedAtConnect' = FALSE
     /\ outboundConnected' = FALSE
     /\ UNCHANGED
          << localTarget,
@@ -246,6 +299,9 @@ ClearOutbound ==
             requestedLocalFP,
             presentedRemoteFP,
             inboundTenant,
+            inboundAuthorizedAtAdmission,
+            inboundTargetResolvedAtAdmission,
+            inboundUniqueAtAdmission,
             inboundAdmitted >>
 
 Next ==
@@ -277,22 +333,19 @@ InvLocalTargetConsistent ==
 InvInboundAdmittedAuthorized ==
     inboundAdmitted =>
         /\ inboundTenant \in Tenants
-        /\ requestedLocalFP = localTarget[inboundTenant]
-        /\ presentedRemoteFP \in authorized[inboundTenant]
+        /\ inboundAuthorizedAtAdmission
+        /\ inboundTargetResolvedAtAdmission
 
 InvNoCrossTenantFallback ==
-    inboundAdmitted =>
-        \A t \in Tenants \ {inboundTenant}:
-            requestedLocalFP # localTarget[t]
+    inboundAdmitted => inboundUniqueAtAdmission
 
 InvNodeGateSound ==
-    inboundAdmitted =>
-        NodeAuthorizes(presentedRemoteFP)
+    inboundAdmitted => inboundAuthorizedAtAdmission
 
 InvOutboundConnectedAuthorized ==
     outboundConnected =>
         /\ outboundTenant \in Tenants
+        /\ outboundAuthorizedAtConnect
         /\ expectedRemoteFP = outboundPresentedFP
-        /\ outboundPresentedFP \in authorized[outboundTenant]
 
 =============================================================================
