@@ -291,6 +291,10 @@ fn frame_detail_json(frame: &Frame, capture_full_ids: bool) -> Option<String> {
             }))
             .ok()
         }
+        Frame::RequestCredit { credits } => serde_json::to_string(&json!({
+            "credits": credits
+        }))
+        .ok(),
         Frame::Event { blob } => {
             let event_id = hash_event(blob);
             serde_json::to_string(&json!({
@@ -309,6 +313,7 @@ fn frame_type(frame: &Frame) -> &'static str {
         Frame::NegOpen { .. } => "NegOpen",
         Frame::NegMsg { .. } => "NegMsg",
         Frame::HaveList { .. } => "HaveList",
+        Frame::RequestCredit { .. } => "RequestCredit",
         Frame::Event { .. } => "Event",
         Frame::Done => "Done",
         Frame::DoneAck => "DoneAck",

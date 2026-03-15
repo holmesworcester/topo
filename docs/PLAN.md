@@ -1123,23 +1123,26 @@ Required changes from the 1:1 sync model:
      `dirty_hot`, cold-timer, backlog-exhaustion, or source-set-change triggers and
      updates SQL truth (`wanted`, candidate sources, peer egress),
    - a **sender/request loop** (higher-rate) that keeps QUIC streams full from that
-     SQL truth using leased windows.
+     SQL truth by draining push egress, advertising source-side request credit,
+     and filling bounded in-memory pull windows.
 5. **Receiver-driven wanted scheduling.** Pull balancing happens at the sink, not
    inside Negentropy. `wanted(event_id, ...)` records demand, and
    `wanted_sources(event_id, peer_id, first_seen_at, last_seen_at,
    priority_lane, priority_ts)` records candidate suppliers discovered by the
    observer loop.
 6. **Per-peer request windows.** The sender/request loop continuously chooses the
-   next wanted rows for each peer from SQL so active peers stay busy:
+   next wanted rows for each peer from SQL whenever that peer advertises spare
+   request credit:
+   - keep durable demand in SQLite and keep per-peer request suppression only in memory,
    - cap in-flight requests per peer,
-   - only claim rows that are currently unleased or expired,
-   - allow another candidate to take a wanted event after release or lease expiry,
+   - allow aggressive duplicate requests across peers when spare credit exists,
    - preserve lane priority (foreground before bulk, newest first within lane).
-   This keeps QUIC full without embedding balancing policy in Negentropy.
+   This keeps QUIC full without embedding balancing policy in Negentropy or paying
+   SQLite churn for every individual request.
 7. **Push and pull share one scheduling model.** Push traffic drains peer egress
-   from leased SQL-backed send windows. Pull traffic fills per-peer wanted request
-   windows from SQL-backed demand state. Both loops are peer-scoped, priority-aware,
-   and low-memory because they lease IDs, not bulk blobs.
+   from leased SQL-backed send windows. Pull traffic fills per-peer request windows
+   from SQL-backed demand state plus source-advertised credit. Both loops are
+   peer-scoped, priority-aware, and low-memory because they hold IDs, not bulk blobs.
 8. **Incremental leased windows, not tiny claim/send cycles.** Once work is known,
    the sender should not round-trip to SQLite on every 1-8 events. It keeps bounded
    in-memory windows of leased row IDs/event IDs, refills below a low-water mark,
@@ -1164,9 +1167,10 @@ Invariants this model is meant to preserve:
 - at most one sender owner drains a peer slot's egress at a time,
 - no balancing logic is embedded in Negentropy,
 - the sink can keep active peers busy whenever candidate supply exists,
-- a slow source does not own events by fiat; another candidate can take over,
+- a slow source does not own events by fiat; another candidate can be used as soon
+  as spare credit exists,
 - multi-source fairness is across distinct peers, not multiplied by duplicate connections,
-- low-memory mode bounds blob residency while still allowing larger leased-ID windows,
+- low-memory mode bounds blob residency while still allowing larger in-memory ID windows,
 - hot/cold cadence does not split the event universe or completion protocol.
 
 ---

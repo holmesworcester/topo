@@ -1195,7 +1195,7 @@ Peer runtime worker shape:
    - claim batch, project each event in autocommit (`valid|block|reject`), batch-dequeue successes, mark retry on failure. `project_queue` stores priority metadata but currently only uses lane priority at claim time: foreground before bulk, then FIFO within the lane (`priority_lane`, then `available_at`, then `rowid`) so dependency-heavy foreground chains are not recency-reordered. WAL autocheckpoint deferred during drain (skipped in low_mem mode).
 3. `PeerReplicator` per authenticated peer slot:
    - **observer loop** (lower-rate): connect/full-sync start, `dirty_hot`, cold timer, backlog exhaustion, or source-set change trigger negentropy observation; the observer updates SQL truth (`wanted`, candidate sources, peer egress rows) but does not attempt to keep the wire full itself.
-   - **sender/request loop** (higher-rate): continuously keeps per-peer QUIC streams fed from leased SQL-backed windows. It drains peer egress for push traffic and maintains sink-side wanted request windows for pull traffic.
+   - **sender/request loop** (higher-rate): continuously keeps per-peer QUIC streams fed. It drains peer egress for push traffic, advertises source-side request credit, and maintains sink-side pull in-flight state in bounded memory.
 4. cleanup worker:
    - reclaim expired leases, purge stale/sent operational rows, TTL endpoint cleanup.
 
@@ -1252,23 +1252,22 @@ Negentropy does discovery only:
 The sink-side sender/request loop does balancing:
 1. `wanted(event_id, ...)` records that the sink still needs an event,
 2. `wanted_sources(event_id, peer_id, first_seen_at, last_seen_at, priority_lane, priority_ts)` records which peers appear to have it,
-3. request-lease fields on `wanted` record which peer currently owns the in-flight request,
-4. the request scheduler keeps each peer's request window full by choosing the next wanted rows from SQL,
-5. source selection uses live lease state and per-peer watermarks, not deterministic hash ownership:
-   - cap in-flight requests per peer,
-   - only claim rows that are currently unleased or expired,
-   - allow another candidate peer to take the same wanted event after release or lease expiry,
-   - preserve lane priority (foreground before bulk, newest first within lane).
+3. the sink keeps only durable demand and candidate-supplier truth in SQLite; per-peer in-flight request suppression is bounded memory state,
+4. the source advertises request credit when its response pipeline falls below a low watermark,
+5. the sink request scheduler fills that credit by choosing the next wanted rows for that peer from SQL,
+6. duplicate requests are allowed aggressively when spare peer credit exists; the system prefers keeping active peers busy over perfectly suppressing duplicate pulls.
 
 This means:
 - negentropy discovers supply,
 - `wanted` models demand,
+- `wanted_sources` models candidate supply,
+- source-advertised credit tells the sink when more pull work can be sent,
 - the sender/request loop is the actuator that balances traffic and keeps QUIC full.
 
 Key properties:
 - no balancing logic is embedded in negentropy,
 - the sink can always keep active peers busy if candidate supply exists,
-- a slow source does not own events by fiat; another candidate can be chosen,
+- a slow source does not own events by fiat; another candidate can be used immediately once there is spare credit,
 - multi-source fairness is across distinct peers, not multiplied by duplicate connections,
 - push traffic and pull traffic share one scheduling model instead of two different balancing stories.
 

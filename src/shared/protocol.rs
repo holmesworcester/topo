@@ -11,6 +11,7 @@ pub fn neg_id_to_event_id(id: &Id) -> EventId {
 pub const MSG_TYPE_NEG_OPEN: u8 = 0x10; // Initial negentropy message
 pub const MSG_TYPE_NEG_MSG: u8 = 0x11; // Negentropy response
 pub const MSG_TYPE_HAVE_LIST: u8 = 0x12; // List of IDs client needs from server
+pub const MSG_TYPE_REQUEST_CREDIT: u8 = 0x13; // Source-advertised request credit
 pub const MSG_TYPE_EVENT: u8 = 0x03; // Event blob (variable length)
 pub const MSG_TYPE_DONE: u8 = 0x20; // Initiator signals all events sent
 pub const MSG_TYPE_DONE_ACK: u8 = 0x21; // Responder acknowledges done
@@ -31,6 +32,8 @@ pub enum Frame {
     NegMsg { msg: Vec<u8> },
     /// List of event IDs the client needs from server (32 bytes each)
     HaveList { ids: Vec<[u8; 32]> },
+    /// Source-advertised request credit (count-based initial version)
+    RequestCredit { credits: u32 },
     /// Send full event blob (variable length)
     Event { blob: Vec<u8> },
     /// Initiator signals all outgoing events have been sent
@@ -103,6 +106,13 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
                 ids.push(id);
             }
             Ok((Frame::HaveList { ids }, total_size))
+        }
+        MSG_TYPE_REQUEST_CREDIT => {
+            if input.len() < 5 {
+                return Err(ParseError::InsufficientData);
+            }
+            let credits = u32::from_le_bytes([input[1], input[2], input[3], input[4]]);
+            Ok((Frame::RequestCredit { credits }, 5))
         }
         MSG_TYPE_EVENT => {
             // Variable length: type(1) + len(4) + blob(len)
@@ -194,6 +204,12 @@ pub fn encode_frame(msg: &Frame) -> Vec<u8> {
             for id in ids {
                 buf.extend_from_slice(id);
             }
+            buf
+        }
+        Frame::RequestCredit { credits } => {
+            let mut buf = Vec::with_capacity(5);
+            buf.push(MSG_TYPE_REQUEST_CREDIT);
+            buf.extend_from_slice(&credits.to_le_bytes());
             buf
         }
         Frame::Event { blob } => {
@@ -478,5 +494,14 @@ mod tests {
         } else {
             panic!("expected HaveList");
         }
+    }
+
+    #[test]
+    fn test_request_credit_roundtrip() {
+        let msg = Frame::RequestCredit { credits: 42 };
+        let encoded = encode_frame(&msg);
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(parsed, msg);
     }
 }

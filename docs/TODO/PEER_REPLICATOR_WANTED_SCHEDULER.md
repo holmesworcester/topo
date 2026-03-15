@@ -29,4 +29,17 @@ Implementation follow-up:
    - when projection blocks on missing deps, insert those missing event IDs into `wanted`,
    - once candidate suppliers are observed, let the same request scheduler prioritize them,
    - preserve a way to rank blockers above ordinary catchup once the lane/priority story is implemented end-to-end.
-9. If the initial lease-based scheduler still needs better fairness under source stalls, add explicit per-peer backoff / retry metadata on top of the current `wanted` lease fields rather than moving balancing back into negentropy.
+9. Keep the first request scheduler simple:
+   - durable truth is only `wanted + wanted_sources`,
+   - per-peer request credit and in-flight suppression stay in memory,
+   - duplicate pulls are allowed aggressively when spare peer credit exists.
+10. Future follow-ups:
+   - split encrypted wrapper types into explicit outer types such as
+     `encrypted_message`, `encrypted_reaction`, `encrypted_file_slice` so
+     discovery can carry only `event_id + timestamp + type_code`,
+   - derive size class / byte-credit mapping from the registry rather than
+     from ad hoc SQL priority metadata,
+   - keep hot/cold observer cadences, where hot is fast/shallow and cold is
+     slow/deep over the same event universe,
+   - add richer prioritization for auth / blockers / dependency discovery once
+     the initial credit-driven request loop is settled.

@@ -33,7 +33,7 @@ use crate::tuning::{low_mem_memtrace, low_mem_mode};
 
 use super::control_plane::{
     append_have_ids_to_pending, observe_need_ids_for_peer, refill_wanted_requests, send_done,
-    send_initial_neg_open,
+    send_initial_neg_open, PeerRequestWindow,
 };
 use super::coordinator::PeerCoord;
 use super::data_plane::{
@@ -177,6 +177,7 @@ where
     let reconcile_start = Instant::now();
     // Pending have_ids buffer: populated by reconciliation, drained incrementally
     let mut pending_have: Vec<EventId> = Vec::new();
+    let mut request_window = PeerRequestWindow::default();
 
     let mut last_bytes_received = 0u64;
     let mut last_egress_log = Instant::now();
@@ -257,6 +258,10 @@ where
                 completed = true;
                 break;
             }
+            Ok(Ok(Frame::RequestCredit { credits })) => {
+                last_activity = Instant::now();
+                request_window.add_credit(credits as usize);
+            }
             Ok(Ok(_)) => {}
             Ok(Err(ConnectionError::Closed)) => {
                 if should_treat_as_startup_control_abort(rounds, events_sent, &bytes_received) {
@@ -308,7 +313,7 @@ where
             );
         }
         let requested_now =
-            refill_wanted_requests(&mut control, &wanted, peer_id, session_owner).await?;
+            refill_wanted_requests(&mut control, &wanted, peer_id, &mut request_window).await?;
         if requested_now > 0 {
             last_activity = Instant::now();
         }
@@ -341,12 +346,7 @@ where
                 .count_outstanding(peer_id, session_owner)
                 .unwrap_or(-1);
             let wanted_pending = wanted.count().unwrap_or(-1);
-            let wanted_peer_backlog = wanted
-                .count_backlog_for_peer(peer_id, session_owner)
-                .unwrap_or(-1);
-            let wanted_peer_outstanding = wanted
-                .count_outstanding_for_peer(peer_id, session_owner)
-                .unwrap_or(-1);
+            let wanted_peer_backlog = wanted.count_backlog_for_peer(peer_id).unwrap_or(-1);
             let ingest_cap = ingest_tx.max_capacity();
             let ingest_used = ingest_cap.saturating_sub(ingest_tx.capacity());
             let sqlite_global = memtrace::sqlite_global_memory();
@@ -354,7 +354,7 @@ where
             let sqlite_neg = memtrace::sqlite_db_memory(&neg_db);
             let allocator = memtrace::allocator_memory();
             let line = format!(
-                "LOWMEM_MEMTRACE initiator peer={} rounds={} have={} need={} have_cap={} need_cap={} pending_have={} pending_have_cap={} wanted_total={} wanted_peer_backlog={} wanted_peer_outstanding={} egress_pending={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_main_cache={} db_main_schema={} db_main_stmt={} db_neg_cache={} db_neg_schema={} db_neg_stmt={} mall_arena={} mall_used={} mall_free={} mall_mmap={} bytes_rx={} bytes_tx={}",
+                "LOWMEM_MEMTRACE initiator peer={} rounds={} have={} need={} have_cap={} need_cap={} pending_have={} pending_have_cap={} wanted_total={} wanted_peer_backlog={} request_inflight={} request_credit={} egress_pending={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_main_cache={} db_main_schema={} db_main_stmt={} db_neg_cache={} db_neg_schema={} db_neg_stmt={} mall_arena={} mall_used={} mall_free={} mall_mmap={} bytes_rx={} bytes_tx={}",
                 peer_id,
                 rounds,
                 have_ids.len(),
@@ -365,7 +365,8 @@ where
                 pending_have.capacity(),
                 wanted_pending,
                 wanted_peer_backlog,
-                wanted_peer_outstanding,
+                request_window.inflight_len(),
+                request_window.available_credit(),
                 egress_pending,
                 ingest_used,
                 ingest_cap,
@@ -394,9 +395,7 @@ where
             last_memtrace = Instant::now();
         }
 
-        let pending_wanted_backlog = wanted
-            .count_backlog_for_peer(peer_id, session_owner)
-            .unwrap_or(0);
+        let pending_wanted_backlog = wanted.count_backlog_for_peer(peer_id).unwrap_or(0);
         let egress_pending = egress
             .count_outstanding(peer_id, session_owner)
             .unwrap_or(0);
@@ -427,6 +426,8 @@ where
                         "pending_have": pending_have.len(),
                         "need_ids": need_ids.len(),
                         "wanted_peer_backlog": pending_wanted_backlog,
+                        "request_inflight": request_window.inflight_len(),
+                        "request_credit": request_window.available_credit(),
                         "egress_pending": egress_pending,
                         "wanted_pending": wanted.count().unwrap_or(-1),
                     }))

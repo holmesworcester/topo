@@ -27,20 +27,24 @@ The sink-side request scheduler is the actuator for pull traffic.
 Its job is only to answer:
 
 - which wanted IDs should this peer be asked for next,
-- how many should be in flight to this peer right now,
-- when should a stalled lease be released so another peer can take over.
+- how much source-advertised request credit should be filled for this peer right now.
 
 SQL truth:
 
 - `wanted_events`: global demand, one row per missing event,
-- `wanted_sources`: candidate suppliers per event/peer,
-- request lease fields on `wanted_events`: which peer currently owns the in-flight request.
+- `wanted_sources`: candidate suppliers per event/peer.
+
+Memory-only control state:
+
+- per-peer request credit,
+- per-peer in-flight requested IDs,
+- optional short-lived retry / timeout bookkeeping.
 
 This is where balancing lives:
 
-- one peer should not request the same event concurrently with another unless a lease expires or is explicitly relaxed,
-- multiple peers can still be kept busy because they claim different unleased wanted rows from the same sink demand table,
-- a slow or dead peer does not own work forever because leases expire or are released on session end.
+- the sink can prefer not to duplicate requests, but duplicate pulls are allowed when spare peer credit exists,
+- multiple peers can be kept busy because each peer plans requests independently from the same durable demand table,
+- a slow or dead peer does not own work forever because in-flight request suppression is bounded memory state rather than durable ownership.
 
 ## 3. Send / Response
 
@@ -65,7 +69,7 @@ This separates three concerns cleanly:
 1. **Discovery** is expensive and low-rate.
    - Negentropy, snapshots, candidate-source updates.
 2. **Request selection** is cheap and high-rate.
-   - Claim wanted leases, keep request windows full.
+   - Fill source-advertised request credit from `wanted + wanted_sources`.
 3. **Data send** is cheap and high-rate.
    - Drain leased windows and keep QUIC streams fed.
 
@@ -81,7 +85,8 @@ The intended invariants are:
 - wanted demand is recorded once per event, independent of how many peers may satisfy it,
 - candidate source membership is recorded separately from demand,
 - pull balancing is sink-driven, not embedded in negentropy,
-- a peer can only claim currently unleased or expired wanted work,
+- per-peer pull in-flight state is bounded in memory and does not scale with total workspace size,
+- once persisted locally, an event cannot become wanted again from stale observation,
 - later sync rounds can rediscover supply without changing the balancing story,
 - low-memory mode keeps many leased IDs possible while blob residency stays small.
 
@@ -92,7 +97,8 @@ The current code is an incremental form of this model rather than the final
 
 - initiator session still contains both the observer and request-refill loops,
 - responder session still contains the send loop for pull responses,
-- `wanted` + `wanted_sources` are already the durable sink-side balancing truth.
+- `wanted` + `wanted_sources` are already the durable sink-side discovery truth,
+- request credit and in-flight request suppression are already memory-only.
 
 That is enough to make the sink-driven scheduler real before the larger actor
 refactor.

@@ -138,6 +138,26 @@ pub fn wanted_refill_quantum() -> usize {
     }
 }
 
+pub fn request_credit_high_watermark() -> usize {
+    wanted_high_watermark()
+}
+
+pub fn request_credit_low_watermark() -> usize {
+    wanted_low_watermark()
+}
+
+pub fn request_inflight_ttl_ms() -> i64 {
+    if low_mem_mode() {
+        read_usize_env("LOW_MEM_REQUEST_INFLIGHT_TTL_MS")
+            .unwrap_or(5_000)
+            .max(1) as i64
+    } else {
+        read_usize_env("P7_REQUEST_INFLIGHT_TTL_MS")
+            .unwrap_or(5_000)
+            .max(1) as i64
+    }
+}
+
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn apply_low_mem_allocator_tuning() {
     if !low_mem_mode() {

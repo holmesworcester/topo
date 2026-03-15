@@ -27,9 +27,11 @@ use crate::runtime::SyncStats;
 use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
-use crate::tuning::{low_mem_memtrace, low_mem_mode};
+use crate::tuning::{
+    low_mem_memtrace, low_mem_mode, request_credit_high_watermark, request_credit_low_watermark,
+};
 
-use super::control_plane::send_done_ack;
+use super::control_plane::{send_done_ack, send_request_credit};
 use super::data_plane::{drain_egress_to_data_stream, send_data_done, spawn_data_receiver};
 use super::logging::{SyncRunCapture, SyncRunRxCapture};
 use super::windowing::{decode_initial_neg_open, SyncWindow, SyncWindowKind};
@@ -170,6 +172,7 @@ where
     let reconcile_start = Instant::now();
     let mut last_bytes_received = 0u64;
     let mut reconciling = false;
+    let mut request_credit_available: usize = 0;
     let memtrace_enabled = low_mem_memtrace();
     let memtrace_interval = Duration::from_secs(2);
     let memtrace_file = std::env::var("LOW_MEM_MEMTRACE_FILE").ok();
@@ -179,6 +182,9 @@ where
     let idle_capture_enabled = send_idle_capture_enabled() && capture.is_some();
     let mut last_send_progress = Instant::now();
     let mut last_idle_marker = Instant::now();
+
+    let credit_high = request_credit_high_watermark().max(1);
+    let credit_low = request_credit_low_watermark().min(credit_high.saturating_sub(1));
 
     loop {
         // Data receiver runs in a separate task — check if it received data
@@ -234,6 +240,12 @@ where
                             rounds,
                             reconcile_start.elapsed().as_millis()
                         );
+                    } else if peer_done {
+                        info!(
+                            "Dropping late NegMsg after peer Done: rounds={}, response_bytes={}",
+                            rounds,
+                            response.len()
+                        );
                     } else {
                         control.send(&Frame::NegMsg { msg: response }).await?;
                         control.flush().await?;
@@ -285,6 +297,7 @@ where
                 if ids.is_empty() {
                     continue;
                 }
+                request_credit_available = request_credit_available.saturating_sub(ids.len());
                 egress
                     .enqueue_events(peer_id, &ids)
                     .map_err(|e| format!("failed to enqueue HaveList ids: {e}"))?;
@@ -325,27 +338,40 @@ where
             last_send_progress = Instant::now();
         }
 
+        let egress_pending = egress
+            .count_outstanding(peer_id, session_owner)
+            .unwrap_or(0);
+        if neg_req_tx.is_some() && !peer_done {
+            let egress_pending_usize = usize::try_from(egress_pending).unwrap_or(usize::MAX);
+            let outstanding_or_reserved = egress_pending_usize.saturating_add(request_credit_available);
+            if outstanding_or_reserved <= credit_low {
+                let grant = credit_high.saturating_sub(outstanding_or_reserved);
+                if grant > 0 {
+                    send_request_credit(&mut control, grant).await?;
+                    request_credit_available = request_credit_available.saturating_add(grant);
+                }
+            }
+        }
+
         if low_mem_mode() && last_alloc_trim.elapsed() >= Duration::from_millis(100) {
             let _ = memtrace::allocator_trim();
             last_alloc_trim = Instant::now();
         }
 
         if memtrace_enabled && last_memtrace.elapsed() >= memtrace_interval {
-            let egress_pending = egress
-                .count_outstanding(peer_id, session_owner)
-                .unwrap_or(-1);
             let ingest_cap = ingest_tx.max_capacity();
             let ingest_used = ingest_cap.saturating_sub(ingest_tx.capacity());
             let sqlite_global = memtrace::sqlite_global_memory();
             let sqlite_db = memtrace::sqlite_db_memory(&db);
             let allocator = memtrace::allocator_memory();
             let line = format!(
-                "LOWMEM_MEMTRACE responder peer={} rounds={} reconciling={} peer_done={} egress_pending={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_cache={} db_schema={} db_stmt={} mall_arena={} mall_used={} mall_free={} mall_mmap={} bytes_rx={} bytes_tx={}",
+                "LOWMEM_MEMTRACE responder peer={} rounds={} reconciling={} peer_done={} egress_pending={} request_credit_available={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_cache={} db_schema={} db_stmt={} mall_arena={} mall_used={} mall_free={} mall_mmap={} bytes_rx={} bytes_tx={}",
                 peer_id,
                 rounds,
                 reconciling,
                 peer_done,
                 egress_pending,
+                request_credit_available,
                 ingest_used,
                 ingest_cap,
                 sqlite_global.map(|s| s.memory_used_bytes).unwrap_or(-1),
@@ -369,10 +395,6 @@ where
             memtrace::emit(&line, memtrace_file.as_deref());
             last_memtrace = Instant::now();
         }
-
-        let egress_pending = egress
-            .count_outstanding(peer_id, session_owner)
-            .unwrap_or(0);
 
         if idle_capture_enabled
             && !completed
@@ -398,6 +420,7 @@ where
                         "reconciling": reconciling,
                         "peer_done": peer_done,
                         "egress_pending": egress_pending,
+                        "request_credit_available": request_credit_available,
                     }))
                     .ok(),
                 );

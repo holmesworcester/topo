@@ -250,11 +250,13 @@ async fn test_egress_queue_lifecycle() {
     let pending = eq.count_pending(conn_id).unwrap();
     assert_eq!(pending, 0);
 
-    // mark_sent now deletes rows, so cleanup_sent finds nothing
-    let purged = eq.cleanup_sent(300_000).unwrap();
-    assert_eq!(purged, 0);
+    // mark_sent leaves short-lived tombstones, so immediate re-enqueue is suppressed
+    let enqueued = eq.enqueue_events(conn_id, &[msg1, msg2]).unwrap();
+    assert_eq!(enqueued, 0);
 
-    // Re-enqueue should work (sent rows are deleted, dedup index cleared)
+    // Once the session-specific sent tombstones are cleared, re-enqueue works again.
+    let purged = eq.cleanup_sent_for_connection(conn_id, 0).unwrap();
+    assert_eq!(purged, 3);
     let enqueued = eq.enqueue_events(conn_id, &[msg1, msg2]).unwrap();
     assert_eq!(enqueued, 2);
 

@@ -9,10 +9,18 @@ use crate::crypto::{event_id_to_base64, EventId};
 ///
 /// `wanted_events` records demand exactly once per event ID.
 /// `wanted_sources` records which peers appear to have that event.
-/// A request lease on `wanted_events` prevents multiple peers from being asked
-/// for the same event concurrently unless the lease expires or is released.
+/// Pull-side in-flight suppression is now bounded memory state. The durable
+/// lease columns remain only as transitional cleanup / test scaffolding.
 pub struct WantedEvents<'a> {
     conn: &'a Connection,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct WantedCandidate {
+    pub event_id: EventId,
+    pub priority_lane: i64,
+    pub priority_ts: i64,
+    pub first_seen_at: i64,
 }
 
 pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
@@ -121,11 +129,58 @@ impl<'a> WantedEvents<'a> {
         })
     }
 
-    /// Claim up to `limit` wanted events for `peer_id`.
+    /// Load candidate request rows for `peer_id`, ordered by current priority.
+    pub fn list_candidates_for_peer(
+        &self,
+        peer_id: &str,
+        limit: usize,
+    ) -> SqliteResult<Vec<WantedCandidate>> {
+        if limit == 0 {
+            return Ok(Vec::new());
+        }
+        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
+        with_sqlite_busy_retry(|| {
+            let mut stmt = self.conn.prepare(
+                "SELECT we.id, ws.priority_lane, ws.priority_ts, we.first_seen_at
+                 FROM wanted_events we
+                 INNER JOIN wanted_sources ws
+                    ON ws.event_id = we.id
+                 WHERE ws.peer_id = ?1
+                 ORDER BY
+                    ws.priority_lane ASC,
+                    ws.priority_ts DESC,
+                    ws.first_seen_at ASC,
+                    we.first_seen_at ASC,
+                    ws.rowid ASC
+                 LIMIT ?2",
+            )?;
+            let rows = stmt.query_map(params![peer_id, limit_i64], |row| {
+                let blob: Vec<u8> = row.get(0)?;
+                let mut event_id = [0u8; 32];
+                if blob.len() != 32 {
+                    return Err(rusqlite::Error::InvalidColumnType(
+                        0,
+                        "id".to_string(),
+                        rusqlite::types::Type::Blob,
+                    ));
+                }
+                event_id.copy_from_slice(&blob);
+                Ok(WantedCandidate {
+                    event_id,
+                    priority_lane: row.get(1)?,
+                    priority_ts: row.get(2)?,
+                    first_seen_at: row.get(3)?,
+                })
+            })?;
+            rows.collect::<Result<Vec<_>, _>>()
+        })
+    }
+
+    /// Legacy transitional API: claim up to `limit` wanted events for `peer_id`.
     ///
-    /// Only unleased or expired rows are claimable. The returned IDs are now
-    /// leased to `(peer_id, lease_owner)` until `lease_ms` elapses or the lease
-    /// is released explicitly.
+    /// The hot path no longer uses durable request leases; current pull
+    /// scheduling keeps only demand/source truth in SQLite and tracks in-flight
+    /// requests in memory.
     pub fn claim_for_peer(
         &self,
         peer_id: &str,
@@ -188,7 +243,8 @@ impl<'a> WantedEvents<'a> {
         })
     }
 
-    /// Count in-flight wanted requests currently leased to `(peer_id, lease_owner)`.
+    /// Legacy transitional API: count durable wanted-request leases currently
+    /// held by `(peer_id, lease_owner)`.
     pub fn count_outstanding_for_peer(&self, peer_id: &str, lease_owner: &str) -> SqliteResult<i64> {
         let now = current_timestamp_ms();
         with_sqlite_busy_retry(|| {
@@ -206,30 +262,24 @@ impl<'a> WantedEvents<'a> {
     }
 
     /// Count all work this peer can still make progress on:
-    /// rows already leased to `(peer_id, lease_owner)` plus rows that are
-    /// currently unleased/expired and list this peer as a candidate source.
-    pub fn count_backlog_for_peer(&self, peer_id: &str, lease_owner: &str) -> SqliteResult<i64> {
-        let now = current_timestamp_ms();
+    /// distinct wanted rows that currently list this peer as a candidate
+    /// source. Request in-flight suppression is now memory-only.
+    pub fn count_backlog_for_peer(&self, peer_id: &str) -> SqliteResult<i64> {
         with_sqlite_busy_retry(|| {
             self.conn.query_row(
                 "SELECT COUNT(DISTINCT we.id)
                  FROM wanted_events we
                  INNER JOIN wanted_sources ws
                     ON ws.event_id = we.id
-                 WHERE ws.peer_id = ?1
-                   AND (
-                        (we.lease_peer_id = ?1 AND we.lease_owner = ?2
-                         AND we.lease_expires_at IS NOT NULL AND we.lease_expires_at > ?3)
-                        OR we.lease_expires_at IS NULL
-                        OR we.lease_expires_at <= ?3
-                   )",
-                params![peer_id, lease_owner, now],
+                 WHERE ws.peer_id = ?1",
+                params![peer_id],
                 |row| row.get(0),
             )
         })
     }
 
-    /// Release all leases held by `(peer_id, lease_owner)`.
+    /// Legacy transitional API: release all durable request leases held by
+    /// `(peer_id, lease_owner)`.
     pub fn release_peer_leases(&self, peer_id: &str, lease_owner: &str) -> SqliteResult<usize> {
         with_sqlite_busy_retry(|| {
             self.conn.execute(
