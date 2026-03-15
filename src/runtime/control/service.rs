@@ -9,7 +9,9 @@ use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::EventId;
-use crate::db::{open_connection, schema::create_tables, transport_trust::is_peer_allowed};
+use crate::db::{
+    open_connection, schema::create_tables, transport_trust::is_authorized_for_tenant,
+};
 use crate::event_modules::peer_shared;
 use crate::transport::create_dual_endpoint_dynamic;
 use crate::transport::identity::{load_transport_cert_required, load_transport_peer_id};
@@ -220,7 +222,7 @@ pub async fn svc_intro(
     let recorded_by_for_lookup = recorded_by.clone();
     let dynamic_allow = Arc::new(move |peer_fp: &[u8; 32]| {
         let db = open_connection(&db_path_for_lookup)?;
-        is_peer_allowed(&db, &recorded_by_for_lookup, peer_fp)
+        is_authorized_for_tenant(&db, &recorded_by_for_lookup, peer_fp)
     });
     let endpoint =
         create_dual_endpoint_dynamic("0.0.0.0:0".parse().unwrap(), cert, key, dynamic_allow)?;
@@ -589,10 +591,8 @@ pub fn svc_event_deps(
             all_rows.push(row);
             // Parse and find further deps.
             if dep_depth < depth {
-                let items = build_event_list_items(
-                    vec![all_rows.last().unwrap().clone()],
-                    &key_secrets,
-                );
+                let items =
+                    build_event_list_items(vec![all_rows.last().unwrap().clone()], &key_secrets);
                 if let Some(item) = items.first() {
                     for (_, next_dep_id) in &item.deps {
                         if visited.insert(next_dep_id.clone()) {
@@ -945,17 +945,13 @@ mod tests {
             .iter()
             .find(|e| e.event_type == "peer_shared")
             .expect("should have a peer_shared event");
-        assert!(
-            !peer_shared.deps.is_empty(),
-            "peer_shared should have deps"
-        );
+        assert!(!peer_shared.deps.is_empty(), "peer_shared should have deps");
 
         let result = svc_event_deps(&db, &recorded_by, &peer_shared.id, 5).unwrap();
         let root_id = result["root_id"].as_str().unwrap();
         assert_eq!(root_id, peer_shared.id);
 
-        let events: Vec<EventListItem> =
-            serde_json::from_value(result["events"].clone()).unwrap();
+        let events: Vec<EventListItem> = serde_json::from_value(result["events"].clone()).unwrap();
         // Should include the root + at least its direct deps
         assert!(
             events.len() >= 3,
@@ -980,19 +976,16 @@ mod tests {
 
         // depth=0 should return only root
         let d0 = svc_event_deps(&db, &recorded_by, &peer_shared.id, 0).unwrap();
-        let d0_events: Vec<EventListItem> =
-            serde_json::from_value(d0["events"].clone()).unwrap();
+        let d0_events: Vec<EventListItem> = serde_json::from_value(d0["events"].clone()).unwrap();
         assert_eq!(d0_events.len(), 1, "depth=0 should return only root");
 
         // depth=1 should return root + direct deps only
         let d1 = svc_event_deps(&db, &recorded_by, &peer_shared.id, 1).unwrap();
-        let d1_events: Vec<EventListItem> =
-            serde_json::from_value(d1["events"].clone()).unwrap();
+        let d1_events: Vec<EventListItem> = serde_json::from_value(d1["events"].clone()).unwrap();
 
         // depth=5 should return more events than depth=1
         let d5 = svc_event_deps(&db, &recorded_by, &peer_shared.id, 5).unwrap();
-        let d5_events: Vec<EventListItem> =
-            serde_json::from_value(d5["events"].clone()).unwrap();
+        let d5_events: Vec<EventListItem> = serde_json::from_value(d5["events"].clone()).unwrap();
         assert!(
             d5_events.len() >= d1_events.len(),
             "depth=5 ({}) should find >= depth=1 ({})",
@@ -1036,9 +1029,6 @@ mod tests {
             .as_ref()
             .expect("encrypted event should be decryptable");
         assert_eq!(dec.inner_type, "message");
-        assert!(
-            !dec.fields.is_empty(),
-            "decrypted inner should have fields"
-        );
+        assert!(!dec.fields.is_empty(), "decrypted inner should have fields");
     }
 }

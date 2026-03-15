@@ -14,7 +14,7 @@ use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 use crate::contracts::peering_contract::TransportSessionIo;
 use crate::db::open_connection;
 use crate::db::transport_creds::discover_local_tenants;
-use crate::db::transport_trust::is_peer_allowed;
+use crate::db::transport_trust::is_authorized_for_tenant;
 use crate::protocol::{encode_frame, Frame};
 
 use super::connection_lifecycle::{
@@ -109,12 +109,15 @@ pub fn create_runtime_endpoint_for_tenants(
 ) -> Result<TransportEndpoint, Box<dyn std::error::Error + Send + Sync>> {
     // Dynamic allow: queries DB for all local tenants on each TLS handshake.
     // No frozen tenant list — new tenants are recognized immediately.
+    // Tenant-scoped auth is one SQL query (`is_authorized_for_tenant`), but
+    // node-scoped auth still loops because local-tenant discovery is not yet
+    // exposed as one projected SQL relation.
     let db_path = db_path.to_string();
     let dynamic_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
         let db = open_connection(&db_path)?;
         let tenants = discover_local_tenants(&db)?;
         for tenant in &tenants {
-            if is_peer_allowed(&db, &tenant.peer_id, peer_fp)? {
+            if is_authorized_for_tenant(&db, &tenant.peer_id, peer_fp)? {
                 return Ok(true);
             }
         }
@@ -259,7 +262,7 @@ pub fn tenant_trusts_peer(
     peer_fp: [u8; 32],
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
-    is_peer_allowed(&db, tenant_id, &peer_fp)
+    is_authorized_for_tenant(&db, tenant_id, &peer_fp)
 }
 
 pub fn resolve_trusting_tenant(

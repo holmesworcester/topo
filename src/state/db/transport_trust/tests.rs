@@ -241,9 +241,15 @@ fn test_is_peer_allowed_checks_all_sources() {
     )
     .unwrap();
 
-    assert!(is_peer_allowed(&conn, recorded_by, &peer_shared_spki).unwrap());
-    assert!(is_peer_allowed(&conn, recorded_by, &pending_only).unwrap());
-    assert!(!is_peer_allowed(&conn, recorded_by, &denied).unwrap());
+    assert!(is_authorized_for_tenant(&conn, recorded_by, &peer_shared_spki).unwrap());
+    assert!(is_authorized_for_tenant(&conn, recorded_by, &pending_only).unwrap());
+    assert!(!is_authorized_for_tenant(&conn, recorded_by, &denied).unwrap());
+
+    // Compatibility wrapper stays aligned with the canonical auth query.
+    assert_eq!(
+        is_peer_allowed(&conn, recorded_by, &peer_shared_spki).unwrap(),
+        is_authorized_for_tenant(&conn, recorded_by, &peer_shared_spki).unwrap()
+    );
 }
 
 #[test]
@@ -1022,7 +1028,7 @@ fn characterization_trust_check_reads_are_pure() {
     insert_peer_shared(&conn, recorded_by, "ps_se", &pubkey);
 
     // Trust checks should NOT trigger supersession as a side effect
-    let _ = is_peer_allowed(&conn, recorded_by, &spki).unwrap();
+    let _ = is_authorized_for_tenant(&conn, recorded_by, &spki).unwrap();
     let _ = allowed_peers_from_db(&conn, recorded_by).unwrap();
 
     let before_consume_rows: i64 = conn
