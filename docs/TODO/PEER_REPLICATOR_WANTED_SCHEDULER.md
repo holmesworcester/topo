@@ -39,7 +39,19 @@ Implementation follow-up:
      discovery can carry only `event_id + timestamp + type_code`,
    - derive size class / byte-credit mapping from the registry rather than
      from ad hoc SQL priority metadata,
-   - keep hot/cold observer cadences, where hot is fast/shallow and cold is
-     slow/deep over the same event universe,
+   - keep hot/cold observer cadences, where hot runs frequently on the newer
+     range and cold runs less frequently on the older range over the same event
+     universe,
    - add richer prioritization for auth / blockers / dependency discovery once
      the initial credit-driven request loop is settled.
+11. Add first-class perf instrumentation for the request-credit design:
+   - exact sender QUIC idle time / idle percentage, not just sampled `SendIdle`
+     diagnostics,
+   - duplicate-request accounting on the sink, especially "duplicate request
+     issued before every currently eligible wanted ID has been requested at
+     least once",
+   - durable-receipt completion metrics separate from projection completion, so
+     network/request performance can be optimized independently from projector
+     cost,
+   - end-to-end file transfer and catchup benchmarks that report request
+     utilization, durable receive completion, and projection lag separately.
