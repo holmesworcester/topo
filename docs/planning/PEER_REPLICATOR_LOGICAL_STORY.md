@@ -98,6 +98,10 @@ The current code is an incremental form of this model rather than the final
 
 - initiator session still contains both the observer and request-refill loops,
 - request selection itself is already shared tenant-scoped coordinator state rather than per-session local SQL selection,
+- sync handlers are now scoped to authenticated connection lifetime, which is
+  where future connection-scoped request/response state belongs,
+- pull credit, in-flight request suppression, and pending responses still reset
+  with each discovery round because requests still ride per-round control streams,
 - responder session now serves pull responses from a bounded in-memory queue
   rather than SQLite egress,
 - `wanted` + `wanted_sources` are already the durable sink-side discovery truth,

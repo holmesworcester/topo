@@ -1271,6 +1271,17 @@ Key properties:
 - multi-source fairness is across distinct peers, not multiplied by duplicate connections,
 - push traffic and pull traffic share one scheduling model instead of two different balancing stories.
 
+Future work: global fairness above connection-local credit.
+- Connection-local credit should continue to come from local send headroom: the
+  source connection knows whether its response queue and QUIC send path are
+  draining.
+- A later global allocator can cap those local grants across all active
+  connections so one busy peer does not monopolize total upload buffering or
+  response work.
+- The intended shape is `effective_credit = min(local_headroom, global_budget_share)`.
+- This is out of scope for the current refactor; the current implementation only
+  scopes sync handlers to authenticated connections and keeps fairness simple.
+
 ### Connection idempotency
 
 All connectivity producers are allowed to be "hungry" and keep emitting dial
@@ -1310,7 +1321,12 @@ depend on fresh session rounds.
    pull uses bounded in-memory reservation/response windows. Blob residency
    stays small in both cases, so SQLite does not pace the wire and memory does
    not scale with total workspace size.
-5. **Negentropy snapshot ordering.** `BEGIN` still must precede
+5. **Connection-scoped scaffolding.** Sync handlers now belong to one
+   authenticated connection lifetime, which is where future connection-scoped
+   request/response state will live. Sink request credit, in-flight request
+   suppression, and source pending-response queues remain round-scoped until
+   request transport itself stops riding per-round control streams.
+6. **Negentropy snapshot ordering.** `BEGIN` still must precede
    `rebuild_blocks()` so the observer sees a consistent read snapshot.
 
 ## 7.7 Negentropy implementation notes
