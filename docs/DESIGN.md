@@ -109,6 +109,8 @@ Linking a second device follows the invite pattern with `peer_invite_shared` and
 
 Local networking uses mDNS/DNS-SD to discover candidate endpoints per tenant. Those advertisements are treated as unauthenticated hints. They can influence "who to try dialing" but never "who is trusted." Actual authority remains event-sourced and projection-backed: after QUIC+mTLS handshake identifies the remote transport identity, tenant trust checks decide whether the session is allowed to proceed. We rely on a `public-addr` CLI parameter to discover remote peers; in production we expect always-on cloud or non-NAT nodes to be the discoverable peers.
 
+For simplicity, discovery is allowed to remain narrower than steady-state direct trust during bootstrap. In particular, a bootstrap-mode node may only have connectivity to the inviter (or whatever peer supplied the invite bootstrap transport identity) until steady-state transport fingerprints converge through sync; this is an acceptable tradeoff if it keeps transport targeting and authorization strictly fingerprint-based rather than introducing broader workspace-wide admission.
+
 ### Connection Establishment And Endpoint Behavior
 
 Transport runs over QUIC with mTLS, while canonical event authenticity comes from event signatures and dependency validation. We intentionally force cloud-style multitenancy into the core runtime model: one daemon, one UDP port, many local tenants, each with its own workspace binding and trust state. That same mechanism is what enables a Slack/Discord-like local client to host many accounts/workspaces without spinning up one endpoint per account.
@@ -707,7 +709,7 @@ The node daemon (`run_node`) operates as follows:
 
 ### Single-port multi-tenant endpoint
 
-All tenants on a device share a single UDP port. The server uses `WorkspaceCertResolver` to select the correct TLS cert based on the client's SNI hostname (`workspace_sni()` maps workspace_id to a DNS-safe hex label). Outbound connections use `workspace_client_config()` for per-workspace cert presentation.
+All tenants on a device share a single UDP port. The server registers exact local transport-fingerprint aliases so a client can request one specific local transport identity in SNI. Outbound connections target one exact remote transport fingerprint at a time; they are not workspace-wildcard dials.
 
 ### Per-tenant dynamic trust
 

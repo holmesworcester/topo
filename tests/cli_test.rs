@@ -436,20 +436,6 @@ fn invite_bootstrap_peer_id(invite_link: &str) -> String {
     ))
 }
 
-fn query_workspace_id_for_peer(db_path: &str, peer_id: &str) -> String {
-    let conn = open_connection(db_path).expect("open db");
-    conn.query_row(
-        "SELECT workspace_id
-         FROM invites_accepted
-         WHERE recorded_by = ?1
-         ORDER BY created_at DESC, event_id DESC
-         LIMIT 1",
-        rusqlite::params![peer_id],
-        |row| row.get(0),
-    )
-    .expect("workspace id for peer")
-}
-
 fn local_transport_cred_source_exists(db_path: &str, peer_id: &str, source: &str) -> bool {
     let conn = open_connection(db_path).expect("open db");
     conn.query_row(
@@ -534,11 +520,12 @@ fn dial_peer_for_tenant(
     db_path: &str,
     tenant_id: &str,
     remote: SocketAddr,
-    workspace_id: &str,
+    expected_remote_transport_fingerprint: &str,
 ) -> Result<String, String> {
     let client_config = topo::transport::build_tenant_client_config_from_db(db_path, tenant_id)
         .map_err(|e| e.to_string())?;
-    let sni = topo::transport::multi_workspace::workspace_sni(workspace_id);
+    let sni =
+        topo::transport::multi_workspace::transport_sni(expected_remote_transport_fingerprint);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -563,7 +550,6 @@ fn wait_for_direct_trust_dial(
     db_path: &str,
     tenant_id: &str,
     remote: SocketAddr,
-    workspace_id: &str,
     expected_peer_id: &str,
     timeout_ms: u64,
 ) {
@@ -572,7 +558,7 @@ fn wait_for_direct_trust_dial(
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     let last_error = loop {
-        match dial_peer_for_tenant(db_path, tenant_id, remote, workspace_id) {
+        match dial_peer_for_tenant(db_path, tenant_id, remote, expected_peer_id) {
             Ok(peer_id) => {
                 assert_eq!(
                     peer_id, expected_peer_id,
@@ -598,13 +584,18 @@ fn assert_direct_dial_never_succeeds(
     db_path: &str,
     tenant_id: &str,
     remote: SocketAddr,
-    workspace_id: &str,
+    expected_remote_transport_fingerprint: &str,
     timeout_ms: u64,
 ) {
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     while start.elapsed() < timeout {
-        if let Ok(peer_id) = dial_peer_for_tenant(db_path, tenant_id, remote, workspace_id) {
+        if let Ok(peer_id) = dial_peer_for_tenant(
+            db_path,
+            tenant_id,
+            remote,
+            expected_remote_transport_fingerprint,
+        ) {
             panic!(
                 "direct dial to {} as tenant {} unexpectedly succeeded with peer {}",
                 remote, tenant_id, peer_id
@@ -1942,7 +1933,6 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
     );
 
     let bob_peer_id = peer_id_for_username(&bob_db, "bob");
-    let workspace_id = query_workspace_id_for_peer(&bob_db, &bob_peer_id);
     let carol_addr: SocketAddr = daemon_listen_addr(&carol_db)
         .parse()
         .expect("carol listen addr");
@@ -1950,7 +1940,6 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
         &bob_db,
         &bob_peer_id,
         carol_addr,
-        &workspace_id,
         &carol_join.peer_id,
         timeout_ms,
     );
@@ -3373,7 +3362,6 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
     assert_event_visible_for_username(&shared_db, "carol-alpha", &dave_live_eid, timeout_ms);
 
     let carol_peer_id = peer_id_for_username(&shared_db, "carol-alpha");
-    let alpha_workspace_id = query_workspace_id_for_peer(&shared_db, &carol_peer_id);
     let dave_peer_id = peer_id_for_username(&dave.db, "dave-alpha");
     let dave_addr: SocketAddr = daemon_listen_addr(&dave.db)
         .parse()
@@ -3382,7 +3370,6 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
         &shared_db,
         &carol_peer_id,
         dave_addr,
-        &alpha_workspace_id,
         &dave_peer_id,
         timeout_ms,
     );
@@ -3641,8 +3628,6 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
     let yuki_peer_id = peer_id_for_username(&shared_db, "yuki-zeta");
     let dave_peer_id = peer_id_for_username(&dave.db, "dave-alpha");
     let emma_peer_id = peer_id_for_username(&emma.db, "emma-zeta");
-    let alpha_workspace_id = query_workspace_id_for_peer(&shared_db, &bob_peer_id);
-    let zeta_workspace_id = query_workspace_id_for_peer(&shared_db, &yuki_peer_id);
     let dave_addr: SocketAddr = daemon_listen_addr(&dave.db)
         .parse()
         .expect("dave listen addr");
@@ -3654,7 +3639,6 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
         &shared_db,
         &bob_peer_id,
         dave_addr,
-        &alpha_workspace_id,
         &dave_peer_id,
         timeout_ms,
     );
@@ -3662,24 +3646,11 @@ fn test_cli_shared_db_multitenant_mdns_self_filtering_and_cross_workspace_isolat
         &shared_db,
         &yuki_peer_id,
         emma_addr,
-        &zeta_workspace_id,
         &emma_peer_id,
         timeout_ms,
     );
-    assert_direct_dial_never_succeeds(
-        &shared_db,
-        &bob_peer_id,
-        emma_addr,
-        &alpha_workspace_id,
-        5000,
-    );
-    assert_direct_dial_never_succeeds(
-        &shared_db,
-        &yuki_peer_id,
-        dave_addr,
-        &zeta_workspace_id,
-        5000,
-    );
+    assert_direct_dial_never_succeeds(&shared_db, &bob_peer_id, emma_addr, &emma_peer_id, 5000);
+    assert_direct_dial_never_succeeds(&shared_db, &yuki_peer_id, dave_addr, &dave_peer_id, 5000);
 
     assert_peers_eventually_include(
         &shared_db,
