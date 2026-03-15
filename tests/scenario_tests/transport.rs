@@ -11,8 +11,8 @@ use topo::testutil::{
 };
 use topo::transport::{
     create_single_port_endpoint, multi_workspace::transport_sni,
-    multi_workspace::WorkspaceCertResolver, peer_identity_from_connection, workspace_client_config,
-    DynamicAllowFn,
+    multi_workspace::TransportTargetCertResolver, peer_identity_from_connection,
+    workspace_client_config, DynamicAllowFn,
 };
 
 fn allow_from_peer(peer: &Peer) -> Arc<DynamicAllowFn> {
@@ -215,7 +215,7 @@ async fn test_connect_with_presents_correct_tenant_cert() {
         }
     });
 
-    let resolver = Arc::new(WorkspaceCertResolver::new());
+    let resolver = Arc::new(TransportTargetCertResolver::new());
     let (default_cert, default_key) = default_tenant.cert_and_key();
     let client_ep = create_single_port_endpoint(
         "127.0.0.1:0".parse().unwrap(),

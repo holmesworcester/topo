@@ -222,7 +222,7 @@ fn test_expired_pending_invite_bootstrap_not_in_allowlist() {
 }
 
 #[test]
-fn test_is_peer_allowed_checks_all_sources() {
+fn test_is_authorized_for_tenant_checks_all_sources() {
     let conn = open_in_memory().unwrap();
     create_tables(&conn).unwrap();
 
@@ -247,7 +247,7 @@ fn test_is_peer_allowed_checks_all_sources() {
 
     // Compatibility wrapper stays aligned with the canonical auth query.
     assert_eq!(
-        is_peer_allowed(&conn, recorded_by, &peer_shared_spki).unwrap(),
+        is_authorized_for_tenant(&conn, recorded_by, &peer_shared_spki).unwrap(),
         is_authorized_for_tenant(&conn, recorded_by, &peer_shared_spki).unwrap()
     );
 }
@@ -331,18 +331,18 @@ fn test_mutual_trust_requires_both_sides() {
     record_pending_invite_bootstrap_trust(&conn, bob, "invite-b", "ws", &alice_spki).unwrap();
 
     assert!(
-        is_peer_allowed(&conn, alice, &bob_spki).unwrap(),
+        is_authorized_for_tenant(&conn, alice, &bob_spki).unwrap(),
         "alice should trust bob once bob is in alice's trust rows"
     );
     assert!(
-        is_peer_allowed(&conn, bob, &alice_spki).unwrap(),
+        is_authorized_for_tenant(&conn, bob, &alice_spki).unwrap(),
         "bob should trust alice once alice is in bob's trust rows"
     );
 
     // One-sided trust is not mutual auth.
     let carol = "carol";
     assert!(
-        !is_peer_allowed(&conn, carol, &alice_spki).unwrap(),
+        !is_authorized_for_tenant(&conn, carol, &alice_spki).unwrap(),
         "carol has no trust rows and must not trust alice"
     );
 }
@@ -366,9 +366,9 @@ fn test_pending_invite_bootstrap_trust_authorizes() {
     assert!(allowed.contains(&pending_1));
     assert!(allowed.contains(&pending_2));
     assert!(!allowed.contains(&not_pending));
-    assert!(is_peer_allowed(&conn, recorded_by, &pending_1).unwrap());
-    assert!(is_peer_allowed(&conn, recorded_by, &pending_2).unwrap());
-    assert!(!is_peer_allowed(&conn, recorded_by, &not_pending).unwrap());
+    assert!(is_authorized_for_tenant(&conn, recorded_by, &pending_1).unwrap());
+    assert!(is_authorized_for_tenant(&conn, recorded_by, &pending_2).unwrap());
+    assert!(!is_authorized_for_tenant(&conn, recorded_by, &not_pending).unwrap());
 }
 
 #[test]
@@ -382,11 +382,11 @@ fn test_pending_bootstrap_superseded_by_peer_shared() {
 
     record_pending_invite_bootstrap_trust(&conn, recorded_by, "invite-1", "ws", &pending_fp)
         .unwrap();
-    assert!(is_peer_allowed(&conn, recorded_by, &pending_fp).unwrap());
+    assert!(is_authorized_for_tenant(&conn, recorded_by, &pending_fp).unwrap());
 
     insert_peer_shared(&conn, recorded_by, "ps-steady", &pubkey);
     consume_bootstrap_for_peer_shared(&conn, recorded_by, &pubkey).unwrap();
-    assert!(is_peer_allowed(&conn, recorded_by, &pending_fp).unwrap());
+    assert!(is_authorized_for_tenant(&conn, recorded_by, &pending_fp).unwrap());
     let allowed = authorized_fingerprints_from_db(&conn, recorded_by).unwrap();
     assert!(allowed.contains(&pending_fp));
     let remaining_rows: i64 = conn
@@ -411,7 +411,7 @@ fn test_unlisted_fingerprint_not_silently_trusted() {
     let recorded_by = "aaaa";
     let raw_fp: [u8; 32] = [0xEE; 32];
 
-    assert!(!is_peer_allowed(&conn, recorded_by, &raw_fp).unwrap());
+    assert!(!is_authorized_for_tenant(&conn, recorded_by, &raw_fp).unwrap());
     let allowed = authorized_fingerprints_from_db(&conn, recorded_by).unwrap();
     assert!(!allowed.contains(&raw_fp));
 }
@@ -431,11 +431,11 @@ fn test_pending_bootstrap_invites_do_not_collide_on_shared_prefix() {
     record_pending_invite_bootstrap_trust(&conn, recorded_by, "invite-b", "ws", &fp_b).unwrap();
 
     assert!(
-        is_peer_allowed(&conn, recorded_by, &fp_a).unwrap(),
+        is_authorized_for_tenant(&conn, recorded_by, &fp_a).unwrap(),
         "fp_a should be trusted after recording distinct pending bootstrap rows"
     );
     assert!(
-        is_peer_allowed(&conn, recorded_by, &fp_b).unwrap(),
+        is_authorized_for_tenant(&conn, recorded_by, &fp_b).unwrap(),
         "fp_b should be trusted after recording distinct pending bootstrap rows"
     );
 
@@ -823,7 +823,7 @@ fn test_allowed_peers_count_ignores_malformed_rows() {
 ///
 /// After eventization: this row must still be produced (by projection
 /// from the locally-created invite event + bootstrap context), and
-/// is_peer_allowed must still return true for the expected SPKI.
+/// is_authorized_for_tenant must still return true for the expected SPKI.
 #[test]
 fn characterization_inviter_pending_trust_allows_first_dial() {
     let conn = open_in_memory().unwrap();
@@ -845,16 +845,16 @@ fn characterization_inviter_pending_trust_allows_first_dial() {
     )
     .unwrap();
 
-    // Invitee's first dial: transport layer checks is_peer_allowed
+    // Invitee's first dial: transport layer checks is_authorized_for_tenant
     assert!(
-        is_peer_allowed(&conn, inviter_id, &expected_invitee_spki).unwrap(),
+        is_authorized_for_tenant(&conn, inviter_id, &expected_invitee_spki).unwrap(),
         "INVARIANT: inviter must allow invitee's invite-derived SPKI before accept"
     );
 
     // Unknown SPKI must still be denied
     let unknown: [u8; 32] = [0x99; 32];
     assert!(
-        !is_peer_allowed(&conn, inviter_id, &unknown).unwrap(),
+        !is_authorized_for_tenant(&conn, inviter_id, &unknown).unwrap(),
         "INVARIANT: unknown SPKI must be denied even when pending trust exists"
     );
 }
@@ -894,7 +894,7 @@ fn characterization_joiner_accepted_trust_allows_bootstrap_sync() {
 
     // Joiner's transport layer checks the inviter's SPKI
     assert!(
-        is_peer_allowed(&conn, joiner_id, &inviter_spki).unwrap(),
+        is_authorized_for_tenant(&conn, joiner_id, &inviter_spki).unwrap(),
         "INVARIANT: joiner must allow inviter's bootstrap SPKI after accept"
     );
 
@@ -1013,7 +1013,7 @@ fn characterization_full_trust_lifecycle() {
     record_pending_invite_bootstrap_trust(&conn, inviter, invite_eid, workspace_id, &invitee_spki)
         .unwrap();
     assert!(
-        is_peer_allowed(&conn, inviter, &invitee_spki).unwrap(),
+        is_authorized_for_tenant(&conn, inviter, &invitee_spki).unwrap(),
         "Stage 1: inviter allows invitee SPKI via pending trust"
     );
 
@@ -1029,7 +1029,7 @@ fn characterization_full_trust_lifecycle() {
     )
     .unwrap();
     assert!(
-        is_peer_allowed(&conn, joiner, &inviter_spki).unwrap(),
+        is_authorized_for_tenant(&conn, joiner, &inviter_spki).unwrap(),
         "Stage 2: joiner allows inviter SPKI via accepted trust"
     );
 
@@ -1041,7 +1041,7 @@ fn characterization_full_trust_lifecycle() {
 
     // After PeerShared, the derived SPKI is trusted via steady state
     assert!(
-        is_peer_allowed(&conn, inviter, &invitee_derived_spki).unwrap(),
+        is_authorized_for_tenant(&conn, inviter, &invitee_derived_spki).unwrap(),
         "Stage 3: inviter allows invitee via PeerShared-derived SPKI"
     );
 
@@ -1065,7 +1065,7 @@ fn characterization_full_trust_lifecycle() {
     )
     .unwrap();
     assert!(
-        is_peer_allowed(&conn, inviter, &matching_spki).unwrap(),
+        is_authorized_for_tenant(&conn, inviter, &matching_spki).unwrap(),
         "Stage 3b: pending trust allows matching SPKI before PeerShared"
     );
 
@@ -1073,7 +1073,7 @@ fn characterization_full_trust_lifecycle() {
     // Supersession now happens at projection time via PeerShared writes
     consume_bootstrap_for_peer_shared(&conn, inviter, &matching_pubkey).unwrap();
     assert!(
-        is_peer_allowed(&conn, inviter, &matching_spki).unwrap(),
+        is_authorized_for_tenant(&conn, inviter, &matching_spki).unwrap(),
         "Stage 3b: SPKI still allowed after PeerShared (via PeerShared path)"
     );
     // Pending trust should now be consumed (PeerShared SPKI matches).
@@ -1088,7 +1088,7 @@ fn characterization_full_trust_lifecycle() {
     assert_eq!(remaining_rows, 0);
     // But the SPKI is still allowed (via PeerShared path)
     assert!(
-        is_peer_allowed(&conn, inviter, &matching_spki).unwrap(),
+        is_authorized_for_tenant(&conn, inviter, &matching_spki).unwrap(),
         "Stage 3b: SPKI still allowed via PeerShared after supersession"
     );
 }

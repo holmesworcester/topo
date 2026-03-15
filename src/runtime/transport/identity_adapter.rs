@@ -10,6 +10,9 @@ use rusqlite::OptionalExtension;
 use crate::contracts::transport_identity_contract::{
     TransportIdentityAdapter, TransportIdentityError, TransportIdentityIntent,
 };
+use crate::db::transport_creds::{
+    set_local_transport_target, CRED_SOURCE_BOOTSTRAP, CRED_SOURCE_PEER_SHARED,
+};
 
 /// Production adapter backed by `transport::identity` install functions.
 pub struct ConcreteTransportIdentityAdapter;
@@ -70,11 +73,15 @@ impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
                         invite_event_id: invite_eid_b64.clone(),
                     })?;
                 let signing_key = parse_signing_key(key_bytes)?;
-                crate::transport::identity::install_invite_bootstrap_transport_identity(
-                    conn,
-                    &signing_key,
-                )
-                .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))
+                let peer_id =
+                    crate::transport::identity::install_invite_bootstrap_transport_identity(
+                        conn,
+                        &signing_key,
+                    )
+                    .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))?;
+                set_local_transport_target(conn, &recorded_by, &peer_id, CRED_SOURCE_BOOTSTRAP)
+                    .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))?;
+                Ok(peer_id)
             }
             TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
                 recorded_by,
@@ -103,8 +110,14 @@ impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
 
                 let signing_key = parse_signing_key(key_bytes)?;
 
-                crate::transport::identity::install_peer_key_transport_identity(conn, &signing_key)
-                    .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))
+                let peer_id = crate::transport::identity::install_peer_key_transport_identity(
+                    conn,
+                    &signing_key,
+                )
+                .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))?;
+                set_local_transport_target(conn, &recorded_by, &peer_id, CRED_SOURCE_PEER_SHARED)
+                    .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))?;
+                Ok(peer_id)
             }
         }
     }

@@ -1,6 +1,6 @@
 //! Large trust-set low-memory correctness and budget tests.
 
-use topo::db::{open_connection, transport_trust::is_peer_allowed};
+use topo::db::{open_connection, transport_trust::is_authorized_for_tenant};
 use topo::testutil::Peer;
 
 fn current_rss_mib() -> Option<f64> {
@@ -39,7 +39,7 @@ impl Drop for EnvGuard {
 }
 
 /// Correctness test: seed 100K pending bootstrap trust entries and verify allow/deny via SQL lookup.
-/// Ensures `is_peer_allowed` returns the correct result without materializing the
+/// Ensures `is_authorized_for_tenant` returns the correct result without materializing the
 /// full trust set.
 #[test]
 #[cfg(target_os = "linux")]
@@ -54,7 +54,8 @@ fn large_trustset_allow_deny_correctness() {
     // Spot-check: first, last, and a middle key should be allowed.
     for &idx in &[0usize, 49_999, 99_999] {
         assert!(
-            is_peer_allowed(&db, &alice.identity, &fps[idx]).expect("is_peer_allowed"),
+            is_authorized_for_tenant(&db, &alice.identity, &fps[idx])
+                .expect("is_authorized_for_tenant"),
             "expected allowed for seeded key index {}",
             idx
         );
@@ -63,7 +64,8 @@ fn large_trustset_allow_deny_correctness() {
     // Unknown key must be denied.
     let unknown = [0xFFu8; 32];
     assert!(
-        !is_peer_allowed(&db, &alice.identity, &unknown).expect("is_peer_allowed"),
+        !is_authorized_for_tenant(&db, &alice.identity, &unknown)
+            .expect("is_authorized_for_tenant"),
         "expected denied for unknown key"
     );
 
@@ -102,13 +104,13 @@ fn low_mem_large_trustset_budget() {
 
     // Perform 1000 lookups across the key space.
     for i in (0..100_000).step_by(100) {
-        let allowed = is_peer_allowed(&db, &alice.identity, &fps[i]).expect("lookup");
+        let allowed = is_authorized_for_tenant(&db, &alice.identity, &fps[i]).expect("lookup");
         assert!(allowed, "key {} should be allowed", i);
     }
 
     // Also check an unknown key.
     let unknown = [0xFFu8; 32];
-    assert!(!is_peer_allowed(&db, &alice.identity, &unknown).expect("lookup unknown"));
+    assert!(!is_authorized_for_tenant(&db, &alice.identity, &unknown).expect("lookup unknown"));
 
     let rss_after = current_rss_mib().expect("VmRSS unavailable");
     let delta = rss_after - rss_before;

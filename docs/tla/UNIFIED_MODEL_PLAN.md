@@ -172,9 +172,12 @@ Drift controls (required):
 | `PW_DialBootstrapFallback` | `runtime/peering/loops/connect` fallback branch |
 | `PW_DialOngoing` / `PW_UpgradeConn` | ongoing-first dial/upgrade behavior in `runtime/peering/loops/connect` |
 | `RT_TrustedSPKIs` | `authorized_fingerprints_from_db()` trust union |
-| `RT_CanAuthorize` | `is_peer_allowed()` and transport trust check |
+| `RT_CanAuthorize` | `is_authorized_for_tenant()` and transport trust check |
 | `RT_DialPreference` | connect-loop ongoing-first with bootstrap fallback |
 | `CtxMode` | canonical `derive_bootstrap_dial_context` decision helper (`runtime/transport/bootstrap_dial_context.rs`) |
+
+Current runtime note:
+- Exact inbound transport targeting also uses replay-derived local routing state (`local_transport_targets`) to resolve `requestedLocalTransportFP -> tenant`. This is not a new authority source; it should be modeled as a derived local-target relation layered on top of transport identity transitions.
 
 ## Runtime check catalog status
 Bridge check ids are now listed in `docs/tla/runtime_check_catalog.md` under

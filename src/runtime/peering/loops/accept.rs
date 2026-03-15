@@ -10,7 +10,7 @@ use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
-use crate::db::transport_creds::discover_local_tenants;
+use crate::db::transport_creds::resolve_local_transport_target;
 use crate::db::transport_trust::{is_authorized_for_tenant, record_transport_binding};
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::SyncSessionHandler;
@@ -393,41 +393,28 @@ fn resolve_requested_tenant_for_peer(
             e
         )
     })?;
-    let matching_tenants: Vec<_> = discover_local_tenants(&db)
-        .map_err(|e| format!("Failed to discover local transport targets: {}", e))?
-        .into_iter()
-        .filter(|tenant| tenant.transport_peer_id == requested.transport_peer_id)
-        .collect();
-    let tenant = match matching_tenants.as_slice() {
-        [tenant] => tenant,
-        [] => {
-            return Err(format!(
+    let tenant = resolve_local_transport_target(&db, &requested.transport_peer_id)
+        .map_err(|e| format!("Failed to resolve requested local transport target: {}", e))?
+        .ok_or_else(|| {
+            format!(
                 "Rejected peer {}: requested local transport fingerprint {} is not present on this node",
                 short_peer_id(remote_peer_id),
                 short_peer_id(&requested.transport_peer_id)
-            ));
-        }
-        _ => {
-            return Err(format!(
-                "Rejected peer {}: requested local transport fingerprint {} is ambiguous on this node",
-                short_peer_id(remote_peer_id),
-                short_peer_id(&requested.transport_peer_id)
-            ));
-        }
-    };
-    let authorized = is_authorized_for_tenant(&db, &tenant.peer_id, &remote_fp)
+            )
+        })?;
+    let authorized = is_authorized_for_tenant(&db, &tenant.tenant_id, &remote_fp)
         .map_err(|e| format!("Inbound tenant-scoped auth query failed: {}", e))?;
     if !authorized {
         return Err(format!(
             "Rejected peer {}: local tenant {} does not authorize this fingerprint",
             short_peer_id(remote_peer_id),
-            short_peer_id(&tenant.peer_id)
+            short_peer_id(&tenant.tenant_id)
         ));
     }
     Ok(InboundAuthContext {
         requested_local_transport_peer_id: requested.transport_peer_id.clone(),
         authenticated_remote_transport_peer_id: remote_peer_id.to_string(),
-        tenant_id: tenant.peer_id.clone(),
+        tenant_id: tenant.tenant_id.clone(),
     })
 }
 
@@ -440,6 +427,7 @@ mod tests {
     use super::*;
 
     use crate::db::schema::create_tables;
+    use crate::db::transport_creds::{set_local_transport_target, CRED_SOURCE_PEER_SHARED};
     use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
 
     fn setup_db() -> (tempfile::TempDir, String) {
@@ -488,6 +476,7 @@ mod tests {
             ],
         )
         .unwrap();
+        set_local_transport_target(conn, tenant_id, tenant_id, CRED_SOURCE_PEER_SHARED).unwrap();
     }
 
     #[test]

@@ -360,20 +360,20 @@ progress properties over bootstrap/upgrade/fallback behavior.
 
 The TLA+ `CanAuthenticate(p, q)` models per-tenant trust: peer `p` admits peer `q`
 only if `q`'s active credential is in `TrustedSPKIs(p)`. The Rust implementation
-now realizes two distinct trust scopes on the same QUIC endpoint:
+now realizes that on a shared QUIC endpoint in two stages:
 
-- **Inbound (server-side)**: Union trust — accept if ANY local tenant trusts the
-  remote. Post-handshake routing determines the correct `recorded_by` tenant.
-  (`run_node`: `dynamic_allow` closure iterates all tenant_peer_ids.)
+- **Inbound pre-admission**: a node-scoped union trust gate rejects remote
+  fingerprints that no local tenant authorizes.
+- **Inbound exact-target admission**: post-handshake, the requested local
+  transport fingerprint is resolved to exactly one tenant through
+  `local_transport_targets`, and only that tenant's `is_authorized_for_tenant`
+  result may admit the session.
+- **Outbound**: each `connect_loop` uses a per-tenant client config and then
+  enforces exact remote transport-fingerprint match for the chosen target.
 
-- **Outbound (client-side)**: Per-tenant trust — each `connect_loop` uses a
-  `workspace_client_config` that presents only that tenant's cert and verifies
-  the remote against only that tenant's `is_peer_allowed`.
-
-The TLA+ model captures the per-tenant semantic (CanAuthenticate is per-peer).
-The union inbound gate is a routing optimization that does not weaken the model
-invariant: once routed, each sync session operates within a single tenant's trust
-boundary. No TLA+ model changes required.
+The TLA+ model still captures the per-tenant security semantic. The node-scoped
+inbound gate is only a coarse first filter; the actual admission invariant is
+the tenant-scoped check after exact local-target resolution.
 
 ## TLA Verification Notes
 
@@ -404,7 +404,7 @@ TLC status (run on 2026-02-17, post-transport-identity-unification):
 ### collapse-single-tenant per-tenant outbound trust (2026-02-17)
 
 `run_node` now builds per-tenant `workspace_client_config` for outbound connections,
-scoping trust to each tenant's `is_peer_allowed`. The TLA+ `CanAuthenticate(p, q)`
+scoping trust to each tenant's `is_authorized_for_tenant`. The TLA+ `CanAuthenticate(p, q)`
 already models per-tenant trust, so no model changes are needed. A Rust comment was
 added to the `CanAuthenticate` operator documenting the dual trust model
 (union inbound, per-tenant outbound). See the table note above for details.

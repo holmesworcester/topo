@@ -67,13 +67,14 @@ TrustedSPKIs(p) ==
     peerSharedTrust[p] \union bootstrapTrust[p] \union pendingBootstrapTrust[p]
 
 \* Whether peer p can authenticate peer q's current credential.
-\* Mirrors is_peer_allowed() (database path, excluding CLI pins).
+\* Mirrors is_authorized_for_tenant() (database path, excluding CLI pins).
 \*
-\* Rust note (collapse-single-tenant): on multi-tenant nodes, inbound (server)
-\* connections use a union gate (accept if ANY tenant trusts q), but post-handshake
-\* routing binds the session to the specific tenant p that trusts q.  Outbound
-\* (client) connections use per-tenant workspace_client_config which enforces
-\* exactly this per-peer CanAuthenticate check at the TLS layer.
+\* Rust note: on multi-tenant nodes, inbound (server) connections first use a
+\* node-scoped union gate (accept if ANY tenant trusts q), then exact local-target
+\* routing resolves requestedLocalTransportFP -> p from replay-derived local state.
+\* Post-handshake admission then enforces this per-peer CanAuthenticate check.
+\* Outbound (client) connections use per-tenant workspace_client_config plus
+\* exact expected remote transport-fingerprint verification.
 CanAuthenticate(p, q) ==
     /\ localCred[q] # None
     /\ localCred[q] \in TrustedSPKIs(p)

@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 pub const CRED_SOURCE_UNKNOWN: &str = "unknown";
@@ -16,6 +16,14 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             created_at INTEGER NOT NULL,
             source TEXT NOT NULL DEFAULT 'unknown'
         );
+        CREATE TABLE IF NOT EXISTS local_transport_targets (
+            tenant_id TEXT PRIMARY KEY,
+            transport_peer_id TEXT NOT NULL UNIQUE,
+            source TEXT NOT NULL,
+            created_at INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_local_transport_targets_transport_peer_id
+            ON local_transport_targets(transport_peer_id);
         ",
     )?;
     // Schema epoch is fixed for this POC, but allow additive column convergence so
@@ -40,6 +48,64 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
         )?;
     }
     Ok(())
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalTransportTarget {
+    pub tenant_id: String,
+    pub transport_peer_id: String,
+    pub source: String,
+}
+
+/// Record the tenant's current local transport target.
+///
+/// This is replay-derived local routing state, not an independent authority
+/// source: projection emits transport identity intents, the adapter applies
+/// them, and this table records which local transport fingerprint is now active
+/// for that tenant.
+pub fn set_local_transport_target(
+    conn: &Connection,
+    tenant_id: &str,
+    transport_peer_id: &str,
+    source: &str,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let now = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64;
+    conn.execute(
+        "INSERT INTO local_transport_targets (tenant_id, transport_peer_id, source, created_at)
+         VALUES (?1, ?2, ?3, ?4)
+         ON CONFLICT(tenant_id) DO UPDATE SET
+             transport_peer_id = excluded.transport_peer_id,
+             source = excluded.source,
+             created_at = excluded.created_at",
+        rusqlite::params![tenant_id, transport_peer_id, source, now],
+    )?;
+    Ok(())
+}
+
+pub fn resolve_local_transport_target(
+    conn: &Connection,
+    transport_peer_id: &str,
+) -> Result<Option<LocalTransportTarget>, Box<dyn std::error::Error + Send + Sync>> {
+    let target = conn
+        .query_row(
+            "SELECT tenant_id, transport_peer_id, source
+             FROM local_transport_targets
+             WHERE transport_peer_id = ?1
+             LIMIT 1",
+            rusqlite::params![transport_peer_id],
+            |row| {
+                Ok(LocalTransportTarget {
+                    tenant_id: row.get(0)?,
+                    transport_peer_id: row.get(1)?,
+                    source: row.get(2)?,
+                })
+            },
+        )
+        .optional()?;
+    Ok(target)
 }
 
 /// Store TLS cert/key DER blobs for a local peer identity.
@@ -197,98 +263,38 @@ pub struct TenantInfo {
 pub fn discover_local_tenants(
     conn: &Connection,
 ) -> Result<Vec<TenantInfo>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut tenants = Vec::new();
-    let mut seen_tenants = std::collections::HashSet::new();
-
-    // Normal case: accepted-workspace binding and transport identity converged.
-    let mut direct_stmt = conn.prepare(
-        "SELECT i.recorded_by, i.workspace_id, c.peer_id, c.cert_der, c.key_der
-         FROM invites_accepted i
-         JOIN local_transport_creds c ON i.recorded_by = c.peer_id
+    let mut stmt = conn.prepare(
+        "SELECT
+             t.tenant_id,
+             i.workspace_id,
+             t.transport_peer_id,
+             c.cert_der,
+             c.key_der
+         FROM local_transport_targets t
+         JOIN local_transport_creds c
+           ON c.peer_id = t.transport_peer_id
+         JOIN invites_accepted i
+           ON i.recorded_by = t.tenant_id
+          AND i.event_id = (
+              SELECT i2.event_id
+              FROM invites_accepted i2
+              WHERE i2.recorded_by = t.tenant_id
+              ORDER BY i2.created_at DESC, i2.event_id DESC
+              LIMIT 1
+          )
          ORDER BY i.created_at ASC, i.event_id ASC",
     )?;
-    let direct_rows = direct_stmt.query_map([], |row| {
-        Ok(TenantInfo {
-            peer_id: row.get(0)?,
-            workspace_id: row.get(1)?,
-            transport_peer_id: row.get(2)?,
-            cert_der: row.get(3)?,
-            key_der: row.get(4)?,
-        })
-    })?;
-    for row in direct_rows {
-        let tenant = row?;
-        if seen_tenants.insert(tenant.peer_id.clone()) {
-            tenants.push(tenant);
-        }
-    }
-
-    // Transitional bootstrap fallback (generalized):
-    // For each accepted tenant without direct peer_id transport creds,
-    // try resolving bootstrap transport identity from invite_secrets.
-    let mut accepted_stmt = conn.prepare(
-        "SELECT recorded_by, workspace_id, invite_event_id
-         FROM invites_accepted
-         ORDER BY created_at DESC, event_id DESC",
-    )?;
-    let accepted_rows = accepted_stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-    for row in accepted_rows {
-        let (tenant_peer_id, workspace_id, invite_event_id) = row?;
-        if !seen_tenants.insert(tenant_peer_id.clone()) {
-            continue;
-        }
-
-        let invite_key_bytes: Option<Vec<u8>> = conn
-            .query_row(
-                "SELECT private_key
-                 FROM invite_secrets
-                 WHERE recorded_by = ?1
-                   AND invite_event_id = ?2
-                 ORDER BY created_at DESC, event_id DESC
-                 LIMIT 1",
-                rusqlite::params![&tenant_peer_id, &invite_event_id],
-                |row| row.get(0),
-            )
-            .ok();
-        let Some(invite_key_bytes) = invite_key_bytes else {
-            continue;
-        };
-        if invite_key_bytes.len() != 32 {
-            continue;
-        }
-        let mut sk_bytes = [0u8; 32];
-        sk_bytes.copy_from_slice(&invite_key_bytes);
-        let sk = ed25519_dalek::SigningKey::from_bytes(&sk_bytes);
-        let bootstrap_peer_id = hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
-            &sk.verifying_key().to_bytes(),
-        ));
-        let maybe_creds: Option<(Vec<u8>, Vec<u8>)> = conn
-            .query_row(
-                "SELECT cert_der, key_der
-                 FROM local_transport_creds
-                 WHERE peer_id = ?1
-                 LIMIT 1",
-                rusqlite::params![&bootstrap_peer_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )
-            .ok();
-        if let Some((cert_der, key_der)) = maybe_creds {
-            tenants.push(TenantInfo {
-                peer_id: tenant_peer_id,
-                workspace_id,
-                transport_peer_id: bootstrap_peer_id,
-                cert_der,
-                key_der,
-            });
-        }
-    }
-
+    let tenants = stmt
+        .query_map([], |row| {
+            Ok(TenantInfo {
+                peer_id: row.get(0)?,
+                workspace_id: row.get(1)?,
+                transport_peer_id: row.get(2)?,
+                cert_der: row.get(3)?,
+                key_der: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
     Ok(tenants)
 }
 
@@ -387,7 +393,7 @@ mod tests {
         // No tenants yet
         assert!(discover_local_tenants(&conn).unwrap().is_empty());
 
-        // Add an accepted-workspace binding and matching creds
+        // Add an accepted-workspace binding, matching creds, and target mapping.
         conn.execute(
             "INSERT INTO invites_accepted (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
              VALUES ('peer1', 'ia1', 't1', 'inv1', 'ws1', 1)",
@@ -395,6 +401,7 @@ mod tests {
         )
         .unwrap();
         store_local_creds(&conn, "peer1", b"cert1", b"key1").unwrap();
+        set_local_transport_target(&conn, "peer1", "peer1", CRED_SOURCE_PEER_SHARED).unwrap();
 
         let tenants = discover_local_tenants(&conn).unwrap();
         assert_eq!(tenants.len(), 1);
@@ -411,29 +418,31 @@ mod tests {
         .unwrap();
         assert_eq!(discover_local_tenants(&conn).unwrap().len(), 1);
 
-        // Add creds for peer2
+        // Add creds and a target mapping for peer2.
         store_local_creds(&conn, "peer2", b"cert2", b"key2").unwrap();
+        set_local_transport_target(&conn, "peer2", "peer2", CRED_SOURCE_PEER_SHARED).unwrap();
         assert_eq!(discover_local_tenants(&conn).unwrap().len(), 2);
     }
 
     #[test]
-    fn test_discover_local_tenants_transitional_fallback() {
+    fn test_resolve_local_transport_target() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
-        conn.execute(
-            "INSERT INTO invites_accepted (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
-             VALUES ('derived_peer', 'ia3', 't3', 'inv3', 'ws1', 3)",
-            [],
-        )
-        .unwrap();
-        store_local_creds(&conn, "invite_peer", b"cert1", b"key1").unwrap();
+        assert!(resolve_local_transport_target(&conn, "peer1")
+            .unwrap()
+            .is_none());
 
-        let tenants = discover_local_tenants(&conn).unwrap();
-        assert_eq!(tenants.len(), 1);
-        assert_eq!(tenants[0].peer_id, "derived_peer");
-        assert_eq!(tenants[0].transport_peer_id, "invite_peer");
-        assert_eq!(tenants[0].workspace_id, "ws1");
+        set_local_transport_target(&conn, "tenant_a", "peer1", CRED_SOURCE_BOOTSTRAP).unwrap();
+
+        assert_eq!(
+            resolve_local_transport_target(&conn, "peer1").unwrap(),
+            Some(LocalTransportTarget {
+                tenant_id: "tenant_a".to_string(),
+                transport_peer_id: "peer1".to_string(),
+                source: CRED_SOURCE_BOOTSTRAP.to_string(),
+            })
+        );
     }
 
     #[test]
@@ -462,7 +471,7 @@ mod tests {
     }
 
     #[test]
-    fn test_discover_local_tenants_multitenant_bootstrap_fallback() {
+    fn test_discover_local_tenants_uses_explicit_target_mapping() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
@@ -481,25 +490,16 @@ mod tests {
             CRED_SOURCE_PEER_SHARED,
         )
         .unwrap();
+        set_local_transport_target(&conn, "tenant_a", "tenant_a", CRED_SOURCE_PEER_SHARED).unwrap();
 
-        // Tenant B is transitional: accepted invite + invite_secret + bootstrap creds.
-        let invite_sk = ed25519_dalek::SigningKey::from_bytes(&[42u8; 32]);
-        let invite_event_id = "inv_b";
+        // Tenant B is transitional: accepted invite + bootstrap creds + explicit target mapping.
         conn.execute(
             "INSERT INTO invites_accepted (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
-             VALUES ('tenant_b', 'ia_b', 't_b', ?1, 'ws_b', 2)",
-            rusqlite::params![invite_event_id],
+             VALUES ('tenant_b', 'ia_b', 't_b', 'inv_b', 'ws_b', 2)",
+            [],
         )
         .unwrap();
-        conn.execute(
-            "INSERT INTO invite_secrets (recorded_by, event_id, invite_event_id, private_key, created_at)
-             VALUES ('tenant_b', 'is_b', ?1, ?2, 2)",
-            rusqlite::params![invite_event_id, invite_sk.to_bytes().to_vec()],
-        )
-        .unwrap();
-        let bootstrap_peer_id = hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
-            &invite_sk.verifying_key().to_bytes(),
-        ));
+        let bootstrap_peer_id = "bootstrap_peer_id".to_string();
         store_local_creds_with_source(
             &conn,
             &bootstrap_peer_id,
@@ -508,6 +508,8 @@ mod tests {
             CRED_SOURCE_BOOTSTRAP,
         )
         .unwrap();
+        set_local_transport_target(&conn, "tenant_b", &bootstrap_peer_id, CRED_SOURCE_BOOTSTRAP)
+            .unwrap();
 
         let tenants = discover_local_tenants(&conn).unwrap();
         assert_eq!(tenants.len(), 2);

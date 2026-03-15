@@ -22,7 +22,7 @@ use crate::protocol::{encode_frame, Frame};
 use super::connection_lifecycle::{
     accept_peer, dial_peer, ConnectedPeer, ConnectionLifecycleError,
 };
-use super::multi_workspace::WorkspaceCertResolver;
+use super::multi_workspace::TransportTargetCertResolver;
 use super::session_factory::{
     accept_session_io, open_session_io, InboundSessionState, SessionOpenError,
 };
@@ -104,7 +104,7 @@ impl SessionProvider {
 
 pub fn create_runtime_endpoint_for_tenants(
     bind_addr: SocketAddr,
-    cert_resolver: Arc<WorkspaceCertResolver>,
+    cert_resolver: Arc<TransportTargetCertResolver>,
     db_path: &str,
     default_client_cert: CertificateDer<'static>,
     default_client_key: PrivatePkcs8KeyDer<'static>,

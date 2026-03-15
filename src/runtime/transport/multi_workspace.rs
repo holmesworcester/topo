@@ -13,24 +13,22 @@ use std::collections::HashMap;
 use std::fmt;
 use std::sync::{Arc, RwLock};
 
-use crate::crypto::event_id_from_base64;
-
 /// Map exact transport-target SNI → CertifiedKey for per-connection cert selection.
-pub struct WorkspaceCertResolver {
+pub struct TransportTargetCertResolver {
     /// SNI hostname → CertifiedKey
     certs: RwLock<HashMap<String, Arc<CertifiedKey>>>,
 }
 
-impl fmt::Debug for WorkspaceCertResolver {
+impl fmt::Debug for TransportTargetCertResolver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let certs = self.certs.read().unwrap();
-        f.debug_struct("WorkspaceCertResolver")
+        f.debug_struct("TransportTargetCertResolver")
             .field("targets", &certs.keys().collect::<Vec<_>>())
             .finish()
     }
 }
 
-impl WorkspaceCertResolver {
+impl TransportTargetCertResolver {
     /// Create a new resolver.
     pub fn new() -> Self {
         Self {
@@ -56,7 +54,7 @@ impl WorkspaceCertResolver {
     }
 }
 
-impl ResolvesServerCert for WorkspaceCertResolver {
+impl ResolvesServerCert for TransportTargetCertResolver {
     fn resolve(&self, client_hello: ClientHello<'_>) -> Option<Arc<CertifiedKey>> {
         if let Some(sni) = client_hello.server_name() {
             let certs = self.certs.read().unwrap();
@@ -65,22 +63,6 @@ impl ResolvesServerCert for WorkspaceCertResolver {
             }
         }
         None
-    }
-}
-
-/// Convert a workspace_id (base64 event_id) to a DNS-safe SNI hostname.
-///
-/// Uses hex encoding of the first 16 bytes of the event_id → 32-char
-/// hex string, well within the 63-char DNS label limit.
-pub fn workspace_sni(workspace_id_b64: &str) -> String {
-    if let Some(eid) = event_id_from_base64(workspace_id_b64) {
-        hex::encode(&eid[..16])
-    } else {
-        // Fallback for invalid b64: sanitize for DNS
-        workspace_id_b64
-            .replace('/', "-")
-            .replace('+', "0")
-            .replace('=', "")
     }
 }
 
@@ -136,24 +118,6 @@ mod tests {
     use super::*;
 
     #[test]
-    fn test_workspace_sni_produces_hex() {
-        // A 32-byte event_id base64-encoded
-        let eid = [0xABu8; 32];
-        let b64 = crate::crypto::event_id_to_base64(&eid);
-        let sni = workspace_sni(&b64);
-        assert_eq!(sni.len(), 32);
-        assert_eq!(sni, "abababababababababababababababab");
-    }
-
-    #[test]
-    fn test_workspace_sni_fallback() {
-        let sni = workspace_sni("not-valid-base64!!!");
-        assert!(!sni.contains('/'));
-        assert!(!sni.contains('+'));
-        assert!(!sni.contains('='));
-    }
-
-    #[test]
     fn test_peer_sni_splits_full_peer_id() {
         let peer_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
         let sni = peer_sni(peer_id);
@@ -184,9 +148,9 @@ mod tests {
     fn test_resolver_selects_by_sni() {
         let provider = rustls::crypto::ring::default_provider();
 
-        let resolver = WorkspaceCertResolver::new();
+        let resolver = TransportTargetCertResolver::new();
 
-        // Generate two workspace certs
+        // Generate two transport certs
         let (cert1, key1) = crate::transport::generate_self_signed_cert().unwrap();
         let (cert2, key2) = crate::transport::generate_self_signed_cert().unwrap();
 

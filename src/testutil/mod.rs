@@ -2027,7 +2027,7 @@ pub fn start_peers(
     peer_a: &Peer,
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
-    use crate::db::transport_trust::is_peer_allowed;
+    use crate::db::transport_trust::is_authorized_for_tenant;
 
     let (cert_a, key_a) = peer_a.cert_and_key();
     let (cert_b, key_b) = peer_b.cert_and_key();
@@ -2037,7 +2037,7 @@ pub fn start_peers(
     let dynamic_allow_a: Arc<crate::transport::DynamicAllowFn> =
         Arc::new(move |peer_fp: &[u8; 32]| {
             let db = open_connection(&a_db_path)?;
-            is_peer_allowed(&db, &a_recorded_by, peer_fp)
+            is_authorized_for_tenant(&db, &a_recorded_by, peer_fp)
         });
 
     let b_db_path = peer_b.db_path.clone();
@@ -2045,7 +2045,7 @@ pub fn start_peers(
     let dynamic_allow_b: Arc<crate::transport::DynamicAllowFn> =
         Arc::new(move |peer_fp: &[u8; 32]| {
             let db = open_connection(&b_db_path)?;
-            is_peer_allowed(&db, &b_recorded_by, peer_fp)
+            is_authorized_for_tenant(&db, &b_recorded_by, peer_fp)
         });
 
     let listener_endpoint = create_dual_endpoint_dynamic(
@@ -2122,7 +2122,7 @@ pub fn start_peers(
 
 /// Start continuous sync between two peers using dynamic DB trust lookup.
 /// Trust is resolved from SQL at each TLS handshake, matching production
-/// behavior (`is_peer_allowed`). Caller must already have real invite/bootstrap
+/// behavior (`is_authorized_for_tenant`). Caller must already have real invite/bootstrap
 /// trust or steady-state peer trust projected in SQL.
 ///
 /// REALISM HELPER: production-matching dynamic trust. Used in holepunch
@@ -2131,7 +2131,7 @@ pub fn start_peers_dynamic(
     peer_a: &Peer,
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
-    use crate::db::transport_trust::is_peer_allowed;
+    use crate::db::transport_trust::is_authorized_for_tenant;
 
     let (cert_a, key_a) = peer_a.cert_and_key();
     let (cert_b, key_b) = peer_b.cert_and_key();
@@ -2141,7 +2141,7 @@ pub fn start_peers_dynamic(
     let dynamic_allow_a: Arc<crate::transport::DynamicAllowFn> =
         Arc::new(move |peer_fp: &[u8; 32]| {
             let db = open_connection(&a_db_path)?;
-            is_peer_allowed(&db, &a_recorded_by, peer_fp)
+            is_authorized_for_tenant(&db, &a_recorded_by, peer_fp)
         });
 
     let b_db_path = peer_b.db_path.clone();
@@ -2149,7 +2149,7 @@ pub fn start_peers_dynamic(
     let dynamic_allow_b: Arc<crate::transport::DynamicAllowFn> =
         Arc::new(move |peer_fp: &[u8; 32]| {
             let db = open_connection(&b_db_path)?;
-            is_peer_allowed(&db, &b_recorded_by, peer_fp)
+            is_authorized_for_tenant(&db, &b_recorded_by, peer_fp)
         });
 
     let listener_endpoint = create_dual_endpoint_dynamic(
@@ -2237,7 +2237,7 @@ pub fn create_dynamic_endpoint_for_peer_bind(
     peer: &Peer,
     bind_addr: std::net::SocketAddr,
 ) -> quinn::Endpoint {
-    use crate::db::transport_trust::is_peer_allowed;
+    use crate::db::transport_trust::is_authorized_for_tenant;
 
     let (cert, key) = peer.cert_and_key();
     let db_path = peer.db_path.clone();
@@ -2245,7 +2245,7 @@ pub fn create_dynamic_endpoint_for_peer_bind(
     let dynamic_allow: Arc<crate::transport::DynamicAllowFn> =
         Arc::new(move |peer_fp: &[u8; 32]| {
             let db = open_connection(&db_path)?;
-            is_peer_allowed(&db, &recorded_by, peer_fp)
+            is_authorized_for_tenant(&db, &recorded_by, peer_fp)
         });
 
     create_dual_endpoint_dynamic(bind_addr, cert, key, dynamic_allow)
@@ -2315,7 +2315,7 @@ where
 ///
 /// Returns thread handles for all accept and connect loops.
 pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
-    use crate::db::transport_trust::is_peer_allowed;
+    use crate::db::transport_trust::is_authorized_for_tenant;
 
     let n = peers.len();
     assert!(n >= 2, "chain requires at least 2 peers");
@@ -2335,7 +2335,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
         let recorded_by = peers[i].identity.clone();
         let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
             let db = open_connection(&db_path)?;
-            is_peer_allowed(&db, &recorded_by, fp)
+            is_authorized_for_tenant(&db, &recorded_by, fp)
         });
         let endpoint =
             create_dual_endpoint_dynamic("127.0.0.1:0".parse().unwrap(), cert, key, allow_fn)
@@ -2353,7 +2353,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
         let recorded_by = peers[i].identity.clone();
         let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
             let db = open_connection(&db_path)?;
-            is_peer_allowed(&db, &recorded_by, fp)
+            is_authorized_for_tenant(&db, &recorded_by, fp)
         });
         let endpoint =
             create_dual_endpoint_dynamic("0.0.0.0:0".parse().unwrap(), cert, key, allow_fn)
@@ -2431,7 +2431,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
 ///
 /// Returns thread handles for all source accept_loops and sink connect loops.
 pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::JoinHandle<()>> {
-    use crate::db::transport_trust::is_peer_allowed;
+    use crate::db::transport_trust::is_authorized_for_tenant;
 
     assert!(!sources.is_empty(), "need at least one source");
     for source in sources {
@@ -2453,7 +2453,7 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
         let src_recorded_by = source.identity.clone();
         let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
             let db = open_connection(&src_db_path)?;
-            is_peer_allowed(&db, &src_recorded_by, fp)
+            is_authorized_for_tenant(&db, &src_recorded_by, fp)
         });
         let server_endpoint =
             create_dual_endpoint_dynamic("127.0.0.1:0".parse().unwrap(), cert, key, allow_fn)
@@ -2494,7 +2494,7 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
         let sink_recorded_by = sink.identity.clone();
         let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
             let db = open_connection(&sink_db_path)?;
-            is_peer_allowed(&db, &sink_recorded_by, fp)
+            is_authorized_for_tenant(&db, &sink_recorded_by, fp)
         });
         let client_endpoint = create_dual_endpoint_dynamic(
             "0.0.0.0:0".parse().unwrap(),
@@ -2587,7 +2587,7 @@ impl SinkDownloadHandles {
 /// Like [`start_sink_download`] but returns [`SinkDownloadHandles`] with
 /// per-source shutdown control for simulating peer dropout.
 pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkDownloadHandles {
-    use crate::db::transport_trust::is_peer_allowed;
+    use crate::db::transport_trust::is_authorized_for_tenant;
 
     assert!(!sources.is_empty(), "need at least one source");
     for source in sources {
@@ -2610,7 +2610,7 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
         let src_recorded_by = source.identity.clone();
         let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
             let db = open_connection(&src_db_path)?;
-            is_peer_allowed(&db, &src_recorded_by, fp)
+            is_authorized_for_tenant(&db, &src_recorded_by, fp)
         });
         let server_endpoint =
             create_dual_endpoint_dynamic("127.0.0.1:0".parse().unwrap(), cert, key, allow_fn)
@@ -2651,7 +2651,7 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
         let sink_recorded_by = sink.identity.clone();
         let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
             let db = open_connection(&sink_db_path)?;
-            is_peer_allowed(&db, &sink_recorded_by, fp)
+            is_authorized_for_tenant(&db, &sink_recorded_by, fp)
         });
         let client_endpoint = create_dual_endpoint_dynamic(
             "0.0.0.0:0".parse().unwrap(),
@@ -2728,18 +2728,18 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
 
 /// Start a sink's accept_loop and return the handle and listen address.
 ///
-/// Uses dynamic trust (`is_peer_allowed`) at each TLS handshake.
+/// Uses dynamic trust (`is_authorized_for_tenant`) at each TLS handshake.
 /// The caller must have already established real projected trust for every
 /// inbound peer that will connect to this sink.
 pub fn start_sink_accept(sink: &Peer) -> (std::thread::JoinHandle<()>, SocketAddr) {
-    use crate::db::transport_trust::is_peer_allowed;
+    use crate::db::transport_trust::is_authorized_for_tenant;
 
     let (cert, key) = sink.cert_and_key();
     let sink_db_path = sink.db_path.clone();
     let sink_recorded_by = sink.identity.clone();
     let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
         let db = open_connection(&sink_db_path)?;
-        is_peer_allowed(&db, &sink_recorded_by, fp)
+        is_authorized_for_tenant(&db, &sink_recorded_by, fp)
     });
     let endpoint =
         create_dual_endpoint_dynamic("127.0.0.1:0".parse().unwrap(), cert, key, allow_fn)

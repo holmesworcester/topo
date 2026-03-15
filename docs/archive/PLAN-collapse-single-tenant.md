@@ -62,7 +62,7 @@ if let Some(remote) = connect {
 ```
 
 **Note on per-tenant client cert**: `create_single_port_endpoint` sets the default client config to the first tenant's cert. For single-tenant (the common case after collapse), this is correct — there's only one cert. For true multi-tenant `--connect`, all outbound connections present the same cert. This is acceptable because:
-- `connect_loop` uses SNI (`workspace_sni`) to identify the workspace
+- `connect_loop` uses exact transport-target SNI (`transport_sni`) to identify the local cert
 - The remote server resolves the tenant via SPKI fingerprint post-handshake
 - Multi-tenant `--connect` is a rare edge case (mDNS discovery handles it)
 

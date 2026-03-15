@@ -558,16 +558,6 @@ pub fn resolve_authorizing_tenant(
     Ok(tenant_id)
 }
 
-/// Backward-compatible alias for the canonical tenant-scoped authorization
-/// check. `recorded_by` is the tenant/workspace scope in the current model.
-pub fn is_peer_allowed(
-    conn: &Connection,
-    recorded_by: &str,
-    spki_fingerprint: &[u8; 32],
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    is_authorized_for_tenant(conn, recorded_by, spki_fingerprint)
-}
-
 /// Check whether any tenant-scoped transport authorization rows are currently
 /// live without materializing the full set. Uses EXISTS for early exit.
 pub fn has_any_trusted_peer(

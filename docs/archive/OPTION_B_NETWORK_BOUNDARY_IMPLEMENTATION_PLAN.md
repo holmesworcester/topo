@@ -509,7 +509,7 @@ After extraction, `src/sync/engine.rs` should contain only orchestration glue (~
    - Tracks `(peer_id, addr, cancellation_token)` per discovered peer.
 2. **`run_node` main body** (lines ~251-629, ~379 lines)
    - Loads tenant identities from DB.
-   - Creates QUIC endpoint with `WorkspaceCertResolver`.
+   - Creates QUIC endpoint with `TransportTargetCertResolver`.
    - Per-tenant: spawns `accept_loop_with_ingest` (inbound), `connect_loop_to_auto_peers`
      (outbound), auto-discovery refresh.
    - Creates shared `batch_writer` channel for inbound events.
