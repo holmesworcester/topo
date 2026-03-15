@@ -171,6 +171,8 @@ where
 
     let mut reconciliation_done = false;
     let mut rounds = 0;
+    let mut round_observed_ids: Vec<crate::crypto::EventId> = Vec::new();
+    let mut round_need_list_ids: Vec<crate::crypto::EventId> = Vec::new();
 
     let mut completed = false;
     let mut done_sent = false;
@@ -245,10 +247,22 @@ where
                             need_ids.len()
                         );
                         reconciliation_done = true;
+                        let completed_at = current_timestamp_ms();
+                        let _ = timeline
+                            .mark_discovery_round_completed_many(&round_observed_ids, completed_at);
+                        let _ = timeline.mark_discovery_round_completed_many(
+                            &round_need_list_ids,
+                            completed_at,
+                        );
                     }
                 }
-                let sent_need_hints =
-                    send_need_list_from_have_ids(&mut control, &mut have_ids).await?;
+                let sent_need_hints = send_need_list_from_have_ids(
+                    &mut control,
+                    &timeline,
+                    &mut have_ids,
+                    &mut round_need_list_ids,
+                )
+                .await?;
                 if sent_need_hints > 0 {
                     last_activity = Instant::now();
                 }
@@ -267,7 +281,7 @@ where
             }
             Ok(Ok(Frame::RequestCredit { credits })) => {
                 last_activity = Instant::now();
-                request_state.add_credit(credits as usize);
+                request_state.add_credit(credits as usize, current_timestamp_ms());
             }
             Ok(Ok(_)) => {}
             Ok(Err(ConnectionError::Closed)) => {
@@ -318,6 +332,7 @@ where
             peer_id,
             reconcile_started_at_ms,
             &mut need_ids,
+            &mut round_observed_ids,
         )?;
         if observed_need_ids > 0 {
             info!(

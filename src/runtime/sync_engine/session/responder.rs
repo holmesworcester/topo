@@ -179,6 +179,7 @@ where
     let mut bytes_sent: u64 = 0;
     let mut rounds = 0;
     let mut peer_done = false;
+    let mut round_observed_ids: Vec<crate::crypto::EventId> = Vec::new();
     let sync_start = Instant::now();
     let reconcile_start = Instant::now();
     let mut reconcile_started_at_ms = current_timestamp_ms();
@@ -251,6 +252,10 @@ where
                             rounds,
                             reconcile_start.elapsed().as_millis()
                         );
+                        let _ = timeline.mark_discovery_round_completed_many(
+                            &round_observed_ids,
+                            current_timestamp_ms(),
+                        );
                     } else if peer_done {
                         info!(
                             "Dropping late NegMsg after peer Done: rounds={}, response_bytes={}",
@@ -314,6 +319,8 @@ where
             }
             Ok(Ok(Frame::NeedList { ids })) => {
                 last_activity = Instant::now();
+                let need_received_at = current_timestamp_ms();
+                let _ = timeline.mark_need_list_received_many(&ids, need_received_at);
                 let observed = observe_event_ids_for_peer(
                     &wanted,
                     &timeline,
@@ -321,6 +328,7 @@ where
                     peer_id,
                     reconcile_started_at_ms,
                     &ids,
+                    &mut round_observed_ids,
                 )?;
                 if observed > 0 {
                     info!(
@@ -336,7 +344,7 @@ where
             }
             Ok(Ok(Frame::RequestCredit { credits })) => {
                 last_activity = Instant::now();
-                request_state.add_credit(credits as usize);
+                request_state.add_credit(credits as usize, current_timestamp_ms());
             }
             Ok(Ok(_)) => {}
             Ok(Err(ConnectionError::Closed)) => {

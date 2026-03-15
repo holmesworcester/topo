@@ -7,6 +7,7 @@ use crate::tuning::request_inflight_ttl_ms;
 #[derive(Debug, Clone, Default)]
 pub struct RequestWindowSnapshot {
     pub remote_credit: usize,
+    pub last_credit_received_at: Option<i64>,
     pub inflight_requested: HashMap<EventId, i64>,
 }
 
@@ -19,6 +20,7 @@ pub struct RequestWindowStats {
 #[derive(Debug, Default)]
 struct ConnectionRequestInner {
     remote_credit: usize,
+    last_credit_received_at: Option<i64>,
     inflight_requested: HashMap<EventId, i64>,
 }
 
@@ -28,9 +30,10 @@ pub struct ConnectionRequestState {
 }
 
 impl ConnectionRequestState {
-    pub fn add_credit(&self, credits: usize) {
+    pub fn add_credit(&self, credits: usize, now_ms: i64) {
         let mut inner = self.inner.lock().expect("request state mutex poisoned");
         inner.remote_credit = inner.remote_credit.saturating_add(credits);
+        inner.last_credit_received_at = Some(now_ms);
     }
 
     pub fn snapshot(&self, now_ms: i64) -> RequestWindowSnapshot {
@@ -38,6 +41,7 @@ impl ConnectionRequestState {
         inner.expire_stale(now_ms);
         RequestWindowSnapshot {
             remote_credit: inner.remote_credit,
+            last_credit_received_at: inner.last_credit_received_at,
             inflight_requested: inner.inflight_requested.clone(),
         }
     }
@@ -63,6 +67,7 @@ impl ConnectionRequestState {
     pub fn clear(&self) {
         let mut inner = self.inner.lock().expect("request state mutex poisoned");
         inner.remote_credit = 0;
+        inner.last_credit_received_at = None;
         inner.inflight_requested.clear();
     }
 }
@@ -159,12 +164,15 @@ mod tests {
     #[test]
     fn request_state_expires_stale_inflight_but_keeps_credit() {
         let state = ConnectionRequestState::default();
-        state.add_credit(3);
+        state.add_credit(3, 17);
         state.note_requested(&[make_event_id(1)], 0);
 
         let stats = state.stats(request_inflight_ttl_ms() + 1);
         assert_eq!(stats.remote_credit, 2);
         assert_eq!(stats.inflight_len, 0);
+
+        let snapshot = state.snapshot(request_inflight_ttl_ms() + 1);
+        assert_eq!(snapshot.last_credit_received_at, Some(17));
     }
 
     #[test]

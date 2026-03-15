@@ -51,6 +51,10 @@ async fn requested_download_records_pipeline_timestamps_on_source_and_sink() {
         "sink should record wanted discovery"
     );
     assert!(
+        sink_timeline.request_selected_at.is_some(),
+        "sink should record request selection"
+    );
+    assert!(
         sink_timeline.request_sent_at.is_some(),
         "sink should record request emission"
     );
@@ -65,6 +69,23 @@ async fn requested_download_records_pipeline_timestamps_on_source_and_sink() {
     assert!(
         sink_timeline.projected_at.is_some(),
         "sink should record projection"
+    );
+    assert_non_decreasing(
+        "sink wanted->selected",
+        sink_timeline.wanted_discovered_at,
+        sink_timeline.request_selected_at,
+    );
+    if sink_timeline.discovery_round_completed_at.is_some() {
+        assert_non_decreasing(
+            "sink discover->complete",
+            sink_timeline.discovery_round_started_at,
+            sink_timeline.discovery_round_completed_at,
+        );
+    }
+    assert_non_decreasing(
+        "sink selected->request",
+        sink_timeline.request_selected_at,
+        sink_timeline.request_sent_at,
     );
     assert_non_decreasing(
         "sink discover->wanted",
@@ -105,6 +126,17 @@ async fn requested_download_records_pipeline_timestamps_on_source_and_sink() {
         source_timeline.response_sent_at.is_some(),
         "source should record response send"
     );
+    if let Some(need_sent_at) = source_timeline.need_list_sent_at {
+        assert!(
+            sink_timeline.need_list_received_at.is_some(),
+            "source recorded NeedList send but sink missed NeedList receipt"
+        );
+        assert_non_decreasing(
+            "needlist send->recv",
+            Some(need_sent_at),
+            sink_timeline.need_list_received_at,
+        );
+    }
     assert_non_decreasing(
         "source request->response",
         source_timeline.request_received_at,

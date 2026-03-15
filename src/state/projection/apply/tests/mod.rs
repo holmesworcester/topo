@@ -4,6 +4,7 @@ use crate::db::{
     open_in_memory,
     schema::create_tables,
     store::{insert_event, insert_neg_item_if_shared, insert_recorded_event},
+    timeline::EventTimeline,
 };
 use crate::event_modules::{
     self as events, registry, BenchDepEvent, EncryptedEvent, FileEvent, FileSliceEvent,
@@ -774,6 +775,23 @@ fn test_project_unblock_cascade() {
         )
         .unwrap();
     assert_eq!(blocked, 0);
+
+    let timeline = EventTimeline::new(&conn);
+    let row = timeline.load(&rxn_b64).unwrap().unwrap();
+    let msg_b64 = event_id_to_base64(&msg_eid);
+    assert!(
+        row.blocked_at.is_some(),
+        "reaction should record blocked_at"
+    );
+    assert!(
+        row.unblocked_at.is_some(),
+        "reaction should record unblocked_at"
+    );
+    assert_eq!(
+        row.unblocked_by_event_id.as_deref(),
+        Some(msg_b64.as_str()),
+        "reaction should record the final unblocking dependency",
+    );
 }
 
 #[test]

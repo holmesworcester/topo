@@ -41,6 +41,7 @@ pub fn observe_need_ids_for_peer(
     peer_id: &str,
     discovery_round_started_at: i64,
     need_ids: &mut Vec<Id>,
+    observed_ids: &mut Vec<EventId>,
 ) -> Result<usize, SyncError> {
     if need_ids.is_empty() {
         return Ok(0);
@@ -59,6 +60,7 @@ pub fn observe_need_ids_for_peer(
                 peer_id,
                 discovery_round_started_at,
                 &batch,
+                observed_ids,
             )?;
             batch.clear();
         }
@@ -71,6 +73,7 @@ pub fn observe_need_ids_for_peer(
             peer_id,
             discovery_round_started_at,
             &batch,
+            observed_ids,
         )?;
     }
     if need_ids.capacity() > (batch_cap * 16) {
@@ -86,10 +89,12 @@ pub fn observe_event_ids_for_peer(
     peer_id: &str,
     discovery_round_started_at: i64,
     ids: &[EventId],
+    observed_ids: &mut Vec<EventId>,
 ) -> Result<usize, SyncError> {
     if ids.is_empty() {
         return Ok(0);
     }
+    observed_ids.extend_from_slice(ids);
     Ok(wanted.observe_many_for_peer(
         local_peer_id,
         peer_id,
@@ -105,7 +110,9 @@ pub fn observe_event_ids_for_peer(
 /// `wanted` state and then pull the blobs under request credit.
 pub async fn send_need_list_from_have_ids<C>(
     control: &mut C,
+    timeline: &EventTimeline<'_>,
     have_ids: &mut Vec<Id>,
+    sent_ids_out: &mut Vec<EventId>,
 ) -> Result<usize, SyncError>
 where
     C: StreamConn,
@@ -122,7 +129,10 @@ where
         for neg_id in have_ids.drain(..drain_count) {
             ids.push(neg_id_to_event_id(&neg_id));
         }
+        sent_ids_out.extend_from_slice(&ids);
+        let sent_at = crate::db::queue::current_timestamp_ms();
         sent += ids.len();
+        let _ = timeline.mark_need_list_sent_many(&ids, sent_at);
         control.send(&Frame::NeedList { ids }).await?;
     }
     control.flush().await?;
@@ -171,6 +181,10 @@ where
     if selected.is_empty() {
         return Ok(0);
     }
+    if let Some(credit_received_at) = snapshot.last_credit_received_at {
+        let _ = timeline.mark_request_credit_received_many(&selected, credit_received_at);
+    }
+    let _ = timeline.mark_request_selected_many(&selected, now_ms);
 
     let batch_size = need_chunk().max(1);
     let mut batch = Vec::with_capacity(batch_size);
@@ -245,7 +259,7 @@ mod tests {
         let state = ConnectionRequestState::default();
         let mut id = [0u8; 32];
         id[0] = 7;
-        state.add_credit(1);
+        state.add_credit(1, 9);
         state.note_requested(&[id], 0);
         assert_eq!(state.stats(request_inflight_ttl_ms() + 1).inflight_len, 0);
     }

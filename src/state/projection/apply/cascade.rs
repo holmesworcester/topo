@@ -79,7 +79,11 @@ fn cascade_unblocked_inner(
             did_unblock = true;
             conn.prepare_cached("DELETE FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2")?
                 .execute(rusqlite::params![recorded_by, eid_b64])?;
-            let _ = EventTimeline::new(conn).mark_unblocked_b64(eid_b64, current_timestamp_ms());
+            let _ = EventTimeline::new(conn).mark_unblocked_with_dependency_b64(
+                eid_b64,
+                current_timestamp_ms(),
+                Some(&blocker),
+            );
 
             // 4. Project this event via project_one_step (no recursive cascade).
             //    apply_projection (called by project_one_step) executes emit_commands,
