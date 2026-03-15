@@ -12,7 +12,7 @@ Primary target:
 2. make those rows projection-owned state derived from event facts + explicitly modeled local context.
 
 ## Hard Constraints
-1. Keep strict mTLS behavior unchanged (`is_peer_allowed` remains authoritative at handshake).
+1. Keep strict mTLS behavior unchanged (`is_authorized_for_tenant` remains authoritative at handshake).
 2. Preserve inviter-side pre-accept trust (invitee first dial must still pass).
 3. Preserve joiner-side accepted bootstrap trust until steady-state PeerShared trust supersedes it.
 4. Do not reintroduce user-removal semantics in this branch; user removal is out of scope in this PoC.
@@ -34,7 +34,7 @@ Use a small local durable context table (projection input), e.g. `bootstrap_cont
 Service/bootstrap code may write context rows, but should not write trust rows directly.
 
 ### C) Trust checks become read-only (preferred)
-`is_peer_allowed` currently performs supersede updates on read.
+`is_authorized_for_tenant` currently performs supersede updates on read.
 Target: move supersession side effects into projection/maintenance path so trust checks are pure reads.
 
 ### D) Root-event guard cascade pattern (poc-6 -> poc-7)

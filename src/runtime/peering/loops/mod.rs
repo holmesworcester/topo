@@ -10,7 +10,7 @@
 //! construction (R4/SC4 of the peering readability plan).
 //!
 //! Sub-modules:
-//!  - `accept`   -- accept_loop, accept_loop_with_ingest, resolve_tenant_for_peer
+//!  - `accept`   -- accept_loop, accept_loop_with_ingest, resolve_inbound_auth_context
 //!  - `connect`  -- connect_loop, connect_loop_with_coordination
 //!  - `supervisor` -- shared preflight + session lifecycle supervision
 

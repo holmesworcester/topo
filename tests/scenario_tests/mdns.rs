@@ -10,7 +10,7 @@ use topo::testutil::{
 /// the discovered address. Exercises the full flow: advertise -> browse ->
 /// discover -> connect -> sync -> verify convergence.
 ///
-/// Uses dynamic DB trust lookup (production-matching `is_peer_allowed`).
+/// Uses dynamic DB trust lookup (production-matching `is_authorized_for_tenant`).
 /// Trust comes from PeerShared-derived identity chain with no manual trust seeding.
 #[cfg(feature = "discovery")]
 #[tokio::test]
@@ -137,7 +137,7 @@ async fn test_mdns_two_peers_discover_and_sync() {
 /// discover each other), external discovery (remote peer discovers all
 /// node tenants), and that sync works via the discovered address.
 ///
-/// Uses dynamic DB trust lookup (production-matching `is_peer_allowed`).
+/// Uses dynamic DB trust lookup (production-matching `is_authorized_for_tenant`).
 /// Trust comes from PeerShared-derived identity chain with no manual trust seeding.
 #[cfg(feature = "discovery")]
 #[tokio::test]

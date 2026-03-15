@@ -582,8 +582,8 @@ pub fn is_peer_allowed(
     Ok(allowed != 0)
 }
 
-/// Check whether any trusted peer fingerprints exist in SQL trust sources
-/// without materializing the full set. Uses EXISTS for early exit.
+/// Check whether any tenant-scoped transport authorization rows are currently
+/// live without materializing the full set. Uses EXISTS for early exit.
 pub fn has_any_trusted_peer(
     conn: &Connection,
     recorded_by: &str,

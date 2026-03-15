@@ -16,16 +16,32 @@ fn setup_db() -> rusqlite::Connection {
 // --- Concrete adapter tests ---
 
 #[test]
-fn concrete_adapter_install_bootstrap_from_invite_key_roundtrip() {
+fn concrete_adapter_install_bootstrap_from_invite_secret_roundtrip() {
     let conn = setup_db();
     let adapter = ConcreteTransportIdentityAdapter;
+    let recorded_by = "tenant-bootstrap";
+    let invite_event_id = [7u8; 32];
+    let invite_eid_b64 = topo::crypto::event_id_to_base64(&invite_event_id);
+    let secret_event_id = topo::crypto::event_id_to_base64(&[8u8; 32]);
     let key_bytes = [7u8; 32];
+    conn.execute(
+        "INSERT INTO invite_secrets (recorded_by, event_id, invite_event_id, private_key, created_at)
+         VALUES (?1, ?2, ?3, ?4, 0)",
+        rusqlite::params![
+            recorded_by,
+            secret_event_id,
+            invite_eid_b64,
+            key_bytes.to_vec()
+        ],
+    )
+    .unwrap();
 
     let peer_id = adapter
         .apply_intent(
             &conn,
-            TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
-                invite_private_key: key_bytes,
+            TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+                recorded_by: recorded_by.to_string(),
+                invite_event_id,
             },
         )
         .unwrap();
@@ -34,8 +50,9 @@ fn concrete_adapter_install_bootstrap_from_invite_key_roundtrip() {
     let peer_id2 = adapter
         .apply_intent(
             &conn,
-            TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
-                invite_private_key: key_bytes,
+            TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+                recorded_by: recorded_by.to_string(),
+                invite_event_id,
             },
         )
         .unwrap();
@@ -200,8 +217,9 @@ fn fake_adapter_records_intents() {
 
     fake.apply_intent(
         &conn,
-        TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
-            invite_private_key: [1u8; 32],
+        TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+            recorded_by: "rb1".to_string(),
+            invite_event_id: [1u8; 32],
         },
     )
     .unwrap();
@@ -237,8 +255,9 @@ fn fake_adapter_records_intents() {
     assert_eq!(intents.len(), 4);
     assert_eq!(
         intents[0],
-        TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
-            invite_private_key: [1u8; 32],
+        TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+            recorded_by: "rb1".to_string(),
+            invite_event_id: [1u8; 32],
         }
     );
     assert_eq!(
@@ -272,8 +291,9 @@ fn fake_adapter_returns_configured_peer_id() {
     let result = fake
         .apply_intent(
             &conn,
-            TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
-                invite_private_key: [0u8; 32],
+            TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+                recorded_by: "rb0".to_string(),
+                invite_event_id: [0u8; 32],
             },
         )
         .unwrap();

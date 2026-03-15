@@ -5274,9 +5274,10 @@ fn test_invite_accepted_materializes_bootstrap_trust_from_projection() {
     assert_eq!(addrs.len(), 1, "must have one active bootstrap addr");
     assert_eq!(addrs[0], bootstrap_addr, "bootstrap addr must match");
 
-    // The SPKI must pass is_peer_allowed
+    // The SPKI must pass is_authorized_for_tenant
     let allowed =
-        crate::db::transport_trust::is_peer_allowed(&conn, recorded_by, &bootstrap_spki).unwrap();
+        crate::db::transport_trust::is_authorized_for_tenant(&conn, recorded_by, &bootstrap_spki)
+            .unwrap();
     assert!(
         allowed,
         "bootstrap SPKI must be allowed via invite_bootstrap_trust"
@@ -5344,7 +5345,8 @@ fn test_invite_accepted_materializes_multiple_bootstrap_trust_rows() {
 
     // SPKI must be allowed
     let allowed =
-        crate::db::transport_trust::is_peer_allowed(&conn, recorded_by, &bootstrap_spki).unwrap();
+        crate::db::transport_trust::is_authorized_for_tenant(&conn, recorded_by, &bootstrap_spki)
+            .unwrap();
     assert!(allowed, "bootstrap SPKI must be allowed");
 }
 
@@ -5566,7 +5568,8 @@ fn test_full_bootstrap_progression_from_projected_sql_state() {
 
     // Verify PeerShared supersedes bootstrap trust
     let still_allowed =
-        crate::db::transport_trust::is_peer_allowed(&conn, recorded_by, &bootstrap_spki).unwrap();
+        crate::db::transport_trust::is_authorized_for_tenant(&conn, recorded_by, &bootstrap_spki)
+            .unwrap();
     // Bootstrap trust should be superseded once PeerShared projects.
     // The bootstrap SPKI was fake ([0xEE; 32]), not derived from peer_shared_pub,
     // so it should NOT be superseded by this PeerShared. It remains allowed until TTL.
@@ -5578,7 +5581,7 @@ fn test_full_bootstrap_progression_from_projected_sql_state() {
     // PeerShared-derived SPKI should now also be allowed (steady-state trust)
     let ps_spki = crate::transport::cert::spki_fingerprint_from_ed25519_pubkey(&peer_shared_pub);
     let ps_allowed =
-        crate::db::transport_trust::is_peer_allowed(&conn, recorded_by, &ps_spki).unwrap();
+        crate::db::transport_trust::is_authorized_for_tenant(&conn, recorded_by, &ps_spki).unwrap();
     assert!(
         ps_allowed,
         "PeerShared-derived SPKI must be allowed via steady-state trust"
@@ -5634,7 +5637,8 @@ fn test_bootstrap_trust_superseded_by_matching_peer_shared() {
 
     // Bootstrap SPKI must be allowed
     assert!(
-        crate::db::transport_trust::is_peer_allowed(&conn, recorded_by, &bootstrap_spki).unwrap(),
+        crate::db::transport_trust::is_authorized_for_tenant(&conn, recorded_by, &bootstrap_spki)
+            .unwrap(),
         "bootstrap SPKI must be allowed before PeerShared"
     );
 
@@ -5713,7 +5717,8 @@ fn test_bootstrap_trust_superseded_by_matching_peer_shared() {
 
     // PeerShared-derived SPKI should still be allowed (via peers_shared steady-state trust)
     assert!(
-        crate::db::transport_trust::is_peer_allowed(&conn, recorded_by, &bootstrap_spki).unwrap(),
+        crate::db::transport_trust::is_authorized_for_tenant(&conn, recorded_by, &bootstrap_spki)
+            .unwrap(),
         "PeerShared-derived SPKI must still be allowed via steady-state trust"
     );
 }

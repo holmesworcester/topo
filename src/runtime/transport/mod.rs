@@ -437,21 +437,21 @@ pub fn requested_server_name_from_connection(conn: &quinn::Connection) -> Option
 
 /// Create a single-port dual-role QUIC endpoint that serves multiple workspaces.
 ///
-/// Server side: uses `WorkspaceCertResolver` to select the correct cert based
+/// Server side: uses `TransportTargetCertResolver` to select the correct cert based
 /// on the client's SNI. Client side: uses a default client config with the
-/// first workspace's cert (outbound connections use `connect_with()` for
-/// per-workspace config).
+/// first local transport cert (outbound connections use `connect_with()` for
+/// per-tenant config).
 ///
 /// Trust verification is via a dynamic allow function that checks across
-/// all workspaces.
+/// all local tenants.
 pub fn create_single_port_endpoint(
     bind_addr: SocketAddr,
-    cert_resolver: Arc<multi_workspace::WorkspaceCertResolver>,
+    cert_resolver: Arc<multi_workspace::TransportTargetCertResolver>,
     allow_fn: Arc<DynamicAllowFn>,
     default_client_cert: CertificateDer<'static>,
     default_client_key: PrivatePkcs8KeyDer<'static>,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
-    // Server config: multi-workspace cert resolver + dynamic trust
+    // Server config: exact transport-target cert resolver + dynamic trust
     let server_verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn.clone()));
     let server_crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(server_verifier)

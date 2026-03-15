@@ -459,7 +459,7 @@ Conceptually:
 
 Transport cert/key materialization is isolated behind a typed contract:
 
-- **`TransportIdentityIntent`** (enum): describes *what* identity change is needed (`InstallBootstrapIdentityFromInviteKey` or `InstallPeerSharedIdentityFromSigner`).
+- **`TransportIdentityIntent`** (enum): describes *what* identity change is needed (`InstallBootstrapIdentityFromInviteSecret` or `InstallPeerSharedIdentityFromSigner`).
 - **`TransportIdentityAdapter`** (trait): executes the intent against the DB. The sole concrete implementation (`ConcreteTransportIdentityAdapter` in `src/runtime/transport/identity_adapter.rs`) is the **only** code that calls raw install functions (`install_invite_bootstrap_transport_identity`, `install_peer_key_transport_identity`).
 - **Workspace command layer** (`accept_invite` / `accept_device_link`) installs invite-derived bootstrap identity via the adapter intent path (not raw transport calls).
 - **Event modules** emit `ApplyTransportIdentityIntent` commands (e.g., `peer_secret` projector for PeerShared signers).
@@ -718,9 +718,9 @@ Why certs are part of discovery:
 The node daemon (`run_node`) operates as follows:
 
 1. Discover all local tenants from the DB.
-2. Create a **single** QUIC endpoint with `WorkspaceCertResolver` for SNI-based cert selection across all tenants.
+2. Create a **single** QUIC endpoint with `TransportTargetCertResolver` for exact local transport-target SNI cert selection across all tenants.
 3. Create one shared `batch_writer` thread that all tenants feed into.
-4. Run a single `accept_loop_with_ingest` with a union dynamic trust closure that checks across all tenants. Post-handshake, the peer's SPKI fingerprint is checked per-tenant to determine `recorded_by` routing.
+4. Run a single `accept_loop_with_ingest` with a node-scoped union trust closure. Post-handshake, the requested local transport fingerprint is resolved to exactly one tenant from local SQL state, then that tenant alone authorizes the authenticated remote fingerprint.
 5. Optionally: per-tenant mDNS advertisement and peer discovery.
 
 ### Single-port multi-tenant endpoint
@@ -729,12 +729,14 @@ All tenants on a device share a single UDP port. The server registers exact loca
 
 ### Per-tenant dynamic trust
 
-The single QUIC endpoint uses a union trust closure that accepts connections trusted by **any** local tenant. Post-handshake, `resolve_tenant_for_peer` checks `is_peer_allowed` for each tenant to determine routing. The trust closure queries three trust sources for each tenant's `recorded_by`:
+The single QUIC endpoint uses a node-scoped union trust closure that accepts a handshake only if **some** local tenant currently authorizes the remote fingerprint. Post-handshake, the client-requested local transport fingerprint is resolved through `local_transport_targets`. If that fingerprint maps to one tenant, only that tenant's `is_authorized_for_tenant` result may admit the session. Temporary bootstrap aliases may overlap during reused invite/device-link bootstrap; in that case the accept boundary filters by tenant-scoped trust and admits the connection only if exactly one tenant authorizes the remote fingerprint, otherwise it rejects the connection as ambiguous. The trust closure queries three trust sources for each tenant's `recorded_by`:
 - **PeerShared-derived transport fingerprints** (primary steady-state; from projected `peers_shared.transport_fingerprint`),
 - `invite_bootstrap_trust` rows (accepted invite-link bootstrap, TTL-bounded),
 - `pending_invite_bootstrap_trust` rows (inviter-side pre-handshake, TTL-bounded).
 
-Trust checks are **tenant-scoped** (`recorded_by`-partitioned). Value-level trust-set overlap is allowed (the same SPKI may appear in multiple tenants' trust rows), and the union closure permits the shared endpoint to accept connections for any local tenant. `invites_accepted` is read during startup tenant discovery (to enumerate local tenant/workspace bindings), but per-connection authorization uses `is_peer_allowed` over PeerShared/bootstrap trust tables, not `invites_accepted`.
+Trust checks are **tenant-scoped** (`recorded_by`-partitioned). Value-level trust-set overlap is allowed (the same SPKI may appear in multiple tenants' trust rows). In steady state, exact local-target routing prevents another tenant's trust from satisfying an SNI request for this tenant. During temporary bootstrap alias reuse, exact-target admission still stays tenant-scoped because ambiguous aliases are rejected unless exactly one tenant authorizes the presented remote fingerprint. `invites_accepted` is read during startup tenant discovery, while per-connection exact-target routing uses `local_transport_targets` and per-connection authorization uses `is_authorized_for_tenant` over PeerShared/bootstrap trust tables.
+
+`local_transport_targets` is not a new authority source. It is replay-derived local routing state: local event projection emits transport identity intents, the transport adapter materializes the cert/key, and that successful apply updates the tenant's currently active local transport fingerprint. Replaying local event state rebuilds both `local_transport_creds` and `local_transport_targets`.
 
 ### User removal is out of scope
 
@@ -782,7 +784,7 @@ Discovery rules:
 mDNS authenticity model (POC):
 1. mDNS advertisements are treated as unauthenticated discovery hints (address + claimed peer_id),
 2. an attacker can spoof mDNS TXT records and cause extra dial attempts,
-3. spoofed advertisements cannot bypass identity/auth: session acceptance still requires mTLS identity and tenant-scoped `is_peer_allowed` trust checks,
+3. spoofed advertisements cannot bypass identity/auth: session acceptance still requires mTLS identity and tenant-scoped `is_authorized_for_tenant` trust checks,
 4. authoritative peer identity for the session is the TLS/SPKI-derived peer fingerprint observed at handshake, not the mDNS TXT claim.
 
 Out-of-scope note (current POC):
@@ -897,7 +899,7 @@ Bootstrap trust materialization uses projector `WriteOp`s (not `EmitCommand`s):
 1. `user_invite_shared`/`peer_invite_shared` projectors write pending bootstrap trust rows when `is_local_create` and `bootstrap_context` are present,
 2. `invite_accepted` projector writes accepted bootstrap trust rows when `bootstrap_context` is present,
 3. `peer_shared` projector consumes matching bootstrap trust rows using deterministic `Delete` write-ops,
-4. trust-check functions (`is_peer_allowed`, `authorized_fingerprints_from_db`) remain read-only.
+4. trust-check functions (`is_authorized_for_tenant`, `authorized_fingerprints_from_db`) remain read-only.
 
 ### ContextSnapshot
 
@@ -1589,7 +1591,7 @@ This approach makes first-user creation and device linking isomorphic to subsequ
 2. Joiner accepts invite (`invite_accepted`) and writes accepted bootstrap trust rows for its scoped tenant.
 3. Initial sync sessions may authenticate via bootstrap trust rows while full identity events are still converging.
 4. `peer_shared` projection consumes matching bootstrap trust rows with deterministic `Delete` write-ops once steady-state PeerShared trust is present.
-5. Ongoing dial/accept checks then use SQL trust queries (`is_peer_allowed`) with no trust writes in read paths.
+5. Ongoing dial/accept checks then use SQL trust queries (`is_authorized_for_tenant`) with no trust writes in read paths.
 
 ## 9.4 Sender-subjective encryption proof-of-concept
 
@@ -1624,7 +1626,7 @@ This section covers the lifecycle state machine for the three trust sources: Pee
 
 Credential transition model: invite acceptance may install a bootstrap transport cert first; projection later installs the PeerShared-derived cert. Runtime enforces one-way transition (no bootstrap-after-PeerShared downgrade).
 
-Consumption: when a PeerShared event is projected, the PeerShared projector deletes matching `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` entries for that SPKI in the same projection apply transaction. This happens at projection time, not on trust check reads — trust check reads (`is_peer_allowed`, `authorized_fingerprints_from_db`) are pure queries with no write side-effects.
+Consumption: when a PeerShared event is projected, the PeerShared projector deletes matching `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` entries for that SPKI in the same projection apply transaction. This happens at projection time, not on trust check reads — trust check reads (`is_authorized_for_tenant`, `authorized_fingerprints_from_db`) are pure queries with no write side-effects.
 
 Lookup shape: trust queries resolve peers via projected `peers_shared.transport_fingerprint` (indexed by `(recorded_by, transport_fingerprint)`), not by runtime fallback scans over `peers_shared.public_key`.
 

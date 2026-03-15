@@ -49,6 +49,7 @@ use crate::projection::create::{
     create_event_synchronous, create_signed_event_staged, create_signed_event_synchronous,
     event_id_or_blocked, CreateEventError,
 };
+use crate::state::db::queue::SQLITE_BUSY_RETRY_ATTEMPTS;
 use crate::state::db::queue::SQLITE_BUSY_RETRY_BASE_MS;
 use crate::transport::identity::{
     ensure_transport_peer_id, load_transport_cert, load_transport_cert_required_from_db,
@@ -722,7 +723,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        self.create_encrypted_signed_event_synchronous(&db, &self.content_key_event_id(&db), &inner)
+        self.create_encrypted_signed_event_synchronous(&self.content_key_event_id(&db), &inner)
     }
 
     /// Create a reaction targeting a message event.
@@ -738,7 +739,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        self.create_encrypted_signed_event_synchronous(&db, &self.content_key_event_id(&db), &inner)
+        self.create_encrypted_signed_event_synchronous(&self.content_key_event_id(&db), &inner)
     }
 
     /// Create a reaction, tolerating blocked projection when the target message
@@ -794,7 +795,6 @@ impl Peer {
     /// Create an encrypted message. The inner message is signed with the PeerShared key,
     /// then encrypted. Returns the encrypted event ID. Requires identity chain.
     pub fn create_encrypted_message(&self, key_event_id: &EventId, content: &str) -> EventId {
-        let db = open_connection(&self.db_path).expect("failed to open db");
         let inner = ParsedEvent::Message(MessageEvent {
             created_at_ms: current_timestamp_ms(),
             workspace_id: self.workspace_id,
@@ -805,7 +805,7 @@ impl Peer {
             signature: [0u8; 64],
         });
         // Sign the inner event, then encrypt the signed blob
-        self.create_encrypted_signed_event_synchronous(&db, key_event_id, &inner)
+        self.create_encrypted_signed_event_synchronous(key_event_id, &inner)
     }
 
     /// Sign an inner event, encrypt the signed blob, wrap in EncryptedEvent, store + project.
@@ -813,13 +813,19 @@ impl Peer {
     /// state rather than panicking, mirroring real ingestion behaviour.
     fn create_encrypted_signed_event_synchronous(
         &self,
-        db: &rusqlite::Connection,
         key_event_id: &EventId,
         inner_event: &ParsedEvent,
     ) -> EventId {
-        for attempt in 0..8 {
+        for attempt in 0..TESTUTIL_SQLITE_BUSY_RETRY_ATTEMPTS {
+            let db = open_connection(&self.db_path).expect("failed to open db");
+            // Full-suite sync_graph runs can create substantial writer
+            // contention on a single test DB. Use a fresh connection per
+            // attempt and give it a longer wait budget before surfacing
+            // SQLITE_BUSY so realistic graph tests remain stable under the
+            // default cargo scheduler.
+            let _ = db.busy_timeout(Duration::from_secs(30));
             match event_id_or_blocked(create_encrypted_event_synchronous(
-                db,
+                &db,
                 &self.identity,
                 key_event_id,
                 inner_event,
@@ -827,7 +833,8 @@ impl Peer {
             )) {
                 Ok(event_id) => return event_id,
                 Err(CreateEventError::DbError(err))
-                    if err.contains("database is locked") && attempt + 1 < 8 =>
+                    if err.contains("database is locked")
+                        && attempt + 1 < TESTUTIL_SQLITE_BUSY_RETRY_ATTEMPTS =>
                 {
                     std::thread::sleep(Duration::from_millis(SQLITE_BUSY_RETRY_BASE_MS << attempt));
                 }
@@ -863,7 +870,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        self.create_encrypted_signed_event_synchronous(&db, &self.content_key_event_id(&db), &inner)
+        self.create_encrypted_signed_event_synchronous(&self.content_key_event_id(&db), &inner)
     }
 
     /// Create an encrypted MessageDeletion event.
@@ -873,7 +880,6 @@ impl Peer {
         key_event_id: &EventId,
         target_event_id: &EventId,
     ) -> EventId {
-        let db = open_connection(&self.db_path).expect("failed to open db");
         let inner = ParsedEvent::MessageDeletion(MessageDeletionEvent {
             created_at_ms: current_timestamp_ms(),
             target_event_id: *target_event_id,
@@ -882,7 +888,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        self.create_encrypted_signed_event_synchronous(&db, key_event_id, &inner)
+        self.create_encrypted_signed_event_synchronous(key_event_id, &inner)
     }
 
     // --- Identity event helpers ---
@@ -1156,7 +1162,7 @@ impl Peer {
                 signer_type: 5,
                 signature: [0u8; 64],
             });
-            self.create_encrypted_signed_event_synchronous(&db, &key_event_id, &inner);
+            self.create_encrypted_signed_event_synchronous(&key_event_id, &inner);
         }
         db.execute("COMMIT", []).expect("failed to commit");
     }
@@ -1186,7 +1192,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let msg_eid = self.create_encrypted_signed_event_synchronous(&db, &key_event_id, &msg);
+        let msg_eid = self.create_encrypted_signed_event_synchronous(&key_event_id, &msg);
 
         let file_id: [u8; 32] = {
             use std::hash::{Hash, Hasher};
@@ -1219,7 +1225,7 @@ impl Peer {
             signer_type: 5,
             signature: [0u8; 64],
         });
-        let _att_eid = self.create_encrypted_signed_event_synchronous(&db, &key_event_id, &att);
+        let _att_eid = self.create_encrypted_signed_event_synchronous(&key_event_id, &att);
 
         // Batch-create file slices inside a transaction
         let ciphertext: Vec<u8> = vec![0xAB; FILE_SLICE_CIPHERTEXT_BYTES];
@@ -3919,3 +3925,4 @@ mod fingerprint_tests {
         }
     }
 }
+const TESTUTIL_SQLITE_BUSY_RETRY_ATTEMPTS: usize = SQLITE_BUSY_RETRY_ATTEMPTS + 4;

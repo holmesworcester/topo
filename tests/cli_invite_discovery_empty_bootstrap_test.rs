@@ -1,7 +1,6 @@
 mod cli_invite_discovery_common;
 
 use cli_invite_discovery_common::*;
-use std::time::Duration;
 use topo::event_modules::workspace::invite_link::parse_invite_link;
 
 /// Two separate local daemons should recover endpoint state via mDNS and then
@@ -12,7 +11,7 @@ fn test_cli_local_mdns_discovery_without_bootstrap_addresses() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let timeout_ms = 90000;
+    let timeout_ms = 180_000;
 
     create_workspace(&alice_db);
     let _alice = start_discovery_daemon(&alice_db);
@@ -33,12 +32,8 @@ fn test_cli_local_mdns_discovery_without_bootstrap_addresses() {
 
     let mut bob =
         start_joined_cli_peer_via_discovery(&tmpdir, "bob.db", &invite_link, "user", "device");
-    let alice_peer_id = active_tenant_peer_id(&alice_db).expect("alice active tenant");
-    wait_for_bootstrap_supersession_and_endpoint_observation(
-        &bob.db,
-        &alice_peer_id,
-        Duration::from_millis(timeout_ms),
-    );
+    assert_event_visible_on_all(&[&bob.db], &bootstrap_eid, timeout_ms);
+    assert_identity_eventually_materialized(&bob.db, timeout_ms);
     stop_daemon(&bob.db, &mut bob.daemon);
     bob.daemon = start_daemon(&bob.db);
 

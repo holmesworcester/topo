@@ -1,8 +1,8 @@
 //! Endpoint creation, tenant discovery, and cert resolver setup.
 //!
 //! Extracts the startup phase of `run_node`: discovers local tenants, verifies
-//! SPKI fingerprints, builds the multi-workspace cert resolver, per-tenant
-//! client configs, and creates the single QUIC endpoint.
+//! SPKI fingerprints, builds the exact transport-target cert resolver,
+//! per-tenant client configs, and creates the single QUIC endpoint.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
@@ -15,7 +15,7 @@ use crate::db::{open_connection, schema::create_tables};
 use crate::transport::{
     build_tenant_client_config_from_creds, create_runtime_endpoint_for_tenants,
     extract_spki_fingerprint,
-    multi_workspace::{transport_sni, WorkspaceCertResolver},
+    multi_workspace::{transport_sni, TransportTargetCertResolver},
     TenantClientConfigs, TransportEndpoint,
 };
 use rustls::sign::CertifiedKey;
@@ -38,7 +38,7 @@ pub(crate) fn setup_endpoint_and_tenants(
     db_path: &str,
     bind: SocketAddr,
     net_info_tx: tokio::sync::oneshot::Sender<NodeRuntimeNetInfo>,
-    cert_resolver: Arc<WorkspaceCertResolver>,
+    cert_resolver: Arc<TransportTargetCertResolver>,
 ) -> Result<StartupResult, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
     create_tables(&db)?;
@@ -58,7 +58,7 @@ pub(crate) fn setup_endpoint_and_tenants(
         .map(|t| t.transport_peer_id.clone())
         .collect();
 
-    // Build multi-workspace cert resolver + tenant metadata
+    // Build exact transport-target cert resolver + tenant metadata
     let provider = rustls::crypto::ring::default_provider();
     let mut peer_to_workspace: HashMap<String, String> = HashMap::new();
     let mut default_cert: Option<(

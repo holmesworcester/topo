@@ -1517,7 +1517,7 @@ struct ManagedRuntime {
     handle: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
     /// Shared cert resolver — kept so new tenants can register certs
     /// on the live endpoint without restarting.
-    cert_resolver: Arc<topo::transport::multi_workspace::WorkspaceCertResolver>,
+    cert_resolver: Arc<topo::transport::multi_workspace::TransportTargetCertResolver>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -1608,7 +1608,7 @@ fn classify_tenant_change(
 fn register_new_tenant_certs(
     db_path: &str,
     new_tenants: &[RuntimeTenantState],
-    cert_resolver: &topo::transport::multi_workspace::WorkspaceCertResolver,
+    cert_resolver: &topo::transport::multi_workspace::TransportTargetCertResolver,
 ) -> Vec<String> {
     let mut registered = Vec::new();
     let provider = rustls::crypto::ring::default_provider();
@@ -1749,7 +1749,8 @@ fn spawn_runtime(
     *state.runtime_net.write().unwrap() = None;
     clear_upnp_report(&state);
 
-    let cert_resolver = Arc::new(topo::transport::multi_workspace::WorkspaceCertResolver::new());
+    let cert_resolver =
+        Arc::new(topo::transport::multi_workspace::TransportTargetCertResolver::new());
     let cert_resolver_for_task = cert_resolver.clone();
 
     let runtime_shutdown = Arc::new(tokio::sync::Notify::new());

@@ -19,7 +19,7 @@ Primary TODO targets:
 ## Current Fake Surface
 
 1. `tests/holepunch_test.rs` manually calls `record_endpoint_observation(...)` for introducer state setup.
-2. Multiple test helpers use static `AllowedPeers::from_fingerprints(...)` where production now favors runtime DB trust lookups (`is_peer_allowed`).
+2. Multiple test helpers use static `AllowedPeers::from_fingerprints(...)` where production now favors runtime DB trust lookups (`is_authorized_for_tenant`).
 
 ## Primary Files
 
@@ -46,7 +46,7 @@ Required commands:
 
 Tasks:
 
-1. Add test helper endpoint mode that resolves trust via DB (`is_peer_allowed`) at handshake time.
+1. Add test helper endpoint mode that resolves trust via DB (`is_authorized_for_tenant`) at handshake time.
 2. Keep static pin helper available for explicit policy tests.
 3. Add helper-level tests or assertions to validate selected mode.
 

@@ -143,6 +143,7 @@ fn assert_event_visible_on_all(db_paths: &[&str], event_id: &str, timeout_ms: u6
 
 #[test]
 fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
+    cleanup_test_daemons();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 90000;
 
@@ -177,6 +178,7 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
         &alice_db,
         &DaemonOptions {
             bind_port: Some(random_port()),
+            disable_discovery: true,
             stdout_file: Some(alice_stdout.clone()),
             stderr_file: Some(alice_stderr.clone()),
             ..Default::default()
@@ -201,6 +203,7 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
         &bob_db,
         &DaemonOptions {
             bind_port: Some(random_port()),
+            disable_discovery: true,
             stdout_file: Some(bob_stdout.clone()),
             stderr_file: Some(bob_stderr.clone()),
             ..Default::default()
@@ -234,22 +237,23 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
         &carol_db,
         &DaemonOptions {
             bind_port: Some(random_port()),
+            disable_discovery: true,
             stdout_file: Some(carol_stdout.clone()),
             stderr_file: Some(carol_stderr.clone()),
             ..Default::default()
         },
     );
 
-    let bob_peer_id = peer_id_for_username(&bob_db, "bob");
-    let carol_addr: SocketAddr = daemon_listen_addr(&carol_db)
-        .parse()
-        .expect("carol listen addr");
     wait_for_transport_cred_source(
         &carol_db,
         &carol_join.peer_id,
         topo::db::transport_creds::CRED_SOURCE_PEER_SHARED,
         timeout_ms,
     );
+    let bob_peer_id = peer_id_for_username(&bob_db, "bob");
+    let carol_addr: SocketAddr = daemon_listen_addr(&carol_db)
+        .parse()
+        .expect("carol listen addr");
     wait_for_direct_trust_dial(
         &bob_db,
         &bob_peer_id,

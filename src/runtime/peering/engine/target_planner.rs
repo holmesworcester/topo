@@ -383,6 +383,13 @@ mod tests {
             transport_creds::CRED_SOURCE_PEER_SHARED,
         )
         .unwrap();
+        transport_creds::set_local_transport_target(
+            conn,
+            tenant_id,
+            tenant_id,
+            transport_creds::CRED_SOURCE_PEER_SHARED,
+        )
+        .unwrap();
         transport_trust::record_invite_bootstrap_trust(
             conn,
             tenant_id,
@@ -438,6 +445,13 @@ mod tests {
             &bootstrap_peer_id,
             b"cert",
             b"key",
+            transport_creds::CRED_SOURCE_BOOTSTRAP,
+        )
+        .unwrap();
+        transport_creds::set_local_transport_target(
+            conn,
+            tenant_id,
+            &bootstrap_peer_id,
             transport_creds::CRED_SOURCE_BOOTSTRAP,
         )
         .unwrap();
@@ -632,7 +646,7 @@ mod tests {
         assert_eq!(addrs[0], bootstrap_addr);
 
         assert!(
-            transport_trust::is_peer_allowed(&conn, recorded_by, &bootstrap_spki).unwrap(),
+            transport_trust::is_authorized_for_tenant(&conn, recorded_by, &bootstrap_spki).unwrap(),
             "bootstrap SPKI must be allowed for TLS handshake"
         );
     }
@@ -709,6 +723,13 @@ mod tests {
             tenant_id,
             b"cert",
             b"key",
+            transport_creds::CRED_SOURCE_PEER_SHARED,
+        )
+        .unwrap();
+        transport_creds::set_local_transport_target(
+            &conn,
+            tenant_id,
+            tenant_id,
             transport_creds::CRED_SOURCE_PEER_SHARED,
         )
         .unwrap();

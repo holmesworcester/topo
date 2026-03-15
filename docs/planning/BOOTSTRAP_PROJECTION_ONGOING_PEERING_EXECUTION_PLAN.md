@@ -74,7 +74,7 @@ Refactor accept flow so service records acceptance and context; runtime handles 
 Unify bootstrap and steady-state sync initiation in runtime loops:
 
 1. Extend existing autodial/queue refresh to treat bootstrap trust rows as normal dial candidates.
-2. Ensure trust oracle gating remains SQL-based (`is_peer_allowed`).
+2. Ensure trust oracle gating remains SQL-based (`is_authorized_for_tenant`).
 3. Ensure retry/backoff and loop cadence handle bootstrap targets without one-off service calls.
 4. Preserve memory-safe behavior for large peer sets (no full-set materialization where avoidable).
 

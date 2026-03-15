@@ -250,7 +250,7 @@ flowchart TD
 - `Shared event send`: `Store::get_shared(events) -> Frame::Event`.
 - `Projection tables`: projected read models (`messages`, `users`, `peers`, `channels`).
 - `Transport trust tables`: transport trust rows (`peer_shared`, invite bootstrap records).
-- `connection lifecycle + trust read`: transport-owned tenant-scoped lookup via `db::transport_trust::is_peer_allowed` plus dial/accept identity handling.
+- `connection lifecycle + trust read`: transport-owned tenant-scoped lookup via `db::transport_trust::is_authorized_for_tenant` plus dial/accept identity handling.
 
 ## 5) Bootstrap Event DAG (Alice/Bob/Carol, Multi-device)
 
@@ -379,4 +379,4 @@ flowchart LR
 8. `HaveList` IDs originate from sync reconciliation `need_ids`; runtime initiator sessions use coordinator-assigned subsets (autodial + mDNS), then land in `egress_queue`.
 9. Foreground runtime is daemon-first (`topo start`): shutdown is coordinated by shared `shutdown_notify` (RPC `Shutdown` or Ctrl-C).
 10. Runtime and helper initiator sessions both route pull assignment through the coordinator; there is no direct `need_ids -> HaveList(all)` bypass path.
-11. Transport trust checks now read `db::transport_trust::is_peer_allowed` directly inside transport; the separate trust-oracle adapter layer is removed.
+11. Transport trust checks now read `db::transport_trust::is_authorized_for_tenant` directly inside transport; the separate trust-oracle adapter layer is removed.

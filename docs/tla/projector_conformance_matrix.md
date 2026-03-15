@@ -149,7 +149,7 @@ both `pass` and `break` polarity unless waived.
 | SPEC_TCL_SPKI_01 | InvSPKIUniqueness | CHK_TCL_SPKI_UNIQUE | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
 | SPEC_TCL_SPKI_01 | InvSPKIUniqueness | CHK_TCL_SPKI_UNIQUE | runtime_unit | runtime::transport::cert::tests::test_validate_cert_key_match_detects_mismatch | break |
 | SPEC_TCL_TRUST_UNION_01 | InvTrustSetIsExactUnion | CHK_TCL_TRUST_UNION | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
-| SPEC_TCL_TRUST_UNION_01 | InvTrustSetIsExactUnion | CHK_TCL_TRUST_UNION | runtime_unit | state::db::transport_trust::tests::test_is_peer_allowed_checks_all_sources | break |
+| SPEC_TCL_TRUST_UNION_01 | InvTrustSetIsExactUnion | CHK_TCL_TRUST_UNION | runtime_unit | state::db::transport_trust::tests::test_is_authorized_for_tenant_checks_all_sources | break |
 | SPEC_TCL_SOURCES_01 | InvTrustSourcesWellFormed | CHK_TCL_SOURCES_FORMED | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
 | SPEC_TCL_SOURCES_01 | InvTrustSourcesWellFormed | CHK_TCL_SOURCES_FORMED | runtime_unit | state::db::transport_trust::tests::test_allowed_peers_count_ignores_malformed_rows | break |
 | SPEC_TCL_MUTUAL_01 | InvMutualAuthSymmetry | CHK_TCL_MUTUAL_AUTH | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
@@ -174,8 +174,8 @@ both `pass` and `break` polarity unless waived.
 | SPEC_BR_PENDING_LOCAL_02 | BrInv_PendingOnlyOnInviter | CHK_BRIDGE_PENDING_LOCAL_CREATE | projector_unit | device_invite_projector_tests::tests::test_device_invite_writes_pending_trust | pass |
 | SPEC_BR_PENDING_LOCAL_02 | BrInv_PendingOnlyOnInviter | CHK_BRIDGE_PENDING_LOCAL_CREATE | projector_unit | device_invite_projector_tests::tests::test_device_invite_no_pending_when_not_local | break |
 | SPEC_BR_ALLOWED_AUTH_01 | BrInv_AllowedPeerMatchesAuthDecision | CHK_BRIDGE_ALLOWED_PEER_AUTH | bridge_integration | tlc::UnifiedBridge::unified_bridge_fix_repro.cfg | pass |
-| SPEC_BR_ALLOWED_AUTH_01 | BrInv_AllowedPeerMatchesAuthDecision | CHK_BRIDGE_ALLOWED_PEER_AUTH | runtime_unit | state::db::transport_trust::tests::test_is_peer_allowed_checks_all_sources | pass |
-| SPEC_BR_ALLOWED_AUTH_01 | BrInv_AllowedPeerMatchesAuthDecision | CHK_BRIDGE_ALLOWED_PEER_AUTH | runtime_unit | state::db::transport_trust::tests::test_is_peer_allowed_checks_all_sources | break |
+| SPEC_BR_ALLOWED_AUTH_01 | BrInv_AllowedPeerMatchesAuthDecision | CHK_BRIDGE_ALLOWED_PEER_AUTH | runtime_unit | state::db::transport_trust::tests::test_is_authorized_for_tenant_checks_all_sources | pass |
+| SPEC_BR_ALLOWED_AUTH_01 | BrInv_AllowedPeerMatchesAuthDecision | CHK_BRIDGE_ALLOWED_PEER_AUTH | runtime_unit | state::db::transport_trust::tests::test_is_authorized_for_tenant_checks_all_sources | break |
 | SPEC_BR_ONGOING_PREF_01 | BrInv_OngoingPreferred | CHK_BRIDGE_ONGOING_PREFERENCE | runtime_unit | bootstrap_dial_context::tests::primary_success_is_ongoing_mode | pass |
 | SPEC_BR_ONGOING_PREF_01 | BrInv_OngoingPreferred | CHK_BRIDGE_ONGOING_PREFERENCE | runtime_unit | connect::tests::fallback_policy_allows_typed_trust_rejection_with_fallback_cfg | break |
 | SPEC_BR_FALLBACK_01 | BrInv_BootstrapFallbackOnlyWhenNeeded | CHK_BRIDGE_BOOTSTRAP_FALLBACK | runtime_unit | connect::tests::fallback_policy_allows_typed_trust_rejection_with_fallback_cfg | pass |

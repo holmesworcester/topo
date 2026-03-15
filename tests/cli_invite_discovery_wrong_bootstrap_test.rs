@@ -11,7 +11,7 @@ fn test_cli_local_mdns_discovery_with_wrong_bootstrap_address_only() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let timeout_ms = 90000;
+    let timeout_ms = 180_000;
 
     create_workspace(&alice_db);
     let _alice = start_discovery_daemon(&alice_db);

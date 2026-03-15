@@ -12,8 +12,8 @@ use topo::testutil::{
 };
 use topo::transport::{
     create_single_port_endpoint, multi_workspace::transport_sni,
-    multi_workspace::WorkspaceCertResolver, peer_identity_from_connection, workspace_client_config,
-    DynamicAllowFn,
+    multi_workspace::TransportTargetCertResolver, peer_identity_from_connection,
+    workspace_client_config, DynamicAllowFn,
 };
 
 fn allow_from_peer(peer: &Peer) -> Arc<DynamicAllowFn> {
@@ -216,7 +216,7 @@ async fn test_connect_with_presents_correct_tenant_cert() {
         }
     });
 
-    let resolver = Arc::new(WorkspaceCertResolver::new());
+    let resolver = Arc::new(TransportTargetCertResolver::new());
     let (default_cert, default_key) = default_tenant.cert_and_key();
     let client_ep = create_single_port_endpoint(
         "127.0.0.1:0".parse().unwrap(),
@@ -344,7 +344,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
     use topo::peering::loops::connect_loop;
     use topo::transport::{
         create_single_port_endpoint,
-        multi_workspace::{transport_sni, WorkspaceCertResolver},
+        multi_workspace::{transport_sni, TransportTargetCertResolver},
         workspace_client_config, DynamicAllowFn,
     };
 
@@ -420,7 +420,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
     let fallback_marker_b64 = event_id_to_base64(&fallback_marker);
 
     let provider = rustls::crypto::ring::default_provider();
-    let cert_resolver_a = WorkspaceCertResolver::new();
+    let cert_resolver_a = TransportTargetCertResolver::new();
     let mut default_cert_a: Option<(CertificateDer<'static>, PrivatePkcs8KeyDer<'static>)> = None;
 
     for t in &tenants_a {
@@ -517,7 +517,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
     }
 
     // Node B endpoint (for outbound connect_loop calls)
-    let cert_resolver_b = WorkspaceCertResolver::new();
+    let cert_resolver_b = TransportTargetCertResolver::new();
     let mut default_cert_b: Option<(CertificateDer<'static>, PrivatePkcs8KeyDer<'static>)> = None;
     for t in &tenants_b {
         let cert_der = CertificateDer::from(t.cert_der.clone());

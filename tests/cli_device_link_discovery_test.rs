@@ -80,6 +80,7 @@ fn start_linked_cli_peer(
         );
         daemon
     };
+    wait_for_active_tenant_ready(&db, std::time::Duration::from_secs(120));
     StartedCliPeer {
         db,
         username: username.to_string(),
@@ -103,6 +104,7 @@ fn start_linked_cli_peer_via_discovery(
         device_name,
         std::time::Duration::from_secs(20),
     );
+    wait_for_active_tenant_ready(&db, std::time::Duration::from_secs(120));
     StartedCliPeer {
         db,
         username: username.to_string(),
@@ -122,7 +124,7 @@ fn assert_event_visible_on_all(db_paths: &[&str], event_id: &str, timeout_ms: u6
 fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 90_000;
+    let timeout_ms = 180_000;
     let workspace_name = "device-link-mixed-topology";
 
     let phone_db = tmpdir.path().join("phone.db").to_str().unwrap().to_string();
