@@ -94,6 +94,66 @@ pub fn workspace_sni(workspace_id_b64: &str) -> String {
     }
 }
 
+/// Parsed peer-scoped SNI target for a multi-tenant workspace listener.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct TenantSniTarget {
+    pub workspace_selector: String,
+    pub peer_id: String,
+}
+
+/// Convert a full 32-byte hex peer_id to a DNS-safe peer-specific SNI suffix.
+///
+/// SNI labels are capped at 63 characters, so split the 64-char hex peer id
+/// across two labels.
+pub fn peer_sni(peer_id_hex: &str) -> String {
+    if peer_id_hex.len() == 64 && peer_id_hex.chars().all(|c| c.is_ascii_hexdigit()) {
+        format!("p7-{}.{}", &peer_id_hex[..32], &peer_id_hex[32..])
+    } else {
+        peer_id_hex
+            .replace('/', "-")
+            .replace('+', "0")
+            .replace('=', "")
+    }
+}
+
+/// Build an SNI hostname that addresses one logical peer within one workspace.
+///
+/// The peer component uses the logical tenant peer id, not the currently
+/// presented transport fingerprint, so callers never need to target bootstrap
+/// identities explicitly.
+pub fn tenant_sni(workspace_id_b64: &str, peer_id_hex: &str) -> String {
+    format!(
+        "{}.{}",
+        workspace_sni(workspace_id_b64),
+        peer_sni(peer_id_hex)
+    )
+}
+
+/// Parse a peer-scoped tenant/workspace SNI.
+///
+/// Returns `None` for workspace-only or otherwise unrecognized SNI values.
+pub fn parse_tenant_sni(sni: &str) -> Option<TenantSniTarget> {
+    let mut parts = sni.split('.');
+    let workspace_selector = parts.next()?.to_string();
+    let first_peer = parts.next()?;
+    let second_peer = parts.next()?;
+    if parts.next().is_some() {
+        return None;
+    }
+    let peer_prefix = first_peer.strip_prefix("p7-")?;
+    if peer_prefix.len() != 32
+        || second_peer.len() != 32
+        || !peer_prefix.chars().all(|c| c.is_ascii_hexdigit())
+        || !second_peer.chars().all(|c| c.is_ascii_hexdigit())
+    {
+        return None;
+    }
+    Some(TenantSniTarget {
+        workspace_selector,
+        peer_id: format!("{peer_prefix}{second_peer}").to_ascii_lowercase(),
+    })
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +174,36 @@ mod tests {
         assert!(!sni.contains('/'));
         assert!(!sni.contains('+'));
         assert!(!sni.contains('='));
+    }
+
+    #[test]
+    fn test_peer_sni_splits_full_peer_id() {
+        let peer_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let sni = peer_sni(peer_id);
+        assert_eq!(
+            sni,
+            "p7-0123456789abcdef0123456789abcdef.0123456789abcdef0123456789abcdef"
+        );
+    }
+
+    #[test]
+    fn test_tenant_sni_round_trips() {
+        let eid = [0xABu8; 32];
+        let workspace_id = crate::crypto::event_id_to_base64(&eid);
+        let peer_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+        let sni = tenant_sni(&workspace_id, peer_id);
+        assert_eq!(
+            parse_tenant_sni(&sni),
+            Some(TenantSniTarget {
+                workspace_selector: "abababababababababababababababab".to_string(),
+                peer_id: peer_id.to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn test_parse_tenant_sni_ignores_workspace_only_values() {
+        assert_eq!(parse_tenant_sni("workspace-only"), None);
     }
 
     #[test]

@@ -113,7 +113,7 @@ pub async fn connect_loop_with_coordination_until_cancel(
     coordination_manager: Arc<CoordinationManager>,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    connect_loop_with_coordination_until_cancel_with_fallback(
+    connect_loop_with_coordination_until_cancel_with_target_tenant_and_fallback(
         db_path,
         recorded_by,
         endpoint,
@@ -123,6 +123,7 @@ pub async fn connect_loop_with_coordination_until_cancel(
         ingest,
         coordination_manager,
         shutdown,
+        None,
         None,
     )
     .await
@@ -140,6 +141,35 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
     ingest: IngestFns,
     coordination_manager: Arc<CoordinationManager>,
     shutdown: CancellationToken,
+    bootstrap_fallback_client_config: Option<TransportClientConfig>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    connect_loop_with_coordination_until_cancel_with_target_tenant_and_fallback(
+        db_path,
+        recorded_by,
+        endpoint,
+        remote,
+        client_config,
+        intro_spawner,
+        ingest,
+        coordination_manager,
+        shutdown,
+        None,
+        bootstrap_fallback_client_config,
+    )
+    .await
+}
+
+pub(crate) async fn connect_loop_with_coordination_until_cancel_with_target_tenant_and_fallback(
+    db_path: &str,
+    recorded_by: &str,
+    endpoint: TransportEndpoint,
+    remote: SocketAddr,
+    client_config: Option<TransportClientConfig>,
+    intro_spawner: IntroSpawnerFn,
+    ingest: IngestFns,
+    coordination_manager: Arc<CoordinationManager>,
+    shutdown: CancellationToken,
+    target_remote_tenant_id: Option<String>,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tenants = vec![recorded_by.to_string()];
@@ -169,6 +199,7 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
             shared_ingest,
             coordination,
             shutdown,
+            target_remote_tenant_id,
             bootstrap_fallback_client_config,
         ))
         .await
@@ -233,6 +264,7 @@ pub async fn connect_loop_with_shared_ingest_until_cancel(
             coordination,
             shutdown,
             None,
+            None,
         ))
         .await
 }
@@ -247,16 +279,10 @@ async fn connect_loop_inner(
     shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
     coordination: Arc<crate::sync::session::coordinator::PeerCoord>,
     shutdown: CancellationToken,
+    target_remote_tenant_id: Option<String>,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Look up workspace SNI for this tenant
-    let sni = {
-        let db = open_connection(db_path)?;
-        match lookup_workspace_id(&db, recorded_by) {
-            Some(ws_id) => crate::transport::multi_workspace::workspace_sni(&ws_id),
-            None => "localhost".to_string(),
-        }
-    };
+    let sni = outbound_sni_for_target(db_path, recorded_by, target_remote_tenant_id.as_deref())?;
     let initiator_handler = SyncSessionHandler::outbound(
         db_path.to_string(),
         SYNC_SESSION_TIMEOUT_SECS,
@@ -422,6 +448,21 @@ async fn connect_loop_inner(
     Ok(())
 }
 
+fn outbound_sni_for_target(
+    db_path: &str,
+    recorded_by: &str,
+    target_remote_tenant_id: Option<&str>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    let Some(workspace_id) = lookup_workspace_id(&db, recorded_by) else {
+        return Ok("localhost".to_string());
+    };
+    Ok(match target_remote_tenant_id {
+        Some(peer_id) => crate::transport::multi_workspace::tenant_sni(&workspace_id, peer_id),
+        None => crate::transport::multi_workspace::workspace_sni(&workspace_id),
+    })
+}
+
 /// Produce a human-readable diagnosis for a connection failure.
 fn describe_connect_failure(remote: SocketAddr, err: &ConnectionLifecycleError) -> String {
     match err {
@@ -580,6 +621,17 @@ async fn dial_provider_ongoing_first(
 mod tests {
     use super::*;
 
+    use crate::db::schema::create_tables;
+
+    fn setup_db() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("connect-loop-test.db");
+        let db_path = db_path.to_string_lossy().to_string();
+        let conn = open_connection(&db_path).unwrap();
+        create_tables(&conn).unwrap();
+        (dir, db_path)
+    }
+
     #[test]
     fn fallback_policy_allows_typed_trust_rejection_with_fallback_cfg() {
         let err = ConnectionLifecycleError::DialTrustRejected(
@@ -644,5 +696,75 @@ mod tests {
             "handshake to 127.0.0.1:4433: trust_rejected".to_string(),
         );
         assert!(should_warn_for_connect_failure(false, &err));
+    }
+
+    #[test]
+    fn outbound_sni_uses_target_tenant_when_present() {
+        let (_dir, db_path) = setup_db();
+        let conn = open_connection(&db_path).unwrap();
+        let recorded_by =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let target_peer =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+        let workspace_id = "ws-sni-scope";
+        conn.execute(
+            "INSERT INTO invites_accepted (
+                recorded_by,
+                event_id,
+                tenant_event_id,
+                invite_event_id,
+                workspace_id,
+                created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                recorded_by,
+                "accepted-event",
+                "tenant-event",
+                "invite-event",
+                workspace_id,
+                1i64
+            ],
+        )
+        .unwrap();
+
+        let sni = outbound_sni_for_target(&db_path, &recorded_by, Some(&target_peer)).unwrap();
+        assert_eq!(
+            sni,
+            crate::transport::multi_workspace::tenant_sni(workspace_id, &target_peer)
+        );
+    }
+
+    #[test]
+    fn outbound_sni_falls_back_to_workspace_only_without_target_tenant() {
+        let (_dir, db_path) = setup_db();
+        let conn = open_connection(&db_path).unwrap();
+        let recorded_by =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let workspace_id = "ws-sni-fallback";
+        conn.execute(
+            "INSERT INTO invites_accepted (
+                recorded_by,
+                event_id,
+                tenant_event_id,
+                invite_event_id,
+                workspace_id,
+                created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                recorded_by,
+                "accepted-event",
+                "tenant-event",
+                "invite-event",
+                workspace_id,
+                1i64
+            ],
+        )
+        .unwrap();
+
+        let sni = outbound_sni_for_target(&db_path, &recorded_by, None).unwrap();
+        assert_eq!(
+            sni,
+            crate::transport::multi_workspace::workspace_sni(workspace_id)
+        );
     }
 }

@@ -412,6 +412,18 @@ pub fn peer_identity_from_connection(conn: &quinn::Connection) -> Option<String>
     Some(hex::encode(fp))
 }
 
+/// Extract the client-requested server name (SNI) from a QUIC connection.
+///
+/// On accepted server-side connections Quinn exposes rustls handshake data with
+/// the requested `server_name`. Outbound connections always return `None`.
+pub fn requested_server_name_from_connection(conn: &quinn::Connection) -> Option<String> {
+    let handshake = conn.handshake_data()?;
+    let handshake = handshake
+        .downcast::<quinn::crypto::rustls::HandshakeData>()
+        .ok()?;
+    handshake.server_name.clone()
+}
+
 /// Create a single-port dual-role QUIC endpoint that serves multiple workspaces.
 ///
 /// Server side: uses `WorkspaceCertResolver` to select the correct cert based

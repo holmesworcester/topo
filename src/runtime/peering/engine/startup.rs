@@ -15,7 +15,7 @@ use crate::db::{open_connection, schema::create_tables};
 use crate::transport::{
     build_tenant_client_config_from_creds, create_runtime_endpoint_for_tenants,
     extract_spki_fingerprint,
-    multi_workspace::{workspace_sni, WorkspaceCertResolver},
+    multi_workspace::{tenant_sni, workspace_sni, WorkspaceCertResolver},
     TenantClientConfigs, TransportEndpoint,
 };
 use rustls::sign::CertifiedKey;
@@ -114,7 +114,9 @@ pub(crate) fn setup_endpoint_and_tenants(
         };
 
         let sni = workspace_sni(&tenant.workspace_id);
-        cert_resolver.add(sni.clone(), ck);
+        let peer_scoped_sni = tenant_sni(&tenant.workspace_id, &tenant.peer_id);
+        cert_resolver.add(sni.clone(), ck.clone());
+        cert_resolver.add(peer_scoped_sni.clone(), ck);
         peer_to_workspace.insert(tenant.peer_id.clone(), tenant.workspace_id.clone());
 
         if default_cert.is_none() {
@@ -122,10 +124,11 @@ pub(crate) fn setup_endpoint_and_tenants(
         }
 
         info!(
-            "Registered tenant {} (workspace {}, sni={})",
+            "Registered tenant {} (workspace {}, sni={}, peer_sni={})",
             &tenant.peer_id[..16],
             &tenant.workspace_id[..16.min(tenant.workspace_id.len())],
-            sni
+            sni,
+            peer_scoped_sni
         );
     }
 

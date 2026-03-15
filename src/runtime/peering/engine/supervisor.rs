@@ -23,7 +23,7 @@ use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
 use crate::db::transport_creds::TenantInfo;
 use crate::peering::loops::{
     accept_loop_with_ingest_until_cancel,
-    connect_loop_with_coordination_until_cancel_with_fallback, IntroSpawnerFn,
+    connect_loop_with_coordination_until_cancel_with_target_tenant_and_fallback, IntroSpawnerFn,
 };
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::CoordinationManager;
@@ -739,11 +739,17 @@ async fn run_target_dispatcher(
         };
 
         let worker_cancel = shutdown.child_token();
+        let target_remote_tenant_id = target_remote_tenant_id(&event.source);
+        let target_note = target_remote_tenant_id
+            .as_deref()
+            .map(short_peer_id)
+            .unwrap_or("workspace-only");
         info!(
-            "Spawning connect worker key={} tenant={} remote={} source={:?}",
+            "Spawning connect worker key={} tenant={} remote={} target={} source={:?}",
             dispatch_key,
             short_peer_id(&event.tenant_id),
             event.remote,
+            target_note,
             event.source
         );
         let worker = std::thread::spawn({
@@ -753,6 +759,7 @@ async fn run_target_dispatcher(
             let worker_cancel = worker_cancel.clone();
             let dispatch_key = dispatch_key.clone();
             let bootstrap_fallback_client_config = bootstrap_fallback_client_config.clone();
+            let target_remote_tenant_id = target_remote_tenant_id.clone();
             move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -768,6 +775,7 @@ async fn run_target_dispatcher(
                     ingest,
                     worker_cancel,
                     dispatch_key,
+                    target_remote_tenant_id,
                     bootstrap_fallback_client_config,
                 ));
             }
@@ -828,6 +836,7 @@ async fn run_connect_worker(
     ingest: IngestFns,
     shutdown: CancellationToken,
     dispatch_key: String,
+    target_remote_tenant_id: Option<String>,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
 ) {
     let mut warning_gate = RepeatedWarningGate::new(Duration::from_secs(300));
@@ -836,7 +845,7 @@ async fn run_connect_worker(
             break;
         }
 
-        let result = connect_loop_with_coordination_until_cancel_with_fallback(
+        let result = connect_loop_with_coordination_until_cancel_with_target_tenant_and_fallback(
             &db_path,
             &tenant_id,
             endpoint.clone(),
@@ -846,6 +855,7 @@ async fn run_connect_worker(
             ingest,
             context.coordination_manager.clone(),
             shutdown.clone(),
+            target_remote_tenant_id.clone(),
             bootstrap_fallback_client_config.clone(),
         )
         .await;
@@ -897,6 +907,14 @@ async fn run_connect_worker(
 
 fn short_peer_id(peer_id: &str) -> &str {
     &peer_id[..16.min(peer_id.len())]
+}
+
+fn target_remote_tenant_id(source: &TargetIngressSource) -> Option<String> {
+    match source {
+        TargetIngressSource::Bootstrap { .. } => None,
+        TargetIngressSource::ObservedPeer { peer_id } => Some(peer_id.clone()),
+        TargetIngressSource::Discovery { .. } => None,
+    }
 }
 
 #[cfg(test)]

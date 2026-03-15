@@ -10,12 +10,13 @@ use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
-use crate::db::transport_trust::record_transport_binding;
+use crate::db::store::lookup_workspace_id;
+use crate::db::transport_trust::{is_authorized_for_tenant, record_transport_binding};
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::SyncSessionHandler;
 use crate::transport::{
-    accept_session_provider, resolve_authorizing_tenant_from_db, TransportClientConfig,
-    TransportEndpoint,
+    accept_session_provider, requested_server_name_from_connection,
+    resolve_authorizing_tenant_from_db, TransportClientConfig, TransportEndpoint,
 };
 
 use super::supervisor::{
@@ -199,9 +200,9 @@ async fn accept_loop_with_ingest_until_cancel_inner(
             // connection before intro handling can record it.
             recorded_by.clone()
         } else {
-            match resolve_tenant_for_peer(db_path, &peer_id) {
-                Some(rb) => rb,
-                None => {
+            match resolve_tenant_for_connection(db_path, &connection, &peer_id) {
+                Ok(Some(rb)) => rb,
+                Ok(None) => {
                     let message = format!(
                         "Rejected peer {}: no local tenant trusts this fingerprint",
                         &peer_id[..16.min(peer_id.len())]
@@ -212,6 +213,15 @@ async fn accept_loop_with_ingest_until_cancel_inner(
                         warn!("{}", message);
                     }
                     connection.close(1u32.into(), b"no matching tenant");
+                    continue;
+                }
+                Err(message) => {
+                    if warning_gate.should_emit(message.clone())
+                        && should_emit_globally(format!("accept:{message}"))
+                    {
+                        warn!("{}", message);
+                    }
+                    connection.close(1u32.into(), b"tenant-scoped auth failed");
                     continue;
                 }
             }
@@ -362,6 +372,74 @@ fn describe_accept_failure(err: &crate::transport::ConnectionLifecycleError) -> 
     }
 }
 
+/// Resolve which local tenant should own a given inbound connection.
+///
+/// When the client requested a peer-scoped SNI, authorization is checked only
+/// for that local tenant. Otherwise this falls back to the node-scoped trust
+/// union and returns one authorizing tenant.
+fn resolve_tenant_for_connection(
+    db_path: &str,
+    connection: &crate::transport::TransportConnection,
+    remote_peer_id: &str,
+) -> Result<Option<String>, String> {
+    if let Some(requested) = requested_tenant_from_connection(connection) {
+        return resolve_requested_tenant_for_peer(db_path, &requested, remote_peer_id).map(Some);
+    }
+    Ok(resolve_tenant_for_peer(db_path, remote_peer_id))
+}
+
+fn requested_tenant_from_connection(
+    connection: &crate::transport::TransportConnection,
+) -> Option<crate::transport::multi_workspace::TenantSniTarget> {
+    let sni = requested_server_name_from_connection(connection)?;
+    crate::transport::multi_workspace::parse_tenant_sni(&sni)
+}
+
+fn resolve_requested_tenant_for_peer(
+    db_path: &str,
+    requested: &crate::transport::multi_workspace::TenantSniTarget,
+    remote_peer_id: &str,
+) -> Result<String, String> {
+    let remote_fp = peer_fingerprint_from_hex(remote_peer_id).ok_or_else(|| {
+        format!(
+            "Rejected peer {}: invalid transport fingerprint for tenant-scoped auth",
+            short_peer_id(remote_peer_id)
+        )
+    })?;
+    let db = open_connection(db_path).map_err(|e| {
+        format!(
+            "Failed to open auth DB for inbound tenant-scoped auth: {}",
+            e
+        )
+    })?;
+    let Some(workspace_id) = lookup_workspace_id(&db, &requested.peer_id) else {
+        return Err(format!(
+            "Rejected peer {}: requested local tenant {} is not present on this node",
+            short_peer_id(remote_peer_id),
+            short_peer_id(&requested.peer_id)
+        ));
+    };
+    let expected_workspace_selector =
+        crate::transport::multi_workspace::workspace_sni(&workspace_id);
+    if expected_workspace_selector != requested.workspace_selector {
+        return Err(format!(
+            "Rejected peer {}: requested workspace selector does not match local tenant {}",
+            short_peer_id(remote_peer_id),
+            short_peer_id(&requested.peer_id)
+        ));
+    }
+    let authorized = is_authorized_for_tenant(&db, &requested.peer_id, &remote_fp)
+        .map_err(|e| format!("Inbound tenant-scoped auth query failed: {}", e))?;
+    if !authorized {
+        return Err(format!(
+            "Rejected peer {}: local tenant {} does not authorize this fingerprint",
+            short_peer_id(remote_peer_id),
+            short_peer_id(&requested.peer_id)
+        ));
+    }
+    Ok(requested.peer_id.clone())
+}
+
 /// Resolve which local tenant trusts a given remote peer.
 ///
 /// Queries the projected trust union directly and returns one tenant that
@@ -371,4 +449,114 @@ fn resolve_tenant_for_peer(db_path: &str, remote_peer_id: &str) -> Option<String
     resolve_authorizing_tenant_from_db(db_path, fp)
         .ok()
         .flatten()
+}
+
+fn short_peer_id(peer_id: &str) -> &str {
+    &peer_id[..16.min(peer_id.len())]
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    use crate::db::schema::create_tables;
+    use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
+
+    fn setup_db() -> (tempfile::TempDir, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("accept-loop-test.db");
+        let db_path = db_path.to_string_lossy().to_string();
+        let conn = open_connection(&db_path).unwrap();
+        create_tables(&conn).unwrap();
+        (dir, db_path)
+    }
+
+    fn insert_tenant(conn: &rusqlite::Connection, tenant_id: &str, workspace_id: &str, n: i64) {
+        conn.execute(
+            "INSERT INTO invites_accepted (
+                recorded_by,
+                event_id,
+                tenant_event_id,
+                invite_event_id,
+                workspace_id,
+                created_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                tenant_id,
+                format!("accepted-event-{n}"),
+                format!("tenant-event-{n}"),
+                format!("invite-event-{n}"),
+                workspace_id,
+                n
+            ],
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn requested_tenant_auth_accepts_when_that_tenant_authorizes_remote_peer() {
+        let (_dir, db_path) = setup_db();
+        let conn = open_connection(&db_path).unwrap();
+        let tenant_a =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let workspace_id = "ws-requested-tenant";
+        let remote_fp = [0x11; 32];
+
+        insert_tenant(&conn, &tenant_a, workspace_id, 1);
+        record_pending_invite_bootstrap_trust(
+            &conn,
+            &tenant_a,
+            "invite-a",
+            workspace_id,
+            &remote_fp,
+        )
+        .unwrap();
+
+        let requested = crate::transport::multi_workspace::TenantSniTarget {
+            workspace_selector: crate::transport::multi_workspace::workspace_sni(workspace_id),
+            peer_id: tenant_a.clone(),
+        };
+
+        let resolved =
+            resolve_requested_tenant_for_peer(&db_path, &requested, &hex::encode(remote_fp))
+                .unwrap();
+        assert_eq!(resolved, tenant_a);
+    }
+
+    #[test]
+    fn requested_tenant_auth_does_not_fallback_to_other_authorizing_tenants() {
+        let (_dir, db_path) = setup_db();
+        let conn = open_connection(&db_path).unwrap();
+        let tenant_a =
+            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+        let tenant_b =
+            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
+        let workspace_id = "ws-shared";
+        let remote_fp = [0x22; 32];
+        let remote_peer_id = hex::encode(remote_fp);
+
+        insert_tenant(&conn, &tenant_a, workspace_id, 1);
+        insert_tenant(&conn, &tenant_b, workspace_id, 2);
+        record_pending_invite_bootstrap_trust(
+            &conn,
+            &tenant_b,
+            "invite-b",
+            workspace_id,
+            &remote_fp,
+        )
+        .unwrap();
+
+        let requested = crate::transport::multi_workspace::TenantSniTarget {
+            workspace_selector: crate::transport::multi_workspace::workspace_sni(workspace_id),
+            peer_id: tenant_a.clone(),
+        };
+
+        let err =
+            resolve_requested_tenant_for_peer(&db_path, &requested, &remote_peer_id).unwrap_err();
+        assert!(err.contains("does not authorize"));
+        assert_eq!(
+            resolve_tenant_for_peer(&db_path, &remote_peer_id),
+            Some(tenant_b)
+        );
+    }
 }
