@@ -179,6 +179,12 @@ Drift controls (required):
 Current runtime note:
 - Exact inbound transport targeting also uses replay-derived local routing state (`local_transport_targets`) to resolve `requestedLocalTransportFP -> tenant`. This is not a new authority source; it should be modeled as a derived local-target relation layered on top of transport identity transitions.
 
+Focused follow-up model:
+- `ExactTransportTargeting.tla` isolates the exact-target transport invariants on top of the existing trust lifecycle model:
+  - inbound admission requires `requestedLocalTransportFP -> tenant` plus tenant-scoped authorization,
+  - no other tenant may satisfy that requested local target,
+  - outbound success requires exact remote fingerprint match plus tenant-scoped authorization.
+
 ## Runtime check catalog status
 Bridge check ids are now listed in `docs/tla/runtime_check_catalog.md` under
 `Unified Bridge Checks`:

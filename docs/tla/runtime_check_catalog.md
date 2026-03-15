@@ -106,6 +106,14 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_BRIDGE_SEC_SOURCE_BINDING | runtime/transport + projection/trust_store | BrSec_SourceBindingConsistency | unified_bridge |
 | CHK_BRIDGE_SEC_IDENTITY_COLLISION | transport/identity_adapter + transport_creds | BrSec_NoIdentityCollisionInAuthPath | unified_bridge |
 
+## Exact Transport Targeting Checks
+
+| check_id | owner | tla_guard_id | category |
+|----------|-------|-------------|----------|
+| CHK_ETT_INBOUND_EXACT_TARGET | runtime/peering/loops/accept | InvInboundAdmittedAuthorized | exact_transport_targeting |
+| CHK_ETT_NO_CROSS_TENANT_FALLBACK | runtime/peering/loops/accept | InvNoCrossTenantFallback | exact_transport_targeting |
+| CHK_ETT_OUTBOUND_EXACT_REMOTE | runtime/peering/loops/connect + runtime/transport | InvOutboundConnectedAuthorized | exact_transport_targeting |
+
 ## Replay/Order Checks
 
 | check_id | owner | tla_guard_id | category |

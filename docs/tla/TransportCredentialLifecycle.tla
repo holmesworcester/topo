@@ -33,7 +33,7 @@ EXTENDS FiniteSets, Naturals
 \* Rust mapping:
 \*   localCred              → active cert SPKI in local_transport_creds
 \*   credSource             → whether localCred came from invite bootstrap or peer_shared
-\*   InstallBootstrapCred   → TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey
+\*   InstallBootstrapCred   → TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret
 \*   InstallPeerSharedCred  → TransportIdentityIntent::InstallPeerSharedIdentityFromSigner
 \*   peerSharedTrust        → PeerShared-derived SPKIs (peer_shared_spki_fingerprints())
 \*   bootstrapTrust         → invite_bootstrap_trust (non-expired, non-superseded)
@@ -131,7 +131,7 @@ Init ==
 
 \* 1. InstallBootstrapCred(p, s)
 \*    Invite bootstrap cert install (invite-derived).
-\*    Rust: InstallBootstrapIdentityFromInviteKey intent.
+\*    Rust: InstallBootstrapIdentityFromInviteSecret intent.
 \*    Guard: cannot downgrade from peer_shared back to bootstrap.
 InstallBootstrapCred(p, s) ==
     /\ credSource[p] # "peershared"

@@ -38,16 +38,6 @@ impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
         intent: TransportIdentityIntent,
     ) -> Result<String, TransportIdentityError> {
         match intent {
-            TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
-                invite_private_key,
-            } => {
-                let signing_key = ed25519_dalek::SigningKey::from_bytes(&invite_private_key);
-                crate::transport::identity::install_invite_bootstrap_transport_identity(
-                    conn,
-                    &signing_key,
-                )
-                .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))
-            }
             TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
                 recorded_by,
                 invite_event_id,
@@ -130,16 +120,41 @@ mod tests {
     use crate::db::schema::create_tables;
     use crate::transport::identity::install_peer_key_transport_identity;
 
+    fn insert_invite_secret(
+        conn: &Connection,
+        recorded_by: &str,
+        invite_event_id: [u8; 32],
+        private_key: [u8; 32],
+    ) {
+        let invite_event_id_b64 = crate::crypto::event_id_to_base64(&invite_event_id);
+        let secret_event_id = crate::crypto::event_id_to_base64(&[1u8; 32]);
+        conn.execute(
+            "INSERT INTO invite_secrets (recorded_by, event_id, invite_event_id, private_key, created_at)
+             VALUES (?1, ?2, ?3, ?4, 0)",
+            rusqlite::params![
+                recorded_by,
+                secret_event_id,
+                invite_event_id_b64,
+                private_key.to_vec()
+            ],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn bootstrap_install_sets_bootstrap_source() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let adapter = ConcreteTransportIdentityAdapter;
+        let recorded_by = "tenant-bootstrap";
+        let invite_event_id = [7u8; 32];
+        insert_invite_secret(&conn, recorded_by, invite_event_id, [7u8; 32]);
 
         let result = adapter.apply_intent(
             &conn,
-            TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
-                invite_private_key: [7u8; 32],
+            TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+                recorded_by: recorded_by.to_string(),
+                invite_event_id,
             },
         );
         assert!(result.is_ok(), "bootstrap install should succeed");
@@ -159,15 +174,19 @@ mod tests {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let adapter = ConcreteTransportIdentityAdapter;
+        let recorded_by = "tenant-bootstrap";
+        let invite_event_id = [9u8; 32];
 
         let same_key = [9u8; 32];
         let peer_key = ed25519_dalek::SigningKey::from_bytes(&same_key);
         install_peer_key_transport_identity(&conn, &peer_key).unwrap();
+        insert_invite_secret(&conn, recorded_by, invite_event_id, same_key);
 
         let result = adapter.apply_intent(
             &conn,
-            TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
-                invite_private_key: same_key,
+            TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+                recorded_by: recorded_by.to_string(),
+                invite_event_id,
             },
         );
         assert!(
@@ -185,15 +204,19 @@ mod tests {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let adapter = ConcreteTransportIdentityAdapter;
+        let recorded_by = "tenant-bootstrap";
+        let invite_event_id = [11u8; 32];
 
         let peer_key = ed25519_dalek::SigningKey::from_bytes(&[9u8; 32]);
         install_peer_key_transport_identity(&conn, &peer_key).unwrap();
+        insert_invite_secret(&conn, recorded_by, invite_event_id, [11u8; 32]);
 
         // Different key => different transport peer_id, allowed in multi-tenant mode.
         let result = adapter.apply_intent(
             &conn,
-            TransportIdentityIntent::InstallBootstrapIdentityFromInviteKey {
-                invite_private_key: [11u8; 32],
+            TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+                recorded_by: recorded_by.to_string(),
+                invite_event_id,
             },
         );
         assert!(
