@@ -1125,26 +1125,27 @@ Required changes from the 1:1 sync model:
    - a **sender/request loop** (higher-rate) that keeps QUIC streams full from that
      SQL truth by draining push egress, serving pull responses from bounded
      in-memory queues, advertising source-side request credit, and filling
-     bounded in-memory pull windows.
+     bounded in-memory pull windows through a shared tenant-scoped coordinator.
 5. **Receiver-driven wanted scheduling.** Pull balancing happens at the sink, not
    inside Negentropy. `wanted(event_id, ...)` records demand, and
    `wanted_sources(event_id, peer_id, first_seen_at, last_seen_at,
    priority_lane, priority_ts)` records candidate suppliers discovered by the
    observer loop.
-6. **Per-peer request windows.** The sender/request loop continuously chooses the
-   next wanted rows for each peer from SQL whenever that peer advertises spare
-   request credit:
-   - keep durable demand in SQLite and keep per-peer request suppression only in memory,
-   - cap in-flight requests per peer,
-   - allow aggressive duplicate requests across peers when spare credit exists,
-   - preserve lane priority (foreground before bulk, newest first within lane).
+6. **Shared pull coordinator.** The sender/request loop continuously refills
+   peer request credit from one tenant-scoped in-memory coordinator:
+   - keep durable demand in SQLite and keep in-flight request suppression only in memory,
+   - plan across all active peers in the tenant instead of selecting per peer in isolation,
+   - cap in-flight requests per peer while allowing aggressive duplicate requests
+     across peers when spare credit exists,
+   - keep the first version simple and fairness-light; richer lane/type priority
+     is a follow-up once the structural split is settled.
    This keeps QUIC full without embedding balancing policy in Negentropy or paying
    SQLite churn for every individual request.
 7. **Push and pull share one scheduling model.** Push traffic drains peer egress
-   from leased SQL-backed send windows. Pull traffic fills per-peer request windows
-   from SQL-backed demand state plus source-advertised credit, and sources serve
-   those requests from bounded in-memory ID queues. Both loops are peer-scoped,
-   priority-aware, and low-memory because they hold IDs, not bulk blobs.
+   from leased SQL-backed send windows. Pull traffic fills coordinator-backed
+   in-memory request windows from SQL-backed demand state plus source-advertised
+   credit, and sources serve those requests from bounded in-memory ID queues.
+   Both loops are peer-scoped and low-memory because they hold IDs, not bulk blobs.
 8. **Incremental leased windows, not tiny claim/send cycles.** Once work is known,
    the sender should not round-trip to SQLite on every 1-8 events. It keeps bounded
    in-memory windows of leased row IDs/event IDs, refills below a low-water mark,

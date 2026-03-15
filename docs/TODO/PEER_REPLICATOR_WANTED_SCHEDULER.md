@@ -12,7 +12,7 @@ Implementation follow-up:
 1. Add durable sink demand state:
    - `wanted(event_id, ...)`
    - `wanted_sources(event_id, peer_id, first_seen_at, last_seen_at, priority_lane, priority_ts)`
-2. Move multi-source pull balancing out of negentropy/session control code and into a peer-scoped request scheduler.
+2. Move the remaining multi-source pull balancing out of session control flow and into a fully connection-scoped request scheduler.
 3. Keep one sender owner per peer slot with leased push windows and batch completion acks.
 4. Keep blob residency low-memory-friendly by leasing IDs more aggressively than blobs.
 5. Replace local-create first-hop shortcuts with `dirty_hot` wakeups so every hop uses the same propagation rule.
@@ -32,6 +32,7 @@ Implementation follow-up:
 9. Keep the first request scheduler simple:
    - durable truth is only `wanted + wanted_sources`,
    - per-peer request credit and in-flight suppression stay in memory,
+   - tenant-scoped shared coordination across active peers is already implemented,
    - duplicate pulls are allowed aggressively when spare peer credit exists.
 10. Future follow-ups:
    - split encrypted wrapper types into explicit outer types such as
@@ -57,10 +58,10 @@ Implementation follow-up:
      utilization, durable receive completion, and projection lag separately.
 12. Finish the structural split implied by the credit model:
    - keep session semantics only for Negentropy discovery rounds,
-   - make request/response serving connection-scoped rather than session-scoped,
+   - make request/response serving fully connection-scoped rather than session-scoped,
    - remove remaining sync-time dependence on durable SQLite egress where credit
      already bounds memory,
-   - move from per-peer request refill toward a global sink scheduler over peer
-     slots, keyed by authenticated `(tenant, peer)` identity rather than bare
-     transport fingerprint, so multi-workspace/multi-tenant demand can be
-     allocated across all credited peers in one testable planning step.
+   - extend the current tenant-scoped shared coordinator to a true global sink
+     scheduler over authenticated `(tenant, peer)` slots, so multi-workspace /
+     multi-tenant demand can be allocated across all credited peers in one
+     testable planning step.

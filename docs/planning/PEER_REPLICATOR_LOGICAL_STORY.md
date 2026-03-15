@@ -43,7 +43,7 @@ Memory-only control state:
 This is where balancing lives:
 
 - the sink can prefer not to duplicate requests, but duplicate pulls are allowed when spare peer credit exists,
-- multiple peers can be kept busy because each peer plans requests independently from the same durable demand table,
+- multiple peers can be kept busy because a shared tenant-scoped coordinator plans requests across the current peer-credit snapshot,
 - a slow or dead peer does not own work forever because in-flight request suppression is bounded memory state rather than durable ownership.
 
 ## 3. Send / Response
@@ -97,6 +97,7 @@ The current code is an incremental form of this model rather than the final
 `PeerReplicator` actor:
 
 - initiator session still contains both the observer and request-refill loops,
+- request selection itself is already shared tenant-scoped coordinator state rather than per-session local SQL selection,
 - responder session now serves pull responses from a bounded in-memory queue
   rather than SQLite egress,
 - `wanted` + `wanted_sources` are already the durable sink-side discovery truth,

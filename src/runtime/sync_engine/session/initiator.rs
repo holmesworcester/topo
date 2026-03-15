@@ -49,6 +49,22 @@ use super::{
     EGRESS_QUIET_WINDOW, EGRESS_SENT_TTL_MS, INITIAL_CONTROL_PROGRESS_TIMEOUT,
 };
 
+struct CoordinationCleanupGuard<'a> {
+    coordination: &'a PeerCoord,
+}
+
+impl<'a> CoordinationCleanupGuard<'a> {
+    fn new(coordination: &'a PeerCoord) -> Self {
+        Self { coordination }
+    }
+}
+
+impl Drop for CoordinationCleanupGuard<'_> {
+    fn drop(&mut self) {
+        self.coordination.clear_request_state();
+    }
+}
+
 fn should_treat_as_startup_control_abort(
     rounds: u64,
     events_sent: u64,
@@ -78,7 +94,7 @@ pub async fn run_sync_initiator<C, S, R>(
     peer_id: &str,
     recorded_by: &str,
     ingress_source_tag: &str,
-    _coordination: &PeerCoord,
+    coordination: &PeerCoord,
     shared_ingest: mpsc::Sender<IngestItem>,
     capture: Option<SyncRunCapture>,
     rx_capture: Option<SyncRunRxCapture>,
@@ -88,6 +104,7 @@ where
     S: StreamSend,
     R: StreamRecv + Send + 'static,
 {
+    let _coordination_cleanup = CoordinationCleanupGuard::new(coordination);
     let DualConnection {
         mut control,
         mut data_send,
@@ -311,8 +328,14 @@ where
                 observed_need_ids, peer_id
             );
         }
-        let requested_now =
-            refill_wanted_requests(&mut control, &wanted, peer_id, &mut request_window).await?;
+        let requested_now = refill_wanted_requests(
+            &mut control,
+            &wanted,
+            coordination,
+            peer_id,
+            &mut request_window,
+        )
+        .await?;
         if requested_now > 0 {
             last_activity = Instant::now();
         }
@@ -470,7 +493,6 @@ where
         }
     }
 
-    let _ = wanted.release_peer_leases(peer_id, session_owner);
     let _ = egress.release_leases(peer_id, session_owner);
     let _ = egress.cleanup_sent_for_connection(peer_id, 0);
     if completed {

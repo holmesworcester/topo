@@ -3,7 +3,7 @@
 //! Owns control-stream message handling concerns:
 //! - Negentropy control messages (`NegOpen` / `NegMsg`)
 //! - Sink-side observation of missing IDs into SQL-backed `wanted` state
-//! - Request-window refill (`HaveList`) from that SQL-backed state
+//! - Request-window refill (`HaveList`) via the shared in-memory coordinator
 //! - Session completion control markers (`Done` / `DoneAck`)
 
 use negentropy::Id;
@@ -11,12 +11,12 @@ use std::collections::HashMap;
 use tracing::info;
 
 use crate::crypto::EventId;
-use crate::db::wanted::{WantedCandidate, WantedEvents};
+use crate::db::wanted::WantedEvents;
 use crate::protocol::{neg_id_to_event_id, Frame};
 use crate::transport::StreamConn;
-use crate::tuning::{request_inflight_ttl_ms, wanted_refill_quantum};
+use crate::tuning::request_inflight_ttl_ms;
 
-use super::need_chunk;
+use super::{coordinator::PeerCoord, need_chunk};
 
 pub type SyncError = Box<dyn std::error::Error + Send + Sync>;
 
@@ -39,6 +39,10 @@ impl PeerRequestWindow {
         self.remote_credit
     }
 
+    pub fn inflight_requested(&self) -> &HashMap<EventId, i64> {
+        &self.inflight_requested
+    }
+
     fn expire_stale(&mut self, now_ms: i64) {
         let ttl_ms = request_inflight_ttl_ms();
         self.inflight_requested
@@ -51,28 +55,6 @@ impl PeerRequestWindow {
         }
         self.remote_credit = self.remote_credit.saturating_sub(ids.len());
     }
-}
-
-pub fn select_request_ids(
-    candidates: &[WantedCandidate],
-    inflight_requested: &HashMap<EventId, i64>,
-    credit: usize,
-) -> Vec<EventId> {
-    if credit == 0 {
-        return Vec::new();
-    }
-
-    let mut selected = Vec::with_capacity(credit);
-    for candidate in candidates {
-        if inflight_requested.contains_key(&candidate.event_id) {
-            continue;
-        }
-        selected.push(candidate.event_id);
-        if selected.len() >= credit {
-            break;
-        }
-    }
-    selected
 }
 
 pub async fn send_initial_neg_open<C>(
@@ -129,13 +111,14 @@ pub fn observe_need_ids_for_peer(
 
 /// Keep the peer's request window topped up from durable `wanted` state.
 ///
-/// This is the sink-side scheduler: it chooses the next IDs this peer should
-/// serve and sends `HaveList` requests for them. Durable truth lives in
-/// `wanted` + `wanted_sources`; duplicate suppression is only in-memory and
-/// bounded to this peer/session.
+/// This is the sink-side scheduler: the shared per-tenant coordinator chooses
+/// the next IDs this peer should serve and sends `HaveList` requests for them.
+/// Durable truth lives in `wanted` + `wanted_sources`; duplicate suppression is
+/// bounded in-memory coordinator state across all active peers for the tenant.
 pub async fn refill_wanted_requests<C>(
     control: &mut C,
     wanted: &WantedEvents<'_>,
+    coordination: &PeerCoord,
     peer_id: &str,
     request_window: &mut PeerRequestWindow,
 ) -> Result<usize, SyncError>
@@ -149,8 +132,7 @@ where
     let now_ms = crate::db::queue::current_timestamp_ms();
     request_window.expire_stale(now_ms);
 
-    let quantum = wanted_refill_quantum().max(1);
-    let credit = request_window.available_credit().min(quantum);
+    let credit = request_window.available_credit();
     if credit == 0 {
         return Ok(0);
     }
@@ -158,8 +140,14 @@ where
     let candidate_limit = credit
         .saturating_add(request_window.inflight_len())
         .saturating_add(need_chunk());
-    let candidates = wanted.list_candidates_for_peer(peer_id, candidate_limit)?;
-    let selected = select_request_ids(&candidates, &request_window.inflight_requested, credit);
+    let selected = coordination.plan_requests(
+        wanted,
+        peer_id,
+        credit,
+        request_window.inflight_requested(),
+        candidate_limit,
+        now_ms,
+    )?;
     if selected.is_empty() {
         return Ok(0);
     }
@@ -184,12 +172,12 @@ where
     request_window.note_requested(&selected, now_ms);
 
     info!(
-        "Requested more wanted IDs from peer {} (requested_now={}, inflight={}, remaining_credit={}, quantum={})",
+        "Requested more wanted IDs from peer {} (requested_now={}, inflight={}, remaining_credit={}, candidate_limit={})",
         peer_id,
         selected.len(),
         request_window.inflight_len(),
         request_window.available_credit(),
-        quantum
+        candidate_limit
     );
     Ok(selected.len())
 }
@@ -229,46 +217,13 @@ where
 mod tests {
     use super::*;
 
-    fn candidate(byte: u8, lane: i64, ts: i64) -> WantedCandidate {
-        let mut event_id = [0u8; 32];
-        event_id[0] = byte;
-        WantedCandidate {
-            event_id,
-            priority_lane: lane,
-            priority_ts: ts,
-            first_seen_at: ts,
-        }
-    }
-
     #[test]
-    fn select_request_ids_skips_same_peer_inflight() {
-        let mut inflight = HashMap::new();
-        let id = candidate(2, 1, 20).event_id;
-        inflight.insert(id, 1);
-        let candidates = vec![
-            candidate(1, 1, 30),
-            candidate(2, 1, 20),
-            candidate(3, 1, 10),
-        ];
-
-        let selected = select_request_ids(&candidates, &inflight, 3);
-        assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0][0], 1);
-        assert_eq!(selected[1][0], 3);
-    }
-
-    #[test]
-    fn select_request_ids_respects_credit_and_order() {
-        let inflight = HashMap::new();
-        let candidates = vec![
-            candidate(9, 1, 50),
-            candidate(8, 1, 40),
-            candidate(7, 2, 30),
-        ];
-
-        let selected = select_request_ids(&candidates, &inflight, 2);
-        assert_eq!(selected.len(), 2);
-        assert_eq!(selected[0][0], 9);
-        assert_eq!(selected[1][0], 8);
+    fn peer_request_window_expires_stale_entries() {
+        let mut window = PeerRequestWindow::default();
+        let mut id = [0u8; 32];
+        id[0] = 7;
+        window.inflight_requested.insert(id, 0);
+        window.expire_stale(request_inflight_ttl_ms() + 1);
+        assert_eq!(window.inflight_len(), 0);
     }
 }

@@ -110,18 +110,3 @@ pub(super) fn send_idle_capture_enabled() -> bool {
         .map(|v| v != "0" && v.to_lowercase() != "false")
         .unwrap_or(false)
 }
-
-// -- Coordinator timing (legacy/advisory) --
-// The coordinator implementation still exists in-tree, but the hot pull path
-// no longer depends on it. Sink-driven wanted scheduling is now the active
-// request-dispatch model.
-
-/// How long the coordinator waits (after the first peer reports) for
-/// remaining peers to finish reconciliation and report their need_ids.
-pub(super) const COORDINATOR_COLLECTION_WINDOW: Duration = Duration::from_secs(2);
-
-/// Coordinator busy-poll interval while waiting for the first peer report.
-pub(super) const COORDINATOR_POLL_INTERVAL: Duration = Duration::from_millis(10);
-
-/// Coordinator poll interval within the collection window.
-pub(super) const COORDINATOR_COLLECTION_POLL: Duration = Duration::from_millis(2);
