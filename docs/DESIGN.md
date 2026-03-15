@@ -1194,24 +1194,22 @@ Peer runtime worker shape:
 2. project worker/drain:
    - claim batch, project each event in autocommit (`valid|block|reject`), batch-dequeue successes, mark retry on failure. `project_queue` stores priority metadata but currently only uses lane priority at claim time: foreground before bulk, then FIFO within the lane (`priority_lane`, then `available_at`, then `rowid`) so dependency-heavy foreground chains are not recency-reordered. WAL autocheckpoint deferred during drain (skipped in low_mem mode).
 3. `PeerReplicator` per authenticated peer slot:
-   - **observer loop** (lower-rate): connect/full-sync start, `dirty_hot`, cold timer, backlog exhaustion, or source-set change trigger negentropy observation; the observer updates SQL truth (`wanted`, candidate sources, peer egress rows) but does not attempt to keep the wire full itself.
-   - **sender/request loop** (higher-rate): continuously keeps per-peer QUIC streams fed. It drains peer egress for push traffic, serves pull responses from a bounded in-memory request queue, advertises source-side request credit, and uses a shared tenant-scoped in-memory coordinator to reserve sink-side pull work across all active peers in bounded memory.
+   - **observer loop** (lower-rate): connect/full-sync start, `dirty_hot`, cold timer, backlog exhaustion, or source-set change trigger negentropy observation; the observer updates SQL truth (`wanted`, candidate sources) but does not attempt to keep the wire full itself.
+   - **sender/request loop** (higher-rate): continuously keeps per-peer QUIC streams fed. It serves requested responses from a bounded in-memory request queue, advertises source-side request credit, and uses a shared tenant-scoped in-memory coordinator to reserve sink-side pull work across all active peers in bounded memory.
 4. cleanup worker:
    - reclaim expired leases, purge stale/sent operational rows, TTL endpoint cleanup.
 
-Queue claim/lease/retry/backoff logic is DRY and shared across `project_queue` and `egress_queue`.
+## 7.3 Sync Transfer Production
 
-## 7.3 Egress production
+Sync event transfer is pull-only.
 
-Egress rows are produced by:
+1. observer-loop reconciliation discovers missing IDs and candidate suppliers and writes `wanted + wanted_sources`,
+2. sink-side wanted scheduling chooses which IDs to request under source-advertised credit,
+3. sources queue requested IDs in bounded in-memory response buffers and read canonical blobs at send time,
+4. control protocol producers (`Frame::NegOpen`, `Frame::NegMsg`, `Frame::NeedList`, `Frame::HaveList`, `Frame::RequestCredit`, `Frame::Done`, `Frame::DataDone`, `Frame::DoneAck`, `Frame::IntroOffer`) live in `shared/protocol.rs`,
+5. hot-observer wakeups from newly valid shared events cause the next peer observation pass to discover those IDs so the sink can request them.
 
-1. observer-loop reconciliation decisions (`runtime/sync_engine/session/control_plane.rs`),
-2. sink-side wanted scheduling decisions (candidate source selection + request windows),
-3. control protocol producers (`Frame::NegOpen`, `Frame::NegMsg`, `Frame::HaveList`, `Frame::Done`, `Frame::DataDone`, `Frame::DoneAck`, `Frame::IntroOffer`) in `shared/protocol.rs`,
-4. hot-observer wakeups from newly valid shared events, which cause the next peer observation pass to populate the relevant peer egress rows,
-5. optional proactive send pathways (future optimization hooks in this queue model).
-
-For canonical event transfer, egress rows carry `event_id`; canonical blob is read at send time.
+Durable `egress_queue` rows are no longer part of live sync event transport.
 
 ## 7.4 Dedupe and purge
 
@@ -1220,8 +1218,8 @@ For canonical event transfer, egress rows carry `event_id`; canonical blob is re
 3. duplicate enqueue races are safe via `INSERT OR IGNORE` plus terminal fast-drop checks,
 4. queue lane classification uses outer semantic type, not decrypted projector output; for encrypted wrappers the runtime reads the wrapper-exposed `inner_type_code`, so encrypted `file_slice` rows are still lane `bulk` without needing decryption,
 5. bulk must not monopolize projection or send scheduling, but foreground order is preserved within a lane,
-6. concurrent sessions release only their own `egress_queue` leases; they do not wipe the peer queue,
-7. `attempts` is retry bookkeeping (backoff, lease recovery, alert thresholds), not business truth.
+6. sync request in-flight suppression is bounded memory state rather than durable egress leasing,
+7. duplicate pulls are acceptable as a recovery/perf tradeoff once spare credit exists; the sink still tries to avoid duplicates before first coverage.
 
 ## 7.5 Atomicity boundaries
 
@@ -1233,7 +1231,7 @@ Must be atomic:
 
 Can be eventual:
 
-1. transport send,
+1. transport send / request retry,
 2. queue cleanup/purge,
 3. metrics/logging.
 
@@ -1244,7 +1242,7 @@ Multi-source download is receiver-driven.
 Negentropy does discovery only:
 1. per source peer, the observer loop discovers:
    - sink `need_ids` (events we still lack),
-   - source `have_ids` (events we can push),
+   - source `have_ids` (events the remote peer appears to be missing, emitted as `NeedList` discovery hints rather than unsolicited data),
    - candidate source membership ("peer P appears to have event E").
 2. this discovery is written into SQL-backed wanted state rather than being
    balanced inline inside the negentropy round.
@@ -1269,7 +1267,7 @@ Key properties:
 - the sink can always keep active peers busy if candidate supply exists,
 - a slow source does not own events by fiat; another candidate can be used immediately once there is spare credit,
 - multi-source fairness is across distinct peers, not multiplied by duplicate connections,
-- push traffic and pull traffic share one scheduling model instead of two different balancing stories.
+- sync data transfer is request/response only; discovery never sends canonical event blobs directly.
 
 Future work: global fairness above connection-local credit.
 - Connection-local credit should continue to come from local send headroom: the

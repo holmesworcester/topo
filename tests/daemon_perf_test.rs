@@ -12,7 +12,7 @@ use std::time::{Duration, Instant};
 use cli_harness::{
     assert_eventually, create_invite_with_spki, daemon_listen_addr, daemon_transport_fingerprint,
     ensure_active_peer, generate_messages, message_count_sql, peak_rss_mib_for_pid, send_message,
-    start_daemon, start_daemon_with_options, topo_cmd, DaemonOptions,
+    start_daemon_with_options, topo_cmd, DaemonOptions,
 };
 use topo::testutil::DaemonGuard;
 
@@ -141,13 +141,20 @@ fn perf_debug_env(name: &str) -> bool {
 
 fn start_perf_daemon(db: &str, tmpdir: &std::path::Path, label: &str) -> DaemonGuard {
     if !perf_debug_env("PERF_DAEMON_LOGS") {
-        return start_daemon(db);
+        return start_daemon_with_options(
+            db,
+            &DaemonOptions {
+                disable_discovery: true,
+                ..Default::default()
+            },
+        );
     }
     start_daemon_with_options(
         db,
         &DaemonOptions {
             stdout_file: Some(tmpdir.join(format!("{label}.daemon.stdout.log"))),
             stderr_file: Some(tmpdir.join(format!("{label}.daemon.stderr.log"))),
+            disable_discovery: true,
             ..Default::default()
         },
     )
@@ -241,20 +248,12 @@ fn format_bench_diagnostics(db: &str) -> String {
     let wanted_events = query_count(&conn, "SELECT COUNT(*) FROM wanted_events");
     let blocked_events = query_count(&conn, "SELECT COUNT(*) FROM blocked_events");
     let project_queue = query_count(&conn, "SELECT COUNT(*) FROM project_queue");
-    let egress_unsent = query_count(
-        &conn,
-        "SELECT COUNT(*) FROM egress_queue WHERE sent_at IS NULL",
-    );
-    let egress_leased = query_count(
-        &conn,
-        "SELECT COUNT(*) FROM egress_queue WHERE sent_at IS NULL AND lease_until IS NOT NULL",
-    );
     let sync_runs = query_count(&conn, "SELECT COUNT(*) FROM sync_runs");
 
     let mut out = String::new();
     out.push_str("bench diagnostics:\n");
     out.push_str(&format!(
-        "  recorded_events={recorded_events} wanted_events={wanted_events} blocked_events={blocked_events} project_queue={project_queue} egress_unsent={egress_unsent} egress_leased={egress_leased} sync_runs={sync_runs}\n"
+        "  recorded_events={recorded_events} wanted_events={wanted_events} blocked_events={blocked_events} project_queue={project_queue} sync_runs={sync_runs}\n"
     ));
 
     if let Ok(mut stmt) = conn.prepare(

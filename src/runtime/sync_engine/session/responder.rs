@@ -1,7 +1,8 @@
 //! Sync responder (server role) with dual-stream transport.
 //!
 //! Handles incoming negentropy reconciliation, serves requested events from a
-//! bounded in-memory queue, and follows the shutdown protocol (DataDone / DoneAck).
+//! bounded in-memory queue, issues sink-side requests under advertised credit,
+//! and follows the shutdown protocol (DataDone / DoneAck).
 //!
 //! Reconciliation runs on a dedicated OS thread so the main loop can
 //! continue draining requested responses during the 100-400ms reconcile() calls.
@@ -21,6 +22,7 @@ use crate::db::{
     open_connection,
     queue::current_timestamp_ms,
     store::{lookup_workspace_id, Store},
+    wanted::WantedEvents,
 };
 use crate::protocol::Frame;
 use crate::runtime::memtrace;
@@ -32,8 +34,11 @@ use crate::tuning::{
     low_mem_memtrace, low_mem_mode, request_credit_high_watermark, request_credit_low_watermark,
 };
 
-use super::connection_scope::ConnectionResponseState;
-use super::control_plane::{send_done_ack, send_request_credit};
+use super::connection_scope::{ConnectionRequestState, ConnectionResponseState};
+use super::control_plane::{
+    observe_event_ids_for_peer, refill_wanted_requests, send_done_ack, send_request_credit,
+};
+use super::coordinator::PeerCoord;
 use super::data_plane::{
     drain_pending_responses_to_data_stream, send_data_done, spawn_data_receiver,
 };
@@ -67,6 +72,8 @@ pub async fn run_sync_responder<C, S, R>(
     peer_id: &str,
     recorded_by: &str,
     ingress_source_tag: &str,
+    coordination: &PeerCoord,
+    request_state: &ConnectionRequestState,
     response_state: &ConnectionResponseState,
     shared_ingest: mpsc::Sender<IngestItem>,
     capture: Option<SyncRunCapture>,
@@ -151,6 +158,7 @@ where
 
     let store = Store::new(&db);
     let timeline = EventTimeline::new(&db);
+    let wanted = WantedEvents::new(&db);
 
     let events_received = Arc::new(AtomicU64::new(0));
     let bytes_received = Arc::new(AtomicU64::new(0));
@@ -173,6 +181,7 @@ where
     let mut peer_done = false;
     let sync_start = Instant::now();
     let reconcile_start = Instant::now();
+    let mut reconcile_started_at_ms = current_timestamp_ms();
     let mut last_bytes_received = 0u64;
     let mut reconciling = false;
     let memtrace_enabled = low_mem_memtrace();
@@ -269,6 +278,7 @@ where
             Ok(Ok(Frame::NegOpen { msg })) => {
                 last_activity = Instant::now();
                 rounds += 1;
+                reconcile_started_at_ms = current_timestamp_ms();
                 let (window, inner_msg) =
                     decode_initial_neg_open(&msg).map_err(|e| format!("bad NegOpen: {e}"))?;
                 if neg_req_tx.is_none() {
@@ -302,10 +312,31 @@ where
                 let _ = timeline.mark_request_received_many(&ids, current_timestamp_ms());
                 response_state.consume_requests(&ids);
             }
+            Ok(Ok(Frame::NeedList { ids })) => {
+                last_activity = Instant::now();
+                let observed = observe_event_ids_for_peer(
+                    &wanted,
+                    &timeline,
+                    recorded_by,
+                    peer_id,
+                    reconcile_started_at_ms,
+                    &ids,
+                )?;
+                if observed > 0 {
+                    info!(
+                        "Observed {} needed IDs from peer {} via NeedList",
+                        observed, peer_id
+                    );
+                }
+            }
             Ok(Ok(Frame::Done)) => {
                 last_activity = Instant::now();
                 info!("Received Done from initiator");
                 peer_done = true;
+            }
+            Ok(Ok(Frame::RequestCredit { credits })) => {
+                last_activity = Instant::now();
+                request_state.add_credit(credits as usize);
             }
             Ok(Ok(_)) => {}
             Ok(Err(ConnectionError::Closed)) => {
@@ -327,6 +358,19 @@ where
             Err(_) => {}
         }
 
+        let requested_now = refill_wanted_requests(
+            &mut control,
+            &wanted,
+            &timeline,
+            coordination,
+            peer_id,
+            request_state,
+        )
+        .await?;
+        if requested_now > 0 {
+            last_activity = Instant::now();
+        }
+
         // Drain requested responses to data stream — runs even while worker is reconciling
         let send_stats = drain_pending_responses_to_data_stream(
             response_state,
@@ -342,7 +386,7 @@ where
             last_send_progress = Instant::now();
         }
 
-        if neg_req_tx.is_some() && !peer_done {
+        if neg_req_tx.is_some() {
             let grant = response_state.desired_credit_grant(credit_high, credit_low);
             if grant > 0 {
                 send_request_credit(&mut control, grant).await?;
@@ -357,19 +401,24 @@ where
 
         if memtrace_enabled && last_memtrace.elapsed() >= memtrace_interval {
             let response_stats = response_state.stats();
+            let request_stats = request_state.stats(current_timestamp_ms());
+            let wanted_peer_backlog = wanted.count_backlog_for_peer(peer_id).unwrap_or(-1);
             let ingest_cap = ingest_tx.max_capacity();
             let ingest_used = ingest_cap.saturating_sub(ingest_tx.capacity());
             let sqlite_global = memtrace::sqlite_global_memory();
             let sqlite_db = memtrace::sqlite_db_memory(&db);
             let allocator = memtrace::allocator_memory();
             let line = format!(
-                "LOWMEM_MEMTRACE responder peer={} rounds={} reconciling={} peer_done={} pending_responses={} request_credit_available={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_cache={} db_schema={} db_stmt={} mall_arena={} mall_used={} mall_free={} mall_mmap={} bytes_rx={} bytes_tx={}",
+                "LOWMEM_MEMTRACE responder peer={} rounds={} reconciling={} peer_done={} pending_responses={} response_credit_available={} wanted_peer_backlog={} request_inflight={} request_credit={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_cache={} db_schema={} db_stmt={} mall_arena={} mall_used={} mall_free={} mall_mmap={} bytes_rx={} bytes_tx={}",
                 peer_id,
                 rounds,
                 reconciling,
                 peer_done,
                 response_stats.pending_len,
                 response_stats.available_credit,
+                wanted_peer_backlog,
+                request_stats.inflight_len,
+                request_stats.remote_credit,
                 ingest_used,
                 ingest_cap,
                 sqlite_global.map(|s| s.memory_used_bytes).unwrap_or(-1),
@@ -399,10 +448,12 @@ where
             && last_idle_marker.elapsed() >= Duration::from_secs(1)
         {
             let response_stats = response_state.stats();
+            let request_stats = request_state.stats(current_timestamp_ms());
+            let pending_wanted_backlog = wanted.count_backlog_for_peer(peer_id).unwrap_or(0);
             if let Some(capture) = capture.as_ref() {
                 let idle_state = if response_stats.pending_len > 0 {
                     "queued_not_sending"
-                } else if reconciling || !peer_done {
+                } else if reconciling || pending_wanted_backlog > 0 || !peer_done {
                     "waiting_on_control"
                 } else {
                     "no_ready_work"
@@ -418,7 +469,10 @@ where
                         "reconciling": reconciling,
                         "peer_done": peer_done,
                         "pending_responses": response_stats.pending_len,
-                        "request_credit_available": response_stats.available_credit,
+                        "response_credit_available": response_stats.available_credit,
+                        "wanted_peer_backlog": pending_wanted_backlog,
+                        "request_inflight": request_stats.inflight_len,
+                        "request_credit": request_stats.remote_credit,
                     }))
                     .ok(),
                 );
@@ -430,7 +484,8 @@ where
         // 1. Send DataDone on data stream (signals peer's data receiver)
         // 2. Wait for peer's DataDone to be consumed by our data receiver
         // 3. Only then send DoneAck on control
-        if peer_done && !reconciling {
+        let pending_wanted_backlog = wanted.count_backlog_for_peer(peer_id).unwrap_or(0);
+        if peer_done && !reconciling && pending_wanted_backlog == 0 {
             if response_state.is_empty() {
                 let quiet_since = egress_quiet_since.get_or_insert_with(Instant::now);
                 if quiet_since.elapsed() >= EGRESS_QUIET_WINDOW {

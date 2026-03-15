@@ -253,7 +253,9 @@ pub fn start_bootstrap_responder(
             .build()
             .expect("failed to create bootstrap responder runtime");
         rt.block_on(async move {
-            let handler = SyncSessionHandler::responder(db_path.clone(), 30, ingest_tx);
+            let coordination = CoordinationManager::new().register_peer();
+            let handler =
+                SyncSessionHandler::responder(db_path.clone(), 30, coordination, ingest_tx);
             // Keep connections alive until the endpoint closes so QUIC can
             // deliver final frames (DoneAck, events) before the connection
             // is torn down. Dropping a quinn::Connection sends

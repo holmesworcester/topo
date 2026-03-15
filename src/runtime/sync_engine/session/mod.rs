@@ -49,15 +49,6 @@ pub(super) fn negentropy_frame_size() -> u64 {
     }
 }
 
-/// Max event IDs sent per HaveList message during reconciliation.
-pub(super) fn have_chunk() -> usize {
-    if low_mem_mode() {
-        8
-    } else {
-        1000
-    }
-}
-
 /// Max event IDs sent per NeedList/HaveList request during reconciliation.
 pub(super) fn need_chunk() -> usize {
     if low_mem_mode() {
@@ -66,35 +57,7 @@ pub(super) fn need_chunk() -> usize {
         1000
     }
 }
-
-/// Max events to enqueue into the egress queue per main-loop iteration.
-pub(super) fn enqueue_batch() -> usize {
-    if low_mem_mode() {
-        8
-    } else {
-        5000
-    }
-}
-
-/// Max events per egress claim (one send batch to the data stream).
-pub(super) fn egress_claim_count() -> usize {
-    if let Ok(v) = std::env::var("P7_EGRESS_CLAIM_COUNT") {
-        if let Ok(parsed) = v.parse::<usize>() {
-            return parsed.max(1);
-        }
-    }
-    if low_mem_mode() {
-        8
-    } else {
-        32
-    }
-}
-
-/// Max age (ms) for sent egress entries before cleanup.
-pub(super) const EGRESS_SENT_TTL_MS: i64 = 300_000;
-/// Lease duration for one egress claim batch.
-pub(super) const EGRESS_LEASE_MS: i64 = 30_000;
-/// Small quiet period before declaring a session's outbound egress drained.
+/// Small quiet period before declaring a session's outbound response queue drained.
 pub(super) const EGRESS_QUIET_WINDOW: Duration = Duration::from_millis(500);
 
 /// Time to wait for inbound data stream drain at session end.

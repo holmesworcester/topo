@@ -154,11 +154,10 @@ fn store_blob_only(
 }
 
 /// Project a stored event and return the committed projection outcome.
-fn project_stored_event_with_priority_outcome(
+fn project_stored_event_outcome(
     conn: &Connection,
     recorded_by: &str,
     event_id: &EventId,
-    queue_priority: Option<(i64, i64)>,
 ) -> Result<CreateAttemptOutcome, CreateEventError> {
     let decision = project_one(conn, recorded_by, event_id)
         .map_err(|e| CreateEventError::DbError(e.to_string()))?;
@@ -167,23 +166,6 @@ fn project_stored_event_with_priority_outcome(
         ProjectionDecision::Valid | ProjectionDecision::AlreadyProcessed => {
             fanout_stored_shared_event_inline(conn, recorded_by, event_id)
                 .map_err(|e| CreateEventError::DbError(e.to_string()))?;
-            match queue_priority {
-                Some((priority_lane, priority_ts)) => {
-                    crate::state::db::egress_queue::enqueue_local_shared_event_to_remote_peers_with_priority(
-                        conn,
-                        recorded_by,
-                        event_id,
-                        priority_lane,
-                        priority_ts,
-                    )
-                }
-                None => crate::state::db::egress_queue::enqueue_local_shared_event_to_remote_peers(
-                    conn,
-                    recorded_by,
-                    event_id,
-                ),
-            }
-            .map_err(|e| CreateEventError::DbError(e.to_string()))?;
             Ok(CreateAttemptOutcome::Success(*event_id))
         }
         ProjectionDecision::Block { missing } => Ok(CreateAttemptOutcome::Blocked {
@@ -202,7 +184,7 @@ fn project_event_outcome(
     recorded_by: &str,
     event_id: &EventId,
 ) -> Result<CreateAttemptOutcome, CreateEventError> {
-    project_stored_event_with_priority_outcome(conn, recorded_by, event_id, None)
+    project_stored_event_outcome(conn, recorded_by, event_id)
 }
 
 fn store_blob_then_project_with<F>(
@@ -216,7 +198,6 @@ fn store_blob_then_project_with<F>(
 where
     F: FnOnce(&Connection, &EventId) -> Result<(), CreateEventError>,
 {
-    let queue_priority = crate::state::db::queue::classify_priority_from_blob(blob, created_at_ms);
     let mut post_store = Some(post_store);
     let outcome = crate::state::db::queue::with_immediate_tx_result(conn, || {
         let event_id = store_blob_only(conn, recorded_by, blob, meta, created_at_ms)?;
@@ -224,12 +205,7 @@ where
             .take()
             .expect("store_blob_then_project_with closure invoked more than once");
         post_store(conn, &event_id)?;
-        project_stored_event_with_priority_outcome(
-            conn,
-            recorded_by,
-            &event_id,
-            Some(queue_priority),
-        )
+        project_stored_event_outcome(conn, recorded_by, &event_id)
     })?;
     outcome.into_result()
 }

@@ -17,6 +17,18 @@ use crate::fake_session_io::{
     test_session_meta, FakePeerSide,
 };
 
+async fn recv_control_ignoring_request_credit(peer: &mut FakePeerSide) -> Frame {
+    loop {
+        let frame = peer
+            .recv_control_msg_timeout(Duration::from_secs(5))
+            .await
+            .expect("expected control frame");
+        if !matches!(frame, Frame::RequestCredit { .. }) {
+            return frame;
+        }
+    }
+}
+
 /// Drive the responder side of an empty-DB sync from the test harness.
 async fn drive_empty_responder(peer: &mut FakePeerSide) {
     // 1. Initiator sends stream materialization markers (outbound only).
@@ -69,10 +81,7 @@ async fn drive_empty_responder(peer: &mut FakePeerSide) {
         .expect("expected DataDone");
     assert_eq!(data_done, Frame::DataDone, "expected DataDone");
 
-    let done = peer
-        .recv_control_msg_timeout(Duration::from_secs(5))
-        .await
-        .expect("expected Done");
+    let done = recv_control_ignoring_request_credit(peer).await;
     assert_eq!(done, Frame::Done, "expected Done");
 
     // 5. Send DataDone + DoneAck back to let initiator complete.
@@ -209,10 +218,7 @@ async fn anticheat_datadone_before_done() {
         );
 
         // Then Done on control stream
-        let done = peer
-            .recv_control_msg_timeout(Duration::from_secs(5))
-            .await
-            .expect("expected Done on control stream");
+        let done = recv_control_ignoring_request_credit(&mut peer).await;
         assert_eq!(done, Frame::Done, "ANTI-CHEAT: Done must follow DataDone");
 
         // Send completion

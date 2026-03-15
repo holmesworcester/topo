@@ -3,7 +3,8 @@
 //! Owns control-stream message handling concerns:
 //! - Negentropy control messages (`NegOpen` / `NegMsg`)
 //! - Sink-side observation of missing IDs into SQL-backed `wanted` state
-//! - Request-window refill (`HaveList`) via the shared in-memory coordinator
+//! - Discovery hints (`NeedList`) and request-window refill (`HaveList`)
+//!   via the shared in-memory coordinator
 //! - Session completion control markers (`Done` / `DoneAck`)
 
 use negentropy::Id;
@@ -31,21 +32,12 @@ where
     Ok(())
 }
 
-pub fn append_have_ids_to_pending(have_ids: &mut Vec<Id>, pending_have: &mut Vec<EventId>) {
-    if have_ids.is_empty() {
-        return;
-    }
-    pending_have.reserve(have_ids.len());
-    for neg_id in have_ids.drain(..) {
-        pending_have.push(neg_id_to_event_id(&neg_id));
-    }
-}
-
 /// Persist reconciliation-discovered `need_ids` as sink demand plus candidate
 /// source membership for this peer.
 pub fn observe_need_ids_for_peer(
     wanted: &WantedEvents<'_>,
     timeline: &EventTimeline<'_>,
+    local_peer_id: &str,
     peer_id: &str,
     discovery_round_started_at: i64,
     need_ids: &mut Vec<Id>,
@@ -60,23 +52,81 @@ pub fn observe_need_ids_for_peer(
     for neg_id in need_ids.drain(..) {
         batch.push(neg_id_to_event_id(&neg_id));
         if batch.len() >= batch_cap {
-            observed_total += wanted.observe_many_for_peer(
-                peer_id,
-                &batch,
-                discovery_round_started_at,
+            observed_total += observe_event_ids_for_peer(
+                wanted,
                 timeline,
+                local_peer_id,
+                peer_id,
+                discovery_round_started_at,
+                &batch,
             )?;
             batch.clear();
         }
     }
     if !batch.is_empty() {
-        observed_total +=
-            wanted.observe_many_for_peer(peer_id, &batch, discovery_round_started_at, timeline)?;
+        observed_total += observe_event_ids_for_peer(
+            wanted,
+            timeline,
+            local_peer_id,
+            peer_id,
+            discovery_round_started_at,
+            &batch,
+        )?;
     }
     if need_ids.capacity() > (batch_cap * 16) {
         need_ids.shrink_to(0);
     }
     Ok(observed_total)
+}
+
+pub fn observe_event_ids_for_peer(
+    wanted: &WantedEvents<'_>,
+    timeline: &EventTimeline<'_>,
+    local_peer_id: &str,
+    peer_id: &str,
+    discovery_round_started_at: i64,
+    ids: &[EventId],
+) -> Result<usize, SyncError> {
+    if ids.is_empty() {
+        return Ok(0);
+    }
+    Ok(wanted.observe_many_for_peer(
+        local_peer_id,
+        peer_id,
+        ids,
+        discovery_round_started_at,
+        timeline,
+    )?)
+}
+
+/// Send discovery hints for IDs the peer is missing.
+///
+/// These are not data sends. They only let the remote side populate durable
+/// `wanted` state and then pull the blobs under request credit.
+pub async fn send_need_list_from_have_ids<C>(
+    control: &mut C,
+    have_ids: &mut Vec<Id>,
+) -> Result<usize, SyncError>
+where
+    C: StreamConn,
+{
+    if have_ids.is_empty() {
+        return Ok(0);
+    }
+
+    let batch_size = need_chunk().max(1);
+    let mut sent = 0usize;
+    while !have_ids.is_empty() {
+        let drain_count = have_ids.len().min(batch_size);
+        let mut ids: Vec<EventId> = Vec::with_capacity(drain_count);
+        for neg_id in have_ids.drain(..drain_count) {
+            ids.push(neg_id_to_event_id(&neg_id));
+        }
+        sent += ids.len();
+        control.send(&Frame::NeedList { ids }).await?;
+    }
+    control.flush().await?;
+    Ok(sent)
 }
 
 /// Keep the peer's request window topped up from durable `wanted` state.

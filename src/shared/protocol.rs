@@ -12,6 +12,7 @@ pub const MSG_TYPE_NEG_OPEN: u8 = 0x10; // Initial negentropy message
 pub const MSG_TYPE_NEG_MSG: u8 = 0x11; // Negentropy response
 pub const MSG_TYPE_HAVE_LIST: u8 = 0x12; // List of IDs client needs from server
 pub const MSG_TYPE_REQUEST_CREDIT: u8 = 0x13; // Source-advertised request credit
+pub const MSG_TYPE_NEED_LIST: u8 = 0x14; // Discovery hint: peer is missing these IDs
 pub const MSG_TYPE_EVENT: u8 = 0x03; // Event blob (variable length)
 pub const MSG_TYPE_DONE: u8 = 0x20; // Initiator signals all events sent
 pub const MSG_TYPE_DONE_ACK: u8 = 0x21; // Responder acknowledges done
@@ -34,6 +35,8 @@ pub enum Frame {
     HaveList { ids: Vec<[u8; 32]> },
     /// Source-advertised request credit (count-based initial version)
     RequestCredit { credits: u32 },
+    /// Discovery hint: the receiver is believed to be missing these IDs
+    NeedList { ids: Vec<[u8; 32]> },
     /// Send full event blob (variable length)
     Event { blob: Vec<u8> },
     /// Initiator signals all outgoing events have been sent
@@ -85,7 +88,7 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
             };
             Ok((sync_msg, total_size))
         }
-        MSG_TYPE_HAVE_LIST => {
+        MSG_TYPE_HAVE_LIST | MSG_TYPE_NEED_LIST => {
             // Variable length: type(1) + count(4) + ids(count * 32)
             if input.len() < 5 {
                 return Err(ParseError::InsufficientData);
@@ -105,7 +108,12 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
                 id.copy_from_slice(&input[start..start + 32]);
                 ids.push(id);
             }
-            Ok((Frame::HaveList { ids }, total_size))
+            let frame = if msg_type == MSG_TYPE_HAVE_LIST {
+                Frame::HaveList { ids }
+            } else {
+                Frame::NeedList { ids }
+            };
+            Ok((frame, total_size))
         }
         MSG_TYPE_REQUEST_CREDIT => {
             if input.len() < 5 {
@@ -200,6 +208,15 @@ pub fn encode_frame(msg: &Frame) -> Vec<u8> {
         Frame::HaveList { ids } => {
             let mut buf = Vec::with_capacity(5 + ids.len() * 32);
             buf.push(MSG_TYPE_HAVE_LIST);
+            buf.extend_from_slice(&(ids.len() as u32).to_le_bytes());
+            for id in ids {
+                buf.extend_from_slice(id);
+            }
+            buf
+        }
+        Frame::NeedList { ids } => {
+            let mut buf = Vec::with_capacity(5 + ids.len() * 32);
+            buf.push(MSG_TYPE_NEED_LIST);
             buf.extend_from_slice(&(ids.len() as u32).to_le_bytes());
             for id in ids {
                 buf.extend_from_slice(id);

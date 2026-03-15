@@ -42,6 +42,18 @@ fn empty_negentropy_response(neg_open: Frame) -> Vec<u8> {
     neg.reconcile(msg).unwrap()
 }
 
+async fn recv_control_ignoring_request_credit(peer: &mut FakePeerSide) -> Frame {
+    loop {
+        let frame = peer
+            .recv_control_msg_timeout(Duration::from_secs(5))
+            .await
+            .expect("expected control frame");
+        if !matches!(frame, Frame::RequestCredit { .. }) {
+            return frame;
+        }
+    }
+}
+
 #[tokio::test]
 async fn initiator_reuses_connection_scoped_credit_across_rounds() {
     run_local(async {
@@ -84,10 +96,7 @@ async fn initiator_reuses_connection_scoped_credit_across_rounds() {
             .await
             .expect("expected DataDone in round 1");
         assert_eq!(data_done, Frame::DataDone);
-        let done = peer1
-            .recv_control_msg_timeout(Duration::from_secs(5))
-            .await
-            .expect("expected Done in round 1");
+        let done = recv_control_ignoring_request_credit(&mut peer1).await;
         assert_eq!(done, Frame::Done);
         peer1.send_data_msg(&Frame::DataDone).await;
         peer1.send_control_msg(&Frame::DoneAck).await;
@@ -104,7 +113,13 @@ async fn initiator_reuses_connection_scoped_credit_across_rounds() {
         let timeline = EventTimeline::new(&conn);
         assert_eq!(
             wanted
-                .observe_many_for_peer(&peer_hex, &[requested_event], 1_000, &timeline)
+                .observe_many_for_peer(
+                    "test-tenant",
+                    &peer_hex,
+                    &[requested_event],
+                    1_000,
+                    &timeline
+                )
                 .expect("observe wanted"),
             1
         );
@@ -122,10 +137,7 @@ async fn initiator_reuses_connection_scoped_credit_across_rounds() {
         });
 
         let _neg_open2 = recv_outbound_markers_and_negopen(&mut peer2).await;
-        let request = peer2
-            .recv_control_msg_timeout(Duration::from_secs(5))
-            .await
-            .expect("expected connection-scoped HaveList request");
+        let request = recv_control_ignoring_request_credit(&mut peer2).await;
         match request {
             Frame::HaveList { ids } => assert_eq!(ids, vec![requested_event]),
             other => panic!("expected HaveList request, got {:?}", other),

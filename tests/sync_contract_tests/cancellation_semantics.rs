@@ -100,7 +100,12 @@ async fn mid_session_cancellation_terminates_handler() {
 async fn responder_cancellation_terminates_handler() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncSessionHandler::responder(db_path, 30, noop_ingest_tx());
+        let handler = SyncSessionHandler::responder(
+            db_path,
+            30,
+            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
+            noop_ingest_tx(),
+        );
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 

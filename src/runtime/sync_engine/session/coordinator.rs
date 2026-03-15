@@ -382,10 +382,22 @@ mod tests {
         c[0] = 3;
 
         wanted
-            .observe_many_for_peer("peer-a", &[a, b], now_ms_placeholder(), &timeline)
+            .observe_many_for_peer(
+                "local-peer",
+                "peer-a",
+                &[a, b],
+                now_ms_placeholder(),
+                &timeline,
+            )
             .unwrap();
         wanted
-            .observe_many_for_peer("peer-b", &[a, c], now_ms_placeholder(), &timeline)
+            .observe_many_for_peer(
+                "local-peer",
+                "peer-b",
+                &[a, c],
+                now_ms_placeholder(),
+                &timeline,
+            )
             .unwrap();
 
         let manager = CoordinationManager::new();

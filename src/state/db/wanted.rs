@@ -84,6 +84,7 @@ impl<'a> WantedEvents<'a> {
     /// This records event demand once and candidate source membership per peer.
     pub fn observe_many_for_peer(
         &self,
+        local_peer_id: &str,
         peer_id: &str,
         ids: &[EventId],
         discovery_round_started_at: i64,
@@ -94,9 +95,11 @@ impl<'a> WantedEvents<'a> {
         }
         let now = current_timestamp_ms();
         with_immediate_tx(self.conn, || {
-            let mut local_exists = self
-                .conn
-                .prepare("SELECT 1 FROM events WHERE event_id = ?1 LIMIT 1")?;
+            let mut already_recorded = self.conn.prepare(
+                "SELECT 1 FROM recorded_events
+                 WHERE peer_id = ?1 AND event_id = ?2
+                 LIMIT 1",
+            )?;
             let mut insert_wanted = self.conn.prepare(
                 "INSERT OR IGNORE INTO wanted_events (id, first_seen_at)
                  VALUES (?1, ?2)",
@@ -115,8 +118,8 @@ impl<'a> WantedEvents<'a> {
             let mut discovered_ids = Vec::with_capacity(ids.len());
             for id in ids {
                 let id_b64 = event_id_to_base64(id);
-                let already_local = local_exists
-                    .query_row(params![&id_b64], |_| Ok(()))
+                let already_local = already_recorded
+                    .query_row(params![local_peer_id, &id_b64], |_| Ok(()))
                     .optional()?
                     .is_some();
                 if already_local {
@@ -389,6 +392,15 @@ mod tests {
         .unwrap();
     }
 
+    fn mark_recorded_for_peer(conn: &Connection, peer_id: &str, id: &EventId) {
+        conn.execute(
+            "INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, 1, 'test')",
+            params![peer_id, event_id_to_base64(id)],
+        )
+        .unwrap();
+    }
+
     #[test]
     fn test_insert_retries_transient_busy_lock() {
         let dir = tempfile::tempdir().unwrap();
@@ -410,7 +422,7 @@ mod tests {
             let wanted = WantedEvents::new(&conn);
             let timeline = EventTimeline::new(&conn);
             wanted
-                .observe_many_for_peer("peer-a", &[make_event_id(7)], 1, &timeline)
+                .observe_many_for_peer("local", "peer-a", &[make_event_id(7)], 1, &timeline)
                 .unwrap()
         });
 
@@ -433,10 +445,10 @@ mod tests {
         let ids = [make_event_id(1), make_event_id(2)];
 
         wanted
-            .observe_many_for_peer("peer-a", &ids, 1, &timeline)
+            .observe_many_for_peer("local", "peer-a", &ids, 1, &timeline)
             .unwrap();
         wanted
-            .observe_many_for_peer("peer-b", &ids, 1, &timeline)
+            .observe_many_for_peer("local", "peer-b", &ids, 1, &timeline)
             .unwrap();
 
         let claimed_a = wanted
@@ -464,10 +476,10 @@ mod tests {
         let id = make_event_id(9);
 
         wanted
-            .observe_many_for_peer("peer-a", &[id], 1, &timeline)
+            .observe_many_for_peer("local", "peer-a", &[id], 1, &timeline)
             .unwrap();
         wanted
-            .observe_many_for_peer("peer-b", &[id], 1, &timeline)
+            .observe_many_for_peer("local", "peer-b", &[id], 1, &timeline)
             .unwrap();
 
         let claimed_a = wanted
@@ -491,10 +503,10 @@ mod tests {
         let id = make_event_id(5);
 
         wanted
-            .observe_many_for_peer("peer-a", &[id], 1, &timeline)
+            .observe_many_for_peer("local", "peer-a", &[id], 1, &timeline)
             .unwrap();
         wanted
-            .observe_many_for_peer("peer-b", &[id], 1, &timeline)
+            .observe_many_for_peer("local", "peer-b", &[id], 1, &timeline)
             .unwrap();
         wanted.remove(&id).unwrap();
 
@@ -525,16 +537,17 @@ mod tests {
         let id = make_event_id(11);
 
         wanted
-            .observe_many_for_peer("peer-a", &[id], 1, &timeline)
+            .observe_many_for_peer("local", "peer-a", &[id], 1, &timeline)
             .unwrap();
         assert_eq!(wanted.count().unwrap(), 1);
 
         insert_local_event(&conn, &id);
+        mark_recorded_for_peer(&conn, "local", &id);
         wanted.remove(&id).unwrap();
 
         assert_eq!(
             wanted
-                .observe_many_for_peer("peer-a", &[id], 1, &timeline)
+                .observe_many_for_peer("local", "peer-a", &[id], 1, &timeline)
                 .unwrap(),
             0
         );

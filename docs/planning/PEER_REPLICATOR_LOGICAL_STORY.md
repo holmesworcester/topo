@@ -14,7 +14,6 @@ Its job is only to answer:
 
 Outputs from observation:
 
-- peer egress demand for push traffic,
 - sink `wanted` demand for pull traffic,
 - sink `wanted_sources` candidate-source rows for pull traffic.
 
@@ -48,19 +47,19 @@ This is where balancing lives:
 
 ## 3. Send / Response
 
-The source-side responder is the actuator for push traffic.
+The source-side responder is the actuator for request/response traffic.
 
 Its job is only to answer:
 
 - for the IDs this peer requested, stream the corresponding canonical blobs,
-- for the IDs discovered as outbound `have_ids`, push them through peer egress.
+- keep advertised request credit topped up when its response pipeline drains.
 
 This side should not decide multi-source balancing either.
 
 It just drains:
 
-- `egress_queue` for push traffic,
-- `HaveList` requests for pull responses.
+- bounded in-memory response queues for requested event IDs,
+- connection-scoped request credit and in-flight state.
 
 ## 4. Why The Split Matters
 
@@ -71,8 +70,7 @@ This separates three concerns cleanly:
 2. **Request selection** is cheap and high-rate.
    - Fill source-advertised request credit from `wanted + wanted_sources`.
 3. **Data send** is cheap and high-rate.
-   - Drain leased push windows or bounded in-memory pull-response queues and
-     keep QUIC streams fed.
+   - Drain bounded in-memory response queues and keep QUIC streams fed.
 
 Without this split, the wire ends up paced by SQLite claim cadence or by fresh
 negentropy rounds instead of by transport availability.
@@ -82,7 +80,6 @@ negentropy rounds instead of by transport availability.
 The intended invariants are:
 
 - at most one steady-state live authenticated peer slot per peer,
-- at most one sender owner drains a peer slot's push egress at a time,
 - wanted demand is recorded once per event, independent of how many peers may satisfy it,
 - candidate source membership is recorded separately from demand,
 - pull balancing is sink-driven, not embedded in negentropy,
@@ -102,8 +99,8 @@ The current code is an incremental form of this model rather than the final
   where connection-scoped request/response state now lives,
 - pull credit, in-flight request suppression, and pending responses survive
   discovery-round boundaries on the same authenticated connection,
-- responder session now serves pull responses from a bounded in-memory queue
-  rather than SQLite egress,
+- responder session now serves all sync responses from a bounded in-memory
+  queue rather than SQLite egress,
 - `wanted` + `wanted_sources` are already the durable sink-side discovery truth,
 - request credit and in-flight request suppression are already memory-only.
 

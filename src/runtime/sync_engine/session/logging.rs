@@ -277,7 +277,7 @@ fn frame_detail_json(frame: &Frame, capture_full_ids: bool) -> Option<String> {
         Frame::NegOpen { msg } | Frame::NegMsg { msg } => {
             serde_json::to_string(&parse_neg_payload(msg, capture_full_ids)).ok()
         }
-        Frame::HaveList { ids } => {
+        Frame::HaveList { ids } | Frame::NeedList { ids } => {
             let keep = if capture_full_ids {
                 ids.len()
             } else {
@@ -313,6 +313,7 @@ fn frame_type(frame: &Frame) -> &'static str {
         Frame::NegOpen { .. } => "NegOpen",
         Frame::NegMsg { .. } => "NegMsg",
         Frame::HaveList { .. } => "HaveList",
+        Frame::NeedList { .. } => "NeedList",
         Frame::RequestCredit { .. } => "RequestCredit",
         Frame::Event { .. } => "Event",
         Frame::Done => "Done",

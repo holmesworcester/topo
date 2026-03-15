@@ -1,7 +1,7 @@
 //! Sync initiator (client role) with dual-stream transport.
 //!
-//! Drives negentropy reconciliation, pushes events the peer needs, and
-//! uses sink-driven `wanted` scheduling for multi-source pull work division.
+//! Drives negentropy reconciliation and uses sink-driven `wanted` scheduling
+//! for multi-source pull work division in both directions.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -13,9 +13,7 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::IngestItem;
-use crate::crypto::EventId;
 use crate::db::{
-    egress_queue::EgressQueue,
     open_connection,
     queue::current_timestamp_ms,
     store::{lookup_workspace_id, Store},
@@ -30,17 +28,18 @@ use crate::runtime::SyncStats;
 use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
-use crate::tuning::{low_mem_memtrace, low_mem_mode};
+use crate::tuning::{
+    low_mem_memtrace, low_mem_mode, request_credit_high_watermark, request_credit_low_watermark,
+};
 
-use super::connection_scope::ConnectionRequestState;
+use super::connection_scope::{ConnectionRequestState, ConnectionResponseState};
 use super::control_plane::{
-    append_have_ids_to_pending, observe_need_ids_for_peer, refill_wanted_requests, send_done,
-    send_initial_neg_open,
+    observe_need_ids_for_peer, refill_wanted_requests, send_done, send_initial_neg_open,
+    send_need_list_from_have_ids, send_request_credit,
 };
 use super::coordinator::PeerCoord;
 use super::data_plane::{
-    drain_egress_to_data_stream, enqueue_pending_have_to_egress, send_data_done,
-    spawn_data_receiver,
+    drain_pending_responses_to_data_stream, send_data_done, spawn_data_receiver,
 };
 use super::logging::{SyncRunCapture, SyncRunRxCapture};
 use super::windowing::{
@@ -48,7 +47,7 @@ use super::windowing::{
 };
 use super::{
     negentropy_frame_size, send_idle_capture_enabled, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT,
-    EGRESS_QUIET_WINDOW, EGRESS_SENT_TTL_MS, INITIAL_CONTROL_PROGRESS_TIMEOUT,
+    EGRESS_QUIET_WINDOW, INITIAL_CONTROL_PROGRESS_TIMEOUT,
 };
 
 fn should_treat_as_startup_control_abort(
@@ -60,28 +59,27 @@ fn should_treat_as_startup_control_abort(
 }
 
 /// Run sync as the initiator (client role) with dual streams.
-/// Control stream: NegOpen, NegMsg, HaveList
-/// Data stream: Event blobs
+/// Control stream: NegOpen, NegMsg, HaveList, RequestCredit
+/// Data stream: requested Event blobs
 ///
-/// Push (have_ids): always sends everything the peer needs.
-/// Pull (need_ids): recorded into sink-side SQL `wanted` state during
-/// reconciliation. A per-peer request window then drains that durable state
-/// into `HaveList` requests, so balancing happens at the sink instead of
-/// inside negentropy.
+/// Discovery is still round-scoped, but all event-data transfer is pull-only:
+/// both sides can request IDs under advertised credit and serve requested
+/// responses from bounded in-memory connection state.
 ///
 /// Callers must provide a `shared_ingest` sender connected to a shared
 /// batch_writer. The session never spawns its own writer thread.
 pub async fn run_sync_initiator<C, S, R>(
     conn: DualConnection<C, S, R>,
-    session_id: u64,
+    _session_id: u64,
     db_path: &str,
     timeout_secs: u64,
-    session_owner: &str,
+    _session_owner: &str,
     peer_id: &str,
     recorded_by: &str,
     ingress_source_tag: &str,
     coordination: &PeerCoord,
     request_state: &ConnectionRequestState,
+    response_state: &ConnectionResponseState,
     shared_ingest: mpsc::Sender<IngestItem>,
     capture: Option<SyncRunCapture>,
     rx_capture: Option<SyncRunRxCapture>,
@@ -109,7 +107,6 @@ where
     let neg_db = open_connection(db_path)?;
     let use_snapshot = !low_mem_mode();
 
-    let egress = EgressQueue::new(&db);
     let wanted = WantedEvents::new(&db);
     let timeline = EventTimeline::new(&db);
     let ws_id = lookup_workspace_id(&db, recorded_by).ok_or_else(|| {
@@ -180,10 +177,7 @@ where
     let sync_start = Instant::now();
     let reconcile_start = Instant::now();
     let reconcile_started_at_ms = current_timestamp_ms();
-    // Pending have_ids buffer: populated by reconciliation, drained incrementally
-    let mut pending_have: Vec<EventId> = Vec::new();
     let mut last_bytes_received = 0u64;
-    let mut last_egress_log = Instant::now();
     let memtrace_enabled = low_mem_memtrace();
     let memtrace_interval = Duration::from_secs(2);
     let memtrace_file = std::env::var("LOW_MEM_MEMTRACE_FILE").ok();
@@ -193,6 +187,8 @@ where
     let idle_capture_enabled = send_idle_capture_enabled() && capture.is_some();
     let mut last_send_progress = Instant::now();
     let mut last_idle_marker = Instant::now();
+    let credit_high = request_credit_high_watermark().max(1);
+    let credit_low = request_credit_low_watermark().min(credit_high.saturating_sub(1));
 
     loop {
         // Data receiver runs in a separate task — check if it received data
@@ -211,10 +207,9 @@ where
         }
         if rounds == 0 && sync_start.elapsed() >= INITIAL_CONTROL_PROGRESS_TIMEOUT {
             warn!(
-                "Initial control progress timeout after {}ms (peer={}, pending_have={})",
+                "Initial control progress timeout after {}ms (peer={})",
                 sync_start.elapsed().as_millis(),
-                peer_id,
-                pending_have.len()
+                peer_id
             );
             if let Some(capture) = capture.as_ref() {
                 capture.record_marker(
@@ -224,7 +219,6 @@ where
                     serde_json::to_string(&json!({
                         "peer_id": peer_id,
                         "elapsed_ms": sync_start.elapsed().as_millis(),
-                        "pending_have": pending_have.len(),
                         "need_ids": need_ids.len(),
                     }))
                     .ok(),
@@ -253,13 +247,23 @@ where
                         reconciliation_done = true;
                     }
                 }
-
-                append_have_ids_to_pending(&mut have_ids, &mut pending_have);
+                let sent_need_hints =
+                    send_need_list_from_have_ids(&mut control, &mut have_ids).await?;
+                if sent_need_hints > 0 {
+                    last_activity = Instant::now();
+                }
             }
             Ok(Ok(Frame::DoneAck)) => {
                 info!("Received DoneAck from responder");
                 completed = true;
                 break;
+            }
+            Ok(Ok(Frame::HaveList { ids })) => {
+                last_activity = Instant::now();
+                if !ids.is_empty() {
+                    let _ = timeline.mark_request_received_many(&ids, current_timestamp_ms());
+                    response_state.consume_requests(&ids);
+                }
             }
             Ok(Ok(Frame::RequestCredit { credits })) => {
                 last_activity = Instant::now();
@@ -310,6 +314,7 @@ where
         let observed_need_ids = observe_need_ids_for_peer(
             &wanted,
             &timeline,
+            recorded_by,
             peer_id,
             reconcile_started_at_ms,
             &mut need_ids,
@@ -333,22 +338,24 @@ where
             last_activity = Instant::now();
         }
 
-        if let Err(err) =
-            enqueue_pending_have_to_egress(session_id, &egress, peer_id, &mut pending_have)
-        {
-            warn!(
-                "Session {} failed to queue pending Have ids for peer {}: {}",
-                session_id, peer_id, err
-            );
-        }
-        let send_stats =
-            drain_egress_to_data_stream(&egress, &store, peer_id, session_owner, &mut data_send)
-                .await;
+        let send_stats = drain_pending_responses_to_data_stream(
+            response_state,
+            &timeline,
+            &store,
+            &mut data_send,
+        )
+        .await;
         events_sent += send_stats.events_sent_delta;
         bytes_sent += send_stats.bytes_sent_delta;
         if send_stats.events_sent_delta > 0 {
             last_activity = Instant::now();
             last_send_progress = Instant::now();
+        }
+
+        let grant = response_state.desired_credit_grant(credit_high, credit_low);
+        if grant > 0 {
+            send_request_credit(&mut control, grant).await?;
+            response_state.note_granted(grant);
         }
 
         if low_mem_mode() && last_alloc_trim.elapsed() >= Duration::from_millis(100) {
@@ -357,12 +364,10 @@ where
         }
 
         if memtrace_enabled && last_memtrace.elapsed() >= memtrace_interval {
-            let egress_pending = egress
-                .count_outstanding(peer_id, session_owner)
-                .unwrap_or(-1);
             let wanted_pending = wanted.count().unwrap_or(-1);
             let wanted_peer_backlog = wanted.count_backlog_for_peer(peer_id).unwrap_or(-1);
             let request_stats = request_state.stats(current_timestamp_ms());
+            let response_stats = response_state.stats();
             let ingest_cap = ingest_tx.max_capacity();
             let ingest_used = ingest_cap.saturating_sub(ingest_tx.capacity());
             let sqlite_global = memtrace::sqlite_global_memory();
@@ -370,20 +375,19 @@ where
             let sqlite_neg = memtrace::sqlite_db_memory(&neg_db);
             let allocator = memtrace::allocator_memory();
             let line = format!(
-                "LOWMEM_MEMTRACE initiator peer={} rounds={} have={} need={} have_cap={} need_cap={} pending_have={} pending_have_cap={} wanted_total={} wanted_peer_backlog={} request_inflight={} request_credit={} egress_pending={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_main_cache={} db_main_schema={} db_main_stmt={} db_neg_cache={} db_neg_schema={} db_neg_stmt={} mall_arena={} mall_used={} mall_free={} mall_mmap={} bytes_rx={} bytes_tx={}",
+                "LOWMEM_MEMTRACE initiator peer={} rounds={} have={} need={} have_cap={} need_cap={} wanted_total={} wanted_peer_backlog={} request_inflight={} request_credit={} pending_responses={} response_credit_available={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_main_cache={} db_main_schema={} db_main_stmt={} db_neg_cache={} db_neg_schema={} db_neg_stmt={} mall_arena={} mall_used={} mall_free={} mall_mmap={} bytes_rx={} bytes_tx={}",
                 peer_id,
                 rounds,
                 have_ids.len(),
                 need_ids.len(),
                 have_ids.capacity(),
                 need_ids.capacity(),
-                pending_have.len(),
-                pending_have.capacity(),
                 wanted_pending,
                 wanted_peer_backlog,
                 request_stats.inflight_len,
                 request_stats.remote_credit,
-                egress_pending,
+                response_stats.pending_len,
+                response_stats.available_credit,
                 ingest_used,
                 ingest_cap,
                 sqlite_global.map(|s| s.memory_used_bytes).unwrap_or(-1),
@@ -412,10 +416,8 @@ where
         }
 
         let pending_wanted_backlog = wanted.count_backlog_for_peer(peer_id).unwrap_or(0);
-        let egress_pending = egress
-            .count_outstanding(peer_id, session_owner)
-            .unwrap_or(0);
         let request_stats = request_state.stats(current_timestamp_ms());
+        let response_stats = response_state.stats();
 
         if idle_capture_enabled
             && !done_sent
@@ -423,7 +425,7 @@ where
             && last_idle_marker.elapsed() >= Duration::from_secs(1)
         {
             if let Some(capture) = capture.as_ref() {
-                let idle_state = if egress_pending > 0 || !pending_have.is_empty() {
+                let idle_state = if response_stats.pending_len > 0 {
                     "queued_not_sending"
                 } else if !reconciliation_done || !need_ids.is_empty() || pending_wanted_backlog > 0
                 {
@@ -440,12 +442,12 @@ where
                         "state": idle_state,
                         "idle_ms": last_send_progress.elapsed().as_millis(),
                         "reconciliation_done": reconciliation_done,
-                        "pending_have": pending_have.len(),
                         "need_ids": need_ids.len(),
                         "wanted_peer_backlog": pending_wanted_backlog,
                         "request_inflight": request_stats.inflight_len,
                         "request_credit": request_stats.remote_credit,
-                        "egress_pending": egress_pending,
+                        "pending_responses": response_stats.pending_len,
+                        "response_credit_available": response_stats.available_credit,
                         "wanted_pending": wanted.count().unwrap_or(-1),
                     }))
                     .ok(),
@@ -455,46 +457,33 @@ where
         }
 
         // Once reconciliation is done, this peer has no remaining wanted
-        // backlog, pending_have is drained, and egress queue is empty, send
+        // backlog, and there are no requested responses left to serve, send
         // DataDone+Done.
         if reconciliation_done
             && need_ids.is_empty()
             && pending_wanted_backlog == 0
-            && pending_have.is_empty()
+            && response_state.is_empty()
             && !done_sent
         {
-            if egress_pending > 0 && last_egress_log.elapsed() >= Duration::from_secs(5) {
+            let quiet_since = egress_quiet_since.get_or_insert_with(Instant::now);
+            if quiet_since.elapsed() >= EGRESS_QUIET_WINDOW {
+                send_data_done(&mut data_send).await?;
+                send_done(&mut control).await?;
+                done_sent = true;
                 info!(
-                    "Draining egress: {} pending, {} sent so far",
-                    egress_pending, events_sent
+                    "Sent DataDone+Done, waiting for DoneAck (sent {}, received {})",
+                    events_sent,
+                    events_received.load(Ordering::Relaxed)
                 );
-                last_egress_log = Instant::now();
             }
-            if egress_pending == 0 {
-                let quiet_since = egress_quiet_since.get_or_insert_with(Instant::now);
-                if quiet_since.elapsed() >= EGRESS_QUIET_WINDOW {
-                    send_data_done(&mut data_send).await?;
-                    send_done(&mut control).await?;
-                    done_sent = true;
-                    info!(
-                        "Sent DataDone+Done, waiting for DoneAck (sent {}, received {})",
-                        events_sent,
-                        events_received.load(Ordering::Relaxed)
-                    );
-                }
-            } else {
-                egress_quiet_since = None;
-            }
+        } else {
+            egress_quiet_since = None;
         }
     }
-
-    let _ = egress.release_leases(peer_id, session_owner);
-    let _ = egress.cleanup_sent_for_connection(peer_id, 0);
     if completed {
         if sync_window.kind == SyncWindowKind::Full {
             mark_outbound_full_completed(db_path, peer_id, current_timestamp_ms());
         }
-        let _ = egress.cleanup_sent(EGRESS_SENT_TTL_MS);
     }
     if use_snapshot {
         let _ = neg_db.execute("COMMIT", []);

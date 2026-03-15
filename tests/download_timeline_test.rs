@@ -1,4 +1,5 @@
 use std::time::Duration;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 use topo::crypto::event_id_to_base64;
 use topo::db::{open_connection, timeline::EventTimeline};
@@ -8,6 +9,13 @@ fn assert_non_decreasing(label: &str, earlier: Option<i64>, later: Option<i64>) 
     let earlier = earlier.unwrap_or_else(|| panic!("{label}: missing earlier timestamp"));
     let later = later.unwrap_or_else(|| panic!("{label}: missing later timestamp"));
     assert!(earlier <= later, "{label}: expected {earlier} <= {later}");
+}
+
+fn current_timestamp_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_millis() as i64
 }
 
 #[tokio::test]
@@ -102,6 +110,70 @@ async fn requested_download_records_pipeline_timestamps_on_source_and_sink() {
         source_timeline.request_received_at,
         source_timeline.response_sent_at,
     );
+
+    harness.finish();
+}
+
+#[tokio::test]
+async fn bidirectional_sync_receives_only_requested_event_data() {
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
+
+    let phase_start_ms = current_timestamp_ms();
+    let alice_msgs: Vec<String> = (0..3)
+        .map(|idx| event_id_to_base64(&alice.create_message(&format!("alice msg {idx}"))))
+        .collect();
+    let bob_msgs: Vec<String> = (0..3)
+        .map(|idx| event_id_to_base64(&bob.create_message(&format!("bob msg {idx}"))))
+        .collect();
+
+    let _metrics = sync_until_converged(
+        &alice,
+        &bob,
+        || {
+            alice_msgs.iter().all(|eid| bob.has_event(eid))
+                && bob_msgs.iter().all(|eid| alice.has_event(eid))
+        },
+        Duration::from_secs(30),
+    )
+    .await;
+
+    let alice_conn = open_connection(&alice.db_path).expect("open alice db");
+    let alice_timeline = EventTimeline::new(&alice_conn);
+    for eid in &bob_msgs {
+        let row = alice_timeline
+            .load(eid)
+            .expect("load alice sink timeline")
+            .expect("alice sink timeline row");
+        assert!(
+            row.request_sent_at.is_some(),
+            "alice received remote event {eid} without a request timestamp after {phase_start_ms}"
+        );
+        assert!(
+            row.response_received_at.is_some(),
+            "alice missing receive timestamp for remote event {eid}"
+        );
+    }
+
+    let bob_conn = open_connection(&bob.db_path).expect("open bob db");
+    let bob_timeline = EventTimeline::new(&bob_conn);
+    for eid in &alice_msgs {
+        let row = bob_timeline
+            .load(eid)
+            .expect("load bob sink timeline")
+            .expect("bob sink timeline row");
+        assert!(
+            row.request_sent_at.is_some(),
+            "bob received remote event {eid} without a request timestamp after {phase_start_ms}"
+        );
+        assert!(
+            row.response_received_at.is_some(),
+            "bob missing receive timestamp for remote event {eid}"
+        );
+    }
 
     harness.finish();
 }

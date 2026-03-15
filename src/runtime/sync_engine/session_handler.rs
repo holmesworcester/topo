@@ -111,21 +111,13 @@ fn map_io_error(err: TransportSessionIoError) -> ConnectionError {
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub enum SessionRole {
-    Initiator {
-        coordination: Arc<PeerCoord>,
-        request_state: Arc<ConnectionRequestState>,
-    },
-    Responder {
-        response_state: Arc<ConnectionResponseState>,
-    },
-}
-
-#[derive(Clone)]
 pub struct SyncSessionHandler {
     db_path: String,
     timeout_secs: u64,
-    role: SessionRole,
+    direction: SessionDirection,
+    coordination: Arc<PeerCoord>,
+    request_state: Arc<ConnectionRequestState>,
+    response_state: Arc<ConnectionResponseState>,
     shared_ingest: mpsc::Sender<IngestItem>,
 }
 
@@ -139,10 +131,10 @@ impl SyncSessionHandler {
         Self {
             db_path,
             timeout_secs,
-            role: SessionRole::Initiator {
-                coordination,
-                request_state: Arc::new(ConnectionRequestState::default()),
-            },
+            direction: SessionDirection::Outbound,
+            coordination,
+            request_state: Arc::new(ConnectionRequestState::default()),
+            response_state: Arc::new(ConnectionResponseState::default()),
             shared_ingest,
         }
     }
@@ -150,14 +142,16 @@ impl SyncSessionHandler {
     pub fn responder(
         db_path: String,
         timeout_secs: u64,
+        coordination: Arc<PeerCoord>,
         shared_ingest: mpsc::Sender<IngestItem>,
     ) -> Self {
         Self {
             db_path,
             timeout_secs,
-            role: SessionRole::Responder {
-                response_state: Arc::new(ConnectionResponseState::default()),
-            },
+            direction: SessionDirection::Inbound,
+            coordination,
+            request_state: Arc::new(ConnectionRequestState::default()),
+            response_state: Arc::new(ConnectionResponseState::default()),
             shared_ingest,
         }
     }
@@ -165,18 +159,9 @@ impl SyncSessionHandler {
 
 impl Drop for SyncSessionHandler {
     fn drop(&mut self) {
-        match &self.role {
-            SessionRole::Initiator {
-                coordination,
-                request_state,
-            } => {
-                request_state.clear();
-                coordination.clear_request_state();
-            }
-            SessionRole::Responder { response_state } => {
-                response_state.clear();
-            }
-        }
+        self.request_state.clear();
+        self.response_state.clear();
+        self.coordination.clear_request_state();
     }
 }
 
@@ -238,9 +223,9 @@ impl SessionHandler for SyncSessionHandler {
         // Split the abstract TransportSessionIo into independent control/data handles,
         // then wrap them as StreamConn/StreamSend/StreamRecv adapters so the
         // existing session functions work without QUIC-specific types.
-        let role_name = match &self.role {
-            SessionRole::Initiator { .. } => "initiator",
-            SessionRole::Responder { .. } => "responder",
+        let role_name = match self.direction {
+            SessionDirection::Outbound => "initiator",
+            SessionDirection::Inbound => "responder",
         };
         let run_logger = SessionRunLogger::maybe_new(&self.db_path, &meta, role_name);
         let capture = run_logger.as_ref().and_then(|l| l.capture());
@@ -287,14 +272,8 @@ impl SessionHandler for SyncSessionHandler {
         }
 
         let mut stats: Option<crate::runtime::SyncStats> = None;
-        let result = match (&self.role, meta.direction) {
-            (
-                SessionRole::Initiator {
-                    coordination,
-                    request_state,
-                },
-                SessionDirection::Outbound,
-            ) => {
+        let result = match (self.direction, meta.direction) {
+            (SessionDirection::Outbound, SessionDirection::Outbound) => {
                 info!(
                     "Session {} entering initiator sync peer={} remote={}",
                     meta.session_id,
@@ -310,8 +289,9 @@ impl SessionHandler for SyncSessionHandler {
                     &peer_id,
                     &tenant_id,
                     &ingress_source_tag,
-                    coordination.as_ref(),
-                    request_state.as_ref(),
+                    self.coordination.as_ref(),
+                    self.request_state.as_ref(),
+                    self.response_state.as_ref(),
                     self.shared_ingest.clone(),
                     run_logger.as_ref().and_then(|l| l.capture()),
                     run_logger.as_ref().and_then(|l| l.rx_capture()),
@@ -331,7 +311,7 @@ impl SessionHandler for SyncSessionHandler {
                     Err(e) => Err(e),
                 }
             }
-            (SessionRole::Responder { response_state }, SessionDirection::Inbound) => {
+            (SessionDirection::Inbound, SessionDirection::Inbound) => {
                 info!(
                     "Session {} entering responder sync peer={} remote={}",
                     meta.session_id,
@@ -347,7 +327,9 @@ impl SessionHandler for SyncSessionHandler {
                     &peer_id,
                     &tenant_id,
                     &ingress_source_tag,
-                    response_state.as_ref(),
+                    self.coordination.as_ref(),
+                    self.request_state.as_ref(),
+                    self.response_state.as_ref(),
                     self.shared_ingest.clone(),
                     run_logger.as_ref().and_then(|l| l.capture()),
                     run_logger.as_ref().and_then(|l| l.rx_capture()),
@@ -366,10 +348,10 @@ impl SessionHandler for SyncSessionHandler {
                     Err(e) => Err(e),
                 }
             }
-            (SessionRole::Initiator { .. }, SessionDirection::Inbound) => {
+            (SessionDirection::Outbound, SessionDirection::Inbound) => {
                 Err("initiator handler cannot run inbound sessions".to_string())
             }
-            (SessionRole::Responder { .. }, SessionDirection::Outbound) => {
+            (SessionDirection::Inbound, SessionDirection::Outbound) => {
                 Err("responder handler cannot run outbound sessions".to_string())
             }
         };

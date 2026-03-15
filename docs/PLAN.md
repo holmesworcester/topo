@@ -1121,10 +1121,10 @@ Required changes from the 1:1 sync model:
    internal loops:
    - an **observer loop** (lower-rate) that runs Negentropy on connect/full-sync,
      `dirty_hot`, cold-timer, backlog-exhaustion, or source-set-change triggers and
-     updates SQL truth (`wanted`, candidate sources, peer egress),
+     updates SQL truth (`wanted`, candidate sources),
    - a **sender/request loop** (higher-rate) that keeps QUIC streams full from that
-     SQL truth by draining push egress, serving pull responses from bounded
-     in-memory queues, advertising source-side request credit, and filling
+     SQL truth by serving pull responses from bounded in-memory queues,
+     advertising source-side request credit, and filling
      bounded in-memory pull windows through a shared tenant-scoped coordinator.
 5. **Receiver-driven wanted scheduling.** Pull balancing happens at the sink, not
    inside Negentropy. `wanted(event_id, ...)` records demand, and
@@ -1141,11 +1141,10 @@ Required changes from the 1:1 sync model:
      is a follow-up once the structural split is settled.
    This keeps QUIC full without embedding balancing policy in Negentropy or paying
    SQLite churn for every individual request.
-7. **Push and pull share one scheduling model.** Push traffic drains peer egress
-   from leased SQL-backed send windows. Pull traffic fills coordinator-backed
-   in-memory request windows from SQL-backed demand state plus source-advertised
-   credit, and sources serve those requests from bounded in-memory ID queues.
-   Both loops are peer-scoped and low-memory because they hold IDs, not bulk blobs.
+7. **Sync event transfer is pull-only.** Discovery populates `wanted` plus
+   candidate suppliers, the sink fills source-advertised credit with request IDs,
+   and sources serve those requests from bounded in-memory ID queues. The live
+   sync path no longer drains SQL-backed peer egress.
 8. **Incremental leased windows, not tiny claim/send cycles.** Once work is known,
    the sender should not round-trip to SQLite on every 1-8 events. It keeps bounded
    in-memory windows of leased row IDs/event IDs, refills below a low-water mark,
@@ -1167,7 +1166,6 @@ Test families (in `sync_graph_test.rs`):
 
 Invariants this model is meant to preserve:
 - at most one steady-state live connection slot per authenticated peer,
-- at most one sender owner drains a peer slot's egress at a time,
 - no balancing logic is embedded in Negentropy,
 - the sink can keep active peers busy whenever candidate supply exists,
 - a slow source does not own events by fiat; another candidate can be used as soon

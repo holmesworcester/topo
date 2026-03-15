@@ -13,8 +13,13 @@ Implementation follow-up:
    - `wanted(event_id, ...)`
    - `wanted_sources(event_id, peer_id, first_seen_at, last_seen_at, priority_lane, priority_ts)`
 2. Move the remaining multi-source pull balancing out of session control flow and into a fully connection-scoped request scheduler.
-3. Keep one sender owner per peer slot with leased push windows and batch completion acks.
-4. Keep blob residency low-memory-friendly by leasing IDs more aggressively than blobs.
+3. Keep sync event transfer pull-only:
+   - discovery only produces `wanted + wanted_sources`,
+   - sources only send canonical event blobs in response to request IDs,
+   - keep bounded in-memory response queues instead of durable sync-time
+     `egress_queue` rows.
+4. Keep blob residency low-memory-friendly by bounding queued request IDs rather
+   than buffering large blobs.
 5. Replace local-create first-hop shortcuts with `dirty_hot` wakeups so every hop uses the same propagation rule.
 6. Preserve connection-level idempotency:
    - many hint sources may call `ensure_connected(peer)`,
@@ -61,8 +66,7 @@ Implementation follow-up:
    - keep evolving request/response transport toward true dedicated
      connection-scoped lanes; the state is now connection-scoped even though
      current requests still ride the active discovery round's streams,
-   - remove remaining sync-time dependence on durable SQLite egress where
-     credit already bounds memory,
+   - keep sync-time event transfer off durable SQLite egress entirely,
    - extend the current tenant-scoped shared coordinator to a true global sink
      scheduler over authenticated `(tenant, peer)` slots, so multi-workspace /
      multi-tenant demand can be allocated across all credited peers in one
