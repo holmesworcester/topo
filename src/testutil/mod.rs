@@ -451,7 +451,10 @@ impl Peer {
         let (_bootstrap_peer_id, peer_cert, peer_key) =
             load_transport_cert_required_from_db(&peer.db_path)
                 .expect("failed to load bootstrap transport cert");
-        let peer_allowed = Arc::new(AllowedPeers::from_fingerprints(vec![creator_spki]));
+        let peer_allowed: Arc<crate::transport::DynamicAllowFn> = Arc::new({
+            let allowed = AllowedPeers::from_fingerprints(vec![creator_spki]);
+            move |fp: &[u8; 32]| Ok(allowed.contains(fp))
+        });
         let peer_endpoint = create_dual_endpoint(
             "127.0.0.1:0".parse().unwrap(),
             peer_cert,
@@ -462,6 +465,7 @@ impl Peer {
         let peer_ep = peer_endpoint.clone();
         let peer_db = peer.db_path.clone();
         let peer_id = scoped_peer_id.clone();
+        let creator_target_peer_id = creator.identity.clone();
         let _connector_handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -473,6 +477,7 @@ impl Peer {
                     &peer_id,
                     peer_ep,
                     sync_addr,
+                    &creator_target_peer_id,
                     None,
                     noop_intro_spawner,
                     test_ingest_fns(),
@@ -623,7 +628,10 @@ impl Peer {
         let (_bootstrap_peer_id, peer_cert, peer_key) =
             load_transport_cert_required_from_db(&peer.db_path)
                 .expect("failed to load bootstrap transport cert");
-        let peer_allowed = Arc::new(AllowedPeers::from_fingerprints(vec![creator_spki]));
+        let peer_allowed: Arc<crate::transport::DynamicAllowFn> = Arc::new({
+            let allowed = AllowedPeers::from_fingerprints(vec![creator_spki]);
+            move |fp: &[u8; 32]| Ok(allowed.contains(fp))
+        });
         let peer_endpoint = create_dual_endpoint(
             "127.0.0.1:0".parse().unwrap(),
             peer_cert,
@@ -634,6 +642,7 @@ impl Peer {
         let peer_ep = peer_endpoint.clone();
         let peer_db = peer.db_path.clone();
         let peer_id = scoped_peer_id.clone();
+        let creator_target_peer_id = creator.identity.clone();
         let _connector_handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -645,6 +654,7 @@ impl Peer {
                     &peer_id,
                     peer_ep,
                     sync_addr,
+                    &creator_target_peer_id,
                     None,
                     noop_intro_spawner,
                     test_ingest_fns(),
@@ -2303,52 +2313,33 @@ pub fn start_peers(
     peer_a: &Peer,
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
-    use crate::db::transport_trust::is_peer_allowed;
-
     let (cert_a, key_a) = peer_a.cert_and_key();
     let (cert_b, key_b) = peer_b.cert_and_key();
+    let a_trusts_b = peer_b.spki_fingerprint();
+    let b_trusts_a = peer_a.spki_fingerprint();
 
-    let a_db_path = peer_a.db_path.clone();
-    let a_recorded_by = peer_a.identity.clone();
-    let dynamic_allow_a: Arc<crate::transport::DynamicAllowFn> =
-        Arc::new(move |peer_fp: &[u8; 32]| {
-            let db = open_connection(&a_db_path)?;
-            is_peer_allowed(&db, &a_recorded_by, peer_fp)
-        });
+    let allow_a: Arc<crate::transport::DynamicAllowFn> =
+        Arc::new(move |peer_fp: &[u8; 32]| Ok(peer_fp == &a_trusts_b));
+    let allow_b: Arc<crate::transport::DynamicAllowFn> =
+        Arc::new(move |peer_fp: &[u8; 32]| Ok(peer_fp == &b_trusts_a));
 
-    let b_db_path = peer_b.db_path.clone();
-    let b_recorded_by = peer_b.identity.clone();
-    let dynamic_allow_b: Arc<crate::transport::DynamicAllowFn> =
-        Arc::new(move |peer_fp: &[u8; 32]| {
-            let db = open_connection(&b_db_path)?;
-            is_peer_allowed(&db, &b_recorded_by, peer_fp)
-        });
-
-    let listener_endpoint = create_dual_endpoint_dynamic(
-        "127.0.0.1:0".parse().unwrap(),
-        cert_a,
-        key_a,
-        dynamic_allow_a,
-    )
-    .expect("failed to create dynamic dual endpoint for A");
+    let listener_endpoint =
+        create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert_a, key_a, allow_a)
+            .expect("failed to create dynamic dual endpoint for A");
 
     let listener_addr = listener_endpoint
         .local_addr()
         .expect("failed to get listener addr");
 
-    let connector_endpoint = create_dual_endpoint_dynamic(
-        "127.0.0.1:0".parse().unwrap(),
-        cert_b,
-        key_b,
-        dynamic_allow_b,
-    )
-    .expect("failed to create dynamic dual endpoint for B");
+    let connector_endpoint =
+        create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert_b, key_b, allow_b)
+            .expect("failed to create dual endpoint for B");
 
     let a_db = peer_a.db_path.clone();
     let a_identity = peer_a.identity.clone();
     let b_db = peer_b.db_path.clone();
     let b_identity = peer_b.identity.clone();
-    let listener_peer_id = peer_a.identity.clone();
+    let target_peer_id = peer_a.identity.clone();
 
     let a_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2381,7 +2372,7 @@ pub fn start_peers(
                 &b_identity,
                 connector_endpoint,
                 listener_addr,
-                &listener_peer_id,
+                &target_peer_id,
                 None,
                 noop_intro_spawner,
                 test_ingest_fns(),
@@ -2452,8 +2443,7 @@ pub fn start_peers_dynamic(
     let a_identity = peer_a.identity.clone();
     let b_db = peer_b.db_path.clone();
     let b_identity = peer_b.identity.clone();
-    let listener_peer_id = peer_a.identity.clone();
-
+    let target_peer_id = peer_a.identity.clone();
     let a_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2485,7 +2475,7 @@ pub fn start_peers_dynamic(
                 &b_identity,
                 connector_endpoint,
                 listener_addr,
-                &listener_peer_id,
+                &target_peer_id,
                 None,
                 noop_intro_spawner,
                 test_ingest_fns(),
@@ -2707,8 +2697,6 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
 ///
 /// Returns thread handles for all source accept_loops and sink connect loops.
 pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::JoinHandle<()>> {
-    use crate::db::transport_trust::is_peer_allowed;
-
     assert!(!sources.is_empty(), "need at least one source");
     for source in sources {
         assert_eq!(
@@ -2721,18 +2709,16 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
 
     let mut handles = Vec::new();
     let mut source_addrs = Vec::new();
+    let sink_spki = sink.spki_fingerprint();
 
-    // Start accept_loop for each source with dynamic trust
+    // Start accept_loop for each source with explicit sink trust.
     for source in sources {
         let (cert, key) = source.cert_and_key();
-        let src_db_path = source.db_path.clone();
-        let src_recorded_by = source.identity.clone();
-        let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
-            let db = open_connection(&src_db_path)?;
-            is_peer_allowed(&db, &src_recorded_by, fp)
-        });
+        let trusted_sink_spki = sink_spki;
+        let allow_fn: Arc<crate::transport::DynamicAllowFn> =
+            Arc::new(move |fp: &[u8; 32]| Ok(fp == &trusted_sink_spki));
         let server_endpoint =
-            create_dual_endpoint_dynamic("127.0.0.1:0".parse().unwrap(), cert, key, allow_fn)
+            create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert, key, allow_fn)
                 .expect("failed to create source server endpoint");
         let addr = server_endpoint
             .local_addr()
@@ -2762,17 +2748,14 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
         }));
     }
 
-    // Build per-source client endpoints for the sink with dynamic trust.
+    // Build per-source client endpoints for the sink with explicit source trust.
     // These are driven by coordinated connect loops (runtime-faithful path).
     let mut sink_connectors = Vec::new();
-    for (i, _source) in sources.iter().enumerate() {
-        let sink_db_path = sink.db_path.clone();
-        let sink_recorded_by = sink.identity.clone();
-        let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
-            let db = open_connection(&sink_db_path)?;
-            is_peer_allowed(&db, &sink_recorded_by, fp)
-        });
-        let client_endpoint = create_dual_endpoint_dynamic(
+    for (i, source) in sources.iter().enumerate() {
+        let trusted_source_spki = source.spki_fingerprint();
+        let allow_fn: Arc<crate::transport::DynamicAllowFn> =
+            Arc::new(move |fp: &[u8; 32]| Ok(fp == &trusted_source_spki));
+        let client_endpoint = create_dual_endpoint(
             "0.0.0.0:0".parse().unwrap(),
             sink_cert.clone(),
             sink_key.clone_key(),
@@ -2863,8 +2846,6 @@ impl SinkDownloadHandles {
 /// Like [`start_sink_download`] but returns [`SinkDownloadHandles`] with
 /// per-source shutdown control for simulating peer dropout.
 pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkDownloadHandles {
-    use crate::db::transport_trust::is_peer_allowed;
-
     assert!(!sources.is_empty(), "need at least one source");
     for source in sources {
         assert_eq!(
@@ -2878,18 +2859,16 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
     let mut handles = Vec::new();
     let mut source_addrs = Vec::new();
     let mut source_endpoints = Vec::new();
+    let sink_spki = sink.spki_fingerprint();
 
-    // Start accept_loop for each source with dynamic trust
+    // Start accept_loop for each source with explicit sink trust.
     for source in sources {
         let (cert, key) = source.cert_and_key();
-        let src_db_path = source.db_path.clone();
-        let src_recorded_by = source.identity.clone();
-        let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
-            let db = open_connection(&src_db_path)?;
-            is_peer_allowed(&db, &src_recorded_by, fp)
-        });
+        let trusted_sink_spki = sink_spki;
+        let allow_fn: Arc<crate::transport::DynamicAllowFn> =
+            Arc::new(move |fp: &[u8; 32]| Ok(fp == &trusted_sink_spki));
         let server_endpoint =
-            create_dual_endpoint_dynamic("127.0.0.1:0".parse().unwrap(), cert, key, allow_fn)
+            create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert, key, allow_fn)
                 .expect("failed to create source server endpoint");
         let addr = server_endpoint
             .local_addr()
@@ -2920,16 +2899,13 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
         }));
     }
 
-    // Build per-source client endpoints for the sink with dynamic trust.
+    // Build per-source client endpoints for the sink with explicit source trust.
     let mut sink_connectors = Vec::new();
-    for (i, _source) in sources.iter().enumerate() {
-        let sink_db_path = sink.db_path.clone();
-        let sink_recorded_by = sink.identity.clone();
-        let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
-            let db = open_connection(&sink_db_path)?;
-            is_peer_allowed(&db, &sink_recorded_by, fp)
-        });
-        let client_endpoint = create_dual_endpoint_dynamic(
+    for (i, source) in sources.iter().enumerate() {
+        let trusted_source_spki = source.spki_fingerprint();
+        let allow_fn: Arc<crate::transport::DynamicAllowFn> =
+            Arc::new(move |fp: &[u8; 32]| Ok(fp == &trusted_source_spki));
+        let client_endpoint = create_dual_endpoint(
             "0.0.0.0:0".parse().unwrap(),
             sink_cert.clone(),
             sink_key.clone_key(),

@@ -110,7 +110,9 @@ pub fn recording_enabled() -> bool {
 
 fn enabled_groups_mask() -> u8 {
     static GROUPS: OnceLock<u8> = OnceLock::new();
-    *GROUPS.get_or_init(|| parse_groups_mask(std::env::var("TOPO_EVENT_TIMELINE_GROUPS").ok().as_deref()))
+    *GROUPS.get_or_init(|| {
+        parse_groups_mask(std::env::var("TOPO_EVENT_TIMELINE_GROUPS").ok().as_deref())
+    })
 }
 
 fn group_enabled(group: TimelineGroup) -> bool {
@@ -135,7 +137,11 @@ fn parse_groups_mask(raw: Option<&str>) -> u8 {
             _ => {}
         }
     }
-    if mask == 0 { ALL_TIMELINE_GROUPS } else { mask }
+    if mask == 0 {
+        ALL_TIMELINE_GROUPS
+    } else {
+        mask
+    }
 }
 
 impl<'a> EventTimeline<'a> {

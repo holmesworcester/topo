@@ -1,13 +1,14 @@
+use std::collections::HashMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use topo::crypto::event_id_to_base64;
+use topo::crypto::{event_id_to_base64, AllowedPeers};
 use topo::db::open_connection;
 use topo::peering::loops::{accept_loop, connect_loop_with_coordination_until_cancel};
 use topo::sync::CoordinationManager;
 use topo::testutil::{
     assert_eventually, create_dynamic_endpoint_for_peer, noop_intro_spawner, test_ingest_fns, Peer,
-    ScenarioHarness,
+    ScenarioHarness, SharedDbNode,
 };
 use topo::transport::{
     create_single_port_endpoint, multi_workspace::transport_sni,
@@ -343,7 +344,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
     use topo::peering::loops::connect_loop;
     use topo::transport::{
         create_single_port_endpoint,
-        multi_workspace::{workspace_sni, WorkspaceCertResolver},
+        multi_workspace::{transport_sni, WorkspaceCertResolver},
         workspace_client_config, DynamicAllowFn,
     };
 
@@ -431,7 +432,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
             &provider,
         )
         .unwrap();
-        let sni = workspace_sni(&t.workspace_id);
+        let sni = transport_sni(&t.transport_peer_id);
         cert_resolver_a.add(sni, Arc::new(ck));
         if default_cert_a.is_none() {
             default_cert_a = Some((cert_der, key_der));
@@ -527,7 +528,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
             &provider,
         )
         .unwrap();
-        cert_resolver_b.add(workspace_sni(&t.workspace_id), Arc::new(ck));
+        cert_resolver_b.add(transport_sni(&t.transport_peer_id), Arc::new(ck));
         if default_cert_b.is_none() {
             default_cert_b = Some((cert_der, key_der));
         }
@@ -559,6 +560,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
     let ep_b0 = endpoint_b.clone();
     let b0_db = node_b.db_path.clone();
     let b0_id = b0.identity.clone();
+    let a_target_for_b0 = fallback_a.identity.clone();
     let _b0_connect = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -570,6 +572,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
                 &b0_id,
                 ep_b0,
                 addr_a,
+                &a_target_for_b0,
                 Some(b0_cfg),
                 noop_intro_spawner,
                 test_ingest_fns(),
@@ -583,6 +586,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
     let ep_b1 = endpoint_b.clone();
     let b1_db = node_b.db_path.clone();
     let b1_id = b1.identity.clone();
+    let a_target_for_b1 = fallback_a.identity.clone();
     let _b1_connect = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -594,6 +598,7 @@ async fn test_run_node_multitenant_outbound_isolation() {
                 &b1_id,
                 ep_b1,
                 addr_a,
+                &a_target_for_b1,
                 Some(b1_cfg),
                 noop_intro_spawner,
                 test_ingest_fns(),

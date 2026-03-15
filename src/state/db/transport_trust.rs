@@ -1,4 +1,4 @@
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 use tracing::info;
@@ -464,6 +464,86 @@ pub fn allowed_peers_from_db(
     fps.extend(peer_shared_spki_fingerprints(conn, recorded_by)?);
 
     Ok(AllowedPeers::from_fingerprints(fps))
+}
+
+/// Return the tenant's currently authorized remote transport fingerprints.
+/// Observation telemetry (peer_transport_bindings) is not consulted.
+pub fn authorized_fingerprints_from_db(
+    conn: &Connection,
+    recorded_by: &str,
+) -> Result<HashSet<[u8; 32]>, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(allowed_peers_from_db(conn, recorded_by)?
+        .fingerprints()
+        .into_iter()
+        .collect())
+}
+
+/// Canonical tenant-scoped transport authorization over projected trust rows.
+pub fn is_authorized_for_tenant(
+    conn: &Connection,
+    tenant_id: &str,
+    spki_fingerprint: &[u8; 32],
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    is_peer_allowed(conn, tenant_id, spki_fingerprint)
+}
+
+/// Resolve one tenant that currently authorizes `spki_fingerprint`.
+pub fn resolve_authorizing_tenant(
+    conn: &Connection,
+    spki_fingerprint: &[u8; 32],
+) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
+    let now = now_ms_i64();
+    let tenant_id = conn
+        .query_row(
+            "SELECT recorded_by
+               FROM (
+                     SELECT p.recorded_by AS recorded_by,
+                            p.transport_fingerprint AS spki_fingerprint,
+                            NULL AS expires_at
+                       FROM peers_shared p
+                      WHERE length(p.transport_fingerprint) = 32
+                        AND NOT EXISTS (
+                            SELECT 1 FROM removed_entities r
+                             WHERE r.recorded_by = p.recorded_by
+                               AND r.target_event_id = p.event_id
+                        )
+                        AND NOT EXISTS (
+                            SELECT 1 FROM removed_entities r
+                             WHERE r.recorded_by = p.recorded_by
+                               AND p.user_event_id IS NOT NULL
+                               AND r.target_event_id = p.user_event_id
+                               AND r.removal_type = 'user'
+                        )
+                     UNION
+                     SELECT t.recorded_by,
+                            t.bootstrap_spki_fingerprint,
+                            t.expires_at
+                       FROM invite_bootstrap_trust t
+                      WHERE length(t.bootstrap_spki_fingerprint) = 32
+                     UNION
+                     SELECT t.recorded_by,
+                            t.expected_bootstrap_spki_fingerprint,
+                            t.expires_at
+                       FROM pending_invite_bootstrap_trust t
+                      WHERE length(t.expected_bootstrap_spki_fingerprint) = 32
+               )
+              WHERE spki_fingerprint = ?1
+                AND (expires_at IS NULL OR expires_at > ?2)
+              ORDER BY recorded_by ASC
+              LIMIT 1",
+            rusqlite::params![spki_fingerprint.as_slice(), now],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(tenant_id)
+}
+
+/// Canonical node-scoped inbound transport authorization over projected trust rows.
+pub fn is_authorized_for_node(
+    conn: &Connection,
+    spki_fingerprint: &[u8; 32],
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    Ok(resolve_authorizing_tenant(conn, spki_fingerprint)?.is_some())
 }
 
 /// Check a single peer fingerprint against SQL trust sources.

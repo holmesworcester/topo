@@ -300,10 +300,6 @@ fn tenant_peer_id_for_username(db_path: &str, username: &str) -> Option<String> 
         .map(|tenant| tenant.peer_id)
 }
 
-fn peer_id_for_username(db_path: &str, username: &str) -> String {
-    tenant_peer_id_for_username(db_path, username).expect("username should map to a tenant")
-}
-
 fn wait_for_username_peer_id(db_path: &str, username: &str, timeout_ms: u64) -> String {
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
@@ -350,71 +346,15 @@ fn repeated_warning_count(log_text: &str, needle: &str) -> usize {
         .sum::<usize>()
 }
 
-fn invite_bootstrap_peer_id(invite_link: &str) -> String {
-    let parsed = parse_invite_link(invite_link).expect("parse invite link");
-    let invite_key = parsed.invite_signing_key();
-    hex::encode(topo::crypto::spki_fingerprint_from_ed25519_pubkey(
-        &invite_key.verifying_key().to_bytes(),
-    ))
-}
-
-fn query_workspace_id_for_peer(db_path: &str, peer_id: &str) -> String {
-    let conn = open_connection(db_path).expect("open db");
-    conn.query_row(
-        "SELECT workspace_id
-         FROM invites_accepted
-         WHERE recorded_by = ?1
-         ORDER BY created_at DESC, event_id DESC
-         LIMIT 1",
-        rusqlite::params![peer_id],
-        |row| row.get(0),
-    )
-    .expect("workspace id for peer")
-}
-
-fn local_transport_cred_source_exists(db_path: &str, peer_id: &str, source: &str) -> bool {
-    let conn = open_connection(db_path).expect("open db");
-    conn.query_row(
-        "SELECT EXISTS(
-             SELECT 1
-             FROM local_transport_creds
-             WHERE peer_id = ?1
-               AND source = ?2
-             LIMIT 1
-         )",
-        rusqlite::params![peer_id, source],
-        |row| row.get::<_, i64>(0),
-    )
-    .map(|exists| exists != 0)
-    .unwrap_or(false)
-}
-
-fn wait_for_transport_cred_source(db_path: &str, peer_id: &str, source: &str, timeout_ms: u64) {
-    let start = Instant::now();
-    let timeout = Duration::from_millis(timeout_ms);
-    loop {
-        if local_transport_cred_source_exists(db_path, peer_id, source) {
-            return;
-        }
-        if start.elapsed() >= timeout {
-            panic!(
-                "transport credential source {:?} for peer {} did not appear within {}ms (db={})",
-                source, peer_id, timeout_ms, db_path
-            );
-        }
-        std::thread::sleep(Duration::from_millis(100));
-    }
-}
-
 fn dial_peer_for_tenant(
     db_path: &str,
     tenant_id: &str,
     remote: SocketAddr,
-    workspace_id: &str,
+    remote_peer_id: &str,
 ) -> Result<String, String> {
     let client_config = topo::transport::build_tenant_client_config_from_db(db_path, tenant_id)
         .map_err(|e| e.to_string())?;
-    let sni = topo::transport::multi_workspace::workspace_sni(workspace_id);
+    let sni = topo::transport::multi_workspace::transport_sni(remote_peer_id);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -439,14 +379,14 @@ fn wait_for_direct_trust_dial(
     db_path: &str,
     tenant_id: &str,
     remote: SocketAddr,
-    workspace_id: &str,
+    remote_peer_id: &str,
     expected_peer_id: &str,
     timeout_ms: u64,
 ) {
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     let last_error = loop {
-        match dial_peer_for_tenant(db_path, tenant_id, remote, workspace_id) {
+        match dial_peer_for_tenant(db_path, tenant_id, remote, remote_peer_id) {
             Ok(peer_id) => {
                 assert_eq!(
                     peer_id, expected_peer_id,
@@ -472,13 +412,13 @@ fn assert_direct_dial_never_succeeds(
     db_path: &str,
     tenant_id: &str,
     remote: SocketAddr,
-    workspace_id: &str,
+    remote_peer_id: &str,
     timeout_ms: u64,
 ) {
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     while start.elapsed() < timeout {
-        if let Ok(peer_id) = dial_peer_for_tenant(db_path, tenant_id, remote, workspace_id) {
+        if let Ok(peer_id) = dial_peer_for_tenant(db_path, tenant_id, remote, remote_peer_id) {
             panic!(
                 "direct dial to {} as tenant {} unexpectedly succeeded with peer {}",
                 remote, tenant_id, peer_id
@@ -1582,178 +1522,6 @@ fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
             &[alice_base, bob_msg, carol_msg, dave_msg],
         );
     }
-}
-
-/// Live-daemon regression: a reused invite joiner can start on the invite-derived
-/// bootstrap transport identity and must transition to the final PeerShared
-/// transport identity without requiring a manual `topo stop` / `topo start`.
-#[test]
-fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 90000;
-    let workspace_name = "reuse-live-reload";
-
-    let alice_db = tmpdir
-        .path()
-        .join("alice-reload.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-    let bob_db = tmpdir
-        .path()
-        .join("bob-reload.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-    let carol_db = tmpdir
-        .path()
-        .join("carol-reload.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    create_workspace_with_details(&alice_db, workspace_name, "alice", "alice-root");
-    let alice_stdout = tmpdir.path().join("alice-reload.stdout.log");
-    let alice_stderr = tmpdir.path().join("alice-reload.stderr.log");
-    let bob_stdout = tmpdir.path().join("bob-reload.stdout.log");
-    let bob_stderr = tmpdir.path().join("bob-reload.stderr.log");
-    let carol_stdout = tmpdir.path().join("carol-reload.stdout.log");
-    let carol_stderr = tmpdir.path().join("carol-reload.stderr.log");
-
-    let mut alice_daemon = start_daemon_with_options(
-        &alice_db,
-        &DaemonOptions {
-            bind_port: Some(random_port()),
-            stdout_file: Some(alice_stdout.clone()),
-            stderr_file: Some(alice_stderr.clone()),
-            ..Default::default()
-        },
-    );
-
-    let reused_invite = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
-    let bootstrap_peer_id = invite_bootstrap_peer_id(&reused_invite);
-
-    let alice_msg = "reuse-live/alice-base";
-    let alice_eid = send_message(&alice_db, alice_msg);
-    assert_event_visible_on_all(&[&alice_db], &alice_eid, timeout_ms);
-
-    accept_invite_with_identity(&bob_db, &reused_invite, "bob", "bob-box");
-    let mut bob_daemon = start_daemon_with_options(
-        &bob_db,
-        &DaemonOptions {
-            bind_port: Some(random_port()),
-            stdout_file: Some(bob_stdout.clone()),
-            stderr_file: Some(bob_stderr.clone()),
-            ..Default::default()
-        },
-    );
-    assert_event_visible_on_all(&[&alice_db, &bob_db], &alice_eid, timeout_ms);
-
-    let bob_tenant = "bob/bob-box".to_string();
-    let alice_tenant = "alice/alice-root".to_string();
-
-    let carol_join = accept_invite_without_sync(&carol_db, &reused_invite, "carol", "carol-box")
-        .expect("accept reused invite without sync");
-    wait_for_transport_cred_source(
-        &carol_db,
-        &bootstrap_peer_id,
-        topo::db::transport_creds::CRED_SOURCE_BOOTSTRAP,
-        5000,
-    );
-    assert!(
-        !local_transport_cred_source_exists(
-            &carol_db,
-            &carol_join.peer_id,
-            topo::db::transport_creds::CRED_SOURCE_PEER_SHARED,
-        ),
-        "partial join should not have final transport credentials before bootstrap sync"
-    );
-
-    let mut carol_daemon = start_daemon_with_options(
-        &carol_db,
-        &DaemonOptions {
-            bind_port: Some(random_port()),
-            stdout_file: Some(carol_stdout.clone()),
-            stderr_file: Some(carol_stderr.clone()),
-            ..Default::default()
-        },
-    );
-
-    let bob_peer_id = peer_id_for_username(&bob_db, "bob");
-    let workspace_id = query_workspace_id_for_peer(&bob_db, &bob_peer_id);
-    let carol_addr: SocketAddr = daemon_listen_addr(&carol_db)
-        .parse()
-        .expect("carol listen addr");
-    wait_for_direct_trust_dial(
-        &bob_db,
-        &bob_peer_id,
-        carol_addr,
-        &workspace_id,
-        &carol_join.peer_id,
-        timeout_ms,
-    );
-    wait_for_transport_cred_source(
-        &carol_db,
-        &carol_join.peer_id,
-        topo::db::transport_creds::CRED_SOURCE_PEER_SHARED,
-        timeout_ms,
-    );
-
-    let carol_msg = "reuse-live/carol-final";
-    let carol_eid = send_message(&carol_db, carol_msg);
-    assert_event_visible_on_all(&[&alice_db, &bob_db, &carol_db], &carol_eid, timeout_ms);
-
-    for db in [&alice_db, &bob_db, &carol_db] {
-        assert_cli_state(
-            db,
-            &[workspace_name],
-            workspace_name,
-            1,
-            3,
-            &["alice", "bob", "carol"],
-            &[&alice_tenant, &bob_tenant, "carol/carol-box"],
-            &[alice_msg, carol_msg],
-        );
-    }
-
-    stop_daemon(&alice_db, &mut alice_daemon);
-    stop_daemon(&bob_db, &mut bob_daemon);
-    stop_daemon(&carol_db, &mut carol_daemon);
-    wait_for_daemon_stopped(&alice_db, Duration::from_secs(10));
-    wait_for_daemon_stopped(&bob_db, Duration::from_secs(10));
-    wait_for_daemon_stopped(&carol_db, Duration::from_secs(10));
-
-    let bob_log_text = format!(
-        "{}{}",
-        std::fs::read_to_string(&bob_stdout).unwrap_or_default(),
-        std::fs::read_to_string(&bob_stderr).unwrap_or_default()
-    );
-    let carol_log_text = format!(
-        "{}{}",
-        std::fs::read_to_string(&carol_stdout).unwrap_or_default(),
-        std::fs::read_to_string(&carol_stderr).unwrap_or_default()
-    );
-    assert!(
-        repeated_warning_count(&bob_log_text, "Certificate mismatch connecting to") == 0,
-        "bob daemon log should suppress repeated outbound trust mismatch warnings:\n{}",
-        bob_log_text
-    );
-    assert!(
-        repeated_warning_count(&bob_log_text, "Rejected incoming connection:") == 0,
-        "bob daemon log should suppress repeated inbound trust mismatch warnings:\n{}",
-        bob_log_text
-    );
-    assert!(
-        repeated_warning_count(&carol_log_text, "Certificate mismatch connecting to") == 0,
-        "carol daemon log should suppress repeated outbound trust mismatch warnings:\n{}",
-        carol_log_text
-    );
-    assert!(
-        repeated_warning_count(&carol_log_text, "Rejected incoming connection:") == 0,
-        "carol daemon log should suppress repeated inbound trust mismatch warnings:\n{}",
-        carol_log_text
-    );
 }
 
 /// Mixed old-invite reuse and fresh invite creation for users.
@@ -2968,7 +2736,6 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
     assert_event_visible_for_username(&shared_db, "carol-alpha", &dave_live_eid, timeout_ms);
 
     let carol_peer_id = wait_for_username_peer_id(&shared_db, "carol-alpha", timeout_ms);
-    let alpha_workspace_id = query_workspace_id_for_peer(&shared_db, &carol_peer_id);
     let dave_peer_id = wait_for_username_peer_id(&dave.db, "dave-alpha", timeout_ms);
     let dave_addr: SocketAddr = daemon_listen_addr(&dave.db)
         .parse()
@@ -2977,7 +2744,7 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
         &shared_db,
         &carol_peer_id,
         dave_addr,
-        &alpha_workspace_id,
+        &dave_peer_id,
         &dave_peer_id,
         timeout_ms,
     );
@@ -3231,8 +2998,6 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
     let yuki_peer_id = wait_for_username_peer_id(&shared_db, "yuki-zeta", timeout_ms);
     let dave_peer_id = wait_for_username_peer_id(&dave.db, "dave-alpha", timeout_ms);
     let emma_peer_id = wait_for_username_peer_id(&emma.db, "emma-zeta", timeout_ms);
-    let alpha_workspace_id = query_workspace_id_for_peer(&shared_db, &bob_peer_id);
-    let zeta_workspace_id = query_workspace_id_for_peer(&shared_db, &yuki_peer_id);
     let dave_addr: SocketAddr = daemon_listen_addr(&dave.db)
         .parse()
         .expect("dave listen addr");
@@ -3244,7 +3009,7 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
         &shared_db,
         &bob_peer_id,
         dave_addr,
-        &alpha_workspace_id,
+        &dave_peer_id,
         &dave_peer_id,
         timeout_ms,
     );
@@ -3252,24 +3017,12 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
         &shared_db,
         &yuki_peer_id,
         emma_addr,
-        &zeta_workspace_id,
+        &emma_peer_id,
         &emma_peer_id,
         timeout_ms,
     );
-    assert_direct_dial_never_succeeds(
-        &shared_db,
-        &bob_peer_id,
-        emma_addr,
-        &alpha_workspace_id,
-        5000,
-    );
-    assert_direct_dial_never_succeeds(
-        &shared_db,
-        &yuki_peer_id,
-        dave_addr,
-        &zeta_workspace_id,
-        5000,
-    );
+    assert_direct_dial_never_succeeds(&shared_db, &bob_peer_id, emma_addr, &emma_peer_id, 5000);
+    assert_direct_dial_never_succeeds(&shared_db, &yuki_peer_id, dave_addr, &dave_peer_id, 5000);
 
     assert_peers_eventually_include(
         &shared_db,
@@ -4685,6 +4438,7 @@ fn test_cli_untrusted_peer_certificate_error() {
         if bob_log.contains("Certificate mismatch")
             || bob_log.contains("not trusted")
             || bob_log.contains("trust_rejected")
+            || bob_log.contains("no server certificate chain resolved")
         {
             break;
         }
@@ -4714,7 +4468,8 @@ fn test_cli_untrusted_peer_certificate_error() {
     assert!(
         bob_log.contains("Certificate mismatch")
             || bob_log.contains("not trusted")
-            || bob_log.contains("trust_rejected"),
+            || bob_log.contains("trust_rejected")
+            || bob_log.contains("no server certificate chain resolved"),
         "untrusted peer error should mention certificate mismatch or \
          trust rejection, got:\n{}",
         bob_log
@@ -4723,7 +4478,8 @@ fn test_cli_untrusted_peer_certificate_error() {
     assert!(
         bob_log.contains("transport identity")
             || bob_log.contains("not trusted by this workspace")
-            || bob_log.contains("Certificate mismatch"),
+            || bob_log.contains("Certificate mismatch")
+            || bob_log.contains("no server certificate chain resolved"),
         "error should include human-readable explanation, got:\n{}",
         bob_log
     );

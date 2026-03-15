@@ -11,12 +11,12 @@ use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
-use crate::db::store::lookup_workspace_id;
 use crate::db::transport_trust::record_transport_binding;
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::session::windowing::reset_outbound_window_state;
 use crate::sync::CoordinationManager;
 use crate::sync::SyncSessionHandler;
+use crate::transport::multi_workspace::transport_sni;
 use crate::transport::{
     derive_bootstrap_dial_context, dial_session_provider, BootstrapDialMode,
     ConnectionLifecycleError, SessionProvider, TransportClientConfig, TransportEndpoint,
@@ -56,6 +56,7 @@ pub async fn connect_loop(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
+    remote_transport_peer_id: &str,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
@@ -69,6 +70,7 @@ pub async fn connect_loop(
         recorded_by,
         endpoint,
         remote,
+        remote_transport_peer_id,
         client_config,
         intro_spawner,
         ingest,
@@ -83,6 +85,7 @@ pub async fn connect_loop_with_coordination(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
+    remote_transport_peer_id: &str,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
@@ -93,6 +96,7 @@ pub async fn connect_loop_with_coordination(
         recorded_by,
         endpoint,
         remote,
+        remote_transport_peer_id,
         client_config,
         intro_spawner,
         ingest,
@@ -108,6 +112,7 @@ pub async fn connect_loop_with_coordination_until_cancel(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
+    remote_transport_peer_id: &str,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
@@ -119,6 +124,7 @@ pub async fn connect_loop_with_coordination_until_cancel(
         recorded_by,
         endpoint,
         remote,
+        remote_transport_peer_id,
         client_config,
         intro_spawner,
         ingest,
@@ -136,6 +142,7 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
+    remote_transport_peer_id: &str,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
@@ -164,6 +171,7 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
             recorded_by,
             endpoint,
             remote,
+            remote_transport_peer_id,
             client_config,
             intro_spawner,
             shared_ingest,
@@ -185,6 +193,7 @@ pub async fn connect_loop_with_shared_ingest(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
+    remote_transport_peer_id: &str,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     coordination: Arc<crate::sync::session::coordinator::PeerCoord>,
@@ -195,6 +204,7 @@ pub async fn connect_loop_with_shared_ingest(
         recorded_by,
         endpoint,
         remote,
+        remote_transport_peer_id,
         intro_spawner,
         ingest,
         coordination,
@@ -211,6 +221,7 @@ pub async fn connect_loop_with_shared_ingest_until_cancel(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
+    remote_transport_peer_id: &str,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     coordination: Arc<crate::sync::session::coordinator::PeerCoord>,
@@ -227,6 +238,7 @@ pub async fn connect_loop_with_shared_ingest_until_cancel(
             recorded_by,
             endpoint,
             remote,
+            remote_transport_peer_id,
             None,
             intro_spawner,
             shared_ingest,
@@ -242,6 +254,7 @@ async fn connect_loop_inner(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
+    remote_transport_peer_id: &str,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
@@ -249,14 +262,7 @@ async fn connect_loop_inner(
     shutdown: CancellationToken,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Look up workspace SNI for this tenant
-    let sni = {
-        let db = open_connection(db_path)?;
-        match lookup_workspace_id(&db, recorded_by) {
-            Some(ws_id) => crate::transport::multi_workspace::workspace_sni(&ws_id),
-            None => "localhost".to_string(),
-        }
-    };
+    let sni = transport_sni(remote_transport_peer_id);
     let mut has_connected_once = false;
     let mut announced_connecting = false;
     let mut consecutive_stale_dial_failures: u32 = 0;

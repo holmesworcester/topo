@@ -199,6 +199,7 @@ pub fn discover_local_tenants(
 ) -> Result<Vec<TenantInfo>, Box<dyn std::error::Error + Send + Sync>> {
     let mut tenants = Vec::new();
     let mut seen_tenants = std::collections::HashSet::new();
+    let mut direct_transport_peer_ids = std::collections::HashSet::new();
 
     // Normal case: accepted-workspace binding and transport identity converged.
     let mut direct_stmt = conn.prepare(
@@ -219,6 +220,7 @@ pub fn discover_local_tenants(
     for row in direct_rows {
         let tenant = row?;
         if seen_tenants.insert(tenant.peer_id.clone()) {
+            direct_transport_peer_ids.insert(tenant.transport_peer_id.clone());
             tenants.push(tenant);
         }
     }
@@ -231,15 +233,48 @@ pub fn discover_local_tenants(
          FROM invites_accepted
          ORDER BY created_at DESC, event_id DESC",
     )?;
-    let accepted_rows = accepted_stmt.query_map([], |row| {
-        Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-        ))
-    })?;
-    for row in accepted_rows {
-        let (tenant_peer_id, workspace_id, invite_event_id) = row?;
+    let accepted_rows = accepted_stmt
+        .query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let unresolved_accept_count = accepted_rows
+        .iter()
+        .filter(|(tenant_peer_id, _, _)| !seen_tenants.contains(tenant_peer_id))
+        .count();
+    let sole_transitional_creds = if unresolved_accept_count == 1 {
+        let mut stmt = conn.prepare(
+            "SELECT peer_id, cert_der, key_der
+               FROM local_transport_creds
+              ORDER BY created_at DESC, peer_id DESC",
+        )?;
+        let rows = stmt
+            .query_map([], |row| {
+                Ok((
+                    row.get::<_, String>(0)?,
+                    row.get::<_, Vec<u8>>(1)?,
+                    row.get::<_, Vec<u8>>(2)?,
+                ))
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        if rows.len() == 1 {
+            let row = rows.into_iter().next().expect("sole transport row");
+            if direct_transport_peer_ids.contains(&row.0) {
+                None
+            } else {
+                Some(row)
+            }
+        } else {
+            None
+        }
+    } else {
+        None
+    };
+    for (tenant_peer_id, workspace_id, invite_event_id) in accepted_rows {
         if !seen_tenants.insert(tenant_peer_id.clone()) {
             continue;
         }
@@ -257,6 +292,15 @@ pub fn discover_local_tenants(
             )
             .ok();
         let Some(invite_key_bytes) = invite_key_bytes else {
+            if let Some((bootstrap_peer_id, cert_der, key_der)) = sole_transitional_creds.as_ref() {
+                tenants.push(TenantInfo {
+                    peer_id: tenant_peer_id,
+                    workspace_id,
+                    transport_peer_id: bootstrap_peer_id.clone(),
+                    cert_der: cert_der.clone(),
+                    key_der: key_der.clone(),
+                });
+            }
             continue;
         };
         if invite_key_bytes.len() != 32 {
@@ -285,6 +329,16 @@ pub fn discover_local_tenants(
                 transport_peer_id: bootstrap_peer_id,
                 cert_der,
                 key_der,
+            });
+        } else if let Some((bootstrap_peer_id, cert_der, key_der)) =
+            sole_transitional_creds.as_ref()
+        {
+            tenants.push(TenantInfo {
+                peer_id: tenant_peer_id,
+                workspace_id,
+                transport_peer_id: bootstrap_peer_id.clone(),
+                cert_der: cert_der.clone(),
+                key_der: key_der.clone(),
             });
         }
     }

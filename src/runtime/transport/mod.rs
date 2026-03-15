@@ -10,6 +10,7 @@ pub mod peering_boundary;
 pub mod session_factory;
 pub mod transport_session_io;
 
+pub use crate::crypto::AllowedPeers;
 pub use bootstrap_dial_context::{
     derive_bootstrap_dial_context, BootstrapDialContext, BootstrapDialMode,
 };

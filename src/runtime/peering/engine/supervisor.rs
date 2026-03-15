@@ -778,6 +778,11 @@ async fn run_target_dispatcher(
         let worker = std::thread::spawn({
             let db_path = db_path.clone();
             let tenant_id = event.tenant_id.clone();
+            let remote_peer_id = match &event.source {
+                TargetIngressSource::Bootstrap { peer_id, .. }
+                | TargetIngressSource::ObservedPeer { peer_id }
+                | TargetIngressSource::Discovery { peer_id } => peer_id.clone(),
+            };
             let endpoint = endpoint.clone();
             let worker_cancel = worker_cancel.clone();
             let dispatch_key = dispatch_key.clone();
@@ -791,6 +796,7 @@ async fn run_target_dispatcher(
                     db_path,
                     tenant_id,
                     event.remote,
+                    remote_peer_id,
                     endpoint,
                     context,
                     intro_spawner,
@@ -852,6 +858,7 @@ async fn run_connect_worker(
     db_path: String,
     tenant_id: String,
     remote: SocketAddr,
+    remote_peer_id: String,
     endpoint: TransportEndpoint,
     context: TenantDispatchContext,
     intro_spawner: IntroSpawnerFn,
@@ -871,6 +878,7 @@ async fn run_connect_worker(
             &tenant_id,
             endpoint.clone(),
             remote,
+            &remote_peer_id,
             Some(context.client_config.clone()),
             intro_spawner,
             ingest,

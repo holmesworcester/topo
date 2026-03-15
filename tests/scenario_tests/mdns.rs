@@ -98,7 +98,7 @@ async fn test_mdns_two_peers_discover_and_sync() {
     let b_db = bob.db_path.clone();
     let b_id = bob.identity.clone();
     let remote = discovered_peer.addr;
-    let target_peer_id = alice.identity.clone();
+    let remote_peer_id = discovered_peer.peer_id.clone();
     let _b_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -110,7 +110,7 @@ async fn test_mdns_two_peers_discover_and_sync() {
                 &b_id,
                 ep_b,
                 remote,
-                &target_peer_id,
+                &remote_peer_id,
                 None,
                 noop_intro_spawner,
                 test_ingest_fns(),
@@ -298,7 +298,7 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
 
     let ext_db = ext.db_path.clone();
     let ext_identity = ext.identity.clone();
-    let t0_target_peer_id = t0.identity.clone();
+    let remote_peer_id = t0.identity.clone();
     let _ext_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -310,7 +310,7 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
                 &ext_identity,
                 ep_ext,
                 t0_connect_addr,
-                &t0_target_peer_id,
+                &remote_peer_id,
                 None,
                 noop_intro_spawner,
                 test_ingest_fns(),

@@ -1,6 +1,9 @@
+#![allow(dead_code, unused_imports)]
+
+#[path = "cli_harness/mod.rs"]
 mod cli_harness;
 
-use cli_harness::*;
+use self::cli_harness::*;
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use topo::event_modules::workspace::invite_link::{
@@ -8,7 +11,7 @@ use topo::event_modules::workspace::invite_link::{
 };
 use topo::testutil::DaemonGuard;
 
-fn cli_test_lock() -> std::sync::MutexGuard<'static, ()> {
+pub fn cli_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     let guard = LOCK
         .get_or_init(|| Mutex::new(()))
@@ -18,7 +21,7 @@ fn cli_test_lock() -> std::sync::MutexGuard<'static, ()> {
     guard
 }
 
-fn reserve_wrong_bootstrap_addr() -> (std::net::UdpSocket, String) {
+pub fn reserve_wrong_bootstrap_addr() -> (std::net::UdpSocket, String) {
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind reserved wrong udp port");
     let addr = socket
         .local_addr()
@@ -27,7 +30,7 @@ fn reserve_wrong_bootstrap_addr() -> (std::net::UdpSocket, String) {
     (socket, addr)
 }
 
-fn rewrite_invite_addrs(invite_link: &str, addrs: &[&str]) -> String {
+pub fn rewrite_invite_addrs(invite_link: &str, addrs: &[&str]) -> String {
     let parsed = addrs
         .iter()
         .map(|addr| parse_bootstrap_address(addr).expect("parse bootstrap address"))
@@ -35,7 +38,7 @@ fn rewrite_invite_addrs(invite_link: &str, addrs: &[&str]) -> String {
     rewrite_bootstrap_addrs(invite_link, &parsed).expect("rewrite invite bootstrap addrs")
 }
 
-fn active_tenant_peer_id(db_path: &str) -> Option<String> {
+pub fn active_tenant_peer_id(db_path: &str) -> Option<String> {
     let output = topo_cmd(db_path, &["tenant", "active"]);
     if !output.status.success() {
         return None;
@@ -49,13 +52,13 @@ fn active_tenant_peer_id(db_path: &str) -> Option<String> {
     }
 }
 
-fn assert_event_visible_on_all(db_paths: &[&str], event_id: &str, timeout_ms: u64) {
+pub fn assert_event_visible_on_all(db_paths: &[&str], event_id: &str, timeout_ms: u64) {
     for db_path in db_paths {
         assert_eventually(db_path, &format!("has_event:{} >= 1", event_id), timeout_ms);
     }
 }
 
-fn assert_identity_eventually_materialized(db_path: &str, timeout_ms: u64) {
+pub fn assert_identity_eventually_materialized(db_path: &str, timeout_ms: u64) {
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     loop {
@@ -81,7 +84,7 @@ fn assert_identity_eventually_materialized(db_path: &str, timeout_ms: u64) {
     }
 }
 
-fn wait_for_bootstrap_supersession_and_endpoint_observation(
+pub fn wait_for_bootstrap_supersession_and_endpoint_observation(
     db_path: &str,
     remote_peer_id: &str,
     timeout: Duration,
@@ -130,12 +133,12 @@ fn wait_for_bootstrap_supersession_and_endpoint_observation(
     }
 }
 
-struct StartedCliPeer {
-    db: String,
-    _daemon: DaemonGuard,
+pub struct StartedCliPeer {
+    pub db: String,
+    pub daemon: DaemonGuard,
 }
 
-fn start_joined_cli_peer_via_discovery(
+pub fn start_joined_cli_peer_via_discovery(
     tmpdir: &tempfile::TempDir,
     db_name: &str,
     invite_link: &str,
@@ -145,107 +148,10 @@ fn start_joined_cli_peer_via_discovery(
     let db = tmpdir.path().join(db_name).to_str().unwrap().to_string();
     accept_invite_with_identity(&db, invite_link, username, device_name);
     let daemon = start_discovery_daemon(&db);
-    StartedCliPeer {
-        db,
-        _daemon: daemon,
-    }
+    StartedCliPeer { db, daemon }
 }
 
-/// Two separate local daemons should recover endpoint state via mDNS and then
-/// sync successfully even when the invite carries no bootstrap addresses.
-#[test]
-#[cfg(feature = "discovery")]
-fn test_cli_local_mdns_discovery_without_bootstrap_addresses() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let timeout_ms = 90000;
-
-    create_workspace(&alice_db);
-    let _alice = start_discovery_daemon(&alice_db);
-    let bootstrap_eid = send_message(&alice_db, "bootstrap");
-    assert_event_visible_on_all(&[&alice_db], &bootstrap_eid, timeout_ms);
-
-    let invite_link = rewrite_invite_addrs(
-        &create_invite(&alice_db, &daemon_listen_addr(&alice_db)),
-        &[],
-    );
-    assert!(
-        parse_invite_link(&invite_link)
-            .expect("parse empty-address invite")
-            .bootstrap_addrs
-            .is_empty(),
-        "invite should carry no bootstrap addresses"
-    );
-
-    let mut bob =
-        start_joined_cli_peer_via_discovery(&tmpdir, "bob.db", &invite_link, "user", "device");
-    let alice_peer_id = active_tenant_peer_id(&alice_db).expect("alice active tenant");
-    wait_for_bootstrap_supersession_and_endpoint_observation(
-        &bob.db,
-        &alice_peer_id,
-        Duration::from_millis(timeout_ms),
-    );
-    stop_daemon(&bob.db, &mut bob._daemon);
-    bob._daemon = start_daemon(&bob.db);
-
-    assert_event_visible_on_all(&[&bob.db], &bootstrap_eid, timeout_ms);
-    assert_identity_eventually_materialized(&bob.db, timeout_ms);
-
-    let alice_live_eid = send_message(&alice_db, "alice-via-mdns-empty-bootstrap");
-    assert_eventually(
-        &bob.db,
-        &format!("has_event:{} >= 1", alice_live_eid),
-        timeout_ms,
-    );
-
-    let bob_msg_eid = send_message(&bob.db, "bob-via-mdns-empty-bootstrap");
-    assert_eventually(
-        &alice_db,
-        &format!("has_event:{} >= 1", bob_msg_eid),
-        timeout_ms,
-    );
-}
-
-/// A rewritten invite with only wrong bootstrap addresses should still recover
-/// via mDNS once both daemons are running.
-#[test]
-#[cfg(feature = "discovery")]
-fn test_cli_local_mdns_discovery_with_wrong_bootstrap_address_only() {
-    let _guard = cli_test_lock();
-    let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let timeout_ms = 90000;
-
-    create_workspace(&alice_db);
-    let _alice = start_discovery_daemon(&alice_db);
-    let (_wrong_addr_guard, wrong_addr) = reserve_wrong_bootstrap_addr();
-    let invite_link = rewrite_invite_addrs(
-        &create_invite(&alice_db, &daemon_listen_addr(&alice_db)),
-        &[&wrong_addr],
-    );
-    assert_eq!(
-        parse_invite_link(&invite_link)
-            .expect("parse wrong-address invite")
-            .bootstrap_addr_strings(),
-        vec![wrong_addr.clone()],
-        "invite should carry only the wrong bootstrap address"
-    );
-
-    let bob =
-        start_joined_cli_peer_via_discovery(&tmpdir, "bob.db", &invite_link, "bob", "bob-box");
-
-    let alice_live_eid = send_message(&alice_db, "alice-via-mdns-wrong-bootstrap");
-    assert_eventually(
-        &bob.db,
-        &format!("has_event:{} >= 1", alice_live_eid),
-        timeout_ms,
-    );
-
-    let bob_live_eid = send_message(&bob.db, "bob-via-mdns-wrong-bootstrap");
-    assert_eventually(
-        &alice_db,
-        &format!("has_event:{} >= 1", bob_live_eid),
-        timeout_ms,
-    );
-}
+pub use cli_harness::{
+    assert_eventually, create_invite, create_workspace, daemon_listen_addr, send_message,
+    start_daemon, start_discovery_daemon, stop_daemon,
+};
