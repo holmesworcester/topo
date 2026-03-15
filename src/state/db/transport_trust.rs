@@ -647,6 +647,7 @@ pub fn list_active_invite_bootstrap_addrs(
 pub struct InviteBootstrapTarget {
     pub invite_event_id: String,
     pub bootstrap_addr: String,
+    pub bootstrap_transport_peer_id: String,
 }
 
 /// List active invite bootstrap targets for a tenant, keyed by invite_event_id.
@@ -659,7 +660,10 @@ pub fn list_active_invite_bootstrap_targets(
 ) -> Result<Vec<InviteBootstrapTarget>, Box<dyn std::error::Error + Send + Sync>> {
     let now = now_ms_i64();
     let mut stmt = conn.prepare(
-        "SELECT t.invite_event_id, t.bootstrap_addr
+        "SELECT
+             t.invite_event_id,
+             t.bootstrap_addr,
+             lower(hex(t.bootstrap_spki_fingerprint)) AS bootstrap_transport_peer_id
            FROM invite_bootstrap_trust t
           WHERE t.recorded_by = ?1
             AND t.expires_at > ?2
@@ -679,6 +683,7 @@ pub fn list_active_invite_bootstrap_targets(
             Ok(InviteBootstrapTarget {
                 invite_event_id: row.get(0)?,
                 bootstrap_addr: row.get(1)?,
+                bootstrap_transport_peer_id: row.get(2)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

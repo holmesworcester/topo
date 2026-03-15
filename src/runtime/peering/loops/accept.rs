@@ -10,13 +10,13 @@ use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
-use crate::db::store::lookup_workspace_id;
+use crate::db::transport_creds::discover_local_tenants;
 use crate::db::transport_trust::{is_authorized_for_tenant, record_transport_binding};
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::SyncSessionHandler;
 use crate::transport::{
-    accept_session_provider, requested_server_name_from_connection,
-    resolve_authorizing_tenant_from_db, TransportClientConfig, TransportEndpoint,
+    accept_session_provider, requested_server_name_from_connection, TransportClientConfig,
+    TransportEndpoint,
 };
 
 use super::supervisor::{
@@ -201,20 +201,7 @@ async fn accept_loop_with_ingest_until_cancel_inner(
             recorded_by.clone()
         } else {
             match resolve_tenant_for_connection(db_path, &connection, &peer_id) {
-                Ok(Some(rb)) => rb,
-                Ok(None) => {
-                    let message = format!(
-                        "Rejected peer {}: no local tenant trusts this fingerprint",
-                        &peer_id[..16.min(peer_id.len())]
-                    );
-                    if warning_gate.should_emit(message.clone())
-                        && should_emit_globally(format!("accept:{message}"))
-                    {
-                        warn!("{}", message);
-                    }
-                    connection.close(1u32.into(), b"no matching tenant");
-                    continue;
-                }
+                Ok(rb) => rb,
                 Err(message) => {
                     if warning_gate.should_emit(message.clone())
                         && should_emit_globally(format!("accept:{message}"))
@@ -361,7 +348,7 @@ fn describe_accept_failure(err: &crate::transport::ConnectionLifecycleError) -> 
             .unwrap_or("unknown");
         format!(
             "Rejected incoming connection: remote peer presented TLS fingerprint {} \
-             which is not trusted by any local workspace. This is normal during bootstrap \
+             which is not trusted by any local tenant. This is normal during bootstrap \
              when the remote peer's transport identity has not been derived yet",
             fp
         )
@@ -374,30 +361,33 @@ fn describe_accept_failure(err: &crate::transport::ConnectionLifecycleError) -> 
 
 /// Resolve which local tenant should own a given inbound connection.
 ///
-/// When the client requested a peer-scoped SNI, authorization is checked only
-/// for that local tenant. Otherwise this falls back to the node-scoped trust
-/// union and returns one authorizing tenant.
+/// The client must request one exact local transport fingerprint in SNI.
+/// That fingerprint is resolved to one local tenant, and authorization is
+/// checked only for that tenant.
 fn resolve_tenant_for_connection(
     db_path: &str,
     connection: &crate::transport::TransportConnection,
     remote_peer_id: &str,
-) -> Result<Option<String>, String> {
-    if let Some(requested) = requested_tenant_from_connection(connection) {
-        return resolve_requested_tenant_for_peer(db_path, &requested, remote_peer_id).map(Some);
-    }
-    Ok(resolve_tenant_for_peer(db_path, remote_peer_id))
+) -> Result<String, String> {
+    let requested = requested_transport_from_connection(connection).ok_or_else(|| {
+        format!(
+            "Rejected peer {}: missing exact transport-target SNI",
+            short_peer_id(remote_peer_id)
+        )
+    })?;
+    resolve_requested_tenant_for_peer(db_path, &requested, remote_peer_id)
 }
 
-fn requested_tenant_from_connection(
+fn requested_transport_from_connection(
     connection: &crate::transport::TransportConnection,
-) -> Option<crate::transport::multi_workspace::TenantSniTarget> {
+) -> Option<crate::transport::multi_workspace::TransportSniTarget> {
     let sni = requested_server_name_from_connection(connection)?;
-    crate::transport::multi_workspace::parse_tenant_sni(&sni)
+    crate::transport::multi_workspace::parse_transport_sni(&sni)
 }
 
 fn resolve_requested_tenant_for_peer(
     db_path: &str,
-    requested: &crate::transport::multi_workspace::TenantSniTarget,
+    requested: &crate::transport::multi_workspace::TransportSniTarget,
     remote_peer_id: &str,
 ) -> Result<String, String> {
     let remote_fp = peer_fingerprint_from_hex(remote_peer_id).ok_or_else(|| {
@@ -412,43 +402,38 @@ fn resolve_requested_tenant_for_peer(
             e
         )
     })?;
-    let Some(workspace_id) = lookup_workspace_id(&db, &requested.peer_id) else {
-        return Err(format!(
-            "Rejected peer {}: requested local tenant {} is not present on this node",
-            short_peer_id(remote_peer_id),
-            short_peer_id(&requested.peer_id)
-        ));
+    let matching_tenants: Vec<_> = discover_local_tenants(&db)
+        .map_err(|e| format!("Failed to discover local transport targets: {}", e))?
+        .into_iter()
+        .filter(|tenant| tenant.transport_peer_id == requested.transport_peer_id)
+        .collect();
+    let tenant = match matching_tenants.as_slice() {
+        [tenant] => tenant,
+        [] => {
+            return Err(format!(
+                "Rejected peer {}: requested local transport fingerprint {} is not present on this node",
+                short_peer_id(remote_peer_id),
+                short_peer_id(&requested.transport_peer_id)
+            ));
+        }
+        _ => {
+            return Err(format!(
+                "Rejected peer {}: requested local transport fingerprint {} is ambiguous on this node",
+                short_peer_id(remote_peer_id),
+                short_peer_id(&requested.transport_peer_id)
+            ));
+        }
     };
-    let expected_workspace_selector =
-        crate::transport::multi_workspace::workspace_sni(&workspace_id);
-    if expected_workspace_selector != requested.workspace_selector {
-        return Err(format!(
-            "Rejected peer {}: requested workspace selector does not match local tenant {}",
-            short_peer_id(remote_peer_id),
-            short_peer_id(&requested.peer_id)
-        ));
-    }
-    let authorized = is_authorized_for_tenant(&db, &requested.peer_id, &remote_fp)
+    let authorized = is_authorized_for_tenant(&db, &tenant.peer_id, &remote_fp)
         .map_err(|e| format!("Inbound tenant-scoped auth query failed: {}", e))?;
     if !authorized {
         return Err(format!(
             "Rejected peer {}: local tenant {} does not authorize this fingerprint",
             short_peer_id(remote_peer_id),
-            short_peer_id(&requested.peer_id)
+            short_peer_id(&tenant.peer_id)
         ));
     }
-    Ok(requested.peer_id.clone())
-}
-
-/// Resolve which local tenant trusts a given remote peer.
-///
-/// Queries the projected trust union directly and returns one tenant that
-/// currently authorizes the peer, or `None` if no tenant matches.
-fn resolve_tenant_for_peer(db_path: &str, remote_peer_id: &str) -> Option<String> {
-    let fp = peer_fingerprint_from_hex(remote_peer_id)?;
-    resolve_authorizing_tenant_from_db(db_path, fp)
-        .ok()
-        .flatten()
+    Ok(tenant.peer_id.clone())
 }
 
 fn short_peer_id(peer_id: &str) -> &str {
@@ -491,6 +476,23 @@ mod tests {
             ],
         )
         .unwrap();
+        conn.execute(
+            "INSERT INTO local_transport_creds (
+                peer_id,
+                cert_der,
+                key_der,
+                created_at,
+                source
+             ) VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                tenant_id,
+                vec![1u8],
+                vec![2u8],
+                n,
+                crate::db::transport_creds::CRED_SOURCE_PEER_SHARED
+            ],
+        )
+        .unwrap();
     }
 
     #[test]
@@ -512,9 +514,8 @@ mod tests {
         )
         .unwrap();
 
-        let requested = crate::transport::multi_workspace::TenantSniTarget {
-            workspace_selector: crate::transport::multi_workspace::workspace_sni(workspace_id),
-            peer_id: tenant_a.clone(),
+        let requested = crate::transport::multi_workspace::TransportSniTarget {
+            transport_peer_id: tenant_a.clone(),
         };
 
         let resolved =
@@ -546,17 +547,12 @@ mod tests {
         )
         .unwrap();
 
-        let requested = crate::transport::multi_workspace::TenantSniTarget {
-            workspace_selector: crate::transport::multi_workspace::workspace_sni(workspace_id),
-            peer_id: tenant_a.clone(),
+        let requested = crate::transport::multi_workspace::TransportSniTarget {
+            transport_peer_id: tenant_a.clone(),
         };
 
         let err =
             resolve_requested_tenant_for_peer(&db_path, &requested, &remote_peer_id).unwrap_err();
         assert!(err.contains("does not authorize"));
-        assert_eq!(
-            resolve_tenant_for_peer(&db_path, &remote_peer_id),
-            Some(tenant_b)
-        );
     }
 }

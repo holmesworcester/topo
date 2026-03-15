@@ -116,16 +116,21 @@ pub(crate) fn discovery_dispatch_key(tenant_id: &str, peer_id: &str) -> String {
 pub(crate) fn load_bootstrap_targets(
     db_path: &str,
     tenant_ids: &[String],
-) -> Result<Vec<(String, String, SocketAddr)>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<(String, String, String, SocketAddr)>, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
-    let mut seen: HashSet<(String, String, SocketAddr)> = HashSet::new();
+    let mut seen: HashSet<(String, String, String, SocketAddr)> = HashSet::new();
     let mut out = Vec::new();
     for tenant_id in tenant_ids {
         for target in list_active_invite_bootstrap_targets(&db, tenant_id)? {
             let addr_text = target.bootstrap_addr;
             match parse_bootstrap_address(&addr_text).and_then(|addr| addr.to_socket_addr()) {
                 Ok(addr) => {
-                    let key = (tenant_id.clone(), target.invite_event_id, addr);
+                    let key = (
+                        tenant_id.clone(),
+                        target.invite_event_id,
+                        target.bootstrap_transport_peer_id,
+                        addr,
+                    );
                     if seen.insert(key.clone()) {
                         out.push(key);
                     }
@@ -147,7 +152,7 @@ pub(crate) fn load_bootstrap_targets(
 /// Collect all bootstrap autodial targets across all local tenants.
 pub(crate) fn collect_all_bootstrap_targets(
     db_path: &str,
-) -> Result<Vec<(String, String, SocketAddr)>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<(String, String, String, SocketAddr)>, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
     let mut tenant_ids: Vec<String> = discover_local_tenants(&db)?
         .into_iter()
@@ -774,7 +779,8 @@ mod tests {
         assert_eq!(targets.len(), 1, "hostname bootstrap should resolve");
         assert_eq!(targets[0].0, recorded_by);
         assert_eq!(targets[0].1, "inv-host");
-        assert_eq!(targets[0].2.port(), 4433);
+        assert_eq!(targets[0].2, hex::encode(bootstrap_spki));
+        assert_eq!(targets[0].3.port(), 4433);
     }
 
     // -- Multi-tenant target deduplication tests --
@@ -873,7 +879,7 @@ mod tests {
         );
         let invite_ids: std::collections::HashSet<String> = targets
             .iter()
-            .map(|(_, invite_id, _)| invite_id.clone())
+            .map(|(_, invite_id, _, _)| invite_id.clone())
             .collect();
         assert!(invite_ids.contains("inv-1"));
         assert!(invite_ids.contains("inv-2"));
@@ -906,7 +912,8 @@ mod tests {
         assert_eq!(targets.len(), 1, "transitional tenant must still autodial");
         assert_eq!(targets[0].0, tenant_id);
         assert_eq!(targets[0].1, invite_event_id);
-        assert_eq!(targets[0].2, "10.0.0.1:4433".parse::<SocketAddr>().unwrap());
+        assert_eq!(targets[0].2, hex::encode([0xCC; 32]));
+        assert_eq!(targets[0].3, "10.0.0.1:4433".parse::<SocketAddr>().unwrap());
     }
 
     #[test]
@@ -934,7 +941,7 @@ mod tests {
 
         let by_tenant: std::collections::HashMap<String, SocketAddr> = targets
             .into_iter()
-            .map(|(tenant_id, _invite_event_id, remote)| (tenant_id, remote))
+            .map(|(tenant_id, _invite_event_id, _transport_peer_id, remote)| (tenant_id, remote))
             .collect();
         assert_eq!(
             by_tenant.get("tenant-direct"),

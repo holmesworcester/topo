@@ -15,7 +15,7 @@ use crate::db::{open_connection, schema::create_tables};
 use crate::transport::{
     build_tenant_client_config_from_creds, create_runtime_endpoint_for_tenants,
     extract_spki_fingerprint,
-    multi_workspace::{tenant_sni, workspace_sni, WorkspaceCertResolver},
+    multi_workspace::{transport_sni, WorkspaceCertResolver},
     TenantClientConfigs, TransportEndpoint,
 };
 use rustls::sign::CertifiedKey;
@@ -28,8 +28,8 @@ pub(crate) struct StartupResult {
     pub(crate) local_addr: SocketAddr,
     pub(crate) tenants: Vec<crate::db::transport_creds::TenantInfo>,
     pub(crate) tenant_client_configs: TenantClientConfigs,
-    /// Peer IDs of all local tenants (for mDNS self-filtering).
-    pub(crate) local_peer_ids: HashSet<String>,
+    /// Transport fingerprints of all local tenants (for mDNS self-filtering).
+    pub(crate) local_transport_peer_ids: HashSet<String>,
 }
 
 /// Discover local tenants, build certs, create the QUIC endpoint, and
@@ -52,8 +52,11 @@ pub(crate) fn setup_endpoint_and_tenants(
 
     info!("Discovered {} local tenant(s)", tenants.len());
 
-    // Collect all local peer_ids for mDNS self-filtering
-    let local_peer_ids: HashSet<String> = tenants.iter().map(|t| t.peer_id.clone()).collect();
+    // Collect all local transport fingerprints for mDNS self-filtering.
+    let local_transport_peer_ids: HashSet<String> = tenants
+        .iter()
+        .map(|t| t.transport_peer_id.clone())
+        .collect();
 
     // Build multi-workspace cert resolver + tenant metadata
     let provider = rustls::crypto::ring::default_provider();
@@ -113,10 +116,8 @@ pub(crate) fn setup_endpoint_and_tenants(
             }
         };
 
-        let sni = workspace_sni(&tenant.workspace_id);
-        let peer_scoped_sni = tenant_sni(&tenant.workspace_id, &tenant.peer_id);
-        cert_resolver.add(sni.clone(), ck.clone());
-        cert_resolver.add(peer_scoped_sni.clone(), ck);
+        let sni = transport_sni(&tenant.transport_peer_id);
+        cert_resolver.add(sni.clone(), ck);
         peer_to_workspace.insert(tenant.peer_id.clone(), tenant.workspace_id.clone());
 
         if default_cert.is_none() {
@@ -124,11 +125,10 @@ pub(crate) fn setup_endpoint_and_tenants(
         }
 
         info!(
-            "Registered tenant {} (workspace {}, sni={}, peer_sni={})",
+            "Registered tenant {} (workspace {}, transport_sni={})",
             &tenant.peer_id[..16],
             &tenant.workspace_id[..16.min(tenant.workspace_id.len())],
-            sni,
-            peer_scoped_sni
+            sni
         );
     }
 
@@ -181,6 +181,6 @@ pub(crate) fn setup_endpoint_and_tenants(
         local_addr,
         tenants,
         tenant_client_configs,
-        local_peer_ids,
+        local_transport_peer_ids,
     })
 }

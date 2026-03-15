@@ -11,7 +11,6 @@ use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
-use crate::db::store::lookup_workspace_id;
 use crate::db::transport_trust::record_transport_binding;
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::CoordinationManager;
@@ -113,7 +112,7 @@ pub async fn connect_loop_with_coordination_until_cancel(
     coordination_manager: Arc<CoordinationManager>,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    connect_loop_with_coordination_until_cancel_with_target_tenant_and_fallback(
+    connect_loop_with_coordination_until_cancel_with_target_fingerprint_and_fallback(
         db_path,
         recorded_by,
         endpoint,
@@ -143,7 +142,7 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
     shutdown: CancellationToken,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    connect_loop_with_coordination_until_cancel_with_target_tenant_and_fallback(
+    connect_loop_with_coordination_until_cancel_with_target_fingerprint_and_fallback(
         db_path,
         recorded_by,
         endpoint,
@@ -159,7 +158,7 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
     .await
 }
 
-pub(crate) async fn connect_loop_with_coordination_until_cancel_with_target_tenant_and_fallback(
+pub(crate) async fn connect_loop_with_coordination_until_cancel_with_target_fingerprint_and_fallback(
     db_path: &str,
     recorded_by: &str,
     endpoint: TransportEndpoint,
@@ -169,7 +168,7 @@ pub(crate) async fn connect_loop_with_coordination_until_cancel_with_target_tena
     ingest: IngestFns,
     coordination_manager: Arc<CoordinationManager>,
     shutdown: CancellationToken,
-    target_remote_tenant_id: Option<String>,
+    target_remote_transport_fingerprint: Option<String>,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tenants = vec![recorded_by.to_string()];
@@ -199,7 +198,7 @@ pub(crate) async fn connect_loop_with_coordination_until_cancel_with_target_tena
             shared_ingest,
             coordination,
             shutdown,
-            target_remote_tenant_id,
+            target_remote_transport_fingerprint,
             bootstrap_fallback_client_config,
         ))
         .await
@@ -279,10 +278,10 @@ async fn connect_loop_inner(
     shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
     coordination: Arc<crate::sync::session::coordinator::PeerCoord>,
     shutdown: CancellationToken,
-    target_remote_tenant_id: Option<String>,
+    target_remote_transport_fingerprint: Option<String>,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let sni = outbound_sni_for_target(db_path, recorded_by, target_remote_tenant_id.as_deref())?;
+    let sni = outbound_sni_for_target(target_remote_transport_fingerprint.as_deref());
     let initiator_handler = SyncSessionHandler::outbound(
         db_path.to_string(),
         SYNC_SESSION_TIMEOUT_SECS,
@@ -358,6 +357,21 @@ async fn connect_loop_inner(
         warning_gate.clear();
         let provider = dial_outcome.provider;
         let used_bootstrap_fallback = dial_outcome.used_bootstrap_fallback;
+        if let Some(expected_remote_transport_fingerprint) =
+            target_remote_transport_fingerprint.as_deref()
+        {
+            let actual_remote_transport_fingerprint = provider.peer_id().to_string();
+            if actual_remote_transport_fingerprint != expected_remote_transport_fingerprint {
+                provider
+                    .connection()
+                    .close(1u32.into(), b"wrong remote transport fingerprint");
+                return Err(ConnectionLifecycleError::DialTrustRejected(format!(
+                    "target fingerprint mismatch for {remote}: expected {} got {}",
+                    expected_remote_transport_fingerprint, actual_remote_transport_fingerprint
+                ))
+                .into());
+            }
+        }
         let connection = provider.connection();
         let peer_id = provider.peer_id().to_string();
         let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
@@ -448,19 +462,10 @@ async fn connect_loop_inner(
     Ok(())
 }
 
-fn outbound_sni_for_target(
-    db_path: &str,
-    recorded_by: &str,
-    target_remote_tenant_id: Option<&str>,
-) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
-    let db = open_connection(db_path)?;
-    let Some(workspace_id) = lookup_workspace_id(&db, recorded_by) else {
-        return Ok("localhost".to_string());
-    };
-    Ok(match target_remote_tenant_id {
-        Some(peer_id) => crate::transport::multi_workspace::tenant_sni(&workspace_id, peer_id),
-        None => crate::transport::multi_workspace::workspace_sni(&workspace_id),
-    })
+fn outbound_sni_for_target(target_remote_transport_fingerprint: Option<&str>) -> String {
+    target_remote_transport_fingerprint
+        .map(crate::transport::multi_workspace::transport_sni)
+        .unwrap_or_else(|| "localhost".to_string())
 }
 
 /// Produce a human-readable diagnosis for a connection failure.
@@ -699,72 +704,20 @@ mod tests {
     }
 
     #[test]
-    fn outbound_sni_uses_target_tenant_when_present() {
-        let (_dir, db_path) = setup_db();
-        let conn = open_connection(&db_path).unwrap();
-        let recorded_by =
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
+    fn outbound_sni_uses_target_transport_fingerprint_when_present() {
+        let (_dir, _db_path) = setup_db();
         let target_peer =
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
-        let workspace_id = "ws-sni-scope";
-        conn.execute(
-            "INSERT INTO invites_accepted (
-                recorded_by,
-                event_id,
-                tenant_event_id,
-                invite_event_id,
-                workspace_id,
-                created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                recorded_by,
-                "accepted-event",
-                "tenant-event",
-                "invite-event",
-                workspace_id,
-                1i64
-            ],
-        )
-        .unwrap();
-
-        let sni = outbound_sni_for_target(&db_path, &recorded_by, Some(&target_peer)).unwrap();
+        let sni = outbound_sni_for_target(Some(&target_peer));
         assert_eq!(
             sni,
-            crate::transport::multi_workspace::tenant_sni(workspace_id, &target_peer)
+            crate::transport::multi_workspace::transport_sni(&target_peer)
         );
     }
 
     #[test]
-    fn outbound_sni_falls_back_to_workspace_only_without_target_tenant() {
-        let (_dir, db_path) = setup_db();
-        let conn = open_connection(&db_path).unwrap();
-        let recorded_by =
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
-        let workspace_id = "ws-sni-fallback";
-        conn.execute(
-            "INSERT INTO invites_accepted (
-                recorded_by,
-                event_id,
-                tenant_event_id,
-                invite_event_id,
-                workspace_id,
-                created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                recorded_by,
-                "accepted-event",
-                "tenant-event",
-                "invite-event",
-                workspace_id,
-                1i64
-            ],
-        )
-        .unwrap();
-
-        let sni = outbound_sni_for_target(&db_path, &recorded_by, None).unwrap();
-        assert_eq!(
-            sni,
-            crate::transport::multi_workspace::workspace_sni(workspace_id)
-        );
+    fn outbound_sni_falls_back_to_localhost_without_target() {
+        let sni = outbound_sni_for_target(None);
+        assert_eq!(sni, "localhost");
     }
 }

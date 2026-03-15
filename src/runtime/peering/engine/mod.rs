@@ -47,7 +47,7 @@ pub async fn run_node(
         local_addr,
         tenants,
         tenant_client_configs,
-        local_peer_ids,
+        local_transport_peer_ids,
     } = setup_endpoint_and_tenants(db_path, bind, net_info_tx, cert_resolver)?;
 
     let mut runtime_supervisor = supervisor::RuntimeSupervisor::new(
@@ -56,7 +56,7 @@ pub async fn run_node(
         local_addr,
         tenants,
         tenant_client_configs,
-        local_peer_ids,
+        local_transport_peer_ids,
         intro_spawner,
         ingest,
     );

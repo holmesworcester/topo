@@ -1651,11 +1651,11 @@ fn register_new_tenant_certs(
                     continue;
                 }
             };
-        let sni = topo::transport::multi_workspace::workspace_sni(&tenant_info.workspace_id);
+        let sni = topo::transport::multi_workspace::transport_sni(&tenant_info.transport_peer_id);
         cert_resolver.add(sni.clone(), ck);
         registered.push(new_t.peer_id.clone());
         tracing::info!(
-            "Registered new tenant {} on live endpoint (sni={})",
+            "Registered new tenant {} on live endpoint (transport_sni={})",
             &new_t.peer_id[..16.min(new_t.peer_id.len())],
             sni
         );

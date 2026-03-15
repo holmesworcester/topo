@@ -1,8 +1,8 @@
-//! Multi-workspace TLS cert resolver.
+//! Multi-tenant TLS cert resolver.
 //!
 //! Implements `ResolvesServerCert` so a single QUIC endpoint can serve
-//! multiple workspaces. The client's SNI selects which workspace cert
-//! the server presents.
+//! multiple local transport identities. The client's SNI selects which
+//! local cert the server presents.
 //!
 //! Uses `RwLock` for interior mutability so new tenants can be registered
 //! on a live endpoint without restarting.
@@ -15,20 +15,17 @@ use std::sync::{Arc, RwLock};
 
 use crate::crypto::event_id_from_base64;
 
-/// Map workspace SNI → CertifiedKey for per-connection cert selection.
+/// Map exact transport-target SNI → CertifiedKey for per-connection cert selection.
 pub struct WorkspaceCertResolver {
     /// SNI hostname → CertifiedKey
     certs: RwLock<HashMap<String, Arc<CertifiedKey>>>,
-    /// Fallback cert when no SNI is provided.
-    fallback: RwLock<Option<Arc<CertifiedKey>>>,
 }
 
 impl fmt::Debug for WorkspaceCertResolver {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         let certs = self.certs.read().unwrap();
         f.debug_struct("WorkspaceCertResolver")
-            .field("workspaces", &certs.keys().collect::<Vec<_>>())
-            .field("has_fallback", &self.fallback.read().unwrap().is_some())
+            .field("targets", &certs.keys().collect::<Vec<_>>())
             .finish()
     }
 }
@@ -38,24 +35,18 @@ impl WorkspaceCertResolver {
     pub fn new() -> Self {
         Self {
             certs: RwLock::new(HashMap::new()),
-            fallback: RwLock::new(None),
         }
     }
 
-    /// Register a workspace's cert+key for the given SNI hostname.
+    /// Register one local transport identity's cert+key for the given SNI hostname.
     ///
     /// Takes `&self` (not `&mut self`) so callers can register new tenants
     /// on a live endpoint behind an `Arc`.
     pub fn add(&self, sni: String, certified_key: Arc<CertifiedKey>) {
-        let mut fallback = self.fallback.write().unwrap();
-        if fallback.is_none() {
-            *fallback = Some(certified_key.clone());
-        }
-        drop(fallback);
         self.certs.write().unwrap().insert(sni, certified_key);
     }
 
-    /// Number of registered workspaces.
+    /// Number of registered exact-SNI aliases.
     pub fn len(&self) -> usize {
         self.certs.read().unwrap().len()
     }
@@ -73,8 +64,7 @@ impl ResolvesServerCert for WorkspaceCertResolver {
                 return Some(ck.clone());
             }
         }
-        // Fallback for clients that do not send workspace-specific SNI.
-        self.fallback.read().unwrap().clone()
+        None
     }
 }
 
@@ -94,11 +84,10 @@ pub fn workspace_sni(workspace_id_b64: &str) -> String {
     }
 }
 
-/// Parsed peer-scoped SNI target for a multi-tenant workspace listener.
+/// Parsed exact transport-target SNI.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct TenantSniTarget {
-    pub workspace_selector: String,
-    pub peer_id: String,
+pub struct TransportSniTarget {
+    pub transport_peer_id: String,
 }
 
 /// Convert a full 32-byte hex peer_id to a DNS-safe peer-specific SNI suffix.
@@ -116,25 +105,14 @@ pub fn peer_sni(peer_id_hex: &str) -> String {
     }
 }
 
-/// Build an SNI hostname that addresses one logical peer within one workspace.
-///
-/// The peer component uses the logical tenant peer id, not the currently
-/// presented transport fingerprint, so callers never need to target bootstrap
-/// identities explicitly.
-pub fn tenant_sni(workspace_id_b64: &str, peer_id_hex: &str) -> String {
-    format!(
-        "{}.{}",
-        workspace_sni(workspace_id_b64),
-        peer_sni(peer_id_hex)
-    )
+/// Build an SNI hostname that addresses one exact local transport fingerprint.
+pub fn transport_sni(transport_peer_id_hex: &str) -> String {
+    peer_sni(transport_peer_id_hex)
 }
 
-/// Parse a peer-scoped tenant/workspace SNI.
-///
-/// Returns `None` for workspace-only or otherwise unrecognized SNI values.
-pub fn parse_tenant_sni(sni: &str) -> Option<TenantSniTarget> {
+/// Parse an exact transport-target SNI.
+pub fn parse_transport_sni(sni: &str) -> Option<TransportSniTarget> {
     let mut parts = sni.split('.');
-    let workspace_selector = parts.next()?.to_string();
     let first_peer = parts.next()?;
     let second_peer = parts.next()?;
     if parts.next().is_some() {
@@ -148,9 +126,8 @@ pub fn parse_tenant_sni(sni: &str) -> Option<TenantSniTarget> {
     {
         return None;
     }
-    Some(TenantSniTarget {
-        workspace_selector,
-        peer_id: format!("{peer_prefix}{second_peer}").to_ascii_lowercase(),
+    Some(TransportSniTarget {
+        transport_peer_id: format!("{peer_prefix}{second_peer}").to_ascii_lowercase(),
     })
 }
 
@@ -187,23 +164,20 @@ mod tests {
     }
 
     #[test]
-    fn test_tenant_sni_round_trips() {
-        let eid = [0xABu8; 32];
-        let workspace_id = crate::crypto::event_id_to_base64(&eid);
+    fn test_transport_sni_round_trips() {
         let peer_id = "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
-        let sni = tenant_sni(&workspace_id, peer_id);
+        let sni = transport_sni(peer_id);
         assert_eq!(
-            parse_tenant_sni(&sni),
-            Some(TenantSniTarget {
-                workspace_selector: "abababababababababababababababab".to_string(),
-                peer_id: peer_id.to_string(),
+            parse_transport_sni(&sni),
+            Some(TransportSniTarget {
+                transport_peer_id: peer_id.to_string(),
             })
         );
     }
 
     #[test]
-    fn test_parse_tenant_sni_ignores_workspace_only_values() {
-        assert_eq!(parse_tenant_sni("workspace-only"), None);
+    fn test_parse_transport_sni_ignores_workspace_only_values() {
+        assert_eq!(parse_transport_sni("workspace-only"), None);
     }
 
     #[test]

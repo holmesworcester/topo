@@ -23,7 +23,8 @@ use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
 use crate::db::transport_creds::TenantInfo;
 use crate::peering::loops::{
     accept_loop_with_ingest_until_cancel,
-    connect_loop_with_coordination_until_cancel_with_target_tenant_and_fallback, IntroSpawnerFn,
+    connect_loop_with_coordination_until_cancel_with_target_fingerprint_and_fallback,
+    IntroSpawnerFn,
 };
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::CoordinationManager;
@@ -92,9 +93,16 @@ struct TenantDispatchContext {
 
 #[derive(Clone, Debug)]
 enum TargetIngressSource {
-    Bootstrap { invite_event_id: String },
-    ObservedPeer { peer_id: String },
-    Discovery { peer_id: String },
+    Bootstrap {
+        invite_event_id: String,
+        transport_peer_id: String,
+    },
+    ObservedPeer {
+        transport_peer_id: String,
+    },
+    Discovery {
+        transport_peer_id: String,
+    },
 }
 
 #[derive(Clone, Debug)]
@@ -115,7 +123,7 @@ pub(crate) struct RuntimeSupervisor {
     local_addr: SocketAddr,
     tenants: Vec<TenantInfo>,
     tenant_client_configs: TenantClientConfigs,
-    local_peer_ids: HashSet<String>,
+    local_transport_peer_ids: HashSet<String>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     state: RuntimeState,
@@ -129,7 +137,7 @@ impl RuntimeSupervisor {
         local_addr: SocketAddr,
         tenants: Vec<TenantInfo>,
         tenant_client_configs: TenantClientConfigs,
-        local_peer_ids: HashSet<String>,
+        local_transport_peer_ids: HashSet<String>,
         intro_spawner: IntroSpawnerFn,
         ingest: IngestFns,
     ) -> Self {
@@ -139,7 +147,7 @@ impl RuntimeSupervisor {
             local_addr,
             tenants,
             tenant_client_configs,
-            local_peer_ids,
+            local_transport_peer_ids,
             intro_spawner,
             ingest,
             state: RuntimeState::IdleNoTenants,
@@ -276,7 +284,7 @@ impl RuntimeSupervisor {
             let setup = super::discovery::prepare_mdns_discovery(
                 &self.tenants,
                 self.local_addr,
-                &self.local_peer_ids,
+                &self.local_transport_peer_ids,
                 &self.tenant_client_configs,
             );
             discovery_handles = setup.handles;
@@ -501,12 +509,15 @@ async fn run_bootstrap_refresher(
         match collect_all_bootstrap_targets(&db_path) {
             Ok(targets) => {
                 warning_gate.clear();
-                for (tenant_id, invite_event_id, remote) in targets {
+                for (tenant_id, invite_event_id, transport_peer_id, remote) in targets {
                     if ingress_tx
                         .send(TargetIngressEvent {
                             tenant_id,
                             remote,
-                            source: TargetIngressSource::Bootstrap { invite_event_id },
+                            source: TargetIngressSource::Bootstrap {
+                                invite_event_id,
+                                transport_peer_id,
+                            },
                         })
                         .is_err()
                     {
@@ -547,12 +558,12 @@ async fn run_observed_endpoint_refresher(
         match collect_all_observed_endpoint_targets(&db_path) {
             Ok(targets) => {
                 warning_gate.clear();
-                for (tenant_id, peer_id, remote) in targets {
+                for (tenant_id, transport_peer_id, remote) in targets {
                     if ingress_tx
                         .send(TargetIngressEvent {
                             tenant_id,
                             remote,
-                            source: TargetIngressSource::ObservedPeer { peer_id },
+                            source: TargetIngressSource::ObservedPeer { transport_peer_id },
                         })
                         .is_err()
                     {
@@ -602,7 +613,7 @@ async fn run_discovery_ingress_worker(
                             tenant_id: source.tenant_id.clone(),
                             remote: dial_addr,
                             source: TargetIngressSource::Discovery {
-                                peer_id: peer.peer_id,
+                                transport_peer_id: peer.peer_id,
                             },
                         })
                         .is_err()
@@ -647,33 +658,40 @@ async fn run_target_dispatcher(
         reap_finished_connect_workers(&mut active_workers, &mut dispatcher).await;
 
         let dispatch_key = match &event.source {
-            TargetIngressSource::Bootstrap { invite_event_id } => {
-                bootstrap_dispatch_key(&event.tenant_id, invite_event_id)
+            TargetIngressSource::Bootstrap {
+                invite_event_id, ..
+            } => bootstrap_dispatch_key(&event.tenant_id, invite_event_id),
+            TargetIngressSource::ObservedPeer { transport_peer_id } => {
+                discovery_dispatch_key(&event.tenant_id, transport_peer_id)
             }
-            TargetIngressSource::ObservedPeer { peer_id } => {
-                discovery_dispatch_key(&event.tenant_id, peer_id)
-            }
-            TargetIngressSource::Discovery { peer_id } => {
-                discovery_dispatch_key(&event.tenant_id, peer_id)
+            TargetIngressSource::Discovery { transport_peer_id } => {
+                discovery_dispatch_key(&event.tenant_id, transport_peer_id)
             }
         };
 
         let should_spawn = match &event.source {
-            TargetIngressSource::Bootstrap { invite_event_id } => dispatch_bootstrap_target(
+            TargetIngressSource::Bootstrap {
+                invite_event_id, ..
+            } => dispatch_bootstrap_target(
                 &mut dispatcher,
                 &event.tenant_id,
                 invite_event_id,
                 event.remote,
             ),
-            TargetIngressSource::ObservedPeer { peer_id } => dispatch_observed_endpoint_target(
+            TargetIngressSource::ObservedPeer { transport_peer_id } => {
+                dispatch_observed_endpoint_target(
+                    &mut dispatcher,
+                    &event.tenant_id,
+                    transport_peer_id,
+                    event.remote,
+                )
+            }
+            TargetIngressSource::Discovery { transport_peer_id } => dispatch_discovery_target(
                 &mut dispatcher,
                 &event.tenant_id,
-                peer_id,
+                transport_peer_id,
                 event.remote,
             ),
-            TargetIngressSource::Discovery { peer_id } => {
-                dispatch_discovery_target(&mut dispatcher, &event.tenant_id, peer_id, event.remote)
-            }
         };
 
         if !should_spawn {
@@ -716,7 +734,9 @@ async fn run_target_dispatcher(
         };
 
         let bootstrap_fallback_client_config = match &event.source {
-            TargetIngressSource::Bootstrap { invite_event_id } => {
+            TargetIngressSource::Bootstrap {
+                invite_event_id, ..
+            } => {
                 match build_tenant_bootstrap_fallback_client_config_for_invite_from_db(
                     &db_path,
                     &event.tenant_id,
@@ -739,11 +759,12 @@ async fn run_target_dispatcher(
         };
 
         let worker_cancel = shutdown.child_token();
-        let target_remote_tenant_id = target_remote_tenant_id(&event.source);
-        let target_note = target_remote_tenant_id
+        let target_remote_transport_fingerprint =
+            target_remote_transport_fingerprint(&event.source);
+        let target_note = target_remote_transport_fingerprint
             .as_deref()
             .map(short_peer_id)
-            .unwrap_or("workspace-only");
+            .unwrap_or("unknown");
         info!(
             "Spawning connect worker key={} tenant={} remote={} target={} source={:?}",
             dispatch_key,
@@ -759,7 +780,7 @@ async fn run_target_dispatcher(
             let worker_cancel = worker_cancel.clone();
             let dispatch_key = dispatch_key.clone();
             let bootstrap_fallback_client_config = bootstrap_fallback_client_config.clone();
-            let target_remote_tenant_id = target_remote_tenant_id.clone();
+            let target_remote_transport_fingerprint = target_remote_transport_fingerprint.clone();
             move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -775,7 +796,7 @@ async fn run_target_dispatcher(
                     ingest,
                     worker_cancel,
                     dispatch_key,
-                    target_remote_tenant_id,
+                    target_remote_transport_fingerprint,
                     bootstrap_fallback_client_config,
                 ));
             }
@@ -836,29 +857,51 @@ async fn run_connect_worker(
     ingest: IngestFns,
     shutdown: CancellationToken,
     dispatch_key: String,
-    target_remote_tenant_id: Option<String>,
+    target_remote_transport_fingerprint: Option<String>,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
 ) {
     let mut warning_gate = RepeatedWarningGate::new(Duration::from_secs(300));
+    let mut refresh_warning_gate = RepeatedWarningGate::new(Duration::from_secs(300));
     loop {
         if shutdown.is_cancelled() {
             break;
         }
 
-        let result = connect_loop_with_coordination_until_cancel_with_target_tenant_and_fallback(
-            &db_path,
-            &tenant_id,
-            endpoint.clone(),
-            remote,
-            Some(context.client_config.clone()),
-            intro_spawner,
-            ingest,
-            context.coordination_manager.clone(),
-            shutdown.clone(),
-            target_remote_tenant_id.clone(),
-            bootstrap_fallback_client_config.clone(),
-        )
-        .await;
+        let current_client_config = match build_tenant_client_config_from_db(&db_path, &tenant_id) {
+            Ok(cfg) => {
+                refresh_warning_gate.clear();
+                cfg
+            }
+            Err(err) => {
+                let message = format!(
+                    "Using cached outbound client config for tenant {}: {}",
+                    short_peer_id(&tenant_id),
+                    err
+                );
+                if refresh_warning_gate.should_emit(message.clone())
+                    && should_emit_globally(format!("engine:{message}"))
+                {
+                    warn!("{}", message);
+                }
+                context.client_config.clone()
+            }
+        };
+
+        let result =
+            connect_loop_with_coordination_until_cancel_with_target_fingerprint_and_fallback(
+                &db_path,
+                &tenant_id,
+                endpoint.clone(),
+                remote,
+                Some(current_client_config),
+                intro_spawner,
+                ingest,
+                context.coordination_manager.clone(),
+                shutdown.clone(),
+                target_remote_transport_fingerprint.clone(),
+                bootstrap_fallback_client_config.clone(),
+            )
+            .await;
 
         if shutdown.is_cancelled() {
             break;
@@ -909,11 +952,13 @@ fn short_peer_id(peer_id: &str) -> &str {
     &peer_id[..16.min(peer_id.len())]
 }
 
-fn target_remote_tenant_id(source: &TargetIngressSource) -> Option<String> {
+fn target_remote_transport_fingerprint(source: &TargetIngressSource) -> Option<String> {
     match source {
-        TargetIngressSource::Bootstrap { .. } => None,
-        TargetIngressSource::ObservedPeer { peer_id } => Some(peer_id.clone()),
-        TargetIngressSource::Discovery { .. } => None,
+        TargetIngressSource::Bootstrap {
+            transport_peer_id, ..
+        } => Some(transport_peer_id.clone()),
+        TargetIngressSource::ObservedPeer { transport_peer_id } => Some(transport_peer_id.clone()),
+        TargetIngressSource::Discovery { transport_peer_id } => Some(transport_peer_id.clone()),
     }
 }
 

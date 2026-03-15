@@ -38,7 +38,7 @@ pub(crate) struct DiscoveryRuntimeSetup {
 pub(crate) fn prepare_mdns_discovery(
     tenants: &[crate::db::transport_creds::TenantInfo],
     local_addr: SocketAddr,
-    local_peer_ids: &HashSet<String>,
+    local_transport_peer_ids: &HashSet<String>,
     tenant_client_configs: &TenantClientConfigs,
 ) -> DiscoveryRuntimeSetup {
     let mut handles: Vec<crate::peering::discovery::TenantDiscovery> = Vec::new();
@@ -54,9 +54,9 @@ pub(crate) fn prepare_mdns_discovery(
 
     for tenant in tenants {
         match crate::peering::discovery::TenantDiscovery::new_with_workspace(
-            &tenant.peer_id,
+            &tenant.transport_peer_id,
             actual_port,
-            local_peer_ids.clone(),
+            local_transport_peer_ids.clone(),
             &advertise_ip,
             Some(&tenant.workspace_id),
         ) {
