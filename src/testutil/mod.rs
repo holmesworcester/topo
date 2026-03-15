@@ -3894,7 +3894,6 @@ mod fingerprint_tests {
             "blocked_event_deps",
             "blocked_events",
             "project_queue",
-            "egress_queue",
             "peer_endpoint_observations",
             "intro_attempts",
             "peer_transport_bindings",

@@ -1,4 +1,3 @@
-pub mod egress_queue;
 pub mod event_display;
 pub mod health;
 pub mod intro;
@@ -106,7 +105,6 @@ pub fn ensure_infra_schema(conn: &Connection) -> SqliteResult<()> {
     store::ensure_schema(conn)?;
     event_display::ensure_schema(conn)?;
     project_queue::ensure_schema(conn)?;
-    egress_queue::ensure_schema(conn)?;
     health::ensure_schema(conn)?;
     intro::ensure_schema(conn)?;
     sync_log::ensure_schema(conn)?;

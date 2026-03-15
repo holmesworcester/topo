@@ -91,7 +91,7 @@ These are required, not optional:
    - PSK bootstrap phase and identity sender-keys phase use the same key-wrap event/projector path.
    - only key source and wrapping algorithm differ.
 5. DRY queue mechanics.
-   - `project_queue` and `egress_queue` share generic claim/lease/retry/backoff helper code.
+   - DB-backed queues such as `project_queue` share generic claim/lease/retry/backoff helper code.
 6. Isomorphism requirement.
    - once canonical event bytes are persisted, source differences disappear (`local_create == wire_receive == replay`) for projection logic.
 7. Shared projection tables with tenant-scoped autowrite.
@@ -801,37 +801,11 @@ CREATE TABLE project_queue (
 );
 CREATE INDEX idx_project_queue_claim
     ON project_queue(peer_id, priority_lane, priority_ts DESC, available_at, event_id);
-
-CREATE TABLE egress_queue (
-    id INTEGER PRIMARY KEY AUTOINCREMENT,
-    connection_id TEXT NOT NULL,
-    frame_type TEXT NOT NULL,          -- event | neg_msg | have_list | ...
-    event_id TEXT,
-    payload BLOB,
-    enqueued_at INTEGER NOT NULL,
-    available_at INTEGER NOT NULL,
-    attempts INTEGER NOT NULL DEFAULT 0,
-    lease_until INTEGER,
-    lease_owner TEXT,
-    sent_at INTEGER,
-    dedupe_key TEXT,
-    priority_lane INTEGER NOT NULL DEFAULT 1,
-    priority_ts INTEGER NOT NULL DEFAULT 0
-);
-CREATE UNIQUE INDEX idx_egress_pending_event
-    ON egress_queue(connection_id, event_id)
-    WHERE frame_type = 'event' AND sent_at IS NULL;
-CREATE UNIQUE INDEX idx_egress_dedupe
-    ON egress_queue(dedupe_key)
-    WHERE dedupe_key IS NOT NULL AND sent_at IS NULL;
-CREATE INDEX idx_egress_claim
-    ON egress_queue(connection_id, priority_lane, priority_ts DESC, id)
-    WHERE sent_at IS NULL;
 ```
 
 Keep canonical and queue data separate:
 - permanent: `events`, `recorded_events`, projection outputs
-- operational/transient: `project_queue`, `blocked_event_deps`, `blocked_events`, `egress_queue`
+- operational/transient: `project_queue`, `blocked_event_deps`, `blocked_events`
 - removed: `ingress_queue` was dropped in migration 28 because no runtime writer or reader used it
 
 ## 8.2 Why not one generic jobs table
@@ -849,22 +823,20 @@ Runtime flow reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) sections `1`,
 
 1. `ingest receiver path` (current runtime): QUIC frame -> ingest channel -> transactional canonical insert -> record by tenant -> enqueue project.
 2. `project worker`: claim row -> project path (`valid`/`block`/`reject`) -> dequeue.
-3. `egress worker`: claim a leased batch by `connection_id` + `lease_owner` -> send frame -> mark `sent`/retry -> release only that session's leases on teardown.
-4. `cleanup worker`: purge sent egress rows, reclaim expired leases, TTL-purge old endpoint observations.
+3. `request/response worker`: sources advertise request credit, sinks choose wanted IDs, and sources serve those requested blobs from bounded in-memory connection-scoped response buffers.
+4. `cleanup worker`: reclaim expired project leases and TTL-purge old endpoint observations.
 
 Queue DRY requirement:
 - implement generic queue helper traits/functions once (`claim_batch`, `renew_lease`, `mark_done`, `mark_retry/backoff`).
-- reuse them for both `project_queue` and `egress_queue` to avoid diverging retry/lease semantics.
+- keep them shared for DB-backed queues such as `project_queue`, rather than duplicating retry/lease semantics.
 
-## 8.4 Egress queue creation (matching working Topo shape)
+## 8.4 Sync transfer shape
 
-Create rows from:
-1. Negentropy reconciliation producer (`have_ids` we can send).
-2. Incoming `HaveList` request producer.
-3. Local protocol producers for control frames.
-4. Local shared-event creation directly into known remote peer queues.
-
-For event transfer, queue `event_id` only and fetch canonical blob at send time.
+Sync event transfer is pull-only:
+1. discovery writes `wanted + wanted_sources`,
+2. sinks fill peer credit by selecting wanted IDs,
+3. sources queue only explicitly requested IDs in bounded in-memory response buffers,
+4. sources fetch canonical blobs at send time.
 
 ## 8.5 Project queue dedupe + purge
 
@@ -874,7 +846,6 @@ For event transfer, queue `event_id` only and fetch canonical blob at send time.
 - On terminal decision (`valid`, `reject`, `block`), remove row from `project_queue` in the same transaction as state write.
 - Queue classification uses outer semantic type. For encrypted wrappers the runtime reads the wrapper-exposed `inner_type_code`, so encrypted `file_slice` rows still enter the bulk lane without waiting for decryption.
 - `project_queue` stores `priority_ts` for policy metadata, but current claim order is lane-first and FIFO within the lane so large `file_slice` bursts cannot monopolize projection while dependency-heavy foreground chains retain arrival order.
-- `egress_queue` claim order is lane-first with recency inside the lane (`priority_ts DESC`) so new foreground events are sent ahead of older bulk backlog.
 
 ## 8.5.1 Test harness cleanup TODO
 

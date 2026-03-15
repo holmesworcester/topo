@@ -2,7 +2,6 @@
 //!
 //! This module centralizes logic reused by queue implementations:
 //! - `src/state/db/project_queue.rs` (projection retry/lease workflow)
-//! - `src/state/db/egress_queue.rs` (egress enqueue/send timestamps)
 //!
 //! Keeping these helpers here ensures retry timing and queue-health reporting
 //! stay consistent when multiple queues evolve.

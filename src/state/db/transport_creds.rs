@@ -161,15 +161,6 @@ pub fn resolve_local_transport_targets(
     Ok(targets)
 }
 
-pub fn resolve_local_transport_target(
-    conn: &Connection,
-    transport_peer_id: &str,
-) -> Result<Option<LocalTransportTarget>, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(resolve_local_transport_targets(conn, transport_peer_id)?
-        .into_iter()
-        .next())
-}
-
 /// Store TLS cert/key DER blobs for a local peer identity.
 pub fn store_local_creds(
     conn: &Connection,
@@ -644,23 +635,23 @@ mod tests {
     }
 
     #[test]
-    fn test_resolve_local_transport_target() {
+    fn test_resolve_local_transport_targets() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
-        assert!(resolve_local_transport_target(&conn, "peer1")
+        assert!(resolve_local_transport_targets(&conn, "peer1")
             .unwrap()
-            .is_none());
+            .is_empty());
 
         set_local_transport_target(&conn, "tenant_a", "peer1", CRED_SOURCE_BOOTSTRAP).unwrap();
 
         assert_eq!(
-            resolve_local_transport_target(&conn, "peer1").unwrap(),
-            Some(LocalTransportTarget {
+            resolve_local_transport_targets(&conn, "peer1").unwrap(),
+            vec![LocalTransportTarget {
                 tenant_id: "tenant_a".to_string(),
                 transport_peer_id: "peer1".to_string(),
                 source: CRED_SOURCE_BOOTSTRAP.to_string(),
-            })
+            }]
         );
     }
 

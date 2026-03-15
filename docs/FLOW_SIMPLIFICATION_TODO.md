@@ -1,7 +1,7 @@
 # Flow Simplification TODO
 
-- [x] Drop `egress_queue` retry/recovery complexity that duplicates negentropy retries across rounds/sessions.
-  - Simplify `egress_queue` usage to ephemeral per-session send buffering semantics.
+- [x] Drop sync-side durable egress queue complexity that duplicates negentropy retries across rounds/sessions.
+  - Simplify sync event transfer to bounded in-memory response buffering scoped to the active connection.
   - Remove unused/low-value retry machinery (`attempts` backoff paths, explicit recovery handling) where safe.
   - Preserve correctness via existing negentropy re-diff/re-request behavior in subsequent rounds/sessions.
   - Validate with sync/session + perf tests to confirm no regression in convergence.

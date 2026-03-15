@@ -16,7 +16,7 @@ Primary source modules:
 - `src/event_pipeline/{mod.rs,phases.rs,planner.rs,effects.rs,drain.rs}`
 - `src/projection/apply/*`
 - `src/projection/create.rs`
-- `src/db/{project_queue.rs,egress_queue.rs,wanted.rs,transport_trust.rs}`
+- `src/db/{project_queue.rs,wanted.rs,transport_trust.rs}`
 
 ## 0) RPC Dispatch And Event Locality
 
@@ -74,11 +74,11 @@ flowchart TD
     HANDLER --> SYNC_RECON["sync reconcile (control exchange)"]
     SYNC_RECON --> IDS["have_ids + need_ids"]
 
-    IDS -->|peer needs my ids| ENQ["egress_queue.enqueue_events(peer_id, ids)"]
-    IDS -->|I need peer ids| HAVE["wanted_events.insert(ids) + send HaveList(ids)"]
-
-    ENQ --> CLAIM["egress_queue.claim_batch + mark_sent"]
-    CLAIM --> OUT["data_send: Frame::Event(blob)"]
+    IDS -->|peer can supply ids| WANT["wanted + wanted_sources update"]
+    WANT --> PLAN["request planner + peer credit"]
+    PLAN --> REQ["send HaveList(requested ids)"]
+    REQ --> RESPQ["connection-scoped response buffer"]
+    RESPQ --> OUT["data_send: Frame::Event(blob)"]
     OUT --> RX["peer receiver task"]
     RX --> IN["ingest channel"]
 
@@ -203,15 +203,15 @@ flowchart TD
       CTRL_STREAM["Sync control"]
       DATA["Sync data"]
       WANT["wanted_events"]
-      EGRESS["egress_queue"]
-      SEND["Shared event send"]
+      RESP["connection-scoped\nresponse buffer"]
+      SEND["Requested event send"]
       RECV["Receive + source tag"]
 
       SYNC --> CTRL_STREAM
       SYNC --> DATA
       CTRL_STREAM --> WANT
-      CTRL_STREAM --> EGRESS
-      EGRESS --> SEND
+      CTRL_STREAM --> RESP
+      RESP --> SEND
       DATA --> RECV
     end
 
@@ -369,14 +369,14 @@ flowchart LR
 
 ## Current Data-Flow Facts
 
-1. `egress_queue` is fed by sync control-plane `HaveList` messages, not by `batch_writer`.
+1. live sync event transfer is pull-only and uses connection-scoped in-memory response buffers, not a durable egress queue.
 2. `batch_writer` is the shared ingest sink for wire-received events and local-create events; it runs explicit phases: persist transaction, post-commit command planning, and effects execution.
 3. RPC command/query dispatch routes to owner modules (event modules for event-domain operations, `state/subscriptions` for local subscription infra); `service.rs` is an infra helper layer (`open_db_*`, node status, intro transport helper).
 4. Peering orchestration (`connect_loop`/`accept_loop`/workflows) now routes transport operations through `transport::peering_boundary`; peering no longer imports QUIC/trust internals directly.
 5. QUIC dial/accept + peer identity extraction are transport-owned in `connection_lifecycle`.
 6. QUIC stream wiring (`open_bi`/`accept_bi`, `DualConnection`, `QuicTransportSessionIo`) is transport-owned in `session_factory`.
 7. Projection outputs both user-facing read tables and transport trust tables; trust rows feed both handshake allow/deny and bootstrap autodial.
-8. `HaveList` IDs originate from sync reconciliation `need_ids`; runtime initiator sessions use coordinator-assigned subsets (autodial + mDNS), then land in `egress_queue`.
+8. `HaveList` IDs originate from sync discovery plus wanted scheduling; runtime initiator sessions use coordinator-assigned subsets (autodial + mDNS), then sources serve those exact requested IDs from connection-scoped response buffers.
 9. Foreground runtime is daemon-first (`topo start`): shutdown is coordinated by shared `shutdown_notify` (RPC `Shutdown` or Ctrl-C).
 10. Runtime and helper initiator sessions both route pull assignment through the coordinator; there is no direct `need_ids -> HaveList(all)` bypass path.
 11. Transport trust checks now read `db::transport_trust::is_authorized_for_tenant` directly inside transport; the separate trust-oracle adapter layer is removed.

@@ -115,7 +115,6 @@ mod tests {
         // Infra-owned tables
         assert!(tables.contains(&"events".to_string()));
         assert!(tables.contains(&"project_queue".to_string()));
-        assert!(tables.contains(&"egress_queue".to_string()));
         assert!(tables.contains(&"bootstrap_context".to_string()));
         assert!(tables.contains(&"event_timeline".to_string()));
 

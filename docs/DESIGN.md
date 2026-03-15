@@ -1177,14 +1177,9 @@ Encrypted wrapper events remain canonical but carry ciphertext payloads whose in
 
 Operational queues:
 
-1. `project_queue(peer_id, event_id, available_at, attempts, lease_until, priority_lane, priority_ts)`,
-2. `egress_queue(connection_id, frame_type, event_id, payload, attempts, lease_until, lease_owner, sent_at, dedupe_key, priority_lane, priority_ts)`.
+1. `project_queue(peer_id, event_id, available_at, attempts, lease_until, priority_lane, priority_ts)`.
 
 Canonical tables and queue tables stay separate.
-
-`egress_queue.connection_id` is a legacy column name. The logical owner is the
-authenticated peer slot, not a raw transport connection. In steady state the
-runtime passes peer-id/peer-slot identity through this column.
 
 ## 7.2 Workers
 
@@ -1197,7 +1192,7 @@ Peer runtime worker shape:
    - claim batch, project each event in autocommit (`valid|block|reject`), batch-dequeue successes, mark retry on failure. `project_queue` stores priority metadata but currently only uses lane priority at claim time: foreground before bulk, then FIFO within the lane (`priority_lane`, then `available_at`, then `rowid`) so dependency-heavy foreground chains are not recency-reordered. WAL autocheckpoint deferred during drain (skipped in low_mem mode).
 3. `PeerReplicator` per authenticated peer slot:
    - **observer loop** (lower-rate): connect/full-sync start, `dirty_hot`, cold timer, backlog exhaustion, or source-set change trigger negentropy observation; the observer updates SQL truth (`wanted`, candidate sources) but does not attempt to keep the wire full itself.
-   - **sender/request loop** (higher-rate): continuously keeps per-peer QUIC streams fed. It serves requested responses from a bounded in-memory request queue, advertises source-side request credit, and uses a shared tenant-scoped in-memory coordinator to reserve sink-side pull work across all active peers in bounded memory.
+   - **sender/request loop** (higher-rate): continuously keeps per-peer QUIC streams fed. It serves requested responses from bounded in-memory connection-scoped response buffers, advertises source-side request credit, and uses a shared tenant-scoped in-memory coordinator to reserve sink-side pull work across all active peers in bounded memory.
 4. cleanup worker:
    - reclaim expired leases, purge stale/sent operational rows, TTL endpoint cleanup.
 
@@ -1211,7 +1206,7 @@ Sync event transfer is pull-only.
 4. control protocol producers (`Frame::NegOpen`, `Frame::NegMsg`, `Frame::NeedList`, `Frame::HaveList`, `Frame::RequestCredit`, `Frame::Done`, `Frame::DataDone`, `Frame::DoneAck`, `Frame::IntroOffer`) live in `shared/protocol.rs`,
 5. hot-observer wakeups from newly valid shared events cause the next peer observation pass to discover those IDs so the sink can request them.
 
-Durable `egress_queue` rows are no longer part of live sync event transport.
+There is no durable sync egress queue anymore. Live sync event transport is request/response only and uses bounded in-memory connection-scoped response buffers.
 
 ## 7.4 Dedupe and purge
 
@@ -1316,11 +1311,11 @@ depend on fresh session rounds.
    keep the wanted graph fresh.
 3. **Sender/request loop.** The sink fills per-peer request credit from a
    shared tenant-scoped in-memory coordinator backed by `wanted` SQL state; the
-   sender keeps per-peer push windows full from `egress_queue`.
-4. **Incremental bounded windows.** Push uses leased SQL-backed windows, while
-   pull uses bounded in-memory reservation/response windows. Blob residency
-   stays small in both cases, so SQLite does not pace the wire and memory does
-   not scale with total workspace size.
+   source serves only explicitly requested event IDs from bounded in-memory
+   response buffers.
+4. **Incremental bounded windows.** Pull uses bounded in-memory reservation and
+   response windows. Blob residency stays small, so SQLite does not pace the
+   wire and memory does not scale with total workspace size.
 5. **Connection-scoped scaffolding.** Sync handlers now belong to one
    authenticated connection lifetime, and the sink's request credit,
    in-flight request suppression, and the source's pending-response queue now
