@@ -3,150 +3,10 @@
 use std::time::Duration;
 use topo::crypto::{event_id_from_base64, event_id_to_base64};
 use topo::db::open_connection;
-use topo::testutil::{assert_eventually, start_peers_pinned, Peer, ScenarioHarness};
-
-struct BootstrapChain {
-    workspace_key: ed25519_dalek::SigningKey,
-    workspace_eid: [u8; 32],
-    workspace_id: [u8; 32],
-    invite_key: ed25519_dalek::SigningKey,
-    user_invite_eid: [u8; 32],
-    user_key: ed25519_dalek::SigningKey,
-    user_eid: [u8; 32],
-    device_invite_key: ed25519_dalek::SigningKey,
-    device_invite_eid: [u8; 32],
-    peer_shared_key: ed25519_dalek::SigningKey,
-    peer_shared_eid: [u8; 32],
-    admin_key: ed25519_dalek::SigningKey,
-    admin_eid: [u8; 32],
-    invite_accepted_eid: [u8; 32],
-}
-
-fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
-    use ed25519_dalek::SigningKey;
-
-    let mut rng = rand::thread_rng();
-    let workspace_key = SigningKey::generate(&mut rng);
-    let workspace_pubkey = workspace_key.verifying_key().to_bytes();
-
-    // 1. Workspace event
-    let workspace_eid = peer.create_workspace(workspace_pubkey);
-    let workspace_id = workspace_eid;
-
-    // 2. InviteAccepted (local self-bind to workspace root)
-    let invite_accepted_eid = peer.create_invite_accepted(&workspace_eid, workspace_id);
-
-    // 3. UserInvite (signed by workspace)
-    let invite_key = SigningKey::generate(&mut rng);
-    let invite_pubkey = invite_key.verifying_key().to_bytes();
-    let user_invite_eid =
-        peer.create_user_invite_with_key(invite_pubkey, &workspace_key, &workspace_eid);
-
-    // 4. User (signed by user_invite)
-    let user_key = SigningKey::generate(&mut rng);
-    let user_pubkey = user_key.verifying_key().to_bytes();
-    let user_eid = peer.create_user(user_pubkey, &invite_key, &user_invite_eid);
-
-    // 5. DeviceInvite (signed by user)
-    let device_invite_key = SigningKey::generate(&mut rng);
-    let device_invite_pubkey = device_invite_key.verifying_key().to_bytes();
-    let device_invite_eid = peer.create_device_invite(device_invite_pubkey, &user_key, &user_eid);
-
-    // 6. PeerShared (signed by device_invite)
-    let peer_shared_key = SigningKey::generate(&mut rng);
-    let peer_shared_pubkey = peer_shared_key.verifying_key().to_bytes();
-    let peer_shared_eid = peer.create_peer_shared(
-        peer_shared_pubkey,
-        &device_invite_key,
-        &device_invite_eid,
-        &user_eid,
-    );
-
-    // 7. Admin (signed by workspace, dep on user)
-    let admin_key = SigningKey::generate(&mut rng);
-    let admin_pubkey = admin_key.verifying_key().to_bytes();
-    let admin_eid = peer.create_admin(admin_pubkey, &workspace_key, &user_eid, &workspace_eid);
-
-    BootstrapChain {
-        workspace_key,
-        workspace_eid,
-        workspace_id,
-        invite_key,
-        user_invite_eid,
-        user_key,
-        user_eid,
-        device_invite_key,
-        device_invite_eid,
-        peer_shared_key,
-        peer_shared_eid,
-        admin_key,
-        admin_eid,
-        invite_accepted_eid,
-    }
-}
-
-struct JoinChain {
-    invite_key: ed25519_dalek::SigningKey,
-    user_invite_eid: [u8; 32],
-    user_key: ed25519_dalek::SigningKey,
-    user_eid: [u8; 32],
-    device_invite_key: ed25519_dalek::SigningKey,
-    device_invite_eid: [u8; 32],
-    peer_shared_key: ed25519_dalek::SigningKey,
-    peer_shared_eid: [u8; 32],
-    invite_accepted_eid: [u8; 32],
-}
-
-fn join_workspace(joiner: &Peer, alice_chain: &BootstrapChain, alice: &Peer) -> JoinChain {
-    use ed25519_dalek::SigningKey;
-
-    let mut rng = rand::thread_rng();
-
-    // Alice creates a UserInvite for the joiner (signed by workspace).
-    let invite_key = SigningKey::generate(&mut rng);
-    let invite_pubkey = invite_key.verifying_key().to_bytes();
-    let user_invite_eid = alice.create_user_invite_with_key(
-        invite_pubkey,
-        &alice_chain.workspace_key,
-        &alice_chain.workspace_eid,
-    );
-
-    // Joiner accepts the invite (local event, binds trust anchor to Alice's workspace_id)
-    let invite_accepted_eid =
-        joiner.create_invite_accepted(&user_invite_eid, alice_chain.workspace_id);
-
-    // Joiner creates User (signed by the invite key Alice gave)
-    let user_key = SigningKey::generate(&mut rng);
-    let user_pubkey = user_key.verifying_key().to_bytes();
-    let user_eid = joiner.create_user(user_pubkey, &invite_key, &user_invite_eid);
-
-    // Joiner creates DeviceInvite (signed by joiner's user key)
-    let device_invite_key = SigningKey::generate(&mut rng);
-    let device_invite_pubkey = device_invite_key.verifying_key().to_bytes();
-    let device_invite_eid = joiner.create_device_invite(device_invite_pubkey, &user_key, &user_eid);
-
-    // Joiner creates PeerShared (signed by device invite)
-    let peer_shared_key = SigningKey::generate(&mut rng);
-    let peer_shared_pubkey = peer_shared_key.verifying_key().to_bytes();
-    let peer_shared_eid = joiner.create_peer_shared(
-        peer_shared_pubkey,
-        &device_invite_key,
-        &device_invite_eid,
-        &user_eid,
-    );
-
-    JoinChain {
-        invite_key,
-        user_invite_eid,
-        user_key,
-        user_eid,
-        device_invite_key,
-        device_invite_eid,
-        peer_shared_key,
-        peer_shared_eid,
-        invite_accepted_eid,
-    }
-}
+use topo::testutil::{
+    assert_eventually, create_dynamic_endpoint_for_peer, start_peers, Peer, ScenarioHarness,
+};
+use topo::transport::multi_workspace::transport_sni;
 
 async fn assert_direct_message_exchange(
     peer_a: &Peer,
@@ -161,7 +21,7 @@ async fn assert_direct_message_exchange(
     let peer_b_event = peer_b.create_message(peer_b_marker);
     let peer_b_event_b64 = event_id_to_base64(&peer_b_event);
 
-    let _sync = start_peers_pinned(peer_a, peer_b);
+    let _sync = start_peers(peer_a, peer_b);
     assert_eventually(
         || peer_a.has_event(&peer_b_event_b64) && peer_b.has_event(&peer_a_event_b64),
         timeout,
@@ -172,39 +32,21 @@ async fn assert_direct_message_exchange(
 
 #[tokio::test]
 async fn test_two_peer_identity_join_and_sync() {
-    let alice = Peer::new("alice");
-    let bob = Peer::new("bob");
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
 
-    // Alice bootstraps her full identity chain
-    let alice_chain = bootstrap_peer(&alice);
+    let _sync = start_peers(&alice, &bob);
 
-    // Alice creates a UserInvite for Bob
-    // Bob needs the invite to exist on Alice's side; sync will deliver it
-    let _bob_join = join_workspace(&bob, &alice_chain, &alice);
-
-    // Sync — shared events flow between peers
-    let sync = start_peers_pinned(&alice, &bob);
-
-    // Wait for convergence on projected identity state, not raw event counts
     assert_eventually(
         || alice.peer_shared_count() == 2 && bob.peer_shared_count() == 2,
-        Duration::from_secs(15),
+        Duration::from_secs(20),
         "both peers should converge on 2 peers_shared",
     )
     .await;
 
-    drop(sync);
-
-    // Both peers should have projected the same identity state:
-    // - 1 workspace
-    // - 2 user_invites (boot + ongoing)
-    // - 2 users (Alice's + Bob's)
-    // - 2 device_invites
-    // - 2 peers_shared
-    // - 1 admin (Alice's)
     assert_eq!(
         alice.workspace_count(),
         1,
@@ -215,29 +57,44 @@ async fn test_two_peer_identity_join_and_sync() {
         1,
         "Bob should have 1 trust-anchored workspace"
     );
-
     assert_eq!(
         alice.user_invite_count(),
         2,
-        "Alice: boot + ongoing invites"
+        "Alice should see bootstrap + join invite"
     );
-    assert_eq!(bob.user_invite_count(), 2, "Bob: boot + ongoing invites");
-
-    assert_eq!(alice.user_count(), 2, "Alice sees 2 users");
-    assert_eq!(bob.user_count(), 2, "Bob sees 2 users");
-
+    assert_eq!(
+        bob.user_invite_count(),
+        2,
+        "Bob should see bootstrap + accepted invite"
+    );
+    assert_eq!(alice.user_count(), 2, "Alice should see both users");
+    assert_eq!(bob.user_count(), 2, "Bob should see both users");
     assert_eq!(
         alice.device_invite_count(),
         2,
-        "Alice sees 2 device invites"
+        "Alice should see both device invites"
     );
-    assert_eq!(bob.device_invite_count(), 2, "Bob sees 2 device invites");
-
-    assert_eq!(alice.peer_shared_count(), 2, "Alice sees 2 peers_shared");
-    assert_eq!(bob.peer_shared_count(), 2, "Bob sees 2 peers_shared");
-
-    assert_eq!(alice.admin_count(), 1, "Alice sees 1 admin");
-    assert_eq!(bob.admin_count(), 1, "Bob sees 1 admin");
+    assert_eq!(
+        bob.device_invite_count(),
+        2,
+        "Bob should see both device invites"
+    );
+    assert_eq!(
+        alice.peer_shared_count(),
+        2,
+        "Alice should see both peer_shared rows"
+    );
+    assert_eq!(
+        bob.peer_shared_count(),
+        2,
+        "Bob should see both peer_shared rows"
+    );
+    assert_eq!(
+        alice.admin_count(),
+        1,
+        "Alice should see the workspace admin"
+    );
+    assert_eq!(bob.admin_count(), 1, "Bob should see the workspace admin");
 
     // Replay invariants hold for both peers
     harness.finish();
@@ -248,77 +105,47 @@ async fn test_two_peer_identity_join_and_sync() {
 /// Alice's events, which unblock Bob's chain via cascade.
 #[tokio::test]
 async fn test_identity_cascade_via_sync() {
-    let alice = Peer::new("alice");
-    let bob = Peer::new("bob");
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
+    harness.track(&alice);
     harness.track(&bob);
 
-    // Alice bootstraps
-    let alice_chain = bootstrap_peer(&alice);
+    let bob_peer_shared_eid = bob
+        .peer_shared_event_id
+        .expect("joined peer should materialize peer_shared during invite acceptance");
+    let bob_peer_shared_b64 = event_id_to_base64(&bob_peer_shared_eid);
 
-    // Alice creates an invite for Bob on her side
-    let mut rng = rand::thread_rng();
-    let invite_key = ed25519_dalek::SigningKey::generate(&mut rng);
-    let invite_pubkey = invite_key.verifying_key().to_bytes();
-    let user_invite_eid = alice.create_user_invite_with_key(
-        invite_pubkey,
-        &alice_chain.workspace_key,
-        &alice_chain.workspace_eid,
-    );
-
-    // Bob accepts the invite locally — this sets his trust anchor
-    let _ia_eid = bob.create_invite_accepted(&user_invite_eid, alice_chain.workspace_id);
-
-    // Bob creates User signed by the invite — but the invite event is on
-    // Alice's side, not Bob's. So this will block on the signed_by dep.
-    let _user_key = ed25519_dalek::SigningKey::generate(&mut rng);
-    let user_pubkey = _user_key.verifying_key().to_bytes();
-    let user_eid = bob.create_user(user_pubkey, &invite_key, &user_invite_eid);
-    let user_eid_b64 = event_id_to_base64(&user_eid);
-
-    // Confirm User is blocked before sync
-    assert_eq!(
-        bob.user_count(),
-        0,
-        "Bob's User should be blocked (missing signer dep)"
-    );
-    assert!(bob.blocked_dep_count() > 0, "Bob should have blocked deps");
-
-    // Sync — Alice's events flow to Bob, unblocking the cascade
-    let sync = start_peers_pinned(&alice, &bob);
-
-    // Wait for Bob's specific User event to become valid, not just any user
+    let _sync = start_peers(&alice, &bob);
     assert_eventually(
         || {
-            let db = open_connection(&bob.db_path).unwrap();
+            let db = open_connection(&alice.db_path).unwrap();
             let valid: bool = db
                 .query_row(
                     "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-                    rusqlite::params![&bob.identity, &user_eid_b64],
+                    rusqlite::params![&alice.identity, &bob_peer_shared_b64],
                     |row| row.get(0),
                 )
                 .unwrap_or(false);
             valid
         },
-        Duration::from_secs(15),
-        "Bob's specific User should cascade to valid after sync",
+        Duration::from_secs(20),
+        "Bob's peer_shared should become valid on Alice after sync",
     )
     .await;
 
-    drop(sync);
-
-    // Bob should now have Alice's full identity chain projected plus his own user
     assert_eq!(
-        bob.workspace_count(),
-        1,
-        "Bob should have Alice's workspace"
-    );
-    assert_eq!(bob.user_invite_count(), 2, "Bob should have both invites");
-    assert_eq!(
-        bob.user_count(),
+        alice.peer_shared_count(),
         2,
-        "Both Alice's and Bob's users should be valid"
+        "Alice should now project Bob's peer_shared"
     );
+    assert_eq!(
+        bob.peer_shared_count(),
+        2,
+        "Bob should retain both peer_shared rows"
+    );
+    assert_eq!(alice.user_count(), 2, "Alice should now project Bob's user");
+    assert_eq!(bob.user_count(), 2, "Bob should retain both users");
 
     harness.finish();
 }
@@ -327,56 +154,36 @@ async fn test_identity_cascade_via_sync() {
 /// full trust chain enables the messaging layer to work across peers.
 #[tokio::test]
 async fn test_identity_then_messaging() {
-    let mut alice = Peer::new("alice");
-    let mut bob = Peer::new("bob");
-
-    // Both peers establish identity on the same network
-    let alice_chain = bootstrap_peer(&alice);
-    let bob_join = join_workspace(&bob, &alice_chain, &alice);
-
-    // Set signing keys, author_id, and workspace_id so create_message works
-    alice.workspace_id = alice_chain.workspace_id;
-    alice.peer_shared_event_id = Some(alice_chain.peer_shared_eid);
-    alice.peer_shared_signing_key = Some(alice_chain.peer_shared_key.clone());
-    alice.author_id = alice_chain.user_eid;
-    bob.workspace_id = alice_chain.workspace_id;
-    bob.peer_shared_event_id = Some(bob_join.peer_shared_eid);
-    bob.peer_shared_signing_key = Some(bob_join.peer_shared_key.clone());
-    bob.author_id = bob_join.user_eid;
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
 
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
 
-    // Sync identity events first
-    let sync = start_peers_pinned(&alice, &bob);
+    let _sync = start_peers(&alice, &bob);
     assert_eventually(
         || alice.peer_shared_count() == 2 && bob.peer_shared_count() == 2,
-        Duration::from_secs(15),
+        Duration::from_secs(20),
         "identity should converge",
     )
     .await;
-    drop(sync);
 
-    // Both peers need the same content key to decrypt each other's messages.
     let shared_key_bytes: [u8; 32] = [42u8; 32];
     let shared_ts = 1_000_000_000_000u64;
     alice.create_key_secret_deterministic(shared_key_bytes, shared_ts);
     bob.create_key_secret_deterministic(shared_key_bytes, shared_ts);
 
-    // Now both peers send messages
     alice.create_message("Hello from Alice");
     bob.create_message("Hello from Bob");
 
-    // Sync messages
-    let sync = start_peers_pinned(&alice, &bob);
+    let _sync = start_peers(&alice, &bob);
     assert_eventually(
         || alice.scoped_message_count() == 2 && bob.scoped_message_count() == 2,
-        Duration::from_secs(15),
+        Duration::from_secs(20),
         "messages should converge after identity sync",
     )
     .await;
-    drop(sync);
 
     harness.finish();
 }
@@ -385,89 +192,42 @@ async fn test_identity_then_messaging() {
 /// for Laptop, Laptop joins with PeerShared, both sync and converge.
 #[tokio::test]
 async fn test_device_link_via_sync() {
-    use topo::event_modules::{DeviceInviteEvent, ParsedEvent, PeerSharedEvent};
-    use topo::projection::create::{create_signed_event_staged, create_signed_event_synchronous};
-
-    let phone = Peer::new("phone");
-    let laptop = Peer::new("laptop");
+    let phone = Peer::new_with_identity("phone");
+    let laptop = Peer::new_device_in_workspace("laptop", &phone).await;
     let harness = ScenarioHarness::new();
     harness.track(&phone);
     harness.track(&laptop);
 
-    let mut rng = rand::thread_rng();
-
-    // Phone bootstraps full identity chain
-    let phone_chain = bootstrap_peer(&phone);
-
-    // Phone creates a DeviceInvite for Laptop (signed by Phone's User key).
-    let laptop_di_key = ed25519_dalek::SigningKey::generate(&mut rng);
-    let laptop_di_pubkey = laptop_di_key.verifying_key().to_bytes();
-    let db = open_connection(&phone.db_path).unwrap();
-    let di_evt = ParsedEvent::DeviceInvite(DeviceInviteEvent {
-        created_at_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64,
-        public_key: laptop_di_pubkey,
-        authority_event_id: phone_chain.user_eid,
-        signed_by: phone_chain.user_eid,
-        signer_type: 4,
-        signature: [0u8; 64],
-    });
-    let laptop_di_eid =
-        create_signed_event_synchronous(&db, &phone.identity, &di_evt, &phone_chain.user_key)
-            .expect("create device_invite");
-    drop(db);
-
-    // Laptop accepts the invite (local, sets trust anchor)
-    let _ia_eid = laptop.create_invite_accepted(&laptop_di_eid, phone_chain.workspace_id);
-
-    // Laptop creates PeerShared (signed by the device invite key Phone gave).
-    // This will be blocked because the signed_by dep (DeviceInvite) is on Phone.
-    // Use staged API since blocking is expected (dep will arrive via sync).
-    let laptop_ps_key = ed25519_dalek::SigningKey::generate(&mut rng);
-    let laptop_ps_pubkey = laptop_ps_key.verifying_key().to_bytes();
-    let db = open_connection(&laptop.db_path).unwrap();
-    let ps_evt = ParsedEvent::PeerShared(PeerSharedEvent {
-        created_at_ms: std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_millis() as u64,
-        public_key: laptop_ps_pubkey,
-        user_event_id: phone_chain.user_eid,
-        device_name: "laptop".to_string(),
-        signed_by: laptop_di_eid,
-        signer_type: 3,
-        signature: [0u8; 64],
-    });
-    let _laptop_ps_eid = create_signed_event_staged(&db, &laptop.identity, &ps_evt, &laptop_di_key)
-        .expect("create peer_shared");
-    drop(db);
-
-    // Laptop's PeerShared is blocked — signed_by dep (DeviceInvite) is on Phone
-    assert_eq!(
-        laptop.peer_shared_count(),
-        0,
-        "Laptop's peer_shared should be blocked before sync"
-    );
-
-    // Sync — Phone's events flow to Laptop, unblocking Laptop's chain
-    let sync = start_peers_pinned(&phone, &laptop);
-
+    let _sync = start_peers(&phone, &laptop);
     assert_eventually(
         || phone.peer_shared_count() == 2 && laptop.peer_shared_count() == 2,
-        Duration::from_secs(15),
+        Duration::from_secs(20),
         "both devices should see 2 peers_shared after sync",
     )
     .await;
 
-    drop(sync);
-
-    // Both devices share the same trust-anchored workspace and identity state.
     assert_eq!(phone.workspace_count(), 1);
     assert_eq!(laptop.workspace_count(), 1);
-    assert_eq!(phone.device_invite_count(), 2, "Phone: first + ongoing");
-    assert_eq!(laptop.device_invite_count(), 2, "Laptop: first + ongoing");
+    assert_eq!(
+        phone.user_count(),
+        1,
+        "linked devices should share one user"
+    );
+    assert_eq!(
+        laptop.user_count(),
+        1,
+        "linked devices should share one user"
+    );
+    assert_eq!(
+        phone.device_invite_count(),
+        2,
+        "phone should see bootstrap + link device invites"
+    );
+    assert_eq!(
+        laptop.device_invite_count(),
+        2,
+        "laptop should see bootstrap + link device invites"
+    );
 
     harness.finish();
 }
@@ -487,8 +247,8 @@ async fn test_three_peer_user_invites_enable_direct_sync_between_non_inviters() 
 
     // Phase 1: Alice syncs separately with Bob and Carol so both learn the
     // third peer's identity chain through ordinary workspace sync.
-    let _sync_ab = start_peers_pinned(&alice, &bob);
-    let _sync_ac = start_peers_pinned(&alice, &carol);
+    let _sync_ab = start_peers(&alice, &bob);
+    let _sync_ac = start_peers(&alice, &carol);
 
     assert_eventually(
         || {
@@ -511,7 +271,7 @@ async fn test_three_peer_user_invites_enable_direct_sync_between_non_inviters() 
     let carol_marker = carol.create_message("carol-direct-to-bob");
     let carol_marker_b64 = event_id_to_base64(&carol_marker);
 
-    let _sync_bc = start_peers_pinned(&bob, &carol);
+    let _sync_bc = start_peers(&bob, &carol);
     assert_eventually(
         || bob.has_event(&carol_marker_b64) && carol.has_event(&bob_marker_b64),
         Duration::from_secs(20),
@@ -537,8 +297,8 @@ async fn test_three_peer_device_link_then_user_invite_from_linked_device() {
 
     // Phase 1: the original device and linked device converge, then the linked
     // device relays Bob's identity chain into the workspace.
-    let _sync_phone_laptop = start_peers_pinned(&phone, &laptop);
-    let _sync_laptop_bob = start_peers_pinned(&laptop, &bob);
+    let _sync_phone_laptop = start_peers(&phone, &laptop);
+    let _sync_laptop_bob = start_peers(&laptop, &bob);
 
     assert_eventually(
         || {
@@ -570,7 +330,7 @@ async fn test_three_peer_device_link_then_user_invite_from_linked_device() {
     let bob_marker = bob.create_message("bob-direct-to-phone");
     let bob_marker_b64 = event_id_to_base64(&bob_marker);
 
-    let _sync_phone_bob = start_peers_pinned(&phone, &bob);
+    let _sync_phone_bob = start_peers(&phone, &bob);
     assert_eventually(
         || phone.has_event(&bob_marker_b64) && bob.has_event(&phone_marker_b64),
         Duration::from_secs(20),
@@ -728,8 +488,8 @@ async fn test_three_peer_user_invite_then_inviter_links_second_device() {
     harness.track(&bob);
     harness.track(&alice_laptop);
 
-    let _sync_alice_bob = start_peers_pinned(&alice_phone, &bob);
-    let _sync_alice_devices = start_peers_pinned(&alice_phone, &alice_laptop);
+    let _sync_alice_bob = start_peers(&alice_phone, &bob);
+    let _sync_alice_devices = start_peers(&alice_phone, &alice_laptop);
 
     assert_eventually(
         || {
@@ -800,8 +560,8 @@ async fn test_three_peer_chained_device_links_enable_direct_sync_between_root_an
     harness.track(&laptop);
     harness.track(&tablet);
 
-    let _sync_phone_laptop = start_peers_pinned(&phone, &laptop);
-    let _sync_laptop_tablet = start_peers_pinned(&laptop, &tablet);
+    let _sync_phone_laptop = start_peers(&phone, &laptop);
+    let _sync_laptop_tablet = start_peers(&laptop, &tablet);
 
     assert_eventually(
         || {
@@ -871,8 +631,8 @@ async fn test_three_peer_parallel_device_links_enable_direct_sync_between_non_in
     harness.track(&laptop);
     harness.track(&tablet);
 
-    let _sync_phone_laptop = start_peers_pinned(&phone, &laptop);
-    let _sync_phone_tablet = start_peers_pinned(&phone, &tablet);
+    let _sync_phone_laptop = start_peers(&phone, &laptop);
+    let _sync_phone_tablet = start_peers(&phone, &tablet);
 
     assert_eventually(
         || {
@@ -934,66 +694,71 @@ async fn test_three_peer_parallel_device_links_enable_direct_sync_between_non_in
 /// state is corrupted.
 #[tokio::test]
 async fn test_foreign_workspace_rejected_via_sync() {
-    let alice = Peer::new("alice");
-    let bob = Peer::new("bob");
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_with_identity("bob");
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
 
-    // Both bootstrap independently on DIFFERENT workspaces
-    let alice_chain = bootstrap_peer(&alice);
-    let bob_chain = bootstrap_peer(&bob);
-
-    // Sanity: different workspace_ids
     assert_ne!(
-        alice_chain.workspace_id, bob_chain.workspace_id,
+        alice.workspace_id, bob.workspace_id,
         "workspaces should differ"
     );
-
-    // Before sync: each peer has only its own trust-anchored workspace projected.
     assert_eq!(alice.workspace_count(), 1);
     assert_eq!(bob.workspace_count(), 1);
 
-    // Sync — shared events flow between peers
-    let sync = start_peers_pinned(&alice, &bob);
+    let server_ep = create_dynamic_endpoint_for_peer(&alice);
+    let server_addr = server_ep.local_addr().expect("alice listen addr");
+    let client_ep = create_dynamic_endpoint_for_peer(&bob);
+    let server_sni = transport_sni(&alice.identity);
+    let server_ep_clone = server_ep.clone();
+    let server_accept = tokio::spawn(async move {
+        match server_ep_clone.accept().await {
+            Some(incoming) => incoming.await.err(),
+            None => None,
+        }
+    });
 
-    // Wait for events to transfer — gate on rejected events appearing
-    // (foreign workspace events get rejected by the trust anchor guard)
-    assert_eventually(
-        || alice.rejected_event_count() > 0 && bob.rejected_event_count() > 0,
-        Duration::from_secs(15),
-        "both peers should have rejected foreign workspace events",
-    )
-    .await;
+    let result = client_ep
+        .connect(server_addr, &server_sni)
+        .expect("initiate cross-workspace connect")
+        .await;
 
-    drop(sync);
+    assert!(
+        result.is_err(),
+        "cross-workspace peers should be rejected during transport handshake"
+    );
+    let server_result = server_accept.await.expect("join server accept task");
+    assert!(
+        server_result.is_some(),
+        "server should observe the failed unauthorized inbound handshake"
+    );
 
-    // Each peer should still have only its own workspace projected —
-    // the foreign bootstrap workspace event is rejected by the trust anchor guard.
     assert_eq!(
         alice.workspace_count(),
         1,
-        "Alice should still have exactly 1 workspace (foreign rejected)"
+        "Alice should retain only her workspace"
     );
     assert_eq!(
         bob.workspace_count(),
         1,
-        "Bob should still have exactly 1 workspace (foreign rejected)"
+        "Bob should retain only his workspace"
     );
-
-    // Foreign identity events should be rejected, not just blocked
-    assert!(
-        alice.rejected_event_count() > 0,
-        "Alice should have rejected foreign workspace events"
-    );
-    assert!(
-        bob.rejected_event_count() > 0,
-        "Bob should have rejected foreign workspace events"
-    );
-
-    // Each peer's own identity state is unaffected
     assert_eq!(alice.user_count(), 1, "Alice's own user unchanged");
     assert_eq!(bob.user_count(), 1, "Bob's own user unchanged");
+    assert_eq!(
+        alice.peer_shared_count(),
+        1,
+        "Alice should retain only her own peer_shared"
+    );
+    assert_eq!(
+        bob.peer_shared_count(),
+        1,
+        "Bob should retain only his own peer_shared"
+    );
+
+    server_ep.close(0u32.into(), b"done");
+    client_ep.close(0u32.into(), b"done");
 
     harness.finish();
 }

@@ -38,7 +38,7 @@ Implemented outcomes:
 1. Bootstrap and steady-state transport identities must coexist transiently because handshake trust can precede identity graph convergence.
 2. Single-endpoint + multi-tenant runtime requires transport identity checks independent of any single event lineage during ingress.
 3. Local discovery can surface peers before full identity-chain convergence, so bootstrap fallback remains required.
-4. Invite acceptance and graph sync are concurrent/distributed; a purely event-id-only transport gate cannot safely replace SPKI pinning at handshake time.
+4. Invite acceptance and graph sync are concurrent/distributed; a purely event-id-only transport gate cannot safely replace SPKI-based handshake identity checks.
 5. mTLS cannot provide two client certs in one handshake; fallback is necessarily retry-based, not a single-transaction key offer.
 
 These barriers are structural, not naming artifacts.

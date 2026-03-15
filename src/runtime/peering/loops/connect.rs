@@ -54,6 +54,7 @@ pub async fn connect_loop(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
+    target_remote_transport_fingerprint: &str,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
@@ -67,6 +68,7 @@ pub async fn connect_loop(
         recorded_by,
         endpoint,
         remote,
+        target_remote_transport_fingerprint,
         client_config,
         intro_spawner,
         ingest,
@@ -81,6 +83,7 @@ pub async fn connect_loop_with_coordination(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
+    target_remote_transport_fingerprint: &str,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
@@ -91,6 +94,7 @@ pub async fn connect_loop_with_coordination(
         recorded_by,
         endpoint,
         remote,
+        target_remote_transport_fingerprint,
         client_config,
         intro_spawner,
         ingest,
@@ -106,6 +110,7 @@ pub async fn connect_loop_with_coordination_until_cancel(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
+    target_remote_transport_fingerprint: &str,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
@@ -117,12 +122,12 @@ pub async fn connect_loop_with_coordination_until_cancel(
         recorded_by,
         endpoint,
         remote,
+        target_remote_transport_fingerprint.to_string(),
         client_config,
         intro_spawner,
         ingest,
         coordination_manager,
         shutdown,
-        None,
         None,
     )
     .await
@@ -135,6 +140,7 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
+    target_remote_transport_fingerprint: &str,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
@@ -147,12 +153,12 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
         recorded_by,
         endpoint,
         remote,
+        target_remote_transport_fingerprint.to_string(),
         client_config,
         intro_spawner,
         ingest,
         coordination_manager,
         shutdown,
-        None,
         bootstrap_fallback_client_config,
     )
     .await
@@ -163,12 +169,12 @@ pub(crate) async fn connect_loop_with_coordination_until_cancel_with_target_fing
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
+    target_remote_transport_fingerprint: String,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     coordination_manager: Arc<CoordinationManager>,
     shutdown: CancellationToken,
-    target_remote_transport_fingerprint: Option<String>,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tenants = vec![recorded_by.to_string()];
@@ -215,6 +221,7 @@ pub async fn connect_loop_with_shared_ingest(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
+    target_remote_transport_fingerprint: &str,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     coordination: Arc<crate::sync::session::coordinator::PeerCoord>,
@@ -225,6 +232,7 @@ pub async fn connect_loop_with_shared_ingest(
         recorded_by,
         endpoint,
         remote,
+        target_remote_transport_fingerprint,
         intro_spawner,
         ingest,
         coordination,
@@ -241,6 +249,7 @@ pub async fn connect_loop_with_shared_ingest_until_cancel(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
+    target_remote_transport_fingerprint: &str,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     coordination: Arc<crate::sync::session::coordinator::PeerCoord>,
@@ -262,7 +271,7 @@ pub async fn connect_loop_with_shared_ingest_until_cancel(
             shared_ingest,
             coordination,
             shutdown,
-            None,
+            target_remote_transport_fingerprint.to_string(),
             None,
         ))
         .await
@@ -278,10 +287,10 @@ async fn connect_loop_inner(
     shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
     coordination: Arc<crate::sync::session::coordinator::PeerCoord>,
     shutdown: CancellationToken,
-    target_remote_transport_fingerprint: Option<String>,
+    target_remote_transport_fingerprint: String,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let sni = outbound_sni_for_target(target_remote_transport_fingerprint.as_deref());
+    let sni = outbound_sni_for_target(&target_remote_transport_fingerprint);
     let initiator_handler = SyncSessionHandler::outbound(
         db_path.to_string(),
         SYNC_SESSION_TIMEOUT_SECS,
@@ -357,20 +366,16 @@ async fn connect_loop_inner(
         warning_gate.clear();
         let provider = dial_outcome.provider;
         let used_bootstrap_fallback = dial_outcome.used_bootstrap_fallback;
-        if let Some(expected_remote_transport_fingerprint) =
-            target_remote_transport_fingerprint.as_deref()
-        {
-            let actual_remote_transport_fingerprint = provider.peer_id().to_string();
-            if actual_remote_transport_fingerprint != expected_remote_transport_fingerprint {
-                provider
-                    .connection()
-                    .close(1u32.into(), b"wrong remote transport fingerprint");
-                return Err(ConnectionLifecycleError::DialTrustRejected(format!(
-                    "target fingerprint mismatch for {remote}: expected {} got {}",
-                    expected_remote_transport_fingerprint, actual_remote_transport_fingerprint
-                ))
-                .into());
-            }
+        let actual_remote_transport_fingerprint = provider.peer_id().to_string();
+        if actual_remote_transport_fingerprint != target_remote_transport_fingerprint {
+            provider
+                .connection()
+                .close(1u32.into(), b"wrong remote transport fingerprint");
+            return Err(ConnectionLifecycleError::DialTrustRejected(format!(
+                "target fingerprint mismatch for {remote}: expected {} got {}",
+                target_remote_transport_fingerprint, actual_remote_transport_fingerprint
+            ))
+            .into());
         }
         let connection = provider.connection();
         let peer_id = provider.peer_id().to_string();
@@ -437,7 +442,7 @@ async fn connect_loop_inner(
             shared_ingest.clone(),
         );
 
-        // Keep session scope pinned to the planner-assigned tenant.
+        // Keep session scope fixed to the planner-assigned tenant.
         // Transport cert rotation can lag tenant scoping during bootstrap.
         let tenant_resolver = SessionTenantResolver::Fixed(recorded_by.to_string());
         let max_sessions = if used_bootstrap_fallback {
@@ -462,10 +467,8 @@ async fn connect_loop_inner(
     Ok(())
 }
 
-fn outbound_sni_for_target(target_remote_transport_fingerprint: Option<&str>) -> String {
-    target_remote_transport_fingerprint
-        .map(crate::transport::multi_workspace::transport_sni)
-        .unwrap_or_else(|| "localhost".to_string())
+fn outbound_sni_for_target(target_remote_transport_fingerprint: &str) -> String {
+    crate::transport::multi_workspace::transport_sni(target_remote_transport_fingerprint)
 }
 
 /// Produce a human-readable diagnosis for a connection failure.
@@ -708,16 +711,10 @@ mod tests {
         let (_dir, _db_path) = setup_db();
         let target_peer =
             "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
-        let sni = outbound_sni_for_target(Some(&target_peer));
+        let sni = outbound_sni_for_target(&target_peer);
         assert_eq!(
             sni,
             crate::transport::multi_workspace::transport_sni(&target_peer)
         );
-    }
-
-    #[test]
-    fn outbound_sni_falls_back_to_localhost_without_target() {
-        let sni = outbound_sni_for_target(None);
-        assert_eq!(sni, "localhost");
     }
 }

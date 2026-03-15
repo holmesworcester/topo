@@ -19,8 +19,9 @@ use crate::db::{
 use crate::protocol::Frame;
 use crate::sync::{CoordinationManager, SyncSessionHandler};
 use crate::transport::{
-    dial_session_provider, read_intro_offer_frame, tenant_trusts_peer, SessionProvider,
-    TransportClientConfig, TransportConnection, TransportEndpoint,
+    dial_session_provider, multi_workspace::transport_sni, read_intro_offer_frame,
+    tenant_trusts_peer, SessionProvider, TransportClientConfig, TransportConnection,
+    TransportEndpoint,
 };
 
 const ENDPOINT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
@@ -188,9 +189,10 @@ pub async fn handle_intro_offer(
 
         // Use per-tenant config when available (node multi-tenant path).
         // Fallback to endpoint default for single-tenant test endpoints.
+        let target_sni = transport_sni(&other_peer_hex);
         match tokio::time::timeout(
             pace,
-            dial_session_provider(&endpoint, addr, "localhost", client_config.as_ref()),
+            dial_session_provider(&endpoint, addr, &target_sni, client_config.as_ref()),
         )
         .await
         {

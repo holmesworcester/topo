@@ -206,7 +206,6 @@ impl RuntimeSupervisor {
                         &tenant_ids,
                         endpoint,
                         cancel,
-                        None,
                         shared_ingest,
                         tenant_cfgs,
                         intro_spawner,
@@ -761,10 +760,7 @@ async fn run_target_dispatcher(
         let worker_cancel = shutdown.child_token();
         let target_remote_transport_fingerprint =
             target_remote_transport_fingerprint(&event.source);
-        let target_note = target_remote_transport_fingerprint
-            .as_deref()
-            .map(short_peer_id)
-            .unwrap_or("unknown");
+        let target_note = short_peer_id(&target_remote_transport_fingerprint);
         info!(
             "Spawning connect worker key={} tenant={} remote={} target={} source={:?}",
             dispatch_key,
@@ -857,7 +853,7 @@ async fn run_connect_worker(
     ingest: IngestFns,
     shutdown: CancellationToken,
     dispatch_key: String,
-    target_remote_transport_fingerprint: Option<String>,
+    target_remote_transport_fingerprint: String,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
 ) {
     let mut warning_gate = RepeatedWarningGate::new(Duration::from_secs(300));
@@ -893,12 +889,12 @@ async fn run_connect_worker(
                 &tenant_id,
                 endpoint.clone(),
                 remote,
+                target_remote_transport_fingerprint.clone(),
                 Some(current_client_config),
                 intro_spawner,
                 ingest,
                 context.coordination_manager.clone(),
                 shutdown.clone(),
-                target_remote_transport_fingerprint.clone(),
                 bootstrap_fallback_client_config.clone(),
             )
             .await;
@@ -952,13 +948,13 @@ fn short_peer_id(peer_id: &str) -> &str {
     &peer_id[..16.min(peer_id.len())]
 }
 
-fn target_remote_transport_fingerprint(source: &TargetIngressSource) -> Option<String> {
+fn target_remote_transport_fingerprint(source: &TargetIngressSource) -> String {
     match source {
         TargetIngressSource::Bootstrap {
             transport_peer_id, ..
-        } => Some(transport_peer_id.clone()),
-        TargetIngressSource::ObservedPeer { transport_peer_id } => Some(transport_peer_id.clone()),
-        TargetIngressSource::Discovery { transport_peer_id } => Some(transport_peer_id.clone()),
+        } => transport_peer_id.clone(),
+        TargetIngressSource::ObservedPeer { transport_peer_id } => transport_peer_id.clone(),
+        TargetIngressSource::Discovery { transport_peer_id } => transport_peer_id.clone(),
     }
 }
 

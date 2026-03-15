@@ -1,8 +1,11 @@
 use std::time::Duration;
 use topo::crypto::event_id_to_base64;
 use topo::db::open_connection;
-use topo::testutil::{assert_eventually, start_peers_pinned, Peer, ScenarioHarness, SharedDbNode};
-use topo::transport::extract_spki_fingerprint;
+use topo::testutil::{
+    assert_eventually, create_dynamic_endpoint_for_peer, start_peers, Peer, ScenarioHarness,
+    SharedDbNode,
+};
+use topo::transport::{extract_spki_fingerprint, multi_workspace::transport_sni};
 
 async fn assert_direct_message_exchange(
     peer_a: &Peer,
@@ -16,7 +19,7 @@ async fn assert_direct_message_exchange(
     let peer_b_event = peer_b.create_message(peer_b_marker);
     let peer_b_event_b64 = event_id_to_base64(&peer_b_event);
 
-    let _sync = start_peers_pinned(peer_a, peer_b);
+    let _sync = start_peers(peer_a, peer_b);
     assert_eventually(
         || peer_a.has_event(&peer_b_event_b64) && peer_b.has_event(&peer_a_event_b64),
         Duration::from_secs(20),
@@ -192,11 +195,11 @@ async fn test_shared_db_no_cross_tenant_leakage() {
 #[tokio::test]
 async fn test_shared_db_sync_with_external_peer() {
     let node = SharedDbNode::new(1);
-    let external = Peer::new_with_identity("external");
+    let tenant = &node.tenants[0];
+    let external = Peer::new_in_workspace("external", tenant).await;
     let harness = ScenarioHarness::new();
     harness.track_node(&node);
     harness.track(&external);
-    let tenant = &node.tenants[0];
 
     // Create messages on both sides
     tenant.batch_create_messages(2);
@@ -210,7 +213,7 @@ async fn test_shared_db_sync_with_external_peer() {
 
     // Start sync between tenant and external peer.
     // The tenant uses the shared db_path, external uses its own.
-    let _sync = start_peers_pinned(tenant, &external);
+    let _sync = start_peers(tenant, &external);
 
     assert_eventually(
         || external.has_event(&tenant_marker_b64) && tenant.has_event(&ext_marker_b64),
@@ -455,8 +458,8 @@ async fn test_shared_db_three_peer_same_workspace_real_network_direct_sync() {
     let external_marker = external.create_message("shared-db-external-marker");
     let external_marker_b64 = event_id_to_base64(&external_marker);
 
-    let _sync_root_external = start_peers_pinned(root, &external);
-    let _sync_sibling_external = start_peers_pinned(sibling, &external);
+    let _sync_root_external = start_peers(root, &external);
+    let _sync_sibling_external = start_peers(sibling, &external);
 
     assert_eventually(
         || {
@@ -500,9 +503,7 @@ async fn test_shared_db_three_peer_same_workspace_real_network_direct_sync() {
 async fn test_shared_db_three_peer_cross_workspace_real_network_isolation() {
     let node = SharedDbNode::new(2);
     let external = Peer::new_in_workspace("external", &node.tenants[0]).await;
-    let harness = ScenarioHarness::skip(
-        "cross-workspace rejection in shared-db multitenant mode intentionally records foreign event ids before projection rejects them",
-    );
+    let harness = ScenarioHarness::new();
     harness.track_node(&node);
     harness.track(&external);
 
@@ -512,7 +513,7 @@ async fn test_shared_db_three_peer_cross_workspace_real_network_isolation() {
     let external_marker = external.create_message("external-cross-workspace-marker");
     let external_marker_b64 = event_id_to_base64(&external_marker);
 
-    let _sync_a_external = start_peers_pinned(workspace_a, &external);
+    let _sync_a_external = start_peers(workspace_a, &external);
     assert_eventually(
         || workspace_a.has_event(&external_marker_b64),
         Duration::from_secs(20),
@@ -520,14 +521,31 @@ async fn test_shared_db_three_peer_cross_workspace_real_network_isolation() {
     )
     .await;
 
-    let rejected_before = workspace_b.rejected_event_count();
-    let _sync_b_external = start_peers_pinned(workspace_b, &external);
-    assert_eventually(
-        || workspace_b.rejected_event_count() > rejected_before,
-        Duration::from_secs(20),
-        "workspace B tenant should reject foreign workspace events from the external peer",
-    )
-    .await;
+    let server_ep = create_dynamic_endpoint_for_peer(&external);
+    let server_addr = server_ep.local_addr().expect("external listen addr");
+    let client_ep = create_dynamic_endpoint_for_peer(workspace_b);
+    let server_sni = transport_sni(&external.identity);
+    let server_ep_clone = server_ep.clone();
+    let server_accept = tokio::spawn(async move {
+        match server_ep_clone.accept().await {
+            Some(incoming) => incoming.await.err(),
+            None => None,
+        }
+    });
+
+    let result = client_ep
+        .connect(server_addr, &server_sni)
+        .expect("initiate cross-workspace connect")
+        .await;
+    assert!(
+        result.is_err(),
+        "isolated tenant should be rejected at transport handshake, not after sync"
+    );
+    let server_result = server_accept.await.expect("join server accept task");
+    assert!(
+        server_result.is_some(),
+        "external peer should observe the failed unauthorized inbound handshake"
+    );
 
     assert!(
         !has_valid_event(workspace_b, &external_marker_b64),
@@ -548,6 +566,9 @@ async fn test_shared_db_three_peer_cross_workspace_real_network_isolation() {
         1,
         "isolated tenant should retain only its own workspace binding",
     );
+
+    server_ep.close(0u32.into(), b"done");
+    client_ep.close(0u32.into(), b"done");
 
     harness.finish();
 }

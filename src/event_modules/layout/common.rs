@@ -63,19 +63,19 @@ pub fn encrypted_inner_wire_size(inner_type_code: u8) -> Option<usize> {
     use super::super::workspace::WORKSPACE_WIRE_SIZE;
 
     match inner_type_code {
-        1 => Some(MESSAGE_WIRE_SIZE),                 // Message
-        2 => Some(REACTION_WIRE_SIZE),                // Reaction
-        7 => Some(MESSAGE_DELETION_WIRE_SIZE),        // MessageDeletion
-        8 => Some(WORKSPACE_WIRE_SIZE),               // Workspace
-        10 => Some(USER_INVITE_WIRE_SIZE),            // UserInvite
-        12 => Some(DEVICE_INVITE_WIRE_SIZE),          // DeviceInvite
-        14 => Some(USER_WIRE_SIZE),                   // User
-        16 => Some(PEER_SHARED_WIRE_SIZE),            // PeerShared
-        18 => Some(ADMIN_WIRE_SIZE),                  // Admin
-        22 => Some(KEY_SHARED_WIRE_SIZE),             // KeyShared
-        24 => Some(FILE_WIRE_SIZE),                   // File
-        25 => Some(FILE_SLICE_WIRE_SIZE),             // FileSlice
-        26 => Some(BENCH_DEP_WIRE_SIZE),              // BenchDep
+        1 => Some(MESSAGE_WIRE_SIZE),          // Message
+        2 => Some(REACTION_WIRE_SIZE),         // Reaction
+        7 => Some(MESSAGE_DELETION_WIRE_SIZE), // MessageDeletion
+        8 => Some(WORKSPACE_WIRE_SIZE),        // Workspace
+        10 => Some(USER_INVITE_WIRE_SIZE),     // UserInvite
+        12 => Some(DEVICE_INVITE_WIRE_SIZE),   // DeviceInvite
+        14 => Some(USER_WIRE_SIZE),            // User
+        16 => Some(PEER_SHARED_WIRE_SIZE),     // PeerShared
+        18 => Some(ADMIN_WIRE_SIZE),           // Admin
+        22 => Some(KEY_SHARED_WIRE_SIZE),      // KeyShared
+        24 => Some(FILE_WIRE_SIZE),            // File
+        25 => Some(FILE_SLICE_WIRE_SIZE),      // FileSlice
+        26 => Some(BENCH_DEP_WIRE_SIZE),       // BenchDep
         // Cannot encrypt: encrypted(5), key_secret(6), invite_accepted(9)
         _ => None,
     }

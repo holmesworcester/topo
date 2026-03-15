@@ -724,7 +724,6 @@ fn rpc_require_daemon(
     }
 }
 
-
 fn resolve_send_file_path(
     file: Option<String>,
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
@@ -1152,7 +1151,11 @@ fn run_sub_action(
                 }
             }
 
-            eprintln!("Watching subscription {} (poll every {}ms, Ctrl-C to stop)", &sub_id[..sub_id.len().min(12)], interval_ms);
+            eprintln!(
+                "Watching subscription {} (poll every {}ms, Ctrl-C to stop)",
+                &sub_id[..sub_id.len().min(12)],
+                interval_ms
+            );
             // Start from seq 0: drain any pending backlog first, then follow
             // new items. This avoids silent data loss when --ack is used.
             let mut cursor: i64 = 0;
@@ -1190,16 +1193,19 @@ fn run_sub_action(
                                         let author = payload["author_id"].as_str().unwrap_or("?");
                                         let author_short = &author[..author.len().min(8)];
                                         // Escape control chars so each event is one safe terminal line
-                                        let escaped: String = content.chars().map(|c| {
-                                            match c {
+                                        let escaped: String = content
+                                            .chars()
+                                            .map(|c| match c {
                                                 '\\' => "\\\\".to_string(),
                                                 '\n' => "\\n".to_string(),
                                                 '\r' => "\\r".to_string(),
                                                 '\t' => "\\t".to_string(),
-                                                c if c.is_control() => format!("\\x{:02x}", c as u32),
+                                                c if c.is_control() => {
+                                                    format!("\\x{:02x}", c as u32)
+                                                }
                                                 c => c.to_string(),
-                                            }
-                                        }).collect();
+                                            })
+                                            .collect();
                                         println!(
                                             "[seq={}] {} event={} ts={} author={} | {}",
                                             seq, etype, eid_short, ts, author_short, escaped,
@@ -1226,7 +1232,10 @@ fn run_sub_action(
                                             cursor = max_seq;
                                         }
                                         Err(e) => {
-                                            eprintln!("ack error (items will be re-delivered): {}", e);
+                                            eprintln!(
+                                                "ack error (items will be re-delivered): {}",
+                                                e
+                                            );
                                         }
                                     }
                                 } else {
@@ -1250,11 +1259,10 @@ fn run_sub_action(
                                     &sub_id[..sub_id.len().min(12)],
                                 ).into());
                             }
-                        } else if msg.contains("daemon is not running") || msg.contains("connection refused") {
-                            return Err(format!(
-                                "daemon stopped — watch exiting ({})",
-                                msg,
-                            ).into());
+                        } else if msg.contains("daemon is not running")
+                            || msg.contains("connection refused")
+                        {
+                            return Err(format!("daemon stopped — watch exiting ({})", msg,).into());
                         } else {
                             consecutive_not_found = 0;
                         }
@@ -1369,22 +1377,16 @@ fn run_event_action(
                         println!("Event display mode set to: {}", mode.as_str());
                     }
                     None => {
-                        return Err(format!(
-                            "Invalid display mode '{}'. Use: tree, list, off",
-                            m
-                        )
-                        .into());
+                        return Err(
+                            format!("Invalid display mode '{}'. Use: tree, list, off", m).into(),
+                        );
                     }
                 },
             }
             Ok(())
         }
         EventAction::Show { prefix } => {
-            let data = rpc_require_daemon(
-                db,
-                socket,
-                RpcMethod::EventShow { prefix },
-            )?;
+            let data = rpc_require_daemon(db, socket, RpcMethod::EventShow { prefix })?;
             let resp: service::EventListResponse = serde_json::from_value(data)?;
             if resp.events.is_empty() {
                 println!("No events matching that prefix.");
@@ -1397,15 +1399,8 @@ fn run_event_action(
             Ok(())
         }
         EventAction::Deps { prefix, depth } => {
-            let data = rpc_require_daemon(
-                db,
-                socket,
-                RpcMethod::EventDeps { prefix, depth },
-            )?;
-            let root_id = data["root_id"]
-                .as_str()
-                .unwrap_or("")
-                .to_string();
+            let data = rpc_require_daemon(db, socket, RpcMethod::EventDeps { prefix, depth })?;
+            let root_id = data["root_id"].as_str().unwrap_or("").to_string();
             let items: Vec<service::EventListItem> =
                 serde_json::from_value(data["events"].clone()).unwrap_or_default();
             if items.is_empty() {
@@ -2014,7 +2009,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let cli = Cli::from_arg_matches(&matches).unwrap_or_else(|err| err.exit());
     let db = &cli.db;
     let socket_override = cli.socket.clone();
-
 
     // Init tracing for commands that need it
     match &cli.command {

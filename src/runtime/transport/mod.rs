@@ -10,7 +10,6 @@ pub mod peering_boundary;
 pub mod session_factory;
 pub mod transport_session_io;
 
-pub use crate::crypto::AllowedPeers;
 pub use bootstrap_dial_context::{
     derive_bootstrap_dial_context, BootstrapDialContext, BootstrapDialMode,
 };
@@ -68,27 +67,12 @@ fn low_mem_transport_config() -> Option<Arc<TransportConfig>> {
     Some(Arc::new(transport))
 }
 
-#[derive(Clone)]
-enum AllowPolicy {
-    Static(Arc<AllowedPeers>),
-    Dynamic(Arc<DynamicAllowFn>),
-}
-
-impl std::fmt::Debug for AllowPolicy {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        match self {
-            AllowPolicy::Static(_) => f.write_str("AllowPolicy::Static"),
-            AllowPolicy::Dynamic(_) => f.write_str("AllowPolicy::Dynamic"),
-        }
-    }
-}
-
 /// Verifies peer certificates by checking SPKI fingerprint against an allowed set.
 /// Implements both ServerCertVerifier (client verifies server) and
 /// ClientCertVerifier (server verifies client).
 /// Tracks rejection counts per fingerprint for log suppression.
 pub struct PinnedCertVerifier {
-    policy: AllowPolicy,
+    allow_fn: Arc<DynamicAllowFn>,
     crypto_provider: Arc<rustls::crypto::CryptoProvider>,
     rejections: Mutex<HashMap<[u8; 32], u64>>,
 }
@@ -96,23 +80,15 @@ pub struct PinnedCertVerifier {
 impl std::fmt::Debug for PinnedCertVerifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("PinnedCertVerifier")
-            .field("policy", &self.policy)
+            .field("allow_fn", &"DynamicAllowFn")
             .finish()
     }
 }
 
 impl PinnedCertVerifier {
-    pub fn new(allowed: Arc<AllowedPeers>) -> Self {
-        Self::new_with_policy(AllowPolicy::Static(allowed))
-    }
-
     pub fn new_dynamic(allow_fn: Arc<DynamicAllowFn>) -> Self {
-        Self::new_with_policy(AllowPolicy::Dynamic(allow_fn))
-    }
-
-    fn new_with_policy(policy: AllowPolicy) -> Self {
         Self {
-            policy,
+            allow_fn,
             crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
             rejections: Mutex::new(HashMap::new()),
         }
@@ -127,15 +103,9 @@ impl PinnedCertVerifier {
             .sum()
     }
 
-    fn check_fingerprint(&self, cert_der: &CertificateDer<'_>) -> Result<(), rustls::Error> {
-        let fp = extract_spki_fingerprint(cert_der.as_ref())
-            .map_err(|e| rustls::Error::General(format!("SPKI extraction failed: {}", e)))?;
-        let allowed = match &self.policy {
-            AllowPolicy::Static(peers) => peers.contains(&fp),
-            AllowPolicy::Dynamic(check_fn) => check_fn(&fp).map_err(|e| {
-                rustls::Error::General(format!("dynamic trust check failed: {}", e))
-            })?,
-        };
+    fn verify_authorized_fingerprint(&self, fp: [u8; 32]) -> Result<(), rustls::Error> {
+        let allowed = (self.allow_fn)(&fp)
+            .map_err(|e| rustls::Error::General(format!("dynamic trust check failed: {}", e)))?;
         if allowed {
             Ok(())
         } else {
@@ -172,6 +142,45 @@ impl PinnedCertVerifier {
             )))
         }
     }
+
+    fn verified_fingerprint(
+        &self,
+        cert_der: &CertificateDer<'_>,
+    ) -> Result<[u8; 32], rustls::Error> {
+        let fp = extract_spki_fingerprint(cert_der.as_ref())
+            .map_err(|e| rustls::Error::General(format!("SPKI extraction failed: {}", e)))?;
+        self.verify_authorized_fingerprint(fp)?;
+        Ok(fp)
+    }
+
+    fn verify_expected_server_identity(
+        &self,
+        server_name: &rustls::pki_types::ServerName<'_>,
+        presented_fp: &[u8; 32],
+    ) -> Result<(), rustls::Error> {
+        let requested_sni = match server_name {
+            rustls::pki_types::ServerName::DnsName(dns_name) => dns_name.as_ref(),
+            other => {
+                return Err(rustls::Error::General(format!(
+                    "missing exact transport-target SNI: unsupported server name {other:?}"
+                )));
+            }
+        };
+        let expected = multi_workspace::parse_transport_sni(requested_sni).ok_or_else(|| {
+            rustls::Error::General(format!(
+                "missing exact transport-target SNI: requested server name '{requested_sni}' is not a transport target"
+            ))
+        })?;
+        let presented = hex::encode(presented_fp);
+        if presented == expected.transport_peer_id {
+            Ok(())
+        } else {
+            Err(rustls::Error::General(format!(
+                "{}: expected remote transport fingerprint {} but peer presented {}",
+                TRUST_REJECTION_MARKER, expected.transport_peer_id, presented
+            )))
+        }
+    }
 }
 
 impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
@@ -179,11 +188,12 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
         &self,
         end_entity: &CertificateDer<'_>,
         _intermediates: &[CertificateDer<'_>],
-        _server_name: &rustls::pki_types::ServerName<'_>,
+        server_name: &rustls::pki_types::ServerName<'_>,
         _ocsp_response: &[u8],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
-        self.check_fingerprint(end_entity)?;
+        let fp = self.verified_fingerprint(end_entity)?;
+        self.verify_expected_server_identity(server_name, &fp)?;
         Ok(rustls::client::danger::ServerCertVerified::assertion())
     }
 
@@ -233,7 +243,7 @@ impl rustls::server::danger::ClientCertVerifier for PinnedCertVerifier {
         _intermediates: &[CertificateDer<'_>],
         _now: rustls::pki_types::UnixTime,
     ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
-        self.check_fingerprint(end_entity)?;
+        self.verified_fingerprint(end_entity)?;
         Ok(rustls::server::danger::ClientCertVerified::assertion())
     }
 
@@ -272,14 +282,14 @@ impl rustls::server::danger::ClientCertVerifier for PinnedCertVerifier {
     }
 }
 
-/// Create a QUIC server endpoint with mTLS (requires client cert, verifies against allowed peers).
+/// Create a QUIC server endpoint with mTLS and dynamic projected-state trust.
 pub fn create_server_endpoint(
     bind_addr: SocketAddr,
     cert_der: CertificateDer<'static>,
     key_der: PrivatePkcs8KeyDer<'static>,
-    allowed_peers: Arc<AllowedPeers>,
+    allow_fn: Arc<DynamicAllowFn>,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
-    let verifier = Arc::new(PinnedCertVerifier::new(allowed_peers));
+    let verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn));
 
     let server_crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier)
@@ -296,14 +306,14 @@ pub fn create_server_endpoint(
     Ok(endpoint)
 }
 
-/// Create a QUIC client endpoint with mTLS (presents client cert, verifies server against allowed peers).
+/// Create a QUIC client endpoint with mTLS and dynamic projected-state trust.
 pub fn create_client_endpoint(
     bind_addr: SocketAddr,
     cert_der: CertificateDer<'static>,
     key_der: PrivatePkcs8KeyDer<'static>,
-    allowed_peers: Arc<AllowedPeers>,
+    allow_fn: Arc<DynamicAllowFn>,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
-    let verifier = Arc::new(PinnedCertVerifier::new(allowed_peers));
+    let verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn));
 
     let crypto = rustls::ClientConfig::builder()
         .dangerous()
@@ -323,17 +333,17 @@ pub fn create_client_endpoint(
 }
 
 /// Create a dual-role QUIC endpoint that can both accept and connect.
-/// Both roles use mTLS with the same identity and trust set.
+/// Both roles use mTLS with the same identity and dynamic trust policy.
 /// This is required for hole punching: the same UDP socket must be used
 /// for outbound connect() and inbound accept() so NAT mappings align.
 pub fn create_dual_endpoint(
     bind_addr: SocketAddr,
     cert_der: CertificateDer<'static>,
     key_der: PrivatePkcs8KeyDer<'static>,
-    allowed_peers: Arc<AllowedPeers>,
+    allow_fn: Arc<DynamicAllowFn>,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
     // Server-side config (for accepting incoming connections)
-    let server_verifier = Arc::new(PinnedCertVerifier::new(allowed_peers.clone()));
+    let server_verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn.clone()));
     let server_crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(server_verifier)
         .with_single_cert(vec![cert_der.clone()], key_der.clone_key().into())?;
@@ -345,7 +355,7 @@ pub fn create_dual_endpoint(
     }
 
     // Client-side config (for outbound connections)
-    let client_verifier = Arc::new(PinnedCertVerifier::new(allowed_peers));
+    let client_verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn));
     let client_crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(client_verifier)
@@ -496,33 +506,25 @@ pub fn workspace_client_config(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use rustls::client::danger::ServerCertVerifier;
 
     #[test]
-    fn test_pinned_verifier_accepts_allowed_cert() {
+    fn test_dynamic_verifier_accepts_allowed_cert() {
         let (cert, _) = generate_self_signed_cert().unwrap();
         let fp = extract_spki_fingerprint(cert.as_ref()).unwrap();
-        let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![fp]));
-        let verifier = PinnedCertVerifier::new(allowed);
-        assert!(verifier.check_fingerprint(&cert).is_ok());
+        let verifier =
+            PinnedCertVerifier::new_dynamic(Arc::new(move |candidate| Ok(candidate == &fp)));
+        assert!(verifier.verified_fingerprint(&cert).is_ok());
     }
 
     #[test]
-    fn test_pinned_verifier_rejects_unknown_cert() {
+    fn test_dynamic_verifier_rejects_unknown_cert() {
         let (cert, _) = generate_self_signed_cert().unwrap();
         let (other_cert, _) = generate_self_signed_cert().unwrap();
         let fp = extract_spki_fingerprint(other_cert.as_ref()).unwrap();
-        let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![fp]));
-        let verifier = PinnedCertVerifier::new(allowed);
-        assert!(verifier.check_fingerprint(&cert).is_err());
-    }
-
-    #[test]
-    fn test_allowed_peers_from_hex() {
-        let (cert, _) = generate_self_signed_cert().unwrap();
-        let fp = extract_spki_fingerprint(cert.as_ref()).unwrap();
-        let hex_str = hex::encode(fp);
-        let allowed = AllowedPeers::from_hex_strings(&[hex_str]).unwrap();
-        assert!(allowed.contains(&fp));
+        let verifier =
+            PinnedCertVerifier::new_dynamic(Arc::new(move |candidate| Ok(candidate == &fp)));
+        assert!(verifier.verified_fingerprint(&cert).is_err());
     }
 
     #[test]
@@ -531,6 +533,25 @@ mod tests {
         let fp = extract_spki_fingerprint(cert.as_ref()).unwrap();
         let verifier =
             PinnedCertVerifier::new_dynamic(Arc::new(move |candidate| Ok(candidate == &fp)));
-        assert!(verifier.check_fingerprint(&cert).is_ok());
+        assert!(verifier.verified_fingerprint(&cert).is_ok());
+    }
+
+    #[test]
+    fn test_server_verifier_requires_exact_transport_target_sni() {
+        let (cert, _) = generate_self_signed_cert().unwrap();
+        let fp = extract_spki_fingerprint(cert.as_ref()).unwrap();
+        let expected = multi_workspace::transport_sni(&hex::encode(fp));
+        let verifier =
+            PinnedCertVerifier::new_dynamic(Arc::new(move |candidate| Ok(candidate == &fp)));
+        let server_name = rustls::pki_types::ServerName::try_from(expected).unwrap();
+        assert!(verifier
+            .verify_server_cert(
+                &cert,
+                &[],
+                &server_name,
+                &[],
+                rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(1)),
+            )
+            .is_ok());
     }
 }

@@ -381,7 +381,8 @@ mod tests {
     use crate::db::transport_creds::store_local_creds;
     use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
     use crate::transport::{
-        create_dual_endpoint, extract_spki_fingerprint, generate_self_signed_cert, AllowedPeers,
+        create_dual_endpoint, extract_spki_fingerprint, generate_self_signed_cert,
+        multi_workspace::transport_sni,
     };
 
     use super::*;
@@ -401,26 +402,33 @@ mod tests {
 
         let server_fp = extract_spki_fingerprint(server_cert.as_ref())?;
         let client_fp = extract_spki_fingerprint(client_cert.as_ref())?;
+        let server_peer_id = hex::encode(server_fp);
+        let client_peer_id = hex::encode(client_fp);
+
+        let allow_client: Arc<crate::transport::DynamicAllowFn> =
+            Arc::new(move |candidate| Ok(candidate == &client_fp));
+        let allow_server: Arc<crate::transport::DynamicAllowFn> =
+            Arc::new(move |candidate| Ok(candidate == &server_fp));
 
         let server_ep = create_dual_endpoint(
             "127.0.0.1:0".parse().unwrap(),
             server_cert,
             server_key,
-            Arc::new(AllowedPeers::from_fingerprints(vec![client_fp])),
+            allow_client,
         )?;
         let client_ep = create_dual_endpoint(
             "127.0.0.1:0".parse().unwrap(),
             client_cert,
             client_key,
-            Arc::new(AllowedPeers::from_fingerprints(vec![server_fp])),
+            allow_server,
         )?;
         let server_addr = server_ep.local_addr()?;
         Ok((
             server_ep,
             client_ep,
             server_addr,
-            hex::encode(server_fp),
-            hex::encode(client_fp),
+            server_peer_id,
+            client_peer_id,
         ))
     }
 
@@ -636,10 +644,11 @@ mod tests {
     async fn boundary_wrappers_cover_dial_accept_and_intro_roundtrip() {
         let (server_ep, client_ep, server_addr, server_peer_id, client_peer_id) =
             endpoint_pair().await.expect("endpoint pair");
+        let server_sni = transport_sni(&server_peer_id);
 
         let (accepted_res, dialed_res) = tokio::join!(
             accept_session_peer(&server_ep),
-            dial_session_peer(&client_ep, server_addr, "localhost", None)
+            dial_session_peer(&client_ep, server_addr, &server_sni, None)
         );
         let accepted = accepted_res.expect("accept").expect("accepted");
         let dialed = dialed_res.expect("dial");

@@ -323,7 +323,7 @@ abstracting over the event graph.
 | InvSPKIUniqueness | BLAKE2b-256 collision resistance: no two peers share an SPKI |
 | InvBootstrapConsumedByPeerShared | supersede_bootstrap_for_peer_shared (projection-time): bootstrap ∩ PeerShared_SPKIs = {} |
 | InvPendingConsumedByPeerShared | supersede_bootstrap_for_peer_shared (projection-time): pending ∩ PeerShared_SPKIs = {} |
-| InvTrustSetIsExactUnion | allowed_peers_from_db: UNION of PeerShared_SPKIs, invite_bootstrap_trust, pending_invite_bootstrap_trust |
+| InvTrustSetIsExactUnion | authorized_fingerprints_from_db: UNION of PeerShared_SPKIs, invite_bootstrap_trust, pending_invite_bootstrap_trust |
 | InvTrustSourcesWellFormed | All trust table rows contain valid 32-byte SPKI fingerprints |
 | InvMutualAuthSymmetry | Mutual CanAuthenticate requires both peers have active credentials |
 | InvPendingTrustOnlyOnInviter | is_local_create gate: pending bootstrap trust exists only on invite creator's trust store |

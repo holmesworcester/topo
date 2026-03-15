@@ -388,7 +388,7 @@ Transport certs are deterministically derived from PeerShared Ed25519 signing ke
 
 ## 2.1 QUIC + mTLS
 
-All peer transport uses QUIC with strict pinned mTLS.
+All peer transport uses QUIC with strict exact-fingerprint mTLS driven by projected trust rows.
 
 Rules:
 1. each daemon profile has persistent cert/private key material,
@@ -494,7 +494,7 @@ An introducer sends `IntroOffer` messages to two peers so they can attempt a dir
 
 Receiver validation:
 1. Expired offers are dropped and recorded as `expired`.
-2. Offers for untrusted peers (not in `AllowedPeers`) are rejected.
+2. Offers for peers outside the current projected authorized-fingerprint set are rejected.
 3. Duplicate `intro_id` values are silently skipped per `(recorded_by, intro_id)`.
 4. `intro_attempts` rows currently have no TTL purge; dedupe horizon is DB-retention lifetime in this POC.
 
@@ -862,7 +862,7 @@ Bootstrap trust materialization uses projector `WriteOp`s (not `EmitCommand`s):
 1. `user_invite_shared`/`peer_invite_shared` projectors write pending bootstrap trust rows when `is_local_create` and `bootstrap_context` are present,
 2. `invite_accepted` projector writes accepted bootstrap trust rows when `bootstrap_context` is present,
 3. `peer_shared` projector consumes matching bootstrap trust rows using deterministic `Delete` write-ops,
-4. trust-check functions (`is_peer_allowed`, `allowed_peers_from_db`) remain read-only.
+4. trust-check functions (`is_peer_allowed`, `authorized_fingerprints_from_db`) remain read-only.
 
 ### ContextSnapshot
 
@@ -1565,7 +1565,7 @@ This section covers the lifecycle state machine for the three trust sources: Pee
 
 Credential transition model: invite acceptance may install a bootstrap transport cert first; projection later installs the PeerShared-derived cert. Runtime enforces one-way transition (no bootstrap-after-PeerShared downgrade).
 
-Consumption: when a PeerShared event is projected, the PeerShared projector deletes matching `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` entries for that SPKI in the same projection apply transaction. This happens at projection time, not on trust check reads — trust check reads (`is_peer_allowed`, `allowed_peers_from_db`) are pure queries with no write side-effects.
+Consumption: when a PeerShared event is projected, the PeerShared projector deletes matching `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` entries for that SPKI in the same projection apply transaction. This happens at projection time, not on trust check reads — trust check reads (`is_peer_allowed`, `authorized_fingerprints_from_db`) are pure queries with no write side-effects.
 
 Lookup shape: trust queries resolve peers via projected `peers_shared.transport_fingerprint` (indexed by `(recorded_by, transport_fingerprint)`), not by runtime fallback scans over `peers_shared.public_key`.
 

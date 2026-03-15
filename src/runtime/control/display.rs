@@ -291,11 +291,7 @@ pub fn print_event_list(events: &[service::EventListItem]) {
 // ---------------------------------------------------------------------------
 
 /// Render a reverse dependency tree from a root event down through its deps.
-pub fn print_deps_tree(
-    root_id: &str,
-    all_items: &[service::EventListItem],
-    max_depth: usize,
-) {
+pub fn print_deps_tree(root_id: &str, all_items: &[service::EventListItem], max_depth: usize) {
     use std::collections::{HashMap, HashSet};
 
     let item_map: HashMap<&str, &service::EventListItem> =
@@ -372,7 +368,9 @@ fn print_dep_node<'a>(
         // Already visited — show cross-reference.
         println!(
             "{}{}{}: ({}) {} (see above)",
-            prefix, connector, field_name,
+            prefix,
+            connector,
+            field_name,
             short_id(id),
             type_display,
         );
@@ -383,7 +381,9 @@ fn print_dep_node<'a>(
         // Root event — no further deps.
         println!(
             "{}{}{}: ({}) {} \u{2190} root",
-            prefix, connector, field_name,
+            prefix,
+            connector,
+            field_name,
             short_id(id),
             type_display,
         );
@@ -403,7 +403,9 @@ fn print_dep_node<'a>(
         // Depth exceeded.
         println!(
             "{}{}{}: ({}) {} ...",
-            prefix, connector, field_name,
+            prefix,
+            connector,
+            field_name,
             short_id(id),
             type_display,
         );
@@ -412,7 +414,9 @@ fn print_dep_node<'a>(
 
     println!(
         "{}{}{}: ({}) {}",
-        prefix, connector, field_name,
+        prefix,
+        connector,
+        field_name,
         short_id(id),
         type_display,
     );

@@ -64,7 +64,7 @@ Maps each TODO section/item to file/test proof of completion.
 | Archive disclaimers | All archive docs have historical disclaimer blockquotes (35 docs including newly archived TODO4) |
 | `docs/INDEX.md` superseded table | Updated with contract file renames and symbol renames |
 | TODO.md items 1-22 | All marked DONE with evidence (items verified before this branch) |
-| TODO.md items 23-26 | Verified: `user_event_id` in PeerShared, `finish()` panic, `svc_bootstrap_workspace_conn`, `start_peers_pinned` |
+| TODO.md items 23-26 | Verified: `user_event_id` in PeerShared, `finish()` panic, `svc_bootstrap_workspace_conn`, `start_peers` |
 | This evidence matrix | `docs/planning/TODO_REMAINING_EVIDENCE.md` |
 | Feedback doc | `feedback.md`: reviewed against instructions, 4 straggler comments fixed |
 | Final audit | `codex_final_audit.md`: codex CLI review with corrected assessment |

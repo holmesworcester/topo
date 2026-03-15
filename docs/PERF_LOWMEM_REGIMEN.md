@@ -36,7 +36,7 @@ test result: FAILED. 0 passed; 1 failed; 1 ignored
 **Baseline flakiness recorded:**
 - `low_mem_ios_budget_smoke_10k` timed out at 180s waiting for sync convergence.
 - The test uses `sync_until_converged()` with a 180s timeout, which calls
-  `start_peers_pinned()` and polls store counts every 200ms.
+  `start_peers()` and polls store counts every 200ms.
 - This timeout may be caused by system load (test ran immediately after a
   full `--release` build), or by insufficient timeout for low-memory mode
   sync overhead on this hardware.

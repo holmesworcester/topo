@@ -9,7 +9,8 @@ use tracing::{info, warn};
 
 use crate::protocol::Frame;
 use crate::transport::{
-    dial_session_peer, send_intro_offer_frame, TransportConnection, TransportEndpoint,
+    dial_session_peer, multi_workspace::transport_sni, send_intro_offer_frame, TransportConnection,
+    TransportEndpoint,
 };
 
 /// Build an IntroOffer message for `recipient` about `other_peer`.
@@ -130,7 +131,7 @@ pub async fn run_intro(
     };
 
     // Send to A
-    match send_intro_to_peer(endpoint, addr_a, &offer_for_a).await {
+    match send_intro_to_peer(endpoint, addr_a, peer_a_hex, &offer_for_a).await {
         Ok(()) => {
             info!("Sent IntroOffer to peer A at {}", addr_a);
             result.sent_to_a = true;
@@ -142,7 +143,7 @@ pub async fn run_intro(
     }
 
     // Send to B
-    match send_intro_to_peer(endpoint, addr_b, &offer_for_b).await {
+    match send_intro_to_peer(endpoint, addr_b, peer_b_hex, &offer_for_b).await {
         Ok(()) => {
             info!("Sent IntroOffer to peer B at {}", addr_b);
             result.sent_to_b = true;
@@ -159,11 +160,13 @@ pub async fn run_intro(
 async fn send_intro_to_peer(
     endpoint: &TransportEndpoint,
     addr: SocketAddr,
+    target_peer_id_hex: &str,
     offer: &Frame,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let target_sni = transport_sni(target_peer_id_hex);
     let connected = tokio::time::timeout(
         Duration::from_secs(5),
-        dial_session_peer(endpoint, addr, "localhost", None),
+        dial_session_peer(endpoint, addr, &target_sni, None),
     )
     .await
     .map_err(|_| "connection timeout")??;

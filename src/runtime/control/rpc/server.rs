@@ -595,9 +595,12 @@ fn dispatch(
                     state.notify_runtime_recheck();
 
                     // Auto-create an invite with detected IPs
-                    let listen_addr = state
-                        .effective_listen_addr()
-                        .unwrap_or_else(|| SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), crate::event_modules::workspace::invite_link::DEFAULT_PORT));
+                    let listen_addr = state.effective_listen_addr().unwrap_or_else(|| {
+                        SocketAddr::new(
+                            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                            crate::event_modules::workspace::invite_link::DEFAULT_PORT,
+                        )
+                    });
                     let mut resp_json = serde_json::to_value(&resp).unwrap();
                     let bootstrap_addrs = autodetect_bootstrap_addrs(state, listen_addr);
                     match bootstrap_addrs.and_then(|addrs| {
@@ -626,14 +629,11 @@ fn dispatch(
                     }
                     let mut rpc_resp = RpcResponse::success(resp_json);
                     // Inject all created identity chain events for the new peer.
-                    if let Ok((recorded_by, db)) =
-                        service::open_db_for_peer(db_path, &resp.peer_id)
+                    if let Ok((recorded_by, db)) = service::open_db_for_peer(db_path, &resp.peer_id)
                     {
                         if let Ok(list_resp) = service::svc_event_list(&db, &recorded_by) {
                             if let Some(ref mut data) = rpc_resp.data {
-                                if let Ok(events_json) =
-                                    serde_json::to_value(&list_resp.events)
-                                {
+                                if let Ok(events_json) = serde_json::to_value(&list_resp.events) {
                                     data["created_events"] = events_json;
                                 }
                             }
@@ -1041,9 +1041,12 @@ fn dispatch(
             public_spki,
         } => match state.require_active_peer() {
             Ok(peer_id) => {
-                let listen_addr = state
-                    .effective_listen_addr()
-                    .unwrap_or_else(|| SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), crate::event_modules::workspace::invite_link::DEFAULT_PORT));
+                let listen_addr = state.effective_listen_addr().unwrap_or_else(|| {
+                    SocketAddr::new(
+                        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                        crate::event_modules::workspace::invite_link::DEFAULT_PORT,
+                    )
+                });
                 let explicit_addrs: Vec<
                     crate::event_modules::workspace::invite_link::BootstrapAddress,
                 > = match public_addr {
@@ -1179,9 +1182,12 @@ fn dispatch(
         } => {
             match state.require_active_peer() {
                 Ok(peer_id) => {
-                    let listen_addr = state
-                        .effective_listen_addr()
-                        .unwrap_or_else(|| SocketAddr::new(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED), crate::event_modules::workspace::invite_link::DEFAULT_PORT));
+                    let listen_addr = state.effective_listen_addr().unwrap_or_else(|| {
+                        SocketAddr::new(
+                            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
+                            crate::event_modules::workspace::invite_link::DEFAULT_PORT,
+                        )
+                    });
                     let explicit_addrs: Vec<crate::event_modules::workspace::invite_link::BootstrapAddress> =
                     match public_addr {
                         Some(ref addr) => {
@@ -1220,14 +1226,10 @@ fn dispatch(
                             } else {
                                 RpcResponse::success(data)
                             };
-                            if let Ok((rb, db)) =
-                                service::open_db_for_peer(db_path, &peer_id)
-                            {
-                                if let Ok(lr) = service::svc_event_list_by_ids(
-                                    &db,
-                                    &rb,
-                                    &[invite_eid_b64],
-                                ) {
+                            if let Ok((rb, db)) = service::open_db_for_peer(db_path, &peer_id) {
+                                if let Ok(lr) =
+                                    service::svc_event_list_by_ids(&db, &rb, &[invite_eid_b64])
+                                {
                                     if let Some(ref mut d) = resp.data {
                                         if let Ok(v) = serde_json::to_value(&lr.events) {
                                             d["created_events"] = v;

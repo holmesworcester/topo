@@ -1,14 +1,14 @@
 use std::time::Duration;
 use topo::crypto::{event_id_from_base64, event_id_to_base64};
 use topo::db::open_connection;
-use topo::testutil::{assert_eventually, start_peers_pinned, Peer, ScenarioHarness};
+use topo::testutil::{assert_eventually, start_peers, Peer, ScenarioHarness};
 
 /// Integration test: Alice creates message + reactions, syncs to Bob. Alice deletes message.
 /// Bob syncs again. Verify: Bob has tombstone, no message, no reactions.
 #[tokio::test]
 async fn test_deletion_sync() {
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -23,7 +23,7 @@ async fn test_deletion_sync() {
     assert_eq!(alice.reaction_count(), 1);
 
     // Sync to Bob
-    let sync = start_peers_pinned(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&msg_b64) && bob.has_event(&rxn_b64),
@@ -34,9 +34,9 @@ async fn test_deletion_sync() {
 
     drop(sync);
 
-    // Bob: Alice's events blocked (foreign signer)
-    assert_eq!(bob.message_count(), 0);
-    assert_eq!(bob.reaction_count(), 0);
+    // Same-workspace sync projects Alice's content on Bob as well.
+    assert_eq!(bob.message_count(), 1);
+    assert_eq!(bob.reaction_count(), 1);
 
     // Alice deletes the message
     let del_id = alice.create_message_deletion(&msg_id);
@@ -47,7 +47,7 @@ async fn test_deletion_sync() {
     assert_eq!(alice.deleted_message_count(), 1); // tombstone
 
     // Sync again — Bob gets the deletion event
-    let sync2 = start_peers_pinned(&alice, &bob);
+    let sync2 = start_peers(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&del_b64),
@@ -58,21 +58,21 @@ async fn test_deletion_sync() {
 
     drop(sync2);
 
-    // Bob: all of Alice's events blocked (foreign signer), including deletion
+    // Bob converges to the same final deleted state as Alice.
     assert_eq!(
         bob.message_count(),
         0,
-        "bob: no messages projected (foreign signer)"
+        "bob: deleted message should be removed after sync"
     );
     assert_eq!(
         bob.reaction_count(),
         0,
-        "bob: no reactions projected (foreign signer)"
+        "bob: cascaded reaction should be removed after sync"
     );
     assert_eq!(
         bob.deleted_message_count(),
-        0,
-        "bob: no tombstones (deletion blocked too)"
+        1,
+        "bob: deletion tombstone should project after sync"
     );
 
     harness.finish();
@@ -86,7 +86,7 @@ async fn test_deletion_sync() {
 #[tokio::test]
 async fn test_deletion_before_target_sync() {
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -100,7 +100,7 @@ async fn test_deletion_before_target_sync() {
     assert_eq!(alice.deleted_message_count(), 1); // tombstone
 
     // Sync
-    let sync = start_peers_pinned(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&del_b64),
@@ -111,12 +111,16 @@ async fn test_deletion_before_target_sync() {
 
     drop(sync);
 
-    // Bob: Alice's events blocked (foreign signer)
-    assert_eq!(bob.message_count(), 0, "bob: no messages (foreign signer)");
+    // Bob should converge to the deleted final state regardless of arrival order.
+    assert_eq!(
+        bob.message_count(),
+        0,
+        "bob: deleted message should not remain projected"
+    );
     assert_eq!(
         bob.deleted_message_count(),
-        0,
-        "bob: no tombstones (foreign signer)"
+        1,
+        "bob: deletion tombstone should project after sync"
     );
 
     harness.finish();
@@ -166,7 +170,7 @@ async fn test_encrypted_deletion() {
 #[tokio::test]
 async fn test_deletion_replay_invariants() {
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -186,7 +190,7 @@ async fn test_deletion_replay_invariants() {
     assert_eq!(alice.deleted_message_count(), 1); // msg2 tombstone
 
     // Sync to Bob
-    let sync = start_peers_pinned(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&del_b64),
@@ -197,10 +201,10 @@ async fn test_deletion_replay_invariants() {
 
     drop(sync);
 
-    // Bob: Alice's events blocked (foreign signer)
-    assert_eq!(bob.message_count(), 0);
-    assert_eq!(bob.reaction_count(), 0);
-    assert_eq!(bob.deleted_message_count(), 0);
+    // Bob should converge to Alice's final projected state.
+    assert_eq!(bob.message_count(), 1);
+    assert_eq!(bob.reaction_count(), 1);
+    assert_eq!(bob.deleted_message_count(), 1);
 
     // Run full replay invariants on both
     harness.finish();

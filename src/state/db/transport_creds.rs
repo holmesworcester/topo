@@ -171,9 +171,8 @@ pub fn list_local_peers(
 pub fn list_local_peers_with_source(
     conn: &Connection,
 ) -> Result<Vec<serde_json::Value>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut stmt = conn.prepare(
-        "SELECT peer_id, source FROM local_transport_creds ORDER BY created_at",
-    )?;
+    let mut stmt =
+        conn.prepare("SELECT peer_id, source FROM local_transport_creds ORDER BY created_at")?;
     let keys = stmt
         .query_map([], |row| {
             Ok(serde_json::json!({
@@ -284,43 +283,6 @@ pub fn discover_local_tenants(
                 peer_id: tenant_peer_id,
                 workspace_id,
                 transport_peer_id: bootstrap_peer_id,
-                cert_der,
-                key_der,
-            });
-        }
-    }
-
-    // Back-compat singleton fallback:
-    // If there is exactly one accepted tenant and one transport credential but
-    // no deterministic mapping above, preserve previous behavior.
-    if tenants.is_empty() {
-        let accepted_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM invites_accepted", [], |row| {
-                row.get(0)
-            })?;
-        let creds_count: i64 =
-            conn.query_row("SELECT COUNT(*) FROM local_transport_creds", [], |row| {
-                row.get(0)
-            })?;
-        if accepted_count == 1 && creds_count == 1 {
-            let (tenant_peer_id, workspace_id): (String, String) = conn.query_row(
-                "SELECT recorded_by, workspace_id
-                 FROM invites_accepted
-                 ORDER BY created_at ASC, event_id ASC
-                 LIMIT 1",
-                [],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            let (transport_peer_id, cert_der, key_der): (String, Vec<u8>, Vec<u8>) = conn
-                .query_row(
-                    "SELECT peer_id, cert_der, key_der FROM local_transport_creds LIMIT 1",
-                    [],
-                    |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
-                )?;
-            tenants.push(TenantInfo {
-                peer_id: tenant_peer_id,
-                workspace_id,
-                transport_peer_id,
                 cert_der,
                 key_der,
             });

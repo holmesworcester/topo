@@ -110,9 +110,12 @@ fn print_chain_message_counts(peers: &[Peer]) {
 /// Run a chain propagation benchmark.
 /// Injects `event_count` events at P0 and waits for convergence at P_{n-1}.
 async fn run_chain_bench(n: usize, event_count: usize) {
-    let peers: Vec<Peer> = (0..n)
-        .map(|i| Peer::new_with_identity(&format!("p{}", i)))
-        .collect();
+    let mut peers = Vec::with_capacity(n);
+    peers.push(Peer::new_with_identity("p0"));
+    for i in 1..n {
+        let joined = Peer::new_in_workspace(&format!("p{}", i), &peers[0]).await;
+        peers.push(joined);
+    }
 
     let gen_start = Instant::now();
     peers[0].batch_create_messages(event_count);
@@ -200,13 +203,12 @@ async fn ten_hop_chain_50k() {
 async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
     assert!(source_count >= 1, "source_count must be >= 1");
     let mut sources: Vec<Peer> = Vec::with_capacity(source_count);
-    // S0 owns canonical event generation identity chain.
     sources.push(Peer::new_with_identity("ds0"));
-    // Remaining sources are transport-only peers; clone S0 dataset into them.
     for i in 1..source_count {
-        sources.push(Peer::new(&format!("ds{}", i)));
+        let joined = Peer::new_in_workspace(&format!("ds{}", i), &sources[0]).await;
+        sources.push(joined);
     }
-    let sink = Peer::new_with_identity("dsink");
+    let sink = Peer::new_in_workspace("dsink", &sources[0]).await;
 
     // Generate events at S0 only
     let gen_start = Instant::now();
@@ -334,10 +336,13 @@ async fn run_catchup_large_file(
     total_slices: usize,
     min_contributing_sources: usize,
 ) {
-    let sources: Vec<Peer> = (0..source_count)
-        .map(|i| Peer::new_with_identity(&format!("fs{}", i)))
-        .collect();
-    let sink = Peer::new_with_identity("fsink");
+    let mut sources = Vec::with_capacity(source_count);
+    sources.push(Peer::new_with_identity("fs0"));
+    for i in 1..source_count {
+        let joined = Peer::new_in_workspace(&format!("fs{}", i), &sources[0]).await;
+        sources.push(joined);
+    }
+    let sink = Peer::new_in_workspace("fsink", &sources[0]).await;
 
     // Generate file slices at S0
     let gen_start = Instant::now();
@@ -555,10 +560,13 @@ async fn catchup_non_uniform_sources() {
     #[cfg(not(debug_assertions))]
     let unique_per_source = 200;
 
-    let sources: Vec<Peer> = (0..source_count)
-        .map(|i| Peer::new_with_identity(&format!("nu{}", i)))
-        .collect();
-    let sink = Peer::new_with_identity("nusink");
+    let mut sources = Vec::with_capacity(source_count);
+    sources.push(Peer::new_with_identity("nu0"));
+    for i in 1..source_count {
+        let joined = Peer::new_in_workspace(&format!("nu{}", i), &sources[0]).await;
+        sources.push(joined);
+    }
+    let sink = Peer::new_in_workspace("nusink", &sources[0]).await;
 
     // Create shared messages at S0
     for i in 0..shared_count {
@@ -645,10 +653,13 @@ async fn catchup_dead_peer_dropout() {
     #[cfg(not(debug_assertions))]
     let event_count = 10_000;
 
-    let sources: Vec<Peer> = (0..source_count)
-        .map(|i| Peer::new_with_identity(&format!("dp{}", i)))
-        .collect();
-    let sink = Peer::new_with_identity("dpsink");
+    let mut sources = Vec::with_capacity(source_count);
+    sources.push(Peer::new_with_identity("dp0"));
+    for i in 1..source_count {
+        let joined = Peer::new_in_workspace(&format!("dp{}", i), &sources[0]).await;
+        sources.push(joined);
+    }
+    let sink = Peer::new_in_workspace("dpsink", &sources[0]).await;
 
     // Create events at S0
     sources[0].batch_create_messages(event_count);

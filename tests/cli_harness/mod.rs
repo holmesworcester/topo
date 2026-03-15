@@ -355,12 +355,13 @@ pub fn daemon_listen_addr(db: &str) -> String {
 /// Get the daemon's transport SPKI fingerprint (first key from transport-keys).
 pub fn daemon_transport_fingerprint(db: &str) -> String {
     let socket = socket_path_for_db(db);
-    let resp =
-        topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::TransportKeys)
-            .expect("transport-keys RPC");
+    let resp = topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::TransportKeys)
+        .expect("transport-keys RPC");
     assert!(resp.ok, "transport-keys RPC returned error");
     let data = resp.data.expect("transport-keys response missing data");
-    let keys = data.as_array().expect("transport-keys response should be array");
+    let keys = data
+        .as_array()
+        .expect("transport-keys response should be array");
     assert!(!keys.is_empty(), "transport-keys returned empty list");
     keys[0]
         .get("peer_id")

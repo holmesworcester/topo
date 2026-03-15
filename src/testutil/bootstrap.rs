@@ -29,8 +29,8 @@ use crate::sync::{CoordinationManager, SyncSessionHandler};
 
 use crate::transport::identity::{load_transport_cert, load_transport_cert_required_from_db};
 use crate::transport::{
-    create_dual_endpoint, peer_identity_from_connection, AllowedPeers, DualConnection,
-    QuicTransportSessionIo,
+    create_dual_endpoint, multi_workspace::transport_sni, peer_identity_from_connection,
+    DualConnection, QuicTransportSessionIo,
 };
 
 const BOOTSTRAP_CONNECT_ATTEMPTS: usize = 5;
@@ -74,7 +74,9 @@ pub async fn bootstrap_sync_from_invite(
 
     let (_peer_id, cert, key) = load_transport_cert_required_from_db(db_path)?;
 
-    let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![*bootstrap_spki]));
+    let bootstrap_fp = *bootstrap_spki;
+    let allowed: Arc<crate::transport::DynamicAllowFn> =
+        Arc::new(move |candidate| Ok(candidate == &bootstrap_fp));
     let endpoint = create_dual_endpoint("0.0.0.0:0".parse().unwrap(), cert, key, allowed)?;
 
     info!(
@@ -88,6 +90,7 @@ pub async fn bootstrap_sync_from_invite(
     let connection = connect_bootstrap_with_retry(
         &endpoint,
         bootstrap_addr,
+        &hex::encode(bootstrap_spki),
         BOOTSTRAP_CONNECT_ATTEMPTS,
         dial_timeout_secs,
     )
@@ -154,12 +157,14 @@ pub async fn bootstrap_sync_from_invite(
 async fn connect_bootstrap_with_retry(
     endpoint: &quinn::Endpoint,
     bootstrap_addr: SocketAddr,
+    bootstrap_peer_id: &str,
     attempts: usize,
     dial_timeout_secs: u64,
 ) -> Result<quinn::Connection, Box<dyn std::error::Error + Send + Sync>> {
     let mut last_err = String::new();
+    let bootstrap_sni = transport_sni(bootstrap_peer_id);
     for attempt in 1..=attempts {
-        let connecting = match endpoint.connect(bootstrap_addr, "localhost") {
+        let connecting = match endpoint.connect(bootstrap_addr, &bootstrap_sni) {
             Ok(connecting) => connecting,
             Err(e) => {
                 last_err = format!("initiate to {}: {}", bootstrap_addr, e);
@@ -222,7 +227,8 @@ pub fn start_bootstrap_responder(
     let (cert, key) = load_transport_cert(&db, inviter_identity)?;
 
     let joiner_spki = expected_invite_bootstrap_spki_from_invite_key(invite_key)?;
-    let allowed = Arc::new(AllowedPeers::from_fingerprints(vec![joiner_spki]));
+    let allowed: Arc<crate::transport::DynamicAllowFn> =
+        Arc::new(move |candidate| Ok(candidate == &joiner_spki));
 
     let endpoint = create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert, key, allowed)?;
     let local_addr = endpoint.local_addr()?;

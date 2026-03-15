@@ -54,12 +54,10 @@ pub async fn accept_loop(
         &tenant_ids,
         endpoint,
         CancellationToken::new(),
-        None,
         shared_ingest_tx,
         std::collections::HashMap::new(),
         intro_spawner,
         ingest,
-        Some(recorded_by.to_string()),
     )
     .await
 }
@@ -77,7 +75,6 @@ pub async fn accept_loop_with_ingest(
     db_path: &str,
     tenant_peer_ids: &[String],
     endpoint: TransportEndpoint,
-    allowed_peers: Option<crate::transport::AllowedPeers>,
     shared_ingest_tx: tokio::sync::mpsc::Sender<
         crate::contracts::event_pipeline_contract::IngestItem,
     >,
@@ -90,12 +87,10 @@ pub async fn accept_loop_with_ingest(
         tenant_peer_ids,
         endpoint,
         CancellationToken::new(),
-        allowed_peers,
         shared_ingest_tx,
         tenant_client_configs,
         intro_spawner,
         ingest,
-        None,
     )
     .await
 }
@@ -107,7 +102,6 @@ pub async fn accept_loop_with_ingest_until_cancel(
     tenant_peer_ids: &[String],
     endpoint: TransportEndpoint,
     shutdown: CancellationToken,
-    _allowed_peers: Option<crate::transport::AllowedPeers>,
     shared_ingest_tx: tokio::sync::mpsc::Sender<
         crate::contracts::event_pipeline_contract::IngestItem,
     >,
@@ -120,12 +114,10 @@ pub async fn accept_loop_with_ingest_until_cancel(
         tenant_peer_ids,
         endpoint,
         shutdown,
-        _allowed_peers,
         shared_ingest_tx,
         tenant_client_configs,
         intro_spawner,
         ingest,
-        None,
     )
     .await
 }
@@ -135,14 +127,12 @@ async fn accept_loop_with_ingest_until_cancel_inner(
     tenant_peer_ids: &[String],
     endpoint: TransportEndpoint,
     shutdown: CancellationToken,
-    _allowed_peers: Option<crate::transport::AllowedPeers>,
     shared_ingest_tx: tokio::sync::mpsc::Sender<
         crate::contracts::event_pipeline_contract::IngestItem,
     >,
     tenant_client_configs: std::collections::HashMap<String, TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
-    fixed_recorded_by: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     struct ConnectionWorker {
         cancel: CancellationToken,
@@ -193,26 +183,19 @@ async fn accept_loop_with_ingest_until_cancel_inner(
         // Resolve which local tenant owns this connection.
         // Always resolve via trust tables — new tenants may have been
         // registered on the live endpoint since the accept loop started.
-        let recorded_by = if let Some(recorded_by) = fixed_recorded_by.as_ref() {
-            // Single-tenant callers already selected the local tenant up front.
-            // Transport admission may come from static pinning rather than DB
-            // trust rows, so re-resolving here would incorrectly drop the
-            // connection before intro handling can record it.
-            recorded_by.clone()
-        } else {
-            match resolve_tenant_for_connection(db_path, &connection, &peer_id) {
-                Ok(rb) => rb,
-                Err(message) => {
-                    if warning_gate.should_emit(message.clone())
-                        && should_emit_globally(format!("accept:{message}"))
-                    {
-                        warn!("{}", message);
-                    }
-                    connection.close(1u32.into(), b"tenant-scoped auth failed");
-                    continue;
+        let auth_context = match resolve_inbound_auth_context(db_path, &connection, &peer_id) {
+            Ok(context) => context,
+            Err(message) => {
+                if warning_gate.should_emit(message.clone())
+                    && should_emit_globally(format!("accept:{message}"))
+                {
+                    warn!("{}", message);
                 }
+                connection.close(1u32.into(), b"tenant-scoped auth failed");
+                continue;
             }
         };
+        let recorded_by = auth_context.tenant_id.clone();
 
         // Record endpoint observation, transport binding, and purge expired
         {
@@ -359,16 +342,24 @@ fn describe_accept_failure(err: &crate::transport::ConnectionLifecycleError) -> 
     }
 }
 
-/// Resolve which local tenant should own a given inbound connection.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InboundAuthContext {
+    requested_local_transport_peer_id: String,
+    authenticated_remote_transport_peer_id: String,
+    tenant_id: String,
+}
+
+/// Resolve the authenticated inbound transport boundary context.
 ///
 /// The client must request one exact local transport fingerprint in SNI.
 /// That fingerprint is resolved to one local tenant, and authorization is
-/// checked only for that tenant.
-fn resolve_tenant_for_connection(
+/// checked only for that tenant using the authenticated remote certificate
+/// fingerprint from the completed handshake.
+fn resolve_inbound_auth_context(
     db_path: &str,
     connection: &crate::transport::TransportConnection,
     remote_peer_id: &str,
-) -> Result<String, String> {
+) -> Result<InboundAuthContext, String> {
     let requested = requested_transport_from_connection(connection).ok_or_else(|| {
         format!(
             "Rejected peer {}: missing exact transport-target SNI",
@@ -389,7 +380,7 @@ fn resolve_requested_tenant_for_peer(
     db_path: &str,
     requested: &crate::transport::multi_workspace::TransportSniTarget,
     remote_peer_id: &str,
-) -> Result<String, String> {
+) -> Result<InboundAuthContext, String> {
     let remote_fp = peer_fingerprint_from_hex(remote_peer_id).ok_or_else(|| {
         format!(
             "Rejected peer {}: invalid transport fingerprint for tenant-scoped auth",
@@ -433,7 +424,11 @@ fn resolve_requested_tenant_for_peer(
             short_peer_id(&tenant.peer_id)
         ));
     }
-    Ok(tenant.peer_id.clone())
+    Ok(InboundAuthContext {
+        requested_local_transport_peer_id: requested.transport_peer_id.clone(),
+        authenticated_remote_transport_peer_id: remote_peer_id.to_string(),
+        tenant_id: tenant.peer_id.clone(),
+    })
 }
 
 fn short_peer_id(peer_id: &str) -> &str {
@@ -521,7 +516,14 @@ mod tests {
         let resolved =
             resolve_requested_tenant_for_peer(&db_path, &requested, &hex::encode(remote_fp))
                 .unwrap();
-        assert_eq!(resolved, tenant_a);
+        assert_eq!(
+            resolved,
+            InboundAuthContext {
+                requested_local_transport_peer_id: tenant_a.clone(),
+                authenticated_remote_transport_peer_id: hex::encode(remote_fp),
+                tenant_id: tenant_a,
+            }
+        );
     }
 
     #[test]

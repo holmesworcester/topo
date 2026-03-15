@@ -11,7 +11,7 @@ use topo::testutil::{
 /// discover -> connect -> sync -> verify convergence.
 ///
 /// Uses dynamic DB trust lookup (production-matching `is_peer_allowed`).
-/// Trust comes from PeerShared-derived identity chain (no CLI pin import).
+/// Trust comes from PeerShared-derived identity chain with no manual trust seeding.
 #[cfg(feature = "discovery")]
 #[tokio::test]
 async fn test_mdns_two_peers_discover_and_sync() {
@@ -98,6 +98,7 @@ async fn test_mdns_two_peers_discover_and_sync() {
     let b_db = bob.db_path.clone();
     let b_id = bob.identity.clone();
     let remote = discovered_peer.addr;
+    let target_peer_id = alice.identity.clone();
     let _b_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -109,6 +110,7 @@ async fn test_mdns_two_peers_discover_and_sync() {
                 &b_id,
                 ep_b,
                 remote,
+                &target_peer_id,
                 None,
                 noop_intro_spawner,
                 test_ingest_fns(),
@@ -136,7 +138,7 @@ async fn test_mdns_two_peers_discover_and_sync() {
 /// node tenants), and that sync works via the discovered address.
 ///
 /// Uses dynamic DB trust lookup (production-matching `is_peer_allowed`).
-/// Trust comes from PeerShared-derived identity chain (no CLI pin import).
+/// Trust comes from PeerShared-derived identity chain with no manual trust seeding.
 #[cfg(feature = "discovery")]
 #[tokio::test]
 async fn test_mdns_multitenant_self_filtering_and_sync() {
@@ -296,6 +298,7 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
 
     let ext_db = ext.db_path.clone();
     let ext_identity = ext.identity.clone();
+    let t0_target_peer_id = t0.identity.clone();
     let _ext_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -307,6 +310,7 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
                 &ext_identity,
                 ep_ext,
                 t0_connect_addr,
+                &t0_target_peer_id,
                 None,
                 noop_intro_spawner,
                 test_ingest_fns(),

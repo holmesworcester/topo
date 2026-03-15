@@ -6,10 +6,8 @@ use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 
 pub type EventId = [u8; 32];
 
-mod allowed_peers;
 mod spki;
 
-pub use allowed_peers::AllowedPeers;
 pub use spki::spki_fingerprint_from_ed25519_pubkey;
 
 type Blake2b256 = Blake2b<U32>;

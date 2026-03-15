@@ -182,7 +182,7 @@ Phase 1 CLI/daemon shape must preserve:
 
 ### Deliverables
 
-- Peer-authenticated QUIC sessions with certificate pinning/validation policy.
+- Peer-authenticated QUIC sessions with exact transport-fingerprint validation against projected trust rows.
 - Runtime protocol messages (sync/intros/holepunch negotiation) handled outside canonical events.
 
 ### Invariants
@@ -199,7 +199,7 @@ Phase 1 CLI/daemon shape must preserve:
 
 ## 4.1 Transport status and source of truth
 
-Phase 2 transport hardening is implemented and should be maintained as strict mTLS + QUIC with pinned peer identity checks.
+Phase 2 transport hardening is implemented and should be maintained as strict mTLS + QUIC with exact transport-fingerprint checks backed by projected trust rows.
 
 Normative transport requirements now live in [DESIGN.md](./DESIGN.md):
 - transport/auth model: §2.1-§2.5,
@@ -209,10 +209,15 @@ Normative transport requirements now live in [DESIGN.md](./DESIGN.md):
 ## 4.2 Implementation focus for ongoing work
 
 When touching transport in future phases:
-1. preserve strict pinning and reject-any-untrusted behavior on both client and server,
+1. preserve strict exact-fingerprint checks and reject-any-untrusted behavior on both client and server,
 2. keep transport trust SQL-backed and projection-owned (no ad-hoc authority path),
 3. keep session identity mapping explicit (`recorded_by`, `via_peer_id`),
 4. keep cert/key materialization behind the established transport-identity contract boundary.
+
+Policy for future transport work:
+1. do not add manual peer pinning or test-only trust seeding paths,
+2. build invite/trust-graph realism before adding transport security layers so transport starts from the same authority model used in production,
+3. prefer projected trust-row queries and exact transport fingerprints over ad-hoc in-memory trust state.
 
 ### Sync session completion protocol (required)
 
@@ -1254,7 +1259,7 @@ Previous gap: TLA models were identity/event-causality models that did not encod
 
 **What remains abstract** (by design):
 - TLS handshake and session-key derivation.
-- CLI pin trust source (modeled only in Rust, not in TLA+).
+- No manual trust source; authorization is modeled as invite/bootstrap or steady-state projected trust only.
 - Event-graph causality for trust-source inputs (nondeterministic in this module; covered by EventGraphSchema.tla).
 
 Config files: `transport_credential_lifecycle_fast.cfg` (2 peers, 3 SPKIs), `transport_credential_lifecycle.cfg` (2 peers, 4 SPKIs).

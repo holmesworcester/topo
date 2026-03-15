@@ -1490,7 +1490,7 @@ fn test_cli_selected_partial_join_tenant_reports_initial_sync_errors() {
 /// Alice bootstraps identity (PeerShared self-trust makes has_any_trusted_peer true).
 /// Bob has independent identity (not in Alice's workspace). Alice should reject Bob.
 #[test]
-fn test_cli_unpinned_peer_rejected() {
+fn test_cli_untrusted_peer_rejected() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
@@ -4923,10 +4923,16 @@ fn test_cli_untrusted_peer_certificate_error() {
 fn create_subscription(db: &str, name: &str, delivery: &str) -> String {
     let out = Command::new(bin())
         .args([
-            "--db", db, "sub", "create",
-            "--name", name,
-            "--event-type", "message",
-            "--delivery", delivery,
+            "--db",
+            db,
+            "sub",
+            "create",
+            "--name",
+            name,
+            "--event-type",
+            "message",
+            "--delivery",
+            delivery,
         ])
         .output()
         .expect("sub create");
@@ -5016,10 +5022,7 @@ fn test_cli_sub_watch_streams_events_to_stdout() {
 
     // Start watch as a child process
     let mut watch = Command::new(bin())
-        .args([
-            "--db", &db, "sub", "watch", "inbox",
-            "--interval-ms", "100",
-        ])
+        .args(["--db", &db, "sub", "watch", "inbox", "--interval-ms", "100"])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
         .spawn()
@@ -5068,7 +5071,12 @@ fn test_cli_sub_watch_streams_events_to_stdout() {
 fn test_cli_sub_watch_json_output() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("watchjson.db").to_str().unwrap().to_string();
+    let db = tmpdir
+        .path()
+        .join("watchjson.db")
+        .to_str()
+        .unwrap()
+        .to_string();
 
     create_workspace(&db);
     let _daemon = start_daemon(&db);
@@ -5077,8 +5085,14 @@ fn test_cli_sub_watch_json_output() {
 
     let mut watch = Command::new(bin())
         .args([
-            "--db", &db, "sub", "watch", "json-feed",
-            "--interval-ms", "100", "--json",
+            "--db",
+            &db,
+            "sub",
+            "watch",
+            "json-feed",
+            "--interval-ms",
+            "100",
+            "--json",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -5133,7 +5147,12 @@ fn test_cli_sub_watch_json_output() {
 fn test_cli_sub_watch_ack_clears_pending() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("watchack.db").to_str().unwrap().to_string();
+    let db = tmpdir
+        .path()
+        .join("watchack.db")
+        .to_str()
+        .unwrap()
+        .to_string();
 
     create_workspace(&db);
     let _daemon = start_daemon(&db);
@@ -5142,8 +5161,14 @@ fn test_cli_sub_watch_ack_clears_pending() {
 
     let mut watch = Command::new(bin())
         .args([
-            "--db", &db, "sub", "watch", "ack-feed",
-            "--interval-ms", "100", "--ack",
+            "--db",
+            &db,
+            "sub",
+            "watch",
+            "ack-feed",
+            "--interval-ms",
+            "100",
+            "--ack",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -5190,7 +5215,13 @@ fn test_cli_sub_multiple_delivery_modes() {
     create_subscription(&db, "changed-sub", "has_changed");
 
     send_message(&db, "delivery-mode-test");
-    wait_for_sub_items(&db, "full-sub", "delivery-mode-test", 1, Duration::from_secs(5));
+    wait_for_sub_items(
+        &db,
+        "full-sub",
+        "delivery-mode-test",
+        1,
+        Duration::from_secs(5),
+    );
 
     // Full mode: should contain content
     let full_poll = Command::new(bin())
@@ -5229,7 +5260,12 @@ fn test_cli_sub_multiple_delivery_modes() {
 fn test_cli_sub_disable_enable() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("disena.db").to_str().unwrap().to_string();
+    let db = tmpdir
+        .path()
+        .join("disena.db")
+        .to_str()
+        .unwrap()
+        .to_string();
 
     create_workspace(&db);
     let _daemon = start_daemon(&db);
@@ -5263,7 +5299,13 @@ fn test_cli_sub_disable_enable() {
 
     // Send after re-enable
     send_message(&db, "after-reenable");
-    wait_for_sub_items(&db, "toggle-sub", "after-reenable", 1, Duration::from_secs(5));
+    wait_for_sub_items(
+        &db,
+        "toggle-sub",
+        "after-reenable",
+        1,
+        Duration::from_secs(5),
+    );
 }
 
 #[test]
@@ -5287,10 +5329,15 @@ fn test_cli_sub_multi_tenant_isolation() {
     // Create second workspace on the live daemon
     let create = Command::new(bin())
         .args([
-            "create-workspace", "--db", &db,
-            "--workspace-name", "beta-space",
-            "--username", "charlie",
-            "--device-name", "tablet",
+            "create-workspace",
+            "--db",
+            &db,
+            "--workspace-name",
+            "beta-space",
+            "--username",
+            "charlie",
+            "--device-name",
+            "tablet",
         ])
         .output()
         .unwrap();
@@ -5388,10 +5435,15 @@ fn test_cli_sub_watch_multi_tenant() {
     // Create second workspace on live daemon
     let create = Command::new(bin())
         .args([
-            "create-workspace", "--db", &db,
-            "--workspace-name", "beta-space",
-            "--username", "charlie",
-            "--device-name", "tablet",
+            "create-workspace",
+            "--db",
+            &db,
+            "--workspace-name",
+            "beta-space",
+            "--username",
+            "charlie",
+            "--device-name",
+            "tablet",
         ])
         .output()
         .unwrap();
@@ -5419,8 +5471,14 @@ fn test_cli_sub_watch_multi_tenant() {
 
     let mut watch = Command::new(bin())
         .args([
-            "--db", &db, "sub", "watch", "charlie-watch",
-            "--interval-ms", "100", "--ack",
+            "--db",
+            &db,
+            "sub",
+            "watch",
+            "charlie-watch",
+            "--interval-ms",
+            "100",
+            "--ack",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -5456,7 +5514,12 @@ fn test_cli_sub_watch_multi_tenant() {
 fn test_cli_sub_watch_rejects_has_changed_mode() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("hcwatch.db").to_str().unwrap().to_string();
+    let db = tmpdir
+        .path()
+        .join("hcwatch.db")
+        .to_str()
+        .unwrap()
+        .to_string();
 
     create_workspace(&db);
     let _daemon = start_daemon(&db);
@@ -5465,8 +5528,13 @@ fn test_cli_sub_watch_rejects_has_changed_mode() {
 
     let output = Command::new(bin())
         .args([
-            "--db", &db, "sub", "watch", "hc-sub",
-            "--interval-ms", "100",
+            "--db",
+            &db,
+            "sub",
+            "watch",
+            "hc-sub",
+            "--interval-ms",
+            "100",
         ])
         .output()
         .expect("sub watch has_changed");
@@ -5488,7 +5556,12 @@ fn test_cli_sub_watch_rejects_has_changed_mode() {
 fn test_cli_sub_watch_exits_on_tenant_switch() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("tswitch.db").to_str().unwrap().to_string();
+    let db = tmpdir
+        .path()
+        .join("tswitch.db")
+        .to_str()
+        .unwrap()
+        .to_string();
     let timeout = Duration::from_secs(10);
 
     create_workspace_with_details(&db, "alpha-space", "alice", "laptop");
@@ -5499,10 +5572,15 @@ fn test_cli_sub_watch_exits_on_tenant_switch() {
     // Create second workspace (auto-switches to tenant 2)
     let create = Command::new(bin())
         .args([
-            "create-workspace", "--db", &db,
-            "--workspace-name", "beta-space",
-            "--username", "charlie",
-            "--device-name", "tablet",
+            "create-workspace",
+            "--db",
+            &db,
+            "--workspace-name",
+            "beta-space",
+            "--username",
+            "charlie",
+            "--device-name",
+            "tablet",
         ])
         .output()
         .unwrap();
@@ -5542,8 +5620,13 @@ fn test_cli_sub_watch_exits_on_tenant_switch() {
 
     let mut watch = Command::new(bin())
         .args([
-            "--db", &db, "sub", "watch", "alice-watch",
-            "--interval-ms", "100",
+            "--db",
+            &db,
+            "sub",
+            "watch",
+            "alice-watch",
+            "--interval-ms",
+            "100",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -5611,7 +5694,12 @@ fn test_cli_sub_watch_exits_on_tenant_switch() {
 fn test_cli_sub_watch_drains_backlog_on_startup() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("backlog.db").to_str().unwrap().to_string();
+    let db = tmpdir
+        .path()
+        .join("backlog.db")
+        .to_str()
+        .unwrap()
+        .to_string();
 
     create_workspace(&db);
     let _daemon = start_daemon(&db);
@@ -5627,8 +5715,13 @@ fn test_cli_sub_watch_drains_backlog_on_startup() {
     // Start watch — it should drain the backlog (cursor starts at 0)
     let mut watch = Command::new(bin())
         .args([
-            "--db", &db, "sub", "watch", "backlog-feed",
-            "--interval-ms", "100",
+            "--db",
+            &db,
+            "sub",
+            "watch",
+            "backlog-feed",
+            "--interval-ms",
+            "100",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -5664,7 +5757,12 @@ fn test_cli_sub_watch_drains_backlog_on_startup() {
 fn test_cli_sub_watch_exits_on_daemon_stop() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("daemonstop.db").to_str().unwrap().to_string();
+    let db = tmpdir
+        .path()
+        .join("daemonstop.db")
+        .to_str()
+        .unwrap()
+        .to_string();
 
     create_workspace(&db);
     let daemon = start_daemon(&db);
@@ -5674,8 +5772,13 @@ fn test_cli_sub_watch_exits_on_daemon_stop() {
     // Start watch
     let mut watch = Command::new(bin())
         .args([
-            "--db", &db, "sub", "watch", "ephemeral",
-            "--interval-ms", "100",
+            "--db",
+            &db,
+            "sub",
+            "watch",
+            "ephemeral",
+            "--interval-ms",
+            "100",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -5697,13 +5800,13 @@ fn test_cli_sub_watch_exits_on_daemon_stop() {
                     !status.success(),
                     "watch should exit with error when daemon stops"
                 );
-                let output = watch.wait_with_output().unwrap_or_else(|_| {
-                    std::process::Output {
+                let output = watch
+                    .wait_with_output()
+                    .unwrap_or_else(|_| std::process::Output {
                         status,
                         stdout: vec![],
                         stderr: vec![],
-                    }
-                });
+                    });
                 let stderr = String::from_utf8_lossy(&output.stderr);
                 assert!(
                     stderr.contains("daemon stopped") || stderr.contains("daemon is not running"),
@@ -5728,7 +5831,12 @@ fn test_cli_sub_watch_exits_on_daemon_stop() {
 fn test_cli_sub_watch_escapes_multiline_content() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("multiline.db").to_str().unwrap().to_string();
+    let db = tmpdir
+        .path()
+        .join("multiline.db")
+        .to_str()
+        .unwrap()
+        .to_string();
 
     create_workspace(&db);
     let _daemon = start_daemon(&db);
@@ -5738,8 +5846,13 @@ fn test_cli_sub_watch_escapes_multiline_content() {
     // Start watch
     let mut watch = Command::new(bin())
         .args([
-            "--db", &db, "sub", "watch", "ml-feed",
-            "--interval-ms", "100",
+            "--db",
+            &db,
+            "sub",
+            "watch",
+            "ml-feed",
+            "--interval-ms",
+            "100",
         ])
         .stdout(Stdio::piped())
         .stderr(Stdio::null())
@@ -5830,7 +5943,11 @@ fn test_cli_event_display_set_and_get() {
         .expect("event display list");
     assert!(set_list.status.success());
     let stdout = String::from_utf8_lossy(&set_list.stdout);
-    assert!(stdout.contains("list"), "should confirm 'list', got:\n{}", stdout);
+    assert!(
+        stdout.contains("list"),
+        "should confirm 'list', got:\n{}",
+        stdout
+    );
 
     // Get should now return list
     let get = Command::new(bin())
@@ -5839,7 +5956,11 @@ fn test_cli_event_display_set_and_get() {
         .expect("event display get");
     assert!(get.status.success());
     let stdout = String::from_utf8_lossy(&get.stdout);
-    assert!(stdout.contains("list"), "should return 'list', got:\n{}", stdout);
+    assert!(
+        stdout.contains("list"),
+        "should return 'list', got:\n{}",
+        stdout
+    );
 
     // Set to off
     let set_off = Command::new(bin())
@@ -5855,7 +5976,11 @@ fn test_cli_event_display_set_and_get() {
         .expect("event display tree");
     assert!(set_tree.status.success());
     let stdout = String::from_utf8_lossy(&set_tree.stdout);
-    assert!(stdout.contains("tree"), "should confirm 'tree', got:\n{}", stdout);
+    assert!(
+        stdout.contains("tree"),
+        "should confirm 'tree', got:\n{}",
+        stdout
+    );
 }
 
 #[test]
@@ -6046,7 +6171,13 @@ fn test_cli_event_deps_depth_limit() {
     // depth=1 should truncate
     let d1 = Command::new(bin())
         .args([
-            "--db", &db, "event", "deps", &peer_shared_id, "--depth", "1",
+            "--db",
+            &db,
+            "event",
+            "deps",
+            &peer_shared_id,
+            "--depth",
+            "1",
         ])
         .output()
         .expect("event deps --depth 1");
@@ -6056,7 +6187,13 @@ fn test_cli_event_deps_depth_limit() {
     // depth=5 should show more
     let d5 = Command::new(bin())
         .args([
-            "--db", &db, "event", "deps", &peer_shared_id, "--depth", "5",
+            "--db",
+            &db,
+            "event",
+            "deps",
+            &peer_shared_id,
+            "--depth",
+            "5",
         ])
         .output()
         .expect("event deps --depth 5");
@@ -6104,7 +6241,11 @@ fn test_cli_send_shows_created_events_with_display_tree() {
     let stdout = String::from_utf8_lossy(&send_out.stdout);
 
     // Should contain the standard "Sent:" line
-    assert!(stdout.contains("Sent:"), "should show Sent:, got:\n{}", stdout);
+    assert!(
+        stdout.contains("Sent:"),
+        "should show Sent:, got:\n{}",
+        stdout
+    );
     // Should show the event_id line
     assert!(
         stdout.contains("event_id:"),
@@ -6147,7 +6288,11 @@ fn test_cli_send_suppressed_with_display_off() {
     let stdout = String::from_utf8_lossy(&send_out.stdout);
 
     // Should contain the standard output
-    assert!(stdout.contains("Sent:"), "should show Sent:, got:\n{}", stdout);
+    assert!(
+        stdout.contains("Sent:"),
+        "should show Sent:, got:\n{}",
+        stdout
+    );
     // Should NOT contain tree connectors or event count footer
     assert!(
         !stdout.contains("events."),
@@ -6220,10 +6365,15 @@ fn test_cli_create_workspace_shows_created_events() {
 
     let out = Command::new(bin())
         .args([
-            "--db", &db, "create-workspace",
-            "--workspace-name", "test",
-            "--username", "alice",
-            "--device-name", "dev",
+            "--db",
+            &db,
+            "create-workspace",
+            "--workspace-name",
+            "test",
+            "--username",
+            "alice",
+            "--device-name",
+            "dev",
         ])
         .output()
         .expect("create-workspace command");

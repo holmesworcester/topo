@@ -50,7 +50,7 @@ use crate::projection::create::{
     CreateEventError,
 };
 use crate::transport::identity::{ensure_transport_peer_id, load_transport_cert};
-use crate::transport::{create_dual_endpoint_dynamic, extract_spki_fingerprint, AllowedPeers};
+use crate::transport::{create_dual_endpoint_dynamic, extract_spki_fingerprint};
 use ed25519_dalek::SigningKey;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
@@ -2019,14 +2019,10 @@ pub fn verify_projection_invariants(peer: &Peer) {
 // REALISM SYNC HELPERS
 // ---------------------------------------------------------------------------
 
-/// Start continuous sync between two peers with dynamic DB trust lookup.
+/// Start sync between two peers in the same workspace with projected trust.
 ///
-/// Uses production-matching dynamic trust (`is_peer_allowed` at each TLS
-/// handshake). Automatically seeds mutual trust via CLI pin import so callers
-/// don't need to manually cross-register trust rows.
-/// Start sync between two peers in the same workspace with PeerShared-derived trust.
-/// Both peers must already have each other's PeerShared events projected (from
-/// invite-based workspace join or bootstrap). No CLI pin seeding.
+/// Both peers must already have each other's PeerShared events projected from
+/// a real invite/bootstrap flow. No synthetic trust seeding is performed.
 pub fn start_peers(
     peer_a: &Peer,
     peer_b: &Peer,
@@ -2076,6 +2072,7 @@ pub fn start_peers(
     let a_identity = peer_a.identity.clone();
     let b_db = peer_b.db_path.clone();
     let b_identity = peer_b.identity.clone();
+    let listener_peer_id = peer_a.identity.clone();
 
     let a_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2108,121 +2105,7 @@ pub fn start_peers(
                 &b_identity,
                 connector_endpoint,
                 listener_addr,
-                None,
-                noop_intro_spawner,
-                test_ingest_fns(),
-            )
-            .await
-            {
-                tracing::warn!("connect_loop exited: {}", e);
-            }
-        });
-    });
-
-    (a_handle, b_handle)
-}
-
-// PINNING BOUNDARY: uses CLI pin import for cross-workspace trust setup.
-// Use `start_peers` instead when both peers share a workspace with PeerShared-derived trust.
-pub fn start_peers_pinned(
-    peer_a: &Peer,
-    peer_b: &Peer,
-) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
-    use crate::db::transport_trust::import_cli_pins_to_sql;
-    use crate::db::transport_trust::is_peer_allowed;
-
-    let (cert_a, key_a) = peer_a.cert_and_key();
-    let (cert_b, key_b) = peer_b.cert_and_key();
-
-    let fp_a = peer_a.spki_fingerprint();
-    let fp_b = peer_b.spki_fingerprint();
-
-    // Seed mutual trust: A trusts B, B trusts A (via CLI pin import)
-    {
-        let db_a = open_connection(&peer_a.db_path).expect("failed to open A db");
-        let pins_for_a = AllowedPeers::from_fingerprints(vec![fp_b]);
-        import_cli_pins_to_sql(&db_a, &peer_a.identity, &pins_for_a)
-            .expect("failed to import pins for A");
-    }
-    {
-        let db_b = open_connection(&peer_b.db_path).expect("failed to open B db");
-        let pins_for_b = AllowedPeers::from_fingerprints(vec![fp_a]);
-        import_cli_pins_to_sql(&db_b, &peer_b.identity, &pins_for_b)
-            .expect("failed to import pins for B");
-    }
-
-    let a_db_path = peer_a.db_path.clone();
-    let a_recorded_by = peer_a.identity.clone();
-    let dynamic_allow_a: Arc<crate::transport::DynamicAllowFn> =
-        Arc::new(move |peer_fp: &[u8; 32]| {
-            let db = open_connection(&a_db_path)?;
-            is_peer_allowed(&db, &a_recorded_by, peer_fp)
-        });
-
-    let b_db_path = peer_b.db_path.clone();
-    let b_recorded_by = peer_b.identity.clone();
-    let dynamic_allow_b: Arc<crate::transport::DynamicAllowFn> =
-        Arc::new(move |peer_fp: &[u8; 32]| {
-            let db = open_connection(&b_db_path)?;
-            is_peer_allowed(&db, &b_recorded_by, peer_fp)
-        });
-
-    let listener_endpoint = create_dual_endpoint_dynamic(
-        "127.0.0.1:0".parse().unwrap(),
-        cert_a,
-        key_a,
-        dynamic_allow_a,
-    )
-    .expect("failed to create dynamic dual endpoint for A");
-
-    let listener_addr = listener_endpoint
-        .local_addr()
-        .expect("failed to get listener addr");
-
-    let connector_endpoint = create_dual_endpoint_dynamic(
-        "127.0.0.1:0".parse().unwrap(),
-        cert_b,
-        key_b,
-        dynamic_allow_b,
-    )
-    .expect("failed to create dynamic dual endpoint for B");
-
-    let a_db = peer_a.db_path.clone();
-    let a_identity = peer_a.identity.clone();
-    let b_db = peer_b.db_path.clone();
-    let b_identity = peer_b.identity.clone();
-
-    let a_handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            if let Err(e) = accept_loop(
-                &a_db,
-                &a_identity,
-                listener_endpoint,
-                noop_intro_spawner,
-                test_ingest_fns(),
-            )
-            .await
-            {
-                tracing::warn!("accept_loop exited: {}", e);
-            }
-        });
-    });
-
-    let b_handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            if let Err(e) = connect_loop(
-                &b_db,
-                &b_identity,
-                connector_endpoint,
-                listener_addr,
+                &listener_peer_id,
                 None,
                 noop_intro_spawner,
                 test_ingest_fns(),
@@ -2239,9 +2122,8 @@ pub fn start_peers_pinned(
 
 /// Start continuous sync between two peers using dynamic DB trust lookup.
 /// Trust is resolved from SQL at each TLS handshake, matching production
-/// behavior (`is_peer_allowed`). Caller must have seeded trust rows
-/// (via `import_cli_pins_to_sql`, or invite
-/// bootstrap) before peers will accept connections.
+/// behavior (`is_peer_allowed`). Caller must already have real invite/bootstrap
+/// trust or steady-state peer trust projected in SQL.
 ///
 /// REALISM HELPER: production-matching dynamic trust. Used in holepunch
 /// integration tests.
@@ -2294,6 +2176,7 @@ pub fn start_peers_dynamic(
     let a_identity = peer_a.identity.clone();
     let b_db = peer_b.db_path.clone();
     let b_identity = peer_b.identity.clone();
+    let listener_peer_id = peer_a.identity.clone();
 
     let a_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2326,6 +2209,7 @@ pub fn start_peers_dynamic(
                 &b_identity,
                 connector_endpoint,
                 listener_addr,
+                &listener_peer_id,
                 None,
                 noop_intro_spawner,
                 test_ingest_fns(),
@@ -2379,7 +2263,7 @@ pub async fn sync_until_converged<F: Fn() -> bool>(
     let b_before = peer_b.shared_store_count();
 
     let start = Instant::now();
-    let sync = start_peers_pinned(peer_a, peer_b);
+    let sync = start_peers(peer_a, peer_b);
 
     assert_eventually(check, timeout, "sync convergence").await;
 
@@ -2431,27 +2315,15 @@ where
 ///
 /// Returns thread handles for all accept and connect loops.
 pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
-    use crate::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
+    use crate::db::transport_trust::is_peer_allowed;
 
     let n = peers.len();
     assert!(n >= 2, "chain requires at least 2 peers");
-
-    // Extract fingerprints for all peers
-    let mut fingerprints: Vec<[u8; 32]> = Vec::new();
-    for peer in peers {
-        fingerprints.push(peer.spki_fingerprint());
-    }
-
-    // Seed mutual trust between adjacent peers via CLI pin import
-    for i in 0..n - 1 {
-        let db_left = open_connection(&peers[i].db_path).expect("failed to open db");
-        let pins = AllowedPeers::from_fingerprints(vec![fingerprints[i + 1]]);
-        import_cli_pins_to_sql(&db_left, &peers[i].identity, &pins).expect("failed to import pins");
-
-        let db_right = open_connection(&peers[i + 1].db_path).expect("failed to open db");
-        let pins = AllowedPeers::from_fingerprints(vec![fingerprints[i]]);
-        import_cli_pins_to_sql(&db_right, &peers[i + 1].identity, &pins)
-            .expect("failed to import pins");
+    for peer in peers.iter().skip(1) {
+        assert_eq!(
+            peer.workspace_id, peers[0].workspace_id,
+            "chain peers must share one workspace and real projected trust"
+        );
     }
 
     // Create server endpoints for peers 0..n-2 with dynamic trust
@@ -2522,6 +2394,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
         let db_path = peers[i].db_path.clone();
         let identity = peers[i].identity.clone();
         let remote = server_addrs[idx];
+        let target_peer_id = peers[idx].identity.clone();
         handles.push(std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2533,6 +2406,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
                     &identity,
                     endpoint,
                     remote,
+                    &target_peer_id,
                     None,
                     noop_intro_spawner,
                     test_ingest_fns(),
@@ -2557,27 +2431,17 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
 ///
 /// Returns thread handles for all source accept_loops and sink connect loops.
 pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::JoinHandle<()>> {
-    use crate::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
+    use crate::db::transport_trust::is_peer_allowed;
 
     assert!(!sources.is_empty(), "need at least one source");
+    for source in sources {
+        assert_eq!(
+            source.workspace_id, sink.workspace_id,
+            "sink download peers must share one workspace and real projected trust"
+        );
+    }
 
     let (sink_cert, sink_key) = sink.cert_and_key();
-    let sink_fp = sink.spki_fingerprint();
-
-    // Seed mutual trust
-    let source_fps: Vec<[u8; 32]> = sources.iter().map(|s| s.spki_fingerprint()).collect();
-    {
-        let db_sink = open_connection(&sink.db_path).expect("failed to open sink db");
-        let pins = AllowedPeers::from_fingerprints(source_fps);
-        import_cli_pins_to_sql(&db_sink, &sink.identity, &pins)
-            .expect("failed to import pins for sink");
-    }
-    for source in sources {
-        let db_src = open_connection(&source.db_path).expect("failed to open source db");
-        let pins = AllowedPeers::from_fingerprints(vec![sink_fp]);
-        import_cli_pins_to_sql(&db_src, &source.identity, &pins)
-            .expect("failed to import pins for source");
-    }
 
     let mut handles = Vec::new();
     let mut source_addrs = Vec::new();
@@ -2640,7 +2504,11 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
         )
         .expect("failed to create sink client endpoint");
 
-        sink_connectors.push((client_endpoint, source_addrs[i]));
+        sink_connectors.push((
+            client_endpoint,
+            source_addrs[i],
+            sources[i].identity.clone(),
+        ));
     }
 
     // Spawn ONE shared batch_writer for the sink so events from all sources
@@ -2667,7 +2535,9 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
     let peer_coords: Vec<_> = (0..sink_connectors.len())
         .map(|_| coord_manager.register_peer())
         .collect();
-    for ((endpoint, remote), coordination) in sink_connectors.into_iter().zip(peer_coords) {
+    for ((endpoint, remote, target_peer_id), coordination) in
+        sink_connectors.into_iter().zip(peer_coords)
+    {
         let sink_db = sink.db_path.clone();
         let sink_identity = sink.identity.clone();
         let sink_ingest = shared_tx.clone();
@@ -2682,6 +2552,7 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
                     &sink_identity,
                     endpoint,
                     remote,
+                    &target_peer_id,
                     noop_intro_spawner,
                     test_ingest_fns(),
                     coordination,
@@ -2716,27 +2587,17 @@ impl SinkDownloadHandles {
 /// Like [`start_sink_download`] but returns [`SinkDownloadHandles`] with
 /// per-source shutdown control for simulating peer dropout.
 pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkDownloadHandles {
-    use crate::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
+    use crate::db::transport_trust::is_peer_allowed;
 
     assert!(!sources.is_empty(), "need at least one source");
+    for source in sources {
+        assert_eq!(
+            source.workspace_id, sink.workspace_id,
+            "sink download peers must share one workspace and real projected trust"
+        );
+    }
 
     let (sink_cert, sink_key) = sink.cert_and_key();
-    let sink_fp = sink.spki_fingerprint();
-
-    // Seed mutual trust
-    let source_fps: Vec<[u8; 32]> = sources.iter().map(|s| s.spki_fingerprint()).collect();
-    {
-        let db_sink = open_connection(&sink.db_path).expect("failed to open sink db");
-        let pins = AllowedPeers::from_fingerprints(source_fps);
-        import_cli_pins_to_sql(&db_sink, &sink.identity, &pins)
-            .expect("failed to import pins for sink");
-    }
-    for source in sources {
-        let db_src = open_connection(&source.db_path).expect("failed to open source db");
-        let pins = AllowedPeers::from_fingerprints(vec![sink_fp]);
-        import_cli_pins_to_sql(&db_src, &source.identity, &pins)
-            .expect("failed to import pins for source");
-    }
 
     let mut handles = Vec::new();
     let mut source_addrs = Vec::new();
@@ -2800,7 +2661,11 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
         )
         .expect("failed to create sink client endpoint");
 
-        sink_connectors.push((client_endpoint, source_addrs[i]));
+        sink_connectors.push((
+            client_endpoint,
+            source_addrs[i],
+            sources[i].identity.clone(),
+        ));
     }
 
     // Shared batch_writer for the sink
@@ -2823,7 +2688,9 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
         .collect();
 
     let mut connect_shutdowns = Vec::new();
-    for ((endpoint, remote), coordination) in sink_connectors.into_iter().zip(peer_coords) {
+    for ((endpoint, remote, target_peer_id), coordination) in
+        sink_connectors.into_iter().zip(peer_coords)
+    {
         let shutdown = tokio_util::sync::CancellationToken::new();
         connect_shutdowns.push(shutdown.clone());
         let sink_db = sink.db_path.clone();
@@ -2840,6 +2707,7 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
                     &sink_identity,
                     endpoint,
                     remote,
+                    &target_peer_id,
                     noop_intro_spawner,
                     test_ingest_fns(),
                     coordination,
@@ -2860,21 +2728,11 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
 
 /// Start a sink's accept_loop and return the handle and listen address.
 ///
-/// Uses dynamic trust (`is_peer_allowed`) at each TLS handshake. The supplied
-/// `allowed_fps` are seeded as CLI pins into the sink's DB so the handshake
-/// succeeds, matching the pattern used by other topology helpers.
-pub fn start_sink_accept(
-    sink: &Peer,
-    allowed_fps: Vec<[u8; 32]>,
-) -> (std::thread::JoinHandle<()>, SocketAddr) {
-    use crate::db::transport_trust::{import_cli_pins_to_sql, is_peer_allowed};
-
-    // Seed trust for all allowed fingerprints
-    {
-        let db = open_connection(&sink.db_path).expect("failed to open sink db");
-        let pins = AllowedPeers::from_fingerprints(allowed_fps);
-        import_cli_pins_to_sql(&db, &sink.identity, &pins).expect("failed to import pins for sink");
-    }
+/// Uses dynamic trust (`is_peer_allowed`) at each TLS handshake.
+/// The caller must have already established real projected trust for every
+/// inbound peer that will connect to this sink.
+pub fn start_sink_accept(sink: &Peer) -> (std::thread::JoinHandle<()>, SocketAddr) {
+    use crate::db::transport_trust::is_peer_allowed;
 
     let (cert, key) = sink.cert_and_key();
     let sink_db_path = sink.db_path.clone();

@@ -1,14 +1,12 @@
 use std::time::{Duration, Instant};
 use topo::crypto::event_id_to_base64;
 use topo::db::open_connection;
-use topo::testutil::{
-    assert_eventually, start_peers_pinned, sync_until_converged, Peer, ScenarioHarness,
-};
+use topo::testutil::{assert_eventually, start_peers, sync_until_converged, Peer, ScenarioHarness};
 
 #[tokio::test]
 async fn test_two_peer_bidirectional_sync() {
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -22,7 +20,7 @@ async fn test_two_peer_bidirectional_sync() {
     let bob_marker = bob.create_message("bob-marker");
     let bob_marker_b64 = event_id_to_base64(&bob_marker);
 
-    let sync = start_peers_pinned(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     // Wait for bidirectional sync to complete
     assert_eventually(
@@ -32,10 +30,8 @@ async fn test_two_peer_bidirectional_sync() {
     )
     .await;
 
-    // Only locally-created messages are projected (remote messages are blocked
-    // because their signer chain is from a different network)
-    assert_eq!(alice.message_count(), 3); // 2 batch + 1 marker
-    assert_eq!(bob.message_count(), 2); // 1 batch + 1 marker
+    assert_eq!(alice.message_count(), 5); // 3 local + 2 from Bob
+    assert_eq!(bob.message_count(), 5); // 2 local + 3 from Alice
 
     drop(sync);
 
@@ -45,7 +41,7 @@ async fn test_two_peer_bidirectional_sync() {
 #[tokio::test]
 async fn test_one_way_sync() {
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -54,7 +50,7 @@ async fn test_one_way_sync() {
     let marker = alice.create_message("alice-sync-marker");
     let marker_b64 = event_id_to_base64(&marker);
 
-    let sync = start_peers_pinned(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     // Wait for bob to receive alice's marker (last created event)
     assert_eventually(
@@ -72,12 +68,12 @@ async fn test_one_way_sync() {
 #[tokio::test]
 async fn test_concurrent_create_and_sync() {
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
 
-    let sync = start_peers_pinned(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     // Give sync loop a moment to connect
     tokio::time::sleep(Duration::from_millis(500)).await;
@@ -121,7 +117,7 @@ async fn test_sync_10k() {
     const EVENT_COUNT: usize = 10_000;
 
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -157,7 +153,7 @@ async fn test_sync_10k() {
 #[tokio::test]
 async fn test_recorded_events_isolation() {
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -176,7 +172,7 @@ async fn test_recorded_events_isolation() {
     let bob_marker_b64 = event_id_to_base64(&bob_marker);
 
     // Sync
-    let sync = start_peers_pinned(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&alice_marker_b64) && alice.has_event(&bob_marker_b64),
@@ -187,13 +183,10 @@ async fn test_recorded_events_isolation() {
 
     drop(sync);
 
-    // Only locally-created messages are projected (remote messages blocked by foreign signer)
-    assert_eq!(alice.message_count(), 4); // 3 batch + 1 marker
-    assert_eq!(bob.message_count(), 3); // 2 batch + 1 marker
-
-    // scoped_message_count: only locally-created messages projected
-    assert_eq!(alice.scoped_message_count(), 4);
-    assert_eq!(bob.scoped_message_count(), 3);
+    assert_eq!(alice.message_count(), 7);
+    assert_eq!(bob.message_count(), 7);
+    assert_eq!(alice.scoped_message_count(), 7);
+    assert_eq!(bob.scoped_message_count(), 7);
 
     harness.finish();
 }
@@ -201,7 +194,7 @@ async fn test_recorded_events_isolation() {
 #[tokio::test]
 async fn test_reaction_sync() {
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -217,7 +210,7 @@ async fn test_reaction_sync() {
     assert_eq!(alice.message_count(), 2);
     assert_eq!(bob.reaction_count(), 0); // blocked until targets arrive
 
-    let sync = start_peers_pinned(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     // Wait for sync convergence: bob gets alice's messages, alice gets bob's reactions
     assert_eventually(
@@ -229,13 +222,10 @@ async fn test_reaction_sync() {
 
     drop(sync);
 
-    // With independent identity chains, cross-peer events are blocked (foreign signer).
-    // Alice projects her own 2 messages; Bob's reactions are blocked (foreign signer on Alice).
-    // Bob: Alice's messages are blocked (foreign signer), so reaction targets remain invalid.
     assert_eq!(alice.message_count(), 2);
-    assert_eq!(bob.message_count(), 0);
-    assert_eq!(alice.reaction_count(), 0);
-    assert_eq!(bob.reaction_count(), 0);
+    assert_eq!(bob.message_count(), 2);
+    assert_eq!(alice.reaction_count(), 2);
+    assert_eq!(bob.reaction_count(), 2);
 
     harness.finish();
 }
@@ -245,7 +235,7 @@ async fn test_reaction_sync() {
 #[tokio::test]
 async fn test_zero_loss_stress() {
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -270,7 +260,7 @@ async fn test_zero_loss_stress() {
     let a_before = alice.stored_message_event_count();
     let b_before = bob.stored_message_event_count();
     let start = Instant::now();
-    let sync = start_peers_pinned(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     // Full-set quiescence gate — require diff <= local_event_count on
     // both sides, stable for 5 consecutive polls at 200ms, before dropping sync.
@@ -355,7 +345,7 @@ async fn test_zero_loss_stress() {
 #[tokio::test]
 async fn test_recorded_at_monotonicity() {
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -369,7 +359,7 @@ async fn test_recorded_at_monotonicity() {
     let third_b64 = event_id_to_base64(&third);
 
     // Sync to Bob — Bob's recorded_at should use local wall clock, not event created_at
-    let sync = start_peers_pinned(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&third_b64),
@@ -408,31 +398,29 @@ async fn test_recorded_at_monotonicity() {
         }
     }
 
-    // Bob's recorded_at for received events should be >= Alice's local create times
-    // (since Bob received them after Alice created them)
+    // For the event created in this test, Bob's receive timestamp should be
+    // after Alice's local create timestamp.
     let alice_db = open_connection(&alice.db_path).expect("open alice db");
-    let alice_max_local_create: i64 = alice_db
-        .query_row(
-            "SELECT MAX(recorded_at) FROM recorded_events WHERE peer_id = ?1 AND source = 'local_create'",
-            rusqlite::params![&alice.identity],
-            |row| row.get(0),
-        )
-        .unwrap();
-
     let bob_db = open_connection(&bob.db_path).expect("open bob db");
-    let bob_min_recv: i64 = bob_db
+    let alice_third_local_create: i64 = alice_db
         .query_row(
-            "SELECT MIN(recorded_at) FROM recorded_events WHERE peer_id = ?1 AND source LIKE 'quic_recv:%'",
-            rusqlite::params![&bob.identity],
+            "SELECT recorded_at FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&alice.identity, &third_b64],
             |row| row.get(0),
         )
         .unwrap();
-
+    let bob_third_recv: i64 = bob_db
+        .query_row(
+            "SELECT recorded_at FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&bob.identity, &third_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert!(
-        bob_min_recv >= alice_max_local_create,
-        "Bob's earliest receive recorded_at ({}) should be >= Alice's latest local_create recorded_at ({})",
-        bob_min_recv,
-        alice_max_local_create,
+        bob_third_recv >= alice_third_local_create,
+        "Bob's receive recorded_at ({}) for the synced event should be >= Alice's local_create recorded_at ({})",
+        bob_third_recv,
+        alice_third_local_create,
     );
 
     harness.finish();
@@ -445,9 +433,9 @@ async fn test_cross_workspace_isolation() {
     // Set B: peerB1 + peerB2 (sync with each other)
     // Verify no cross-set contamination.
     let peer_a1 = Peer::new_with_identity("peerA1");
-    let peer_a2 = Peer::new_with_identity("peerA2");
+    let peer_a2 = Peer::new_in_workspace("peerA2", &peer_a1).await;
     let peer_b1 = Peer::new_with_identity("peerB1");
-    let peer_b2 = Peer::new_with_identity("peerB2");
+    let peer_b2 = Peer::new_in_workspace("peerB2", &peer_b1).await;
     let harness = ScenarioHarness::new();
     harness.track(&peer_a1);
     harness.track(&peer_a2);
@@ -471,7 +459,7 @@ async fn test_cross_workspace_isolation() {
     let b2_marker_b64 = event_id_to_base64(&b2_marker);
 
     // Sync workspace A peers
-    let sync_a = start_peers_pinned(&peer_a1, &peer_a2);
+    let sync_a = start_peers(&peer_a1, &peer_a2);
     assert_eventually(
         || peer_a2.has_event(&a1_marker_b64) && peer_a1.has_event(&a2_marker_b64),
         Duration::from_secs(15),
@@ -481,7 +469,7 @@ async fn test_cross_workspace_isolation() {
     drop(sync_a);
 
     // Sync workspace B peers
-    let sync_b = start_peers_pinned(&peer_b1, &peer_b2);
+    let sync_b = start_peers(&peer_b1, &peer_b2);
     assert_eventually(
         || peer_b2.has_event(&b1_marker_b64) && peer_b1.has_event(&b2_marker_b64),
         Duration::from_secs(15),
@@ -490,11 +478,10 @@ async fn test_cross_workspace_isolation() {
     .await;
     drop(sync_b);
 
-    // Verify scoped messages: only locally-created messages are projected (foreign signer blocked)
-    assert_eq!(peer_a1.scoped_message_count(), 6); // 5 batch + 1 marker
-    assert_eq!(peer_a2.scoped_message_count(), 4); // 3 batch + 1 marker
-    assert_eq!(peer_b1.scoped_message_count(), 5); // 4 batch + 1 marker
-    assert_eq!(peer_b2.scoped_message_count(), 3); // 2 batch + 1 marker
+    assert_eq!(peer_a1.scoped_message_count(), 10);
+    assert_eq!(peer_a2.scoped_message_count(), 10);
+    assert_eq!(peer_b1.scoped_message_count(), 8);
+    assert_eq!(peer_b2.scoped_message_count(), 8);
 
     // Cross-check: assert zero overlap in event IDs between workspace A and B events.
     // This is a stronger isolation proof than checking peer_id (which is always local).
@@ -563,7 +550,7 @@ async fn test_sync_50k() {
 
     let harness = ScenarioHarness::skip("replay invariants too slow at high event counts");
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
 
     let gen_start = Instant::now();
     alice.batch_create_messages(EVENT_COUNT);
@@ -598,7 +585,7 @@ async fn test_sync_50k() {
 #[tokio::test]
 async fn test_out_of_order_reaction_sync() {
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -615,7 +602,7 @@ async fn test_out_of_order_reaction_sync() {
     assert_eq!(alice.message_count(), 1);
 
     // Sync — both get each other's events
-    let sync = start_peers_pinned(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&msg_id_b64) && alice.has_event(&rxn_id_b64),
@@ -626,14 +613,10 @@ async fn test_out_of_order_reaction_sync() {
 
     drop(sync);
 
-    // With independent identity chains, cross-peer events are blocked (foreign signer).
-    // Bob: Alice's message blocked (foreign signer), reaction still blocked (target not valid)
-    assert_eq!(bob.message_count(), 0);
-    assert_eq!(bob.reaction_count(), 0);
-
-    // Alice: own message valid, Bob's reaction blocked (foreign signer)
+    assert_eq!(bob.message_count(), 1);
+    assert_eq!(bob.reaction_count(), 1);
     assert_eq!(alice.message_count(), 1);
-    assert_eq!(alice.reaction_count(), 0);
+    assert_eq!(alice.reaction_count(), 1);
 
     harness.finish();
 }
@@ -643,7 +626,7 @@ async fn test_out_of_order_reaction_sync() {
 #[tokio::test]
 async fn test_multi_dep_blocking_sync() {
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -663,7 +646,7 @@ async fn test_multi_dep_blocking_sync() {
     assert_eq!(bob.reaction_count(), 0);
 
     // Sync
-    let sync = start_peers_pinned(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&msg3_b64) && alice.has_event(&bob_rxn3_b64),
@@ -674,11 +657,10 @@ async fn test_multi_dep_blocking_sync() {
 
     drop(sync);
 
-    // With independent identity chains, cross-peer events are blocked (foreign signer).
     assert_eq!(alice.message_count(), 3);
-    assert_eq!(bob.message_count(), 0);
-    assert_eq!(alice.reaction_count(), 0);
-    assert_eq!(bob.reaction_count(), 0);
+    assert_eq!(bob.message_count(), 3);
+    assert_eq!(alice.reaction_count(), 3);
+    assert_eq!(bob.reaction_count(), 3);
 
     harness.finish();
 }
@@ -689,7 +671,7 @@ async fn test_multi_dep_blocking_sync() {
 #[tokio::test]
 async fn test_cross_tenant_dep_scoping_after_sync() {
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -704,7 +686,7 @@ async fn test_cross_tenant_dep_scoping_after_sync() {
     assert_eq!(alice.reaction_count(), 1);
 
     // Sync to Bob
-    let sync = start_peers_pinned(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&msg_b64) && bob.has_event(&rxn_b64),
@@ -715,34 +697,45 @@ async fn test_cross_tenant_dep_scoping_after_sync() {
 
     drop(sync);
 
-    // Bob: Alice's events blocked (foreign signer)
-    assert_eq!(bob.message_count(), 0);
-    assert_eq!(bob.reaction_count(), 0);
+    assert_eq!(bob.message_count(), 1);
+    assert_eq!(bob.reaction_count(), 1);
 
-    // Verify valid_events are tenant-scoped: Alice has more valid events than Bob
-    // because her content events are valid locally but rejected on Bob's side
+    // Verify valid_events are still tenant-scoped and include the synced content
+    // for both peers in the shared workspace.
     let alice_db = open_connection(&alice.db_path).expect("open alice db");
     let bob_db = open_connection(&bob.db_path).expect("open bob db");
 
-    let alice_valid: i64 = alice_db
+    let alice_msg_valid: bool = alice_db
         .query_row(
-            "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
-            rusqlite::params![&alice.identity],
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&alice.identity, &msg_b64],
             |row| row.get(0),
         )
         .unwrap();
-    let bob_valid: i64 = bob_db
+    let bob_msg_valid: bool = bob_db
         .query_row(
-            "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
-            rusqlite::params![&bob.identity],
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&bob.identity, &msg_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let alice_rxn_valid: bool = alice_db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&alice.identity, &rxn_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let bob_rxn_valid: bool = bob_db
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&bob.identity, &rxn_b64],
             |row| row.get(0),
         )
         .unwrap();
     assert!(
-        alice_valid > bob_valid,
-        "Alice should have more valid events due to content (alice={}, bob={})",
-        alice_valid,
-        bob_valid
+        alice_msg_valid && bob_msg_valid && alice_rxn_valid && bob_rxn_valid,
+        "both peers should treat the synced message and reaction as valid in the shared workspace"
     );
 
     harness.finish();
@@ -751,7 +744,7 @@ async fn test_cross_tenant_dep_scoping_after_sync() {
 #[tokio::test]
 async fn test_local_only_events_not_synced() {
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -774,7 +767,7 @@ async fn test_local_only_events_not_synced() {
     let alice_msg_b64 = event_id_to_base64(&alice_msg);
 
     // Sync
-    let sync = start_peers_pinned(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&enc_b64) && bob.has_event(&alice_msg_b64),
@@ -787,8 +780,7 @@ async fn test_local_only_events_not_synced() {
 
     // Bob should NOT have received Alice's SK event -- his store has his own SK
     assert_eq!(bob.key_secret_count(), bob_initial_keys + 1);
-    // Bob: encrypted inner rejected (foreign signer), normal msg blocked (foreign signer)
-    assert_eq!(bob.scoped_message_count(), 0);
+    assert_eq!(bob.scoped_message_count(), 2);
 
     // Verify Alice's SK event_id IS in bob's events (because bob created his own copy)
     let sk_b64 = event_id_to_base64(&sk_eid);
@@ -804,7 +796,7 @@ async fn test_local_only_events_not_synced() {
 #[tokio::test]
 async fn test_psk_two_set_isolation() {
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -824,7 +816,7 @@ async fn test_psk_two_set_isolation() {
     let alice_msg_b64 = event_id_to_base64(&alice_msg);
 
     // Sync
-    let sync = start_peers_pinned(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&enc_b64) && bob.has_event(&alice_msg_b64),
@@ -835,11 +827,10 @@ async fn test_psk_two_set_isolation() {
 
     drop(sync);
 
-    // Bob: normal message blocked (foreign signer), encrypted blocked (missing key dep)
     assert_eq!(
         bob.scoped_message_count(),
-        0,
-        "bob should see no messages (foreign signer + missing key)"
+        1,
+        "bob should project Alice's cleartext message while the encrypted one stays blocked"
     );
 
     // Verify the encrypted event is blocked
@@ -866,7 +857,7 @@ async fn test_endpoint_observations_recorded() {
     use topo::db::health::purge_expired_endpoints;
 
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -875,7 +866,7 @@ async fn test_endpoint_observations_recorded() {
     let marker = alice.create_message("endpoint obs test");
     let marker_b64 = event_id_to_base64(&marker);
 
-    let sync = start_peers_pinned(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&marker_b64),

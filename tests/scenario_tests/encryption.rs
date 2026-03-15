@@ -1,13 +1,13 @@
 use std::time::Duration;
 use topo::crypto::event_id_to_base64;
 use topo::db::open_connection;
-use topo::testutil::{assert_eventually, start_peers_pinned, Peer, ScenarioHarness};
+use topo::testutil::{assert_eventually, start_peers, Peer, ScenarioHarness};
 
 /// Integration test: Alice creates a PSK + encrypted message → syncs to Bob → Bob projects.
 #[tokio::test]
 async fn test_encrypted_event_sync() {
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -33,7 +33,7 @@ async fn test_encrypted_event_sync() {
     assert_eq!(alice.scoped_message_count(), 1);
 
     // Sync to Bob
-    let sync = start_peers_pinned(&alice, &bob);
+    let sync = start_peers(&alice, &bob);
 
     assert_eventually(
         || bob.has_event(&enc_b64),
@@ -44,12 +44,10 @@ async fn test_encrypted_event_sync() {
 
     drop(sync);
 
-    // Bob has his local secret key. The encrypted wrapper decrypts to a Message
-    // with signed_by = Alice's PeerShared (foreign signer -> inner message rejected).
+    // Bob has the same local secret key, so the encrypted wrapper can decrypt
+    // and project Alice's message in the shared workspace.
     assert_eq!(bob.key_secret_count(), bob_initial_keys + 1);
-    // Encrypted inner message is rejected because its signer (Alice's PeerShared)
-    // is not valid on Bob's side (foreign network)
-    assert_eq!(bob.scoped_message_count(), 0);
+    assert_eq!(bob.scoped_message_count(), 1);
 
     harness.finish();
 }
@@ -58,7 +56,7 @@ async fn test_encrypted_event_sync() {
 #[tokio::test]
 async fn test_encrypted_out_of_order_sync() {
     let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_with_identity("bob");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
     let harness = ScenarioHarness::new();
     harness.track(&alice);
     harness.track(&bob);
@@ -81,7 +79,7 @@ async fn test_encrypted_out_of_order_sync() {
 
     // Sync phase 1: ciphertext arrives before key materialization on Bob.
     // Note: alice's SK is local scope, not synced
-    let sync1 = start_peers_pinned(&alice, &bob);
+    let sync1 = start_peers(&alice, &bob);
 
     assert_eventually(
         || {
@@ -98,8 +96,8 @@ async fn test_encrypted_out_of_order_sync() {
 
     // Bob should be blocked on missing key after phase 1.
     assert_eq!(bob.key_secret_count(), bob_initial_keys);
-    // Bob: only his own message projected (Alice's normal message blocked by foreign signer)
-    assert_eq!(bob.scoped_message_count(), 1);
+    // Bob can still project Alice's cleartext message in the shared workspace.
+    assert_eq!(bob.scoped_message_count(), 2);
     let bob_db = open_connection(&bob.db_path).expect("open bob db");
     let blocked_before: i64 = bob_db
         .query_row(
@@ -120,14 +118,13 @@ async fn test_encrypted_out_of_order_sync() {
         "bob key materialization should match alice key event id"
     );
 
-    // After key materialization, the encrypted wrapper unblocks. But the inner message
-    // has signed_by = Alice's PeerShared (foreign signer), so it gets rejected.
+    // After key materialization, the encrypted wrapper unblocks and Alice's
+    // encrypted inner message becomes valid too.
     assert_eq!(bob.key_secret_count(), bob_initial_keys + 1);
-    // Bob still only sees his own message (encrypted inner rejected due to foreign signer)
-    assert_eq!(bob.scoped_message_count(), 1);
+    assert_eq!(bob.scoped_message_count(), 3);
 
-    // Alice sees all her own messages
-    assert_eq!(alice.scoped_message_count(), 2); // encrypted inner + normal message
+    // Alice sees both her messages plus Bob's cleartext message after sync.
+    assert_eq!(alice.scoped_message_count(), 3);
 
     harness.finish();
 }

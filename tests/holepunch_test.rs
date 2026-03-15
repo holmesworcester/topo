@@ -7,20 +7,19 @@
 //! On localhost there's no NAT, so the "punch" is a regular connect.
 //! This tests the full IntroOffer send/receive/validate/dial/sync path.
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use topo::crypto::{event_id_from_base64, event_id_to_base64};
 use topo::db::intro::{freshest_endpoint, list_intro_attempts};
 use topo::db::open_connection;
 use topo::db::project_queue::ProjectQueue;
-use topo::db::transport_trust::allowed_peers_from_db;
+use topo::db::transport_trust::authorized_fingerprints_from_db;
 use topo::peering::loops::{accept_loop, connect_loop};
 use topo::peering::workflows::intro::{build_intro_offer, run_intro, send_intro_offer};
 use topo::peering::workflows::punch::spawn_intro_listener;
 use topo::projection::apply::project_one;
 use topo::testutil::{assert_eventually, create_dynamic_endpoint_for_peer, Peer};
-use topo::transport::{create_dual_endpoint, AllowedPeers};
+use topo::transport::multi_workspace::transport_sni;
 
 /// Force-drain the project_queue for a peer's DB, projecting any pending items.
 /// This handles the race where the batch_writer committed events but hasn't
@@ -71,8 +70,8 @@ async fn test_three_peer_intro_happy_path() {
     let fp_b = peer_b.spki_fingerprint();
 
     // Trust is derived from PeerShared events synced during workspace join.
-    // No CLI pins needed — all peers share the same workspace so identity chains
-    // project trust entries at each peer after sync.
+    // All peers share the same workspace, so identity chains project trust
+    // entries at each peer after sync without any manual trust seeding.
 
     // Create dynamic dual endpoints for all three peers.
     // Trust is resolved from SQL at each TLS handshake (production behavior).
@@ -113,6 +112,7 @@ async fn test_three_peer_intro_happy_path() {
     let a_ep1 = ep_a.clone();
     let a_db1 = peer_a.db_path.clone();
     let a_id1 = peer_a.identity.clone();
+    let intro_target_for_a = intro.identity.clone();
     let _a_connect = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -124,6 +124,7 @@ async fn test_three_peer_intro_happy_path() {
                 &a_id1,
                 a_ep1,
                 addr_i,
+                &intro_target_for_a,
                 None,
                 spawn_intro_listener,
                 topo::testutil::test_ingest_fns(),
@@ -135,6 +136,7 @@ async fn test_three_peer_intro_happy_path() {
     let b_ep1 = ep_b.clone();
     let b_db1 = peer_b.db_path.clone();
     let b_id1 = peer_b.identity.clone();
+    let intro_target_for_b = intro.identity.clone();
     let _b_connect = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -146,6 +148,7 @@ async fn test_three_peer_intro_happy_path() {
                 &b_id1,
                 b_ep1,
                 addr_i,
+                &intro_target_for_b,
                 None,
                 spawn_intro_listener,
                 topo::testutil::test_ingest_fns(),
@@ -227,12 +230,12 @@ async fn test_three_peer_intro_happy_path() {
                 drain_project_queue(&b_path, &b_ident);
                 let a_ok = open_connection(&a_path)
                     .ok()
-                    .and_then(|c| allowed_peers_from_db(&c, &a_ident).ok())
+                    .and_then(|c| authorized_fingerprints_from_db(&c, &a_ident).ok())
                     .map(|ap| ap.contains(&fp_b) && ap.contains(&fp_i))
                     .unwrap_or(false);
                 let b_ok = open_connection(&b_path)
                     .ok()
-                    .and_then(|c| allowed_peers_from_db(&c, &b_ident).ok())
+                    .and_then(|c| authorized_fingerprints_from_db(&c, &b_ident).ok())
                     .map(|ap| ap.contains(&fp_a) && ap.contains(&fp_i))
                     .unwrap_or(false);
                 a_ok && b_ok
@@ -437,8 +440,9 @@ async fn test_dynamic_trust_rejects_unknown_peer() {
     // Unknown peer tries to connect to A — should fail at TLS handshake
     // because A's dynamic trust lookup finds no matching row.
     let ep_unknown = create_dynamic_endpoint_for_peer(&unknown);
+    let target_sni = transport_sni(&peer_a.identity);
     let result = ep_unknown
-        .connect(addr_a, "localhost")
+        .connect(addr_a, &target_sni)
         .expect("initiate connect")
         .await;
 
@@ -457,21 +461,12 @@ async fn test_dynamic_trust_rejects_unknown_peer() {
 
 /// TRUST BOUNDARY TEST: Stale intro rejected.
 /// Expired expires_at_ms should result in status='expired'.
-/// Uses static pinning — this test exercises intro validation logic,
-/// not transport trust resolution.
 #[tokio::test]
 async fn test_stale_intro_rejected() {
-    let intro = Peer::new("stale_introducer");
-    let peer_a = Peer::new("stale_a");
+    let intro = Peer::new_with_identity("stale_introducer");
+    let peer_a = Peer::new_in_workspace("stale_a", &intro).await;
 
-    let fp_i = intro.spki_fingerprint();
-    let fp_a = peer_a.spki_fingerprint();
-
-    // Static pin: A trusts only I (pinning policy is the thing under test here)
-    let (cert_a, key_a) = peer_a.cert_and_key();
-    let allowed_a = Arc::new(AllowedPeers::from_fingerprints(vec![fp_i]));
-    let ep_a = create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert_a, key_a, allowed_a)
-        .expect("ep_a");
+    let ep_a = create_dynamic_endpoint_for_peer(&peer_a);
     let addr_a = ep_a.local_addr().expect("addr_a");
 
     // Start A's accept loop with intro listener
@@ -508,13 +503,11 @@ async fn test_stale_intro_rejected() {
     .expect("build stale offer");
 
     // Connect to A and send the stale intro
-    let (cert_i, key_i) = intro.cert_and_key();
-    let allowed_i = Arc::new(AllowedPeers::from_fingerprints(vec![fp_a]));
-    let ep_i = create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert_i, key_i, allowed_i)
-        .expect("ep_i");
+    let ep_i = create_dynamic_endpoint_for_peer(&intro);
+    let target_sni = transport_sni(&peer_a.identity);
 
     let conn = ep_i
-        .connect(addr_a, "localhost")
+        .connect(addr_a, &target_sni)
         .unwrap()
         .await
         .expect("connect to A");
@@ -550,21 +543,12 @@ async fn test_stale_intro_rejected() {
 
 /// TRUST BOUNDARY TEST: Untrusted target rejected.
 /// other_peer_id not in allowed set.
-/// Uses static pinning — this test exercises intro target trust validation,
-/// not transport trust resolution.
 #[tokio::test]
 async fn test_untrusted_peer_intro_rejected() {
-    let intro = Peer::new("untrust_introducer");
-    let peer_a = Peer::new("untrust_a");
+    let intro = Peer::new_with_identity("untrust_introducer");
+    let peer_a = Peer::new_in_workspace("untrust_a", &intro).await;
 
-    let fp_i = intro.spki_fingerprint();
-    let fp_a = peer_a.spki_fingerprint();
-
-    // Static pin: A only trusts I, not the introduced peer (pinning policy under test)
-    let (cert_a, key_a) = peer_a.cert_and_key();
-    let allowed_a = Arc::new(AllowedPeers::from_fingerprints(vec![fp_i]));
-    let ep_a = create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert_a, key_a, allowed_a)
-        .expect("ep_a");
+    let ep_a = create_dynamic_endpoint_for_peer(&peer_a);
     let addr_a = ep_a.local_addr().expect("addr_a");
 
     let a_db = peer_a.db_path.clone();
@@ -604,13 +588,11 @@ async fn test_untrusted_peer_intro_rejected() {
     )
     .expect("build offer");
 
-    let (cert_i, key_i) = intro.cert_and_key();
-    let allowed_i = Arc::new(AllowedPeers::from_fingerprints(vec![fp_a]));
-    let ep_i = create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert_i, key_i, allowed_i)
-        .expect("ep_i");
+    let ep_i = create_dynamic_endpoint_for_peer(&intro);
+    let target_sni = transport_sni(&peer_a.identity);
 
     let conn = ep_i
-        .connect(addr_a, "localhost")
+        .connect(addr_a, &target_sni)
         .unwrap()
         .await
         .expect("connect to A");

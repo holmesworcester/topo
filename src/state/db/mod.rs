@@ -44,7 +44,10 @@ pub fn friendly_db_error<P: AsRef<Path>>(path: P, e: rusqlite::Error) -> String 
             let detail = msg.as_deref().unwrap_or("unknown error");
             match err.code {
                 rusqlite::ffi::ErrorCode::NotADatabase => {
-                    format!("cannot open database: file is not a database: {}", p.display())
+                    format!(
+                        "cannot open database: file is not a database: {}",
+                        p.display()
+                    )
                 }
                 rusqlite::ffi::ErrorCode::ReadOnly => {
                     format!("cannot open database: read-only: {}", p.display())

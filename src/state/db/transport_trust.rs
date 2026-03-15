@@ -1,8 +1,7 @@
+use crate::crypto::spki_fingerprint_from_ed25519_pubkey;
 use rusqlite::{Connection, OptionalExtension};
+use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::info;
-
-use crate::crypto::{spki_fingerprint_from_ed25519_pubkey, AllowedPeers};
 
 /// Pending bootstrap trust from locally-created invites is temporary.
 /// If a peer never joins, this entry should not authorize transport forever.
@@ -10,9 +9,6 @@ pub(crate) const PENDING_INVITE_BOOTSTRAP_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 /// Accepted bootstrap trust is also temporary until steady-state transport key
 /// trust converges for that same SPKI.
 pub(crate) const ACCEPTED_INVITE_BOOTSTRAP_TTL_MS: i64 = 24 * 60 * 60 * 1000;
-
-/// Workspace sentinel for CLI-pin-imported bootstrap trust rows.
-const CLI_PIN_WORKSPACE: &str = "cli-bootstrap";
 
 // Canonical tenant-scoped transport authorization over projected trust rows.
 //
@@ -200,12 +196,6 @@ const NODE_AUTHORIZING_TENANT_SQL: &str = "
     ORDER BY tenant_id ASC
     LIMIT 1
 ";
-
-/// Build the deterministic `invite_event_id` for a CLI-pin import.
-/// Uses the full 32-byte hex fingerprint so distinct pins never collide.
-fn cli_pin_invite_event_id(spki_fingerprint: &[u8; 32]) -> String {
-    format!("cli-pin-{}", hex::encode(spki_fingerprint))
-}
 
 fn now_ms_i64() -> i64 {
     SystemTime::now()
@@ -407,7 +397,7 @@ pub fn consume_bootstrap_for_transport_fingerprint(
 /// Record an observed transport binding (observation telemetry only).
 /// peer_id (hex SPKI fingerprint) was seen on a TLS connection with this SPKI
 /// fingerprint. Idempotent (INSERT OR IGNORE). NOT used for trust decisions —
-/// allowed_peers_from_db queries PeerShared-derived SPKIs and bootstrap trust only.
+/// authorized_fingerprints_from_db queries PeerShared-derived SPKIs and bootstrap trust only.
 pub fn record_transport_binding(
     conn: &Connection,
     recorded_by: &str,
@@ -464,7 +454,7 @@ pub fn record_invite_bootstrap_trust(
 
 /// Record inviter-side pending bootstrap trust for an invite before the invitee
 /// has connected. This lets incoming invitee TLS certs pass strict mTLS checks
-/// without CLI pin flags.
+/// before steady-state PeerShared trust appears.
 ///
 /// Uses INSERT OR IGNORE so replays do not refresh TTL.
 pub fn record_pending_invite_bootstrap_trust(
@@ -496,47 +486,15 @@ pub fn record_pending_invite_bootstrap_trust(
     Ok(())
 }
 
-/// Import CLI pin hex strings as `pending_invite_bootstrap_trust` rows.
-///
-/// Each pin is stored with a deterministic `invite_event_id` (via
-/// `cli_pin_invite_event_id`) and `workspace_id = CLI_PIN_WORKSPACE`.
-/// Reuses the existing table and 24h TTL.
-/// Existing consume logic auto-removes these stale rows when PeerShared-derived trust appears.
-///
-/// This is idempotent: re-importing existing pins is a no-op (INSERT OR IGNORE).
-pub fn import_cli_pins_to_sql(
-    conn: &Connection,
-    recorded_by: &str,
-    cli_pins: &AllowedPeers,
-) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    let fps = cli_pins.fingerprints();
-    let mut imported = 0;
-    for fp in &fps {
-        let invite_event_id = cli_pin_invite_event_id(fp);
-        record_pending_invite_bootstrap_trust(
-            conn,
-            recorded_by,
-            &invite_event_id,
-            CLI_PIN_WORKSPACE,
-            fp,
-        )?;
-        imported += 1;
-    }
-    if imported > 0 {
-        info!("Imported {} CLI pin(s) to SQL trust rows", imported);
-    }
-    Ok(imported)
-}
-
-/// Build AllowedPeers from projected authorization rows only.
+/// Return the tenant's currently authorized remote transport fingerprints.
 /// Observation telemetry (peer_transport_bindings) is NOT consulted.
-pub fn allowed_peers_from_db(
+pub fn authorized_fingerprints_from_db(
     conn: &Connection,
     recorded_by: &str,
-) -> Result<AllowedPeers, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<HashSet<[u8; 32]>, Box<dyn std::error::Error + Send + Sync>> {
     let now = now_ms_i64();
     let mut stmt = conn.prepare(TENANT_AUTHORIZED_FINGERPRINTS_SQL)?;
-    let fps: Vec<[u8; 32]> = stmt
+    let fps: HashSet<[u8; 32]> = stmt
         .query_map(rusqlite::params![recorded_by, now], |row| {
             let blob: Vec<u8> = row.get(0)?;
             Ok(decode_32_byte_blob(blob))
@@ -545,7 +503,7 @@ pub fn allowed_peers_from_db(
         .into_iter()
         .flatten()
         .collect();
-    Ok(AllowedPeers::from_fingerprints(fps))
+    Ok(fps)
 }
 
 /// Canonical tenant-scoped transport authorization over projected trust rows.

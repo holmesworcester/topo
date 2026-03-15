@@ -38,7 +38,8 @@ mod tests {
 
     use crate::protocol::{encode_frame, Frame};
     use crate::transport::{
-        create_dual_endpoint, extract_spki_fingerprint, generate_self_signed_cert, AllowedPeers,
+        create_dual_endpoint, extract_spki_fingerprint, generate_self_signed_cert,
+        multi_workspace::transport_sni,
     };
 
     use super::accept_and_read_intro;
@@ -56,9 +57,12 @@ mod tests {
         let server_fp = extract_spki_fingerprint(server_cert.as_ref())?;
         let (client_cert, client_key) = generate_self_signed_cert()?;
         let client_fp = extract_spki_fingerprint(client_cert.as_ref())?;
+        let server_peer_id = hex::encode(server_fp);
 
-        let server_allowed = Arc::new(AllowedPeers::from_fingerprints(vec![client_fp]));
-        let client_allowed = Arc::new(AllowedPeers::from_fingerprints(vec![server_fp]));
+        let server_allowed: Arc<crate::transport::DynamicAllowFn> =
+            Arc::new(move |candidate| Ok(candidate == &client_fp));
+        let client_allowed: Arc<crate::transport::DynamicAllowFn> =
+            Arc::new(move |candidate| Ok(candidate == &server_fp));
 
         let server_ep = create_dual_endpoint(
             "127.0.0.1:0".parse().unwrap(),
@@ -86,7 +90,8 @@ mod tests {
 
         let client_ep_connect = client_ep.clone();
         let client_connect = async move {
-            let connecting = client_ep_connect.connect(server_addr, "localhost")?;
+            let connecting =
+                client_ep_connect.connect(server_addr, &transport_sni(&server_peer_id))?;
             let conn = connecting.await?;
             Ok::<quinn::Connection, Box<dyn std::error::Error + Send + Sync>>(conn)
         };

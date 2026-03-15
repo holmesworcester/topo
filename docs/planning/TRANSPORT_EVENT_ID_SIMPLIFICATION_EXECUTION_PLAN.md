@@ -2,7 +2,7 @@
 
 ## Goal
 
-Reduce transport identity complexity while preserving strict pinned mTLS and multi-tenant runtime behavior.
+Reduce transport identity complexity while preserving strict exact-fingerprint mTLS and multi-tenant runtime behavior.
 
 Core direction:
 1. Keep `event_id` as canonical event-graph identity.
