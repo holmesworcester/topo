@@ -615,7 +615,8 @@ async fn catchup_non_uniform_sources() {
     )
     .await;
 
-    let wall_ms = start.elapsed().as_millis();
+    let wall_secs = start.elapsed().as_secs_f64();
+    let msgs_per_sec = total_expected as f64 / wall_secs;
     drop(handles);
 
     // Verify every source's unique events made it to the sink
@@ -641,7 +642,9 @@ async fn catchup_non_uniform_sources() {
     );
     eprintln!("  Total expected: {}", total_expected);
     eprintln!("  Sink received:  {}", sink.recorded_message_event_count());
-    eprintln!("  Wall time:      {} ms", wall_ms);
+    eprintln!("  Wall time:      {:.2}s", wall_secs);
+    eprintln!("  Messages:       {}", total_expected);
+    eprintln!("  Msgs/s:         {:.0}", msgs_per_sec);
     eprintln!();
 }
 
@@ -699,7 +702,8 @@ async fn catchup_dead_peer_dropout() {
     )
     .await;
 
-    let wall_ms = start.elapsed().as_millis();
+    let wall_secs = start.elapsed().as_secs_f64();
+    let msgs_per_sec = expected_count as f64 / wall_secs;
     drop(dl_handles);
 
     eprintln!();
@@ -709,7 +713,9 @@ async fn catchup_dead_peer_dropout() {
     );
     eprintln!("  Expected: {}", expected_count);
     eprintln!("  Sink received: {}", sink.recorded_message_event_count());
-    eprintln!("  Wall time: {} ms", wall_ms);
+    eprintln!("  Wall time: {:.2}s", wall_secs);
+    eprintln!("  Messages: {}", expected_count);
+    eprintln!("  Msgs/s:   {:.0}", msgs_per_sec);
     eprintln!();
 
     assert_eq!(
