@@ -280,10 +280,43 @@ impl Default for DaemonOptions {
     }
 }
 
-fn read_daemon_log(path: &Option<std::path::PathBuf>) -> String {
-    path.as_ref()
-        .and_then(|p| std::fs::read_to_string(p).ok())
-        .unwrap_or_default()
+fn default_daemon_log_path(db: &str, stream: &str) -> PathBuf {
+    let db_path = PathBuf::from(db);
+    let db_name = db_path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("test.db");
+    let sanitized = db_name.replace('.', "_");
+    let pid = std::process::id();
+    std::env::temp_dir().join(format!("topo-{sanitized}-{pid}.{stream}.log"))
+}
+
+fn read_daemon_log(path: &PathBuf) -> String {
+    std::fs::read_to_string(path).unwrap_or_default()
+}
+
+fn tail_daemon_log(path: &PathBuf, max_lines: usize) -> String {
+    let text = read_daemon_log(path);
+    let mut lines: Vec<&str> = text.lines().collect();
+    if lines.len() > max_lines {
+        lines = lines.split_off(lines.len() - max_lines);
+    }
+    lines.join("\n")
+}
+
+fn daemon_debug_context(db: &str) -> String {
+    let socket = socket_path_for_db(db);
+    let stdout_path = default_daemon_log_path(db, "stdout");
+    let stderr_path = default_daemon_log_path(db, "stderr");
+    format!(
+        "daemon=\n  socket_exists={}\n  socket_path={}\n  stdout_log={}\n{}\n  stderr_log={}\n{}",
+        socket.exists(),
+        socket.display(),
+        stdout_path.display(),
+        tail_daemon_log(&stdout_path, 80),
+        stderr_path.display(),
+        tail_daemon_log(&stderr_path, 80)
+    )
 }
 
 fn daemon_inherit_stdio_env() -> bool {
@@ -358,6 +391,14 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
             requested_bind_addr.clone()
         };
         let inherit_stdio = opts.inherit_stdio || daemon_inherit_stdio_env();
+        let stdout_path = opts
+            .stdout_file
+            .clone()
+            .unwrap_or_else(|| default_daemon_log_path(db, "stdout"));
+        let stderr_path = opts
+            .stderr_file
+            .clone()
+            .unwrap_or_else(|| default_daemon_log_path(db, "stderr"));
         let mut cmd = Command::new(bin());
         cmd.arg("--db")
             .arg(db)
@@ -381,7 +422,8 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
         } else if inherit_stdio {
             cmd.stdout(Stdio::inherit());
         } else {
-            cmd.stdout(Stdio::null());
+            let f = std::fs::File::create(&stdout_path).expect("create default stdout log file");
+            cmd.stdout(f);
         }
 
         if let Some(ref path) = opts.stderr_file {
@@ -390,7 +432,8 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
         } else if inherit_stdio {
             cmd.stderr(Stdio::inherit());
         } else {
-            cmd.stderr(Stdio::null());
+            let f = std::fs::File::create(&stderr_path).expect("create default stderr log file");
+            cmd.stderr(f);
         }
 
         let mut child = cmd.spawn().expect("failed to start topo daemon");
@@ -423,8 +466,8 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
                 "daemon exited immediately with {} (db={})\nstdout:\n{}\nstderr:\n{}",
                 status,
                 db,
-                read_daemon_log(&opts.stdout_file),
-                read_daemon_log(&opts.stderr_file)
+                read_daemon_log(&stdout_path),
+                read_daemon_log(&stderr_path)
             );
         }
 
@@ -445,8 +488,8 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
                 "daemon socket did not appear at {} within 5s (db={})\nstdout:\n{}\nstderr:\n{}",
                 socket.display(),
                 db,
-                read_daemon_log(&opts.stdout_file),
-                read_daemon_log(&opts.stderr_file)
+                read_daemon_log(&stdout_path),
+                read_daemon_log(&stderr_path)
             );
         }
 
@@ -476,8 +519,8 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
                     "daemon socket exists but RPC not responding after 5s (db={}): {}\nstdout:\n{}\nstderr:\n{}",
                     db,
                     String::from_utf8_lossy(&out.stderr),
-                    read_daemon_log(&opts.stdout_file),
-                    read_daemon_log(&opts.stderr_file)
+                    read_daemon_log(&stdout_path),
+                    read_daemon_log(&stderr_path)
                 );
             }
             std::thread::sleep(Duration::from_millis(100));
@@ -543,10 +586,11 @@ pub fn wait_for_daemon_stopped(db: &str, timeout: Duration) {
         std::thread::sleep(Duration::from_millis(50));
     }
     panic!(
-        "daemon did not stop within {:?} (db={}, socket={})",
+        "daemon did not stop within {:?} (db={}, socket={})\n{}",
         timeout,
         db,
-        socket.display()
+        socket.display(),
+        daemon_debug_context(db)
     );
 }
 
@@ -556,14 +600,27 @@ pub fn stop_daemon(db: &str, daemon: &mut DaemonGuard) {
     let start = Instant::now();
     loop {
         match daemon.child().try_wait() {
-            Ok(Some(_)) => return,
+            Ok(Some(_)) => {
+                wait_for_daemon_stopped(db, Duration::from_secs(5));
+                return;
+            }
             Ok(None) => {
                 if start.elapsed().as_secs() >= 5 {
-                    return; // DaemonGuard will kill on drop
+                    let _ = daemon.child().kill();
+                    let _ = daemon.child().wait();
+                    wait_for_daemon_stopped(db, Duration::from_secs(5));
+                    return;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
-            Err(_) => return, // DaemonGuard will kill on drop
+            Err(err) => {
+                panic!(
+                    "failed to stop daemon for {}: {}\n{}",
+                    db,
+                    err,
+                    daemon_debug_context(db)
+                );
+            }
         }
     }
 }
@@ -618,27 +675,16 @@ pub fn wait_for_tenant_count(db: &str, min_count: usize, timeout: Duration) -> s
 }
 
 pub fn wait_for_active_tenant_ready(db: &str, timeout: Duration) -> serde_json::Value {
-    let result = assert_value_eventually(
-        timeout,
-        Duration::from_millis(100),
-        "active tenant ready",
-        || try_status_via_rpc_for_db(db),
-        |result| match result {
-            Ok(data) => data["tenants"]
-                .as_array()
-                .map(|tenants| {
-                    tenants.iter().any(|tenant| {
-                        tenant["active"].as_bool().unwrap_or(false)
-                            && tenant["ready"].as_bool().unwrap_or(false)
-                    })
-                })
-                .unwrap_or(false),
-            Err(_) => false,
-        },
-    );
-    match result {
-        Ok(data) => data,
-        Err(err) => panic!("status RPC did not become available for {}: {}", db, err),
+    match wait_for_active_tenant_ready_debug(db, timeout) {
+        Ok(()) => try_status_via_rpc_for_db(db)
+            .unwrap_or_else(|err| panic!("status RPC unavailable for {} after ready: {}", db, err)),
+        Err(err) => panic!(
+            "timed out waiting for active tenant ready after {:?}; last value: {}\n{}\n{}",
+            timeout,
+            err,
+            assert_eventually_debug_context(db),
+            daemon_debug_context(db)
+        ),
     }
 }
 
@@ -868,12 +914,13 @@ pub fn ensure_active_peer(db: &str, timeout: Duration) {
     }
 
     panic!(
-        "failed to establish active tenant within {:?} (db={}): active={}, tenants={}, tenant-use-error={}",
+        "failed to establish active tenant within {:?} (db={}): active={}, tenants={}, tenant-use-error={}\n{}",
         timeout,
         db,
         last_active,
         last_peers.replace('\n', " | "),
-        last_use_peer_err
+        last_use_peer_err,
+        daemon_debug_context(db)
     );
 }
 
@@ -1181,10 +1228,7 @@ fn wait_for_active_tenant_ready_debug(db: &str, timeout: Duration) -> Result<(),
         }
         std::thread::sleep(Duration::from_millis(100));
     }
-    Err(format!(
-        "active tenant not ready within {:?} (db={}): {}",
-        timeout, db, last
-    ))
+    Err(last)
 }
 
 // ---------------------------------------------------------------------------
@@ -1362,10 +1406,11 @@ pub fn assert_eventually(db: &str, predicate: &str, timeout_ms: u64) {
     let debug = assert_eventually_debug_context(db);
     assert!(
         output.status.success(),
-        "assert-eventually timed out: {} ({})\n{}",
+        "assert-eventually timed out: {} ({})\n{}\n{}",
         predicate,
         text.trim(),
-        debug
+        debug,
+        daemon_debug_context(db)
     );
 }
 
@@ -1578,9 +1623,10 @@ pub fn use_tenant(db: &str, selector: &str) {
         .expect("failed to run tenant use");
     assert!(
         output.status.success(),
-        "tenant use failed: stdout={} stderr={}",
+        "tenant use failed: stdout={} stderr={}\n{}",
         String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
+        String::from_utf8_lossy(&output.stderr),
+        daemon_debug_context(db)
     );
 }
 

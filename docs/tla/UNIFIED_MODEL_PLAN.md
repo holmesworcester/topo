@@ -178,6 +178,8 @@ Drift controls (required):
 
 Current runtime note:
 - Exact inbound transport targeting also uses replay-derived local routing state (`local_transport_targets`) to resolve `requestedLocalTransportFP -> tenant`. This is not a new authority source; it should be modeled as a derived local-target relation layered on top of transport identity transitions.
+- Invite creation is now transport-fingerprint exact too: when no explicit `public_spki` is supplied, invite links use the tenant's current `local_transport_targets` fingerprint rather than assuming `peer_id` and transport identity are already equal.
+- Discovery-only bootstrap acceptance may persist an empty `bootstrap_addr` marker row so invite SPKI provenance survives replay, but that row is intentionally not an autodial target and should be modeled as provenance-only state.
 
 Focused follow-up model:
 - `ExactTransportTargeting.tla` isolates the exact-target transport invariants on top of the existing trust lifecycle model:

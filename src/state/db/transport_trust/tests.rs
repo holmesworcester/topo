@@ -992,6 +992,38 @@ fn test_list_active_invite_bootstrap_targets_latest_row_wins_per_invite() {
     assert_eq!(targets[0].bootstrap_addr, "10.0.0.2:4433");
 }
 
+#[test]
+fn test_list_active_invite_bootstrap_targets_ignores_empty_discovery_markers() {
+    let conn = open_in_memory().unwrap();
+    create_tables(&conn).unwrap();
+
+    let recorded_by = "joiner_targets_3";
+    let spki: [u8; 32] = [0x51; 32];
+
+    record_invite_bootstrap_trust(
+        &conn,
+        recorded_by,
+        "ia-empty",
+        "invite-empty",
+        "ws-1",
+        "",
+        &spki,
+    )
+    .unwrap();
+
+    let targets = list_active_invite_bootstrap_targets(&conn, recorded_by).unwrap();
+    assert!(
+        targets.is_empty(),
+        "empty bootstrap_addr rows are discovery-only markers and must not create autodial targets"
+    );
+
+    let addrs = list_active_invite_bootstrap_addrs(&conn, recorded_by).unwrap();
+    assert!(
+        addrs.is_empty(),
+        "empty bootstrap_addr rows must not surface as active autodial addresses"
+    );
+}
+
 /// Characterization: full trust lifecycle — pending → accepted → superseded.
 ///
 /// Covers the complete lifecycle:

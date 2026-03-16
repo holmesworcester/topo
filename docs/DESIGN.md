@@ -117,6 +117,8 @@ Transport runs over QUIC with mTLS, while canonical event authenticity comes fro
 
 At daemon startup, local tenants are discovered from event-projected identity/trust state plus local transport creds. The runtime then builds a single endpoint with exact local transport-fingerprint aliases. Outbound dials always carry one exact expected remote transport fingerprint in SNI. Inbound SNI names the exact local transport fingerprint to reach, not a wildcard workspace.
 
+Invite creation follows the same rule. If a user or device-link invite does not override `public_spki`, the invite link embeds the tenant's current local transport fingerprint from replay-derived `local_transport_targets`, not a looser workspace/peer identifier. That keeps bootstrap targeting aligned with the exact certificate the daemon will actually present.
+
 Client-side verification is exact and immediate: rustls checks that the presented server certificate fingerprint is currently authorized by projected trust rows and exactly matches the fingerprint named in SNI. Server-side verification is split only because Quinn/rustls does not expose SNI to the client-cert verifier. The server verifier therefore performs a node-scoped projected-trust check during handshake, then the accept boundary immediately resolves the requested local transport fingerprint from SNI, maps it to one tenant, re-runs tenant-scoped projected auth for the presented client fingerprint, and rejects before any session work starts if that exact scope check fails. This is the key boundary: one shared socket and one shared accept loop, but tenant-specific trust checks, routing, projection, and query visibility.
 
 This also covers the hard case where multiple local identities on the same endpoint belong to the same workspace. Tenant trust sets may overlap in value, so the same remote peer can be valid for more than one local tenant. A given accepted connection is routed to one tenant scope, but the shared endpoint can concurrently host sessions for many tenant scopes, including multiple identities in the same workspace, without collapsing their state into one identity.
@@ -737,6 +739,8 @@ The single QUIC endpoint uses a node-scoped union trust closure that accepts a h
 Trust checks are **tenant-scoped** (`recorded_by`-partitioned). Value-level trust-set overlap is allowed on the remote side (the same remote SPKI may appear in multiple tenants' trust rows), but exact local-target routing requires one unique local transport fingerprint per tenant target. Another tenant's trust must never satisfy an SNI request for this tenant. `invites_accepted` is read during startup tenant discovery, while per-connection exact-target routing uses `local_transport_targets` and per-connection authorization uses `is_authorized_for_tenant` over PeerShared/bootstrap trust tables.
 
 `local_transport_targets` is not a new authority source. It is replay-derived local routing state: local event projection emits transport identity intents, the transport adapter materializes the cert/key, and that successful apply updates the tenant's currently active local transport fingerprint. Replaying local event state rebuilds both `local_transport_creds` and `local_transport_targets`.
+
+Discovery-only invite acceptance may still persist an empty `bootstrap_addr` marker row so the bootstrap SPKI remains available in projected state. That row is a projection marker only; it must never create an autodial target or be treated like a concrete bootstrap endpoint.
 
 ### User removal is out of scope
 

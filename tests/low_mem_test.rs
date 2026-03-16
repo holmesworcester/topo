@@ -6,7 +6,7 @@
 
 use std::time::Duration;
 
-use topo::testutil::{sync_until_converged, Peer};
+use topo::testutil::{converge_workspace_transport_graph, sync_until_converged, Peer};
 
 fn peak_rss_mib() -> Option<f64> {
     let status = std::fs::read_to_string("/proc/self/status").ok()?;
@@ -79,29 +79,37 @@ async fn low_mem_ios_functional_smoke_2k() {
     let _env = EnvGuard::enable_low_mem_ios();
 
     let alice = Peer::new_with_identity("alice_lowmem_functional");
-    let bob = Peer::new_with_identity("bob_lowmem_functional");
+    let bob = Peer::new_in_workspace("bob_lowmem_functional", &alice).await;
+    let peers = vec![alice, bob];
+    converge_workspace_transport_graph(&peers).await;
+    let mut peers = peers.into_iter();
+    let alice = peers.next().expect("missing alice");
+    let bob = peers.next().expect("missing bob");
 
     alice.batch_create_messages(1_000);
     bob.batch_create_messages(1_000);
 
-    let alice_shared_before_sync = alice.shared_store_count();
-    let bob_shared_before_sync = bob.shared_store_count();
-    let expected_alice_shared = alice_shared_before_sync + bob_shared_before_sync;
-    let expected_bob_shared = bob_shared_before_sync + alice_shared_before_sync;
+    let expected_recorded_messages = 2_000;
 
     let _metrics = sync_until_converged(
         &alice,
         &bob,
         || {
-            alice.shared_store_count() >= expected_alice_shared
-                && bob.shared_store_count() >= expected_bob_shared
+            alice.recorded_message_event_count() >= expected_recorded_messages
+                && bob.recorded_message_event_count() >= expected_recorded_messages
         },
         Duration::from_secs(120),
     )
     .await;
 
-    assert_eq!(alice.message_count(), 1_000);
-    assert_eq!(bob.message_count(), 1_000);
+    assert_eq!(
+        alice.recorded_message_event_count(),
+        expected_recorded_messages
+    );
+    assert_eq!(
+        bob.recorded_message_event_count(),
+        expected_recorded_messages
+    );
 
     eprintln!();
     eprintln!("=== Low-mem functional smoke (2k) ===");
@@ -120,31 +128,37 @@ async fn low_mem_ios_budget_smoke_10k() {
     let _env = EnvGuard::enable_low_mem_ios();
 
     let alice = Peer::new_with_identity("alice_lowmem_smoke");
-    let bob = Peer::new_with_identity("bob_lowmem_smoke");
+    let bob = Peer::new_in_workspace("bob_lowmem_smoke", &alice).await;
+    let peers = vec![alice, bob];
+    converge_workspace_transport_graph(&peers).await;
+    let mut peers = peers.into_iter();
+    let alice = peers.next().expect("missing alice");
+    let bob = peers.next().expect("missing bob");
 
     alice.batch_create_messages(5_000);
     bob.batch_create_messages(5_000);
 
-    // Convergence gate on raw shared events. Remote messages are synced into
-    // the store but may remain projection-blocked across independently bootstrapped peers.
-    let alice_shared_before_sync = alice.shared_store_count();
-    let bob_shared_before_sync = bob.shared_store_count();
-    let expected_alice_shared = alice_shared_before_sync + bob_shared_before_sync;
-    let expected_bob_shared = bob_shared_before_sync + alice_shared_before_sync;
+    let expected_recorded_messages = 10_000;
 
     let _metrics = sync_until_converged(
         &alice,
         &bob,
         || {
-            alice.shared_store_count() >= expected_alice_shared
-                && bob.shared_store_count() >= expected_bob_shared
+            alice.recorded_message_event_count() >= expected_recorded_messages
+                && bob.recorded_message_event_count() >= expected_recorded_messages
         },
         Duration::from_secs(180),
     )
     .await;
 
-    assert_eq!(alice.message_count(), 5_000);
-    assert_eq!(bob.message_count(), 5_000);
+    assert_eq!(
+        alice.recorded_message_event_count(),
+        expected_recorded_messages
+    );
+    assert_eq!(
+        bob.recorded_message_event_count(),
+        expected_recorded_messages
+    );
 
     // Use current RSS here instead of process-wide VmHWM so this test's budget
     // is not polluted by other low_mem_test cases that may run in the same
@@ -179,23 +193,25 @@ async fn low_mem_ios_budget_soak_million() {
     let budget = rss_budget_mib_from_env("LOW_MEM_IOS_SOAK_BUDGET_MIB", 24.0);
 
     let alice = Peer::new_with_identity("alice_lowmem_soak");
-    let bob = Peer::new_with_identity("bob_lowmem_soak");
+    let bob = Peer::new_in_workspace("bob_lowmem_soak", &alice).await;
+    let peers = vec![alice, bob];
+    converge_workspace_transport_graph(&peers).await;
+    let mut peers = peers.into_iter();
+    let alice = peers.next().expect("missing alice");
+    let bob = peers.next().expect("missing bob");
 
     alice.batch_create_messages(events);
-    // Convergence gate on raw shared events. Projection validity is a separate concern.
-    let alice_shared_before_sync = alice.shared_store_count();
-    let bob_shared_before_sync = bob.shared_store_count();
-    let expected_bob_shared = bob_shared_before_sync + alice_shared_before_sync;
 
     let _metrics = sync_until_converged(
         &alice,
         &bob,
-        || bob.shared_store_count() >= expected_bob_shared,
+        || bob.recorded_message_event_count() >= events as i64,
         Duration::from_secs(3600),
     )
     .await;
 
-    assert_eq!(alice.message_count(), events as i64);
+    assert_eq!(alice.recorded_message_event_count(), events as i64);
+    assert_eq!(bob.recorded_message_event_count(), events as i64);
 
     let peak = peak_rss_mib().expect("VmHWM unavailable on this platform");
     assert!(

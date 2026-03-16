@@ -18,8 +18,8 @@ use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 use topo::crypto::{event_id_from_base64, event_id_to_base64};
 use topo::testutil::{
-    assert_eventually, clone_events_to, start_chain, start_sink_download,
-    start_sink_download_with_shutdown, Peer,
+    assert_eventually, clone_events_to, converge_workspace_transport_graph, start_chain,
+    start_sink_download, start_sink_download_with_shutdown, Peer,
 };
 
 /// Read peak resident set size from /proc/self/status (Linux only).
@@ -119,6 +119,7 @@ async fn run_chain_bench(n: usize, event_count: usize) {
         let joined = Peer::new_in_workspace(&format!("p{}", i), &peers[0]).await;
         peers.push(joined);
     }
+    converge_workspace_transport_graph(&peers).await;
 
     let gen_start = Instant::now();
     peers[0].batch_create_messages(event_count);
@@ -213,6 +214,9 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
         sources.push(joined);
     }
     let sink = Peer::new_in_workspace("dsink", &sources[0]).await;
+    sources.push(sink);
+    converge_workspace_transport_graph(&sources).await;
+    let sink = sources.pop().expect("sink peer missing after convergence");
 
     // Generate events at S0 only
     let gen_start = Instant::now();
@@ -351,6 +355,9 @@ async fn run_catchup_large_file(
         sources.push(joined);
     }
     let sink = Peer::new_in_workspace("fsink", &sources[0]).await;
+    sources.push(sink);
+    converge_workspace_transport_graph(&sources).await;
+    let sink = sources.pop().expect("sink peer missing after convergence");
 
     // Generate file slices at S0
     let gen_start = Instant::now();
@@ -575,6 +582,9 @@ async fn catchup_non_uniform_sources() {
         sources.push(joined);
     }
     let sink = Peer::new_in_workspace("nusink", &sources[0]).await;
+    sources.push(sink);
+    converge_workspace_transport_graph(&sources).await;
+    let sink = sources.pop().expect("sink peer missing after convergence");
 
     // Create shared messages at S0
     for i in 0..shared_count {
@@ -671,6 +681,9 @@ async fn catchup_dead_peer_dropout() {
         sources.push(joined);
     }
     let sink = Peer::new_in_workspace("dpsink", &sources[0]).await;
+    sources.push(sink);
+    converge_workspace_transport_graph(&sources).await;
+    let sink = sources.pop().expect("sink peer missing after convergence");
 
     // Create events at S0
     sources[0].batch_create_messages(event_count);

@@ -40,8 +40,8 @@ use crate::event_modules::{
     ReactionEvent, TenantEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
 };
 use crate::peering::loops::{
-    accept_loop, connect_loop, connect_loop_with_shared_ingest,
-    connect_loop_with_shared_ingest_until_cancel,
+    accept_loop, connect_loop, connect_loop_with_coordination_until_cancel,
+    connect_loop_with_shared_ingest, connect_loop_with_shared_ingest_until_cancel,
 };
 use crate::projection::apply::project_one;
 use crate::projection::create::{
@@ -188,6 +188,303 @@ async fn wait_for_materialized_local_peer_signer(
     panic!(
         "local peer signer not materialized for {} within {:?}: {}",
         scoped_peer_id, timeout, debug
+    );
+}
+
+async fn poll_for_tenant_transport_target(
+    db_path: &str,
+    tenant_id: &str,
+    expected_transport_peer_id: &str,
+    timeout: Duration,
+) -> bool {
+    let start = Instant::now();
+    loop {
+        let _ = crate::event_pipeline::drain_project_queue(db_path, tenant_id, 1000);
+        if let Ok(db) = open_connection(db_path) {
+            if let Ok(Some(target)) =
+                crate::state::db::transport_creds::resolve_tenant_transport_target(&db, tenant_id)
+            {
+                if target.transport_peer_id == expected_transport_peer_id {
+                    return true;
+                }
+            }
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_tenant_transport_target(
+    db_path: &str,
+    tenant_id: &str,
+    expected_transport_peer_id: &str,
+    timeout: Duration,
+) {
+    if poll_for_tenant_transport_target(db_path, tenant_id, expected_transport_peer_id, timeout)
+        .await
+    {
+        return;
+    }
+
+    let debug = open_connection(db_path)
+        .ok()
+        .map(|db| {
+            let target =
+                crate::state::db::transport_creds::resolve_tenant_transport_target(&db, tenant_id)
+                    .ok()
+                    .flatten()
+                    .map(|target| target.transport_peer_id)
+                    .unwrap_or_else(|| "<none>".to_string());
+            let bootstrap_rows: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM invite_bootstrap_trust WHERE recorded_by = ?1",
+                    rusqlite::params![tenant_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let pending_rows: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM pending_invite_bootstrap_trust WHERE recorded_by = ?1",
+                    rusqlite::params![tenant_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            let peers_shared_rows: i64 = db
+                .query_row(
+                    "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
+                    rusqlite::params![tenant_id],
+                    |row| row.get(0),
+                )
+                .unwrap_or(0);
+            format!(
+                "target={} bootstrap_rows={} pending_rows={} peers_shared_rows={}",
+                target, bootstrap_rows, pending_rows, peers_shared_rows
+            )
+        })
+        .unwrap_or_else(|| "failed to open db for debug".to_string());
+
+    panic!(
+        "tenant {} transport target did not converge to {} within {:?}: {}",
+        tenant_id, expected_transport_peer_id, timeout, debug
+    );
+}
+
+async fn poll_for_projected_peer_transport(
+    db_path: &str,
+    recorded_by: &str,
+    expected_transport_peer_id: &str,
+    timeout: Duration,
+) -> bool {
+    let start = Instant::now();
+    loop {
+        let _ = crate::event_pipeline::drain_project_queue(db_path, recorded_by, 1000);
+        if has_projected_peer_transport_now(db_path, recorded_by, expected_transport_peer_id) {
+            return true;
+        }
+        if start.elapsed() >= timeout {
+            return false;
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
+
+async fn wait_for_projected_peer_transport(
+    db_path: &str,
+    recorded_by: &str,
+    expected_transport_peer_id: &str,
+    timeout: Duration,
+) {
+    if poll_for_projected_peer_transport(db_path, recorded_by, expected_transport_peer_id, timeout)
+        .await
+    {
+        return;
+    }
+
+    panic!(
+        "peer {} did not project transport fingerprint {} within {:?}",
+        recorded_by, expected_transport_peer_id, timeout
+    );
+}
+
+fn has_projected_peer_transport_now(
+    db_path: &str,
+    recorded_by: &str,
+    expected_transport_peer_id: &str,
+) -> bool {
+    open_connection(db_path)
+        .ok()
+        .and_then(|db| {
+            db.query_row(
+                "SELECT COUNT(*)
+                 FROM peers_shared
+                 WHERE recorded_by = ?1
+                   AND lower(hex(transport_fingerprint)) = ?2",
+                rusqlite::params![recorded_by, expected_transport_peer_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .ok()
+        })
+        .unwrap_or(0)
+        > 0
+}
+
+fn missing_transport_views(peers: &[&Peer], expected_targets: &[(String, String)]) -> Vec<String> {
+    let mut missing = Vec::new();
+    for peer in peers {
+        for (owner_identity, target_transport_peer_id) in expected_targets {
+            if owner_identity == &peer.identity {
+                continue;
+            }
+            if !has_projected_peer_transport_now(
+                &peer.db_path,
+                &peer.identity,
+                target_transport_peer_id,
+            ) {
+                missing.push(format!(
+                    "{} missing transport target {} from {}",
+                    peer.name, target_transport_peer_id, owner_identity
+                ));
+            }
+        }
+    }
+    missing
+}
+
+async fn sync_pair_until_transport_converged(
+    peer_a: &Peer,
+    peer_b: &Peer,
+    expected_targets: &[(String, String)],
+    timeout: Duration,
+) {
+    let accept_endpoint = create_dynamic_endpoint_for_peer(peer_a);
+    let accept_addr = accept_endpoint
+        .local_addr()
+        .expect("failed to get accept endpoint addr");
+    let connect_endpoint =
+        create_dynamic_endpoint_for_peer_bind(peer_b, "0.0.0.0:0".parse().unwrap());
+    let connect_cancel = tokio_util::sync::CancellationToken::new();
+    let connect_cancel_thread = connect_cancel.clone();
+    let accept_endpoint_thread = accept_endpoint.clone();
+    let connect_endpoint_thread = connect_endpoint.clone();
+    let a_db = peer_a.db_path.clone();
+    let a_identity = peer_a.identity.clone();
+    let b_db = peer_b.db_path.clone();
+    let b_identity = peer_b.identity.clone();
+    let target_peer_id = current_transport_target(peer_a);
+
+    let accept_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            if let Err(e) = accept_loop(
+                &a_db,
+                &a_identity,
+                accept_endpoint_thread,
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await
+            {
+                tracing::warn!("temporary identity accept_loop exited: {}", e);
+            }
+        });
+    });
+
+    let connect_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            if let Err(e) = connect_loop_with_coordination_until_cancel(
+                &b_db,
+                &b_identity,
+                connect_endpoint_thread,
+                accept_addr,
+                &target_peer_id,
+                None,
+                noop_intro_spawner,
+                test_ingest_fns(),
+                Arc::new(crate::sync::CoordinationManager::new()),
+                connect_cancel_thread,
+            )
+            .await
+            {
+                tracing::warn!("temporary identity connect_loop exited: {}", e);
+            }
+        });
+    });
+
+    let check_peers = [peer_a, peer_b];
+    let start = Instant::now();
+    loop {
+        let missing = missing_transport_views(&check_peers, expected_targets);
+        if missing.is_empty() {
+            break;
+        }
+        if start.elapsed() >= timeout {
+            connect_cancel.cancel();
+            connect_endpoint.close(0u32.into(), b"identity convergence timeout");
+            accept_endpoint.close(0u32.into(), b"identity convergence timeout");
+            let _ = accept_handle.join();
+            let _ = connect_handle.join();
+            panic!(
+                "workspace transport graph did not converge between {} and {} within {:?}: {:?}",
+                peer_a.name, peer_b.name, timeout, missing
+            );
+        }
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+
+    connect_cancel.cancel();
+    connect_endpoint.close(0u32.into(), b"identity convergence done");
+    accept_endpoint.close(0u32.into(), b"identity convergence done");
+    let _ = accept_handle.join();
+    let _ = connect_handle.join();
+}
+
+/// Ensure every peer in one workspace has projected every other peer's current
+/// strict transport target before benchmark/test data generation begins.
+///
+/// This keeps the realism/benchmark harness aligned with exact-target transport:
+/// once message/file traffic starts, the topology helpers should not need to
+/// widen auth or rely on stale/bootstrap aliases just to discover peers.
+pub async fn converge_workspace_transport_graph(peers: &[Peer]) {
+    if peers.len() < 2 {
+        return;
+    }
+    for peer in peers.iter().skip(1) {
+        assert_eq!(
+            peer.workspace_id, peers[0].workspace_id,
+            "workspace transport graph convergence requires one shared workspace"
+        );
+    }
+
+    let expected_targets: Vec<(String, String)> = peers
+        .iter()
+        .map(|peer| (peer.identity.clone(), current_transport_target(peer)))
+        .collect();
+
+    for peer in peers.iter().skip(1) {
+        sync_pair_until_transport_converged(
+            &peers[0],
+            peer,
+            &expected_targets,
+            Duration::from_secs(30),
+        )
+        .await;
+    }
+
+    let peer_refs: Vec<&Peer> = peers.iter().collect();
+    let missing = missing_transport_views(&peer_refs, &expected_targets);
+    assert!(
+        missing.is_empty(),
+        "workspace transport graph not fully converged after hub fanout: {:?}",
+        missing
     );
 }
 
@@ -451,7 +748,8 @@ impl Peer {
         let peer_ep = peer_endpoint.clone();
         let peer_db = peer.db_path.clone();
         let peer_id = scoped_peer_id.clone();
-        let creator_target_peer_id = creator.identity.clone();
+        let creator_target_peer_id = hex::encode(creator.spki_fingerprint());
+        let creator_target_peer_id_for_thread = creator_target_peer_id.clone();
         let _connector_handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -463,7 +761,7 @@ impl Peer {
                     &peer_id,
                     peer_ep,
                     sync_addr,
-                    &creator_target_peer_id,
+                    &creator_target_peer_id_for_thread,
                     None,
                     noop_intro_spawner,
                     test_ingest_fns(),
@@ -476,6 +774,28 @@ impl Peer {
         let (eid, key) = wait_for_materialized_local_peer_signer(
             &peer.db_path,
             &scoped_peer_id,
+            Duration::from_secs(10),
+        )
+        .await;
+        wait_for_tenant_transport_target(
+            &peer.db_path,
+            &scoped_peer_id,
+            &scoped_peer_id,
+            Duration::from_secs(10),
+        )
+        .await;
+        let joiner_target_peer_id = current_transport_target(&peer);
+        wait_for_projected_peer_transport(
+            &peer.db_path,
+            &scoped_peer_id,
+            &creator_target_peer_id,
+            Duration::from_secs(10),
+        )
+        .await;
+        wait_for_projected_peer_transport(
+            &creator.db_path,
+            &creator.identity,
+            &joiner_target_peer_id,
             Duration::from_secs(10),
         )
         .await;
@@ -615,7 +935,8 @@ impl Peer {
         let peer_ep = peer_endpoint.clone();
         let peer_db = peer.db_path.clone();
         let peer_id = scoped_peer_id.clone();
-        let creator_target_peer_id = creator.identity.clone();
+        let creator_target_peer_id = hex::encode(creator.spki_fingerprint());
+        let creator_target_peer_id_for_thread = creator_target_peer_id.clone();
         let _connector_handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -627,7 +948,7 @@ impl Peer {
                     &peer_id,
                     peer_ep,
                     sync_addr,
-                    &creator_target_peer_id,
+                    &creator_target_peer_id_for_thread,
                     None,
                     noop_intro_spawner,
                     test_ingest_fns(),
@@ -639,6 +960,28 @@ impl Peer {
         let (eid, key) = wait_for_materialized_local_peer_signer(
             &peer.db_path,
             &scoped_peer_id,
+            Duration::from_secs(10),
+        )
+        .await;
+        wait_for_tenant_transport_target(
+            &peer.db_path,
+            &scoped_peer_id,
+            &scoped_peer_id,
+            Duration::from_secs(10),
+        )
+        .await;
+        let joiner_target_peer_id = current_transport_target(&peer);
+        wait_for_projected_peer_transport(
+            &peer.db_path,
+            &scoped_peer_id,
+            &creator_target_peer_id,
+            Duration::from_secs(10),
+        )
+        .await;
+        wait_for_projected_peer_transport(
+            &creator.db_path,
+            &creator.identity,
+            &joiner_target_peer_id,
             Duration::from_secs(10),
         )
         .await;
@@ -2289,6 +2632,10 @@ pub fn verify_projection_invariants(peer: &Peer) {
 // REALISM SYNC HELPERS
 // ---------------------------------------------------------------------------
 
+fn current_transport_target(peer: &Peer) -> String {
+    hex::encode(peer.spki_fingerprint())
+}
+
 /// Start sync between two peers in the same workspace with projected trust.
 ///
 /// Both peers must already have each other's PeerShared events projected from
@@ -2323,7 +2670,7 @@ pub fn start_peers(
     let a_identity = peer_a.identity.clone();
     let b_db = peer_b.db_path.clone();
     let b_identity = peer_b.identity.clone();
-    let target_peer_id = peer_a.identity.clone();
+    let target_peer_id = current_transport_target(peer_a);
 
     let a_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -2427,7 +2774,7 @@ pub fn start_peers_dynamic(
     let a_identity = peer_a.identity.clone();
     let b_db = peer_b.db_path.clone();
     let b_identity = peer_b.identity.clone();
-    let target_peer_id = peer_a.identity.clone();
+    let target_peer_id = current_transport_target(peer_a);
     let a_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -2644,7 +2991,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
         let db_path = peers[i].db_path.clone();
         let identity = peers[i].identity.clone();
         let remote = server_addrs[idx];
-        let target_peer_id = peers[idx].identity.clone();
+        let target_peer_id = current_transport_target(&peers[idx]);
         handles.push(std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -2750,7 +3097,7 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
         sink_connectors.push((
             client_endpoint,
             source_addrs[i],
-            sources[i].identity.clone(),
+            current_transport_target(&sources[i]),
         ));
     }
 
@@ -2900,7 +3247,7 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
         sink_connectors.push((
             client_endpoint,
             source_addrs[i],
-            sources[i].identity.clone(),
+            current_transport_target(&sources[i]),
         ));
     }
 

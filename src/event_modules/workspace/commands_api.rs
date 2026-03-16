@@ -7,6 +7,7 @@ use super::commands::{
     join_workspace_as_new_user, persist_join_peer_secret, persist_link_peer_secret,
 };
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
+use crate::db::transport_creds;
 use crate::service::{open_db_for_peer, open_db_load};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -95,6 +96,43 @@ fn resolve_admin_event_for_signer(
     }
 }
 
+fn decode_hex32(
+    value: &str,
+    what: &str,
+) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+    let bytes = hex::decode(value)?;
+    if bytes.len() != 32 {
+        return Err(format!("{what} is not valid 32-byte hex SPKI").into());
+    }
+    let mut arr = [0u8; 32];
+    arr.copy_from_slice(&bytes);
+    Ok(arr)
+}
+
+fn resolve_invite_bootstrap_spki(
+    db: &Connection,
+    recorded_by: &str,
+    public_spki_hex: Option<&str>,
+) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
+    if let Some(spki_hex) = public_spki_hex {
+        return decode_hex32(spki_hex, "SPKI");
+    }
+
+    if let Some(target) = transport_creds::resolve_tenant_transport_target(db, recorded_by)? {
+        return decode_hex32(&target.transport_peer_id, "transport_peer_id");
+    }
+
+    if transport_creds::load_local_creds(db, recorded_by)?.is_some() {
+        return decode_hex32(recorded_by, "peer_id");
+    }
+
+    Err(format!(
+        "no local transport target is materialized for tenant {}; cannot create invite",
+        recorded_by
+    )
+    .into())
+}
+
 // DB-path-level command wrappers (moved from service.rs)
 
 pub fn create_workspace_for_db(
@@ -142,23 +180,7 @@ fn create_invite_for_recorded_by(
             "Could not resolve admin event for local peer signer.".into()
         })?;
 
-    let bootstrap_spki = if let Some(spki_hex) = public_spki_hex {
-        let spki_bytes = hex::decode(spki_hex)?;
-        if spki_bytes.len() != 32 {
-            return Err("SPKI must be 32 bytes hex".into());
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&spki_bytes);
-        arr
-    } else {
-        let spki_bytes = hex::decode(recorded_by)?;
-        if spki_bytes.len() != 32 {
-            return Err("peer_id is not valid 32-byte hex SPKI".into());
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&spki_bytes);
-        arr
-    };
+    let bootstrap_spki = resolve_invite_bootstrap_spki(db, recorded_by, public_spki_hex)?;
 
     let addrs = if bootstrap_addrs.is_empty() {
         let detected = super::invite_link::detect_bootstrap_addrs(listen_port);
@@ -449,24 +471,7 @@ pub fn create_device_link_for_peer(
 
     let workspace_id = super::resolve_workspace_for_peer(&db, peer_id)?;
 
-    // Resolve SPKI: use provided or fall back to peer's transport SPKI
-    let bootstrap_spki = if let Some(spki_hex) = public_spki_hex {
-        let spki_bytes = hex::decode(spki_hex)?;
-        if spki_bytes.len() != 32 {
-            return Err("SPKI must be 32 bytes hex".into());
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&spki_bytes);
-        arr
-    } else {
-        let spki_bytes = hex::decode(peer_id)?;
-        if spki_bytes.len() != 32 {
-            return Err("peer_id is not valid 32-byte hex SPKI".into());
-        }
-        let mut arr = [0u8; 32];
-        arr.copy_from_slice(&spki_bytes);
-        arr
-    };
+    let bootstrap_spki = resolve_invite_bootstrap_spki(&db, peer_id, public_spki_hex)?;
 
     let addrs = if bootstrap_addrs.is_empty() {
         let detected = super::invite_link::detect_bootstrap_addrs(listen_port);
@@ -496,4 +501,55 @@ pub fn create_device_link_for_peer(
         invite_link: result.invite_link,
         invite_event_id: event_id_to_base64(&result.invite_event_id),
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::resolve_invite_bootstrap_spki;
+    use crate::db::open_in_memory;
+    use crate::db::schema::create_tables;
+    use crate::db::transport_creds::{
+        set_local_transport_target, store_local_creds_with_source, CRED_SOURCE_PEER_SHARED,
+    };
+
+    #[test]
+    fn resolve_invite_bootstrap_spki_prefers_current_transport_target() {
+        let db = open_in_memory().expect("open in-memory db");
+        create_tables(&db).expect("create tables");
+
+        let tenant_id = hex::encode([0x11; 32]);
+        let target_id = hex::encode([0x22; 32]);
+
+        store_local_creds_with_source(&db, &target_id, b"cert", b"key", CRED_SOURCE_PEER_SHARED)
+            .expect("store target creds");
+        set_local_transport_target(&db, &tenant_id, &target_id, CRED_SOURCE_PEER_SHARED)
+            .expect("set local transport target");
+
+        let spki = resolve_invite_bootstrap_spki(&db, &tenant_id, None).expect("resolve spki");
+        assert_eq!(spki, [0x22; 32]);
+    }
+
+    #[test]
+    fn resolve_invite_bootstrap_spki_accepts_explicit_override() {
+        let db = open_in_memory().expect("open in-memory db");
+        create_tables(&db).expect("create tables");
+
+        let explicit = hex::encode([0x33; 32]);
+        let spki =
+            resolve_invite_bootstrap_spki(&db, "tenant", Some(&explicit)).expect("resolve spki");
+        assert_eq!(spki, [0x33; 32]);
+    }
+
+    #[test]
+    fn resolve_invite_bootstrap_spki_falls_back_to_direct_peer_creds() {
+        let db = open_in_memory().expect("open in-memory db");
+        create_tables(&db).expect("create tables");
+
+        let tenant_id = hex::encode([0x44; 32]);
+        store_local_creds_with_source(&db, &tenant_id, b"cert", b"key", CRED_SOURCE_PEER_SHARED)
+            .expect("store direct creds");
+
+        let spki = resolve_invite_bootstrap_spki(&db, &tenant_id, None).expect("resolve spki");
+        assert_eq!(spki, [0x44; 32]);
+    }
 }
