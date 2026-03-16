@@ -255,6 +255,8 @@ pub struct DaemonOptions {
     pub bind_ip: Option<String>,
     /// Specific port to bind to. None = random (127.0.0.1:0).
     pub bind_port: Option<u16>,
+    /// Allow retrying on an ephemeral port if the requested bind port is busy.
+    pub allow_ephemeral_bind_fallback: bool,
     /// Disable placeholder autodial via environment variable.
     pub disable_placeholder_autodial: bool,
     /// Disable mDNS discovery via environment variable.
@@ -274,6 +276,7 @@ impl Default for DaemonOptions {
         Self {
             bind_ip: None,
             bind_port: None,
+            allow_ephemeral_bind_fallback: true,
             disable_placeholder_autodial: false,
             disable_discovery: false,
             inherit_stdio: false,
@@ -439,6 +442,21 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
             .arg("start")
             .arg("--bind")
             .arg(&bind_addr);
+        cmd.env_clear();
+        for key in [
+            "HOME",
+            "TMPDIR",
+            "XDG_RUNTIME_DIR",
+            "PATH",
+            "RUST_LOG",
+            "RUST_BACKTRACE",
+            "SSL_CERT_FILE",
+            "SSL_CERT_DIR",
+        ] {
+            if let Some(value) = std::env::var_os(key) {
+                cmd.env(key, value);
+            }
+        }
 
         if opts.disable_placeholder_autodial {
             cmd.env("P7_DISABLE_PLACEHOLDER_AUTODIAL", "1");
@@ -482,7 +500,8 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
         if let Some(status) = exited_early {
             wait_for_daemon_stopped(db, Duration::from_secs(2));
             if attempt + 1 < DAEMON_START_MAX_ATTEMPTS {
-                retry_with_ephemeral_bind |= opts.bind_port.is_some();
+                retry_with_ephemeral_bind |=
+                    opts.allow_ephemeral_bind_fallback && opts.bind_port.is_some();
                 let backoff_ms =
                     DAEMON_START_RETRY_BASE_MS.saturating_mul((attempt as u64).saturating_add(1));
                 std::thread::sleep(Duration::from_millis(backoff_ms));
@@ -504,7 +523,8 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
                 wait_for_daemon_stopped(db, Duration::from_secs(2));
             }
             if attempt + 1 < DAEMON_START_MAX_ATTEMPTS {
-                retry_with_ephemeral_bind |= opts.bind_port.is_some();
+                retry_with_ephemeral_bind |=
+                    opts.allow_ephemeral_bind_fallback && opts.bind_port.is_some();
                 let backoff_ms =
                     DAEMON_START_RETRY_BASE_MS.saturating_mul((attempt as u64).saturating_add(1));
                 std::thread::sleep(Duration::from_millis(backoff_ms));
@@ -531,7 +551,8 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
                 if let Some(status) = child.try_wait().expect("failed to check daemon status") {
                     wait_for_daemon_stopped(db, Duration::from_secs(2));
                     if attempt < 7 {
-                        retry_with_ephemeral_bind |= opts.bind_port.is_some();
+                        retry_with_ephemeral_bind |=
+                            opts.allow_ephemeral_bind_fallback && opts.bind_port.is_some();
                         std::thread::sleep(Duration::from_millis(100));
                         break;
                     }
@@ -550,7 +571,8 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
                 let _ = child.wait();
                 wait_for_daemon_stopped(db, Duration::from_secs(2));
                 if attempt < 7 {
-                    retry_with_ephemeral_bind |= opts.bind_port.is_some();
+                    retry_with_ephemeral_bind |=
+                        opts.allow_ephemeral_bind_fallback && opts.bind_port.is_some();
                     std::thread::sleep(Duration::from_millis(100));
                     break;
                 }
@@ -2059,6 +2081,118 @@ pub fn seed_invite_bootstrap_trust(
         &spki,
     )
     .expect("record_invite_bootstrap_trust");
+}
+
+pub fn wait_for_bootstrap_supersession_and_endpoint_observation(
+    db_path: &str,
+    remote_peer_id: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_millis() as i64;
+        let conn = topo::db::open_connection(db_path).expect("open db");
+        let pending_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM pending_invite_bootstrap_trust",
+                [],
+                |row| row.get(0),
+            )
+            .expect("count pending_invite_bootstrap_trust");
+        let observed_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*)
+                 FROM peer_endpoint_observations
+                 WHERE via_peer_id = ?1
+                   AND expires_at > ?2",
+                rusqlite::params![remote_peer_id, now_ms],
+                |row| row.get(0),
+            )
+            .expect("count peer_endpoint_observations");
+        let transport_identity_materialized = topo::db::transport_creds::discover_local_tenants(&conn)
+            .map(|tenants| {
+                tenants.len() == 1 && tenants[0].transport_peer_id == tenants[0].peer_id
+            })
+            .unwrap_or(false);
+        drop(conn);
+
+        if transport_identity_materialized && pending_rows == 0 && observed_rows > 0 {
+            return;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "bootstrap materialization + endpoint observation did not converge for peer {} in {}ms",
+            remote_peer_id,
+            timeout.as_millis()
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+pub fn wait_for_pending_bootstrap_trust_cleared_and_endpoint_observation(
+    db_path: &str,
+    timeout: Duration,
+) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let now_ms = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .expect("system time")
+            .as_millis() as i64;
+        let conn = topo::db::open_connection(db_path).expect("open db");
+        let active_peer_id: Option<String> = conn
+            .query_row(
+                "SELECT peer_id
+                 FROM active_tenant_state
+                 ORDER BY created_at DESC
+                 LIMIT 1",
+                [],
+                |row| row.get(0),
+            )
+            .ok();
+        let pending_rows: i64 = active_peer_id
+            .as_ref()
+            .and_then(|peer_id| {
+                conn.query_row(
+                    "SELECT COUNT(*) FROM pending_invite_bootstrap_trust WHERE recorded_by = ?1",
+                    rusqlite::params![peer_id],
+                    |row| row.get(0),
+                )
+                .ok()
+            })
+            .unwrap_or(i64::MAX);
+        let observed_rows: i64 = active_peer_id
+            .as_ref()
+            .and_then(|peer_id| {
+                conn.query_row(
+                    "SELECT COUNT(*)
+                     FROM peer_endpoint_observations
+                     WHERE recorded_by = ?1
+                       AND expires_at > ?2",
+                    rusqlite::params![peer_id, now_ms],
+                    |row| row.get(0),
+                )
+                .ok()
+            })
+            .unwrap_or(0);
+        drop(conn);
+
+        if pending_rows == 0 && observed_rows > 0 {
+            return;
+        }
+
+        assert!(
+            Instant::now() < deadline,
+            "pending bootstrap trust + endpoint observation did not converge in {}ms for {}",
+            timeout.as_millis(),
+            db_path
+        );
+        std::thread::sleep(Duration::from_millis(100));
+    }
 }
 
 pub fn generate_messages(db: &str, count: usize) {
