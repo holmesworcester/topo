@@ -948,8 +948,10 @@ fn test_list_active_invite_bootstrap_targets_keeps_distinct_invites_same_addr() 
         targets.iter().map(|t| t.invite_event_id.clone()).collect();
     assert!(ids.contains("invite-1"));
     assert!(ids.contains("invite-2"));
-    let peer_ids: std::collections::HashSet<String> =
-        targets.iter().map(|t| t.peer_id.clone()).collect();
+    let peer_ids: std::collections::HashSet<String> = targets
+        .iter()
+        .map(|t| t.transport_peer_id.clone())
+        .collect();
     assert_eq!(
         peer_ids,
         std::collections::HashSet::from([hex::encode(spki_a), hex::encode(spki_b),])
@@ -988,7 +990,7 @@ fn test_list_active_invite_bootstrap_targets_latest_row_wins_per_invite() {
     let targets = list_active_invite_bootstrap_targets(&conn, recorded_by).unwrap();
     assert_eq!(targets.len(), 1, "one deterministic winner per invite id");
     assert_eq!(targets[0].invite_event_id, "invite-1");
-    assert_eq!(targets[0].peer_id, hex::encode(spki));
+    assert_eq!(targets[0].transport_peer_id, hex::encode(spki));
     assert_eq!(targets[0].bootstrap_addr, "10.0.0.2:4433");
 }
 

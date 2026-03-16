@@ -4131,7 +4131,8 @@ mod tests {
     use ed25519_dalek::SigningKey;
     use topo::crypto::spki_fingerprint_from_ed25519_pubkey;
     use topo::db::transport_creds::{
-        store_local_creds_with_source, CRED_SOURCE_BOOTSTRAP, CRED_SOURCE_PEER_SHARED,
+        set_local_transport_target, store_local_creds_with_source, CRED_SOURCE_BOOTSTRAP,
+        CRED_SOURCE_PEER_SHARED,
     };
 
     #[test]
@@ -4236,6 +4237,13 @@ mod tests {
             CRED_SOURCE_BOOTSTRAP,
         )
         .expect("store bootstrap creds");
+        set_local_transport_target(
+            &conn,
+            &tenant_peer_id,
+            &bootstrap_peer_id,
+            CRED_SOURCE_BOOTSTRAP,
+        )
+        .expect("set bootstrap transport target");
 
         let states = discover_runtime_tenant_states(&db_path).expect("discover bootstrap state");
         assert_eq!(states.len(), 1);

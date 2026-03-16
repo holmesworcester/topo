@@ -695,7 +695,7 @@ pub fn list_active_invite_bootstrap_addrs(
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InviteBootstrapTarget {
     pub invite_event_id: String,
-    pub peer_id: String,
+    pub transport_peer_id: String,
     pub bootstrap_addr: String,
 }
 
@@ -729,7 +729,7 @@ pub fn list_active_invite_bootstrap_targets(
     let rows = stmt
         .query_map(rusqlite::params![recorded_by, now], |row| {
             let bootstrap_spki_fingerprint: Vec<u8> = row.get(1)?;
-            let peer_id = decode_32_byte_blob(bootstrap_spki_fingerprint)
+            let transport_peer_id = decode_32_byte_blob(bootstrap_spki_fingerprint)
                 .map(hex::encode)
                 .ok_or_else(|| {
                     rusqlite::Error::FromSqlConversionFailure(
@@ -740,7 +740,7 @@ pub fn list_active_invite_bootstrap_targets(
                 })?;
             Ok(InviteBootstrapTarget {
                 invite_event_id: row.get(0)?,
-                peer_id,
+                transport_peer_id,
                 bootstrap_addr: row.get(2)?,
             })
         })?
