@@ -818,12 +818,8 @@ The production peering runtime follows a single conceptual loop:
 - **Transport connection lifecycle**: `src/runtime/transport/connection_lifecycle.rs` — sole owner of QUIC `connect/accept` and TLS peer identity extraction for peering paths (`dial_peer`, `accept_peer`).
 - **Transport session factory**: `src/runtime/transport/session_factory.rs` — sole owner of QUIC stream opening and `DualConnection` / `QuicTransportSessionIo` construction. Provides `open_session_io()` and `accept_session_io()` that return `(session_id, Box<dyn TransportSessionIo>)`.
 - **Transport session I/O adapter**: `src/runtime/transport/transport_session_io.rs` — sole owner of frame boundary validation (`parse_frame` exact-consumption), max-frame-size enforcement, and mapping between QUIC stream errors and `TransportSessionIoError`.
-<<<<<<< HEAD
-- **Peering orchestration seam**: `src/runtime/peering/loops/mod.rs::run_session` — wires session metadata, cancellation, and the session handler together. Receives pre-built `TransportSessionIo` from the transport session factory.
-=======
 - **Live connection ownership**: `src/runtime/peering/loops/mod.rs` — owns the per-peer live connection slot registry and deterministic preferred-direction rule used by both outbound and inbound loops.
 - **Peering orchestration seam**: `src/runtime/peering/loops/mod.rs::run_session` — wires session metadata, peer-removal cancellation, and the session handler together. Receives pre-built `TransportSessionIo` from the transport session factory.
->>>>>>> 0017b2b (Add steady-state peer connection idempotency)
 - **Bootstrap test helpers**: `src/testutil/bootstrap.rs` — test-only. Production runtime never depends on these; bootstrap progression is driven by the autodial loop polling projected SQL state.
 
 ### Event-sourced authority boundary (peering)

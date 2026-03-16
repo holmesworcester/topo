@@ -12,7 +12,6 @@ Maps each TODO section/item to file/test proof of completion.
 | `network` → `peering` | Zero `crate::network` hits in `src/` and `tests/`; `src/peering/` is canonical |
 | `replication` → `sync` | Zero `crate::replication` hits; `src/sync/` is canonical; zero "replication" in src/ comments |
 | `events` → `event_modules` | Zero `crate::events` (bare) hits; `src/event_modules/` is canonical |
-<<<<<<< HEAD
 | `event_runtime` → `event_pipeline` | Zero `crate::event_runtime` hits; `src/event_pipeline.rs` is canonical; straggler comments fixed |
 | `event_runtime_contract.rs` → `event_pipeline_contract.rs` | `src/contracts/event_pipeline_contract.rs` |
 | `network_contract.rs` → `peering_contract.rs` | `src/contracts/peering_contract.rs` |
