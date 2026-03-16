@@ -524,7 +524,7 @@ async fn test_shared_db_three_peer_cross_workspace_real_network_isolation() {
     let server_ep = create_dynamic_endpoint_for_peer(&external);
     let server_addr = server_ep.local_addr().expect("external listen addr");
     let client_ep = create_dynamic_endpoint_for_peer(workspace_b);
-    let server_sni = transport_sni(&external.identity);
+    let server_sni = transport_sni(&external.transport_peer_id());
     let server_ep_clone = server_ep.clone();
     let server_accept = tokio::spawn(async move {
         match server_ep_clone.accept().await {

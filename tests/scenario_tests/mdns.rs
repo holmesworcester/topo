@@ -298,7 +298,7 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
 
     let ext_db = ext.db_path.clone();
     let ext_identity = ext.identity.clone();
-    let remote_peer_id = t0.identity.clone();
+    let remote_peer_id = t0.transport_peer_id();
     let _ext_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()

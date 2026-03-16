@@ -112,7 +112,7 @@ async fn test_three_peer_intro_happy_path() {
     let a_ep1 = ep_a.clone();
     let a_db1 = peer_a.db_path.clone();
     let a_id1 = peer_a.identity.clone();
-    let intro_target_for_a = intro.identity.clone();
+    let intro_target_for_a = intro.transport_peer_id();
     let _a_connect = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -136,7 +136,7 @@ async fn test_three_peer_intro_happy_path() {
     let b_ep1 = ep_b.clone();
     let b_db1 = peer_b.db_path.clone();
     let b_id1 = peer_b.identity.clone();
-    let intro_target_for_b = intro.identity.clone();
+    let intro_target_for_b = intro.transport_peer_id();
     let _b_connect = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -188,10 +188,10 @@ async fn test_three_peer_intro_happy_path() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
-        let ep_a_obs =
-            freshest_endpoint(&db, &intro.identity, &peer_a.identity, now_ms).expect("query ep_a");
-        let ep_b_obs =
-            freshest_endpoint(&db, &intro.identity, &peer_b.identity, now_ms).expect("query ep_b");
+        let ep_a_obs = freshest_endpoint(&db, &intro.identity, &peer_a.transport_peer_id(), now_ms)
+            .expect("query ep_a");
+        let ep_b_obs = freshest_endpoint(&db, &intro.identity, &peer_b.transport_peer_id(), now_ms)
+            .expect("query ep_b");
         assert!(
             ep_a_obs.is_some(),
             "I should have organic endpoint observation for A"
@@ -305,8 +305,8 @@ async fn test_three_peer_intro_happy_path() {
         &ep_i2,
         &intro.db_path,
         &intro.identity,
-        &peer_a.identity,
-        &peer_b.identity,
+        &peer_a.transport_peer_id(),
+        &peer_b.transport_peer_id(),
         30_000,
         4_000,
     )
@@ -440,7 +440,7 @@ async fn test_dynamic_trust_rejects_unknown_peer() {
     // Unknown peer tries to connect to A — should fail at TLS handshake
     // because A's dynamic trust lookup finds no matching row.
     let ep_unknown = create_dynamic_endpoint_for_peer(&unknown);
-    let target_sni = transport_sni(&peer_a.identity);
+    let target_sni = transport_sni(&peer_a.transport_peer_id());
     let result = ep_unknown
         .connect(addr_a, &target_sni)
         .expect("initiate connect")
@@ -504,7 +504,7 @@ async fn test_stale_intro_rejected() {
 
     // Connect to A and send the stale intro
     let ep_i = create_dynamic_endpoint_for_peer(&intro);
-    let target_sni = transport_sni(&peer_a.identity);
+    let target_sni = transport_sni(&peer_a.transport_peer_id());
 
     let conn = ep_i
         .connect(addr_a, &target_sni)
@@ -589,7 +589,7 @@ async fn test_untrusted_peer_intro_rejected() {
     .expect("build offer");
 
     let ep_i = create_dynamic_endpoint_for_peer(&intro);
-    let target_sni = transport_sni(&peer_a.identity);
+    let target_sni = transport_sni(&peer_a.transport_peer_id());
 
     let conn = ep_i
         .connect(addr_a, &target_sni)

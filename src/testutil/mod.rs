@@ -1042,6 +1042,11 @@ impl Peer {
         extract_spki_fingerprint(cert.as_ref()).expect("failed to extract fingerprint")
     }
 
+    /// Return the current exact transport target id (hex SPKI fingerprint) for this peer.
+    pub fn transport_peer_id(&self) -> String {
+        hex::encode(self.spki_fingerprint())
+    }
+
     /// Create a message and insert it into all relevant tables.
     /// Returns the event ID. Requires identity chain (use new_with_identity).
     pub fn create_message(&self, content: &str) -> EventId {
@@ -2644,7 +2649,7 @@ pub fn verify_projection_invariants(peer: &Peer) {
 // ---------------------------------------------------------------------------
 
 fn current_transport_target(peer: &Peer) -> String {
-    hex::encode(peer.spki_fingerprint())
+    peer.transport_peer_id()
 }
 
 /// Start sync between two peers in the same workspace with projected trust.
