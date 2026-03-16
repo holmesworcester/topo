@@ -114,7 +114,7 @@ pub fn set_local_transport_target(
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
-    conn.execute(
+    if let Err(err) = conn.execute(
         "INSERT INTO local_transport_targets (tenant_id, transport_peer_id, source, created_at)
          VALUES (?1, ?2, ?3, ?4)
          ON CONFLICT(tenant_id) DO UPDATE SET
@@ -122,7 +122,35 @@ pub fn set_local_transport_target(
              source = excluded.source,
              created_at = excluded.created_at",
         rusqlite::params![tenant_id, transport_peer_id, source, now],
-    )?;
+    ) {
+        let existing: Option<(String, String)> = conn
+            .query_row(
+                "SELECT tenant_id, source
+                 FROM local_transport_targets
+                 WHERE transport_peer_id = ?1
+                 LIMIT 1",
+                rusqlite::params![transport_peer_id],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        if let Some((existing_tenant_id, existing_source)) = existing {
+            return Err(format!(
+                "failed to set local transport target tenant={} transport_peer_id={} source={}: already owned by tenant={} source={}: {}",
+                tenant_id,
+                transport_peer_id,
+                source,
+                existing_tenant_id,
+                existing_source,
+                err
+            )
+            .into());
+        }
+        return Err(format!(
+            "failed to set local transport target tenant={} transport_peer_id={} source={}: {}",
+            tenant_id, transport_peer_id, source, err
+        )
+        .into());
+    }
     Ok(())
 }
 

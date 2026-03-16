@@ -120,8 +120,12 @@ pub(crate) fn normalize_discovered_addr_for_local_bind(
 // Unified dispatch-keying for bootstrap + discovery ingestion
 // ---------------------------------------------------------------------------
 
-pub(crate) fn bootstrap_dispatch_key(tenant_id: &str, peer_id: &str) -> String {
-    discovery_dispatch_key(tenant_id, peer_id)
+pub(crate) fn bootstrap_dispatch_key(tenant_id: &str, peer_id: &str, remote: SocketAddr) -> String {
+    format!("{tenant_id}@bootstrap:{peer_id}@{remote}")
+}
+
+pub(crate) fn bootstrap_dispatch_key_prefix(tenant_id: &str, peer_id: &str) -> String {
+    format!("{tenant_id}@bootstrap:{peer_id}@")
 }
 
 pub(crate) fn known_peer_dispatch_key(tenant_id: &str, peer_id: &str) -> String {
@@ -292,7 +296,7 @@ pub(crate) fn dispatch_bootstrap_target(
     peer_id: &str,
     remote: SocketAddr,
 ) -> bool {
-    let key = bootstrap_dispatch_key(tenant_id, peer_id);
+    let key = bootstrap_dispatch_key(tenant_id, peer_id, remote);
     let (action, _cancel_rx) = dispatcher.dispatch(&key, remote);
     matches!(
         action,
@@ -1060,13 +1064,13 @@ mod tests {
     }
 
     #[test]
-    fn test_bootstrap_dispatch_key_matches_discovery_key_for_same_peer() {
+    fn test_bootstrap_dispatch_key_is_remote_scoped() {
         let peer_id = format!("{:064x}", 7);
-        let bootstrap = bootstrap_dispatch_key("tenant-a", &peer_id);
-        let discovery = discovery_dispatch_key("tenant-a", &peer_id);
-        assert_eq!(
-            bootstrap, discovery,
-            "bootstrap and discovery must share one peer-scoped dispatch key"
+        let a = bootstrap_dispatch_key("tenant-a", &peer_id, addr(4433));
+        let b = bootstrap_dispatch_key("tenant-a", &peer_id, addr(4434));
+        assert_ne!(
+            a, b,
+            "distinct bootstrap addresses for the same peer must not cancel each other"
         );
     }
 
@@ -1110,7 +1114,7 @@ mod tests {
     }
 
     #[test]
-    fn test_bootstrap_dispatch_collapses_with_discovery_for_same_peer() {
+    fn test_bootstrap_dispatch_allows_multiple_addrs_for_same_peer() {
         let mut dispatcher = PeerDispatcher::new();
         let peer_id = format!("{:064x}", 9);
 
@@ -1121,8 +1125,8 @@ mod tests {
             addr(4433)
         ));
         assert!(
-            !dispatch_discovery_target(&mut dispatcher, "tenant-a", &peer_id, addr(4433)),
-            "discovery target for an already-tracked bootstrap peer should not spawn a second worker"
+            dispatch_bootstrap_target(&mut dispatcher, "tenant-a", &peer_id, addr(4434)),
+            "a second bootstrap address for the same peer should get its own connect attempt"
         );
     }
 }

@@ -178,6 +178,7 @@ where
     let mut bytes_sent: u64 = 0;
     let mut rounds = 0;
     let mut round_observed_ids: Vec<crate::crypto::EventId> = Vec::new();
+    let mut round_open = false;
     let sync_start = Instant::now();
     let reconcile_start = Instant::now();
     let mut reconcile_started_at_ms = current_timestamp_ms();
@@ -244,24 +245,14 @@ where
                     last_activity = Instant::now();
                     if response.is_empty() {
                         info!(
-                            "Reconciliation complete: {} rounds, {}ms",
+                            "Reconciliation locally quiescent: {} rounds, {}ms",
                             rounds,
                             reconcile_start.elapsed().as_millis()
-                        );
-                        let _ = timeline.mark_discovery_round_completed_many(
-                            &round_observed_ids,
-                            current_timestamp_ms(),
                         );
                     } else {
                         control.send(&Frame::NegMsg { msg: response }).await?;
                         control.flush().await?;
                     }
-                    neg_req_tx = None;
-                    neg_resp_rx = None;
-                    if let Some(handle) = neg_worker.take() {
-                        let _ = handle.join();
-                    }
-                    round_observed_ids.clear();
                 }
                 Ok(Err(e)) => {
                     return Err(e.into());
@@ -282,8 +273,20 @@ where
                 reconcile_started_at_ms = current_timestamp_ms();
                 let (window, inner_msg) =
                     decode_initial_neg_open(&msg).map_err(|e| format!("bad NegOpen: {e}"))?;
-                if neg_req_tx.is_some() || reconciling {
+                if reconciling {
                     return Err("received overlapping NegOpen before prior round completed".into());
+                }
+                if round_open {
+                    let _ = timeline.mark_discovery_round_completed_many(
+                        &round_observed_ids,
+                        current_timestamp_ms(),
+                    );
+                    drop(neg_req_tx.take());
+                    let _ = neg_resp_rx.take();
+                    if let Some(handle) = neg_worker.take() {
+                        let _ = handle.join();
+                    }
+                    round_observed_ids.clear();
                 }
                 round_observed_ids.clear();
                 let (req_tx, resp_rx, handle) = spawn_neg_worker(window);
@@ -296,6 +299,7 @@ where
                     .send(inner_msg.to_vec())
                     .map_err(|_| "neg worker channel closed".to_string())?;
                 reconciling = true;
+                round_open = true;
             }
             Ok(Ok(Frame::NegMsg { msg })) => {
                 last_activity = Instant::now();
@@ -478,6 +482,10 @@ where
             }
             last_idle_marker = Instant::now();
         }
+    }
+    if round_open {
+        let _ = timeline
+            .mark_discovery_round_completed_many(&round_observed_ids, current_timestamp_ms());
     }
     // Drop the request channel to signal the worker to exit
     drop(neg_req_tx);

@@ -415,18 +415,24 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
                 attempt + 1
             ))
         });
-        let stdout_path = opts.stdout_file.clone().or_else(|| {
-            debug_log_base
-                .as_ref()
-                .map(|base| base.with_extension("stdout.log"))
-        })
-        .unwrap_or_else(|| default_daemon_log_path(db, "stdout"));
-        let stderr_path = opts.stderr_file.clone().or_else(|| {
-            debug_log_base
-                .as_ref()
-                .map(|base| base.with_extension("stderr.log"))
-        })
-        .unwrap_or_else(|| default_daemon_log_path(db, "stderr"));
+        let stdout_path = opts
+            .stdout_file
+            .clone()
+            .or_else(|| {
+                debug_log_base
+                    .as_ref()
+                    .map(|base| base.with_extension("stdout.log"))
+            })
+            .unwrap_or_else(|| default_daemon_log_path(db, "stdout"));
+        let stderr_path = opts
+            .stderr_file
+            .clone()
+            .or_else(|| {
+                debug_log_base
+                    .as_ref()
+                    .map(|base| base.with_extension("stderr.log"))
+            })
+            .unwrap_or_else(|| default_daemon_log_path(db, "stderr"));
         let mut cmd = Command::new(bin());
         cmd.arg("--db")
             .arg(db)
@@ -717,6 +723,60 @@ pub fn wait_for_active_tenant_ready(db: &str, timeout: Duration) -> serde_json::
             .unwrap_or_else(|err| panic!("status RPC unavailable for {} after ready: {}", db, err)),
         Err(err) => panic!(
             "timed out waiting for active tenant ready after {:?}; last value: {}\n{}\n{}",
+            timeout,
+            err,
+            assert_eventually_debug_context(db),
+            daemon_debug_context(db)
+        ),
+    }
+}
+
+pub fn wait_for_active_tenant_transport_converged(db: &str, timeout: Duration) {
+    match wait_for_active_tenant_transport_converged_debug(db, timeout) {
+        Ok(()) => {}
+        Err(err) => panic!(
+            "timed out waiting for active tenant transport convergence after {:?}; last value: {}\n{}\n{}",
+            timeout,
+            err,
+            assert_eventually_debug_context(db),
+            daemon_debug_context(db)
+        ),
+    }
+}
+
+pub fn wait_for_tenant_transport_converged(db: &str, tenant_peer_id: &str, timeout: Duration) {
+    match wait_for_tenant_transport_converged_debug(db, tenant_peer_id, timeout) {
+        Ok(()) => {}
+        Err(err) => panic!(
+            "timed out waiting for tenant {} transport convergence after {:?}; last value: {}\n{}\n{}",
+            tenant_peer_id,
+            timeout,
+            err,
+            assert_eventually_debug_context(db),
+            daemon_debug_context(db)
+        ),
+    }
+}
+
+pub fn wait_for_active_tenant_bootstrap_ready(db: &str, timeout: Duration) {
+    match wait_for_active_tenant_bootstrap_ready_debug(db, timeout) {
+        Ok(()) => {}
+        Err(err) => panic!(
+            "timed out waiting for active tenant bootstrap readiness after {:?}; last value: {}\n{}\n{}",
+            timeout,
+            err,
+            assert_eventually_debug_context(db),
+            daemon_debug_context(db)
+        ),
+    }
+}
+
+pub fn wait_for_tenant_bootstrap_ready(db: &str, tenant_peer_id: &str, timeout: Duration) {
+    match wait_for_tenant_bootstrap_ready_debug(db, tenant_peer_id, timeout) {
+        Ok(()) => {}
+        Err(err) => panic!(
+            "timed out waiting for tenant {} bootstrap readiness after {:?}; last value: {}\n{}\n{}",
+            tenant_peer_id,
             timeout,
             err,
             assert_eventually_debug_context(db),
@@ -1136,6 +1196,11 @@ pub fn accept_invite_with_identity_and_timeout(
         devicename,
         accept_timeout,
     );
+    if !invite_has_empty_bootstrap_addrs(invite_link) {
+        let accepted_peer_id = active_tenant_peer_id(db)
+            .expect("accepted invite should set the new tenant active on the running daemon");
+        wait_for_tenant_transport_converged(db, &accepted_peer_id, accept_timeout);
+    }
     // Stop temporary daemon; callers decide daemon lifecycle.
     stop_daemon(db, &mut tmp_daemon);
     wait_for_daemon_stopped(db, Duration::from_secs(10));
@@ -1199,6 +1264,11 @@ pub fn accept_device_link_with_name_and_timeout(
         start_daemon(db)
     };
     accept_device_link_with_name_on_running_daemon(db, invite_link, devicename, accept_timeout);
+    if !invite_has_empty_bootstrap_addrs(invite_link) {
+        let accepted_peer_id = active_tenant_peer_id(db)
+            .expect("accepted device link should set the new tenant active on the running daemon");
+        wait_for_tenant_transport_converged(db, &accepted_peer_id, accept_timeout);
+    }
     stop_daemon(db, &mut tmp_daemon);
     wait_for_daemon_stopped(db, Duration::from_secs(10));
 }
@@ -1260,6 +1330,174 @@ fn wait_for_active_tenant_ready_debug(db: &str, timeout: Duration) -> Result<(),
                 last = err;
             }
         }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(last)
+}
+
+fn wait_for_active_tenant_transport_converged_debug(
+    db: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let start = Instant::now();
+    let mut last = String::from("status unavailable");
+    while start.elapsed() < timeout {
+        let status = try_status_via_rpc_for_db(db);
+        let active_peer_id = status
+            .as_ref()
+            .ok()
+            .and_then(|data| {
+                data["tenants"].as_array().and_then(|tenants| {
+                    tenants.iter().find_map(|tenant| {
+                        tenant["active"]
+                            .as_bool()
+                            .unwrap_or(false)
+                            .then(|| tenant["peer_id"].as_str().map(str::to_string))
+                            .flatten()
+                    })
+                })
+            })
+            .or_else(|| {
+                let conn = topo::db::open_connection(db).ok()?;
+                topo::db::transport_creds::discover_local_tenants(&conn)
+                    .ok()?
+                    .into_iter()
+                    .next()
+                    .map(|tenant| tenant.peer_id)
+            });
+
+        match active_peer_id {
+            Some(active_peer_id) => {
+                match wait_for_tenant_transport_converged_debug(
+                    db,
+                    &active_peer_id,
+                    Duration::from_millis(1),
+                ) {
+                    Ok(()) => return Ok(()),
+                    Err(err) => {
+                        last = err;
+                    }
+                }
+            }
+            None => {
+                last = status
+                    .map(|data| data.to_string())
+                    .unwrap_or_else(|err| err);
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(last)
+}
+
+fn wait_for_tenant_transport_converged_debug(
+    db: &str,
+    tenant_peer_id: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let start = Instant::now();
+    let mut last = String::from("transport target unavailable");
+    while start.elapsed() < timeout {
+        match topo::db::open_connection(db).ok().and_then(|conn| {
+            topo::db::transport_creds::resolve_tenant_transport_target(&conn, tenant_peer_id)
+                .ok()
+                .flatten()
+        }) {
+            Some(target) if target.transport_peer_id == tenant_peer_id => return Ok(()),
+            Some(target) => {
+                last = format!(
+                    "tenant_peer_id={} transport_peer_id={} source={}",
+                    tenant_peer_id, target.transport_peer_id, target.source
+                );
+            }
+            None => {
+                last = format!(
+                    "tenant_peer_id={} transport target unavailable",
+                    tenant_peer_id
+                );
+            }
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(last)
+}
+
+fn wait_for_active_tenant_bootstrap_ready_debug(db: &str, timeout: Duration) -> Result<(), String> {
+    let start = Instant::now();
+    let mut last = String::from("status unavailable");
+    while start.elapsed() < timeout {
+        let active_peer_id = active_tenant_peer_id(db).or_else(|| {
+            let conn = topo::db::open_connection(db).ok()?;
+            topo::db::transport_creds::discover_local_tenants(&conn)
+                .ok()?
+                .into_iter()
+                .next()
+                .map(|tenant| tenant.peer_id)
+        });
+
+        if let Some(active_peer_id) = active_peer_id {
+            match wait_for_tenant_bootstrap_ready_debug(
+                db,
+                &active_peer_id,
+                Duration::from_millis(1),
+            ) {
+                Ok(()) => return Ok(()),
+                Err(err) => last = err,
+            }
+        } else {
+            last = String::from("no active tenant");
+        }
+
+        std::thread::sleep(Duration::from_millis(100));
+    }
+    Err(last)
+}
+
+fn wait_for_tenant_bootstrap_ready_debug(
+    db: &str,
+    tenant_peer_id: &str,
+    timeout: Duration,
+) -> Result<(), String> {
+    let start = Instant::now();
+    let mut last = String::from("status unavailable");
+    while start.elapsed() < timeout {
+        if let Ok(conn) = topo::db::open_connection(db) {
+            let transport_target =
+                topo::db::transport_creds::resolve_tenant_transport_target(&conn, tenant_peer_id)
+                    .ok()
+                    .flatten();
+            let converged = transport_target
+                .as_ref()
+                .map(|target| {
+                    target.transport_peer_id == tenant_peer_id
+                        && target.source == topo::db::transport_creds::CRED_SOURCE_PEER_SHARED
+                })
+                .unwrap_or(false);
+            if converged {
+                return Ok(());
+            }
+
+            let bootstrap_targets =
+                topo::db::transport_trust::list_active_invite_bootstrap_targets(
+                    &conn,
+                    tenant_peer_id,
+                )
+                .map(|targets| targets.len())
+                .unwrap_or(0);
+            if bootstrap_targets > 0 {
+                return Ok(());
+            }
+
+            last = format!(
+                "tenant_peer_id={} bootstrap_targets={} transport_target={:?}",
+                tenant_peer_id,
+                bootstrap_targets,
+                transport_target.map(|target| (target.transport_peer_id, target.source))
+            );
+        } else {
+            last = format!("tenant_peer_id={} db unavailable", tenant_peer_id);
+        }
+
         std::thread::sleep(Duration::from_millis(100));
     }
     Err(last)

@@ -21,7 +21,11 @@ use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
 use crate::contracts::peering_contract::SessionDirection;
-use crate::db::transport_creds::TenantInfo;
+use crate::db::open_connection;
+use crate::db::transport_creds::{
+    resolve_tenant_transport_target, TenantInfo, CRED_SOURCE_BOOTSTRAP,
+};
+use crate::db::transport_trust::is_peer_shared_transport_fingerprint;
 use crate::peering::loops::{
     accept_loop_with_ingest_until_cancel,
     connect_loop_with_coordination_until_cancel_with_fallback, preferred_connection_direction,
@@ -37,9 +41,10 @@ use crate::transport::{
 use crate::tuning::shared_ingest_cap;
 
 use super::target_planner::{
-    bootstrap_dispatch_key, collect_all_bootstrap_targets, collect_all_observed_endpoint_targets,
-    discovery_dispatch_key, dispatch_bootstrap_target, dispatch_discovery_target,
-    dispatch_observed_endpoint_target, normalize_discovered_addr_for_local_bind, PeerDispatcher,
+    bootstrap_dispatch_key, bootstrap_dispatch_key_prefix, collect_all_bootstrap_targets,
+    collect_all_observed_endpoint_targets, discovery_dispatch_key, dispatch_bootstrap_target,
+    dispatch_discovery_target, dispatch_observed_endpoint_target,
+    normalize_discovered_addr_for_local_bind, PeerDispatcher,
 };
 
 const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
@@ -117,6 +122,20 @@ struct ActiveConnectWorker {
     cancel: CancellationToken,
     join: std::thread::JoinHandle<()>,
     source: TargetIngressSource,
+}
+
+fn source_precedence(source: &TargetIngressSource) -> u8 {
+    match source {
+        TargetIngressSource::Bootstrap { .. } => 0,
+        TargetIngressSource::ObservedPeer { .. } | TargetIngressSource::Discovery { .. } => 1,
+    }
+}
+
+fn should_ignore_target_event(
+    existing: &TargetIngressSource,
+    incoming: &TargetIngressSource,
+) -> bool {
+    source_precedence(existing) > source_precedence(incoming)
 }
 
 pub(crate) struct RuntimeSupervisor {
@@ -660,7 +679,7 @@ async fn run_target_dispatcher(
 
         let dispatch_key = match &event.source {
             TargetIngressSource::Bootstrap { peer_id, .. } => {
-                bootstrap_dispatch_key(&event.tenant_id, peer_id)
+                bootstrap_dispatch_key(&event.tenant_id, peer_id, event.remote)
             }
             TargetIngressSource::ObservedPeer { peer_id } => {
                 discovery_dispatch_key(&event.tenant_id, peer_id)
@@ -670,7 +689,7 @@ async fn run_target_dispatcher(
             }
         };
 
-        if !should_initiate_connect_for_source(&event.tenant_id, &event.source) {
+        if !should_initiate_connect_for_source_with_db(&db_path, &event.tenant_id, &event.source) {
             if let Some(peer_id) = preferred_outbound_only_peer_id(&event.source) {
                 info!(
                     "Skipping non-preferred {:?} dial key={} tenant={} peer={}",
@@ -681,6 +700,37 @@ async fn run_target_dispatcher(
                 );
             }
             continue;
+        }
+
+        if matches!(event.source, TargetIngressSource::Bootstrap { .. }) {
+            let known_peer_key = known_peer_key_for_event(&event);
+            if let Some(existing) = active_workers.get(&known_peer_key) {
+                if should_ignore_target_event(&existing.source, &event.source) {
+                    info!(
+                        "Keeping existing higher-priority {:?} worker over {:?} key={} tenant={} remote={}",
+                        existing.source,
+                        event.source,
+                        known_peer_key,
+                        short_peer_id(&event.tenant_id),
+                        event.remote
+                    );
+                    continue;
+                }
+            }
+        }
+
+        if let Some(existing) = active_workers.get(&dispatch_key) {
+            if should_ignore_target_event(&existing.source, &event.source) {
+                info!(
+                    "Keeping existing higher-priority {:?} worker over {:?} key={} tenant={} remote={}",
+                    existing.source,
+                    event.source,
+                    dispatch_key,
+                    short_peer_id(&event.tenant_id),
+                    event.remote
+                );
+                continue;
+            }
         }
 
         let should_spawn = match &event.source {
@@ -703,23 +753,12 @@ async fn run_target_dispatcher(
         }
 
         if matches!(
-            (
-                &event.source,
-                active_workers.get(&dispatch_key).map(|w| &w.source)
-            ),
-            (
-                TargetIngressSource::Bootstrap { .. },
-                Some(TargetIngressSource::Bootstrap { .. })
-            )
+            event.source,
+            TargetIngressSource::ObservedPeer { .. } | TargetIngressSource::Discovery { .. }
         ) {
-            info!(
-                "Keeping existing bootstrap worker key={} tenant={} remote={} source={:?}",
-                dispatch_key,
-                short_peer_id(&event.tenant_id),
-                event.remote,
-                event.source
-            );
-            continue;
+            let prefix = bootstrap_worker_prefix_for_event(&event);
+            cancel_bootstrap_workers_for_prefix(&mut active_workers, &mut dispatcher, &prefix)
+                .await;
         }
 
         if let Some(existing) = active_workers.remove(&dispatch_key) {
@@ -843,21 +882,125 @@ async fn run_target_dispatcher(
 
 fn preferred_outbound_only_peer_id(source: &TargetIngressSource) -> Option<&str> {
     match source {
-        TargetIngressSource::Bootstrap { .. } => None,
-        TargetIngressSource::ObservedPeer { peer_id }
-        | TargetIngressSource::Discovery { peer_id } => Some(peer_id),
+        TargetIngressSource::Discovery { peer_id } => Some(peer_id),
+        TargetIngressSource::Bootstrap { .. } | TargetIngressSource::ObservedPeer { .. } => None,
     }
 }
 
 fn should_initiate_connect_for_source(tenant_id: &str, source: &TargetIngressSource) -> bool {
-    let Some(peer_id) = preferred_outbound_only_peer_id(source) else {
-        return true;
-    };
+    match source {
+        TargetIngressSource::Bootstrap { .. } => true,
+        TargetIngressSource::ObservedPeer { peer_id }
+        | TargetIngressSource::Discovery { peer_id } => matches!(
+            preferred_connection_direction(tenant_id, peer_id),
+            Some(SessionDirection::Outbound)
+        ),
+    }
+}
 
-    matches!(
-        preferred_connection_direction(tenant_id, peer_id),
-        Some(SessionDirection::Outbound)
-    )
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum BootstrapDiscoveryAuth {
+    None,
+    AcceptedDiscoveryAndObserved,
+    AcceptedObservedOnly,
+    PendingOnly,
+    SteadyStateOrMixed,
+}
+
+fn local_transport_target_is_bootstrap(conn: &rusqlite::Connection, tenant_id: &str) -> bool {
+    resolve_tenant_transport_target(conn, tenant_id)
+        .ok()
+        .flatten()
+        .map(|target| target.source == CRED_SOURCE_BOOTSTRAP)
+        .unwrap_or(false)
+}
+
+fn classify_bootstrap_discovery_auth(
+    db_path: &str,
+    tenant_id: &str,
+    peer_id: &str,
+) -> BootstrapDiscoveryAuth {
+    let Ok(fp_bytes) = hex::decode(peer_id) else {
+        return BootstrapDiscoveryAuth::None;
+    };
+    if fp_bytes.len() != 32 {
+        return BootstrapDiscoveryAuth::None;
+    }
+    let mut fp = [0u8; 32];
+    fp.copy_from_slice(&fp_bytes);
+
+    let Ok(conn) = open_connection(db_path) else {
+        return BootstrapDiscoveryAuth::None;
+    };
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let accepted_bootstrap_authorized = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM invite_bootstrap_trust
+                 WHERE recorded_by = ?1
+                   AND bootstrap_spki_fingerprint = ?2
+                   AND expires_at > ?3
+             )",
+            rusqlite::params![tenant_id, fp.as_slice(), now_ms],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    let pending_bootstrap_authorized = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1
+                 FROM pending_invite_bootstrap_trust
+                 WHERE recorded_by = ?1
+                   AND expected_bootstrap_spki_fingerprint = ?2
+                   AND expires_at > ?3
+             )",
+            rusqlite::params![tenant_id, fp.as_slice(), now_ms],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    let steady_state = is_peer_shared_transport_fingerprint(&conn, tenant_id, &fp).unwrap_or(false);
+    let local_bootstrap_target = local_transport_target_is_bootstrap(&conn, tenant_id);
+
+    match (
+        accepted_bootstrap_authorized,
+        pending_bootstrap_authorized,
+        steady_state,
+        local_bootstrap_target,
+    ) {
+        (_, _, true, _) => BootstrapDiscoveryAuth::SteadyStateOrMixed,
+        (true, false, false, true) => BootstrapDiscoveryAuth::AcceptedDiscoveryAndObserved,
+        (true, false, false, false) => BootstrapDiscoveryAuth::AcceptedObservedOnly,
+        (false, true, false, _) => BootstrapDiscoveryAuth::PendingOnly,
+        (false, false, false, _) => BootstrapDiscoveryAuth::None,
+        (true, true, false, _) => BootstrapDiscoveryAuth::SteadyStateOrMixed,
+    }
+}
+
+fn should_initiate_connect_for_source_with_db(
+    db_path: &str,
+    tenant_id: &str,
+    source: &TargetIngressSource,
+) -> bool {
+    match source {
+        TargetIngressSource::Discovery { peer_id } => {
+            match classify_bootstrap_discovery_auth(db_path, tenant_id, peer_id) {
+                BootstrapDiscoveryAuth::AcceptedDiscoveryAndObserved => true,
+                BootstrapDiscoveryAuth::PendingOnly => false,
+                BootstrapDiscoveryAuth::AcceptedObservedOnly
+                | BootstrapDiscoveryAuth::None
+                | BootstrapDiscoveryAuth::SteadyStateOrMixed => {
+                    should_initiate_connect_for_source(tenant_id, source)
+                }
+            }
+        }
+        TargetIngressSource::ObservedPeer { .. } => true,
+        TargetIngressSource::Bootstrap { .. } => true,
+    }
 }
 
 async fn join_connect_worker(worker: ActiveConnectWorker) {
@@ -865,6 +1008,45 @@ async fn join_connect_worker(worker: ActiveConnectWorker) {
         let _ = worker.join.join();
     })
     .await;
+}
+
+fn known_peer_key_for_event(event: &TargetIngressEvent) -> String {
+    match &event.source {
+        TargetIngressSource::Bootstrap { peer_id, .. }
+        | TargetIngressSource::ObservedPeer { peer_id }
+        | TargetIngressSource::Discovery { peer_id } => {
+            discovery_dispatch_key(&event.tenant_id, peer_id)
+        }
+    }
+}
+
+fn bootstrap_worker_prefix_for_event(event: &TargetIngressEvent) -> String {
+    match &event.source {
+        TargetIngressSource::Bootstrap { peer_id, .. }
+        | TargetIngressSource::ObservedPeer { peer_id }
+        | TargetIngressSource::Discovery { peer_id } => {
+            bootstrap_dispatch_key_prefix(&event.tenant_id, peer_id)
+        }
+    }
+}
+
+async fn cancel_bootstrap_workers_for_prefix(
+    active_workers: &mut HashMap<String, ActiveConnectWorker>,
+    dispatcher: &mut PeerDispatcher,
+    prefix: &str,
+) {
+    let keys: Vec<String> = active_workers
+        .keys()
+        .filter(|key| key.starts_with(prefix))
+        .cloned()
+        .collect();
+    for key in keys {
+        if let Some(worker) = active_workers.remove(&key) {
+            worker.cancel.cancel();
+            join_connect_worker(worker).await;
+            dispatcher.forget(&key);
+        }
+    }
 }
 
 async fn reap_finished_connect_workers(
@@ -974,6 +1156,11 @@ fn short_peer_id(peer_id: &str) -> &str {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::schema::create_tables;
+    use crate::db::transport_creds::{set_local_transport_target, CRED_SOURCE_PEER_SHARED};
+    use crate::db::transport_trust::{
+        record_invite_bootstrap_trust, record_pending_invite_bootstrap_trust,
+    };
 
     #[test]
     fn transition_to_active_when_tenants_present() {
@@ -1049,7 +1236,7 @@ mod tests {
     }
 
     #[test]
-    fn discovery_and_observed_targets_only_dial_on_preferred_side() {
+    fn discovery_and_observed_targets_follow_preferred_side_gate() {
         let lower = "0000000000000000000000000000000000000000000000000000000000000001";
         let higher = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
 
@@ -1091,5 +1278,294 @@ mod tests {
                 invite_event_id: "invite".to_string(),
             }
         ));
+    }
+
+    #[test]
+    fn bootstrap_authorized_discovery_targets_override_preferred_side_gate() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tmpdir.path().join("bootstrap-discovery.db");
+        let conn = open_connection(db_path.to_str().expect("db path")).expect("open db");
+        create_tables(&conn).expect("create tables");
+
+        let tenant = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let peer = "0000000000000000000000000000000000000000000000000000000000000001";
+        set_local_transport_target(&conn, tenant, peer, CRED_SOURCE_BOOTSTRAP)
+            .expect("set bootstrap local transport target");
+        let fp = hex::decode(peer).expect("peer hex");
+        let mut fp_arr = [0u8; 32];
+        fp_arr.copy_from_slice(&fp);
+        record_invite_bootstrap_trust(
+            &conn,
+            tenant,
+            "invite-accepted",
+            "invite-event",
+            "workspace",
+            "",
+            &fp_arr,
+        )
+        .expect("record invite bootstrap trust");
+        drop(conn);
+
+        assert!(
+            !should_initiate_connect_for_source(
+                tenant,
+                &TargetIngressSource::Discovery {
+                    peer_id: peer.to_string(),
+                }
+            ),
+            "pure preferred-side gating should reject the non-preferred bootstrap peer"
+        );
+        assert!(
+            should_initiate_connect_for_source_with_db(
+                db_path.to_str().expect("db path"),
+                tenant,
+                &TargetIngressSource::Discovery {
+                    peer_id: peer.to_string(),
+                }
+            ),
+            "bootstrap-authorized discovery peer should be allowed to connect until steady-state trust supersedes it"
+        );
+    }
+
+    #[test]
+    fn pending_bootstrap_discovery_targets_stay_bottlenecked() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tmpdir.path().join("pending-bootstrap-discovery.db");
+        let conn = open_connection(db_path.to_str().expect("db path")).expect("open db");
+        create_tables(&conn).expect("create tables");
+
+        let tenant = "0000000000000000000000000000000000000000000000000000000000000001";
+        let peer = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let fp = hex::decode(peer).expect("peer hex");
+        let mut fp_arr = [0u8; 32];
+        fp_arr.copy_from_slice(&fp);
+        record_pending_invite_bootstrap_trust(&conn, tenant, "invite-event", "workspace", &fp_arr)
+            .expect("record pending invite bootstrap trust");
+        drop(conn);
+
+        assert!(
+            should_initiate_connect_for_source(
+                tenant,
+                &TargetIngressSource::Discovery {
+                    peer_id: peer.to_string(),
+                }
+            ),
+            "pure preferred-side gating would allow the inviter side to dial here"
+        );
+        assert!(
+            !should_initiate_connect_for_source_with_db(
+                db_path.to_str().expect("db path"),
+                tenant,
+                &TargetIngressSource::Discovery {
+                    peer_id: peer.to_string(),
+                }
+            ),
+            "pending bootstrap trust should keep the inviter side bottlenecked"
+        );
+    }
+
+    #[test]
+    fn pending_bootstrap_observed_targets_can_reconnect_exact_peer() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tmpdir.path().join("pending-bootstrap-observed.db");
+        let conn = open_connection(db_path.to_str().expect("db path")).expect("open db");
+        create_tables(&conn).expect("create tables");
+
+        let tenant = "0000000000000000000000000000000000000000000000000000000000000001";
+        let peer = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let fp = hex::decode(peer).expect("peer hex");
+        let mut fp_arr = [0u8; 32];
+        fp_arr.copy_from_slice(&fp);
+        record_pending_invite_bootstrap_trust(&conn, tenant, "invite-event", "workspace", &fp_arr)
+            .expect("record pending invite bootstrap trust");
+        drop(conn);
+
+        assert!(
+            should_initiate_connect_for_source_with_db(
+                db_path.to_str().expect("db path"),
+                tenant,
+                &TargetIngressSource::ObservedPeer {
+                    peer_id: peer.to_string(),
+                }
+            ),
+            "pending bootstrap trust should still allow exact observed-endpoint reconnects"
+        );
+        assert!(
+            !should_initiate_connect_for_source_with_db(
+                db_path.to_str().expect("db path"),
+                tenant,
+                &TargetIngressSource::Discovery {
+                    peer_id: peer.to_string(),
+                }
+            ),
+            "pending bootstrap trust must continue bottlenecking broad discovery dialing"
+        );
+    }
+
+    #[test]
+    fn discovery_source_beats_bootstrap_source_for_same_peer() {
+        let bootstrap = TargetIngressSource::Bootstrap {
+            peer_id: "peer".to_string(),
+            invite_event_id: "invite".to_string(),
+        };
+        let discovery = TargetIngressSource::Discovery {
+            peer_id: "peer".to_string(),
+        };
+        let observed = TargetIngressSource::ObservedPeer {
+            peer_id: "peer".to_string(),
+        };
+
+        assert!(
+            should_ignore_target_event(&discovery, &bootstrap),
+            "stale bootstrap targets must not replace a live discovery worker for the same peer"
+        );
+        assert!(
+            should_ignore_target_event(&observed, &bootstrap),
+            "stale bootstrap targets must not replace a live observed-endpoint worker for the same peer"
+        );
+        assert!(
+            !should_ignore_target_event(&bootstrap, &discovery),
+            "discovery must be able to supersede a stale bootstrap worker"
+        );
+    }
+
+    #[test]
+    fn bootstrap_authorized_observed_targets_override_preferred_side_gate() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tmpdir.path().join("bootstrap-observed.db");
+        let conn = open_connection(db_path.to_str().expect("db path")).expect("open db");
+        create_tables(&conn).expect("create tables");
+
+        let tenant = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let peer = "0000000000000000000000000000000000000000000000000000000000000001";
+        set_local_transport_target(&conn, tenant, peer, CRED_SOURCE_BOOTSTRAP)
+            .expect("set bootstrap local transport target");
+        let fp = hex::decode(peer).expect("peer hex");
+        let mut fp_arr = [0u8; 32];
+        fp_arr.copy_from_slice(&fp);
+        record_invite_bootstrap_trust(
+            &conn,
+            tenant,
+            "invite-accepted",
+            "invite-event",
+            "workspace",
+            "",
+            &fp_arr,
+        )
+        .expect("record invite bootstrap trust");
+        drop(conn);
+
+        assert!(
+            !matches!(
+                preferred_connection_direction(tenant, peer),
+                Some(SessionDirection::Outbound)
+            ),
+            "test setup requires the observed peer to be non-preferred"
+        );
+        assert!(
+            !should_initiate_connect_for_source(
+                tenant,
+                &TargetIngressSource::ObservedPeer {
+                    peer_id: peer.to_string(),
+                }
+            ),
+            "pure preferred-side gating should reject the non-preferred observed peer"
+        );
+        assert!(
+            should_initiate_connect_for_source_with_db(
+                db_path.to_str().expect("db path"),
+                tenant,
+                &TargetIngressSource::ObservedPeer {
+                    peer_id: peer.to_string(),
+                }
+            ),
+            "bootstrap-authorized observed endpoints should be allowed until steady-state trust supersedes them"
+        );
+    }
+
+    #[test]
+    fn converged_local_transport_target_keeps_bootstrap_authorized_discovery_bottlenecked() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tmpdir.path().join("bootstrap-discovery-converged.db");
+        let conn = open_connection(db_path.to_str().expect("db path")).expect("open db");
+        create_tables(&conn).expect("create tables");
+
+        let tenant = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let peer = "0000000000000000000000000000000000000000000000000000000000000001";
+        set_local_transport_target(&conn, tenant, tenant, CRED_SOURCE_PEER_SHARED)
+            .expect("set peershared local transport target");
+        let fp = hex::decode(peer).expect("peer hex");
+        let mut fp_arr = [0u8; 32];
+        fp_arr.copy_from_slice(&fp);
+        record_invite_bootstrap_trust(
+            &conn,
+            tenant,
+            "invite-accepted",
+            "invite-event",
+            "workspace",
+            "",
+            &fp_arr,
+        )
+        .expect("record invite bootstrap trust");
+        drop(conn);
+
+        assert!(
+            !should_initiate_connect_for_source_with_db(
+                db_path.to_str().expect("db path"),
+                tenant,
+                &TargetIngressSource::Discovery {
+                    peer_id: peer.to_string(),
+                }
+            ),
+            "once local transport has converged to peershared, bootstrap trust must not re-enable non-preferred discovery dialing"
+        );
+    }
+
+    #[test]
+    fn converged_local_transport_target_still_allows_bootstrap_authorized_observed_reconnects() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tmpdir.path().join("bootstrap-observed-converged.db");
+        let conn = open_connection(db_path.to_str().expect("db path")).expect("open db");
+        create_tables(&conn).expect("create tables");
+
+        let tenant = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let peer = "0000000000000000000000000000000000000000000000000000000000000001";
+        set_local_transport_target(&conn, tenant, tenant, CRED_SOURCE_PEER_SHARED)
+            .expect("set peershared local transport target");
+        let fp = hex::decode(peer).expect("peer hex");
+        let mut fp_arr = [0u8; 32];
+        fp_arr.copy_from_slice(&fp);
+        record_invite_bootstrap_trust(
+            &conn,
+            tenant,
+            "invite-accepted",
+            "invite-event",
+            "workspace",
+            "",
+            &fp_arr,
+        )
+        .expect("record invite bootstrap trust");
+        drop(conn);
+
+        assert!(
+            should_initiate_connect_for_source_with_db(
+                db_path.to_str().expect("db path"),
+                tenant,
+                &TargetIngressSource::ObservedPeer {
+                    peer_id: peer.to_string(),
+                }
+            ),
+            "exact observed-endpoint reconnects should stay allowed until steady-state peer trust supersedes bootstrap auth"
+        );
+        assert!(
+            !should_initiate_connect_for_source_with_db(
+                db_path.to_str().expect("db path"),
+                tenant,
+                &TargetIngressSource::Discovery {
+                    peer_id: peer.to_string(),
+                }
+            ),
+            "broad discovery should still stay bottlenecked after local transport convergence"
+        );
     }
 }

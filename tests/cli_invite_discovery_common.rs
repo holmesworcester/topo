@@ -147,12 +147,19 @@ pub fn start_joined_cli_peer_via_discovery(
     device_name: &str,
 ) -> StartedCliPeer {
     let db = tmpdir.path().join(db_name).to_str().unwrap().to_string();
-    accept_invite_with_identity(&db, invite_link, username, device_name);
     let daemon = start_discovery_daemon(&db);
+    accept_invite_with_identity_on_running_daemon(
+        &db,
+        invite_link,
+        username,
+        device_name,
+        Duration::from_secs(20),
+    );
     StartedCliPeer { db, daemon }
 }
 
 pub use cli_harness::{
-    assert_eventually, create_invite, create_workspace, daemon_listen_addr, send_message,
-    start_daemon, start_discovery_daemon, stop_daemon,
+    accept_invite_with_identity_on_running_daemon, assert_eventually, create_invite,
+    create_workspace, daemon_listen_addr, send_message, start_daemon, start_discovery_daemon,
+    stop_daemon,
 };

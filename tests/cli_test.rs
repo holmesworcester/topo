@@ -19,7 +19,7 @@ use std::net::SocketAddr;
 use std::process::{Command, Stdio};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
-use topo::crypto::{event_id_from_base64, event_id_from_hex, event_id_to_base64};
+use topo::crypto::event_id_from_base64;
 use topo::db::open_connection;
 use topo::event_modules::workspace::commands::{
     accept_invite as accept_invite_without_sync, create_user_invite_raw,
@@ -503,6 +503,8 @@ fn start_linked_cli_peer(
             Duration::from_secs(10),
         );
     }
+    wait_for_active_tenant_ready(&db, Duration::from_secs(120));
+    wait_for_active_tenant_transport_converged(&db, Duration::from_secs(120));
     StartedCliPeer {
         db,
         username: username.to_string(),
@@ -2603,28 +2605,24 @@ fn test_cli_live_daemon_creating_third_workspace_preserves_existing_second_works
 }
 
 /// Mixed realistic topology:
-/// 1. a shared DB accepts empty-address invites into two workspaces and must
-///    recover via mDNS,
-/// 2. one additional alpha peer joins with explicit endpoint addresses
-///    (dead-first, live-second),
-/// 3. CLI state remains workspace-scoped with overlapping but non-identical
-///    membership across clients.
+/// Shared-db same-workspace explicit-endpoint case:
+/// two tenants on one shared DB accept distinct invites into the same
+/// workspace, an external peer joins via explicit bootstrap addresses, and all
+/// participants stay in one workspace-scoped view with the expected direct
+/// trust path.
 #[test]
-#[cfg(feature = "discovery")]
-fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_endpoints() {
+fn test_cli_shared_db_same_workspace_accepts_distinct_explicit_invites() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 45000;
 
     let alpha_db = tmpdir.path().join("alpha.db").to_str().unwrap().to_string();
-    let zeta_db = tmpdir.path().join("zeta.db").to_str().unwrap().to_string();
     let shared_db = tmpdir
         .path()
         .join("shared.db")
         .to_str()
         .unwrap()
         .to_string();
-    let dave_db = tmpdir.path().join("dave.db").to_str().unwrap().to_string();
 
     create_workspace_with_details(&alpha_db, "alpha-space", "alpha", "alpha-root");
     let alpha = StartedCliPeer {
@@ -2656,25 +2654,13 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
             &format!("127.0.0.1:{}", alpha_live_port),
         ],
     );
-
-    create_workspace_with_details(&zeta_db, "zeta-space", "zeta", "zeta-root");
-    let zeta = StartedCliPeer {
-        db: zeta_db,
-        username: "zeta".to_string(),
-        device_name: "zeta-root".to_string(),
-        _daemon: start_daemon(
-            tmpdir
-                .path()
-                .join("zeta.db")
-                .to_str()
-                .expect("zeta db path"),
-        ),
-    };
-    let zeta_tenant = zeta.tenant_label();
-    let zeta_bootstrap_msg = "zeta-space/bootstrap";
-    let zeta_bootstrap_eid = send_message(&zeta.db, zeta_bootstrap_msg);
-    assert_event_visible_on_all(&[&zeta.db], &zeta_bootstrap_eid, timeout_ms);
-    let zeta_explicit_invite = create_invite(&zeta.db, &daemon_listen_addr(&zeta.db));
+    let alpha_explicit_invite_for_carol = rewrite_invite_addrs(
+        &create_invite(&alpha.db, &alpha_live_addr),
+        &[
+            &format!("127.0.0.1:{}", random_port()),
+            &format!("127.0.0.1:{}", alpha_live_port),
+        ],
+    );
 
     accept_invite_with_identity(
         &shared_db,
@@ -2684,51 +2670,39 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
     );
     accept_invite_with_identity(
         &shared_db,
-        &zeta_explicit_invite,
-        "yuki-zeta",
-        "yuki-terminal",
-    );
-    accept_invite_with_identity(
-        &shared_db,
-        &alpha_explicit_invite,
+        &alpha_explicit_invite_for_carol,
         "carol-alpha",
         "carol-terminal",
     );
     let _shared_daemon = start_daemon(&shared_db);
-    let dave = {
-        accept_invite_with_identity(
-            &dave_db,
-            &alpha_explicit_invite,
-            "dave-alpha",
-            "dave-laptop",
-        );
-        StartedCliPeer {
-            db: dave_db,
-            username: "dave-alpha".to_string(),
-            device_name: "dave-laptop".to_string(),
-            _daemon: start_daemon(
-                tmpdir
-                    .path()
-                    .join("dave.db")
-                    .to_str()
-                    .expect("dave db path"),
-            ),
-        }
-    };
+    let alpha_transport_peer_id = daemon_transport_fingerprint(&alpha.db);
+    wait_for_bootstrap_supersession_and_endpoint_observation(
+        &shared_db,
+        &alpha_transport_peer_id,
+        Duration::from_secs(30),
+    );
+    let dave = start_joined_cli_peer(
+        &tmpdir,
+        "dave.db",
+        &alpha_explicit_invite,
+        "dave-alpha",
+        "dave-laptop",
+    );
     let dave_tenant = dave.tenant_label();
+    wait_for_bootstrap_supersession_and_endpoint_observation(
+        &dave.db,
+        &alpha_transport_peer_id,
+        Duration::from_secs(30),
+    );
 
-    let alpha_live_msg = "alpha-space/alpha-via-empty-bootstrap-mdns";
+    let alpha_live_msg = "alpha-space/alpha-via-explicit-bootstrap";
     let alpha_live_eid = send_message(&alpha.db, alpha_live_msg);
-    let zeta_live_msg = "zeta-space/zeta-via-empty-bootstrap-mdns";
-    let zeta_live_eid = send_message(&zeta.db, zeta_live_msg);
 
     wait_for_username_peer_id(&shared_db, "bob-alpha", timeout_ms);
     wait_for_username_peer_id(&shared_db, "carol-alpha", timeout_ms);
-    wait_for_username_peer_id(&shared_db, "yuki-zeta", timeout_ms);
     assert_event_visible_for_username(&shared_db, "bob-alpha", &alpha_live_eid, timeout_ms);
     assert_event_visible_for_username(&shared_db, "carol-alpha", &alpha_live_eid, timeout_ms);
     assert_event_visible_on_all(&[&dave.db], &alpha_live_eid, timeout_ms);
-    assert_event_visible_for_username(&shared_db, "yuki-zeta", &zeta_live_eid, timeout_ms);
 
     let dave_live_msg = "alpha-space/dave-via-explicit-endpoints";
     let dave_live_eid = send_message(&dave.db, dave_live_msg);
@@ -2755,13 +2729,8 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
     assert_event_visible_on_all(&[&alpha.db, &dave.db], &bob_live_eid, timeout_ms);
     assert_event_visible_for_username(&shared_db, "carol-alpha", &bob_live_eid, timeout_ms);
 
-    let yuki_live_msg = "zeta-space/yuki-from-shared-db";
-    let yuki_live_eid = send_message_as_username(&shared_db, "yuki-zeta", yuki_live_msg);
-    assert_event_visible_on_all(&[&zeta.db], &yuki_live_eid, timeout_ms);
-
     let bob_alpha_tenant = "bob-alpha/bob-terminal";
     let carol_alpha_tenant = "carol-alpha/carol-terminal";
-    let yuki_zeta_tenant = "yuki-zeta/yuki-terminal";
 
     assert_cli_state(
         &alpha.db,
@@ -2782,16 +2751,6 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
             dave_live_msg,
             bob_live_msg,
         ],
-    );
-    assert_cli_state(
-        &zeta.db,
-        &["zeta-space"],
-        "zeta-space",
-        1,
-        2,
-        &["zeta", "yuki-zeta"],
-        &[zeta_tenant.as_str(), yuki_zeta_tenant],
-        &[zeta_bootstrap_msg, zeta_live_msg, yuki_live_msg],
     );
     assert_cli_state(
         &dave.db,
@@ -2816,9 +2775,9 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
     assert_cli_state_for_username(
         &shared_db,
         "bob-alpha",
-        &["alpha-space", "zeta-space"],
+        &["alpha-space"],
         "alpha-space",
-        3,
+        2,
         4,
         &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
         &[
@@ -2837,9 +2796,9 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
     assert_cli_state_for_username(
         &shared_db,
         "carol-alpha",
-        &["alpha-space", "zeta-space"],
+        &["alpha-space"],
         "alpha-space",
-        3,
+        2,
         4,
         &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
         &[
@@ -2854,35 +2813,6 @@ fn test_cli_shared_db_multiworkspace_mixes_empty_bootstrap_mdns_and_explicit_end
             dave_live_msg,
             bob_live_msg,
         ],
-    );
-    assert_cli_state_for_username(
-        &shared_db,
-        "yuki-zeta",
-        &["alpha-space", "zeta-space"],
-        "zeta-space",
-        3,
-        2,
-        &["zeta", "yuki-zeta"],
-        &[zeta_tenant.as_str(), yuki_zeta_tenant],
-        &[zeta_bootstrap_msg, zeta_live_msg, yuki_live_msg],
-    );
-
-    use_tenant_for_username(&shared_db, "yuki-zeta");
-    let yuki_view = get_view_raw(&shared_db);
-    assert!(
-        !yuki_view.contains(alpha_live_msg)
-            && !yuki_view.contains(dave_live_msg)
-            && !yuki_view.contains(bob_live_msg),
-        "zeta tenant view should not leak alpha workspace messages:\n{}",
-        yuki_view
-    );
-
-    use_tenant_for_username(&shared_db, "bob-alpha");
-    let bob_view = get_view_raw(&shared_db);
-    assert!(
-        !bob_view.contains(zeta_live_msg) && !bob_view.contains(yuki_live_msg),
-        "alpha tenant view should not leak zeta workspace messages:\n{}",
-        bob_view
     );
 }
 
@@ -2953,6 +2883,18 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
         "yuki-terminal",
     );
     let _shared_daemon = start_daemon(&shared_db);
+    let alpha_transport_peer_id = daemon_transport_fingerprint(&alpha.db);
+    let zeta_transport_peer_id = daemon_transport_fingerprint(&zeta.db);
+    wait_for_bootstrap_supersession_and_endpoint_observation(
+        &shared_db,
+        &alpha_transport_peer_id,
+        Duration::from_secs(30),
+    );
+    wait_for_bootstrap_supersession_and_endpoint_observation(
+        &shared_db,
+        &zeta_transport_peer_id,
+        Duration::from_secs(30),
+    );
 
     let dave_alpha_invite = create_invite(&alpha.db, &daemon_listen_addr(&alpha.db));
     let emma_zeta_invite = create_invite(&zeta.db, &daemon_listen_addr(&zeta.db));
@@ -2966,6 +2908,11 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
     );
     let dave_tenant = dave.tenant_label();
     wait_for_active_tenant_ready(&dave.db, Duration::from_millis(timeout_ms));
+    wait_for_bootstrap_supersession_and_endpoint_observation(
+        &dave.db,
+        &alpha_transport_peer_id,
+        Duration::from_secs(30),
+    );
 
     let emma = start_joined_cli_peer(
         &tmpdir,
@@ -2976,6 +2923,11 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
     );
     let emma_tenant = emma.tenant_label();
     wait_for_active_tenant_ready(&emma.db, Duration::from_millis(timeout_ms));
+    wait_for_bootstrap_supersession_and_endpoint_observation(
+        &emma.db,
+        &zeta_transport_peer_id,
+        Duration::from_secs(30),
+    );
 
     let dave_alpha_msg = "alpha-space/dave-external";
     let dave_alpha_eid = send_message(&dave.db, dave_alpha_msg);

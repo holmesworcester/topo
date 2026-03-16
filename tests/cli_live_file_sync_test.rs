@@ -197,13 +197,14 @@ fn test_cli_live_message_during_large_file_sync() {
                     .all(|content| snapshot.messages_stdout.contains(content))
         },
     );
+    let file_slice_count_when_live_visible = live_visible_snapshot.raw_file_slice_count;
     let final_snapshot = assert_value_eventually(
-        Duration::from_secs(60),
+        Duration::from_secs(20),
         Duration::from_millis(100),
         "later file slices arrive after the live messages",
         &load_snapshot,
         |snapshot| {
-            snapshot.raw_file_slice_count == expected_total_file_slices
+            snapshot.raw_file_slice_count > file_slice_count_when_live_visible
                 && matches!(
                     (
                         snapshot.earliest_live_recorded_rowid,

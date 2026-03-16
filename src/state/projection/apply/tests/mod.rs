@@ -8,9 +8,9 @@ use crate::db::{
 };
 use crate::event_modules::{
     self as events, registry, BenchDepEvent, EncryptedEvent, FileEvent, FileSliceEvent,
-    KeySecretEvent, KeySharedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
-    ReactionEvent, WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_FILE_SLICE,
-    EVENT_TYPE_MESSAGE, EVENT_TYPE_MESSAGE_DELETION, EVENT_TYPE_REACTION,
+    KeySecretEvent, KeySharedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent, ReactionEvent,
+    WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_FILE_SLICE, EVENT_TYPE_MESSAGE,
+    EVENT_TYPE_MESSAGE_DELETION, EVENT_TYPE_REACTION,
 };
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::encrypted::encrypt_event_blob;
@@ -549,7 +549,10 @@ fn key_shared_does_not_block_non_recipient_observers_on_local_invite_secret() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(projected, "key_shared row should still project for observers");
+    assert!(
+        projected,
+        "key_shared row should still project for observers"
+    );
 
     let emitted_key_secret: bool = conn
         .query_row(

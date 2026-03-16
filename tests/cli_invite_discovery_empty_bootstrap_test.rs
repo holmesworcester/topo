@@ -34,6 +34,12 @@ fn test_cli_local_mdns_discovery_without_bootstrap_addresses() {
         start_joined_cli_peer_via_discovery(&tmpdir, "bob.db", &invite_link, "user", "device");
     assert_event_visible_on_all(&[&bob.db], &bootstrap_eid, timeout_ms);
     assert_identity_eventually_materialized(&bob.db, timeout_ms);
+    let alice_peer_id = active_tenant_peer_id(&alice_db).expect("alice active tenant");
+    wait_for_bootstrap_supersession_and_endpoint_observation(
+        &bob.db,
+        &alice_peer_id,
+        std::time::Duration::from_secs(120),
+    );
     stop_daemon(&bob.db, &mut bob.daemon);
     bob.daemon = start_daemon(&bob.db);
 

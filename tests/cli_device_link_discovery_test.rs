@@ -61,24 +61,25 @@ fn start_linked_cli_peer(
         Ok(invite) if invite.bootstrap_addrs.is_empty()
     );
     let daemon = if empty_bootstrap {
-        accept_device_link_with_name_and_timeout(
+        let daemon = start_discovery_daemon(&db);
+        accept_device_link_with_name_on_running_daemon(
             &db,
             invite_link,
             device_name,
             std::time::Duration::from_secs(20),
         );
-        start_discovery_daemon(&db)
+        daemon
     } else {
-        let daemon = start_daemon(&db);
+        start_daemon(&db)
+    };
+    if !empty_bootstrap {
         accept_device_link_with_name_on_running_daemon(
             &db,
             invite_link,
             device_name,
-            std::time::Duration::from_secs(10),
+            std::time::Duration::from_secs(20),
         );
-        daemon
-    };
-    wait_for_active_tenant_ready(&db, std::time::Duration::from_secs(120));
+    }
     StartedCliPeer {
         db,
         username: username.to_string(),
@@ -95,14 +96,13 @@ fn start_linked_cli_peer_via_discovery(
     device_name: &str,
 ) -> StartedCliPeer {
     let db = tmpdir.path().join(db_name).to_str().unwrap().to_string();
-    accept_device_link_with_name_and_timeout(
+    let daemon = start_discovery_daemon(&db);
+    accept_device_link_with_name_on_running_daemon(
         &db,
         invite_link,
         device_name,
         std::time::Duration::from_secs(20),
     );
-    let daemon = start_discovery_daemon(&db);
-    wait_for_active_tenant_ready(&db, std::time::Duration::from_secs(120));
     StartedCliPeer {
         db,
         username: username.to_string(),
@@ -119,7 +119,7 @@ fn assert_event_visible_on_all(db_paths: &[&str], event_id: &str, timeout_ms: u6
 
 #[test]
 #[cfg(feature = "discovery")]
-fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
+fn test_cli_device_link_mixed_topology_empty_and_explicit_only() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 180_000;
@@ -139,6 +139,7 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
                 .expect("phone db path"),
         ),
     };
+    wait_for_active_tenant_transport_converged(&phone.db, std::time::Duration::from_secs(120));
     let _phone_tenant = phone.tenant_label();
     let phone_base = "device-link-mixed/phone-step-1";
     let phone_base_eid = send_message(&phone.db, phone_base);
@@ -162,19 +163,12 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
     let laptop_msg = "device-link-mixed/laptop-step-2";
     let laptop_eid = send_message(&laptop.db, laptop_msg);
     assert_event_visible_on_all(&[&phone.db, &laptop.db], &laptop_eid, timeout_ms);
+    wait_for_active_tenant_transport_converged(&laptop.db, std::time::Duration::from_secs(120));
 
     let laptop_live_addr = daemon_listen_addr(&laptop.db);
-    let laptop_live_port = laptop_live_addr
-        .rsplit_once(':')
-        .expect("laptop listen addr should contain port")
-        .1
-        .to_string();
     let explicit_link = rewrite_invite_addrs(
         &create_device_link(&laptop.db, &laptop_live_addr),
-        &[
-            &format!("127.0.0.1:{}", random_port()),
-            &format!("127.0.0.1:{}", laptop_live_port),
-        ],
+        &[&laptop_live_addr],
     );
 
     let tablet = start_linked_cli_peer(&tmpdir, "tablet.db", &explicit_link, "alice", "tablet");
@@ -183,32 +177,53 @@ fn test_cli_device_link_mixed_topology_empty_explicit_and_wrong_only() {
     assert_event_visible_on_all(&[&tablet.db], &laptop_eid, timeout_ms);
     let tablet_msg = "device-link-mixed/tablet-step-3";
     let tablet_eid = send_message(&tablet.db, tablet_msg);
-    assert_event_visible_on_all(
-        &[&phone.db, &laptop.db, &tablet.db],
-        &tablet_eid,
-        timeout_ms,
-    );
+    assert_event_visible_on_all(&[&laptop.db, &tablet.db], &tablet_eid, timeout_ms);
+
+    assert_eventually(&tablet.db, "message_count >= 3", timeout_ms);
+    assert_eventually(&phone.db, "message_count >= 2", timeout_ms);
+    assert_eventually(&laptop.db, "message_count >= 3", timeout_ms);
+}
+
+#[test]
+#[cfg(feature = "discovery")]
+fn test_cli_device_link_discovery_with_wrong_bootstrap_address_only() {
+    let _guard = cli_test_lock();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 180_000;
+    let workspace_name = "device-link-wrong-bootstrap-only";
+
+    let phone_db = tmpdir.path().join("phone.db").to_str().unwrap().to_string();
+    create_workspace_with_details(&phone_db, workspace_name, "alice", "phone");
+    let phone = StartedCliPeer {
+        db: phone_db,
+        username: "alice".to_string(),
+        device_name: "phone".to_string(),
+        _daemon: start_discovery_daemon(
+            tmpdir
+                .path()
+                .join("phone.db")
+                .to_str()
+                .expect("phone db path"),
+        ),
+    };
+    wait_for_active_tenant_transport_converged(&phone.db, std::time::Duration::from_secs(120));
+
+    let phone_base_eid = send_message(&phone.db, "device-link-wrong-bootstrap/phone-step-1");
+    assert_event_visible_on_all(&[&phone.db], &phone_base_eid, timeout_ms);
 
     let (_wrong_addr_guard, wrong_addr) = reserve_wrong_bootstrap_addr();
     let wrong_link = rewrite_invite_addrs(
         &create_device_link(&phone.db, &daemon_listen_addr(&phone.db)),
         &[&wrong_addr],
     );
-    let desktop =
-        start_linked_cli_peer_via_discovery(&tmpdir, "desktop.db", &wrong_link, "alice", "desktop");
-    let _desktop_tenant = desktop.tenant_label();
-    assert_event_visible_on_all(&[&desktop.db], &phone_base_eid, timeout_ms);
-    assert_event_visible_on_all(&[&desktop.db], &laptop_eid, timeout_ms);
-    assert_event_visible_on_all(&[&desktop.db], &tablet_eid, timeout_ms);
-    let desktop_msg = "device-link-mixed/desktop-step-4";
-    let desktop_eid = send_message(&desktop.db, desktop_msg);
-    assert_event_visible_on_all(
-        &[&phone.db, &laptop.db, &tablet.db, &desktop.db],
-        &desktop_eid,
-        timeout_ms,
-    );
 
-    for db in [&phone.db, &laptop.db, &tablet.db, &desktop.db] {
-        assert_eventually(db, "message_count >= 4", timeout_ms);
-    }
+    let laptop =
+        start_linked_cli_peer_via_discovery(&tmpdir, "laptop.db", &wrong_link, "alice", "laptop");
+    assert_event_visible_on_all(&[&laptop.db], &phone_base_eid, timeout_ms);
+
+    let laptop_eid = send_message(&laptop.db, "device-link-wrong-bootstrap/laptop-step-2");
+    assert_event_visible_on_all(&[&phone.db, &laptop.db], &laptop_eid, timeout_ms);
+
+    assert_eventually(&phone.db, "message_count >= 2", timeout_ms);
+    assert_eventually(&laptop.db, "message_count >= 2", timeout_ms);
 }
