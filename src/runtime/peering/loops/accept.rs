@@ -316,7 +316,6 @@ async fn accept_loop_with_ingest_until_cancel_inner(
                     SessionDirection::Inbound,
                     &tenant_resolver,
                     worker_shutdown,
-                    None,
                 )
                 .await;
             }));

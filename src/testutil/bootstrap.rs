@@ -264,7 +264,7 @@ pub fn start_bootstrap_responder(
             let handler =
                 SyncSessionHandler::responder(db_path.clone(), 30, coordination, ingest_tx);
             // Keep connections alive until the endpoint closes so QUIC can
-            // deliver final frames (DoneAck, events) before the connection
+            // deliver in-flight control/data frames before the connection
             // is torn down. Dropping a quinn::Connection sends
             // CONNECTION_CLOSE which aborts in-flight stream data.
             let mut _connections = Vec::new();

@@ -3,6 +3,7 @@ use super::super::encrypted::project_encrypted;
 use super::super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::timeline::EventTimeline;
+use crate::db::wanted::WantedEvents;
 use crate::event_modules::{registry, ParsedEvent, TransportPrivacy};
 use rusqlite::{Connection, OptionalExtension};
 use std::time::{SystemTime, UNIX_EPOCH};
@@ -197,6 +198,7 @@ pub(crate) fn check_deps_and_block(
          VALUES (?1, ?2, ?3)",
         rusqlite::params![recorded_by, event_id_b64, missing.len() as i64],
     )?;
+    let _ = WantedEvents::new(conn).insert_many_for_local(recorded_by, &missing);
     let _ = EventTimeline::new(conn).mark_blocked_b64(event_id_b64, current_timestamp_ms());
 
     Ok(Some(ProjectionDecision::Block { missing }))

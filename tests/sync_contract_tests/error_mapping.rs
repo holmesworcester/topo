@@ -110,10 +110,11 @@ async fn abrupt_close_surfaces_connection_lost() {
     .await;
 }
 
-/// Test that handler completes full round-trip with normal frames
-/// (serves as baseline to verify error tests are meaningful).
+/// Test that a normal empty discovery round succeeds without using a
+/// per-round completion handshake, and the handler remains healthy until
+/// cancellation.
 #[tokio::test]
-async fn normal_roundtrip_completes_successfully() {
+async fn normal_roundtrip_stays_healthy_until_cancel() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
         let handler = SyncSessionHandler::responder(
@@ -132,7 +133,6 @@ async fn normal_roundtrip_completes_successfully() {
             async move { handler.on_session(meta, Box::new(fake_io), cancel).await }
         });
 
-        // Normal protocol: NegOpen → NegMsg → Done → DoneAck
         let storage = empty_negentropy_storage();
         let mut neg =
             negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
@@ -140,22 +140,30 @@ async fn normal_roundtrip_completes_successfully() {
         peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
             .await;
 
-        // Consume NegMsg if any
-        let _ = peer.recv_control_msg_timeout(Duration::from_secs(2)).await;
+        if let Some(frame) = peer.recv_control_msg_timeout(Duration::from_secs(2)).await {
+            if let Frame::NegMsg { msg } = frame {
+                let mut have_ids = Vec::new();
+                let mut need_ids = Vec::new();
+                if let Some(next) = neg
+                    .reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)
+                    .unwrap()
+                {
+                    peer.send_control_msg(&Frame::NegMsg { msg: next }).await;
+                }
+            }
+        }
 
-        // Signal done
-        peer.send_data_msg(&Frame::DataDone).await;
-        peer.send_control_msg(&Frame::Done).await;
+        let unexpected = peer.recv_data_msg_timeout(Duration::from_millis(250)).await;
+        assert!(
+            unexpected.is_none(),
+            "expected no per-round DataDone marker, got {:?}",
+            unexpected
+        );
 
-        // Get DataDone + DoneAck
-        let _ = peer.recv_data_msg_timeout(Duration::from_secs(5)).await;
-        let _ = peer.recv_control_msg_timeout(Duration::from_secs(5)).await;
-
-        let result = tokio::time::timeout(Duration::from_secs(10), handler_task)
-            .await
-            .expect("handler timed out")
-            .expect("handler panicked");
-        assert!(result.is_ok(), "normal roundtrip should succeed");
+        cancel.cancel();
+        peer.force_close();
+        handler_task.abort();
+        let _ = handler_task.await;
     })
     .await;
 }

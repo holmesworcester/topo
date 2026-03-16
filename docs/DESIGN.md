@@ -125,7 +125,7 @@ This also covers the hard case where multiple local identities on the same endpo
 
 ### Sync And Convergence
 
-Once connected, peers reconcile their events over a set reconciliation algorithm that guarantees all peers will eventually have the same event set and (due to deterministic projection of events) the same convergent state for all shared data. Control and data are sent on separate QUIC streams for simplicity and reliability. Data streams carry events; control streams carry completion semantics (`Done`, `DataDone`, `DoneAck`) so each side can tell exactly when a round is complete. 
+Once connected, peers reconcile their events over a set reconciliation algorithm that guarantees all peers will eventually have the same event set and (due to deterministic projection of events) the same convergent state for all shared data. Control and data are sent on separate QUIC streams for simplicity and reliability. Data streams carry event blobs; control streams carry discovery hints, request windows, and request IDs. Discovery still runs in rounds, but request/response stays alive for the lifetime of the authenticated connection rather than ending each round with a separate completion handshake.
 
 Negentropy reconciliation exchanges compact set summaries (`NegOpen`/`NegMsg`) over workspace-scoped, time-based `(ts, event_id)` membership and yields `need_ids` without walking the dependency graph directly. Unlike sync algorithms used by OrbitDB, Git, etc., it is important for our design to chose one that does not care about the shape of our data and is ideal for event sets that are always growing. In this way, set reconcilation / syncing can be decoupled from the content of events.
 
@@ -387,24 +387,20 @@ Safety rule:
 3. all canonical event types have fixed wire sizes; `payload_len` must exactly match the schema-defined size for the event type (or, for encrypted events, the size determined by `inner_type_code`).
 4. any mismatch rejects the frame.
 
-## 1.5 Dual-stream sync completion protocol
+## 1.5 Dual-stream sync separation
 
 Sync sessions use one control stream and one data stream.
 
 Why split streams:
-1. keeps large event transfer (`Event` frames) from head-of-line blocking control semantics (`Done`, `DoneAck`),
-2. makes completion semantics explicit (data completion vs control completion),
+1. keeps large event transfer (`Event` frames) from head-of-line blocking discovery and request control,
+2. lets discovery rounds start and finish independently of the request/response data plane,
 3. improves practical throughput and observability by separating reconciliation/control chatter from bulk payload flow.
 
-Completion frames:
-1. `Done` (control stream, initiator -> responder): initiator has finished producing outbound work for this round.
-2. `DataDone` (data stream, either direction): sender has no more `Event` frames on the data stream.
-3. `DoneAck` (control stream, responder -> initiator): responder confirms terminal completion.
-
-Completion invariants:
-1. responder sends `DoneAck` only after its egress is drained, it has sent its own `DataDone`, and it has observed peer `DataDone` on inbound data.
-2. initiator treats the session as complete only after `DoneAck`.
-3. this handshake gives explicit end-of-data semantics without relying on transport stream close timing.
+Current shape:
+1. discovery rounds use `NegOpen` / `NegMsg` / `NeedList` on the control stream,
+2. request flow uses `RequestCredit` and `HaveList` on the control stream,
+3. the data stream carries only requested `Event` blobs,
+4. there is no per-round `Done` / `DataDone` / `DoneAck` drain handshake in live sync anymore.
 
 ---
 
@@ -1207,7 +1203,7 @@ Sync event transfer is pull-only.
 1. observer-loop reconciliation discovers missing IDs and candidate suppliers and writes `wanted + wanted_sources`,
 2. sink-side wanted scheduling chooses which IDs to request under source-advertised credit,
 3. sources queue requested IDs in bounded in-memory response buffers and read canonical blobs at send time,
-4. control protocol producers (`Frame::NegOpen`, `Frame::NegMsg`, `Frame::NeedList`, `Frame::HaveList`, `Frame::RequestCredit`, `Frame::Done`, `Frame::DataDone`, `Frame::DoneAck`, `Frame::IntroOffer`) live in `shared/protocol.rs`,
+4. control protocol producers (`Frame::NegOpen`, `Frame::NegMsg`, `Frame::NeedList`, `Frame::HaveList`, `Frame::RequestCredit`, `Frame::IntroOffer`) live in `shared/protocol.rs`,
 5. hot-observer wakeups from newly valid shared events cause the next peer observation pass to discover those IDs so the sink can request them.
 
 There is no durable sync egress queue anymore. Live sync event transport is request/response only and uses bounded in-memory connection-scoped response buffers.

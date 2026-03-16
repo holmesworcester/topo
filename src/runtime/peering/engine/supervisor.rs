@@ -20,10 +20,12 @@ use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
+use crate::contracts::peering_contract::SessionDirection;
 use crate::db::transport_creds::TenantInfo;
 use crate::peering::loops::{
     accept_loop_with_ingest_until_cancel,
-    connect_loop_with_coordination_until_cancel_with_fallback, IntroSpawnerFn,
+    connect_loop_with_coordination_until_cancel_with_fallback, preferred_connection_direction,
+    IntroSpawnerFn,
 };
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::CoordinationManager;
@@ -667,6 +669,20 @@ async fn run_target_dispatcher(
                 discovery_dispatch_key(&event.tenant_id, peer_id)
             }
         };
+
+        if !should_initiate_connect_for_source(&event.tenant_id, &event.source) {
+            if let Some(peer_id) = preferred_outbound_only_peer_id(&event.source) {
+                info!(
+                    "Skipping non-preferred {:?} dial key={} tenant={} peer={}",
+                    event.source,
+                    dispatch_key,
+                    short_peer_id(&event.tenant_id),
+                    short_peer_id(peer_id)
+                );
+            }
+            continue;
+        }
+
         let should_spawn = match &event.source {
             TargetIngressSource::Bootstrap { peer_id, .. } => {
                 dispatch_bootstrap_target(&mut dispatcher, &event.tenant_id, peer_id, event.remote)
@@ -823,6 +839,25 @@ async fn run_target_dispatcher(
     }
 
     Ok(())
+}
+
+fn preferred_outbound_only_peer_id(source: &TargetIngressSource) -> Option<&str> {
+    match source {
+        TargetIngressSource::Bootstrap { .. } => None,
+        TargetIngressSource::ObservedPeer { peer_id }
+        | TargetIngressSource::Discovery { peer_id } => Some(peer_id),
+    }
+}
+
+fn should_initiate_connect_for_source(tenant_id: &str, source: &TargetIngressSource) -> bool {
+    let Some(peer_id) = preferred_outbound_only_peer_id(source) else {
+        return true;
+    };
+
+    matches!(
+        preferred_connection_direction(tenant_id, peer_id),
+        Some(SessionDirection::Outbound)
+    )
 }
 
 async fn join_connect_worker(worker: ActiveConnectWorker) {
@@ -1011,5 +1046,50 @@ mod tests {
             worker_failure_policy(WorkerKind::ObservedEndpointRefresher),
             WorkerFailurePolicy::FailRuntime
         );
+    }
+
+    #[test]
+    fn discovery_and_observed_targets_only_dial_on_preferred_side() {
+        let lower = "0000000000000000000000000000000000000000000000000000000000000001";
+        let higher = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+
+        assert!(should_initiate_connect_for_source(
+            lower,
+            &TargetIngressSource::Discovery {
+                peer_id: higher.to_string(),
+            }
+        ));
+        assert!(!should_initiate_connect_for_source(
+            higher,
+            &TargetIngressSource::Discovery {
+                peer_id: lower.to_string(),
+            }
+        ));
+        assert!(should_initiate_connect_for_source(
+            lower,
+            &TargetIngressSource::ObservedPeer {
+                peer_id: higher.to_string(),
+            }
+        ));
+        assert!(!should_initiate_connect_for_source(
+            higher,
+            &TargetIngressSource::ObservedPeer {
+                peer_id: lower.to_string(),
+            }
+        ));
+    }
+
+    #[test]
+    fn bootstrap_targets_always_allow_connect_initiation() {
+        let tenant = "ffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffffff";
+        let peer = "0000000000000000000000000000000000000000000000000000000000000001";
+
+        assert!(should_initiate_connect_for_source(
+            tenant,
+            &TargetIngressSource::Bootstrap {
+                peer_id: peer.to_string(),
+                invite_event_id: "invite".to_string(),
+            }
+        ));
     }
 }

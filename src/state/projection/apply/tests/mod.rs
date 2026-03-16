@@ -8,9 +8,9 @@ use crate::db::{
 };
 use crate::event_modules::{
     self as events, registry, BenchDepEvent, EncryptedEvent, FileEvent, FileSliceEvent,
-    KeySecretEvent, MessageDeletionEvent, MessageEvent, ParsedEvent, ReactionEvent, WorkspaceEvent,
-    EVENT_TYPE_ENCRYPTED, EVENT_TYPE_FILE_SLICE, EVENT_TYPE_MESSAGE, EVENT_TYPE_MESSAGE_DELETION,
-    EVENT_TYPE_REACTION,
+    KeySecretEvent, KeySharedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent,
+    ReactionEvent, WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_FILE_SLICE,
+    EVENT_TYPE_MESSAGE, EVENT_TYPE_MESSAGE_DELETION, EVENT_TYPE_REACTION,
 };
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::encrypted::encrypt_event_blob;
@@ -491,6 +491,77 @@ fn sign_blob(key: &SigningKey, blob: &mut Vec<u8>) {
     let len = blob.len();
     let sig = sign_event_bytes(key, &blob[..len - 64]);
     blob[len - 64..].copy_from_slice(&sig);
+}
+
+#[test]
+fn key_shared_does_not_block_non_recipient_observers_on_local_invite_secret() {
+    let conn = open_in_memory().unwrap();
+    create_tables(&conn).unwrap();
+    let recorded_by = "observer-tenant";
+    let (signer_eid, signer_key, chain_blobs) = build_identity_chain_deferred(recorded_by);
+    insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
+
+    let recipient_event_id: EventId = conn
+        .query_row(
+            "SELECT event_id FROM user_invites WHERE recorded_by = ?1 LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .map(|eid_b64: String| event_id_from_base64(&eid_b64).expect("valid user_invite event id"))
+        .unwrap();
+    let key_shared = ParsedEvent::KeyShared(KeySharedEvent {
+        created_at_ms: now_ms(),
+        key_event_id: [0x44; 32],
+        recipient_event_id,
+        // This is recipient-local invite_secret material; the observer tenant
+        // does not have it and should still be able to validate/project the
+        // shared key wrapper row without blocking.
+        unwrap_key_event_id: [0x55; 32],
+        wrapped_key: [0x66; 32],
+        signed_by: signer_eid,
+        signer_type: 5,
+        signature: [0u8; 64],
+    });
+    let mut blob = events::encode_event(&key_shared).unwrap();
+    sign_blob(&signer_key, &mut blob);
+    let key_shared_eid = insert_event_raw(&conn, recorded_by, &blob);
+
+    let decision = project_one(&conn, recorded_by, &key_shared_eid).unwrap();
+    assert_eq!(decision, ProjectionDecision::Valid);
+
+    let key_shared_b64 = event_id_to_base64(&key_shared_eid);
+    let blocked: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &key_shared_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !blocked,
+        "non-recipient observers must not block on recipient-local invite_secret"
+    );
+
+    let projected: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM key_shared WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &key_shared_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(projected, "key_shared row should still project for observers");
+
+    let emitted_key_secret: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM key_secrets WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !emitted_key_secret,
+        "observer without local invite_secret must not derive key material"
+    );
 }
 
 /// Create a signed message event blob. Returns (parsed, blob).

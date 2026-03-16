@@ -88,8 +88,7 @@ flowchart TD
     P2 --> P3["phase 3: run effects executor"]
     P3 --> PROJ["project_one + cascade"]
 
-    OUT --> DD["DataDone"]
-    DD --> SHUT["Done / DoneAck shutdown protocol"]
+    OUT --> NEXT["next discovery round"]
 ```
 
 ## 3) High-Level Runtime Boundaries
@@ -245,8 +244,8 @@ flowchart TD
 - `runtime::supervisor::RuntimeSupervisor`: single owner for long-lived runtime workers (writer, accept loop, unified target dispatcher, target ingress workers).
 - `service.rs helpers`: `open_db_*`, node status helpers, intro transport helper entry points.
 - `Persist + enqueue`: phase 1 persists events/recorded/sync state and enqueues `project_queue`.
-- `Sync control`: sync control stream messages including `HaveList` and `Done`.
-- `Sync data`: sync data stream frames (`Event`, `DataDone`).
+- `Sync control`: sync control stream messages including `NegOpen`, `NegMsg`, `NeedList`, `HaveList`, and `RequestCredit`.
+- `Sync data`: sync data stream frames (`Event`).
 - `Shared event send`: `Store::get_shared(events) -> Frame::Event`.
 - `Projection tables`: projected read models (`messages`, `users`, `peers`, `channels`).
 - `Transport trust tables`: transport trust rows (`peer_shared`, invite bootstrap records).

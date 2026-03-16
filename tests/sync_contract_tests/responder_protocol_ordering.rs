@@ -1,8 +1,5 @@
-//! Tests that the responder (inbound) session handler emits protocol
-//! messages in the correct order through the FakeSessionIo contract.
-//!
-//! Anti-cheat: asserts exact frame-level events, goes through SessionHandler
-//! entrypoint (on_session), never invokes internal helpers directly.
+//! Tests that the responder answers repeated discovery rounds on one
+//! long-lived session without emitting per-round completion markers.
 
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -16,8 +13,41 @@ use crate::fake_session_io::{
     test_session_meta,
 };
 
+async fn drive_empty_inbound_round(peer: &mut crate::fake_session_io::FakePeerSide) {
+    let storage = empty_negentropy_storage();
+    let mut neg = negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
+    peer.send_control_msg(&Frame::NegOpen {
+        msg: neg.initiate().unwrap(),
+    })
+    .await;
+
+    loop {
+        let Some(frame) = peer
+            .recv_control_msg_timeout(Duration::from_millis(300))
+            .await
+        else {
+            break;
+        };
+        if matches!(frame, Frame::RequestCredit { .. }) {
+            continue;
+        }
+        let Frame::NegMsg { msg } = frame else {
+            panic!("expected NegMsg from responder");
+        };
+        let mut have_ids = Vec::new();
+        let mut need_ids = Vec::new();
+        if let Some(next) = neg
+            .reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)
+            .unwrap()
+        {
+            peer.send_control_msg(&Frame::NegMsg { msg: next }).await;
+        }
+        break;
+    }
+}
+
 #[tokio::test]
-async fn responder_inbound_replies_negmsg_then_doneack() {
+async fn responder_inbound_replies_negmsg_and_stays_open_for_next_round() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
         let handler = SyncSessionHandler::responder(
@@ -36,115 +66,26 @@ async fn responder_inbound_replies_negmsg_then_doneack() {
             async move { handler.on_session(meta, Box::new(fake_io), cancel).await }
         });
 
-        // Simulate the initiator side:
-        // 1. Send NegOpen with empty negentropy
-        let storage = empty_negentropy_storage();
-        let mut neg =
-            negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
-        let initial_msg = neg.initiate().unwrap();
-        peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
-            .await;
+        drive_empty_inbound_round(&mut peer).await;
 
-        // 2. Responder should reply with NegMsg
-        let neg_msg = peer.recv_control_msg_timeout(Duration::from_secs(5)).await;
-        if let Some(Frame::NegMsg { msg }) = &neg_msg {
-            let mut have_ids = Vec::new();
-            let mut need_ids = Vec::new();
-            let _ = neg.reconcile_with_ids(msg, &mut have_ids, &mut need_ids);
-        }
-
-        // 3. Signal Done from initiator
-        peer.send_data_msg(&Frame::DataDone).await;
-        peer.send_control_msg(&Frame::Done).await;
-
-        // 4. Responder should send DataDone on data stream, then DoneAck on control
-        let data_done = peer
-            .recv_data_msg_timeout(Duration::from_secs(5))
-            .await
-            .expect("expected DataDone from responder");
-        assert_eq!(data_done, Frame::DataDone);
-
-        let done_ack = peer
-            .recv_control_msg_timeout(Duration::from_secs(5))
-            .await
-            .expect("expected DoneAck from responder");
-        assert_eq!(done_ack, Frame::DoneAck);
-
-        let result = tokio::time::timeout(Duration::from_secs(10), handler_task)
-            .await
-            .expect("handler timed out")
-            .expect("handler panicked");
-        assert!(result.is_ok(), "handler failed: {:?}", result.err());
-    })
-    .await;
-}
-
-/// Anti-cheat mutation target: DoneAck ordering.
-/// Responder MUST send DataDone BEFORE DoneAck.
-#[tokio::test]
-async fn anticheat_responder_datadone_before_doneack() {
-    run_local(async {
-        let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncSessionHandler::responder(
-            db_path,
-            30,
-            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
-            noop_ingest_tx(),
-        );
-        let meta = test_session_meta(SessionDirection::Inbound);
-        let cancel = CancellationToken::new();
-
-        let (fake_io, mut peer) = fake_session_io_pair(meta.session_id);
-
-        tokio::task::spawn_local({
-            let cancel = cancel.clone();
-            async move {
-                let _ = handler.on_session(meta, Box::new(fake_io), cancel).await;
-            }
-        });
-
-        // Drive initiator side: NegOpen → Done
-        let storage = empty_negentropy_storage();
-        let mut neg =
-            negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
-        let initial_msg = neg.initiate().unwrap();
-        peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
-            .await;
-
-        // Consume NegMsg if any
-        let _ = peer.recv_control_msg_timeout(Duration::from_secs(2)).await;
-
-        // Signal done
-        peer.send_data_msg(&Frame::DataDone).await;
-        peer.send_control_msg(&Frame::Done).await;
-
-        // DataDone must arrive on data stream before DoneAck on control.
-        let data_msg = peer
-            .recv_data_msg_timeout(Duration::from_secs(5))
-            .await
-            .expect("expected data message from responder");
-        assert_eq!(
-            data_msg,
-            Frame::DataDone,
-            "ANTI-CHEAT: responder's first post-Done data message must be DataDone"
+        let unexpected = peer.recv_data_msg_timeout(Duration::from_millis(250)).await;
+        assert!(
+            unexpected.is_none(),
+            "expected no DataDone marker from responder, got {:?}",
+            unexpected
         );
 
-        let ctrl_msg = peer
-            .recv_control_msg_timeout(Duration::from_secs(5))
-            .await
-            .expect("expected control message from responder");
-        assert_eq!(
-            ctrl_msg,
-            Frame::DoneAck,
-            "ANTI-CHEAT: responder's post-DataDone control message must be DoneAck"
-        );
+        // A second round on the same session should also be answered.
+        drive_empty_inbound_round(&mut peer).await;
 
         cancel.cancel();
+        peer.force_close();
+        handler_task.abort();
+        let _ = handler_task.await;
     })
     .await;
 }
 
-/// Verify that responder rejects outbound direction.
 #[tokio::test]
 async fn responder_rejects_outbound_direction() {
     run_local(async {
@@ -165,14 +106,13 @@ async fn responder_rejects_outbound_direction() {
         assert!(
             result
                 .unwrap_err()
-                .contains("responder handler cannot run outbound"),
+                .contains("responder handler cannot run outbound sessions"),
             "expected role/direction mismatch error"
         );
     })
     .await;
 }
 
-/// Responder handles empty HaveList (marker) gracefully by ignoring it.
 #[tokio::test]
 async fn responder_ignores_empty_havelist_marker() {
     run_local(async {
@@ -195,39 +135,13 @@ async fn responder_ignores_empty_havelist_marker() {
             }
         });
 
-        // Send empty HaveList markers (like an outbound initiator would)
         peer.send_control_msg(&Frame::HaveList { ids: vec![] })
             .await;
 
-        // Then proceed with normal protocol
-        let storage = empty_negentropy_storage();
-        let mut neg =
-            negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
-        let initial_msg = neg.initiate().unwrap();
-        peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
-            .await;
-
-        // Consume NegMsg
-        let _ = peer.recv_control_msg_timeout(Duration::from_secs(2)).await;
-
-        // Signal done
-        peer.send_data_msg(&Frame::DataDone).await;
-        peer.send_control_msg(&Frame::Done).await;
-
-        // Should still get proper DoneAck sequence
-        let data_done = peer
-            .recv_data_msg_timeout(Duration::from_secs(5))
-            .await
-            .expect("expected DataDone");
-        assert_eq!(data_done, Frame::DataDone);
-
-        let done_ack = peer
-            .recv_control_msg_timeout(Duration::from_secs(5))
-            .await
-            .expect("expected DoneAck");
-        assert_eq!(done_ack, Frame::DoneAck);
+        drive_empty_inbound_round(&mut peer).await;
 
         cancel.cancel();
+        peer.force_close();
     })
     .await;
 }

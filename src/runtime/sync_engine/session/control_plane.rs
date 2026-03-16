@@ -5,7 +5,6 @@
 //! - Sink-side observation of missing IDs into SQL-backed `wanted` state
 //! - Discovery hints (`NeedList`) and request-window refill (`HaveList`)
 //!   via the shared in-memory coordinator
-//! - Session completion control markers (`Done` / `DoneAck`)
 
 use negentropy::Id;
 use tracing::info;
@@ -227,24 +226,6 @@ where
     }
     let credits = u32::try_from(credits).unwrap_or(u32::MAX);
     control.send(&Frame::RequestCredit { credits }).await?;
-    control.flush().await?;
-    Ok(())
-}
-
-pub async fn send_done<C>(control: &mut C) -> Result<(), SyncError>
-where
-    C: StreamConn,
-{
-    control.send(&Frame::Done).await?;
-    control.flush().await?;
-    Ok(())
-}
-
-pub async fn send_done_ack<C>(control: &mut C) -> Result<(), SyncError>
-where
-    C: StreamConn,
-{
-    control.send(&Frame::DoneAck).await?;
     control.flush().await?;
     Ok(())
 }

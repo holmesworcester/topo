@@ -3,7 +3,7 @@
 //! This module owns shared loop orchestration:
 //! - startup preflight/recovery
 //! - shared ingest writer setup
-//! - repeated per-connection sync session supervision
+//! - one long-lived sync session per authenticated connection
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
@@ -24,27 +24,12 @@ use crate::runtime::memtrace;
 use crate::runtime::repeated_warning::should_emit_globally;
 use crate::sync::SyncSessionHandler;
 use crate::transport::session_factory::extract_build_mismatch_reason;
-use crate::transport::{SessionProvider, TransportConnection};
+use crate::transport::SessionProvider;
 use crate::tuning::{low_mem_memtrace, low_mem_mode};
 
-use super::{current_timestamp_ms, drain_batch_size, run_session, shared_ingest_cap, SESSION_GAP};
+use super::{current_timestamp_ms, drain_batch_size, run_session, shared_ingest_cap};
 
 static PEER_SESSION_GATES: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> = OnceLock::new();
-static PEER_CONNECTIONS: OnceLock<Mutex<HashMap<String, ActivePeerConnection>>> = OnceLock::new();
-
-#[derive(Clone)]
-struct ActivePeerConnection {
-    direction: SessionDirection,
-    connection_id: usize,
-    connection: TransportConnection,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PeerConnectionAction {
-    KeepNew,
-    RejectNew,
-    ReplaceExisting,
-}
 
 /// How a session loop resolves the tenant (`recorded_by`) for each session.
 pub(super) enum SessionTenantResolver {
@@ -178,152 +163,104 @@ pub(super) async fn supervise_connection_sessions(
     direction: SessionDirection,
     tenant_resolver: &SessionTenantResolver,
     shutdown: CancellationToken,
-    max_sessions: Option<usize>,
 ) {
     let connection = provider.connection();
     let recorded_by = tenant_resolver.resolve(db_path);
-    match register_peer_connection(db_path, &recorded_by, peer_id, direction, &connection) {
-        PeerConnectionAction::KeepNew => {}
-        PeerConnectionAction::ReplaceExisting => {
-            info!(
-                "Connection {} ({:?}) became canonical for tenant={} peer={}",
-                connection.stable_id(),
-                direction,
-                short_peer_id(&recorded_by),
-                short_peer_id(peer_id)
-            );
-        }
-        PeerConnectionAction::RejectNew => {
-            info!(
-                "Closing non-canonical connection {} ({:?}) tenant={} peer={}",
-                connection.stable_id(),
-                direction,
-                short_peer_id(&recorded_by),
-                short_peer_id(peer_id)
-            );
-            connection.close(0u32.into(), b"non-canonical peer connection");
+    if shutdown.is_cancelled() {
+        connection.close(0u32.into(), b"runtime shutdown");
+        return;
+    }
+
+    let session = match tokio::select! {
+        _ = shutdown.cancelled() => {
+            connection.close(0u32.into(), b"runtime shutdown");
             return;
         }
-    }
-    let mut sessions_completed = 0usize;
-
-    loop {
-        if shutdown.is_cancelled() {
-            connection.close(0u32.into(), b"runtime shutdown");
-            break;
-        }
-
-        let session = match tokio::select! {
-            _ = shutdown.cancelled() => {
-                connection.close(0u32.into(), b"runtime shutdown");
-                break;
-            }
-            session = provider.next_session() => session,
-        } {
-            Ok(session) => session,
-            Err(e) => {
-                if let Some(reason) = extract_build_mismatch_reason(&e.to_string()) {
-                    note_build_mismatch(peer_id, reason);
-                    let key = format!(
-                        "session-build-mismatch:{:?}:{}:{}",
-                        direction, recorded_by, peer_id
+        session = provider.next_session() => session,
+    } {
+        Ok(session) => session,
+        Err(e) => {
+            if let Some(reason) = extract_build_mismatch_reason(&e.to_string()) {
+                note_build_mismatch(peer_id, reason);
+                let key = format!(
+                    "session-build-mismatch:{:?}:{}:{}",
+                    direction, recorded_by, peer_id
+                );
+                if should_emit_globally(key) {
+                    warn!(
+                        "Peer {} rejected {:?} session on connection {}: {}",
+                        short_peer_id(peer_id),
+                        direction,
+                        connection.stable_id(),
+                        reason
                     );
-                    if should_emit_globally(key) {
-                        warn!(
-                            "Peer {} rejected {:?} session on connection {}: {}",
-                            short_peer_id(peer_id),
-                            direction,
-                            connection.stable_id(),
-                            reason
-                        );
-                    }
-                    break;
                 }
+            } else {
                 info!(
-                    "Connection {} dropped while opening next {:?} session: {}",
+                    "Connection {} dropped while opening {:?} session: {}",
                     connection.stable_id(),
                     direction,
                     e
                 );
-                break;
             }
-        };
+            return;
+        }
+    };
 
-        let session_start = std::time::Instant::now();
-        let gate = peer_session_gate(db_path, &recorded_by, peer_id);
-        let gate_wait_start = std::time::Instant::now();
-        let session_slot = match gate.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                info!(
-                    "Session {} ({:?}) on connection {} waiting for peer session slot tenant={} peer={}",
-                    session.session_id,
-                    direction,
-                    connection.stable_id(),
-                    short_peer_id(&recorded_by),
-                    short_peer_id(peer_id)
-                );
-                let guard = gate.lock().await;
-                info!(
-                    "Session {} ({:?}) on connection {} acquired peer session slot after {}ms tenant={} peer={}",
-                    session.session_id,
-                    direction,
-                    connection.stable_id(),
-                    gate_wait_start.elapsed().as_millis(),
-                    short_peer_id(&recorded_by),
-                    short_peer_id(peer_id)
-                );
-                guard
-            }
-        };
-        info!(
-            "Starting session {} ({:?}) on connection {}",
-            session.session_id,
-            direction,
-            connection.stable_id()
-        );
-
-        run_session(
-            handler,
-            session.session_id,
-            session.io,
-            &recorded_by,
-            peer_fp,
-            session.remote_addr,
-            direction,
-            db_path,
-        )
-        .await;
-        drop(session_slot);
-        sessions_completed += 1;
-        if max_sessions.is_some_and(|limit| sessions_completed >= limit) {
+    let session_start = std::time::Instant::now();
+    let gate = peer_session_gate(db_path, &recorded_by, peer_id);
+    let gate_wait_start = std::time::Instant::now();
+    let session_slot = match gate.try_lock() {
+        Ok(guard) => guard,
+        Err(_) => {
             info!(
-                "Connection {} reached session budget {}; closing",
-                short_peer_id(peer_id),
-                sessions_completed
+                "Session {} ({:?}) on connection {} waiting for peer session slot tenant={} peer={}",
+                session.session_id,
+                direction,
+                connection.stable_id(),
+                short_peer_id(&recorded_by),
+                short_peer_id(peer_id)
             );
-            connection.close(0u32.into(), b"session budget reached");
-            break;
+            let guard = gate.lock().await;
+            info!(
+                "Session {} ({:?}) on connection {} acquired peer session slot after {}ms tenant={} peer={}",
+                session.session_id,
+                direction,
+                connection.stable_id(),
+                gate_wait_start.elapsed().as_millis(),
+                short_peer_id(&recorded_by),
+                short_peer_id(peer_id)
+            );
+            guard
         }
+    };
+    info!(
+        "Starting session {} ({:?}) on connection {}",
+        session.session_id,
+        direction,
+        connection.stable_id()
+    );
 
-        info!(
-            "Session {} ({:?}) on connection {} finished in {}ms",
-            session.session_id,
-            direction,
-            connection.stable_id(),
-            session_start.elapsed().as_millis()
-        );
+    run_session(
+        handler,
+        session.session_id,
+        session.io,
+        &recorded_by,
+        peer_fp,
+        session.remote_addr,
+        direction,
+        db_path,
+    )
+    .await;
+    drop(session_slot);
 
-        tokio::select! {
-            _ = shutdown.cancelled() => {
-                connection.close(0u32.into(), b"runtime shutdown");
-                break;
-            }
-            _ = tokio::time::sleep(SESSION_GAP) => {}
-        }
-    }
-
-    release_peer_connection(db_path, &recorded_by, peer_id, connection.stable_id());
+    info!(
+        "Session {} ({:?}) on connection {} finished in {}ms",
+        session.session_id,
+        direction,
+        connection.stable_id(),
+        session_start.elapsed().as_millis()
+    );
 }
 
 fn short_peer_id(peer_id: &str) -> &str {
@@ -338,105 +275,6 @@ fn peer_session_gate(db_path: &str, tenant_id: &str, peer_id: &str) -> Arc<Async
         .entry(key)
         .or_insert_with(|| Arc::new(AsyncMutex::new(())))
         .clone()
-}
-
-fn peer_connection_key(db_path: &str, tenant_id: &str, peer_id: &str) -> String {
-    format!("{db_path}|{tenant_id}|{peer_id}")
-}
-
-fn preferred_peer_connection_direction(tenant_id: &str, peer_id: &str) -> SessionDirection {
-    if tenant_id <= peer_id {
-        SessionDirection::Outbound
-    } else {
-        SessionDirection::Inbound
-    }
-}
-
-fn choose_peer_connection_action(
-    existing_direction: SessionDirection,
-    new_direction: SessionDirection,
-    preferred_direction: SessionDirection,
-) -> PeerConnectionAction {
-    if existing_direction == new_direction {
-        PeerConnectionAction::RejectNew
-    } else if new_direction == preferred_direction {
-        PeerConnectionAction::ReplaceExisting
-    } else {
-        PeerConnectionAction::RejectNew
-    }
-}
-
-fn register_peer_connection(
-    db_path: &str,
-    tenant_id: &str,
-    peer_id: &str,
-    direction: SessionDirection,
-    connection: &TransportConnection,
-) -> PeerConnectionAction {
-    let key = peer_connection_key(db_path, tenant_id, peer_id);
-    let registry = PEER_CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut registry = registry.lock().expect("peer connection registry");
-    let connection_id = connection.stable_id();
-
-    match registry.get(&key).cloned() {
-        None => {
-            registry.insert(
-                key,
-                ActivePeerConnection {
-                    direction,
-                    connection_id,
-                    connection: connection.clone(),
-                },
-            );
-            PeerConnectionAction::KeepNew
-        }
-        Some(existing) if existing.connection_id == connection_id => PeerConnectionAction::KeepNew,
-        Some(existing) => {
-            let preferred_direction = preferred_peer_connection_direction(tenant_id, peer_id);
-            let action =
-                choose_peer_connection_action(existing.direction, direction, preferred_direction);
-            match action {
-                PeerConnectionAction::KeepNew => PeerConnectionAction::KeepNew,
-                PeerConnectionAction::RejectNew => action,
-                PeerConnectionAction::ReplaceExisting => {
-                    info!(
-                        "Replacing connection {} ({:?}) with connection {} ({:?}) tenant={} peer={} preferred={:?}",
-                        existing.connection_id,
-                        existing.direction,
-                        connection_id,
-                        direction,
-                        short_peer_id(tenant_id),
-                        short_peer_id(peer_id),
-                        preferred_direction
-                    );
-                    existing
-                        .connection
-                        .close(0u32.into(), b"replaced by canonical peer connection");
-                    registry.insert(
-                        key,
-                        ActivePeerConnection {
-                            direction,
-                            connection_id,
-                            connection: connection.clone(),
-                        },
-                    );
-                    action
-                }
-            }
-        }
-    }
-}
-
-fn release_peer_connection(db_path: &str, tenant_id: &str, peer_id: &str, connection_id: usize) {
-    let key = peer_connection_key(db_path, tenant_id, peer_id);
-    let registry = PEER_CONNECTIONS.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut registry = registry.lock().expect("peer connection registry");
-    let should_remove = registry
-        .get(&key)
-        .is_some_and(|entry| entry.connection_id == connection_id);
-    if should_remove {
-        registry.remove(&key);
-    }
 }
 
 #[cfg(test)]
@@ -489,58 +327,6 @@ mod tests {
             "0123456789abcdef"
         );
         assert_eq!(short_peer_id("short"), "short");
-    }
-
-    #[test]
-    fn preferred_connection_direction_uses_stable_peer_order() {
-        assert_eq!(
-            preferred_peer_connection_direction("alice", "bob"),
-            SessionDirection::Outbound
-        );
-        assert_eq!(
-            preferred_peer_connection_direction("bob", "alice"),
-            SessionDirection::Inbound
-        );
-    }
-
-    #[test]
-    fn connection_action_rejects_same_direction_duplicates() {
-        assert_eq!(
-            choose_peer_connection_action(
-                SessionDirection::Outbound,
-                SessionDirection::Outbound,
-                SessionDirection::Outbound,
-            ),
-            PeerConnectionAction::RejectNew
-        );
-        assert_eq!(
-            choose_peer_connection_action(
-                SessionDirection::Inbound,
-                SessionDirection::Inbound,
-                SessionDirection::Inbound,
-            ),
-            PeerConnectionAction::RejectNew
-        );
-    }
-
-    #[test]
-    fn connection_action_prefers_canonical_direction_once_both_exist() {
-        assert_eq!(
-            choose_peer_connection_action(
-                SessionDirection::Inbound,
-                SessionDirection::Outbound,
-                SessionDirection::Outbound,
-            ),
-            PeerConnectionAction::ReplaceExisting
-        );
-        assert_eq!(
-            choose_peer_connection_action(
-                SessionDirection::Outbound,
-                SessionDirection::Inbound,
-                SessionDirection::Outbound,
-            ),
-            PeerConnectionAction::RejectNew
-        );
     }
 
     #[tokio::test]

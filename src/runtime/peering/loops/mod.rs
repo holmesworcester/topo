@@ -70,11 +70,8 @@ pub type IntroSpawnerFn = fn(
 /// Endpoint observation TTL: 24 hours in milliseconds.
 pub(super) const ENDPOINT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// Negentropy session timeout for initiator and responder (seconds).
+/// Long-lived sync-session activity timeout for initiator and responder (seconds).
 pub const SYNC_SESSION_TIMEOUT_SECS: u64 = 60;
-
-/// Sleep between consecutive sync sessions on the same connection.
-pub(super) const SESSION_GAP: Duration = Duration::from_millis(100);
 
 /// Sleep after a failed QUIC connection attempt before retrying.
 pub(super) const CONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);

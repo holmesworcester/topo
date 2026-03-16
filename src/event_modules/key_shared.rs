@@ -256,8 +256,11 @@ pub static KEY_SHARED_META: EventTypeMeta = EventTypeMeta {
     type_name: "key_shared",
     projection_table: "key_shared",
     share_scope: ShareScope::Shared,
-    dep_fields: &["recipient_event_id", "unwrap_key_event_id", "signed_by"],
-    dep_field_type_codes: &[&[10, 12], &[28], &[]],
+    // `unwrap_key_event_id` points at recipient-local invite_secret material.
+    // Non-recipient peers legitimately never have that event, so treating it
+    // as a universal hard dependency wedges shared observers on foreign links.
+    dep_fields: &["recipient_event_id", "signed_by"],
+    dep_field_type_codes: &[&[10, 12], &[]],
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,

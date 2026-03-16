@@ -1,9 +1,8 @@
 //! Data-plane helpers for sync sessions.
 //!
 //! Owns data-stream and blob-movement concerns:
-//! - inbound event receiver task (`Event` / `DataDone`)
+//! - inbound event receiver task (`Event`)
 //! - draining requested response blobs to the data stream (`Event`)
-//! - completion marker emission on data stream (`DataDone`)
 
 use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -142,19 +141,8 @@ where
     }
 }
 
-pub async fn send_data_done<S>(data_send: &mut S) -> Result<(), ConnectionError>
-where
-    S: StreamSend,
-{
-    let _ = data_send.flush().await;
-    data_send.send(&Frame::DataDone).await?;
-    data_send.flush().await?;
-    Ok(())
-}
-
 /// Spawn data receiver task. Returns:
-/// - `shutdown_tx`: forced shutdown (timeout fallback only)
-/// - `data_drained_rx`: signals when peer's DataDone marker is received (all data consumed)
+/// - `shutdown_tx`: forced shutdown when the owning sync session exits
 /// - `JoinHandle`: task handle
 ///
 /// Each received event is tagged with `recorded_by` before being sent to the
@@ -167,20 +155,14 @@ pub fn spawn_data_receiver<R>(
     recorded_by: String,
     source_tag: String,
     rx_capture: Option<SyncRunRxCapture>,
-) -> (
-    oneshot::Sender<()>,
-    oneshot::Receiver<()>,
-    tokio::task::JoinHandle<()>,
-)
+) -> (oneshot::Sender<()>, tokio::task::JoinHandle<()>)
 where
     R: StreamRecv + Send + 'static,
 {
     let memtrace_enabled = low_mem_memtrace();
     let memtrace_file = std::env::var("LOW_MEM_MEMTRACE_FILE").ok();
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
-    let (data_done_tx, data_done_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
-        let mut data_done_tx = Some(data_done_tx);
         let mut events_ingested: u64 = 0;
         let mut max_blob_size: usize = 0;
         let memtrace_interval = Duration::from_secs(2);
@@ -234,13 +216,6 @@ where
                                 last_memtrace = Instant::now();
                             }
                         }
-                        Ok(Frame::DataDone) => {
-                            info!("Received DataDone from peer — all data consumed");
-                            if let Some(tx) = data_done_tx.take() {
-                                let _ = tx.send(());
-                            }
-                            break;
-                        }
                         Ok(_) => {}
                         Err(ConnectionError::Closed) => {
                             info!("Data stream closed by peer");
@@ -264,7 +239,7 @@ where
         }
     });
 
-    (shutdown_tx, data_done_rx, handle)
+    (shutdown_tx, handle)
 }
 
 #[cfg(test)]

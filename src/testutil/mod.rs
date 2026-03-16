@@ -21,6 +21,17 @@ impl DaemonGuard {
     pub fn child(&mut self) -> &mut Child {
         self.child.as_mut().expect("DaemonGuard already consumed")
     }
+
+    /// Prevent Drop from touching a child that has already been reaped or
+    /// transferred elsewhere.
+    pub fn clear(&mut self) {
+        self.child = None;
+    }
+
+    /// Take ownership of the underlying child process.
+    pub fn take(&mut self) -> Option<Child> {
+        self.child.take()
+    }
 }
 
 impl Drop for DaemonGuard {

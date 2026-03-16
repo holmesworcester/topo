@@ -2,7 +2,8 @@
 //!
 //! Handles incoming negentropy reconciliation, serves requested events from a
 //! bounded in-memory queue, issues sink-side requests under advertised credit,
-//! and follows the shutdown protocol (DataDone / DoneAck).
+//! and keeps those request/response lanes alive across repeated discovery
+//! rounds on the same transport session.
 //!
 //! Reconciliation runs on a dedicated OS thread so the main loop can
 //! continue draining requested responses during the 100-400ms reconcile() calls.
@@ -36,17 +37,15 @@ use crate::tuning::{
 
 use super::connection_scope::{ConnectionRequestState, ConnectionResponseState};
 use super::control_plane::{
-    observe_event_ids_for_peer, refill_wanted_requests, send_done_ack, send_request_credit,
+    observe_event_ids_for_peer, refill_wanted_requests, send_request_credit,
 };
 use super::coordinator::PeerCoord;
-use super::data_plane::{
-    drain_pending_responses_to_data_stream, send_data_done, spawn_data_receiver,
-};
+use super::data_plane::{drain_pending_responses_to_data_stream, spawn_data_receiver};
 use super::logging::{SyncRunCapture, SyncRunRxCapture};
 use super::windowing::{decode_initial_neg_open, SyncWindow, SyncWindowKind};
 use super::{
-    negentropy_frame_size, send_idle_capture_enabled, CONTROL_POLL_TIMEOUT, DATA_DRAIN_TIMEOUT,
-    EGRESS_QUIET_WINDOW, INITIAL_CONTROL_PROGRESS_TIMEOUT,
+    negentropy_frame_size, send_idle_capture_enabled, CONTROL_POLL_TIMEOUT,
+    INITIAL_CONTROL_PROGRESS_TIMEOUT,
 };
 
 fn should_treat_as_startup_control_abort(
@@ -165,7 +164,7 @@ where
 
     let ingest_tx = shared_ingest;
 
-    let (shutdown_tx, data_drained_rx, recv_handle) = spawn_data_receiver(
+    let (shutdown_tx, recv_handle) = spawn_data_receiver(
         data_recv,
         ingest_tx.clone(),
         events_received.clone(),
@@ -178,7 +177,6 @@ where
     let mut events_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
     let mut rounds = 0;
-    let mut peer_done = false;
     let mut round_observed_ids: Vec<crate::crypto::EventId> = Vec::new();
     let sync_start = Instant::now();
     let reconcile_start = Instant::now();
@@ -190,7 +188,6 @@ where
     let memtrace_file = std::env::var("LOW_MEM_MEMTRACE_FILE").ok();
     let mut last_memtrace = Instant::now();
     let mut last_alloc_trim = Instant::now();
-    let mut egress_quiet_since: Option<Instant> = None;
     let idle_capture_enabled = send_idle_capture_enabled() && capture.is_some();
     let mut last_send_progress = Instant::now();
     let mut last_idle_marker = Instant::now();
@@ -228,7 +225,6 @@ where
                         "peer_id": peer_id,
                         "elapsed_ms": sync_start.elapsed().as_millis(),
                         "reconciling": reconciling,
-                        "peer_done": peer_done,
                     }))
                     .ok(),
                 );
@@ -256,16 +252,16 @@ where
                             &round_observed_ids,
                             current_timestamp_ms(),
                         );
-                    } else if peer_done {
-                        info!(
-                            "Dropping late NegMsg after peer Done: rounds={}, response_bytes={}",
-                            rounds,
-                            response.len()
-                        );
                     } else {
                         control.send(&Frame::NegMsg { msg: response }).await?;
                         control.flush().await?;
                     }
+                    neg_req_tx = None;
+                    neg_resp_rx = None;
+                    if let Some(handle) = neg_worker.take() {
+                        let _ = handle.join();
+                    }
+                    round_observed_ids.clear();
                 }
                 Ok(Err(e)) => {
                     return Err(e.into());
@@ -286,12 +282,14 @@ where
                 reconcile_started_at_ms = current_timestamp_ms();
                 let (window, inner_msg) =
                     decode_initial_neg_open(&msg).map_err(|e| format!("bad NegOpen: {e}"))?;
-                if neg_req_tx.is_none() {
-                    let (req_tx, resp_rx, handle) = spawn_neg_worker(window);
-                    neg_req_tx = Some(req_tx);
-                    neg_resp_rx = Some(resp_rx);
-                    neg_worker = Some(handle);
+                if neg_req_tx.is_some() || reconciling {
+                    return Err("received overlapping NegOpen before prior round completed".into());
                 }
+                round_observed_ids.clear();
+                let (req_tx, resp_rx, handle) = spawn_neg_worker(window);
+                neg_req_tx = Some(req_tx);
+                neg_resp_rx = Some(resp_rx);
+                neg_worker = Some(handle);
                 neg_req_tx
                     .as_ref()
                     .expect("neg worker sender missing")
@@ -336,11 +334,6 @@ where
                         observed, peer_id
                     );
                 }
-            }
-            Ok(Ok(Frame::Done)) => {
-                last_activity = Instant::now();
-                info!("Received Done from initiator");
-                peer_done = true;
             }
             Ok(Ok(Frame::RequestCredit { credits })) => {
                 last_activity = Instant::now();
@@ -417,11 +410,10 @@ where
             let sqlite_db = memtrace::sqlite_db_memory(&db);
             let allocator = memtrace::allocator_memory();
             let line = format!(
-                "LOWMEM_MEMTRACE responder peer={} rounds={} reconciling={} peer_done={} pending_responses={} response_credit_available={} wanted_peer_backlog={} request_inflight={} request_credit={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_cache={} db_schema={} db_stmt={} mall_arena={} mall_used={} mall_free={} mall_mmap={} bytes_rx={} bytes_tx={}",
+                "LOWMEM_MEMTRACE responder peer={} rounds={} reconciling={} pending_responses={} response_credit_available={} wanted_peer_backlog={} request_inflight={} request_credit={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_cache={} db_schema={} db_stmt={} mall_arena={} mall_used={} mall_free={} mall_mmap={} bytes_rx={} bytes_tx={}",
                 peer_id,
                 rounds,
                 reconciling,
-                peer_done,
                 response_stats.pending_len,
                 response_stats.available_credit,
                 wanted_peer_backlog,
@@ -461,10 +453,10 @@ where
             if let Some(capture) = capture.as_ref() {
                 let idle_state = if response_stats.pending_len > 0 {
                     "queued_not_sending"
-                } else if reconciling || pending_wanted_backlog > 0 || !peer_done {
+                } else if reconciling || pending_wanted_backlog > 0 {
                     "waiting_on_control"
                 } else {
-                    "no_ready_work"
+                    "between_rounds"
                 };
                 capture.record_marker(
                     "meta",
@@ -475,7 +467,6 @@ where
                         "state": idle_state,
                         "idle_ms": last_send_progress.elapsed().as_millis(),
                         "reconciling": reconciling,
-                        "peer_done": peer_done,
                         "pending_responses": response_stats.pending_len,
                         "response_credit_available": response_stats.available_credit,
                         "wanted_peer_backlog": pending_wanted_backlog,
@@ -486,37 +477,6 @@ where
                 );
             }
             last_idle_marker = Instant::now();
-        }
-
-        // After peer signalled Done and our requested-response queue is drained:
-        // 1. Send DataDone on data stream (signals peer's data receiver)
-        // 2. Wait for peer's DataDone to be consumed by our data receiver
-        // 3. Only then send DoneAck on control
-        let pending_wanted_backlog = wanted.count_backlog_for_peer(peer_id).unwrap_or(0);
-        if peer_done && !reconciling && pending_wanted_backlog == 0 {
-            if response_state.is_empty() {
-                let quiet_since = egress_quiet_since.get_or_insert_with(Instant::now);
-                if quiet_since.elapsed() >= EGRESS_QUIET_WINDOW {
-                    send_data_done(&mut data_send).await?;
-
-                    let drain_timeout = DATA_DRAIN_TIMEOUT;
-                    match tokio::time::timeout(drain_timeout, data_drained_rx).await {
-                        Ok(Ok(())) => info!("Inbound data fully drained"),
-                        Ok(Err(_)) => info!("Data drain channel dropped (receiver already exited)"),
-                        Err(_) => warn!("Timed out waiting for inbound data drain"),
-                    }
-
-                    send_done_ack(&mut control).await?;
-                    info!(
-                        "Sent DoneAck (sent {}, received {})",
-                        events_sent,
-                        events_received.load(Ordering::Relaxed)
-                    );
-                    break;
-                }
-            } else {
-                egress_quiet_since = None;
-            }
         }
     }
     // Drop the request channel to signal the worker to exit

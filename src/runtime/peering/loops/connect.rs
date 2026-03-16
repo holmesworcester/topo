@@ -442,7 +442,6 @@ async fn connect_loop_inner(
             SessionDirection::Outbound,
             &tenant_resolver,
             shutdown.clone(),
-            None,
         )
         .await;
         drop(connection_lease);

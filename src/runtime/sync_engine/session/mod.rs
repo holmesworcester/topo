@@ -1,14 +1,11 @@
 //! Sync session logic: initiator and responder sync loops.
 //!
-//! Extracted from sync/engine.rs (Phase 3 of Option B refactor).
-//! Wire protocol behavior is unchanged -- this is a pure code-movement extraction.
-//!
-//! Shutdown protocol (preserved):
-//! 1. Each side sends DataDone on the data stream after flushing all events.
-//! 2. Initiator sends Done on control after its DataDone.
-//! 3. Responder receives Done, finishes sending, sends DataDone on data,
-//!    waits for initiator's DataDone to be consumed, then sends DoneAck.
-//! 4. Initiator receives DoneAck, waits for responder's DataDone, exits.
+//! Discovery remains round-scoped, but one transport session now stays alive
+//! for the lifetime of the authenticated connection:
+//! - initiator starts repeated negentropy rounds over the same control stream
+//! - responder answers those rounds over the same control stream
+//! - request credit, request issuance, and response sends stay connection-scoped
+//! - there is no per-round data-plane drain handshake
 
 pub mod connection_scope;
 pub mod control_plane;
@@ -57,18 +54,15 @@ pub(super) fn need_chunk() -> usize {
         1000
     }
 }
-/// Small quiet period before declaring a session's outbound response queue drained.
-pub(super) const EGRESS_QUIET_WINDOW: Duration = Duration::from_millis(500);
-
-/// Time to wait for inbound data stream drain at session end.
-pub(super) const DATA_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
-
 /// Time to wait for a single data-stream send/flush before treating it as stalled.
 pub(super) const DATA_SEND_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum time a session may sit without any initial control-round progress.
 /// If a session never gets past the first negentropy exchange, restarting it is
 /// better than blocking the connection supervisor for the full activity timeout.
 pub(super) const INITIAL_CONTROL_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// Gap between initiator-driven discovery rounds on an established connection.
+pub(super) const DISCOVERY_ROUND_GAP: Duration = Duration::from_millis(100);
 
 /// Non-blocking poll timeout for the control stream receive.
 pub(super) const CONTROL_POLL_TIMEOUT: Duration = Duration::from_millis(1);

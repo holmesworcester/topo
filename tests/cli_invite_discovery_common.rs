@@ -13,6 +13,7 @@ use topo::testutil::DaemonGuard;
 
 pub fn cli_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    hold_network_test_lock_for_binary();
     let guard = LOCK
         .get_or_init(|| Mutex::new(()))
         .lock()

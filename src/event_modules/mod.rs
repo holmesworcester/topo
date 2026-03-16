@@ -215,7 +215,6 @@ impl ParsedEvent {
             ParsedEvent::KeyShared(s) => {
                 vec![
                     ("recipient_event_id", s.recipient_event_id),
-                    ("unwrap_key_event_id", s.unwrap_key_event_id),
                     ("signed_by", s.signed_by),
                 ]
             }

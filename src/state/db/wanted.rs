@@ -79,6 +79,51 @@ impl<'a> WantedEvents<'a> {
         })
     }
 
+    /// Insert pure demand for missing events for a specific local tenant.
+    ///
+    /// This is used by projection blocking paths where the sink knows it still
+    /// needs a dependency, but does not yet know which peer can satisfy it.
+    /// Demand is tenant-scoped via `recorded_events`, so shared-DB sibling
+    /// blobs do not incorrectly suppress fetches for the current tenant.
+    pub fn insert_many_for_local(
+        &self,
+        local_peer_id: &str,
+        ids: &[EventId],
+    ) -> SqliteResult<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+
+        let now = current_timestamp_ms();
+        let mut already_recorded = self.conn.prepare(
+            "SELECT 1 FROM recorded_events
+             WHERE peer_id = ?1 AND event_id = ?2
+             LIMIT 1",
+        )?;
+        let mut insert_wanted = self
+            .conn
+            .prepare("INSERT OR IGNORE INTO wanted_events (id, first_seen_at) VALUES (?1, ?2)")?;
+
+        let mut inserted = 0usize;
+        for id in ids {
+            let id_b64 = event_id_to_base64(id);
+            let already_local = already_recorded
+                .query_row(params![local_peer_id, &id_b64], |_| Ok(()))
+                .optional()?
+                .is_some();
+            if already_local {
+                delete_wanted_row(self.conn, id)?;
+                continue;
+            }
+            let rows = insert_wanted.execute(params![&id[..], now])?;
+            if rows > 0 {
+                inserted += 1;
+            }
+        }
+
+        Ok(inserted)
+    }
+
     /// Observe that `peer_id` appears to have each event in `ids`.
     ///
     /// This records event demand once and candidate source membership per peer.
@@ -385,7 +430,7 @@ mod tests {
 
     fn insert_local_event(conn: &Connection, id: &EventId) {
         conn.execute(
-            "INSERT INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
              VALUES (?1, 'encrypted', x'00', 'shared', 1, 1)",
             params![event_id_to_base64(id)],
         )
@@ -393,12 +438,44 @@ mod tests {
     }
 
     fn mark_recorded_for_peer(conn: &Connection, peer_id: &str, id: &EventId) {
+        insert_local_event(conn, id);
         conn.execute(
             "INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
              VALUES (?1, ?2, 1, 'test')",
             params![peer_id, event_id_to_base64(id)],
         )
         .unwrap();
+    }
+
+    #[test]
+    fn test_insert_many_for_local_uses_tenant_recorded_state_not_global_blob_presence() {
+        let conn = crate::db::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let wanted = WantedEvents::new(&conn);
+        let id = make_event_id(42);
+
+        insert_local_event(&conn, &id);
+        assert_eq!(
+            wanted.insert_many_for_local("tenant-a", &[id]).unwrap(),
+            1,
+            "raw blob presence must not suppress tenant-local demand"
+        );
+
+        mark_recorded_for_peer(&conn, "tenant-a", &id);
+        assert_eq!(
+            wanted.insert_many_for_local("tenant-a", &[id]).unwrap(),
+            0,
+            "tenant-recorded events must not remain wanted"
+        );
+
+        let wanted_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM wanted_events WHERE id = ?1",
+                params![&id[..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wanted_count, 0);
     }
 
     #[test]

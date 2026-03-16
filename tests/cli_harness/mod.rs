@@ -12,8 +12,8 @@ use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use topo::testutil::DaemonGuard;
 
-const DAEMON_START_MAX_ATTEMPTS: usize = 8;
-const DAEMON_START_RETRY_BASE_MS: u64 = 100;
+const DAEMON_START_MAX_ATTEMPTS: usize = 20;
+const DAEMON_START_RETRY_BASE_MS: u64 = 200;
 
 pub fn cleanup_test_daemons() {
     hold_network_test_binary_lock();
@@ -194,6 +194,10 @@ fn hold_network_test_binary_lock() {
     });
 }
 
+pub fn hold_network_test_lock_for_binary() {
+    hold_network_test_binary_lock();
+}
+
 pub struct LocalTenantInfo {
     pub peer_id: String,
     pub workspace_id: String,
@@ -325,6 +329,10 @@ fn daemon_inherit_stdio_env() -> bool {
         .unwrap_or(false)
 }
 
+fn daemon_debug_log_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("P7_TEST_DAEMON_LOG_DIR").map(std::path::PathBuf::from)
+}
+
 /// Start a daemon with default options (random port, suppressed I/O).
 pub fn start_daemon(db: &str) -> DaemonGuard {
     start_daemon_with_options(
@@ -353,7 +361,10 @@ pub fn start_discovery_daemon(db: &str) -> DaemonGuard {
     start_daemon_with_options(
         db,
         &DaemonOptions {
-            bind_ip: Some("0.0.0.0".to_string()),
+            // Same-host discovery tests still browse/advertise over mDNS, but
+            // binding the QUIC socket to loopback avoids environment-specific
+            // wildcard-bind failures without changing the sync path under test.
+            bind_ip: Some("127.0.0.1".to_string()),
             extra_env: vec![("P7_TEST_DISCOVERY_LOOPBACK".to_string(), "1".to_string())],
             ..Default::default()
         },
@@ -365,7 +376,7 @@ pub fn start_discovery_daemon_on_port(db: &str, port: u16) -> DaemonGuard {
     start_daemon_with_options(
         db,
         &DaemonOptions {
-            bind_ip: Some("0.0.0.0".to_string()),
+            bind_ip: Some("127.0.0.1".to_string()),
             bind_port: Some(port),
             extra_env: vec![("P7_TEST_DISCOVERY_LOOPBACK".to_string(), "1".to_string())],
             ..Default::default()
@@ -391,14 +402,31 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
             requested_bind_addr.clone()
         };
         let inherit_stdio = opts.inherit_stdio || daemon_inherit_stdio_env();
-        let stdout_path = opts
-            .stdout_file
-            .clone()
-            .unwrap_or_else(|| default_daemon_log_path(db, "stdout"));
-        let stderr_path = opts
-            .stderr_file
-            .clone()
-            .unwrap_or_else(|| default_daemon_log_path(db, "stderr"));
+        let debug_log_base = daemon_debug_log_dir().map(|dir| {
+            std::fs::create_dir_all(&dir).expect("create daemon debug log dir");
+            let db_label = std::path::Path::new(db)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("daemon");
+            dir.join(format!(
+                "{}-pid{}-attempt{}",
+                db_label,
+                std::process::id(),
+                attempt + 1
+            ))
+        });
+        let stdout_path = opts.stdout_file.clone().or_else(|| {
+            debug_log_base
+                .as_ref()
+                .map(|base| base.with_extension("stdout.log"))
+        })
+        .unwrap_or_else(|| default_daemon_log_path(db, "stdout"));
+        let stderr_path = opts.stderr_file.clone().or_else(|| {
+            debug_log_base
+                .as_ref()
+                .map(|base| base.with_extension("stderr.log"))
+        })
+        .unwrap_or_else(|| default_daemon_log_path(db, "stderr"));
         let mut cmd = Command::new(bin());
         cmd.arg("--db")
             .arg(db)
@@ -416,20 +444,14 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
             cmd.env(key, value);
         }
 
-        if let Some(ref path) = opts.stdout_file {
-            let f = std::fs::File::create(path).expect("create stdout log file");
-            cmd.stdout(f);
-        } else if inherit_stdio {
+        if inherit_stdio && opts.stdout_file.is_none() && debug_log_base.is_none() {
             cmd.stdout(Stdio::inherit());
         } else {
             let f = std::fs::File::create(&stdout_path).expect("create default stdout log file");
             cmd.stdout(f);
         }
 
-        if let Some(ref path) = opts.stderr_file {
-            let f = std::fs::File::create(path).expect("create stderr log file");
-            cmd.stderr(f);
-        } else if inherit_stdio {
+        if inherit_stdio && opts.stderr_file.is_none() && debug_log_base.is_none() {
             cmd.stderr(Stdio::inherit());
         } else {
             let f = std::fs::File::create(&stderr_path).expect("create default stderr log file");
@@ -452,9 +474,7 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
         }
 
         if let Some(status) = exited_early {
-            if socket.exists() {
-                wait_for_daemon_stopped(db, Duration::from_secs(2));
-            }
+            wait_for_daemon_stopped(db, Duration::from_secs(2));
             if attempt + 1 < DAEMON_START_MAX_ATTEMPTS {
                 retry_with_ephemeral_bind |= opts.bind_port.is_some();
                 let backoff_ms =
@@ -502,14 +522,27 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
                 .output()
                 .expect("failed to probe daemon tenant active");
             if out.status.success() {
+                if let Some(status) = child.try_wait().expect("failed to check daemon status") {
+                    wait_for_daemon_stopped(db, Duration::from_secs(2));
+                    if attempt < 7 {
+                        retry_with_ephemeral_bind |= opts.bind_port.is_some();
+                        std::thread::sleep(Duration::from_millis(100));
+                        break;
+                    }
+                    panic!(
+                        "daemon child exited after readiness probe with {} (db={})\nstdout:\n{}\nstderr:\n{}",
+                        status,
+                        db,
+                        read_daemon_log(&stdout_path),
+                        read_daemon_log(&stderr_path)
+                    );
+                }
                 return DaemonGuard::new(child);
             }
             if rpc_start.elapsed().as_secs() >= 5 {
                 let _ = child.kill();
                 let _ = child.wait();
-                if socket.exists() {
-                    wait_for_daemon_stopped(db, Duration::from_secs(2));
-                }
+                wait_for_daemon_stopped(db, Duration::from_secs(2));
                 if attempt < 7 {
                     retry_with_ephemeral_bind |= opts.bind_port.is_some();
                     std::thread::sleep(Duration::from_millis(100));
@@ -602,14 +635,12 @@ pub fn stop_daemon(db: &str, daemon: &mut DaemonGuard) {
         match daemon.child().try_wait() {
             Ok(Some(_)) => {
                 wait_for_daemon_stopped(db, Duration::from_secs(5));
+                daemon.clear();
                 return;
             }
             Ok(None) => {
                 if start.elapsed().as_secs() >= 5 {
-                    let _ = daemon.child().kill();
-                    let _ = daemon.child().wait();
-                    wait_for_daemon_stopped(db, Duration::from_secs(5));
-                    return;
+                    break;
                 }
                 std::thread::sleep(Duration::from_millis(100));
             }
@@ -622,6 +653,12 @@ pub fn stop_daemon(db: &str, daemon: &mut DaemonGuard) {
                 );
             }
         }
+    }
+
+    if let Some(mut child) = daemon.take() {
+        let _ = child.kill();
+        let _ = child.wait();
+        wait_for_daemon_stopped(db, Duration::from_secs(5));
     }
 }
 
@@ -794,7 +831,7 @@ pub fn create_workspace_with_details(
     username: &str,
     device_name: &str,
 ) {
-    let tmp_daemon = start_daemon(db);
+    let mut tmp_daemon = start_daemon(db);
     let out = Command::new(bin())
         .args([
             "create-workspace",
@@ -814,7 +851,7 @@ pub fn create_workspace_with_details(
         "create-workspace failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    // Wait until tenant discovery sees at least one peer before stopping.
+    // Wait until tenant discovery sees at least one peer before proceeding.
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(5) {
         let peers = Command::new(bin())
@@ -833,8 +870,7 @@ pub fn create_workspace_with_details(
         std::thread::sleep(Duration::from_millis(100));
     }
     // Stop temporary daemon; callers decide daemon lifecycle.
-    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
-    drop(tmp_daemon);
+    stop_daemon(db, &mut tmp_daemon);
     wait_for_daemon_stopped(db, Duration::from_secs(10));
 }
 
@@ -1088,7 +1124,7 @@ pub fn accept_invite_with_identity_and_timeout(
     devicename: &str,
     accept_timeout: Duration,
 ) {
-    let tmp_daemon = if invite_has_empty_bootstrap_addrs(invite_link) {
+    let mut tmp_daemon = if invite_has_empty_bootstrap_addrs(invite_link) {
         start_discovery_daemon(db)
     } else {
         start_daemon(db)
@@ -1101,8 +1137,7 @@ pub fn accept_invite_with_identity_and_timeout(
         accept_timeout,
     );
     // Stop temporary daemon; callers decide daemon lifecycle.
-    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
-    drop(tmp_daemon);
+    stop_daemon(db, &mut tmp_daemon);
     wait_for_daemon_stopped(db, Duration::from_secs(10));
 }
 
@@ -1158,14 +1193,13 @@ pub fn accept_device_link_with_name_and_timeout(
     devicename: &str,
     accept_timeout: Duration,
 ) {
-    let tmp_daemon = if invite_has_empty_bootstrap_addrs(invite_link) {
+    let mut tmp_daemon = if invite_has_empty_bootstrap_addrs(invite_link) {
         start_discovery_daemon(db)
     } else {
         start_daemon(db)
     };
     accept_device_link_with_name_on_running_daemon(db, invite_link, devicename, accept_timeout);
-    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
-    drop(tmp_daemon);
+    stop_daemon(db, &mut tmp_daemon);
     wait_for_daemon_stopped(db, Duration::from_secs(10));
 }
 
@@ -1367,12 +1401,85 @@ fn assert_eventually_debug_context(db: &str) -> String {
                 Some(rows.filter_map(Result::ok).collect())
             })
             .unwrap_or_default();
+        let blocked_details: Vec<String> = active_peer_id
+            .as_ref()
+            .and_then(|peer_id| {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT d.event_id, d.blocker_event_id
+                         FROM blocked_event_deps d
+                         WHERE d.peer_id = ?1
+                         ORDER BY d.rowid
+                         LIMIT 8",
+                    )
+                    .ok()?;
+                let rows = stmt
+                    .query_map(rusqlite::params![peer_id], |row| {
+                        let event_id: String = row.get(0)?;
+                        let blocker_id: String = row.get(1)?;
+                        Ok((event_id, blocker_id))
+                    })
+                    .ok()?;
+                Some(
+                    rows.filter_map(Result::ok)
+                        .map(|(event_id, blocker_id)| {
+                            let event_type = conn
+                                .query_row(
+                                    "SELECT event_type FROM events WHERE event_id = ?1",
+                                    rusqlite::params![&event_id],
+                                    |row| row.get::<_, String>(0),
+                                )
+                                .unwrap_or_else(|_| "<missing>".to_string());
+                            let blocker_type = conn
+                                .query_row(
+                                    "SELECT event_type FROM events WHERE event_id = ?1",
+                                    rusqlite::params![&blocker_id],
+                                    |row| row.get::<_, String>(0),
+                                )
+                                .unwrap_or_else(|_| "<missing>".to_string());
+                            let blocker_recorded = conn
+                                .query_row(
+                                    "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+                                    rusqlite::params![peer_id, &blocker_id],
+                                    |row| row.get::<_, bool>(0),
+                                )
+                                .unwrap_or(false);
+                            let blocker_valid = conn
+                                .query_row(
+                                    "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                                    rusqlite::params![peer_id, &blocker_id],
+                                    |row| row.get::<_, bool>(0),
+                                )
+                                .unwrap_or(false);
+                            let blocker_blocked = conn
+                                .query_row(
+                                    "SELECT COUNT(*) > 0 FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2",
+                                    rusqlite::params![peer_id, &blocker_id],
+                                    |row| row.get::<_, bool>(0),
+                                )
+                                .unwrap_or(false);
+                            format!(
+                                "{} ({}) <- {} [type={}, recorded={}, valid={}, blocked={}]",
+                                event_id,
+                                event_type,
+                                blocker_id,
+                                blocker_type,
+                                blocker_recorded,
+                                blocker_valid,
+                                blocker_blocked
+                            )
+                        })
+                        .collect(),
+                )
+            })
+            .unwrap_or_default();
 
         format!(
-            "db=\n  active_peer={}\n  local_transport_creds={}\n  blocked_events={}\n  pending_bootstrap_trust={}\n  bootstrap_context_rows={}\n  endpoint_observations={}\n  latest_endpoints={:?}",
+            "db=\n  active_peer={}\n  local_transport_creds={}\n  blocked_events={}\n  blocked_details={:?}\n  pending_bootstrap_trust={}\n  bootstrap_context_rows={}\n  endpoint_observations={}\n  latest_endpoints={:?}",
             active_peer_id.unwrap_or_else(|| "<none>".to_string()),
             local_transport_creds,
             blocked_events,
+            blocked_details,
             pending_bootstrap_trust,
             bootstrap_context_rows,
             endpoint_observations,
@@ -1817,7 +1924,7 @@ pub fn topo_create_invite_retry(db: &str, bootstrap_addr: &str) -> String {
 /// Realism tests use this when acceptance happens before the long-lived daemon
 /// starts; writability is asserted later through normal runtime behavior.
 pub fn accept_invite_lightweight(db: &str, invite_link: &str) {
-    let tmp_daemon = start_discovery_daemon(db);
+    let mut tmp_daemon = start_discovery_daemon(db);
     accept_invite_with_identity_on_running_daemon(
         db,
         invite_link,
@@ -1825,8 +1932,7 @@ pub fn accept_invite_lightweight(db: &str, invite_link: &str) {
         "device",
         Duration::from_secs(10),
     );
-    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
-    drop(tmp_daemon);
+    stop_daemon(db, &mut tmp_daemon);
     wait_for_daemon_stopped(db, Duration::from_secs(10));
 }
 

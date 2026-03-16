@@ -229,15 +229,14 @@ Policy for future transport work:
 2. build invite/trust-graph realism before adding transport security layers so transport starts from the same authority model used in production,
 3. prefer projected trust-row queries and exact transport fingerprints over ad-hoc in-memory trust state.
 
-### Sync session completion protocol (required)
+### Sync session lifetime
 
-Sync sessions use explicit completion frames and must not rely on stream-close timing:
+Sync keeps one long-lived request/response session per authenticated connection.
 
-1. `Done` (initiator control stream) means initiator is outbound-complete for the round.
-2. `DataDone` (data stream, either direction) means no more data frames from that sender.
-3. `DoneAck` (responder control stream) is sent only after responder drain and both `DataDone` observations.
-
-Initiator completion is `DoneAck`-gated.
+1. discovery remains round-scoped (`NegOpen` / `NegMsg` / `NeedList`),
+2. request credit and `HaveList` requests are connection-scoped,
+3. the data stream carries only requested `Event` blobs,
+4. there is no per-round `Done` / `DataDone` / `DoneAck` completion handshake in live sync.
 
 ## 4.3 Transport regression checklist
 

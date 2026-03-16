@@ -499,10 +499,10 @@ fn test_key_shared_key_wrap() {
     harness.finish();
 }
 
-/// Out-of-order test: KeyShared blocks until the local invite_secret dep exists,
-/// then unblocks via normal cascade once invite_secret is projected.
+/// KeyShared is shared workspace metadata, so observing peers must not block on
+/// recipient-local invite_secret material that only the intended invitee has.
 #[test]
-fn test_key_shared_blocks_until_signer_valid() {
+fn test_key_shared_does_not_block_on_missing_local_invite_secret() {
     use topo::event_modules::{KeySharedEvent, ParsedEvent};
     use topo::projection::create::create_signed_event_staged;
     use topo::projection::encrypted::wrap_key_for_recipient;
@@ -521,8 +521,8 @@ fn test_key_shared_blocks_until_signer_valid() {
         topo::event_modules::key_secret::deterministic_key_secret_created_at_ms(&key_secret_bytes),
     );
 
-    // KeyShared depends on deterministic invite_secret event id.
-    // Do not emit invite_secret yet, so this should block.
+    // The recipient-local invite_secret may be absent for an observing peer.
+    // KeyShared should still validate/project the wrapper row without blocking.
     let invite_secret_eid =
         topo::event_modules::invite_secret::deterministic_invite_secret_event_id(
             &chain.user_invite_eid,
@@ -553,10 +553,9 @@ fn test_key_shared_blocks_until_signer_valid() {
         &ss_event,
         &chain.peer_shared_key,
     )
-    .expect("staged create should succeed even if blocked");
+    .expect("staged create should succeed");
     let ss_b64 = event_id_to_base64(&ss_eid);
 
-    // KeyShared should be blocked: invite_secret dep missing.
     let blocked_count: i64 = alice_db
         .query_row(
             "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1 AND event_id = ?2",
@@ -564,15 +563,11 @@ fn test_key_shared_blocks_until_signer_valid() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(
-        blocked_count >= 1,
-        "KeyShared should block until invite_secret exists"
+    assert_eq!(
+        blocked_count, 0,
+        "KeyShared should not block on recipient-local invite_secret"
     );
 
-    // Emit deterministic invite_secret; normal cascade should unblock key_shared.
-    let _ = alice.create_invite_secret(&chain.user_invite_eid, chain.invite_key.to_bytes());
-
-    // After invite_secret projection + cascade, KeyShared should be valid.
     let ss_valid: bool = alice_db
         .query_row(
             "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
@@ -580,10 +575,7 @@ fn test_key_shared_blocks_until_signer_valid() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(
-        ss_valid,
-        "KeyShared should be valid after invite_secret is projected"
-    );
+    assert!(ss_valid, "KeyShared should still become valid");
 
     let ss_projected: i64 = alice_db
         .query_row(
@@ -594,7 +586,7 @@ fn test_key_shared_blocks_until_signer_valid() {
         .unwrap();
     assert!(
         ss_projected >= 1,
-        "KeyShared should be in projection table after cascade"
+        "KeyShared should still project its wrapper row"
     );
 
     harness.finish();
