@@ -3,41 +3,7 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use blake2::digest::consts::U32;
 use blake2::{Blake2b, Digest};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
-use std::collections::HashSet;
-
 pub type EventId = [u8; 32];
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AllowedPeers {
-    fingerprints: HashSet<[u8; 32]>,
-}
-
-impl AllowedPeers {
-    pub fn from_fingerprints<I>(fingerprints: I) -> Self
-    where
-        I: IntoIterator<Item = [u8; 32]>,
-    {
-        Self {
-            fingerprints: fingerprints.into_iter().collect(),
-        }
-    }
-
-    pub fn contains(&self, fingerprint: &[u8; 32]) -> bool {
-        self.fingerprints.contains(fingerprint)
-    }
-
-    pub fn fingerprints(&self) -> Vec<[u8; 32]> {
-        self.fingerprints.iter().copied().collect()
-    }
-
-    pub fn len(&self) -> usize {
-        self.fingerprints.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.fingerprints.is_empty()
-    }
-}
 
 mod spki;
 

@@ -1,9 +1,8 @@
 use rusqlite::{Connection, OptionalExtension};
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
-use tracing::info;
 
-use crate::crypto::{spki_fingerprint_from_ed25519_pubkey, AllowedPeers};
+use crate::crypto::spki_fingerprint_from_ed25519_pubkey;
 
 /// Pending bootstrap trust from locally-created invites is temporary.
 /// If a peer never joins, this entry should not authorize transport forever.
@@ -12,14 +11,246 @@ pub(crate) const PENDING_INVITE_BOOTSTRAP_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 /// trust converges for that same SPKI.
 pub(crate) const ACCEPTED_INVITE_BOOTSTRAP_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// Workspace sentinel for CLI-pin-imported bootstrap trust rows.
-const CLI_PIN_WORKSPACE: &str = "cli-bootstrap";
+// Canonical tenant-scoped transport authorization over projected trust rows.
+//
+// Authoritative sources:
+// - peers_shared.transport_fingerprint (steady-state)
+// - invite_bootstrap_trust.bootstrap_spki_fingerprint (accepted bootstrap)
+// - pending_invite_bootstrap_trust.expected_bootstrap_spki_fingerprint (pending bootstrap)
+//
+// Observation telemetry (peer_transport_bindings) is intentionally excluded.
+const TENANT_AUTHORIZED_FINGERPRINTS_SQL: &str = "
+    WITH authorized_transport_rows AS (
+        SELECT
+            p.transport_fingerprint AS spki_fingerprint,
+            NULL AS expires_at
+        FROM peers_shared p
+        WHERE p.recorded_by = ?1
+          AND length(p.transport_fingerprint) = 32
+          AND NOT EXISTS (
+              SELECT 1 FROM removed_entities r
+              WHERE r.recorded_by = p.recorded_by
+                AND r.target_event_id = p.event_id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM removed_entities r
+              WHERE r.recorded_by = p.recorded_by
+                AND p.user_event_id IS NOT NULL
+                AND r.target_event_id = p.user_event_id
+                AND r.removal_type = 'user'
+          )
 
-/// Build the deterministic `invite_event_id` for a CLI-pin import.
-/// Uses the full 32-byte hex fingerprint so distinct pins never collide.
-fn cli_pin_invite_event_id(spki_fingerprint: &[u8; 32]) -> String {
-    format!("cli-pin-{}", hex::encode(spki_fingerprint))
-}
+        UNION
+
+        SELECT
+            t.bootstrap_spki_fingerprint AS spki_fingerprint,
+            t.expires_at AS expires_at
+        FROM invite_bootstrap_trust t
+        WHERE t.recorded_by = ?1
+          AND length(t.bootstrap_spki_fingerprint) = 32
+
+        UNION
+
+        SELECT
+            t.expected_bootstrap_spki_fingerprint AS spki_fingerprint,
+            t.expires_at AS expires_at
+        FROM pending_invite_bootstrap_trust t
+        WHERE t.recorded_by = ?1
+          AND length(t.expected_bootstrap_spki_fingerprint) = 32
+    )
+    SELECT DISTINCT spki_fingerprint
+    FROM authorized_transport_rows
+    WHERE expires_at IS NULL OR expires_at > ?2
+";
+
+const TENANT_AUTHORIZATION_EXISTS_SQL: &str = "
+    WITH authorized_transport_rows AS (
+        SELECT
+            p.transport_fingerprint AS spki_fingerprint,
+            NULL AS expires_at
+        FROM peers_shared p
+        WHERE p.recorded_by = ?1
+          AND length(p.transport_fingerprint) = 32
+          AND p.transport_fingerprint = ?2
+          AND NOT EXISTS (
+              SELECT 1 FROM removed_entities r
+              WHERE r.recorded_by = p.recorded_by
+                AND r.target_event_id = p.event_id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM removed_entities r
+              WHERE r.recorded_by = p.recorded_by
+                AND p.user_event_id IS NOT NULL
+                AND r.target_event_id = p.user_event_id
+                AND r.removal_type = 'user'
+          )
+
+        UNION
+
+        SELECT
+            t.bootstrap_spki_fingerprint AS spki_fingerprint,
+            t.expires_at AS expires_at
+        FROM invite_bootstrap_trust t
+        WHERE t.recorded_by = ?1
+          AND length(t.bootstrap_spki_fingerprint) = 32
+          AND t.bootstrap_spki_fingerprint = ?2
+
+        UNION
+
+        SELECT
+            t.expected_bootstrap_spki_fingerprint AS spki_fingerprint,
+            t.expires_at AS expires_at
+        FROM pending_invite_bootstrap_trust t
+        WHERE t.recorded_by = ?1
+          AND length(t.expected_bootstrap_spki_fingerprint) = 32
+          AND t.expected_bootstrap_spki_fingerprint = ?2
+    )
+    SELECT EXISTS(
+        SELECT 1
+        FROM authorized_transport_rows
+        WHERE expires_at IS NULL OR expires_at > ?3
+    )
+";
+
+const TENANT_HAS_ANY_AUTHORIZED_FINGERPRINT_SQL: &str = "
+    WITH authorized_transport_rows AS (
+        SELECT
+            p.transport_fingerprint AS spki_fingerprint,
+            NULL AS expires_at
+        FROM peers_shared p
+        WHERE p.recorded_by = ?1
+          AND length(p.transport_fingerprint) = 32
+          AND NOT EXISTS (
+              SELECT 1 FROM removed_entities r
+              WHERE r.recorded_by = p.recorded_by
+                AND r.target_event_id = p.event_id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM removed_entities r
+              WHERE r.recorded_by = p.recorded_by
+                AND p.user_event_id IS NOT NULL
+                AND r.target_event_id = p.user_event_id
+                AND r.removal_type = 'user'
+          )
+
+        UNION
+
+        SELECT
+            t.bootstrap_spki_fingerprint AS spki_fingerprint,
+            t.expires_at AS expires_at
+        FROM invite_bootstrap_trust t
+        WHERE t.recorded_by = ?1
+          AND length(t.bootstrap_spki_fingerprint) = 32
+
+        UNION
+
+        SELECT
+            t.expected_bootstrap_spki_fingerprint AS spki_fingerprint,
+            t.expires_at AS expires_at
+        FROM pending_invite_bootstrap_trust t
+        WHERE t.recorded_by = ?1
+          AND length(t.expected_bootstrap_spki_fingerprint) = 32
+    )
+    SELECT EXISTS(
+        SELECT 1
+        FROM authorized_transport_rows
+        WHERE expires_at IS NULL OR expires_at > ?2
+    )
+";
+
+const NODE_AUTHORIZATION_EXISTS_SQL: &str = "
+    WITH authorized_transport_rows AS (
+        SELECT
+            p.recorded_by AS tenant_id,
+            p.transport_fingerprint AS spki_fingerprint,
+            NULL AS expires_at
+        FROM peers_shared p
+        WHERE length(p.transport_fingerprint) = 32
+          AND NOT EXISTS (
+              SELECT 1 FROM removed_entities r
+              WHERE r.recorded_by = p.recorded_by
+                AND r.target_event_id = p.event_id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM removed_entities r
+              WHERE r.recorded_by = p.recorded_by
+                AND p.user_event_id IS NOT NULL
+                AND r.target_event_id = p.user_event_id
+                AND r.removal_type = 'user'
+          )
+
+        UNION
+
+        SELECT
+            t.recorded_by AS tenant_id,
+            t.bootstrap_spki_fingerprint AS spki_fingerprint,
+            t.expires_at AS expires_at
+        FROM invite_bootstrap_trust t
+        WHERE length(t.bootstrap_spki_fingerprint) = 32
+
+        UNION
+
+        SELECT
+            t.recorded_by AS tenant_id,
+            t.expected_bootstrap_spki_fingerprint AS spki_fingerprint,
+            t.expires_at AS expires_at
+        FROM pending_invite_bootstrap_trust t
+        WHERE length(t.expected_bootstrap_spki_fingerprint) = 32
+    )
+    SELECT EXISTS(
+        SELECT 1
+        FROM authorized_transport_rows
+        WHERE spki_fingerprint = ?1
+          AND (expires_at IS NULL OR expires_at > ?2)
+    )
+";
+
+const NODE_AUTHORIZING_TENANT_SQL: &str = "
+    WITH authorized_transport_rows AS (
+        SELECT
+            p.recorded_by AS tenant_id,
+            p.transport_fingerprint AS spki_fingerprint,
+            NULL AS expires_at
+        FROM peers_shared p
+        WHERE length(p.transport_fingerprint) = 32
+          AND NOT EXISTS (
+              SELECT 1 FROM removed_entities r
+              WHERE r.recorded_by = p.recorded_by
+                AND r.target_event_id = p.event_id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM removed_entities r
+              WHERE r.recorded_by = p.recorded_by
+                AND p.user_event_id IS NOT NULL
+                AND r.target_event_id = p.user_event_id
+                AND r.removal_type = 'user'
+          )
+
+        UNION
+
+        SELECT
+            t.recorded_by AS tenant_id,
+            t.bootstrap_spki_fingerprint AS spki_fingerprint,
+            t.expires_at AS expires_at
+        FROM invite_bootstrap_trust t
+        WHERE length(t.bootstrap_spki_fingerprint) = 32
+
+        UNION
+
+        SELECT
+            t.recorded_by AS tenant_id,
+            t.expected_bootstrap_spki_fingerprint AS spki_fingerprint,
+            t.expires_at AS expires_at
+        FROM pending_invite_bootstrap_trust t
+        WHERE length(t.expected_bootstrap_spki_fingerprint) = 32
+    )
+    SELECT tenant_id
+    FROM authorized_transport_rows
+    WHERE spki_fingerprint = ?1
+      AND (expires_at IS NULL OR expires_at > ?2)
+    ORDER BY tenant_id ASC
+    LIMIT 1
+";
 
 fn now_ms_i64() -> i64 {
     SystemTime::now()
@@ -231,7 +462,7 @@ pub fn consume_bootstrap_for_transport_fingerprint(
 /// Record an observed transport binding (observation telemetry only).
 /// peer_id (hex SPKI fingerprint) was seen on a TLS connection with this SPKI
 /// fingerprint. Idempotent (INSERT OR IGNORE). NOT used for trust decisions —
-/// allowed_peers_from_db queries PeerShared-derived SPKIs and bootstrap trust only.
+/// authorization queries use projected trust rows only.
 pub fn record_transport_binding(
     conn: &Connection,
     recorded_by: &str,
@@ -288,7 +519,7 @@ pub fn record_invite_bootstrap_trust(
 
 /// Record inviter-side pending bootstrap trust for an invite before the invitee
 /// has connected. This lets incoming invitee TLS certs pass strict mTLS checks
-/// without CLI pin flags.
+/// before steady-state PeerShared trust appears.
 ///
 /// Uses INSERT OR IGNORE so replays do not refresh TTL.
 pub fn record_pending_invite_bootstrap_trust(
@@ -318,74 +549,6 @@ pub fn record_pending_invite_bootstrap_trust(
         ],
     )?;
     Ok(())
-}
-
-/// Import CLI pin hex strings as `pending_invite_bootstrap_trust` rows.
-///
-/// Each pin is stored with a deterministic `invite_event_id` (via
-/// `cli_pin_invite_event_id`) and `workspace_id = CLI_PIN_WORKSPACE`.
-/// Reuses the existing table and 24h TTL.
-/// Existing consume logic auto-removes these stale rows when PeerShared-derived trust appears.
-///
-/// This is idempotent: re-importing existing pins is a no-op (INSERT OR IGNORE).
-pub fn import_cli_pins_to_sql(
-    conn: &Connection,
-    recorded_by: &str,
-    cli_pins: &AllowedPeers,
-) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
-    let fps = cli_pins.fingerprints();
-    let mut imported = 0;
-    for fp in &fps {
-        let invite_event_id = cli_pin_invite_event_id(fp);
-        record_pending_invite_bootstrap_trust(
-            conn,
-            recorded_by,
-            &invite_event_id,
-            CLI_PIN_WORKSPACE,
-            fp,
-        )?;
-        imported += 1;
-    }
-    if imported > 0 {
-        info!("Imported {} CLI pin(s) to SQL trust rows", imported);
-    }
-    Ok(imported)
-}
-
-/// Compute SPKI fingerprints for all non-removed PeerShared public keys belonging to a peer.
-fn peer_shared_spki_fingerprints(
-    conn: &Connection,
-    recorded_by: &str,
-) -> Result<Vec<[u8; 32]>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut out = HashSet::new();
-
-    // Transport trust resolution is projection-backed only.
-    let mut stmt = conn.prepare(
-        "SELECT p.transport_fingerprint FROM peers_shared p
-         WHERE p.recorded_by = ?1
-           AND length(p.transport_fingerprint) = 32
-           AND NOT EXISTS (
-             SELECT 1 FROM removed_entities r
-             WHERE r.recorded_by = p.recorded_by
-               AND r.target_event_id = p.event_id
-           )
-           AND NOT EXISTS (
-             SELECT 1 FROM removed_entities r
-             WHERE r.recorded_by = p.recorded_by
-               AND p.user_event_id IS NOT NULL
-               AND r.target_event_id = p.user_event_id
-               AND r.removal_type = 'user'
-           )",
-    )?;
-    let direct_fps: Vec<[u8; 32]> = stmt
-        .query_map(rusqlite::params![recorded_by], |row| {
-            Ok(row.get::<_, Vec<u8>>(0)?)
-        })?
-        .filter_map(|r| r.ok().and_then(decode_32_byte_blob))
-        .collect();
-    out.extend(direct_fps);
-
-    Ok(out.into_iter().collect())
 }
 
 /// Check whether a given SPKI fingerprint matches any PeerShared-derived identity.
@@ -428,29 +591,15 @@ pub fn is_peer_shared_transport_fingerprint(
     is_peer_shared_spki(conn, recorded_by, spki_fingerprint)
 }
 
-/// Build AllowedPeers from SQL trust sources only.
-/// Trust sources: PeerShared-derived SPKIs (steady-state) ∪ accepted invite
-/// bootstrap trust ∪ pending invite bootstrap trust.
-/// Observation telemetry (peer_transport_bindings) is NOT consulted for trust.
-pub fn allowed_peers_from_db(
+/// Return the tenant's currently authorized remote transport fingerprints.
+/// Observation telemetry (peer_transport_bindings) is NOT consulted.
+pub fn authorized_fingerprints_from_db(
     conn: &Connection,
     recorded_by: &str,
-) -> Result<AllowedPeers, Box<dyn std::error::Error + Send + Sync>> {
-    // Supersession is handled at projection time via PeerShared writes.
-    // Trust check reads are pure.
+) -> Result<HashSet<[u8; 32]>, Box<dyn std::error::Error + Send + Sync>> {
     let now = now_ms_i64();
-    let mut stmt = conn.prepare(
-        "SELECT DISTINCT bootstrap_spki_fingerprint AS spki_fingerprint
-          FROM invite_bootstrap_trust
-          WHERE recorded_by = ?1
-            AND expires_at > ?2
-         UNION
-         SELECT DISTINCT expected_bootstrap_spki_fingerprint AS spki_fingerprint
-          FROM pending_invite_bootstrap_trust
-          WHERE recorded_by = ?1
-            AND expires_at > ?2",
-    )?;
-    let mut fps: Vec<[u8; 32]> = stmt
+    let mut stmt = conn.prepare(TENANT_AUTHORIZED_FINGERPRINTS_SQL)?;
+    let fps: HashSet<[u8; 32]> = stmt
         .query_map(rusqlite::params![recorded_by, now], |row| {
             let blob: Vec<u8> = row.get(0)?;
             Ok(decode_32_byte_blob(blob))
@@ -459,32 +608,25 @@ pub fn allowed_peers_from_db(
         .into_iter()
         .flatten()
         .collect();
-
-    // Add PeerShared-derived SPKIs (primary steady-state trust source)
-    fps.extend(peer_shared_spki_fingerprints(conn, recorded_by)?);
-
-    Ok(AllowedPeers::from_fingerprints(fps))
-}
-
-/// Return the tenant's currently authorized remote transport fingerprints.
-/// Observation telemetry (peer_transport_bindings) is not consulted.
-pub fn authorized_fingerprints_from_db(
-    conn: &Connection,
-    recorded_by: &str,
-) -> Result<HashSet<[u8; 32]>, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(allowed_peers_from_db(conn, recorded_by)?
-        .fingerprints()
-        .into_iter()
-        .collect())
+    Ok(fps)
 }
 
 /// Canonical tenant-scoped transport authorization over projected trust rows.
+///
+/// Returns true iff `spki_fingerprint` is currently authorized for `tenant_id`
+/// by any authoritative projected trust source.
 pub fn is_authorized_for_tenant(
     conn: &Connection,
     tenant_id: &str,
     spki_fingerprint: &[u8; 32],
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    is_peer_allowed(conn, tenant_id, spki_fingerprint)
+    let now = now_ms_i64();
+    let allowed: i64 = conn.query_row(
+        TENANT_AUTHORIZATION_EXISTS_SQL,
+        rusqlite::params![tenant_id, spki_fingerprint.as_slice(), now],
+        |row| row.get(0),
+    )?;
+    Ok(allowed != 0)
 }
 
 /// Resolve one tenant that currently authorizes `spki_fingerprint`.
@@ -495,42 +637,7 @@ pub fn resolve_authorizing_tenant(
     let now = now_ms_i64();
     let tenant_id = conn
         .query_row(
-            "SELECT recorded_by
-               FROM (
-                     SELECT p.recorded_by AS recorded_by,
-                            p.transport_fingerprint AS spki_fingerprint,
-                            NULL AS expires_at
-                       FROM peers_shared p
-                      WHERE length(p.transport_fingerprint) = 32
-                        AND NOT EXISTS (
-                            SELECT 1 FROM removed_entities r
-                             WHERE r.recorded_by = p.recorded_by
-                               AND r.target_event_id = p.event_id
-                        )
-                        AND NOT EXISTS (
-                            SELECT 1 FROM removed_entities r
-                             WHERE r.recorded_by = p.recorded_by
-                               AND p.user_event_id IS NOT NULL
-                               AND r.target_event_id = p.user_event_id
-                               AND r.removal_type = 'user'
-                        )
-                     UNION
-                     SELECT t.recorded_by,
-                            t.bootstrap_spki_fingerprint,
-                            t.expires_at
-                       FROM invite_bootstrap_trust t
-                      WHERE length(t.bootstrap_spki_fingerprint) = 32
-                     UNION
-                     SELECT t.recorded_by,
-                            t.expected_bootstrap_spki_fingerprint,
-                            t.expires_at
-                       FROM pending_invite_bootstrap_trust t
-                      WHERE length(t.expected_bootstrap_spki_fingerprint) = 32
-               )
-              WHERE spki_fingerprint = ?1
-                AND (expires_at IS NULL OR expires_at > ?2)
-              ORDER BY recorded_by ASC
-              LIMIT 1",
+            NODE_AUTHORIZING_TENANT_SQL,
             rusqlite::params![spki_fingerprint.as_slice(), now],
             |row| row.get(0),
         )
@@ -543,40 +650,10 @@ pub fn is_authorized_for_node(
     conn: &Connection,
     spki_fingerprint: &[u8; 32],
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(resolve_authorizing_tenant(conn, spki_fingerprint)?.is_some())
-}
-
-/// Check a single peer fingerprint against SQL trust sources.
-/// Trust sources: PeerShared-derived SPKIs ∪ accepted bootstrap ∪ pending bootstrap.
-pub fn is_peer_allowed(
-    conn: &Connection,
-    recorded_by: &str,
-    spki_fingerprint: &[u8; 32],
-) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    // Supersession is handled at projection time via PeerShared writes.
-    // Trust check reads are pure.
-    // Check PeerShared-derived SPKIs first (primary steady-state trust source)
-    if is_peer_shared_spki(conn, recorded_by, spki_fingerprint)? {
-        return Ok(true);
-    }
     let now = now_ms_i64();
     let allowed: i64 = conn.query_row(
-        "SELECT
-            EXISTS(
-                SELECT 1
-                  FROM invite_bootstrap_trust
-                 WHERE recorded_by = ?1
-                   AND bootstrap_spki_fingerprint = ?2
-                   AND expires_at > ?3
-            )
-            OR EXISTS(
-                SELECT 1
-                  FROM pending_invite_bootstrap_trust
-                 WHERE recorded_by = ?1
-                   AND expected_bootstrap_spki_fingerprint = ?2
-                   AND expires_at > ?3
-            )",
-        rusqlite::params![recorded_by, spki_fingerprint.as_slice(), now],
+        NODE_AUTHORIZATION_EXISTS_SQL,
+        rusqlite::params![spki_fingerprint.as_slice(), now],
         |row| row.get(0),
     )?;
     Ok(allowed != 0)
@@ -588,40 +665,9 @@ pub fn has_any_trusted_peer(
     conn: &Connection,
     recorded_by: &str,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    // Supersession is handled at projection time via PeerShared writes.
-    // Trust check reads are pure.
     let now = now_ms_i64();
     let has_any: i64 = conn.query_row(
-        "SELECT
-            EXISTS(
-                SELECT 1 FROM invite_bootstrap_trust
-                WHERE recorded_by = ?1
-                  AND length(bootstrap_spki_fingerprint) = 32
-                  AND expires_at > ?2
-            )
-            OR EXISTS(
-                SELECT 1 FROM pending_invite_bootstrap_trust
-                WHERE recorded_by = ?1
-                  AND length(expected_bootstrap_spki_fingerprint) = 32
-                  AND expires_at > ?2
-            )
-            OR EXISTS(
-                SELECT 1 FROM peers_shared
-                WHERE recorded_by = ?1
-                  AND length(transport_fingerprint) = 32
-                  AND NOT EXISTS (
-                    SELECT 1 FROM removed_entities r
-                    WHERE r.recorded_by = peers_shared.recorded_by
-                      AND r.target_event_id = peers_shared.event_id
-                  )
-                  AND NOT EXISTS (
-                    SELECT 1 FROM removed_entities r
-                    WHERE r.recorded_by = peers_shared.recorded_by
-                      AND peers_shared.user_event_id IS NOT NULL
-                      AND r.target_event_id = peers_shared.user_event_id
-                      AND r.removal_type = 'user'
-                  )
-            )",
+        TENANT_HAS_ANY_AUTHORIZED_FINGERPRINT_SQL,
         rusqlite::params![recorded_by, now],
         |row| row.get(0),
     )?;

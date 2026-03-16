@@ -74,9 +74,12 @@ pub async fn bootstrap_sync_from_invite(
 
     let (_peer_id, cert, key) = load_transport_cert_required_from_db(db_path)?;
 
-    let bootstrap_fp = *bootstrap_spki;
-    let allowed: Arc<crate::transport::DynamicAllowFn> =
-        Arc::new(move |candidate| Ok(candidate == &bootstrap_fp));
+    let db_path_owned = db_path.to_string();
+    let recorded_by_owned = recorded_by.to_string();
+    let allowed: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |candidate| {
+        let db = open_connection(&db_path_owned)?;
+        crate::db::transport_trust::is_authorized_for_tenant(&db, &recorded_by_owned, candidate)
+    });
     let endpoint = create_dual_endpoint("0.0.0.0:0".parse().unwrap(), cert, key, allowed)?;
 
     info!(
@@ -227,9 +230,13 @@ pub fn start_bootstrap_responder(
     let db = open_connection(inviter_db_path)?;
     let (cert, key) = load_transport_cert(&db, inviter_identity)?;
 
-    let joiner_spki = expected_invite_bootstrap_spki_from_invite_key(invite_key)?;
-    let allowed: Arc<crate::transport::DynamicAllowFn> =
-        Arc::new(move |candidate| Ok(candidate == &joiner_spki));
+    let _joiner_spki = expected_invite_bootstrap_spki_from_invite_key(invite_key)?;
+    let db_path_owned = inviter_db_path.to_string();
+    let recorded_by_owned = inviter_identity.to_string();
+    let allowed: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |candidate| {
+        let db = open_connection(&db_path_owned)?;
+        crate::db::transport_trust::is_authorized_for_tenant(&db, &recorded_by_owned, candidate)
+    });
 
     let endpoint = create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert, key, allowed)?;
     let local_addr = endpoint.local_addr()?;

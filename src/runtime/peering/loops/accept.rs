@@ -10,7 +10,7 @@ use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
-use crate::db::transport_creds::resolve_local_transport_targets;
+use crate::db::transport_creds::resolve_local_transport_target;
 use crate::db::transport_trust::{is_authorized_for_tenant, record_transport_binding};
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::{CoordinationManager, SyncSessionHandler};
@@ -54,12 +54,10 @@ pub async fn accept_loop(
         &tenant_ids,
         endpoint,
         CancellationToken::new(),
-        None,
         shared_ingest_tx,
         std::collections::HashMap::new(),
         intro_spawner,
         ingest,
-        Some(recorded_by.to_string()),
     )
     .await
 }
@@ -70,14 +68,14 @@ pub async fn accept_loop(
 /// of spawning its own batch_writer. Used by the multi-tenant node daemon so
 /// all tenants share a single writer thread.
 ///
-/// `tenant_peer_ids` lists local tenants. After TLS handshake, the remote
-/// peer's SPKI fingerprint is checked against each tenant's trust set to
-/// determine the `recorded_by` for that connection.
+/// `tenant_peer_ids` lists local tenants for startup preflight. After TLS
+/// handshake, the requested local transport fingerprint from SNI is resolved
+/// to exactly one tenant from projected local SQL state, and only that tenant
+/// authorizes the authenticated remote fingerprint.
 pub async fn accept_loop_with_ingest(
     db_path: &str,
     tenant_peer_ids: &[String],
     endpoint: TransportEndpoint,
-    allowed_peers: Option<crate::transport::AllowedPeers>,
     shared_ingest_tx: tokio::sync::mpsc::Sender<
         crate::contracts::event_pipeline_contract::IngestItem,
     >,
@@ -90,12 +88,10 @@ pub async fn accept_loop_with_ingest(
         tenant_peer_ids,
         endpoint,
         CancellationToken::new(),
-        allowed_peers,
         shared_ingest_tx,
         tenant_client_configs,
         intro_spawner,
         ingest,
-        None,
     )
     .await
 }
@@ -107,7 +103,6 @@ pub async fn accept_loop_with_ingest_until_cancel(
     tenant_peer_ids: &[String],
     endpoint: TransportEndpoint,
     shutdown: CancellationToken,
-    _allowed_peers: Option<crate::transport::AllowedPeers>,
     shared_ingest_tx: tokio::sync::mpsc::Sender<
         crate::contracts::event_pipeline_contract::IngestItem,
     >,
@@ -120,12 +115,10 @@ pub async fn accept_loop_with_ingest_until_cancel(
         tenant_peer_ids,
         endpoint,
         shutdown,
-        _allowed_peers,
         shared_ingest_tx,
         tenant_client_configs,
         intro_spawner,
         ingest,
-        None,
     )
     .await
 }
@@ -135,14 +128,12 @@ async fn accept_loop_with_ingest_until_cancel_inner(
     tenant_peer_ids: &[String],
     endpoint: TransportEndpoint,
     shutdown: CancellationToken,
-    _allowed_peers: Option<crate::transport::AllowedPeers>,
     shared_ingest_tx: tokio::sync::mpsc::Sender<
         crate::contracts::event_pipeline_contract::IngestItem,
     >,
     tenant_client_configs: std::collections::HashMap<String, TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
-    fixed_recorded_by: Option<String>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     struct ConnectionWorker {
         cancel: CancellationToken,
@@ -194,26 +185,19 @@ async fn accept_loop_with_ingest_until_cancel_inner(
         // Resolve which local tenant owns this connection.
         // Always resolve via trust tables — new tenants may have been
         // registered on the live endpoint since the accept loop started.
-        let recorded_by = if let Some(recorded_by) = fixed_recorded_by.as_ref() {
-            // Single-tenant callers already selected the local tenant up front.
-            // Transport admission may come from static pinning rather than DB
-            // trust rows, so re-resolving here would incorrectly drop the
-            // connection before intro handling can record it.
-            recorded_by.clone()
-        } else {
-            match resolve_inbound_auth_context(db_path, &connection, &peer_id) {
-                Ok(context) => context.tenant_id,
-                Err(message) => {
-                    if warning_gate.should_emit(message.clone())
-                        && should_emit_globally(format!("accept:{message}"))
-                    {
-                        warn!("{}", message);
-                    }
-                    connection.close(1u32.into(), b"tenant-scoped auth failed");
-                    continue;
+        let auth_context = match resolve_inbound_auth_context(db_path, &connection, &peer_id) {
+            Ok(context) => context,
+            Err(message) => {
+                if warning_gate.should_emit(message.clone())
+                    && should_emit_globally(format!("accept:{message}"))
+                {
+                    warn!("{}", message);
                 }
+                connection.close(1u32.into(), b"tenant-scoped auth failed");
+                continue;
             }
         };
+        let recorded_by = auth_context.tenant_id.clone();
         let connection_lease = match claim_live_connection_slot(
             db_path,
             &recorded_by,
@@ -433,41 +417,24 @@ fn resolve_requested_tenant_for_peer(
             e
         )
     })?;
-    let targets = resolve_local_transport_targets(&db, &requested.transport_peer_id)
-        .map_err(|e| format!("Failed to resolve requested local transport target: {}", e))?;
-    if targets.is_empty() {
-        return Err(format!(
-            "Rejected peer {}: requested local transport fingerprint {} is not present on this node",
-            short_peer_id(remote_peer_id),
-            short_peer_id(&requested.transport_peer_id)
-        ));
-    }
-    let mut authorized_targets = Vec::new();
-    for tenant in targets {
-        let authorized = is_authorized_for_tenant(&db, &tenant.tenant_id, &remote_fp)
-            .map_err(|e| format!("Inbound tenant-scoped auth query failed: {}", e))?;
-        if authorized {
-            authorized_targets.push(tenant);
-        }
-    }
-    let tenant = match authorized_targets.len() {
-        0 => {
-            return Err(format!(
-                "Rejected peer {}: no local tenant for requested transport fingerprint {} authorizes this fingerprint",
+    let tenant = resolve_local_transport_target(&db, &requested.transport_peer_id)
+        .map_err(|e| format!("Failed to resolve requested local transport target: {}", e))?
+        .ok_or_else(|| {
+            format!(
+                "Rejected peer {}: requested local transport fingerprint {} is not present on this node",
                 short_peer_id(remote_peer_id),
                 short_peer_id(&requested.transport_peer_id)
-            ))
-        }
-        1 => authorized_targets.remove(0),
-        _ => {
-            return Err(format!(
-                "Rejected peer {}: requested local transport fingerprint {} is ambiguous across {} authorized tenants",
-                short_peer_id(remote_peer_id),
-                short_peer_id(&requested.transport_peer_id),
-                authorized_targets.len()
-            ))
-        }
-    };
+            )
+        })?;
+    let authorized = is_authorized_for_tenant(&db, &tenant.tenant_id, &remote_fp)
+        .map_err(|e| format!("Inbound tenant-scoped auth query failed: {}", e))?;
+    if !authorized {
+        return Err(format!(
+            "Rejected peer {}: local tenant {} does not authorize this fingerprint",
+            short_peer_id(remote_peer_id),
+            short_peer_id(&tenant.tenant_id)
+        ));
+    }
     Ok(InboundAuthContext {
         requested_local_transport_peer_id: requested.transport_peer_id.clone(),
         authenticated_remote_transport_peer_id: remote_peer_id.to_string(),
@@ -484,9 +451,7 @@ mod tests {
     use super::*;
 
     use crate::db::schema::create_tables;
-    use crate::db::transport_creds::{
-        set_local_transport_target, CRED_SOURCE_BOOTSTRAP, CRED_SOURCE_PEER_SHARED,
-    };
+    use crate::db::transport_creds::{set_local_transport_target, CRED_SOURCE_PEER_SHARED};
     use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
 
     fn setup_db() -> (tempfile::TempDir, String) {
@@ -604,91 +569,8 @@ mod tests {
         let err =
             resolve_requested_tenant_for_peer(&db_path, &requested, &remote_peer_id).unwrap_err();
         assert!(
-            err.contains("authorizes this fingerprint"),
+            err.contains("does not authorize this fingerprint"),
             "unexpected error: {err}"
         );
-    }
-
-    #[test]
-    fn requested_tenant_auth_resolves_unique_authorized_bootstrap_alias() {
-        let (_dir, db_path) = setup_db();
-        let conn = open_connection(&db_path).unwrap();
-        let tenant_a =
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
-        let tenant_b =
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
-        let workspace_id = "ws-bootstrap-alias";
-        let remote_fp = [0x44; 32];
-        let shared_bootstrap =
-            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string();
-
-        insert_tenant(&conn, &tenant_a, workspace_id, 1);
-        insert_tenant(&conn, &tenant_b, workspace_id, 2);
-        set_local_transport_target(&conn, &tenant_a, &shared_bootstrap, CRED_SOURCE_BOOTSTRAP)
-            .unwrap();
-        set_local_transport_target(&conn, &tenant_b, &shared_bootstrap, CRED_SOURCE_BOOTSTRAP)
-            .unwrap();
-        record_pending_invite_bootstrap_trust(
-            &conn,
-            &tenant_b,
-            "invite-b",
-            workspace_id,
-            &remote_fp,
-        )
-        .unwrap();
-
-        let requested = crate::transport::multi_workspace::TransportSniTarget {
-            transport_peer_id: shared_bootstrap.clone(),
-        };
-
-        let resolved =
-            resolve_requested_tenant_for_peer(&db_path, &requested, &hex::encode(remote_fp))
-                .unwrap();
-        assert_eq!(resolved.tenant_id, tenant_b);
-    }
-
-    #[test]
-    fn requested_tenant_auth_rejects_ambiguous_bootstrap_alias() {
-        let (_dir, db_path) = setup_db();
-        let conn = open_connection(&db_path).unwrap();
-        let tenant_a =
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
-        let tenant_b =
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
-        let workspace_id = "ws-bootstrap-ambiguous";
-        let remote_fp = [0x55; 32];
-        let shared_bootstrap =
-            "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd".to_string();
-
-        insert_tenant(&conn, &tenant_a, workspace_id, 1);
-        insert_tenant(&conn, &tenant_b, workspace_id, 2);
-        set_local_transport_target(&conn, &tenant_a, &shared_bootstrap, CRED_SOURCE_BOOTSTRAP)
-            .unwrap();
-        set_local_transport_target(&conn, &tenant_b, &shared_bootstrap, CRED_SOURCE_BOOTSTRAP)
-            .unwrap();
-        record_pending_invite_bootstrap_trust(
-            &conn,
-            &tenant_a,
-            "invite-a",
-            workspace_id,
-            &remote_fp,
-        )
-        .unwrap();
-        record_pending_invite_bootstrap_trust(
-            &conn,
-            &tenant_b,
-            "invite-b",
-            workspace_id,
-            &remote_fp,
-        )
-        .unwrap();
-
-        let requested = crate::transport::multi_workspace::TransportSniTarget {
-            transport_peer_id: shared_bootstrap,
-        };
-
-        let err = resolve_requested_tenant_for_peer(&db_path, &requested, &hex::encode(remote_fp))
-            .unwrap_err();
-        assert!(err.contains("ambiguous"), "unexpected error: {err}");
     }
 }

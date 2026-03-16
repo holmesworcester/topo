@@ -542,7 +542,7 @@ async fn test_stale_intro_rejected() {
 }
 
 /// TRUST BOUNDARY TEST: Untrusted target rejected.
-/// other_peer_id not in allowed set.
+/// other_peer_id not in authorized set.
 #[tokio::test]
 async fn test_untrusted_peer_intro_rejected() {
     let intro = Peer::new_with_identity("untrust_introducer");

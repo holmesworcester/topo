@@ -10,7 +10,6 @@ pub mod peering_boundary;
 pub mod session_factory;
 pub mod transport_session_io;
 
-pub use crate::crypto::AllowedPeers;
 pub use bootstrap_dial_context::{
     derive_bootstrap_dial_context, BootstrapDialContext, BootstrapDialMode,
 };
@@ -68,25 +67,27 @@ fn low_mem_transport_config() -> Option<Arc<TransportConfig>> {
     Some(Arc::new(transport))
 }
 
-/// Verifies peer certificates by checking SPKI fingerprint against an allowed set.
+/// Verifies peer certificates by checking SPKI fingerprints against projected
+/// transport authorization state.
+///
 /// Implements both ServerCertVerifier (client verifies server) and
-/// ClientCertVerifier (server verifies client).
-/// Tracks rejection counts per fingerprint for log suppression.
-pub struct PinnedCertVerifier {
+/// ClientCertVerifier (server verifies client). Tracks rejection counts per
+/// fingerprint for log suppression.
+pub struct TransportAuthVerifier {
     allow_fn: Arc<DynamicAllowFn>,
     crypto_provider: Arc<rustls::crypto::CryptoProvider>,
     rejections: Mutex<HashMap<[u8; 32], u64>>,
 }
 
-impl std::fmt::Debug for PinnedCertVerifier {
+impl std::fmt::Debug for TransportAuthVerifier {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("PinnedCertVerifier")
+        f.debug_struct("TransportAuthVerifier")
             .field("allow_fn", &"DynamicAllowFn")
             .finish()
     }
 }
 
-impl PinnedCertVerifier {
+impl TransportAuthVerifier {
     pub fn new_dynamic(allow_fn: Arc<DynamicAllowFn>) -> Self {
         Self {
             allow_fn,
@@ -138,7 +139,7 @@ impl PinnedCertVerifier {
                 );
             }
             Err(rustls::Error::General(format!(
-                "{}: peer fingerprint {} not in allowed set",
+                "{}: peer fingerprint {} is not authorized",
                 TRUST_REJECTION_MARKER, fp_hex
             )))
         }
@@ -184,7 +185,7 @@ impl PinnedCertVerifier {
     }
 }
 
-impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
+impl rustls::client::danger::ServerCertVerifier for TransportAuthVerifier {
     fn verify_server_cert(
         &self,
         end_entity: &CertificateDer<'_>,
@@ -233,7 +234,7 @@ impl rustls::client::danger::ServerCertVerifier for PinnedCertVerifier {
     }
 }
 
-impl rustls::server::danger::ClientCertVerifier for PinnedCertVerifier {
+impl rustls::server::danger::ClientCertVerifier for TransportAuthVerifier {
     fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
         &[]
     }
@@ -290,7 +291,7 @@ pub fn create_server_endpoint(
     key_der: PrivatePkcs8KeyDer<'static>,
     allow_fn: Arc<DynamicAllowFn>,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
-    let verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn));
+    let verifier = Arc::new(TransportAuthVerifier::new_dynamic(allow_fn));
 
     let server_crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(verifier)
@@ -314,7 +315,7 @@ pub fn create_client_endpoint(
     key_der: PrivatePkcs8KeyDer<'static>,
     allow_fn: Arc<DynamicAllowFn>,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
-    let verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn));
+    let verifier = Arc::new(TransportAuthVerifier::new_dynamic(allow_fn));
 
     let crypto = rustls::ClientConfig::builder()
         .dangerous()
@@ -344,7 +345,7 @@ pub fn create_dual_endpoint(
     allow_fn: Arc<DynamicAllowFn>,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
     // Server-side config (for accepting incoming connections)
-    let server_verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn.clone()));
+    let server_verifier = Arc::new(TransportAuthVerifier::new_dynamic(allow_fn.clone()));
     let server_crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(server_verifier)
         .with_single_cert(vec![cert_der.clone()], key_der.clone_key().into())?;
@@ -356,7 +357,7 @@ pub fn create_dual_endpoint(
     }
 
     // Client-side config (for outbound connections)
-    let client_verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn));
+    let client_verifier = Arc::new(TransportAuthVerifier::new_dynamic(allow_fn));
     let client_crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(client_verifier)
@@ -383,7 +384,7 @@ pub fn create_dual_endpoint_dynamic(
     allow_fn: Arc<DynamicAllowFn>,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
     // Server-side config (for accepting incoming connections)
-    let server_verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn.clone()));
+    let server_verifier = Arc::new(TransportAuthVerifier::new_dynamic(allow_fn.clone()));
     let server_crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(server_verifier)
         .with_single_cert(vec![cert_der.clone()], key_der.clone_key().into())?;
@@ -395,7 +396,7 @@ pub fn create_dual_endpoint_dynamic(
     }
 
     // Client-side config (for outbound connections)
-    let client_verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn));
+    let client_verifier = Arc::new(TransportAuthVerifier::new_dynamic(allow_fn));
     let client_crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(client_verifier)
@@ -452,7 +453,7 @@ pub fn create_single_port_endpoint(
     default_client_key: PrivatePkcs8KeyDer<'static>,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
     // Server config: exact transport-target cert resolver + dynamic trust
-    let server_verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn.clone()));
+    let server_verifier = Arc::new(TransportAuthVerifier::new_dynamic(allow_fn.clone()));
     let server_crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(server_verifier)
         .with_cert_resolver(cert_resolver);
@@ -464,7 +465,7 @@ pub fn create_single_port_endpoint(
     }
 
     // Default client config (for outbound connections that don't use connect_with)
-    let client_verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn));
+    let client_verifier = Arc::new(TransportAuthVerifier::new_dynamic(allow_fn));
     let client_crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(client_verifier)
@@ -490,7 +491,7 @@ pub fn workspace_client_config(
     key_der: PrivatePkcs8KeyDer<'static>,
     allow_fn: Arc<DynamicAllowFn>,
 ) -> Result<ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let verifier = Arc::new(PinnedCertVerifier::new_dynamic(allow_fn));
+    let verifier = Arc::new(TransportAuthVerifier::new_dynamic(allow_fn));
     let crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
@@ -514,7 +515,7 @@ mod tests {
         let (cert, _) = generate_self_signed_cert().unwrap();
         let fp = extract_spki_fingerprint(cert.as_ref()).unwrap();
         let verifier =
-            PinnedCertVerifier::new_dynamic(Arc::new(move |candidate| Ok(candidate == &fp)));
+            TransportAuthVerifier::new_dynamic(Arc::new(move |candidate| Ok(candidate == &fp)));
         assert!(verifier.verified_fingerprint(&cert).is_ok());
     }
 
@@ -524,7 +525,7 @@ mod tests {
         let (other_cert, _) = generate_self_signed_cert().unwrap();
         let fp = extract_spki_fingerprint(other_cert.as_ref()).unwrap();
         let verifier =
-            PinnedCertVerifier::new_dynamic(Arc::new(move |candidate| Ok(candidate == &fp)));
+            TransportAuthVerifier::new_dynamic(Arc::new(move |candidate| Ok(candidate == &fp)));
         assert!(verifier.verified_fingerprint(&cert).is_err());
     }
 
@@ -533,7 +534,7 @@ mod tests {
         let (cert, _) = generate_self_signed_cert().unwrap();
         let fp = extract_spki_fingerprint(cert.as_ref()).unwrap();
         let verifier =
-            PinnedCertVerifier::new_dynamic(Arc::new(move |candidate| Ok(candidate == &fp)));
+            TransportAuthVerifier::new_dynamic(Arc::new(move |candidate| Ok(candidate == &fp)));
         assert!(verifier.verified_fingerprint(&cert).is_ok());
     }
 
@@ -543,7 +544,7 @@ mod tests {
         let fp = extract_spki_fingerprint(cert.as_ref()).unwrap();
         let expected = multi_workspace::transport_sni(&hex::encode(fp));
         let verifier =
-            PinnedCertVerifier::new_dynamic(Arc::new(move |candidate| Ok(candidate == &fp)));
+            TransportAuthVerifier::new_dynamic(Arc::new(move |candidate| Ok(candidate == &fp)));
         let server_name = rustls::pki_types::ServerName::try_from(expected).unwrap();
         assert!(verifier
             .verify_server_cert(

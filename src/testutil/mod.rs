@@ -51,11 +51,9 @@ use crate::projection::create::{
 };
 use crate::state::db::queue::SQLITE_BUSY_RETRY_ATTEMPTS;
 use crate::state::db::queue::SQLITE_BUSY_RETRY_BASE_MS;
-use crate::transport::identity::{
-    ensure_transport_peer_id, load_transport_cert, load_transport_cert_required_from_db,
-};
+use crate::transport::identity::{ensure_transport_peer_id, load_transport_cert};
 use crate::transport::{
-    create_dual_endpoint, create_dual_endpoint_dynamic, extract_spki_fingerprint, AllowedPeers,
+    create_dual_endpoint, create_dual_endpoint_dynamic, extract_spki_fingerprint,
 };
 use ed25519_dalek::SigningKey;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
@@ -449,20 +447,7 @@ impl Peer {
             });
         });
 
-        let (_bootstrap_peer_id, peer_cert, peer_key) =
-            load_transport_cert_required_from_db(&peer.db_path)
-                .expect("failed to load bootstrap transport cert");
-        let peer_allowed: Arc<crate::transport::DynamicAllowFn> = Arc::new({
-            let allowed = AllowedPeers::from_fingerprints(vec![creator_spki]);
-            move |fp: &[u8; 32]| Ok(allowed.contains(fp))
-        });
-        let peer_endpoint = create_dual_endpoint(
-            "127.0.0.1:0".parse().unwrap(),
-            peer_cert,
-            peer_key,
-            peer_allowed,
-        )
-        .expect("failed to create bootstrap connect endpoint");
+        let peer_endpoint = create_dynamic_endpoint_for_peer(&peer);
         let peer_ep = peer_endpoint.clone();
         let peer_db = peer.db_path.clone();
         let peer_id = scoped_peer_id.clone();
@@ -626,20 +611,7 @@ impl Peer {
             });
         });
 
-        let (_bootstrap_peer_id, peer_cert, peer_key) =
-            load_transport_cert_required_from_db(&peer.db_path)
-                .expect("failed to load bootstrap transport cert");
-        let peer_allowed: Arc<crate::transport::DynamicAllowFn> = Arc::new({
-            let allowed = AllowedPeers::from_fingerprints(vec![creator_spki]);
-            move |fp: &[u8; 32]| Ok(allowed.contains(fp))
-        });
-        let peer_endpoint = create_dual_endpoint(
-            "127.0.0.1:0".parse().unwrap(),
-            peer_cert,
-            peer_key,
-            peer_allowed,
-        )
-        .expect("failed to create bootstrap connect endpoint");
+        let peer_endpoint = create_dynamic_endpoint_for_peer(&peer);
         let peer_ep = peer_endpoint.clone();
         let peer_db = peer.db_path.clone();
         let peer_id = scoped_peer_id.clone();
@@ -700,7 +672,13 @@ impl Peer {
     /// Load (or generate) the transport certificate and private key for this peer.
     pub fn cert_and_key(&self) -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>) {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        let (cert, key) = load_transport_cert(&db, &self.identity).expect("failed to load cert");
+        let transport_peer_id =
+            crate::state::db::transport_creds::resolve_tenant_transport_target(&db, &self.identity)
+                .expect("failed to resolve tenant transport target")
+                .map(|target| target.transport_peer_id)
+                .unwrap_or_else(|| self.identity.clone());
+        let (cert, key) =
+            load_transport_cert(&db, &transport_peer_id).expect("failed to load cert");
         (cert, key)
     }
 
@@ -2395,7 +2373,7 @@ pub fn start_peers(
 
 /// Start continuous sync between two peers using dynamic DB trust lookup.
 /// Trust is resolved from SQL at each TLS handshake, matching production
-/// behavior (`is_peer_allowed`). Caller must already have real invite/bootstrap
+/// behavior (`is_authorized_for_tenant`). Caller must already have real invite/bootstrap
 /// trust or steady-state peer trust projected in SQL.
 ///
 /// REALISM HELPER: production-matching dynamic trust. Used in holepunch
@@ -2404,7 +2382,7 @@ pub fn start_peers_dynamic(
     peer_a: &Peer,
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
-    use crate::db::transport_trust::is_peer_allowed;
+    use crate::db::transport_trust::is_authorized_for_tenant;
 
     let (cert_a, key_a) = peer_a.cert_and_key();
     let (cert_b, key_b) = peer_b.cert_and_key();
@@ -2414,7 +2392,7 @@ pub fn start_peers_dynamic(
     let dynamic_allow_a: Arc<crate::transport::DynamicAllowFn> =
         Arc::new(move |peer_fp: &[u8; 32]| {
             let db = open_connection(&a_db_path)?;
-            is_peer_allowed(&db, &a_recorded_by, peer_fp)
+            is_authorized_for_tenant(&db, &a_recorded_by, peer_fp)
         });
 
     let b_db_path = peer_b.db_path.clone();
@@ -2422,7 +2400,7 @@ pub fn start_peers_dynamic(
     let dynamic_allow_b: Arc<crate::transport::DynamicAllowFn> =
         Arc::new(move |peer_fp: &[u8; 32]| {
             let db = open_connection(&b_db_path)?;
-            is_peer_allowed(&db, &b_recorded_by, peer_fp)
+            is_authorized_for_tenant(&db, &b_recorded_by, peer_fp)
         });
 
     let listener_endpoint = create_dual_endpoint_dynamic(
@@ -2509,7 +2487,7 @@ pub fn create_dynamic_endpoint_for_peer_bind(
     peer: &Peer,
     bind_addr: std::net::SocketAddr,
 ) -> quinn::Endpoint {
-    use crate::db::transport_trust::is_peer_allowed;
+    use crate::db::transport_trust::is_authorized_for_tenant;
 
     let (cert, key) = peer.cert_and_key();
     let db_path = peer.db_path.clone();
@@ -2517,7 +2495,7 @@ pub fn create_dynamic_endpoint_for_peer_bind(
     let dynamic_allow: Arc<crate::transport::DynamicAllowFn> =
         Arc::new(move |peer_fp: &[u8; 32]| {
             let db = open_connection(&db_path)?;
-            is_peer_allowed(&db, &recorded_by, peer_fp)
+            is_authorized_for_tenant(&db, &recorded_by, peer_fp)
         });
 
     create_dual_endpoint_dynamic(bind_addr, cert, key, dynamic_allow)
@@ -2587,7 +2565,7 @@ where
 ///
 /// Returns thread handles for all accept and connect loops.
 pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
-    use crate::db::transport_trust::is_peer_allowed;
+    use crate::db::transport_trust::is_authorized_for_tenant;
 
     let n = peers.len();
     assert!(n >= 2, "chain requires at least 2 peers");
@@ -2607,7 +2585,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
         let recorded_by = peers[i].identity.clone();
         let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
             let db = open_connection(&db_path)?;
-            is_peer_allowed(&db, &recorded_by, fp)
+            is_authorized_for_tenant(&db, &recorded_by, fp)
         });
         let endpoint =
             create_dual_endpoint_dynamic("127.0.0.1:0".parse().unwrap(), cert, key, allow_fn)
@@ -2625,7 +2603,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
         let recorded_by = peers[i].identity.clone();
         let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
             let db = open_connection(&db_path)?;
-            is_peer_allowed(&db, &recorded_by, fp)
+            is_authorized_for_tenant(&db, &recorded_by, fp)
         });
         let endpoint =
             create_dual_endpoint_dynamic("0.0.0.0:0".parse().unwrap(), cert, key, allow_fn)
@@ -2987,18 +2965,18 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
 
 /// Start a sink's accept_loop and return the handle and listen address.
 ///
-/// Uses dynamic trust (`is_peer_allowed`) at each TLS handshake.
+/// Uses dynamic trust (`is_authorized_for_tenant`) at each TLS handshake.
 /// The caller must have already established real projected trust for every
 /// inbound peer that will connect to this sink.
 pub fn start_sink_accept(sink: &Peer) -> (std::thread::JoinHandle<()>, SocketAddr) {
-    use crate::db::transport_trust::is_peer_allowed;
+    use crate::db::transport_trust::is_authorized_for_tenant;
 
     let (cert, key) = sink.cert_and_key();
     let sink_db_path = sink.db_path.clone();
     let sink_recorded_by = sink.identity.clone();
     let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
         let db = open_connection(&sink_db_path)?;
-        is_peer_allowed(&db, &sink_recorded_by, fp)
+        is_authorized_for_tenant(&db, &sink_recorded_by, fp)
     });
     let endpoint =
         create_dual_endpoint_dynamic("127.0.0.1:0".parse().unwrap(), cert, key, allow_fn)

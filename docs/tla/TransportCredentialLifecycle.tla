@@ -62,7 +62,7 @@ EventIds == PeerEvents \union {NoneEvent}
 \* ---- Derived operators ----
 
 \* Union of all three trust sources for a peer.
-\* Mirrors allowed_peers_from_db(): PeerShared_SPKIs ∪ bootstrap ∪ pending.
+\* Mirrors authorized_fingerprints_from_db(): PeerShared_SPKIs ∪ bootstrap ∪ pending.
 TrustedSPKIs(p) ==
     peerSharedTrust[p] \union bootstrapTrust[p] \union pendingBootstrapTrust[p]
 
@@ -221,7 +221,7 @@ AddPendingBootstrapTrust(p, s) ==
 
 \* 6. ExpireBootstrapTrust(p, s)
 \*    TTL expiry of accepted bootstrap trust.
-\*    Rust: expires_at > now filter in allowed_peers_from_db().
+\*    Rust: expires_at > now filter in authorized_fingerprints_from_db().
 ExpireBootstrapTrust(p, s) ==
     /\ s \in bootstrapTrust[p]
     /\ bootstrapTrust' = [bootstrapTrust EXCEPT ![p] = @ \ {s}]
@@ -229,7 +229,7 @@ ExpireBootstrapTrust(p, s) ==
 
 \* 7. ExpirePendingBootstrapTrust(p, s)
 \*    TTL expiry of pending bootstrap trust.
-\*    Rust: expires_at > now filter in allowed_peers_from_db().
+\*    Rust: expires_at > now filter in authorized_fingerprints_from_db().
 ExpirePendingBootstrapTrust(p, s) ==
     /\ s \in pendingBootstrapTrust[p]
     /\ pendingBootstrapTrust' = [pendingBootstrapTrust EXCEPT ![p] = @ \ {s}]

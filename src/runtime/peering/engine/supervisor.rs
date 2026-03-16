@@ -206,7 +206,6 @@ impl RuntimeSupervisor {
                         &tenant_ids,
                         endpoint,
                         cancel,
-                        None,
                         shared_ingest,
                         tenant_cfgs,
                         intro_spawner,

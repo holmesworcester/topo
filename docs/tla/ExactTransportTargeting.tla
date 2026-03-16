@@ -6,12 +6,9 @@ EXTENDS FiniteSets, TLC
 \* from; it models how exact local-target routing and exact outbound remote
 \* matching consume a tenant-scoped authorization predicate.
 \*
-\* Rust currently has one bootstrap-specific exception that is intentionally out
-\* of scope here: temporary invite/device-link bootstrap aliases may overlap
-\* across tenants until PeerShared transport identities converge. The runtime
-\* handles that by filtering aliases through tenant-scoped authorization and
-\* rejecting ambiguous matches. This module models the steady-state unique-target
-\* case only.
+\* Rust maps requested local transport fingerprints to exactly one tenant via
+\* replay-derived local transport target state. This module models that strict
+\* unique-target behavior directly.
 \* Rust mapping:
 \*   localTarget[t]        → replay-derived local_transport_targets[t]
 \*   authorized[t]         → is_authorized_for_tenant(t, remote_fp)

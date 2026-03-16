@@ -2,7 +2,7 @@ use super::*;
 use crate::db::{open_in_memory, schema::create_tables};
 
 #[test]
-fn test_binding_alone_not_in_allowlist() {
+fn test_binding_alone_not_in_authorized_fingerprints() {
     let conn = open_in_memory().unwrap();
     create_tables(&conn).unwrap();
 
@@ -13,9 +13,9 @@ fn test_binding_alone_not_in_allowlist() {
     // Record a transport binding (observation telemetry)
     record_transport_binding(&conn, recorded_by, peer_id, &spki).unwrap();
 
-    // Binding alone must NOT appear in allowed peers
-    let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
-    assert!(!allowed.contains(&spki));
+    // Binding telemetry alone must not authorize a fingerprint.
+    let authorized = authorized_fingerprints_from_db(&conn, recorded_by).unwrap();
+    assert!(!authorized.contains(&spki));
 
     // Idempotent insert still works
     record_transport_binding(&conn, recorded_by, peer_id, &spki).unwrap();
@@ -70,7 +70,7 @@ fn insert_peer_shared_with_user(
 }
 
 #[test]
-fn test_peer_shared_derived_in_allowlist() {
+fn test_peer_shared_derived_in_authorized_fingerprints() {
     let conn = open_in_memory().unwrap();
     create_tables(&conn).unwrap();
 
@@ -78,12 +78,12 @@ fn test_peer_shared_derived_in_allowlist() {
     let pubkey: [u8; 32] = [42u8; 32];
     let spki = insert_peer_shared(&conn, recorded_by, "ps1", &pubkey);
 
-    let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
-    assert!(allowed.contains(&spki));
+    let authorized = authorized_fingerprints_from_db(&conn, recorded_by).unwrap();
+    assert!(authorized.contains(&spki));
 }
 
 #[test]
-fn test_invite_bootstrap_trust_in_allowlist() {
+fn test_invite_bootstrap_trust_in_authorized_fingerprints() {
     let conn = open_in_memory().unwrap();
     create_tables(&conn).unwrap();
 
@@ -100,8 +100,8 @@ fn test_invite_bootstrap_trust_in_allowlist() {
     )
     .unwrap();
 
-    let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
-    assert!(allowed.contains(&spki));
+    let authorized = authorized_fingerprints_from_db(&conn, recorded_by).unwrap();
+    assert!(authorized.contains(&spki));
 }
 
 #[test]
@@ -129,8 +129,8 @@ fn test_invite_bootstrap_superseded_when_peer_shared_exists() {
     // Supersession now happens at projection time, not on read
     consume_bootstrap_for_peer_shared(&conn, recorded_by, &pubkey).unwrap();
 
-    let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
-    assert!(allowed.contains(&spki));
+    let authorized = authorized_fingerprints_from_db(&conn, recorded_by).unwrap();
+    assert!(authorized.contains(&spki));
 
     let remaining_rows: i64 = conn
         .query_row(
@@ -144,7 +144,7 @@ fn test_invite_bootstrap_superseded_when_peer_shared_exists() {
 }
 
 #[test]
-fn test_expired_invite_bootstrap_not_in_allowlist() {
+fn test_expired_invite_bootstrap_not_in_authorized_fingerprints() {
     let conn = open_in_memory().unwrap();
     create_tables(&conn).unwrap();
 
@@ -168,12 +168,12 @@ fn test_expired_invite_bootstrap_not_in_allowlist() {
         )
         .unwrap();
 
-    let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
-    assert!(!allowed.contains(&spki));
+    let authorized = authorized_fingerprints_from_db(&conn, recorded_by).unwrap();
+    assert!(!authorized.contains(&spki));
 }
 
 #[test]
-fn test_pending_invite_bootstrap_trust_in_allowlist() {
+fn test_pending_invite_bootstrap_trust_in_authorized_fingerprints() {
     let conn = open_in_memory().unwrap();
     create_tables(&conn).unwrap();
 
@@ -184,8 +184,8 @@ fn test_pending_invite_bootstrap_trust_in_allowlist() {
     record_pending_invite_bootstrap_trust(&conn, recorded_by, invite_eid, workspace_id, &spki)
         .unwrap();
 
-    let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
-    assert!(allowed.contains(&spki));
+    let authorized = authorized_fingerprints_from_db(&conn, recorded_by).unwrap();
+    assert!(authorized.contains(&spki));
 }
 
 #[test]
@@ -205,8 +205,8 @@ fn test_pending_invite_bootstrap_superseded_when_peer_shared_exists() {
     // Supersession now happens at projection time, not on read
     consume_bootstrap_for_peer_shared(&conn, recorded_by, &pubkey).unwrap();
 
-    let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
-    assert!(allowed.contains(&spki));
+    let authorized = authorized_fingerprints_from_db(&conn, recorded_by).unwrap();
+    assert!(authorized.contains(&spki));
 
     let remaining_rows: i64 = conn
         .query_row(
@@ -220,7 +220,7 @@ fn test_pending_invite_bootstrap_superseded_when_peer_shared_exists() {
 }
 
 #[test]
-fn test_expired_pending_invite_bootstrap_not_in_allowlist() {
+fn test_expired_pending_invite_bootstrap_not_in_authorized_fingerprints() {
     let conn = open_in_memory().unwrap();
     create_tables(&conn).unwrap();
 
@@ -242,12 +242,12 @@ fn test_expired_pending_invite_bootstrap_not_in_allowlist() {
         )
         .unwrap();
 
-    let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
-    assert!(!allowed.contains(&spki));
+    let authorized = authorized_fingerprints_from_db(&conn, recorded_by).unwrap();
+    assert!(!authorized.contains(&spki));
 }
 
 #[test]
-fn test_is_peer_allowed_checks_all_sources() {
+fn test_is_authorized_for_tenant_checks_all_sources() {
     let conn = open_in_memory().unwrap();
     create_tables(&conn).unwrap();
 
@@ -266,9 +266,9 @@ fn test_is_peer_allowed_checks_all_sources() {
     )
     .unwrap();
 
-    assert!(is_peer_allowed(&conn, recorded_by, &peer_shared_spki).unwrap());
-    assert!(is_peer_allowed(&conn, recorded_by, &pending_only).unwrap());
-    assert!(!is_peer_allowed(&conn, recorded_by, &denied).unwrap());
+    assert!(is_authorized_for_tenant(&conn, recorded_by, &peer_shared_spki).unwrap());
+    assert!(is_authorized_for_tenant(&conn, recorded_by, &pending_only).unwrap());
+    assert!(!is_authorized_for_tenant(&conn, recorded_by, &denied).unwrap());
 }
 
 #[test]
@@ -314,136 +314,20 @@ fn test_mutual_trust_requires_both_sides() {
     record_pending_invite_bootstrap_trust(&conn, bob, "invite-b", "ws", &alice_spki).unwrap();
 
     assert!(
-        is_peer_allowed(&conn, alice, &bob_spki).unwrap(),
+        is_authorized_for_tenant(&conn, alice, &bob_spki).unwrap(),
         "alice should trust bob once bob is in alice's trust rows"
     );
     assert!(
-        is_peer_allowed(&conn, bob, &alice_spki).unwrap(),
+        is_authorized_for_tenant(&conn, bob, &alice_spki).unwrap(),
         "bob should trust alice once alice is in bob's trust rows"
     );
 
     // One-sided trust is not mutual auth.
     let carol = "carol";
     assert!(
-        !is_peer_allowed(&conn, carol, &alice_spki).unwrap(),
+        !is_authorized_for_tenant(&conn, carol, &alice_spki).unwrap(),
         "carol has no trust rows and must not trust alice"
     );
-}
-
-#[test]
-fn test_import_cli_pins_to_sql() {
-    let conn = open_in_memory().unwrap();
-    create_tables(&conn).unwrap();
-
-    let recorded_by = "aaaa";
-    let pin1: [u8; 32] = [0xAA; 32];
-    let pin2: [u8; 32] = [0xBB; 32];
-    let not_pinned: [u8; 32] = [0xCC; 32];
-
-    let cli_pins = AllowedPeers::from_fingerprints(vec![pin1, pin2]);
-    let imported = import_cli_pins_to_sql(&conn, recorded_by, &cli_pins).unwrap();
-    assert_eq!(imported, 2);
-
-    // Both should be visible via allowed_peers_from_db
-    let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
-    assert!(allowed.contains(&pin1));
-    assert!(allowed.contains(&pin2));
-    assert!(!allowed.contains(&not_pinned));
-
-    // And via is_peer_allowed
-    assert!(is_peer_allowed(&conn, recorded_by, &pin1).unwrap());
-    assert!(is_peer_allowed(&conn, recorded_by, &pin2).unwrap());
-    assert!(!is_peer_allowed(&conn, recorded_by, &not_pinned).unwrap());
-}
-
-#[test]
-fn test_cli_pin_superseded_by_peer_shared() {
-    let conn = open_in_memory().unwrap();
-    create_tables(&conn).unwrap();
-
-    let recorded_by = "aaaa";
-    // Choose a pubkey whose derived SPKI we'll use as the CLI pin
-    let pubkey: [u8; 32] = [0xDD; 32];
-    let pin_fp = spki_fingerprint_from_ed25519_pubkey(&pubkey);
-
-    // Import a CLI pin
-    let cli_pins = AllowedPeers::from_fingerprints(vec![pin_fp]);
-    import_cli_pins_to_sql(&conn, recorded_by, &cli_pins).unwrap();
-
-    // Verify it's trusted
-    assert!(is_peer_allowed(&conn, recorded_by, &pin_fp).unwrap());
-
-    // Simulate arrival of a PeerShared entry for the same SPKI
-    insert_peer_shared(&conn, recorded_by, "ps-steady", &pubkey);
-
-    // Supersession now happens at projection time, not on read
-    consume_bootstrap_for_peer_shared(&conn, recorded_by, &pubkey).unwrap();
-
-    // Still trusted (via PeerShared now)
-    assert!(is_peer_allowed(&conn, recorded_by, &pin_fp).unwrap());
-
-    // Bootstrap row should be consumed by the PeerShared projection path.
-    let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
-    assert!(allowed.contains(&pin_fp));
-
-    let invite_event_id = cli_pin_invite_event_id(&pin_fp);
-    let remaining_rows: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM pending_invite_bootstrap_trust
-                  WHERE recorded_by = ?1 AND invite_event_id = ?2",
-            rusqlite::params![recorded_by, &invite_event_id],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        remaining_rows, 0,
-        "CLI pin bootstrap row should be consumed"
-    );
-}
-
-#[test]
-fn test_cli_pin_not_silently_trusted_without_import() {
-    let conn = open_in_memory().unwrap();
-    create_tables(&conn).unwrap();
-
-    let recorded_by = "aaaa";
-    let raw_fp: [u8; 32] = [0xEE; 32];
-
-    // Without importing, a raw fingerprint should NOT be trusted
-    assert!(!is_peer_allowed(&conn, recorded_by, &raw_fp).unwrap());
-    let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
-    assert!(!allowed.contains(&raw_fp));
-}
-
-#[test]
-fn test_cli_pin_import_no_collision_on_shared_prefix() {
-    let conn = open_in_memory().unwrap();
-    create_tables(&conn).unwrap();
-
-    let recorded_by = "aaaa";
-    // Two fingerprints that share the same first 8 bytes but differ after
-    let mut fp_a: [u8; 32] = [0xAB; 32];
-    let mut fp_b: [u8; 32] = [0xAB; 32];
-    fp_a[8] = 0x01;
-    fp_b[8] = 0x02;
-
-    let pins = AllowedPeers::from_fingerprints(vec![fp_a, fp_b]);
-    let count = import_cli_pins_to_sql(&conn, recorded_by, &pins).unwrap();
-    assert_eq!(count, 2);
-
-    // Both must remain trusted — no silent overwrite
-    assert!(
-        is_peer_allowed(&conn, recorded_by, &fp_a).unwrap(),
-        "fp_a should be trusted after import"
-    );
-    assert!(
-        is_peer_allowed(&conn, recorded_by, &fp_b).unwrap(),
-        "fp_b should be trusted after import"
-    );
-
-    let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
-    assert!(allowed.contains(&fp_a), "fp_a should be in allowed set");
-    assert!(allowed.contains(&fp_b), "fp_b should be in allowed set");
 }
 
 #[test]
@@ -588,10 +472,10 @@ fn test_different_recorded_by_isolation() {
     let pubkey: [u8; 32] = [42u8; 32];
     let spki = insert_peer_shared(&conn, "peer_a", "ps1", &pubkey);
 
-    let allowed_a = allowed_peers_from_db(&conn, "peer_a").unwrap();
+    let allowed_a = authorized_fingerprints_from_db(&conn, "peer_a").unwrap();
     assert!(allowed_a.contains(&spki));
 
-    let allowed_b = allowed_peers_from_db(&conn, "peer_b").unwrap();
+    let allowed_b = authorized_fingerprints_from_db(&conn, "peer_b").unwrap();
     assert!(!allowed_b.contains(&spki));
 }
 
@@ -611,7 +495,7 @@ fn test_malformed_peer_shared_pubkey_skipped() {
     )
     .unwrap();
 
-    let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
+    let allowed = authorized_fingerprints_from_db(&conn, recorded_by).unwrap();
     assert!(allowed.contains(&good_spki));
     // Malformed entry should be skipped — only 1 valid entry
     let zero_fp: [u8; 32] = [0u8; 32];
@@ -629,11 +513,21 @@ fn test_allowed_peers_count() {
     let spki_pending: [u8; 32] = [3u8; 32];
 
     // Empty → count should be 0
-    assert_eq!(allowed_peers_from_db(&conn, recorded_by).unwrap().len(), 0);
+    assert_eq!(
+        authorized_fingerprints_from_db(&conn, recorded_by)
+            .unwrap()
+            .len(),
+        0
+    );
 
     // Add PeerShared row
     insert_peer_shared(&conn, recorded_by, "ps1", &pubkey_ps);
-    assert_eq!(allowed_peers_from_db(&conn, recorded_by).unwrap().len(), 1);
+    assert_eq!(
+        authorized_fingerprints_from_db(&conn, recorded_by)
+            .unwrap()
+            .len(),
+        1
+    );
 
     // Add accepted invite bootstrap trust
     record_invite_bootstrap_trust(
@@ -646,19 +540,34 @@ fn test_allowed_peers_count() {
         &spki_bootstrap,
     )
     .unwrap();
-    assert_eq!(allowed_peers_from_db(&conn, recorded_by).unwrap().len(), 2);
+    assert_eq!(
+        authorized_fingerprints_from_db(&conn, recorded_by)
+            .unwrap()
+            .len(),
+        2
+    );
 
     // Add pending invite bootstrap trust
     record_pending_invite_bootstrap_trust(&conn, recorded_by, "invite2", "ws2", &spki_pending)
         .unwrap();
-    assert_eq!(allowed_peers_from_db(&conn, recorded_by).unwrap().len(), 3);
+    assert_eq!(
+        authorized_fingerprints_from_db(&conn, recorded_by)
+            .unwrap()
+            .len(),
+        3
+    );
 
     // Cross-tenant isolation: different recorded_by sees 0
-    assert_eq!(allowed_peers_from_db(&conn, "other_peer").unwrap().len(), 0);
+    assert_eq!(
+        authorized_fingerprints_from_db(&conn, "other_peer")
+            .unwrap()
+            .len(),
+        0
+    );
 }
 
 #[test]
-fn test_allowed_peers_count_dedupes_overlap_across_sources() {
+fn test_authorized_fingerprints_dedupes_overlap_across_sources() {
     let conn = open_in_memory().unwrap();
     create_tables(&conn).unwrap();
 
@@ -686,7 +595,9 @@ fn test_allowed_peers_count_dedupes_overlap_across_sources() {
     .unwrap();
 
     assert_eq!(
-        allowed_peers_from_db(&conn, recorded_by).unwrap().len(),
+        authorized_fingerprints_from_db(&conn, recorded_by)
+            .unwrap()
+            .len(),
         1,
         "same fingerprint in peers_shared + bootstrap rows should count once"
     );
@@ -774,7 +685,12 @@ fn test_allowed_peers_count_ignores_malformed_rows() {
             ],
         ).unwrap();
 
-    assert_eq!(allowed_peers_from_db(&conn, recorded_by).unwrap().len(), 0);
+    assert_eq!(
+        authorized_fingerprints_from_db(&conn, recorded_by)
+            .unwrap()
+            .len(),
+        0
+    );
     assert!(!has_any_trusted_peer(&conn, recorded_by).unwrap());
 }
 
@@ -803,14 +719,14 @@ fn test_removed_peer_excluded_from_trust() {
 
     // Before removal: peer should be trusted
     assert!(
-        is_peer_allowed(&conn, recorded_by, &spki).unwrap(),
+        is_authorized_for_tenant(&conn, recorded_by, &spki).unwrap(),
         "peer should be trusted before removal"
     );
     assert!(
         has_any_trusted_peer(&conn, recorded_by).unwrap(),
         "should have trusted peers before removal"
     );
-    let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
+    let allowed = authorized_fingerprints_from_db(&conn, recorded_by).unwrap();
     assert!(
         allowed.contains(&spki),
         "allowed set should contain peer before removal"
@@ -826,14 +742,14 @@ fn test_removed_peer_excluded_from_trust() {
 
     // After removal: peer should NOT be trusted
     assert!(
-        !is_peer_allowed(&conn, recorded_by, &spki).unwrap(),
+        !is_authorized_for_tenant(&conn, recorded_by, &spki).unwrap(),
         "removed peer should not be trusted"
     );
     assert!(
         !has_any_trusted_peer(&conn, recorded_by).unwrap(),
         "should have no trusted peers after only peer removed"
     );
-    let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
+    let allowed = authorized_fingerprints_from_db(&conn, recorded_by).unwrap();
     assert!(
         !allowed.contains(&spki),
         "allowed set should not contain removed peer"
@@ -860,14 +776,14 @@ fn test_user_removed_denies_linked_peer_trust() {
 
     // Before removal: peer should be trusted
     assert!(
-        is_peer_allowed(&conn, recorded_by, &spki).unwrap(),
+        is_authorized_for_tenant(&conn, recorded_by, &spki).unwrap(),
         "peer should be trusted before user removal"
     );
     assert!(
         has_any_trusted_peer(&conn, recorded_by).unwrap(),
         "should have trusted peers before user removal"
     );
-    let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
+    let allowed = authorized_fingerprints_from_db(&conn, recorded_by).unwrap();
     assert!(
         allowed.contains(&spki),
         "allowed set should contain peer before user removal"
@@ -883,14 +799,14 @@ fn test_user_removed_denies_linked_peer_trust() {
 
     // After user removal: peer should NOT be trusted (transitive denial)
     assert!(
-        !is_peer_allowed(&conn, recorded_by, &spki).unwrap(),
+        !is_authorized_for_tenant(&conn, recorded_by, &spki).unwrap(),
         "peer linked to removed user should not be trusted"
     );
     assert!(
         !has_any_trusted_peer(&conn, recorded_by).unwrap(),
         "should have no trusted peers after user removed"
     );
-    let allowed = allowed_peers_from_db(&conn, recorded_by).unwrap();
+    let allowed = authorized_fingerprints_from_db(&conn, recorded_by).unwrap();
     assert!(
         !allowed.contains(&spki),
         "allowed set should not contain peer linked to removed user"
@@ -912,7 +828,7 @@ fn test_user_removed_denies_linked_peer_trust() {
 ///
 /// After eventization: this row must still be produced (by projection
 /// from the locally-created invite event + bootstrap context), and
-/// is_peer_allowed must still return true for the expected SPKI.
+/// is_authorized_for_tenant must still return true for the expected SPKI.
 #[test]
 fn characterization_inviter_pending_trust_allows_first_dial() {
     let conn = open_in_memory().unwrap();
@@ -934,16 +850,16 @@ fn characterization_inviter_pending_trust_allows_first_dial() {
     )
     .unwrap();
 
-    // Invitee's first dial: transport layer checks is_peer_allowed
+    // Invitee's first dial: transport layer checks is_authorized_for_tenant
     assert!(
-        is_peer_allowed(&conn, inviter_id, &expected_invitee_spki).unwrap(),
+        is_authorized_for_tenant(&conn, inviter_id, &expected_invitee_spki).unwrap(),
         "INVARIANT: inviter must allow invitee's invite-derived SPKI before accept"
     );
 
     // Unknown SPKI must still be denied
     let unknown: [u8; 32] = [0x99; 32];
     assert!(
-        !is_peer_allowed(&conn, inviter_id, &unknown).unwrap(),
+        !is_authorized_for_tenant(&conn, inviter_id, &unknown).unwrap(),
         "INVARIANT: unknown SPKI must be denied even when pending trust exists"
     );
 }
@@ -983,7 +899,7 @@ fn characterization_joiner_accepted_trust_allows_bootstrap_sync() {
 
     // Joiner's transport layer checks the inviter's SPKI
     assert!(
-        is_peer_allowed(&conn, joiner_id, &inviter_spki).unwrap(),
+        is_authorized_for_tenant(&conn, joiner_id, &inviter_spki).unwrap(),
         "INVARIANT: joiner must allow inviter's bootstrap SPKI after accept"
     );
 
@@ -1102,7 +1018,7 @@ fn characterization_full_trust_lifecycle() {
     record_pending_invite_bootstrap_trust(&conn, inviter, invite_eid, workspace_id, &invitee_spki)
         .unwrap();
     assert!(
-        is_peer_allowed(&conn, inviter, &invitee_spki).unwrap(),
+        is_authorized_for_tenant(&conn, inviter, &invitee_spki).unwrap(),
         "Stage 1: inviter allows invitee SPKI via pending trust"
     );
 
@@ -1118,7 +1034,7 @@ fn characterization_full_trust_lifecycle() {
     )
     .unwrap();
     assert!(
-        is_peer_allowed(&conn, joiner, &inviter_spki).unwrap(),
+        is_authorized_for_tenant(&conn, joiner, &inviter_spki).unwrap(),
         "Stage 2: joiner allows inviter SPKI via accepted trust"
     );
 
@@ -1130,7 +1046,7 @@ fn characterization_full_trust_lifecycle() {
 
     // After PeerShared, the derived SPKI is trusted via steady state
     assert!(
-        is_peer_allowed(&conn, inviter, &invitee_derived_spki).unwrap(),
+        is_authorized_for_tenant(&conn, inviter, &invitee_derived_spki).unwrap(),
         "Stage 3: inviter allows invitee via PeerShared-derived SPKI"
     );
 
@@ -1154,7 +1070,7 @@ fn characterization_full_trust_lifecycle() {
     )
     .unwrap();
     assert!(
-        is_peer_allowed(&conn, inviter, &matching_spki).unwrap(),
+        is_authorized_for_tenant(&conn, inviter, &matching_spki).unwrap(),
         "Stage 3b: pending trust allows matching SPKI before PeerShared"
     );
 
@@ -1162,7 +1078,7 @@ fn characterization_full_trust_lifecycle() {
     // Supersession now happens at projection time via PeerShared writes
     consume_bootstrap_for_peer_shared(&conn, inviter, &matching_pubkey).unwrap();
     assert!(
-        is_peer_allowed(&conn, inviter, &matching_spki).unwrap(),
+        is_authorized_for_tenant(&conn, inviter, &matching_spki).unwrap(),
         "Stage 3b: SPKI still allowed after PeerShared (via PeerShared path)"
     );
     // Pending trust should now be consumed (PeerShared SPKI matches).
@@ -1177,7 +1093,7 @@ fn characterization_full_trust_lifecycle() {
     assert_eq!(remaining_rows, 0);
     // But the SPKI is still allowed (via PeerShared path)
     assert!(
-        is_peer_allowed(&conn, inviter, &matching_spki).unwrap(),
+        is_authorized_for_tenant(&conn, inviter, &matching_spki).unwrap(),
         "Stage 3b: SPKI still allowed via PeerShared after supersession"
     );
 }
@@ -1203,7 +1119,7 @@ fn characterization_removal_denies_all_peer_shared_trust() {
     // --- PeerRemoved denies direct peer trust ---
     let spki = insert_peer_shared(&conn, recorded_by, peer_event_id, &peer_pubkey);
     assert!(
-        is_peer_allowed(&conn, recorded_by, &spki).unwrap(),
+        is_authorized_for_tenant(&conn, recorded_by, &spki).unwrap(),
         "peer trusted before removal"
     );
 
@@ -1214,7 +1130,7 @@ fn characterization_removal_denies_all_peer_shared_trust() {
     )
     .unwrap();
     assert!(
-        !is_peer_allowed(&conn, recorded_by, &spki).unwrap(),
+        !is_authorized_for_tenant(&conn, recorded_by, &spki).unwrap(),
         "INVARIANT: PeerRemoved must deny trust for that peer's SPKI"
     );
 
@@ -1224,7 +1140,7 @@ fn characterization_removal_denies_all_peer_shared_trust() {
     let other_spki =
         insert_peer_shared_with_user(&conn, other_rb, "ps_linked", &other_pubkey, user_event_id);
     assert!(
-        is_peer_allowed(&conn, other_rb, &other_spki).unwrap(),
+        is_authorized_for_tenant(&conn, other_rb, &other_spki).unwrap(),
         "linked peer trusted before user removal"
     );
 
@@ -1235,7 +1151,7 @@ fn characterization_removal_denies_all_peer_shared_trust() {
     )
     .unwrap();
     assert!(
-        !is_peer_allowed(&conn, other_rb, &other_spki).unwrap(),
+        !is_authorized_for_tenant(&conn, other_rb, &other_spki).unwrap(),
         "INVARIANT: UserRemoved must transitively deny linked peer trust"
     );
 
@@ -1255,14 +1171,14 @@ fn characterization_removal_denies_all_peer_shared_trust() {
     .unwrap();
     // Even if a PeerRemoved exists for some unrelated peer, bootstrap trust remains
     assert!(
-        is_peer_allowed(&conn, bootstrap_only_rb, &bootstrap_spki).unwrap(),
+        is_authorized_for_tenant(&conn, bootstrap_only_rb, &bootstrap_spki).unwrap(),
         "bootstrap trust unaffected by removal (independent trust source)"
     );
 }
 
 /// Characterization: trust check reads are pure (no side effects).
 ///
-/// After eventization (Phase 5), is_peer_allowed and allowed_peers_from_db
+/// After eventization (Phase 5), is_authorized_for_tenant and authorized_fingerprints_from_db
 /// are pure read-only queries. Supersession is handled at projection time
 /// by PeerShared projection writes.
 /// This test verifies that reads do NOT mutate the database.
@@ -1280,8 +1196,8 @@ fn characterization_trust_check_reads_are_pure() {
     insert_peer_shared(&conn, recorded_by, "ps_se", &pubkey);
 
     // Trust checks should NOT trigger supersession as a side effect
-    let _ = is_peer_allowed(&conn, recorded_by, &spki).unwrap();
-    let _ = allowed_peers_from_db(&conn, recorded_by).unwrap();
+    let _ = is_authorized_for_tenant(&conn, recorded_by, &spki).unwrap();
+    let _ = authorized_fingerprints_from_db(&conn, recorded_by).unwrap();
 
     let before_consume_rows: i64 = conn
         .query_row(

@@ -55,7 +55,7 @@ Each write intent must map to a Rust projection path in a table in this file.
 3. `BrInv_PendingOnlyOnInviter`:
    pending trust row/materialized trust may exist only for invite creator context (`is_local_create` equivalent).
 4. `BrInv_AllowedPeerMatchesAuthDecision`:
-   if runtime allowed set contains remote active SPKI then connection-auth decision can succeed; otherwise deny.
+   if runtime authorized set contains remote active SPKI then connection-auth decision can succeed; otherwise deny.
 5. `BrInv_OngoingPreferred`:
    ongoing trust source implies ongoing dial preference.
 6. `BrInv_BootstrapFallbackOnlyWhenNeeded`:

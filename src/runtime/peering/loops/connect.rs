@@ -455,7 +455,7 @@ async fn connect_loop_inner(
 fn describe_connect_failure(remote: SocketAddr, err: &ConnectionLifecycleError) -> String {
     match err {
         ConnectionLifecycleError::DialTrustRejected(msg) => {
-            // Extract the fingerprint from "trust_rejected: peer fingerprint <hex> not in allowed set"
+            // Extract the fingerprint from "trust_rejected: peer fingerprint <hex> not in authorized set"
             let fp = msg
                 .split("peer fingerprint ")
                 .nth(1)
@@ -612,7 +612,7 @@ mod tests {
     #[test]
     fn fallback_policy_allows_typed_trust_rejection_with_fallback_cfg() {
         let err = ConnectionLifecycleError::DialTrustRejected(
-            "handshake to 127.0.0.1:4433: trust_rejected: peer fingerprint deadbeef not in allowed set".to_string()
+            "handshake to 127.0.0.1:4433: trust_rejected: peer fingerprint deadbeef not in authorized set".to_string()
         );
         let decision = derive_bootstrap_dial_context(Some(&err), true);
         assert_eq!(decision.mode, BootstrapDialMode::BootstrapFallback);
@@ -630,7 +630,7 @@ mod tests {
     #[test]
     fn fallback_policy_denies_trust_rejection_without_cfg() {
         let err = ConnectionLifecycleError::DialTrustRejected(
-            "handshake to 127.0.0.1:4433: trust_rejected: peer fingerprint deadbeef not in allowed set".to_string()
+            "handshake to 127.0.0.1:4433: trust_rejected: peer fingerprint deadbeef not in authorized set".to_string()
         );
         let decision = derive_bootstrap_dial_context(Some(&err), false);
         assert_eq!(decision.mode, BootstrapDialMode::Deny);
