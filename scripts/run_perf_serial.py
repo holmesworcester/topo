@@ -369,6 +369,33 @@ class PerfRunner:
             self.run_lowmem_poc()
             return
 
+        if self.mode == "network":
+            self.run_daemon_realistic_network_perf_test(
+                "Realistic Network Sync (perf_sync_10k_realistic_profiles)",
+                "perf_sync_10k_realistic_profiles",
+            )
+            self.run_daemon_realistic_network_perf_test(
+                "Realistic Network Sync (perf_continuous_10k_realistic_profiles)",
+                "perf_continuous_10k_realistic_profiles",
+            )
+            self.run_daemon_realistic_network_perf_test(
+                "Realistic Network Sync (perf_sync_50k_realistic_profiles)",
+                "perf_sync_50k_realistic_profiles",
+            )
+            self.run_daemon_realistic_network_perf_test(
+                "Realistic Network Sync (perf_sync_100k_realistic_profiles)",
+                "perf_sync_100k_realistic_profiles",
+            )
+            self.run_daemon_realistic_network_perf_test(
+                "Realistic Network Sync (perf_sync_200k_realistic_profiles)",
+                "perf_sync_200k_realistic_profiles",
+            )
+            self.run_daemon_realistic_network_perf_test(
+                "Realistic Network Sync (perf_sync_500k_realistic_profiles)",
+                "perf_sync_500k_realistic_profiles",
+            )
+            return
+
         if self.mode == "full":
             self.run_mode_core_full_common()
             self.run_daemon_perf_test(
@@ -401,7 +428,7 @@ class PerfRunner:
             return
 
         raise SystemExit(
-            f"unknown mode: {self.mode}\nusage: python3 scripts/run_perf_serial.py [core|lowmem|full]"
+            f"unknown mode: {self.mode}\nusage: python3 scripts/run_perf_serial.py [core|lowmem|network|full]"
         )
 
     def run_mode_core_full_common(self) -> None:
@@ -470,6 +497,33 @@ class PerfRunner:
             args,
             allow_failure=allow_failure,
             summary_path=self.repo_root / f"target/perf-results/daemon_perf_test.{test_name}.summary",
+        )
+
+    def run_daemon_realistic_network_perf_test(
+        self,
+        label: str,
+        test_name: str,
+    ) -> None:
+        args = [
+            "cargo",
+            "+stable",
+            "test",
+            "--release",
+            "--test",
+            "daemon_realistic_network_perf_test",
+            test_name,
+            "--",
+            "--nocapture",
+            "--ignored",
+            "--test-threads=1",
+        ]
+        self.run_capture(
+            label,
+            args,
+            summary_path=(
+                self.repo_root
+                / f"target/perf-results/daemon_realistic_network_perf_test.{test_name}.summary"
+            ),
         )
 
     def run_topo_cascade(
