@@ -11,9 +11,9 @@ use crate::cli_harness::{
     accept_invite_with_identity_on_running_daemon, assert_eventually, create_invite_with_spki,
     daemon_listen_addr, daemon_transport_fingerprint, ensure_active_peer, generate_messages,
     message_count_sql, peak_rss_mib_for_pid, random_port, send_message, start_daemon_with_options,
-    stop_daemon, topo_cmd, wait_for_active_tenant_ready, wait_for_daemon_stopped,
-    wait_for_bootstrap_supersession_and_endpoint_observation,
-    wait_for_pending_bootstrap_trust_cleared_and_endpoint_observation, DaemonOptions,
+    stop_daemon, topo_cmd, wait_for_active_tenant_ready,
+    wait_for_bootstrap_supersession_and_endpoint_observation, wait_for_daemon_stopped,
+    DaemonOptions,
 };
 
 pub type BenchNetworkGuard = Box<dyn std::any::Any + Send>;
@@ -101,8 +101,7 @@ impl SharedWorkspaceBench {
             .parse::<SocketAddr>()
             .unwrap_or_else(|_| panic!("parse daemon listen addr `{alice_direct_addr}`"));
         let bob_bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, random_port()));
-        let network_path =
-            configure_network(alice_direct_addr.clone(), bob_bind_addr.to_string());
+        let network_path = configure_network(alice_direct_addr.clone(), bob_bind_addr.to_string());
         let use_fixed_bob_bind = network_path.guard.is_some();
         if use_fixed_bob_bind {
             assert!(
@@ -227,7 +226,6 @@ impl SharedWorkspaceBench {
             &self.alice_transport_peer_id,
             timeout,
         );
-        wait_for_pending_bootstrap_trust_cleared_and_endpoint_observation(&self.alice_db, timeout);
         self.warm_bidirectional(timeout);
     }
 

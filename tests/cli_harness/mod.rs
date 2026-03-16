@@ -2112,11 +2112,12 @@ pub fn wait_for_bootstrap_supersession_and_endpoint_observation(
                 |row| row.get(0),
             )
             .expect("count peer_endpoint_observations");
-        let transport_identity_materialized = topo::db::transport_creds::discover_local_tenants(&conn)
-            .map(|tenants| {
-                tenants.len() == 1 && tenants[0].transport_peer_id == tenants[0].peer_id
-            })
-            .unwrap_or(false);
+        let transport_identity_materialized =
+            topo::db::transport_creds::discover_local_tenants(&conn)
+                .map(|tenants| {
+                    tenants.len() == 1 && tenants[0].transport_peer_id == tenants[0].peer_id
+                })
+                .unwrap_or(false);
         drop(conn);
 
         if transport_identity_materialized && pending_rows == 0 && observed_rows > 0 {
@@ -2144,16 +2145,16 @@ pub fn wait_for_pending_bootstrap_trust_cleared_and_endpoint_observation(
             .expect("system time")
             .as_millis() as i64;
         let conn = topo::db::open_connection(db_path).expect("open db");
-        let active_peer_id: Option<String> = conn
-            .query_row(
-                "SELECT peer_id
-                 FROM active_tenant_state
-                 ORDER BY created_at DESC
-                 LIMIT 1",
-                [],
-                |row| row.get(0),
-            )
-            .ok();
+        let active_peer_id: Option<String> =
+            topo::db::transport_creds::discover_local_tenants(&conn)
+                .ok()
+                .and_then(|mut tenants| {
+                    if tenants.len() == 1 {
+                        Some(tenants.remove(0).peer_id)
+                    } else {
+                        None
+                    }
+                });
         let pending_rows: i64 = active_peer_id
             .as_ref()
             .and_then(|peer_id| {
@@ -2187,9 +2188,12 @@ pub fn wait_for_pending_bootstrap_trust_cleared_and_endpoint_observation(
 
         assert!(
             Instant::now() < deadline,
-            "pending bootstrap trust + endpoint observation did not converge in {}ms for {}",
+            "pending bootstrap trust + endpoint observation did not converge in {}ms for {} (active_peer_id={:?}, pending_rows={}, observed_rows={})",
             timeout.as_millis(),
-            db_path
+            db_path,
+            active_peer_id,
+            pending_rows,
+            observed_rows
         );
         std::thread::sleep(Duration::from_millis(100));
     }
