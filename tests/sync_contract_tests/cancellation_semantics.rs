@@ -67,10 +67,6 @@ async fn mid_session_cancellation_terminates_handler() {
                 .await
         });
 
-        // Consume the stream materialization markers so the handler proceeds
-        let _ = peer.recv_control_msg_timeout(Duration::from_secs(5)).await;
-        let _ = peer.recv_data_msg_timeout(Duration::from_secs(5)).await;
-
         // Consume NegOpen
         let _ = peer.recv_control_msg_timeout(Duration::from_secs(5)).await;
 

@@ -403,20 +403,7 @@ mod tests {
             .await
             .expect("open_session_io");
         assert!(client_session_id > 0);
-        let mut parts = client_io.split();
-        let marker = encode_frame(&Frame::HaveList { ids: vec![] });
-        parts
-            .control
-            .send(&marker)
-            .await
-            .expect("send control marker");
-        parts
-            .data_send
-            .send(&marker)
-            .await
-            .expect("send data marker");
-        parts.control.flush().await.expect("flush control marker");
-        parts.data_send.flush().await.expect("flush data marker");
+        drop(client_io);
 
         server_accept_task
             .await
@@ -440,35 +427,12 @@ mod tests {
         write_session_stream_header(&mut data_send, session_id, SessionStreamKind::Data)
             .await
             .expect("write data header");
-        let marker = encode_frame(&Frame::HaveList { ids: vec![] });
-        ctrl_send
-            .write_all(&marker)
-            .await
-            .expect("write control marker");
-        ctrl_send.flush().await.expect("flush control marker");
-        data_send
-            .write_all(&marker)
-            .await
-            .expect("write data marker");
-        data_send.flush().await.expect("flush data marker");
 
         let (server_session_id, server_io) = accept_session_io(&server_conn, &inbound_state)
             .await
             .expect("accept_session_io");
         assert_eq!(server_session_id, session_id);
-
-        let mut server_parts = server_io.split();
-        let recv = server_parts
-            .control
-            .recv()
-            .await
-            .expect("recv control frame");
-        let (parsed, consumed) = parse_frame(&recv).expect("parse recv frame");
-        assert_eq!(consumed, recv.len());
-        match parsed {
-            Frame::HaveList { ids } => assert!(ids.is_empty()),
-            other => panic!("expected HaveList marker, got {:?}", other),
-        }
+        drop(server_io);
     }
 
     #[tokio::test]

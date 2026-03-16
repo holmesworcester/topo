@@ -13,19 +13,7 @@ use crate::fake_session_io::{
     test_session_meta, FakePeerSide,
 };
 
-async fn recv_outbound_markers_and_negopen(peer: &mut FakePeerSide) -> Frame {
-    let ctrl_marker = peer
-        .recv_control_msg_timeout(Duration::from_secs(5))
-        .await
-        .expect("expected control marker");
-    assert_eq!(ctrl_marker, Frame::HaveList { ids: vec![] });
-
-    let data_marker = peer
-        .recv_data_msg_timeout(Duration::from_secs(5))
-        .await
-        .expect("expected data marker");
-    assert_eq!(data_marker, Frame::HaveList { ids: vec![] });
-
+async fn recv_outbound_negopen(peer: &mut FakePeerSide) -> Frame {
     peer.recv_control_msg_timeout(Duration::from_secs(5))
         .await
         .expect("expected NegOpen")
@@ -65,7 +53,7 @@ async fn initiator_reuses_connection_scoped_credit_across_repeated_rounds() {
         });
 
         // First round: grant credit, but there is no wanted work yet.
-        let neg_open1 = recv_outbound_markers_and_negopen(&mut peer).await;
+        let neg_open1 = recv_outbound_negopen(&mut peer).await;
         peer.send_control_msg(&Frame::RequestCredit { credits: 1 })
             .await;
         peer.send_control_msg(&Frame::NegMsg {
