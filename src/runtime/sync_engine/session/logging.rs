@@ -303,7 +303,6 @@ fn frame_detail_json(frame: &Frame, capture_full_ids: bool) -> Option<String> {
             }))
             .ok()
         }
-        Frame::Done | Frame::DoneAck | Frame::DataDone => None,
         Frame::IntroOffer { .. } => None,
     }
 }
@@ -316,9 +315,6 @@ fn frame_type(frame: &Frame) -> &'static str {
         Frame::NeedList { .. } => "NeedList",
         Frame::RequestCredit { .. } => "RequestCredit",
         Frame::Event { .. } => "Event",
-        Frame::Done => "Done",
-        Frame::DoneAck => "DoneAck",
-        Frame::DataDone => "DataDone",
         Frame::IntroOffer { .. } => "IntroOffer",
     }
 }

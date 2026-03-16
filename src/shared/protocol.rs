@@ -14,9 +14,6 @@ pub const MSG_TYPE_HAVE_LIST: u8 = 0x12; // List of IDs client needs from server
 pub const MSG_TYPE_REQUEST_CREDIT: u8 = 0x13; // Source-advertised request credit
 pub const MSG_TYPE_NEED_LIST: u8 = 0x14; // Discovery hint: peer is missing these IDs
 pub const MSG_TYPE_EVENT: u8 = 0x03; // Event blob (variable length)
-pub const MSG_TYPE_DONE: u8 = 0x20; // Initiator signals all events sent
-pub const MSG_TYPE_DONE_ACK: u8 = 0x21; // Responder acknowledges done
-pub const MSG_TYPE_DATA_DONE: u8 = 0x22; // Sent on data stream: no more events will follow
 pub const MSG_TYPE_INTRO_OFFER: u8 = 0x30; // Intro offer for hole punching
 
 /// Max negentropy message payload: 4 MiB (generous for large reconciliation rounds)
@@ -39,12 +36,6 @@ pub enum Frame {
     NeedList { ids: Vec<[u8; 32]> },
     /// Send full event blob (variable length)
     Event { blob: Vec<u8> },
-    /// Initiator signals all outgoing events have been sent
-    Done,
-    /// Responder acknowledges Done after draining its own queues
-    DoneAck,
-    /// Sent on data stream to signal no more events will follow
-    DataDone,
     /// Intro offer for QUIC hole punching via a third peer
     IntroOffer {
         intro_id: [u8; 16],
@@ -138,9 +129,6 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
             let blob = input[5..total_size].to_vec();
             Ok((Frame::Event { blob }, total_size))
         }
-        MSG_TYPE_DONE => Ok((Frame::Done, 1)),
-        MSG_TYPE_DONE_ACK => Ok((Frame::DoneAck, 1)),
-        MSG_TYPE_DATA_DONE => Ok((Frame::DataDone, 1)),
         MSG_TYPE_INTRO_OFFER => {
             // Fixed layout: type(1) + intro_id(16) + other_peer_id(32)
             //   + origin_family(1) + origin_ip(16) + origin_port(2)
@@ -236,9 +224,6 @@ pub fn encode_frame(msg: &Frame) -> Vec<u8> {
             buf.extend_from_slice(blob);
             buf
         }
-        Frame::Done => vec![MSG_TYPE_DONE],
-        Frame::DoneAck => vec![MSG_TYPE_DONE_ACK],
-        Frame::DataDone => vec![MSG_TYPE_DATA_DONE],
         Frame::IntroOffer {
             intro_id,
             other_peer_id,
@@ -367,36 +352,6 @@ mod tests {
         let result = parse_frame(&[0xFF, 0, 0, 0, 0]);
         assert_eq!(result, Err(ParseError::UnknownType(0xFF)));
     }
-    #[test]
-    fn test_done_roundtrip() {
-        let msg = Frame::Done;
-        let encoded = encode_frame(&msg);
-        assert_eq!(encoded.len(), 1);
-        let (parsed, consumed) = parse_frame(&encoded).unwrap();
-        assert_eq!(consumed, 1);
-        assert_eq!(parsed, msg);
-    }
-
-    #[test]
-    fn test_done_ack_roundtrip() {
-        let msg = Frame::DoneAck;
-        let encoded = encode_frame(&msg);
-        assert_eq!(encoded.len(), 1);
-        let (parsed, consumed) = parse_frame(&encoded).unwrap();
-        assert_eq!(consumed, 1);
-        assert_eq!(parsed, msg);
-    }
-
-    #[test]
-    fn test_data_done_roundtrip() {
-        let msg = Frame::DataDone;
-        let encoded = encode_frame(&msg);
-        assert_eq!(encoded.len(), 1);
-        let (parsed, consumed) = parse_frame(&encoded).unwrap();
-        assert_eq!(consumed, 1);
-        assert_eq!(parsed, msg);
-    }
-
     #[test]
     fn test_intro_offer_roundtrip() {
         let msg = Frame::IntroOffer {

@@ -229,7 +229,7 @@ async fn test_reaction_sync() {
 }
 
 /// Stress test: high-volume bidirectional sync verifying exact event ID equality.
-/// This checks the Done/DoneAck handshake prevents data loss at scale.
+/// This checks long-lived pull sync avoids data loss at scale.
 #[tokio::test]
 async fn test_zero_loss_stress() {
     let alice = Peer::new_with_identity("alice");

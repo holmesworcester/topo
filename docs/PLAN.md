@@ -61,7 +61,7 @@ For active work:
 - Use one blocker mechanism for everything, including missing keys for encrypted events.
 - Blocked-event normalcy rule:
   - blocked events are still canonical/shareable facts and can be expected end-states for some tenants.
-  - after a sync session, appropriately blocked events do not indicate protocol failure.
+  - after a sync connection run, appropriately blocked events do not indicate protocol failure.
   - expected examples include encrypted content for non-recipients and key-share events for non-recipients.
 - No per-event transit wrapper. QUIC + mTLS secures the channel.
 - Use separate tables for permanent canonical data vs operational queues.
@@ -229,9 +229,9 @@ Policy for future transport work:
 2. build invite/trust-graph realism before adding transport security layers so transport starts from the same authority model used in production,
 3. prefer projected trust-row queries and exact transport fingerprints over ad-hoc in-memory trust state.
 
-### Sync session lifetime
+### Sync connection lifetime
 
-Sync keeps one long-lived request/response session per authenticated connection.
+Sync keeps one long-lived request/response lane set per authenticated connection.
 
 1. discovery remains round-scoped (`NegOpen` / `NegMsg` / `NeedList`),
 2. request credit and `HaveList` requests are connection-scoped,
@@ -1402,7 +1402,7 @@ Behavior tests:
 
 ## 12.7 Real QUIC system tests
 
-Topology reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) sections `2` (one sync session) and `4` (runtime topology).
+Topology reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) sections `2` (one sync connection) and `4` (runtime topology).
 
 - 2-node bootstrap and sync.
 - 3-node out-of-order convergence.

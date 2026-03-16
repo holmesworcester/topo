@@ -76,7 +76,7 @@ async fn initiator_reuses_connection_scoped_credit_across_repeated_rounds() {
         let unexpected_data = peer.recv_data_msg_timeout(Duration::from_millis(250)).await;
         assert!(
             unexpected_data.is_none(),
-            "no per-round DataDone/data marker should be emitted, got {:?}",
+            "no unsolicited per-round data marker should be emitted, got {:?}",
             unexpected_data
         );
 

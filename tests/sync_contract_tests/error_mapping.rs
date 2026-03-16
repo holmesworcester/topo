@@ -156,7 +156,7 @@ async fn normal_roundtrip_stays_healthy_until_cancel() {
         let unexpected = peer.recv_data_msg_timeout(Duration::from_millis(250)).await;
         assert!(
             unexpected.is_none(),
-            "expected no per-round DataDone marker, got {:?}",
+            "expected no unsolicited per-round data marker, got {:?}",
             unexpected
         );
 
@@ -359,16 +359,9 @@ async fn fragmented_data_frames_handler_completes() {
         })
         .await;
 
-        // Send DataDone (1-byte message, not fragmented since len==1) and
-        // Done on control to drive the session toward completion.
-        peer.send_data_msg(&Frame::DataDone).await;
-        peer.send_control_msg(&Frame::Done).await;
-
-        // Consume any responses from the handler.
-        let _ = peer.recv_data_msg_timeout(Duration::from_secs(5)).await;
-        let _ = peer.recv_control_msg_timeout(Duration::from_secs(5)).await;
-
-        // Drop channels to ensure handler can exit.
+        // Drop channels to ensure handler can exit after seeing the malformed
+        // fragmented event path. The connection-scoped data lane no longer
+        // relies on per-session completion markers.
         drop(peer.control_send);
         drop(peer.data_send);
 
@@ -475,77 +468,6 @@ async fn garbage_control_frame_terminates_handler() {
         assert!(
             result.is_ok(),
             "handler should exit gracefully on garbage control frame, got: {:?}",
-            result
-        );
-        cancel.cancel();
-    })
-    .await;
-}
-
-/// Verify behavior when a DuplicateDone violation is injected. The harness
-/// sends Done twice on the control channel. The responder should either
-/// handle the duplicate gracefully or error — but must not hang or panic.
-#[tokio::test]
-async fn duplicate_done_violation_terminates_handler() {
-    run_local(async {
-        let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncSessionHandler::responder(
-            db_path,
-            30,
-            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
-            noop_ingest_tx(),
-        );
-        let meta = test_session_meta(SessionDirection::Inbound);
-        let cancel = CancellationToken::new();
-
-        let config = FakeIoConfig {
-            inject_protocol_violation: Some(ProtocolViolation::DuplicateDone),
-            ..Default::default()
-        };
-        let (fake_io, mut peer) = fake_session_io_pair_with_config(meta.session_id, config);
-
-        let handler_task = tokio::task::spawn_local({
-            let cancel = cancel.clone();
-            async move { handler.on_session(meta, Box::new(fake_io), cancel).await }
-        });
-
-        // Drive the normal protocol up to Done, which will be duplicated
-        // by the FakeControlIo violation injection.
-        let storage = empty_negentropy_storage();
-        let mut neg =
-            negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
-        let initial_msg = neg.initiate().unwrap();
-        peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
-            .await;
-
-        // Consume NegMsg from responder
-        let _ = peer.recv_control_msg_timeout(Duration::from_secs(2)).await;
-
-        // Signal done (the FakeControlIo will auto-duplicate this Done)
-        peer.send_data_msg(&Frame::DataDone).await;
-        peer.send_control_msg(&Frame::Done).await;
-
-        // Try to receive DataDone + DoneAck — the handler may or may not
-        // produce these depending on how it handles the duplicate Done.
-        let _ = peer.recv_data_msg_timeout(Duration::from_secs(5)).await;
-        let _ = peer.recv_control_msg_timeout(Duration::from_secs(5)).await;
-
-        // Drop our channels so the handler doesn't block indefinitely
-        // waiting for more messages after processing the duplicate.
-        drop(peer.control_send);
-        drop(peer.data_send);
-
-        let result = tokio::time::timeout(Duration::from_secs(10), handler_task)
-            .await
-            .expect("handler timed out on duplicate Done — it should not hang")
-            .expect("handler panicked");
-
-        // Handler processes the first Done normally and completes the
-        // session. The duplicate Done arrives after the control loop has
-        // already exited, so the handler terminates gracefully.
-        assert!(
-            result.is_ok(),
-            "handler should complete gracefully despite duplicate Done, got: {:?}",
             result
         );
         cancel.cancel();

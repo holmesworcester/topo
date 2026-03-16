@@ -71,7 +71,7 @@ async fn responder_inbound_replies_negmsg_and_stays_open_for_next_round() {
         let unexpected = peer.recv_data_msg_timeout(Duration::from_millis(250)).await;
         assert!(
             unexpected.is_none(),
-            "expected no DataDone marker from responder, got {:?}",
+            "expected no unsolicited data marker from responder, got {:?}",
             unexpected
         );
 

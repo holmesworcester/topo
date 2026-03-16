@@ -72,7 +72,7 @@ The design goal is to keep protocol behavior auditable while still supporting re
 
 ### Daemon Start
 
-Every participant begins by starting a daemon (`topo ... start`) with a local database and bind address. That daemon owns the long-running machinery: projection workers, dial/accept peering loops, and sync session handling. Every step that follows is processed by the same runtime process.
+Every participant begins by starting a daemon (`topo ... start`) with a local database and bind address. That daemon owns the long-running machinery: projection workers, dial/accept peering loops, and long-lived sync connection handling. Every step that follows is processed by the same runtime process.
 
 ### Workspace Creation And First User Creation
 
@@ -532,7 +532,7 @@ After receiving a valid IntroOffer, the peer attempts paced QUIC connections to 
 1. Dial attempts are paced at 200ms intervals within the `attempt_window_ms` (default 4s). The 200ms pace is the current implementation default and can be promoted to a tuning knob if field data requires it.
 2. Each attempt uses `endpoint.connect()` on the same QUIC endpoint (sharing the UDP socket and local port).
 3. On successful connection, the peer verifies the remote peer's identity matches the expected `other_peer_id`.
-4. On identity match, a normal sync session runs on the punched connection.
+4. On identity match, a normal sync connection run starts on the punched connection.
 5. The attempt lifecycle is recorded in `intro_attempts` with status transitions: `received → dialing → connected | failed | expired | rejected`.
 
 NAT traversal relies on simultaneous open: both peers dial each other at roughly the same time, creating outgoing NAT mappings that allow the other's packets through.
@@ -799,7 +799,7 @@ Same-host daemon discovery: when two daemons run on the same machine bound to `1
 
 ## 3.2.3 Peering runtime loop model
 
-Runtime flow reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) sections `1` (unified ingest), `2` (sync session control/data), `3` (high-level boundaries), and `4` (runtime topology).
+Runtime flow reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) sections `1` (unified ingest), `2` (sync connection control/data), `3` (high-level boundaries), and `4` (runtime topology).
 
 The production peering runtime follows a single conceptual loop:
 
@@ -1584,7 +1584,7 @@ This approach makes first-user creation and device linking isomorphic to subsequ
 
 1. Inviter projects `user_invite_shared`/`peer_invite_shared` and writes pending bootstrap trust rows from local `bootstrap_context`.
 2. Joiner accepts invite (`invite_accepted`) and writes accepted bootstrap trust rows for its scoped tenant.
-3. Initial sync sessions may authenticate via bootstrap trust rows while full identity events are still converging.
+3. Initial sync connection runs may authenticate via bootstrap trust rows while full identity events are still converging.
 4. `peer_shared` projection consumes matching bootstrap trust rows with deterministic `Delete` write-ops once steady-state PeerShared trust is present.
 5. Ongoing dial/accept checks then use SQL trust queries (`is_authorized_for_tenant`) with no trust writes in read paths.
 

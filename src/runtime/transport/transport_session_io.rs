@@ -373,7 +373,9 @@ mod tests {
     #[tokio::test]
     async fn session_io_encodes_decodes_control_and_data_frames() {
         let (mut parts, control_state, data_send_state) = build_io(
-            vec![Ok(Frame::Done)],
+            vec![Ok(Frame::NeedList {
+                ids: vec![[0x11; 32]],
+            })],
             vec![Ok(Frame::Event {
                 blob: vec![1, 2, 3],
             })],
@@ -382,7 +384,12 @@ mod tests {
         let control_frame = parts.control.recv().await.expect("recv control");
         let (control_msg, consumed) = parse_frame(&control_frame).expect("parse control");
         assert_eq!(consumed, control_frame.len());
-        assert_eq!(control_msg, Frame::Done);
+        assert_eq!(
+            control_msg,
+            Frame::NeedList {
+                ids: vec![[0x11; 32]],
+            }
+        );
 
         let data_frame = parts.data_recv.recv().await.expect("recv data");
         let (data_msg, consumed) = parse_frame(&data_frame).expect("parse data");
@@ -396,8 +403,10 @@ mod tests {
 
         let neg_open = encode_frame(&Frame::NegOpen { msg: vec![9, 8, 7] });
         parts.control.send(&neg_open).await.expect("send control");
-        let data_done = encode_frame(&Frame::DataDone);
-        parts.data_send.send(&data_done).await.expect("send data");
+        let event = encode_frame(&Frame::Event {
+            blob: vec![4, 5, 6],
+        });
+        parts.data_send.send(&event).await.expect("send data");
 
         parts.control.flush().await.expect("control flush");
         parts.data_send.flush().await.expect("data_send flush");
@@ -409,14 +418,19 @@ mod tests {
 
         let data_send = data_send_state.lock().expect("send lock");
         assert_eq!(data_send.sent.len(), 1);
-        assert_eq!(data_send.sent[0], Frame::DataDone);
+        assert_eq!(
+            data_send.sent[0],
+            Frame::Event {
+                blob: vec![4, 5, 6]
+            }
+        );
         assert!(data_send.flushes >= 1);
     }
 
     #[tokio::test]
     async fn send_control_rejects_trailing_bytes() {
         let (mut parts, _control_state, _data_send_state) = build_io(vec![], vec![]);
-        let mut frame = encode_frame(&Frame::Done);
+        let mut frame = encode_frame(&Frame::RequestCredit { credits: 7 });
         frame.push(0);
 
         let err = parts

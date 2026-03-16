@@ -3,7 +3,7 @@
 //! This module owns shared loop orchestration:
 //! - startup preflight/recovery
 //! - shared ingest writer setup
-//! - one long-lived sync session per authenticated connection
+//! - one long-lived sync connection scope per authenticated connection
 
 use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;

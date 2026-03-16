@@ -25,6 +25,15 @@ struct SharedWorkspaceBench {
 }
 
 impl SharedWorkspaceBench {
+    fn enable_sync_logging_for_db(db: &str) {
+        let out = topo_cmd(db, &["sync-log", "enable", "--all-runs"]);
+        assert!(
+            out.status.success(),
+            "sync-log enable failed: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+
     fn new() -> Self {
         let tmpdir = tempfile::tempdir().unwrap();
         let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
@@ -32,6 +41,7 @@ impl SharedWorkspaceBench {
 
         create_workspace(&alice_db);
         wait_for_daemon_stopped(&alice_db, Duration::from_secs(10));
+        Self::enable_sync_logging_for_db(&alice_db);
         let alice_daemon = start_daemon(&alice_db);
 
         let invite_link = create_invite_with_spki(
@@ -41,6 +51,7 @@ impl SharedWorkspaceBench {
         );
         accept_invite_with_identity(&bob_db, &invite_link, "bob", "laptop");
         wait_for_daemon_stopped(&bob_db, Duration::from_secs(10));
+        Self::enable_sync_logging_for_db(&bob_db);
 
         let bob_daemon = start_daemon(&bob_db);
 
@@ -53,17 +64,6 @@ impl SharedWorkspaceBench {
             bob_db,
             alice_daemon,
             bob_daemon,
-        }
-    }
-
-    fn enable_sync_logging(&self) {
-        for db in [&self.alice_db, &self.bob_db] {
-            let out = topo_cmd(db, &["sync-log", "enable", "--all-runs"]);
-            assert!(
-                out.status.success(),
-                "sync-log enable failed: {}",
-                String::from_utf8_lossy(&out.stderr)
-            );
         }
     }
 
@@ -186,7 +186,6 @@ fn duplicate_sends_stay_below_regression_threshold() {
     const N: i64 = 200;
 
     let bench = SharedWorkspaceBench::new();
-    bench.enable_sync_logging();
     let baseline = bench.warm();
 
     let _ = bench.wait_for_events_sent_stable(

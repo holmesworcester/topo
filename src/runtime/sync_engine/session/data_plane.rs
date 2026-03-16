@@ -1,4 +1,4 @@
-//! Data-plane helpers for sync sessions.
+//! Data-plane helpers for long-lived sync connections.
 //!
 //! Owns data-stream and blob-movement concerns:
 //! - inbound event receiver task (`Event`)
@@ -142,7 +142,7 @@ where
 }
 
 /// Spawn data receiver task. Returns:
-/// - `shutdown_tx`: forced shutdown when the owning sync session exits
+/// - `shutdown_tx`: forced shutdown when the owning sync connection exits
 /// - `JoinHandle`: task handle
 ///
 /// Each received event is tagged with `recorded_by` before being sent to the

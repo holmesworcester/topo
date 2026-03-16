@@ -1,4 +1,4 @@
-//! Connect-side loops: outbound QUIC connections and initiator sync sessions.
+//! Connect-side loops: outbound QUIC connections and initiator sync runs.
 
 use std::net::SocketAddr;
 use std::sync::Arc;
@@ -39,10 +39,11 @@ const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
 // Connect loops
 // ---------------------------------------------------------------------------
 
-/// Connect to a remote peer and run initiator sync sessions.
+/// Connect to a remote peer and run initiator sync over that connection.
 ///
-/// Outer loop reconnects on connection drop. Inner loop runs repeated
-/// sync sessions on the same connection.
+/// Outer loop reconnects on connection drop. Each authenticated connection
+/// runs one long-lived sync control/data lane set with repeated discovery
+/// rounds inside it.
 ///
 /// When `client_config` is `Some`, outbound dials present the correct per-tenant
 /// cert and tenant-scoped trust.

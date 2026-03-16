@@ -1,5 +1,5 @@
 //! Accept-side connection loops: incoming QUIC connections and responder
-//! sync sessions.
+//! sync runs.
 
 use std::time::Duration;
 
@@ -34,7 +34,7 @@ const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
 // Accept loops
 // ---------------------------------------------------------------------------
 
-/// Accept incoming connections and run responder sync sessions.
+/// Accept incoming connections and run responder sync on each connection.
 ///
 /// Each incoming connection is handled concurrently. A shared ingest writer
 /// is used for all responder sessions.

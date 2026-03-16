@@ -39,7 +39,8 @@ enum SessionOpenMode {
     Inbound,
 }
 
-/// Transport-owned provider for repeated sync sessions over one QUIC connection.
+/// Transport-owned provider for one long-lived sync control/data lane pair over
+/// one QUIC connection.
 ///
 /// Peering orchestration uses this to avoid touching stream-open details.
 #[derive(Clone)]
@@ -51,7 +52,7 @@ pub struct SessionProvider {
     inbound_state: InboundSessionState,
 }
 
-/// One ready-to-run sync session from a [`SessionProvider`].
+/// One ready-to-run sync connection scope from a [`SessionProvider`].
 pub struct SessionEnvelope {
     /// Hex-encoded peer certificate SPKI fingerprint.
     pub peer_id: String,

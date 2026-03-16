@@ -1,4 +1,4 @@
-//! Control-plane helpers for sync sessions.
+//! Control-plane helpers for long-lived sync connections.
 //!
 //! Owns control-stream message handling concerns:
 //! - Negentropy control messages (`NegOpen` / `NegMsg`)

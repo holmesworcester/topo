@@ -70,7 +70,7 @@ async fn initiator_outbound_sends_markers_then_negopen_then_next_round() {
         let unexpected = peer.recv_data_msg_timeout(Duration::from_millis(250)).await;
         assert!(
             unexpected.is_none(),
-            "expected no per-round DataDone marker, got {:?}",
+            "expected no unsolicited per-round data marker, got {:?}",
             unexpected
         );
 

@@ -48,9 +48,6 @@ pub enum ProtocolViolation {
     /// Inject random garbage bytes as a control frame. The handler should
     /// fail with a parse error when it tries to decode the invalid frame.
     GarbageControlFrame,
-    /// Send the `Done` control message twice. The handler should detect the
-    /// duplicate and either ignore it or error out.
-    DuplicateDone,
 }
 
 /// Configuration for FakeTransportSessionIo failure-mode simulation.
@@ -76,9 +73,7 @@ pub struct FakeIoConfig {
     /// arrives as multiple smaller reads.
     pub fragment_data_frames: bool,
     /// If set, inject a deterministic protocol violation during the session.
-    /// The violation is injected on the control channel at an appropriate
-    /// point (e.g., as the first control frame for `GarbageControlFrame`,
-    /// or after a legitimate `Done` for `DuplicateDone`).
+    /// The violation is injected on the control channel at session start.
     pub inject_protocol_violation: Option<ProtocolViolation>,
 }
 
@@ -192,8 +187,6 @@ struct FakeControlIo {
     violation: Option<ProtocolViolation>,
     /// Number of frames delivered so far (for injection timing).
     recv_count: u64,
-    /// Pending frame to re-deliver (used by DuplicateDone).
-    pending_duplicate: Option<Vec<u8>>,
 }
 
 /// Garbage bytes that cannot be parsed as any valid Frame.
@@ -210,12 +203,6 @@ impl ControlIo for FakeControlIo {
             tokio::time::sleep(delay).await;
         }
 
-        // DuplicateDone: if we have a pending duplicate, deliver it first.
-        if let Some(dup) = self.pending_duplicate.take() {
-            self.recv_count += 1;
-            return Ok(dup);
-        }
-
         // GarbageControlFrame: inject garbage as the very first control frame.
         if self.recv_count == 0 {
             if let Some(ProtocolViolation::GarbageControlFrame) = &self.violation {
@@ -229,14 +216,6 @@ impl ControlIo for FakeControlIo {
             .recv()
             .await
             .ok_or(TransportSessionIoError::ConnectionLost)?;
-
-        // DuplicateDone: when we see a Done frame, queue a duplicate.
-        if let Some(ProtocolViolation::DuplicateDone) = &self.violation {
-            // Done is encoded as a single byte (MSG_TYPE_DONE = 0x20).
-            if frame.len() == 1 && frame[0] == 0x20 {
-                self.pending_duplicate = Some(frame.clone());
-            }
-        }
 
         self.recv_count += 1;
         Ok(frame)
@@ -385,7 +364,6 @@ impl TransportSessionIo for FakeTransportSessionIo {
                 frame_delay: config.frame_delay,
                 violation: config.inject_protocol_violation.clone(),
                 recv_count: 0,
-                pending_duplicate: None,
             }),
             data_send: Box::new(FakeDataSendIo {
                 tx: self.data_out_tx.expect("split called twice"),
