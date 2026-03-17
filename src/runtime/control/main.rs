@@ -4313,6 +4313,14 @@ mod tests {
             CRED_SOURCE_PEER_SHARED,
         )
         .expect("store peershared creds");
+        // Projection pipeline updates the target mapping when InstallPeerSharedIdentityFromSigner runs.
+        set_local_transport_target(
+            &conn,
+            &tenant_peer_id,
+            &tenant_peer_id,
+            CRED_SOURCE_PEER_SHARED,
+        )
+        .expect("update transport target to peershared");
 
         let states = discover_runtime_tenant_states(&db_path).expect("discover peershared state");
         assert_eq!(states.len(), 1);

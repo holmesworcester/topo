@@ -100,10 +100,10 @@ pub struct LocalTransportTarget {
 
 /// Record the tenant's current local transport target.
 ///
-/// This is replay-derived local routing state, not an independent authority
-/// source: projection emits transport identity intents, the adapter applies
-/// them, and this table records which local transport fingerprint is now active
-/// for that tenant.
+/// This is replay-derived local routing state owned by the projection
+/// pipeline (`write_exec.rs`). The adapter materializes cert/key bytes,
+/// and the pipeline records which transport fingerprint is active for
+/// each tenant. This table is the sole authority for tenant discovery.
 pub fn set_local_transport_target(
     conn: &Connection,
     tenant_id: &str,
@@ -342,8 +342,10 @@ pub fn list_local_peers_with_source(
     Ok(keys)
 }
 
-/// Tenant discovery: join invites_accepted with local_transport_creds to find
-/// all local identities that have both a workspace binding and TLS material.
+/// Tenant discovery: resolve local tenants purely from replay-derived
+/// `local_transport_targets` joined with `local_transport_creds` and
+/// `invites_accepted`. No heuristic inference — if the projection
+/// pipeline hasn't recorded a target mapping, the tenant won't appear.
 pub struct TenantInfo {
     pub peer_id: String,
     pub workspace_id: String,
@@ -355,38 +357,7 @@ pub struct TenantInfo {
 pub fn discover_local_tenants(
     conn: &Connection,
 ) -> Result<Vec<TenantInfo>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut tenants = Vec::new();
-    let mut seen_tenants = std::collections::HashSet::new();
-
-    // Preferred case: accepted-workspace binding and transport identity converged
-    // directly on the tenant peer id. This should win over transitional bootstrap
-    // mappings as soon as the final PeerShared transport identity exists.
-    let mut direct_stmt = conn.prepare(
-        "SELECT i.recorded_by, i.workspace_id, c.peer_id, c.cert_der, c.key_der
-         FROM invites_accepted i
-         JOIN local_transport_creds c ON i.recorded_by = c.peer_id
-         ORDER BY i.created_at ASC, i.event_id ASC",
-    )?;
-    let direct_rows = direct_stmt.query_map([], |row| {
-        Ok(TenantInfo {
-            peer_id: row.get(0)?,
-            workspace_id: row.get(1)?,
-            transport_peer_id: row.get(2)?,
-            cert_der: row.get(3)?,
-            key_der: row.get(4)?,
-        })
-    })?;
-    for row in direct_rows {
-        let tenant = row?;
-        if seen_tenants.insert(tenant.peer_id.clone()) {
-            tenants.push(tenant);
-        }
-    }
-
-    // Stable routing state recorded by the identity adapter. This covers
-    // explicit bootstrap targets and post-bootstrap transport aliases for
-    // tenants that do not yet have direct peer-id creds.
-    let mut mapped_stmt = conn.prepare(
+    let mut stmt = conn.prepare(
         "SELECT
              t.tenant_id,
              i.workspace_id,
@@ -407,7 +378,7 @@ pub fn discover_local_tenants(
           )
          ORDER BY i.created_at ASC, i.event_id ASC",
     )?;
-    let mapped_rows = mapped_stmt.query_map([], |row| {
+    let rows = stmt.query_map([], |row| {
         Ok(TenantInfo {
             peer_id: row.get(0)?,
             workspace_id: row.get(1)?,
@@ -416,13 +387,14 @@ pub fn discover_local_tenants(
             key_der: row.get(4)?,
         })
     })?;
-    for row in mapped_rows {
+    let mut tenants = Vec::new();
+    let mut seen_tenants = std::collections::HashSet::new();
+    for row in rows {
         let tenant = row?;
         if seen_tenants.insert(tenant.peer_id.clone()) {
             tenants.push(tenant);
         }
     }
-
     Ok(tenants)
 }
 
@@ -747,5 +719,67 @@ mod tests {
             }
         }
         assert!(has_source, "ensure_schema should add source column");
+    }
+
+    /// Replay test: wipe derived transport tables and rebuild from the same
+    /// state that the projection pipeline would produce. Confirms that
+    /// discover_local_tenants produces identical output before and after.
+    #[test]
+    fn test_discover_local_tenants_survives_replay_of_derived_tables() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        // Seed the projection-derived state that write_exec produces.
+        conn.execute(
+            "INSERT INTO invites_accepted
+             (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES ('tenant-a', 'ia-a', 't-a', 'inv-a', 'ws-a', 1)",
+            [],
+        )
+        .unwrap();
+        store_local_creds_with_source(
+            &conn,
+            "peer-a",
+            b"cert-a",
+            b"key-a",
+            CRED_SOURCE_PEER_SHARED,
+        )
+        .unwrap();
+        set_local_transport_target(&conn, "tenant-a", "peer-a", CRED_SOURCE_PEER_SHARED).unwrap();
+
+        let before = discover_local_tenants(&conn).unwrap();
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].peer_id, "tenant-a");
+        assert_eq!(before[0].transport_peer_id, "peer-a");
+
+        // Simulate replay: wipe derived transport tables, then re-apply.
+        conn.execute_batch(
+            "DELETE FROM local_transport_creds;
+             DELETE FROM local_transport_targets;",
+        )
+        .unwrap();
+
+        let empty = discover_local_tenants(&conn).unwrap();
+        assert!(
+            empty.is_empty(),
+            "after wipe, discover must return empty (no inference)"
+        );
+
+        // Re-apply what the projection pipeline would produce on replay.
+        store_local_creds_with_source(
+            &conn,
+            "peer-a",
+            b"cert-a",
+            b"key-a",
+            CRED_SOURCE_PEER_SHARED,
+        )
+        .unwrap();
+        set_local_transport_target(&conn, "tenant-a", "peer-a", CRED_SOURCE_PEER_SHARED).unwrap();
+
+        let after = discover_local_tenants(&conn).unwrap();
+        assert_eq!(after.len(), 1, "after replay, tenant must be rediscovered");
+        assert_eq!(after[0].peer_id, "tenant-a");
+        assert_eq!(after[0].transport_peer_id, "peer-a");
+        assert_eq!(before[0].workspace_id, after[0].workspace_id);
     }
 }

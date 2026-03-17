@@ -496,6 +496,13 @@ mod tests {
             key.secret_pkcs8_der().as_ref(),
         )
         .unwrap();
+        crate::db::transport_creds::set_local_transport_target(
+            &db,
+            "tenant-a",
+            "tenant-a",
+            crate::db::transport_creds::CRED_SOURCE_PEER_SHARED,
+        )
+        .unwrap();
         db.execute(
             "INSERT INTO invites_accepted
              (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)

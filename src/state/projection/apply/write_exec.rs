@@ -133,11 +133,34 @@ pub(crate) fn execute_emit_commands(
                 )?;
             }
             EmitCommand::ApplyTransportIdentityIntent { intent } => {
-                use crate::contracts::transport_identity_contract::TransportIdentityAdapter;
+                use crate::contracts::transport_identity_contract::{
+                    TransportIdentityAdapter, TransportIdentityIntent,
+                };
                 let adapter = crate::transport::identity_adapter::ConcreteTransportIdentityAdapter;
-                adapter
+                let peer_id = adapter
                     .apply_intent(conn, intent.clone())
                     .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
+                // Target ownership is projection-pipeline-owned, not adapter-owned.
+                let (tenant_id, source) = match &intent {
+                    TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+                        recorded_by,
+                        ..
+                    } => (
+                        recorded_by.as_str(),
+                        crate::db::transport_creds::CRED_SOURCE_BOOTSTRAP,
+                    ),
+                    TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+                        recorded_by,
+                        ..
+                    } => (
+                        recorded_by.as_str(),
+                        crate::db::transport_creds::CRED_SOURCE_PEER_SHARED,
+                    ),
+                };
+                crate::db::transport_creds::set_local_transport_target(
+                    conn, tenant_id, &peer_id, source,
+                )
+                .map_err(|e| -> Box<dyn std::error::Error> { e })?;
             }
             EmitCommand::EmitDeterministicBlob { blob } => {
                 let _ = crate::projection::emit::emit_deterministic_blob(conn, recorded_by, blob)?;

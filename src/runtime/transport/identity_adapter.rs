@@ -1,17 +1,15 @@
 //! Concrete `TransportIdentityAdapter` implementation.
 //!
-//! This is the **sole** module that calls raw transport identity install
-//! functions (`install_peer_key_transport_identity`). All other code
-//! (service, projection, event_modules) must go through the adapter trait.
+//! This is a **pure materializer**: it generates cert/key bytes from
+//! event-derived signing keys and stores them in `local_transport_creds`.
+//! It does NOT record target ownership in `local_transport_targets` —
+//! that is the projection pipeline's responsibility (see `write_exec.rs`).
 
 use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 
 use crate::contracts::transport_identity_contract::{
     TransportIdentityAdapter, TransportIdentityError, TransportIdentityIntent,
-};
-use crate::db::transport_creds::{
-    set_local_transport_target, CRED_SOURCE_BOOTSTRAP, CRED_SOURCE_PEER_SHARED,
 };
 
 /// Production adapter backed by `transport::identity` install functions.
@@ -69,8 +67,6 @@ impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
                         &signing_key,
                     )
                     .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))?;
-                set_local_transport_target(conn, &recorded_by, &peer_id, CRED_SOURCE_BOOTSTRAP)
-                    .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))?;
                 Ok(peer_id)
             }
             TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
@@ -105,8 +101,6 @@ impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
                     &signing_key,
                 )
                 .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))?;
-                set_local_transport_target(conn, &recorded_by, &peer_id, CRED_SOURCE_PEER_SHARED)
-                    .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))?;
                 Ok(peer_id)
             }
         }
