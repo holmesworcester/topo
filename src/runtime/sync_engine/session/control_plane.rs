@@ -171,15 +171,20 @@ pub async fn send_forward_on_have_hints<C>(
 where
     C: StreamConn,
 {
+    // Cap total items consumed from the receiver, not just unique forwarded IDs.
+    // Self-hints and duplicates count toward the cap so a backlog of filtered
+    // items cannot drain the channel unboundedly in a single tick.
     let cap = need_chunk();
+    let mut drained = 0usize;
     let mut ids = Vec::new();
     let mut seen = std::collections::HashSet::new();
     loop {
-        if ids.len() >= cap {
+        if drained >= cap {
             break;
         }
         match receiver.try_recv() {
             Ok(hint) => {
+                drained += 1;
                 if hint.source_peer_id.as_deref() == Some(peer_id) {
                     continue;
                 }
