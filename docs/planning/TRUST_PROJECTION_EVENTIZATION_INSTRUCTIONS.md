@@ -33,8 +33,9 @@ Use a small local durable context table (projection input), e.g. `bootstrap_cont
 
 Service/bootstrap code may write context rows, but should not write trust rows directly.
 
-### C) Trust checks are read-only
-Completed: `is_authorized_for_tenant` and related auth helpers are now pure SQL reads over projected trust rows. Supersession side effects live in projection/maintenance paths, not in transport trust checks.
+### C) Trust checks become read-only (preferred)
+`is_authorized_for_tenant` currently performs supersede updates on read.
+Target: move supersession side effects into projection/maintenance path so trust checks are pure reads.
 
 ### D) Root-event guard cascade pattern (poc-6 -> poc-7)
 Use `poc-6` as the reference pattern for trust-anchor-driven root validity:
@@ -68,8 +69,8 @@ Mapping:
 2. In `InviteAccepted` projection handling, materialize accepted bootstrap trust using context + event IDs.
 
 ### Phase 5: Optional cleanup
-1. Keep trust check paths read-only.
-2. Keep supersession in projection-triggered maintenance or explicit sweeper paths, not on auth reads.
+1. Make trust check path read-only by removing supersede-on-read mutations.
+2. Perform supersession in projection-triggered maintenance or explicit sweeper path.
 
 ## File Starting Points
 - `src/service.rs`
@@ -90,7 +91,7 @@ Mapping:
 1. queue/lease state: `project_queue`, `egress_queue`, `wanted_events`
 2. reconciliation caches: `neg_items`, `neg_blocks`, `neg_meta`
 3. runtime observations/telemetry: `peer_endpoint_observations`, `intro_attempts`, `peer_transport_bindings`
-4. transport certificate/key cache (`local_transport_creds`) and local routing cache (`local_transport_targets`) when they are derivable from event-projected signer state
+4. transport certificate/key cache (`local_transport_creds`) when it is derivable from event-projected signer state
 
 Rule of thumb:
 - durable semantic state (shared or local) => event + projection

@@ -58,7 +58,6 @@ Library-level integration tests using `Peer` + `ScenarioHarness` (no CLI binary)
 | `identity_transport_contract_tests/` | Transport identity adapter conformance |
 | `holepunch_test.rs` | QUIC holepunch intro flow |
 | `daemon_perf_test.rs` | Daemon-based sync throughput benchmarks (warm-start timing, per-daemon VmHWM) |
-| `daemon_realistic_network_perf_test.rs` | Daemon-based sync throughput matrix over shaped realistic WAN profiles (`cable`, `dsl`, `mobile`, `slow-mobile`, `starlink`) |
 | `sync_graph_test.rs` | Legacy in-process chain and catchup benchmarks |
 | `topo_cascade_test.rs` | SQLite topo-sort cascade performance |
 | `file_throughput_test.rs` | File-slice insertion throughput |
@@ -96,21 +95,4 @@ cargo build --release
 sudo tests/netns_nat_test.sh              # cone NAT (expected PASS)
 sudo tests/netns_nat_test.sh --symmetric  # symmetric NAT (expected FAIL)
 sudo tests/netns_nat_test.sh --cleanup    # remove leftover namespaces
-```
-
-## Realistic network perf matrix
-
-Run the shaped-network daemon perf suite explicitly because every scenario is
-ignored by default:
-
-```bash
-cargo test --release --test daemon_realistic_network_perf_test perf_sync_10k_realistic_profiles -- --ignored --nocapture --test-threads=1
-python3 scripts/run_perf_serial.py network
-```
-
-Useful environment filters:
-
-```bash
-PERF_REALISTIC_NETWORK_PROFILES=cable,starlink
-PERF_REALISTIC_NETWORK_REPEATS=3
 ```

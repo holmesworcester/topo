@@ -9,8 +9,20 @@ pub const SQL_INSERT_EVENT: &str =
 pub const SQL_INSERT_NEG_ITEM: &str =
     "INSERT OR IGNORE INTO neg_items (workspace_id, ts, id) VALUES (?1, ?2, ?3)";
 pub const SQL_INSERT_RECORDED_EVENT: &str =
-    "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
-     VALUES (?1, ?2, ?3, ?4)";
+    "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, received_at_ms, source)
+     VALUES (?1, ?2, ?3, ?4, ?5)";
+
+fn recorded_events_column_exists(conn: &Connection, column: &str) -> SqliteResult<bool> {
+    let mut stmt = conn.prepare("PRAGMA table_info(recorded_events)")?;
+    let mut rows = stmt.query([])?;
+    while let Some(row) = rows.next()? {
+        let name: String = row.get(1)?;
+        if name == column {
+            return Ok(true);
+        }
+    }
+    Ok(false)
+}
 
 pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     conn.execute_batch(
@@ -29,6 +41,7 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
             peer_id TEXT NOT NULL,
             event_id TEXT NOT NULL,
             recorded_at INTEGER NOT NULL,
+            received_at_ms INTEGER,
             source TEXT NOT NULL,
             UNIQUE(peer_id, event_id)
         );
@@ -52,6 +65,31 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
             key TEXT PRIMARY KEY,
             value INTEGER NOT NULL
         );
+        ",
+    )?;
+    if !recorded_events_column_exists(conn, "received_at_ms")? {
+        conn.execute(
+            "ALTER TABLE recorded_events ADD COLUMN received_at_ms INTEGER",
+            [],
+        )?;
+    }
+    conn.execute(
+        "UPDATE recorded_events
+         SET received_at_ms = recorded_at
+         WHERE received_at_ms IS NULL",
+        [],
+    )?;
+    conn.execute_batch(
+        "
+        CREATE TRIGGER IF NOT EXISTS trg_recorded_events_default_received_at
+        AFTER INSERT ON recorded_events
+        FOR EACH ROW
+        WHEN NEW.received_at_ms IS NULL
+        BEGIN
+            UPDATE recorded_events
+            SET received_at_ms = NEW.recorded_at
+            WHERE id = NEW.id;
+        END;
         ",
     )?;
     Ok(())
@@ -124,6 +162,26 @@ pub fn lookup_workspace_id(conn: &Connection, peer_id: &str) -> Option<String> {
     .expect("lookup_workspace_id: unexpected DB error querying invites_accepted")
 }
 
+pub fn insert_recorded_event_checked(
+    conn: &Connection,
+    peer_id: &str,
+    event_id: &EventId,
+    recorded_at_ms: i64,
+    source: &str,
+) -> SqliteResult<bool> {
+    let event_id_b64 = event_id_to_base64(event_id);
+    Ok(conn.execute(
+        SQL_INSERT_RECORDED_EVENT,
+        params![
+            peer_id,
+            &event_id_b64,
+            recorded_at_ms,
+            recorded_at_ms,
+            source
+        ],
+    )? > 0)
+}
+
 pub fn insert_recorded_event(
     conn: &Connection,
     peer_id: &str,
@@ -131,11 +189,7 @@ pub fn insert_recorded_event(
     recorded_at_ms: i64,
     source: &str,
 ) -> SqliteResult<()> {
-    let event_id_b64 = event_id_to_base64(event_id);
-    conn.execute(
-        SQL_INSERT_RECORDED_EVENT,
-        params![peer_id, &event_id_b64, recorded_at_ms, source],
-    )?;
+    let _ = insert_recorded_event_checked(conn, peer_id, event_id, recorded_at_ms, source)?;
     Ok(())
 }
 
@@ -268,5 +322,60 @@ mod tests {
         ).unwrap();
 
         assert!(store.exists(&id).unwrap());
+    }
+
+    #[test]
+    fn ensure_schema_backfills_received_at_ms_for_legacy_rows() {
+        let conn = open_in_memory().unwrap();
+        conn.execute_batch(
+            "
+            CREATE TABLE recorded_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                peer_id TEXT NOT NULL,
+                event_id TEXT NOT NULL,
+                recorded_at INTEGER NOT NULL,
+                source TEXT NOT NULL,
+                UNIQUE(peer_id, event_id)
+            );
+            INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
+            VALUES ('peer-a', 'evt-1', 1234, 'legacy');
+            ",
+        )
+        .unwrap();
+
+        ensure_schema(&conn).unwrap();
+
+        let received_at_ms: i64 = conn
+            .query_row(
+                "SELECT received_at_ms
+                 FROM recorded_events
+                 WHERE peer_id = 'peer-a' AND event_id = 'evt-1'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(received_at_ms, 1234);
+    }
+
+    #[test]
+    fn direct_recorded_event_inserts_default_received_at_ms_to_recorded_at() {
+        let conn = setup();
+        conn.execute(
+            "INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, ?3, ?4)",
+            params!["peer-a", "evt-2", 5678i64, "test"],
+        )
+        .unwrap();
+
+        let received_at_ms: i64 = conn
+            .query_row(
+                "SELECT received_at_ms
+                 FROM recorded_events
+                 WHERE peer_id = ?1 AND event_id = ?2",
+                params!["peer-a", "evt-2"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(received_at_ms, 5678);
     }
 }

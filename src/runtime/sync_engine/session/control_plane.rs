@@ -7,12 +7,14 @@
 //!   via the shared in-memory coordinator
 
 use negentropy::Id;
+use tokio::sync::broadcast;
 use tracing::info;
 
 use crate::crypto::EventId;
 use crate::db::timeline::EventTimeline;
 use crate::db::wanted::WantedEvents;
 use crate::protocol::{neg_id_to_event_id, Frame};
+use crate::state::live_hints::LiveHint;
 use crate::transport::StreamConn;
 
 use super::{connection_scope::ConnectionRequestState, coordinator::PeerCoord, need_chunk};
@@ -129,13 +131,70 @@ where
             ids.push(neg_id_to_event_id(&neg_id));
         }
         sent_ids_out.extend_from_slice(&ids);
-        let sent_at = crate::db::queue::current_timestamp_ms();
-        sent += ids.len();
-        let _ = timeline.mark_need_list_sent_many(&ids, sent_at);
-        control.send(&Frame::NeedList { ids }).await?;
+        sent += send_need_list_for_event_ids(control, timeline, &ids).await?;
+    }
+    Ok(sent)
+}
+
+pub async fn send_need_list_for_event_ids<C>(
+    control: &mut C,
+    timeline: &EventTimeline<'_>,
+    ids: &[EventId],
+) -> Result<usize, SyncError>
+where
+    C: StreamConn,
+{
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    let batch_size = need_chunk().max(1);
+    let sent_at = crate::db::queue::current_timestamp_ms();
+    for chunk in ids.chunks(batch_size) {
+        control
+            .send(&Frame::NeedList {
+                ids: chunk.to_vec(),
+            })
+            .await?;
     }
     control.flush().await?;
-    Ok(sent)
+    let _ = timeline.mark_need_list_sent_many(ids, sent_at);
+    Ok(ids.len())
+}
+
+pub async fn send_forward_on_have_hints<C>(
+    control: &mut C,
+    timeline: &EventTimeline<'_>,
+    peer_id: &str,
+    receiver: &mut broadcast::Receiver<LiveHint>,
+) -> Result<usize, SyncError>
+where
+    C: StreamConn,
+{
+    let mut ids = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        match receiver.try_recv() {
+            Ok(hint) => {
+                if hint.source_peer_id.as_deref() == Some(peer_id) {
+                    continue;
+                }
+                if seen.insert(hint.event_id) {
+                    ids.push(hint.event_id);
+                }
+            }
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                info!(
+                    peer = %peer_id,
+                    skipped,
+                    "forward-on-have hint receiver lagged; periodic negentropy will repair misses"
+                );
+            }
+            Err(broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+    send_need_list_for_event_ids(control, timeline, &ids).await
 }
 
 /// Keep the peer's request window topped up from durable `wanted` state.

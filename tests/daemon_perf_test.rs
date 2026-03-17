@@ -281,18 +281,7 @@ fn format_bench_diagnostics(db: &str) -> String {
         if let Some(rows) = rows {
             out.push_str("  recent_runs:\n");
             for row in rows.flatten() {
-                let (
-                    run_id,
-                    direction,
-                    role,
-                    rounds,
-                    sent,
-                    recv,
-                    bytes_sent,
-                    bytes_recv,
-                    outcome,
-                    error,
-                ) = row;
+                let (run_id, direction, role, rounds, sent, recv, bytes_sent, bytes_recv, outcome, error) = row;
                 out.push_str(&format!(
                     "    run_id={run_id} {direction}/{role} rounds={rounds} sent={sent} recv={recv} bytes_sent={bytes_sent} bytes_recv={bytes_recv} outcome={outcome}"
                 ));

@@ -8,12 +8,14 @@ use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::store::lookup_workspace_id;
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::{self as events, registry::EventRegistry, ShareScope};
+use crate::state::live_hints::{source_peer_id_from_source_tag, LiveHintEvent};
 use crate::state::shared_workspace_fanout::SharedEventFanout;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct PersistPhaseOutput {
     pub persisted_event_ids: Vec<EventId>,
     pub tenants_seen: HashSet<String>,
+    pub live_hints: Vec<LiveHintEvent>,
     pub shared_event_fanouts: Vec<SharedEventFanout>,
 }
 
@@ -38,6 +40,7 @@ pub(super) fn run_persist_phase(
     let mut persist_output = PersistPhaseOutput {
         persisted_event_ids: Vec::with_capacity(batch.len()),
         tenants_seen: HashSet::new(),
+        live_hints: Vec::new(),
         shared_event_fanouts: Vec::new(),
     };
 
@@ -98,15 +101,23 @@ pub(super) fn run_persist_phase(
                     }
 
                     let recorded_at = current_timestamp_ms();
-                    if let Err(e) = recorded_stmt.execute(rusqlite::params![
+                    let recorded_inserted = match recorded_stmt.execute(rusqlite::params![
                         recorded_by,
                         &event_id_b64,
                         recorded_at,
+                        received_at_ms,
                         source_tag
                     ]) {
-                        tracing::warn!("recorded_events insert error for {}: {}", event_id_b64, e);
-                        continue;
-                    }
+                        Ok(rows) => rows > 0,
+                        Err(e) => {
+                            tracing::warn!(
+                                "recorded_events insert error for {}: {}",
+                                event_id_b64,
+                                e
+                            );
+                            continue;
+                        }
+                    };
                     let _ = timeline.mark_persisted_b64(&event_id_b64, recorded_at);
 
                     // Enqueue for durable projection (atomicity boundary 1)
@@ -129,6 +140,13 @@ pub(super) fn run_persist_phase(
 
                     persist_output.tenants_seen.insert(recorded_by.clone());
                     persist_output.persisted_event_ids.push(*event_id);
+                    if recorded_inserted && meta.share_scope == ShareScope::Shared {
+                        persist_output.live_hints.push(LiveHintEvent {
+                            tenant_id: recorded_by.clone(),
+                            event_id: *event_id,
+                            source_peer_id: source_peer_id_from_source_tag(source_tag),
+                        });
+                    }
                     if meta.share_scope == ShareScope::Shared {
                         if let Some(workspace_id) = if meta.type_name == "workspace" {
                             Some(event_id_b64.clone())
@@ -206,12 +224,13 @@ mod tests {
         }))
         .unwrap();
         let event_id = hash_event(&blob);
+        let received_at_ms = 456i64;
         let batch = vec![(
             event_id,
             blob,
             "peer-alpha".to_string(),
             "sync".to_string(),
-            0,
+            received_at_ms,
         )];
 
         let output = run_persist_phase(
@@ -236,5 +255,23 @@ mod tests {
             )
             .unwrap();
         assert_eq!(priority_lane, 2);
+        let stored_received_at_ms: i64 = db
+            .query_row(
+                "SELECT received_at_ms
+                 FROM recorded_events
+                 WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params!["peer-alpha", event_id_to_base64(&event_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(stored_received_at_ms, received_at_ms);
+        assert_eq!(
+            output.live_hints,
+            vec![LiveHintEvent {
+                tenant_id: "peer-alpha".to_string(),
+                event_id,
+                source_peer_id: None,
+            }]
+        );
     }
 }

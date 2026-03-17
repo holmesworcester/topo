@@ -1,6 +1,6 @@
 use super::*;
 use crate::crypto::{event_id_to_base64, EventId};
-use crate::db::{open_in_memory, schema::create_tables};
+use crate::db::{open_connection, open_in_memory, schema::create_tables};
 use ed25519_dalek::SigningKey;
 
 fn peer_id_for_signing_key(key: &SigningKey) -> String {
@@ -448,5 +448,84 @@ fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
     assert_eq!(
         blocked_count, 0,
         "device link should not leave blocked local events"
+    );
+}
+
+#[test]
+fn join_workspace_seed_replay_emits_live_hints_for_existing_shared_events() {
+    let dir = tempfile::tempdir().expect("create tempdir");
+    let db_path = dir.path().join("db.sqlite");
+    let db_path = db_path.to_string_lossy().to_string();
+    let conn = open_connection(&db_path).expect("open db");
+    create_tables(&conn).expect("create tables");
+
+    let workspace =
+        create_workspace(&conn, "bootstrap", "ws", "alice", "laptop").expect("create workspace");
+    let creator_peer_id = peer_id_for_signing_key(&workspace.peer_shared_key);
+    let creator_admin_eid: EventId = conn
+        .query_row(
+            "SELECT event_id FROM admins WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
+            rusqlite::params![&creator_peer_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
+        .expect("creator admin event");
+    let creator_user_eid: EventId = conn
+        .query_row(
+            "SELECT event_id FROM users WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
+            rusqlite::params![&creator_peer_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
+        .expect("creator user event");
+    let seeded_message_id = crate::event_modules::message::commands::create(
+        &conn,
+        &creator_peer_id,
+        &workspace.peer_shared_event_id,
+        &workspace.peer_shared_key,
+        7,
+        crate::event_modules::message::commands::CreateMessageCmd {
+            workspace_id: workspace.workspace_id,
+            author_id: creator_user_eid,
+            content: "seeded-before-join".to_string(),
+        },
+    )
+    .expect("create seeded message");
+    let invite = create_user_invite_raw(
+        &conn,
+        &creator_peer_id,
+        &workspace.peer_shared_key,
+        &workspace.peer_shared_event_id,
+        &creator_admin_eid,
+        &workspace.workspace_id,
+    )
+    .expect("create invite");
+
+    let bob_key = SigningKey::from_bytes(&[9u8; 32]);
+    let bob_peer_id = peer_id_for_signing_key(&bob_key);
+    let mut rx = crate::state::live_hints::subscribe(&db_path, &bob_peer_id);
+
+    let _join = join_workspace_as_new_user(
+        &conn,
+        &bob_peer_id,
+        &invite.invite_key,
+        &invite.invite_event_id,
+        workspace.workspace_id,
+        "bob",
+        "tablet",
+        bob_key,
+    )
+    .expect("join workspace");
+
+    let mut hinted = std::collections::HashSet::new();
+    while let Ok(hint) = rx.try_recv() {
+        hinted.insert(hint.event_id);
+    }
+
+    assert!(
+        hinted.contains(&seeded_message_id),
+        "same-workspace seed replay should emit a live hint for preexisting shared messages"
     );
 }

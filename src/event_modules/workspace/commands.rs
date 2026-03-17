@@ -19,7 +19,7 @@ use std::collections::HashSet;
 
 use crate::crypto::EventId;
 use crate::crypto::{event_id_from_base64, event_id_to_base64};
-use crate::db::store::insert_recorded_event;
+use crate::db::store::insert_recorded_event_checked;
 use crate::event_modules::{
     peer_secret::PeerSecretEvent, AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, ParsedEvent,
     PeerSharedEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
@@ -29,6 +29,7 @@ use crate::projection::create::{
     create_event_staged, create_event_synchronous, create_signed_event_synchronous,
     event_id_or_blocked, project_event,
 };
+use crate::state::live_hints::{self, LiveHintEvent};
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -123,6 +124,8 @@ fn replay_existing_workspace_shared_events_for_tenant(
 
     let pq = crate::state::db::project_queue::ProjectQueue::new(db);
     let recorded_at = now_ms() as i64;
+    let publish_after_commit = db.is_autocommit();
+    let mut live_hints = Vec::new();
 
     // Phase 1: Durably record and enqueue ALL events before projecting any.
     // Wrapped in a savepoint so a crash mid-loop cannot leave partial
@@ -130,17 +133,26 @@ fn replay_existing_workspace_shared_events_for_tenant(
     // Uses SAVEPOINT (not BEGIN) to nest safely inside caller transactions.
     db.execute_batch("SAVEPOINT replay_seed")?;
     for event_id in &event_ids {
-        insert_recorded_event(
+        if insert_recorded_event_checked(
             db,
             recorded_by,
             event_id,
             recorded_at,
             "same_workspace_seed",
-        )?;
+        )? {
+            live_hints.push(LiveHintEvent {
+                tenant_id: recorded_by.to_string(),
+                event_id: *event_id,
+                source_peer_id: None,
+            });
+        }
         let event_id_b64 = event_id_to_base64(event_id);
         let _ = pq.enqueue(recorded_by, &event_id_b64);
     }
     db.execute_batch("RELEASE replay_seed")?;
+    if publish_after_commit {
+        live_hints::publish_from_connection(db, &live_hints);
+    }
 
     // Phase 2: Project inline and clean up queue entries.
     // Blocked events (e.g. encrypted events whose key_secret hasn't been

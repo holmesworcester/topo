@@ -25,6 +25,7 @@ use crate::runtime::build_mismatch::recent_build_mismatch_reason;
 use crate::runtime::memtrace;
 use crate::runtime::repeated_warning::should_emit_globally;
 use crate::runtime::SyncStats;
+use crate::state::live_hints;
 use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
@@ -34,8 +35,9 @@ use crate::tuning::{
 
 use super::connection_scope::{ConnectionRequestState, ConnectionResponseState};
 use super::control_plane::{
-    observe_need_ids_for_peer, refill_wanted_requests, send_initial_neg_open,
-    send_need_list_from_have_ids, send_request_credit,
+    observe_event_ids_for_peer, observe_need_ids_for_peer, refill_wanted_requests,
+    send_forward_on_have_hints, send_initial_neg_open, send_need_list_from_have_ids,
+    send_request_credit,
 };
 use super::coordinator::PeerCoord;
 use super::data_plane::{drain_pending_responses_to_data_stream, spawn_data_receiver};
@@ -44,8 +46,8 @@ use super::windowing::{
     encode_initial_neg_open, mark_outbound_full_completed, select_outbound_window, SyncWindowKind,
 };
 use super::{
-    negentropy_frame_size, send_idle_capture_enabled, CONTROL_POLL_TIMEOUT, DISCOVERY_ROUND_GAP,
-    INITIAL_CONTROL_PROGRESS_TIMEOUT,
+    discovery_round_gap, forward_on_have_enabled, negentropy_frame_size, send_idle_capture_enabled,
+    CONTROL_POLL_TIMEOUT, INITIAL_CONTROL_PROGRESS_TIMEOUT,
 };
 
 fn should_treat_as_startup_control_abort(
@@ -144,6 +146,8 @@ where
     let mut last_idle_marker = Instant::now();
     let credit_high = request_credit_high_watermark().max(1);
     let credit_low = request_credit_low_watermark().min(credit_high.saturating_sub(1));
+    let forward_on_have = forward_on_have_enabled();
+    let mut forward_hint_rx = forward_on_have.then(|| live_hints::subscribe(db_path, recorded_by));
     let mut rounds_total = 0u64;
     let mut next_round_due = Instant::now();
     let mut observed_initial_control_progress = false;
@@ -294,6 +298,26 @@ where
                             response_state.consume_requests(&ids);
                         }
                     }
+                    Ok(Ok(Frame::NeedList { ids })) => {
+                        last_activity = Instant::now();
+                        let need_received_at = current_timestamp_ms();
+                        let _ = timeline.mark_need_list_received_many(&ids, need_received_at);
+                        let observed = observe_event_ids_for_peer(
+                            &wanted,
+                            &timeline,
+                            recorded_by,
+                            peer_id,
+                            need_received_at,
+                            &ids,
+                            &mut round_observed_ids,
+                        )?;
+                        if observed > 0 {
+                            info!(
+                                "Observed {} needed IDs from peer {} via NeedList",
+                                observed, peer_id
+                            );
+                        }
+                    }
                     Ok(Ok(Frame::RequestCredit { credits })) => {
                         last_activity = Instant::now();
                         request_state.add_credit(credits as usize, current_timestamp_ms());
@@ -374,6 +398,15 @@ where
                 .await?;
                 if requested_now > 0 {
                     last_activity = Instant::now();
+                }
+
+                if let Some(receiver) = forward_hint_rx.as_mut() {
+                    let hinted =
+                        send_forward_on_have_hints(&mut control, &timeline, peer_id, receiver)
+                            .await?;
+                    if hinted > 0 {
+                        last_activity = Instant::now();
+                    }
                 }
 
                 let send_stats = drain_pending_responses_to_data_stream(
@@ -502,7 +535,7 @@ where
             if use_snapshot {
                 let _ = neg_db.execute("COMMIT", []);
             }
-            next_round_due = Instant::now() + DISCOVERY_ROUND_GAP;
+            next_round_due = Instant::now() + discovery_round_gap();
             continue;
         }
 
@@ -517,6 +550,27 @@ where
             Ok(Ok(Frame::RequestCredit { credits })) => {
                 last_activity = Instant::now();
                 request_state.add_credit(credits as usize, current_timestamp_ms());
+            }
+            Ok(Ok(Frame::NeedList { ids })) => {
+                last_activity = Instant::now();
+                let need_received_at = current_timestamp_ms();
+                let _ = timeline.mark_need_list_received_many(&ids, need_received_at);
+                let mut observed_ids = Vec::new();
+                let observed = observe_event_ids_for_peer(
+                    &wanted,
+                    &timeline,
+                    recorded_by,
+                    peer_id,
+                    need_received_at,
+                    &ids,
+                    &mut observed_ids,
+                )?;
+                if observed > 0 {
+                    info!(
+                        "Observed {} needed IDs from peer {} via NeedList",
+                        observed, peer_id
+                    );
+                }
             }
             Ok(Ok(_)) => {}
             Ok(Err(ConnectionError::Closed)) => {
@@ -573,6 +627,14 @@ where
         .await?;
         if requested_now > 0 {
             last_activity = Instant::now();
+        }
+
+        if let Some(receiver) = forward_hint_rx.as_mut() {
+            let hinted =
+                send_forward_on_have_hints(&mut control, &timeline, peer_id, receiver).await?;
+            if hinted > 0 {
+                last_activity = Instant::now();
+            }
         }
 
         let send_stats = drain_pending_responses_to_data_stream(

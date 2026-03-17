@@ -5,12 +5,13 @@ use super::apply::project_one;
 use super::decision::ProjectionDecision;
 use crate::crypto::{event_id_to_base64, hash_event, EventId};
 use crate::db::store::{
-    insert_event, insert_neg_item_if_shared, insert_recorded_event, lookup_workspace_id,
+    insert_event, insert_neg_item_if_shared, insert_recorded_event_checked, lookup_workspace_id,
 };
 use crate::event_modules::EncryptedEvent;
 use crate::event_modules::{self as events, registry, ParsedEvent, TransportPrivacy};
 use crate::projection::encrypted::encrypt_event_blob;
 use crate::projection::signer::sign_event_bytes;
+use crate::state::live_hints::{self, LiveHintEvent};
 use crate::state::shared_workspace_fanout::fanout_stored_shared_event_inline;
 use ed25519_dalek::SigningKey;
 
@@ -88,6 +89,28 @@ impl CreateAttemptOutcome {
     }
 }
 
+#[derive(Debug)]
+struct StoredBlob {
+    event_id: EventId,
+    live_hints: Vec<LiveHintEvent>,
+}
+
+#[derive(Debug)]
+struct StoredProjectionOutcome {
+    outcome: CreateAttemptOutcome,
+    live_hints: Vec<LiveHintEvent>,
+}
+
+fn publish_live_hints_after_commit(
+    conn: &Connection,
+    publish_after_commit: bool,
+    live_hints: &[LiveHintEvent],
+) {
+    if publish_after_commit {
+        live_hints::publish_from_connection(conn, live_hints);
+    }
+}
+
 /// Extract event_id from Ok or Blocked (event is stored in both cases).
 /// Returns Err only for true failures (encode, db, rejected).
 ///
@@ -111,7 +134,7 @@ fn store_blob_only(
     blob: &[u8],
     meta: &events::EventTypeMeta,
     created_at_ms: i64,
-) -> Result<EventId, CreateEventError> {
+) -> Result<StoredBlob, CreateEventError> {
     let event_id = hash_event(blob);
 
     let now_ms = SystemTime::now()
@@ -147,10 +170,26 @@ fn store_blob_only(
         );
     }
 
-    insert_recorded_event(conn, recorded_by, &event_id, now_ms, "local_create")
-        .map_err(|e| CreateEventError::DbError(e.to_string()))?;
+    let recorded_inserted =
+        insert_recorded_event_checked(conn, recorded_by, &event_id, now_ms, "local_create")
+            .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
-    Ok(event_id)
+    let live_hints = if recorded_inserted
+        && meta.share_scope == crate::event_modules::registry::ShareScope::Shared
+    {
+        vec![LiveHintEvent {
+            tenant_id: recorded_by.to_string(),
+            event_id,
+            source_peer_id: None,
+        }]
+    } else {
+        Vec::new()
+    };
+
+    Ok(StoredBlob {
+        event_id,
+        live_hints,
+    })
 }
 
 /// Project a stored event and return the committed projection outcome.
@@ -158,23 +197,39 @@ fn project_stored_event_outcome(
     conn: &Connection,
     recorded_by: &str,
     event_id: &EventId,
-) -> Result<CreateAttemptOutcome, CreateEventError> {
+) -> Result<StoredProjectionOutcome, CreateEventError> {
     let decision = project_one(conn, recorded_by, event_id)
         .map_err(|e| CreateEventError::DbError(e.to_string()))?;
 
     match decision {
         ProjectionDecision::Valid | ProjectionDecision::AlreadyProcessed => {
-            fanout_stored_shared_event_inline(conn, recorded_by, event_id)
+            let sibling_tenants = fanout_stored_shared_event_inline(conn, recorded_by, event_id)
                 .map_err(|e| CreateEventError::DbError(e.to_string()))?;
-            Ok(CreateAttemptOutcome::Success(*event_id))
+            Ok(StoredProjectionOutcome {
+                outcome: CreateAttemptOutcome::Success(*event_id),
+                live_hints: sibling_tenants
+                    .into_iter()
+                    .map(|tenant_id| LiveHintEvent {
+                        tenant_id,
+                        event_id: *event_id,
+                        source_peer_id: None,
+                    })
+                    .collect(),
+            })
         }
-        ProjectionDecision::Block { missing } => Ok(CreateAttemptOutcome::Blocked {
-            event_id: *event_id,
-            missing,
+        ProjectionDecision::Block { missing } => Ok(StoredProjectionOutcome {
+            outcome: CreateAttemptOutcome::Blocked {
+                event_id: *event_id,
+                missing,
+            },
+            live_hints: Vec::new(),
         }),
-        ProjectionDecision::Reject { reason } => Ok(CreateAttemptOutcome::Rejected {
-            event_id: *event_id,
-            reason,
+        ProjectionDecision::Reject { reason } => Ok(StoredProjectionOutcome {
+            outcome: CreateAttemptOutcome::Rejected {
+                event_id: *event_id,
+                reason,
+            },
+            live_hints: Vec::new(),
         }),
     }
 }
@@ -184,7 +239,16 @@ fn project_event_outcome(
     recorded_by: &str,
     event_id: &EventId,
 ) -> Result<CreateAttemptOutcome, CreateEventError> {
-    project_stored_event_outcome(conn, recorded_by, event_id)
+    let publish_after_commit = conn.is_autocommit();
+    let projected = if publish_after_commit {
+        crate::state::db::queue::with_immediate_tx_result(conn, || {
+            project_stored_event_outcome(conn, recorded_by, event_id)
+        })?
+    } else {
+        project_stored_event_outcome(conn, recorded_by, event_id)?
+    };
+    publish_live_hints_after_commit(conn, publish_after_commit, &projected.live_hints);
+    Ok(projected.outcome)
 }
 
 fn store_blob_then_project_with<F>(
@@ -199,15 +263,26 @@ where
     F: FnOnce(&Connection, &EventId) -> Result<(), CreateEventError>,
 {
     let mut post_store = Some(post_store);
-    let outcome = crate::state::db::queue::with_immediate_tx_result(conn, || {
-        let event_id = store_blob_only(conn, recorded_by, blob, meta, created_at_ms)?;
-        let post_store = post_store
-            .take()
-            .expect("store_blob_then_project_with closure invoked more than once");
-        post_store(conn, &event_id)?;
-        project_stored_event_outcome(conn, recorded_by, &event_id)
-    })?;
-    outcome.into_result()
+    let publish_after_commit = conn.is_autocommit();
+    let outcome = crate::state::db::queue::with_immediate_tx_result(
+        conn,
+        || -> Result<StoredProjectionOutcome, CreateEventError> {
+            let stored = store_blob_only(conn, recorded_by, blob, meta, created_at_ms)?;
+            let post_store = post_store
+                .take()
+                .expect("store_blob_then_project_with closure invoked more than once");
+            post_store(conn, &stored.event_id)?;
+            let projected = project_stored_event_outcome(conn, recorded_by, &stored.event_id)?;
+            let mut live_hints = stored.live_hints;
+            live_hints.extend(projected.live_hints);
+            Ok(StoredProjectionOutcome {
+                outcome: projected.outcome,
+                live_hints,
+            })
+        },
+    )?;
+    publish_live_hints_after_commit(conn, publish_after_commit, &outcome.live_hints);
+    outcome.outcome.into_result()
 }
 
 /// Shared helper: hash blob, write to events/neg_items/recorded_events, project via project_one.
@@ -306,7 +381,16 @@ pub fn store_signed_event_only(
     blob[blob_len - sig_len..].copy_from_slice(&sig);
 
     let created_at_ms = event.created_at_ms() as i64;
-    store_blob_only(conn, recorded_by, &blob, meta, created_at_ms)
+    let publish_after_commit = conn.is_autocommit();
+    let stored = if publish_after_commit {
+        crate::state::db::queue::with_immediate_tx_result(conn, || {
+            store_blob_only(conn, recorded_by, &blob, meta, created_at_ms)
+        })?
+    } else {
+        store_blob_only(conn, recorded_by, &blob, meta, created_at_ms)?
+    };
+    publish_live_hints_after_commit(conn, publish_after_commit, &stored.live_hints);
+    Ok(stored.event_id)
 }
 
 /// Rare explicit two-phase create path:
@@ -368,7 +452,16 @@ pub fn store_event_only(
         .ok_or_else(|| CreateEventError::EncodeError(format!("unknown type code {}", type_code)))?;
 
     let created_at_ms = event.created_at_ms() as i64;
-    store_blob_only(conn, recorded_by, &blob, meta, created_at_ms)
+    let publish_after_commit = conn.is_autocommit();
+    let stored = if publish_after_commit {
+        crate::state::db::queue::with_immediate_tx_result(conn, || {
+            store_blob_only(conn, recorded_by, &blob, meta, created_at_ms)
+        })?
+    } else {
+        store_blob_only(conn, recorded_by, &blob, meta, created_at_ms)?
+    };
+    publish_live_hints_after_commit(conn, publish_after_commit, &stored.live_hints);
+    Ok(stored.event_id)
 }
 
 /// Project a previously-stored event. Returns event_id on Valid/AlreadyProcessed,

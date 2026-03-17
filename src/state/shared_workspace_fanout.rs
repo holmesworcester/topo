@@ -1,7 +1,7 @@
 use rusqlite::Connection;
 
 use crate::crypto::{event_id_to_base64, EventId};
-use crate::db::store::{insert_recorded_event, lookup_workspace_id};
+use crate::db::store::{insert_recorded_event_checked, lookup_workspace_id};
 use crate::event_modules::ShareScope;
 use crate::projection::apply::project_one;
 use crate::state::db::project_queue::ProjectQueue;
@@ -325,10 +325,10 @@ pub(crate) fn fanout_stored_shared_event_inline(
     conn: &Connection,
     recorded_by: &str,
     event_id: &EventId,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let Some(workspace_id) = workspace_id_for_stored_shared_event(conn, recorded_by, event_id)?
     else {
-        return Ok(());
+        return Ok(Vec::new());
     };
 
     fanout_shared_event_immediate(conn, recorded_by, &workspace_id, event_id)
@@ -338,10 +338,10 @@ pub(crate) fn fanout_stored_shared_event_immediate(
     conn: &Connection,
     recorded_by: &str,
     event_id: &EventId,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let Some(workspace_id) = workspace_id_for_stored_shared_event(conn, recorded_by, event_id)?
     else {
-        return Ok(());
+        return Ok(Vec::new());
     };
 
     // Write a durable pending entry so the fanout survives a crash.
@@ -371,10 +371,10 @@ pub(crate) fn fanout_shared_event_immediate(
     origin_peer_id: &str,
     workspace_id: &str,
     event_id: &EventId,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     // Skip fanout for events the origin tenant rejected (bad signature, etc.)
     if is_origin_rejected(conn, origin_peer_id, event_id) {
-        return Ok(());
+        return Ok(Vec::new());
     }
     let siblings = sibling_tenants_in_workspace(conn, origin_peer_id, workspace_id)?;
     // Skip fanout from removed tenants — a removed local tenant must not
@@ -389,11 +389,11 @@ pub(crate) fn fanout_shared_event_immediate(
             .chain(std::iter::once(origin_peer_id))
             .collect();
         if is_sibling_removed(conn, origin_peer_id, &all_scopes) {
-            return Ok(());
+            return Ok(Vec::new());
         }
     }
     if siblings.is_empty() {
-        return Ok(());
+        return Ok(Vec::new());
     }
 
     let now_ms = std::time::SystemTime::now()
@@ -421,15 +421,18 @@ pub(crate) fn fanout_shared_event_immediate(
             removal && is_removal_targeting_sibling(conn, event_id, s, origin_peer_id)
         })
         .collect();
+    let mut fanned = Vec::new();
     for sibling in &active_siblings {
-        insert_recorded_event(conn, sibling, event_id, now_ms, &source)?;
+        if insert_recorded_event_checked(conn, sibling, event_id, now_ms, &source)? {
+            fanned.push((*sibling).clone());
+        }
     }
     for sibling in &active_siblings {
         let _ = project_one(conn, sibling, event_id)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
     }
 
-    Ok(())
+    Ok(fanned)
 }
 
 pub(crate) fn fanout_shared_event_enqueue(
@@ -495,9 +498,12 @@ pub(crate) fn fanout_shared_event_enqueue(
                 continue;
             }
         }
-        insert_recorded_event(conn, sibling, &fanout.event_id, now_ms, &source)?;
+        let inserted =
+            insert_recorded_event_checked(conn, sibling, &fanout.event_id, now_ms, &source)?;
         let _ = pq.enqueue(sibling, &event_id_b64)?;
-        fanned.push(sibling.clone());
+        if inserted {
+            fanned.push(sibling.clone());
+        }
     }
 
     Ok(fanned)

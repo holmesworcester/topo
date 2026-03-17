@@ -721,7 +721,7 @@ async fn test_foreign_workspace_rejected_via_sync() {
     let server_ep = create_dynamic_endpoint_for_peer(&alice);
     let server_addr = server_ep.local_addr().expect("alice listen addr");
     let client_ep = create_dynamic_endpoint_for_peer(&bob);
-    let server_sni = transport_sni(&alice.transport_peer_id());
+    let server_sni = transport_sni(&alice.identity);
     let server_ep_clone = server_ep.clone();
     let server_accept = tokio::spawn(async move {
         match server_ep_clone.accept().await {

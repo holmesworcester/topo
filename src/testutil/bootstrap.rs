@@ -116,9 +116,8 @@ pub async fn bootstrap_sync_from_invite(
 
     let conn = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
 
-    // Session stream headers are already flushed during stream setup,
-    // so the handler can begin sync immediately without protocol-level
-    // startup marker frames.
+    // Stream materialization markers are now sent by
+    // SyncSessionHandler::on_session for outbound sessions.
 
     // Shared batch_writer for this one-shot bootstrap session.
     let (ingest_tx, ingest_rx) = mpsc::channel::<IngestItem>(5000);

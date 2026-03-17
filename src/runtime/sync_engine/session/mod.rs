@@ -61,11 +61,27 @@ pub(super) const DATA_SEND_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// better than blocking the connection supervisor for the full activity timeout.
 pub(super) const INITIAL_CONTROL_PROGRESS_TIMEOUT: Duration = Duration::from_secs(5);
 
-/// Gap between initiator-driven discovery rounds on an established connection.
-pub(super) const DISCOVERY_ROUND_GAP: Duration = Duration::from_millis(100);
-
 /// Non-blocking poll timeout for the control stream receive.
 pub(super) const CONTROL_POLL_TIMEOUT: Duration = Duration::from_millis(1);
+
+fn read_bool_env(name: &str) -> bool {
+    std::env::var(name)
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(false)
+}
+
+fn read_u64_env(name: &str) -> Option<u64> {
+    std::env::var(name).ok()?.parse::<u64>().ok()
+}
+
+/// Gap between initiator-driven discovery rounds on an established connection.
+pub(super) fn discovery_round_gap() -> Duration {
+    Duration::from_millis(read_u64_env("P7_DISCOVERY_ROUND_GAP_MS").unwrap_or(100))
+}
+
+pub(super) fn forward_on_have_enabled() -> bool {
+    read_bool_env("P7_FORWARD_ON_HAVE")
+}
 
 pub(super) fn send_idle_capture_enabled() -> bool {
     std::env::var("SYNC_SEND_IDLE_LOG")

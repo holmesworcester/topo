@@ -1042,11 +1042,6 @@ impl Peer {
         extract_spki_fingerprint(cert.as_ref()).expect("failed to extract fingerprint")
     }
 
-    /// Return the current exact transport target id (hex SPKI fingerprint) for this peer.
-    pub fn transport_peer_id(&self) -> String {
-        hex::encode(self.spki_fingerprint())
-    }
-
     /// Create a message and insert it into all relevant tables.
     /// Returns the event ID. Requires identity chain (use new_with_identity).
     pub fn create_message(&self, content: &str) -> EventId {
@@ -2649,7 +2644,7 @@ pub fn verify_projection_invariants(peer: &Peer) {
 // ---------------------------------------------------------------------------
 
 fn current_transport_target(peer: &Peer) -> String {
-    peer.transport_peer_id()
+    hex::encode(peer.spki_fingerprint())
 }
 
 /// Start sync between two peers in the same workspace with projected trust.
@@ -2714,6 +2709,93 @@ pub fn start_peers(
             .build()
             .unwrap();
         rt.block_on(async move {
+            if let Err(e) = connect_loop(
+                &b_db,
+                &b_identity,
+                connector_endpoint,
+                listener_addr,
+                &target_peer_id,
+                None,
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await
+            {
+                tracing::warn!("connect_loop exited: {}", e);
+            }
+        });
+    });
+
+    (a_handle, b_handle)
+}
+
+/// Like `start_peers` but creates Quinn endpoints on the session threads.
+///
+/// Quinn's `EndpointDriver` I/O task is spawned on whatever tokio runtime is
+/// current when the endpoint is constructed.  `start_peers` creates endpoints
+/// on the *caller's* runtime, so if the caller later blocks that runtime (e.g.
+/// with `thread::sleep`), all QUIC I/O stalls.  This variant defers endpoint
+/// construction to each session thread's own `current_thread` runtime, ensuring
+/// the I/O driver is always being polled while the session is active.
+pub fn start_peers_runtime_affine(
+    peer_a: &Peer,
+    peer_b: &Peer,
+) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+    let (cert_a, key_a) = peer_a.cert_and_key();
+    let (cert_b, key_b) = peer_b.cert_and_key();
+    let a_trusts_b = peer_b.spki_fingerprint();
+    let b_trusts_a = peer_a.spki_fingerprint();
+
+    let a_db = peer_a.db_path.clone();
+    let a_identity = peer_a.identity.clone();
+    let b_db = peer_b.db_path.clone();
+    let b_identity = peer_b.identity.clone();
+    let target_peer_id = current_transport_target(peer_a);
+
+    // Channel for the listener to communicate its bound address to the connector.
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel::<SocketAddr>();
+
+    let a_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let allow_a: Arc<crate::transport::DynamicAllowFn> =
+                Arc::new(move |peer_fp: &[u8; 32]| Ok(peer_fp == &a_trusts_b));
+            let listener_endpoint =
+                create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert_a, key_a, allow_a)
+                    .expect("failed to create listener endpoint");
+            let listener_addr = listener_endpoint
+                .local_addr()
+                .expect("failed to get listener addr");
+            addr_tx.send(listener_addr).expect("addr channel closed");
+            if let Err(e) = accept_loop(
+                &a_db,
+                &a_identity,
+                listener_endpoint,
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await
+            {
+                tracing::warn!("accept_loop exited: {}", e);
+            }
+        });
+    });
+
+    let b_handle = std::thread::spawn(move || {
+        let listener_addr = addr_rx.recv().expect("listener addr not received");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let allow_b: Arc<crate::transport::DynamicAllowFn> =
+                Arc::new(move |peer_fp: &[u8; 32]| Ok(peer_fp == &b_trusts_a));
+            let connector_endpoint =
+                create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert_b, key_b, allow_b)
+                    .expect("failed to create connector endpoint");
             if let Err(e) = connect_loop(
                 &b_db,
                 &b_identity,

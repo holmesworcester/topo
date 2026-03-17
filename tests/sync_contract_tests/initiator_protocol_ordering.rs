@@ -25,7 +25,7 @@ fn empty_negentropy_response(neg_open: Frame) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn initiator_outbound_starts_with_negopen_then_next_round() {
+async fn initiator_outbound_sends_markers_then_negopen_then_next_round() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
         let handler = SyncSessionHandler::outbound(
@@ -43,6 +43,18 @@ async fn initiator_outbound_starts_with_negopen_then_next_round() {
             let cancel = cancel.clone();
             async move { handler.on_session(meta, Box::new(fake_io), cancel).await }
         });
+
+        let ctrl_marker = peer
+            .recv_control_msg_timeout(Duration::from_secs(5))
+            .await
+            .expect("expected control marker");
+        assert_eq!(ctrl_marker, Frame::HaveList { ids: vec![] });
+
+        let data_marker = peer
+            .recv_data_msg_timeout(Duration::from_secs(5))
+            .await
+            .expect("expected data marker");
+        assert_eq!(data_marker, Frame::HaveList { ids: vec![] });
 
         let neg_open_1 = peer
             .recv_control_msg_timeout(Duration::from_secs(5))
@@ -96,7 +108,7 @@ async fn initiator_outbound_starts_with_negopen_then_next_round() {
 }
 
 #[tokio::test]
-async fn anticheat_first_control_frame_is_negopen() {
+async fn anticheat_markers_precede_negopen() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
         let handler = SyncSessionHandler::outbound(
@@ -121,15 +133,10 @@ async fn anticheat_first_control_frame_is_negopen() {
             .recv_control_msg_timeout(Duration::from_secs(5))
             .await
             .expect("expected first control message");
-        assert!(
-            matches!(first, Frame::NegOpen { .. }),
-            "ANTI-CHEAT: first control message must be NegOpen, not a fake startup marker"
-        );
-
-        let unexpected_data = peer.recv_data_msg_timeout(Duration::from_millis(250)).await;
-        assert!(
-            unexpected_data.is_none(),
-            "ANTI-CHEAT: data stream must not carry startup markers or unsolicited data"
+        assert_eq!(
+            first,
+            Frame::HaveList { ids: vec![] },
+            "ANTI-CHEAT: first control message must be the stream-open marker"
         );
 
         cancel.cancel();

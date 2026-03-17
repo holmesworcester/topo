@@ -28,6 +28,7 @@ use crate::db::{
 use crate::protocol::Frame;
 use crate::runtime::memtrace;
 use crate::runtime::SyncStats;
+use crate::state::live_hints;
 use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
@@ -37,15 +38,16 @@ use crate::tuning::{
 
 use super::connection_scope::{ConnectionRequestState, ConnectionResponseState};
 use super::control_plane::{
-    observe_event_ids_for_peer, refill_wanted_requests, send_request_credit,
+    observe_event_ids_for_peer, refill_wanted_requests, send_forward_on_have_hints,
+    send_request_credit,
 };
 use super::coordinator::PeerCoord;
 use super::data_plane::{drain_pending_responses_to_data_stream, spawn_data_receiver};
 use super::logging::{SyncRunCapture, SyncRunRxCapture};
 use super::windowing::{decode_initial_neg_open, SyncWindow, SyncWindowKind};
 use super::{
-    negentropy_frame_size, send_idle_capture_enabled, CONTROL_POLL_TIMEOUT,
-    INITIAL_CONTROL_PROGRESS_TIMEOUT,
+    forward_on_have_enabled, negentropy_frame_size, send_idle_capture_enabled,
+    CONTROL_POLL_TIMEOUT, INITIAL_CONTROL_PROGRESS_TIMEOUT,
 };
 
 fn should_treat_as_startup_control_abort(
@@ -181,7 +183,6 @@ where
     let mut round_open = false;
     let sync_start = Instant::now();
     let reconcile_start = Instant::now();
-    let mut reconcile_started_at_ms = current_timestamp_ms();
     let mut last_bytes_received = 0u64;
     let mut reconciling = false;
     let memtrace_enabled = low_mem_memtrace();
@@ -192,6 +193,8 @@ where
     let idle_capture_enabled = send_idle_capture_enabled() && capture.is_some();
     let mut last_send_progress = Instant::now();
     let mut last_idle_marker = Instant::now();
+    let forward_on_have = forward_on_have_enabled();
+    let mut forward_hint_rx = forward_on_have.then(|| live_hints::subscribe(db_path, recorded_by));
 
     let credit_high = request_credit_high_watermark().max(1);
     let credit_low = request_credit_low_watermark().min(credit_high.saturating_sub(1));
@@ -270,7 +273,6 @@ where
             Ok(Ok(Frame::NegOpen { msg })) => {
                 last_activity = Instant::now();
                 rounds += 1;
-                reconcile_started_at_ms = current_timestamp_ms();
                 let (window, inner_msg) =
                     decode_initial_neg_open(&msg).map_err(|e| format!("bad NegOpen: {e}"))?;
                 if reconciling {
@@ -328,7 +330,7 @@ where
                     &timeline,
                     recorded_by,
                     peer_id,
-                    reconcile_started_at_ms,
+                    need_received_at,
                     &ids,
                     &mut round_observed_ids,
                 )?;
@@ -374,6 +376,14 @@ where
         .await?;
         if requested_now > 0 {
             last_activity = Instant::now();
+        }
+
+        if let Some(receiver) = forward_hint_rx.as_mut() {
+            let hinted =
+                send_forward_on_have_hints(&mut control, &timeline, peer_id, receiver).await?;
+            if hinted > 0 {
+                last_activity = Instant::now();
+            }
         }
 
         // Drain requested responses to data stream — runs even while worker is reconciling

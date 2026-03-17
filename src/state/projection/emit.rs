@@ -5,10 +5,16 @@ use super::apply::project_one;
 use super::decision::ProjectionDecision;
 use crate::crypto::{event_id_to_base64, hash_event, EventId};
 use crate::db::store::{
-    insert_event, insert_neg_item_if_shared, insert_recorded_event, lookup_workspace_id,
+    insert_event, insert_neg_item_if_shared, insert_recorded_event_checked, lookup_workspace_id,
 };
 use crate::event_modules::{self as events, registry, ParsedEvent};
+use crate::state::live_hints::{self, LiveHintEvent};
 use crate::state::shared_workspace_fanout::fanout_stored_shared_event_immediate;
+
+struct EmitOutcome {
+    event_id: EventId,
+    live_hints: Vec<LiveHintEvent>,
+}
 
 /// Emit a deterministic event: compute blob, hash to event_id, check if already
 /// exists, if not: store in events/neg_items/recorded_events and project via project_one.
@@ -31,6 +37,25 @@ pub fn emit_deterministic_blob(
     recorded_by: &str,
     blob: &[u8],
 ) -> Result<EventId, Box<dyn std::error::Error>> {
+    let publish_after_commit = conn.is_autocommit();
+    let emitted = if publish_after_commit {
+        crate::state::db::queue::with_immediate_tx_result(conn, || {
+            emit_deterministic_blob_in_tx(conn, recorded_by, blob)
+        })?
+    } else {
+        emit_deterministic_blob_in_tx(conn, recorded_by, blob)?
+    };
+    if publish_after_commit {
+        live_hints::publish_from_connection(conn, &emitted.live_hints);
+    }
+    Ok(emitted.event_id)
+}
+
+fn emit_deterministic_blob_in_tx(
+    conn: &Connection,
+    recorded_by: &str,
+    blob: &[u8],
+) -> Result<EmitOutcome, Box<dyn std::error::Error>> {
     if blob.is_empty() {
         return Err("deterministic blob cannot be empty".into());
     }
@@ -84,12 +109,27 @@ pub fn emit_deterministic_blob(
     }
 
     // Always record for this tenant and project (even if event already existed globally)
-    insert_recorded_event(conn, recorded_by, &event_id, now_ms, "emitted")?;
+    let recorded_inserted =
+        insert_recorded_event_checked(conn, recorded_by, &event_id, now_ms, "emitted")?;
+    let mut live_hints = Vec::new();
+    if recorded_inserted && meta.share_scope == crate::event_modules::registry::ShareScope::Shared {
+        live_hints.push(LiveHintEvent {
+            tenant_id: recorded_by.to_string(),
+            event_id,
+            source_peer_id: None,
+        });
+    }
 
     match project_one(conn, recorded_by, &event_id) {
         Ok(ProjectionDecision::Valid | ProjectionDecision::AlreadyProcessed) => {
-            fanout_stored_shared_event_immediate(conn, recorded_by, &event_id)
-                .map_err(|e| format!("same-workspace fanout failed: {}", e))?;
+            let sibling_tenants =
+                fanout_stored_shared_event_immediate(conn, recorded_by, &event_id)
+                    .map_err(|e| format!("same-workspace fanout failed: {}", e))?;
+            live_hints.extend(sibling_tenants.into_iter().map(|tenant_id| LiveHintEvent {
+                tenant_id,
+                event_id,
+                source_peer_id: None,
+            }));
         }
         Ok(_) => {}
         Err(e) => {
@@ -101,5 +141,8 @@ pub fn emit_deterministic_blob(
         }
     }
 
-    Ok(event_id)
+    Ok(EmitOutcome {
+        event_id,
+        live_hints,
+    })
 }

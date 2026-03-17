@@ -9,9 +9,9 @@
 //!   observations so known peers remain dialable after bootstrap supersession.
 //! - **Discovery dispatch**: deduplicates mDNS-discovered peers and computes
 //!   connect/reconnect/skip actions (`PeerDispatcher`).
-//! - **Dispatch-key helpers**: deterministic transport-target keying for bootstrap +
+//! - **Dispatch-key helpers**: deterministic peer-keying for bootstrap +
 //!   discovery target streams so one runtime dispatcher can own lifecycle
-//!   decisions once the authenticated transport fingerprint is known.
+//!   decisions once the authenticated peer fingerprint is known.
 //!
 //! This consolidation satisfies R3/SC3 of the peering readability plan:
 //! one module is the source of truth for dial target planning.
@@ -120,24 +120,20 @@ pub(crate) fn normalize_discovered_addr_for_local_bind(
 // Unified dispatch-keying for bootstrap + discovery ingestion
 // ---------------------------------------------------------------------------
 
-pub(crate) fn bootstrap_dispatch_key(
-    tenant_id: &str,
-    transport_peer_id: &str,
-    remote: SocketAddr,
-) -> String {
-    format!("{tenant_id}@bootstrap:{transport_peer_id}@{remote}")
+pub(crate) fn bootstrap_dispatch_key(tenant_id: &str, peer_id: &str, remote: SocketAddr) -> String {
+    format!("{tenant_id}@bootstrap:{peer_id}@{remote}")
 }
 
-pub(crate) fn bootstrap_dispatch_key_prefix(tenant_id: &str, transport_peer_id: &str) -> String {
-    format!("{tenant_id}@bootstrap:{transport_peer_id}@")
+pub(crate) fn bootstrap_dispatch_key_prefix(tenant_id: &str, peer_id: &str) -> String {
+    format!("{tenant_id}@bootstrap:{peer_id}@")
 }
 
-pub(crate) fn known_peer_dispatch_key(tenant_id: &str, transport_peer_id: &str) -> String {
-    format!("{}@peer:{}", tenant_id, transport_peer_id)
+pub(crate) fn known_peer_dispatch_key(tenant_id: &str, peer_id: &str) -> String {
+    format!("{}@peer:{}", tenant_id, peer_id)
 }
 
-pub(crate) fn discovery_dispatch_key(tenant_id: &str, transport_peer_id: &str) -> String {
-    known_peer_dispatch_key(tenant_id, transport_peer_id)
+pub(crate) fn discovery_dispatch_key(tenant_id: &str, peer_id: &str) -> String {
+    known_peer_dispatch_key(tenant_id, peer_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -157,11 +153,11 @@ pub(crate) fn load_bootstrap_targets(
             let addr_text = target.bootstrap_addr;
             match parse_bootstrap_address(&addr_text).and_then(|addr| addr.to_socket_addr()) {
                 Ok(addr) => {
-                    let key = (tenant_id.clone(), target.transport_peer_id.clone(), addr);
+                    let key = (tenant_id.clone(), target.peer_id.clone(), addr);
                     if seen.insert(key.clone()) {
                         out.push((
                             tenant_id.clone(),
-                            target.transport_peer_id,
+                            target.peer_id,
                             target.invite_event_id,
                             addr,
                         ));
@@ -290,17 +286,17 @@ pub(crate) fn collect_all_observed_endpoint_targets(
 
 /// Dispatch a bootstrap dial target through `PeerDispatcher`.
 ///
-/// Bootstrap targets are keyed by authenticated transport fingerprint, not
-/// invite event id, so invite bootstrap, observed endpoints, and discovery all
-/// converge on one exact-target connect worker once the remote fingerprint is
+/// Bootstrap targets are keyed by authenticated peer fingerprint, not invite
+/// event id, so invite bootstrap, observed endpoints, and discovery all
+/// converge on one peer-scoped connect worker once the peer fingerprint is
 /// known. Returns `true` if a new connect loop should be spawned.
 pub(crate) fn dispatch_bootstrap_target(
     dispatcher: &mut PeerDispatcher,
     tenant_id: &str,
-    transport_peer_id: &str,
+    peer_id: &str,
     remote: SocketAddr,
 ) -> bool {
-    let key = bootstrap_dispatch_key(tenant_id, transport_peer_id, remote);
+    let key = bootstrap_dispatch_key(tenant_id, peer_id, remote);
     let (action, _cancel_rx) = dispatcher.dispatch(&key, remote);
     matches!(
         action,
@@ -315,10 +311,10 @@ pub(crate) fn dispatch_bootstrap_target(
 pub(crate) fn dispatch_known_peer_target(
     dispatcher: &mut PeerDispatcher,
     tenant_id: &str,
-    transport_peer_id: &str,
+    peer_id: &str,
     remote: SocketAddr,
 ) -> bool {
-    let key = known_peer_dispatch_key(tenant_id, transport_peer_id);
+    let key = known_peer_dispatch_key(tenant_id, peer_id);
     let (action, _cancel_rx) = dispatcher.dispatch(&key, remote);
     matches!(
         action,

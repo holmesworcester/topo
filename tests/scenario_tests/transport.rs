@@ -90,7 +90,7 @@ async fn test_bidirectional_connect_loops_do_not_deadlock_peer_session_gate() {
     let alice_connect_db = alice.db_path.clone();
     let alice_connect_id = alice.identity.clone();
     let alice_connect_cancel = alice_cancel.clone();
-    let bob_target = bob.transport_peer_id();
+    let bob_target = bob.identity.clone();
     let alice_connect = thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -116,7 +116,7 @@ async fn test_bidirectional_connect_loops_do_not_deadlock_peer_session_gate() {
     let bob_connect_db = bob.db_path.clone();
     let bob_connect_id = bob.identity.clone();
     let bob_connect_cancel = bob_cancel.clone();
-    let alice_target = alice.transport_peer_id();
+    let alice_target = alice.identity.clone();
     let bob_connect = thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -176,7 +176,7 @@ async fn test_peer_identity_extraction_live_handshake() {
     let server_ep = create_dynamic_endpoint_for_peer(&alice);
     let addr = server_ep.local_addr().expect("server addr");
     let client_ep = create_dynamic_endpoint_for_peer(&bob);
-    let server_sni = transport_sni(&alice.transport_peer_id());
+    let server_sni = transport_sni(&alice.identity);
 
     let (client_conn, server_conn) = tokio::join!(
         async { client_ep.connect(addr, &server_sni).unwrap().await.unwrap() },
@@ -185,17 +185,9 @@ async fn test_peer_identity_extraction_live_handshake() {
 
     let client_sees_server = peer_identity_from_connection(&client_conn);
     let server_sees_client = peer_identity_from_connection(&server_conn);
-    let alice_transport_peer_id = alice.transport_peer_id();
-    let bob_transport_peer_id = bob.transport_peer_id();
 
-    assert_eq!(
-        client_sees_server.as_deref(),
-        Some(alice_transport_peer_id.as_str())
-    );
-    assert_eq!(
-        server_sees_client.as_deref(),
-        Some(bob_transport_peer_id.as_str())
-    );
+    assert_eq!(client_sees_server.as_deref(), Some(alice.identity.as_str()));
+    assert_eq!(server_sees_client.as_deref(), Some(bob.identity.as_str()));
 
     harness.finish();
 }
@@ -212,7 +204,7 @@ async fn test_connect_with_presents_correct_tenant_cert() {
 
     let server_ep = create_dynamic_endpoint_for_peer(&server);
     let server_addr = server_ep.local_addr().expect("server addr");
-    let server_target_sni = transport_sni(&server.transport_peer_id());
+    let server_target_sni = transport_sni(&server.identity);
 
     let server_ep_clone = server_ep.clone();
     let server_accept = tokio::spawn(async move {
@@ -252,8 +244,7 @@ async fn test_connect_with_presents_correct_tenant_cert() {
     let server_saw_peer = peer_identity_from_connection(&server_conn)
         .expect("server should see client cert identity");
     assert_eq!(
-        server_saw_peer,
-        actual_tenant.transport_peer_id(),
+        server_saw_peer, actual_tenant.identity,
         "server should see the requested tenant cert, not the endpoint default cert"
     );
 
@@ -300,7 +291,7 @@ async fn test_tenant_scoped_outbound_trust_rejects_untrusted_server() {
         .connect_with(
             tenant_config.clone(),
             trusted_addr,
-            &transport_sni(&trusted_server.transport_peer_id()),
+            &transport_sni(&trusted_server.identity),
         )
         .unwrap()
         .await;
@@ -313,7 +304,7 @@ async fn test_tenant_scoped_outbound_trust_rejects_untrusted_server() {
         .connect_with(
             tenant_config,
             untrusted_addr,
-            &transport_sni(&untrusted_server.transport_peer_id()),
+            &transport_sni(&untrusted_server.identity),
         )
         .unwrap()
         .await;
