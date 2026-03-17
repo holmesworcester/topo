@@ -236,6 +236,13 @@ pub(crate) fn load_observed_endpoint_targets(
                FROM local_transport_creds c
                WHERE c.peer_id = lower(hex(ps.transport_fingerprint))
            )
+           AND NOT EXISTS(
+               SELECT 1
+               FROM pending_invite_bootstrap_trust p
+               WHERE p.recorded_by = ps.recorded_by
+                 AND p.expected_bootstrap_spki_fingerprint = ps.transport_fingerprint
+                 AND p.expires_at > ?2
+           )
            AND EXISTS(
                SELECT 1
                FROM peer_endpoint_observations e
