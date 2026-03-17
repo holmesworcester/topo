@@ -55,7 +55,7 @@ These are the current source module names. Active docs should use these names ex
 | `network_contract.rs` | `peering_contract.rs` |
 | `ReplicationStore` | `SyncStore` |
 | `SqliteReplicationStore` | `SqliteSyncStore` |
-| `ReplicationSessionHandler` | `SyncSessionHandler` |
+| `ReplicationSessionHandler` | `SyncConnectionHandler` |
 | `tests/replication_contract_tests/` | `tests/sync_contract_tests/` |
 
 ## Maintenance Note

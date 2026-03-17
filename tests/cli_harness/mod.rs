@@ -526,6 +526,8 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> HarnessDaemo
         }
         if opts.disable_discovery {
             cmd.env("P7_DISABLE_DISCOVERY", "1");
+        } else {
+            cmd.env_remove("P7_DISABLE_DISCOVERY");
         }
         for (key, value) in &opts.extra_env {
             cmd.env(key, value);
@@ -1118,7 +1120,7 @@ pub fn ensure_active_peer(db: &str, timeout: Duration) {
     );
 }
 
-fn active_tenant_peer_id(db: &str) -> Option<String> {
+pub fn active_tenant_peer_id(db: &str) -> Option<String> {
     let active = Command::new(bin())
         .args(["--db", db, "tenant", "active"])
         .output()
@@ -1166,7 +1168,9 @@ pub fn send_message(db: &str, content: &str) -> String {
                 ensure_active_peer(db, Duration::from_secs(5));
             }
             if stderr.contains("workspace has not completed initial sync yet") {
-                ensure_active_peer(db, Duration::from_secs(5));
+                let remaining = send_timeout.saturating_sub(start.elapsed());
+                let wait_for = remaining.min(Duration::from_secs(5));
+                let _ = wait_for_active_tenant_ready_debug(db, wait_for);
             }
             std::thread::sleep(Duration::from_millis(100));
             continue;
@@ -1275,12 +1279,47 @@ pub fn accept_invite_with_identity(db: &str, invite_link: &str, username: &str, 
     );
 }
 
+pub fn accept_invite_with_identity_persisted_only(
+    db: &str,
+    invite_link: &str,
+    username: &str,
+    devicename: &str,
+    accept_timeout: Duration,
+) {
+    accept_invite_with_identity_inner(
+        db,
+        invite_link,
+        username,
+        devicename,
+        accept_timeout,
+        false,
+    );
+}
+
 pub fn accept_invite_with_identity_and_timeout(
     db: &str,
     invite_link: &str,
     username: &str,
     devicename: &str,
     accept_timeout: Duration,
+) {
+    accept_invite_with_identity_inner(
+        db,
+        invite_link,
+        username,
+        devicename,
+        accept_timeout,
+        true,
+    );
+}
+
+fn accept_invite_with_identity_inner(
+    db: &str,
+    invite_link: &str,
+    username: &str,
+    devicename: &str,
+    accept_timeout: Duration,
+    wait_for_transport_convergence: bool,
 ) {
     let mut tmp_daemon = if invite_has_empty_bootstrap_addrs(invite_link) {
         start_discovery_daemon(db)
@@ -1294,7 +1333,7 @@ pub fn accept_invite_with_identity_and_timeout(
         devicename,
         accept_timeout,
     );
-    if !invite_has_empty_bootstrap_addrs(invite_link) {
+    if wait_for_transport_convergence && !invite_has_empty_bootstrap_addrs(invite_link) {
         let accepted_peer_id = active_tenant_peer_id(db)
             .expect("accepted invite should set the new tenant active on the running daemon");
         wait_for_tenant_transport_converged(db, &accepted_peer_id, accept_timeout);
@@ -2324,6 +2363,11 @@ pub fn topo_rpc_retry(db: &str, args: &[&str], timeout: Duration) -> Output {
         let stderr = String::from_utf8_lossy(&out.stderr);
         if stderr.contains("no active tenant") {
             let _ = topo_cmd(db, &["tenant", "use", "1"]);
+        }
+        if stderr.contains("workspace has not completed initial sync yet") {
+            let remaining = timeout.saturating_sub(start.elapsed());
+            let wait_for = remaining.min(Duration::from_secs(5));
+            let _ = wait_for_active_tenant_ready_debug(db, wait_for);
         }
         if start.elapsed() >= timeout || !is_transient_rpc_startup_error(&stderr) {
             return out;

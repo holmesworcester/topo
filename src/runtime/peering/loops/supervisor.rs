@@ -22,7 +22,7 @@ use crate::db::schema::create_tables;
 use crate::runtime::build_mismatch::note_build_mismatch;
 use crate::runtime::memtrace;
 use crate::runtime::repeated_warning::should_emit_globally;
-use crate::sync::SyncSessionHandler;
+use crate::sync::SyncConnectionHandler;
 use crate::transport::session_factory::extract_build_mismatch_reason;
 use crate::transport::SessionProvider;
 use crate::tuning::{low_mem_memtrace, low_mem_mode};
@@ -159,7 +159,7 @@ pub(super) async fn supervise_connection_sessions(
     peer_id: &str,
     peer_fp: [u8; 32],
     provider: &SessionProvider,
-    handler: &SyncSessionHandler,
+    handler: &SyncConnectionHandler,
     direction: SessionDirection,
     tenant_resolver: &SessionTenantResolver,
     shutdown: CancellationToken,

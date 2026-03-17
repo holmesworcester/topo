@@ -4,7 +4,6 @@
 //! - inbound event receiver task (`Event`)
 //! - draining requested response blobs to the data stream (`Event`)
 
-use std::collections::VecDeque;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -20,43 +19,15 @@ use crate::protocol::Frame;
 use crate::runtime::memtrace;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
-use crate::tuning::{blob_drain_batch_size, low_mem_memtrace};
+use crate::tuning::{blob_drain_batch_size, low_mem_memtrace, response_send_quantum_bytes};
 
-use super::connection_scope::ConnectionResponseState;
+use super::connection_scope::{ConnectionResponseState, QueuedResponse};
 use super::logging::SyncRunRxCapture;
 use super::DATA_SEND_STALL_TIMEOUT;
 
 pub struct DataPlaneSendStats {
     pub events_sent_delta: u64,
     pub bytes_sent_delta: u64,
-}
-
-#[derive(Debug, Default)]
-pub struct PendingResponseQueue {
-    ids: VecDeque<EventId>,
-}
-
-impl PendingResponseQueue {
-    pub fn enqueue_many(&mut self, ids: &[EventId]) -> usize {
-        self.ids.extend(ids.iter().copied());
-        ids.len()
-    }
-
-    pub fn len(&self) -> usize {
-        self.ids.len()
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.ids.is_empty()
-    }
-
-    pub fn pop_front(&mut self) -> Option<EventId> {
-        self.ids.pop_front()
-    }
-
-    pub fn push_front(&mut self, event_id: EventId) {
-        self.ids.push_front(event_id);
-    }
 }
 
 fn should_treat_as_startup_data_abort(events_ingested: u64, bytes_received: &AtomicU64) -> bool {
@@ -79,6 +50,7 @@ where
 {
     let mut events_sent_delta = 0u64;
     let mut bytes_sent_delta = 0u64;
+    let send_quantum_bytes = response_send_quantum_bytes() as u64;
     let mut sent_any = false;
 
     // Peek one batch of IDs without removing them so we can batch-read blobs.
@@ -107,8 +79,12 @@ where
     };
 
     for event_id in &batch_ids {
+        if bytes_sent_delta >= send_quantum_bytes {
+            break;
+        }
         if let Some(blob) = blobs.remove(event_id) {
             let blob_len = blob.len() as u64;
+            let queued = response_state.pop_next_response();
             match tokio::time::timeout(
                 DATA_SEND_STALL_TIMEOUT,
                 data_send.send(&Frame::Event { blob }),
@@ -116,7 +92,6 @@ where
             .await
             {
                 Ok(Ok(())) => {
-                    response_state.pop_next_response();
                     events_sent_delta += 1;
                     bytes_sent_delta += blob_len;
                     sent_any = true;
@@ -128,6 +103,9 @@ where
                         event_id_to_base64(event_id),
                         err
                     );
+                    if let Some(queued) = queued {
+                        response_state.requeue_front(queued);
+                    }
                     break;
                 }
                 Err(_) => {
@@ -136,6 +114,9 @@ where
                         event_id_to_base64(event_id),
                         DATA_SEND_STALL_TIMEOUT.as_millis()
                     );
+                    if let Some(queued) = queued {
+                        response_state.requeue_front(queued);
+                    }
                     break;
                 }
             }
@@ -160,6 +141,35 @@ where
         events_sent_delta,
         bytes_sent_delta,
     }
+}
+
+pub fn queue_requested_responses(
+    response_state: &ConnectionResponseState,
+    timeline: &EventTimeline<'_>,
+    store: &Store<'_>,
+    requested_ids: &[EventId],
+) -> usize {
+    if requested_ids.is_empty() {
+        return 0;
+    }
+
+    let mut accepted_ids = Vec::with_capacity(requested_ids.len());
+    let mut queued = Vec::with_capacity(requested_ids.len());
+    for event_id in requested_ids {
+        let Ok(Some(summary)) = store.get_shared_summary(event_id) else {
+            continue;
+        };
+        accepted_ids.push(summary.event_id);
+        queued.push(QueuedResponse {
+            event_id: summary.event_id,
+            encoded_size_bytes: summary.encoded_size_bytes as usize,
+        });
+    }
+    if accepted_ids.is_empty() {
+        return 0;
+    }
+    let _ = timeline.mark_request_received_many(&accepted_ids, current_timestamp_ms());
+    response_state.consume_requests(&queued)
 }
 
 /// Spawn data receiver task. Returns:
@@ -270,6 +280,7 @@ mod tests {
     use crate::db::{open_connection, schema::create_tables, store::insert_event, store::Store};
     use crate::event_modules::ShareScope;
     use crate::protocol::Frame;
+    use crate::sync::session::connection_scope::QueuedResponse;
     use crate::sync::session::ConnectionResponseState;
     use crate::transport::connection::ConnectionError;
     use crate::transport::StreamSend;
@@ -347,7 +358,10 @@ mod tests {
         let mut send = sender;
         let pending = ConnectionResponseState::default();
         let timeline = EventTimeline::new(&conn);
-        pending.consume_requests(&[event_id]);
+        pending.consume_requests(&[QueuedResponse {
+            event_id,
+            encoded_size_bytes: blob.len(),
+        }]);
 
         let stats =
             drain_pending_responses_to_data_stream(&pending, &timeline, &store, &mut send).await;

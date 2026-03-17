@@ -48,7 +48,7 @@ pub struct RecvConnection {
 
 /// Dual-stream connection for separating control and data planes
 ///
-/// Control stream: NegOpen, NegMsg, HaveList messages
+/// Control stream: NegOpen, NegMsg, DiscoveryHints, RequestIds, ResponseCredit
 /// Data stream: Event blobs
 ///
 /// This prevents large event transfers from blocking control messages.

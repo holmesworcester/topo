@@ -46,7 +46,7 @@ pub(super) fn negentropy_frame_size() -> u64 {
     }
 }
 
-/// Max event IDs sent per NeedList/HaveList request during reconciliation.
+/// Max discovery hints or request IDs sent in one control-frame batch.
 pub(super) fn need_chunk() -> usize {
     if low_mem_mode() {
         8

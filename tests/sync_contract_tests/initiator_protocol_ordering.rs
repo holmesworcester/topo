@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use topo::contracts::peering_contract::{SessionDirection, SessionHandler};
 use topo::protocol::Frame;
 use topo::sync::session::windowing::decode_initial_neg_open;
-use topo::sync::session_handler::SyncSessionHandler;
+use topo::sync::session_handler::SyncConnectionHandler;
 
 use crate::fake_session_io::{
     create_test_db, empty_negentropy_storage, fake_session_io_pair, noop_ingest_tx, run_local,
@@ -28,7 +28,7 @@ fn empty_negentropy_response(neg_open: Frame) -> Vec<u8> {
 async fn initiator_outbound_starts_with_negopen_then_next_round() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncSessionHandler::outbound(
+        let handler = SyncConnectionHandler::outbound(
             db_path,
             30,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
@@ -70,7 +70,7 @@ async fn initiator_outbound_starts_with_negopen_then_next_round() {
                 .await
                 .expect("expected control frame");
             match frame {
-                Frame::RequestCredit { .. } => {}
+                Frame::ResponseCredit { .. } => {}
                 neg_open_2 @ Frame::NegOpen { .. } => {
                     saw_second_round = true;
                     peer.send_control_msg(&Frame::NegMsg {
@@ -99,7 +99,7 @@ async fn initiator_outbound_starts_with_negopen_then_next_round() {
 async fn anticheat_first_control_frame_is_negopen() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncSessionHandler::outbound(
+        let handler = SyncConnectionHandler::outbound(
             db_path,
             30,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
@@ -142,7 +142,7 @@ async fn anticheat_first_control_frame_is_negopen() {
 async fn initiator_rejects_inbound_direction() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncSessionHandler::outbound(
+        let handler = SyncConnectionHandler::outbound(
             db_path,
             30,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),

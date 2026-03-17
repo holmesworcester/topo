@@ -32,15 +32,18 @@ use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 use crate::tuning::{
-    low_mem_memtrace, low_mem_mode, request_credit_high_watermark, request_credit_low_watermark,
+    low_mem_memtrace, low_mem_mode, response_credit_high_watermark_bytes,
+    response_credit_low_watermark_bytes,
 };
 
 use super::connection_scope::{ConnectionRequestState, ConnectionResponseState};
 use super::control_plane::{
-    observe_event_ids_for_peer, refill_wanted_requests, send_request_credit,
+    observe_discovery_hints_for_peer, refill_wanted_requests, send_response_credit_bytes,
 };
 use super::coordinator::PeerCoord;
-use super::data_plane::{drain_pending_responses_to_data_stream, spawn_data_receiver};
+use super::data_plane::{
+    drain_pending_responses_to_data_stream, queue_requested_responses, spawn_data_receiver,
+};
 use super::logging::{SyncRunCapture, SyncRunRxCapture};
 use super::windowing::{decode_initial_neg_open, SyncWindow, SyncWindowKind};
 use super::{
@@ -193,8 +196,8 @@ where
     let mut last_send_progress = Instant::now();
     let mut last_idle_marker = Instant::now();
 
-    let credit_high = request_credit_high_watermark().max(1);
-    let credit_low = request_credit_low_watermark().min(credit_high.saturating_sub(1));
+    let credit_high = response_credit_high_watermark_bytes().max(1);
+    let credit_low = response_credit_low_watermark_bytes().min(credit_high.saturating_sub(1));
 
     loop {
         // Data receiver runs in a separate task — check if it received data
@@ -311,37 +314,38 @@ where
                     .map_err(|_| "neg worker channel closed".to_string())?;
                 reconciling = true;
             }
-            Ok(Ok(Frame::HaveList { ids })) => {
+            Ok(Ok(Frame::RequestIds { ids })) => {
                 last_activity = Instant::now();
                 if ids.is_empty() {
                     continue;
                 }
                 let _ = timeline.mark_request_received_many(&ids, current_timestamp_ms());
-                response_state.consume_requests(&ids);
+                queue_requested_responses(response_state, &timeline, &store, &ids);
             }
-            Ok(Ok(Frame::NeedList { ids })) => {
+            Ok(Ok(Frame::DiscoveryHints { hints })) => {
                 last_activity = Instant::now();
+                let hint_ids: Vec<_> = hints.iter().map(|hint| hint.event_id).collect();
                 let need_received_at = current_timestamp_ms();
-                let _ = timeline.mark_need_list_received_many(&ids, need_received_at);
-                let observed = observe_event_ids_for_peer(
+                let _ = timeline.mark_need_list_received_many(&hint_ids, need_received_at);
+                let observed = observe_discovery_hints_for_peer(
                     &wanted,
                     &timeline,
                     recorded_by,
                     peer_id,
                     reconcile_started_at_ms,
-                    &ids,
+                    &hints,
                     &mut round_observed_ids,
                 )?;
                 if observed > 0 {
                     info!(
-                        "Observed {} needed IDs from peer {} via NeedList",
+                        "Observed {} discovery hints from peer {}",
                         observed, peer_id
                     );
                 }
             }
-            Ok(Ok(Frame::RequestCredit { credits })) => {
+            Ok(Ok(Frame::ResponseCredit { bytes })) => {
                 last_activity = Instant::now();
-                request_state.add_credit(credits as usize, current_timestamp_ms());
+                request_state.add_credit_bytes(bytes as usize, current_timestamp_ms());
             }
             Ok(Ok(_)) => {}
             Ok(Err(ConnectionError::Closed)) => {
@@ -392,10 +396,10 @@ where
         }
 
         if neg_req_tx.is_some() {
-            let grant = response_state.desired_credit_grant(credit_high, credit_low);
+            let grant = response_state.desired_credit_grant_bytes(credit_high, credit_low);
             if grant > 0 {
-                send_request_credit(&mut control, grant).await?;
-                response_state.note_granted(grant);
+                send_response_credit_bytes(&mut control, grant).await?;
+                response_state.note_granted_bytes(grant);
             }
         }
 
@@ -419,10 +423,10 @@ where
                 rounds,
                 reconciling,
                 response_stats.pending_len,
-                response_stats.available_credit,
+                response_stats.available_credit_bytes,
                 wanted_peer_backlog,
                 request_stats.inflight_len,
-                request_stats.remote_credit,
+                request_stats.remote_credit_bytes,
                 ingest_used,
                 ingest_cap,
                 sqlite_global.map(|s| s.memory_used_bytes).unwrap_or(-1),
@@ -472,10 +476,10 @@ where
                         "idle_ms": last_send_progress.elapsed().as_millis(),
                         "reconciling": reconciling,
                         "pending_responses": response_stats.pending_len,
-                        "response_credit_available": response_stats.available_credit,
+                        "response_credit_available_bytes": response_stats.available_credit_bytes,
                         "wanted_peer_backlog": pending_wanted_backlog,
                         "request_inflight": request_stats.inflight_len,
-                        "request_credit": request_stats.remote_credit,
+                        "response_credit_bytes": request_stats.remote_credit_bytes,
                     }))
                     .ok(),
                 );

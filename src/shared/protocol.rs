@@ -10,16 +10,24 @@ pub fn neg_id_to_event_id(id: &Id) -> EventId {
 /// Sync message types
 pub const MSG_TYPE_NEG_OPEN: u8 = 0x10; // Initial negentropy message
 pub const MSG_TYPE_NEG_MSG: u8 = 0x11; // Negentropy response
-pub const MSG_TYPE_HAVE_LIST: u8 = 0x12; // List of IDs client needs from server
-pub const MSG_TYPE_REQUEST_CREDIT: u8 = 0x13; // Source-advertised request credit
-pub const MSG_TYPE_NEED_LIST: u8 = 0x14; // Discovery hint: peer is missing these IDs
+pub const MSG_TYPE_REQUEST_IDS: u8 = 0x12; // Sink request: source should send these IDs
+pub const MSG_TYPE_RESPONSE_CREDIT: u8 = 0x13; // Source-advertised response byte credit
+pub const MSG_TYPE_DISCOVERY_HINTS: u8 = 0x14; // Discovery hint: peer is missing these IDs
 pub const MSG_TYPE_EVENT: u8 = 0x03; // Event blob (variable length)
 pub const MSG_TYPE_INTRO_OFFER: u8 = 0x30; // Intro offer for hole punching
 
 /// Max negentropy message payload: 4 MiB (generous for large reconciliation rounds)
 const MAX_NEG_MSG_BYTES: usize = 4 * 1024 * 1024;
-/// Max number of event IDs in a HaveList message
-const MAX_HAVE_LIST_IDS: usize = 100_000;
+/// Max number of IDs or discovery hints carried in one control-plane frame.
+const MAX_ID_LIST_ENTRIES: usize = 100_000;
+const DISCOVERY_HINT_WIRE_BYTES: usize = 32 + 1 + 4;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscoveryHint {
+    pub event_id: EventId,
+    pub semantic_type_code: u8,
+    pub encoded_size_bytes: u32,
+}
 
 /// Sync protocol messages
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -28,12 +36,12 @@ pub enum Frame {
     NegOpen { msg: Vec<u8> },
     /// Negentropy reconciliation response
     NegMsg { msg: Vec<u8> },
-    /// List of event IDs the client needs from server (32 bytes each)
-    HaveList { ids: Vec<[u8; 32]> },
-    /// Source-advertised request credit (count-based initial version)
-    RequestCredit { credits: u32 },
-    /// Discovery hint: the receiver is believed to be missing these IDs
-    NeedList { ids: Vec<[u8; 32]> },
+    /// Exact event IDs the sink is requesting from the source.
+    RequestIds { ids: Vec<[u8; 32]> },
+    /// Source-advertised response credit in encoded event bytes.
+    ResponseCredit { bytes: u32 },
+    /// Discovery hints describing events the peer appears to be missing.
+    DiscoveryHints { hints: Vec<DiscoveryHint> },
     /// Send full event blob (variable length)
     Event { blob: Vec<u8> },
     /// Intro offer for QUIC hole punching via a third peer
@@ -79,13 +87,13 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
             };
             Ok((sync_msg, total_size))
         }
-        MSG_TYPE_HAVE_LIST | MSG_TYPE_NEED_LIST => {
+        MSG_TYPE_REQUEST_IDS => {
             // Variable length: type(1) + count(4) + ids(count * 32)
             if input.len() < 5 {
                 return Err(ParseError::InsufficientData);
             }
             let count = u32::from_le_bytes([input[1], input[2], input[3], input[4]]) as usize;
-            if count > MAX_HAVE_LIST_IDS {
+            if count > MAX_ID_LIST_ENTRIES {
                 return Err(ParseError::TooManyIds(count));
             }
             let total_size = 5 + count * 32;
@@ -99,19 +107,46 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
                 id.copy_from_slice(&input[start..start + 32]);
                 ids.push(id);
             }
-            let frame = if msg_type == MSG_TYPE_HAVE_LIST {
-                Frame::HaveList { ids }
-            } else {
-                Frame::NeedList { ids }
-            };
-            Ok((frame, total_size))
+            Ok((Frame::RequestIds { ids }, total_size))
         }
-        MSG_TYPE_REQUEST_CREDIT => {
+        MSG_TYPE_DISCOVERY_HINTS => {
             if input.len() < 5 {
                 return Err(ParseError::InsufficientData);
             }
-            let credits = u32::from_le_bytes([input[1], input[2], input[3], input[4]]);
-            Ok((Frame::RequestCredit { credits }, 5))
+            let count = u32::from_le_bytes([input[1], input[2], input[3], input[4]]) as usize;
+            if count > MAX_ID_LIST_ENTRIES {
+                return Err(ParseError::TooManyIds(count));
+            }
+            let total_size = 5 + count * DISCOVERY_HINT_WIRE_BYTES;
+            if input.len() < total_size {
+                return Err(ParseError::InsufficientData);
+            }
+            let mut hints = Vec::with_capacity(count);
+            for i in 0..count {
+                let start = 5 + i * DISCOVERY_HINT_WIRE_BYTES;
+                let mut event_id = [0u8; 32];
+                event_id.copy_from_slice(&input[start..start + 32]);
+                let semantic_type_code = input[start + 32];
+                let encoded_size_bytes = u32::from_le_bytes([
+                    input[start + 33],
+                    input[start + 34],
+                    input[start + 35],
+                    input[start + 36],
+                ]);
+                hints.push(DiscoveryHint {
+                    event_id,
+                    semantic_type_code,
+                    encoded_size_bytes,
+                });
+            }
+            Ok((Frame::DiscoveryHints { hints }, total_size))
+        }
+        MSG_TYPE_RESPONSE_CREDIT => {
+            if input.len() < 5 {
+                return Err(ParseError::InsufficientData);
+            }
+            let bytes = u32::from_le_bytes([input[1], input[2], input[3], input[4]]);
+            Ok((Frame::ResponseCredit { bytes }, 5))
         }
         MSG_TYPE_EVENT => {
             // Variable length: type(1) + len(4) + blob(len)
@@ -193,28 +228,30 @@ pub fn encode_frame(msg: &Frame) -> Vec<u8> {
             buf.extend_from_slice(data);
             buf
         }
-        Frame::HaveList { ids } => {
+        Frame::RequestIds { ids } => {
             let mut buf = Vec::with_capacity(5 + ids.len() * 32);
-            buf.push(MSG_TYPE_HAVE_LIST);
+            buf.push(MSG_TYPE_REQUEST_IDS);
             buf.extend_from_slice(&(ids.len() as u32).to_le_bytes());
             for id in ids {
                 buf.extend_from_slice(id);
             }
             buf
         }
-        Frame::NeedList { ids } => {
-            let mut buf = Vec::with_capacity(5 + ids.len() * 32);
-            buf.push(MSG_TYPE_NEED_LIST);
-            buf.extend_from_slice(&(ids.len() as u32).to_le_bytes());
-            for id in ids {
-                buf.extend_from_slice(id);
+        Frame::DiscoveryHints { hints } => {
+            let mut buf = Vec::with_capacity(5 + hints.len() * DISCOVERY_HINT_WIRE_BYTES);
+            buf.push(MSG_TYPE_DISCOVERY_HINTS);
+            buf.extend_from_slice(&(hints.len() as u32).to_le_bytes());
+            for hint in hints {
+                buf.extend_from_slice(&hint.event_id);
+                buf.push(hint.semantic_type_code);
+                buf.extend_from_slice(&hint.encoded_size_bytes.to_le_bytes());
             }
             buf
         }
-        Frame::RequestCredit { credits } => {
+        Frame::ResponseCredit { bytes } => {
             let mut buf = Vec::with_capacity(5);
-            buf.push(MSG_TYPE_REQUEST_CREDIT);
-            buf.extend_from_slice(&credits.to_le_bytes());
+            buf.push(MSG_TYPE_RESPONSE_CREDIT);
+            buf.extend_from_slice(&bytes.to_le_bytes());
             buf
         }
         Frame::Event { blob } => {
@@ -267,7 +304,7 @@ impl std::fmt::Display for ParseError {
             ParseError::NegMessageTooLarge(len) => {
                 write!(f, "negentropy message too large: {} bytes", len)
             }
-            ParseError::TooManyIds(count) => write!(f, "too many IDs in have_list: {}", count),
+            ParseError::TooManyIds(count) => write!(f, "too many IDs in control frame: {}", count),
         }
     }
 }
@@ -444,33 +481,55 @@ mod tests {
     }
 
     #[test]
-    fn test_have_list_too_many_ids() {
-        let oversized_count = (MAX_HAVE_LIST_IDS + 1) as u32;
-        let mut buf = vec![MSG_TYPE_HAVE_LIST];
+    fn test_request_ids_too_many_ids() {
+        let oversized_count = (MAX_ID_LIST_ENTRIES + 1) as u32;
+        let mut buf = vec![MSG_TYPE_REQUEST_IDS];
         buf.extend_from_slice(&oversized_count.to_le_bytes());
         // Don't need full data — parser should reject based on count
         let result = parse_frame(&buf);
-        assert_eq!(result, Err(ParseError::TooManyIds(MAX_HAVE_LIST_IDS + 1)));
+        assert_eq!(result, Err(ParseError::TooManyIds(MAX_ID_LIST_ENTRIES + 1)));
     }
 
     #[test]
-    fn test_have_list_at_limit_ok() {
-        let max_count = MAX_HAVE_LIST_IDS as u32;
-        let mut buf = vec![MSG_TYPE_HAVE_LIST];
+    fn test_request_ids_at_limit_ok() {
+        let max_count = MAX_ID_LIST_ENTRIES as u32;
+        let mut buf = vec![MSG_TYPE_REQUEST_IDS];
         buf.extend_from_slice(&max_count.to_le_bytes());
-        buf.extend_from_slice(&vec![0u8; MAX_HAVE_LIST_IDS * 32]);
+        buf.extend_from_slice(&vec![0u8; MAX_ID_LIST_ENTRIES * 32]);
         let (msg, consumed) = parse_frame(&buf).unwrap();
-        assert_eq!(consumed, 5 + MAX_HAVE_LIST_IDS * 32);
-        if let Frame::HaveList { ids } = msg {
-            assert_eq!(ids.len(), MAX_HAVE_LIST_IDS);
+        assert_eq!(consumed, 5 + MAX_ID_LIST_ENTRIES * 32);
+        if let Frame::RequestIds { ids } = msg {
+            assert_eq!(ids.len(), MAX_ID_LIST_ENTRIES);
         } else {
-            panic!("expected HaveList");
+            panic!("expected RequestIds");
         }
     }
 
     #[test]
-    fn test_request_credit_roundtrip() {
-        let msg = Frame::RequestCredit { credits: 42 };
+    fn test_response_credit_roundtrip() {
+        let msg = Frame::ResponseCredit { bytes: 42 };
+        let encoded = encode_frame(&msg);
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_discovery_hints_roundtrip() {
+        let msg = Frame::DiscoveryHints {
+            hints: vec![
+                DiscoveryHint {
+                    event_id: [0x11; 32],
+                    semantic_type_code: 7,
+                    encoded_size_bytes: 144,
+                },
+                DiscoveryHint {
+                    event_id: [0x22; 32],
+                    semantic_type_code: 14,
+                    encoded_size_bytes: 262_214,
+                },
+            ],
+        };
         let encoded = encode_frame(&msg);
         let (parsed, consumed) = parse_frame(&encoded).unwrap();
         assert_eq!(consumed, encoded.len());

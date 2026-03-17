@@ -1,7 +1,7 @@
 //! Centralized queue tuning and low-memory configuration.
 //!
-//! One canonical config surface for queue capacities, claim sizes,
-//! batch caps, and low-memory toggles. All values are determined by
+//! One canonical config surface for queue capacities, batching,
+//! byte-credit watermarks, and low-memory toggles. All values are determined by
 //! the LOW_MEM_IOS environment variable at runtime.
 
 pub fn low_mem_mode() -> bool {
@@ -66,19 +66,10 @@ pub fn bulk_write_batch_cap() -> usize {
     }
 }
 
-pub fn bulk_egress_claim_count() -> usize {
-    if let Some(v) = read_usize_env("P7_BULK_EGRESS_CLAIM_COUNT") {
-        return v.max(1);
-    }
-    if low_mem_mode() {
-        2
-    } else {
-        4
-    }
-}
-
-pub fn egress_send_quantum_bytes() -> usize {
-    if let Some(v) = read_usize_env("P7_EGRESS_SEND_QUANTUM_BYTES") {
+pub fn response_send_quantum_bytes() -> usize {
+    if let Some(v) = read_usize_env("P7_RESPONSE_SEND_QUANTUM_BYTES")
+        .or_else(|| read_usize_env("P7_EGRESS_SEND_QUANTUM_BYTES"))
+    {
         return v.max(1);
     }
     if low_mem_mode() {
@@ -149,12 +140,20 @@ pub fn wanted_refill_quantum() -> usize {
     }
 }
 
-pub fn request_credit_high_watermark() -> usize {
-    wanted_high_watermark()
+pub fn response_credit_high_watermark_bytes() -> usize {
+    if low_mem_mode() {
+        read_usize_env("LOW_MEM_RESPONSE_CREDIT_HIGH_WATERMARK_BYTES").unwrap_or(64 * 1024)
+    } else {
+        read_usize_env("P7_RESPONSE_CREDIT_HIGH_WATERMARK_BYTES").unwrap_or(512 * 1024)
+    }
 }
 
-pub fn request_credit_low_watermark() -> usize {
-    wanted_low_watermark()
+pub fn response_credit_low_watermark_bytes() -> usize {
+    if low_mem_mode() {
+        read_usize_env("LOW_MEM_RESPONSE_CREDIT_LOW_WATERMARK_BYTES").unwrap_or(16 * 1024)
+    } else {
+        read_usize_env("P7_RESPONSE_CREDIT_LOW_WATERMARK_BYTES").unwrap_or(128 * 1024)
+    }
 }
 
 pub fn request_inflight_ttl_ms() -> i64 {

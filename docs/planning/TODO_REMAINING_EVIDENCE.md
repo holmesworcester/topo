@@ -17,7 +17,7 @@ Maps each TODO section/item to file/test proof of completion.
 | `network_contract.rs` → `peering_contract.rs` | `src/contracts/peering_contract.rs` |
 | `ReplicationStore` → `SyncStore` | `src/contracts/event_pipeline_contract.rs:65` |
 | `SqliteReplicationStore` → `SqliteSyncStore` | Zero symbol hits in `src/` (legacy names removed from active code) |
-| `ReplicationSessionHandler` → `SyncSessionHandler` | `src/sync/session_handler.rs:109`, `src/sync/mod.rs:7` |
+| `ReplicationSessionHandler` → `SyncConnectionHandler` | `src/sync/session_handler.rs:109`, `src/sync/mod.rs:7` |
 | `tests/replication_contract_tests/` → `tests/sync_contract_tests/` | `tests/sync_contract_tests/main.rs` |
 | Boundary script updated | `scripts/check_boundary_imports.sh` uses `event_pipeline_contract`, `peering_contract` |
 | Active docs vocabulary | `docs/INDEX.md` superseded table updated; `docs/DESIGN.md` `Frame::Event` (was `SyncMessage::Event`) |

@@ -6,7 +6,7 @@ use tokio_util::sync::CancellationToken;
 
 use topo::contracts::peering_contract::{SessionDirection, SessionHandler};
 use topo::protocol::Frame;
-use topo::sync::session_handler::SyncSessionHandler;
+use topo::sync::session_handler::SyncConnectionHandler;
 
 use crate::fake_session_io::{
     create_test_db, empty_negentropy_storage, fake_session_io_pair, noop_ingest_tx, run_local,
@@ -28,7 +28,7 @@ async fn drive_empty_inbound_round(peer: &mut crate::fake_session_io::FakePeerSi
         else {
             break;
         };
-        if matches!(frame, Frame::RequestCredit { .. }) {
+        if matches!(frame, Frame::ResponseCredit { .. }) {
             continue;
         }
         let Frame::NegMsg { msg } = frame else {
@@ -50,7 +50,7 @@ async fn drive_empty_inbound_round(peer: &mut crate::fake_session_io::FakePeerSi
 async fn responder_inbound_replies_negmsg_and_stays_open_for_next_round() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncSessionHandler::responder(
+        let handler = SyncConnectionHandler::responder(
             db_path,
             30,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
@@ -90,7 +90,7 @@ async fn responder_inbound_replies_negmsg_and_stays_open_for_next_round() {
 async fn responder_rejects_outbound_direction() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncSessionHandler::responder(
+        let handler = SyncConnectionHandler::responder(
             db_path,
             30,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
@@ -114,10 +114,10 @@ async fn responder_rejects_outbound_direction() {
 }
 
 #[tokio::test]
-async fn responder_ignores_empty_havelist_marker() {
+async fn responder_ignores_empty_request_ids_marker() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncSessionHandler::responder(
+        let handler = SyncConnectionHandler::responder(
             db_path,
             30,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
@@ -135,7 +135,7 @@ async fn responder_ignores_empty_havelist_marker() {
             }
         });
 
-        peer.send_control_msg(&Frame::HaveList { ids: vec![] })
+        peer.send_control_msg(&Frame::RequestIds { ids: vec![] })
             .await;
 
         drive_empty_inbound_round(&mut peer).await;

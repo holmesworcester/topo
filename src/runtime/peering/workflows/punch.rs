@@ -17,7 +17,7 @@ use crate::db::{
     open_connection,
 };
 use crate::protocol::Frame;
-use crate::sync::{CoordinationManager, SyncSessionHandler};
+use crate::sync::{CoordinationManager, SyncConnectionHandler};
 use crate::transport::{
     dial_session_provider, multi_workspace::transport_sni, read_intro_offer_frame,
     tenant_trusts_peer, SessionProvider, TransportClientConfig, TransportConnection,
@@ -306,7 +306,7 @@ async fn run_sync_on_punched_connection(
     let coordination_manager = std::sync::Arc::new(CoordinationManager::new());
     let coordination = coordination_manager.register_peer();
     let handler =
-        SyncSessionHandler::outbound(db_path.to_string(), 60, coordination, shared_ingest);
+        SyncConnectionHandler::outbound(db_path.to_string(), 60, coordination, shared_ingest);
 
     if let Err(e) = handler
         .on_session(meta, session.io, CancellationToken::new())

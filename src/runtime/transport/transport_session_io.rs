@@ -373,8 +373,12 @@ mod tests {
     #[tokio::test]
     async fn session_io_encodes_decodes_control_and_data_frames() {
         let (mut parts, control_state, data_send_state) = build_io(
-            vec![Ok(Frame::NeedList {
-                ids: vec![[0x11; 32]],
+            vec![Ok(Frame::DiscoveryHints {
+                hints: vec![crate::protocol::DiscoveryHint {
+                    event_id: [0x11; 32],
+                    semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
+                    encoded_size_bytes: 144,
+                }],
             })],
             vec![Ok(Frame::Event {
                 blob: vec![1, 2, 3],
@@ -386,8 +390,12 @@ mod tests {
         assert_eq!(consumed, control_frame.len());
         assert_eq!(
             control_msg,
-            Frame::NeedList {
-                ids: vec![[0x11; 32]],
+            Frame::DiscoveryHints {
+                hints: vec![crate::protocol::DiscoveryHint {
+                    event_id: [0x11; 32],
+                    semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
+                    encoded_size_bytes: 144,
+                }],
             }
         );
 
@@ -430,7 +438,7 @@ mod tests {
     #[tokio::test]
     async fn send_control_rejects_trailing_bytes() {
         let (mut parts, _control_state, _data_send_state) = build_io(vec![], vec![]);
-        let mut frame = encode_frame(&Frame::RequestCredit { credits: 7 });
+        let mut frame = encode_frame(&Frame::ResponseCredit { bytes: 7 });
         frame.push(0);
 
         let err = parts

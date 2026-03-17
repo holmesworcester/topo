@@ -3400,7 +3400,7 @@ fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> S
                 )
             }
         }
-        "HaveList" => {
+        "RequestIds" => {
             let count = v["id_count"].as_u64().unwrap_or(0);
             let ids = v["ids"]
                 .as_array()
@@ -3430,6 +3430,41 @@ fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> S
                     count, truncated, shown, extra
                 )
             }
+        }
+        "DiscoveryHints" => {
+            let count = v["hint_count"].as_u64().unwrap_or(0);
+            let ids = v["ids"]
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|x| x.as_str())
+                        .map(short_sync_id)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            let truncated = v["hints_truncated"].as_bool().unwrap_or(false);
+            if ids.is_empty() {
+                format!(" detail=hints(count={} truncated={})", count, truncated)
+            } else {
+                let shown = ids.join(",");
+                let shown_count = ids.len() as u64;
+                let more = count.saturating_sub(shown_count);
+                let extra = if more > 0 {
+                    format!(" (+{} more)", more)
+                } else if truncated {
+                    " ...".to_string()
+                } else {
+                    String::new()
+                };
+                format!(
+                    " detail=hints(count={} truncated={} ids=[{}]{})",
+                    count, truncated, shown, extra
+                )
+            }
+        }
+        "ResponseCredit" => {
+            let bytes = v["bytes"].as_u64().unwrap_or(0);
+            format!(" detail=response_credit(bytes={})", bytes)
         }
         "Event" => {
             let eid = v["event_id"].as_str().unwrap_or("");

@@ -4,9 +4,9 @@ use tokio_util::sync::CancellationToken;
 
 use topo::contracts::peering_contract::{SessionDirection, SessionHandler};
 use topo::db::{open_connection, timeline::EventTimeline, wanted::WantedEvents};
-use topo::protocol::Frame;
+use topo::protocol::{DiscoveryHint, Frame};
 use topo::sync::session::windowing::decode_initial_neg_open;
-use topo::sync::session_handler::SyncSessionHandler;
+use topo::sync::session_handler::SyncConnectionHandler;
 
 use crate::fake_session_io::{
     create_test_db, empty_negentropy_storage, fake_session_io_pair, noop_ingest_tx, run_local,
@@ -37,7 +37,7 @@ async fn initiator_reuses_connection_scoped_credit_across_repeated_rounds() {
         let mut requested_event = [0u8; 32];
         requested_event[0] = 7;
 
-        let handler = SyncSessionHandler::outbound(
+        let handler = SyncConnectionHandler::outbound(
             db_path.clone(),
             30,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
@@ -54,7 +54,7 @@ async fn initiator_reuses_connection_scoped_credit_across_repeated_rounds() {
 
         // First round: grant credit, but there is no wanted work yet.
         let neg_open1 = recv_outbound_negopen(&mut peer).await;
-        peer.send_control_msg(&Frame::RequestCredit { credits: 1 })
+        peer.send_control_msg(&Frame::ResponseCredit { bytes: 1024 })
             .await;
         peer.send_control_msg(&Frame::NegMsg {
             msg: empty_negentropy_response(neg_open1),
@@ -77,7 +77,11 @@ async fn initiator_reuses_connection_scoped_credit_across_repeated_rounds() {
                 .observe_many_for_peer(
                     "test-tenant",
                     &peer_hex,
-                    &[requested_event],
+                    &[DiscoveryHint {
+                        event_id: requested_event,
+                        semantic_type_code: topo::event_modules::EVENT_TYPE_MESSAGE,
+                        encoded_size_bytes: 144,
+                    }],
                     1_000,
                     &timeline
                 )
@@ -87,7 +91,7 @@ async fn initiator_reuses_connection_scoped_credit_across_repeated_rounds() {
         drop(conn);
 
         // On the same long-lived session:
-        // - existing request credit should be reused to emit HaveList
+        // - existing response credit should be reused to emit RequestIds
         // - a later discovery round should still start with another NegOpen
         let mut saw_request = false;
         let mut saw_second_round = false;
@@ -97,8 +101,8 @@ async fn initiator_reuses_connection_scoped_credit_across_repeated_rounds() {
                 .await
                 .expect("expected control frame on long-lived session");
             match frame {
-                Frame::RequestCredit { .. } => {}
-                Frame::HaveList { ids } => {
+                Frame::ResponseCredit { .. } => {}
+                Frame::RequestIds { ids } => {
                     assert_eq!(ids, vec![requested_event]);
                     saw_request = true;
                 }
@@ -116,7 +120,7 @@ async fn initiator_reuses_connection_scoped_credit_across_repeated_rounds() {
             }
         }
 
-        assert!(saw_request, "expected HaveList to reuse connection credit");
+        assert!(saw_request, "expected RequestIds to reuse connection credit");
         assert!(
             saw_second_round,
             "expected a second NegOpen on the same session"

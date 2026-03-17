@@ -49,8 +49,15 @@ fn test_invite_only_daemons_should_autodial_without_manual_connect() {
     let (alice_db, bob_db, invite_link) = bootstrap_alice_and_invite(&tmpdir);
 
     let _alice = start_discovery_daemon(&alice_db);
-    accept_invite_lightweight(&bob_db, &invite_link);
+    accept_invite_with_identity_persisted_only(
+        &bob_db,
+        &invite_link,
+        "user",
+        "device",
+        std::time::Duration::from_secs(30),
+    );
     let _bob = start_discovery_daemon(&bob_db);
+    wait_for_active_tenant_ready(&bob_db, std::time::Duration::from_secs(30));
 
     // Desired behavior: after invite acceptance, daemons should autodial based on
     // persisted bootstrap/discovery state, with no manual connect flag.
@@ -82,12 +89,15 @@ fn test_daemon_cli_invite_lifecycle_works_without_restart() {
     // Create invite while Alice's daemon is running (via RPC).
     let invite_link = topo_create_invite_retry(&alice_db, &daemon_listen_addr(&alice_db));
 
-    // Bob accepts invite before starting daemon (daemon-routed CLI command).
-    accept_invite_lightweight(&bob_db, &invite_link);
-
-    // Bob starts daemon after accept — the persisted invite bootstrap should
-    // be enough here because Alice stayed on the same running daemon/path.
+    accept_invite_with_identity_persisted_only(
+        &bob_db,
+        &invite_link,
+        "user",
+        "device",
+        std::time::Duration::from_secs(30),
+    );
     let _bob = start_daemon(&bob_db);
+    wait_for_active_tenant_ready(&bob_db, std::time::Duration::from_secs(30));
 
     // Bob sends a message in the shared workspace via daemon RPC.
     let bob_event_id = topo_send_retry(&bob_db, "runtime-accept-no-restart");

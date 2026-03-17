@@ -6,20 +6,20 @@ use crate::tuning::request_inflight_ttl_ms;
 
 #[derive(Debug, Clone, Default)]
 pub struct RequestWindowSnapshot {
-    pub remote_credit: usize,
+    pub remote_credit_bytes: usize,
     pub last_credit_received_at: Option<i64>,
     pub inflight_requested: HashMap<EventId, i64>,
 }
 
 #[derive(Debug, Clone, Copy, Default)]
 pub struct RequestWindowStats {
-    pub remote_credit: usize,
+    pub remote_credit_bytes: usize,
     pub inflight_len: usize,
 }
 
 #[derive(Debug, Default)]
 struct ConnectionRequestInner {
-    remote_credit: usize,
+    remote_credit_bytes: usize,
     last_credit_received_at: Option<i64>,
     inflight_requested: HashMap<EventId, i64>,
 }
@@ -30,9 +30,9 @@ pub struct ConnectionRequestState {
 }
 
 impl ConnectionRequestState {
-    pub fn add_credit(&self, credits: usize, now_ms: i64) {
+    pub fn add_credit_bytes(&self, bytes: usize, now_ms: i64) {
         let mut inner = self.inner.lock().expect("request state mutex poisoned");
-        inner.remote_credit = inner.remote_credit.saturating_add(credits);
+        inner.remote_credit_bytes = inner.remote_credit_bytes.saturating_add(bytes);
         inner.last_credit_received_at = Some(now_ms);
     }
 
@@ -40,33 +40,33 @@ impl ConnectionRequestState {
         let mut inner = self.inner.lock().expect("request state mutex poisoned");
         inner.expire_stale(now_ms);
         RequestWindowSnapshot {
-            remote_credit: inner.remote_credit,
+            remote_credit_bytes: inner.remote_credit_bytes,
             last_credit_received_at: inner.last_credit_received_at,
             inflight_requested: inner.inflight_requested.clone(),
         }
     }
 
-    pub fn note_requested(&self, ids: &[EventId], now_ms: i64) {
+    pub fn note_requested(&self, ids: &[EventId], reserved_bytes: usize, now_ms: i64) {
         let mut inner = self.inner.lock().expect("request state mutex poisoned");
         inner.expire_stale(now_ms);
         for event_id in ids {
             inner.inflight_requested.insert(*event_id, now_ms);
         }
-        inner.remote_credit = inner.remote_credit.saturating_sub(ids.len());
+        inner.remote_credit_bytes = inner.remote_credit_bytes.saturating_sub(reserved_bytes);
     }
 
     pub fn stats(&self, now_ms: i64) -> RequestWindowStats {
         let mut inner = self.inner.lock().expect("request state mutex poisoned");
         inner.expire_stale(now_ms);
         RequestWindowStats {
-            remote_credit: inner.remote_credit,
+            remote_credit_bytes: inner.remote_credit_bytes,
             inflight_len: inner.inflight_requested.len(),
         }
     }
 
     pub fn clear(&self) {
         let mut inner = self.inner.lock().expect("request state mutex poisoned");
-        inner.remote_credit = 0;
+        inner.remote_credit_bytes = 0;
         inner.last_credit_received_at = None;
         inner.inflight_requested.clear();
     }
@@ -83,13 +83,21 @@ impl ConnectionRequestInner {
 #[derive(Debug, Clone, Copy, Default)]
 pub struct ResponseQueueStats {
     pub pending_len: usize,
-    pub available_credit: usize,
+    pub pending_bytes: usize,
+    pub available_credit_bytes: usize,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueuedResponse {
+    pub event_id: EventId,
+    pub encoded_size_bytes: usize,
 }
 
 #[derive(Debug, Default)]
 struct ConnectionResponseInner {
-    pending_ids: VecDeque<EventId>,
-    available_credit: usize,
+    pending: VecDeque<QueuedResponse>,
+    pending_bytes: usize,
+    available_credit_bytes: usize,
 }
 
 #[derive(Debug, Default)]
@@ -98,52 +106,57 @@ pub struct ConnectionResponseState {
 }
 
 impl ConnectionResponseState {
-    pub fn consume_requests(&self, ids: &[EventId]) -> usize {
+    pub fn consume_requests(&self, responses: &[QueuedResponse]) -> usize {
         let mut inner = self.inner.lock().expect("response state mutex poisoned");
-        inner.available_credit = inner.available_credit.saturating_sub(ids.len());
-        inner.pending_ids.extend(ids.iter().copied());
-        ids.len()
+        let reserved_bytes: usize = responses.iter().map(|response| response.encoded_size_bytes).sum();
+        inner.available_credit_bytes = inner.available_credit_bytes.saturating_sub(reserved_bytes);
+        inner.pending_bytes = inner.pending_bytes.saturating_add(reserved_bytes);
+        inner.pending.extend(responses.iter().copied());
+        responses.len()
     }
 
-    pub fn desired_credit_grant(&self, high: usize, low: usize) -> usize {
+    pub fn desired_credit_grant_bytes(&self, high: usize, low: usize) -> usize {
         let inner = self.inner.lock().expect("response state mutex poisoned");
         let outstanding_or_reserved = inner
-            .pending_ids
-            .len()
-            .saturating_add(inner.available_credit);
+            .pending_bytes
+            .saturating_add(inner.available_credit_bytes);
         if outstanding_or_reserved > low {
             return 0;
         }
         high.saturating_sub(outstanding_or_reserved)
     }
 
-    pub fn note_granted(&self, grant: usize) {
+    pub fn note_granted_bytes(&self, grant: usize) {
         let mut inner = self.inner.lock().expect("response state mutex poisoned");
-        inner.available_credit = inner.available_credit.saturating_add(grant);
+        inner.available_credit_bytes = inner.available_credit_bytes.saturating_add(grant);
     }
 
-    pub fn pop_next_response(&self) -> Option<EventId> {
+    pub fn pop_next_response(&self) -> Option<QueuedResponse> {
         let mut inner = self.inner.lock().expect("response state mutex poisoned");
-        inner.pending_ids.pop_front()
+        let next = inner.pending.pop_front()?;
+        inner.pending_bytes = inner.pending_bytes.saturating_sub(next.encoded_size_bytes);
+        Some(next)
     }
 
     /// Peek at up to `n` event IDs from the front of the queue without removing them.
     /// Used to batch-read blobs before the send loop pops IDs one at a time.
     pub fn peek_front_n(&self, n: usize) -> Vec<EventId> {
         let inner = self.inner.lock().expect("response state mutex poisoned");
-        inner.pending_ids.iter().take(n).copied().collect()
+        inner.pending.iter().take(n).map(|q| q.event_id).collect()
     }
 
-    pub fn requeue_front(&self, event_id: EventId) {
+    pub fn requeue_front(&self, response: QueuedResponse) {
         let mut inner = self.inner.lock().expect("response state mutex poisoned");
-        inner.pending_ids.push_front(event_id);
+        inner.pending.push_front(response);
+        inner.pending_bytes = inner.pending_bytes.saturating_add(response.encoded_size_bytes);
     }
 
     pub fn stats(&self) -> ResponseQueueStats {
         let inner = self.inner.lock().expect("response state mutex poisoned");
         ResponseQueueStats {
-            pending_len: inner.pending_ids.len(),
-            available_credit: inner.available_credit,
+            pending_len: inner.pending.len(),
+            pending_bytes: inner.pending_bytes,
+            available_credit_bytes: inner.available_credit_bytes,
         }
     }
 
@@ -153,8 +166,9 @@ impl ConnectionResponseState {
 
     pub fn clear(&self) {
         let mut inner = self.inner.lock().expect("response state mutex poisoned");
-        inner.pending_ids.clear();
-        inner.available_credit = 0;
+        inner.pending.clear();
+        inner.pending_bytes = 0;
+        inner.available_credit_bytes = 0;
     }
 }
 
@@ -171,11 +185,11 @@ mod tests {
     #[test]
     fn request_state_expires_stale_inflight_but_keeps_credit() {
         let state = ConnectionRequestState::default();
-        state.add_credit(3, 17);
-        state.note_requested(&[make_event_id(1)], 0);
+        state.add_credit_bytes(300, 17);
+        state.note_requested(&[make_event_id(1)], 100, 0);
 
         let stats = state.stats(request_inflight_ttl_ms() + 1);
-        assert_eq!(stats.remote_credit, 2);
+        assert_eq!(stats.remote_credit_bytes, 200);
         assert_eq!(stats.inflight_len, 0);
 
         let snapshot = state.snapshot(request_inflight_ttl_ms() + 1);
@@ -185,19 +199,29 @@ mod tests {
     #[test]
     fn response_state_requeues_and_tracks_credit() {
         let state = ConnectionResponseState::default();
-        state.note_granted(2);
-        assert_eq!(state.stats().available_credit, 2);
+        state.note_granted_bytes(320);
+        assert_eq!(state.stats().available_credit_bytes, 320);
 
-        state.consume_requests(&[make_event_id(1), make_event_id(2)]);
+        state.consume_requests(&[
+            QueuedResponse {
+                event_id: make_event_id(1),
+                encoded_size_bytes: 120,
+            },
+            QueuedResponse {
+                event_id: make_event_id(2),
+                encoded_size_bytes: 140,
+            },
+        ]);
         let stats = state.stats();
-        assert_eq!(stats.available_credit, 0);
+        assert_eq!(stats.available_credit_bytes, 60);
         assert_eq!(stats.pending_len, 2);
+        assert_eq!(stats.pending_bytes, 260);
 
         let first = state.pop_next_response().unwrap();
         let second = state.pop_next_response().unwrap();
         state.requeue_front(first);
         let replay = state.pop_next_response().unwrap();
         assert_eq!(replay, first);
-        assert_eq!(second, make_event_id(2));
+        assert_eq!(second.event_id, make_event_id(2));
     }
 }

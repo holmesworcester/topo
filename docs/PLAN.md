@@ -233,8 +233,8 @@ Policy for future transport work:
 
 Sync keeps one long-lived request/response lane set per authenticated connection.
 
-1. discovery remains round-scoped (`NegOpen` / `NegMsg` / `NeedList`),
-2. request credit and `HaveList` requests are connection-scoped,
+1. discovery remains round-scoped (`NegOpen` / `NegMsg` / `DiscoveryHints`),
+2. response credit and `RequestIds` requests are connection-scoped,
 3. the data stream carries only requested `Event` blobs,
 4. there is no per-round `Done` / `DataDone` / `DoneAck` completion handshake in live sync.
 

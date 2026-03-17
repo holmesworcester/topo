@@ -397,8 +397,8 @@ Why split streams:
 3. improves practical throughput and observability by separating reconciliation/control chatter from bulk payload flow.
 
 Current shape:
-1. discovery rounds use `NegOpen` / `NegMsg` / `NeedList` on the control stream,
-2. request flow uses `RequestCredit` and `HaveList` on the control stream,
+1. discovery rounds use `NegOpen` / `NegMsg` / `DiscoveryHints` on the control stream,
+2. request flow uses `ResponseCredit` and `RequestIds` on the control stream,
 3. the data stream carries only requested `Event` blobs,
 4. there is no per-round `Done` / `DataDone` / `DoneAck` drain handshake in live sync anymore.
 
@@ -808,7 +808,7 @@ The production peering runtime follows a single conceptual loop:
 3. **Supervisor layer**: startup preflight + loop orchestration live in the peering supervisor. Connectivity inputs are hints to `ensure_connected(peer)`, not independent long-lived owners.
 4. **Dial/accept loops**: `connect_loop` (outbound) and `accept_loop` (inbound) are separate long-running loops coordinated by shared projected state and cancellation/watch channels. QUIC dial/accept + peer identity extraction flows through `transport::connection_lifecycle`, and stream wiring flows through `transport::session_factory`.
 5. **Live peer slot**: after mTLS identity extraction, if the remote transport fingerprint is already backed by projected `peers_shared` state for this tenant, the runtime claims one local live-connection slot per `(db_path, recorded_by, remote_transport_fingerprint)`. Duplicates are closed instead of starting overlapping sync ownership. If both directions appear, the deterministic preferred direction is the lexicographically lower peer dialing outbound and the higher peer retaining inbound; a preferred-direction connection replaces a non-preferred one.
-6. **Sync session runner** (`SyncSessionHandler`): protocol-agnostic session handler invoked via the `SessionHandler` contract.
+6. **Sync connection runner** (`SyncConnectionHandler`): protocol-agnostic connection handler invoked via the `SessionHandler` contract.
 7. **Ingest writer** (`batch_writer`): single shared thread consuming `IngestItem` tuples from all concurrent sessions.
 8. **Projected SQLite state**: projection cascade updates trust rows, completing the loop.
 
@@ -1199,7 +1199,7 @@ Sync event transfer is pull-only.
 1. observer-loop reconciliation discovers missing IDs and candidate suppliers and writes `wanted + wanted_sources`,
 2. sink-side wanted scheduling chooses which IDs to request under source-advertised credit,
 3. sources queue requested IDs in bounded in-memory response buffers and read canonical blobs at send time,
-4. control protocol producers (`Frame::NegOpen`, `Frame::NegMsg`, `Frame::NeedList`, `Frame::HaveList`, `Frame::RequestCredit`, `Frame::IntroOffer`) live in `shared/protocol.rs`,
+4. control protocol producers (`Frame::NegOpen`, `Frame::NegMsg`, `Frame::DiscoveryHints`, `Frame::RequestIds`, `Frame::ResponseCredit`, `Frame::IntroOffer`) live in `shared/protocol.rs`,
 5. hot-observer wakeups from newly valid shared events cause the next peer observation pass to discover those IDs so the sink can request them.
 
 There is no durable sync egress queue anymore. Live sync event transport is request/response only and uses bounded in-memory connection-scoped response buffers.
@@ -1235,7 +1235,7 @@ Multi-source download is receiver-driven.
 Negentropy does discovery only:
 1. per source peer, the observer loop discovers:
    - sink `need_ids` (events we still lack),
-   - source `have_ids` (events the remote peer appears to be missing, emitted as `NeedList` discovery hints rather than unsolicited data),
+   - source `have_ids` (events the remote peer appears to be missing, emitted as `DiscoveryHints` rather than unsolicited data),
    - candidate source membership ("peer P appears to have event E").
 2. this discovery is written into SQL-backed wanted state rather than being
    balanced inline inside the negentropy round.

@@ -10,9 +10,10 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cli_harness::{
-    assert_eventually, create_invite_with_spki, daemon_listen_addr, daemon_transport_fingerprint,
-    ensure_active_peer, generate_messages, message_count_sql, peak_rss_mib_for_pid, send_message,
-    start_daemon_with_options, topo_cmd, DaemonOptions, HarnessDaemon,
+    accept_invite_with_identity_persisted_only, assert_eventually, create_invite_with_spki,
+    daemon_listen_addr, daemon_transport_fingerprint, ensure_active_peer, generate_messages,
+    message_count_sql, peak_rss_mib_for_pid, send_message, start_daemon_with_options, topo_cmd,
+    DaemonOptions, HarnessDaemon,
 };
 
 struct SharedWorkspaceBench {
@@ -170,8 +171,13 @@ fn create_workspace_direct(db: &str, username: &str, device_name: &str) {
 }
 
 fn accept_invite_direct(db: &str, invite_link: &str, username: &str, device_name: &str) {
-    topo::event_modules::workspace::commands::accept_invite(db, invite_link, username, device_name)
-        .expect("accept_invite");
+    accept_invite_with_identity_persisted_only(
+        db,
+        invite_link,
+        username,
+        device_name,
+        Duration::from_secs(30),
+    );
 }
 
 fn wait_for_message_count(db: &str, expected: i64, timeout: Duration) {
