@@ -218,4 +218,37 @@ mod tests {
             "bootstrap install should succeed for other peer"
         );
     }
+
+    /// Verifies that apply_intent no longer sets local_transport_targets.
+    /// Target recording is now the projection pipeline's job (write_exec.rs).
+    #[test]
+    fn adapter_does_not_set_transport_target() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let adapter = ConcreteTransportIdentityAdapter;
+        let recorded_by = "tenant-no-target";
+        let invite_event_id = [3u8; 32];
+        insert_invite_secret(&conn, recorded_by, invite_event_id, [3u8; 32]);
+
+        let result = adapter.apply_intent(
+            &conn,
+            TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+                recorded_by: recorded_by.to_string(),
+                invite_event_id,
+            },
+        );
+        assert!(result.is_ok(), "bootstrap install should succeed");
+
+        let target_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM local_transport_targets",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            target_count, 0,
+            "adapter must not write local_transport_targets; pipeline owns target recording"
+        );
+    }
 }

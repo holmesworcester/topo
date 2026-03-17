@@ -169,3 +169,105 @@ pub(crate) fn execute_emit_commands(
     }
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::contracts::transport_identity_contract::TransportIdentityIntent;
+    use crate::db::{open_in_memory, schema::create_tables};
+    use rusqlite::OptionalExtension;
+
+    fn insert_invite_secret(
+        conn: &rusqlite::Connection,
+        recorded_by: &str,
+        invite_event_id: [u8; 32],
+        key: [u8; 32],
+    ) {
+        let eid_b64 = crate::crypto::event_id_to_base64(&invite_event_id);
+        let secret_eid = crate::crypto::event_id_to_base64(&[0xAAu8; 32]);
+        conn.execute(
+            "INSERT INTO invite_secrets
+             (recorded_by, event_id, invite_event_id, private_key, created_at)
+             VALUES (?1, ?2, ?3, ?4, 0)",
+            rusqlite::params![recorded_by, secret_eid, eid_b64, key.to_vec()],
+        )
+        .unwrap();
+    }
+
+    /// Pipeline-level test: execute_emit_commands with ApplyTransportIdentityIntent
+    /// must record the transport target mapping in local_transport_targets.
+    /// This validates that the ownership transfer from adapter → pipeline is wired correctly.
+    #[test]
+    fn execute_emit_commands_records_transport_target_for_bootstrap_intent() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let recorded_by = "tenant-pipeline";
+        let invite_event_id = [0x42u8; 32];
+        insert_invite_secret(&conn, recorded_by, invite_event_id, [0x42u8; 32]);
+
+        let intent = TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+            recorded_by: recorded_by.to_string(),
+            invite_event_id,
+        };
+        let cmd = EmitCommand::ApplyTransportIdentityIntent { intent };
+        execute_emit_commands(&conn, recorded_by, &[cmd]).unwrap();
+
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT transport_peer_id, source
+                 FROM local_transport_targets WHERE tenant_id = ?1",
+                rusqlite::params![recorded_by],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .unwrap();
+        let (peer_id, source) = row.expect("pipeline must write local_transport_targets");
+        assert!(!peer_id.is_empty(), "transport_peer_id must be non-empty");
+        assert_eq!(source, crate::db::transport_creds::CRED_SOURCE_BOOTSTRAP);
+    }
+
+    /// Pipeline-level test: peershared intent also records target mapping via pipeline.
+    #[test]
+    fn execute_emit_commands_records_transport_target_for_peershared_intent() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let recorded_by = "tenant-peershared";
+        let signer_event_id = [0x55u8; 32];
+        let signer_eid_b64 = crate::crypto::event_id_to_base64(&signer_event_id);
+        let key_bytes = [0x55u8; 32];
+        conn.execute(
+            "INSERT INTO peer_secrets
+             (recorded_by, event_id, signer_event_id, private_key, created_at)
+             VALUES (?1, ?2, ?3, ?4, 0)",
+            rusqlite::params![
+                recorded_by,
+                signer_eid_b64.clone(),
+                signer_eid_b64,
+                key_bytes.to_vec()
+            ],
+        )
+        .unwrap();
+
+        let intent = TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+            recorded_by: recorded_by.to_string(),
+            signer_event_id,
+        };
+        let cmd = EmitCommand::ApplyTransportIdentityIntent { intent };
+        execute_emit_commands(&conn, recorded_by, &[cmd]).unwrap();
+
+        let row: Option<(String, String)> = conn
+            .query_row(
+                "SELECT transport_peer_id, source
+                 FROM local_transport_targets WHERE tenant_id = ?1",
+                rusqlite::params![recorded_by],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()
+            .unwrap();
+        let (peer_id, source) = row.expect("pipeline must write local_transport_targets");
+        assert!(!peer_id.is_empty(), "transport_peer_id must be non-empty");
+        assert_eq!(source, crate::db::transport_creds::CRED_SOURCE_PEER_SHARED);
+    }
+}
