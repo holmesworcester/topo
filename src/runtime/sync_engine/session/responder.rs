@@ -8,6 +8,7 @@
 //! Reconciliation runs on a dedicated OS thread so the main loop can
 //! continue draining requested responses during the 100-400ms reconcile() calls.
 
+use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
@@ -18,11 +19,12 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::IngestItem;
+use crate::crypto::EventId;
 use crate::db::timeline::EventTimeline;
 use crate::db::{
     open_connection,
     queue::current_timestamp_ms,
-    store::{lookup_workspace_id, Store},
+    store::{current_neg_visible_seq, lookup_workspace_id, Store},
     wanted::WantedEvents,
 };
 use crate::protocol::Frame;
@@ -30,21 +32,27 @@ use crate::runtime::memtrace;
 use crate::runtime::SyncStats;
 use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
-use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
+use crate::transport::{StreamRecv, StreamSend};
 use crate::tuning::{
     low_mem_memtrace, low_mem_mode, request_credit_high_watermark, request_credit_low_watermark,
 };
 
 use super::connection_scope::{ConnectionRequestState, ConnectionResponseState};
 use super::control_plane::{
-    observe_event_ids_for_peer, refill_wanted_requests, send_request_credit,
+    enqueue_recent_local_responses, observe_event_ids_for_peer, refill_wanted_requests,
+    send_recent_local_need_hints, send_request_credit, NeedHintDedupe,
 };
 use super::coordinator::PeerCoord;
 use super::data_plane::{drain_pending_responses_to_data_stream, spawn_data_receiver};
 use super::logging::{SyncRunCapture, SyncRunRxCapture};
-use super::windowing::{decode_initial_neg_open, SyncWindow, SyncWindowKind};
+use super::windowing::{
+    decode_initial_neg_open, decode_round_neg_msg, encode_round_neg_msg, SyncRound, SyncWindow,
+    SyncWindowKind,
+};
 use super::{
-    negentropy_frame_size, send_idle_capture_enabled, CONTROL_POLL_TIMEOUT,
+    configure_sync_db_connection, control_loop_profile_enabled, control_loop_profile_threshold_ms,
+    control_poll_timeout, hot_hint_interval, hot_hint_lookback, maybe_yield_after_control_send,
+    negentropy_frame_size, send_idle_capture_enabled, spawn_control_receiver,
     INITIAL_CONTROL_PROGRESS_TIMEOUT,
 };
 
@@ -56,14 +64,109 @@ fn should_treat_as_startup_control_abort(
     rounds == 0 && events_sent == 0 && bytes_received.load(Ordering::Relaxed) == 0
 }
 
+#[derive(Debug)]
+struct ActiveInboundRound {
+    round: SyncRound,
+    kind: SyncWindowKind,
+    started_at: Instant,
+    request_tx: std::sync::mpsc::Sender<Vec<u8>>,
+    response_rx: std::sync::mpsc::Receiver<Result<Vec<u8>, String>>,
+    handle: std::thread::JoinHandle<()>,
+    observed_ids: Vec<EventId>,
+}
+
+fn spawn_inbound_round(
+    db_path: &str,
+    ws_id: &str,
+    window: SyncWindow,
+    round: SyncRound,
+) -> ActiveInboundRound {
+    let (request_tx, request_rx) = std::sync::mpsc::channel::<Vec<u8>>();
+    let (response_tx, response_rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
+    let db_path = db_path.to_string();
+    let ws_id = ws_id.to_string();
+    let handle = std::thread::spawn(move || {
+        let neg_db = open_connection(&db_path).expect("neg worker: open_connection");
+        configure_sync_db_connection(&neg_db);
+        let neg_storage = NegentropyStorageSqlite::new_with_scope(
+            &neg_db,
+            &ws_id,
+            window.ts_min(),
+            window.ts_max_exclusive(),
+            Some(round.snapshot_seq),
+        );
+        let rebuild_start = Instant::now();
+        neg_storage
+            .rebuild_blocks()
+            .expect("neg worker: rebuild_blocks");
+        let item_count = neg_storage.size().unwrap_or(0);
+        info!(
+            "Responder round {} storage has {} items (window={:?}, snapshot_seq={}, rebuild={}ms)",
+            round.round_id,
+            item_count,
+            window.kind,
+            round.snapshot_seq,
+            rebuild_start.elapsed().as_millis()
+        );
+
+        let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), negentropy_frame_size())
+            .expect("neg worker: Negentropy::new");
+
+        while let Ok(msg) = request_rx.recv() {
+            let reconcile_start = Instant::now();
+            let result = neg.reconcile(&msg).map_err(|e| format!("{e}"));
+            info!(
+                "Responder worker processed negentropy message (round={}, window={:?}, req_bytes={}, elapsed={}ms, ok={})",
+                round.round_id,
+                window.kind,
+                msg.len(),
+                reconcile_start.elapsed().as_millis(),
+                result.is_ok()
+            );
+            if response_tx.send(result).is_err() {
+                break;
+            }
+        }
+    });
+
+    ActiveInboundRound {
+        round,
+        kind: window.kind,
+        started_at: Instant::now(),
+        request_tx,
+        response_rx,
+        handle,
+        observed_ids: Vec::new(),
+    }
+}
+
+fn finish_inbound_round(
+    round: ActiveInboundRound,
+    timeline: &EventTimeline<'_>,
+) -> Result<(), String> {
+    if !round.observed_ids.is_empty() {
+        let _ = timeline
+            .mark_discovery_round_completed_many(&round.observed_ids, current_timestamp_ms());
+    }
+    drop(round.request_tx);
+    round
+        .handle
+        .join()
+        .map_err(|_| "round worker panicked".to_string())?;
+    Ok(())
+}
+
 /// Run sync as the responder (server role) with dual streams.
 ///
 /// Callers must provide a `shared_ingest` sender connected to a shared
 /// batch_writer. The session never spawns its own writer thread.
 /// This eliminates SQLite write contention when multiple sources sync
 /// concurrently.
-pub async fn run_sync_responder<C, S, R>(
-    conn: DualConnection<C, S, R>,
+pub async fn run_sync_responder<CS, CR, S, R>(
+    mut control_send: CS,
+    control_recv: CR,
+    mut data_send: S,
+    data_recv: R,
     _session_id: u64,
     db_path: &str,
     timeout_secs: u64,
@@ -79,15 +182,11 @@ pub async fn run_sync_responder<C, S, R>(
     rx_capture: Option<SyncRunRxCapture>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
-    C: StreamConn,
+    CS: StreamSend,
+    CR: StreamRecv + Send + 'static,
     S: StreamSend,
     R: StreamRecv + Send + 'static,
 {
-    let DualConnection {
-        mut control,
-        mut data_send,
-        data_recv,
-    } = conn;
     let start = Instant::now();
     let activity_timeout = Duration::from_secs(timeout_secs);
     let mut last_activity = Instant::now();
@@ -98,7 +197,7 @@ where
     );
 
     let db = open_connection(db_path)?;
-    let use_snapshot = !low_mem_mode();
+    configure_sync_db_connection(&db);
 
     let ws_id = lookup_workspace_id(&db, recorded_by).ok_or_else(|| {
         format!(
@@ -106,54 +205,6 @@ where
             recorded_by
         )
     })?;
-
-    let db_path_for_neg = db_path.to_string();
-    let ws_id_for_neg = ws_id.clone();
-    let mut neg_req_tx: Option<std::sync::mpsc::Sender<Vec<u8>>> = None;
-    let mut neg_resp_rx: Option<std::sync::mpsc::Receiver<Result<Vec<u8>, String>>> = None;
-    let mut neg_worker: Option<std::thread::JoinHandle<()>> = None;
-    let spawn_neg_worker = |window: SyncWindow| {
-        let (req_tx, req_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        let (resp_tx, resp_rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
-        let db_path = db_path_for_neg.clone();
-        let ws_id = ws_id_for_neg.clone();
-        let handle = std::thread::spawn(move || {
-            let neg_db = open_connection(&db_path).expect("neg worker: open_connection");
-            let neg_storage = match window.kind {
-                SyncWindowKind::Full => NegentropyStorageSqlite::new(&neg_db, &ws_id),
-                _ => NegentropyStorageSqlite::new_with_range(
-                    &neg_db,
-                    &ws_id,
-                    window.ts_min(),
-                    window.ts_max_exclusive(),
-                ),
-            };
-            if use_snapshot {
-                neg_db.execute("BEGIN", []).expect("neg worker: BEGIN");
-            }
-            neg_storage
-                .rebuild_blocks()
-                .expect("neg worker: rebuild_blocks");
-
-            let item_count = neg_storage.size().unwrap_or(0);
-            info!("Negentropy storage has {} items (responder)", item_count);
-
-            let mut neg = Negentropy::new(Storage::Borrowed(&neg_storage), negentropy_frame_size())
-                .expect("neg worker: Negentropy::new");
-
-            while let Ok(msg) = req_rx.recv() {
-                let result = neg.reconcile(&msg).map_err(|e| format!("{}", e));
-                if resp_tx.send(result).is_err() {
-                    break;
-                }
-            }
-
-            if use_snapshot {
-                let _ = neg_db.execute("COMMIT", []);
-            }
-        });
-        (req_tx, resp_rx, handle)
-    };
 
     let store = Store::new(&db);
     let timeline = EventTimeline::new(&db);
@@ -176,13 +227,11 @@ where
 
     let mut events_sent: u64 = 0;
     let mut bytes_sent: u64 = 0;
+    let (control_shutdown_tx, mut control_rx, control_recv_handle) =
+        spawn_control_receiver(control_recv);
     let mut rounds = 0;
-    let mut round_observed_ids: Vec<crate::crypto::EventId> = Vec::new();
     let sync_start = Instant::now();
-    let reconcile_start = Instant::now();
-    let mut reconcile_started_at_ms = current_timestamp_ms();
     let mut last_bytes_received = 0u64;
-    let mut reconciling = false;
     let memtrace_enabled = low_mem_memtrace();
     let memtrace_interval = Duration::from_secs(2);
     let memtrace_file = std::env::var("LOW_MEM_MEMTRACE_FILE").ok();
@@ -191,11 +240,24 @@ where
     let idle_capture_enabled = send_idle_capture_enabled() && capture.is_some();
     let mut last_send_progress = Instant::now();
     let mut last_idle_marker = Instant::now();
+    let mut next_hot_hint_due = Instant::now();
+    let mut active_rounds: HashMap<u64, ActiveInboundRound> = HashMap::new();
+    let mut need_hint_dedupe = NeedHintDedupe::default();
+    let profile_control_loop = control_loop_profile_enabled();
+    let profile_threshold_ms = control_loop_profile_threshold_ms();
 
     let credit_high = request_credit_high_watermark().max(1);
     let credit_low = request_credit_low_watermark().min(credit_high.saturating_sub(1));
 
     loop {
+        let loop_started_at = Instant::now();
+        let mut profile_hot_hint_ms = 0u128;
+        let mut profile_round_work_ms = 0u128;
+        let mut profile_recv_ms = 0u128;
+        let mut profile_refill_ms = 0u128;
+        let mut profile_drain_ms = 0u128;
+        let mut profile_grant_ms = 0u128;
+
         // Data receiver runs in a separate task — check if it received data
         let current_bytes = bytes_received.load(Ordering::Relaxed);
         if current_bytes > last_bytes_received {
@@ -224,7 +286,7 @@ where
                     serde_json::to_string(&json!({
                         "peer_id": peer_id,
                         "elapsed_ms": sync_start.elapsed().as_millis(),
-                        "reconciling": reconciling,
+                        "reconciling": !active_rounds.is_empty(),
                     }))
                     .ok(),
                 );
@@ -232,102 +294,185 @@ where
             break;
         }
 
-        // Check for reconciliation response from worker thread
-        if reconciling {
-            match neg_resp_rx
-                .as_ref()
-                .expect("neg responder worker missing")
-                .try_recv()
-            {
+        if Instant::now() >= next_hot_hint_due {
+            let phase_started_at = Instant::now();
+            let scan_until_ms = current_timestamp_ms();
+            let scan_from_ms = scan_until_ms.saturating_sub(hot_hint_lookback().as_millis() as i64);
+            let hinted = send_recent_local_need_hints(
+                &mut control_send,
+                &timeline,
+                &db,
+                recorded_by,
+                scan_from_ms,
+                scan_until_ms,
+                &mut need_hint_dedupe,
+            )
+            .await?;
+            if hinted > 0 {
+                last_activity = Instant::now();
+            }
+            let pushed = enqueue_recent_local_responses(
+                response_state,
+                &db,
+                recorded_by,
+                scan_from_ms,
+                scan_until_ms,
+            )?;
+            if pushed > 0 {
+                last_activity = Instant::now();
+            }
+            next_hot_hint_due = Instant::now() + hot_hint_interval();
+            profile_hot_hint_ms += phase_started_at.elapsed().as_millis();
+        }
+
+        let phase_started_at = Instant::now();
+        let mut completed_round_ids = Vec::new();
+        let active_round_ids: Vec<u64> = active_rounds.keys().copied().collect();
+        for round_id in active_round_ids {
+            let round_result = match active_rounds.get_mut(&round_id) {
+                Some(round) => round.response_rx.try_recv(),
+                None => continue,
+            };
+            match round_result {
                 Ok(Ok(response)) => {
-                    reconciling = false;
                     last_activity = Instant::now();
+                    let round = active_rounds
+                        .get(&round_id)
+                        .expect("inbound round missing during response");
                     if response.is_empty() {
                         info!(
-                            "Reconciliation complete: {} rounds, {}ms",
-                            rounds,
-                            reconcile_start.elapsed().as_millis()
+                            "Reconciliation complete for round {} (window={:?}, elapsed={}ms)",
+                            round.round.round_id,
+                            round.kind,
+                            round.started_at.elapsed().as_millis()
                         );
-                        let _ = timeline.mark_discovery_round_completed_many(
-                            &round_observed_ids,
-                            current_timestamp_ms(),
-                        );
+                        completed_round_ids.push(round_id);
                     } else {
-                        control.send(&Frame::NegMsg { msg: response }).await?;
-                        control.flush().await?;
+                        control_send
+                            .send(&Frame::NegMsg {
+                                msg: encode_round_neg_msg(round.round, response),
+                            })
+                            .await?;
+                        control_send.flush().await?;
+                        maybe_yield_after_control_send().await;
                     }
-                    neg_req_tx = None;
-                    neg_resp_rx = None;
-                    if let Some(handle) = neg_worker.take() {
-                        let _ = handle.join();
-                    }
-                    round_observed_ids.clear();
                 }
-                Ok(Err(e)) => {
-                    return Err(e.into());
-                }
-                Err(std::sync::mpsc::TryRecvError::Empty) => {
-                    // Worker still processing — continue draining egress
-                }
+                Ok(Err(err)) => return Err(err.into()),
+                Err(std::sync::mpsc::TryRecvError::Empty) => {}
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
-                    return Err("neg worker disconnected".into());
+                    return Err(format!("neg worker disconnected for round {}", round_id).into());
                 }
             }
         }
+        for round_id in completed_round_ids.drain(..) {
+            if let Some(round) = active_rounds.remove(&round_id) {
+                finish_inbound_round(round, &timeline)
+                    .map_err(|e| format!("Failed to finish inbound round {round_id}: {e}"))?;
+            }
+        }
+        profile_round_work_ms += phase_started_at.elapsed().as_millis();
 
-        match tokio::time::timeout(CONTROL_POLL_TIMEOUT, control.recv()).await {
-            Ok(Ok(Frame::NegOpen { msg })) => {
+        let phase_started_at = Instant::now();
+        match tokio::time::timeout(control_poll_timeout(), control_rx.recv()).await {
+            Ok(Some(Ok(Frame::NegOpen { msg }))) => {
                 last_activity = Instant::now();
                 rounds += 1;
-                reconcile_started_at_ms = current_timestamp_ms();
-                let (window, inner_msg) =
+                let (open, inner_msg) =
                     decode_initial_neg_open(&msg).map_err(|e| format!("bad NegOpen: {e}"))?;
-                if neg_req_tx.is_some() || reconciling {
-                    return Err("received overlapping NegOpen before prior round completed".into());
+                if active_rounds.contains_key(&open.round.round_id) {
+                    return Err(format!(
+                        "received overlapping NegOpen for round {}",
+                        open.round.round_id
+                    )
+                    .into());
                 }
-                round_observed_ids.clear();
-                let (req_tx, resp_rx, handle) = spawn_neg_worker(window);
-                neg_req_tx = Some(req_tx);
-                neg_resp_rx = Some(resp_rx);
-                neg_worker = Some(handle);
-                neg_req_tx
-                    .as_ref()
-                    .expect("neg worker sender missing")
+                let round = SyncRound {
+                    round_id: open.round.round_id,
+                    snapshot_seq: current_neg_visible_seq(&db)?,
+                };
+                let inbound_round = spawn_inbound_round(db_path, &ws_id, open.window, round);
+                inbound_round
+                    .request_tx
                     .send(inner_msg.to_vec())
                     .map_err(|_| "neg worker channel closed".to_string())?;
-                reconciling = true;
+                info!(
+                    "Responder accepted NegOpen for round {} (remote_snapshot_seq={}, local_snapshot_seq={}, window={:?})",
+                    round.round_id,
+                    open.round.snapshot_seq,
+                    round.snapshot_seq,
+                    open.window.kind
+                );
+                active_rounds.insert(round.round_id, inbound_round);
             }
-            Ok(Ok(Frame::NegMsg { msg })) => {
+            Ok(Some(Ok(Frame::NegMsg { msg }))) => {
                 last_activity = Instant::now();
                 rounds += 1;
-                neg_req_tx
-                    .as_ref()
-                    .ok_or_else(|| "received NegMsg before NegOpen".to_string())?
-                    .send(msg)
-                    .map_err(|_| "neg worker channel closed".to_string())?;
-                reconciling = true;
+                let (round, inner_msg) =
+                    decode_round_neg_msg(&msg).map_err(|e| format!("bad NegMsg: {e}"))?;
+                if let Some(active_round) = active_rounds.get(&round.round_id) {
+                    active_round
+                        .request_tx
+                        .send(inner_msg.to_vec())
+                        .map_err(|_| "neg worker channel closed".to_string())?;
+                } else if round.round_id != 0 {
+                    info!(
+                        "Ignoring NegMsg for stale/unknown round {} from peer {}",
+                        round.round_id, peer_id
+                    );
+                } else {
+                    return Err("received NegMsg before NegOpen".into());
+                }
             }
-            Ok(Ok(Frame::HaveList { ids })) => {
+            Ok(Some(Ok(Frame::HaveList { ids }))) => {
                 last_activity = Instant::now();
                 if ids.is_empty() {
                     continue;
                 }
+                let mark_request_received_start = Instant::now();
                 let _ = timeline.mark_request_received_many(&ids, current_timestamp_ms());
+                let mark_request_received_elapsed = mark_request_received_start.elapsed();
+                if mark_request_received_elapsed >= Duration::from_millis(50) {
+                    info!(
+                        "Responder mark_request_received_many took {}ms (ids={})",
+                        mark_request_received_elapsed.as_millis(),
+                        ids.len()
+                    );
+                }
                 response_state.consume_requests(&ids);
             }
-            Ok(Ok(Frame::NeedList { ids })) => {
+            Ok(Some(Ok(Frame::NeedList { ids }))) => {
                 last_activity = Instant::now();
                 let need_received_at = current_timestamp_ms();
+                let mark_need_list_received_start = Instant::now();
                 let _ = timeline.mark_need_list_received_many(&ids, need_received_at);
+                let mark_need_list_received_elapsed = mark_need_list_received_start.elapsed();
+                if mark_need_list_received_elapsed >= Duration::from_millis(50) {
+                    info!(
+                        "Responder mark_need_list_received_many took {}ms (ids={})",
+                        mark_need_list_received_elapsed.as_millis(),
+                        ids.len()
+                    );
+                }
+                let observe_needed_start = Instant::now();
+                let mut observed_ids = Vec::with_capacity(ids.len());
                 let observed = observe_event_ids_for_peer(
                     &wanted,
                     &timeline,
                     recorded_by,
                     peer_id,
-                    reconcile_started_at_ms,
+                    current_timestamp_ms(),
                     &ids,
-                    &mut round_observed_ids,
+                    &mut observed_ids,
                 )?;
+                let observe_needed_elapsed = observe_needed_start.elapsed();
+                if observe_needed_elapsed >= Duration::from_millis(50) {
+                    info!(
+                        "Responder observe_event_ids_for_peer took {}ms (ids={}, observed={})",
+                        observe_needed_elapsed.as_millis(),
+                        ids.len(),
+                        observed
+                    );
+                }
                 if observed > 0 {
                     info!(
                         "Observed {} needed IDs from peer {} via NeedList",
@@ -335,12 +480,12 @@ where
                     );
                 }
             }
-            Ok(Ok(Frame::RequestCredit { credits })) => {
+            Ok(Some(Ok(Frame::RequestCredit { credits }))) => {
                 last_activity = Instant::now();
                 request_state.add_credit(credits as usize, current_timestamp_ms());
             }
-            Ok(Ok(_)) => {}
-            Ok(Err(ConnectionError::Closed)) => {
+            Ok(Some(Ok(_))) => {}
+            Ok(Some(Err(ConnectionError::Closed))) => {
                 if should_treat_as_startup_control_abort(rounds, events_sent, &bytes_received) {
                     info!("Control stream closed before sync started by peer");
                 } else {
@@ -348,7 +493,7 @@ where
                 }
                 break;
             }
-            Ok(Err(e)) => {
+            Ok(Some(Err(e))) => {
                 if should_treat_as_startup_control_abort(rounds, events_sent, &bytes_received) {
                     info!("Control stream closed before sync started: {}", e);
                 } else {
@@ -356,11 +501,18 @@ where
                 }
                 break;
             }
+            Ok(None) => {
+                info!("Control receiver task ended");
+                break;
+            }
             Err(_) => {}
         }
+        profile_recv_ms += phase_started_at.elapsed().as_millis();
 
+        let phase_started_at = Instant::now();
+        let refill_start = Instant::now();
         let requested_now = refill_wanted_requests(
-            &mut control,
+            &mut control_send,
             &wanted,
             &timeline,
             coordination,
@@ -368,11 +520,23 @@ where
             request_state,
         )
         .await?;
+        let refill_elapsed = refill_start.elapsed();
+        if refill_elapsed >= Duration::from_millis(50) {
+            info!(
+                "Responder refill_wanted_requests took {}ms (requested_now={}, reconciling={})",
+                refill_elapsed.as_millis(),
+                requested_now,
+                !active_rounds.is_empty()
+            );
+        }
         if requested_now > 0 {
             last_activity = Instant::now();
         }
+        profile_refill_ms += phase_started_at.elapsed().as_millis();
 
         // Drain requested responses to data stream — runs even while worker is reconciling
+        let phase_started_at = Instant::now();
+        let drain_start = Instant::now();
         let send_stats = drain_pending_responses_to_data_stream(
             response_state,
             &timeline,
@@ -380,19 +544,34 @@ where
             &mut data_send,
         )
         .await;
+        let drain_elapsed = drain_start.elapsed();
+        if drain_elapsed >= Duration::from_millis(50) {
+            let response_stats = response_state.stats();
+            info!(
+                "Responder data drain took {}ms (events_sent_delta={}, bytes_sent_delta={}, pending_after={}, reconciling={})",
+                drain_elapsed.as_millis(),
+                send_stats.events_sent_delta,
+                send_stats.bytes_sent_delta,
+                response_stats.pending_len,
+                !active_rounds.is_empty()
+            );
+        }
         events_sent += send_stats.events_sent_delta;
         bytes_sent += send_stats.bytes_sent_delta;
         if send_stats.events_sent_delta > 0 {
             last_activity = Instant::now();
             last_send_progress = Instant::now();
         }
+        profile_drain_ms += phase_started_at.elapsed().as_millis();
 
-        if neg_req_tx.is_some() {
+        if !active_rounds.is_empty() {
+            let phase_started_at = Instant::now();
             let grant = response_state.desired_credit_grant(credit_high, credit_low);
             if grant > 0 {
-                send_request_credit(&mut control, grant).await?;
+                send_request_credit(&mut control_send, grant).await?;
                 response_state.note_granted(grant);
             }
+            profile_grant_ms += phase_started_at.elapsed().as_millis();
         }
 
         if low_mem_mode() && last_alloc_trim.elapsed() >= Duration::from_millis(100) {
@@ -413,7 +592,7 @@ where
                 "LOWMEM_MEMTRACE responder peer={} rounds={} reconciling={} pending_responses={} response_credit_available={} wanted_peer_backlog={} request_inflight={} request_credit={} ingest_used={}/{} sqlite_mem_cur={} sqlite_mem_high={} sqlite_pcache_ovfl_cur={} sqlite_pcache_ovfl_high={} db_cache={} db_schema={} db_stmt={} mall_arena={} mall_used={} mall_free={} mall_mmap={} bytes_rx={} bytes_tx={}",
                 peer_id,
                 rounds,
-                reconciling,
+                !active_rounds.is_empty(),
                 response_stats.pending_len,
                 response_stats.available_credit,
                 wanted_peer_backlog,
@@ -453,7 +632,7 @@ where
             if let Some(capture) = capture.as_ref() {
                 let idle_state = if response_stats.pending_len > 0 {
                     "queued_not_sending"
-                } else if reconciling || pending_wanted_backlog > 0 {
+                } else if !active_rounds.is_empty() || pending_wanted_backlog > 0 {
                     "waiting_on_control"
                 } else {
                     "between_rounds"
@@ -466,7 +645,7 @@ where
                         "peer_id": peer_id,
                         "state": idle_state,
                         "idle_ms": last_send_progress.elapsed().as_millis(),
-                        "reconciling": reconciling,
+                        "reconciling": !active_rounds.is_empty(),
                         "pending_responses": response_stats.pending_len,
                         "response_credit_available": response_stats.available_credit,
                         "wanted_peer_backlog": pending_wanted_backlog,
@@ -478,12 +657,43 @@ where
             }
             last_idle_marker = Instant::now();
         }
+
+        if profile_control_loop {
+            let total_ms = loop_started_at.elapsed().as_millis();
+            let slow = total_ms >= profile_threshold_ms
+                || profile_hot_hint_ms >= profile_threshold_ms
+                || profile_round_work_ms >= profile_threshold_ms
+                || profile_recv_ms >= profile_threshold_ms
+                || profile_refill_ms >= profile_threshold_ms
+                || profile_drain_ms >= profile_threshold_ms
+                || profile_grant_ms >= profile_threshold_ms;
+            if slow {
+                let request_stats = request_state.stats(current_timestamp_ms());
+                let response_stats = response_state.stats();
+                eprintln!(
+                    "P7 loop responder peer={} total={}ms recv={}ms hot_hint={}ms rounds={}ms refill={}ms drain={}ms grant={}ms active_rounds={} wanted_backlog={} request_credit={} request_inflight={} pending_responses={}",
+                    peer_id,
+                    total_ms,
+                    profile_recv_ms,
+                    profile_hot_hint_ms,
+                    profile_round_work_ms,
+                    profile_refill_ms,
+                    profile_drain_ms,
+                    profile_grant_ms,
+                    active_rounds.len(),
+                    wanted.count_backlog_for_peer(peer_id).unwrap_or(-1),
+                    request_stats.remote_credit,
+                    request_stats.inflight_len,
+                    response_stats.pending_len,
+                );
+            }
+        }
     }
-    // Drop the request channel to signal the worker to exit
-    drop(neg_req_tx);
-    if let Some(handle) = neg_worker {
-        let _ = handle.join();
+    for (_, round) in active_rounds.drain() {
+        let _ = finish_inbound_round(round, &timeline);
     }
+    let _ = control_shutdown_tx.send(());
+    let _ = control_recv_handle.await;
     let _ = shutdown_tx.send(());
     let _ = recv_handle.await;
     drop(ingest_tx);
