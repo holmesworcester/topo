@@ -198,7 +198,7 @@ const TENANT_AUTHORIZED_TRANSPORT_ROWS_SQL: &str = "
             t.invite_event_id AS invite_event_id,
             t.invite_accepted_event_id AS invite_accepted_event_id,
             t.workspace_id AS workspace_id,
-            MIN(t.expires_at) AS expires_at
+            MAX(t.expires_at) AS expires_at
         FROM invite_bootstrap_trust t
         WHERE t.recorded_by = ?1
           AND length(t.bootstrap_spki_fingerprint) = 32

@@ -379,9 +379,9 @@ where
                 }
 
                 let need_hints: Vec<crate::protocol::DiscoveryHint> = need_ids
-                    .iter()
+                    .drain(..)
                     .map(|neg_id| {
-                        let event_id = crate::protocol::neg_id_to_event_id(neg_id);
+                        let event_id = crate::protocol::neg_id_to_event_id(&neg_id);
                         match store.get_shared_summary(&event_id) {
                             Ok(Some(summary)) => crate::protocol::DiscoveryHint {
                                 event_id: summary.event_id,
