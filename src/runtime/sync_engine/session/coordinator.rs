@@ -16,6 +16,22 @@ use crate::crypto::EventId;
 use crate::db::wanted::{WantedCandidate, WantedEvents};
 use crate::tuning::request_inflight_ttl_ms;
 
+/// Conservative per-event credit cost when encoded_size_bytes is 0 (metadata
+/// not yet received via DiscoveryHints). Ensures placeholder-metadata events
+/// still consume credit and cannot generate unbounded RequestIds without fresh
+/// ResponseCredit grants.
+const UNKNOWN_EVENT_CREDIT_FLOOR_BYTES: usize = 256;
+
+/// Effective credit cost for a candidate. Uses a floor for zero-metadata events
+/// so the byte-credit window is respected even before real sizes arrive.
+pub(super) fn credit_cost(encoded_size_bytes: u32) -> usize {
+    if encoded_size_bytes == 0 {
+        UNKNOWN_EVENT_CREDIT_FLOOR_BYTES
+    } else {
+        encoded_size_bytes as usize
+    }
+}
+
 #[derive(Default)]
 struct CoordinatorState {
     peers: HashMap<usize, PeerRequestState>,
@@ -85,7 +101,7 @@ impl PeerCoord {
         if let Some(peer_state) = state.peers.get_mut(&self.peer_idx) {
             let selected_bytes: usize = selected
                 .iter()
-                .map(|candidate| candidate.encoded_size_bytes as usize)
+                .map(|candidate| credit_cost(candidate.encoded_size_bytes))
                 .sum();
             peer_state.available_credit_bytes = peer_state
                 .available_credit_bytes
@@ -227,7 +243,7 @@ fn plan_requests_across_peers(
     ) {
         assignments.entry(peer_idx).or_default().push(event_id);
         if let Some(credit_bytes) = credits_bytes.get_mut(&peer_idx) {
-            *credit_bytes = credit_bytes.saturating_sub(event_id.encoded_size_bytes as usize);
+            *credit_bytes = credit_bytes.saturating_sub(credit_cost(event_id.encoded_size_bytes));
         }
         if let Some(seen) = peer_seen.get_mut(&peer_idx) {
             seen.insert(event_id.event_id);
@@ -249,7 +265,7 @@ fn plan_requests_across_peers(
     ) {
         assignments.entry(peer_idx).or_default().push(event_id);
         if let Some(credit_bytes) = credits_bytes.get_mut(&peer_idx) {
-            *credit_bytes = credit_bytes.saturating_sub(event_id.encoded_size_bytes as usize);
+            *credit_bytes = credit_bytes.saturating_sub(credit_cost(event_id.encoded_size_bytes));
         }
         if let Some(seen) = peer_seen.get_mut(&peer_idx) {
             seen.insert(event_id.event_id);
@@ -280,7 +296,7 @@ fn next_assignment(
         let start = cursors.get(&report.peer_idx).copied().unwrap_or(0);
         let mut idx = start;
         while let Some(candidate) = report.candidates.get(idx) {
-            if candidate.encoded_size_bytes as usize > remaining_credit_bytes {
+            if credit_cost(candidate.encoded_size_bytes) > remaining_credit_bytes {
                 idx += 1;
                 continue;
             }
@@ -475,6 +491,30 @@ mod tests {
         assert_eq!(
             second[0].event_id, c,
             "peer-b should consume the still-unrequested unique candidate first"
+        );
+    }
+
+    /// Zero-metadata candidates (encoded_size_bytes=0, from negentropy placeholders)
+    /// must consume floor credit so they cannot generate unbounded RequestIds
+    /// without receiving fresh ResponseCredit grants.
+    #[test]
+    fn zero_metadata_candidates_consume_floor_credit() {
+        // With credit equal to exactly one floor unit, only one zero-metadata
+        // candidate must be selected. Without the floor fix, 0 <= any credit
+        // so all candidates would be selected and credit would remain unchanged.
+        let reports = vec![PeerRequestReport {
+            peer_idx: 0,
+            available_credit_bytes: UNKNOWN_EVENT_CREDIT_FLOOR_BYTES,
+            inflight_requested: HashMap::new(),
+            candidates: vec![candidate(1, 1, 100, 0), candidate(2, 1, 90, 0)],
+        }];
+
+        let assignments = plan_requests_across_peers(&reports);
+        let assigned = assignments.get(&0).cloned().unwrap_or_default();
+        assert_eq!(
+            assigned.len(),
+            1,
+            "zero-metadata events must consume floor credit, not bypass the byte-credit window"
         );
     }
 
