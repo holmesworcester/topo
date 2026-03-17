@@ -149,8 +149,8 @@ impl<'a> WantedEvents<'a> {
                 "INSERT INTO wanted_events (id, first_seen_at, semantic_type_code, encoded_size_bytes)
                  VALUES (?1, ?2, ?3, ?4)
                  ON CONFLICT(id) DO UPDATE SET
-                     semantic_type_code = COALESCE(wanted_events.semantic_type_code, excluded.semantic_type_code),
-                     encoded_size_bytes = COALESCE(wanted_events.encoded_size_bytes, excluded.encoded_size_bytes)",
+                     semantic_type_code = COALESCE(NULLIF(excluded.semantic_type_code, 0), NULLIF(wanted_events.semantic_type_code, 0), excluded.semantic_type_code),
+                     encoded_size_bytes = COALESCE(NULLIF(excluded.encoded_size_bytes, 0), NULLIF(wanted_events.encoded_size_bytes, 0), excluded.encoded_size_bytes)",
             )?;
             let mut upsert_source = self.conn.prepare(
                 "INSERT INTO wanted_sources (
