@@ -689,6 +689,41 @@ mod tests {
         );
     }
 
+    /// Direct-match inference regression test: creds present where peer_id == tenant_id,
+    /// but no local_transport_targets row — discovery must still return empty.
+    ///
+    /// The old two-phase discovery would find this via the direct JOIN
+    /// `invites_accepted.recorded_by = local_transport_creds.peer_id`. That path
+    /// is removed; this test proves it cannot be silently reintroduced.
+    #[test]
+    fn test_discover_local_tenants_rejects_direct_peer_id_match_without_target_mapping() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        // recorded_by == peer_id — this was the pattern the old direct-match inferred.
+        conn.execute(
+            "INSERT INTO invites_accepted (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES ('tenant_a', 'ia_a', 't_a', 'inv_a', 'ws_a', 1)",
+            [],
+        )
+        .unwrap();
+        store_local_creds_with_source(
+            &conn,
+            "tenant_a", // peer_id == tenant_id — was the old inference trigger
+            b"cert_a",
+            b"key_a",
+            CRED_SOURCE_PEER_SHARED,
+        )
+        .unwrap();
+        // Deliberately no set_local_transport_target call.
+
+        let tenants = discover_local_tenants(&conn).unwrap();
+        assert!(
+            tenants.is_empty(),
+            "creds with peer_id == tenant_id must not be discovered without explicit target mapping"
+        );
+    }
+
     #[test]
     fn test_ensure_schema_adds_source_column_for_legacy_table_shape() {
         let conn = open_in_memory().unwrap();
@@ -781,5 +816,93 @@ mod tests {
         assert_eq!(after[0].peer_id, "tenant-a");
         assert_eq!(after[0].transport_peer_id, "peer-a");
         assert_eq!(before[0].workspace_id, after[0].workspace_id);
+    }
+
+    /// Bootstrap-to-peershared handoff replay: the most likely regression after
+    /// removing two-phase discovery. Verifies that replaying bootstrap then
+    /// upgrading to peershared produces the correct final state.
+    #[test]
+    fn test_discover_local_tenants_bootstrap_to_peershared_replay() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        conn.execute(
+            "INSERT INTO invites_accepted (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES ('tenant-b', 'ia-b', 't-b', 'inv-b', 'ws-b', 1)",
+            [],
+        )
+        .unwrap();
+
+        // Phase 1: bootstrap identity installed first.
+        store_local_creds_with_source(
+            &conn,
+            "bootstrap-peer",
+            b"bootstrap-cert",
+            b"bootstrap-key",
+            CRED_SOURCE_BOOTSTRAP,
+        )
+        .unwrap();
+        set_local_transport_target(&conn, "tenant-b", "bootstrap-peer", CRED_SOURCE_BOOTSTRAP)
+            .unwrap();
+
+        let bootstrap_state = discover_local_tenants(&conn).unwrap();
+        assert_eq!(bootstrap_state.len(), 1);
+        assert_eq!(bootstrap_state[0].transport_peer_id, "bootstrap-peer");
+
+        // Phase 2: peershared identity materializes, target updated.
+        store_local_creds_with_source(
+            &conn,
+            "final-peer",
+            b"final-cert",
+            b"final-key",
+            CRED_SOURCE_PEER_SHARED,
+        )
+        .unwrap();
+        set_local_transport_target(&conn, "tenant-b", "final-peer", CRED_SOURCE_PEER_SHARED)
+            .unwrap();
+
+        let final_state = discover_local_tenants(&conn).unwrap();
+        assert_eq!(final_state.len(), 1);
+        assert_eq!(
+            final_state[0].transport_peer_id, "final-peer",
+            "after peershared upgrade, transport_peer_id must point to peershared identity"
+        );
+
+        // Replay: wipe and rebuild both phases in order.
+        conn.execute_batch(
+            "DELETE FROM local_transport_creds;
+             DELETE FROM local_transport_targets;",
+        )
+        .unwrap();
+
+        // Bootstrap phase replay.
+        store_local_creds_with_source(
+            &conn,
+            "bootstrap-peer",
+            b"bootstrap-cert",
+            b"bootstrap-key",
+            CRED_SOURCE_BOOTSTRAP,
+        )
+        .unwrap();
+        set_local_transport_target(&conn, "tenant-b", "bootstrap-peer", CRED_SOURCE_BOOTSTRAP)
+            .unwrap();
+
+        // Peershared upgrade replay.
+        store_local_creds_with_source(
+            &conn,
+            "final-peer",
+            b"final-cert",
+            b"final-key",
+            CRED_SOURCE_PEER_SHARED,
+        )
+        .unwrap();
+        set_local_transport_target(&conn, "tenant-b", "final-peer", CRED_SOURCE_PEER_SHARED)
+            .unwrap();
+
+        let replayed = discover_local_tenants(&conn).unwrap();
+        assert_eq!(replayed.len(), 1, "replay must restore exactly one tenant");
+        assert_eq!(replayed[0].transport_peer_id, "final-peer",
+            "replayed state must converge to peershared identity, not stale bootstrap");
+        assert_eq!(replayed[0].workspace_id, final_state[0].workspace_id);
     }
 }
