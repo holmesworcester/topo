@@ -132,6 +132,9 @@ Negentropy reconciliation exchanges compact set summaries (`NegOpen`/`NegMsg`) o
 We use the Rust [`negentropy` library](https://crates.io/crates/negentropy) (`negentropy = "0.5"` in this repo), and this is the concrete engine behind our range-based set reconciliation approach ([Aljoscha Meyer, "Range-Based Set Reconciliation"](https://aljoscha-meyer.de/assets/landing/rbsr.pdf)). We modified our Negentropy integration to use a SQLite-backed store (`neg_items` + per-session `session_blocks`) instead of unbounded in-memory item sets, so reconciliation remains memory-bounded at large history sizes. (This is important for doing background sync in a memory-limited context on iOS). 
 
 We also modified the session flow for multi-source catchup: each source still runs Negentropy independently, but Negentropy is now only responsible for discovering candidate supply (`need_ids`, `have_ids`, and which peers appear to have which events). Balancing is sink-driven through SQL-backed `wanted` state and per-peer request windows, while all sources still feed one shared batch writer to avoid duplicate pull storms and SQLite write contention. Inbound events are ingested through the same `project_one` path used by local creation and replay, which is why the system can enforce one convergence contract across source types: `local_create`, `wire_receive`, and replay all converge to the same projected state.
+
+**Forward-on-have live hint bus.** Negentropy rounds run on a configurable interval (default 100 ms, tunable via `P7_DISCOVERY_ROUND_GAP_MS`). To eliminate that discovery gap for freshly created events, the pipeline publishes a `LiveHint` to an in-process broadcast channel keyed by `(db_path, tenant_id)` every time a shared canonical event is newly persisted. Active sync sessions subscribe on startup and drain the channel once per control-loop tick (1 ms). When hints arrive, the session immediately emits a `NeedList` frame on the control stream — no negentropy round required. The sink records receipt in `event_timeline.need_list_received_at`, which proves the hint path was taken. Source-filtered: hints tagged with the receiving peer's own ID are not echoed back. Drain is capped at `need_chunk()` items per tick so a burst of self-hints or duplicates does not stall the control loop. Negentropy rounds remain authoritative for repair and history catchup; forward-on-have is a low-latency supplement, not a replacement. Enabling flag: `P7_FORWARD_ON_HAVE=1`. Measured delivery latency at 1–10 msg/s: avg 2–3 ms, p95 ≤ 5 ms, worst-case 8 ms (all in-process loopback).
+
 For same-workspace sibling tenants sharing one DB, there is one extra local step after canonical persistence: shared events created locally or ingested from the network are fanned out to sibling tenant scopes with the same `workspace_id`, then projected through those tenants' normal queue/drain path. This is not a transport shortcut and it does not bypass projectors; it is local fanout of already-canonical shared blobs so one shared DB converges the same way multiple separate daemons would.
 
 ### Steady-State Repeats The Same Loop
@@ -397,7 +400,7 @@ Why split streams:
 3. improves practical throughput and observability by separating reconciliation/control chatter from bulk payload flow.
 
 Current shape:
-1. discovery rounds use `NegOpen` / `NegMsg` / `NeedList` on the control stream,
+1. discovery rounds use `NegOpen` / `NegMsg` / `NeedList` on the control stream; the forward-on-have hint bus provides a second, lower-latency source of `NeedList` frames that fires immediately on new event persistence without waiting for the next scheduled round,
 2. request flow uses `RequestCredit` and `HaveList` on the control stream,
 3. the data stream carries only requested `Event` blobs,
 4. there is no per-round `Done` / `DataDone` / `DoneAck` drain handshake in live sync anymore.
@@ -1200,7 +1203,8 @@ Sync event transfer is pull-only.
 2. sink-side wanted scheduling chooses which IDs to request under source-advertised credit,
 3. sources queue requested IDs in bounded in-memory response buffers and read canonical blobs at send time,
 4. control protocol producers (`Frame::NegOpen`, `Frame::NegMsg`, `Frame::NeedList`, `Frame::HaveList`, `Frame::RequestCredit`, `Frame::IntroOffer`) live in `shared/protocol.rs`,
-5. hot-observer wakeups from newly valid shared events cause the next peer observation pass to discover those IDs so the sink can request them.
+5. newly persisted shared events publish `LiveHint` entries to the forward-on-have broadcast channel (`src/state/live_hints.rs`); active sessions drain the channel each tick and emit `NeedList` hints immediately — this is the primary low-latency discovery path for fresh events,
+6. negentropy rounds discover events not yet covered by live hints (history, missed hints due to lag, cross-session catchup); hot-observer wakeups cause the next round to include the new IDs.
 
 There is no durable sync egress queue anymore. Live sync event transport is request/response only and uses bounded in-memory connection-scoped response buffers.
 
@@ -1705,7 +1709,8 @@ Section 10 stays focused on convergence/test invariants derived from that lifecy
 5. provide `low_mem_ios` mode with a target of `<= 24 MiB` steady-state RSS for constrained runtimes (including iOS NSE),
 6. in `low_mem_ios`, enforce strict in-flight bounds and prefer reduced throughput over memory spikes,
 7. use serial perf measurement (`--test-threads=1`, `scripts/run_perf_serial.sh`) for tail profiling to avoid cross-test interference; profile before tuning,
-8. projection drain uses batch dequeue (`mark_done_batch`) and deferred WAL autocheckpoint to reduce per-batch overhead at high cardinality.
+8. projection drain uses batch dequeue (`mark_done_batch`) and deferred WAL autocheckpoint to reduce per-batch overhead at high cardinality,
+9. forward-on-have live hint bus (`src/state/live_hints.rs`, enabled by `P7_FORWARD_ON_HAVE=1`) reduces fresh-event discovery latency from one negentropy round gap (default 100 ms) to sub-10 ms by broadcasting `LiveHint` entries to active sessions immediately on canonical persist.
 
 Operational payload caps for this prototype (wire-format specifics in section 1.2 and file-flow details in section 12.2):
 

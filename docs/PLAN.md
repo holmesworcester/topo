@@ -982,6 +982,50 @@ Profiling evidence: 500k one-way sync improved from 170.93s (2,925 msgs/s) to 10
 
 Note: wrapping all projection writes in a single transaction was attempted first but abandoned — it caused ~0.06% of events to be left unprojected at 500k scale due to cascade_unblocked bulk cleanup interacting with the transaction scope.
 
+### 10.0.2 Implemented: forward-on-have live hint bus
+
+**Problem.** Negentropy discovery runs on a periodic interval (default 100 ms, tunable via `P7_DISCOVERY_ROUND_GAP_MS`). A freshly created message must wait for the next scheduled round before the remote peer discovers it. In tests with a 5-second round gap this produced avg 2.3 s / worst 4.5 s delivery times, and in tests with a 60-second gap events took the full round duration to arrive.
+
+**Design.** Each time the persist phase newly inserts a shared canonical event it publishes a `LiveHint { event_id, source_peer_id, tenant_id }` entry to a per-`(db_path, tenant_id)` tokio broadcast channel (`src/state/live_hints.rs`). Active initiator and responder sessions subscribe on startup. Each control-loop tick (1 ms poll) the session drains up to `need_chunk()` hints from its receiver and emits a `NeedList` frame immediately on the control stream. The sink records `event_timeline.need_list_received_at` on receipt; this timestamp is the proof that the live-hint path ran. Self-hint filtering: hints tagged with the receiving peer's own ID are skipped. Drain cap: the loop tracks `drained` (total items consumed, including filtered ones) and breaks at `need_chunk()` so a backlog of self-hints or duplicates cannot stall the control loop.
+
+**Publication sites** (all guarded by `share_scope == Shared` and `first-seen` insertion check):
+- `src/state/pipeline/phases.rs` — ingest persist path
+- `src/state/pipeline/effects.rs` — post-commit local fanout
+- `src/state/projection/create.rs` — local create path
+- `src/state/projection/emit.rs` — deterministic emit path
+- `src/event_modules/workspace/commands.rs` — workspace seed replay (join path)
+
+**Quinn EndpointDriver runtime affinity.** Quinn's `EndpointDriver` I/O task is spawned on whatever tokio runtime is current when the endpoint is constructed (`quinn::Endpoint::server()`). In `current_thread` runtimes this means the driver must be polled by that runtime's event loop. The perf test helper `start_peers()` created endpoints on the *caller's* runtime; when the test then called `thread::sleep` to pace message sends, it blocked that runtime, stalling all QUIC I/O and causing measured latencies of 7293 ms avg / 14545 ms worst regardless of message rate. Fix: `start_peers_runtime_affine()` defers endpoint construction to each session thread via a `std::sync::mpsc::channel::<SocketAddr>` address-handoff. The listener thread binds, sends its address, then blocks on `rt.block_on()`. The connector receives the address and creates its endpoint on its own runtime. This ensures the `EndpointDriver` is always polled while the session is active.
+
+**Correctness tests** (SC4):
+```
+cargo test --lib join_workspace_seed_replay_emits_live_hints_for_existing_shared_events
+cargo test --test download_timeline_test forward_on_have_hints_fresh_events_with_slow_negentropy_repair --test-threads=1
+```
+The second test sets `P7_DISCOVERY_ROUND_GAP_MS=60000` and asserts delivery within 3 seconds — the only path that can deliver within that window is the live-hint path.
+
+**Measured delivery latency** (in-process loopback, `P7_FORWARD_ON_HAVE=1`, no preload):
+
+| Rate | Duration | avg | p95 | worst |
+|------|----------|-----|-----|-------|
+| 1 msg/s | 5 s | 2.0 ms | 3 ms | 3 ms |
+| 1 msg/s | 20 s | 2.6 ms | 4 ms | 5 ms |
+| 2 msg/s | 5 s | 2.4 ms | 4 ms | 4 ms |
+| 2 msg/s | 20 s | 2.6 ms | 5 ms | 5 ms |
+| 4 msg/s | 5 s | 2.4 ms | 4 ms | 4 ms |
+| 4 msg/s | 20 s | 3.2 ms | 5 ms | 8 ms |
+| 10 msg/s | 5 s | 2.8 ms | 4 ms | 5 ms |
+| 10 msg/s | 20 s | 2.9 ms | 4 ms | 5 ms |
+
+Worst observed: **8 ms** at 4 msg/s × 20 s. Rate has negligible effect on tail latency. Bottleneck is QUIC loopback RTT (~2 ms), not the sync protocol.
+
+**Key files:**
+- `src/state/live_hints.rs` — broadcast bus, `LiveHint` type, `subscribe()`, `publish_from_connection()`
+- `src/runtime/sync_engine/session/control_plane.rs` — `send_forward_on_have_hints()`, `send_need_list_for_event_ids()`
+- `src/state/db/timeline.rs` — `mark_need_list_sent_many()`, `mark_need_list_received_many()`, COALESCE first-writer-wins
+- `src/testutil/mod.rs` — `start_peers_runtime_affine()`
+- `tests/multi_peer_delivery_latency_perf_test.rs` — perf harness with per-event stage timing
+
 `low_mem_ios` requirements:
 - target steady-state RSS at or below `24 MiB` during sustained sync/projection.
 - keep memory bounded with strict in-flight caps (queue claims, decode buffers, batch sizes).
