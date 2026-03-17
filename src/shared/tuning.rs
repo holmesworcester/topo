@@ -142,7 +142,10 @@ pub fn wanted_refill_quantum() -> usize {
 
 pub fn response_credit_high_watermark_bytes() -> usize {
     if low_mem_mode() {
-        read_usize_env("LOW_MEM_RESPONSE_CREDIT_HIGH_WATERMARK_BYTES").unwrap_or(64 * 1024)
+        // Must exceed the largest valid event (FileSlice wire size ~262 KiB) so
+        // that file-slice events remain requestable in low-memory mode. Mirrors
+        // the same constraint applied to max_recv_buffer above.
+        read_usize_env("LOW_MEM_RESPONSE_CREDIT_HIGH_WATERMARK_BYTES").unwrap_or(320 * 1024)
     } else {
         read_usize_env("P7_RESPONSE_CREDIT_HIGH_WATERMARK_BYTES").unwrap_or(512 * 1024)
     }
@@ -150,7 +153,7 @@ pub fn response_credit_high_watermark_bytes() -> usize {
 
 pub fn response_credit_low_watermark_bytes() -> usize {
     if low_mem_mode() {
-        read_usize_env("LOW_MEM_RESPONSE_CREDIT_LOW_WATERMARK_BYTES").unwrap_or(16 * 1024)
+        read_usize_env("LOW_MEM_RESPONSE_CREDIT_LOW_WATERMARK_BYTES").unwrap_or(80 * 1024)
     } else {
         read_usize_env("P7_RESPONSE_CREDIT_LOW_WATERMARK_BYTES").unwrap_or(128 * 1024)
     }
