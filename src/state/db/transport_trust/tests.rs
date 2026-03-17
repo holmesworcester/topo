@@ -272,6 +272,88 @@ fn test_is_authorized_for_tenant_checks_all_sources() {
 }
 
 #[test]
+fn test_list_authorized_transport_rows_reports_projected_provenance() {
+    let conn = open_in_memory().unwrap();
+    create_tables(&conn).unwrap();
+
+    let recorded_by = "aaaa";
+    let peer_shared_spki =
+        insert_peer_shared_with_user(&conn, recorded_by, "ps1", &[9u8; 32], "user1");
+    conn.execute(
+        "UPDATE peers_shared
+         SET device_name = 'laptop'
+         WHERE recorded_by = ?1 AND event_id = 'ps1'",
+        rusqlite::params![recorded_by],
+    )
+    .unwrap();
+
+    let accepted_spki: [u8; 32] = [0x44; 32];
+    record_invite_bootstrap_trust(
+        &conn,
+        recorded_by,
+        "ia1",
+        "invite1",
+        "workspace1",
+        "127.0.0.1:4433",
+        &accepted_spki,
+    )
+    .unwrap();
+    record_invite_bootstrap_trust(
+        &conn,
+        recorded_by,
+        "ia1",
+        "invite1",
+        "workspace1",
+        "127.0.0.1:4434",
+        &accepted_spki,
+    )
+    .unwrap();
+
+    let pending_spki: [u8; 32] = [0x55; 32];
+    record_pending_invite_bootstrap_trust(
+        &conn,
+        recorded_by,
+        "invite2",
+        "workspace2",
+        &pending_spki,
+    )
+    .unwrap();
+
+    let rows = list_authorized_transport_rows(&conn, recorded_by).unwrap();
+    assert_eq!(
+        rows.len(),
+        3,
+        "expected one row per live projected auth provenance"
+    );
+
+    let peer_shared = rows.iter().find(|r| r.source == "peer_shared").unwrap();
+    assert_eq!(peer_shared.transport_peer_id, hex::encode(peer_shared_spki));
+    assert_eq!(peer_shared.peer_shared_event_id.as_deref(), Some("ps1"));
+    assert_eq!(peer_shared.user_event_id.as_deref(), Some("user1"));
+    assert_eq!(peer_shared.device_name.as_deref(), Some("laptop"));
+    assert!(peer_shared.expires_at.is_none());
+
+    let accepted = rows
+        .iter()
+        .find(|r| r.source == "accepted_bootstrap")
+        .unwrap();
+    assert_eq!(accepted.transport_peer_id, hex::encode(accepted_spki));
+    assert_eq!(accepted.invite_event_id.as_deref(), Some("invite1"));
+    assert_eq!(accepted.invite_accepted_event_id.as_deref(), Some("ia1"));
+    assert_eq!(accepted.workspace_id.as_deref(), Some("workspace1"));
+    assert!(accepted.expires_at.is_some());
+
+    let pending = rows
+        .iter()
+        .find(|r| r.source == "pending_bootstrap")
+        .unwrap();
+    assert_eq!(pending.transport_peer_id, hex::encode(pending_spki));
+    assert_eq!(pending.invite_event_id.as_deref(), Some("invite2"));
+    assert_eq!(pending.workspace_id.as_deref(), Some("workspace2"));
+    assert!(pending.expires_at.is_some());
+}
+
+#[test]
 fn test_peer_shared_transport_fingerprint_excludes_bootstrap_aliases() {
     let conn = open_in_memory().unwrap();
     create_tables(&conn).unwrap();

@@ -111,6 +111,12 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"TransportKeys"}"#,
     },
     MethodInfo {
+        name: "TransportAuth",
+        purpose: "List all currently authorized remote transport fingerprints for the active tenant, with projected provenance",
+        params: PARAM_NONE,
+        example_json: r#"{"type":"TransportAuth"}"#,
+    },
+    MethodInfo {
         name: "React",
         purpose: "Create a reaction to a message",
         params: params![

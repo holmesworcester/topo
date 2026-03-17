@@ -795,6 +795,21 @@ fn dispatch(
             }
             Err(e) => RpcResponse::error(e.to_string()),
         },
+        RpcMethod::TransportAuth => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => {
+                    match crate::state::db::transport_trust::list_authorized_transport_rows(
+                        &db,
+                        &recorded_by,
+                    ) {
+                        Ok(rows) => RpcResponse::success(serde_json::json!(rows)),
+                        Err(e) => RpcResponse::error(e.to_string()),
+                    }
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
         RpcMethod::Messages { limit } => match state.require_active_peer() {
             Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
                 Ok((recorded_by, db)) => match message::list(&db, &recorded_by, limit) {
