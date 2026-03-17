@@ -40,7 +40,9 @@ fn shaping_profile(
     }
 }
 
-async fn connect_session_providers(profile: Option<NetworkProfile>) -> TestResult<ConnectedProviders> {
+async fn connect_session_providers(
+    profile: Option<NetworkProfile>,
+) -> TestResult<ConnectedProviders> {
     let (server_cert, server_key) = generate_self_signed_cert()?;
     let server_fp = extract_spki_fingerprint(server_cert.as_ref())?;
     let (client_cert, client_key) = generate_self_signed_cert()?;
@@ -110,7 +112,12 @@ async fn exercise_roundtrip_sessions(
         client_parts.control.send(&neg_open).await?;
         client_parts.control.flush().await?;
         let received = server_parts.control.recv().await?;
-        assert_eq!(parse_frame(&received)?.0, Frame::NegOpen { msg: vec![round as u8, 0xAA, 0x55] });
+        assert_eq!(
+            parse_frame(&received)?.0,
+            Frame::NegOpen {
+                msg: vec![round as u8, 0xAA, 0x55]
+            }
+        );
 
         let have_list = encode_frame(&Frame::HaveList { ids: vec![] });
         server_parts.control.send(&have_list).await?;
@@ -132,8 +139,8 @@ async fn exercise_roundtrip_sessions(
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn direct_quinn_repeated_sessions_succeed() -> TestResult {
-    let providers = tokio::time::timeout(Duration::from_secs(10), connect_session_providers(None))
-        .await??;
+    let providers =
+        tokio::time::timeout(Duration::from_secs(10), connect_session_providers(None)).await??;
     tokio::time::timeout(
         Duration::from_secs(10),
         exercise_roundtrip_sessions(&providers, 5, 32 * 1024),
