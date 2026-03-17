@@ -103,7 +103,7 @@ fn format_matrix_summary(
 
     for entry in measurements {
         summary.push_str(&format!(
-            "\n  Profile:      {} ({})\n  Repeat:       {}/{}\n  Note:         {}\n  Bandwidth:    {:.1} Mbps/dir\n  RTT:          {} ms\n  Jitter:       +/- {} ms\n  Loss:         {:.2}%\n  Wall time:    {:.2}s\n  Messages:     {}\n  Msgs/s:       {:.0}\n  Peak RSS:     {:.1} MiB (max daemon VmHWM)\n  Alice peak RSS: {:.1} MiB\n  Bob peak RSS:   {:.1} MiB\n",
+            "\n  Profile:      {} ({})\n  Repeat:       {}/{}\n  Note:         {}\n  Bandwidth:    {:.1} Mbps/dir\n  RTT:          {} ms\n  Jitter:       +/- {} ms\n  Loss:         {:.2}%\n  Wall time:    {:.2}s\n  Generate:     {:.2}s\n  Sync wait:    {:.2}s\n  Messages:     {}\n  Msgs/s:       {:.0}\n  Peak RSS:     {:.1} MiB (max daemon VmHWM)\n  Alice peak RSS: {:.1} MiB\n  Bob peak RSS:   {:.1} MiB\n",
             entry.profile.title,
             entry.profile.slug,
             entry.repeat,
@@ -114,6 +114,8 @@ fn format_matrix_summary(
             entry.profile.jitter_ms,
             entry.profile.loss_percent,
             entry.measurement.wall_secs,
+            entry.measurement.generate_secs,
+            entry.measurement.sync_wait_secs,
             entry.measurement.messages,
             entry.measurement.msgs_per_sec,
             entry.measurement.max_rss,
@@ -123,6 +125,25 @@ fn format_matrix_summary(
     }
 
     summary
+}
+
+#[test]
+#[ignore]
+fn perf_sync_2k_realistic_profiles() {
+    run_profile_matrix(
+        "daemon_realistic_network_perf_test.perf_sync_2k_realistic_profiles",
+        "2k bidirectional sync (daemon, warm, realistic network matrix)",
+        |profile| {
+            run_bidirectional_sync(
+                1_000,
+                Duration::from_secs(300),
+                Duration::from_secs(300),
+                move |alice_direct_addr, bob_direct_addr| {
+                    shaped_network_path(profile, alice_direct_addr, bob_direct_addr)
+                },
+            )
+        },
+    );
 }
 
 #[test]

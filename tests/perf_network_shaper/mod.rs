@@ -1,3 +1,4 @@
+use std::collections::VecDeque;
 use std::net::{SocketAddr, UdpSocket};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{mpsc, Arc, Mutex};
@@ -27,6 +28,61 @@ impl NetworkProfile {
 
     pub fn jitter(&self) -> Duration {
         Duration::from_millis(self.jitter_ms)
+    }
+}
+
+#[derive(Clone, Default)]
+struct DirectionStats {
+    inner: Arc<Mutex<DirectionStatsInner>>,
+}
+
+#[derive(Default)]
+struct DirectionStatsInner {
+    packets_sent: u64,
+    bytes_sent: u64,
+    packets_dropped: u64,
+    bytes_dropped: u64,
+    first_send_at: Option<Instant>,
+    last_send_at: Option<Instant>,
+}
+
+struct DirectionStatsSnapshot {
+    packets_sent: u64,
+    bytes_sent: u64,
+    packets_dropped: u64,
+    bytes_dropped: u64,
+    active_secs: f64,
+}
+
+impl DirectionStats {
+    fn record_sent(&self, bytes: usize) {
+        let now = Instant::now();
+        let mut inner = self.inner.lock().expect("lock direction stats");
+        inner.packets_sent = inner.packets_sent.saturating_add(1);
+        inner.bytes_sent = inner.bytes_sent.saturating_add(bytes as u64);
+        inner.first_send_at.get_or_insert(now);
+        inner.last_send_at = Some(now);
+    }
+
+    fn record_drop(&self, bytes: usize) {
+        let mut inner = self.inner.lock().expect("lock direction stats");
+        inner.packets_dropped = inner.packets_dropped.saturating_add(1);
+        inner.bytes_dropped = inner.bytes_dropped.saturating_add(bytes as u64);
+    }
+
+    fn snapshot(&self) -> DirectionStatsSnapshot {
+        let inner = self.inner.lock().expect("lock direction stats");
+        let active_secs = match (inner.first_send_at, inner.last_send_at) {
+            (Some(first), Some(last)) if last > first => (last - first).as_secs_f64(),
+            _ => 0.0,
+        };
+        DirectionStatsSnapshot {
+            packets_sent: inner.packets_sent,
+            bytes_sent: inner.bytes_sent,
+            packets_dropped: inner.packets_dropped,
+            bytes_dropped: inner.bytes_dropped,
+            active_secs,
+        }
     }
 }
 
@@ -183,6 +239,8 @@ pub struct UdpTrafficShaper {
     right_addr: SocketAddr,
     profile_state: Arc<Mutex<NetworkProfile>>,
     stop: Arc<AtomicBool>,
+    left_to_right_stats: DirectionStats,
+    right_to_left_stats: DirectionStats,
     handles: Vec<JoinHandle<()>>,
 }
 
@@ -217,6 +275,8 @@ impl UdpTrafficShaper {
 
         let profile_state = Arc::new(Mutex::new(profile));
         let stop = Arc::new(AtomicBool::new(false));
+        let left_to_right_stats = DirectionStats::default();
+        let right_to_left_stats = DirectionStats::default();
         let (to_left_tx, to_left_rx) = mpsc::channel::<QueuedPacket>();
         let (to_right_tx, to_right_rx) = mpsc::channel::<QueuedPacket>();
         let mut handles = Vec::new();
@@ -246,6 +306,7 @@ impl UdpTrafficShaper {
             to_left_rx,
             Arc::clone(&profile_state),
             Arc::clone(&stop),
+            right_to_left_stats.clone(),
             0xC0A1E_u64,
         ));
         handles.push(spawn_sender(
@@ -253,6 +314,7 @@ impl UdpTrafficShaper {
             to_right_rx,
             Arc::clone(&profile_state),
             Arc::clone(&stop),
+            left_to_right_stats.clone(),
             0xB0B_u64,
         ));
 
@@ -261,6 +323,8 @@ impl UdpTrafficShaper {
             right_addr,
             profile_state,
             stop,
+            left_to_right_stats,
+            right_to_left_stats,
             handles,
         }
     }
@@ -287,6 +351,19 @@ impl Drop for UdpTrafficShaper {
         wake_socket(self.right_addr);
         while let Some(handle) = self.handles.pop() {
             let _ = handle.join();
+        }
+        if shaper_stats_enabled() {
+            let profile = *self.profile_state.lock().expect("lock shaper profile");
+            log_direction_stats(
+                profile.slug,
+                "left->right",
+                &self.left_to_right_stats.snapshot(),
+            );
+            log_direction_stats(
+                profile.slug,
+                "right->left",
+                &self.right_to_left_stats.snapshot(),
+            );
         }
     }
 }
@@ -332,42 +409,79 @@ fn spawn_receiver(
     })
 }
 
+/// Spawn a sender thread that models both bandwidth (serialization delay) and
+/// latency (propagation delay) without confounding the two.
+///
+/// Previous implementation slept for serialization + propagation per packet,
+/// which reset the bandwidth clock every iteration and limited throughput to
+/// `packet_size / (serialization + propagation)` instead of the intended
+/// `packet_size / serialization`. The fix uses a delay line: packets are
+/// scheduled based on when the wire finishes serializing them, held in a
+/// VecDeque until their arrival time, then delivered to the socket.
 fn spawn_sender(
     send_socket: UdpSocket,
     queue_rx: mpsc::Receiver<QueuedPacket>,
     profile_state: Arc<Mutex<NetworkProfile>>,
     stop: Arc<AtomicBool>,
+    stats: DirectionStats,
     seed: u64,
 ) -> JoinHandle<()> {
     thread::spawn(move || {
         let mut next_tx_finish = Instant::now();
-        let mut last_send_at = Instant::now();
+        let mut last_arrival = Instant::now();
         let mut rng = StdRng::seed_from_u64(seed);
+        let mut delay_line: VecDeque<(Instant, QueuedPacket)> = VecDeque::new();
+
         loop {
-            match queue_rx.recv_timeout(SOCKET_POLL_INTERVAL) {
+            // Deliver packets whose arrival time has passed.
+            let now = Instant::now();
+            while let Some((arrival, _)) = delay_line.front() {
+                if now >= *arrival {
+                    let (_, pkt) = delay_line.pop_front().unwrap();
+                    if send_socket.send_to(&pkt.payload, pkt.dest).is_ok() {
+                        stats.record_sent(pkt.payload.len());
+                    }
+                } else {
+                    break;
+                }
+            }
+
+            if stop.load(Ordering::Relaxed) {
+                break;
+            }
+
+            // Wait for the next delay-line delivery or a new inbound packet.
+            let recv_timeout = match delay_line.front() {
+                Some((arrival, _)) => {
+                    let remaining = arrival.saturating_duration_since(Instant::now());
+                    if remaining.is_zero() {
+                        Duration::from_micros(1)
+                    } else {
+                        remaining.min(SOCKET_POLL_INTERVAL)
+                    }
+                }
+                None => SOCKET_POLL_INTERVAL,
+            };
+
+            match queue_rx.recv_timeout(recv_timeout) {
                 Ok(packet) => {
                     let profile = *profile_state.lock().expect("lock shaper profile");
                     if should_drop(&mut rng, profile.loss_percent) {
+                        stats.record_drop(packet.payload.len());
                         continue;
                     }
                     let now = Instant::now();
                     let start_tx = next_tx_finish.max(now);
                     let serialization = serialization_delay(&profile, packet.payload.len());
                     next_tx_finish = start_tx + serialization;
-                    let send_at =
-                        (next_tx_finish + propagation_delay(&mut rng, &profile)).max(last_send_at);
-                    last_send_at = send_at;
-                    sleep_until(send_at);
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                    let _ = send_socket.send_to(&packet.payload, packet.dest);
+                    // Arrival = when this packet reaches the destination.
+                    // .max(last_arrival) preserves in-order delivery.
+                    let arrival = (next_tx_finish + propagation_delay(&mut rng, &profile))
+                        .max(last_arrival);
+                    last_arrival = arrival;
+                    delay_line.push_back((arrival, packet));
                 }
-                Err(mpsc::RecvTimeoutError::Timeout) => {
-                    if stop.load(Ordering::Relaxed) {
-                        break;
-                    }
-                }
+                Err(mpsc::RecvTimeoutError::Timeout) => {}
                 Err(mpsc::RecvTimeoutError::Disconnected) => break,
             }
         }
@@ -394,15 +508,35 @@ fn propagation_delay(rng: &mut StdRng, profile: &NetworkProfile) -> Duration {
     Duration::from_secs_f64(((base_ms + offset_ms).max(0.0)) / 1_000.0)
 }
 
-fn sleep_until(target: Instant) {
-    let now = Instant::now();
-    if target > now {
-        thread::sleep(target - now);
-    }
-}
-
 fn wake_socket(addr: SocketAddr) {
     if let Ok(socket) = UdpSocket::bind(("127.0.0.1", 0)) {
         let _ = socket.send_to(&[0u8], addr);
     }
+}
+
+fn shaper_stats_enabled() -> bool {
+    std::env::var("PERF_REALISTIC_NETWORK_SHAPER_STATS")
+        .map(|value| value != "0" && value.to_lowercase() != "false")
+        .unwrap_or(false)
+}
+
+fn log_direction_stats(profile_slug: &str, direction: &str, stats: &DirectionStatsSnapshot) {
+    let mib_sent = stats.bytes_sent as f64 / (1024.0 * 1024.0);
+    let effective_mbps = if stats.active_secs > 0.0 {
+        (stats.bytes_sent as f64 * 8.0) / stats.active_secs / 1_000_000.0
+    } else {
+        0.0
+    };
+    eprintln!(
+        "[shaper-stats] profile={} direction={} packets_sent={} bytes_sent={} ({:.2} MiB) packets_dropped={} bytes_dropped={} active_secs={:.3} effective_mbps={:.2}",
+        profile_slug,
+        direction,
+        stats.packets_sent,
+        stats.bytes_sent,
+        mib_sent,
+        stats.packets_dropped,
+        stats.bytes_dropped,
+        stats.active_secs,
+        effective_mbps,
+    );
 }

@@ -261,6 +261,8 @@ impl Drop for SharedWorkspaceBench {
 
 pub struct PerfMeasurement {
     pub wall_secs: f64,
+    pub generate_secs: f64,
+    pub sync_wait_secs: f64,
     pub messages: i64,
     pub msgs_per_sec: f64,
     pub alice_rss: f64,
@@ -285,13 +287,19 @@ where
     let baseline = bench.warm_one_way(warm_timeout);
 
     let start = Instant::now();
+    let generate_start = Instant::now();
     generate_messages(&bench.alice_db, message_count as usize);
+    let generate_secs = generate_start.elapsed().as_secs_f64();
+    let wait_start = Instant::now();
     wait_for_message_count(&bench.bob_db, baseline + message_count, sync_timeout);
+    let sync_wait_secs = wait_start.elapsed().as_secs_f64();
     let wall_secs = start.elapsed().as_secs_f64();
 
     let (alice_rss, bob_rss, max_rss) = bench.daemon_rss();
     PerfMeasurement {
         wall_secs,
+        generate_secs,
+        sync_wait_secs,
         messages: message_count,
         msgs_per_sec: message_count as f64 / wall_secs,
         alice_rss,
@@ -318,19 +326,25 @@ where
     let baseline = bench.warm_bidirectional(warm_timeout);
 
     let start = Instant::now();
+    let generate_start = Instant::now();
     generate_messages(&bench.alice_db, per_peer as usize);
     generate_messages(&bench.bob_db, per_peer as usize);
+    let generate_secs = generate_start.elapsed().as_secs_f64();
+    let wait_start = Instant::now();
     wait_for_message_count_pair(
         &bench.alice_db,
         &bench.bob_db,
         baseline + total,
         sync_timeout,
     );
+    let sync_wait_secs = wait_start.elapsed().as_secs_f64();
     let wall_secs = start.elapsed().as_secs_f64();
 
     let (alice_rss, bob_rss, max_rss) = bench.daemon_rss();
     PerfMeasurement {
         wall_secs,
+        generate_secs,
+        sync_wait_secs,
         messages: total,
         msgs_per_sec: total as f64 / wall_secs,
         alice_rss,
@@ -359,21 +373,27 @@ where
     let alice_db = bench.alice_db.clone();
     let bob_db = bench.bob_db.clone();
     let start = Instant::now();
+    let generate_start = Instant::now();
     let alice_writer = thread::spawn(move || generate_messages(&alice_db, per_peer as usize));
     let bob_writer = thread::spawn(move || generate_messages(&bob_db, per_peer as usize));
     alice_writer.join().expect("alice generate thread panicked");
     bob_writer.join().expect("bob generate thread panicked");
+    let generate_secs = generate_start.elapsed().as_secs_f64();
+    let wait_start = Instant::now();
     wait_for_message_count_pair(
         &bench.alice_db,
         &bench.bob_db,
         baseline + total,
         sync_timeout,
     );
+    let sync_wait_secs = wait_start.elapsed().as_secs_f64();
     let wall_secs = start.elapsed().as_secs_f64();
 
     let (alice_rss, bob_rss, max_rss) = bench.daemon_rss();
     PerfMeasurement {
         wall_secs,
+        generate_secs,
+        sync_wait_secs,
         messages: total,
         msgs_per_sec: total as f64 / wall_secs,
         alice_rss,

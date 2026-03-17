@@ -177,7 +177,6 @@ where
                         Ok(Frame::Event { blob }) => {
                             events_received.fetch_add(1, Ordering::Relaxed);
                             bytes_received.fetch_add(blob.len() as u64, Ordering::Relaxed);
-                            events_received.fetch_add(1, Ordering::Relaxed);
                             max_blob_size = max_blob_size.max(blob.len());
                             let event_id = hash_event(&blob);
                             if should_capture_rx_event_link(&blob) {
