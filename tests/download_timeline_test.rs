@@ -246,7 +246,10 @@ async fn bidirectional_sync_receives_only_requested_event_data() {
 async fn forward_on_have_hints_fresh_events_with_slow_negentropy_repair() {
     let _env_guard = env_lock().lock().expect("env mutex poisoned");
     let _forward_on_have = ScopedEnv::set("P7_FORWARD_ON_HAVE", "1");
-    let _round_gap_ms = ScopedEnv::set("P7_DISCOVERY_ROUND_GAP_MS", "5000");
+    // 60-second round gap: if live hints are broken the event can only arrive
+    // via the next scheduled negentropy round, which would take ~60s.  The
+    // tight 3-second assertion window below proves the live-hint path was used.
+    let _round_gap_ms = ScopedEnv::set("P7_DISCOVERY_ROUND_GAP_MS", "60000");
 
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_in_workspace("bob", &alice).await;
@@ -267,10 +270,12 @@ async fn forward_on_have_hints_fresh_events_with_slow_negentropy_repair() {
 
     let marker = alice.create_message("forward-on-have marker");
     let marker_b64 = event_id_to_base64(&marker);
+    // 3-second window: the 60-second round gap means negentropy repair cannot
+    // deliver within this window, so delivery must come from the live-hint path.
     assert_eventually(
         || bob.has_event(&marker_b64),
-        Duration::from_secs(10),
-        "forward-on-have marker convergence",
+        Duration::from_secs(3),
+        "forward-on-have marker convergence via live hint",
     )
     .await;
 

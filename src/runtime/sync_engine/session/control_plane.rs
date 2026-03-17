@@ -171,9 +171,13 @@ pub async fn send_forward_on_have_hints<C>(
 where
     C: StreamConn,
 {
+    let cap = need_chunk();
     let mut ids = Vec::new();
     let mut seen = std::collections::HashSet::new();
     loop {
+        if ids.len() >= cap {
+            break;
+        }
         match receiver.try_recv() {
             Ok(hint) => {
                 if hint.source_peer_id.as_deref() == Some(peer_id) {
