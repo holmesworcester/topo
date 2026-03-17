@@ -28,7 +28,9 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 
 #[derive(Debug, Clone)]
 struct TenantScope {
-    peer_id: String,
+    /// The local peer's identity within a workspace (`recorded_by` in the DB).
+    /// Used as the tenant discriminator across all sync-control and policy APIs.
+    tenant_id: String,
 }
 
 fn discover_tenant_scopes(
@@ -42,7 +44,7 @@ fn discover_tenant_scopes(
     let rows = stmt
         .query_map([], |row| {
             Ok(TenantScope {
-                peer_id: row.get(0)?,
+                tenant_id: row.get(0)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -96,7 +98,7 @@ impl DaemonState {
             Ok(conn) => {
                 let _ = crate::db::schema::create_tables(&conn);
                 match discover_tenant_scopes(&conn) {
-                    Ok(tenants) if tenants.len() == 1 => Some(tenants[0].peer_id.clone()),
+                    Ok(tenants) if tenants.len() == 1 => Some(tenants[0].tenant_id.clone()),
                     Ok(_) => None,
                     Err(_) => None,
                 }
@@ -150,7 +152,7 @@ impl DaemonState {
         if let Some(peer_id) = cached {
             match discovered.as_ref() {
                 Some(tenants) => {
-                    if tenants.iter().any(|t| t.peer_id == peer_id) {
+                    if tenants.iter().any(|t| t.tenant_id == peer_id) {
                         return Ok(peer_id);
                     }
                     *self.active_peer.write().unwrap() = None;
@@ -164,7 +166,7 @@ impl DaemonState {
 
         if let Some(tenants) = discovered {
             if tenants.len() == 1 {
-                let peer_id = tenants[0].peer_id.clone();
+                let peer_id = tenants[0].tenant_id.clone();
                 *self.active_peer.write().unwrap() = Some(peer_id.clone());
                 return Ok(peer_id);
             }

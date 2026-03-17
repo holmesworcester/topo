@@ -473,14 +473,19 @@ impl SyncControlRegistry {
     }
 }
 
-/// Query event IDs from the wanted table that are not yet in the local store.
-fn query_wanted_event_ids(conn: &rusqlite::Connection, tenant_id: &str, _peer_id: &str) -> Vec<String> {
-    // Query the need_queue for events we want but don't have yet.
-    let query = "SELECT hex(event_id) FROM need_queue WHERE recorded_by = ?1 ORDER BY rowid LIMIT 200";
+/// Query event IDs from `wanted_sources` that are pending from a specific peer.
+///
+/// `wanted_sources` records (event_id, peer_id) pairs for every event that
+/// negentropy reconciliation has observed the remote peer carrying but that we
+/// do not yet hold locally. This is the primary table for "events eligible for
+/// request" from a given connected peer.
+fn query_wanted_event_ids(conn: &rusqlite::Connection, _tenant_id: &str, peer_id: &str) -> Vec<String> {
+    let query = "SELECT hex(event_id) FROM wanted_sources \
+                 WHERE peer_id = ?1 ORDER BY first_seen_at LIMIT 200";
     match conn.prepare(query) {
         Ok(mut stmt) => {
             let rows = stmt
-                .query_map(rusqlite::params![tenant_id], |row| row.get::<_, String>(0))
+                .query_map(rusqlite::params![peer_id], |row| row.get::<_, String>(0))
                 .ok();
             match rows {
                 Some(iter) => iter.filter_map(|r| r.ok()).collect(),
