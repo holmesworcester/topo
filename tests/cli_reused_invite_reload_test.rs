@@ -177,7 +177,6 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
     let mut alice_daemon = start_daemon_with_options(
         &alice_db,
         &DaemonOptions {
-            bind_port: Some(random_port()),
             disable_discovery: true,
             stdout_file: Some(alice_stdout.clone()),
             stderr_file: Some(alice_stderr.clone()),
@@ -202,7 +201,6 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
     let mut bob_daemon = start_daemon_with_options(
         &bob_db,
         &DaemonOptions {
-            bind_port: Some(random_port()),
             disable_discovery: true,
             stdout_file: Some(bob_stdout.clone()),
             stderr_file: Some(bob_stderr.clone()),
@@ -236,7 +234,6 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
     let mut carol_daemon = start_daemon_with_options(
         &carol_db,
         &DaemonOptions {
-            bind_port: Some(random_port()),
             disable_discovery: true,
             stdout_file: Some(carol_stdout.clone()),
             stderr_file: Some(carol_stderr.clone()),

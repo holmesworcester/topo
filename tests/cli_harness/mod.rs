@@ -6,10 +6,11 @@
 
 #![allow(dead_code)]
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::OnceLock;
+use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use topo::testutil::DaemonGuard;
 
@@ -19,10 +20,19 @@ fn next_daemon_instance_id() -> u64 {
     DAEMON_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed)
 }
 
+// Registry mapping db_path → (stdout_log_path, stderr_log_path) for the running daemon.
+// Populated at daemon start, removed at drop/kill, consulted by daemon_debug_context().
+static DAEMON_LOG_REGISTRY: OnceLock<Mutex<HashMap<String, (PathBuf, PathBuf)>>> =
+    OnceLock::new();
+
+fn daemon_log_registry() -> &'static Mutex<HashMap<String, (PathBuf, PathBuf)>> {
+    DAEMON_LOG_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
 /// RAII guard for a daemon started by the test harness.
 ///
 /// Owns the child process and cleans it up on drop:
-///   1. Sends `topo --db {db} stop` (fire-and-forget)
+///   1. Sends `topo --db {db} stop` (blocks up to 5 s for graceful exit)
 ///   2. Polls the child for up to 2 s
 ///   3. SIGKILLs if still alive
 ///   4. Removes the socket file if still present
@@ -66,6 +76,7 @@ impl HarnessDaemon {
         if self.socket_path.exists() {
             let _ = std::fs::remove_file(&self.socket_path);
         }
+        daemon_log_registry().lock().unwrap().remove(&self.db_path);
     }
 
     /// Graceful stop: send `topo stop`, wait up to 5 s, force-kill if needed.
@@ -107,7 +118,7 @@ impl Drop for HarnessDaemon {
         let Some(ref mut child) = self.child else {
             return;
         };
-        // Fire-and-forget graceful stop signal (best-effort, ignore errors).
+        // Graceful stop: blocks until `topo stop` exits (up to 5s), best-effort.
         let _ = Command::new(bin())
             .args(["--db", &self.db_path, "stop"])
             .output();
@@ -133,6 +144,7 @@ impl Drop for HarnessDaemon {
         if self.socket_path.exists() {
             let _ = std::fs::remove_file(&self.socket_path);
         }
+        daemon_log_registry().lock().unwrap().remove(&self.db_path);
     }
 }
 
@@ -438,8 +450,25 @@ fn tail_daemon_log(path: &PathBuf, max_lines: usize) -> String {
 
 fn daemon_debug_context(db: &str) -> String {
     let socket = socket_path_for_db(db);
-    let stdout_path = default_daemon_log_path(db, "stdout");
-    let stderr_path = default_daemon_log_path(db, "stderr");
+    let (stdout_path, stderr_path) = daemon_log_registry()
+        .lock()
+        .unwrap()
+        .get(db)
+        .cloned()
+        .unwrap_or_else(|| {
+            // Fallback for callers that run after the daemon has already been dropped
+            // (registry entry removed). Use a best-effort path without a counter.
+            let db_name = PathBuf::from(db)
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("test.db")
+                .replace('.', "_");
+            let pid = std::process::id();
+            (
+                std::env::temp_dir().join(format!("topo-{db_name}-{pid}.stdout.log")),
+                std::env::temp_dir().join(format!("topo-{db_name}-{pid}.stderr.log")),
+            )
+        });
     format!(
         "daemon=\n  socket_exists={}\n  socket_path={}\n  stdout_log={}\n{}\n  stderr_log={}\n{}",
         socket.exists(),
@@ -689,6 +718,10 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> HarnessDaemo
                         read_daemon_log(&stderr_path)
                     );
                 }
+                daemon_log_registry()
+                    .lock()
+                    .unwrap()
+                    .insert(db.to_string(), (stdout_path.clone(), stderr_path.clone()));
                 return HarnessDaemon::new(child, db);
             }
             if rpc_start.elapsed().as_secs() >= 5 {
