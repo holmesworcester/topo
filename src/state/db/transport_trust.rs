@@ -1,4 +1,5 @@
 use rusqlite::{Connection, OptionalExtension};
+use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -156,6 +157,88 @@ const TENANT_HAS_ANY_AUTHORIZED_FINGERPRINT_SQL: &str = "
         FROM authorized_transport_rows
         WHERE expires_at IS NULL OR expires_at > ?2
     )
+";
+
+const TENANT_AUTHORIZED_TRANSPORT_ROWS_SQL: &str = "
+    WITH authorized_transport_rows AS (
+        SELECT DISTINCT
+            'peer_shared' AS source,
+            lower(hex(p.transport_fingerprint)) AS transport_peer_id,
+            p.event_id AS peer_shared_event_id,
+            p.user_event_id AS user_event_id,
+            p.device_name AS device_name,
+            NULL AS invite_event_id,
+            NULL AS invite_accepted_event_id,
+            NULL AS workspace_id,
+            NULL AS expires_at
+        FROM peers_shared p
+        WHERE p.recorded_by = ?1
+          AND length(p.transport_fingerprint) = 32
+          AND NOT EXISTS (
+              SELECT 1 FROM removed_entities r
+              WHERE r.recorded_by = p.recorded_by
+                AND r.target_event_id = p.event_id
+          )
+          AND NOT EXISTS (
+              SELECT 1 FROM removed_entities r
+              WHERE r.recorded_by = p.recorded_by
+                AND p.user_event_id IS NOT NULL
+                AND r.target_event_id = p.user_event_id
+                AND r.removal_type = 'user'
+          )
+
+        UNION ALL
+
+        SELECT DISTINCT
+            'accepted_bootstrap' AS source,
+            lower(hex(t.bootstrap_spki_fingerprint)) AS transport_peer_id,
+            NULL AS peer_shared_event_id,
+            NULL AS user_event_id,
+            NULL AS device_name,
+            t.invite_event_id AS invite_event_id,
+            t.invite_accepted_event_id AS invite_accepted_event_id,
+            t.workspace_id AS workspace_id,
+            t.expires_at AS expires_at
+        FROM invite_bootstrap_trust t
+        WHERE t.recorded_by = ?1
+          AND length(t.bootstrap_spki_fingerprint) = 32
+
+        UNION ALL
+
+        SELECT DISTINCT
+            'pending_bootstrap' AS source,
+            lower(hex(t.expected_bootstrap_spki_fingerprint)) AS transport_peer_id,
+            NULL AS peer_shared_event_id,
+            NULL AS user_event_id,
+            NULL AS device_name,
+            t.invite_event_id AS invite_event_id,
+            NULL AS invite_accepted_event_id,
+            t.workspace_id AS workspace_id,
+            t.expires_at AS expires_at
+        FROM pending_invite_bootstrap_trust t
+        WHERE t.recorded_by = ?1
+          AND length(t.expected_bootstrap_spki_fingerprint) = 32
+    )
+    SELECT
+        source,
+        transport_peer_id,
+        peer_shared_event_id,
+        user_event_id,
+        device_name,
+        invite_event_id,
+        invite_accepted_event_id,
+        workspace_id,
+        expires_at
+    FROM authorized_transport_rows
+    WHERE expires_at IS NULL OR expires_at > ?2
+    ORDER BY
+        CASE source
+            WHEN 'peer_shared' THEN 0
+            WHEN 'accepted_bootstrap' THEN 1
+            ELSE 2
+        END,
+        transport_peer_id ASC,
+        COALESCE(peer_shared_event_id, invite_accepted_event_id, invite_event_id, '') ASC
 ";
 
 const NODE_AUTHORIZATION_EXISTS_SQL: &str = "
@@ -672,6 +755,45 @@ pub fn has_any_trusted_peer(
         |row| row.get(0),
     )?;
     Ok(has_any != 0)
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct AuthorizedTransportRow {
+    pub source: String,
+    pub transport_peer_id: String,
+    pub peer_shared_event_id: Option<String>,
+    pub user_event_id: Option<String>,
+    pub device_name: Option<String>,
+    pub invite_event_id: Option<String>,
+    pub invite_accepted_event_id: Option<String>,
+    pub workspace_id: Option<String>,
+    pub expires_at: Option<i64>,
+}
+
+/// Return all currently authorized transport fingerprints for one tenant,
+/// including their projected provenance rows.
+pub fn list_authorized_transport_rows(
+    conn: &Connection,
+    recorded_by: &str,
+) -> Result<Vec<AuthorizedTransportRow>, Box<dyn std::error::Error + Send + Sync>> {
+    let now = now_ms_i64();
+    let mut stmt = conn.prepare(TENANT_AUTHORIZED_TRANSPORT_ROWS_SQL)?;
+    let rows = stmt
+        .query_map(rusqlite::params![recorded_by, now], |row| {
+            Ok(AuthorizedTransportRow {
+                source: row.get(0)?,
+                transport_peer_id: row.get(1)?,
+                peer_shared_event_id: row.get(2)?,
+                user_event_id: row.get(3)?,
+                device_name: row.get(4)?,
+                invite_event_id: row.get(5)?,
+                invite_accepted_event_id: row.get(6)?,
+                workspace_id: row.get(7)?,
+                expires_at: row.get(8)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 /// List active invite bootstrap addresses for a tenant.

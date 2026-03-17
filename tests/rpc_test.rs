@@ -214,6 +214,7 @@ fn rpc_all_methods_serialize() {
             interval_ms: 200,
         },
         RpcMethod::TransportKeys,
+        RpcMethod::TransportAuth,
         RpcMethod::React {
             target: "abc".into(),
             emoji: "thumbs_up".into(),
@@ -1796,6 +1797,100 @@ fn rpc_peers_returns_local_peer_after_create_workspace() {
 }
 
 #[test]
+fn rpc_transport_auth_lists_pending_invite_provenance_for_active_tenant() {
+    let (_dir, db) = temp_db();
+    let socket = socket_path_for_db(&db);
+
+    create_workspace(&db);
+
+    let _daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .unwrap(),
+    );
+
+    wait_for_socket(&socket);
+
+    let listen_addr = daemon_listen_addr(&db);
+    let _invite_link = create_invite(&db, &listen_addr);
+
+    let resp = topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::TransportAuth)
+        .unwrap();
+    assert!(
+        resp.ok,
+        "transport-auth RPC should succeed: {:?}",
+        resp.error
+    );
+
+    let rows = resp
+        .data
+        .expect("transport-auth response missing data")
+        .as_array()
+        .cloned()
+        .expect("transport-auth response should be an array");
+
+    assert!(
+        rows.iter()
+            .any(|row| row["source"].as_str() == Some("pending_bootstrap")
+                && row["transport_peer_id"]
+                    .as_str()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false)
+                && row["invite_event_id"]
+                    .as_str()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false)
+                && row["workspace_id"]
+                    .as_str()
+                    .map(|s| !s.is_empty())
+                    .unwrap_or(false)
+                && row["expires_at"].as_i64().is_some()),
+        "expected pending bootstrap provenance row, got: {:?}",
+        rows
+    );
+}
+
+#[test]
+fn cli_transport_auth_prints_projected_pending_invite_provenance() {
+    let (_dir, db) = temp_db();
+
+    create_workspace(&db);
+    let mut daemon = start_daemon(&db);
+    let listen_addr = daemon_listen_addr(&db);
+    let _invite_link = create_invite(&db, &listen_addr);
+
+    let out = Command::new(bin())
+        .args(["--db", &db, "transport-auth"])
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "transport-auth CLI should succeed: stderr={}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("AUTHORIZED TRANSPORT FINGERPRINTS"),
+        "expected transport-auth header, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("[pending_bootstrap]"),
+        "expected pending bootstrap row, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("invite_event:"),
+        "expected invite provenance in CLI output, got:\n{}",
+        stdout
+    );
+
+    stop_daemon(&db, &mut daemon);
+}
+
+#[test]
 fn cli_peers_output_format() {
     let (_dir, db) = temp_db();
     let socket = socket_path_for_db(&db);
@@ -2087,6 +2182,7 @@ fn catalog_drift_test_method_count_matches_protocol() {
         "AssertNow",
         "AssertEventually",
         "TransportKeys",
+        "TransportAuth",
         "React",
         "DeleteMessage",
         "Reactions",

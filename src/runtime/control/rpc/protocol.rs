@@ -57,6 +57,7 @@ pub enum RpcMethod {
         interval_ms: u64,
     },
     TransportKeys,
+    TransportAuth,
     React {
         target: String,
         emoji: String,

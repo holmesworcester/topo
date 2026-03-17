@@ -165,6 +165,10 @@ enum Commands {
     #[command(name = "transport-keys")]
     TransportKeys,
 
+    /// List authorized remote transport fingerprints with projected provenance
+    #[command(name = "transport-auth")]
+    TransportAuth,
+
     /// Combined view: sidebar + messages with inline reactions
     View {
         /// Max messages to show (0 = all)
@@ -2316,6 +2320,51 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let peer_id = key["peer_id"].as_str().unwrap_or("");
                         let source = key["source"].as_str().unwrap_or("unknown");
                         println!("  {} ({})", peer_id, source);
+                    }
+                }
+            }
+        }
+
+        Commands::TransportAuth => {
+            let data =
+                rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::TransportAuth)?;
+            if let Some(rows) = data.as_array() {
+                if rows.is_empty() {
+                    println!("(no authorized transport fingerprints)");
+                } else {
+                    println!("AUTHORIZED TRANSPORT FINGERPRINTS ({}):", rows.len());
+                    for row in rows {
+                        let transport_peer_id = row["transport_peer_id"]
+                            .as_str()
+                            .unwrap_or("<missing-spki>");
+                        let source = row["source"].as_str().unwrap_or("unknown");
+                        println!("  {} [{}]", transport_peer_id, source);
+                        if let Some(event_id) = row["peer_shared_event_id"].as_str() {
+                            println!("    peer_shared_event: {}", short_id(event_id));
+                        }
+                        if let Some(user_event_id) = row["user_event_id"].as_str() {
+                            println!("    user_event: {}", short_id(user_event_id));
+                        }
+                        if let Some(device_name) = row["device_name"].as_str() {
+                            println!("    device: {}", device_name);
+                        }
+                        if let Some(invite_event_id) = row["invite_event_id"].as_str() {
+                            println!("    invite_event: {}", short_id(invite_event_id));
+                        }
+                        if let Some(invite_accepted_event_id) =
+                            row["invite_accepted_event_id"].as_str()
+                        {
+                            println!(
+                                "    invite_accepted_event: {}",
+                                short_id(invite_accepted_event_id)
+                            );
+                        }
+                        if let Some(workspace_id) = row["workspace_id"].as_str() {
+                            println!("    workspace: {}", short_id(workspace_id));
+                        }
+                        if let Some(expires_at) = row["expires_at"].as_i64() {
+                            println!("    expires_at_ms: {}", expires_at);
+                        }
                     }
                 }
             }
