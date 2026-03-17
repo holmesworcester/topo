@@ -6,6 +6,7 @@ pub mod need_queue;
 pub mod project_queue;
 pub mod queue;
 pub mod schema;
+pub mod sync_control;
 pub mod store;
 pub mod sync_log;
 pub mod timeline;
@@ -108,6 +109,7 @@ pub fn ensure_infra_schema(conn: &Connection) -> SqliteResult<()> {
     health::ensure_schema(conn)?;
     intro::ensure_schema(conn)?;
     sync_log::ensure_schema(conn)?;
+    sync_control::ensure_schema(conn)?;
     timeline::ensure_schema(conn)?;
     transport_trust::ensure_schema(conn)?;
     transport_creds::ensure_schema(conn)?;

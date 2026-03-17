@@ -18,6 +18,7 @@ use tracing::{info, warn};
 use crate::event_modules::{file, message, peer_shared, reaction, user, workspace};
 use crate::node::NodeRuntimeNetInfo;
 use crate::rpc::protocol::*;
+use crate::runtime::sync_control::SyncControlRegistry;
 use crate::service;
 use crate::state::subscriptions;
 
@@ -69,6 +70,8 @@ pub struct DaemonState {
     pub runtime_recheck: Notify,
     /// Invite/link strings stored by number (index+1 = invite ref number).
     pub invite_refs: RwLock<Vec<String>>,
+    /// Shared sync control registry for manual sync commands.
+    pub sync_control: Arc<SyncControlRegistry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -101,6 +104,7 @@ impl DaemonState {
             Err(_) => None,
         };
         DaemonState {
+            sync_control: Arc::new(SyncControlRegistry::new(db_path.to_string())),
             db_path: db_path.to_string(),
             active_peer: RwLock::new(active),
             // Runtime manager owns lifecycle transitions.
@@ -1583,6 +1587,88 @@ fn dispatch(
                     }
                 }
                 Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+
+        // --- Sync control methods ---
+
+        RpcMethod::SyncPolicyShow => match state.require_active_peer() {
+            Ok(peer_id) => match state.sync_control.load_policy(&peer_id) {
+                Ok(policy) => RpcResponse::success(policy),
+                Err(e) => RpcResponse::error(e),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+
+        RpcMethod::SyncPolicySet {
+            requests,
+            responses,
+            forward_on_have,
+        } => match state.require_active_peer() {
+            Ok(peer_id) => {
+                use crate::shared::sync_control::SyncPolicyMode;
+                let parse = |s: Option<String>| -> Result<Option<SyncPolicyMode>, String> {
+                    match s {
+                        None => Ok(None),
+                        Some(v) => v.parse::<SyncPolicyMode>().map(Some),
+                    }
+                };
+                let req = match parse(requests) {
+                    Ok(v) => v,
+                    Err(e) => return RpcResponse::error(e),
+                };
+                let resp = match parse(responses) {
+                    Ok(v) => v,
+                    Err(e) => return RpcResponse::error(e),
+                };
+                let foh = match parse(forward_on_have) {
+                    Ok(v) => v,
+                    Err(e) => return RpcResponse::error(e),
+                };
+                match state.sync_control.update_policy(&peer_id, req, resp, foh) {
+                    Ok(policy) => RpcResponse::success(policy),
+                    Err(e) => RpcResponse::error(e),
+                }
+            }
+            Err(e) => RpcResponse::error(e),
+        },
+
+        RpcMethod::SyncRoundPeer { peer } => match state.require_active_peer() {
+            Ok(peer_id) => {
+                match state.sync_control.trigger_round_for_peer(&peer_id, &peer) {
+                    Ok(capture) => RpcResponse::success(capture),
+                    Err(e) => RpcResponse::error(e),
+                }
+            }
+            Err(e) => RpcResponse::error(e),
+        },
+
+        RpcMethod::SyncRoundAll => match state.require_active_peer() {
+            Ok(peer_id) => match state.sync_control.trigger_round_for_all(&peer_id) {
+                Ok(captures) => RpcResponse::success(captures),
+                Err(e) => RpcResponse::error(e),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+
+        RpcMethod::SyncRequestPeer { peer } => match state.require_active_peer() {
+            Ok(peer_id) => {
+                match state
+                    .sync_control
+                    .trigger_request_for_peer(&peer_id, &peer)
+                {
+                    Ok(result) => RpcResponse::success(result),
+                    Err(e) => RpcResponse::error(e),
+                }
+            }
+            Err(e) => RpcResponse::error(e),
+        },
+
+        RpcMethod::SyncRequestAll => match state.require_active_peer() {
+            Ok(peer_id) => match state.sync_control.trigger_request_for_all(&peer_id) {
+                Ok(results) => RpcResponse::success(results),
+                Err(e) => RpcResponse::error(e),
             },
             Err(e) => RpcResponse::error(e),
         },

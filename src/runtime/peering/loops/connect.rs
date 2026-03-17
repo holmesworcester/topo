@@ -132,6 +132,7 @@ pub async fn connect_loop_with_coordination_until_cancel(
         coordination_manager,
         shutdown,
         None,
+        None,
     )
     .await
 }
@@ -150,6 +151,7 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
     coordination_manager: Arc<CoordinationManager>,
     shutdown: CancellationToken,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
+    sync_control: Option<Arc<crate::runtime::sync_control::SyncControlRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tenants = vec![recorded_by.to_string()];
     run_startup_preflight(db_path, &tenants, ingest)?;
@@ -179,6 +181,7 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
             coordination,
             shutdown,
             bootstrap_fallback_client_config,
+            sync_control,
         ))
         .await
 }
@@ -246,6 +249,7 @@ pub async fn connect_loop_with_shared_ingest_until_cancel(
             coordination,
             shutdown,
             None,
+            None,
         ))
         .await
 }
@@ -262,6 +266,7 @@ async fn connect_loop_inner(
     coordination: Arc<crate::sync::session::coordinator::PeerCoord>,
     shutdown: CancellationToken,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
+    sync_control: Option<Arc<crate::runtime::sync_control::SyncControlRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sni = transport_sni(remote_transport_peer_id);
     let mut has_connected_once = false;
@@ -388,6 +393,7 @@ async fn connect_loop_inner(
         let initiator_handler = SyncSessionHandler::outbound(
             db_path.to_string(),
             SYNC_SESSION_TIMEOUT_SECS,
+            sync_control.clone(),
             coordination.clone(),
             shared_ingest.clone(),
         );

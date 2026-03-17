@@ -425,6 +425,16 @@ enum Commands {
         action: Option<UpnpCommand>,
     },
 
+    /// Manual sync controls: policy, round, request
+    #[command(
+        name = "sync",
+        after_help = "Examples:\n  topo sync policy show\n  topo sync policy set --requests manual\n  topo sync round peer abc123\n  topo sync round all\n  topo sync request peer abc123\n  topo sync request all"
+    )]
+    Sync {
+        #[command(subcommand)]
+        action: SyncAction,
+    },
+
     /// Reset all local state: stop daemon, delete DB and socket files
     Reset,
 }
@@ -460,6 +470,54 @@ enum RpcAction {
         #[arg(long, group = "input")]
         stdin: bool,
     },
+}
+
+#[derive(Subcommand)]
+enum SyncAction {
+    /// Show or set tenant sync policy
+    Policy {
+        #[command(subcommand)]
+        action: SyncPolicyAction,
+    },
+    /// Force a manual sync round
+    Round {
+        #[command(subcommand)]
+        target: SyncTarget,
+    },
+    /// Manually trigger request issuance
+    Request {
+        #[command(subcommand)]
+        target: SyncTarget,
+    },
+}
+
+#[derive(Subcommand)]
+enum SyncPolicyAction {
+    /// Show current sync policy
+    Show,
+    /// Set sync policy knobs
+    Set {
+        /// Request mode: auto, manual, or disabled
+        #[arg(long)]
+        requests: Option<String>,
+        /// Response mode: auto, manual, or disabled
+        #[arg(long)]
+        responses: Option<String>,
+        /// Forward-on-have mode: auto, manual, or disabled
+        #[arg(long)]
+        forward_on_have: Option<String>,
+    },
+}
+
+#[derive(Subcommand)]
+enum SyncTarget {
+    /// Target a specific peer by hex fingerprint prefix
+    Peer {
+        /// Peer SPKI fingerprint prefix (hex)
+        peer: String,
+    },
+    /// Target all connected peers
+    All,
 }
 
 #[derive(Subcommand, Clone, Copy)]
@@ -697,6 +755,81 @@ fn target_socket_path(db: &str, socket: Option<&str>) -> PathBuf {
     socket
         .map(PathBuf::from)
         .unwrap_or_else(|| service::socket_path_for_db(db))
+}
+
+fn print_round_capture(data: &serde_json::Value) {
+    let peer = data["peer_id"].as_str().unwrap_or("?");
+    let short_peer = &peer[..16.min(peer.len())];
+    let role = data["role"].as_str().unwrap_or("?");
+    let started = data["started_at_ms"].as_i64().unwrap_or(0);
+    let ended = data["ended_at_ms"].as_i64().unwrap_or(0);
+    let duration_ms = ended.saturating_sub(started);
+
+    println!("SYNC ROUND peer={} role={} duration={}ms", short_peer, role, duration_ms);
+
+    if let Some(events) = data["events"].as_array() {
+        if events.is_empty() {
+            println!("  (no frames exchanged)");
+        }
+        for event in events {
+            let dir = event["direction"].as_str().unwrap_or("?");
+            let lane = event["lane"].as_str().unwrap_or("?");
+            let ft = event["frame_type"].as_str().unwrap_or("?");
+            let msg_len = event["msg_len"].as_u64().unwrap_or(0);
+            print!("  {} {} {} {}B", dir, lane, ft, msg_len);
+            if let Some(detail) = event["detail_json"].as_str() {
+                if let Ok(parsed) = serde_json::from_str::<serde_json::Value>(detail) {
+                    if let Some(count) = parsed.get("id_count") {
+                        print!(" ids={}", count);
+                    }
+                    if let Some(fp) = parsed.get("fingerprint_hex") {
+                        let fp_str = fp.as_str().unwrap_or("?");
+                        print!(" fp={}...", &fp_str[..8.min(fp_str.len())]);
+                    }
+                }
+            }
+            println!();
+        }
+    }
+
+    if let Some(newly) = data["newly_observed_ids"].as_array() {
+        if newly.is_empty() {
+            println!("  Newly observed: nothing new learned");
+        } else {
+            println!("  Newly observed: {} event(s)", newly.len());
+            for id in newly {
+                if let Some(s) = id.as_str() {
+                    println!("    {}", &s[..16.min(s.len())]);
+                }
+            }
+        }
+    }
+}
+
+fn print_request_result(data: &serde_json::Value) {
+    let peer = data["peer_id"].as_str().unwrap_or("?");
+    let short_peer = &peer[..16.min(peer.len())];
+    let role = data["role"].as_str().unwrap_or("?");
+
+    if let Some(reason) = data["reason"].as_str() {
+        println!("SYNC REQUEST peer={} role={}: {}", short_peer, role, reason);
+        return;
+    }
+
+    let ids = data["requested_ids"].as_array();
+    let count = ids.map(|a| a.len()).unwrap_or(0);
+
+    println!("SYNC REQUEST peer={} role={}: {} event(s) requested", short_peer, role, count);
+    if let Some(ids) = ids {
+        for id in ids {
+            if let Some(s) = id.as_str() {
+                println!("  {}", s);
+            }
+        }
+    }
+    if count == 0 {
+        println!("  (no events eligible for request)");
+    }
 }
 
 fn rpc_require_daemon(
@@ -1777,6 +1910,7 @@ fn spawn_runtime(
         }
     });
 
+    let sync_control_for_task = Some(state.sync_control.clone());
     let handle = tokio::spawn(async move {
         topo::node::run_node(
             &db_for_task,
@@ -1784,6 +1918,7 @@ fn spawn_runtime(
             net_tx,
             runtime_shutdown_for_task,
             cert_resolver_for_task,
+            sync_control_for_task,
         )
         .await
     });
@@ -3170,6 +3305,69 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
         }
+
+        Commands::Sync { action } => match action {
+            SyncAction::Policy { action: policy_action } => match policy_action {
+                SyncPolicyAction::Show => {
+                    let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::SyncPolicyShow)?;
+                    println!("SYNC POLICY:");
+                    println!("  requests:        {}", data["requests"].as_str().unwrap_or("auto"));
+                    println!("  responses:       {}", data["responses"].as_str().unwrap_or("auto"));
+                    println!("  forward_on_have: {}", data["forward_on_have"].as_str().unwrap_or("auto"));
+                }
+                SyncPolicyAction::Set { requests, responses, forward_on_have } => {
+                    let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::SyncPolicySet {
+                        requests,
+                        responses,
+                        forward_on_have,
+                    })?;
+                    println!("SYNC POLICY (updated):");
+                    println!("  requests:        {}", data["requests"].as_str().unwrap_or("auto"));
+                    println!("  responses:       {}", data["responses"].as_str().unwrap_or("auto"));
+                    println!("  forward_on_have: {}", data["forward_on_have"].as_str().unwrap_or("auto"));
+                }
+            },
+            SyncAction::Round { target } => match target {
+                SyncTarget::Peer { peer } => {
+                    let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::SyncRoundPeer { peer })?;
+                    print_round_capture(&data);
+                }
+                SyncTarget::All => {
+                    let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::SyncRoundAll)?;
+                    if let Some(captures) = data.as_array() {
+                        if captures.is_empty() {
+                            println!("No live sessions to round.");
+                        }
+                        for capture in captures {
+                            print_round_capture(capture);
+                            println!();
+                        }
+                    } else {
+                        print_round_capture(&data);
+                    }
+                }
+            },
+            SyncAction::Request { target } => match target {
+                SyncTarget::Peer { peer } => {
+                    let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::SyncRequestPeer { peer })?;
+                    print_request_result(&data);
+                }
+                SyncTarget::All => {
+                    let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::SyncRequestAll)?;
+                    if let Some(results) = data.as_array() {
+                        if results.is_empty() {
+                            println!("No live sessions to request from.");
+                        }
+                        for result in results {
+                            print_request_result(result);
+                            println!();
+                        }
+                    } else {
+                        print_request_result(&data);
+                    }
+                }
+            },
+        },
 
         Commands::Reset => {
             let socket_path = socket_override

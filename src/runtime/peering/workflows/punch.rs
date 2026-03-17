@@ -306,7 +306,7 @@ async fn run_sync_on_punched_connection(
     let coordination_manager = std::sync::Arc::new(CoordinationManager::new());
     let coordination = coordination_manager.register_peer();
     let handler =
-        SyncSessionHandler::outbound(db_path.to_string(), 60, coordination, shared_ingest);
+        SyncSessionHandler::outbound(db_path.to_string(), 60, None, coordination, shared_ingest);
 
     if let Err(e) = handler
         .on_session(meta, session.io, CancellationToken::new())

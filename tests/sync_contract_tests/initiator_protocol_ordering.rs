@@ -31,6 +31,7 @@ async fn initiator_outbound_starts_with_negopen_then_next_round() {
         let handler = SyncSessionHandler::outbound(
             db_path,
             30,
+            None,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );
@@ -102,6 +103,7 @@ async fn anticheat_first_control_frame_is_negopen() {
         let handler = SyncSessionHandler::outbound(
             db_path,
             30,
+            None,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );
@@ -145,6 +147,7 @@ async fn initiator_rejects_inbound_direction() {
         let handler = SyncSessionHandler::outbound(
             db_path,
             30,
+            None,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );

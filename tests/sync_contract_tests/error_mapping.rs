@@ -29,6 +29,7 @@ async fn control_channel_half_close_terminates_handler() {
         let handler = SyncSessionHandler::responder(
             db_path,
             30,
+            None,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );
@@ -70,6 +71,7 @@ async fn abrupt_close_surfaces_connection_lost() {
         let handler = SyncSessionHandler::outbound(
             db_path,
             30,
+            None,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );
@@ -120,6 +122,7 @@ async fn normal_roundtrip_stays_healthy_until_cancel() {
         let handler = SyncSessionHandler::responder(
             db_path,
             30,
+            None,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );
@@ -323,6 +326,7 @@ async fn fragmented_data_frames_handler_completes() {
         let handler = SyncSessionHandler::responder(
             db_path,
             30,
+            None,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );
@@ -435,6 +439,7 @@ async fn garbage_control_frame_terminates_handler() {
         let handler = SyncSessionHandler::responder(
             db_path,
             30,
+            None,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );

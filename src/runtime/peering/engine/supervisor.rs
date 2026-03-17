@@ -148,6 +148,7 @@ pub(crate) struct RuntimeSupervisor {
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     state: RuntimeState,
+    sync_control: Option<Arc<crate::runtime::sync_control::SyncControlRegistry>>,
 }
 
 impl RuntimeSupervisor {
@@ -161,6 +162,7 @@ impl RuntimeSupervisor {
         local_peer_ids: HashSet<String>,
         intro_spawner: IntroSpawnerFn,
         ingest: IngestFns,
+        sync_control: Option<Arc<crate::runtime::sync_control::SyncControlRegistry>>,
     ) -> Self {
         Self {
             db_path,
@@ -172,6 +174,7 @@ impl RuntimeSupervisor {
             intro_spawner,
             ingest,
             state: RuntimeState::IdleNoTenants,
+            sync_control,
         }
     }
 
@@ -216,6 +219,7 @@ impl RuntimeSupervisor {
             let intro_spawner = self.intro_spawner;
             let ingest = self.ingest;
             let cancel = root_cancel.child_token();
+            let sync_control = self.sync_control.clone();
             spawn_worker(
                 &mut workers,
                 WorkerKind::AcceptLoop,
@@ -231,6 +235,7 @@ impl RuntimeSupervisor {
                         tenant_cfgs,
                         intro_spawner,
                         ingest,
+                        sync_control,
                     )
                     .await
                     .map_err(|e| e.to_string())
@@ -245,6 +250,7 @@ impl RuntimeSupervisor {
             let intro_spawner = self.intro_spawner;
             let ingest = self.ingest;
             let cancel = root_cancel.child_token();
+            let sync_control = self.sync_control.clone();
             spawn_worker(
                 &mut workers,
                 WorkerKind::TargetDispatcher,
@@ -259,6 +265,7 @@ impl RuntimeSupervisor {
                         tenant_contexts,
                         target_rx,
                         cancel,
+                        sync_control,
                     )
                     .await
                 },
@@ -660,6 +667,7 @@ async fn run_target_dispatcher(
     tenant_contexts: HashMap<String, TenantDispatchContext>,
     mut ingress_rx: mpsc::UnboundedReceiver<TargetIngressEvent>,
     shutdown: CancellationToken,
+    sync_control: Option<Arc<crate::runtime::sync_control::SyncControlRegistry>>,
 ) -> Result<(), String> {
     let mut dispatcher = PeerDispatcher::new();
     let mut tenant_contexts = tenant_contexts;
@@ -841,6 +849,7 @@ async fn run_target_dispatcher(
             let worker_cancel = worker_cancel.clone();
             let dispatch_key = dispatch_key.clone();
             let bootstrap_fallback_client_config = bootstrap_fallback_client_config.clone();
+            let sync_control = sync_control.clone();
             move || {
                 let runtime = tokio::runtime::Builder::new_current_thread()
                     .enable_all()
@@ -858,6 +867,7 @@ async fn run_target_dispatcher(
                     worker_cancel,
                     dispatch_key,
                     bootstrap_fallback_client_config,
+                    sync_control,
                 ));
             }
         });
@@ -1082,6 +1092,7 @@ async fn run_connect_worker(
     shutdown: CancellationToken,
     dispatch_key: String,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
+    sync_control: Option<Arc<crate::runtime::sync_control::SyncControlRegistry>>,
 ) {
     let mut warning_gate = RepeatedWarningGate::new(Duration::from_secs(300));
     loop {
@@ -1101,6 +1112,7 @@ async fn run_connect_worker(
             context.coordination_manager.clone(),
             shutdown.clone(),
             bootstrap_fallback_client_config.clone(),
+            sync_control.clone(),
         )
         .await;
 

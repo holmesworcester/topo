@@ -58,6 +58,7 @@ pub async fn accept_loop(
         std::collections::HashMap::new(),
         intro_spawner,
         ingest,
+        None,
     )
     .await
 }
@@ -92,6 +93,7 @@ pub async fn accept_loop_with_ingest(
         tenant_client_configs,
         intro_spawner,
         ingest,
+        None,
     )
     .await
 }
@@ -109,6 +111,7 @@ pub async fn accept_loop_with_ingest_until_cancel(
     tenant_client_configs: std::collections::HashMap<String, TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
+    sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     accept_loop_with_ingest_until_cancel_inner(
         db_path,
@@ -119,6 +122,7 @@ pub async fn accept_loop_with_ingest_until_cancel(
         tenant_client_configs,
         intro_spawner,
         ingest,
+        sync_control,
     )
     .await
 }
@@ -134,6 +138,7 @@ async fn accept_loop_with_ingest_until_cancel_inner(
     tenant_client_configs: std::collections::HashMap<String, TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
+    sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     struct ConnectionWorker {
         cancel: CancellationToken,
@@ -261,6 +266,7 @@ async fn accept_loop_with_ingest_until_cancel_inner(
         let worker_shutdown = shutdown.child_token();
         let worker_cancel = worker_shutdown.clone();
         let coordination_manager = coordination_manager.clone();
+        let sync_control = sync_control.clone();
 
         let join = std::thread::spawn(move || {
             let _connection_lease = connection_lease;
@@ -302,6 +308,7 @@ async fn accept_loop_with_ingest_until_cancel_inner(
                 let responder_handler = SyncSessionHandler::responder(
                     db_path_owned.clone(),
                     SYNC_SESSION_TIMEOUT_SECS,
+                    sync_control.clone(),
                     coordination_manager.register_peer(),
                     ingest_clone.clone(),
                 );

@@ -40,6 +40,7 @@ async fn initiator_reuses_connection_scoped_credit_across_repeated_rounds() {
         let handler = SyncSessionHandler::outbound(
             db_path.clone(),
             30,
+            None,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );

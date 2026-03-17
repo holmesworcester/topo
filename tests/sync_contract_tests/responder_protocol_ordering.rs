@@ -53,6 +53,7 @@ async fn responder_inbound_replies_negmsg_and_stays_open_for_next_round() {
         let handler = SyncSessionHandler::responder(
             db_path,
             30,
+            None,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );
@@ -93,6 +94,7 @@ async fn responder_rejects_outbound_direction() {
         let handler = SyncSessionHandler::responder(
             db_path,
             30,
+            None,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );
@@ -120,6 +122,7 @@ async fn responder_ignores_empty_havelist_marker() {
         let handler = SyncSessionHandler::responder(
             db_path,
             30,
+            None,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );

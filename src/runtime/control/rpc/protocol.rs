@@ -189,6 +189,29 @@ pub enum RpcMethod {
         #[serde(default = "default_intro_attempt_window_ms")]
         attempt_window_ms: u32,
     },
+    /// Show the sync policy for the active tenant.
+    SyncPolicyShow,
+    /// Update the sync policy for the active tenant.
+    SyncPolicySet {
+        #[serde(default)]
+        requests: Option<String>,
+        #[serde(default)]
+        responses: Option<String>,
+        #[serde(default)]
+        forward_on_have: Option<String>,
+    },
+    /// Force a sync round with a specific peer.
+    SyncRoundPeer {
+        peer: String,
+    },
+    /// Force a sync round with all connected peers.
+    SyncRoundAll,
+    /// Manually trigger request issuance for a specific peer.
+    SyncRequestPeer {
+        peer: String,
+    },
+    /// Manually trigger request issuance for all connected peers.
+    SyncRequestAll,
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]

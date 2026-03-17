@@ -140,7 +140,7 @@ pub async fn bootstrap_sync_from_invite(
     let coordination_manager = Arc::new(CoordinationManager::new());
     let coordination = coordination_manager.register_peer();
     let handler =
-        SyncSessionHandler::outbound(db_path.to_string(), timeout_secs, coordination, ingest_tx);
+        SyncSessionHandler::outbound(db_path.to_string(), timeout_secs, None, coordination, ingest_tx);
     let io = QuicTransportSessionIo::new(session_id, conn);
     handler
         .on_session(meta, Box::new(io), CancellationToken::new())
@@ -263,7 +263,7 @@ pub fn start_bootstrap_responder(
         rt.block_on(async move {
             let coordination = CoordinationManager::new().register_peer();
             let handler =
-                SyncSessionHandler::responder(db_path.clone(), 30, coordination, ingest_tx);
+                SyncSessionHandler::responder(db_path.clone(), 30, None, coordination, ingest_tx);
             // Keep connections alive until the endpoint closes so QUIC can
             // deliver in-flight control/data frames before the connection
             // is torn down. Dropping a quinn::Connection sends

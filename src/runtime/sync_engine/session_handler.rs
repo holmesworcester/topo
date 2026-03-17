@@ -17,6 +17,7 @@ use crate::contracts::peering_contract::{
 };
 use crate::protocol::Frame;
 use crate::protocol::{encode_frame, parse_frame};
+use crate::runtime::sync_control::{ActionCaptureHub, SyncControlRegistry};
 use crate::sync::session::coordinator::PeerCoord;
 use crate::sync::session::logging::{LogDir, LogLane, SessionRunLogger, SyncRunCapture};
 use crate::sync::session::{run_sync_initiator, run_sync_responder};
@@ -32,6 +33,7 @@ use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 struct ControlAdapter {
     inner: Box<dyn ControlIo>,
     capture: Option<SyncRunCapture>,
+    manual_capture: ActionCaptureHub,
 }
 
 #[async_trait]
@@ -41,6 +43,8 @@ impl StreamConn for ControlAdapter {
         if let Some(c) = &self.capture {
             c.record_frame(LogLane::Control, LogDir::Tx, msg, frame.len());
         }
+        self.manual_capture
+            .record_frame(LogLane::Control, LogDir::Tx, msg, frame.len());
         self.inner.send(&frame).await.map_err(|e| map_io_error(e))
     }
 
@@ -54,6 +58,8 @@ impl StreamConn for ControlAdapter {
         if let Some(c) = &self.capture {
             c.record_frame(LogLane::Control, LogDir::Rx, &msg, frame.len());
         }
+        self.manual_capture
+            .record_frame(LogLane::Control, LogDir::Rx, &msg, frame.len());
         Ok(msg)
     }
 }
@@ -61,6 +67,7 @@ impl StreamConn for ControlAdapter {
 struct DataSendAdapter {
     inner: Box<dyn DataSendIo>,
     capture: Option<SyncRunCapture>,
+    manual_capture: ActionCaptureHub,
 }
 
 #[async_trait]
@@ -70,6 +77,8 @@ impl StreamSend for DataSendAdapter {
         if let Some(c) = &self.capture {
             c.record_frame(LogLane::Data, LogDir::Tx, msg, frame.len());
         }
+        self.manual_capture
+            .record_frame(LogLane::Data, LogDir::Tx, msg, frame.len());
         self.inner.send(&frame).await.map_err(|e| map_io_error(e))
     }
 
@@ -81,6 +90,7 @@ impl StreamSend for DataSendAdapter {
 struct DataRecvAdapter {
     inner: Box<dyn DataRecvIo>,
     capture: Option<SyncRunCapture>,
+    manual_capture: ActionCaptureHub,
 }
 
 #[async_trait]
@@ -91,6 +101,8 @@ impl StreamRecv for DataRecvAdapter {
         if let Some(c) = &self.capture {
             c.record_frame(LogLane::Data, LogDir::Rx, &msg, frame.len());
         }
+        self.manual_capture
+            .record_frame(LogLane::Data, LogDir::Rx, &msg, frame.len());
         Ok(msg)
     }
 }
@@ -114,6 +126,7 @@ pub struct SyncSessionHandler {
     db_path: String,
     timeout_secs: u64,
     direction: SessionDirection,
+    sync_control: Option<Arc<SyncControlRegistry>>,
     coordination: Arc<PeerCoord>,
     request_state: Arc<ConnectionRequestState>,
     response_state: Arc<ConnectionResponseState>,
@@ -124,6 +137,7 @@ impl SyncSessionHandler {
     pub fn outbound(
         db_path: String,
         timeout_secs: u64,
+        sync_control: Option<Arc<SyncControlRegistry>>,
         coordination: Arc<PeerCoord>,
         shared_ingest: mpsc::Sender<IngestItem>,
     ) -> Self {
@@ -131,6 +145,7 @@ impl SyncSessionHandler {
             db_path,
             timeout_secs,
             direction: SessionDirection::Outbound,
+            sync_control,
             coordination,
             request_state: Arc::new(ConnectionRequestState::default()),
             response_state: Arc::new(ConnectionResponseState::default()),
@@ -141,6 +156,7 @@ impl SyncSessionHandler {
     pub fn responder(
         db_path: String,
         timeout_secs: u64,
+        sync_control: Option<Arc<SyncControlRegistry>>,
         coordination: Arc<PeerCoord>,
         shared_ingest: mpsc::Sender<IngestItem>,
     ) -> Self {
@@ -148,6 +164,7 @@ impl SyncSessionHandler {
             db_path,
             timeout_secs,
             direction: SessionDirection::Inbound,
+            sync_control,
             coordination,
             request_state: Arc::new(ConnectionRequestState::default()),
             response_state: Arc::new(ConnectionResponseState::default()),
@@ -189,20 +206,25 @@ impl SessionHandler for SyncSessionHandler {
         let run_logger = SessionRunLogger::maybe_new(&self.db_path, &meta, role_name);
         let capture = run_logger.as_ref().and_then(|l| l.capture());
 
+        let manual_capture = ActionCaptureHub::default();
+
         let parts = io.split();
         let conn: DualConnection<ControlAdapter, DataSendAdapter, DataRecvAdapter> =
             DualConnection {
                 control: ControlAdapter {
                     inner: parts.control,
                     capture: capture.clone(),
+                    manual_capture: manual_capture.clone(),
                 },
                 data_send: DataSendAdapter {
                     inner: parts.data_send,
                     capture: capture.clone(),
+                    manual_capture: manual_capture.clone(),
                 },
                 data_recv: DataRecvAdapter {
                     inner: parts.data_recv,
                     capture,
+                    manual_capture: manual_capture.clone(),
                 },
             };
 
@@ -210,6 +232,17 @@ impl SessionHandler for SyncSessionHandler {
         let tenant_id = meta.tenant.0.clone();
         let ingress_source_tag = format!("quic_recv:{}@{}", peer_id, meta.remote_addr);
         let session_owner = format!("{}:{}", role_name, meta.session_id);
+
+        // Register with sync control registry (if available) so CLI commands
+        // can target this live session.
+        let _registered = self.sync_control.as_ref().and_then(|sc| {
+            sc.register_session(
+                tenant_id.clone(),
+                peer_id.clone(),
+                role_name.to_string(),
+            )
+            .ok()
+        });
 
         let mut stats: Option<crate::runtime::SyncStats> = None;
         let result = match (self.direction, meta.direction) {

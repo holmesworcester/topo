@@ -1,0 +1,117 @@
+Manual Sync Controls — CLI Session Captures
+=============================================
+
+Captured from a two-peer test scenario:
+  peer1 (alice): creator of workspace "testws"
+  peer2 (bob):   joined via invite link
+
+Both peers running on localhost with automatic discovery.
+
+--- SC1: Policy Show / Set ---
+
+$ topo sync policy show
+SYNC POLICY:
+  requests:        auto
+  responses:       auto
+  forward_on_have: auto
+
+$ topo sync policy set --requests manual
+SYNC POLICY (updated):
+  requests:        manual
+  responses:       auto
+  forward_on_have: auto
+
+$ topo sync policy show
+SYNC POLICY:
+  requests:        manual
+  responses:       auto
+  forward_on_have: auto
+
+$ topo sync policy set --requests disabled --responses disabled --forward-on-have disabled
+SYNC POLICY (updated):
+  requests:        disabled
+  responses:       disabled
+  forward_on_have: disabled
+
+$ topo sync policy show
+SYNC POLICY:
+  requests:        disabled
+  responses:       disabled
+  forward_on_have: disabled
+
+$ topo sync policy set --requests auto --responses auto --forward-on-have auto
+SYNC POLICY (updated):
+  requests:        auto
+  responses:       auto
+  forward_on_have: auto
+
+
+--- SC2: Sync Round ---
+
+$ topo sync round all
+SYNC ROUND peer=8e63dac418bac986 role=responder duration=0ms
+  (no frames exchanged)
+  Newly observed: nothing new learned
+
+$ topo sync round peer 8e63dac418bac986
+SYNC ROUND peer=8e63dac418bac986 role=responder duration=2ms
+  (no frames exchanged)
+  Newly observed: nothing new learned
+
+(Output correctly identifies peer, role, and duration. When no new
+information is discovered during the round, it explicitly says so.)
+
+
+--- SC3: Sync Request ---
+
+$ topo sync request all
+SYNC REQUEST peer=8e63dac418bac986 role=responder: 0 event(s) requested
+  (no events eligible for request)
+
+(When no events are eligible for request, the output says so explicitly.
+When events would be listed, each event ID appears on its own line.)
+
+
+--- SC4: Policy Affects Runtime ---
+
+# With requests=manual, sync round and request commands still work:
+$ topo sync policy set --requests manual
+SYNC POLICY (updated):
+  requests:        manual
+  responses:       auto
+  forward_on_have: auto
+
+$ topo sync request all
+SYNC REQUEST peer=8e63dac418bac986 role=responder: 0 event(s) requested
+  (no events eligible for request)
+
+# With requests=disabled, manual requests are refused:
+$ topo sync policy set --requests disabled
+SYNC POLICY (updated):
+  requests:        disabled
+  responses:       auto
+  forward_on_have: disabled
+
+$ topo sync request all
+SYNC REQUEST peer=8e63dac418bac986 role=responder: requests are disabled for this tenant
+
+
+--- SC5: Round Output Tells User What Changed ---
+
+$ topo sync round all
+SYNC ROUND peer=8e63dac418bac986 role=responder duration=0ms
+  (no frames exchanged)
+  Newly observed: nothing new learned
+
+(When something new would be learned, it shows "Newly observed: N event(s)"
+with truncated event ID hashes listed below. When nothing new is learned,
+it explicitly says "nothing new learned".)
+
+
+--- Notes ---
+
+- Discovery is always automatic; there is no discovery policy knob.
+- Response gating is surfaced in policy (responses field) but actual
+  response suppression is deferred until forward-on-have exists on master.
+- Forward-on-have policy is stored and visible but the underlying behavior
+  is deferred until the feature exists on master.

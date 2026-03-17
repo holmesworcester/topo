@@ -21,6 +21,7 @@ async fn pre_cancelled_session_returns_error() {
         let handler = SyncSessionHandler::outbound(
             db_path,
             30,
+            None,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );
@@ -52,6 +53,7 @@ async fn mid_session_cancellation_terminates_handler() {
         let handler = SyncSessionHandler::outbound(
             db_path,
             30,
+            None,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );
@@ -99,6 +101,7 @@ async fn responder_cancellation_terminates_handler() {
         let handler = SyncSessionHandler::responder(
             db_path,
             30,
+            None,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
             noop_ingest_tx(),
         );

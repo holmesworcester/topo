@@ -33,7 +33,7 @@ pub enum LogDir {
 }
 
 impl LogLane {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Control => "control",
             Self::Data => "data",
@@ -42,7 +42,7 @@ impl LogLane {
 }
 
 impl LogDir {
-    fn as_str(self) -> &'static str {
+    pub(crate) fn as_str(self) -> &'static str {
         match self {
             Self::Tx => "tx",
             Self::Rx => "rx",
@@ -317,6 +317,16 @@ fn frame_type(frame: &Frame) -> &'static str {
         Frame::Event { .. } => "Event",
         Frame::IntroOffer { .. } => "IntroOffer",
     }
+}
+
+pub(crate) fn capture_frame_for_manual_action(
+    frame: &Frame,
+    capture_full_ids: bool,
+) -> (String, Option<String>) {
+    (
+        frame_type(frame).to_string(),
+        frame_detail_json(frame, capture_full_ids),
+    )
 }
 
 enum WorkerMsg {
