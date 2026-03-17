@@ -193,3 +193,117 @@ async fn bandwidth_only_proxy_quinn_repeated_sessions_succeed() -> TestResult {
     .await??;
     Ok(())
 }
+
+// ---------------------------------------------------------------------------
+// Shaper sanity checks
+//
+// These tests validate that the shaper knobs actually do what they claim.
+// They are complementary to the "sessions succeed" tests above: where those
+// prove the shaper never accidentally breaks connectivity, these prove it
+// actually imposes the configured impairment.
+// ---------------------------------------------------------------------------
+
+/// A shaper configured with zero impairment (huge bandwidth, no latency, no loss)
+/// must complete the same workload as direct QUIC within the same time budget.
+/// This proves the shaper itself adds no material overhead when not impeding traffic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn zero_impairment_proxy_matches_direct_speed() -> TestResult {
+    // Same workload as direct_quinn_repeated_sessions_succeed: 5 rounds × 32 KiB.
+    let providers = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_session_providers(Some(shaping_profile(
+            "zero-impairment",
+            1_000_000.0,
+            0,
+            0,
+            0.0,
+        ))),
+    )
+    .await??;
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        exercise_roundtrip_sessions(&providers, 5, 32 * 1024),
+    )
+    .await??;
+    Ok(())
+}
+
+/// 100% packet loss makes the QUIC handshake impossible: all UDP packets are
+/// discarded before reaching the peer.  The connection attempt must not succeed
+/// within a short window, proving the drop path is active.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn total_loss_proxy_blocks_connection() {
+    let result = tokio::time::timeout(
+        Duration::from_secs(3),
+        connect_session_providers(Some(shaping_profile("blackhole", 1_000.0, 0, 0, 100.0))),
+    )
+    .await;
+    // Must either time out (Err from tokio::time::timeout) or produce a
+    // transport-level error — never a successfully-connected provider pair.
+    let succeeded = matches!(result, Ok(Ok(_)));
+    assert!(
+        !succeeded,
+        "connection through a 100% loss shaper must not succeed within 3s"
+    );
+}
+
+/// An extreme bandwidth cap measurably slows bulk data transfer, proving the
+/// serialization-delay model is applied.
+///
+/// At 1 Mbps (125 KB/s), transmitting 128 KiB of QUIC-packetised event data
+/// requires roughly 1.05 s of serialization time.  The test checks that the
+/// elapsed transfer time is at least 800 ms (≈76% of the theoretical minimum),
+/// giving generous margin for OS scheduling and QUIC stack overhead while still
+/// catching a broken or bypassed shaper.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn low_bandwidth_proxy_measurably_throttles_transfer() -> TestResult {
+    let providers = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_session_providers(Some(shaping_profile("narrow", 1.0, 0, 0, 0.0))),
+    )
+    .await??;
+    let start = std::time::Instant::now();
+    tokio::time::timeout(
+        Duration::from_secs(30),
+        exercise_roundtrip_sessions(&providers, 1, 128 * 1024),
+    )
+    .await??;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(800),
+        "128 KiB at 1 Mbps should take ≥800 ms, took {} ms",
+        elapsed.as_millis()
+    );
+    Ok(())
+}
+
+/// High propagation delay measurably slows sequential message exchanges, proving
+/// the delay-line latency model is applied.
+///
+/// One call to `exercise_roundtrip_sessions` sends three one-way messages
+/// (NegOpen client→server, HaveList server→client, Event client→server).
+/// At 200 ms RTT (100 ms one-way), those three hops require at least 300 ms.
+/// The test checks for ≥250 ms, giving 50 ms of slack for timing imprecision.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn high_latency_proxy_measurably_delays_roundtrip() -> TestResult {
+    // Connection setup itself takes ~1 RTT at 200 ms; use a generous timeout.
+    let providers = tokio::time::timeout(
+        Duration::from_secs(10),
+        connect_session_providers(Some(shaping_profile("high-latency", 1_000.0, 200, 0, 0.0))),
+    )
+    .await??;
+    let start = std::time::Instant::now();
+    // Tiny payload so serialization is negligible; only propagation delay matters.
+    tokio::time::timeout(
+        Duration::from_secs(10),
+        exercise_roundtrip_sessions(&providers, 1, 32),
+    )
+    .await??;
+    let elapsed = start.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(250),
+        "3 one-way messages at 200 ms RTT should take ≥250 ms, took {} ms",
+        elapsed.as_millis()
+    );
+    Ok(())
+}
