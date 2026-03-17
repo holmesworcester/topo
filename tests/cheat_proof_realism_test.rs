@@ -16,12 +16,10 @@ use std::sync::{Mutex, OnceLock};
 
 fn realism_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    let guard = LOCK
-        .get_or_init(|| Mutex::new(()))
+    hold_network_test_lock_for_binary();
+    LOCK.get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cleanup_test_daemons();
-    guard
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 fn bootstrap_alice_and_invite(tmpdir: &tempfile::TempDir) -> (String, String, String) {

@@ -5,15 +5,13 @@ use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant};
 
-use topo::testutil::DaemonGuard;
-
 use crate::cli_harness::{
     accept_invite_with_identity_on_running_daemon, assert_eventually, create_invite_with_spki,
     daemon_listen_addr, daemon_transport_fingerprint, ensure_active_peer, generate_messages,
     message_count_sql, peak_rss_mib_for_pid, random_port, send_message, start_daemon_with_options,
     stop_daemon, topo_cmd, wait_for_active_tenant_ready,
     wait_for_bootstrap_supersession_and_endpoint_observation, wait_for_daemon_stopped,
-    DaemonOptions,
+    DaemonOptions, HarnessDaemon,
 };
 
 pub type BenchNetworkGuard = Box<dyn std::any::Any + Send>;
@@ -53,11 +51,11 @@ pub struct SharedWorkspaceBench {
     keep_tmpdir: bool,
     pub alice_db: String,
     pub bob_db: String,
-    alice_daemon: DaemonGuard,
+    alice_daemon: HarnessDaemon,
     alice_pid: u32,
     alice_bind_addr: SocketAddr,
     alice_transport_peer_id: String,
-    bob_daemon: DaemonGuard,
+    bob_daemon: HarnessDaemon,
     bob_pid: u32,
     alice_disable_placeholder_autodial: bool,
     bob_disable_placeholder_autodial: bool,
@@ -425,7 +423,7 @@ fn start_perf_daemon(
     label: &str,
     disable_placeholder_autodial: bool,
     bind_addr: Option<SocketAddr>,
-) -> DaemonGuard {
+) -> HarnessDaemon {
     let bind_ip = bind_addr.map(|addr| addr.ip().to_string());
     let bind_port = bind_addr.map(|addr| addr.port());
     if !perf_debug_env("PERF_DAEMON_LOGS") {
@@ -434,7 +432,6 @@ fn start_perf_daemon(
             &DaemonOptions {
                 bind_ip,
                 bind_port,
-                allow_ephemeral_bind_fallback: bind_addr.is_none(),
                 disable_placeholder_autodial,
                 disable_discovery: true,
                 ..Default::default()
@@ -446,7 +443,6 @@ fn start_perf_daemon(
         &DaemonOptions {
             bind_ip,
             bind_port,
-            allow_ephemeral_bind_fallback: bind_addr.is_none(),
             stdout_file: Some(tmpdir.join(format!("{label}.daemon.stdout.log"))),
             stderr_file: Some(tmpdir.join(format!("{label}.daemon.stderr.log"))),
             disable_placeholder_autodial,

@@ -12,16 +12,15 @@ use std::time::{Duration, Instant};
 use cli_harness::{
     accept_invite_with_identity, assert_eventually, create_invite_with_spki, create_workspace,
     daemon_listen_addr, daemon_transport_fingerprint, ensure_active_peer, generate_messages,
-    message_count_sql, start_daemon, topo_cmd, wait_for_daemon_stopped,
+    message_count_sql, start_daemon, topo_cmd, wait_for_daemon_stopped, HarnessDaemon,
 };
-use topo::testutil::DaemonGuard;
 
 struct SharedWorkspaceBench {
     _tmpdir: tempfile::TempDir,
     alice_db: String,
     bob_db: String,
-    alice_daemon: DaemonGuard,
-    bob_daemon: DaemonGuard,
+    alice_daemon: HarnessDaemon,
+    bob_daemon: HarnessDaemon,
 }
 
 impl SharedWorkspaceBench {

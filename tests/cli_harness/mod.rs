@@ -8,9 +8,133 @@
 
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use topo::testutil::DaemonGuard;
+
+static DAEMON_INSTANCE_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+fn next_daemon_instance_id() -> u64 {
+    DAEMON_INSTANCE_COUNTER.fetch_add(1, Ordering::Relaxed)
+}
+
+/// RAII guard for a daemon started by the test harness.
+///
+/// Owns the child process and cleans it up on drop:
+///   1. Sends `topo --db {db} stop` (fire-and-forget)
+///   2. Polls the child for up to 2 s
+///   3. SIGKILLs if still alive
+///   4. Removes the socket file if still present
+pub struct HarnessDaemon {
+    child: Option<std::process::Child>,
+    db_path: String,
+    socket_path: PathBuf,
+}
+
+impl HarnessDaemon {
+    pub fn new(child: std::process::Child, db: &str) -> Self {
+        let socket_path = topo::service::socket_path_for_db(db);
+        Self {
+            child: Some(child),
+            db_path: db.to_string(),
+            socket_path,
+        }
+    }
+
+    /// Access the underlying child process.
+    pub fn child(&mut self) -> &mut std::process::Child {
+        self.child.as_mut().expect("HarnessDaemon already consumed")
+    }
+
+    /// Take ownership of the child process without running the drop cleanup.
+    pub fn take_child(&mut self) -> Option<std::process::Child> {
+        self.child.take()
+    }
+
+    /// Mark the daemon as already stopped so Drop does nothing.
+    pub fn clear(&mut self) {
+        self.child = None;
+    }
+
+    /// Immediately SIGKILL the child and remove the socket file.
+    pub fn kill(&mut self) {
+        if let Some(mut child) = self.child.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        if self.socket_path.exists() {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+    }
+
+    /// Graceful stop: send `topo stop`, wait up to 5 s, force-kill if needed.
+    /// Panics if the daemon does not stop.
+    pub fn stop(&mut self) {
+        let db = self.db_path.clone();
+        let _ = Command::new(bin()).args(["--db", &db, "stop"]).output();
+        let start = Instant::now();
+        let mut stopped = false;
+        while start.elapsed().as_secs() < 5 {
+            if let Some(ref mut child) = self.child {
+                match child.try_wait() {
+                    Ok(Some(_)) => {
+                        stopped = true;
+                        break;
+                    }
+                    Ok(None) => {}
+                    Err(_) => break,
+                }
+            } else {
+                stopped = true;
+                break;
+            }
+            std::thread::sleep(Duration::from_millis(100));
+        }
+        if !stopped {
+            if let Some(mut child) = self.child.take() {
+                let _ = child.kill();
+                let _ = child.wait();
+            }
+        }
+        wait_for_daemon_stopped(&db, Duration::from_secs(5));
+        self.clear();
+    }
+}
+
+impl Drop for HarnessDaemon {
+    fn drop(&mut self) {
+        let Some(ref mut child) = self.child else {
+            return;
+        };
+        // Fire-and-forget graceful stop signal (best-effort, ignore errors).
+        let _ = Command::new(bin())
+            .args(["--db", &self.db_path, "stop"])
+            .output();
+        // Poll for up to 2 s.
+        let start = Instant::now();
+        let mut exited = false;
+        while start.elapsed().as_secs() < 2 {
+            match child.try_wait() {
+                Ok(Some(_)) => {
+                    exited = true;
+                    break;
+                }
+                Ok(None) => {}
+                Err(_) => break,
+            }
+            std::thread::sleep(Duration::from_millis(50));
+        }
+        if !exited {
+            let _ = child.kill();
+            let _ = child.wait();
+        }
+        self.child = None;
+        if self.socket_path.exists() {
+            let _ = std::fs::remove_file(&self.socket_path);
+        }
+    }
+}
 
 const DAEMON_START_MAX_ATTEMPTS: usize = 20;
 const DAEMON_START_RETRY_BASE_MS: u64 = 200;
@@ -295,7 +419,8 @@ fn default_daemon_log_path(db: &str, stream: &str) -> PathBuf {
         .unwrap_or("test.db");
     let sanitized = db_name.replace('.', "_");
     let pid = std::process::id();
-    std::env::temp_dir().join(format!("topo-{sanitized}-{pid}.{stream}.log"))
+    let instance_id = next_daemon_instance_id();
+    std::env::temp_dir().join(format!("topo-{sanitized}-{pid}-{instance_id}.{stream}.log"))
 }
 
 fn read_daemon_log(path: &PathBuf) -> String {
@@ -337,7 +462,7 @@ fn daemon_debug_log_dir() -> Option<std::path::PathBuf> {
 }
 
 /// Start a daemon with default options (random port, suppressed I/O).
-pub fn start_daemon(db: &str) -> DaemonGuard {
+pub fn start_daemon(db: &str) -> HarnessDaemon {
     start_daemon_with_options(
         db,
         &DaemonOptions {
@@ -348,7 +473,7 @@ pub fn start_daemon(db: &str) -> DaemonGuard {
 }
 
 /// Start a daemon on a specific port with suppressed I/O.
-pub fn start_daemon_on_port(db: &str, port: u16) -> DaemonGuard {
+pub fn start_daemon_on_port(db: &str, port: u16) -> HarnessDaemon {
     start_daemon_with_options(
         db,
         &DaemonOptions {
@@ -360,7 +485,7 @@ pub fn start_daemon_on_port(db: &str, port: u16) -> DaemonGuard {
 }
 
 /// Start a daemon with mDNS discovery enabled.
-pub fn start_discovery_daemon(db: &str) -> DaemonGuard {
+pub fn start_discovery_daemon(db: &str) -> HarnessDaemon {
     start_daemon_with_options(
         db,
         &DaemonOptions {
@@ -375,7 +500,7 @@ pub fn start_discovery_daemon(db: &str) -> DaemonGuard {
 }
 
 /// Start a discovery-enabled daemon on a specific port.
-pub fn start_discovery_daemon_on_port(db: &str, port: u16) -> DaemonGuard {
+pub fn start_discovery_daemon_on_port(db: &str, port: u16) -> HarnessDaemon {
     start_daemon_with_options(
         db,
         &DaemonOptions {
@@ -388,7 +513,7 @@ pub fn start_discovery_daemon_on_port(db: &str, port: u16) -> DaemonGuard {
 }
 
 /// Start a daemon with full control over options.
-pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard {
+pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> HarnessDaemon {
     hold_network_test_binary_lock();
     let socket = socket_path_for_db(db);
     let bind_ip = opts.bind_ip.as_deref().unwrap_or("127.0.0.1");
@@ -564,7 +689,7 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> DaemonGuard 
                         read_daemon_log(&stderr_path)
                     );
                 }
-                return DaemonGuard::new(child);
+                return HarnessDaemon::new(child, db);
             }
             if rpc_start.elapsed().as_secs() >= 5 {
                 let _ = child.kill();
@@ -655,39 +780,48 @@ pub fn wait_for_daemon_stopped(db: &str, timeout: Duration) {
     );
 }
 
-/// Send stop command and wait for the daemon process to exit.
-pub fn stop_daemon(db: &str, daemon: &mut DaemonGuard) {
-    let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
-    let start = Instant::now();
-    loop {
-        match daemon.child().try_wait() {
-            Ok(Some(_)) => {
-                wait_for_daemon_stopped(db, Duration::from_secs(5));
-                daemon.clear();
-                return;
-            }
-            Ok(None) => {
-                if start.elapsed().as_secs() >= 5 {
-                    break;
+/// Trait for daemon handles that support a graceful stop operation.
+pub trait StopDaemon {
+    fn stop_with_db(&mut self, db: &str);
+}
+
+impl StopDaemon for HarnessDaemon {
+    fn stop_with_db(&mut self, _db: &str) {
+        self.stop();
+    }
+}
+
+impl StopDaemon for DaemonGuard {
+    fn stop_with_db(&mut self, db: &str) {
+        let _ = Command::new(bin()).args(["--db", db, "stop"]).output();
+        let start = Instant::now();
+        loop {
+            match self.child().try_wait() {
+                Ok(Some(_)) => {
+                    wait_for_daemon_stopped(db, Duration::from_secs(5));
+                    self.clear();
+                    return;
                 }
-                std::thread::sleep(Duration::from_millis(100));
-            }
-            Err(err) => {
-                panic!(
-                    "failed to stop daemon for {}: {}\n{}",
-                    db,
-                    err,
-                    daemon_debug_context(db)
-                );
+                Ok(None) => {
+                    if start.elapsed().as_secs() >= 5 {
+                        break;
+                    }
+                    std::thread::sleep(Duration::from_millis(100));
+                }
+                Err(_) => break,
             }
         }
+        if let Some(mut child) = self.take() {
+            let _ = child.kill();
+            let _ = child.wait();
+            wait_for_daemon_stopped(db, Duration::from_secs(5));
+        }
     }
+}
 
-    if let Some(mut child) = daemon.take() {
-        let _ = child.kill();
-        let _ = child.wait();
-        wait_for_daemon_stopped(db, Duration::from_secs(5));
-    }
+/// Send stop command and wait for the daemon process to exit.
+pub fn stop_daemon<D: StopDaemon>(db: &str, daemon: &mut D) {
+    daemon.stop_with_db(db);
 }
 
 // ---------------------------------------------------------------------------

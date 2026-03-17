@@ -17,7 +17,6 @@ use cli_harness::*;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use topo::crypto::event_id_from_base64;
 use topo::db::open_connection;
@@ -27,18 +26,7 @@ use topo::event_modules::workspace::commands::{
 use topo::event_modules::workspace::invite_link::{
     create_invite_link, parse_bootstrap_address, parse_invite_link, rewrite_bootstrap_addrs,
 };
-use topo::testutil::{DaemonGuard, Peer};
-
-fn cli_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    hold_network_test_lock_for_binary();
-    let guard = LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cleanup_test_daemons();
-    guard
-}
+use topo::testutil::Peer;
 
 fn create_user_invite_link_for_test_peer(creator: &Peer, bootstrap_addr: &str) -> String {
     let creator_db = open_connection(&creator.db_path).expect("open creator db");
@@ -146,7 +134,7 @@ struct StartedCliPeer {
     db: String,
     username: String,
     device_name: String,
-    _daemon: DaemonGuard,
+    _daemon: HarnessDaemon,
 }
 
 impl StartedCliPeer {
@@ -844,7 +832,6 @@ fn assert_cli_state_for_username(
 /// Both send messages in the shared workspace.
 #[test]
 fn test_cli_bidirectional_sync() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
@@ -889,7 +876,6 @@ fn test_cli_bidirectional_sync() {
 /// Verifies sync picks up new messages over time (ongoing sync).
 #[test]
 fn test_cli_ongoing_sync() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
@@ -934,23 +920,21 @@ fn test_cli_ongoing_sync() {
 
 #[test]
 fn test_cli_reconnects_after_bootstrap_supersession_using_observed_endpoint() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 30000;
-    let alice_port = random_port();
 
     create_workspace(&alice_db);
     let mut alice_daemon = start_daemon_with_options(
         &alice_db,
         &DaemonOptions {
-            bind_port: Some(alice_port),
             disable_discovery: true,
             ..Default::default()
         },
     );
-    let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
+    let alice_addr = daemon_listen_addr(&alice_db);
+    let invite_link = create_invite(&alice_db, &alice_addr);
 
     accept_invite(&bob_db, &invite_link);
     let mut bob_daemon = start_daemon_with_options(
@@ -998,23 +982,21 @@ fn test_cli_reconnects_after_bootstrap_supersession_using_observed_endpoint() {
 
 #[test]
 fn test_cli_lowmem_receiver_restart_catches_offline_delta_and_resumes_sync() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 30000;
-    let alice_port = random_port();
 
     create_workspace(&alice_db);
     let mut alice_daemon = start_daemon_with_options(
         &alice_db,
         &DaemonOptions {
-            bind_port: Some(alice_port),
             disable_discovery: true,
             ..Default::default()
         },
     );
-    let invite_link = create_invite(&alice_db, &format!("127.0.0.1:{}", alice_port));
+    let alice_addr = daemon_listen_addr(&alice_db);
+    let invite_link = create_invite(&alice_db, &alice_addr);
 
     accept_invite(&bob_db, &invite_link);
     let mut bob_daemon = start_daemon_with_options(
@@ -1072,7 +1054,6 @@ fn test_cli_lowmem_receiver_restart_catches_offline_delta_and_resumes_sync() {
 
 #[test]
 fn test_cli_send_and_messages() {
-    let _guard = cli_test_lock();
     // Basic test: create workspace, start daemon, send/messages work
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir.path().join("test.db").to_str().unwrap().to_string();
@@ -1094,7 +1075,6 @@ fn test_cli_send_and_messages() {
 
 #[test]
 fn test_cli_selected_partial_join_tenant_reports_initial_sync_errors() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
 
@@ -1192,7 +1172,6 @@ fn test_cli_selected_partial_join_tenant_reports_initial_sync_errors() {
 /// Bob has independent identity (not in Alice's workspace). Alice should reject Bob.
 #[test]
 fn test_cli_unpinned_peer_rejected() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
@@ -1229,7 +1208,6 @@ fn test_cli_unpinned_peer_rejected() {
 /// Bob receives all slices and saves it to disk.
 #[test]
 fn test_cli_file_upload_sync_and_save() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
@@ -1306,7 +1284,6 @@ fn test_cli_file_upload_sync_and_save() {
 /// Daemon start on an empty DB should keep control plane up in IdleNoTenants state.
 #[test]
 fn test_cli_start_without_trust_starts_idle_runtime() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -1348,7 +1325,6 @@ fn test_cli_start_without_trust_starts_idle_runtime() {
 /// identity chain to completion.
 #[test]
 fn test_cli_sync_bootstrap_from_accepted_invite_data() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir
         .path()
@@ -1420,7 +1396,6 @@ fn test_cli_sync_bootstrap_from_accepted_invite_data() {
 /// state for everyone.
 #[test]
 fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 90000;
     let workspace_name = "reuse-user-induction";
@@ -1531,7 +1506,6 @@ fn test_cli_multi_use_user_invite_reuse_induction_n_to_n_plus_one() {
 /// The old invite keeps working as the workspace grows and new invites are issued.
 #[test]
 fn test_cli_multi_use_user_invites_mix_reuse_and_new_creation() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 90000;
     let workspace_name = "mixed-user-invites";
@@ -1611,7 +1585,6 @@ fn test_cli_multi_use_user_invites_mix_reuse_and_new_creation() {
 /// later for another device.
 #[test]
 fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 90000;
     let workspace_name = "device-link-induction";
@@ -1696,7 +1669,6 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
 /// should still converge to the correct CLI-visible state.
 #[test]
 fn test_cli_invite_with_dead_first_and_live_second_address() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 30000;
     let workspace_name = "dead-first-live-second";
@@ -1762,7 +1734,6 @@ fn test_cli_invite_with_dead_first_and_live_second_address() {
 /// 3. then a reused old invite adds one more tenant to the first workspace.
 #[test]
 fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 45000;
 
@@ -1930,7 +1901,6 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
 /// newly joined workspace so immediate sends land in the correct workspace.
 #[test]
 fn test_cli_live_daemon_accept_second_workspace_switches_active_tenant() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 60000;
 
@@ -2058,7 +2028,6 @@ fn test_cli_live_daemon_accept_second_workspace_switches_active_tenant() {
 /// follow-up sends do not stay pinned to the original tenant.
 #[test]
 fn test_cli_live_daemon_create_second_workspace_switches_active_tenant() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 60000;
 
@@ -2169,7 +2138,6 @@ fn test_cli_live_daemon_create_second_workspace_switches_active_tenant() {
 /// workspace without leaking into the first workspace's view.
 #[test]
 fn test_cli_live_daemon_second_workspace_invite_syncs_bidirectionally() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 60000;
 
@@ -2266,7 +2234,6 @@ fn test_cli_live_daemon_second_workspace_invite_syncs_bidirectionally() {
 /// accepted tenant.
 #[test]
 fn test_cli_live_daemon_accept_second_workspace_can_switch_back_and_sync_original_tenant() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 60000;
 
@@ -2373,7 +2340,6 @@ fn test_cli_live_daemon_accept_second_workspace_can_switch_back_and_sync_origina
 /// selected workspace even after follow-up sync is active in both tenants.
 #[test]
 fn test_cli_live_daemon_create_second_workspace_can_switch_between_tenants_and_sync_both() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 60000;
 
@@ -2489,7 +2455,6 @@ fn test_cli_live_daemon_create_second_workspace_can_switch_between_tenants_and_s
 /// workspace, and the newly created workspace must remain isolated.
 #[test]
 fn test_cli_live_daemon_creating_third_workspace_preserves_existing_second_workspace_sync() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 60000;
 
@@ -2612,7 +2577,6 @@ fn test_cli_live_daemon_creating_third_workspace_preserves_existing_second_works
 /// trust path.
 #[test]
 fn test_cli_shared_db_same_workspace_accepts_distinct_explicit_invites() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 45000;
 
@@ -2822,7 +2786,6 @@ fn test_cli_shared_db_same_workspace_accepts_distinct_explicit_invites() {
 /// stays isolated in users, peers, views, and direct trust dials.
 #[test]
 fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 90000;
 
@@ -3074,7 +3037,6 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
 
 #[test]
 fn test_cli_completions_bash() {
-    let _guard = cli_test_lock();
     let output = Command::new(bin())
         .args(["completions", "bash"])
         .output()
@@ -3090,7 +3052,6 @@ fn test_cli_completions_bash() {
 
 #[test]
 fn test_cli_completions_zsh() {
-    let _guard = cli_test_lock();
     let output = Command::new(bin())
         .args(["completions", "zsh"])
         .output()
@@ -3102,7 +3063,6 @@ fn test_cli_completions_zsh() {
 
 #[test]
 fn test_cli_workspaces() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -3128,7 +3088,6 @@ fn test_cli_workspaces() {
 
 #[test]
 fn test_cli_react_by_message_number() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -3208,7 +3167,6 @@ fn test_cli_react_by_message_number() {
 
 #[test]
 fn test_cli_messages_include_reactions() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -3265,7 +3223,6 @@ fn test_cli_messages_include_reactions() {
 
 #[test]
 fn test_cli_sub_commands_accept_name_selector_and_nested_shape() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir.path().join("subs.db").to_str().unwrap().to_string();
 
@@ -3366,7 +3323,6 @@ fn test_cli_sub_commands_accept_name_selector_and_nested_shape() {
 
 #[test]
 fn test_cli_send_file_and_messages_display() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -3445,7 +3401,6 @@ fn test_cli_send_file_and_messages_display() {
 
 #[test]
 fn test_cli_send_file_accepts_path_from_stdin_when_flag_omitted() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -3490,7 +3445,6 @@ fn test_cli_send_file_accepts_path_from_stdin_when_flag_omitted() {
 
 #[test]
 fn test_cli_send_file_without_path_uses_placeholder_and_save_file_defaults_target() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -3588,7 +3542,6 @@ fn test_cli_send_file_without_path_uses_placeholder_and_save_file_defaults_targe
 
 #[test]
 fn test_cli_files_and_save_file_roundtrip_after_sync() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir
         .path()
@@ -3674,7 +3627,6 @@ fn test_cli_files_and_save_file_roundtrip_after_sync() {
 
 #[test]
 fn test_cli_generate_files_messages_display() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -3721,7 +3673,6 @@ fn test_cli_generate_files_messages_display() {
 
 #[test]
 fn test_cli_event_tree_shows_structure() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -3781,7 +3732,6 @@ fn test_cli_event_tree_shows_structure() {
 
 #[test]
 fn test_cli_event_list_shows_all_events() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -3832,7 +3782,6 @@ fn test_cli_event_list_shows_all_events() {
 
 #[test]
 fn test_cli_event_tree_empty_db() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir.path().join("empty.db").to_str().unwrap().to_string();
 
@@ -3858,7 +3807,6 @@ fn test_cli_event_tree_empty_db() {
 
 #[test]
 fn test_cli_event_list_empty_db() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -3889,7 +3837,6 @@ fn test_cli_event_list_empty_db() {
 
 #[test]
 fn test_cli_event_tree_cross_refs_shown() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -3922,7 +3869,6 @@ fn test_cli_event_tree_cross_refs_shown() {
 
 #[test]
 fn test_cli_event_commands_require_daemon() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -3970,7 +3916,6 @@ fn test_cli_event_commands_require_daemon() {
 /// clear error about the port being in use, not silently retry forever.
 #[test]
 fn test_cli_port_already_in_use_error() {
-    let _guard = cli_test_lock();
     let (_tmpdir_a, db_a) = temp_db();
     let (_tmpdir_b, db_b) = temp_db();
 
@@ -4008,7 +3953,6 @@ fn test_cli_port_already_in_use_error() {
 /// human-readable diagnostic (timeout or connection refused), not raw errors.
 #[test]
 fn test_cli_connect_to_dead_address_error() {
-    let _guard = cli_test_lock();
     let (_tmpdir_a, db_a) = temp_db();
     let (_tmpdir_b, db_b) = temp_db();
 
@@ -4104,7 +4048,6 @@ fn test_cli_connect_to_dead_address_error() {
 /// certificate mismatch, not dump raw TLS internals.
 #[test]
 fn test_cli_untrusted_peer_certificate_error() {
-    let _guard = cli_test_lock();
     let (_tmpdir_a, db_a) = temp_db();
     let (_tmpdir_b, db_b) = temp_db();
 
@@ -4333,7 +4276,6 @@ fn wait_for_sub_items(db: &str, name: &str, pattern: &str, min_count: usize, tim
 
 #[test]
 fn test_cli_sub_poll_json_output() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -4377,7 +4319,6 @@ fn test_cli_sub_poll_json_output() {
 
 #[test]
 fn test_cli_sub_ack_clears_pending() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -4436,7 +4377,6 @@ fn test_cli_sub_ack_clears_pending() {
 
 #[test]
 fn test_cli_sub_poll_returns_existing_backlog() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -4475,7 +4415,6 @@ fn test_cli_sub_poll_returns_existing_backlog() {
 
 #[test]
 fn test_cli_sub_multiple_delivery_modes() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir.path().join("modes.db").to_str().unwrap().to_string();
 
@@ -4530,7 +4469,6 @@ fn test_cli_sub_multiple_delivery_modes() {
 
 #[test]
 fn test_cli_sub_disable_enable() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir
         .path()
@@ -4582,7 +4520,6 @@ fn test_cli_sub_disable_enable() {
 
 #[test]
 fn test_cli_sub_multi_tenant_isolation() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir.path().join("mt.db").to_str().unwrap().to_string();
     let timeout = Duration::from_secs(10);

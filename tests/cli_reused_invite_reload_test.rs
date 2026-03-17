@@ -143,7 +143,7 @@ fn assert_event_visible_on_all(db_paths: &[&str], event_id: &str, timeout_ms: u6
 
 #[test]
 fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
-    cleanup_test_daemons();
+    hold_network_test_lock_for_binary();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 90000;
 

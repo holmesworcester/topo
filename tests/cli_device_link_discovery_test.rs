@@ -1,22 +1,9 @@
 mod cli_harness;
 
 use cli_harness::*;
-use std::sync::{Mutex, OnceLock};
 use topo::event_modules::workspace::invite_link::{
     parse_bootstrap_address, parse_invite_link, rewrite_bootstrap_addrs,
 };
-use topo::testutil::DaemonGuard;
-
-fn cli_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    hold_network_test_lock_for_binary();
-    let guard = LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cleanup_test_daemons();
-    guard
-}
 
 fn reserve_wrong_bootstrap_addr() -> (std::net::UdpSocket, String) {
     let socket = std::net::UdpSocket::bind("127.0.0.1:0").expect("bind reserved wrong udp port");
@@ -31,7 +18,7 @@ struct StartedCliPeer {
     db: String,
     username: String,
     device_name: String,
-    _daemon: DaemonGuard,
+    _daemon: HarnessDaemon,
 }
 
 impl StartedCliPeer {
@@ -120,7 +107,6 @@ fn assert_event_visible_on_all(db_paths: &[&str], event_id: &str, timeout_ms: u6
 #[test]
 #[cfg(feature = "discovery")]
 fn test_cli_device_link_mixed_topology_empty_and_explicit_only() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 180_000;
     let workspace_name = "device-link-mixed-topology";
@@ -187,7 +173,6 @@ fn test_cli_device_link_mixed_topology_empty_and_explicit_only() {
 #[test]
 #[cfg(feature = "discovery")]
 fn test_cli_device_link_discovery_with_wrong_bootstrap_address_only() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let timeout_ms = 180_000;
     let workspace_name = "device-link-wrong-bootstrap-only";

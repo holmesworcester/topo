@@ -9,17 +9,13 @@ use std::time::{Duration, Instant};
 use topo::event_modules::workspace::invite_link::{
     parse_bootstrap_address, parse_invite_link, rewrite_bootstrap_addrs,
 };
-use topo::testutil::DaemonGuard;
 
 pub fn cli_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     hold_network_test_lock_for_binary();
-    let guard = LOCK
-        .get_or_init(|| Mutex::new(()))
+    LOCK.get_or_init(|| Mutex::new(()))
         .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cleanup_test_daemons();
-    guard
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
 }
 
 pub fn reserve_wrong_bootstrap_addr() -> (std::net::UdpSocket, String) {
@@ -136,7 +132,7 @@ pub fn wait_for_bootstrap_supersession_and_endpoint_observation(
 
 pub struct StartedCliPeer {
     pub db: String,
-    pub daemon: DaemonGuard,
+    pub daemon: HarnessDaemon,
 }
 
 pub fn start_joined_cli_peer_via_discovery(

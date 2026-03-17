@@ -3,25 +3,12 @@ mod cli_harness;
 use cli_harness::*;
 use std::io::Write;
 use std::process::{Command, Stdio};
-use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, Instant};
 use topo::crypto::{event_id_from_hex, event_id_to_base64};
 use topo::db::open_connection;
 
-fn cli_test_lock() -> std::sync::MutexGuard<'static, ()> {
-    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-    hold_network_test_lock_for_binary();
-    let guard = LOCK
-        .get_or_init(|| Mutex::new(()))
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    cleanup_test_daemons();
-    guard
-}
-
 #[test]
 fn test_cli_live_message_during_large_file_sync() {
-    let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir
         .path()

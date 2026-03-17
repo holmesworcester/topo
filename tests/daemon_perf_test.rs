@@ -12,9 +12,8 @@ use std::time::{Duration, Instant};
 use cli_harness::{
     assert_eventually, create_invite_with_spki, daemon_listen_addr, daemon_transport_fingerprint,
     ensure_active_peer, generate_messages, message_count_sql, peak_rss_mib_for_pid, send_message,
-    start_daemon_with_options, topo_cmd, DaemonOptions,
+    start_daemon_with_options, topo_cmd, DaemonOptions, HarnessDaemon,
 };
-use topo::testutil::DaemonGuard;
 
 struct SharedWorkspaceBench {
     tmpdir: Option<tempfile::TempDir>,
@@ -22,9 +21,9 @@ struct SharedWorkspaceBench {
     keep_tmpdir: bool,
     alice_db: String,
     bob_db: String,
-    alice_daemon: DaemonGuard,
+    alice_daemon: HarnessDaemon,
     alice_pid: u32,
-    bob_daemon: DaemonGuard,
+    bob_daemon: HarnessDaemon,
     bob_pid: u32,
 }
 
@@ -139,7 +138,7 @@ fn perf_debug_env(name: &str) -> bool {
         .unwrap_or(false)
 }
 
-fn start_perf_daemon(db: &str, tmpdir: &std::path::Path, label: &str) -> DaemonGuard {
+fn start_perf_daemon(db: &str, tmpdir: &std::path::Path, label: &str) -> HarnessDaemon {
     if !perf_debug_env("PERF_DAEMON_LOGS") {
         return start_daemon_with_options(
             db,
