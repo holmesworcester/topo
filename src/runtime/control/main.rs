@@ -3274,6 +3274,8 @@ fn maybe_show_created_events(db: &str, data: &serde_json::Value) {
         return;
     }
 
+    println!();
+
     // Load display mode from infra DB (direct read, no RPC).
     let mode = match open_connection(db) {
         Ok(conn) => {
