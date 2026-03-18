@@ -48,7 +48,7 @@ pub fn drain_batch_size() -> usize {
         4
     } else {
         // Projection drain batch — larger batches amortize transaction overhead.
-        500
+        1000
     }
 }
 pub fn write_batch_cap() -> usize {
@@ -58,7 +58,7 @@ pub fn write_batch_cap() -> usize {
         // Max events per persist transaction. The writer takes whatever is
         // in the channel up to this cap, so under load batches grow
         // automatically while idle latency stays low.
-        2000
+        5000
     }
 }
 
@@ -97,7 +97,7 @@ pub fn session_ingest_cap() -> usize {
     if low_mem_mode() {
         8
     } else {
-        5000
+        10000
     }
 }
 
