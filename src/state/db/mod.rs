@@ -93,6 +93,7 @@ fn apply_pragmas(conn: &Connection) -> SqliteResult<()> {
             PRAGMA cache_size = -64000;
             PRAGMA busy_timeout = 5000;
             PRAGMA foreign_keys = OFF;
+            PRAGMA temp_store = MEMORY;
             ",
         )?;
     }

@@ -27,7 +27,7 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         );
 
         CREATE TABLE IF NOT EXISTS recorded_events (
-            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            id INTEGER PRIMARY KEY,
             peer_id TEXT NOT NULL,
             event_id TEXT NOT NULL,
             recorded_at INTEGER NOT NULL,
