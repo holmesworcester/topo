@@ -429,6 +429,16 @@ enum Commands {
         action: Option<UpnpCommand>,
     },
 
+    /// Manual sync controls: policy, round, request
+    #[command(
+        name = "sync",
+        after_help = "Examples:\n  topo sync policy show             # show current policy\n  topo sync policy set --requests manual\n  topo sync round --peer abc123     # trigger round for one peer\n  topo sync round --all             # trigger round for all peers\n  topo sync request --peer abc123   # trigger request refill for one peer\n  topo sync request --all           # trigger request refill for all peers"
+    )]
+    Sync {
+        #[command(subcommand)]
+        action: SyncAction,
+    },
+
     /// Reset all local state: stop daemon, delete DB and socket files
     Reset,
 }
@@ -474,6 +484,51 @@ enum UpnpCommand {
     Disable,
     /// Show the current UPnP mode and last mapping result.
     Status,
+}
+
+#[derive(Subcommand)]
+enum SyncAction {
+    /// Manage sync policy (show or set)
+    Policy {
+        #[command(subcommand)]
+        action: SyncPolicyAction,
+    },
+    /// Trigger a negentropy discovery round
+    Round {
+        /// Target peer prefix
+        #[arg(long)]
+        peer: Option<String>,
+        /// Target all connected peers
+        #[arg(long)]
+        all: bool,
+    },
+    /// Trigger a request refill
+    Request {
+        /// Target peer prefix
+        #[arg(long)]
+        peer: Option<String>,
+        /// Target all connected peers
+        #[arg(long)]
+        all: bool,
+    },
+}
+
+#[derive(Subcommand)]
+enum SyncPolicyAction {
+    /// Show the current sync policy
+    Show,
+    /// Set sync policy fields
+    Set {
+        /// Requests lane mode (auto, manual, disabled)
+        #[arg(long)]
+        requests: Option<String>,
+        /// Responses lane mode (auto, manual, disabled)
+        #[arg(long)]
+        responses: Option<String>,
+        /// Forward-on-have lane mode (auto, manual, disabled)
+        #[arg(long)]
+        forward_on_have: Option<String>,
+    },
 }
 
 #[derive(Subcommand)]
@@ -1781,6 +1836,7 @@ fn spawn_runtime(
         }
     });
 
+    let sync_control_for_task = state.sync_control.clone();
     let handle = tokio::spawn(async move {
         topo::node::run_node(
             &db_for_task,
@@ -1788,6 +1844,7 @@ fn spawn_runtime(
             net_tx,
             runtime_shutdown_for_task,
             cert_resolver_for_task,
+            Some(sync_control_for_task),
         )
         .await
     });
@@ -3220,6 +3277,81 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
+        Commands::Sync { action } => {
+            let sock_ref = socket_override.as_deref();
+            match action {
+                SyncAction::Policy {
+                    action: SyncPolicyAction::Show,
+                } => {
+                    let data = rpc_require_daemon(db, sock_ref, RpcMethod::SyncPolicyShow)?;
+                    println!("{}", serde_json::to_string_pretty(&data).unwrap());
+                }
+                SyncAction::Policy {
+                    action:
+                        SyncPolicyAction::Set {
+                            requests,
+                            responses,
+                            forward_on_have,
+                        },
+                } => {
+                    let data = rpc_require_daemon(
+                        db,
+                        sock_ref,
+                        RpcMethod::SyncPolicySet {
+                            requests,
+                            responses,
+                            forward_on_have,
+                        },
+                    )?;
+                    println!("{}", serde_json::to_string_pretty(&data).unwrap());
+                }
+                SyncAction::Round { peer, all } => {
+                    if let Some(peer) = peer {
+                        let data = rpc_require_daemon(
+                            db,
+                            sock_ref,
+                            RpcMethod::SyncRoundPeer { peer },
+                        )?;
+                        print_round_capture(&data);
+                    } else if all {
+                        let data =
+                            rpc_require_daemon(db, sock_ref, RpcMethod::SyncRoundAll)?;
+                        if let Some(arr) = data.as_array() {
+                            for item in arr {
+                                print_round_capture(item);
+                            }
+                        } else {
+                            print_round_capture(&data);
+                        }
+                    } else {
+                        return Err("specify --peer <prefix> or --all".into());
+                    }
+                }
+                SyncAction::Request { peer, all } => {
+                    if let Some(peer) = peer {
+                        let data = rpc_require_daemon(
+                            db,
+                            sock_ref,
+                            RpcMethod::SyncRequestPeer { peer },
+                        )?;
+                        print_request_result(&data);
+                    } else if all {
+                        let data =
+                            rpc_require_daemon(db, sock_ref, RpcMethod::SyncRequestAll)?;
+                        if let Some(arr) = data.as_array() {
+                            for item in arr {
+                                print_request_result(item);
+                            }
+                        } else {
+                            print_request_result(&data);
+                        }
+                    } else {
+                        return Err("specify --peer <prefix> or --all".into());
+                    }
+                }
+            }
+        }
+
         Commands::Reset => {
             let socket_path = socket_override
                 .as_ref()
@@ -4628,4 +4760,35 @@ fn show_view(data: &serde_json::Value) {
         }
     }
     println!();
+}
+
+fn print_round_capture(data: &serde_json::Value) {
+    if let Some(peer_id) = data.get("peer_id").and_then(|v| v.as_str()) {
+        println!("peer: {}", peer_id);
+    }
+    if let Some(ids) = data.get("observed_ids").and_then(|v| v.as_array()) {
+        println!("observed_ids: {}", ids.len());
+        for id in ids {
+            if let Some(s) = id.as_str() {
+                println!("  {}", s);
+            }
+        }
+    }
+}
+
+fn print_request_result(data: &serde_json::Value) {
+    if let Some(peer_id) = data.get("peer_id").and_then(|v| v.as_str()) {
+        println!("peer: {}", peer_id);
+    }
+    if let Some(reason) = data.get("reason").and_then(|v| v.as_str()) {
+        println!("reason: {}", reason);
+    }
+    if let Some(ids) = data.get("requested_ids").and_then(|v| v.as_array()) {
+        println!("requested_ids: {}", ids.len());
+        for id in ids {
+            if let Some(s) = id.as_str() {
+                println!("  {}", s);
+            }
+        }
+    }
 }

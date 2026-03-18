@@ -118,6 +118,7 @@ pub struct SyncConnectionHandler {
     request_state: Arc<ConnectionRequestState>,
     response_state: Arc<ConnectionResponseState>,
     shared_ingest: mpsc::Sender<IngestItem>,
+    sync_control: Option<Arc<crate::runtime::sync_control::SyncControlRegistry>>,
 }
 
 impl SyncConnectionHandler {
@@ -135,6 +136,7 @@ impl SyncConnectionHandler {
             request_state: Arc::new(ConnectionRequestState::default()),
             response_state: Arc::new(ConnectionResponseState::default()),
             shared_ingest,
+            sync_control: None,
         }
     }
 
@@ -152,7 +154,17 @@ impl SyncConnectionHandler {
             request_state: Arc::new(ConnectionRequestState::default()),
             response_state: Arc::new(ConnectionResponseState::default()),
             shared_ingest,
+            sync_control: None,
         }
+    }
+
+    /// Set the sync control registry for manual sync operations.
+    pub fn with_sync_control(
+        mut self,
+        sync_control: Option<Arc<crate::runtime::sync_control::SyncControlRegistry>>,
+    ) -> Self {
+        self.sync_control = sync_control;
+        self
     }
 }
 
@@ -211,6 +223,22 @@ impl SessionHandler for SyncConnectionHandler {
         let ingress_source_tag = format!("quic_recv:{}@{}", peer_id, meta.remote_addr);
         let session_owner = format!("{}:{}", role_name, meta.session_id);
 
+        // Register with sync control registry if available.
+        let sc_role = match self.direction {
+            SessionDirection::Outbound => crate::runtime::sync_control::SessionRole::Initiator,
+            SessionDirection::Inbound => crate::runtime::sync_control::SessionRole::Responder,
+        };
+        let registered = self.sync_control.as_ref().map(|sc| {
+            sc.register_session(&tenant_id, &peer_id, sc_role)
+        });
+        let (mut manual_cmd_rx, mut manual_pol_rx, _sc_guard) = match registered {
+            Some(rs) => {
+                let (crx, prx, guard) = rs.into_parts();
+                (Some(crx), Some(prx), Some(guard))
+            }
+            None => (None, None, None),
+        };
+
         let mut stats: Option<crate::runtime::SyncStats> = None;
         let result = match (self.direction, meta.direction) {
             (SessionDirection::Outbound, SessionDirection::Outbound) => {
@@ -235,6 +263,8 @@ impl SessionHandler for SyncConnectionHandler {
                     self.shared_ingest.clone(),
                     run_logger.as_ref().and_then(|l| l.capture()),
                     run_logger.as_ref().and_then(|l| l.rx_capture()),
+                    manual_cmd_rx.take(),
+                    manual_pol_rx.take(),
                 );
                 tokio::pin!(run);
                 let run_result: Result<crate::runtime::SyncStats, String> = tokio::select! {
@@ -273,6 +303,8 @@ impl SessionHandler for SyncConnectionHandler {
                     self.shared_ingest.clone(),
                     run_logger.as_ref().and_then(|l| l.capture()),
                     run_logger.as_ref().and_then(|l| l.rx_capture()),
+                    manual_cmd_rx.take(),
+                    manual_pol_rx.take(),
                 );
                 tokio::pin!(run);
                 let run_result: Result<crate::runtime::SyncStats, String> = tokio::select! {

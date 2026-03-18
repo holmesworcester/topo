@@ -82,6 +82,8 @@ pub async fn run_sync_initiator<C, S, R>(
     shared_ingest: mpsc::Sender<IngestItem>,
     capture: Option<SyncRunCapture>,
     rx_capture: Option<SyncRunRxCapture>,
+    mut command_rx: Option<tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>>,
+    policy_rx: Option<tokio::sync::watch::Receiver<crate::shared::sync_control::TenantSyncPolicy>>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
     C: StreamConn,
@@ -148,8 +150,45 @@ where
     let mut rounds_total = 0u64;
     let mut next_round_due = Instant::now();
     let mut observed_initial_control_progress = false;
+    let mut pending_round_reply: Option<
+        std::sync::mpsc::Sender<Result<crate::runtime::sync_control::ManualSyncRoundCapture, String>>,
+    > = None;
 
     'session: loop {
+        // Process manual commands from the sync control registry.
+        if let Some(ref mut rx) = command_rx {
+            while let Ok(cmd) = rx.try_recv() {
+                use crate::runtime::sync_control::SessionCommand;
+                match cmd {
+                    SessionCommand::ForceRound { reply } => {
+                        pending_round_reply = Some(reply);
+                        next_round_due = Instant::now();
+                    }
+                    SessionCommand::ForceRequest { reply } => {
+                        let (count, ids) = refill_wanted_requests(
+                            &mut control,
+                            &wanted,
+                            &timeline,
+                            coordination,
+                            peer_id,
+                            request_state,
+                        )
+                        .await?;
+                        if count > 0 {
+                            last_activity = Instant::now();
+                        }
+                        let id_hexes: Vec<String> =
+                            ids.iter().map(|id| hex::encode(id)).collect();
+                        let _ = reply.send(Ok(crate::runtime::sync_control::ManualSyncRequestResult {
+                            peer_id: peer_id.to_string(),
+                            requested_ids: id_hexes,
+                            reason: None,
+                        }));
+                    }
+                }
+            }
+        }
+
         // Data receiver runs in a separate task — check if it received data
         let current_bytes = bytes_received.load(Ordering::Relaxed);
         if current_bytes > last_bytes_received {
@@ -274,6 +313,18 @@ where
                                     &round_need_list_ids,
                                     completed_at,
                                 );
+
+                                // Reply to pending ForceRound command if one is waiting.
+                                if let Some(reply) = pending_round_reply.take() {
+                                    let newly_hex: Vec<String> = round_observed_ids
+                                        .iter()
+                                        .map(|eid| hex::encode(eid))
+                                        .collect();
+                                    let _ = reply.send(Ok(crate::runtime::sync_control::ManualSyncRoundCapture {
+                                        peer_id: peer_id.to_string(),
+                                        observed_ids: newly_hex,
+                                    }));
+                                }
                             }
                         }
                         let sent_need_hints = send_discovery_hints_from_have_ids(
@@ -411,17 +462,23 @@ where
                         observed_need_ids, peer_id
                     );
                 }
-                let requested_now = refill_wanted_requests(
-                    &mut control,
-                    &wanted,
-                    &timeline,
-                    coordination,
-                    peer_id,
-                    request_state,
-                )
-                .await?;
-                if requested_now > 0 {
-                    last_activity = Instant::now();
+                let auto_requests = policy_rx
+                    .as_ref()
+                    .map(|rx| rx.borrow().requests == crate::shared::sync_control::SyncPolicyMode::Auto)
+                    .unwrap_or(true);
+                if auto_requests {
+                    let (requested_now, _) = refill_wanted_requests(
+                        &mut control,
+                        &wanted,
+                        &timeline,
+                        coordination,
+                        peer_id,
+                        request_state,
+                    )
+                    .await?;
+                    if requested_now > 0 {
+                        last_activity = Instant::now();
+                    }
                 }
 
                 let send_stats = drain_pending_responses_to_data_stream(
@@ -636,17 +693,23 @@ where
             Err(_) => {}
         }
 
-        let requested_now = refill_wanted_requests(
-            &mut control,
-            &wanted,
-            &timeline,
-            coordination,
-            peer_id,
-            request_state,
-        )
-        .await?;
-        if requested_now > 0 {
-            last_activity = Instant::now();
+        let auto_requests = policy_rx
+            .as_ref()
+            .map(|rx| rx.borrow().requests == crate::shared::sync_control::SyncPolicyMode::Auto)
+            .unwrap_or(true);
+        if auto_requests {
+            let (requested_now, _) = refill_wanted_requests(
+                &mut control,
+                &wanted,
+                &timeline,
+                coordination,
+                peer_id,
+                request_state,
+            )
+            .await?;
+            if requested_now > 0 {
+                last_activity = Instant::now();
+            }
         }
 
         let send_stats = drain_pending_responses_to_data_stream(

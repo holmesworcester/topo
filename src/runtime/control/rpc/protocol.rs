@@ -181,6 +181,30 @@ pub enum RpcMethod {
         prefix: String,
         depth: usize,
     },
+    /// Show the current sync policy for the active tenant.
+    SyncPolicyShow,
+    /// Set sync policy fields for the active tenant.
+    SyncPolicySet {
+        #[serde(default)]
+        requests: Option<String>,
+        #[serde(default)]
+        responses: Option<String>,
+        #[serde(default)]
+        forward_on_have: Option<String>,
+    },
+    /// Trigger a negentropy round for a specific peer.
+    SyncRoundPeer {
+        peer: String,
+    },
+    /// Trigger a negentropy round for all connected peers.
+    SyncRoundAll,
+    /// Trigger a request refill for a specific peer.
+    SyncRequestPeer {
+        peer: String,
+    },
+    /// Trigger a request refill for all connected peers.
+    SyncRequestAll,
+
     /// Run intro: connect peer_a and peer_b via this node.
     Intro {
         peer_a: String,
