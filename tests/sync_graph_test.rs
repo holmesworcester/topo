@@ -17,6 +17,8 @@
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
 use topo::crypto::{event_id_from_base64, event_id_to_base64};
+use rusqlite::OptionalExtension;
+use topo::db::open_connection;
 use topo::testutil::{
     assert_eventually, clone_events_to, converge_workspace_transport_graph, start_chain,
     start_sink_download, start_sink_download_with_shutdown, Peer,
@@ -106,6 +108,53 @@ fn print_chain_message_counts(peers: &[Peer]) {
     }
 }
 
+/// Collect per-event delivery latencies (ms) from origin to sink.
+///
+/// For each shared message event created by the origin peer, computes
+/// `received_at_ms(sink) - created_at(origin)`.  Returns a sorted vec.
+fn collect_per_event_delivery_latencies(origin: &Peer, sink: &Peer) -> Vec<i64> {
+    let origin_conn = open_connection(&origin.db_path).expect("open origin db");
+    let sink_conn = open_connection(&sink.db_path).expect("open sink db");
+
+    // Get shared event IDs with created_at from the origin, filtering to events
+    // that were locally created (not received from sync).
+    let mut stmt = origin_conn
+        .prepare(
+            "SELECT e.event_id, e.created_at
+             FROM events e
+             JOIN recorded_events re ON re.event_id = e.event_id
+             WHERE re.peer_id = ?1
+               AND re.source = 'local_create'
+               AND e.share_scope = 'shared'",
+        )
+        .expect("prepare origin query");
+    let rows: Vec<(String, i64)> = stmt
+        .query_map(rusqlite::params![&origin.identity], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .expect("query origin events")
+        .filter_map(|r| r.ok())
+        .collect();
+
+    let mut latencies = Vec::with_capacity(rows.len());
+    for (event_id_b64, created_at_ms) in &rows {
+        let received_at_ms: Option<i64> = sink_conn
+            .query_row(
+                "SELECT received_at_ms FROM recorded_events
+                 WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![&sink.identity, event_id_b64],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("query sink received_at");
+        if let Some(received) = received_at_ms {
+            latencies.push(received - created_at_ms);
+        }
+    }
+    latencies.sort();
+    latencies
+}
+
 // ---------------------------------------------------------------------------
 // Family A: Chain propagation
 // ---------------------------------------------------------------------------
@@ -164,6 +213,12 @@ async fn run_chain_bench(n: usize, event_count: usize) {
 
     drop(handles);
 
+    // Per-event delivery latency: for each message event, measure
+    // (received_at_ms on tail peer) - (created_at on origin peer).
+    let tail_peer = &peers[n - 1];
+    let origin_peer = &peers[0];
+    let delivery_latencies_ms = collect_per_event_delivery_latencies(origin_peer, tail_peer);
+
     eprintln!();
     eprintln!("=== Chain: {} peers, {} events ===", n, event_count);
     eprintln!("  Tail converge:    {} ms", tail_wall_ms);
@@ -176,6 +231,20 @@ async fn run_chain_bench(n: usize, event_count: usize) {
         hop_delays.len()
     );
     eprintln!("  Hop latency P95:  {:.1} ms", hop_p95);
+    if !delivery_latencies_ms.is_empty() {
+        let avg = delivery_latencies_ms.iter().sum::<i64>() as f64
+            / delivery_latencies_ms.len() as f64;
+        let best = delivery_latencies_ms[0];
+        let worst = delivery_latencies_ms[delivery_latencies_ms.len() - 1];
+        let p50 = delivery_latencies_ms
+            [((delivery_latencies_ms.len() as f64 * 0.50) as usize).min(delivery_latencies_ms.len() - 1)];
+        let p95 = delivery_latencies_ms
+            [((delivery_latencies_ms.len() as f64 * 0.95) as usize).min(delivery_latencies_ms.len() - 1)];
+        eprintln!(
+            "  Delivery P0->P{}: best={} avg={:.0} p50={} p95={} worst={} ms ({} events)",
+            n - 1, best, avg, p50, p95, worst, delivery_latencies_ms.len()
+        );
+    }
     eprintln!(
         "  Peak RSS:         {:.1} MiB (before: {:.1})",
         rss_after, rss_before
