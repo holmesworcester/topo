@@ -371,6 +371,10 @@ class PerfRunner:
 
         if self.mode == "network":
             self.run_daemon_realistic_network_perf_test(
+                "Realistic Network Sync (perf_sync_2k_realistic_profiles)",
+                "perf_sync_2k_realistic_profiles",
+            )
+            self.run_daemon_realistic_network_perf_test(
                 "Realistic Network Sync (perf_sync_10k_realistic_profiles)",
                 "perf_sync_10k_realistic_profiles",
             )
