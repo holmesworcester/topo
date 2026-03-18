@@ -67,14 +67,15 @@ fn read_u64_env(name: &str) -> Option<u64> {
 
 /// Gap between initiator-driven discovery rounds on an established connection.
 ///
-/// Default 5000 ms (5 s).  With forward-on-have handling the low-latency path
-/// for freshly created events, negentropy rounds only need to run often enough
-/// for repair and initial catchup.  At 1M events a single round can take 2-4 s
-/// (SQLite snapshot + multiple RTTs), so 5 s avoids back-to-back reconciliation
-/// during bulk transfer while keeping repair responsive.  The first round always
-/// fires immediately on connection regardless of this gap.
+/// Default 100 ms.  Rounds run serially — if a round takes longer than the gap,
+/// the next one starts immediately after the previous completes.  At large scale
+/// (1M+ events) a single round can take seconds (SQLite snapshot + multiple
+/// RTTs), so the effective cadence self-limits under load without configuration.
+/// With forward-on-have handling the low-latency path for freshly created events,
+/// most rounds discover nothing and complete in single-digit ms.  The first round
+/// always fires immediately on connection regardless of this gap.
 pub(super) fn discovery_round_gap() -> Duration {
-    Duration::from_millis(read_u64_env("TOPO_DISCOVERY_ROUND_GAP_MS").unwrap_or(5000))
+    Duration::from_millis(read_u64_env("TOPO_DISCOVERY_ROUND_GAP_MS").unwrap_or(100))
 }
 
 pub(super) fn forward_on_have_enabled() -> bool {
