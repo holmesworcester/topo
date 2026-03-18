@@ -110,6 +110,9 @@ impl HarnessDaemon {
         }
         wait_for_daemon_stopped(&db, Duration::from_secs(5));
         self.clear();
+        // Don't clear the log registry here — stop() is a mid-test operation
+        // and downstream code may still call daemon_debug_context() if a
+        // post-stop assertion panics. The registry entry is cleared in Drop.
     }
 }
 
@@ -151,65 +154,6 @@ impl Drop for HarnessDaemon {
 const DAEMON_START_MAX_ATTEMPTS: usize = 20;
 const DAEMON_START_RETRY_BASE_MS: u64 = 200;
 
-pub fn cleanup_test_daemons() {
-    hold_network_test_binary_lock();
-    let repo_prefixes = repo_test_binary_prefixes();
-    let self_pid = std::process::id();
-    let children_path = format!("/proc/{self_pid}/task/{self_pid}/children");
-    let direct_children: std::collections::HashSet<i32> = std::fs::read_to_string(children_path)
-        .ok()
-        .map(|children| {
-            children
-                .split_whitespace()
-                .filter_map(|pid| pid.parse::<i32>().ok())
-                .collect()
-        })
-        .unwrap_or_default();
-    let mut candidate_pids = direct_children.clone();
-    let proc_entries = match std::fs::read_dir("/proc") {
-        Ok(entries) => entries,
-        Err(_) => return,
-    };
-    for entry in proc_entries.flatten() {
-        let Ok(pid) = entry.file_name().to_string_lossy().parse::<i32>() else {
-            continue;
-        };
-        if pid <= 0 || pid == self_pid as i32 {
-            continue;
-        }
-        let cmdline_path = format!("/proc/{pid}/cmdline");
-        let Ok(cmdline) = std::fs::read(&cmdline_path) else {
-            continue;
-        };
-        let cmdline = String::from_utf8_lossy(&cmdline).replace('\0', " ");
-        let is_repo_daemon = repo_prefixes
-            .iter()
-            .any(|prefix| cmdline.starts_with(prefix))
-            && cmdline.contains(" start ")
-            && cmdline.contains(" --db ");
-        if is_repo_daemon {
-            candidate_pids.insert(pid);
-        }
-    }
-    let mut candidate_pids: Vec<i32> = candidate_pids.into_iter().collect();
-    candidate_pids.sort_unstable();
-    for pid in candidate_pids {
-        unsafe {
-            libc::kill(pid, libc::SIGKILL);
-        }
-        if direct_children.contains(&pid) {
-            unsafe {
-                let _ = libc::waitpid(pid, std::ptr::null_mut(), 0);
-            }
-            continue;
-        }
-        let proc_pid = format!("/proc/{pid}");
-        let start = Instant::now();
-        while start.elapsed() < Duration::from_secs(2) && std::path::Path::new(&proc_pid).exists() {
-            std::thread::sleep(Duration::from_millis(20));
-        }
-    }
-}
 
 // ---------------------------------------------------------------------------
 // Core utilities
@@ -240,41 +184,6 @@ fn git_common_dir() -> String {
                 );
             }
             String::from_utf8_lossy(&out.stdout).trim().to_string()
-        })
-        .clone()
-}
-
-fn repo_test_binary_prefixes() -> Vec<String> {
-    static PREFIXES: OnceLock<Vec<String>> = OnceLock::new();
-    PREFIXES
-        .get_or_init(|| {
-            let mut prefixes = vec![format!("{} ", bin())];
-            let out = Command::new("git")
-                .args([
-                    "-C",
-                    env!("CARGO_MANIFEST_DIR"),
-                    "worktree",
-                    "list",
-                    "--porcelain",
-                ])
-                .output()
-                .expect("run git worktree list --porcelain");
-            if !out.status.success() {
-                panic!(
-                    "git worktree list --porcelain failed: {}",
-                    String::from_utf8_lossy(&out.stderr)
-                );
-            }
-            for line in String::from_utf8_lossy(&out.stdout).lines() {
-                let Some(path) = line.strip_prefix("worktree ") else {
-                    continue;
-                };
-                prefixes.push(format!("{path}/target/debug/topo "));
-                prefixes.push(format!("{path}/target/release/topo "));
-            }
-            prefixes.sort();
-            prefixes.dedup();
-            prefixes
         })
         .clone()
 }
