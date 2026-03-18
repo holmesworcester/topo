@@ -3571,6 +3571,16 @@ fn test_cli_files_and_save_file_roundtrip_after_sync() {
     accept_invite(&bob_db, &invite_link);
     let _bob = start_daemon(&bob_db);
 
+    // Readiness gate: confirm daemons are connected and syncing before
+    // sending the file. Without this, the file-transfer timeout burns
+    // time waiting for the QUIC handshake under CPU pressure.
+    let gate_eid = send_message(&alice_db, "pre-file-gate");
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", gate_eid),
+        timeout_ms,
+    );
+
     let send_out = Command::new(bin())
         .args([
             "--db",
