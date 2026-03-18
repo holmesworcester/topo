@@ -16,22 +16,6 @@ use crate::crypto::EventId;
 use crate::db::wanted::{WantedCandidate, WantedEvents};
 use crate::tuning::request_inflight_ttl_ms;
 
-/// Conservative per-event credit cost when encoded_size_bytes is 0 (metadata
-/// not yet received via DiscoveryHints). Ensures placeholder-metadata events
-/// still consume credit and cannot generate unbounded RequestIds without fresh
-/// ResponseCredit grants.
-const UNKNOWN_EVENT_CREDIT_FLOOR_BYTES: usize = 256;
-
-/// Effective credit cost for a candidate. Uses a floor for zero-metadata events
-/// so the byte-credit window is respected even before real sizes arrive.
-pub(super) fn credit_cost(encoded_size_bytes: u32) -> usize {
-    if encoded_size_bytes == 0 {
-        UNKNOWN_EVENT_CREDIT_FLOOR_BYTES
-    } else {
-        encoded_size_bytes as usize
-    }
-}
-
 #[derive(Default)]
 struct CoordinatorState {
     peers: HashMap<usize, PeerRequestState>,
@@ -101,7 +85,7 @@ impl PeerCoord {
         if let Some(peer_state) = state.peers.get_mut(&self.peer_idx) {
             let selected_bytes: usize = selected
                 .iter()
-                .map(|candidate| credit_cost(candidate.encoded_size_bytes))
+                .map(|candidate| candidate.credit_cost())
                 .sum();
             peer_state.available_credit_bytes = peer_state
                 .available_credit_bytes
@@ -243,7 +227,7 @@ fn plan_requests_across_peers(
     ) {
         assignments.entry(peer_idx).or_default().push(event_id);
         if let Some(credit_bytes) = credits_bytes.get_mut(&peer_idx) {
-            *credit_bytes = credit_bytes.saturating_sub(credit_cost(event_id.encoded_size_bytes));
+            *credit_bytes = credit_bytes.saturating_sub(event_id.credit_cost());
         }
         if let Some(seen) = peer_seen.get_mut(&peer_idx) {
             seen.insert(event_id.event_id);
@@ -265,7 +249,7 @@ fn plan_requests_across_peers(
     ) {
         assignments.entry(peer_idx).or_default().push(event_id);
         if let Some(credit_bytes) = credits_bytes.get_mut(&peer_idx) {
-            *credit_bytes = credit_bytes.saturating_sub(credit_cost(event_id.encoded_size_bytes));
+            *credit_bytes = credit_bytes.saturating_sub(event_id.credit_cost());
         }
         if let Some(seen) = peer_seen.get_mut(&peer_idx) {
             seen.insert(event_id.event_id);
@@ -296,7 +280,7 @@ fn next_assignment(
         let start = cursors.get(&report.peer_idx).copied().unwrap_or(0);
         let mut idx = start;
         while let Some(candidate) = report.candidates.get(idx) {
-            if credit_cost(candidate.encoded_size_bytes) > remaining_credit_bytes {
+            if candidate.credit_cost() > remaining_credit_bytes {
                 idx += 1;
                 continue;
             }
@@ -504,7 +488,7 @@ mod tests {
         // so all candidates would be selected and credit would remain unchanged.
         let reports = vec![PeerRequestReport {
             peer_idx: 0,
-            available_credit_bytes: UNKNOWN_EVENT_CREDIT_FLOOR_BYTES,
+            available_credit_bytes: crate::db::wanted::UNKNOWN_EVENT_CREDIT_FLOOR_BYTES,
             inflight_requested: HashMap::new(),
             candidates: vec![candidate(1, 1, 100, 0), candidate(2, 1, 90, 0)],
         }];

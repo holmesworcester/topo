@@ -17,6 +17,11 @@ pub struct WantedEvents<'a> {
     conn: &'a Connection,
 }
 
+/// Conservative floor for events whose size is not yet known (e.g. negentropy
+/// diff IDs before the responder's DiscoveryHints arrive). Ensures credit
+/// accounting is never zero for a real event.
+pub const UNKNOWN_EVENT_CREDIT_FLOOR_BYTES: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WantedCandidate {
     pub event_id: EventId,
@@ -25,6 +30,18 @@ pub struct WantedCandidate {
     pub priority_lane: i64,
     pub priority_ts: i64,
     pub first_seen_at: i64,
+}
+
+impl WantedCandidate {
+    /// Effective byte cost for credit accounting. Returns the real size when
+    /// known, or a conservative floor when metadata has not yet arrived.
+    pub fn credit_cost(&self) -> usize {
+        if self.encoded_size_bytes == 0 {
+            UNKNOWN_EVENT_CREDIT_FLOOR_BYTES
+        } else {
+            self.encoded_size_bytes as usize
+        }
+    }
 }
 
 pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {

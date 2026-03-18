@@ -1240,6 +1240,33 @@ Negentropy does discovery only:
 2. this discovery is written into SQL-backed wanted state rather than being
    balanced inline inside the negentropy round.
 
+### Bidirectional DiscoveryHints and real byte credits
+
+Both sides of a sync connection send `DiscoveryHints` so the other side has
+real `encoded_size_bytes` for byte-credit accounting:
+
+- **Initiator → Responder**: the initiator sends `DiscoveryHints` for its
+  `have_ids` (events it has that the responder appears to lack) during each
+  negentropy round via `send_discovery_hints_from_have_ids`.
+- **Responder → Initiator**: the responder uses a patched negentropy
+  (`reconcile_with_diff`) that exposes the diff IDs the upstream crate
+  normally discards on the server side. The responder sends `DiscoveryHints`
+  for its `have_ids` (events it has that the initiator lacks) **before** the
+  final `NegMsg`, so the initiator has real sizes when its scheduling loop
+  runs.
+
+Without responder-side hints the initiator would only have negentropy diff
+IDs with no metadata (`encoded_size_bytes=0`). A conservative 256-byte
+credit floor (`WantedCandidate::credit_cost`) covers the transient window
+as a safety net, but real byte credits from DiscoveryHints are the intended
+normal path.
+
+The negentropy crate is vendored at `vendor/negentropy` with a small patch:
+`reconcile_with_diff()` is a new public method that calls the same internal
+`reconcile_aux` as `reconcile()` but populates `have_ids`/`need_ids` vecs
+instead of discarding them. The `is_initiator` guards on diff-ID collection
+inside `reconcile_aux` are removed so both caller paths collect IDs.
+
 The sink-side sender/request loop does balancing:
 1. `wanted(event_id, ...)` records that the sink still needs an event,
 2. `wanted_sources(event_id, peer_id, first_seen_at, last_seen_at, priority_lane, priority_ts)` records which peers appear to have it,

@@ -112,12 +112,22 @@ where
 
     let db_path_for_neg = db_path.to_string();
     let ws_id_for_neg = ws_id.clone();
+
+    /// Result from the negentropy worker thread: the NegMsg response bytes
+    /// plus diff IDs the responder has that the initiator lacks.
+    struct NegWorkerResult {
+        response: Vec<u8>,
+        /// IDs we have that the remote appears to lack — used to send
+        /// DiscoveryHints so the initiator has real byte sizes for credit.
+        responder_have_ids: Vec<negentropy::Id>,
+    }
+
     let mut neg_req_tx: Option<std::sync::mpsc::Sender<Vec<u8>>> = None;
-    let mut neg_resp_rx: Option<std::sync::mpsc::Receiver<Result<Vec<u8>, String>>> = None;
+    let mut neg_resp_rx: Option<std::sync::mpsc::Receiver<Result<NegWorkerResult, String>>> = None;
     let mut neg_worker: Option<std::thread::JoinHandle<()>> = None;
     let spawn_neg_worker = |window: SyncWindow| {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        let (resp_tx, resp_rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel::<Result<NegWorkerResult, String>>();
         let db_path = db_path_for_neg.clone();
         let ws_id = ws_id_for_neg.clone();
         let handle = std::thread::spawn(move || {
@@ -145,7 +155,15 @@ where
                 .expect("neg worker: Negentropy::new");
 
             while let Ok(msg) = req_rx.recv() {
-                let result = neg.reconcile(&msg).map_err(|e| format!("{}", e));
+                let mut have_ids = Vec::new();
+                let mut need_ids = Vec::new();
+                let result = neg
+                    .reconcile_with_diff(&msg, &mut have_ids, &mut need_ids)
+                    .map(|response| NegWorkerResult {
+                        response,
+                        responder_have_ids: have_ids,
+                    })
+                    .map_err(|e| format!("{}", e));
                 if resp_tx.send(result).is_err() {
                     break;
                 }
@@ -243,17 +261,52 @@ where
                 .expect("neg responder worker missing")
                 .try_recv()
             {
-                Ok(Ok(response)) => {
+                Ok(Ok(result)) => {
                     reconciling = false;
                     last_activity = Instant::now();
-                    if response.is_empty() {
+
+                    // Send DiscoveryHints for diff IDs BEFORE the NegMsg so the
+                    // initiator has real byte sizes when it starts scheduling
+                    // requests from the need_ids this round will produce.
+                    if !result.responder_have_ids.is_empty() {
+                        let batch_size = super::need_chunk().max(1);
+                        let mut hints = Vec::with_capacity(batch_size);
+                        for neg_id in &result.responder_have_ids {
+                            let event_id = crate::protocol::neg_id_to_event_id(neg_id);
+                            if let Ok(Some(summary)) = store.get_shared_summary(&event_id) {
+                                hints.push(crate::protocol::DiscoveryHint {
+                                    event_id: summary.event_id,
+                                    semantic_type_code: summary.semantic_type_code,
+                                    encoded_size_bytes: summary.encoded_size_bytes,
+                                });
+                                if hints.len() >= batch_size {
+                                    control
+                                        .send(&Frame::DiscoveryHints {
+                                            hints: std::mem::take(&mut hints),
+                                        })
+                                        .await?;
+                                }
+                            }
+                        }
+                        if !hints.is_empty() {
+                            control.send(&Frame::DiscoveryHints { hints }).await?;
+                        }
+                        control.flush().await?;
+                        info!(
+                            "Sent {} discovery hints for responder diff to peer {}",
+                            result.responder_have_ids.len(),
+                            peer_id
+                        );
+                    }
+
+                    if result.response.is_empty() {
                         info!(
                             "Reconciliation locally quiescent: {} rounds, {}ms",
                             rounds,
                             reconcile_start.elapsed().as_millis()
                         );
                     } else {
-                        control.send(&Frame::NegMsg { msg: response }).await?;
+                        control.send(&Frame::NegMsg { msg: result.response }).await?;
                         control.flush().await?;
                     }
                 }

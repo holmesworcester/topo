@@ -152,7 +152,7 @@ where
     let _ = timeline.mark_request_selected_many(&selected_ids, now_ms);
     let reserved_bytes: usize = selected
         .iter()
-        .map(|candidate| crate::runtime::sync_engine::session::coordinator::credit_cost(candidate.encoded_size_bytes))
+        .map(|candidate| candidate.credit_cost())
         .sum();
 
     let batch_size = need_chunk().max(1);
