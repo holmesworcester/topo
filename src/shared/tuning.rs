@@ -47,14 +47,18 @@ pub fn drain_batch_size() -> usize {
     if low_mem_mode() {
         4
     } else {
-        100
+        // Projection drain batch — larger batches amortize transaction overhead.
+        500
     }
 }
 pub fn write_batch_cap() -> usize {
     if low_mem_mode() {
         8
     } else {
-        1000
+        // Max events per persist transaction. The writer takes whatever is
+        // in the channel up to this cap, so under load batches grow
+        // automatically while idle latency stays low.
+        2000
     }
 }
 

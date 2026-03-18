@@ -212,6 +212,13 @@ pub fn batch_writer(
     let mut cumulative_events: u64 = 0;
     let mut profile_epoch = Instant::now();
 
+    // Disable WAL autocheckpoint on the writer — we checkpoint manually
+    // after each batch to avoid checkpoint stalls mid-transaction.
+    let deferred_wal = !low_mem_mode();
+    if deferred_wal {
+        let _ = db.execute_batch("PRAGMA wal_autocheckpoint = 0");
+    }
+
     loop {
         let first = match rx.blocking_recv() {
             Some(item) => item,
@@ -290,6 +297,13 @@ pub fn batch_writer(
         let persisted_count = persist_output.persisted_event_ids.len() as u64;
         cumulative_events += persisted_count;
         events_received.fetch_add(persisted_count, Ordering::Relaxed);
+
+        // Non-blocking PASSIVE checkpoint on a cadence — merges WAL pages
+        // into the main DB without blocking readers. Every 10k events keeps
+        // the WAL bounded without checkpointing on every batch.
+        if deferred_wal && cumulative_events % 10_000 < persisted_count {
+            let _ = db.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
+        }
 
         // Profile logging: emit every 10k events to avoid log noise
         if cumulative_events / 10_000 != (cumulative_events - persisted_count) / 10_000 {
