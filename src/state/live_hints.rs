@@ -80,6 +80,9 @@ pub fn subscribe(db_path: &str, tenant_id: &str) -> broadcast::Receiver<LiveHint
 }
 
 pub fn publish_many(db_path: &str, events: &[LiveHintEvent]) {
+    if !forward_on_have_enabled() || events.is_empty() {
+        return;
+    }
     for event in events {
         let _ = sender_for(db_path, &event.tenant_id).send(LiveHint {
             event_id: event.event_id,
@@ -89,6 +92,9 @@ pub fn publish_many(db_path: &str, events: &[LiveHintEvent]) {
 }
 
 pub fn publish_from_connection(conn: &Connection, events: &[LiveHintEvent]) {
+    if !forward_on_have_enabled() || events.is_empty() {
+        return;
+    }
     let Some(db_path) = database_path_key(conn).ok().flatten() else {
         return;
     };

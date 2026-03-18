@@ -142,11 +142,18 @@ fn perf_debug_env(name: &str) -> bool {
 }
 
 fn start_perf_daemon(db: &str, tmpdir: &std::path::Path, label: &str) -> HarnessDaemon {
+    // Use a fast negentropy round gap for bulk throughput tests.
+    // The production default (5 s) is tuned for live delivery with forward-on-have;
+    // bulk preload/generate tests need frequent rounds to sustain throughput.
+    let perf_env = vec![
+        ("TOPO_DISCOVERY_ROUND_GAP_MS".to_string(), "100".to_string()),
+    ];
     if !perf_debug_env("PERF_DAEMON_LOGS") {
         return start_daemon_with_options(
             db,
             &DaemonOptions {
                 disable_discovery: true,
+                extra_env: perf_env,
                 ..Default::default()
             },
         );
@@ -157,6 +164,7 @@ fn start_perf_daemon(db: &str, tmpdir: &std::path::Path, label: &str) -> Harness
             stdout_file: Some(tmpdir.join(format!("{label}.daemon.stdout.log"))),
             stderr_file: Some(tmpdir.join(format!("{label}.daemon.stderr.log"))),
             disable_discovery: true,
+            extra_env: perf_env,
             ..Default::default()
         },
     )

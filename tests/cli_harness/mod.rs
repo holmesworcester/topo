@@ -521,6 +521,10 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> HarnessDaemo
             }
         }
 
+        // Enable forward-on-have by default — this is the production configuration.
+        // Tests that need negentropy-only behavior can override via extra_env.
+        cmd.env("TOPO_FORWARD_ON_HAVE", "1");
+
         if opts.disable_placeholder_autodial {
             cmd.env("TOPO_DISABLE_PLACEHOLDER_AUTODIAL", "1");
         }
