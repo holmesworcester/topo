@@ -52,6 +52,46 @@ setup. The only way forward is **fewer writes per event**.
 
 ---
 
+## Known Bugs That Affect Perceived Latency
+
+### Send-idle stall (1s+ pauses with queued work)
+
+Documented in `docs/planning/PERF_HYPOTHESES_2026-03-12.md`. Overlapping
+live sessions cause 1.0-1.1s `SendIdle` gaps where the sync handler has
+events queued for transfer but isn't sending them. This alone can blow
+the entire <1s latency budget even if throughput is high. Must be
+investigated and fixed — no amount of throughput optimization helps if
+the protocol stalls for a full second between bursts.
+
+---
+
+## Corrections From Code Review
+
+These were identified by tracing the actual code paths:
+
+- **`priority_ts` is set to discovery time (now), not event `created_at`**
+  (`wanted.rs:195`). Newest-first download doesn't actually work yet.
+  The wire `DiscoveryHint` doesn't carry `created_at_ms` (`protocol.rs:25`),
+  so the scheduler has no way to sort by event age.
+
+- **Messages DO have dependents.** Reactions and files depend on messages
+  (`event_modules/mod.rs:177`). Cascade skip should only apply to true
+  leaf types (reactions, file_slices), not messages.
+
+- **Hot ingest bypasses project_queue** (on the tuning branch) and calls
+  `project_batch()` directly after commit. Projection priority (Idea 3)
+  needs to be implemented in that direct path, not just in project_queue.
+
+- **Blob re-read on hot ingest.** `run_persist_phase()` already has blob
+  bytes in memory, but `project_batch()` re-reads them from the events
+  table. Carrying blobs through `PersistPhaseOutput` avoids this re-read.
+
+- **Incremental neg_items rebuild is not multi-workspace safe.** The
+  current helper stamps every event with one `workspace_id`, which
+  breaks on a shared DB hosting multiple workspaces.
+
+---
+
 ## Ideas for <1s Perceived Latency
 
 ### Idea 1: Memory-first processing — only store what earns it
@@ -82,6 +122,18 @@ events (deps not downloaded yet) cost zero SQLite until their deps arrive.
 `wanted_events` and `wanted_sources` can also be in-memory. Losing them
 on crash is fine — negentropy rediscovers everything in the next round.
 
+**Risks** (from Codex review):
+- Invasive: projection assumes blobs live in `events` before processing.
+  Signer resolution reads signer blobs from `events JOIN valid_events`.
+  Egress serves blobs from `events`. All need an in-memory overlay.
+- Low-memory mode: caps `shared_ingest_cap` to 2 and enforces 24 MiB
+  per-instance limits. An in-memory orphan pool can break this.
+- Crash recovery: `project_queue` and `pending_shared_fanouts` rely on
+  durable recovery boundaries. Memory-first needs a clear rule for which
+  blocked/fanout states still become durable.
+- Demand suppression: `recorded_events` check in `wanted.rs:105` assumes
+  events are in the DB. In-memory events need an overlay for this check.
+
 ### Idea 2: Hash-chain signature batching
 
 Each message includes a 32-byte `prev_message_ref` (hash of sender's
@@ -94,8 +146,20 @@ previous message blob). During catchup:
 For 10k messages from 2 devices: 2 sig verifies + 10k hash checks.
 Saves ~640ms of the current 650ms sig verify cost.
 
-Requires wire format change (new field in message events). Safe because
-an unbroken hash chain from a verified tip authenticates the entire chain.
+Requires wire format change (new field in message events).
+
+**Design concerns** (from Codex review):
+- Chain scope: per signer or per signer+workspace? A global chain per
+  signer creates cross-workspace coupling with encrypted events.
+- What to hash: outer encrypted event ID or inner signed bytes? Outer
+  fits sync, inner fits signature semantics.
+- Fork handling: concurrent sends from same signer create ambiguous tips.
+  Need fork rejection or deterministic branch choice.
+- Mixed-mode: legacy events, key rotations, and gaps force fallback to
+  ordinary ed25519 verification. Win is on contiguous new history only.
+- Scope: message-only batching leaves reactions, deletions, files on the
+  old path. A generic `prev_signed_event_ref` is cleaner but bigger.
+- This is an authenticity optimization, not a freshness proof.
 
 ### Idea 3: Project newest and blocking events first
 
@@ -107,19 +171,22 @@ The projection cursor processes events in priority order:
    already tried to project
 4. **Everything else** — old history fills in behind the scenes
 
-The user sees the latest messages in <1s even during a 100k event
-catchup. History appears progressively.
+**Prerequisite**: the hot-ingest direct projection path (post-commit
+`project_batch()`) needs to honor this priority order, not just the
+queue-based path.
 
 ### Idea 4: Download what matters first
 
-Mirror projection priority in the download scheduler:
+**Prerequisite**: add `created_at_ms` to the `DiscoveryHint` wire format
+(`protocol.rs:25`). Currently hints don't carry timestamps, so
+`wanted_sources.priority_ts` is set to discovery time (now), not event
+creation time. Without this, newest-first scheduling doesn't work.
 
-- `wanted_events.priority_ts` already sorts `created_at DESC` (newest first)
-- When projection blocks on a missing dep, boost that dep to MAX_PRIORITY
-- Prefer downloading events that are either newest or unblock stored events
-
-This means the download order matches what the user needs, not just
-what negentropy discovered.
+With `created_at_ms` in hints:
+- Store it in `wanted_sources.priority_ts` during `observe_many_for_peer`
+- The planner already sorts `priority_ts DESC` — newest events get
+  requested first automatically
+- When projection blocks on a missing dep, boost that dep's priority
 
 ### Idea 5: Newest-first negentropy discovery
 
@@ -143,8 +210,8 @@ Add `recorded_by`, `recorded_at`, `source` columns to `events`.
 Eliminates one full table's INSERTs from the hot path. The "already
 local" check becomes `SELECT 1 FROM events WHERE event_id = ?`.
 
-20+ read sites across the codebase need migration. Medium-high effort
-but reduces write amplification permanently.
+100+ references to `recorded_events` across the codebase need migration.
+Medium-high effort but reduces write amplification permanently.
 
 ### Idea 8: Defer neg_items to incremental rebuild
 
@@ -152,21 +219,61 @@ Track last-synced rowid in `neg_meta`. Before each negentropy round,
 bulk-insert new events from the events table. Moves the cost from the
 hot ingest path to the observer loop.
 
-### Idea 9: Skip cascade for dependency-free types
+**Caveat**: must handle multi-workspace DBs correctly. The current
+prototype stamps every event with one `workspace_id`, which is not
+safe for shared DBs hosting multiple workspaces.
 
-Messages, reactions, and file_slices have no dependents. The cascade
-check always returns empty. Skip it based on event type metadata.
+### Idea 9: Skip cascade for true leaf types only
+
+~~Messages, reactions, and file_slices have no dependents.~~
+
+**Correction**: messages DO have dependents (reactions, files). Cascade
+skip should only apply to true leaf types: reactions, file_slices.
+These types are never referenced as a dependency by any other type.
 
 ### Idea 10: Skip subscription check when none active
 
 Cache a flag for "any active subscriptions?" — skip the per-event
-subscription hook when there are none.
+subscription hook when there are none. Subscription filtering currently
+only exists for messages (`subscriptions/engine.rs:122`), so this is
+a small win but easy.
 
 ### Idea 11: Progressive UI rendering
 
 Show partial projected state while sync is ongoing. "N more messages
 loading..." instead of a spinner. The UI queries projected state which
 fills in progressively.
+
+### Idea 12: Avoid blob re-read on hot ingest
+
+`run_persist_phase()` already has blob bytes in memory from the ingest
+channel. `project_batch()` then re-reads them from the events table.
+Carry blobs through `PersistPhaseOutput` to project from memory.
+Cheap localized optimization, no architectural change.
+
+### Idea 13: Fix the send-idle stall
+
+The 1s+ SendIdle gaps documented in `PERF_HYPOTHESES_2026-03-12.md`
+are a protocol-level bug where overlapping sessions cause the sync
+handler to stall with events queued but not sending. This is a
+blocking bug for <1s perceived latency regardless of throughput.
+
+---
+
+## What Would Ship First (2-week push)
+
+Based on code review feedback, the highest-impact items for perceived
+latency that don't require architectural changes:
+
+1. **Add `created_at_ms` to DiscoveryHint wire format** → enables real
+   newest-first download scheduling (Idea 4 prerequisite)
+2. **Fix the send-idle stall** (Idea 13) → removes 1s+ pauses
+3. **Progressive UI rendering** (Idea 11) → makes sync feel instant
+4. **Low-risk trims**: skip empty subscriptions (Idea 10), avoid blob
+   re-read (Idea 12), skip cascade for leaf types only (Idea 9)
+
+Defer for later: memory-first processing (Idea 1), hash-chain batching
+(Idea 2), recorded_events consolidation (Idea 7).
 
 ---
 
@@ -175,7 +282,14 @@ fills in progressively.
 - Forward-on-have live hint bus (sub-second live delivery)
 - Bidirectional DiscoveryHints with real byte sizes (vendored negentropy)
 - Credit watermarks tuned for file slices (2 MiB high, 512 KiB low)
-- Batch projection architecture (gather/map/reduce/apply) — on branch, not merged
 - Configurable timeline recording (`TOPO_EVENT_TIMELINE` env var)
 - Batched recorded_events check in observe_many_for_peer
 - Cached rebuild_blocks (count-based skip)
+
+## What's on Branches (not merged)
+
+- `codex/batch-projection-tuning`: batch projection architecture,
+  multi-row INSERT, project queue bypass, larger batch sizes,
+  preloaded sync benchmark
+- `codex/batch-projection-refactor`: full gather/map/reduce/apply
+  pipeline, parallel rayon map, project_batch_from_blobs
