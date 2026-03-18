@@ -465,6 +465,7 @@ async fn sync_pair_until_transport_converged(
 /// once message/file traffic starts, the topology helpers should not need to
 /// widen auth or rely on stale/bootstrap aliases just to discover peers.
 pub async fn converge_workspace_transport_graph(peers: &[Peer]) {
+    crate::state::live_hints::init_forward_on_have_from_env();
     if peers.len() < 2 {
         return;
     }
@@ -3012,6 +3013,7 @@ where
 ///
 /// Returns thread handles for all accept and connect loops.
 pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
+    crate::state::live_hints::init_forward_on_have_from_env();
     use crate::db::transport_trust::is_authorized_for_tenant;
 
     let n = peers.len();
@@ -3128,6 +3130,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
 ///
 /// Returns thread handles for all source accept_loops and sink connect loops.
 pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::JoinHandle<()>> {
+    crate::state::live_hints::init_forward_on_have_from_env();
     assert!(!sources.is_empty(), "need at least one source");
     for source in sources {
         assert_eq!(
