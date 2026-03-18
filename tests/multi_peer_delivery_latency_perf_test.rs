@@ -19,7 +19,7 @@ use topo::testutil::{assert_eventually, start_peers_runtime_affine, Peer};
 const DEFAULT_MESSAGES_PER_SEC: usize = 5;
 const DEFAULT_LIVE_SECONDS: usize = 60;
 const TWO_PEER_GATE_MESSAGES_PER_SEC: usize = 2;
-const TWO_PEER_GATE_MAX_WORST_MS: i64 = 2_000;
+const TWO_PEER_GATE_MAX_WORST_MS: i64 = 50;
 
 #[derive(Clone)]
 struct SentMessage {

@@ -299,7 +299,7 @@ Forward-on-have: freshly created events are pushed to connected peers immediatel
 | 4 msg/s | 20s | 3.2 ms | 3 ms | 5 ms | 8 ms |
 | 10 msg/s | 20s | 2.9 ms | 3 ms | 4 ms | 5 ms |
 
-- Gate assertion: worst ≤ 2,000 ms at 2 msg/s × 15s (actual: 4 ms)
+- Gate assertion: worst ≤ 50 ms at 2 msg/s × 15s (actual: 4–5 ms)
 - Rate has negligible effect — bottleneck is QUIC loopback RTT (~2 ms)
 - `topo forward enable/disable` toggles hint delivery at runtime for A/B testing
 
