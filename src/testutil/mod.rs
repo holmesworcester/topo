@@ -2655,6 +2655,7 @@ pub fn start_peers(
     peer_a: &Peer,
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+    crate::state::live_hints::init_forward_on_have_from_env();
     let (cert_a, key_a) = peer_a.cert_and_key();
     let (cert_b, key_b) = peer_b.cert_and_key();
     let a_trusts_b = peer_b.spki_fingerprint();
@@ -2741,6 +2742,7 @@ pub fn start_peers_runtime_affine(
     peer_a: &Peer,
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+    crate::state::live_hints::init_forward_on_have_from_env();
     let (cert_a, key_a) = peer_a.cert_and_key();
     let (cert_b, key_b) = peer_b.cert_and_key();
     let a_trusts_b = peer_b.spki_fingerprint();

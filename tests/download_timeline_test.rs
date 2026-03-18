@@ -314,3 +314,59 @@ async fn forward_on_have_hints_fresh_events_with_slow_negentropy_repair() {
     drop(sync);
     harness.finish();
 }
+
+/// Verify that `topo forward disable` / `set_forward_on_have(false)` actually
+/// prevents fast hint-based delivery, and re-enabling restores it.
+#[tokio::test]
+async fn forward_on_have_toggle_controls_hint_delivery() {
+    let _env_guard = env_lock().lock().expect("env mutex poisoned");
+    let _forward_on_have = ScopedEnv::set("P7_FORWARD_ON_HAVE", "1");
+    // 60-second round gap: without hints, events cannot arrive within 3 seconds.
+    let _round_gap_ms = ScopedEnv::set("P7_DISCOVERY_ROUND_GAP_MS", "60000");
+
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
+
+    let sync = start_peers(&alice, &bob);
+
+    // Warmup: verify the connection is live.
+    let warmup = alice.create_message("toggle warmup");
+    let warmup_b64 = event_id_to_base64(&warmup);
+    assert_eventually(
+        || bob.has_event(&warmup_b64),
+        Duration::from_secs(3),
+        "toggle warmup convergence via live hint",
+    )
+    .await;
+
+    // --- Disable forward-on-have at runtime ---
+    topo::state::live_hints::set_forward_on_have(false);
+
+    let blocked = alice.create_message("should not arrive fast");
+    let blocked_b64 = event_id_to_base64(&blocked);
+
+    // Wait 2 seconds — with a 60s round gap and no hints, it must NOT arrive.
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    assert!(
+        !bob.has_event(&blocked_b64),
+        "event should NOT arrive within 2s when forward-on-have is disabled"
+    );
+
+    // --- Re-enable forward-on-have ---
+    topo::state::live_hints::set_forward_on_have(true);
+
+    let fast = alice.create_message("should arrive fast");
+    let fast_b64 = event_id_to_base64(&fast);
+    assert_eventually(
+        || bob.has_event(&fast_b64),
+        Duration::from_secs(3),
+        "fast delivery restored after forward re-enable",
+    )
+    .await;
+
+    drop(sync);
+    harness.finish();
+}

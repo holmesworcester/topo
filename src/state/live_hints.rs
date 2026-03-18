@@ -1,4 +1,5 @@
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Mutex, OnceLock};
 
 use rusqlite::Connection;
@@ -7,6 +8,30 @@ use tokio::sync::broadcast;
 use crate::crypto::EventId;
 
 const LIVE_HINT_CHANNEL_CAPACITY: usize = 4096;
+
+// ---------------------------------------------------------------------------
+// Runtime toggle
+// ---------------------------------------------------------------------------
+
+static FORWARD_ON_HAVE: AtomicBool = AtomicBool::new(false);
+
+/// Returns true when forward-on-have hint delivery is active.
+pub fn forward_on_have_enabled() -> bool {
+    FORWARD_ON_HAVE.load(Ordering::Relaxed)
+}
+
+/// Toggle forward-on-have at runtime (called from RPC dispatch).
+pub fn set_forward_on_have(enabled: bool) {
+    FORWARD_ON_HAVE.store(enabled, Ordering::Relaxed);
+}
+
+/// One-time initialization from `P7_FORWARD_ON_HAVE` env var.
+pub fn init_forward_on_have_from_env() {
+    let enabled = std::env::var("P7_FORWARD_ON_HAVE")
+        .map(|v| v != "0" && v.to_lowercase() != "false")
+        .unwrap_or(false);
+    set_forward_on_have(enabled);
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct LiveHint {
@@ -111,6 +136,16 @@ mod tests {
             source_peer_id_from_source_tag("same_workspace_fanout:peer-a"),
             None
         );
+    }
+
+    #[test]
+    fn toggle_forward_on_have_at_runtime() {
+        set_forward_on_have(false);
+        assert!(!forward_on_have_enabled());
+        set_forward_on_have(true);
+        assert!(forward_on_have_enabled());
+        set_forward_on_have(false);
+        assert!(!forward_on_have_enabled());
     }
 
     #[test]

@@ -146,8 +146,7 @@ where
     let mut last_idle_marker = Instant::now();
     let credit_high = request_credit_high_watermark().max(1);
     let credit_low = request_credit_low_watermark().min(credit_high.saturating_sub(1));
-    let forward_on_have = forward_on_have_enabled();
-    let mut forward_hint_rx = forward_on_have.then(|| live_hints::subscribe(db_path, recorded_by));
+    let mut forward_hint_rx = live_hints::subscribe(db_path, recorded_by);
     let mut rounds_total = 0u64;
     let mut next_round_due = Instant::now();
     let mut observed_initial_control_progress = false;
@@ -400,9 +399,9 @@ where
                     last_activity = Instant::now();
                 }
 
-                if let Some(receiver) = forward_hint_rx.as_mut() {
+                if forward_on_have_enabled() {
                     let hinted =
-                        send_forward_on_have_hints(&mut control, &timeline, peer_id, receiver)
+                        send_forward_on_have_hints(&mut control, &timeline, peer_id, &mut forward_hint_rx)
                             .await?;
                     if hinted > 0 {
                         last_activity = Instant::now();
@@ -629,9 +628,9 @@ where
             last_activity = Instant::now();
         }
 
-        if let Some(receiver) = forward_hint_rx.as_mut() {
+        if forward_on_have_enabled() {
             let hinted =
-                send_forward_on_have_hints(&mut control, &timeline, peer_id, receiver).await?;
+                send_forward_on_have_hints(&mut control, &timeline, peer_id, &mut forward_hint_rx).await?;
             if hinted > 0 {
                 last_activity = Instant::now();
             }

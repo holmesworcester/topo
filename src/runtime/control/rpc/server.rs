@@ -1114,6 +1114,23 @@ fn dispatch(
             }
             Err(e) => RpcResponse::error(e),
         },
+        RpcMethod::Forward { action } => {
+            use crate::state::live_hints;
+            match action {
+                ForwardAction::Enable => {
+                    live_hints::set_forward_on_have(true);
+                    RpcResponse::success(serde_json::json!({"forward_on_have": true}))
+                }
+                ForwardAction::Disable => {
+                    live_hints::set_forward_on_have(false);
+                    RpcResponse::success(serde_json::json!({"forward_on_have": false}))
+                }
+                ForwardAction::Status => {
+                    let enabled = live_hints::forward_on_have_enabled();
+                    RpcResponse::success(serde_json::json!({"forward_on_have": enabled}))
+                }
+            }
+        }
         RpcMethod::Upnp { action } => match action {
             UpnpAction::Disable => {
                 *state.upnp_enabled.write().unwrap() = false;

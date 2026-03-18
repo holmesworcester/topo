@@ -18,7 +18,7 @@ use topo::db::transport_creds::discover_local_tenants;
 use topo::db::{friendly_db_error, open_connection, schema::create_tables, sync_log};
 use topo::rpc::catalog;
 use topo::rpc::client::{rpc_call, rpc_call_raw, RpcClientError};
-use topo::rpc::protocol::{RpcMethod, UpnpAction, PROTOCOL_VERSION};
+use topo::rpc::protocol::{ForwardAction, RpcMethod, UpnpAction, PROTOCOL_VERSION};
 use topo::rpc::server::{run_rpc_server, DaemonState, RuntimeState};
 use topo::service;
 use topo::tuning::apply_low_mem_allocator_tuning;
@@ -418,6 +418,14 @@ enum Commands {
         action: RpcAction,
     },
 
+    /// Enable, disable, or inspect forward-on-have live hint delivery.
+    /// When enabled, freshly persisted events are pushed to connected peers
+    /// immediately instead of waiting for the next negentropy round.
+    Forward {
+        #[command(subcommand)]
+        action: Option<ForwardCommand>,
+    },
+
     /// Enable, disable, or inspect runtime-managed UPnP port forwarding.
     /// Mapping attempts are ephemeral daemon state and reset on restart.
     Upnp {
@@ -460,6 +468,16 @@ enum RpcAction {
         #[arg(long, group = "input")]
         stdin: bool,
     },
+}
+
+#[derive(Subcommand, Clone, Copy)]
+enum ForwardCommand {
+    /// Enable forward-on-have live hint delivery.
+    Enable,
+    /// Disable forward-on-have (events discovered only via negentropy rounds).
+    Disable,
+    /// Show whether forward-on-have is currently enabled.
+    Status,
 }
 
 #[derive(Subcommand, Clone, Copy)]
@@ -2076,6 +2094,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let (idle_bind_reservation, resolved_bind) =
                 reserve_idle_bind(bind, start_uses_default_bind)?;
 
+            topo::state::live_hints::init_forward_on_have_from_env();
+
             let shutdown = Arc::new(AtomicBool::new(false));
             let shutdown_notify = Arc::new(tokio::sync::Notify::new());
             let state = Arc::new(DaemonState::new(db));
@@ -3117,6 +3137,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 }
             }
         },
+
+        Commands::Forward { action } => {
+            let action = match action.unwrap_or(ForwardCommand::Status) {
+                ForwardCommand::Enable => ForwardAction::Enable,
+                ForwardCommand::Disable => ForwardAction::Disable,
+                ForwardCommand::Status => ForwardAction::Status,
+            };
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::Forward { action },
+            )?;
+            let enabled = data["forward_on_have"].as_bool().unwrap_or(false);
+            println!("forward-on-have: {}", if enabled { "enabled" } else { "disabled" });
+        }
 
         Commands::Upnp { action } => {
             let action = match action.unwrap_or(UpnpCommand::Enable) {

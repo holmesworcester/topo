@@ -64,12 +64,6 @@ pub(super) const INITIAL_CONTROL_PROGRESS_TIMEOUT: Duration = Duration::from_sec
 /// Non-blocking poll timeout for the control stream receive.
 pub(super) const CONTROL_POLL_TIMEOUT: Duration = Duration::from_millis(1);
 
-fn read_bool_env(name: &str) -> bool {
-    std::env::var(name)
-        .map(|v| v != "0" && v.to_lowercase() != "false")
-        .unwrap_or(false)
-}
-
 fn read_u64_env(name: &str) -> Option<u64> {
     std::env::var(name).ok()?.parse::<u64>().ok()
 }
@@ -80,7 +74,7 @@ pub(super) fn discovery_round_gap() -> Duration {
 }
 
 pub(super) fn forward_on_have_enabled() -> bool {
-    read_bool_env("P7_FORWARD_ON_HAVE")
+    crate::state::live_hints::forward_on_have_enabled()
 }
 
 pub(super) fn send_idle_capture_enabled() -> bool {
