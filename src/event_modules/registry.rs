@@ -55,6 +55,15 @@ pub struct EventTypeMeta {
     ) -> Result<ContextSnapshot, Box<dyn std::error::Error>>,
 }
 
+impl EventTypeMeta {
+    /// Whether this event type uses the default empty context loader.
+    /// Types with custom context loaders need per-event DB queries and
+    /// cannot be batch-projected without a type-specific cache.
+    pub fn has_empty_context_loader(&self) -> bool {
+        self.context_loader as usize == load_empty_context as usize
+    }
+}
+
 /// Default context loader for event types whose projectors do not require
 /// additional DB-derived context.
 pub fn load_empty_context(

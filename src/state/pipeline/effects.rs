@@ -43,7 +43,16 @@ impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
         tenants.sort();
 
         for tenant_id in &tenants {
-            if let Err(e) = drain_project_queue_batched(self.db, tenant_id, batch_size) {
+            let t0 = std::time::Instant::now();
+            let drain_result = drain_project_queue_batched(self.db, tenant_id, batch_size);
+            let drain_ms = t0.elapsed().as_millis();
+            match &drain_result {
+                Ok(count) if *count > 0 => {
+                    tracing::info!("BATCH_DRAIN: tenant={} projected={} elapsed={}ms", short_id(tenant_id), count, drain_ms);
+                }
+                _ => {}
+            }
+            if let Err(e) = drain_result {
                 tracing::warn!("project_queue drain error for {}: {}", tenant_id, e);
             }
 

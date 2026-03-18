@@ -18,7 +18,7 @@ pub fn drain_project_queue(db_path: &str, tenant_id: &str, batch_size: usize) ->
         }
     };
 
-    drain_project_queue_on_connection(&db, tenant_id, batch_size).unwrap_or(0)
+    drain_project_queue_batched(&db, tenant_id, batch_size).unwrap_or(0)
 }
 
 pub(super) fn drain_project_queue_on_connection(

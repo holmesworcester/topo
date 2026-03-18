@@ -304,6 +304,71 @@ pub(crate) fn apply_projection(
     Ok((result.decision, None))
 }
 
+/// Like `apply_projection` but returns the `ProjectorResult` without executing
+/// writes. Used by batch projection to collect WriteOps across many events and
+/// execute them in one transaction.
+///
+/// Returns `None` for encrypted events (they need the old recursive path).
+pub(crate) fn prepare_projection(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+    blob: &[u8],
+    parsed: &ParsedEvent,
+) -> Result<Option<crate::state::projection::contract::ProjectorResult>, Box<dyn std::error::Error>>
+{
+    let meta = registry()
+        .lookup(parsed.event_type_code())
+        .ok_or_else(|| format!("unknown type code {}", parsed.event_type_code()))?;
+
+    // Signer verification
+    if meta.signer_required {
+        let (signer_event_id, signer_type) = parsed
+            .signer_fields()
+            .ok_or("signer_required but no signer_fields")?;
+        let resolution = resolve_signer_key(conn, recorded_by, signer_type, &signer_event_id)?;
+        match resolution {
+            SignerResolution::NotFound => {
+                return Ok(Some(crate::state::projection::contract::ProjectorResult::reject(
+                    "signer key not found".to_string(),
+                )));
+            }
+            SignerResolution::Invalid(msg) => {
+                return Ok(Some(crate::state::projection::contract::ProjectorResult::reject(
+                    format!("signer resolution failed: {}", msg),
+                )));
+            }
+            SignerResolution::Found(key) => {
+                let sig_len = meta.signature_byte_len;
+                if blob.len() < sig_len {
+                    return Ok(Some(crate::state::projection::contract::ProjectorResult::reject(
+                        "blob too short for signature".to_string(),
+                    )));
+                }
+                let signing_bytes = &blob[..blob.len() - sig_len];
+                let sig_bytes = &blob[blob.len() - sig_len..];
+                if !verify_ed25519_signature(&key, signing_bytes, sig_bytes) {
+                    return Ok(Some(crate::state::projection::contract::ProjectorResult::reject(
+                        "invalid signature".to_string(),
+                    )));
+                }
+            }
+        }
+    }
+
+    // Encrypted events cannot be prepared — they recurse internally
+    if matches!(parsed, ParsedEvent::Encrypted(_)) {
+        return Ok(None);
+    }
+
+    // Build context and dispatch to pure projector
+    let mut ctx = (meta.context_loader)(conn, recorded_by, event_id_b64, parsed)?;
+    ctx.current_transport_key_event_id = None;
+
+    let result = dispatch_pure_projector(recorded_by, event_id_b64, parsed, &ctx);
+    Ok(Some(result))
+}
+
 /// Shared dependency/signer/projection stage bundle used by cleartext and
 /// decrypted-inner flows.
 ///
