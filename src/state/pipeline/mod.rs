@@ -16,6 +16,7 @@ use crate::db::store::{
     lookup_workspace_id, SQL_INSERT_EVENT, SQL_INSERT_NEG_ITEM, SQL_INSERT_RECORDED_EVENT,
 };
 use crate::event_modules::{self as events, registry};
+use crate::state::live_hints;
 use crate::tuning::{bulk_write_batch_cap, drain_batch_size, low_mem_mode, write_batch_cap};
 
 use self::effects::{
@@ -73,6 +74,7 @@ fn commit_and_run_post_commit_effects<E: PostCommitEffectsExecutor>(
     batch_size: usize,
 ) -> rusqlite::Result<()> {
     db.execute("COMMIT", [])?;
+    live_hints::publish_from_connection(db, &persist_output.live_hints);
     run_post_commit_tail(persist_output, effects_executor, batch_size, || {
         enforce_low_mem_wal_cap(db)
     });
@@ -330,6 +332,7 @@ mod tests {
         PersistPhaseOutput {
             persisted_event_ids: vec![[1u8; 32], [2u8; 32]],
             tenants_seen: HashSet::from(["tenant-b".to_string(), "tenant-a".to_string()]),
+            live_hints: Vec::new(),
             shared_event_fanouts: Vec::new(),
         }
     }

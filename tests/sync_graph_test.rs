@@ -16,7 +16,9 @@
 
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
+use rusqlite::OptionalExtension;
 use topo::crypto::{event_id_from_base64, event_id_to_base64};
+use topo::db::open_connection;
 use topo::testutil::{
     assert_eventually, clone_events_to, converge_workspace_transport_graph, start_chain,
     start_sink_download, start_sink_download_with_shutdown, Peer,
@@ -106,6 +108,53 @@ fn print_chain_message_counts(peers: &[Peer]) {
     }
 }
 
+/// Collect per-event delivery latencies (ms) from origin to sink.
+fn collect_per_event_delivery_latencies(origin: &Peer, sink: &Peer) -> Vec<i64> {
+    let origin_conn = open_connection(&origin.db_path).expect("open origin db");
+    let sink_conn = open_connection(&sink.db_path).expect("open sink db");
+    let mut stmt = origin_conn
+        .prepare(
+            "SELECT e.event_id, e.created_at
+             FROM events e
+             JOIN recorded_events re ON re.event_id = e.event_id
+             WHERE re.peer_id = ?1
+               AND re.source = 'local_create'
+               AND e.share_scope = 'shared'",
+        )
+        .expect("prepare origin query");
+    let rows: Vec<(String, i64)> = stmt
+        .query_map(rusqlite::params![&origin.identity], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        })
+        .expect("query origin events")
+        .filter_map(|r| r.ok())
+        .collect();
+    let mut latencies = Vec::with_capacity(rows.len());
+    for (event_id_b64, created_at_ms) in &rows {
+        let recorded_at: Option<i64> = sink_conn
+            .query_row(
+                "SELECT recorded_at FROM recorded_events
+                 WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![&sink.identity, event_id_b64],
+                |row| row.get(0),
+            )
+            .optional()
+            .expect("query sink received_at");
+        if let Some(received) = recorded_at {
+            latencies.push(received - created_at_ms);
+        }
+    }
+    latencies.sort();
+    latencies
+}
+
+fn env_usize_sg(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
 // ---------------------------------------------------------------------------
 // Family A: Chain propagation
 // ---------------------------------------------------------------------------
@@ -164,6 +213,8 @@ async fn run_chain_bench(n: usize, event_count: usize) {
 
     drop(handles);
 
+    let delivery_ms = collect_per_event_delivery_latencies(&peers[0], &peers[n - 1]);
+
     eprintln!();
     eprintln!("=== Chain: {} peers, {} events ===", n, event_count);
     eprintln!("  Tail converge:    {} ms", tail_wall_ms);
@@ -176,6 +227,17 @@ async fn run_chain_bench(n: usize, event_count: usize) {
         hop_delays.len()
     );
     eprintln!("  Hop latency P95:  {:.1} ms", hop_p95);
+    if !delivery_ms.is_empty() {
+        let avg = delivery_ms.iter().sum::<i64>() as f64 / delivery_ms.len() as f64;
+        let best = delivery_ms[0];
+        let worst = delivery_ms[delivery_ms.len() - 1];
+        let p50 = delivery_ms[((delivery_ms.len() as f64 * 0.50) as usize).min(delivery_ms.len() - 1)];
+        let p95 = delivery_ms[((delivery_ms.len() as f64 * 0.95) as usize).min(delivery_ms.len() - 1)];
+        eprintln!(
+            "  Delivery P0->P{}: best={} avg={:.0} p50={} p95={} worst={} ms ({} events)",
+            n - 1, best, avg, p50, p95, worst, delivery_ms.len()
+        );
+    }
     eprintln!(
         "  Peak RSS:         {:.1} MiB (before: {:.1})",
         rss_after, rss_before
@@ -184,7 +246,86 @@ async fn run_chain_bench(n: usize, event_count: usize) {
     eprintln!();
 }
 
-/// 10-hop chain smoke: 10 peers, 10k events.
+// ---------------------------------------------------------------------------
+// Family A2: Live-rate chain propagation
+// ---------------------------------------------------------------------------
+
+async fn run_chain_live_rate(n: usize, messages_per_sec: usize, live_seconds: usize) {
+    assert!(n >= 2);
+    assert!(messages_per_sec > 0);
+    assert!(live_seconds > 0);
+
+    let mut peers = Vec::with_capacity(n);
+    peers.push(Peer::new_with_identity("p0"));
+    for i in 1..n {
+        let joined = Peer::new_in_workspace(&format!("p{}", i), &peers[0]).await;
+        peers.push(joined);
+    }
+    converge_workspace_transport_graph(&peers).await;
+    let handles = start_chain(&peers);
+
+    let warmup_id = peers[0].create_message("chain-warmup");
+    let warmup_b64 = event_id_to_base64(&warmup_id);
+    let tail = &peers[n - 1];
+    assert_eventually(
+        || tail.has_event(&warmup_b64),
+        Duration::from_secs(120),
+        "chain warmup convergence at tail",
+    )
+    .await;
+
+    let total_messages = messages_per_sec * live_seconds;
+    let start = Instant::now();
+    for seq in 0..total_messages {
+        let target_elapsed = Duration::from_secs_f64(seq as f64 / messages_per_sec as f64);
+        if let Some(remaining) = target_elapsed.checked_sub(start.elapsed()) {
+            std::thread::sleep(remaining);
+        }
+        peers[0].create_message(&format!("live-{}", seq));
+    }
+
+    let expected_count = (total_messages + 1) as i64;
+    assert_eventually(
+        || tail.recorded_message_event_count() >= expected_count,
+        Duration::from_secs(300),
+        "chain live-rate convergence at tail",
+    )
+    .await;
+    let wall_secs = start.elapsed().as_secs_f64();
+
+    let delivery_ms = collect_per_event_delivery_latencies(&peers[0], tail);
+    drop(handles);
+
+    let avg = if delivery_ms.is_empty() { 0.0 } else {
+        delivery_ms.iter().sum::<i64>() as f64 / delivery_ms.len() as f64
+    };
+    let best = delivery_ms.first().copied().unwrap_or(0);
+    let worst = delivery_ms.last().copied().unwrap_or(0);
+    let p50_idx = ((delivery_ms.len() as f64 * 0.50) as usize).min(delivery_ms.len().saturating_sub(1));
+    let p95_idx = ((delivery_ms.len() as f64 * 0.95) as usize).min(delivery_ms.len().saturating_sub(1));
+    let p50 = delivery_ms.get(p50_idx).copied().unwrap_or(0);
+    let p95 = delivery_ms.get(p95_idx).copied().unwrap_or(0);
+
+    eprintln!();
+    eprintln!("=== Chain live-rate: {} peers, {} msg/s, {}s ===", n, messages_per_sec, live_seconds);
+    eprintln!("  Messages:         {}", total_messages);
+    eprintln!("  Wall time:        {:.1}s", wall_secs);
+    eprintln!(
+        "  Delivery P0->P{}: best={} avg={:.0} p50={} p95={} worst={} ms ({} events)",
+        n - 1, best, avg, p50, p95, worst, delivery_ms.len()
+    );
+    eprintln!();
+}
+
+#[tokio::test]
+#[ignore]
+async fn ten_hop_chain_live_rate() {
+    let mps = env_usize_sg("TOPO_PERF_MESSAGES_PER_SEC", 2);
+    let secs = env_usize_sg("TOPO_PERF_LIVE_SECONDS", 15);
+    run_chain_live_rate(10, mps, secs).await;
+}
+
+/// 10-hop chain smoke: 10 peers, 10k events (pre-seeded bulk).
 #[tokio::test]
 async fn ten_hop_chain_10k() {
     run_chain_bench(10, 10_000).await;

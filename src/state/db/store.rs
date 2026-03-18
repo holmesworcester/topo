@@ -141,6 +141,22 @@ pub fn insert_recorded_event(
     Ok(())
 }
 
+/// Like `insert_recorded_event` but returns whether a new row was inserted.
+/// `INSERT OR IGNORE` returns rows_changed=0 when the row already exists.
+pub fn insert_recorded_event_checked(
+    conn: &Connection,
+    peer_id: &str,
+    event_id: &EventId,
+    recorded_at_ms: i64,
+    source: &str,
+) -> SqliteResult<bool> {
+    let event_id_b64 = event_id_to_base64(event_id);
+    Ok(conn.execute(
+        SQL_INSERT_RECORDED_EVENT,
+        params![peer_id, &event_id_b64, recorded_at_ms, source],
+    )? > 0)
+}
+
 /// Content-addressed blob storage backed by the `events` table.
 pub struct Store<'a> {
     conn: &'a Connection,

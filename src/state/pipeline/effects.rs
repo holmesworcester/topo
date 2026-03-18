@@ -1,5 +1,6 @@
 use crate::db::project_queue::ProjectQueue;
 use crate::db::wanted::WantedEvents;
+use crate::state::live_hints::{self, LiveHintEvent};
 use crate::state::shared_workspace_fanout::fanout_shared_event_enqueue;
 
 use super::drain::drain_project_queue_on_connection;
@@ -85,10 +86,18 @@ impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
             }
         };
         let mut sibling_tenants = std::collections::HashSet::new();
+        let mut sibling_live_hints = Vec::new();
         for fanout in &pending {
             match fanout_shared_event_enqueue(self.db, fanout) {
                 Ok(siblings) => {
-                    sibling_tenants.extend(siblings);
+                    sibling_tenants.extend(siblings.iter().cloned());
+                    sibling_live_hints.extend(siblings.into_iter().map(|tenant_id| {
+                        LiveHintEvent {
+                            tenant_id,
+                            event_id: fanout.event_id,
+                            source_peer_id: None,
+                        }
+                    }));
                     // Delete after successful enqueue. The pending entry only
                     // needs to survive the persist→enqueue gap. Once enqueued,
                     // the project_queue handles retry (exponential backoff) for
@@ -107,6 +116,8 @@ impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
                 }
             }
         }
+
+        live_hints::publish_from_connection(self.db, &sibling_live_hints);
 
         // Drain newly enqueued sibling project_queue entries.
         let mut sibling_list: Vec<String> = sibling_tenants.into_iter().collect();
@@ -149,6 +160,7 @@ mod tests {
         let persist_output = PersistPhaseOutput {
             persisted_event_ids: vec![wanted_id],
             tenants_seen: std::collections::HashSet::from(["tenant-a".to_string()]),
+            live_hints: Vec::new(),
             shared_event_fanouts: Vec::new(),
         };
         let executor = SqlitePostCommitEffectsExecutor::new(&conn);
@@ -191,6 +203,7 @@ mod tests {
         let persist_output = PersistPhaseOutput {
             persisted_event_ids: vec![wanted_id],
             tenants_seen: std::collections::HashSet::from(["tenant-a".to_string()]),
+            live_hints: Vec::new(),
             shared_event_fanouts: Vec::new(),
         };
         let executor = SqlitePostCommitEffectsExecutor::new(&conn);
@@ -324,6 +337,7 @@ mod tests {
         let persist_output = PersistPhaseOutput {
             persisted_event_ids: vec![event_id],
             tenants_seen: std::collections::HashSet::from([origin.identity.clone()]),
+            live_hints: Vec::new(),
             shared_event_fanouts: Vec::new(),
         };
         let executor = SqlitePostCommitEffectsExecutor::new(&conn);

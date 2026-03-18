@@ -36,9 +36,12 @@ use crate::tuning::{
     response_credit_low_watermark_bytes,
 };
 
+use crate::state::live_hints;
+
 use super::connection_scope::{ConnectionRequestState, ConnectionResponseState};
 use super::control_plane::{
-    observe_discovery_hints_for_peer, refill_wanted_requests, send_response_credit_bytes,
+    observe_discovery_hints_for_peer, refill_wanted_requests, send_forward_on_have_hints,
+    send_response_credit_bytes,
 };
 use super::coordinator::PeerCoord;
 use super::data_plane::{
@@ -47,8 +50,8 @@ use super::data_plane::{
 use super::logging::{SyncRunCapture, SyncRunRxCapture};
 use super::windowing::{decode_initial_neg_open, SyncWindow, SyncWindowKind};
 use super::{
-    negentropy_frame_size, send_idle_capture_enabled, CONTROL_POLL_TIMEOUT,
-    INITIAL_CONTROL_PROGRESS_TIMEOUT,
+    forward_on_have_enabled, negentropy_frame_size, send_idle_capture_enabled,
+    CONTROL_POLL_TIMEOUT, INITIAL_CONTROL_PROGRESS_TIMEOUT,
 };
 
 fn should_treat_as_startup_control_abort(
@@ -235,6 +238,7 @@ where
 
     let credit_high = response_credit_high_watermark_bytes().max(1);
     let credit_low = response_credit_low_watermark_bytes().min(credit_high.saturating_sub(1));
+    let mut forward_hint_rx = live_hints::subscribe(db_path, recorded_by);
 
     loop {
         // Data receiver runs in a separate task — check if it received data
@@ -475,6 +479,14 @@ where
             )
             .await?;
             if requested_now > 0 {
+                last_activity = Instant::now();
+            }
+        }
+
+        if forward_on_have_enabled() {
+            let hinted =
+                send_forward_on_have_hints(&mut control, &timeline, &store, peer_id, &mut forward_hint_rx).await?;
+            if hinted > 0 {
                 last_activity = Instant::now();
             }
         }

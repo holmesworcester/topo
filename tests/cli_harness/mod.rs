@@ -390,13 +390,13 @@ fn daemon_debug_context(db: &str) -> String {
 }
 
 fn daemon_inherit_stdio_env() -> bool {
-    std::env::var("P7_TEST_DAEMON_INHERIT_STDIO")
+    std::env::var("TOPO_TEST_DAEMON_INHERIT_STDIO")
         .map(|v| v != "0" && v.to_lowercase() != "false")
         .unwrap_or(false)
 }
 
 fn daemon_debug_log_dir() -> Option<std::path::PathBuf> {
-    std::env::var_os("P7_TEST_DAEMON_LOG_DIR").map(std::path::PathBuf::from)
+    std::env::var_os("TOPO_TEST_DAEMON_LOG_DIR").map(std::path::PathBuf::from)
 }
 
 /// Start a daemon with default options (random port, suppressed I/O).
@@ -431,7 +431,7 @@ pub fn start_discovery_daemon(db: &str) -> HarnessDaemon {
             // binding the QUIC socket to loopback avoids environment-specific
             // wildcard-bind failures without changing the sync path under test.
             bind_ip: Some("127.0.0.1".to_string()),
-            extra_env: vec![("P7_TEST_DISCOVERY_LOOPBACK".to_string(), "1".to_string())],
+            extra_env: vec![("TOPO_TEST_DISCOVERY_LOOPBACK".to_string(), "1".to_string())],
             ..Default::default()
         },
     )
@@ -444,7 +444,7 @@ pub fn start_discovery_daemon_on_port(db: &str, port: u16) -> HarnessDaemon {
         &DaemonOptions {
             bind_ip: Some("127.0.0.1".to_string()),
             bind_port: Some(port),
-            extra_env: vec![("P7_TEST_DISCOVERY_LOOPBACK".to_string(), "1".to_string())],
+            extra_env: vec![("TOPO_TEST_DISCOVERY_LOOPBACK".to_string(), "1".to_string())],
             ..Default::default()
         },
     )
@@ -522,12 +522,12 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> HarnessDaemo
         }
 
         if opts.disable_placeholder_autodial {
-            cmd.env("P7_DISABLE_PLACEHOLDER_AUTODIAL", "1");
+            cmd.env("TOPO_DISABLE_PLACEHOLDER_AUTODIAL", "1");
         }
         if opts.disable_discovery {
-            cmd.env("P7_DISABLE_DISCOVERY", "1");
+            cmd.env("TOPO_DISABLE_DISCOVERY", "1");
         } else {
-            cmd.env_remove("P7_DISABLE_DISCOVERY");
+            cmd.env_remove("TOPO_DISABLE_DISCOVERY");
         }
         for (key, value) in &opts.extra_env {
             cmd.env(key, value);

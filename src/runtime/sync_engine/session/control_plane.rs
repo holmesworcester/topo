@@ -3,10 +3,11 @@
 //! Owns control-stream message handling concerns:
 //! - Negentropy control messages (`NegOpen` / `NegMsg`)
 //! - Sink-side observation of missing IDs into SQL-backed `wanted` state
-//! - Discovery hints and byte-budgeted request refill
+//! - Discovery hints (`DiscoveryHints`) and request-window refill (`RequestIds`)
 //!   via the shared in-memory coordinator
 
 use negentropy::Id;
+use tokio::sync::broadcast;
 use tracing::info;
 
 use crate::crypto::EventId;
@@ -14,6 +15,7 @@ use crate::db::timeline::EventTimeline;
 use crate::db::wanted::WantedEvents;
 use crate::db::store::Store;
 use crate::protocol::{neg_id_to_event_id, DiscoveryHint, Frame};
+use crate::state::live_hints::LiveHint;
 use crate::transport::StreamConn;
 
 use super::{connection_scope::ConnectionRequestState, coordinator::PeerCoord, need_chunk};
@@ -200,6 +202,92 @@ where
     control.send(&Frame::ResponseCredit { bytes }).await?;
     control.flush().await?;
     Ok(())
+}
+
+pub async fn send_forward_on_have_hints<C>(
+    control: &mut C,
+    timeline: &EventTimeline<'_>,
+    store: &Store<'_>,
+    peer_id: &str,
+    receiver: &mut broadcast::Receiver<LiveHint>,
+) -> Result<usize, SyncError>
+where
+    C: StreamConn,
+{
+    // Cap total items consumed from the receiver, not just unique forwarded IDs.
+    // Self-hints and duplicates count toward the cap so a backlog of filtered
+    // items cannot drain the channel unboundedly in a single tick.
+    let cap = need_chunk();
+    let mut drained = 0usize;
+    let mut ids = Vec::new();
+    let mut seen = std::collections::HashSet::new();
+    loop {
+        if drained >= cap {
+            break;
+        }
+        match receiver.try_recv() {
+            Ok(hint) => {
+                drained += 1;
+                if hint.source_peer_id.as_deref() == Some(peer_id) {
+                    continue;
+                }
+                if seen.insert(hint.event_id) {
+                    ids.push(hint.event_id);
+                }
+            }
+            Err(broadcast::error::TryRecvError::Empty) => break,
+            Err(broadcast::error::TryRecvError::Lagged(skipped)) => {
+                info!(
+                    peer = %peer_id,
+                    skipped,
+                    "forward-on-have hint receiver lagged; periodic negentropy will repair misses"
+                );
+            }
+            Err(broadcast::error::TryRecvError::Closed) => break,
+        }
+    }
+    send_discovery_hints_for_event_ids(control, timeline, store, &ids).await
+}
+
+pub async fn send_discovery_hints_for_event_ids<C>(
+    control: &mut C,
+    timeline: &EventTimeline<'_>,
+    store: &Store<'_>,
+    ids: &[EventId],
+) -> Result<usize, SyncError>
+where
+    C: StreamConn,
+{
+    if ids.is_empty() {
+        return Ok(0);
+    }
+
+    let batch_size = need_chunk().max(1);
+    let sent_at = crate::db::queue::current_timestamp_ms();
+    let mut hints: Vec<DiscoveryHint> = Vec::new();
+    for event_id in ids {
+        if let Some(summary) = store.get_shared_summary(event_id)? {
+            hints.push(DiscoveryHint {
+                event_id: summary.event_id,
+                semantic_type_code: summary.semantic_type_code,
+                encoded_size_bytes: summary.encoded_size_bytes,
+            });
+        }
+    }
+    if hints.is_empty() {
+        return Ok(0);
+    }
+    let hint_ids: Vec<EventId> = hints.iter().map(|h| h.event_id).collect();
+    for chunk in hints.chunks(batch_size) {
+        control
+            .send(&Frame::DiscoveryHints {
+                hints: chunk.to_vec(),
+            })
+            .await?;
+    }
+    control.flush().await?;
+    let _ = timeline.mark_need_list_sent_many(&hint_ids, sent_at);
+    Ok(hint_ids.len())
 }
 
 fn candidate_limit_for_credit_bytes(credit_bytes: usize, inflight_count: usize) -> usize {

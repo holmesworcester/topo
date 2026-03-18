@@ -17,11 +17,11 @@ pub struct SyncWindow {
 const WINDOW_MAGIC: &[u8; 4] = b"P7SW";
 const WINDOW_VERSION: u8 = 1;
 const HOT_WINDOW_MS: i64 = 30_000;
-const COLD_SESSION_INTERVAL_MS: i64 = 5_000;
+const _COLD_SESSION_INTERVAL_MS: i64 = 5_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum PlannerState {
-    NeedFull,
+    _NeedFull,
     Established { last_cold_ms: i64 },
 }
 
@@ -38,30 +38,17 @@ pub fn reset_outbound_window_state(db_path: &str, peer_id: &str) {
     state.remove(&key);
 }
 
-pub fn select_outbound_window(db_path: &str, peer_id: &str, now_ms: i64) -> SyncWindow {
+pub fn select_outbound_window(_db_path: &str, _peer_id: &str, now_ms: i64) -> SyncWindow {
+    // Always use Full window.  The previous Hot/Cold split assumed a fast round
+    // cadence (100 ms) where Cold could sweep old events on a slower cadence.
+    // With the production round gap at 5 s, the Cold condition fired every round,
+    // making all rounds Cold (ts < now-30s) and hiding freshly created events for
+    // 30+ seconds.  A single Full window avoids that bug and keeps the protocol
+    // simple: one negentropy snapshot per round, covering the entire event set.
     let cutoff_ms = now_ms - HOT_WINDOW_MS;
-    let key = format!("{db_path}|{peer_id}");
-    let mut state = planner_state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match state.entry(key).or_insert(PlannerState::NeedFull) {
-        PlannerState::NeedFull => SyncWindow {
-            kind: SyncWindowKind::Full,
-            cutoff_ms,
-        },
-        PlannerState::Established { last_cold_ms }
-            if now_ms - *last_cold_ms >= COLD_SESSION_INTERVAL_MS =>
-        {
-            *last_cold_ms = now_ms;
-            SyncWindow {
-                kind: SyncWindowKind::Cold,
-                cutoff_ms,
-            }
-        }
-        PlannerState::Established { .. } => SyncWindow {
-            kind: SyncWindowKind::Hot,
-            cutoff_ms,
-        },
+    SyncWindow {
+        kind: SyncWindowKind::Full,
+        cutoff_ms,
     }
 }
 
@@ -150,17 +137,18 @@ mod tests {
     }
 
     #[test]
-    fn completed_full_transitions_to_hot_then_cold() {
+    fn completed_full_stays_full_after_completion() {
         let db_path = "/tmp/window-test-b";
         let peer_id = "peer-b";
         reset_outbound_window_state(db_path, peer_id);
         mark_outbound_full_completed(db_path, peer_id, 100_000);
 
-        let hot = select_outbound_window(db_path, peer_id, 101_000);
-        let cold = select_outbound_window(db_path, peer_id, 106_500);
+        // With always-Full windowing, post-completion rounds are also Full.
+        let next = select_outbound_window(db_path, peer_id, 101_000);
+        let later = select_outbound_window(db_path, peer_id, 106_500);
 
-        assert_eq!(hot.kind, SyncWindowKind::Hot);
-        assert_eq!(cold.kind, SyncWindowKind::Cold);
+        assert_eq!(next.kind, SyncWindowKind::Full);
+        assert_eq!(later.kind, SyncWindowKind::Full);
     }
 
     #[test]

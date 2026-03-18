@@ -306,6 +306,37 @@ Same QUIC sync, but through a UDP traffic shaper modelling real-world link condi
 
 ---
 
+# Live Message Delivery Latency
+
+Two discovery modes, tested independently and together. 2 msg/s × 15 s, in-process loopback, no preload.
+
+| Discovery mode | avg | p50 | p95 | worst |
+|----------------|-----|-----|-----|-------|
+| forward-on-have only | 2.7 ms | 3 ms | 4 ms | 5 ms |
+| negentropy only (5 s rounds) | 2,561 ms | 2,805 ms | 4,813 ms | 4,833 ms |
+| **both (production)** | **3.2 ms** | **3 ms** | **4 ms** | **5 ms** |
+
+- Forward-on-have pushes hints to peers immediately via broadcast channel — 1,000× faster than round-based discovery at production cadence
+- Negentropy avg ≈ half the round gap (~2.5 s at 5 s rounds) — expected
+- Production mode tracks the forward path; negentropy is invisible unless hints are lost
+- Gate assertion: worst ≤ 50 ms at 2 msg/s (actual: 4 ms)
+- `topo forward enable/disable` toggles hint delivery at runtime for A/B testing
+
+---
+
+# Delivery Latency by Rate (forward-on-have)
+
+| Rate | Duration | avg | p50 | p95 | worst |
+|------|----------|-----|-----|-----|-------|
+| 1 msg/s | 5s | 2.0 ms | 2 ms | 3 ms | 3 ms |
+| 2 msg/s | 15s | 2.4 ms | 2 ms | 4 ms | 4 ms |
+| 4 msg/s | 20s | 3.2 ms | 3 ms | 5 ms | 8 ms |
+| 10 msg/s | 20s | 2.9 ms | 3 ms | 4 ms | 5 ms |
+
+- Rate has negligible effect — bottleneck is QUIC loopback RTT (~2 ms)
+
+---
+
 # File Attachment Throughput
 
 Local encode + store + project for 256 KiB ciphertext slices (no sync).

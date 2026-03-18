@@ -983,6 +983,26 @@ Profiling evidence: 500k one-way sync improved from 170.93s (2,925 msgs/s) to 10
 
 Note: wrapping all projection writes in a single transaction was attempted first but abandoned — it caused ~0.06% of events to be left unprojected at 500k scale due to cascade_unblocked bulk cleanup interacting with the transaction scope.
 
+### 10.0.2 Implemented: forward-on-have live hint bus
+
+**Problem.** Negentropy discovery runs on a periodic interval (default 5 s, tunable via `TOPO_DISCOVERY_ROUND_GAP_MS`). A freshly created message must wait for the next scheduled round before the remote peer discovers it.
+
+**Design.** Each time the persist phase newly inserts a shared canonical event it publishes a `LiveHint { event_id, source_peer_id, tenant_id }` entry to a per-`(db_path, tenant_id)` tokio broadcast channel (`src/state/live_hints.rs`). Active initiator and responder sessions subscribe on startup. Each control-loop tick (1 ms poll) the session drains up to `need_chunk()` hints from its receiver and emits a `NeedList` frame immediately on the control stream. Self-hint filtering: hints tagged with the receiving peer's own ID are skipped. Drain cap: the loop tracks `drained` (total items consumed, including filtered ones) and breaks at `need_chunk()` so a backlog of self-hints or duplicates cannot stall the control loop.
+
+**Measured delivery latency** (in-process loopback, `TOPO_FORWARD_ON_HAVE=1`, no preload):
+
+| Discovery mode | avg | p95 | worst |
+|----------------|-----|-----|-------|
+| forward-on-have only | 2.7 ms | 4 ms | 5 ms |
+| negentropy only (5 s rounds) | 2,561 ms | 4,813 ms | 4,833 ms |
+| **both (production)** | **3.2 ms** | **4 ms** | **5 ms** |
+
+**Key files:**
+- `src/state/live_hints.rs` — broadcast bus, `LiveHint` type, `subscribe()`, `publish_from_connection()`
+- `src/runtime/sync_engine/session/control_plane.rs` — `send_forward_on_have_hints()`, `send_need_list_for_event_ids()`
+- `src/testutil/mod.rs` — `start_peers_runtime_affine()`
+- `tests/multi_peer_delivery_latency_perf_test.rs` — perf harness with per-event stage timing
+
 `low_mem_ios` requirements:
 - target steady-state RSS at or below `24 MiB` during sustained sync/projection.
 - keep memory bounded with strict in-flight caps (queue claims, decode buffers, batch sizes).

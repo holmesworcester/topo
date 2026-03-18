@@ -34,9 +34,11 @@ use crate::tuning::{
 };
 
 use super::connection_scope::{ConnectionRequestState, ConnectionResponseState};
+use crate::state::live_hints;
+
 use super::control_plane::{
     observe_discovery_hints_for_peer, refill_wanted_requests, send_discovery_hints_from_have_ids,
-    send_initial_neg_open, send_response_credit_bytes,
+    send_forward_on_have_hints, send_initial_neg_open, send_response_credit_bytes,
 };
 use super::coordinator::PeerCoord;
 use super::data_plane::{drain_pending_responses_to_data_stream, spawn_data_receiver};
@@ -45,8 +47,8 @@ use super::windowing::{
     encode_initial_neg_open, mark_outbound_full_completed, select_outbound_window, SyncWindowKind,
 };
 use super::{
-    negentropy_frame_size, send_idle_capture_enabled, CONTROL_POLL_TIMEOUT, DISCOVERY_ROUND_GAP,
-    INITIAL_CONTROL_PROGRESS_TIMEOUT,
+    discovery_round_gap, forward_on_have_enabled, negentropy_frame_size, send_idle_capture_enabled,
+    CONTROL_POLL_TIMEOUT, INITIAL_CONTROL_PROGRESS_TIMEOUT,
 };
 
 fn should_treat_as_startup_control_abort(
@@ -147,6 +149,7 @@ where
     let mut last_idle_marker = Instant::now();
     let credit_high = response_credit_high_watermark_bytes().max(1);
     let credit_low = response_credit_low_watermark_bytes().min(credit_high.saturating_sub(1));
+    let mut forward_hint_rx = live_hints::subscribe(db_path, recorded_by);
     let mut rounds_total = 0u64;
     let mut next_round_due = Instant::now();
     let mut observed_initial_control_progress = false;
@@ -481,6 +484,20 @@ where
                     }
                 }
 
+                if forward_on_have_enabled() {
+                    let hinted = send_forward_on_have_hints(
+                        &mut control,
+                        &timeline,
+                        &store,
+                        peer_id,
+                        &mut forward_hint_rx,
+                    )
+                    .await?;
+                    if hinted > 0 {
+                        last_activity = Instant::now();
+                    }
+                }
+
                 let send_stats = drain_pending_responses_to_data_stream(
                     response_state,
                     &timeline,
@@ -607,7 +624,7 @@ where
             if use_snapshot {
                 let _ = neg_db.execute("COMMIT", []);
             }
-            next_round_due = Instant::now() + DISCOVERY_ROUND_GAP;
+            next_round_due = Instant::now() + discovery_round_gap();
             continue;
         }
 
@@ -708,6 +725,20 @@ where
             )
             .await?;
             if requested_now > 0 {
+                last_activity = Instant::now();
+            }
+        }
+
+        if forward_on_have_enabled() {
+            let hinted = send_forward_on_have_hints(
+                &mut control,
+                &timeline,
+                &store,
+                peer_id,
+                &mut forward_hint_rx,
+            )
+            .await?;
+            if hinted > 0 {
                 last_activity = Instant::now();
             }
         }

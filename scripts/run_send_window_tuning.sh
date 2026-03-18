@@ -23,11 +23,11 @@ run_perf_case() {
 
   rm -f "$summary"
   if [[ "$claim" == "-" ]]; then
-    unset P7_EGRESS_CLAIM_COUNT P7_BULK_EGRESS_CLAIM_COUNT P7_EGRESS_SEND_QUANTUM_BYTES
+    unset TOPO_EGRESS_CLAIM_COUNT TOPO_BULK_EGRESS_CLAIM_COUNT TOPO_EGRESS_SEND_QUANTUM_BYTES
   else
-    export P7_EGRESS_CLAIM_COUNT="$claim"
-    export P7_BULK_EGRESS_CLAIM_COUNT="$bulk"
-    export P7_EGRESS_SEND_QUANTUM_BYTES="$quantum"
+    export TOPO_EGRESS_CLAIM_COUNT="$claim"
+    export TOPO_BULK_EGRESS_CLAIM_COUNT="$bulk"
+    export TOPO_EGRESS_SEND_QUANTUM_BYTES="$quantum"
   fi
 
   echo "== $label :: $test_name =="
@@ -61,11 +61,11 @@ run_double_send_case() {
   local quantum="$4"
 
   if [[ "$claim" == "-" ]]; then
-    unset P7_EGRESS_CLAIM_COUNT P7_BULK_EGRESS_CLAIM_COUNT P7_EGRESS_SEND_QUANTUM_BYTES
+    unset TOPO_EGRESS_CLAIM_COUNT TOPO_BULK_EGRESS_CLAIM_COUNT TOPO_EGRESS_SEND_QUANTUM_BYTES
   else
-    export P7_EGRESS_CLAIM_COUNT="$claim"
-    export P7_BULK_EGRESS_CLAIM_COUNT="$bulk"
-    export P7_EGRESS_SEND_QUANTUM_BYTES="$quantum"
+    export TOPO_EGRESS_CLAIM_COUNT="$claim"
+    export TOPO_BULK_EGRESS_CLAIM_COUNT="$bulk"
+    export TOPO_EGRESS_SEND_QUANTUM_BYTES="$quantum"
   fi
 
   echo "== $label :: double_send_test =="
@@ -82,11 +82,11 @@ run_lowmem_smoke() {
 
   export LOW_MEM_IOS=1
   if [[ "$claim" == "-" ]]; then
-    unset P7_EGRESS_CLAIM_COUNT P7_BULK_EGRESS_CLAIM_COUNT P7_EGRESS_SEND_QUANTUM_BYTES
+    unset TOPO_EGRESS_CLAIM_COUNT TOPO_BULK_EGRESS_CLAIM_COUNT TOPO_EGRESS_SEND_QUANTUM_BYTES
   else
-    export P7_EGRESS_CLAIM_COUNT="$claim"
-    export P7_BULK_EGRESS_CLAIM_COUNT="$bulk"
-    export P7_EGRESS_SEND_QUANTUM_BYTES="$quantum"
+    export TOPO_EGRESS_CLAIM_COUNT="$claim"
+    export TOPO_BULK_EGRESS_CLAIM_COUNT="$bulk"
+    export TOPO_EGRESS_SEND_QUANTUM_BYTES="$quantum"
   fi
 
   echo "== $label :: low_mem_ios_budget_smoke_10k =="

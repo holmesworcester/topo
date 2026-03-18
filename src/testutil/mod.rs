@@ -465,6 +465,7 @@ async fn sync_pair_until_transport_converged(
 /// once message/file traffic starts, the topology helpers should not need to
 /// widen auth or rely on stale/bootstrap aliases just to discover peers.
 pub async fn converge_workspace_transport_graph(peers: &[Peer]) {
+    crate::state::live_hints::init_forward_on_have_from_env();
     if peers.len() < 2 {
         return;
     }
@@ -2701,6 +2702,7 @@ pub fn start_peers(
     peer_a: &Peer,
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+    crate::state::live_hints::init_forward_on_have_from_env();
     let (cert_a, key_a) = peer_a.cert_and_key();
     let (cert_b, key_b) = peer_b.cert_and_key();
     let a_trusts_b = peer_b.spki_fingerprint();
@@ -2775,6 +2777,91 @@ pub fn start_peers(
     (a_handle, b_handle)
 }
 
+/// Like `start_peers` but creates Quinn endpoints on the session threads.
+///
+/// Quinn's `EndpointDriver` I/O task is spawned on whatever tokio runtime is
+/// current when the endpoint is constructed.  `start_peers` creates endpoints
+/// on the *caller's* runtime, so if the caller later blocks that runtime (e.g.
+/// with `thread::sleep`), all QUIC I/O stalls.  This variant defers endpoint
+/// construction to each session thread's own `current_thread` runtime, ensuring
+/// the I/O driver is always being polled while the session is active.
+pub fn start_peers_runtime_affine(
+    peer_a: &Peer,
+    peer_b: &Peer,
+) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+    crate::state::live_hints::init_forward_on_have_from_env();
+    let (cert_a, key_a) = peer_a.cert_and_key();
+    let (cert_b, key_b) = peer_b.cert_and_key();
+    let a_trusts_b = peer_b.spki_fingerprint();
+    let b_trusts_a = peer_a.spki_fingerprint();
+    let a_db = peer_a.db_path.clone();
+    let a_identity = peer_a.identity.clone();
+    let b_db = peer_b.db_path.clone();
+    let b_identity = peer_b.identity.clone();
+    let target_peer_id = current_transport_target(peer_a);
+    let (addr_tx, addr_rx) = std::sync::mpsc::channel::<SocketAddr>();
+
+    let a_handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let allow_a: Arc<crate::transport::DynamicAllowFn> =
+                Arc::new(move |peer_fp: &[u8; 32]| Ok(peer_fp == &a_trusts_b));
+            let listener_endpoint =
+                create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert_a, key_a, allow_a)
+                    .expect("failed to create listener endpoint");
+            let listener_addr = listener_endpoint
+                .local_addr()
+                .expect("failed to get listener addr");
+            addr_tx.send(listener_addr).expect("addr channel closed");
+            if let Err(e) = accept_loop(
+                &a_db,
+                &a_identity,
+                listener_endpoint,
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await
+            {
+                tracing::warn!("accept_loop exited: {}", e);
+            }
+        });
+    });
+
+    let b_handle = std::thread::spawn(move || {
+        let listener_addr = addr_rx.recv().expect("listener addr not received");
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let allow_b: Arc<crate::transport::DynamicAllowFn> =
+                Arc::new(move |peer_fp: &[u8; 32]| Ok(peer_fp == &b_trusts_a));
+            let connector_endpoint =
+                create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert_b, key_b, allow_b)
+                    .expect("failed to create connector endpoint");
+            if let Err(e) = connect_loop(
+                &b_db,
+                &b_identity,
+                connector_endpoint,
+                listener_addr,
+                &target_peer_id,
+                None,
+                noop_intro_spawner,
+                test_ingest_fns(),
+            )
+            .await
+            {
+                tracing::warn!("connect_loop exited: {}", e);
+            }
+        });
+    });
+
+    (a_handle, b_handle)
+}
+
 /// Start continuous sync between two peers using dynamic DB trust lookup.
 /// Trust is resolved from SQL at each TLS handshake, matching production
 /// behavior (`is_authorized_for_tenant`). Caller must already have real invite/bootstrap
@@ -2786,6 +2873,7 @@ pub fn start_peers_dynamic(
     peer_a: &Peer,
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
+    crate::state::live_hints::init_forward_on_have_from_env();
     use crate::db::transport_trust::is_authorized_for_tenant;
 
     let (cert_a, key_a) = peer_a.cert_and_key();
@@ -2969,6 +3057,7 @@ where
 ///
 /// Returns thread handles for all accept and connect loops.
 pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
+    crate::state::live_hints::init_forward_on_have_from_env();
     use crate::db::transport_trust::is_authorized_for_tenant;
 
     let n = peers.len();
@@ -3085,6 +3174,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
 ///
 /// Returns thread handles for all source accept_loops and sink connect loops.
 pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::JoinHandle<()>> {
+    crate::state::live_hints::init_forward_on_have_from_env();
     assert!(!sources.is_empty(), "need at least one source");
     for source in sources {
         assert_eq!(

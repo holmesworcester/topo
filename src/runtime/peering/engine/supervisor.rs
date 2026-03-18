@@ -273,8 +273,8 @@ impl RuntimeSupervisor {
         }
 
         // Bootstrap refresher emits into unified target ingress channel.
-        if env_flag("P7_DISABLE_PLACEHOLDER_AUTODIAL") {
-            warn!("BOOTSTRAP AUTODIAL DISABLED by P7_DISABLE_PLACEHOLDER_AUTODIAL");
+        if env_flag("TOPO_DISABLE_PLACEHOLDER_AUTODIAL") {
+            warn!("BOOTSTRAP AUTODIAL DISABLED by TOPO_DISABLE_PLACEHOLDER_AUTODIAL");
         } else {
             let db_path = self.db_path.clone();
             let ingress = target_tx.clone();
@@ -305,8 +305,8 @@ impl RuntimeSupervisor {
         let mut discovery_handles = Vec::new();
 
         #[cfg(feature = "discovery")]
-        if env_flag("P7_DISABLE_DISCOVERY") {
-            warn!("mDNS discovery disabled by P7_DISABLE_DISCOVERY");
+        if env_flag("TOPO_DISABLE_DISCOVERY") {
+            warn!("mDNS discovery disabled by TOPO_DISABLE_DISCOVERY");
         } else {
             let setup = super::discovery::prepare_mdns_discovery(
                 &self.tenants,

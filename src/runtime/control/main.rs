@@ -18,7 +18,7 @@ use topo::db::transport_creds::discover_local_tenants;
 use topo::db::{friendly_db_error, open_connection, schema::create_tables, sync_log};
 use topo::rpc::catalog;
 use topo::rpc::client::{rpc_call, rpc_call_raw, RpcClientError};
-use topo::rpc::protocol::{RpcMethod, UpnpAction, PROTOCOL_VERSION};
+use topo::rpc::protocol::{ForwardAction, RpcMethod, UpnpAction, PROTOCOL_VERSION};
 use topo::rpc::server::{run_rpc_server, DaemonState, RuntimeState};
 use topo::service;
 use topo::tuning::apply_low_mem_allocator_tuning;
@@ -429,6 +429,12 @@ enum Commands {
         action: Option<UpnpCommand>,
     },
 
+    /// Enable, disable, or query forward-on-have live hint delivery.
+    Forward {
+        #[command(subcommand)]
+        action: Option<ForwardCommand>,
+    },
+
     /// Manual sync controls: policy, round, request
     #[command(
         name = "sync",
@@ -483,6 +489,16 @@ enum UpnpCommand {
     /// Disable UPnP mode and stop advertising any prior UPnP address.
     Disable,
     /// Show the current UPnP mode and last mapping result.
+    Status,
+}
+
+#[derive(Subcommand)]
+enum ForwardCommand {
+    /// Enable forward-on-have live hint delivery.
+    Enable,
+    /// Disable forward-on-have live hint delivery.
+    Disable,
+    /// Show the current forward-on-have status.
     Status,
 }
 
@@ -2140,6 +2156,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let (idle_bind_reservation, resolved_bind) =
                 reserve_idle_bind(bind, start_uses_default_bind)?;
 
+            topo::state::live_hints::init_forward_on_have_from_env();
+
             let shutdown = Arc::new(AtomicBool::new(false));
             let shutdown_notify = Arc::new(tokio::sync::Notify::new());
             let state = Arc::new(DaemonState::new(db));
@@ -3278,6 +3296,24 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     );
                 }
             }
+        }
+
+        Commands::Forward { action } => {
+            let action = match action.unwrap_or(ForwardCommand::Status) {
+                ForwardCommand::Enable => ForwardAction::Enable,
+                ForwardCommand::Disable => ForwardAction::Disable,
+                ForwardCommand::Status => ForwardAction::Status,
+            };
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::Forward { action },
+            )?;
+            let enabled = data["forward_on_have"].as_bool().unwrap_or(false);
+            println!(
+                "forward-on-have: {}",
+                if enabled { "enabled" } else { "disabled" }
+            );
         }
 
         Commands::Sync { action } => {

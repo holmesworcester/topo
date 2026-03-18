@@ -67,8 +67,8 @@ pub fn bulk_write_batch_cap() -> usize {
 }
 
 pub fn response_send_quantum_bytes() -> usize {
-    if let Some(v) = read_usize_env("P7_RESPONSE_SEND_QUANTUM_BYTES")
-        .or_else(|| read_usize_env("P7_EGRESS_SEND_QUANTUM_BYTES"))
+    if let Some(v) = read_usize_env("TOPO_RESPONSE_SEND_QUANTUM_BYTES")
+        .or_else(|| read_usize_env("TOPO_EGRESS_SEND_QUANTUM_BYTES"))
     {
         return v.max(1);
     }
@@ -120,7 +120,7 @@ pub fn wanted_high_watermark() -> usize {
     if low_mem_mode() {
         low_mem_wanted_high_watermark()
     } else {
-        read_usize_env("P7_WANTED_HIGH_WATERMARK").unwrap_or(512)
+        read_usize_env("TOPO_WANTED_HIGH_WATERMARK").unwrap_or(512)
     }
 }
 
@@ -128,7 +128,7 @@ pub fn wanted_low_watermark() -> usize {
     if low_mem_mode() {
         low_mem_wanted_low_watermark()
     } else {
-        read_usize_env("P7_WANTED_LOW_WATERMARK").unwrap_or(128)
+        read_usize_env("TOPO_WANTED_LOW_WATERMARK").unwrap_or(128)
     }
 }
 
@@ -136,7 +136,7 @@ pub fn wanted_refill_quantum() -> usize {
     if low_mem_mode() {
         read_usize_env("LOW_MEM_WANTED_REFILL_QUANTUM").unwrap_or(4)
     } else {
-        read_usize_env("P7_WANTED_REFILL_QUANTUM").unwrap_or(64)
+        read_usize_env("TOPO_WANTED_REFILL_QUANTUM").unwrap_or(64)
     }
 }
 
@@ -150,7 +150,7 @@ pub fn response_credit_high_watermark_bytes() -> usize {
         // 2 MiB allows 7-8 file slices (~262 KiB each) in flight, better
         // utilizing network bandwidth. Must be at least 2× file-slice size
         // to avoid the credit dead zone (remainder < slice but > low watermark).
-        read_usize_env("P7_RESPONSE_CREDIT_HIGH_WATERMARK_BYTES").unwrap_or(2 * 1024 * 1024)
+        read_usize_env("TOPO_RESPONSE_CREDIT_HIGH_WATERMARK_BYTES").unwrap_or(2 * 1024 * 1024)
     }
 }
 
@@ -161,7 +161,7 @@ pub fn response_credit_low_watermark_bytes() -> usize {
         // Triggers credit refill when outstanding is below 2 file slices.
         // At 512 KiB the responder refills aggressively, keeping the
         // request pipeline full.
-        read_usize_env("P7_RESPONSE_CREDIT_LOW_WATERMARK_BYTES").unwrap_or(512 * 1024)
+        read_usize_env("TOPO_RESPONSE_CREDIT_LOW_WATERMARK_BYTES").unwrap_or(512 * 1024)
     }
 }
 
@@ -171,7 +171,7 @@ pub fn request_inflight_ttl_ms() -> i64 {
             .unwrap_or(5_000)
             .max(1) as i64
     } else {
-        read_usize_env("P7_REQUEST_INFLIGHT_TTL_MS")
+        read_usize_env("TOPO_REQUEST_INFLIGHT_TTL_MS")
             .unwrap_or(60_000)
             .max(1) as i64
     }

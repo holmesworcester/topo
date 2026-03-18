@@ -126,6 +126,11 @@ pub enum RpcMethod {
         #[serde(default = "default_upnp_action")]
         action: UpnpAction,
     },
+    /// Enable, disable, or inspect forward-on-have live hint delivery.
+    Forward {
+        #[serde(default = "default_forward_action")]
+        action: ForwardAction,
+    },
     /// Combined view: sidebar (workspace, users, tenants) + messages with inline reactions.
     View {
         #[serde(default = "default_view_limit")]
@@ -226,6 +231,18 @@ pub enum UpnpAction {
 
 fn default_upnp_action() -> UpnpAction {
     UpnpAction::Enable
+}
+
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum ForwardAction {
+    Enable,
+    Disable,
+    Status,
+}
+
+fn default_forward_action() -> ForwardAction {
+    ForwardAction::Status
 }
 
 fn default_intro_ttl_ms() -> u64 {

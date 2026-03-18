@@ -787,12 +787,12 @@ impl Drop for StarTopologyBench {
 /// pattern where the workspace creator uses `start_discovery_daemon`).
 fn start_hub_daemon(db: &str, tmpdir: &std::path::Path) -> HarnessDaemon {
     let extra_env = vec![
-        ("P7_TEST_DISCOVERY_LOOPBACK".to_string(), "1".to_string()),
-        // Override P7_DISABLE_DISCOVERY with an empty string so hub mDNS is
+        ("TOPO_TEST_DISCOVERY_LOOPBACK".to_string(), "1".to_string()),
+        // Override TOPO_DISABLE_DISCOVERY with an empty string so hub mDNS is
         // not suppressed when the test process inherits this variable from the
         // sandbox or test runner.  env_flag() in supervisor.rs only returns
         // true for "1", "true", or "yes"; empty string evaluates to false.
-        ("P7_DISABLE_DISCOVERY".to_string(), "".to_string()),
+        ("TOPO_DISABLE_DISCOVERY".to_string(), "".to_string()),
     ];
 
     if !perf_debug_env("PERF_DAEMON_LOGS") {
