@@ -288,6 +288,24 @@ Peer-to-peer QUIC sync over localhost with negentropy reconciliation (daemon-bas
 
 ---
 
+# Realistic Network Sync (2k bidirectional)
+
+Same QUIC sync, but through a UDP traffic shaper modelling real-world link conditions (bandwidth cap, latency, jitter, packet loss).
+
+| Profile | Bandwidth | RTT | Loss | Wall Time | Msgs/s | Peak VmHWM |
+|---------|----------:|----:|-----:|----------:|-------:|-----------:|
+| Cable | 35 Mbps | 24ms | 0.2% | 1.32s | 1,514 | 25.6 MiB |
+| DSL | 3 Mbps | 44ms | 0.3% | 7.13s | 281 | 25.2 MiB |
+| Mobile | 15 Mbps | 80ms | 0.8% | 7.03s | 285 | 24.3 MiB |
+| Slow Mobile | 2 Mbps | 140ms | 1.5% | 20.47s | 98 | 26.5 MiB |
+| Starlink | 15 Mbps | 70ms | 0.5% | 6.33s | 316 | 23.3 MiB |
+
+- All profiles complete successfully, including degraded conditions (slow mobile: 2 Mbps, 140ms RTT, 1.5% loss)
+- Memory stays flat ~24 MiB across all profiles — no protocol-driven memory blowup
+- Throughput scales with link quality as expected; not artificially bottlenecked
+
+---
+
 # File Attachment Throughput
 
 Local encode + store + project for 256 KiB ciphertext slices (no sync).

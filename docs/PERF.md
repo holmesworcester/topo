@@ -17,6 +17,7 @@
 # `full` includes topo cascade at 10k, 50k, and 500k.
 python3 scripts/run_perf_serial.py core
 python3 scripts/run_perf_serial.py lowmem
+python3 scripts/run_perf_serial.py network
 python3 scripts/run_perf_serial.py full
 
 # Optional: run serial perf suite without writing docs/PERF.md
