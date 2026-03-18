@@ -29,6 +29,8 @@ pub struct NegentropyStorageSqlite<'a> {
     ts_max_exclusive: Option<i64>,
     /// Cached size (computed once per sync)
     cached_size: RefCell<Option<usize>>,
+    /// Item count at last rebuild — used to skip rebuild when unchanged.
+    last_rebuilt_count: RefCell<Option<usize>>,
 }
 
 impl<'a> NegentropyStorageSqlite<'a> {
@@ -49,6 +51,7 @@ impl<'a> NegentropyStorageSqlite<'a> {
             ts_min,
             ts_max_exclusive,
             cached_size: RefCell::new(None),
+            last_rebuilt_count: RefCell::new(None),
         }
     }
 
@@ -72,6 +75,21 @@ impl<'a> NegentropyStorageSqlite<'a> {
     /// Call before sync when items have been inserted.
     pub fn rebuild_blocks(&self) -> Result<(), rusqlite::Error> {
         let start = std::time::Instant::now();
+
+        // Quick check: if the item count hasn't changed since the last
+        // rebuild, the block index is still valid — skip the O(N) scan.
+        let current_count = self.count_items()?;
+        if let Some(prev) = *self.last_rebuilt_count.borrow() {
+            if current_count == prev {
+                *self.cached_size.borrow_mut() = Some(current_count);
+                tracing::debug!(
+                    "rebuild_blocks: skipped (count unchanged at {})",
+                    current_count
+                );
+                return Ok(());
+            }
+        }
+
         self.ensure_session_table()?;
 
         // Clear existing session blocks
@@ -112,8 +130,9 @@ impl<'a> NegentropyStorageSqlite<'a> {
             row_idx += 1;
         }
 
-        // Update cached size
+        // Update cached state
         *self.cached_size.borrow_mut() = Some(row_idx);
+        *self.last_rebuilt_count.borrow_mut() = Some(row_idx);
 
         tracing::info!(
             "rebuild_blocks: {} items, {} blocks in {}ms",
@@ -123,6 +142,25 @@ impl<'a> NegentropyStorageSqlite<'a> {
         );
 
         Ok(())
+    }
+
+    /// Cheap item count for the current scope — used to detect whether a
+    /// rebuild is needed without scanning all rows.
+    fn count_items(&self) -> Result<usize, rusqlite::Error> {
+        let count: i64 = self.conn.query_row(
+            "SELECT COUNT(*)
+             FROM neg_items
+             WHERE workspace_id = :workspace_id
+               AND (:ts_min IS NULL OR ts >= :ts_min)
+               AND (:ts_max IS NULL OR ts < :ts_max)",
+            rusqlite::named_params! {
+                ":workspace_id": &self.workspace_id,
+                ":ts_min": self.ts_min,
+                ":ts_max": self.ts_max_exclusive,
+            },
+            |row| row.get(0),
+        )?;
+        Ok(count as usize)
     }
 
     /// Get the (ts, id) key for a given block index
