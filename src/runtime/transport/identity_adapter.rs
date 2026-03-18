@@ -1,4 +1,4 @@
-//! Concrete `TransportIdentityAdapter` implementation.
+//! Concrete `TransportIdentityMaterializer` implementation.
 //!
 //! This is a **pure materializer**: it generates cert/key bytes from
 //! event-derived signing keys and stores them in `local_transport_creds`.
@@ -9,11 +9,11 @@ use rusqlite::Connection;
 use rusqlite::OptionalExtension;
 
 use crate::contracts::transport_identity_contract::{
-    TransportIdentityAdapter, TransportIdentityError, TransportIdentityIntent,
+    TransportIdentityError, TransportIdentityMaterializer, TransportIdentitySpec,
 };
 
-/// Production adapter backed by `transport::identity` install functions.
-pub struct ConcreteTransportIdentityAdapter;
+/// Production materializer backed by `transport::identity` install functions.
+pub struct ConcreteTransportIdentityMaterializer;
 
 fn parse_signing_key(
     key_bytes: Vec<u8>,
@@ -29,14 +29,14 @@ fn parse_signing_key(
     Ok(ed25519_dalek::SigningKey::from_bytes(&arr))
 }
 
-impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
-    fn apply_intent(
+impl TransportIdentityMaterializer for ConcreteTransportIdentityMaterializer {
+    fn materialize(
         &self,
         conn: &Connection,
-        intent: TransportIdentityIntent,
+        spec: TransportIdentitySpec,
     ) -> Result<String, TransportIdentityError> {
-        match intent {
-            TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+        match spec {
+            TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret {
                 recorded_by,
                 invite_event_id,
             } => {
@@ -69,7 +69,7 @@ impl TransportIdentityAdapter for ConcreteTransportIdentityAdapter {
                     .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))?;
                 Ok(peer_id)
             }
-            TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+            TransportIdentitySpec::InstallPeerSharedIdentityFromSigner {
                 recorded_by,
                 signer_event_id,
             } => {
@@ -139,14 +139,14 @@ mod tests {
     fn bootstrap_install_sets_bootstrap_source() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
-        let adapter = ConcreteTransportIdentityAdapter;
+        let adapter = ConcreteTransportIdentityMaterializer;
         let recorded_by = "tenant-bootstrap";
         let invite_event_id = [7u8; 32];
         insert_invite_secret(&conn, recorded_by, invite_event_id, [7u8; 32]);
 
-        let result = adapter.apply_intent(
+        let result = adapter.materialize(
             &conn,
-            TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+            TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret {
                 recorded_by: recorded_by.to_string(),
                 invite_event_id,
             },
@@ -167,7 +167,7 @@ mod tests {
     fn bootstrap_install_rejected_after_peershared_for_same_peer() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
-        let adapter = ConcreteTransportIdentityAdapter;
+        let adapter = ConcreteTransportIdentityMaterializer;
         let recorded_by = "tenant-bootstrap";
         let invite_event_id = [9u8; 32];
 
@@ -176,9 +176,9 @@ mod tests {
         install_peer_key_transport_identity(&conn, &peer_key).unwrap();
         insert_invite_secret(&conn, recorded_by, invite_event_id, same_key);
 
-        let result = adapter.apply_intent(
+        let result = adapter.materialize(
             &conn,
-            TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+            TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret {
                 recorded_by: recorded_by.to_string(),
                 invite_event_id,
             },
@@ -197,7 +197,7 @@ mod tests {
     fn bootstrap_install_allowed_when_other_peer_has_peershared() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
-        let adapter = ConcreteTransportIdentityAdapter;
+        let adapter = ConcreteTransportIdentityMaterializer;
         let recorded_by = "tenant-bootstrap";
         let invite_event_id = [11u8; 32];
 
@@ -206,9 +206,9 @@ mod tests {
         insert_invite_secret(&conn, recorded_by, invite_event_id, [11u8; 32]);
 
         // Different key => different transport peer_id, allowed in multi-tenant mode.
-        let result = adapter.apply_intent(
+        let result = adapter.materialize(
             &conn,
-            TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+            TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret {
                 recorded_by: recorded_by.to_string(),
                 invite_event_id,
             },
@@ -219,20 +219,20 @@ mod tests {
         );
     }
 
-    /// Verifies that apply_intent no longer sets local_transport_targets.
+    /// Verifies that materialize no longer sets local_transport_targets.
     /// Target recording is now the projection pipeline's job (write_exec.rs).
     #[test]
     fn adapter_does_not_set_transport_target() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
-        let adapter = ConcreteTransportIdentityAdapter;
+        let adapter = ConcreteTransportIdentityMaterializer;
         let recorded_by = "tenant-no-target";
         let invite_event_id = [3u8; 32];
         insert_invite_secret(&conn, recorded_by, invite_event_id, [3u8; 32]);
 
-        let result = adapter.apply_intent(
+        let result = adapter.materialize(
             &conn,
-            TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+            TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret {
                 recorded_by: recorded_by.to_string(),
                 invite_event_id,
             },

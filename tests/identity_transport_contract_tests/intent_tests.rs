@@ -1,11 +1,11 @@
 //! Contract tests: verify exact intents emitted by the adapter and projector.
 
 use topo::contracts::transport_identity_contract::{
-    TransportIdentityAdapter, TransportIdentityError, TransportIdentityIntent,
+    TransportIdentityMaterializer, TransportIdentityError, TransportIdentitySpec,
 };
-use topo::transport::identity_adapter::ConcreteTransportIdentityAdapter;
+use topo::transport::identity_adapter::ConcreteTransportIdentityMaterializer;
 
-use super::fake_adapter::FakeTransportIdentityAdapter;
+use super::fake_adapter::FakeTransportIdentityMaterializer;
 
 fn setup_db() -> rusqlite::Connection {
     let conn = rusqlite::Connection::open_in_memory().unwrap();
@@ -18,7 +18,7 @@ fn setup_db() -> rusqlite::Connection {
 #[test]
 fn concrete_adapter_install_bootstrap_from_invite_secret_roundtrip() {
     let conn = setup_db();
-    let adapter = ConcreteTransportIdentityAdapter;
+    let adapter = ConcreteTransportIdentityMaterializer;
     let recorded_by = "tenant-bootstrap";
     let invite_event_id = [7u8; 32];
     let invite_eid_b64 = topo::crypto::event_id_to_base64(&invite_event_id);
@@ -37,9 +37,9 @@ fn concrete_adapter_install_bootstrap_from_invite_secret_roundtrip() {
     .unwrap();
 
     let peer_id = adapter
-        .apply_intent(
+        .materialize(
             &conn,
-            TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+            TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret {
                 recorded_by: recorded_by.to_string(),
                 invite_event_id,
             },
@@ -48,9 +48,9 @@ fn concrete_adapter_install_bootstrap_from_invite_secret_roundtrip() {
 
     // Verify deterministic: same key -> same peer_id.
     let peer_id2 = adapter
-        .apply_intent(
+        .materialize(
             &conn,
-            TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+            TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret {
                 recorded_by: recorded_by.to_string(),
                 invite_event_id,
             },
@@ -63,7 +63,7 @@ fn concrete_adapter_install_bootstrap_from_invite_secret_roundtrip() {
 #[test]
 fn concrete_adapter_install_peer_shared_from_signer() {
     let conn = setup_db();
-    let adapter = ConcreteTransportIdentityAdapter;
+    let adapter = ConcreteTransportIdentityMaterializer;
     let recorded_by = "test-peer";
 
     // Store a peer_shared key in peer_secrets
@@ -78,9 +78,9 @@ fn concrete_adapter_install_peer_shared_from_signer() {
     .unwrap();
 
     let peer_id = adapter
-        .apply_intent(
+        .materialize(
             &conn,
-            TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+            TransportIdentitySpec::InstallPeerSharedIdentityFromSigner {
                 recorded_by: recorded_by.to_string(),
                 signer_event_id,
             },
@@ -97,7 +97,7 @@ fn concrete_adapter_install_peer_shared_from_signer() {
 #[test]
 fn concrete_adapter_install_bootstrap_from_invite_secret() {
     let conn = setup_db();
-    let adapter = ConcreteTransportIdentityAdapter;
+    let adapter = ConcreteTransportIdentityMaterializer;
     let recorded_by = "test-peer";
     let invite_event_id = [6u8; 32];
     let invite_eid_b64 = topo::crypto::event_id_to_base64(&invite_event_id);
@@ -116,9 +116,9 @@ fn concrete_adapter_install_bootstrap_from_invite_secret() {
     .unwrap();
 
     let peer_id = adapter
-        .apply_intent(
+        .materialize(
             &conn,
-            TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+            TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret {
                 recorded_by: recorded_by.to_string(),
                 invite_event_id,
             },
@@ -130,11 +130,11 @@ fn concrete_adapter_install_bootstrap_from_invite_secret() {
 #[test]
 fn concrete_adapter_invite_secret_not_found_error() {
     let conn = setup_db();
-    let adapter = ConcreteTransportIdentityAdapter;
+    let adapter = ConcreteTransportIdentityMaterializer;
 
-    let result = adapter.apply_intent(
+    let result = adapter.materialize(
         &conn,
-        TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+        TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret {
             recorded_by: "nonexistent".to_string(),
             invite_event_id: [4u8; 32],
         },
@@ -152,11 +152,11 @@ fn concrete_adapter_invite_secret_not_found_error() {
 #[test]
 fn concrete_adapter_signer_not_found_error() {
     let conn = setup_db();
-    let adapter = ConcreteTransportIdentityAdapter;
+    let adapter = ConcreteTransportIdentityMaterializer;
 
-    let result = adapter.apply_intent(
+    let result = adapter.materialize(
         &conn,
-        TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+        TransportIdentitySpec::InstallPeerSharedIdentityFromSigner {
             recorded_by: "nonexistent".to_string(),
             signer_event_id: [0u8; 32],
         },
@@ -174,7 +174,7 @@ fn concrete_adapter_signer_not_found_error() {
 #[test]
 fn concrete_adapter_invalid_key_material_error() {
     let conn = setup_db();
-    let adapter = ConcreteTransportIdentityAdapter;
+    let adapter = ConcreteTransportIdentityMaterializer;
     let recorded_by = "test-peer";
     let signer_event_id = [11u8; 32];
     let signer_eid_b64 = topo::crypto::event_id_to_base64(&signer_event_id);
@@ -187,9 +187,9 @@ fn concrete_adapter_invalid_key_material_error() {
     )
     .unwrap();
 
-    let result = adapter.apply_intent(
+    let result = adapter.materialize(
         &conn,
-        TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+        TransportIdentitySpec::InstallPeerSharedIdentityFromSigner {
             recorded_by: recorded_by.to_string(),
             signer_event_id,
         },
@@ -213,38 +213,38 @@ fn concrete_adapter_invalid_key_material_error() {
 #[test]
 fn fake_adapter_records_intents() {
     let conn = setup_db();
-    let fake = FakeTransportIdentityAdapter::new("fake-peer-id");
+    let fake = FakeTransportIdentityMaterializer::new("fake-peer-id");
 
-    fake.apply_intent(
+    fake.materialize(
         &conn,
-        TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+        TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret {
             recorded_by: "rb1".to_string(),
             invite_event_id: [1u8; 32],
         },
     )
     .unwrap();
 
-    fake.apply_intent(
+    fake.materialize(
         &conn,
-        TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+        TransportIdentitySpec::InstallPeerSharedIdentityFromSigner {
             recorded_by: "rb2".to_string(),
             signer_event_id: [2u8; 32],
         },
     )
     .unwrap();
 
-    fake.apply_intent(
+    fake.materialize(
         &conn,
-        TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+        TransportIdentitySpec::InstallPeerSharedIdentityFromSigner {
             recorded_by: "rb3".to_string(),
             signer_event_id: [3u8; 32],
         },
     )
     .unwrap();
 
-    fake.apply_intent(
+    fake.materialize(
         &conn,
-        TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+        TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret {
             recorded_by: "rb4".to_string(),
             invite_event_id: [4u8; 32],
         },
@@ -255,28 +255,28 @@ fn fake_adapter_records_intents() {
     assert_eq!(intents.len(), 4);
     assert_eq!(
         intents[0],
-        TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+        TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret {
             recorded_by: "rb1".to_string(),
             invite_event_id: [1u8; 32],
         }
     );
     assert_eq!(
         intents[1],
-        TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+        TransportIdentitySpec::InstallPeerSharedIdentityFromSigner {
             recorded_by: "rb2".to_string(),
             signer_event_id: [2u8; 32],
         }
     );
     assert_eq!(
         intents[2],
-        TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+        TransportIdentitySpec::InstallPeerSharedIdentityFromSigner {
             recorded_by: "rb3".to_string(),
             signer_event_id: [3u8; 32],
         }
     );
     assert_eq!(
         intents[3],
-        TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+        TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret {
             recorded_by: "rb4".to_string(),
             invite_event_id: [4u8; 32],
         }
@@ -286,12 +286,12 @@ fn fake_adapter_records_intents() {
 #[test]
 fn fake_adapter_returns_configured_peer_id() {
     let conn = setup_db();
-    let fake = FakeTransportIdentityAdapter::new("custom-peer-id-42");
+    let fake = FakeTransportIdentityMaterializer::new("custom-peer-id-42");
 
     let result = fake
-        .apply_intent(
+        .materialize(
             &conn,
-            TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+            TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret {
                 recorded_by: "rb0".to_string(),
                 invite_event_id: [0u8; 32],
             },

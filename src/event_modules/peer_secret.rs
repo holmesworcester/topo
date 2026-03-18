@@ -75,7 +75,7 @@ pub fn encode_peer_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
 // === Projector (event-module locality) ===
 
-use crate::contracts::transport_identity_contract::TransportIdentityIntent;
+use crate::contracts::transport_identity_contract::TransportIdentitySpec;
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 use rusqlite::Connection;
@@ -99,7 +99,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 /// Pure projector: PeerSecret -> peer_secrets table (one row per event).
-/// Always emits ApplyTransportIdentityIntent(InstallPeerSharedIdentityFromSigner).
+/// Always emits MaterializeTransportIdentity(InstallPeerSharedIdentityFromSigner).
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
@@ -131,8 +131,8 @@ pub fn project_pure(
                 SqlVal::Int(e.created_at_ms as i64),
             ],
         }],
-        vec![EmitCommand::ApplyTransportIdentityIntent {
-            intent: TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+        vec![EmitCommand::MaterializeTransportIdentity {
+            spec: TransportIdentitySpec::InstallPeerSharedIdentityFromSigner {
                 recorded_by: recorded_by.to_string(),
                 signer_event_id: e.signer_event_id,
             },

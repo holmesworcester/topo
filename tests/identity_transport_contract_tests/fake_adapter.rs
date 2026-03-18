@@ -1,21 +1,21 @@
-//! Fake TransportIdentityAdapter for testing intent emission without
+//! Fake `TransportIdentityMaterializer` for testing spec emission without
 //! real cert/key materialisation.
 
 use std::cell::RefCell;
 
 use rusqlite::Connection;
 use topo::contracts::transport_identity_contract::{
-    TransportIdentityAdapter, TransportIdentityError, TransportIdentityIntent,
+    TransportIdentityMaterializer, TransportIdentityError, TransportIdentitySpec,
 };
 
-/// Records intents applied through the adapter for later assertion.
-pub struct FakeTransportIdentityAdapter {
-    intents: RefCell<Vec<TransportIdentityIntent>>,
-    /// Fixed peer_id to return from apply_intent.
+/// Records specs applied through the materializer for later assertion.
+pub struct FakeTransportIdentityMaterializer {
+    intents: RefCell<Vec<TransportIdentitySpec>>,
+    /// Fixed peer_id to return from materialize.
     pub return_peer_id: String,
 }
 
-impl FakeTransportIdentityAdapter {
+impl FakeTransportIdentityMaterializer {
     pub fn new(return_peer_id: &str) -> Self {
         Self {
             intents: RefCell::new(Vec::new()),
@@ -23,18 +23,18 @@ impl FakeTransportIdentityAdapter {
         }
     }
 
-    pub fn applied_intents(&self) -> Vec<TransportIdentityIntent> {
+    pub fn applied_intents(&self) -> Vec<TransportIdentitySpec> {
         self.intents.borrow().clone()
     }
 }
 
-impl TransportIdentityAdapter for FakeTransportIdentityAdapter {
-    fn apply_intent(
+impl TransportIdentityMaterializer for FakeTransportIdentityMaterializer {
+    fn materialize(
         &self,
         _conn: &Connection,
-        intent: TransportIdentityIntent,
+        spec: TransportIdentitySpec,
     ) -> Result<String, TransportIdentityError> {
-        self.intents.borrow_mut().push(intent);
+        self.intents.borrow_mut().push(spec);
         Ok(self.return_peer_id.clone())
     }
 }

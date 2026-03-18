@@ -1,7 +1,7 @@
 //! Projection command path tests: verify that peer_secret projection
-//! emits the correct ApplyTransportIdentityIntent for peer_shared signer key material.
+//! emits the correct MaterializeTransportIdentity for peer_shared signer key material.
 
-use topo::contracts::transport_identity_contract::TransportIdentityIntent;
+use topo::contracts::transport_identity_contract::TransportIdentitySpec;
 use topo::event_modules::peer_secret::PeerSecretEvent;
 use topo::event_modules::ParsedEvent;
 use topo::projection::contract::EmitCommand;
@@ -17,7 +17,7 @@ fn project(recorded_by: &str, event: &ParsedEvent) -> Vec<EmitCommand> {
 }
 
 #[test]
-fn peer_secret_emits_install_intent() {
+fn peer_secret_emits_install_spec() {
     let signer_event_id = [5u8; 32];
     let event = ParsedEvent::PeerSecret(PeerSecretEvent {
         created_at_ms: 1000,
@@ -30,18 +30,18 @@ fn peer_secret_emits_install_intent() {
     assert_eq!(
         cmds.len(),
         1,
-        "peer_secret should emit exactly one transport intent"
+        "peer_secret should emit exactly one transport spec"
     );
-    let intent = cmds
+    let spec = cmds
         .iter()
         .find_map(|c| match c {
-            EmitCommand::ApplyTransportIdentityIntent { intent } => Some(intent),
+            EmitCommand::MaterializeTransportIdentity { spec } => Some(spec),
             _ => None,
         })
-        .expect("missing ApplyTransportIdentityIntent");
+        .expect("missing MaterializeTransportIdentity");
     assert_eq!(
-        *intent,
-        TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+        *spec,
+        TransportIdentitySpec::InstallPeerSharedIdentityFromSigner {
             recorded_by: "test-peer".to_string(),
             signer_event_id,
         }
@@ -49,7 +49,7 @@ fn peer_secret_emits_install_intent() {
 }
 
 #[test]
-fn intent_carries_correct_recorded_by() {
+fn spec_carries_correct_recorded_by() {
     let event = ParsedEvent::PeerSecret(PeerSecretEvent {
         created_at_ms: 1000,
         signer_event_id: [9u8; 32],
@@ -57,23 +57,23 @@ fn intent_carries_correct_recorded_by() {
     });
 
     let cmds = project("specific-recorded-by-value", &event);
-    let intent = cmds
+    let spec = cmds
         .iter()
         .find_map(|c| match c {
-            EmitCommand::ApplyTransportIdentityIntent { intent } => Some(intent),
+            EmitCommand::MaterializeTransportIdentity { spec } => Some(spec),
             _ => None,
         })
-        .expect("missing ApplyTransportIdentityIntent");
-    match intent {
-        TransportIdentityIntent::InstallPeerSharedIdentityFromSigner { recorded_by, .. } => {
+        .expect("missing MaterializeTransportIdentity");
+    match spec {
+        TransportIdentitySpec::InstallPeerSharedIdentityFromSigner { recorded_by, .. } => {
             assert_eq!(recorded_by, "specific-recorded-by-value");
         }
-        other => panic!("wrong intent variant: {:?}", other),
+        other => panic!("wrong spec variant: {:?}", other),
     }
 }
 
 #[test]
-fn no_duplicate_intents_emitted() {
+fn no_duplicate_specs_emitted() {
     let event = ParsedEvent::PeerSecret(PeerSecretEvent {
         created_at_ms: 1000,
         signer_event_id: [7u8; 32],
@@ -81,12 +81,12 @@ fn no_duplicate_intents_emitted() {
     });
 
     let cmds = project("rb", &event);
-    let intent_count = cmds
+    let spec_count = cmds
         .iter()
-        .filter(|c| matches!(c, EmitCommand::ApplyTransportIdentityIntent { .. }))
+        .filter(|c| matches!(c, EmitCommand::MaterializeTransportIdentity { .. }))
         .count();
     assert_eq!(
-        intent_count, 1,
-        "must emit exactly one intent, no duplicates"
+        spec_count, 1,
+        "must emit exactly one spec, no duplicates"
     );
 }

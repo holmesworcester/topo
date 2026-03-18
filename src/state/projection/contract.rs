@@ -44,10 +44,10 @@ pub enum EmitCommand {
     RetryFileSliceGuards { file_id: String },
     /// Record a guard-block for a file_slice awaiting its descriptor.
     RecordFileSliceGuardBlock { file_id: String, event_id: String },
-    /// Apply a typed transport identity transition via the adapter boundary.
+    /// Materialise a transport identity transition via the materializer boundary.
     /// Replaces the former ad-hoc RefreshTransportCreds marker.
-    ApplyTransportIdentityIntent {
-        intent: crate::contracts::transport_identity_contract::TransportIdentityIntent,
+    MaterializeTransportIdentity {
+        spec: crate::contracts::transport_identity_contract::TransportIdentitySpec,
     },
     /// Emit a canonical deterministic event blob through the normal event
     /// pipeline (events + recorded_events + project_one).

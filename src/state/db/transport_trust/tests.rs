@@ -288,26 +288,30 @@ fn test_list_authorized_transport_rows_reports_projected_provenance() {
     .unwrap();
 
     let accepted_spki: [u8; 32] = [0x44; 32];
-    record_invite_bootstrap_trust(
-        &conn,
-        recorded_by,
-        "ia1",
-        "invite1",
-        "workspace1",
-        "127.0.0.1:4433",
-        &accepted_spki,
-    )
-    .unwrap();
-    record_invite_bootstrap_trust(
-        &conn,
-        recorded_by,
-        "ia1",
-        "invite1",
-        "workspace1",
-        "127.0.0.1:4434",
-        &accepted_spki,
-    )
-    .unwrap();
+    // Capture a single timestamp for both rows so SELECT DISTINCT collapses them.
+    // Two separate record_invite_bootstrap_trust calls can straddle a millisecond
+    // boundary, giving different expires_at values and 2 DISTINCT rows instead of 1.
+    let ts: i64 = now_ms_i64();
+    let expires: i64 = ts + ACCEPTED_INVITE_BOOTSTRAP_TTL_MS;
+    for addr in &["127.0.0.1:4433", "127.0.0.1:4434"] {
+        conn.execute(
+            "INSERT OR IGNORE INTO invite_bootstrap_trust (
+                recorded_by, invite_accepted_event_id, invite_event_id, workspace_id,
+                bootstrap_addr, bootstrap_spki_fingerprint, accepted_at, expires_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+            rusqlite::params![
+                recorded_by,
+                "ia1",
+                "invite1",
+                "workspace1",
+                addr,
+                accepted_spki.as_slice(),
+                ts,
+                expires
+            ],
+        )
+        .unwrap();
+    }
 
     let pending_spki: [u8; 32] = [0x55; 32];
     record_pending_invite_bootstrap_trust(

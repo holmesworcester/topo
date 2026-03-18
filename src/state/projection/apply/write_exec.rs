@@ -132,24 +132,25 @@ pub(crate) fn execute_emit_commands(
                     rusqlite::params![recorded_by, file_id, event_id],
                 )?;
             }
-            EmitCommand::ApplyTransportIdentityIntent { intent } => {
+            EmitCommand::MaterializeTransportIdentity { spec } => {
                 use crate::contracts::transport_identity_contract::{
-                    TransportIdentityAdapter, TransportIdentityIntent,
+                    TransportIdentityMaterializer, TransportIdentitySpec,
                 };
-                let adapter = crate::transport::identity_adapter::ConcreteTransportIdentityAdapter;
-                let peer_id = adapter
-                    .apply_intent(conn, intent.clone())
+                let materializer =
+                    crate::transport::identity_adapter::ConcreteTransportIdentityMaterializer;
+                let peer_id = materializer
+                    .materialize(conn, spec.clone())
                     .map_err(|e| -> Box<dyn std::error::Error> { Box::new(e) })?;
-                // Target ownership is projection-pipeline-owned, not adapter-owned.
-                let (tenant_id, source) = match &intent {
-                    TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+                // Target ownership is projection-pipeline-owned, not materializer-owned.
+                let (tenant_id, source) = match &spec {
+                    TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret {
                         recorded_by,
                         ..
                     } => (
                         recorded_by.as_str(),
                         crate::db::transport_creds::CRED_SOURCE_BOOTSTRAP,
                     ),
-                    TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+                    TransportIdentitySpec::InstallPeerSharedIdentityFromSigner {
                         recorded_by,
                         ..
                     } => (
@@ -173,7 +174,7 @@ pub(crate) fn execute_emit_commands(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contracts::transport_identity_contract::TransportIdentityIntent;
+    use crate::contracts::transport_identity_contract::TransportIdentitySpec;
     use crate::db::{open_in_memory, schema::create_tables};
     use rusqlite::OptionalExtension;
 
@@ -194,9 +195,9 @@ mod tests {
         .unwrap();
     }
 
-    /// Pipeline-level test: execute_emit_commands with ApplyTransportIdentityIntent
+    /// Pipeline-level test: execute_emit_commands with MaterializeTransportIdentity
     /// must record the transport target mapping in local_transport_targets.
-    /// This validates that the ownership transfer from adapter → pipeline is wired correctly.
+    /// This validates that the ownership transfer from materializer → pipeline is wired correctly.
     #[test]
     fn execute_emit_commands_records_transport_target_for_bootstrap_intent() {
         let conn = open_in_memory().unwrap();
@@ -206,11 +207,11 @@ mod tests {
         let invite_event_id = [0x42u8; 32];
         insert_invite_secret(&conn, recorded_by, invite_event_id, [0x42u8; 32]);
 
-        let intent = TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+        let spec = TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret {
             recorded_by: recorded_by.to_string(),
             invite_event_id,
         };
-        let cmd = EmitCommand::ApplyTransportIdentityIntent { intent };
+        let cmd = EmitCommand::MaterializeTransportIdentity { spec };
         execute_emit_commands(&conn, recorded_by, &[cmd]).unwrap();
 
         let row: Option<(String, String)> = conn
@@ -250,11 +251,11 @@ mod tests {
         )
         .unwrap();
 
-        let intent = TransportIdentityIntent::InstallPeerSharedIdentityFromSigner {
+        let spec = TransportIdentitySpec::InstallPeerSharedIdentityFromSigner {
             recorded_by: recorded_by.to_string(),
             signer_event_id,
         };
-        let cmd = EmitCommand::ApplyTransportIdentityIntent { intent };
+        let cmd = EmitCommand::MaterializeTransportIdentity { spec };
         execute_emit_commands(&conn, recorded_by, &[cmd]).unwrap();
 
         let row: Option<(String, String)> = conn

@@ -89,7 +89,7 @@ pub fn encode_invite_accepted(event: &ParsedEvent) -> Result<Vec<u8>, EventError
 
 // === Projector (event-module locality) ===
 
-use crate::contracts::transport_identity_contract::TransportIdentityIntent;
+use crate::contracts::transport_identity_contract::TransportIdentitySpec;
 use crate::crypto::event_id_to_base64;
 use crate::db::transport_creds::{peer_has_creds_with_source, CRED_SOURCE_PEER_SHARED};
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
@@ -233,8 +233,8 @@ pub fn project_pure(
     }];
 
     if ctx.has_local_invite_secret && !ctx.peer_shared_transport_identity_active {
-        commands.push(EmitCommand::ApplyTransportIdentityIntent {
-            intent: TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret {
+        commands.push(EmitCommand::MaterializeTransportIdentity {
+            spec: TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret {
                 recorded_by: recorded_by.to_string(),
                 invite_event_id: ia.invite_event_id,
             },
