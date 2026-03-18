@@ -127,6 +127,13 @@ impl ConnectionResponseState {
         inner.pending_ids.pop_front()
     }
 
+    /// Peek at up to `n` event IDs from the front of the queue without removing them.
+    /// Used to batch-read blobs before the send loop pops IDs one at a time.
+    pub fn peek_front_n(&self, n: usize) -> Vec<EventId> {
+        let inner = self.inner.lock().expect("response state mutex poisoned");
+        inner.pending_ids.iter().take(n).copied().collect()
+    }
+
     pub fn requeue_front(&self, event_id: EventId) {
         let mut inner = self.inner.lock().expect("response state mutex poisoned");
         inner.pending_ids.push_front(event_id);
