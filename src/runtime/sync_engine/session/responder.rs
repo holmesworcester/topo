@@ -114,12 +114,12 @@ where
     let ws_id_for_neg = ws_id.clone();
 
     /// Result from the negentropy worker thread: the NegMsg response bytes
-    /// plus diff IDs the responder has that the initiator lacks.
+    /// plus pre-built DiscoveryHints for the diff (looked up in the worker
+    /// thread's own DB connection so the async loop does no blob reads).
     struct NegWorkerResult {
         response: Vec<u8>,
-        /// IDs we have that the remote appears to lack — used to send
-        /// DiscoveryHints so the initiator has real byte sizes for credit.
-        responder_have_ids: Vec<negentropy::Id>,
+        /// Ready-to-send hints for events we have that the remote lacks.
+        diff_hints: Vec<crate::protocol::DiscoveryHint>,
     }
 
     let mut neg_req_tx: Option<std::sync::mpsc::Sender<Vec<u8>>> = None;
@@ -132,6 +132,7 @@ where
         let ws_id = ws_id_for_neg.clone();
         let handle = std::thread::spawn(move || {
             let neg_db = open_connection(&db_path).expect("neg worker: open_connection");
+            let worker_store = Store::new(&neg_db);
             let neg_storage = match window.kind {
                 SyncWindowKind::Full => NegentropyStorageSqlite::new(&neg_db, &ws_id),
                 _ => NegentropyStorageSqlite::new_with_range(
@@ -159,9 +160,25 @@ where
                 let mut need_ids = Vec::new();
                 let result = neg
                     .reconcile_with_diff(&msg, &mut have_ids, &mut need_ids)
-                    .map(|response| NegWorkerResult {
-                        response,
-                        responder_have_ids: have_ids,
+                    .map(|response| {
+                        // Build hints in the worker thread — no blob reads on the async loop.
+                        let diff_hints: Vec<crate::protocol::DiscoveryHint> = have_ids
+                            .iter()
+                            .filter_map(|neg_id| {
+                                let event_id = crate::protocol::neg_id_to_event_id(neg_id);
+                                worker_store.get_shared_summary(&event_id).ok().flatten().map(
+                                    |summary| crate::protocol::DiscoveryHint {
+                                        event_id: summary.event_id,
+                                        semantic_type_code: summary.semantic_type_code,
+                                        encoded_size_bytes: summary.encoded_size_bytes,
+                                    },
+                                )
+                            })
+                            .collect();
+                        NegWorkerResult {
+                            response,
+                            diff_hints,
+                        }
                     })
                     .map_err(|e| format!("{}", e));
                 if resp_tx.send(result).is_err() {
@@ -265,37 +282,23 @@ where
                     reconciling = false;
                     last_activity = Instant::now();
 
-                    // Send DiscoveryHints for diff IDs BEFORE the NegMsg so the
-                    // initiator has real byte sizes when it starts scheduling
-                    // requests from the need_ids this round will produce.
-                    if !result.responder_have_ids.is_empty() {
+                    // Send pre-built DiscoveryHints BEFORE the NegMsg so the
+                    // initiator has real byte sizes when it starts scheduling.
+                    // Hints were built in the worker thread (no DB work here).
+                    if !result.diff_hints.is_empty() {
                         let batch_size = super::need_chunk().max(1);
-                        let mut hints = Vec::with_capacity(batch_size);
-                        for neg_id in &result.responder_have_ids {
-                            let event_id = crate::protocol::neg_id_to_event_id(neg_id);
-                            if let Ok(Some(summary)) = store.get_shared_summary(&event_id) {
-                                hints.push(crate::protocol::DiscoveryHint {
-                                    event_id: summary.event_id,
-                                    semantic_type_code: summary.semantic_type_code,
-                                    encoded_size_bytes: summary.encoded_size_bytes,
-                                });
-                                if hints.len() >= batch_size {
-                                    control
-                                        .send(&Frame::DiscoveryHints {
-                                            hints: std::mem::take(&mut hints),
-                                        })
-                                        .await?;
-                                }
-                            }
-                        }
-                        if !hints.is_empty() {
-                            control.send(&Frame::DiscoveryHints { hints }).await?;
+                        let total_hints = result.diff_hints.len();
+                        for chunk in result.diff_hints.chunks(batch_size) {
+                            control
+                                .send(&Frame::DiscoveryHints {
+                                    hints: chunk.to_vec(),
+                                })
+                                .await?;
                         }
                         control.flush().await?;
                         info!(
                             "Sent {} discovery hints for responder diff to peer {}",
-                            result.responder_have_ids.len(),
-                            peer_id
+                            total_hints, peer_id
                         );
                     }
 
