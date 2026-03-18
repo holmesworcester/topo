@@ -98,13 +98,19 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     Ok(())
 }
 
+/// Whether event timeline recording is enabled. Controlled by the
+/// `TOPO_EVENT_TIMELINE` env var:
+///   "0" / "false" / "no" → disabled (even in debug builds)
+///   "1" / "true" / "yes" → enabled
+///   unset → enabled in debug builds, disabled in release builds
 pub fn recording_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(|| {
-        cfg!(debug_assertions)
-            || std::env::var("TOPO_EVENT_TIMELINE")
-                .ok()
-                .is_some_and(|v| matches!(v.as_str(), "1" | "true" | "TRUE" | "yes" | "YES"))
+        match std::env::var("TOPO_EVENT_TIMELINE").ok().as_deref() {
+            Some("0") | Some("false") | Some("FALSE") | Some("no") | Some("NO") => false,
+            Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") => true,
+            _ => cfg!(debug_assertions),
+        }
     })
 }
 

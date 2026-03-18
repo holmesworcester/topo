@@ -157,11 +157,34 @@ impl<'a> WantedEvents<'a> {
         }
         let now = current_timestamp_ms();
         with_immediate_tx(self.conn, || {
-            let mut already_recorded = self.conn.prepare(
-                "SELECT 1 FROM recorded_events
-                 WHERE peer_id = ?1 AND event_id = ?2
-                 LIMIT 1",
-            )?;
+            // Batch-check which hints are already locally recorded in one query
+            // instead of N individual lookups.
+            let hint_b64s: Vec<String> = hints.iter().map(|h| event_id_to_base64(&h.event_id)).collect();
+            let already_local_set: std::collections::HashSet<String> = {
+                let mut set = std::collections::HashSet::new();
+                // SQLite max variable count is 999; chunk to stay within limits
+                for chunk in hint_b64s.chunks(900) {
+                    let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                    let sql = format!(
+                        "SELECT event_id FROM recorded_events WHERE peer_id = ?1 AND event_id IN ({})",
+                        placeholders
+                    );
+                    let mut stmt = self.conn.prepare(&sql)?;
+                    let mut param_idx = 1;
+                    stmt.raw_bind_parameter(param_idx, local_peer_id)?;
+                    for id_b64 in chunk {
+                        param_idx += 1;
+                        stmt.raw_bind_parameter(param_idx, id_b64.as_str())?;
+                    }
+                    let mut rows = stmt.raw_query();
+                    while let Some(row) = rows.next()? {
+                        let id: String = row.get(0)?;
+                        set.insert(id);
+                    }
+                }
+                set
+            };
+
             let mut upsert_wanted = self.conn.prepare(
                 "INSERT INTO wanted_events (id, first_seen_at, semantic_type_code, encoded_size_bytes)
                  VALUES (?1, ?2, ?3, ?4)
@@ -181,13 +204,8 @@ impl<'a> WantedEvents<'a> {
 
             let mut observed = 0usize;
             let mut discovered_ids = Vec::with_capacity(hints.len());
-            for hint in hints {
-                let id_b64 = event_id_to_base64(&hint.event_id);
-                let already_local = already_recorded
-                    .query_row(params![local_peer_id, &id_b64], |_| Ok(()))
-                    .optional()?
-                    .is_some();
-                if already_local {
+            for (hint, id_b64) in hints.iter().zip(hint_b64s.iter()) {
+                if already_local_set.contains(id_b64) {
                     delete_wanted_row(self.conn, &hint.event_id)?;
                     continue;
                 }
