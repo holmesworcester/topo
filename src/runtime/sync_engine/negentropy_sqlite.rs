@@ -69,6 +69,67 @@ impl<'a> NegentropyStorageSqlite<'a> {
         Ok(())
     }
 
+    /// Incrementally sync new events from the events table into neg_items.
+    /// Uses a rowid watermark stored in neg_meta so only new events are
+    /// scanned. Call this before rebuild_blocks to ensure neg_items is fresh.
+    pub fn sync_neg_items_from_events(&self) -> Result<usize, rusqlite::Error> {
+        use crate::crypto::event_id_from_base64;
+
+        let start = std::time::Instant::now();
+
+        // Read the last synced rowid watermark
+        let last_rowid: i64 = self.conn
+            .query_row(
+                "SELECT COALESCE((SELECT value FROM neg_meta WHERE key = 'last_neg_sync_rowid'), 0)",
+                [],
+                |row| row.get(0),
+            )?;
+
+        // Query new shared events (event_id is base64 text, needs Rust decode)
+        let mut stmt = self.conn.prepare(
+            "SELECT e.event_id, e.created_at
+             FROM events e
+             WHERE e.rowid > ?1
+               AND e.share_scope = 'shared'"
+        )?;
+
+        let mut insert_stmt = self.conn.prepare(
+            "INSERT OR IGNORE INTO neg_items (workspace_id, ts, id) VALUES (?1, ?2, ?3)"
+        )?;
+
+        let mut inserted = 0usize;
+        let mut rows = stmt.query(rusqlite::params![last_rowid])?;
+        while let Some(row) = rows.next()? {
+            let event_id_b64: String = row.get(0)?;
+            let created_at: i64 = row.get(1)?;
+            if let Some(event_id) = event_id_from_base64(&event_id_b64) {
+                if insert_stmt.execute(rusqlite::params![
+                    &self.workspace_id,
+                    created_at,
+                    event_id.as_slice()
+                ]).is_ok() {
+                    inserted += 1;
+                }
+            }
+        }
+
+        // Update watermark
+        if inserted > 0 {
+            self.conn.execute(
+                "INSERT OR REPLACE INTO neg_meta (key, value)
+                 VALUES ('last_neg_sync_rowid', (SELECT COALESCE(MAX(rowid), 0) FROM events))",
+                [],
+            )?;
+            tracing::info!(
+                "sync_neg_items_from_events: {} new items in {}ms",
+                inserted,
+                start.elapsed().as_millis()
+            );
+        }
+
+        Ok(inserted)
+    }
+
     /// Rebuild the block index from neg_items into a per-connection TEMP table.
     ///
     /// This is O(N) but streaming and memory-flat.

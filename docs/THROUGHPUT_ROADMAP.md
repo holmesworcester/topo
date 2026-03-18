@@ -1,4 +1,13 @@
-# Throughput Roadmap: 5K → 20K events/s
+# Sync Performance Roadmap
+
+## Goal
+
+Make download and sync times invisible to the user (<1s perceived latency)
+when catching up and connected to a fast node, regardless of workspace size.
+
+This means: when a user opens the app after being offline, the most recent
+messages and files should appear immediately. History fills in behind the
+scenes. The user should never see "syncing..." for more than a moment.
 
 ## Current State (March 2026)
 
@@ -11,174 +20,313 @@
 
 ## Where Time Goes (10k events, 2.0s wall)
 
-| Phase | Est. time | % | Notes |
-|---|---|---|---|
-| ed25519 sig verification | ~650ms | 32% | 10k × 65µs, per-event |
-| Persist: events INSERT | ~200ms | 10% | 10k rows, 1 multi-row INSERT per chunk |
-| Persist: neg_items INSERT | ~150ms | 8% | 10k rows, shared events only |
-| Persist: recorded_events INSERT | ~150ms | 8% | 10k rows, per-tenant scoped |
-| Persist: project_queue INSERT | ~200ms | 10% | 10k rows, 3 NOT EXISTS subqueries each |
-| Projection: context load + dispatch + write | ~350ms | 17% | Per-event autocommit |
-| Negentropy reconciliation | ~200ms | 10% | rebuild_blocks + protocol rounds |
-| QUIC transfer + framing | ~100ms | 5% | ~400 bytes × 10k = 4MB on localhost |
+| Phase | Est. time | % |
+|---|---|---|
+| ed25519 sig verification | ~650ms | 32% |
+| Persist: events INSERT | ~200ms | 10% |
+| Persist: neg_items INSERT | ~150ms | 8% |
+| Persist: recorded_events INSERT | ~150ms | 8% |
+| Persist: project_queue INSERT | ~200ms | 10% |
+| Projection: context + dispatch + write | ~350ms | 17% |
+| Negentropy reconciliation | ~200ms | 10% |
+| QUIC transfer + framing | ~100ms | 5% |
 
 ## Network Ceiling (small ~400-byte messages)
 
-| Link | Network ceiling | CPU-bound until |
-|---|---|---|
-| Localhost | 12M msgs/s | Always CPU-bound |
-| LAN 1Gbps | 2M msgs/s | Always CPU-bound |
-| WAN 100Mbps | 25K msgs/s | ~25K msgs/s |
-| WAN 50Mbps | 12.5K msgs/s | ~12.5K msgs/s |
-| Mobile 10Mbps | 2.5K msgs/s | Already network-bound at ~2.5K |
+| Link | Network ceiling |
+|---|---|
+| Localhost | 12M msgs/s |
+| LAN 1Gbps | 2M msgs/s |
+| WAN 100Mbps | 25K msgs/s |
+| WAN 50Mbps | 12.5K msgs/s |
+| Mobile 10Mbps | 2.5K msgs/s |
 
-For small events, the system is CPU/DB-bound on all but mobile links.
+For small events, the system is CPU/DB-bound on all non-mobile links.
 
 ---
 
-## Tier 1: Eliminate Per-Event DB Work (5K → 10K)
+## Architecture: Decouple Download from Projection
 
-These changes reduce the number of SQLite B-tree operations per event.
+The core design change that enables everything below: **download is just
+blob storage (fast, I/O bound); projection is indexing + verification
+(slow, CPU bound). Let them run at different speeds with a cursor between
+them.**
 
-### 1a. Consolidate recorded_events into events table
+### Fast blob persist (download-speed path)
 
-**Impact**: eliminates 10K INSERTs per batch (one full table's worth)
+Persist downloaded event blobs as fast as possible. Don't index them —
+no neg_items, no recorded_events, no project_queue INSERT. Just:
+
+```sql
+INSERT OR IGNORE INTO events (event_id, blob, share_scope, created_at, inserted_at)
+VALUES (?, ?, ?, ?, ?)
+```
+
+One INSERT per event, no subqueries, no constraint checks beyond the PK.
+This makes downloads network-bound (not CPU-bound) on any reasonable link.
+
+### Background projection cursor
+
+A background job walks unprojected events via a cursor:
+
+```sql
+SELECT event_id, blob FROM events
+WHERE projected_at IS NULL
+ORDER BY priority_score DESC
+LIMIT ?
+```
+
+The cursor processes events in priority order (see below), running
+projection, indexing, and sig verification at its own pace. The UI
+queries projected state, which fills in progressively.
+
+### Priority-driven projection order
+
+Not all events are equal. Project in this order:
+
+1. **Subscription-matching events** — events visible in the current UI
+   view (matches an active query/subscription). These appear instantly.
+2. **Newest events** — sort by `created_at DESC` so recent messages
+   show before old history.
+3. **Dependency-unblocking events** — if projection of event B is
+   blocked waiting for event A, boost A's priority so B can proceed.
+4. **Everything else** — old history, bulk backfill.
+
+This way the user sees the latest messages in <1s even while 100k old
+events are still being projected in the background.
+
+### Priority-driven download order
+
+Mirror the projection priority in the download scheduler:
+
+- `wanted_events.priority_ts` already sorts by `created_at DESC`
+  (newest first) within priority lanes.
+- When projection blocks on a missing dep, boost that dep's priority
+  in `wanted_events` so it gets requested sooner.
+- The planner already respects priority ordering — just needs the
+  priority values set correctly.
+
+This ensures we download what the user needs first, not just whatever
+negentropy discovered first.
+
+---
+
+## Optimizations: Ranked by Impact
+
+### Tier 1: Eliminate Per-Event DB Work (5K → 10K)
+
+#### 1a. Blob-only persist (skip indexing on the hot path)
+
+**Impact**: reduces persist from ~4 INSERTs/event to 1 INSERT/event
+**Effort**: Medium
+
+Persist only the events table row during download. A background cursor
+handles neg_items, recorded_events, and projection. Downloads become
+network-bound.
+
+#### 1b. Consolidate recorded_events into events table
+
+**Impact**: eliminates one full table's INSERTs from the hot path
 **Effort**: Medium-high (20+ read sites to migrate)
 
-Add `recorded_by`, `recorded_at`, `source` columns to the `events` table.
-The "already local" check becomes `SELECT 1 FROM events WHERE event_id = ?`.
-All 20+ read sites in service.rs, assert.rs, file_slice, workspace, etc.
-need to join on `events` instead of `recorded_events`.
+Add `recorded_by`, `recorded_at`, `source` columns to the `events`
+table. The "already local" check becomes `SELECT 1 FROM events WHERE
+event_id = ?`. All read sites in service.rs, assert.rs, file_slice,
+workspace, etc. need migration.
 
-### 1b. Eliminate project_queue from hot path
+#### 1c. Eliminate project_queue from hot path
 
-**Impact**: eliminates 10K INSERTs with 3 NOT EXISTS subqueries each
+**Impact**: eliminates per-event INSERT with 3 NOT EXISTS subqueries
 **Effort**: Done (on `codex/batch-projection-tuning` branch)
 
 Pass event IDs directly from persist output to `project_batch` in
 post-commit effects. Queue still used for startup recovery and fanout.
 
-### 1c. Defer neg_items to incremental rebuild
+#### 1d. Defer neg_items to incremental rebuild
 
-**Impact**: eliminates 10K INSERTs from persist, replaces with 1 bulk INSERT...SELECT before negentropy
-**Effort**: Medium (lock contention with neg worker needs careful design)
+**Impact**: eliminates per-event neg_items INSERT from persist
+**Effort**: Medium
 
-Track last-synced rowid in neg_meta. Before each negentropy round, bulk-insert
-new events from the events table. The cost moves from the hot ingest path
-to the observer loop (which runs every few seconds, not per event).
+Track last-synced rowid in `neg_meta`. Before each negentropy round,
+bulk-insert new events. Cost moves from the hot ingest path to the
+observer loop (runs every few seconds).
 
-Challenge: the neg worker runs on a separate connection. The bulk INSERT
-must happen on the writer connection (which holds the write lock) or
-before the neg worker takes its snapshot.
+### Tier 2: Reduce Per-Event CPU Work (10K → 15K)
 
----
+#### 2a. Hash-chain signature batching (merkle chain per device)
 
-## Tier 2: Reduce Per-Event CPU Work (10K → 15K)
+**Impact**: reduces 10K sig verifications to ~2-5 (one per device per sync)
+**Effort**: Medium (protocol/wire format change)
 
-### 2a. Hash-chain signature batching (merkle chain)
+Each message includes a 32-byte `prev_message_ref` (hash of sender's
+previous message blob). During catchup sync:
 
-**Impact**: reduces 10K sig verifications to ~2-5 (one per device per sync round)
-**Effort**: Medium (protocol change — add prev_message_ref field)
+1. Sort received messages by signer, find the chain tips (newest)
+2. Verify ed25519 signature on chain tips only (~2-5 verifies)
+3. Walk each chain backwards, verifying hash links (~1µs each vs 65µs)
+4. If hash chain is unbroken, all messages in the chain are authenticated
 
-Each message includes a 32-byte hash of the sender's previous message.
-During sync, verify only the chain tip's signature, then walk the hash
-chain backwards. Each link is authenticated by the hash above it.
+For 10k messages from 2 devices: 2 sig verifies + 10k hash checks.
+Saves ~640ms (from 650ms to ~12ms).
 
-- BLAKE2b hash check: ~1µs per event (vs 65µs for ed25519)
-- For 10k messages from 2 devices: 2 sig verifies + 10k hash checks
-- Saves ~640ms (from 650ms to 10ms)
+Safe because: if the tip signature is valid and the hash chain is
+unbroken, every message was created by the same signer. An attacker
+can't splice in a fake message without breaking the hash link above it.
 
-Requires wire format change (new field in message events).
-
-### 2b. Skip cascade for dependency-free types
+#### 2b. Skip cascade for dependency-free types
 
 **Impact**: eliminates ~10K no-op cascade queries
 **Effort**: Low
 
-Messages have no dependents. The cascade check (`SELECT ... FROM
-blocked_event_deps WHERE blocker_event_id = ?`) always returns empty.
-Skip it entirely for event types with no possible dependents (messages,
-reactions, file_slices).
+Messages, reactions, and file_slices have no dependents. The cascade
+check (`SELECT FROM blocked_event_deps WHERE blocker_event_id = ?`)
+always returns empty for these types. Skip it entirely based on
+event type metadata.
 
-### 2c. Cache signer key resolution
+#### 2c. Cache signer key resolution
 
 **Impact**: eliminates ~10K blob reads for signer keys
-**Effort**: Low (already done in batch projection — key lookup is batched)
+**Effort**: Low (already done in batch projection pipeline)
 
-In the per-event path, cache the signer public key after first resolution.
-All messages from the same peer use the same key.
+All messages from the same peer use the same signer key. Cache it
+after first resolution. The batch projection pipeline already does
+this via `gather_signer_keys`.
 
-### 2d. Skip subscription check when no subscriptions active
+#### 2d. Skip subscription check when no subscriptions active
 
 **Impact**: eliminates ~10K queries when no subscriptions exist
 **Effort**: Low
 
-Check a cached flag "any active subscriptions?" before the per-event
-subscription hook. If none, skip entirely.
+Check a cached flag before the per-event subscription hook. If no
+active subscriptions, skip entirely.
 
----
+### Tier 3: Parallelism (15K → 20K+)
 
-## Tier 3: Parallelism (15K → 20K+)
-
-### 3a. Parallel signature verification (rayon)
+#### 3a. Parallel signature verification (rayon)
 
 **Impact**: divides sig verify time by core count
 **Effort**: Low (already prototyped on `codex/batch-projection-refactor`)
 
-The map phase of the batch pipeline (parse + verify + build context +
-dispatch projector) is pure — no DB access. Use `rayon::par_iter` for
-batches > 50 events. On 8 cores: 650ms → ~80ms.
+The map phase of the batch projection pipeline is pure — no DB access.
+Use `rayon::par_iter` for batches > 50 events. On 8 cores: 650ms → ~80ms.
 
-Only useful AFTER the hash-chain optimization makes sig verify rare,
-OR if hash chains aren't implemented.
+Most useful before hash-chain optimization is implemented. After hash
+chains, sig verify is already fast enough that parallelism adds little.
 
-### 3b. Concurrent persist + project on separate threads
+#### 3b. Parallel projection of independent events
 
-**Impact**: hides projection latency behind persist
-**Effort**: Medium
+**Impact**: utilize multiple cores for projection
+**Effort**: High
 
-Persist thread: writes events to DB, passes event IDs to project thread.
-Project thread: reads blobs (already in page cache), projects, writes results.
-Both use the same DB but different transactions.
+Messages are independent (no cross-event deps). Their projection could
+run on multiple threads with a shared SQLite writer collecting results.
+Requires careful transaction design.
 
-Challenge: SQLite single-writer means they can't both write simultaneously.
-Would need to batch and alternate, or use WAL mode's concurrent-reader
-capability to let the project thread read while persist writes.
+### Tier 4: Perceived Performance (any throughput → <1s UX)
 
----
+These don't increase raw throughput but make sync feel instant.
 
-## Tier 4: Architecture Changes (20K+)
+#### 4a. Subscription-aware projection priority
 
-### 4a. Memory-first event staging
+**Impact**: events visible in the current UI view project first
+**Effort**: Low
 
-Buffer received events in memory. Project from in-memory blobs (no DB
-read-back). Flush to SQLite in large batches on a timer or threshold.
-Crash loses unflushed events but sync will re-request them.
+When the projection cursor picks events to process, check against
+active subscriptions first. If a message matches what the user is
+looking at, project it before processing old history.
 
-### 4b. Workspace-scoped event deduplication
+**Privacy note**: this only affects local projection order, not
+download order. Download order stays the same (newest first), so
+no information about UI state leaks to peers.
+
+#### 4b. Newest-first download scheduling
+
+**Impact**: recent messages download before old history
+**Effort**: Already implemented
+
+`wanted_events.priority_ts` sorts by `created_at DESC`. The planner
+requests newest events first. Combined with forward-on-have for
+truly live events, this means:
+- Live: forward-on-have delivers in <100ms
+- Recent (last hour): downloaded first via priority scheduling
+- History: fills in behind the scenes
+
+#### 4c. Dependency-boost in download priority
+
+**Impact**: unblocks projection chains faster
+**Effort**: Low
+
+When projection blocks on a missing dep, boost that dep's `priority_ts`
+in `wanted_events` to `MAX_PRIORITY`. The planner requests it next.
+This prevents identity chain stalls during bootstrap.
+
+#### 4d. Progressive UI rendering
+
+**Impact**: show partial results while sync is ongoing
+**Effort**: UI-layer change
+
+The UI queries projected state, which fills in progressively. Show
+a count of "N more messages loading..." while the projection cursor
+catches up. No spinner, no blocking — just progressive rendering.
+
+### Tier 5: Architecture Changes (20K+)
+
+#### 5a. Memory-first event staging
+
+Buffer received events in memory (Vec). Project from in-memory blobs
+(no DB read-back). Flush to SQLite in large batches on a timer.
+Crash loses unflushed events but sync re-requests them.
+
+#### 5b. Workspace-scoped event deduplication
 
 Replace per-tenant `recorded_events` with workspace-scoped dedup.
-"Any event recorded by one tenant in a workspace will be recorded by
-every tenant in the same workspace." This means the dedup check is
-just "does this event_id exist in events?" — no per-tenant scoping needed.
+All tenants in a workspace see the same shared events. The dedup
+check becomes `SELECT 1 FROM events WHERE event_id = ?` — no
+per-tenant scoping needed for shared events.
 
-### 4c. LSM or append-only storage for events
+#### 5c. LSM or append-only storage for events
 
-The events table is append-only (INSERT OR IGNORE, never UPDATE/DELETE
-during normal operation). A log-structured storage engine (RocksDB,
-sled, or custom WAL-only append) would eliminate B-tree rebalancing
-overhead entirely. Reads are rare (only during projection and data-plane
-drain). Writes dominate.
+The events table is append-only. A log-structured engine (RocksDB,
+sled, or custom WAL-append) would eliminate B-tree rebalancing.
+Reads are rare (only during projection and data-plane drain).
+Writes dominate.
 
 ---
 
 ## Priority Sequence
 
-1. **Skip cascade for dep-free types** (Tier 2b) — low effort, immediate win
-2. **Cache signer keys** (Tier 2c) — low effort
-3. **Skip empty subscriptions** (Tier 2d) — low effort
-4. **Eliminate project_queue** (Tier 1b) — done
-5. **Hash-chain sig batching** (Tier 2a) — medium effort, biggest single win
-6. **Consolidate recorded_events** (Tier 1a) — medium-high effort, reduces write amplification
-7. **Defer neg_items** (Tier 1c) — medium effort
-8. **Parallel sig verify** (Tier 3a) — low effort, only matters after hash chains
+For the <1s perceived latency goal, the order is:
+
+1. **Blob-only persist + background cursor** (1a) — makes downloads
+   network-bound, decouples download from projection
+2. **Newest-first download** (4b) — already implemented
+3. **Subscription-aware projection** (4a) — low effort, instant UX win
+4. **Dependency-boost** (4c) — low effort, fixes bootstrap stalls
+5. **Skip cascade for dep-free types** (2b) — low effort, speeds projection
+6. **Hash-chain sig batching** (2a) — medium effort, biggest CPU win
+7. **Consolidate recorded_events** (1b) — medium effort, reduces writes
+8. **Progressive UI rendering** (4d) — UI-layer, makes everything feel fast
+
+The first 4 items give the user <1s perceived latency for recent messages
+even during a large catchup sync, without changing raw throughput at all.
+The remaining items increase raw throughput for the background projection.
+
+---
+
+## Already Implemented
+
+- Batch projection pipeline (gather/map/reduce/apply) — `codex/batch-projection-refactor`
+- Project queue bypass — `codex/batch-projection-tuning`
+- Multi-row INSERT for persist phase — `codex/batch-projection-tuning`
+- Batched recorded_events check in observe_many_for_peer
+- Cached rebuild_blocks (count-based skip)
+- Forward-on-have live hint bus (sub-second live delivery)
+- Larger batch sizes (write_batch_cap 5000, drain 1000)
+- Credit watermarks tuned for file slices (2 MiB high, 512 KiB low)
+- Bidirectional DiscoveryHints with real byte sizes
+- Vendored negentropy with reconcile_with_diff
+- Configurable timeline recording (TOPO_EVENT_TIMELINE env var)
+- WAL checkpoint deferral on writer
+- AUTOINCREMENT removed from recorded_events
+- temp_store=MEMORY for non-low-mem mode
+- Preloaded sync benchmark for isolated measurement

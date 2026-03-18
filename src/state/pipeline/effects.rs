@@ -40,6 +40,7 @@ impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
             let _ = wanted.remove(event_id);
         }
 
+
         // Direct batch projection from just-persisted event IDs — bypasses
         // the project_queue. Events are already in the events table from the
         // persist phase so project_batch reads blobs from there.
