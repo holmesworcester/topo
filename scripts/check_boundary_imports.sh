@@ -210,9 +210,9 @@ check_required 'contracts::peering_contract' "$PEERING_PATH"
 check_required 'contracts::event_pipeline_contract' "$SYNC_PATH"
 check_required 'contracts::peering_contract' "$SYNC_PATH"
 
-# transport identity adapter must use contract types
-check_required 'TransportIdentityAdapter' "${TRANSPORT_PATH}identity_adapter.rs"
-check_required 'TransportIdentityIntent' "${TRANSPORT_PATH}identity_adapter.rs"
+# transport identity materializer must use contract types
+check_required 'TransportIdentityMaterializer' "${TRANSPORT_PATH}identity_adapter.rs"
+check_required 'TransportIdentitySpec' "${TRANSPORT_PATH}identity_adapter.rs"
 
 # transport session factory must own stream wiring
 check_required 'open_session_io' "${TRANSPORT_PATH}session_factory.rs"
@@ -230,8 +230,8 @@ check_required 'pub async fn next_session' "${TRANSPORT_PATH}peering_boundary.rs
 check_required 'pub fn create_runtime_endpoint_for_tenants' "${TRANSPORT_PATH}peering_boundary.rs"
 check_required 'pub fn build_tenant_client_config_from_db' "${TRANSPORT_PATH}peering_boundary.rs"
 
-# projection must route through adapter contract, not raw install fns
-check_required 'ApplyTransportIdentityIntent' "$PROJECTION_PATH"
+# projection must route through materializer contract, not raw install fns
+check_required 'MaterializeTransportIdentity' "$PROJECTION_PATH"
 
 # -- identity eventization positive checks (SC4): event-module commands own workflows --
 check_required 'pub fn create_workspace' src/event_modules/workspace/commands.rs

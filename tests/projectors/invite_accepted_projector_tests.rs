@@ -7,7 +7,7 @@
 #[cfg(test)]
 mod tests {
     use crate::harness::fixtures::*;
-    use topo::contracts::transport_identity_contract::TransportIdentityIntent;
+    use topo::contracts::transport_identity_contract::TransportIdentitySpec;
     use topo::event_modules::invite_accepted::{project_pure, InviteAcceptedEvent};
     use topo::event_modules::ParsedEvent;
     use topo::projection::contract::{EmitCommand, SqlVal, WriteOp};
@@ -54,8 +54,8 @@ mod tests {
         assert_emits_command(&result, "InstallBootstrapIdentityFromInviteSecret", |c| {
             matches!(
                 c,
-                EmitCommand::ApplyTransportIdentityIntent {
-                    intent: TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret { .. }
+                EmitCommand::MaterializeTransportIdentity {
+                    spec: TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret { .. }
                 }
             )
         });
@@ -79,8 +79,8 @@ mod tests {
         assert_no_command(&result, |c| {
             matches!(
                 c,
-                EmitCommand::ApplyTransportIdentityIntent {
-                    intent: TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret { .. }
+                EmitCommand::MaterializeTransportIdentity {
+                    spec: TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret { .. }
                 }
             )
         });
@@ -99,8 +99,8 @@ mod tests {
         assert_no_command(&result, |c| {
             matches!(
                 c,
-                EmitCommand::ApplyTransportIdentityIntent {
-                    intent: TransportIdentityIntent::InstallBootstrapIdentityFromInviteSecret { .. }
+                EmitCommand::MaterializeTransportIdentity {
+                    spec: TransportIdentitySpec::InstallBootstrapIdentityFromInviteSecret { .. }
                 }
             )
         });

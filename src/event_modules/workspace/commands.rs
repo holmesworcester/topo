@@ -542,7 +542,7 @@ fn join_workspace_inner(
 
 /// Persist signer secrets for a join.
 ///
-/// The peer_shared PeerSecret triggers ApplyTransportIdentityIntent
+/// The peer_shared PeerSecret triggers MaterializeTransportIdentity
 /// on projection, which installs the PeerShared-derived transport identity.
 /// Events may block if the identity chain hasn't completed yet; they will
 /// project via cascade when prerequisites arrive.

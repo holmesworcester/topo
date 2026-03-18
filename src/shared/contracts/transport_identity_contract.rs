@@ -1,9 +1,9 @@
 //! Typed contract for event/identity → transport identity transitions.
 //!
-//! Event/identity logic emits `TransportIdentityIntent`s to describe *what*
-//! transition should happen. The `TransportIdentityAdapter` trait is
+//! Event/identity logic emits `TransportIdentitySpec`s to describe *what*
+//! transition should happen. The `TransportIdentityMaterializer` trait is
 //! implemented by the transport layer to perform the actual cert/key
-//! materialisation. Service and projection layers call through the adapter —
+//! materialisation. Service and projection layers call through the materializer —
 //! never directly to raw install functions.
 
 use rusqlite::Connection;
@@ -11,7 +11,7 @@ use rusqlite::Connection;
 /// Describes an identity transition that the transport layer should
 /// materialise into cert/key state.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub enum TransportIdentityIntent {
+pub enum TransportIdentitySpec {
     /// Install bootstrap transport identity from locally projected invite_secret
     /// key material for a specific invite event.
     InstallBootstrapIdentityFromInviteSecret {
@@ -26,7 +26,7 @@ pub enum TransportIdentityIntent {
     },
 }
 
-/// Typed errors from adapter operations.
+/// Typed errors from materializer operations.
 #[derive(Debug, thiserror::Error)]
 pub enum TransportIdentityError {
     #[error("transport identity install failed: {0}")]
@@ -46,14 +46,14 @@ pub enum TransportIdentityError {
     InvalidKeyMaterial(String),
 }
 
-/// Adapter trait: the sole entry point for materialising transport identity.
+/// Materializer trait: the sole entry point for materialising transport identity.
 ///
 /// Implementations live in the transport layer. Service and projection code
-/// calls `apply_intent` — never the raw install functions directly.
-pub trait TransportIdentityAdapter {
-    fn apply_intent(
+/// calls `materialize` — never the raw install functions directly.
+pub trait TransportIdentityMaterializer {
+    fn materialize(
         &self,
         conn: &Connection,
-        intent: TransportIdentityIntent,
+        spec: TransportIdentitySpec,
     ) -> Result<String, TransportIdentityError>;
 }

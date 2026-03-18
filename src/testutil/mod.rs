@@ -2149,72 +2149,95 @@ const FINGERPRINT_TABLES: &[FingerprintTable] = &[
         name: "messages",
         scope: Scope::RecordedBy,
         order: "ORDER BY message_id",
+        columns: None,
     },
     FingerprintTable {
         name: "reactions",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
+        columns: None,
     },
     FingerprintTable {
         name: "key_secrets",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
+        columns: None,
     },
     FingerprintTable {
         name: "deleted_messages",
         scope: Scope::RecordedBy,
         order: "ORDER BY message_id",
+        columns: None,
     },
     FingerprintTable {
         name: "files",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
+        columns: None,
     },
     FingerprintTable {
         name: "file_slices",
         scope: Scope::RecordedBy,
         order: "ORDER BY file_id, slice_number",
+        columns: None,
     },
     // Identity projections
     FingerprintTable {
         name: "workspaces",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
+        columns: None,
     },
     FingerprintTable {
         name: "invites_accepted",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
+        columns: None,
     },
     FingerprintTable {
         name: "user_invites",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
+        columns: None,
     },
     FingerprintTable {
         name: "device_invites",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
+        columns: None,
     },
     FingerprintTable {
         name: "users",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
+        columns: None,
     },
     FingerprintTable {
         name: "peers_shared",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
+        columns: None,
     },
     FingerprintTable {
         name: "admins",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
+        columns: None,
     },
     FingerprintTable {
         name: "key_shared",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
+        columns: None,
+    },
+    // Transport identity (replay-derived via MaterializeTransportIdentity).
+    // `created_at` is a wall-clock timestamp — excluded from fingerprint to
+    // ensure replay produces identical hashes regardless of when it runs.
+    FingerprintTable {
+        name: "local_transport_targets",
+        scope: Scope::TenantId,
+        order: "ORDER BY tenant_id",
+        columns: Some("tenant_id, transport_peer_id, source"),
     },
 ];
 
@@ -2222,11 +2245,16 @@ struct FingerprintTable {
     name: &'static str,
     scope: Scope,
     order: &'static str,
+    /// Explicit column list for SELECT. `None` means `SELECT *`.
+    /// Use when a table has non-deterministic columns (e.g. wall-clock `created_at`)
+    /// that should be excluded from the fingerprint.
+    columns: Option<&'static str>,
 }
 
 #[derive(Clone, Copy)]
 enum Scope {
     RecordedBy,
+    TenantId,
 }
 
 /// Per-table fingerprint diagnostic record.
@@ -2301,8 +2329,10 @@ fn compute_projection_fingerprint(
 
         let where_clause = match ft.scope {
             Scope::RecordedBy => "WHERE recorded_by = ?1",
+            Scope::TenantId => "WHERE tenant_id = ?1",
         };
-        let query = format!("SELECT * FROM {} {} {}", ft.name, where_clause, ft.order);
+        let select = ft.columns.unwrap_or("*");
+        let query = format!("SELECT {} FROM {} {} {}", select, ft.name, where_clause, ft.order);
         let mut row_count: i64 = 0;
 
         if let Ok(mut stmt) = db.prepare(&query) {
@@ -2479,6 +2509,17 @@ fn clear_projection_tables(db: &rusqlite::Connection, recorded_by: &str) {
     .expect("failed to clear rejected_events");
     db.execute(
         "DELETE FROM project_queue WHERE peer_id = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .ok();
+    // — Transport identity (replay-derived via MaterializeTransportIdentity command)
+    db.execute(
+        "DELETE FROM local_transport_creds WHERE peer_id IN (SELECT transport_peer_id FROM local_transport_targets WHERE tenant_id = ?1)",
+        rusqlite::params![recorded_by],
+    )
+    .ok();
+    db.execute(
+        "DELETE FROM local_transport_targets WHERE tenant_id = ?1",
         rusqlite::params![recorded_by],
     )
     .ok();
@@ -4228,6 +4269,7 @@ mod fingerprint_tests {
             "peers_shared",
             "admins",
             "key_shared",
+            "local_transport_targets",
         ];
         let excluded_tables = [
             "valid_events",

@@ -120,7 +120,9 @@ pub fn set_local_transport_target(
          ON CONFLICT(tenant_id) DO UPDATE SET
              transport_peer_id = excluded.transport_peer_id,
              source = excluded.source,
-             created_at = excluded.created_at",
+             created_at = excluded.created_at
+         WHERE excluded.source = 'peershared'
+            OR local_transport_targets.source != 'peershared'",
         rusqlite::params![tenant_id, transport_peer_id, source, now],
     ) {
         let existing: Option<(String, String)> = conn
@@ -580,6 +582,46 @@ mod tests {
             err.to_string().contains("UNIQUE constraint failed"),
             "unexpected error: {err}"
         );
+    }
+
+    #[test]
+    fn test_bootstrap_cannot_overwrite_peershared_target() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        // peershared is set first
+        set_local_transport_target(&conn, "tenant_a", "peershared_peer", CRED_SOURCE_PEER_SHARED)
+            .unwrap();
+
+        // bootstrap for the same tenant must not overwrite peershared
+        set_local_transport_target(&conn, "tenant_a", "bootstrap_peer", CRED_SOURCE_BOOTSTRAP)
+            .unwrap();
+
+        let target = resolve_tenant_transport_target(&conn, "tenant_a")
+            .unwrap()
+            .expect("target should exist");
+        assert_eq!(target.transport_peer_id, "peershared_peer");
+        assert_eq!(target.source, CRED_SOURCE_PEER_SHARED);
+    }
+
+    #[test]
+    fn test_peershared_overwrites_bootstrap_target() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        // bootstrap is set first
+        set_local_transport_target(&conn, "tenant_a", "bootstrap_peer", CRED_SOURCE_BOOTSTRAP)
+            .unwrap();
+
+        // peershared for the same tenant must overwrite bootstrap
+        set_local_transport_target(&conn, "tenant_a", "peershared_peer", CRED_SOURCE_PEER_SHARED)
+            .unwrap();
+
+        let target = resolve_tenant_transport_target(&conn, "tenant_a")
+            .unwrap()
+            .expect("target should exist");
+        assert_eq!(target.transport_peer_id, "peershared_peer");
+        assert_eq!(target.source, CRED_SOURCE_PEER_SHARED);
     }
 
     #[test]
