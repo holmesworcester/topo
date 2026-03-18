@@ -16,6 +16,9 @@ SUMMARY_PATTERN = re.compile(
     r"  Messages/peer:|  Current RSS:|  Budget:|  RSS before:|  RSS after:|"
     r"  RSS delta:|  Seeded keys:|  Lookups:|  Alice messages:|  Bob messages:|"
     r"  [A-Za-z0-9_-]+ peak RSS:|  P[0-9]+ peak RSS:|  Catchup wall|"
+    r"  Leaf daemons:|  Total nodes:|  Lowmem:|  Hub messages:|  Messages/leaf:|"
+    r"  Total deliveries:|  Deliveries/s:|  Hub RSS|  Leaf RSS|  Hub threads:|"
+    r"  Leaf threads:|  Hub FDs:|  Leaf FDs:|  Hub maps:|  Leaf maps:|"
     r"  Events/s|  MB/s:|  Total attributed:|  Throughput:|  Tail converge|"
     r"  All converge|  Hop latency|Generated|RUN_DIR=|SCENARIO=|DELTA_KIND=|"
     r"BASE_EVENTS=|DELTA_EVENTS=|DELTA_FILES=|DELTA_FILE_SIZE_MIB=|"
@@ -330,6 +333,11 @@ class PerfRunner:
                 "Core Sync (daemon_perf_test perf_continuous_10k)",
                 "perf_continuous_10k",
             )
+            self.run_star_topology(
+                "Star Topology (perf_star_topology_capacity, 50 leaves)",
+                leaves=50,
+                allow_failure=True,
+            )
             self.run(
                 "File Throughput (file_throughput_test)",
                 [
@@ -501,6 +509,38 @@ class PerfRunner:
             args,
             allow_failure=allow_failure,
             summary_path=self.repo_root / f"target/perf-results/daemon_perf_test.{test_name}.summary",
+        )
+
+    def run_star_topology(
+        self,
+        label: str,
+        leaves: int,
+        allow_failure: bool = False,
+    ) -> None:
+        extra_env = {
+            "STAR_TOPOLOGY_LEAVES": str(leaves),
+            "STAR_TOPOLOGY_HUB_MESSAGES": "1",
+            "STAR_TOPOLOGY_MESSAGES_PER_LEAF": "1",
+        }
+        args = [
+            "cargo",
+            "+stable",
+            "test",
+            "--release",
+            "--test",
+            "daemon_perf_test",
+            "perf_star_topology_capacity",
+            "--",
+            "--nocapture",
+            "--ignored",
+            "--test-threads=1",
+        ]
+        self.run_capture(
+            label,
+            args,
+            extra_env=extra_env,
+            allow_failure=allow_failure,
+            summary_path=self.repo_root / "target/perf-results/daemon_perf_test.perf_star_topology_capacity.summary",
         )
 
     def run_daemon_realistic_network_perf_test(

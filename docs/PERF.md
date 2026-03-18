@@ -70,6 +70,10 @@ python3 scripts/run_perf_serial.py lowmem
 cargo test --release --test daemon_perf_test -- --nocapture
 cargo test --release --test daemon_perf_test -- --nocapture --include-ignored
 
+# Star topology: hub + N leaves (daemon-managed invite acceptance)
+env STAR_TOPOLOGY_LEAVES=50 STAR_TOPOLOGY_HUB_MESSAGES=1 STAR_TOPOLOGY_MESSAGES_PER_LEAF=1 \
+  cargo test --release --test daemon_perf_test perf_star_topology_capacity -- --ignored --nocapture
+
 # File attachment throughput
 cargo test --release --test file_throughput_test -- --nocapture --include-ignored
 
@@ -485,6 +489,35 @@ MAX_MALL_ARENA=0
 MAX_MALL_USED=0
 MAX_MALL_FREE=0
 MAX_MALL_MMAP=0
+```
+### Star Topology (perf_star_topology_capacity, 50 leaves)
+
+```bash
+env STAR_TOPOLOGY_LEAVES=50 STAR_TOPOLOGY_HUB_MESSAGES=1 STAR_TOPOLOGY_MESSAGES_PER_LEAF=1 cargo +stable test --release --test daemon_perf_test perf_star_topology_capacity -- --nocapture --ignored --test-threads=1
+```
+
+```text
+=== Star topology capacity probe (daemon, warm) ===
+  Leaf daemons:        50
+  Total nodes:         51
+  Lowmem:              false
+  Hub messages:        1
+  Messages/leaf:       1
+  Total messages:      51
+  Total deliveries:    2601
+  Wall time:           4.67s
+  Messages/s:          11
+  Deliveries/s:        557
+  Hub RSS current:     117.2 MiB
+  Hub RSS peak:        117.2 MiB
+  Leaf RSS current:    avg 21.7 MiB / p95 22.5 MiB / max 22.9 MiB
+  Leaf RSS peak:       avg 21.7 MiB / p95 22.5 MiB / max 22.9 MiB
+  Hub threads:         208
+  Leaf threads:        avg 39.6 / max 40
+  Hub FDs:             675
+  Leaf FDs:            avg 31.2 / max 33
+  Hub maps:            891
+  Leaf maps:           avg 202.7 / max 206
 ```
 <!-- PERF_AUTO_RESULTS_END -->
 

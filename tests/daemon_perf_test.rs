@@ -1027,8 +1027,8 @@ fn perf_star_topology_capacity() {
     let avg_u = |v: &[usize]| v.iter().sum::<usize>() as f64 / v.len().max(1) as f64;
     let max_u = |v: &[usize]| v.iter().cloned().max().unwrap_or(0);
 
-    eprintln!(
-        "\n=== Star topology capacity probe (daemon, warm) ===\n\
+    let summary = format!(
+        "=== Star topology capacity probe (daemon, warm) ===\n\
          \x20 Leaf daemons:        {leaf_count}\n\
          \x20 Total nodes:         {total_nodes}\n\
          \x20 Lowmem:              {lowmem}\n\
@@ -1067,4 +1067,13 @@ fn perf_star_topology_capacity() {
         avg_u(&leaf_maps),
         max_u(&leaf_maps),
     );
+    eprintln!("\n{summary}");
+    let summary_dir =
+        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-results");
+    std::fs::create_dir_all(&summary_dir).expect("create target/perf-results");
+    std::fs::write(
+        summary_dir.join("daemon_perf_test.perf_star_topology_capacity.summary"),
+        &summary,
+    )
+    .expect("write star topology summary file");
 }
