@@ -506,6 +506,47 @@ fn perf_continuous_10k() {
     );
 }
 
+/// Preloaded sync: 10k messages created on Alice BEFORE timing starts.
+/// Measures pure negentropy discovery + transfer + Bob's ingest.
+/// Source creation is NOT in the hot path.
+#[test]
+fn perf_preloaded_10k() {
+    const N: i64 = 10_000;
+
+    let bench = SharedWorkspaceBench::new();
+    // Warm the connection first so bootstrap identity sync is done
+    let baseline = bench.warm_one_way();
+
+    // Generate all messages on Alice (untimed)
+    generate_messages(&bench.alice_db, N as usize);
+    // Wait for Alice's daemon to persist all generated messages
+    wait_for_message_count(&bench.alice_db, baseline + N, Duration::from_secs(60));
+
+    // Now measure: how fast does Bob get the events via negentropy + transfer?
+    let bob_before = message_count_sql(&bench.bob_db);
+    let remaining = baseline + N - bob_before;
+    if remaining <= 0 {
+        eprintln!("All events already synced — nothing to measure");
+        return;
+    }
+    let start = Instant::now();
+    wait_for_message_count(&bench.bob_db, baseline + N, Duration::from_secs(300));
+    let wall_secs = start.elapsed().as_secs_f64();
+
+    let (alice_rss, bob_rss, max_rss) = bench.daemon_rss();
+    let msgs_per_sec = remaining as f64 / wall_secs;
+    emit_summary(
+        "daemon_perf_test.perf_preloaded_10k",
+        "10k preloaded sync (negentropy + transfer + ingest only)",
+        wall_secs,
+        remaining,
+        msgs_per_sec,
+        alice_rss,
+        bob_rss,
+        max_rss,
+    );
+}
+
 /// 100k one-way sync.
 #[test]
 #[ignore]
