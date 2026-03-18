@@ -44,7 +44,7 @@ LOWMEM_BUDGET_KB="${LOWMEM_BUDGET_KB:-24576}"
 LOWMEM_CGROUP_ENFORCE="${LOWMEM_CGROUP_ENFORCE:-0}"
 LOWMEM_CGROUP_LIMIT_KB="${LOWMEM_CGROUP_LIMIT_KB:-22528}"
 LOWMEM_CGROUP_PARENT="${LOWMEM_CGROUP_PARENT:-}"
-LOWMEM_DISABLE_DISCOVERY="${P7_DISABLE_DISCOVERY:-1}"
+LOWMEM_DISABLE_DISCOVERY="${TOPO_DISABLE_DISCOVERY:-1}"
 
 export TMPDIR="${TMPDIR:-${SCRIPT_ROOT}/target/tmp}"
 mkdir -p "${RUN_ROOT}" "${TMPDIR}"
@@ -82,9 +82,9 @@ start_daemon() {
   done
   local _log="${_db_path%.db}.daemon.log"
   {
-    printf '\n[%s] start_daemon RUST_LOG=%s P7_DISABLE_DISCOVERY=%s %s start --bind 127.0.0.1:0\n' "$(date --iso-8601=seconds)" "${LOWMEM_DAEMON_RUST_LOG}" "${LOWMEM_DISABLE_DISCOVERY}" "${TOPO_BIN}"
+    printf '\n[%s] start_daemon RUST_LOG=%s TOPO_DISABLE_DISCOVERY=%s %s start --bind 127.0.0.1:0\n' "$(date --iso-8601=seconds)" "${LOWMEM_DAEMON_RUST_LOG}" "${LOWMEM_DISABLE_DISCOVERY}" "${TOPO_BIN}"
   } >> "${_log}"
-  P7_DISABLE_DISCOVERY="${LOWMEM_DISABLE_DISCOVERY}" RUST_LOG="${LOWMEM_DAEMON_RUST_LOG}" "${TOPO_BIN}" "$@" start --bind 127.0.0.1:0 >>"${_log}" 2>&1 &
+  TOPO_DISABLE_DISCOVERY="${LOWMEM_DISABLE_DISCOVERY}" RUST_LOG="${LOWMEM_DAEMON_RUST_LOG}" "${TOPO_BIN}" "$@" start --bind 127.0.0.1:0 >>"${_log}" 2>&1 &
 }
 
 default_cgroup_parent() {

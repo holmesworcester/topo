@@ -517,7 +517,7 @@ class PerfRunner:
             "--test-threads=1",
         ]
         env = extra_env or {}
-        env.setdefault("P7_FORWARD_ON_HAVE", "1")
+        env.setdefault("TOPO_FORWARD_ON_HAVE", "1")
         env.setdefault("TOPO_PERF_STAGE_BREAKDOWN", "1")
         summary_path = (
             self.repo_root / f"target/perf-results/{summary_file}"

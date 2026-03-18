@@ -245,11 +245,11 @@ async fn bidirectional_sync_receives_only_requested_event_data() {
 #[tokio::test]
 async fn forward_on_have_hints_fresh_events_with_slow_negentropy_repair() {
     let _env_guard = env_lock().lock().expect("env mutex poisoned");
-    let _forward_on_have = ScopedEnv::set("P7_FORWARD_ON_HAVE", "1");
+    let _forward_on_have = ScopedEnv::set("TOPO_FORWARD_ON_HAVE", "1");
     // 60-second round gap: if live hints are broken the event can only arrive
     // via the next scheduled negentropy round, which would take ~60s.  The
     // tight 3-second assertion window below proves the live-hint path was used.
-    let _round_gap_ms = ScopedEnv::set("P7_DISCOVERY_ROUND_GAP_MS", "60000");
+    let _round_gap_ms = ScopedEnv::set("TOPO_DISCOVERY_ROUND_GAP_MS", "60000");
 
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_in_workspace("bob", &alice).await;
@@ -320,9 +320,9 @@ async fn forward_on_have_hints_fresh_events_with_slow_negentropy_repair() {
 #[tokio::test]
 async fn forward_on_have_toggle_controls_hint_delivery() {
     let _env_guard = env_lock().lock().expect("env mutex poisoned");
-    let _forward_on_have = ScopedEnv::set("P7_FORWARD_ON_HAVE", "1");
+    let _forward_on_have = ScopedEnv::set("TOPO_FORWARD_ON_HAVE", "1");
     // 60-second round gap: without hints, events cannot arrive within 3 seconds.
-    let _round_gap_ms = ScopedEnv::set("P7_DISCOVERY_ROUND_GAP_MS", "60000");
+    let _round_gap_ms = ScopedEnv::set("TOPO_DISCOVERY_ROUND_GAP_MS", "60000");
 
     let alice = Peer::new_with_identity("alice");
     let bob = Peer::new_in_workspace("bob", &alice).await;

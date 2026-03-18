@@ -106,7 +106,7 @@ pub(crate) fn normalize_discovered_addr_for_local_bind(
     local_listen_ip: std::net::IpAddr,
     discovered: SocketAddr,
 ) -> SocketAddr {
-    let force_loopback = std::env::var("P7_TEST_DISCOVERY_LOOPBACK")
+    let force_loopback = std::env::var("TOPO_TEST_DISCOVERY_LOOPBACK")
         .map(|v| v != "0" && v.to_lowercase() != "false")
         .unwrap_or(false);
     normalize_discovered_addr_for_local_bind_with_options(

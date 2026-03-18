@@ -25,9 +25,9 @@ pub fn set_forward_on_have(enabled: bool) {
     FORWARD_ON_HAVE.store(enabled, Ordering::Relaxed);
 }
 
-/// One-time initialization from `P7_FORWARD_ON_HAVE` env var.
+/// One-time initialization from `TOPO_FORWARD_ON_HAVE` env var.
 pub fn init_forward_on_have_from_env() {
-    let enabled = std::env::var("P7_FORWARD_ON_HAVE")
+    let enabled = std::env::var("TOPO_FORWARD_ON_HAVE")
         .map(|v| v != "0" && v.to_lowercase() != "false")
         .unwrap_or(false);
     set_forward_on_have(enabled);

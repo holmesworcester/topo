@@ -984,7 +984,7 @@ Note: wrapping all projection writes in a single transaction was attempted first
 
 ### 10.0.2 Implemented: forward-on-have live hint bus
 
-**Problem.** Negentropy discovery runs on a periodic interval (default 100 ms, tunable via `P7_DISCOVERY_ROUND_GAP_MS`). A freshly created message must wait for the next scheduled round before the remote peer discovers it. In tests with a 5-second round gap this produced avg 2.3 s / worst 4.5 s delivery times, and in tests with a 60-second gap events took the full round duration to arrive.
+**Problem.** Negentropy discovery runs on a periodic interval (default 5 s, tunable via `TOPO_DISCOVERY_ROUND_GAP_MS`). A freshly created message must wait for the next scheduled round before the remote peer discovers it. In tests with a 5-second round gap this produced avg 2.3 s / worst 4.5 s delivery times, and in tests with a 60-second gap events took the full round duration to arrive.
 
 **Design.** Each time the persist phase newly inserts a shared canonical event it publishes a `LiveHint { event_id, source_peer_id, tenant_id }` entry to a per-`(db_path, tenant_id)` tokio broadcast channel (`src/state/live_hints.rs`). Active initiator and responder sessions subscribe on startup. Each control-loop tick (1 ms poll) the session drains up to `need_chunk()` hints from its receiver and emits a `NeedList` frame immediately on the control stream. The sink records `event_timeline.need_list_received_at` on receipt; this timestamp is the proof that the live-hint path ran. Self-hint filtering: hints tagged with the receiving peer's own ID are skipped. Drain cap: the loop tracks `drained` (total items consumed, including filtered ones) and breaks at `need_chunk()` so a backlog of self-hints or duplicates cannot stall the control loop.
 
@@ -1002,9 +1002,9 @@ Note: wrapping all projection writes in a single transaction was attempted first
 cargo test --lib join_workspace_seed_replay_emits_live_hints_for_existing_shared_events
 cargo test --test download_timeline_test forward_on_have_hints_fresh_events_with_slow_negentropy_repair --test-threads=1
 ```
-The second test sets `P7_DISCOVERY_ROUND_GAP_MS=60000` and asserts delivery within 3 seconds — the only path that can deliver within that window is the live-hint path.
+The second test sets `TOPO_DISCOVERY_ROUND_GAP_MS=60000` and asserts delivery within 3 seconds — the only path that can deliver within that window is the live-hint path.
 
-**Measured delivery latency** (in-process loopback, `P7_FORWARD_ON_HAVE=1`, no preload):
+**Measured delivery latency** (in-process loopback, `TOPO_FORWARD_ON_HAVE=1`, no preload):
 
 | Rate | Duration | avg | p95 | worst |
 |------|----------|-----|-----|-------|

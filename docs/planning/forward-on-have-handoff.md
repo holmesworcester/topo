@@ -53,7 +53,7 @@ Relevant files:
 
 Behavior:
 
-- `P7_FORWARD_ON_HAVE=1` enables live-hint forwarding
+- `TOPO_FORWARD_ON_HAVE=1` enables live-hint forwarding
 - sessions drain live hints and send `NeedList` immediately on the control stream
 - hints from the same remote peer are not echoed back to that peer
 - hint receipt still goes through durable `wanted` / `wanted_sources`
@@ -175,8 +175,8 @@ env TOPO_PERF_PRELOAD_MESSAGES=5000 \
     TOPO_PERF_LIVE_SECONDS=15 \
     TOPO_PERF_PROGRESS_WINDOWS=6 \
     TOPO_PERF_STAGE_BREAKDOWN=1 \
-    P7_FORWARD_ON_HAVE=1 \
-    P7_DISCOVERY_ROUND_GAP_MS=5000 \
+    TOPO_FORWARD_ON_HAVE=1 \
+    TOPO_DISCOVERY_ROUND_GAP_MS=5000 \
     cargo test --release --test multi_peer_delivery_latency_perf_test \
     perf_two_peer_delivery_latency_over_time \
     -- --ignored --nocapture --test-threads=1
@@ -223,8 +223,8 @@ env TOPO_PERF_PRELOAD_MESSAGES=5000 \
     TOPO_PERF_LIVE_SECONDS=15 \
     TOPO_PERF_PROGRESS_WINDOWS=6 \
     TOPO_PERF_STAGE_BREAKDOWN=1 \
-    P7_FORWARD_ON_HAVE=1 \
-    P7_DISCOVERY_ROUND_GAP_MS=5000 \
+    TOPO_FORWARD_ON_HAVE=1 \
+    TOPO_DISCOVERY_ROUND_GAP_MS=5000 \
     cargo test --release --test multi_peer_delivery_latency_perf_test \
     perf_two_peer_delivery_latency_over_time \
     -- --ignored --nocapture --test-threads=1
@@ -285,7 +285,7 @@ A traced run with the same workload showed:
 
 Important caution:
 
-- Slowing `P7_DISCOVERY_ROUND_GAP_MS` from `5000` to `60000` did **not** materially improve the benchmark result in this workload.
+- Slowing `TOPO_DISCOVERY_ROUND_GAP_MS` from `5000` to `60000` did **not** materially improve the benchmark result in this workload.
 - That means the issue is **not explained solely by periodic hot rounds**.
 - The stronger current hypothesis is:
   - live hints are being delayed behind existing control-stream backlog from the large preload/catchup state on the same long-lived session
@@ -329,8 +329,8 @@ env TOPO_PERF_PRELOAD_MESSAGES=5000 \
     TOPO_PERF_LIVE_SECONDS=15 \
     TOPO_PERF_PROGRESS_WINDOWS=6 \
     TOPO_PERF_STAGE_BREAKDOWN=1 \
-    P7_FORWARD_ON_HAVE=1 \
-    P7_DISCOVERY_ROUND_GAP_MS=5000 \
+    TOPO_FORWARD_ON_HAVE=1 \
+    TOPO_DISCOVERY_ROUND_GAP_MS=5000 \
     cargo test --release --test multi_peer_delivery_latency_perf_test \
     perf_two_peer_delivery_latency_over_time \
     -- --ignored --nocapture --test-threads=1
@@ -341,8 +341,8 @@ env TOPO_PERF_PRELOAD_MESSAGES=0 \
     TOPO_PERF_LIVE_SECONDS=15 \
     TOPO_PERF_PROGRESS_WINDOWS=6 \
     TOPO_PERF_STAGE_BREAKDOWN=1 \
-    P7_FORWARD_ON_HAVE=1 \
-    P7_DISCOVERY_ROUND_GAP_MS=5000 \
+    TOPO_FORWARD_ON_HAVE=1 \
+    TOPO_DISCOVERY_ROUND_GAP_MS=5000 \
     cargo test --release --test multi_peer_delivery_latency_perf_test \
     perf_two_peer_delivery_latency_over_time \
     -- --ignored --nocapture --test-threads=1

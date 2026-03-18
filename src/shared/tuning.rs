@@ -56,7 +56,7 @@ pub fn bulk_write_batch_cap() -> usize {
 }
 
 pub fn bulk_egress_claim_count() -> usize {
-    if let Some(v) = read_usize_env("P7_BULK_EGRESS_CLAIM_COUNT") {
+    if let Some(v) = read_usize_env("TOPO_BULK_EGRESS_CLAIM_COUNT") {
         return v.max(1);
     }
     if low_mem_mode() {
@@ -67,7 +67,7 @@ pub fn bulk_egress_claim_count() -> usize {
 }
 
 pub fn egress_send_quantum_bytes() -> usize {
-    if let Some(v) = read_usize_env("P7_EGRESS_SEND_QUANTUM_BYTES") {
+    if let Some(v) = read_usize_env("TOPO_EGRESS_SEND_QUANTUM_BYTES") {
         return v.max(1);
     }
     if low_mem_mode() {
@@ -118,7 +118,7 @@ pub fn wanted_high_watermark() -> usize {
     if low_mem_mode() {
         low_mem_wanted_high_watermark()
     } else {
-        read_usize_env("P7_WANTED_HIGH_WATERMARK").unwrap_or(512)
+        read_usize_env("TOPO_WANTED_HIGH_WATERMARK").unwrap_or(512)
     }
 }
 
@@ -126,7 +126,7 @@ pub fn wanted_low_watermark() -> usize {
     if low_mem_mode() {
         low_mem_wanted_low_watermark()
     } else {
-        read_usize_env("P7_WANTED_LOW_WATERMARK").unwrap_or(128)
+        read_usize_env("TOPO_WANTED_LOW_WATERMARK").unwrap_or(128)
     }
 }
 
@@ -134,7 +134,7 @@ pub fn wanted_refill_quantum() -> usize {
     if low_mem_mode() {
         read_usize_env("LOW_MEM_WANTED_REFILL_QUANTUM").unwrap_or(4)
     } else {
-        read_usize_env("P7_WANTED_REFILL_QUANTUM").unwrap_or(64)
+        read_usize_env("TOPO_WANTED_REFILL_QUANTUM").unwrap_or(64)
     }
 }
 
@@ -152,7 +152,7 @@ pub fn request_inflight_ttl_ms() -> i64 {
             .unwrap_or(5_000)
             .max(1) as i64
     } else {
-        read_usize_env("P7_REQUEST_INFLIGHT_TTL_MS")
+        read_usize_env("TOPO_REQUEST_INFLIGHT_TTL_MS")
             .unwrap_or(60_000)
             .max(1) as i64
     }
