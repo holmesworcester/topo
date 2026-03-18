@@ -288,6 +288,23 @@ Peer-to-peer QUIC sync over localhost with negentropy reconciliation (daemon-bas
 
 ---
 
+# Live Message Delivery Latency
+
+Forward-on-have: freshly created events are pushed to connected peers immediately via an in-process broadcast channel, bypassing the negentropy round interval.
+
+| Rate | Duration | avg | p50 | p95 | worst |
+|------|----------|-----|-----|-----|-------|
+| 1 msg/s | 5s | 2.0 ms | 2 ms | 3 ms | 3 ms |
+| 2 msg/s | 15s | 2.4 ms | 2 ms | 4 ms | 4 ms |
+| 4 msg/s | 20s | 3.2 ms | 3 ms | 5 ms | 8 ms |
+| 10 msg/s | 20s | 2.9 ms | 3 ms | 4 ms | 5 ms |
+
+- Gate assertion: worst ≤ 2,000 ms at 2 msg/s × 15s (actual: 4 ms)
+- Rate has negligible effect — bottleneck is QUIC loopback RTT (~2 ms)
+- `topo forward enable/disable` toggles hint delivery at runtime for A/B testing
+
+---
+
 # File Attachment Throughput
 
 Local encode + store + project for 256 KiB ciphertext slices (no sync).

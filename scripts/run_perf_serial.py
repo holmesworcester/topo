@@ -17,7 +17,9 @@ SUMMARY_PATTERN = re.compile(
     r"  RSS delta:|  Seeded keys:|  Lookups:|  Alice messages:|  Bob messages:|"
     r"  [A-Za-z0-9_-]+ peak RSS:|  P[0-9]+ peak RSS:|  Catchup wall|"
     r"  Events/s|  MB/s:|  Total attributed:|  Throughput:|  Tail converge|"
-    r"  All converge|  Hop latency|Generated|RUN_DIR=|SCENARIO=|DELTA_KIND=|"
+    r"  All converge|  Hop latency|  Delivery|  Live rate|  Live duration|"
+    r"  Peers:|  Preload|  Remote deliveries|  Stage breakdown|  Progress windows|"
+    r"    sent |Generated|RUN_DIR=|SCENARIO=|DELTA_KIND=|"
     r"BASE_EVENTS=|DELTA_EVENTS=|DELTA_FILES=|DELTA_FILE_SIZE_MIB=|"
     r"DELTA_FILE_SLICES_EXPECTED=|PRE_DELTA_MESSAGES=|POST_DELTA_MESSAGES=|"
     r"DELTA_MESSAGES_OBSERVED=|PRE_DELTA_FILE_SLICES=|POST_DELTA_FILE_SLICES=|"
@@ -425,6 +427,28 @@ class PerfRunner:
                 "--test-threads=1",
             ],
         )
+        self.run_delivery_latency_test(
+            "Delivery Latency Gate (2 msg/s, 15s, forward-on-have)",
+            "perf_two_peer_delivery_latency_gate",
+            extra_env={
+                "TOPO_PERF_PRELOAD_MESSAGES": "0",
+                "TOPO_PERF_MESSAGES_PER_SEC": "2",
+                "TOPO_PERF_LIVE_SECONDS": "15",
+                "TOPO_PERF_PROGRESS_WINDOWS": "6",
+            },
+            summary_file="two-peer-gate-pre0-m2-s15-w6.summary",
+        )
+        self.run_delivery_latency_test(
+            "Delivery Latency (10 msg/s, 20s, forward-on-have)",
+            "perf_two_peer_delivery_latency_over_time",
+            extra_env={
+                "TOPO_PERF_PRELOAD_MESSAGES": "0",
+                "TOPO_PERF_MESSAGES_PER_SEC": "10",
+                "TOPO_PERF_LIVE_SECONDS": "20",
+                "TOPO_PERF_PROGRESS_WINDOWS": "4",
+            },
+            summary_file="two-peer-pre0-m10-s20-w4.summary",
+        )
         self.run(
             "Topo Cascade (topo_cascade_10k)",
             [
@@ -471,6 +495,36 @@ class PerfRunner:
             allow_failure=allow_failure,
             summary_path=self.repo_root / f"target/perf-results/daemon_perf_test.{test_name}.summary",
         )
+
+    def run_delivery_latency_test(
+        self,
+        label: str,
+        test_name: str,
+        extra_env: dict[str, str] | None = None,
+        summary_file: str | None = None,
+    ) -> None:
+        args = [
+            "cargo",
+            "+stable",
+            "test",
+            "--release",
+            "--test",
+            "multi_peer_delivery_latency_perf_test",
+            test_name,
+            "--",
+            "--nocapture",
+            "--ignored",
+            "--test-threads=1",
+        ]
+        env = extra_env or {}
+        env.setdefault("P7_FORWARD_ON_HAVE", "1")
+        env.setdefault("TOPO_PERF_STAGE_BREAKDOWN", "1")
+        summary_path = (
+            self.repo_root / f"target/perf-results/{summary_file}"
+            if summary_file
+            else None
+        )
+        self.run_capture(label, args, extra_env=env, summary_path=summary_path)
 
     def run_topo_cascade(
         self, test_name: str, ignored: bool = False, extra_env: dict[str, str] | None = None,

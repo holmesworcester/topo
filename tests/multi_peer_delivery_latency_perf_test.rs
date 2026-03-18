@@ -18,8 +18,8 @@ use topo::testutil::{assert_eventually, start_peers_runtime_affine, Peer};
 
 const DEFAULT_MESSAGES_PER_SEC: usize = 5;
 const DEFAULT_LIVE_SECONDS: usize = 60;
-const TWO_PEER_SLA_MESSAGES_PER_SEC: usize = 2;
-const TWO_PEER_SLA_MAX_WORST_MS: i64 = 2_000;
+const TWO_PEER_GATE_MESSAGES_PER_SEC: usize = 2;
+const TWO_PEER_GATE_MAX_WORST_MS: i64 = 2_000;
 
 #[derive(Clone)]
 struct SentMessage {
@@ -951,16 +951,16 @@ async fn perf_two_peer_delivery_latency_over_time() {
 
 #[tokio::test]
 #[ignore]
-async fn perf_two_peer_delivery_latency_sla_2msg_per_sec() {
+async fn perf_two_peer_delivery_latency_gate() {
     maybe_init_tracing();
     let preload_messages = env_usize("TOPO_PERF_PRELOAD_MESSAGES", 0);
-    let messages_per_sec = env_usize("TOPO_PERF_MESSAGES_PER_SEC", TWO_PEER_SLA_MESSAGES_PER_SEC);
+    let messages_per_sec = env_usize("TOPO_PERF_MESSAGES_PER_SEC", TWO_PEER_GATE_MESSAGES_PER_SEC);
     let live_seconds = env_usize("TOPO_PERF_LIVE_SECONDS", 15);
     let window_count = env_usize("TOPO_PERF_PROGRESS_WINDOWS", 6);
 
     let (_, latency) = run_two_peer_latency_benchmark(
-        "Two-peer delivery latency SLA (in-process peer harness)",
-        "two-peer-sla",
+        "Two-peer delivery latency gate (in-process peer harness)",
+        "two-peer-gate",
         preload_messages,
         messages_per_sec,
         live_seconds,
@@ -969,10 +969,10 @@ async fn perf_two_peer_delivery_latency_sla_2msg_per_sec() {
     .await;
 
     assert!(
-        latency.worst.latency_ms <= TWO_PEER_SLA_MAX_WORST_MS,
-        "two-peer SLA failed: worst latency {} ms exceeded {} ms at {} msg/s over {}s",
+        latency.worst.latency_ms <= TWO_PEER_GATE_MAX_WORST_MS,
+        "delivery latency gate failed: worst {} ms exceeded {} ms at {} msg/s over {}s",
         latency.worst.latency_ms,
-        TWO_PEER_SLA_MAX_WORST_MS,
+        TWO_PEER_GATE_MAX_WORST_MS,
         messages_per_sec,
         live_seconds
     );
