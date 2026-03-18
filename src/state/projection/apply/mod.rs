@@ -1,9 +1,11 @@
+pub(crate) mod batch;
 mod cascade;
 mod dispatch;
 pub(crate) mod project_one;
 mod stages;
 mod write_exec;
 
+pub use batch::project_batch;
 pub use project_one::project_one;
 pub(crate) use stages::run_dep_and_projection_stages;
 

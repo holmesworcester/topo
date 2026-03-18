@@ -3,7 +3,7 @@ use crate::db::wanted::WantedEvents;
 use crate::state::live_hints::{self, LiveHintEvent};
 use crate::state::shared_workspace_fanout::fanout_shared_event_enqueue;
 
-use super::drain::drain_project_queue_on_connection;
+use super::drain::drain_project_queue_batched;
 use super::phases::PersistPhaseOutput;
 
 pub(super) trait PostCommitEffectsExecutor {
@@ -43,7 +43,7 @@ impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
         tenants.sort();
 
         for tenant_id in &tenants {
-            if let Err(e) = drain_project_queue_on_connection(self.db, tenant_id, batch_size) {
+            if let Err(e) = drain_project_queue_batched(self.db, tenant_id, batch_size) {
                 tracing::warn!("project_queue drain error for {}: {}", tenant_id, e);
             }
 
@@ -123,7 +123,7 @@ impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
         let mut sibling_list: Vec<String> = sibling_tenants.into_iter().collect();
         sibling_list.sort();
         for tenant_id in &sibling_list {
-            if let Err(e) = drain_project_queue_on_connection(self.db, tenant_id, batch_size) {
+            if let Err(e) = drain_project_queue_batched(self.db, tenant_id, batch_size) {
                 tracing::warn!("sibling project_queue drain error for {}: {}", tenant_id, e);
             }
         }
