@@ -94,6 +94,13 @@ cargo test --release --test low_mem_test -- --ignored --nocapture --test-threads
 scripts/run_lowmem.sh delta10k
 LOWMEM_BASE_EVENTS=100000 LOWMEM_DELTA_EVENTS=50000 scripts/run_lowmem.sh delta10k
 LOWMEM_BASE_EVENTS=500000 LOWMEM_DELTA_EVENTS=10000 scripts/run_lowmem.sh delta10k
+
+# Linux tc-based shaper validation (optional, requires root + tc)
+# Validates that the userspace UDP traffic shaper produces results
+# comparable to kernel htb + netem on loopback.  Skips gracefully
+# without root or when PERF_LINUX_TC is unset.
+sudo PERF_LINUX_TC=1 cargo +stable test --release \
+  --test tc_network_validation_test -- --ignored --nocapture --test-threads=1
 ```
 
 ## Latest Results
