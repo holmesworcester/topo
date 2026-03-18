@@ -933,6 +933,7 @@ async fn run_two_peer_latency_benchmark(
 #[ignore]
 async fn perf_two_peer_delivery_latency_over_time() {
     maybe_init_tracing();
+    std::env::set_var("TOPO_FORWARD_ON_HAVE", "1");
     let preload_messages = env_usize("TOPO_PERF_PRELOAD_MESSAGES", 0);
     let messages_per_sec = env_usize("TOPO_PERF_MESSAGES_PER_SEC", DEFAULT_MESSAGES_PER_SEC);
     let live_seconds = env_usize("TOPO_PERF_LIVE_SECONDS", DEFAULT_LIVE_SECONDS);
@@ -953,6 +954,7 @@ async fn perf_two_peer_delivery_latency_over_time() {
 #[ignore]
 async fn perf_two_peer_delivery_latency_gate() {
     maybe_init_tracing();
+    std::env::set_var("TOPO_FORWARD_ON_HAVE", "1");
     let preload_messages = env_usize("TOPO_PERF_PRELOAD_MESSAGES", 0);
     let messages_per_sec = env_usize("TOPO_PERF_MESSAGES_PER_SEC", TWO_PEER_GATE_MESSAGES_PER_SEC);
     let live_seconds = env_usize("TOPO_PERF_LIVE_SECONDS", 15);
@@ -1002,17 +1004,17 @@ async fn perf_delivery_forward_only() {
     .await;
 }
 
-/// Negentropy only: no hint bus, fast 100 ms rounds.  Shows the baseline
-/// latency when forward-on-have is disabled.
+/// Negentropy only: no hint bus, default 5 s rounds.  Shows the actual
+/// production baseline latency when forward-on-have is disabled.
 #[tokio::test]
 #[ignore]
 async fn perf_delivery_negentropy_only() {
     maybe_init_tracing();
     std::env::set_var("TOPO_FORWARD_ON_HAVE", "0");
-    std::env::set_var("TOPO_DISCOVERY_ROUND_GAP_MS", "100");
+    std::env::set_var("TOPO_DISCOVERY_ROUND_GAP_MS", "5000");
 
     let _ = run_two_peer_latency_benchmark(
-        "Delivery latency: negentropy only, 100ms rounds (in-process peer harness)",
+        "Delivery latency: negentropy only, 5s rounds (in-process peer harness)",
         "two-peer-negentropy",
         0,
         2,

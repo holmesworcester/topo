@@ -294,12 +294,12 @@ Two discovery modes, tested independently and together. 2 msg/s × 15 s, in-proc
 
 | Discovery mode | avg | p50 | p95 | worst |
 |----------------|-----|-----|-----|-------|
-| forward-on-have only | 2.4 ms | 3 ms | 4 ms | 4 ms |
-| negentropy only (100 ms rounds) | 54 ms | 50 ms | 104 ms | 106 ms |
-| **both (production)** | **3.2 ms** | **3 ms** | **5 ms** | **20 ms** |
+| forward-on-have only | 2.7 ms | 3 ms | 4 ms | 5 ms |
+| negentropy only (5 s rounds) | 2,561 ms | 2,805 ms | 4,813 ms | 4,833 ms |
+| **both (production)** | **2.5 ms** | **3 ms** | **4 ms** | **4 ms** |
 
-- Forward-on-have pushes hints to peers immediately via broadcast channel — 20× faster than round-based discovery
-- Negentropy avg ≈ half the round gap (~50 ms at 100 ms rounds) — expected
+- Forward-on-have pushes hints to peers immediately via broadcast channel — 1,000× faster than round-based discovery at production cadence
+- Negentropy avg ≈ half the round gap (~2.5 s at 5 s rounds) — expected
 - Production mode tracks the forward path; negentropy is invisible unless hints are lost
 - Gate assertion: worst ≤ 50 ms at 2 msg/s (actual: 4 ms)
 - `topo forward enable/disable` toggles hint delivery at runtime for A/B testing

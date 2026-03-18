@@ -444,7 +444,7 @@ class PerfRunner:
             summary_file="two-peer-forward-pre0-m2-s15-w6.summary",
         )
         self.run_delivery_latency_test(
-            "Delivery Latency: negentropy only, 100ms rounds (2 msg/s, 15s)",
+            "Delivery Latency: negentropy only, 5s rounds (2 msg/s, 15s)",
             "perf_delivery_negentropy_only",
             extra_env={"TOPO_FORWARD_ON_HAVE": "0"},
             summary_file="two-peer-negentropy-pre0-m2-s15-w6.summary",

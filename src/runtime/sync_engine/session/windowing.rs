@@ -38,30 +38,17 @@ pub fn reset_outbound_window_state(db_path: &str, peer_id: &str) {
     state.remove(&key);
 }
 
-pub fn select_outbound_window(db_path: &str, peer_id: &str, now_ms: i64) -> SyncWindow {
+pub fn select_outbound_window(_db_path: &str, _peer_id: &str, now_ms: i64) -> SyncWindow {
+    // Always use Full window.  The previous Hot/Cold split assumed a fast round
+    // cadence (100 ms) where Cold could sweep old events on a slower cadence.
+    // With the production round gap at 5 s, the Cold condition fired every round,
+    // making all rounds Cold (ts < now-30s) and hiding freshly created events for
+    // 30+ seconds.  A single Full window avoids that bug and keeps the protocol
+    // simple: one negentropy snapshot per round, covering the entire event set.
     let cutoff_ms = now_ms - HOT_WINDOW_MS;
-    let key = format!("{db_path}|{peer_id}");
-    let mut state = planner_state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    match state.entry(key).or_insert(PlannerState::NeedFull) {
-        PlannerState::NeedFull => SyncWindow {
-            kind: SyncWindowKind::Full,
-            cutoff_ms,
-        },
-        PlannerState::Established { last_cold_ms }
-            if now_ms - *last_cold_ms >= COLD_SESSION_INTERVAL_MS =>
-        {
-            *last_cold_ms = now_ms;
-            SyncWindow {
-                kind: SyncWindowKind::Cold,
-                cutoff_ms,
-            }
-        }
-        PlannerState::Established { .. } => SyncWindow {
-            kind: SyncWindowKind::Hot,
-            cutoff_ms,
-        },
+    SyncWindow {
+        kind: SyncWindowKind::Full,
+        cutoff_ms,
     }
 }
 
