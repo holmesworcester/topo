@@ -81,7 +81,7 @@ pub fn assert_identity_eventually_materialized(db_path: &str, timeout_ms: u64) {
     }
 }
 
-pub fn wait_for_bootstrap_supersession_and_endpoint_observation(
+pub fn wait_for_endpoint_observation(
     db_path: &str,
     remote_peer_id: &str,
     timeout: Duration,
@@ -93,18 +93,6 @@ pub fn wait_for_bootstrap_supersession_and_endpoint_observation(
             .expect("system time")
             .as_millis() as i64;
         let conn = topo::db::open_connection(db_path).expect("open db");
-        let bootstrap_rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM invite_bootstrap_trust", [], |row| {
-                row.get(0)
-            })
-            .expect("count invite_bootstrap_trust");
-        let pending_rows: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pending_invite_bootstrap_trust",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count pending_invite_bootstrap_trust");
         let observed_rows: i64 = conn
             .query_row(
                 "SELECT COUNT(*)
@@ -117,12 +105,12 @@ pub fn wait_for_bootstrap_supersession_and_endpoint_observation(
             .expect("count peer_endpoint_observations");
         drop(conn);
 
-        if bootstrap_rows == 0 && pending_rows == 0 && observed_rows > 0 {
+        if observed_rows > 0 {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "bootstrap supersession + endpoint observation did not converge for peer {} in {}ms",
+            "endpoint observation did not appear for peer {} in {}ms",
             remote_peer_id,
             timeout.as_millis()
         );

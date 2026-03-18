@@ -2198,7 +2198,7 @@ pub fn seed_invite_bootstrap_trust(
     .expect("record_invite_bootstrap_trust");
 }
 
-pub fn wait_for_bootstrap_supersession_and_endpoint_observation(
+pub fn wait_for_endpoint_observation(
     db_path: &str,
     remote_peer_id: &str,
     timeout: Duration,

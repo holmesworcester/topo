@@ -88,10 +88,11 @@ mod tests {
         }
     }
 
-    // ── SPEC_BOOTSTRAP_CONSUMED_01 + SPEC_PENDING_CONSUMED_01: pass ──
+    // Bootstrap trust rows are intentionally NOT deleted by PeerShared projection.
+    // They survive as autodial fallback targets and expire via 24h TTL.
 
     #[test]
-    fn test_peer_shared_consumes_bootstrap_trust() {
+    fn test_peer_shared_preserves_bootstrap_trust() {
         let pk = [5u8; 32];
         let parsed = make_peer_shared(pk, [6u8; 32]);
         let ctx = empty_ctx();
@@ -99,8 +100,8 @@ mod tests {
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
-        assert_deletes_from_table(&result, "pending_invite_bootstrap_trust");
-        assert_deletes_from_table(&result, "invite_bootstrap_trust");
+        assert_no_write_to_table(&result, "pending_invite_bootstrap_trust");
+        assert_no_write_to_table(&result, "invite_bootstrap_trust");
     }
 
     #[test]

@@ -35,7 +35,7 @@ fn test_cli_local_mdns_discovery_without_bootstrap_addresses() {
     assert_event_visible_on_all(&[&bob.db], &bootstrap_eid, timeout_ms);
     assert_identity_eventually_materialized(&bob.db, timeout_ms);
     let alice_peer_id = active_tenant_peer_id(&alice_db).expect("alice active tenant");
-    wait_for_bootstrap_supersession_and_endpoint_observation(
+    wait_for_endpoint_observation(
         &bob.db,
         &alice_peer_id,
         std::time::Duration::from_secs(120),

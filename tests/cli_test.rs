@@ -77,7 +77,7 @@ fn tenant_index_for_peer_id(db_path: &str, peer_id: &str) -> usize {
         .expect("peer id should appear in tenant scopes")
 }
 
-fn wait_for_bootstrap_supersession_and_endpoint_observation(
+fn wait_for_endpoint_observation(
     db_path: &str,
     remote_peer_id: &str,
     timeout: Duration,
@@ -89,18 +89,6 @@ fn wait_for_bootstrap_supersession_and_endpoint_observation(
             .expect("system time")
             .as_millis() as i64;
         let conn = open_connection(db_path).expect("open db");
-        let bootstrap_rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM invite_bootstrap_trust", [], |row| {
-                row.get(0)
-            })
-            .expect("count invite_bootstrap_trust");
-        let pending_rows: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM pending_invite_bootstrap_trust",
-                [],
-                |row| row.get(0),
-            )
-            .expect("count pending_invite_bootstrap_trust");
         let observed_rows: i64 = conn
             .query_row(
                 "SELECT COUNT(*)
@@ -113,17 +101,15 @@ fn wait_for_bootstrap_supersession_and_endpoint_observation(
             .expect("count peer_endpoint_observations");
         drop(conn);
 
-        if bootstrap_rows == 0 && pending_rows == 0 && observed_rows > 0 {
+        if observed_rows > 0 {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "bootstrap trust did not supersede into observed-endpoint state for db={} remote={} within {:?} (bootstrap_rows={}, pending_rows={}, observed_rows={})",
+            "endpoint observation did not appear for db={} remote={} within {:?} (observed_rows={})",
             db_path,
             remote_peer_id,
             timeout,
-            bootstrap_rows,
-            pending_rows,
             observed_rows
         );
         std::thread::sleep(Duration::from_millis(100));
@@ -953,7 +939,7 @@ fn test_cli_reconnects_after_bootstrap_supersession_using_observed_endpoint() {
     );
 
     let alice_transport_peer_id = daemon_transport_fingerprint(&alice_db);
-    wait_for_bootstrap_supersession_and_endpoint_observation(
+    wait_for_endpoint_observation(
         &bob_db,
         &alice_transport_peer_id,
         Duration::from_secs(15),
@@ -1011,7 +997,7 @@ fn test_cli_lowmem_receiver_restart_catches_offline_delta_and_resumes_sync() {
     assert_eventually(&bob_db, "message_count >= 2000", timeout_ms);
 
     let alice_transport_peer_id = daemon_transport_fingerprint(&alice_db);
-    wait_for_bootstrap_supersession_and_endpoint_observation(
+    wait_for_endpoint_observation(
         &bob_db,
         &alice_transport_peer_id,
         Duration::from_secs(15),
@@ -2640,7 +2626,7 @@ fn test_cli_shared_db_same_workspace_accepts_distinct_explicit_invites() {
     );
     let _shared_daemon = start_daemon(&shared_db);
     let alpha_transport_peer_id = daemon_transport_fingerprint(&alpha.db);
-    wait_for_bootstrap_supersession_and_endpoint_observation(
+    wait_for_endpoint_observation(
         &shared_db,
         &alpha_transport_peer_id,
         Duration::from_secs(30),
@@ -2653,7 +2639,7 @@ fn test_cli_shared_db_same_workspace_accepts_distinct_explicit_invites() {
         "dave-laptop",
     );
     let dave_tenant = dave.tenant_label();
-    wait_for_bootstrap_supersession_and_endpoint_observation(
+    wait_for_endpoint_observation(
         &dave.db,
         &alpha_transport_peer_id,
         Duration::from_secs(30),
@@ -2848,12 +2834,12 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
     let _shared_daemon = start_daemon(&shared_db);
     let alpha_transport_peer_id = daemon_transport_fingerprint(&alpha.db);
     let zeta_transport_peer_id = daemon_transport_fingerprint(&zeta.db);
-    wait_for_bootstrap_supersession_and_endpoint_observation(
+    wait_for_endpoint_observation(
         &shared_db,
         &alpha_transport_peer_id,
         Duration::from_secs(30),
     );
-    wait_for_bootstrap_supersession_and_endpoint_observation(
+    wait_for_endpoint_observation(
         &shared_db,
         &zeta_transport_peer_id,
         Duration::from_secs(30),
@@ -2871,7 +2857,7 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
     );
     let dave_tenant = dave.tenant_label();
     wait_for_active_tenant_ready(&dave.db, Duration::from_millis(timeout_ms));
-    wait_for_bootstrap_supersession_and_endpoint_observation(
+    wait_for_endpoint_observation(
         &dave.db,
         &alpha_transport_peer_id,
         Duration::from_secs(30),
@@ -2886,7 +2872,7 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
     );
     let emma_tenant = emma.tenant_label();
     wait_for_active_tenant_ready(&emma.db, Duration::from_millis(timeout_ms));
-    wait_for_bootstrap_supersession_and_endpoint_observation(
+    wait_for_endpoint_observation(
         &emma.db,
         &zeta_transport_peer_id,
         Duration::from_secs(30),
