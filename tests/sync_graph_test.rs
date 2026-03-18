@@ -253,17 +253,127 @@ async fn run_chain_bench(n: usize, event_count: usize) {
     eprintln!();
 }
 
-/// 10-hop chain smoke: 10 peers, 10k events.
+/// 10-hop chain smoke: 10 peers, 10k events (pre-seeded bulk).
 #[tokio::test]
 async fn ten_hop_chain_10k() {
     run_chain_bench(10, 10_000).await;
 }
 
-/// 10-hop chain: 10 peers, 50k events.
+/// 10-hop chain: 10 peers, 50k events (pre-seeded bulk).
 #[tokio::test]
 #[ignore]
 async fn ten_hop_chain_50k() {
     run_chain_bench(10, 50_000).await;
+}
+
+// ---------------------------------------------------------------------------
+// Family A2: Live-rate chain propagation
+// ---------------------------------------------------------------------------
+
+/// Run a chain test where messages are injected at a controlled rate while
+/// the chain is already running.  This isolates forward-on-have per-message
+/// delivery rather than bulk-transfer throughput.
+async fn run_chain_live_rate(n: usize, messages_per_sec: usize, live_seconds: usize) {
+    assert!(n >= 2);
+    assert!(messages_per_sec > 0);
+    assert!(live_seconds > 0);
+
+    let mut peers = Vec::with_capacity(n);
+    peers.push(Peer::new_with_identity("p0"));
+    for i in 1..n {
+        let joined = Peer::new_in_workspace(&format!("p{}", i), &peers[0]).await;
+        peers.push(joined);
+    }
+    converge_workspace_transport_graph(&peers).await;
+
+    let handles = start_chain(&peers);
+
+    // Warmup: one message end-to-end to confirm the chain is live.
+    let warmup_id = peers[0].create_message("chain-warmup");
+    let warmup_b64 = event_id_to_base64(&warmup_id);
+    let tail = &peers[n - 1];
+    assert_eventually(
+        || tail.has_event(&warmup_b64),
+        Duration::from_secs(120),
+        "chain warmup convergence at tail",
+    )
+    .await;
+
+    // Inject messages at the controlled rate from P0.
+    let total_messages = messages_per_sec * live_seconds;
+    let start = Instant::now();
+    let mut event_ids = Vec::with_capacity(total_messages);
+    for seq in 0..total_messages {
+        let target_elapsed = Duration::from_secs_f64(seq as f64 / messages_per_sec as f64);
+        if let Some(remaining) = target_elapsed.checked_sub(start.elapsed()) {
+            std::thread::sleep(remaining);
+        }
+        event_ids.push(peers[0].create_message(&format!("live-{}", seq)));
+    }
+
+    // Wait for all messages to reach the tail peer.
+    let expected_count = (total_messages + 1) as i64; // +1 for warmup
+    assert_eventually(
+        || tail.recorded_message_event_count() >= expected_count,
+        Duration::from_secs(300),
+        "chain live-rate convergence at tail",
+    )
+    .await;
+    let wall_secs = start.elapsed().as_secs_f64();
+
+    // Collect per-event delivery latency from P0 to tail.
+    let delivery_ms = collect_per_event_delivery_latencies(&peers[0], tail);
+
+    drop(handles);
+
+    // Report.
+    let avg = if delivery_ms.is_empty() {
+        0.0
+    } else {
+        delivery_ms.iter().sum::<i64>() as f64 / delivery_ms.len() as f64
+    };
+    let best = delivery_ms.first().copied().unwrap_or(0);
+    let worst = delivery_ms.last().copied().unwrap_or(0);
+    let p50_idx = ((delivery_ms.len() as f64 * 0.50) as usize).min(delivery_ms.len().saturating_sub(1));
+    let p95_idx = ((delivery_ms.len() as f64 * 0.95) as usize).min(delivery_ms.len().saturating_sub(1));
+    let p50 = delivery_ms.get(p50_idx).copied().unwrap_or(0);
+    let p95 = delivery_ms.get(p95_idx).copied().unwrap_or(0);
+
+    eprintln!();
+    eprintln!(
+        "=== Chain live-rate: {} peers, {} msg/s, {}s ===",
+        n, messages_per_sec, live_seconds
+    );
+    eprintln!("  Messages:         {}", total_messages);
+    eprintln!("  Wall time:        {:.1}s", wall_secs);
+    eprintln!(
+        "  Delivery P0->P{}: best={} avg={:.0} p50={} p95={} worst={} ms ({} events)",
+        n - 1,
+        best,
+        avg,
+        p50,
+        p95,
+        worst,
+        delivery_ms.len()
+    );
+    eprintln!();
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
+    std::env::var(name)
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(default)
+}
+
+/// 10-hop chain, live injection at configurable rate.
+/// Default: 2 msg/s for 15s.  Override with TOPO_PERF_MESSAGES_PER_SEC / TOPO_PERF_LIVE_SECONDS.
+#[tokio::test]
+#[ignore]
+async fn ten_hop_chain_live_rate() {
+    let mps = env_usize("TOPO_PERF_MESSAGES_PER_SEC", 2);
+    let secs = env_usize("TOPO_PERF_LIVE_SECONDS", 15);
+    run_chain_live_rate(10, mps, secs).await;
 }
 
 // ---------------------------------------------------------------------------
