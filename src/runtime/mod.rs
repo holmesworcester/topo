@@ -4,6 +4,7 @@ pub mod memtrace;
 pub mod peering;
 pub(crate) mod repeated_warning;
 pub mod setup;
+pub mod sync_control;
 pub mod sync_engine;
 pub mod transport;
 

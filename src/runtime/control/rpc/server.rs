@@ -27,7 +27,7 @@ const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 
 #[derive(Debug, Clone)]
 struct TenantScope {
-    peer_id: String,
+    tenant_id: String,
 }
 
 fn discover_tenant_scopes(
@@ -41,7 +41,7 @@ fn discover_tenant_scopes(
     let rows = stmt
         .query_map([], |row| {
             Ok(TenantScope {
-                peer_id: row.get(0)?,
+                tenant_id: row.get(0)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -69,6 +69,8 @@ pub struct DaemonState {
     pub runtime_recheck: Notify,
     /// Invite/link strings stored by number (index+1 = invite ref number).
     pub invite_refs: RwLock<Vec<String>>,
+    /// Sync control registry for manual sync operations.
+    pub sync_control: Arc<crate::runtime::sync_control::SyncControlRegistry>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -93,7 +95,7 @@ impl DaemonState {
             Ok(conn) => {
                 let _ = crate::db::schema::create_tables(&conn);
                 match discover_tenant_scopes(&conn) {
-                    Ok(tenants) if tenants.len() == 1 => Some(tenants[0].peer_id.clone()),
+                    Ok(tenants) if tenants.len() == 1 => Some(tenants[0].tenant_id.clone()),
                     Ok(_) => None,
                     Err(_) => None,
                 }
@@ -111,6 +113,9 @@ impl DaemonState {
             upnp_result: RwLock::new(None),
             runtime_recheck: Notify::new(),
             invite_refs: RwLock::new(Vec::new()),
+            sync_control: Arc::new(crate::runtime::sync_control::SyncControlRegistry::new(
+                db_path.to_string(),
+            )),
         }
     }
 
@@ -146,7 +151,7 @@ impl DaemonState {
         if let Some(peer_id) = cached {
             match discovered.as_ref() {
                 Some(tenants) => {
-                    if tenants.iter().any(|t| t.peer_id == peer_id) {
+                    if tenants.iter().any(|t| t.tenant_id == peer_id) {
                         return Ok(peer_id);
                     }
                     *self.active_peer.write().unwrap() = None;
@@ -160,7 +165,7 @@ impl DaemonState {
 
         if let Some(tenants) = discovered {
             if tenants.len() == 1 {
-                let peer_id = tenants[0].peer_id.clone();
+                let peer_id = tenants[0].tenant_id.clone();
                 *self.active_peer.write().unwrap() = Some(peer_id.clone());
                 return Ok(peer_id);
             }
@@ -1323,6 +1328,85 @@ fn dispatch(
             Ok(peer_id) => match workspace::view_for_peer(db_path, &peer_id, limit) {
                 Ok(data) => RpcResponse::success(data),
                 Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+
+        // ----- Sync control -----
+        RpcMethod::SyncPolicyShow => match state.require_active_peer() {
+            Ok(tenant_id) => match state.sync_control.load_policy(&tenant_id) {
+                Ok(policy) => RpcResponse::success(policy),
+                Err(e) => RpcResponse::error(e),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+
+        RpcMethod::SyncPolicySet {
+            requests,
+            responses,
+            forward_on_have,
+        } => match state.require_active_peer() {
+            Ok(tenant_id) => {
+                use crate::shared::sync_control::SyncPolicyMode;
+                let parse = |s: Option<String>| -> Result<Option<SyncPolicyMode>, String> {
+                    match s {
+                        None => Ok(None),
+                        Some(v) => v.parse::<SyncPolicyMode>().map(Some),
+                    }
+                };
+                let r = match parse(requests) {
+                    Ok(v) => v,
+                    Err(e) => return RpcResponse::error(e),
+                };
+                let resp = match parse(responses) {
+                    Ok(v) => v,
+                    Err(e) => return RpcResponse::error(e),
+                };
+                let foh = match parse(forward_on_have) {
+                    Ok(v) => v,
+                    Err(e) => return RpcResponse::error(e),
+                };
+                match state.sync_control.update_policy(&tenant_id, r, resp, foh) {
+                    Ok(policy) => RpcResponse::success(policy),
+                    Err(e) => RpcResponse::error(e),
+                }
+            }
+            Err(e) => RpcResponse::error(e),
+        },
+
+        RpcMethod::SyncRoundPeer { peer } => match state.require_active_peer() {
+            Ok(tenant_id) => match state.sync_control.trigger_round_for_peer(&tenant_id, &peer) {
+                Ok(capture) => RpcResponse::success(capture),
+                Err(e) => RpcResponse::error(e),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+
+        RpcMethod::SyncRoundAll => match state.require_active_peer() {
+            Ok(tenant_id) => match state.sync_control.trigger_round_for_all(&tenant_id) {
+                Ok(captures) => RpcResponse::success(captures),
+                Err(e) => RpcResponse::error(e),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+
+        RpcMethod::SyncRequestPeer { peer } => match state.require_active_peer() {
+            Ok(tenant_id) => {
+                match state
+                    .sync_control
+                    .trigger_request_for_peer(&tenant_id, &peer)
+                {
+                    Ok(result) => RpcResponse::success(result),
+                    Err(e) => RpcResponse::error(e),
+                }
+            }
+            Err(e) => RpcResponse::error(e),
+        },
+
+        RpcMethod::SyncRequestAll => match state.require_active_peer() {
+            Ok(tenant_id) => match state.sync_control.trigger_request_for_all(&tenant_id) {
+                Ok(results) => RpcResponse::success(results),
+                Err(e) => RpcResponse::error(e),
             },
             Err(e) => RpcResponse::error(e),
         },

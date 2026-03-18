@@ -80,6 +80,8 @@ pub async fn run_sync_responder<C, S, R>(
     shared_ingest: mpsc::Sender<IngestItem>,
     capture: Option<SyncRunCapture>,
     rx_capture: Option<SyncRunRxCapture>,
+    mut command_rx: Option<tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>>,
+    policy_rx: Option<tokio::sync::watch::Receiver<crate::shared::sync_control::TenantSyncPolicy>>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
     C: StreamConn,
@@ -254,6 +256,41 @@ where
             break;
         }
 
+        // Process manual commands from the sync control registry.
+        if let Some(ref mut rx) = command_rx {
+            while let Ok(cmd) = rx.try_recv() {
+                use crate::runtime::sync_control::SessionCommand;
+                match cmd {
+                    SessionCommand::ForceRound { reply } => {
+                        let _ = reply.send(Err(
+                            "only initiator sessions can drive negentropy rounds".to_string(),
+                        ));
+                    }
+                    SessionCommand::ForceRequest { reply } => {
+                        let (count, ids) = refill_wanted_requests(
+                            &mut control,
+                            &wanted,
+                            &timeline,
+                            coordination,
+                            peer_id,
+                            request_state,
+                        )
+                        .await?;
+                        if count > 0 {
+                            last_activity = Instant::now();
+                        }
+                        let id_hexes: Vec<String> =
+                            ids.iter().map(|id| hex::encode(id)).collect();
+                        let _ = reply.send(Ok(crate::runtime::sync_control::ManualSyncRequestResult {
+                            peer_id: peer_id.to_string(),
+                            requested_ids: id_hexes,
+                            reason: None,
+                        }));
+                    }
+                }
+            }
+        }
+
         // Check for reconciliation response from worker thread
         if reconciling {
             match neg_resp_rx
@@ -420,17 +457,23 @@ where
             Err(_) => {}
         }
 
-        let requested_now = refill_wanted_requests(
-            &mut control,
-            &wanted,
-            &timeline,
-            coordination,
-            peer_id,
-            request_state,
-        )
-        .await?;
-        if requested_now > 0 {
-            last_activity = Instant::now();
+        let auto_requests = policy_rx
+            .as_ref()
+            .map(|rx| rx.borrow().requests == crate::shared::sync_control::SyncPolicyMode::Auto)
+            .unwrap_or(true);
+        if auto_requests {
+            let (requested_now, _) = refill_wanted_requests(
+                &mut control,
+                &wanted,
+                &timeline,
+                coordination,
+                peer_id,
+                request_state,
+            )
+            .await?;
+            if requested_now > 0 {
+                last_activity = Instant::now();
+            }
         }
 
         // Drain requested responses to data stream — runs even while worker is reconciling

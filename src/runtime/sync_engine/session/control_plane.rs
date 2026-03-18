@@ -117,19 +117,19 @@ pub async fn refill_wanted_requests<C>(
     coordination: &PeerCoord,
     peer_id: &str,
     request_state: &ConnectionRequestState,
-) -> Result<usize, SyncError>
+) -> Result<(usize, Vec<EventId>), SyncError>
 where
     C: StreamConn,
 {
     let now_ms = crate::db::queue::current_timestamp_ms();
     let snapshot = request_state.snapshot(now_ms);
     if snapshot.remote_credit_bytes == 0 {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
 
     let credit_bytes = snapshot.remote_credit_bytes;
     if credit_bytes == 0 {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
 
     let candidate_limit = candidate_limit_for_credit_bytes(credit_bytes, snapshot.inflight_requested.len());
@@ -142,7 +142,7 @@ where
         now_ms,
     )?;
     if selected.is_empty() {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
     if let Some(credit_received_at) = snapshot.last_credit_received_at {
         let selected_ids: Vec<EventId> = selected.iter().map(|candidate| candidate.event_id).collect();
@@ -185,7 +185,8 @@ where
         stats.remote_credit_bytes,
         candidate_limit
     );
-    Ok(selected_ids.len())
+    let count = selected_ids.len();
+    Ok((count, selected_ids))
 }
 
 pub async fn send_response_credit_bytes<C>(control: &mut C, bytes: usize) -> Result<(), SyncError>

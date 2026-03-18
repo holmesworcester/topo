@@ -15,6 +15,7 @@ use tracing::info;
 
 use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::peering::loops::IntroSpawnerFn;
+use crate::runtime::sync_control::SyncControlRegistry;
 use crate::transport::multi_workspace::TransportTargetCertResolver;
 
 use startup::setup_endpoint_and_tenants;
@@ -41,6 +42,7 @@ pub async fn run_node(
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     cert_resolver: Arc<TransportTargetCertResolver>,
+    sync_control: Option<Arc<SyncControlRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let startup::StartupResult {
         endpoint,
@@ -59,6 +61,7 @@ pub async fn run_node(
         local_transport_peer_ids,
         intro_spawner,
         ingest,
+        sync_control,
     );
 
     let events_received = runtime_supervisor
