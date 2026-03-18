@@ -977,3 +977,67 @@ async fn perf_two_peer_delivery_latency_gate() {
         live_seconds
     );
 }
+
+// ---------------------------------------------------------------------------
+// Discovery-mode comparison: forward-only / negentropy-only / both
+// ---------------------------------------------------------------------------
+
+/// Forward-on-have only: hints deliver events, negentropy round gap is
+/// effectively infinite (5 min).  Proves hint-path latency in isolation.
+#[tokio::test]
+#[ignore]
+async fn perf_delivery_forward_only() {
+    maybe_init_tracing();
+    std::env::set_var("TOPO_FORWARD_ON_HAVE", "1");
+    std::env::set_var("TOPO_DISCOVERY_ROUND_GAP_MS", "300000");
+
+    let _ = run_two_peer_latency_benchmark(
+        "Delivery latency: forward-on-have only (in-process peer harness)",
+        "two-peer-forward",
+        0,
+        2,
+        15,
+        6,
+    )
+    .await;
+}
+
+/// Negentropy only: no hint bus, fast 100 ms rounds.  Shows the baseline
+/// latency when forward-on-have is disabled.
+#[tokio::test]
+#[ignore]
+async fn perf_delivery_negentropy_only() {
+    maybe_init_tracing();
+    std::env::set_var("TOPO_FORWARD_ON_HAVE", "0");
+    std::env::set_var("TOPO_DISCOVERY_ROUND_GAP_MS", "100");
+
+    let _ = run_two_peer_latency_benchmark(
+        "Delivery latency: negentropy only, 100ms rounds (in-process peer harness)",
+        "two-peer-negentropy",
+        0,
+        2,
+        15,
+        6,
+    )
+    .await;
+}
+
+/// Both enabled: forward-on-have + default 5 s negentropy rounds.
+/// This is the production configuration.
+#[tokio::test]
+#[ignore]
+async fn perf_delivery_both() {
+    maybe_init_tracing();
+    std::env::set_var("TOPO_FORWARD_ON_HAVE", "1");
+    std::env::set_var("TOPO_DISCOVERY_ROUND_GAP_MS", "5000");
+
+    let _ = run_two_peer_latency_benchmark(
+        "Delivery latency: both, production mode (in-process peer harness)",
+        "two-peer-both",
+        0,
+        2,
+        15,
+        6,
+    )
+    .await;
+}
