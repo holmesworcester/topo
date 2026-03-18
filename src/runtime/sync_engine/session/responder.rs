@@ -27,7 +27,9 @@ use crate::db::{
 };
 use crate::protocol::Frame;
 use crate::runtime::memtrace;
+use crate::runtime::sync_control::{ManualSyncRequestResult, SessionCommand};
 use crate::runtime::SyncStats;
+use crate::shared::sync_control::{SyncPolicyMode, TenantSyncPolicy};
 use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
@@ -77,6 +79,8 @@ pub async fn run_sync_responder<C, S, R>(
     shared_ingest: mpsc::Sender<IngestItem>,
     capture: Option<SyncRunCapture>,
     rx_capture: Option<SyncRunRxCapture>,
+    mut command_rx: Option<tokio::sync::mpsc::Receiver<SessionCommand>>,
+    policy_rx: Option<tokio::sync::watch::Receiver<TenantSyncPolicy>>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
     C: StreamConn,
@@ -233,6 +237,42 @@ where
             break;
         }
 
+        // Process manual commands from the sync control registry.
+        if let Some(ref mut rx) = command_rx {
+            while let Ok(cmd) = rx.try_recv() {
+                match cmd {
+                    SessionCommand::ForceRound { reply } => {
+                        let _ = reply.send(Err(
+                            "only initiator sessions can drive negentropy rounds".to_string(),
+                        ));
+                    }
+                    SessionCommand::ForceRequest { reply } => {
+                        let (count, ids) = refill_wanted_requests(
+                            &mut control,
+                            &wanted,
+                            &timeline,
+                            coordination,
+                            peer_id,
+                            request_state,
+                        )
+                        .await?;
+                        if count > 0 {
+                            last_activity = Instant::now();
+                        }
+                        let id_hexes: Vec<String> =
+                            ids.iter().map(|id| hex::encode(id)).collect();
+                        let _ = reply.send(Ok(ManualSyncRequestResult {
+                            tenant_id: recorded_by.to_string(),
+                            peer_id: peer_id.to_string(),
+                            role: "responder".to_string(),
+                            requested_ids: id_hexes,
+                            reason: None,
+                        }));
+                    }
+                }
+            }
+        }
+
         // Check for reconciliation response from worker thread
         if reconciling {
             match neg_resp_rx
@@ -363,17 +403,23 @@ where
             Err(_) => {}
         }
 
-        let requested_now = refill_wanted_requests(
-            &mut control,
-            &wanted,
-            &timeline,
-            coordination,
-            peer_id,
-            request_state,
-        )
-        .await?;
-        if requested_now > 0 {
-            last_activity = Instant::now();
+        let auto_requests_allowed = policy_rx
+            .as_ref()
+            .map(|rx| rx.borrow().requests == SyncPolicyMode::Auto)
+            .unwrap_or(true);
+        if auto_requests_allowed {
+            let (requested_now, _) = refill_wanted_requests(
+                &mut control,
+                &wanted,
+                &timeline,
+                coordination,
+                peer_id,
+                request_state,
+            )
+            .await?;
+            if requested_now > 0 {
+                last_activity = Instant::now();
+            }
         }
 
         // Drain requested responses to data stream — runs even while worker is reconciling

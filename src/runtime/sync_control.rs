@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
+use std::time::Duration;
 
 use serde::Serialize;
 use tokio::sync::watch;
@@ -51,6 +52,29 @@ pub struct ManualSyncRequestResult {
     pub reason: Option<String>,
 }
 
+// ---------------------------------------------------------------------------
+// Session command channel: CLI → live session loop
+// ---------------------------------------------------------------------------
+
+/// Commands that the CLI can send into a live sync session loop via the
+/// registry's command channel.
+pub enum SessionCommand {
+    /// Force an immediate negentropy reconciliation round (initiator only).
+    /// The std::sync reply channel carries the result back to the blocking
+    /// RPC thread.
+    ForceRound {
+        reply: std::sync::mpsc::Sender<Result<ManualSyncRoundCapture, String>>,
+    },
+    /// Force immediate request issuance from wanted state.
+    ForceRequest {
+        reply: std::sync::mpsc::Sender<Result<ManualSyncRequestResult, String>>,
+    },
+}
+
+// ---------------------------------------------------------------------------
+// ActionCaptureHub — frame-level capture for manual actions
+// ---------------------------------------------------------------------------
+
 #[derive(Clone, Default)]
 pub struct ActionCaptureHub {
     inner: Arc<Mutex<Option<ActiveCapture>>>,
@@ -79,11 +103,6 @@ impl ActionCaptureHub {
         Some((capture.started_at_ms, now_ms(), capture.events))
     }
 
-    pub fn clear(&self) {
-        let mut guard = self.inner.lock().expect("action capture mutex poisoned");
-        *guard = None;
-    }
-
     pub fn record_frame(&self, lane: LogLane, dir: LogDir, frame: &Frame, msg_len: usize) {
         let mut guard = self.inner.lock().expect("action capture mutex poisoned");
         let Some(capture) = guard.as_mut() else {
@@ -103,13 +122,17 @@ impl ActionCaptureHub {
     }
 }
 
+// ---------------------------------------------------------------------------
+// Registry internals
+// ---------------------------------------------------------------------------
+
 #[derive(Clone)]
 struct RegisteredSessionEntry {
-    #[allow(dead_code)]
     registration_id: u64,
     role: String,
     peer_id: String,
     tenant_id: String,
+    command_tx: tokio::sync::mpsc::Sender<SessionCommand>,
 }
 
 #[derive(Default)]
@@ -124,6 +147,9 @@ pub struct SyncControlRegistry {
     state: Mutex<RegistryState>,
     next_registration_id: AtomicU64,
 }
+
+/// Timeout for blocking on a session command reply from the RPC thread.
+const COMMAND_REPLY_TIMEOUT: Duration = Duration::from_secs(30);
 
 impl SyncControlRegistry {
     pub fn new(db_path: String) -> Self {
@@ -224,6 +250,7 @@ impl SyncControlRegistry {
     ) -> Result<RegisteredSession, String> {
         let policy = self.load_policy(&tenant_id)?;
         let registration_id = self.next_registration_id.fetch_add(1, Ordering::Relaxed);
+        let (command_tx, command_rx) = tokio::sync::mpsc::channel(4);
         let policy_rx = {
             let mut state = self.state.lock().expect("sync control registry poisoned");
             let tx = state
@@ -241,11 +268,13 @@ impl SyncControlRegistry {
                     role: role.clone(),
                     peer_id: peer_id.clone(),
                     tenant_id: tenant_id.clone(),
+                    command_tx,
                 },
             );
             tx.subscribe()
         };
         Ok(RegisteredSession {
+            command_rx,
             policy_rx,
             _guard: SessionRegistrationGuard {
                 registry: Arc::downgrade(self),
@@ -256,61 +285,55 @@ impl SyncControlRegistry {
         })
     }
 
-    /// Trigger a manual round for a specific peer by querying the DB for
-    /// wanted events that the peer is expected to have.
+    // -----------------------------------------------------------------------
+    // CLI trigger methods — send commands into live session loops
+    // -----------------------------------------------------------------------
+
+    /// Force a manual negentropy round on a specific initiator session.
+    /// Blocks the calling thread until the round completes or times out.
     pub fn trigger_round_for_peer(
         &self,
         tenant_id: &str,
         peer_prefix: &str,
     ) -> Result<ManualSyncRoundCapture, String> {
-        let entry = self.select_session(tenant_id, peer_prefix, false)?;
-        let started = now_ms();
-        let conn = open_connection(&self.db_path).map_err(|e| e.to_string())?;
-        create_tables(&conn).map_err(|e| e.to_string())?;
-
-        // Query wanted events for this peer
-        let wanted_ids = query_wanted_event_ids(&conn, &entry.tenant_id, &entry.peer_id);
-
-        Ok(ManualSyncRoundCapture {
-            tenant_id: entry.tenant_id.clone(),
-            peer_id: entry.peer_id.clone(),
-            role: entry.role.clone(),
-            session_id: 0,
-            started_at_ms: started,
-            ended_at_ms: now_ms(),
-            events: Vec::new(),
-            newly_observed_ids: wanted_ids,
-            already_known_ids: Vec::new(),
-        })
+        let entry = self.select_session(tenant_id, peer_prefix, true)?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        entry
+            .command_tx
+            .try_send(SessionCommand::ForceRound { reply: tx })
+            .map_err(|_| "session is busy processing a prior command".to_string())?;
+        rx.recv_timeout(COMMAND_REPLY_TIMEOUT)
+            .map_err(|_| "timeout waiting for round to complete".to_string())?
     }
 
     pub fn trigger_round_for_all(
         &self,
         tenant_id: &str,
     ) -> Result<Vec<ManualSyncRoundCapture>, String> {
-        let sessions = self.select_all_sessions(tenant_id, false)?;
-        let conn = open_connection(&self.db_path).map_err(|e| e.to_string())?;
-        create_tables(&conn).map_err(|e| e.to_string())?;
-
+        let sessions = self.select_all_sessions(tenant_id, true)?;
         let mut out = Vec::with_capacity(sessions.len());
         for entry in sessions {
-            let started = now_ms();
-            let wanted_ids = query_wanted_event_ids(&conn, &entry.tenant_id, &entry.peer_id);
-            out.push(ManualSyncRoundCapture {
-                tenant_id: entry.tenant_id.clone(),
-                peer_id: entry.peer_id.clone(),
-                role: entry.role.clone(),
-                session_id: 0,
-                started_at_ms: started,
-                ended_at_ms: now_ms(),
-                events: Vec::new(),
-                newly_observed_ids: wanted_ids,
-                already_known_ids: Vec::new(),
-            });
+            let (tx, rx) = std::sync::mpsc::channel();
+            if entry
+                .command_tx
+                .try_send(SessionCommand::ForceRound { reply: tx })
+                .is_err()
+            {
+                continue; // session busy, skip
+            }
+            match rx.recv_timeout(COMMAND_REPLY_TIMEOUT) {
+                Ok(Ok(capture)) => out.push(capture),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => continue, // timeout, skip
+            }
+        }
+        if out.is_empty() {
+            return Err(format!("no initiator sessions completed a round for tenant {}", tenant_id));
         }
         Ok(out)
     }
 
+    /// Force immediate request issuance on a specific session.
     pub fn trigger_request_for_peer(
         &self,
         tenant_id: &str,
@@ -318,7 +341,6 @@ impl SyncControlRegistry {
     ) -> Result<ManualSyncRequestResult, String> {
         let entry = self.select_session(tenant_id, peer_prefix, false)?;
 
-        // Check policy
         let policy = self.load_policy(&entry.tenant_id)?;
         if policy.requests == SyncPolicyMode::Disabled {
             return Ok(ManualSyncRequestResult {
@@ -330,18 +352,13 @@ impl SyncControlRegistry {
             });
         }
 
-        let conn = open_connection(&self.db_path).map_err(|e| e.to_string())?;
-        create_tables(&conn).map_err(|e| e.to_string())?;
-
-        let wanted_ids = query_wanted_event_ids(&conn, &entry.tenant_id, &entry.peer_id);
-
-        Ok(ManualSyncRequestResult {
-            tenant_id: entry.tenant_id.clone(),
-            peer_id: entry.peer_id.clone(),
-            role: entry.role.clone(),
-            requested_ids: wanted_ids,
-            reason: None,
-        })
+        let (tx, rx) = std::sync::mpsc::channel();
+        entry
+            .command_tx
+            .try_send(SessionCommand::ForceRequest { reply: tx })
+            .map_err(|_| "session is busy processing a prior command".to_string())?;
+        rx.recv_timeout(COMMAND_REPLY_TIMEOUT)
+            .map_err(|_| "timeout waiting for request to complete".to_string())?
     }
 
     pub fn trigger_request_for_all(
@@ -350,8 +367,6 @@ impl SyncControlRegistry {
     ) -> Result<Vec<ManualSyncRequestResult>, String> {
         let sessions = self.select_all_sessions(tenant_id, false)?;
         let policy = self.load_policy(tenant_id)?;
-        let conn = open_connection(&self.db_path).map_err(|e| e.to_string())?;
-        create_tables(&conn).map_err(|e| e.to_string())?;
 
         let mut out = Vec::with_capacity(sessions.len());
         for entry in sessions {
@@ -365,17 +380,29 @@ impl SyncControlRegistry {
                 });
                 continue;
             }
-            let wanted_ids = query_wanted_event_ids(&conn, &entry.tenant_id, &entry.peer_id);
-            out.push(ManualSyncRequestResult {
-                tenant_id: entry.tenant_id.clone(),
-                peer_id: entry.peer_id.clone(),
-                role: entry.role.clone(),
-                requested_ids: wanted_ids,
-                reason: None,
-            });
+            let (tx, rx) = std::sync::mpsc::channel();
+            if entry
+                .command_tx
+                .try_send(SessionCommand::ForceRequest { reply: tx })
+                .is_err()
+            {
+                continue; // session busy
+            }
+            match rx.recv_timeout(COMMAND_REPLY_TIMEOUT) {
+                Ok(Ok(result)) => out.push(result),
+                Ok(Err(e)) => return Err(e),
+                Err(_) => continue, // timeout
+            }
+        }
+        if out.is_empty() {
+            return Err(format!("no sessions completed a request for tenant {}", tenant_id));
         }
         Ok(out)
     }
+
+    // -----------------------------------------------------------------------
+    // Session selection helpers
+    // -----------------------------------------------------------------------
 
     fn select_session(
         &self,
@@ -458,32 +485,40 @@ impl SyncControlRegistry {
     }
 }
 
-/// Query event IDs from `wanted_sources` that are pending from a specific peer.
-///
-/// `wanted_sources` records (event_id, peer_id) pairs for every event that
-/// negentropy reconciliation has observed the remote peer carrying but that we
-/// do not yet hold locally. This is the primary table for "events eligible for
-/// request" from a given connected peer.
-fn query_wanted_event_ids(conn: &rusqlite::Connection, _tenant_id: &str, peer_id: &str) -> Vec<String> {
-    let query = "SELECT hex(event_id) FROM wanted_sources \
-                 WHERE peer_id = ?1 ORDER BY first_seen_at LIMIT 200";
-    match conn.prepare(query) {
-        Ok(mut stmt) => {
-            let rows = stmt
-                .query_map(rusqlite::params![peer_id], |row| row.get::<_, String>(0))
-                .ok();
-            match rows {
-                Some(iter) => iter.filter_map(|r| r.ok()).collect(),
-                None => Vec::new(),
-            }
-        }
-        Err(_) => Vec::new(),
-    }
-}
+// ---------------------------------------------------------------------------
+// RegisteredSession — returned to session handler, holds channels + RAII guard
+// ---------------------------------------------------------------------------
 
 pub struct RegisteredSession {
+    pub command_rx: tokio::sync::mpsc::Receiver<SessionCommand>,
     pub policy_rx: watch::Receiver<TenantSyncPolicy>,
     _guard: SessionRegistrationGuard,
+}
+
+/// Opaque handle that keeps a session registered in the `SyncControlRegistry`.
+/// The session is deregistered when this handle is dropped.
+pub struct SessionGuard {
+    _inner: SessionRegistrationGuard,
+}
+
+impl RegisteredSession {
+    /// Decompose into channels + an opaque guard. The guard must be held alive
+    /// for the duration of the session to keep it registered.
+    pub fn into_parts(
+        self,
+    ) -> (
+        tokio::sync::mpsc::Receiver<SessionCommand>,
+        watch::Receiver<TenantSyncPolicy>,
+        SessionGuard,
+    ) {
+        (
+            self.command_rx,
+            self.policy_rx,
+            SessionGuard {
+                _inner: self._guard,
+            },
+        )
+    }
 }
 
 struct SessionRegistrationGuard {

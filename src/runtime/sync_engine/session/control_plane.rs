@@ -144,6 +144,8 @@ where
 /// the next IDs this peer should serve and sends `HaveList` requests for them.
 /// Durable truth lives in `wanted` + `wanted_sources`; duplicate suppression is
 /// bounded in-memory coordinator state across all active peers for the tenant.
+/// Return type carries both the count and the exact event IDs that were sent
+/// as HaveList requests, so manual CLI triggers can report them.
 pub async fn refill_wanted_requests<C>(
     control: &mut C,
     wanted: &WantedEvents<'_>,
@@ -151,19 +153,19 @@ pub async fn refill_wanted_requests<C>(
     coordination: &PeerCoord,
     peer_id: &str,
     request_state: &ConnectionRequestState,
-) -> Result<usize, SyncError>
+) -> Result<(usize, Vec<EventId>), SyncError>
 where
     C: StreamConn,
 {
     let now_ms = crate::db::queue::current_timestamp_ms();
     let snapshot = request_state.snapshot(now_ms);
     if snapshot.remote_credit == 0 {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
 
     let credit = snapshot.remote_credit;
     if credit == 0 {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
 
     let candidate_limit = credit
@@ -178,7 +180,7 @@ where
         now_ms,
     )?;
     if selected.is_empty() {
-        return Ok(0);
+        return Ok((0, Vec::new()));
     }
     if let Some(credit_received_at) = snapshot.last_credit_received_at {
         let _ = timeline.mark_request_credit_received_many(&selected, credit_received_at);
@@ -214,7 +216,8 @@ where
         stats.remote_credit,
         candidate_limit
     );
-    Ok(selected.len())
+    let count = selected.len();
+    Ok((count, selected))
 }
 
 pub async fn send_request_credit<C>(control: &mut C, credits: usize) -> Result<(), SyncError>

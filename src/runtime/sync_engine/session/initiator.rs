@@ -24,7 +24,11 @@ use crate::protocol::Frame;
 use crate::runtime::build_mismatch::recent_build_mismatch_reason;
 use crate::runtime::memtrace;
 use crate::runtime::repeated_warning::should_emit_globally;
+use crate::runtime::sync_control::{
+    ManualSyncRoundCapture, ManualSyncRequestResult, SessionCommand,
+};
 use crate::runtime::SyncStats;
+use crate::shared::sync_control::{SyncPolicyMode, TenantSyncPolicy};
 use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
@@ -81,6 +85,8 @@ pub async fn run_sync_initiator<C, S, R>(
     shared_ingest: mpsc::Sender<IngestItem>,
     capture: Option<SyncRunCapture>,
     rx_capture: Option<SyncRunRxCapture>,
+    mut command_rx: Option<tokio::sync::mpsc::Receiver<SessionCommand>>,
+    policy_rx: Option<tokio::sync::watch::Receiver<TenantSyncPolicy>>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
     C: StreamConn,
@@ -147,8 +153,45 @@ where
     let mut rounds_total = 0u64;
     let mut next_round_due = Instant::now();
     let mut observed_initial_control_progress = false;
+    let mut pending_round_reply: Option<
+        std::sync::mpsc::Sender<Result<ManualSyncRoundCapture, String>>,
+    > = None;
 
     'session: loop {
+        // Process manual commands from the sync control registry.
+        if let Some(ref mut rx) = command_rx {
+            while let Ok(cmd) = rx.try_recv() {
+                match cmd {
+                    SessionCommand::ForceRound { reply } => {
+                        pending_round_reply = Some(reply);
+                        next_round_due = Instant::now();
+                    }
+                    SessionCommand::ForceRequest { reply } => {
+                        let (count, ids) = refill_wanted_requests(
+                            &mut control,
+                            &wanted,
+                            &timeline,
+                            coordination,
+                            peer_id,
+                            request_state,
+                        )
+                        .await?;
+                        if count > 0 {
+                            last_activity = Instant::now();
+                        }
+                        let id_hexes: Vec<String> =
+                            ids.iter().map(|id| hex::encode(id)).collect();
+                        let _ = reply.send(Ok(ManualSyncRequestResult {
+                            tenant_id: recorded_by.to_string(),
+                            peer_id: peer_id.to_string(),
+                            role: "initiator".to_string(),
+                            requested_ids: id_hexes,
+                            reason: None,
+                        }));
+                    }
+                }
+            }
+        }
         // Data receiver runs in a separate task — check if it received data
         let current_bytes = bytes_received.load(Ordering::Relaxed);
         if current_bytes > last_bytes_received {
@@ -273,6 +316,35 @@ where
                                     &round_need_list_ids,
                                     completed_at,
                                 );
+
+                                // Reply to a pending ForceRound command if one is waiting.
+                                if let Some(reply) = pending_round_reply.take() {
+                                    let newly_hex: Vec<String> = need_ids
+                                        .iter()
+                                        .map(|neg_id| {
+                                            hex::encode(crate::protocol::neg_id_to_event_id(neg_id))
+                                        })
+                                        .chain(
+                                            round_observed_ids
+                                                .iter()
+                                                .map(|eid| hex::encode(eid)),
+                                        )
+                                        .collect();
+                                    let _ = reply.send(Ok(ManualSyncRoundCapture {
+                                        tenant_id: recorded_by.to_string(),
+                                        peer_id: peer_id.to_string(),
+                                        role: "initiator".to_string(),
+                                        session_id: 0,
+                                        started_at_ms: reconcile_start
+                                            .elapsed()
+                                            .as_millis()
+                                            as i64,
+                                        ended_at_ms: crate::db::queue::current_timestamp_ms(),
+                                        events: Vec::new(),
+                                        newly_observed_ids: newly_hex,
+                                        already_known_ids: Vec::new(),
+                                    }));
+                                }
                             }
                         }
                         let sent_need_hints = send_need_list_from_have_ids(
@@ -363,17 +435,23 @@ where
                         observed_need_ids, peer_id
                     );
                 }
-                let requested_now = refill_wanted_requests(
-                    &mut control,
-                    &wanted,
-                    &timeline,
-                    coordination,
-                    peer_id,
-                    request_state,
-                )
-                .await?;
-                if requested_now > 0 {
-                    last_activity = Instant::now();
+                let auto_requests_allowed = policy_rx
+                    .as_ref()
+                    .map(|rx| rx.borrow().requests == SyncPolicyMode::Auto)
+                    .unwrap_or(true);
+                if auto_requests_allowed {
+                    let (requested_now, _) = refill_wanted_requests(
+                        &mut control,
+                        &wanted,
+                        &timeline,
+                        coordination,
+                        peer_id,
+                        request_state,
+                    )
+                    .await?;
+                    if requested_now > 0 {
+                        last_activity = Instant::now();
+                    }
                 }
 
                 let send_stats = drain_pending_responses_to_data_stream(
@@ -562,17 +640,23 @@ where
             Err(_) => {}
         }
 
-        let requested_now = refill_wanted_requests(
-            &mut control,
-            &wanted,
-            &timeline,
-            coordination,
-            peer_id,
-            request_state,
-        )
-        .await?;
-        if requested_now > 0 {
-            last_activity = Instant::now();
+        let auto_requests_allowed = policy_rx
+            .as_ref()
+            .map(|rx| rx.borrow().requests == SyncPolicyMode::Auto)
+            .unwrap_or(true);
+        if auto_requests_allowed {
+            let (requested_now, _) = refill_wanted_requests(
+                &mut control,
+                &wanted,
+                &timeline,
+                coordination,
+                peer_id,
+                request_state,
+            )
+            .await?;
+            if requested_now > 0 {
+                last_activity = Instant::now();
+            }
         }
 
         let send_stats = drain_pending_responses_to_data_stream(

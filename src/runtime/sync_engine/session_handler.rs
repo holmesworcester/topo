@@ -234,15 +234,24 @@ impl SessionHandler for SyncSessionHandler {
         let session_owner = format!("{}:{}", role_name, meta.session_id);
 
         // Register with sync control registry (if available) so CLI commands
-        // can target this live session.
-        let _registered = self.sync_control.as_ref().and_then(|sc| {
-            sc.register_session(
-                tenant_id.clone(),
-                peer_id.clone(),
-                role_name.to_string(),
-            )
-            .ok()
-        });
+        // can target this live session. Extract channels for session loop use;
+        // keep the guard alive for RAII deregistration.
+        let (mut manual_command_rx, mut manual_policy_rx, _session_guard) =
+            if let Some(sc) = self.sync_control.as_ref() {
+                match sc.register_session(
+                    tenant_id.clone(),
+                    peer_id.clone(),
+                    role_name.to_string(),
+                ) {
+                    Ok(session) => {
+                        let (cmd, pol, guard) = session.into_parts();
+                        (Some(cmd), Some(pol), Some(guard))
+                    }
+                    Err(_) => (None, None, None),
+                }
+            } else {
+                (None, None, None)
+            };
 
         let mut stats: Option<crate::runtime::SyncStats> = None;
         let result = match (self.direction, meta.direction) {
@@ -268,6 +277,8 @@ impl SessionHandler for SyncSessionHandler {
                     self.shared_ingest.clone(),
                     run_logger.as_ref().and_then(|l| l.capture()),
                     run_logger.as_ref().and_then(|l| l.rx_capture()),
+                    manual_command_rx.take(),
+                    manual_policy_rx.take(),
                 );
                 tokio::pin!(run);
                 let run_result: Result<crate::runtime::SyncStats, String> = tokio::select! {
@@ -306,6 +317,8 @@ impl SessionHandler for SyncSessionHandler {
                     self.shared_ingest.clone(),
                     run_logger.as_ref().and_then(|l| l.capture()),
                     run_logger.as_ref().and_then(|l| l.rx_capture()),
+                    manual_command_rx.take(),
+                    manual_policy_rx.take(),
                 );
                 tokio::pin!(run);
                 let run_result: Result<crate::runtime::SyncStats, String> = tokio::select! {
