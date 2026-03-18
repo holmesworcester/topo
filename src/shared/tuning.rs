@@ -147,12 +147,10 @@ pub fn response_credit_high_watermark_bytes() -> usize {
         // the same constraint applied to max_recv_buffer above.
         read_usize_env("LOW_MEM_RESPONSE_CREDIT_HIGH_WATERMARK_BYTES").unwrap_or(320 * 1024)
     } else {
-        // Must accommodate at least 2 file slices (~262 KiB each) so that
-        // the planner can always schedule the next slice from the remainder
-        // after one slice is reserved. Without this, a credit dead zone
-        // forms: remainder < slice size (can't plan) but > low watermark
-        // (no refill). 1 MiB allows 3-4 slices in flight.
-        read_usize_env("P7_RESPONSE_CREDIT_HIGH_WATERMARK_BYTES").unwrap_or(1024 * 1024)
+        // 2 MiB allows 7-8 file slices (~262 KiB each) in flight, better
+        // utilizing network bandwidth. Must be at least 2× file-slice size
+        // to avoid the credit dead zone (remainder < slice but > low watermark).
+        read_usize_env("P7_RESPONSE_CREDIT_HIGH_WATERMARK_BYTES").unwrap_or(2 * 1024 * 1024)
     }
 }
 
@@ -160,11 +158,10 @@ pub fn response_credit_low_watermark_bytes() -> usize {
     if low_mem_mode() {
         read_usize_env("LOW_MEM_RESPONSE_CREDIT_LOW_WATERMARK_BYTES").unwrap_or(80 * 1024)
     } else {
-        // Must be below a single file slice (~262 KiB) so that credit is
-        // refilled before the planner stalls. At 256 KiB the responder
-        // grants fresh credit as soon as less than one slice's worth of
-        // requests remain outstanding.
-        read_usize_env("P7_RESPONSE_CREDIT_LOW_WATERMARK_BYTES").unwrap_or(256 * 1024)
+        // Triggers credit refill when outstanding is below 2 file slices.
+        // At 512 KiB the responder refills aggressively, keeping the
+        // request pipeline full.
+        read_usize_env("P7_RESPONSE_CREDIT_LOW_WATERMARK_BYTES").unwrap_or(512 * 1024)
     }
 }
 
