@@ -146,6 +146,13 @@ pub struct Store<'a> {
     conn: &'a Connection,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SharedEventSummary {
+    pub event_id: EventId,
+    pub semantic_type_code: u8,
+    pub encoded_size_bytes: u32,
+}
+
 impl<'a> Store<'a> {
     pub fn new(conn: &'a Connection) -> Self {
         Self { conn }
@@ -210,6 +217,23 @@ impl<'a> Store<'a> {
             }
         }
         Ok(map)
+    }
+
+    /// Get lightweight discovery metadata for a shared event without exposing
+    /// local-only rows.
+    pub fn get_shared_summary(&self, id: &EventId) -> SqliteResult<Option<SharedEventSummary>> {
+        let Some(blob) = self.get_shared(id)? else {
+            return Ok(None);
+        };
+        let Some(semantic_type_code) = crate::event_modules::outer_semantic_type_code(&blob) else {
+            return Ok(None);
+        };
+        let encoded_size_bytes = u32::try_from(blob.len()).unwrap_or(u32::MAX);
+        Ok(Some(SharedEventSummary {
+            event_id: *id,
+            semantic_type_code,
+            encoded_size_bytes,
+        }))
     }
 
     /// Check if we have a blob
@@ -296,5 +320,30 @@ mod tests {
         ).unwrap();
 
         assert!(store.exists(&id).unwrap());
+    }
+
+    #[test]
+    fn test_get_shared_summary_uses_outer_semantic_type_and_encoded_size() {
+        let conn = setup();
+        let store = Store::new(&conn);
+
+        let blob = vec![crate::event_modules::EVENT_TYPE_MESSAGE, b's', b'u', b'm'];
+        let id = hash_event(&blob);
+        let id_str = event_id_to_base64(&id);
+        let now = now_ms();
+        conn.execute(
+            "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![id_str, "message", &blob[..], "shared", now, now],
+        )
+        .unwrap();
+
+        let summary = store.get_shared_summary(&id).unwrap().unwrap();
+        assert_eq!(summary.event_id, id);
+        assert_eq!(
+            summary.semantic_type_code,
+            crate::event_modules::EVENT_TYPE_MESSAGE
+        );
+        assert_eq!(summary.encoded_size_bytes, blob.len() as u32);
     }
 }

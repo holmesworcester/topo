@@ -21,7 +21,7 @@ rand = "0.8"
 clap = { version = "4", features = ["derive"] }
 clap_complete = "4"
 thiserror = "1"
-negentropy = "0.5"
+negentropy = { path = "vendor/negentropy" }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 async-trait = "0.1"

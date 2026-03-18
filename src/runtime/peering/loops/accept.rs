@@ -13,7 +13,7 @@ use crate::db::open_connection;
 use crate::db::transport_creds::resolve_local_transport_target;
 use crate::db::transport_trust::{is_authorized_for_tenant, record_transport_binding};
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
-use crate::sync::{CoordinationManager, SyncSessionHandler};
+use crate::sync::{CoordinationManager, SyncConnectionHandler};
 use crate::transport::{
     accept_session_provider, requested_server_name_from_connection, TransportClientConfig,
     TransportEndpoint,
@@ -299,7 +299,7 @@ async fn accept_loop_with_ingest_until_cancel_inner(
                     }
                 };
 
-                let responder_handler = SyncSessionHandler::responder(
+                let responder_handler = SyncConnectionHandler::responder(
                     db_path_owned.clone(),
                     SYNC_SESSION_TIMEOUT_SECS,
                     coordination_manager.register_peer(),

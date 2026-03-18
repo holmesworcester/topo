@@ -129,7 +129,7 @@ async fn requested_download_records_pipeline_timestamps_on_source_and_sink() {
     if let Some(need_sent_at) = source_timeline.need_list_sent_at {
         assert!(
             sink_timeline.need_list_received_at.is_some(),
-            "source recorded NeedList send but sink missed NeedList receipt"
+            "source recorded discovery-hint send but sink missed discovery-hint receipt"
         );
         assert_non_decreasing(
             "needlist send->recv",

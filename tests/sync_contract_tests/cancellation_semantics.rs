@@ -7,7 +7,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use topo::contracts::peering_contract::{SessionDirection, SessionHandler};
-use topo::sync::session_handler::SyncSessionHandler;
+use topo::sync::session_handler::SyncConnectionHandler;
 
 use crate::fake_session_io::{
     create_test_db, fake_session_io_pair, noop_ingest_tx, run_local, test_session_meta,
@@ -18,7 +18,7 @@ use crate::fake_session_io::{
 async fn pre_cancelled_session_returns_error() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncSessionHandler::outbound(
+        let handler = SyncConnectionHandler::outbound(
             db_path,
             30,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
@@ -49,7 +49,7 @@ async fn pre_cancelled_session_returns_error() {
 async fn mid_session_cancellation_terminates_handler() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncSessionHandler::outbound(
+        let handler = SyncConnectionHandler::outbound(
             db_path,
             30,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
@@ -96,7 +96,7 @@ async fn mid_session_cancellation_terminates_handler() {
 async fn responder_cancellation_terminates_handler() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncSessionHandler::responder(
+        let handler = SyncConnectionHandler::responder(
             db_path,
             30,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),

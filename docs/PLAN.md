@@ -233,10 +233,11 @@ Policy for future transport work:
 
 Sync keeps one long-lived request/response lane set per authenticated connection.
 
-1. discovery remains round-scoped (`NegOpen` / `NegMsg` / `NeedList`),
-2. request credit and `HaveList` requests are connection-scoped,
-3. the data stream carries only requested `Event` blobs,
-4. there is no per-round `Done` / `DataDone` / `DoneAck` completion handshake in live sync.
+1. discovery remains round-scoped (`NegOpen` / `NegMsg` / `DiscoveryHints`),
+2. both sides send `DiscoveryHints` with real `encoded_size_bytes` so byte-credit accounting uses actual event sizes rather than a conservative floor,
+3. response credit and `RequestIds` requests are connection-scoped,
+4. the data stream carries only requested `Event` blobs,
+5. there is no per-round `Done` / `DataDone` / `DoneAck` completion handshake in live sync.
 
 ## 4.3 Transport regression checklist
 

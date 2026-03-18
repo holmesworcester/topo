@@ -12,7 +12,7 @@ use topo::contracts::peering_contract::{
     SessionDirection, SessionHandler, TransportSessionIo, TransportSessionIoError,
 };
 use topo::protocol::Frame;
-use topo::sync::session_handler::SyncSessionHandler;
+use topo::sync::session_handler::SyncConnectionHandler;
 
 use crate::fake_session_io::{
     create_test_db, empty_negentropy_storage, fake_session_io_pair,
@@ -26,7 +26,7 @@ use crate::fake_session_io::{
 async fn control_channel_half_close_terminates_handler() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncSessionHandler::responder(
+        let handler = SyncConnectionHandler::responder(
             db_path,
             30,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
@@ -67,7 +67,7 @@ async fn control_channel_half_close_terminates_handler() {
 async fn abrupt_close_surfaces_connection_lost() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncSessionHandler::outbound(
+        let handler = SyncConnectionHandler::outbound(
             db_path,
             30,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
@@ -117,7 +117,7 @@ async fn abrupt_close_surfaces_connection_lost() {
 async fn normal_roundtrip_stays_healthy_until_cancel() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncSessionHandler::responder(
+        let handler = SyncConnectionHandler::responder(
             db_path,
             30,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
@@ -320,7 +320,7 @@ async fn out_of_order_data_delivery() {
 async fn fragmented_data_frames_handler_completes() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncSessionHandler::responder(
+        let handler = SyncConnectionHandler::responder(
             db_path,
             30,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
@@ -432,7 +432,7 @@ async fn fragmentation_splits_data_frames_into_chunks() {
 async fn garbage_control_frame_terminates_handler() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncSessionHandler::responder(
+        let handler = SyncConnectionHandler::responder(
             db_path,
             30,
             std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),

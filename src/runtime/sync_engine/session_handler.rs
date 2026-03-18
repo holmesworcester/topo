@@ -1,4 +1,4 @@
-//! Sync session handler: bridges the SessionHandler contract to the
+//! Sync connection handler: bridges the SessionHandler contract to the
 //! sync initiator/responder functions in sync::session.
 //!
 //! Phase 6: removed `into_any` downcast; uses `TransportSessionIo::split()` and
@@ -106,11 +106,11 @@ fn map_io_error(err: TransportSessionIoError) -> ConnectionError {
 }
 
 // ---------------------------------------------------------------------------
-// Session handler
+// Connection handler
 // ---------------------------------------------------------------------------
 
 #[derive(Clone)]
-pub struct SyncSessionHandler {
+pub struct SyncConnectionHandler {
     db_path: String,
     timeout_secs: u64,
     direction: SessionDirection,
@@ -120,7 +120,7 @@ pub struct SyncSessionHandler {
     shared_ingest: mpsc::Sender<IngestItem>,
 }
 
-impl SyncSessionHandler {
+impl SyncConnectionHandler {
     pub fn outbound(
         db_path: String,
         timeout_secs: u64,
@@ -156,7 +156,7 @@ impl SyncSessionHandler {
     }
 }
 
-impl Drop for SyncSessionHandler {
+impl Drop for SyncConnectionHandler {
     fn drop(&mut self) {
         self.request_state.clear();
         self.response_state.clear();
@@ -165,7 +165,7 @@ impl Drop for SyncSessionHandler {
 }
 
 #[async_trait(?Send)]
-impl SessionHandler for SyncSessionHandler {
+impl SessionHandler for SyncConnectionHandler {
     async fn on_session(
         &self,
         meta: SessionMeta,

@@ -57,7 +57,7 @@ flowchart TD
     QDB --> APPLY["project_one + cascade"]
     APPLY --> PDB[("SQLite Projections")]
 
-    CTRL["Sync control stream (HaveList / need_ids)"] --> QDB
+    CTRL["Sync control stream (RequestIds / discovery hints)"] --> QDB
     PDB -->|trust rows| LIFE
 ```
 
@@ -69,14 +69,14 @@ flowchart TD
     BOUND --> LIFE["connection_lifecycle (connected peer + peer_id)"]
     BOUND --> FACT["session_factory (open/accept streams)"]
     FACT --> IO["TransportSessionIo + session_id"]
-    IO --> HANDLER["SyncSessionHandler::on_session"]
+    IO --> HANDLER["SyncConnectionHandler::on_session"]
 
     HANDLER --> SYNC_RECON["sync reconcile (control exchange)"]
     SYNC_RECON --> IDS["have_ids + need_ids"]
 
     IDS -->|peer can supply ids| WANT["wanted + wanted_sources update"]
     WANT --> PLAN["request planner + peer credit"]
-    PLAN --> REQ["send HaveList(requested ids)"]
+    PLAN --> REQ["send RequestIds(requested ids)"]
     REQ --> RESPQ["connection-scoped response buffer"]
     RESPQ --> OUT["data_send: Frame::Event(blob)"]
     OUT --> RX["peer receiver task"]
@@ -198,7 +198,7 @@ flowchart TD
     BOUND --> IIO
 
     subgraph SYNC_ENG["Sync Engine"]
-      SYNC["SyncSessionHandler (on_session)"]
+      SYNC["SyncConnectionHandler (on_session)"]
       CTRL_STREAM["Sync control"]
       DATA["Sync data"]
       WANT["wanted_events"]
@@ -244,7 +244,7 @@ flowchart TD
 - `runtime::supervisor::RuntimeSupervisor`: single owner for long-lived runtime workers (writer, accept loop, unified target dispatcher, target ingress workers).
 - `service.rs helpers`: `open_db_*`, node status helpers, intro transport helper entry points.
 - `Persist + enqueue`: phase 1 persists events/recorded/sync state and enqueues `project_queue`.
-- `Sync control`: sync control stream messages including `NegOpen`, `NegMsg`, `NeedList`, `HaveList`, and `RequestCredit`.
+- `Sync control`: sync control stream messages including `NegOpen`, `NegMsg`, `DiscoveryHints`, `RequestIds`, and `ResponseCredit`.
 - `Sync data`: sync data stream frames (`Event`).
 - `Shared event send`: `Store::get_shared(events) -> Frame::Event`.
 - `Projection tables`: projected read models (`messages`, `users`, `peers`, `channels`).
@@ -375,7 +375,7 @@ flowchart LR
 5. QUIC dial/accept + peer identity extraction are transport-owned in `connection_lifecycle`.
 6. QUIC stream wiring (`open_bi`/`accept_bi`, `DualConnection`, `QuicTransportSessionIo`) is transport-owned in `session_factory`.
 7. Projection outputs both user-facing read tables and transport trust tables; trust rows feed both handshake allow/deny and bootstrap autodial.
-8. `HaveList` IDs originate from sync discovery plus wanted scheduling; runtime initiator sessions use coordinator-assigned subsets (autodial + mDNS), then sources serve those exact requested IDs from connection-scoped response buffers.
+8. `RequestIds` originate from sync discovery plus wanted scheduling; runtime initiator sessions use coordinator-assigned subsets (autodial + mDNS), then sources serve those exact requested IDs from connection-scoped response buffers.
 9. Foreground runtime is daemon-first (`topo start`): shutdown is coordinated by shared `shutdown_notify` (RPC `Shutdown` or Ctrl-C).
-10. Runtime and helper initiator sessions both route pull assignment through the coordinator; there is no direct `need_ids -> HaveList(all)` bypass path.
+10. Runtime and helper initiator sessions both route pull assignment through the coordinator; there is no direct `need_ids -> RequestIds(all)` bypass path.
 11. Transport trust checks now read `db::transport_trust::is_authorized_for_tenant` directly inside transport; the separate trust-oracle adapter layer is removed.

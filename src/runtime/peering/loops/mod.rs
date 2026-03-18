@@ -40,7 +40,7 @@ use crate::contracts::peering_contract::{
     PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId, TransportSessionIo,
 };
 use crate::runtime::repeated_warning::should_emit_globally;
-use crate::sync::SyncSessionHandler;
+use crate::sync::SyncConnectionHandler;
 use crate::transport::session_factory::extract_build_mismatch_reason;
 
 // ---------------------------------------------------------------------------
@@ -263,7 +263,7 @@ pub(crate) fn claim_live_connection_slot(
 /// details (stream opening, `DualConnection`, `QuicTransportSessionIo`)
 /// are handled by `transport::session_factory` before this is called.
 pub(super) async fn run_session(
-    handler: &SyncSessionHandler,
+    handler: &SyncConnectionHandler,
     session_id: u64,
     io: Box<dyn TransportSessionIo>,
     tenant_id: &str,

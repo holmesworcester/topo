@@ -32,15 +32,18 @@ use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 use crate::tuning::{
-    low_mem_memtrace, low_mem_mode, request_credit_high_watermark, request_credit_low_watermark,
+    low_mem_memtrace, low_mem_mode, response_credit_high_watermark_bytes,
+    response_credit_low_watermark_bytes,
 };
 
 use super::connection_scope::{ConnectionRequestState, ConnectionResponseState};
 use super::control_plane::{
-    observe_event_ids_for_peer, refill_wanted_requests, send_request_credit,
+    observe_discovery_hints_for_peer, refill_wanted_requests, send_response_credit_bytes,
 };
 use super::coordinator::PeerCoord;
-use super::data_plane::{drain_pending_responses_to_data_stream, spawn_data_receiver};
+use super::data_plane::{
+    drain_pending_responses_to_data_stream, queue_requested_responses, spawn_data_receiver,
+};
 use super::logging::{SyncRunCapture, SyncRunRxCapture};
 use super::windowing::{decode_initial_neg_open, SyncWindow, SyncWindowKind};
 use super::{
@@ -109,12 +112,22 @@ where
 
     let db_path_for_neg = db_path.to_string();
     let ws_id_for_neg = ws_id.clone();
+
+    /// Result from the negentropy worker thread: the NegMsg response bytes
+    /// plus diff IDs the responder has that the initiator lacks.
+    struct NegWorkerResult {
+        response: Vec<u8>,
+        /// IDs we have that the remote appears to lack — used to send
+        /// DiscoveryHints so the initiator has real byte sizes for credit.
+        responder_have_ids: Vec<negentropy::Id>,
+    }
+
     let mut neg_req_tx: Option<std::sync::mpsc::Sender<Vec<u8>>> = None;
-    let mut neg_resp_rx: Option<std::sync::mpsc::Receiver<Result<Vec<u8>, String>>> = None;
+    let mut neg_resp_rx: Option<std::sync::mpsc::Receiver<Result<NegWorkerResult, String>>> = None;
     let mut neg_worker: Option<std::thread::JoinHandle<()>> = None;
     let spawn_neg_worker = |window: SyncWindow| {
         let (req_tx, req_rx) = std::sync::mpsc::channel::<Vec<u8>>();
-        let (resp_tx, resp_rx) = std::sync::mpsc::channel::<Result<Vec<u8>, String>>();
+        let (resp_tx, resp_rx) = std::sync::mpsc::channel::<Result<NegWorkerResult, String>>();
         let db_path = db_path_for_neg.clone();
         let ws_id = ws_id_for_neg.clone();
         let handle = std::thread::spawn(move || {
@@ -142,7 +155,15 @@ where
                 .expect("neg worker: Negentropy::new");
 
             while let Ok(msg) = req_rx.recv() {
-                let result = neg.reconcile(&msg).map_err(|e| format!("{}", e));
+                let mut have_ids = Vec::new();
+                let mut need_ids = Vec::new();
+                let result = neg
+                    .reconcile_with_diff(&msg, &mut have_ids, &mut need_ids)
+                    .map(|response| NegWorkerResult {
+                        response,
+                        responder_have_ids: have_ids,
+                    })
+                    .map_err(|e| format!("{}", e));
                 if resp_tx.send(result).is_err() {
                     break;
                 }
@@ -193,8 +214,8 @@ where
     let mut last_send_progress = Instant::now();
     let mut last_idle_marker = Instant::now();
 
-    let credit_high = request_credit_high_watermark().max(1);
-    let credit_low = request_credit_low_watermark().min(credit_high.saturating_sub(1));
+    let credit_high = response_credit_high_watermark_bytes().max(1);
+    let credit_low = response_credit_low_watermark_bytes().min(credit_high.saturating_sub(1));
 
     loop {
         // Data receiver runs in a separate task — check if it received data
@@ -240,17 +261,52 @@ where
                 .expect("neg responder worker missing")
                 .try_recv()
             {
-                Ok(Ok(response)) => {
+                Ok(Ok(result)) => {
                     reconciling = false;
                     last_activity = Instant::now();
-                    if response.is_empty() {
+
+                    // Send DiscoveryHints for diff IDs BEFORE the NegMsg so the
+                    // initiator has real byte sizes when it starts scheduling
+                    // requests from the need_ids this round will produce.
+                    if !result.responder_have_ids.is_empty() {
+                        let batch_size = super::need_chunk().max(1);
+                        let mut hints = Vec::with_capacity(batch_size);
+                        for neg_id in &result.responder_have_ids {
+                            let event_id = crate::protocol::neg_id_to_event_id(neg_id);
+                            if let Ok(Some(summary)) = store.get_shared_summary(&event_id) {
+                                hints.push(crate::protocol::DiscoveryHint {
+                                    event_id: summary.event_id,
+                                    semantic_type_code: summary.semantic_type_code,
+                                    encoded_size_bytes: summary.encoded_size_bytes,
+                                });
+                                if hints.len() >= batch_size {
+                                    control
+                                        .send(&Frame::DiscoveryHints {
+                                            hints: std::mem::take(&mut hints),
+                                        })
+                                        .await?;
+                                }
+                            }
+                        }
+                        if !hints.is_empty() {
+                            control.send(&Frame::DiscoveryHints { hints }).await?;
+                        }
+                        control.flush().await?;
+                        info!(
+                            "Sent {} discovery hints for responder diff to peer {}",
+                            result.responder_have_ids.len(),
+                            peer_id
+                        );
+                    }
+
+                    if result.response.is_empty() {
                         info!(
                             "Reconciliation locally quiescent: {} rounds, {}ms",
                             rounds,
                             reconcile_start.elapsed().as_millis()
                         );
                     } else {
-                        control.send(&Frame::NegMsg { msg: response }).await?;
+                        control.send(&Frame::NegMsg { msg: result.response }).await?;
                         control.flush().await?;
                     }
                 }
@@ -311,37 +367,38 @@ where
                     .map_err(|_| "neg worker channel closed".to_string())?;
                 reconciling = true;
             }
-            Ok(Ok(Frame::HaveList { ids })) => {
+            Ok(Ok(Frame::RequestIds { ids })) => {
                 last_activity = Instant::now();
                 if ids.is_empty() {
                     continue;
                 }
                 let _ = timeline.mark_request_received_many(&ids, current_timestamp_ms());
-                response_state.consume_requests(&ids);
+                queue_requested_responses(response_state, &timeline, &store, &ids);
             }
-            Ok(Ok(Frame::NeedList { ids })) => {
+            Ok(Ok(Frame::DiscoveryHints { hints })) => {
                 last_activity = Instant::now();
+                let hint_ids: Vec<_> = hints.iter().map(|hint| hint.event_id).collect();
                 let need_received_at = current_timestamp_ms();
-                let _ = timeline.mark_need_list_received_many(&ids, need_received_at);
-                let observed = observe_event_ids_for_peer(
+                let _ = timeline.mark_need_list_received_many(&hint_ids, need_received_at);
+                let observed = observe_discovery_hints_for_peer(
                     &wanted,
                     &timeline,
                     recorded_by,
                     peer_id,
                     reconcile_started_at_ms,
-                    &ids,
+                    &hints,
                     &mut round_observed_ids,
                 )?;
                 if observed > 0 {
                     info!(
-                        "Observed {} needed IDs from peer {} via NeedList",
+                        "Observed {} discovery hints from peer {}",
                         observed, peer_id
                     );
                 }
             }
-            Ok(Ok(Frame::RequestCredit { credits })) => {
+            Ok(Ok(Frame::ResponseCredit { bytes })) => {
                 last_activity = Instant::now();
-                request_state.add_credit(credits as usize, current_timestamp_ms());
+                request_state.add_credit_bytes(bytes as usize, current_timestamp_ms());
             }
             Ok(Ok(_)) => {}
             Ok(Err(ConnectionError::Closed)) => {
@@ -392,10 +449,10 @@ where
         }
 
         if neg_req_tx.is_some() {
-            let grant = response_state.desired_credit_grant(credit_high, credit_low);
+            let grant = response_state.desired_credit_grant_bytes(credit_high, credit_low);
             if grant > 0 {
-                send_request_credit(&mut control, grant).await?;
-                response_state.note_granted(grant);
+                send_response_credit_bytes(&mut control, grant).await?;
+                response_state.note_granted_bytes(grant);
             }
         }
 
@@ -419,10 +476,10 @@ where
                 rounds,
                 reconciling,
                 response_stats.pending_len,
-                response_stats.available_credit,
+                response_stats.available_credit_bytes,
                 wanted_peer_backlog,
                 request_stats.inflight_len,
-                request_stats.remote_credit,
+                request_stats.remote_credit_bytes,
                 ingest_used,
                 ingest_cap,
                 sqlite_global.map(|s| s.memory_used_bytes).unwrap_or(-1),
@@ -472,10 +529,10 @@ where
                         "idle_ms": last_send_progress.elapsed().as_millis(),
                         "reconciling": reconciling,
                         "pending_responses": response_stats.pending_len,
-                        "response_credit_available": response_stats.available_credit,
+                        "response_credit_available_bytes": response_stats.available_credit_bytes,
                         "wanted_peer_backlog": pending_wanted_backlog,
                         "request_inflight": request_stats.inflight_len,
-                        "request_credit": request_stats.remote_credit,
+                        "response_credit_bytes": request_stats.remote_credit_bytes,
                     }))
                     .ok(),
                 );

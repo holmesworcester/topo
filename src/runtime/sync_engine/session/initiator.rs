@@ -29,13 +29,14 @@ use crate::sync::negentropy_sqlite::NegentropyStorageSqlite;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 use crate::tuning::{
-    low_mem_memtrace, low_mem_mode, request_credit_high_watermark, request_credit_low_watermark,
+    low_mem_memtrace, low_mem_mode, response_credit_high_watermark_bytes,
+    response_credit_low_watermark_bytes,
 };
 
 use super::connection_scope::{ConnectionRequestState, ConnectionResponseState};
 use super::control_plane::{
-    observe_need_ids_for_peer, refill_wanted_requests, send_initial_neg_open,
-    send_need_list_from_have_ids, send_request_credit,
+    observe_discovery_hints_for_peer, refill_wanted_requests, send_discovery_hints_from_have_ids,
+    send_initial_neg_open, send_response_credit_bytes,
 };
 use super::coordinator::PeerCoord;
 use super::data_plane::{drain_pending_responses_to_data_stream, spawn_data_receiver};
@@ -57,7 +58,7 @@ fn should_treat_as_startup_control_abort(
 }
 
 /// Run sync as the initiator (client role) with dual streams.
-/// Control stream: NegOpen, NegMsg, HaveList, RequestCredit
+/// Control stream: NegOpen, NegMsg, DiscoveryHints, RequestIds, ResponseCredit
 /// Data stream: requested Event blobs
 ///
 /// Discovery is still round-scoped, but all event-data transfer is pull-only:
@@ -142,8 +143,8 @@ where
     let idle_capture_enabled = send_idle_capture_enabled() && capture.is_some();
     let mut last_send_progress = Instant::now();
     let mut last_idle_marker = Instant::now();
-    let credit_high = request_credit_high_watermark().max(1);
-    let credit_low = request_credit_low_watermark().min(credit_high.saturating_sub(1));
+    let credit_high = response_credit_high_watermark_bytes().max(1);
+    let credit_low = response_credit_low_watermark_bytes().min(credit_high.saturating_sub(1));
     let mut rounds_total = 0u64;
     let mut next_round_due = Instant::now();
     let mut observed_initial_control_progress = false;
@@ -275,9 +276,10 @@ where
                                 );
                             }
                         }
-                        let sent_need_hints = send_need_list_from_have_ids(
+                        let sent_need_hints = send_discovery_hints_from_have_ids(
                             &mut control,
                             &timeline,
+                            &store,
                             &mut have_ids,
                             &mut round_need_list_ids,
                         )
@@ -286,17 +288,45 @@ where
                             last_activity = Instant::now();
                         }
                     }
-                    Ok(Ok(Frame::HaveList { ids })) => {
+                    Ok(Ok(Frame::RequestIds { ids })) => {
                         last_activity = Instant::now();
                         if !ids.is_empty() {
                             let _ =
                                 timeline.mark_request_received_many(&ids, current_timestamp_ms());
-                            response_state.consume_requests(&ids);
+                            super::data_plane::queue_requested_responses(
+                                response_state,
+                                &timeline,
+                                &store,
+                                &ids,
+                            );
                         }
                     }
-                    Ok(Ok(Frame::RequestCredit { credits })) => {
+                    Ok(Ok(Frame::DiscoveryHints { hints })) => {
                         last_activity = Instant::now();
-                        request_state.add_credit(credits as usize, current_timestamp_ms());
+                        let hint_ids: Vec<_> = hints.iter().map(|h| h.event_id).collect();
+                        let _ = timeline.mark_need_list_received_many(
+                            &hint_ids,
+                            current_timestamp_ms(),
+                        );
+                        let observed = observe_discovery_hints_for_peer(
+                            &wanted,
+                            &timeline,
+                            recorded_by,
+                            peer_id,
+                            reconcile_started_at_ms,
+                            &hints,
+                            &mut round_observed_ids,
+                        )?;
+                        if observed > 0 {
+                            info!(
+                                "Observed {} discovery hints from peer {} during reconciliation",
+                                observed, peer_id
+                            );
+                        }
+                    }
+                    Ok(Ok(Frame::ResponseCredit { bytes })) => {
+                        last_activity = Instant::now();
+                        request_state.add_credit_bytes(bytes as usize, current_timestamp_ms());
                     }
                     Ok(Ok(_)) => {}
                     Ok(Err(ConnectionError::Closed)) => {
@@ -348,13 +378,31 @@ where
                     Err(_) => {}
                 }
 
-                let observed_need_ids = observe_need_ids_for_peer(
+                let need_hints: Vec<crate::protocol::DiscoveryHint> = need_ids
+                    .drain(..)
+                    .map(|neg_id| {
+                        let event_id = crate::protocol::neg_id_to_event_id(&neg_id);
+                        match store.get_shared_summary(&event_id) {
+                            Ok(Some(summary)) => crate::protocol::DiscoveryHint {
+                                event_id: summary.event_id,
+                                semantic_type_code: summary.semantic_type_code,
+                                encoded_size_bytes: summary.encoded_size_bytes,
+                            },
+                            _ => crate::protocol::DiscoveryHint {
+                                event_id,
+                                semantic_type_code: 0,
+                                encoded_size_bytes: 0,
+                            },
+                        }
+                    })
+                    .collect();
+                let observed_need_ids = observe_discovery_hints_for_peer(
                     &wanted,
                     &timeline,
                     recorded_by,
                     peer_id,
                     reconcile_started_at_ms,
-                    &mut need_ids,
+                    &need_hints,
                     &mut round_observed_ids,
                 )?;
                 if observed_need_ids > 0 {
@@ -390,10 +438,10 @@ where
                     last_send_progress = Instant::now();
                 }
 
-                let grant = response_state.desired_credit_grant(credit_high, credit_low);
+                let grant = response_state.desired_credit_grant_bytes(credit_high, credit_low);
                 if grant > 0 {
-                    send_request_credit(&mut control, grant).await?;
-                    response_state.note_granted(grant);
+                    send_response_credit_bytes(&mut control, grant).await?;
+                    response_state.note_granted_bytes(grant);
                 }
 
                 if low_mem_mode() && last_alloc_trim.elapsed() >= Duration::from_millis(100) {
@@ -423,9 +471,9 @@ where
                         wanted_pending,
                         wanted_peer_backlog,
                         request_stats.inflight_len,
-                        request_stats.remote_credit,
+                        request_stats.remote_credit_bytes,
                         response_stats.pending_len,
-                        response_stats.available_credit,
+                        response_stats.available_credit_bytes,
                         ingest_used,
                         ingest_cap,
                         sqlite_global.map(|s| s.memory_used_bytes).unwrap_or(-1),
@@ -484,9 +532,9 @@ where
                                 "need_ids": need_ids.len(),
                                 "wanted_peer_backlog": pending_wanted_backlog,
                                 "request_inflight": request_stats.inflight_len,
-                                "request_credit": request_stats.remote_credit,
+                                "response_credit_bytes": request_stats.remote_credit_bytes,
                                 "pending_responses": response_stats.pending_len,
-                                "response_credit_available": response_stats.available_credit,
+                                "response_credit_available_bytes": response_stats.available_credit_bytes,
                                 "wanted_pending": wanted.count().unwrap_or(-1),
                             }))
                             .ok(),
@@ -507,16 +555,42 @@ where
         }
 
         match tokio::time::timeout(CONTROL_POLL_TIMEOUT, control.recv()).await {
-            Ok(Ok(Frame::HaveList { ids })) => {
+            Ok(Ok(Frame::RequestIds { ids })) => {
                 last_activity = Instant::now();
                 if !ids.is_empty() {
                     let _ = timeline.mark_request_received_many(&ids, current_timestamp_ms());
-                    response_state.consume_requests(&ids);
+                    super::data_plane::queue_requested_responses(
+                        response_state,
+                        &timeline,
+                        &store,
+                        &ids,
+                    );
                 }
             }
-            Ok(Ok(Frame::RequestCredit { credits })) => {
+            Ok(Ok(Frame::DiscoveryHints { hints })) => {
                 last_activity = Instant::now();
-                request_state.add_credit(credits as usize, current_timestamp_ms());
+                let hint_ids: Vec<_> = hints.iter().map(|h| h.event_id).collect();
+                let _ =
+                    timeline.mark_need_list_received_many(&hint_ids, current_timestamp_ms());
+                let observed = observe_discovery_hints_for_peer(
+                    &wanted,
+                    &timeline,
+                    recorded_by,
+                    peer_id,
+                    current_timestamp_ms(),
+                    &hints,
+                    &mut Vec::new(),
+                )?;
+                if observed > 0 {
+                    info!(
+                        "Observed {} discovery hints from peer {} between rounds",
+                        observed, peer_id
+                    );
+                }
+            }
+            Ok(Ok(Frame::ResponseCredit { bytes })) => {
+                last_activity = Instant::now();
+                request_state.add_credit_bytes(bytes as usize, current_timestamp_ms());
             }
             Ok(Ok(_)) => {}
             Ok(Err(ConnectionError::Closed)) => {
@@ -589,10 +663,10 @@ where
             last_send_progress = Instant::now();
         }
 
-        let grant = response_state.desired_credit_grant(credit_high, credit_low);
+        let grant = response_state.desired_credit_grant_bytes(credit_high, credit_low);
         if grant > 0 {
-            send_request_credit(&mut control, grant).await?;
-            response_state.note_granted(grant);
+            send_response_credit_bytes(&mut control, grant).await?;
+            response_state.note_granted_bytes(grant);
         }
 
         if low_mem_mode() && last_alloc_trim.elapsed() >= Duration::from_millis(100) {
@@ -621,9 +695,9 @@ where
                 wanted_pending,
                 wanted_peer_backlog,
                 request_stats.inflight_len,
-                request_stats.remote_credit,
+                request_stats.remote_credit_bytes,
                 response_stats.pending_len,
-                response_stats.available_credit,
+                response_stats.available_credit_bytes,
                 ingest_used,
                 ingest_cap,
                 sqlite_global.map(|s| s.memory_used_bytes).unwrap_or(-1),
@@ -679,9 +753,9 @@ where
                         "need_ids": 0,
                         "wanted_peer_backlog": pending_wanted_backlog,
                         "request_inflight": request_stats.inflight_len,
-                        "request_credit": request_stats.remote_credit,
+                        "response_credit_bytes": request_stats.remote_credit_bytes,
                         "pending_responses": response_stats.pending_len,
-                        "response_credit_available": response_stats.available_credit,
+                        "response_credit_available_bytes": response_stats.available_credit_bytes,
                         "wanted_pending": wanted.count().unwrap_or(-1),
                     }))
                     .ok(),

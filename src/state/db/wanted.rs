@@ -5,23 +5,43 @@ use super::queue::{
 };
 use super::timeline::EventTimeline;
 use crate::crypto::{event_id_to_base64, EventId};
+use crate::protocol::DiscoveryHint;
 
 /// Wanted events - events the sink still needs to fetch.
 ///
 /// `wanted_events` records demand exactly once per event ID.
 /// `wanted_sources` records which peers appear to have that event.
-/// Pull-side in-flight suppression is now bounded memory state. The durable
-/// lease columns remain only as transitional cleanup / test scaffolding.
+/// `wanted_events` also carries source-discovered type/size metadata so the
+/// request planner can budget byte credits without loading blobs.
 pub struct WantedEvents<'a> {
     conn: &'a Connection,
 }
 
+/// Conservative floor for events whose size is not yet known (e.g. negentropy
+/// diff IDs before the responder's DiscoveryHints arrive). Ensures credit
+/// accounting is never zero for a real event.
+pub const UNKNOWN_EVENT_CREDIT_FLOOR_BYTES: usize = 256;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct WantedCandidate {
     pub event_id: EventId,
+    pub semantic_type_code: u8,
+    pub encoded_size_bytes: u32,
     pub priority_lane: i64,
     pub priority_ts: i64,
     pub first_seen_at: i64,
+}
+
+impl WantedCandidate {
+    /// Effective byte cost for credit accounting. Returns the real size when
+    /// known, or a conservative floor when metadata has not yet arrived.
+    pub fn credit_cost(&self) -> usize {
+        if self.encoded_size_bytes == 0 {
+            UNKNOWN_EVENT_CREDIT_FLOOR_BYTES
+        } else {
+            self.encoded_size_bytes as usize
+        }
+    }
 }
 
 pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
@@ -30,12 +50,9 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         CREATE TABLE IF NOT EXISTS wanted_events (
             id BLOB PRIMARY KEY,
             first_seen_at INTEGER NOT NULL,
-            lease_peer_id TEXT,
-            lease_owner TEXT,
-            lease_expires_at INTEGER
+            semantic_type_code INTEGER,
+            encoded_size_bytes INTEGER
         );
-        CREATE INDEX IF NOT EXISTS idx_wanted_events_lease
-        ON wanted_events(lease_peer_id, lease_owner, lease_expires_at);
 
         CREATE TABLE IF NOT EXISTS wanted_sources (
             event_id BLOB NOT NULL,
@@ -131,11 +148,11 @@ impl<'a> WantedEvents<'a> {
         &self,
         local_peer_id: &str,
         peer_id: &str,
-        ids: &[EventId],
+        hints: &[DiscoveryHint],
         discovery_round_started_at: i64,
         timeline: &EventTimeline<'_>,
     ) -> SqliteResult<usize> {
-        if ids.is_empty() {
+        if hints.is_empty() {
             return Ok(0);
         }
         let now = current_timestamp_ms();
@@ -145,9 +162,12 @@ impl<'a> WantedEvents<'a> {
                  WHERE peer_id = ?1 AND event_id = ?2
                  LIMIT 1",
             )?;
-            let mut insert_wanted = self.conn.prepare(
-                "INSERT OR IGNORE INTO wanted_events (id, first_seen_at)
-                 VALUES (?1, ?2)",
+            let mut upsert_wanted = self.conn.prepare(
+                "INSERT INTO wanted_events (id, first_seen_at, semantic_type_code, encoded_size_bytes)
+                 VALUES (?1, ?2, ?3, ?4)
+                 ON CONFLICT(id) DO UPDATE SET
+                     semantic_type_code = COALESCE(NULLIF(excluded.semantic_type_code, 0), NULLIF(wanted_events.semantic_type_code, 0), excluded.semantic_type_code),
+                     encoded_size_bytes = COALESCE(NULLIF(excluded.encoded_size_bytes, 0), NULLIF(wanted_events.encoded_size_bytes, 0), excluded.encoded_size_bytes)",
             )?;
             let mut upsert_source = self.conn.prepare(
                 "INSERT INTO wanted_sources (
@@ -160,27 +180,32 @@ impl<'a> WantedEvents<'a> {
             )?;
 
             let mut observed = 0usize;
-            let mut discovered_ids = Vec::with_capacity(ids.len());
-            for id in ids {
-                let id_b64 = event_id_to_base64(id);
+            let mut discovered_ids = Vec::with_capacity(hints.len());
+            for hint in hints {
+                let id_b64 = event_id_to_base64(&hint.event_id);
                 let already_local = already_recorded
                     .query_row(params![local_peer_id, &id_b64], |_| Ok(()))
                     .optional()?
                     .is_some();
                 if already_local {
-                    delete_wanted_row(self.conn, id)?;
+                    delete_wanted_row(self.conn, &hint.event_id)?;
                     continue;
                 }
-                let _ = insert_wanted.execute(params![&id[..], now])?;
+                let _ = upsert_wanted.execute(params![
+                    &hint.event_id[..],
+                    now,
+                    i64::from(hint.semantic_type_code),
+                    i64::from(hint.encoded_size_bytes),
+                ])?;
                 upsert_source.execute(params![
-                    &id[..],
+                    &hint.event_id[..],
                     peer_id,
                     now,
                     PRIORITY_LANE_FOREGROUND,
                     now,
                 ])?;
                 observed += 1;
-                discovered_ids.push(*id);
+                discovered_ids.push(hint.event_id);
             }
             if !discovered_ids.is_empty() {
                 let _ = timeline.mark_discovered_many_with_round_start(
@@ -205,11 +230,14 @@ impl<'a> WantedEvents<'a> {
         let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
         with_sqlite_busy_retry(|| {
             let mut stmt = self.conn.prepare(
-                "SELECT we.id, ws.priority_lane, ws.priority_ts, we.first_seen_at
+                "SELECT we.id, we.semantic_type_code, we.encoded_size_bytes,
+                        ws.priority_lane, ws.priority_ts, we.first_seen_at
                  FROM wanted_events we
                  INNER JOIN wanted_sources ws
                     ON ws.event_id = we.id
                  WHERE ws.peer_id = ?1
+                   AND we.semantic_type_code IS NOT NULL
+                   AND we.encoded_size_bytes IS NOT NULL
                  ORDER BY
                     ws.priority_lane ASC,
                     ws.priority_ts DESC,
@@ -220,6 +248,8 @@ impl<'a> WantedEvents<'a> {
             )?;
             let rows = stmt.query_map(params![peer_id, limit_i64], |row| {
                 let blob: Vec<u8> = row.get(0)?;
+                let semantic_type_code_i64: i64 = row.get(1)?;
+                let encoded_size_bytes_i64: i64 = row.get(2)?;
                 let mut event_id = [0u8; 32];
                 if blob.len() != 32 {
                     return Err(rusqlite::Error::InvalidColumnType(
@@ -231,102 +261,18 @@ impl<'a> WantedEvents<'a> {
                 event_id.copy_from_slice(&blob);
                 Ok(WantedCandidate {
                     event_id,
-                    priority_lane: row.get(1)?,
-                    priority_ts: row.get(2)?,
-                    first_seen_at: row.get(3)?,
+                    semantic_type_code: u8::try_from(semantic_type_code_i64).map_err(|_| {
+                        rusqlite::Error::IntegralValueOutOfRange(1, semantic_type_code_i64)
+                    })?,
+                    encoded_size_bytes: u32::try_from(encoded_size_bytes_i64).map_err(|_| {
+                        rusqlite::Error::IntegralValueOutOfRange(2, encoded_size_bytes_i64)
+                    })?,
+                    priority_lane: row.get(3)?,
+                    priority_ts: row.get(4)?,
+                    first_seen_at: row.get(5)?,
                 })
             })?;
             rows.collect::<Result<Vec<_>, _>>()
-        })
-    }
-
-    /// Legacy transitional API: claim up to `limit` wanted events for `peer_id`.
-    ///
-    /// The hot path no longer uses durable request leases; current pull
-    /// scheduling keeps only demand/source truth in SQLite and tracks in-flight
-    /// requests in memory.
-    pub fn claim_for_peer(
-        &self,
-        peer_id: &str,
-        lease_owner: &str,
-        limit: usize,
-        lease_ms: i64,
-    ) -> SqliteResult<Vec<EventId>> {
-        if limit == 0 {
-            return Ok(Vec::new());
-        }
-        let now = current_timestamp_ms();
-        let lease_until = now.saturating_add(lease_ms.max(1));
-        let limit_i64 = i64::try_from(limit).unwrap_or(i64::MAX);
-
-        with_immediate_tx(self.conn, || {
-            let mut stmt = self.conn.prepare(
-                "SELECT we.id
-                 FROM wanted_events we
-                 INNER JOIN wanted_sources ws
-                    ON ws.event_id = we.id
-                 WHERE ws.peer_id = ?1
-                   AND (we.lease_expires_at IS NULL OR we.lease_expires_at <= ?2)
-                 ORDER BY
-                    ws.priority_lane ASC,
-                    ws.priority_ts DESC,
-                    ws.first_seen_at ASC,
-                    we.first_seen_at ASC,
-                    ws.rowid ASC
-                 LIMIT ?3",
-            )?;
-
-            let mut rows = stmt.query(params![peer_id, now, limit_i64])?;
-            let mut selected = Vec::new();
-            while let Some(row) = rows.next()? {
-                let blob: Vec<u8> = row.get(0)?;
-                if blob.len() != 32 {
-                    continue;
-                }
-                let mut id = [0u8; 32];
-                id.copy_from_slice(&blob);
-                selected.push(id);
-            }
-
-            let mut claimed = Vec::with_capacity(selected.len());
-            let mut update = self.conn.prepare(
-                "UPDATE wanted_events
-                 SET lease_peer_id = ?1,
-                     lease_owner = ?2,
-                     lease_expires_at = ?3
-                 WHERE id = ?4
-                   AND (lease_expires_at IS NULL OR lease_expires_at <= ?5)",
-            )?;
-            for id in selected {
-                let rows =
-                    update.execute(params![peer_id, lease_owner, lease_until, &id[..], now])?;
-                if rows > 0 {
-                    claimed.push(id);
-                }
-            }
-            Ok(claimed)
-        })
-    }
-
-    /// Legacy transitional API: count durable wanted-request leases currently
-    /// held by `(peer_id, lease_owner)`.
-    pub fn count_outstanding_for_peer(
-        &self,
-        peer_id: &str,
-        lease_owner: &str,
-    ) -> SqliteResult<i64> {
-        let now = current_timestamp_ms();
-        with_sqlite_busy_retry(|| {
-            self.conn.query_row(
-                "SELECT COUNT(*)
-                 FROM wanted_events
-                 WHERE lease_peer_id = ?1
-                   AND lease_owner = ?2
-                   AND lease_expires_at IS NOT NULL
-                   AND lease_expires_at > ?3",
-                params![peer_id, lease_owner, now],
-                |row| row.get(0),
-            )
         })
     }
 
@@ -343,22 +289,6 @@ impl<'a> WantedEvents<'a> {
                  WHERE ws.peer_id = ?1",
                 params![peer_id],
                 |row| row.get(0),
-            )
-        })
-    }
-
-    /// Legacy transitional API: release all durable request leases held by
-    /// `(peer_id, lease_owner)`.
-    pub fn release_peer_leases(&self, peer_id: &str, lease_owner: &str) -> SqliteResult<usize> {
-        with_sqlite_busy_retry(|| {
-            self.conn.execute(
-                "UPDATE wanted_events
-                 SET lease_peer_id = NULL,
-                     lease_owner = NULL,
-                     lease_expires_at = NULL
-                 WHERE lease_peer_id = ?1
-                   AND lease_owner = ?2",
-                params![peer_id, lease_owner],
             )
         })
     }
@@ -426,6 +356,14 @@ mod tests {
         let mut id = [0u8; 32];
         id[0] = byte;
         id
+    }
+
+    fn discovery_hint(byte: u8, type_code: u8, encoded_size_bytes: u32) -> DiscoveryHint {
+        DiscoveryHint {
+            event_id: make_event_id(byte),
+            semantic_type_code: type_code,
+            encoded_size_bytes,
+        }
     }
 
     fn insert_local_event(conn: &Connection, id: &EventId) {
@@ -499,7 +437,13 @@ mod tests {
             let wanted = WantedEvents::new(&conn);
             let timeline = EventTimeline::new(&conn);
             wanted
-                .observe_many_for_peer("local", "peer-a", &[make_event_id(7)], 1, &timeline)
+                .observe_many_for_peer(
+                    "local",
+                    "peer-a",
+                    &[discovery_hint(7, crate::event_modules::EVENT_TYPE_MESSAGE, 144)],
+                    1,
+                    &timeline,
+                )
                 .unwrap()
         });
 
@@ -514,61 +458,28 @@ mod tests {
     }
 
     #[test]
-    fn test_multi_source_claims_do_not_duplicate_live_leases() {
+    fn test_multi_source_candidates_keep_metadata_and_backlog() {
         let conn = crate::db::open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let wanted = WantedEvents::new(&conn);
         let timeline = EventTimeline::new(&conn);
-        let ids = [make_event_id(1), make_event_id(2)];
+        let hints = [
+            discovery_hint(1, crate::event_modules::EVENT_TYPE_MESSAGE, 144),
+            discovery_hint(2, crate::event_modules::EVENT_TYPE_REACTION, 96),
+        ];
 
         wanted
-            .observe_many_for_peer("local", "peer-a", &ids, 1, &timeline)
+            .observe_many_for_peer("local", "peer-a", &hints, 1, &timeline)
             .unwrap();
         wanted
-            .observe_many_for_peer("local", "peer-b", &ids, 1, &timeline)
+            .observe_many_for_peer("local", "peer-b", &hints, 1, &timeline)
             .unwrap();
 
-        let claimed_a = wanted
-            .claim_for_peer("peer-a", "owner-a", 1, 30_000)
-            .unwrap();
-        assert_eq!(claimed_a.len(), 1);
-
-        let claimed_b = wanted
-            .claim_for_peer("peer-b", "owner-b", 2, 30_000)
-            .unwrap();
-        assert_eq!(
-            claimed_b.len(),
-            1,
-            "peer-b should only get the still-unleased event"
-        );
-        assert_ne!(claimed_a[0], claimed_b[0], "live leases must not overlap");
-    }
-
-    #[test]
-    fn test_release_allows_another_peer_to_claim() {
-        let conn = crate::db::open_in_memory().unwrap();
-        create_tables(&conn).unwrap();
-        let wanted = WantedEvents::new(&conn);
-        let timeline = EventTimeline::new(&conn);
-        let id = make_event_id(9);
-
-        wanted
-            .observe_many_for_peer("local", "peer-a", &[id], 1, &timeline)
-            .unwrap();
-        wanted
-            .observe_many_for_peer("local", "peer-b", &[id], 1, &timeline)
-            .unwrap();
-
-        let claimed_a = wanted
-            .claim_for_peer("peer-a", "owner-a", 1, 30_000)
-            .unwrap();
-        assert_eq!(claimed_a, vec![id]);
-        assert_eq!(wanted.release_peer_leases("peer-a", "owner-a").unwrap(), 1);
-
-        let claimed_b = wanted
-            .claim_for_peer("peer-b", "owner-b", 1, 30_000)
-            .unwrap();
-        assert_eq!(claimed_b, vec![id]);
+        let peer_a_candidates = wanted.list_candidates_for_peer("peer-a", 8).unwrap();
+        assert_eq!(peer_a_candidates.len(), 2);
+        assert_eq!(peer_a_candidates[0].semantic_type_code, crate::event_modules::EVENT_TYPE_MESSAGE);
+        assert_eq!(peer_a_candidates[0].encoded_size_bytes, 144);
+        assert_eq!(wanted.count_backlog_for_peer("peer-b").unwrap(), 2);
     }
 
     #[test]
@@ -580,10 +491,30 @@ mod tests {
         let id = make_event_id(5);
 
         wanted
-            .observe_many_for_peer("local", "peer-a", &[id], 1, &timeline)
+            .observe_many_for_peer(
+                "local",
+                "peer-a",
+                &[DiscoveryHint {
+                    event_id: id,
+                    semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
+                    encoded_size_bytes: 144,
+                }],
+                1,
+                &timeline,
+            )
             .unwrap();
         wanted
-            .observe_many_for_peer("local", "peer-b", &[id], 1, &timeline)
+            .observe_many_for_peer(
+                "local",
+                "peer-b",
+                &[DiscoveryHint {
+                    event_id: id,
+                    semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
+                    encoded_size_bytes: 144,
+                }],
+                1,
+                &timeline,
+            )
             .unwrap();
         wanted.remove(&id).unwrap();
 
@@ -614,7 +545,17 @@ mod tests {
         let id = make_event_id(11);
 
         wanted
-            .observe_many_for_peer("local", "peer-a", &[id], 1, &timeline)
+            .observe_many_for_peer(
+                "local",
+                "peer-a",
+                &[DiscoveryHint {
+                    event_id: id,
+                    semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
+                    encoded_size_bytes: 144,
+                }],
+                1,
+                &timeline,
+            )
             .unwrap();
         assert_eq!(wanted.count().unwrap(), 1);
 
@@ -624,7 +565,17 @@ mod tests {
 
         assert_eq!(
             wanted
-                .observe_many_for_peer("local", "peer-a", &[id], 1, &timeline)
+                .observe_many_for_peer(
+                    "local",
+                    "peer-a",
+                    &[DiscoveryHint {
+                        event_id: id,
+                        semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
+                        encoded_size_bytes: 144,
+                    }],
+                    1,
+                    &timeline,
+                )
                 .unwrap(),
             0
         );

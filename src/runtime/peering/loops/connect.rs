@@ -15,7 +15,7 @@ use crate::db::transport_trust::record_transport_binding;
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::session::windowing::reset_outbound_window_state;
 use crate::sync::CoordinationManager;
-use crate::sync::SyncSessionHandler;
+use crate::sync::SyncConnectionHandler;
 use crate::transport::multi_workspace::transport_sni;
 use crate::transport::{
     derive_bootstrap_dial_context, dial_session_provider, BootstrapDialMode,
@@ -385,7 +385,7 @@ async fn connect_loop_inner(
         );
         // Handler state is scoped to this authenticated connection so any
         // connection-lifetime sync state is dropped when the connection is.
-        let initiator_handler = SyncSessionHandler::outbound(
+        let initiator_handler = SyncConnectionHandler::outbound(
             db_path.to_string(),
             SYNC_SESSION_TIMEOUT_SECS,
             coordination.clone(),

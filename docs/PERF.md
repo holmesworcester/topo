@@ -494,7 +494,7 @@ MAX_MALL_MMAP=0
 2. **Reconciliation worker thread**: neg.reconcile() runs on a dedicated OS thread so egress drain continues during 100-400ms reconciliation calls
 3. **Immediate egress deletion**: sent items are deleted (not marked) to keep the egress table small during bulk transfers
 4. **Batch transactions**: BEGIN/COMMIT around event batches
-5. **Streaming pull dispatch**: HaveList frames sent during reconciliation rounds, not deferred until reconciliation completes
+5. **Streaming pull dispatch**: RequestIds frames sent during reconciliation rounds, not deferred until reconciliation completes
 6. **Inline projection**: project in same transaction as store
 7. **Coordinated download**: sink-driven round-based assignment avoids redundant transfers from overlapping sources
 

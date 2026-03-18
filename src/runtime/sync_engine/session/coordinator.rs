@@ -24,7 +24,7 @@ struct CoordinatorState {
 #[derive(Clone, Default)]
 struct PeerRequestState {
     source_peer_id: String,
-    available_credit: usize,
+    available_credit_bytes: usize,
     candidate_limit: usize,
     inflight_requested: HashMap<EventId, i64>,
 }
@@ -40,7 +40,7 @@ impl PeerRequestState {
 #[derive(Clone)]
 struct PeerRequestReport {
     peer_idx: usize,
-    available_credit: usize,
+    available_credit_bytes: usize,
     inflight_requested: HashMap<EventId, i64>,
     candidates: Vec<WantedCandidate>,
 }
@@ -62,16 +62,16 @@ impl PeerCoord {
         &self,
         wanted: &WantedEvents<'_>,
         peer_id: &str,
-        available_credit: usize,
+        available_credit_bytes: usize,
         inflight_requested: &HashMap<EventId, i64>,
         candidate_limit: usize,
         now_ms: i64,
-    ) -> SqliteResult<Vec<EventId>> {
+    ) -> SqliteResult<Vec<WantedCandidate>> {
         let mut state = self.state.lock().expect("coordination mutex poisoned");
         let entry = state.peers.entry(self.peer_idx).or_default();
         entry.source_peer_id = peer_id.to_string();
-        entry.available_credit = available_credit;
-        entry.candidate_limit = candidate_limit.max(available_credit).max(1);
+        entry.available_credit_bytes = available_credit_bytes;
+        entry.candidate_limit = candidate_limit.max(1);
         entry.inflight_requested = inflight_requested.clone();
 
         for peer_state in state.peers.values_mut() {
@@ -83,10 +83,17 @@ impl PeerCoord {
         let selected = assignments.get(&self.peer_idx).cloned().unwrap_or_default();
 
         if let Some(peer_state) = state.peers.get_mut(&self.peer_idx) {
-            peer_state.available_credit =
-                peer_state.available_credit.saturating_sub(selected.len());
-            for event_id in &selected {
-                peer_state.inflight_requested.insert(*event_id, now_ms);
+            let selected_bytes: usize = selected
+                .iter()
+                .map(|candidate| candidate.credit_cost())
+                .sum();
+            peer_state.available_credit_bytes = peer_state
+                .available_credit_bytes
+                .saturating_sub(selected_bytes);
+            for candidate in &selected {
+                peer_state
+                    .inflight_requested
+                    .insert(candidate.event_id, now_ms);
             }
         }
 
@@ -100,7 +107,7 @@ impl PeerCoord {
         if let Some(state) = self.state_weak.upgrade() {
             if let Ok(mut state) = state.lock() {
                 if let Some(peer_state) = state.peers.get_mut(&self.peer_idx) {
-                    peer_state.available_credit = 0;
+                    peer_state.available_credit_bytes = 0;
                     peer_state.inflight_requested.clear();
                 }
             }
@@ -124,12 +131,13 @@ impl CoordinatorState {
         let mut reports = Vec::with_capacity(self.peers.len());
         for (&peer_idx, peer_state) in &self.peers {
             if peer_state.source_peer_id.is_empty()
-                || (peer_state.available_credit == 0 && peer_state.inflight_requested.is_empty())
+                || (peer_state.available_credit_bytes == 0
+                    && peer_state.inflight_requested.is_empty())
             {
                 continue;
             }
 
-            let candidates = if peer_state.available_credit == 0 {
+            let candidates = if peer_state.available_credit_bytes == 0 {
                 Vec::new()
             } else {
                 wanted.list_candidates_for_peer(
@@ -139,7 +147,7 @@ impl CoordinatorState {
             };
             reports.push(PeerRequestReport {
                 peer_idx,
-                available_credit: peer_state.available_credit,
+                available_credit_bytes: peer_state.available_credit_bytes,
                 inflight_requested: peer_state.inflight_requested.clone(),
                 candidates,
             });
@@ -185,19 +193,22 @@ fn compare_candidates(left: &WantedCandidate, right: &WantedCandidate) -> Orderi
         .then_with(|| left.event_id.cmp(&right.event_id))
 }
 
-fn plan_requests_across_peers(reports: &[PeerRequestReport]) -> HashMap<usize, Vec<EventId>> {
+fn plan_requests_across_peers(
+    reports: &[PeerRequestReport],
+) -> HashMap<usize, Vec<WantedCandidate>> {
     if reports.is_empty() {
         return HashMap::new();
     }
 
-    let mut assignments: HashMap<usize, Vec<EventId>> = HashMap::with_capacity(reports.len());
-    let mut credits: HashMap<usize, usize> = HashMap::with_capacity(reports.len());
+    let mut assignments: HashMap<usize, Vec<WantedCandidate>> =
+        HashMap::with_capacity(reports.len());
+    let mut credits_bytes: HashMap<usize, usize> = HashMap::with_capacity(reports.len());
     let mut peer_seen: HashMap<usize, HashSet<EventId>> = HashMap::with_capacity(reports.len());
     let mut cursors: HashMap<usize, usize> = HashMap::with_capacity(reports.len());
     let mut globally_inflight: HashSet<EventId> = HashSet::new();
 
     for report in reports {
-        credits.insert(report.peer_idx, report.available_credit);
+        credits_bytes.insert(report.peer_idx, report.available_credit_bytes);
         peer_seen.insert(
             report.peer_idx,
             report.inflight_requested.keys().copied().collect(),
@@ -209,19 +220,19 @@ fn plan_requests_across_peers(reports: &[PeerRequestReport]) -> HashMap<usize, V
 
     while let Some((peer_idx, event_id, next_cursor)) = next_assignment(
         reports,
-        &credits,
+        &credits_bytes,
         &peer_seen,
         &cursors,
         Some(&globally_inflight),
     ) {
         assignments.entry(peer_idx).or_default().push(event_id);
-        if let Some(credit) = credits.get_mut(&peer_idx) {
-            *credit = credit.saturating_sub(1);
+        if let Some(credit_bytes) = credits_bytes.get_mut(&peer_idx) {
+            *credit_bytes = credit_bytes.saturating_sub(event_id.credit_cost());
         }
         if let Some(seen) = peer_seen.get_mut(&peer_idx) {
-            seen.insert(event_id);
+            seen.insert(event_id.event_id);
         }
-        globally_inflight.insert(event_id);
+        globally_inflight.insert(event_id.event_id);
         cursors.insert(peer_idx, next_cursor);
     }
 
@@ -229,15 +240,19 @@ fn plan_requests_across_peers(reports: &[PeerRequestReport]) -> HashMap<usize, V
         .iter()
         .map(|report| (report.peer_idx, 0usize))
         .collect();
-    while let Some((peer_idx, event_id, next_cursor)) =
-        next_assignment(reports, &credits, &peer_seen, &duplicate_cursors, None)
-    {
+    while let Some((peer_idx, event_id, next_cursor)) = next_assignment(
+        reports,
+        &credits_bytes,
+        &peer_seen,
+        &duplicate_cursors,
+        None,
+    ) {
         assignments.entry(peer_idx).or_default().push(event_id);
-        if let Some(credit) = credits.get_mut(&peer_idx) {
-            *credit = credit.saturating_sub(1);
+        if let Some(credit_bytes) = credits_bytes.get_mut(&peer_idx) {
+            *credit_bytes = credit_bytes.saturating_sub(event_id.credit_cost());
         }
         if let Some(seen) = peer_seen.get_mut(&peer_idx) {
-            seen.insert(event_id);
+            seen.insert(event_id.event_id);
         }
         duplicate_cursors.insert(peer_idx, next_cursor);
     }
@@ -247,16 +262,16 @@ fn plan_requests_across_peers(reports: &[PeerRequestReport]) -> HashMap<usize, V
 
 fn next_assignment(
     reports: &[PeerRequestReport],
-    credits: &HashMap<usize, usize>,
+    credits_bytes: &HashMap<usize, usize>,
     peer_seen: &HashMap<usize, HashSet<EventId>>,
     cursors: &HashMap<usize, usize>,
     global_exclude: Option<&HashSet<EventId>>,
-) -> Option<(usize, EventId, usize)> {
-    let mut best: Option<(usize, EventId, usize, WantedCandidate)> = None;
+) -> Option<(usize, WantedCandidate, usize)> {
+    let mut best: Option<(usize, WantedCandidate, usize)> = None;
 
     for report in reports {
-        let remaining_credit = credits.get(&report.peer_idx).copied().unwrap_or(0);
-        if remaining_credit == 0 {
+        let remaining_credit_bytes = credits_bytes.get(&report.peer_idx).copied().unwrap_or(0);
+        if remaining_credit_bytes == 0 {
             continue;
         }
         let seen = peer_seen
@@ -265,6 +280,10 @@ fn next_assignment(
         let start = cursors.get(&report.peer_idx).copied().unwrap_or(0);
         let mut idx = start;
         while let Some(candidate) = report.candidates.get(idx) {
+            if candidate.credit_cost() > remaining_credit_bytes {
+                idx += 1;
+                continue;
+            }
             if seen.contains(&candidate.event_id) {
                 idx += 1;
                 continue;
@@ -274,17 +293,17 @@ fn next_assignment(
                 continue;
             }
             match &best {
-                Some((_, _, _, best_candidate))
+                Some((_, best_candidate, _))
                     if compare_candidates(best_candidate, candidate) != Ordering::Greater => {}
                 _ => {
-                    best = Some((report.peer_idx, candidate.event_id, idx + 1, *candidate));
+                    best = Some((report.peer_idx, *candidate, idx + 1));
                 }
             }
             break;
         }
     }
 
-    best.map(|(peer_idx, event_id, next_cursor, _)| (peer_idx, event_id, next_cursor))
+    best.map(|(peer_idx, candidate, next_cursor)| (peer_idx, candidate, next_cursor))
 }
 
 #[cfg(test)]
@@ -293,11 +312,13 @@ mod tests {
     use crate::db::{open_in_memory, schema::create_tables, timeline::EventTimeline};
     use std::collections::HashMap;
 
-    fn candidate(byte: u8, lane: i64, ts: i64) -> WantedCandidate {
+    fn candidate(byte: u8, lane: i64, ts: i64, encoded_size_bytes: u32) -> WantedCandidate {
         let mut event_id = [0u8; 32];
         event_id[0] = byte;
         WantedCandidate {
             event_id,
+            semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
+            encoded_size_bytes,
             priority_lane: lane,
             priority_ts: ts,
             first_seen_at: ts,
@@ -309,20 +330,24 @@ mod tests {
         let reports = vec![
             PeerRequestReport {
                 peer_idx: 0,
-                available_credit: 2,
+                available_credit_bytes: 300,
                 inflight_requested: HashMap::new(),
-                candidates: vec![candidate(1, 1, 100), candidate(2, 1, 90)],
+                candidates: vec![candidate(1, 1, 100, 100), candidate(2, 1, 90, 100)],
             },
             PeerRequestReport {
                 peer_idx: 1,
-                available_credit: 2,
+                available_credit_bytes: 300,
                 inflight_requested: HashMap::new(),
-                candidates: vec![candidate(1, 1, 100), candidate(3, 1, 80)],
+                candidates: vec![candidate(1, 1, 100, 100), candidate(3, 1, 80, 100)],
             },
         ];
 
         let assignments = plan_requests_across_peers(&reports);
-        let mut all = assignments.values().flatten().copied().collect::<Vec<_>>();
+        let mut all = assignments
+            .values()
+            .flatten()
+            .map(|candidate| candidate.event_id)
+            .collect::<Vec<_>>();
         all.sort();
         all.dedup();
         assert_eq!(
@@ -340,30 +365,42 @@ mod tests {
     #[test]
     fn planner_respects_existing_inflight_across_peers() {
         let mut inflight = HashMap::new();
-        inflight.insert(candidate(1, 1, 100).event_id, 1);
+        inflight.insert(candidate(1, 1, 100, 100).event_id, 1);
         let reports = vec![
             PeerRequestReport {
                 peer_idx: 0,
-                available_credit: 1,
+                available_credit_bytes: 100,
                 inflight_requested: inflight,
-                candidates: vec![candidate(1, 1, 100), candidate(2, 1, 90)],
+                candidates: vec![candidate(1, 1, 100, 100), candidate(2, 1, 90, 100)],
             },
             PeerRequestReport {
                 peer_idx: 1,
-                available_credit: 1,
+                available_credit_bytes: 100,
                 inflight_requested: HashMap::new(),
-                candidates: vec![candidate(1, 1, 100), candidate(3, 1, 80)],
+                candidates: vec![candidate(1, 1, 100, 100), candidate(3, 1, 80, 100)],
             },
         ];
 
         let assignments = plan_requests_across_peers(&reports);
         assert_eq!(
-            assignments.get(&0).cloned().unwrap_or_default(),
-            vec![candidate(2, 1, 90).event_id]
+            assignments
+                .get(&0)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|candidate| candidate.event_id)
+                .collect::<Vec<_>>(),
+            vec![candidate(2, 1, 90, 100).event_id]
         );
         assert_eq!(
-            assignments.get(&1).cloned().unwrap_or_default(),
-            vec![candidate(3, 1, 80).event_id]
+            assignments
+                .get(&1)
+                .cloned()
+                .unwrap_or_default()
+                .into_iter()
+                .map(|candidate| candidate.event_id)
+                .collect::<Vec<_>>(),
+            vec![candidate(3, 1, 80, 100).event_id]
         );
     }
 
@@ -385,7 +422,18 @@ mod tests {
             .observe_many_for_peer(
                 "local-peer",
                 "peer-a",
-                &[a, b],
+                &[
+                    crate::protocol::DiscoveryHint {
+                        event_id: a,
+                        semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
+                        encoded_size_bytes: 128,
+                    },
+                    crate::protocol::DiscoveryHint {
+                        event_id: b,
+                        semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
+                        encoded_size_bytes: 128,
+                    },
+                ],
                 now_ms_placeholder(),
                 &timeline,
             )
@@ -394,7 +442,18 @@ mod tests {
             .observe_many_for_peer(
                 "local-peer",
                 "peer-b",
-                &[a, c],
+                &[
+                    crate::protocol::DiscoveryHint {
+                        event_id: a,
+                        semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
+                        encoded_size_bytes: 128,
+                    },
+                    crate::protocol::DiscoveryHint {
+                        event_id: c,
+                        semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
+                        encoded_size_bytes: 128,
+                    },
+                ],
                 now_ms_placeholder(),
                 &timeline,
             )
@@ -406,16 +465,40 @@ mod tests {
         let now_ms = 1_000;
 
         let first = coord_a
-            .plan_requests(&wanted, "peer-a", 2, &HashMap::new(), 8, now_ms)
+            .plan_requests(&wanted, "peer-a", 256, &HashMap::new(), 8, now_ms)
             .unwrap();
         assert_eq!(first.len(), 2);
 
         let second = coord_b
-            .plan_requests(&wanted, "peer-b", 2, &HashMap::new(), 8, now_ms)
+            .plan_requests(&wanted, "peer-b", 256, &HashMap::new(), 8, now_ms)
             .unwrap();
         assert_eq!(
-            second[0], c,
+            second[0].event_id, c,
             "peer-b should consume the still-unrequested unique candidate first"
+        );
+    }
+
+    /// Zero-metadata candidates (encoded_size_bytes=0, from negentropy placeholders)
+    /// must consume floor credit so they cannot generate unbounded RequestIds
+    /// without receiving fresh ResponseCredit grants.
+    #[test]
+    fn zero_metadata_candidates_consume_floor_credit() {
+        // With credit equal to exactly one floor unit, only one zero-metadata
+        // candidate must be selected. Without the floor fix, 0 <= any credit
+        // so all candidates would be selected and credit would remain unchanged.
+        let reports = vec![PeerRequestReport {
+            peer_idx: 0,
+            available_credit_bytes: crate::db::wanted::UNKNOWN_EVENT_CREDIT_FLOOR_BYTES,
+            inflight_requested: HashMap::new(),
+            candidates: vec![candidate(1, 1, 100, 0), candidate(2, 1, 90, 0)],
+        }];
+
+        let assignments = plan_requests_across_peers(&reports);
+        let assigned = assignments.get(&0).cloned().unwrap_or_default();
+        assert_eq!(
+            assigned.len(),
+            1,
+            "zero-metadata events must consume floor credit, not bypass the byte-credit window"
         );
     }
 

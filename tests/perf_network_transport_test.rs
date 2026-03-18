@@ -119,11 +119,11 @@ async fn exercise_roundtrip_sessions(
             }
         );
 
-        let have_list = encode_frame(&Frame::HaveList { ids: vec![] });
-        server_parts.control.send(&have_list).await?;
+        let request_ids = encode_frame(&Frame::RequestIds { ids: vec![] });
+        server_parts.control.send(&request_ids).await?;
         server_parts.control.flush().await?;
         let received = client_parts.control.recv().await?;
-        assert_eq!(parse_frame(&received)?.0, Frame::HaveList { ids: vec![] });
+        assert_eq!(parse_frame(&received)?.0, Frame::RequestIds { ids: vec![] });
 
         let payload = vec![round as u8; data_payload_len];
         let event = encode_frame(&Frame::Event {

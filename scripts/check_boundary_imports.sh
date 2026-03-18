@@ -195,8 +195,8 @@ check_no_match 'endpoint\.connect\(' src/runtime/peering/workflows/
 
 # -- coordinated-download-only initiator enforcement --
 check_no_match 'coordination:\s*Option<(&|Arc<)PeerCoord' src/
-check_no_match 'SyncSessionHandler::initiator\(' src/
-check_no_match 'SyncSessionHandler::initiator\(' tests/
+check_no_match 'SyncConnectionHandler::initiator\(' src/
+check_no_match 'SyncConnectionHandler::initiator\(' tests/
 check_no_match_multiline 'run_sync_initiator\([\s\S]{0,240}None' src tests
 check_no_match 'coordination_enabled' src/runtime/sync_engine/session/
 check_no_match_text 'non-coordinated|legacy helper/test path' \
