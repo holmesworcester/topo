@@ -1,3 +1,5 @@
+use std::collections::HashMap;
+
 use crate::db::project_queue::ProjectQueue;
 use crate::db::wanted::WantedEvents;
 use crate::state::live_hints::{self, LiveHintEvent};
@@ -5,6 +7,7 @@ use crate::state::shared_workspace_fanout::fanout_shared_event_enqueue;
 
 use super::drain::drain_project_queue_batched;
 use super::phases::PersistPhaseOutput;
+use crate::projection::apply::project_batch;
 
 pub(super) trait PostCommitEffectsExecutor {
     fn run_post_commit_effects(&self, persist_output: &PersistPhaseOutput, batch_size: usize);
@@ -37,26 +40,26 @@ impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
             let _ = wanted.remove(event_id);
         }
 
-        // First drain the origin tenants so removals in this batch are
-        // projected before we fan out to siblings.
+        // Project events directly from the persisted batch — bypasses the
+        // project_queue for the hot path. This eliminates per-event enqueue
+        // (INSERT with 3 NOT EXISTS subqueries), claim, and dequeue.
         let mut tenants: Vec<String> = persist_output.tenants_seen.iter().cloned().collect();
         tenants.sort();
 
         for tenant_id in &tenants {
-            let t0 = std::time::Instant::now();
-            let drain_result = drain_project_queue_batched(self.db, tenant_id, batch_size);
-            let drain_ms = t0.elapsed().as_millis();
-            match &drain_result {
-                Ok(count) if *count > 0 => {
-                    tracing::info!("BATCH_DRAIN: tenant={} projected={} elapsed={}ms", short_id(tenant_id), count, drain_ms);
+            // Direct batch projection of just-persisted events
+            if let Some(event_ids) = persist_output.tenant_event_ids.get(tenant_id) {
+                if let Err(e) = project_batch(self.db, tenant_id, event_ids) {
+                    tracing::warn!("direct batch projection error for {}: {}", tenant_id, e);
                 }
-                _ => {}
             }
-            if let Err(e) = drain_result {
+
+            // Drain any remaining queued items (startup recovery, retries, fanout)
+            if let Err(e) = drain_project_queue_batched(self.db, tenant_id, batch_size) {
                 tracing::warn!("project_queue drain error for {}: {}", tenant_id, e);
             }
 
-            if let Ok(h) = pq.health(&tenant_id) {
+            if let Ok(h) = pq.health(tenant_id) {
                 if h.pending > 0 || h.max_attempts > 0 {
                     tracing::debug!(
                         tenant = %tenant_id,
@@ -169,6 +172,7 @@ mod tests {
         let persist_output = PersistPhaseOutput {
             persisted_event_ids: vec![wanted_id],
             tenants_seen: std::collections::HashSet::from(["tenant-a".to_string()]),
+            tenant_event_ids: HashMap::new(),
             live_hints: Vec::new(),
             shared_event_fanouts: Vec::new(),
         };
@@ -212,6 +216,7 @@ mod tests {
         let persist_output = PersistPhaseOutput {
             persisted_event_ids: vec![wanted_id],
             tenants_seen: std::collections::HashSet::from(["tenant-a".to_string()]),
+            tenant_event_ids: HashMap::new(),
             live_hints: Vec::new(),
             shared_event_fanouts: Vec::new(),
         };
@@ -346,6 +351,7 @@ mod tests {
         let persist_output = PersistPhaseOutput {
             persisted_event_ids: vec![event_id],
             tenants_seen: std::collections::HashSet::from([origin.identity.clone()]),
+            tenant_event_ids: HashMap::new(),
             live_hints: Vec::new(),
             shared_event_fanouts: Vec::new(),
         };

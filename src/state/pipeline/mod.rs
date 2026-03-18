@@ -307,8 +307,8 @@ pub fn batch_writer(
             let _ = db.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
         }
 
-        // Profile logging: emit every 10k events to avoid log noise
-        if cumulative_events / 10_000 != (cumulative_events - persisted_count) / 10_000 {
+        // Profile logging: emit every batch when batch > 100 events
+        if batch_len > 100 || cumulative_events / 10_000 != (cumulative_events - persisted_count) / 10_000 {
             let epoch_ms = profile_epoch.elapsed().as_millis();
             info!(
                 "WRITER_PROFILE: cumulative={} batch={} persist={}ms commit+effects={}ms epoch_10k={}ms",
@@ -346,6 +346,7 @@ mod tests {
         PersistPhaseOutput {
             persisted_event_ids: vec![[1u8; 32], [2u8; 32]],
             tenants_seen: HashSet::from(["tenant-b".to_string(), "tenant-a".to_string()]),
+            tenant_event_ids: HashMap::new(),
             live_hints: Vec::new(),
             shared_event_fanouts: Vec::new(),
         }

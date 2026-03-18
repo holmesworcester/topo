@@ -15,6 +15,9 @@ use crate::state::shared_workspace_fanout::SharedEventFanout;
 pub(super) struct PersistPhaseOutput {
     pub persisted_event_ids: Vec<EventId>,
     pub tenants_seen: HashSet<String>,
+    /// Tenant → event_id_b64 mapping for direct batch projection
+    /// (bypasses project_queue for the hot path).
+    pub tenant_event_ids: HashMap<String, Vec<String>>,
     pub live_hints: Vec<LiveHintEvent>,
     pub shared_event_fanouts: Vec<SharedEventFanout>,
 }
@@ -40,6 +43,7 @@ pub(super) fn run_persist_phase(
     let mut persist_output = PersistPhaseOutput {
         persisted_event_ids: Vec::with_capacity(batch.len()),
         tenants_seen: HashSet::new(),
+        tenant_event_ids: HashMap::new(),
         live_hints: Vec::new(),
         shared_event_fanouts: Vec::new(),
     };
@@ -119,26 +123,17 @@ pub(super) fn run_persist_phase(
                     };
                     let _ = timeline.mark_persisted_b64(&event_id_b64, recorded_at);
 
-                    // Enqueue for durable projection (atomicity boundary 1)
-                    let priority_lane = if events::outer_semantic_type_code(blob)
-                        == Some(events::EVENT_TYPE_FILE_SLICE)
-                    {
-                        2
-                    } else {
-                        1
-                    };
-                    if let Err(e) = enqueue_stmt.execute(rusqlite::params![
-                        recorded_by,
-                        &event_id_b64,
-                        current_timestamp_ms(),
-                        priority_lane,
-                        created_at_ms as i64
-                    ]) {
-                        tracing::warn!("project_queue enqueue error for {}: {}", event_id_b64, e);
-                    }
+                    // Projection is handled directly in post-commit effects
+                    // via project_batch, bypassing the project_queue for the
+                    // hot path. The queue is still used for startup recovery
+                    // and fanout retries.
 
                     persist_output.tenants_seen.insert(recorded_by.clone());
                     persist_output.persisted_event_ids.push(*event_id);
+                    persist_output.tenant_event_ids
+                        .entry(recorded_by.clone())
+                        .or_default()
+                        .push(event_id_b64.clone());
                     if recorded_inserted && meta.share_scope == ShareScope::Shared {
                         persist_output.live_hints.push(LiveHintEvent {
                             tenant_id: recorded_by.clone(),
@@ -243,16 +238,10 @@ mod tests {
         );
 
         assert_eq!(output.persisted_event_ids, vec![event_id]);
-        let priority_lane: i64 = db
-            .query_row(
-                "SELECT priority_lane
-                 FROM project_queue
-                 WHERE peer_id = ?1 AND event_id = ?2",
-                rusqlite::params!["peer-alpha", event_id_to_base64(&event_id)],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(priority_lane, 2);
+        // Projection is now handled directly in post-commit effects
+        // via project_batch, not through the project_queue.
+        let tenant_eids = output.tenant_event_ids.get("peer-alpha").expect("tenant should have events");
+        assert!(tenant_eids.contains(&event_id_to_base64(&event_id)));
         assert_eq!(
             output.live_hints,
             vec![LiveHintEvent {

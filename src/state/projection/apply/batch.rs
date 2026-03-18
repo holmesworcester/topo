@@ -95,19 +95,33 @@ pub fn project_batch(
     let signer_keys = gather_signer_keys(conn, tenant_id, &signer_ids)?;
     let valid_deps = gather_valid_set(conn, tenant_id, &dep_ids)?;
 
-    // ── Stage 2: Map (pure — no DB access) ───────────────────────────
+    // ── Stage 2: Map (pure — no DB access, parallelizable) ─────────
+    //
+    // Run map_event for all events. Signature verification (~65µs each)
+    // dominates this phase and is embarrassingly parallel.
+
+    let map_results: Vec<(&ParsedInput, MapResult)> = if parsed_events.len() > 50 {
+        use rayon::prelude::*;
+        parsed_events.par_iter()
+            .map(|ev| (ev, map_event(ev, tenant_id, reg, &signer_keys, &valid_deps, &peers_shared, &del_intents)))
+            .collect()
+    } else {
+        parsed_events.iter()
+            .map(|ev| (ev, map_event(ev, tenant_id, reg, &signer_keys, &valid_deps, &peers_shared, &del_intents)))
+            .collect()
+    };
 
     let mut valids: Vec<MappedValid> = Vec::new();
     let mut fallbacks: Vec<EventId> = Vec::new();
 
-    for ev in &parsed_events {
-        match map_event(ev, tenant_id, reg, &signer_keys, &valid_deps, &peers_shared, &del_intents) {
-            MapResult::Valid(result) => valids.push(MappedValid { eid_b64: ev.eid_b64, parsed: &ev.parsed, result }),
+    for (ev, map_result) in map_results {
+        match map_result {
+            MapResult::Valid(proj_result) => valids.push(MappedValid { eid_b64: ev.eid_b64, parsed: &ev.parsed, result: proj_result }),
             MapResult::Blocked(missing) => write_block_rows(conn, tenant_id, ev.eid_b64, &missing),
             MapResult::Rejected(reason) => { record_rejection(conn, tenant_id, ev.eid_b64, &reason); terminal_count += 1; }
             MapResult::Fallback => fallbacks.push(ev.eid),
-            MapResult::BlockWithCommands(result) => {
-                let _ = execute_emit_commands(conn, tenant_id, &result.emit_commands);
+            MapResult::BlockWithCommands(proj_result) => {
+                let _ = execute_emit_commands(conn, tenant_id, &proj_result.emit_commands);
                 let _ = EventTimeline::new(conn).mark_blocked_b64(ev.eid_b64, current_timestamp_ms());
             }
         }
