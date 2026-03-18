@@ -1,6 +1,8 @@
+use std::collections::HashMap;
+
 use rusqlite::{params, Connection, Result as SqliteResult};
 
-use crate::crypto::{event_id_to_base64, EventId};
+use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::event_modules::ShareScope;
 
 pub const SQL_INSERT_EVENT: &str =
@@ -182,6 +184,32 @@ impl<'a> Store<'a> {
             Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
             Err(e) => Err(e),
         }
+    }
+
+    /// Fetch blobs for multiple event IDs in a single query.  Only returns rows
+    /// whose `share_scope = 'shared'` (same guard as `get_shared`).  Missing or
+    /// non-shared IDs are simply absent from the returned map.
+    pub fn get_shared_batch(&self, ids: &[EventId]) -> SqliteResult<HashMap<EventId, Vec<u8>>> {
+        if ids.is_empty() {
+            return Ok(HashMap::new());
+        }
+        let placeholders = ids.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let sql = format!(
+            "SELECT event_id, blob FROM events WHERE event_id IN ({}) AND share_scope = 'shared'",
+            placeholders
+        );
+        let id_strs: Vec<String> = ids.iter().map(event_id_to_base64).collect();
+        let mut stmt = self.conn.prepare(&sql)?;
+        let mut map = HashMap::with_capacity(ids.len());
+        let mut rows = stmt.query(rusqlite::params_from_iter(id_strs.iter()))?;
+        while let Some(row) = rows.next()? {
+            let id_str: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            if let Some(event_id) = event_id_from_base64(&id_str) {
+                map.insert(event_id, blob);
+            }
+        }
+        Ok(map)
     }
 
     /// Check if we have a blob

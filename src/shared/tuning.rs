@@ -31,6 +31,17 @@ fn read_i32_env(name: &str) -> Option<i32> {
     std::env::var(name).ok().and_then(|v| v.parse::<i32>().ok())
 }
 
+/// Number of event IDs to batch-read from the DB in a single `get_shared_batch`
+/// call during the data-plane drain loop.  A larger value reduces per-round
+/// SQLite query overhead; keep it small in low-memory mode to limit allocation.
+pub fn blob_drain_batch_size() -> usize {
+    if low_mem_mode() {
+        8
+    } else {
+        64
+    }
+}
+
 // -- Ingest pipeline --
 pub fn drain_batch_size() -> usize {
     if low_mem_mode() {

@@ -20,7 +20,7 @@ use crate::protocol::Frame;
 use crate::runtime::memtrace;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
-use crate::tuning::{egress_send_quantum_bytes, low_mem_memtrace};
+use crate::tuning::{blob_drain_batch_size, low_mem_memtrace};
 
 use super::connection_scope::ConnectionResponseState;
 use super::logging::SyncRunRxCapture;
@@ -79,48 +79,69 @@ where
 {
     let mut events_sent_delta = 0u64;
     let mut bytes_sent_delta = 0u64;
-    let send_quantum_bytes = egress_send_quantum_bytes() as u64;
     let mut sent_any = false;
 
-    while bytes_sent_delta < send_quantum_bytes {
-        let Some(event_id) = response_state.pop_next_response() else {
-            break;
+    // Peek one batch of IDs without removing them so we can batch-read blobs.
+    // We intentionally process at most one batch per call (not a while loop)
+    // so that the caller's session loop can service control traffic between
+    // drain passes.  The session loop calls us every ~1 ms, which at 64 events
+    // per batch is more than sufficient throughput for any realistic link.
+    let batch_ids = response_state.peek_front_n(blob_drain_batch_size());
+    if batch_ids.is_empty() {
+        return DataPlaneSendStats {
+            events_sent_delta: 0,
+            bytes_sent_delta: 0,
         };
+    }
 
-        let Ok(Some(blob)) = store.get_shared(&event_id) else {
-            continue;
-        };
-        let blob_len = blob.len() as u64;
-        match tokio::time::timeout(
-            DATA_SEND_STALL_TIMEOUT,
-            data_send.send(&Frame::Event { blob }),
-        )
-        .await
-        {
-            Ok(Ok(())) => {
-                events_sent_delta += 1;
-                bytes_sent_delta += blob_len;
-                sent_any = true;
-                let _ = timeline.mark_response_sent(&event_id, current_timestamp_ms());
+    // Single DB round-trip for the whole batch.
+    let mut blobs = match store.get_shared_batch(&batch_ids) {
+        Ok(b) => b,
+        Err(e) => {
+            warn!("data plane batch blob read failed: {}", e);
+            return DataPlaneSendStats {
+                events_sent_delta: 0,
+                bytes_sent_delta: 0,
+            };
+        }
+    };
+
+    for event_id in &batch_ids {
+        if let Some(blob) = blobs.remove(event_id) {
+            let blob_len = blob.len() as u64;
+            match tokio::time::timeout(
+                DATA_SEND_STALL_TIMEOUT,
+                data_send.send(&Frame::Event { blob }),
+            )
+            .await
+            {
+                Ok(Ok(())) => {
+                    response_state.pop_next_response();
+                    events_sent_delta += 1;
+                    bytes_sent_delta += blob_len;
+                    sent_any = true;
+                    let _ = timeline.mark_response_sent(event_id, current_timestamp_ms());
+                }
+                Ok(Err(err)) => {
+                    warn!(
+                        "data send failed for requested response event={} error={}",
+                        event_id_to_base64(event_id),
+                        err
+                    );
+                    break;
+                }
+                Err(_) => {
+                    warn!(
+                        "data send stalled for requested response event={} timeout_ms={}",
+                        event_id_to_base64(event_id),
+                        DATA_SEND_STALL_TIMEOUT.as_millis()
+                    );
+                    break;
+                }
             }
-            Ok(Err(err)) => {
-                warn!(
-                    "data send failed for requested response event={} error={}",
-                    event_id_to_base64(&event_id),
-                    err
-                );
-                response_state.requeue_front(event_id);
-                break;
-            }
-            Err(_) => {
-                warn!(
-                    "data send stalled for requested response event={} timeout_ms={}",
-                    event_id_to_base64(&event_id),
-                    DATA_SEND_STALL_TIMEOUT.as_millis()
-                );
-                response_state.requeue_front(event_id);
-                break;
-            }
+        } else {
+            // Not shared or not found — discard from queue and skip.
+            response_state.pop_next_response();
         }
     }
 
