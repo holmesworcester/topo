@@ -432,7 +432,7 @@ enum Commands {
     /// Manual sync controls: policy, round, request
     #[command(
         name = "sync",
-        after_help = "Examples:\n  topo sync policy show             # show current policy\n  topo sync policy set --requests manual\n  topo sync round --peer abc123     # trigger round for one peer\n  topo sync round --all             # trigger round for all peers\n  topo sync request --peer abc123   # trigger request refill for one peer\n  topo sync request --all           # trigger request refill for all peers"
+        after_help = "Examples:\n  topo sync policy show\n  topo sync policy set --requests manual\n  topo sync round peer abc123\n  topo sync round all\n  topo sync request peer abc123\n  topo sync request all"
     )]
     Sync {
         #[command(subcommand)]
@@ -495,22 +495,25 @@ enum SyncAction {
     },
     /// Trigger a negentropy discovery round
     Round {
-        /// Target peer prefix
-        #[arg(long)]
-        peer: Option<String>,
-        /// Target all connected peers
-        #[arg(long)]
-        all: bool,
+        #[command(subcommand)]
+        target: SyncTarget,
     },
     /// Trigger a request refill
     Request {
-        /// Target peer prefix
-        #[arg(long)]
-        peer: Option<String>,
-        /// Target all connected peers
-        #[arg(long)]
-        all: bool,
+        #[command(subcommand)]
+        target: SyncTarget,
     },
+}
+
+#[derive(Subcommand)]
+enum SyncTarget {
+    /// Target a specific peer by hex fingerprint prefix
+    Peer {
+        /// Peer SPKI fingerprint prefix (hex)
+        peer: String,
+    },
+    /// Target all connected peers
+    All,
 }
 
 #[derive(Subcommand)]
@@ -3284,7 +3287,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     action: SyncPolicyAction::Show,
                 } => {
                     let data = rpc_require_daemon(db, sock_ref, RpcMethod::SyncPolicyShow)?;
-                    println!("{}", serde_json::to_string_pretty(&data).unwrap());
+                    println!("SYNC POLICY:");
+                    println!("  requests:        {}", data["requests"].as_str().unwrap_or("auto"));
+                    println!("  responses:       {}", data["responses"].as_str().unwrap_or("auto"));
+                    println!("  forward_on_have: {}", data["forward_on_have"].as_str().unwrap_or("auto"));
                 }
                 SyncAction::Policy {
                     action:
@@ -3303,17 +3309,21 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             forward_on_have,
                         },
                     )?;
-                    println!("{}", serde_json::to_string_pretty(&data).unwrap());
+                    println!("SYNC POLICY (updated):");
+                    println!("  requests:        {}", data["requests"].as_str().unwrap_or("auto"));
+                    println!("  responses:       {}", data["responses"].as_str().unwrap_or("auto"));
+                    println!("  forward_on_have: {}", data["forward_on_have"].as_str().unwrap_or("auto"));
                 }
-                SyncAction::Round { peer, all } => {
-                    if let Some(peer) = peer {
+                SyncAction::Round { target } => match target {
+                    SyncTarget::Peer { peer } => {
                         let data = rpc_require_daemon(
                             db,
                             sock_ref,
                             RpcMethod::SyncRoundPeer { peer },
                         )?;
                         print_round_capture(&data);
-                    } else if all {
+                    }
+                    SyncTarget::All => {
                         let data =
                             rpc_require_daemon(db, sock_ref, RpcMethod::SyncRoundAll)?;
                         if let Some(arr) = data.as_array() {
@@ -3323,19 +3333,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         } else {
                             print_round_capture(&data);
                         }
-                    } else {
-                        return Err("specify --peer <prefix> or --all".into());
                     }
-                }
-                SyncAction::Request { peer, all } => {
-                    if let Some(peer) = peer {
+                },
+                SyncAction::Request { target } => match target {
+                    SyncTarget::Peer { peer } => {
                         let data = rpc_require_daemon(
                             db,
                             sock_ref,
                             RpcMethod::SyncRequestPeer { peer },
                         )?;
                         print_request_result(&data);
-                    } else if all {
+                    }
+                    SyncTarget::All => {
                         let data =
                             rpc_require_daemon(db, sock_ref, RpcMethod::SyncRequestAll)?;
                         if let Some(arr) = data.as_array() {
@@ -3345,10 +3354,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         } else {
                             print_request_result(&data);
                         }
-                    } else {
-                        return Err("specify --peer <prefix> or --all".into());
                     }
-                }
+                },
             }
         }
 
@@ -4763,32 +4770,49 @@ fn show_view(data: &serde_json::Value) {
 }
 
 fn print_round_capture(data: &serde_json::Value) {
-    if let Some(peer_id) = data.get("peer_id").and_then(|v| v.as_str()) {
-        println!("peer: {}", peer_id);
-    }
-    if let Some(ids) = data.get("observed_ids").and_then(|v| v.as_array()) {
-        println!("observed_ids: {}", ids.len());
-        for id in ids {
-            if let Some(s) = id.as_str() {
-                println!("  {}", s);
+    let peer = data["peer_id"].as_str().unwrap_or("?");
+    let short_peer = &peer[..16.min(peer.len())];
+
+    if let Some(ids) = data["observed_ids"].as_array() {
+        if ids.is_empty() {
+            println!("SYNC ROUND peer={}", short_peer);
+            println!("  Newly observed: nothing new learned");
+        } else {
+            println!("SYNC ROUND peer={}", short_peer);
+            println!("  Newly observed: {} event(s)", ids.len());
+            for id in ids {
+                if let Some(s) = id.as_str() {
+                    println!("    {}", &s[..16.min(s.len())]);
+                }
             }
         }
+    } else {
+        println!("SYNC ROUND peer={}", short_peer);
+        println!("  Newly observed: nothing new learned");
     }
 }
 
 fn print_request_result(data: &serde_json::Value) {
-    if let Some(peer_id) = data.get("peer_id").and_then(|v| v.as_str()) {
-        println!("peer: {}", peer_id);
+    let peer = data["peer_id"].as_str().unwrap_or("?");
+    let short_peer = &peer[..16.min(peer.len())];
+
+    if let Some(reason) = data["reason"].as_str() {
+        println!("SYNC REQUEST peer={}: {}", short_peer, reason);
+        return;
     }
-    if let Some(reason) = data.get("reason").and_then(|v| v.as_str()) {
-        println!("reason: {}", reason);
-    }
-    if let Some(ids) = data.get("requested_ids").and_then(|v| v.as_array()) {
-        println!("requested_ids: {}", ids.len());
+
+    let ids = data["requested_ids"].as_array();
+    let count = ids.map(|a| a.len()).unwrap_or(0);
+
+    println!("SYNC REQUEST peer={}: {} event(s) requested", short_peer, count);
+    if let Some(ids) = ids {
         for id in ids {
             if let Some(s) = id.as_str() {
                 println!("  {}", s);
             }
         }
+    }
+    if count == 0 {
+        println!("  (no events eligible for request)");
     }
 }

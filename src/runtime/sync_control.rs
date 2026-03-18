@@ -287,15 +287,24 @@ impl SyncControlRegistry {
         tenant_id: &str,
     ) -> Result<Vec<ManualSyncRequestResult>, String> {
         let policy = self.load_policy(tenant_id).unwrap_or_default();
-        if policy.requests == SyncPolicyMode::Disabled {
-            return Ok(vec![ManualSyncRequestResult {
-                peer_id: "all".to_string(),
-                requested_ids: vec![],
-                reason: Some("requests lane is disabled by policy".to_string()),
-            }]);
-        }
-
         let sessions = self.find_sessions(tenant_id, None, false);
+        if policy.requests == SyncPolicyMode::Disabled {
+            if sessions.is_empty() {
+                return Ok(vec![ManualSyncRequestResult {
+                    peer_id: "(no peers)".to_string(),
+                    requested_ids: vec![],
+                    reason: Some("requests are disabled for this tenant".to_string()),
+                }]);
+            }
+            return Ok(sessions
+                .iter()
+                .map(|s| ManualSyncRequestResult {
+                    peer_id: s.peer_id.clone(),
+                    requested_ids: vec![],
+                    reason: Some("requests are disabled for this tenant".to_string()),
+                })
+                .collect());
+        }
         if sessions.is_empty() {
             return Err("no live sessions".to_string());
         }
