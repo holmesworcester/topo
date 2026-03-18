@@ -49,7 +49,6 @@ pub fn save_policy(
     tenant_id: &str,
     policy: TenantSyncPolicy,
 ) -> SqliteResult<TenantSyncPolicy> {
-    ensure_schema(conn)?;
     conn.execute(
         "INSERT INTO sync_control_policies
          (tenant_id, requests_mode, responses_mode, forward_on_have_mode, updated_at_ms)

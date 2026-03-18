@@ -3,7 +3,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, Weak};
 
 use serde::Serialize;
-use tokio::sync::{mpsc, watch};
+use tokio::sync::watch;
 
 use crate::db::open_connection;
 use crate::db::{schema::create_tables, sync_control as sync_control_db};
@@ -49,15 +49,6 @@ pub struct ManualSyncRequestResult {
     pub role: String,
     pub requested_ids: Vec<String>,
     pub reason: Option<String>,
-}
-
-pub enum SessionCommand {
-    ForceRound {
-        reply: tokio::sync::oneshot::Sender<Result<ManualSyncRoundCapture, String>>,
-    },
-    ManualRequest {
-        reply: tokio::sync::oneshot::Sender<Result<ManualSyncRequestResult, String>>,
-    },
 }
 
 #[derive(Clone, Default)]
@@ -119,8 +110,6 @@ struct RegisteredSessionEntry {
     role: String,
     peer_id: String,
     tenant_id: String,
-    #[allow(dead_code)]
-    command_tx: mpsc::UnboundedSender<SessionCommand>,
 }
 
 #[derive(Default)]
@@ -235,7 +224,6 @@ impl SyncControlRegistry {
     ) -> Result<RegisteredSession, String> {
         let policy = self.load_policy(&tenant_id)?;
         let registration_id = self.next_registration_id.fetch_add(1, Ordering::Relaxed);
-        let (command_tx, command_rx) = mpsc::unbounded_channel();
         let policy_rx = {
             let mut state = self.state.lock().expect("sync control registry poisoned");
             let tx = state
@@ -253,15 +241,12 @@ impl SyncControlRegistry {
                     role: role.clone(),
                     peer_id: peer_id.clone(),
                     tenant_id: tenant_id.clone(),
-                    command_tx,
                 },
             );
             tx.subscribe()
         };
         Ok(RegisteredSession {
-            command_rx,
             policy_rx,
-            capture_hub: ActionCaptureHub::default(),
             _guard: SessionRegistrationGuard {
                 registry: Arc::downgrade(self),
                 registration_id,
@@ -497,9 +482,7 @@ fn query_wanted_event_ids(conn: &rusqlite::Connection, _tenant_id: &str, peer_id
 }
 
 pub struct RegisteredSession {
-    pub command_rx: mpsc::UnboundedReceiver<SessionCommand>,
     pub policy_rx: watch::Receiver<TenantSyncPolicy>,
-    pub capture_hub: ActionCaptureHub,
     _guard: SessionRegistrationGuard,
 }
 
