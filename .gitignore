@@ -3,3 +3,4 @@
 *.db*
 *.jar
 docs/tla/states/
+*.pyc
