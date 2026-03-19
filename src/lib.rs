@@ -29,4 +29,26 @@ mod boundary_tests {
             panic!("Boundary import check failed:\n{}\n{}", stdout, stderr);
         }
     }
+
+    fn assert_python_script_passes(script: &str) {
+        let result = std::process::Command::new("python3")
+            .arg(script)
+            .output()
+            .unwrap_or_else(|err| panic!("failed to run {} via python3: {}", script, err));
+        if !result.status.success() {
+            let stderr = String::from_utf8_lossy(&result.stderr);
+            let stdout = String::from_utf8_lossy(&result.stdout);
+            panic!("{} failed:\n{}\n{}", script, stdout, stderr);
+        }
+    }
+
+    #[test]
+    fn test_projector_tla_conformance_enforced() {
+        assert_python_script_passes("scripts/check_projector_tla_conformance.py");
+    }
+
+    #[test]
+    fn test_projector_tla_bijection_enforced() {
+        assert_python_script_passes("scripts/check_projector_tla_bijection.py");
+    }
 }

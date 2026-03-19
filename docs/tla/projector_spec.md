@@ -99,15 +99,15 @@ Changes to this document require TLA+ model re-verification.
 | 7 | project_message_deletion | deleted_messages | author auth + cascade |
 | 8 | project_workspace | workspaces | TrustAnchorMatch guard |
 | 9 | project_invite_accepted | invites_accepted | writes accepted-binding row; emits RetryWorkspaceEvent + WriteAcceptedBootstrapTrust |
-| 10 | project_user_invite | user_invites | enforces authority/signer invariants; emits WritePendingBootstrapTrust (gated by is_local_create) |
+| 10 | project_user_invite | user_invites | bootstrap requires workspace signer+authority; peer-signed requires signer peer to resolve to claimed admin identity; emits WritePendingBootstrapTrust (gated by is_local_create) |
 | 11 | retired (code reserved) | — | rejected as unknown type |
-| 12 | project_device_invite | device_invites | enforces authority/signer invariants; emits WritePendingBootstrapTrust (gated by is_local_create) |
+| 12 | project_device_invite | device_invites | bootstrap requires authority user == signer user; peer-signed requires signer peer to resolve to claimed admin identity; emits WritePendingBootstrapTrust (gated by is_local_create) |
 | 13 | retired (code reserved) | — | rejected as unknown type |
 | 14 | project_user | users | — |
 | 15 | retired (code reserved) | — | rejected as unknown type |
-| 16 | project_peer_shared | peers_shared | emits SupersedeBootstrapTrust |
+| 16 | project_peer_shared | peers_shared | rejects when claimed `user_event_id` does not match the user authorized by the signing DeviceInvite chain; emits SupersedeBootstrapTrust |
 | 17 | retired (code reserved) | — | rejected as unknown type |
-| 18 | project_admin | admins | — |
+| 18 | project_admin | admins | rejects when `admin.public_key` does not match `users.public_key` for `user_event_id` |
 | 19 | retired (code reserved) | — | rejected as unknown type |
 | 20 | retired (unused) | — | rejected as unknown type |
 | 21 | retired (unused) | — | rejected as unknown type |
@@ -299,7 +299,7 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 | InvAllValidRequireWorkspace | test_bootstrap_sequence: non-local events require workspace valid |
 | InvMessageWorkspace | Message projection requires workspace (workspace_event_id dep) |
 | InvEncryptedKey | Encrypted content requires valid secret dependency |
-| InvSecretSharedKey | SecretShared key_event_id must match deterministic unwrapped key_secret event id |
+| InvSecretSharedKey | KeyShared key_event_id must match deterministic unwrapped key_secret event id |
 | InvFileSliceAuth | FileSlice and MessageAttachment for the same file must share the same signer |
 
 ### Bootstrap key materialization
@@ -321,13 +321,27 @@ abstracting over the event graph.
 | TLA+ Invariant | Rust Check |
 |----------------|------------|
 | InvSPKIUniqueness | BLAKE2b-256 collision resistance: no two peers share an SPKI |
-| InvBootstrapConsumedByPeerShared | supersede_bootstrap_for_peer_shared (projection-time): bootstrap ∩ PeerShared_SPKIs = {} |
-| InvPendingConsumedByPeerShared | supersede_bootstrap_for_peer_shared (projection-time): pending ∩ PeerShared_SPKIs = {} |
+| InvBootstrapConsumedByPeerShared | consume_bootstrap_for_peer_shared (projection-time): bootstrap ∩ PeerShared_SPKIs = {} |
+| InvPendingConsumedByPeerShared | consume_bootstrap_for_peer_shared (projection-time): pending ∩ PeerShared_SPKIs = {} |
 | InvTrustSetIsExactUnion | authorized_fingerprints_from_db: UNION of PeerShared_SPKIs, invite_bootstrap_trust, pending_invite_bootstrap_trust |
 | InvTrustSourcesWellFormed | All trust table rows contain valid 32-byte SPKI fingerprints |
 | InvMutualAuthSymmetry | Mutual CanAuthenticate requires both peers have active credentials |
 | InvPendingTrustOnlyOnInviter | is_local_create gate: pending bootstrap trust exists only on invite creator's trust store |
 | InvCredentialSourceConsistency | local credential presence/source consistency during bootstrap→PeerShared transition |
+
+## Exact transport targeting model (ExactTransportTargeting.tla)
+
+Standalone module modeling exact transport-target admission and connect-time
+identity binding. This sits below the event projector boundary but is part of
+the same modeled auth story: inbound admission must stay scoped to the
+requested tenant, and outbound connection establishment must bind the remote
+certificate to the exact transport-target SNI.
+
+| TLA+ Invariant | Rust Check |
+|----------------|------------|
+| InvInboundAdmittedAuthorized | inbound accept admits only when the requested tenant authorizes the remote fingerprint |
+| InvNoCrossTenantFallback | inbound accept does not fall back to a different authorizing tenant than the exact requested target |
+| InvOutboundConnectedAuthorized | outbound client verifier requires exact transport-target SNI and matching remote fingerprint |
 
 ## Unified bridge model (UnifiedBridge.tla)
 

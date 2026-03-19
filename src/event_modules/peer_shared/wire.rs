@@ -77,6 +77,11 @@ pub fn parse_peer_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let mut signed_by = [0u8; 32];
     signed_by.copy_from_slice(&blob[off::SIGNED_BY..off::SIGNER_TYPE]);
     let signer_type = blob[off::SIGNER_TYPE];
+    if signer_type != 3 {
+        return Err(EventError::InvalidMetadata(
+            "peer_shared signer_type must be 3 (peer_invite_shared)",
+        ));
+    }
     let mut signature = [0u8; 64];
     signature.copy_from_slice(&blob[off::SIGNATURE..off::SIGNATURE + 64]);
 
@@ -125,15 +130,43 @@ pub static PEER_SHARED_META: EventTypeMeta = EventTypeMeta {
     parse: parse_peer_shared,
     encode: encode_peer_shared,
     projector: super::projector::project_pure,
-    context_loader: crate::event_modules::registry::load_empty_context,
+    context_loader: super::projection_context::build_projector_context,
 };
 
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+    use crate::event_modules::{encode_event, parse_event};
 
     #[test]
     fn offsets_consistent() {
         assert_eq!(peer_shared_offsets::SIGNATURE + 64, PEER_SHARED_WIRE_SIZE);
+    }
+
+    #[test]
+    fn parse_peer_shared_accepts_peer_invite_signer_type() {
+        let event = ParsedEvent::PeerShared(PeerSharedEvent {
+            created_at_ms: 123,
+            public_key: [1u8; 32],
+            user_event_id: [2u8; 32],
+            device_name: "device".to_string(),
+            signed_by: [3u8; 32],
+            signer_type: 3,
+            signature: [0u8; 64],
+        });
+
+        let blob = encode_event(&event).unwrap();
+        let parsed = parse_event(&blob).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn parse_peer_shared_rejects_wrong_signer_type() {
+        let mut blob = vec![0u8; PEER_SHARED_WIRE_SIZE];
+        blob[0] = EVENT_TYPE_PEER_SHARED;
+        blob[off::SIGNER_TYPE] = 5;
+
+        let err = parse_peer_shared(&blob).expect_err("should reject wrong signer type");
+        assert!(matches!(err, EventError::InvalidMetadata(_)));
     }
 }

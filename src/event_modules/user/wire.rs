@@ -72,6 +72,11 @@ pub fn parse_user(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let mut signed_by = [0u8; 32];
     signed_by.copy_from_slice(&blob[off::SIGNED_BY..off::SIGNER_TYPE]);
     let signer_type = blob[off::SIGNER_TYPE];
+    if signer_type != 2 {
+        return Err(EventError::InvalidMetadata(
+            "user signer_type must be 2 (user_invite_shared)",
+        ));
+    }
     let mut signature = [0u8; 64];
     signature.copy_from_slice(&blob[off::SIGNATURE..off::SIGNATURE + 64]);
 
@@ -124,9 +129,36 @@ pub static USER_META: EventTypeMeta = EventTypeMeta {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+    use crate::event_modules::{encode_event, parse_event};
 
     #[test]
     fn offsets_consistent() {
         assert_eq!(user_offsets::SIGNATURE + 64, USER_WIRE_SIZE);
+    }
+
+    #[test]
+    fn parse_user_accepts_user_invite_signer_type() {
+        let event = ParsedEvent::User(UserEvent {
+            created_at_ms: 123,
+            public_key: [1u8; 32],
+            username: "alice".to_string(),
+            signed_by: [2u8; 32],
+            signer_type: 2,
+            signature: [0u8; 64],
+        });
+
+        let blob = encode_event(&event).unwrap();
+        let parsed = parse_event(&blob).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn parse_user_rejects_wrong_signer_type() {
+        let mut blob = vec![0u8; USER_WIRE_SIZE];
+        blob[0] = EVENT_TYPE_USER;
+        blob[off::SIGNER_TYPE] = 1;
+
+        let err = parse_user(&blob).expect_err("should reject wrong signer type");
+        assert!(matches!(err, EventError::InvalidMetadata(_)));
     }
 }

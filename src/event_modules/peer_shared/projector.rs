@@ -21,12 +21,15 @@ pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    _ctx: &ContextSnapshot,
+    ctx: &ContextSnapshot,
 ) -> ProjectorResult {
     let (public_key, user_event_id, device_name) = match parsed {
         ParsedEvent::PeerShared(p) => (&p.public_key, &p.user_event_id, &p.device_name),
         _ => return ProjectorResult::reject("not a peer_shared event".to_string()),
     };
+    if let Some(reason) = &ctx.peer_shared_user_mismatch_reason {
+        return ProjectorResult::reject(reason.clone());
+    }
 
     let user_event_id_b64 = event_id_to_base64(user_event_id);
     let transport_fingerprint = crate::crypto::spki_fingerprint_from_ed25519_pubkey(public_key);
@@ -51,4 +54,75 @@ pub fn project_pure(
     }];
 
     ProjectorResult::valid(ops)
+}
+
+#[cfg(test)]
+mod projector_tests {
+    use super::*;
+    use crate::event_modules::{ParsedEvent, PeerSharedEvent, WorkspaceEvent};
+
+    fn peer_shared_event() -> ParsedEvent {
+        ParsedEvent::PeerShared(PeerSharedEvent {
+            created_at_ms: 1,
+            public_key: [5u8; 32],
+            user_event_id: [6u8; 32],
+            device_name: "phone".to_string(),
+            signed_by: [7u8; 32],
+            signer_type: 3,
+            signature: [0u8; 64],
+        })
+    }
+
+    #[test]
+    fn test_peer_shared_valid() {
+        let result = project_pure(
+            "peer1",
+            "peer-shared-event",
+            &peer_shared_event(),
+            &ContextSnapshot::default(),
+        );
+        assert!(matches!(
+            result.decision,
+            crate::projection::decision::ProjectionDecision::Valid
+        ));
+        assert_eq!(result.write_ops.len(), 1);
+    }
+
+    #[test]
+    fn test_peer_shared_rejects_authorized_user_mismatch() {
+        let result = project_pure(
+            "peer1",
+            "peer-shared-event",
+            &peer_shared_event(),
+            &ContextSnapshot {
+                peer_shared_user_mismatch_reason: Some(
+                    "peer_shared signer authorizes user a but event claims b".to_string(),
+                ),
+                ..ContextSnapshot::default()
+            },
+        );
+        assert!(matches!(
+            result.decision,
+            crate::projection::decision::ProjectionDecision::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn test_peer_shared_rejects_non_peer_shared_event() {
+        let other = ParsedEvent::Workspace(WorkspaceEvent {
+            created_at_ms: 1,
+            public_key: [0u8; 32],
+            name: "ws".to_string(),
+        });
+        let result = project_pure(
+            "peer1",
+            "workspace-event",
+            &other,
+            &ContextSnapshot::default(),
+        );
+        assert!(matches!(
+            result.decision,
+            crate::projection::decision::ProjectionDecision::Reject { .. }
+        ));
+    }
 }

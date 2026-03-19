@@ -28,14 +28,15 @@ both `pass` and `break` polarity unless waived.
 | SPEC_WS_SINGLE_01 | InvSingleWorkspace | CHK_WS_INSERT | projector_unit | workspace_projector_tests::tests::test_workspace_insert_or_ignore | pass |
 | SPEC_WS_SINGLE_01 | InvSingleWorkspace | CHK_WS_INSERT | projector_unit | workspace_projector_tests::tests::test_workspace_rejects_anchor_mismatch | break |
 | SPEC_ANCHOR_IMMUTABLE_01 | InvTrustAnchorImmutable | CHK_IA_TRUST_ANCHOR_WRITE | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_writes_workspace_binding | pass |
-| SPEC_ANCHOR_IMMUTABLE_01 | InvTrustAnchorImmutable | CHK_IA_WINNER_ORDER | scenario_integration | identity::test_trust_anchor_immutability | pass |
+| SPEC_ANCHOR_IMMUTABLE_01 | InvTrustAnchorImmutable | CHK_IA_TRUST_ANCHOR_CONFLICT | scenario_integration | identity::test_trust_anchor_immutability | break |
+| SPEC_ANCHOR_IMMUTABLE_01 | InvTrustAnchorImmutable | CHK_IA_WINNER_ORDER | scenario_integration | identity::test_trust_anchor_immutability | break |
 | SPEC_ANCHOR_SOURCE_01 | InvTrustAnchorSource | CHK_IA_TRUST_ANCHOR_WRITE | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_writes_workspace_binding | pass |
 | SPEC_ANCHOR_SOURCE_01 | InvTrustAnchorSource | CHK_WS_TRUST_ANCHOR_BLOCK | projector_unit | workspace_projector_tests::tests::test_workspace_blocks_without_trust_anchor | break |
 | SPEC_BOOTSTRAP_TRUST_01 | InvBootstrapTrustSource | CHK_IA_BOOTSTRAP_TRUST | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_writes_bootstrap_trust | pass |
 | SPEC_BOOTSTRAP_TRUST_01 | InvBootstrapTrustSource | CHK_IA_BOOTSTRAP_TRUST | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_no_bootstrap_without_context | break |
 | SPEC_ANCHOR_SOURCE_02 | InvTrustAnchorSource | CHK_IA_INVITE_RECORDED | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_writes_workspace_binding | pass |
-| SPEC_BOOTSTRAP_CONSUMED_01 | InvBootstrapTrustConsumedByPeerShared | CHK_PS_SUPERSEDE | projector_unit | peer_shared_projector_tests::tests::test_peer_shared_consumes_bootstrap_trust | pass |
-| SPEC_BOOTSTRAP_CONSUMED_01 | InvBootstrapTrustConsumedByPeerShared | CHK_PS_SUPERSEDE | projector_unit | peer_shared_projector_tests::tests::test_peer_shared_rejects_non_peer_shared_event | break |
+| SPEC_BOOTSTRAP_CONSUMED_01 | InvBootstrapTrustConsumedByPeerShared | CHK_PS_BOOTSTRAP_TRUST_CONSUME | transport_credential | state::db::transport_trust::tests::test_invite_bootstrap_superseded_when_peer_shared_exists | pass |
+| SPEC_BOOTSTRAP_CONSUMED_01 | InvBootstrapTrustConsumedByPeerShared | CHK_PS_BOOTSTRAP_TRUST_CONSUME | transport_credential | state::db::transport_trust::tests::test_invite_bootstrap_trust_in_authorized_fingerprints | break |
 | SPEC_PENDING_TRUST_01 | InvPendingBootstrapTrustSource | CHK_UI_PENDING_BOOTSTRAP_SRC | projector_unit | user_invite_projector_tests::tests::test_user_invite_writes_pending_trust | pass |
 | SPEC_PENDING_TRUST_01 | InvPendingBootstrapTrustSource | CHK_UI_PENDING_BOOTSTRAP_SRC | projector_unit | user_invite_projector_tests::tests::test_user_invite_no_pending_when_not_local | break |
 | SPEC_PENDING_TRUST_02 | InvPendingBootstrapTrustSource | CHK_DI_PENDING_BOOTSTRAP_SRC | projector_unit | device_invite_projector_tests::tests::test_device_invite_writes_pending_trust | pass |
@@ -48,14 +49,48 @@ both `pass` and `break` polarity unless waived.
 | SPEC_PEER_SHARED_TRUST_01 | InvPeerSharedTrustSource | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::test_project_reaction_blocked | break |
 | SPEC_PEER_SHARED_TRUST_02 | InvPeerSharedTrustMatchesCarried | CHK_PS_MATCH_CARRIED | projector_unit | peer_shared_projector_tests::tests::test_peer_shared_writes_correct_fields | pass |
 | SPEC_PEER_SHARED_TRUST_02 | InvPeerSharedTrustMatchesCarried | CHK_PS_MATCH_CARRIED | projector_unit | peer_shared_projector_tests::tests::test_peer_shared_rejects_non_peer_shared_event | break |
-| SPEC_PENDING_CONSUMED_01 | InvPendingBootstrapTrustConsumedByPeerShared | CHK_PS_SUPERSEDE | projector_unit | peer_shared_projector_tests::tests::test_peer_shared_consumes_bootstrap_trust | pass |
-| SPEC_PENDING_CONSUMED_01 | InvPendingBootstrapTrustConsumedByPeerShared | CHK_PS_SUPERSEDE | projector_unit | peer_shared_projector_tests::tests::test_peer_shared_rejects_non_peer_shared_event | break |
+| SPEC_PENDING_CONSUMED_01 | InvPendingBootstrapTrustConsumedByPeerShared | CHK_PS_PENDING_BOOTSTRAP_CONSUME | transport_credential | state::db::transport_trust::tests::test_pending_invite_bootstrap_superseded_when_peer_shared_exists | pass |
+| SPEC_PENDING_CONSUMED_01 | InvPendingBootstrapTrustConsumedByPeerShared | CHK_PS_PENDING_BOOTSTRAP_CONSUME | transport_credential | state::db::transport_trust::tests::test_pending_invite_bootstrap_trust_in_authorized_fingerprints | break |
+| SPEC_UI_SIGNER_01 | InvUserInviteChain | CHK_UI_SIGNER_FAMILY | wire_validation | parse_user_invite_accepts_workspace_signer_type | pass |
+| SPEC_UI_SIGNER_01 | InvUserInviteChain | CHK_UI_SIGNER_FAMILY | wire_validation | parse_user_invite_accepts_peer_shared_signer_type | pass |
+| SPEC_UI_SIGNER_01 | InvUserInviteChain | CHK_UI_SIGNER_FAMILY | wire_validation | parse_user_invite_rejects_wrong_signer_type | break |
+| SPEC_UI_AUTH_01 | InvUserInviteChain | CHK_UI_AUTHORITY | projector_unit | event_modules::user_invite_shared::projector::user_invite_projector_tests::test_user_invite_basic_valid | pass |
+| SPEC_UI_AUTH_01 | InvUserInviteChain | CHK_UI_AUTHORITY | projector_unit | event_modules::user_invite_shared::projector::user_invite_projector_tests::test_user_invite_rejects_bootstrap_signer_mismatch | break |
+| SPEC_UI_AUTH_01 | InvUserInviteChain | CHK_UI_AUTHORITY | projector_unit | event_modules::user_invite_shared::projector::user_invite_projector_tests::test_user_invite_rejects_bootstrap_authority_mismatch | break |
+| SPEC_UI_AUTH_01 | InvUserInviteChain | CHK_UI_AUTHORITY | projector_unit | event_modules::user_invite_shared::projector::user_invite_projector_tests::test_user_invite_rejects_peer_signed_authority_mismatch | break |
+| SPEC_UI_AUTH_01 | InvUserInviteChain | CHK_UI_AUTHORITY | pipeline_integration | apply::tests::test_user_invite_projects_with_peer_signed_admin_authority | pass |
+| SPEC_UI_AUTH_01 | InvUserInviteChain | CHK_UI_AUTHORITY | pipeline_integration | apply::tests::test_user_invite_rejects_bootstrap_authority_mismatch_at_projection | break |
+| SPEC_UI_AUTH_01 | InvUserInviteChain | CHK_UI_AUTHORITY | pipeline_integration | apply::tests::test_user_invite_rejects_peer_signed_authority_mismatch_at_projection | break |
 | SPEC_INVITE_CHAIN_01 | InvUserInviteChain | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
 | SPEC_INVITE_CHAIN_01 | InvUserInviteChain | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::test_project_reaction_blocked | break |
+| SPEC_INVITE_CHAIN_01 | InvUserInviteChain | CHK_USR_SIGNER_FAMILY | wire_validation | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
+| SPEC_INVITE_CHAIN_01 | InvUserInviteChain | CHK_USR_SIGNER_FAMILY | wire_validation | test_user_rejects_wrong_signer_family_at_projection | break |
+| SPEC_DI_SIGNER_01 | InvDeviceInviteChain | CHK_DI_SIGNER_FAMILY | wire_validation | parse_device_invite_accepts_user_signer_type | pass |
+| SPEC_DI_SIGNER_01 | InvDeviceInviteChain | CHK_DI_SIGNER_FAMILY | wire_validation | parse_device_invite_accepts_peer_shared_signer_type | pass |
+| SPEC_DI_SIGNER_01 | InvDeviceInviteChain | CHK_DI_SIGNER_FAMILY | wire_validation | parse_device_invite_rejects_wrong_signer_type | break |
+| SPEC_DI_AUTH_01 | InvDeviceInviteChain | CHK_DI_AUTHORITY | projector_unit | event_modules::peer_invite_shared::projector::device_invite_projector_tests::test_device_invite_writes_pending_trust | pass |
+| SPEC_DI_AUTH_01 | InvDeviceInviteChain | CHK_DI_AUTHORITY | projector_unit | event_modules::peer_invite_shared::projector::device_invite_projector_tests::test_device_invite_rejects_bootstrap_authority_mismatch | break |
+| SPEC_DI_AUTH_01 | InvDeviceInviteChain | CHK_DI_AUTHORITY | projector_unit | event_modules::peer_invite_shared::projector::device_invite_projector_tests::test_device_invite_rejects_peer_signed_authority_mismatch | break |
+| SPEC_DI_AUTH_01 | InvDeviceInviteChain | CHK_DI_AUTHORITY | pipeline_integration | apply::tests::test_device_invite_projects_with_peer_signed_admin_authority | pass |
+| SPEC_DI_AUTH_01 | InvDeviceInviteChain | CHK_DI_AUTHORITY | pipeline_integration | apply::tests::test_device_invite_rejects_bootstrap_authority_mismatch_at_projection | break |
+| SPEC_DI_AUTH_01 | InvDeviceInviteChain | CHK_DI_AUTHORITY | pipeline_integration | apply::tests::test_device_invite_rejects_peer_signed_authority_mismatch_at_projection | break |
 | SPEC_DEVICE_CHAIN_01 | InvDeviceInviteChain | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
 | SPEC_DEVICE_CHAIN_01 | InvDeviceInviteChain | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::test_project_reaction_blocked | break |
+| SPEC_DEVICE_CHAIN_01 | InvDeviceInviteChain | CHK_PS_SIGNER_FAMILY | wire_validation | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
+| SPEC_DEVICE_CHAIN_01 | InvDeviceInviteChain | CHK_PS_SIGNER_FAMILY | wire_validation | test_peer_shared_rejects_wrong_signer_family_at_projection | break |
+| SPEC_DEVICE_CHAIN_01 | InvDeviceInviteChain | CHK_PS_AUTHORIZED_USER | projector_unit | event_modules::peer_shared::projector::projector_tests::test_peer_shared_valid | pass |
+| SPEC_DEVICE_CHAIN_01 | InvDeviceInviteChain | CHK_PS_AUTHORIZED_USER | projector_unit | event_modules::peer_shared::projector::projector_tests::test_peer_shared_rejects_authorized_user_mismatch | break |
+| SPEC_DEVICE_CHAIN_01 | InvDeviceInviteChain | CHK_PS_AUTHORIZED_USER | pipeline_integration | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
+| SPEC_DEVICE_CHAIN_01 | InvDeviceInviteChain | CHK_PS_AUTHORIZED_USER | pipeline_integration | apply::tests::test_peer_shared_rejects_bootstrap_user_mismatch | break |
+| SPEC_DEVICE_CHAIN_01 | InvDeviceInviteChain | CHK_PS_AUTHORIZED_USER | pipeline_integration | apply::tests::test_peer_shared_rejects_peer_signed_device_link_user_mismatch | break |
 | SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
 | SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::test_project_reaction_blocked | break |
+| SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_SIGNER_FAMILY | wire_validation | test_admin_projects_with_workspace_signer_family | pass |
+| SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_SIGNER_FAMILY | wire_validation | test_admin_rejects_wrong_signer_family_at_projection | break |
+| SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_MATCH_USER_KEY | projector_unit | event_modules::admin::projector::projector_tests::test_admin_valid_with_matching_user_binding | pass |
+| SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_MATCH_USER_KEY | projector_unit | event_modules::admin::projector::projector_tests::test_admin_rejects_user_key_mismatch | break |
+| SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_MATCH_USER_KEY | pipeline_integration | apply::tests::test_admin_projects_with_workspace_signer_family | pass |
+| SPEC_ADMIN_CHAIN_01 | InvAdminChain | CHK_ADM_MATCH_USER_KEY | pipeline_integration | apply::tests::test_admin_rejects_public_key_that_does_not_match_user | break |
 | SPEC_MSG_WORKSPACE_01 | InvMessageWorkspace | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::test_project_message_valid | pass |
 | SPEC_MSG_WORKSPACE_01 | InvMessageWorkspace | CHK_DEP_PRESENCE | pipeline_integration | apply::tests::test_project_reaction_blocked | break |
 | SPEC_MSG_SIGNER_01 | InvSigner (message) | CHK_MSG_SIGNER_USER_MISMATCH | projector_unit | message_projector_tests::tests::test_message_rejects_signer_user_mismatch | break |
@@ -70,7 +105,8 @@ both `pass` and `break` polarity unless waived.
 | SPEC_ENCRYPTED_NESTED_01 | (structural) | CHK_ENCRYPTED_NESTED | pipeline_integration | apply::tests::test_encrypted_message_valid | pass |
 | SPEC_ENCRYPTED_ADMISSIBLE_01 | (admissibility) | CHK_ENCRYPTED_ADMISSIBLE | pipeline_integration | apply::tests::test_encrypted_identity_event_rejects | break |
 | SPEC_ENCRYPTED_ADMISSIBLE_01 | (admissibility) | CHK_ENCRYPTED_ADMISSIBLE | pipeline_integration | apply::tests::test_encrypted_message_valid | pass |
-| SPEC_SECRET_SHARED_KEY_01 | InvSecretSharedKey | CHK_SS_INSERT | projector_unit | secret_shared_projector_tests::tests::test_secret_shared_valid | pass |
+| SPEC_SECRET_SHARED_KEY_01 | InvSecretSharedKey | CHK_SS_INSERT | projector_unit | key_shared_projector_tests::tests::test_key_shared_valid | pass |
+| SPEC_SECRET_SHARED_KEY_01 | InvSecretSharedKey | CHK_SS_INSERT | projector_unit | key_shared_projector_tests::tests::test_key_shared_rejects_key_event_id_mismatch | break |
 | SPEC_FILE_AUTH_01 | InvFileSliceAuth | CHK_FS_GUARD_BLOCK | projector_unit | file_slice_projector_tests::tests::test_file_slice_blocks_no_descriptor | break |
 | SPEC_FILE_AUTH_01 | InvFileSliceAuth | CHK_FS_INSERT | projector_unit | file_slice_projector_tests::tests::test_file_slice_valid | pass |
 | SPEC_FILE_AUTH_02 | InvFileSliceAuth | CHK_FS_SIGNER_MISMATCH | projector_unit | file_slice_projector_tests::tests::test_file_slice_rejects_signer_mismatch | break |
@@ -105,12 +141,12 @@ both `pass` and `break` polarity unless waived.
 | SPEC_UI_INSERT_01 | InvUserInviteChain | CHK_UI_INSERT | projector_unit | user_invite_projector_tests::tests::test_user_invite_rejects_non_user_invite_event | break |
 | SPEC_USR_INSERT_01 | InvDeps | CHK_USR_INSERT | projector_unit | simple_projector_tests::tests::test_user_valid | pass |
 | SPEC_USR_INSERT_01 | InvDeps | CHK_USR_INSERT | projector_unit | simple_projector_tests::tests::test_user_rejects_non_user_event | break |
-| SPEC_SK_INSERT_01 | InvEncryptedKey | CHK_SK_INSERT | projector_unit | simple_projector_tests::tests::test_secret_key_valid | pass |
-| SPEC_SK_INSERT_01 | InvEncryptedKey | CHK_SK_INSERT | projector_unit | simple_projector_tests::tests::test_secret_key_rejects_non_secret_key_event | break |
-| SPEC_MA_INSERT_01 | InvDeps | CHK_MA_INSERT | projector_unit | simple_projector_tests::tests::test_message_attachment_valid | pass |
-| SPEC_MA_INSERT_01 | InvDeps | CHK_MA_INSERT | projector_unit | simple_projector_tests::tests::test_message_attachment_rejects_non_attachment_event | break |
-| SPEC_MA_RETRY_01 | InvFileSliceAuth | CHK_MA_RETRY_GUARD | projector_unit | simple_projector_tests::tests::test_message_attachment_valid | pass |
-| SPEC_MA_RETRY_01 | InvFileSliceAuth | CHK_MA_RETRY_GUARD | projector_unit | simple_projector_tests::tests::test_message_attachment_rejects_non_attachment_event | break |
+| SPEC_SK_INSERT_01 | InvEncryptedKey | CHK_SK_INSERT | projector_unit | simple_projector_tests::tests::test_key_secret_valid | pass |
+| SPEC_SK_INSERT_01 | InvEncryptedKey | CHK_SK_INSERT | projector_unit | simple_projector_tests::tests::test_key_secret_rejects_non_key_secret_event | break |
+| SPEC_MA_INSERT_01 | InvDeps | CHK_MA_INSERT | projector_unit | simple_projector_tests::tests::test_file_valid | pass |
+| SPEC_MA_INSERT_01 | InvDeps | CHK_MA_INSERT | projector_unit | simple_projector_tests::tests::test_file_rejects_non_attachment_event | break |
+| SPEC_MA_RETRY_01 | InvFileSliceAuth | CHK_MA_RETRY_GUARD | projector_unit | simple_projector_tests::tests::test_file_valid | pass |
+| SPEC_MA_RETRY_01 | InvFileSliceAuth | CHK_MA_RETRY_GUARD | projector_unit | simple_projector_tests::tests::test_file_rejects_non_attachment_event | break |
 | SPEC_BD_NOOP_01 | (benchmark) | CHK_BD_NOOP | projector_unit | simple_projector_tests::tests::test_bench_dep_noop | pass |
 | SPEC_BD_NOOP_01 | (benchmark) | CHK_BD_NOOP | projector_unit | simple_projector_tests::tests::test_bench_dep_rejects_non_bench_dep_event | break |
 | SPEC_IA_RETRY_01 | InvWorkspaceAnchor | CHK_IA_RETRY_GUARDS | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_writes_workspace_binding | pass |
@@ -123,12 +159,12 @@ both `pass` and `break` polarity unless waived.
 | SPEC_REJECTION_01 | (durable rejection) | CHK_REJECTION_RECORD | pipeline_integration | apply::tests::test_project_message_valid | break |
 | SPEC_ANCHOR_SOURCE_02 | InvTrustAnchorSource | CHK_IA_ANCHOR_SOURCE | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_writes_workspace_binding | pass |
 | SPEC_ANCHOR_SOURCE_02 | InvTrustAnchorSource | CHK_IA_ANCHOR_SOURCE | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_no_bootstrap_without_context | break |
-| SPEC_BOOTSTRAP_TRUST_CONSUME_01 | InvBootstrapTrustConsumedByPeerShared | CHK_PS_BOOTSTRAP_TRUST_CONSUME | projector_unit | peer_shared_projector_tests::tests::test_peer_shared_consumes_bootstrap_trust | pass |
-| SPEC_BOOTSTRAP_TRUST_CONSUME_01 | InvBootstrapTrustConsumedByPeerShared | CHK_PS_BOOTSTRAP_TRUST_CONSUME | projector_unit | peer_shared_projector_tests::tests::test_peer_shared_rejects_non_peer_shared_event | break |
-| SPEC_PENDING_CONSUME_02 | InvPendingConsumedByPeerShared | CHK_PS_PENDING_CONSUME | projector_unit | peer_shared_projector_tests::tests::test_peer_shared_consumes_bootstrap_trust | pass |
-| SPEC_PENDING_CONSUME_02 | InvPendingConsumedByPeerShared | CHK_PS_PENDING_CONSUME | projector_unit | peer_shared_projector_tests::tests::test_peer_shared_rejects_non_peer_shared_event | break |
-| SPEC_PENDING_BOOTSTRAP_CONSUME_01 | InvPendingBootstrapTrustConsumedByPeerShared | CHK_PS_PENDING_BOOTSTRAP_CONSUME | projector_unit | peer_shared_projector_tests::tests::test_peer_shared_consumes_bootstrap_trust | pass |
-| SPEC_PENDING_BOOTSTRAP_CONSUME_01 | InvPendingBootstrapTrustConsumedByPeerShared | CHK_PS_PENDING_BOOTSTRAP_CONSUME | projector_unit | peer_shared_projector_tests::tests::test_peer_shared_rejects_non_peer_shared_event | break |
+| SPEC_BOOTSTRAP_TRUST_CONSUME_01 | InvBootstrapTrustConsumedByPeerShared | CHK_PS_BOOTSTRAP_TRUST_CONSUME | transport_credential | state::db::transport_trust::tests::test_invite_bootstrap_superseded_when_peer_shared_exists | pass |
+| SPEC_BOOTSTRAP_TRUST_CONSUME_01 | InvBootstrapTrustConsumedByPeerShared | CHK_PS_BOOTSTRAP_TRUST_CONSUME | transport_credential | state::db::transport_trust::tests::test_invite_bootstrap_trust_in_authorized_fingerprints | break |
+| SPEC_PENDING_CONSUME_02 | InvPendingConsumedByPeerShared | CHK_PS_PENDING_CONSUME | transport_credential | state::db::transport_trust::tests::test_pending_invite_bootstrap_superseded_when_peer_shared_exists | pass |
+| SPEC_PENDING_CONSUME_02 | InvPendingConsumedByPeerShared | CHK_PS_PENDING_CONSUME | transport_credential | state::db::transport_trust::tests::test_pending_invite_bootstrap_trust_in_authorized_fingerprints | break |
+| SPEC_PENDING_BOOTSTRAP_CONSUME_01 | InvPendingBootstrapTrustConsumedByPeerShared | CHK_PS_PENDING_BOOTSTRAP_CONSUME | transport_credential | state::db::transport_trust::tests::test_pending_invite_bootstrap_superseded_when_peer_shared_exists | pass |
+| SPEC_PENDING_BOOTSTRAP_CONSUME_01 | InvPendingBootstrapTrustConsumedByPeerShared | CHK_PS_PENDING_BOOTSTRAP_CONSUME | transport_credential | state::db::transport_trust::tests::test_pending_invite_bootstrap_trust_in_authorized_fingerprints | break |
 | SPEC_PENDING_SOURCE_01 | InvPendingBootstrapTrustSource | CHK_UI_PENDING_SOURCE | projector_unit | user_invite_projector_tests::tests::test_user_invite_writes_pending_trust | pass |
 | SPEC_PENDING_SOURCE_01 | InvPendingBootstrapTrustSource | CHK_UI_PENDING_SOURCE | projector_unit | user_invite_projector_tests::tests::test_user_invite_no_pending_when_not_local | break |
 | SPEC_WS_DEP_01 | InvAllValidRequireWorkspace | CHK_WS_DEP_REQUIRED | pipeline_integration | apply::tests::test_project_message_valid | pass |
@@ -138,10 +174,10 @@ both `pass` and `break` polarity unless waived.
 
 | spec_id | source | check_id | layer | test_id | polarity |
 |---------|--------|----------|-------|---------|----------|
-| SPEC_BOOTSTRAP_CONSUMED_TCL_01 | InvBootstrapConsumedByPeerShared | CHK_PS_SUPERSEDE | projector_unit | peer_shared_projector_tests::tests::test_peer_shared_consumes_bootstrap_trust | pass |
-| SPEC_BOOTSTRAP_CONSUMED_TCL_01 | InvBootstrapConsumedByPeerShared | CHK_PS_SUPERSEDE | projector_unit | peer_shared_projector_tests::tests::test_peer_shared_rejects_non_peer_shared_event | break |
-| SPEC_PENDING_CONSUMED_TCL_01 | InvPendingConsumedByPeerShared | CHK_PS_SUPERSEDE | projector_unit | peer_shared_projector_tests::tests::test_peer_shared_consumes_bootstrap_trust | pass |
-| SPEC_PENDING_CONSUMED_TCL_01 | InvPendingConsumedByPeerShared | CHK_PS_SUPERSEDE | projector_unit | peer_shared_projector_tests::tests::test_peer_shared_rejects_non_peer_shared_event | break |
+| SPEC_BOOTSTRAP_CONSUMED_TCL_01 | InvBootstrapConsumedByPeerShared | CHK_PS_SUPERSEDE | transport_credential | state::db::transport_trust::tests::test_invite_bootstrap_superseded_when_peer_shared_exists | pass |
+| SPEC_BOOTSTRAP_CONSUMED_TCL_01 | InvBootstrapConsumedByPeerShared | CHK_PS_SUPERSEDE | transport_credential | state::db::transport_trust::tests::test_invite_bootstrap_trust_in_authorized_fingerprints | break |
+| SPEC_PENDING_CONSUMED_TCL_01 | InvPendingConsumedByPeerShared | CHK_PS_PENDING_CONSUME | transport_credential | state::db::transport_trust::tests::test_pending_invite_bootstrap_superseded_when_peer_shared_exists | pass |
+| SPEC_PENDING_CONSUMED_TCL_01 | InvPendingConsumedByPeerShared | CHK_PS_PENDING_CONSUME | transport_credential | state::db::transport_trust::tests::test_pending_invite_bootstrap_trust_in_authorized_fingerprints | break |
 | SPEC_PENDING_INVITER_TCL_01 | InvPendingTrustOnlyOnInviter | CHK_UI_PENDING_TRUST | projector_unit | user_invite_projector_tests::tests::test_user_invite_no_pending_when_not_local | break |
 | SPEC_PENDING_INVITER_TCL_01 | InvPendingTrustOnlyOnInviter | CHK_UI_PENDING_TRUST | projector_unit | user_invite_projector_tests::tests::test_user_invite_writes_pending_trust | pass |
 | SPEC_PENDING_INVITER_TCL_02 | InvPendingTrustOnlyOnInviter | CHK_DI_PENDING_TRUST | projector_unit | device_invite_projector_tests::tests::test_device_invite_no_pending_when_not_local | break |
@@ -161,7 +197,18 @@ both `pass` and `break` polarity unless waived.
 | SPEC_TCL_PENDING_MATCH_01 | InvPendingBootstrapTrustMatchesCarried | CHK_TCL_PENDING_MATCH | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
 | SPEC_TCL_PENDING_MATCH_01 | InvPendingBootstrapTrustMatchesCarried | CHK_TCL_PENDING_MATCH | runtime_unit | state::db::transport_trust::tests::test_expired_pending_invite_bootstrap_not_in_authorized_fingerprints | break |
 | SPEC_TCL_CRED_SOURCE_01 | InvCredentialSourceConsistency | CHK_TCL_CRED_SOURCE_CONSISTENCY | transport_credential | apply::tests::test_signed_content_events_project_with_identity_chain | pass |
-| SPEC_TCL_CRED_SOURCE_01 | InvCredentialSourceConsistency | CHK_TCL_CRED_SOURCE_CONSISTENCY | runtime_unit | runtime::transport::identity_adapter::tests::bootstrap_install_rejected_after_peershared | break |
+| SPEC_TCL_CRED_SOURCE_01 | InvCredentialSourceConsistency | CHK_TCL_CRED_SOURCE_CONSISTENCY | runtime_unit | runtime::transport::identity_adapter::tests::bootstrap_install_rejected_after_peershared_for_same_peer | break |
+
+## Exact Transport Targeting Invariants
+
+| spec_id | source | check_id | layer | test_id | polarity |
+|---------|--------|----------|-------|---------|----------|
+| SPEC_ETT_INBOUND_01 | InvInboundAdmittedAuthorized | CHK_ETT_INBOUND_EXACT_TARGET | runtime_unit | runtime::peering::loops::accept::tests::requested_tenant_auth_accepts_when_that_tenant_authorizes_remote_peer | pass |
+| SPEC_ETT_INBOUND_01 | InvInboundAdmittedAuthorized | CHK_ETT_INBOUND_EXACT_TARGET | runtime_unit | runtime::peering::loops::accept::tests::requested_tenant_auth_does_not_fallback_to_other_authorizing_tenants | break |
+| SPEC_ETT_CROSS_TENANT_01 | InvNoCrossTenantFallback | CHK_ETT_NO_CROSS_TENANT_FALLBACK | runtime_unit | runtime::peering::loops::accept::tests::requested_tenant_auth_accepts_when_that_tenant_authorizes_remote_peer | pass |
+| SPEC_ETT_CROSS_TENANT_01 | InvNoCrossTenantFallback | CHK_ETT_NO_CROSS_TENANT_FALLBACK | runtime_unit | runtime::peering::loops::accept::tests::requested_tenant_auth_does_not_fallback_to_other_authorizing_tenants | break |
+| SPEC_ETT_OUTBOUND_01 | InvOutboundConnectedAuthorized | CHK_ETT_OUTBOUND_EXACT_REMOTE | runtime_unit | runtime::transport::tests::test_server_verifier_requires_exact_transport_target_sni | pass |
+| SPEC_ETT_OUTBOUND_01 | InvOutboundConnectedAuthorized | CHK_ETT_OUTBOUND_EXACT_REMOTE | runtime_unit | runtime::transport::tests::test_server_verifier_rejects_mismatched_exact_transport_target | break |
 
 ## UnifiedBridge Invariants
 
