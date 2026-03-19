@@ -15,6 +15,9 @@ use crate::event_modules::{
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::encrypted::encrypt_event_blob;
 use crate::projection::signer::sign_event_bytes;
+use crate::state::projection::create::{
+    create_event_staged, create_event_synchronous, create_signed_event_synchronous,
+};
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use ed25519_dalek::SigningKey;
@@ -234,27 +237,17 @@ fn setup_tenant_event(conn: &Connection, recorded_by: &str) -> EventId {
         created_at_ms: now_ms(),
         public_key: peer_key.verifying_key().to_bytes(),
     });
-    let tenant_blob = events::encode_event(&tenant_event).unwrap();
-    let tenant_eid = insert_event_raw(conn, recorded_by, &tenant_blob);
-    let tenant_decision = project_one(conn, recorded_by, &tenant_eid).unwrap();
-    assert_eq!(tenant_decision, ProjectionDecision::Valid);
-    tenant_eid
+    create_event_synchronous(conn, recorded_by, &tenant_event).unwrap()
 }
 
 /// Create a minimal identity chain and return (peer_shared_event_id, signing_key).
-/// Projects all identity events through the pipeline so the signer is in valid_events.
+/// Uses the normal create helpers for the happy path so fixture signing and
+/// projection match production behavior.
 fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, SigningKey) {
     let mut rng = rand::thread_rng();
 
     // 1. Local tenant root
-    let peer_key = SigningKey::generate(&mut rng);
-    let tenant_event = ParsedEvent::Tenant(TenantEvent {
-        created_at_ms: now_ms(),
-        public_key: peer_key.verifying_key().to_bytes(),
-    });
-    let tenant_blob = events::encode_event(&tenant_event).unwrap();
-    let tenant_eid = insert_event_raw(conn, recorded_by, &tenant_blob);
-    project_one(conn, recorded_by, &tenant_eid).unwrap();
+    let tenant_eid = setup_tenant_event(conn, recorded_by);
 
     // 2. Workspace
     let workspace_key = SigningKey::generate(&mut rng);
@@ -264,8 +257,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
         public_key: workspace_pub,
         name: "workspace".to_string(),
     });
-    let net_blob = events::encode_event(&net_event).unwrap();
-    let net_eid = insert_event_raw(conn, recorded_by, &net_blob);
+    let net_eid = create_event_staged(conn, recorded_by, &net_event).unwrap();
 
     // 3. InviteAccepted (local, binds trust anchor)
     let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
@@ -274,10 +266,14 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
         invite_event_id: net_eid,
         workspace_id: net_eid,
     });
-    let ia_blob = events::encode_event(&ia_event).unwrap();
-    let ia_eid = insert_event_raw(conn, recorded_by, &ia_blob);
-    project_one(conn, recorded_by, &ia_eid).unwrap();
-    project_one(conn, recorded_by, &net_eid).unwrap();
+    create_event_synchronous(conn, recorded_by, &ia_event).unwrap();
+    assert!(
+        matches!(
+            project_one(conn, recorded_by, &net_eid).unwrap(),
+            ProjectionDecision::Valid | ProjectionDecision::AlreadyProcessed
+        ),
+        "workspace should be projected by the invite_accepted retry path"
+    );
 
     // 4. UserInvite (signed by workspace key)
     let invite_key = SigningKey::generate(&mut rng);
@@ -292,10 +288,8 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
         signature: [0u8; 64],
     };
     let uib_event = ParsedEvent::UserInvite(uib);
-    let mut uib_blob = events::encode_event(&uib_event).unwrap();
-    sign_blob(&workspace_key, &mut uib_blob);
-    let uib_eid = insert_event_raw(conn, recorded_by, &uib_blob);
-    project_one(conn, recorded_by, &uib_eid).unwrap();
+    let uib_eid =
+        create_signed_event_synchronous(conn, recorded_by, &uib_event, &workspace_key).unwrap();
 
     // 5. User (signed by invite key)
     let user_key = SigningKey::generate(&mut rng);
@@ -309,10 +303,8 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
         signature: [0u8; 64],
     };
     let ub_event = ParsedEvent::User(ub);
-    let mut ub_blob = events::encode_event(&ub_event).unwrap();
-    sign_blob(&invite_key, &mut ub_blob);
-    let ub_eid = insert_event_raw(conn, recorded_by, &ub_blob);
-    project_one(conn, recorded_by, &ub_eid).unwrap();
+    let ub_eid =
+        create_signed_event_synchronous(conn, recorded_by, &ub_event, &invite_key).unwrap();
 
     // 6. DeviceInvite (signed by user key)
     let device_invite_key = SigningKey::generate(&mut rng);
@@ -326,10 +318,8 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
         signature: [0u8; 64],
     };
     let dif_event = ParsedEvent::DeviceInvite(dif);
-    let mut dif_blob = events::encode_event(&dif_event).unwrap();
-    sign_blob(&user_key, &mut dif_blob);
-    let dif_eid = insert_event_raw(conn, recorded_by, &dif_blob);
-    project_one(conn, recorded_by, &dif_eid).unwrap();
+    let dif_eid =
+        create_signed_event_synchronous(conn, recorded_by, &dif_event, &user_key).unwrap();
 
     // 7. PeerShared (signed by device_invite key)
     let peer_shared_key = SigningKey::generate(&mut rng);
@@ -344,10 +334,8 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
         signature: [0u8; 64],
     };
     let psf_event = ParsedEvent::PeerShared(psf);
-    let mut psf_blob = events::encode_event(&psf_event).unwrap();
-    sign_blob(&device_invite_key, &mut psf_blob);
-    let psf_eid = insert_event_raw(conn, recorded_by, &psf_blob);
-    project_one(conn, recorded_by, &psf_eid).unwrap();
+    let psf_eid =
+        create_signed_event_synchronous(conn, recorded_by, &psf_event, &device_invite_key).unwrap();
 
     register_signer_user(psf_eid, ub_eid);
     (psf_eid, peer_shared_key)
@@ -357,6 +345,8 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
 /// Returns (signer_eid, signing_key, chain_blobs) where chain_blobs
 /// are in dependency order (Network, InviteAccepted, UserInvite, etc.).
 /// Caller must insert_event_raw + project_one each blob in order.
+/// This stays synthetic because the deferred/order tests need exact raw blobs
+/// before any create helper writes or retries projection.
 fn build_identity_chain_deferred(
     _recorded_by: &str,
 ) -> (EventId, SigningKey, Vec<(EventId, Vec<u8>)>) {
@@ -3027,16 +3017,7 @@ fn assert_projection_rejection_contains(
 fn setup_workspace_anchor(conn: &Connection, recorded_by: &str) -> (EventId, SigningKey) {
     let mut rng = rand::thread_rng();
 
-    let tenant_event = ParsedEvent::Tenant(crate::event_modules::TenantEvent {
-        created_at_ms: now_ms(),
-        public_key: SigningKey::generate(&mut rng).verifying_key().to_bytes(),
-    });
-    let tenant_blob = events::encode_event(&tenant_event).unwrap();
-    let tenant_eid = insert_event_raw(conn, recorded_by, &tenant_blob);
-    assert_eq!(
-        project_one(conn, recorded_by, &tenant_eid).unwrap(),
-        ProjectionDecision::Valid
-    );
+    let tenant_eid = setup_tenant_event(conn, recorded_by);
 
     let workspace_key = SigningKey::generate(&mut rng);
     let workspace_event = ParsedEvent::Workspace(WorkspaceEvent {
@@ -3044,8 +3025,7 @@ fn setup_workspace_anchor(conn: &Connection, recorded_by: &str) -> (EventId, Sig
         public_key: workspace_key.verifying_key().to_bytes(),
         name: "workspace".to_string(),
     });
-    let workspace_blob = events::encode_event(&workspace_event).unwrap();
-    let workspace_eid = insert_event_raw(conn, recorded_by, &workspace_blob);
+    let workspace_eid = create_event_staged(conn, recorded_by, &workspace_event).unwrap();
 
     let invite_accepted = ParsedEvent::InviteAccepted(crate::event_modules::InviteAcceptedEvent {
         created_at_ms: now_ms(),
@@ -3053,12 +3033,7 @@ fn setup_workspace_anchor(conn: &Connection, recorded_by: &str) -> (EventId, Sig
         invite_event_id: workspace_eid,
         workspace_id: workspace_eid,
     });
-    let invite_accepted_blob = events::encode_event(&invite_accepted).unwrap();
-    let invite_accepted_eid = insert_event_raw(conn, recorded_by, &invite_accepted_blob);
-    assert_eq!(
-        project_one(conn, recorded_by, &invite_accepted_eid).unwrap(),
-        ProjectionDecision::Valid
-    );
+    create_event_synchronous(conn, recorded_by, &invite_accepted).unwrap();
     assert!(
         matches!(
             project_one(conn, recorded_by, &workspace_eid).unwrap(),
@@ -3087,13 +3062,8 @@ fn create_bootstrap_user_invite(
         signer_type: 1,
         signature: [0u8; 64],
     });
-    let mut invite_blob = events::encode_event(&invite_event).unwrap();
-    sign_blob(workspace_key, &mut invite_blob);
-    let invite_eid = insert_event_raw(conn, recorded_by, &invite_blob);
-    assert_eq!(
-        project_one(conn, recorded_by, &invite_eid).unwrap(),
-        ProjectionDecision::Valid
-    );
+    let invite_eid =
+        create_signed_event_synchronous(conn, recorded_by, &invite_event, workspace_key).unwrap();
     (invite_eid, invite_key)
 }
 
@@ -3113,13 +3083,8 @@ fn project_valid_user_from_invite(
         signer_type: 2,
         signature: [0u8; 64],
     });
-    let mut user_blob = events::encode_event(&user_event).unwrap();
-    sign_blob(invite_key, &mut user_blob);
-    let user_eid = insert_event_raw(conn, recorded_by, &user_blob);
-    assert_eq!(
-        project_one(conn, recorded_by, &user_eid).unwrap(),
-        ProjectionDecision::Valid
-    );
+    let user_eid =
+        create_signed_event_synchronous(conn, recorded_by, &user_event, invite_key).unwrap();
     (user_eid, user_key)
 }
 
@@ -3139,13 +3104,8 @@ fn project_valid_bootstrap_device_invite(
         signer_type: 4,
         signature: [0u8; 64],
     });
-    let mut device_invite_blob = events::encode_event(&device_invite_event).unwrap();
-    sign_blob(user_key, &mut device_invite_blob);
-    let device_invite_eid = insert_event_raw(conn, recorded_by, &device_invite_blob);
-    assert_eq!(
-        project_one(conn, recorded_by, &device_invite_eid).unwrap(),
-        ProjectionDecision::Valid
-    );
+    let device_invite_eid =
+        create_signed_event_synchronous(conn, recorded_by, &device_invite_event, user_key).unwrap();
     (device_invite_eid, device_invite_key)
 }
 
@@ -3165,14 +3125,7 @@ fn project_valid_admin_for_user(
         signer_type: 1,
         signature: [0u8; 64],
     });
-    let mut admin_blob = events::encode_event(&admin_event).unwrap();
-    sign_blob(workspace_key, &mut admin_blob);
-    let admin_eid = insert_event_raw(conn, recorded_by, &admin_blob);
-    assert_eq!(
-        project_one(conn, recorded_by, &admin_eid).unwrap(),
-        ProjectionDecision::Valid
-    );
-    admin_eid
+    create_signed_event_synchronous(conn, recorded_by, &admin_event, workspace_key).unwrap()
 }
 
 fn project_valid_peer_shared_for_user(
@@ -3194,13 +3147,9 @@ fn project_valid_peer_shared_for_user(
         signer_type: 3,
         signature: [0u8; 64],
     });
-    let mut peer_shared_blob = events::encode_event(&peer_shared).unwrap();
-    sign_blob(device_invite_key, &mut peer_shared_blob);
-    let peer_shared_eid = insert_event_raw(conn, recorded_by, &peer_shared_blob);
-    assert_eq!(
-        project_one(conn, recorded_by, &peer_shared_eid).unwrap(),
-        ProjectionDecision::Valid
-    );
+    let peer_shared_eid =
+        create_signed_event_synchronous(conn, recorded_by, &peer_shared, device_invite_key)
+            .unwrap();
     (peer_shared_eid, peer_shared_key)
 }
 
@@ -3478,7 +3427,7 @@ fn test_peer_shared_rejects_peer_signed_device_link_user_mismatch() {
     let (bootstrap_device_invite_eid, bootstrap_device_invite_key) =
         project_valid_bootstrap_device_invite(&conn, recorded_by, user_a_eid, &user_a_key);
     let user_a_public_key = user_a_key.verifying_key().to_bytes();
-    let admin_eid = project_valid_admin_for_user(
+    let _admin_eid = project_valid_admin_for_user(
         &conn,
         recorded_by,
         workspace_eid,
@@ -3514,7 +3463,7 @@ fn test_peer_shared_rejects_peer_signed_device_link_user_mismatch() {
     let link_device_invite = ParsedEvent::DeviceInvite(crate::event_modules::DeviceInviteEvent {
         created_at_ms: now_ms(),
         public_key: link_device_invite_key.verifying_key().to_bytes(),
-        authority_event_id: admin_eid,
+        authority_event_id: user_a_eid,
         signed_by: admin_peer_shared_eid,
         signer_type: 5,
         signature: [0u8; 64],
@@ -3727,7 +3676,7 @@ fn test_device_invite_projects_with_peer_signed_admin_authority() {
         create_bootstrap_user_invite(&conn, recorded_by, workspace_eid, &workspace_key);
     let (user_eid, user_key) =
         project_valid_user_from_invite(&conn, recorded_by, invite_eid, &invite_key, "alice");
-    let (admin_eid, admin_peer_shared_eid, admin_peer_shared_key) = setup_admin_signer_peer(
+    let (_admin_eid, admin_peer_shared_eid, admin_peer_shared_key) = setup_admin_signer_peer(
         &conn,
         recorded_by,
         workspace_eid,
@@ -3740,7 +3689,7 @@ fn test_device_invite_projects_with_peer_signed_admin_authority() {
     let device_invite = ParsedEvent::DeviceInvite(crate::event_modules::DeviceInviteEvent {
         created_at_ms: now_ms(),
         public_key: SigningKey::generate(&mut rng).verifying_key().to_bytes(),
-        authority_event_id: admin_eid,
+        authority_event_id: user_eid,
         signed_by: admin_peer_shared_eid,
         signer_type: 5,
         signature: [0u8; 64],
