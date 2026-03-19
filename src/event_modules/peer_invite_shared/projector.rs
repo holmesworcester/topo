@@ -78,3 +78,126 @@ pub fn project_pure(
 
     ProjectorResult::valid(ops)
 }
+
+#[cfg(test)]
+mod device_invite_projector_tests {
+    use super::*;
+    use crate::event_modules::{DeviceInviteEvent, ParsedEvent, WorkspaceEvent};
+    use crate::projection::contract::{BootstrapContextSnapshot, ContextSnapshot, WriteOp};
+    use crate::projection::decision::ProjectionDecision;
+
+    fn bootstrap_device_invite() -> ParsedEvent {
+        ParsedEvent::DeviceInvite(DeviceInviteEvent {
+            created_at_ms: 1,
+            public_key: [9u8; 32],
+            authority_event_id: [2u8; 32],
+            signed_by: [2u8; 32],
+            signer_type: 4,
+            signature: [0u8; 64],
+        })
+    }
+
+    fn peer_signed_device_invite() -> ParsedEvent {
+        ParsedEvent::DeviceInvite(DeviceInviteEvent {
+            created_at_ms: 1,
+            public_key: [9u8; 32],
+            authority_event_id: [4u8; 32],
+            signed_by: [3u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
+        })
+    }
+
+    fn local_bootstrap_ctx() -> ContextSnapshot {
+        ContextSnapshot {
+            bootstrap_context: Some(BootstrapContextSnapshot {
+                workspace_id: "workspace".to_string(),
+                bootstrap_addrs: vec!["tcp://127.0.0.1:7777".to_string()],
+                bootstrap_spki_fingerprint: [7u8; 32],
+            }),
+            is_local_create: true,
+            ..ContextSnapshot::default()
+        }
+    }
+
+    fn assert_valid(result: &ProjectorResult, expected_writes: usize) {
+        assert!(matches!(result.decision, ProjectionDecision::Valid));
+        assert_eq!(result.write_ops.len(), expected_writes);
+    }
+
+    #[test]
+    fn test_device_invite_writes_pending_trust() {
+        let result = project_pure(
+            "peer1",
+            "invite-event",
+            &bootstrap_device_invite(),
+            &local_bootstrap_ctx(),
+        );
+        assert_valid(&result, 2);
+        assert!(matches!(
+            &result.write_ops[1],
+            WriteOp::InsertOrIgnore { table, .. } if *table == "pending_invite_bootstrap_trust"
+        ));
+    }
+
+    #[test]
+    fn test_device_invite_no_pending_when_not_local() {
+        let mut ctx = local_bootstrap_ctx();
+        ctx.is_local_create = false;
+
+        let result = project_pure("peer1", "invite-event", &bootstrap_device_invite(), &ctx);
+        assert_valid(&result, 1);
+    }
+
+    #[test]
+    fn test_device_invite_rejects_bootstrap_authority_mismatch() {
+        let event = ParsedEvent::DeviceInvite(DeviceInviteEvent {
+            created_at_ms: 1,
+            public_key: [9u8; 32],
+            authority_event_id: [6u8; 32],
+            signed_by: [2u8; 32],
+            signer_type: 4,
+            signature: [0u8; 64],
+        });
+        let result = project_pure("peer1", "invite-event", &event, &ContextSnapshot::default());
+        assert!(matches!(
+            result.decision,
+            ProjectionDecision::Reject { ref reason }
+                if reason.contains("bootstrap device_invite authority must match signer user event")
+        ));
+    }
+
+    #[test]
+    fn test_device_invite_rejects_peer_signed_authority_mismatch() {
+        let result = project_pure(
+            "peer1",
+            "invite-event",
+            &peer_signed_device_invite(),
+            &ContextSnapshot {
+                invite_authority_matches_signer: Some(false),
+                ..ContextSnapshot::default()
+            },
+        );
+        assert!(matches!(
+            result.decision,
+            ProjectionDecision::Reject { ref reason }
+                if reason.contains("peer-signed device_invite authority does not match signer admin identity")
+        ));
+    }
+
+    #[test]
+    fn test_device_invite_rejects_non_device_invite_event() {
+        let other = ParsedEvent::Workspace(WorkspaceEvent {
+            created_at_ms: 1,
+            public_key: [0u8; 32],
+            name: "ws".to_string(),
+        });
+        let result = project_pure(
+            "peer1",
+            "workspace-event",
+            &other,
+            &ContextSnapshot::default(),
+        );
+        assert!(matches!(result.decision, ProjectionDecision::Reject { .. }));
+    }
+}

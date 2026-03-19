@@ -29,3 +29,54 @@ pub fn project_pure(
     }];
     ProjectorResult::valid(ops)
 }
+
+#[cfg(test)]
+mod projector_tests {
+    use super::*;
+    use crate::event_modules::{ParsedEvent, UserEvent, WorkspaceEvent};
+
+    fn user_event() -> ParsedEvent {
+        ParsedEvent::User(UserEvent {
+            created_at_ms: 1,
+            public_key: [7u8; 32],
+            username: "alice".to_string(),
+            signed_by: [8u8; 32],
+            signer_type: 2,
+            signature: [0u8; 64],
+        })
+    }
+
+    #[test]
+    fn test_user_valid() {
+        let result = project_pure(
+            "peer1",
+            "user-event",
+            &user_event(),
+            &ContextSnapshot::default(),
+        );
+        assert!(matches!(
+            result.decision,
+            crate::projection::decision::ProjectionDecision::Valid
+        ));
+        assert_eq!(result.write_ops.len(), 1);
+    }
+
+    #[test]
+    fn test_user_rejects_non_user_event() {
+        let other = ParsedEvent::Workspace(WorkspaceEvent {
+            created_at_ms: 1,
+            public_key: [0u8; 32],
+            name: "ws".to_string(),
+        });
+        let result = project_pure(
+            "peer1",
+            "workspace-event",
+            &other,
+            &ContextSnapshot::default(),
+        );
+        assert!(matches!(
+            result.decision,
+            crate::projection::decision::ProjectionDecision::Reject { .. }
+        ));
+    }
+}

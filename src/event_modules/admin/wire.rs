@@ -50,6 +50,11 @@ pub fn parse_admin(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let mut signed_by = [0u8; 32];
     signed_by.copy_from_slice(&blob[73..105]);
     let signer_type = blob[105];
+    if signer_type != 1 {
+        return Err(EventError::InvalidMetadata(
+            "admin signer_type must be 1 (workspace)",
+        ));
+    }
     let mut signature = [0u8; 64];
     signature.copy_from_slice(&blob[106..170]);
 
@@ -92,5 +97,37 @@ pub static ADMIN_META: EventTypeMeta = EventTypeMeta {
     parse: parse_admin,
     encode: encode_admin,
     projector: super::projector::project_pure,
-    context_loader: crate::event_modules::registry::load_empty_context,
+    context_loader: super::projection_context::build_projector_context,
 };
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::event_modules::{encode_event, parse_event};
+
+    #[test]
+    fn parse_admin_accepts_workspace_signer_type() {
+        let event = ParsedEvent::Admin(AdminEvent {
+            created_at_ms: 123,
+            public_key: [1u8; 32],
+            user_event_id: [2u8; 32],
+            signed_by: [3u8; 32],
+            signer_type: 1,
+            signature: [0u8; 64],
+        });
+
+        let blob = encode_event(&event).unwrap();
+        let parsed = parse_event(&blob).unwrap();
+        assert_eq!(parsed, event);
+    }
+
+    #[test]
+    fn parse_admin_rejects_wrong_signer_type() {
+        let mut blob = vec![0u8; ADMIN_WIRE_SIZE];
+        blob[0] = EVENT_TYPE_ADMIN;
+        blob[105] = 4;
+
+        let err = parse_admin(&blob).expect_err("should reject wrong signer type");
+        assert!(matches!(err, EventError::InvalidMetadata(_)));
+    }
+}

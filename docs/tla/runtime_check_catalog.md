@@ -12,7 +12,8 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_WS_TRUST_ANCHOR_MISMATCH | event_modules/workspace::project_pure | InvForeignWorkspaceExcluded | projector_local |
 | CHK_WS_INSERT | event_modules/workspace::project_pure | InvSingleWorkspace | projector_local |
 | CHK_IA_TRUST_ANCHOR_WRITE | event_modules/invite_accepted::project_pure | InvTrustAnchorImmutable | projector_local |
-| CHK_IA_TRUST_ANCHOR_CONFLICT | event_modules/invite_accepted::project_pure | InvTrustAnchorImmutable | projector_local |
+| CHK_IA_TRUST_ANCHOR_CONFLICT | state/db/store::lookup_workspace_id | InvTrustAnchorImmutable | projection_read_model |
+| CHK_IA_WINNER_ORDER | state/db/store::lookup_workspace_id | InvTrustAnchorImmutable | projection_read_model |
 | CHK_IA_RETRY_GUARDS | event_modules/invite_accepted::project_pure | InvWorkspaceAnchor | projector_local |
 | CHK_IA_BOOTSTRAP_TRUST | event_modules/invite_accepted::project_pure | InvBootstrapTrustSource | projector_local |
 | CHK_MSG_SIGNER_USER_MISMATCH | event_modules/message::project_pure | InvSigner | projector_local |
@@ -36,24 +37,38 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_MA_INSERT | event_modules/message_attachment::project_pure | InvDeps | projector_local |
 | CHK_MA_RETRY_GUARD | event_modules/message_attachment::project_pure | InvFileSliceAuth | projector_local |
 | CHK_UI_INSERT | event_modules/user_invite::project_pure | InvUserInviteChain | projector_local |
+| CHK_UI_AUTHORITY | event_modules/user_invite::project_pure + build_projector_context | InvUserInviteChain | projector_local |
 | CHK_UI_PENDING_TRUST | event_modules/user_invite::project_pure | InvPendingTrustOnlyOnInviter | projector_local |
 | CHK_UI_PENDING_BOOTSTRAP_SRC | event_modules/user_invite::project_pure | InvPendingBootstrapTrustSource | projector_local |
 | CHK_DI_INSERT | event_modules/device_invite::project_pure | InvDeviceInviteChain | projector_local |
+| CHK_DI_AUTHORITY | event_modules/device_invite::project_pure + build_projector_context | InvDeviceInviteChain | projector_local |
 | CHK_DI_PENDING_TRUST | event_modules/device_invite::project_pure | InvPendingTrustOnlyOnInviter | projector_local |
 | CHK_DI_PENDING_BOOTSTRAP_SRC | event_modules/device_invite::project_pure | InvPendingBootstrapTrustSource | projector_local |
 | CHK_USR_INSERT | event_modules/user::project_pure | InvDeps | projector_local |
 | CHK_PS_INSERT | event_modules/peer_shared::project_pure | InvPeerSharedTrustSource | projector_local |
+| CHK_PS_AUTHORIZED_USER | event_modules/peer_shared::build_projector_context | InvDeviceInviteChain | projector_local |
 | CHK_PS_MATCH_CARRIED | event_modules/peer_shared::project_pure | InvPeerSharedTrustMatchesCarried | projector_local |
-| CHK_PS_SUPERSEDE | event_modules/peer_shared::project_pure | InvBootstrapConsumedByPeerShared | projector_local |
+| CHK_PS_SUPERSEDE | state/db/transport_trust::consume_bootstrap_for_peer_shared | InvBootstrapConsumedByPeerShared | transport_credential |
 | CHK_ADM_INSERT | event_modules/admin::project_pure | InvAdminChain | projector_local |
+| CHK_ADM_MATCH_USER_KEY | event_modules/admin::build_projector_context | InvAdminChain | projector_local |
 | CHK_SK_INSERT | event_modules/secret_key::project_pure | InvEncryptedKey | projector_local |
 | CHK_BD_NOOP | event_modules/bench_dep::project_pure | NON_MODELED::benchmark_only | projector_local |
 | CHK_IA_INVITE_RECORDED | event_modules/invite_accepted::project_pure | NON_MODELED::no_prior_invite_required | projector_local |
 | CHK_IA_ANCHOR_SOURCE | event_modules/invite_accepted::project_pure | InvTrustAnchorSource | projector_local |
-| CHK_PS_BOOTSTRAP_TRUST_CONSUME | event_modules/peer_shared::project_pure | InvBootstrapTrustConsumedByPeerShared | projector_local |
-| CHK_PS_PENDING_CONSUME | event_modules/peer_shared::project_pure | InvPendingConsumedByPeerShared | projector_local |
-| CHK_PS_PENDING_BOOTSTRAP_CONSUME | event_modules/peer_shared::project_pure | InvPendingBootstrapTrustConsumedByPeerShared | projector_local |
+| CHK_PS_BOOTSTRAP_TRUST_CONSUME | state/db/transport_trust::consume_bootstrap_for_peer_shared | InvBootstrapTrustConsumedByPeerShared | transport_credential |
+| CHK_PS_PENDING_CONSUME | state/db/transport_trust::consume_bootstrap_for_peer_shared | InvPendingConsumedByPeerShared | transport_credential |
+| CHK_PS_PENDING_BOOTSTRAP_CONSUME | state/db/transport_trust::consume_bootstrap_for_peer_shared | InvPendingBootstrapTrustConsumedByPeerShared | transport_credential |
 | CHK_UI_PENDING_SOURCE | event_modules/user_invite::project_pure | InvPendingBootstrapTrustSource | projector_local |
+
+## Wire Validation Checks
+
+| check_id | owner | tla_guard_id | category |
+|----------|-------|-------------|----------|
+| CHK_UI_SIGNER_FAMILY | event_modules/user_invite::parse_user_invite | InvUserInviteChain | wire_validation |
+| CHK_DI_SIGNER_FAMILY | event_modules/device_invite::parse_device_invite | InvDeviceInviteChain | wire_validation |
+| CHK_USR_SIGNER_FAMILY | event_modules/user::parse_user | InvUserInviteChain | wire_validation |
+| CHK_PS_SIGNER_FAMILY | event_modules/peer_shared::parse_peer_shared | InvDeviceInviteChain | wire_validation |
+| CHK_ADM_SIGNER_FAMILY | event_modules/admin::parse_admin | InvAdminChain | wire_validation |
 
 ## Pipeline-Shared Checks
 
