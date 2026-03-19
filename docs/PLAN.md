@@ -1201,6 +1201,7 @@ Only include identity and policy needed for:
 - accepted-workspace bootstrap/join cascade
 - self-invite bootstrap flow
 - device linking
+- device-link authorization scoped to the signer's own user identity; adding new users stays admin-only
 - recipient selection for encrypted message key wraps
 - transport mTLS trust policy derived from identity-backed SQL trust state
   (PeerShared-derived SPKIs + accepted-invite bootstrap trust), not static CLI/file pin sources

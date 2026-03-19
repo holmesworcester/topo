@@ -459,13 +459,6 @@ pub fn create_device_link_for_peer(
 
     let (sender_peer_eid, sender_peer_key) =
         crate::event_modules::peer_shared::load_local_peer_signer_required(&db, peer_id)?;
-    if !signer_is_admin(&db, peer_id, &sender_peer_eid)? {
-        return Err("Local peer signer is not admin for this workspace.".into());
-    }
-    let admin_event_id = resolve_admin_event_for_signer(&db, peer_id, &sender_peer_eid)?
-        .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
-            "Could not resolve admin event for local peer signer.".into()
-        })?;
     let user_event_id =
         crate::event_modules::peer_shared::resolve_user_event_id(&db, peer_id, &sender_peer_eid)?;
 
@@ -490,7 +483,6 @@ pub fn create_device_link_for_peer(
         peer_id,
         &sender_peer_key,
         &sender_peer_eid,
-        &admin_event_id,
         &user_event_id,
         &workspace_id,
         &addrs,

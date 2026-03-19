@@ -361,13 +361,13 @@ fn create_user_invite_events_with_signer(
     })
 }
 
-/// Create an ongoing device-link invite signed by an admin peer_shared signer.
-pub(crate) fn create_device_link_invite_events_as_admin(
+/// Create an ongoing device-link invite signed by a peer_shared signer for the
+/// signer's own user.
+pub(crate) fn create_device_link_invite_events_for_user(
     conn: &Connection,
     recorded_by: &str,
-    admin_peer_shared_key: &SigningKey,
-    admin_peer_shared_event_id: &EventId,
-    admin_event_id: &EventId,
+    peer_shared_key: &SigningKey,
+    peer_shared_event_id: &EventId,
     user_event_id: &EventId,
     workspace_id: &EventId,
     bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
@@ -375,9 +375,9 @@ pub(crate) fn create_device_link_invite_events_as_admin(
     create_device_link_invite_events_with_signer(
         conn,
         recorded_by,
-        admin_peer_shared_key,
-        admin_peer_shared_event_id,
-        admin_event_id,
+        peer_shared_key,
+        peer_shared_event_id,
+        user_event_id,
         5,
         user_event_id,
         workspace_id,

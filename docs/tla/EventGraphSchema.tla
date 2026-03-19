@@ -186,7 +186,9 @@ RawDeps(e) ==
        \* user_invite_shared: authority dep (workspace in bootstrap flow; admin in ongoing flow)
        [] e = UserInvite -> {Workspace}
 
-       \* peer_invite_shared: authority dep (user in bootstrap flow; admin in ongoing flow)
+       \* peer_invite_shared: authority dep is always user-scoped.
+       \* bootstrap flow uses the user signer directly; ongoing self-link uses
+       \* peer_shared but still targets that signer's user identity.
        [] e = DeviceInvite -> {User}
 
        \* user: no raw deps beyond signer
@@ -227,7 +229,7 @@ SignerDep(e) ==
     CASE \* user_invite_shared: signed by workspace
          e = UserInvite -> {Workspace}
 
-       \* peer_invite_shared: signed by user
+       \* peer_invite_shared: signer chain resolves to the linked user identity
        [] e = DeviceInvite -> {User}
 
        \* user: signed by the user_invite_shared key

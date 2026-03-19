@@ -30,7 +30,7 @@ pub fn project_pure(
     } else if signer_type == 5 {
         if ctx.invite_authority_matches_signer != Some(true) {
             return ProjectorResult::reject(
-                "peer-signed device_invite authority does not match signer admin identity"
+                "peer-signed device_invite authority does not match signer user identity"
                     .to_string(),
             );
         }
@@ -181,7 +181,7 @@ mod device_invite_projector_tests {
         assert!(matches!(
             result.decision,
             ProjectionDecision::Reject { ref reason }
-                if reason.contains("peer-signed device_invite authority does not match signer admin identity")
+                if reason.contains("peer-signed device_invite authority does not match signer user identity")
         ));
     }
 

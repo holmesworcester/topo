@@ -20,7 +20,6 @@ use std::collections::HashSet;
 use crate::crypto::EventId;
 use crate::crypto::{event_id_from_base64, event_id_to_base64};
 use crate::db::store::insert_recorded_event_checked;
-use crate::state::live_hints::{self, LiveHintEvent};
 use crate::event_modules::{
     peer_secret::PeerSecretEvent, AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, ParsedEvent,
     PeerSharedEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
@@ -30,6 +29,7 @@ use crate::projection::create::{
     create_event_staged, create_event_synchronous, create_signed_event_synchronous,
     event_id_or_blocked, project_event,
 };
+use crate::state::live_hints::{self, LiveHintEvent};
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -714,9 +714,8 @@ pub fn create_user_invite(
 pub fn create_device_link_invite(
     db: &Connection,
     recorded_by: &str,
-    admin_peer_shared_key: &SigningKey,
-    admin_peer_shared_event_id: &EventId,
-    admin_event_id: &EventId,
+    peer_shared_key: &SigningKey,
+    peer_shared_event_id: &EventId,
     user_event_id: &EventId,
     workspace_id: &EventId,
     bootstrap_addrs: &[super::invite_link::BootstrapAddress],
@@ -730,12 +729,11 @@ pub fn create_device_link_invite(
         bootstrap_addrs: &addr_strings,
         bootstrap_spki,
     };
-    let invite = ops::create_device_link_invite_events_as_admin(
+    let invite = ops::create_device_link_invite_events_for_user(
         db,
         recorded_by,
-        admin_peer_shared_key,
-        admin_peer_shared_event_id,
-        admin_event_id,
+        peer_shared_key,
+        peer_shared_event_id,
         user_event_id,
         workspace_id,
         Some(&ctx),
@@ -780,18 +778,16 @@ pub fn create_user_invite_raw(
 pub fn create_device_link_invite_raw(
     db: &Connection,
     recorded_by: &str,
-    admin_peer_shared_key: &SigningKey,
-    admin_peer_shared_event_id: &EventId,
-    admin_event_id: &EventId,
+    peer_shared_key: &SigningKey,
+    peer_shared_event_id: &EventId,
     user_event_id: &EventId,
     workspace_id: &EventId,
 ) -> Result<super::identity_ops::InviteData, Box<dyn std::error::Error + Send + Sync>> {
-    ops::create_device_link_invite_events_as_admin(
+    ops::create_device_link_invite_events_for_user(
         db,
         recorded_by,
-        admin_peer_shared_key,
-        admin_peer_shared_event_id,
-        admin_event_id,
+        peer_shared_key,
+        peer_shared_event_id,
         user_event_id,
         workspace_id,
         None,

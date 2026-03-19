@@ -865,26 +865,11 @@ impl Peer {
         let creator_peer_eid = creator
             .peer_shared_event_id
             .expect("creator has no peer_shared_event_id; use new_with_identity()");
-        let creator_admin_eid: EventId = creator_db
-            .query_row(
-                "SELECT event_id
-                 FROM admins
-                 WHERE recorded_by = ?1
-                 ORDER BY event_id ASC
-                 LIMIT 1",
-                rusqlite::params![&creator.identity],
-                |row| row.get::<_, String>(0),
-            )
-            .ok()
-            .and_then(|b64| event_id_from_base64(&b64))
-            .expect("creator has no admin event; use new_with_identity()");
-
         let invite = create_device_link_invite_raw(
             &creator_db,
             &creator.identity,
             creator_peer_key,
             &creator_peer_eid,
-            &creator_admin_eid,
             &creator.author_id,
             &creator.workspace_id,
         )
@@ -2333,7 +2318,10 @@ fn compute_projection_fingerprint(
             Scope::TenantId => "WHERE tenant_id = ?1",
         };
         let select = ft.columns.unwrap_or("*");
-        let query = format!("SELECT {} FROM {} {} {}", select, ft.name, where_clause, ft.order);
+        let query = format!(
+            "SELECT {} FROM {} {} {}",
+            select, ft.name, where_clause, ft.order
+        );
         let mut row_count: i64 = 0;
 
         if let Ok(mut stmt) = db.prepare(&query) {

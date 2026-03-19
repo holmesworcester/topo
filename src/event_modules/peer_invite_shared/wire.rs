@@ -10,7 +10,7 @@ pub const DEVICE_INVITE_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + SIGNA
 pub struct DeviceInviteEvent {
     pub created_at_ms: u64,
     pub public_key: [u8; 32],
-    pub authority_event_id: [u8; 32], // user (bootstrap) or admin (ongoing)
+    pub authority_event_id: [u8; 32], // user (bootstrap or ongoing self-link)
     pub signed_by: [u8; 32],
     pub signer_type: u8,
     pub signature: [u8; 64],
@@ -98,7 +98,7 @@ pub static DEVICE_INVITE_META: EventTypeMeta = EventTypeMeta {
     projection_table: "device_invites",
     share_scope: ShareScope::Shared,
     dep_fields: &["authority_event_id", "signed_by"],
-    dep_field_type_codes: &[&[14, 18], &[14, 16]],
+    dep_field_type_codes: &[&[14], &[14, 16]],
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,

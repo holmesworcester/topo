@@ -100,15 +100,6 @@ fn create_device_link_materializes_pending_bootstrap_trust_via_projection() {
         &workspace.peer_shared_key.verifying_key().to_bytes(),
     ));
 
-    let admin_event_id: EventId = conn
-        .query_row(
-            "SELECT event_id FROM admins WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
-            rusqlite::params![&recorded_by],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
-        .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
-        .expect("workspace bootstrap must create an admin event");
     let user_event_id: EventId = conn
         .query_row(
             "SELECT event_id FROM users WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
@@ -129,7 +120,6 @@ fn create_device_link_materializes_pending_bootstrap_trust_via_projection() {
         &recorded_by,
         &workspace.peer_shared_key,
         &workspace.peer_shared_event_id,
-        &admin_event_id,
         &user_event_id,
         &workspace.workspace_id,
         &bootstrap_addrs,
@@ -333,15 +323,6 @@ fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
     let workspace =
         create_workspace(&conn, "bootstrap", "ws", "alice", "laptop").expect("create workspace");
     let creator_peer_id = peer_id_for_signing_key(&workspace.peer_shared_key);
-    let creator_admin_eid: EventId = conn
-        .query_row(
-            "SELECT event_id FROM admins WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
-            rusqlite::params![&creator_peer_id],
-            |row| row.get::<_, String>(0),
-        )
-        .ok()
-        .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
-        .expect("creator admin event");
     let creator_user_eid: EventId = conn
         .query_row(
             "SELECT event_id FROM users WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
@@ -376,7 +357,6 @@ fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
         &creator_peer_id,
         &workspace.peer_shared_key,
         &workspace.peer_shared_event_id,
-        &creator_admin_eid,
         &creator_user_eid,
         &workspace.workspace_id,
     )

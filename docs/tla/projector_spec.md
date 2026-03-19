@@ -66,6 +66,10 @@ Changes to this document require TLA+ model re-verification.
 | 14 | {signed_by} | [signed_by] |
 | 15 | retired (code reserved) | [] |
 | 16 | {user_event_id, signed_by} | [user_event_id, signed_by] |
+
+Type 12 note: `authority_event_id` is always a `User` event. Ongoing self-link
+still uses signer_type `5` (`PeerShared`), but the authority remains the
+signer's user, not an admin event.
 | 17 | retired (code reserved) | [] |
 | 18 | {user_event_id, signed_by} | [user_event_id, signed_by] |
 | 19 | retired (code reserved) | [] |

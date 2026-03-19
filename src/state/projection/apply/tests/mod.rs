@@ -3780,7 +3780,7 @@ fn test_device_invite_rejects_peer_signed_authority_mismatch_at_projection() {
         create_bootstrap_user_invite(&conn, recorded_by, workspace_eid, &workspace_key);
     let (user_b_eid, user_b_key) =
         project_valid_user_from_invite(&conn, recorded_by, invite_b_eid, &invite_b_key, "bob");
-    let admin_b_eid = project_valid_admin_for_user(
+    let _admin_b_eid = project_valid_admin_for_user(
         &conn,
         recorded_by,
         workspace_eid,
@@ -3792,7 +3792,7 @@ fn test_device_invite_rejects_peer_signed_authority_mismatch_at_projection() {
     let bad_invite = ParsedEvent::DeviceInvite(crate::event_modules::DeviceInviteEvent {
         created_at_ms: now_ms(),
         public_key: SigningKey::generate(&mut rng).verifying_key().to_bytes(),
-        authority_event_id: admin_b_eid,
+        authority_event_id: user_b_eid,
         signed_by: admin_peer_shared_eid,
         signer_type: 5,
         signature: [0u8; 64],
@@ -3804,7 +3804,7 @@ fn test_device_invite_rejects_peer_signed_authority_mismatch_at_projection() {
         &conn,
         recorded_by,
         &bad_invite_blob,
-        "peer-signed device_invite authority does not match signer admin identity",
+        "peer-signed device_invite authority does not match signer user identity",
     );
 }
 

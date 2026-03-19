@@ -197,7 +197,8 @@ pub struct ContextSnapshot {
     pub bootstrap_context: Option<BootstrapContextSnapshot>,
 
     /// For invite events signed by peer_shared: whether `authority_event_id`
-    /// resolves to an admin event for the same user identity as `signed_by`.
+    /// resolves to the identity authorized by `signed_by`.
+    /// UserInvite requires admin authority; DeviceInvite requires the signer's user.
     pub invite_authority_matches_signer: Option<bool>,
 
     /// Whether this event was locally created (source = 'local' in recorded_events).

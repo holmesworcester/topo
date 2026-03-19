@@ -28,16 +28,10 @@ pub fn build_projector_context(
             let authority_matches_signer: bool = conn.query_row(
                 "SELECT EXISTS(
                      SELECT 1
-                     FROM peers_shared ps
-                     JOIN users u
-                       ON u.recorded_by = ps.recorded_by
-                      AND u.event_id = ps.user_event_id
-                     JOIN admins a
-                       ON a.recorded_by = u.recorded_by
-                      AND a.public_key = u.public_key
-                     WHERE ps.recorded_by = ?1
-                       AND ps.event_id = ?2
-                       AND a.event_id = ?3
+                     FROM peers_shared
+                     WHERE recorded_by = ?1
+                       AND event_id = ?2
+                       AND user_event_id = ?3
                  )",
                 rusqlite::params![recorded_by, signer_b64, authority_b64],
                 |row| row.get(0),
