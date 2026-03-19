@@ -53,8 +53,8 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_ADM_MATCH_USER_KEY | event_modules/admin::build_projector_context | InvAdminChain | projector_local |
 | CHK_SK_INSERT | event_modules/secret_key::project_pure | InvEncryptedKey | projector_local |
 | CHK_BD_NOOP | event_modules/bench_dep::project_pure | NON_MODELED::benchmark_only | projector_local |
-| CHK_IA_INVITE_RECORDED | event_modules/invite_accepted::project_pure | NON_MODELED::no_prior_invite_required | projector_local |
 | CHK_IA_ANCHOR_SOURCE | event_modules/invite_accepted::project_pure | InvTrustAnchorSource | projector_local |
+| CHK_IA_LINK_WORKSPACE_MATCH | event_modules/invite_accepted::build_projector_context | InvInviteAcceptedLinkWorkspace | projector_local |
 | CHK_PS_BOOTSTRAP_TRUST_CONSUME | state/db/transport_trust::consume_bootstrap_for_peer_shared | InvBootstrapTrustConsumedByPeerShared | transport_credential |
 | CHK_PS_PENDING_CONSUME | state/db/transport_trust::consume_bootstrap_for_peer_shared | InvPendingConsumedByPeerShared | transport_credential |
 | CHK_PS_PENDING_BOOTSTRAP_CONSUME | state/db/transport_trust::consume_bootstrap_for_peer_shared | InvPendingBootstrapTrustConsumedByPeerShared | transport_credential |

@@ -201,6 +201,11 @@ pub struct ContextSnapshot {
     /// UserInvite requires admin authority; DeviceInvite requires the signer's user.
     pub invite_authority_matches_signer: Option<bool>,
 
+    /// For InviteAccepted: external accepts must match the workspace_id
+    /// recorded from the accepted invite link. Local self-create remains
+    /// valid when invite_event_id == workspace_id.
+    pub invite_accepted_link_workspace_mismatch_reason: Option<String>,
+
     /// Whether this event was locally created (source = 'local' in recorded_events).
     /// Used to gate pending bootstrap trust writes: only locally-created invite
     /// events should write pending trust rows. Synced invite events on the

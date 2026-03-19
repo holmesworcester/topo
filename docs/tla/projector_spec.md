@@ -102,7 +102,7 @@ signer's user, not an admin event.
 | 6 | project_secret | secret_keys | — |
 | 7 | project_message_deletion | deleted_messages | author auth + cascade |
 | 8 | project_workspace | workspaces | TrustAnchorMatch guard |
-| 9 | project_invite_accepted | invites_accepted | writes accepted-binding row; emits RetryWorkspaceEvent + WriteAcceptedBootstrapTrust |
+| 9 | project_invite_accepted | invites_accepted | rejects when external accept lacks a matching local invite-link workspace binding; writes accepted-binding row; emits RetryWorkspaceEvent + WriteAcceptedBootstrapTrust |
 | 10 | project_user_invite | user_invites | bootstrap requires workspace signer+authority; peer-signed requires signer peer to resolve to claimed admin identity; emits WritePendingBootstrapTrust (gated by is_local_create) |
 | 11 | retired (code reserved) | — | rejected as unknown type |
 | 12 | project_device_invite | device_invites | bootstrap requires authority user == signer user; peer-signed requires signer peer to resolve to claimed admin identity; emits WritePendingBootstrapTrust (gated by is_local_create) |
@@ -286,6 +286,7 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 | InvSingleWorkspace | At most one workspace row per peer in workspaces table |
 | InvTrustAnchorImmutable | test_trust_anchor_immutability: accepted-workspace winner remains earliest `(created_at,event_id)` |
 | InvTrustAnchorSource | invite_accepted must be valid for accepted-binding rows to be set |
+| InvInviteAcceptedLinkWorkspace | external `invite_accepted.workspace_id` must match the locally accepted invite-link workspace for `invite_event_id`; self-create is allowed when `invite_event_id == workspace_id` |
 | InvBootstrapTrustSource | bootstrap transport trust (`invite_bootstrap_trust`) is derived only from valid `invite_accepted` |
 | InvBootstrapTrustMatchesCarried | bootstrap trust identity matches invite-carried bootstrap identity fields |
 | InvBootstrapTrustConsumedByPeerShared | bootstrap trust is consumed when equivalent PeerShared-derived trust appears |

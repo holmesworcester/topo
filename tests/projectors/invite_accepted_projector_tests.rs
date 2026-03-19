@@ -2,6 +2,7 @@
 //!
 //! TLA+ guards tested:
 //!   SPEC_ANCHOR_SOURCE_01   — InvTrustAnchorSource (invites_accepted written)
+//!   SPEC_IA_LINK_WORKSPACE_01 — InvInviteAcceptedLinkWorkspace (accept link matches workspace)
 //!   SPEC_BOOTSTRAP_TRUST_01 — InvBootstrapTrustSource (write/no-write)
 
 #[cfg(test)]
@@ -29,9 +30,19 @@ mod tests {
     fn test_invite_accepted_writes_workspace_binding() {
         let ws_id = [10u8; 32];
         let parsed = make_invite_accepted([5u8; 32], ws_id);
-        let ctx = empty_ctx(); // no existing anchor
+        let ctx = ctx_with_bootstrap(&b64(&ws_id), false);
 
         let result = project_pure(PEER, "event_ia_1", &parsed, &ctx);
+        assert_valid(&result);
+        assert_writes_to_table(&result, "invites_accepted");
+    }
+
+    #[test]
+    fn test_invite_accepted_allows_self_accept_without_bootstrap_context() {
+        let ws_id = [11u8; 32];
+        let parsed = make_invite_accepted(ws_id, ws_id);
+
+        let result = project_pure(PEER, "event_ia_self", &parsed, &empty_ctx());
         assert_valid(&result);
         assert_writes_to_table(&result, "invites_accepted");
     }
@@ -66,8 +77,8 @@ mod tests {
     #[test]
     fn test_invite_accepted_no_bootstrap_without_context() {
         let ws_id = [10u8; 32];
-        let parsed = make_invite_accepted([5u8; 32], ws_id);
-        let ctx = empty_ctx(); // no bootstrap context
+        let parsed = make_invite_accepted(ws_id, ws_id);
+        let ctx = empty_ctx(); // self-accept: no bootstrap context required
 
         let result = project_pure(PEER, "event_ia_3", &parsed, &ctx);
         assert_valid(&result);
@@ -84,6 +95,43 @@ mod tests {
                 }
             )
         });
+    }
+
+    #[test]
+    fn test_invite_accepted_rejects_missing_local_link_workspace_binding() {
+        let ws_id = [12u8; 32];
+        let parsed = make_invite_accepted([6u8; 32], ws_id);
+        let mut ctx = empty_ctx();
+        ctx.invite_accepted_link_workspace_mismatch_reason = Some(
+            "invite_accepted missing locally recorded invite-link workspace binding".to_string(),
+        );
+
+        let result = project_pure(PEER, "event_ia_missing_link", &parsed, &ctx);
+        assert_reject_contains(
+            &result,
+            "missing locally recorded invite-link workspace binding",
+        );
+        assert_no_write_to_table(&result, "invites_accepted");
+        assert_no_commands(&result);
+    }
+
+    #[test]
+    fn test_invite_accepted_rejects_local_link_workspace_mismatch() {
+        let ws_id = [13u8; 32];
+        let parsed = make_invite_accepted([7u8; 32], ws_id);
+        let mut ctx = ctx_with_bootstrap(&b64(&[14u8; 32]), false);
+        ctx.invite_accepted_link_workspace_mismatch_reason = Some(
+            "invite_accepted workspace_id does not match locally recorded invite-link workspace"
+                .to_string(),
+        );
+
+        let result = project_pure(PEER, "event_ia_mismatch", &parsed, &ctx);
+        assert_reject_contains(
+            &result,
+            "workspace_id does not match locally recorded invite-link workspace",
+        );
+        assert_no_write_to_table(&result, "invites_accepted");
+        assert_no_commands(&result);
     }
 
     #[test]
