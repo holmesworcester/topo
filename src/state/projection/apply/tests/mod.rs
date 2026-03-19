@@ -298,7 +298,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     project_one(conn, recorded_by, &uib_eid).unwrap();
 
     // 5. User (signed by invite key)
-    let user_key = SigningKey::from_bytes(&invite_key.to_bytes());
+    let user_key = SigningKey::generate(&mut rng);
     let user_pub = user_key.verifying_key().to_bytes();
     let ub = UserEvent {
         created_at_ms: now_ms(),
@@ -310,7 +310,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
     };
     let ub_event = ParsedEvent::User(ub);
     let mut ub_blob = events::encode_event(&ub_event).unwrap();
-    sign_blob(&user_key, &mut ub_blob);
+    sign_blob(&invite_key, &mut ub_blob);
     let ub_eid = insert_event_raw(conn, recorded_by, &ub_blob);
     project_one(conn, recorded_by, &ub_eid).unwrap();
 
@@ -410,7 +410,7 @@ fn build_identity_chain_deferred(
     let uib_eid = hash_event(&uib_blob);
 
     // 5. User (signed by invite key)
-    let user_key = SigningKey::from_bytes(&invite_key.to_bytes());
+    let user_key = SigningKey::generate(&mut rng);
     let user_pub = user_key.verifying_key().to_bytes();
     let ub = UserEvent {
         created_at_ms: now_ms(),
@@ -422,7 +422,7 @@ fn build_identity_chain_deferred(
     };
     let ub_event = ParsedEvent::User(ub);
     let mut ub_blob = events::encode_event(&ub_event).unwrap();
-    sign_blob(&user_key, &mut ub_blob);
+    sign_blob(&invite_key, &mut ub_blob);
     let ub_eid = hash_event(&ub_blob);
 
     // 6. DeviceInvite (signed by user key)
@@ -3104,7 +3104,7 @@ fn project_valid_user_from_invite(
     invite_key: &SigningKey,
     username: &str,
 ) -> (EventId, SigningKey) {
-    let user_key = SigningKey::from_bytes(&invite_key.to_bytes());
+    let user_key = SigningKey::generate(&mut rand::thread_rng());
     let user_event = ParsedEvent::User(crate::event_modules::UserEvent {
         created_at_ms: now_ms(),
         public_key: user_key.verifying_key().to_bytes(),
@@ -3114,7 +3114,7 @@ fn project_valid_user_from_invite(
         signature: [0u8; 64],
     });
     let mut user_blob = events::encode_event(&user_event).unwrap();
-    sign_blob(&user_key, &mut user_blob);
+    sign_blob(invite_key, &mut user_blob);
     let user_eid = insert_event_raw(conn, recorded_by, &user_blob);
     assert_eq!(
         project_one(conn, recorded_by, &user_eid).unwrap(),
@@ -3359,7 +3359,7 @@ fn test_admin_projects_with_workspace_signer_family() {
         ProjectionDecision::Valid
     );
 
-    let user_key = SigningKey::from_bytes(&invite_key.to_bytes());
+    let user_key = SigningKey::generate(&mut rng);
     let user_event = UserEvent {
         created_at_ms: now_ms(),
         public_key: user_key.verifying_key().to_bytes(),
@@ -3370,7 +3370,7 @@ fn test_admin_projects_with_workspace_signer_family() {
     };
     let user_parsed = ParsedEvent::User(user_event);
     let mut user_blob = events::encode_event(&user_parsed).unwrap();
-    sign_blob(&user_key, &mut user_blob);
+    sign_blob(&invite_key, &mut user_blob);
     let user_eid = insert_event_raw(&conn, recorded_by, &user_blob);
     assert_eq!(
         project_one(&conn, recorded_by, &user_eid).unwrap(),
@@ -4628,7 +4628,7 @@ fn test_file_slice_wrong_signer_rejected() {
     project_one(&conn, recorded_by, &uib_eid).unwrap();
 
     // 4. User (signed by invite key)
-    let user_key = SigningKey::from_bytes(&invite_key.to_bytes());
+    let user_key = SigningKey::generate(&mut rng);
     let user_pub = user_key.verifying_key().to_bytes();
     let ub = UserEvent {
         created_at_ms: now_ms(),
@@ -4640,7 +4640,7 @@ fn test_file_slice_wrong_signer_rejected() {
     };
     let ub_event = ParsedEvent::User(ub);
     let mut ub_blob = events::encode_event(&ub_event).unwrap();
-    sign_blob(&user_key, &mut ub_blob);
+    sign_blob(&invite_key, &mut ub_blob);
     let ub_eid = insert_event_raw(&conn, recorded_by, &ub_blob);
     project_one(&conn, recorded_by, &ub_eid).unwrap();
 
@@ -6424,7 +6424,7 @@ fn test_full_bootstrap_progression_from_projected_sql_state() {
     );
 
     // Step 4: Full identity chain completes
-    let user_key = SigningKey::from_bytes(&invite_key.to_bytes());
+    let user_key = SigningKey::generate(&mut rng);
     let user_pub = user_key.verifying_key().to_bytes();
     let ub = UserEvent {
         created_at_ms: now_ms(),
@@ -6436,7 +6436,7 @@ fn test_full_bootstrap_progression_from_projected_sql_state() {
     };
     let ub_event = ParsedEvent::User(ub);
     let mut ub_blob = events::encode_event(&ub_event).unwrap();
-    sign_blob(&user_key, &mut ub_blob);
+    sign_blob(&invite_key, &mut ub_blob);
     let ub_eid = insert_event_raw(&conn, recorded_by, &ub_blob);
     assert_eq!(
         project_one(&conn, recorded_by, &ub_eid).unwrap(),
