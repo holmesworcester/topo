@@ -3,19 +3,35 @@ use crate::db::wanted::WantedEvents;
 use crate::state::live_hints::{self, LiveHintEvent};
 use crate::state::shared_workspace_fanout::fanout_shared_event_enqueue;
 
-use super::drain::drain_project_queue_on_connection;
+use super::drain::{
+    drain_project_queue_once_on_connection, drain_project_queue_on_connection,
+};
 use super::phases::PersistPhaseOutput;
 
+const HOT_BACKLOG_PROJECT_DRAIN_BATCH_SIZE: usize = 64;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum PostCommitDrainMode {
+    Idle,
+    HotBacklog,
+}
+
 pub(super) trait PostCommitEffectsExecutor {
-    fn run_post_commit_effects(&self, persist_output: &PersistPhaseOutput, batch_size: usize);
+    fn run_post_commit_effects(
+        &self,
+        persist_output: &PersistPhaseOutput,
+        batch_size: usize,
+        drain_mode: PostCommitDrainMode,
+    );
 }
 
 pub(super) fn run_post_commit_effects<E: PostCommitEffectsExecutor>(
     executor: &E,
     persist_output: &PersistPhaseOutput,
     batch_size: usize,
+    drain_mode: PostCommitDrainMode,
 ) {
-    executor.run_post_commit_effects(persist_output, batch_size);
+    executor.run_post_commit_effects(persist_output, batch_size, drain_mode);
 }
 
 pub(super) struct SqlitePostCommitEffectsExecutor<'a> {
@@ -29,7 +45,12 @@ impl<'a> SqlitePostCommitEffectsExecutor<'a> {
 }
 
 impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
-    fn run_post_commit_effects(&self, persist_output: &PersistPhaseOutput, batch_size: usize) {
+    fn run_post_commit_effects(
+        &self,
+        persist_output: &PersistPhaseOutput,
+        batch_size: usize,
+        drain_mode: PostCommitDrainMode,
+    ) {
         let wanted = WantedEvents::new(self.db);
         let pq = ProjectQueue::new(self.db);
 
@@ -43,7 +64,17 @@ impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
         tenants.sort();
 
         for tenant_id in &tenants {
-            if let Err(e) = drain_project_queue_on_connection(self.db, tenant_id, batch_size) {
+            let drain_result = match drain_mode {
+                PostCommitDrainMode::Idle => {
+                    drain_project_queue_on_connection(self.db, tenant_id, batch_size)
+                }
+                PostCommitDrainMode::HotBacklog => drain_project_queue_once_on_connection(
+                    self.db,
+                    tenant_id,
+                    HOT_BACKLOG_PROJECT_DRAIN_BATCH_SIZE,
+                ),
+            };
+            if let Err(e) = drain_result {
                 tracing::warn!("project_queue drain error for {}: {}", tenant_id, e);
             }
 
@@ -59,19 +90,25 @@ impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
                 }
             }
 
-            match crate::event_modules::post_drain_hooks(self.db, tenant_id) {
-                Ok(count) if count > 0 => {
-                    tracing::info!(
-                        "post-drain hooks: tenant {} resolved {} item(s)",
-                        short_id(tenant_id),
-                        count
-                    );
-                }
-                Ok(_) => {}
-                Err(e) => {
-                    tracing::warn!("post-drain hooks failed for {}: {}", short_id(tenant_id), e)
+            if matches!(drain_mode, PostCommitDrainMode::Idle) {
+                match crate::event_modules::post_drain_hooks(self.db, tenant_id) {
+                    Ok(count) if count > 0 => {
+                        tracing::info!(
+                            "post-drain hooks: tenant {} resolved {} item(s)",
+                            short_id(tenant_id),
+                            count
+                        );
+                    }
+                    Ok(_) => {}
+                    Err(e) => {
+                        tracing::warn!("post-drain hooks failed for {}: {}", short_id(tenant_id), e)
+                    }
                 }
             }
+        }
+
+        if matches!(drain_mode, PostCommitDrainMode::HotBacklog) {
+            return;
         }
 
         // Load durably persisted fanout entries (written inside the
@@ -165,7 +202,12 @@ mod tests {
         };
         let executor = SqlitePostCommitEffectsExecutor::new(&conn);
 
-        run_post_commit_effects(&executor, &persist_output, 16);
+        run_post_commit_effects(
+            &executor,
+            &persist_output,
+            16,
+            PostCommitDrainMode::Idle,
+        );
 
         let wanted_count: i64 = conn
             .query_row(
@@ -208,7 +250,12 @@ mod tests {
         };
         let executor = SqlitePostCommitEffectsExecutor::new(&conn);
 
-        run_post_commit_effects(&executor, &persist_output, 8);
+        run_post_commit_effects(
+            &executor,
+            &persist_output,
+            8,
+            PostCommitDrainMode::Idle,
+        );
 
         let wanted_count: i64 = conn
             .query_row(
@@ -220,6 +267,61 @@ mod tests {
         assert_eq!(
             wanted_count, 0,
             "remove wanted should still run after prior command failure"
+        );
+    }
+
+    #[test]
+    fn event_pipeline_hot_backlog_mode_defers_full_projection_drain() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let wanted = WantedEvents::new(&conn);
+        let wanted_id = [11u8; 32];
+        wanted.insert(&wanted_id).unwrap();
+
+        for idx in 0..80 {
+            conn.execute(
+                "INSERT INTO project_queue (peer_id, event_id, available_at)
+                 VALUES (?1, ?2, 0)",
+                params!["tenant-a", format!("event-{idx:03}")],
+            )
+            .unwrap();
+        }
+
+        let persist_output = PersistPhaseOutput {
+            persisted_event_ids: vec![wanted_id],
+            tenants_seen: std::collections::HashSet::from(["tenant-a".to_string()]),
+            live_hints: Vec::new(),
+            shared_event_fanouts: Vec::new(),
+        };
+        let executor = SqlitePostCommitEffectsExecutor::new(&conn);
+
+        run_post_commit_effects(
+            &executor,
+            &persist_output,
+            16,
+            PostCommitDrainMode::HotBacklog,
+        );
+
+        let wanted_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM wanted_events WHERE id = ?1",
+                params![&wanted_id[..]],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(wanted_count, 0, "wanted rows should still clear in hot mode");
+
+        let remaining: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM project_queue WHERE peer_id = ?1",
+                params!["tenant-a"],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            remaining > 0,
+            "hot-backlog mode should leave projection backlog for the idle drain"
         );
     }
 
@@ -342,7 +444,12 @@ mod tests {
         };
         let executor = SqlitePostCommitEffectsExecutor::new(&conn);
 
-        run_post_commit_effects(&executor, &persist_output, 16);
+        run_post_commit_effects(
+            &executor,
+            &persist_output,
+            16,
+            PostCommitDrainMode::Idle,
+        );
 
         let sibling_count: i64 = conn
             .query_row(

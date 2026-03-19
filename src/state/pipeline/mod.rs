@@ -20,7 +20,8 @@ use crate::state::live_hints;
 use crate::tuning::{bulk_write_batch_cap, drain_batch_size, low_mem_mode, write_batch_cap};
 
 use self::effects::{
-    run_post_commit_effects, PostCommitEffectsExecutor, SqlitePostCommitEffectsExecutor,
+    run_post_commit_effects, PostCommitDrainMode, PostCommitEffectsExecutor,
+    SqlitePostCommitEffectsExecutor,
 };
 use self::phases::{run_persist_phase, PersistPhaseOutput};
 
@@ -72,10 +73,11 @@ fn commit_and_run_post_commit_effects<E: PostCommitEffectsExecutor>(
     persist_output: &PersistPhaseOutput,
     effects_executor: &E,
     batch_size: usize,
+    drain_mode: PostCommitDrainMode,
 ) -> rusqlite::Result<()> {
     db.execute("COMMIT", [])?;
     live_hints::publish_from_connection(db, &persist_output.live_hints);
-    run_post_commit_tail(persist_output, effects_executor, batch_size, || {
+    run_post_commit_tail(persist_output, effects_executor, batch_size, drain_mode, || {
         enforce_low_mem_wal_cap(db)
     });
     Ok(())
@@ -85,6 +87,7 @@ fn run_post_commit_tail<E, F>(
     persist_output: &PersistPhaseOutput,
     effects_executor: &E,
     batch_size: usize,
+    drain_mode: PostCommitDrainMode,
     wal_cap_check: F,
 ) where
     E: PostCommitEffectsExecutor,
@@ -93,7 +96,7 @@ fn run_post_commit_tail<E, F>(
     if let Err(e) = wal_cap_check() {
         tracing::warn!("post-commit WAL cap check failed: {}", e);
     }
-    run_post_commit_effects(effects_executor, persist_output, batch_size);
+    run_post_commit_effects(effects_executor, persist_output, batch_size, drain_mode);
 }
 
 fn low_mem_wal_cap_bytes() -> i64 {
@@ -161,6 +164,7 @@ pub fn batch_writer(
     mut rx: mpsc::Receiver<IngestItem>,
     events_received: Arc<AtomicU64>,
 ) {
+    let mut prefetched_first: Option<IngestItem> = None;
     let db = match open_connection(&db_path) {
         Ok(db) => db,
         Err(e) => {
@@ -222,9 +226,12 @@ pub fn batch_writer(
     }
 
     loop {
-        let first = match rx.blocking_recv() {
+        let first = match prefetched_first.take() {
             Some(item) => item,
-            None => break,
+            None => match rx.blocking_recv() {
+                Some(item) => item,
+                None => break,
+            },
         };
 
         let mut batch = vec![first];
@@ -236,6 +243,18 @@ pub fn batch_writer(
             }
         }
         sort_ingest_batch(&mut batch);
+        let hot_backlog = if batch.len() >= cap {
+            match rx.try_recv() {
+                Ok(item) => {
+                    prefetched_first = Some(item);
+                    true
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => false,
+            }
+        } else {
+            false
+        };
 
         let batch_len = batch.len();
 
@@ -285,6 +304,11 @@ pub fn batch_writer(
             &persist_output,
             &effects_executor,
             drain_batch_size(),
+            if hot_backlog {
+                PostCommitDrainMode::HotBacklog
+            } else {
+                PostCommitDrainMode::Idle
+            },
         ) {
             Ok(()) => {}
             Err(e) => {
@@ -324,21 +348,26 @@ mod tests {
     use std::cell::RefCell;
     use std::collections::HashSet;
 
-    use super::effects::PostCommitEffectsExecutor;
+    use super::effects::{PostCommitDrainMode, PostCommitEffectsExecutor};
     use super::phases::PersistPhaseOutput;
     use super::*;
     use crate::event_modules::{EVENT_TYPE_FILE_SLICE, EVENT_TYPE_MESSAGE};
 
     #[derive(Default)]
     struct RecordingExecutor {
-        invocations: RefCell<Vec<(PersistPhaseOutput, usize)>>,
+        invocations: RefCell<Vec<(PersistPhaseOutput, usize, PostCommitDrainMode)>>,
     }
 
     impl PostCommitEffectsExecutor for RecordingExecutor {
-        fn run_post_commit_effects(&self, persist_output: &PersistPhaseOutput, batch_size: usize) {
+        fn run_post_commit_effects(
+            &self,
+            persist_output: &PersistPhaseOutput,
+            batch_size: usize,
+            drain_mode: PostCommitDrainMode,
+        ) {
             self.invocations
                 .borrow_mut()
-                .push((persist_output.clone(), batch_size));
+                .push((persist_output.clone(), batch_size, drain_mode));
         }
     }
 
@@ -369,7 +398,13 @@ mod tests {
         let executor = RecordingExecutor::default();
         let persist_output = sample_persist_output();
 
-        let result = commit_and_run_post_commit_effects(&db, &persist_output, &executor, 8);
+        let result = commit_and_run_post_commit_effects(
+            &db,
+            &persist_output,
+            &executor,
+            8,
+            PostCommitDrainMode::Idle,
+        );
         assert!(
             result.is_err(),
             "commit should fail without active transaction"
@@ -388,11 +423,18 @@ mod tests {
         let executor = RecordingExecutor::default();
         let persist_output = sample_persist_output();
 
-        commit_and_run_post_commit_effects(&db, &persist_output, &executor, 16).unwrap();
+        commit_and_run_post_commit_effects(
+            &db,
+            &persist_output,
+            &executor,
+            16,
+            PostCommitDrainMode::Idle,
+        )
+        .unwrap();
 
         let invocations = executor.invocations.borrow();
         assert_eq!(invocations.len(), 1, "effects should run once after commit");
-        let (recorded_output, recorded_batch_size) = &invocations[0];
+        let (recorded_output, recorded_batch_size, recorded_drain_mode) = &invocations[0];
         assert_eq!(
             recorded_output, &persist_output,
             "effects should receive persist output directly"
@@ -401,6 +443,11 @@ mod tests {
             *recorded_batch_size, 16,
             "effects should receive batch size"
         );
+        assert_eq!(
+            *recorded_drain_mode,
+            PostCommitDrainMode::Idle,
+            "effects should receive drain mode"
+        );
     }
 
     #[test]
@@ -408,7 +455,7 @@ mod tests {
         let executor = RecordingExecutor::default();
         let persist_output = sample_persist_output();
 
-        run_post_commit_tail(&persist_output, &executor, 8, || {
+        run_post_commit_tail(&persist_output, &executor, 8, PostCommitDrainMode::Idle, || {
             Err(rusqlite::Error::InvalidQuery)
         });
 
@@ -418,9 +465,10 @@ mod tests {
             1,
             "effects should still run after advisory WAL-cap failure"
         );
-        let (recorded_output, recorded_batch_size) = &invocations[0];
+        let (recorded_output, recorded_batch_size, recorded_drain_mode) = &invocations[0];
         assert_eq!(recorded_output, &persist_output);
         assert_eq!(*recorded_batch_size, 8);
+        assert_eq!(*recorded_drain_mode, PostCommitDrainMode::Idle);
     }
 
     #[test]

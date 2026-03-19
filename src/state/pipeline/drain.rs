@@ -52,3 +52,39 @@ pub(super) fn drain_project_queue_on_connection(
 
     result
 }
+
+pub(super) fn drain_project_queue_once_on_connection(
+    db: &rusqlite::Connection,
+    tenant_id: &str,
+    batch_size: usize,
+) -> rusqlite::Result<usize> {
+    if batch_size == 0 {
+        return Ok(0);
+    }
+
+    let pq = ProjectQueue::new(db);
+    let tenant = tenant_id.to_string();
+    let batch = pq.claim_batch(&tenant, batch_size, 30_000)?;
+    if batch.is_empty() {
+        return Ok(0);
+    }
+
+    let mut succeeded_ids: Vec<&str> = Vec::new();
+    for event_id_b64 in &batch {
+        match event_id_from_base64(event_id_b64) {
+            Some(event_id) => match project_one(db, &tenant, &event_id) {
+                Ok(_) => succeeded_ids.push(event_id_b64),
+                Err(_) => {
+                    let _ = pq.mark_retry(&tenant, event_id_b64);
+                }
+            },
+            None => succeeded_ids.push(event_id_b64),
+        }
+    }
+
+    if !succeeded_ids.is_empty() {
+        pq.mark_done_batch(&tenant, &succeeded_ids)?;
+    }
+
+    Ok(succeeded_ids.len())
+}

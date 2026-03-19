@@ -3,13 +3,13 @@
 use std::net::{Ipv4Addr, SocketAddr};
 use std::path::PathBuf;
 use std::thread;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use crate::cli_harness::{
-    accept_invite_with_identity_on_running_daemon, assert_eventually, create_invite_with_spki,
-    daemon_listen_addr, daemon_transport_fingerprint, ensure_active_peer, generate_messages,
-    message_count_sql, peak_rss_mib_for_pid, random_port, send_message, start_daemon_with_options,
-    stop_daemon, topo_cmd, wait_for_active_tenant_ready,
+    accept_invite_with_identity_on_running_daemon, active_tenant_peer_id, assert_eventually,
+    create_invite_with_spki, daemon_listen_addr, daemon_transport_fingerprint, ensure_active_peer,
+    generate_messages, message_count_sql, peak_rss_mib_for_pid, random_port, send_message,
+    start_daemon_with_options, stop_daemon, topo_cmd, wait_for_active_tenant_ready,
     wait_for_endpoint_observation, wait_for_daemon_stopped,
     DaemonOptions, HarnessDaemon,
 };
@@ -57,6 +57,7 @@ pub struct SharedWorkspaceBench {
     alice_transport_peer_id: String,
     bob_daemon: HarnessDaemon,
     bob_pid: u32,
+    bob_bind_addr: Option<SocketAddr>,
     alice_disable_placeholder_autodial: bool,
     bob_disable_placeholder_autodial: bool,
     activate_after_warmup: Option<BenchReadyHook>,
@@ -171,6 +172,7 @@ impl SharedWorkspaceBench {
             alice_transport_peer_id,
             bob_daemon,
             bob_pid,
+            bob_bind_addr: use_fixed_bob_bind.then_some(bob_bind_addr),
             alice_disable_placeholder_autodial: true,
             bob_disable_placeholder_autodial: network_path.disable_bob_placeholder_autodial,
             activate_after_warmup: network_path.activate_after_ready,
@@ -238,6 +240,21 @@ impl SharedWorkspaceBench {
             ensure_active_peer(&self.bob_db, Duration::from_secs(10));
         }
     }
+
+    pub fn stop_bob_daemon(&mut self) {
+        stop_daemon(&self.bob_db, &mut self.bob_daemon);
+    }
+
+    pub fn restart_bob_daemon(&mut self) {
+        self.bob_daemon = start_perf_daemon(
+            &self.bob_db,
+            &self.tmpdir_path,
+            "bob-restart",
+            self.bob_disable_placeholder_autodial,
+            self.bob_bind_addr,
+        );
+        self.bob_pid = self.bob_daemon.child().id();
+    }
 }
 
 impl Drop for SharedWorkspaceBench {
@@ -266,6 +283,28 @@ pub struct PerfMeasurement {
     pub alice_rss: f64,
     pub bob_rss: f64,
     pub max_rss: f64,
+}
+
+pub struct DurableCatchupMeasurement {
+    pub all_durable_wall_secs: f64,
+    pub all_projected_wall_secs: f64,
+    pub first_durable_delay_ms: i64,
+    pub first_projected_delay_ms: i64,
+    pub durable_to_projected_tail_ms: i64,
+    pub generate_secs: f64,
+    pub messages: i64,
+    pub durable_msgs_per_sec: f64,
+    pub projected_msgs_per_sec: f64,
+    pub alice_rss: f64,
+    pub bob_rss: f64,
+    pub max_rss: f64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct RecordedEventsWindow {
+    count: i64,
+    first_recorded_at: Option<i64>,
+    last_recorded_at: Option<i64>,
 }
 
 pub fn run_one_way_sync<F>(
@@ -400,12 +439,135 @@ where
     }
 }
 
+pub fn run_preloaded_durable_catchup<F>(
+    message_count: i64,
+    warm_timeout: Duration,
+    source_settle_timeout: Duration,
+    catchup_timeout: Duration,
+    configure_network: F,
+) -> DurableCatchupMeasurement
+where
+    F: FnOnce(String, String) -> BenchNetworkPath,
+{
+    let mut bench = SharedWorkspaceBench::new_with_network(configure_network);
+    if bench.has_pending_network_profile_activation() {
+        bench.stabilize_bootstrap_joiner(warm_timeout);
+    }
+    bench.activate_network_profile();
+
+    let bob_message_baseline = bench.warm_one_way(warm_timeout);
+    let alice_message_baseline = message_count_sql(&bench.alice_db);
+    let bob_recorded_by = active_recorded_by(&bench.bob_db);
+    let bob_recorded_high_watermark =
+        recorded_events_max_id(&bench.bob_db, &bob_recorded_by);
+
+    bench.stop_bob_daemon();
+
+    let generate_start = Instant::now();
+    generate_messages_offline(&bench.alice_db, message_count as usize);
+    let generate_secs = generate_start.elapsed().as_secs_f64();
+    wait_for_message_count(
+        &bench.alice_db,
+        alice_message_baseline + message_count,
+        source_settle_timeout,
+    );
+
+    let catchup_start_ms = current_timestamp_ms();
+    let catchup_start = Instant::now();
+    bench.restart_bob_daemon();
+
+    let first_projected_at_ms = wait_for_message_count_at_least(
+        &bench.bob_db,
+        bob_message_baseline + 1,
+        catchup_timeout,
+    );
+
+    wait_for_recorded_events_delta(
+        &bench.bob_db,
+        &bob_recorded_by,
+        bob_recorded_high_watermark,
+        message_count,
+        catchup_timeout,
+    );
+    let all_durable_wall_secs = catchup_start.elapsed().as_secs_f64();
+    let recorded_window = recorded_events_window_after_id(
+        &bench.bob_db,
+        &bob_recorded_by,
+        bob_recorded_high_watermark,
+    );
+    assert!(
+        recorded_window.count >= message_count,
+        "durable catchup recorded too few events: expected at least {}, actual {}",
+        message_count,
+        recorded_window.count,
+    );
+
+    wait_for_message_count(
+        &bench.bob_db,
+        bob_message_baseline + message_count,
+        catchup_timeout,
+    );
+    let all_projected_wall_secs = catchup_start.elapsed().as_secs_f64();
+
+    let first_recorded_at = recorded_window
+        .first_recorded_at
+        .expect("durable catchup missing first recorded_at");
+    let first_durable_delay_ms = first_recorded_at.saturating_sub(catchup_start_ms);
+    let first_projected_delay_ms = first_projected_at_ms.saturating_sub(catchup_start_ms);
+    let durable_to_projected_tail_ms = ((all_projected_wall_secs - all_durable_wall_secs).max(0.0)
+        * 1000.0)
+        .round() as i64;
+
+    let (alice_rss, bob_rss, max_rss) = bench.daemon_rss();
+    let durable_msgs_per_sec = message_count as f64 / all_durable_wall_secs.max(0.001);
+    let projected_msgs_per_sec = message_count as f64 / all_projected_wall_secs.max(0.001);
+
+    DurableCatchupMeasurement {
+        all_durable_wall_secs,
+        all_projected_wall_secs,
+        first_durable_delay_ms,
+        first_projected_delay_ms,
+        durable_to_projected_tail_ms,
+        generate_secs,
+        messages: message_count,
+        durable_msgs_per_sec,
+        projected_msgs_per_sec,
+        alice_rss,
+        bob_rss,
+        max_rss,
+    }
+}
+
 pub fn emit_summary(summary_key: &str, title: &str, measurement: &PerfMeasurement) {
     let summary = format!(
         "=== {title} ===\n  Wall time:    {wall_secs:.2}s\n  Messages:     {messages}\n  Msgs/s:       {msgs_per_sec:.0}\n  Peak RSS:     {max_rss:.1} MiB (max daemon VmHWM)\n  Alice peak RSS: {alice_rss:.1} MiB\n  Bob peak RSS:   {bob_rss:.1} MiB\n",
         wall_secs = measurement.wall_secs,
         messages = measurement.messages,
         msgs_per_sec = measurement.msgs_per_sec,
+        max_rss = measurement.max_rss,
+        alice_rss = measurement.alice_rss,
+        bob_rss = measurement.bob_rss,
+    );
+    eprintln!("\n{summary}");
+    write_summary(summary_key, &summary);
+}
+
+pub fn emit_durable_summary(
+    summary_key: &str,
+    title: &str,
+    measurement: &DurableCatchupMeasurement,
+) {
+    let summary = format!(
+        "=== {title} ===\n  First durable:   {first_durable_delay_ms} ms after restart\n  All durable:     {all_durable_wall_secs:.2}s after restart\n  First projected: {first_projected_delay_ms} ms after restart\n  All projected:   {all_projected_wall_secs:.2}s after restart\n  Durable tail:    {durable_to_projected_tail_ms} ms (all durable -> all projected)\n  Generate time:   {generate_secs:.2}s (untimed preload)\n  Messages:        {messages}\n  Durable msgs/s:  {durable_msgs_per_sec:.0}\n  Projected msgs/s:{projected_msgs_per_sec:>6.0}\n  Peak RSS:        {max_rss:.1} MiB (max daemon VmHWM)\n  Alice peak RSS:  {alice_rss:.1} MiB\n  Bob peak RSS:    {bob_rss:.1} MiB\n",
+        first_durable_delay_ms = measurement.first_durable_delay_ms,
+        all_durable_wall_secs = measurement.all_durable_wall_secs,
+        first_projected_delay_ms = measurement.first_projected_delay_ms,
+        all_projected_wall_secs = measurement.all_projected_wall_secs,
+        durable_to_projected_tail_ms = measurement.durable_to_projected_tail_ms,
+        generate_secs = measurement.generate_secs,
+        messages = measurement.messages,
+        durable_msgs_per_sec = measurement.durable_msgs_per_sec,
+        projected_msgs_per_sec = measurement.projected_msgs_per_sec,
         max_rss = measurement.max_rss,
         alice_rss = measurement.alice_rss,
         bob_rss = measurement.bob_rss,
@@ -500,6 +662,26 @@ fn wait_for_message_count(db: &str, expected: i64, timeout: Duration) {
             timeout,
             db,
             expected,
+            count,
+            format_bench_diagnostics(db)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_message_count_at_least(db: &str, expected_min: i64, timeout: Duration) -> i64 {
+    let start = Instant::now();
+    loop {
+        let count = message_count_sql(db);
+        if count >= expected_min {
+            return current_timestamp_ms();
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "message_count>= timed out after {:?} for db={}: expected_at_least={}, actual={}\n{}",
+            timeout,
+            db,
+            expected_min,
             count,
             format_bench_diagnostics(db)
         );
@@ -670,4 +852,83 @@ fn format_bench_diagnostics(db: &str) -> String {
     }
 
     out
+}
+
+fn current_timestamp_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_millis() as i64
+}
+
+fn active_recorded_by(db: &str) -> String {
+    active_tenant_peer_id(db).unwrap_or_else(|| panic!("no active tenant for {}", db))
+}
+
+fn generate_messages_offline(db: &str, count: usize) {
+    let output = topo_cmd(db, &["generate", "--count", &count.to_string()]);
+    assert!(
+        output.status.success(),
+        "offline generate failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+}
+
+fn recorded_events_max_id(db: &str, recorded_by: &str) -> i64 {
+    let conn = rusqlite::Connection::open(db).expect("open db for recorded_events_max_id");
+    conn.query_row(
+        "SELECT COALESCE(MAX(id), 0) FROM recorded_events WHERE peer_id = ?1",
+        rusqlite::params![recorded_by],
+        |row| row.get(0),
+    )
+    .expect("query recorded_events max id")
+}
+
+fn recorded_events_window_after_id(
+    db: &str,
+    recorded_by: &str,
+    after_id: i64,
+) -> RecordedEventsWindow {
+    let conn = rusqlite::Connection::open(db).expect("open db for recorded_events_window_after_id");
+    conn.query_row(
+        "SELECT COUNT(*), MIN(recorded_at), MAX(recorded_at)
+         FROM recorded_events
+         WHERE peer_id = ?1 AND id > ?2",
+        rusqlite::params![recorded_by, after_id],
+        |row| {
+            Ok(RecordedEventsWindow {
+                count: row.get(0)?,
+                first_recorded_at: row.get(1)?,
+                last_recorded_at: row.get(2)?,
+            })
+        },
+    )
+    .expect("query recorded_events window")
+}
+
+fn wait_for_recorded_events_delta(
+    db: &str,
+    recorded_by: &str,
+    after_id: i64,
+    expected_delta: i64,
+    timeout: Duration,
+) {
+    let start = Instant::now();
+    loop {
+        let window = recorded_events_window_after_id(db, recorded_by, after_id);
+        if window.count >= expected_delta {
+            return;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "recorded_events delta timed out after {:?} for db={}: expected_delta={}, actual_delta={}\n{}",
+            timeout,
+            db,
+            expected_delta,
+            window.count,
+            format_bench_diagnostics(db)
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
 }
