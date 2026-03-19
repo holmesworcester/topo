@@ -36,6 +36,7 @@ fn bootstrap_transport_target_set_and_survives_replay() {
 
     // Create invite_accepted referencing the invite.
     let workspace_id = [0x77u8; 32];
+    alice.record_invite_link_workspace(&invite_event_id, workspace_id);
     alice.create_invite_accepted(&invite_event_id, workspace_id);
 
     // Explicit assertion before replay: bootstrap transport target must be set.
@@ -92,7 +93,10 @@ fn peershared_transport_target_set_and_survives_replay() {
         "peershared transport target must be set after create_workspace"
     );
     let initial_peer_id = target.unwrap().transport_peer_id;
-    assert!(!initial_peer_id.is_empty(), "transport_peer_id must be non-empty");
+    assert!(
+        !initial_peer_id.is_empty(),
+        "transport_peer_id must be non-empty"
+    );
     // PeerShared peer_id should match alice.identity (derived from peer_shared key).
     assert_eq!(
         initial_peer_id, alice.identity,

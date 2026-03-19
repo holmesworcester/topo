@@ -350,6 +350,7 @@ fn test_out_of_order_identity() {
 
     // Create InviteAccepted → sets trust anchor, triggers retry_guard_blocked_events
     // which re-projects Workspace → Valid → cascades UserInvite → Valid → cascades User → Valid
+    alice.record_invite_link_workspace(&user_invite_eid, workspace_id);
     let _ia_eid = alice.create_invite_accepted(&user_invite_eid, workspace_id);
 
     // Assert full cascade completed — User should now be valid
@@ -892,8 +893,9 @@ fn test_identity_replay_invariants() {
 // Phase 7 logic fixes: corrected guard and binding semantics
 // =============================================================================
 
-/// invite_accepted projects without any prior invite event recorded.
-/// This verifies the HasRecordedInvite guard has been removed.
+/// invite_accepted still does not require the shared invite event to be
+/// recorded locally, but it must match the locally accepted invite-link
+/// workspace binding.
 #[test]
 fn test_invite_accepted_no_prior_invite_required() {
     let alice = Peer::new("alice");
@@ -905,7 +907,9 @@ fn test_invite_accepted_no_prior_invite_required() {
     let fake_invite_eid: [u8; 32] = rand::random();
 
     // Create invite_accepted BEFORE any invite event exists.
-    // Under old semantics this would Block; under corrected semantics it should project.
+    // The invite event itself is still absent, but the accepted invite-link
+    // workspace binding is present locally.
+    alice.record_invite_link_workspace(&fake_invite_eid, workspace_id);
     let ia_eid = alice.create_invite_accepted(&fake_invite_eid, workspace_id);
 
     let ia_b64 = event_id_to_base64(&ia_eid);
@@ -958,6 +962,7 @@ fn test_trust_anchor_immutability() {
     let fake_invite_2: [u8; 32] = rand::random();
 
     // First invite_accepted sets the trust anchor
+    alice.record_invite_link_workspace(&fake_invite_1, workspace_id_1);
     let ia1_eid = alice.create_invite_accepted(&fake_invite_1, workspace_id_1);
     let ia1_b64 = event_id_to_base64(&ia1_eid);
     let valid1: bool = db
@@ -971,6 +976,7 @@ fn test_trust_anchor_immutability() {
 
     // Second invite_accepted with different workspace_id should still project;
     // the winner is determined when reading invites_accepted.
+    alice.record_invite_link_workspace(&fake_invite_2, workspace_id_2);
     let ia2_eid = alice.create_invite_accepted(&fake_invite_2, workspace_id_2);
     let ia2_b64 = event_id_to_base64(&ia2_eid);
     let valid2: bool = db
@@ -1091,6 +1097,7 @@ fn test_true_out_of_order_identity_chain() {
     let invite_pubkey = invite_key.verifying_key().to_bytes();
 
     let dummy_invite_eid = [42u8; 32];
+    alice.record_invite_link_workspace(&dummy_invite_eid, workspace_id);
     let ia_eid = alice.create_invite_accepted(&dummy_invite_eid, workspace_id);
 
     let ia_b64 = event_id_to_base64(&ia_eid);

@@ -240,6 +240,25 @@ fn setup_tenant_event(conn: &Connection, recorded_by: &str) -> EventId {
     create_event_synchronous(conn, recorded_by, &tenant_event).unwrap()
 }
 
+fn append_invite_link_workspace_context(
+    conn: &Connection,
+    recorded_by: &str,
+    invite_event_id: EventId,
+    workspace_id: EventId,
+) {
+    let invite_event_id_b64 = event_id_to_base64(&invite_event_id);
+    let workspace_id_b64 = event_id_to_base64(&workspace_id);
+    crate::db::transport_trust::append_bootstrap_context(
+        conn,
+        recorded_by,
+        &invite_event_id_b64,
+        &workspace_id_b64,
+        "",
+        &[0xAB; 32],
+    )
+    .unwrap();
+}
+
 /// Create a minimal identity chain and return (peer_shared_event_id, signing_key).
 /// Uses the normal create helpers for the happy path so fixture signing and
 /// projection match production behavior.
@@ -6038,9 +6057,11 @@ fn test_invite_accepted_requires_tenant_not_workspace() {
     let tenant_event_id = setup_tenant_event(&conn, recorded_by);
 
     // Create InviteAccepted pointing to a workspace_id that does NOT exist
-    // in the events table at all. It should still project Valid.
+    // in the events table at all. A matching local invite-link workspace
+    // binding should still allow it to project Valid.
     let fake_workspace_id = [0xBB; 32];
     let fake_invite_eid = [0xCC; 32];
+    append_invite_link_workspace_context(&conn, recorded_by, fake_invite_eid, fake_workspace_id);
     let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
         tenant_event_id,
@@ -6081,6 +6102,52 @@ fn test_invite_accepted_requires_tenant_not_workspace() {
         )
         .unwrap();
     assert_eq!(ia_count, 1, "invites_accepted projection row must exist");
+}
+
+#[test]
+fn test_invite_accepted_rejects_missing_local_link_workspace_binding() {
+    let conn = setup();
+    let recorded_by = "peer1";
+
+    let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
+        created_at_ms: now_ms(),
+        tenant_event_id: setup_tenant_event(&conn, recorded_by),
+        invite_event_id: [0xC2; 32],
+        workspace_id: [0xB2; 32],
+    });
+    let ia_blob = events::encode_event(&ia_event).unwrap();
+
+    assert_projection_rejection_contains(
+        &conn,
+        recorded_by,
+        &ia_blob,
+        "missing locally recorded invite-link workspace binding",
+    );
+}
+
+#[test]
+fn test_invite_accepted_rejects_local_link_workspace_mismatch() {
+    let conn = setup();
+    let recorded_by = "peer1";
+    let invite_event_id = [0xC3; 32];
+    let workspace_id = [0xB3; 32];
+
+    append_invite_link_workspace_context(&conn, recorded_by, invite_event_id, [0xD3; 32]);
+
+    let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
+        created_at_ms: now_ms(),
+        tenant_event_id: setup_tenant_event(&conn, recorded_by),
+        invite_event_id,
+        workspace_id,
+    });
+    let ia_blob = events::encode_event(&ia_event).unwrap();
+
+    assert_projection_rejection_contains(
+        &conn,
+        recorded_by,
+        &ia_blob,
+        "workspace_id does not match locally recorded invite-link workspace",
+    );
 }
 
 /// Target semantics 2: Bootstrap trust rows are materialized from projection
@@ -6598,6 +6665,7 @@ fn test_invite_accepted_same_workspace_binding_is_scoped_per_tenant() {
     let shared_workspace_b64 = event_id_to_base64(&shared_workspace_id);
 
     for (tenant, invite_event_id) in [("tenant_a", [0xC1; 32]), ("tenant_b", [0xC2; 32])] {
+        append_invite_link_workspace_context(&conn, tenant, invite_event_id, shared_workspace_id);
         let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
             created_at_ms: now_ms(),
             tenant_event_id: setup_tenant_event(&conn, tenant),

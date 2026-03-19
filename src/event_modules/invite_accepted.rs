@@ -148,6 +148,7 @@ pub fn build_projector_context(
 
     let mut ctx = ContextSnapshot::default();
     let invite_event_id_b64 = event_id_to_base64(&ia.invite_event_id);
+    let workspace_id_b64 = event_id_to_base64(&ia.workspace_id);
 
     let has_local_invite_secret: bool = conn
         .query_row(
@@ -170,6 +171,12 @@ pub fn build_projector_context(
         crate::db::transport_trust::read_bootstrap_context(conn, recorded_by, &invite_event_id_b64)
             .map_err(|e| -> Box<dyn std::error::Error> { e })?
     {
+        if bc.workspace_id != workspace_id_b64 {
+            ctx.invite_accepted_link_workspace_mismatch_reason = Some(
+                "invite_accepted workspace_id does not match locally recorded invite-link workspace"
+                    .to_string(),
+            );
+        }
         ctx.bootstrap_spki_already_peer_shared =
             bootstrap_spki_already_peer_shared(conn, recorded_by, &bc.bootstrap_spki_fingerprint)?;
         ctx.bootstrap_context = Some(crate::projection::contract::BootstrapContextSnapshot {
@@ -177,6 +184,10 @@ pub fn build_projector_context(
             bootstrap_addrs: bc.bootstrap_addrs,
             bootstrap_spki_fingerprint: bc.bootstrap_spki_fingerprint,
         });
+    } else if ia.invite_event_id != ia.workspace_id {
+        ctx.invite_accepted_link_workspace_mismatch_reason = Some(
+            "invite_accepted missing locally recorded invite-link workspace binding".to_string(),
+        );
     }
 
     Ok(ctx)
@@ -201,6 +212,10 @@ pub fn project_pure(
         ParsedEvent::InviteAccepted(a) => a,
         _ => return ProjectorResult::reject("not an invite_accepted event".to_string()),
     };
+
+    if let Some(reason) = &ctx.invite_accepted_link_workspace_mismatch_reason {
+        return ProjectorResult::reject(reason.clone());
+    }
 
     let invite_eid_b64 = event_id_to_base64(&ia.invite_event_id);
     let workspace_id_b64 = event_id_to_base64(&ia.workspace_id);

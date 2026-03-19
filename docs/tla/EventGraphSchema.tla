@@ -19,7 +19,8 @@ EXTENDS Naturals, FiniteSets
 \*
 \* Workspace binding refinement:
 \*   Workspace events are parameterized by workspace id.
-\*   invite_accepted binds trustAnchor directly from its own workspace_id field.
+\*   invite_accepted binds trustAnchor from the locally accepted invite-link
+\*   workspace (or self-create when invite_event_id == workspace_id).
 \*   Model approximation: trustAnchor is a single first-write-wins value, so
 \*   conflicting invite_accepted cannot change it (modeled as reject/no-op).
 \*   Runtime stores all rows in invites_accepted and resolves winner at read time
@@ -310,10 +311,9 @@ Init ==
     /\ peerSharedTrustPeer = [p \in Peers |-> "none"]
     /\ connState = [p \in Peers |-> "none"]
 
-\* Record captures the event-carried workspace_id at ingress time.
-\* For invite_accepted, the event carries a specific workspace_id chosen
-\* nondeterministically here (models the fact that any workspace could be
-\* referenced). The choice is fixed at record time, not projection time.
+\* Record captures the accepted invite-link workspace at ingress time.
+\* For invite_accepted, the local accept flow fixes a specific workspace_id
+\* before projection. The choice is fixed at record time, not projection time.
 Record(p, e) ==
     /\ p \in Peers
     /\ e \in EVENTS
@@ -350,7 +350,7 @@ Record(p, e) ==
        ELSE UNCHANGED peerSharedDerivedPeer
     /\ UNCHANGED <<valid, trustAnchor, bootstrapTrustPeer, peerSharedTrustPeer, connState>>
 
-\* invite_accepted binds the trust anchor from its event-carried workspace_id.
+\* invite_accepted binds the trust anchor from its accepted invite-link workspace.
 \* First-write-wins: if trust anchor is already set to a different workspace,
 \* invite_accepted is rejected (cannot project).
 Project(p, e) ==

@@ -1248,6 +1248,23 @@ impl Peer {
         create_event_synchronous(&db, &self.identity, &ws)
     }
 
+    /// Record the local invite-link workspace binding that InviteAccepted
+    /// projection uses to self-validate external accepts in tests.
+    pub fn record_invite_link_workspace(&self, invite_event_id: &EventId, workspace_id: [u8; 32]) {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let invite_event_id_b64 = event_id_to_base64(invite_event_id);
+        let workspace_id_b64 = event_id_to_base64(&workspace_id);
+        crate::db::transport_trust::append_bootstrap_context(
+            &db,
+            &self.identity,
+            &invite_event_id_b64,
+            &workspace_id_b64,
+            "",
+            &[0xAB; 32],
+        )
+        .expect("failed to record invite-link workspace binding");
+    }
+
     /// Create an InviteAccepted event (local). Returns the event ID.
     pub fn create_invite_accepted(
         &self,

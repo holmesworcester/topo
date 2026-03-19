@@ -31,10 +31,17 @@ both `pass` and `break` polarity unless waived.
 | SPEC_ANCHOR_IMMUTABLE_01 | InvTrustAnchorImmutable | CHK_IA_TRUST_ANCHOR_CONFLICT | scenario_integration | identity::test_trust_anchor_immutability | break |
 | SPEC_ANCHOR_IMMUTABLE_01 | InvTrustAnchorImmutable | CHK_IA_WINNER_ORDER | scenario_integration | identity::test_trust_anchor_immutability | break |
 | SPEC_ANCHOR_SOURCE_01 | InvTrustAnchorSource | CHK_IA_TRUST_ANCHOR_WRITE | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_writes_workspace_binding | pass |
+| SPEC_ANCHOR_SOURCE_01 | InvTrustAnchorSource | CHK_IA_ANCHOR_SOURCE | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_writes_workspace_binding | pass |
 | SPEC_ANCHOR_SOURCE_01 | InvTrustAnchorSource | CHK_WS_TRUST_ANCHOR_BLOCK | projector_unit | workspace_projector_tests::tests::test_workspace_blocks_without_trust_anchor | break |
 | SPEC_BOOTSTRAP_TRUST_01 | InvBootstrapTrustSource | CHK_IA_BOOTSTRAP_TRUST | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_writes_bootstrap_trust | pass |
 | SPEC_BOOTSTRAP_TRUST_01 | InvBootstrapTrustSource | CHK_IA_BOOTSTRAP_TRUST | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_no_bootstrap_without_context | break |
-| SPEC_ANCHOR_SOURCE_02 | InvTrustAnchorSource | CHK_IA_INVITE_RECORDED | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_writes_workspace_binding | pass |
+| SPEC_IA_LINK_WORKSPACE_01 | InvInviteAcceptedLinkWorkspace | CHK_IA_LINK_WORKSPACE_MATCH | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_writes_workspace_binding | pass |
+| SPEC_IA_LINK_WORKSPACE_01 | InvInviteAcceptedLinkWorkspace | CHK_IA_LINK_WORKSPACE_MATCH | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_allows_self_accept_without_bootstrap_context | pass |
+| SPEC_IA_LINK_WORKSPACE_01 | InvInviteAcceptedLinkWorkspace | CHK_IA_LINK_WORKSPACE_MATCH | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_rejects_missing_local_link_workspace_binding | break |
+| SPEC_IA_LINK_WORKSPACE_01 | InvInviteAcceptedLinkWorkspace | CHK_IA_LINK_WORKSPACE_MATCH | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_rejects_local_link_workspace_mismatch | break |
+| SPEC_IA_LINK_WORKSPACE_01 | InvInviteAcceptedLinkWorkspace | CHK_IA_LINK_WORKSPACE_MATCH | pipeline_integration | apply::tests::test_invite_accepted_requires_tenant_not_workspace | pass |
+| SPEC_IA_LINK_WORKSPACE_01 | InvInviteAcceptedLinkWorkspace | CHK_IA_LINK_WORKSPACE_MATCH | pipeline_integration | apply::tests::test_invite_accepted_rejects_missing_local_link_workspace_binding | break |
+| SPEC_IA_LINK_WORKSPACE_01 | InvInviteAcceptedLinkWorkspace | CHK_IA_LINK_WORKSPACE_MATCH | pipeline_integration | apply::tests::test_invite_accepted_rejects_local_link_workspace_mismatch | break |
 | SPEC_BOOTSTRAP_CONSUMED_01 | InvBootstrapTrustConsumedByPeerShared | CHK_PS_BOOTSTRAP_TRUST_CONSUME | transport_credential | state::db::transport_trust::tests::test_invite_bootstrap_superseded_when_peer_shared_exists | pass |
 | SPEC_BOOTSTRAP_CONSUMED_01 | InvBootstrapTrustConsumedByPeerShared | CHK_PS_BOOTSTRAP_TRUST_CONSUME | transport_credential | state::db::transport_trust::tests::test_invite_bootstrap_trust_in_authorized_fingerprints | break |
 | SPEC_PENDING_TRUST_01 | InvPendingBootstrapTrustSource | CHK_UI_PENDING_BOOTSTRAP_SRC | projector_unit | user_invite_projector_tests::tests::test_user_invite_writes_pending_trust | pass |
@@ -157,8 +164,6 @@ both `pass` and `break` polarity unless waived.
 | SPEC_DISPATCH_01 | (registry) | CHK_DISPATCH_UNKNOWN_TYPE | pipeline_integration | apply::tests::test_retired_type3_peer_key_blob_rejected | break |
 | SPEC_REJECTION_01 | (durable rejection) | CHK_REJECTION_RECORD | pipeline_integration | apply::tests::test_file_slice_invalid_signature_rejects | pass |
 | SPEC_REJECTION_01 | (durable rejection) | CHK_REJECTION_RECORD | pipeline_integration | apply::tests::test_project_message_valid | break |
-| SPEC_ANCHOR_SOURCE_02 | InvTrustAnchorSource | CHK_IA_ANCHOR_SOURCE | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_writes_workspace_binding | pass |
-| SPEC_ANCHOR_SOURCE_02 | InvTrustAnchorSource | CHK_IA_ANCHOR_SOURCE | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_no_bootstrap_without_context | break |
 | SPEC_BOOTSTRAP_TRUST_CONSUME_01 | InvBootstrapTrustConsumedByPeerShared | CHK_PS_BOOTSTRAP_TRUST_CONSUME | transport_credential | state::db::transport_trust::tests::test_invite_bootstrap_superseded_when_peer_shared_exists | pass |
 | SPEC_BOOTSTRAP_TRUST_CONSUME_01 | InvBootstrapTrustConsumedByPeerShared | CHK_PS_BOOTSTRAP_TRUST_CONSUME | transport_credential | state::db::transport_trust::tests::test_invite_bootstrap_trust_in_authorized_fingerprints | break |
 | SPEC_PENDING_CONSUME_02 | InvPendingConsumedByPeerShared | CHK_PS_PENDING_CONSUME | transport_credential | state::db::transport_trust::tests::test_pending_invite_bootstrap_superseded_when_peer_shared_exists | pass |
