@@ -684,17 +684,10 @@ impl StarTopologyBench {
                 leaf_probe.trim(),
                 Duration::from_secs(120),
             );
-            assert_event_visible_on_all(
-                &[db.as_str()],
-                hub_probe.trim(),
-                Duration::from_secs(120),
-            );
+            assert_event_visible_on_all(&[db.as_str()], hub_probe.trim(), Duration::from_secs(120));
 
             if let Some(last) = leaves.last() {
-                let last_probe = send_message(
-                    &last.db,
-                    &format!("join-leaf-{idx:03}-last"),
-                );
+                let last_probe = send_message(&last.db, &format!("join-leaf-{idx:03}-last"));
                 assert_event_visible_on_all(
                     &[hub_db.as_str(), db.as_str()],
                     last_probe.trim(),
@@ -703,10 +696,7 @@ impl StarTopologyBench {
             }
             if leaves.len() >= 2 {
                 let first = &leaves[0];
-                let first_probe = send_message(
-                    &first.db,
-                    &format!("join-leaf-{idx:03}-first"),
-                );
+                let first_probe = send_message(&first.db, &format!("join-leaf-{idx:03}-first"));
                 assert_event_visible_on_all(
                     &[hub_db.as_str(), db.as_str()],
                     first_probe.trim(),
@@ -714,7 +704,11 @@ impl StarTopologyBench {
                 );
             }
 
-            leaves.push(StarLeafBench { db, _daemon: daemon, pid });
+            leaves.push(StarLeafBench {
+                db,
+                _daemon: daemon,
+                pid,
+            });
         }
 
         // Final all-node convergence: one probe from hub, verify every node
@@ -819,7 +813,12 @@ fn start_hub_daemon(db: &str, tmpdir: &std::path::Path) -> HarnessDaemon {
 }
 
 /// Start a leaf daemon with discovery disabled.
-fn start_star_daemon(db: &str, tmpdir: &std::path::Path, label: &str, lowmem: bool) -> HarnessDaemon {
+fn start_star_daemon(
+    db: &str,
+    tmpdir: &std::path::Path,
+    label: &str,
+    lowmem: bool,
+) -> HarnessDaemon {
     let mut extra_env = Vec::new();
     if lowmem {
         extra_env.push(("LOW_MEM_IOS".to_string(), "1".to_string()));
@@ -998,7 +997,10 @@ fn perf_star_topology_capacity() {
     }
     for (leaf_idx, leaf) in bench.leaves.iter().enumerate() {
         for msg_idx in 0..messages_per_leaf {
-            send_message(&leaf.db, &format!("star-leaf-{leaf_idx:03}-msg-{msg_idx:03}"));
+            send_message(
+                &leaf.db,
+                &format!("star-leaf-{leaf_idx:03}-msg-{msg_idx:03}"),
+            );
         }
     }
     let total_messages = hub_messages + leaf_count * messages_per_leaf;
@@ -1068,8 +1070,7 @@ fn perf_star_topology_capacity() {
         max_u(&leaf_maps),
     );
     eprintln!("\n{summary}");
-    let summary_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-results");
+    let summary_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-results");
     std::fs::create_dir_all(&summary_dir).expect("create target/perf-results");
     std::fs::write(
         summary_dir.join("daemon_perf_test.perf_star_topology_capacity.summary"),

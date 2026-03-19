@@ -120,7 +120,10 @@ async fn initiator_reuses_connection_scoped_credit_across_repeated_rounds() {
             }
         }
 
-        assert!(saw_request, "expected RequestIds to reuse connection credit");
+        assert!(
+            saw_request,
+            "expected RequestIds to reuse connection credit"
+        );
         assert!(
             saw_second_round,
             "expected a second NegOpen on the same session"

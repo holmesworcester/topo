@@ -22,8 +22,7 @@ fn next_daemon_instance_id() -> u64 {
 
 // Registry mapping db_path → (stdout_log_path, stderr_log_path) for the running daemon.
 // Populated at daemon start, removed at drop/kill, consulted by daemon_debug_context().
-static DAEMON_LOG_REGISTRY: OnceLock<Mutex<HashMap<String, (PathBuf, PathBuf)>>> =
-    OnceLock::new();
+static DAEMON_LOG_REGISTRY: OnceLock<Mutex<HashMap<String, (PathBuf, PathBuf)>>> = OnceLock::new();
 
 fn daemon_log_registry() -> &'static Mutex<HashMap<String, (PathBuf, PathBuf)>> {
     DAEMON_LOG_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
@@ -153,7 +152,6 @@ impl Drop for HarnessDaemon {
 
 const DAEMON_START_MAX_ATTEMPTS: usize = 20;
 const DAEMON_START_RETRY_BASE_MS: u64 = 200;
-
 
 // ---------------------------------------------------------------------------
 // Core utilities
@@ -1290,14 +1288,7 @@ pub fn accept_invite_with_identity_persisted_only(
     devicename: &str,
     accept_timeout: Duration,
 ) {
-    accept_invite_with_identity_inner(
-        db,
-        invite_link,
-        username,
-        devicename,
-        accept_timeout,
-        false,
-    );
+    accept_invite_with_identity_inner(db, invite_link, username, devicename, accept_timeout, false);
 }
 
 pub fn accept_invite_with_identity_and_timeout(
@@ -1307,14 +1298,7 @@ pub fn accept_invite_with_identity_and_timeout(
     devicename: &str,
     accept_timeout: Duration,
 ) {
-    accept_invite_with_identity_inner(
-        db,
-        invite_link,
-        username,
-        devicename,
-        accept_timeout,
-        true,
-    );
+    accept_invite_with_identity_inner(db, invite_link, username, devicename, accept_timeout, true);
 }
 
 fn accept_invite_with_identity_inner(
@@ -2202,11 +2186,7 @@ pub fn seed_invite_bootstrap_trust(
     .expect("record_invite_bootstrap_trust");
 }
 
-pub fn wait_for_endpoint_observation(
-    db_path: &str,
-    remote_peer_id: &str,
-    timeout: Duration,
-) {
+pub fn wait_for_endpoint_observation(db_path: &str, remote_peer_id: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         let now_ms = std::time::SystemTime::now()

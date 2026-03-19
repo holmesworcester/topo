@@ -228,9 +228,10 @@ impl SessionHandler for SyncConnectionHandler {
             SessionDirection::Outbound => crate::runtime::sync_control::SessionRole::Initiator,
             SessionDirection::Inbound => crate::runtime::sync_control::SessionRole::Responder,
         };
-        let registered = self.sync_control.as_ref().map(|sc| {
-            sc.register_session(&tenant_id, &peer_id, sc_role)
-        });
+        let registered = self
+            .sync_control
+            .as_ref()
+            .map(|sc| sc.register_session(&tenant_id, &peer_id, sc_role));
         let (mut manual_cmd_rx, mut manual_pol_rx, _sc_guard) = match registered {
             Some(rs) => {
                 let (crx, prx, guard) = rs.into_parts();

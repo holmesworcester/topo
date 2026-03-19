@@ -5,7 +5,7 @@ use std::cell::RefCell;
 
 use rusqlite::Connection;
 use topo::contracts::transport_identity_contract::{
-    TransportIdentityMaterializer, TransportIdentityError, TransportIdentitySpec,
+    TransportIdentityError, TransportIdentityMaterializer, TransportIdentitySpec,
 };
 
 /// Records specs applied through the materializer for later assertion.

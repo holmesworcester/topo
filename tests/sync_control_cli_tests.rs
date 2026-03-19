@@ -139,12 +139,20 @@ fn test_sync_policy_set_all_disabled_then_restore() {
     let _daemon = start_daemon(&db);
     ensure_active_peer(&db, Duration::from_secs(10));
 
-    let set = topo_cmd(&db, &[
-        "sync", "policy", "set",
-        "--requests", "disabled",
-        "--responses", "disabled",
-        "--forward-on-have", "disabled",
-    ]);
+    let set = topo_cmd(
+        &db,
+        &[
+            "sync",
+            "policy",
+            "set",
+            "--requests",
+            "disabled",
+            "--responses",
+            "disabled",
+            "--forward-on-have",
+            "disabled",
+        ],
+    );
     assert!(set.status.success());
     let stdout = String::from_utf8_lossy(&set.stdout);
     let disabled_count = stdout.matches("disabled").count();
@@ -156,12 +164,20 @@ fn test_sync_policy_set_all_disabled_then_restore() {
     );
 
     // Restore
-    let restore = topo_cmd(&db, &[
-        "sync", "policy", "set",
-        "--requests", "auto",
-        "--responses", "auto",
-        "--forward-on-have", "auto",
-    ]);
+    let restore = topo_cmd(
+        &db,
+        &[
+            "sync",
+            "policy",
+            "set",
+            "--requests",
+            "auto",
+            "--responses",
+            "auto",
+            "--forward-on-have",
+            "auto",
+        ],
+    );
     assert!(restore.status.success());
     let restore_stdout = String::from_utf8_lossy(&restore.stdout);
     let auto_count = restore_stdout.matches("auto").count();
@@ -188,10 +204,7 @@ fn test_sync_policy_set_invalid_mode() {
 
     let out = topo_cmd(&db, &["sync", "policy", "set", "--requests", "bogus"]);
     // Should fail with a clear error message
-    assert!(
-        !out.status.success(),
-        "bogus mode should fail"
-    );
+    assert!(!out.status.success(), "bogus mode should fail");
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("invalid") || stderr.contains("bogus"),
@@ -321,7 +334,10 @@ fn test_sync_round_and_request_with_live_peer() {
     );
 
     // SC4: disabled policy refuses requests with clear message
-    let set = topo_cmd(&bob_db, &["sync", "policy", "set", "--requests", "disabled"]);
+    let set = topo_cmd(
+        &bob_db,
+        &["sync", "policy", "set", "--requests", "disabled"],
+    );
     assert!(set.status.success());
 
     let req_disabled = topo_cmd(&bob_db, &["sync", "request", "all"]);

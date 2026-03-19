@@ -117,9 +117,9 @@ async fn invite_endpoint_race_prevents_bootstrap_sync() {
         "BUG: Invitee should have many failed sync attempts"
     );
     assert!(
-        invitee_sync_runs.iter().all(|(_, _, rounds, _, outcome)| {
-            *rounds == 0 && outcome == "ok"
-        }),
+        invitee_sync_runs
+            .iter()
+            .all(|(_, _, rounds, _, outcome)| { *rounds == 0 && outcome == "ok" }),
         "BUG: All invitee sync runs should have 0 rounds and 'ok' outcome"
     );
     assert!(

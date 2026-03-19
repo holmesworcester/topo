@@ -3324,9 +3324,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 } => {
                     let data = rpc_require_daemon(db, sock_ref, RpcMethod::SyncPolicyShow)?;
                     println!("SYNC POLICY:");
-                    println!("  requests:        {}", data["requests"].as_str().unwrap_or("auto"));
-                    println!("  responses:       {}", data["responses"].as_str().unwrap_or("auto"));
-                    println!("  forward_on_have: {}", data["forward_on_have"].as_str().unwrap_or("auto"));
+                    println!(
+                        "  requests:        {}",
+                        data["requests"].as_str().unwrap_or("auto")
+                    );
+                    println!(
+                        "  responses:       {}",
+                        data["responses"].as_str().unwrap_or("auto")
+                    );
+                    println!(
+                        "  forward_on_have: {}",
+                        data["forward_on_have"].as_str().unwrap_or("auto")
+                    );
                 }
                 SyncAction::Policy {
                     action:
@@ -3346,22 +3355,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         },
                     )?;
                     println!("SYNC POLICY (updated):");
-                    println!("  requests:        {}", data["requests"].as_str().unwrap_or("auto"));
-                    println!("  responses:       {}", data["responses"].as_str().unwrap_or("auto"));
-                    println!("  forward_on_have: {}", data["forward_on_have"].as_str().unwrap_or("auto"));
+                    println!(
+                        "  requests:        {}",
+                        data["requests"].as_str().unwrap_or("auto")
+                    );
+                    println!(
+                        "  responses:       {}",
+                        data["responses"].as_str().unwrap_or("auto")
+                    );
+                    println!(
+                        "  forward_on_have: {}",
+                        data["forward_on_have"].as_str().unwrap_or("auto")
+                    );
                 }
                 SyncAction::Round { target } => match target {
                     SyncTarget::Peer { peer } => {
-                        let data = rpc_require_daemon(
-                            db,
-                            sock_ref,
-                            RpcMethod::SyncRoundPeer { peer },
-                        )?;
+                        let data =
+                            rpc_require_daemon(db, sock_ref, RpcMethod::SyncRoundPeer { peer })?;
                         print_round_capture(&data);
                     }
                     SyncTarget::All => {
-                        let data =
-                            rpc_require_daemon(db, sock_ref, RpcMethod::SyncRoundAll)?;
+                        let data = rpc_require_daemon(db, sock_ref, RpcMethod::SyncRoundAll)?;
                         if let Some(arr) = data.as_array() {
                             for item in arr {
                                 print_round_capture(item);
@@ -3373,16 +3387,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 },
                 SyncAction::Request { target } => match target {
                     SyncTarget::Peer { peer } => {
-                        let data = rpc_require_daemon(
-                            db,
-                            sock_ref,
-                            RpcMethod::SyncRequestPeer { peer },
-                        )?;
+                        let data =
+                            rpc_require_daemon(db, sock_ref, RpcMethod::SyncRequestPeer { peer })?;
                         print_request_result(&data);
                     }
                     SyncTarget::All => {
-                        let data =
-                            rpc_require_daemon(db, sock_ref, RpcMethod::SyncRequestAll)?;
+                        let data = rpc_require_daemon(db, sock_ref, RpcMethod::SyncRequestAll)?;
                         if let Some(arr) = data.as_array() {
                             for item in arr {
                                 print_request_result(item);
@@ -4840,7 +4850,10 @@ fn print_request_result(data: &serde_json::Value) {
     let ids = data["requested_ids"].as_array();
     let count = ids.map(|a| a.len()).unwrap_or(0);
 
-    println!("SYNC REQUEST peer={}: {} event(s) requested", short_peer, count);
+    println!(
+        "SYNC REQUEST peer={}: {} event(s) requested",
+        short_peer, count
+    );
     if let Some(ids) = ids {
         for id in ids {
             if let Some(s) = id.as_str() {

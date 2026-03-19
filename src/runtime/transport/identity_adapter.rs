@@ -240,11 +240,9 @@ mod tests {
         assert!(result.is_ok(), "bootstrap install should succeed");
 
         let target_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM local_transport_targets",
-                [],
-                |row| row.get(0),
-            )
+            .query_row("SELECT COUNT(*) FROM local_transport_targets", [], |row| {
+                row.get(0)
+            })
             .unwrap();
         assert_eq!(
             target_count, 0,

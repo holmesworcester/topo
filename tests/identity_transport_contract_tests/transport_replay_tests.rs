@@ -92,7 +92,10 @@ fn peershared_transport_target_set_and_survives_replay() {
         "peershared transport target must be set after create_workspace"
     );
     let initial_peer_id = target.unwrap().transport_peer_id;
-    assert!(!initial_peer_id.is_empty(), "transport_peer_id must be non-empty");
+    assert!(
+        !initial_peer_id.is_empty(),
+        "transport_peer_id must be non-empty"
+    );
     // PeerShared peer_id should match alice.identity (derived from peer_shared key).
     assert_eq!(
         initial_peer_id, alice.identity,

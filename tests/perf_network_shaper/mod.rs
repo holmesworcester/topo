@@ -476,8 +476,8 @@ fn spawn_sender(
                     next_tx_finish = start_tx + serialization;
                     // Arrival = when this packet reaches the destination.
                     // .max(last_arrival) preserves in-order delivery.
-                    let arrival = (next_tx_finish + propagation_delay(&mut rng, &profile))
-                        .max(last_arrival);
+                    let arrival =
+                        (next_tx_finish + propagation_delay(&mut rng, &profile)).max(last_arrival);
                     last_arrival = arrival;
                     delay_line.push_back((arrival, packet));
                 }

@@ -1,7 +1,7 @@
 //! Contract tests: verify exact intents emitted by the adapter and projector.
 
 use topo::contracts::transport_identity_contract::{
-    TransportIdentityMaterializer, TransportIdentityError, TransportIdentitySpec,
+    TransportIdentityError, TransportIdentityMaterializer, TransportIdentitySpec,
 };
 use topo::transport::identity_adapter::ConcreteTransportIdentityMaterializer;
 

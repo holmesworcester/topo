@@ -31,7 +31,16 @@ pub fn tc_shaping_available() -> bool {
     // removing a harmless pfifo_fast qdisc.  This catches the common case
     // where `tc` exists but we lack CAP_NET_ADMIN.
     let add = Command::new("tc")
-        .args(["qdisc", "add", "dev", "lo", "root", "handle", "9999:", "pfifo_fast"])
+        .args([
+            "qdisc",
+            "add",
+            "dev",
+            "lo",
+            "root",
+            "handle",
+            "9999:",
+            "pfifo_fast",
+        ])
         .output();
     match add {
         Ok(out) if out.status.success() => {
@@ -97,15 +106,27 @@ impl TcLoopbackShaper {
             "qdisc", "add", "dev", "lo", "root", "handle", "1:", "htb", "default", "10",
         ])?;
         tc_run(&[
-            "class", "add", "dev", "lo", "parent", "1:", "classid", "1:10", "htb", "rate",
-            "10gbit",
+            "class", "add", "dev", "lo", "parent", "1:", "classid", "1:10", "htb", "rate", "10gbit",
         ])?;
 
         // Shaped class with bandwidth cap.
         let rate_str = format!("{bw_kbit}kbit");
         tc_run(&[
-            "class", "add", "dev", "lo", "parent", "1:", "classid", "1:20", "htb", "rate",
-            &rate_str, "ceil", &rate_str, "burst", &format!("{burst_kb}kb"),
+            "class",
+            "add",
+            "dev",
+            "lo",
+            "parent",
+            "1:",
+            "classid",
+            "1:20",
+            "htb",
+            "rate",
+            &rate_str,
+            "ceil",
+            &rate_str,
+            "burst",
+            &format!("{burst_kb}kb"),
         ])?;
 
         // Netem leaf under the shaped class for delay/jitter/loss.

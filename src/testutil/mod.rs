@@ -2333,7 +2333,10 @@ fn compute_projection_fingerprint(
             Scope::TenantId => "WHERE tenant_id = ?1",
         };
         let select = ft.columns.unwrap_or("*");
-        let query = format!("SELECT {} FROM {} {} {}", select, ft.name, where_clause, ft.order);
+        let query = format!(
+            "SELECT {} FROM {} {} {}",
+            select, ft.name, where_clause, ft.order
+        );
         let mut row_count: i64 = 0;
 
         if let Ok(mut stmt) = db.prepare(&query) {

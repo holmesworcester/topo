@@ -102,8 +102,8 @@ impl SyncControlRegistry {
     ) -> Result<TenantSyncPolicy, String> {
         let conn = crate::db::open_connection(&self.db_path).map_err(|e| e.to_string())?;
         crate::db::sync_control::ensure_schema(&conn).map_err(|e| e.to_string())?;
-        let saved =
-            crate::db::sync_control::save_policy(&conn, tenant_id, policy).map_err(|e| e.to_string())?;
+        let saved = crate::db::sync_control::save_policy(&conn, tenant_id, policy)
+            .map_err(|e| e.to_string())?;
         self.notify_policy_watchers(tenant_id, &saved);
         Ok(saved)
     }

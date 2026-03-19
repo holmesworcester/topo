@@ -11,9 +11,9 @@ use tokio::sync::broadcast;
 use tracing::info;
 
 use crate::crypto::EventId;
+use crate::db::store::Store;
 use crate::db::timeline::EventTimeline;
 use crate::db::wanted::WantedEvents;
-use crate::db::store::Store;
 use crate::protocol::{neg_id_to_event_id, DiscoveryHint, Frame};
 use crate::state::live_hints::LiveHint;
 use crate::transport::StreamConn;
@@ -134,7 +134,8 @@ where
         return Ok((0, Vec::new()));
     }
 
-    let candidate_limit = candidate_limit_for_credit_bytes(credit_bytes, snapshot.inflight_requested.len());
+    let candidate_limit =
+        candidate_limit_for_credit_bytes(credit_bytes, snapshot.inflight_requested.len());
     let selected = coordination.plan_requests(
         wanted,
         peer_id,
@@ -147,10 +148,16 @@ where
         return Ok((0, Vec::new()));
     }
     if let Some(credit_received_at) = snapshot.last_credit_received_at {
-        let selected_ids: Vec<EventId> = selected.iter().map(|candidate| candidate.event_id).collect();
+        let selected_ids: Vec<EventId> = selected
+            .iter()
+            .map(|candidate| candidate.event_id)
+            .collect();
         let _ = timeline.mark_request_credit_received_many(&selected_ids, credit_received_at);
     }
-    let selected_ids: Vec<EventId> = selected.iter().map(|candidate| candidate.event_id).collect();
+    let selected_ids: Vec<EventId> = selected
+        .iter()
+        .map(|candidate| candidate.event_id)
+        .collect();
     let _ = timeline.mark_request_selected_many(&selected_ids, now_ms);
     let reserved_bytes: usize = selected
         .iter()

@@ -108,7 +108,10 @@ pub struct ConnectionResponseState {
 impl ConnectionResponseState {
     pub fn consume_requests(&self, responses: &[QueuedResponse]) -> usize {
         let mut inner = self.inner.lock().expect("response state mutex poisoned");
-        let reserved_bytes: usize = responses.iter().map(|response| response.encoded_size_bytes).sum();
+        let reserved_bytes: usize = responses
+            .iter()
+            .map(|response| response.encoded_size_bytes)
+            .sum();
         inner.available_credit_bytes = inner.available_credit_bytes.saturating_sub(reserved_bytes);
         inner.pending_bytes = inner.pending_bytes.saturating_add(reserved_bytes);
         inner.pending.extend(responses.iter().copied());
@@ -148,7 +151,9 @@ impl ConnectionResponseState {
     pub fn requeue_front(&self, response: QueuedResponse) {
         let mut inner = self.inner.lock().expect("response state mutex poisoned");
         inner.pending.push_front(response);
-        inner.pending_bytes = inner.pending_bytes.saturating_add(response.encoded_size_bytes);
+        inner.pending_bytes = inner
+            .pending_bytes
+            .saturating_add(response.encoded_size_bytes);
     }
 
     pub fn stats(&self) -> ResponseQueueStats {

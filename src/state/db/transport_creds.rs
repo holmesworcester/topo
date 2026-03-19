@@ -590,8 +590,13 @@ mod tests {
         create_tables(&conn).unwrap();
 
         // peershared is set first
-        set_local_transport_target(&conn, "tenant_a", "peershared_peer", CRED_SOURCE_PEER_SHARED)
-            .unwrap();
+        set_local_transport_target(
+            &conn,
+            "tenant_a",
+            "peershared_peer",
+            CRED_SOURCE_PEER_SHARED,
+        )
+        .unwrap();
 
         // bootstrap for the same tenant must not overwrite peershared
         set_local_transport_target(&conn, "tenant_a", "bootstrap_peer", CRED_SOURCE_BOOTSTRAP)
@@ -614,8 +619,13 @@ mod tests {
             .unwrap();
 
         // peershared for the same tenant must overwrite bootstrap
-        set_local_transport_target(&conn, "tenant_a", "peershared_peer", CRED_SOURCE_PEER_SHARED)
-            .unwrap();
+        set_local_transport_target(
+            &conn,
+            "tenant_a",
+            "peershared_peer",
+            CRED_SOURCE_PEER_SHARED,
+        )
+        .unwrap();
 
         let target = resolve_tenant_transport_target(&conn, "tenant_a")
             .unwrap()
@@ -943,8 +953,10 @@ mod tests {
 
         let replayed = discover_local_tenants(&conn).unwrap();
         assert_eq!(replayed.len(), 1, "replay must restore exactly one tenant");
-        assert_eq!(replayed[0].transport_peer_id, "final-peer",
-            "replayed state must converge to peershared identity, not stale bootstrap");
+        assert_eq!(
+            replayed[0].transport_peer_id, "final-peer",
+            "replayed state must converge to peershared identity, not stale bootstrap"
+        );
         assert_eq!(replayed[0].workspace_id, final_state[0].workspace_id);
     }
 }

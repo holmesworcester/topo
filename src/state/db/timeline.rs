@@ -105,13 +105,13 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
 ///   unset → enabled in debug builds, disabled in release builds
 pub fn recording_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        match std::env::var("TOPO_EVENT_TIMELINE").ok().as_deref() {
+    *ENABLED.get_or_init(
+        || match std::env::var("TOPO_EVENT_TIMELINE").ok().as_deref() {
             Some("0") | Some("false") | Some("FALSE") | Some("no") | Some("NO") => false,
             Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") => true,
             _ => cfg!(debug_assertions),
-        }
-    })
+        },
+    )
 }
 
 fn enabled_groups_mask() -> u8 {

@@ -77,11 +77,7 @@ fn tenant_index_for_peer_id(db_path: &str, peer_id: &str) -> usize {
         .expect("peer id should appear in tenant scopes")
 }
 
-fn wait_for_endpoint_observation(
-    db_path: &str,
-    remote_peer_id: &str,
-    timeout: Duration,
-) {
+fn wait_for_endpoint_observation(db_path: &str, remote_peer_id: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         let now_ms = std::time::SystemTime::now()
@@ -939,11 +935,7 @@ fn test_cli_reconnects_after_bootstrap_supersession_using_observed_endpoint() {
     );
 
     let alice_transport_peer_id = daemon_transport_fingerprint(&alice_db);
-    wait_for_endpoint_observation(
-        &bob_db,
-        &alice_transport_peer_id,
-        Duration::from_secs(15),
-    );
+    wait_for_endpoint_observation(&bob_db, &alice_transport_peer_id, Duration::from_secs(15));
 
     stop_daemon(&bob_db, &mut bob_daemon);
 
@@ -997,11 +989,7 @@ fn test_cli_lowmem_receiver_restart_catches_offline_delta_and_resumes_sync() {
     assert_eventually(&bob_db, "message_count >= 2000", timeout_ms);
 
     let alice_transport_peer_id = daemon_transport_fingerprint(&alice_db);
-    wait_for_endpoint_observation(
-        &bob_db,
-        &alice_transport_peer_id,
-        Duration::from_secs(15),
-    );
+    wait_for_endpoint_observation(&bob_db, &alice_transport_peer_id, Duration::from_secs(15));
 
     stop_daemon(&bob_db, &mut bob_daemon);
 
@@ -2639,11 +2627,7 @@ fn test_cli_shared_db_same_workspace_accepts_distinct_explicit_invites() {
         "dave-laptop",
     );
     let dave_tenant = dave.tenant_label();
-    wait_for_endpoint_observation(
-        &dave.db,
-        &alpha_transport_peer_id,
-        Duration::from_secs(30),
-    );
+    wait_for_endpoint_observation(&dave.db, &alpha_transport_peer_id, Duration::from_secs(30));
 
     let alpha_live_msg = "alpha-space/alpha-via-explicit-bootstrap";
     let alpha_live_eid = send_message(&alpha.db, alpha_live_msg);
@@ -2839,11 +2823,7 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
         &alpha_transport_peer_id,
         Duration::from_secs(30),
     );
-    wait_for_endpoint_observation(
-        &shared_db,
-        &zeta_transport_peer_id,
-        Duration::from_secs(30),
-    );
+    wait_for_endpoint_observation(&shared_db, &zeta_transport_peer_id, Duration::from_secs(30));
 
     let dave_alpha_invite = create_invite(&alpha.db, &daemon_listen_addr(&alpha.db));
     let emma_zeta_invite = create_invite(&zeta.db, &daemon_listen_addr(&zeta.db));
@@ -2857,11 +2837,7 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
     );
     let dave_tenant = dave.tenant_label();
     wait_for_active_tenant_ready(&dave.db, Duration::from_millis(timeout_ms));
-    wait_for_endpoint_observation(
-        &dave.db,
-        &alpha_transport_peer_id,
-        Duration::from_secs(30),
-    );
+    wait_for_endpoint_observation(&dave.db, &alpha_transport_peer_id, Duration::from_secs(30));
 
     let emma = start_joined_cli_peer(
         &tmpdir,
@@ -2872,11 +2848,7 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
     );
     let emma_tenant = emma.tenant_label();
     wait_for_active_tenant_ready(&emma.db, Duration::from_millis(timeout_ms));
-    wait_for_endpoint_observation(
-        &emma.db,
-        &zeta_transport_peer_id,
-        Duration::from_secs(30),
-    );
+    wait_for_endpoint_observation(&emma.db, &zeta_transport_peer_id, Duration::from_secs(30));
 
     let dave_alpha_msg = "alpha-space/dave-external";
     let dave_alpha_eid = send_message(&dave.db, dave_alpha_msg);
@@ -3561,11 +3533,7 @@ fn test_cli_files_and_save_file_roundtrip_after_sync() {
     // sending the file. Without this, the file-transfer timeout burns
     // time waiting for the QUIC handshake under CPU pressure.
     let gate_eid = send_message(&alice_db, "pre-file-gate");
-    assert_eventually(
-        &bob_db,
-        &format!("has_event:{} >= 1", gate_eid),
-        timeout_ms,
-    );
+    assert_eventually(&bob_db, &format!("has_event:{} >= 1", gate_eid), timeout_ms);
 
     let send_out = Command::new(bin())
         .args([

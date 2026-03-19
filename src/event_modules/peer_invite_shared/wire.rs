@@ -113,6 +113,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_device_invite_accepts_user_signer_type() {
+        let mut blob = vec![0u8; DEVICE_INVITE_WIRE_SIZE];
+        blob[0] = EVENT_TYPE_DEVICE_INVITE;
+        blob[105] = 4;
+
+        assert!(matches!(
+            parse_device_invite(&blob),
+            Ok(ParsedEvent::DeviceInvite(_))
+        ));
+    }
+
+    #[test]
+    fn parse_device_invite_accepts_peer_shared_signer_type() {
+        let mut blob = vec![0u8; DEVICE_INVITE_WIRE_SIZE];
+        blob[0] = EVENT_TYPE_DEVICE_INVITE;
+        blob[105] = 5;
+
+        assert!(matches!(
+            parse_device_invite(&blob),
+            Ok(ParsedEvent::DeviceInvite(_))
+        ));
+    }
+
+    #[test]
     fn parse_device_invite_rejects_wrong_signer_type() {
         let mut blob = vec![0u8; DEVICE_INVITE_WIRE_SIZE];
         blob[0] = EVENT_TYPE_DEVICE_INVITE;

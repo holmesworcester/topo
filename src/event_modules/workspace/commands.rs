@@ -20,7 +20,6 @@ use std::collections::HashSet;
 use crate::crypto::EventId;
 use crate::crypto::{event_id_from_base64, event_id_to_base64};
 use crate::db::store::insert_recorded_event_checked;
-use crate::state::live_hints::{self, LiveHintEvent};
 use crate::event_modules::{
     peer_secret::PeerSecretEvent, AdminEvent, DeviceInviteEvent, InviteAcceptedEvent, ParsedEvent,
     PeerSharedEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
@@ -30,6 +29,7 @@ use crate::projection::create::{
     create_event_staged, create_event_synchronous, create_signed_event_synchronous,
     event_id_or_blocked, project_event,
 };
+use crate::state::live_hints::{self, LiveHintEvent};
 
 fn now_ms() -> u64 {
     SystemTime::now()

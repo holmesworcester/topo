@@ -81,11 +81,7 @@ pub fn assert_identity_eventually_materialized(db_path: &str, timeout_ms: u64) {
     }
 }
 
-pub fn wait_for_endpoint_observation(
-    db_path: &str,
-    remote_peer_id: &str,
-    timeout: Duration,
-) {
+pub fn wait_for_endpoint_observation(db_path: &str, remote_peer_id: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         let now_ms = std::time::SystemTime::now()
