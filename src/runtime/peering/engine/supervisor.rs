@@ -714,15 +714,28 @@ async fn run_target_dispatcher(
             let known_peer_key = known_peer_key_for_event(&event);
             if let Some(existing) = active_workers.get(&known_peer_key) {
                 if should_ignore_target_event(&existing.source, &event.source) {
-                    info!(
-                        "Keeping existing higher-priority {:?} worker over {:?} key={} tenant={} remote={}",
-                        existing.source,
-                        event.source,
-                        known_peer_key,
-                        short_peer_id(&event.tenant_id),
-                        event.remote
-                    );
-                    continue;
+                    // During bootstrap phase the Bootstrap worker carries the
+                    // only cert the inviter will accept.  Don't let a Discovery
+                    // worker (which lacks the bootstrap fallback cert) suppress it.
+                    if is_tenant_in_bootstrap_phase(&db_path, &event.tenant_id) {
+                        info!(
+                            "Allowing Bootstrap worker despite existing {:?} worker (tenant still bootstrapping) key={} tenant={} remote={}",
+                            existing.source,
+                            known_peer_key,
+                            short_peer_id(&event.tenant_id),
+                            event.remote
+                        );
+                    } else {
+                        info!(
+                            "Keeping existing higher-priority {:?} worker over {:?} key={} tenant={} remote={}",
+                            existing.source,
+                            event.source,
+                            known_peer_key,
+                            short_peer_id(&event.tenant_id),
+                            event.remote
+                        );
+                        continue;
+                    }
                 }
             }
         }
@@ -764,9 +777,13 @@ async fn run_target_dispatcher(
             event.source,
             TargetIngressSource::ObservedPeer { .. } | TargetIngressSource::Discovery { .. }
         ) {
-            let prefix = bootstrap_worker_prefix_for_event(&event);
-            cancel_bootstrap_workers_for_prefix(&mut active_workers, &mut dispatcher, &prefix)
-                .await;
+            // During bootstrap phase, keep bootstrap workers alive — they carry
+            // the only cert the inviter will accept.
+            if !is_tenant_in_bootstrap_phase(&db_path, &event.tenant_id) {
+                let prefix = bootstrap_worker_prefix_for_event(&event);
+                cancel_bootstrap_workers_for_prefix(&mut active_workers, &mut dispatcher, &prefix)
+                    .await;
+            }
         }
 
         if let Some(existing) = active_workers.remove(&dispatch_key) {
@@ -922,6 +939,15 @@ fn local_transport_target_is_bootstrap(conn: &rusqlite::Connection, tenant_id: &
         .ok()
         .flatten()
         .map(|target| target.source == CRED_SOURCE_BOOTSTRAP)
+        .unwrap_or(false)
+}
+
+/// Check whether a tenant is still in bootstrap phase (its local transport
+/// credential comes from an invite rather than steady-state PeerShared).
+fn is_tenant_in_bootstrap_phase(db_path: &str, tenant_id: &str) -> bool {
+    open_connection(db_path)
+        .ok()
+        .map(|conn| local_transport_target_is_bootstrap(&conn, tenant_id))
         .unwrap_or(false)
 }
 
@@ -1579,5 +1605,215 @@ mod tests {
             ),
             "broad discovery should still stay bottlenecked after local transport convergence"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Bootstrap-phase guards: during bootstrap, no source may suppress or
+    // cancel Bootstrap workers because only Bootstrap carries the invite
+    // fallback cert that the inviter will accept.
+    // -----------------------------------------------------------------------
+
+    #[test]
+    fn bootstrap_phase_detected_for_bootstrap_transport_target() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tmpdir.path().join("bs-phase-detect.db");
+        let db_str = db_path.to_str().expect("db path");
+        let conn = open_connection(db_str).expect("open db");
+        create_tables(&conn).expect("create tables");
+
+        let tenant = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let peer = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        // No transport target → not in bootstrap phase
+        assert!(
+            !is_tenant_in_bootstrap_phase(db_str, tenant),
+            "tenant with no transport target should not be in bootstrap phase"
+        );
+
+        // Bootstrap transport target → in bootstrap phase
+        set_local_transport_target(&conn, tenant, peer, CRED_SOURCE_BOOTSTRAP)
+            .expect("set bootstrap target");
+        drop(conn);
+        assert!(
+            is_tenant_in_bootstrap_phase(db_str, tenant),
+            "tenant with bootstrap transport target must be detected as bootstrap phase"
+        );
+
+        // PeerShared transport target → no longer in bootstrap phase
+        let conn = open_connection(db_str).expect("open db");
+        set_local_transport_target(&conn, tenant, peer, CRED_SOURCE_PEER_SHARED)
+            .expect("set peershared target");
+        drop(conn);
+        assert!(
+            !is_tenant_in_bootstrap_phase(db_str, tenant),
+            "tenant with peershared transport target must not be in bootstrap phase"
+        );
+    }
+
+    /// During bootstrap phase, a Bootstrap connect event must never be
+    /// suppressed by an existing Discovery or ObservedPeer worker.
+    ///
+    /// Only the Bootstrap source carries the invite fallback TLS cert.
+    /// If Discovery or ObservedPeer suppress it, the invitee is stuck
+    /// because those sources use the PeerShared cert the inviter does
+    /// not yet trust.
+    #[test]
+    fn bootstrap_events_never_suppressed_during_bootstrap_phase() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tmpdir.path().join("bs-suppress-guard.db");
+        let db_str = db_path.to_str().expect("db path");
+        let conn = open_connection(db_str).expect("open db");
+        create_tables(&conn).expect("create tables");
+
+        let tenant = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let peer = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        // Put tenant in bootstrap phase
+        set_local_transport_target(&conn, tenant, peer, CRED_SOURCE_BOOTSTRAP)
+            .expect("set bootstrap target");
+        let fp = hex::decode(peer).expect("peer hex");
+        let mut fp_arr = [0u8; 32];
+        fp_arr.copy_from_slice(&fp);
+        record_invite_bootstrap_trust(
+            &conn,
+            tenant,
+            "invite-accepted",
+            "invite-event",
+            "workspace",
+            "",
+            &fp_arr,
+        )
+        .expect("record invite bootstrap trust");
+        drop(conn);
+
+        let bootstrap = TargetIngressSource::Bootstrap {
+            peer_id: peer.to_string(),
+            invite_event_id: "invite".to_string(),
+        };
+
+        // Test against every non-Bootstrap source type
+        let competing_sources = [
+            TargetIngressSource::Discovery {
+                peer_id: peer.to_string(),
+            },
+            TargetIngressSource::ObservedPeer {
+                peer_id: peer.to_string(),
+            },
+        ];
+
+        for existing in &competing_sources {
+            // Precondition: the competing source has higher precedence
+            assert!(
+                should_ignore_target_event(existing, &bootstrap),
+                "{:?} should have higher static precedence than Bootstrap",
+                existing
+            );
+
+            // The dispatcher's combined suppression decision mirrors:
+            //   suppress = should_ignore(existing, bootstrap)
+            //              && !is_tenant_in_bootstrap_phase(db, tenant)
+            let would_suppress = should_ignore_target_event(existing, &bootstrap)
+                && !is_tenant_in_bootstrap_phase(db_str, tenant);
+            assert!(
+                !would_suppress,
+                "during bootstrap phase, {:?} must NOT suppress Bootstrap events",
+                existing
+            );
+        }
+
+        // The dispatcher's cancellation decision mirrors:
+        //   cancel_bootstrap = is_non_bootstrap_source
+        //                      && !is_tenant_in_bootstrap_phase(db, tenant)
+        assert!(
+            !(!is_tenant_in_bootstrap_phase(db_str, tenant)),
+            "during bootstrap phase, non-bootstrap events must not cancel bootstrap workers"
+        );
+
+        // After bootstrap completes, normal precedence resumes
+        let conn = open_connection(db_str).expect("open db");
+        set_local_transport_target(&conn, tenant, tenant, CRED_SOURCE_PEER_SHARED)
+            .expect("transition to peershared");
+        drop(conn);
+
+        assert!(
+            !is_tenant_in_bootstrap_phase(db_str, tenant),
+            "tenant should have exited bootstrap phase"
+        );
+        for existing in &competing_sources {
+            // After bootstrap, suppression IS allowed
+            let would_suppress = should_ignore_target_event(existing, &bootstrap)
+                && !is_tenant_in_bootstrap_phase(db_str, tenant);
+            assert!(
+                would_suppress,
+                "after bootstrap, {:?} SHOULD suppress stale Bootstrap events",
+                existing
+            );
+        }
+        // After bootstrap, cancellation IS allowed
+        assert!(
+            !is_tenant_in_bootstrap_phase(db_str, tenant),
+            "after bootstrap, non-bootstrap events may cancel bootstrap workers"
+        );
+    }
+
+    /// During bootstrap phase, Discovery/ObservedPeer events must not
+    /// cancel running Bootstrap workers.
+    ///
+    /// The dispatcher decides whether to cancel bootstrap workers via:
+    ///   cancel = is_non_bootstrap_source && !is_tenant_in_bootstrap_phase(..)
+    #[test]
+    fn bootstrap_workers_not_cancelled_during_bootstrap_phase() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tmpdir.path().join("bs-cancel-guard.db");
+        let db_str = db_path.to_str().expect("db path");
+        let conn = open_connection(db_str).expect("open db");
+        create_tables(&conn).expect("create tables");
+
+        let tenant = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let peer = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        let non_bootstrap_sources = [
+            TargetIngressSource::Discovery {
+                peer_id: peer.to_string(),
+            },
+            TargetIngressSource::ObservedPeer {
+                peer_id: peer.to_string(),
+            },
+        ];
+
+        // Bootstrap phase: cancellation must be blocked
+        set_local_transport_target(&conn, tenant, peer, CRED_SOURCE_BOOTSTRAP)
+            .expect("set bootstrap target");
+        drop(conn);
+
+        for source in &non_bootstrap_sources {
+            let would_cancel = matches!(
+                source,
+                TargetIngressSource::ObservedPeer { .. } | TargetIngressSource::Discovery { .. }
+            ) && !is_tenant_in_bootstrap_phase(db_str, tenant);
+            assert!(
+                !would_cancel,
+                "during bootstrap phase, {:?} must NOT cancel bootstrap workers",
+                source
+            );
+        }
+
+        // Steady state: cancellation is allowed
+        let conn = open_connection(db_str).expect("open db");
+        set_local_transport_target(&conn, tenant, peer, CRED_SOURCE_PEER_SHARED)
+            .expect("transition to peershared");
+        drop(conn);
+
+        for source in &non_bootstrap_sources {
+            let would_cancel = matches!(
+                source,
+                TargetIngressSource::ObservedPeer { .. } | TargetIngressSource::Discovery { .. }
+            ) && !is_tenant_in_bootstrap_phase(db_str, tenant);
+            assert!(
+                would_cancel,
+                "after bootstrap, {:?} SHOULD cancel stale bootstrap workers",
+                source
+            );
+        }
     }
 }
