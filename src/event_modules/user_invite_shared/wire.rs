@@ -117,6 +117,30 @@ mod tests {
     use super::*;
 
     #[test]
+    fn parse_user_invite_accepts_workspace_signer_type() {
+        let mut blob = vec![0u8; USER_INVITE_WIRE_SIZE];
+        blob[0] = EVENT_TYPE_USER_INVITE;
+        blob[137] = 1;
+
+        assert!(matches!(
+            parse_user_invite(&blob),
+            Ok(ParsedEvent::UserInvite(_))
+        ));
+    }
+
+    #[test]
+    fn parse_user_invite_accepts_peer_shared_signer_type() {
+        let mut blob = vec![0u8; USER_INVITE_WIRE_SIZE];
+        blob[0] = EVENT_TYPE_USER_INVITE;
+        blob[137] = 5;
+
+        assert!(matches!(
+            parse_user_invite(&blob),
+            Ok(ParsedEvent::UserInvite(_))
+        ));
+    }
+
+    #[test]
     fn parse_user_invite_rejects_wrong_signer_type() {
         let mut blob = vec![0u8; USER_INVITE_WIRE_SIZE];
         blob[0] = EVENT_TYPE_USER_INVITE;

@@ -152,6 +152,14 @@ pub struct ContextSnapshot {
     /// pure projectors can reject deterministically without issuing SQL.
     pub signer_user_mismatch_reason: Option<String>,
 
+    /// For PeerShared: the claimed `user_event_id` must match the user identity
+    /// authorized by the signing device-invite chain.
+    pub peer_shared_user_mismatch_reason: Option<String>,
+
+    /// For Admin: the claimed `public_key` must match the referenced
+    /// `users.public_key` for `user_event_id`.
+    pub admin_user_key_mismatch_reason: Option<String>,
+
     /// For MessageDeletion: the author_id of the target message (if it exists in messages).
     pub target_message_author: Option<String>,
     /// For MessageDeletion: the author_id from an existing tombstone (if any).

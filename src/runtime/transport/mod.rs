@@ -556,4 +556,31 @@ mod tests {
             )
             .is_ok());
     }
+
+    #[test]
+    fn test_server_verifier_rejects_mismatched_exact_transport_target() {
+        let (cert, _) = generate_self_signed_cert().unwrap();
+        let fp = extract_spki_fingerprint(cert.as_ref()).unwrap();
+        let wrong_expected = multi_workspace::transport_sni(&hex::encode([0xEE; 32]));
+        let verifier =
+            TransportAuthVerifier::new_dynamic(Arc::new(move |candidate| Ok(candidate == &fp)));
+        let server_name = rustls::pki_types::ServerName::try_from(wrong_expected).unwrap();
+
+        let err = verifier
+            .verify_server_cert(
+                &cert,
+                &[],
+                &server_name,
+                &[],
+                rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(1)),
+            )
+            .unwrap_err();
+
+        let err_text = err.to_string();
+        assert!(
+            err_text.contains(TRUST_REJECTION_MARKER)
+                && err_text.contains("expected remote transport fingerprint"),
+            "unexpected error: {err_text}"
+        );
+    }
 }

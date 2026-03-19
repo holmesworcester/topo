@@ -23,6 +23,58 @@ MATRIX_PATH = REPO_ROOT / "docs" / "tla" / "projector_conformance_matrix.md"
 CATALOG_PATH = REPO_ROOT / "docs" / "tla" / "runtime_check_catalog.md"
 
 
+def extract_test_functions(source: str) -> set[str]:
+    return {
+        m.group(1)
+        for m in re.finditer(r"^\s*(?:async\s+)?fn\s+(test_\w+)\s*\(", source, re.MULTILINE)
+    }
+
+
+def collect_integration_test_paths() -> set[str]:
+    """Best-effort exact path discovery for integration tests from source layout.
+
+    This supplements `cargo test --tests -- --list`, which can fail to enumerate
+    valid test trees when unrelated integration crates do not compile.
+    """
+    test_paths: set[str] = set()
+    tests_dir = REPO_ROOT / "tests"
+    if not tests_dir.exists():
+        return test_paths
+
+    # Standalone integration crates: tests/foo.rs -> foo::test_name
+    for rs_file in tests_dir.glob("*.rs"):
+        for fn_name in extract_test_functions(rs_file.read_text()):
+            test_paths.add(f"{rs_file.stem}::{fn_name}")
+
+    # Module-tree integration crates: tests/<tree>/main.rs with `mod child;`
+    for main_rs in tests_dir.glob("**/main.rs"):
+        main_text = main_rs.read_text()
+
+        for fn_name in extract_test_functions(main_text):
+            test_paths.add(fn_name)
+
+        for mod_match in re.finditer(r"^\s*mod\s+([A-Za-z_]\w*)\s*;", main_text, re.MULTILINE):
+            mod_name = mod_match.group(1)
+            child_candidates = [
+                main_rs.parent / f"{mod_name}.rs",
+                main_rs.parent / mod_name / "mod.rs",
+            ]
+            child_path = next((p for p in child_candidates if p.exists()), None)
+            if child_path is None:
+                continue
+
+            child_text = child_path.read_text()
+            child_tests = extract_test_functions(child_text)
+            if re.search(r"^\s*mod\s+tests\s*\{", child_text, re.MULTILINE):
+                for fn_name in child_tests:
+                    test_paths.add(f"{mod_name}::tests::{fn_name}")
+            else:
+                for fn_name in child_tests:
+                    test_paths.add(f"{mod_name}::{fn_name}")
+
+    return test_paths
+
+
 def parse_markdown_table(path: Path) -> list[dict[str, str]]:
     """Parse markdown tables into list of dicts (header → value)."""
     rows = []
@@ -147,6 +199,10 @@ def main() -> int:
                     real_test_paths.add(line[:-6])  # strip ": test"
         except (FileNotFoundError, subprocess.CalledProcessError):
             pass
+
+    # Always supplement with source-derived integration test paths so valid test
+    # trees remain discoverable even when unrelated integration crates fail.
+    real_test_paths.update(collect_integration_test_paths())
 
     if not cargo_available:
         # Fallback: scan source files for bare function names. In this mode
