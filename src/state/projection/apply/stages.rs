@@ -167,7 +167,9 @@ pub(crate) fn check_deps_and_block(
     deps: &[(&str, EventId)],
 ) -> Result<Option<ProjectionDecision>, Box<dyn std::error::Error>> {
     let mut missing = Vec::new();
-    for (_field_name, dep_id) in deps {
+    let mut blocked_by_key = false;
+    let mut blocked_by_dep = false;
+    for (field_name, dep_id) in deps {
         let dep_b64 = event_id_to_base64(dep_id);
         let dep_valid: bool = conn.query_row(
             "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
@@ -176,6 +178,11 @@ pub(crate) fn check_deps_and_block(
         )?;
         if !dep_valid {
             missing.push(*dep_id);
+            if *field_name == "key_event_id" {
+                blocked_by_key = true;
+            } else {
+                blocked_by_dep = true;
+            }
         }
     }
 
@@ -199,9 +206,54 @@ pub(crate) fn check_deps_and_block(
         rusqlite::params![recorded_by, event_id_b64, missing.len() as i64],
     )?;
     let _ = WantedEvents::new(conn).insert_many_for_local(recorded_by, &missing);
-    let _ = EventTimeline::new(conn).mark_blocked_b64(event_id_b64, current_timestamp_ms());
+    let blocked_at = current_timestamp_ms();
+    let timeline = EventTimeline::new(conn);
+    let _ = timeline.mark_blocked_b64(event_id_b64, blocked_at);
+    if blocked_by_key {
+        let _ = timeline.mark_blocked_by_key_b64(event_id_b64, blocked_at);
+    }
+    if blocked_by_dep {
+        let _ = timeline.mark_blocked_by_dep_b64(event_id_b64, blocked_at);
+    }
 
     Ok(Some(ProjectionDecision::Block { missing }))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::timeline::EventTimeline;
+    use crate::db::{open_in_memory, schema::create_tables};
+
+    fn event_id(byte: u8) -> EventId {
+        let mut event_id = [0u8; 32];
+        event_id[0] = byte;
+        event_id
+    }
+
+    #[test]
+    fn check_deps_and_block_marks_key_and_dep_block_timestamps() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let event_id_b64 = crate::crypto::event_id_to_base64(&event_id(1));
+
+        let decision = check_deps_and_block(
+            &conn,
+            "peer-a",
+            &event_id_b64,
+            &[("key_event_id", event_id(2)), ("signed_by", event_id(3))],
+        )
+        .unwrap();
+        assert!(matches!(decision, Some(ProjectionDecision::Block { .. })));
+
+        let row = EventTimeline::new(&conn)
+            .load(&event_id_b64)
+            .unwrap()
+            .unwrap();
+        assert!(row.blocked_at.is_some());
+        assert!(row.blocked_by_key_at.is_some());
+        assert!(row.blocked_by_dep_at.is_some());
+    }
 }
 
 /// Shared projection helper: verify signer (if required), build context snapshot,

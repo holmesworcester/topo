@@ -386,8 +386,16 @@ fn append_dependency_timeline_summary(
                 .map(short_id)
                 .unwrap_or("-");
             summary.push_str(&format!(
-                "    blocking: blocked={} | unblocked={} | by={} | blocked->unblocked={} | unblocked->projected={}\n",
+                "    blocking: blocked={} | blocked_by_key={} | blocked_by_dep={} | unblocked={} | by={} | blocked->unblocked={} | unblocked->projected={}\n",
                 fmt_rel_ts(bob_row.as_ref().and_then(|row| row.blocked_at), metric_start_ms),
+                fmt_rel_ts(
+                    bob_row.as_ref().and_then(|row| row.blocked_by_key_at),
+                    metric_start_ms,
+                ),
+                fmt_rel_ts(
+                    bob_row.as_ref().and_then(|row| row.blocked_by_dep_at),
+                    metric_start_ms,
+                ),
                 fmt_rel_ts(bob_row.as_ref().and_then(|row| row.unblocked_at), metric_start_ms),
                 unblocked_by,
                 fmt_rel_delta(
@@ -403,7 +411,7 @@ fn append_dependency_timeline_summary(
         if item.event_type == "key_secret" {
             if let Some(provenance) = lookup_key_secret_provenance(bob_db, bob_peer_id, &item.id) {
                 summary.push_str(&format!(
-                    "    wrapped_from key_shared[{}]: discovered={} | requested={} | arrived={} | projected={}; key_secret_unwrapped_recorded={} | key_secret_projected={}\n",
+                    "    wrapped_from key_shared[{}]: discovered={} | requested={} | arrived={} | persisted={} | blocked_by_dep={} | unblocked={} | projected={}; key_secret_unwrapped_recorded={} | key_secret_projected={}\n",
                     short_id(&provenance.wrapped_key_event_id),
                     fmt_rel_ts(
                         provenance
@@ -424,6 +432,27 @@ fn append_dependency_timeline_summary(
                             .wrapped_key_timeline
                             .as_ref()
                             .and_then(|row| row.response_received_at),
+                        metric_start_ms,
+                    ),
+                    fmt_rel_ts(
+                        provenance
+                            .wrapped_key_timeline
+                            .as_ref()
+                            .and_then(|row| row.persisted_at),
+                        metric_start_ms,
+                    ),
+                    fmt_rel_ts(
+                        provenance
+                            .wrapped_key_timeline
+                            .as_ref()
+                            .and_then(|row| row.blocked_by_dep_at),
+                        metric_start_ms,
+                    ),
+                    fmt_rel_ts(
+                        provenance
+                            .wrapped_key_timeline
+                            .as_ref()
+                            .and_then(|row| row.unblocked_at),
                         metric_start_ms,
                     ),
                     fmt_rel_ts(

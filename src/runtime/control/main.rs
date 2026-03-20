@@ -1583,6 +1583,18 @@ fn print_event_timeline_summary_with_deps(
             format_timeline_stage_ts(row.blocked_at, anchor_ts)
         );
     }
+    if row.blocked_by_key_at.is_some() {
+        println!(
+            "  blocked_by_key_at: {}",
+            format_timeline_stage_ts(row.blocked_by_key_at, anchor_ts)
+        );
+    }
+    if row.blocked_by_dep_at.is_some() {
+        println!(
+            "  blocked_by_dep_at: {}",
+            format_timeline_stage_ts(row.blocked_by_dep_at, anchor_ts)
+        );
+    }
     if row.unblocked_at.is_some() || row.unblocked_by_event_id.is_some() {
         let mut line = format!(
             "  unblocked_at: {}",
@@ -1643,6 +1655,8 @@ fn print_event_timeline_summary_with_deps(
         ("response_received_at", row.response_received_at),
         ("persisted_at", row.persisted_at),
         ("blocked_at", row.blocked_at),
+        ("blocked_by_key_at", row.blocked_by_key_at),
+        ("blocked_by_dep_at", row.blocked_by_dep_at),
         ("unblocked_at", row.unblocked_at),
         ("projected_at", row.projected_at),
     ] {
@@ -1678,6 +1692,12 @@ fn print_event_timeline_summary_with_deps(
     }
     if let Some(ms) = diff_ms(row.wanted_discovered_at, row.projected_at) {
         spans.push(format!("discovered->projected={}ms", ms));
+    }
+    if let Some(ms) = diff_ms(row.blocked_by_key_at, row.unblocked_at) {
+        spans.push(format!("blocked_by_key={}ms", ms));
+    }
+    if let Some(ms) = diff_ms(row.blocked_by_dep_at, row.unblocked_at) {
+        spans.push(format!("blocked_by_dep={}ms", ms));
     }
     if let Some(ms) = diff_ms(row.blocked_at, row.unblocked_at) {
         spans.push(format!("blocked={}ms", ms));

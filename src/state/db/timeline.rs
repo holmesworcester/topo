@@ -51,6 +51,8 @@ pub struct EventTimelineRow {
     pub response_received_at: Option<i64>,
     pub persisted_at: Option<i64>,
     pub blocked_at: Option<i64>,
+    pub blocked_by_key_at: Option<i64>,
+    pub blocked_by_dep_at: Option<i64>,
     pub unblocked_at: Option<i64>,
     pub unblocked_by_event_id: Option<String>,
     pub projected_at: Option<i64>,
@@ -78,6 +80,8 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
             response_received_at INTEGER,
             persisted_at INTEGER,
             blocked_at INTEGER,
+            blocked_by_key_at INTEGER,
+            blocked_by_dep_at INTEGER,
             unblocked_at INTEGER,
             unblocked_by_event_id TEXT,
             projected_at INTEGER
@@ -89,6 +93,8 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     ensure_column(conn, "need_list_received_at")?;
     ensure_column(conn, "request_credit_received_at")?;
     ensure_column(conn, "request_selected_at")?;
+    ensure_column(conn, "blocked_by_key_at")?;
+    ensure_column(conn, "blocked_by_dep_at")?;
     if !column_exists(conn, "unblocked_by_event_id")? {
         conn.execute(
             "ALTER TABLE event_timeline ADD COLUMN unblocked_by_event_id TEXT",
@@ -105,13 +111,13 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
 ///   unset → enabled in debug builds, disabled in release builds
 pub fn recording_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        match std::env::var("TOPO_EVENT_TIMELINE").ok().as_deref() {
+    *ENABLED.get_or_init(
+        || match std::env::var("TOPO_EVENT_TIMELINE").ok().as_deref() {
             Some("0") | Some("false") | Some("FALSE") | Some("no") | Some("NO") => false,
             Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") => true,
             _ => cfg!(debug_assertions),
-        }
-    })
+        },
+    )
 }
 
 fn enabled_groups_mask() -> u8 {
@@ -270,6 +276,20 @@ impl<'a> EventTimeline<'a> {
         self.mark_b64(event_id_b64, "blocked_at", ts)
     }
 
+    pub fn mark_blocked_by_key_b64(&self, event_id_b64: &str, ts: i64) -> SqliteResult<()> {
+        if !group_enabled(TimelineGroup::Blocking) {
+            return Ok(());
+        }
+        self.mark_b64(event_id_b64, "blocked_by_key_at", ts)
+    }
+
+    pub fn mark_blocked_by_dep_b64(&self, event_id_b64: &str, ts: i64) -> SqliteResult<()> {
+        if !group_enabled(TimelineGroup::Blocking) {
+            return Ok(());
+        }
+        self.mark_b64(event_id_b64, "blocked_by_dep_at", ts)
+    }
+
     pub fn mark_unblocked_b64(&self, event_id_b64: &str, ts: i64) -> SqliteResult<()> {
         self.mark_unblocked_with_dependency_b64(event_id_b64, ts, None)
     }
@@ -322,6 +342,8 @@ impl<'a> EventTimeline<'a> {
                          response_received_at,
                          persisted_at,
                          blocked_at,
+                         blocked_by_key_at,
+                         blocked_by_dep_at,
                          unblocked_at,
                          unblocked_by_event_id,
                          projected_at
@@ -344,9 +366,11 @@ impl<'a> EventTimeline<'a> {
                             response_received_at: row.get(11)?,
                             persisted_at: row.get(12)?,
                             blocked_at: row.get(13)?,
-                            unblocked_at: row.get(14)?,
-                            unblocked_by_event_id: row.get(15)?,
-                            projected_at: row.get(16)?,
+                            blocked_by_key_at: row.get(14)?,
+                            blocked_by_dep_at: row.get(15)?,
+                            unblocked_at: row.get(16)?,
+                            unblocked_by_event_id: row.get(17)?,
+                            projected_at: row.get(18)?,
                         })
                     },
                 )
@@ -419,6 +443,16 @@ impl<'a> EventTimeline<'a> {
                 row.response_received_at,
                 row.persisted_at,
             ),
+            span_label(
+                "key_blocked_duration_ms",
+                row.blocked_by_key_at,
+                row.unblocked_at,
+            ),
+            span_label(
+                "dep_blocked_duration_ms",
+                row.blocked_by_dep_at,
+                row.unblocked_at,
+            ),
             span_label("persist_to_project_ms", row.persisted_at, row.projected_at),
             span_label("blocked_duration_ms", row.blocked_at, row.unblocked_at),
         ]
@@ -427,7 +461,7 @@ impl<'a> EventTimeline<'a> {
         .collect::<Vec<_>>()
         .join(", ");
         let stages = format!(
-            "discover_start={}; discover_done={}; need_sent={}; need_recv={}; wanted={}; credit_recv={}; req_selected={}; req_sent={}; req_recv={}; resp_sent={}; resp_recv={}; persisted={}; blocked={}; unblocked={}; unblocked_by={}; projected={}",
+            "discover_start={}; discover_done={}; need_sent={}; need_recv={}; wanted={}; credit_recv={}; req_selected={}; req_sent={}; req_recv={}; resp_sent={}; resp_recv={}; persisted={}; blocked={}; blocked_by_key={}; blocked_by_dep={}; unblocked={}; unblocked_by={}; projected={}",
             fmt_opt(row.discovery_round_started_at),
             fmt_opt(row.discovery_round_completed_at),
             fmt_opt(row.need_list_sent_at),
@@ -441,6 +475,8 @@ impl<'a> EventTimeline<'a> {
             fmt_opt(row.response_received_at),
             fmt_opt(row.persisted_at),
             fmt_opt(row.blocked_at),
+            fmt_opt(row.blocked_by_key_at),
+            fmt_opt(row.blocked_by_dep_at),
             fmt_opt(row.unblocked_at),
             row.unblocked_by_event_id
                 .clone()
@@ -566,6 +602,8 @@ mod tests {
             .unwrap();
         timeline.mark_persisted_b64(&event_id_b64, 60).unwrap();
         timeline.mark_blocked_b64(&event_id_b64, 65).unwrap();
+        timeline.mark_blocked_by_key_b64(&event_id_b64, 66).unwrap();
+        timeline.mark_blocked_by_dep_b64(&event_id_b64, 67).unwrap();
         timeline
             .mark_unblocked_with_dependency_b64(&event_id_b64, 70, Some("dep-1"))
             .unwrap();
@@ -583,6 +621,8 @@ mod tests {
         assert_eq!(row.response_received_at, Some(50));
         assert_eq!(row.persisted_at, Some(60));
         assert_eq!(row.blocked_at, Some(65));
+        assert_eq!(row.blocked_by_key_at, Some(66));
+        assert_eq!(row.blocked_by_dep_at, Some(67));
         assert_eq!(row.unblocked_at, Some(70));
         assert_eq!(row.unblocked_by_event_id.as_deref(), Some("dep-1"));
         assert_eq!(row.projected_at, Some(80));
@@ -590,6 +630,8 @@ mod tests {
         let summary = timeline.summary(&event_id_b64).unwrap().unwrap();
         assert!(summary.contains("persist_to_project_ms=20"));
         assert!(summary.contains("selected_to_request_ms=1"));
+        assert!(summary.contains("blocked_by_key=66"));
+        assert!(summary.contains("blocked_by_dep=67"));
         assert!(summary.contains("unblocked_by=dep-1"));
     }
 
