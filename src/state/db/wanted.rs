@@ -1,7 +1,8 @@
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 
 use super::queue::{
-    current_timestamp_ms, with_immediate_tx, with_sqlite_busy_retry, PRIORITY_LANE_FOREGROUND,
+    current_timestamp_ms, with_immediate_tx, with_sqlite_busy_retry, PRIORITY_LANE_BLOCKER,
+    PRIORITY_LANE_FOREGROUND,
 };
 use super::timeline::EventTimeline;
 use crate::crypto::{event_id_to_base64, EventId};
@@ -122,6 +123,7 @@ impl<'a> WantedEvents<'a> {
             .prepare("INSERT OR IGNORE INTO wanted_events (id, first_seen_at) VALUES (?1, ?2)")?;
 
         let mut inserted = 0usize;
+        let mut unresolved = Vec::new();
         for id in ids {
             let id_b64 = event_id_to_base64(id);
             let already_local = already_recorded
@@ -136,7 +138,9 @@ impl<'a> WantedEvents<'a> {
             if rows > 0 {
                 inserted += 1;
             }
+            unresolved.push(*id);
         }
+        promote_wanted_sources_to_blocker(self.conn, &unresolved)?;
 
         Ok(inserted)
     }
@@ -159,12 +163,16 @@ impl<'a> WantedEvents<'a> {
         with_immediate_tx(self.conn, || {
             // Batch-check which hints are already locally recorded in one query
             // instead of N individual lookups.
-            let hint_b64s: Vec<String> = hints.iter().map(|h| event_id_to_base64(&h.event_id)).collect();
+            let hint_b64s: Vec<String> = hints
+                .iter()
+                .map(|h| event_id_to_base64(&h.event_id))
+                .collect();
             let already_local_set: std::collections::HashSet<String> = {
                 let mut set = std::collections::HashSet::new();
                 // SQLite max variable count is 999; chunk to stay within limits
                 for chunk in hint_b64s.chunks(900) {
-                    let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                    let placeholders: String =
+                        chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                     let sql = format!(
                         "SELECT event_id FROM recorded_events WHERE peer_id = ?1 AND event_id IN ({})",
                         placeholders
@@ -195,10 +203,21 @@ impl<'a> WantedEvents<'a> {
             let mut upsert_source = self.conn.prepare(
                 "INSERT INTO wanted_sources (
                      event_id, peer_id, first_seen_at, last_seen_at, priority_lane, priority_ts
-                 ) VALUES (?1, ?2, ?3, ?3, ?4, ?5)
+                 ) VALUES (
+                     ?1, ?2, ?3, ?3,
+                     CASE
+                         WHEN EXISTS (
+                             SELECT 1
+                             FROM blocked_event_deps
+                             WHERE peer_id = ?6 AND blocker_event_id = ?7
+                         ) THEN ?8
+                         ELSE ?4
+                     END,
+                     ?5
+                 )
                  ON CONFLICT(event_id, peer_id) DO UPDATE SET
                      last_seen_at = excluded.last_seen_at,
-                     priority_lane = excluded.priority_lane,
+                     priority_lane = MIN(wanted_sources.priority_lane, excluded.priority_lane),
                      priority_ts = MAX(wanted_sources.priority_ts, excluded.priority_ts)",
             )?;
 
@@ -215,12 +234,16 @@ impl<'a> WantedEvents<'a> {
                     i64::from(hint.semantic_type_code),
                     i64::from(hint.encoded_size_bytes),
                 ])?;
+                let priority_ts = priority_ts_from_created_at_ms(hint.created_at_ms);
                 upsert_source.execute(params![
                     &hint.event_id[..],
                     peer_id,
                     now,
                     PRIORITY_LANE_FOREGROUND,
-                    now,
+                    priority_ts,
+                    local_peer_id,
+                    id_b64,
+                    PRIORITY_LANE_BLOCKER,
                 ])?;
                 observed += 1;
                 discovered_ids.push(hint.event_id);
@@ -354,6 +377,26 @@ fn local_event_exists(conn: &Connection, event_id_b64: &str) -> SqliteResult<boo
     .map(|row| row.is_some())
 }
 
+fn priority_ts_from_created_at_ms(created_at_ms: u64) -> i64 {
+    i64::try_from(created_at_ms).unwrap_or(i64::MAX)
+}
+
+fn promote_wanted_sources_to_blocker(conn: &Connection, ids: &[EventId]) -> SqliteResult<()> {
+    if ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut stmt = conn.prepare(
+        "UPDATE wanted_sources
+         SET priority_lane = MIN(priority_lane, ?2)
+         WHERE event_id = ?1",
+    )?;
+    for id in ids {
+        stmt.execute(params![&id[..], PRIORITY_LANE_BLOCKER])?;
+    }
+    Ok(())
+}
+
 fn delete_wanted_row(conn: &Connection, id: &EventId) -> SqliteResult<()> {
     conn.execute(
         "DELETE FROM wanted_sources WHERE event_id = ?1",
@@ -376,11 +419,17 @@ mod tests {
         id
     }
 
-    fn discovery_hint(byte: u8, type_code: u8, encoded_size_bytes: u32) -> DiscoveryHint {
+    fn discovery_hint(
+        byte: u8,
+        type_code: u8,
+        encoded_size_bytes: u32,
+        created_at_ms: u64,
+    ) -> DiscoveryHint {
         DiscoveryHint {
             event_id: make_event_id(byte),
             semantic_type_code: type_code,
             encoded_size_bytes,
+            created_at_ms,
         }
     }
 
@@ -458,7 +507,12 @@ mod tests {
                 .observe_many_for_peer(
                     "local",
                     "peer-a",
-                    &[discovery_hint(7, crate::event_modules::EVENT_TYPE_MESSAGE, 144)],
+                    &[discovery_hint(
+                        7,
+                        crate::event_modules::EVENT_TYPE_MESSAGE,
+                        144,
+                        7_000,
+                    )],
                     1,
                     &timeline,
                 )
@@ -482,8 +536,8 @@ mod tests {
         let wanted = WantedEvents::new(&conn);
         let timeline = EventTimeline::new(&conn);
         let hints = [
-            discovery_hint(1, crate::event_modules::EVENT_TYPE_MESSAGE, 144),
-            discovery_hint(2, crate::event_modules::EVENT_TYPE_REACTION, 96),
+            discovery_hint(1, crate::event_modules::EVENT_TYPE_MESSAGE, 144, 2_000),
+            discovery_hint(2, crate::event_modules::EVENT_TYPE_REACTION, 96, 1_000),
         ];
 
         wanted
@@ -495,9 +549,110 @@ mod tests {
 
         let peer_a_candidates = wanted.list_candidates_for_peer("peer-a", 8).unwrap();
         assert_eq!(peer_a_candidates.len(), 2);
-        assert_eq!(peer_a_candidates[0].semantic_type_code, crate::event_modules::EVENT_TYPE_MESSAGE);
+        assert_eq!(
+            peer_a_candidates[0].semantic_type_code,
+            crate::event_modules::EVENT_TYPE_MESSAGE
+        );
         assert_eq!(peer_a_candidates[0].encoded_size_bytes, 144);
         assert_eq!(wanted.count_backlog_for_peer("peer-b").unwrap(), 2);
+    }
+
+    #[test]
+    fn test_candidates_prefer_newer_created_at_first() {
+        let conn = crate::db::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let wanted = WantedEvents::new(&conn);
+        let timeline = EventTimeline::new(&conn);
+        let older = make_event_id(1);
+        let newer = make_event_id(2);
+
+        wanted
+            .observe_many_for_peer(
+                "local",
+                "peer-a",
+                &[
+                    DiscoveryHint {
+                        event_id: older,
+                        semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
+                        encoded_size_bytes: 144,
+                        created_at_ms: 1_000,
+                    },
+                    DiscoveryHint {
+                        event_id: newer,
+                        semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
+                        encoded_size_bytes: 144,
+                        created_at_ms: 2_000,
+                    },
+                ],
+                1,
+                &timeline,
+            )
+            .unwrap();
+
+        let candidates = wanted.list_candidates_for_peer("peer-a", 8).unwrap();
+        assert_eq!(
+            candidates
+                .iter()
+                .map(|candidate| candidate.event_id)
+                .collect::<Vec<_>>(),
+            vec![newer, older],
+            "request planning should prefer the newest known events first"
+        );
+    }
+
+    #[test]
+    fn test_insert_many_for_local_promotes_existing_sources_to_blocker_lane() {
+        let conn = crate::db::open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let wanted = WantedEvents::new(&conn);
+        let timeline = EventTimeline::new(&conn);
+        let blocker = make_event_id(7);
+        let unrelated = make_event_id(8);
+
+        wanted
+            .observe_many_for_peer(
+                "local",
+                "peer-a",
+                &[
+                    DiscoveryHint {
+                        event_id: blocker,
+                        semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
+                        encoded_size_bytes: 144,
+                        created_at_ms: 100,
+                    },
+                    DiscoveryHint {
+                        event_id: unrelated,
+                        semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
+                        encoded_size_bytes: 144,
+                        created_at_ms: 5_000,
+                    },
+                ],
+                1,
+                &timeline,
+            )
+            .unwrap();
+
+        let before = wanted.list_candidates_for_peer("peer-a", 8).unwrap();
+        assert_eq!(
+            before
+                .iter()
+                .map(|candidate| candidate.event_id)
+                .collect::<Vec<_>>(),
+            vec![unrelated, blocker],
+            "newer foreground work should lead before blocker promotion"
+        );
+
+        wanted.insert_many_for_local("local", &[blocker]).unwrap();
+
+        let after = wanted.list_candidates_for_peer("peer-a", 8).unwrap();
+        assert_eq!(
+            after
+                .iter()
+                .map(|candidate| candidate.event_id)
+                .collect::<Vec<_>>(),
+            vec![blocker, unrelated],
+            "missing deps that already block local work should jump ahead of normal pulls"
+        );
     }
 
     #[test]
@@ -516,6 +671,7 @@ mod tests {
                     event_id: id,
                     semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
                     encoded_size_bytes: 144,
+                    created_at_ms: 1_000,
                 }],
                 1,
                 &timeline,
@@ -529,6 +685,7 @@ mod tests {
                     event_id: id,
                     semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
                     encoded_size_bytes: 144,
+                    created_at_ms: 1_000,
                 }],
                 1,
                 &timeline,
@@ -570,6 +727,7 @@ mod tests {
                     event_id: id,
                     semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
                     encoded_size_bytes: 144,
+                    created_at_ms: 1_000,
                 }],
                 1,
                 &timeline,
@@ -590,6 +748,7 @@ mod tests {
                         event_id: id,
                         semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
                         encoded_size_bytes: 144,
+                        created_at_ms: 1_000,
                     }],
                     1,
                     &timeline,

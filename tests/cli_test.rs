@@ -20,12 +20,14 @@ use std::process::{Command, Stdio};
 use std::time::{Duration, Instant};
 use topo::crypto::event_id_from_base64;
 use topo::db::open_connection;
+use topo::db::timeline::EventTimeline;
 use topo::event_modules::workspace::commands::{
     accept_invite as accept_invite_without_sync, create_user_invite_raw,
 };
 use topo::event_modules::workspace::invite_link::{
     create_invite_link, parse_bootstrap_address, parse_invite_link, rewrite_bootstrap_addrs,
 };
+use topo::service;
 use topo::testutil::Peer;
 
 fn create_user_invite_link_for_test_peer(creator: &Peer, bootstrap_addr: &str) -> String {
@@ -77,11 +79,7 @@ fn tenant_index_for_peer_id(db_path: &str, peer_id: &str) -> usize {
         .expect("peer id should appear in tenant scopes")
 }
 
-fn wait_for_endpoint_observation(
-    db_path: &str,
-    remote_peer_id: &str,
-    timeout: Duration,
-) {
+fn wait_for_endpoint_observation(db_path: &str, remote_peer_id: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         let now_ms = std::time::SystemTime::now()
@@ -939,11 +937,7 @@ fn test_cli_reconnects_after_bootstrap_supersession_using_observed_endpoint() {
     );
 
     let alice_transport_peer_id = daemon_transport_fingerprint(&alice_db);
-    wait_for_endpoint_observation(
-        &bob_db,
-        &alice_transport_peer_id,
-        Duration::from_secs(15),
-    );
+    wait_for_endpoint_observation(&bob_db, &alice_transport_peer_id, Duration::from_secs(15));
 
     stop_daemon(&bob_db, &mut bob_daemon);
 
@@ -997,11 +991,7 @@ fn test_cli_lowmem_receiver_restart_catches_offline_delta_and_resumes_sync() {
     assert_eventually(&bob_db, "message_count >= 2000", timeout_ms);
 
     let alice_transport_peer_id = daemon_transport_fingerprint(&alice_db);
-    wait_for_endpoint_observation(
-        &bob_db,
-        &alice_transport_peer_id,
-        Duration::from_secs(15),
-    );
+    wait_for_endpoint_observation(&bob_db, &alice_transport_peer_id, Duration::from_secs(15));
 
     stop_daemon(&bob_db, &mut bob_daemon);
 
@@ -2639,11 +2629,7 @@ fn test_cli_shared_db_same_workspace_accepts_distinct_explicit_invites() {
         "dave-laptop",
     );
     let dave_tenant = dave.tenant_label();
-    wait_for_endpoint_observation(
-        &dave.db,
-        &alpha_transport_peer_id,
-        Duration::from_secs(30),
-    );
+    wait_for_endpoint_observation(&dave.db, &alpha_transport_peer_id, Duration::from_secs(30));
 
     let alpha_live_msg = "alpha-space/alpha-via-explicit-bootstrap";
     let alpha_live_eid = send_message(&alpha.db, alpha_live_msg);
@@ -2839,11 +2825,7 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
         &alpha_transport_peer_id,
         Duration::from_secs(30),
     );
-    wait_for_endpoint_observation(
-        &shared_db,
-        &zeta_transport_peer_id,
-        Duration::from_secs(30),
-    );
+    wait_for_endpoint_observation(&shared_db, &zeta_transport_peer_id, Duration::from_secs(30));
 
     let dave_alpha_invite = create_invite(&alpha.db, &daemon_listen_addr(&alpha.db));
     let emma_zeta_invite = create_invite(&zeta.db, &daemon_listen_addr(&zeta.db));
@@ -2857,11 +2839,7 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
     );
     let dave_tenant = dave.tenant_label();
     wait_for_active_tenant_ready(&dave.db, Duration::from_millis(timeout_ms));
-    wait_for_endpoint_observation(
-        &dave.db,
-        &alpha_transport_peer_id,
-        Duration::from_secs(30),
-    );
+    wait_for_endpoint_observation(&dave.db, &alpha_transport_peer_id, Duration::from_secs(30));
 
     let emma = start_joined_cli_peer(
         &tmpdir,
@@ -2872,11 +2850,7 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
     );
     let emma_tenant = emma.tenant_label();
     wait_for_active_tenant_ready(&emma.db, Duration::from_millis(timeout_ms));
-    wait_for_endpoint_observation(
-        &emma.db,
-        &zeta_transport_peer_id,
-        Duration::from_secs(30),
-    );
+    wait_for_endpoint_observation(&emma.db, &zeta_transport_peer_id, Duration::from_secs(30));
 
     let dave_alpha_msg = "alpha-space/dave-external";
     let dave_alpha_eid = send_message(&dave.db, dave_alpha_msg);
@@ -3561,11 +3535,7 @@ fn test_cli_files_and_save_file_roundtrip_after_sync() {
     // sending the file. Without this, the file-transfer timeout burns
     // time waiting for the QUIC handshake under CPU pressure.
     let gate_eid = send_message(&alice_db, "pre-file-gate");
-    assert_eventually(
-        &bob_db,
-        &format!("has_event:{} >= 1", gate_eid),
-        timeout_ms,
-    );
+    assert_eventually(&bob_db, &format!("has_event:{} >= 1", gate_eid), timeout_ms);
 
     let send_out = Command::new(bin())
         .args([
@@ -3827,6 +3797,293 @@ fn test_cli_event_list_empty_db() {
     assert!(
         stdout.contains("no events"),
         "event-list on empty db should say no events, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_cli_event_timeline_shows_anchored_stage_offsets() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("event_timeline.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+
+    let conn = open_connection(&db).expect("open db");
+    let event_id_b64: String = conn
+        .query_row(
+            "SELECT event_id
+             FROM events
+             WHERE event_type = 'workspace'
+             ORDER BY created_at ASC, event_id ASC
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("workspace event id");
+    conn.execute(
+        "DELETE FROM event_timeline WHERE event_id = ?1",
+        rusqlite::params![&event_id_b64],
+    )
+    .expect("clear existing event timeline row");
+    let event_id = event_id_from_base64(&event_id_b64).expect("decode event id");
+    let timeline = EventTimeline::new(&conn);
+    timeline
+        .mark_discovered_many_with_round_start(&[event_id], 1_000, 1_020)
+        .expect("mark discovered");
+    timeline
+        .mark_request_selected_many(&[event_id], 1_025)
+        .expect("mark request selected");
+    timeline
+        .mark_request_sent_many(&[event_id], 1_026)
+        .expect("mark request sent");
+    timeline
+        .mark_response_received_b64(&event_id_b64, 1_044)
+        .expect("mark response received");
+    timeline
+        .mark_persisted_b64(&event_id_b64, 1_046)
+        .expect("mark persisted");
+    timeline
+        .mark_projected_b64(&event_id_b64, 1_050)
+        .expect("mark projected");
+    drop(conn);
+
+    let prefix = &event_id_b64[..8];
+    let out = Command::new(bin())
+        .args(["--db", &db, "event", "timeline", prefix])
+        .output()
+        .expect("event timeline command");
+    assert!(
+        out.status.success(),
+        "event timeline failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("anchor: wanted_discovered_at = 1020 (+0ms)"),
+        "event timeline should anchor on wanted_discovered_at, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("request_selected_at") && stdout.contains("1025 (+5ms)"),
+        "event timeline should show anchored request_selected_at offset, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("projected_at") && stdout.contains("1050 (+30ms)"),
+        "event timeline should show anchored projected_at offset, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("discovered->projected=30ms"),
+        "event timeline should show derived span summary, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_cli_event_timeline_shows_dep_projection_order_and_unblocked_at() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("event_timeline_deps.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+
+    let (recorded_by, conn) = service::open_db_load(&db).expect("open db load");
+    let peer_shared = service::svc_event_list(&conn, &recorded_by)
+        .expect("list events")
+        .events
+        .into_iter()
+        .find(|item| item.event_type == "peer_shared")
+        .expect("peer_shared event");
+    assert_eq!(
+        peer_shared.deps.len(),
+        2,
+        "expected peer_shared to have 2 deps"
+    );
+
+    conn.execute(
+        "DELETE FROM event_timeline WHERE event_id = ?1",
+        rusqlite::params![&peer_shared.id],
+    )
+    .expect("clear peer_shared timeline");
+    for (_, dep_id) in &peer_shared.deps {
+        conn.execute(
+            "DELETE FROM event_timeline WHERE event_id = ?1",
+            rusqlite::params![dep_id],
+        )
+        .expect("clear dep timeline");
+    }
+
+    let timeline = EventTimeline::new(&conn);
+    let dep_a = &peer_shared.deps[0].1;
+    let dep_b = &peer_shared.deps[1].1;
+    timeline
+        .mark_projected_b64(dep_a, 1_110)
+        .expect("mark dep a projected");
+    timeline
+        .mark_projected_b64(dep_b, 1_120)
+        .expect("mark dep b projected");
+
+    let peer_shared_id = event_id_from_base64(&peer_shared.id).expect("decode peer_shared id");
+    timeline
+        .mark_discovered_many_with_round_start(&[peer_shared_id], 1_000, 1_000)
+        .expect("mark peer_shared discovered");
+    timeline
+        .mark_blocked_b64(&peer_shared.id, 1_001)
+        .expect("mark peer_shared blocked");
+    timeline
+        .mark_unblocked_with_dependency_b64(&peer_shared.id, 1_120, Some(dep_b))
+        .expect("mark peer_shared unblocked");
+    timeline
+        .mark_projected_b64(&peer_shared.id, 1_125)
+        .expect("mark peer_shared projected");
+    drop(conn);
+
+    let prefix = &peer_shared.id[..8];
+    let out = Command::new(bin())
+        .args(["--db", &db, "event", "timeline", prefix])
+        .output()
+        .expect("event timeline command");
+    assert!(
+        out.status.success(),
+        "event timeline failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("blocked_at: 1001 (+1ms)"),
+        "event timeline should show blocked_at, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("unblocked_at: 1120 (+120ms) by"),
+        "event timeline should show explicit unblocked_at line, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("dep projection order:"),
+        "event timeline should show dep projection order section, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("projected_at=1110 (+110ms)")
+            && stdout.contains("projected_at=1120 (+120ms)"),
+        "event timeline should show dep projection timestamps, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("<- unblocked_by"),
+        "event timeline should mark the dep that unblocked the event, got:\n{}",
+        stdout
+    );
+}
+
+#[test]
+fn test_cli_event_timeline_shows_transitive_unblock_chain() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("event_timeline_chain.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+
+    let (recorded_by, conn) = service::open_db_load(&db).expect("open db load");
+    let events = service::svc_event_list(&conn, &recorded_by)
+        .expect("list events")
+        .events;
+    let user = events
+        .iter()
+        .find(|item| item.event_type == "user")
+        .expect("user event")
+        .clone();
+    let user_invite_shared = events
+        .iter()
+        .find(|item| item.event_type == "user_invite_shared")
+        .expect("user_invite_shared event")
+        .clone();
+    let workspace = events
+        .iter()
+        .find(|item| item.event_type == "workspace")
+        .expect("workspace event")
+        .clone();
+
+    for event_id in [&user.id, &user_invite_shared.id, &workspace.id] {
+        conn.execute(
+            "DELETE FROM event_timeline WHERE event_id = ?1",
+            rusqlite::params![event_id],
+        )
+        .expect("clear timeline row");
+    }
+
+    let timeline = EventTimeline::new(&conn);
+    timeline
+        .mark_projected_b64(&workspace.id, 1_110)
+        .expect("mark workspace projected");
+    timeline
+        .mark_blocked_b64(&user_invite_shared.id, 1_111)
+        .expect("mark user_invite_shared blocked");
+    timeline
+        .mark_unblocked_with_dependency_b64(&user_invite_shared.id, 1_112, Some(&workspace.id))
+        .expect("mark user_invite_shared unblocked");
+    timeline
+        .mark_projected_b64(&user_invite_shared.id, 1_113)
+        .expect("mark user_invite_shared projected");
+
+    let user_id = event_id_from_base64(&user.id).expect("decode user id");
+    timeline
+        .mark_discovered_many_with_round_start(&[user_id], 1_100, 1_120)
+        .expect("mark user discovered");
+    timeline
+        .mark_blocked_b64(&user.id, 1_121)
+        .expect("mark user blocked");
+    timeline
+        .mark_unblocked_with_dependency_b64(&user.id, 1_123, Some(&user_invite_shared.id))
+        .expect("mark user unblocked");
+    timeline
+        .mark_projected_b64(&user.id, 1_125)
+        .expect("mark user projected");
+    drop(conn);
+
+    let prefix = &user.id[..8];
+    let out = Command::new(bin())
+        .args(["--db", &db, "event", "timeline", prefix])
+        .output()
+        .expect("event timeline command");
+    assert!(
+        out.status.success(),
+        "event timeline failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("critical unblock chain:"),
+        "event timeline should show a critical unblock chain section, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("signed_by -> user_invite_shared")
+            && stdout.contains("projected_at=1113 (-7ms)")
+            && stdout.contains("unblocked user at 1123 (+3ms)"),
+        "event timeline should show the immediate blocker step, got:\n{}",
+        stdout
+    );
+    assert!(
+        stdout.contains("authority_event_id|signed_by -> workspace")
+            && stdout.contains("projected_at=1110 (-10ms)")
+            && stdout.contains("unblocked user_invite_shared at 1112 (-8ms)"),
+        "event timeline should show the transitive blocker step, got:\n{}",
         stdout
     );
 }

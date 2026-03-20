@@ -15,7 +15,12 @@ use tracing::{info, Level};
 use tracing_subscriber::FmtSubscriber;
 
 use topo::db::transport_creds::discover_local_tenants;
-use topo::db::{friendly_db_error, open_connection, schema::create_tables, sync_log};
+use topo::db::{
+    friendly_db_error, open_connection,
+    schema::create_tables,
+    sync_log,
+    timeline::{EventTimeline, EventTimelineRow},
+};
 use topo::rpc::catalog;
 use topo::rpc::client::{rpc_call, rpc_call_raw, RpcClientError};
 use topo::rpc::protocol::{ForwardAction, RpcMethod, UpnpAction, PROTOCOL_VERSION};
@@ -307,9 +312,9 @@ enum Commands {
     /// List all known peers (local + remote) with connection endpoint info
     Peers,
 
-    /// Event inspection commands (tree, list)
+    /// Event inspection commands (tree, list, timeline)
     #[command(
-        after_help = "Examples:\n  topo event tree     # show event dependency tree\n  topo event list     # list all events with dependencies"
+        after_help = "Examples:\n  topo event tree              # show event dependency tree\n  topo event list              # list all events with dependencies\n  topo event timeline abc12345 # show timeline stats for one event"
     )]
     Event {
         #[command(subcommand)]
@@ -685,6 +690,11 @@ enum EventAction {
         /// Maximum traversal depth
         #[arg(long, default_value = "5")]
         depth: usize,
+    },
+    /// Show local event timeline stats for events matching an ID prefix
+    Timeline {
+        /// Event ID prefix (first few characters of base64 ID)
+        prefix: String,
     },
 }
 
@@ -1488,7 +1498,367 @@ fn run_event_action(
             }
             Ok(())
         }
+        EventAction::Timeline { prefix } => {
+            let (recorded_by, conn) = service::open_db_load(db)?;
+            let resp = service::svc_event_show(&conn, &recorded_by, &prefix)?;
+            if resp.events.is_empty() {
+                println!("No events matching that prefix.");
+                return Ok(());
+            }
+            if resp.events.len() > 1 {
+                println!("({} matches)\n", resp.events.len());
+            }
+            let timeline = EventTimeline::new(&conn);
+            for (idx, item) in resp.events.iter().enumerate() {
+                let row = timeline.load(&item.id)?;
+                let dep_context = load_event_timeline_dep_context(
+                    &conn,
+                    &recorded_by,
+                    item,
+                    row.as_ref()
+                        .and_then(|timeline| timeline.unblocked_by_event_id.as_deref()),
+                )?;
+                print_event_timeline_summary_with_deps(
+                    item,
+                    row,
+                    &dep_context.direct_deps,
+                    &dep_context.unblock_chain,
+                );
+                if idx + 1 != resp.events.len() {
+                    println!();
+                }
+            }
+            Ok(())
+        }
     }
+}
+
+fn print_event_timeline_summary_with_deps(
+    item: &service::EventListItem,
+    row: Option<EventTimelineRow>,
+    deps: &[DepProjectionView],
+    unblock_chain: &[UnblockChainStep],
+) {
+    let type_label = event_timeline_label(item);
+    println!("({}) {}", short_id(&item.id), type_label);
+    println!("  event_id: {}", item.id);
+    println!(
+        "  created_at: {} ({})",
+        item.created_at_ms,
+        topo::display::format_timestamp_ms(item.created_at_ms)
+    );
+    if !item.deps.is_empty() {
+        let deps = item
+            .deps
+            .iter()
+            .map(|(field, dep_id)| format!("{}: {}", field, short_id(dep_id)))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  deps: {}", deps);
+    }
+    let fields = event_timeline_fields(item);
+    if !fields.is_empty() {
+        let summary = fields
+            .iter()
+            .take(3)
+            .map(|(key, value)| format!("{}={}", key, value))
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("  fields: {}", summary);
+    }
+
+    let Some(row) = row else {
+        println!("  timeline: (no local event_timeline row recorded for this event)");
+        return;
+    };
+    let Some((anchor_label, anchor_ts)) = event_timeline_anchor(&row) else {
+        println!("  timeline: (event_timeline row exists but has no recorded timestamps)");
+        return;
+    };
+
+    println!("  anchor: {} = {} (+0ms)", anchor_label, anchor_ts);
+    if row.blocked_at.is_some() {
+        println!(
+            "  blocked_at: {}",
+            format_timeline_stage_ts(row.blocked_at, anchor_ts)
+        );
+    }
+    if row.unblocked_at.is_some() || row.unblocked_by_event_id.is_some() {
+        let mut line = format!(
+            "  unblocked_at: {}",
+            format_timeline_stage_ts(row.unblocked_at, anchor_ts)
+        );
+        if let Some(unblocked_by) = row.unblocked_by_event_id.as_deref() {
+            line.push_str(&format!(" by {}", short_id(unblocked_by)));
+        }
+        println!("{}", line);
+    }
+    if !deps.is_empty() {
+        println!("  direct dep projection order:");
+        for (idx, dep) in deps.iter().enumerate() {
+            let mut line = format!(
+                "    {}. {} -> {}({}) projected_at={}",
+                idx + 1,
+                dep.field,
+                dep.label,
+                short_id(&dep.id),
+                format_timeline_stage_ts(dep.projected_at, anchor_ts)
+            );
+            if dep.unblocked_by {
+                line.push_str(" <- unblocked_by");
+            }
+            println!("{}", line);
+        }
+    }
+    if !unblock_chain.is_empty() {
+        println!("  critical unblock chain:");
+        for (idx, step) in unblock_chain.iter().enumerate() {
+            println!(
+                "    {}. {} -> {}({}) projected_at={} unblocked {} at {}",
+                idx + 1,
+                step.via_fields,
+                step.blocker_label,
+                short_id(&step.blocker_id),
+                format_timeline_stage_ts(step.blocker_projected_at, anchor_ts),
+                step.blocked_label,
+                format_timeline_stage_ts(step.blocked_unblocked_at, anchor_ts),
+            );
+        }
+    }
+    println!("  timeline:");
+    for (label, ts) in [
+        ("discovery_round_started_at", row.discovery_round_started_at),
+        (
+            "discovery_round_completed_at",
+            row.discovery_round_completed_at,
+        ),
+        ("need_list_sent_at", row.need_list_sent_at),
+        ("need_list_received_at", row.need_list_received_at),
+        ("wanted_discovered_at", row.wanted_discovered_at),
+        ("request_credit_received_at", row.request_credit_received_at),
+        ("request_selected_at", row.request_selected_at),
+        ("request_sent_at", row.request_sent_at),
+        ("request_received_at", row.request_received_at),
+        ("response_sent_at", row.response_sent_at),
+        ("response_received_at", row.response_received_at),
+        ("persisted_at", row.persisted_at),
+        ("blocked_at", row.blocked_at),
+        ("unblocked_at", row.unblocked_at),
+        ("projected_at", row.projected_at),
+    ] {
+        println!(
+            "    {:<27} {}",
+            label,
+            format_timeline_stage_ts(ts, anchor_ts)
+        );
+    }
+    if let Some(unblocked_by) = row.unblocked_by_event_id.as_deref() {
+        println!(
+            "    {:<27} {}",
+            "unblocked_by_event_id",
+            short_id(unblocked_by)
+        );
+    }
+
+    let mut spans = Vec::new();
+    if let Some(ms) = diff_ms(row.wanted_discovered_at, row.request_selected_at) {
+        spans.push(format!("discovered->selected={}ms", ms));
+    }
+    if let Some(ms) = diff_ms(row.request_selected_at, row.request_sent_at) {
+        spans.push(format!("selected->sent={}ms", ms));
+    }
+    if let Some(ms) = diff_ms(row.request_sent_at, row.response_received_at) {
+        spans.push(format!("sent->recv={}ms", ms));
+    }
+    if let Some(ms) = diff_ms(row.response_received_at, row.persisted_at) {
+        spans.push(format!("recv->persist={}ms", ms));
+    }
+    if let Some(ms) = diff_ms(row.persisted_at, row.projected_at) {
+        spans.push(format!("persist->projected={}ms", ms));
+    }
+    if let Some(ms) = diff_ms(row.wanted_discovered_at, row.projected_at) {
+        spans.push(format!("discovered->projected={}ms", ms));
+    }
+    if let Some(ms) = diff_ms(row.blocked_at, row.unblocked_at) {
+        spans.push(format!("blocked={}ms", ms));
+    }
+    if !spans.is_empty() {
+        println!("  spans: {}", spans.join(", "));
+    }
+}
+
+#[derive(Debug, Clone)]
+struct DepProjectionView {
+    field: String,
+    id: String,
+    label: String,
+    projected_at: Option<i64>,
+    declared_idx: usize,
+    unblocked_by: bool,
+}
+
+#[derive(Debug, Clone)]
+struct UnblockChainStep {
+    blocker_id: String,
+    blocker_label: String,
+    blocker_projected_at: Option<i64>,
+    blocked_label: String,
+    blocked_unblocked_at: Option<i64>,
+    via_fields: String,
+}
+
+#[derive(Debug, Clone, Default)]
+struct EventTimelineDepContext {
+    direct_deps: Vec<DepProjectionView>,
+    unblock_chain: Vec<UnblockChainStep>,
+}
+
+const EVENT_TIMELINE_CHAIN_DEPTH: usize = 32;
+
+fn load_event_timeline_dep_context(
+    conn: &rusqlite::Connection,
+    recorded_by: &str,
+    item: &service::EventListItem,
+    unblocked_by_event_id: Option<&str>,
+) -> Result<EventTimelineDepContext, Box<dyn std::error::Error + Send + Sync>> {
+    if item.deps.is_empty() {
+        return Ok(EventTimelineDepContext::default());
+    }
+
+    let dep_graph_resp =
+        service::svc_event_deps(conn, recorded_by, &item.id, EVENT_TIMELINE_CHAIN_DEPTH)?;
+    let dep_items: Vec<service::EventListItem> =
+        serde_json::from_value(dep_graph_resp["events"].clone()).unwrap_or_default();
+    let dep_item_map = dep_items
+        .into_iter()
+        .map(|dep| (dep.id.clone(), dep))
+        .collect::<std::collections::HashMap<_, _>>();
+    let timeline = EventTimeline::new(conn);
+
+    let mut direct_deps = item
+        .deps
+        .iter()
+        .enumerate()
+        .map(|(declared_idx, (field, dep_id))| {
+            let dep_item = dep_item_map.get(dep_id);
+            let label = dep_item
+                .map(event_timeline_label)
+                .unwrap_or_else(|| "missing".to_string());
+            let projected_at = timeline
+                .load(dep_id)
+                .ok()
+                .flatten()
+                .and_then(|row| row.projected_at);
+            DepProjectionView {
+                field: field.clone(),
+                id: dep_id.clone(),
+                label,
+                projected_at,
+                declared_idx,
+                unblocked_by: unblocked_by_event_id == Some(dep_id.as_str()),
+            }
+        })
+        .collect::<Vec<_>>();
+
+    direct_deps.sort_by_key(|dep| {
+        (
+            dep.projected_at.is_none(),
+            dep.projected_at.unwrap_or(i64::MAX),
+            dep.declared_idx,
+        )
+    });
+
+    let mut unblock_chain = Vec::new();
+    let mut current_item = item.clone();
+    let mut current_unblocked_by = unblocked_by_event_id.map(str::to_string);
+    let mut current_unblocked_at = timeline.load(&item.id)?.and_then(|row| row.unblocked_at);
+    let mut seen = std::collections::HashSet::new();
+    seen.insert(item.id.clone());
+
+    while let Some(blocker_id) = current_unblocked_by.clone() {
+        if !seen.insert(blocker_id.clone()) {
+            break;
+        }
+        let Some(blocker_item) = dep_item_map.get(&blocker_id) else {
+            break;
+        };
+        let blocker_row = timeline.load(&blocker_id)?;
+        let via_fields = current_item
+            .deps
+            .iter()
+            .filter(|(_, dep_id)| dep_id == &blocker_id)
+            .map(|(field, _)| field.clone())
+            .collect::<Vec<_>>();
+        unblock_chain.push(UnblockChainStep {
+            blocker_id: blocker_id.clone(),
+            blocker_label: event_timeline_label(blocker_item),
+            blocker_projected_at: blocker_row.as_ref().and_then(|row| row.projected_at),
+            blocked_label: event_timeline_label(&current_item),
+            blocked_unblocked_at: current_unblocked_at,
+            via_fields: via_fields.join("|"),
+        });
+        current_item = blocker_item.clone();
+        current_unblocked_at = blocker_row.as_ref().and_then(|row| row.unblocked_at);
+        current_unblocked_by = blocker_row.and_then(|row| row.unblocked_by_event_id);
+    }
+
+    Ok(EventTimelineDepContext {
+        direct_deps,
+        unblock_chain,
+    })
+}
+
+fn event_timeline_label(item: &service::EventListItem) -> String {
+    match &item.decrypted_inner {
+        Some(inner) => format!("{}({})", item.event_type, inner.inner_type),
+        None => item.event_type.clone(),
+    }
+}
+
+fn event_timeline_fields(item: &service::EventListItem) -> &[(String, String)] {
+    match &item.decrypted_inner {
+        Some(inner) => &inner.fields,
+        None => &item.fields,
+    }
+}
+
+fn event_timeline_anchor(row: &EventTimelineRow) -> Option<(&'static str, i64)> {
+    if let Some(ts) = row.wanted_discovered_at {
+        return Some(("wanted_discovered_at", ts));
+    }
+    [
+        ("discovery_round_started_at", row.discovery_round_started_at),
+        (
+            "discovery_round_completed_at",
+            row.discovery_round_completed_at,
+        ),
+        ("need_list_sent_at", row.need_list_sent_at),
+        ("need_list_received_at", row.need_list_received_at),
+        ("request_credit_received_at", row.request_credit_received_at),
+        ("request_selected_at", row.request_selected_at),
+        ("request_sent_at", row.request_sent_at),
+        ("request_received_at", row.request_received_at),
+        ("response_sent_at", row.response_sent_at),
+        ("response_received_at", row.response_received_at),
+        ("persisted_at", row.persisted_at),
+        ("blocked_at", row.blocked_at),
+        ("unblocked_at", row.unblocked_at),
+        ("projected_at", row.projected_at),
+    ]
+    .into_iter()
+    .filter_map(|(label, ts)| ts.map(|value| (label, value)))
+    .min_by_key(|(_, ts)| *ts)
+}
+
+fn format_timeline_stage_ts(ts: Option<i64>, anchor_ts: i64) -> String {
+    match ts {
+        Some(value) => format!("{value} ({:+}ms)", value - anchor_ts),
+        None => "-".to_string(),
+    }
+}
+
+fn diff_ms(start: Option<i64>, end: Option<i64>) -> Option<i64> {
+    Some(end? - start?)
 }
 
 fn run_sync_log_action(
@@ -3324,9 +3694,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 } => {
                     let data = rpc_require_daemon(db, sock_ref, RpcMethod::SyncPolicyShow)?;
                     println!("SYNC POLICY:");
-                    println!("  requests:        {}", data["requests"].as_str().unwrap_or("auto"));
-                    println!("  responses:       {}", data["responses"].as_str().unwrap_or("auto"));
-                    println!("  forward_on_have: {}", data["forward_on_have"].as_str().unwrap_or("auto"));
+                    println!(
+                        "  requests:        {}",
+                        data["requests"].as_str().unwrap_or("auto")
+                    );
+                    println!(
+                        "  responses:       {}",
+                        data["responses"].as_str().unwrap_or("auto")
+                    );
+                    println!(
+                        "  forward_on_have: {}",
+                        data["forward_on_have"].as_str().unwrap_or("auto")
+                    );
                 }
                 SyncAction::Policy {
                     action:
@@ -3346,22 +3725,27 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         },
                     )?;
                     println!("SYNC POLICY (updated):");
-                    println!("  requests:        {}", data["requests"].as_str().unwrap_or("auto"));
-                    println!("  responses:       {}", data["responses"].as_str().unwrap_or("auto"));
-                    println!("  forward_on_have: {}", data["forward_on_have"].as_str().unwrap_or("auto"));
+                    println!(
+                        "  requests:        {}",
+                        data["requests"].as_str().unwrap_or("auto")
+                    );
+                    println!(
+                        "  responses:       {}",
+                        data["responses"].as_str().unwrap_or("auto")
+                    );
+                    println!(
+                        "  forward_on_have: {}",
+                        data["forward_on_have"].as_str().unwrap_or("auto")
+                    );
                 }
                 SyncAction::Round { target } => match target {
                     SyncTarget::Peer { peer } => {
-                        let data = rpc_require_daemon(
-                            db,
-                            sock_ref,
-                            RpcMethod::SyncRoundPeer { peer },
-                        )?;
+                        let data =
+                            rpc_require_daemon(db, sock_ref, RpcMethod::SyncRoundPeer { peer })?;
                         print_round_capture(&data);
                     }
                     SyncTarget::All => {
-                        let data =
-                            rpc_require_daemon(db, sock_ref, RpcMethod::SyncRoundAll)?;
+                        let data = rpc_require_daemon(db, sock_ref, RpcMethod::SyncRoundAll)?;
                         if let Some(arr) = data.as_array() {
                             for item in arr {
                                 print_round_capture(item);
@@ -3373,16 +3757,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 },
                 SyncAction::Request { target } => match target {
                     SyncTarget::Peer { peer } => {
-                        let data = rpc_require_daemon(
-                            db,
-                            sock_ref,
-                            RpcMethod::SyncRequestPeer { peer },
-                        )?;
+                        let data =
+                            rpc_require_daemon(db, sock_ref, RpcMethod::SyncRequestPeer { peer })?;
                         print_request_result(&data);
                     }
                     SyncTarget::All => {
-                        let data =
-                            rpc_require_daemon(db, sock_ref, RpcMethod::SyncRequestAll)?;
+                        let data = rpc_require_daemon(db, sock_ref, RpcMethod::SyncRequestAll)?;
                         if let Some(arr) = data.as_array() {
                             for item in arr {
                                 print_request_result(item);
@@ -4840,7 +5220,10 @@ fn print_request_result(data: &serde_json::Value) {
     let ids = data["requested_ids"].as_array();
     let count = ids.map(|a| a.len()).unwrap_or(0);
 
-    println!("SYNC REQUEST peer={}: {} event(s) requested", short_peer, count);
+    println!(
+        "SYNC REQUEST peer={}: {} event(s) requested",
+        short_peer, count
+    );
     if let Some(ids) = ids {
         for id in ids {
             if let Some(s) = id.as_str() {

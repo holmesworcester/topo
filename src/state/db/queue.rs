@@ -13,6 +13,7 @@ pub const BACKOFF_BASE_MS: i64 = 1000;
 pub const BACKOFF_MAX_ATTEMPTS: u32 = 10;
 pub const SQLITE_BUSY_RETRY_BASE_MS: u64 = 10;
 pub const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 8;
+pub const PRIORITY_LANE_BLOCKER: i64 = 0;
 pub const PRIORITY_LANE_FOREGROUND: i64 = 1;
 pub const PRIORITY_LANE_BULK: i64 = 2;
 
@@ -31,14 +32,18 @@ pub fn current_timestamp_ms() -> i64 {
         .as_millis() as i64
 }
 
-pub fn classify_priority_from_blob(blob: &[u8], created_at: i64) -> (i64, i64) {
-    let lane = if crate::event_modules::outer_semantic_type_code(blob)
-        == Some(crate::event_modules::EVENT_TYPE_FILE_SLICE)
-    {
+pub fn priority_lane_for_semantic_type_code(semantic_type_code: u8) -> i64 {
+    if semantic_type_code == crate::event_modules::EVENT_TYPE_FILE_SLICE {
         PRIORITY_LANE_BULK
     } else {
         PRIORITY_LANE_FOREGROUND
-    };
+    }
+}
+
+pub fn classify_priority_from_blob(blob: &[u8], created_at: i64) -> (i64, i64) {
+    let lane = crate::event_modules::outer_semantic_type_code(blob)
+        .map(priority_lane_for_semantic_type_code)
+        .unwrap_or(PRIORITY_LANE_FOREGROUND);
     (lane, created_at)
 }
 pub fn is_sqlite_busy(err: &rusqlite::Error) -> bool {

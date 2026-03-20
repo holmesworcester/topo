@@ -11,9 +11,9 @@ use tokio::sync::broadcast;
 use tracing::info;
 
 use crate::crypto::EventId;
+use crate::db::store::Store;
 use crate::db::timeline::EventTimeline;
 use crate::db::wanted::WantedEvents;
-use crate::db::store::Store;
 use crate::protocol::{neg_id_to_event_id, DiscoveryHint, Frame};
 use crate::state::live_hints::LiveHint;
 use crate::transport::StreamConn;
@@ -58,6 +58,43 @@ pub fn observe_discovery_hints_for_peer(
     )?)
 }
 
+pub(super) fn sort_discovery_hints_by_priority(hints: &mut [DiscoveryHint]) {
+    hints.sort_unstable_by(|left, right| {
+        right
+            .created_at_ms
+            .cmp(&left.created_at_ms)
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
+}
+
+async fn send_discovery_hints<C>(
+    control: &mut C,
+    timeline: &EventTimeline<'_>,
+    hints: &mut Vec<DiscoveryHint>,
+) -> Result<usize, SyncError>
+where
+    C: StreamConn,
+{
+    if hints.is_empty() {
+        return Ok(0);
+    }
+
+    sort_discovery_hints_by_priority(hints);
+    let hint_ids: Vec<EventId> = hints.iter().map(|hint| hint.event_id).collect();
+    let sent_at = crate::db::queue::current_timestamp_ms();
+    let batch_size = need_chunk().max(1);
+    for chunk in hints.chunks(batch_size) {
+        control
+            .send(&Frame::DiscoveryHints {
+                hints: chunk.to_vec(),
+            })
+            .await?;
+    }
+    let _ = timeline.mark_need_list_sent_many(&hint_ids, sent_at);
+    control.flush().await?;
+    Ok(hint_ids.len())
+}
+
 /// Send discovery hints for IDs the peer is missing.
 ///
 /// These are not data sends. They only let the remote side populate durable
@@ -76,34 +113,25 @@ where
         return Ok(0);
     }
 
-    let batch_size = need_chunk().max(1);
-    let mut sent = 0usize;
-    while !have_ids.is_empty() {
-        let drain_count = have_ids.len().min(batch_size);
-        let mut hints = Vec::with_capacity(drain_count);
-        for neg_id in have_ids.drain(..drain_count) {
-            let event_id = neg_id_to_event_id(&neg_id);
-            let Some(summary) = store.get_shared_summary(&event_id)? else {
-                continue;
-            };
-            hints.push(DiscoveryHint {
-                event_id: summary.event_id,
-                semantic_type_code: summary.semantic_type_code,
-                encoded_size_bytes: summary.encoded_size_bytes,
-            });
-        }
-        if hints.is_empty() {
+    let mut hints = Vec::with_capacity(have_ids.len());
+    for neg_id in have_ids.drain(..) {
+        let event_id = neg_id_to_event_id(&neg_id);
+        let Some(summary) = store.get_shared_summary(&event_id)? else {
             continue;
-        }
-        let ids: Vec<EventId> = hints.iter().map(|hint| hint.event_id).collect();
-        sent_ids_out.extend_from_slice(&ids);
-        let sent_at = crate::db::queue::current_timestamp_ms();
-        sent += hints.len();
-        let _ = timeline.mark_need_list_sent_many(&ids, sent_at);
-        control.send(&Frame::DiscoveryHints { hints }).await?;
+        };
+        hints.push(DiscoveryHint {
+            event_id: summary.event_id,
+            semantic_type_code: summary.semantic_type_code,
+            encoded_size_bytes: summary.encoded_size_bytes,
+            created_at_ms: u64::try_from(summary.created_at_ms).unwrap_or(0),
+        });
     }
-    control.flush().await?;
-    Ok(sent)
+    if hints.is_empty() {
+        return Ok(0);
+    }
+
+    sent_ids_out.extend(hints.iter().map(|hint| hint.event_id));
+    send_discovery_hints(control, timeline, &mut hints).await
 }
 
 /// Keep the peer's request window topped up from durable `wanted` state.
@@ -134,7 +162,8 @@ where
         return Ok((0, Vec::new()));
     }
 
-    let candidate_limit = candidate_limit_for_credit_bytes(credit_bytes, snapshot.inflight_requested.len());
+    let candidate_limit =
+        candidate_limit_for_credit_bytes(credit_bytes, snapshot.inflight_requested.len());
     let selected = coordination.plan_requests(
         wanted,
         peer_id,
@@ -147,10 +176,16 @@ where
         return Ok((0, Vec::new()));
     }
     if let Some(credit_received_at) = snapshot.last_credit_received_at {
-        let selected_ids: Vec<EventId> = selected.iter().map(|candidate| candidate.event_id).collect();
+        let selected_ids: Vec<EventId> = selected
+            .iter()
+            .map(|candidate| candidate.event_id)
+            .collect();
         let _ = timeline.mark_request_credit_received_many(&selected_ids, credit_received_at);
     }
-    let selected_ids: Vec<EventId> = selected.iter().map(|candidate| candidate.event_id).collect();
+    let selected_ids: Vec<EventId> = selected
+        .iter()
+        .map(|candidate| candidate.event_id)
+        .collect();
     let _ = timeline.mark_request_selected_many(&selected_ids, now_ms);
     let reserved_bytes: usize = selected
         .iter()
@@ -271,12 +306,14 @@ where
                 event_id: summary.event_id,
                 semantic_type_code: summary.semantic_type_code,
                 encoded_size_bytes: summary.encoded_size_bytes,
+                created_at_ms: u64::try_from(summary.created_at_ms).unwrap_or(0),
             });
         }
     }
     if hints.is_empty() {
         return Ok(0);
     }
+    sort_discovery_hints_by_priority(&mut hints);
     let hint_ids: Vec<EventId> = hints.iter().map(|h| h.event_id).collect();
     for chunk in hints.chunks(batch_size) {
         control

@@ -167,6 +167,7 @@ pub struct SharedEventSummary {
     pub event_id: EventId,
     pub semantic_type_code: u8,
     pub encoded_size_bytes: u32,
+    pub created_at_ms: i64,
 }
 
 impl<'a> Store<'a> {
@@ -238,8 +239,18 @@ impl<'a> Store<'a> {
     /// Get lightweight discovery metadata for a shared event without exposing
     /// local-only rows.
     pub fn get_shared_summary(&self, id: &EventId) -> SqliteResult<Option<SharedEventSummary>> {
-        let Some(blob) = self.get_shared(id)? else {
-            return Ok(None);
+        let id_str = event_id_to_base64(id);
+        let result = self.conn.query_row(
+            "SELECT blob, created_at
+             FROM events
+             WHERE event_id = ?1 AND share_scope = 'shared'",
+            params![id_str],
+            |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?)),
+        );
+        let (blob, created_at_ms) = match result {
+            Ok(row) => row,
+            Err(rusqlite::Error::QueryReturnedNoRows) => return Ok(None),
+            Err(err) => return Err(err),
         };
         let Some(semantic_type_code) = crate::event_modules::outer_semantic_type_code(&blob) else {
             return Ok(None);
@@ -249,6 +260,7 @@ impl<'a> Store<'a> {
             event_id: *id,
             semantic_type_code,
             encoded_size_bytes,
+            created_at_ms,
         }))
     }
 
@@ -361,5 +373,6 @@ mod tests {
             crate::event_modules::EVENT_TYPE_MESSAGE
         );
         assert_eq!(summary.encoded_size_bytes, blob.len() as u32);
+        assert_eq!(summary.created_at_ms, now);
     }
 }

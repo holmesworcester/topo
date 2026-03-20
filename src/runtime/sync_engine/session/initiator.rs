@@ -84,7 +84,9 @@ pub async fn run_sync_initiator<C, S, R>(
     shared_ingest: mpsc::Sender<IngestItem>,
     capture: Option<SyncRunCapture>,
     rx_capture: Option<SyncRunRxCapture>,
-    mut command_rx: Option<tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>>,
+    mut command_rx: Option<
+        tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>,
+    >,
     policy_rx: Option<tokio::sync::watch::Receiver<crate::shared::sync_control::TenantSyncPolicy>>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
@@ -154,7 +156,9 @@ where
     let mut next_round_due = Instant::now();
     let mut observed_initial_control_progress = false;
     let mut pending_round_reply: Option<
-        std::sync::mpsc::Sender<Result<crate::runtime::sync_control::ManualSyncRoundCapture, String>>,
+        std::sync::mpsc::Sender<
+            Result<crate::runtime::sync_control::ManualSyncRoundCapture, String>,
+        >,
     > = None;
 
     'session: loop {
@@ -180,13 +184,13 @@ where
                         if count > 0 {
                             last_activity = Instant::now();
                         }
-                        let id_hexes: Vec<String> =
-                            ids.iter().map(|id| hex::encode(id)).collect();
-                        let _ = reply.send(Ok(crate::runtime::sync_control::ManualSyncRequestResult {
-                            peer_id: peer_id.to_string(),
-                            requested_ids: id_hexes,
-                            reason: None,
-                        }));
+                        let id_hexes: Vec<String> = ids.iter().map(|id| hex::encode(id)).collect();
+                        let _ =
+                            reply.send(Ok(crate::runtime::sync_control::ManualSyncRequestResult {
+                                peer_id: peer_id.to_string(),
+                                requested_ids: id_hexes,
+                                reason: None,
+                            }));
                     }
                 }
             }
@@ -323,10 +327,12 @@ where
                                         .iter()
                                         .map(|eid| hex::encode(eid))
                                         .collect();
-                                    let _ = reply.send(Ok(crate::runtime::sync_control::ManualSyncRoundCapture {
-                                        peer_id: peer_id.to_string(),
-                                        observed_ids: newly_hex,
-                                    }));
+                                    let _ = reply.send(Ok(
+                                        crate::runtime::sync_control::ManualSyncRoundCapture {
+                                            peer_id: peer_id.to_string(),
+                                            observed_ids: newly_hex,
+                                        },
+                                    ));
                                 }
                             }
                         }
@@ -358,10 +364,8 @@ where
                     Ok(Ok(Frame::DiscoveryHints { hints })) => {
                         last_activity = Instant::now();
                         let hint_ids: Vec<_> = hints.iter().map(|h| h.event_id).collect();
-                        let _ = timeline.mark_need_list_received_many(
-                            &hint_ids,
-                            current_timestamp_ms(),
-                        );
+                        let _ = timeline
+                            .mark_need_list_received_many(&hint_ids, current_timestamp_ms());
                         let observed = observe_discovery_hints_for_peer(
                             &wanted,
                             &timeline,
@@ -441,11 +445,13 @@ where
                                 event_id: summary.event_id,
                                 semantic_type_code: summary.semantic_type_code,
                                 encoded_size_bytes: summary.encoded_size_bytes,
+                                created_at_ms: u64::try_from(summary.created_at_ms).unwrap_or(0),
                             },
                             _ => crate::protocol::DiscoveryHint {
                                 event_id,
                                 semantic_type_code: 0,
                                 encoded_size_bytes: 0,
+                                created_at_ms: 0,
                             },
                         }
                     })
@@ -467,7 +473,9 @@ where
                 }
                 let auto_requests = policy_rx
                     .as_ref()
-                    .map(|rx| rx.borrow().requests == crate::shared::sync_control::SyncPolicyMode::Auto)
+                    .map(|rx| {
+                        rx.borrow().requests == crate::shared::sync_control::SyncPolicyMode::Auto
+                    })
                     .unwrap_or(true);
                 if auto_requests {
                     let (requested_now, _) = refill_wanted_requests(
@@ -644,8 +652,7 @@ where
             Ok(Ok(Frame::DiscoveryHints { hints })) => {
                 last_activity = Instant::now();
                 let hint_ids: Vec<_> = hints.iter().map(|h| h.event_id).collect();
-                let _ =
-                    timeline.mark_need_list_received_many(&hint_ids, current_timestamp_ms());
+                let _ = timeline.mark_need_list_received_many(&hint_ids, current_timestamp_ms());
                 let observed = observe_discovery_hints_for_peer(
                     &wanted,
                     &timeline,

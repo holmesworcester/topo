@@ -54,6 +54,20 @@ pub(super) fn need_chunk() -> usize {
         1000
     }
 }
+
+pub(super) fn startup_hint_limit() -> usize {
+    read_u64_env("TOPO_SYNC_STARTUP_HINT_LIMIT")
+        .unwrap_or(64)
+        .try_into()
+        .unwrap_or(64)
+}
+
+pub(super) fn startup_dependency_hint_limit() -> usize {
+    read_u64_env("TOPO_SYNC_STARTUP_DEP_HINT_LIMIT")
+        .unwrap_or(16)
+        .try_into()
+        .unwrap_or(16)
+}
 /// Time to wait for a single data-stream send/flush before treating it as stalled.
 pub(super) const DATA_SEND_STALL_TIMEOUT: Duration = Duration::from_secs(10);
 /// Maximum time a session may sit without any initial control-round progress.

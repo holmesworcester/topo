@@ -41,7 +41,7 @@ use crate::state::live_hints;
 use super::connection_scope::{ConnectionRequestState, ConnectionResponseState};
 use super::control_plane::{
     observe_discovery_hints_for_peer, refill_wanted_requests, send_forward_on_have_hints,
-    send_response_credit_bytes,
+    send_response_credit_bytes, sort_discovery_hints_by_priority,
 };
 use super::coordinator::PeerCoord;
 use super::data_plane::{
@@ -83,7 +83,9 @@ pub async fn run_sync_responder<C, S, R>(
     shared_ingest: mpsc::Sender<IngestItem>,
     capture: Option<SyncRunCapture>,
     rx_capture: Option<SyncRunRxCapture>,
-    mut command_rx: Option<tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>>,
+    mut command_rx: Option<
+        tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>,
+    >,
     policy_rx: Option<tokio::sync::watch::Receiver<crate::shared::sync_control::TenantSyncPolicy>>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
@@ -171,13 +173,17 @@ where
                             .iter()
                             .filter_map(|neg_id| {
                                 let event_id = crate::protocol::neg_id_to_event_id(neg_id);
-                                worker_store.get_shared_summary(&event_id).ok().flatten().map(
-                                    |summary| crate::protocol::DiscoveryHint {
+                                worker_store
+                                    .get_shared_summary(&event_id)
+                                    .ok()
+                                    .flatten()
+                                    .map(|summary| crate::protocol::DiscoveryHint {
                                         event_id: summary.event_id,
                                         semantic_type_code: summary.semantic_type_code,
                                         encoded_size_bytes: summary.encoded_size_bytes,
-                                    },
-                                )
+                                        created_at_ms: u64::try_from(summary.created_at_ms)
+                                            .unwrap_or(0),
+                                    })
                             })
                             .collect();
                         NegWorkerResult {
@@ -283,9 +289,10 @@ where
                 use crate::runtime::sync_control::SessionCommand;
                 match cmd {
                     SessionCommand::ForceRound { reply } => {
-                        let _ = reply.send(Err(
-                            "only initiator sessions can drive negentropy rounds".to_string(),
-                        ));
+                        let _ =
+                            reply
+                                .send(Err("only initiator sessions can drive negentropy rounds"
+                                    .to_string()));
                     }
                     SessionCommand::ForceRequest { reply } => {
                         let (count, ids) = refill_wanted_requests(
@@ -300,13 +307,13 @@ where
                         if count > 0 {
                             last_activity = Instant::now();
                         }
-                        let id_hexes: Vec<String> =
-                            ids.iter().map(|id| hex::encode(id)).collect();
-                        let _ = reply.send(Ok(crate::runtime::sync_control::ManualSyncRequestResult {
-                            peer_id: peer_id.to_string(),
-                            requested_ids: id_hexes,
-                            reason: None,
-                        }));
+                        let id_hexes: Vec<String> = ids.iter().map(|id| hex::encode(id)).collect();
+                        let _ =
+                            reply.send(Ok(crate::runtime::sync_control::ManualSyncRequestResult {
+                                peer_id: peer_id.to_string(),
+                                requested_ids: id_hexes,
+                                reason: None,
+                            }));
                     }
                 }
             }
@@ -319,7 +326,7 @@ where
                 .expect("neg responder worker missing")
                 .try_recv()
             {
-                Ok(Ok(result)) => {
+                Ok(Ok(mut result)) => {
                     reconciling = false;
                     last_activity = Instant::now();
 
@@ -327,6 +334,7 @@ where
                     // initiator has real byte sizes when it starts scheduling.
                     // Hints were built in the worker thread (no DB work here).
                     if !result.diff_hints.is_empty() {
+                        sort_discovery_hints_by_priority(&mut result.diff_hints);
                         let batch_size = super::need_chunk().max(1);
                         let total_hints = result.diff_hints.len();
                         for chunk in result.diff_hints.chunks(batch_size) {
@@ -350,7 +358,11 @@ where
                             reconcile_start.elapsed().as_millis()
                         );
                     } else {
-                        control.send(&Frame::NegMsg { msg: result.response }).await?;
+                        control
+                            .send(&Frame::NegMsg {
+                                msg: result.response,
+                            })
+                            .await?;
                         control.flush().await?;
                     }
                 }
@@ -484,8 +496,14 @@ where
         }
 
         if forward_on_have_enabled() {
-            let hinted =
-                send_forward_on_have_hints(&mut control, &timeline, &store, peer_id, &mut forward_hint_rx).await?;
+            let hinted = send_forward_on_have_hints(
+                &mut control,
+                &timeline,
+                &store,
+                peer_id,
+                &mut forward_hint_rx,
+            )
+            .await?;
             if hinted > 0 {
                 last_activity = Instant::now();
             }

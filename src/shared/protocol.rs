@@ -20,13 +20,14 @@ pub const MSG_TYPE_INTRO_OFFER: u8 = 0x30; // Intro offer for hole punching
 const MAX_NEG_MSG_BYTES: usize = 4 * 1024 * 1024;
 /// Max number of IDs or discovery hints carried in one control-plane frame.
 const MAX_ID_LIST_ENTRIES: usize = 100_000;
-const DISCOVERY_HINT_WIRE_BYTES: usize = 32 + 1 + 4;
+const DISCOVERY_HINT_WIRE_BYTES: usize = 32 + 1 + 4 + 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiscoveryHint {
     pub event_id: EventId,
     pub semantic_type_code: u8,
     pub encoded_size_bytes: u32,
+    pub created_at_ms: u64,
 }
 
 /// Sync protocol messages
@@ -133,10 +134,16 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
                     input[start + 35],
                     input[start + 36],
                 ]);
+                let created_at_ms = u64::from_le_bytes(
+                    input[start + 37..start + 45]
+                        .try_into()
+                        .map_err(|_| ParseError::InsufficientData)?,
+                );
                 hints.push(DiscoveryHint {
                     event_id,
                     semantic_type_code,
                     encoded_size_bytes,
+                    created_at_ms,
                 });
             }
             Ok((Frame::DiscoveryHints { hints }, total_size))
@@ -245,6 +252,7 @@ pub fn encode_frame(msg: &Frame) -> Vec<u8> {
                 buf.extend_from_slice(&hint.event_id);
                 buf.push(hint.semantic_type_code);
                 buf.extend_from_slice(&hint.encoded_size_bytes.to_le_bytes());
+                buf.extend_from_slice(&hint.created_at_ms.to_le_bytes());
             }
             buf
         }
@@ -522,11 +530,13 @@ mod tests {
                     event_id: [0x11; 32],
                     semantic_type_code: 7,
                     encoded_size_bytes: 144,
+                    created_at_ms: 1_234,
                 },
                 DiscoveryHint {
                     event_id: [0x22; 32],
                     semantic_type_code: 14,
                     encoded_size_bytes: 262_214,
+                    created_at_ms: 9_876,
                 },
             ],
         };

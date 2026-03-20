@@ -261,7 +261,7 @@ pub async fn svc_intro(
 // Event list (workspace-scoped)
 // ---------------------------------------------------------------------------
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventListItem {
     pub id: String,
     pub event_type: String,
@@ -272,7 +272,7 @@ pub struct EventListItem {
     pub decrypted_inner: Option<EventListDecrypted>,
 }
 
-#[derive(Debug, Serialize, Deserialize)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct EventListDecrypted {
     pub inner_type: String,
     pub deps: Vec<(String, String)>,
