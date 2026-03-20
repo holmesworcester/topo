@@ -5,7 +5,7 @@
 
 mod cli_harness;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -99,6 +99,34 @@ fn load_dep_events(
     let response =
         service::svc_event_deps(&conn, recorded_by, event_id_b64, depth).expect("svc_event_deps");
     serde_json::from_value(response["events"].clone()).expect("deserialize dependency events")
+}
+
+fn load_dep_events_with_transport_provenance(
+    db: &str,
+    recorded_by: &str,
+    event_id_b64: &str,
+    depth: usize,
+) -> Vec<EventListItem> {
+    let mut dep_events = load_dep_events(db, recorded_by, event_id_b64, depth);
+    let mut seen_ids: HashSet<String> = dep_events.iter().map(|item| item.id.clone()).collect();
+    let key_secret_ids = dep_events
+        .iter()
+        .filter(|item| item.event_type == "key_secret")
+        .map(|item| item.id.clone())
+        .collect::<Vec<_>>();
+
+    for key_secret_id in key_secret_ids {
+        let Some(provenance) = lookup_key_secret_provenance(db, recorded_by, &key_secret_id) else {
+            continue;
+        };
+        for item in load_dep_events(db, recorded_by, &provenance.wrapped_key_event_id, depth) {
+            if seen_ids.insert(item.id.clone()) {
+                dep_events.push(item);
+            }
+        }
+    }
+
+    dep_events
 }
 
 struct KeySecretProvenance {
@@ -280,28 +308,48 @@ fn append_dependency_timeline_summary(
     newest_message_id: &str,
     metric_start_ms: i64,
 ) {
-    let dep_events = load_dep_events(bob_db, bob_peer_id, newest_message_id, DEP_GRAPH_DEPTH);
+    let dep_events = load_dep_events_with_transport_provenance(
+        bob_db,
+        bob_peer_id,
+        newest_message_id,
+        DEP_GRAPH_DEPTH,
+    );
     let dep_map: HashMap<String, &EventListItem> = dep_events
         .iter()
         .map(|item| (item.id.clone(), item))
         .collect();
 
-    summary.push_str("\nDependency graph for newest message (merged inner deps + wrapper deps):\n");
+    summary.push_str(
+        "\nDependency graph for newest message (merged inner deps + wrapper deps + key transport provenance):\n",
+    );
     for item in &dep_events {
-        let deps = if item.deps.is_empty() {
+        let mut dep_parts = item
+            .deps
+            .iter()
+            .map(|(field, dep_id)| {
+                let dep_label = dep_map
+                    .get(dep_id)
+                    .map(|dep| event_label(dep))
+                    .unwrap_or_else(|| "missing".to_string());
+                format!("{field}->{dep_label}[{}]", short_id(dep_id))
+            })
+            .collect::<Vec<_>>();
+        if item.event_type == "key_secret" {
+            if let Some(provenance) = lookup_key_secret_provenance(bob_db, bob_peer_id, &item.id) {
+                let dep_label = dep_map
+                    .get(&provenance.wrapped_key_event_id)
+                    .map(|dep| event_label(dep))
+                    .unwrap_or_else(|| "key_shared".to_string());
+                dep_parts.push(format!(
+                    "transport_key_shared->{dep_label}[{}]",
+                    short_id(&provenance.wrapped_key_event_id)
+                ));
+            }
+        }
+        let deps = if dep_parts.is_empty() {
             "-".to_string()
         } else {
-            item.deps
-                .iter()
-                .map(|(field, dep_id)| {
-                    let dep_label = dep_map
-                        .get(dep_id)
-                        .map(|dep| event_label(dep))
-                        .unwrap_or_else(|| "missing".to_string());
-                    format!("{field}->{dep_label}[{}]", short_id(dep_id))
-                })
-                .collect::<Vec<_>>()
-                .join(", ")
+            dep_parts.join(", ")
         };
         summary.push_str(&format!(
             "  {} {} created_at={}{}\n",
