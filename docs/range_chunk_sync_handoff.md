@@ -9,6 +9,10 @@ This handoff is for a new implementation branch and worktree:
 
 Do not continue this work on `/home/holmes/poc-7` `master`.
 
+Read this first before starting implementation:
+
+- `/home/holmes/poc-7/.codex-worktrees/range-chunk-sync-design/docs/range_chunk_sync_start_here.md`
+
 ## Important Starting-State Caveat
 
 This worktree was created from committed branch state at:
@@ -371,6 +375,10 @@ Reference-only prototype worktree:
 - `/home/holmes/poc-7/.codex-worktrees/tiered-hot-window-sync/tests/daemon_tiered_window_perf_test.rs`
 
 ## Success Criteria
+
+For the compact execution checklist and quantitative target matrix, see:
+
+- `/home/holmes/poc-7/.codex-worktrees/range-chunk-sync-design/docs/range_chunk_sync_start_here.md`
 
 ### SC1: Preserve recent-message performance benefits
 
