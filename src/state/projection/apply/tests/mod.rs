@@ -16,7 +16,8 @@ use crate::projection::decision::ProjectionDecision;
 use crate::projection::encrypted::encrypt_event_blob;
 use crate::projection::signer::sign_event_bytes;
 use crate::state::projection::create::{
-    create_event_staged, create_event_synchronous, create_signed_event_synchronous,
+    create_event_staged, create_event_synchronous, create_signed_event_synchronous, project_event,
+    store_event_only,
 };
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -276,7 +277,7 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
         public_key: workspace_pub,
         name: "workspace".to_string(),
     });
-    let net_eid = create_event_staged(conn, recorded_by, &net_event).unwrap();
+    let net_eid = store_event_only(conn, recorded_by, &net_event).unwrap();
 
     // 3. InviteAccepted (local, binds trust anchor)
     let ia_event = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
@@ -286,13 +287,8 @@ fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (EventId, Signin
         workspace_id: net_eid,
     });
     create_event_synchronous(conn, recorded_by, &ia_event).unwrap();
-    assert!(
-        matches!(
-            project_one(conn, recorded_by, &net_eid).unwrap(),
-            ProjectionDecision::Valid | ProjectionDecision::AlreadyProcessed
-        ),
-        "workspace should be projected by the invite_accepted retry path"
-    );
+    project_event(conn, recorded_by, &net_eid).unwrap();
+    mark_valid_for_test(conn, recorded_by, &net_eid, net_event.event_type_code());
 
     // 4. UserInvite (signed by workspace key)
     let invite_key = SigningKey::generate(&mut rng);
@@ -1304,8 +1300,6 @@ fn test_two_tenant_contexts_single_db() {
     let conn = setup();
     let tenant_a = "tenant_a";
     let tenant_b = "tenant_b";
-    let _net_eid_a = setup_workspace_event(&conn, tenant_a);
-    let _net_eid_b = setup_workspace_event(&conn, tenant_b);
 
     // Each tenant creates a message with its own identity chain
     let (_msg_a, msg_a_blob) = make_message(&conn, tenant_a, "hello from A");

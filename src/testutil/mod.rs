@@ -3762,6 +3762,16 @@ impl SharedDbNode {
             ],
         );
 
+        crate::db::transport_trust::append_bootstrap_context(
+            &db,
+            &tenant_identity,
+            &event_id_to_base64(&invite.invite_event_id),
+            &event_id_to_base64(&workspace_id),
+            "",
+            &[0xAB; 32],
+        )
+        .expect("failed to record invite-link workspace binding");
+
         // Accept the invite (production flow via workspace commands)
         let peer_shared_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
         let join = join_workspace_as_new_user(

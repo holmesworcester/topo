@@ -130,6 +130,12 @@ pub fn source_peer_id_from_source_tag(source_tag: &str) -> Option<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn test_lock() -> &'static Mutex<()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(()))
+    }
 
     #[test]
     fn source_peer_id_is_parsed_from_quic_source_tags() {
@@ -146,6 +152,7 @@ mod tests {
 
     #[test]
     fn toggle_forward_on_have_at_runtime() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
         set_forward_on_have(false);
         assert!(!forward_on_have_enabled());
         set_forward_on_have(true);
@@ -156,6 +163,9 @@ mod tests {
 
     #[test]
     fn publish_many_reaches_subscribers_for_matching_db_and_tenant() {
+        let _guard = test_lock().lock().expect("test lock poisoned");
+        let prior = forward_on_have_enabled();
+        set_forward_on_have(true);
         let mut rx = subscribe("/tmp/live-hints-test.db", "tenant-a");
         let event_id = [7u8; 32];
         publish_many(
@@ -175,5 +185,6 @@ mod tests {
                 source_peer_id: Some("peer-z".to_string()),
             }
         );
+        set_forward_on_have(prior);
     }
 }

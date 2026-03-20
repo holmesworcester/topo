@@ -9,6 +9,23 @@ fn peer_id_for_signing_key(key: &SigningKey) -> String {
     ))
 }
 
+fn record_invite_link_workspace(
+    conn: &rusqlite::Connection,
+    recorded_by: &str,
+    invite_event_id: &EventId,
+    workspace_id: EventId,
+) {
+    crate::db::transport_trust::append_bootstrap_context(
+        conn,
+        recorded_by,
+        &event_id_to_base64(invite_event_id),
+        &event_id_to_base64(&workspace_id),
+        "",
+        &[0xAB; 32],
+    )
+    .expect("record invite-link workspace binding");
+}
+
 #[test]
 fn create_user_invite_materializes_pending_bootstrap_trust_via_projection() {
     let conn = open_in_memory().expect("open in-memory db");
@@ -259,6 +276,12 @@ fn join_workspace_replays_existing_same_workspace_shared_events_for_new_tenant()
 
     let bob_key = SigningKey::from_bytes(&[7u8; 32]);
     let bob_peer_id = peer_id_for_signing_key(&bob_key);
+    record_invite_link_workspace(
+        &conn,
+        &bob_peer_id,
+        &invite.invite_event_id,
+        workspace.workspace_id,
+    );
     let join = join_workspace_as_new_user(
         &conn,
         &bob_peer_id,
@@ -364,6 +387,12 @@ fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
 
     let phone_key = SigningKey::from_bytes(&[8u8; 32]);
     let phone_peer_id = peer_id_for_signing_key(&phone_key);
+    record_invite_link_workspace(
+        &conn,
+        &phone_peer_id,
+        &invite.invite_event_id,
+        workspace.workspace_id,
+    );
     let link = add_device_to_workspace(
         &conn,
         &phone_peer_id,
