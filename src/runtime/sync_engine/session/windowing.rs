@@ -1,28 +1,57 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use crate::state::db::queue::{
+    PRIORITY_LANE_FOREGROUND, PRIORITY_LANE_TIER_DAY, PRIORITY_LANE_TIER_HOUR,
+    PRIORITY_LANE_TIER_MONTH, PRIORITY_LANE_TIER_WEEK,
+};
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncWindowKind {
     Full = 0,
-    Hot = 1,
-    Cold = 2,
+    LastHour = 1,
+    LastDay = 2,
+    LastWeek = 3,
+    LastMonth = 4,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SyncWindow {
     pub kind: SyncWindowKind,
-    pub cutoff_ms: i64,
+    pub ts_min_inclusive_ms: Option<i64>,
+    pub ts_max_exclusive_ms: Option<i64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncTierMode {
+    Off,
+    Parallel,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncWindowShape {
+    Nested,
+    Disjoint,
 }
 
 const WINDOW_MAGIC: &[u8; 4] = b"P7SW";
-const WINDOW_VERSION: u8 = 1;
-const HOT_WINDOW_MS: i64 = 30_000;
-const _COLD_SESSION_INTERVAL_MS: i64 = 5_000;
+const WINDOW_VERSION: u8 = 2;
+const NONE_TS_SENTINEL: i64 = i64::MIN;
+const HOUR_MS: i64 = 60 * 60 * 1000;
+const DAY_MS: i64 = 24 * HOUR_MS;
+const WEEK_MS: i64 = 7 * DAY_MS;
+const MONTH_MS: i64 = 30 * DAY_MS;
+const TIER_ORDER: [SyncWindowKind; 5] = [
+    SyncWindowKind::LastHour,
+    SyncWindowKind::LastDay,
+    SyncWindowKind::LastWeek,
+    SyncWindowKind::LastMonth,
+    SyncWindowKind::Full,
+];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum PlannerState {
-    _NeedFull,
-    Established { last_cold_ms: i64 },
+struct PlannerState {
+    next_idx: usize,
 }
 
 fn planner_state() -> &'static Mutex<HashMap<String, PlannerState>> {
@@ -30,73 +59,200 @@ fn planner_state() -> &'static Mutex<HashMap<String, PlannerState>> {
     STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-pub fn reset_outbound_window_state(db_path: &str, peer_id: &str) {
-    let key = format!("{db_path}|{peer_id}");
-    let mut state = planner_state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.remove(&key);
+fn planner_key(db_path: &str, peer_id: &str) -> String {
+    format!("{db_path}|{peer_id}")
 }
 
-pub fn select_outbound_window(_db_path: &str, _peer_id: &str, now_ms: i64) -> SyncWindow {
-    // Always use Full window.  The previous Hot/Cold split assumed a fast round
-    // cadence (100 ms) where Cold could sweep old events on a slower cadence.
-    // With the production round gap at 5 s, the Cold condition fired every round,
-    // making all rounds Cold (ts < now-30s) and hiding freshly created events for
-    // 30+ seconds.  A single Full window avoids that bug and keeps the protocol
-    // simple: one negentropy snapshot per round, covering the entire event set.
-    let cutoff_ms = now_ms - HOT_WINDOW_MS;
-    SyncWindow {
-        kind: SyncWindowKind::Full,
-        cutoff_ms,
+fn state_for<'a>(
+    state: &'a mut HashMap<String, PlannerState>,
+    db_path: &str,
+    peer_id: &str,
+) -> &'a mut PlannerState {
+    state
+        .entry(planner_key(db_path, peer_id))
+        .or_insert(PlannerState { next_idx: 0 })
+}
+
+pub fn sync_tier_mode() -> SyncTierMode {
+    match std::env::var("TOPO_SYNC_TIER_MODE")
+        .ok()
+        .unwrap_or_else(|| "off".to_string())
+        .to_lowercase()
+        .as_str()
+    {
+        // Keep the old value as a compatibility alias now that tiered mode
+        // has only one supported behavior.
+        "serial" | "parallel" => SyncTierMode::Parallel,
+        _ => SyncTierMode::Off,
     }
 }
 
-pub fn mark_outbound_full_completed(db_path: &str, peer_id: &str, now_ms: i64) {
-    let key = format!("{db_path}|{peer_id}");
+pub fn sync_window_shape() -> SyncWindowShape {
+    match std::env::var("TOPO_SYNC_WINDOW_SHAPE")
+        .ok()
+        .unwrap_or_else(|| "nested".to_string())
+        .to_lowercase()
+        .as_str()
+    {
+        "disjoint" => SyncWindowShape::Disjoint,
+        _ => SyncWindowShape::Nested,
+    }
+}
+
+pub fn reset_outbound_window_state(db_path: &str, peer_id: &str) {
     let mut state = planner_state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.insert(
-        key,
-        PlannerState::Established {
-            last_cold_ms: now_ms,
+    state.remove(&planner_key(db_path, peer_id));
+}
+
+pub fn select_outbound_window(db_path: &str, peer_id: &str, now_ms: i64) -> SyncWindow {
+    let mode = sync_tier_mode();
+    let mut state = planner_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let planner = state_for(&mut state, db_path, peer_id);
+    match mode {
+        SyncTierMode::Off => window_for_kind(SyncWindowKind::Full, now_ms),
+        SyncTierMode::Parallel => {
+            let idx = planner.next_idx % TIER_ORDER.len();
+            window_for_kind(TIER_ORDER[idx], now_ms)
+        }
+    }
+}
+
+pub fn mark_outbound_window_completed(db_path: &str, peer_id: &str, window: SyncWindow) -> bool {
+    let mode = sync_tier_mode();
+    let mut state = planner_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let planner = state_for(&mut state, db_path, peer_id);
+    match mode {
+        SyncTierMode::Off => false,
+        SyncTierMode::Parallel => {
+            planner.next_idx = (planner.next_idx + 1) % TIER_ORDER.len();
+            window.kind != SyncWindowKind::Full
+        }
+    }
+}
+
+pub fn priority_lane_for_window_kind(kind: SyncWindowKind) -> i64 {
+    match kind {
+        SyncWindowKind::LastHour => PRIORITY_LANE_TIER_HOUR,
+        SyncWindowKind::LastDay => PRIORITY_LANE_TIER_DAY,
+        SyncWindowKind::LastWeek => PRIORITY_LANE_TIER_WEEK,
+        SyncWindowKind::LastMonth => PRIORITY_LANE_TIER_MONTH,
+        SyncWindowKind::Full => PRIORITY_LANE_FOREGROUND,
+    }
+}
+
+pub fn should_hunt_blockers_for_window(kind: SyncWindowKind) -> bool {
+    !matches!(kind, SyncWindowKind::Full)
+}
+
+pub fn priority_lane_for_event_age(now_ms: i64, created_at_ms: i64) -> i64 {
+    let age_ms = now_ms.saturating_sub(created_at_ms);
+    if age_ms <= HOUR_MS {
+        PRIORITY_LANE_TIER_HOUR
+    } else if age_ms <= DAY_MS {
+        PRIORITY_LANE_TIER_DAY
+    } else if age_ms <= WEEK_MS {
+        PRIORITY_LANE_TIER_WEEK
+    } else if age_ms <= MONTH_MS {
+        PRIORITY_LANE_TIER_MONTH
+    } else {
+        PRIORITY_LANE_FOREGROUND
+    }
+}
+
+fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
+    match (sync_window_shape(), kind) {
+        (_, SyncWindowKind::Full) => SyncWindow {
+            kind,
+            ts_min_inclusive_ms: None,
+            ts_max_exclusive_ms: None,
         },
-    );
+        (SyncWindowShape::Nested, SyncWindowKind::LastHour) => SyncWindow {
+            kind,
+            ts_min_inclusive_ms: Some(now_ms - HOUR_MS),
+            ts_max_exclusive_ms: None,
+        },
+        (SyncWindowShape::Nested, SyncWindowKind::LastDay) => SyncWindow {
+            kind,
+            ts_min_inclusive_ms: Some(now_ms - DAY_MS),
+            ts_max_exclusive_ms: None,
+        },
+        (SyncWindowShape::Nested, SyncWindowKind::LastWeek) => SyncWindow {
+            kind,
+            ts_min_inclusive_ms: Some(now_ms - WEEK_MS),
+            ts_max_exclusive_ms: None,
+        },
+        (SyncWindowShape::Nested, SyncWindowKind::LastMonth) => SyncWindow {
+            kind,
+            ts_min_inclusive_ms: Some(now_ms - MONTH_MS),
+            ts_max_exclusive_ms: None,
+        },
+        (SyncWindowShape::Disjoint, SyncWindowKind::LastHour) => SyncWindow {
+            kind,
+            ts_min_inclusive_ms: Some(now_ms - HOUR_MS),
+            ts_max_exclusive_ms: None,
+        },
+        (SyncWindowShape::Disjoint, SyncWindowKind::LastDay) => SyncWindow {
+            kind,
+            ts_min_inclusive_ms: Some(now_ms - DAY_MS),
+            ts_max_exclusive_ms: Some(now_ms - HOUR_MS),
+        },
+        (SyncWindowShape::Disjoint, SyncWindowKind::LastWeek) => SyncWindow {
+            kind,
+            ts_min_inclusive_ms: Some(now_ms - WEEK_MS),
+            ts_max_exclusive_ms: Some(now_ms - DAY_MS),
+        },
+        (SyncWindowShape::Disjoint, SyncWindowKind::LastMonth) => SyncWindow {
+            kind,
+            ts_min_inclusive_ms: Some(now_ms - MONTH_MS),
+            ts_max_exclusive_ms: Some(now_ms - WEEK_MS),
+        },
+    }
 }
 
 impl SyncWindow {
     pub fn ts_min(self) -> Option<i64> {
-        match self.kind {
-            SyncWindowKind::Hot => Some(self.cutoff_ms),
-            _ => None,
-        }
+        self.ts_min_inclusive_ms
     }
 
     pub fn ts_max_exclusive(self) -> Option<i64> {
-        match self.kind {
-            SyncWindowKind::Cold => Some(self.cutoff_ms),
-            _ => None,
-        }
+        self.ts_max_exclusive_ms
     }
 }
 
 pub fn encode_initial_neg_open(window: SyncWindow, inner: Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + 1 + 1 + 8 + inner.len());
+    let mut out = Vec::with_capacity(4 + 1 + 1 + 8 + 8 + inner.len());
     out.extend_from_slice(WINDOW_MAGIC);
     out.push(WINDOW_VERSION);
     out.push(window.kind as u8);
-    out.extend_from_slice(&window.cutoff_ms.to_le_bytes());
+    out.extend_from_slice(
+        &window
+            .ts_min_inclusive_ms
+            .unwrap_or(NONE_TS_SENTINEL)
+            .to_le_bytes(),
+    );
+    out.extend_from_slice(
+        &window
+            .ts_max_exclusive_ms
+            .unwrap_or(NONE_TS_SENTINEL)
+            .to_le_bytes(),
+    );
     out.extend_from_slice(&inner);
     out
 }
 
 pub fn decode_initial_neg_open(msg: &[u8]) -> Result<(SyncWindow, &[u8]), String> {
-    if msg.len() < 14 || &msg[..4] != WINDOW_MAGIC {
+    if msg.len() < 22 || &msg[..4] != WINDOW_MAGIC {
         return Ok((
             SyncWindow {
                 kind: SyncWindowKind::Full,
-                cutoff_ms: 0,
+                ts_min_inclusive_ms: None,
+                ts_max_exclusive_ms: None,
             },
             msg,
         ));
@@ -108,81 +264,160 @@ pub fn decode_initial_neg_open(msg: &[u8]) -> Result<(SyncWindow, &[u8]), String
     }
     let kind = match msg[5] {
         0 => SyncWindowKind::Full,
-        1 => SyncWindowKind::Hot,
-        2 => SyncWindowKind::Cold,
+        1 => SyncWindowKind::LastHour,
+        2 => SyncWindowKind::LastDay,
+        3 => SyncWindowKind::LastWeek,
+        4 => SyncWindowKind::LastMonth,
         other => return Err(format!("unsupported sync window kind {}", other)),
     };
-    let cutoff_ms = i64::from_le_bytes(
+    let ts_min = i64::from_le_bytes(
         msg[6..14]
             .try_into()
-            .map_err(|_| "sync window header truncated".to_string())?,
+            .map_err(|_| "sync window min header truncated".to_string())?,
     );
-    Ok((SyncWindow { kind, cutoff_ms }, &msg[14..]))
+    let ts_max = i64::from_le_bytes(
+        msg[14..22]
+            .try_into()
+            .map_err(|_| "sync window max header truncated".to_string())?,
+    );
+    Ok((
+        SyncWindow {
+            kind,
+            ts_min_inclusive_ms: (ts_min != NONE_TS_SENTINEL).then_some(ts_min),
+            ts_max_exclusive_ms: (ts_max != NONE_TS_SENTINEL).then_some(ts_max),
+        },
+        &msg[22..],
+    ))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
     #[test]
-    fn sessions_stay_full_until_first_full_completes() {
-        let db_path = "/tmp/window-test-a";
+    fn off_mode_always_uses_full_window() {
+        let _guard = env_guard();
+        std::env::remove_var("TOPO_SYNC_TIER_MODE");
+        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
+        reset_outbound_window_state("/tmp/window-off", "peer-a");
+        let window = select_outbound_window("/tmp/window-off", "peer-a", 100_000);
+        assert_eq!(window.kind, SyncWindowKind::Full);
+        assert_eq!(window.ts_min(), None);
+        assert_eq!(window.ts_max_exclusive(), None);
+    }
+
+    #[test]
+    fn tier_mode_round_robins_windows() {
+        let _guard = env_guard();
+        std::env::set_var("TOPO_SYNC_TIER_MODE", "parallel");
+        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
+        let db_path = "/tmp/window-parallel";
         let peer_id = "peer-a";
         reset_outbound_window_state(db_path, peer_id);
-        let first = select_outbound_window(db_path, peer_id, 100_000);
-        let second = select_outbound_window(db_path, peer_id, 101_000);
 
-        assert_eq!(first.kind, SyncWindowKind::Full);
-        assert_eq!(second.kind, SyncWindowKind::Full);
+        let kinds: Vec<SyncWindowKind> = (0..7)
+            .map(|_| {
+                let window = select_outbound_window(db_path, peer_id, 1_000_000);
+                let kind = window.kind;
+                let _ = mark_outbound_window_completed(db_path, peer_id, window);
+                kind
+            })
+            .collect();
+
+        assert_eq!(
+            kinds,
+            vec![
+                SyncWindowKind::LastHour,
+                SyncWindowKind::LastDay,
+                SyncWindowKind::LastWeek,
+                SyncWindowKind::LastMonth,
+                SyncWindowKind::Full,
+                SyncWindowKind::LastHour,
+                SyncWindowKind::LastDay,
+            ]
+        );
+        std::env::remove_var("TOPO_SYNC_TIER_MODE");
+        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
     }
 
     #[test]
-    fn completed_full_stays_full_after_completion() {
-        let db_path = "/tmp/window-test-b";
-        let peer_id = "peer-b";
+    fn legacy_serial_alias_uses_parallel_behavior() {
+        let _guard = env_guard();
+        std::env::set_var("TOPO_SYNC_TIER_MODE", "serial");
+        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
+        let db_path = "/tmp/window-serial-alias";
+        let peer_id = "peer-a";
         reset_outbound_window_state(db_path, peer_id);
-        mark_outbound_full_completed(db_path, peer_id, 100_000);
 
-        // With always-Full windowing, post-completion rounds are also Full.
-        let next = select_outbound_window(db_path, peer_id, 101_000);
-        let later = select_outbound_window(db_path, peer_id, 106_500);
+        let kinds: Vec<SyncWindowKind> = (0..5)
+            .map(|_| {
+                let window = select_outbound_window(db_path, peer_id, 1_000_000);
+                let kind = window.kind;
+                let _ = mark_outbound_window_completed(db_path, peer_id, window);
+                kind
+            })
+            .collect();
 
-        assert_eq!(next.kind, SyncWindowKind::Full);
-        assert_eq!(later.kind, SyncWindowKind::Full);
+        assert_eq!(
+            kinds,
+            vec![
+                SyncWindowKind::LastHour,
+                SyncWindowKind::LastDay,
+                SyncWindowKind::LastWeek,
+                SyncWindowKind::LastMonth,
+                SyncWindowKind::Full,
+            ]
+        );
+        std::env::remove_var("TOPO_SYNC_TIER_MODE");
+        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
     }
 
     #[test]
-    fn reset_returns_planner_to_full_baseline() {
-        let db_path = "/tmp/window-test-c";
-        let peer_id = "peer-c";
-        reset_outbound_window_state(db_path, peer_id);
-        mark_outbound_full_completed(db_path, peer_id, 100_000);
-        reset_outbound_window_state(db_path, peer_id);
+    fn disjoint_shape_uses_adjacent_non_full_windows() {
+        let _guard = env_guard();
+        std::env::set_var("TOPO_SYNC_WINDOW_SHAPE", "disjoint");
 
-        let window = select_outbound_window(db_path, peer_id, 101_000);
-        assert_eq!(window.kind, SyncWindowKind::Full);
+        let hour = window_for_kind(SyncWindowKind::LastHour, 1_000_000);
+        let day = window_for_kind(SyncWindowKind::LastDay, 1_000_000);
+        let week = window_for_kind(SyncWindowKind::LastWeek, 1_000_000);
+        let month = window_for_kind(SyncWindowKind::LastMonth, 1_000_000);
+        let full = window_for_kind(SyncWindowKind::Full, 1_000_000);
+
+        assert_eq!(hour.ts_min(), Some(1_000_000 - HOUR_MS));
+        assert_eq!(hour.ts_max_exclusive(), None);
+
+        assert_eq!(day.ts_min(), Some(1_000_000 - DAY_MS));
+        assert_eq!(day.ts_max_exclusive(), Some(1_000_000 - HOUR_MS));
+
+        assert_eq!(week.ts_min(), Some(1_000_000 - WEEK_MS));
+        assert_eq!(week.ts_max_exclusive(), Some(1_000_000 - DAY_MS));
+
+        assert_eq!(month.ts_min(), Some(1_000_000 - MONTH_MS));
+        assert_eq!(month.ts_max_exclusive(), Some(1_000_000 - WEEK_MS));
+
+        assert_eq!(full.ts_min(), None);
+        assert_eq!(full.ts_max_exclusive(), None);
+
+        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
     }
 
     #[test]
     fn initial_neg_open_roundtrips_window_header() {
         let window = SyncWindow {
-            kind: SyncWindowKind::Hot,
-            cutoff_ms: 123_456,
+            kind: SyncWindowKind::LastWeek,
+            ts_min_inclusive_ms: Some(123_456),
+            ts_max_exclusive_ms: Some(456_789),
         };
         let payload = vec![1, 2, 3, 4];
         let encoded = encode_initial_neg_open(window, payload.clone());
         let (decoded_window, inner) = decode_initial_neg_open(&encoded).unwrap();
 
         assert_eq!(decoded_window, window);
-        assert_eq!(inner, payload.as_slice());
-    }
-
-    #[test]
-    fn decode_initial_neg_open_accepts_legacy_raw_payload() {
-        let payload = vec![9, 8, 7];
-        let (window, inner) = decode_initial_neg_open(&payload).unwrap();
-
-        assert_eq!(window.kind, SyncWindowKind::Full);
         assert_eq!(inner, payload.as_slice());
     }
 }

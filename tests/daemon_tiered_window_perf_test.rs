@@ -1,0 +1,308 @@
+//! Tiered window catch-up benchmark:
+//! last hour -> last day -> last week -> last month -> full history.
+//!
+//! Run with:
+//! `cargo test --release --test daemon_tiered_window_perf_test -- --ignored --nocapture --test-threads=1`
+
+mod cli_harness;
+mod perf_network_shaper;
+
+use std::net::{Ipv4Addr, SocketAddr};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+
+use cli_harness::{
+    accept_invite_with_identity_on_running_daemon, create_invite_with_spki,
+    create_workspace_with_details, daemon_listen_addr, daemon_transport_fingerprint,
+    ensure_active_peer, generate_messages, message_count_sql, random_port,
+    start_daemon_with_options, stop_daemon, wait_for_daemon_stopped, DaemonOptions,
+};
+use perf_network_shaper::{NetworkProfile, UdpTrafficShaper, REALISTIC_NETWORK_PROFILES};
+
+const HOUR_MS: i64 = 60 * 60 * 1000;
+const DAY_MS: i64 = 24 * HOUR_MS;
+const WEEK_MS: i64 = 7 * DAY_MS;
+const MONTH_MS: i64 = 30 * DAY_MS;
+const THREE_YEARS_MS: i64 = 3 * 365 * DAY_MS;
+
+fn current_timestamp_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system clock before unix epoch")
+        .as_millis() as i64
+}
+
+fn env_i64(name: &str, default: i64) -> i64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<i64>().ok())
+        .unwrap_or(default)
+}
+
+fn inherited_tier_env() -> Vec<(String, String)> {
+    [
+        "TOPO_SYNC_TIER_MODE",
+        "TOPO_SYNC_WINDOW_SHAPE",
+        "TOPO_GENERATE_MESSAGE_SPREAD_MS",
+        "TOPO_FORWARD_ON_HAVE",
+        "TOPO_EVENT_TIMELINE",
+    ]
+    .into_iter()
+    .filter_map(|key| {
+        std::env::var(key)
+            .ok()
+            .map(|value| (key.to_string(), value))
+    })
+    .collect()
+}
+
+fn join_catchup_network_profile_from_env() -> Option<NetworkProfile> {
+    let slug = match std::env::var("TOPO_JOIN_CATCHUP_NETWORK_PROFILE") {
+        Ok(value) => value,
+        Err(_) => return None,
+    };
+    let slug = slug.trim();
+    if slug.is_empty() || slug.eq_ignore_ascii_case("loopback") {
+        return None;
+    }
+    REALISTIC_NETWORK_PROFILES
+        .iter()
+        .copied()
+        .find(|profile| profile.slug == slug)
+        .unwrap_or_else(|| {
+            panic!(
+                "unknown TOPO_JOIN_CATCHUP_NETWORK_PROFILE `{slug}`; supported={}",
+                REALISTIC_NETWORK_PROFILES
+                    .iter()
+                    .map(|profile| profile.slug)
+                    .collect::<Vec<_>>()
+                    .join(",")
+            )
+        })
+        .into()
+}
+
+fn message_count_since_sql(db: &str, cutoff_ms: i64) -> i64 {
+    let conn = topo::db::open_connection(db).expect("open db for message_count_since");
+    let peer_id = cli_harness::active_tenant_peer_id(db).expect("active tenant peer id");
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM messages
+         WHERE recorded_by = ?1
+           AND created_at >= ?2",
+        rusqlite::params![peer_id, cutoff_ms],
+        |row| row.get(0),
+    )
+    .expect("query message_count_since")
+}
+
+fn wait_for_message_count_since(db: &str, cutoff_ms: i64, expected: i64, timeout: Duration) -> i64 {
+    let start = Instant::now();
+    loop {
+        let count = message_count_since_sql(db, cutoff_ms);
+        if count >= expected {
+            return current_timestamp_ms();
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "message_count_since timed out after {:?} for db={}: cutoff_ms={} expected_at_least={} actual={}",
+            timeout,
+            db,
+            cutoff_ms,
+            expected,
+            count
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn wait_for_message_count(db: &str, expected: i64, timeout: Duration) -> i64 {
+    let start = Instant::now();
+    loop {
+        let count = message_count_sql(db);
+        if count >= expected {
+            return current_timestamp_ms();
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "message_count timed out after {:?} for db={}: expected_at_least={} actual={}",
+            timeout,
+            db,
+            expected,
+            count
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn write_summary(summary_key: &str, summary: &str) {
+    let summary_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-results");
+    std::fs::create_dir_all(&summary_dir).expect("create target/perf-results");
+    std::fs::write(summary_dir.join(format!("{summary_key}.summary")), summary)
+        .expect("write benchmark summary file");
+}
+
+fn run_tiered_window_bench() {
+    let mode = "parallel";
+    std::env::set_var("TOPO_SYNC_TIER_MODE", mode);
+    std::env::set_var(
+        "TOPO_GENERATE_MESSAGE_SPREAD_MS",
+        THREE_YEARS_MS.to_string(),
+    );
+    std::env::set_var("TOPO_FORWARD_ON_HAVE", "1");
+
+    let total_messages = env_i64("TOPO_TIERED_SYNC_TOTAL_MESSAGES", 50_000);
+    let window_shape = std::env::var("TOPO_SYNC_WINDOW_SHAPE")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| "nested".to_string());
+    let network_profile = join_catchup_network_profile_from_env();
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+
+    create_workspace_with_details(&alice_db, "workspace", "alice", "desktop");
+    let mut alice_daemon = start_daemon_with_options(
+        &alice_db,
+        &DaemonOptions {
+            disable_discovery: true,
+            extra_env: inherited_tier_env(),
+            ..Default::default()
+        },
+    );
+    ensure_active_peer(&alice_db, Duration::from_secs(10));
+    generate_messages(&alice_db, total_messages as usize);
+    assert!(
+        message_count_sql(&alice_db) >= total_messages,
+        "alice should have generated all messages"
+    );
+
+    let measurement_now_ms = current_timestamp_ms();
+    let hour_cutoff = measurement_now_ms - HOUR_MS;
+    let day_cutoff = measurement_now_ms - DAY_MS;
+    let week_cutoff = measurement_now_ms - WEEK_MS;
+    let month_cutoff = measurement_now_ms - MONTH_MS;
+    let expected_hour = message_count_since_sql(&alice_db, hour_cutoff);
+    let expected_day = message_count_since_sql(&alice_db, day_cutoff);
+    let expected_week = message_count_since_sql(&alice_db, week_cutoff);
+    let expected_month = message_count_since_sql(&alice_db, month_cutoff);
+
+    let alice_direct_addr = daemon_listen_addr(&alice_db);
+    let (invite_addr, bob_bind_addr, network_guard) = if let Some(profile) = network_profile {
+        let alice_real_addr = alice_direct_addr
+            .parse::<SocketAddr>()
+            .unwrap_or_else(|_| panic!("parse alice daemon listen addr `{alice_direct_addr}`"));
+        let bob_bind_addr = SocketAddr::from((Ipv4Addr::LOCALHOST, random_port()));
+        let shaper = UdpTrafficShaper::new(alice_real_addr, bob_bind_addr, profile);
+        (
+            shaper.left_addr().to_string(),
+            Some(bob_bind_addr),
+            Some(shaper),
+        )
+    } else {
+        (alice_direct_addr.clone(), None, None)
+    };
+    let invite_link = create_invite_with_spki(
+        &alice_db,
+        &invite_addr,
+        Some(&daemon_transport_fingerprint(&alice_db)),
+    );
+    let mut bob_daemon = start_daemon_with_options(
+        &bob_db,
+        &DaemonOptions {
+            bind_ip: bob_bind_addr.map(|addr| addr.ip().to_string()),
+            bind_port: bob_bind_addr.map(|addr| addr.port()),
+            disable_discovery: true,
+            extra_env: inherited_tier_env(),
+            ..Default::default()
+        },
+    );
+    let _network_guard = network_guard;
+
+    let metric_start_ms = current_timestamp_ms();
+    let bench_start = Instant::now();
+    accept_invite_with_identity_on_running_daemon(
+        &bob_db,
+        &invite_link,
+        "bob",
+        "laptop",
+        Duration::from_secs(30),
+    );
+
+    let hour_projected_ms = if expected_hour > 0 {
+        wait_for_message_count_since(
+            &bob_db,
+            hour_cutoff,
+            expected_hour,
+            Duration::from_secs(1200),
+        )
+    } else {
+        metric_start_ms
+    };
+    let day_projected_ms = if expected_day > 0 {
+        wait_for_message_count_since(&bob_db, day_cutoff, expected_day, Duration::from_secs(1200))
+    } else {
+        metric_start_ms
+    };
+    let week_projected_ms = if expected_week > 0 {
+        wait_for_message_count_since(
+            &bob_db,
+            week_cutoff,
+            expected_week,
+            Duration::from_secs(1200),
+        )
+    } else {
+        metric_start_ms
+    };
+    let month_projected_ms = if expected_month > 0 {
+        wait_for_message_count_since(
+            &bob_db,
+            month_cutoff,
+            expected_month,
+            Duration::from_secs(1200),
+        )
+    } else {
+        metric_start_ms
+    };
+    let full_projected_ms =
+        wait_for_message_count(&bob_db, total_messages, Duration::from_secs(1200));
+    let full_wall_secs = bench_start.elapsed().as_secs_f64();
+
+    let summary = format!(
+        "=== tiered window catchup ===\n  Mode: {mode}\n  Window shape: {window_shape}\n  Messages preloaded on inviter: {total_messages}\n  Network profile: {}\n  Generated spread: 3 years\n  Metric start: invite accept on running joiner daemon\n  Last hour: {} msgs projected in {:.2}s\n  Last day: {} msgs projected in {:.2}s\n  Last week: {} msgs projected in {:.2}s\n  Last month: {} msgs projected in {:.2}s\n  Full history: {} msgs projected in {:.2}s\n  Full catchup wall: {:.2}s\n",
+        network_profile.map(|profile| profile.slug).unwrap_or("loopback"),
+        expected_hour,
+        (hour_projected_ms - metric_start_ms) as f64 / 1000.0,
+        expected_day,
+        (day_projected_ms - metric_start_ms) as f64 / 1000.0,
+        expected_week,
+        (week_projected_ms - metric_start_ms) as f64 / 1000.0,
+        expected_month,
+        (month_projected_ms - metric_start_ms) as f64 / 1000.0,
+        total_messages,
+        (full_projected_ms - metric_start_ms) as f64 / 1000.0,
+        full_wall_secs,
+    );
+    eprintln!("\n{summary}");
+    let summary_key = format!(
+        "daemon_tiered_window_perf_test.{}_{}_{}_{}",
+        mode,
+        window_shape,
+        total_messages,
+        network_profile
+            .map(|profile| profile.slug)
+            .unwrap_or("loopback"),
+    );
+    write_summary(&summary_key, &summary);
+
+    stop_daemon(&bob_db, &mut bob_daemon);
+    wait_for_daemon_stopped(&bob_db, Duration::from_secs(10));
+    stop_daemon(&alice_db, &mut alice_daemon);
+    wait_for_daemon_stopped(&alice_db, Duration::from_secs(10));
+}
+
+#[test]
+#[ignore]
+fn perf_tiered_window_50k_parallel() {
+    run_tiered_window_bench();
+}

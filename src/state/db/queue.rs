@@ -13,8 +13,13 @@ pub const BACKOFF_BASE_MS: i64 = 1000;
 pub const BACKOFF_MAX_ATTEMPTS: u32 = 10;
 pub const SQLITE_BUSY_RETRY_BASE_MS: u64 = 10;
 pub const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 8;
-pub const PRIORITY_LANE_FOREGROUND: i64 = 1;
-pub const PRIORITY_LANE_BULK: i64 = 2;
+pub const PRIORITY_LANE_BLOCKER: i64 = 0;
+pub const PRIORITY_LANE_TIER_HOUR: i64 = 1;
+pub const PRIORITY_LANE_TIER_DAY: i64 = 2;
+pub const PRIORITY_LANE_TIER_WEEK: i64 = 3;
+pub const PRIORITY_LANE_TIER_MONTH: i64 = 4;
+pub const PRIORITY_LANE_FOREGROUND: i64 = 5;
+pub const PRIORITY_LANE_BULK: i64 = 6;
 
 /// Queue health snapshot for observability.
 #[derive(Debug, Clone)]

@@ -20,13 +20,14 @@ pub const MSG_TYPE_INTRO_OFFER: u8 = 0x30; // Intro offer for hole punching
 const MAX_NEG_MSG_BYTES: usize = 4 * 1024 * 1024;
 /// Max number of IDs or discovery hints carried in one control-plane frame.
 const MAX_ID_LIST_ENTRIES: usize = 100_000;
-const DISCOVERY_HINT_WIRE_BYTES: usize = 32 + 1 + 4;
+const DISCOVERY_HINT_WIRE_BYTES: usize = 32 + 1 + 4 + 8;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiscoveryHint {
     pub event_id: EventId,
     pub semantic_type_code: u8,
     pub encoded_size_bytes: u32,
+    pub created_at_ms: u64,
 }
 
 /// Sync protocol messages
@@ -41,7 +42,10 @@ pub enum Frame {
     /// Source-advertised response credit in encoded event bytes.
     ResponseCredit { bytes: u32 },
     /// Discovery hints describing events the peer appears to be missing.
-    DiscoveryHints { hints: Vec<DiscoveryHint> },
+    DiscoveryHints {
+        priority_lane: u8,
+        hints: Vec<DiscoveryHint>,
+    },
     /// Send full event blob (variable length)
     Event { blob: Vec<u8> },
     /// Intro offer for QUIC hole punching via a third peer
@@ -110,20 +114,21 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
             Ok((Frame::RequestIds { ids }, total_size))
         }
         MSG_TYPE_DISCOVERY_HINTS => {
-            if input.len() < 5 {
+            if input.len() < 6 {
                 return Err(ParseError::InsufficientData);
             }
-            let count = u32::from_le_bytes([input[1], input[2], input[3], input[4]]) as usize;
+            let priority_lane = input[1];
+            let count = u32::from_le_bytes([input[2], input[3], input[4], input[5]]) as usize;
             if count > MAX_ID_LIST_ENTRIES {
                 return Err(ParseError::TooManyIds(count));
             }
-            let total_size = 5 + count * DISCOVERY_HINT_WIRE_BYTES;
+            let total_size = 6 + count * DISCOVERY_HINT_WIRE_BYTES;
             if input.len() < total_size {
                 return Err(ParseError::InsufficientData);
             }
             let mut hints = Vec::with_capacity(count);
             for i in 0..count {
-                let start = 5 + i * DISCOVERY_HINT_WIRE_BYTES;
+                let start = 6 + i * DISCOVERY_HINT_WIRE_BYTES;
                 let mut event_id = [0u8; 32];
                 event_id.copy_from_slice(&input[start..start + 32]);
                 let semantic_type_code = input[start + 32];
@@ -133,13 +138,30 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
                     input[start + 35],
                     input[start + 36],
                 ]);
+                let created_at_ms = u64::from_le_bytes([
+                    input[start + 37],
+                    input[start + 38],
+                    input[start + 39],
+                    input[start + 40],
+                    input[start + 41],
+                    input[start + 42],
+                    input[start + 43],
+                    input[start + 44],
+                ]);
                 hints.push(DiscoveryHint {
                     event_id,
                     semantic_type_code,
                     encoded_size_bytes,
+                    created_at_ms,
                 });
             }
-            Ok((Frame::DiscoveryHints { hints }, total_size))
+            Ok((
+                Frame::DiscoveryHints {
+                    priority_lane,
+                    hints,
+                },
+                total_size,
+            ))
         }
         MSG_TYPE_RESPONSE_CREDIT => {
             if input.len() < 5 {
@@ -237,14 +259,19 @@ pub fn encode_frame(msg: &Frame) -> Vec<u8> {
             }
             buf
         }
-        Frame::DiscoveryHints { hints } => {
-            let mut buf = Vec::with_capacity(5 + hints.len() * DISCOVERY_HINT_WIRE_BYTES);
+        Frame::DiscoveryHints {
+            priority_lane,
+            hints,
+        } => {
+            let mut buf = Vec::with_capacity(6 + hints.len() * DISCOVERY_HINT_WIRE_BYTES);
             buf.push(MSG_TYPE_DISCOVERY_HINTS);
+            buf.push(*priority_lane);
             buf.extend_from_slice(&(hints.len() as u32).to_le_bytes());
             for hint in hints {
                 buf.extend_from_slice(&hint.event_id);
                 buf.push(hint.semantic_type_code);
                 buf.extend_from_slice(&hint.encoded_size_bytes.to_le_bytes());
+                buf.extend_from_slice(&hint.created_at_ms.to_le_bytes());
             }
             buf
         }
@@ -517,16 +544,19 @@ mod tests {
     #[test]
     fn test_discovery_hints_roundtrip() {
         let msg = Frame::DiscoveryHints {
+            priority_lane: 3,
             hints: vec![
                 DiscoveryHint {
                     event_id: [0x11; 32],
                     semantic_type_code: 7,
                     encoded_size_bytes: 144,
+                    created_at_ms: 1_000,
                 },
                 DiscoveryHint {
                     event_id: [0x22; 32],
                     semantic_type_code: 14,
                     encoded_size_bytes: 262_214,
+                    created_at_ms: 2_000,
                 },
             ],
         };

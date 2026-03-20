@@ -427,13 +427,16 @@ mod tests {
                         event_id: a,
                         semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
                         encoded_size_bytes: 128,
+                        created_at_ms: 10,
                     },
                     crate::protocol::DiscoveryHint {
                         event_id: b,
                         semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
                         encoded_size_bytes: 128,
+                        created_at_ms: 20,
                     },
                 ],
+                1,
                 now_ms_placeholder(),
                 &timeline,
             )
@@ -447,13 +450,16 @@ mod tests {
                         event_id: a,
                         semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
                         encoded_size_bytes: 128,
+                        created_at_ms: 10,
                     },
                     crate::protocol::DiscoveryHint {
                         event_id: c,
                         semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
                         encoded_size_bytes: 128,
+                        created_at_ms: 30,
                     },
                 ],
+                1,
                 now_ms_placeholder(),
                 &timeline,
             )

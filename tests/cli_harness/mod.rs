@@ -11,6 +11,7 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
+use std::thread;
 use std::time::{Duration, Instant};
 use topo::testutil::DaemonGuard;
 
@@ -22,8 +23,7 @@ fn next_daemon_instance_id() -> u64 {
 
 // Registry mapping db_path → (stdout_log_path, stderr_log_path) for the running daemon.
 // Populated at daemon start, removed at drop/kill, consulted by daemon_debug_context().
-static DAEMON_LOG_REGISTRY: OnceLock<Mutex<HashMap<String, (PathBuf, PathBuf)>>> =
-    OnceLock::new();
+static DAEMON_LOG_REGISTRY: OnceLock<Mutex<HashMap<String, (PathBuf, PathBuf)>>> = OnceLock::new();
 
 fn daemon_log_registry() -> &'static Mutex<HashMap<String, (PathBuf, PathBuf)>> {
     DAEMON_LOG_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
@@ -153,7 +153,6 @@ impl Drop for HarnessDaemon {
 
 const DAEMON_START_MAX_ATTEMPTS: usize = 20;
 const DAEMON_START_RETRY_BASE_MS: u64 = 200;
-
 
 // ---------------------------------------------------------------------------
 // Core utilities
@@ -968,19 +967,31 @@ pub fn daemon_listen_addr(db: &str) -> String {
 /// Get the daemon's transport SPKI fingerprint (first key from transport-keys).
 pub fn daemon_transport_fingerprint(db: &str) -> String {
     let socket = socket_path_for_db(db);
-    let resp = topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::TransportKeys)
-        .expect("transport-keys RPC");
-    assert!(resp.ok, "transport-keys RPC returned error");
-    let data = resp.data.expect("transport-keys response missing data");
-    let keys = data
-        .as_array()
-        .expect("transport-keys response should be array");
-    assert!(!keys.is_empty(), "transport-keys returned empty list");
-    keys[0]
-        .get("peer_id")
-        .and_then(|v| v.as_str())
-        .map(str::to_string)
-        .expect("transport-keys entry missing peer_id")
+    let start = Instant::now();
+    let timeout = Duration::from_secs(10);
+    loop {
+        let resp =
+            topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::TransportKeys)
+                .expect("transport-keys RPC");
+        assert!(resp.ok, "transport-keys RPC returned error");
+        let data = resp.data.expect("transport-keys response missing data");
+        let keys = data
+            .as_array()
+            .expect("transport-keys response should be array");
+        if let Some(peer_id) = keys
+            .first()
+            .and_then(|entry| entry.get("peer_id"))
+            .and_then(|v| v.as_str())
+        {
+            return peer_id.to_string();
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "transport-keys returned empty list for {:?}",
+            timeout
+        );
+        thread::sleep(Duration::from_millis(100));
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1290,14 +1301,7 @@ pub fn accept_invite_with_identity_persisted_only(
     devicename: &str,
     accept_timeout: Duration,
 ) {
-    accept_invite_with_identity_inner(
-        db,
-        invite_link,
-        username,
-        devicename,
-        accept_timeout,
-        false,
-    );
+    accept_invite_with_identity_inner(db, invite_link, username, devicename, accept_timeout, false);
 }
 
 pub fn accept_invite_with_identity_and_timeout(
@@ -1307,14 +1311,7 @@ pub fn accept_invite_with_identity_and_timeout(
     devicename: &str,
     accept_timeout: Duration,
 ) {
-    accept_invite_with_identity_inner(
-        db,
-        invite_link,
-        username,
-        devicename,
-        accept_timeout,
-        true,
-    );
+    accept_invite_with_identity_inner(db, invite_link, username, devicename, accept_timeout, true);
 }
 
 fn accept_invite_with_identity_inner(
@@ -2202,11 +2199,7 @@ pub fn seed_invite_bootstrap_trust(
     .expect("record_invite_bootstrap_trust");
 }
 
-pub fn wait_for_endpoint_observation(
-    db_path: &str,
-    remote_peer_id: &str,
-    timeout: Duration,
-) {
+pub fn wait_for_endpoint_observation(db_path: &str, remote_peer_id: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         let now_ms = std::time::SystemTime::now()

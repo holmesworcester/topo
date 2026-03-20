@@ -544,13 +544,11 @@ pub fn create_encrypted_event_synchronous(
         .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
 
     // 5. Build EncryptedEvent wrapper
-    let now_ms = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-
     let wrapper = ParsedEvent::Encrypted(EncryptedEvent {
-        created_at_ms: now_ms,
+        // Preserve the inner event's logical timestamp on the wrapper so
+        // recency-based discovery/sync policies can prioritize encrypted
+        // content by the user-visible event time without decrypting first.
+        created_at_ms: inner_event.created_at_ms(),
         key_event_id: *key_event_id,
         inner_type_code: inner_event.event_type_code(),
         nonce,
@@ -1241,6 +1239,49 @@ mod tests {
             pending_fanout_count, 0,
             "synchronous local create should not rely on pending shared fanout recovery rows"
         );
+    }
+
+    #[test]
+    fn test_encrypted_wrapper_created_at_matches_inner_event_timestamp() {
+        let conn = setup();
+        let recorded_by = "peer1";
+        let net_eid = setup_workspace_event(&conn, recorded_by);
+        let (signer_eid, signing_key, user_event_id) = make_identity_chain(&conn, recorded_by);
+        let key_event_id =
+            crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+                &conn,
+                recorded_by,
+            )
+            .unwrap();
+        let inner_created_at_ms = 1_700_000_000_123u64;
+        let msg = ParsedEvent::Message(MessageEvent {
+            created_at_ms: inner_created_at_ms,
+            workspace_id: net_eid,
+            author_id: user_event_id,
+            content: "timestamp preserved".to_string(),
+            signed_by: signer_eid,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+
+        let event_id = create_encrypted_event_synchronous(
+            &conn,
+            recorded_by,
+            &key_event_id,
+            &msg,
+            Some(&signing_key),
+        )
+        .unwrap();
+        let wrapper_blob: Vec<u8> = conn
+            .query_row(
+                "SELECT blob FROM events WHERE event_id = ?1",
+                rusqlite::params![event_id_to_base64(&event_id)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let wrapper = crate::event_modules::parse_event(&wrapper_blob).unwrap();
+
+        assert_eq!(wrapper.created_at_ms(), inner_created_at_ms);
     }
 
     #[test]

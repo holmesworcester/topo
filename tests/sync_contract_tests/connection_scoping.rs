@@ -81,8 +81,10 @@ async fn initiator_reuses_connection_scoped_credit_across_repeated_rounds() {
                         event_id: requested_event,
                         semantic_type_code: topo::event_modules::EVENT_TYPE_MESSAGE,
                         encoded_size_bytes: 144,
+                        created_at_ms: 1_000,
                     }],
                     1_000,
+                    0,
                     &timeline
                 )
                 .expect("observe wanted"),
@@ -120,7 +122,10 @@ async fn initiator_reuses_connection_scoped_credit_across_repeated_rounds() {
             }
         }
 
-        assert!(saw_request, "expected RequestIds to reuse connection credit");
+        assert!(
+            saw_request,
+            "expected RequestIds to reuse connection credit"
+        );
         assert!(
             saw_second_round,
             "expected a second NegOpen on the same session"

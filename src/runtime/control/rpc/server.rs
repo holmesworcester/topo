@@ -730,14 +730,20 @@ fn dispatch(
             },
             Err(e) => RpcResponse::error(e),
         },
-        RpcMethod::Generate { count } => match state.require_active_peer() {
-            Ok(peer_id) => match message::generate_for_peer(db_path, &peer_id, count) {
-                Ok(data) => {
-                    state.notify_runtime_recheck();
-                    RpcResponse::success(data)
+        RpcMethod::Generate {
+            count,
+            history_span,
+        } => match state.require_active_peer() {
+            Ok(peer_id) => {
+                match message::generate_for_peer(db_path, &peer_id, count, history_span.as_deref())
+                {
+                    Ok(data) => {
+                        state.notify_runtime_recheck();
+                        RpcResponse::success(data)
+                    }
+                    Err(e) => RpcResponse::error(e.to_string()),
                 }
-                Err(e) => RpcResponse::error(e.to_string()),
-            },
+            }
             Err(e) => RpcResponse::error(e),
         },
         RpcMethod::GenerateFiles { count, size_mib } => match state.require_active_peer() {

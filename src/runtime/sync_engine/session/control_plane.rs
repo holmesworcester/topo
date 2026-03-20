@@ -7,17 +7,19 @@
 //!   via the shared in-memory coordinator
 
 use negentropy::Id;
+use std::collections::BTreeMap;
 use tokio::sync::broadcast;
 use tracing::info;
 
 use crate::crypto::EventId;
+use crate::db::store::Store;
 use crate::db::timeline::EventTimeline;
 use crate::db::wanted::WantedEvents;
-use crate::db::store::Store;
 use crate::protocol::{neg_id_to_event_id, DiscoveryHint, Frame};
 use crate::state::live_hints::LiveHint;
 use crate::transport::StreamConn;
 
+use super::windowing::{priority_lane_for_event_age, priority_lane_for_window_kind, SyncWindow};
 use super::{connection_scope::ConnectionRequestState, coordinator::PeerCoord, need_chunk};
 
 pub type SyncError = Box<dyn std::error::Error + Send + Sync>;
@@ -42,6 +44,7 @@ pub fn observe_discovery_hints_for_peer(
     local_peer_id: &str,
     peer_id: &str,
     discovery_round_started_at: i64,
+    priority_lane: i64,
     hints: &[DiscoveryHint],
     observed_ids: &mut Vec<EventId>,
 ) -> Result<usize, SyncError> {
@@ -53,6 +56,7 @@ pub fn observe_discovery_hints_for_peer(
         local_peer_id,
         peer_id,
         hints,
+        priority_lane,
         discovery_round_started_at,
         timeline,
     )?)
@@ -67,6 +71,7 @@ pub async fn send_discovery_hints_from_have_ids<C>(
     timeline: &EventTimeline<'_>,
     store: &Store<'_>,
     have_ids: &mut Vec<Id>,
+    sync_window: SyncWindow,
     sent_ids_out: &mut Vec<EventId>,
 ) -> Result<usize, SyncError>
 where
@@ -77,6 +82,8 @@ where
     }
 
     let batch_size = need_chunk().max(1);
+    let priority_lane =
+        u8::try_from(priority_lane_for_window_kind(sync_window.kind)).unwrap_or(u8::MAX);
     let mut sent = 0usize;
     while !have_ids.is_empty() {
         let drain_count = have_ids.len().min(batch_size);
@@ -90,17 +97,24 @@ where
                 event_id: summary.event_id,
                 semantic_type_code: summary.semantic_type_code,
                 encoded_size_bytes: summary.encoded_size_bytes,
+                created_at_ms: u64::try_from(summary.created_at_ms).unwrap_or_default(),
             });
         }
         if hints.is_empty() {
             continue;
         }
+        sort_discovery_hints_by_priority(&mut hints);
         let ids: Vec<EventId> = hints.iter().map(|hint| hint.event_id).collect();
         sent_ids_out.extend_from_slice(&ids);
         let sent_at = crate::db::queue::current_timestamp_ms();
         sent += hints.len();
         let _ = timeline.mark_need_list_sent_many(&ids, sent_at);
-        control.send(&Frame::DiscoveryHints { hints }).await?;
+        control
+            .send(&Frame::DiscoveryHints {
+                priority_lane,
+                hints,
+            })
+            .await?;
     }
     control.flush().await?;
     Ok(sent)
@@ -134,7 +148,8 @@ where
         return Ok((0, Vec::new()));
     }
 
-    let candidate_limit = candidate_limit_for_credit_bytes(credit_bytes, snapshot.inflight_requested.len());
+    let candidate_limit =
+        candidate_limit_for_credit_bytes(credit_bytes, snapshot.inflight_requested.len());
     let selected = coordination.plan_requests(
         wanted,
         peer_id,
@@ -147,10 +162,16 @@ where
         return Ok((0, Vec::new()));
     }
     if let Some(credit_received_at) = snapshot.last_credit_received_at {
-        let selected_ids: Vec<EventId> = selected.iter().map(|candidate| candidate.event_id).collect();
+        let selected_ids: Vec<EventId> = selected
+            .iter()
+            .map(|candidate| candidate.event_id)
+            .collect();
         let _ = timeline.mark_request_credit_received_many(&selected_ids, credit_received_at);
     }
-    let selected_ids: Vec<EventId> = selected.iter().map(|candidate| candidate.event_id).collect();
+    let selected_ids: Vec<EventId> = selected
+        .iter()
+        .map(|candidate| candidate.event_id)
+        .collect();
     let _ = timeline.mark_request_selected_many(&selected_ids, now_ms);
     let reserved_bytes: usize = selected
         .iter()
@@ -264,30 +285,51 @@ where
 
     let batch_size = need_chunk().max(1);
     let sent_at = crate::db::queue::current_timestamp_ms();
-    let mut hints: Vec<DiscoveryHint> = Vec::new();
+    let mut hints_by_lane = BTreeMap::<u8, Vec<DiscoveryHint>>::new();
     for event_id in ids {
         if let Some(summary) = store.get_shared_summary(event_id)? {
-            hints.push(DiscoveryHint {
-                event_id: summary.event_id,
-                semantic_type_code: summary.semantic_type_code,
-                encoded_size_bytes: summary.encoded_size_bytes,
-            });
+            let priority_lane =
+                u8::try_from(priority_lane_for_event_age(sent_at, summary.created_at_ms))
+                    .unwrap_or(u8::MAX);
+            hints_by_lane
+                .entry(priority_lane)
+                .or_default()
+                .push(DiscoveryHint {
+                    event_id: summary.event_id,
+                    semantic_type_code: summary.semantic_type_code,
+                    encoded_size_bytes: summary.encoded_size_bytes,
+                    created_at_ms: u64::try_from(summary.created_at_ms).unwrap_or_default(),
+                });
         }
     }
-    if hints.is_empty() {
+    if hints_by_lane.is_empty() {
         return Ok(0);
     }
-    let hint_ids: Vec<EventId> = hints.iter().map(|h| h.event_id).collect();
-    for chunk in hints.chunks(batch_size) {
-        control
-            .send(&Frame::DiscoveryHints {
-                hints: chunk.to_vec(),
-            })
-            .await?;
+    let mut hint_ids = Vec::new();
+    for (priority_lane, mut hints) in hints_by_lane {
+        sort_discovery_hints_by_priority(&mut hints);
+        hint_ids.extend(hints.iter().map(|hint| hint.event_id));
+        for chunk in hints.chunks(batch_size) {
+            control
+                .send(&Frame::DiscoveryHints {
+                    priority_lane,
+                    hints: chunk.to_vec(),
+                })
+                .await?;
+        }
     }
     control.flush().await?;
     let _ = timeline.mark_need_list_sent_many(&hint_ids, sent_at);
     Ok(hint_ids.len())
+}
+
+pub fn sort_discovery_hints_by_priority(hints: &mut [DiscoveryHint]) {
+    hints.sort_by(|left, right| {
+        right
+            .created_at_ms
+            .cmp(&left.created_at_ms)
+            .then_with(|| left.event_id.cmp(&right.event_id))
+    });
 }
 
 fn candidate_limit_for_credit_bytes(credit_bytes: usize, inflight_count: usize) -> usize {
