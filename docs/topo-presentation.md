@@ -290,19 +290,25 @@ Peer-to-peer QUIC sync over localhost with negentropy reconciliation (daemon-bas
 
 # Realistic Network Sync (2k bidirectional)
 
-Same QUIC sync, but through a UDP traffic shaper modelling real-world link conditions (bandwidth cap, latency, jitter, packet loss).
+Same QUIC sync, but through a UDP traffic shaper modelling link conditions
+(bandwidth cap, latency, jitter, packet loss). The matrix mixes WAN-style
+profiles with optimistic short-range Wi-Fi / Bluetooth / BLE ceiling profiles
+for nearby peers on clean links.
 
 | Profile | Bandwidth | RTT | Loss | Wall Time | Msgs/s | Peak VmHWM |
 |---------|----------:|----:|-----:|----------:|-------:|-----------:|
-| Cable | 35 Mbps | 24ms | 0.2% | 1.32s | 1,514 | 25.6 MiB |
-| DSL | 3 Mbps | 44ms | 0.3% | 7.13s | 281 | 25.2 MiB |
-| Mobile | 15 Mbps | 80ms | 0.8% | 7.03s | 285 | 24.3 MiB |
-| Slow Mobile | 2 Mbps | 140ms | 1.5% | 20.47s | 98 | 26.5 MiB |
-| Starlink | 15 Mbps | 70ms | 0.5% | 6.33s | 316 | 23.3 MiB |
+| Wi-Fi Max | 150 Mbps | 8ms | 0.1% | 0.82s | 2,430 | 26.0 MiB |
+| Bluetooth Max | 2.1 Mbps | 20ms | 0.2% | 10.34s | 193 | 29.4 MiB |
+| BLE Max | 1.4 Mbps | 18ms | 0.1% | 15.34s | 130 | 26.8 MiB |
+| Cable | 35 Mbps | 24ms | 0.2% | 1.17s | 1,714 | 25.8 MiB |
+| DSL | 3 Mbps | 44ms | 0.3% | 7.69s | 260 | 27.1 MiB |
+| Mobile | 15 Mbps | 80ms | 0.8% | 5.72s | 349 | 25.8 MiB |
+| Slow Mobile | 2 Mbps | 140ms | 1.5% | 19.63s | 102 | 24.1 MiB |
+| Starlink | 15 Mbps | 70ms | 0.5% | 3.24s | 617 | 25.2 MiB |
 
-- All profiles complete successfully, including degraded conditions (slow mobile: 2 Mbps, 140ms RTT, 1.5% loss)
-- Memory stays flat ~24 MiB across all profiles — no protocol-driven memory blowup
-- Throughput scales with link quality as expected; not artificially bottlenecked
+- All eight profiles complete successfully, from optimistic short-range Wi-Fi through degraded slow mobile
+- The short-range ceiling references behave as expected: Wi-Fi is fast enough to expose protocol overhead, while Bluetooth and BLE stay throughput-bound
+- Memory stays roughly flat in the mid-20 MiB range across the matrix, with no protocol-driven memory blowup
 
 ---
 

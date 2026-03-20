@@ -105,7 +105,47 @@ LOWMEM_BASE_EVENTS=500000 LOWMEM_DELTA_EVENTS=10000 scripts/run_lowmem.sh delta1
 # without root or when PERF_LINUX_TC is unset.
 sudo PERF_LINUX_TC=1 cargo +stable test --release \
   --test tc_network_validation_test -- --ignored --nocapture --test-threads=1
+
+# Realistic traffic-shaper network matrix (maintained separately from `full`)
+# Includes WAN-style profiles plus optimistic short-range Wi-Fi / Bluetooth /
+# BLE max-link references.
+python3 scripts/run_perf_serial.py network
+
+# Optional: run only the short-range max-link profiles
+PERF_REALISTIC_NETWORK_PROFILES=wifi-max,bluetooth-max,ble-max \
+  cargo +stable test --release --test daemon_realistic_network_perf_test \
+  perf_sync_2k_realistic_profiles -- --nocapture --ignored --test-threads=1
 ```
+
+## Traffic Shaper Network Profiles
+
+The maintained traffic-shaper matrix includes two categories:
+
+- WAN-style access profiles: `cable`, `dsl`, `mobile`, `slow-mobile`, `starlink`
+- Optimistic short-range upper bounds: `wifi-max`, `bluetooth-max`, `ble-max`
+
+The short-range profiles are intentionally framed as optimistic ceilings for
+nearby peers on clean links. They are not claims about every Wi-Fi or
+Bluetooth device; they are reference points for "best case local radio"
+throughput and latency in the shaper.
+
+Current 2k realistic-network matrix from:
+
+```bash
+cargo +stable test --release --test daemon_realistic_network_perf_test \
+  perf_sync_2k_realistic_profiles -- --nocapture --ignored --test-threads=1
+```
+
+| Profile | Bandwidth | RTT | Loss | Wall Time | Msgs/s | Peak VmHWM |
+|---------|----------:|----:|-----:|----------:|-------:|-----------:|
+| Wi-Fi Max | 150 Mbps | 8 ms | 0.1% | 0.82s | 2,430 | 26.0 MiB |
+| Bluetooth Max | 2.1 Mbps | 20 ms | 0.2% | 10.34s | 193 | 29.4 MiB |
+| BLE Max | 1.4 Mbps | 18 ms | 0.1% | 15.34s | 130 | 26.8 MiB |
+| Cable | 35 Mbps | 24 ms | 0.2% | 1.17s | 1,714 | 25.8 MiB |
+| DSL | 3 Mbps | 44 ms | 0.3% | 7.69s | 260 | 27.1 MiB |
+| Mobile | 15 Mbps | 80 ms | 0.8% | 5.72s | 349 | 25.8 MiB |
+| Slow Mobile | 2 Mbps | 140 ms | 1.5% | 19.63s | 102 | 24.1 MiB |
+| Starlink | 15 Mbps | 70 ms | 0.5% | 3.24s | 617 | 25.2 MiB |
 
 ## Latest Results
 

@@ -88,6 +88,33 @@ impl DirectionStats {
 
 pub const REALISTIC_NETWORK_PROFILES: &[NetworkProfile] = &[
     NetworkProfile {
+        slug: "wifi-max",
+        title: "Wi-Fi Max",
+        note: "Optimistic short-range Wi-Fi ceiling profile for local peer-to-peer sync on a strong link",
+        bandwidth_mbps_per_direction: 150.0,
+        rtt_ms: 8,
+        jitter_ms: 1,
+        loss_percent: 0.1,
+    },
+    NetworkProfile {
+        slug: "bluetooth-max",
+        title: "Bluetooth Max",
+        note: "Optimistic Bluetooth Classic ceiling profile for nearby peers on a clean link",
+        bandwidth_mbps_per_direction: 2.1,
+        rtt_ms: 20,
+        jitter_ms: 3,
+        loss_percent: 0.2,
+    },
+    NetworkProfile {
+        slug: "ble-max",
+        title: "BLE Max",
+        note: "Optimistic BLE 2M-style ceiling profile for metadata-heavy but low-throughput local sync",
+        bandwidth_mbps_per_direction: 1.4,
+        rtt_ms: 18,
+        jitter_ms: 2,
+        loss_percent: 0.1,
+    },
+    NetworkProfile {
         slug: "cable",
         title: "Cable",
         note: "Low-latency residential cable bottlenecked by practical peer-to-peer uplink",
