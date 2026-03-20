@@ -2,6 +2,7 @@ use super::super::decision::ProjectionDecision;
 use super::super::encrypted::project_encrypted;
 use super::super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
 use crate::crypto::{event_id_to_base64, EventId};
+use crate::db::queue::{PRIORITY_LANE_BLOCKER, PRIORITY_LANE_FOREGROUND};
 use crate::db::timeline::EventTimeline;
 use crate::db::wanted::WantedEvents;
 use crate::event_modules::{registry, ParsedEvent, TransportPrivacy};
@@ -33,6 +34,26 @@ fn derive_semantic_type_code_from_blob(
         Err(_) => return Ok(crate::event_modules::outer_semantic_type_code(blob)),
     };
     Ok(Some(semantic_type_code_for_parsed(&parsed)))
+}
+
+fn current_source_peer_id_for_event(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let source_tag: Option<String> = conn
+        .query_row(
+            "SELECT source
+             FROM recorded_events
+             WHERE peer_id = ?1 AND event_id = ?2
+             ORDER BY recorded_at DESC, id DESC
+             LIMIT 1",
+            rusqlite::params![recorded_by, event_id_b64],
+            |row| row.get(0),
+        )
+        .optional()?;
+    Ok(source_tag
+        .and_then(|source| crate::state::live_hints::source_peer_id_from_source_tag(&source)))
 }
 
 fn check_transport_privacy(
@@ -198,7 +219,26 @@ pub(crate) fn check_deps_and_block(
          VALUES (?1, ?2, ?3)",
         rusqlite::params![recorded_by, event_id_b64, missing.len() as i64],
     )?;
-    let _ = WantedEvents::new(conn).insert_many_for_local(recorded_by, &missing);
+    let wanted = WantedEvents::new(conn);
+    let _ = wanted.insert_many_for_local(recorded_by, &missing);
+    if let Some((priority_lane, priority_ts)) = wanted.current_priority_for_event(
+        &crate::crypto::event_id_from_base64(event_id_b64).unwrap_or([0u8; 32]),
+    )? {
+        if priority_lane < PRIORITY_LANE_FOREGROUND {
+            let _ = wanted.promote_existing_sources(&missing, PRIORITY_LANE_BLOCKER, priority_ts);
+            if let Some(source_peer_id) =
+                current_source_peer_id_for_event(conn, recorded_by, event_id_b64)?
+            {
+                let _ = wanted.observe_missing_for_peer(
+                    recorded_by,
+                    &source_peer_id,
+                    &missing,
+                    PRIORITY_LANE_BLOCKER,
+                    priority_ts,
+                );
+            }
+        }
+    }
     let _ = EventTimeline::new(conn).mark_blocked_b64(event_id_b64, current_timestamp_ms());
 
     Ok(Some(ProjectionDecision::Block { missing }))

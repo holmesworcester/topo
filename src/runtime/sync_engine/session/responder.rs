@@ -48,7 +48,9 @@ use super::data_plane::{
     drain_pending_responses_to_data_stream, queue_requested_responses, spawn_data_receiver,
 };
 use super::logging::{SyncRunCapture, SyncRunRxCapture};
-use super::windowing::{decode_initial_neg_open, SyncWindow, SyncWindowKind};
+use super::windowing::{
+    decode_initial_neg_open, priority_lane_for_window_kind, SyncWindow, SyncWindowKind,
+};
 use super::{
     forward_on_have_enabled, negentropy_frame_size, send_idle_capture_enabled,
     CONTROL_POLL_TIMEOUT, INITIAL_CONTROL_PROGRESS_TIMEOUT,
@@ -83,7 +85,9 @@ pub async fn run_sync_responder<C, S, R>(
     shared_ingest: mpsc::Sender<IngestItem>,
     capture: Option<SyncRunCapture>,
     rx_capture: Option<SyncRunRxCapture>,
-    mut command_rx: Option<tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>>,
+    mut command_rx: Option<
+        tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>,
+    >,
     policy_rx: Option<tokio::sync::watch::Receiver<crate::shared::sync_control::TenantSyncPolicy>>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
@@ -125,6 +129,7 @@ where
         response: Vec<u8>,
         /// Ready-to-send hints for events we have that the remote lacks.
         diff_hints: Vec<crate::protocol::DiscoveryHint>,
+        priority_lane: u8,
     }
 
     let mut neg_req_tx: Option<std::sync::mpsc::Sender<Vec<u8>>> = None;
@@ -171,18 +176,24 @@ where
                             .iter()
                             .filter_map(|neg_id| {
                                 let event_id = crate::protocol::neg_id_to_event_id(neg_id);
-                                worker_store.get_shared_summary(&event_id).ok().flatten().map(
-                                    |summary| crate::protocol::DiscoveryHint {
+                                worker_store
+                                    .get_shared_summary(&event_id)
+                                    .ok()
+                                    .flatten()
+                                    .map(|summary| crate::protocol::DiscoveryHint {
                                         event_id: summary.event_id,
                                         semantic_type_code: summary.semantic_type_code,
                                         encoded_size_bytes: summary.encoded_size_bytes,
-                                    },
-                                )
+                                        created_at_ms: u64::try_from(summary.created_at_ms)
+                                            .unwrap_or_default(),
+                                    })
                             })
                             .collect();
                         NegWorkerResult {
                             response,
                             diff_hints,
+                            priority_lane: u8::try_from(priority_lane_for_window_kind(window.kind))
+                                .unwrap_or(u8::MAX),
                         }
                     })
                     .map_err(|e| format!("{}", e));
@@ -283,9 +294,10 @@ where
                 use crate::runtime::sync_control::SessionCommand;
                 match cmd {
                     SessionCommand::ForceRound { reply } => {
-                        let _ = reply.send(Err(
-                            "only initiator sessions can drive negentropy rounds".to_string(),
-                        ));
+                        let _ =
+                            reply
+                                .send(Err("only initiator sessions can drive negentropy rounds"
+                                    .to_string()));
                     }
                     SessionCommand::ForceRequest { reply } => {
                         let (count, ids) = refill_wanted_requests(
@@ -294,19 +306,19 @@ where
                             &timeline,
                             coordination,
                             peer_id,
-                            request_state,
+                            &request_state,
                         )
                         .await?;
                         if count > 0 {
                             last_activity = Instant::now();
                         }
-                        let id_hexes: Vec<String> =
-                            ids.iter().map(|id| hex::encode(id)).collect();
-                        let _ = reply.send(Ok(crate::runtime::sync_control::ManualSyncRequestResult {
-                            peer_id: peer_id.to_string(),
-                            requested_ids: id_hexes,
-                            reason: None,
-                        }));
+                        let id_hexes: Vec<String> = ids.iter().map(|id| hex::encode(id)).collect();
+                        let _ =
+                            reply.send(Ok(crate::runtime::sync_control::ManualSyncRequestResult {
+                                peer_id: peer_id.to_string(),
+                                requested_ids: id_hexes,
+                                reason: None,
+                            }));
                     }
                 }
             }
@@ -332,6 +344,7 @@ where
                         for chunk in result.diff_hints.chunks(batch_size) {
                             control
                                 .send(&Frame::DiscoveryHints {
+                                    priority_lane: result.priority_lane,
                                     hints: chunk.to_vec(),
                                 })
                                 .await?;
@@ -350,7 +363,11 @@ where
                             reconcile_start.elapsed().as_millis()
                         );
                     } else {
-                        control.send(&Frame::NegMsg { msg: result.response }).await?;
+                        control
+                            .send(&Frame::NegMsg {
+                                msg: result.response,
+                            })
+                            .await?;
                         control.flush().await?;
                     }
                 }
@@ -419,7 +436,10 @@ where
                 let _ = timeline.mark_request_received_many(&ids, current_timestamp_ms());
                 queue_requested_responses(response_state, &timeline, &store, &ids);
             }
-            Ok(Ok(Frame::DiscoveryHints { hints })) => {
+            Ok(Ok(Frame::DiscoveryHints {
+                priority_lane,
+                hints,
+            })) => {
                 last_activity = Instant::now();
                 let hint_ids: Vec<_> = hints.iter().map(|hint| hint.event_id).collect();
                 let need_received_at = current_timestamp_ms();
@@ -430,6 +450,7 @@ where
                     recorded_by,
                     peer_id,
                     reconcile_started_at_ms,
+                    i64::from(priority_lane),
                     &hints,
                     &mut round_observed_ids,
                 )?;
@@ -475,7 +496,7 @@ where
                 &timeline,
                 coordination,
                 peer_id,
-                request_state,
+                &request_state,
             )
             .await?;
             if requested_now > 0 {
@@ -484,8 +505,14 @@ where
         }
 
         if forward_on_have_enabled() {
-            let hinted =
-                send_forward_on_have_hints(&mut control, &timeline, &store, peer_id, &mut forward_hint_rx).await?;
+            let hinted = send_forward_on_have_hints(
+                &mut control,
+                &timeline,
+                &store,
+                peer_id,
+                &mut forward_hint_rx,
+            )
+            .await?;
             if hinted > 0 {
                 last_activity = Instant::now();
             }

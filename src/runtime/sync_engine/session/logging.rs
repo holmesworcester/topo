@@ -291,7 +291,10 @@ fn frame_detail_json(frame: &Frame, capture_full_ids: bool) -> Option<String> {
             }))
             .ok()
         }
-        Frame::DiscoveryHints { hints } => {
+        Frame::DiscoveryHints {
+            priority_lane,
+            hints,
+        } => {
             let keep = if capture_full_ids {
                 hints.len()
             } else {
@@ -312,11 +315,18 @@ fn frame_detail_json(frame: &Frame, capture_full_ids: bool) -> Option<String> {
                 .take(keep)
                 .map(|hint| hint.encoded_size_bytes)
                 .collect();
+            let created_at_ms: Vec<u64> = hints
+                .iter()
+                .take(keep)
+                .map(|hint| hint.created_at_ms)
+                .collect();
             serde_json::to_string(&json!({
+                "priority_lane": priority_lane,
                 "hint_count": hints.len(),
                 "ids": ids_hex,
                 "semantic_type_codes": semantic_types,
                 "encoded_size_bytes": encoded_sizes,
+                "created_at_ms": created_at_ms,
                 "hints_truncated": !capture_full_ids && hints.len() > MAX_CAPTURE_IDS
             }))
             .ok()

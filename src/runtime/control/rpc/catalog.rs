@@ -76,8 +76,11 @@ static CATALOG: &[MethodInfo] = &[
     MethodInfo {
         name: "Generate",
         purpose: "Generate synthetic test messages",
-        params: params!["count", "usize", true, None],
-        example_json: r#"{"type":"Generate","count":10}"#,
+        params: params![
+            "count", "usize", true, None;
+            "history_span", "string", false, Some("3y")
+        ],
+        example_json: r#"{"type":"Generate","count":10,"history_span":"3y"}"#,
     },
     MethodInfo {
         name: "GenerateFiles",

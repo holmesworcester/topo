@@ -1,6 +1,6 @@
 use std::collections::HashMap;
 
-use rusqlite::{params, Connection, Result as SqliteResult};
+use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::event_modules::ShareScope;
@@ -167,6 +167,7 @@ pub struct SharedEventSummary {
     pub event_id: EventId,
     pub semantic_type_code: u8,
     pub encoded_size_bytes: u32,
+    pub created_at_ms: i64,
 }
 
 impl<'a> Store<'a> {
@@ -238,7 +239,19 @@ impl<'a> Store<'a> {
     /// Get lightweight discovery metadata for a shared event without exposing
     /// local-only rows.
     pub fn get_shared_summary(&self, id: &EventId) -> SqliteResult<Option<SharedEventSummary>> {
-        let Some(blob) = self.get_shared(id)? else {
+        let id_str = event_id_to_base64(id);
+        let row: Option<(Vec<u8>, i64)> = self
+            .conn
+            .query_row(
+                "SELECT blob, created_at
+                 FROM events
+                 WHERE event_id = ?1
+                   AND share_scope = 'shared'",
+                params![id_str],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let Some((blob, created_at_ms)) = row else {
             return Ok(None);
         };
         let Some(semantic_type_code) = crate::event_modules::outer_semantic_type_code(&blob) else {
@@ -249,6 +262,7 @@ impl<'a> Store<'a> {
             event_id: *id,
             semantic_type_code,
             encoded_size_bytes,
+            created_at_ms,
         }))
     }
 

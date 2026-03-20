@@ -29,6 +29,54 @@ fn generate_progress_logging_enabled() -> bool {
     std::env::var_os("TOPO_GENERATE_PROGRESS_LOG").is_some()
 }
 
+const DEFAULT_GENERATE_HISTORY_SPAN_MS: u64 = 3 * 365 * 24 * 60 * 60 * 1000;
+
+fn parse_history_span_ms(spec: &str) -> Option<u64> {
+    let trimmed = spec.trim().to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let (number, unit_ms) = if let Some(value) = trimmed.strip_suffix("ms") {
+        (value, 1u64)
+    } else if let Some(value) = trimmed.strip_suffix("min") {
+        (value, 60_000u64)
+    } else if let Some(value) = trimmed.strip_suffix("mo") {
+        (value, 30 * 24 * 60 * 60 * 1000u64)
+    } else if let Some(value) = trimmed.strip_suffix('s') {
+        (value, 1_000u64)
+    } else if let Some(value) = trimmed.strip_suffix('m') {
+        (value, 60_000u64)
+    } else if let Some(value) = trimmed.strip_suffix('h') {
+        (value, 60 * 60 * 1000u64)
+    } else if let Some(value) = trimmed.strip_suffix('d') {
+        (value, 24 * 60 * 60 * 1000u64)
+    } else if let Some(value) = trimmed.strip_suffix('w') {
+        (value, 7 * 24 * 60 * 60 * 1000u64)
+    } else if let Some(value) = trimmed.strip_suffix('y') {
+        (value, 365 * 24 * 60 * 60 * 1000u64)
+    } else {
+        (trimmed.as_str(), 1u64)
+    };
+    number
+        .parse::<u64>()
+        .ok()
+        .map(|count| count.saturating_mul(unit_ms))
+}
+
+fn generate_message_spread_ms() -> Option<u64> {
+    std::env::var("TOPO_GENERATE_MESSAGE_SPREAD_MS")
+        .ok()
+        .and_then(|value| parse_history_span_ms(&value).or_else(|| value.parse::<u64>().ok()))
+        .filter(|value| *value > 0)
+}
+
+fn resolve_generate_history_span_ms(history_span: Option<&str>) -> u64 {
+    history_span
+        .and_then(parse_history_span_ms)
+        .or_else(generate_message_spread_ms)
+        .unwrap_or(DEFAULT_GENERATE_HISTORY_SPAN_MS)
+}
+
 fn begin_immediate_with_retry(
     db: &Connection,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -284,11 +332,26 @@ pub fn generate_for_peer(
     db_path: &str,
     peer_id: &str,
     count: usize,
+    history_span: Option<&str>,
 ) -> Result<GenerateResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
     let log_progress = generate_progress_logging_enabled();
     let generate_start = Instant::now();
     let ctx = workspace::load_local_authoring_context(&db, &recorded_by)?;
+    let spread_ms = Some(resolve_generate_history_span_ms(history_span));
+    let end_at_ms = current_timestamp_ms();
+    let start_at_ms = spread_ms.map(|spread| end_at_ms.saturating_sub(spread));
+    let timestamp_for_index = |index: usize| -> u64 {
+        match (start_at_ms, spread_ms, count) {
+            (Some(start_at_ms), Some(spread_ms), count) if count > 1 => {
+                let numerator = (index as u128).saturating_mul(spread_ms as u128);
+                let step = numerator / u128::try_from(count - 1).unwrap_or(1);
+                start_at_ms.saturating_add(u64::try_from(step).unwrap_or(u64::MAX))
+            }
+            (Some(start_at_ms), _, _) => start_at_ms,
+            _ => current_timestamp_ms(),
+        }
+    };
 
     // Break into smaller batches to avoid holding the write lock too long.
     // A single long transaction causes SQLITE_BUSY for the sync engine's
@@ -311,7 +374,7 @@ pub fn generate_for_peer(
                 &recorded_by,
                 &ctx.signer_event_id,
                 &ctx.signing_key,
-                current_timestamp_ms(),
+                timestamp_for_index(j),
                 CreateMessageCmd {
                     workspace_id: ctx.workspace_id,
                     author_id: ctx.author_id,
@@ -650,4 +713,47 @@ pub fn send_file_for_peer(
         filename,
         file_size,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
+    }
+
+    #[test]
+    fn parse_history_span_supports_human_units() {
+        assert_eq!(parse_history_span_ms("1500ms"), Some(1_500));
+        assert_eq!(parse_history_span_ms("2h"), Some(2 * 60 * 60 * 1000));
+        assert_eq!(parse_history_span_ms("3d"), Some(3 * 24 * 60 * 60 * 1000));
+        assert_eq!(
+            parse_history_span_ms("3y"),
+            Some(DEFAULT_GENERATE_HISTORY_SPAN_MS)
+        );
+    }
+
+    #[test]
+    fn resolve_generate_history_span_defaults_to_three_years() {
+        let _guard = env_guard();
+        std::env::remove_var("TOPO_GENERATE_MESSAGE_SPREAD_MS");
+        assert_eq!(
+            resolve_generate_history_span_ms(None),
+            DEFAULT_GENERATE_HISTORY_SPAN_MS
+        );
+    }
+
+    #[test]
+    fn resolve_generate_history_span_prefers_explicit_argument_over_env() {
+        let _guard = env_guard();
+        std::env::set_var("TOPO_GENERATE_MESSAGE_SPREAD_MS", "30d");
+        assert_eq!(
+            resolve_generate_history_span_ms(Some("7d")),
+            7 * 24 * 60 * 60 * 1000
+        );
+        std::env::remove_var("TOPO_GENERATE_MESSAGE_SPREAD_MS");
+    }
 }

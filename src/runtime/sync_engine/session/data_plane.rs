@@ -34,11 +34,6 @@ fn should_treat_as_startup_data_abort(events_ingested: u64, bytes_received: &Ato
     events_ingested == 0 && bytes_received.load(Ordering::Relaxed) == 0
 }
 
-fn should_capture_rx_event_link(blob: &[u8]) -> bool {
-    crate::event_modules::outer_semantic_type_code(blob)
-        == Some(crate::event_modules::EVENT_TYPE_FILE_SLICE)
-}
-
 pub async fn drain_pending_responses_to_data_stream<S>(
     response_state: &ConnectionResponseState,
     timeline: &EventTimeline<'_>,
@@ -210,10 +205,10 @@ where
                             bytes_received.fetch_add(blob.len() as u64, Ordering::Relaxed);
                             max_blob_size = max_blob_size.max(blob.len());
                             let event_id = hash_event(&blob);
-                            if should_capture_rx_event_link(&blob) {
-                                if let Some(capture) = &rx_capture {
-                                    capture.record_event_id_b64(crate::crypto::event_id_to_base64(&event_id));
-                                }
+                            if let Some(capture) = &rx_capture {
+                                capture.record_event_id_b64(crate::crypto::event_id_to_base64(
+                                    &event_id,
+                                ));
                             }
                             if ingest_tx
                                 .send((
@@ -274,7 +269,7 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::{drain_pending_responses_to_data_stream, should_capture_rx_event_link};
+    use super::drain_pending_responses_to_data_stream;
     use crate::crypto::{event_id_to_base64, hash_event};
     use crate::db::timeline::EventTimeline;
     use crate::db::{open_connection, schema::create_tables, store::insert_event, store::Store};
@@ -313,26 +308,6 @@ mod tests {
         conn.busy_timeout(Duration::from_millis(20)).unwrap();
         create_tables(&conn).unwrap();
         (dir, path, conn)
-    }
-
-    #[test]
-    fn should_capture_only_file_slice_events() {
-        assert!(should_capture_rx_event_link(&[
-            crate::event_modules::EVENT_TYPE_FILE_SLICE,
-            0,
-            1,
-        ]));
-        assert!(!should_capture_rx_event_link(&[
-            crate::event_modules::EVENT_TYPE_MESSAGE,
-            0,
-            1,
-        ]));
-        assert!(!should_capture_rx_event_link(&[
-            crate::event_modules::EVENT_TYPE_FILE,
-            0,
-            1,
-        ]));
-        assert!(!should_capture_rx_event_link(&[]));
     }
 
     #[tokio::test]

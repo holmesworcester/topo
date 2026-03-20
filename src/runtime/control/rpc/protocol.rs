@@ -43,6 +43,8 @@ pub enum RpcMethod {
     },
     Generate {
         count: usize,
+        #[serde(default)]
+        history_span: Option<String>,
     },
     GenerateFiles {
         count: usize,

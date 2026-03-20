@@ -204,7 +204,10 @@ fn rpc_all_methods_serialize() {
             target: "1".into(),
             output_path: "/tmp/out.bin".into(),
         },
-        RpcMethod::Generate { count: 10 },
+        RpcMethod::Generate {
+            count: 10,
+            history_span: Some("3y".into()),
+        },
         RpcMethod::AssertNow {
             predicate: "message_count == 0".into(),
         },

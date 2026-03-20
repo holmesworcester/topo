@@ -1,8 +1,6 @@
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 
-use super::queue::{
-    current_timestamp_ms, with_immediate_tx, with_sqlite_busy_retry, PRIORITY_LANE_FOREGROUND,
-};
+use super::queue::{current_timestamp_ms, with_immediate_tx, with_sqlite_busy_retry};
 use super::timeline::EventTimeline;
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::protocol::DiscoveryHint;
@@ -149,6 +147,7 @@ impl<'a> WantedEvents<'a> {
         local_peer_id: &str,
         peer_id: &str,
         hints: &[DiscoveryHint],
+        priority_lane: i64,
         discovery_round_started_at: i64,
         timeline: &EventTimeline<'_>,
     ) -> SqliteResult<usize> {
@@ -159,12 +158,16 @@ impl<'a> WantedEvents<'a> {
         with_immediate_tx(self.conn, || {
             // Batch-check which hints are already locally recorded in one query
             // instead of N individual lookups.
-            let hint_b64s: Vec<String> = hints.iter().map(|h| event_id_to_base64(&h.event_id)).collect();
+            let hint_b64s: Vec<String> = hints
+                .iter()
+                .map(|h| event_id_to_base64(&h.event_id))
+                .collect();
             let already_local_set: std::collections::HashSet<String> = {
                 let mut set = std::collections::HashSet::new();
                 // SQLite max variable count is 999; chunk to stay within limits
                 for chunk in hint_b64s.chunks(900) {
-                    let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                    let placeholders: String =
+                        chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                     let sql = format!(
                         "SELECT event_id FROM recorded_events WHERE peer_id = ?1 AND event_id IN ({})",
                         placeholders
@@ -198,7 +201,7 @@ impl<'a> WantedEvents<'a> {
                  ) VALUES (?1, ?2, ?3, ?3, ?4, ?5)
                  ON CONFLICT(event_id, peer_id) DO UPDATE SET
                      last_seen_at = excluded.last_seen_at,
-                     priority_lane = excluded.priority_lane,
+                     priority_lane = MIN(wanted_sources.priority_lane, excluded.priority_lane),
                      priority_ts = MAX(wanted_sources.priority_ts, excluded.priority_ts)",
             )?;
 
@@ -219,8 +222,8 @@ impl<'a> WantedEvents<'a> {
                     &hint.event_id[..],
                     peer_id,
                     now,
-                    PRIORITY_LANE_FOREGROUND,
-                    now,
+                    priority_lane,
+                    i64::try_from(hint.created_at_ms).unwrap_or(now),
                 ])?;
                 observed += 1;
                 discovered_ids.push(hint.event_id);
@@ -234,6 +237,105 @@ impl<'a> WantedEvents<'a> {
             }
             Ok(observed)
         })
+    }
+
+    pub fn observe_missing_for_peer(
+        &self,
+        local_peer_id: &str,
+        peer_id: &str,
+        ids: &[EventId],
+        priority_lane: i64,
+        priority_ts: i64,
+    ) -> SqliteResult<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        let now = current_timestamp_ms();
+        with_immediate_tx(self.conn, || {
+            let mut already_recorded = self.conn.prepare(
+                "SELECT 1 FROM recorded_events
+                 WHERE peer_id = ?1 AND event_id = ?2
+                 LIMIT 1",
+            )?;
+            let mut insert_wanted = self.conn.prepare(
+                "INSERT INTO wanted_events (id, first_seen_at)
+                 VALUES (?1, ?2)
+                 ON CONFLICT(id) DO NOTHING",
+            )?;
+            let mut upsert_source = self.conn.prepare(
+                "INSERT INTO wanted_sources (
+                     event_id, peer_id, first_seen_at, last_seen_at, priority_lane, priority_ts
+                 ) VALUES (?1, ?2, ?3, ?3, ?4, ?5)
+                 ON CONFLICT(event_id, peer_id) DO UPDATE SET
+                     last_seen_at = excluded.last_seen_at,
+                     priority_lane = MIN(wanted_sources.priority_lane, excluded.priority_lane),
+                     priority_ts = MAX(wanted_sources.priority_ts, excluded.priority_ts)",
+            )?;
+
+            let mut observed = 0usize;
+            for id in ids {
+                let id_b64 = event_id_to_base64(id);
+                let already_local = already_recorded
+                    .query_row(params![local_peer_id, &id_b64], |_| Ok(()))
+                    .optional()?
+                    .is_some();
+                if already_local {
+                    delete_wanted_row(self.conn, id)?;
+                    continue;
+                }
+                let _ = insert_wanted.execute(params![&id[..], now])?;
+                upsert_source.execute(params![
+                    &id[..],
+                    peer_id,
+                    now,
+                    priority_lane,
+                    priority_ts
+                ])?;
+                observed += 1;
+            }
+            Ok(observed)
+        })
+    }
+
+    pub fn promote_existing_sources(
+        &self,
+        ids: &[EventId],
+        priority_lane: i64,
+        priority_ts: i64,
+    ) -> SqliteResult<usize> {
+        if ids.is_empty() {
+            return Ok(0);
+        }
+        with_immediate_tx(self.conn, || {
+            let mut updated = 0usize;
+            let mut stmt = self.conn.prepare(
+                "UPDATE wanted_sources
+                 SET priority_lane = MIN(priority_lane, ?2),
+                     priority_ts = MAX(priority_ts, ?3)
+                 WHERE event_id = ?1",
+            )?;
+            for id in ids {
+                updated += stmt.execute(params![&id[..], priority_lane, priority_ts])?;
+            }
+            Ok(updated)
+        })
+    }
+
+    pub fn current_priority_for_event(&self, id: &EventId) -> SqliteResult<Option<(i64, i64)>> {
+        self.conn
+            .query_row(
+                "SELECT MIN(priority_lane), MAX(priority_ts)
+                 FROM wanted_sources
+                 WHERE event_id = ?1",
+                params![&id[..]],
+                |row| {
+                    let lane: Option<i64> = row.get(0)?;
+                    let ts: Option<i64> = row.get(1)?;
+                    Ok(lane.zip(ts))
+                },
+            )
+            .optional()
+            .map(|value| value.flatten())
     }
 
     /// Load candidate request rows for `peer_id`, ordered by current priority.
@@ -254,8 +356,6 @@ impl<'a> WantedEvents<'a> {
                  INNER JOIN wanted_sources ws
                     ON ws.event_id = we.id
                  WHERE ws.peer_id = ?1
-                   AND we.semantic_type_code IS NOT NULL
-                   AND we.encoded_size_bytes IS NOT NULL
                  ORDER BY
                     ws.priority_lane ASC,
                     ws.priority_ts DESC,
@@ -266,8 +366,8 @@ impl<'a> WantedEvents<'a> {
             )?;
             let rows = stmt.query_map(params![peer_id, limit_i64], |row| {
                 let blob: Vec<u8> = row.get(0)?;
-                let semantic_type_code_i64: i64 = row.get(1)?;
-                let encoded_size_bytes_i64: i64 = row.get(2)?;
+                let semantic_type_code_i64: Option<i64> = row.get(1)?;
+                let encoded_size_bytes_i64: Option<i64> = row.get(2)?;
                 let mut event_id = [0u8; 32];
                 if blob.len() != 32 {
                     return Err(rusqlite::Error::InvalidColumnType(
@@ -279,12 +379,16 @@ impl<'a> WantedEvents<'a> {
                 event_id.copy_from_slice(&blob);
                 Ok(WantedCandidate {
                     event_id,
-                    semantic_type_code: u8::try_from(semantic_type_code_i64).map_err(|_| {
-                        rusqlite::Error::IntegralValueOutOfRange(1, semantic_type_code_i64)
-                    })?,
-                    encoded_size_bytes: u32::try_from(encoded_size_bytes_i64).map_err(|_| {
-                        rusqlite::Error::IntegralValueOutOfRange(2, encoded_size_bytes_i64)
-                    })?,
+                    semantic_type_code: match semantic_type_code_i64 {
+                        Some(code) => u8::try_from(code)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(1, code))?,
+                        None => 0,
+                    },
+                    encoded_size_bytes: match encoded_size_bytes_i64 {
+                        Some(bytes) => u32::try_from(bytes)
+                            .map_err(|_| rusqlite::Error::IntegralValueOutOfRange(2, bytes))?,
+                        None => 0,
+                    },
                     priority_lane: row.get(3)?,
                     priority_ts: row.get(4)?,
                     first_seen_at: row.get(5)?,
@@ -381,6 +485,7 @@ mod tests {
             event_id: make_event_id(byte),
             semantic_type_code: type_code,
             encoded_size_bytes,
+            created_at_ms: u64::from(byte),
         }
     }
 
@@ -458,8 +563,13 @@ mod tests {
                 .observe_many_for_peer(
                     "local",
                     "peer-a",
-                    &[discovery_hint(7, crate::event_modules::EVENT_TYPE_MESSAGE, 144)],
+                    &[discovery_hint(
+                        7,
+                        crate::event_modules::EVENT_TYPE_MESSAGE,
+                        144,
+                    )],
                     1,
+                    0,
                     &timeline,
                 )
                 .unwrap()
@@ -487,15 +597,18 @@ mod tests {
         ];
 
         wanted
-            .observe_many_for_peer("local", "peer-a", &hints, 1, &timeline)
+            .observe_many_for_peer("local", "peer-a", &hints, 1, 0, &timeline)
             .unwrap();
         wanted
-            .observe_many_for_peer("local", "peer-b", &hints, 1, &timeline)
+            .observe_many_for_peer("local", "peer-b", &hints, 1, 0, &timeline)
             .unwrap();
 
         let peer_a_candidates = wanted.list_candidates_for_peer("peer-a", 8).unwrap();
         assert_eq!(peer_a_candidates.len(), 2);
-        assert_eq!(peer_a_candidates[0].semantic_type_code, crate::event_modules::EVENT_TYPE_MESSAGE);
+        assert_eq!(
+            peer_a_candidates[0].semantic_type_code,
+            crate::event_modules::EVENT_TYPE_MESSAGE
+        );
         assert_eq!(peer_a_candidates[0].encoded_size_bytes, 144);
         assert_eq!(wanted.count_backlog_for_peer("peer-b").unwrap(), 2);
     }
@@ -516,8 +629,10 @@ mod tests {
                     event_id: id,
                     semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
                     encoded_size_bytes: 144,
+                    created_at_ms: 1,
                 }],
                 1,
+                0,
                 &timeline,
             )
             .unwrap();
@@ -529,8 +644,10 @@ mod tests {
                     event_id: id,
                     semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
                     encoded_size_bytes: 144,
+                    created_at_ms: 1,
                 }],
                 1,
+                0,
                 &timeline,
             )
             .unwrap();
@@ -570,8 +687,10 @@ mod tests {
                     event_id: id,
                     semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
                     encoded_size_bytes: 144,
+                    created_at_ms: 1,
                 }],
                 1,
+                0,
                 &timeline,
             )
             .unwrap();
@@ -590,8 +709,10 @@ mod tests {
                         event_id: id,
                         semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
                         encoded_size_bytes: 144,
+                        created_at_ms: 2,
                     }],
                     1,
+                    0,
                     &timeline,
                 )
                 .unwrap(),

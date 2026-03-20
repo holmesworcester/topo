@@ -374,10 +374,12 @@ mod tests {
     async fn session_io_encodes_decodes_control_and_data_frames() {
         let (mut parts, control_state, data_send_state) = build_io(
             vec![Ok(Frame::DiscoveryHints {
+                priority_lane: 2,
                 hints: vec![crate::protocol::DiscoveryHint {
                     event_id: [0x11; 32],
                     semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
                     encoded_size_bytes: 144,
+                    created_at_ms: 1_234,
                 }],
             })],
             vec![Ok(Frame::Event {
@@ -391,10 +393,12 @@ mod tests {
         assert_eq!(
             control_msg,
             Frame::DiscoveryHints {
+                priority_lane: 2,
                 hints: vec![crate::protocol::DiscoveryHint {
                     event_id: [0x11; 32],
                     semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
                     encoded_size_bytes: 144,
+                    created_at_ms: 1_234,
                 }],
             }
         );

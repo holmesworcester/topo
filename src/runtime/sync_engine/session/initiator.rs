@@ -44,7 +44,8 @@ use super::coordinator::PeerCoord;
 use super::data_plane::{drain_pending_responses_to_data_stream, spawn_data_receiver};
 use super::logging::{SyncRunCapture, SyncRunRxCapture};
 use super::windowing::{
-    encode_initial_neg_open, mark_outbound_full_completed, select_outbound_window, SyncWindowKind,
+    encode_initial_neg_open, mark_outbound_window_completed, priority_lane_for_window_kind,
+    select_outbound_window,
 };
 use super::{
     discovery_round_gap, forward_on_have_enabled, negentropy_frame_size, send_idle_capture_enabled,
@@ -84,7 +85,9 @@ pub async fn run_sync_initiator<C, S, R>(
     shared_ingest: mpsc::Sender<IngestItem>,
     capture: Option<SyncRunCapture>,
     rx_capture: Option<SyncRunRxCapture>,
-    mut command_rx: Option<tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>>,
+    mut command_rx: Option<
+        tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>,
+    >,
     policy_rx: Option<tokio::sync::watch::Receiver<crate::shared::sync_control::TenantSyncPolicy>>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
@@ -154,7 +157,9 @@ where
     let mut next_round_due = Instant::now();
     let mut observed_initial_control_progress = false;
     let mut pending_round_reply: Option<
-        std::sync::mpsc::Sender<Result<crate::runtime::sync_control::ManualSyncRoundCapture, String>>,
+        std::sync::mpsc::Sender<
+            Result<crate::runtime::sync_control::ManualSyncRoundCapture, String>,
+        >,
     > = None;
 
     'session: loop {
@@ -174,19 +179,19 @@ where
                             &timeline,
                             coordination,
                             peer_id,
-                            request_state,
+                            &request_state,
                         )
                         .await?;
                         if count > 0 {
                             last_activity = Instant::now();
                         }
-                        let id_hexes: Vec<String> =
-                            ids.iter().map(|id| hex::encode(id)).collect();
-                        let _ = reply.send(Ok(crate::runtime::sync_control::ManualSyncRequestResult {
-                            peer_id: peer_id.to_string(),
-                            requested_ids: id_hexes,
-                            reason: None,
-                        }));
+                        let id_hexes: Vec<String> = ids.iter().map(|id| hex::encode(id)).collect();
+                        let _ =
+                            reply.send(Ok(crate::runtime::sync_control::ManualSyncRequestResult {
+                                peer_id: peer_id.to_string(),
+                                requested_ids: id_hexes,
+                                reason: None,
+                            }));
                     }
                 }
             }
@@ -323,10 +328,12 @@ where
                                         .iter()
                                         .map(|eid| hex::encode(eid))
                                         .collect();
-                                    let _ = reply.send(Ok(crate::runtime::sync_control::ManualSyncRoundCapture {
-                                        peer_id: peer_id.to_string(),
-                                        observed_ids: newly_hex,
-                                    }));
+                                    let _ = reply.send(Ok(
+                                        crate::runtime::sync_control::ManualSyncRoundCapture {
+                                            peer_id: peer_id.to_string(),
+                                            observed_ids: newly_hex,
+                                        },
+                                    ));
                                 }
                             }
                         }
@@ -335,6 +342,7 @@ where
                             &timeline,
                             &store,
                             &mut have_ids,
+                            sync_window,
                             &mut round_need_list_ids,
                         )
                         .await?;
@@ -355,19 +363,21 @@ where
                             );
                         }
                     }
-                    Ok(Ok(Frame::DiscoveryHints { hints })) => {
+                    Ok(Ok(Frame::DiscoveryHints {
+                        priority_lane,
+                        hints,
+                    })) => {
                         last_activity = Instant::now();
                         let hint_ids: Vec<_> = hints.iter().map(|h| h.event_id).collect();
-                        let _ = timeline.mark_need_list_received_many(
-                            &hint_ids,
-                            current_timestamp_ms(),
-                        );
+                        let _ = timeline
+                            .mark_need_list_received_many(&hint_ids, current_timestamp_ms());
                         let observed = observe_discovery_hints_for_peer(
                             &wanted,
                             &timeline,
                             recorded_by,
                             peer_id,
                             reconcile_started_at_ms,
+                            i64::from(priority_lane),
                             &hints,
                             &mut round_observed_ids,
                         )?;
@@ -441,11 +451,14 @@ where
                                 event_id: summary.event_id,
                                 semantic_type_code: summary.semantic_type_code,
                                 encoded_size_bytes: summary.encoded_size_bytes,
+                                created_at_ms: u64::try_from(summary.created_at_ms)
+                                    .unwrap_or_default(),
                             },
                             _ => crate::protocol::DiscoveryHint {
                                 event_id,
                                 semantic_type_code: 0,
                                 encoded_size_bytes: 0,
+                                created_at_ms: 0,
                             },
                         }
                     })
@@ -456,6 +469,7 @@ where
                     recorded_by,
                     peer_id,
                     reconcile_started_at_ms,
+                    priority_lane_for_window_kind(sync_window.kind),
                     &need_hints,
                     &mut round_observed_ids,
                 )?;
@@ -467,7 +481,9 @@ where
                 }
                 let auto_requests = policy_rx
                     .as_ref()
-                    .map(|rx| rx.borrow().requests == crate::shared::sync_control::SyncPolicyMode::Auto)
+                    .map(|rx| {
+                        rx.borrow().requests == crate::shared::sync_control::SyncPolicyMode::Auto
+                    })
                     .unwrap_or(true);
                 if auto_requests {
                     let (requested_now, _) = refill_wanted_requests(
@@ -476,7 +492,7 @@ where
                         &timeline,
                         coordination,
                         peer_id,
-                        request_state,
+                        &request_state,
                     )
                     .await?;
                     if requested_now > 0 {
@@ -618,13 +634,15 @@ where
                 }
             }
 
-            if sync_window.kind == SyncWindowKind::Full {
-                mark_outbound_full_completed(db_path, peer_id, current_timestamp_ms());
-            }
+            let immediate_followup = mark_outbound_window_completed(db_path, peer_id, sync_window);
             if use_snapshot {
                 let _ = neg_db.execute("COMMIT", []);
             }
-            next_round_due = Instant::now() + discovery_round_gap();
+            next_round_due = if immediate_followup {
+                Instant::now()
+            } else {
+                Instant::now() + discovery_round_gap()
+            };
             continue;
         }
 
@@ -641,17 +659,20 @@ where
                     );
                 }
             }
-            Ok(Ok(Frame::DiscoveryHints { hints })) => {
+            Ok(Ok(Frame::DiscoveryHints {
+                priority_lane,
+                hints,
+            })) => {
                 last_activity = Instant::now();
                 let hint_ids: Vec<_> = hints.iter().map(|h| h.event_id).collect();
-                let _ =
-                    timeline.mark_need_list_received_many(&hint_ids, current_timestamp_ms());
+                let _ = timeline.mark_need_list_received_many(&hint_ids, current_timestamp_ms());
                 let observed = observe_discovery_hints_for_peer(
                     &wanted,
                     &timeline,
                     recorded_by,
                     peer_id,
                     current_timestamp_ms(),
+                    i64::from(priority_lane),
                     &hints,
                     &mut Vec::new(),
                 )?;
@@ -721,7 +742,7 @@ where
                 &timeline,
                 coordination,
                 peer_id,
-                request_state,
+                &request_state,
             )
             .await?;
             if requested_now > 0 {
