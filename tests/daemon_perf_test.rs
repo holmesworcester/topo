@@ -4,6 +4,7 @@
 //! and report per-daemon VmHWM instead of process-shared RSS.
 
 mod cli_harness;
+mod perf_metrics;
 
 use std::path::PathBuf;
 use std::thread;
@@ -11,11 +12,15 @@ use std::time::{Duration, Instant};
 
 use cli_harness::{
     accept_invite_with_identity_on_running_daemon, accept_invite_with_identity_persisted_only,
-    assert_eventually, create_invite, create_invite_with_spki, create_workspace_with_details,
-    daemon_listen_addr, daemon_transport_fingerprint, ensure_active_peer, generate_messages,
-    get_users_raw, message_count_sql, peak_rss_mib_for_pid, send_message,
-    start_daemon_with_options, topo_cmd, wait_for_active_tenant_ready,
+    active_tenant_peer_id, assert_eventually, create_invite, create_invite_with_spki,
+    create_workspace_with_details, daemon_listen_addr, daemon_transport_fingerprint,
+    ensure_active_peer, generate_messages, get_users_raw, message_count_sql, peak_rss_mib_for_pid,
+    send_message, start_daemon_with_options, topo_cmd, wait_for_active_tenant_ready,
     wait_for_tenant_ready_by_username, DaemonOptions, HarnessDaemon,
+};
+use perf_metrics::{
+    bandwidth_summary, delay_from, diff_new_ids, enable_projection_timeline, max_opt, min_opt,
+    projection_window, recorded_message_event_ids, total_event_blob_bytes,
 };
 
 struct SharedWorkspaceBench {
@@ -141,12 +146,74 @@ fn perf_debug_env(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn current_timestamp_ms() -> i64 {
+    use std::time::{SystemTime, UNIX_EPOCH};
+
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .expect("system time before unix epoch")
+        .as_millis() as i64
+}
+
+fn daemon_perf_extra_env() -> Vec<(String, String)> {
+    enable_projection_timeline();
+    vec![
+        ("TOPO_EVENT_TIMELINE".to_string(), "1".to_string()),
+        (
+            "TOPO_EVENT_TIMELINE_GROUPS".to_string(),
+            "projection".to_string(),
+        ),
+    ]
+}
+
+struct ProjectionPerfSummary {
+    first_recorded_at_delay_ms: Option<i64>,
+    last_recorded_at_delay_ms: Option<i64>,
+    first_projected_at_delay_ms: Option<i64>,
+    last_projected_at_delay_ms: Option<i64>,
+    projected_tail_ms: Option<i64>,
+    payload: perf_metrics::BandwidthSummary,
+}
+
+fn summarize_projection(
+    request_start_ms: i64,
+    windows: &[perf_metrics::ProjectionWindow],
+    payload_bytes: u64,
+    wall_secs: f64,
+) -> ProjectionPerfSummary {
+    let mut first_recorded_at = None;
+    let mut last_recorded_at = None;
+    let mut first_projected_at = None;
+    let mut last_projected_at = None;
+
+    for window in windows {
+        first_recorded_at = min_opt(first_recorded_at, window.recorded_at.first_at_ms);
+        last_recorded_at = max_opt(last_recorded_at, window.recorded_at.last_at_ms);
+        first_projected_at = min_opt(first_projected_at, window.projected_at.first_at_ms);
+        last_projected_at = max_opt(last_projected_at, window.projected_at.last_at_ms);
+    }
+
+    ProjectionPerfSummary {
+        first_recorded_at_delay_ms: delay_from(request_start_ms, first_recorded_at),
+        last_recorded_at_delay_ms: delay_from(request_start_ms, last_recorded_at),
+        first_projected_at_delay_ms: delay_from(request_start_ms, first_projected_at),
+        last_projected_at_delay_ms: delay_from(request_start_ms, last_projected_at),
+        projected_tail_ms: match (last_recorded_at, last_projected_at) {
+            (Some(recorded), Some(projected)) => Some(projected.saturating_sub(recorded)),
+            _ => None,
+        },
+        payload: bandwidth_summary(payload_bytes, wall_secs, None),
+    }
+}
+
 fn start_perf_daemon(db: &str, tmpdir: &std::path::Path, label: &str) -> HarnessDaemon {
+    let extra_env = daemon_perf_extra_env();
     if !perf_debug_env("PERF_DAEMON_LOGS") {
         return start_daemon_with_options(
             db,
             &DaemonOptions {
                 disable_discovery: true,
+                extra_env,
                 ..Default::default()
             },
         );
@@ -157,6 +224,7 @@ fn start_perf_daemon(db: &str, tmpdir: &std::path::Path, label: &str) -> Harness
             stdout_file: Some(tmpdir.join(format!("{label}.daemon.stdout.log"))),
             stderr_file: Some(tmpdir.join(format!("{label}.daemon.stderr.log"))),
             disable_discovery: true,
+            extra_env,
             ..Default::default()
         },
     )
@@ -382,14 +450,42 @@ fn emit_summary(
     summary_key: &str,
     title: &str,
     wall_secs: f64,
+    generate_secs: Option<f64>,
     messages: i64,
     msgs_per_sec: f64,
+    projection: &ProjectionPerfSummary,
     alice_rss: f64,
     bob_rss: f64,
     max_rss: f64,
 ) {
     let summary = format!(
-        "=== {title} ===\n  Wall time:    {wall_secs:.2}s\n  Messages:     {messages}\n  Msgs/s:       {msgs_per_sec:.0}\n  Peak RSS:     {max_rss:.1} MiB (max daemon VmHWM)\n  Alice peak RSS: {alice_rss:.1} MiB\n  Bob peak RSS:   {bob_rss:.1} MiB\n"
+        "=== {title} ===\n  Full projected_count: {wall_secs:.2}s\n  First recorded_at:    {first_recorded_at}\n  Last recorded_at:     {last_recorded_at}\n  First projected_at:   {first_projected_at}\n  Last projected_at:    {last_projected_at}\n  Projected tail:       {projected_tail}\n  Generate:             {generate_secs}\n  Messages:             {messages}\n  Projected msgs/s:     {msgs_per_sec:.0}\n  Payload bytes:        {payload_bytes}\n  Payload MiB/s:        {payload_mib_s:.2}\n  Payload Mbps:         {payload_mbps:.2}\n  Peak RSS:             {max_rss:.1} MiB (max daemon VmHWM)\n  Alice peak RSS:       {alice_rss:.1} MiB\n  Bob peak RSS:         {bob_rss:.1} MiB\n",
+        first_recorded_at = projection
+            .first_recorded_at_delay_ms
+            .map(|ms| format!("{ms} ms after start"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        last_recorded_at = projection
+            .last_recorded_at_delay_ms
+            .map(|ms| format!("{ms} ms after start"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        first_projected_at = projection
+            .first_projected_at_delay_ms
+            .map(|ms| format!("{ms} ms after start"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        last_projected_at = projection
+            .last_projected_at_delay_ms
+            .map(|ms| format!("{ms} ms after start"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        projected_tail = projection
+            .projected_tail_ms
+            .map(|ms| format!("{ms} ms (last recorded_at -> last projected_at)"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        generate_secs = generate_secs
+            .map(|secs| format!("{secs:.2}s"))
+            .unwrap_or_else(|| "n/a".to_string()),
+        payload_bytes = projection.payload.payload_bytes,
+        payload_mib_s = projection.payload.payload_mib_s,
+        payload_mbps = projection.payload.payload_mbps,
     );
     eprintln!("\n{summary}");
     let summary_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-results");
@@ -406,20 +502,44 @@ fn perf_sync_50k() {
 
     let bench = SharedWorkspaceBench::new();
     let baseline = bench.warm_one_way();
+    let alice_peer_id =
+        active_tenant_peer_id(&bench.alice_db).expect("alice active tenant for perf_sync_50k");
+    let bob_peer_id =
+        active_tenant_peer_id(&bench.bob_db).expect("bob active tenant for perf_sync_50k");
+    let alice_baseline_ids = recorded_message_event_ids(&bench.alice_db, &alice_peer_id);
 
     let start = Instant::now();
+    let request_start_ms = current_timestamp_ms();
+    let generate_start = Instant::now();
     generate_messages(&bench.alice_db, N as usize);
+    let generate_secs = generate_start.elapsed().as_secs_f64();
+    let alice_target_ids = diff_new_ids(
+        &alice_baseline_ids,
+        &recorded_message_event_ids(&bench.alice_db, &alice_peer_id),
+    );
     wait_for_message_count(&bench.bob_db, baseline + N, Duration::from_secs(300));
     let wall_secs = start.elapsed().as_secs_f64();
 
     let (alice_rss, bob_rss, max_rss) = bench.daemon_rss();
     let msgs_per_sec = N as f64 / wall_secs;
+    let projection = summarize_projection(
+        request_start_ms,
+        &[projection_window(
+            &bench.bob_db,
+            &bob_peer_id,
+            &alice_target_ids,
+        )],
+        total_event_blob_bytes(&bench.alice_db, &alice_target_ids),
+        wall_secs,
+    );
     emit_summary(
         "daemon_perf_test.perf_sync_50k",
         "50k one-way sync (daemon, warm)",
         wall_secs,
+        Some(generate_secs),
         N,
         msgs_per_sec,
+        &projection,
         alice_rss,
         bob_rss,
         max_rss,
@@ -434,10 +554,27 @@ fn perf_sync_10k() {
 
     let bench = SharedWorkspaceBench::new();
     let baseline = bench.warm_bidirectional();
+    let alice_peer_id =
+        active_tenant_peer_id(&bench.alice_db).expect("alice active tenant for perf_sync_10k");
+    let bob_peer_id =
+        active_tenant_peer_id(&bench.bob_db).expect("bob active tenant for perf_sync_10k");
+    let alice_baseline_ids = recorded_message_event_ids(&bench.alice_db, &alice_peer_id);
+    let bob_baseline_ids = recorded_message_event_ids(&bench.bob_db, &bob_peer_id);
 
     let start = Instant::now();
+    let request_start_ms = current_timestamp_ms();
+    let generate_start = Instant::now();
     generate_messages(&bench.alice_db, PER_PEER as usize);
     generate_messages(&bench.bob_db, PER_PEER as usize);
+    let generate_secs = generate_start.elapsed().as_secs_f64();
+    let alice_target_ids = diff_new_ids(
+        &alice_baseline_ids,
+        &recorded_message_event_ids(&bench.alice_db, &alice_peer_id),
+    );
+    let bob_target_ids = diff_new_ids(
+        &bob_baseline_ids,
+        &recorded_message_event_ids(&bench.bob_db, &bob_peer_id),
+    );
     wait_for_message_count_pair(
         &bench.alice_db,
         &bench.bob_db,
@@ -448,12 +585,24 @@ fn perf_sync_10k() {
 
     let (alice_rss, bob_rss, max_rss) = bench.daemon_rss();
     let msgs_per_sec = TOTAL as f64 / wall_secs;
+    let projection = summarize_projection(
+        request_start_ms,
+        &[
+            projection_window(&bench.alice_db, &alice_peer_id, &bob_target_ids),
+            projection_window(&bench.bob_db, &bob_peer_id, &alice_target_ids),
+        ],
+        total_event_blob_bytes(&bench.alice_db, &alice_target_ids)
+            + total_event_blob_bytes(&bench.bob_db, &bob_target_ids),
+        wall_secs,
+    );
     emit_summary(
         "daemon_perf_test.perf_sync_10k",
         "10k bidirectional sync (daemon, warm)",
         wall_secs,
+        Some(generate_secs),
         TOTAL,
         msgs_per_sec,
+        &projection,
         alice_rss,
         bob_rss,
         max_rss,
@@ -468,14 +617,31 @@ fn perf_continuous_10k() {
 
     let bench = SharedWorkspaceBench::new();
     let baseline = bench.warm_bidirectional();
+    let alice_peer_id = active_tenant_peer_id(&bench.alice_db)
+        .expect("alice active tenant for perf_continuous_10k");
+    let bob_peer_id =
+        active_tenant_peer_id(&bench.bob_db).expect("bob active tenant for perf_continuous_10k");
+    let alice_baseline_ids = recorded_message_event_ids(&bench.alice_db, &alice_peer_id);
+    let bob_baseline_ids = recorded_message_event_ids(&bench.bob_db, &bob_peer_id);
 
     let alice_db = bench.alice_db.clone();
     let bob_db = bench.bob_db.clone();
     let start = Instant::now();
+    let request_start_ms = current_timestamp_ms();
+    let generate_start = Instant::now();
     let alice_writer = thread::spawn(move || generate_messages(&alice_db, PER_PEER as usize));
     let bob_writer = thread::spawn(move || generate_messages(&bob_db, PER_PEER as usize));
     alice_writer.join().expect("alice generate thread panicked");
     bob_writer.join().expect("bob generate thread panicked");
+    let generate_secs = generate_start.elapsed().as_secs_f64();
+    let alice_target_ids = diff_new_ids(
+        &alice_baseline_ids,
+        &recorded_message_event_ids(&bench.alice_db, &alice_peer_id),
+    );
+    let bob_target_ids = diff_new_ids(
+        &bob_baseline_ids,
+        &recorded_message_event_ids(&bench.bob_db, &bob_peer_id),
+    );
     wait_for_message_count_pair(
         &bench.alice_db,
         &bench.bob_db,
@@ -486,12 +652,24 @@ fn perf_continuous_10k() {
 
     let (alice_rss, bob_rss, max_rss) = bench.daemon_rss();
     let msgs_per_sec = TOTAL as f64 / wall_secs;
+    let projection = summarize_projection(
+        request_start_ms,
+        &[
+            projection_window(&bench.alice_db, &alice_peer_id, &bob_target_ids),
+            projection_window(&bench.bob_db, &bob_peer_id, &alice_target_ids),
+        ],
+        total_event_blob_bytes(&bench.alice_db, &alice_target_ids)
+            + total_event_blob_bytes(&bench.bob_db, &bob_target_ids),
+        wall_secs,
+    );
     emit_summary(
         "daemon_perf_test.perf_continuous_10k",
         "10k continuous sync (daemon, warm)",
         wall_secs,
+        Some(generate_secs),
         TOTAL,
         msgs_per_sec,
+        &projection,
         alice_rss,
         bob_rss,
         max_rss,
@@ -508,9 +686,20 @@ fn perf_preloaded_10k() {
     let bench = SharedWorkspaceBench::new();
     // Warm the connection first so bootstrap identity sync is done
     let baseline = bench.warm_one_way();
+    let alice_peer_id =
+        active_tenant_peer_id(&bench.alice_db).expect("alice active tenant for perf_preloaded_10k");
+    let bob_peer_id =
+        active_tenant_peer_id(&bench.bob_db).expect("bob active tenant for perf_preloaded_10k");
+    let alice_baseline_ids = recorded_message_event_ids(&bench.alice_db, &alice_peer_id);
 
     // Generate all messages on Alice (untimed)
+    let generate_start = Instant::now();
     generate_messages(&bench.alice_db, N as usize);
+    let generate_secs = generate_start.elapsed().as_secs_f64();
+    let alice_target_ids = diff_new_ids(
+        &alice_baseline_ids,
+        &recorded_message_event_ids(&bench.alice_db, &alice_peer_id),
+    );
     // Wait for Alice's daemon to persist all generated messages
     wait_for_message_count(&bench.alice_db, baseline + N, Duration::from_secs(60));
 
@@ -522,17 +711,30 @@ fn perf_preloaded_10k() {
         return;
     }
     let start = Instant::now();
+    let request_start_ms = current_timestamp_ms();
     wait_for_message_count(&bench.bob_db, baseline + N, Duration::from_secs(300));
     let wall_secs = start.elapsed().as_secs_f64();
 
     let (alice_rss, bob_rss, max_rss) = bench.daemon_rss();
     let msgs_per_sec = remaining as f64 / wall_secs;
+    let projection = summarize_projection(
+        request_start_ms,
+        &[projection_window(
+            &bench.bob_db,
+            &bob_peer_id,
+            &alice_target_ids,
+        )],
+        total_event_blob_bytes(&bench.alice_db, &alice_target_ids),
+        wall_secs,
+    );
     emit_summary(
         "daemon_perf_test.perf_preloaded_10k",
         "10k preloaded sync (negentropy + transfer + ingest only)",
         wall_secs,
+        Some(generate_secs),
         remaining,
         msgs_per_sec,
+        &projection,
         alice_rss,
         bob_rss,
         max_rss,
@@ -547,20 +749,44 @@ fn perf_sync_100k() {
 
     let bench = SharedWorkspaceBench::new();
     let baseline = bench.warm_one_way();
+    let alice_peer_id =
+        active_tenant_peer_id(&bench.alice_db).expect("alice active tenant for perf_sync_100k");
+    let bob_peer_id =
+        active_tenant_peer_id(&bench.bob_db).expect("bob active tenant for perf_sync_100k");
+    let alice_baseline_ids = recorded_message_event_ids(&bench.alice_db, &alice_peer_id);
 
     let start = Instant::now();
+    let request_start_ms = current_timestamp_ms();
+    let generate_start = Instant::now();
     generate_messages(&bench.alice_db, N as usize);
+    let generate_secs = generate_start.elapsed().as_secs_f64();
+    let alice_target_ids = diff_new_ids(
+        &alice_baseline_ids,
+        &recorded_message_event_ids(&bench.alice_db, &alice_peer_id),
+    );
     wait_for_message_count(&bench.bob_db, baseline + N, Duration::from_secs(600));
     let wall_secs = start.elapsed().as_secs_f64();
 
     let (alice_rss, bob_rss, max_rss) = bench.daemon_rss();
     let msgs_per_sec = N as f64 / wall_secs;
+    let projection = summarize_projection(
+        request_start_ms,
+        &[projection_window(
+            &bench.bob_db,
+            &bob_peer_id,
+            &alice_target_ids,
+        )],
+        total_event_blob_bytes(&bench.alice_db, &alice_target_ids),
+        wall_secs,
+    );
     emit_summary(
         "daemon_perf_test.perf_sync_100k",
         "100k one-way sync (daemon, warm)",
         wall_secs,
+        Some(generate_secs),
         N,
         msgs_per_sec,
+        &projection,
         alice_rss,
         bob_rss,
         max_rss,
@@ -575,20 +801,44 @@ fn perf_sync_200k() {
 
     let bench = SharedWorkspaceBench::new();
     let baseline = bench.warm_one_way();
+    let alice_peer_id =
+        active_tenant_peer_id(&bench.alice_db).expect("alice active tenant for perf_sync_200k");
+    let bob_peer_id =
+        active_tenant_peer_id(&bench.bob_db).expect("bob active tenant for perf_sync_200k");
+    let alice_baseline_ids = recorded_message_event_ids(&bench.alice_db, &alice_peer_id);
 
     let start = Instant::now();
+    let request_start_ms = current_timestamp_ms();
+    let generate_start = Instant::now();
     generate_messages(&bench.alice_db, N as usize);
+    let generate_secs = generate_start.elapsed().as_secs_f64();
+    let alice_target_ids = diff_new_ids(
+        &alice_baseline_ids,
+        &recorded_message_event_ids(&bench.alice_db, &alice_peer_id),
+    );
     wait_for_message_count(&bench.bob_db, baseline + N, Duration::from_secs(600));
     let wall_secs = start.elapsed().as_secs_f64();
 
     let (alice_rss, bob_rss, max_rss) = bench.daemon_rss();
     let msgs_per_sec = N as f64 / wall_secs;
+    let projection = summarize_projection(
+        request_start_ms,
+        &[projection_window(
+            &bench.bob_db,
+            &bob_peer_id,
+            &alice_target_ids,
+        )],
+        total_event_blob_bytes(&bench.alice_db, &alice_target_ids),
+        wall_secs,
+    );
     emit_summary(
         "daemon_perf_test.perf_sync_200k",
         "200k one-way sync (daemon, warm)",
         wall_secs,
+        Some(generate_secs),
         N,
         msgs_per_sec,
+        &projection,
         alice_rss,
         bob_rss,
         max_rss,
@@ -603,20 +853,44 @@ fn perf_sync_500k() {
 
     let bench = SharedWorkspaceBench::new();
     let baseline = bench.warm_one_way();
+    let alice_peer_id =
+        active_tenant_peer_id(&bench.alice_db).expect("alice active tenant for perf_sync_500k");
+    let bob_peer_id =
+        active_tenant_peer_id(&bench.bob_db).expect("bob active tenant for perf_sync_500k");
+    let alice_baseline_ids = recorded_message_event_ids(&bench.alice_db, &alice_peer_id);
 
     let start = Instant::now();
+    let request_start_ms = current_timestamp_ms();
+    let generate_start = Instant::now();
     generate_messages(&bench.alice_db, N as usize);
+    let generate_secs = generate_start.elapsed().as_secs_f64();
+    let alice_target_ids = diff_new_ids(
+        &alice_baseline_ids,
+        &recorded_message_event_ids(&bench.alice_db, &alice_peer_id),
+    );
     wait_for_message_count(&bench.bob_db, baseline + N, Duration::from_secs(1_200));
     let wall_secs = start.elapsed().as_secs_f64();
 
     let (alice_rss, bob_rss, max_rss) = bench.daemon_rss();
     let msgs_per_sec = N as f64 / wall_secs;
+    let projection = summarize_projection(
+        request_start_ms,
+        &[projection_window(
+            &bench.bob_db,
+            &bob_peer_id,
+            &alice_target_ids,
+        )],
+        total_event_blob_bytes(&bench.alice_db, &alice_target_ids),
+        wall_secs,
+    );
     emit_summary(
         "daemon_perf_test.perf_sync_500k",
         "500k one-way sync (daemon, warm)",
         wall_secs,
+        Some(generate_secs),
         N,
         msgs_per_sec,
+        &projection,
         alice_rss,
         bob_rss,
         max_rss,
@@ -725,17 +999,10 @@ impl StarTopologyBench {
                 leaf_probe.trim(),
                 Duration::from_secs(120),
             );
-            assert_event_visible_on_all(
-                &[db.as_str()],
-                hub_probe.trim(),
-                Duration::from_secs(120),
-            );
+            assert_event_visible_on_all(&[db.as_str()], hub_probe.trim(), Duration::from_secs(120));
 
             if let Some(last) = leaves.last() {
-                let last_probe = send_message(
-                    &last.db,
-                    &format!("join-leaf-{idx:03}-last"),
-                );
+                let last_probe = send_message(&last.db, &format!("join-leaf-{idx:03}-last"));
                 assert_event_visible_on_all(
                     &[hub_db.as_str(), db.as_str()],
                     last_probe.trim(),
@@ -744,10 +1011,7 @@ impl StarTopologyBench {
             }
             if leaves.len() >= 2 {
                 let first = &leaves[0];
-                let first_probe = send_message(
-                    &first.db,
-                    &format!("join-leaf-{idx:03}-first"),
-                );
+                let first_probe = send_message(&first.db, &format!("join-leaf-{idx:03}-first"));
                 assert_event_visible_on_all(
                     &[hub_db.as_str(), db.as_str()],
                     first_probe.trim(),
@@ -755,7 +1019,11 @@ impl StarTopologyBench {
                 );
             }
 
-            leaves.push(StarLeafBench { db, _daemon: daemon, pid });
+            leaves.push(StarLeafBench {
+                db,
+                _daemon: daemon,
+                pid,
+            });
         }
 
         // Final all-node convergence: one probe from hub, verify every node
@@ -860,7 +1128,12 @@ fn start_hub_daemon(db: &str, tmpdir: &std::path::Path) -> HarnessDaemon {
 }
 
 /// Start a leaf daemon with discovery disabled.
-fn start_star_daemon(db: &str, tmpdir: &std::path::Path, label: &str, lowmem: bool) -> HarnessDaemon {
+fn start_star_daemon(
+    db: &str,
+    tmpdir: &std::path::Path,
+    label: &str,
+    lowmem: bool,
+) -> HarnessDaemon {
     let mut extra_env = Vec::new();
     if lowmem {
         extra_env.push(("LOW_MEM_IOS".to_string(), "1".to_string()));
@@ -1039,7 +1312,10 @@ fn perf_star_topology_capacity() {
     }
     for (leaf_idx, leaf) in bench.leaves.iter().enumerate() {
         for msg_idx in 0..messages_per_leaf {
-            send_message(&leaf.db, &format!("star-leaf-{leaf_idx:03}-msg-{msg_idx:03}"));
+            send_message(
+                &leaf.db,
+                &format!("star-leaf-{leaf_idx:03}-msg-{msg_idx:03}"),
+            );
         }
     }
     let total_messages = hub_messages + leaf_count * messages_per_leaf;
@@ -1109,8 +1385,7 @@ fn perf_star_topology_capacity() {
         max_u(&leaf_maps),
     );
     eprintln!("\n{summary}");
-    let summary_dir =
-        std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-results");
+    let summary_dir = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("target/perf-results");
     std::fs::create_dir_all(&summary_dir).expect("create target/perf-results");
     std::fs::write(
         summary_dir.join("daemon_perf_test.perf_star_topology_capacity.summary"),

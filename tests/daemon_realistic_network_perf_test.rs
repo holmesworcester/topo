@@ -6,6 +6,7 @@
 
 mod cli_harness;
 mod daemon_perf_harness;
+mod perf_metrics;
 mod perf_network_shaper;
 
 use std::net::SocketAddr;
@@ -15,6 +16,7 @@ use daemon_perf_harness::{
     run_bidirectional_sync, run_continuous_sync, run_one_way_sync, write_summary, BenchNetworkPath,
     PerfMeasurement, SharedWorkspaceBench,
 };
+use perf_metrics::{bandwidth_summary, ShapedNetworkCeiling};
 use perf_network_shaper::{
     clear_realistic_network_env, repeat_count_from_env, selected_profiles_from_env, NetworkProfile,
     UdpTrafficShaper, REALISTIC_NETWORK_PROFILES,
@@ -102,8 +104,17 @@ fn format_matrix_summary(
     );
 
     for entry in measurements {
+        let bandwidth = bandwidth_summary(
+            entry.measurement.payload_bytes,
+            entry.measurement.wall_secs,
+            Some(ShapedNetworkCeiling {
+                bandwidth_mbps_per_direction: entry.profile.bandwidth_mbps_per_direction,
+                rtt_ms: entry.profile.rtt_ms,
+                loss_percent: entry.profile.loss_percent,
+            }),
+        );
         summary.push_str(&format!(
-            "\n  Profile:      {} ({})\n  Repeat:       {}/{}\n  Note:         {}\n  Bandwidth:    {:.1} Mbps/dir\n  RTT:          {} ms\n  Jitter:       +/- {} ms\n  Loss:         {:.2}%\n  Wall time:    {:.2}s\n  Generate:     {:.2}s\n  Sync wait:    {:.2}s\n  Messages:     {}\n  Msgs/s:       {:.0}\n  Peak RSS:     {:.1} MiB (max daemon VmHWM)\n  Alice peak RSS: {:.1} MiB\n  Bob peak RSS:   {:.1} MiB\n",
+            "\n  Profile:      {} ({})\n  Repeat:       {}/{}\n  Note:         {}\n  Bandwidth:    {:.1} Mbps/dir\n  RTT:          {} ms\n  Jitter:       +/- {} ms\n  Loss:         {:.2}%\n  Full projected_count: {:.2}s\n  First recorded_at:    {}\n  Last recorded_at:     {}\n  First projected_at:   {}\n  Last projected_at:    {}\n  Projected tail:       {}\n  Generate:     {:.2}s\n  Sync wait:    {:.2}s\n  Messages:     {}\n  Projected msgs/s: {:.0}\n  Payload bytes: {}\n  Payload MiB/s: {:.2}\n  Payload Mbps:  {:.2}\n  Bandwidth saturation: {}\n  Peak RSS:     {:.1} MiB (max daemon VmHWM)\n  Alice peak RSS: {:.1} MiB\n  Bob peak RSS:   {:.1} MiB\n",
             entry.profile.title,
             entry.profile.slug,
             entry.repeat,
@@ -114,14 +125,47 @@ fn format_matrix_summary(
             entry.profile.jitter_ms,
             entry.profile.loss_percent,
             entry.measurement.wall_secs,
+            entry.measurement
+                .first_recorded_at_delay_ms
+                .map(|ms| format!("{ms} ms after start"))
+                .unwrap_or_else(|| "n/a".to_string()),
+            entry.measurement
+                .last_recorded_at_delay_ms
+                .map(|ms| format!("{ms} ms after start"))
+                .unwrap_or_else(|| "n/a".to_string()),
+            entry.measurement
+                .first_projected_at_delay_ms
+                .map(|ms| format!("{ms} ms after start"))
+                .unwrap_or_else(|| "n/a".to_string()),
+            entry.measurement
+                .last_projected_at_delay_ms
+                .map(|ms| format!("{ms} ms after start"))
+                .unwrap_or_else(|| "n/a".to_string()),
+            entry.measurement
+                .projected_tail_ms
+                .map(|ms| format!("{ms} ms (last recorded_at -> last projected_at)"))
+                .unwrap_or_else(|| "n/a".to_string()),
             entry.measurement.generate_secs,
             entry.measurement.sync_wait_secs,
             entry.measurement.messages,
             entry.measurement.msgs_per_sec,
+            entry.measurement.payload_bytes,
+            entry.measurement.payload_mib_s,
+            entry.measurement.payload_mbps,
+            bandwidth
+                .bandwidth_saturation_pct
+                .map(|pct| format!("{pct:.1}%"))
+                .unwrap_or_else(|| "n/a".to_string()),
             entry.measurement.max_rss,
             entry.measurement.alice_rss,
             entry.measurement.bob_rss,
         ));
+        if let Some(perfect) = bandwidth.perfect_payload_mbps {
+            summary.push_str(&format!("  Perfect max Mbps: {:.2}\n", perfect));
+        }
+        if let Some(ceiling) = bandwidth.estimated_quic_ceiling_mbps {
+            summary.push_str(&format!("  Estimated QUIC ceiling: {:.2}\n", ceiling));
+        }
     }
 
     summary
