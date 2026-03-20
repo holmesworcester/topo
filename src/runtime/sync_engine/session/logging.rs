@@ -321,6 +321,38 @@ fn frame_detail_json(frame: &Frame, capture_full_ids: bool) -> Option<String> {
             }))
             .ok()
         }
+        Frame::ExactDiffHints { upper_bound, hints } => {
+            let keep = if capture_full_ids {
+                hints.len()
+            } else {
+                hints.len().min(MAX_CAPTURE_IDS)
+            };
+            let ids_hex: Vec<String> = hints
+                .iter()
+                .take(keep)
+                .map(|hint| hex::encode(hint.event_id))
+                .collect();
+            let semantic_types: Vec<u8> = hints
+                .iter()
+                .take(keep)
+                .map(|hint| hint.semantic_type_code)
+                .collect();
+            let encoded_sizes: Vec<u32> = hints
+                .iter()
+                .take(keep)
+                .map(|hint| hint.encoded_size_bytes)
+                .collect();
+            serde_json::to_string(&json!({
+                "bound_ts": upper_bound.timestamp,
+                "bound_id_prefix": hex::encode(&upper_bound.id_prefix),
+                "hint_count": hints.len(),
+                "ids": ids_hex,
+                "semantic_type_codes": semantic_types,
+                "encoded_size_bytes": encoded_sizes,
+                "hints_truncated": !capture_full_ids && hints.len() > MAX_CAPTURE_IDS
+            }))
+            .ok()
+        }
         Frame::ResponseCredit { bytes } => serde_json::to_string(&json!({
             "bytes": bytes
         }))
@@ -343,6 +375,7 @@ fn frame_type(frame: &Frame) -> &'static str {
         Frame::NegMsg { .. } => "NegMsg",
         Frame::RequestIds { .. } => "RequestIds",
         Frame::DiscoveryHints { .. } => "DiscoveryHints",
+        Frame::ExactDiffHints { .. } => "ExactDiffHints",
         Frame::ResponseCredit { .. } => "ResponseCredit",
         Frame::Event { .. } => "Event",
         Frame::IntroOffer { .. } => "IntroOffer",

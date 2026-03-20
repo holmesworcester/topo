@@ -3,18 +3,18 @@
 //! Owns control-stream message handling concerns:
 //! - Negentropy control messages (`NegOpen` / `NegMsg`)
 //! - Sink-side observation of missing IDs into SQL-backed `wanted` state
-//! - Discovery hints (`DiscoveryHints`) and request-window refill (`RequestIds`)
+//! - Exact diff hints (`ExactDiffHints`), live discovery hints
+//!   (`DiscoveryHints`), and request-window refill (`RequestIds`)
 //!   via the shared in-memory coordinator
 
-use negentropy::Id;
 use tokio::sync::broadcast;
 use tracing::info;
 
 use crate::crypto::EventId;
+use crate::db::store::Store;
 use crate::db::timeline::EventTimeline;
 use crate::db::wanted::WantedEvents;
-use crate::db::store::Store;
-use crate::protocol::{neg_id_to_event_id, DiscoveryHint, Frame};
+use crate::protocol::{neg_bound_to_wire, neg_id_to_event_id, DiscoveryHint, Frame};
 use crate::state::live_hints::LiveHint;
 use crate::transport::StreamConn;
 
@@ -34,9 +34,9 @@ where
     Ok(())
 }
 
-/// Persist reconciliation-discovered `need_ids` as sink demand plus candidate
-/// source membership for this peer.
-pub fn observe_discovery_hints_for_peer(
+/// Persist sink-discovered event hints as durable demand plus candidate-source
+/// membership for this peer.
+pub fn observe_event_hints_for_peer(
     wanted: &WantedEvents<'_>,
     timeline: &EventTimeline<'_>,
     local_peer_id: &str,
@@ -58,30 +58,27 @@ pub fn observe_discovery_hints_for_peer(
     )?)
 }
 
-/// Send discovery hints for IDs the peer is missing.
-///
-/// These are not data sends. They only let the remote side populate durable
-/// `wanted` state and then pull the blobs under request credit.
-pub async fn send_discovery_hints_from_have_ids<C>(
+/// Send exact-diff hints for negentropy ranges where we know the peer is
+/// missing some of our events.
+pub async fn send_exact_diff_hints_from_ranges<C>(
     control: &mut C,
     timeline: &EventTimeline<'_>,
     store: &Store<'_>,
-    have_ids: &mut Vec<Id>,
+    exact_ranges: &mut Vec<negentropy::ExactDiffRange>,
     sent_ids_out: &mut Vec<EventId>,
 ) -> Result<usize, SyncError>
 where
     C: StreamConn,
 {
-    if have_ids.is_empty() {
+    if exact_ranges.is_empty() {
         return Ok(0);
     }
 
     let batch_size = need_chunk().max(1);
     let mut sent = 0usize;
-    while !have_ids.is_empty() {
-        let drain_count = have_ids.len().min(batch_size);
-        let mut hints = Vec::with_capacity(drain_count);
-        for neg_id in have_ids.drain(..drain_count) {
+    for exact_range in exact_ranges.drain(..) {
+        let mut hints = Vec::with_capacity(exact_range.have_ids.len());
+        for neg_id in exact_range.have_ids {
             let event_id = neg_id_to_event_id(&neg_id);
             let Some(summary) = store.get_shared_summary(&event_id)? else {
                 continue;
@@ -100,7 +97,15 @@ where
         let sent_at = crate::db::queue::current_timestamp_ms();
         sent += hints.len();
         let _ = timeline.mark_need_list_sent_many(&ids, sent_at);
-        control.send(&Frame::DiscoveryHints { hints }).await?;
+        let upper_bound = neg_bound_to_wire(&exact_range.upper_bound);
+        for chunk in hints.chunks(batch_size) {
+            control
+                .send(&Frame::ExactDiffHints {
+                    upper_bound: upper_bound.clone(),
+                    hints: chunk.to_vec(),
+                })
+                .await?;
+        }
     }
     control.flush().await?;
     Ok(sent)
@@ -134,7 +139,8 @@ where
         return Ok((0, Vec::new()));
     }
 
-    let candidate_limit = candidate_limit_for_credit_bytes(credit_bytes, snapshot.inflight_requested.len());
+    let candidate_limit =
+        candidate_limit_for_credit_bytes(credit_bytes, snapshot.inflight_requested.len());
     let selected = coordination.plan_requests(
         wanted,
         peer_id,
@@ -147,10 +153,16 @@ where
         return Ok((0, Vec::new()));
     }
     if let Some(credit_received_at) = snapshot.last_credit_received_at {
-        let selected_ids: Vec<EventId> = selected.iter().map(|candidate| candidate.event_id).collect();
+        let selected_ids: Vec<EventId> = selected
+            .iter()
+            .map(|candidate| candidate.event_id)
+            .collect();
         let _ = timeline.mark_request_credit_received_many(&selected_ids, credit_received_at);
     }
-    let selected_ids: Vec<EventId> = selected.iter().map(|candidate| candidate.event_id).collect();
+    let selected_ids: Vec<EventId> = selected
+        .iter()
+        .map(|candidate| candidate.event_id)
+        .collect();
     let _ = timeline.mark_request_selected_many(&selected_ids, now_ms);
     let reserved_bytes: usize = selected
         .iter()

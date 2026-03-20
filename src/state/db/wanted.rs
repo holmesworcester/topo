@@ -18,7 +18,7 @@ pub struct WantedEvents<'a> {
 }
 
 /// Conservative floor for events whose size is not yet known (e.g. negentropy
-/// diff IDs before the responder's DiscoveryHints arrive). Ensures credit
+/// diff IDs before the responder's ExactDiffHints arrive). Ensures credit
 /// accounting is never zero for a real event.
 pub const UNKNOWN_EVENT_CREDIT_FLOOR_BYTES: usize = 256;
 
@@ -159,12 +159,16 @@ impl<'a> WantedEvents<'a> {
         with_immediate_tx(self.conn, || {
             // Batch-check which hints are already locally recorded in one query
             // instead of N individual lookups.
-            let hint_b64s: Vec<String> = hints.iter().map(|h| event_id_to_base64(&h.event_id)).collect();
+            let hint_b64s: Vec<String> = hints
+                .iter()
+                .map(|h| event_id_to_base64(&h.event_id))
+                .collect();
             let already_local_set: std::collections::HashSet<String> = {
                 let mut set = std::collections::HashSet::new();
                 // SQLite max variable count is 999; chunk to stay within limits
                 for chunk in hint_b64s.chunks(900) {
-                    let placeholders: String = chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+                    let placeholders: String =
+                        chunk.iter().map(|_| "?").collect::<Vec<_>>().join(",");
                     let sql = format!(
                         "SELECT event_id FROM recorded_events WHERE peer_id = ?1 AND event_id IN ({})",
                         placeholders
@@ -458,7 +462,11 @@ mod tests {
                 .observe_many_for_peer(
                     "local",
                     "peer-a",
-                    &[discovery_hint(7, crate::event_modules::EVENT_TYPE_MESSAGE, 144)],
+                    &[discovery_hint(
+                        7,
+                        crate::event_modules::EVENT_TYPE_MESSAGE,
+                        144,
+                    )],
                     1,
                     &timeline,
                 )
@@ -495,7 +503,10 @@ mod tests {
 
         let peer_a_candidates = wanted.list_candidates_for_peer("peer-a", 8).unwrap();
         assert_eq!(peer_a_candidates.len(), 2);
-        assert_eq!(peer_a_candidates[0].semantic_type_code, crate::event_modules::EVENT_TYPE_MESSAGE);
+        assert_eq!(
+            peer_a_candidates[0].semantic_type_code,
+            crate::event_modules::EVENT_TYPE_MESSAGE
+        );
         assert_eq!(peer_a_candidates[0].encoded_size_bytes, 144);
         assert_eq!(wanted.count_backlog_for_peer("peer-b").unwrap(), 2);
     }

@@ -5,6 +5,10 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use topo::contracts::peering_contract::{SessionDirection, SessionHandler};
+use topo::crypto::hash_event;
+use topo::db::open_connection;
+use topo::db::store::{insert_event, insert_neg_item_if_shared};
+use topo::event_modules::{ShareScope, EVENT_TYPE_MESSAGE};
 use topo::protocol::Frame;
 use topo::sync::session_handler::SyncConnectionHandler;
 
@@ -142,6 +146,92 @@ async fn responder_ignores_empty_request_ids_marker() {
 
         cancel.cancel();
         peer.force_close();
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn responder_sends_exact_diff_hints_before_negmsg_for_exact_mismatch() {
+    run_local(async {
+        let tenant_id = "test-tenant";
+        let (db_path, _tmpdir) = create_test_db(tenant_id);
+        let conn = open_connection(&db_path).expect("open db");
+        let blob = vec![EVENT_TYPE_MESSAGE, b'e', b'x', b'a', b'c', b't'];
+        let event_id = hash_event(&blob);
+        insert_event(&conn, &event_id, "message", &blob, ShareScope::Shared, 1, 1)
+            .expect("insert event");
+        insert_neg_item_if_shared(
+            &conn,
+            ShareScope::Shared,
+            1,
+            &event_id,
+            &format!("ws-{tenant_id}"),
+        )
+        .expect("insert neg item");
+        drop(conn);
+
+        let handler = SyncConnectionHandler::responder(
+            db_path,
+            30,
+            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
+            noop_ingest_tx(),
+        );
+        let meta = test_session_meta(SessionDirection::Inbound);
+        let cancel = CancellationToken::new();
+
+        let (fake_io, mut peer) = fake_session_io_pair(meta.session_id);
+
+        let handler_task = tokio::task::spawn_local({
+            let cancel = cancel.clone();
+            async move { handler.on_session(meta, Box::new(fake_io), cancel).await }
+        });
+
+        let storage = empty_negentropy_storage();
+        let mut neg =
+            negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
+        peer.send_control_msg(&Frame::NegOpen {
+            msg: neg.initiate().unwrap(),
+        })
+        .await;
+
+        let mut saw_exact = false;
+        loop {
+            let frame = peer
+                .recv_control_msg_timeout(Duration::from_secs(2))
+                .await
+                .expect("expected responder control frame");
+            match frame {
+                Frame::ResponseCredit { .. } => continue,
+                Frame::ExactDiffHints { upper_bound, hints } => {
+                    saw_exact = true;
+                    assert_eq!(upper_bound.timestamp, u64::MAX);
+                    assert!(upper_bound.id_prefix.is_empty());
+                    assert_eq!(hints.len(), 1);
+                    assert_eq!(hints[0].event_id, event_id);
+                    assert_eq!(hints[0].semantic_type_code, EVENT_TYPE_MESSAGE);
+                    assert_eq!(hints[0].encoded_size_bytes, blob.len() as u32);
+                }
+                Frame::NegMsg { msg } => {
+                    assert!(saw_exact, "expected ExactDiffHints before NegMsg");
+                    let mut have_ids = Vec::new();
+                    let mut need_ids = Vec::new();
+                    let next = neg
+                        .reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)
+                        .expect("reconcile response");
+                    assert!(
+                        next.is_none(),
+                        "expected exact mismatch to finish in one reply"
+                    );
+                    break;
+                }
+                other => panic!("unexpected frame from responder: {other:?}"),
+            }
+        }
+
+        cancel.cancel();
+        peer.force_close();
+        handler_task.abort();
+        let _ = handler_task.await;
     })
     .await;
 }

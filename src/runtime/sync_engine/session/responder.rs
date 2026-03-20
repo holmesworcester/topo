@@ -40,7 +40,7 @@ use crate::state::live_hints;
 
 use super::connection_scope::{ConnectionRequestState, ConnectionResponseState};
 use super::control_plane::{
-    observe_discovery_hints_for_peer, refill_wanted_requests, send_forward_on_have_hints,
+    observe_event_hints_for_peer, refill_wanted_requests, send_forward_on_have_hints,
     send_response_credit_bytes,
 };
 use super::coordinator::PeerCoord;
@@ -83,7 +83,9 @@ pub async fn run_sync_responder<C, S, R>(
     shared_ingest: mpsc::Sender<IngestItem>,
     capture: Option<SyncRunCapture>,
     rx_capture: Option<SyncRunRxCapture>,
-    mut command_rx: Option<tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>>,
+    mut command_rx: Option<
+        tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>,
+    >,
     policy_rx: Option<tokio::sync::watch::Receiver<crate::shared::sync_control::TenantSyncPolicy>>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
@@ -119,12 +121,12 @@ where
     let ws_id_for_neg = ws_id.clone();
 
     /// Result from the negentropy worker thread: the NegMsg response bytes
-    /// plus pre-built DiscoveryHints for the diff (looked up in the worker
+    /// plus pre-built exact-diff hint frames (looked up in the worker
     /// thread's own DB connection so the async loop does no blob reads).
     struct NegWorkerResult {
         response: Vec<u8>,
-        /// Ready-to-send hints for events we have that the remote lacks.
-        diff_hints: Vec<crate::protocol::DiscoveryHint>,
+        /// Ready-to-send exact-diff frames for events we have that the remote lacks.
+        exact_diff_frames: Vec<crate::protocol::Frame>,
     }
 
     let mut neg_req_tx: Option<std::sync::mpsc::Sender<Vec<u8>>> = None;
@@ -163,26 +165,52 @@ where
             while let Ok(msg) = req_rx.recv() {
                 let mut have_ids = Vec::new();
                 let mut need_ids = Vec::new();
+                let mut exact_ranges = Vec::new();
                 let result = neg
-                    .reconcile_with_diff(&msg, &mut have_ids, &mut need_ids)
+                    .reconcile_with_diff_ranges(
+                        &msg,
+                        &mut have_ids,
+                        &mut need_ids,
+                        &mut exact_ranges,
+                    )
                     .map(|response| {
-                        // Build hints in the worker thread — no blob reads on the async loop.
-                        let diff_hints: Vec<crate::protocol::DiscoveryHint> = have_ids
-                            .iter()
-                            .filter_map(|neg_id| {
-                                let event_id = crate::protocol::neg_id_to_event_id(neg_id);
-                                worker_store.get_shared_summary(&event_id).ok().flatten().map(
-                                    |summary| crate::protocol::DiscoveryHint {
-                                        event_id: summary.event_id,
-                                        semantic_type_code: summary.semantic_type_code,
-                                        encoded_size_bytes: summary.encoded_size_bytes,
-                                    },
-                                )
-                            })
-                            .collect();
+                        // Build exact diff frames in the worker thread — no
+                        // blob reads on the async loop.
+                        let mut exact_diff_frames = Vec::new();
+                        let batch_size = super::need_chunk().max(1);
+                        for exact_range in exact_ranges {
+                            let mut hints: Vec<crate::protocol::DiscoveryHint> = exact_range
+                                .have_ids
+                                .iter()
+                                .filter_map(|neg_id| {
+                                    let event_id = crate::protocol::neg_id_to_event_id(neg_id);
+                                    worker_store
+                                        .get_shared_summary(&event_id)
+                                        .ok()
+                                        .flatten()
+                                        .map(|summary| crate::protocol::DiscoveryHint {
+                                            event_id: summary.event_id,
+                                            semantic_type_code: summary.semantic_type_code,
+                                            encoded_size_bytes: summary.encoded_size_bytes,
+                                        })
+                                })
+                                .collect();
+                            if hints.is_empty() {
+                                continue;
+                            }
+                            let upper_bound =
+                                crate::protocol::neg_bound_to_wire(&exact_range.upper_bound);
+                            for chunk in hints.chunks(batch_size) {
+                                exact_diff_frames.push(crate::protocol::Frame::ExactDiffHints {
+                                    upper_bound: upper_bound.clone(),
+                                    hints: chunk.to_vec(),
+                                });
+                            }
+                            hints.clear();
+                        }
                         NegWorkerResult {
                             response,
-                            diff_hints,
+                            exact_diff_frames,
                         }
                     })
                     .map_err(|e| format!("{}", e));
@@ -283,9 +311,10 @@ where
                 use crate::runtime::sync_control::SessionCommand;
                 match cmd {
                     SessionCommand::ForceRound { reply } => {
-                        let _ = reply.send(Err(
-                            "only initiator sessions can drive negentropy rounds".to_string(),
-                        ));
+                        let _ =
+                            reply
+                                .send(Err("only initiator sessions can drive negentropy rounds"
+                                    .to_string()));
                     }
                     SessionCommand::ForceRequest { reply } => {
                         let (count, ids) = refill_wanted_requests(
@@ -300,13 +329,13 @@ where
                         if count > 0 {
                             last_activity = Instant::now();
                         }
-                        let id_hexes: Vec<String> =
-                            ids.iter().map(|id| hex::encode(id)).collect();
-                        let _ = reply.send(Ok(crate::runtime::sync_control::ManualSyncRequestResult {
-                            peer_id: peer_id.to_string(),
-                            requested_ids: id_hexes,
-                            reason: None,
-                        }));
+                        let id_hexes: Vec<String> = ids.iter().map(|id| hex::encode(id)).collect();
+                        let _ =
+                            reply.send(Ok(crate::runtime::sync_control::ManualSyncRequestResult {
+                                peer_id: peer_id.to_string(),
+                                requested_ids: id_hexes,
+                                reason: None,
+                            }));
                     }
                 }
             }
@@ -322,35 +351,40 @@ where
                 Ok(Ok(result)) => {
                     reconciling = false;
                     last_activity = Instant::now();
+                    let NegWorkerResult {
+                        response,
+                        exact_diff_frames,
+                    } = result;
 
-                    // Send pre-built DiscoveryHints BEFORE the NegMsg so the
+                    // Send exact diff hints BEFORE the NegMsg so the
                     // initiator has real byte sizes when it starts scheduling.
-                    // Hints were built in the worker thread (no DB work here).
-                    if !result.diff_hints.is_empty() {
-                        let batch_size = super::need_chunk().max(1);
-                        let total_hints = result.diff_hints.len();
-                        for chunk in result.diff_hints.chunks(batch_size) {
-                            control
-                                .send(&Frame::DiscoveryHints {
-                                    hints: chunk.to_vec(),
-                                })
-                                .await?;
+                    // Frames were built in the worker thread (no DB work here).
+                    if !exact_diff_frames.is_empty() {
+                        let total_hints: usize = exact_diff_frames
+                            .iter()
+                            .map(|frame| match frame {
+                                Frame::ExactDiffHints { hints, .. } => hints.len(),
+                                _ => 0,
+                            })
+                            .sum();
+                        for frame in exact_diff_frames {
+                            control.send(&frame).await?;
                         }
                         control.flush().await?;
                         info!(
-                            "Sent {} discovery hints for responder diff to peer {}",
+                            "Sent {} exact diff hints for responder diff to peer {}",
                             total_hints, peer_id
                         );
                     }
 
-                    if result.response.is_empty() {
+                    if response.is_empty() {
                         info!(
                             "Reconciliation locally quiescent: {} rounds, {}ms",
                             rounds,
                             reconcile_start.elapsed().as_millis()
                         );
                     } else {
-                        control.send(&Frame::NegMsg { msg: result.response }).await?;
+                        control.send(&Frame::NegMsg { msg: response }).await?;
                         control.flush().await?;
                     }
                 }
@@ -424,7 +458,7 @@ where
                 let hint_ids: Vec<_> = hints.iter().map(|hint| hint.event_id).collect();
                 let need_received_at = current_timestamp_ms();
                 let _ = timeline.mark_need_list_received_many(&hint_ids, need_received_at);
-                let observed = observe_discovery_hints_for_peer(
+                let observed = observe_event_hints_for_peer(
                     &wanted,
                     &timeline,
                     recorded_by,
@@ -436,6 +470,30 @@ where
                 if observed > 0 {
                     info!(
                         "Observed {} discovery hints from peer {}",
+                        observed, peer_id
+                    );
+                }
+            }
+            Ok(Ok(Frame::ExactDiffHints {
+                upper_bound: _,
+                hints,
+            })) => {
+                last_activity = Instant::now();
+                let hint_ids: Vec<_> = hints.iter().map(|hint| hint.event_id).collect();
+                let need_received_at = current_timestamp_ms();
+                let _ = timeline.mark_need_list_received_many(&hint_ids, need_received_at);
+                let observed = observe_event_hints_for_peer(
+                    &wanted,
+                    &timeline,
+                    recorded_by,
+                    peer_id,
+                    reconcile_started_at_ms,
+                    &hints,
+                    &mut round_observed_ids,
+                )?;
+                if observed > 0 {
+                    info!(
+                        "Observed {} exact diff hints from peer {}",
                         observed, peer_id
                     );
                 }
@@ -484,8 +542,14 @@ where
         }
 
         if forward_on_have_enabled() {
-            let hinted =
-                send_forward_on_have_hints(&mut control, &timeline, &store, peer_id, &mut forward_hint_rx).await?;
+            let hinted = send_forward_on_have_hints(
+                &mut control,
+                &timeline,
+                &store,
+                peer_id,
+                &mut forward_hint_rx,
+            )
+            .await?;
             if hinted > 0 {
                 last_activity = Instant::now();
             }

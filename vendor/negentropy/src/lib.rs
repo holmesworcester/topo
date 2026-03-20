@@ -44,6 +44,17 @@ const MAX_U64: u64 = u64::MAX;
 const BUCKETS: usize = 16;
 const DOUBLE_BUCKETS: usize = BUCKETS * 2;
 
+/// Exact diff details for a reconciled range.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ExactDiffRange {
+    /// Upper bound for the exact range.
+    pub upper_bound: Bound,
+    /// IDs we have that the remote side lacks in this range.
+    pub have_ids: Vec<Id>,
+    /// IDs the remote side has that we lack in this range.
+    pub need_ids: Vec<Id>,
+}
+
 /// Negentropy
 #[derive(Debug)]
 pub struct Negentropy<'a, T> {
@@ -120,7 +131,7 @@ where
             return Err(Error::Initiator);
         }
 
-        self.reconcile_aux(query, &mut Vec::new(), &mut Vec::new())
+        self.reconcile_aux(query, &mut Vec::new(), &mut Vec::new(), None)
     }
 
     /// Reconcile (server method) with diff output.
@@ -139,7 +150,22 @@ where
             return Err(Error::Initiator);
         }
 
-        self.reconcile_aux(query, have_ids, need_ids)
+        self.reconcile_aux(query, have_ids, need_ids, None)
+    }
+
+    /// Reconcile (server method) with flat diff IDs plus exact range grouping.
+    pub fn reconcile_with_diff_ranges(
+        &mut self,
+        query: &[u8],
+        have_ids: &mut Vec<Id>,
+        need_ids: &mut Vec<Id>,
+        exact_ranges: &mut Vec<ExactDiffRange>,
+    ) -> Result<Vec<u8>, Error> {
+        if self.is_initiator {
+            return Err(Error::Initiator);
+        }
+
+        self.reconcile_aux(query, have_ids, need_ids, Some(exact_ranges))
     }
 
     /// Reconcile (client method)
@@ -153,7 +179,28 @@ where
             return Err(Error::NonInitiator);
         }
 
-        let output: Vec<u8> = self.reconcile_aux(query, have_ids, need_ids)?;
+        let output: Vec<u8> = self.reconcile_aux(query, have_ids, need_ids, None)?;
+        if output.len() == 1 {
+            return Ok(None);
+        }
+
+        Ok(Some(output))
+    }
+
+    /// Reconcile (client method) with flat diff IDs plus exact range grouping.
+    pub fn reconcile_with_ids_ranges(
+        &mut self,
+        query: &[u8],
+        have_ids: &mut Vec<Id>,
+        need_ids: &mut Vec<Id>,
+        exact_ranges: &mut Vec<ExactDiffRange>,
+    ) -> Result<Option<Vec<u8>>, Error> {
+        if !self.is_initiator {
+            return Err(Error::NonInitiator);
+        }
+
+        let output: Vec<u8> =
+            self.reconcile_aux(query, have_ids, need_ids, Some(exact_ranges))?;
         if output.len() == 1 {
             return Ok(None);
         }
@@ -166,6 +213,7 @@ where
         mut query: &[u8],
         have_ids: &mut Vec<Id>,
         need_ids: &mut Vec<Id>,
+        mut exact_ranges: Option<&mut Vec<ExactDiffRange>>,
     ) -> Result<Vec<u8>, Error> {
         self.last_timestamp_in = 0;
         self.last_timestamp_out = 0;
@@ -242,10 +290,13 @@ where
                         their_elems.insert(Id::from_byte_array(e));
                     }
 
+                    let mut range_have_ids: Vec<Id> = Vec::new();
+                    let mut range_need_ids: Vec<Id> = Vec::new();
                     self.storage.iterate(lower, upper, &mut |item: Item, _| {
                         let k: Id = item.id;
                         if !their_elems.contains(&k) {
                             have_ids.push(k);
+                            range_have_ids.push(k);
                         } else {
                             their_elems.remove(&k);
                         }
@@ -255,6 +306,17 @@ where
 
                     for k in their_elems.iter() {
                         need_ids.push(*k);
+                        range_need_ids.push(*k);
+                    }
+
+                    if let Some(exact_ranges) = exact_ranges.as_deref_mut() {
+                        if !range_have_ids.is_empty() || !range_need_ids.is_empty() {
+                            exact_ranges.push(ExactDiffRange {
+                                upper_bound: curr_bound,
+                                have_ids: range_have_ids,
+                                need_ids: range_need_ids,
+                            });
+                        }
                     }
 
                     if self.is_initiator {
@@ -593,6 +655,77 @@ mod tests {
                 ]),
             ]
         )
+    }
+
+    #[test]
+    fn test_reconcile_with_ids_ranges_collects_exact_bounds() {
+        let mut storage_client = NegentropyStorageVector::new();
+        storage_client
+            .insert(
+                1,
+                Id::from_byte_array([
+                    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+                    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+                    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+                ]),
+            )
+            .unwrap();
+        storage_client
+            .insert(
+                2,
+                Id::from_byte_array([
+                    0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
+                    0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
+                    0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb, 0xbb,
+                ]),
+            )
+            .unwrap();
+        storage_client.seal().unwrap();
+        let mut client = Negentropy::new(Storage::Borrowed(&storage_client), 0).unwrap();
+        let init_output = client.initiate().unwrap();
+
+        let mut storage_relay = NegentropyStorageVector::new();
+        storage_relay
+            .insert(
+                1,
+                Id::from_byte_array([
+                    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+                    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+                    0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa, 0xaa,
+                ]),
+            )
+            .unwrap();
+        storage_relay
+            .insert(
+                3,
+                Id::from_byte_array([
+                    0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+                    0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+                    0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc, 0xcc,
+                ]),
+            )
+            .unwrap();
+        storage_relay.seal().unwrap();
+        let mut relay = Negentropy::new(Storage::Borrowed(&storage_relay), 0).unwrap();
+        let reconcile_output = relay.reconcile(&init_output).unwrap();
+
+        let mut have_ids = Vec::new();
+        let mut need_ids = Vec::new();
+        let mut exact_ranges = Vec::new();
+        let next = client
+            .reconcile_with_ids_ranges(
+                &reconcile_output,
+                &mut have_ids,
+                &mut need_ids,
+                &mut exact_ranges,
+            )
+            .unwrap();
+
+        assert!(next.is_none());
+        assert_eq!(exact_ranges.len(), 1);
+        assert_eq!(exact_ranges[0].upper_bound.item.timestamp, u64::MAX);
+        assert_eq!(exact_ranges[0].have_ids, have_ids);
+        assert_eq!(exact_ranges[0].need_ids, need_ids);
     }
 }
 

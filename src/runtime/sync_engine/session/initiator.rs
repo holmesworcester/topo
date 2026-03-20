@@ -37,7 +37,7 @@ use super::connection_scope::{ConnectionRequestState, ConnectionResponseState};
 use crate::state::live_hints;
 
 use super::control_plane::{
-    observe_discovery_hints_for_peer, refill_wanted_requests, send_discovery_hints_from_have_ids,
+    observe_event_hints_for_peer, refill_wanted_requests, send_exact_diff_hints_from_ranges,
     send_forward_on_have_hints, send_initial_neg_open, send_response_credit_bytes,
 };
 use super::coordinator::PeerCoord;
@@ -60,7 +60,7 @@ fn should_treat_as_startup_control_abort(
 }
 
 /// Run sync as the initiator (client role) with dual streams.
-/// Control stream: NegOpen, NegMsg, DiscoveryHints, RequestIds, ResponseCredit
+/// Control stream: NegOpen, NegMsg, ExactDiffHints, DiscoveryHints, RequestIds, ResponseCredit
 /// Data stream: requested Event blobs
 ///
 /// Discovery is still round-scoped, but all event-data transfer is pull-only:
@@ -84,7 +84,9 @@ pub async fn run_sync_initiator<C, S, R>(
     shared_ingest: mpsc::Sender<IngestItem>,
     capture: Option<SyncRunCapture>,
     rx_capture: Option<SyncRunRxCapture>,
-    mut command_rx: Option<tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>>,
+    mut command_rx: Option<
+        tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>,
+    >,
     policy_rx: Option<tokio::sync::watch::Receiver<crate::shared::sync_control::TenantSyncPolicy>>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
@@ -154,7 +156,9 @@ where
     let mut next_round_due = Instant::now();
     let mut observed_initial_control_progress = false;
     let mut pending_round_reply: Option<
-        std::sync::mpsc::Sender<Result<crate::runtime::sync_control::ManualSyncRoundCapture, String>>,
+        std::sync::mpsc::Sender<
+            Result<crate::runtime::sync_control::ManualSyncRoundCapture, String>,
+        >,
     > = None;
 
     'session: loop {
@@ -180,13 +184,13 @@ where
                         if count > 0 {
                             last_activity = Instant::now();
                         }
-                        let id_hexes: Vec<String> =
-                            ids.iter().map(|id| hex::encode(id)).collect();
-                        let _ = reply.send(Ok(crate::runtime::sync_control::ManualSyncRequestResult {
-                            peer_id: peer_id.to_string(),
-                            requested_ids: id_hexes,
-                            reason: None,
-                        }));
+                        let id_hexes: Vec<String> = ids.iter().map(|id| hex::encode(id)).collect();
+                        let _ =
+                            reply.send(Ok(crate::runtime::sync_control::ManualSyncRequestResult {
+                                peer_id: peer_id.to_string(),
+                                requested_ids: id_hexes,
+                                reason: None,
+                            }));
                     }
                 }
             }
@@ -268,6 +272,7 @@ where
 
             let mut have_ids: Vec<Id> = Vec::new();
             let mut need_ids: Vec<Id> = Vec::new();
+            let mut exact_diff_ranges: Vec<negentropy::ExactDiffRange> = Vec::new();
             let mut round_observed_ids: Vec<crate::crypto::EventId> = Vec::new();
             let mut round_need_list_ids: Vec<crate::crypto::EventId> = Vec::new();
             let mut reconciliation_done = false;
@@ -293,7 +298,12 @@ where
                         last_activity = Instant::now();
                         round_rounds += 1;
                         rounds_total += 1;
-                        match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
+                        match neg.reconcile_with_ids_ranges(
+                            &msg,
+                            &mut have_ids,
+                            &mut need_ids,
+                            &mut exact_diff_ranges,
+                        )? {
                             Some(next_msg) => {
                                 control.send(&Frame::NegMsg { msg: next_msg }).await?;
                                 control.flush().await?;
@@ -323,24 +333,28 @@ where
                                         .iter()
                                         .map(|eid| hex::encode(eid))
                                         .collect();
-                                    let _ = reply.send(Ok(crate::runtime::sync_control::ManualSyncRoundCapture {
-                                        peer_id: peer_id.to_string(),
-                                        observed_ids: newly_hex,
-                                    }));
+                                    let _ = reply.send(Ok(
+                                        crate::runtime::sync_control::ManualSyncRoundCapture {
+                                            peer_id: peer_id.to_string(),
+                                            observed_ids: newly_hex,
+                                        },
+                                    ));
                                 }
                             }
                         }
-                        let sent_need_hints = send_discovery_hints_from_have_ids(
+                        let sent_need_hints = send_exact_diff_hints_from_ranges(
                             &mut control,
                             &timeline,
                             &store,
-                            &mut have_ids,
+                            &mut exact_diff_ranges,
                             &mut round_need_list_ids,
                         )
                         .await?;
                         if sent_need_hints > 0 {
                             last_activity = Instant::now();
                         }
+                        have_ids.clear();
+                        need_ids.clear();
                     }
                     Ok(Ok(Frame::RequestIds { ids })) => {
                         last_activity = Instant::now();
@@ -358,11 +372,9 @@ where
                     Ok(Ok(Frame::DiscoveryHints { hints })) => {
                         last_activity = Instant::now();
                         let hint_ids: Vec<_> = hints.iter().map(|h| h.event_id).collect();
-                        let _ = timeline.mark_need_list_received_many(
-                            &hint_ids,
-                            current_timestamp_ms(),
-                        );
-                        let observed = observe_discovery_hints_for_peer(
+                        let _ = timeline
+                            .mark_need_list_received_many(&hint_ids, current_timestamp_ms());
+                        let observed = observe_event_hints_for_peer(
                             &wanted,
                             &timeline,
                             recorded_by,
@@ -374,6 +386,30 @@ where
                         if observed > 0 {
                             info!(
                                 "Observed {} discovery hints from peer {} during reconciliation",
+                                observed, peer_id
+                            );
+                        }
+                    }
+                    Ok(Ok(Frame::ExactDiffHints {
+                        upper_bound: _,
+                        hints,
+                    })) => {
+                        last_activity = Instant::now();
+                        let hint_ids: Vec<_> = hints.iter().map(|h| h.event_id).collect();
+                        let _ = timeline
+                            .mark_need_list_received_many(&hint_ids, current_timestamp_ms());
+                        let observed = observe_event_hints_for_peer(
+                            &wanted,
+                            &timeline,
+                            recorded_by,
+                            peer_id,
+                            reconcile_started_at_ms,
+                            &hints,
+                            &mut round_observed_ids,
+                        )?;
+                        if observed > 0 {
+                            info!(
+                                "Observed {} exact diff hints from peer {} during reconciliation",
                                 observed, peer_id
                             );
                         }
@@ -431,43 +467,11 @@ where
                     }
                     Err(_) => {}
                 }
-
-                let need_hints: Vec<crate::protocol::DiscoveryHint> = need_ids
-                    .drain(..)
-                    .map(|neg_id| {
-                        let event_id = crate::protocol::neg_id_to_event_id(&neg_id);
-                        match store.get_shared_summary(&event_id) {
-                            Ok(Some(summary)) => crate::protocol::DiscoveryHint {
-                                event_id: summary.event_id,
-                                semantic_type_code: summary.semantic_type_code,
-                                encoded_size_bytes: summary.encoded_size_bytes,
-                            },
-                            _ => crate::protocol::DiscoveryHint {
-                                event_id,
-                                semantic_type_code: 0,
-                                encoded_size_bytes: 0,
-                            },
-                        }
-                    })
-                    .collect();
-                let observed_need_ids = observe_discovery_hints_for_peer(
-                    &wanted,
-                    &timeline,
-                    recorded_by,
-                    peer_id,
-                    reconcile_started_at_ms,
-                    &need_hints,
-                    &mut round_observed_ids,
-                )?;
-                if observed_need_ids > 0 {
-                    info!(
-                        "Observed {} wanted IDs from peer {} during reconciliation",
-                        observed_need_ids, peer_id
-                    );
-                }
                 let auto_requests = policy_rx
                     .as_ref()
-                    .map(|rx| rx.borrow().requests == crate::shared::sync_control::SyncPolicyMode::Auto)
+                    .map(|rx| {
+                        rx.borrow().requests == crate::shared::sync_control::SyncPolicyMode::Auto
+                    })
                     .unwrap_or(true);
                 if auto_requests {
                     let (requested_now, _) = refill_wanted_requests(
@@ -644,9 +648,8 @@ where
             Ok(Ok(Frame::DiscoveryHints { hints })) => {
                 last_activity = Instant::now();
                 let hint_ids: Vec<_> = hints.iter().map(|h| h.event_id).collect();
-                let _ =
-                    timeline.mark_need_list_received_many(&hint_ids, current_timestamp_ms());
-                let observed = observe_discovery_hints_for_peer(
+                let _ = timeline.mark_need_list_received_many(&hint_ids, current_timestamp_ms());
+                let observed = observe_event_hints_for_peer(
                     &wanted,
                     &timeline,
                     recorded_by,
@@ -658,6 +661,29 @@ where
                 if observed > 0 {
                     info!(
                         "Observed {} discovery hints from peer {} between rounds",
+                        observed, peer_id
+                    );
+                }
+            }
+            Ok(Ok(Frame::ExactDiffHints {
+                upper_bound: _,
+                hints,
+            })) => {
+                last_activity = Instant::now();
+                let hint_ids: Vec<_> = hints.iter().map(|h| h.event_id).collect();
+                let _ = timeline.mark_need_list_received_many(&hint_ids, current_timestamp_ms());
+                let observed = observe_event_hints_for_peer(
+                    &wanted,
+                    &timeline,
+                    recorded_by,
+                    peer_id,
+                    current_timestamp_ms(),
+                    &hints,
+                    &mut Vec::new(),
+                )?;
+                if observed > 0 {
+                    info!(
+                        "Observed {} exact diff hints from peer {} between rounds",
                         observed, peer_id
                     );
                 }

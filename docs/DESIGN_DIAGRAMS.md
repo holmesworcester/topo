@@ -244,7 +244,7 @@ flowchart TD
 - `runtime::supervisor::RuntimeSupervisor`: single owner for long-lived runtime workers (writer, accept loop, unified target dispatcher, target ingress workers).
 - `service.rs helpers`: `open_db_*`, node status helpers, intro transport helper entry points.
 - `Persist + enqueue`: phase 1 persists events/recorded/sync state and enqueues `project_queue`.
-- `Sync control`: sync control stream messages including `NegOpen`, `NegMsg`, `DiscoveryHints`, `RequestIds`, and `ResponseCredit`.
+- `Sync control`: sync control stream messages including `NegOpen`, `NegMsg`, `ExactDiffHints`, live `DiscoveryHints`, `RequestIds`, and `ResponseCredit`.
 - `Sync data`: sync data stream frames (`Event`).
 - `Shared event send`: `Store::get_shared(events) -> Frame::Event`.
 - `Projection tables`: projected read models (`messages`, `users`, `peers`, `channels`).

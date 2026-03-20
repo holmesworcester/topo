@@ -1,6 +1,6 @@
 use crate::crypto::EventId;
 use crate::event_modules::EVENT_MAX_BLOB_BYTES;
-use negentropy::Id;
+use negentropy::{Bound, Id};
 
 /// Convert negentropy Id to our EventId
 pub fn neg_id_to_event_id(id: &Id) -> EventId {
@@ -13,6 +13,7 @@ pub const MSG_TYPE_NEG_MSG: u8 = 0x11; // Negentropy response
 pub const MSG_TYPE_REQUEST_IDS: u8 = 0x12; // Sink request: source should send these IDs
 pub const MSG_TYPE_RESPONSE_CREDIT: u8 = 0x13; // Source-advertised response byte credit
 pub const MSG_TYPE_DISCOVERY_HINTS: u8 = 0x14; // Discovery hint: peer is missing these IDs
+pub const MSG_TYPE_EXACT_DIFF_HINTS: u8 = 0x15; // Exact diff metadata for one negentropy range
 pub const MSG_TYPE_EVENT: u8 = 0x03; // Event blob (variable length)
 pub const MSG_TYPE_INTRO_OFFER: u8 = 0x30; // Intro offer for hole punching
 
@@ -20,13 +21,27 @@ pub const MSG_TYPE_INTRO_OFFER: u8 = 0x30; // Intro offer for hole punching
 const MAX_NEG_MSG_BYTES: usize = 4 * 1024 * 1024;
 /// Max number of IDs or discovery hints carried in one control-plane frame.
 const MAX_ID_LIST_ENTRIES: usize = 100_000;
+const MAX_BOUND_ID_PREFIX_BYTES: usize = 32;
 const DISCOVERY_HINT_WIRE_BYTES: usize = 32 + 1 + 4;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NegentropyBoundWire {
+    pub timestamp: u64,
+    pub id_prefix: Vec<u8>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct DiscoveryHint {
     pub event_id: EventId,
     pub semantic_type_code: u8,
     pub encoded_size_bytes: u32,
+}
+
+pub fn neg_bound_to_wire(bound: &Bound) -> NegentropyBoundWire {
+    NegentropyBoundWire {
+        timestamp: bound.item.timestamp,
+        id_prefix: bound.item.id[..bound.id_len].to_vec(),
+    }
 }
 
 /// Sync protocol messages
@@ -42,6 +57,11 @@ pub enum Frame {
     ResponseCredit { bytes: u32 },
     /// Discovery hints describing events the peer appears to be missing.
     DiscoveryHints { hints: Vec<DiscoveryHint> },
+    /// Exact diff metadata for one reconciled negentropy range.
+    ExactDiffHints {
+        upper_bound: NegentropyBoundWire,
+        hints: Vec<DiscoveryHint>,
+    },
     /// Send full event blob (variable length)
     Event { blob: Vec<u8> },
     /// Intro offer for QUIC hole punching via a third peer
@@ -140,6 +160,65 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
                 });
             }
             Ok((Frame::DiscoveryHints { hints }, total_size))
+        }
+        MSG_TYPE_EXACT_DIFF_HINTS => {
+            if input.len() < 14 {
+                return Err(ParseError::InsufficientData);
+            }
+            let timestamp = u64::from_le_bytes([
+                input[1], input[2], input[3], input[4], input[5], input[6], input[7], input[8],
+            ]);
+            let prefix_len = input[9] as usize;
+            if prefix_len > MAX_BOUND_ID_PREFIX_BYTES {
+                return Err(ParseError::InvalidBoundPrefixLen(prefix_len));
+            }
+            let count_start = 10 + prefix_len;
+            if input.len() < count_start + 4 {
+                return Err(ParseError::InsufficientData);
+            }
+            let id_prefix = input[10..count_start].to_vec();
+            let count = u32::from_le_bytes([
+                input[count_start],
+                input[count_start + 1],
+                input[count_start + 2],
+                input[count_start + 3],
+            ]) as usize;
+            if count > MAX_ID_LIST_ENTRIES {
+                return Err(ParseError::TooManyIds(count));
+            }
+            let hints_start = count_start + 4;
+            let total_size = hints_start + count * DISCOVERY_HINT_WIRE_BYTES;
+            if input.len() < total_size {
+                return Err(ParseError::InsufficientData);
+            }
+            let mut hints = Vec::with_capacity(count);
+            for i in 0..count {
+                let start = hints_start + i * DISCOVERY_HINT_WIRE_BYTES;
+                let mut event_id = [0u8; 32];
+                event_id.copy_from_slice(&input[start..start + 32]);
+                let semantic_type_code = input[start + 32];
+                let encoded_size_bytes = u32::from_le_bytes([
+                    input[start + 33],
+                    input[start + 34],
+                    input[start + 35],
+                    input[start + 36],
+                ]);
+                hints.push(DiscoveryHint {
+                    event_id,
+                    semantic_type_code,
+                    encoded_size_bytes,
+                });
+            }
+            Ok((
+                Frame::ExactDiffHints {
+                    upper_bound: NegentropyBoundWire {
+                        timestamp,
+                        id_prefix,
+                    },
+                    hints,
+                },
+                total_size,
+            ))
         }
         MSG_TYPE_RESPONSE_CREDIT => {
             if input.len() < 5 {
@@ -248,6 +327,22 @@ pub fn encode_frame(msg: &Frame) -> Vec<u8> {
             }
             buf
         }
+        Frame::ExactDiffHints { upper_bound, hints } => {
+            let mut buf = Vec::with_capacity(
+                14 + upper_bound.id_prefix.len() + hints.len() * DISCOVERY_HINT_WIRE_BYTES,
+            );
+            buf.push(MSG_TYPE_EXACT_DIFF_HINTS);
+            buf.extend_from_slice(&upper_bound.timestamp.to_le_bytes());
+            buf.push(u8::try_from(upper_bound.id_prefix.len()).unwrap_or(u8::MAX));
+            buf.extend_from_slice(&upper_bound.id_prefix);
+            buf.extend_from_slice(&(hints.len() as u32).to_le_bytes());
+            for hint in hints {
+                buf.extend_from_slice(&hint.event_id);
+                buf.push(hint.semantic_type_code);
+                buf.extend_from_slice(&hint.encoded_size_bytes.to_le_bytes());
+            }
+            buf
+        }
         Frame::ResponseCredit { bytes } => {
             let mut buf = Vec::with_capacity(5);
             buf.push(MSG_TYPE_RESPONSE_CREDIT);
@@ -293,6 +388,7 @@ pub enum ParseError {
     EventTooLarge(usize),
     NegMessageTooLarge(usize),
     TooManyIds(usize),
+    InvalidBoundPrefixLen(usize),
 }
 
 impl std::fmt::Display for ParseError {
@@ -305,6 +401,9 @@ impl std::fmt::Display for ParseError {
                 write!(f, "negentropy message too large: {} bytes", len)
             }
             ParseError::TooManyIds(count) => write!(f, "too many IDs in control frame: {}", count),
+            ParseError::InvalidBoundPrefixLen(len) => {
+                write!(f, "invalid negentropy bound prefix length: {}", len)
+            }
         }
     }
 }
@@ -534,5 +633,46 @@ mod tests {
         let (parsed, consumed) = parse_frame(&encoded).unwrap();
         assert_eq!(consumed, encoded.len());
         assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_exact_diff_hints_roundtrip() {
+        let msg = Frame::ExactDiffHints {
+            upper_bound: NegentropyBoundWire {
+                timestamp: 1234,
+                id_prefix: vec![0xAA, 0xBB, 0xCC],
+            },
+            hints: vec![
+                DiscoveryHint {
+                    event_id: [0x33; 32],
+                    semantic_type_code: 4,
+                    encoded_size_bytes: 512,
+                },
+                DiscoveryHint {
+                    event_id: [0x44; 32],
+                    semantic_type_code: 9,
+                    encoded_size_bytes: 2048,
+                },
+            ],
+        };
+        let encoded = encode_frame(&msg);
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_exact_diff_hints_rejects_oversized_bound_prefix() {
+        let mut encoded = vec![MSG_TYPE_EXACT_DIFF_HINTS];
+        encoded.extend_from_slice(&42u64.to_le_bytes());
+        encoded.push((MAX_BOUND_ID_PREFIX_BYTES + 1) as u8);
+        encoded.extend_from_slice(&[0u8; MAX_BOUND_ID_PREFIX_BYTES + 1]);
+        encoded.extend_from_slice(&0u32.to_le_bytes());
+        assert_eq!(
+            parse_frame(&encoded),
+            Err(ParseError::InvalidBoundPrefixLen(
+                MAX_BOUND_ID_PREFIX_BYTES + 1
+            ))
+        );
     }
 }
