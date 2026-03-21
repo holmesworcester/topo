@@ -3655,10 +3655,6 @@ fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> S
                 )
             }
         }
-        "ResponseCredit" => {
-            let bytes = v["bytes"].as_u64().unwrap_or(0);
-            format!(" detail=response_credit(bytes={})", bytes)
-        }
         "Event" => {
             let eid = v["event_id"].as_str().unwrap_or("");
             let blob_len = v["blob_len"].as_u64().unwrap_or(0);

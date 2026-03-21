@@ -27,9 +27,6 @@ async fn drive_empty_inbound_round(peer: &mut crate::fake_session_io::FakePeerSi
         else {
             break;
         };
-        if matches!(frame, Frame::ResponseCredit { .. }) {
-            continue;
-        }
         let Frame::NegMsg { msg } = frame else {
             panic!("expected NegMsg from responder");
         };

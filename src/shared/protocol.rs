@@ -11,7 +11,6 @@ pub fn neg_id_to_event_id(id: &Id) -> EventId {
 pub const MSG_TYPE_NEG_OPEN: u8 = 0x10; // Initial negentropy message
 pub const MSG_TYPE_NEG_MSG: u8 = 0x11; // Negentropy response
 pub const MSG_TYPE_REQUEST_IDS: u8 = 0x12; // Sink request: source should send these IDs
-pub const MSG_TYPE_RESPONSE_CREDIT: u8 = 0x13; // Source-advertised response byte credit
 pub const MSG_TYPE_DISCOVERY_HINTS: u8 = 0x14; // Discovery hint: peer is missing these IDs
 pub const MSG_TYPE_EVENT: u8 = 0x03; // Event blob (variable length)
 pub const MSG_TYPE_INTRO_OFFER: u8 = 0x30; // Intro offer for hole punching
@@ -39,8 +38,6 @@ pub enum Frame {
     NegMsg { msg: Vec<u8> },
     /// Exact event IDs the sink is requesting from the source.
     RequestIds { ids: Vec<[u8; 32]> },
-    /// Source-advertised response credit in encoded event bytes.
-    ResponseCredit { bytes: u32 },
     /// Discovery hints describing events the peer appears to be missing.
     DiscoveryHints {
         priority_lane: u8,
@@ -163,13 +160,6 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
                 total_size,
             ))
         }
-        MSG_TYPE_RESPONSE_CREDIT => {
-            if input.len() < 5 {
-                return Err(ParseError::InsufficientData);
-            }
-            let bytes = u32::from_le_bytes([input[1], input[2], input[3], input[4]]);
-            Ok((Frame::ResponseCredit { bytes }, 5))
-        }
         MSG_TYPE_EVENT => {
             // Variable length: type(1) + len(4) + blob(len)
             if input.len() < 5 {
@@ -273,12 +263,6 @@ pub fn encode_frame(msg: &Frame) -> Vec<u8> {
                 buf.extend_from_slice(&hint.encoded_size_bytes.to_le_bytes());
                 buf.extend_from_slice(&hint.created_at_ms.to_le_bytes());
             }
-            buf
-        }
-        Frame::ResponseCredit { bytes } => {
-            let mut buf = Vec::with_capacity(5);
-            buf.push(MSG_TYPE_RESPONSE_CREDIT);
-            buf.extend_from_slice(&bytes.to_le_bytes());
             buf
         }
         Frame::Event { blob } => {
@@ -530,15 +514,6 @@ mod tests {
         } else {
             panic!("expected RequestIds");
         }
-    }
-
-    #[test]
-    fn test_response_credit_roundtrip() {
-        let msg = Frame::ResponseCredit { bytes: 42 };
-        let encoded = encode_frame(&msg);
-        let (parsed, consumed) = parse_frame(&encoded).unwrap();
-        assert_eq!(consumed, encoded.len());
-        assert_eq!(parsed, msg);
     }
 
     #[test]

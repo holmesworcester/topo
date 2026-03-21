@@ -96,7 +96,6 @@ async fn run_dependency_control_loop(
                     }
                     Frame::NegOpen { .. }
                     | Frame::NegMsg { .. }
-                    | Frame::ResponseCredit { .. }
                     | Frame::DiscoveryHints { .. }
                     | Frame::IntroOffer { .. }
                     | Frame::Event { .. } => {}

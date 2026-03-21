@@ -442,7 +442,7 @@ mod tests {
     #[tokio::test]
     async fn send_control_rejects_trailing_bytes() {
         let (mut parts, _control_state, _data_send_state) = build_io(vec![], vec![]);
-        let mut frame = encode_frame(&Frame::ResponseCredit { bytes: 7 });
+        let mut frame = encode_frame(&Frame::RequestIds { ids: vec![[7u8; 32]] });
         frame.push(0);
 
         let err = parts

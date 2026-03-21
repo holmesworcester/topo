@@ -1,11 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::state::db::queue::{
-    PRIORITY_LANE_FOREGROUND, PRIORITY_LANE_TIER_DAY, PRIORITY_LANE_TIER_HOUR,
-    PRIORITY_LANE_TIER_MONTH, PRIORITY_LANE_TIER_WEEK,
-};
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncWindowKind {
     Full = 0,
@@ -136,35 +131,6 @@ pub fn mark_outbound_window_completed(db_path: &str, peer_id: &str, window: Sync
             planner.next_idx = (planner.next_idx + 1) % TIER_ORDER.len();
             window.kind != SyncWindowKind::Full
         }
-    }
-}
-
-pub fn priority_lane_for_window_kind(kind: SyncWindowKind) -> i64 {
-    match kind {
-        SyncWindowKind::LastHour => PRIORITY_LANE_TIER_HOUR,
-        SyncWindowKind::LastDay => PRIORITY_LANE_TIER_DAY,
-        SyncWindowKind::LastWeek => PRIORITY_LANE_TIER_WEEK,
-        SyncWindowKind::LastMonth => PRIORITY_LANE_TIER_MONTH,
-        SyncWindowKind::LastYear | SyncWindowKind::Full => PRIORITY_LANE_FOREGROUND,
-    }
-}
-
-pub fn should_hunt_blockers_for_window(kind: SyncWindowKind) -> bool {
-    !matches!(kind, SyncWindowKind::Full)
-}
-
-pub fn priority_lane_for_event_age(now_ms: i64, created_at_ms: i64) -> i64 {
-    let age_ms = now_ms.saturating_sub(created_at_ms);
-    if age_ms <= HOUR_MS {
-        PRIORITY_LANE_TIER_HOUR
-    } else if age_ms <= DAY_MS {
-        PRIORITY_LANE_TIER_DAY
-    } else if age_ms <= WEEK_MS {
-        PRIORITY_LANE_TIER_WEEK
-    } else if age_ms <= MONTH_MS {
-        PRIORITY_LANE_TIER_MONTH
-    } else {
-        PRIORITY_LANE_FOREGROUND
     }
 }
 
