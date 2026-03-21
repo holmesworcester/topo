@@ -1,9 +1,12 @@
 //! Saturating valid-event sender benchmark.
 //!
-//! Opens one live QUIC session, then the source pushes valid message events on
-//! the data stream as fast as the transport will take them. This bypasses
-//! discovery, request planning, and credit pacing so we can isolate whether
-//! projection/import interferes with durable receipt.
+//! Opens one live QUIC session and sends valid message events over the data
+//! stream with two sender modes:
+//! - open-loop: source pushes blobs as fast as the transport will take them
+//! - watermarked: sink drives flow with request and credit hysteresis
+//!
+//! Both modes bypass discovery and the normal wanted planner so we can isolate
+//! how receipt, import, and projection behave once valid events are in flight.
 
 use std::collections::BTreeSet;
 use std::error::Error;
@@ -21,6 +24,10 @@ use topo::protocol::{encode_frame, parse_frame, Frame};
 use topo::testutil::{create_dynamic_endpoint_for_peer, Peer};
 use topo::transport::{
     accept_session_provider, dial_session_provider, multi_workspace::transport_sni, SessionEnvelope,
+};
+use topo::tuning::{
+    response_credit_high_watermark_bytes, response_credit_low_watermark_bytes,
+    wanted_high_watermark, wanted_low_watermark, wanted_refill_quantum,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -55,6 +62,12 @@ impl Drop for ScopedEnv {
 enum ProjectionMode {
     ReceiptOnly,
     RecordedAndProjected,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SenderMode {
+    OpenLoop,
+    Watermarked,
 }
 
 #[derive(Debug)]
@@ -99,6 +112,10 @@ fn current_timestamp_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64
+}
+
+fn is_peer_stopped_error(err: &dyn std::fmt::Display) -> bool {
+    err.to_string().contains("sending stopped by peer")
 }
 
 fn write_summary(summary_key: &str, summary: &str) {
@@ -342,7 +359,7 @@ where
     }
 }
 
-async fn run_source_session(
+async fn run_source_session_open_loop(
     alice_db: String,
     session: SessionEnvelope,
     event_ids: Vec<EventId>,
@@ -370,7 +387,100 @@ async fn run_source_session(
     Ok(sent_bytes)
 }
 
-async fn run_sink_session(
+async fn run_source_session_watermarked(
+    alice_db: String,
+    session: SessionEnvelope,
+    expected_ids: Vec<EventId>,
+) -> TestResult<u64> {
+    use std::collections::VecDeque;
+
+    let mut parts = session.io.split();
+    let db = open_connection(&alice_db)?;
+    let store = Store::new(&db);
+    let mut available_credit_bytes = 0usize;
+    let mut pending_ids = VecDeque::new();
+    let mut sent_events = 0usize;
+    let mut sent_bytes = 0u64;
+    let expected_events = expected_ids.len();
+
+    while sent_events < expected_events {
+        while !pending_ids.is_empty() && available_credit_bytes > 0 && sent_events < expected_events
+        {
+            let mut fetch_chunk = Vec::with_capacity(SEND_FLUSH_BATCH);
+            while fetch_chunk.len() < SEND_FLUSH_BATCH {
+                let Some(event_id) = pending_ids.pop_front() else {
+                    break;
+                };
+                fetch_chunk.push(event_id);
+            }
+            if fetch_chunk.is_empty() {
+                break;
+            }
+
+            let blobs = store.get_shared_batch(&fetch_chunk)?;
+            let mut sent_any = false;
+            let mut iter = fetch_chunk.into_iter();
+            while let Some(event_id) = iter.next() {
+                let Some(blob) = blobs.get(&event_id) else {
+                    continue;
+                };
+                if blob.len() > available_credit_bytes {
+                    let mut unsent = vec![event_id];
+                    unsent.extend(iter);
+                    for queued in unsent.into_iter().rev() {
+                        pending_ids.push_front(queued);
+                    }
+                    break;
+                }
+                parts
+                    .data_send
+                    .send(&encode_frame(&Frame::Event { blob: blob.clone() }))
+                    .await?;
+                available_credit_bytes = available_credit_bytes.saturating_sub(blob.len());
+                sent_events += 1;
+                sent_bytes = sent_bytes.saturating_add(blob.len() as u64);
+                sent_any = true;
+            }
+
+            if sent_any {
+                parts.data_send.flush().await?;
+            } else {
+                break;
+            }
+        }
+
+        if sent_events >= expected_events {
+            break;
+        }
+
+        let frame_bytes = parts.control.recv().await?;
+        let (frame, consumed) = parse_frame(&frame_bytes)?;
+        if consumed != frame_bytes.len() {
+            return Err(Box::new(std::io::Error::other(format!(
+                "control frame had trailing bytes: consumed={}, total={}",
+                consumed,
+                frame_bytes.len()
+            ))));
+        }
+        match frame {
+            Frame::ResponseCredit { bytes } => {
+                available_credit_bytes = available_credit_bytes.saturating_add(bytes as usize);
+            }
+            Frame::RequestIds { ids } => {
+                pending_ids.extend(ids);
+            }
+            other => {
+                return Err(Box::new(std::io::Error::other(format!(
+                    "unexpected control frame on source: {other:?}"
+                ))));
+            }
+        }
+    }
+
+    Ok(sent_bytes)
+}
+
+async fn run_sink_session_open_loop(
     bob_identity: String,
     session: SessionEnvelope,
     expected_events: usize,
@@ -415,8 +525,166 @@ async fn run_sink_session(
     Ok(received)
 }
 
+async fn run_sink_session_watermarked(
+    bob_identity: String,
+    requested_ids: Vec<EventId>,
+    session: SessionEnvelope,
+    ingest_tx: mpsc::Sender<IngestItem>,
+) -> TestResult<usize> {
+    let mut parts = session.io.split();
+    let expected_events = requested_ids.len();
+    let source_tag = format!("raw_saturating:{}", session.peer_id);
+    let credit_high = response_credit_high_watermark_bytes().max(1);
+    let credit_low = response_credit_low_watermark_bytes().min(credit_high.saturating_sub(1));
+    let wanted_high = wanted_high_watermark().max(1);
+    let wanted_low = wanted_low_watermark().min(wanted_high.saturating_sub(1));
+    let request_quantum = wanted_refill_quantum().max(1);
+
+    let initial_grant = credit_high.min(u32::MAX as usize) as u32;
+    parts
+        .control
+        .send(&encode_frame(&Frame::ResponseCredit {
+            bytes: initial_grant,
+        }))
+        .await?;
+
+    let mut credit_remaining = initial_grant as usize;
+    let mut next_request_index = 0usize;
+    let mut outstanding_requests = 0usize;
+    while outstanding_requests < wanted_high && next_request_index < requested_ids.len() {
+        let available_slots = wanted_high.saturating_sub(outstanding_requests);
+        let chunk_len = available_slots
+            .min(request_quantum)
+            .min(SEND_FLUSH_BATCH)
+            .min(requested_ids.len().saturating_sub(next_request_index));
+        if chunk_len == 0 {
+            break;
+        }
+        parts
+            .control
+            .send(&encode_frame(&Frame::RequestIds {
+                ids: requested_ids[next_request_index..next_request_index + chunk_len].to_vec(),
+            }))
+            .await?;
+        outstanding_requests += chunk_len;
+        next_request_index += chunk_len;
+    }
+    parts.control.flush().await?;
+
+    let mut received_events = 0usize;
+    let mut control_open = true;
+    while received_events < expected_events {
+        let frame_bytes = parts.data_recv.recv().await?;
+        let (frame, consumed) = parse_frame(&frame_bytes)?;
+        if consumed != frame_bytes.len() {
+            return Err(Box::new(std::io::Error::other(format!(
+                "data frame had trailing bytes: consumed={}, total={}",
+                consumed,
+                frame_bytes.len()
+            ))));
+        }
+        match frame {
+            Frame::Event { blob } => {
+                let blob_len = blob.len();
+                ingest_tx
+                    .send((
+                        [0u8; 32],
+                        blob,
+                        bob_identity.clone(),
+                        source_tag.clone(),
+                        current_timestamp_ms(),
+                    ))
+                    .await
+                    .map_err(|_| std::io::Error::other("ingest channel closed"))?;
+                received_events += 1;
+                outstanding_requests = outstanding_requests.saturating_sub(1);
+                credit_remaining = credit_remaining.saturating_sub(blob_len);
+
+                let mut sent_control = false;
+                if control_open
+                    && received_events < expected_events
+                    && credit_remaining <= credit_low
+                {
+                    let grant = credit_high
+                        .saturating_sub(credit_remaining)
+                        .min(u32::MAX as usize);
+                    if grant > 0 {
+                        match parts
+                            .control
+                            .send(&encode_frame(&Frame::ResponseCredit {
+                                bytes: grant as u32,
+                            }))
+                            .await
+                        {
+                            Ok(()) => {
+                                credit_remaining = credit_remaining.saturating_add(grant);
+                                sent_control = true;
+                            }
+                            Err(err) if is_peer_stopped_error(&err) => {
+                                control_open = false;
+                            }
+                            Err(err) => return Err(Box::new(err)),
+                        }
+                    }
+                }
+
+                while control_open
+                    && outstanding_requests <= wanted_low
+                    && next_request_index < requested_ids.len()
+                {
+                    let available_slots = wanted_high.saturating_sub(outstanding_requests);
+                    let chunk_len = available_slots
+                        .min(request_quantum)
+                        .min(SEND_FLUSH_BATCH)
+                        .min(requested_ids.len().saturating_sub(next_request_index));
+                    if chunk_len == 0 {
+                        break;
+                    }
+                    match parts
+                        .control
+                        .send(&encode_frame(&Frame::RequestIds {
+                            ids: requested_ids[next_request_index..next_request_index + chunk_len]
+                                .to_vec(),
+                        }))
+                        .await
+                    {
+                        Ok(()) => {
+                            next_request_index += chunk_len;
+                            outstanding_requests += chunk_len;
+                            sent_control = true;
+                        }
+                        Err(err) if is_peer_stopped_error(&err) => {
+                            control_open = false;
+                            break;
+                        }
+                        Err(err) => return Err(Box::new(err)),
+                    }
+                }
+
+                if control_open && sent_control {
+                    match parts.control.flush().await {
+                        Ok(()) => {}
+                        Err(err) if is_peer_stopped_error(&err) => {
+                            control_open = false;
+                        }
+                        Err(err) => return Err(Box::new(err)),
+                    }
+                }
+            }
+            other => {
+                return Err(Box::new(std::io::Error::other(format!(
+                    "unexpected frame on sink data stream: {other:?}"
+                ))));
+            }
+        }
+    }
+
+    Ok(received_events)
+}
+
 async fn run_saturating_valid_event_sync(
     message_count: usize,
+    sender_mode: SenderMode,
     projection_mode: ProjectionMode,
     timeout: Duration,
 ) -> TestResult<SaturatingMeasurement> {
@@ -499,13 +767,42 @@ async fn run_saturating_valid_event_sync(
     let projected_db = bob.db_path.clone();
     let projected_by = bob.identity.clone();
 
-    let source_future = run_source_session(alice.db_path.clone(), server_session, event_ids);
-    let sink_future = run_sink_session(
-        bob.identity.clone(),
-        client_session,
-        expected_events,
-        ingest_tx,
-    );
+    let source_db = alice.db_path.clone();
+    let source_event_ids = event_ids.clone();
+    let source_future = async move {
+        match sender_mode {
+            SenderMode::OpenLoop => {
+                run_source_session_open_loop(source_db, server_session, source_event_ids).await
+            }
+            SenderMode::Watermarked => {
+                run_source_session_watermarked(source_db, server_session, source_event_ids).await
+            }
+        }
+    };
+    let sink_identity = bob.identity.clone();
+    let sink_requested_ids = event_ids.clone();
+    let sink_future = async move {
+        match sender_mode {
+            SenderMode::OpenLoop => {
+                run_sink_session_open_loop(
+                    sink_identity,
+                    client_session,
+                    expected_events,
+                    ingest_tx,
+                )
+                .await
+            }
+            SenderMode::Watermarked => {
+                run_sink_session_watermarked(
+                    sink_identity,
+                    sink_requested_ids,
+                    client_session,
+                    ingest_tx,
+                )
+                .await
+            }
+        }
+    };
     let durable_wait = async {
         let stats = wait_for_receipt_spool_count(&bob.db_path, expected_events, timeout).await;
         (stats, current_timestamp_ms())
@@ -648,6 +945,7 @@ fn run_bench(
     summary_key: &str,
     title: &str,
     message_count: usize,
+    sender_mode: SenderMode,
     projection_mode: ProjectionMode,
     timeout: Duration,
 ) {
@@ -655,6 +953,7 @@ fn run_bench(
     let measurement = runtime
         .block_on(run_saturating_valid_event_sync(
             message_count,
+            sender_mode,
             projection_mode,
             timeout,
         ))
@@ -668,6 +967,7 @@ fn perf_saturating_valid_events_10k_receipt_only() {
         "raw_saturating_valid_events_perf_test.perf_saturating_valid_events_10k_receipt_only",
         "10k saturating valid events (receipt only)",
         10_000,
+        SenderMode::OpenLoop,
         ProjectionMode::ReceiptOnly,
         Duration::from_secs(180),
     );
@@ -679,6 +979,31 @@ fn perf_saturating_valid_events_10k_projected() {
         "raw_saturating_valid_events_perf_test.perf_saturating_valid_events_10k_projected",
         "10k saturating valid events (recorded + projected)",
         10_000,
+        SenderMode::OpenLoop,
+        ProjectionMode::RecordedAndProjected,
+        Duration::from_secs(180),
+    );
+}
+
+#[test]
+fn perf_saturating_valid_events_10k_receipt_only_watermarked() {
+    run_bench(
+        "raw_saturating_valid_events_perf_test.perf_saturating_valid_events_10k_receipt_only_watermarked",
+        "10k saturating valid events (receipt only, watermarked sender)",
+        10_000,
+        SenderMode::Watermarked,
+        ProjectionMode::ReceiptOnly,
+        Duration::from_secs(180),
+    );
+}
+
+#[test]
+fn perf_saturating_valid_events_10k_projected_watermarked() {
+    run_bench(
+        "raw_saturating_valid_events_perf_test.perf_saturating_valid_events_10k_projected_watermarked",
+        "10k saturating valid events (recorded + projected, watermarked sender)",
+        10_000,
+        SenderMode::Watermarked,
         ProjectionMode::RecordedAndProjected,
         Duration::from_secs(180),
     );
@@ -691,6 +1016,7 @@ fn perf_saturating_valid_events_50k_receipt_only() {
         "raw_saturating_valid_events_perf_test.perf_saturating_valid_events_50k_receipt_only",
         "50k saturating valid events (receipt only)",
         50_000,
+        SenderMode::OpenLoop,
         ProjectionMode::ReceiptOnly,
         Duration::from_secs(600),
     );
@@ -703,6 +1029,33 @@ fn perf_saturating_valid_events_50k_projected() {
         "raw_saturating_valid_events_perf_test.perf_saturating_valid_events_50k_projected",
         "50k saturating valid events (recorded + projected)",
         50_000,
+        SenderMode::OpenLoop,
+        ProjectionMode::RecordedAndProjected,
+        Duration::from_secs(600),
+    );
+}
+
+#[test]
+#[ignore]
+fn perf_saturating_valid_events_50k_receipt_only_watermarked() {
+    run_bench(
+        "raw_saturating_valid_events_perf_test.perf_saturating_valid_events_50k_receipt_only_watermarked",
+        "50k saturating valid events (receipt only, watermarked sender)",
+        50_000,
+        SenderMode::Watermarked,
+        ProjectionMode::ReceiptOnly,
+        Duration::from_secs(600),
+    );
+}
+
+#[test]
+#[ignore]
+fn perf_saturating_valid_events_50k_projected_watermarked() {
+    run_bench(
+        "raw_saturating_valid_events_perf_test.perf_saturating_valid_events_50k_projected_watermarked",
+        "50k saturating valid events (recorded + projected, watermarked sender)",
+        50_000,
+        SenderMode::Watermarked,
         ProjectionMode::RecordedAndProjected,
         Duration::from_secs(600),
     );
