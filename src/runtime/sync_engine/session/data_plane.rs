@@ -19,7 +19,9 @@ use crate::protocol::Frame;
 use crate::runtime::memtrace;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
-use crate::tuning::{blob_drain_batch_size, low_mem_memtrace, response_send_quantum_bytes};
+use crate::tuning::{
+    blob_drain_batch_size, low_mem_memtrace, receipt_spool_defer_hash, response_send_quantum_bytes,
+};
 
 use super::connection_scope::{ConnectionResponseState, QueuedResponse};
 use super::logging::SyncRunRxCapture;
@@ -191,6 +193,7 @@ where
     R: StreamRecv + Send + 'static,
 {
     let memtrace_enabled = low_mem_memtrace();
+    let defer_hash = receipt_spool_defer_hash();
     let memtrace_file = std::env::var("LOW_MEM_MEMTRACE_FILE").ok();
     let (shutdown_tx, mut shutdown_rx) = oneshot::channel::<()>();
     let handle = tokio::spawn(async move {
@@ -209,10 +212,17 @@ where
                             events_received.fetch_add(1, Ordering::Relaxed);
                             bytes_received.fetch_add(blob.len() as u64, Ordering::Relaxed);
                             max_blob_size = max_blob_size.max(blob.len());
-                            let event_id = hash_event(&blob);
+                            let event_id = if defer_hash { [0u8; 32] } else { hash_event(&blob) };
                             if should_capture_rx_event_link(&blob) {
                                 if let Some(capture) = &rx_capture {
-                                    capture.record_event_id_b64(crate::crypto::event_id_to_base64(&event_id));
+                                    let capture_id = if defer_hash {
+                                        hash_event(&blob)
+                                    } else {
+                                        event_id
+                                    };
+                                    capture.record_event_id_b64(
+                                        crate::crypto::event_id_to_base64(&capture_id),
+                                    );
                                 }
                             }
                             if ingest_tx

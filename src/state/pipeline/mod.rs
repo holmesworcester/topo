@@ -3,21 +3,26 @@ mod effects;
 mod phases;
 
 use std::collections::HashMap;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use tokio::sync::mpsc;
 use tracing::{error, info, warn};
 
 use crate::contracts::event_pipeline_contract::IngestItem;
+use crate::crypto::hash_event;
 use crate::db::open_connection;
+use crate::db::receipt_spool::ReceiptSpool;
 use crate::db::store::{
     lookup_workspace_id, SQL_INSERT_EVENT, SQL_INSERT_NEG_ITEM, SQL_INSERT_RECORDED_EVENT,
 };
 use crate::event_modules::{self as events, registry};
 use crate::state::live_hints;
-use crate::tuning::{bulk_write_batch_cap, drain_batch_size, low_mem_mode, write_batch_cap};
+use crate::tuning::{
+    bulk_write_batch_cap, drain_batch_size, low_mem_mode, receipt_spool_import_enabled,
+    receipt_spool_import_idle_ms, write_batch_cap,
+};
 
 use self::effects::{
     run_post_commit_effects, PostCommitEffectsExecutor, SqlitePostCommitEffectsExecutor,
@@ -25,6 +30,13 @@ use self::effects::{
 use self::phases::{run_persist_phase, PersistPhaseOutput};
 
 pub use self::drain::drain_project_queue;
+
+fn current_timestamp_ms() -> i64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as i64
+}
 
 fn ingest_is_bulk(item: &IngestItem) -> bool {
     events::outer_semantic_type_code(&item.1) == Some(events::EVENT_TYPE_FILE_SLICE)
@@ -63,6 +75,180 @@ fn prewarm_workspace_cache(
         }
         if let Some(workspace_id) = lookup_workspace_id(db, recorded_by) {
             workspace_cache.insert(recorded_by.clone(), workspace_id);
+        }
+    }
+}
+
+fn begin_immediate_with_retry(db: &rusqlite::Connection) -> bool {
+    for attempt in 0..3 {
+        match db.execute("BEGIN IMMEDIATE", []) {
+            Ok(_) => return true,
+            Err(e) => {
+                warn!("BEGIN failed (attempt {}): {}", attempt + 1, e);
+                let _ = db.execute("ROLLBACK", []);
+                std::thread::sleep(Duration::from_millis(50 * (1 << attempt)));
+            }
+        }
+    }
+    false
+}
+
+fn materialize_receipt_spool_batch<E: PostCommitEffectsExecutor>(
+    db: &rusqlite::Connection,
+    receipt_spool: &ReceiptSpool,
+    reg: &'static registry::EventRegistry,
+    workspace_cache: &mut HashMap<String, String>,
+    neg_items_stmt: &mut rusqlite::Statement<'_>,
+    recorded_stmt: &mut rusqlite::Statement<'_>,
+    events_stmt: &mut rusqlite::Statement<'_>,
+    enqueue_stmt: &mut rusqlite::Statement<'_>,
+    effects_executor: &E,
+) -> rusqlite::Result<usize> {
+    let pending = receipt_spool
+        .load_pending_batch(write_batch_cap())
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    if pending.is_empty() {
+        return Ok(0);
+    }
+
+    let mut batch: Vec<IngestItem> = pending.iter().map(|row| row.item.clone()).collect();
+    let spool_ids: Vec<i64> = pending.iter().map(|row| row.spool_id).collect();
+    for (event_id, blob, _, _, _) in &mut batch {
+        if *event_id == [0u8; 32] {
+            *event_id = hash_event(blob);
+        }
+    }
+    prewarm_workspace_cache(db, &batch, workspace_cache);
+
+    if !begin_immediate_with_retry(db) {
+        return Ok(0);
+    }
+
+    let persist_output = run_persist_phase(
+        db,
+        &batch,
+        reg,
+        workspace_cache,
+        neg_items_stmt,
+        recorded_stmt,
+        events_stmt,
+        enqueue_stmt,
+    );
+    receipt_spool
+        .mark_materialized(&spool_ids, current_timestamp_ms())
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    commit_and_run_post_commit_effects(db, &persist_output, effects_executor, drain_batch_size())?;
+    receipt_spool
+        .prune_consumed_file()
+        .map_err(|e| rusqlite::Error::ToSqlConversionFailure(Box::new(e)))?;
+    Ok(persist_output.persisted_event_ids.len())
+}
+
+fn run_receipt_importer(
+    db_path: String,
+    writer_done: Arc<AtomicBool>,
+    last_append_at_ms: Arc<AtomicI64>,
+) {
+    let db = match open_connection(&db_path) {
+        Ok(db) => db,
+        Err(e) => {
+            error!("Receipt importer failed to open db: {}", e);
+            return;
+        }
+    };
+
+    let mut neg_items_stmt = match db.prepare(SQL_INSERT_NEG_ITEM) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            error!(
+                "Receipt importer failed to prepare neg_items statement: {}",
+                e
+            );
+            return;
+        }
+    };
+    let mut recorded_stmt = match db.prepare(SQL_INSERT_RECORDED_EVENT) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            error!(
+                "Receipt importer failed to prepare recorded_events statement: {}",
+                e
+            );
+            return;
+        }
+    };
+    let mut events_stmt = match db.prepare(SQL_INSERT_EVENT) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            error!("Receipt importer failed to prepare events statement: {}", e);
+            return;
+        }
+    };
+    let mut enqueue_stmt = match db.prepare(
+        "INSERT OR IGNORE INTO project_queue
+         (peer_id, event_id, available_at, priority_lane, priority_ts)
+         SELECT ?1, ?2, ?3, ?4, ?5
+         WHERE NOT EXISTS (SELECT 1 FROM valid_events WHERE peer_id=?1 AND event_id=?2)
+         AND NOT EXISTS (SELECT 1 FROM rejected_events WHERE peer_id=?1 AND event_id=?2)
+         AND NOT EXISTS (SELECT 1 FROM blocked_event_deps WHERE peer_id=?1 AND event_id=?2)",
+    ) {
+        Ok(stmt) => stmt,
+        Err(e) => {
+            error!(
+                "Receipt importer failed to prepare enqueue statement: {}",
+                e
+            );
+            return;
+        }
+    };
+
+    let reg = registry();
+    let receipt_spool = ReceiptSpool::new_for_db_path(&db_path);
+    let mut workspace_cache: HashMap<String, String> = HashMap::new();
+    let effects_executor = SqlitePostCommitEffectsExecutor::new(&db);
+    let import_idle_ms = receipt_spool_import_idle_ms() as i64;
+
+    if !low_mem_mode() {
+        let _ = db.execute_batch("PRAGMA wal_autocheckpoint = 0");
+    }
+
+    loop {
+        if !writer_done.load(Ordering::Relaxed) && import_idle_ms > 0 {
+            let last_append_ms = last_append_at_ms.load(Ordering::Relaxed);
+            let idle_ms = current_timestamp_ms().saturating_sub(last_append_ms);
+            if idle_ms < import_idle_ms {
+                std::thread::sleep(Duration::from_millis(1));
+                continue;
+            }
+        }
+
+        match materialize_receipt_spool_batch(
+            &db,
+            &receipt_spool,
+            reg,
+            &mut workspace_cache,
+            &mut neg_items_stmt,
+            &mut recorded_stmt,
+            &mut events_stmt,
+            &mut enqueue_stmt,
+            &effects_executor,
+        ) {
+            Ok(imported) if imported > 0 => continue,
+            Ok(_) => {
+                if writer_done.load(Ordering::Relaxed) {
+                    match receipt_spool.load_pending_batch(1) {
+                        Ok(rows) if rows.is_empty() => break,
+                        Ok(_) => {}
+                        Err(e) => warn!("receipt importer pending scan failed: {}", e),
+                    }
+                }
+                std::thread::sleep(Duration::from_millis(1));
+            }
+            Err(e) => {
+                warn!("receipt spool materialization failed: {}", e);
+                let _ = db.execute("ROLLBACK", []);
+                std::thread::sleep(Duration::from_millis(5));
+            }
         }
     }
 }
@@ -161,70 +347,30 @@ pub fn batch_writer(
     mut rx: mpsc::Receiver<IngestItem>,
     events_received: Arc<AtomicU64>,
 ) {
-    let db = match open_connection(&db_path) {
-        Ok(db) => db,
-        Err(e) => {
-            error!("Writer failed to open db: {}", e);
-            return;
-        }
-    };
-
-    let mut neg_items_stmt = match db.prepare(SQL_INSERT_NEG_ITEM) {
-        Ok(stmt) => stmt,
-        Err(e) => {
-            error!("Failed to prepare neg_items statement: {}", e);
-            return;
-        }
-    };
-
-    let mut recorded_stmt = match db.prepare(SQL_INSERT_RECORDED_EVENT) {
-        Ok(stmt) => stmt,
-        Err(e) => {
-            error!("Failed to prepare recorded_events statement: {}", e);
-            return;
-        }
-    };
-
-    let mut events_stmt = match db.prepare(SQL_INSERT_EVENT) {
-        Ok(stmt) => stmt,
-        Err(e) => {
-            error!("Failed to prepare events statement: {}", e);
-            return;
-        }
-    };
-
-    let mut enqueue_stmt = match db.prepare(
-        "INSERT OR IGNORE INTO project_queue
-         (peer_id, event_id, available_at, priority_lane, priority_ts)
-         SELECT ?1, ?2, ?3, ?4, ?5
-         WHERE NOT EXISTS (SELECT 1 FROM valid_events WHERE peer_id=?1 AND event_id=?2)
-         AND NOT EXISTS (SELECT 1 FROM rejected_events WHERE peer_id=?1 AND event_id=?2)
-         AND NOT EXISTS (SELECT 1 FROM blocked_event_deps WHERE peer_id=?1 AND event_id=?2)",
-    ) {
-        Ok(stmt) => stmt,
-        Err(e) => {
-            error!("Failed to prepare enqueue statement: {}", e);
-            return;
-        }
-    };
-
-    let reg = registry();
-    let mut workspace_cache: HashMap<String, String> = HashMap::new();
-    let effects_executor = SqlitePostCommitEffectsExecutor::new(&db);
+    let mut prefetched_first: Option<IngestItem> = None;
+    let receipt_spool = ReceiptSpool::new_for_db_path(&db_path);
     let mut cumulative_events: u64 = 0;
     let mut profile_epoch = Instant::now();
-
-    // Disable WAL autocheckpoint on the writer — we checkpoint manually
-    // after each batch to avoid checkpoint stalls mid-transaction.
-    let deferred_wal = !low_mem_mode();
-    if deferred_wal {
-        let _ = db.execute_batch("PRAGMA wal_autocheckpoint = 0");
-    }
+    let writer_done = Arc::new(AtomicBool::new(false));
+    let last_append_at_ms = Arc::new(AtomicI64::new(0));
+    let importer_handle = if receipt_spool_import_enabled() {
+        let importer_db_path = db_path.clone();
+        let importer_done = Arc::clone(&writer_done);
+        let importer_last_append_at_ms = Arc::clone(&last_append_at_ms);
+        Some(std::thread::spawn(move || {
+            run_receipt_importer(importer_db_path, importer_done, importer_last_append_at_ms);
+        }))
+    } else {
+        None
+    };
 
     loop {
-        let first = match rx.blocking_recv() {
+        let first = match prefetched_first.take() {
             Some(item) => item,
-            None => break,
+            None => match rx.blocking_recv() {
+                Some(item) => item,
+                None => break,
+            },
         };
 
         let mut batch = vec![first];
@@ -236,85 +382,49 @@ pub fn batch_writer(
             }
         }
         sort_ingest_batch(&mut batch);
+        let hot_backlog = if batch.len() >= cap {
+            match rx.try_recv() {
+                Ok(item) => {
+                    prefetched_first = Some(item);
+                    true
+                }
+                Err(tokio::sync::mpsc::error::TryRecvError::Empty) => false,
+                Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => false,
+            }
+        } else {
+            false
+        };
 
         let batch_len = batch.len();
-
-        prewarm_workspace_cache(&db, &batch, &mut workspace_cache);
-
-        // BEGIN with retry+backoff — do not drain batch on failure
-        let mut begin_ok = false;
-        for attempt in 0..3 {
-            match db.execute("BEGIN IMMEDIATE", []) {
-                Ok(_) => {
-                    begin_ok = true;
-                    break;
-                }
-                Err(e) => {
-                    warn!("BEGIN failed (attempt {}): {}", attempt + 1, e);
-                    // Ensure no leftover transaction state
-                    let _ = db.execute("ROLLBACK", []);
-                    std::thread::sleep(Duration::from_millis(50 * (1 << attempt)));
-                }
-            }
-        }
-        if !begin_ok {
-            error!(
-                "BEGIN failed after retries, preserving {} items for next batch",
-                batch.len()
-            );
-            // Items remain in wanted — they will be re-requested on next sync
-            continue;
-        }
-
-        let t_persist = Instant::now();
-        let persist_output = run_persist_phase(
-            &db,
-            &batch,
-            reg,
-            &mut workspace_cache,
-            &mut neg_items_stmt,
-            &mut recorded_stmt,
-            &mut events_stmt,
-            &mut enqueue_stmt,
-        );
-        let persist_ms = t_persist.elapsed().as_millis();
-
-        let t_commit = Instant::now();
-        match commit_and_run_post_commit_effects(
-            &db,
-            &persist_output,
-            &effects_executor,
-            drain_batch_size(),
-        ) {
-            Ok(()) => {}
+        let t_spool = Instant::now();
+        let durable_at_ms = current_timestamp_ms();
+        let spooled_count = match receipt_spool.append_batch(&batch, durable_at_ms) {
+            Ok(count) => count as u64,
             Err(e) => {
-                warn!("COMMIT failed, rolling back: {}", e);
-                let _ = db.execute("ROLLBACK", []);
-                // Items remain in wanted — they will be re-requested on next sync
+                warn!("receipt spool append failed: {}", e);
                 continue;
             }
-        }
-        let commit_and_effects_ms = t_commit.elapsed().as_millis();
+        };
+        let spool_ms = t_spool.elapsed().as_millis();
+        last_append_at_ms.store(durable_at_ms, Ordering::Relaxed);
+        cumulative_events += spooled_count;
+        events_received.fetch_add(spooled_count, Ordering::Relaxed);
 
-        let persisted_count = persist_output.persisted_event_ids.len() as u64;
-        cumulative_events += persisted_count;
-        events_received.fetch_add(persisted_count, Ordering::Relaxed);
-
-        // Non-blocking PASSIVE checkpoint on a cadence — merges WAL pages
-        // into the main DB without blocking readers. Every 10k events keeps
-        // the WAL bounded without checkpointing on every batch.
-        if deferred_wal && cumulative_events % 10_000 < persisted_count {
-            let _ = db.execute_batch("PRAGMA wal_checkpoint(PASSIVE)");
-        }
-
-        // Profile logging: emit every 10k events to avoid log noise
-        if cumulative_events / 10_000 != (cumulative_events - persisted_count) / 10_000 {
+        if cumulative_events / 10_000 != (cumulative_events.saturating_sub(spooled_count)) / 10_000
+        {
             let epoch_ms = profile_epoch.elapsed().as_millis();
             info!(
-                "WRITER_PROFILE: cumulative={} batch={} persist={}ms commit+effects={}ms epoch_10k={}ms",
-                cumulative_events, batch_len, persist_ms, commit_and_effects_ms, epoch_ms,
+                "WRITER_PROFILE: cumulative={} batch={} spool={}ms hot_backlog={} epoch_10k={}ms",
+                cumulative_events, batch_len, spool_ms, hot_backlog, epoch_ms,
             );
             profile_epoch = Instant::now();
+        }
+    }
+
+    writer_done.store(true, Ordering::Relaxed);
+    if let Some(importer_handle) = importer_handle {
+        if let Err(err) = importer_handle.join() {
+            error!("Receipt importer thread panicked: {:?}", err);
         }
     }
 }

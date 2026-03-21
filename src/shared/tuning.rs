@@ -70,6 +70,21 @@ pub fn bulk_write_batch_cap() -> usize {
     }
 }
 
+pub fn receipt_spool_import_idle_ms() -> u64 {
+    read_usize_env("TOPO_RECEIPT_SPOOL_IMPORT_IDLE_MS").unwrap_or(0) as u64
+}
+
+pub fn receipt_spool_import_enabled() -> bool {
+    match std::env::var("TOPO_RECEIPT_SPOOL_IMPORT_ENABLED") {
+        Ok(value) => value != "0" && value.to_lowercase() != "false",
+        Err(_) => true,
+    }
+}
+
+pub fn receipt_spool_defer_hash() -> bool {
+    read_bool_env("TOPO_RECEIPT_SPOOL_DEFER_HASH")
+}
+
 pub fn response_send_quantum_bytes() -> usize {
     if let Some(v) = read_usize_env("TOPO_RESPONSE_SEND_QUANTUM_BYTES")
         .or_else(|| read_usize_env("TOPO_EGRESS_SEND_QUANTUM_BYTES"))

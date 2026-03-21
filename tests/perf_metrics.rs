@@ -33,6 +33,14 @@ pub struct BandwidthSummary {
     pub bandwidth_saturation_pct: Option<f64>,
 }
 
+#[derive(Debug, Clone, Copy)]
+struct SpanStats {
+    avg_ms: f64,
+    p50_ms: i64,
+    p95_ms: i64,
+    max_ms: i64,
+}
+
 pub fn enable_projection_timeline() {
     std::env::set_var("TOPO_EVENT_TIMELINE", "1");
     std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "projection");
@@ -237,4 +245,163 @@ pub fn bandwidth_summary(
         estimated_quic_ceiling_mbps,
         bandwidth_saturation_pct,
     }
+}
+
+fn compute_span_stats(values: &mut Vec<i64>) -> Option<SpanStats> {
+    if values.is_empty() {
+        return None;
+    }
+    values.sort_unstable();
+    let len = values.len();
+    let p50_ms = values[(len - 1) / 2];
+    let p95_ms = values[((len - 1) as f64 * 0.95).floor() as usize];
+    let max_ms = *values.last().unwrap_or(&0);
+    let avg_ms = values.iter().map(|v| *v as f64).sum::<f64>() / len as f64;
+    Some(SpanStats {
+        avg_ms,
+        p50_ms,
+        p95_ms,
+        max_ms,
+    })
+}
+
+fn format_span(label: &str, stats: SpanStats) -> String {
+    format!(
+        "    {label:<20} avg={:.1}ms p50={}ms p95={}ms max={}ms",
+        stats.avg_ms, stats.p50_ms, stats.p95_ms, stats.max_ms
+    )
+}
+
+pub fn joined_one_way_stage_spans_summary(
+    sender_db_path: &str,
+    receiver_db_path: &str,
+    event_ids_b64: &[String],
+) -> Option<String> {
+    with_temp_target_event_ids(sender_db_path, event_ids_b64, |conn| {
+        conn.execute(
+            "ATTACH DATABASE ?1 AS receiver",
+            rusqlite::params![receiver_db_path],
+        )?;
+        let result = (|| -> rusqlite::Result<Option<String>> {
+            let mut stmt = conn.prepare(
+                "SELECT
+                     recv.wanted_discovered_at,
+                     recv.request_credit_received_at,
+                     recv.request_selected_at,
+                     recv.request_sent_at,
+                     send.request_received_at,
+                     send.response_sent_at,
+                     recv.response_received_at,
+                     recv.persisted_at,
+                     recv.projected_at
+                 FROM event_timeline send
+                 INNER JOIN receiver.event_timeline recv
+                         ON recv.event_id = send.event_id
+                 INNER JOIN temp.perf_target_event_ids target
+                         ON target.event_id = send.event_id",
+            )?;
+
+            let mut wanted_to_credit_ms = Vec::new();
+            let mut credit_to_select_ms = Vec::new();
+            let mut select_to_send_ms = Vec::new();
+            let mut req_transit_ms = Vec::new();
+            let mut source_queue_send_ms = Vec::new();
+            let mut response_transit_ms = Vec::new();
+            let mut receive_to_persist_ms = Vec::new();
+            let mut persist_to_project_ms = Vec::new();
+
+            let rows = stmt.query_map([], |row| {
+                Ok((
+                    row.get::<_, Option<i64>>(0)?,
+                    row.get::<_, Option<i64>>(1)?,
+                    row.get::<_, Option<i64>>(2)?,
+                    row.get::<_, Option<i64>>(3)?,
+                    row.get::<_, Option<i64>>(4)?,
+                    row.get::<_, Option<i64>>(5)?,
+                    row.get::<_, Option<i64>>(6)?,
+                    row.get::<_, Option<i64>>(7)?,
+                    row.get::<_, Option<i64>>(8)?,
+                ))
+            })?;
+
+            for row in rows {
+                let (
+                    wanted_discovered_at,
+                    request_credit_received_at,
+                    request_selected_at,
+                    request_sent_at,
+                    request_received_at,
+                    response_sent_at,
+                    response_received_at,
+                    persisted_at,
+                    projected_at,
+                ) = row?;
+
+                if let (Some(start), Some(end)) = (wanted_discovered_at, request_credit_received_at)
+                {
+                    wanted_to_credit_ms.push(end.saturating_sub(start));
+                }
+                if let (Some(start), Some(end)) = (request_credit_received_at, request_selected_at)
+                {
+                    credit_to_select_ms.push(end.saturating_sub(start));
+                }
+                if let (Some(start), Some(end)) = (request_selected_at, request_sent_at) {
+                    select_to_send_ms.push(end.saturating_sub(start));
+                }
+                if let (Some(start), Some(end)) = (request_sent_at, request_received_at) {
+                    req_transit_ms.push(end.saturating_sub(start));
+                }
+                if let (Some(start), Some(end)) = (request_received_at, response_sent_at) {
+                    source_queue_send_ms.push(end.saturating_sub(start));
+                }
+                if let (Some(start), Some(end)) = (response_sent_at, response_received_at) {
+                    response_transit_ms.push(end.saturating_sub(start));
+                }
+                if let (Some(start), Some(end)) = (response_received_at, persisted_at) {
+                    receive_to_persist_ms.push(end.saturating_sub(start));
+                }
+                if let (Some(start), Some(end)) = (persisted_at, projected_at) {
+                    persist_to_project_ms.push(end.saturating_sub(start));
+                }
+            }
+
+            let mut lines = Vec::new();
+            if let Some(stats) = compute_span_stats(&mut wanted_to_credit_ms) {
+                lines.push(format_span("wanted->credit", stats));
+            }
+            if let Some(stats) = compute_span_stats(&mut credit_to_select_ms) {
+                lines.push(format_span("credit->select", stats));
+            }
+            if let Some(stats) = compute_span_stats(&mut select_to_send_ms) {
+                lines.push(format_span("select->send", stats));
+            }
+            if let Some(stats) = compute_span_stats(&mut req_transit_ms) {
+                lines.push(format_span("request transit", stats));
+            }
+            if let Some(stats) = compute_span_stats(&mut source_queue_send_ms) {
+                lines.push(format_span("source queue/send", stats));
+            }
+            if let Some(stats) = compute_span_stats(&mut response_transit_ms) {
+                lines.push(format_span("response transit", stats));
+            }
+            if let Some(stats) = compute_span_stats(&mut receive_to_persist_ms) {
+                lines.push(format_span("receive->persist", stats));
+            }
+            if let Some(stats) = compute_span_stats(&mut persist_to_project_ms) {
+                lines.push(format_span("persist->project", stats));
+            }
+
+            if lines.is_empty() {
+                Ok(None)
+            } else {
+                Ok(Some(format!(
+                    "  Joined stage spans:\n{}\n",
+                    lines.join("\n")
+                )))
+            }
+        })();
+        let _ = conn.execute_batch("DETACH DATABASE receiver");
+        result
+    })
+    .expect("query joined one-way stage spans")
 }

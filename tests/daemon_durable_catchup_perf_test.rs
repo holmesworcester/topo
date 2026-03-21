@@ -1,8 +1,8 @@
 //! Catchup benchmark focused on sink durable receipt throughput.
 //!
 //! The sink is taken offline, the source preloads a backlog, then the sink
-//! restarts and catches up. This measures durable receipt (`recorded_events`)
-//! separately from projected message visibility.
+//! restarts and catches up. This measures durable receipt at the append-only
+//! receipt spool boundary separately from projected message visibility.
 
 mod cli_harness;
 mod daemon_perf_harness;

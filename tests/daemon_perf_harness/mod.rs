@@ -13,8 +13,9 @@ use crate::cli_harness::{
     wait_for_daemon_stopped, wait_for_endpoint_observation, DaemonOptions, HarnessDaemon,
 };
 use crate::perf_metrics::{
-    bandwidth_summary, delay_from, diff_new_ids, enable_projection_timeline, max_opt, min_opt,
-    projection_window, recorded_message_event_ids, total_event_blob_bytes,
+    bandwidth_summary, delay_from, diff_new_ids, enable_projection_timeline,
+    joined_one_way_stage_spans_summary, max_opt, min_opt, projection_window,
+    recorded_message_event_ids, total_event_blob_bytes,
 };
 
 pub type BenchNetworkGuard = Box<dyn std::any::Any + Send>;
@@ -290,6 +291,7 @@ pub struct PerfMeasurement {
     pub perfect_payload_mbps: Option<f64>,
     pub estimated_quic_ceiling_mbps: Option<f64>,
     pub bandwidth_saturation_pct: Option<f64>,
+    pub joined_stage_spans_summary: Option<String>,
     pub alice_rss: f64,
     pub bob_rss: f64,
     pub max_rss: f64,
@@ -305,16 +307,17 @@ pub struct DurableCatchupMeasurement {
     pub messages: i64,
     pub durable_msgs_per_sec: f64,
     pub projected_msgs_per_sec: f64,
+    pub joined_stage_spans_summary: Option<String>,
     pub alice_rss: f64,
     pub bob_rss: f64,
     pub max_rss: f64,
 }
 
 #[derive(Debug, Clone, Copy)]
-struct RecordedEventsWindow {
+struct ReceiptSpoolWindow {
     count: i64,
-    first_recorded_at: Option<i64>,
-    last_recorded_at: Option<i64>,
+    first_durable_at: Option<i64>,
+    last_durable_at: Option<i64>,
 }
 
 struct BenchProjectionSnapshot {
@@ -328,13 +331,17 @@ struct BenchProjectionSnapshot {
 
 fn daemon_perf_extra_env() -> Vec<(String, String)> {
     enable_projection_timeline();
-    vec![
+    let mut env = vec![
         ("TOPO_EVENT_TIMELINE".to_string(), "1".to_string()),
         (
             "TOPO_EVENT_TIMELINE_GROUPS".to_string(),
-            "projection".to_string(),
+            "request,transfer,persist,projection".to_string(),
         ),
-    ]
+    ];
+    if perf_debug_env("PERF_ENABLE_SYNC_LOG") {
+        env.push(("SYNC_SEND_IDLE_LOG".to_string(), "1".to_string()));
+    }
+    env
 }
 
 fn active_peer_id_or_panic(db: &str) -> String {
@@ -419,6 +426,8 @@ where
         total_event_blob_bytes(&bench.alice_db, &alice_target_ids),
     );
     let bandwidth = bandwidth_summary(projection.payload_bytes, wall_secs, None);
+    let joined_stage_spans_summary =
+        joined_one_way_stage_spans_summary(&bench.alice_db, &bench.bob_db, &alice_target_ids);
 
     let (alice_rss, bob_rss, max_rss) = bench.daemon_rss();
     PerfMeasurement {
@@ -438,6 +447,7 @@ where
         perfect_payload_mbps: bandwidth.perfect_payload_mbps,
         estimated_quic_ceiling_mbps: bandwidth.estimated_quic_ceiling_mbps,
         bandwidth_saturation_pct: bandwidth.bandwidth_saturation_pct,
+        joined_stage_spans_summary,
         alice_rss,
         bob_rss,
         max_rss,
@@ -517,6 +527,7 @@ where
         perfect_payload_mbps: bandwidth.perfect_payload_mbps,
         estimated_quic_ceiling_mbps: bandwidth.estimated_quic_ceiling_mbps,
         bandwidth_saturation_pct: bandwidth.bandwidth_saturation_pct,
+        joined_stage_spans_summary: None,
         alice_rss,
         bob_rss,
         max_rss,
@@ -600,6 +611,7 @@ where
         perfect_payload_mbps: bandwidth.perfect_payload_mbps,
         estimated_quic_ceiling_mbps: bandwidth.estimated_quic_ceiling_mbps,
         bandwidth_saturation_pct: bandwidth.bandwidth_saturation_pct,
+        joined_stage_spans_summary: None,
         alice_rss,
         bob_rss,
         max_rss,
@@ -624,8 +636,12 @@ where
 
     let bob_message_baseline = bench.warm_one_way(warm_timeout);
     let alice_message_baseline = message_count_sql(&bench.alice_db);
-    let bob_recorded_by = active_recorded_by(&bench.bob_db);
-    let bob_recorded_high_watermark = recorded_events_max_id(&bench.bob_db, &bob_recorded_by);
+    let alice_peer_id = active_peer_id_or_panic(&bench.alice_db);
+    let alice_baseline_ids = recorded_message_event_ids(&bench.alice_db, &alice_peer_id);
+    topo::state::db::receipt_spool::reset_for_db_path(&bench.bob_db)
+        .expect("reset receipt spool files before catchup benchmark");
+    let bob_receipt_high_watermark =
+        receipt_spool_max_id(&bench.bob_db, &active_recorded_by(&bench.bob_db));
 
     bench.stop_bob_daemon();
 
@@ -637,6 +653,10 @@ where
         alice_message_baseline + message_count,
         source_settle_timeout,
     );
+    let alice_target_ids = diff_new_ids(
+        &alice_baseline_ids,
+        &recorded_message_event_ids(&bench.alice_db, &alice_peer_id),
+    );
 
     let catchup_start_ms = current_timestamp_ms();
     let catchup_start = Instant::now();
@@ -645,24 +665,24 @@ where
     let first_projected_at_ms =
         wait_for_message_count_at_least(&bench.bob_db, bob_message_baseline + 1, catchup_timeout);
 
-    wait_for_recorded_events_delta(
+    wait_for_receipt_spool_delta(
         &bench.bob_db,
-        &bob_recorded_by,
-        bob_recorded_high_watermark,
+        &active_recorded_by(&bench.bob_db),
+        bob_receipt_high_watermark,
         message_count,
         catchup_timeout,
     );
     let all_durable_wall_secs = catchup_start.elapsed().as_secs_f64();
-    let recorded_window = recorded_events_window_after_id(
+    let receipt_window = receipt_spool_window_after_id(
         &bench.bob_db,
-        &bob_recorded_by,
-        bob_recorded_high_watermark,
+        &active_recorded_by(&bench.bob_db),
+        bob_receipt_high_watermark,
     );
     assert!(
-        recorded_window.count >= message_count,
-        "durable catchup recorded too few events: expected at least {}, actual {}",
+        receipt_window.count >= message_count,
+        "durable catchup spooled too few events: expected at least {}, actual {}",
         message_count,
-        recorded_window.count
+        receipt_window.count
     );
 
     wait_for_message_count(
@@ -672,10 +692,10 @@ where
     );
     let all_projected_wall_secs = catchup_start.elapsed().as_secs_f64();
 
-    let first_recorded_at = recorded_window
-        .first_recorded_at
-        .expect("durable catchup missing first recorded_at");
-    let first_durable_delay_ms = first_recorded_at.saturating_sub(catchup_start_ms);
+    let first_durable_at = receipt_window
+        .first_durable_at
+        .expect("durable catchup missing first durable_at");
+    let first_durable_delay_ms = first_durable_at.saturating_sub(catchup_start_ms);
     let first_projected_delay_ms = first_projected_at_ms.saturating_sub(catchup_start_ms);
     let durable_to_projected_tail_ms =
         ((all_projected_wall_secs - all_durable_wall_secs).max(0.0) * 1000.0).round() as i64;
@@ -683,6 +703,8 @@ where
     let (alice_rss, bob_rss, max_rss) = bench.daemon_rss();
     let durable_msgs_per_sec = message_count as f64 / all_durable_wall_secs.max(0.001);
     let projected_msgs_per_sec = message_count as f64 / all_projected_wall_secs.max(0.001);
+    let joined_stage_spans_summary =
+        joined_one_way_stage_spans_summary(&bench.alice_db, &bench.bob_db, &alice_target_ids);
 
     DurableCatchupMeasurement {
         all_durable_wall_secs,
@@ -694,6 +716,7 @@ where
         messages: message_count,
         durable_msgs_per_sec,
         projected_msgs_per_sec,
+        joined_stage_spans_summary,
         alice_rss,
         bob_rss,
         max_rss,
@@ -706,7 +729,7 @@ pub fn emit_summary(summary_key: &str, title: &str, measurement: &PerfMeasuremen
         .map(|pct| format!("{pct:.1}%"))
         .unwrap_or_else(|| "n/a (unshaped)".to_string());
     let summary = format!(
-        "=== {title} ===\n  Full projected_count: {wall_secs:.2}s\n  First recorded_at:    {first_recorded_at}\n  Last recorded_at:     {last_recorded_at}\n  First projected_at:   {first_projected_at}\n  Last projected_at:    {last_projected_at}\n  Projected tail:       {projected_tail}\n  Generate:             {generate_secs:.2}s\n  Sync wait:            {sync_wait_secs:.2}s\n  Messages:             {messages}\n  Projected msgs/s:     {msgs_per_sec:.0}\n  Payload bytes:        {payload_bytes}\n  Payload MiB/s:        {payload_mib_s:.2}\n  Payload Mbps:         {payload_mbps:.2}\n  Bandwidth saturation: {bandwidth_saturation}\n  Peak RSS:             {max_rss:.1} MiB (max daemon VmHWM)\n  Alice peak RSS:       {alice_rss:.1} MiB\n  Bob peak RSS:         {bob_rss:.1} MiB\n",
+        "=== {title} ===\n  Full projected_count: {wall_secs:.2}s\n  First recorded_at:    {first_recorded_at}\n  Last recorded_at:     {last_recorded_at}\n  First projected_at:   {first_projected_at}\n  Last projected_at:    {last_projected_at}\n  Projected tail:       {projected_tail}\n  Generate:             {generate_secs:.2}s\n  Sync wait:            {sync_wait_secs:.2}s\n  Messages:             {messages}\n  Projected msgs/s:     {msgs_per_sec:.0}\n  Payload bytes:        {payload_bytes}\n  Payload MiB/s:        {payload_mib_s:.2}\n  Payload Mbps:         {payload_mbps:.2}\n  Bandwidth saturation: {bandwidth_saturation}\n{joined_stage_spans}  Peak RSS:             {max_rss:.1} MiB (max daemon VmHWM)\n  Alice peak RSS:       {alice_rss:.1} MiB\n  Bob peak RSS:         {bob_rss:.1} MiB\n",
         wall_secs = measurement.wall_secs,
         first_recorded_at = measurement
             .first_recorded_at_delay_ms
@@ -736,6 +759,10 @@ pub fn emit_summary(summary_key: &str, title: &str, measurement: &PerfMeasuremen
         payload_mib_s = measurement.payload_mib_s,
         payload_mbps = measurement.payload_mbps,
         bandwidth_saturation = bandwidth_saturation,
+        joined_stage_spans = measurement
+            .joined_stage_spans_summary
+            .as_deref()
+            .unwrap_or(""),
         max_rss = measurement.max_rss,
         alice_rss = measurement.alice_rss,
         bob_rss = measurement.bob_rss,
@@ -750,7 +777,7 @@ pub fn emit_durable_summary(
     measurement: &DurableCatchupMeasurement,
 ) {
     let summary = format!(
-        "=== {title} ===\n  First durable:   {first_durable_delay_ms} ms after restart\n  All durable:     {all_durable_wall_secs:.2}s after restart\n  First projected: {first_projected_delay_ms} ms after restart\n  All projected:   {all_projected_wall_secs:.2}s after restart\n  Durable tail:    {durable_to_projected_tail_ms} ms (all durable -> all projected)\n  Generate time:   {generate_secs:.2}s (untimed preload)\n  Messages:        {messages}\n  Durable msgs/s:  {durable_msgs_per_sec:.0}\n  Projected msgs/s:{projected_msgs_per_sec:>6.0}\n  Peak RSS:        {max_rss:.1} MiB (max daemon VmHWM)\n  Alice peak RSS:  {alice_rss:.1} MiB\n  Bob peak RSS:    {bob_rss:.1} MiB\n",
+        "=== {title} ===\n  First durable:   {first_durable_delay_ms} ms after restart\n  All durable:     {all_durable_wall_secs:.2}s after restart\n  First projected: {first_projected_delay_ms} ms after restart\n  All projected:   {all_projected_wall_secs:.2}s after restart\n  Durable tail:    {durable_to_projected_tail_ms} ms (all durable -> all projected)\n  Generate time:   {generate_secs:.2}s (untimed preload)\n  Messages:        {messages}\n  Durable msgs/s:  {durable_msgs_per_sec:.0}\n  Projected msgs/s:{projected_msgs_per_sec:>6.0}\n{joined_stage_spans}  Peak RSS:        {max_rss:.1} MiB (max daemon VmHWM)\n  Alice peak RSS:  {alice_rss:.1} MiB\n  Bob peak RSS:    {bob_rss:.1} MiB\n",
         first_durable_delay_ms = measurement.first_durable_delay_ms,
         all_durable_wall_secs = measurement.all_durable_wall_secs,
         first_projected_delay_ms = measurement.first_projected_delay_ms,
@@ -760,6 +787,10 @@ pub fn emit_durable_summary(
         messages = measurement.messages,
         durable_msgs_per_sec = measurement.durable_msgs_per_sec,
         projected_msgs_per_sec = measurement.projected_msgs_per_sec,
+        joined_stage_spans = measurement
+            .joined_stage_spans_summary
+            .as_deref()
+            .unwrap_or(""),
         max_rss = measurement.max_rss,
         alice_rss = measurement.alice_rss,
         bob_rss = measurement.bob_rss,
@@ -814,39 +845,27 @@ fn generate_messages_offline(db: &str, count: usize) {
     );
 }
 
-fn recorded_events_max_id(db: &str, recorded_by: &str) -> i64 {
-    let conn = rusqlite::Connection::open(db).expect("open db for recorded_events_max_id");
-    conn.query_row(
-        "SELECT COALESCE(MAX(id), 0) FROM recorded_events WHERE peer_id = ?1",
-        rusqlite::params![recorded_by],
-        |row| row.get(0),
-    )
-    .expect("query recorded_events max id")
+fn receipt_spool_max_id(db: &str, _recorded_by: &str) -> i64 {
+    topo::state::db::receipt_spool::stats_for_db_path(db, 0)
+        .expect("scan receipt spool for baseline")
+        .count
 }
 
-fn recorded_events_window_after_id(
+fn receipt_spool_window_after_id(
     db: &str,
-    recorded_by: &str,
+    _recorded_by: &str,
     after_id: i64,
-) -> RecordedEventsWindow {
-    let conn = rusqlite::Connection::open(db).expect("open db for recorded_events_window_after_id");
-    conn.query_row(
-        "SELECT COUNT(*), MIN(recorded_at), MAX(recorded_at)
-         FROM recorded_events
-         WHERE peer_id = ?1 AND id > ?2",
-        rusqlite::params![recorded_by, after_id],
-        |row| {
-            Ok(RecordedEventsWindow {
-                count: row.get(0)?,
-                first_recorded_at: row.get(1)?,
-                last_recorded_at: row.get(2)?,
-            })
-        },
-    )
-    .expect("query recorded_events window")
+) -> ReceiptSpoolWindow {
+    let stats = topo::state::db::receipt_spool::stats_for_db_path(db, after_id as usize)
+        .expect("scan receipt spool window");
+    ReceiptSpoolWindow {
+        count: stats.count,
+        first_durable_at: stats.first_durable_at_ms,
+        last_durable_at: stats.last_durable_at_ms,
+    }
 }
 
-fn wait_for_recorded_events_delta(
+fn wait_for_receipt_spool_delta(
     db: &str,
     recorded_by: &str,
     after_id: i64,
@@ -855,13 +874,13 @@ fn wait_for_recorded_events_delta(
 ) {
     let start = Instant::now();
     loop {
-        let window = recorded_events_window_after_id(db, recorded_by, after_id);
+        let window = receipt_spool_window_after_id(db, recorded_by, after_id);
         if window.count >= expected_delta {
             return;
         }
         assert!(
             start.elapsed() < timeout,
-            "recorded_events delta timed out after {:?} for db={}: expected_delta={}, actual_delta={}\n{}",
+            "receipt_spool delta timed out after {:?} for db={}: expected_delta={}, actual_delta={}\n{}",
             timeout,
             db,
             expected_delta,
