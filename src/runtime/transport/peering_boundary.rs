@@ -24,7 +24,8 @@ use super::connection_lifecycle::{
 };
 use super::multi_workspace::TransportTargetCertResolver;
 use super::session_factory::{
-    accept_session_io, open_session_io, InboundSessionState, SessionOpenError,
+    accept_session_io, open_dependency_session_io, open_session_io, InboundSessionState,
+    SessionClass, SessionOpenError,
 };
 use super::{create_single_port_endpoint, workspace_client_config, DynamicAllowFn};
 
@@ -58,6 +59,7 @@ pub struct SessionEnvelope {
     pub peer_id: String,
     pub remote_addr: SocketAddr,
     pub session_id: u64,
+    pub class: SessionClass,
     pub io: Box<dyn TransportSessionIo>,
 }
 
@@ -88,16 +90,18 @@ impl SessionProvider {
     }
 
     pub async fn next_session(&self) -> Result<SessionEnvelope, SessionOpenError> {
-        let (session_id, io) = match self.mode {
-            SessionOpenMode::Outbound => open_session_io(&self.connection).await?,
-            SessionOpenMode::Inbound => {
-                accept_session_io(&self.connection, &self.inbound_state).await?
+        let (session_id, class, io) = match self.mode {
+            SessionOpenMode::Outbound => {
+                let (session_id, io) = open_session_io(&self.connection).await?;
+                (session_id, SessionClass::Range, io)
             }
+            SessionOpenMode::Inbound => accept_session_io(&self.connection, &self.inbound_state).await?,
         };
         Ok(SessionEnvelope {
             peer_id: self.peer_id.clone(),
             remote_addr: self.connection.remote_address(),
             session_id,
+            class,
             io,
         })
     }
@@ -349,10 +353,17 @@ pub async fn open_outbound_session(
     open_session_io(conn).await
 }
 
+pub async fn open_outbound_dependency_session(
+    conn: &TransportConnection,
+) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError> {
+    open_dependency_session_io(conn).await
+}
+
 pub async fn open_inbound_session(
     conn: &TransportConnection,
 ) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError> {
-    accept_session_io(conn, &InboundSessionState::default()).await
+    let (session_id, _class, io) = accept_session_io(conn, &InboundSessionState::default()).await?;
+    Ok((session_id, io))
 }
 
 pub async fn read_intro_offer_frame(

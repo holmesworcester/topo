@@ -262,7 +262,6 @@ pub fn batch_writer(
                 "BEGIN failed after retries, preserving {} items for next batch",
                 batch.len()
             );
-            // Items remain in wanted — they will be re-requested on next sync
             continue;
         }
 
@@ -290,7 +289,6 @@ pub fn batch_writer(
             Err(e) => {
                 warn!("COMMIT failed, rolling back: {}", e);
                 let _ = db.execute("ROLLBACK", []);
-                // Items remain in wanted — they will be re-requested on next sync
                 continue;
             }
         }
@@ -317,6 +315,80 @@ pub fn batch_writer(
             profile_epoch = Instant::now();
         }
     }
+}
+
+pub fn ingest_now(db_path: &str, mut batch: Vec<IngestItem>) -> Result<usize, String> {
+    if batch.is_empty() {
+        return Ok(0);
+    }
+
+    let db = open_connection(db_path).map_err(|e| format!("open ingest db: {e}"))?;
+    let mut neg_items_stmt = db
+        .prepare(SQL_INSERT_NEG_ITEM)
+        .map_err(|e| format!("prepare neg_items statement: {e}"))?;
+    let mut recorded_stmt = db
+        .prepare(SQL_INSERT_RECORDED_EVENT)
+        .map_err(|e| format!("prepare recorded_events statement: {e}"))?;
+    let mut events_stmt = db
+        .prepare(SQL_INSERT_EVENT)
+        .map_err(|e| format!("prepare events statement: {e}"))?;
+    let mut enqueue_stmt = db
+        .prepare(
+            "INSERT OR IGNORE INTO project_queue
+             (peer_id, event_id, available_at, priority_lane, priority_ts)
+             SELECT ?1, ?2, ?3, ?4, ?5
+             WHERE NOT EXISTS (SELECT 1 FROM valid_events WHERE peer_id=?1 AND event_id=?2)
+             AND NOT EXISTS (SELECT 1 FROM rejected_events WHERE peer_id=?1 AND event_id=?2)
+             AND NOT EXISTS (SELECT 1 FROM blocked_event_deps WHERE peer_id=?1 AND event_id=?2)",
+        )
+        .map_err(|e| format!("prepare enqueue statement: {e}"))?;
+
+    sort_ingest_batch(&mut batch);
+    let reg = registry();
+    let mut workspace_cache = HashMap::new();
+    prewarm_workspace_cache(&db, &batch, &mut workspace_cache);
+
+    let mut begin_ok = false;
+    for attempt in 0..3 {
+        match db.execute("BEGIN IMMEDIATE", []) {
+            Ok(_) => {
+                begin_ok = true;
+                break;
+            }
+            Err(e) => {
+                let _ = db.execute("ROLLBACK", []);
+                if attempt == 2 {
+                    return Err(format!("begin immediate failed after retries: {e}"));
+                }
+                std::thread::sleep(Duration::from_millis(50 * (1 << attempt)));
+            }
+        }
+    }
+    if !begin_ok {
+        return Err("begin immediate failed".to_string());
+    }
+
+    let persist_output = run_persist_phase(
+        &db,
+        &batch,
+        reg,
+        &mut workspace_cache,
+        &mut neg_items_stmt,
+        &mut recorded_stmt,
+        &mut events_stmt,
+        &mut enqueue_stmt,
+    );
+    let effects_executor = SqlitePostCommitEffectsExecutor::new(&db);
+    commit_and_run_post_commit_effects(&db, &persist_output, &effects_executor, drain_batch_size())
+        .map_err(|e| {
+            let _ = db.execute("ROLLBACK", []);
+            format!("commit immediate ingest batch: {e}")
+        })?;
+    Ok(persist_output.persisted_event_ids.len())
+}
+
+pub fn ingest_one(db_path: &str, item: IngestItem) -> Result<(), String> {
+    ingest_now(db_path, vec![item]).map(|_| ())
 }
 
 #[cfg(test)]

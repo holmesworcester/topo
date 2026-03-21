@@ -2,13 +2,10 @@ use std::sync::OnceLock;
 
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 
-use super::queue::{with_immediate_tx, with_sqlite_busy_retry};
-use crate::crypto::{event_id_to_base64, EventId};
+use super::queue::with_sqlite_busy_retry;
 
 #[derive(Clone, Copy)]
 enum TimelineGroup {
-    Discovery,
-    Request,
     Transfer,
     Persist,
     Projection,
@@ -18,19 +15,15 @@ enum TimelineGroup {
 impl TimelineGroup {
     const fn bit(self) -> u8 {
         match self {
-            TimelineGroup::Discovery => 1 << 0,
-            TimelineGroup::Request => 1 << 1,
-            TimelineGroup::Transfer => 1 << 2,
-            TimelineGroup::Persist => 1 << 3,
-            TimelineGroup::Projection => 1 << 4,
-            TimelineGroup::Blocking => 1 << 5,
+            TimelineGroup::Transfer => 1 << 0,
+            TimelineGroup::Persist => 1 << 1,
+            TimelineGroup::Projection => 1 << 2,
+            TimelineGroup::Blocking => 1 << 3,
         }
     }
 }
 
-const ALL_TIMELINE_GROUPS: u8 = TimelineGroup::Discovery.bit()
-    | TimelineGroup::Request.bit()
-    | TimelineGroup::Transfer.bit()
+const ALL_TIMELINE_GROUPS: u8 = TimelineGroup::Transfer.bit()
     | TimelineGroup::Persist.bit()
     | TimelineGroup::Projection.bit()
     | TimelineGroup::Blocking.bit();
@@ -38,16 +31,6 @@ const ALL_TIMELINE_GROUPS: u8 = TimelineGroup::Discovery.bit()
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventTimelineRow {
     pub event_id: String,
-    pub discovery_round_started_at: Option<i64>,
-    pub discovery_round_completed_at: Option<i64>,
-    pub need_list_sent_at: Option<i64>,
-    pub need_list_received_at: Option<i64>,
-    pub wanted_discovered_at: Option<i64>,
-    pub request_credit_received_at: Option<i64>,
-    pub request_selected_at: Option<i64>,
-    pub request_sent_at: Option<i64>,
-    pub request_received_at: Option<i64>,
-    pub response_sent_at: Option<i64>,
     pub response_received_at: Option<i64>,
     // First durable store time. For range sync this is the append-only receive
     // log write; for direct ingest fallback paths this is the canonical insert.
@@ -67,16 +50,6 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         "
         CREATE TABLE IF NOT EXISTS event_timeline (
             event_id TEXT PRIMARY KEY,
-            discovery_round_started_at INTEGER,
-            discovery_round_completed_at INTEGER,
-            need_list_sent_at INTEGER,
-            need_list_received_at INTEGER,
-            wanted_discovered_at INTEGER,
-            request_credit_received_at INTEGER,
-            request_selected_at INTEGER,
-            request_sent_at INTEGER,
-            request_received_at INTEGER,
-            response_sent_at INTEGER,
             response_received_at INTEGER,
             persisted_at INTEGER,
             blocked_at INTEGER,
@@ -86,11 +59,6 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         );
         ",
     )?;
-    ensure_column(conn, "discovery_round_completed_at")?;
-    ensure_column(conn, "need_list_sent_at")?;
-    ensure_column(conn, "need_list_received_at")?;
-    ensure_column(conn, "request_credit_received_at")?;
-    ensure_column(conn, "request_selected_at")?;
     if !column_exists(conn, "unblocked_by_event_id")? {
         conn.execute(
             "ALTER TABLE event_timeline ADD COLUMN unblocked_by_event_id TEXT",
@@ -102,9 +70,9 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
 
 /// Whether event timeline recording is enabled. Controlled by the
 /// `TOPO_EVENT_TIMELINE` env var:
-///   "0" / "false" / "no" → disabled (even in debug builds)
-///   "1" / "true" / "yes" → enabled
-///   unset → enabled in debug builds, disabled in release builds
+///   "0" / "false" / "no" -> disabled (even in debug builds)
+///   "1" / "true" / "yes" -> enabled
+///   unset -> enabled in debug builds, disabled in release builds
 pub fn recording_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
     *ENABLED.get_or_init(
@@ -136,8 +104,6 @@ fn parse_groups_mask(raw: Option<&str>) -> u8 {
         match part.as_str() {
             "" => {}
             "all" => return ALL_TIMELINE_GROUPS,
-            "discovery" => mask |= TimelineGroup::Discovery.bit(),
-            "request" => mask |= TimelineGroup::Request.bit(),
             "transfer" => mask |= TimelineGroup::Transfer.bit(),
             "persist" => mask |= TimelineGroup::Persist.bit(),
             "projection" => mask |= TimelineGroup::Projection.bit(),
@@ -155,100 +121,6 @@ fn parse_groups_mask(raw: Option<&str>) -> u8 {
 impl<'a> EventTimeline<'a> {
     pub fn new(conn: &'a Connection) -> Self {
         Self { conn }
-    }
-
-    pub fn mark_discovered_many_with_round_start(
-        &self,
-        ids: &[EventId],
-        round_started_at: i64,
-        discovered_at: i64,
-    ) -> SqliteResult<usize> {
-        if !group_enabled(TimelineGroup::Discovery) || ids.is_empty() {
-            return Ok(0);
-        }
-        with_immediate_tx(self.conn, || {
-            let mut stmt = self.conn.prepare(
-                "INSERT INTO event_timeline (
-                     event_id, discovery_round_started_at, wanted_discovered_at
-                 ) VALUES (?1, ?2, ?3)
-                 ON CONFLICT(event_id) DO UPDATE SET
-                     discovery_round_started_at = COALESCE(event_timeline.discovery_round_started_at, excluded.discovery_round_started_at),
-                     wanted_discovered_at = COALESCE(event_timeline.wanted_discovered_at, excluded.wanted_discovered_at)",
-            )?;
-            let mut changed = 0usize;
-            for event_id in ids {
-                changed += stmt.execute(params![
-                    event_id_to_base64(event_id),
-                    round_started_at,
-                    discovered_at
-                ])?;
-            }
-            Ok(changed)
-        })
-    }
-
-    pub fn mark_discovery_round_completed_many(
-        &self,
-        ids: &[EventId],
-        ts: i64,
-    ) -> SqliteResult<usize> {
-        if !group_enabled(TimelineGroup::Discovery) {
-            return Ok(0);
-        }
-        self.mark_many(ids, "discovery_round_completed_at", ts)
-    }
-
-    pub fn mark_need_list_sent_many(&self, ids: &[EventId], ts: i64) -> SqliteResult<usize> {
-        if !group_enabled(TimelineGroup::Discovery) {
-            return Ok(0);
-        }
-        self.mark_many(ids, "need_list_sent_at", ts)
-    }
-
-    pub fn mark_need_list_received_many(&self, ids: &[EventId], ts: i64) -> SqliteResult<usize> {
-        if !group_enabled(TimelineGroup::Discovery) {
-            return Ok(0);
-        }
-        self.mark_many(ids, "need_list_received_at", ts)
-    }
-
-    pub fn mark_request_credit_received_many(
-        &self,
-        ids: &[EventId],
-        ts: i64,
-    ) -> SqliteResult<usize> {
-        if !group_enabled(TimelineGroup::Request) {
-            return Ok(0);
-        }
-        self.mark_many(ids, "request_credit_received_at", ts)
-    }
-
-    pub fn mark_request_selected_many(&self, ids: &[EventId], ts: i64) -> SqliteResult<usize> {
-        if !group_enabled(TimelineGroup::Request) {
-            return Ok(0);
-        }
-        self.mark_many(ids, "request_selected_at", ts)
-    }
-
-    pub fn mark_request_sent_many(&self, ids: &[EventId], ts: i64) -> SqliteResult<usize> {
-        if !group_enabled(TimelineGroup::Request) {
-            return Ok(0);
-        }
-        self.mark_many(ids, "request_sent_at", ts)
-    }
-
-    pub fn mark_request_received_many(&self, ids: &[EventId], ts: i64) -> SqliteResult<usize> {
-        if !group_enabled(TimelineGroup::Request) {
-            return Ok(0);
-        }
-        self.mark_many(ids, "request_received_at", ts)
-    }
-
-    pub fn mark_response_sent(&self, event_id: &EventId, ts: i64) -> SqliteResult<()> {
-        if !group_enabled(TimelineGroup::Transfer) {
-            return Ok(());
-        }
-        self.mark_b64(&event_id_to_base64(event_id), "response_sent_at", ts)
     }
 
     pub fn mark_response_received_b64(&self, event_id_b64: &str, ts: i64) -> SqliteResult<()> {
@@ -311,16 +183,6 @@ impl<'a> EventTimeline<'a> {
                 .query_row(
                     "SELECT
                          event_id,
-                         discovery_round_started_at,
-                         discovery_round_completed_at,
-                         need_list_sent_at,
-                         need_list_received_at,
-                         wanted_discovered_at,
-                         request_credit_received_at,
-                         request_selected_at,
-                         request_sent_at,
-                         request_received_at,
-                         response_sent_at,
                          response_received_at,
                          persisted_at,
                          blocked_at,
@@ -333,22 +195,12 @@ impl<'a> EventTimeline<'a> {
                     |row| {
                         Ok(EventTimelineRow {
                             event_id: row.get(0)?,
-                            discovery_round_started_at: row.get(1)?,
-                            discovery_round_completed_at: row.get(2)?,
-                            need_list_sent_at: row.get(3)?,
-                            need_list_received_at: row.get(4)?,
-                            wanted_discovered_at: row.get(5)?,
-                            request_credit_received_at: row.get(6)?,
-                            request_selected_at: row.get(7)?,
-                            request_sent_at: row.get(8)?,
-                            request_received_at: row.get(9)?,
-                            response_sent_at: row.get(10)?,
-                            response_received_at: row.get(11)?,
-                            persisted_at: row.get(12)?,
-                            blocked_at: row.get(13)?,
-                            unblocked_at: row.get(14)?,
-                            unblocked_by_event_id: row.get(15)?,
-                            projected_at: row.get(16)?,
+                            response_received_at: row.get(1)?,
+                            persisted_at: row.get(2)?,
+                            blocked_at: row.get(3)?,
+                            unblocked_at: row.get(4)?,
+                            unblocked_by_event_id: row.get(5)?,
+                            projected_at: row.get(6)?,
                         })
                     },
                 )
@@ -361,66 +213,7 @@ impl<'a> EventTimeline<'a> {
             return Ok(None);
         };
         let spans = [
-            span_label(
-                "discover_round_ms",
-                row.discovery_round_started_at,
-                row.discovery_round_completed_at,
-            ),
-            span_label(
-                "discover_done_to_need_sent_ms",
-                row.discovery_round_completed_at,
-                row.need_list_sent_at,
-            ),
-            span_label(
-                "need_transit_ms",
-                row.need_list_sent_at,
-                row.need_list_received_at,
-            ),
-            span_label(
-                "need_recv_to_wanted_ms",
-                row.need_list_received_at,
-                row.wanted_discovered_at,
-            ),
-            span_label(
-                "wanted_to_credit_ms",
-                row.wanted_discovered_at,
-                row.request_credit_received_at,
-            ),
-            span_label(
-                "credit_to_selected_ms",
-                row.request_credit_received_at,
-                row.request_selected_at,
-            ),
-            span_label(
-                "selected_to_request_ms",
-                row.request_selected_at,
-                row.request_sent_at,
-            ),
-            span_label(
-                "discover_to_request_ms",
-                row.wanted_discovered_at,
-                row.request_sent_at,
-            ),
-            span_label(
-                "request_transit_ms",
-                row.request_sent_at,
-                row.request_received_at,
-            ),
-            span_label(
-                "source_queue_ms",
-                row.request_received_at,
-                row.response_sent_at,
-            ),
-            span_label(
-                "response_transit_ms",
-                row.response_sent_at,
-                row.response_received_at,
-            ),
-            span_label(
-                "receive_to_store_ms",
-                row.response_received_at,
-                row.persisted_at,
-            ),
+            span_label("receive_to_store_ms", row.response_received_at, row.persisted_at),
             span_label("store_to_project_ms", row.persisted_at, row.projected_at),
             span_label("blocked_duration_ms", row.blocked_at, row.unblocked_at),
         ]
@@ -429,17 +222,7 @@ impl<'a> EventTimeline<'a> {
         .collect::<Vec<_>>()
         .join(", ");
         let stages = format!(
-            "discover_start={}; discover_done={}; need_sent={}; need_recv={}; wanted={}; credit_recv={}; req_selected={}; req_sent={}; req_recv={}; resp_sent={}; resp_recv={}; stored={}; blocked={}; unblocked={}; unblocked_by={}; projected={}",
-            fmt_opt(row.discovery_round_started_at),
-            fmt_opt(row.discovery_round_completed_at),
-            fmt_opt(row.need_list_sent_at),
-            fmt_opt(row.need_list_received_at),
-            fmt_opt(row.wanted_discovered_at),
-            fmt_opt(row.request_credit_received_at),
-            fmt_opt(row.request_selected_at),
-            fmt_opt(row.request_sent_at),
-            fmt_opt(row.request_received_at),
-            fmt_opt(row.response_sent_at),
+            "resp_recv={}; stored={}; blocked={}; unblocked={}; unblocked_by={}; projected={}",
             fmt_opt(row.response_received_at),
             fmt_opt(row.persisted_at),
             fmt_opt(row.blocked_at),
@@ -458,25 +241,6 @@ impl<'a> EventTimeline<'a> {
             "event_timeline {}: {}; {}",
             row.event_id, stages, spans
         )))
-    }
-
-    fn mark_many(&self, ids: &[EventId], column: &str, ts: i64) -> SqliteResult<usize> {
-        if !recording_enabled() || ids.is_empty() {
-            return Ok(0);
-        }
-        with_immediate_tx(self.conn, || {
-            let sql = format!(
-                "INSERT INTO event_timeline (event_id, {column}) VALUES (?1, ?2)
-                 ON CONFLICT(event_id) DO UPDATE SET
-                     {column} = COALESCE(event_timeline.{column}, excluded.{column})"
-            );
-            let mut stmt = self.conn.prepare(&sql)?;
-            let mut changed = 0usize;
-            for event_id in ids {
-                changed += stmt.execute(params![event_id_to_base64(event_id), ts])?;
-            }
-            Ok(changed)
-        })
     }
 
     fn mark_b64(&self, event_id_b64: &str, column: &str, ts: i64) -> SqliteResult<()> {
@@ -512,16 +276,6 @@ fn column_exists(conn: &Connection, column: &str) -> SqliteResult<bool> {
     Ok(false)
 }
 
-fn ensure_column(conn: &Connection, column: &str) -> SqliteResult<()> {
-    if !column_exists(conn, column)? {
-        conn.execute(
-            &format!("ALTER TABLE event_timeline ADD COLUMN {column} INTEGER"),
-            [],
-        )?;
-    }
-    Ok(())
-}
-
 fn span_label(label: &str, start: Option<i64>, end: Option<i64>) -> Option<String> {
     Some(format!("{label}={}", end?.saturating_sub(start?)))
 }
@@ -529,6 +283,7 @@ fn span_label(label: &str, start: Option<i64>, end: Option<i64>) -> Option<Strin
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::crypto::{event_id_to_base64, EventId};
     use crate::db::{open_in_memory, schema::create_tables};
 
     fn event_id(byte: u8) -> EventId {
@@ -546,63 +301,35 @@ mod tests {
         let event_id_b64 = event_id_to_base64(&event_id);
 
         timeline
-            .mark_discovered_many_with_round_start(&[event_id], 10, 20)
-            .unwrap();
-        timeline
-            .mark_discovery_round_completed_many(&[event_id], 25)
-            .unwrap();
-        timeline.mark_need_list_sent_many(&[event_id], 26).unwrap();
-        timeline
-            .mark_need_list_received_many(&[event_id], 27)
-            .unwrap();
-        timeline
-            .mark_request_credit_received_many(&[event_id], 28)
-            .unwrap();
-        timeline
-            .mark_request_selected_many(&[event_id], 29)
-            .unwrap();
-        timeline.mark_request_sent_many(&[event_id], 30).unwrap();
-        timeline.mark_request_sent_many(&[event_id], 40).unwrap();
-        timeline
             .mark_response_received_b64(&event_id_b64, 50)
             .unwrap();
         timeline.mark_persisted_b64(&event_id_b64, 60).unwrap();
+        timeline.mark_persisted_b64(&event_id_b64, 70).unwrap();
         timeline.mark_blocked_b64(&event_id_b64, 65).unwrap();
         timeline
-            .mark_unblocked_with_dependency_b64(&event_id_b64, 70, Some("dep-1"))
+            .mark_unblocked_with_dependency_b64(&event_id_b64, 80, Some("dep-1"))
             .unwrap();
-        timeline.mark_projected_b64(&event_id_b64, 80).unwrap();
+        timeline.mark_projected_b64(&event_id_b64, 90).unwrap();
 
         let row = timeline.load(&event_id_b64).unwrap().unwrap();
-        assert_eq!(row.discovery_round_started_at, Some(10));
-        assert_eq!(row.discovery_round_completed_at, Some(25));
-        assert_eq!(row.need_list_sent_at, Some(26));
-        assert_eq!(row.need_list_received_at, Some(27));
-        assert_eq!(row.wanted_discovered_at, Some(20));
-        assert_eq!(row.request_credit_received_at, Some(28));
-        assert_eq!(row.request_selected_at, Some(29));
-        assert_eq!(row.request_sent_at, Some(30));
         assert_eq!(row.response_received_at, Some(50));
         assert_eq!(row.persisted_at, Some(60));
         assert_eq!(row.blocked_at, Some(65));
-        assert_eq!(row.unblocked_at, Some(70));
+        assert_eq!(row.unblocked_at, Some(80));
         assert_eq!(row.unblocked_by_event_id.as_deref(), Some("dep-1"));
-        assert_eq!(row.projected_at, Some(80));
+        assert_eq!(row.projected_at, Some(90));
 
         let summary = timeline.summary(&event_id_b64).unwrap().unwrap();
-        assert!(summary.contains("store_to_project_ms=20"));
-        assert!(summary.contains("selected_to_request_ms=1"));
+        assert!(summary.contains("store_to_project_ms=30"));
         assert!(summary.contains("unblocked_by=dep-1"));
     }
 
     #[test]
     fn parse_groups_mask_accepts_named_subsets() {
-        let mask = parse_groups_mask(Some("discovery, request ,persist"));
-        assert_ne!(mask & TimelineGroup::Discovery.bit(), 0);
-        assert_ne!(mask & TimelineGroup::Request.bit(), 0);
+        let mask = parse_groups_mask(Some("transfer,persist,blocking"));
+        assert_ne!(mask & TimelineGroup::Transfer.bit(), 0);
         assert_ne!(mask & TimelineGroup::Persist.bit(), 0);
-        assert_eq!(mask & TimelineGroup::Transfer.bit(), 0);
+        assert_ne!(mask & TimelineGroup::Blocking.bit(), 0);
         assert_eq!(mask & TimelineGroup::Projection.bit(), 0);
-        assert_eq!(mask & TimelineGroup::Blocking.bit(), 0);
     }
 }

@@ -12,7 +12,6 @@ pub mod sync_log;
 pub mod timeline;
 pub mod transport_creds;
 pub mod transport_trust;
-pub mod wanted;
 
 use rusqlite::{Connection, Result as SqliteResult};
 use std::path::Path;
@@ -103,7 +102,6 @@ fn apply_pragmas(conn: &Connection) -> SqliteResult<()> {
 use crate::tuning::low_mem_mode;
 
 pub fn ensure_infra_schema(conn: &Connection) -> SqliteResult<()> {
-    wanted::ensure_schema(conn)?;
     store::ensure_schema(conn)?;
     event_display::ensure_schema(conn)?;
     project_queue::ensure_schema(conn)?;

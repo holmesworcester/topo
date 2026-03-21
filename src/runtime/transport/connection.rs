@@ -46,12 +46,10 @@ pub struct RecvConnection {
     recv_buffer: Vec<u8>,
 }
 
-/// Dual-stream connection for separating control and data planes
+/// Dual-stream connection for separating control and data planes.
 ///
-/// Control stream: NegOpen, NegMsg, DiscoveryHints, RequestIds, ResponseCredit
-/// Data stream: Event blobs
-///
-/// This prevents large event transfers from blocking control messages.
+/// Control carries session protocol messages. Data carries event blobs.
+/// This keeps bulk transfer from blocking session progress.
 pub struct DualConnection<
     C: StreamConn = Connection,
     S: StreamSend = SendConnection,

@@ -511,11 +511,11 @@ mod tests {
             // While session is alive, trigger with wrong prefix should fail with "no live"
             let result = registry.trigger_round_for_peer("tenant1", "zzzz");
             assert!(result.is_err());
-            assert!(result.unwrap_err().contains("no live initiator session"));
+            assert!(result.unwrap_err().contains("no live session"));
         }
         // After drop, trigger should also fail with "no live"
         let result = registry.trigger_round_for_peer("tenant1", "abcd");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no live initiator session"));
+        assert!(result.unwrap_err().contains("no live session"));
     }
 }

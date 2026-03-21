@@ -12,9 +12,9 @@ use crate::contracts::peering_contract::{next_session_id, TransportSessionIo};
 use super::{DualConnection, QuicTransportSessionIo};
 
 const SESSION_STREAM_HEADER_MAGIC: [u8; 4] = *b"P7SS";
-const SESSION_STREAM_HEADER_VERSION: u8 = 2;
-// v2 header: [4 magic][1 version][1 kind][8 session_id][8 commit_hash] = 22 bytes
-const SESSION_STREAM_HEADER_LEN: usize = 22;
+const SESSION_STREAM_HEADER_VERSION: u8 = 3;
+// v3 header: [4 magic][1 version][1 class][1 kind][8 session_id][8 commit_hash] = 23 bytes
+const SESSION_STREAM_HEADER_LEN: usize = 23;
 const BUILD_MISMATCH_PREFIX: &str =
     "Version negotiation is out of scope for this PoC -- builds must be from the same commit.";
 const CONNECTION_CLOSE_REASON_LIMIT: usize = 900;
@@ -111,10 +111,36 @@ impl SessionStreamKind {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum SessionClass {
+    Range,
+    Dependency,
+}
+
+impl SessionClass {
+    fn to_byte(self) -> u8 {
+        match self {
+            Self::Range => 0,
+            Self::Dependency => 1,
+        }
+    }
+
+    fn from_byte(value: u8) -> Result<Self, SessionOpenError> {
+        match value {
+            0 => Ok(Self::Range),
+            1 => Ok(Self::Dependency),
+            other => Err(SessionOpenError::Protocol(format!(
+                "invalid session class {other}"
+            ))),
+        }
+    }
+}
+
 type BiStream = (quinn::SendStream, quinn::RecvStream);
 
 #[derive(Default)]
 struct PendingInboundSession {
+    class: Option<SessionClass>,
     control: Option<BiStream>,
     data: Option<BiStream>,
 }
@@ -147,14 +173,16 @@ impl std::error::Error for SessionOpenError {}
 async fn write_session_stream_header(
     send: &mut quinn::SendStream,
     session_id: u64,
+    class: SessionClass,
     kind: SessionStreamKind,
 ) -> Result<(), SessionOpenError> {
     let mut header = [0u8; SESSION_STREAM_HEADER_LEN];
     header[..4].copy_from_slice(&SESSION_STREAM_HEADER_MAGIC);
     header[4] = SESSION_STREAM_HEADER_VERSION;
-    header[5] = kind.to_byte();
-    header[6..14].copy_from_slice(&session_id.to_be_bytes());
-    header[14..22].copy_from_slice(&local_commit_hash());
+    header[5] = class.to_byte();
+    header[6] = kind.to_byte();
+    header[7..15].copy_from_slice(&session_id.to_be_bytes());
+    header[15..23].copy_from_slice(&local_commit_hash());
     send.write_all(&header)
         .await
         .map_err(|e| SessionOpenError::ConnectionLost(format!("write session header: {e}")))?;
@@ -166,9 +194,9 @@ async fn write_session_stream_header(
 
 async fn read_session_stream_header(
     recv: &mut quinn::RecvStream,
-) -> Result<(u64, SessionStreamKind), SessionOpenError> {
-    // Read first 6 bytes to check magic + version before committing to full read.
-    let mut prefix = [0u8; 6];
+) -> Result<(u64, SessionClass, SessionStreamKind), SessionOpenError> {
+    // Read first 7 bytes to check magic + version before committing to full read.
+    let mut prefix = [0u8; 7];
     recv.read_exact(&mut prefix)
         .await
         .map_err(|e| SessionOpenError::ConnectionLost(format!("read session header: {e}")))?;
@@ -183,7 +211,8 @@ async fn read_session_stream_header(
             build_mismatch_reason_remote_protocol(remote_version),
         ));
     }
-    let kind = SessionStreamKind::from_byte(prefix[5])?;
+    let class = SessionClass::from_byte(prefix[5])?;
+    let kind = SessionStreamKind::from_byte(prefix[6])?;
 
     // Read remaining 16 bytes: [8 session_id][8 commit_hash]
     let mut rest = [0u8; 16];
@@ -203,11 +232,12 @@ async fn read_session_stream_header(
         ));
     }
 
-    Ok((u64::from_be_bytes(session_id_bytes), kind))
+    Ok((u64::from_be_bytes(session_id_bytes), class, kind))
 }
 
 struct CompletedInboundSession {
     session_id: u64,
+    class: SessionClass,
     control: BiStream,
     data: BiStream,
 }
@@ -215,6 +245,7 @@ struct CompletedInboundSession {
 fn insert_pending_stream(
     state: &InboundSessionState,
     session_id: u64,
+    class: SessionClass,
     kind: SessionStreamKind,
     send: quinn::SendStream,
     recv: quinn::RecvStream,
@@ -224,6 +255,16 @@ fn insert_pending_stream(
         .lock()
         .map_err(|_| SessionOpenError::Protocol("pending session state poisoned".to_string()))?;
     let entry = pending.entry(session_id).or_default();
+    match entry.class {
+        Some(existing) if existing != class => {
+            return Err(SessionOpenError::Protocol(format!(
+                "mismatched session class for session {}",
+                session_id
+            )))
+        }
+        None => entry.class = Some(class),
+        Some(_) => {}
+    }
     let slot = match kind {
         SessionStreamKind::Control => &mut entry.control,
         SessionStreamKind::Data => &mut entry.data,
@@ -240,6 +281,7 @@ fn insert_pending_stream(
         let complete = pending.remove(&session_id).expect("pending entry exists");
         Ok(Some(CompletedInboundSession {
             session_id,
+            class: complete.class.expect("session class present"),
             control: complete.control.expect("control stream present"),
             data: complete.data.expect("data stream present"),
         }))
@@ -248,39 +290,54 @@ fn insert_pending_stream(
     }
 }
 
-/// Open two bidirectional streams (control + data) as initiator and wrap
-/// into a `TransportSessionIo`. Returns `(session_id, io)`.
-pub async fn open_session_io(
+pub async fn open_session_io_for_class(
     conn: &quinn::Connection,
+    class: SessionClass,
 ) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError> {
     let session_id = next_session_id();
     let (mut ctrl_send, ctrl_recv) = conn
         .open_bi()
         .await
         .map_err(|e| SessionOpenError::ConnectionLost(format!("control open: {e}")))?;
-    write_session_stream_header(&mut ctrl_send, session_id, SessionStreamKind::Control).await?;
+    write_session_stream_header(&mut ctrl_send, session_id, class, SessionStreamKind::Control)
+        .await?;
     let (mut data_send, data_recv) = conn
         .open_bi()
         .await
         .map_err(|e| SessionOpenError::ConnectionLost(format!("data open: {e}")))?;
-    write_session_stream_header(&mut data_send, session_id, SessionStreamKind::Data).await?;
+    write_session_stream_header(&mut data_send, session_id, class, SessionStreamKind::Data)
+        .await?;
     let dual = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
     let io = QuicTransportSessionIo::new(session_id, dual);
     Ok((session_id, Box::new(io)))
 }
 
+/// Open two bidirectional streams (control + data) as a range session.
+pub async fn open_session_io(
+    conn: &quinn::Connection,
+) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError> {
+    open_session_io_for_class(conn, SessionClass::Range).await
+}
+
+/// Open two bidirectional streams (control + data) as a dependency session.
+pub async fn open_dependency_session_io(
+    conn: &quinn::Connection,
+) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError> {
+    open_session_io_for_class(conn, SessionClass::Dependency).await
+}
+
 /// Accept two bidirectional streams (control + data) as responder and wrap
-/// into a `TransportSessionIo`. Returns `(session_id, io)`.
+/// into a `TransportSessionIo`. Returns `(session_id, class, io)`.
 pub async fn accept_session_io(
     conn: &quinn::Connection,
     state: &InboundSessionState,
-) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError> {
+) -> Result<(u64, SessionClass, Box<dyn TransportSessionIo>), SessionOpenError> {
     loop {
         let (send, mut recv) = conn
             .accept_bi()
             .await
             .map_err(|e| SessionOpenError::ConnectionLost(format!("stream accept: {e}")))?;
-        let (session_id, kind) = match read_session_stream_header(&mut recv).await {
+        let (session_id, class, kind) = match read_session_stream_header(&mut recv).await {
             Ok(header) => header,
             Err(SessionOpenError::Protocol(message))
                 if extract_build_mismatch_reason(&message).is_some() =>
@@ -291,7 +348,9 @@ pub async fn accept_session_io(
             }
             Err(err) => return Err(err),
         };
-        if let Some(complete) = insert_pending_stream(state, session_id, kind, send, recv)? {
+        if let Some(complete) =
+            insert_pending_stream(state, session_id, class, kind, send, recv)?
+        {
             let dual = DualConnection::new(
                 complete.control.0,
                 complete.control.1,
@@ -299,7 +358,7 @@ pub async fn accept_session_io(
                 complete.data.1,
             );
             let io = QuicTransportSessionIo::new(complete.session_id, dual);
-            return Ok((complete.session_id, Box::new(io)));
+            return Ok((complete.session_id, complete.class, Box::new(io)));
         }
     }
 }
@@ -318,9 +377,9 @@ mod tests {
 
     use super::{
         accept_session_io, local_commit_hash_str, local_commit_subject, open_session_io,
-        write_session_stream_header, InboundSessionState, SessionOpenError, SessionStreamKind,
-        BUILD_MISMATCH_PREFIX, SESSION_STREAM_HEADER_LEN, SESSION_STREAM_HEADER_MAGIC,
-        SESSION_STREAM_HEADER_VERSION,
+        write_session_stream_header, InboundSessionState, SessionClass, SessionOpenError,
+        SessionStreamKind, BUILD_MISMATCH_PREFIX, SESSION_STREAM_HEADER_LEN,
+        SESSION_STREAM_HEADER_MAGIC, SESSION_STREAM_HEADER_VERSION,
     };
 
     async fn connected_pair() -> Result<
@@ -420,18 +479,29 @@ mod tests {
         // Pre-open the two bi streams the responder expects.
         let session_id = 77;
         let (mut ctrl_send, _ctrl_recv) = client_conn.open_bi().await.expect("open control bi");
-        write_session_stream_header(&mut ctrl_send, session_id, SessionStreamKind::Control)
-            .await
-            .expect("write control header");
+        write_session_stream_header(
+            &mut ctrl_send,
+            session_id,
+            SessionClass::Range,
+            SessionStreamKind::Control,
+        )
+        .await
+        .expect("write control header");
         let (mut data_send, _data_recv) = client_conn.open_bi().await.expect("open data bi");
-        write_session_stream_header(&mut data_send, session_id, SessionStreamKind::Data)
-            .await
-            .expect("write data header");
+        write_session_stream_header(
+            &mut data_send,
+            session_id,
+            SessionClass::Range,
+            SessionStreamKind::Data,
+        )
+        .await
+        .expect("write data header");
 
-        let (server_session_id, server_io) = accept_session_io(&server_conn, &inbound_state)
+        let (server_session_id, server_class, server_io) = accept_session_io(&server_conn, &inbound_state)
             .await
             .expect("accept_session_io");
         assert_eq!(server_session_id, session_id);
+        assert_eq!(server_class, SessionClass::Range);
         drop(server_io);
     }
 
@@ -449,9 +519,14 @@ mod tests {
         let data_b = Frame::Event { blob: vec![0xb2] };
 
         let (mut ctrl_a_send, _ctrl_a_recv) = client_conn.open_bi().await.expect("open ctrl a");
-        write_session_stream_header(&mut ctrl_a_send, session_a, SessionStreamKind::Control)
-            .await
-            .expect("write ctrl a header");
+        write_session_stream_header(
+            &mut ctrl_a_send,
+            session_a,
+            SessionClass::Range,
+            SessionStreamKind::Control,
+        )
+        .await
+        .expect("write ctrl a header");
         ctrl_a_send
             .write_all(&encode_frame(&control_a))
             .await
@@ -459,9 +534,14 @@ mod tests {
         ctrl_a_send.flush().await.expect("flush ctrl a frame");
 
         let (mut ctrl_b_send, _ctrl_b_recv) = client_conn.open_bi().await.expect("open ctrl b");
-        write_session_stream_header(&mut ctrl_b_send, session_b, SessionStreamKind::Control)
-            .await
-            .expect("write ctrl b header");
+        write_session_stream_header(
+            &mut ctrl_b_send,
+            session_b,
+            SessionClass::Range,
+            SessionStreamKind::Control,
+        )
+        .await
+        .expect("write ctrl b header");
         ctrl_b_send
             .write_all(&encode_frame(&control_b))
             .await
@@ -469,9 +549,14 @@ mod tests {
         ctrl_b_send.flush().await.expect("flush ctrl b frame");
 
         let (mut data_a_send, _data_a_recv) = client_conn.open_bi().await.expect("open data a");
-        write_session_stream_header(&mut data_a_send, session_a, SessionStreamKind::Data)
-            .await
-            .expect("write data a header");
+        write_session_stream_header(
+            &mut data_a_send,
+            session_a,
+            SessionClass::Range,
+            SessionStreamKind::Data,
+        )
+        .await
+        .expect("write data a header");
         data_a_send
             .write_all(&encode_frame(&data_a))
             .await
@@ -479,19 +564,26 @@ mod tests {
         data_a_send.flush().await.expect("flush data a frame");
 
         let (mut data_b_send, _data_b_recv) = client_conn.open_bi().await.expect("open data b");
-        write_session_stream_header(&mut data_b_send, session_b, SessionStreamKind::Data)
-            .await
-            .expect("write data b header");
+        write_session_stream_header(
+            &mut data_b_send,
+            session_b,
+            SessionClass::Range,
+            SessionStreamKind::Data,
+        )
+        .await
+        .expect("write data b header");
         data_b_send
             .write_all(&encode_frame(&data_b))
             .await
             .expect("write data b frame");
         data_b_send.flush().await.expect("flush data b frame");
 
-        let (accepted_a_id, accepted_a_io) = accept_session_io(&server_conn, &inbound_state)
+        let (accepted_a_id, accepted_a_class, accepted_a_io) =
+            accept_session_io(&server_conn, &inbound_state)
             .await
             .expect("accept first session");
         assert_eq!(accepted_a_id, session_a);
+        assert_eq!(accepted_a_class, SessionClass::Range);
         let mut accepted_a = accepted_a_io.split();
         let accepted_a_control = accepted_a.control.recv().await.expect("recv control a");
         let accepted_a_data = accepted_a.data_recv.recv().await.expect("recv data a");
@@ -504,10 +596,12 @@ mod tests {
             data_a
         );
 
-        let (accepted_b_id, accepted_b_io) = accept_session_io(&server_conn, &inbound_state)
+        let (accepted_b_id, accepted_b_class, accepted_b_io) =
+            accept_session_io(&server_conn, &inbound_state)
             .await
             .expect("accept second session");
         assert_eq!(accepted_b_id, session_b);
+        assert_eq!(accepted_b_class, SessionClass::Range);
         let mut accepted_b = accepted_b_io.split();
         let accepted_b_control = accepted_b.control.recv().await.expect("recv control b");
         let accepted_b_data = accepted_b.data_recv.recv().await.expect("recv data b");
@@ -558,9 +652,10 @@ mod tests {
         let mut header = [0u8; SESSION_STREAM_HEADER_LEN];
         header[..4].copy_from_slice(&SESSION_STREAM_HEADER_MAGIC);
         header[4] = SESSION_STREAM_HEADER_VERSION;
-        header[5] = SessionStreamKind::Control.to_byte();
-        header[6..14].copy_from_slice(&77u64.to_be_bytes());
-        header[14..22].copy_from_slice(&remote_hash);
+        header[5] = SessionClass::Range.to_byte();
+        header[6] = SessionStreamKind::Control.to_byte();
+        header[7..15].copy_from_slice(&77u64.to_be_bytes());
+        header[15..23].copy_from_slice(&remote_hash);
         ctrl_send
             .write_all(&header)
             .await

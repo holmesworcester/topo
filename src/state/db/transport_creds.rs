@@ -18,12 +18,15 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
         );
         CREATE TABLE IF NOT EXISTS local_transport_targets (
             tenant_id TEXT PRIMARY KEY,
-            transport_peer_id TEXT NOT NULL UNIQUE,
+            transport_peer_id TEXT NOT NULL,
             source TEXT NOT NULL,
             created_at INTEGER NOT NULL
         );
         CREATE INDEX IF NOT EXISTS idx_local_transport_targets_transport_peer_id
             ON local_transport_targets(transport_peer_id);
+        CREATE UNIQUE INDEX IF NOT EXISTS idx_local_transport_targets_peershared_owner
+            ON local_transport_targets(transport_peer_id)
+            WHERE source = 'peershared';
         ",
     )?;
     // Schema epoch is fixed for this POC, but allow additive column convergence so
@@ -60,7 +63,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
         .optional()?;
     if target_table_sql
         .as_deref()
-        .map(|sql| !sql.contains("transport_peer_id TEXT NOT NULL UNIQUE"))
+        .map(|sql| sql.contains("transport_peer_id TEXT NOT NULL UNIQUE"))
         .unwrap_or(false)
     {
         conn.execute_batch(
@@ -68,11 +71,11 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             ALTER TABLE local_transport_targets RENAME TO local_transport_targets_old;
             CREATE TABLE local_transport_targets (
                 tenant_id TEXT PRIMARY KEY,
-                transport_peer_id TEXT NOT NULL UNIQUE,
+                transport_peer_id TEXT NOT NULL,
                 source TEXT NOT NULL,
                 created_at INTEGER NOT NULL
             );
-            INSERT OR IGNORE INTO local_transport_targets (tenant_id, transport_peer_id, source, created_at)
+            INSERT OR REPLACE INTO local_transport_targets (tenant_id, transport_peer_id, source, created_at)
             SELECT tenant_id, transport_peer_id, source, created_at
             FROM local_transport_targets_old
             ORDER BY CASE source
@@ -85,6 +88,9 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             DROP TABLE local_transport_targets_old;
             CREATE INDEX IF NOT EXISTS idx_local_transport_targets_transport_peer_id
                 ON local_transport_targets(transport_peer_id);
+            CREATE UNIQUE INDEX IF NOT EXISTS idx_local_transport_targets_peershared_owner
+                ON local_transport_targets(transport_peer_id)
+                WHERE source = 'peershared';
             ",
         )?;
     }
@@ -114,6 +120,34 @@ pub fn set_local_transport_target(
         .duration_since(UNIX_EPOCH)
         .unwrap()
         .as_millis() as i64;
+    let conflicting_owner: Option<(String, String)> = conn
+        .query_row(
+            "SELECT tenant_id, source
+             FROM local_transport_targets
+             WHERE transport_peer_id = ?1
+               AND tenant_id != ?2
+             ORDER BY CASE source
+                          WHEN 'peershared' THEN 0
+                          WHEN 'bootstrap' THEN 1
+                          ELSE 2
+                      END,
+                      created_at ASC,
+                      tenant_id ASC
+             LIMIT 1",
+            rusqlite::params![transport_peer_id, tenant_id],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .optional()?;
+    if let Some((existing_tenant_id, existing_source)) = conflicting_owner {
+        if source == CRED_SOURCE_PEER_SHARED || existing_source == CRED_SOURCE_PEER_SHARED {
+            return Err(format!(
+                "failed to set local transport target tenant={} transport_peer_id={} source={}: already owned by tenant={} source={}",
+                tenant_id, transport_peer_id, source, existing_tenant_id, existing_source
+            )
+            .into());
+        }
+    }
+
     if let Err(err) = conn.execute(
         "INSERT INTO local_transport_targets (tenant_id, transport_peer_id, source, created_at)
          VALUES (?1, ?2, ?3, ?4)
@@ -160,23 +194,37 @@ pub fn resolve_local_transport_target(
     conn: &Connection,
     transport_peer_id: &str,
 ) -> Result<Option<LocalTransportTarget>, Box<dyn std::error::Error + Send + Sync>> {
-    let target = conn
-        .query_row(
-            "SELECT tenant_id, transport_peer_id, source
-             FROM local_transport_targets
-             WHERE transport_peer_id = ?1
-             LIMIT 1",
-            rusqlite::params![transport_peer_id],
-            |row| {
-                Ok(LocalTransportTarget {
-                    tenant_id: row.get(0)?,
-                    transport_peer_id: row.get(1)?,
-                    source: row.get(2)?,
-                })
-            },
-        )
-        .optional()?;
-    Ok(target)
+    Ok(resolve_local_transport_targets(conn, transport_peer_id)?
+        .into_iter()
+        .next())
+}
+
+pub fn resolve_local_transport_targets(
+    conn: &Connection,
+    transport_peer_id: &str,
+) -> Result<Vec<LocalTransportTarget>, Box<dyn std::error::Error + Send + Sync>> {
+    let mut stmt = conn.prepare(
+        "SELECT tenant_id, transport_peer_id, source
+         FROM local_transport_targets
+         WHERE transport_peer_id = ?1
+         ORDER BY CASE source
+                      WHEN 'peershared' THEN 0
+                      WHEN 'bootstrap' THEN 1
+                      ELSE 2
+                  END,
+                  created_at ASC,
+                  tenant_id ASC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![transport_peer_id], |row| {
+            Ok(LocalTransportTarget {
+                tenant_id: row.get(0)?,
+                transport_peer_id: row.get(1)?,
+                source: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
 }
 
 pub fn resolve_tenant_transport_target(
@@ -569,17 +617,42 @@ mod tests {
     }
 
     #[test]
-    fn test_transport_target_stays_unique_across_tenants() {
+    fn test_bootstrap_transport_target_can_be_shared_across_tenants() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
         set_local_transport_target(&conn, "tenant_a", "bootstrap_peer", CRED_SOURCE_BOOTSTRAP)
             .unwrap();
-        let err =
-            set_local_transport_target(&conn, "tenant_b", "bootstrap_peer", CRED_SOURCE_BOOTSTRAP)
-                .unwrap_err();
+        set_local_transport_target(&conn, "tenant_b", "bootstrap_peer", CRED_SOURCE_BOOTSTRAP)
+            .unwrap();
+
+        let targets = resolve_local_transport_targets(&conn, "bootstrap_peer").unwrap();
+        assert_eq!(targets.len(), 2);
+        assert_eq!(targets[0].tenant_id, "tenant_a");
+        assert_eq!(targets[1].tenant_id, "tenant_b");
+    }
+
+    #[test]
+    fn test_peershared_transport_target_stays_unique_across_tenants() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        set_local_transport_target(
+            &conn,
+            "tenant_a",
+            "shared_peer",
+            CRED_SOURCE_PEER_SHARED,
+        )
+        .unwrap();
+        let err = set_local_transport_target(
+            &conn,
+            "tenant_b",
+            "shared_peer",
+            CRED_SOURCE_BOOTSTRAP,
+        )
+        .unwrap_err();
         assert!(
-            err.to_string().contains("UNIQUE constraint failed"),
+            err.to_string().contains("already owned"),
             "unexpected error: {err}"
         );
     }

@@ -9,8 +9,7 @@ use topo::protocol::Frame;
 use topo::sync::session_handler::SyncConnectionHandler;
 
 use crate::fake_session_io::{
-    create_test_db, empty_negentropy_storage, fake_session_io_pair, noop_ingest_tx, run_local,
-    test_session_meta,
+    create_test_db, empty_negentropy_storage, fake_session_io_pair, run_local, test_session_meta,
 };
 
 async fn drive_empty_inbound_round(peer: &mut crate::fake_session_io::FakePeerSide) {
@@ -50,12 +49,7 @@ async fn drive_empty_inbound_round(peer: &mut crate::fake_session_io::FakePeerSi
 async fn responder_inbound_replies_negmsg_and_stays_open_for_next_round() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncConnectionHandler::responder(
-            db_path,
-            30,
-            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
-            noop_ingest_tx(),
-        );
+        let handler = SyncConnectionHandler::responder(db_path, 30);
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -90,12 +84,7 @@ async fn responder_inbound_replies_negmsg_and_stays_open_for_next_round() {
 async fn responder_rejects_outbound_direction() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncConnectionHandler::responder(
-            db_path,
-            30,
-            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
-            noop_ingest_tx(),
-        );
+        let handler = SyncConnectionHandler::responder(db_path, 30);
         let meta = test_session_meta(SessionDirection::Outbound);
         let cancel = CancellationToken::new();
 
@@ -117,12 +106,7 @@ async fn responder_rejects_outbound_direction() {
 async fn responder_ignores_empty_request_ids_marker() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncConnectionHandler::responder(
-            db_path,
-            30,
-            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
-            noop_ingest_tx(),
-        );
+        let handler = SyncConnectionHandler::responder(db_path, 30);
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 

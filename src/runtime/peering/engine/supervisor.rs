@@ -32,7 +32,6 @@ use crate::peering::loops::{
     IntroSpawnerFn,
 };
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
-use crate::sync::CoordinationManager;
 use crate::transport::{
     build_tenant_bootstrap_fallback_client_config_for_invite_from_db,
     build_tenant_client_config_from_db, TenantClientConfigs, TransportClientConfig,
@@ -94,7 +93,6 @@ enum WorkerExitDisposition {
 #[derive(Clone)]
 struct TenantDispatchContext {
     client_config: TransportClientConfig,
-    coordination_manager: Arc<CoordinationManager>,
 }
 
 #[derive(Clone, Debug)]
@@ -432,7 +430,6 @@ fn build_tenant_contexts(
             tenant_id.clone(),
             TenantDispatchContext {
                 client_config,
-                coordination_manager: Arc::new(CoordinationManager::new()),
             },
         );
     }
@@ -788,7 +785,6 @@ async fn run_target_dispatcher(
                 Ok(client_config) => {
                     let context = TenantDispatchContext {
                         client_config,
-                        coordination_manager: Arc::new(CoordinationManager::new()),
                     };
                     tenant_contexts.insert(event.tenant_id.clone(), context.clone());
                     context
@@ -1109,7 +1105,6 @@ async fn run_connect_worker(
             Some(context.client_config.clone()),
             intro_spawner,
             ingest,
-            context.coordination_manager.clone(),
             shutdown.clone(),
             bootstrap_fallback_client_config.clone(),
             sync_control.clone(),

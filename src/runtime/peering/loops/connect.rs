@@ -1,7 +1,6 @@
 //! Connect-side loops: outbound QUIC connections and initiator sync runs.
 
 use std::net::SocketAddr;
-use std::sync::Arc;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
@@ -13,8 +12,8 @@ use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
 use crate::db::transport_trust::record_transport_binding;
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
+use crate::sync::session::dependency_session::spawn_outbound_dependency_session;
 use crate::sync::session::windowing::reset_outbound_window_state;
-use crate::sync::CoordinationManager;
 use crate::sync::SyncConnectionHandler;
 use crate::transport::multi_workspace::transport_sni;
 use crate::transport::{
@@ -48,10 +47,6 @@ const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
 /// When `client_config` is `Some`, outbound dials present the correct per-tenant
 /// cert and tenant-scoped trust.
 ///
-/// The initiator participates in tenant-scoped coordinated multi-source pull:
-/// discovery persists durable `wanted` state, and a shared in-memory
-/// coordinator assigns pull requests across all peers sharing this connect
-/// context.
 pub async fn connect_loop(
     db_path: &str,
     recorded_by: &str,
@@ -62,10 +57,6 @@ pub async fn connect_loop(
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Default connect loop path is coordinated as well: a single-peer
-    // coordinator degenerates to pass-through assignment but keeps one
-    // initiator behavior across tests and runtime.
-    let coordination_manager = Arc::new(CoordinationManager::new());
     connect_loop_with_coordination(
         db_path,
         recorded_by,
@@ -75,12 +66,10 @@ pub async fn connect_loop(
         client_config,
         intro_spawner,
         ingest,
-        coordination_manager,
     )
     .await
 }
 
-/// Coordinated connect loop variant used by runtime target planners.
 pub async fn connect_loop_with_coordination(
     db_path: &str,
     recorded_by: &str,
@@ -90,7 +79,6 @@ pub async fn connect_loop_with_coordination(
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
-    coordination_manager: Arc<CoordinationManager>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     connect_loop_with_coordination_until_cancel(
         db_path,
@@ -101,13 +89,11 @@ pub async fn connect_loop_with_coordination(
         client_config,
         intro_spawner,
         ingest,
-        coordination_manager,
         CancellationToken::new(),
     )
     .await
 }
 
-/// Coordinated connect loop with explicit cancellation.
 pub async fn connect_loop_with_coordination_until_cancel(
     db_path: &str,
     recorded_by: &str,
@@ -117,7 +103,6 @@ pub async fn connect_loop_with_coordination_until_cancel(
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
-    coordination_manager: Arc<CoordinationManager>,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     connect_loop_with_coordination_until_cancel_with_fallback(
@@ -129,7 +114,6 @@ pub async fn connect_loop_with_coordination_until_cancel(
         client_config,
         intro_spawner,
         ingest,
-        coordination_manager,
         shutdown,
         None,
         None,
@@ -148,7 +132,6 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
-    coordination_manager: Arc<CoordinationManager>,
     shutdown: CancellationToken,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
     sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
@@ -159,11 +142,6 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
     // Shared batch_writer: single writer thread for all outbound initiator
     // sessions on this connect loop.
     let shared_ingest = spawn_shared_ingest_writer(db_path, ingest);
-
-    // Register this connect loop's peer before starting sessions. The handle
-    // is reused across reconnect sessions and carries the bounded in-memory
-    // request state used by the shared pull coordinator.
-    let coordination = coordination_manager.register_peer();
 
     // Use LocalSet so the intro listener (spawn_intro_listener uses spawn_local)
     // can run on the same runtime that drives the endpoint I/O.
@@ -178,7 +156,6 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
             client_config,
             intro_spawner,
             shared_ingest,
-            coordination,
             shutdown,
             bootstrap_fallback_client_config,
             sync_control,
@@ -200,7 +177,6 @@ pub async fn connect_loop_with_shared_ingest(
     remote_transport_peer_id: &str,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
-    coordination: Arc<crate::sync::session::coordinator::PeerCoord>,
     shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     connect_loop_with_shared_ingest_until_cancel(
@@ -211,7 +187,6 @@ pub async fn connect_loop_with_shared_ingest(
         remote_transport_peer_id,
         intro_spawner,
         ingest,
-        coordination,
         shared_ingest,
         CancellationToken::new(),
     )
@@ -228,7 +203,6 @@ pub async fn connect_loop_with_shared_ingest_until_cancel(
     remote_transport_peer_id: &str,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
-    coordination: Arc<crate::sync::session::coordinator::PeerCoord>,
     shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -246,7 +220,6 @@ pub async fn connect_loop_with_shared_ingest_until_cancel(
             None,
             intro_spawner,
             shared_ingest,
-            coordination,
             shutdown,
             None,
             None,
@@ -263,7 +236,6 @@ async fn connect_loop_inner(
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
-    coordination: Arc<crate::sync::session::coordinator::PeerCoord>,
     shutdown: CancellationToken,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
     sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
@@ -390,13 +362,9 @@ async fn connect_loop_inner(
         );
         // Handler state is scoped to this authenticated connection so any
         // connection-lifetime sync state is dropped when the connection is.
-        let initiator_handler = SyncConnectionHandler::outbound(
-            db_path.to_string(),
-            SYNC_SESSION_TIMEOUT_SECS,
-            coordination.clone(),
-            shared_ingest.clone(),
-        )
-        .with_sync_control(sync_control.clone());
+        let initiator_handler =
+            SyncConnectionHandler::outbound(db_path.to_string(), SYNC_SESSION_TIMEOUT_SECS)
+                .with_sync_control(sync_control.clone());
         reset_outbound_window_state(db_path, &peer_id);
 
         // Record endpoint observation, transport binding, and purge expired
@@ -435,6 +403,15 @@ async fn connect_loop_inner(
                 client_config.clone()
             },
             shared_ingest.clone(),
+        );
+
+        let _dependency_handle = spawn_outbound_dependency_session(
+            connection.clone(),
+            db_path.to_string(),
+            recorded_by.to_string(),
+            peer_id.clone(),
+            connection.remote_address(),
+            shutdown.child_token(),
         );
 
         // Keep session scope pinned to the planner-assigned tenant.

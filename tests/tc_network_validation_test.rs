@@ -133,12 +133,15 @@ async fn exercise_roundtrip(
             }
         );
 
-        // HaveList: server → client
-        let have_list = encode_frame(&Frame::HaveList { ids: vec![] });
-        server_parts.control.send(&have_list).await?;
+        // NegMsg: server → client
+        let neg_msg = encode_frame(&Frame::NegMsg { msg: vec![round as u8] });
+        server_parts.control.send(&neg_msg).await?;
         server_parts.control.flush().await?;
         let received = client_parts.control.recv().await?;
-        assert_eq!(parse_frame(&received)?.0, Frame::HaveList { ids: vec![] });
+        assert_eq!(
+            parse_frame(&received)?.0,
+            Frame::NegMsg { msg: vec![round as u8] }
+        );
 
         // Event: client → server (bulk data)
         let payload = vec![round as u8; data_payload_len];

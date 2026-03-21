@@ -5,11 +5,10 @@
 //! - shared ingest writer setup
 //! - one long-lived sync connection scope per authenticated connection
 
-use std::collections::HashMap;
 use std::sync::atomic::AtomicU64;
-use std::sync::{Arc, Mutex, OnceLock};
+use std::sync::Arc;
 
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -22,15 +21,14 @@ use crate::db::schema::create_tables;
 use crate::runtime::build_mismatch::note_build_mismatch;
 use crate::runtime::memtrace;
 use crate::runtime::repeated_warning::should_emit_globally;
+use crate::sync::session::dependency_session::run_dependency_session;
 use crate::sync::session::receive_log::recover_receive_logs;
 use crate::sync::SyncConnectionHandler;
 use crate::transport::session_factory::extract_build_mismatch_reason;
-use crate::transport::SessionProvider;
+use crate::transport::{SessionClass, SessionProvider};
 use crate::tuning::{low_mem_memtrace, low_mem_mode};
 
 use super::{current_timestamp_ms, drain_batch_size, run_session, shared_ingest_cap};
-
-static PEER_SESSION_GATES: OnceLock<Mutex<HashMap<String, Arc<AsyncMutex<()>>>>> = OnceLock::new();
 
 /// How a session loop resolves the tenant (`recorded_by`) for each session.
 pub(super) enum SessionTenantResolver {
@@ -221,32 +219,33 @@ pub(super) async fn supervise_connection_sessions(
         };
 
         let session_start = std::time::Instant::now();
-        let gate = peer_session_gate(db_path, &recorded_by, peer_id);
-        let gate_wait_start = std::time::Instant::now();
-        let session_slot = match gate.try_lock() {
-            Ok(guard) => guard,
-            Err(_) => {
-                info!(
-                    "Session {} ({:?}) on connection {} waiting for peer session slot tenant={} peer={}",
-                    session.session_id,
-                    direction,
-                    connection.stable_id(),
-                    short_peer_id(&recorded_by),
-                    short_peer_id(peer_id)
-                );
-                let guard = gate.lock().await;
-                info!(
-                    "Session {} ({:?}) on connection {} acquired peer session slot after {}ms tenant={} peer={}",
-                    session.session_id,
-                    direction,
-                    connection.stable_id(),
-                    gate_wait_start.elapsed().as_millis(),
-                    short_peer_id(&recorded_by),
-                    short_peer_id(peer_id)
-                );
-                guard
-            }
-        };
+        if session.class == SessionClass::Dependency {
+            let db_path = db_path.to_string();
+            let recorded_by = recorded_by.clone();
+            let peer_id = peer_id.to_string();
+            let remote_addr = session.remote_addr;
+            let dep_shutdown = shutdown.child_token();
+            tokio::task::spawn_local(async move {
+                if let Err(err) = run_dependency_session(
+                    session.io,
+                    db_path,
+                    recorded_by,
+                    peer_id.clone(),
+                    remote_addr,
+                    dep_shutdown,
+                )
+                .await
+                {
+                    warn!(
+                        "Dependency session {} error peer={}: {}",
+                        session.session_id,
+                        short_peer_id(&peer_id),
+                        err
+                    );
+                }
+            });
+            continue;
+        }
         info!(
             "Starting session {} ({:?}) on connection {}",
             session.session_id,
@@ -265,7 +264,6 @@ pub(super) async fn supervise_connection_sessions(
             db_path,
         )
         .await;
-        drop(session_slot);
 
         info!(
             "Session {} ({:?}) on connection {} finished in {}ms",
@@ -291,20 +289,9 @@ fn short_peer_id(peer_id: &str) -> &str {
     &peer_id[..16.min(peer_id.len())]
 }
 
-fn peer_session_gate(db_path: &str, tenant_id: &str, peer_id: &str) -> Arc<AsyncMutex<()>> {
-    let key = format!("{db_path}|{tenant_id}|{peer_id}");
-    let registry = PEER_SESSION_GATES.get_or_init(|| Mutex::new(HashMap::new()));
-    let mut registry = registry.lock().expect("peer session gate registry");
-    registry
-        .entry(key)
-        .or_insert_with(|| Arc::new(AsyncMutex::new(())))
-        .clone()
-}
-
 #[cfg(test)]
 mod tests {
     use std::sync::atomic::{AtomicUsize, Ordering};
-    use std::sync::Arc;
 
     use super::*;
 
@@ -351,29 +338,5 @@ mod tests {
             "0123456789abcdef"
         );
         assert_eq!(short_peer_id("short"), "short");
-    }
-
-    #[tokio::test]
-    async fn peer_session_gate_serializes_same_peer_key() {
-        let gate_a = peer_session_gate("/tmp/a.db", "tenant-a", "peer-a");
-        let gate_b = peer_session_gate("/tmp/a.db", "tenant-a", "peer-a");
-
-        let _guard = gate_a.lock().await;
-        assert!(
-            gate_b.try_lock().is_err(),
-            "same db/tenant/peer should share one gate"
-        );
-    }
-
-    #[tokio::test]
-    async fn peer_session_gate_is_tenant_scoped() {
-        let gate_a = peer_session_gate("/tmp/a.db", "tenant-a", "peer-a");
-        let gate_b = peer_session_gate("/tmp/a.db", "tenant-b", "peer-a");
-
-        let _guard = gate_a.lock().await;
-        assert!(
-            gate_b.try_lock().is_ok(),
-            "different tenants should not serialize each other"
-        );
     }
 }

@@ -420,7 +420,6 @@ async fn sync_pair_until_transport_converged(
                 None,
                 noop_intro_spawner,
                 test_ingest_fns(),
-                Arc::new(crate::sync::CoordinationManager::new()),
                 connect_cancel_thread,
             )
             .await
@@ -3173,9 +3172,8 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
 /// Start a sink-driven download topology: sink connects to all sources.
 ///
 /// Each source runs accept_loop (responder). The sink runs one
-/// `connect_loop_with_shared_ingest` per source with a shared
-/// `CoordinationManager`, matching the production runtime path used by
-/// bootstrap/mDNS autodial.
+/// `connect_loop_with_shared_ingest` per source, matching the production
+/// runtime path used by bootstrap/mDNS autodial.
 ///
 /// Returns thread handles for all source accept_loops and sink connect loops.
 pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::JoinHandle<()>> {
@@ -3269,17 +3267,7 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
         batch_writer_fn(writer_db, shared_rx, writer_events);
     });
 
-    // Pre-register all peer handles before spawning threads. The active pull
-    // scheduler now lives in sink-side `wanted` SQL state, but keeping peer
-    // registration stable across the topology still matches the production
-    // runtime wiring.
-    let coord_manager = Arc::new(crate::sync::CoordinationManager::new());
-    let peer_coords: Vec<_> = (0..sink_connectors.len())
-        .map(|_| coord_manager.register_peer())
-        .collect();
-    for ((endpoint, remote, target_peer_id), coordination) in
-        sink_connectors.into_iter().zip(peer_coords)
-    {
+    for (endpoint, remote, target_peer_id) in sink_connectors {
         let sink_db = sink.db_path.clone();
         let sink_identity = sink.identity.clone();
         let sink_ingest = shared_tx.clone();
@@ -3297,7 +3285,6 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
                     &target_peer_id,
                     noop_intro_spawner,
                     test_ingest_fns(),
-                    coordination,
                     sink_ingest,
                 )
                 .await;
@@ -3416,17 +3403,8 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
         batch_writer_fn(writer_db, shared_rx, writer_events);
     });
 
-    // Pre-register peer handles before spawning threads so the topology wiring
-    // matches the production runtime path.
-    let coord_manager = Arc::new(crate::sync::CoordinationManager::new());
-    let peer_coords: Vec<_> = (0..sink_connectors.len())
-        .map(|_| coord_manager.register_peer())
-        .collect();
-
     let mut connect_shutdowns = Vec::new();
-    for ((endpoint, remote, target_peer_id), coordination) in
-        sink_connectors.into_iter().zip(peer_coords)
-    {
+    for (endpoint, remote, target_peer_id) in sink_connectors {
         let shutdown = tokio_util::sync::CancellationToken::new();
         connect_shutdowns.push(shutdown.clone());
         let sink_db = sink.db_path.clone();
@@ -3446,7 +3424,6 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
                     &target_peer_id,
                     noop_intro_spawner,
                     test_ingest_fns(),
-                    coordination,
                     sink_ingest,
                     shutdown,
                 )

@@ -1,5 +1,4 @@
-//! Tests that the initiator keeps one long-lived sync session open while
-//! repeating discovery rounds on it.
+//! Tests the current one-range-per-session initiator control ordering.
 
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
@@ -10,8 +9,7 @@ use topo::sync::session::windowing::decode_initial_neg_open;
 use topo::sync::session_handler::SyncConnectionHandler;
 
 use crate::fake_session_io::{
-    create_test_db, empty_negentropy_storage, fake_session_io_pair, noop_ingest_tx, run_local,
-    test_session_meta,
+    create_test_db, empty_negentropy_storage, fake_session_io_pair, run_local, test_session_meta,
 };
 
 fn empty_negentropy_response(neg_open: Frame) -> Vec<u8> {
@@ -25,15 +23,10 @@ fn empty_negentropy_response(neg_open: Frame) -> Vec<u8> {
 }
 
 #[tokio::test]
-async fn initiator_outbound_starts_with_negopen_then_next_round() {
+async fn initiator_outbound_starts_with_negopen_then_ends_control_phase() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncConnectionHandler::outbound(
-            db_path,
-            30,
-            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
-            noop_ingest_tx(),
-        );
+        let handler = SyncConnectionHandler::outbound(db_path, 30);
         let meta = test_session_meta(SessionDirection::Outbound);
         let cancel = CancellationToken::new();
 
@@ -62,29 +55,19 @@ async fn initiator_outbound_starts_with_negopen_then_next_round() {
             unexpected
         );
 
-        // The same session should later start another discovery round.
-        let mut saw_second_round = false;
-        for _ in 0..6 {
-            let frame = peer
-                .recv_control_msg_timeout(Duration::from_secs(5))
-                .await
-                .expect("expected control frame");
-            match frame {
-                Frame::ResponseCredit { .. } => {}
-                neg_open_2 @ Frame::NegOpen { .. } => {
-                    saw_second_round = true;
-                    peer.send_control_msg(&Frame::NegMsg {
-                        msg: empty_negentropy_response(neg_open_2),
-                    })
-                    .await;
-                    break;
-                }
-                other => panic!("unexpected control frame after round 1: {:?}", other),
-            }
-        }
+        // The simplified range session ends the control phase with an empty
+        // NegMsg instead of starting another round on the same session.
+        let frame = peer
+            .recv_control_msg_timeout(Duration::from_secs(5))
+            .await
+            .expect("expected control terminator");
+        assert_eq!(frame, Frame::NegMsg { msg: Vec::new() });
+
+        let no_second_round = peer.recv_control_msg_timeout(Duration::from_millis(250)).await;
         assert!(
-            saw_second_round,
-            "expected a second NegOpen on the same session"
+            no_second_round.is_none(),
+            "expected no second NegOpen on the same session, got {:?}",
+            no_second_round
         );
 
         cancel.cancel();
@@ -99,12 +82,7 @@ async fn initiator_outbound_starts_with_negopen_then_next_round() {
 async fn anticheat_first_control_frame_is_negopen() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncConnectionHandler::outbound(
-            db_path,
-            30,
-            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
-            noop_ingest_tx(),
-        );
+        let handler = SyncConnectionHandler::outbound(db_path, 30);
         let meta = test_session_meta(SessionDirection::Outbound);
         let cancel = CancellationToken::new();
 
@@ -142,12 +120,7 @@ async fn anticheat_first_control_frame_is_negopen() {
 async fn initiator_rejects_inbound_direction() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncConnectionHandler::outbound(
-            db_path,
-            30,
-            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
-            noop_ingest_tx(),
-        );
+        let handler = SyncConnectionHandler::outbound(db_path, 30);
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 

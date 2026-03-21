@@ -17,7 +17,7 @@ use crate::db::{
     open_connection,
 };
 use crate::protocol::Frame;
-use crate::sync::{CoordinationManager, SyncConnectionHandler};
+use crate::sync::SyncConnectionHandler;
 use crate::transport::{
     dial_session_provider, multi_workspace::transport_sni, read_intro_offer_frame,
     tenant_trusts_peer, SessionProvider, TransportClientConfig, TransportConnection,
@@ -272,7 +272,7 @@ async fn run_sync_on_punched_connection(
     db_path: &str,
     recorded_by: &str,
     peer_id: &str,
-    shared_ingest: tokio::sync::mpsc::Sender<IngestItem>,
+    _shared_ingest: tokio::sync::mpsc::Sender<IngestItem>,
 ) {
     let session = match provider.next_session().await {
         Ok(s) => s,
@@ -303,10 +303,7 @@ async fn run_sync_on_punched_connection(
     };
     // Punched connections route through the same outbound coordinator model as
     // connect-loop sessions so runtime initiator behavior stays consistent.
-    let coordination_manager = std::sync::Arc::new(CoordinationManager::new());
-    let coordination = coordination_manager.register_peer();
-    let handler =
-        SyncConnectionHandler::outbound(db_path.to_string(), 60, coordination, shared_ingest);
+    let handler = SyncConnectionHandler::outbound(db_path.to_string(), 60);
 
     if let Err(e) = handler
         .on_session(meta, session.io, CancellationToken::new())

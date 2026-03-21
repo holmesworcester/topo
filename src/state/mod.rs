@@ -1,3 +1,4 @@
+pub mod dependency_fetch;
 pub mod db;
 pub mod live_hints;
 pub mod pipeline;

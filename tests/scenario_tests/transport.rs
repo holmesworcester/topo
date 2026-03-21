@@ -4,7 +4,6 @@ use std::time::Duration;
 use topo::crypto::event_id_to_base64;
 use topo::db::open_connection;
 use topo::peering::loops::{accept_loop, connect_loop_with_coordination_until_cancel};
-use topo::sync::CoordinationManager;
 use topo::testutil::{
     assert_eventually, create_dynamic_endpoint_for_peer, noop_intro_spawner, test_ingest_fns, Peer,
     ScenarioHarness,
@@ -106,7 +105,6 @@ async fn test_bidirectional_connect_loops_do_not_deadlock_peer_session_gate() {
                 None,
                 noop_intro_spawner,
                 test_ingest_fns(),
-                Arc::new(CoordinationManager::new()),
                 alice_connect_cancel,
             )
             .await;
@@ -132,7 +130,6 @@ async fn test_bidirectional_connect_loops_do_not_deadlock_peer_session_gate() {
                 None,
                 noop_intro_spawner,
                 test_ingest_fns(),
-                Arc::new(CoordinationManager::new()),
                 bob_connect_cancel,
             )
             .await;

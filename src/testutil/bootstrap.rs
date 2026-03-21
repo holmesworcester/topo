@@ -25,7 +25,7 @@ use crate::contracts::peering_contract::{
 };
 use crate::db::{open_connection, schema::create_tables};
 use crate::event_modules::workspace::identity_ops::expected_invite_bootstrap_spki_from_invite_key;
-use crate::sync::{CoordinationManager, SyncConnectionHandler};
+use crate::sync::SyncConnectionHandler;
 
 use crate::transport::identity::{load_transport_cert, load_transport_cert_required_from_db};
 use crate::transport::{
@@ -121,7 +121,7 @@ pub async fn bootstrap_sync_from_invite(
     // startup marker frames.
 
     // Shared batch_writer for this one-shot bootstrap session.
-    let (ingest_tx, ingest_rx) = mpsc::channel::<IngestItem>(5000);
+    let (_ingest_tx, ingest_rx) = mpsc::channel::<IngestItem>(5000);
     let writer_events = Arc::new(AtomicU64::new(0));
     let writer_db = db_path.to_string();
     let bw = batch_writer;
@@ -137,10 +137,7 @@ pub async fn bootstrap_sync_from_invite(
         remote_addr: connection.remote_address(),
         direction: SessionDirection::Outbound,
     };
-    let coordination_manager = Arc::new(CoordinationManager::new());
-    let coordination = coordination_manager.register_peer();
-    let handler =
-        SyncConnectionHandler::outbound(db_path.to_string(), timeout_secs, coordination, ingest_tx);
+    let handler = SyncConnectionHandler::outbound(db_path.to_string(), timeout_secs);
     let io = QuicTransportSessionIo::new(session_id, conn);
     handler
         .on_session(meta, Box::new(io), CancellationToken::new())
@@ -248,7 +245,7 @@ pub fn start_bootstrap_responder(
 
     std::thread::spawn(move || {
         // Shared batch_writer for bootstrap responder sessions.
-        let (ingest_tx, ingest_rx) = mpsc::channel::<IngestItem>(5000);
+        let (_ingest_tx, ingest_rx) = mpsc::channel::<IngestItem>(5000);
         let writer_events = Arc::new(AtomicU64::new(0));
         let writer_db = db_path.clone();
         let bw = batch_writer;
@@ -261,9 +258,7 @@ pub fn start_bootstrap_responder(
             .build()
             .expect("failed to create bootstrap responder runtime");
         rt.block_on(async move {
-            let coordination = CoordinationManager::new().register_peer();
-            let handler =
-                SyncConnectionHandler::responder(db_path.clone(), 30, coordination, ingest_tx);
+            let handler = SyncConnectionHandler::responder(db_path.clone(), 30);
             // Keep connections alive until the endpoint closes so QUIC can
             // deliver in-flight control/data frames before the connection
             // is torn down. Dropping a quinn::Connection sends

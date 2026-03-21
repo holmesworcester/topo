@@ -4,6 +4,7 @@ use super::super::signer::{resolve_signer_key, verify_ed25519_signature, SignerR
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::{registry, ParsedEvent, TransportPrivacy};
+use crate::state::{dependency_fetch, live_hints::source_peer_id_from_source_tag};
 use rusqlite::{Connection, OptionalExtension};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -106,6 +107,24 @@ fn load_valid_semantic_type_code(
     }
 }
 
+fn load_recorded_source_peer_id(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+) -> Result<Option<String>, Box<dyn std::error::Error>> {
+    let source_tag: Option<String> = conn
+        .query_row(
+            "SELECT source
+             FROM recorded_events
+             WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, event_id_b64],
+            |row| row.get(0),
+        )
+        .optional()?
+        .flatten();
+    Ok(source_tag.and_then(|source_tag| source_peer_id_from_source_tag(&source_tag)))
+}
+
 /// Check that each dep's type code matches the allowed types for that dep field.
 /// Returns Some(reason) if a type mismatch is found, None if all pass.
 pub(crate) fn check_dep_types(
@@ -198,6 +217,9 @@ pub(crate) fn check_deps_and_block(
         rusqlite::params![recorded_by, event_id_b64, missing.len() as i64],
     )?;
     let _ = EventTimeline::new(conn).mark_blocked_b64(event_id_b64, current_timestamp_ms());
+    if let Some(source_peer_id) = load_recorded_source_peer_id(conn, recorded_by, event_id_b64)? {
+        dependency_fetch::publish_from_connection(conn, recorded_by, &source_peer_id, &missing);
+    }
 
     Ok(Some(ProjectionDecision::Block { missing }))
 }
@@ -300,6 +322,72 @@ pub(crate) fn apply_projection(
     }
 
     Ok((result.decision, None))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::db::{open_connection, schema::create_tables};
+
+    fn setup_file_db() -> (tempfile::TempDir, String, Connection) {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("stages.db").to_string_lossy().to_string();
+        let conn = open_connection(&db_path).unwrap();
+        create_tables(&conn).unwrap();
+        (dir, db_path, conn)
+    }
+
+    fn event_id(byte: u8) -> EventId {
+        let mut id = [0u8; 32];
+        id[0] = byte;
+        id
+    }
+
+    #[tokio::test]
+    async fn blocked_quic_event_emits_dependency_fetch_for_source_peer() {
+        let (_dir, db_path, conn) = setup_file_db();
+        let blocked = event_id(1);
+        let missing = event_id(2);
+        let blocked_b64 = event_id_to_base64(&blocked);
+        conn.execute(
+            "INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, 1, ?3)",
+            rusqlite::params![
+                "tenant-a",
+                &blocked_b64,
+                "quic_recv:peer-z@127.0.0.1:7777"
+            ],
+        )
+        .unwrap();
+
+        let (mut rx, _guard) = dependency_fetch::register(&db_path, "tenant-a", "peer-z");
+        let decision = check_deps_and_block(&conn, "tenant-a", &blocked_b64, &[("dep", missing)])
+            .unwrap();
+        assert!(matches!(decision, Some(ProjectionDecision::Block { .. })));
+        assert_eq!(rx.recv().await, Some(vec![missing]));
+    }
+
+    #[tokio::test]
+    async fn local_only_blocked_event_does_not_emit_dependency_fetch() {
+        let (_dir, db_path, conn) = setup_file_db();
+        let blocked = event_id(3);
+        let missing = event_id(4);
+        let blocked_b64 = event_id_to_base64(&blocked);
+        conn.execute(
+            "INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
+             VALUES (?1, ?2, 1, ?3)",
+            rusqlite::params!["tenant-a", &blocked_b64, "local_create"],
+        )
+        .unwrap();
+
+        let (mut rx, _guard) = dependency_fetch::register(&db_path, "tenant-a", "peer-z");
+        let decision = check_deps_and_block(&conn, "tenant-a", &blocked_b64, &[("dep", missing)])
+            .unwrap();
+        assert!(matches!(decision, Some(ProjectionDecision::Block { .. })));
+        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), rx.recv())
+            .await
+            .is_err());
+    }
 }
 
 /// Shared dependency/signer/projection stage bundle used by cleartext and

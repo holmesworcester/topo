@@ -1,23 +1,20 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
-use tokio::sync::mpsc;
 
 use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::crypto::{event_id_to_base64, hash_event};
 use crate::db::{open_connection, timeline::EventTimeline};
-use crate::event_pipeline::batch_writer;
 use crate::protocol::{encode_frame, parse_frame, Frame, ParseError};
-use crate::tuning::shared_ingest_cap;
+use crate::state::pipeline::ingest_now;
 
 const RECEIVE_LOG_PREFIX: &str = "recvlog";
 const RECEIVE_LOG_DATA_SUFFIX: &str = "bin";
 const RECEIVE_LOG_META_SUFFIX: &str = "meta";
+const RECEIVE_LOG_INGEST_BATCH_CAP: usize = 256;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiveLogMeta {
@@ -113,37 +110,31 @@ pub fn receive_log_dir(db_path: &str) -> PathBuf {
 
 pub fn ingest_receive_log(db_path: &str, path: &Path) -> Result<usize, String> {
     let meta = parse_receive_log_meta(path)?;
-    let ingest_cap = shared_ingest_cap();
-    let (tx, rx) = mpsc::channel::<IngestItem>(ingest_cap);
-    let writer_db_path = db_path.to_string();
-    let writer_events = Arc::new(AtomicU64::new(0));
-    let writer_events_clone = writer_events.clone();
-    let writer = std::thread::spawn(move || {
-        batch_writer(writer_db_path, rx, writer_events_clone);
-    });
+    let mut ingested = 0usize;
+    let mut batch = Vec::<IngestItem>::with_capacity(RECEIVE_LOG_INGEST_BATCH_CAP);
 
-    let send_result = stream_receive_log(path, |blob| {
+    stream_receive_log(path, |blob| {
         let event_id = hash_event(&blob);
-        tx.blocking_send((
+        batch.push((
             event_id,
             blob,
             meta.recorded_by.clone(),
             meta.source_tag.clone(),
             current_timestamp_ms(),
-        ))
-        .map_err(|e| format!("receive log ingest send {}: {e}", path.display()))
-    });
-    drop(tx);
-
-    writer
-        .join()
-        .map_err(|_| format!("receive log writer panicked for {}", path.display()))?;
-    send_result?;
+        ));
+        if batch.len() >= RECEIVE_LOG_INGEST_BATCH_CAP {
+            ingested += ingest_now(db_path, std::mem::take(&mut batch))?;
+        }
+        Ok(())
+    })?;
+    if !batch.is_empty() {
+        ingested += ingest_now(db_path, batch)?;
+    }
 
     fs::remove_file(path).map_err(|e| format!("delete receive log {}: {e}", path.display()))?;
     let meta_path = receive_log_meta_path(path);
     let _ = fs::remove_file(&meta_path);
-    Ok(writer_events.load(std::sync::atomic::Ordering::Relaxed) as usize)
+    Ok(ingested)
 }
 
 pub fn recover_receive_logs(db_path: &str) -> Result<usize, String> {

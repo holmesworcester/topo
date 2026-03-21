@@ -3,25 +3,19 @@
 use std::time::{Duration, Instant};
 
 use negentropy::{Id, Negentropy};
-use tokio::sync::mpsc;
-
-use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::db::{
     open_connection,
     store::{lookup_workspace_id, Store},
 };
 use crate::protocol::{neg_id_to_event_id, Frame};
 use crate::runtime::SyncStats;
-use crate::sync::session::logging::{SyncRunCapture, SyncRunRxCapture};
+use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::range_session::{
     load_range_storage, send_have_events, spawn_receive_log_task,
 };
 use crate::sync::session::receive_log::ingest_receive_log;
 use crate::sync::session::windowing::decode_initial_neg_open;
-use crate::sync::session::PeerCoord;
-use crate::sync::session::{
-    ConnectionRequestState, ConnectionResponseState, INITIAL_CONTROL_PROGRESS_TIMEOUT,
-};
+use crate::sync::session::INITIAL_CONTROL_PROGRESS_TIMEOUT;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
 type ManualRoundReply =
@@ -86,20 +80,13 @@ pub async fn run_sync_responder<C, S, R>(
     session_id: u64,
     db_path: &str,
     timeout_secs: u64,
-    _session_owner: &str,
     peer_id: &str,
     recorded_by: &str,
     ingress_source_tag: &str,
-    _coordination: &PeerCoord,
-    _request_state: &ConnectionRequestState,
-    _response_state: &ConnectionResponseState,
-    _shared_ingest: mpsc::Sender<IngestItem>,
-    _capture: Option<SyncRunCapture>,
     rx_capture: Option<SyncRunRxCapture>,
     mut command_rx: Option<
         tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>,
     >,
-    _policy_rx: Option<tokio::sync::watch::Receiver<crate::shared::sync_control::TenantSyncPolicy>>,
 ) -> Result<SyncStats, Box<dyn std::error::Error + Send + Sync>>
 where
     C: StreamConn,

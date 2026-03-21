@@ -16,7 +16,7 @@ use topo::sync::session_handler::SyncConnectionHandler;
 
 use crate::fake_session_io::{
     create_test_db, empty_negentropy_storage, fake_session_io_pair,
-    fake_session_io_pair_with_config, noop_ingest_tx, run_local, test_session_meta, FakeIoConfig,
+    fake_session_io_pair_with_config, run_local, test_session_meta, FakeIoConfig,
     ProtocolViolation,
 };
 
@@ -26,12 +26,7 @@ use crate::fake_session_io::{
 async fn control_channel_half_close_terminates_handler() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncConnectionHandler::responder(
-            db_path,
-            30,
-            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
-            noop_ingest_tx(),
-        );
+        let handler = SyncConnectionHandler::responder(db_path, 30);
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -67,12 +62,7 @@ async fn control_channel_half_close_terminates_handler() {
 async fn abrupt_close_surfaces_connection_lost() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncConnectionHandler::outbound(
-            db_path,
-            30,
-            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
-            noop_ingest_tx(),
-        );
+        let handler = SyncConnectionHandler::outbound(db_path, 30);
         let meta = test_session_meta(SessionDirection::Outbound);
         let cancel = CancellationToken::new();
 
@@ -117,12 +107,7 @@ async fn abrupt_close_surfaces_connection_lost() {
 async fn normal_roundtrip_stays_healthy_until_cancel() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncConnectionHandler::responder(
-            db_path,
-            30,
-            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
-            noop_ingest_tx(),
-        );
+        let handler = SyncConnectionHandler::responder(db_path, 30);
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -320,12 +305,7 @@ async fn out_of_order_data_delivery() {
 async fn fragmented_data_frames_handler_completes() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncConnectionHandler::responder(
-            db_path,
-            30,
-            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
-            noop_ingest_tx(),
-        );
+        let handler = SyncConnectionHandler::responder(db_path, 30);
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -370,11 +350,11 @@ async fn fragmented_data_frames_handler_completes() {
             .expect("handler timed out with fragmented frames -- must not hang")
             .expect("handler panicked");
 
-        // The handler tolerates data-receiver parse failures from fragmented
-        // frames — the control loop drives the session to completion.
+        // The responder may surface the truncated data path as a connection
+        // close, but it must still terminate promptly instead of hanging.
         assert!(
-            result.is_ok(),
-            "handler should complete gracefully despite fragmented data frames, got: {:?}",
+            matches!(result, Err(ref err) if err.contains("Connection closed")),
+            "handler should terminate promptly on fragmented data frames, got: {:?}",
             result
         );
         cancel.cancel();
@@ -432,12 +412,7 @@ async fn fragmentation_splits_data_frames_into_chunks() {
 async fn garbage_control_frame_terminates_handler() {
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncConnectionHandler::responder(
-            db_path,
-            30,
-            std::sync::Arc::new(topo::sync::CoordinationManager::new()).register_peer(),
-            noop_ingest_tx(),
-        );
+        let handler = SyncConnectionHandler::responder(db_path, 30);
         let meta = test_session_meta(SessionDirection::Inbound);
         let cancel = CancellationToken::new();
 
@@ -463,11 +438,11 @@ async fn garbage_control_frame_terminates_handler() {
             .expect("handler timed out on garbage control frame -- must not hang")
             .expect("handler panicked");
 
-        // Responder breaks out of its control loop on parse errors and
-        // terminates the session gracefully — garbage does not cause hangs.
+        // Garbage control bytes are now surfaced as a parse failure, but the
+        // important contract is still "fail fast, do not hang".
         assert!(
-            result.is_ok(),
-            "handler should exit gracefully on garbage control frame, got: {:?}",
+            matches!(result, Err(ref err) if err.contains("Parse error")),
+            "handler should fail fast on garbage control frame, got: {:?}",
             result
         );
         cancel.cancel();

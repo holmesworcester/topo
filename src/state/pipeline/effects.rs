@@ -1,5 +1,4 @@
 use crate::db::project_queue::ProjectQueue;
-use crate::db::wanted::WantedEvents;
 use crate::state::live_hints::{self, LiveHintEvent};
 use crate::state::shared_workspace_fanout::fanout_shared_event_enqueue;
 
@@ -30,12 +29,7 @@ impl<'a> SqlitePostCommitEffectsExecutor<'a> {
 
 impl PostCommitEffectsExecutor for SqlitePostCommitEffectsExecutor<'_> {
     fn run_post_commit_effects(&self, persist_output: &PersistPhaseOutput, batch_size: usize) {
-        let wanted = WantedEvents::new(self.db);
         let pq = ProjectQueue::new(self.db);
-
-        for event_id in &persist_output.persisted_event_ids {
-            let _ = wanted.remove(event_id);
-        }
 
         // First drain the origin tenants so removals in this batch are
         // projected before we fan out to siblings.
@@ -140,16 +134,12 @@ mod tests {
 
     use super::*;
     use crate::db::schema::create_tables;
-    use crate::db::{open_in_memory, wanted::WantedEvents};
+    use crate::db::open_in_memory;
 
     #[test]
     fn event_pipeline_effects_execute_expected_sqlite_side_effects() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
-
-        let wanted = WantedEvents::new(&conn);
-        let wanted_id = [7u8; 32];
-        wanted.insert(&wanted_id).unwrap();
 
         conn.execute(
             "INSERT INTO project_queue (peer_id, event_id, available_at) VALUES (?1, ?2, 0)",
@@ -158,7 +148,7 @@ mod tests {
         .unwrap();
 
         let persist_output = PersistPhaseOutput {
-            persisted_event_ids: vec![wanted_id],
+            persisted_event_ids: vec![[7u8; 32]],
             tenants_seen: std::collections::HashSet::from(["tenant-a".to_string()]),
             live_hints: Vec::new(),
             shared_event_fanouts: Vec::new(),
@@ -166,15 +156,6 @@ mod tests {
         let executor = SqlitePostCommitEffectsExecutor::new(&conn);
 
         run_post_commit_effects(&executor, &persist_output, 16);
-
-        let wanted_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM wanted_events WHERE id = ?1",
-                params![&wanted_id[..]],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(wanted_count, 0, "wanted.remove should clear requested id");
 
         let queue_count: i64 = conn
             .query_row(
@@ -194,14 +175,10 @@ mod tests {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
-        let wanted = WantedEvents::new(&conn);
-        let wanted_id = [9u8; 32];
-        wanted.insert(&wanted_id).unwrap();
-
         conn.execute("DROP TABLE project_queue", []).unwrap();
 
         let persist_output = PersistPhaseOutput {
-            persisted_event_ids: vec![wanted_id],
+            persisted_event_ids: vec![[9u8; 32]],
             tenants_seen: std::collections::HashSet::from(["tenant-a".to_string()]),
             live_hints: Vec::new(),
             shared_event_fanouts: Vec::new(),
@@ -209,18 +186,6 @@ mod tests {
         let executor = SqlitePostCommitEffectsExecutor::new(&conn);
 
         run_post_commit_effects(&executor, &persist_output, 8);
-
-        let wanted_count: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM wanted_events WHERE id = ?1",
-                params![&wanted_id[..]],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(
-            wanted_count, 0,
-            "remove wanted should still run after prior command failure"
-        );
     }
 
     #[test]

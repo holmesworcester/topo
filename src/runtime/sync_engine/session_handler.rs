@@ -6,21 +6,17 @@
 
 use async_trait::async_trait;
 use std::sync::Arc;
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
 
-use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::contracts::peering_contract::{
     ControlIo, DataRecvIo, DataSendIo, SessionDirection, SessionHandler, SessionMeta,
     TransportSessionIo, TransportSessionIoError,
 };
 use crate::protocol::Frame;
 use crate::protocol::{encode_frame, parse_frame};
-use crate::sync::session::coordinator::PeerCoord;
 use crate::sync::session::logging::{LogDir, LogLane, SessionRunLogger, SyncRunCapture};
 use crate::sync::session::{run_sync_initiator, run_sync_responder};
-use crate::sync::session::{ConnectionRequestState, ConnectionResponseState};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
@@ -114,46 +110,24 @@ pub struct SyncConnectionHandler {
     db_path: String,
     timeout_secs: u64,
     direction: SessionDirection,
-    coordination: Arc<PeerCoord>,
-    request_state: Arc<ConnectionRequestState>,
-    response_state: Arc<ConnectionResponseState>,
-    shared_ingest: mpsc::Sender<IngestItem>,
     sync_control: Option<Arc<crate::runtime::sync_control::SyncControlRegistry>>,
 }
 
 impl SyncConnectionHandler {
-    pub fn outbound(
-        db_path: String,
-        timeout_secs: u64,
-        coordination: Arc<PeerCoord>,
-        shared_ingest: mpsc::Sender<IngestItem>,
-    ) -> Self {
+    pub fn outbound(db_path: String, timeout_secs: u64) -> Self {
         Self {
             db_path,
             timeout_secs,
             direction: SessionDirection::Outbound,
-            coordination,
-            request_state: Arc::new(ConnectionRequestState::default()),
-            response_state: Arc::new(ConnectionResponseState::default()),
-            shared_ingest,
             sync_control: None,
         }
     }
 
-    pub fn responder(
-        db_path: String,
-        timeout_secs: u64,
-        coordination: Arc<PeerCoord>,
-        shared_ingest: mpsc::Sender<IngestItem>,
-    ) -> Self {
+    pub fn responder(db_path: String, timeout_secs: u64) -> Self {
         Self {
             db_path,
             timeout_secs,
             direction: SessionDirection::Inbound,
-            coordination,
-            request_state: Arc::new(ConnectionRequestState::default()),
-            response_state: Arc::new(ConnectionResponseState::default()),
-            shared_ingest,
             sync_control: None,
         }
     }
@@ -165,14 +139,6 @@ impl SyncConnectionHandler {
     ) -> Self {
         self.sync_control = sync_control;
         self
-    }
-}
-
-impl Drop for SyncConnectionHandler {
-    fn drop(&mut self) {
-        self.request_state.clear();
-        self.response_state.clear();
-        self.coordination.clear_request_state();
     }
 }
 
@@ -221,7 +187,6 @@ impl SessionHandler for SyncConnectionHandler {
         let peer_id = hex::encode(meta.peer.0);
         let tenant_id = meta.tenant.0.clone();
         let ingress_source_tag = format!("quic_recv:{}@{}", peer_id, meta.remote_addr);
-        let session_owner = format!("{}:{}", role_name, meta.session_id);
 
         // Register with sync control registry if available.
         let sc_role = match self.direction {
@@ -232,15 +197,16 @@ impl SessionHandler for SyncConnectionHandler {
             .sync_control
             .as_ref()
             .map(|sc| sc.register_session(&tenant_id, &peer_id, sc_role));
-        let (mut manual_cmd_rx, mut manual_pol_rx, _sc_guard) = match registered {
+        let (mut manual_cmd_rx, _sc_guard) = match registered {
             Some(rs) => {
-                let (crx, prx, guard) = rs.into_parts();
-                (Some(crx), Some(prx), Some(guard))
+                let (crx, _prx, guard) = rs.into_parts();
+                (Some(crx), Some(guard))
             }
-            None => (None, None, None),
+            None => (None, None),
         };
 
         let mut stats: Option<crate::runtime::SyncStats> = None;
+        let session_timeout = std::time::Duration::from_secs(self.timeout_secs.saturating_add(10));
         let result = match (self.direction, meta.direction) {
             (SessionDirection::Outbound, SessionDirection::Outbound) => {
                 info!(
@@ -254,24 +220,23 @@ impl SessionHandler for SyncConnectionHandler {
                     meta.session_id,
                     &self.db_path,
                     self.timeout_secs,
-                    &session_owner,
                     &peer_id,
                     &tenant_id,
                     &ingress_source_tag,
-                    self.coordination.as_ref(),
-                    self.request_state.as_ref(),
-                    self.response_state.as_ref(),
-                    self.shared_ingest.clone(),
-                    run_logger.as_ref().and_then(|l| l.capture()),
                     run_logger.as_ref().and_then(|l| l.rx_capture()),
                     manual_cmd_rx.take(),
-                    manual_pol_rx.take(),
                 );
                 tokio::pin!(run);
                 let run_result: Result<crate::runtime::SyncStats, String> = tokio::select! {
                     _ = cancel.cancelled() => Err(format!("session {} cancelled", meta.session_id)),
-                    result = &mut run => {
-                        result.map_err(|e| format!("initiator sync failed: {e}"))
+                    result = tokio::time::timeout(session_timeout, &mut run) => {
+                        match result {
+                            Ok(result) => result.map_err(|e| format!("initiator sync failed: {e}")),
+                            Err(_) => Err(format!(
+                                "initiator sync timed out after {}s",
+                                session_timeout.as_secs()
+                            )),
+                        }
                     },
                 };
                 match run_result {
@@ -294,24 +259,25 @@ impl SessionHandler for SyncConnectionHandler {
                     meta.session_id,
                     &self.db_path,
                     self.timeout_secs,
-                    &session_owner,
                     &peer_id,
                     &tenant_id,
                     &ingress_source_tag,
-                    self.coordination.as_ref(),
-                    self.request_state.as_ref(),
-                    self.response_state.as_ref(),
-                    self.shared_ingest.clone(),
-                    run_logger.as_ref().and_then(|l| l.capture()),
                     run_logger.as_ref().and_then(|l| l.rx_capture()),
                     manual_cmd_rx.take(),
-                    manual_pol_rx.take(),
                 );
                 tokio::pin!(run);
                 let run_result: Result<crate::runtime::SyncStats, String> = tokio::select! {
                     _ = cancel.cancelled() => Err(format!("session {} cancelled", meta.session_id)),
-                    result = &mut run => result
-                        .map_err(|e| format!("responder sync failed: {e}")),
+                    result = tokio::time::timeout(session_timeout, &mut run) => {
+                        match result {
+                            Ok(result) => result
+                                .map_err(|e| format!("responder sync failed: {e}")),
+                            Err(_) => Err(format!(
+                                "responder sync timed out after {}s",
+                                session_timeout.as_secs()
+                            )),
+                        }
+                    },
                 };
                 match run_result {
                     Ok(s) => {
