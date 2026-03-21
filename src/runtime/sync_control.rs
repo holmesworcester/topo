@@ -102,8 +102,8 @@ impl SyncControlRegistry {
     ) -> Result<TenantSyncPolicy, String> {
         let conn = crate::db::open_connection(&self.db_path).map_err(|e| e.to_string())?;
         crate::db::sync_control::ensure_schema(&conn).map_err(|e| e.to_string())?;
-        let saved =
-            crate::db::sync_control::save_policy(&conn, tenant_id, policy).map_err(|e| e.to_string())?;
+        let saved = crate::db::sync_control::save_policy(&conn, tenant_id, policy)
+            .map_err(|e| e.to_string())?;
         self.notify_policy_watchers(tenant_id, &saved);
         Ok(saved)
     }
@@ -196,10 +196,10 @@ impl SyncControlRegistry {
         tenant_id: &str,
         peer_prefix: &str,
     ) -> Result<ManualSyncRoundCapture, String> {
-        let sessions = self.find_sessions(tenant_id, Some(peer_prefix), true);
+        let sessions = self.find_sessions(tenant_id, Some(peer_prefix), false);
         if sessions.is_empty() {
             return Err(format!(
-                "no live initiator session matches peer prefix '{}'",
+                "no live session matches peer prefix '{}'",
                 peer_prefix
             ));
         }
@@ -220,9 +220,9 @@ impl SyncControlRegistry {
         &self,
         tenant_id: &str,
     ) -> Result<Vec<ManualSyncRoundCapture>, String> {
-        let sessions = self.find_sessions(tenant_id, None, true);
+        let sessions = self.find_sessions(tenant_id, None, false);
         if sessions.is_empty() {
-            return Err("no live initiator sessions".to_string());
+            return Err("no live sessions".to_string());
         }
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         for entry in &sessions {
@@ -244,7 +244,11 @@ impl SyncControlRegistry {
                 Err(_) => break,
             }
         }
-        Ok(results)
+        if results.is_empty() {
+            Err("timeout waiting for round reply (30s)".to_string())
+        } else {
+            Ok(results)
+        }
     }
 
     pub fn trigger_request_for_peer(
@@ -264,10 +268,11 @@ impl SyncControlRegistry {
 
         let sessions = self.find_sessions(tenant_id, Some(peer_prefix), false);
         if sessions.is_empty() {
-            return Err(format!(
-                "no live session matches peer prefix '{}'",
-                peer_prefix
-            ));
+            return Ok(ManualSyncRequestResult {
+                peer_id: peer_prefix.to_string(),
+                requested_ids: vec![],
+                reason: None,
+            });
         }
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         for entry in &sessions {
@@ -306,7 +311,11 @@ impl SyncControlRegistry {
                 .collect());
         }
         if sessions.is_empty() {
-            return Err("no live sessions".to_string());
+            return Ok(vec![ManualSyncRequestResult {
+                peer_id: "(no live sessions)".to_string(),
+                requested_ids: vec![],
+                reason: None,
+            }]);
         }
         let (reply_tx, reply_rx) = std::sync::mpsc::channel();
         for entry in &sessions {
@@ -328,7 +337,11 @@ impl SyncControlRegistry {
                 Err(_) => break,
             }
         }
-        Ok(results)
+        if results.is_empty() {
+            Err("timeout waiting for request reply (30s)".to_string())
+        } else {
+            Ok(results)
+        }
     }
 
     // -- Internal helpers --

@@ -49,6 +49,8 @@ pub struct EventTimelineRow {
     pub request_received_at: Option<i64>,
     pub response_sent_at: Option<i64>,
     pub response_received_at: Option<i64>,
+    // First durable store time. For range sync this is the append-only receive
+    // log write; for direct ingest fallback paths this is the canonical insert.
     pub persisted_at: Option<i64>,
     pub blocked_at: Option<i64>,
     pub unblocked_at: Option<i64>,
@@ -105,13 +107,13 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
 ///   unset → enabled in debug builds, disabled in release builds
 pub fn recording_enabled() -> bool {
     static ENABLED: OnceLock<bool> = OnceLock::new();
-    *ENABLED.get_or_init(|| {
-        match std::env::var("TOPO_EVENT_TIMELINE").ok().as_deref() {
+    *ENABLED.get_or_init(
+        || match std::env::var("TOPO_EVENT_TIMELINE").ok().as_deref() {
             Some("0") | Some("false") | Some("FALSE") | Some("no") | Some("NO") => false,
             Some("1") | Some("true") | Some("TRUE") | Some("yes") | Some("YES") => true,
             _ => cfg!(debug_assertions),
-        }
-    })
+        },
+    )
 }
 
 fn enabled_groups_mask() -> u8 {
@@ -415,11 +417,11 @@ impl<'a> EventTimeline<'a> {
                 row.response_received_at,
             ),
             span_label(
-                "receive_to_persist_ms",
+                "receive_to_store_ms",
                 row.response_received_at,
                 row.persisted_at,
             ),
-            span_label("persist_to_project_ms", row.persisted_at, row.projected_at),
+            span_label("store_to_project_ms", row.persisted_at, row.projected_at),
             span_label("blocked_duration_ms", row.blocked_at, row.unblocked_at),
         ]
         .into_iter()
@@ -427,7 +429,7 @@ impl<'a> EventTimeline<'a> {
         .collect::<Vec<_>>()
         .join(", ");
         let stages = format!(
-            "discover_start={}; discover_done={}; need_sent={}; need_recv={}; wanted={}; credit_recv={}; req_selected={}; req_sent={}; req_recv={}; resp_sent={}; resp_recv={}; persisted={}; blocked={}; unblocked={}; unblocked_by={}; projected={}",
+            "discover_start={}; discover_done={}; need_sent={}; need_recv={}; wanted={}; credit_recv={}; req_selected={}; req_sent={}; req_recv={}; resp_sent={}; resp_recv={}; stored={}; blocked={}; unblocked={}; unblocked_by={}; projected={}",
             fmt_opt(row.discovery_round_started_at),
             fmt_opt(row.discovery_round_completed_at),
             fmt_opt(row.need_list_sent_at),
@@ -588,7 +590,7 @@ mod tests {
         assert_eq!(row.projected_at, Some(80));
 
         let summary = timeline.summary(&event_id_b64).unwrap().unwrap();
-        assert!(summary.contains("persist_to_project_ms=20"));
+        assert!(summary.contains("store_to_project_ms=20"));
         assert!(summary.contains("selected_to_request_ms=1"));
         assert!(summary.contains("unblocked_by=dep-1"));
     }

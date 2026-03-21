@@ -23,7 +23,14 @@ const HOUR_MS: i64 = 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 const WEEK_MS: i64 = 7 * DAY_MS;
 const MONTH_MS: i64 = 30 * DAY_MS;
+const YEAR_MS: i64 = 365 * DAY_MS;
 const THREE_YEARS_MS: i64 = 3 * 365 * DAY_MS;
+
+struct RangeTiming {
+    count: i64,
+    persisted_at_ms: Option<i64>,
+    projected_at_ms: Option<i64>,
+}
 
 fn current_timestamp_ms() -> i64 {
     SystemTime::now()
@@ -96,6 +103,34 @@ fn message_count_since_sql(db: &str, cutoff_ms: i64) -> i64 {
     .expect("query message_count_since")
 }
 
+fn range_timing_sql(db: &str, min_created_at_ms: Option<i64>) -> RangeTiming {
+    let conn = topo::db::open_connection(db).expect("open db for range_timing");
+    let peer_id = cli_harness::active_tenant_peer_id(db).expect("active tenant peer id");
+    conn.query_row(
+        "SELECT COUNT(*), MAX(t.persisted_at), MAX(t.projected_at)
+         FROM messages m
+         LEFT JOIN event_timeline t ON t.event_id = m.message_id
+         WHERE m.recorded_by = ?1
+           AND (?2 IS NULL OR m.created_at >= ?2)",
+        rusqlite::params![peer_id, min_created_at_ms],
+        |row| {
+            Ok(RangeTiming {
+                count: row.get(0)?,
+                persisted_at_ms: row.get(1)?,
+                projected_at_ms: row.get(2)?,
+            })
+        },
+    )
+    .expect("query range_timing")
+}
+
+fn elapsed_secs(metric_start_ms: i64, ts_ms: Option<i64>) -> f64 {
+    ts_ms
+        .unwrap_or(metric_start_ms)
+        .saturating_sub(metric_start_ms) as f64
+        / 1000.0
+}
+
 fn wait_for_message_count_since(db: &str, cutoff_ms: i64, expected: i64, timeout: Duration) -> i64 {
     let start = Instant::now();
     loop {
@@ -150,6 +185,8 @@ fn run_tiered_window_bench() {
         THREE_YEARS_MS.to_string(),
     );
     std::env::set_var("TOPO_FORWARD_ON_HAVE", "1");
+    std::env::set_var("TOPO_EVENT_TIMELINE", "1");
+    std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "persist,projection");
 
     let total_messages = env_i64("TOPO_TIERED_SYNC_TOTAL_MESSAGES", 50_000);
     let window_shape = std::env::var("TOPO_SYNC_WINDOW_SHAPE")
@@ -182,10 +219,12 @@ fn run_tiered_window_bench() {
     let day_cutoff = measurement_now_ms - DAY_MS;
     let week_cutoff = measurement_now_ms - WEEK_MS;
     let month_cutoff = measurement_now_ms - MONTH_MS;
+    let year_cutoff = measurement_now_ms - YEAR_MS;
     let expected_hour = message_count_since_sql(&alice_db, hour_cutoff);
     let expected_day = message_count_since_sql(&alice_db, day_cutoff);
     let expected_week = message_count_since_sql(&alice_db, week_cutoff);
     let expected_month = message_count_since_sql(&alice_db, month_cutoff);
+    let expected_year = message_count_since_sql(&alice_db, year_cutoff);
 
     let alice_direct_addr = daemon_listen_addr(&alice_db);
     let (invite_addr, bob_bind_addr, network_guard) = if let Some(profile) = network_profile {
@@ -264,23 +303,48 @@ fn run_tiered_window_bench() {
     } else {
         metric_start_ms
     };
+    let year_projected_ms = if expected_year > 0 {
+        wait_for_message_count_since(
+            &bob_db,
+            year_cutoff,
+            expected_year,
+            Duration::from_secs(1200),
+        )
+    } else {
+        metric_start_ms
+    };
     let full_projected_ms =
         wait_for_message_count(&bob_db, total_messages, Duration::from_secs(1200));
     let full_wall_secs = bench_start.elapsed().as_secs_f64();
 
+    let hour_timing = range_timing_sql(&bob_db, Some(hour_cutoff));
+    let day_timing = range_timing_sql(&bob_db, Some(day_cutoff));
+    let week_timing = range_timing_sql(&bob_db, Some(week_cutoff));
+    let month_timing = range_timing_sql(&bob_db, Some(month_cutoff));
+    let year_timing = range_timing_sql(&bob_db, Some(year_cutoff));
+    let all_timing = range_timing_sql(&bob_db, None);
+
     let summary = format!(
-        "=== tiered window catchup ===\n  Mode: {mode}\n  Window shape: {window_shape}\n  Messages preloaded on inviter: {total_messages}\n  Network profile: {}\n  Generated spread: 3 years\n  Metric start: invite accept on running joiner daemon\n  Last hour: {} msgs projected in {:.2}s\n  Last day: {} msgs projected in {:.2}s\n  Last week: {} msgs projected in {:.2}s\n  Last month: {} msgs projected in {:.2}s\n  Full history: {} msgs projected in {:.2}s\n  Full catchup wall: {:.2}s\n",
+        "=== tiered window catchup ===\n  Mode: {mode}\n  Window shape: {window_shape}\n  Messages preloaded on inviter: {total_messages}\n  Network profile: {}\n  Generated spread: 3 years\n  Metric start: invite accept on running joiner daemon\n  Last hour:  {} msgs durable in {:.2}s projected in {:.2}s\n  Last day:   {} msgs durable in {:.2}s projected in {:.2}s\n  Last week:  {} msgs durable in {:.2}s projected in {:.2}s\n  Last month: {} msgs durable in {:.2}s projected in {:.2}s\n  Last year:  {} msgs durable in {:.2}s projected in {:.2}s\n  All:        {} msgs durable in {:.2}s projected in {:.2}s\n  Full catchup wall: {:.2}s\n",
         network_profile.map(|profile| profile.slug).unwrap_or("loopback"),
-        expected_hour,
-        (hour_projected_ms - metric_start_ms) as f64 / 1000.0,
-        expected_day,
-        (day_projected_ms - metric_start_ms) as f64 / 1000.0,
-        expected_week,
-        (week_projected_ms - metric_start_ms) as f64 / 1000.0,
-        expected_month,
-        (month_projected_ms - metric_start_ms) as f64 / 1000.0,
-        total_messages,
-        (full_projected_ms - metric_start_ms) as f64 / 1000.0,
+        hour_timing.count,
+        elapsed_secs(metric_start_ms, hour_timing.persisted_at_ms),
+        elapsed_secs(metric_start_ms, hour_timing.projected_at_ms.or(Some(hour_projected_ms))),
+        day_timing.count,
+        elapsed_secs(metric_start_ms, day_timing.persisted_at_ms),
+        elapsed_secs(metric_start_ms, day_timing.projected_at_ms.or(Some(day_projected_ms))),
+        week_timing.count,
+        elapsed_secs(metric_start_ms, week_timing.persisted_at_ms),
+        elapsed_secs(metric_start_ms, week_timing.projected_at_ms.or(Some(week_projected_ms))),
+        month_timing.count,
+        elapsed_secs(metric_start_ms, month_timing.persisted_at_ms),
+        elapsed_secs(metric_start_ms, month_timing.projected_at_ms.or(Some(month_projected_ms))),
+        year_timing.count,
+        elapsed_secs(metric_start_ms, year_timing.persisted_at_ms),
+        elapsed_secs(metric_start_ms, year_timing.projected_at_ms.or(Some(year_projected_ms))),
+        all_timing.count,
+        elapsed_secs(metric_start_ms, all_timing.persisted_at_ms),
+        elapsed_secs(metric_start_ms, all_timing.projected_at_ms.or(Some(full_projected_ms))),
         full_wall_secs,
     );
     eprintln!("\n{summary}");

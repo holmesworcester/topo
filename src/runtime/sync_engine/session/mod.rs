@@ -13,6 +13,8 @@ pub mod coordinator;
 pub mod data_plane;
 pub mod initiator;
 pub mod logging;
+pub mod range_session;
+pub mod receive_log;
 pub mod responder;
 pub mod windowing;
 

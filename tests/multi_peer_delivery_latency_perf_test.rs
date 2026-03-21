@@ -568,11 +568,11 @@ fn collect_stage_report(peers: &[Peer], samples: &[DeliverySample]) -> DeliveryS
             row_ts(&origin_row, |row| row.response_sent_at),
             row_ts(&sink_row, |row| row.response_received_at),
         );
-        let response_recv_to_persisted_ms = stage_delta(
+        let response_recv_to_stored_ms = stage_delta(
             row_ts(&sink_row, |row| row.response_received_at),
             row_ts(&sink_row, |row| row.persisted_at),
         );
-        let persisted_to_projected_ms = stage_delta(
+        let stored_to_projected_ms = stage_delta(
             row_ts(&sink_row, |row| row.persisted_at),
             row_ts(&sink_row, |row| row.projected_at),
         );
@@ -597,11 +597,8 @@ fn collect_stage_report(peers: &[Peer], samples: &[DeliverySample]) -> DeliveryS
                 request_recv_to_response_sent_ms,
             ),
             (&mut response_transit, response_transit_ms),
-            (
-                &mut response_recv_to_persisted,
-                response_recv_to_persisted_ms,
-            ),
-            (&mut persisted_to_projected, persisted_to_projected_ms),
+            (&mut response_recv_to_persisted, response_recv_to_stored_ms),
+            (&mut persisted_to_projected, stored_to_projected_ms),
         ] {
             if let Some(ms) = value {
                 bucket.push(ms);
@@ -622,8 +619,8 @@ fn collect_stage_report(peers: &[Peer], samples: &[DeliverySample]) -> DeliveryS
             request_transit_ms,
             request_recv_to_response_sent_ms,
             response_transit_ms,
-            response_recv_to_persisted_ms,
-            persisted_to_projected_ms,
+            response_recv_to_persisted_ms: response_recv_to_stored_ms,
+            persisted_to_projected_ms: stored_to_projected_ms,
             origin_timeline: origin_summary,
             sink_timeline: sink_summary,
         });
@@ -649,8 +646,8 @@ fn collect_stage_report(peers: &[Peer], samples: &[DeliverySample]) -> DeliveryS
             request_recv_to_response_sent,
         ),
         ("response_transit_ms", response_transit),
-        ("response_recv_to_persisted_ms", response_recv_to_persisted),
-        ("persisted_to_projected_ms", persisted_to_projected),
+        ("response_recv_to_stored_ms", response_recv_to_persisted),
+        ("stored_to_projected_ms", persisted_to_projected),
     ];
     let summaries = stage_specs
         .into_iter()
@@ -671,10 +668,10 @@ fn emit_stage_csv(path_name: &str, report: &DeliveryStageReport) {
         "sent_order,origin_seq,origin_name,sink_name,event_id_b64,event_id_hex,created_at_ms,latency_ms,\
 origin_need_list_sent_at,sink_need_list_received_at,sink_wanted_discovered_at,sink_request_credit_received_at,\
 sink_request_selected_at,sink_request_sent_at,origin_request_received_at,origin_response_sent_at,\
-sink_response_received_at,sink_persisted_at,sink_projected_at,\
+sink_response_received_at,sink_stored_at,sink_projected_at,\
 created_to_need_sent_ms,need_transit_ms,need_recv_to_wanted_ms,wanted_to_credit_ms,credit_to_request_selected_ms,\
 wanted_to_request_selected_ms,selected_to_request_sent_ms,request_transit_ms,request_recv_to_response_sent_ms,\
-response_transit_ms,response_recv_to_persisted_ms,persisted_to_projected_ms\n",
+response_transit_ms,response_recv_to_stored_ms,stored_to_projected_ms\n",
     );
     for sample in &report.samples {
         let row = [
@@ -758,10 +755,10 @@ fn emit_stage_report(summary: &mut String, report: &DeliveryStageReport) {
         ),
         ("response_transit_ms", worst.response_transit_ms),
         (
-            "response_recv_to_persisted_ms",
+            "response_recv_to_stored_ms",
             worst.response_recv_to_persisted_ms,
         ),
-        ("persisted_to_projected_ms", worst.persisted_to_projected_ms),
+        ("stored_to_projected_ms", worst.persisted_to_projected_ms),
     ] {
         summary.push_str(&format!(
             "    {:<30} {}\n",

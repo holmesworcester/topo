@@ -28,7 +28,15 @@ const HOUR_MS: i64 = 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 const WEEK_MS: i64 = 7 * DAY_MS;
 const MONTH_MS: i64 = 30 * DAY_MS;
+const YEAR_MS: i64 = 365 * DAY_MS;
 const THREE_YEARS_MS: i64 = 3 * 365 * DAY_MS;
+
+#[derive(Clone, Copy)]
+struct RangeTiming {
+    count: i64,
+    persisted_at_ms: Option<i64>,
+    projected_at_ms: Option<i64>,
+}
 
 fn current_timestamp_ms() -> i64 {
     SystemTime::now()
@@ -107,6 +115,34 @@ fn message_count_since_sql(db: &str, cutoff_ms: i64) -> i64 {
         |row| row.get(0),
     )
     .expect("query message_count_since")
+}
+
+fn range_timing_sql(db: &str, min_created_at_ms: Option<i64>) -> RangeTiming {
+    let conn = topo::db::open_connection(db).expect("open db for range_timing");
+    let peer_id = active_tenant_peer_id(db).expect("active tenant peer id");
+    conn.query_row(
+        "SELECT COUNT(*), MAX(t.persisted_at), MAX(t.projected_at)
+         FROM messages m
+         LEFT JOIN event_timeline t ON t.event_id = m.message_id
+         WHERE m.recorded_by = ?1
+           AND (?2 IS NULL OR m.created_at >= ?2)",
+        rusqlite::params![peer_id, min_created_at_ms],
+        |row| {
+            Ok(RangeTiming {
+                count: row.get(0)?,
+                persisted_at_ms: row.get(1)?,
+                projected_at_ms: row.get(2)?,
+            })
+        },
+    )
+    .expect("query range_timing")
+}
+
+fn elapsed_secs(metric_start_ms: i64, ts_ms: Option<i64>) -> f64 {
+    ts_ms
+        .unwrap_or(metric_start_ms)
+        .saturating_sub(metric_start_ms) as f64
+        / 1000.0
 }
 
 fn wait_for_message_count(db: &str, expected: i64, timeout: Duration) -> i64 {
@@ -383,17 +419,8 @@ fn emit_warmup_messages(nodes: &[Node]) -> i64 {
 fn write_summary_with_sources(
     summary_key: &str,
     title: &str,
-    expected_hour: i64,
-    expected_day: i64,
-    expected_week: i64,
-    expected_month: i64,
-    expected_total: i64,
+    ranges: &[(&str, RangeTiming)],
     metric_start_ms: i64,
-    hour_projected_ms: i64,
-    day_projected_ms: i64,
-    week_projected_ms: i64,
-    month_projected_ms: i64,
-    full_projected_ms: i64,
     total_wall_secs: f64,
     useful_unique_events: i64,
     downloader_event_frames: i64,
@@ -406,23 +433,22 @@ fn write_summary_with_sources(
     endpoint_obs_counts: &[i64],
 ) {
     let mut summary = format!(
-        "=== {title} ===\n  Last hour:      {} msgs in {:.2}s\n  Last day:       {} msgs in {:.2}s\n  Last week:      {} msgs in {:.2}s\n  Last month:     {} msgs in {:.2}s\n  Full history:   {} msgs in {:.2}s\n  Wall time:      {:.2}s\n  Useful unique events: {}\n  Downloader event frames: {}\n  Delivery efficiency: {:.1}%\n  Active source peers: {}\n",
-        expected_hour,
-        (hour_projected_ms - metric_start_ms) as f64 / 1000.0,
-        expected_day,
-        (day_projected_ms - metric_start_ms) as f64 / 1000.0,
-        expected_week,
-        (week_projected_ms - metric_start_ms) as f64 / 1000.0,
-        expected_month,
-        (month_projected_ms - metric_start_ms) as f64 / 1000.0,
-        expected_total,
-        (full_projected_ms - metric_start_ms) as f64 / 1000.0,
+        "=== {title} ===\n  Wall time:      {:.2}s\n  Useful unique events: {}\n  Downloader event frames: {}\n  Delivery efficiency: {:.1}%\n  Active source peers: {}\n",
         total_wall_secs,
         useful_unique_events,
         downloader_event_frames,
         delivery_efficiency * 100.0,
         active_sources,
     );
+    for (label, timing) in ranges {
+        summary.push_str(&format!(
+            "  {:<12} {} msgs durable in {:.2}s projected in {:.2}s\n",
+            label,
+            timing.count,
+            elapsed_secs(metric_start_ms, timing.persisted_at_ms),
+            elapsed_secs(metric_start_ms, timing.projected_at_ms),
+        ));
+    }
     summary.push_str("\n  Per-source downloader receives:\n");
     for (((source, sent), run_delta), obs_count) in sources
         .iter()
@@ -454,6 +480,8 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) {
         THREE_YEARS_MS.to_string(),
     );
     std::env::set_var("TOPO_FORWARD_ON_HAVE", "1");
+    std::env::set_var("TOPO_EVENT_TIMELINE", "1");
+    std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "persist,projection");
 
     let total_messages = env_i64("TOPO_MULTI_SOURCE_TOTAL_MESSAGES", 10_000);
     let tmpdir = bench_tmpdir("mscj-");
@@ -474,10 +502,12 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) {
     let day_cutoff = measurement_now_ms - DAY_MS;
     let week_cutoff = measurement_now_ms - WEEK_MS;
     let month_cutoff = measurement_now_ms - MONTH_MS;
+    let year_cutoff = measurement_now_ms - YEAR_MS;
     let expected_hour = message_count_since_sql(&sources[0].db, hour_cutoff);
     let expected_day = message_count_since_sql(&sources[0].db, day_cutoff);
     let expected_week = message_count_since_sql(&sources[0].db, week_cutoff);
     let expected_month = message_count_since_sql(&sources[0].db, month_cutoff);
+    let expected_year = message_count_since_sql(&sources[0].db, year_cutoff);
     let sink_db = tmpdir.path().join("sink.db").to_str().unwrap().to_string();
     enable_sync_logging(&sink_db);
     let inherited_env = inherited_tier_env();
@@ -499,7 +529,7 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) {
         Duration::from_secs(120),
     );
 
-    let hour_projected_ms = if expected_hour > 0 {
+    let _hour_projected_ms = if expected_hour > 0 {
         wait_for_message_count_since(
             &sink_db,
             hour_cutoff,
@@ -509,7 +539,7 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) {
     } else {
         metric_start_ms
     };
-    let day_projected_ms = if expected_day > 0 {
+    let _day_projected_ms = if expected_day > 0 {
         wait_for_message_count_since(
             &sink_db,
             day_cutoff,
@@ -519,7 +549,7 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) {
     } else {
         metric_start_ms
     };
-    let week_projected_ms = if expected_week > 0 {
+    let _week_projected_ms = if expected_week > 0 {
         wait_for_message_count_since(
             &sink_db,
             week_cutoff,
@@ -529,7 +559,7 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) {
     } else {
         metric_start_ms
     };
-    let month_projected_ms = if expected_month > 0 {
+    let _month_projected_ms = if expected_month > 0 {
         wait_for_message_count_since(
             &sink_db,
             month_cutoff,
@@ -541,6 +571,14 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) {
     };
     let full_projected_ms =
         wait_for_message_count(&sink_db, expected_total, Duration::from_secs(3600));
+    let _ = (expected_year, full_projected_ms);
+
+    let hour_timing = range_timing_sql(&sink_db, Some(hour_cutoff));
+    let day_timing = range_timing_sql(&sink_db, Some(day_cutoff));
+    let week_timing = range_timing_sql(&sink_db, Some(week_cutoff));
+    let month_timing = range_timing_sql(&sink_db, Some(month_cutoff));
+    let year_timing = range_timing_sql(&sink_db, Some(year_cutoff));
+    let all_timing = range_timing_sql(&sink_db, None);
 
     wait_for_downloader_receives_stable(
         &sink_db,
@@ -600,17 +638,15 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) {
             total_messages,
             connectivity.title()
         ),
-        expected_hour,
-        expected_day,
-        expected_week,
-        expected_month,
-        expected_total,
+        &[
+            ("Last hour", hour_timing),
+            ("Last day", day_timing),
+            ("Last week", week_timing),
+            ("Last month", month_timing),
+            ("Last year", year_timing),
+            ("All", all_timing),
+        ],
         metric_start_ms,
-        hour_projected_ms,
-        day_projected_ms,
-        week_projected_ms,
-        month_projected_ms,
-        full_projected_ms,
         bench_start.elapsed().as_secs_f64(),
         useful_unique_events,
         downloader_event_frames,
@@ -636,6 +672,8 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) {
         THREE_YEARS_MS.to_string(),
     );
     std::env::set_var("TOPO_FORWARD_ON_HAVE", "1");
+    std::env::set_var("TOPO_EVENT_TIMELINE", "1");
+    std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "persist,projection");
 
     let total_messages = env_i64("TOPO_MULTI_SOURCE_TOTAL_MESSAGES", 10_000);
     let baseline_messages = env_i64("TOPO_MULTI_SOURCE_BASELINE_MESSAGES", total_messages / 2);
@@ -693,10 +731,12 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) {
     let day_cutoff = measurement_now_ms - DAY_MS;
     let week_cutoff = measurement_now_ms - WEEK_MS;
     let month_cutoff = measurement_now_ms - MONTH_MS;
+    let year_cutoff = measurement_now_ms - YEAR_MS;
     let expected_hour = message_count_since_sql(&sources[0].db, hour_cutoff);
     let expected_day = message_count_since_sql(&sources[0].db, day_cutoff);
     let expected_week = message_count_since_sql(&sources[0].db, week_cutoff);
     let expected_month = message_count_since_sql(&sources[0].db, month_cutoff);
+    let expected_year = message_count_since_sql(&sources[0].db, year_cutoff);
     let useful_unique_events_before = unique_sync_received_event_count_sql(&rejoiner.db);
     let rejoiner_received_frames_before = received_event_frames_by_peer_for_db(&rejoiner.db);
     let source_sync_runs_before: Vec<i64> = source_dbs
@@ -711,7 +751,7 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) {
     ensure_active_peer(&rejoiner.db, Duration::from_secs(10));
     wait_for_active_tenant_ready(&rejoiner.db, Duration::from_secs(120));
 
-    let hour_projected_ms = if expected_hour > 0 {
+    let _hour_projected_ms = if expected_hour > 0 {
         wait_for_message_count_since(
             &rejoiner.db,
             hour_cutoff,
@@ -721,7 +761,7 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) {
     } else {
         metric_start_ms
     };
-    let day_projected_ms = if expected_day > 0 {
+    let _day_projected_ms = if expected_day > 0 {
         wait_for_message_count_since(
             &rejoiner.db,
             day_cutoff,
@@ -731,7 +771,7 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) {
     } else {
         metric_start_ms
     };
-    let week_projected_ms = if expected_week > 0 {
+    let _week_projected_ms = if expected_week > 0 {
         wait_for_message_count_since(
             &rejoiner.db,
             week_cutoff,
@@ -741,7 +781,7 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) {
     } else {
         metric_start_ms
     };
-    let month_projected_ms = if expected_month > 0 {
+    let _month_projected_ms = if expected_month > 0 {
         wait_for_message_count_since(
             &rejoiner.db,
             month_cutoff,
@@ -753,6 +793,14 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) {
     };
     let full_projected_ms =
         wait_for_message_count(&rejoiner.db, final_target, Duration::from_secs(3600));
+    let _ = (expected_year, full_projected_ms);
+
+    let hour_timing = range_timing_sql(&rejoiner.db, Some(hour_cutoff));
+    let day_timing = range_timing_sql(&rejoiner.db, Some(day_cutoff));
+    let week_timing = range_timing_sql(&rejoiner.db, Some(week_cutoff));
+    let month_timing = range_timing_sql(&rejoiner.db, Some(month_cutoff));
+    let year_timing = range_timing_sql(&rejoiner.db, Some(year_cutoff));
+    let all_timing = range_timing_sql(&rejoiner.db, None);
 
     wait_for_downloader_receives_stable(
         &rejoiner.db,
@@ -821,17 +869,15 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) {
             total_messages,
             connectivity.title()
         ),
-        expected_hour,
-        expected_day,
-        expected_week,
-        expected_month,
-        final_target,
+        &[
+            ("Last hour", hour_timing),
+            ("Last day", day_timing),
+            ("Last week", week_timing),
+            ("Last month", month_timing),
+            ("Last year", year_timing),
+            ("All", all_timing),
+        ],
         metric_start_ms,
-        hour_projected_ms,
-        day_projected_ms,
-        week_projected_ms,
-        month_projected_ms,
-        full_projected_ms,
         bench_start.elapsed().as_secs_f64(),
         useful_unique_events,
         downloader_event_frames,

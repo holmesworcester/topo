@@ -14,9 +14,9 @@
 //! NOTE: --test-threads=1 is required; concurrent heavy tests trigger a negentropy
 //! race condition (duplicate items from concurrent reads/writes to neg_items).
 
+use rusqlite::OptionalExtension;
 use std::collections::BTreeSet;
 use std::time::{Duration, Instant};
-use rusqlite::OptionalExtension;
 use topo::crypto::{event_id_from_base64, event_id_to_base64};
 use topo::db::open_connection;
 use topo::testutil::{
@@ -231,11 +231,19 @@ async fn run_chain_bench(n: usize, event_count: usize) {
         let avg = delivery_ms.iter().sum::<i64>() as f64 / delivery_ms.len() as f64;
         let best = delivery_ms[0];
         let worst = delivery_ms[delivery_ms.len() - 1];
-        let p50 = delivery_ms[((delivery_ms.len() as f64 * 0.50) as usize).min(delivery_ms.len() - 1)];
-        let p95 = delivery_ms[((delivery_ms.len() as f64 * 0.95) as usize).min(delivery_ms.len() - 1)];
+        let p50 =
+            delivery_ms[((delivery_ms.len() as f64 * 0.50) as usize).min(delivery_ms.len() - 1)];
+        let p95 =
+            delivery_ms[((delivery_ms.len() as f64 * 0.95) as usize).min(delivery_ms.len() - 1)];
         eprintln!(
             "  Delivery P0->P{}: best={} avg={:.0} p50={} p95={} worst={} ms ({} events)",
-            n - 1, best, avg, p50, p95, worst, delivery_ms.len()
+            n - 1,
+            best,
+            avg,
+            p50,
+            p95,
+            worst,
+            delivery_ms.len()
         );
     }
     eprintln!(
@@ -296,23 +304,36 @@ async fn run_chain_live_rate(n: usize, messages_per_sec: usize, live_seconds: us
     let delivery_ms = collect_per_event_delivery_latencies(&peers[0], tail);
     drop(handles);
 
-    let avg = if delivery_ms.is_empty() { 0.0 } else {
+    let avg = if delivery_ms.is_empty() {
+        0.0
+    } else {
         delivery_ms.iter().sum::<i64>() as f64 / delivery_ms.len() as f64
     };
     let best = delivery_ms.first().copied().unwrap_or(0);
     let worst = delivery_ms.last().copied().unwrap_or(0);
-    let p50_idx = ((delivery_ms.len() as f64 * 0.50) as usize).min(delivery_ms.len().saturating_sub(1));
-    let p95_idx = ((delivery_ms.len() as f64 * 0.95) as usize).min(delivery_ms.len().saturating_sub(1));
+    let p50_idx =
+        ((delivery_ms.len() as f64 * 0.50) as usize).min(delivery_ms.len().saturating_sub(1));
+    let p95_idx =
+        ((delivery_ms.len() as f64 * 0.95) as usize).min(delivery_ms.len().saturating_sub(1));
     let p50 = delivery_ms.get(p50_idx).copied().unwrap_or(0);
     let p95 = delivery_ms.get(p95_idx).copied().unwrap_or(0);
 
     eprintln!();
-    eprintln!("=== Chain live-rate: {} peers, {} msg/s, {}s ===", n, messages_per_sec, live_seconds);
+    eprintln!(
+        "=== Chain live-rate: {} peers, {} msg/s, {}s ===",
+        n, messages_per_sec, live_seconds
+    );
     eprintln!("  Messages:         {}", total_messages);
     eprintln!("  Wall time:        {:.1}s", wall_secs);
     eprintln!(
         "  Delivery P0->P{}: best={} avg={:.0} p50={} p95={} worst={} ms ({} events)",
-        n - 1, best, avg, p50, p95, worst, delivery_ms.len()
+        n - 1,
+        best,
+        avg,
+        p50,
+        p95,
+        worst,
+        delivery_ms.len()
     );
     eprintln!();
 }

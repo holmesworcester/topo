@@ -51,14 +51,8 @@ fn save_and_load_roundtrip() {
 fn update_policy_merges_fields() {
     let (_dir, path) = temp_db_path();
     let conn = open_connection(&path).unwrap();
-    sync_control::update_policy(
-        &conn,
-        "tenant_b",
-        Some(SyncPolicyMode::Manual),
-        None,
-        None,
-    )
-    .unwrap();
+    sync_control::update_policy(&conn, "tenant_b", Some(SyncPolicyMode::Manual), None, None)
+        .unwrap();
     let p1 = sync_control::load_policy(&conn, "tenant_b").unwrap();
     assert_eq!(p1.requests, SyncPolicyMode::Manual);
     assert_eq!(p1.responses, SyncPolicyMode::Auto);
@@ -88,14 +82,8 @@ fn update_policy_is_tenant_scoped() {
         None,
     )
     .unwrap();
-    sync_control::update_policy(
-        &conn,
-        "tenant_y",
-        None,
-        Some(SyncPolicyMode::Manual),
-        None,
-    )
-    .unwrap();
+    sync_control::update_policy(&conn, "tenant_y", None, Some(SyncPolicyMode::Manual), None)
+        .unwrap();
 
     let x = sync_control::load_policy(&conn, "tenant_x").unwrap();
     assert_eq!(x.requests, SyncPolicyMode::Disabled);
@@ -193,8 +181,7 @@ async fn registry_session_deregisters_on_drop() {
     let registry = Arc::new(SyncControlRegistry::new(path));
 
     {
-        let _session =
-            registry.register_session("tenant1", "abcd1234peer", SessionRole::Initiator);
+        let _session = registry.register_session("tenant1", "abcd1234peer", SessionRole::Initiator);
         // While session is alive, wrong prefix should fail
         let result = registry.trigger_round_for_peer("tenant1", "zzzz");
         assert!(result.is_err());

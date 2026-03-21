@@ -271,7 +271,7 @@ pub(super) async fn run_session(
     remote_addr: SocketAddr,
     direction: SessionDirection,
     _db_path: &str,
-) {
+) -> bool {
     let meta = SessionMeta {
         session_id,
         tenant: TenantId(tenant_id.to_string()),
@@ -300,8 +300,11 @@ pub(super) async fn run_session(
         } else {
             warn!("{} session error: {}", label, e);
         }
+        cancel.cancel();
+        return false;
     }
     cancel.cancel();
+    true
 }
 
 pub(super) use crate::tuning::drain_batch_size;

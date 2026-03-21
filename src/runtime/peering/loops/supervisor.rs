@@ -22,6 +22,7 @@ use crate::db::schema::create_tables;
 use crate::runtime::build_mismatch::note_build_mismatch;
 use crate::runtime::memtrace;
 use crate::runtime::repeated_warning::should_emit_globally;
+use crate::sync::session::receive_log::recover_receive_logs;
 use crate::sync::SyncConnectionHandler;
 use crate::transport::session_factory::extract_build_mismatch_reason;
 use crate::transport::SessionProvider;
@@ -57,6 +58,17 @@ pub(super) fn run_startup_preflight(
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
     create_tables(&db)?;
+
+    let recovered_receive_logs = recover_receive_logs(db_path).unwrap_or_else(|e| {
+        tracing::warn!("receive log recovery failed: {}", e);
+        0
+    });
+    if recovered_receive_logs > 0 {
+        info!(
+            "Recovered {} event(s) from receive logs",
+            recovered_receive_logs
+        );
+    }
 
     let purged = purge_expired_endpoints(&db, current_timestamp_ms()).unwrap_or(0);
     if purged > 0 {
@@ -166,101 +178,113 @@ pub(super) async fn supervise_connection_sessions(
 ) {
     let connection = provider.connection();
     let recorded_by = tenant_resolver.resolve(db_path);
-    if shutdown.is_cancelled() {
-        connection.close(0u32.into(), b"runtime shutdown");
-        return;
-    }
-
-    let session = match tokio::select! {
-        _ = shutdown.cancelled() => {
+    loop {
+        if shutdown.is_cancelled() {
             connection.close(0u32.into(), b"runtime shutdown");
             return;
         }
-        session = provider.next_session() => session,
-    } {
-        Ok(session) => session,
-        Err(e) => {
-            if let Some(reason) = extract_build_mismatch_reason(&e.to_string()) {
-                note_build_mismatch(peer_id, reason);
-                let key = format!(
-                    "session-build-mismatch:{:?}:{}:{}",
-                    direction, recorded_by, peer_id
-                );
-                if should_emit_globally(key) {
-                    warn!(
-                        "Peer {} rejected {:?} session on connection {}: {}",
-                        short_peer_id(peer_id),
-                        direction,
+
+        let session = match tokio::select! {
+            _ = shutdown.cancelled() => {
+                connection.close(0u32.into(), b"runtime shutdown");
+                return;
+            }
+            session = provider.next_session() => session,
+        } {
+            Ok(session) => session,
+            Err(e) => {
+                if let Some(reason) = extract_build_mismatch_reason(&e.to_string()) {
+                    note_build_mismatch(peer_id, reason);
+                    let key = format!(
+                        "session-build-mismatch:{:?}:{}:{}",
+                        direction, recorded_by, peer_id
+                    );
+                    if should_emit_globally(key) {
+                        warn!(
+                            "Peer {} rejected {:?} session on connection {}: {}",
+                            short_peer_id(peer_id),
+                            direction,
+                            connection.stable_id(),
+                            reason
+                        );
+                    }
+                } else {
+                    info!(
+                        "Connection {} dropped while opening {:?} session: {}",
                         connection.stable_id(),
-                        reason
+                        direction,
+                        e
                     );
                 }
-            } else {
-                info!(
-                    "Connection {} dropped while opening {:?} session: {}",
-                    connection.stable_id(),
-                    direction,
-                    e
-                );
+                return;
             }
-            return;
+        };
+
+        let session_start = std::time::Instant::now();
+        let gate = peer_session_gate(db_path, &recorded_by, peer_id);
+        let gate_wait_start = std::time::Instant::now();
+        let session_slot = match gate.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                info!(
+                    "Session {} ({:?}) on connection {} waiting for peer session slot tenant={} peer={}",
+                    session.session_id,
+                    direction,
+                    connection.stable_id(),
+                    short_peer_id(&recorded_by),
+                    short_peer_id(peer_id)
+                );
+                let guard = gate.lock().await;
+                info!(
+                    "Session {} ({:?}) on connection {} acquired peer session slot after {}ms tenant={} peer={}",
+                    session.session_id,
+                    direction,
+                    connection.stable_id(),
+                    gate_wait_start.elapsed().as_millis(),
+                    short_peer_id(&recorded_by),
+                    short_peer_id(peer_id)
+                );
+                guard
+            }
+        };
+        info!(
+            "Starting session {} ({:?}) on connection {}",
+            session.session_id,
+            direction,
+            connection.stable_id()
+        );
+
+        let session_ok = run_session(
+            handler,
+            session.session_id,
+            session.io,
+            &recorded_by,
+            peer_fp,
+            session.remote_addr,
+            direction,
+            db_path,
+        )
+        .await;
+        drop(session_slot);
+
+        info!(
+            "Session {} ({:?}) on connection {} finished in {}ms",
+            session.session_id,
+            direction,
+            connection.stable_id(),
+            session_start.elapsed().as_millis()
+        );
+
+        if !session_ok {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    connection.close(0u32.into(), b"runtime shutdown");
+                    return;
+                }
+                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+            }
         }
-    };
-
-    let session_start = std::time::Instant::now();
-    let gate = peer_session_gate(db_path, &recorded_by, peer_id);
-    let gate_wait_start = std::time::Instant::now();
-    let session_slot = match gate.try_lock() {
-        Ok(guard) => guard,
-        Err(_) => {
-            info!(
-                "Session {} ({:?}) on connection {} waiting for peer session slot tenant={} peer={}",
-                session.session_id,
-                direction,
-                connection.stable_id(),
-                short_peer_id(&recorded_by),
-                short_peer_id(peer_id)
-            );
-            let guard = gate.lock().await;
-            info!(
-                "Session {} ({:?}) on connection {} acquired peer session slot after {}ms tenant={} peer={}",
-                session.session_id,
-                direction,
-                connection.stable_id(),
-                gate_wait_start.elapsed().as_millis(),
-                short_peer_id(&recorded_by),
-                short_peer_id(peer_id)
-            );
-            guard
-        }
-    };
-    info!(
-        "Starting session {} ({:?}) on connection {}",
-        session.session_id,
-        direction,
-        connection.stable_id()
-    );
-
-    run_session(
-        handler,
-        session.session_id,
-        session.io,
-        &recorded_by,
-        peer_fp,
-        session.remote_addr,
-        direction,
-        db_path,
-    )
-    .await;
-    drop(session_slot);
-
-    info!(
-        "Session {} ({:?}) on connection {} finished in {}ms",
-        session.session_id,
-        direction,
-        connection.stable_id(),
-        session_start.elapsed().as_millis()
-    );
+    }
 }
 
 fn short_peer_id(peer_id: &str) -> &str {

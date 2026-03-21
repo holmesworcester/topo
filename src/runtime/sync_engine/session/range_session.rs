@@ -1,0 +1,147 @@
+use std::path::PathBuf;
+use std::time::Duration;
+
+use negentropy::{Id, NegentropyStorageVector};
+use rusqlite::Connection;
+
+use crate::crypto::{event_id_to_base64, hash_event, EventId};
+use crate::db::store::Store;
+use crate::protocol::{neg_id_to_event_id, Frame};
+use crate::sync::session::logging::SyncRunRxCapture;
+use crate::sync::session::receive_log::ReceiveLogWriter;
+use crate::sync::session::windowing::SyncWindow;
+use crate::transport::connection::ConnectionError;
+use crate::transport::{StreamRecv, StreamSend};
+
+pub struct RangeReceiveResult {
+    pub events_received: u64,
+    pub bytes_received: u64,
+    pub path: Option<PathBuf>,
+}
+
+pub fn load_range_storage(
+    conn: &Connection,
+    workspace_id: &str,
+    range: SyncWindow,
+) -> Result<NegentropyStorageVector, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT ts, id
+             FROM neg_items
+             WHERE workspace_id = :workspace_id
+               AND (:ts_min IS NULL OR ts >= :ts_min)
+               AND (:ts_max IS NULL OR ts < :ts_max)
+             ORDER BY ts, id",
+        )
+        .map_err(|e| format!("prepare neg_items range query: {e}"))?;
+    let mut rows = stmt
+        .query(rusqlite::named_params! {
+            ":workspace_id": workspace_id,
+            ":ts_min": range.ts_min(),
+            ":ts_max": range.ts_max_exclusive(),
+        })
+        .map_err(|e| format!("query neg_items range rows: {e}"))?;
+
+    let mut storage = NegentropyStorageVector::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("iterate neg_items range rows: {e}"))?
+    {
+        let ts: i64 = row.get(0).map_err(|e| format!("read neg_items ts: {e}"))?;
+        let id_blob: Vec<u8> = row.get(1).map_err(|e| format!("read neg_items id: {e}"))?;
+        if id_blob.len() != 32 {
+            continue;
+        }
+        let mut event_id = [0u8; 32];
+        event_id.copy_from_slice(&id_blob);
+        storage
+            .insert(ts.max(0) as u64, Id::from_byte_array(event_id))
+            .map_err(|e| format!("insert negentropy vector item: {e}"))?;
+    }
+    storage
+        .seal()
+        .map_err(|e| format!("seal negentropy vector storage: {e}"))?;
+    Ok(storage)
+}
+
+pub async fn send_have_events<S>(
+    store: &Store<'_>,
+    data_send: &mut S,
+    have_ids: &[Id],
+) -> Result<(u64, u64), String>
+where
+    S: StreamSend,
+{
+    if have_ids.is_empty() {
+        return Ok((0, 0));
+    }
+
+    let mut events_sent = 0u64;
+    let mut bytes_sent = 0u64;
+    let event_ids: Vec<EventId> = have_ids.iter().map(neg_id_to_event_id).collect();
+    for chunk in event_ids.chunks(64) {
+        let blobs = store
+            .get_shared_batch(chunk)
+            .map_err(|e| format!("load shared batch for range send: {e}"))?;
+        for event_id in chunk {
+            let Some(blob) = blobs.get(event_id) else {
+                continue;
+            };
+            data_send
+                .send(&Frame::Event { blob: blob.clone() })
+                .await
+                .map_err(|e| format!("send range event {}: {e}", event_id_to_base64(event_id)))?;
+            events_sent += 1;
+            bytes_sent += blob.len() as u64;
+        }
+    }
+    data_send
+        .flush()
+        .await
+        .map_err(|e| format!("flush range data stream: {e}"))?;
+    Ok((events_sent, bytes_sent))
+}
+
+pub fn spawn_receive_log_task<R>(
+    data_recv: R,
+    db_path: String,
+    recorded_by: String,
+    session_id: u64,
+    source_tag: String,
+    idle_timeout: Duration,
+    rx_capture: Option<SyncRunRxCapture>,
+) -> tokio::task::JoinHandle<Result<RangeReceiveResult, String>>
+where
+    R: StreamRecv + Send + 'static,
+{
+    tokio::spawn(async move {
+        let mut data_recv = data_recv;
+        let mut writer = ReceiveLogWriter::open(&db_path, &recorded_by, session_id, &source_tag)?;
+        let mut events_received = 0u64;
+        let mut bytes_received = 0u64;
+
+        loop {
+            let next = tokio::time::timeout(idle_timeout, data_recv.recv()).await;
+            match next {
+                Ok(Ok(Frame::Event { blob })) => {
+                    if let Some(capture) = &rx_capture {
+                        capture.record_event_id_b64(event_id_to_base64(&hash_event(&blob)));
+                    }
+                    bytes_received += blob.len() as u64;
+                    events_received += 1;
+                    writer.append_blob(&blob)?;
+                }
+                Ok(Ok(_)) => {}
+                Ok(Err(ConnectionError::Closed)) => break,
+                Ok(Err(_)) => break,
+                Err(_) => break,
+            }
+        }
+
+        Ok(RangeReceiveResult {
+            events_received,
+            bytes_received,
+            path: writer.finish()?,
+        })
+    })
+}

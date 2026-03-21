@@ -117,14 +117,7 @@ mod tests {
     fn update_policy_is_tenant_scoped() {
         let conn = setup();
         // Set tenant_x to manual requests
-        update_policy(
-            &conn,
-            "tenant_x",
-            Some(SyncPolicyMode::Manual),
-            None,
-            None,
-        )
-        .unwrap();
+        update_policy(&conn, "tenant_x", Some(SyncPolicyMode::Manual), None, None).unwrap();
         // Set tenant_y to disabled responses
         update_policy(
             &conn,

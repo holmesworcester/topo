@@ -9,9 +9,8 @@ use crate::cli_harness::{
     accept_invite_with_identity_on_running_daemon, assert_eventually, create_invite_with_spki,
     daemon_listen_addr, daemon_transport_fingerprint, ensure_active_peer, generate_messages,
     message_count_sql, peak_rss_mib_for_pid, random_port, send_message, start_daemon_with_options,
-    stop_daemon, topo_cmd, wait_for_active_tenant_ready,
-    wait_for_endpoint_observation, wait_for_daemon_stopped,
-    DaemonOptions, HarnessDaemon,
+    stop_daemon, topo_cmd, wait_for_active_tenant_ready, wait_for_daemon_stopped,
+    wait_for_endpoint_observation, DaemonOptions, HarnessDaemon,
 };
 
 pub type BenchNetworkGuard = Box<dyn std::any::Any + Send>;
@@ -219,11 +218,7 @@ impl SharedWorkspaceBench {
     }
 
     pub fn stabilize_bootstrap_joiner(&self, timeout: Duration) {
-        wait_for_endpoint_observation(
-            &self.bob_db,
-            &self.alice_transport_peer_id,
-            timeout,
-        );
+        wait_for_endpoint_observation(&self.bob_db, &self.alice_transport_peer_id, timeout);
         self.warm_bidirectional(timeout);
     }
 

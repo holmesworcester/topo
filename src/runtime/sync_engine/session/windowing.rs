@@ -13,6 +13,7 @@ pub enum SyncWindowKind {
     LastDay = 2,
     LastWeek = 3,
     LastMonth = 4,
+    LastYear = 5,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -41,11 +42,13 @@ const HOUR_MS: i64 = 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 const WEEK_MS: i64 = 7 * DAY_MS;
 const MONTH_MS: i64 = 30 * DAY_MS;
-const TIER_ORDER: [SyncWindowKind; 5] = [
+const YEAR_MS: i64 = 365 * DAY_MS;
+const TIER_ORDER: [SyncWindowKind; 6] = [
     SyncWindowKind::LastHour,
     SyncWindowKind::LastDay,
     SyncWindowKind::LastWeek,
     SyncWindowKind::LastMonth,
+    SyncWindowKind::LastYear,
     SyncWindowKind::Full,
 ];
 
@@ -142,7 +145,7 @@ pub fn priority_lane_for_window_kind(kind: SyncWindowKind) -> i64 {
         SyncWindowKind::LastDay => PRIORITY_LANE_TIER_DAY,
         SyncWindowKind::LastWeek => PRIORITY_LANE_TIER_WEEK,
         SyncWindowKind::LastMonth => PRIORITY_LANE_TIER_MONTH,
-        SyncWindowKind::Full => PRIORITY_LANE_FOREGROUND,
+        SyncWindowKind::LastYear | SyncWindowKind::Full => PRIORITY_LANE_FOREGROUND,
     }
 }
 
@@ -192,6 +195,11 @@ fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
             ts_min_inclusive_ms: Some(now_ms - MONTH_MS),
             ts_max_exclusive_ms: None,
         },
+        (SyncWindowShape::Nested, SyncWindowKind::LastYear) => SyncWindow {
+            kind,
+            ts_min_inclusive_ms: Some(now_ms - YEAR_MS),
+            ts_max_exclusive_ms: None,
+        },
         (SyncWindowShape::Disjoint, SyncWindowKind::LastHour) => SyncWindow {
             kind,
             ts_min_inclusive_ms: Some(now_ms - HOUR_MS),
@@ -211,6 +219,11 @@ fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
             kind,
             ts_min_inclusive_ms: Some(now_ms - MONTH_MS),
             ts_max_exclusive_ms: Some(now_ms - WEEK_MS),
+        },
+        (SyncWindowShape::Disjoint, SyncWindowKind::LastYear) => SyncWindow {
+            kind,
+            ts_min_inclusive_ms: Some(now_ms - YEAR_MS),
+            ts_max_exclusive_ms: Some(now_ms - MONTH_MS),
         },
     }
 }
@@ -268,6 +281,7 @@ pub fn decode_initial_neg_open(msg: &[u8]) -> Result<(SyncWindow, &[u8]), String
         2 => SyncWindowKind::LastDay,
         3 => SyncWindowKind::LastWeek,
         4 => SyncWindowKind::LastMonth,
+        5 => SyncWindowKind::LastYear,
         other => return Err(format!("unsupported sync window kind {}", other)),
     };
     let ts_min = i64::from_le_bytes(
@@ -320,7 +334,7 @@ mod tests {
         let peer_id = "peer-a";
         reset_outbound_window_state(db_path, peer_id);
 
-        let kinds: Vec<SyncWindowKind> = (0..7)
+        let kinds: Vec<SyncWindowKind> = (0..8)
             .map(|_| {
                 let window = select_outbound_window(db_path, peer_id, 1_000_000);
                 let kind = window.kind;
@@ -336,9 +350,10 @@ mod tests {
                 SyncWindowKind::LastDay,
                 SyncWindowKind::LastWeek,
                 SyncWindowKind::LastMonth,
+                SyncWindowKind::LastYear,
                 SyncWindowKind::Full,
                 SyncWindowKind::LastHour,
-                SyncWindowKind::LastDay,
+                SyncWindowKind::LastDay
             ]
         );
         std::env::remove_var("TOPO_SYNC_TIER_MODE");
@@ -354,7 +369,7 @@ mod tests {
         let peer_id = "peer-a";
         reset_outbound_window_state(db_path, peer_id);
 
-        let kinds: Vec<SyncWindowKind> = (0..5)
+        let kinds: Vec<SyncWindowKind> = (0..6)
             .map(|_| {
                 let window = select_outbound_window(db_path, peer_id, 1_000_000);
                 let kind = window.kind;
@@ -370,6 +385,7 @@ mod tests {
                 SyncWindowKind::LastDay,
                 SyncWindowKind::LastWeek,
                 SyncWindowKind::LastMonth,
+                SyncWindowKind::LastYear,
                 SyncWindowKind::Full,
             ]
         );
@@ -386,6 +402,7 @@ mod tests {
         let day = window_for_kind(SyncWindowKind::LastDay, 1_000_000);
         let week = window_for_kind(SyncWindowKind::LastWeek, 1_000_000);
         let month = window_for_kind(SyncWindowKind::LastMonth, 1_000_000);
+        let year = window_for_kind(SyncWindowKind::LastYear, 1_000_000);
         let full = window_for_kind(SyncWindowKind::Full, 1_000_000);
 
         assert_eq!(hour.ts_min(), Some(1_000_000 - HOUR_MS));
@@ -399,6 +416,9 @@ mod tests {
 
         assert_eq!(month.ts_min(), Some(1_000_000 - MONTH_MS));
         assert_eq!(month.ts_max_exclusive(), Some(1_000_000 - WEEK_MS));
+
+        assert_eq!(year.ts_min(), Some(1_000_000 - YEAR_MS));
+        assert_eq!(year.ts_max_exclusive(), Some(1_000_000 - MONTH_MS));
 
         assert_eq!(full.ts_min(), None);
         assert_eq!(full.ts_max_exclusive(), None);

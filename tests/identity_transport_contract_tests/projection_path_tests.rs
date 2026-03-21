@@ -85,8 +85,5 @@ fn no_duplicate_specs_emitted() {
         .iter()
         .filter(|c| matches!(c, EmitCommand::MaterializeTransportIdentity { .. }))
         .count();
-    assert_eq!(
-        spec_count, 1,
-        "must emit exactly one spec, no duplicates"
-    );
+    assert_eq!(spec_count, 1, "must emit exactly one spec, no duplicates");
 }

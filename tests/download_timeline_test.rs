@@ -96,7 +96,7 @@ async fn requested_download_records_pipeline_timestamps_on_source_and_sink() {
     );
     assert!(
         sink_timeline.persisted_at.is_some(),
-        "sink should record durable persist"
+        "sink should record first durable store"
     );
     assert!(
         sink_timeline.projected_at.is_some(),
@@ -135,12 +135,12 @@ async fn requested_download_records_pipeline_timestamps_on_source_and_sink() {
         sink_timeline.response_received_at,
     );
     assert_non_decreasing(
-        "sink receive->persist",
+        "sink receive->store",
         sink_timeline.response_received_at,
         sink_timeline.persisted_at,
     );
     assert_non_decreasing(
-        "sink persist->project",
+        "sink store->project",
         sink_timeline.persisted_at,
         sink_timeline.projected_at,
     );
