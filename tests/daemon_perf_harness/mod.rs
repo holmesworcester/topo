@@ -552,7 +552,6 @@ fn format_bench_diagnostics(db: &str) -> String {
     };
 
     let recorded_events = query_count(&conn, "SELECT COUNT(*) FROM recorded_events");
-    let wanted_events = query_count(&conn, "SELECT COUNT(*) FROM wanted_events");
     let blocked_events = query_count(&conn, "SELECT COUNT(*) FROM blocked_events");
     let project_queue = query_count(&conn, "SELECT COUNT(*) FROM project_queue");
     let sync_runs = query_count(&conn, "SELECT COUNT(*) FROM sync_runs");
@@ -560,7 +559,7 @@ fn format_bench_diagnostics(db: &str) -> String {
     let mut out = String::new();
     out.push_str("bench diagnostics:\n");
     out.push_str(&format!(
-        "  recorded_events={recorded_events} wanted_events={wanted_events} blocked_events={blocked_events} project_queue={project_queue} sync_runs={sync_runs}\n"
+        "  recorded_events={recorded_events} blocked_events={blocked_events} project_queue={project_queue} sync_runs={sync_runs}\n"
     ));
 
     if let Ok(mut stmt) = conn.prepare(

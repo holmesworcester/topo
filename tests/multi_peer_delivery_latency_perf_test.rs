@@ -74,21 +74,10 @@ struct DeliveryWindowReport {
 #[derive(Clone)]
 struct StageTimingSample {
     sample: DeliverySample,
-    origin_row: Option<EventTimelineRow>,
     sink_row: Option<EventTimelineRow>,
-    created_to_need_sent_ms: Option<i64>,
-    need_transit_ms: Option<i64>,
-    need_recv_to_wanted_ms: Option<i64>,
-    wanted_to_credit_ms: Option<i64>,
-    credit_to_request_selected_ms: Option<i64>,
-    wanted_to_request_selected_ms: Option<i64>,
-    selected_to_request_sent_ms: Option<i64>,
-    request_transit_ms: Option<i64>,
-    request_recv_to_response_sent_ms: Option<i64>,
-    response_transit_ms: Option<i64>,
-    response_recv_to_persisted_ms: Option<i64>,
-    persisted_to_projected_ms: Option<i64>,
-    origin_timeline: Option<String>,
+    created_to_received_ms: Option<i64>,
+    received_to_stored_ms: Option<i64>,
+    stored_to_projected_ms: Option<i64>,
     sink_timeline: Option<String>,
 }
 
@@ -500,75 +489,24 @@ where
 }
 
 fn collect_stage_report(peers: &[Peer], samples: &[DeliverySample]) -> DeliveryStageReport {
-    let mut created_to_need_sent = Vec::new();
-    let mut need_transit = Vec::new();
-    let mut need_recv_to_wanted = Vec::new();
-    let mut wanted_to_credit = Vec::new();
-    let mut credit_to_request_selected = Vec::new();
-    let mut wanted_to_request_selected = Vec::new();
-    let mut selected_to_request_sent = Vec::new();
-    let mut request_transit = Vec::new();
-    let mut request_recv_to_response_sent = Vec::new();
-    let mut response_transit = Vec::new();
-    let mut response_recv_to_persisted = Vec::new();
-    let mut persisted_to_projected = Vec::new();
+    let mut created_to_received = Vec::new();
+    let mut received_to_stored = Vec::new();
+    let mut stored_to_projected = Vec::new();
     let mut stage_samples = Vec::with_capacity(samples.len());
 
     for sample in samples {
-        let origin = peers
-            .iter()
-            .find(|peer| peer.name == sample.origin_name)
-            .unwrap_or_else(|| panic!("missing origin peer {}", sample.origin_name));
         let sink = peers
             .iter()
             .find(|peer| peer.name == sample.sink_name)
             .unwrap_or_else(|| panic!("missing sink peer {}", sample.sink_name));
-        let origin_row = lookup_timeline_row(origin, &sample.event_id_b64);
         let sink_row = lookup_timeline_row(sink, &sample.event_id_b64);
-        let origin_summary = timeline_summary(origin, &sample.event_id_b64);
         let sink_summary = timeline_summary(sink, &sample.event_id_b64);
 
-        let created_to_need_sent_ms = stage_delta(
+        let created_to_received_ms = stage_delta(
             Some(sample.created_at_ms),
-            row_ts(&origin_row, |row| row.need_list_sent_at),
-        );
-        let need_transit_ms = stage_delta(
-            row_ts(&origin_row, |row| row.need_list_sent_at),
-            row_ts(&sink_row, |row| row.need_list_received_at),
-        );
-        let need_recv_to_wanted_ms = stage_delta(
-            row_ts(&sink_row, |row| row.need_list_received_at),
-            row_ts(&sink_row, |row| row.wanted_discovered_at),
-        );
-        let wanted_to_credit_ms = stage_delta(
-            row_ts(&sink_row, |row| row.wanted_discovered_at),
-            row_ts(&sink_row, |row| row.request_credit_received_at),
-        );
-        let credit_to_request_selected_ms = stage_delta(
-            row_ts(&sink_row, |row| row.request_credit_received_at),
-            row_ts(&sink_row, |row| row.request_selected_at),
-        );
-        let wanted_to_request_selected_ms = stage_delta(
-            row_ts(&sink_row, |row| row.wanted_discovered_at),
-            row_ts(&sink_row, |row| row.request_selected_at),
-        );
-        let selected_to_request_sent_ms = stage_delta(
-            row_ts(&sink_row, |row| row.request_selected_at),
-            row_ts(&sink_row, |row| row.request_sent_at),
-        );
-        let request_transit_ms = stage_delta(
-            row_ts(&sink_row, |row| row.request_sent_at),
-            row_ts(&origin_row, |row| row.request_received_at),
-        );
-        let request_recv_to_response_sent_ms = stage_delta(
-            row_ts(&origin_row, |row| row.request_received_at),
-            row_ts(&origin_row, |row| row.response_sent_at),
-        );
-        let response_transit_ms = stage_delta(
-            row_ts(&origin_row, |row| row.response_sent_at),
             row_ts(&sink_row, |row| row.response_received_at),
         );
-        let response_recv_to_stored_ms = stage_delta(
+        let received_to_stored_ms = stage_delta(
             row_ts(&sink_row, |row| row.response_received_at),
             row_ts(&sink_row, |row| row.persisted_at),
         );
@@ -578,27 +516,9 @@ fn collect_stage_report(peers: &[Peer], samples: &[DeliverySample]) -> DeliveryS
         );
 
         for (bucket, value) in [
-            (&mut created_to_need_sent, created_to_need_sent_ms),
-            (&mut need_transit, need_transit_ms),
-            (&mut need_recv_to_wanted, need_recv_to_wanted_ms),
-            (&mut wanted_to_credit, wanted_to_credit_ms),
-            (
-                &mut credit_to_request_selected,
-                credit_to_request_selected_ms,
-            ),
-            (
-                &mut wanted_to_request_selected,
-                wanted_to_request_selected_ms,
-            ),
-            (&mut selected_to_request_sent, selected_to_request_sent_ms),
-            (&mut request_transit, request_transit_ms),
-            (
-                &mut request_recv_to_response_sent,
-                request_recv_to_response_sent_ms,
-            ),
-            (&mut response_transit, response_transit_ms),
-            (&mut response_recv_to_persisted, response_recv_to_stored_ms),
-            (&mut persisted_to_projected, stored_to_projected_ms),
+            (&mut created_to_received, created_to_received_ms),
+            (&mut received_to_stored, received_to_stored_ms),
+            (&mut stored_to_projected, stored_to_projected_ms),
         ] {
             if let Some(ms) = value {
                 bucket.push(ms);
@@ -607,21 +527,10 @@ fn collect_stage_report(peers: &[Peer], samples: &[DeliverySample]) -> DeliveryS
 
         stage_samples.push(StageTimingSample {
             sample: sample.clone(),
-            origin_row,
             sink_row,
-            created_to_need_sent_ms,
-            need_transit_ms,
-            need_recv_to_wanted_ms,
-            wanted_to_credit_ms,
-            credit_to_request_selected_ms,
-            wanted_to_request_selected_ms,
-            selected_to_request_sent_ms,
-            request_transit_ms,
-            request_recv_to_response_sent_ms,
-            response_transit_ms,
-            response_recv_to_persisted_ms: response_recv_to_stored_ms,
-            persisted_to_projected_ms: stored_to_projected_ms,
-            origin_timeline: origin_summary,
+            created_to_received_ms,
+            received_to_stored_ms,
+            stored_to_projected_ms,
             sink_timeline: sink_summary,
         });
     }
@@ -633,21 +542,9 @@ fn collect_stage_report(peers: &[Peer], samples: &[DeliverySample]) -> DeliveryS
         .clone();
 
     let stage_specs = [
-        ("create_to_need_sent_ms", created_to_need_sent),
-        ("need_transit_ms", need_transit),
-        ("need_recv_to_wanted_ms", need_recv_to_wanted),
-        ("wanted_to_credit_ms", wanted_to_credit),
-        ("credit_to_request_selected_ms", credit_to_request_selected),
-        ("wanted_to_request_selected_ms", wanted_to_request_selected),
-        ("selected_to_request_sent_ms", selected_to_request_sent),
-        ("request_transit_ms", request_transit),
-        (
-            "request_recv_to_response_sent_ms",
-            request_recv_to_response_sent,
-        ),
-        ("response_transit_ms", response_transit),
-        ("response_recv_to_stored_ms", response_recv_to_persisted),
-        ("stored_to_projected_ms", persisted_to_projected),
+        ("created_to_received_ms", created_to_received),
+        ("received_to_stored_ms", received_to_stored),
+        ("stored_to_projected_ms", stored_to_projected),
     ];
     let summaries = stage_specs
         .into_iter()
@@ -666,12 +563,8 @@ fn emit_stage_csv(path_name: &str, report: &DeliveryStageReport) {
     std::fs::create_dir_all(&output_dir).expect("create target/perf-results");
     let mut csv = String::from(
         "sent_order,origin_seq,origin_name,sink_name,event_id_b64,event_id_hex,created_at_ms,latency_ms,\
-origin_need_list_sent_at,sink_need_list_received_at,sink_wanted_discovered_at,sink_request_credit_received_at,\
-sink_request_selected_at,sink_request_sent_at,origin_request_received_at,origin_response_sent_at,\
 sink_response_received_at,sink_stored_at,sink_projected_at,\
-created_to_need_sent_ms,need_transit_ms,need_recv_to_wanted_ms,wanted_to_credit_ms,credit_to_request_selected_ms,\
-wanted_to_request_selected_ms,selected_to_request_sent_ms,request_transit_ms,request_recv_to_response_sent_ms,\
-response_transit_ms,response_recv_to_stored_ms,stored_to_projected_ms\n",
+created_to_received_ms,received_to_stored_ms,stored_to_projected_ms\n",
     );
     for sample in &report.samples {
         let row = [
@@ -683,31 +576,12 @@ response_transit_ms,response_recv_to_stored_ms,stored_to_projected_ms\n",
             sample.sample.event_id_hex.clone(),
             sample.sample.created_at_ms.to_string(),
             sample.sample.latency_ms.to_string(),
-            fmt_csv_opt(row_ts(&sample.origin_row, |row| row.need_list_sent_at)),
-            fmt_csv_opt(row_ts(&sample.sink_row, |row| row.need_list_received_at)),
-            fmt_csv_opt(row_ts(&sample.sink_row, |row| row.wanted_discovered_at)),
-            fmt_csv_opt(row_ts(&sample.sink_row, |row| {
-                row.request_credit_received_at
-            })),
-            fmt_csv_opt(row_ts(&sample.sink_row, |row| row.request_selected_at)),
-            fmt_csv_opt(row_ts(&sample.sink_row, |row| row.request_sent_at)),
-            fmt_csv_opt(row_ts(&sample.origin_row, |row| row.request_received_at)),
-            fmt_csv_opt(row_ts(&sample.origin_row, |row| row.response_sent_at)),
             fmt_csv_opt(row_ts(&sample.sink_row, |row| row.response_received_at)),
             fmt_csv_opt(row_ts(&sample.sink_row, |row| row.persisted_at)),
             fmt_csv_opt(row_ts(&sample.sink_row, |row| row.projected_at)),
-            fmt_csv_opt(sample.created_to_need_sent_ms),
-            fmt_csv_opt(sample.need_transit_ms),
-            fmt_csv_opt(sample.need_recv_to_wanted_ms),
-            fmt_csv_opt(sample.wanted_to_credit_ms),
-            fmt_csv_opt(sample.credit_to_request_selected_ms),
-            fmt_csv_opt(sample.wanted_to_request_selected_ms),
-            fmt_csv_opt(sample.selected_to_request_sent_ms),
-            fmt_csv_opt(sample.request_transit_ms),
-            fmt_csv_opt(sample.request_recv_to_response_sent_ms),
-            fmt_csv_opt(sample.response_transit_ms),
-            fmt_csv_opt(sample.response_recv_to_persisted_ms),
-            fmt_csv_opt(sample.persisted_to_projected_ms),
+            fmt_csv_opt(sample.created_to_received_ms),
+            fmt_csv_opt(sample.received_to_stored_ms),
+            fmt_csv_opt(sample.stored_to_projected_ms),
         ];
         csv.push_str(&row.join(","));
         csv.push('\n');
@@ -732,33 +606,9 @@ fn emit_stage_report(summary: &mut String, report: &DeliveryStageReport) {
         worst.sample.latency_ms
     ));
     for (label, value) in [
-        ("create_to_need_sent_ms", worst.created_to_need_sent_ms),
-        ("need_transit_ms", worst.need_transit_ms),
-        ("need_recv_to_wanted_ms", worst.need_recv_to_wanted_ms),
-        ("wanted_to_credit_ms", worst.wanted_to_credit_ms),
-        (
-            "credit_to_request_selected_ms",
-            worst.credit_to_request_selected_ms,
-        ),
-        (
-            "wanted_to_request_selected_ms",
-            worst.wanted_to_request_selected_ms,
-        ),
-        (
-            "selected_to_request_sent_ms",
-            worst.selected_to_request_sent_ms,
-        ),
-        ("request_transit_ms", worst.request_transit_ms),
-        (
-            "request_recv_to_response_sent_ms",
-            worst.request_recv_to_response_sent_ms,
-        ),
-        ("response_transit_ms", worst.response_transit_ms),
-        (
-            "response_recv_to_stored_ms",
-            worst.response_recv_to_persisted_ms,
-        ),
-        ("stored_to_projected_ms", worst.persisted_to_projected_ms),
+        ("created_to_received_ms", worst.created_to_received_ms),
+        ("received_to_stored_ms", worst.received_to_stored_ms),
+        ("stored_to_projected_ms", worst.stored_to_projected_ms),
     ] {
         summary.push_str(&format!(
             "    {:<30} {}\n",
@@ -767,9 +617,6 @@ fn emit_stage_report(summary: &mut String, report: &DeliveryStageReport) {
                 .map(|ms| ms.to_string())
                 .unwrap_or_else(|| "-".to_string())
         ));
-    }
-    if let Some(origin_summary) = &worst.origin_timeline {
-        summary.push_str(&format!("  Worst source timeline: {origin_summary}\n"));
     }
     if let Some(sink_summary) = &worst.sink_timeline {
         summary.push_str(&format!("  Worst sink timeline:   {sink_summary}\n"));
