@@ -125,15 +125,20 @@ This also covers the hard case where multiple local identities on the same endpo
 
 ### Sync And Convergence
 
-Once connected, peers reconcile their events over a set reconciliation algorithm that guarantees all peers will eventually have the same event set and (due to deterministic projection of events) the same convergent state for all shared data. Control and data are sent on separate QUIC streams for simplicity and reliability. Data streams carry event blobs; control streams carry discovery hints, request windows, and request IDs. Discovery still runs in rounds, but request/response stays alive for the lifetime of the authenticated connection rather than ending each round with a separate completion handshake.
+Once connected, peers reconcile explicit time ranges instead of planning per-event pull work. A range session loads the local `(ts, event_id)` membership for one selected range from `neg_items`, seals it into an in-memory `NegentropyStorageVector`, exchanges `NegOpen` / `NegMsg`, and then both sides stream all missing blobs for that range. The receiver appends those blobs to a `ReceiveLog`, stamps first-store timing as each blob is appended, and only then hands the file to canonical ingest.
 
-Negentropy reconciliation exchanges compact set summaries (`NegOpen`/`NegMsg`) over workspace-scoped, time-based `(ts, event_id)` membership and yields `need_ids` without walking the dependency graph directly. Unlike sync algorithms used by OrbitDB, Git, etc., it is important for our design to chose one that does not care about the shape of our data and is ideal for event sets that are always growing. In this way, set reconcilation / syncing can be decoupled from the content of events.
+Negentropy remains the set-reconciliation engine because it is agnostic to event content and naturally fits an ever-growing event set. The active range path uses the Rust [`negentropy` library](https://crates.io/crates/negentropy) over one selected range at a time. The current scheduler intentionally stays simple and round-robins:
 
-We use the Rust [`negentropy` library](https://crates.io/crates/negentropy) (`negentropy = "0.5"` in this repo), and this is the concrete engine behind our range-based set reconciliation approach ([Aljoscha Meyer, "Range-Based Set Reconciliation"](https://aljoscha-meyer.de/assets/landing/rbsr.pdf)). We modified our Negentropy integration to use a SQLite-backed store (`neg_items` + per-session `session_blocks`) instead of unbounded in-memory item sets, so reconciliation remains memory-bounded at large history sizes. (This is important for doing background sync in a memory-limited context on iOS). 
+1. `last hour`
+2. `last day`
+3. `last week`
+4. `last month`
+5. `last year`
+6. `full history`
 
-We also modified the session flow for multi-source catchup: each source still runs Negentropy independently, but Negentropy is now only responsible for discovering candidate supply (`need_ids`, `have_ids`, and which peers appear to have which events). Balancing is sink-driven through SQL-backed `wanted` state and per-peer request windows, while all sources still feed one shared batch writer to avoid duplicate pull storms and SQLite write contention. Inbound events are ingested through the same `project_one` path used by local creation and replay, which is why the system can enforce one convergence contract across source types: `local_create`, `wire_receive`, and replay all converge to the same projected state.
+Dependency repair is a separate fast path. Projection blocking emits direct dependency requests keyed by source peer, and dependency replies are ingested immediately through the same canonical/projector path used by local creation and replay. This preserves one convergence contract across source types while keeping bulk transfer durable-first and blocker repair latency-first.
 
-Tiered sync discovery gives the sink a narrower early frontier than "full history immediately". In tiered mode, outbound rounds cycle through `last hour -> last day -> last week -> last month -> full`, then repeat. Each round carries its concrete timestamp bounds in the initial `NegOpen`, and each discovered event is stored with both a window-derived priority lane and its `created_at_ms`. Non-full windows aggressively promote and follow missing blockers; `full` remains the repair/catchup lane. This is what lets recent messages become displayable quickly without blocking full-history convergence.
+Forward-on-have remains a low-latency supplement for recent discovery hints, but it does not replace the range-owned bulk path. The bulk path no longer uses durable `wanted` rows, `ResponseCredit`, or a shared ingest channel to keep the wire busy.
 
 **Forward-on-have live hint bus.** Negentropy rounds still run periodically, but recent live traffic does not wait for the next scheduled round. Each time the persist phase newly inserts a shared canonical event it publishes a `LiveHint` to an in-process broadcast channel keyed by `(db_path, tenant_id)` — strictly after the persist transaction commits. Active sync sessions subscribe on startup and drain the channel once per control-loop tick. When hints arrive, the session immediately emits `DiscoveryHints` on the control stream, grouped by the same age-derived priority lanes used by tiered discovery. Hints from the receiving peer's own source tag are not echoed back. Negentropy rounds remain authoritative for repair and history catchup; forward-on-have is a low-latency supplement, not a replacement. Implementation details and measured latency in [PLAN.md § 10.0.2](./PLAN.md).
 
@@ -392,20 +397,25 @@ Safety rule:
 3. all canonical event types have fixed wire sizes; `payload_len` must exactly match the schema-defined size for the event type (or, for encrypted events, the size determined by `inner_type_code`).
 4. any mismatch rejects the frame.
 
-## 1.5 Dual-stream sync separation
+## 1.5 Sync session classes and stream separation
 
-Sync sessions use one control stream and one data stream.
+One authenticated QUIC connection can host two sync session classes:
 
-Why split streams:
-1. keeps large event transfer (`Event` frames) from head-of-line blocking discovery and request control,
-2. lets discovery rounds start and finish independently of the request/response data plane,
-3. improves practical throughput and observability by separating reconciliation/control chatter from bulk payload flow.
+1. `Range` sessions for bulk catchup,
+2. `Dependency` sessions for targeted blocker repair.
+
+Why keep control and data separate inside a session:
+1. large `Event` blobs do not head-of-line block reconciliation or dependency requests,
+2. control remains readable and bounded while data transfer stays bulk-oriented,
+3. dependency replies can stay latency-first without sharing the same hot path as range bulk transfer.
 
 Current shape:
-1. discovery rounds use `NegOpen` / `NegMsg` / `DiscoveryHints` on the control stream,
-2. request flow uses `ResponseCredit` and `RequestIds` on the control stream,
-3. the data stream carries only requested `Event` blobs,
-4. there is no per-round `Done` / `DataDone` / `DoneAck` drain handshake in live sync anymore.
+1. a `Range` session uses one control stream plus one data stream and runs in two strict phases:
+   - negentropy reconcile for one explicit range,
+   - bulk event transfer for that same range,
+2. a `Dependency` session uses one control stream for `RequestIds` and one data stream for dependency `Event` replies,
+3. bulk range transfer does not use `ResponseCredit`, durable `wanted`, or a per-event request scheduler,
+4. the receiver writes bulk data to a `ReceiveLog`; dependency replies ingest immediately through the normal canonical path.
 
 ---
 
@@ -722,8 +732,10 @@ The node daemon (`run_node`) operates as follows:
 
 1. Discover all local tenants from the DB.
 2. Create a **single** QUIC endpoint with `TransportTargetCertResolver` for exact local transport-target SNI cert selection across all tenants.
-3. Create one shared `batch_writer` thread that all tenants feed into.
-4. Run a single `accept_loop_with_ingest` with a node-scoped union trust closure. Post-handshake, the requested local transport fingerprint is resolved to exactly one tenant from local SQL state, then that tenant alone authorizes the authenticated remote fingerprint.
+3. Run one accept loop over that shared endpoint; post-handshake, the requested local transport fingerprint is resolved to exactly one tenant from local SQL state, then that tenant alone authorizes the authenticated remote fingerprint.
+4. For each authenticated peer connection, keep one connection owner and host:
+   - range sessions for bulk catchup,
+   - one dependency session for blocker repair.
 5. Optionally: per-tenant mDNS advertisement and peer discovery.
 
 ### Single-port multi-tenant endpoint
@@ -747,31 +759,28 @@ Discovery-only invite acceptance may still persist an empty `bootstrap_addr` mar
 
 This PoC does not implement `PeerRemoved`, `UserRemoved`, or a `ban` command. Safe user/device removal requires coordinated group key agreement plus key rotation so future ciphertext is no longer available to the removed member. We intentionally defer that work here and keep transport trust/session logic limited to invite/bootstrap trust and steady-state `PeerShared` trust.
 
-### Shared batch writer with tenant routing
+### Receive logs and immediate ingest
 
-All tenants share a single `batch_writer` thread to avoid SQLite write contention.
-Each ingested event carries `recorded_by` and source attribution
-(`IngestItem = (event_id, blob, recorded_by, source_tag)`), so one writer can
-safely persist mixed-tenant ingress without cross-tenant state confusion while
-retaining per-peer ingest provenance in `recorded_events.source`.
+The active network ingest model has two boundaries:
 
-Per batch:
-1. collect ingress tuples from concurrent sessions,
-2. persist canonical rows once (`events`) and tenant receipt rows (`recorded_events`) in one transaction,
-3. enqueue tenant-scoped projection work (`project_queue`),
-4. commit,
-5. run post-commit effects (queue drain, health logging, post-drain hooks).
+1. **Range bulk receive** writes blobs to a per-session `ReceiveLog`.
+2. **Dependency replies** call `ingest_now` immediately.
 
-The batch writer runs two explicit phases:
+Range bulk path:
+1. append each blob to the `ReceiveLog`,
+2. stamp first-store timing as the append succeeds,
+3. finalize on connection close or idle timeout,
+4. replay the log into canonical ingest,
+5. recover leftover logs on startup and delete them after successful replay.
 
-1. Persist phase (`state/pipeline/phases.rs`): inserts into `events`, `recorded_events`, and `neg_items`, and enqueues `project_queue` rows in one transaction.
-2. Effects phase (`state/pipeline/effects.rs`): executes side effects directly from `PersistPhaseOutput` through the executor boundary (wanted removal, queue drain/projection, queue health logging, post-drain hooks).
+Dependency path:
+1. receive one or more dependency `Event` replies,
+2. opportunistically drain what is already buffered now,
+3. call `ingest_now`,
+4. let normal `project_queue` / `project_one` logic unblock dependents.
 
-The projection drain (`project_queue::drain_with_limit`) runs each projection in autocommit mode and batches dequeue DELETEs via `mark_done_batch` (one `BEGIN`/`COMMIT` per claim cycle). Individual projection failures are retried with exponential backoff via `mark_retry`. During the drain (outside low_mem mode), `drain_project_queue_on_connection` defers WAL autocheckpointing (`PRAGMA wal_autocheckpoint = 0`) to avoid checkpoint stalls between autocommit writes, restoring the default after drain completes. In low_mem mode this is skipped to keep WAL growth bounded. Crash safety is provided by the queue: interrupted drains leave events in `project_queue` for re-projection on the next cycle.
-
-Ownership statement: persist owns ingest SQL writes, planner owns deterministic command mapping, effects owns side-effect execution, and `batch_writer` in `state/pipeline/mod.rs` owns sequencing/retry policy.
-
-This eliminates write contention while preserving per-tenant projection isolation.
+This keeps the bulk hot path free of per-event SQLite work while still using
+the same canonical/projector pipeline after the durable handoff point.
 
 ### TLS credential storage
 
@@ -814,7 +823,7 @@ The production peering runtime follows a single conceptual loop:
 4. **Dial/accept loops**: `connect_loop` (outbound) and `accept_loop` (inbound) are separate long-running loops coordinated by shared projected state and cancellation/watch channels. QUIC dial/accept + peer identity extraction flows through `transport::connection_lifecycle`, and stream wiring flows through `transport::session_factory`.
 5. **Live peer slot**: after mTLS identity extraction, if the remote transport fingerprint is already backed by projected `peers_shared` state for this tenant, the runtime claims one local live-connection slot per `(db_path, recorded_by, remote_transport_fingerprint)`. Duplicates are closed instead of starting overlapping sync ownership. If both directions appear, the deterministic preferred direction is the lexicographically lower peer dialing outbound and the higher peer retaining inbound; a preferred-direction connection replaces a non-preferred one.
 6. **Sync connection runner** (`SyncConnectionHandler`): protocol-agnostic connection handler invoked via the `SessionHandler` contract.
-7. **Ingest writer** (`batch_writer`): single shared thread consuming `IngestItem` tuples from all concurrent sessions.
+7. **Ingest boundary**: range sessions write `ReceiveLog` files and dependency sessions call `ingest_now`; both converge through the same canonical/projector path.
 8. **Projected SQLite state**: projection cascade updates trust rows, completing the loop.
 
 ### Module ownership
@@ -1185,125 +1194,88 @@ Canonical tables and queue tables stay separate.
 ## 7.2 Workers
 
 Peer runtime worker shape:
-1. sync ingest receiver path:
-   - receive `Frame::Event` blobs,
-   - decode + canonical insert (`events`, `neg_items`, `recorded_events`) + `project_queue` enqueue in one transaction,
-   - commit, then drain `project_queue`.
-2. project worker/drain:
-   - claim batch, project each event in autocommit (`valid|block|reject`), batch-dequeue successes, mark retry on failure. `project_queue` stores priority metadata but currently only uses lane priority at claim time: foreground before bulk, then FIFO within the lane (`priority_lane`, then `available_at`, then `rowid`) so dependency-heavy foreground chains are not recency-reordered. WAL autocheckpoint deferred during drain (skipped in low_mem mode).
-3. `PeerReplicator` per authenticated peer slot:
-   - **observer loop** (lower-rate): connect/full-sync start, `dirty_hot`, cold timer, backlog exhaustion, or source-set change trigger negentropy observation; the observer updates SQL truth (`wanted`, candidate sources) but does not attempt to keep the wire full itself.
-   - **sender/request loop** (higher-rate): continuously keeps per-peer QUIC streams fed. It serves requested responses from bounded in-memory connection-scoped response buffers, advertises source-side request credit, and uses a shared tenant-scoped in-memory coordinator to reserve sink-side pull work across all active peers in bounded memory.
+1. `RangeSession`:
+   - choose one explicit range,
+   - reconcile that range with negentropy on the control stream,
+   - exchange missing blobs on the data stream,
+   - append received blobs to a `ReceiveLog`.
+2. dependency session:
+   - receive direct dependency requests on the control stream,
+   - send dependency replies on the data stream,
+   - ingest replies immediately through `ingest_now`.
+3. project worker/drain:
+   - claim `project_queue`,
+   - run `project_one` in autocommit,
+   - dequeue successes in batches and retry failures with backoff.
 4. cleanup worker:
-   - reclaim expired leases, purge stale/sent operational rows, TTL endpoint cleanup.
+   - recover leftover receive logs,
+   - reclaim expired leases,
+   - purge stale operational rows and expired endpoint observations.
 
 ## 7.3 Sync Transfer Production
 
-Sync event transfer is pull-only.
+Bulk transfer is range-owned.
 
-1. observer-loop reconciliation discovers missing IDs and candidate suppliers and writes `wanted + wanted_sources`,
-2. sink-side wanted scheduling chooses which IDs to request under source-advertised credit,
-3. sources queue requested IDs in bounded in-memory response buffers and read canonical blobs at send time,
-4. control protocol producers (`Frame::NegOpen`, `Frame::NegMsg`, `Frame::DiscoveryHints`, `Frame::RequestIds`, `Frame::ResponseCredit`, `Frame::IntroOffer`) live in `shared/protocol.rs`,
-5. hot-observer wakeups from newly valid shared events cause the next peer observation pass to discover those IDs so the sink can request them.
+1. the scheduler picks one range from the current ladder:
+   - `last hour`
+   - `last day`
+   - `last week`
+   - `last month`
+   - `last year`
+   - `full history`
+2. the initiator opens a `Range` session and sends the concrete window bounds in the initial `NegOpen`,
+3. both sides load that range from `neg_items` into an in-memory `NegentropyStorageVector`,
+4. negentropy computes `have_ids` / `need_ids` for that explicit range,
+5. both sides stream all missing `Event` blobs for that range,
+6. the receiver appends blobs to a `ReceiveLog`,
+7. on close or idle timeout, the log is finalized and replayed into canonical ingest.
 
-There is no durable sync egress queue anymore. Live sync event transport is request/response only and uses bounded in-memory connection-scoped response buffers.
+Dependency repair is separate:
 
-## 7.4 Dedupe and purge
+1. projection blocking records the missing dep and source peer,
+2. the runtime publishes that dep to the live dependency session for the source peer,
+3. the peer replies with `Event` blobs,
+4. replies ingest immediately and may unblock waiting events.
 
-1. `project_queue` is transient and purged on terminal decision (`Valid`, `Reject`, or `AlreadyProcessed` for the `(peer_id, event_id)` projection target),
-2. enqueue uses dedupe guards and skips terminal/blocked states,
-3. duplicate enqueue races are safe via `INSERT OR IGNORE` plus terminal fast-drop checks,
-4. queue lane classification uses outer semantic type, not decrypted projector output; for encrypted wrappers the runtime reads the wrapper-exposed `inner_type_code`, so encrypted `file_slice` rows are still lane `bulk` without needing decryption,
-5. bulk must not monopolize projection or send scheduling, but foreground order is preserved within a lane,
-6. sync request in-flight suppression is bounded memory state rather than durable egress leasing,
-7. duplicate pulls are acceptable as a recovery/perf tradeoff once spare credit exists; the sink still tries to avoid duplicates before first coverage.
+## 7.4 Dedupe and recovery
+
+1. `project_queue` is transient and purged on terminal decision for the `(peer_id, event_id)` projection target.
+2. enqueue uses dedupe guards and skips terminal or already-blocked states.
+3. duplicate enqueue races are safe via `INSERT OR IGNORE` plus terminal fast-drop checks.
+4. `ReceiveLog` replay parses valid frames to EOF and ignores a truncated tail.
+5. leftover receive logs are ingested on startup; interrupted bulk ranges are not discarded.
+6. dependency-session routing state is bounded in-memory state keyed by `(db_path, tenant_id, peer_id)`.
 
 ## 7.5 Atomicity boundaries
 
 Must be atomic:
 
-1. canonical event insert + recorded insert + project enqueue,
-2. projection state transition + project dequeue,
-3. unblock update + project requeue.
+1. append one blob to the `ReceiveLog`,
+2. canonical event insert + recorded insert + `project_queue` enqueue,
+3. projection state transition + project dequeue,
+4. unblock update + project requeue.
 
 Can be eventual:
 
-1. transport send / request retry,
-2. queue cleanup/purge,
-3. metrics/logging.
+1. range retry after timeout or connection loss,
+2. dependency request retry,
+3. queue cleanup and metrics/logging.
 
-## 7.6 Multi-source download coordination
+## 7.6 Multi-source coordination
 
-Multi-source download is receiver-driven.
+The active implementation keeps coordination intentionally simple.
 
-Negentropy does discovery only:
-1. per source peer, the observer loop discovers:
-   - sink `need_ids` (events we still lack),
-   - source `have_ids` (events the remote peer appears to be missing, emitted as `DiscoveryHints` rather than unsolicited data),
-   - candidate source membership ("peer P appears to have event E").
-2. this discovery is written into SQL-backed wanted state rather than being
-   balanced inline inside the negentropy round.
+1. there is one authenticated QUIC connection per peer,
+2. each peer can host multiple range sessions plus one dependency session,
+3. bulk scheduling is range-based, not event-based,
+4. newer ranges are favored by the fixed ladder order,
+5. true arbitrary-range splitting and cross-peer range balancing are future work.
 
-### Bidirectional DiscoveryHints and real byte credits
+This means the current branch optimizes for:
 
-Both sides of a sync connection send `DiscoveryHints` so the other side has
-real `encoded_size_bytes` for byte-credit accounting:
-
-- **Initiator → Responder**: the initiator sends `DiscoveryHints` for its
-  `have_ids` (events it has that the responder appears to lack) during each
-  negentropy round via `send_discovery_hints_from_have_ids`.
-- **Responder → Initiator**: the responder uses a patched negentropy
-  (`reconcile_with_diff`) that exposes the diff IDs the upstream crate
-  normally discards on the server side. The responder sends `DiscoveryHints`
-  for its `have_ids` (events it has that the initiator lacks) **before** the
-  final `NegMsg`, so the initiator has real sizes when its scheduling loop
-  runs.
-
-Without responder-side hints the initiator would only have negentropy diff
-IDs with no metadata (`encoded_size_bytes=0`). A conservative 256-byte
-credit floor (`WantedCandidate::credit_cost`) covers the transient window
-as a safety net, but real byte credits from DiscoveryHints are the intended
-normal path.
-
-The negentropy crate is vendored at `vendor/negentropy` with a small patch:
-`reconcile_with_diff()` is a new public method that calls the same internal
-`reconcile_aux` as `reconcile()` but populates `have_ids`/`need_ids` vecs
-instead of discarding them. The `is_initiator` guards on diff-ID collection
-inside `reconcile_aux` are removed so both caller paths collect IDs.
-
-The sink-side sender/request loop does balancing:
-1. `wanted(event_id, ...)` records that the sink still needs an event,
-2. `wanted_sources(event_id, peer_id, first_seen_at, last_seen_at, priority_lane, priority_ts)` records which peers appear to have it,
-3. the sink keeps only durable demand and candidate-supplier truth in SQLite; per-peer in-flight request suppression is bounded memory state owned by a shared tenant-scoped coordinator,
-4. the source advertises request credit when its in-memory response pipeline falls below a low watermark,
-5. the sink request scheduler fills that credit by planning across all currently known peer credits/in-flight sets, then choosing the next wanted rows for the specific peer from SQL-backed candidate truth,
-6. duplicate requests are allowed aggressively when spare peer credit exists; the system prefers keeping active peers busy over perfectly suppressing duplicate pulls.
-
-This means:
-- negentropy discovers supply,
-- `wanted` models demand,
-- `wanted_sources` models candidate supply,
-- source-advertised credit tells the sink when more pull work can be sent,
-- the sender/request loop is the actuator that balances traffic and keeps QUIC full.
-
-Key properties:
-- no balancing logic is embedded in negentropy,
-- the sink can always keep active peers busy if candidate supply exists,
-- a slow source does not own events by fiat; another candidate can be used immediately once there is spare credit,
-- multi-source fairness is across distinct peers, not multiplied by duplicate connections,
-- sync data transfer is request/response only; discovery never sends canonical event blobs directly.
-
-Future work: global fairness above connection-local credit.
-- Connection-local credit should continue to come from local send headroom: the
-  source connection knows whether its response queue and QUIC send path are
-  draining.
-- A later global allocator can cap those local grants across all active
-  connections so one busy peer does not monopolize total upload buffering or
-  response work.
-- The intended shape is `effective_credit = min(local_headroom, global_budget_share)`.
-- This is out of scope for the current refactor; the current implementation only
-  scopes sync handlers to authenticated connections and keeps fairness simple.
+1. minimum time to first durable store for recent data,
+2. minimum latency to unblock projection for missing deps,
+3. a small, readable scheduler rather than a global per-event allocator.
 
 ### Connection idempotency
 
@@ -1326,51 +1298,41 @@ live connections to the same peer.
 
 ### Implementation decisions
 
-The old "deterministic ownership in negentropy" approach was a transitional
-shortcut: it reduced duplicate downloads without introducing a durable sink-side
-scheduler, but it coupled balancing to reconciliation and made transport fill
-depend on fresh session rounds.
+The active branch chooses simpler boundaries over a global per-event planner:
 
-`PeerReplicator` replaces that with a cleaner split:
-
-1. **Shared batch_writer.** All concurrent sessions still feed one shared
-   SQLite writer. This remains the correct way to avoid WAL contention.
-2. **Observer loop.** Per-peer negentropy rounds discover candidate supply and
-   keep the wanted graph fresh.
-3. **Sender/request loop.** The sink fills per-peer request credit from a
-   shared tenant-scoped in-memory coordinator backed by `wanted` SQL state; the
-   source serves only explicitly requested event IDs from bounded in-memory
-   response buffers.
-4. **Incremental bounded windows.** Pull uses bounded in-memory reservation and
-   response windows. Blob residency stays small, so SQLite does not pace the
-   wire and memory does not scale with total workspace size.
-5. **Connection-scoped scaffolding.** Sync handlers now belong to one
-   authenticated connection lifetime, and the sink's request credit,
-   in-flight request suppression, and the source's pending-response queue now
-   survive discovery-round boundaries on that connection. Discovery rounds
-   still own Negentropy snapshot semantics; request/response state simply
-   borrows the current round's streams while the authenticated connection is
-   alive.
-6. **Negentropy snapshot ordering.** `BEGIN` still must precede
-   `rebuild_blocks()` so the observer sees a consistent read snapshot.
+1. **Range-owned bulk transfer.** One range session owns one explicit range and
+   one `ReceiveLog`.
+2. **Immediate dependency repair.** Blockers go to a separate dependency
+   session and reply ingestion does not wait behind bulk files.
+3. **Connection-scoped ownership.** Sessions belong to one authenticated
+   connection lifetime, and duplicate live connections are still collapsed by
+   the live-connection slot rule.
+4. **Simple scheduler first.** The current scheduler round-robins the fixed
+   range ladder before growing into arbitrary coordinator-chosen ranges.
+5. **Use stock negentropy directly.** The active path builds an in-memory
+   vector from `neg_items` for the selected range instead of routing bulk sync
+   through a bespoke request-credit scheduler.
 
 ## 7.7 Negentropy implementation notes
 
 Baseline implementation:
 1. `neg_items` stores shared-event membership tuples (`workspace_id`, timestamp, event id bytes).
-2. Per-session block indexes are rebuilt into `session_blocks` for reconciliation rounds.
-3. Control-plane reconciliation uses `NegOpen` and `NegMsg` frames; the first `NegOpen` may carry a small `P7SW` window envelope that selects one of three ranges over the same event universe:
-   - `Full`: no timestamp filter,
-   - `Hot`: `ts >= cutoff_ms`,
-   - `Cold`: `ts < cutoff_ms`.
-4. The first outbound session to a `(db_path, peer_id)` pair is `Full`; later sessions are usually `Hot`, with a `Cold` sweep injected on a slower cadence. Legacy raw `NegOpen` payloads are interpreted as `Full`.
-5. Data-plane transfer streams `Event` frames while reconciliation can continue in parallel.
-6. Multi-source coordination does not replace negentropy; it consumes per-peer `need_ids` plus candidate-source observations discovered by negentropy.
-7. Hot/cold windows are a cadence optimization only. They do not create separate event universes, separate dependency graphs, or separate completion protocols.
+2. `RangeSession` queries `neg_items` for one explicit range and loads that slice into an in-memory `NegentropyStorageVector`.
+3. Control-plane reconciliation uses `NegOpen` and `NegMsg`; the first `NegOpen` may carry a `P7SW` window envelope selecting one of:
+   - `LastHour`
+   - `LastDay`
+   - `LastWeek`
+   - `LastMonth`
+   - `LastYear`
+   - `Full`
+4. Outbound scheduling currently round-robins those windows per `(db_path, peer_id)`.
+5. Range data transfer streams `Event` frames after reconciliation for that range.
+6. Multi-source coordination does not replace negentropy; future smarter range balancing will still consume range-local membership discovered by negentropy.
+7. The older SQLite-backed negentropy storage remains in-tree, but the active range path uses the in-memory vector-backed storage built directly from `neg_items`.
 
 Primary code references:
-1. `src/runtime/sync_engine/negentropy_sqlite.rs`
-2. `src/runtime/sync_engine/session/control_plane.rs`
+1. `src/runtime/sync_engine/session/range_session.rs`
+2. `src/runtime/sync_engine/session/windowing.rs`
 3. `src/shared/protocol.rs`
 
 ---

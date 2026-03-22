@@ -4,19 +4,17 @@ Code-accurate runtime and data-flow snapshot for `master` in `poc-7`.
 
 Primary source modules:
 - `src/main.rs`
-- `src/rpc/server.rs`
+- `src/runtime/control/*`
 - `src/node.rs`
 - `src/service.rs`
 - `src/event_modules/*/{commands.rs,queries.rs}`
-- `src/peering/runtime/*`
-- `src/peering/loops/*`
-- `src/peering/workflows/*`
-- `src/transport/{peering_boundary.rs,connection_lifecycle.rs,session_factory.rs,intro_io.rs}`
-- `src/sync/session/*`
-- `src/event_pipeline/{mod.rs,phases.rs,planner.rs,effects.rs,drain.rs}`
-- `src/projection/apply/*`
-- `src/projection/create.rs`
-- `src/db/{project_queue.rs,wanted.rs,transport_trust.rs}`
+- `src/runtime/peering/*`
+- `src/runtime/sync_engine/session/*`
+- `src/runtime/transport/*`
+- `src/state/pipeline/*`
+- `src/state/projection/apply/*`
+- `src/state/dependency_fetch.rs`
+- `src/state/db/{project_queue.rs,transport_trust.rs}`
 
 ## 0) RPC Dispatch And Event Locality
 
@@ -40,24 +38,25 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    LOCAL["Local create events"] --> INGEST["shared ingest + batch_writer"]
-    OTHERS["Other peers"] -->|"sync sessions"| EP
+    LOCAL["Local create events"] --> CREATE["create_* + project_one"]
+    CREATE --> PDB[("SQLite projections")]
 
-    subgraph NET["Incoming Wire"]
-      EP["QUIC endpoint"] --> LIFE["connection lifecycle"]
-      LIFE --> FACT["session factory"]
-      FACT --> SESS["sync session (data stream)"]
-      SESS --> RECV["receiver task"]
-      RECV --> INCOMING["incoming sync events"]
-    end
+    OTHERS["Other peers"] --> EP["QUIC endpoint"]
+    EP --> LIFE["connection lifecycle"]
+    LIFE --> FACT["session factory"]
+    FACT --> RANGE["Range session"]
+    FACT --> DEP["Dependency session"]
 
-    INCOMING --> INGEST
-    INGEST --> STORE["events + recorded + sync state persist"]
-    STORE --> QDB[("SQLite Queues")]
+    RANGE --> LOG["ReceiveLog append"]
+    LOG --> INGEST["ingest_event_log"]
+    DEP --> NOW["ingest_now"]
+
+    INGEST --> STORE["persist + project_queue enqueue"]
+    NOW --> STORE
+    STORE --> QDB[("project_queue")]
     QDB --> APPLY["project_one + cascade"]
-    APPLY --> PDB[("SQLite Projections")]
+    APPLY --> PDB
 
-    CTRL["Sync control stream (RequestIds / discovery hints)"] --> QDB
     PDB -->|trust rows| LIFE
 ```
 
@@ -65,30 +64,23 @@ flowchart TD
 
 ```mermaid
 flowchart TD
-    PEER["peering loop (connect/accept/download/punch)"] --> BOUND["transport::peering_boundary (dial/accept/session/intro helpers)"]
-    BOUND --> LIFE["connection_lifecycle (connected peer + peer_id)"]
-    BOUND --> FACT["session_factory (open/accept streams)"]
-    FACT --> IO["TransportSessionIo + session_id"]
-    IO --> HANDLER["SyncConnectionHandler::on_session"]
+    PEER["one authenticated peer connection"] --> FACT["session_factory"]
 
-    HANDLER --> SYNC_RECON["sync reconcile (control exchange)"]
-    SYNC_RECON --> IDS["have_ids + need_ids"]
+    FACT --> RANGE["Range session"]
+    RANGE --> WIN["select explicit range"]
+    WIN --> NEG["NegOpen / NegMsg"]
+    NEG --> SEND["send missing Event blobs"]
+    NEG --> RECV["receive missing Event blobs"]
+    RECV --> LOG["ReceiveLog append"]
+    LOG --> INGEST["ingest_event_log"]
+    INGEST --> PROJ["project_one + cascade"]
 
-    IDS -->|peer can supply ids| WANT["wanted + wanted_sources update"]
-    WANT --> PLAN["request planner + peer credit"]
-    PLAN --> REQ["send RequestIds(requested ids)"]
-    REQ --> RESPQ["connection-scoped response buffer"]
-    RESPQ --> OUT["data_send: Frame::Event(blob)"]
-    OUT --> RX["peer receiver task"]
-    RX --> IN["ingest channel"]
-
-    IN --> WRITER["batch_writer"]
-    WRITER --> P1["phase 1: persist + enqueue"]
-    P1 --> P2["phase 2: plan post-commit commands"]
-    P2 --> P3["phase 3: run effects executor"]
-    P3 --> PROJ["project_one + cascade"]
-
-    OUT --> NEXT["next discovery round"]
+    FACT --> DEP["Dependency session"]
+    BLOCKED["blocked_event_deps"] --> DEP
+    DEP --> REQ["RequestIds"]
+    DEP --> REPLY["dependency Event replies"]
+    REPLY --> NOW["ingest_now"]
+    NOW --> PROJ
 ```
 
 ## 3) High-Level Runtime Boundaries
@@ -151,11 +143,11 @@ flowchart TD
       RSUP["Supervisor"]
       RSTATE["state machine: IdleNoTenants <-> Active"]
       RCANCEL["CancellationToken tree"]
-      TARGET_Q["unified target ingress queue"]
+      TARGET_Q["target ingress queue"]
       DISPATCHER["single target dispatcher"]
-      ACCEPT_W["accept-loop worker"]
-      CONNECT_W["connect-loop workers"]
-      INGRESS_W["target ingress workers"]
+      ACCEPT_W["accept loop"]
+      CONNECT_W["connect loops"]
+      INGRESS_W["bootstrap / observed / discovery ingress"]
       RSUP --> RSTATE
       RSUP --> RCANCEL
       RSUP --> ACCEPT_W
@@ -170,14 +162,13 @@ flowchart TD
     START --> RSUP
 
     subgraph PIPE["Event Pipeline"]
-      LOCAL --> INGEST["shared ingest channel (mpsc)"]
-      INGEST --> WRITER["batch_writer thread"]
-      WRITER --> P1["Persist + enqueue"]
+      LOCAL --> LOCAL_PROJ["local create + project_one"]
+      RANGE_LOG["ReceiveLog"] --> LOG_INGEST["ingest_event_log"]
+      DEP_INGEST["ingest_now"] --> P1["Persist + enqueue"]
+      LOG_INGEST --> P1
       P1 --> PROJ_Q["project_queue"]
-      PROJ_Q --> P3
-      P1 --> P2["phase 2: plan post-commit commands"]
-      P2 --> P3["phase 3: execute effects boundary"]
-      P3 --> PROJ["project_one + cascade"]
+      PROJ_Q --> PROJ["project_one + cascade"]
+      LOCAL_PROJ --> PROJ
     end
 
     subgraph TRANS["Transport"]
@@ -190,7 +181,6 @@ flowchart TD
     end
 
     START --> EP
-    RSUP --> WRITER
     ACCEPT_W --> BOUND
     CONNECT_W --> BOUND
     BOUND --> LIFE
@@ -198,24 +188,25 @@ flowchart TD
     BOUND --> IIO
 
     subgraph SYNC_ENG["Sync Engine"]
-      SYNC["SyncConnectionHandler (on_session)"]
-      CTRL_STREAM["Sync control"]
-      DATA["Sync data"]
-      WANT["wanted_events"]
-      RESP["connection-scoped\nresponse buffer"]
-      SEND["Requested event send"]
-      RECV["Receive + source tag"]
+      SYNC["SyncConnectionHandler"]
+      RANGE_SESS["RangeSession"]
+      DEP_SESS["DependencySession"]
+      RANGE_CTRL["range control"]
+      RANGE_DATA["range data"]
+      DEP_CTRL["dependency control"]
+      DEP_DATA["dependency data"]
 
-      SYNC --> CTRL_STREAM
-      SYNC --> DATA
-      CTRL_STREAM --> WANT
-      CTRL_STREAM --> RESP
-      RESP --> SEND
-      DATA --> RECV
+      SYNC --> RANGE_SESS
+      SYNC --> DEP_SESS
+      RANGE_SESS --> RANGE_CTRL
+      RANGE_SESS --> RANGE_DATA
+      DEP_SESS --> DEP_CTRL
+      DEP_SESS --> DEP_DATA
     end
 
     FACT --> SYNC
-    RECV --> INGEST
+    RANGE_DATA --> RANGE_LOG
+    DEP_DATA --> DEP_INGEST
 
     subgraph PSTATE["Projection State"]
       direction LR
@@ -241,11 +232,11 @@ flowchart TD
 ```
 
 **Runtime Topology Legend**
-- `runtime::supervisor::RuntimeSupervisor`: single owner for long-lived runtime workers (writer, accept loop, unified target dispatcher, target ingress workers).
+- `runtime::supervisor::RuntimeSupervisor`: single owner for long-lived runtime workers (accept loop, unified target dispatcher, target ingress workers).
 - `service.rs helpers`: `open_db_*`, node status helpers, intro transport helper entry points.
 - `Persist + enqueue`: phase 1 persists events/recorded/sync state and enqueues `project_queue`.
-- `Sync control`: sync control stream messages including `NegOpen`, `NegMsg`, `DiscoveryHints`, `RequestIds`, and `ResponseCredit`.
-- `Sync data`: sync data stream frames (`Event`).
+- `Range session`: one explicit range, one reconcile phase, one bulk transfer phase.
+- `Dependency session`: long-lived blocker-repair path using `RequestIds` plus `Event` replies.
 - `Shared event send`: `Store::get_shared(events) -> Frame::Event`.
 - `Projection tables`: projected read models (`messages`, `users`, `peers`, `channels`).
 - `Transport trust tables`: transport trust rows (`peer_shared`, invite bootstrap records).
@@ -368,14 +359,13 @@ flowchart LR
 
 ## Current Data-Flow Facts
 
-1. live sync event transfer is pull-only and uses connection-scoped in-memory response buffers, not a durable egress queue.
-2. `batch_writer` is the shared ingest sink for wire-received events and local-create events; it runs explicit phases: persist transaction, post-commit command planning, and effects execution.
-3. RPC command/query dispatch routes to owner modules (event modules for event-domain operations, `state/subscriptions` for local subscription infra); `service.rs` is an infra helper layer (`open_db_*`, node status, intro transport helper).
-4. Peering orchestration (`connect_loop`/`accept_loop`/workflows) now routes transport operations through `transport::peering_boundary`; peering no longer imports QUIC/trust internals directly.
-5. QUIC dial/accept + peer identity extraction are transport-owned in `connection_lifecycle`.
-6. QUIC stream wiring (`open_bi`/`accept_bi`, `DualConnection`, `QuicTransportSessionIo`) is transport-owned in `session_factory`.
-7. Projection outputs both user-facing read tables and transport trust tables; trust rows feed both handshake allow/deny and bootstrap autodial.
-8. `RequestIds` originate from sync discovery plus wanted scheduling; runtime initiator sessions use coordinator-assigned subsets (autodial + mDNS), then sources serve those exact requested IDs from connection-scoped response buffers.
+1. bulk sync is range-owned and writes to `ReceiveLog`, not a shared ingest channel.
+2. dependency repair is a separate session class and ingests replies immediately with `ingest_now`.
+3. the active bulk path does not use durable `wanted`, request-credit, or `ResponseCredit`.
+4. RPC command/query dispatch still routes to owner modules; `service.rs` remains an infra helper layer.
+5. Peering orchestration (`connect_loop` / `accept_loop` / workflows) routes transport operations through `transport::peering_boundary`; peering does not own QUIC/trust internals directly.
+6. QUIC dial/accept plus peer identity extraction are transport-owned in `connection_lifecycle`.
+7. QUIC stream wiring is transport-owned in `session_factory`.
+8. Projection outputs both user-facing read tables and transport trust tables; trust rows still feed handshake allow/deny and bootstrap autodial.
 9. Foreground runtime is daemon-first (`topo start`): shutdown is coordinated by shared `shutdown_notify` (RPC `Shutdown` or Ctrl-C).
-10. Runtime and helper initiator sessions both route pull assignment through the coordinator; there is no direct `need_ids -> RequestIds(all)` bypass path.
-11. Transport trust checks now read `db::transport_trust::is_authorized_for_tenant` directly inside transport; the separate trust-oracle adapter layer is removed.
+10. Transport trust checks read `db::transport_trust::is_authorized_for_tenant` directly inside transport.
