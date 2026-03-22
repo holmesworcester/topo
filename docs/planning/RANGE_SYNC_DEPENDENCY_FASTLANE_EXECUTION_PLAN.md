@@ -45,6 +45,19 @@ Keep the sync hot path small and readable:
 5. This is the current bootstrap scheduler, not the final arbitrary-range
    coordinator.
 
+### Multi-source strategy
+
+1. `hour` and `day` are duplicated across all live peers.
+2. `week`, `month`, `year`, and `all` are partitioned across the live peer set
+   by sorted peer rank.
+3. The partition is recomputed every time a new range session starts.
+4. This is the simplest robust rule for peer churn:
+   - no durable ownership table,
+   - no per-event planner,
+   - no rebalance state to repair after a peer disappears.
+5. When a peer drops, the next round sees a smaller live set and the remaining
+   peers automatically widen their historical slices.
+
 ### Bulk receive path
 
 1. The range receiver appends blobs to one `ReceiveLog`.
@@ -95,8 +108,10 @@ Keep the sync hot path small and readable:
 1. The current scheduler is still the fixed `hour/day/week/month/year/all`
    ladder.
 2. Arbitrary coordinator-chosen ranges are future work.
-3. True peer balancing by splitting large historical ranges across multiple
-   peers is future work.
+3. The current multi-source rule is fixed:
+   - duplicate hot ranges,
+   - partition cold ranges by live peer rank.
+4. Smarter balancing by measured peer throughput is future work.
 
 ### Dependency path
 
@@ -122,6 +137,8 @@ Satisfied on this branch:
 4. The old request-credit hot path is gone.
 5. The scheduler is simpler and always range-based.
 6. The runtime no longer carries dead shared-ingest wrappers.
+7. Multi-source historical ranges repartition automatically when peers drop.
+8. The graph test binary no longer needs manual `--test-threads=1`.
 
 Still open:
 
@@ -137,14 +154,29 @@ Core validation used on this branch:
 2. `cargo test -q receive_log_ --lib`
 3. `cargo test -q --test sync_contract_tests`
 4. `cargo test -q --test download_timeline_test`
-5. `cargo test --test holepunch_test -- --test-threads=1`
-6. `cargo test -q --tests --no-run`
+5. `cargo test --test sync_graph_test`
+6. `cargo test --test holepunch_test -- --test-threads=1`
+7. `cargo test -q --tests --no-run`
 
 Preserved CLI / e2e validation used on this branch:
 
 1. `cargo test --test cli_test -- --test-threads=1`
 2. `cargo test --test sync_control_cli_tests -- --test-threads=1`
-3. `cargo test --test cli_invite_discovery_empty_bootstrap_test --test cli_invite_discovery_wrong_bootstrap_test --test cli_device_link_discovery_test --test cli_reused_invite_reload_test --test cli_live_file_sync_test -- --test-threads=1`
+3. `cargo test --test cli_invite_discovery_empty_bootstrap_test -- --test-threads=1`
+4. `cargo test --test cli_invite_discovery_wrong_bootstrap_test -- --test-threads=1`
+5. `cargo test --test cli_device_link_discovery_test -- --test-threads=1`
+6. `cargo test --test cli_reused_invite_reload_test -- --test-threads=1`
+7. `cargo test --test cli_live_file_sync_test -- --test-threads=1`
+
+Representative multi-source proof on this branch:
+
+1. `catchup_4x_240_spread_uses_multiple_sources_efficiently`
+2. Result on current head:
+   - 240 useful unique messages,
+   - 243 received `Event` frames,
+   - 4 active sources,
+   - 98.8% delivery efficiency,
+   - peer-dropout recovery still passes in `catchup_dead_peer_dropout`.
 
 ## Naming
 

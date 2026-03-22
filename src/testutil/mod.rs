@@ -501,6 +501,36 @@ pub async fn converge_workspace_transport_graph(peers: &[Peer]) {
     }
 }
 
+/// Ensure a sink and each source have projected each other's current transport
+/// target before starting direct sink↔source download loops.
+pub async fn converge_sink_download_transport(sources: &[Peer], sink: &Peer) {
+    crate::state::live_hints::init_forward_on_have_from_env();
+    if sources.is_empty() {
+        return;
+    }
+
+    let hub = &sources[0];
+    let pair_timeout = Duration::from_secs(20 + (sources.len() as u64 * 4));
+
+    for source in sources.iter().skip(1) {
+        let source_expected = vec![
+            (hub.identity.clone(), current_transport_target(hub)),
+            (source.identity.clone(), current_transport_target(source)),
+            (sink.identity.clone(), current_transport_target(sink)),
+        ];
+        sync_pair_until_transport_converged(hub, source, &source_expected, pair_timeout).await;
+    }
+
+    for source in sources.iter().skip(1) {
+        let sink_expected = vec![
+            (hub.identity.clone(), current_transport_target(hub)),
+            (sink.identity.clone(), current_transport_target(sink)),
+            (source.identity.clone(), current_transport_target(source)),
+        ];
+        sync_pair_until_transport_converged(hub, sink, &sink_expected, pair_timeout).await;
+    }
+}
+
 /// Open a lightweight connection for polling counts during active sync.
 /// Avoids reapplying full connection pragmas on each poll, which can
 /// contend with writers and cause transient open failures.
@@ -1503,7 +1533,47 @@ impl Peer {
                 signer_type: 5,
                 signature: [0u8; 64],
             });
-            self.create_encrypted_signed_event_synchronous(&key_event_id, &inner);
+            event_id_or_blocked(create_encrypted_event_synchronous(
+                &db,
+                &self.identity,
+                &key_event_id,
+                &inner,
+                Some(self.signing_key()),
+            ))
+            .expect("failed to create batch message");
+        }
+        db.execute("COMMIT", []).expect("failed to commit");
+    }
+
+    /// Create multiple messages whose `created_at_ms` values are spread across
+    /// a wall-clock span. Requires identity chain.
+    pub fn batch_create_messages_spread(&self, count: usize, start_ms: u64, spread_ms: u64) {
+        let db = open_connection(&self.db_path).expect("failed to open db");
+        let key_event_id = self.content_key_event_id(&db);
+        db.execute("BEGIN", []).expect("failed to begin");
+        for i in 0..count {
+            let offset_ms = if count <= 1 {
+                0
+            } else {
+                spread_ms.saturating_mul(i as u64) / (count.saturating_sub(1) as u64)
+            };
+            let inner = ParsedEvent::Message(MessageEvent {
+                created_at_ms: start_ms.saturating_add(offset_ms),
+                workspace_id: self.workspace_id,
+                author_id: self.author_id,
+                content: format!("Spread message {} from {}", i, self.name),
+                signed_by: self.signer_eid(),
+                signer_type: 5,
+                signature: [0u8; 64],
+            });
+            event_id_or_blocked(create_encrypted_event_synchronous(
+                &db,
+                &self.identity,
+                &key_event_id,
+                &inner,
+                Some(self.signing_key()),
+            ))
+            .expect("failed to create spread batch message");
         }
         db.execute("COMMIT", []).expect("failed to commit");
     }
@@ -3212,110 +3282,7 @@ pub fn start_chain(peers: &[Peer]) -> ChainHandles {
 /// `connect_loop` per source, matching the production runtime path used by
 /// bootstrap/mDNS autodial.
 pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> SinkDownloadHandles {
-    crate::state::live_hints::init_forward_on_have_from_env();
-    assert!(!sources.is_empty(), "need at least one source");
-    for source in sources {
-        assert_eq!(
-            source.workspace_id, sink.workspace_id,
-            "sink download peers must share one workspace and real projected trust"
-        );
-    }
-
-    let (sink_cert, sink_key) = sink.cert_and_key();
-
-    let mut handles = Vec::new();
-    let mut source_addrs = Vec::new();
-    let mut source_endpoints = Vec::new();
-    let sink_spki = sink.spki_fingerprint();
-
-    for source in sources {
-        let (cert, key) = source.cert_and_key();
-        let trusted_sink_spki = sink_spki;
-        let allow_fn: Arc<crate::transport::DynamicAllowFn> =
-            Arc::new(move |fp: &[u8; 32]| Ok(fp == &trusted_sink_spki));
-        let server_endpoint =
-            create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert, key, allow_fn)
-                .expect("failed to create source server endpoint");
-        let addr = server_endpoint
-            .local_addr()
-            .expect("failed to get source addr");
-        source_addrs.push(addr);
-        source_endpoints.push(server_endpoint.clone());
-
-        let db_path = source.db_path.clone();
-        let identity = source.identity.clone();
-        handles.push(std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                if let Err(e) = accept_loop(
-                    &db_path,
-                    &identity,
-                    server_endpoint,
-                    noop_intro_spawner,
-                    test_ingest_fns(),
-                )
-                .await
-                {
-                    tracing::warn!("source accept_loop exited: {}", e);
-                }
-            });
-        }));
-    }
-
-    let mut sink_connectors = Vec::new();
-    let mut client_endpoints: Vec<crate::transport::TransportEndpoint> = Vec::new();
-    for (i, source) in sources.iter().enumerate() {
-        let trusted_source_spki = source.spki_fingerprint();
-        let allow_fn: Arc<crate::transport::DynamicAllowFn> =
-            Arc::new(move |fp: &[u8; 32]| Ok(fp == &trusted_source_spki));
-        let client_endpoint = create_dual_endpoint(
-            "0.0.0.0:0".parse().unwrap(),
-            sink_cert.clone(),
-            sink_key.clone_key(),
-            allow_fn,
-        )
-        .expect("failed to create sink client endpoint");
-        client_endpoints.push(client_endpoint.clone());
-        sink_connectors.push((
-            client_endpoint,
-            source_addrs[i],
-            current_transport_target(&sources[i]),
-        ));
-    }
-
-    for (endpoint, remote, target_peer_id) in sink_connectors {
-        let sink_db = sink.db_path.clone();
-        let sink_identity = sink.identity.clone();
-        handles.push(std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                let _ = connect_loop(
-                    &sink_db,
-                    &sink_identity,
-                    endpoint,
-                    remote,
-                    &target_peer_id,
-                    None,
-                    noop_intro_spawner,
-                    test_ingest_fns(),
-                )
-                .await;
-            });
-        }));
-    }
-
-    SinkDownloadHandles {
-        thread_handles: handles,
-        source_endpoints,
-        client_endpoints,
-        connect_shutdowns: Vec::new(),
-    }
+    start_sink_download_with_shutdown(sources, sink)
 }
 
 /// Handles from a sink-driven download topology with per-source shutdown control.

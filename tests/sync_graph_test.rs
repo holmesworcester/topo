@@ -8,21 +8,100 @@
 //! Family A: Chain propagation (P0 <-> P1 <-> ... <-> Pn)
 //! Family B: Multi-source catchup (S1..Sn feed lagging sink via coordinated download)
 //!
-//! Run smoke tests:    cargo test --release --test sync_graph_test -- --nocapture --test-threads=1
-//! Run all:            cargo test --release --test sync_graph_test -- --nocapture --include-ignored --test-threads=1
-//!
-//! NOTE: --test-threads=1 is required; concurrent heavy tests trigger a negentropy
-//! race condition (duplicate items from concurrent reads/writes to neg_items).
+//! Run smoke tests:    cargo test --release --test sync_graph_test -- --nocapture
+//! Run all:            cargo test --release --test sync_graph_test -- --nocapture --include-ignored
+
+mod cli_harness;
 
 use rusqlite::OptionalExtension;
-use std::collections::BTreeSet;
+use std::collections::{BTreeMap, BTreeSet};
+use std::sync::OnceLock;
 use std::time::{Duration, Instant};
+use topo::db::sync_log::{ensure_schema, update_config, SyncLogConfigPatch};
 use topo::crypto::event_id_to_base64;
 use topo::db::open_connection;
 use topo::testutil::{
-    assert_eventually, clone_events_to, converge_workspace_transport_graph, start_chain,
-    start_sink_download, start_sink_download_with_shutdown, Peer,
+    assert_eventually, clone_events_to, converge_sink_download_transport,
+    converge_workspace_transport_graph, start_chain, start_sink_download,
+    start_sink_download_with_shutdown, Peer,
 };
+use cli_harness::hold_network_test_lock_for_binary;
+
+const HOUR_MS: u64 = 60 * 60 * 1000;
+const DAY_MS: u64 = 24 * HOUR_MS;
+const YEAR_MS: u64 = 365 * DAY_MS;
+const THREE_YEARS_MS: u64 = 3 * YEAR_MS;
+
+fn graph_test_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: OnceLock<tokio::sync::Mutex<()>> = OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+async fn acquire_graph_test_guard() -> tokio::sync::MutexGuard<'static, ()> {
+    hold_network_test_lock_for_binary();
+    graph_test_lock().lock().await
+}
+
+fn enable_sync_logging(peer: &Peer) {
+    let conn = open_connection(&peer.db_path).expect("open db for sync-log config");
+    ensure_schema(&conn).expect("ensure sync-log schema");
+    update_config(
+        &conn,
+        SyncLogConfigPatch {
+            enabled: Some(true),
+            changed_only: Some(false),
+            ..Default::default()
+        },
+    )
+    .expect("enable sync-log config");
+}
+
+fn received_event_frames_by_peer(peer: &Peer) -> BTreeMap<String, i64> {
+    let conn = open_connection(&peer.db_path).expect("open sink db for sync-log query");
+    let mut stmt = conn
+        .prepare(
+            "SELECT r.peer_id, COUNT(*)
+             FROM sync_run_events e
+             JOIN sync_runs r ON r.run_id = e.run_id
+             WHERE e.lane = 'data'
+               AND e.direction = 'rx'
+               AND e.frame_type = 'Event'
+             GROUP BY r.peer_id
+             ORDER BY r.peer_id",
+        )
+        .expect("prepare sync frame query");
+    stmt.query_map([], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })
+    .expect("query sync frame rows")
+    .collect::<Result<BTreeMap<_, _>, _>>()
+    .expect("collect sync frame rows")
+}
+
+async fn wait_for_received_frames_stable(peer: &Peer, timeout: Duration, stable_for: Duration) {
+    let start = Instant::now();
+    let mut last_total = -1;
+    let mut stable_since = None;
+    loop {
+        let current_total: i64 = received_event_frames_by_peer(peer).values().sum();
+        if current_total == last_total {
+            let since = stable_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= stable_for {
+                return;
+            }
+        } else {
+            last_total = current_total;
+            stable_since = None;
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "received event frames did not stabilize within {:?}: total={}",
+            timeout,
+            current_total
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+    }
+}
 
 /// Read peak resident set size from /proc/self/status (Linux only).
 fn peak_rss_mib() -> f64 {
@@ -162,6 +241,7 @@ fn env_usize_sg(name: &str, default: usize) -> usize {
 /// Run a chain propagation benchmark.
 /// Injects `event_count` events at P0 and waits for convergence at P_{n-1}.
 async fn run_chain_bench(n: usize, event_count: usize) {
+    let _guard = acquire_graph_test_guard().await;
     let mut peers = Vec::with_capacity(n);
     peers.push(Peer::new_with_identity("p0"));
     for i in 1..n {
@@ -259,6 +339,7 @@ async fn run_chain_bench(n: usize, event_count: usize) {
 // ---------------------------------------------------------------------------
 
 async fn run_chain_live_rate(n: usize, messages_per_sec: usize, live_seconds: usize) {
+    let _guard = acquire_graph_test_guard().await;
     assert!(n >= 2);
     assert!(messages_per_sec > 0);
     assert!(live_seconds > 0);
@@ -375,6 +456,7 @@ async fn ten_hop_chain_50k() {
 /// Sources share the same pre-seeded dataset (cloned from S0). The sink
 /// connects to all sources as initiator using coordinated round-based assignment.
 async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
+    let _guard = acquire_graph_test_guard().await;
     assert!(source_count >= 1, "source_count must be >= 1");
     let mut sources: Vec<Peer> = Vec::with_capacity(source_count);
     sources.push(Peer::new_with_identity("ds0"));
@@ -386,6 +468,7 @@ async fn run_catchup_bench(source_count: usize, events_per_source: usize) {
     sources.push(sink);
     converge_workspace_transport_graph(&sources).await;
     let sink = sources.pop().expect("sink peer missing after convergence");
+    converge_sink_download_transport(&sources, &sink).await;
 
     // Generate events at S0 only
     let gen_start = Instant::now();
@@ -485,6 +568,108 @@ async fn catchup_8x_100k() {
     run_catchup_bench(8, 100_000).await;
 }
 
+/// Replicated-source smoke: range partitioning should use multiple peers and
+/// keep duplicate transfer overhead bounded on a time-spread history.
+#[tokio::test]
+async fn catchup_4x_240_spread_uses_multiple_sources_efficiently() {
+    let _guard = acquire_graph_test_guard().await;
+    std::env::set_var("TOPO_SYNC_WINDOW_SHAPE", "disjoint");
+
+    let source_count = 4;
+    let total_messages = 240usize;
+    let start_ms = topo::db::queue::current_timestamp_ms() as u64 - THREE_YEARS_MS;
+
+    let mut sources: Vec<Peer> = Vec::with_capacity(source_count);
+    sources.push(Peer::new_with_identity("ms0"));
+    for i in 1..source_count {
+        let joined = Peer::new_in_workspace(&format!("ms{}", i), &sources[0]).await;
+        sources.push(joined);
+    }
+    let sink = Peer::new_in_workspace("mssink", &sources[0]).await;
+    sources.push(sink);
+    eprintln!("  Created peers, converging transport graph...");
+    converge_workspace_transport_graph(&sources).await;
+    let sink = sources.pop().expect("sink peer missing after convergence");
+    converge_sink_download_transport(&sources, &sink).await;
+
+    eprintln!("  Generating spread messages...");
+    sources[0].batch_create_messages_spread(total_messages, start_ms, THREE_YEARS_MS);
+    let targets: Vec<&Peer> = sources[1..].iter().collect();
+    eprintln!("  Cloning spread history to replicated sources...");
+    clone_events_to(&sources[0], &targets);
+    enable_sync_logging(&sink);
+
+    let expected_count = total_messages as i64;
+    let start = Instant::now();
+    eprintln!("  Starting sink download...");
+    let handles = start_sink_download(&sources, &sink);
+
+    assert_eventually(
+        || sink.recorded_message_event_count() >= expected_count,
+        Duration::from_secs(180),
+        &format!(
+            "sink receives all {} spread messages (current: {})",
+            expected_count,
+            sink.recorded_message_event_count()
+        ),
+    )
+    .await;
+
+    eprintln!("  Sink reached full unique count, waiting for frame totals to settle...");
+    wait_for_received_frames_stable(&sink, Duration::from_secs(20), Duration::from_millis(500))
+        .await;
+
+    let wall_secs = start.elapsed().as_secs_f64();
+    drop(handles);
+
+    let frames_by_peer = received_event_frames_by_peer(&sink);
+    let total_frames: i64 = frames_by_peer.values().sum();
+    let active_sources = sources
+        .iter()
+        .filter(|source| {
+            frames_by_peer
+                .get(&source.transport_peer_id())
+                .copied()
+                .unwrap_or(0)
+                > 0
+        })
+        .count();
+    let delivery_efficiency = if total_frames > 0 {
+        expected_count as f64 / total_frames as f64
+    } else {
+        0.0
+    };
+
+    eprintln!();
+    eprintln!("=== Replicated spread catchup: 4 sources x 240 messages ===");
+    eprintln!("  Wall time:           {:.2}s", wall_secs);
+    eprintln!("  Useful unique msgs:  {}", expected_count);
+    eprintln!("  Downloader frames:   {}", total_frames);
+    eprintln!("  Active sources:      {}", active_sources);
+    eprintln!("  Delivery efficiency: {:.1}%", delivery_efficiency * 100.0);
+    eprintln!("  Per-source frames:   {:?}", frames_by_peer);
+    eprintln!();
+
+    assert_eq!(
+        sink.recorded_message_event_count(),
+        expected_count,
+        "sink must have all {} spread messages",
+        expected_count
+    );
+    assert!(
+        active_sources >= 3,
+        "expected at least 3 sources to contribute event frames, got {} with {:?}",
+        active_sources,
+        frames_by_peer
+    );
+    assert!(
+        delivery_efficiency >= 0.55,
+        "expected delivery efficiency >= 55%, got {:.1}% with {:?}",
+        delivery_efficiency * 100.0,
+        frames_by_peer
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Family C: Multi-source large-file catchup with source attribution
 // ---------------------------------------------------------------------------
@@ -502,6 +687,7 @@ async fn run_catchup_large_file(
     total_slices: usize,
     min_contributing_sources: usize,
 ) {
+    let _guard = acquire_graph_test_guard().await;
     let mut sources = Vec::with_capacity(source_count);
     sources.push(Peer::new_with_identity("fs0"));
     for i in 1..source_count {
@@ -512,6 +698,7 @@ async fn run_catchup_large_file(
     sources.push(sink);
     converge_workspace_transport_graph(&sources).await;
     let sink = sources.pop().expect("sink peer missing after convergence");
+    converge_sink_download_transport(&sources, &sink).await;
 
     // Generate file slices at S0
     let gen_start = Instant::now();
@@ -706,6 +893,7 @@ async fn catchup_large_file_8x_1024_slices() {
 #[tokio::test]
 #[ignore = "diagnostic probe for non-replicated source sets; not part of the current replicated-source correctness contract"]
 async fn catchup_non_uniform_sources() {
+    let _guard = acquire_graph_test_guard().await;
     let source_count = 4;
     // Debug builds are ~10x slower; scale down to keep under timeout.
     #[cfg(debug_assertions)]
@@ -730,6 +918,7 @@ async fn catchup_non_uniform_sources() {
     sources.push(sink);
     converge_workspace_transport_graph(&sources).await;
     let sink = sources.pop().expect("sink peer missing after convergence");
+    converge_sink_download_transport(&sources, &sink).await;
 
     // Create shared messages at S0
     for i in 0..shared_count {
@@ -810,6 +999,7 @@ async fn catchup_non_uniform_sources() {
 /// live peers, so the sink must still converge on the full dataset.
 #[tokio::test]
 async fn catchup_dead_peer_dropout() {
+    let _guard = acquire_graph_test_guard().await;
     let source_count = 4;
     // Large enough that session 2 can't finish syncing before we kill it.
     // Debug builds are ~10x slower; scale down to keep under timeout.
@@ -828,6 +1018,7 @@ async fn catchup_dead_peer_dropout() {
     sources.push(sink);
     converge_workspace_transport_graph(&sources).await;
     let sink = sources.pop().expect("sink peer missing after convergence");
+    converge_sink_download_transport(&sources, &sink).await;
 
     // Create events at S0
     sources[0].batch_create_messages(event_count);

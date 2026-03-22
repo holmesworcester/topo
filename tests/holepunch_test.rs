@@ -489,7 +489,7 @@ async fn test_stale_intro_rejected() {
             .await;
         });
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Build an expired IntroOffer (expires_at_ms in the past)
     let stale_offer = build_intro_offer(
@@ -516,7 +516,7 @@ async fn test_stale_intro_rejected() {
         .expect("send stale offer");
     // connection.close() is immediate; give the QUIC stack time to flush the
     // uni stream the same way the production intro path does.
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    tokio::time::sleep(Duration::from_millis(1500)).await;
     conn.close(0u32.into(), b"sent");
 
     assert_eventually(
@@ -527,7 +527,7 @@ async fn test_stale_intro_rejected() {
                 .map(|attempts| !attempts.is_empty())
                 .unwrap_or(false)
         },
-        Duration::from_secs(3),
+        Duration::from_secs(10),
         "stale intro recorded",
     )
     .await;

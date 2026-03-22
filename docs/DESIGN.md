@@ -136,11 +136,17 @@ Negentropy remains the set-reconciliation engine because it is agnostic to event
 5. `last year`
 6. `full history`
 
+When multiple peers are connected, the scheduler uses the same simple rule every round:
+
+1. `hour` and `day` are duplicated across all live peers to minimize time-to-project for recent history,
+2. `week`, `month`, `year`, and `full history` are partitioned across the current live peer set by sorted peer rank,
+3. the partition is recomputed on every new range session from the live connection set.
+
+This is intentionally the simplest robust strategy. There is no durable ownership table, no per-event planner, and no sticky assignment state to repair after a peer disappears. If a peer drops mid-download, the next round sees a smaller live peer set and the remaining peers automatically widen their assigned historical slices.
+
 Dependency repair is a separate fast path. Projection blocking emits direct dependency requests keyed by source peer, and dependency replies are ingested immediately through the same canonical/projector path used by local creation and replay. This preserves one convergence contract across source types while keeping bulk transfer durable-first and blocker repair latency-first.
 
-Forward-on-have remains a low-latency supplement for recent discovery hints, but it does not replace the range-owned bulk path. The bulk path no longer uses durable `wanted` rows, `ResponseCredit`, or a shared ingest channel to keep the wire busy.
-
-**Forward-on-have live hint bus.** Negentropy rounds still run periodically, but recent live traffic does not wait for the next scheduled round. Each time the persist phase newly inserts a shared canonical event it publishes a `LiveHint` to an in-process broadcast channel keyed by `(db_path, tenant_id)` — strictly after the persist transaction commits. Active sync sessions subscribe on startup and drain the channel once per control-loop tick. When hints arrive, the session immediately emits `DiscoveryHints` on the control stream, grouped by the same age-derived priority lanes used by tiered discovery. Hints from the receiving peer's own source tag are not echoed back. Negentropy rounds remain authoritative for repair and history catchup; forward-on-have is a low-latency supplement, not a replacement. Implementation details and measured latency in [PLAN.md § 10.0.2](./PLAN.md).
+Legacy `forward_on_have` controls are no longer part of the active range-owned sync design. The tested path is range sessions plus immediate dependency repair; bulk sync no longer uses durable `wanted` rows, `ResponseCredit`, or a shared ingest channel to keep the wire busy.
 
 For same-workspace sibling tenants sharing one DB, there is one extra local step after canonical persistence: shared events created locally or ingested from the network are fanned out to sibling tenant scopes with the same `workspace_id`, then projected through those tenants' normal queue/drain path. This is not a transport shortcut and it does not bypass projectors; it is local fanout of already-canonical shared blobs so one shared DB converges the same way multiple separate daemons would.
 
