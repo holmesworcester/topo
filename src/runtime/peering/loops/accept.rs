@@ -20,8 +20,7 @@ use crate::transport::{
 };
 
 use super::supervisor::{
-    run_startup_preflight, spawn_shared_ingest_writer, supervise_connection_sessions,
-    SessionTenantResolver,
+    run_startup_preflight, supervise_connection_sessions, SessionTenantResolver,
 };
 use super::{
     claim_live_connection_slot, current_timestamp_ms, peer_fingerprint_from_hex, IntroSpawnerFn,
@@ -45,16 +44,12 @@ pub async fn accept_loop(
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Shared batch_writer: single writer thread for all concurrent responder sessions.
-    let shared_ingest_tx = spawn_shared_ingest_writer(db_path, ingest);
-
     let tenant_ids = vec![recorded_by.to_string()];
-    accept_loop_with_ingest_until_cancel_inner(
+    accept_loop_until_cancel_inner(
         db_path,
         &tenant_ids,
         endpoint,
         CancellationToken::new(),
-        shared_ingest_tx,
         std::collections::HashMap::new(),
         intro_spawner,
         ingest,
@@ -63,62 +58,28 @@ pub async fn accept_loop(
     .await
 }
 
-/// Accept incoming connections using an externally-provided ingest channel.
-///
-/// Same as `accept_loop` but takes a pre-existing `Sender<IngestItem>` instead
-/// of spawning its own batch_writer. Used by the multi-tenant node daemon so
-/// all tenants share a single writer thread.
+/// Cancellation-aware variant of [`accept_loop`] used by runtime supervision
+/// so shutdown can deterministically await all workers.
 ///
 /// `tenant_peer_ids` lists local tenants for startup preflight. After TLS
 /// handshake, the requested local transport fingerprint from SNI is resolved
 /// to exactly one tenant from projected local SQL state, and only that tenant
 /// authorizes the authenticated remote fingerprint.
-pub async fn accept_loop_with_ingest(
-    db_path: &str,
-    tenant_peer_ids: &[String],
-    endpoint: TransportEndpoint,
-    shared_ingest_tx: tokio::sync::mpsc::Sender<
-        crate::contracts::event_pipeline_contract::IngestItem,
-    >,
-    tenant_client_configs: std::collections::HashMap<String, TransportClientConfig>,
-    intro_spawner: IntroSpawnerFn,
-    ingest: IngestFns,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    accept_loop_with_ingest_until_cancel_inner(
-        db_path,
-        tenant_peer_ids,
-        endpoint,
-        CancellationToken::new(),
-        shared_ingest_tx,
-        tenant_client_configs,
-        intro_spawner,
-        ingest,
-        None,
-    )
-    .await
-}
-
-/// Cancellation-aware variant of [`accept_loop_with_ingest`] used by runtime
-/// supervision so shutdown can deterministically await all workers.
-pub async fn accept_loop_with_ingest_until_cancel(
+pub async fn accept_loop_until_cancel(
     db_path: &str,
     tenant_peer_ids: &[String],
     endpoint: TransportEndpoint,
     shutdown: CancellationToken,
-    shared_ingest_tx: tokio::sync::mpsc::Sender<
-        crate::contracts::event_pipeline_contract::IngestItem,
-    >,
     tenant_client_configs: std::collections::HashMap<String, TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    accept_loop_with_ingest_until_cancel_inner(
+    accept_loop_until_cancel_inner(
         db_path,
         tenant_peer_ids,
         endpoint,
         shutdown,
-        shared_ingest_tx,
         tenant_client_configs,
         intro_spawner,
         ingest,
@@ -127,14 +88,11 @@ pub async fn accept_loop_with_ingest_until_cancel(
     .await
 }
 
-async fn accept_loop_with_ingest_until_cancel_inner(
+async fn accept_loop_until_cancel_inner(
     db_path: &str,
     tenant_peer_ids: &[String],
     endpoint: TransportEndpoint,
     shutdown: CancellationToken,
-    shared_ingest_tx: tokio::sync::mpsc::Sender<
-        crate::contracts::event_pipeline_contract::IngestItem,
-    >,
     tenant_client_configs: std::collections::HashMap<String, TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
@@ -248,7 +206,6 @@ async fn accept_loop_with_ingest_until_cancel_inner(
         // Spawn a supervised worker for this accepted connection.
         let db_path_owned = db_path.to_string();
         let recorded_by_owned = recorded_by;
-        let ingest_clone = shared_ingest_tx.clone();
         let intro_endpoint = endpoint.clone();
         let intro_client_cfg = tenant_client_configs
             .get(&recorded_by_owned)
@@ -282,7 +239,6 @@ async fn accept_loop_with_ingest_until_cancel_inner(
                     peer_id_owned.clone(),
                     intro_endpoint,
                     intro_client_cfg,
-                    ingest_clone.clone(),
                 );
 
                 let peer_fp = match peer_fingerprint_from_hex(&peer_id_owned) {

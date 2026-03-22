@@ -10,7 +10,7 @@
 //! construction (R4/SC4 of the peering readability plan).
 //!
 //! Sub-modules:
-//!  - `accept`   -- accept_loop, accept_loop_with_ingest, resolve_inbound_auth_context
+//!  - `accept`   -- accept_loop, accept_loop_until_cancel, resolve_inbound_auth_context
 //!  - `connect`  -- connect_loop, connect_loop_with_coordination
 //!  - `supervisor` -- shared preflight + session lifecycle supervision
 
@@ -19,12 +19,10 @@ mod connect;
 mod supervisor;
 
 // Re-export public API so callers can still `use crate::peering::loops::*`.
-pub use accept::accept_loop_with_ingest_until_cancel;
-pub use accept::{accept_loop, accept_loop_with_ingest};
+pub use accept::{accept_loop, accept_loop_until_cancel};
 pub use connect::{
     connect_loop, connect_loop_with_coordination, connect_loop_with_coordination_until_cancel,
-    connect_loop_with_coordination_until_cancel_with_fallback, connect_loop_with_shared_ingest,
-    connect_loop_with_shared_ingest_until_cancel,
+    connect_loop_with_coordination_until_cancel_with_fallback,
 };
 
 use std::collections::HashMap;
@@ -50,8 +48,6 @@ use crate::transport::session_factory::extract_build_mismatch_reason;
 /// Function that spawns an intro listener for holepunch handling on a QUIC connection.
 /// Injected by the composition root so peering/ doesn't depend on sync::punch.
 ///
-/// The last parameter is a shared ingest sender — punch sessions reuse the
-/// parent loop's batch_writer instead of spawning their own.
 pub type IntroSpawnerFn = fn(
     crate::transport::TransportConnection,
     String,
@@ -59,7 +55,6 @@ pub type IntroSpawnerFn = fn(
     String,
     crate::transport::TransportEndpoint,
     Option<crate::transport::TransportClientConfig>,
-    tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
 ) -> tokio::task::JoinHandle<()>;
 
 // ---------------------------------------------------------------------------
@@ -308,7 +303,6 @@ pub(super) async fn run_session(
 }
 
 pub(super) use crate::tuning::drain_batch_size;
-pub(super) use crate::tuning::shared_ingest_cap;
 
 #[cfg(test)]
 mod tests {

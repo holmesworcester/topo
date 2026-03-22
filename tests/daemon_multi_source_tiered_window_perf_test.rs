@@ -54,7 +54,6 @@ fn env_i64(name: &str, default: i64) -> i64 {
 
 fn inherited_tier_env() -> Vec<(String, String)> {
     [
-        "TOPO_SYNC_TIER_MODE",
         "TOPO_SYNC_WINDOW_SHAPE",
         "TOPO_GENERATE_MESSAGE_SPREAD_MS",
         "TOPO_FORWARD_ON_HAVE",
@@ -474,7 +473,6 @@ fn write_summary_with_sources(
 fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) {
     assert!(source_count >= 2, "source_count must be >= 2");
     hold_network_test_lock_for_binary();
-    std::env::set_var("TOPO_SYNC_TIER_MODE", "parallel");
     std::env::set_var(
         "TOPO_GENERATE_MESSAGE_SPREAD_MS",
         THREE_YEARS_MS.to_string(),
@@ -666,7 +664,6 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) {
 fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) {
     assert!(source_count >= 2, "source_count must be >= 2");
     hold_network_test_lock_for_binary();
-    std::env::set_var("TOPO_SYNC_TIER_MODE", "parallel");
     std::env::set_var(
         "TOPO_GENERATE_MESSAGE_SPREAD_MS",
         THREE_YEARS_MS.to_string(),

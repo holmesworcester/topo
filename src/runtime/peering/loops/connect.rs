@@ -22,8 +22,7 @@ use crate::transport::{
 };
 
 use super::supervisor::{
-    run_startup_preflight, spawn_shared_ingest_writer, supervise_connection_sessions,
-    SessionTenantResolver,
+    run_startup_preflight, supervise_connection_sessions, SessionTenantResolver,
 };
 use super::{
     claim_live_connection_slot, current_timestamp_ms, peer_fingerprint_from_hex, IntroSpawnerFn,
@@ -139,10 +138,6 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
     let tenants = vec![recorded_by.to_string()];
     run_startup_preflight(db_path, &tenants, ingest)?;
 
-    // Shared batch_writer: single writer thread for all outbound initiator
-    // sessions on this connect loop.
-    let shared_ingest = spawn_shared_ingest_writer(db_path, ingest);
-
     // Use LocalSet so the intro listener (spawn_intro_listener uses spawn_local)
     // can run on the same runtime that drives the endpoint I/O.
     let local = tokio::task::LocalSet::new();
@@ -155,74 +150,9 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
             remote_transport_peer_id,
             client_config,
             intro_spawner,
-            shared_ingest,
             shutdown,
             bootstrap_fallback_client_config,
             sync_control,
-        ))
-        .await
-}
-
-/// Coordinated connect loop that reuses a pre-existing shared ingest sender.
-///
-/// Used for multi-source download where all connect loops targeting the same
-/// sink DB share a single batch_writer for fair source attribution. Without
-/// this, each connect loop spawns its own batch_writer and concurrent writers
-/// race on `INSERT OR IGNORE`, causing one source to dominate attribution.
-pub async fn connect_loop_with_shared_ingest(
-    db_path: &str,
-    recorded_by: &str,
-    endpoint: TransportEndpoint,
-    remote: SocketAddr,
-    remote_transport_peer_id: &str,
-    intro_spawner: IntroSpawnerFn,
-    ingest: IngestFns,
-    shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    connect_loop_with_shared_ingest_until_cancel(
-        db_path,
-        recorded_by,
-        endpoint,
-        remote,
-        remote_transport_peer_id,
-        intro_spawner,
-        ingest,
-        shared_ingest,
-        CancellationToken::new(),
-    )
-    .await
-}
-
-/// Like [`connect_loop_with_shared_ingest`] but accepts an external
-/// cancellation token for test-driven shutdown.
-pub async fn connect_loop_with_shared_ingest_until_cancel(
-    db_path: &str,
-    recorded_by: &str,
-    endpoint: TransportEndpoint,
-    remote: SocketAddr,
-    remote_transport_peer_id: &str,
-    intro_spawner: IntroSpawnerFn,
-    ingest: IngestFns,
-    shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
-    shutdown: CancellationToken,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let tenants = vec![recorded_by.to_string()];
-    run_startup_preflight(db_path, &tenants, ingest)?;
-
-    let local = tokio::task::LocalSet::new();
-    local
-        .run_until(connect_loop_inner(
-            db_path,
-            recorded_by,
-            endpoint,
-            remote,
-            remote_transport_peer_id,
-            None,
-            intro_spawner,
-            shared_ingest,
-            shutdown,
-            None,
-            None,
         ))
         .await
 }
@@ -235,7 +165,6 @@ async fn connect_loop_inner(
     remote_transport_peer_id: &str,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
-    shared_ingest: tokio::sync::mpsc::Sender<crate::contracts::event_pipeline_contract::IngestItem>,
     shutdown: CancellationToken,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
     sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
@@ -402,7 +331,6 @@ async fn connect_loop_inner(
             } else {
                 client_config.clone()
             },
-            shared_ingest.clone(),
         );
 
         let _dependency_handle = spawn_outbound_dependency_session(

@@ -52,7 +52,6 @@ use crate::event_modules::{
 };
 use crate::peering::loops::{
     accept_loop, connect_loop, connect_loop_with_coordination_until_cancel,
-    connect_loop_with_shared_ingest, connect_loop_with_shared_ingest_until_cancel,
 };
 use crate::projection::apply::project_one;
 use crate::projection::create::{
@@ -77,9 +76,6 @@ pub fn noop_intro_spawner(
     _peer_id: String,
     _endpoint: quinn::Endpoint,
     _client_config: Option<quinn::ClientConfig>,
-    _shared_ingest: tokio::sync::mpsc::Sender<
-        crate::contracts::event_pipeline_contract::IngestItem,
-    >,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async {})
 }
@@ -3172,8 +3168,8 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
 /// Start a sink-driven download topology: sink connects to all sources.
 ///
 /// Each source runs accept_loop (responder). The sink runs one
-/// `connect_loop_with_shared_ingest` per source, matching the production
-/// runtime path used by bootstrap/mDNS autodial.
+/// `connect_loop` per source, matching the production runtime path used by
+/// bootstrap/mDNS autodial.
 ///
 /// Returns thread handles for all source accept_loops and sink connect loops.
 pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::JoinHandle<()>> {
@@ -3251,41 +3247,24 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
         ));
     }
 
-    // Spawn ONE shared batch_writer for the sink so events from all sources
-    // interleave in a single channel.  Without this, each connect_loop spawns
-    // its own writer and concurrent writers race on INSERT OR IGNORE, causing
-    // one source to dominate attribution.
-    let ingest_fns = test_ingest_fns();
-    let ingest_cap = crate::tuning::shared_ingest_cap();
-    let (shared_tx, shared_rx) = tokio::sync::mpsc::channel::<
-        crate::contracts::event_pipeline_contract::IngestItem,
-    >(ingest_cap);
-    let writer_db = sink.db_path.clone();
-    let writer_events = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let batch_writer_fn = ingest_fns.batch_writer;
-    let _writer_handle = std::thread::spawn(move || {
-        batch_writer_fn(writer_db, shared_rx, writer_events);
-    });
-
     for (endpoint, remote, target_peer_id) in sink_connectors {
         let sink_db = sink.db_path.clone();
         let sink_identity = sink.identity.clone();
-        let sink_ingest = shared_tx.clone();
         handles.push(std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                let _ = connect_loop_with_shared_ingest(
+                let _ = connect_loop(
                     &sink_db,
                     &sink_identity,
                     endpoint,
                     remote,
                     &target_peer_id,
+                    None,
                     noop_intro_spawner,
                     test_ingest_fns(),
-                    sink_ingest,
                 )
                 .await;
             });
@@ -3390,41 +3369,27 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
         ));
     }
 
-    // Shared batch_writer for the sink
-    let ingest_fns = test_ingest_fns();
-    let ingest_cap = crate::tuning::shared_ingest_cap();
-    let (shared_tx, shared_rx) = tokio::sync::mpsc::channel::<
-        crate::contracts::event_pipeline_contract::IngestItem,
-    >(ingest_cap);
-    let writer_db = sink.db_path.clone();
-    let writer_events = Arc::new(std::sync::atomic::AtomicU64::new(0));
-    let batch_writer_fn = ingest_fns.batch_writer;
-    let _writer_handle = std::thread::spawn(move || {
-        batch_writer_fn(writer_db, shared_rx, writer_events);
-    });
-
     let mut connect_shutdowns = Vec::new();
     for (endpoint, remote, target_peer_id) in sink_connectors {
         let shutdown = tokio_util::sync::CancellationToken::new();
         connect_shutdowns.push(shutdown.clone());
         let sink_db = sink.db_path.clone();
         let sink_identity = sink.identity.clone();
-        let sink_ingest = shared_tx.clone();
         handles.push(std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                let _ = connect_loop_with_shared_ingest_until_cancel(
+                let _ = connect_loop_with_coordination_until_cancel(
                     &sink_db,
                     &sink_identity,
                     endpoint,
                     remote,
                     &target_peer_id,
+                    None,
                     noop_intro_spawner,
                     test_ingest_fns(),
-                    sink_ingest,
                     shutdown,
                 )
                 .await;

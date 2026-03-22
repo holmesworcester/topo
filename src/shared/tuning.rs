@@ -83,15 +83,6 @@ pub fn response_send_quantum_bytes() -> usize {
     }
 }
 
-// -- Peering --
-pub fn shared_ingest_cap() -> usize {
-    if low_mem_mode() {
-        read_usize_env("LOW_MEM_SHARED_INGEST_CAP").unwrap_or(2)
-    } else {
-        10000
-    }
-}
-
 // -- Sync sessions --
 pub fn session_ingest_cap() -> usize {
     if low_mem_mode() {

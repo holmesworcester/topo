@@ -2,33 +2,26 @@
 //!
 //! This module owns shared loop orchestration:
 //! - startup preflight/recovery
-//! - shared ingest writer setup
 //! - one long-lived sync connection scope per authenticated connection
 
-use std::sync::atomic::AtomicU64;
-use std::sync::Arc;
-
-use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
+use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::purge_expired_endpoints;
 use crate::db::open_connection;
 use crate::db::project_queue::ProjectQueue;
 use crate::db::schema::create_tables;
 use crate::runtime::build_mismatch::note_build_mismatch;
-use crate::runtime::memtrace;
 use crate::runtime::repeated_warning::should_emit_globally;
 use crate::sync::session::dependency_session::run_dependency_session;
 use crate::sync::session::receive_log::recover_receive_logs;
 use crate::sync::SyncConnectionHandler;
 use crate::transport::session_factory::extract_build_mismatch_reason;
 use crate::transport::{SessionClass, SessionProvider};
-use crate::tuning::{low_mem_memtrace, low_mem_mode};
 
-use super::{current_timestamp_ms, drain_batch_size, run_session, shared_ingest_cap};
+use super::{current_timestamp_ms, drain_batch_size, run_session};
 
 /// How a session loop resolves the tenant (`recorded_by`) for each session.
 pub(super) enum SessionTenantResolver {
@@ -136,31 +129,6 @@ pub(super) fn run_startup_preflight(
     }
 
     Ok(())
-}
-
-/// Shared ingest writer setup used by wrapper loops that own their writer.
-pub(super) fn spawn_shared_ingest_writer(
-    db_path: &str,
-    ingest: IngestFns,
-) -> mpsc::Sender<IngestItem> {
-    let ingest_cap = shared_ingest_cap();
-    if low_mem_memtrace() {
-        let line = format!(
-            "LOWMEM_MEMTRACE shared_ingest_config cap={} low_mem={}",
-            ingest_cap,
-            low_mem_mode()
-        );
-        let memtrace_file = std::env::var("LOW_MEM_MEMTRACE_FILE").ok();
-        memtrace::emit(&line, memtrace_file.as_deref());
-    }
-    let (shared_tx, shared_rx) = mpsc::channel::<IngestItem>(ingest_cap);
-    let writer_events = Arc::new(AtomicU64::new(0));
-    let writer_db = db_path.to_string();
-    let batch_writer = ingest.batch_writer;
-    let _writer_handle = std::thread::spawn(move || {
-        batch_writer(writer_db, shared_rx, writer_events);
-    });
-    shared_tx
 }
 
 /// Shared per-connection supervision loop for both connect and accept modes.
@@ -291,9 +259,14 @@ fn short_peer_id(peer_id: &str) -> &str {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::atomic::AtomicU64;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
+
+    use tokio::sync::mpsc;
 
     use super::*;
+    use crate::contracts::event_pipeline_contract::IngestItem;
 
     static DRAIN_CALLS: AtomicUsize = AtomicUsize::new(0);
 

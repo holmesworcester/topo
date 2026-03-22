@@ -435,7 +435,7 @@ async fn test_dynamic_trust_rejects_unknown_peer() {
             .await;
         });
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Unknown peer tries to connect to A — should fail at TLS handshake
     // because A's dynamic trust lookup finds no matching row.
@@ -514,12 +514,23 @@ async fn test_stale_intro_rejected() {
     send_intro_offer(&conn, &stale_offer)
         .await
         .expect("send stale offer");
-    // Allow time for the uni stream data to be delivered before closing
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // connection.close() is immediate; give the QUIC stack time to flush the
+    // uni stream the same way the production intro path does.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     conn.close(0u32.into(), b"sent");
 
-    // Give A time to process
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eventually(
+        || {
+            open_connection(&peer_a.db_path)
+                .ok()
+                .and_then(|db| list_intro_attempts(&db, &peer_a.identity, None).ok())
+                .map(|attempts| !attempts.is_empty())
+                .unwrap_or(false)
+        },
+        Duration::from_secs(3),
+        "stale intro recorded",
+    )
+    .await;
 
     // Check that A recorded the intro as expired
     let db_a = open_connection(&peer_a.db_path).expect("open A db");
@@ -539,6 +550,7 @@ async fn test_stale_intro_rejected() {
     );
 
     ep_i.close(0u32.into(), b"done");
+    ep_a.close(0u32.into(), b"done");
 }
 
 /// TRUST BOUNDARY TEST: Untrusted target rejected.
@@ -570,7 +582,7 @@ async fn test_untrusted_peer_intro_rejected() {
             .await;
         });
     });
-    tokio::time::sleep(Duration::from_millis(200)).await;
+    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Build an IntroOffer for an unknown peer (not in A's SQL trust rows)
     let unknown_peer = [0xCC; 32];
@@ -597,11 +609,23 @@ async fn test_untrusted_peer_intro_rejected() {
         .await
         .expect("connect to A");
     send_intro_offer(&conn, &offer).await.expect("send offer");
-    // Allow time for the uni stream data to be delivered before closing
-    tokio::time::sleep(Duration::from_millis(100)).await;
+    // connection.close() is immediate; give the QUIC stack time to flush the
+    // uni stream the same way the production intro path does.
+    tokio::time::sleep(Duration::from_millis(500)).await;
     conn.close(0u32.into(), b"sent");
 
-    tokio::time::sleep(Duration::from_millis(500)).await;
+    assert_eventually(
+        || {
+            open_connection(&peer_a.db_path)
+                .ok()
+                .and_then(|db| list_intro_attempts(&db, &peer_a.identity, None).ok())
+                .map(|attempts| !attempts.is_empty())
+                .unwrap_or(false)
+        },
+        Duration::from_secs(3),
+        "untrusted intro recorded",
+    )
+    .await;
 
     let db_a = open_connection(&peer_a.db_path).expect("open A db");
     let attempts = list_intro_attempts(&db_a, &peer_a.identity, None).expect("list attempts");
@@ -620,4 +644,5 @@ async fn test_untrusted_peer_intro_rejected() {
     );
 
     ep_i.close(0u32.into(), b"done");
+    ep_a.close(0u32.into(), b"done");
 }

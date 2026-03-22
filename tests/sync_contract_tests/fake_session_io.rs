@@ -500,31 +500,6 @@ pub fn create_test_db(tenant_id: &str) -> (String, tempfile::TempDir) {
     (db_path_str, tmpdir)
 }
 
-/// No-op batch writer for tests that don't need event ingestion.
-pub fn noop_batch_writer(
-    _db_path: String,
-    mut rx: tokio::sync::mpsc::Receiver<topo::contracts::event_pipeline_contract::IngestItem>,
-    _events_received: std::sync::Arc<std::sync::atomic::AtomicU64>,
-) {
-    // Drain the channel so senders don't block
-    while rx.blocking_recv().is_some() {}
-}
-
-/// Create a no-op ingest sender for tests that don't exercise event ingestion.
-/// Spawns a background thread that drains the channel to prevent backpressure.
-pub fn noop_ingest_tx(
-) -> tokio::sync::mpsc::Sender<topo::contracts::event_pipeline_contract::IngestItem> {
-    let (tx, rx) = tokio::sync::mpsc::channel(100);
-    std::thread::spawn(move || {
-        noop_batch_writer(
-            String::new(),
-            rx,
-            std::sync::Arc::new(std::sync::atomic::AtomicU64::new(0)),
-        );
-    });
-    tx
-}
-
 /// Build a SessionMeta for testing.
 pub fn test_session_meta(
     direction: topo::contracts::peering_contract::SessionDirection,

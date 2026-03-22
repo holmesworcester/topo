@@ -48,7 +48,6 @@ fn env_i64(name: &str, default: i64) -> i64 {
 
 fn inherited_tier_env() -> Vec<(String, String)> {
     [
-        "TOPO_SYNC_TIER_MODE",
         "TOPO_SYNC_WINDOW_SHAPE",
         "TOPO_GENERATE_MESSAGE_SPREAD_MS",
         "TOPO_FORWARD_ON_HAVE",
@@ -178,8 +177,6 @@ fn write_summary(summary_key: &str, summary: &str) {
 }
 
 fn run_tiered_window_bench() {
-    let mode = "parallel";
-    std::env::set_var("TOPO_SYNC_TIER_MODE", mode);
     std::env::set_var(
         "TOPO_GENERATE_MESSAGE_SPREAD_MS",
         THREE_YEARS_MS.to_string(),
@@ -325,7 +322,7 @@ fn run_tiered_window_bench() {
     let all_timing = range_timing_sql(&bob_db, None);
 
     let summary = format!(
-        "=== tiered window catchup ===\n  Mode: {mode}\n  Window shape: {window_shape}\n  Messages preloaded on inviter: {total_messages}\n  Network profile: {}\n  Generated spread: 3 years\n  Metric start: invite accept on running joiner daemon\n  Last hour:  {} msgs durable in {:.2}s projected in {:.2}s\n  Last day:   {} msgs durable in {:.2}s projected in {:.2}s\n  Last week:  {} msgs durable in {:.2}s projected in {:.2}s\n  Last month: {} msgs durable in {:.2}s projected in {:.2}s\n  Last year:  {} msgs durable in {:.2}s projected in {:.2}s\n  All:        {} msgs durable in {:.2}s projected in {:.2}s\n  Full catchup wall: {:.2}s\n",
+        "=== tiered window catchup ===\n  Window shape: {window_shape}\n  Messages preloaded on inviter: {total_messages}\n  Network profile: {}\n  Generated spread: 3 years\n  Metric start: invite accept on running joiner daemon\n  Last hour:  {} msgs durable in {:.2}s projected in {:.2}s\n  Last day:   {} msgs durable in {:.2}s projected in {:.2}s\n  Last week:  {} msgs durable in {:.2}s projected in {:.2}s\n  Last month: {} msgs durable in {:.2}s projected in {:.2}s\n  Last year:  {} msgs durable in {:.2}s projected in {:.2}s\n  All:        {} msgs durable in {:.2}s projected in {:.2}s\n  Full catchup wall: {:.2}s\n",
         network_profile.map(|profile| profile.slug).unwrap_or("loopback"),
         hour_timing.count,
         elapsed_secs(metric_start_ms, hour_timing.persisted_at_ms),
@@ -349,8 +346,7 @@ fn run_tiered_window_bench() {
     );
     eprintln!("\n{summary}");
     let summary_key = format!(
-        "daemon_tiered_window_perf_test.{}_{}_{}_{}",
-        mode,
+        "daemon_tiered_window_perf_test.{}_{}_{}",
         window_shape,
         total_messages,
         network_profile

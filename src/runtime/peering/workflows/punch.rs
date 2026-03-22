@@ -7,7 +7,6 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::contracts::peering_contract::{
     PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId,
 };
@@ -64,7 +63,6 @@ pub async fn handle_intro_offer(
     expires_at_ms: u64,
     attempt_window_ms: u32,
     client_config: Option<TransportClientConfig>,
-    shared_ingest: tokio::sync::mpsc::Sender<IngestItem>,
 ) {
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)
@@ -246,7 +244,6 @@ pub async fn handle_intro_offer(
                     db_path,
                     recorded_by,
                     &other_peer_hex,
-                    shared_ingest,
                 )
                 .await;
                 return;
@@ -272,7 +269,6 @@ async fn run_sync_on_punched_connection(
     db_path: &str,
     recorded_by: &str,
     peer_id: &str,
-    _shared_ingest: tokio::sync::mpsc::Sender<IngestItem>,
 ) {
     let session = match provider.next_session().await {
         Ok(s) => s,
@@ -329,7 +325,6 @@ pub fn spawn_intro_listener(
     introduced_by: String,
     endpoint: TransportEndpoint,
     client_config: Option<TransportClientConfig>,
-    shared_ingest: tokio::sync::mpsc::Sender<IngestItem>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async move {
         loop {
@@ -367,8 +362,6 @@ pub fn spawn_intro_listener(
                     let introduced_by = introduced_by.clone();
                     let endpoint = endpoint.clone();
                     let cfg = client_config.clone();
-                    let ingest = shared_ingest.clone();
-
                     // Spawn punch attempt as a local task — runs on the same
                     // LocalSet / runtime that owns the endpoint I/O driver.
                     tokio::task::spawn_local(async move {
@@ -386,7 +379,6 @@ pub fn spawn_intro_listener(
                             expires_at_ms,
                             attempt_window_ms,
                             cfg,
-                            ingest,
                         )
                         .await;
                     });

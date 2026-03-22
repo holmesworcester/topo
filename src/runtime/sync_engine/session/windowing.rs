@@ -19,12 +19,6 @@ pub struct SyncWindow {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyncTierMode {
-    Off,
-    Parallel,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncWindowShape {
     Nested,
     Disjoint,
@@ -71,20 +65,6 @@ fn state_for<'a>(
         .or_insert(PlannerState { next_idx: 0 })
 }
 
-pub fn sync_tier_mode() -> SyncTierMode {
-    match std::env::var("TOPO_SYNC_TIER_MODE")
-        .ok()
-        .unwrap_or_else(|| "off".to_string())
-        .to_lowercase()
-        .as_str()
-    {
-        // Keep the old value as a compatibility alias now that tiered mode
-        // has only one supported behavior.
-        "serial" | "parallel" => SyncTierMode::Parallel,
-        _ => SyncTierMode::Off,
-    }
-}
-
 pub fn sync_window_shape() -> SyncWindowShape {
     match std::env::var("TOPO_SYNC_WINDOW_SHAPE")
         .ok()
@@ -105,33 +85,20 @@ pub fn reset_outbound_window_state(db_path: &str, peer_id: &str) {
 }
 
 pub fn select_outbound_window(db_path: &str, peer_id: &str, now_ms: i64) -> SyncWindow {
-    let mode = sync_tier_mode();
     let mut state = planner_state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let planner = state_for(&mut state, db_path, peer_id);
-    match mode {
-        SyncTierMode::Off => window_for_kind(SyncWindowKind::Full, now_ms),
-        SyncTierMode::Parallel => {
-            let idx = planner.next_idx % TIER_ORDER.len();
-            window_for_kind(TIER_ORDER[idx], now_ms)
-        }
-    }
+    let idx = planner.next_idx % TIER_ORDER.len();
+    window_for_kind(TIER_ORDER[idx], now_ms)
 }
 
-pub fn mark_outbound_window_completed(db_path: &str, peer_id: &str, window: SyncWindow) -> bool {
-    let mode = sync_tier_mode();
+pub fn mark_outbound_window_completed(db_path: &str, peer_id: &str, _window: SyncWindow) {
     let mut state = planner_state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let planner = state_for(&mut state, db_path, peer_id);
-    match mode {
-        SyncTierMode::Off => false,
-        SyncTierMode::Parallel => {
-            planner.next_idx = (planner.next_idx + 1) % TIER_ORDER.len();
-            window.kind != SyncWindowKind::Full
-        }
-    }
+    planner.next_idx = (planner.next_idx + 1) % TIER_ORDER.len();
 }
 
 fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
@@ -280,23 +247,10 @@ mod tests {
     }
 
     #[test]
-    fn off_mode_always_uses_full_window() {
+    fn range_scheduler_round_robins_windows() {
         let _guard = env_guard();
-        std::env::remove_var("TOPO_SYNC_TIER_MODE");
         std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
-        reset_outbound_window_state("/tmp/window-off", "peer-a");
-        let window = select_outbound_window("/tmp/window-off", "peer-a", 100_000);
-        assert_eq!(window.kind, SyncWindowKind::Full);
-        assert_eq!(window.ts_min(), None);
-        assert_eq!(window.ts_max_exclusive(), None);
-    }
-
-    #[test]
-    fn tier_mode_round_robins_windows() {
-        let _guard = env_guard();
-        std::env::set_var("TOPO_SYNC_TIER_MODE", "parallel");
-        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
-        let db_path = "/tmp/window-parallel";
+        let db_path = "/tmp/window-round-robin";
         let peer_id = "peer-a";
         reset_outbound_window_state(db_path, peer_id);
 
@@ -304,7 +258,7 @@ mod tests {
             .map(|_| {
                 let window = select_outbound_window(db_path, peer_id, 1_000_000);
                 let kind = window.kind;
-                let _ = mark_outbound_window_completed(db_path, peer_id, window);
+                mark_outbound_window_completed(db_path, peer_id, window);
                 kind
             })
             .collect();
@@ -322,40 +276,6 @@ mod tests {
                 SyncWindowKind::LastDay
             ]
         );
-        std::env::remove_var("TOPO_SYNC_TIER_MODE");
-        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
-    }
-
-    #[test]
-    fn legacy_serial_alias_uses_parallel_behavior() {
-        let _guard = env_guard();
-        std::env::set_var("TOPO_SYNC_TIER_MODE", "serial");
-        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
-        let db_path = "/tmp/window-serial-alias";
-        let peer_id = "peer-a";
-        reset_outbound_window_state(db_path, peer_id);
-
-        let kinds: Vec<SyncWindowKind> = (0..6)
-            .map(|_| {
-                let window = select_outbound_window(db_path, peer_id, 1_000_000);
-                let kind = window.kind;
-                let _ = mark_outbound_window_completed(db_path, peer_id, window);
-                kind
-            })
-            .collect();
-
-        assert_eq!(
-            kinds,
-            vec![
-                SyncWindowKind::LastHour,
-                SyncWindowKind::LastDay,
-                SyncWindowKind::LastWeek,
-                SyncWindowKind::LastMonth,
-                SyncWindowKind::LastYear,
-                SyncWindowKind::Full,
-            ]
-        );
-        std::env::remove_var("TOPO_SYNC_TIER_MODE");
         std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
     }
 

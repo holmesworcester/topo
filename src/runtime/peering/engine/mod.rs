@@ -64,9 +64,7 @@ pub async fn run_node(
         sync_control,
     );
 
-    let events_received = runtime_supervisor
-        .run_until_shutdown(shutdown_notify)
-        .await?;
-    info!("Shutting down ({} events received)", events_received);
+    runtime_supervisor.run_until_shutdown(shutdown_notify).await?;
+    info!("Shutting down");
     Ok(())
 }

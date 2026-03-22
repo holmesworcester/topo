@@ -10,7 +10,6 @@
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -19,7 +18,7 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use crate::contracts::event_pipeline_contract::{IngestFns, IngestItem};
+use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
 use crate::db::open_connection;
 use crate::db::transport_creds::{
@@ -27,7 +26,7 @@ use crate::db::transport_creds::{
 };
 use crate::db::transport_trust::is_peer_shared_transport_fingerprint;
 use crate::peering::loops::{
-    accept_loop_with_ingest_until_cancel,
+    accept_loop_until_cancel,
     connect_loop_with_coordination_until_cancel_with_fallback, preferred_connection_direction,
     IntroSpawnerFn,
 };
@@ -37,8 +36,6 @@ use crate::transport::{
     build_tenant_client_config_from_db, TenantClientConfigs, TransportClientConfig,
     TransportEndpoint,
 };
-use crate::tuning::shared_ingest_cap;
-
 use super::target_planner::{
     bootstrap_dispatch_key, bootstrap_dispatch_key_prefix, collect_all_bootstrap_targets,
     collect_all_observed_endpoint_targets, discovery_dispatch_key, dispatch_bootstrap_target,
@@ -62,7 +59,6 @@ enum RuntimeEvent {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum WorkerKind {
-    BatchWriter,
     AcceptLoop,
     TargetDispatcher,
     BootstrapRefresher,
@@ -179,7 +175,7 @@ impl RuntimeSupervisor {
     pub(crate) async fn run_until_shutdown(
         &mut self,
         shutdown_notify: Arc<Notify>,
-    ) -> Result<u64, Box<dyn std::error::Error + Send + Sync>> {
+    ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         self.state = transition_state(
             self.state,
             RuntimeEvent::TenantSetChanged(self.tenants.len()),
@@ -192,19 +188,6 @@ impl RuntimeSupervisor {
         let tenant_ids: Vec<String> = self.tenants.iter().map(|t| t.peer_id.clone()).collect();
         let tenant_contexts = build_tenant_contexts(&self.db_path, &tenant_ids);
 
-        let ingest_cap = shared_ingest_cap();
-        let (shared_tx, shared_rx) = mpsc::channel::<IngestItem>(ingest_cap);
-        let events_received = Arc::new(AtomicU64::new(0));
-
-        spawn_batch_writer_worker(
-            &mut workers,
-            self.ingest,
-            self.db_path.clone(),
-            shared_rx,
-            events_received.clone(),
-            root_cancel.child_token(),
-        );
-
         let (target_tx, target_rx) = mpsc::unbounded_channel::<TargetIngressEvent>();
 
         // Accept worker: inbound transport sessions for all known tenants.
@@ -212,7 +195,6 @@ impl RuntimeSupervisor {
             let db_path = self.db_path.clone();
             let endpoint = self.endpoint.clone();
             let tenant_ids = tenant_ids.clone();
-            let shared_ingest = shared_tx.clone();
             let tenant_cfgs = self.tenant_client_configs.clone();
             let intro_spawner = self.intro_spawner;
             let ingest = self.ingest;
@@ -224,12 +206,11 @@ impl RuntimeSupervisor {
                 "accept-loop",
                 cancel.clone(),
                 async move {
-                    accept_loop_with_ingest_until_cancel(
+                    accept_loop_until_cancel(
                         &db_path,
                         &tenant_ids,
                         endpoint,
                         cancel,
-                        shared_ingest,
                         tenant_cfgs,
                         intro_spawner,
                         ingest,
@@ -364,9 +345,7 @@ impl RuntimeSupervisor {
         root_cancel.cancel();
         self.endpoint.close(0u32.into(), b"runtime shutdown");
 
-        // Let the writer drain and stop.
         drop(target_tx);
-        drop(shared_tx);
 
         while let Some(joined) = workers.join_next().await {
             match joined {
@@ -394,7 +373,7 @@ impl RuntimeSupervisor {
             return Err(err.into());
         }
 
-        Ok(events_received.load(Ordering::Relaxed))
+        Ok(())
     }
 }
 
@@ -436,31 +415,6 @@ fn build_tenant_contexts(
     out
 }
 
-fn spawn_batch_writer_worker(
-    workers: &mut JoinSet<WorkerExit>,
-    ingest: IngestFns,
-    db_path: String,
-    rx: mpsc::Receiver<IngestItem>,
-    events_received: Arc<AtomicU64>,
-    cancel: CancellationToken,
-) {
-    let writer = ingest.batch_writer;
-    spawn_worker(
-        workers,
-        WorkerKind::BatchWriter,
-        "shared-batch-writer",
-        cancel,
-        async move {
-            tokio::task::spawn_blocking(move || {
-                writer(db_path, rx, events_received);
-            })
-            .await
-            .map_err(|e| format!("batch_writer worker join error: {}", e))?;
-            Ok(())
-        },
-    );
-}
-
 fn spawn_worker<F>(
     workers: &mut JoinSet<WorkerExit>,
     kind: WorkerKind,
@@ -484,8 +438,7 @@ fn spawn_worker<F>(
 
 fn worker_failure_policy(kind: WorkerKind) -> WorkerFailurePolicy {
     match kind {
-        WorkerKind::BatchWriter
-        | WorkerKind::AcceptLoop
+        WorkerKind::AcceptLoop
         | WorkerKind::TargetDispatcher
         | WorkerKind::BootstrapRefresher
         | WorkerKind::ObservedEndpointRefresher => WorkerFailurePolicy::FailRuntime,
