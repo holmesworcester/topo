@@ -27,6 +27,7 @@ pub enum SyncWindowShape {
 const WINDOW_MAGIC: &[u8; 4] = b"P7SW";
 const WINDOW_VERSION: u8 = 2;
 const NONE_TS_SENTINEL: i64 = i64::MIN;
+const ALL_START_MS: i64 = 0;
 const HOUR_MS: i64 = 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 const WEEK_MS: i64 = 7 * DAY_MS;
@@ -51,17 +52,18 @@ fn planner_state() -> &'static Mutex<HashMap<String, PlannerState>> {
     STATE.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn planner_key(db_path: &str, peer_id: &str) -> String {
-    format!("{db_path}|{peer_id}")
+fn planner_key(db_path: &str, recorded_by: &str, peer_id: &str) -> String {
+    format!("{db_path}|{recorded_by}|{peer_id}")
 }
 
 fn state_for<'a>(
     state: &'a mut HashMap<String, PlannerState>,
     db_path: &str,
+    recorded_by: &str,
     peer_id: &str,
 ) -> &'a mut PlannerState {
     state
-        .entry(planner_key(db_path, peer_id))
+        .entry(planner_key(db_path, recorded_by, peer_id))
         .or_insert(PlannerState { next_idx: 0 })
 }
 
@@ -77,36 +79,70 @@ pub fn sync_window_shape() -> SyncWindowShape {
     }
 }
 
-pub fn reset_outbound_window_state(db_path: &str, peer_id: &str) {
+pub fn reset_outbound_window_state(db_path: &str, recorded_by: &str, peer_id: &str) {
     let mut state = planner_state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.remove(&planner_key(db_path, peer_id));
+    state.remove(&planner_key(db_path, recorded_by, peer_id));
 }
 
-pub fn select_outbound_window(db_path: &str, peer_id: &str, now_ms: i64) -> SyncWindow {
+pub fn prime_outbound_window_kind(
+    db_path: &str,
+    recorded_by: &str,
+    peer_id: &str,
+    kind: SyncWindowKind,
+) {
     let mut state = planner_state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let planner = state_for(&mut state, db_path, peer_id);
+    let planner = state_for(&mut state, db_path, recorded_by, peer_id);
+    let idx = TIER_ORDER
+        .iter()
+        .position(|candidate| *candidate == kind)
+        .unwrap_or(0);
+    planner.next_idx = idx;
+}
+
+pub fn select_outbound_window(
+    db_path: &str,
+    recorded_by: &str,
+    peer_id: &str,
+    live_peer_ids: &[String],
+    now_ms: i64,
+) -> SyncWindow {
+    let mut state = planner_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let planner = state_for(&mut state, db_path, recorded_by, peer_id);
     let idx = planner.next_idx % TIER_ORDER.len();
-    window_for_kind(TIER_ORDER[idx], now_ms)
+    let kind = TIER_ORDER[idx];
+    assign_window(window_for_kind(kind, now_ms), kind, peer_id, live_peer_ids, now_ms)
 }
 
-pub fn mark_outbound_window_completed(db_path: &str, peer_id: &str, _window: SyncWindow) {
+pub fn mark_outbound_window_completed(
+    db_path: &str,
+    recorded_by: &str,
+    peer_id: &str,
+    _window: SyncWindow,
+) {
     let mut state = planner_state()
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let planner = state_for(&mut state, db_path, peer_id);
+    let planner = state_for(&mut state, db_path, recorded_by, peer_id);
     planner.next_idx = (planner.next_idx + 1) % TIER_ORDER.len();
 }
 
 fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
     match (sync_window_shape(), kind) {
-        (_, SyncWindowKind::Full) => SyncWindow {
+        (SyncWindowShape::Nested, SyncWindowKind::Full) => SyncWindow {
             kind,
-            ts_min_inclusive_ms: None,
-            ts_max_exclusive_ms: None,
+            ts_min_inclusive_ms: Some(ALL_START_MS),
+            ts_max_exclusive_ms: Some(now_ms),
+        },
+        (SyncWindowShape::Disjoint, SyncWindowKind::Full) => SyncWindow {
+            kind,
+            ts_min_inclusive_ms: Some(ALL_START_MS),
+            ts_max_exclusive_ms: Some(now_ms - YEAR_MS),
         },
         (SyncWindowShape::Nested, SyncWindowKind::LastHour) => SyncWindow {
             kind,
@@ -159,6 +195,65 @@ fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
             ts_max_exclusive_ms: Some(now_ms - MONTH_MS),
         },
     }
+}
+
+fn is_hot_window(kind: SyncWindowKind) -> bool {
+    matches!(kind, SyncWindowKind::LastHour | SyncWindowKind::LastDay)
+}
+
+fn normalized_live_peers(peer_id: &str, live_peer_ids: &[String]) -> Vec<String> {
+    let mut peers = live_peer_ids.to_vec();
+    if !peers.iter().any(|candidate| candidate == peer_id) {
+        peers.push(peer_id.to_string());
+    }
+    peers.sort();
+    peers.dedup();
+    peers
+}
+
+fn partition_window_bounds(window: SyncWindow, now_ms: i64) -> Option<(i64, i64)> {
+    let start = window.ts_min()?;
+    let end = window.ts_max_exclusive().unwrap_or(now_ms);
+    (start < end).then_some((start, end))
+}
+
+fn partition_window(window: SyncWindow, peer_rank: usize, peer_count: usize, now_ms: i64) -> SyncWindow {
+    if peer_count <= 1 {
+        return window;
+    }
+    let Some((start, end)) = partition_window_bounds(window, now_ms) else {
+        return window;
+    };
+    let width = end.saturating_sub(start);
+    if width <= 1 {
+        return window;
+    }
+
+    let oldest_slot = peer_count.saturating_sub(peer_rank + 1);
+    let slice_start = start + (width * oldest_slot as i64) / peer_count as i64;
+    let slice_end = start + (width * (oldest_slot + 1) as i64) / peer_count as i64;
+    SyncWindow {
+        kind: window.kind,
+        ts_min_inclusive_ms: Some(slice_start),
+        ts_max_exclusive_ms: Some(slice_end.max(slice_start)),
+    }
+}
+
+fn assign_window(
+    window: SyncWindow,
+    kind: SyncWindowKind,
+    peer_id: &str,
+    live_peer_ids: &[String],
+    now_ms: i64,
+) -> SyncWindow {
+    if is_hot_window(kind) {
+        return window;
+    }
+    let peers = normalized_live_peers(peer_id, live_peer_ids);
+    let Some(peer_rank) = peers.iter().position(|candidate| candidate == peer_id) else {
+        return window;
+    };
+    partition_window(window, peer_rank, peers.len(), now_ms)
 }
 
 impl SyncWindow {
@@ -251,14 +346,22 @@ mod tests {
         let _guard = env_guard();
         std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
         let db_path = "/tmp/window-round-robin";
+        let recorded_by = "tenant-a";
         let peer_id = "peer-a";
-        reset_outbound_window_state(db_path, peer_id);
+        let live_peers = vec![peer_id.to_string()];
+        reset_outbound_window_state(db_path, recorded_by, peer_id);
 
         let kinds: Vec<SyncWindowKind> = (0..8)
             .map(|_| {
-                let window = select_outbound_window(db_path, peer_id, 1_000_000);
+                let window = select_outbound_window(
+                    db_path,
+                    recorded_by,
+                    peer_id,
+                    &live_peers,
+                    1_000_000,
+                );
                 let kind = window.kind;
-                mark_outbound_window_completed(db_path, peer_id, window);
+                mark_outbound_window_completed(db_path, recorded_by, peer_id, window);
                 kind
             })
             .collect();
@@ -306,8 +409,199 @@ mod tests {
         assert_eq!(year.ts_min(), Some(1_000_000 - YEAR_MS));
         assert_eq!(year.ts_max_exclusive(), Some(1_000_000 - MONTH_MS));
 
-        assert_eq!(full.ts_min(), None);
-        assert_eq!(full.ts_max_exclusive(), None);
+        assert_eq!(full.ts_min(), Some(ALL_START_MS));
+        assert_eq!(full.ts_max_exclusive(), Some(1_000_000 - YEAR_MS));
+
+        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
+    }
+
+    #[test]
+    fn hot_windows_are_duplicated_across_live_peers() {
+        let _guard = env_guard();
+        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
+        let db_path = "/tmp/window-hot-dup";
+        let recorded_by = "tenant-a";
+        let peer_a = "peer-a";
+        let peer_b = "peer-b";
+        let live_peers = vec![peer_a.to_string(), peer_b.to_string()];
+        reset_outbound_window_state(db_path, recorded_by, peer_a);
+        reset_outbound_window_state(db_path, recorded_by, peer_b);
+
+        let hour_a = select_outbound_window(
+            db_path,
+            recorded_by,
+            peer_a,
+            &live_peers,
+            1_000_000,
+        );
+        let hour_b = select_outbound_window(
+            db_path,
+            recorded_by,
+            peer_b,
+            &live_peers,
+            1_000_000,
+        );
+        assert_eq!(hour_a, hour_b);
+
+        mark_outbound_window_completed(db_path, recorded_by, peer_a, hour_a);
+        mark_outbound_window_completed(db_path, recorded_by, peer_b, hour_b);
+
+        let day_a = select_outbound_window(
+            db_path,
+            recorded_by,
+            peer_a,
+            &live_peers,
+            1_000_000,
+        );
+        let day_b = select_outbound_window(
+            db_path,
+            recorded_by,
+            peer_b,
+            &live_peers,
+            1_000_000,
+        );
+        assert_eq!(day_a, day_b);
+    }
+
+    #[test]
+    fn cold_windows_partition_by_live_peer_rank() {
+        let _guard = env_guard();
+        std::env::set_var("TOPO_SYNC_WINDOW_SHAPE", "disjoint");
+        let db_path = "/tmp/window-partition";
+        let recorded_by = "tenant-a";
+        let peer_a = "peer-a";
+        let peer_b = "peer-b";
+        let live_peers = vec![peer_a.to_string(), peer_b.to_string()];
+        reset_outbound_window_state(db_path, recorded_by, peer_a);
+        reset_outbound_window_state(db_path, recorded_by, peer_b);
+
+        for _ in 0..2 {
+            let a = select_outbound_window(
+                db_path,
+                recorded_by,
+                peer_a,
+                &live_peers,
+                1_000_000,
+            );
+            let b = select_outbound_window(
+                db_path,
+                recorded_by,
+                peer_b,
+                &live_peers,
+                1_000_000,
+            );
+            mark_outbound_window_completed(db_path, recorded_by, peer_a, a);
+            mark_outbound_window_completed(db_path, recorded_by, peer_b, b);
+        }
+
+        let week_a = select_outbound_window(
+            db_path,
+            recorded_by,
+            peer_a,
+            &live_peers,
+            1_000_000,
+        );
+        let week_b = select_outbound_window(
+            db_path,
+            recorded_by,
+            peer_b,
+            &live_peers,
+            1_000_000,
+        );
+
+        assert_eq!(week_a.kind, SyncWindowKind::LastWeek);
+        assert_eq!(week_b.kind, SyncWindowKind::LastWeek);
+        assert_eq!(week_a.ts_min(), week_b.ts_max_exclusive());
+        assert_eq!(week_a.ts_min(), Some(1_000_000 - (4 * DAY_MS)));
+        assert_eq!(week_a.ts_max_exclusive(), Some(1_000_000 - DAY_MS));
+        assert_eq!(week_b.ts_min(), Some(1_000_000 - WEEK_MS));
+        assert_eq!(week_b.ts_max_exclusive(), Some(1_000_000 - (4 * DAY_MS)));
+
+        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
+    }
+
+    #[test]
+    fn cold_windows_expand_when_live_peer_set_shrinks() {
+        let _guard = env_guard();
+        std::env::set_var("TOPO_SYNC_WINDOW_SHAPE", "disjoint");
+        let db_path = "/tmp/window-peer-loss";
+        let recorded_by = "tenant-a";
+        let peer_a = "peer-a";
+        let peer_b = "peer-b";
+        reset_outbound_window_state(db_path, recorded_by, peer_a);
+        reset_outbound_window_state(db_path, recorded_by, peer_b);
+
+        for _ in 0..2 {
+            let a = select_outbound_window(
+                db_path,
+                recorded_by,
+                peer_a,
+                &[peer_a.to_string(), peer_b.to_string()],
+                1_000_000,
+            );
+            mark_outbound_window_completed(db_path, recorded_by, peer_a, a);
+        }
+        let split_week = select_outbound_window(
+            db_path,
+            recorded_by,
+            peer_a,
+            &[peer_a.to_string(), peer_b.to_string()],
+            1_000_000,
+        );
+        let single_week = select_outbound_window(
+            db_path,
+            recorded_by,
+            peer_a,
+            &[peer_a.to_string()],
+            1_000_000,
+        );
+
+        assert_eq!(split_week.kind, SyncWindowKind::LastWeek);
+        assert_eq!(split_week.ts_min(), Some(1_000_000 - (4 * DAY_MS)));
+        assert_eq!(split_week.ts_max_exclusive(), Some(1_000_000 - DAY_MS));
+        assert_eq!(single_week.ts_min(), Some(1_000_000 - WEEK_MS));
+        assert_eq!(single_week.ts_max_exclusive(), Some(1_000_000 - DAY_MS));
+
+        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
+    }
+
+    #[test]
+    fn full_range_partitions_cover_without_overlap() {
+        let _guard = env_guard();
+        std::env::set_var("TOPO_SYNC_WINDOW_SHAPE", "disjoint");
+        let db_path = "/tmp/window-full-cover";
+        let recorded_by = "tenant-a";
+        let peers = vec![
+            "peer-a".to_string(),
+            "peer-b".to_string(),
+            "peer-c".to_string(),
+            "peer-d".to_string(),
+        ];
+        let now_ms = 4 * YEAR_MS;
+        for peer in &peers {
+            reset_outbound_window_state(db_path, recorded_by, peer);
+        }
+
+        for peer in &peers {
+            for _ in 0..5 {
+                let window =
+                    select_outbound_window(db_path, recorded_by, peer, &peers, now_ms);
+                mark_outbound_window_completed(db_path, recorded_by, peer, window);
+            }
+        }
+
+        let mut full_windows: Vec<SyncWindow> = peers
+            .iter()
+            .map(|peer| select_outbound_window(db_path, recorded_by, peer, &peers, now_ms))
+            .collect();
+        full_windows.sort_by_key(|window| window.ts_min());
+
+        assert_eq!(full_windows.len(), 4);
+        assert_eq!(full_windows[0].ts_min(), Some(ALL_START_MS));
+        assert_eq!(full_windows[3].ts_max_exclusive(), Some(3 * YEAR_MS));
+        for pair in full_windows.windows(2) {
+            assert_eq!(pair[0].ts_max_exclusive(), pair[1].ts_min());
+        }
 
         std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
     }

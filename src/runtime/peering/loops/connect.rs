@@ -294,7 +294,7 @@ async fn connect_loop_inner(
         let initiator_handler =
             SyncConnectionHandler::outbound(db_path.to_string(), SYNC_SESSION_TIMEOUT_SECS)
                 .with_sync_control(sync_control.clone());
-        reset_outbound_window_state(db_path, &peer_id);
+        reset_outbound_window_state(db_path, recorded_by, &peer_id);
 
         // Record endpoint observation, transport binding, and purge expired
         {

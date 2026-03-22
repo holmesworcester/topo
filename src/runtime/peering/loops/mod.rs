@@ -247,6 +247,20 @@ pub(crate) fn claim_live_connection_slot(
     claim
 }
 
+pub(crate) fn live_connection_peer_ids(db_path: &str, recorded_by: &str) -> Vec<String> {
+    let slots = live_connection_slots()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut peer_ids: Vec<String> = slots
+        .keys()
+        .filter(|key| key.db_path == db_path && key.recorded_by == recorded_by)
+        .map(|key| key.peer_id.clone())
+        .collect();
+    peer_ids.sort();
+    peer_ids.dedup();
+    peer_ids
+}
+
 // ---------------------------------------------------------------------------
 // Transport↔peering session seam
 // ---------------------------------------------------------------------------

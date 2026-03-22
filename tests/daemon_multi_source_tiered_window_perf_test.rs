@@ -10,7 +10,7 @@
 mod cli_harness;
 mod daemon_perf_harness;
 
-use std::collections::HashMap;
+use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -36,6 +36,16 @@ struct RangeTiming {
     count: i64,
     persisted_at_ms: Option<i64>,
     projected_at_ms: Option<i64>,
+}
+
+#[allow(dead_code)]
+#[derive(Debug)]
+struct BenchOutcome {
+    useful_unique_events: i64,
+    downloader_event_frames: i64,
+    delivery_efficiency: f64,
+    source_recorded_events: Vec<i64>,
+    active_sources: usize,
 }
 
 fn current_timestamp_ms() -> i64 {
@@ -100,6 +110,29 @@ fn total_message_count_sql(db: &str) -> i64 {
         |row| row.get(0),
     )
     .expect("query total_message_count")
+}
+
+fn message_ids_since_sql(db: &str, cutoff_ms: Option<i64>) -> BTreeSet<String> {
+    let conn = topo::db::open_connection(db).expect("open db for message_ids_since");
+    let mut stmt = conn
+        .prepare(
+            "SELECT message_id
+             FROM messages
+             WHERE (?1 IS NULL OR created_at >= ?1)",
+        )
+        .expect("prepare message_ids_since");
+    stmt.query_map(rusqlite::params![cutoff_ms], |row| row.get::<_, String>(0))
+        .expect("query message_ids_since")
+        .collect::<Result<BTreeSet<_>, _>>()
+        .expect("collect message_ids_since")
+}
+
+fn union_message_count_since_sql(dbs: &[String], cutoff_ms: Option<i64>) -> i64 {
+    let mut message_ids = BTreeSet::new();
+    for db in dbs {
+        message_ids.extend(message_ids_since_sql(db, cutoff_ms));
+    }
+    message_ids.len() as i64
 }
 
 fn message_count_since_sql(db: &str, cutoff_ms: i64) -> i64 {
@@ -239,6 +272,45 @@ fn diff_count_map(
         }
     }
     delta
+}
+
+fn received_recorded_events_by_source_for_db(db: &str) -> HashMap<String, i64> {
+    let conn = topo::db::open_connection(db).expect("open db for recorded source rows");
+    let Some(peer_id) = active_tenant_peer_id(db) else {
+        return HashMap::new();
+    };
+    let mut stmt = conn
+        .prepare(
+            "SELECT source, COUNT(*)
+             FROM recorded_events
+             WHERE peer_id = ?1
+               AND source LIKE 'quic_recv:%'
+             GROUP BY source",
+        )
+        .expect("prepare recorded source query");
+    stmt.query_map(rusqlite::params![peer_id], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+    })
+    .expect("query recorded source rows")
+    .collect::<Result<HashMap<_, _>, _>>()
+    .expect("collect recorded source rows")
+}
+
+fn count_source_tag_events(
+    source_counts: &HashMap<String, i64>,
+    sources: &[Node],
+) -> Vec<i64> {
+    sources
+        .iter()
+        .map(|source| {
+            let prefix = format!("quic_recv:{}@", source.transport_peer_id);
+            source_counts
+                .iter()
+                .filter(|(tag, _)| tag.starts_with(&prefix))
+                .map(|(_, count)| *count)
+                .sum()
+        })
+        .collect()
 }
 
 fn changed_sync_run_count(db: &str) -> i64 {
@@ -415,6 +487,21 @@ fn emit_warmup_messages(nodes: &[Node]) -> i64 {
     nodes.len() as i64
 }
 
+fn generate_messages_distributed(nodes: &[&Node], total_messages: i64) {
+    assert!(total_messages >= 0, "total_messages must be non-negative");
+    if nodes.is_empty() || total_messages == 0 {
+        return;
+    }
+    let per_node = total_messages / nodes.len() as i64;
+    let remainder = total_messages % nodes.len() as i64;
+    for (idx, node) in nodes.iter().enumerate() {
+        let count = per_node + i64::from((idx as i64) < remainder);
+        if count > 0 {
+            generate_messages(&node.db, count as usize);
+        }
+    }
+}
+
 fn write_summary_with_sources(
     summary_key: &str,
     title: &str,
@@ -470,14 +557,14 @@ fn write_summary_with_sources(
     write_summary(summary_key, &summary);
 }
 
-fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) {
+fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) -> BenchOutcome {
     assert!(source_count >= 2, "source_count must be >= 2");
     hold_network_test_lock_for_binary();
     std::env::set_var(
         "TOPO_GENERATE_MESSAGE_SPREAD_MS",
         THREE_YEARS_MS.to_string(),
     );
-    std::env::set_var("TOPO_FORWARD_ON_HAVE", "1");
+    std::env::set_var("TOPO_FORWARD_ON_HAVE", "0");
     std::env::set_var("TOPO_EVENT_TIMELINE", "1");
     std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "persist,projection");
 
@@ -490,10 +577,10 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) {
     let (sources, invite_link) = create_online_community(&tmpdir, &peer_labels, connectivity);
     let source_dbs: Vec<String> = sources.iter().map(|source| source.db.clone()).collect();
 
-    let baseline = total_message_count_sql(&sources[0].db);
-    generate_messages(&sources[0].db, total_messages as usize);
-    let expected_total = baseline + total_messages;
-    wait_for_message_count_all(&source_dbs, expected_total, Duration::from_secs(1200));
+    let source_refs: Vec<&Node> = sources.iter().collect();
+    generate_messages_distributed(&source_refs, total_messages);
+    let source_expected_total = union_message_count_since_sql(&source_dbs, None);
+    wait_for_message_count_all(&source_dbs, source_expected_total, Duration::from_secs(1200));
 
     let measurement_now_ms = current_timestamp_ms();
     let hour_cutoff = measurement_now_ms - HOUR_MS;
@@ -501,16 +588,18 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) {
     let week_cutoff = measurement_now_ms - WEEK_MS;
     let month_cutoff = measurement_now_ms - MONTH_MS;
     let year_cutoff = measurement_now_ms - YEAR_MS;
-    let expected_hour = message_count_since_sql(&sources[0].db, hour_cutoff);
-    let expected_day = message_count_since_sql(&sources[0].db, day_cutoff);
-    let expected_week = message_count_since_sql(&sources[0].db, week_cutoff);
-    let expected_month = message_count_since_sql(&sources[0].db, month_cutoff);
-    let expected_year = message_count_since_sql(&sources[0].db, year_cutoff);
+    let expected_total = union_message_count_since_sql(&source_dbs, None);
+    let expected_hour = union_message_count_since_sql(&source_dbs, Some(hour_cutoff));
+    let expected_day = union_message_count_since_sql(&source_dbs, Some(day_cutoff));
+    let expected_week = union_message_count_since_sql(&source_dbs, Some(week_cutoff));
+    let expected_month = union_message_count_since_sql(&source_dbs, Some(month_cutoff));
+    let expected_year = union_message_count_since_sql(&source_dbs, Some(year_cutoff));
     let sink_db = tmpdir.path().join("sink.db").to_str().unwrap().to_string();
     enable_sync_logging(&sink_db);
     let inherited_env = inherited_tier_env();
     let mut sink_daemon = start_peer(&sink_db, inherited_env, connectivity);
     let sink_received_frames_before = received_event_frames_by_peer_for_db(&sink_db);
+    let sink_recorded_sources_before = received_recorded_events_by_source_for_db(&sink_db);
     let useful_unique_events_before = unique_sync_received_event_count_sql(&sink_db);
     let source_sync_runs_before: Vec<i64> = source_dbs
         .iter()
@@ -595,6 +684,11 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) {
                 .unwrap_or(0)
         })
         .collect();
+    let sink_recorded_sources_after = received_recorded_events_by_source_for_db(&sink_db);
+    let sink_recorded_source_deltas =
+        diff_count_map(&sink_recorded_sources_after, &sink_recorded_sources_before);
+    let source_recorded_events =
+        count_source_tag_events(&sink_recorded_source_deltas, &sources);
     let source_sync_runs_after: Vec<i64> = source_dbs
         .iter()
         .map(|db| changed_sync_run_count(db))
@@ -659,16 +753,24 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) {
 
     stop_daemon(&sink_db, &mut sink_daemon);
     wait_for_daemon_stopped(&sink_db, Duration::from_secs(10));
+
+    BenchOutcome {
+        useful_unique_events,
+        downloader_event_frames,
+        delivery_efficiency,
+        source_recorded_events,
+        active_sources,
+    }
 }
 
-fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) {
+fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) -> BenchOutcome {
     assert!(source_count >= 2, "source_count must be >= 2");
     hold_network_test_lock_for_binary();
     std::env::set_var(
         "TOPO_GENERATE_MESSAGE_SPREAD_MS",
         THREE_YEARS_MS.to_string(),
     );
-    std::env::set_var("TOPO_FORWARD_ON_HAVE", "1");
+    std::env::set_var("TOPO_FORWARD_ON_HAVE", "0");
     std::env::set_var("TOPO_EVENT_TIMELINE", "1");
     std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "persist,projection");
 
@@ -701,11 +803,12 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) {
     let _ = send_message(&rejoiner.db, "warmup-rejoiner");
     wait_for_message_count_all(&all_dbs, warmup_messages, Duration::from_secs(120));
 
-    let baseline_target = warmup_messages + baseline_messages;
+    let all_nodes: Vec<&Node> = sources.iter().chain(std::iter::once(&rejoiner)).collect();
     if baseline_messages > 0 {
-        generate_messages(&sources[0].db, baseline_messages as usize);
-        wait_for_message_count_all(&all_dbs, baseline_target, Duration::from_secs(1200));
+        generate_messages_distributed(&all_nodes, baseline_messages);
     }
+    let baseline_expected_total = union_message_count_since_sql(&all_dbs, None);
+    wait_for_message_count_all(&all_dbs, baseline_expected_total, Duration::from_secs(1200));
 
     let pre_rejoin_endpoint_obs: Vec<i64> = sources
         .iter()
@@ -716,12 +819,13 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) {
     stop_daemon(&rejoiner.db, &mut rejoiner_daemon);
     wait_for_daemon_stopped(&rejoiner.db, Duration::from_secs(10));
 
-    let final_target = warmup_messages + total_messages;
     let delta_messages = total_messages - baseline_messages;
     if delta_messages > 0 {
-        generate_messages(&sources[0].db, delta_messages as usize);
-        wait_for_message_count_all(&source_dbs, final_target, Duration::from_secs(1200));
+        let source_refs: Vec<&Node> = sources.iter().collect();
+        generate_messages_distributed(&source_refs, delta_messages);
     }
+    let source_expected_total = union_message_count_since_sql(&source_dbs, None);
+    wait_for_message_count_all(&source_dbs, source_expected_total, Duration::from_secs(1200));
 
     let measurement_now_ms = current_timestamp_ms();
     let hour_cutoff = measurement_now_ms - HOUR_MS;
@@ -729,13 +833,15 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) {
     let week_cutoff = measurement_now_ms - WEEK_MS;
     let month_cutoff = measurement_now_ms - MONTH_MS;
     let year_cutoff = measurement_now_ms - YEAR_MS;
-    let expected_hour = message_count_since_sql(&sources[0].db, hour_cutoff);
-    let expected_day = message_count_since_sql(&sources[0].db, day_cutoff);
-    let expected_week = message_count_since_sql(&sources[0].db, week_cutoff);
-    let expected_month = message_count_since_sql(&sources[0].db, month_cutoff);
-    let expected_year = message_count_since_sql(&sources[0].db, year_cutoff);
+    let expected_total = union_message_count_since_sql(&source_dbs, None);
+    let expected_hour = union_message_count_since_sql(&source_dbs, Some(hour_cutoff));
+    let expected_day = union_message_count_since_sql(&source_dbs, Some(day_cutoff));
+    let expected_week = union_message_count_since_sql(&source_dbs, Some(week_cutoff));
+    let expected_month = union_message_count_since_sql(&source_dbs, Some(month_cutoff));
+    let expected_year = union_message_count_since_sql(&source_dbs, Some(year_cutoff));
     let useful_unique_events_before = unique_sync_received_event_count_sql(&rejoiner.db);
     let rejoiner_received_frames_before = received_event_frames_by_peer_for_db(&rejoiner.db);
+    let rejoiner_recorded_sources_before = received_recorded_events_by_source_for_db(&rejoiner.db);
     let source_sync_runs_before: Vec<i64> = source_dbs
         .iter()
         .map(|db| changed_sync_run_count(db))
@@ -789,7 +895,7 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) {
         metric_start_ms
     };
     let full_projected_ms =
-        wait_for_message_count(&rejoiner.db, final_target, Duration::from_secs(3600));
+        wait_for_message_count(&rejoiner.db, expected_total, Duration::from_secs(3600));
     let _ = (expected_year, full_projected_ms);
 
     let hour_timing = range_timing_sql(&rejoiner.db, Some(hour_cutoff));
@@ -818,6 +924,13 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) {
                 .unwrap_or(0)
         })
         .collect();
+    let rejoiner_recorded_sources_after = received_recorded_events_by_source_for_db(&rejoiner.db);
+    let rejoiner_recorded_source_deltas = diff_count_map(
+        &rejoiner_recorded_sources_after,
+        &rejoiner_recorded_sources_before,
+    );
+    let source_recorded_events =
+        count_source_tag_events(&rejoiner_recorded_source_deltas, &sources);
     let source_sync_runs_after: Vec<i64> = source_dbs
         .iter()
         .map(|db| changed_sync_run_count(db))
@@ -886,54 +999,101 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) {
         &source_sync_run_deltas,
         &endpoint_obs_counts,
     );
+
+    BenchOutcome {
+        useful_unique_events,
+        downloader_event_frames,
+        delivery_efficiency,
+        source_recorded_events,
+        active_sources,
+    }
 }
 
 #[test]
 #[ignore]
 fn perf_multi_source_cold_join_4x_10k() {
-    run_cold_join_bench(4, ConnectivityMode::BootstrapOnly);
+    let _ = run_cold_join_bench(4, ConnectivityMode::BootstrapOnly);
 }
 
 #[test]
 #[ignore]
 fn perf_multi_source_cold_join_8x_10k() {
-    run_cold_join_bench(8, ConnectivityMode::BootstrapOnly);
+    let _ = run_cold_join_bench(8, ConnectivityMode::BootstrapOnly);
 }
 
 #[test]
 #[ignore]
 fn perf_multi_source_rejoin_4x_10k() {
-    run_rejoin_bench(4, ConnectivityMode::BootstrapOnly);
+    let _ = run_rejoin_bench(4, ConnectivityMode::BootstrapOnly);
 }
 
 #[test]
 #[ignore]
 fn perf_multi_source_rejoin_8x_10k() {
-    run_rejoin_bench(8, ConnectivityMode::BootstrapOnly);
+    let _ = run_rejoin_bench(8, ConnectivityMode::BootstrapOnly);
 }
 
 #[test]
 #[ignore]
 fn perf_multi_source_cold_join_4x_10k_discovery() {
-    run_cold_join_bench(4, ConnectivityMode::DiscoveryLoopback);
+    let _ = run_cold_join_bench(4, ConnectivityMode::DiscoveryLoopback);
 }
 
 #[test]
 #[ignore]
 fn perf_multi_source_cold_join_8x_10k_discovery() {
-    run_cold_join_bench(8, ConnectivityMode::DiscoveryLoopback);
+    let _ = run_cold_join_bench(8, ConnectivityMode::DiscoveryLoopback);
 }
 
 #[test]
 #[ignore]
 fn perf_multi_source_rejoin_4x_10k_discovery() {
-    run_rejoin_bench(4, ConnectivityMode::DiscoveryLoopback);
+    let _ = run_rejoin_bench(4, ConnectivityMode::DiscoveryLoopback);
 }
 
 #[test]
 #[ignore]
 fn perf_multi_source_rejoin_8x_10k_discovery() {
-    run_rejoin_bench(8, ConnectivityMode::DiscoveryLoopback);
+    let _ = run_rejoin_bench(8, ConnectivityMode::DiscoveryLoopback);
+}
+
+#[test]
+#[ignore = "fresh invitees only know the inviter until discovery warms enough to expose the full peer set"]
+fn cold_join_4x_1k_uses_multiple_sources_efficiently() {
+    std::env::set_var("TOPO_MULTI_SOURCE_TOTAL_MESSAGES", "1000");
+    std::env::set_var("TOPO_SYNC_WINDOW_SHAPE", "disjoint");
+    let outcome = run_cold_join_bench(4, ConnectivityMode::DiscoveryLoopback);
+
+    assert!(
+        outcome
+            .source_recorded_events
+            .iter()
+            .filter(|count| **count > 0)
+            .count()
+            >= 2,
+        "expected at least 2 peers to contribute recorded events, got {:?}",
+        outcome.source_recorded_events
+    );
+}
+
+#[test]
+#[ignore = "graph harness provides the stable multi-source proof; daemon rejoin remains diagnostic while discovery/bootstrap convergence is still noisy"]
+fn rejoin_4x_1k_uses_multiple_sources_after_preconvergence() {
+    std::env::set_var("TOPO_MULTI_SOURCE_TOTAL_MESSAGES", "1000");
+    std::env::set_var("TOPO_MULTI_SOURCE_BASELINE_MESSAGES", "500");
+    std::env::set_var("TOPO_SYNC_WINDOW_SHAPE", "disjoint");
+    let outcome = run_rejoin_bench(4, ConnectivityMode::DiscoveryLoopback);
+
+    assert!(
+        outcome.active_sources >= 2,
+        "expected at least 2 peers to contribute after rejoin, got active_sources={} counts={:?}",
+        outcome.active_sources,
+        outcome.source_recorded_events
+    );
+    assert!(
+        outcome.useful_unique_events > 0,
+        "expected rejoiner to ingest new events during rejoin"
+    );
 }
 
 #[test]

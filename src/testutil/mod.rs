@@ -380,6 +380,13 @@ async fn sync_pair_until_transport_converged(
     let b_db = peer_b.db_path.clone();
     let b_identity = peer_b.identity.clone();
     let target_peer_id = current_transport_target(peer_a);
+    let target_peer_id_for_connect = target_peer_id.clone();
+    crate::sync::session::windowing::prime_outbound_window_kind(
+        &peer_b.db_path,
+        &peer_b.identity,
+        &target_peer_id,
+        crate::sync::session::windowing::SyncWindowKind::Full,
+    );
 
     let accept_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
@@ -412,7 +419,7 @@ async fn sync_pair_until_transport_converged(
                 &b_identity,
                 connect_endpoint_thread,
                 accept_addr,
-                &target_peer_id,
+                &target_peer_id_for_connect,
                 None,
                 noop_intro_spawner,
                 test_ingest_fns(),
@@ -451,14 +458,20 @@ async fn sync_pair_until_transport_converged(
     accept_endpoint.close(0u32.into(), b"identity convergence done");
     let _ = accept_handle.join();
     let _ = connect_handle.join();
+    crate::sync::session::windowing::reset_outbound_window_state(
+        &peer_b.db_path,
+        &peer_b.identity,
+        &target_peer_id,
+    );
 }
 
-/// Ensure every peer in one workspace has projected every other peer's current
-/// strict transport target before benchmark/test data generation begins.
+/// Ensure the hub peer and every other peer have projected each other's
+/// current strict transport target before benchmark/test data generation begins.
 ///
-/// This keeps the realism/benchmark harness aligned with exact-target transport:
-/// once message/file traffic starts, the topology helpers should not need to
-/// widen auth or rely on stale/bootstrap aliases just to discover peers.
+/// Under the current exact-target model, a peer does not learn every other
+/// peer's current transport target through a single hub sync. The test harness
+/// only needs the pairwise hub<->peer transport view to be current before it
+/// starts a concrete chain or sink-download topology.
 pub async fn converge_workspace_transport_graph(peers: &[Peer]) {
     crate::state::live_hints::init_forward_on_have_from_env();
     if peers.len() < 2 {
@@ -471,28 +484,21 @@ pub async fn converge_workspace_transport_graph(peers: &[Peer]) {
         );
     }
 
-    let expected_targets: Vec<(String, String)> = peers
-        .iter()
-        .map(|peer| (peer.identity.clone(), current_transport_target(peer)))
-        .collect();
+    let pair_timeout = Duration::from_secs(20 + (peers.len() as u64 * 4));
 
     for peer in peers.iter().skip(1) {
+        let expected_targets = vec![
+            (peers[0].identity.clone(), current_transport_target(&peers[0])),
+            (peer.identity.clone(), current_transport_target(peer)),
+        ];
         sync_pair_until_transport_converged(
             &peers[0],
             peer,
             &expected_targets,
-            Duration::from_secs(30),
+            pair_timeout,
         )
         .await;
     }
-
-    let peer_refs: Vec<&Peer> = peers.iter().collect();
-    let missing = missing_transport_views(&peer_refs, &expected_targets);
-    assert!(
-        missing.is_empty(),
-        "workspace transport graph not fully converged after hub fanout: {:?}",
-        missing
-    );
 }
 
 /// Open a lightweight connection for polling counts during active sync.
@@ -3049,14 +3055,38 @@ where
     }
 }
 
+pub struct ChainHandles {
+    pub thread_handles: Vec<std::thread::JoinHandle<()>>,
+    pub endpoints: Vec<quinn::Endpoint>,
+    pub connect_shutdowns: Vec<tokio_util::sync::CancellationToken>,
+}
+
+impl ChainHandles {
+    pub fn shutdown(&mut self) {
+        for shutdown in &self.connect_shutdowns {
+            shutdown.cancel();
+        }
+        for endpoint in &self.endpoints {
+            endpoint.close(0u32.into(), b"test-chain-shutdown");
+        }
+        while let Some(handle) = self.thread_handles.pop() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for ChainHandles {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
 /// Start a chain topology: P0 <-> P1 <-> ... <-> P_{n-1}.
 ///
 /// Each adjacent pair has a bidirectional sync link:
 /// - P_i runs accept_loop (server) for P_{i+1}
 /// - P_{i+1} runs connect_loop (client) to P_i
-///
-/// Returns thread handles for all accept and connect loops.
-pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
+pub fn start_chain(peers: &[Peer]) -> ChainHandles {
     crate::state::live_hints::init_forward_on_have_from_env();
     use crate::db::transport_trust::is_authorized_for_tenant;
 
@@ -3105,9 +3135,11 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
     }
 
     let mut handles = Vec::new();
+    let mut endpoints = Vec::new();
 
     // Spawn accept_loop for peers 0..n-2
     for (i, endpoint) in server_endpoints.into_iter().enumerate() {
+        endpoints.push(endpoint.clone());
         let db_path = peers[i].db_path.clone();
         let identity = peers[i].identity.clone();
         handles.push(std::thread::spawn(move || {
@@ -3132,19 +3164,23 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
     }
 
     // Spawn connect_loop for peers 1..n-1
+    let mut connect_shutdowns = Vec::new();
     for (idx, endpoint) in client_endpoints.into_iter().enumerate() {
         let i = idx + 1;
         let db_path = peers[i].db_path.clone();
         let identity = peers[i].identity.clone();
         let remote = server_addrs[idx];
         let target_peer_id = current_transport_target(&peers[idx]);
+        let shutdown = tokio_util::sync::CancellationToken::new();
+        connect_shutdowns.push(shutdown.clone());
+        endpoints.push(endpoint.clone());
         handles.push(std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = connect_loop(
+                if let Err(e) = connect_loop_with_coordination_until_cancel(
                     &db_path,
                     &identity,
                     endpoint,
@@ -3153,6 +3189,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
                     None,
                     noop_intro_spawner,
                     test_ingest_fns(),
+                    shutdown,
                 )
                 .await
                 {
@@ -3162,7 +3199,11 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
         }));
     }
 
-    handles
+    ChainHandles {
+        thread_handles: handles,
+        endpoints,
+        connect_shutdowns,
+    }
 }
 
 /// Start a sink-driven download topology: sink connects to all sources.
@@ -3170,9 +3211,7 @@ pub fn start_chain(peers: &[Peer]) -> Vec<std::thread::JoinHandle<()>> {
 /// Each source runs accept_loop (responder). The sink runs one
 /// `connect_loop` per source, matching the production runtime path used by
 /// bootstrap/mDNS autodial.
-///
-/// Returns thread handles for all source accept_loops and sink connect loops.
-pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::JoinHandle<()>> {
+pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> SinkDownloadHandles {
     crate::state::live_hints::init_forward_on_have_from_env();
     assert!(!sources.is_empty(), "need at least one source");
     for source in sources {
@@ -3186,9 +3225,9 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
 
     let mut handles = Vec::new();
     let mut source_addrs = Vec::new();
+    let mut source_endpoints = Vec::new();
     let sink_spki = sink.spki_fingerprint();
 
-    // Start accept_loop for each source with explicit sink trust.
     for source in sources {
         let (cert, key) = source.cert_and_key();
         let trusted_sink_spki = sink_spki;
@@ -3201,6 +3240,7 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
             .local_addr()
             .expect("failed to get source addr");
         source_addrs.push(addr);
+        source_endpoints.push(server_endpoint.clone());
 
         let db_path = source.db_path.clone();
         let identity = source.identity.clone();
@@ -3225,9 +3265,8 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
         }));
     }
 
-    // Build per-source client endpoints for the sink with explicit source trust.
-    // These are driven by coordinated connect loops (runtime-faithful path).
     let mut sink_connectors = Vec::new();
+    let mut client_endpoints: Vec<crate::transport::TransportEndpoint> = Vec::new();
     for (i, source) in sources.iter().enumerate() {
         let trusted_source_spki = source.spki_fingerprint();
         let allow_fn: Arc<crate::transport::DynamicAllowFn> =
@@ -3239,7 +3278,7 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
             allow_fn,
         )
         .expect("failed to create sink client endpoint");
-
+        client_endpoints.push(client_endpoint.clone());
         sink_connectors.push((
             client_endpoint,
             source_addrs[i],
@@ -3271,7 +3310,12 @@ pub fn start_sink_download(sources: &[Peer], sink: &Peer) -> Vec<std::thread::Jo
         }));
     }
 
-    handles
+    SinkDownloadHandles {
+        thread_handles: handles,
+        source_endpoints,
+        client_endpoints,
+        connect_shutdowns: Vec::new(),
+    }
 }
 
 /// Handles from a sink-driven download topology with per-source shutdown control.
@@ -3279,6 +3323,8 @@ pub struct SinkDownloadHandles {
     pub thread_handles: Vec<std::thread::JoinHandle<()>>,
     /// Source server endpoints (cloned); close to simulate source failure.
     pub source_endpoints: Vec<crate::transport::TransportEndpoint>,
+    /// Sink-side client endpoints; close to terminate ordinary connect loops.
+    pub client_endpoints: Vec<crate::transport::TransportEndpoint>,
     /// Per-connect-loop cancellation tokens; cancel to stop a sink's connect loop.
     pub connect_shutdowns: Vec<tokio_util::sync::CancellationToken>,
 }
@@ -3290,11 +3336,33 @@ impl SinkDownloadHandles {
         self.source_endpoints[idx].close(0u32.into(), b"test-shutdown");
         self.connect_shutdowns[idx].cancel();
     }
+
+    pub fn shutdown(&mut self) {
+        for endpoint in &self.source_endpoints {
+            endpoint.close(0u32.into(), b"test-download-shutdown");
+        }
+        for endpoint in &self.client_endpoints {
+            endpoint.close(0u32.into(), b"test-download-shutdown");
+        }
+        for shutdown in &self.connect_shutdowns {
+            shutdown.cancel();
+        }
+        while let Some(handle) = self.thread_handles.pop() {
+            let _ = handle.join();
+        }
+    }
+}
+
+impl Drop for SinkDownloadHandles {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
 }
 
 /// Like [`start_sink_download`] but returns [`SinkDownloadHandles`] with
 /// per-source shutdown control for simulating peer dropout.
 pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkDownloadHandles {
+    crate::state::live_hints::init_forward_on_have_from_env();
     assert!(!sources.is_empty(), "need at least one source");
     for source in sources {
         assert_eq!(
@@ -3308,6 +3376,7 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
     let mut handles = Vec::new();
     let mut source_addrs = Vec::new();
     let mut source_endpoints = Vec::new();
+    let mut client_endpoints = Vec::new();
     let sink_spki = sink.spki_fingerprint();
 
     // Start accept_loop for each source with explicit sink trust.
@@ -3349,6 +3418,7 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
     }
 
     // Build per-source client endpoints for the sink with explicit source trust.
+    // These are driven by coordinated connect loops (runtime-faithful path).
     let mut sink_connectors = Vec::new();
     for (i, source) in sources.iter().enumerate() {
         let trusted_source_spki = source.spki_fingerprint();
@@ -3361,6 +3431,7 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
             allow_fn,
         )
         .expect("failed to create sink client endpoint");
+        client_endpoints.push(client_endpoint.clone());
 
         sink_connectors.push((
             client_endpoint,
@@ -3396,10 +3467,10 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
             });
         }));
     }
-
     SinkDownloadHandles {
         thread_handles: handles,
         source_endpoints,
+        client_endpoints,
         connect_shutdowns,
     }
 }

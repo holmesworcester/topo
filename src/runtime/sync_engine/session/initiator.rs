@@ -9,6 +9,7 @@ use crate::db::{
 };
 use crate::protocol::{neg_id_to_event_id, Frame};
 use crate::runtime::SyncStats;
+use crate::runtime::peering::loops::live_connection_peer_ids;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::range_session::{
     load_range_storage, send_have_events, spawn_receive_log_task,
@@ -113,7 +114,14 @@ where
             recorded_by
         )
     })?;
-    let range = select_outbound_window(db_path, peer_id, crate::db::queue::current_timestamp_ms());
+    let live_peer_ids = live_connection_peer_ids(db_path, recorded_by);
+    let range = select_outbound_window(
+        db_path,
+        recorded_by,
+        peer_id,
+        &live_peer_ids,
+        crate::db::queue::current_timestamp_ms(),
+    );
     let storage = load_range_storage(&db, &ws_id, range)?;
     let mut neg = Negentropy::borrowed(&storage, crate::sync::session::negentropy_frame_size())?;
     let initial_msg = encode_initial_neg_open(range, neg.initiate()?);
@@ -177,7 +185,7 @@ where
     drain_manual_commands(peer_id, &mut command_rx, &mut pending_round_replies);
     reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);
 
-    let _ = mark_outbound_window_completed(db_path, peer_id, range);
+    let _ = mark_outbound_window_completed(db_path, recorded_by, peer_id, range);
 
     Ok(SyncStats {
         events_sent,
