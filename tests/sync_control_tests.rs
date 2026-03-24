@@ -185,10 +185,10 @@ async fn registry_session_deregisters_on_drop() {
         // While session is alive, wrong prefix should fail
         let result = registry.trigger_round_for_peer("tenant1", "zzzz");
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("no live initiator session"));
+        assert!(result.unwrap_err().contains("no live session"));
     }
     // After drop, correct prefix should also fail (session was deregistered)
     let result = registry.trigger_round_for_peer("tenant1", "abcd");
     assert!(result.is_err());
-    assert!(result.unwrap_err().contains("no live initiator session"));
+    assert!(result.unwrap_err().contains("no live session"));
 }

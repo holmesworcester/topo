@@ -20,7 +20,6 @@ struct BootstrapChain {
     device_invite_eid: [u8; 32],
     peer_shared_key: ed25519_dalek::SigningKey,
     peer_shared_eid: [u8; 32],
-    admin_key: ed25519_dalek::SigningKey,
     admin_eid: [u8; 32],
     invite_accepted_eid: [u8; 32],
 }
@@ -66,9 +65,7 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
     );
 
     // 7. Admin (signed by workspace, dep on user)
-    let admin_key = SigningKey::generate(&mut rng);
-    let admin_pubkey = admin_key.verifying_key().to_bytes();
-    let admin_eid = peer.create_admin(admin_pubkey, &workspace_key, &user_eid, &workspace_eid);
+    let admin_eid = peer.create_admin(user_pubkey, &workspace_key, &user_eid, &workspace_eid);
 
     BootstrapChain {
         workspace_key,
@@ -82,7 +79,6 @@ fn bootstrap_peer(peer: &Peer) -> BootstrapChain {
         device_invite_eid,
         peer_shared_key,
         peer_shared_eid,
-        admin_key,
         admin_eid,
         invite_accepted_eid,
     }

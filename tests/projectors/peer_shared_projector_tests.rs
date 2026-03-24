@@ -3,8 +3,8 @@
 //! TLA+ guards tested:
 //!   SPEC_PEER_SHARED_TRUST_01 — InvPeerSharedTrustSource (valid insert)
 //!   SPEC_PEER_SHARED_TRUST_02 — InvPeerSharedTrustMatchesCarried (correct fields)
-//!   SPEC_BOOTSTRAP_CONSUMED_01 — InvBootstrapConsumedByPeerShared (write-time delete)
-//!   SPEC_PENDING_CONSUMED_01 — InvPendingBootstrapTrustConsumedByPeerShared (write-time delete)
+//! Bootstrap trust consumption is no longer a pure-projector write effect here.
+//! That tenant-scoped behavior is covered in projection/apply tests.
 
 #[cfg(test)]
 mod tests {
@@ -116,43 +116,39 @@ mod tests {
     }
 
     #[test]
-    fn test_peer_shared_consumption_deletes_are_scoped_to_recorded_by() {
+    fn test_peer_shared_write_is_scoped_to_recorded_by() {
         let recorded_by = "tenant_b";
         let pk = [9u8; 32];
-        let transport_fingerprint = spki_fingerprint_from_ed25519_pubkey(&pk);
         let parsed = make_peer_shared(pk, [8u8; 32]);
         let event_id = b64(&[25u8; 32]);
 
         let result = project_pure(recorded_by, &event_id, &parsed, &empty_ctx());
         assert_valid(&result);
 
-        for table in ["pending_invite_bootstrap_trust", "invite_bootstrap_trust"] {
-            let delete = result
-                .write_ops
-                .iter()
-                .find(|op| matches!(op, WriteOp::Delete { table: t, .. } if *t == table));
-            let Some(WriteOp::Delete { where_clause, .. }) = delete else {
-                panic!("expected delete from {table}, got {:?}", result.write_ops);
-            };
-            assert!(
-                where_clause.contains(&("recorded_by", SqlVal::Text(recorded_by.to_string()))),
-                "delete for {table} must be tenant-scoped: {:?}",
-                where_clause
-            );
+        let insert = result.write_ops.iter().find(|op| {
+            matches!(
+                op,
+                WriteOp::InsertOrIgnore {
+                    table: "peers_shared",
+                    ..
+                }
+            )
+        });
+        let Some(WriteOp::InsertOrIgnore {
+            columns, values, ..
+        }) = insert
+        else {
+            panic!("expected peers_shared insert, got {:?}", result.write_ops);
+        };
 
-            let expected_fp_column = if table == "pending_invite_bootstrap_trust" {
-                "expected_bootstrap_spki_fingerprint"
-            } else {
-                "bootstrap_spki_fingerprint"
-            };
-            assert!(
-                where_clause.contains(&(
-                    expected_fp_column,
-                    SqlVal::Blob(transport_fingerprint.to_vec())
-                )),
-                "delete for {table} must match the carried transport fingerprint: {:?}",
-                where_clause
-            );
-        }
+        let recorded_by_idx = columns.iter().position(|c| *c == "recorded_by").unwrap();
+        assert_eq!(
+            values[recorded_by_idx],
+            SqlVal::Text(recorded_by.to_string()),
+            "peers_shared write must stay tenant-scoped"
+        );
+
+        assert_no_write_to_table(&result, "pending_invite_bootstrap_trust");
+        assert_no_write_to_table(&result, "invite_bootstrap_trust");
     }
 }

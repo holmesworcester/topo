@@ -14,6 +14,24 @@ use topo::transport::{
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
 
+async fn recv_data_frame(
+    recv: &mut dyn topo::contracts::peering_contract::DataRecvIo,
+) -> TestResult<Frame> {
+    let mut buffered = Vec::new();
+    loop {
+        let chunk = recv.recv().await?;
+        buffered.extend_from_slice(&chunk);
+        match parse_frame(&buffered) {
+            Ok((frame, consumed)) if consumed == buffered.len() => return Ok(frame),
+            Ok((_frame, _consumed)) => {
+                return Err("unexpected trailing bytes after decoded data frame".into())
+            }
+            Err(topo::protocol::ParseError::InsufficientData) => {}
+            Err(err) => return Err(Box::new(err)),
+        }
+    }
+}
+
 struct ConnectedProviders {
     _server_ep: topo::transport::TransportEndpoint,
     server_provider: SessionProvider,
@@ -131,8 +149,8 @@ async fn exercise_roundtrip_sessions(
         });
         client_parts.data_send.send(&event).await?;
         client_parts.data_send.flush().await?;
-        let received = server_parts.data_recv.recv().await?;
-        assert_eq!(parse_frame(&received)?.0, Frame::Event { blob: payload });
+        let received = recv_data_frame(server_parts.data_recv.as_mut()).await?;
+        assert_eq!(received, Frame::Event { blob: payload });
     }
     Ok(())
 }
