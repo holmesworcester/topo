@@ -95,7 +95,9 @@ impl SessionProvider {
                 let (session_id, io) = open_session_io(&self.connection).await?;
                 (session_id, SessionClass::Range, io)
             }
-            SessionOpenMode::Inbound => accept_session_io(&self.connection, &self.inbound_state).await?,
+            SessionOpenMode::Inbound => {
+                accept_session_io(&self.connection, &self.inbound_state).await?
+            }
         };
         Ok(SessionEnvelope {
             peer_id: self.peer_id.clone(),

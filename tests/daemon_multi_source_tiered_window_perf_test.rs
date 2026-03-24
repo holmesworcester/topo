@@ -178,10 +178,22 @@ fn elapsed_secs(metric_start_ms: i64, ts_ms: Option<i64>) -> f64 {
 
 fn wait_for_message_count(db: &str, expected: i64, timeout: Duration) -> i64 {
     let start = Instant::now();
+    let mut last_count = -1;
+    let mut stable_since = None;
     loop {
         let count = total_message_count_sql(db);
         if count >= expected {
             return current_timestamp_ms();
+        }
+        if count == last_count {
+            let since = stable_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_secs(2) {
+                trigger_sync_round_all(db);
+                stable_since = None;
+            }
+        } else {
+            last_count = count;
+            stable_since = None;
         }
         assert!(
             start.elapsed() < timeout,
@@ -197,10 +209,22 @@ fn wait_for_message_count(db: &str, expected: i64, timeout: Duration) -> i64 {
 
 fn wait_for_message_count_since(db: &str, cutoff_ms: i64, expected: i64, timeout: Duration) -> i64 {
     let start = Instant::now();
+    let mut last_count = -1;
+    let mut stable_since = None;
     loop {
         let count = message_count_since_sql(db, cutoff_ms);
         if count >= expected {
             return current_timestamp_ms();
+        }
+        if count == last_count {
+            let since = stable_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_secs(2) {
+                trigger_sync_round_all(db);
+                stable_since = None;
+            }
+        } else {
+            last_count = count;
+            stable_since = None;
         }
         assert!(
             start.elapsed() < timeout,
@@ -217,10 +241,24 @@ fn wait_for_message_count_since(db: &str, cutoff_ms: i64, expected: i64, timeout
 
 fn wait_for_message_count_all(dbs: &[String], expected: i64, timeout: Duration) {
     let start = Instant::now();
+    let mut last_counts = Vec::<i64>::new();
+    let mut stable_since = None;
     loop {
         let counts: Vec<i64> = dbs.iter().map(|db| total_message_count_sql(db)).collect();
         if counts.iter().all(|count| *count >= expected) {
             return;
+        }
+        if counts == last_counts {
+            let since = stable_since.get_or_insert_with(Instant::now);
+            if since.elapsed() >= Duration::from_secs(2) {
+                for db in dbs {
+                    trigger_sync_round_all(db);
+                }
+                stable_since = None;
+            }
+        } else {
+            last_counts = counts.clone();
+            stable_since = None;
         }
         assert!(
             start.elapsed() < timeout,
@@ -233,29 +271,26 @@ fn wait_for_message_count_all(dbs: &[String], expected: i64, timeout: Duration) 
     }
 }
 
-fn received_event_frames_by_peer_for_conn(conn: &rusqlite::Connection) -> HashMap<String, i64> {
+fn received_events_by_peer_for_conn(conn: &rusqlite::Connection) -> HashMap<String, i64> {
     let mut stmt = conn
         .prepare(
-            "SELECT r.peer_id, COUNT(*)
-             FROM sync_run_events e
-             JOIN sync_runs r ON r.run_id = e.run_id
-             WHERE e.lane = 'data'
-               AND e.direction = 'rx'
-               AND e.frame_type = 'Event'
-             GROUP BY r.peer_id",
+            "SELECT peer_id, COALESCE(SUM(events_received), 0)
+             FROM sync_runs
+             WHERE events_received > 0
+             GROUP BY peer_id",
         )
-        .expect("prepare downloader receive query");
+        .expect("prepare downloader received events query");
     stmt.query_map([], |row| {
         Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
     })
-    .expect("query downloader receive rows")
+    .expect("query downloader received events rows")
     .collect::<Result<HashMap<_, _>, _>>()
-    .expect("collect downloader receive rows")
+    .expect("collect downloader received events rows")
 }
 
-fn received_event_frames_by_peer_for_db(db: &str) -> HashMap<String, i64> {
+fn received_events_by_peer_for_db(db: &str) -> HashMap<String, i64> {
     let conn = topo::db::open_connection(db).expect("open db for downloader receive rows");
-    received_event_frames_by_peer_for_conn(&conn)
+    received_events_by_peer_for_conn(&conn)
 }
 
 fn diff_count_map(
@@ -295,10 +330,7 @@ fn received_recorded_events_by_source_for_db(db: &str) -> HashMap<String, i64> {
     .expect("collect recorded source rows")
 }
 
-fn count_source_tag_events(
-    source_counts: &HashMap<String, i64>,
-    sources: &[Node],
-) -> Vec<i64> {
+fn count_source_tag_events(source_counts: &HashMap<String, i64>, sources: &[Node]) -> Vec<i64> {
     sources
         .iter()
         .map(|source| {
@@ -340,10 +372,15 @@ fn endpoint_observation_count(db: &str, remote_peer_id: &str) -> i64 {
 
 fn unique_sync_received_event_count_sql(db: &str) -> i64 {
     let conn = topo::db::open_connection(db).expect("open db for sync received event count");
+    let Some(peer_id) = active_tenant_peer_id(db) else {
+        return 0;
+    };
     conn.query_row(
         "SELECT COUNT(DISTINCT event_id)
-         FROM sync_run_rx_events",
-        [],
+         FROM recorded_events
+         WHERE peer_id = ?1
+           AND source LIKE 'quic_recv:%'",
+        rusqlite::params![peer_id],
         |row| row.get(0),
     )
     .unwrap_or(0)
@@ -351,10 +388,10 @@ fn unique_sync_received_event_count_sql(db: &str) -> i64 {
 
 fn wait_for_downloader_receives_stable(db: &str, timeout: Duration, stable_for: Duration) {
     let start = Instant::now();
-    let mut last: i64 = received_event_frames_by_peer_for_db(db).values().sum();
+    let mut last: i64 = received_events_by_peer_for_db(db).values().sum();
     let mut stable_since = None;
     loop {
-        let current: i64 = received_event_frames_by_peer_for_db(db).values().sum();
+        let current: i64 = received_events_by_peer_for_db(db).values().sum();
         if current == last {
             let since = stable_since.get_or_insert_with(Instant::now);
             if since.elapsed() >= stable_for {
@@ -371,6 +408,17 @@ fn wait_for_downloader_receives_stable(db: &str, timeout: Duration, stable_for: 
             current
         );
         thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn trigger_sync_round_all(db: &str) {
+    let out = topo_cmd(db, &["sync", "round", "all"]);
+    if !out.status.success() {
+        eprintln!(
+            "  note: sync round all failed for {}: {}",
+            db,
+            String::from_utf8_lossy(&out.stderr)
+        );
     }
 }
 
@@ -579,7 +627,11 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) -> B
     let source_refs: Vec<&Node> = sources.iter().collect();
     generate_messages_distributed(&source_refs, total_messages);
     let source_expected_total = union_message_count_since_sql(&source_dbs, None);
-    wait_for_message_count_all(&source_dbs, source_expected_total, Duration::from_secs(1200));
+    wait_for_message_count_all(
+        &source_dbs,
+        source_expected_total,
+        Duration::from_secs(1200),
+    );
 
     let measurement_now_ms = current_timestamp_ms();
     let day_cutoff = measurement_now_ms - DAY_MS;
@@ -593,7 +645,7 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) -> B
     enable_sync_logging(&sink_db);
     let inherited_env = inherited_tier_env();
     let mut sink_daemon = start_peer(&sink_db, inherited_env, connectivity);
-    let sink_received_frames_before = received_event_frames_by_peer_for_db(&sink_db);
+    let sink_received_frames_before = received_events_by_peer_for_db(&sink_db);
     let sink_recorded_sources_before = received_recorded_events_by_source_for_db(&sink_db);
     let useful_unique_events_before = unique_sync_received_event_count_sql(&sink_db);
     let source_sync_runs_before: Vec<i64> = source_dbs
@@ -647,8 +699,7 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) -> B
 
     let day_timing = range_timing_sql(&sink_db, Some(day_cutoff));
     let week_timing = range_timing_sql(&sink_db, Some(week_cutoff));
-    let twelve_week_timing =
-        range_timing_sql(&sink_db, Some(measurement_now_ms - TWELVE_WEEK_MS));
+    let twelve_week_timing = range_timing_sql(&sink_db, Some(measurement_now_ms - TWELVE_WEEK_MS));
     let all_timing = range_timing_sql(&sink_db, None);
 
     wait_for_downloader_receives_stable(
@@ -656,7 +707,7 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) -> B
         Duration::from_secs(60),
         Duration::from_millis(500),
     );
-    let sink_received_frames_after = received_event_frames_by_peer_for_db(&sink_db);
+    let sink_received_frames_after = received_events_by_peer_for_db(&sink_db);
     let sink_received_frame_deltas =
         diff_count_map(&sink_received_frames_after, &sink_received_frames_before);
     let source_event_frames: Vec<i64> = sources
@@ -671,8 +722,7 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) -> B
     let sink_recorded_sources_after = received_recorded_events_by_source_for_db(&sink_db);
     let sink_recorded_source_deltas =
         diff_count_map(&sink_recorded_sources_after, &sink_recorded_sources_before);
-    let source_recorded_events =
-        count_source_tag_events(&sink_recorded_source_deltas, &sources);
+    let source_recorded_events = count_source_tag_events(&sink_recorded_source_deltas, &sources);
     let source_sync_runs_after: Vec<i64> = source_dbs
         .iter()
         .map(|db| changed_sync_run_count(db))
@@ -807,7 +857,11 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) -> Benc
         generate_messages_distributed(&source_refs, delta_messages);
     }
     let source_expected_total = union_message_count_since_sql(&source_dbs, None);
-    wait_for_message_count_all(&source_dbs, source_expected_total, Duration::from_secs(1200));
+    wait_for_message_count_all(
+        &source_dbs,
+        source_expected_total,
+        Duration::from_secs(1200),
+    );
 
     let measurement_now_ms = current_timestamp_ms();
     let day_cutoff = measurement_now_ms - DAY_MS;
@@ -818,7 +872,7 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) -> Benc
     let expected_twelve_weeks =
         union_message_count_since_sql(&source_dbs, Some(measurement_now_ms - TWELVE_WEEK_MS));
     let useful_unique_events_before = unique_sync_received_event_count_sql(&rejoiner.db);
-    let rejoiner_received_frames_before = received_event_frames_by_peer_for_db(&rejoiner.db);
+    let rejoiner_received_frames_before = received_events_by_peer_for_db(&rejoiner.db);
     let rejoiner_recorded_sources_before = received_recorded_events_by_source_for_db(&rejoiner.db);
     let source_sync_runs_before: Vec<i64> = source_dbs
         .iter()
@@ -877,7 +931,7 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) -> Benc
         Duration::from_secs(60),
         Duration::from_millis(500),
     );
-    let rejoiner_received_frames_after = received_event_frames_by_peer_for_db(&rejoiner.db);
+    let rejoiner_received_frames_after = received_events_by_peer_for_db(&rejoiner.db);
     let rejoiner_received_frame_deltas = diff_count_map(
         &rejoiner_received_frames_after,
         &rejoiner_received_frames_before,
@@ -1062,7 +1116,7 @@ fn rejoin_4x_1k_uses_multiple_sources_after_preconvergence() {
 }
 
 #[test]
-fn downloader_receive_metric_counts_frames_by_remote_peer() {
+fn downloader_receive_metric_counts_events_by_remote_peer() {
     use topo::db::sync_log::ensure_schema;
 
     let tmpdir = tempfile::tempdir().expect("tempdir");
@@ -1076,26 +1130,14 @@ fn downloader_receive_metric_counts_frames_by_remote_peer() {
          (run_id, started_at_ms, ended_at_ms, session_id, tenant_id, peer_id, direction, remote_addr, role,
           rounds, events_sent, events_received, bytes_sent, bytes_received, changed, outcome, error)
          VALUES
-         (1, 1, 2, 1, 'tenant', 'sink-peer', 'outbound', '127.0.0.1:1', 'initiator', 1, 2, 0, 20, 0, 1, 'ok', NULL),
-         (2, 3, 4, 2, 'tenant', 'other-peer', 'outbound', '127.0.0.1:2', 'initiator', 1, 3, 0, 30, 0, 1, 'ok', NULL)",
+         (1, 1, 2, 1, 'tenant', 'sink-peer', 'outbound', '127.0.0.1:1', 'initiator', 1, 2, 2, 20, 20, 1, 'ok', NULL),
+         (2, 3, 4, 2, 'tenant', 'other-peer', 'outbound', '127.0.0.1:2', 'initiator', 1, 3, 3, 30, 30, 1, 'ok', NULL)",
         [],
     )
     .expect("insert sync_runs");
-    conn.execute(
-        "INSERT INTO sync_run_events
-         (run_id, seq, ts_ms, lane, direction, frame_type, msg_len, detail_json)
-         VALUES
-         (1, 1, 11, 'data', 'rx', 'Event', 10, NULL),
-         (1, 2, 12, 'data', 'rx', 'Event', 10, NULL),
-         (2, 1, 13, 'data', 'rx', 'Event', 10, NULL),
-         (2, 2, 14, 'data', 'rx', 'Event', 10, NULL),
-         (2, 3, 15, 'data', 'rx', 'Event', 10, NULL)",
-        [],
-    )
-    .expect("insert sync_run_events");
 
-    let from_conn = received_event_frames_by_peer_for_conn(&conn);
-    let from_db = received_event_frames_by_peer_for_db(db_path_str);
+    let from_conn = received_events_by_peer_for_conn(&conn);
+    let from_db = received_events_by_peer_for_db(db_path_str);
 
     assert_eq!(from_conn.get("sink-peer").copied(), Some(2));
     assert_eq!(from_conn.get("other-peer").copied(), Some(3));

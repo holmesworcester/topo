@@ -239,13 +239,8 @@ pub async fn handle_intro_offer(
                 }
 
                 // Run normal sync on the direct connection
-                run_sync_on_punched_connection(
-                    provider,
-                    db_path,
-                    recorded_by,
-                    &other_peer_hex,
-                )
-                .await;
+                run_sync_on_punched_connection(provider, db_path, recorded_by, &other_peer_hex)
+                    .await;
                 return;
             }
             Ok(Err(e)) => {

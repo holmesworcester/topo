@@ -352,17 +352,13 @@ mod tests {
         conn.execute(
             "INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
              VALUES (?1, ?2, 1, ?3)",
-            rusqlite::params![
-                "tenant-a",
-                &blocked_b64,
-                "quic_recv:peer-z@127.0.0.1:7777"
-            ],
+            rusqlite::params!["tenant-a", &blocked_b64, "quic_recv:peer-z@127.0.0.1:7777"],
         )
         .unwrap();
 
         let (mut rx, _guard) = dependency_fetch::register(&db_path, "tenant-a", "peer-z");
-        let decision = check_deps_and_block(&conn, "tenant-a", &blocked_b64, &[("dep", missing)])
-            .unwrap();
+        let decision =
+            check_deps_and_block(&conn, "tenant-a", &blocked_b64, &[("dep", missing)]).unwrap();
         assert!(matches!(decision, Some(ProjectionDecision::Block { .. })));
         assert_eq!(rx.recv().await, Some(vec![missing]));
     }
@@ -381,12 +377,14 @@ mod tests {
         .unwrap();
 
         let (mut rx, _guard) = dependency_fetch::register(&db_path, "tenant-a", "peer-z");
-        let decision = check_deps_and_block(&conn, "tenant-a", &blocked_b64, &[("dep", missing)])
-            .unwrap();
+        let decision =
+            check_deps_and_block(&conn, "tenant-a", &blocked_b64, &[("dep", missing)]).unwrap();
         assert!(matches!(decision, Some(ProjectionDecision::Block { .. })));
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), rx.recv())
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), rx.recv())
+                .await
+                .is_err()
+        );
     }
 }
 

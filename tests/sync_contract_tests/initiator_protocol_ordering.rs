@@ -63,7 +63,9 @@ async fn initiator_outbound_starts_with_negopen_then_ends_control_phase() {
             .expect("expected control terminator");
         assert_eq!(frame, Frame::NegMsg { msg: Vec::new() });
 
-        let no_second_round = peer.recv_control_msg_timeout(Duration::from_millis(250)).await;
+        let no_second_round = peer
+            .recv_control_msg_timeout(Duration::from_millis(250))
+            .await;
         assert!(
             no_second_round.is_none(),
             "expected no second NegOpen on the same session, got {:?}",

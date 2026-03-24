@@ -212,7 +212,12 @@ fn partition_window_bounds(window: SyncWindow, now_ms: i64) -> Option<(i64, i64)
     (start < end).then_some((start, end))
 }
 
-fn partition_window(window: SyncWindow, peer_rank: usize, peer_count: usize, now_ms: i64) -> SyncWindow {
+fn partition_window(
+    window: SyncWindow,
+    peer_rank: usize,
+    peer_count: usize,
+    now_ms: i64,
+) -> SyncWindow {
     if peer_count <= 1 {
         return window;
     }
@@ -360,13 +365,8 @@ mod tests {
 
         let kinds: Vec<SyncWindowKind> = (0..8)
             .map(|_| {
-                let window = select_outbound_window(
-                    db_path,
-                    recorded_by,
-                    peer_id,
-                    &live_peers,
-                    1_000_000,
-                );
+                let window =
+                    select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 1_000_000);
                 let kind = window.kind;
                 mark_outbound_window_completed(db_path, recorded_by, peer_id, window);
                 kind
@@ -426,20 +426,8 @@ mod tests {
         reset_outbound_window_state(db_path, recorded_by, peer_a);
         reset_outbound_window_state(db_path, recorded_by, peer_b);
 
-        let day_a = select_outbound_window(
-            db_path,
-            recorded_by,
-            peer_a,
-            &live_peers,
-            1_000_000,
-        );
-        let day_b = select_outbound_window(
-            db_path,
-            recorded_by,
-            peer_b,
-            &live_peers,
-            1_000_000,
-        );
+        let day_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
+        let day_b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
         assert_eq!(day_a, day_b);
     }
 
@@ -453,21 +441,9 @@ mod tests {
         let live_peers = vec![peer_id.to_string()];
         reset_outbound_window_state(db_path, recorded_by, peer_id);
 
-        let day = select_outbound_window(
-            db_path,
-            recorded_by,
-            peer_id,
-            &live_peers,
-            1_000_000,
-        );
+        let day = select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 1_000_000);
         mark_outbound_window_completed(db_path, recorded_by, peer_id, day);
-        let week = select_outbound_window(
-            db_path,
-            recorded_by,
-            peer_id,
-            &live_peers,
-            2_000_000,
-        );
+        let week = select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 2_000_000);
 
         assert_eq!(day.kind, SyncWindowKind::LastDay);
         assert_eq!(week.kind, SyncWindowKind::LastWeek);
@@ -487,38 +463,14 @@ mod tests {
         reset_outbound_window_state(db_path, recorded_by, peer_b);
 
         for _ in 0..1 {
-            let a = select_outbound_window(
-                db_path,
-                recorded_by,
-                peer_a,
-                &live_peers,
-                1_000_000,
-            );
-            let b = select_outbound_window(
-                db_path,
-                recorded_by,
-                peer_b,
-                &live_peers,
-                1_000_000,
-            );
+            let a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
+            let b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
             mark_outbound_window_completed(db_path, recorded_by, peer_a, a);
             mark_outbound_window_completed(db_path, recorded_by, peer_b, b);
         }
 
-        let week_a = select_outbound_window(
-            db_path,
-            recorded_by,
-            peer_a,
-            &live_peers,
-            1_000_000,
-        );
-        let week_b = select_outbound_window(
-            db_path,
-            recorded_by,
-            peer_b,
-            &live_peers,
-            1_000_000,
-        );
+        let week_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
+        let week_b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
 
         assert_eq!(week_a.kind, SyncWindowKind::LastWeek);
         assert_eq!(week_b.kind, SyncWindowKind::LastWeek);
@@ -595,8 +547,7 @@ mod tests {
 
         for peer in &peers {
             for _ in 0..3 {
-                let window =
-                    select_outbound_window(db_path, recorded_by, peer, &peers, now_ms);
+                let window = select_outbound_window(db_path, recorded_by, peer, &peers, now_ms);
                 mark_outbound_window_completed(db_path, recorded_by, peer, window);
             }
         }
@@ -609,7 +560,10 @@ mod tests {
 
         assert_eq!(full_windows.len(), 4);
         assert_eq!(full_windows[0].ts_min(), Some(ALL_START_MS));
-        assert_eq!(full_windows[3].ts_max_exclusive(), Some(now_ms - TWELVE_WEEK_MS));
+        assert_eq!(
+            full_windows[3].ts_max_exclusive(),
+            Some(now_ms - TWELVE_WEEK_MS)
+        );
         for pair in full_windows.windows(2) {
             assert_eq!(pair[0].ts_max_exclusive(), pair[1].ts_min());
         }

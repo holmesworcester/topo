@@ -141,12 +141,27 @@ fn perf_debug_env(name: &str) -> bool {
         .unwrap_or(false)
 }
 
+fn perf_lowmem_env(label: &str) -> Vec<(String, String)> {
+    let scoped = match label {
+        "alice" => perf_debug_env("PERF_ALICE_LOWMEM"),
+        "bob" => perf_debug_env("PERF_BOB_LOWMEM"),
+        _ => false,
+    };
+    if perf_debug_env("PERF_ALL_DAEMONS_LOWMEM") || scoped {
+        vec![("LOW_MEM_IOS".to_string(), "1".to_string())]
+    } else {
+        Vec::new()
+    }
+}
+
 fn start_perf_daemon(db: &str, tmpdir: &std::path::Path, label: &str) -> HarnessDaemon {
+    let extra_env = perf_lowmem_env(label);
     if !perf_debug_env("PERF_DAEMON_LOGS") {
         return start_daemon_with_options(
             db,
             &DaemonOptions {
                 disable_discovery: true,
+                extra_env,
                 ..Default::default()
             },
         );
@@ -157,6 +172,7 @@ fn start_perf_daemon(db: &str, tmpdir: &std::path::Path, label: &str) -> Harness
             stdout_file: Some(tmpdir.join(format!("{label}.daemon.stdout.log"))),
             stderr_file: Some(tmpdir.join(format!("{label}.daemon.stderr.log"))),
             disable_discovery: true,
+            extra_env,
             ..Default::default()
         },
     )

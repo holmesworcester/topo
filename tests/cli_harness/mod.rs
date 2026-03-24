@@ -2313,13 +2313,23 @@ pub fn wait_for_pending_bootstrap_trust_cleared_and_endpoint_observation(
 
 pub fn generate_messages(db: &str, count: usize) {
     ensure_active_peer(db, Duration::from_secs(10));
-    let output = topo_cmd(db, &["generate", "--count", &count.to_string()]);
-    assert!(
-        output.status.success(),
-        "generate failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
+    let chunk_size = std::env::var("TOPO_TEST_GENERATE_CHUNK_SIZE")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(100_000);
+    let mut remaining = count;
+    while remaining > 0 {
+        let next = remaining.min(chunk_size);
+        let output = topo_cmd(db, &["generate", "--count", &next.to_string()]);
+        assert!(
+            output.status.success(),
+            "generate failed: stdout={} stderr={}",
+            String::from_utf8_lossy(&output.stdout),
+            String::from_utf8_lossy(&output.stderr)
+        );
+        remaining -= next;
+    }
 }
 
 pub fn peak_rss_mib_for_pid(pid: u32) -> Option<f64> {

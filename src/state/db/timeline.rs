@@ -252,7 +252,11 @@ impl<'a> EventTimeline<'a> {
             return Ok(None);
         };
         let spans = [
-            span_label("receive_to_store_ms", row.response_received_at, row.persisted_at),
+            span_label(
+                "receive_to_store_ms",
+                row.response_received_at,
+                row.persisted_at,
+            ),
             span_label("store_to_project_ms", row.persisted_at, row.projected_at),
             span_label("blocked_duration_ms", row.blocked_at, row.unblocked_at),
         ]

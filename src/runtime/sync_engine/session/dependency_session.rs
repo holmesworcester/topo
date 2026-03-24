@@ -26,7 +26,8 @@ fn current_timestamp_ms() -> i64 {
 }
 
 fn decode_exact_frame(frame: &[u8]) -> Result<Frame, String> {
-    let (parsed, consumed) = parse_frame(frame).map_err(|e| format!("parse dependency frame: {e}"))?;
+    let (parsed, consumed) =
+        parse_frame(frame).map_err(|e| format!("parse dependency frame: {e}"))?;
     if consumed != frame.len() {
         return Err(format!(
             "parse dependency frame: trailing bytes consumed={consumed} total={}",
@@ -258,7 +259,10 @@ pub fn spawn_outbound_dependency_session(
         let (session_id, io) = match open_outbound_dependency_session(&connection).await {
             Ok(opened) => opened,
             Err(err) => {
-                warn!("dependency session open failed for peer {}: {}", peer_id, err);
+                warn!(
+                    "dependency session open failed for peer {}: {}",
+                    peer_id, err
+                );
                 return;
             }
         };

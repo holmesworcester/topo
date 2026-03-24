@@ -529,10 +529,7 @@ mod tests {
 
         let err =
             resolve_requested_tenant_for_peer(&db_path, &requested, &remote_peer_id).unwrap_err();
-        assert!(
-            err.contains("no local tenant"),
-            "unexpected error: {err}"
-        );
+        assert!(err.contains("no local tenant"), "unexpected error: {err}");
     }
 
     #[test]

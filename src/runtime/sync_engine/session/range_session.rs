@@ -1,17 +1,19 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use negentropy::{Id, NegentropyStorageVector};
+use negentropy::{Bound, Id, Item, NegentropyStorageBase, NegentropyStorageVector};
 use rusqlite::Connection;
 
 use crate::crypto::{event_id_to_base64, hash_event, EventId};
 use crate::db::store::Store;
 use crate::protocol::neg_id_to_event_id;
+use crate::runtime::sync_engine::NegentropyStorageSqlite;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::receive_log::ReceiveLogWriter;
-use crate::sync::session::windowing::SyncWindow;
+use crate::sync::session::windowing::{SyncWindow, SyncWindowKind};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
+use crate::tuning::low_mem_mode;
 
 const RANGE_DATA_RECORD_PREFIX_LEN: usize = 4;
 
@@ -21,11 +23,72 @@ pub struct RangeReceiveResult {
     pub path: Option<PathBuf>,
 }
 
-pub fn load_range_storage(
-    conn: &Connection,
+pub enum RangeStorage<'a> {
+    InMemory(NegentropyStorageVector),
+    Sqlite(NegentropyStorageSqlite<'a>),
+}
+
+impl NegentropyStorageBase for RangeStorage<'_> {
+    fn size(&self) -> Result<usize, negentropy::Error> {
+        match self {
+            Self::InMemory(storage) => storage.size(),
+            Self::Sqlite(storage) => storage.size(),
+        }
+    }
+
+    fn get_item(&self, i: usize) -> Result<Option<Item>, negentropy::Error> {
+        match self {
+            Self::InMemory(storage) => storage.get_item(i),
+            Self::Sqlite(storage) => storage.get_item(i),
+        }
+    }
+
+    fn iterate(
+        &self,
+        begin: usize,
+        end: usize,
+        cb: &mut dyn FnMut(Item, usize) -> Result<bool, negentropy::Error>,
+    ) -> Result<(), negentropy::Error> {
+        match self {
+            Self::InMemory(storage) => storage.iterate(begin, end, cb),
+            Self::Sqlite(storage) => storage.iterate(begin, end, cb),
+        }
+    }
+
+    fn find_lower_bound(&self, first: usize, last: usize, value: &Bound) -> usize {
+        match self {
+            Self::InMemory(storage) => storage.find_lower_bound(first, last, value),
+            Self::Sqlite(storage) => storage.find_lower_bound(first, last, value),
+        }
+    }
+}
+
+fn use_sqlite_storage(range: SyncWindow) -> bool {
+    low_mem_mode()
+        && matches!(
+            range.kind,
+            SyncWindowKind::LastTwelveWeeks | SyncWindowKind::Full
+        )
+}
+
+pub fn load_range_storage<'a>(
+    conn: &'a Connection,
     workspace_id: &str,
     range: SyncWindow,
-) -> Result<NegentropyStorageVector, String> {
+) -> Result<RangeStorage<'a>, String> {
+    if use_sqlite_storage(range) {
+        let storage = NegentropyStorageSqlite::new_with_range(
+            conn,
+            workspace_id,
+            range.ts_min(),
+            range.ts_max_exclusive(),
+        );
+        storage
+            .rebuild_blocks()
+            .map_err(|e| format!("rebuild sqlite negentropy blocks: {e}"))?;
+        return Ok(RangeStorage::Sqlite(storage));
+    }
+
     let mut stmt = conn
         .prepare(
             "SELECT ts, id
@@ -63,7 +126,7 @@ pub fn load_range_storage(
     storage
         .seal()
         .map_err(|e| format!("seal negentropy vector storage: {e}"))?;
-    Ok(storage)
+    Ok(RangeStorage::InMemory(storage))
 }
 
 pub async fn send_have_events<S>(
@@ -110,6 +173,37 @@ where
         .await
         .map_err(|e| format!("flush range data stream: {e}"))?;
     Ok((events_sent, bytes_sent))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn lowmem_large_windows_use_sqlite_storage() {
+        std::env::set_var("LOW_MEM_IOS", "1");
+        assert!(use_sqlite_storage(SyncWindow {
+            kind: SyncWindowKind::LastTwelveWeeks,
+            ts_min_inclusive_ms: Some(1),
+            ts_max_exclusive_ms: Some(2),
+        }));
+        assert!(use_sqlite_storage(SyncWindow {
+            kind: SyncWindowKind::Full,
+            ts_min_inclusive_ms: Some(1),
+            ts_max_exclusive_ms: Some(2),
+        }));
+        assert!(!use_sqlite_storage(SyncWindow {
+            kind: SyncWindowKind::LastDay,
+            ts_min_inclusive_ms: Some(1),
+            ts_max_exclusive_ms: Some(2),
+        }));
+        assert!(!use_sqlite_storage(SyncWindow {
+            kind: SyncWindowKind::LastWeek,
+            ts_min_inclusive_ms: Some(1),
+            ts_max_exclusive_ms: Some(2),
+        }));
+        std::env::remove_var("LOW_MEM_IOS");
+    }
 }
 
 fn parse_next_blob_record(buffer: &[u8], offset: &mut usize) -> Result<Option<Vec<u8>>, String> {

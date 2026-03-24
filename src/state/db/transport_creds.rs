@@ -637,20 +637,11 @@ mod tests {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
-        set_local_transport_target(
-            &conn,
-            "tenant_a",
-            "shared_peer",
-            CRED_SOURCE_PEER_SHARED,
-        )
-        .unwrap();
-        let err = set_local_transport_target(
-            &conn,
-            "tenant_b",
-            "shared_peer",
-            CRED_SOURCE_BOOTSTRAP,
-        )
-        .unwrap_err();
+        set_local_transport_target(&conn, "tenant_a", "shared_peer", CRED_SOURCE_PEER_SHARED)
+            .unwrap();
+        let err =
+            set_local_transport_target(&conn, "tenant_b", "shared_peer", CRED_SOURCE_BOOTSTRAP)
+                .unwrap_err();
         assert!(
             err.to_string().contains("already owned"),
             "unexpected error: {err}"

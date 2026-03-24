@@ -1,6 +1,6 @@
+use std::collections::{HashMap, VecDeque};
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Condvar, Mutex, OnceLock};
@@ -341,7 +341,10 @@ fn open_receive_log(path: &Path) -> Result<(File, ReceiveLogHeader, ReceiveLogVe
         File::open(path).map_err(|e| format!("open receive log {}: {e}", path.display()))?;
     let (header, version) = match try_read_embedded_receive_log_header(&mut file, path)? {
         Some(result) => result,
-        None => (parse_legacy_receive_log_meta(path)?, ReceiveLogVersion::V1Frames),
+        None => (
+            parse_legacy_receive_log_meta(path)?,
+            ReceiveLogVersion::V1Frames,
+        ),
     };
     Ok((file, header, version))
 }

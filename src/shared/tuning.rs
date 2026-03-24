@@ -103,7 +103,6 @@ pub fn max_recv_buffer() -> usize {
     }
 }
 
-
 #[cfg(all(target_os = "linux", target_env = "gnu"))]
 pub fn apply_low_mem_allocator_tuning() {
     if !low_mem_mode() {

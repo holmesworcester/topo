@@ -299,14 +299,18 @@ pub async fn open_session_io_for_class(
         .open_bi()
         .await
         .map_err(|e| SessionOpenError::ConnectionLost(format!("control open: {e}")))?;
-    write_session_stream_header(&mut ctrl_send, session_id, class, SessionStreamKind::Control)
-        .await?;
+    write_session_stream_header(
+        &mut ctrl_send,
+        session_id,
+        class,
+        SessionStreamKind::Control,
+    )
+    .await?;
     let (mut data_send, data_recv) = conn
         .open_bi()
         .await
         .map_err(|e| SessionOpenError::ConnectionLost(format!("data open: {e}")))?;
-    write_session_stream_header(&mut data_send, session_id, class, SessionStreamKind::Data)
-        .await?;
+    write_session_stream_header(&mut data_send, session_id, class, SessionStreamKind::Data).await?;
     let dual = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
     let io = QuicTransportSessionIo::new(session_id, dual);
     Ok((session_id, Box::new(io)))
@@ -348,9 +352,7 @@ pub async fn accept_session_io(
             }
             Err(err) => return Err(err),
         };
-        if let Some(complete) =
-            insert_pending_stream(state, session_id, class, kind, send, recv)?
-        {
+        if let Some(complete) = insert_pending_stream(state, session_id, class, kind, send, recv)? {
             let dual = DualConnection::new(
                 complete.control.0,
                 complete.control.1,
@@ -497,9 +499,10 @@ mod tests {
         .await
         .expect("write data header");
 
-        let (server_session_id, server_class, server_io) = accept_session_io(&server_conn, &inbound_state)
-            .await
-            .expect("accept_session_io");
+        let (server_session_id, server_class, server_io) =
+            accept_session_io(&server_conn, &inbound_state)
+                .await
+                .expect("accept_session_io");
         assert_eq!(server_session_id, session_id);
         assert_eq!(server_class, SessionClass::Range);
         drop(server_io);
@@ -580,8 +583,8 @@ mod tests {
 
         let (accepted_a_id, accepted_a_class, accepted_a_io) =
             accept_session_io(&server_conn, &inbound_state)
-            .await
-            .expect("accept first session");
+                .await
+                .expect("accept first session");
         assert_eq!(accepted_a_id, session_a);
         assert_eq!(accepted_a_class, SessionClass::Range);
         let mut accepted_a = accepted_a_io.split();
@@ -598,8 +601,8 @@ mod tests {
 
         let (accepted_b_id, accepted_b_class, accepted_b_io) =
             accept_session_io(&server_conn, &inbound_state)
-            .await
-            .expect("accept second session");
+                .await
+                .expect("accept second session");
         assert_eq!(accepted_b_id, session_b);
         assert_eq!(accepted_b_class, SessionClass::Range);
         let mut accepted_b = accepted_b_io.split();

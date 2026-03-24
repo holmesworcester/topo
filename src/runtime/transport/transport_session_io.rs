@@ -452,7 +452,9 @@ mod tests {
     #[tokio::test]
     async fn send_control_rejects_trailing_bytes() {
         let (mut parts, _control_state, _data_send_state) = build_io(vec![], vec![]);
-        let mut frame = encode_frame(&Frame::RequestIds { ids: vec![[7u8; 32]] });
+        let mut frame = encode_frame(&Frame::RequestIds {
+            ids: vec![[7u8; 32]],
+        });
         frame.push(0);
 
         let err = parts
@@ -475,8 +477,7 @@ mod tests {
     #[tokio::test]
     async fn data_send_and_recv_pass_raw_bytes_through() {
         let raw = vec![9u8; DEFAULT_SYNC_FRAME_MAX_BYTES + 17];
-        let (mut parts, _control_state, data_send_state) =
-            build_io(vec![], vec![Ok(raw.clone())]);
+        let (mut parts, _control_state, data_send_state) = build_io(vec![], vec![Ok(raw.clone())]);
 
         let recv = parts.data_recv.recv().await.expect("recv raw data");
         assert_eq!(recv, raw);

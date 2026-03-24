@@ -133,8 +133,8 @@ mod tests {
     use rusqlite::params;
 
     use super::*;
-    use crate::db::schema::create_tables;
     use crate::db::open_in_memory;
+    use crate::db::schema::create_tables;
 
     #[test]
     fn event_pipeline_effects_execute_expected_sqlite_side_effects() {

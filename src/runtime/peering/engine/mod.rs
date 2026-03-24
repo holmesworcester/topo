@@ -64,7 +64,9 @@ pub async fn run_node(
         sync_control,
     );
 
-    runtime_supervisor.run_until_shutdown(shutdown_notify).await?;
+    runtime_supervisor
+        .run_until_shutdown(shutdown_notify)
+        .await?;
     info!("Shutting down");
     Ok(())
 }

@@ -2,7 +2,6 @@
 
 use std::time::{Duration, Instant};
 
-use negentropy::{Id, Negentropy};
 use crate::db::{
     open_connection,
     store::{lookup_workspace_id, Store},
@@ -19,6 +18,7 @@ use crate::sync::session::receive_log::{
 use crate::sync::session::windowing::{decode_initial_neg_open, is_hot_window};
 use crate::sync::session::INITIAL_CONTROL_PROGRESS_TIMEOUT;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
+use negentropy::{Id, Negentropy};
 
 type ManualRoundReply =
     std::sync::mpsc::Sender<Result<crate::runtime::sync_control::ManualSyncRoundCapture, String>>;
@@ -120,7 +120,8 @@ where
         )
     })?;
     let storage = load_range_storage(&db, &ws_id, range)?;
-    let mut neg = Negentropy::borrowed(&storage, crate::sync::session::negentropy_frame_size())?;
+    let mut neg =
+        Negentropy::borrowed(&storage, crate::sync::session::negentropy_frame_size(range))?;
 
     let mut have_ids = Vec::<Id>::new();
     let mut need_ids = Vec::<Id>::new();

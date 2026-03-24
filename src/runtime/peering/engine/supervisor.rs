@@ -18,6 +18,12 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
+use super::target_planner::{
+    bootstrap_dispatch_key, bootstrap_dispatch_key_prefix, collect_all_bootstrap_targets,
+    collect_all_observed_endpoint_targets, discovery_dispatch_key, dispatch_bootstrap_target,
+    dispatch_discovery_target, dispatch_observed_endpoint_target,
+    normalize_discovered_addr_for_local_bind, PeerDispatcher,
+};
 use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
 use crate::db::open_connection;
@@ -26,21 +32,14 @@ use crate::db::transport_creds::{
 };
 use crate::db::transport_trust::is_peer_shared_transport_fingerprint;
 use crate::peering::loops::{
-    accept_loop_until_cancel,
-    connect_loop_with_coordination_until_cancel_with_fallback, preferred_connection_direction,
-    IntroSpawnerFn,
+    accept_loop_until_cancel, connect_loop_with_coordination_until_cancel_with_fallback,
+    preferred_connection_direction, IntroSpawnerFn,
 };
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::transport::{
     build_tenant_bootstrap_fallback_client_config_for_invite_from_db,
     build_tenant_client_config_from_db, TenantClientConfigs, TransportClientConfig,
     TransportEndpoint,
-};
-use super::target_planner::{
-    bootstrap_dispatch_key, bootstrap_dispatch_key_prefix, collect_all_bootstrap_targets,
-    collect_all_observed_endpoint_targets, discovery_dispatch_key, dispatch_bootstrap_target,
-    dispatch_discovery_target, dispatch_observed_endpoint_target,
-    normalize_discovered_addr_for_local_bind, PeerDispatcher,
 };
 
 const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
@@ -405,12 +404,7 @@ fn build_tenant_contexts(
             }
         };
 
-        out.insert(
-            tenant_id.clone(),
-            TenantDispatchContext {
-                client_config,
-            },
-        );
+        out.insert(tenant_id.clone(), TenantDispatchContext { client_config });
     }
     out
 }
@@ -736,9 +730,7 @@ async fn run_target_dispatcher(
         } else {
             match build_tenant_client_config_from_db(&db_path, &event.tenant_id) {
                 Ok(client_config) => {
-                    let context = TenantDispatchContext {
-                        client_config,
-                    };
+                    let context = TenantDispatchContext { client_config };
                     tenant_contexts.insert(event.tenant_id.clone(), context.clone());
                     context
                 }

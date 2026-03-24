@@ -994,6 +994,7 @@ fn test_cli_lowmem_receiver_restart_catches_offline_delta_and_resumes_sync() {
     stop_daemon(&bob_db, &mut bob_daemon);
 
     generate_messages(&alice_db, 200);
+    let offline_batch_tail_eid = send_message(&alice_db, "offline batch tail before bob restart");
     let offline_delta_eid = send_message(&alice_db, "delta after bob lowmem restart");
 
     bob_daemon = start_daemon_with_options(
@@ -1010,10 +1011,14 @@ fn test_cli_lowmem_receiver_restart_catches_offline_delta_and_resumes_sync() {
 
     assert_eventually(
         &bob_db,
+        &format!("has_event:{} >= 1", offline_batch_tail_eid),
+        timeout_ms,
+    );
+    assert_eventually(
+        &bob_db,
         &format!("has_event:{} >= 1", offline_delta_eid),
         timeout_ms,
     );
-    assert_eventually(&bob_db, "message_count >= 2201", timeout_ms);
 
     let steady_state_eid = send_message(&bob_db, "steady after bob lowmem catch-up");
     assert_eventually(

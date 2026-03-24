@@ -13,19 +13,19 @@
 
 mod cli_harness;
 
+use cli_harness::hold_network_test_lock_for_binary;
 use rusqlite::OptionalExtension;
 use std::collections::BTreeSet;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
-use topo::db::sync_log::{ensure_schema, update_config, SyncLogConfigPatch};
 use topo::crypto::event_id_to_base64;
 use topo::db::open_connection;
+use topo::db::sync_log::{ensure_schema, update_config, SyncLogConfigPatch};
 use topo::testutil::{
     assert_eventually, clone_events_to, converge_sink_download_transport,
     converge_workspace_transport_graph, start_chain, start_sink_download,
     start_sink_download_with_shutdown, Peer,
 };
-use cli_harness::hold_network_test_lock_for_binary;
 
 const HOUR_MS: u64 = 60 * 60 * 1000;
 const DAY_MS: u64 = 24 * HOUR_MS;
@@ -571,7 +571,9 @@ async fn catchup_4x_240_spread_uses_multiple_sources_efficiently() {
     let source_marker_ids: Vec<String> = sources
         .iter()
         .enumerate()
-        .map(|(idx, source)| event_id_to_base64(&source.create_message(&format!("spread-src-{idx}"))))
+        .map(|(idx, source)| {
+            event_id_to_base64(&source.create_message(&format!("spread-src-{idx}")))
+        })
         .collect();
     enable_sync_logging(&sink);
 
@@ -608,7 +610,11 @@ async fn catchup_4x_240_spread_uses_multiple_sources_efficiently() {
     eprintln!("=== Replicated spread catchup: 4 sources x 240 messages ===");
     eprintln!("  Wall time:           {:.2}s", wall_secs);
     eprintln!("  Visible messages:    {}", expected_count);
-    eprintln!("  Visible source marks: {}/{}", visible_markers, source_marker_ids.len());
+    eprintln!(
+        "  Visible source marks: {}/{}",
+        visible_markers,
+        source_marker_ids.len()
+    );
     eprintln!();
 
     assert_eq!(

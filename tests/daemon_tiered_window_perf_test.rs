@@ -45,6 +45,12 @@ fn env_i64(name: &str, default: i64) -> i64 {
         .unwrap_or(default)
 }
 
+fn env_bool(name: &str) -> bool {
+    std::env::var(name)
+        .map(|value| value != "0" && value.to_lowercase() != "false")
+        .unwrap_or(false)
+}
+
 fn inherited_tier_env() -> Vec<(String, String)> {
     [
         "TOPO_SYNC_WINDOW_SHAPE",
@@ -59,6 +65,14 @@ fn inherited_tier_env() -> Vec<(String, String)> {
             .map(|value| (key.to_string(), value))
     })
     .collect()
+}
+
+fn tier_role_env(base: &[(String, String)], lowmem: bool) -> Vec<(String, String)> {
+    let mut env = base.to_vec();
+    if lowmem {
+        env.push(("LOW_MEM_IOS".to_string(), "1".to_string()));
+    }
+    env
 }
 
 fn join_catchup_network_profile_from_env() -> Option<NetworkProfile> {
@@ -195,11 +209,12 @@ fn run_tiered_window_bench() {
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
 
     create_workspace_with_details(&alice_db, "workspace", "alice", "desktop");
+    let inherited_env = inherited_tier_env();
     let mut alice_daemon = start_daemon_with_options(
         &alice_db,
         &DaemonOptions {
             disable_discovery: true,
-            extra_env: inherited_tier_env(),
+            extra_env: tier_role_env(&inherited_env, env_bool("TOPO_TIERED_ALICE_LOWMEM")),
             ..Default::default()
         },
     );
@@ -244,7 +259,7 @@ fn run_tiered_window_bench() {
             bind_ip: bob_bind_addr.map(|addr| addr.ip().to_string()),
             bind_port: bob_bind_addr.map(|addr| addr.port()),
             disable_discovery: true,
-            extra_env: inherited_tier_env(),
+            extra_env: tier_role_env(&inherited_env, env_bool("TOPO_TIERED_BOB_LOWMEM")),
             ..Default::default()
         },
     );

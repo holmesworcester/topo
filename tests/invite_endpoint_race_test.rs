@@ -30,8 +30,12 @@ async fn invite_endpoint_race_prevents_bootstrap_sync() {
     let (_invitee_dir, invitee_db) = temp_db();
     let _invitee = start_daemon(&invitee_db);
 
-    assert!(topo_cmd(&inviter_db, &["sync-log", "enable", "--all-runs"]).status.success());
-    assert!(topo_cmd(&invitee_db, &["sync-log", "enable", "--all-runs"]).status.success());
+    assert!(topo_cmd(&inviter_db, &["sync-log", "enable", "--all-runs"])
+        .status
+        .success());
+    assert!(topo_cmd(&invitee_db, &["sync-log", "enable", "--all-runs"])
+        .status
+        .success());
 
     accept_invite_with_identity_on_running_daemon(
         &invitee_db,
@@ -91,8 +95,12 @@ async fn invite_endpoint_race_fixed_allows_bootstrap_sync() {
     let (_invitee_dir, invitee_db) = temp_db();
     let _invitee = start_daemon(&invitee_db);
 
-    assert!(topo_cmd(&inviter_db, &["sync-log", "enable", "--all-runs"]).status.success());
-    assert!(topo_cmd(&invitee_db, &["sync-log", "enable", "--all-runs"]).status.success());
+    assert!(topo_cmd(&inviter_db, &["sync-log", "enable", "--all-runs"])
+        .status
+        .success());
+    assert!(topo_cmd(&invitee_db, &["sync-log", "enable", "--all-runs"])
+        .status
+        .success());
 
     accept_invite_with_identity_on_running_daemon(
         &invitee_db,
@@ -126,10 +134,7 @@ async fn invite_endpoint_race_fixed_allows_bootstrap_sync() {
     println!("Invitee successful sync_runs: {}", invitee_sync_runs.len());
 }
 
-fn query_sync_runs(
-    db_path: &str,
-    sql: &str,
-) -> SqliteResult<Vec<(i64, String, i64, i64, String)>> {
+fn query_sync_runs(db_path: &str, sql: &str) -> SqliteResult<Vec<(i64, String, i64, i64, String)>> {
     let conn = Connection::open(db_path)?;
     let mut stmt = conn.prepare(sql)?;
     let rows = stmt.query_map([], |row| {

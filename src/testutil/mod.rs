@@ -488,16 +488,13 @@ pub async fn converge_workspace_transport_graph(peers: &[Peer]) {
 
     for peer in peers.iter().skip(1) {
         let expected_targets = vec![
-            (peers[0].identity.clone(), current_transport_target(&peers[0])),
+            (
+                peers[0].identity.clone(),
+                current_transport_target(&peers[0]),
+            ),
             (peer.identity.clone(), current_transport_target(peer)),
         ];
-        sync_pair_until_transport_converged(
-            &peers[0],
-            peer,
-            &expected_targets,
-            pair_timeout,
-        )
-        .await;
+        sync_pair_until_transport_converged(&peers[0], peer, &expected_targets, pair_timeout).await;
     }
 }
 

@@ -103,8 +103,10 @@ mod tests {
         let db_path = dir.path().join("ignore.db").to_string_lossy().to_string();
         let (mut rx, _guard) = register(&db_path, "tenant-a", "peer-a");
         publish(&db_path, "tenant-a", "peer-b", &[[9u8; 32]]);
-        assert!(tokio::time::timeout(std::time::Duration::from_millis(10), rx.recv())
-            .await
-            .is_err());
+        assert!(
+            tokio::time::timeout(std::time::Duration::from_millis(10), rx.recv())
+                .await
+                .is_err()
+        );
     }
 }
