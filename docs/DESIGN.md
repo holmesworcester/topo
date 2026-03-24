@@ -125,24 +125,22 @@ This also covers the hard case where multiple local identities on the same endpo
 
 ### Sync And Convergence
 
-Once connected, peers reconcile explicit time ranges instead of planning per-event pull work. A range session loads the local `(ts, event_id)` membership for one selected range from `neg_items`, seals it into an in-memory `NegentropyStorageVector`, exchanges `NegOpen` / `NegMsg`, and then both sides stream all missing blobs for that range. The receiver appends those blobs to a `ReceiveLog`, stamps first-store timing as each blob is appended, and only then hands the file to canonical ingest.
+Once connected, peers reconcile explicit time ranges instead of planning per-event pull work. A range session loads the local `(ts, event_id)` membership for one selected range from `neg_items`, seals it into an in-memory `NegentropyStorageVector`, exchanges `NegOpen` / `NegMsg`, and then both sides stream all missing blobs for that range as raw length-delimited records. The receiver appends those blobs to a `ReceiveLog`, stamps `first_received_at` / `first_stored_at` in the file as each blob is appended, finalizes the spool file, and then lets canonical ingest continue in the background.
 
 Negentropy remains the set-reconciliation engine because it is agnostic to event content and naturally fits an ever-growing event set. The active range path uses the Rust [`negentropy` library](https://crates.io/crates/negentropy) over one selected range at a time. The current scheduler intentionally stays simple and round-robins:
 
-1. `last hour`
-2. `last day`
-3. `last week`
-4. `last month`
-5. `last year`
-6. `full history`
+1. `last day`
+2. `last week`
+3. `last twelve weeks`
+4. `full history`
 
 When multiple peers are connected, the scheduler uses the same simple rule every round:
 
-1. `hour` and `day` are duplicated across all live peers to minimize time-to-project for recent history,
-2. `week`, `month`, `year`, and `full history` are partitioned across the current live peer set by sorted peer rank,
+1. `last day` is duplicated across all live peers to minimize time-to-project for recent history,
+2. `last week`, `last twelve weeks`, and `full history` are partitioned across the current live peer set by sorted peer rank,
 3. the partition is recomputed on every new range session from the live connection set.
 
-This is intentionally the simplest robust strategy. There is no durable ownership table, no per-event planner, and no sticky assignment state to repair after a peer disappears. If a peer drops mid-download, the next round sees a smaller live peer set and the remaining peers automatically widen their assigned historical slices.
+This is intentionally the simplest robust strategy. There is no durable ownership table, no per-event planner, and no sticky assignment state to repair after a peer disappears. If a peer drops mid-download, the next round sees a smaller live peer set and the remaining peers automatically widen their assigned historical slices. While a hot `LastDay` receive is active for a DB, background receive-log ingest stays paused so download/store remains the priority path.
 
 Dependency repair is a separate fast path. Projection blocking emits direct dependency requests keyed by source peer, and dependency replies are ingested immediately through the same canonical/projector path used by local creation and replay. This preserves one convergence contract across source types while keeping bulk transfer durable-first and blocker repair latency-first.
 
@@ -1203,8 +1201,9 @@ Peer runtime worker shape:
 1. `RangeSession`:
    - choose one explicit range,
    - reconcile that range with negentropy on the control stream,
-   - exchange missing blobs on the data stream,
-   - append received blobs to a `ReceiveLog`.
+   - exchange missing blobs on the data stream as raw length-delimited records,
+   - append received blobs to a `ReceiveLog`,
+   - finish the spool file before local canonical ingest continues in the background.
 2. dependency session:
    - receive direct dependency requests on the control stream,
    - send dependency replies on the data stream,
@@ -1223,18 +1222,17 @@ Peer runtime worker shape:
 Bulk transfer is range-owned.
 
 1. the scheduler picks one range from the current ladder:
-   - `last hour`
    - `last day`
    - `last week`
-   - `last month`
-   - `last year`
+   - `last twelve weeks`
    - `full history`
 2. the initiator opens a `Range` session and sends the concrete window bounds in the initial `NegOpen`,
 3. both sides load that range from `neg_items` into an in-memory `NegentropyStorageVector`,
 4. negentropy computes `have_ids` / `need_ids` for that explicit range,
-5. both sides stream all missing `Event` blobs for that range,
-6. the receiver appends blobs to a `ReceiveLog`,
-7. on close or idle timeout, the log is finalized and replayed into canonical ingest.
+5. both sides stream all missing blobs for that range as raw `[u32 len][blob]` records,
+6. the receiver appends those records to a `ReceiveLog`, stamping `first_received_at` and `first_stored_at` in the file,
+7. on close or idle timeout, the log is finalized with `flush + sync_all`, the range session ends, and the log is queued for background canonical ingest,
+8. while a hot `LastDay` receive is active for a DB, bulk receive-log replay stays paused so download/store remains the priority path.
 
 Dependency repair is separate:
 
@@ -1248,7 +1246,7 @@ Dependency repair is separate:
 1. `project_queue` is transient and purged on terminal decision for the `(peer_id, event_id)` projection target.
 2. enqueue uses dedupe guards and skips terminal or already-blocked states.
 3. duplicate enqueue races are safe via `INSERT OR IGNORE` plus terminal fast-drop checks.
-4. `ReceiveLog` replay parses valid frames to EOF and ignores a truncated tail.
+4. `ReceiveLog` replay parses valid records to EOF and ignores a truncated tail.
 5. leftover receive logs are ingested on startup; interrupted bulk ranges are not discarded.
 6. dependency-session routing state is bounded in-memory state keyed by `(db_path, tenant_id, peer_id)`.
 
@@ -1330,7 +1328,7 @@ Baseline implementation:
    - `LastTwelveWeeks`
    - `Full`
 4. Outbound scheduling currently round-robins those windows per `(db_path, peer_id)`.
-5. Range data transfer streams `Event` frames after reconciliation for that range.
+5. Range data transfer streams raw length-delimited blob records (`[u32 len][blob]`) after reconciliation for that range.
 6. Multi-source coordination does not replace negentropy; future smarter range balancing will still consume range-local membership discovered by negentropy.
 7. The older SQLite-backed negentropy storage remains in-tree, but the active range path uses the in-memory vector-backed storage built directly from `neg_items`.
 

@@ -25,7 +25,8 @@ Keep the sync hot path small and readable:
 3. A `RangeSession` uses a control stream plus a data stream, but semantically
    it is one range-owned job with two strict phases:
    - reconcile the selected range with negentropy,
-   - exchange all missing event blobs for that range.
+   - exchange all missing event blobs for that range as raw
+     `[u32 len][blob]` records.
 4. A dependency session stays alive alongside range sessions and uses:
    - control for `RequestIds`,
    - data for dependency `Event` replies.
@@ -65,10 +66,13 @@ Keep the sync hot path small and readable:
    - `first_received_at`
    - `first_stored_at`
 4. `first_stored_at` is the first-store timestamp used by perf tests.
-5. On connection close or idle timeout, the log is finalized and replayed into
-   canonical ingest.
-6. On startup, leftover logs are ingested and deleted.
-7. Replay parses valid frames to EOF and ignores a truncated tail.
+5. On connection close or idle timeout, the log is finalized with
+   `flush + sync_all`, the range session ends, and the log is queued for
+   background canonical ingest.
+6. While a hot `LastDay` receive is active for a DB, background receive-log
+   ingest stays paused so download/store remains the priority path.
+7. On startup, leftover logs are ingested and deleted.
+8. Replay parses valid records to EOF and ignores a truncated tail.
 
 ### Dependency fast path
 
@@ -171,7 +175,7 @@ Representative multi-source proof on this branch:
 1. `catchup_4x_240_spread_uses_multiple_sources_efficiently`
 2. Result on current head:
    - 240 useful unique messages,
-   - 243 received `Event` frames,
+   - 243 received event payloads,
    - 4 active sources,
    - 98.8% delivery efficiency,
    - peer-dropout recovery still passes in `catchup_dead_peer_dropout`.
