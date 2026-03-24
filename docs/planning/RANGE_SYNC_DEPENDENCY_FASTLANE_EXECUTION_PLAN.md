@@ -34,21 +34,19 @@ Keep the sync hot path small and readable:
 
 1. The scheduler is intentionally simple.
 2. Outbound range selection round-robins over:
-   - `hour`
-   - `day`
-   - `week`
-   - `month`
-   - `year`
-   - `all`
+   - `LastDay`
+   - `LastWeek`
+   - `LastTwelveWeeks`
+   - `Full`
 3. `TOPO_SYNC_TIER_MODE` is gone.
-4. `TOPO_SYNC_WINDOW_SHAPE` still controls nested vs disjoint ranges.
+4. The active scheduler is the disjoint ladder above; nested mode is gone.
 5. This is the current bootstrap scheduler, not the final arbitrary-range
    coordinator.
 
 ### Multi-source strategy
 
-1. `hour` and `day` are duplicated across all live peers.
-2. `week`, `month`, `year`, and `all` are partitioned across the live peer set
+1. `LastDay` is duplicated across all live peers.
+2. `week`, `12 weeks`, and `full` are partitioned across the live peer set
    by sorted peer rank.
 3. The partition is recomputed every time a new range session starts.
 4. This is the simplest robust rule for peer churn:
@@ -64,9 +62,9 @@ Keep the sync hot path small and readable:
 2. `ReceiveLog` has a single embedded header in the `.bin` file; new logs do
    not use a `.meta` sidecar.
 3. Each append stamps:
-   - `response_received_at`
-   - `persisted_at`
-4. `persisted_at` is the first-store timestamp used by perf tests.
+   - `first_received_at`
+   - `first_stored_at`
+4. `first_stored_at` is the first-store timestamp used by perf tests.
 5. On connection close or idle timeout, the log is finalized and replayed into
    canonical ingest.
 6. On startup, leftover logs are ingested and deleted.
@@ -105,7 +103,7 @@ Keep the sync hot path small and readable:
 
 ### Coordinator
 
-1. The current scheduler is still the fixed `hour/day/week/month/year/all`
+1. The current scheduler is still the fixed `LastDay/LastWeek/LastTwelveWeeks/Full`
    ladder.
 2. Arbitrary coordinator-chosen ranges are future work.
 3. The current multi-source rule is fixed:

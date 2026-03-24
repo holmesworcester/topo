@@ -504,14 +504,14 @@ fn collect_stage_report(peers: &[Peer], samples: &[DeliverySample]) -> DeliveryS
 
         let created_to_received_ms = stage_delta(
             Some(sample.created_at_ms),
-            row_ts(&sink_row, |row| row.response_received_at),
+            row_ts(&sink_row, |row| row.first_received_at),
         );
         let received_to_stored_ms = stage_delta(
-            row_ts(&sink_row, |row| row.response_received_at),
-            row_ts(&sink_row, |row| row.persisted_at),
+            row_ts(&sink_row, |row| row.first_received_at),
+            row_ts(&sink_row, |row| row.first_stored_at),
         );
         let stored_to_projected_ms = stage_delta(
-            row_ts(&sink_row, |row| row.persisted_at),
+            row_ts(&sink_row, |row| row.first_stored_at),
             row_ts(&sink_row, |row| row.projected_at),
         );
 
@@ -563,7 +563,7 @@ fn emit_stage_csv(path_name: &str, report: &DeliveryStageReport) {
     std::fs::create_dir_all(&output_dir).expect("create target/perf-results");
     let mut csv = String::from(
         "sent_order,origin_seq,origin_name,sink_name,event_id_b64,event_id_hex,created_at_ms,latency_ms,\
-sink_response_received_at,sink_stored_at,sink_projected_at,\
+sink_first_received_at,sink_first_stored_at,sink_projected_at,\
 created_to_received_ms,received_to_stored_ms,stored_to_projected_ms\n",
     );
     for sample in &report.samples {
@@ -576,8 +576,8 @@ created_to_received_ms,received_to_stored_ms,stored_to_projected_ms\n",
             sample.sample.event_id_hex.clone(),
             sample.sample.created_at_ms.to_string(),
             sample.sample.latency_ms.to_string(),
-            fmt_csv_opt(row_ts(&sample.sink_row, |row| row.response_received_at)),
-            fmt_csv_opt(row_ts(&sample.sink_row, |row| row.persisted_at)),
+            fmt_csv_opt(row_ts(&sample.sink_row, |row| row.first_received_at)),
+            fmt_csv_opt(row_ts(&sample.sink_row, |row| row.first_stored_at)),
             fmt_csv_opt(row_ts(&sample.sink_row, |row| row.projected_at)),
             fmt_csv_opt(sample.created_to_received_ms),
             fmt_csv_opt(sample.received_to_stored_ms),

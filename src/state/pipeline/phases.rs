@@ -46,7 +46,7 @@ pub(super) fn run_persist_phase(
 
     for (event_id, blob, recorded_by, source_tag, received_at_ms, first_stored_at_ms) in batch {
         let event_id_b64 = event_id_to_base64(event_id);
-        let _ = timeline.mark_received_and_persisted_b64(
+        let _ = timeline.mark_received_and_stored_b64(
             &event_id_b64,
             *received_at_ms,
             *first_stored_at_ms,

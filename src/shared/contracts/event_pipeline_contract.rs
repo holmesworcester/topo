@@ -4,7 +4,7 @@ use std::sync::Arc;
 use tokio::sync::mpsc;
 
 /// Ingest channel item:
-/// `(event_id, blob, recorded_by_tenant_id, source_tag, received_at_ms, first_stored_at_ms)`.
+/// `(event_id, blob, recorded_by_tenant_id, source_tag, first_received_at_ms, first_stored_at_ms)`.
 ///
 /// Shared between peering, sync, and event_pipeline layers so that
 /// callers never import event_pipeline internals directly.

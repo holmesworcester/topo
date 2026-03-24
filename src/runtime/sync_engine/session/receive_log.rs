@@ -639,9 +639,9 @@ mod tests {
 
         let timeline = EventTimeline::new(&conn);
         let row = timeline.load(&event_id_b64).unwrap().unwrap();
-        assert!(row.response_received_at.is_some());
-        assert!(row.persisted_at.is_some());
-        assert!(row.response_received_at.unwrap() <= row.persisted_at.unwrap());
+        assert!(row.first_received_at.is_some());
+        assert!(row.first_stored_at.is_some());
+        assert!(row.first_received_at.unwrap() <= row.first_stored_at.unwrap());
     }
 
     #[test]

@@ -119,18 +119,6 @@ pub mod fixtures {
         );
     }
 
-    /// Assert that write_ops contain a Delete from the given table.
-    pub fn assert_deletes_from_table(result: &ProjectorResult, table: &str) {
-        assert!(
-            result.write_ops.iter().any(|op| matches!(
-                op, WriteOp::Delete { table: t, .. } if *t == table
-            )),
-            "expected Delete from table '{}', ops: {:?}",
-            table,
-            result.write_ops
-        );
-    }
-
     /// Assert that no write_ops target the given table.
     pub fn assert_no_write_to_table(result: &ProjectorResult, table: &str) {
         assert!(

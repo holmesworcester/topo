@@ -27,7 +27,7 @@ const THREE_YEARS_MS: i64 = 3 * 365 * DAY_MS;
 
 struct RangeTiming {
     count: i64,
-    persisted_at_ms: Option<i64>,
+    first_stored_at_ms: Option<i64>,
     projected_at_ms: Option<i64>,
 }
 
@@ -53,7 +53,6 @@ fn env_bool(name: &str) -> bool {
 
 fn inherited_tier_env() -> Vec<(String, String)> {
     [
-        "TOPO_SYNC_WINDOW_SHAPE",
         "TOPO_GENERATE_MESSAGE_SPREAD_MS",
         "TOPO_FORWARD_ON_HAVE",
         "TOPO_EVENT_TIMELINE",
@@ -119,7 +118,7 @@ fn range_timing_sql(db: &str, min_created_at_ms: Option<i64>) -> RangeTiming {
     let conn = topo::db::open_connection(db).expect("open db for range_timing");
     let peer_id = cli_harness::active_tenant_peer_id(db).expect("active tenant peer id");
     conn.query_row(
-        "SELECT COUNT(*), MAX(t.persisted_at), MAX(t.projected_at)
+        "SELECT COUNT(*), MAX(t.first_stored_at), MAX(t.projected_at)
          FROM messages m
          LEFT JOIN event_timeline t ON t.event_id = m.message_id
          WHERE m.recorded_by = ?1
@@ -128,7 +127,7 @@ fn range_timing_sql(db: &str, min_created_at_ms: Option<i64>) -> RangeTiming {
         |row| {
             Ok(RangeTiming {
                 count: row.get(0)?,
-                persisted_at_ms: row.get(1)?,
+                first_stored_at_ms: row.get(1)?,
                 projected_at_ms: row.get(2)?,
             })
         },
@@ -199,10 +198,6 @@ fn run_tiered_window_bench() {
     std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "persist,projection");
 
     let total_messages = env_i64("TOPO_TIERED_SYNC_TOTAL_MESSAGES", 50_000);
-    let window_shape = std::env::var("TOPO_SYNC_WINDOW_SHAPE")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or_else(|| "disjoint".to_string());
     let network_profile = join_catchup_network_profile_from_env();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
@@ -310,16 +305,16 @@ fn run_tiered_window_bench() {
     let all_timing = range_timing_sql(&bob_db, None);
 
     let summary = format!(
-        "=== tiered window catchup ===\n  Window shape: {window_shape}\n  Messages preloaded on inviter: {total_messages}\n  Network profile: {}\n  Generated spread: 3 years\n  Metric start: invite accept on running joiner daemon\n  Last day:      {} msgs durable in {:.2}s projected in {:.2}s\n  Last week:     {} msgs durable in {:.2}s projected in {:.2}s\n  Last 12 weeks: {} msgs durable in {:.2}s projected in {:.2}s\n  All:           {} msgs durable in {:.2}s projected in {:.2}s\n  Full catchup wall: {:.2}s\n",
+        "=== tiered window catchup ===\n  Window ladder: LastDay -> LastWeek -> Last12Weeks -> Full\n  Messages preloaded on inviter: {total_messages}\n  Network profile: {}\n  Generated spread: 3 years\n  Metric start: invite accept on running joiner daemon\n  Last day:      {} msgs durable in {:.2}s projected in {:.2}s\n  Last week:     {} msgs durable in {:.2}s projected in {:.2}s\n  Last 12 weeks: {} msgs durable in {:.2}s projected in {:.2}s\n  All:           {} msgs durable in {:.2}s projected in {:.2}s\n  Full catchup wall: {:.2}s\n",
         network_profile.map(|profile| profile.slug).unwrap_or("loopback"),
         day_timing.count,
-        elapsed_secs(metric_start_ms, day_timing.persisted_at_ms),
+        elapsed_secs(metric_start_ms, day_timing.first_stored_at_ms),
         elapsed_secs(metric_start_ms, day_timing.projected_at_ms.or(Some(day_projected_ms))),
         week_timing.count,
-        elapsed_secs(metric_start_ms, week_timing.persisted_at_ms),
+        elapsed_secs(metric_start_ms, week_timing.first_stored_at_ms),
         elapsed_secs(metric_start_ms, week_timing.projected_at_ms.or(Some(week_projected_ms))),
         twelve_week_timing.count,
-        elapsed_secs(metric_start_ms, twelve_week_timing.persisted_at_ms),
+        elapsed_secs(metric_start_ms, twelve_week_timing.first_stored_at_ms),
         elapsed_secs(
             metric_start_ms,
             twelve_week_timing
@@ -327,14 +322,13 @@ fn run_tiered_window_bench() {
                 .or(Some(twelve_week_projected_ms))
         ),
         all_timing.count,
-        elapsed_secs(metric_start_ms, all_timing.persisted_at_ms),
+        elapsed_secs(metric_start_ms, all_timing.first_stored_at_ms),
         elapsed_secs(metric_start_ms, all_timing.projected_at_ms.or(Some(full_projected_ms))),
         full_wall_secs,
     );
     eprintln!("\n{summary}");
     let summary_key = format!(
-        "daemon_tiered_window_perf_test.{}_{}_{}",
-        window_shape,
+        "daemon_tiered_window_perf_test.disjoint_{}_{}",
         total_messages,
         network_profile
             .map(|profile| profile.slug)

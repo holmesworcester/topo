@@ -18,12 +18,6 @@ pub struct SyncWindow {
     pub ts_max_exclusive_ms: Option<i64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyncWindowShape {
-    Nested,
-    Disjoint,
-}
-
 const WINDOW_MAGIC: &[u8; 4] = b"P7SW";
 const WINDOW_VERSION: u8 = 2;
 const NONE_TS_SENTINEL: i64 = i64::MIN;
@@ -67,18 +61,6 @@ fn state_for<'a>(
             next_idx: 0,
             cycle_anchor_now_ms: None,
         })
-}
-
-pub fn sync_window_shape() -> SyncWindowShape {
-    match std::env::var("TOPO_SYNC_WINDOW_SHAPE")
-        .ok()
-        .unwrap_or_else(|| "disjoint".to_string())
-        .to_lowercase()
-        .as_str()
-    {
-        "disjoint" => SyncWindowShape::Disjoint,
-        _ => SyncWindowShape::Nested,
-    }
 }
 
 pub fn reset_outbound_window_state(db_path: &str, recorded_by: &str, peer_id: &str) {
@@ -148,43 +130,23 @@ pub fn mark_outbound_window_completed(
 }
 
 fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
-    match (sync_window_shape(), kind) {
-        (SyncWindowShape::Nested, SyncWindowKind::Full) => SyncWindow {
-            kind,
-            ts_min_inclusive_ms: Some(ALL_START_MS),
-            ts_max_exclusive_ms: Some(now_ms),
-        },
-        (SyncWindowShape::Disjoint, SyncWindowKind::Full) => SyncWindow {
+    match kind {
+        SyncWindowKind::Full => SyncWindow {
             kind,
             ts_min_inclusive_ms: Some(ALL_START_MS),
             ts_max_exclusive_ms: Some(now_ms - TWELVE_WEEK_MS),
         },
-        (SyncWindowShape::Nested, SyncWindowKind::LastDay) => SyncWindow {
+        SyncWindowKind::LastDay => SyncWindow {
             kind,
             ts_min_inclusive_ms: Some(now_ms - DAY_MS),
             ts_max_exclusive_ms: None,
         },
-        (SyncWindowShape::Nested, SyncWindowKind::LastWeek) => SyncWindow {
-            kind,
-            ts_min_inclusive_ms: Some(now_ms - WEEK_MS),
-            ts_max_exclusive_ms: None,
-        },
-        (SyncWindowShape::Nested, SyncWindowKind::LastTwelveWeeks) => SyncWindow {
-            kind,
-            ts_min_inclusive_ms: Some(now_ms - TWELVE_WEEK_MS),
-            ts_max_exclusive_ms: None,
-        },
-        (SyncWindowShape::Disjoint, SyncWindowKind::LastDay) => SyncWindow {
-            kind,
-            ts_min_inclusive_ms: Some(now_ms - DAY_MS),
-            ts_max_exclusive_ms: None,
-        },
-        (SyncWindowShape::Disjoint, SyncWindowKind::LastWeek) => SyncWindow {
+        SyncWindowKind::LastWeek => SyncWindow {
             kind,
             ts_min_inclusive_ms: Some(now_ms - WEEK_MS),
             ts_max_exclusive_ms: Some(now_ms - DAY_MS),
         },
-        (SyncWindowShape::Disjoint, SyncWindowKind::LastTwelveWeeks) => SyncWindow {
+        SyncWindowKind::LastTwelveWeeks => SyncWindow {
             kind,
             ts_min_inclusive_ms: Some(now_ms - TWELVE_WEEK_MS),
             ts_max_exclusive_ms: Some(now_ms - WEEK_MS),
@@ -348,15 +310,8 @@ pub fn decode_initial_neg_open(msg: &[u8]) -> Result<(SyncWindow, &[u8]), String
 mod tests {
     use super::*;
 
-    fn env_guard() -> std::sync::MutexGuard<'static, ()> {
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        LOCK.get_or_init(|| Mutex::new(())).lock().unwrap()
-    }
-
     #[test]
     fn range_scheduler_round_robins_windows() {
-        let _guard = env_guard();
-        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
         let db_path = "/tmp/window-round-robin";
         let recorded_by = "tenant-a";
         let peer_id = "peer-a";
@@ -386,14 +341,10 @@ mod tests {
                 SyncWindowKind::Full,
             ]
         );
-        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
     }
 
     #[test]
-    fn disjoint_shape_uses_adjacent_non_full_windows() {
-        let _guard = env_guard();
-        std::env::set_var("TOPO_SYNC_WINDOW_SHAPE", "disjoint");
-
+    fn scheduler_uses_adjacent_non_full_windows() {
         let day = window_for_kind(SyncWindowKind::LastDay, 1_000_000);
         let week = window_for_kind(SyncWindowKind::LastWeek, 1_000_000);
         let twelve_weeks = window_for_kind(SyncWindowKind::LastTwelveWeeks, 1_000_000);
@@ -410,14 +361,10 @@ mod tests {
 
         assert_eq!(full.ts_min(), Some(ALL_START_MS));
         assert_eq!(full.ts_max_exclusive(), Some(1_000_000 - TWELVE_WEEK_MS));
-
-        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
     }
 
     #[test]
     fn hot_windows_are_duplicated_across_live_peers() {
-        let _guard = env_guard();
-        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
         let db_path = "/tmp/window-hot-dup";
         let recorded_by = "tenant-a";
         let peer_a = "peer-a";
@@ -433,8 +380,6 @@ mod tests {
 
     #[test]
     fn range_scheduler_uses_stable_cycle_anchor_across_window_steps() {
-        let _guard = env_guard();
-        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
         let db_path = "/tmp/window-cycle-anchor";
         let recorded_by = "tenant-a";
         let peer_id = "peer-a";
@@ -452,8 +397,6 @@ mod tests {
 
     #[test]
     fn cold_windows_partition_by_live_peer_rank() {
-        let _guard = env_guard();
-        std::env::set_var("TOPO_SYNC_WINDOW_SHAPE", "disjoint");
         let db_path = "/tmp/window-partition";
         let recorded_by = "tenant-a";
         let peer_a = "peer-a";
@@ -479,14 +422,10 @@ mod tests {
         assert_eq!(week_a.ts_max_exclusive(), Some(1_000_000 - DAY_MS));
         assert_eq!(week_b.ts_min(), Some(1_000_000 - WEEK_MS));
         assert_eq!(week_b.ts_max_exclusive(), Some(1_000_000 - (4 * DAY_MS)));
-
-        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
     }
 
     #[test]
     fn cold_windows_expand_when_live_peer_set_shrinks() {
-        let _guard = env_guard();
-        std::env::set_var("TOPO_SYNC_WINDOW_SHAPE", "disjoint");
         let db_path = "/tmp/window-peer-loss";
         let recorded_by = "tenant-a";
         let peer_a = "peer-a";
@@ -524,14 +463,10 @@ mod tests {
         assert_eq!(split_week.ts_max_exclusive(), Some(1_000_000 - DAY_MS));
         assert_eq!(single_week.ts_min(), Some(1_000_000 - WEEK_MS));
         assert_eq!(single_week.ts_max_exclusive(), Some(1_000_000 - DAY_MS));
-
-        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
     }
 
     #[test]
     fn full_range_partitions_cover_without_overlap() {
-        let _guard = env_guard();
-        std::env::set_var("TOPO_SYNC_WINDOW_SHAPE", "disjoint");
         let db_path = "/tmp/window-full-cover";
         let recorded_by = "tenant-a";
         let peers = vec![
@@ -567,8 +502,6 @@ mod tests {
         for pair in full_windows.windows(2) {
             assert_eq!(pair[0].ts_max_exclusive(), pair[1].ts_min());
         }
-
-        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
     }
 
     #[test]

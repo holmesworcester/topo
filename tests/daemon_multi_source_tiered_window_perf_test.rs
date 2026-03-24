@@ -33,7 +33,7 @@ const THREE_YEARS_MS: i64 = 3 * 365 * DAY_MS;
 #[derive(Clone, Copy)]
 struct RangeTiming {
     count: i64,
-    persisted_at_ms: Option<i64>,
+    first_stored_at_ms: Option<i64>,
     projected_at_ms: Option<i64>,
 }
 
@@ -63,7 +63,6 @@ fn env_i64(name: &str, default: i64) -> i64 {
 
 fn inherited_tier_env() -> Vec<(String, String)> {
     [
-        "TOPO_SYNC_WINDOW_SHAPE",
         "TOPO_GENERATE_MESSAGE_SPREAD_MS",
         "TOPO_FORWARD_ON_HAVE",
         "TOPO_EVENT_TIMELINE",
@@ -152,7 +151,7 @@ fn range_timing_sql(db: &str, min_created_at_ms: Option<i64>) -> RangeTiming {
     let conn = topo::db::open_connection(db).expect("open db for range_timing");
     let peer_id = active_tenant_peer_id(db).expect("active tenant peer id");
     conn.query_row(
-        "SELECT COUNT(*), MAX(t.persisted_at), MAX(t.projected_at)
+        "SELECT COUNT(*), MAX(t.first_stored_at), MAX(t.projected_at)
          FROM messages m
          LEFT JOIN event_timeline t ON t.event_id = m.message_id
          WHERE m.recorded_by = ?1
@@ -161,7 +160,7 @@ fn range_timing_sql(db: &str, min_created_at_ms: Option<i64>) -> RangeTiming {
         |row| {
             Ok(RangeTiming {
                 count: row.get(0)?,
-                persisted_at_ms: row.get(1)?,
+                first_stored_at_ms: row.get(1)?,
                 projected_at_ms: row.get(2)?,
             })
         },
@@ -578,7 +577,7 @@ fn write_summary_with_sources(
             "  {:<12} {} msgs durable in {:.2}s projected in {:.2}s\n",
             label,
             timing.count,
-            elapsed_secs(metric_start_ms, timing.persisted_at_ms),
+            elapsed_secs(metric_start_ms, timing.first_stored_at_ms),
             elapsed_secs(metric_start_ms, timing.projected_at_ms),
         ));
     }
@@ -1080,7 +1079,6 @@ fn perf_multi_source_rejoin_8x_10k_discovery() {
 #[ignore = "fresh invitees only know the inviter until discovery warms enough to expose the full peer set"]
 fn cold_join_4x_1k_uses_multiple_sources_efficiently() {
     std::env::set_var("TOPO_MULTI_SOURCE_TOTAL_MESSAGES", "1000");
-    std::env::set_var("TOPO_SYNC_WINDOW_SHAPE", "disjoint");
     let outcome = run_cold_join_bench(4, ConnectivityMode::DiscoveryLoopback);
 
     assert!(
@@ -1100,7 +1098,6 @@ fn cold_join_4x_1k_uses_multiple_sources_efficiently() {
 fn rejoin_4x_1k_uses_multiple_sources_after_preconvergence() {
     std::env::set_var("TOPO_MULTI_SOURCE_TOTAL_MESSAGES", "1000");
     std::env::set_var("TOPO_MULTI_SOURCE_BASELINE_MESSAGES", "500");
-    std::env::set_var("TOPO_SYNC_WINDOW_SHAPE", "disjoint");
     let outcome = run_rejoin_bench(4, ConnectivityMode::DiscoveryLoopback);
 
     assert!(

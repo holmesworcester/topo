@@ -6,8 +6,8 @@ use super::queue::with_sqlite_busy_retry;
 
 #[derive(Clone, Copy)]
 enum TimelineGroup {
-    Transfer,
-    Persist,
+    Receive,
+    Store,
     Projection,
     Blocking,
 }
@@ -15,26 +15,26 @@ enum TimelineGroup {
 impl TimelineGroup {
     const fn bit(self) -> u8 {
         match self {
-            TimelineGroup::Transfer => 1 << 0,
-            TimelineGroup::Persist => 1 << 1,
+            TimelineGroup::Receive => 1 << 0,
+            TimelineGroup::Store => 1 << 1,
             TimelineGroup::Projection => 1 << 2,
             TimelineGroup::Blocking => 1 << 3,
         }
     }
 }
 
-const ALL_TIMELINE_GROUPS: u8 = TimelineGroup::Transfer.bit()
-    | TimelineGroup::Persist.bit()
+const ALL_TIMELINE_GROUPS: u8 = TimelineGroup::Receive.bit()
+    | TimelineGroup::Store.bit()
     | TimelineGroup::Projection.bit()
     | TimelineGroup::Blocking.bit();
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EventTimelineRow {
     pub event_id: String,
-    pub response_received_at: Option<i64>,
-    // First durable store time. For range sync this is the append-only receive
-    // log write; for direct ingest fallback paths this is the canonical insert.
-    pub persisted_at: Option<i64>,
+    pub first_received_at: Option<i64>,
+    // First store time. For range sync this is the append-only receive-log
+    // write; for direct ingest fallback paths this is the canonical insert.
+    pub first_stored_at: Option<i64>,
     pub blocked_at: Option<i64>,
     pub unblocked_at: Option<i64>,
     pub unblocked_by_event_id: Option<String>,
@@ -50,8 +50,8 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         "
         CREATE TABLE IF NOT EXISTS event_timeline (
             event_id TEXT PRIMARY KEY,
-            response_received_at INTEGER,
-            persisted_at INTEGER,
+            first_received_at INTEGER,
+            first_stored_at INTEGER,
             blocked_at INTEGER,
             unblocked_at INTEGER,
             unblocked_by_event_id TEXT,
@@ -59,6 +59,8 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         );
         ",
     )?;
+    rename_or_copy_column(conn, "response_received_at", "first_received_at")?;
+    rename_or_copy_column(conn, "persisted_at", "first_stored_at")?;
     if !column_exists(conn, "unblocked_by_event_id")? {
         conn.execute(
             "ALTER TABLE event_timeline ADD COLUMN unblocked_by_event_id TEXT",
@@ -104,8 +106,8 @@ fn parse_groups_mask(raw: Option<&str>) -> u8 {
         match part.as_str() {
             "" => {}
             "all" => return ALL_TIMELINE_GROUPS,
-            "transfer" => mask |= TimelineGroup::Transfer.bit(),
-            "persist" => mask |= TimelineGroup::Persist.bit(),
+            "receive" | "transfer" => mask |= TimelineGroup::Receive.bit(),
+            "store" | "persist" => mask |= TimelineGroup::Store.bit(),
             "projection" => mask |= TimelineGroup::Projection.bit(),
             "blocking" => mask |= TimelineGroup::Blocking.bit(),
             _ => {}
@@ -123,53 +125,53 @@ impl<'a> EventTimeline<'a> {
         Self { conn }
     }
 
-    pub fn mark_response_received_b64(&self, event_id_b64: &str, ts: i64) -> SqliteResult<()> {
-        if !group_enabled(TimelineGroup::Transfer) {
+    pub fn mark_first_received_b64(&self, event_id_b64: &str, ts: i64) -> SqliteResult<()> {
+        if !group_enabled(TimelineGroup::Receive) {
             return Ok(());
         }
-        self.mark_b64(event_id_b64, "response_received_at", ts)
+        self.mark_b64(event_id_b64, "first_received_at", ts)
     }
 
-    pub fn mark_persisted_b64(&self, event_id_b64: &str, ts: i64) -> SqliteResult<()> {
-        if !group_enabled(TimelineGroup::Persist) {
+    pub fn mark_first_stored_b64(&self, event_id_b64: &str, ts: i64) -> SqliteResult<()> {
+        if !group_enabled(TimelineGroup::Store) {
             return Ok(());
         }
-        self.mark_b64(event_id_b64, "persisted_at", ts)
+        self.mark_b64(event_id_b64, "first_stored_at", ts)
     }
 
-    pub fn mark_received_and_persisted_b64(
+    pub fn mark_received_and_stored_b64(
         &self,
         event_id_b64: &str,
-        response_received_at: i64,
-        persisted_at: i64,
+        first_received_at: i64,
+        first_stored_at: i64,
     ) -> SqliteResult<()> {
         if !recording_enabled() {
             return Ok(());
         }
-        let write_transfer = group_enabled(TimelineGroup::Transfer);
-        let write_persist = group_enabled(TimelineGroup::Persist);
-        if !write_transfer && !write_persist {
+        let write_receive = group_enabled(TimelineGroup::Receive);
+        let write_store = group_enabled(TimelineGroup::Store);
+        if !write_receive && !write_store {
             return Ok(());
         }
         with_sqlite_busy_retry(|| {
             self.conn.execute(
-                "INSERT INTO event_timeline (event_id, response_received_at, persisted_at)
+                "INSERT INTO event_timeline (event_id, first_received_at, first_stored_at)
                  VALUES (?1, ?2, ?3)
                  ON CONFLICT(event_id) DO UPDATE SET
-                     response_received_at = CASE
-                         WHEN event_timeline.response_received_at IS NULL AND ?4 != 0 THEN excluded.response_received_at
-                         ELSE event_timeline.response_received_at
+                     first_received_at = CASE
+                         WHEN event_timeline.first_received_at IS NULL AND ?4 != 0 THEN excluded.first_received_at
+                         ELSE event_timeline.first_received_at
                      END,
-                     persisted_at = CASE
-                         WHEN event_timeline.persisted_at IS NULL AND ?5 != 0 THEN excluded.persisted_at
-                         ELSE event_timeline.persisted_at
+                     first_stored_at = CASE
+                         WHEN event_timeline.first_stored_at IS NULL AND ?5 != 0 THEN excluded.first_stored_at
+                         ELSE event_timeline.first_stored_at
                      END",
                 params![
                     event_id_b64,
-                    write_transfer.then_some(response_received_at),
-                    write_persist.then_some(persisted_at),
-                    if write_transfer { 1 } else { 0 },
-                    if write_persist { 1 } else { 0 },
+                    write_receive.then_some(first_received_at),
+                    write_store.then_some(first_stored_at),
+                    if write_receive { 1 } else { 0 },
+                    if write_store { 1 } else { 0 },
                 ],
             )?;
             Ok(())
@@ -222,8 +224,8 @@ impl<'a> EventTimeline<'a> {
                 .query_row(
                     "SELECT
                          event_id,
-                         response_received_at,
-                         persisted_at,
+                         first_received_at,
+                         first_stored_at,
                          blocked_at,
                          unblocked_at,
                          unblocked_by_event_id,
@@ -234,8 +236,8 @@ impl<'a> EventTimeline<'a> {
                     |row| {
                         Ok(EventTimelineRow {
                             event_id: row.get(0)?,
-                            response_received_at: row.get(1)?,
-                            persisted_at: row.get(2)?,
+                            first_received_at: row.get(1)?,
+                            first_stored_at: row.get(2)?,
                             blocked_at: row.get(3)?,
                             unblocked_at: row.get(4)?,
                             unblocked_by_event_id: row.get(5)?,
@@ -254,10 +256,10 @@ impl<'a> EventTimeline<'a> {
         let spans = [
             span_label(
                 "receive_to_store_ms",
-                row.response_received_at,
-                row.persisted_at,
+                row.first_received_at,
+                row.first_stored_at,
             ),
-            span_label("store_to_project_ms", row.persisted_at, row.projected_at),
+            span_label("store_to_project_ms", row.first_stored_at, row.projected_at),
             span_label("blocked_duration_ms", row.blocked_at, row.unblocked_at),
         ]
         .into_iter()
@@ -265,9 +267,9 @@ impl<'a> EventTimeline<'a> {
         .collect::<Vec<_>>()
         .join(", ");
         let stages = format!(
-            "resp_recv={}; stored={}; blocked={}; unblocked={}; unblocked_by={}; projected={}",
-            fmt_opt(row.response_received_at),
-            fmt_opt(row.persisted_at),
+            "received={}; stored={}; blocked={}; unblocked={}; unblocked_by={}; projected={}",
+            fmt_opt(row.first_received_at),
+            fmt_opt(row.first_stored_at),
             fmt_opt(row.blocked_at),
             fmt_opt(row.unblocked_at),
             row.unblocked_by_event_id
@@ -319,6 +321,31 @@ fn column_exists(conn: &Connection, column: &str) -> SqliteResult<bool> {
     Ok(false)
 }
 
+fn rename_or_copy_column(
+    conn: &Connection,
+    old_column: &str,
+    new_column: &str,
+) -> SqliteResult<()> {
+    if column_exists(conn, new_column)? || !column_exists(conn, old_column)? {
+        return Ok(());
+    }
+
+    let rename_sql =
+        format!("ALTER TABLE event_timeline RENAME COLUMN {old_column} TO {new_column}");
+    match conn.execute(&rename_sql, []) {
+        Ok(_) => Ok(()),
+        Err(_) => {
+            let add_sql = format!("ALTER TABLE event_timeline ADD COLUMN {new_column} INTEGER");
+            conn.execute(&add_sql, [])?;
+            let copy_sql = format!(
+                "UPDATE event_timeline SET {new_column} = {old_column} WHERE {new_column} IS NULL"
+            );
+            conn.execute(&copy_sql, [])?;
+            Ok(())
+        }
+    }
+}
+
 fn span_label(label: &str, start: Option<i64>, end: Option<i64>) -> Option<String> {
     Some(format!("{label}={}", end?.saturating_sub(start?)))
 }
@@ -343,11 +370,9 @@ mod tests {
         let event_id = event_id(7);
         let event_id_b64 = event_id_to_base64(&event_id);
 
-        timeline
-            .mark_response_received_b64(&event_id_b64, 50)
-            .unwrap();
-        timeline.mark_persisted_b64(&event_id_b64, 60).unwrap();
-        timeline.mark_persisted_b64(&event_id_b64, 70).unwrap();
+        timeline.mark_first_received_b64(&event_id_b64, 50).unwrap();
+        timeline.mark_first_stored_b64(&event_id_b64, 60).unwrap();
+        timeline.mark_first_stored_b64(&event_id_b64, 70).unwrap();
         timeline.mark_blocked_b64(&event_id_b64, 65).unwrap();
         timeline
             .mark_unblocked_with_dependency_b64(&event_id_b64, 80, Some("dep-1"))
@@ -355,8 +380,8 @@ mod tests {
         timeline.mark_projected_b64(&event_id_b64, 90).unwrap();
 
         let row = timeline.load(&event_id_b64).unwrap().unwrap();
-        assert_eq!(row.response_received_at, Some(50));
-        assert_eq!(row.persisted_at, Some(60));
+        assert_eq!(row.first_received_at, Some(50));
+        assert_eq!(row.first_stored_at, Some(60));
         assert_eq!(row.blocked_at, Some(65));
         assert_eq!(row.unblocked_at, Some(80));
         assert_eq!(row.unblocked_by_event_id.as_deref(), Some("dep-1"));
@@ -370,8 +395,8 @@ mod tests {
     #[test]
     fn parse_groups_mask_accepts_named_subsets() {
         let mask = parse_groups_mask(Some("transfer,persist,blocking"));
-        assert_ne!(mask & TimelineGroup::Transfer.bit(), 0);
-        assert_ne!(mask & TimelineGroup::Persist.bit(), 0);
+        assert_ne!(mask & TimelineGroup::Receive.bit(), 0);
+        assert_ne!(mask & TimelineGroup::Store.bit(), 0);
         assert_ne!(mask & TimelineGroup::Blocking.bit(), 0);
         assert_eq!(mask & TimelineGroup::Projection.bit(), 0);
     }

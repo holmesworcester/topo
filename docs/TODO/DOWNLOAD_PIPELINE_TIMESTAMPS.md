@@ -47,8 +47,8 @@ For each `event_id`, record nullable timestamps such as:
 - `request_sent_at`
 - `request_received_at`
 - `response_sent_at`
-- `response_received_at`
-- `persisted_at`
+- `first_received_at`
+- `first_stored_at`
 - `projected_at`
 
 - `blocked_at`

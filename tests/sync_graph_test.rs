@@ -544,7 +544,6 @@ async fn catchup_8x_100k() {
 #[tokio::test]
 async fn catchup_4x_240_spread_uses_multiple_sources_efficiently() {
     let _guard = acquire_graph_test_guard().await;
-    std::env::set_var("TOPO_SYNC_WINDOW_SHAPE", "disjoint");
 
     let source_count = 4;
     let total_messages = 240usize;

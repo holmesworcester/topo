@@ -1325,11 +1325,9 @@ Baseline implementation:
 1. `neg_items` stores shared-event membership tuples (`workspace_id`, timestamp, event id bytes).
 2. `RangeSession` queries `neg_items` for one explicit range and loads that slice into an in-memory `NegentropyStorageVector`.
 3. Control-plane reconciliation uses `NegOpen` and `NegMsg`; the first `NegOpen` may carry a `P7SW` window envelope selecting one of:
-   - `LastHour`
    - `LastDay`
    - `LastWeek`
-   - `LastMonth`
-   - `LastYear`
+   - `LastTwelveWeeks`
    - `Full`
 4. Outbound scheduling currently round-robins those windows per `(db_path, peer_id)`.
 5. Range data transfer streams `Event` frames after reconciliation for that range.

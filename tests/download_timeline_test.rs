@@ -22,11 +22,11 @@ fn assert_sink_delivery_timeline(
             panic!("missing sink timeline row for {sink_name} event {event_id_b64}")
         });
     assert!(
-        row.response_received_at.is_some(),
+        row.first_received_at.is_some(),
         "{sink_name} should record receive time for {event_id_b64}"
     );
     assert!(
-        row.persisted_at.is_some(),
+        row.first_stored_at.is_some(),
         "{sink_name} should record first store time for {event_id_b64}"
     );
     assert!(
@@ -35,12 +35,12 @@ fn assert_sink_delivery_timeline(
     );
     assert_non_decreasing(
         &format!("{sink_name} receive->store"),
-        row.response_received_at,
-        row.persisted_at,
+        row.first_received_at,
+        row.first_stored_at,
     );
     assert_non_decreasing(
         &format!("{sink_name} store->project"),
-        row.persisted_at,
+        row.first_stored_at,
         row.projected_at,
     );
 }
