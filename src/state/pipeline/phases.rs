@@ -44,9 +44,13 @@ pub(super) fn run_persist_phase(
         shared_event_fanouts: Vec::new(),
     };
 
-    for (event_id, blob, recorded_by, source_tag, received_at_ms) in batch {
+    for (event_id, blob, recorded_by, source_tag, received_at_ms, first_stored_at_ms) in batch {
         let event_id_b64 = event_id_to_base64(event_id);
-        let _ = timeline.mark_response_received_b64(&event_id_b64, *received_at_ms);
+        let _ = timeline.mark_received_and_persisted_b64(
+            &event_id_b64,
+            *received_at_ms,
+            *first_stored_at_ms,
+        );
 
         if let Some(created_at_ms) = events::extract_created_at_ms(blob) {
             if let Some(type_code) = events::extract_event_type(blob) {
@@ -117,8 +121,6 @@ pub(super) fn run_persist_phase(
                             continue;
                         }
                     };
-                    let _ = timeline.mark_persisted_b64(&event_id_b64, recorded_at);
-
                     // Enqueue for durable projection (atomicity boundary 1)
                     let priority_lane = if events::outer_semantic_type_code(blob)
                         == Some(events::EVENT_TYPE_FILE_SLICE)
@@ -228,6 +230,7 @@ mod tests {
             blob,
             "peer-alpha".to_string(),
             "sync".to_string(),
+            0,
             0,
         )];
 

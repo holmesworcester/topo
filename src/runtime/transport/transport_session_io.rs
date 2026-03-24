@@ -137,15 +137,8 @@ struct SyncDataSendIo<S: StreamSend + Send + 'static> {
 #[async_trait]
 impl<S: StreamSend + Send + 'static> DataSendIo for SyncDataSendIo<S> {
     async fn send(&mut self, frame: &[u8]) -> Result<(), TransportSessionIoError> {
-        if frame.len() > self.max_frame_size {
-            return Err(TransportSessionIoError::FrameTooLarge {
-                len: frame.len(),
-                max: self.max_frame_size,
-            });
-        }
-        let msg = decode_exact_frame(frame, self.max_frame_size)?;
         self.inner
-            .send(&msg)
+            .send_bytes(frame)
             .await
             .map_err(|e| map_connection_error(e, self.max_frame_size))
     }
@@ -166,12 +159,10 @@ struct SyncDataRecvIo<R: StreamRecv + Send + 'static> {
 #[async_trait]
 impl<R: StreamRecv + Send + 'static> DataRecvIo for SyncDataRecvIo<R> {
     async fn recv(&mut self) -> Result<Vec<u8>, TransportSessionIoError> {
-        let msg = self
-            .inner
-            .recv()
+        self.inner
+            .recv_chunk()
             .await
-            .map_err(|e| map_connection_error(e, self.max_frame_size))?;
-        Ok(encode_frame(&msg))
+            .map_err(|e| map_connection_error(e, self.max_frame_size))
     }
 }
 
@@ -278,7 +269,7 @@ mod tests {
 
     #[derive(Default)]
     struct MockSendState {
-        sent: Vec<Frame>,
+        sent: Vec<Vec<u8>>,
         flushes: usize,
     }
 
@@ -302,7 +293,20 @@ mod tests {
     #[async_trait]
     impl StreamSend for MockDataSend {
         async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
-            self.state.lock().expect("send lock").sent.push(msg.clone());
+            self.state
+                .lock()
+                .expect("send lock")
+                .sent
+                .push(encode_frame(msg));
+            Ok(())
+        }
+
+        async fn send_bytes(&mut self, bytes: &[u8]) -> Result<(), ConnectionError> {
+            self.state
+                .lock()
+                .expect("send lock")
+                .sent
+                .push(bytes.to_vec());
             Ok(())
         }
 
@@ -314,7 +318,7 @@ mod tests {
 
     #[derive(Default)]
     struct MockRecvState {
-        recv: VecDeque<Result<Frame, ConnectionError>>,
+        recv: VecDeque<Result<Vec<u8>, ConnectionError>>,
     }
 
     #[derive(Clone)]
@@ -324,7 +328,7 @@ mod tests {
 
     impl MockDataRecv {
         fn with_recv(
-            recv: Vec<Result<Frame, ConnectionError>>,
+            recv: Vec<Result<Vec<u8>, ConnectionError>>,
         ) -> (Self, Arc<Mutex<MockRecvState>>) {
             let state = Arc::new(Mutex::new(MockRecvState { recv: recv.into() }));
             (
@@ -339,6 +343,17 @@ mod tests {
     #[async_trait]
     impl StreamRecv for MockDataRecv {
         async fn recv(&mut self) -> Result<Frame, ConnectionError> {
+            let chunk = self.recv_chunk().await?;
+            let (frame, consumed) = parse_frame(&chunk)?;
+            if consumed != chunk.len() {
+                return Err(ConnectionError::Parse(ParseError::NegMessageTooLarge(
+                    chunk.len(),
+                )));
+            }
+            Ok(frame)
+        }
+
+        async fn recv_chunk(&mut self) -> Result<Vec<u8>, ConnectionError> {
             self.state
                 .lock()
                 .expect("recv lock")
@@ -350,7 +365,7 @@ mod tests {
 
     fn build_io(
         control_recv: Vec<Result<Frame, ConnectionError>>,
-        data_recv: Vec<Result<Frame, ConnectionError>>,
+        data_recv: Vec<Result<Vec<u8>, ConnectionError>>,
     ) -> (
         TransportSessionIoParts,
         Arc<Mutex<MockControlState>>,
@@ -382,9 +397,9 @@ mod tests {
                     created_at_ms: 1_234,
                 }],
             })],
-            vec![Ok(Frame::Event {
+            vec![Ok(encode_frame(&Frame::Event {
                 blob: vec![1, 2, 3],
-            })],
+            }))],
         );
 
         let control_frame = parts.control.recv().await.expect("recv control");
@@ -430,12 +445,7 @@ mod tests {
 
         let data_send = data_send_state.lock().expect("send lock");
         assert_eq!(data_send.sent.len(), 1);
-        assert_eq!(
-            data_send.sent[0],
-            Frame::Event {
-                blob: vec![4, 5, 6]
-            }
-        );
+        assert_eq!(data_send.sent[0], event);
         assert!(data_send.flushes >= 1);
     }
 
@@ -463,36 +473,19 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn recv_data_maps_parse_too_large_to_typed_error() {
-        let parse_err = ConnectionError::Parse(ParseError::NegMessageTooLarge(123_456));
-        let (mut parts, _control_state, _data_send_state) = build_io(vec![], vec![Err(parse_err)]);
+    async fn data_send_and_recv_pass_raw_bytes_through() {
+        let raw = vec![9u8; DEFAULT_SYNC_FRAME_MAX_BYTES + 17];
+        let (mut parts, _control_state, data_send_state) =
+            build_io(vec![], vec![Ok(raw.clone())]);
 
-        let err = parts.data_recv.recv().await.expect_err("expected error");
-        assert_eq!(
-            err,
-            TransportSessionIoError::FrameTooLarge {
-                len: 123_456,
-                max: DEFAULT_SYNC_FRAME_MAX_BYTES,
-            }
-        );
-    }
+        let recv = parts.data_recv.recv().await.expect("recv raw data");
+        assert_eq!(recv, raw);
 
-    #[tokio::test]
-    async fn send_data_rejects_oversized_frame_before_parse() {
-        let (mut parts, _control_state, _data_send_state) = build_io(vec![], vec![]);
-        let oversized = vec![0u8; DEFAULT_SYNC_FRAME_MAX_BYTES + 1];
+        parts.data_send.send(&raw).await.expect("send raw data");
+        parts.data_send.flush().await.expect("flush raw data");
 
-        let err = parts
-            .data_send
-            .send(&oversized)
-            .await
-            .expect_err("expected error");
-        assert_eq!(
-            err,
-            TransportSessionIoError::FrameTooLarge {
-                len: DEFAULT_SYNC_FRAME_MAX_BYTES + 1,
-                max: DEFAULT_SYNC_FRAME_MAX_BYTES,
-            }
-        );
+        let data_send = data_send_state.lock().expect("send lock");
+        assert_eq!(data_send.sent, vec![raw]);
+        assert!(data_send.flushes >= 1);
     }
 }

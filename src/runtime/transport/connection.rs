@@ -19,6 +19,7 @@ pub trait StreamConn {
 #[async_trait]
 pub trait StreamSend {
     async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError>;
+    async fn send_bytes(&mut self, bytes: &[u8]) -> Result<(), ConnectionError>;
     async fn flush(&mut self) -> Result<(), ConnectionError>;
 }
 
@@ -26,6 +27,7 @@ pub trait StreamSend {
 #[async_trait]
 pub trait StreamRecv {
     async fn recv(&mut self) -> Result<Frame, ConnectionError>;
+    async fn recv_chunk(&mut self) -> Result<Vec<u8>, ConnectionError>;
 }
 
 /// Bidirectional QUIC stream wrapper for sync protocol
@@ -159,7 +161,11 @@ impl SendConnection {
 
     pub async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
         let data = encode_frame(msg);
-        self.send.write_all(&data).await?;
+        self.send_bytes(&data).await
+    }
+
+    pub async fn send_bytes(&mut self, bytes: &[u8]) -> Result<(), ConnectionError> {
+        self.send.write_all(bytes).await?;
         Ok(())
     }
 
@@ -210,6 +216,18 @@ impl RecvConnection {
             }
         }
     }
+
+    pub async fn recv_chunk(&mut self) -> Result<Vec<u8>, ConnectionError> {
+        let mut buf = vec![0u8; 64 * 1024];
+        let chunk = self.recv.read(&mut buf).await?;
+        match chunk {
+            Some(n) if n > 0 => {
+                buf.truncate(n);
+                Ok(buf)
+            }
+            _ => Err(ConnectionError::Closed),
+        }
+    }
 }
 
 #[async_trait]
@@ -233,6 +251,10 @@ impl StreamSend for SendConnection {
         SendConnection::send(self, msg).await
     }
 
+    async fn send_bytes(&mut self, bytes: &[u8]) -> Result<(), ConnectionError> {
+        SendConnection::send_bytes(self, bytes).await
+    }
+
     async fn flush(&mut self) -> Result<(), ConnectionError> {
         SendConnection::flush(self).await
     }
@@ -242,6 +264,10 @@ impl StreamSend for SendConnection {
 impl StreamRecv for RecvConnection {
     async fn recv(&mut self) -> Result<Frame, ConnectionError> {
         RecvConnection::recv(self).await
+    }
+
+    async fn recv_chunk(&mut self) -> Result<Vec<u8>, ConnectionError> {
+        RecvConnection::recv_chunk(self).await
     }
 }
 

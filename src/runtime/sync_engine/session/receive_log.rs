@@ -1,24 +1,27 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
 
 use crate::contracts::event_pipeline_contract::IngestItem;
-use crate::crypto::{event_id_to_base64, hash_event};
-use crate::db::{open_connection, timeline::EventTimeline};
-use crate::protocol::{encode_frame, parse_frame, Frame, ParseError};
+use crate::crypto::hash_event;
+use crate::protocol::{parse_frame, Frame, ParseError};
 use crate::state::pipeline::ingest_now;
 
 const RECEIVE_LOG_PREFIX: &str = "recvlog";
 const RECEIVE_LOG_DATA_SUFFIX: &str = "bin";
 const RECEIVE_LOG_META_SUFFIX: &str = "meta";
 const RECEIVE_LOG_INGEST_BATCH_CAP: usize = 256;
+const RECEIVE_LOG_INGEST_BATCH_MAX_BYTES: usize = 8 * 1024 * 1024;
 const RECEIVE_LOG_HEADER_MAGIC: &[u8; 4] = b"P7RL";
-const RECEIVE_LOG_HEADER_VERSION: u8 = 1;
+const RECEIVE_LOG_HEADER_VERSION: u8 = 2;
 const RECEIVE_LOG_HEADER_PREFIX_LEN: usize = 9;
 const RECEIVE_LOG_HEADER_MAX_BYTES: usize = 64 * 1024;
+const RECEIVE_LOG_RECORD_PREFIX_LEN: usize = 12;
+const RECEIVE_LOG_RECORD_SUFFIX_LEN: usize = 8;
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiveLogHeader {
@@ -30,8 +33,20 @@ pub struct ReceiveLogHeader {
 pub struct ReceiveLogWriter {
     path: PathBuf,
     file: File,
-    timeline_db: rusqlite::Connection,
     bytes_written: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct ReceiveLogRecord {
+    blob: Vec<u8>,
+    received_at_ms: i64,
+    first_stored_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ReceiveLogVersion {
+    V1Frames,
+    V2Records,
 }
 
 impl ReceiveLogWriter {
@@ -58,29 +73,34 @@ impl ReceiveLogWriter {
             .open(&path)
             .map_err(|e| format!("open receive log {}: {e}", path.display()))?;
         write_receive_log_header(&mut file, &header)?;
-        let timeline_db = open_connection(db_path)
-            .map_err(|e| format!("open timeline db for receive log {}: {e}", path.display()))?;
+        let _ = db_path;
         Ok(Self {
             path,
             file,
-            timeline_db,
             bytes_written: 0,
         })
     }
 
     pub fn append_blob(&mut self, blob: &[u8]) -> Result<(), String> {
-        let event_id_b64 = event_id_to_base64(&hash_event(blob));
         let received_at = current_timestamp_ms();
-        let timeline = EventTimeline::new(&self.timeline_db);
-        let _ = timeline.mark_response_received_b64(&event_id_b64, received_at);
-        let frame = encode_frame(&Frame::Event {
-            blob: blob.to_vec(),
-        });
+        let blob_len = u32::try_from(blob.len())
+            .map_err(|_| format!("receive log blob too large: {} bytes", blob.len()))?;
         self.file
-            .write_all(&frame)
+            .write_all(&received_at.to_le_bytes())
             .map_err(|e| format!("append receive log {}: {e}", self.path.display()))?;
-        self.bytes_written = self.bytes_written.saturating_add(frame.len() as u64);
-        let _ = timeline.mark_persisted_b64(&event_id_b64, current_timestamp_ms());
+        self.file
+            .write_all(&blob_len.to_le_bytes())
+            .map_err(|e| format!("append receive log {}: {e}", self.path.display()))?;
+        self.file
+            .write_all(blob)
+            .map_err(|e| format!("append receive log {}: {e}", self.path.display()))?;
+        let first_stored_at_ms = current_timestamp_ms();
+        self.file
+            .write_all(&first_stored_at_ms.to_le_bytes())
+            .map_err(|e| format!("append receive log {}: {e}", self.path.display()))?;
+        self.bytes_written = self.bytes_written.saturating_add(
+            (RECEIVE_LOG_RECORD_PREFIX_LEN + blob.len() + RECEIVE_LOG_RECORD_SUFFIX_LEN) as u64,
+        );
         Ok(())
     }
 
@@ -92,8 +112,16 @@ impl ReceiveLogWriter {
             .sync_all()
             .map_err(|e| format!("sync receive log {}: {e}", self.path.display()))?;
         if self.bytes_written == 0 {
-            fs::remove_file(&self.path)
-                .map_err(|e| format!("delete empty receive log {}: {e}", self.path.display()))?;
+            match fs::remove_file(&self.path) {
+                Ok(()) => {}
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+                Err(e) => {
+                    return Err(format!(
+                        "delete empty receive log {}: {e}",
+                        self.path.display()
+                    ))
+                }
+            }
             return Ok(None);
         }
         Ok(Some(self.path))
@@ -105,21 +133,27 @@ pub fn receive_log_dir(db_path: &str) -> PathBuf {
 }
 
 pub fn ingest_receive_log(db_path: &str, path: &Path) -> Result<usize, String> {
-    let (mut file, header) = open_receive_log(path)?;
+    let (mut file, header, version) = open_receive_log(path)?;
     let mut ingested = 0usize;
     let mut batch = Vec::<IngestItem>::with_capacity(RECEIVE_LOG_INGEST_BATCH_CAP);
+    let mut batch_bytes = 0usize;
 
-    stream_receive_log(&mut file, path, |blob| {
-        let event_id = hash_event(&blob);
+    stream_receive_log(&mut file, path, version, |record| {
+        let event_id = hash_event(&record.blob);
+        batch_bytes = batch_bytes.saturating_add(record.blob.len());
         batch.push((
             event_id,
-            blob,
+            record.blob,
             header.recorded_by.clone(),
             header.source_tag.clone(),
-            current_timestamp_ms(),
+            record.received_at_ms,
+            record.first_stored_at_ms,
         ));
-        if batch.len() >= RECEIVE_LOG_INGEST_BATCH_CAP {
+        if batch.len() >= RECEIVE_LOG_INGEST_BATCH_CAP
+            || batch_bytes >= RECEIVE_LOG_INGEST_BATCH_MAX_BYTES
+        {
             ingested += ingest_now(db_path, std::mem::take(&mut batch))?;
+            batch_bytes = 0;
         }
         Ok(())
     })?;
@@ -164,9 +198,11 @@ pub fn recover_receive_logs(db_path: &str) -> Result<usize, String> {
 }
 
 fn receive_log_stem(session_id: u64) -> String {
+    static NEXT_RECEIVE_LOG_NONCE: AtomicU64 = AtomicU64::new(1);
     format!(
-        "{RECEIVE_LOG_PREFIX}.{session_id}.{}",
-        current_timestamp_ms()
+        "{RECEIVE_LOG_PREFIX}.{session_id}.{}.{}",
+        current_timestamp_ms(),
+        NEXT_RECEIVE_LOG_NONCE.fetch_add(1, Ordering::Relaxed)
     )
 }
 
@@ -190,20 +226,20 @@ fn write_receive_log_header(file: &mut File, header: &ReceiveLogHeader) -> Resul
     Ok(())
 }
 
-fn open_receive_log(path: &Path) -> Result<(File, ReceiveLogHeader), String> {
+fn open_receive_log(path: &Path) -> Result<(File, ReceiveLogHeader, ReceiveLogVersion), String> {
     let mut file =
         File::open(path).map_err(|e| format!("open receive log {}: {e}", path.display()))?;
-    let header = match try_read_embedded_receive_log_header(&mut file, path)? {
-        Some(header) => header,
-        None => parse_legacy_receive_log_meta(path)?,
+    let (header, version) = match try_read_embedded_receive_log_header(&mut file, path)? {
+        Some(result) => result,
+        None => (parse_legacy_receive_log_meta(path)?, ReceiveLogVersion::V1Frames),
     };
-    Ok((file, header))
+    Ok((file, header, version))
 }
 
 fn try_read_embedded_receive_log_header(
     file: &mut File,
     path: &Path,
-) -> Result<Option<ReceiveLogHeader>, String> {
+) -> Result<Option<(ReceiveLogHeader, ReceiveLogVersion)>, String> {
     let mut prefix = [0u8; RECEIVE_LOG_HEADER_PREFIX_LEN];
     match file.read_exact(&mut prefix) {
         Ok(()) => {}
@@ -220,13 +256,17 @@ fn try_read_embedded_receive_log_header(
             .map_err(|e| format!("rewind receive log {}: {e}", path.display()))?;
         return Ok(None);
     }
-    if prefix[4] != RECEIVE_LOG_HEADER_VERSION {
-        return Err(format!(
-            "unsupported receive log header version {} for {}",
-            prefix[4],
-            path.display()
-        ));
-    }
+    let version = match prefix[4] {
+        1 => ReceiveLogVersion::V1Frames,
+        2 => ReceiveLogVersion::V2Records,
+        other => {
+            return Err(format!(
+                "unsupported receive log header version {} for {}",
+                other,
+                path.display()
+            ))
+        }
+    };
     let len = u32::from_le_bytes(prefix[5..9].try_into().unwrap()) as usize;
     if len > RECEIVE_LOG_HEADER_MAX_BYTES {
         return Err(format!(
@@ -240,7 +280,7 @@ fn try_read_embedded_receive_log_header(
         .map_err(|e| format!("read receive log header payload {}: {e}", path.display()))?;
     let header: ReceiveLogHeader = serde_json::from_slice(&payload)
         .map_err(|e| format!("decode receive log header {}: {e}", path.display()))?;
-    Ok(Some(header))
+    Ok(Some((header, version)))
 }
 
 fn parse_legacy_receive_log_meta(path: &Path) -> Result<ReceiveLogHeader, String> {
@@ -255,9 +295,28 @@ fn legacy_receive_log_meta_path(path: &Path) -> PathBuf {
     path.with_extension(RECEIVE_LOG_META_SUFFIX)
 }
 
-fn stream_receive_log<F>(file: &mut File, path: &Path, mut on_blob: F) -> Result<usize, String>
+fn stream_receive_log<F>(
+    file: &mut File,
+    path: &Path,
+    version: ReceiveLogVersion,
+    on_record: F,
+) -> Result<usize, String>
 where
-    F: FnMut(Vec<u8>) -> Result<(), String>,
+    F: FnMut(ReceiveLogRecord) -> Result<(), String>,
+{
+    match version {
+        ReceiveLogVersion::V1Frames => stream_legacy_receive_log(file, path, on_record),
+        ReceiveLogVersion::V2Records => stream_record_receive_log(file, path, on_record),
+    }
+}
+
+fn stream_legacy_receive_log<F>(
+    file: &mut File,
+    path: &Path,
+    mut on_record: F,
+) -> Result<usize, String>
+where
+    F: FnMut(ReceiveLogRecord) -> Result<(), String>,
 {
     let mut buffer = Vec::<u8>::with_capacity(64 * 1024);
     let mut read_buf = [0u8; 64 * 1024];
@@ -267,10 +326,53 @@ where
     loop {
         match parse_next_frame(&buffer, &mut offset)? {
             Some(Frame::Event { blob }) => {
-                on_blob(blob)?;
+                let now_ms = current_timestamp_ms();
+                on_record(ReceiveLogRecord {
+                    blob,
+                    received_at_ms: now_ms,
+                    first_stored_at_ms: now_ms,
+                })?;
                 sent += 1;
             }
             Some(_) => {}
+            None => {
+                if offset > 0 {
+                    buffer.drain(..offset);
+                    offset = 0;
+                }
+                let read = file
+                    .read(&mut read_buf)
+                    .map_err(|e| format!("read receive log {}: {e}", path.display()))?;
+                if read == 0 {
+                    break;
+                }
+                buffer.extend_from_slice(&read_buf[..read]);
+            }
+        }
+    }
+
+    Ok(sent)
+}
+
+fn stream_record_receive_log<F>(
+    file: &mut File,
+    path: &Path,
+    mut on_record: F,
+) -> Result<usize, String>
+where
+    F: FnMut(ReceiveLogRecord) -> Result<(), String>,
+{
+    let mut buffer = Vec::<u8>::with_capacity(64 * 1024);
+    let mut read_buf = [0u8; 64 * 1024];
+    let mut offset = 0usize;
+    let mut sent = 0usize;
+
+    loop {
+        match parse_next_record(&buffer, &mut offset)? {
+            Some(record) => {
+                on_record(record)?;
+                sent += 1;
+            }
             None => {
                 if offset > 0 {
                     buffer.drain(..offset);
@@ -308,6 +410,50 @@ fn parse_next_frame(buffer: &[u8], offset: &mut usize) -> Result<Option<Frame>, 
     }
 }
 
+fn parse_next_record(
+    buffer: &[u8],
+    offset: &mut usize,
+) -> Result<Option<ReceiveLogRecord>, String> {
+    if *offset >= buffer.len() {
+        return Ok(None);
+    }
+    if buffer.len() - *offset < RECEIVE_LOG_RECORD_PREFIX_LEN {
+        return Ok(None);
+    }
+
+    let received_at_ms = i64::from_le_bytes(
+        buffer[*offset..*offset + 8]
+            .try_into()
+            .map_err(|_| "receive log record received_at truncated".to_string())?,
+    );
+    let blob_len = u32::from_le_bytes(
+        buffer[*offset + 8..*offset + 12]
+            .try_into()
+            .map_err(|_| "receive log record blob length truncated".to_string())?,
+    ) as usize;
+    let record_len = RECEIVE_LOG_RECORD_PREFIX_LEN
+        .saturating_add(blob_len)
+        .saturating_add(RECEIVE_LOG_RECORD_SUFFIX_LEN);
+    if buffer.len() - *offset < record_len {
+        return Ok(None);
+    }
+
+    let blob_start = *offset + RECEIVE_LOG_RECORD_PREFIX_LEN;
+    let blob_end = blob_start + blob_len;
+    let first_stored_at_ms = i64::from_le_bytes(
+        buffer[blob_end..blob_end + RECEIVE_LOG_RECORD_SUFFIX_LEN]
+            .try_into()
+            .map_err(|_| "receive log record stored_at truncated".to_string())?,
+    );
+    let blob = buffer[blob_start..blob_end].to_vec();
+    *offset += record_len;
+    Ok(Some(ReceiveLogRecord {
+        blob,
+        received_at_ms,
+        first_stored_at_ms,
+    }))
+}
+
 fn current_timestamp_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -318,7 +464,7 @@ fn current_timestamp_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::event_id_to_base64;
+    use crate::crypto::{event_id_to_base64, hash_event};
     use crate::db::{open_connection, schema::create_tables, timeline::EventTimeline};
 
     #[test]
@@ -344,23 +490,24 @@ mod tests {
         }
 
         let mut blobs = Vec::new();
-        let (mut file, _header) = open_receive_log(&path).unwrap();
-        let parsed = stream_receive_log(&mut file, &path, |blob| {
-            blobs.push(blob);
+        let (mut file, _header, version) = open_receive_log(&path).unwrap();
+        let parsed = stream_receive_log(&mut file, &path, version, |record| {
+            blobs.push(record.blob);
             Ok(())
         })
         .unwrap();
         assert_eq!(parsed, 2);
         assert_eq!(blobs, vec![b"one".to_vec(), b"two".to_vec()]);
 
-        let (_file, header) = open_receive_log(&path).unwrap();
+        let (_file, header, version) = open_receive_log(&path).unwrap();
         assert_eq!(header.recorded_by, "tenant-a");
         assert_eq!(header.session_id, 7);
         assert_eq!(header.source_tag, "quic_recv:peer-x@127.0.0.1:7777");
+        assert_eq!(version, ReceiveLogVersion::V2Records);
     }
 
     #[test]
-    fn receive_log_append_marks_first_store_time() {
+    fn receive_log_ingest_replays_first_store_time() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
         let conn = open_connection(&db_path).unwrap();
@@ -371,12 +518,23 @@ mod tests {
         let mut writer =
             ReceiveLogWriter::open(db_path.to_str().unwrap(), "tenant-a", 8, "peer-x").unwrap();
         writer.append_blob(&blob).unwrap();
-        writer.finish().unwrap();
+        let path = writer.finish().unwrap().unwrap();
+
+        ingest_receive_log(db_path.to_str().unwrap(), &path).unwrap();
 
         let timeline = EventTimeline::new(&conn);
         let row = timeline.load(&event_id_b64).unwrap().unwrap();
         assert!(row.response_received_at.is_some());
         assert!(row.persisted_at.is_some());
         assert!(row.response_received_at.unwrap() <= row.persisted_at.unwrap());
+    }
+
+    #[test]
+    fn receive_log_stems_are_unique_with_same_session_and_timestamp() {
+        let first = receive_log_stem(42);
+        let second = receive_log_stem(42);
+        assert_ne!(first, second);
+        assert!(first.starts_with("recvlog.42."));
+        assert!(second.starts_with("recvlog.42."));
     }
 }

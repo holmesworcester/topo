@@ -45,12 +45,14 @@ fn make_ingest_item(
     recorded_by: &str,
     source_tag: &str,
 ) -> crate::contracts::event_pipeline_contract::IngestItem {
+    let now_ms = current_timestamp_ms();
     (
         hash_event(&blob),
         blob,
         recorded_by.to_string(),
         source_tag.to_string(),
-        current_timestamp_ms(),
+        now_ms,
+        now_ms,
     )
 }
 
@@ -157,37 +159,45 @@ async fn run_dependency_receiver(
     source_tag: String,
     cancel: CancellationToken,
 ) -> Result<(), String> {
+    let mut recv_buffer = Vec::<u8>::with_capacity(64 * 1024);
     loop {
-        let frame = tokio::select! {
-            _ = cancel.cancelled() => return Ok(()),
-            frame = data_recv.recv() => frame,
-        };
-        let frame = match frame {
-            Ok(frame) => frame,
-            Err(TransportSessionIoError::ConnectionLost) => return Ok(()),
-            Err(err) => return Err(io_error("dependency data recv", err)),
-        };
         let mut batch = Vec::with_capacity(DEPENDENCY_BATCH_CAP);
-        if let Frame::Event { blob } = decode_exact_frame(&frame)? {
-            batch.push(make_ingest_item(blob, &recorded_by, &source_tag));
-        }
         while batch.len() < DEPENDENCY_BATCH_CAP {
-            let next = tokio::time::timeout(Duration::ZERO, data_recv.recv()).await;
-            let Ok(next) = next else {
-                break;
-            };
-            let frame = match next {
-                Ok(frame) => frame,
-                Err(TransportSessionIoError::ConnectionLost) => break,
-                Err(err) => return Err(io_error("dependency data recv", err)),
-            };
-            if let Frame::Event { blob } = decode_exact_frame(&frame)? {
-                batch.push(make_ingest_item(blob, &recorded_by, &source_tag));
+            match parse_frame(&recv_buffer) {
+                Ok((Frame::Event { blob }, consumed)) => {
+                    recv_buffer.drain(..consumed);
+                    batch.push(make_ingest_item(blob, &recorded_by, &source_tag));
+                }
+                Ok((_other, consumed)) => {
+                    recv_buffer.drain(..consumed);
+                }
+                Err(crate::protocol::ParseError::InsufficientData) => {
+                    let next = if batch.is_empty() {
+                        tokio::select! {
+                            _ = cancel.cancelled() => return Ok(()),
+                            frame = data_recv.recv() => frame,
+                        }
+                    } else {
+                        let next = tokio::time::timeout(Duration::ZERO, data_recv.recv()).await;
+                        let Ok(next) = next else {
+                            break;
+                        };
+                        next
+                    };
+                    match next {
+                        Ok(chunk) => recv_buffer.extend_from_slice(&chunk),
+                        Err(TransportSessionIoError::ConnectionLost) => break,
+                        Err(err) => return Err(io_error("dependency data recv", err)),
+                    }
+                }
+                Err(err) => return Err(format!("parse dependency frame: {err}")),
             }
         }
         if !batch.is_empty() {
             ingest_now(&db_path, batch)?;
+            continue;
         }
+        return Ok(());
     }
 }
 

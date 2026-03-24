@@ -137,6 +137,45 @@ impl<'a> EventTimeline<'a> {
         self.mark_b64(event_id_b64, "persisted_at", ts)
     }
 
+    pub fn mark_received_and_persisted_b64(
+        &self,
+        event_id_b64: &str,
+        response_received_at: i64,
+        persisted_at: i64,
+    ) -> SqliteResult<()> {
+        if !recording_enabled() {
+            return Ok(());
+        }
+        let write_transfer = group_enabled(TimelineGroup::Transfer);
+        let write_persist = group_enabled(TimelineGroup::Persist);
+        if !write_transfer && !write_persist {
+            return Ok(());
+        }
+        with_sqlite_busy_retry(|| {
+            self.conn.execute(
+                "INSERT INTO event_timeline (event_id, response_received_at, persisted_at)
+                 VALUES (?1, ?2, ?3)
+                 ON CONFLICT(event_id) DO UPDATE SET
+                     response_received_at = CASE
+                         WHEN event_timeline.response_received_at IS NULL AND ?4 != 0 THEN excluded.response_received_at
+                         ELSE event_timeline.response_received_at
+                     END,
+                     persisted_at = CASE
+                         WHEN event_timeline.persisted_at IS NULL AND ?5 != 0 THEN excluded.persisted_at
+                         ELSE event_timeline.persisted_at
+                     END",
+                params![
+                    event_id_b64,
+                    write_transfer.then_some(response_received_at),
+                    write_persist.then_some(persisted_at),
+                    if write_transfer { 1 } else { 0 },
+                    if write_persist { 1 } else { 0 },
+                ],
+            )?;
+            Ok(())
+        })
+    }
+
     pub fn mark_blocked_b64(&self, event_id_b64: &str, ts: i64) -> SqliteResult<()> {
         if !group_enabled(TimelineGroup::Blocking) {
             return Ok(());

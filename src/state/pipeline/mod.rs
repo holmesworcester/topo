@@ -57,7 +57,7 @@ fn prewarm_workspace_cache(
     batch: &[IngestItem],
     workspace_cache: &mut HashMap<String, String>,
 ) {
-    for (_, _, recorded_by, _, _) in batch {
+    for (_, _, recorded_by, _, _, _) in batch {
         if workspace_cache.contains_key(recorded_by) {
             continue;
         }
@@ -431,6 +431,7 @@ mod tests {
             blob,
             "tenant-a".to_string(),
             "sync".to_string(),
+            0,
             0,
         )
     }

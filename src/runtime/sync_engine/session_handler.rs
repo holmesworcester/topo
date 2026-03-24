@@ -5,6 +5,7 @@
 //! adapter wrappers so sync never depends on QUIC concrete types.
 
 use async_trait::async_trait;
+use serde_json::json;
 use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 use tracing::info;
@@ -69,6 +70,18 @@ impl StreamSend for DataSendAdapter {
         self.inner.send(&frame).await.map_err(|e| map_io_error(e))
     }
 
+    async fn send_bytes(&mut self, bytes: &[u8]) -> Result<(), ConnectionError> {
+        if let Some(c) = &self.capture {
+            c.record_marker(
+                "data",
+                "tx",
+                "raw_chunk",
+                Some(json!({ "len": bytes.len() }).to_string()),
+            );
+        }
+        self.inner.send(bytes).await.map_err(|e| map_io_error(e))
+    }
+
     async fn flush(&mut self) -> Result<(), ConnectionError> {
         self.inner.flush().await.map_err(|e| map_io_error(e))
     }
@@ -77,17 +90,43 @@ impl StreamSend for DataSendAdapter {
 struct DataRecvAdapter {
     inner: Box<dyn DataRecvIo>,
     capture: Option<SyncRunCapture>,
+    recv_buffer: Vec<u8>,
 }
 
 #[async_trait]
 impl StreamRecv for DataRecvAdapter {
     async fn recv(&mut self) -> Result<Frame, ConnectionError> {
-        let frame = self.inner.recv().await.map_err(|e| map_io_error(e))?;
-        let (msg, _) = parse_frame(&frame).map_err(|e| ConnectionError::Parse(e))?;
-        if let Some(c) = &self.capture {
-            c.record_frame(LogLane::Data, LogDir::Rx, &msg, frame.len());
+        loop {
+            if !self.recv_buffer.is_empty() {
+                match parse_frame(&self.recv_buffer) {
+                    Ok((msg, consumed)) => {
+                        self.recv_buffer.drain(..consumed);
+                        if let Some(c) = &self.capture {
+                            c.record_frame(LogLane::Data, LogDir::Rx, &msg, consumed);
+                        }
+                        return Ok(msg);
+                    }
+                    Err(crate::protocol::ParseError::InsufficientData) => {}
+                    Err(e) => return Err(ConnectionError::Parse(e)),
+                }
+            }
+
+            let chunk = self.inner.recv().await.map_err(|e| map_io_error(e))?;
+            self.recv_buffer.extend_from_slice(&chunk);
         }
-        Ok(msg)
+    }
+
+    async fn recv_chunk(&mut self) -> Result<Vec<u8>, ConnectionError> {
+        let chunk = self.inner.recv().await.map_err(|e| map_io_error(e))?;
+        if let Some(c) = &self.capture {
+            c.record_marker(
+                "data",
+                "rx",
+                "raw_chunk",
+                Some(json!({ "len": chunk.len() }).to_string()),
+            );
+        }
+        Ok(chunk)
     }
 }
 
@@ -181,6 +220,7 @@ impl SessionHandler for SyncConnectionHandler {
                 data_recv: DataRecvAdapter {
                     inner: parts.data_recv,
                     capture,
+                    recv_buffer: Vec::new(),
                 },
             };
 

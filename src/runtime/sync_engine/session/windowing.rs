@@ -45,6 +45,7 @@ const TIER_ORDER: [SyncWindowKind; 6] = [
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PlannerState {
     next_idx: usize,
+    cycle_anchor_now_ms: Option<i64>,
 }
 
 fn planner_state() -> &'static Mutex<HashMap<String, PlannerState>> {
@@ -64,7 +65,10 @@ fn state_for<'a>(
 ) -> &'a mut PlannerState {
     state
         .entry(planner_key(db_path, recorded_by, peer_id))
-        .or_insert(PlannerState { next_idx: 0 })
+        .or_insert(PlannerState {
+            next_idx: 0,
+            cycle_anchor_now_ms: None,
+        })
 }
 
 pub fn sync_window_shape() -> SyncWindowShape {
@@ -101,6 +105,7 @@ pub fn prime_outbound_window_kind(
         .position(|candidate| *candidate == kind)
         .unwrap_or(0);
     planner.next_idx = idx;
+    planner.cycle_anchor_now_ms = None;
 }
 
 pub fn select_outbound_window(
@@ -114,9 +119,16 @@ pub fn select_outbound_window(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let planner = state_for(&mut state, db_path, recorded_by, peer_id);
+    let anchor_now_ms = *planner.cycle_anchor_now_ms.get_or_insert(now_ms);
     let idx = planner.next_idx % TIER_ORDER.len();
     let kind = TIER_ORDER[idx];
-    assign_window(window_for_kind(kind, now_ms), kind, peer_id, live_peer_ids, now_ms)
+    assign_window(
+        window_for_kind(kind, anchor_now_ms),
+        kind,
+        peer_id,
+        live_peer_ids,
+        anchor_now_ms,
+    )
 }
 
 pub fn mark_outbound_window_completed(
@@ -130,6 +142,9 @@ pub fn mark_outbound_window_completed(
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let planner = state_for(&mut state, db_path, recorded_by, peer_id);
     planner.next_idx = (planner.next_idx + 1) % TIER_ORDER.len();
+    if planner.next_idx == 0 {
+        planner.cycle_anchor_now_ms = None;
+    }
 }
 
 fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
@@ -461,6 +476,37 @@ mod tests {
             1_000_000,
         );
         assert_eq!(day_a, day_b);
+    }
+
+    #[test]
+    fn range_scheduler_uses_stable_cycle_anchor_across_window_steps() {
+        let _guard = env_guard();
+        std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
+        let db_path = "/tmp/window-cycle-anchor";
+        let recorded_by = "tenant-a";
+        let peer_id = "peer-a";
+        let live_peers = vec![peer_id.to_string()];
+        reset_outbound_window_state(db_path, recorded_by, peer_id);
+
+        let hour = select_outbound_window(
+            db_path,
+            recorded_by,
+            peer_id,
+            &live_peers,
+            1_000_000,
+        );
+        mark_outbound_window_completed(db_path, recorded_by, peer_id, hour);
+        let day = select_outbound_window(
+            db_path,
+            recorded_by,
+            peer_id,
+            &live_peers,
+            2_000_000,
+        );
+
+        assert_eq!(hour.kind, SyncWindowKind::LastHour);
+        assert_eq!(day.kind, SyncWindowKind::LastDay);
+        assert_eq!(day.ts_min(), Some(1_000_000 - DAY_MS));
     }
 
     #[test]
