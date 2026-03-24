@@ -235,6 +235,10 @@ enum Commands {
         count: usize,
         #[arg(long, default_value = "3y")]
         history_span: String,
+        #[arg(long, default_value = "1")]
+        members: usize,
+        #[arg(long = "devices-per-member", default_value = "1")]
+        devices_per_member: usize,
     },
 
     /// Generate synthetic file events (message + file + file slices)
@@ -2661,6 +2665,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::Generate {
             count,
             history_span,
+            members,
+            devices_per_member,
         } => {
             let data = rpc_require_daemon(
                 db,
@@ -2668,9 +2674,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 RpcMethod::Generate {
                     count,
                     history_span: Some(history_span),
+                    members,
+                    devices_per_member,
                 },
             )?;
-            println!("Generated {} messages in {}", data["count"], db);
+            println!(
+                "Generated {} messages across {} members / {} devices in {}",
+                data["count"], data["members"], data["total_devices"], db
+            );
         }
 
         Commands::GenerateFiles { count, size_mib } => {

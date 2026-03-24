@@ -45,6 +45,10 @@ pub enum RpcMethod {
         count: usize,
         #[serde(default)]
         history_span: Option<String>,
+        #[serde(default = "default_generate_members")]
+        members: usize,
+        #[serde(default = "default_generate_devices_per_member")]
+        devices_per_member: usize,
     },
     GenerateFiles {
         count: usize,
@@ -264,6 +268,14 @@ fn default_device_name() -> String {
 }
 fn default_view_limit() -> usize {
     50
+}
+
+fn default_generate_members() -> usize {
+    1
+}
+
+fn default_generate_devices_per_member() -> usize {
+    1
 }
 fn default_sub_poll_limit() -> usize {
     50

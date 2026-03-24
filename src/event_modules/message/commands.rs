@@ -1,4 +1,5 @@
 use std::io::{BufReader, Read};
+use std::net::Ipv4Addr;
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -260,6 +261,9 @@ pub fn delete_message(
 #[derive(Debug, Serialize, Deserialize)]
 pub struct GenerateResponse {
     pub count: usize,
+    pub members: usize,
+    pub devices_per_member: usize,
+    pub total_devices: usize,
 }
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -278,6 +282,141 @@ fn slices_for_file_size_mib(file_size_mib: usize) -> Result<usize, String> {
         .checked_mul(1024 * 1024)
         .ok_or_else(|| "file_size_mib overflow".to_string())?;
     Ok(file_size_bytes.div_ceil(FILE_SLICE_CIPHERTEXT_BYTES))
+}
+
+fn community_bootstrap_addrs() -> Vec<workspace::invite_link::BootstrapAddress> {
+    vec![workspace::invite_link::BootstrapAddress::Ipv4 {
+        ip: Ipv4Addr::LOCALHOST,
+        port: workspace::invite_link::DEFAULT_PORT,
+    }]
+}
+
+fn build_generated_community(
+    db_path: &str,
+    founder_peer_id: &str,
+    members: usize,
+    devices_per_member: usize,
+) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
+    if members == 0 {
+        return Err("members must be >= 1".into());
+    }
+    if devices_per_member == 0 {
+        return Err("devices_per_member must be >= 1".into());
+    }
+
+    let bootstrap_addrs = community_bootstrap_addrs();
+    let mut participant_peer_ids = vec![founder_peer_id.to_string()];
+
+    for device_idx in 1..devices_per_member {
+        let invite = workspace::commands::create_device_link_for_peer(
+            db_path,
+            founder_peer_id,
+            &bootstrap_addrs,
+            workspace::invite_link::DEFAULT_PORT,
+            None,
+        )?;
+        let accepted = workspace::commands::accept_device_link(
+            db_path,
+            &invite.invite_link,
+            &format!("founder-device-{:02}", device_idx + 1),
+        )?;
+        participant_peer_ids.push(accepted.peer_id);
+    }
+
+    for member_idx in 1..members {
+        let invite = workspace::commands::create_invite_for_peer(
+            db_path,
+            founder_peer_id,
+            &bootstrap_addrs,
+            workspace::invite_link::DEFAULT_PORT,
+            None,
+        )?;
+        let primary = workspace::commands::accept_invite(
+            db_path,
+            &invite.invite_link,
+            &format!("member-{:03}", member_idx + 1),
+            "device-01",
+        )?;
+        let primary_peer_id = primary.peer_id.clone();
+        participant_peer_ids.push(primary.peer_id);
+
+        for device_idx in 1..devices_per_member {
+            let link = workspace::commands::create_device_link_for_peer(
+                db_path,
+                &primary_peer_id,
+                &bootstrap_addrs,
+                workspace::invite_link::DEFAULT_PORT,
+                None,
+            )?;
+            let accepted = workspace::commands::accept_device_link(
+                db_path,
+                &link.invite_link,
+                &format!("device-{:02}", device_idx + 1),
+            )?;
+            participant_peer_ids.push(accepted.peer_id);
+        }
+    }
+
+    Ok(participant_peer_ids)
+}
+
+fn generate_messages_for_peer_range(
+    db_path: &str,
+    peer_id: &str,
+    start_index: usize,
+    count: usize,
+    total_count: usize,
+    history_span: Option<&str>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    if count == 0 {
+        return Ok(());
+    }
+
+    let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
+    let ctx = workspace::load_local_authoring_context(&db, &recorded_by)?;
+    let spread_ms = Some(resolve_generate_history_span_ms(history_span));
+    let end_at_ms = current_timestamp_ms();
+    let start_at_ms = spread_ms.map(|spread| end_at_ms.saturating_sub(spread));
+    let timestamp_for_global_index = |index: usize| -> u64 {
+        match (start_at_ms, spread_ms, total_count) {
+            (Some(start_at_ms), Some(spread_ms), total_count) if total_count > 1 => {
+                let numerator = (index as u128).saturating_mul(spread_ms as u128);
+                let step = numerator / u128::try_from(total_count - 1).unwrap_or(1);
+                start_at_ms.saturating_add(u64::try_from(step).unwrap_or(u64::MAX))
+            }
+            (Some(start_at_ms), _, _) => start_at_ms,
+            _ => current_timestamp_ms(),
+        }
+    };
+
+    const BATCH_SIZE: usize = 1000;
+    let mut generated = 0usize;
+    while generated < count {
+        let batch_end = (generated + BATCH_SIZE).min(count);
+        begin_immediate_with_retry(&db)?;
+        for local_idx in generated..batch_end {
+            let global_idx = start_index + local_idx;
+            create(
+                &db,
+                &recorded_by,
+                &ctx.signer_event_id,
+                &ctx.signing_key,
+                timestamp_for_global_index(global_idx),
+                CreateMessageCmd {
+                    workspace_id: ctx.workspace_id,
+                    author_id: ctx.author_id,
+                    content: format!("Message {}", global_idx),
+                },
+            )
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("create event error: {}", e).into()
+            })?;
+        }
+        db.execute("COMMIT", [])?;
+        generated = batch_end;
+    }
+
+    Ok(())
 }
 
 /// Send a message as a specific peer (daemon provides the peer_id).
@@ -333,79 +472,67 @@ pub fn generate_for_peer(
     peer_id: &str,
     count: usize,
     history_span: Option<&str>,
+    members: usize,
+    devices_per_member: usize,
 ) -> Result<GenerateResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
     let log_progress = generate_progress_logging_enabled();
     let generate_start = Instant::now();
-    let ctx = workspace::load_local_authoring_context(&db, &recorded_by)?;
-    let spread_ms = Some(resolve_generate_history_span_ms(history_span));
-    let end_at_ms = current_timestamp_ms();
-    let start_at_ms = spread_ms.map(|spread| end_at_ms.saturating_sub(spread));
-    let timestamp_for_index = |index: usize| -> u64 {
-        match (start_at_ms, spread_ms, count) {
-            (Some(start_at_ms), Some(spread_ms), count) if count > 1 => {
-                let numerator = (index as u128).saturating_mul(spread_ms as u128);
-                let step = numerator / u128::try_from(count - 1).unwrap_or(1);
-                start_at_ms.saturating_add(u64::try_from(step).unwrap_or(u64::MAX))
-            }
-            (Some(start_at_ms), _, _) => start_at_ms,
-            _ => current_timestamp_ms(),
-        }
-    };
+    if members == 0 {
+        return Err("members must be >= 1".into());
+    }
+    if devices_per_member == 0 {
+        return Err("devices_per_member must be >= 1".into());
+    }
 
-    // Break into smaller batches to avoid holding the write lock too long.
-    // A single long transaction causes SQLITE_BUSY for the sync engine's
-    // runtime manager, which treats it as a fatal error.
-    const BATCH_SIZE: usize = 1000;
+    drop(db);
+    drop(recorded_by);
+
+    let participant_peer_ids = if members == 1 && devices_per_member == 1 {
+        vec![peer_id.to_string()]
+    } else {
+        build_generated_community(db_path, peer_id, members, devices_per_member)?
+    };
+    let total_devices = participant_peer_ids.len();
+
     if log_progress {
         eprintln!(
-            "[generate] start kind=messages count={} batch_size={} db={} peer={}",
-            count, BATCH_SIZE, db_path, peer_id
+            "[generate] start kind=messages count={} members={} devices_per_member={} total_devices={} db={} peer={}",
+            count, members, devices_per_member, total_devices, db_path, peer_id
         );
     }
-    let mut i = 0;
-    while i < count {
-        let batch_end = (i + BATCH_SIZE).min(count);
-        let batch_start = Instant::now();
-        begin_immediate_with_retry(&db)?;
-        for j in i..batch_end {
-            create(
-                &db,
-                &recorded_by,
-                &ctx.signer_event_id,
-                &ctx.signing_key,
-                timestamp_for_index(j),
-                CreateMessageCmd {
-                    workspace_id: ctx.workspace_id,
-                    author_id: ctx.author_id,
-                    content: format!("Message {}", j),
-                },
-            )
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("create event error: {}", e).into()
-            })?;
-        }
-        db.execute("COMMIT", [])?;
-        i = batch_end;
-        if log_progress && (i == count || i % 10_000 == 0 || i == BATCH_SIZE) {
-            eprintln!(
-                "[generate] progress kind=messages committed={} remaining={} batch_ms={} total_ms={}",
-                i,
-                count.saturating_sub(i),
-                batch_start.elapsed().as_millis(),
-                generate_start.elapsed().as_millis()
-            );
-        }
+
+    let mut next_start = 0usize;
+    for (participant_idx, participant_peer_id) in participant_peer_ids.iter().enumerate() {
+        let peer_count =
+            count / total_devices + usize::from(participant_idx < (count % total_devices));
+        generate_messages_for_peer_range(
+            db_path,
+            participant_peer_id,
+            next_start,
+            peer_count,
+            count,
+            history_span,
+        )?;
+        next_start += peer_count;
     }
     if log_progress {
         eprintln!(
-            "[generate] done kind=messages count={} total_ms={}",
+            "[generate] done kind=messages count={} members={} devices_per_member={} total_devices={} total_ms={}",
             count,
+            members,
+            devices_per_member,
+            total_devices,
             generate_start.elapsed().as_millis()
         );
     }
 
-    Ok(GenerateResponse { count })
+    Ok(GenerateResponse {
+        count,
+        members,
+        devices_per_member,
+        total_devices,
+    })
 }
 
 /// Generate N synthetic files as a specific peer.

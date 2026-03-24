@@ -3641,6 +3641,80 @@ fn test_cli_generate_files_messages_display() {
 }
 
 #[test]
+fn test_cli_generate_realistic_community_creates_users_devices_and_messages() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("gencommunity.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    let out = Command::new(bin())
+        .args([
+            "--db",
+            &db,
+            "generate",
+            "--count",
+            "24",
+            "--members",
+            "3",
+            "--devices-per-member",
+            "2",
+        ])
+        .output()
+        .expect("generate realistic community");
+    assert!(
+        out.status.success(),
+        "generate failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let status = get_status_raw(&db);
+    assert_eq!(
+        status_projected_count(&status, "Messages"),
+        24,
+        "status should report generated message count:\n{}",
+        status
+    );
+
+    let users = get_users_raw(&db);
+    assert_eq!(
+        numbered_item_count(&users),
+        3,
+        "users should contain founder + 2 generated members:\n{}",
+        users
+    );
+    assert!(
+        users.contains("user"),
+        "users should include founder:\n{}",
+        users
+    );
+    assert!(
+        users.contains("member-002"),
+        "users should include generated member-002:\n{}",
+        users
+    );
+    assert!(
+        users.contains("member-003"),
+        "users should include generated member-003:\n{}",
+        users
+    );
+
+    let tenants = get_tenants_raw(&db);
+    assert_eq!(
+        numbered_item_count(&tenants),
+        6,
+        "tenants should contain 3 members x 2 devices:\n{}",
+        tenants
+    );
+}
+
+#[test]
 fn test_cli_event_tree_shows_structure() {
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir

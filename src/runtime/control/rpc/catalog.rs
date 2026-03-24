@@ -75,12 +75,14 @@ static CATALOG: &[MethodInfo] = &[
     },
     MethodInfo {
         name: "Generate",
-        purpose: "Generate synthetic test messages",
+        purpose: "Generate synthetic test messages, optionally across a realistic member/device community",
         params: params![
             "count", "usize", true, None;
-            "history_span", "string", false, Some("3y")
+            "history_span", "string", false, Some("3y");
+            "members", "usize", false, Some("1");
+            "devices_per_member", "usize", false, Some("1")
         ],
-        example_json: r#"{"type":"Generate","count":10,"history_span":"3y"}"#,
+        example_json: r#"{"type":"Generate","count":10,"history_span":"3y","members":3,"devices_per_member":2}"#,
     },
     MethodInfo {
         name: "GenerateFiles",

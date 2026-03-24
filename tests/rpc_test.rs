@@ -207,6 +207,8 @@ fn rpc_all_methods_serialize() {
         RpcMethod::Generate {
             count: 10,
             history_span: Some("3y".into()),
+            members: 3,
+            devices_per_member: 2,
         },
         RpcMethod::AssertNow {
             predicate: "message_count == 0".into(),

@@ -733,10 +733,18 @@ fn dispatch(
         RpcMethod::Generate {
             count,
             history_span,
+            members,
+            devices_per_member,
         } => match state.require_active_peer() {
             Ok(peer_id) => {
-                match message::generate_for_peer(db_path, &peer_id, count, history_span.as_deref())
-                {
+                match message::generate_for_peer(
+                    db_path,
+                    &peer_id,
+                    count,
+                    history_span.as_deref(),
+                    members,
+                    devices_per_member,
+                ) {
                     Ok(data) => {
                         state.notify_runtime_recheck();
                         RpcResponse::success(data)
