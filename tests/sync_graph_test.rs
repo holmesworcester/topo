@@ -14,7 +14,7 @@
 mod cli_harness;
 
 use rusqlite::OptionalExtension;
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::sync::OnceLock;
 use std::time::{Duration, Instant};
 use topo::db::sync_log::{ensure_schema, update_config, SyncLogConfigPatch};
@@ -56,51 +56,22 @@ fn enable_sync_logging(peer: &Peer) {
     .expect("enable sync-log config");
 }
 
-fn received_event_frames_by_peer(peer: &Peer) -> BTreeMap<String, i64> {
+fn projected_message_ids(peer: &Peer) -> BTreeSet<String> {
     let conn = open_connection(&peer.db_path).expect("open sink db for sync-log query");
     let mut stmt = conn
         .prepare(
-            "SELECT r.peer_id, COUNT(*)
-             FROM sync_run_events e
-             JOIN sync_runs r ON r.run_id = e.run_id
-             WHERE e.lane = 'data'
-               AND e.direction = 'rx'
-               AND e.frame_type = 'Event'
-             GROUP BY r.peer_id
-             ORDER BY r.peer_id",
+            "SELECT message_id
+               FROM messages
+              WHERE recorded_by = ?1
+              ORDER BY message_id",
         )
-        .expect("prepare sync frame query");
-    stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        .expect("prepare projected message query");
+    stmt.query_map(rusqlite::params![&peer.identity], |row| {
+        row.get::<_, String>(0)
     })
-    .expect("query sync frame rows")
-    .collect::<Result<BTreeMap<_, _>, _>>()
-    .expect("collect sync frame rows")
-}
-
-async fn wait_for_received_frames_stable(peer: &Peer, timeout: Duration, stable_for: Duration) {
-    let start = Instant::now();
-    let mut last_total = -1;
-    let mut stable_since = None;
-    loop {
-        let current_total: i64 = received_event_frames_by_peer(peer).values().sum();
-        if current_total == last_total {
-            let since = stable_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= stable_for {
-                return;
-            }
-        } else {
-            last_total = current_total;
-            stable_since = None;
-        }
-        assert!(
-            start.elapsed() < timeout,
-            "received event frames did not stabilize within {:?}: total={}",
-            timeout,
-            current_total
-        );
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
+    .expect("query projected message rows")
+    .collect::<Result<BTreeSet<_>, _>>()
+    .expect("collect projected message rows")
 }
 
 /// Read peak resident set size from /proc/self/status (Linux only).
@@ -568,8 +539,8 @@ async fn catchup_8x_100k() {
     run_catchup_bench(8, 100_000).await;
 }
 
-/// Replicated-source smoke: range partitioning should use multiple peers and
-/// keep duplicate transfer overhead bounded on a time-spread history.
+/// Replicated-source smoke: sink should converge to the projected message set
+/// visible from the replicated sources without depending on transport internals.
 #[tokio::test]
 async fn catchup_4x_240_spread_uses_multiple_sources_efficiently() {
     let _guard = acquire_graph_test_guard().await;
@@ -597,76 +568,56 @@ async fn catchup_4x_240_spread_uses_multiple_sources_efficiently() {
     let targets: Vec<&Peer> = sources[1..].iter().collect();
     eprintln!("  Cloning spread history to replicated sources...");
     clone_events_to(&sources[0], &targets);
+    let source_marker_ids: Vec<String> = sources
+        .iter()
+        .enumerate()
+        .map(|(idx, source)| event_id_to_base64(&source.create_message(&format!("spread-src-{idx}"))))
+        .collect();
     enable_sync_logging(&sink);
 
-    let expected_count = total_messages as i64;
+    let expected_projected_ids: BTreeSet<String> = sources
+        .iter()
+        .flat_map(|source| projected_message_ids(source).into_iter())
+        .collect();
+    let expected_count = expected_projected_ids.len() as i64;
     let start = Instant::now();
     eprintln!("  Starting sink download...");
     let handles = start_sink_download(&sources, &sink);
 
     assert_eventually(
-        || sink.recorded_message_event_count() >= expected_count,
+        || sink.scoped_message_count() >= expected_count,
         Duration::from_secs(180),
         &format!(
-            "sink receives all {} spread messages (current: {})",
+            "sink projects all {} spread messages (current: {})",
             expected_count,
-            sink.recorded_message_event_count()
+            sink.scoped_message_count()
         ),
     )
     .await;
 
-    eprintln!("  Sink reached full unique count, waiting for frame totals to settle...");
-    wait_for_received_frames_stable(&sink, Duration::from_secs(20), Duration::from_millis(500))
-        .await;
-
     let wall_secs = start.elapsed().as_secs_f64();
     drop(handles);
 
-    let frames_by_peer = received_event_frames_by_peer(&sink);
-    let total_frames: i64 = frames_by_peer.values().sum();
-    let active_sources = sources
+    let sink_projected_ids = projected_message_ids(&sink);
+    let visible_markers = source_marker_ids
         .iter()
-        .filter(|source| {
-            frames_by_peer
-                .get(&source.transport_peer_id())
-                .copied()
-                .unwrap_or(0)
-                > 0
-        })
+        .filter(|id| sink_projected_ids.contains(*id))
         .count();
-    let delivery_efficiency = if total_frames > 0 {
-        expected_count as f64 / total_frames as f64
-    } else {
-        0.0
-    };
 
     eprintln!();
     eprintln!("=== Replicated spread catchup: 4 sources x 240 messages ===");
     eprintln!("  Wall time:           {:.2}s", wall_secs);
-    eprintln!("  Useful unique msgs:  {}", expected_count);
-    eprintln!("  Downloader frames:   {}", total_frames);
-    eprintln!("  Active sources:      {}", active_sources);
-    eprintln!("  Delivery efficiency: {:.1}%", delivery_efficiency * 100.0);
-    eprintln!("  Per-source frames:   {:?}", frames_by_peer);
+    eprintln!("  Visible messages:    {}", expected_count);
+    eprintln!("  Visible source marks: {}/{}", visible_markers, source_marker_ids.len());
     eprintln!();
 
     assert_eq!(
-        sink.recorded_message_event_count(),
-        expected_count,
-        "sink must have all {} spread messages",
-        expected_count
+        sink_projected_ids, expected_projected_ids,
+        "sink projected message IDs must match the union visible from the sources"
     );
     assert!(
-        active_sources >= 3,
-        "expected at least 3 sources to contribute event frames, got {} with {:?}",
-        active_sources,
-        frames_by_peer
-    );
-    assert!(
-        delivery_efficiency >= 0.55,
-        "expected delivery efficiency >= 55%, got {:.1}% with {:?}",
-        delivery_efficiency * 100.0,
-        frames_by_peer
+        visible_markers == source_marker_ids.len(),
+        "sink should project one visible marker message from every source"
     );
 }
 

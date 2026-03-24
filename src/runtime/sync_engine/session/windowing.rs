@@ -1,14 +1,14 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use crate::db::open_connection;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncWindowKind {
     Full = 0,
-    LastHour = 1,
-    LastDay = 2,
-    LastWeek = 3,
-    LastMonth = 4,
-    LastYear = 5,
+    LastDay = 1,
+    LastWeek = 2,
+    LastTwelveWeeks = 3,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,14 +31,12 @@ const ALL_START_MS: i64 = 0;
 const HOUR_MS: i64 = 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 const WEEK_MS: i64 = 7 * DAY_MS;
-const MONTH_MS: i64 = 30 * DAY_MS;
-const YEAR_MS: i64 = 365 * DAY_MS;
-const TIER_ORDER: [SyncWindowKind; 6] = [
-    SyncWindowKind::LastHour,
+const TWELVE_WEEK_MS: i64 = 12 * WEEK_MS;
+const COLD_PARTITION_MAX_LOCAL_MESSAGES: i64 = 64;
+const TIER_ORDER: [SyncWindowKind; 4] = [
     SyncWindowKind::LastDay,
     SyncWindowKind::LastWeek,
-    SyncWindowKind::LastMonth,
-    SyncWindowKind::LastYear,
+    SyncWindowKind::LastTwelveWeeks,
     SyncWindowKind::Full,
 ];
 
@@ -74,7 +72,7 @@ fn state_for<'a>(
 pub fn sync_window_shape() -> SyncWindowShape {
     match std::env::var("TOPO_SYNC_WINDOW_SHAPE")
         .ok()
-        .unwrap_or_else(|| "nested".to_string())
+        .unwrap_or_else(|| "disjoint".to_string())
         .to_lowercase()
         .as_str()
     {
@@ -122,12 +120,14 @@ pub fn select_outbound_window(
     let anchor_now_ms = *planner.cycle_anchor_now_ms.get_or_insert(now_ms);
     let idx = planner.next_idx % TIER_ORDER.len();
     let kind = TIER_ORDER[idx];
+    let partition_cold = should_partition_cold_windows(db_path);
     assign_window(
         window_for_kind(kind, anchor_now_ms),
         kind,
         peer_id,
         live_peer_ids,
         anchor_now_ms,
+        partition_cold,
     )
 }
 
@@ -157,12 +157,7 @@ fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
         (SyncWindowShape::Disjoint, SyncWindowKind::Full) => SyncWindow {
             kind,
             ts_min_inclusive_ms: Some(ALL_START_MS),
-            ts_max_exclusive_ms: Some(now_ms - YEAR_MS),
-        },
-        (SyncWindowShape::Nested, SyncWindowKind::LastHour) => SyncWindow {
-            kind,
-            ts_min_inclusive_ms: Some(now_ms - HOUR_MS),
-            ts_max_exclusive_ms: None,
+            ts_max_exclusive_ms: Some(now_ms - TWELVE_WEEK_MS),
         },
         (SyncWindowShape::Nested, SyncWindowKind::LastDay) => SyncWindow {
             kind,
@@ -174,46 +169,31 @@ fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
             ts_min_inclusive_ms: Some(now_ms - WEEK_MS),
             ts_max_exclusive_ms: None,
         },
-        (SyncWindowShape::Nested, SyncWindowKind::LastMonth) => SyncWindow {
+        (SyncWindowShape::Nested, SyncWindowKind::LastTwelveWeeks) => SyncWindow {
             kind,
-            ts_min_inclusive_ms: Some(now_ms - MONTH_MS),
-            ts_max_exclusive_ms: None,
-        },
-        (SyncWindowShape::Nested, SyncWindowKind::LastYear) => SyncWindow {
-            kind,
-            ts_min_inclusive_ms: Some(now_ms - YEAR_MS),
-            ts_max_exclusive_ms: None,
-        },
-        (SyncWindowShape::Disjoint, SyncWindowKind::LastHour) => SyncWindow {
-            kind,
-            ts_min_inclusive_ms: Some(now_ms - HOUR_MS),
+            ts_min_inclusive_ms: Some(now_ms - TWELVE_WEEK_MS),
             ts_max_exclusive_ms: None,
         },
         (SyncWindowShape::Disjoint, SyncWindowKind::LastDay) => SyncWindow {
             kind,
             ts_min_inclusive_ms: Some(now_ms - DAY_MS),
-            ts_max_exclusive_ms: Some(now_ms - HOUR_MS),
+            ts_max_exclusive_ms: None,
         },
         (SyncWindowShape::Disjoint, SyncWindowKind::LastWeek) => SyncWindow {
             kind,
             ts_min_inclusive_ms: Some(now_ms - WEEK_MS),
             ts_max_exclusive_ms: Some(now_ms - DAY_MS),
         },
-        (SyncWindowShape::Disjoint, SyncWindowKind::LastMonth) => SyncWindow {
+        (SyncWindowShape::Disjoint, SyncWindowKind::LastTwelveWeeks) => SyncWindow {
             kind,
-            ts_min_inclusive_ms: Some(now_ms - MONTH_MS),
+            ts_min_inclusive_ms: Some(now_ms - TWELVE_WEEK_MS),
             ts_max_exclusive_ms: Some(now_ms - WEEK_MS),
-        },
-        (SyncWindowShape::Disjoint, SyncWindowKind::LastYear) => SyncWindow {
-            kind,
-            ts_min_inclusive_ms: Some(now_ms - YEAR_MS),
-            ts_max_exclusive_ms: Some(now_ms - MONTH_MS),
         },
     }
 }
 
-fn is_hot_window(kind: SyncWindowKind) -> bool {
-    matches!(kind, SyncWindowKind::LastHour | SyncWindowKind::LastDay)
+pub fn is_hot_window(kind: SyncWindowKind) -> bool {
+    matches!(kind, SyncWindowKind::LastDay)
 }
 
 fn normalized_live_peers(peer_id: &str, live_peer_ids: &[String]) -> Vec<String> {
@@ -260,8 +240,12 @@ fn assign_window(
     peer_id: &str,
     live_peer_ids: &[String],
     now_ms: i64,
+    partition_cold: bool,
 ) -> SyncWindow {
     if is_hot_window(kind) {
+        return window;
+    }
+    if !partition_cold {
         return window;
     }
     let peers = normalized_live_peers(peer_id, live_peer_ids);
@@ -269,6 +253,16 @@ fn assign_window(
         return window;
     };
     partition_window(window, peer_rank, peers.len(), now_ms)
+}
+
+fn should_partition_cold_windows(db_path: &str) -> bool {
+    let Ok(db) = open_connection(db_path) else {
+        return true;
+    };
+    let message_count: i64 = db
+        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
+        .unwrap_or(0);
+    message_count <= COLD_PARTITION_MAX_LOCAL_MESSAGES
 }
 
 impl SyncWindow {
@@ -320,11 +314,9 @@ pub fn decode_initial_neg_open(msg: &[u8]) -> Result<(SyncWindow, &[u8]), String
     }
     let kind = match msg[5] {
         0 => SyncWindowKind::Full,
-        1 => SyncWindowKind::LastHour,
-        2 => SyncWindowKind::LastDay,
-        3 => SyncWindowKind::LastWeek,
-        4 => SyncWindowKind::LastMonth,
-        5 => SyncWindowKind::LastYear,
+        1 => SyncWindowKind::LastDay,
+        2 => SyncWindowKind::LastWeek,
+        3 => SyncWindowKind::LastTwelveWeeks,
         other => return Err(format!("unsupported sync window kind {}", other)),
     };
     let ts_min = i64::from_le_bytes(
@@ -384,14 +376,14 @@ mod tests {
         assert_eq!(
             kinds,
             vec![
-                SyncWindowKind::LastHour,
                 SyncWindowKind::LastDay,
                 SyncWindowKind::LastWeek,
-                SyncWindowKind::LastMonth,
-                SyncWindowKind::LastYear,
+                SyncWindowKind::LastTwelveWeeks,
                 SyncWindowKind::Full,
-                SyncWindowKind::LastHour,
-                SyncWindowKind::LastDay
+                SyncWindowKind::LastDay,
+                SyncWindowKind::LastWeek,
+                SyncWindowKind::LastTwelveWeeks,
+                SyncWindowKind::Full,
             ]
         );
         std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
@@ -402,30 +394,22 @@ mod tests {
         let _guard = env_guard();
         std::env::set_var("TOPO_SYNC_WINDOW_SHAPE", "disjoint");
 
-        let hour = window_for_kind(SyncWindowKind::LastHour, 1_000_000);
         let day = window_for_kind(SyncWindowKind::LastDay, 1_000_000);
         let week = window_for_kind(SyncWindowKind::LastWeek, 1_000_000);
-        let month = window_for_kind(SyncWindowKind::LastMonth, 1_000_000);
-        let year = window_for_kind(SyncWindowKind::LastYear, 1_000_000);
+        let twelve_weeks = window_for_kind(SyncWindowKind::LastTwelveWeeks, 1_000_000);
         let full = window_for_kind(SyncWindowKind::Full, 1_000_000);
 
-        assert_eq!(hour.ts_min(), Some(1_000_000 - HOUR_MS));
-        assert_eq!(hour.ts_max_exclusive(), None);
-
         assert_eq!(day.ts_min(), Some(1_000_000 - DAY_MS));
-        assert_eq!(day.ts_max_exclusive(), Some(1_000_000 - HOUR_MS));
+        assert_eq!(day.ts_max_exclusive(), None);
 
         assert_eq!(week.ts_min(), Some(1_000_000 - WEEK_MS));
         assert_eq!(week.ts_max_exclusive(), Some(1_000_000 - DAY_MS));
 
-        assert_eq!(month.ts_min(), Some(1_000_000 - MONTH_MS));
-        assert_eq!(month.ts_max_exclusive(), Some(1_000_000 - WEEK_MS));
-
-        assert_eq!(year.ts_min(), Some(1_000_000 - YEAR_MS));
-        assert_eq!(year.ts_max_exclusive(), Some(1_000_000 - MONTH_MS));
+        assert_eq!(twelve_weeks.ts_min(), Some(1_000_000 - TWELVE_WEEK_MS));
+        assert_eq!(twelve_weeks.ts_max_exclusive(), Some(1_000_000 - WEEK_MS));
 
         assert_eq!(full.ts_min(), Some(ALL_START_MS));
-        assert_eq!(full.ts_max_exclusive(), Some(1_000_000 - YEAR_MS));
+        assert_eq!(full.ts_max_exclusive(), Some(1_000_000 - TWELVE_WEEK_MS));
 
         std::env::remove_var("TOPO_SYNC_WINDOW_SHAPE");
     }
@@ -441,25 +425,6 @@ mod tests {
         let live_peers = vec![peer_a.to_string(), peer_b.to_string()];
         reset_outbound_window_state(db_path, recorded_by, peer_a);
         reset_outbound_window_state(db_path, recorded_by, peer_b);
-
-        let hour_a = select_outbound_window(
-            db_path,
-            recorded_by,
-            peer_a,
-            &live_peers,
-            1_000_000,
-        );
-        let hour_b = select_outbound_window(
-            db_path,
-            recorded_by,
-            peer_b,
-            &live_peers,
-            1_000_000,
-        );
-        assert_eq!(hour_a, hour_b);
-
-        mark_outbound_window_completed(db_path, recorded_by, peer_a, hour_a);
-        mark_outbound_window_completed(db_path, recorded_by, peer_b, hour_b);
 
         let day_a = select_outbound_window(
             db_path,
@@ -488,15 +453,15 @@ mod tests {
         let live_peers = vec![peer_id.to_string()];
         reset_outbound_window_state(db_path, recorded_by, peer_id);
 
-        let hour = select_outbound_window(
+        let day = select_outbound_window(
             db_path,
             recorded_by,
             peer_id,
             &live_peers,
             1_000_000,
         );
-        mark_outbound_window_completed(db_path, recorded_by, peer_id, hour);
-        let day = select_outbound_window(
+        mark_outbound_window_completed(db_path, recorded_by, peer_id, day);
+        let week = select_outbound_window(
             db_path,
             recorded_by,
             peer_id,
@@ -504,9 +469,9 @@ mod tests {
             2_000_000,
         );
 
-        assert_eq!(hour.kind, SyncWindowKind::LastHour);
         assert_eq!(day.kind, SyncWindowKind::LastDay);
-        assert_eq!(day.ts_min(), Some(1_000_000 - DAY_MS));
+        assert_eq!(week.kind, SyncWindowKind::LastWeek);
+        assert_eq!(week.ts_min(), Some(1_000_000 - WEEK_MS));
     }
 
     #[test]
@@ -521,7 +486,7 @@ mod tests {
         reset_outbound_window_state(db_path, recorded_by, peer_a);
         reset_outbound_window_state(db_path, recorded_by, peer_b);
 
-        for _ in 0..2 {
+        for _ in 0..1 {
             let a = select_outbound_window(
                 db_path,
                 recorded_by,
@@ -577,7 +542,7 @@ mod tests {
         reset_outbound_window_state(db_path, recorded_by, peer_a);
         reset_outbound_window_state(db_path, recorded_by, peer_b);
 
-        for _ in 0..2 {
+        for _ in 0..1 {
             let a = select_outbound_window(
                 db_path,
                 recorded_by,
@@ -623,13 +588,13 @@ mod tests {
             "peer-c".to_string(),
             "peer-d".to_string(),
         ];
-        let now_ms = 4 * YEAR_MS;
+        let now_ms = 4 * TWELVE_WEEK_MS;
         for peer in &peers {
             reset_outbound_window_state(db_path, recorded_by, peer);
         }
 
         for peer in &peers {
-            for _ in 0..5 {
+            for _ in 0..3 {
                 let window =
                     select_outbound_window(db_path, recorded_by, peer, &peers, now_ms);
                 mark_outbound_window_completed(db_path, recorded_by, peer, window);
@@ -644,7 +609,7 @@ mod tests {
 
         assert_eq!(full_windows.len(), 4);
         assert_eq!(full_windows[0].ts_min(), Some(ALL_START_MS));
-        assert_eq!(full_windows[3].ts_max_exclusive(), Some(3 * YEAR_MS));
+        assert_eq!(full_windows[3].ts_max_exclusive(), Some(now_ms - TWELVE_WEEK_MS));
         for pair in full_windows.windows(2) {
             assert_eq!(pair[0].ts_max_exclusive(), pair[1].ts_min());
         }

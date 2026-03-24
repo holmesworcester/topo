@@ -27,8 +27,7 @@ use daemon_perf_harness::write_summary;
 const HOUR_MS: i64 = 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 const WEEK_MS: i64 = 7 * DAY_MS;
-const MONTH_MS: i64 = 30 * DAY_MS;
-const YEAR_MS: i64 = 365 * DAY_MS;
+const TWELVE_WEEK_MS: i64 = 12 * WEEK_MS;
 const THREE_YEARS_MS: i64 = 3 * 365 * DAY_MS;
 
 #[derive(Clone, Copy)]
@@ -583,17 +582,13 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) -> B
     wait_for_message_count_all(&source_dbs, source_expected_total, Duration::from_secs(1200));
 
     let measurement_now_ms = current_timestamp_ms();
-    let hour_cutoff = measurement_now_ms - HOUR_MS;
     let day_cutoff = measurement_now_ms - DAY_MS;
     let week_cutoff = measurement_now_ms - WEEK_MS;
-    let month_cutoff = measurement_now_ms - MONTH_MS;
-    let year_cutoff = measurement_now_ms - YEAR_MS;
     let expected_total = union_message_count_since_sql(&source_dbs, None);
-    let expected_hour = union_message_count_since_sql(&source_dbs, Some(hour_cutoff));
     let expected_day = union_message_count_since_sql(&source_dbs, Some(day_cutoff));
     let expected_week = union_message_count_since_sql(&source_dbs, Some(week_cutoff));
-    let expected_month = union_message_count_since_sql(&source_dbs, Some(month_cutoff));
-    let expected_year = union_message_count_since_sql(&source_dbs, Some(year_cutoff));
+    let expected_twelve_weeks =
+        union_message_count_since_sql(&source_dbs, Some(measurement_now_ms - TWELVE_WEEK_MS));
     let sink_db = tmpdir.path().join("sink.db").to_str().unwrap().to_string();
     enable_sync_logging(&sink_db);
     let inherited_env = inherited_tier_env();
@@ -616,16 +611,6 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) -> B
         Duration::from_secs(120),
     );
 
-    let _hour_projected_ms = if expected_hour > 0 {
-        wait_for_message_count_since(
-            &sink_db,
-            hour_cutoff,
-            expected_hour,
-            Duration::from_secs(1800),
-        )
-    } else {
-        metric_start_ms
-    };
     let _day_projected_ms = if expected_day > 0 {
         wait_for_message_count_since(
             &sink_db,
@@ -646,11 +631,11 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) -> B
     } else {
         metric_start_ms
     };
-    let _month_projected_ms = if expected_month > 0 {
+    let _twelve_week_projected_ms = if expected_twelve_weeks > 0 {
         wait_for_message_count_since(
             &sink_db,
-            month_cutoff,
-            expected_month,
+            measurement_now_ms - TWELVE_WEEK_MS,
+            expected_twelve_weeks,
             Duration::from_secs(1800),
         )
     } else {
@@ -658,13 +643,12 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) -> B
     };
     let full_projected_ms =
         wait_for_message_count(&sink_db, expected_total, Duration::from_secs(3600));
-    let _ = (expected_year, full_projected_ms);
+    let _ = full_projected_ms;
 
-    let hour_timing = range_timing_sql(&sink_db, Some(hour_cutoff));
     let day_timing = range_timing_sql(&sink_db, Some(day_cutoff));
     let week_timing = range_timing_sql(&sink_db, Some(week_cutoff));
-    let month_timing = range_timing_sql(&sink_db, Some(month_cutoff));
-    let year_timing = range_timing_sql(&sink_db, Some(year_cutoff));
+    let twelve_week_timing =
+        range_timing_sql(&sink_db, Some(measurement_now_ms - TWELVE_WEEK_MS));
     let all_timing = range_timing_sql(&sink_db, None);
 
     wait_for_downloader_receives_stable(
@@ -731,11 +715,9 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) -> B
             connectivity.title()
         ),
         &[
-            ("Last hour", hour_timing),
             ("Last day", day_timing),
             ("Last week", week_timing),
-            ("Last month", month_timing),
-            ("Last year", year_timing),
+            ("Last 12 weeks", twelve_week_timing),
             ("All", all_timing),
         ],
         metric_start_ms,
@@ -828,17 +810,13 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) -> Benc
     wait_for_message_count_all(&source_dbs, source_expected_total, Duration::from_secs(1200));
 
     let measurement_now_ms = current_timestamp_ms();
-    let hour_cutoff = measurement_now_ms - HOUR_MS;
     let day_cutoff = measurement_now_ms - DAY_MS;
     let week_cutoff = measurement_now_ms - WEEK_MS;
-    let month_cutoff = measurement_now_ms - MONTH_MS;
-    let year_cutoff = measurement_now_ms - YEAR_MS;
     let expected_total = union_message_count_since_sql(&source_dbs, None);
-    let expected_hour = union_message_count_since_sql(&source_dbs, Some(hour_cutoff));
     let expected_day = union_message_count_since_sql(&source_dbs, Some(day_cutoff));
     let expected_week = union_message_count_since_sql(&source_dbs, Some(week_cutoff));
-    let expected_month = union_message_count_since_sql(&source_dbs, Some(month_cutoff));
-    let expected_year = union_message_count_since_sql(&source_dbs, Some(year_cutoff));
+    let expected_twelve_weeks =
+        union_message_count_since_sql(&source_dbs, Some(measurement_now_ms - TWELVE_WEEK_MS));
     let useful_unique_events_before = unique_sync_received_event_count_sql(&rejoiner.db);
     let rejoiner_received_frames_before = received_event_frames_by_peer_for_db(&rejoiner.db);
     let rejoiner_recorded_sources_before = received_recorded_events_by_source_for_db(&rejoiner.db);
@@ -854,16 +832,6 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) -> Benc
     ensure_active_peer(&rejoiner.db, Duration::from_secs(10));
     wait_for_active_tenant_ready(&rejoiner.db, Duration::from_secs(120));
 
-    let _hour_projected_ms = if expected_hour > 0 {
-        wait_for_message_count_since(
-            &rejoiner.db,
-            hour_cutoff,
-            expected_hour,
-            Duration::from_secs(1800),
-        )
-    } else {
-        metric_start_ms
-    };
     let _day_projected_ms = if expected_day > 0 {
         wait_for_message_count_since(
             &rejoiner.db,
@@ -884,11 +852,11 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) -> Benc
     } else {
         metric_start_ms
     };
-    let _month_projected_ms = if expected_month > 0 {
+    let _twelve_week_projected_ms = if expected_twelve_weeks > 0 {
         wait_for_message_count_since(
             &rejoiner.db,
-            month_cutoff,
-            expected_month,
+            measurement_now_ms - TWELVE_WEEK_MS,
+            expected_twelve_weeks,
             Duration::from_secs(1800),
         )
     } else {
@@ -896,13 +864,12 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) -> Benc
     };
     let full_projected_ms =
         wait_for_message_count(&rejoiner.db, expected_total, Duration::from_secs(3600));
-    let _ = (expected_year, full_projected_ms);
+    let _ = full_projected_ms;
 
-    let hour_timing = range_timing_sql(&rejoiner.db, Some(hour_cutoff));
     let day_timing = range_timing_sql(&rejoiner.db, Some(day_cutoff));
     let week_timing = range_timing_sql(&rejoiner.db, Some(week_cutoff));
-    let month_timing = range_timing_sql(&rejoiner.db, Some(month_cutoff));
-    let year_timing = range_timing_sql(&rejoiner.db, Some(year_cutoff));
+    let twelve_week_timing =
+        range_timing_sql(&rejoiner.db, Some(measurement_now_ms - TWELVE_WEEK_MS));
     let all_timing = range_timing_sql(&rejoiner.db, None);
 
     wait_for_downloader_receives_stable(
@@ -980,11 +947,9 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) -> Benc
             connectivity.title()
         ),
         &[
-            ("Last hour", hour_timing),
             ("Last day", day_timing),
             ("Last week", week_timing),
-            ("Last month", month_timing),
-            ("Last year", year_timing),
+            ("Last 12 weeks", twelve_week_timing),
             ("All", all_timing),
         ],
         metric_start_ms,

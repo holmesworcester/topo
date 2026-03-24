@@ -14,9 +14,12 @@ use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::range_session::{
     load_range_storage, send_have_events, spawn_receive_log_task,
 };
-use crate::sync::session::receive_log::ingest_receive_log;
+use crate::sync::session::receive_log::{
+    enqueue_receive_log_ingest, note_hot_receive_finished, note_hot_receive_started,
+};
 use crate::sync::session::windowing::{
-    encode_initial_neg_open, mark_outbound_window_completed, select_outbound_window,
+    encode_initial_neg_open, is_hot_window, mark_outbound_window_completed,
+    select_outbound_window,
 };
 use crate::sync::session::INITIAL_CONTROL_PROGRESS_TIMEOUT;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
@@ -159,6 +162,10 @@ where
     drain_manual_commands(peer_id, &mut command_rx, &mut pending_round_replies);
     reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);
 
+    let hot_receive = is_hot_window(range.kind);
+    if hot_receive {
+        note_hot_receive_started(db_path);
+    }
     let receive_task = spawn_receive_log_task(
         data_recv,
         db_path.to_string(),
@@ -173,14 +180,22 @@ where
     let (events_sent, bytes_sent) = send_have_events(&store, &mut data_send, &have_ids).await?;
     drop(data_send);
 
-    let received = receive_task
-        .await
-        .map_err(|e| format!("receive log task join: {e}"))??;
+    let received = match receive_task.await {
+        Ok(result) => {
+            if hot_receive {
+                note_hot_receive_finished(db_path);
+            }
+            result.map_err(|e| format!("receive log task: {e}"))?
+        }
+        Err(e) => {
+            if hot_receive {
+                note_hot_receive_finished(db_path);
+            }
+            return Err(format!("receive log task join: {e}").into());
+        }
+    };
     if let Some(path) = received.path.clone() {
-        let ingest_db_path = db_path.to_string();
-        tokio::task::spawn_blocking(move || ingest_receive_log(&ingest_db_path, &path))
-            .await
-            .map_err(|e| format!("receive log ingest join: {e}"))??;
+        enqueue_receive_log_ingest(db_path, path);
     }
     drain_manual_commands(peer_id, &mut command_rx, &mut pending_round_replies);
     reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);

@@ -1,7 +1,9 @@
 use std::fs::{self, File, OpenOptions};
 use std::io::{Read, Seek, SeekFrom, Write};
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, Condvar, Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::{Deserialize, Serialize};
@@ -23,6 +25,19 @@ const RECEIVE_LOG_HEADER_MAX_BYTES: usize = 64 * 1024;
 const RECEIVE_LOG_RECORD_PREFIX_LEN: usize = 12;
 const RECEIVE_LOG_RECORD_SUFFIX_LEN: usize = 8;
 
+#[derive(Default)]
+struct ReceiveLogIngestInner {
+    pending: VecDeque<PathBuf>,
+    active_hot_receives: usize,
+    worker_running: bool,
+}
+
+#[derive(Default)]
+struct ReceiveLogIngestState {
+    inner: Mutex<ReceiveLogIngestInner>,
+    wake: Condvar,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct ReceiveLogHeader {
     pub recorded_by: String,
@@ -34,6 +49,101 @@ pub struct ReceiveLogWriter {
     path: PathBuf,
     file: File,
     bytes_written: u64,
+}
+
+fn ingest_state_map() -> &'static Mutex<HashMap<String, Arc<ReceiveLogIngestState>>> {
+    static STATES: OnceLock<Mutex<HashMap<String, Arc<ReceiveLogIngestState>>>> = OnceLock::new();
+    STATES.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn ingest_state(db_path: &str) -> Arc<ReceiveLogIngestState> {
+    let mut states = ingest_state_map()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    states
+        .entry(db_path.to_string())
+        .or_insert_with(|| Arc::new(ReceiveLogIngestState::default()))
+        .clone()
+}
+
+pub fn note_hot_receive_started(db_path: &str) {
+    let state = ingest_state(db_path);
+    let mut inner = state
+        .inner
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    inner.active_hot_receives = inner.active_hot_receives.saturating_add(1);
+}
+
+pub fn note_hot_receive_finished(db_path: &str) {
+    let state = ingest_state(db_path);
+    {
+        let mut inner = state
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.active_hot_receives = inner.active_hot_receives.saturating_sub(1);
+    }
+    state.wake.notify_all();
+}
+
+pub fn enqueue_receive_log_ingest(db_path: &str, path: PathBuf) {
+    let state = ingest_state(db_path);
+    let mut spawn_worker = false;
+    {
+        let mut inner = state
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        inner.pending.push_back(path);
+        if !inner.worker_running {
+            inner.worker_running = true;
+            spawn_worker = true;
+        }
+    }
+    state.wake.notify_all();
+
+    if spawn_worker {
+        let db_path = db_path.to_string();
+        let state = state.clone();
+        if let Err(e) = std::thread::Builder::new()
+            .name(format!("recvlog-ingest-{}", current_timestamp_ms()))
+            .spawn(move || receive_log_ingest_worker(db_path, state))
+        {
+            tracing::warn!("spawn receive log ingest worker: {}", e);
+        }
+    }
+}
+
+fn receive_log_ingest_worker(db_path: String, state: Arc<ReceiveLogIngestState>) {
+    loop {
+        let next_path = {
+            let mut inner = state
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            loop {
+                if inner.pending.is_empty() {
+                    inner.worker_running = false;
+                    return;
+                }
+                if inner.active_hot_receives == 0 {
+                    break inner.pending.pop_front();
+                }
+                inner = state
+                    .wake
+                    .wait(inner)
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+            }
+        };
+
+        let Some(path) = next_path else {
+            continue;
+        };
+        if let Err(e) = ingest_receive_log(&db_path, &path) {
+            tracing::warn!("background receive log ingest {}: {}", path.display(), e);
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -463,6 +573,8 @@ fn current_timestamp_ms() -> i64 {
 
 #[cfg(test)]
 mod tests {
+    use std::time::{Duration, Instant};
+
     use super::*;
     use crate::crypto::{event_id_to_base64, hash_event};
     use crate::db::{open_connection, schema::create_tables, timeline::EventTimeline};
@@ -536,5 +648,45 @@ mod tests {
         assert_ne!(first, second);
         assert!(first.starts_with("recvlog.42."));
         assert!(second.starts_with("recvlog.42."));
+    }
+
+    #[test]
+    fn background_ingest_waits_for_active_hot_receives() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let conn = open_connection(&db_path).unwrap();
+        create_tables(&conn).unwrap();
+
+        let blob = b"queued while downloading".to_vec();
+        let event_id_b64 = event_id_to_base64(&hash_event(&blob));
+        let mut writer =
+            ReceiveLogWriter::open(db_path.to_str().unwrap(), "tenant-a", 9, "peer-x").unwrap();
+        writer.append_blob(&blob).unwrap();
+        let path = writer.finish().unwrap().unwrap();
+
+        note_hot_receive_started(db_path.to_str().unwrap());
+        enqueue_receive_log_ingest(db_path.to_str().unwrap(), path.clone());
+        std::thread::sleep(Duration::from_millis(150));
+
+        let timeline = EventTimeline::new(&conn);
+        assert!(path.exists(), "queued receive log should remain on disk");
+        assert!(
+            timeline.load(&event_id_b64).unwrap().is_none(),
+            "background ingest should stay paused while a hot range receive is active"
+        );
+
+        note_hot_receive_finished(db_path.to_str().unwrap());
+
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            if timeline.load(&event_id_b64).unwrap().is_some() && !path.exists() {
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "background ingest did not resume after receives went idle"
+            );
+            std::thread::sleep(Duration::from_millis(25));
+        }
     }
 }
