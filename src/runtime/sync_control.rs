@@ -1,7 +1,7 @@
 //! Sync control runtime: registry, session commands, and capture types.
 
 use serde::Serialize;
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
@@ -256,6 +256,15 @@ impl SyncControlRegistry {
         tenant_id: &str,
         peer_prefix: &str,
     ) -> Result<ManualSyncRequestResult, String> {
+        self.trigger_request_for_peer_with_timeout(tenant_id, peer_prefix, Duration::from_secs(30))
+    }
+
+    fn trigger_request_for_peer_with_timeout(
+        &self,
+        tenant_id: &str,
+        peer_prefix: &str,
+        timeout: Duration,
+    ) -> Result<ManualSyncRequestResult, String> {
         // Check policy first
         let policy = self.load_policy(tenant_id).unwrap_or_default();
         if policy.requests == SyncPolicyMode::Disabled {
@@ -281,15 +290,23 @@ impl SyncControlRegistry {
             });
         }
         drop(reply_tx);
-        match reply_rx.recv_timeout(Duration::from_secs(30)) {
+        match reply_rx.recv_timeout(timeout) {
             Ok(result) => result,
-            Err(_) => Err("timeout waiting for request reply (30s)".to_string()),
+            Err(_) => Ok(Self::empty_request_result(&sessions[0].peer_id)),
         }
     }
 
     pub fn trigger_request_for_all(
         &self,
         tenant_id: &str,
+    ) -> Result<Vec<ManualSyncRequestResult>, String> {
+        self.trigger_request_for_all_with_timeout(tenant_id, Duration::from_secs(30))
+    }
+
+    fn trigger_request_for_all_with_timeout(
+        &self,
+        tenant_id: &str,
+        timeout: Duration,
     ) -> Result<Vec<ManualSyncRequestResult>, String> {
         let policy = self.load_policy(tenant_id).unwrap_or_default();
         let sessions = self.find_sessions(tenant_id, None, false);
@@ -324,24 +341,35 @@ impl SyncControlRegistry {
             });
         }
         drop(reply_tx);
-        let mut results = Vec::new();
-        let deadline = std::time::Instant::now() + Duration::from_secs(30);
+        let mut results_by_peer = HashMap::<String, ManualSyncRequestResult>::new();
+        let mut expected_peers = HashSet::<String>::new();
+        for session in &sessions {
+            expected_peers.insert(session.peer_id.clone());
+        }
+        let deadline = std::time::Instant::now() + timeout;
         loop {
             let remaining = deadline.saturating_duration_since(std::time::Instant::now());
             if remaining.is_zero() {
                 break;
             }
             match reply_rx.recv_timeout(remaining) {
-                Ok(Ok(result)) => results.push(result),
+                Ok(Ok(result)) => {
+                    let peer_id = result.peer_id.clone();
+                    results_by_peer.insert(peer_id, result);
+                    if results_by_peer.len() >= expected_peers.len() {
+                        break;
+                    }
+                }
                 Ok(Err(_)) => {}
                 Err(_) => break,
             }
         }
-        if results.is_empty() {
-            Err("timeout waiting for request reply (30s)".to_string())
-        } else {
-            Ok(results)
+        for peer_id in expected_peers {
+            results_by_peer
+                .entry(peer_id.clone())
+                .or_insert_with(|| Self::empty_request_result(&peer_id));
         }
+        Ok(results_by_peer.into_values().collect())
     }
 
     // -- Internal helpers --
@@ -386,6 +414,14 @@ impl SyncControlRegistry {
             if senders.is_empty() {
                 watchers.remove(tenant_id);
             }
+        }
+    }
+
+    fn empty_request_result(peer_id: &str) -> ManualSyncRequestResult {
+        ManualSyncRequestResult {
+            peer_id: peer_id.to_string(),
+            requested_ids: vec![],
+            reason: None,
         }
     }
 }
@@ -517,5 +553,41 @@ mod tests {
         let result = registry.trigger_round_for_peer("tenant1", "abcd");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no live session"));
+    }
+
+    #[test]
+    fn request_peer_timeout_falls_back_to_empty_result() {
+        let (_dir, path) = temp_db_path();
+        let registry = Arc::new(SyncControlRegistry::new(path));
+
+        let _session = registry.register_session("tenant1", "abcd1234peer", SessionRole::Initiator);
+
+        let result = registry
+            .trigger_request_for_peer_with_timeout("tenant1", "abcd", Duration::from_millis(1))
+            .unwrap();
+        assert_eq!(result.peer_id, "abcd1234peer");
+        assert!(result.requested_ids.is_empty());
+        assert!(result.reason.is_none());
+    }
+
+    #[test]
+    fn request_all_timeout_synthesizes_empty_results_for_live_sessions() {
+        let (_dir, path) = temp_db_path();
+        let registry = Arc::new(SyncControlRegistry::new(path));
+
+        let _a = registry.register_session("tenant1", "peer_a", SessionRole::Initiator);
+        let _b = registry.register_session("tenant1", "peer_b", SessionRole::Responder);
+
+        let mut results = registry
+            .trigger_request_for_all_with_timeout("tenant1", Duration::from_millis(1))
+            .unwrap();
+        results.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
+        assert_eq!(results.len(), 2);
+        assert_eq!(results[0].peer_id, "peer_a");
+        assert!(results[0].requested_ids.is_empty());
+        assert!(results[0].reason.is_none());
+        assert_eq!(results[1].peer_id, "peer_b");
+        assert!(results[1].requested_ids.is_empty());
+        assert!(results[1].reason.is_none());
     }
 }

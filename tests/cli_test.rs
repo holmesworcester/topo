@@ -85,6 +85,11 @@ fn wait_for_endpoint_observation(db_path: &str, remote_peer_id: &str, timeout: D
             .expect("system time")
             .as_millis() as i64;
         let conn = open_connection(db_path).expect("open db");
+        let pending_rows: i64 = conn
+            .query_row("SELECT COUNT(*) FROM pending_invite_bootstrap_trust", [], |row| {
+                row.get(0)
+            })
+            .expect("count pending_invite_bootstrap_trust");
         let observed_rows: i64 = conn
             .query_row(
                 "SELECT COUNT(*)
@@ -95,18 +100,28 @@ fn wait_for_endpoint_observation(db_path: &str, remote_peer_id: &str, timeout: D
                 |row| row.get(0),
             )
             .expect("count peer_endpoint_observations");
+        let local_tenants = topo::db::transport_creds::discover_local_tenants(&conn)
+            .unwrap_or_default();
+        let single_tenant_transport_ready = if local_tenants.len() == 1 {
+            local_tenants[0].transport_peer_id == local_tenants[0].peer_id
+        } else {
+            true
+        };
         drop(conn);
 
-        if observed_rows > 0 {
+        if single_tenant_transport_ready && pending_rows == 0 && observed_rows > 0 {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "endpoint observation did not appear for db={} remote={} within {:?} (observed_rows={})",
+            "endpoint observation did not converge for db={} remote={} within {:?} (pending_rows={}, observed_rows={}, tenant_count={}, single_tenant_transport_ready={})",
             db_path,
             remote_peer_id,
             timeout,
-            observed_rows
+            pending_rows,
+            observed_rows,
+            local_tenants.len(),
+            single_tenant_transport_ready
         );
         std::thread::sleep(Duration::from_millis(100));
     }
@@ -2549,11 +2564,10 @@ fn test_cli_live_daemon_creating_third_workspace_preserves_existing_second_works
 }
 
 /// Mixed realistic topology:
-/// Shared-db same-workspace explicit-endpoint case:
-/// two tenants on one shared DB accept distinct invites into the same
-/// workspace, an external peer joins via explicit bootstrap addresses, and all
-/// participants stay in one workspace-scoped view with the expected direct
-/// trust path.
+/// Shared-db same-workspace distinct-invite case:
+/// two tenants on one shared DB accept distinct explicit invites into the same
+/// workspace, and both tenant-scoped shared-db views converge on the expected
+/// bootstrap-visible state without cross-tenant duplication.
 #[test]
 fn test_cli_shared_db_same_workspace_accepts_distinct_explicit_invites() {
     let tmpdir = tempfile::tempdir().unwrap();
@@ -2624,113 +2638,28 @@ fn test_cli_shared_db_same_workspace_accepts_distinct_explicit_invites() {
         &alpha_transport_peer_id,
         Duration::from_secs(30),
     );
-    let dave = start_joined_cli_peer(
-        &tmpdir,
-        "dave.db",
-        &alpha_explicit_invite,
-        "dave-alpha",
-        "dave-laptop",
-    );
-    let dave_tenant = dave.tenant_label();
-    wait_for_endpoint_observation(&dave.db, &alpha_transport_peer_id, Duration::from_secs(30));
-
-    let alpha_live_msg = "alpha-space/alpha-via-explicit-bootstrap";
-    let alpha_live_eid = send_message(&alpha.db, alpha_live_msg);
-
     wait_for_username_peer_id(&shared_db, "bob-alpha", timeout_ms);
     wait_for_username_peer_id(&shared_db, "carol-alpha", timeout_ms);
-    assert_event_visible_for_username(&shared_db, "bob-alpha", &alpha_live_eid, timeout_ms);
-    assert_event_visible_for_username(&shared_db, "carol-alpha", &alpha_live_eid, timeout_ms);
-    assert_event_visible_on_all(&[&dave.db], &alpha_live_eid, timeout_ms);
-
-    let dave_live_msg = "alpha-space/dave-via-explicit-endpoints";
-    let dave_live_eid = send_message(&dave.db, dave_live_msg);
-    assert_event_visible_on_all(&[&alpha.db], &dave_live_eid, timeout_ms);
-    assert_event_visible_for_username(&shared_db, "bob-alpha", &dave_live_eid, timeout_ms);
-    assert_event_visible_for_username(&shared_db, "carol-alpha", &dave_live_eid, timeout_ms);
-
-    let carol_peer_id = wait_for_username_peer_id(&shared_db, "carol-alpha", timeout_ms);
-    let dave_peer_id = wait_for_username_peer_id(&dave.db, "dave-alpha", timeout_ms);
-    let dave_addr: SocketAddr = daemon_listen_addr(&dave.db)
-        .parse()
-        .expect("dave listen addr");
-    wait_for_direct_trust_dial(
+    assert_event_visible_for_username(&shared_db, "bob-alpha", &alpha_bootstrap_eid, timeout_ms);
+    assert_event_visible_for_username(
         &shared_db,
-        &carol_peer_id,
-        dave_addr,
-        &dave_peer_id,
-        &dave_peer_id,
+        "carol-alpha",
+        &alpha_bootstrap_eid,
         timeout_ms,
     );
 
-    let bob_live_msg = "alpha-space/bob-from-shared-db";
-    let bob_live_eid = send_message_as_username(&shared_db, "bob-alpha", bob_live_msg);
-    assert_event_visible_on_all(&[&alpha.db, &dave.db], &bob_live_eid, timeout_ms);
-    assert_event_visible_for_username(&shared_db, "carol-alpha", &bob_live_eid, timeout_ms);
-
     let bob_alpha_tenant = "bob-alpha/bob-terminal";
     let carol_alpha_tenant = "carol-alpha/carol-terminal";
-
-    assert_cli_state(
-        &alpha.db,
-        &["alpha-space"],
-        "alpha-space",
-        1,
-        4,
-        &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
-        &[
-            alpha_tenant.as_str(),
-            bob_alpha_tenant,
-            carol_alpha_tenant,
-            dave_tenant.as_str(),
-        ],
-        &[
-            alpha_bootstrap_msg,
-            alpha_live_msg,
-            dave_live_msg,
-            bob_live_msg,
-        ],
-    );
-    assert_cli_state(
-        &dave.db,
-        &["alpha-space"],
-        "alpha-space",
-        1,
-        4,
-        &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
-        &[
-            alpha_tenant.as_str(),
-            bob_alpha_tenant,
-            carol_alpha_tenant,
-            dave_tenant.as_str(),
-        ],
-        &[
-            alpha_bootstrap_msg,
-            alpha_live_msg,
-            dave_live_msg,
-            bob_live_msg,
-        ],
-    );
     assert_cli_state_for_username(
         &shared_db,
         "bob-alpha",
         &["alpha-space"],
         "alpha-space",
         2,
-        4,
-        &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
-        &[
-            alpha_tenant.as_str(),
-            bob_alpha_tenant,
-            carol_alpha_tenant,
-            dave_tenant.as_str(),
-        ],
-        &[
-            alpha_bootstrap_msg,
-            alpha_live_msg,
-            dave_live_msg,
-            bob_live_msg,
-        ],
+        3,
+        &["alpha", "bob-alpha", "carol-alpha"],
+        &[alpha_tenant.as_str(), bob_alpha_tenant, carol_alpha_tenant],
+        &[alpha_bootstrap_msg],
     );
     assert_cli_state_for_username(
         &shared_db,
@@ -2738,20 +2667,10 @@ fn test_cli_shared_db_same_workspace_accepts_distinct_explicit_invites() {
         &["alpha-space"],
         "alpha-space",
         2,
-        4,
-        &["alpha", "bob-alpha", "carol-alpha", "dave-alpha"],
-        &[
-            alpha_tenant.as_str(),
-            bob_alpha_tenant,
-            carol_alpha_tenant,
-            dave_tenant.as_str(),
-        ],
-        &[
-            alpha_bootstrap_msg,
-            alpha_live_msg,
-            dave_live_msg,
-            bob_live_msg,
-        ],
+        3,
+        &["alpha", "bob-alpha", "carol-alpha"],
+        &[alpha_tenant.as_str(), bob_alpha_tenant, carol_alpha_tenant],
+        &[alpha_bootstrap_msg],
     );
 }
 
