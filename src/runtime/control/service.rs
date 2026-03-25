@@ -3,8 +3,6 @@
 //! event modules (message/commands, reaction/commands, user/commands,
 //! workspace/commands, workspace/queries).
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
@@ -160,13 +158,6 @@ pub use crate::event_modules::workspace::{
 // ---------------------------------------------------------------------------
 // Helpers
 // ---------------------------------------------------------------------------
-
-pub fn current_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
 
 /// Resolve the user_event_id for a specific signer from the peers_shared table.
 pub fn resolve_user_event_id_for_signer(

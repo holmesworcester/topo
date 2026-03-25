@@ -1,8 +1,7 @@
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use crate::crypto::EventId;
 use crate::projection::create::create_encrypted_event_synchronous;
 use crate::service::open_db_for_peer;
+use crate::state::db::queue::current_timestamp_ms_u64;
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
@@ -11,13 +10,6 @@ use super::super::ParsedEvent;
 use super::wire::ReactionEvent;
 
 use serde::{Deserialize, Serialize};
-
-fn current_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
 
 pub struct CreateReactionCmd {
     pub target_event_id: [u8; 32],
@@ -112,7 +104,7 @@ pub fn react_for_peer(
         &recorded_by,
         &ctx.signer_event_id,
         &ctx.signing_key,
-        current_timestamp_ms(),
+        current_timestamp_ms_u64(),
         ctx.author_id,
         target_event_id,
         emoji,

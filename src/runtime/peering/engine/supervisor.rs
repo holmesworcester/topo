@@ -32,8 +32,8 @@ use crate::db::transport_creds::{
 };
 use crate::db::transport_trust::is_peer_shared_transport_fingerprint;
 use crate::peering::loops::{
-    accept_loop_until_cancel, connect_loop, preferred_connection_direction, ConnectLoopConfig,
-    IntroSpawnerFn,
+    accept_loop_until_cancel, connect_loop, preferred_connection_direction, short_peer_id,
+    ConnectLoopConfig, IntroSpawnerFn, STALE_DIAL_TARGET_MARKER,
 };
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::transport::{
@@ -41,8 +41,6 @@ use crate::transport::{
     build_tenant_client_config_from_db, resolve_bound_daemon_peer_id, OutboundSessionAuthPlan,
     TenantClientConfigs, TransportClientConfig, TransportEndpoint,
 };
-
-const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeState {
@@ -1302,10 +1300,6 @@ async fn run_connect_worker(
             _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
         }
     }
-}
-
-fn short_peer_id(peer_id: &str) -> &str {
-    &peer_id[..16.min(peer_id.len())]
 }
 
 #[cfg(test)]

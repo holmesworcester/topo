@@ -36,6 +36,13 @@ pub fn current_timestamp_ms() -> i64 {
         .as_millis() as i64
 }
 
+pub fn current_timestamp_ms_u64() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64
+}
+
 pub fn classify_priority_from_blob(blob: &[u8], created_at: i64) -> (i64, i64) {
     let lane = if crate::event_modules::outer_semantic_type_code(blob)
         == Some(crate::event_modules::EVENT_TYPE_FILE_SLICE)

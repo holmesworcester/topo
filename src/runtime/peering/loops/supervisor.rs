@@ -21,7 +21,7 @@ use crate::sync::SyncConnectionHandler;
 use crate::transport::session_factory::extract_build_mismatch_reason;
 use crate::transport::{SessionClass, SessionProvider};
 
-use super::{current_timestamp_ms, drain_batch_size, run_session};
+use super::{current_timestamp_ms, drain_batch_size, run_session, short_peer_id};
 
 /// How a session loop resolves the tenant (`recorded_by`) for each session.
 pub(super) enum SessionTenantResolver {
@@ -251,10 +251,6 @@ pub(super) async fn supervise_connection_sessions(
             }
         }
     }
-}
-
-fn short_peer_id(peer_id: &str) -> &str {
-    &peer_id[..16.min(peer_id.len())]
 }
 
 #[cfg(test)]

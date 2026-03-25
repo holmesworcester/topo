@@ -1,8 +1,8 @@
 use rusqlite::{Connection, OptionalExtension};
 use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
-use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::queue::current_timestamp_ms;
 use crate::crypto::spki_fingerprint_from_ed25519_pubkey;
 
 /// Pending bootstrap trust from locally-created invites is temporary.
@@ -340,13 +340,6 @@ const NODE_AUTHORIZING_TENANT_SQL: &str = "
     LIMIT 1
 ";
 
-fn now_ms_i64() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
-}
-
 fn decode_32_byte_blob(blob: Vec<u8>) -> Option<[u8; 32]> {
     if blob.len() != 32 {
         return None;
@@ -440,7 +433,7 @@ pub fn append_bootstrap_context(
     bootstrap_addr: &str,
     bootstrap_spki_fingerprint: &[u8; 32],
 ) -> Result<(), rusqlite::Error> {
-    let now = now_ms_i64();
+    let now = current_timestamp_ms();
     conn.execute(
         "INSERT INTO bootstrap_context (
              recorded_by,
@@ -560,7 +553,7 @@ pub fn record_transport_binding(
     conn.execute(
         "INSERT OR IGNORE INTO peer_transport_bindings (recorded_by, peer_id, spki_fingerprint, bound_at)
          VALUES (?1, ?2, ?3, ?4)",
-        rusqlite::params![recorded_by, peer_id, spki_fingerprint.as_slice(), now_ms_i64()],
+        rusqlite::params![recorded_by, peer_id, spki_fingerprint.as_slice(), current_timestamp_ms()],
     )?;
     Ok(())
 }
@@ -579,7 +572,7 @@ pub fn record_invite_bootstrap_trust(
     bootstrap_addr: &str,
     bootstrap_spki_fingerprint: &[u8; 32],
 ) -> Result<(), rusqlite::Error> {
-    let now = now_ms_i64();
+    let now = current_timestamp_ms();
     conn.execute(
         "INSERT OR IGNORE INTO invite_bootstrap_trust (
              recorded_by,
@@ -617,7 +610,7 @@ pub fn record_pending_invite_bootstrap_trust(
     workspace_id: &str,
     expected_bootstrap_spki_fingerprint: &[u8; 32],
 ) -> Result<(), rusqlite::Error> {
-    let now = now_ms_i64();
+    let now = current_timestamp_ms();
     conn.execute(
         "INSERT OR IGNORE INTO pending_invite_bootstrap_trust (
              recorded_by,
@@ -685,7 +678,7 @@ pub fn authorized_fingerprints_from_db(
     conn: &Connection,
     recorded_by: &str,
 ) -> Result<HashSet<[u8; 32]>, Box<dyn std::error::Error + Send + Sync>> {
-    let now = now_ms_i64();
+    let now = current_timestamp_ms();
     let mut stmt = conn.prepare(TENANT_AUTHORIZED_FINGERPRINTS_SQL)?;
     let fps: HashSet<[u8; 32]> = stmt
         .query_map(rusqlite::params![recorded_by, now], |row| {
@@ -708,7 +701,7 @@ pub fn is_authorized_for_tenant(
     tenant_id: &str,
     spki_fingerprint: &[u8; 32],
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let now = now_ms_i64();
+    let now = current_timestamp_ms();
     let allowed: i64 = conn.query_row(
         TENANT_AUTHORIZATION_EXISTS_SQL,
         rusqlite::params![tenant_id, spki_fingerprint.as_slice(), now],
@@ -722,7 +715,7 @@ pub fn resolve_authorizing_tenant(
     conn: &Connection,
     spki_fingerprint: &[u8; 32],
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
-    let now = now_ms_i64();
+    let now = current_timestamp_ms();
     let tenant_id = conn
         .query_row(
             NODE_AUTHORIZING_TENANT_SQL,
@@ -738,7 +731,7 @@ pub fn is_authorized_for_node(
     conn: &Connection,
     spki_fingerprint: &[u8; 32],
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let now = now_ms_i64();
+    let now = current_timestamp_ms();
     let allowed: i64 = conn.query_row(
         NODE_AUTHORIZATION_EXISTS_SQL,
         rusqlite::params![spki_fingerprint.as_slice(), now],
@@ -753,7 +746,7 @@ pub fn has_any_trusted_peer(
     conn: &Connection,
     recorded_by: &str,
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
-    let now = now_ms_i64();
+    let now = current_timestamp_ms();
     let has_any: i64 = conn.query_row(
         TENANT_HAS_ANY_AUTHORIZED_FINGERPRINT_SQL,
         rusqlite::params![recorded_by, now],
@@ -781,7 +774,7 @@ pub fn list_authorized_transport_rows(
     conn: &Connection,
     recorded_by: &str,
 ) -> Result<Vec<AuthorizedTransportRow>, Box<dyn std::error::Error + Send + Sync>> {
-    let now = now_ms_i64();
+    let now = current_timestamp_ms();
     let mut stmt = conn.prepare(TENANT_AUTHORIZED_TRANSPORT_ROWS_SQL)?;
     let rows = stmt
         .query_map(rusqlite::params![recorded_by, now], |row| {
@@ -834,7 +827,7 @@ pub fn list_active_invite_bootstrap_targets(
     conn: &Connection,
     recorded_by: &str,
 ) -> Result<Vec<InviteBootstrapTarget>, Box<dyn std::error::Error + Send + Sync>> {
-    let now = now_ms_i64();
+    let now = current_timestamp_ms();
     let mut stmt = conn.prepare(
         "SELECT t.invite_event_id, t.bootstrap_spki_fingerprint, t.bootstrap_addr
            FROM invite_bootstrap_trust t
@@ -873,6 +866,13 @@ pub fn list_active_invite_bootstrap_targets(
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)
+}
+
+/// Thin alias so that `#[cfg(test)] mod tests` (which uses `super::*`) can
+/// continue calling `now_ms_i64()` without modification.
+#[cfg(test)]
+fn now_ms_i64() -> i64 {
+    current_timestamp_ms()
 }
 
 #[cfg(test)]

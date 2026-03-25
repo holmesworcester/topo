@@ -8,6 +8,7 @@ use tracing::warn;
 use crate::contracts::peering_contract::{SessionDirection, SessionMeta};
 use crate::crypto::hash_event;
 use crate::db::open_connection;
+use crate::db::queue::current_timestamp_ms;
 use crate::db::sync_log::{
     ensure_schema, finalize_run, insert_run_event, insert_run_received_event, insert_run_start,
     load_config, NewSyncRun, NewSyncRunEvent,
@@ -48,13 +49,6 @@ impl LogDir {
             Self::Rx => "rx",
         }
     }
-}
-
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
 }
 
 fn short_peer(peer_hex: &str) -> String {
@@ -391,7 +385,7 @@ impl SyncRunCapture {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed).saturating_add(1);
         let event = NewSyncRunEvent {
             seq,
-            ts_ms: now_ms(),
+            ts_ms: current_timestamp_ms(),
             lane: lane.as_str().to_string(),
             direction: dir.as_str().to_string(),
             frame_type: frame_type(frame).to_string(),
@@ -411,7 +405,7 @@ impl SyncRunCapture {
         let seq = self.seq.fetch_add(1, Ordering::Relaxed).saturating_add(1);
         let event = NewSyncRunEvent {
             seq,
-            ts_ms: now_ms(),
+            ts_ms: current_timestamp_ms(),
             lane: lane.to_string(),
             direction: direction.to_string(),
             frame_type: frame_type.to_string(),
@@ -466,7 +460,7 @@ impl SessionRunLogger {
             SessionDirection::Outbound => "outbound",
         };
 
-        let started_at_ms = now_ms();
+        let started_at_ms = current_timestamp_ms();
         let initial_run = NewSyncRun {
             started_at_ms,
             ended_at_ms: started_at_ms,
@@ -587,7 +581,7 @@ impl SessionRunLogger {
 
         let run = NewSyncRun {
             started_at_ms: self.started_at_ms,
-            ended_at_ms: now_ms(),
+            ended_at_ms: current_timestamp_ms(),
             session_id: self.session_id,
             tenant_id: self.tenant_id,
             peer_id: self.peer_id,

@@ -3,7 +3,7 @@ pub mod bootstrap;
 pub(crate) use std::net::SocketAddr;
 use std::process::Child;
 pub(crate) use std::sync::Arc;
-pub(crate) use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
+pub(crate) use std::time::{Duration, Instant};
 
 /// RAII guard that kills a daemon process on drop, preventing leaked processes
 /// when tests panic before reaching manual cleanup.
@@ -57,6 +57,7 @@ use crate::projection::create::{
     create_event_synchronous, create_signed_event_staged, create_signed_event_synchronous,
     event_id_or_blocked, CreateEventError,
 };
+pub(crate) use crate::state::db::queue::current_timestamp_ms_u64;
 pub(crate) use crate::state::db::queue::SQLITE_BUSY_RETRY_ATTEMPTS;
 pub(crate) use crate::state::db::queue::SQLITE_BUSY_RETRY_BASE_MS;
 pub(crate) use crate::transport::identity::{ensure_transport_peer_id, load_transport_cert};
@@ -87,13 +88,6 @@ pub fn test_ingest_fns() -> crate::contracts::event_pipeline_contract::IngestFns
 }
 
 pub(crate) const TESTUTIL_SQLITE_BUSY_RETRY_ATTEMPTS: usize = SQLITE_BUSY_RETRY_ATTEMPTS + 4;
-
-pub(crate) fn current_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
 
 async fn poll_for_materialized_local_peer_signer(
     db_path: &str,
@@ -1080,7 +1074,7 @@ impl Peer {
     pub fn create_message(&self, content: &str) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let inner = ParsedEvent::Message(MessageEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             workspace_id: self.workspace_id,
             author_id: self.author_id,
             content: content.to_string(),
@@ -1096,7 +1090,7 @@ impl Peer {
     pub fn create_reaction(&self, target_event_id: &EventId, emoji: &str) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let inner = ParsedEvent::Reaction(ReactionEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             target_event_id: *target_event_id,
             author_id: self.author_id,
             emoji: emoji.to_string(),
@@ -1112,7 +1106,7 @@ impl Peer {
     pub fn create_reaction_staged(&self, target_event_id: &EventId, emoji: &str) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let inner = ParsedEvent::Reaction(ReactionEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             target_event_id: *target_event_id,
             author_id: self.author_id,
             emoji: emoji.to_string(),
@@ -1135,7 +1129,7 @@ impl Peer {
     pub fn create_key_secret(&self, key_bytes: [u8; 32]) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let sk = ParsedEvent::KeySecret(KeySecretEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             key_bytes,
         });
         create_event_synchronous(&db, &self.identity, &sk).expect("failed to create key_secret")
@@ -1161,7 +1155,7 @@ impl Peer {
     /// then encrypted. Returns the encrypted event ID. Requires identity chain.
     pub fn create_encrypted_message(&self, key_event_id: &EventId, content: &str) -> EventId {
         let inner = ParsedEvent::Message(MessageEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             workspace_id: self.workspace_id,
             author_id: self.author_id,
             content: content.to_string(),
@@ -1228,7 +1222,7 @@ impl Peer {
     pub fn create_message_deletion(&self, target_event_id: &EventId) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let inner = ParsedEvent::MessageDeletion(MessageDeletionEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             target_event_id: *target_event_id,
             author_id: self.author_id,
             signed_by: self.signer_eid(),
@@ -1246,7 +1240,7 @@ impl Peer {
         target_event_id: &EventId,
     ) -> EventId {
         let inner = ParsedEvent::MessageDeletion(MessageDeletionEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             target_event_id: *target_event_id,
             author_id: self.author_id,
             signed_by: self.signer_eid(),
@@ -1265,7 +1259,7 @@ impl Peer {
     pub fn create_workspace(&self, public_key: [u8; 32]) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let ws = ParsedEvent::Workspace(WorkspaceEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             public_key,
             name: "test-workspace".to_string(),
         });
@@ -1283,7 +1277,7 @@ impl Peer {
     pub fn try_create_workspace(&self, public_key: [u8; 32]) -> Result<EventId, CreateEventError> {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let ws = ParsedEvent::Workspace(WorkspaceEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             public_key,
             name: "test-workspace".to_string(),
         });
@@ -1316,7 +1310,7 @@ impl Peer {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let tenant_event_id = self.ensure_local_tenant_event_id(&db);
         let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             tenant_event_id,
             invite_event_id: *invite_event_id,
             workspace_id,
@@ -1334,7 +1328,7 @@ impl Peer {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let tenant_event_id = self.ensure_local_tenant_event_id(&db);
         let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             tenant_event_id,
             invite_event_id: *invite_event_id,
             workspace_id,
@@ -1356,7 +1350,7 @@ impl Peer {
 
         let peer_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
         let tenant_evt = ParsedEvent::Tenant(TenantEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             public_key: peer_key.verifying_key().to_bytes(),
         });
         create_event_synchronous(db, &self.identity, &tenant_evt).expect("failed to create tenant")
@@ -1373,7 +1367,7 @@ impl Peer {
             .verifying_key()
             .to_bytes();
         let evt = ParsedEvent::UserInvite(UserInviteEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             public_key,
             workspace_id: *workspace_id,
             authority_event_id: *workspace_id,
@@ -1394,7 +1388,7 @@ impl Peer {
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let evt = ParsedEvent::UserInvite(UserInviteEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             public_key: invite_public_key,
             workspace_id: *workspace_id,
             authority_event_id: *workspace_id,
@@ -1429,7 +1423,7 @@ impl Peer {
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let evt = ParsedEvent::User(UserEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             public_key: user_public_key,
             username: "test-user".to_string(),
             signed_by: *user_invite_event_id,
@@ -1449,7 +1443,7 @@ impl Peer {
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let evt = ParsedEvent::DeviceInvite(DeviceInviteEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             public_key: device_invite_public_key,
             authority_event_id: *user_event_id,
             signed_by: *user_event_id,
@@ -1470,7 +1464,7 @@ impl Peer {
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let evt = ParsedEvent::PeerShared(PeerSharedEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             public_key: peer_shared_public_key,
             user_event_id: *user_event_id,
             device_name: "test-device".to_string(),
@@ -1492,7 +1486,7 @@ impl Peer {
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let evt = ParsedEvent::Admin(AdminEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             public_key: admin_public_key,
             user_event_id: *user_event_id,
             signed_by: *workspace_id,
@@ -1515,7 +1509,7 @@ impl Peer {
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let evt = ParsedEvent::KeyShared(KeySharedEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             key_event_id: *key_event_id,
             recipient_event_id: *recipient_event_id,
             unwrap_key_event_id: *unwrap_key_event_id,
@@ -1536,7 +1530,7 @@ impl Peer {
         db.execute("BEGIN", []).expect("failed to begin");
         for i in 0..count {
             let inner = ParsedEvent::Message(MessageEvent {
-                created_at_ms: current_timestamp_ms(),
+                created_at_ms: current_timestamp_ms_u64(),
                 workspace_id: self.workspace_id,
                 author_id: self.author_id,
                 content: format!("Message {} from {}", i, self.name),
@@ -1606,7 +1600,7 @@ impl Peer {
         let key_event_id = self.content_key_event_id(&db);
 
         let msg = ParsedEvent::Message(MessageEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             workspace_id: self.workspace_id,
             author_id: self.author_id,
             content: format!("file-parent-{}", self.name),
@@ -1620,7 +1614,7 @@ impl Peer {
             use std::hash::{Hash, Hasher};
             let mut hasher = std::collections::hash_map::DefaultHasher::new();
             self.name.hash(&mut hasher);
-            current_timestamp_ms().hash(&mut hasher);
+            current_timestamp_ms_u64().hash(&mut hasher);
             let h = hasher.finish().to_le_bytes();
             let mut fid = [0u8; 32];
             fid[..8].copy_from_slice(&h);
@@ -1633,7 +1627,7 @@ impl Peer {
 
         // Message attachment descriptor
         let att = ParsedEvent::File(FileEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             message_id: msg_eid,
             file_id,
             blob_bytes: file_bytes as u64,
@@ -1659,7 +1653,7 @@ impl Peer {
             // neg_items ts. If these diverge, the sink's batch_writer (which
             // extracts created_at from the blob) inserts a different neg_items
             // key than the source, causing negentropy to never converge.
-            let created_at = current_timestamp_ms();
+            let created_at = current_timestamp_ms_u64();
             let fs = ParsedEvent::FileSlice(FileSliceEvent {
                 created_at_ms: created_at,
                 file_id,
@@ -1688,7 +1682,7 @@ impl Peer {
                 crate::projection::encrypted::encrypt_event_blob(&key_arr, &inner_blob)
                     .expect("failed to encrypt file_slice");
             let enc = ParsedEvent::Encrypted(crate::event_modules::EncryptedEvent {
-                created_at_ms: current_timestamp_ms(),
+                created_at_ms: current_timestamp_ms_u64(),
                 key_event_id,
                 inner_type_code: crate::event_modules::EVENT_TYPE_FILE_SLICE,
                 nonce,
@@ -3543,7 +3537,7 @@ fn record_shared_db_events_for_tenant(
 ) {
     use crate::projection::apply::project_one;
 
-    let now_ms = current_timestamp_ms() as i64;
+    let now_ms = current_timestamp_ms_u64() as i64;
     for eid in event_ids {
         insert_recorded_event(db, tenant_id, eid, now_ms, "test")
             .expect("failed to record event for tenant");

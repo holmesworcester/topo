@@ -21,12 +21,13 @@ mod supervisor;
 // Re-export public API so callers can still `use crate::peering::loops::*`.
 pub use accept::{accept_loop, accept_loop_until_cancel};
 pub use connect::{connect_loop, ConnectLoopConfig};
+pub(crate) use connect::STALE_DIAL_TARGET_MARKER;
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
 use tracing::warn;
@@ -72,11 +73,10 @@ pub(super) const CONNECT_RETRY_DELAY: Duration = Duration::from_secs(1);
 // Shared helpers
 // ---------------------------------------------------------------------------
 
-pub(crate) fn current_timestamp_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
+pub(crate) use crate::db::queue::current_timestamp_ms;
+
+pub(crate) fn short_peer_id(peer_id: &str) -> &str {
+    &peer_id[..16.min(peer_id.len())]
 }
 
 pub(crate) fn peer_fingerprint_from_hex(peer_id: &str) -> Option<[u8; 32]> {

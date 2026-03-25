@@ -14,16 +14,8 @@ use crate::projection::create::{
     store_signed_event_then_project,
 };
 use crate::projection::encrypted::wrap_key_for_recipient;
+use crate::state::db::queue::current_timestamp_ms_u64;
 use crate::transport::{extract_spki_fingerprint, generate_self_signed_cert_from_signing_key};
-
-use std::time::{SystemTime, UNIX_EPOCH};
-
-pub(crate) fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
 
 /// Ensure a local `tenant` event exists for this tenant and return its event id.
 /// `tenant` is the local root for local-only identity events.
@@ -47,7 +39,7 @@ pub(crate) fn ensure_local_tenant_event(
         event_id_from_base64(&eid_b64).ok_or("invalid tenants.event_id base64")?
     } else {
         let tenant_evt = ParsedEvent::Tenant(TenantEvent {
-            created_at_ms: now_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             public_key: peer_key.verifying_key().to_bytes(),
         });
         event_id_or_blocked(create_event_synchronous(conn, recorded_by, &tenant_evt))?
@@ -200,7 +192,7 @@ pub(crate) fn wrap_content_key_for_invite(
     );
 
     let ss_evt = ParsedEvent::KeyShared(KeySharedEvent {
-        created_at_ms: now_ms(),
+        created_at_ms: current_timestamp_ms_u64(),
         key_event_id,
         recipient_event_id: *invite_event_id,
         unwrap_key_event_id: invite_secret_event_id,
@@ -324,7 +316,7 @@ fn create_user_invite_events_with_signer(
     let invite_pub = invite_key.verifying_key().to_bytes();
 
     let evt = ParsedEvent::UserInvite(UserInviteEvent {
-        created_at_ms: now_ms(),
+        created_at_ms: current_timestamp_ms_u64(),
         public_key: invite_pub,
         workspace_id: *workspace_id,
         authority_event_id: *authority_event_id,
@@ -401,7 +393,7 @@ fn create_device_link_invite_events_with_signer(
     let device_invite_pub = device_invite_key.verifying_key().to_bytes();
 
     let evt = ParsedEvent::DeviceInvite(DeviceInviteEvent {
-        created_at_ms: now_ms(),
+        created_at_ms: current_timestamp_ms_u64(),
         public_key: device_invite_pub,
         authority_event_id: *authority_event_id,
         signed_by: *signer_event_id,

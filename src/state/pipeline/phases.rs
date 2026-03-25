@@ -1,10 +1,10 @@
 use std::collections::{HashMap, HashSet};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::Connection;
 
 use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::crypto::{event_id_to_base64, EventId};
+use crate::db::queue::current_timestamp_ms;
 use crate::db::store::lookup_workspace_id;
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::{self as events, registry::EventRegistry, ShareScope};
@@ -17,13 +17,6 @@ pub(super) struct PersistPhaseOutput {
     pub tenants_seen: HashSet<String>,
     pub live_hints: Vec<LiveHintEvent>,
     pub shared_event_fanouts: Vec<SharedEventFanout>,
-}
-
-fn current_timestamp_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
 }
 
 pub(super) fn run_persist_phase(

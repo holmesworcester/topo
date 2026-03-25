@@ -1,7 +1,6 @@
 use rusqlite::{params, Connection, Result as SqliteResult};
-use std::time::{SystemTime, UNIX_EPOCH};
 
-use super::queue::{with_immediate_tx, with_sqlite_busy_retry};
+use super::queue::{current_timestamp_ms, with_immediate_tx, with_sqlite_busy_retry};
 use crate::crypto::EventId;
 
 /// Deferred need-id queue for low-memory pull backpressure.
@@ -121,13 +120,6 @@ impl<'a> NeedQueue<'a> {
         })?;
         Ok(())
     }
-}
-
-fn current_timestamp_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
 }
 
 #[cfg(test)]

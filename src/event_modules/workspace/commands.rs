@@ -9,8 +9,6 @@
 //! Service.rs calls these for event-domain work; transport/sync orchestration
 //! stays in service.
 
-use std::time::{SystemTime, UNIX_EPOCH};
-
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 
@@ -29,14 +27,8 @@ use crate::projection::create::{
     create_event_staged, create_event_synchronous, create_signed_event_synchronous,
     event_id_or_blocked, project_event,
 };
+use crate::state::db::queue::current_timestamp_ms_u64;
 use crate::state::live_hints::{self, LiveHintEvent};
-
-fn now_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
 
 /// In a shared DB, sibling tenants can already have the workspace's shared
 /// event history in `events`/`shared_event_index` even though this tenant has not yet
@@ -123,7 +115,7 @@ fn replay_existing_workspace_shared_events_for_tenant(
     }
 
     let pq = crate::state::db::project_queue::ProjectQueue::new(db);
-    let recorded_at = now_ms() as i64;
+    let recorded_at = current_timestamp_ms_u64() as i64;
     let publish_after_commit = db.is_autocommit();
     let mut live_hints = Vec::new();
 
@@ -190,7 +182,7 @@ fn emit_peer_secret(
     signing_key: &SigningKey,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
     let evt = ParsedEvent::PeerSecret(PeerSecretEvent {
-        created_at_ms: now_ms(),
+        created_at_ms: current_timestamp_ms_u64(),
         signer_event_id: *signer_event_id,
         private_key_bytes: signing_key.to_bytes(),
     });
@@ -302,7 +294,7 @@ fn create_workspace_inner(
     // 1. Pre-compute workspace event_id for the local self-accept flow.
     let workspace_key = SigningKey::generate(&mut rng);
     let ws = ParsedEvent::Workspace(WorkspaceEvent {
-        created_at_ms: now_ms(),
+        created_at_ms: current_timestamp_ms_u64(),
         public_key: workspace_key.verifying_key().to_bytes(),
         name: workspace_name.to_string(),
     });
@@ -319,7 +311,7 @@ fn create_workspace_inner(
 
     // 4. InviteAccepted (local event — becomes authoritative workspace binding).
     let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-        created_at_ms: now_ms(),
+        created_at_ms: current_timestamp_ms_u64(),
         tenant_event_id,
         invite_event_id: ws_eid,
         workspace_id: ws_eid,
@@ -331,7 +323,7 @@ fn create_workspace_inner(
     // 5. UserInvite (signed by workspace_key)
     let invite_key = SigningKey::generate(&mut rng);
     let uib = ParsedEvent::UserInvite(UserInviteEvent {
-        created_at_ms: now_ms(),
+        created_at_ms: current_timestamp_ms_u64(),
         public_key: invite_key.verifying_key().to_bytes(),
         workspace_id: ws_eid,
         authority_event_id: ws_eid,
@@ -344,7 +336,7 @@ fn create_workspace_inner(
     // 7. User (signed by invite_key)
     let user_key = SigningKey::generate(&mut rng);
     let ub = ParsedEvent::User(UserEvent {
-        created_at_ms: now_ms(),
+        created_at_ms: current_timestamp_ms_u64(),
         public_key: user_key.verifying_key().to_bytes(),
         username: username.to_string(),
         signed_by: uib_eid,
@@ -355,7 +347,7 @@ fn create_workspace_inner(
 
     // 8. Admin (bootstrap grant for creator user; signed by workspace_key)
     let admin_evt = ParsedEvent::Admin(AdminEvent {
-        created_at_ms: now_ms(),
+        created_at_ms: current_timestamp_ms_u64(),
         public_key: user_key.verifying_key().to_bytes(),
         user_event_id: ub_eid,
         signed_by: ws_eid,
@@ -368,7 +360,7 @@ fn create_workspace_inner(
     // 9. DeviceInvite (signed by user_key)
     let device_invite_key = SigningKey::generate(&mut rng);
     let dif = ParsedEvent::DeviceInvite(DeviceInviteEvent {
-        created_at_ms: now_ms(),
+        created_at_ms: current_timestamp_ms_u64(),
         public_key: device_invite_key.verifying_key().to_bytes(),
         authority_event_id: ub_eid,
         signed_by: ub_eid,
@@ -379,7 +371,7 @@ fn create_workspace_inner(
 
     // 10. PeerShared (signed by device_invite_key; key pre-generated above)
     let psf = ParsedEvent::PeerShared(PeerSharedEvent {
-        created_at_ms: now_ms(),
+        created_at_ms: current_timestamp_ms_u64(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
         user_event_id: ub_eid,
         device_name: device_name.to_string(),
@@ -473,7 +465,7 @@ fn join_workspace_inner(
 
     // 1. InviteAccepted (local event) — binds accepted workspace, triggers guard cascade
     let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-        created_at_ms: now_ms(),
+        created_at_ms: current_timestamp_ms_u64(),
         tenant_event_id,
         invite_event_id: *invite_event_id,
         workspace_id,
@@ -487,7 +479,7 @@ fn join_workspace_inner(
     // the invite event arrives.
     let user_key = SigningKey::generate(&mut rng);
     let ub_evt = ParsedEvent::User(UserEvent {
-        created_at_ms: now_ms(),
+        created_at_ms: current_timestamp_ms_u64(),
         public_key: user_key.verifying_key().to_bytes(),
         username: username.to_string(),
         signed_by: *invite_event_id,
@@ -504,7 +496,7 @@ fn join_workspace_inner(
     // 3. DeviceInvite (signed by user_key) — may block if User is blocked.
     let device_invite_key = SigningKey::generate(&mut rng);
     let dif_evt = ParsedEvent::DeviceInvite(DeviceInviteEvent {
-        created_at_ms: now_ms(),
+        created_at_ms: current_timestamp_ms_u64(),
         public_key: device_invite_key.verifying_key().to_bytes(),
         authority_event_id: user_event_id,
         signed_by: user_event_id,
@@ -520,7 +512,7 @@ fn join_workspace_inner(
 
     // 4. PeerShared (signed by device_invite_key) — may block.
     let psf_evt = ParsedEvent::PeerShared(PeerSharedEvent {
-        created_at_ms: now_ms(),
+        created_at_ms: current_timestamp_ms_u64(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
         user_event_id,
         device_name: device_name.to_string(),
@@ -602,7 +594,7 @@ pub fn add_device_to_workspace(
 
     // 1. InviteAccepted (local event) — binds accepted workspace, triggers guard cascade
     let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-        created_at_ms: now_ms(),
+        created_at_ms: current_timestamp_ms_u64(),
         tenant_event_id,
         invite_event_id: *device_invite_event_id,
         workspace_id,
@@ -615,7 +607,7 @@ pub fn add_device_to_workspace(
     // event not yet synced. Tolerates Blocked: the event is stored and will project
     // via cascade when prerequisites arrive.
     let psf_evt = ParsedEvent::PeerShared(PeerSharedEvent {
-        created_at_ms: now_ms(),
+        created_at_ms: current_timestamp_ms_u64(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
         user_event_id,
         device_name: device_name.to_string(),

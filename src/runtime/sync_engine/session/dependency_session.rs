@@ -1,4 +1,4 @@
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
@@ -8,6 +8,7 @@ use crate::contracts::peering_contract::{
     ControlIo, DataRecvIo, DataSendIo, TransportSessionIo, TransportSessionIoError,
 };
 use crate::crypto::{hash_event, EventId};
+use crate::db::queue::current_timestamp_ms;
 use crate::db::{open_connection, store::Store};
 use crate::protocol::{encode_frame, parse_frame, Frame};
 use crate::runtime::transport::open_outbound_dependency_session;
@@ -17,13 +18,6 @@ use crate::transport::TransportConnection;
 const DEPENDENCY_BATCH_CAP: usize = 16;
 const REQUEST_BATCH_CAP: usize = 64;
 const RESPONSE_QUEUE_CAP: usize = 256;
-
-fn current_timestamp_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
 
 fn decode_exact_frame(frame: &[u8]) -> Result<Frame, String> {
     let (parsed, consumed) =

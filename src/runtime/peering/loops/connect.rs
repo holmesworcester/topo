@@ -30,7 +30,7 @@ use super::{
     CONNECT_RETRY_DELAY, ENDPOINT_TTL_MS, SYNC_SESSION_TIMEOUT_SECS,
 };
 
-const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
+pub(crate) const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
 const STALE_DIAL_FAILURE_THRESHOLD: u32 = 8;
 const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
 

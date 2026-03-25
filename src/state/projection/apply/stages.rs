@@ -2,11 +2,11 @@ use super::super::decision::ProjectionDecision;
 use super::super::encrypted::project_encrypted;
 use super::super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
 use crate::crypto::{event_id_to_base64, EventId};
+use crate::db::queue::current_timestamp_ms;
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::{registry, ParsedEvent, TransportPrivacy};
 use crate::state::{dependency_fetch, live_hints::source_peer_id_from_source_tag};
 use rusqlite::{Connection, OptionalExtension};
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::dispatch::dispatch_pure_projector;
 use super::write_exec::{execute_emit_commands, execute_write_ops};
@@ -16,13 +16,6 @@ fn semantic_type_code_for_parsed(parsed: &ParsedEvent) -> u8 {
         ParsedEvent::Encrypted(enc) => enc.inner_type_code,
         _ => parsed.event_type_code(),
     }
-}
-
-fn current_timestamp_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as i64
 }
 
 fn derive_semantic_type_code_from_blob(

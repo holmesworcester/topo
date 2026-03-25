@@ -2,12 +2,13 @@ use std::io::{BufReader, Read};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::Instant;
 
 use crate::crypto::EventId;
 use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
 use crate::projection::create::create_encrypted_event_synchronous;
 use crate::service::open_db_for_peer;
+use crate::state::db::queue::current_timestamp_ms_u64;
 use ed25519_dalek::SigningKey;
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -17,13 +18,6 @@ use super::super::workspace;
 use super::super::ParsedEvent;
 use super::super::{FileEvent, FileSliceEvent};
 use super::wire::MessageEvent;
-
-fn current_timestamp_ms() -> u64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64
-}
 
 fn generate_progress_logging_enabled() -> bool {
     std::env::var_os("TOPO_GENERATE_PROGRESS_LOG").is_some()
@@ -294,7 +288,7 @@ pub fn send_for_peer(
         &recorded_by,
         &ctx.signer_event_id,
         &ctx.signing_key,
-        current_timestamp_ms(),
+        current_timestamp_ms_u64(),
         ctx.workspace_id,
         ctx.author_id,
         content,
@@ -318,7 +312,7 @@ pub fn delete_message_for_peer(
         &recorded_by,
         &ctx.signer_event_id,
         &ctx.signing_key,
-        current_timestamp_ms(),
+        current_timestamp_ms_u64(),
         ctx.author_id,
         target_event_id,
     )
@@ -339,7 +333,7 @@ pub fn generate_for_peer(
     let generate_start = Instant::now();
     let ctx = workspace::load_local_authoring_context(&db, &recorded_by)?;
     let spread_ms = Some(resolve_generate_history_span_ms(history_span));
-    let end_at_ms = current_timestamp_ms();
+    let end_at_ms = current_timestamp_ms_u64();
     let start_at_ms = spread_ms.map(|spread| end_at_ms.saturating_sub(spread));
     let timestamp_for_index = |index: usize| -> u64 {
         match (start_at_ms, spread_ms, count) {
@@ -349,7 +343,7 @@ pub fn generate_for_peer(
                 start_at_ms.saturating_add(u64::try_from(step).unwrap_or(u64::MAX))
             }
             (Some(start_at_ms), _, _) => start_at_ms,
-            _ => current_timestamp_ms(),
+            _ => current_timestamp_ms_u64(),
         }
     };
 
@@ -450,7 +444,7 @@ pub fn generate_files_for_peer(
             &recorded_by,
             &ctx.signer_event_id,
             &ctx.signing_key,
-            current_timestamp_ms(),
+            current_timestamp_ms_u64(),
             CreateMessageCmd {
                 workspace_id: ctx.workspace_id,
                 author_id: ctx.author_id,
@@ -478,7 +472,7 @@ pub fn generate_files_for_peer(
             &recorded_by,
             &key_event_id,
             &ParsedEvent::File(FileEvent {
-                created_at_ms: current_timestamp_ms(),
+                created_at_ms: current_timestamp_ms_u64(),
                 message_id: message_event_id,
                 file_id,
                 blob_bytes,
@@ -504,7 +498,7 @@ pub fn generate_files_for_peer(
                 &recorded_by,
                 &key_event_id,
                 &ParsedEvent::FileSlice(FileSliceEvent {
-                    created_at_ms: current_timestamp_ms(),
+                    created_at_ms: current_timestamp_ms_u64(),
                     file_id,
                     slice_number: slice_number as u32,
                     ciphertext: ciphertext.clone(),
@@ -629,7 +623,7 @@ pub fn send_file_for_peer(
         &recorded_by,
         &ctx.signer_event_id,
         &ctx.signing_key,
-        current_timestamp_ms(),
+        current_timestamp_ms_u64(),
         CreateMessageCmd {
             workspace_id: ctx.workspace_id,
             author_id: ctx.author_id,
@@ -659,7 +653,7 @@ pub fn send_file_for_peer(
         &recorded_by,
         &key_event_id,
         &ParsedEvent::File(FileEvent {
-            created_at_ms: current_timestamp_ms(),
+            created_at_ms: current_timestamp_ms_u64(),
             message_id: message_event_id,
             file_id,
             blob_bytes: file_size,
@@ -688,7 +682,7 @@ pub fn send_file_for_peer(
             &recorded_by,
             &key_event_id,
             &ParsedEvent::FileSlice(FileSliceEvent {
-                created_at_ms: current_timestamp_ms(),
+                created_at_ms: current_timestamp_ms_u64(),
                 file_id,
                 slice_number: slice_number as u32,
                 ciphertext,

@@ -1,16 +1,9 @@
 //! CRUD queries for local subscriptions, feed, and state.
 
 use rusqlite::Connection;
-use std::time::{SystemTime, UNIX_EPOCH};
 
 use super::types::*;
-
-fn now_ms() -> i64 {
-    SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
+use crate::db::queue::current_timestamp_ms;
 
 /// Create a new subscription and initialize its state row.
 pub fn create_subscription(
@@ -24,7 +17,7 @@ pub fn create_subscription(
     let subscription_id = uuid_v4();
     let spec_json =
         serde_json::to_string(spec).map_err(|e| format!("spec serialization: {}", e))?;
-    let now = now_ms();
+    let now = current_timestamp_ms();
 
     conn.execute(
         "INSERT INTO local_subscriptions
@@ -174,7 +167,7 @@ pub fn set_enabled(
         .execute(
             "UPDATE local_subscriptions SET enabled = ?3, updated_at_ms = ?4
              WHERE recorded_by = ?1 AND subscription_id = ?2",
-            rusqlite::params![recorded_by, subscription_id, enabled, now_ms()],
+            rusqlite::params![recorded_by, subscription_id, enabled, current_timestamp_ms()],
         )
         .map_err(|e| e.to_string())?;
     if rows == 0 {
@@ -199,7 +192,7 @@ pub fn append_feed_item(
     created_at_ms: i64,
     payload: &serde_json::Value,
 ) -> Result<i64, String> {
-    let now = now_ms();
+    let now = current_timestamp_ms();
     let payload_json =
         serde_json::to_string(payload).map_err(|e| format!("payload serialization: {}", e))?;
 
@@ -321,7 +314,7 @@ pub fn mark_changed(
     event_id: &str,
     created_at_ms: i64,
 ) -> Result<i64, String> {
-    let now = now_ms();
+    let now = current_timestamp_ms();
 
     conn.execute(
         "UPDATE local_subscription_state
@@ -433,7 +426,7 @@ pub fn ack_feed(
         )
         .map_err(|e| format!("subscription not found: {}", e))?;
 
-    let now = now_ms();
+    let now = current_timestamp_ms();
 
     if delivery_str == "has_changed" {
         // has_changed mode: no feed rows to delete, just reset state.

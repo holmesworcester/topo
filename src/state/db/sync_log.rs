@@ -2,6 +2,8 @@ use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 use std::thread;
 use std::time::Duration;
 
+use super::queue::current_timestamp_ms;
+
 const DAY_MS: i64 = 24 * 60 * 60 * 1000;
 const SQLITE_BUSY_RETRY_ATTEMPTS: usize = 8;
 
@@ -156,13 +158,6 @@ fn i64_to_usize(v: i64) -> usize {
     }
 }
 
-fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_millis() as i64
-}
-
 fn sanitize_config(mut cfg: SyncLogConfig) -> SyncLogConfig {
     if cfg.max_runs < 1 {
         cfg.max_runs = 1;
@@ -249,7 +244,7 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
             bool_to_i64(defaults.capture_full_ids),
             defaults.max_runs,
             defaults.max_age_days,
-            now_ms(),
+            current_timestamp_ms(),
         ],
     )?;
     Ok(())
@@ -315,7 +310,7 @@ pub fn update_config(conn: &Connection, patch: SyncLogConfigPatch) -> SqliteResu
             bool_to_i64(cfg.capture_full_ids),
             cfg.max_runs,
             cfg.max_age_days,
-            now_ms(),
+            current_timestamp_ms(),
         ],
     )?;
 
@@ -528,7 +523,7 @@ pub fn append_run_with_events(
 }
 
 fn prune_locked(conn: &Connection, cfg: &SyncLogConfig) -> SqliteResult<()> {
-    let cutoff = now_ms().saturating_sub(cfg.max_age_days.saturating_mul(DAY_MS));
+    let cutoff = current_timestamp_ms().saturating_sub(cfg.max_age_days.saturating_mul(DAY_MS));
     conn.execute(
         "DELETE FROM sync_run_rx_events
          WHERE run_id IN (SELECT run_id FROM sync_runs WHERE ended_at_ms < ?1)",
@@ -707,6 +702,13 @@ fn row_to_run(row: &rusqlite::Row<'_>) -> SqliteResult<SyncRunRow> {
         outcome: row.get(15)?,
         error: row.get(16)?,
     })
+}
+
+/// Thin alias so that `#[cfg(test)] mod tests` (which uses `super::*`) can
+/// continue calling `now_ms()` without modification.
+#[cfg(test)]
+fn now_ms() -> i64 {
+    current_timestamp_ms()
 }
 
 #[cfg(test)]
