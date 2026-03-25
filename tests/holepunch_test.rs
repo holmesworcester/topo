@@ -14,7 +14,7 @@ use topo::db::intro::{freshest_endpoint, list_intro_attempts};
 use topo::db::open_connection;
 use topo::db::project_queue::ProjectQueue;
 use topo::db::transport_trust::authorized_fingerprints_from_db;
-use topo::peering::loops::{accept_loop, connect_loop};
+use topo::peering::loops::{accept_loop, connect_loop, ConnectLoopConfig};
 use topo::peering::workflows::intro::{build_intro_offer, run_intro, send_intro_offer};
 use topo::peering::workflows::punch::spawn_intro_listener;
 use topo::projection::apply::project_one;
@@ -119,16 +119,19 @@ async fn test_three_peer_intro_happy_path() {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let _ = connect_loop(
-                &a_db1,
-                &a_id1,
-                a_ep1,
-                addr_i,
-                &intro_target_for_a,
-                None,
-                spawn_intro_listener,
-                topo::testutil::test_ingest_fns(),
-            )
+            let _ = connect_loop(ConnectLoopConfig {
+                db_path: a_db1.clone(),
+                recorded_by: a_id1.clone(),
+                endpoint: a_ep1,
+                remote: addr_i,
+                remote_transport_peer_id: intro_target_for_a.clone(),
+                client_config: None,
+                intro_spawner: spawn_intro_listener,
+                ingest: topo::testutil::test_ingest_fns(),
+                shutdown: None,
+                bootstrap_fallback_client_config: None,
+                sync_control: None,
+            })
             .await;
         });
     });
@@ -143,16 +146,19 @@ async fn test_three_peer_intro_happy_path() {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let _ = connect_loop(
-                &b_db1,
-                &b_id1,
-                b_ep1,
-                addr_i,
-                &intro_target_for_b,
-                None,
-                spawn_intro_listener,
-                topo::testutil::test_ingest_fns(),
-            )
+            let _ = connect_loop(ConnectLoopConfig {
+                db_path: b_db1.clone(),
+                recorded_by: b_id1.clone(),
+                endpoint: b_ep1,
+                remote: addr_i,
+                remote_transport_peer_id: intro_target_for_b.clone(),
+                client_config: None,
+                intro_spawner: spawn_intro_listener,
+                ingest: topo::testutil::test_ingest_fns(),
+                shutdown: None,
+                bootstrap_fallback_client_config: None,
+                sync_control: None,
+            })
             .await;
         });
     });

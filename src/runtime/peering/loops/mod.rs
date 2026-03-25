@@ -11,7 +11,7 @@
 //!
 //! Sub-modules:
 //!  - `accept`   -- accept_loop, accept_loop_until_cancel, resolve_inbound_auth_context
-//!  - `connect`  -- connect_loop, connect_loop_with_coordination
+//!  - `connect`  -- connect_loop, ConnectLoopConfig
 //!  - `supervisor` -- shared preflight + session lifecycle supervision
 
 mod accept;
@@ -20,10 +20,7 @@ mod supervisor;
 
 // Re-export public API so callers can still `use crate::peering::loops::*`.
 pub use accept::{accept_loop, accept_loop_until_cancel};
-pub use connect::{
-    connect_loop, connect_loop_with_coordination, connect_loop_with_coordination_until_cancel,
-    connect_loop_with_coordination_until_cancel_with_fallback,
-};
+pub use connect::{connect_loop, ConnectLoopConfig};
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

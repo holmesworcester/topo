@@ -32,8 +32,8 @@ use crate::db::transport_creds::{
 };
 use crate::db::transport_trust::is_peer_shared_transport_fingerprint;
 use crate::peering::loops::{
-    accept_loop_until_cancel, connect_loop_with_coordination_until_cancel_with_fallback,
-    preferred_connection_direction, IntroSpawnerFn,
+    accept_loop_until_cancel, connect_loop, preferred_connection_direction, ConnectLoopConfig,
+    IntroSpawnerFn,
 };
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::transport::{
@@ -1067,19 +1067,19 @@ async fn run_connect_worker(
             break;
         }
 
-        let result = connect_loop_with_coordination_until_cancel_with_fallback(
-            &db_path,
-            &tenant_id,
-            endpoint.clone(),
+        let result = connect_loop(ConnectLoopConfig {
+            db_path: db_path.clone(),
+            recorded_by: tenant_id.clone(),
+            endpoint: endpoint.clone(),
             remote,
-            &remote_peer_id,
-            Some(context.client_config.clone()),
+            remote_transport_peer_id: remote_peer_id.clone(),
+            client_config: Some(context.client_config.clone()),
             intro_spawner,
             ingest,
-            shutdown.clone(),
-            bootstrap_fallback_client_config.clone(),
-            sync_control.clone(),
-        )
+            shutdown: Some(shutdown.clone()),
+            bootstrap_fallback_client_config: bootstrap_fallback_client_config.clone(),
+            sync_control: sync_control.clone(),
+        })
         .await;
 
         if shutdown.is_cancelled() {

@@ -50,9 +50,7 @@ use crate::event_modules::{
     KeySharedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent, PeerSharedEvent,
     ReactionEvent, TenantEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
 };
-use crate::peering::loops::{
-    accept_loop, connect_loop, connect_loop_with_coordination_until_cancel,
-};
+use crate::peering::loops::{accept_loop, connect_loop, ConnectLoopConfig};
 use crate::projection::apply::project_one;
 use crate::projection::create::{
     create_encrypted_event_staged, create_encrypted_event_synchronous, create_event_staged,
@@ -414,17 +412,19 @@ async fn sync_pair_until_transport_converged(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = connect_loop_with_coordination_until_cancel(
-                &b_db,
-                &b_identity,
-                connect_endpoint_thread,
-                accept_addr,
-                &target_peer_id_for_connect,
-                None,
-                noop_intro_spawner,
-                test_ingest_fns(),
-                connect_cancel_thread,
-            )
+            if let Err(e) = connect_loop(ConnectLoopConfig {
+                db_path: b_db.clone(),
+                recorded_by: b_identity.clone(),
+                endpoint: connect_endpoint_thread,
+                remote: accept_addr,
+                remote_transport_peer_id: target_peer_id_for_connect.clone(),
+                client_config: None,
+                intro_spawner: noop_intro_spawner,
+                ingest: test_ingest_fns(),
+                shutdown: Some(connect_cancel_thread),
+                bootstrap_fallback_client_config: None,
+                sync_control: None,
+            })
             .await
             {
                 tracing::warn!("temporary identity connect_loop exited: {}", e);
@@ -796,16 +796,19 @@ impl Peer {
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                let _ = connect_loop(
-                    &peer_db,
-                    &peer_id,
-                    peer_ep,
-                    sync_addr,
-                    &creator_target_peer_id_for_thread,
-                    None,
-                    noop_intro_spawner,
-                    test_ingest_fns(),
-                )
+                let _ = connect_loop(ConnectLoopConfig {
+                    db_path: peer_db.clone(),
+                    recorded_by: peer_id.clone(),
+                    endpoint: peer_ep,
+                    remote: sync_addr,
+                    remote_transport_peer_id: creator_target_peer_id_for_thread.clone(),
+                    client_config: None,
+                    intro_spawner: noop_intro_spawner,
+                    ingest: test_ingest_fns(),
+                    shutdown: None,
+                    bootstrap_fallback_client_config: None,
+                    sync_control: None,
+                })
                 .await;
             });
         });
@@ -968,16 +971,19 @@ impl Peer {
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                let _ = connect_loop(
-                    &peer_db,
-                    &peer_id,
-                    peer_ep,
-                    sync_addr,
-                    &creator_target_peer_id_for_thread,
-                    None,
-                    noop_intro_spawner,
-                    test_ingest_fns(),
-                )
+                let _ = connect_loop(ConnectLoopConfig {
+                    db_path: peer_db.clone(),
+                    recorded_by: peer_id.clone(),
+                    endpoint: peer_ep,
+                    remote: sync_addr,
+                    remote_transport_peer_id: creator_target_peer_id_for_thread.clone(),
+                    client_config: None,
+                    intro_spawner: noop_intro_spawner,
+                    ingest: test_ingest_fns(),
+                    shutdown: None,
+                    bootstrap_fallback_client_config: None,
+                    sync_control: None,
+                })
                 .await;
             });
         });
@@ -2830,16 +2836,19 @@ pub fn start_peers(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = connect_loop(
-                &b_db,
-                &b_identity,
-                connector_endpoint,
-                listener_addr,
-                &target_peer_id,
-                None,
-                noop_intro_spawner,
-                test_ingest_fns(),
-            )
+            if let Err(e) = connect_loop(ConnectLoopConfig {
+                db_path: b_db.clone(),
+                recorded_by: b_identity.clone(),
+                endpoint: connector_endpoint,
+                remote: listener_addr,
+                remote_transport_peer_id: target_peer_id.clone(),
+                client_config: None,
+                intro_spawner: noop_intro_spawner,
+                ingest: test_ingest_fns(),
+                shutdown: None,
+                bootstrap_fallback_client_config: None,
+                sync_control: None,
+            })
             .await
             {
                 tracing::warn!("connect_loop exited: {}", e);
@@ -2915,16 +2924,19 @@ pub fn start_peers_runtime_affine(
             let connector_endpoint =
                 create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert_b, key_b, allow_b)
                     .expect("failed to create connector endpoint");
-            if let Err(e) = connect_loop(
-                &b_db,
-                &b_identity,
-                connector_endpoint,
-                listener_addr,
-                &target_peer_id,
-                None,
-                noop_intro_spawner,
-                test_ingest_fns(),
-            )
+            if let Err(e) = connect_loop(ConnectLoopConfig {
+                db_path: b_db.clone(),
+                recorded_by: b_identity.clone(),
+                endpoint: connector_endpoint,
+                remote: listener_addr,
+                remote_transport_peer_id: target_peer_id.clone(),
+                client_config: None,
+                intro_spawner: noop_intro_spawner,
+                ingest: test_ingest_fns(),
+                shutdown: None,
+                bootstrap_fallback_client_config: None,
+                sync_control: None,
+            })
             .await
             {
                 tracing::warn!("connect_loop exited: {}", e);
@@ -3019,16 +3031,19 @@ pub fn start_peers_dynamic(
             .build()
             .unwrap();
         rt.block_on(async move {
-            if let Err(e) = connect_loop(
-                &b_db,
-                &b_identity,
-                connector_endpoint,
-                listener_addr,
-                &target_peer_id,
-                None,
-                noop_intro_spawner,
-                test_ingest_fns(),
-            )
+            if let Err(e) = connect_loop(ConnectLoopConfig {
+                db_path: b_db.clone(),
+                recorded_by: b_identity.clone(),
+                endpoint: connector_endpoint,
+                remote: listener_addr,
+                remote_transport_peer_id: target_peer_id.clone(),
+                client_config: None,
+                intro_spawner: noop_intro_spawner,
+                ingest: test_ingest_fns(),
+                shutdown: None,
+                bootstrap_fallback_client_config: None,
+                sync_control: None,
+            })
             .await
             {
                 tracing::warn!("connect_loop exited: {}", e);
@@ -3247,17 +3262,19 @@ pub fn start_chain(peers: &[Peer]) -> ChainHandles {
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                if let Err(e) = connect_loop_with_coordination_until_cancel(
-                    &db_path,
-                    &identity,
+                if let Err(e) = connect_loop(ConnectLoopConfig {
+                    db_path: db_path.clone(),
+                    recorded_by: identity.clone(),
                     endpoint,
                     remote,
-                    &target_peer_id,
-                    None,
-                    noop_intro_spawner,
-                    test_ingest_fns(),
-                    shutdown,
-                )
+                    remote_transport_peer_id: target_peer_id.clone(),
+                    client_config: None,
+                    intro_spawner: noop_intro_spawner,
+                    ingest: test_ingest_fns(),
+                    shutdown: Some(shutdown),
+                    bootstrap_fallback_client_config: None,
+                    sync_control: None,
+                })
                 .await
                 {
                     tracing::warn!("chain connect_loop[{}] exited: {}", i, e);
@@ -3416,17 +3433,19 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                let _ = connect_loop_with_coordination_until_cancel(
-                    &sink_db,
-                    &sink_identity,
+                let _ = connect_loop(ConnectLoopConfig {
+                    db_path: sink_db.clone(),
+                    recorded_by: sink_identity.clone(),
                     endpoint,
                     remote,
-                    &target_peer_id,
-                    None,
-                    noop_intro_spawner,
-                    test_ingest_fns(),
-                    shutdown,
-                )
+                    remote_transport_peer_id: target_peer_id.clone(),
+                    client_config: None,
+                    intro_spawner: noop_intro_spawner,
+                    ingest: test_ingest_fns(),
+                    shutdown: Some(shutdown),
+                    bootstrap_fallback_client_config: None,
+                    sync_control: None,
+                })
                 .await;
             });
         }));

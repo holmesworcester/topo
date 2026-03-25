@@ -1,7 +1,7 @@
 use std::time::Duration;
 use std::time::Instant;
 use topo::crypto::event_id_to_base64;
-use topo::peering::loops::{accept_loop, connect_loop};
+use topo::peering::loops::{accept_loop, connect_loop, ConnectLoopConfig};
 use topo::testutil::{
     assert_eventually, noop_intro_spawner, test_ingest_fns, Peer, ScenarioHarness,
 };
@@ -105,16 +105,19 @@ async fn test_mdns_two_peers_discover_and_sync() {
             .build()
             .unwrap();
         rt.block_on(async {
-            let _ = connect_loop(
-                &b_db,
-                &b_id,
-                ep_b,
+            let _ = connect_loop(ConnectLoopConfig {
+                db_path: b_db.clone(),
+                recorded_by: b_id.clone(),
+                endpoint: ep_b,
                 remote,
-                &remote_peer_id,
-                None,
-                noop_intro_spawner,
-                test_ingest_fns(),
-            )
+                remote_transport_peer_id: remote_peer_id.clone(),
+                client_config: None,
+                intro_spawner: noop_intro_spawner,
+                ingest: test_ingest_fns(),
+                shutdown: None,
+                bootstrap_fallback_client_config: None,
+                sync_control: None,
+            })
             .await;
         });
     });
@@ -305,16 +308,19 @@ async fn test_mdns_multitenant_self_filtering_and_sync() {
             .build()
             .unwrap();
         rt.block_on(async {
-            let _ = connect_loop(
-                &ext_db,
-                &ext_identity,
-                ep_ext,
-                t0_connect_addr,
-                &remote_peer_id,
-                None,
-                noop_intro_spawner,
-                test_ingest_fns(),
-            )
+            let _ = connect_loop(ConnectLoopConfig {
+                db_path: ext_db.clone(),
+                recorded_by: ext_identity.clone(),
+                endpoint: ep_ext,
+                remote: t0_connect_addr,
+                remote_transport_peer_id: remote_peer_id.clone(),
+                client_config: None,
+                intro_spawner: noop_intro_spawner,
+                ingest: test_ingest_fns(),
+                shutdown: None,
+                bootstrap_fallback_client_config: None,
+                sync_control: None,
+            })
             .await;
         });
     });
