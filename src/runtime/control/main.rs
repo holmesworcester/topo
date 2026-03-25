@@ -1973,19 +1973,53 @@ async fn reevaluate_runtime(
             Ok(Err(e)) => {
                 let msg = e.to_string();
                 let m = msg.to_ascii_lowercase();
-                if let Ok(conn) = open_connection(&finished_db_path) {
-                    if let Err(err) =
-                        topo::event_modules::operational::client_lifecycle::mark_runtime_stopped(
-                            &conn,
-                            &finished_client_run,
-                            "runtime_exited_with_error",
-                        )
-                    {
-                        tracing::warn!(
-                            "failed to record runtime error exit for run {}: {}",
-                            finished_client_run.run_id,
-                            err
-                        );
+                let is_bind_failure = m.contains("address already in use")
+                    || m.contains("os error 98")   // Linux EADDRINUSE
+                    || m.contains("os error 48")    // macOS EADDRINUSE
+                    || m.contains("os error 10048") // Windows WSAEADDRINUSE
+                    || m.contains("permission denied")
+                    || m.contains("os error 13");
+                if is_bind_failure {
+                    // Record a durable listener_bind_failed event instead of
+                    // a generic runtime stop — the run stays retriable.
+                    let error_kind = if m.contains("permission denied") || m.contains("os error 13") {
+                        "permission_denied"
+                    } else {
+                        "address_in_use"
+                    };
+                    if let Ok(conn) = open_connection(&finished_db_path) {
+                        if let Err(err) =
+                            topo::event_modules::operational::client_lifecycle::record_listener_bind_failed(
+                                &conn,
+                                &finished_client_run,
+                                bind,
+                                error_kind,
+                                Some(&msg),
+                            )
+                        {
+                            tracing::warn!(
+                                "failed to record listener bind failure for run {}: {}",
+                                finished_client_run.run_id,
+                                err
+                            );
+                        }
+                    }
+                }
+                if !is_bind_failure {
+                    if let Ok(conn) = open_connection(&finished_db_path) {
+                        if let Err(err) =
+                            topo::event_modules::operational::client_lifecycle::mark_runtime_stopped(
+                                &conn,
+                                &finished_client_run,
+                                "runtime_exited_with_error",
+                            )
+                        {
+                            tracing::warn!(
+                                "failed to record runtime error exit for run {}: {}",
+                                finished_client_run.run_id,
+                                err
+                            );
+                        }
                     }
                 }
                 if m.contains("address already in use")

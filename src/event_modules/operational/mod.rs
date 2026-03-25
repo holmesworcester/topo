@@ -11,6 +11,7 @@ pub mod durable_jobs;
 pub mod inbound_connection_authenticated;
 pub mod ingress_provenance;
 pub mod inbound_connection_closed;
+pub mod listener_bind_failed;
 pub mod inbound_connection_rejected;
 pub mod mdns_peer_observed;
 pub mod outbound_connection_authenticated;
@@ -44,5 +45,6 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     sync_round_started::ensure_schema(conn)?;
     sync_round_completed::ensure_schema(conn)?;
     sync_window_selected::ensure_schema(conn)?;
+    listener_bind_failed::ensure_schema(conn)?;
     Ok(())
 }

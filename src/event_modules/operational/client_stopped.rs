@@ -189,6 +189,7 @@ pub static CLIENT_STOPPED_META: EventTypeMeta = EventTypeMeta {
         super::super::EVENT_TYPE_CLIENT_STARTED,
         super::super::EVENT_TYPE_CLIENT_ACTIVATED,
         super::super::EVENT_TYPE_CLIENT_STOPPED,
+        super::super::EVENT_TYPE_LISTENER_BIND_FAILED,
     ]],
     signer_required: false,
     signature_byte_len: 0,

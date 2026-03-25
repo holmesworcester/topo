@@ -21,6 +21,7 @@ pub enum ClientRuntimeStatus {
     Starting,
     Active,
     Stopped,
+    BindFailed,
 }
 
 impl ClientRuntimeStatus {
@@ -30,6 +31,7 @@ impl ClientRuntimeStatus {
             Self::Starting => "starting",
             Self::Active => "active",
             Self::Stopped => "stopped",
+            Self::BindFailed => "bind_failed",
         }
     }
 
@@ -39,6 +41,7 @@ impl ClientRuntimeStatus {
             "starting" => Self::Starting,
             "active" => Self::Active,
             "stopped" => Self::Stopped,
+            "bind_failed" => Self::BindFailed,
             _ => Self::Stopped,
         }
     }
@@ -220,6 +223,34 @@ pub fn mark_runtime_active(
     Ok(())
 }
 
+pub fn record_listener_bind_failed(
+    conn: &Connection,
+    run: &ClientRun,
+    bind_addr: std::net::SocketAddr,
+    error_kind: &str,
+    detail: Option<&str>,
+) -> Result<(), CreateEventError> {
+    let basis_event_id = match load_run(conn, &run.client_id, &run.run_id)? {
+        Some(row) => event_id_from_base64(&row.latest_event_id).ok_or_else(|| {
+            CreateEventError::EncodeError("invalid client latest_event_id".to_string())
+        })?,
+        None => event_id_from_base64(&run.run_id).ok_or_else(|| {
+            CreateEventError::EncodeError("invalid client run_id event id".to_string())
+        })?,
+    };
+    let event = ParsedEvent::ListenerBindFailed(
+        super::listener_bind_failed::ListenerBindFailedEvent {
+            created_at_ms: now_ms() as u64,
+            basis_event_id,
+            bind_addr: bind_addr.to_string(),
+            error_kind: error_kind.to_string(),
+            detail: detail.map(str::to_string),
+        },
+    );
+    let _ = create_event_synchronous(conn, &run.client_id, &event)?;
+    Ok(())
+}
+
 pub fn mark_runtime_stopped(
     conn: &Connection,
     run: &ClientRun,
@@ -342,7 +373,9 @@ pub fn load_state(
     Ok(row.map(|row| {
         let current_run_id = match row.runtime_status {
             ClientRuntimeStatus::Stopped | ClientRuntimeStatus::IdleNoTenants => None,
-            ClientRuntimeStatus::Starting | ClientRuntimeStatus::Active => Some(row.run_id.clone()),
+            ClientRuntimeStatus::Starting
+            | ClientRuntimeStatus::Active
+            | ClientRuntimeStatus::BindFailed => Some(row.run_id.clone()),
         };
         ClientRuntimeStateRow {
             latest_event_id: row.latest_event_id,
@@ -431,7 +464,7 @@ pub fn desired_runtime_action(
         return DesiredRuntimeAction::IdleNoTenants;
     }
     match lifecycle_state.map(|s| s.runtime_status) {
-        Some(ClientRuntimeStatus::Starting) => {
+        Some(ClientRuntimeStatus::Starting) | Some(ClientRuntimeStatus::BindFailed) => {
             if let Some(run_id) = lifecycle_state.and_then(|s| s.current_run_id.clone()) {
                 DesiredRuntimeAction::SpawnRuntime { run_id }
             } else {

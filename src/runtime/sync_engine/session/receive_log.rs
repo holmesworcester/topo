@@ -246,11 +246,39 @@ pub fn ingest_receive_log(db_path: &str, path: &Path) -> Result<usize, String> {
     let (mut file, header, version) = open_receive_log(path)?;
     let mut ingested = 0usize;
     let mut batch = Vec::<IngestItem>::with_capacity(RECEIVE_LOG_INGEST_BATCH_CAP);
+    let mut batch_event_ids = Vec::<[u8; 32]>::with_capacity(RECEIVE_LOG_INGEST_BATCH_CAP);
     let mut batch_bytes = 0usize;
+
+    let flush_provenance = |db_path: &str,
+                            header: &ReceiveLogHeader,
+                            event_ids: &[[u8; 32]]|
+     -> Result<(), String> {
+        if event_ids.is_empty() {
+            return Ok(());
+        }
+        let conn =
+            crate::db::open_connection(db_path).map_err(|e| format!("open provenance db: {e}"))?;
+        let b64_ids: Vec<String> = event_ids
+            .iter()
+            .map(crate::crypto::event_id_to_base64)
+            .collect();
+        let round_id = format!("session:{}", header.session_id);
+        let _ = crate::event_modules::operational::ingress_provenance::record_ingress_batch(
+            &conn,
+            &header.recorded_by,
+            &b64_ids,
+            None,
+            Some(&round_id),
+            &header.source_tag,
+            "receive_log",
+        );
+        Ok(())
+    };
 
     stream_receive_log(&mut file, path, version, |record| {
         let event_id = hash_event(&record.blob);
         batch_bytes = batch_bytes.saturating_add(record.blob.len());
+        batch_event_ids.push(event_id);
         batch.push((
             event_id,
             record.blob,
@@ -262,13 +290,17 @@ pub fn ingest_receive_log(db_path: &str, path: &Path) -> Result<usize, String> {
         if batch.len() >= RECEIVE_LOG_INGEST_BATCH_CAP
             || batch_bytes >= RECEIVE_LOG_INGEST_BATCH_MAX_BYTES
         {
+            let ids = std::mem::take(&mut batch_event_ids);
             ingested += ingest_now(db_path, std::mem::take(&mut batch))?;
+            let _ = flush_provenance(db_path, &header, &ids);
             batch_bytes = 0;
         }
         Ok(())
     })?;
     if !batch.is_empty() {
+        let ids = std::mem::take(&mut batch_event_ids);
         ingested += ingest_now(db_path, batch)?;
+        let _ = flush_provenance(db_path, &header, &ids);
     }
 
     fs::remove_file(path).map_err(|e| format!("delete receive log {}: {e}", path.display()))?;

@@ -104,6 +104,7 @@ pub const EVENT_TYPE_INBOUND_CONNECTION_CLOSED: u8 = 41;
 pub const EVENT_TYPE_SYNC_ROUND_STARTED: u8 = 42;
 pub const EVENT_TYPE_SYNC_ROUND_COMPLETED: u8 = 43;
 pub const EVENT_TYPE_CLIENT_IDLE_RESERVED: u8 = 44;
+pub const EVENT_TYPE_LISTENER_BIND_FAILED: u8 = 45;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -187,6 +188,7 @@ pub enum ParsedEvent {
     InboundConnectionClosed(operational::inbound_connection_closed::InboundConnectionClosedEvent),
     SyncRoundStarted(operational::sync_round_started::SyncRoundStartedEvent),
     SyncRoundCompleted(operational::sync_round_completed::SyncRoundCompletedEvent),
+    ListenerBindFailed(operational::listener_bind_failed::ListenerBindFailedEvent),
 }
 
 impl ParsedEvent {
@@ -226,6 +228,7 @@ impl ParsedEvent {
             ParsedEvent::InboundConnectionClosed(c) => c.created_at_ms,
             ParsedEvent::SyncRoundStarted(c) => c.created_at_ms,
             ParsedEvent::SyncRoundCompleted(c) => c.created_at_ms,
+            ParsedEvent::ListenerBindFailed(c) => c.created_at_ms,
         }
     }
 
@@ -308,6 +311,7 @@ impl ParsedEvent {
             ParsedEvent::InboundConnectionClosed(c) => vec![("basis_event_id", c.basis_event_id)],
             ParsedEvent::SyncRoundStarted(c) => vec![("basis_event_id", c.basis_event_id)],
             ParsedEvent::SyncRoundCompleted(c) => vec![("basis_event_id", c.basis_event_id)],
+            ParsedEvent::ListenerBindFailed(c) => vec![("basis_event_id", c.basis_event_id)],
         }
     }
 
@@ -351,6 +355,7 @@ impl ParsedEvent {
             ParsedEvent::InboundConnectionClosed(_) => EVENT_TYPE_INBOUND_CONNECTION_CLOSED,
             ParsedEvent::SyncRoundStarted(_) => EVENT_TYPE_SYNC_ROUND_STARTED,
             ParsedEvent::SyncRoundCompleted(_) => EVENT_TYPE_SYNC_ROUND_COMPLETED,
+            ParsedEvent::ListenerBindFailed(_) => EVENT_TYPE_LISTENER_BIND_FAILED,
         }
     }
 
@@ -391,7 +396,8 @@ impl ParsedEvent {
             | ParsedEvent::InboundConnectionRejected(_)
             | ParsedEvent::InboundConnectionClosed(_)
             | ParsedEvent::SyncRoundStarted(_)
-            | ParsedEvent::SyncRoundCompleted(_) => None,
+            | ParsedEvent::SyncRoundCompleted(_)
+            | ParsedEvent::ListenerBindFailed(_) => None,
         }
     }
 
@@ -432,6 +438,7 @@ impl ParsedEvent {
             ParsedEvent::InboundConnectionClosed(e) => e.human_fields(),
             ParsedEvent::SyncRoundStarted(e) => e.human_fields(),
             ParsedEvent::SyncRoundCompleted(e) => e.human_fields(),
+            ParsedEvent::ListenerBindFailed(e) => e.human_fields(),
         }
     }
 }
@@ -536,6 +543,7 @@ pub fn registry() -> &'static EventRegistry {
             &operational::inbound_connection_closed::INBOUND_CONNECTION_CLOSED_META,
             &operational::sync_round_started::SYNC_ROUND_STARTED_META,
             &operational::sync_round_completed::SYNC_ROUND_COMPLETED_META,
+            &operational::listener_bind_failed::LISTENER_BIND_FAILED_META,
         ])
     })
 }
