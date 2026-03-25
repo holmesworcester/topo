@@ -15,10 +15,11 @@ use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate
 use crate::sync::session::dependency_session::spawn_outbound_dependency_session;
 use crate::sync::session::windowing::reset_outbound_window_state;
 use crate::sync::SyncConnectionHandler;
-use crate::transport::multi_workspace::transport_sni;
 use crate::transport::{
-    derive_bootstrap_dial_context, dial_session_provider, BootstrapDialMode,
-    ConnectionLifecycleError, SessionProvider, TransportClientConfig, TransportEndpoint,
+    derive_bootstrap_dial_context, dial_session_provider, resolve_bootstrap_inviter_peer_id,
+    send_outbound_session_auth, BootstrapDialMode, ConnectionLifecycleError,
+    OutboundSessionAuthPlan, SessionProvider, TransportClientConfig, TransportEndpoint,
+    COVER_SERVER_NAME,
 };
 
 use super::supervisor::{
@@ -51,17 +52,48 @@ pub async fn connect_loop(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
-    remote_transport_peer_id: &str,
+    remote_peer_id: &str,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    connect_loop_with_coordination(
+    connect_loop_with_auth(
         db_path,
         recorded_by,
         endpoint,
         remote,
-        remote_transport_peer_id,
+        remote_peer_id,
+        remote_peer_id,
+        OutboundSessionAuthPlan::PeerShared {
+            target_peer_id: remote_peer_id.to_string(),
+        },
+        client_config,
+        intro_spawner,
+        ingest,
+    )
+    .await
+}
+
+pub async fn connect_loop_with_auth(
+    db_path: &str,
+    recorded_by: &str,
+    endpoint: TransportEndpoint,
+    remote: SocketAddr,
+    remote_peer_id: &str,
+    expected_remote_daemon_peer_id: &str,
+    auth_plan: OutboundSessionAuthPlan,
+    client_config: Option<TransportClientConfig>,
+    intro_spawner: IntroSpawnerFn,
+    ingest: IngestFns,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    connect_loop_with_coordination_with_auth(
+        db_path,
+        recorded_by,
+        endpoint,
+        remote,
+        remote_peer_id,
+        expected_remote_daemon_peer_id,
+        auth_plan,
         client_config,
         intro_spawner,
         ingest,
@@ -74,17 +106,48 @@ pub async fn connect_loop_with_coordination(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
-    remote_transport_peer_id: &str,
+    remote_peer_id: &str,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    connect_loop_with_coordination_until_cancel(
+    connect_loop_with_coordination_with_auth(
         db_path,
         recorded_by,
         endpoint,
         remote,
-        remote_transport_peer_id,
+        remote_peer_id,
+        remote_peer_id,
+        OutboundSessionAuthPlan::PeerShared {
+            target_peer_id: remote_peer_id.to_string(),
+        },
+        client_config,
+        intro_spawner,
+        ingest,
+    )
+    .await
+}
+
+pub async fn connect_loop_with_coordination_with_auth(
+    db_path: &str,
+    recorded_by: &str,
+    endpoint: TransportEndpoint,
+    remote: SocketAddr,
+    remote_peer_id: &str,
+    expected_remote_daemon_peer_id: &str,
+    auth_plan: OutboundSessionAuthPlan,
+    client_config: Option<TransportClientConfig>,
+    intro_spawner: IntroSpawnerFn,
+    ingest: IngestFns,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    connect_loop_with_coordination_until_cancel_with_auth(
+        db_path,
+        recorded_by,
+        endpoint,
+        remote,
+        remote_peer_id,
+        expected_remote_daemon_peer_id,
+        auth_plan,
         client_config,
         intro_spawner,
         ingest,
@@ -98,18 +161,51 @@ pub async fn connect_loop_with_coordination_until_cancel(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
-    remote_transport_peer_id: &str,
+    remote_peer_id: &str,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     shutdown: CancellationToken,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    connect_loop_with_coordination_until_cancel_with_fallback(
+    connect_loop_with_coordination_until_cancel_with_auth(
         db_path,
         recorded_by,
         endpoint,
         remote,
-        remote_transport_peer_id,
+        remote_peer_id,
+        remote_peer_id,
+        OutboundSessionAuthPlan::PeerShared {
+            target_peer_id: remote_peer_id.to_string(),
+        },
+        client_config,
+        intro_spawner,
+        ingest,
+        shutdown,
+    )
+    .await
+}
+
+pub async fn connect_loop_with_coordination_until_cancel_with_auth(
+    db_path: &str,
+    recorded_by: &str,
+    endpoint: TransportEndpoint,
+    remote: SocketAddr,
+    remote_peer_id: &str,
+    expected_remote_daemon_peer_id: &str,
+    auth_plan: OutboundSessionAuthPlan,
+    client_config: Option<TransportClientConfig>,
+    intro_spawner: IntroSpawnerFn,
+    ingest: IngestFns,
+    shutdown: CancellationToken,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    connect_loop_with_coordination_until_cancel_with_fallback_with_auth(
+        db_path,
+        recorded_by,
+        endpoint,
+        remote,
+        remote_peer_id,
+        expected_remote_daemon_peer_id,
+        auth_plan,
         client_config,
         intro_spawner,
         ingest,
@@ -127,7 +223,42 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
-    remote_transport_peer_id: &str,
+    remote_peer_id: &str,
+    client_config: Option<TransportClientConfig>,
+    intro_spawner: IntroSpawnerFn,
+    ingest: IngestFns,
+    shutdown: CancellationToken,
+    bootstrap_fallback_client_config: Option<TransportClientConfig>,
+    sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    connect_loop_with_coordination_until_cancel_with_fallback_with_auth(
+        db_path,
+        recorded_by,
+        endpoint,
+        remote,
+        remote_peer_id,
+        remote_peer_id,
+        OutboundSessionAuthPlan::PeerShared {
+            target_peer_id: remote_peer_id.to_string(),
+        },
+        client_config,
+        intro_spawner,
+        ingest,
+        shutdown,
+        bootstrap_fallback_client_config,
+        sync_control,
+    )
+    .await
+}
+
+pub async fn connect_loop_with_coordination_until_cancel_with_fallback_with_auth(
+    db_path: &str,
+    recorded_by: &str,
+    endpoint: TransportEndpoint,
+    remote: SocketAddr,
+    remote_peer_id: &str,
+    expected_remote_daemon_peer_id: &str,
+    auth_plan: OutboundSessionAuthPlan,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
@@ -147,7 +278,9 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
             recorded_by,
             endpoint,
             remote,
-            remote_transport_peer_id,
+            remote_peer_id,
+            expected_remote_daemon_peer_id,
+            auth_plan,
             client_config,
             intro_spawner,
             shutdown,
@@ -162,14 +295,15 @@ async fn connect_loop_inner(
     recorded_by: &str,
     endpoint: TransportEndpoint,
     remote: SocketAddr,
-    remote_transport_peer_id: &str,
+    remote_peer_id: &str,
+    expected_remote_daemon_peer_id: &str,
+    auth_plan: OutboundSessionAuthPlan,
     client_config: Option<TransportClientConfig>,
     intro_spawner: IntroSpawnerFn,
     shutdown: CancellationToken,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
     sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let sni = transport_sni(remote_transport_peer_id);
     let mut has_connected_once = false;
     let mut announced_connecting = false;
     let mut consecutive_stale_dial_failures: u32 = 0;
@@ -190,7 +324,7 @@ async fn connect_loop_inner(
             outcome = dial_provider_ongoing_first(
                 &endpoint,
                 remote,
-                &sni,
+                COVER_SERVER_NAME,
                 client_config.as_ref(),
                 bootstrap_fallback_client_config.as_ref(),
             ) => outcome,
@@ -198,7 +332,8 @@ async fn connect_loop_inner(
             Ok(outcome) => outcome,
             Err(e) => {
                 let message = describe_connect_failure(remote, &e);
-                let warn_on_startup_stale_failure = bootstrap_fallback_client_config.is_some();
+                let warn_on_startup_stale_failure = bootstrap_fallback_client_config.is_some()
+                    || matches!(auth_plan, OutboundSessionAuthPlan::InviteBootstrap { .. });
                 if (should_warn_for_connect_failure(has_connected_once, &e)
                     || warn_on_startup_stale_failure)
                     && warning_gate.should_emit(message.clone())
@@ -237,9 +372,35 @@ async fn connect_loop_inner(
         announced_connecting = false;
         consecutive_stale_dial_failures = 0;
         warning_gate.clear();
-        let provider = dial_outcome.provider;
+        let mut provider = dial_outcome.provider;
         let used_bootstrap_fallback = dial_outcome.used_bootstrap_fallback;
         let connection = provider.connection();
+        let auth_result = match send_outbound_session_auth(
+            &connection,
+            db_path,
+            recorded_by,
+            Some(expected_remote_daemon_peer_id),
+            &auth_plan,
+        )
+        .await
+        {
+            Ok(auth_result) => auth_result,
+            Err(e) => {
+                let message = describe_session_auth_failure(remote, remote_peer_id, &*e);
+                if warning_gate.should_emit(message.clone())
+                    && should_emit_globally(format!("connect:{message}"))
+                {
+                    warn!("{}", message);
+                }
+                connection.close(1u32.into(), b"session auth failed");
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(CONNECT_RETRY_DELAY) => {}
+                }
+                continue;
+            }
+        };
+        provider = provider.with_peer_id(auth_result.session_peer_id.clone());
         let peer_id = provider.peer_id().to_string();
         let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
             Some(fp) => fp,
@@ -310,8 +471,18 @@ async fn connect_loop_inner(
                     now,
                     ENDPOINT_TTL_MS,
                 );
-                // Record transport binding (peer_id is hex SPKI fingerprint)
-                let _ = record_transport_binding(&db, recorded_by, &peer_id, &peer_fp);
+                if let Some(ref canonical_remote_peer_id) = auth_result.canonical_remote_peer_id {
+                    if let Some(remote_daemon_fp) =
+                        peer_fingerprint_from_hex(&auth_result.remote_daemon_peer_id)
+                    {
+                        let _ = record_transport_binding(
+                            &db,
+                            recorded_by,
+                            canonical_remote_peer_id,
+                            &remote_daemon_fp,
+                        );
+                    }
+                }
                 let purged = purge_expired_endpoints(&db, now).unwrap_or(0);
                 if purged > 0 {
                     info!("Purged {} expired endpoint observations", purged);
@@ -356,6 +527,36 @@ async fn connect_loop_inner(
             shutdown.clone(),
         )
         .await;
+
+        if let OutboundSessionAuthPlan::InviteBootstrap { invite_event_id } = &auth_plan {
+            if let Ok(db) = open_connection(db_path) {
+                if let Ok(Some(canonical_remote_peer_id)) =
+                    resolve_bootstrap_inviter_peer_id(&db, recorded_by, invite_event_id)
+                {
+                    let remote_addr = connection.remote_address();
+                    let now = current_timestamp_ms();
+                    let _ = record_endpoint_observation(
+                        &db,
+                        recorded_by,
+                        &canonical_remote_peer_id,
+                        &remote_addr.ip().to_string(),
+                        remote_addr.port(),
+                        now,
+                        ENDPOINT_TTL_MS,
+                    );
+                    if let Some(remote_daemon_fp) =
+                        peer_fingerprint_from_hex(&auth_result.remote_daemon_peer_id)
+                    {
+                        let _ = record_transport_binding(
+                            &db,
+                            recorded_by,
+                            &canonical_remote_peer_id,
+                            &remote_daemon_fp,
+                        );
+                    }
+                }
+            }
+        }
         drop(connection_lease);
     }
 
@@ -425,6 +626,28 @@ fn describe_connect_failure(remote: SocketAddr, err: &ConnectionLifecycleError) 
             )
         }
     }
+}
+
+fn describe_session_auth_failure(
+    remote: SocketAddr,
+    remote_peer_id: &str,
+    err: &(dyn std::error::Error + Send + Sync),
+) -> String {
+    let msg = err.to_string();
+    if let Some((expected, presented)) = msg
+        .strip_prefix("connected daemon fingerprint mismatch: expected ")
+        .and_then(|rest| rest.split_once(", got "))
+    {
+        return format!(
+            "Certificate mismatch connecting to {}: expected daemon fingerprint {}, got {}. \
+             The invite/bootstrap link may point at the wrong daemon or carry stale daemon identity.",
+            remote, expected, presented
+        );
+    }
+    format!(
+        "Failed to authenticate session to {} for remote principal {}: {}",
+        remote, remote_peer_id, msg
+    )
 }
 
 fn is_stale_dial_failure(err: &ConnectionLifecycleError) -> bool {

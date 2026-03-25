@@ -40,7 +40,7 @@ fn test_two_process_invite_and_sync() {
     let invite_link = create_invite_with_spki(
         &alice_db,
         &daemon_listen_addr(&alice_db),
-        Some(&daemon_transport_fingerprint(&alice_db)),
+        Some(&daemon_identity_fingerprint(&alice_db)),
     );
     assert!(
         invite_link.starts_with("topo://invite/"),

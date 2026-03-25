@@ -4,6 +4,7 @@ use rusqlite::OptionalExtension;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::{event_id_from_base64, EventId};
+use crate::event_modules::{parse_event, ParsedEvent};
 
 // ---------------------------------------------------------------------------
 // Identity helpers (moved from service.rs)
@@ -32,6 +33,37 @@ fn has_accepted_workspace_binding(
     )
 }
 
+fn load_local_peer_signer_from_recorded_event(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<Option<(EventId, SigningKey)>, Box<dyn std::error::Error + Send + Sync>> {
+    let blob: Option<Vec<u8>> = db
+        .query_row(
+            "SELECT e.blob
+             FROM recorded_events re
+             JOIN events e ON e.event_id = re.event_id
+             WHERE re.peer_id = ?1
+               AND e.event_type = 'peer_secret'
+             ORDER BY re.recorded_at DESC, re.id DESC
+             LIMIT 1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(blob) = blob else {
+        return Ok(None);
+    };
+    match parse_event(&blob)? {
+        ParsedEvent::PeerSecret(event) => Ok(Some((
+            event.signer_event_id,
+            SigningKey::from_bytes(&event.private_key_bytes),
+        ))),
+        other => {
+            Err(format!("expected peer_secret event in recorded fallback, got {other:?}").into())
+        }
+    }
+}
+
 /// Load the local peer signer from peer_secrets.
 pub fn load_local_peer_signer(
     db: &Connection,
@@ -53,6 +85,9 @@ pub fn load_local_peer_signer(
         let eid = event_id_from_base64(&eid_b64)
             .ok_or_else(|| "bad local peer signer event_id".to_string())?;
         return Ok(Some((eid, signing_key)));
+    }
+    if let Some(signer) = load_local_peer_signer_from_recorded_event(db, recorded_by)? {
+        return Ok(Some(signer));
     }
     Ok(None)
 }
@@ -350,6 +385,9 @@ mod tests {
     use crate::crypto::event_id_to_base64;
     use crate::crypto::spki_fingerprint_from_ed25519_pubkey;
     use crate::db::{open_in_memory, schema::create_tables};
+    use crate::event_modules::ShareScope;
+    use crate::event_modules::{encode_event, PeerSecretEvent};
+    use crate::state::db::store::{insert_event, insert_recorded_event};
 
     #[test]
     fn resolve_event_id_by_transport_fingerprint_uses_projected_index() {
@@ -558,5 +596,54 @@ mod tests {
             "unexpected error: {}",
             err
         );
+    }
+
+    #[test]
+    fn load_local_peer_signer_uses_recorded_peer_secret_during_initial_sync() {
+        let conn = open_in_memory().expect("open in-memory db");
+        create_tables(&conn).expect("create tables");
+
+        conn.execute(
+            "INSERT INTO invites_accepted
+             (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "pending-tenant",
+                "ia-1",
+                "tenant-evt-1",
+                "invite-evt-1",
+                event_id_to_base64(&[0x55; 32]),
+                1i64
+            ],
+        )
+        .expect("insert invite_accepted");
+
+        let signer_event_id = [0x33; 32];
+        let private_key_bytes = [0x44; 32];
+        let event = ParsedEvent::PeerSecret(PeerSecretEvent {
+            created_at_ms: 2,
+            signer_event_id,
+            private_key_bytes,
+        });
+        let blob = encode_event(&event).expect("encode peer_secret");
+        let event_id = [0x66; 32];
+        insert_event(
+            &conn,
+            &event_id,
+            "peer_secret",
+            &blob,
+            ShareScope::Local,
+            2,
+            2,
+        )
+        .expect("insert event");
+        insert_recorded_event(&conn, "pending-tenant", &event_id, 2, "local")
+            .expect("insert recorded event");
+
+        let (loaded_signer_event_id, signing_key) =
+            load_local_peer_signer_required(&conn, "pending-tenant")
+                .expect("recorded peer_secret should satisfy bootstrap auth");
+        assert_eq!(loaded_signer_event_id, signer_event_id);
+        assert_eq!(signing_key.to_bytes(), private_key_bytes);
     }
 }

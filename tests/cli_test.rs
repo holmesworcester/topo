@@ -334,15 +334,34 @@ fn dial_peer_for_tenant(
     runtime.block_on(async {
         let endpoint =
             quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).map_err(|e| e.to_string())?;
-        topo::transport::dial_peer(&endpoint, remote, &sni, Some(&client_config))
+        let result = async {
+            let connected =
+                topo::transport::dial_peer(&endpoint, remote, &sni, Some(&client_config))
+                    .await
+                    .map_err(|e| e.to_string())?;
+            let auth_result = topo::transport::send_outbound_session_auth(
+                &connected.connection,
+                db_path,
+                tenant_id,
+                None,
+                &topo::transport::OutboundSessionAuthPlan::PeerShared {
+                    target_peer_id: remote_peer_id.to_string(),
+                },
+            )
             .await
-            .map(|connected| {
-                let peer_id = connected.peer_id.clone();
-                connected.connection.close(0u32.into(), b"test done");
-                endpoint.close(0u32.into(), b"test done");
-                peer_id
-            })
-            .map_err(|e| e.to_string())
+            .map_err(|e| e.to_string())?;
+            let close_probe =
+                tokio::time::timeout(Duration::from_millis(250), connected.connection.closed())
+                    .await;
+            connected.connection.close(0u32.into(), b"test done");
+            endpoint.close(0u32.into(), b"test done");
+            match close_probe {
+                Ok(err) => Err(format!("connection closed after session auth: {err}")),
+                Err(_) => Ok(auth_result.session_peer_id),
+            }
+        }
+        .await;
+        result
     })
 }
 

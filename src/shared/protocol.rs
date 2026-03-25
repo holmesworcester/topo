@@ -14,6 +14,9 @@ pub const MSG_TYPE_REQUEST_IDS: u8 = 0x12; // Sink request: source should send t
 pub const MSG_TYPE_DISCOVERY_HINTS: u8 = 0x14; // Discovery hint: peer is missing these IDs
 pub const MSG_TYPE_EVENT: u8 = 0x03; // Event blob (variable length)
 pub const MSG_TYPE_INTRO_OFFER: u8 = 0x30; // Intro offer for hole punching
+pub const MSG_TYPE_OPEN_SESSION_AUTH_PEER_SHARED: u8 = 0x31;
+pub const MSG_TYPE_OPEN_SESSION_AUTH_INVITE: u8 = 0x32;
+pub const MSG_TYPE_OPEN_SESSION_AUTH_ACK: u8 = 0x33;
 
 /// Max negentropy message payload: 4 MiB (generous for large reconciliation rounds)
 const MAX_NEG_MSG_BYTES: usize = 4 * 1024 * 1024;
@@ -29,22 +32,57 @@ pub struct DiscoveryHint {
     pub created_at_ms: u64,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenSessionAuthPeerShared {
+    pub source_peer_id: [u8; 32],
+    pub target_tenant_id: [u8; 32],
+    pub signer_event_id: EventId,
+    pub local_daemon_peer_id: [u8; 32],
+    pub remote_daemon_peer_id: [u8; 32],
+    pub expires_at_ms: u64,
+    pub signature: [u8; 64],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenSessionAuthInvite {
+    pub source_peer_id: [u8; 32],
+    pub source_peer_public_key: [u8; 32],
+    pub target_invite_event_id: EventId,
+    pub local_daemon_peer_id: [u8; 32],
+    pub remote_daemon_peer_id: [u8; 32],
+    pub expires_at_ms: u64,
+    pub signature: [u8; 64],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenSessionAuthAck {
+    pub target_tenant_id: [u8; 32],
+}
+
 /// Sync protocol messages
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Frame {
     /// Initial negentropy reconciliation message
-    NegOpen { msg: Vec<u8> },
+    NegOpen {
+        msg: Vec<u8>,
+    },
     /// Negentropy reconciliation response
-    NegMsg { msg: Vec<u8> },
+    NegMsg {
+        msg: Vec<u8>,
+    },
     /// Exact event IDs the sink is requesting from the source.
-    RequestIds { ids: Vec<[u8; 32]> },
+    RequestIds {
+        ids: Vec<[u8; 32]>,
+    },
     /// Discovery hints describing events the peer appears to be missing.
     DiscoveryHints {
         priority_lane: u8,
         hints: Vec<DiscoveryHint>,
     },
     /// Send full event blob (variable length)
-    Event { blob: Vec<u8> },
+    Event {
+        blob: Vec<u8>,
+    },
     /// Intro offer for QUIC hole punching via a third peer
     IntroOffer {
         intro_id: [u8; 16],
@@ -55,6 +93,15 @@ pub enum Frame {
         observed_at_ms: u64,
         expires_at_ms: u64,
         attempt_window_ms: u32,
+    },
+    OpenSessionAuthPeerShared {
+        auth: OpenSessionAuthPeerShared,
+    },
+    OpenSessionAuthInvite {
+        auth: OpenSessionAuthInvite,
+    },
+    OpenSessionAuthAck {
+        ack: OpenSessionAuthAck,
     },
 }
 
@@ -219,6 +266,104 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
                 INTRO_OFFER_SIZE,
             ))
         }
+        MSG_TYPE_OPEN_SESSION_AUTH_PEER_SHARED => {
+            const AUTH_SIZE: usize = 1 + 32 + 32 + 32 + 32 + 32 + 8 + 64;
+            if input.len() < AUTH_SIZE {
+                return Err(ParseError::InsufficientData);
+            }
+            let mut pos = 1;
+            let mut source_peer_id = [0u8; 32];
+            source_peer_id.copy_from_slice(&input[pos..pos + 32]);
+            pos += 32;
+            let mut target_tenant_id = [0u8; 32];
+            target_tenant_id.copy_from_slice(&input[pos..pos + 32]);
+            pos += 32;
+            let mut signer_event_id = [0u8; 32];
+            signer_event_id.copy_from_slice(&input[pos..pos + 32]);
+            pos += 32;
+            let mut local_daemon_peer_id = [0u8; 32];
+            local_daemon_peer_id.copy_from_slice(&input[pos..pos + 32]);
+            pos += 32;
+            let mut remote_daemon_peer_id = [0u8; 32];
+            remote_daemon_peer_id.copy_from_slice(&input[pos..pos + 32]);
+            pos += 32;
+            let expires_at_ms = u64::from_le_bytes(input[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let mut signature = [0u8; 64];
+            signature.copy_from_slice(&input[pos..pos + 64]);
+            pos += 64;
+            debug_assert_eq!(pos, AUTH_SIZE);
+            Ok((
+                Frame::OpenSessionAuthPeerShared {
+                    auth: OpenSessionAuthPeerShared {
+                        source_peer_id,
+                        target_tenant_id,
+                        signer_event_id,
+                        local_daemon_peer_id,
+                        remote_daemon_peer_id,
+                        expires_at_ms,
+                        signature,
+                    },
+                },
+                AUTH_SIZE,
+            ))
+        }
+        MSG_TYPE_OPEN_SESSION_AUTH_INVITE => {
+            const AUTH_SIZE: usize = 1 + 32 + 32 + 32 + 32 + 32 + 8 + 64;
+            if input.len() < AUTH_SIZE {
+                return Err(ParseError::InsufficientData);
+            }
+            let mut pos = 1;
+            let mut source_peer_id = [0u8; 32];
+            source_peer_id.copy_from_slice(&input[pos..pos + 32]);
+            pos += 32;
+            let mut source_peer_public_key = [0u8; 32];
+            source_peer_public_key.copy_from_slice(&input[pos..pos + 32]);
+            pos += 32;
+            let mut target_invite_event_id = [0u8; 32];
+            target_invite_event_id.copy_from_slice(&input[pos..pos + 32]);
+            pos += 32;
+            let mut local_daemon_peer_id = [0u8; 32];
+            local_daemon_peer_id.copy_from_slice(&input[pos..pos + 32]);
+            pos += 32;
+            let mut remote_daemon_peer_id = [0u8; 32];
+            remote_daemon_peer_id.copy_from_slice(&input[pos..pos + 32]);
+            pos += 32;
+            let expires_at_ms = u64::from_le_bytes(input[pos..pos + 8].try_into().unwrap());
+            pos += 8;
+            let mut signature = [0u8; 64];
+            signature.copy_from_slice(&input[pos..pos + 64]);
+            pos += 64;
+            debug_assert_eq!(pos, AUTH_SIZE);
+            Ok((
+                Frame::OpenSessionAuthInvite {
+                    auth: OpenSessionAuthInvite {
+                        source_peer_id,
+                        source_peer_public_key,
+                        target_invite_event_id,
+                        local_daemon_peer_id,
+                        remote_daemon_peer_id,
+                        expires_at_ms,
+                        signature,
+                    },
+                },
+                AUTH_SIZE,
+            ))
+        }
+        MSG_TYPE_OPEN_SESSION_AUTH_ACK => {
+            const ACK_SIZE: usize = 1 + 32;
+            if input.len() < ACK_SIZE {
+                return Err(ParseError::InsufficientData);
+            }
+            let mut target_tenant_id = [0u8; 32];
+            target_tenant_id.copy_from_slice(&input[1..33]);
+            Ok((
+                Frame::OpenSessionAuthAck {
+                    ack: OpenSessionAuthAck { target_tenant_id },
+                },
+                ACK_SIZE,
+            ))
+        }
         _ => Err(ParseError::UnknownType(msg_type)),
     }
 }
@@ -292,6 +437,36 @@ pub fn encode_frame(msg: &Frame) -> Vec<u8> {
             buf.extend_from_slice(&observed_at_ms.to_le_bytes());
             buf.extend_from_slice(&expires_at_ms.to_le_bytes());
             buf.extend_from_slice(&attempt_window_ms.to_le_bytes());
+            buf
+        }
+        Frame::OpenSessionAuthPeerShared { auth } => {
+            let mut buf = Vec::with_capacity(1 + 32 + 32 + 32 + 32 + 32 + 8 + 64);
+            buf.push(MSG_TYPE_OPEN_SESSION_AUTH_PEER_SHARED);
+            buf.extend_from_slice(&auth.source_peer_id);
+            buf.extend_from_slice(&auth.target_tenant_id);
+            buf.extend_from_slice(&auth.signer_event_id);
+            buf.extend_from_slice(&auth.local_daemon_peer_id);
+            buf.extend_from_slice(&auth.remote_daemon_peer_id);
+            buf.extend_from_slice(&auth.expires_at_ms.to_le_bytes());
+            buf.extend_from_slice(&auth.signature);
+            buf
+        }
+        Frame::OpenSessionAuthInvite { auth } => {
+            let mut buf = Vec::with_capacity(1 + 32 + 32 + 32 + 32 + 32 + 8 + 64);
+            buf.push(MSG_TYPE_OPEN_SESSION_AUTH_INVITE);
+            buf.extend_from_slice(&auth.source_peer_id);
+            buf.extend_from_slice(&auth.source_peer_public_key);
+            buf.extend_from_slice(&auth.target_invite_event_id);
+            buf.extend_from_slice(&auth.local_daemon_peer_id);
+            buf.extend_from_slice(&auth.remote_daemon_peer_id);
+            buf.extend_from_slice(&auth.expires_at_ms.to_le_bytes());
+            buf.extend_from_slice(&auth.signature);
+            buf
+        }
+        Frame::OpenSessionAuthAck { ack } => {
+            let mut buf = Vec::with_capacity(1 + 32);
+            buf.push(MSG_TYPE_OPEN_SESSION_AUTH_ACK);
+            buf.extend_from_slice(&ack.target_tenant_id);
             buf
         }
     }
@@ -457,6 +632,57 @@ mod tests {
         buf.extend_from_slice(&[0u8; 50]);
         let result = parse_frame(&buf);
         assert_eq!(result, Err(ParseError::InsufficientData));
+    }
+
+    #[test]
+    fn test_open_session_auth_peer_shared_roundtrip() {
+        let msg = Frame::OpenSessionAuthPeerShared {
+            auth: OpenSessionAuthPeerShared {
+                source_peer_id: [0x11; 32],
+                target_tenant_id: [0x22; 32],
+                signer_event_id: [0x33; 32],
+                local_daemon_peer_id: [0x44; 32],
+                remote_daemon_peer_id: [0x55; 32],
+                expires_at_ms: 123456789,
+                signature: [0x66; 64],
+            },
+        };
+        let encoded = encode_frame(&msg);
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_open_session_auth_invite_roundtrip() {
+        let msg = Frame::OpenSessionAuthInvite {
+            auth: OpenSessionAuthInvite {
+                source_peer_id: [0x11; 32],
+                source_peer_public_key: [0x22; 32],
+                target_invite_event_id: [0x33; 32],
+                local_daemon_peer_id: [0x44; 32],
+                remote_daemon_peer_id: [0x55; 32],
+                expires_at_ms: 123456789,
+                signature: [0x66; 64],
+            },
+        };
+        let encoded = encode_frame(&msg);
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_open_session_auth_ack_roundtrip() {
+        let msg = Frame::OpenSessionAuthAck {
+            ack: OpenSessionAuthAck {
+                target_tenant_id: [0x77; 32],
+            },
+        };
+        let encoded = encode_frame(&msg);
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(parsed, msg);
     }
 
     #[test]

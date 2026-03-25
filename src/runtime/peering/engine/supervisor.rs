@@ -32,14 +32,14 @@ use crate::db::transport_creds::{
 };
 use crate::db::transport_trust::is_peer_shared_transport_fingerprint;
 use crate::peering::loops::{
-    accept_loop_until_cancel, connect_loop_with_coordination_until_cancel_with_fallback,
+    accept_loop_until_cancel, connect_loop_with_coordination_until_cancel_with_fallback_with_auth,
     preferred_connection_direction, IntroSpawnerFn,
 };
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::transport::{
     build_tenant_bootstrap_fallback_client_config_for_invite_from_db,
-    build_tenant_client_config_from_db, TenantClientConfigs, TransportClientConfig,
-    TransportEndpoint,
+    build_tenant_client_config_from_db, resolve_bound_daemon_peer_id, OutboundSessionAuthPlan,
+    TenantClientConfigs, TransportClientConfig, TransportEndpoint,
 };
 
 const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
@@ -93,7 +93,7 @@ struct TenantDispatchContext {
 #[derive(Clone, Debug)]
 enum TargetIngressSource {
     Bootstrap {
-        peer_id: String,
+        daemon_peer_id: String,
         invite_event_id: String,
     },
     ObservedPeer {
@@ -117,6 +117,12 @@ struct ActiveConnectWorker {
     source: TargetIngressSource,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct BootstrapSessionFallback {
+    daemon_peer_id: String,
+    invite_event_id: String,
+}
+
 fn source_precedence(source: &TargetIngressSource) -> u8 {
     match source {
         TargetIngressSource::Bootstrap { .. } => 0,
@@ -129,6 +135,20 @@ fn should_ignore_target_event(
     incoming: &TargetIngressSource,
 ) -> bool {
     source_precedence(existing) > source_precedence(incoming)
+}
+
+fn should_keep_existing_bootstrap_worker(
+    db_path: &str,
+    tenant_id: &str,
+    existing: &TargetIngressSource,
+    incoming: &TargetIngressSource,
+) -> bool {
+    is_tenant_in_bootstrap_phase(db_path, tenant_id)
+        && matches!(existing, TargetIngressSource::Bootstrap { .. })
+        && matches!(
+            incoming,
+            TargetIngressSource::ObservedPeer { .. } | TargetIngressSource::Discovery { .. }
+        )
 }
 
 pub(crate) struct RuntimeSupervisor {
@@ -486,7 +506,7 @@ async fn run_bootstrap_refresher(
                             tenant_id,
                             remote,
                             source: TargetIngressSource::Bootstrap {
-                                peer_id,
+                                daemon_peer_id: peer_id,
                                 invite_event_id,
                             },
                         })
@@ -630,8 +650,8 @@ async fn run_target_dispatcher(
         reap_finished_connect_workers(&mut active_workers, &mut dispatcher).await;
 
         let dispatch_key = match &event.source {
-            TargetIngressSource::Bootstrap { peer_id, .. } => {
-                bootstrap_dispatch_key(&event.tenant_id, peer_id, event.remote)
+            TargetIngressSource::Bootstrap { daemon_peer_id, .. } => {
+                bootstrap_dispatch_key(&event.tenant_id, daemon_peer_id, event.remote)
             }
             TargetIngressSource::ObservedPeer { peer_id } => {
                 discovery_dispatch_key(&event.tenant_id, peer_id)
@@ -685,6 +705,21 @@ async fn run_target_dispatcher(
         }
 
         if let Some(existing) = active_workers.get(&dispatch_key) {
+            if should_keep_existing_bootstrap_worker(
+                &db_path,
+                &event.tenant_id,
+                &existing.source,
+                &event.source,
+            ) {
+                info!(
+                    "Keeping existing bootstrap worker over {:?} during bootstrap phase key={} tenant={} remote={}",
+                    event.source,
+                    dispatch_key,
+                    short_peer_id(&event.tenant_id),
+                    event.remote
+                );
+                continue;
+            }
             if should_ignore_target_event(&existing.source, &event.source) {
                 info!(
                     "Keeping existing higher-priority {:?} worker over {:?} key={} tenant={} remote={}",
@@ -699,7 +734,10 @@ async fn run_target_dispatcher(
         }
 
         let should_spawn = match &event.source {
-            TargetIngressSource::Bootstrap { peer_id, .. } => {
+            TargetIngressSource::Bootstrap {
+                daemon_peer_id: peer_id,
+                ..
+            } => {
                 dispatch_bootstrap_target(&mut dispatcher, &event.tenant_id, peer_id, event.remote)
             }
             TargetIngressSource::ObservedPeer { peer_id } => dispatch_observed_endpoint_target(
@@ -787,7 +825,75 @@ async fn run_target_dispatcher(
             TargetIngressSource::Discovery { .. } => None,
         };
 
+        let bootstrap_session_fallback = match &event.source {
+            TargetIngressSource::Bootstrap {
+                daemon_peer_id,
+                invite_event_id,
+            } => Some(BootstrapSessionFallback {
+                daemon_peer_id: daemon_peer_id.clone(),
+                invite_event_id: invite_event_id.clone(),
+            }),
+            TargetIngressSource::ObservedPeer { .. } => {
+                resolve_active_bootstrap_session_fallback(&db_path, &event.tenant_id, false)
+            }
+            TargetIngressSource::Discovery { .. } => {
+                resolve_active_bootstrap_session_fallback(&db_path, &event.tenant_id, true)
+            }
+        };
+
         let worker_cancel = shutdown.child_token();
+        let remote_peer_id = match &event.source {
+            TargetIngressSource::Bootstrap { daemon_peer_id, .. } => daemon_peer_id.clone(),
+            TargetIngressSource::ObservedPeer { peer_id }
+            | TargetIngressSource::Discovery { peer_id } => peer_id.clone(),
+        };
+        let expected_remote_daemon_peer_id = match &event.source {
+            TargetIngressSource::ObservedPeer { peer_id }
+            | TargetIngressSource::Discovery { peer_id } => {
+                let conn = open_connection(&db_path).ok();
+                conn.and_then(|conn| {
+                    resolve_bound_daemon_peer_id(&conn, &event.tenant_id, peer_id)
+                        .ok()
+                        .flatten()
+                })
+            }
+            TargetIngressSource::Bootstrap { .. } => None,
+        };
+        let expected_remote_daemon_peer_id = expected_remote_daemon_peer_id.or_else(|| {
+            bootstrap_session_fallback
+                .as_ref()
+                .map(|fallback| fallback.daemon_peer_id.clone())
+        });
+        let Some(expected_remote_daemon_peer_id) = expected_remote_daemon_peer_id else {
+            warn!(
+                "Skipping connect worker for tenant {} source {:?}: no bound daemon fingerprint",
+                short_peer_id(&event.tenant_id),
+                event.source
+            );
+            continue;
+        };
+        let tenant_in_bootstrap_phase = is_tenant_in_bootstrap_phase(&db_path, &event.tenant_id);
+        let auth_plan = if matches!(event.source, TargetIngressSource::Bootstrap { .. })
+            || (tenant_in_bootstrap_phase && bootstrap_session_fallback.is_some())
+        {
+            let Some(fallback) = bootstrap_session_fallback.as_ref() else {
+                unreachable!("bootstrap source must always have a bootstrap session fallback")
+            };
+            OutboundSessionAuthPlan::InviteBootstrap {
+                invite_event_id: fallback.invite_event_id.clone(),
+            }
+        } else {
+            let peer_id = match &event.source {
+                TargetIngressSource::ObservedPeer { peer_id }
+                | TargetIngressSource::Discovery { peer_id } => peer_id,
+                TargetIngressSource::Bootstrap { .. } => {
+                    unreachable!("bootstrap source handled by invite bootstrap auth")
+                }
+            };
+            OutboundSessionAuthPlan::PeerShared {
+                target_peer_id: peer_id.clone(),
+            }
+        };
         info!(
             "Spawning connect worker key={} tenant={} remote={} source={:?}",
             dispatch_key,
@@ -798,11 +904,9 @@ async fn run_target_dispatcher(
         let worker = std::thread::spawn({
             let db_path = db_path.clone();
             let tenant_id = event.tenant_id.clone();
-            let remote_peer_id = match &event.source {
-                TargetIngressSource::Bootstrap { peer_id, .. }
-                | TargetIngressSource::ObservedPeer { peer_id }
-                | TargetIngressSource::Discovery { peer_id } => peer_id.clone(),
-            };
+            let remote_peer_id = remote_peer_id.clone();
+            let expected_remote_daemon_peer_id = expected_remote_daemon_peer_id.clone();
+            let auth_plan = auth_plan.clone();
             let endpoint = endpoint.clone();
             let worker_cancel = worker_cancel.clone();
             let dispatch_key = dispatch_key.clone();
@@ -818,6 +922,8 @@ async fn run_target_dispatcher(
                     tenant_id,
                     event.remote,
                     remote_peer_id,
+                    expected_remote_daemon_peer_id,
+                    auth_plan,
                     endpoint,
                     context,
                     intro_spawner,
@@ -890,6 +996,61 @@ fn is_tenant_in_bootstrap_phase(db_path: &str, tenant_id: &str) -> bool {
         .ok()
         .map(|conn| local_transport_target_is_bootstrap(&conn, tenant_id))
         .unwrap_or(false)
+}
+
+fn resolve_active_bootstrap_session_fallback(
+    db_path: &str,
+    tenant_id: &str,
+    require_local_bootstrap_phase: bool,
+) -> Option<BootstrapSessionFallback> {
+    if require_local_bootstrap_phase && !is_tenant_in_bootstrap_phase(db_path, tenant_id) {
+        return None;
+    }
+
+    let conn = open_connection(db_path).ok()?;
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0);
+    let mut stmt = conn
+        .prepare(
+            "SELECT invite_event_id, bootstrap_spki_fingerprint
+             FROM invite_bootstrap_trust
+             WHERE recorded_by = ?1
+               AND expires_at > ?2
+             ORDER BY accepted_at DESC, invite_accepted_event_id DESC",
+        )
+        .ok()?;
+    let mut fallbacks = stmt
+        .query_map(rusqlite::params![tenant_id, now_ms], |row| {
+            let invite_event_id: String = row.get(0)?;
+            let fp_bytes: Vec<u8> = row.get(1)?;
+            if fp_bytes.len() != 32 {
+                return Err(rusqlite::Error::FromSqlConversionFailure(
+                    1,
+                    rusqlite::types::Type::Blob,
+                    "bootstrap_spki_fingerprint is not 32 bytes".into(),
+                ));
+            }
+            Ok(BootstrapSessionFallback {
+                daemon_peer_id: hex::encode(fp_bytes),
+                invite_event_id,
+            })
+        })
+        .ok()?
+        .collect::<Result<Vec<_>, _>>()
+        .ok()?;
+    fallbacks.sort_by(|a, b| {
+        a.invite_event_id
+            .cmp(&b.invite_event_id)
+            .then_with(|| a.daemon_peer_id.cmp(&b.daemon_peer_id))
+    });
+    fallbacks.dedup();
+    match fallbacks.as_slice() {
+        [fallback] => Some(fallback.clone()),
+        _ => return None,
+    }
 }
 
 fn classify_bootstrap_discovery_auth(
@@ -965,6 +1126,9 @@ fn should_initiate_connect_for_source_with_db(
 ) -> bool {
     match source {
         TargetIngressSource::Discovery { peer_id } => {
+            if resolve_active_bootstrap_session_fallback(db_path, tenant_id, true).is_some() {
+                return true;
+            }
             match classify_bootstrap_discovery_auth(db_path, tenant_id, peer_id) {
                 BootstrapDiscoveryAuth::AcceptedDiscoveryAndObserved => true,
                 BootstrapDiscoveryAuth::PendingOnly => false,
@@ -975,7 +1139,10 @@ fn should_initiate_connect_for_source_with_db(
                 }
             }
         }
-        TargetIngressSource::ObservedPeer { .. } => true,
+        TargetIngressSource::ObservedPeer { .. } => {
+            should_initiate_connect_for_source(tenant_id, source)
+                || resolve_active_bootstrap_session_fallback(db_path, tenant_id, false).is_some()
+        }
         TargetIngressSource::Bootstrap { .. } => true,
     }
 }
@@ -989,7 +1156,10 @@ async fn join_connect_worker(worker: ActiveConnectWorker) {
 
 fn known_peer_key_for_event(event: &TargetIngressEvent) -> String {
     match &event.source {
-        TargetIngressSource::Bootstrap { peer_id, .. }
+        TargetIngressSource::Bootstrap {
+            daemon_peer_id: peer_id,
+            ..
+        }
         | TargetIngressSource::ObservedPeer { peer_id }
         | TargetIngressSource::Discovery { peer_id } => {
             discovery_dispatch_key(&event.tenant_id, peer_id)
@@ -999,7 +1169,10 @@ fn known_peer_key_for_event(event: &TargetIngressEvent) -> String {
 
 fn bootstrap_worker_prefix_for_event(event: &TargetIngressEvent) -> String {
     match &event.source {
-        TargetIngressSource::Bootstrap { peer_id, .. }
+        TargetIngressSource::Bootstrap {
+            daemon_peer_id: peer_id,
+            ..
+        }
         | TargetIngressSource::ObservedPeer { peer_id }
         | TargetIngressSource::Discovery { peer_id } => {
             bootstrap_dispatch_key_prefix(&event.tenant_id, peer_id)
@@ -1052,6 +1225,8 @@ async fn run_connect_worker(
     tenant_id: String,
     remote: SocketAddr,
     remote_peer_id: String,
+    expected_remote_daemon_peer_id: String,
+    auth_plan: OutboundSessionAuthPlan,
     endpoint: TransportEndpoint,
     context: TenantDispatchContext,
     intro_spawner: IntroSpawnerFn,
@@ -1067,12 +1242,14 @@ async fn run_connect_worker(
             break;
         }
 
-        let result = connect_loop_with_coordination_until_cancel_with_fallback(
+        let result = connect_loop_with_coordination_until_cancel_with_fallback_with_auth(
             &db_path,
             &tenant_id,
             endpoint.clone(),
             remote,
             &remote_peer_id,
+            &expected_remote_daemon_peer_id,
+            auth_plan.clone(),
             Some(context.client_config.clone()),
             intro_spawner,
             ingest,
@@ -1252,7 +1429,7 @@ mod tests {
         assert!(should_initiate_connect_for_source(
             tenant,
             &TargetIngressSource::Bootstrap {
-                peer_id: peer.to_string(),
+                daemon_peer_id: peer.to_string(),
                 invite_event_id: "invite".to_string(),
             }
         ));
@@ -1383,7 +1560,7 @@ mod tests {
     #[test]
     fn discovery_source_beats_bootstrap_source_for_same_peer() {
         let bootstrap = TargetIngressSource::Bootstrap {
-            peer_id: "peer".to_string(),
+            daemon_peer_id: "peer".to_string(),
             invite_event_id: "invite".to_string(),
         };
         let discovery = TargetIngressSource::Discovery {
@@ -1627,7 +1804,7 @@ mod tests {
         drop(conn);
 
         let bootstrap = TargetIngressSource::Bootstrap {
-            peer_id: peer.to_string(),
+            daemon_peer_id: peer.to_string(),
             invite_event_id: "invite".to_string(),
         };
 
@@ -1755,5 +1932,55 @@ mod tests {
                 source
             );
         }
+    }
+
+    #[test]
+    fn bootstrap_phase_keeps_existing_bootstrap_worker_over_discovery_and_observed() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tmpdir.path().join("bs-existing-worker-guard.db");
+        let db_str = db_path.to_str().expect("db path");
+        let conn = open_connection(db_str).expect("open db");
+        create_tables(&conn).expect("create tables");
+
+        let tenant = "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa";
+        let peer = "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb";
+
+        set_local_transport_target(&conn, tenant, peer, CRED_SOURCE_BOOTSTRAP)
+            .expect("set bootstrap target");
+        drop(conn);
+
+        let existing = TargetIngressSource::Bootstrap {
+            daemon_peer_id: peer.to_string(),
+            invite_event_id: "invite".to_string(),
+        };
+        let discovery = TargetIngressSource::Discovery {
+            peer_id: peer.to_string(),
+        };
+        let observed = TargetIngressSource::ObservedPeer {
+            peer_id: peer.to_string(),
+        };
+
+        assert!(
+            should_keep_existing_bootstrap_worker(db_str, tenant, &existing, &discovery),
+            "bootstrap phase must keep the bootstrap worker over discovery"
+        );
+        assert!(
+            should_keep_existing_bootstrap_worker(db_str, tenant, &existing, &observed),
+            "bootstrap phase must keep the bootstrap worker over observed reconnects"
+        );
+
+        let conn = open_connection(db_str).expect("open db");
+        set_local_transport_target(&conn, tenant, tenant, CRED_SOURCE_PEER_SHARED)
+            .expect("transition to peershared");
+        drop(conn);
+
+        assert!(
+            !should_keep_existing_bootstrap_worker(db_str, tenant, &existing, &discovery),
+            "after bootstrap, discovery may replace stale bootstrap workers"
+        );
+        assert!(
+            !should_keep_existing_bootstrap_worker(db_str, tenant, &existing, &observed),
+            "after bootstrap, observed reconnects may replace stale bootstrap workers"
+        );
     }
 }
