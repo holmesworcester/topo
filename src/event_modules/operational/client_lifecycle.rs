@@ -384,6 +384,51 @@ pub fn load_run(
     )
 }
 
+// ---------------------------------------------------------------------------
+// Reconciler helpers: derive desired runtime action from projected state
+// ---------------------------------------------------------------------------
+
+/// Desired action for the host reconciler, derived entirely from projected
+/// client runtime state and current tenant configuration.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DesiredRuntimeAction {
+    /// No tenants configured — ensure idle bind reservation, no runtime needed.
+    IdleNoTenants,
+    /// A `client_started` event exists but no runtime is active yet. The
+    /// reconciler should spawn the runtime for this run.
+    SpawnRuntime { run_id: String },
+    /// The runtime is already active — nothing to do for listener lifecycle.
+    RuntimeActive,
+    /// The latest state is stopped or unknown — record `client_started` to
+    /// begin a new run.
+    StartNewRun,
+}
+
+/// Derive the desired runtime action from projected client lifecycle state
+/// and current tenant count. This is the single event-owned decision point
+/// for the host reconciler.
+pub fn desired_runtime_action(
+    lifecycle_state: Option<&ClientRuntimeStateRow>,
+    has_tenants: bool,
+) -> DesiredRuntimeAction {
+    if !has_tenants {
+        return DesiredRuntimeAction::IdleNoTenants;
+    }
+    match lifecycle_state.map(|s| s.runtime_status) {
+        Some(ClientRuntimeStatus::Starting) => {
+            if let Some(run_id) = lifecycle_state.and_then(|s| s.current_run_id.clone()) {
+                DesiredRuntimeAction::SpawnRuntime { run_id }
+            } else {
+                DesiredRuntimeAction::StartNewRun
+            }
+        }
+        Some(ClientRuntimeStatus::Active) => DesiredRuntimeAction::RuntimeActive,
+        Some(ClientRuntimeStatus::Stopped)
+        | Some(ClientRuntimeStatus::IdleNoTenants)
+        | None => DesiredRuntimeAction::StartNewRun,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -490,6 +535,79 @@ mod tests {
             CreateEventError::Blocked { .. } => {}
             other => panic!("expected blocked activation, got {other:?}"),
         }
+    }
+
+    #[test]
+    fn desired_action_no_tenants_returns_idle() {
+        assert_eq!(
+            desired_runtime_action(None, false),
+            DesiredRuntimeAction::IdleNoTenants
+        );
+    }
+
+    #[test]
+    fn desired_action_no_state_with_tenants_returns_start() {
+        assert_eq!(
+            desired_runtime_action(None, true),
+            DesiredRuntimeAction::StartNewRun
+        );
+    }
+
+    #[test]
+    fn desired_action_starting_returns_spawn() {
+        let conn = setup();
+        let db_path = "/tmp/topo-client-desired-spawn.db";
+        let client_id = client_id_for_db_path(db_path);
+        start_runtime(&conn, db_path, addr(7000), Some(addr(7001)), 1).unwrap();
+        let state = load_state(&conn, &client_id).unwrap();
+        let action = desired_runtime_action(state.as_ref(), true);
+        match action {
+            DesiredRuntimeAction::SpawnRuntime { .. } => {}
+            other => panic!("expected SpawnRuntime, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn desired_action_active_returns_active() {
+        let conn = setup();
+        let db_path = "/tmp/topo-client-desired-active.db";
+        let client_id = client_id_for_db_path(db_path);
+        let run = start_runtime(&conn, db_path, addr(7000), Some(addr(7001)), 1).unwrap();
+        mark_runtime_active(&conn, &run, addr(7443), 1).unwrap();
+        let state = load_state(&conn, &client_id).unwrap();
+        assert_eq!(
+            desired_runtime_action(state.as_ref(), true),
+            DesiredRuntimeAction::RuntimeActive
+        );
+    }
+
+    #[test]
+    fn desired_action_stopped_with_tenants_returns_start() {
+        let conn = setup();
+        let db_path = "/tmp/topo-client-desired-restart.db";
+        let client_id = client_id_for_db_path(db_path);
+        let run = start_runtime(&conn, db_path, addr(7000), Some(addr(7001)), 1).unwrap();
+        mark_runtime_active(&conn, &run, addr(7443), 1).unwrap();
+        mark_runtime_stopped(&conn, &run, "graceful_shutdown").unwrap();
+        let state = load_state(&conn, &client_id).unwrap();
+        assert_eq!(
+            desired_runtime_action(state.as_ref(), true),
+            DesiredRuntimeAction::StartNewRun
+        );
+    }
+
+    #[test]
+    fn desired_action_stopped_no_tenants_returns_idle() {
+        let conn = setup();
+        let db_path = "/tmp/topo-client-desired-idle.db";
+        let client_id = client_id_for_db_path(db_path);
+        let run = start_runtime(&conn, db_path, addr(7000), Some(addr(7001)), 1).unwrap();
+        mark_runtime_stopped(&conn, &run, "no_tenants").unwrap();
+        let state = load_state(&conn, &client_id).unwrap();
+        assert_eq!(
+            desired_runtime_action(state.as_ref(), false),
+            DesiredRuntimeAction::IdleNoTenants
+        );
     }
 
     #[test]

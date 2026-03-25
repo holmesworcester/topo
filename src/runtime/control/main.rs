@@ -2060,72 +2060,75 @@ async fn reevaluate_runtime(
     let lifecycle_state =
         topo::event_modules::operational::client_lifecycle::load_state(&conn, &client_id)?;
 
-    if tenant_states.is_empty() {
-        if let Some(runtime) = active_runtime.take() {
-            stop_runtime(runtime).await;
-        }
-        if idle_bind_reservation.is_none() {
-            let (reservation, resolved_bind) = reserve_idle_bind(bind, false)?;
-            *state.resolved_bind_addr.write().unwrap() = Some(resolved_bind);
-            *idle_bind_reservation = Some(reservation);
-        }
-        if let Some(resolved_bind) = *state.resolved_bind_addr.read().unwrap() {
-            let conn = open_connection(db_path)?;
-            create_tables(&conn)?;
-            topo::event_modules::operational::client_lifecycle::record_idle_bind_reservation(
-                &conn,
-                db_path,
-                bind,
-                resolved_bind,
-                tenant_states.len(),
-            )?;
-        }
-        *state.runtime_state.write().unwrap() = RuntimeState::IdleNoTenants;
-        *state.runtime_net.write().unwrap() = None;
-        clear_upnp_report(&state);
-        return Ok(());
-    }
+    // Derive the desired runtime action from projected lifecycle state.
+    // This is the single event-owned decision point for the reconciler.
+    let desired_action = topo::event_modules::operational::client_lifecycle::desired_runtime_action(
+        lifecycle_state.as_ref(),
+        !tenant_states.is_empty(),
+    );
 
-    if active_runtime.is_none() {
-        match lifecycle_state.as_ref().map(|row| row.runtime_status) {
-            Some(
-                topo::event_modules::operational::client_lifecycle::ClientRuntimeStatus::Starting,
-            ) => {
-                if let Some(run_id) = lifecycle_state
-                    .as_ref()
-                    .and_then(|row| row.current_run_id.clone())
-                {
-                    tracing::info!(
-                        "activating peering runtime from projected client_started run {} ({} tenant(s))",
-                        run_id,
-                        tenant_states.len()
-                    );
-                    *active_runtime = Some(spawn_runtime(
-                        db_path,
-                        bind,
-                        state.clone(),
-                        tenant_states.clone(),
-                        topo::event_modules::operational::client_lifecycle::ClientRun {
-                            client_id: client_id.clone(),
-                            run_id,
-                        },
-                    )?);
-                }
+    use topo::event_modules::operational::client_lifecycle::DesiredRuntimeAction;
+    match desired_action {
+        DesiredRuntimeAction::IdleNoTenants => {
+            if let Some(runtime) = active_runtime.take() {
+                stop_runtime(runtime).await;
             }
-            Some(
-                topo::event_modules::operational::client_lifecycle::ClientRuntimeStatus::Active,
-            ) => {}
-            _ => {
-                let reserved_bind = *state.resolved_bind_addr.read().unwrap();
-                topo::event_modules::operational::client_lifecycle::start_runtime(
+            if idle_bind_reservation.is_none() {
+                let (reservation, resolved_bind) = reserve_idle_bind(bind, false)?;
+                *state.resolved_bind_addr.write().unwrap() = Some(resolved_bind);
+                *idle_bind_reservation = Some(reservation);
+            }
+            if let Some(resolved_bind) = *state.resolved_bind_addr.read().unwrap() {
+                let conn = open_connection(db_path)?;
+                create_tables(&conn)?;
+                topo::event_modules::operational::client_lifecycle::record_idle_bind_reservation(
                     &conn,
                     db_path,
                     bind,
-                    reserved_bind,
+                    resolved_bind,
                     tenant_states.len(),
                 )?;
-                return Ok(());
             }
+            *state.runtime_state.write().unwrap() = RuntimeState::IdleNoTenants;
+            *state.runtime_net.write().unwrap() = None;
+            clear_upnp_report(&state);
+            return Ok(());
+        }
+        DesiredRuntimeAction::StartNewRun => {
+            if let Some(runtime) = active_runtime.take() {
+                stop_runtime(runtime).await;
+            }
+            let reserved_bind = *state.resolved_bind_addr.read().unwrap();
+            topo::event_modules::operational::client_lifecycle::start_runtime(
+                &conn,
+                db_path,
+                bind,
+                reserved_bind,
+                tenant_states.len(),
+            )?;
+            return Ok(());
+        }
+        DesiredRuntimeAction::SpawnRuntime { run_id } => {
+            if active_runtime.is_none() {
+                tracing::info!(
+                    "activating peering runtime from projected client_started run {} ({} tenant(s))",
+                    run_id,
+                    tenant_states.len()
+                );
+                *active_runtime = Some(spawn_runtime(
+                    db_path,
+                    bind,
+                    state.clone(),
+                    tenant_states.clone(),
+                    topo::event_modules::operational::client_lifecycle::ClientRun {
+                        client_id: client_id.clone(),
+                        run_id,
+                    },
+                )?);
+            }
+        }
+        DesiredRuntimeAction::RuntimeActive => {
+            // Runtime is active, fall through to tenant change detection below.
         }
     }
 
