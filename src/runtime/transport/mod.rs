@@ -411,57 +411,6 @@ impl rustls::server::danger::ClientCertVerifier for TransportAuthVerifier {
     }
 }
 
-/// Create a QUIC server endpoint with mTLS and dynamic projected-state trust.
-pub fn create_server_endpoint(
-    bind_addr: SocketAddr,
-    cert_der: CertificateDer<'static>,
-    key_der: PrivatePkcs8KeyDer<'static>,
-    allow_fn: Arc<DynamicAllowFn>,
-) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
-    let verifier = Arc::new(TransportAuthVerifier::new_dynamic(allow_fn));
-
-    let server_crypto = rustls::ServerConfig::builder()
-        .with_client_cert_verifier(verifier)
-        .with_single_cert(vec![cert_der], key_der.into())?;
-
-    let mut server_config = ServerConfig::with_crypto(Arc::new(
-        quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
-    ));
-    if let Some(transport) = low_mem_transport_config() {
-        server_config.transport_config(transport);
-    }
-
-    let endpoint = Endpoint::server(server_config, bind_addr)?;
-    Ok(endpoint)
-}
-
-/// Create a QUIC client endpoint with mTLS and dynamic projected-state trust.
-pub fn create_client_endpoint(
-    bind_addr: SocketAddr,
-    cert_der: CertificateDer<'static>,
-    key_der: PrivatePkcs8KeyDer<'static>,
-    allow_fn: Arc<DynamicAllowFn>,
-) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
-    let verifier = Arc::new(TransportAuthVerifier::new_dynamic(allow_fn));
-
-    let mut crypto = rustls::ClientConfig::builder()
-        .dangerous()
-        .with_custom_certificate_verifier(verifier)
-        .with_client_auth_cert(vec![cert_der], key_der.into())?;
-    crypto.enable_sni = false;
-
-    let mut client_config = ClientConfig::new(Arc::new(
-        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
-    ));
-    if let Some(transport) = low_mem_transport_config() {
-        client_config.transport_config(transport);
-    }
-
-    let mut endpoint = Endpoint::client(bind_addr)?;
-    endpoint.set_default_client_config(client_config);
-    Ok(endpoint)
-}
-
 /// Create a dual-role QUIC endpoint that can both accept and connect.
 /// Both roles use mTLS with the same identity and dynamic trust policy.
 /// This is required for hole punching: the same UDP socket must be used
