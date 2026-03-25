@@ -21,7 +21,9 @@ pub fn replay_single_client(
     recorded_by: &str,
     event_blobs: &[Vec<u8>],
 ) -> Result<Connection, ReplayError> {
-    let conn = crate::db::open_in_memory().map_err(|e| ReplayError::Db(e.to_string()))?;
+    let conn = Connection::open_in_memory().map_err(|e| ReplayError::Db(e.to_string()))?;
+    conn.execute_batch("PRAGMA journal_mode=WAL; PRAGMA synchronous=NORMAL; PRAGMA foreign_keys=ON;")
+        .map_err(|e| ReplayError::Db(e.to_string()))?;
     create_tables(&conn).map_err(|e| ReplayError::Db(e.to_string()))?;
 
     for (idx, blob) in event_blobs.iter().enumerate() {
