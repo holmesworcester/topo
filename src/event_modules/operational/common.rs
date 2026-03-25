@@ -120,6 +120,44 @@ pub(crate) fn write_flag(blob: &mut [u8], idx: usize, value: bool) {
     blob[idx] = value as u8;
 }
 
+// ---------------------------------------------------------------------------
+// Shared authoring helpers for operational events
+// ---------------------------------------------------------------------------
+
+/// Helper for creating a local operational event with common boilerplate.
+/// Encapsulates: open connection → resolve basis → create event.
+pub fn author_local_event_from_db<F>(
+    db_path: &str,
+    client_id: &str,
+    build_event: F,
+) -> Result<[u8; 32], String>
+where
+    F: FnOnce(&rusqlite::Connection) -> Result<crate::event_modules::ParsedEvent, String>,
+{
+    let conn = crate::db::open_connection(db_path).map_err(|e| e.to_string())?;
+    let event = build_event(&conn)?;
+    crate::projection::create::create_event_synchronous(&conn, client_id, &event)
+        .map_err(|e| e.to_string())
+}
+
+/// Helper for the common "require latest basis from a chain" pattern.
+/// Returns (tenant_id_or_client_id, basis_event_id_bytes).
+pub fn require_latest_basis<F>(
+    conn: &rusqlite::Connection,
+    entity_id: &str,
+    loader: F,
+) -> Result<[u8; 32], String>
+where
+    F: FnOnce(&rusqlite::Connection, &str) -> Result<Option<String>, String>,
+{
+    let Some(latest_event_id) = loader(conn, entity_id)? else {
+        return Err(format!("missing latest state for {entity_id}"));
+    };
+    crate::crypto::event_id_from_base64(&latest_event_id).ok_or_else(|| {
+        format!("invalid latest_event_id {latest_event_id} for {entity_id}")
+    })
+}
+
 pub(crate) fn build_client_state_basis_context(
     conn: &rusqlite::Connection,
     recorded_by: &str,
