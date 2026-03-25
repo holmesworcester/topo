@@ -180,6 +180,49 @@ mod tests {
     }
 
     #[test]
+    fn provenance_traces_event_to_connection_and_round() {
+        // E2E: simulate what the production ingest path does — record provenance
+        // for canonical events, then verify the system can answer "how did this
+        // event enter the node?"
+        let conn = setup();
+        let tenant = "tenant-ingest";
+        let peer = "peer-abc";
+        let conn_id = "conn-77";
+        let round_id = "session:42";
+
+        // Simulate ingesting 2 canonical events from a sync round
+        let event_ids = vec!["ev-canonical-1".to_string(), "ev-canonical-2".to_string()];
+        let recorded = record_ingress_batch(
+            &conn,
+            tenant,
+            &event_ids,
+            Some(conn_id),
+            Some(round_id),
+            peer,
+            "receive_log",
+        )
+        .unwrap();
+        assert_eq!(recorded, 2);
+
+        // Now answer: "how did ev-canonical-1 enter this node?"
+        let prov = query_provenance(&conn, tenant, "ev-canonical-1").unwrap().unwrap();
+        assert_eq!(prov.peer_id, peer);
+        assert_eq!(prov.connection_id.as_deref(), Some(conn_id));
+        assert_eq!(prov.sync_round_id.as_deref(), Some(round_id));
+        assert_eq!(prov.source_tag, "receive_log");
+
+        // Count: how many events arrived in that sync round?
+        assert_eq!(count_events_in_round(&conn, tenant, round_id).unwrap(), 2);
+    }
+
+    #[test]
+    fn provenance_absent_when_event_not_ingested() {
+        let conn = setup();
+        // No provenance recorded — query should return None
+        assert!(query_provenance(&conn, "tenant-x", "ev-never-ingested").unwrap().is_none());
+    }
+
+    #[test]
     fn duplicate_event_ids_are_ignored() {
         let conn = setup();
         let ids = vec!["event-dup".to_string()];

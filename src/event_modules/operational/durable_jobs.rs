@@ -100,7 +100,7 @@ pub fn enable_job(
         conn.execute(
             "INSERT INTO durable_jobs (client_id, job_kind, enabled, interval_ms, next_due_at_ms, created_at)
              VALUES (?1, ?2, 1, ?3, ?4, ?4)
-             ON CONFLICT(client_id, job_kind) DO UPDATE SET enabled = 1",
+             ON CONFLICT(client_id, job_kind) DO UPDATE SET enabled = 1, next_due_at_ms = ?4",
             params![client_id, kind.as_str(), kind.default_interval_ms(), now],
         )?;
         Ok(())
@@ -309,6 +309,38 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn due_work_survives_disable_reenable_simulating_restart() {
+        // Simulates a client restart: enable → complete → disable (stop) →
+        // re-enable (restart). The job should be due again after re-enable
+        // because enable resets next_due_at_ms to now.
+        let conn = setup();
+        crate::db::schema::create_tables(&conn).unwrap();
+        enable_job(&conn, "client-a", DurableJobKind::BootstrapRefresh).unwrap();
+        complete_job(&conn, "client-a", DurableJobKind::BootstrapRefresh).unwrap();
+
+        // Simulate stop
+        disable_all_jobs(&conn, "client-a").unwrap();
+        assert!(poll_due_jobs(&conn, 10).unwrap().is_empty());
+
+        // Simulate restart: re-enable makes the job due immediately
+        enable_job(&conn, "client-a", DurableJobKind::BootstrapRefresh).unwrap();
+        let due = poll_due_jobs(&conn, 10).unwrap();
+        assert_eq!(due.len(), 1, "job should be due again after re-enable (simulated restart)");
+        assert_eq!(due[0].kind, DurableJobKind::BootstrapRefresh);
+
+        // complete_job also authors a job_due event
+        complete_job(&conn, "client-a", DurableJobKind::BootstrapRefresh).unwrap();
+        let history_count: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM job_due_history WHERE recorded_by = 'client-a'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(history_count >= 1, "job_due events should be recorded in history");
     }
 
     #[test]
