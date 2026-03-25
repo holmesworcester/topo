@@ -11,7 +11,6 @@ use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
-use std::thread;
 use std::time::{Duration, Instant};
 use topo::testutil::DaemonGuard;
 
@@ -964,34 +963,21 @@ pub fn daemon_listen_addr(db: &str) -> String {
         .unwrap_or(listen_addr)
 }
 
-/// Get the daemon's transport SPKI fingerprint (first key from transport-keys).
+/// Resolve the active tenant transport fingerprint used for steady-state peer
+/// observations, falling back to the daemon bootstrap identity when no tenant
+/// is active yet.
 pub fn daemon_transport_fingerprint(db: &str) -> String {
-    let socket = socket_path_for_db(db);
-    let start = Instant::now();
-    let timeout = Duration::from_secs(10);
-    loop {
-        let resp =
-            topo::rpc::client::rpc_call(&socket, topo::rpc::protocol::RpcMethod::TransportKeys)
-                .expect("transport-keys RPC");
-        assert!(resp.ok, "transport-keys RPC returned error");
-        let data = resp.data.expect("transport-keys response missing data");
-        let keys = data
-            .as_array()
-            .expect("transport-keys response should be array");
-        if let Some(peer_id) = keys
-            .first()
-            .and_then(|entry| entry.get("peer_id"))
-            .and_then(|v| v.as_str())
-        {
-            return peer_id.to_string();
-        }
-        assert!(
-            start.elapsed() < timeout,
-            "transport-keys returned empty list for {:?}",
-            timeout
-        );
-        thread::sleep(Duration::from_millis(100));
+    if let Some(peer_id) = active_tenant_peer_id(db) {
+        return peer_id;
     }
+    daemon_identity_fingerprint(db)
+}
+
+/// Get the daemon identity fingerprint used for bootstrap invite SPKI.
+pub fn daemon_identity_fingerprint(db: &str) -> String {
+    let (peer_id, _cert_der, _key_der) = topo::transport::ensure_daemon_identity_from_db(db)
+        .expect("load daemon transport identity");
+    peer_id
 }
 
 // ---------------------------------------------------------------------------

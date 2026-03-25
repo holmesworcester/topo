@@ -24,12 +24,7 @@ use cli_invite_discovery_common::*;
 fn invite_bootstrap_completes_with_mdns_active() {
     let _guard = cli_test_lock();
     let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir
-        .path()
-        .join("alice.db")
-        .to_str()
-        .unwrap()
-        .to_string();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let timeout_ms = 120_000;
 
     // --- inviter (alice) ---
@@ -68,6 +63,10 @@ fn invite_bootstrap_completes_with_mdns_active() {
     // Send a fresh message from alice and verify all invitees see it.
     let live_eid = send_message(&alice_db, "post-bootstrap-live-message");
     for peer in &peers {
-        assert_eventually(&peer.db, &format!("has_event:{} >= 1", live_eid), timeout_ms);
+        assert_eventually(
+            &peer.db,
+            &format!("has_event:{} >= 1", live_eid),
+            timeout_ms,
+        );
     }
 }

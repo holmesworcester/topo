@@ -10,13 +10,12 @@ use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
-use crate::db::transport_creds::resolve_local_transport_targets;
-use crate::db::transport_trust::{is_authorized_for_tenant, record_transport_binding};
+use crate::db::transport_trust::record_transport_binding;
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::SyncConnectionHandler;
 use crate::transport::{
-    accept_session_provider, requested_server_name_from_connection, TransportClientConfig,
-    TransportEndpoint,
+    accept_session_provider, read_inbound_session_auth, send_inbound_session_auth_ack,
+    TransportClientConfig, TransportEndpoint,
 };
 
 use super::supervisor::{
@@ -113,7 +112,7 @@ async fn accept_loop_until_cancel_inner(
         }
 
         info!("Waiting for incoming connection...");
-        let provider = match tokio::select! {
+        let mut provider = match tokio::select! {
             _ = shutdown.cancelled() => {
                 break;
             }
@@ -136,19 +135,14 @@ async fn accept_loop_until_cancel_inner(
         };
 
         let connection = provider.connection();
-        let peer_id = provider.peer_id().to_string();
-        info!(
-            "Accepted connection from {} on connection {}",
-            peer_id,
-            connection.stable_id()
-        );
-
-        // Resolve which local tenant owns this connection.
-        // Always resolve via trust tables — new tenants may have been
-        // registered on the live endpoint since the accept loop started.
-        let auth_context = match resolve_inbound_auth_context(db_path, &connection, &peer_id) {
+        let auth_context = match read_inbound_session_auth(&connection, db_path).await {
             Ok(context) => context,
-            Err(message) => {
+            Err(err) => {
+                let message = format!(
+                    "Rejected inbound session on connection {}: {}",
+                    connection.stable_id(),
+                    err
+                );
                 if warning_gate.should_emit(message.clone())
                     && should_emit_globally(format!("accept:{message}"))
                 {
@@ -158,6 +152,29 @@ async fn accept_loop_until_cancel_inner(
                 continue;
             }
         };
+        if let Err(err) = send_inbound_session_auth_ack(&connection, &auth_context.tenant_id).await
+        {
+            let message = format!(
+                "Rejected inbound session on connection {}: failed to send session auth ack: {}",
+                connection.stable_id(),
+                err
+            );
+            if warning_gate.should_emit(message.clone())
+                && should_emit_globally(format!("accept:{message}"))
+            {
+                warn!("{}", message);
+            }
+            connection.close(1u32.into(), b"tenant-scoped auth ack failed");
+            continue;
+        }
+        provider = provider.with_peer_id(auth_context.remote_peer_id.clone());
+        let peer_id = provider.peer_id().to_string();
+        info!(
+            "Accepted connection from peer {} via daemon {} on connection {}",
+            peer_id,
+            auth_context.remote_daemon_peer_id,
+            connection.stable_id()
+        );
         let recorded_by = auth_context.tenant_id.clone();
         let connection_lease = match claim_live_connection_slot(
             db_path,
@@ -193,8 +210,11 @@ async fn accept_loop_until_cancel_inner(
                     now,
                     ENDPOINT_TTL_MS,
                 );
-                if let Some(fp) = peer_fingerprint_from_hex(&peer_id) {
-                    let _ = record_transport_binding(&db, &recorded_by, &peer_id, &fp);
+                if let Some(remote_daemon_fp) =
+                    peer_fingerprint_from_hex(&auth_context.remote_daemon_peer_id)
+                {
+                    let _ =
+                        record_transport_binding(&db, &recorded_by, &peer_id, &remote_daemon_fp);
                 }
                 let purged = purge_expired_endpoints(&db, now).unwrap_or(0);
                 if purged > 0 {
@@ -320,275 +340,5 @@ fn describe_accept_failure(err: &crate::transport::ConnectionLifecycleError) -> 
         "Incoming connection was reset by the remote peer before handshake completed".to_string()
     } else {
         format!("Failed to accept incoming connection: {}", msg)
-    }
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
-struct InboundAuthContext {
-    requested_local_transport_peer_id: String,
-    authenticated_remote_transport_peer_id: String,
-    tenant_id: String,
-}
-
-/// Resolve the authenticated inbound transport boundary context.
-///
-/// The client must request one exact local transport fingerprint in SNI.
-/// That fingerprint is resolved to one local tenant, and authorization is
-/// checked only for that tenant using the authenticated remote certificate
-/// fingerprint from the completed handshake.
-fn resolve_inbound_auth_context(
-    db_path: &str,
-    connection: &crate::transport::TransportConnection,
-    remote_peer_id: &str,
-) -> Result<InboundAuthContext, String> {
-    let requested = requested_transport_from_connection(connection).ok_or_else(|| {
-        format!(
-            "Rejected peer {}: missing exact transport-target SNI",
-            short_peer_id(remote_peer_id)
-        )
-    })?;
-    resolve_requested_tenant_for_peer(db_path, &requested, remote_peer_id)
-}
-
-fn requested_transport_from_connection(
-    connection: &crate::transport::TransportConnection,
-) -> Option<crate::transport::multi_workspace::TransportSniTarget> {
-    let sni = requested_server_name_from_connection(connection)?;
-    crate::transport::multi_workspace::parse_transport_sni(&sni)
-}
-
-fn resolve_requested_tenant_for_peer(
-    db_path: &str,
-    requested: &crate::transport::multi_workspace::TransportSniTarget,
-    remote_peer_id: &str,
-) -> Result<InboundAuthContext, String> {
-    let remote_fp = peer_fingerprint_from_hex(remote_peer_id).ok_or_else(|| {
-        format!(
-            "Rejected peer {}: invalid transport fingerprint for tenant-scoped auth",
-            short_peer_id(remote_peer_id)
-        )
-    })?;
-    let db = open_connection(db_path).map_err(|e| {
-        format!(
-            "Failed to open auth DB for inbound tenant-scoped auth: {}",
-            e
-        )
-    })?;
-    let tenants = resolve_local_transport_targets(&db, &requested.transport_peer_id)
-        .map_err(|e| format!("Failed to resolve requested local transport target: {}", e))?;
-    if tenants.is_empty() {
-        return Err(format!(
-            "Rejected peer {}: requested local transport fingerprint {} is not present on this node",
-            short_peer_id(remote_peer_id),
-            short_peer_id(&requested.transport_peer_id)
-        ));
-    }
-    for tenant in tenants {
-        let authorized = is_authorized_for_tenant(&db, &tenant.tenant_id, &remote_fp)
-            .map_err(|e| format!("Inbound tenant-scoped auth query failed: {}", e))?;
-        if authorized {
-            return Ok(InboundAuthContext {
-                requested_local_transport_peer_id: requested.transport_peer_id.clone(),
-                authenticated_remote_transport_peer_id: remote_peer_id.to_string(),
-                tenant_id: tenant.tenant_id.clone(),
-            });
-        }
-    }
-    Err(format!(
-        "Rejected peer {}: no local tenant for requested transport {} authorizes this fingerprint",
-        short_peer_id(remote_peer_id),
-        short_peer_id(&requested.transport_peer_id)
-    ))
-}
-
-fn short_peer_id(peer_id: &str) -> &str {
-    &peer_id[..16.min(peer_id.len())]
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    use crate::db::schema::create_tables;
-    use crate::db::transport_creds::{
-        set_local_transport_target, CRED_SOURCE_BOOTSTRAP, CRED_SOURCE_PEER_SHARED,
-    };
-    use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
-
-    fn setup_db() -> (tempfile::TempDir, String) {
-        let dir = tempfile::tempdir().unwrap();
-        let db_path = dir.path().join("accept-loop-test.db");
-        let db_path = db_path.to_string_lossy().to_string();
-        let conn = open_connection(&db_path).unwrap();
-        create_tables(&conn).unwrap();
-        (dir, db_path)
-    }
-
-    fn insert_tenant(conn: &rusqlite::Connection, tenant_id: &str, workspace_id: &str, n: i64) {
-        conn.execute(
-            "INSERT INTO invites_accepted (
-                recorded_by,
-                event_id,
-                tenant_event_id,
-                invite_event_id,
-                workspace_id,
-                created_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                tenant_id,
-                format!("accepted-event-{n}"),
-                format!("tenant-event-{n}"),
-                format!("invite-event-{n}"),
-                workspace_id,
-                n
-            ],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO local_transport_creds (
-                peer_id,
-                cert_der,
-                key_der,
-                created_at,
-                source
-             ) VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                tenant_id,
-                vec![1u8],
-                vec![2u8],
-                n,
-                crate::db::transport_creds::CRED_SOURCE_PEER_SHARED
-            ],
-        )
-        .unwrap();
-        set_local_transport_target(conn, tenant_id, tenant_id, CRED_SOURCE_PEER_SHARED).unwrap();
-    }
-
-    #[test]
-    fn requested_tenant_auth_accepts_when_that_tenant_authorizes_remote_peer() {
-        let (_dir, db_path) = setup_db();
-        let conn = open_connection(&db_path).unwrap();
-        let tenant_a =
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
-        let workspace_id = "ws-requested-tenant";
-        let remote_fp = [0x11; 32];
-
-        insert_tenant(&conn, &tenant_a, workspace_id, 1);
-        record_pending_invite_bootstrap_trust(
-            &conn,
-            &tenant_a,
-            "invite-a",
-            workspace_id,
-            &remote_fp,
-        )
-        .unwrap();
-
-        let requested = crate::transport::multi_workspace::TransportSniTarget {
-            transport_peer_id: tenant_a.clone(),
-        };
-
-        let resolved =
-            resolve_requested_tenant_for_peer(&db_path, &requested, &hex::encode(remote_fp))
-                .unwrap();
-        assert_eq!(
-            resolved,
-            InboundAuthContext {
-                requested_local_transport_peer_id: tenant_a.clone(),
-                authenticated_remote_transport_peer_id: hex::encode(remote_fp),
-                tenant_id: tenant_a,
-            }
-        );
-    }
-
-    #[test]
-    fn requested_tenant_auth_does_not_fallback_to_other_authorizing_tenants() {
-        let (_dir, db_path) = setup_db();
-        let conn = open_connection(&db_path).unwrap();
-        let tenant_a =
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
-        let tenant_b =
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
-        let workspace_id = "ws-shared";
-        let remote_fp = [0x22; 32];
-        let remote_peer_id = hex::encode(remote_fp);
-
-        insert_tenant(&conn, &tenant_a, workspace_id, 1);
-        insert_tenant(&conn, &tenant_b, workspace_id, 2);
-        record_pending_invite_bootstrap_trust(
-            &conn,
-            &tenant_b,
-            "invite-b",
-            workspace_id,
-            &remote_fp,
-        )
-        .unwrap();
-
-        let requested = crate::transport::multi_workspace::TransportSniTarget {
-            transport_peer_id: tenant_a.clone(),
-        };
-
-        let err =
-            resolve_requested_tenant_for_peer(&db_path, &requested, &remote_peer_id).unwrap_err();
-        assert!(err.contains("no local tenant"), "unexpected error: {err}");
-    }
-
-    #[test]
-    fn requested_tenant_auth_selects_authorized_tenant_when_bootstrap_target_is_shared() {
-        let (_dir, db_path) = setup_db();
-        let conn = open_connection(&db_path).unwrap();
-        let tenant_a =
-            "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa".to_string();
-        let tenant_b =
-            "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb".to_string();
-        let shared_transport_peer_id =
-            "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc".to_string();
-        let workspace_id = "ws-shared-bootstrap";
-        let remote_fp = [0x33; 32];
-
-        insert_tenant(&conn, &tenant_a, workspace_id, 1);
-        insert_tenant(&conn, &tenant_b, workspace_id, 2);
-        conn.execute(
-            "DELETE FROM local_transport_targets WHERE tenant_id IN (?1, ?2)",
-            rusqlite::params![&tenant_a, &tenant_b],
-        )
-        .unwrap();
-        set_local_transport_target(
-            &conn,
-            &tenant_a,
-            &shared_transport_peer_id,
-            CRED_SOURCE_BOOTSTRAP,
-        )
-        .unwrap();
-        set_local_transport_target(
-            &conn,
-            &tenant_b,
-            &shared_transport_peer_id,
-            CRED_SOURCE_BOOTSTRAP,
-        )
-        .unwrap();
-        record_pending_invite_bootstrap_trust(
-            &conn,
-            &tenant_b,
-            "invite-b",
-            workspace_id,
-            &remote_fp,
-        )
-        .unwrap();
-
-        let requested = crate::transport::multi_workspace::TransportSniTarget {
-            transport_peer_id: shared_transport_peer_id.clone(),
-        };
-
-        let resolved =
-            resolve_requested_tenant_for_peer(&db_path, &requested, &hex::encode(remote_fp))
-                .unwrap();
-        assert_eq!(
-            resolved,
-            InboundAuthContext {
-                requested_local_transport_peer_id: shared_transport_peer_id,
-                authenticated_remote_transport_peer_id: hex::encode(remote_fp),
-                tenant_id: tenant_b,
-            }
-        );
     }
 }

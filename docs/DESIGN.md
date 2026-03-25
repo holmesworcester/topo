@@ -115,13 +115,13 @@ For simplicity, discovery is allowed to remain narrower than steady-state direct
 
 Transport runs over QUIC with mTLS, while canonical event authenticity comes from event signatures and dependency validation. We intentionally force cloud-style multitenancy into the core runtime model: one daemon, one UDP port, many local tenants, each with its own workspace binding and trust state. That same mechanism is what enables a Slack/Discord-like local client to host many accounts/workspaces without spinning up one endpoint per account.
 
-At daemon startup, local tenants are discovered from event-projected identity/trust state plus local transport creds. The runtime then builds a single endpoint with exact local transport-fingerprint aliases. Outbound dials always carry one exact expected remote transport fingerprint in SNI. Inbound SNI names the exact local transport fingerprint to reach, not a wildcard workspace.
+At daemon startup, local tenants are still discovered from event-projected identity/trust state plus replay-derived tenant transport creds, but the live QUIC endpoint is now daemon-scoped. The runtime ensures one persistent daemon cert/key in `daemon_transport_identity`, builds one shared endpoint from that identity, and disables sensitive SNI on the wire. Quinn still requires a `server_name` parameter for dials, so the runtime uses one fixed cover name rather than embedding tenant or peer identity in handshake metadata.
 
-Invite creation follows the same rule. If a user or device-link invite does not override `public_spki`, the invite link embeds the tenant's current local transport fingerprint from replay-derived `local_transport_targets`, not a looser workspace/peer identifier. That keeps bootstrap targeting aligned with the exact certificate the daemon will actually present.
+Invite creation follows the daemon-scoped rule. If a user or device-link invite does not override `public_spki`, the invite link embeds the daemon transport fingerprint, not the tenant's current local transport fingerprint. Bootstrap targeting is therefore "dial daemon D and redeem invite I", not "dial exact tenant transport cert T".
 
-Client-side verification is exact and immediate: rustls checks that the presented server certificate fingerprint is currently authorized by projected trust rows and exactly matches the fingerprint named in SNI. Server-side verification is split only because Quinn/rustls does not expose SNI to the client-cert verifier. The server verifier therefore performs a node-scoped projected-trust check during handshake, then the accept boundary immediately resolves the requested local transport fingerprint from SNI, maps it to one tenant, re-runs tenant-scoped projected auth for the presented client fingerprint, and rejects before any session work starts if that exact scope check fails. This is the key boundary: one shared socket and one shared accept loop, but tenant-specific trust checks, routing, projection, and query visibility.
+Handshake verification is split into two layers. First, rustls checks that the presented remote daemon certificate fingerprint is currently authorized by projected trust rows at node scope. Then, after the encrypted channel exists, the first `OpenSessionAuth*` frame binds the session to one tenant: steady-state sessions use a `peer_shared` signature over `(source_peer_id, target_tenant_id, signer_event_id, local_daemon_peer_id, remote_daemon_peer_id, expires_at_ms)`, while bootstrap sessions use the invite key over `(source_peer_id, source_peer_public_key, target_invite_event_id, local_daemon_peer_id, remote_daemon_peer_id, expires_at_ms)`. The accept boundary rejects before any sync work starts unless that encrypted session-auth frame resolves to exactly one authorized tenant.
 
-This also covers the hard case where multiple local identities on the same endpoint belong to the same workspace. Tenant trust sets may overlap in value, so the same remote peer can be valid for more than one local tenant. A given accepted connection is routed to one tenant scope, but the shared endpoint can concurrently host sessions for many tenant scopes, including multiple identities in the same workspace, without collapsing their state into one identity.
+This also covers the hard case where multiple local identities on the same endpoint belong to the same workspace. One daemon-to-daemon QUIC connection can carry multiple tenant-scoped streams over time, and tenant trust sets may overlap in value, but session admission remains tenant-scoped because the first encrypted auth frame names the exact tenant/workspace scope to bind.
 
 ### Sync And Convergence
 
@@ -427,17 +427,17 @@ Current shape:
 
 Transport identity is derived from event-layer peer identity:
 
-1. **Transport identity** (mTLS scope): cert/key material, SPKI fingerprints, `peer_id` derived from BLAKE2b-256 of X.509 SPKI. Managed by `src/runtime/transport/identity.rs` via `src/runtime/transport/identity_adapter.rs`.
+1. **Transport identity** (mTLS scope): daemon-scoped cert/key material in `daemon_transport_identity`, plus replay-derived tenant transport creds/fingerprints in `local_transport_creds` / `local_transport_targets`. Both use SPKI-derived `peer_id` fingerprints, but only the daemon cert terminates QUIC handshakes.
 2. **Event-graph identity** (identity layer scope): Ed25519 keys, signer chains, accepted workspace bindings (`invites_accepted`), and identity events (types 8-22). Owned by event modules (for example `src/event_modules/workspace/*`, `src/event_modules/invite_accepted.rs`, `src/event_modules/peer_shared/*`, `src/event_modules/peer_secret.rs`) and executed through the generic projection pipeline (`src/state/projection/apply/*`).
 
-Transport certs are deterministically derived from PeerShared Ed25519 signing keys, so the two identity scopes are unified. All transport trust is derived from PeerShared Ed25519 public keys via `spki_fingerprint_from_ed25519_pubkey()`.
+Tenant-scoped transport fingerprints remain deterministically derived from PeerShared Ed25519 signing keys via `spki_fingerprint_from_ed25519_pubkey()`. The QUIC daemon cert is separate, random self-signed node identity used only for daemon-to-daemon channel authentication.
 
 ## 2.1 QUIC + mTLS
 
-All peer transport uses QUIC with strict exact-fingerprint mTLS driven by projected trust rows.
+All peer transport uses QUIC with daemon-scoped mTLS plus tenant-scoped encrypted session auth, both driven by projected trust rows.
 
 Rules:
-1. each daemon profile has persistent cert/private key material,
+1. each daemon profile has persistent daemon cert/private key material,
 2. peer allow/deny policy is based on SQL trust state:
    - PeerShared-derived transport fingerprints from projected `peers_shared.transport_fingerprint` rows (deterministically computed from PeerShared public key at projection time),
    - `invite_bootstrap_trust` rows produced by projection from `InviteAccepted` events + local `bootstrap_context`,
@@ -447,13 +447,13 @@ Rules:
 
 ## 2.2 Transport identity binding
 
-Transport peer identity is SPKI-derived:
+Transport peer identity is split:
 
-1. `peer_id = hex(BLAKE2b-256(cert_SPKI))`,
-2. `peer_shared` projection materializes `peers_shared.transport_fingerprint` as that deterministic SPKI fingerprint and indexes `(recorded_by, transport_fingerprint)`,
-3. the `peer_transport_bindings` table is observation telemetry keyed by `(recorded_by, peer_id)`, where `recorded_by` is the local tenant key and `peer_id` is the remote transport fingerprint; `spki_fingerprint` stores the raw 32-byte SPKI for lookup/diagnostics,
+1. `daemon_peer_id = hex(BLAKE2b-256(daemon_cert_SPKI))`,
+2. `peer_shared` projection materializes `peers_shared.transport_fingerprint` as the deterministic tenant/peer transport fingerprint and indexes `(recorded_by, transport_fingerprint)`,
+3. the `peer_transport_bindings` table is observation telemetry keyed by `(recorded_by, peer_id)`, where `recorded_by` is the local tenant key and `peer_id` is the remote tenant/peer transport fingerprint; `spki_fingerprint` stores the remote daemon fingerprint observed on the authenticated QUIC channel,
 4. `invite_bootstrap_trust` stores accepted invite-link bootstrap tuples
-   (`bootstrap_addr`, inviter SPKI) used before PeerShared-derived trust appears,
+   (`bootstrap_addr`, daemon SPKI) used before steady-state peer bindings appear,
 5. `pending_invite_bootstrap_trust` stores inviter-side expected invitee SPKI
    until PeerShared-derived trust consumes it,
 6. accepted/pending bootstrap rows are time-bounded and consumed at projection time
@@ -478,11 +478,11 @@ Transport cert/key materialization is isolated behind a typed contract:
 
 - **`TransportIdentityIntent`** (enum): describes *what* identity change is needed (`InstallBootstrapIdentityFromInviteSecret` or `InstallPeerSharedIdentityFromSigner`).
 - **`TransportIdentityAdapter`** (trait): executes the intent against the DB. The sole concrete implementation (`ConcreteTransportIdentityAdapter` in `src/runtime/transport/identity_adapter.rs`) is the **only** code that calls raw install functions (`install_invite_bootstrap_transport_identity`, `install_peer_key_transport_identity`).
-- **Workspace command layer** (`accept_invite` / `accept_device_link`) installs invite-derived bootstrap identity via the adapter intent path (not raw transport calls).
+- **Workspace command layer** (`accept_invite` / `accept_device_link`) still installs invite-derived tenant bootstrap identity via the adapter intent path (not raw transport calls), but that identity no longer terminates the live QUIC handshake.
 - **Event modules** emit `ApplyTransportIdentityIntent` commands (e.g., `peer_secret` projector for PeerShared signers).
 - **Projection pipeline** (`write_exec.rs`) routes intents through the adapter.
 - **Downgrade guard**: bootstrap install is rejected once a PeerShared-derived identity has been installed (`BootstrapAfterPeerSharedDenied`), enforcing one-way transition.
-- **Credential source tracking**: `local_transport_creds.source` records `random | bootstrap | peershared` for runtime guard checks and diagnostics.
+- **Credential source tracking**: `local_transport_creds.source` records `random | bootstrap | peershared` for tenant identity/trust diagnostics, while the live daemon QUIC identity is stored separately in `daemon_transport_identity`.
 - **Boundary enforcement**: layered controls enforce this boundary:
   1. typed intent contract (`TransportIdentityIntent`),
   2. single adapter implementation (`ConcreteTransportIdentityAdapter`),
@@ -632,10 +632,12 @@ so all events are written under the final peer_id from the start.
 - **Workspace creation** (`create_workspace`): pre-derives PeerShared key,
   installs PeerShared-derived transport cert directly. No bootstrap sync needed.
 - **Invite acceptance / device link** (`accept_invite`, `accept_device_link`):
-  pre-derives PeerShared key for `recorded_by`, but installs an invite-derived
-  bootstrap transport cert (needed for the initial QUIC handshake — the inviter
-  expects the invite-derived SPKI). The PeerShared-derived transport identity
-  replaces it later via projection cascade
+  pre-derives PeerShared key for `recorded_by` and still materializes
+  invite-derived tenant bootstrap transport creds in replay state, but the
+  initial QUIC handshake now uses the daemon transport identity. Bootstrap
+  authorization moves to the first encrypted `OpenSessionAuthInvite` frame,
+  and the PeerShared-derived tenant transport identity replaces the bootstrap
+  tenant identity later via projection cascade
   (`ApplyTransportIdentityIntent::InstallPeerSharedIdentityFromSigner`).
 - **Connect loop**: identity is resolved once per QUIC connection (not per
   session). Identity transitions only happen during discrete CLI commands,
@@ -735,8 +737,8 @@ Why certs are part of discovery:
 The node daemon (`run_node`) operates as follows:
 
 1. Discover all local tenants from the DB.
-2. Create a **single** QUIC endpoint with `TransportTargetCertResolver` for exact local transport-target SNI cert selection across all tenants.
-3. Run one accept loop over that shared endpoint; post-handshake, the requested local transport fingerprint is resolved to exactly one tenant from local SQL state, then that tenant alone authorizes the authenticated remote fingerprint.
+2. Ensure one persistent daemon transport identity and create a **single** QUIC endpoint from that daemon cert.
+3. Run one accept loop over that shared endpoint; post-handshake, read one encrypted `OpenSessionAuth*` frame, resolve it to exactly one tenant from local SQL state, and let only that tenant authorize the authenticated remote peer.
 4. For each authenticated peer connection, keep one connection owner and host:
    - range sessions for bulk catchup,
    - one dependency session for blocker repair.
@@ -744,18 +746,18 @@ The node daemon (`run_node`) operates as follows:
 
 ### Single-port multi-tenant endpoint
 
-All tenants on a device share a single UDP port. The server registers exact local transport-fingerprint aliases so a client can request one specific local transport identity in SNI. Outbound connections target one exact remote transport fingerprint at a time; they are not workspace-wildcard dials.
+All tenants on a device share a single UDP port and one daemon cert. Outbound dials use a fixed cover name and disable sensitive SNI on the wire. Tenant routing is no longer a TLS handshake concern; it happens in the first encrypted session-auth frame.
 
 ### Per-tenant dynamic trust
 
-The single QUIC endpoint uses a node-scoped union trust closure that accepts a handshake only if **some** local tenant currently authorizes the remote fingerprint. Post-handshake, the client-requested local transport fingerprint is resolved through `local_transport_targets`. That fingerprint must map to exactly one tenant, and only that tenant's `is_authorized_for_tenant` result may admit the session. The trust closure queries three trust sources for each tenant's `recorded_by`:
+The single QUIC endpoint uses a node-scoped union trust closure that accepts a handshake only if **some** local tenant currently authorizes the remote daemon fingerprint. Post-handshake, the first encrypted session-auth frame resolves the target tenant. That tenant must be unique, and only that tenant's `is_authorized_for_tenant` result may admit the session. The trust closure queries three trust sources for each tenant's `recorded_by`:
 - **PeerShared-derived transport fingerprints** (primary steady-state; from projected `peers_shared.transport_fingerprint`),
 - `invite_bootstrap_trust` rows (accepted invite-link bootstrap, TTL-bounded),
 - `pending_invite_bootstrap_trust` rows (inviter-side pre-handshake, TTL-bounded).
 
-Trust checks are **tenant-scoped** (`recorded_by`-partitioned). Value-level trust-set overlap is allowed on the remote side (the same remote SPKI may appear in multiple tenants' trust rows), but exact local-target routing requires one unique local transport fingerprint per tenant target. Another tenant's trust must never satisfy an SNI request for this tenant. `invites_accepted` is read during startup tenant discovery, while per-connection exact-target routing uses `local_transport_targets` and per-connection authorization uses `is_authorized_for_tenant` over PeerShared/bootstrap trust tables.
+Trust checks are **tenant-scoped** (`recorded_by`-partitioned). Value-level trust-set overlap is allowed on the remote side (the same remote peer or daemon SPKI may appear in multiple tenants' trust rows), but session admission still requires one unique tenant binding from the encrypted auth frame. Another tenant's trust must never satisfy that frame. `invites_accepted` is read during startup tenant discovery, while per-connection authorization uses node-scoped daemon admission first and `is_authorized_for_tenant` over PeerShared/bootstrap trust tables second.
 
-`local_transport_targets` is not a new authority source. It is replay-derived local routing state: local event projection emits transport identity intents, the transport adapter materializes the cert/key, and that successful apply updates the tenant's currently active local transport fingerprint. Replaying local event state rebuilds both `local_transport_creds` and `local_transport_targets`. Startup tenant discovery must not infer tenant ownership from a lone transitional cert row or invite-secret derivation when that mapping is absent; exact local-target ownership comes only from direct tenant-peer creds or an explicit `local_transport_targets` row.
+`local_transport_targets` is not a new authority source. It remains replay-derived tenant identity state for projected trust, discovery, and bootstrap lineage: local event projection emits transport identity intents, the transport adapter materializes tenant cert/key bytes, and that successful apply updates the tenant's current transport fingerprint. Replaying local event state rebuilds both `local_transport_creds` and `local_transport_targets`, but the live QUIC endpoint uses `daemon_transport_identity` rather than those tenant certs.
 
 Discovery-only invite acceptance may still persist an empty `bootstrap_addr` marker row so the bootstrap SPKI remains available in projected state. That row is a projection marker only; it must never create an autodial target or be treated like a concrete bootstrap endpoint.
 
@@ -1538,7 +1540,7 @@ Device-link invite:
 topo://link/v3/device_link/eid.<hex64>/key.<hex64>/wid.<hex64>/uid.<hex64>/spki.<hex64>/addr.<a1>,<a2>
 ```
 
-Field labels: `eid` = invite event ID, `key` = invite private key, `wid` = workspace ID, `uid` = user event ID (device-link only), `spki` = bootstrap SPKI fingerprint. All ID/key fields are 32-byte hex (64 hex chars). Address tokens are comma-separated; port omitted when default 4433. IPv6 addresses are fully expanded as 8 dash-separated groups of 4 hex digits (no brackets) to avoid shell glob/escaping issues; non-default port uses `_port` suffix (e.g. `2601-0645-8881-1d40-0216-3eff-fe8c-0d03_7443`).
+Field labels: `eid` = invite event ID, `key` = invite private key, `wid` = workspace ID, `uid` = user event ID (device-link only), `spki` = daemon SPKI fingerprint. All ID/key fields are 32-byte hex (64 hex chars). Address tokens are comma-separated; port omitted when default 4433. IPv6 addresses are fully expanded as 8 dash-separated groups of 4 hex digits (no brackets) to avoid shell glob/escaping issues; non-default port uses `_port` suffix (e.g. `2601-0645-8881-1d40-0216-3eff-fe8c-0d03_7443`).
 
 ## 9.3 Accepted-workspace cascade
 
@@ -1611,7 +1613,7 @@ All key acquisition flows through the same event-backed wrap/unwrap path.
 
 This section covers the lifecycle state machine for the three trust sources: PeerShared-derived SPKIs (steady-state), `invite_bootstrap_trust`, and `pending_invite_bootstrap_trust`.
 
-Credential transition model: invite acceptance may install a bootstrap transport cert first; projection later installs the PeerShared-derived cert. Runtime enforces one-way transition (no bootstrap-after-PeerShared downgrade).
+Credential transition model: tenant-scoped replay state may install a bootstrap transport cert first; projection later installs the PeerShared-derived tenant cert. The live QUIC endpoint continues to use the separate daemon transport identity throughout. Runtime enforces one-way transition for tenant creds (no bootstrap-after-PeerShared downgrade).
 
 Consumption: when a PeerShared event is projected, the PeerShared projector deletes matching `invite_bootstrap_trust` and `pending_invite_bootstrap_trust` entries for that SPKI in the same projection apply transaction. This happens at projection time, not on trust check reads — trust check reads (`is_authorized_for_tenant`, `authorized_fingerprints_from_db`) are pure queries with no write side-effects.
 

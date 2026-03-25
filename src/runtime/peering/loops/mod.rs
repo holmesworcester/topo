@@ -23,6 +23,7 @@ pub use accept::{accept_loop, accept_loop_until_cancel};
 pub use connect::{
     connect_loop, connect_loop_with_coordination, connect_loop_with_coordination_until_cancel,
     connect_loop_with_coordination_until_cancel_with_fallback,
+    connect_loop_with_coordination_until_cancel_with_fallback_with_auth,
 };
 
 use std::collections::HashMap;

@@ -1,24 +1,20 @@
 //! Endpoint creation, tenant discovery, and cert resolver setup.
 //!
 //! Extracts the startup phase of `run_node`: discovers local tenants, verifies
-//! SPKI fingerprints, builds the exact transport-target cert resolver,
-//! per-tenant client configs, and creates the single QUIC endpoint.
+//! local/runtime tenant state, loads the singleton daemon transport identity,
+//! builds per-tenant client configs, and creates the single QUIC endpoint.
 
 use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
-use std::sync::Arc;
 
 use tracing::{error, info, warn};
 
 use crate::db::transport_creds::discover_local_tenants;
 use crate::db::{open_connection, schema::create_tables};
 use crate::transport::{
-    build_tenant_client_config_from_creds, create_runtime_endpoint_for_tenants,
-    extract_spki_fingerprint,
-    multi_workspace::{transport_sni, TransportTargetCertResolver},
-    TenantClientConfigs, TransportEndpoint,
+    build_tenant_client_config_from_db, create_runtime_endpoint_for_tenants,
+    ensure_daemon_identity, extract_spki_fingerprint, TenantClientConfigs, TransportEndpoint,
 };
-use rustls::sign::CertifiedKey;
 
 use super::NodeRuntimeNetInfo;
 
@@ -38,10 +34,11 @@ pub(crate) fn setup_endpoint_and_tenants(
     db_path: &str,
     bind: SocketAddr,
     net_info_tx: tokio::sync::oneshot::Sender<NodeRuntimeNetInfo>,
-    cert_resolver: Arc<TransportTargetCertResolver>,
+    _cert_resolver: std::sync::Arc<crate::transport::multi_workspace::TransportTargetCertResolver>,
 ) -> Result<StartupResult, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
     create_tables(&db)?;
+    let (daemon_peer_id, _daemon_cert, _daemon_key) = ensure_daemon_identity(&db)?;
 
     let tenants = discover_local_tenants(&db)?;
     drop(db);
@@ -58,13 +55,7 @@ pub(crate) fn setup_endpoint_and_tenants(
         .map(|t| t.transport_peer_id.clone())
         .collect();
 
-    // Build exact transport-target cert resolver + tenant metadata
-    let provider = rustls::crypto::ring::default_provider();
     let mut peer_to_workspace: HashMap<String, String> = HashMap::new();
-    let mut default_cert: Option<(
-        rustls::pki_types::CertificateDer<'static>,
-        rustls::pki_types::PrivatePkcs8KeyDer<'static>,
-    )> = None;
 
     for tenant in &tenants {
         // Verify SPKI fingerprint matches peer_id
@@ -97,50 +88,17 @@ pub(crate) fn setup_endpoint_and_tenants(
             );
         }
 
-        let cert_der = rustls::pki_types::CertificateDer::from(tenant.cert_der.clone());
-        let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(tenant.key_der.clone());
-
-        // Build CertifiedKey for the resolver
-        let ck = match CertifiedKey::from_der(
-            vec![cert_der.clone()],
-            key_der.clone_key().into(),
-            &provider,
-        ) {
-            Ok(ck) => Arc::new(ck),
-            Err(e) => {
-                error!(
-                    "Failed to create CertifiedKey for tenant {}: {}",
-                    tenant.peer_id, e
-                );
-                continue;
-            }
-        };
-
-        let sni = transport_sni(&tenant.transport_peer_id);
-        cert_resolver.add(sni.clone(), ck);
         peer_to_workspace.insert(tenant.peer_id.clone(), tenant.workspace_id.clone());
 
-        if default_cert.is_none() {
-            default_cert = Some((cert_der, key_der));
-        }
-
         info!(
-            "Registered tenant {} (workspace {}, transport_sni={})",
+            "Registered tenant {} (workspace {}, daemon_peer_id={})",
             &tenant.peer_id[..16],
             &tenant.workspace_id[..16.min(tenant.workspace_id.len())],
-            sni
+            &daemon_peer_id[..16.min(daemon_peer_id.len())]
         );
     }
 
-    let (default_cert_der, default_key_der) = default_cert.ok_or("No valid tenant certs found")?;
-
-    let endpoint = create_runtime_endpoint_for_tenants(
-        bind,
-        cert_resolver,
-        db_path,
-        default_cert_der,
-        default_key_der,
-    )?;
+    let endpoint = create_runtime_endpoint_for_tenants(bind, db_path)?;
 
     let local_addr = endpoint.local_addr().unwrap_or(bind);
     info!(
@@ -159,9 +117,7 @@ pub(crate) fn setup_endpoint_and_tenants(
     // Per-tenant outbound client configs
     let mut tenant_client_configs: TenantClientConfigs = HashMap::new();
     for tenant in &tenants {
-        let cert_der = rustls::pki_types::CertificateDer::from(tenant.cert_der.clone());
-        let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(tenant.key_der.clone());
-        match build_tenant_client_config_from_creds(db_path, &tenant.peer_id, cert_der, key_der) {
+        match build_tenant_client_config_from_db(db_path, &tenant.peer_id) {
             Ok(cfg) => {
                 tenant_client_configs.insert(tenant.peer_id.clone(), cfg);
             }

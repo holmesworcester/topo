@@ -11,7 +11,7 @@ use std::time::{Duration, Instant};
 
 use cli_harness::{
     accept_invite_with_identity, assert_eventually, create_invite_with_spki, create_workspace,
-    daemon_listen_addr, daemon_transport_fingerprint, ensure_active_peer, generate_messages,
+    daemon_identity_fingerprint, daemon_listen_addr, ensure_active_peer, generate_messages,
     message_count_sql, start_daemon, topo_cmd, wait_for_daemon_stopped, HarnessDaemon,
 };
 
@@ -46,7 +46,7 @@ impl SharedWorkspaceBench {
         let invite_link = create_invite_with_spki(
             &alice_db,
             &daemon_listen_addr(&alice_db),
-            Some(&daemon_transport_fingerprint(&alice_db)),
+            Some(&daemon_identity_fingerprint(&alice_db)),
         );
         accept_invite_with_identity(&bob_db, &invite_link, "bob", "laptop");
         wait_for_daemon_stopped(&bob_db, Duration::from_secs(10));

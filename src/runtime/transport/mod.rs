@@ -2,11 +2,13 @@ pub mod bootstrap_dial_context;
 pub mod cert;
 pub mod connection;
 pub mod connection_lifecycle;
+pub mod daemon_identity;
 pub mod identity;
 pub mod identity_adapter;
 pub mod intro_io;
 pub mod multi_workspace;
 pub mod peering_boundary;
+pub mod session_auth;
 pub mod session_factory;
 pub mod transport_session_io;
 
@@ -19,6 +21,10 @@ pub use cert::{
 };
 pub use connection::{DualConnection, StreamConn, StreamRecv, StreamSend};
 pub use connection_lifecycle::{accept_peer, dial_peer, ConnectedPeer, ConnectionLifecycleError};
+pub use daemon_identity::{
+    ensure_daemon_identity, ensure_daemon_identity_from_db, load_daemon_identity,
+    load_daemon_identity_from_db,
+};
 pub use peering_boundary::{
     accept_session_peer, accept_session_provider,
     build_tenant_bootstrap_fallback_client_config_for_invite_from_db,
@@ -28,8 +34,14 @@ pub use peering_boundary::{
     open_outbound_dependency_session, open_outbound_session,
     outbound_session_provider_for_connection, read_intro_offer_frame,
     resolve_authorizing_tenant_from_db, resolve_trusting_tenant, send_intro_offer_frame,
-    tenant_trusts_peer, SessionEnvelope, SessionProvider, TenantClientConfigs,
-    TransportClientConfig, TransportConnection, TransportEndpoint,
+    tenant_trusts_daemon_peer, tenant_trusts_peer, SessionEnvelope, SessionProvider,
+    TenantClientConfigs, TransportClientConfig, TransportConnection, TransportEndpoint,
+};
+pub(crate) use session_auth::send_inbound_session_auth_ack;
+pub use session_auth::{
+    read_inbound_session_auth, resolve_bootstrap_inviter_peer_id, resolve_bound_daemon_peer_id,
+    send_outbound_session_auth, InboundSessionAuthContext, OutboundSessionAuthPlan,
+    OutboundSessionAuthResult, MAX_SESSION_AUTH_TTL_MS,
 };
 pub use session_factory::SessionClass;
 pub use transport_session_io::{QuicTransportSessionIo, DEFAULT_SYNC_FRAME_MAX_BYTES};
@@ -49,6 +61,7 @@ pub type DynamicAllowFn =
     dyn Fn(&[u8; 32]) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> + Send + Sync;
 
 pub(crate) const TRUST_REJECTION_MARKER: &str = "trust_rejected";
+pub(crate) const COVER_SERVER_NAME: &str = "daemon.topo.invalid";
 
 fn low_mem_transport_config() -> Option<Arc<TransportConfig>> {
     if !low_mem_mode() {
@@ -170,6 +183,9 @@ impl TransportAuthVerifier {
                 )));
             }
         };
+        if requested_sni.eq_ignore_ascii_case(COVER_SERVER_NAME) {
+            return Ok(());
+        }
         let expected = multi_workspace::parse_transport_sni(requested_sni).ok_or_else(|| {
             rustls::Error::General(format!(
                 "missing exact transport-target SNI: requested server name '{requested_sni}' is not a transport target"
@@ -184,6 +200,115 @@ impl TransportAuthVerifier {
                 TRUST_REJECTION_MARKER, expected.transport_peer_id, presented
             )))
         }
+    }
+}
+
+#[derive(Debug)]
+struct PresentedCertVerifier {
+    crypto_provider: Arc<rustls::crypto::CryptoProvider>,
+}
+
+impl PresentedCertVerifier {
+    fn new() -> Self {
+        Self {
+            crypto_provider: Arc::new(rustls::crypto::ring::default_provider()),
+        }
+    }
+}
+
+impl rustls::client::danger::ServerCertVerifier for PresentedCertVerifier {
+    fn verify_server_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _server_name: &rustls::pki_types::ServerName<'_>,
+        _ocsp_response: &[u8],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::client::danger::ServerCertVerified, rustls::Error> {
+        Ok(rustls::client::danger::ServerCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.crypto_provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.crypto_provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.crypto_provider
+            .signature_verification_algorithms
+            .supported_schemes()
+    }
+}
+
+impl rustls::server::danger::ClientCertVerifier for PresentedCertVerifier {
+    fn root_hint_subjects(&self) -> &[rustls::DistinguishedName] {
+        &[]
+    }
+
+    fn verify_client_cert(
+        &self,
+        _end_entity: &CertificateDer<'_>,
+        _intermediates: &[CertificateDer<'_>],
+        _now: rustls::pki_types::UnixTime,
+    ) -> Result<rustls::server::danger::ClientCertVerified, rustls::Error> {
+        Ok(rustls::server::danger::ClientCertVerified::assertion())
+    }
+
+    fn verify_tls12_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls12_signature(
+            message,
+            cert,
+            dss,
+            &self.crypto_provider.signature_verification_algorithms,
+        )
+    }
+
+    fn verify_tls13_signature(
+        &self,
+        message: &[u8],
+        cert: &CertificateDer<'_>,
+        dss: &rustls::DigitallySignedStruct,
+    ) -> Result<rustls::client::danger::HandshakeSignatureValid, rustls::Error> {
+        rustls::crypto::verify_tls13_signature(
+            message,
+            cert,
+            dss,
+            &self.crypto_provider.signature_verification_algorithms,
+        )
+    }
+
+    fn supported_verify_schemes(&self) -> Vec<rustls::SignatureScheme> {
+        self.crypto_provider
+            .signature_verification_algorithms
+            .supported_schemes()
     }
 }
 
@@ -319,10 +444,11 @@ pub fn create_client_endpoint(
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
     let verifier = Arc::new(TransportAuthVerifier::new_dynamic(allow_fn));
 
-    let crypto = rustls::ClientConfig::builder()
+    let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(vec![cert_der], key_der.into())?;
+    crypto.enable_sni = false;
 
     let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
@@ -360,10 +486,11 @@ pub fn create_dual_endpoint(
 
     // Client-side config (for outbound connections)
     let client_verifier = Arc::new(TransportAuthVerifier::new_dynamic(allow_fn));
-    let client_crypto = rustls::ClientConfig::builder()
+    let mut client_crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(client_verifier)
         .with_client_auth_cert(vec![cert_der], key_der.into())?;
+    client_crypto.enable_sni = false;
     let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
     ));
@@ -399,10 +526,11 @@ pub fn create_dual_endpoint_dynamic(
 
     // Client-side config (for outbound connections)
     let client_verifier = Arc::new(TransportAuthVerifier::new_dynamic(allow_fn));
-    let client_crypto = rustls::ClientConfig::builder()
+    let mut client_crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(client_verifier)
         .with_client_auth_cert(vec![cert_der], key_der.into())?;
+    client_crypto.enable_sni = false;
     let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
     ));
@@ -449,16 +577,23 @@ pub fn requested_server_name_from_connection(conn: &quinn::Connection) -> Option
 /// all local tenants.
 pub fn create_single_port_endpoint(
     bind_addr: SocketAddr,
-    cert_resolver: Arc<multi_workspace::TransportTargetCertResolver>,
-    allow_fn: Arc<DynamicAllowFn>,
+    _cert_resolver: Arc<multi_workspace::TransportTargetCertResolver>,
+    _allow_fn: Arc<DynamicAllowFn>,
     default_client_cert: CertificateDer<'static>,
     default_client_key: PrivatePkcs8KeyDer<'static>,
 ) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
-    // Server config: exact transport-target cert resolver + dynamic trust
-    let server_verifier = Arc::new(TransportAuthVerifier::new_dynamic(allow_fn.clone()));
+    create_single_port_endpoint_with_identity(bind_addr, default_client_cert, default_client_key)
+}
+
+pub(crate) fn create_single_port_endpoint_with_identity(
+    bind_addr: SocketAddr,
+    cert_der: CertificateDer<'static>,
+    key_der: PrivatePkcs8KeyDer<'static>,
+) -> Result<Endpoint, Box<dyn std::error::Error + Send + Sync>> {
+    let server_verifier = Arc::new(PresentedCertVerifier::new());
     let server_crypto = rustls::ServerConfig::builder()
         .with_client_cert_verifier(server_verifier)
-        .with_cert_resolver(cert_resolver);
+        .with_single_cert(vec![cert_der.clone()], key_der.clone_key().into())?;
     let mut server_config = ServerConfig::with_crypto(Arc::new(
         quinn::crypto::rustls::QuicServerConfig::try_from(server_crypto)?,
     ));
@@ -467,11 +602,12 @@ pub fn create_single_port_endpoint(
     }
 
     // Default client config (for outbound connections that don't use connect_with)
-    let client_verifier = Arc::new(TransportAuthVerifier::new_dynamic(allow_fn));
-    let client_crypto = rustls::ClientConfig::builder()
+    let client_verifier = Arc::new(PresentedCertVerifier::new());
+    let mut client_crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(client_verifier)
-        .with_client_auth_cert(vec![default_client_cert], default_client_key.into())?;
+        .with_client_auth_cert(vec![cert_der], key_der.into())?;
+    client_crypto.enable_sni = false;
     let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(client_crypto)?,
     ));
@@ -494,10 +630,30 @@ pub fn workspace_client_config(
     allow_fn: Arc<DynamicAllowFn>,
 ) -> Result<ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
     let verifier = Arc::new(TransportAuthVerifier::new_dynamic(allow_fn));
-    let crypto = rustls::ClientConfig::builder()
+    let mut crypto = rustls::ClientConfig::builder()
         .dangerous()
         .with_custom_certificate_verifier(verifier)
         .with_client_auth_cert(vec![cert_der], key_der.into())?;
+    crypto.enable_sni = false;
+    let mut client_config = ClientConfig::new(Arc::new(
+        quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
+    ));
+    if let Some(transport) = low_mem_transport_config() {
+        client_config.transport_config(transport);
+    }
+    Ok(client_config)
+}
+
+pub(crate) fn workspace_client_config_with_identity(
+    cert_der: CertificateDer<'static>,
+    key_der: PrivatePkcs8KeyDer<'static>,
+) -> Result<ClientConfig, Box<dyn std::error::Error + Send + Sync>> {
+    let verifier = Arc::new(PresentedCertVerifier::new());
+    let mut crypto = rustls::ClientConfig::builder()
+        .dangerous()
+        .with_custom_certificate_verifier(verifier)
+        .with_client_auth_cert(vec![cert_der], key_der.into())?;
+    crypto.enable_sni = false;
     let mut client_config = ClientConfig::new(Arc::new(
         quinn::crypto::rustls::QuicClientConfig::try_from(crypto)?,
     ));
@@ -548,6 +704,24 @@ mod tests {
         let verifier =
             TransportAuthVerifier::new_dynamic(Arc::new(move |candidate| Ok(candidate == &fp)));
         let server_name = rustls::pki_types::ServerName::try_from(expected).unwrap();
+        assert!(verifier
+            .verify_server_cert(
+                &cert,
+                &[],
+                &server_name,
+                &[],
+                rustls::pki_types::UnixTime::since_unix_epoch(std::time::Duration::from_secs(1)),
+            )
+            .is_ok());
+    }
+
+    #[test]
+    fn test_server_verifier_accepts_cover_server_name() {
+        let (cert, _) = generate_self_signed_cert().unwrap();
+        let fp = extract_spki_fingerprint(cert.as_ref()).unwrap();
+        let verifier =
+            TransportAuthVerifier::new_dynamic(Arc::new(move |candidate| Ok(candidate == &fp)));
+        let server_name = rustls::pki_types::ServerName::try_from(COVER_SERVER_NAME).unwrap();
         assert!(verifier
             .verify_server_cert(
                 &cert,

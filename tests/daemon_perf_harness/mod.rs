@@ -7,10 +7,10 @@ use std::time::{Duration, Instant};
 
 use crate::cli_harness::{
     accept_invite_with_identity_on_running_daemon, assert_eventually, create_invite_with_spki,
-    daemon_listen_addr, daemon_transport_fingerprint, ensure_active_peer, generate_messages,
-    message_count_sql, peak_rss_mib_for_pid, random_port, send_message, start_daemon_with_options,
-    stop_daemon, topo_cmd, wait_for_active_tenant_ready, wait_for_daemon_stopped,
-    wait_for_endpoint_observation, DaemonOptions, HarnessDaemon,
+    daemon_identity_fingerprint, daemon_listen_addr, daemon_transport_fingerprint,
+    ensure_active_peer, generate_messages, message_count_sql, peak_rss_mib_for_pid, random_port,
+    send_message, start_daemon_with_options, stop_daemon, topo_cmd, wait_for_active_tenant_ready,
+    wait_for_daemon_stopped, wait_for_endpoint_observation, DaemonOptions, HarnessDaemon,
 };
 
 pub type BenchNetworkGuard = Box<dyn std::any::Any + Send>;
@@ -109,7 +109,7 @@ impl SharedWorkspaceBench {
         let invite_link = create_invite_with_spki(
             &alice_db,
             &network_path.bootstrap_addr,
-            Some(&daemon_transport_fingerprint(&alice_db)),
+            Some(&daemon_identity_fingerprint(&alice_db)),
         );
         let bob_bootstrap_seed_after_activate = if network_path.reseed_bob_bootstrap_after_activate
         {
@@ -121,7 +121,7 @@ impl SharedWorkspaceBench {
                     &parsed_invite.invite_event_id,
                 ),
                 bootstrap_addr: network_path.bootstrap_addr.clone(),
-                bootstrap_spki_hex: hex::encode(parsed_invite.bootstrap_spki_fingerprint),
+                bootstrap_spki_hex: hex::encode(parsed_invite.daemon_spki_fingerprint),
             })
         } else {
             None
