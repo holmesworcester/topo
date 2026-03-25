@@ -434,6 +434,75 @@ pub fn existing_source_has_higher_precedence(
     source_precedence(existing) > source_precedence(incoming)
 }
 
+/// Event-owned policy: should this connection plan be activated?
+/// Checks preferred direction and bootstrap auth state. This replaces
+/// the runtime-local `should_initiate_connect_for_source_with_db`.
+pub fn should_activate_plan(
+    conn: &Connection,
+    tenant_id: &str,
+    source_kind: ConnectionPlanSourceKind,
+    peer_id: &str,
+) -> bool {
+    use super::connection_runtime::preferred_connection_direction;
+    use crate::contracts::peering_contract::SessionDirection;
+    match source_kind {
+        ConnectionPlanSourceKind::Bootstrap | ConnectionPlanSourceKind::ObservedPeer => true,
+        ConnectionPlanSourceKind::Discovery => {
+            // For discovery targets, check if we are the preferred initiator
+            // (deterministic tiebreak by peer ID comparison), unless bootstrap
+            // auth state overrides.
+            let direction_ok = matches!(
+                preferred_connection_direction(tenant_id, peer_id),
+                Some(SessionDirection::Outbound)
+            );
+            if direction_ok {
+                return true;
+            }
+            // Check if bootstrap auth gives us discovery+observed permission
+            let accepted_and_discovered =
+                check_bootstrap_discovery_auth(conn, tenant_id, peer_id);
+            accepted_and_discovered
+        }
+    }
+}
+
+/// Check if the peer has accepted bootstrap trust that grants discovery
+/// connection permission.
+fn check_bootstrap_discovery_auth(
+    conn: &Connection,
+    tenant_id: &str,
+    peer_id: &str,
+) -> bool {
+    let Ok(fp_bytes) = hex::decode(peer_id) else {
+        return false;
+    };
+    if fp_bytes.len() != 32 {
+        return false;
+    }
+    let mut fp = [0u8; 32];
+    fp.copy_from_slice(&fp_bytes);
+
+    let now_ms = crate::db::queue::current_timestamp_ms();
+    let accepted = conn
+        .query_row(
+            "SELECT EXISTS(
+                 SELECT 1 FROM invite_bootstrap_trust
+                 WHERE recorded_by = ?1
+                   AND bootstrap_spki_fingerprint = ?2
+                   AND expires_at > ?3
+             )",
+            params![tenant_id, fp.as_slice(), now_ms],
+            |row| row.get::<_, bool>(0),
+        )
+        .unwrap_or(false);
+    let local_bootstrap = crate::db::transport_creds::resolve_tenant_transport_target(conn, tenant_id)
+        .ok()
+        .flatten()
+        .map(|t| t.source == crate::db::transport_creds::CRED_SOURCE_BOOTSTRAP)
+        .unwrap_or(false);
+    accepted && local_bootstrap
+}
+
 pub fn dispatch_target_from_row(
     plan: &ConnectionPlanRow,
 ) -> Result<ConnectionPlanDispatchTarget, String> {

@@ -777,12 +777,16 @@ async fn run_target_dispatcher(
 
             let connection_plan_id = effect.connection_id.clone();
 
-            if !should_initiate_connect_for_source_with_db(
-                &db_path,
-                &target.tenant_id,
-                target.source_kind,
-                &target.remote_peer_id,
-            ) {
+            let should_activate = {
+                let conn = open_connection(&db_path).map_err(|e| e.to_string())?;
+                crate::event_modules::operational::connection_planned::should_activate_plan(
+                    &conn,
+                    &target.tenant_id,
+                    target.source_kind,
+                    &target.remote_peer_id,
+                )
+            };
+            if !should_activate {
                 let _ = emit_connection_plan_transition(
                     &db_path,
                     &connection_plan_id,
@@ -993,6 +997,9 @@ async fn run_target_dispatcher(
     Ok(())
 }
 
+// Test-only legacy helper — production code uses
+// connection_planned::should_activate_plan from the event family.
+#[cfg(test)]
 fn should_initiate_connect_for_source(
     tenant_id: &str,
     source_kind: ConnectionPlanSourceKind,
@@ -1007,6 +1014,7 @@ fn should_initiate_connect_for_source(
     }
 }
 
+#[cfg(test)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum BootstrapDiscoveryAuth {
     None,
@@ -1016,6 +1024,7 @@ enum BootstrapDiscoveryAuth {
     SteadyStateOrMixed,
 }
 
+#[cfg(test)]
 fn local_transport_target_is_bootstrap(conn: &rusqlite::Connection, tenant_id: &str) -> bool {
     resolve_tenant_transport_target(conn, tenant_id)
         .ok()
@@ -1024,6 +1033,7 @@ fn local_transport_target_is_bootstrap(conn: &rusqlite::Connection, tenant_id: &
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn classify_bootstrap_discovery_auth(
     db_path: &str,
     tenant_id: &str,
@@ -1090,6 +1100,7 @@ fn classify_bootstrap_discovery_auth(
     }
 }
 
+#[cfg(test)]
 fn should_initiate_connect_for_source_with_db(
     db_path: &str,
     tenant_id: &str,
