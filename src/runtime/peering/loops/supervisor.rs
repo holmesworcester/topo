@@ -30,7 +30,34 @@ impl SessionTenantResolver {
     }
 }
 
+/// Typed outcome from `supervise_connection_sessions`. Callers use this to
+/// select the appropriate close reason for the operational event instead of
+/// hardcoding `"session_ended"`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) enum SessionOutcome {
+    /// The runtime shutdown token was cancelled.
+    Shutdown,
+    /// The connection was dropped while opening a session (QUIC connection lost).
+    ConnectionDropped { detail: String },
+    /// The remote peer rejected the session due to a build/version mismatch.
+    BuildMismatch { reason: String },
+}
+
+impl SessionOutcome {
+    /// Map this outcome to a close_reason string for operational events.
+    pub fn close_reason(&self) -> &str {
+        match self {
+            Self::Shutdown => "runtime_shutdown",
+            Self::ConnectionDropped { .. } => "connection_dropped",
+            Self::BuildMismatch { .. } => "build_mismatch",
+        }
+    }
+}
+
 /// Shared per-connection supervision loop for both connect and accept modes.
+///
+/// Returns a typed [`SessionOutcome`] so callers can record the specific
+/// close reason in operational events.
 pub(super) async fn supervise_connection_sessions(
     db_path: &str,
     peer_id: &str,
@@ -40,19 +67,19 @@ pub(super) async fn supervise_connection_sessions(
     direction: SessionDirection,
     tenant_resolver: &SessionTenantResolver,
     shutdown: CancellationToken,
-) {
+) -> SessionOutcome {
     let connection = provider.connection();
     let recorded_by = tenant_resolver.resolve(db_path);
     loop {
         if shutdown.is_cancelled() {
             connection.close(0u32.into(), b"runtime shutdown");
-            return;
+            return SessionOutcome::Shutdown;
         }
 
         let session = match tokio::select! {
             _ = shutdown.cancelled() => {
                 connection.close(0u32.into(), b"runtime shutdown");
-                return;
+                return SessionOutcome::Shutdown;
             }
             session = provider.next_session() => session,
         } {
@@ -73,6 +100,9 @@ pub(super) async fn supervise_connection_sessions(
                             reason
                         );
                     }
+                    return SessionOutcome::BuildMismatch {
+                        reason: reason.to_string(),
+                    };
                 } else {
                     info!(
                         "Connection {} dropped while opening {:?} session: {}",
@@ -80,8 +110,10 @@ pub(super) async fn supervise_connection_sessions(
                         direction,
                         e
                     );
+                    return SessionOutcome::ConnectionDropped {
+                        detail: e.to_string(),
+                    };
                 }
-                return;
             }
         };
 
@@ -144,7 +176,7 @@ pub(super) async fn supervise_connection_sessions(
             tokio::select! {
                 _ = shutdown.cancelled() => {
                     connection.close(0u32.into(), b"runtime shutdown");
-                    return;
+                    return SessionOutcome::Shutdown;
                 }
                 _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
             }
@@ -173,5 +205,24 @@ mod tests {
             "0123456789abcdef"
         );
         assert_eq!(short_peer_id("short"), "short");
+    }
+
+    #[test]
+    fn session_outcome_close_reason_maps_correctly() {
+        assert_eq!(SessionOutcome::Shutdown.close_reason(), "runtime_shutdown");
+        assert_eq!(
+            SessionOutcome::ConnectionDropped {
+                detail: "reset".to_string()
+            }
+            .close_reason(),
+            "connection_dropped"
+        );
+        assert_eq!(
+            SessionOutcome::BuildMismatch {
+                reason: "version 2 != 3".to_string()
+            }
+            .close_reason(),
+            "build_mismatch"
+        );
     }
 }

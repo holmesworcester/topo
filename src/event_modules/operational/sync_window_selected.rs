@@ -45,7 +45,7 @@ pub fn load(conn: &Connection, recorded_by: &str, peer_id: &str) -> SqliteResult
             "SELECT next_idx, cycle_anchor_now_ms
              FROM sync_window_state_history
              WHERE recorded_by = ?1 AND peer_id = ?2
-             ORDER BY created_at DESC, event_id DESC
+             ORDER BY created_at DESC, rowid DESC
              LIMIT 1",
             params![recorded_by, peer_id],
             |row| {

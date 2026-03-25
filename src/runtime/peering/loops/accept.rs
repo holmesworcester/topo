@@ -228,7 +228,7 @@ async fn accept_loop_until_cancel_inner(
                 .with_sync_control(sync_control_clone.clone());
                 let tenant_resolver = SessionTenantResolver::Fixed(recorded_by_owned.clone());
 
-                supervise_connection_sessions(
+                let outcome = supervise_connection_sessions(
                     &db_path_owned,
                     &peer_id_owned,
                     peer_fp,
@@ -243,7 +243,7 @@ async fn accept_loop_until_cancel_inner(
                 if let Err(err) = record_inbound_connection_closed(
                     &db_path_owned,
                     &inbound_connection_id_owned,
-                    Some("session_ended"),
+                    Some(outcome.close_reason()),
                 ) {
                     warn!(
                         "failed to record inbound_connection_closed for {}: {}",

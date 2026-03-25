@@ -335,7 +335,13 @@ pub fn observe_outbound_authenticated_connection(
 pub fn failure_kind(err: &ConnectionLifecycleError) -> &'static str {
     match err {
         ConnectionLifecycleError::DialTrustRejected(_) => "dial_trust_rejected",
-        ConnectionLifecycleError::Dial(_) => "dial_error",
+        ConnectionLifecycleError::Dial(_) => {
+            if is_stale_dial_failure(err) {
+                "dial_stale"
+            } else {
+                "dial_error"
+            }
+        }
         ConnectionLifecycleError::Accept(_) => "accept_error",
         ConnectionLifecycleError::MissingPeerIdentity => "missing_peer_identity",
     }
@@ -554,6 +560,96 @@ pub fn record_outbound_connection_failed(
     .map_err(|e| e.to_string())
 }
 
+// ---------------------------------------------------------------------------
+// Event-owned stale-dial streak helpers
+// ---------------------------------------------------------------------------
+
+/// Count consecutive `dial_stale` failures for `connection_id` since the last
+/// non-stale event (success, close, or non-stale failure). Returns 0 if no
+/// stale failures or the history is empty.
+pub fn consecutive_stale_failure_count(
+    conn: &rusqlite::Connection,
+    connection_id: &str,
+) -> Result<u32, String> {
+    let count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM outbound_connection_history
+             WHERE connection_id = ?1
+               AND lifecycle_kind = 'failed'
+               AND failure_kind = 'dial_stale'
+               AND created_at > COALESCE(
+                   (SELECT MAX(created_at) FROM outbound_connection_history
+                    WHERE connection_id = ?1
+                      AND (lifecycle_kind != 'failed' OR failure_kind != 'dial_stale')),
+                   0
+               )",
+            rusqlite::params![connection_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(count as u32)
+}
+
+/// Whether any `authenticated` event exists for this `connection_id`.
+pub fn has_ever_authenticated(
+    conn: &rusqlite::Connection,
+    connection_id: &str,
+) -> Result<bool, String> {
+    let exists: bool = conn
+        .query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM outbound_connection_history
+                WHERE connection_id = ?1 AND lifecycle_kind = 'authenticated'
+            )",
+            rusqlite::params![connection_id],
+            |row| row.get(0),
+        )
+        .map_err(|e| e.to_string())?;
+    Ok(exists)
+}
+
+/// Evaluate whether the stale-dial threshold has been reached for this
+/// connection. Returns `Some(count)` if `count >= threshold`, meaning the
+/// caller should treat the target as terminally stale. Returns `None` if
+/// below threshold.
+pub fn evaluate_stale_dial_terminal(
+    conn: &rusqlite::Connection,
+    connection_id: &str,
+    threshold: u32,
+) -> Result<Option<u32>, String> {
+    let count = consecutive_stale_failure_count(conn, connection_id)?;
+    if count >= threshold {
+        Ok(Some(count))
+    } else {
+        Ok(None)
+    }
+}
+
+/// Combined stale-dial evaluation from db_path. Opens a connection, checks
+/// both `has_ever_authenticated` and `evaluate_stale_dial_terminal`.
+pub fn check_stale_dial_state(
+    db_path: &str,
+    connection_id: &str,
+    threshold: u32,
+) -> Result<StaleDialState, String> {
+    let conn = open_connection(db_path).map_err(|e| e.to_string())?;
+    let has_connected = has_ever_authenticated(&conn, connection_id)?;
+    let terminal = evaluate_stale_dial_terminal(&conn, connection_id, threshold)?;
+    Ok(StaleDialState {
+        has_connected_once: has_connected,
+        terminal_stale_count: terminal,
+    })
+}
+
+/// Result of evaluating stale-dial state from projected connection history.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StaleDialState {
+    /// Whether this connection has ever successfully authenticated.
+    pub has_connected_once: bool,
+    /// If `Some(count)`, the stale threshold has been reached.
+    pub terminal_stale_count: Option<u32>,
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -622,6 +718,155 @@ mod tests {
             )
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    fn setup_active_plan(conn: &Connection) -> (String, [u8; 32]) {
+        let plan_event_id = create_connection_planned(
+            conn,
+            "tenant-a",
+            &"a".repeat(64),
+            "127.0.0.1:7443".parse().unwrap(),
+            ConnectionPlanSourceKind::Discovery,
+            None,
+        )
+        .unwrap()
+        .unwrap();
+        let connection_id = discovery_connection_id("tenant-a", &"a".repeat(64));
+        create_connection_plan_transitioned(
+            conn,
+            "tenant-a",
+            plan_event_id,
+            &connection_id,
+            ConnectionPlanStatus::Active,
+            Some("spawned"),
+            0,
+        )
+        .unwrap();
+        let active_basis =
+            crate::event_modules::operational::connection_planned::load(conn, &connection_id)
+                .unwrap()
+                .unwrap();
+        let basis = crate::crypto::event_id_from_base64(&active_basis.latest_event_id).unwrap();
+        (connection_id, basis)
+    }
+
+    use std::sync::atomic::{AtomicU32, Ordering as AtomicOrd};
+    static TEST_SEQ: AtomicU32 = AtomicU32::new(0);
+
+    fn record_stale_failure(conn: &Connection, connection_id: &str) {
+        let (_, basis) = super::require_current_plan_basis(conn, connection_id).unwrap();
+        let seq = TEST_SEQ.fetch_add(1, AtomicOrd::Relaxed);
+        create_outbound_connection_failed(
+            conn,
+            "tenant-a",
+            basis,
+            connection_id,
+            "dial_stale",
+            Some(&format!("timed out #{seq}")),
+            false,
+        )
+        .unwrap();
+    }
+
+    fn record_non_stale_failure(conn: &Connection, connection_id: &str) {
+        let (_, basis) = super::require_current_plan_basis(conn, connection_id).unwrap();
+        let seq = TEST_SEQ.fetch_add(1, AtomicOrd::Relaxed);
+        create_outbound_connection_failed(
+            conn,
+            "tenant-a",
+            basis,
+            connection_id,
+            "dial_trust_rejected",
+            Some(&format!("trust rejected #{seq}")),
+            false,
+        )
+        .unwrap();
+    }
+
+    fn record_success(conn: &Connection, connection_id: &str) {
+        use crate::event_modules::operational::outbound_connection_authenticated::create_outbound_connection_authenticated;
+        let (_, basis) = super::require_current_plan_basis(conn, connection_id).unwrap();
+        create_outbound_connection_authenticated(
+            conn,
+            "tenant-a",
+            basis,
+            connection_id,
+            &"a".repeat(64),
+            "127.0.0.1:7443".parse().unwrap(),
+            false,
+        )
+        .unwrap();
+    }
+
+    #[test]
+    fn stale_failure_streak_accumulates_from_projected_history() {
+        let conn = setup();
+        let (connection_id, _basis) = setup_active_plan(&conn);
+
+        assert_eq!(consecutive_stale_failure_count(&conn, &connection_id).unwrap(), 0);
+        assert!(!has_ever_authenticated(&conn, &connection_id).unwrap());
+
+        record_stale_failure(&conn, &connection_id);
+        assert_eq!(consecutive_stale_failure_count(&conn, &connection_id).unwrap(), 1);
+
+        record_stale_failure(&conn, &connection_id);
+        assert_eq!(consecutive_stale_failure_count(&conn, &connection_id).unwrap(), 2);
+
+        record_stale_failure(&conn, &connection_id);
+        assert_eq!(consecutive_stale_failure_count(&conn, &connection_id).unwrap(), 3);
+    }
+
+    #[test]
+    fn stale_failure_streak_resets_after_success() {
+        let conn = setup();
+        let (connection_id, _basis) = setup_active_plan(&conn);
+
+        record_stale_failure(&conn, &connection_id);
+        record_stale_failure(&conn, &connection_id);
+        assert_eq!(consecutive_stale_failure_count(&conn, &connection_id).unwrap(), 2);
+
+        record_success(&conn, &connection_id);
+        assert_eq!(consecutive_stale_failure_count(&conn, &connection_id).unwrap(), 0);
+        assert!(has_ever_authenticated(&conn, &connection_id).unwrap());
+    }
+
+    #[test]
+    fn stale_failure_streak_resets_after_non_stale_failure() {
+        let conn = setup();
+        let (connection_id, _basis) = setup_active_plan(&conn);
+
+        record_stale_failure(&conn, &connection_id);
+        record_stale_failure(&conn, &connection_id);
+        assert_eq!(consecutive_stale_failure_count(&conn, &connection_id).unwrap(), 2);
+
+        record_non_stale_failure(&conn, &connection_id);
+        assert_eq!(consecutive_stale_failure_count(&conn, &connection_id).unwrap(), 0);
+    }
+
+    #[test]
+    fn evaluate_stale_terminal_reports_threshold_reached() {
+        let conn = setup();
+        let (connection_id, _basis) = setup_active_plan(&conn);
+
+        for _ in 0..3 {
+            record_stale_failure(&conn, &connection_id);
+        }
+        assert_eq!(evaluate_stale_dial_terminal(&conn, &connection_id, 4).unwrap(), None);
+
+        record_stale_failure(&conn, &connection_id);
+        assert_eq!(evaluate_stale_dial_terminal(&conn, &connection_id, 4).unwrap(), Some(4));
+    }
+
+    #[test]
+    fn failure_kind_distinguishes_stale_from_non_stale() {
+        let stale = ConnectionLifecycleError::Dial("connection refused".to_string());
+        assert_eq!(failure_kind(&stale), "dial_stale");
+
+        let non_stale = ConnectionLifecycleError::Dial("TLS handshake error".to_string());
+        assert_eq!(failure_kind(&non_stale), "dial_error");
+
+        let trust = ConnectionLifecycleError::DialTrustRejected("trust_rejected".to_string());
+        assert_eq!(failure_kind(&trust), "dial_trust_rejected");
     }
 
     #[test]
