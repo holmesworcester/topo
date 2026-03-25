@@ -162,6 +162,7 @@ fn parsed_event_type_name(parsed: &ParsedEvent) -> &'static str {
         ParsedEvent::SyncRoundStarted(_) => "sync_round_started",
         ParsedEvent::SyncRoundCompleted(_) => "sync_round_completed",
         ParsedEvent::ListenerBindFailed(_) => "listener_bind_failed",
+        ParsedEvent::JobDue(_) => "job_due",
     }
 }
 

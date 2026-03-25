@@ -5,6 +5,10 @@
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 
 use crate::db::queue::{current_timestamp_ms, with_sqlite_busy_retry};
+use crate::event_modules::ParsedEvent;
+use crate::projection::create::create_event_synchronous;
+
+use super::job_due::JobDueEvent;
 
 // ---------------------------------------------------------------------------
 // Job kind registry
@@ -168,6 +172,7 @@ pub fn poll_due_jobs(conn: &Connection, limit: usize) -> SqliteResult<Vec<DueJob
 }
 
 /// Mark a job as completed and advance its next_due_at_ms by the interval.
+/// Also authors a `job_due` event to record the completion in the event log.
 pub fn complete_job(
     conn: &Connection,
     client_id: &str,
@@ -183,7 +188,26 @@ pub fn complete_job(
             params![now, client_id, kind.as_str()],
         )?;
         Ok(())
-    })
+    })?;
+    // Best-effort: record the job_due event. If this fails, the job still
+    // completed — the event is observational, not authoritative.
+    let _ = record_job_due(conn, client_id, kind);
+    Ok(())
+}
+
+/// Record a job_due event for the given client and job kind. Returns the
+/// event id on success.
+pub fn record_job_due(
+    conn: &Connection,
+    client_id: &str,
+    kind: DurableJobKind,
+) -> Result<[u8; 32], String> {
+    let event = ParsedEvent::JobDue(JobDueEvent {
+        created_at_ms: current_timestamp_ms() as u64,
+        job_kind: kind.as_str().to_string(),
+        client_id: client_id.to_string(),
+    });
+    create_event_synchronous(conn, client_id, &event).map_err(|e| e.to_string())
 }
 
 /// Return the earliest due time of any enabled job, or None if no jobs are

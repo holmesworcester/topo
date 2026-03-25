@@ -183,15 +183,41 @@ pub fn live_connection_peer_ids(db_path: &str, recorded_by: &str) -> Vec<String>
     peer_ids
 }
 
+/// Derive a bilateral connection episode ID that both sides compute identically.
+/// sorted(peer_a, peer_b) + stable_id → deterministic hash.
+pub fn bilateral_connection_episode_id(
+    local_peer_id: &str,
+    remote_peer_id: &str,
+    connection_stable_id: usize,
+) -> String {
+    let (first, second) = if local_peer_id <= remote_peer_id {
+        (local_peer_id, remote_peer_id)
+    } else {
+        (remote_peer_id, local_peer_id)
+    };
+    let input = format!("conn:{first}:{second}:{connection_stable_id}");
+    let hash = crate::crypto::hash_event(input.as_bytes());
+    crate::crypto::event_id_to_base64(&hash)
+}
+
+/// Derive a bilateral sync round episode ID from shared context.
+pub fn bilateral_sync_round_episode_id(
+    connection_episode_id: &str,
+    session_id: u64,
+) -> String {
+    let input = format!("round:{connection_episode_id}:{session_id}");
+    let hash = crate::crypto::hash_event(input.as_bytes());
+    crate::crypto::event_id_to_base64(&hash)
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{preferred_connection_direction, SessionDirection};
+    use super::*;
 
     #[test]
     fn preferred_connection_direction_is_symmetric() {
         let lower = format!("{:064x}", 1);
         let higher = format!("{:064x}", 2);
-
         assert_eq!(
             preferred_connection_direction(&lower, &higher),
             Some(SessionDirection::Outbound)
@@ -214,5 +240,46 @@ mod tests {
     #[test]
     fn preferred_connection_direction_returns_none_for_invalid_peer_ids() {
         assert_eq!(preferred_connection_direction("not-hex", "also-bad"), None);
+    }
+
+    #[test]
+    fn bilateral_connection_id_is_symmetric() {
+        let a = format!("{:064x}", 1);
+        let b = format!("{:064x}", 2);
+        assert_eq!(
+            bilateral_connection_episode_id(&a, &b, 42),
+            bilateral_connection_episode_id(&b, &a, 42)
+        );
+    }
+
+    #[test]
+    fn bilateral_connection_id_differs_by_stable_id() {
+        let a = format!("{:064x}", 1);
+        let b = format!("{:064x}", 2);
+        assert_ne!(
+            bilateral_connection_episode_id(&a, &b, 1),
+            bilateral_connection_episode_id(&a, &b, 2)
+        );
+    }
+
+    #[test]
+    fn bilateral_round_id_differs_by_session() {
+        let ep = bilateral_connection_episode_id("a", "b", 1);
+        assert_ne!(
+            bilateral_sync_round_episode_id(&ep, 1),
+            bilateral_sync_round_episode_id(&ep, 2)
+        );
+    }
+
+    #[test]
+    fn two_client_exchange_paired_by_episode_ids() {
+        let (alice, bob, stable, sess) = ("alice", "bob", 7usize, 3u64);
+        let a_conn = bilateral_connection_episode_id(alice, bob, stable);
+        let b_conn = bilateral_connection_episode_id(bob, alice, stable);
+        assert_eq!(a_conn, b_conn);
+        assert_eq!(
+            bilateral_sync_round_episode_id(&a_conn, sess),
+            bilateral_sync_round_episode_id(&b_conn, sess)
+        );
     }
 }
