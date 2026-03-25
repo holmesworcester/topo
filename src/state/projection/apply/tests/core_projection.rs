@@ -74,7 +74,6 @@ fn key_shared_does_not_block_non_recipient_observers_on_local_invite_secret() {
     );
 }
 
-
 #[test]
 fn test_project_message_valid() {
     let conn = setup();

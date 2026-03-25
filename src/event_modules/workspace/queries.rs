@@ -135,7 +135,7 @@ pub struct StatusResponse {
     pub messages_count: i64,
     pub reactions_count: i64,
     pub recorded_events_count: i64,
-    pub neg_items_count: i64,
+    pub shared_event_index_count: i64,
     pub tenants: Vec<ViewTenant>,
 }
 
@@ -146,8 +146,10 @@ pub fn status(db: &Connection, recorded_by: &str) -> StatusResponse {
         .unwrap_or(0);
     let messages_count = message::count(db, recorded_by).unwrap_or(0);
     let reactions_count = reaction::count(db, recorded_by).unwrap_or(0);
-    let neg_items_count: i64 = db
-        .query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
+    let shared_event_index_count: i64 = db
+        .query_row("SELECT COUNT(*) FROM shared_event_index", [], |row| {
+            row.get(0)
+        })
         .unwrap_or(0);
     let recorded_events_count: i64 = db
         .query_row(
@@ -163,7 +165,7 @@ pub fn status(db: &Connection, recorded_by: &str) -> StatusResponse {
         messages_count,
         reactions_count,
         recorded_events_count,
-        neg_items_count,
+        shared_event_index_count,
         tenants,
     }
 }

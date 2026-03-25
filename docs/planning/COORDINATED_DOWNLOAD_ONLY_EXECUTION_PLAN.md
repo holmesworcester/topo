@@ -30,9 +30,9 @@ threshold-based claim-all fallback for source-unique events.
    connect loops for one sink, providing fair source attribution via
    `recorded_events.source`.
 
-5. **clone_events_to workspace_id fix**: test helper now inserts neg_items with
+5. **clone_events_to workspace_id fix**: test helper now inserts shared_event_index with
    the target peer's workspace_id (not default ''), preventing duplicate
-   neg_items that inflated negentropy counts.
+   shared_event_index that inflated negentropy counts.
 
 ### Files changed
 

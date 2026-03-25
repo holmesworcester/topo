@@ -1,5 +1,5 @@
-use super::*;
 use super::peer::Peer;
+use super::*;
 
 // ---------------------------------------------------------------------------
 // Deterministic projection fingerprinting
@@ -553,7 +553,6 @@ pub fn verify_projection_invariants(peer: &Peer) {
     let _ = replay_and_fingerprint(&db, &peer.identity, "ORDER BY created_at ASC, event_id ASC");
 }
 
-
 // ---------------------------------------------------------------------------
 // Unit tests for deterministic fingerprinting
 // ---------------------------------------------------------------------------
@@ -834,7 +833,7 @@ mod fingerprint_tests {
             "pending_invite_bootstrap_trust",
             "local_transport_creds",
             "file_slice_guard_blocks",
-            "neg_items",
+            "shared_event_index",
             "events",
             "recorded_events",
         ];
@@ -857,4 +856,3 @@ mod fingerprint_tests {
         }
     }
 }
-

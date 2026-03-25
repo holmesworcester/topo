@@ -31,28 +31,32 @@ pub fn load_range_storage(
     let mut stmt = conn
         .prepare(
             "SELECT ts, id
-             FROM neg_items
+             FROM shared_event_index
              WHERE workspace_id = :workspace_id
                AND (:ts_min IS NULL OR ts >= :ts_min)
                AND (:ts_max IS NULL OR ts < :ts_max)
              ORDER BY ts, id",
         )
-        .map_err(|e| format!("prepare neg_items range query: {e}"))?;
+        .map_err(|e| format!("prepare shared_event_index range query: {e}"))?;
     let mut rows = stmt
         .query(rusqlite::named_params! {
             ":workspace_id": workspace_id,
             ":ts_min": range.ts_min(),
             ":ts_max": range.ts_max_exclusive(),
         })
-        .map_err(|e| format!("query neg_items range rows: {e}"))?;
+        .map_err(|e| format!("query shared_event_index range rows: {e}"))?;
 
     let mut storage = NegentropyStorageVector::new();
     while let Some(row) = rows
         .next()
-        .map_err(|e| format!("iterate neg_items range rows: {e}"))?
+        .map_err(|e| format!("iterate shared_event_index range rows: {e}"))?
     {
-        let ts: i64 = row.get(0).map_err(|e| format!("read neg_items ts: {e}"))?;
-        let id_blob: Vec<u8> = row.get(1).map_err(|e| format!("read neg_items id: {e}"))?;
+        let ts: i64 = row
+            .get(0)
+            .map_err(|e| format!("read shared_event_index ts: {e}"))?;
+        let id_blob: Vec<u8> = row
+            .get(1)
+            .map_err(|e| format!("read shared_event_index id: {e}"))?;
         if id_blob.len() != 32 {
             continue;
         }

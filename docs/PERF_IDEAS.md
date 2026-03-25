@@ -86,7 +86,7 @@ These were identified by tracing the actual code paths:
   bytes in memory, but `project_batch()` re-reads them from the events
   table. Carrying blobs through `PersistPhaseOutput` avoids this re-read.
 
-- **Incremental neg_items rebuild is not multi-workspace safe.** The
+- **Incremental shared_event_index rebuild is not multi-workspace safe.** The
   current helper stamps every event with one `workspace_id`, which
   breaks on a shared DB hosting multiple workspaces.
 
@@ -213,10 +213,10 @@ local" check becomes `SELECT 1 FROM events WHERE event_id = ?`.
 100+ references to `recorded_events` across the codebase need migration.
 Medium-high effort but reduces write amplification permanently.
 
-### Idea 8: Defer neg_items to incremental rebuild
+### Idea 8: Defer shared_event_index to incremental rebuild
 
 Track a dedicated runtime checkpoint for the last scanned shared event,
-then bulk-insert new entries into `neg_items` from the shared event
+then bulk-insert new entries into `shared_event_index` from the shared event
 stream before each negentropy round. Moves the cost from the hot ingest
 path to the observer loop.
 

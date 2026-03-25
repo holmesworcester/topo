@@ -116,7 +116,7 @@ Add a lightweight session envelope on top of the first negentropy message:
 2. later hot sessions use `ts >= cutoff`
 3. periodic cold sessions use `ts < cutoff`
 
-The storage adapter is range-filtered from the same `neg_items` table. The
+The storage adapter is range-filtered from the same `shared_event_index` table. The
 runtime schedules hot sessions frequently and cold sessions less frequently.
 
 ### Phase 5. Projection and ingest fairness for bulk slices

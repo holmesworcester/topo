@@ -31,7 +31,7 @@ pub(super) fn run_persist_phase(
     batch: &[IngestItem],
     reg: &'static EventRegistry,
     workspace_cache: &mut HashMap<String, String>,
-    neg_items_stmt: &mut rusqlite::Statement<'_>,
+    shared_event_index_stmt: &mut rusqlite::Statement<'_>,
     recorded_stmt: &mut rusqlite::Statement<'_>,
     events_stmt: &mut rusqlite::Statement<'_>,
     enqueue_stmt: &mut rusqlite::Statement<'_>,
@@ -55,7 +55,7 @@ pub(super) fn run_persist_phase(
         if let Some(created_at_ms) = events::extract_created_at_ms(blob) {
             if let Some(type_code) = events::extract_event_type(blob) {
                 if let Some(meta) = reg.lookup(type_code) {
-                    // Only insert into neg_items for shared events (defense-in-depth)
+                    // Only insert into shared_event_index for shared events (defense-in-depth)
                     if meta.share_scope == ShareScope::Shared {
                         // Look up workspace_id from cache or invites_accepted projection.
                         // For shared workspace events themselves, workspace_id is the
@@ -69,22 +69,22 @@ pub(super) fn run_persist_phase(
                             Some(ws)
                         } else {
                             tracing::warn!(
-                                "no accepted workspace binding for {}, skipping neg_items for {}",
+                                "no accepted workspace binding for {}, skipping shared_event_index for {}",
                                 recorded_by,
                                 event_id_b64
                             );
                             None
                         };
                         if let Some(ws_id) = ws_id {
-                            if let Err(e) = neg_items_stmt.execute(rusqlite::params![
+                            if let Err(e) = shared_event_index_stmt.execute(rusqlite::params![
                                 &ws_id,
                                 created_at_ms as i64,
                                 event_id.as_slice()
                             ]) {
-                                // Non-fatal: neg_items is a reconciliation cache;
+                                // Non-fatal: shared_event_index is a reconciliation cache;
                                 // event will be re-added on next sync session.
                                 tracing::warn!(
-                                    "neg_items insert error for {}: {}",
+                                    "shared_event_index insert error for {}: {}",
                                     event_id_b64,
                                     e
                                 );
@@ -192,7 +192,7 @@ mod tests {
     use crate::db::{
         open_in_memory,
         schema::create_tables,
-        store::{SQL_INSERT_EVENT, SQL_INSERT_NEG_ITEM, SQL_INSERT_RECORDED_EVENT},
+        store::{SQL_INSERT_EVENT, SQL_INSERT_RECORDED_EVENT, SQL_INSERT_SHARED_EVENT_INDEX_ENTRY},
     };
     use crate::event_modules::{self, EncryptedEvent, ParsedEvent, EVENT_TYPE_FILE_SLICE};
 
@@ -201,7 +201,7 @@ mod tests {
         let db = open_in_memory().unwrap();
         create_tables(&db).unwrap();
 
-        let mut neg_items_stmt = db.prepare(SQL_INSERT_NEG_ITEM).unwrap();
+        let mut shared_event_index_stmt = db.prepare(SQL_INSERT_SHARED_EVENT_INDEX_ENTRY).unwrap();
         let mut recorded_stmt = db.prepare(SQL_INSERT_RECORDED_EVENT).unwrap();
         let mut events_stmt = db.prepare(SQL_INSERT_EVENT).unwrap();
         let mut enqueue_stmt = db
@@ -239,7 +239,7 @@ mod tests {
             &batch,
             event_modules::registry(),
             &mut workspace_cache,
-            &mut neg_items_stmt,
+            &mut shared_event_index_stmt,
             &mut recorded_stmt,
             &mut events_stmt,
             &mut enqueue_stmt,

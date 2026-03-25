@@ -1,5 +1,5 @@
-use super::*;
 use super::peer::Peer;
+use super::*;
 
 // ---------------------------------------------------------------------------
 // REALISM SYNC HELPERS
@@ -851,4 +851,3 @@ pub fn start_sink_accept(sink: &Peer) -> (std::thread::JoinHandle<()>, SocketAdd
 pub fn peer_fingerprint(peer: &Peer) -> [u8; 32] {
     peer.spki_fingerprint()
 }
-

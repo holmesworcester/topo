@@ -8,8 +8,8 @@ use crate::event_modules::ShareScope;
 pub const SQL_INSERT_EVENT: &str =
     "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
-pub const SQL_INSERT_NEG_ITEM: &str =
-    "INSERT OR IGNORE INTO neg_items (workspace_id, ts, id) VALUES (?1, ?2, ?3)";
+pub const SQL_INSERT_SHARED_EVENT_INDEX_ENTRY: &str =
+    "INSERT OR IGNORE INTO shared_event_index (workspace_id, ts, id) VALUES (?1, ?2, ?3)";
 pub const SQL_INSERT_RECORDED_EVENT: &str =
     "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
      VALUES (?1, ?2, ?3, ?4)";
@@ -36,15 +36,12 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         );
         CREATE INDEX IF NOT EXISTS idx_recorded_peer_order ON recorded_events(peer_id, id);
 
-        CREATE TABLE IF NOT EXISTS neg_items (
+        CREATE TABLE IF NOT EXISTS shared_event_index (
             workspace_id TEXT NOT NULL DEFAULT '',
             ts INTEGER NOT NULL,
             id BLOB NOT NULL,
             PRIMARY KEY (workspace_id, ts, id)
         ) WITHOUT ROWID;
-
-        DROP TABLE IF EXISTS neg_blocks;
-        DROP TABLE IF EXISTS neg_meta;
         ",
     )?;
     Ok(())
@@ -82,7 +79,7 @@ pub fn insert_event(
     Ok(())
 }
 
-pub fn insert_neg_item_if_shared(
+pub fn insert_shared_event_index_entry_if_shared(
     conn: &Connection,
     share_scope: ShareScope,
     created_at_ms: i64,
@@ -91,7 +88,7 @@ pub fn insert_neg_item_if_shared(
 ) -> SqliteResult<()> {
     if share_scope == ShareScope::Shared {
         conn.execute(
-            SQL_INSERT_NEG_ITEM,
+            SQL_INSERT_SHARED_EVENT_INDEX_ENTRY,
             params![workspace_id, created_at_ms, event_id.as_slice()],
         )?;
     }
@@ -366,43 +363,5 @@ mod tests {
             crate::event_modules::EVENT_TYPE_MESSAGE
         );
         assert_eq!(summary.encoded_size_bytes, blob.len() as u32);
-    }
-
-    #[test]
-    fn test_ensure_schema_drops_stale_negentropy_tables() {
-        let conn = setup();
-        conn.execute_batch(
-            "
-            CREATE TABLE neg_blocks (
-                block_idx INTEGER PRIMARY KEY,
-                ts INTEGER NOT NULL,
-                id BLOB NOT NULL
-            );
-            CREATE TABLE neg_meta (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL
-            );
-            ",
-        )
-        .unwrap();
-
-        ensure_schema(&conn).unwrap();
-
-        let neg_blocks_exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='neg_blocks'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        let neg_meta_exists: i64 = conn
-            .query_row(
-                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='neg_meta'",
-                [],
-                |row| row.get(0),
-            )
-            .unwrap();
-        assert_eq!(neg_blocks_exists, 0);
-        assert_eq!(neg_meta_exists, 0);
     }
 }

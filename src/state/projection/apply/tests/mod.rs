@@ -3,7 +3,7 @@ use crate::crypto::{event_id_from_base64, event_id_to_base64, hash_event, EventI
 use crate::db::{
     open_in_memory,
     schema::create_tables,
-    store::{insert_event, insert_neg_item_if_shared, insert_recorded_event},
+    store::{insert_event, insert_recorded_event, insert_shared_event_index_entry_if_shared},
     timeline::EventTimeline,
 };
 use crate::event_modules::{
@@ -27,14 +27,14 @@ use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 use std::time::{SystemTime, UNIX_EPOCH};
 
-mod core_projection;
-mod tenant;
-mod encryption;
-mod deletion;
-mod identity;
-mod file_slice;
 mod cascade;
+mod core_projection;
+mod deletion;
+mod encryption;
+mod file_slice;
+mod identity;
 mod invite;
+mod tenant;
 
 fn now_ms() -> u64 {
     SystemTime::now()
@@ -156,11 +156,15 @@ pub(super) fn wrap_test_content_blob(conn: &Connection, recorded_by: &str, blob:
     events::encode_event(&wrapper).unwrap()
 }
 
-pub(super) fn canonical_test_event_id(conn: &Connection, recorded_by: &str, blob: &[u8]) -> EventId {
+pub(super) fn canonical_test_event_id(
+    conn: &Connection,
+    recorded_by: &str,
+    blob: &[u8],
+) -> EventId {
     hash_event(&wrap_test_content_blob(conn, recorded_by, blob))
 }
 
-/// Insert a blob into events + neg_items + recorded_events (simulating what
+/// Insert a blob into events + shared_event_index + recorded_events (simulating what
 /// batch_writer or create_event_synchronous does before calling project_one).
 pub(super) fn insert_event_raw(conn: &Connection, recorded_by: &str, blob: &[u8]) -> EventId {
     let blob = wrap_test_content_blob(conn, recorded_by, blob);
@@ -182,7 +186,7 @@ pub(super) fn insert_event_raw(conn: &Connection, recorded_by: &str, blob: &[u8]
         ts as i64,
     )
     .unwrap();
-    insert_neg_item_if_shared(
+    insert_shared_event_index_entry_if_shared(
         conn,
         crate::event_modules::ShareScope::Shared,
         ts as i64,
@@ -530,7 +534,11 @@ fn make_message_signed(
 }
 
 /// Convenience: create identity chain + signed message in one call.
-pub(super) fn make_message(conn: &Connection, recorded_by: &str, content: &str) -> (ParsedEvent, Vec<u8>) {
+pub(super) fn make_message(
+    conn: &Connection,
+    recorded_by: &str,
+    content: &str,
+) -> (ParsedEvent, Vec<u8>) {
     let (signer_eid, signing_key) = make_identity_chain(conn, recorded_by);
     make_message_signed(&signing_key, &signer_eid, content)
 }
@@ -661,7 +669,6 @@ pub(super) fn make_encrypted_event(
     let blob = events::encode_event(&enc).unwrap();
     (enc, blob)
 }
-
 
 // === File attachment helpers ===
 

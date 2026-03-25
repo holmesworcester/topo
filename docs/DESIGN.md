@@ -125,7 +125,7 @@ This also covers the hard case where multiple local identities on the same endpo
 
 ### Sync And Convergence
 
-Once connected, peers reconcile explicit time ranges instead of planning per-event pull work. A range session loads the local `(ts, event_id)` membership for one selected range from `neg_items`, seals it into an in-memory `NegentropyStorageVector`, exchanges `NegOpen` / `NegMsg`, and then both sides stream all missing blobs for that range as raw length-delimited records. The receiver appends those blobs to a `ReceiveLog`, stamps `first_received_at` / `first_stored_at` in the file as each blob is appended, finalizes the spool file, and then lets canonical ingest continue in the background.
+Once connected, peers reconcile explicit time ranges instead of planning per-event pull work. A range session loads the local `(ts, event_id)` membership for one selected range from `shared_event_index`, seals it into an in-memory `NegentropyStorageVector`, exchanges `NegOpen` / `NegMsg`, and then both sides stream all missing blobs for that range as raw length-delimited records. The receiver appends those blobs to a `ReceiveLog`, stamps `first_received_at` / `first_stored_at` in the file as each blob is appended, finalizes the spool file, and then lets canonical ingest continue in the background.
 
 Negentropy remains the set-reconciliation engine because it is agnostic to event content and naturally fits an ever-growing event set. The active range path uses the Rust [`negentropy` library](https://crates.io/crates/negentropy) over one selected range at a time. The current scheduler intentionally stays simple and round-robins:
 
@@ -614,7 +614,7 @@ InviteAccepted (accepted workspace binding) → User → DeviceInvite → PeerSh
 Prerequisite: the joiner's DB must already contain the Workspace and UserInvite events (copied from the inviter before or during sync).
 Scope rule: workspace invite acceptance is also tenant-agnostic at the CLI/RPC boundary. It creates a new local tenant bound to the invited workspace instead of reusing the active tenant.
 The acceptance path also unwraps bootstrap content-key material received via `key_shared` events (wrapped to the invite public key at creation time) and materializes local `key_secret` events so that encrypted content received during bootstrap sync can be decrypted.
-On shared-DB multi-tenant nodes, acceptance also replays already-present shared events for the accepted workspace into the new tenant scope. Canonical blobs may already exist globally in `events` / `neg_items`, and negentropy will not refetch them just because a new local tenant accepted the workspace. That replay is therefore part of the correctness contract for same-DB joins, not just an optimization.
+On shared-DB multi-tenant nodes, acceptance also replays already-present shared events for the accepted workspace into the new tenant scope. Canonical blobs may already exist globally in `events` / `shared_event_index`, and negentropy will not refetch them just because a new local tenant accepted the workspace. That replay is therefore part of the correctness contract for same-DB joins, not just an optimization.
 Signer secrets (PeerSecret events) are NOT emitted here; `persist_join_peer_secret` is called separately after push-back sync completes.
 
 **Device link** (`workspace::commands::create_device_link_invite` / `add_device_to_workspace`): similar to user invite but creates a shorter chain (PeerShared only, skipping user/peer_invite_shared creation). Authorization rule: any linked device may issue a device-link invite for its own user identity; adding new users remains admin-only through `create_user_invite`.
@@ -711,7 +711,7 @@ Rules:
 
 This preserves scoped reads/writes while keeping the schema ergonomic.
 
-**Known limitation:** `neg_items` is one shared physical table. Negentropy reads are workspace-scoped (`workspace_id = ? OR workspace_id = ''`), so tenants do not enumerate other tenants' non-empty workspace buckets. Remaining leakage risk is limited to rows with empty `workspace_id` during bootstrap/pre-anchor windows. In this document, **pseudonym isolation** means preventing any cross-tenant metadata correlation at the node level; full pseudonym isolation still requires separate node instances on separate network paths.
+**Known limitation:** `shared_event_index` is one shared physical table. Negentropy reads are workspace-scoped (`workspace_id = ? OR workspace_id = ''`), so tenants do not enumerate other tenants' non-empty workspace buckets. Remaining leakage risk is limited to rows with empty `workspace_id` during bootstrap/pre-anchor windows. In this document, **pseudonym isolation** means preventing any cross-tenant metadata correlation at the node level; full pseudonym isolation still requires separate node instances on separate network paths.
 
 ## 3.2.1 Functional multitenancy: one node, N tenants
 
@@ -1229,7 +1229,7 @@ Bulk transfer is range-owned.
    - `last twelve weeks`
    - `full history`
 2. the initiator opens a `Range` session and sends the concrete window bounds in the initial `NegOpen`,
-3. both sides load that range from `neg_items` into an in-memory `NegentropyStorageVector`,
+3. both sides load that range from `shared_event_index` into an in-memory `NegentropyStorageVector`,
 4. negentropy computes `have_ids` / `need_ids` for that explicit range,
 5. both sides stream all missing blobs for that range as raw `[u32 len][blob]` records,
 6. the receiver appends those records to a `ReceiveLog`, stamping `first_received_at` and `first_stored_at` in the file,
@@ -1316,14 +1316,14 @@ The active branch chooses simpler boundaries over a global per-event planner:
 4. **Simple scheduler first.** The current scheduler round-robins the fixed
    range ladder before growing into arbitrary coordinator-chosen ranges.
 5. **Use stock negentropy directly.** The active path builds an in-memory
-   vector from `neg_items` for the selected range instead of routing bulk sync
+   vector from `shared_event_index` for the selected range instead of routing bulk sync
    through a bespoke request-credit scheduler.
 
 ## 7.7 Negentropy implementation notes
 
 Baseline implementation:
-1. `neg_items` stores shared-event membership tuples (`workspace_id`, timestamp, event id bytes).
-2. `RangeSession` queries `neg_items` for one explicit range and loads that slice into an in-memory `NegentropyStorageVector`.
+1. `shared_event_index` stores shared-event membership tuples (`workspace_id`, timestamp, event id bytes).
+2. `RangeSession` queries `shared_event_index` for one explicit range and loads that slice into an in-memory `NegentropyStorageVector`.
 3. Control-plane reconciliation uses `NegOpen` and `NegMsg`; the first `NegOpen` may carry a `P7SW` window envelope selecting one of:
    - `LastDay`
    - `LastWeek`
@@ -1332,7 +1332,7 @@ Baseline implementation:
 4. Outbound scheduling currently round-robins those windows per `(db_path, peer_id)`.
 5. Range data transfer streams raw length-delimited blob records (`[u32 len][blob]`) after reconciliation for that range.
 6. Multi-source coordination does not replace negentropy; future smarter range balancing will still consume range-local membership discovered by negentropy.
-7. The current range path uses only the in-memory vector-backed storage built directly from `neg_items`; the older SQLite-backed storage path has been removed.
+7. The current range path uses only the in-memory vector-backed storage built directly from `shared_event_index`; the older SQLite-backed storage path has been removed.
 
 Primary code references:
 1. `src/runtime/sync_engine/session/range_session.rs`
@@ -1675,7 +1675,7 @@ Why: the identity bootstrap chain produces a variable number of events (workspac
 Rules:
 1. **Convergence detection** uses `has_event(event_id)` on a specific known event, not `store_count >= N`.
 2. **Assertions** use projection-level counts: `message_count()`, `reaction_count()`, `peer_shared_count()`, `user_count()`, etc.
-3. **Never assert** on `store_count()`, `recorded_events_count()`, or `neg_items_count()` — these include identity overhead that varies.
+3. **Never assert** on `store_count()`, `recorded_events_count()`, or `shared_event_index_count()` — these include identity overhead that varies.
 4. **High-volume convergence** samples multiple events (50+) from both sides to avoid premature convergence (a single sample can pass after only partial transfer).
 5. **Performance benchmarks** use the same pattern: sample event IDs from the sender, check arrival at the receiver via `has_event()`.
 

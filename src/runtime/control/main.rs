@@ -2545,7 +2545,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             println!("  Messages:  {} projected", data["messages_count"]);
             println!("  Reactions: {} projected", data["reactions_count"]);
             println!("  Recorded:  {} events", data["recorded_events_count"]);
-            println!("  NegItems:  {} indexed", data["neg_items_count"]);
+            println!(
+                "  SharedEventIndex:  {} indexed",
+                data["shared_event_index_count"]
+            );
             println!(
                 "  Runtime:   {}",
                 data["runtime_state"].as_str().unwrap_or("unknown")

@@ -268,7 +268,7 @@ mod tests {
             42,
         )
         .unwrap();
-        crate::db::store::insert_neg_item_if_shared(
+        crate::db::store::insert_shared_event_index_entry_if_shared(
             &conn,
             crate::event_modules::ShareScope::Shared,
             42,

@@ -1,5 +1,5 @@
-use super::*;
 use super::peer::Peer;
+use super::*;
 
 async fn poll_for_materialized_local_peer_signer(
     db_path: &str,

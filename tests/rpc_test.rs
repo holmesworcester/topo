@@ -163,7 +163,7 @@ fn rpc_response_success_roundtrip() {
         messages_count: 10,
         reactions_count: 3,
         recorded_events_count: 42,
-        neg_items_count: 42,
+        shared_event_index_count: 42,
         tenants: Vec::new(),
     };
     let resp = RpcResponse::success(data);

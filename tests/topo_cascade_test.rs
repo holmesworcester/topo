@@ -47,7 +47,7 @@ fn insert_event_raw(conn: &Connection, recorded_by: &str, blob: &[u8]) -> EventI
     )
     .unwrap();
     conn.execute(
-        "INSERT OR IGNORE INTO neg_items (ts, id) VALUES (?1, ?2)",
+        "INSERT OR IGNORE INTO shared_event_index (ts, id) VALUES (?1, ?2)",
         rusqlite::params![ts as i64, event_id.as_slice()],
     )
     .unwrap();

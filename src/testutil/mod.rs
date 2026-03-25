@@ -101,13 +101,13 @@ pub(crate) fn current_timestamp_ms() -> u64 {
 }
 
 mod convergence;
-mod peer;
 mod fingerprint;
-mod sync_harness;
+mod peer;
 mod shared_db;
+mod sync_harness;
 
 pub use convergence::*;
-pub use peer::*;
 pub use fingerprint::verify_projection_invariants;
-pub use sync_harness::*;
+pub use peer::*;
 pub use shared_db::*;
+pub use sync_harness::*;

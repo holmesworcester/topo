@@ -106,8 +106,10 @@ pub fn query_field(
         "reaction_count" => {
             reaction::count(db, recorded_by).map_err(|e| format!("query failed: {}", e))
         }
-        "neg_items_count" => db
-            .query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
+        "shared_event_index_count" => db
+            .query_row("SELECT COUNT(*) FROM shared_event_index", [], |row| {
+                row.get(0)
+            })
             .map_err(|e| format!("query failed: {}", e)),
         "recorded_events_count" => db
             .query_row(

@@ -72,7 +72,6 @@ fn assert_parse_error_rejection(
     assert_eq!(rej_count, 1, "rejected_events row must be recorded");
 }
 
-
 fn setup_workspace_anchor(conn: &Connection, recorded_by: &str) -> (EventId, SigningKey) {
     let mut rng = rand::thread_rng();
 
@@ -890,7 +889,7 @@ fn test_emit_cross_tenant_records_and_projects() {
 }
 
 #[test]
-fn test_emit_local_share_scope_no_neg_items() {
+fn test_emit_local_share_scope_no_shared_event_index() {
     use crate::projection::emit::emit_deterministic_event;
 
     let conn = setup();
@@ -925,13 +924,15 @@ fn test_emit_local_share_scope_no_neg_items() {
         .unwrap();
     assert_eq!(rec_count, 1);
 
-    // neg_items should have 0 rows (ShareScope::Local)
-    let neg_count: i64 = conn
-        .query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
+    // shared_event_index should have 0 rows (ShareScope::Local)
+    let shared_event_index_count: i64 = conn
+        .query_row("SELECT COUNT(*) FROM shared_event_index", [], |row| {
+            row.get(0)
+        })
         .unwrap();
     assert_eq!(
-        neg_count, 0,
-        "local-scope events must not be inserted into neg_items"
+        shared_event_index_count, 0,
+        "local-scope events must not be inserted into shared_event_index"
     );
 }
 

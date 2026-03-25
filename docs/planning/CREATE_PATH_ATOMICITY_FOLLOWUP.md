@@ -24,7 +24,7 @@ For any locally-created shared event, the following rows must be committed in
 one transaction or not at all:
 
 1. `events`
-2. `neg_items` when the event is shared
+2. `shared_event_index` when the event is shared
 3. `recorded_events`
 
 Local create no longer relies on create-side origin `project_queue` rows or

@@ -1277,8 +1277,8 @@ impl Peer {
         db.execute("BEGIN", []).expect("failed to begin");
         for i in 0..total_slices as u32 {
             // Use a single timestamp for both the blob's created_at and the
-            // neg_items ts. If these diverge, the sink's batch_writer (which
-            // extracts created_at from the blob) inserts a different neg_items
+            // shared_event_index ts. If these diverge, the sink's batch_writer (which
+            // extracts created_at from the blob) inserts a different shared_event_index
             // key than the source, causing negentropy to never converge.
             let created_at = current_timestamp_ms();
             let fs = ParsedEvent::FileSlice(FileSliceEvent {
@@ -1322,9 +1322,9 @@ impl Peer {
             let event_id = crate::crypto::hash_event(&blob);
             let event_id_b64 = event_id_to_base64(&event_id);
 
-            // Insert into events, neg_items, recorded_events — all use the
+            // Insert into events, shared_event_index, recorded_events — all use the
             // same created_at that is embedded in the blob so that the
-            // neg_items (ts, id) key matches what a receiving batch_writer
+            // shared_event_index (ts, id) key matches what a receiving batch_writer
             // would extract from the blob.
             db.execute(
                 "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
@@ -1332,7 +1332,7 @@ impl Peer {
                 rusqlite::params![&event_id_b64, "encrypted", blob.as_slice(), created_at as i64, created_at as i64],
             ).expect("failed to insert file_slice event");
             db.execute(
-                "INSERT OR IGNORE INTO neg_items (workspace_id, ts, id) VALUES (?1, ?2, ?3)",
+                "INSERT OR IGNORE INTO shared_event_index (workspace_id, ts, id) VALUES (?1, ?2, ?3)",
                 rusqlite::params![&workspace_id, created_at as i64, event_id.as_slice()],
             )
             .expect("failed to insert neg_item");
@@ -1471,11 +1471,13 @@ impl Peer {
         .unwrap_or(0)
     }
 
-    /// Count rows in the neg_items table (events advertised for sync).
-    pub fn neg_items_count(&self) -> i64 {
+    /// Count rows in the shared_event_index table (events advertised for sync).
+    pub fn shared_event_index_count(&self) -> i64 {
         let db = open_connection(&self.db_path).expect("failed to open db");
-        db.query_row("SELECT COUNT(*) FROM neg_items", [], |row| row.get(0))
-            .unwrap_or(0)
+        db.query_row("SELECT COUNT(*) FROM shared_event_index", [], |row| {
+            row.get(0)
+        })
+        .unwrap_or(0)
     }
 
     /// Check if a specific event_id (base64) exists in the events table.
@@ -1841,4 +1843,3 @@ impl Peer {
         fps
     }
 }
-

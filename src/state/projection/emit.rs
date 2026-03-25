@@ -5,7 +5,8 @@ use super::apply::project_one;
 use super::decision::ProjectionDecision;
 use crate::crypto::{event_id_to_base64, hash_event, EventId};
 use crate::db::store::{
-    insert_event, insert_neg_item_if_shared, insert_recorded_event_checked, lookup_workspace_id,
+    insert_event, insert_recorded_event_checked, insert_shared_event_index_entry_if_shared,
+    lookup_workspace_id,
 };
 use crate::event_modules::{self as events, registry, ParsedEvent};
 use crate::state::live_hints::{self, LiveHintEvent};
@@ -17,7 +18,7 @@ struct EmitOutcome {
 }
 
 /// Emit a deterministic event: compute blob, hash to event_id, check if already
-/// exists, if not: store in events/neg_items/recorded_events and project via project_one.
+/// exists, if not: store in events/shared_event_index/recorded_events and project via project_one.
 /// Returns the event_id regardless of whether it was newly created or already existed.
 ///
 /// This follows the emitted-event rule: "emit canonical event X only (to events +
@@ -98,10 +99,16 @@ fn emit_deterministic_blob_in_tx(
             lookup_workspace_id(conn, recorded_by)
         };
         if let Some(ws_id) = ws_id_for_neg {
-            insert_neg_item_if_shared(conn, meta.share_scope, created_at_ms, &event_id, &ws_id)?;
+            insert_shared_event_index_entry_if_shared(
+                conn,
+                meta.share_scope,
+                created_at_ms,
+                &event_id,
+                &ws_id,
+            )?;
         } else if meta.share_scope == crate::event_modules::registry::ShareScope::Shared {
             tracing::warn!(
-                "no accepted workspace binding for {}, shared event {} missing from neg_items",
+                "no accepted workspace binding for {}, shared event {} missing from shared_event_index",
                 recorded_by,
                 crate::crypto::event_id_to_base64(&event_id)
             );

@@ -39,7 +39,7 @@ fn now_ms() -> u64 {
 }
 
 /// In a shared DB, sibling tenants can already have the workspace's shared
-/// event history in `events`/`neg_items` even though this tenant has not yet
+/// event history in `events`/`shared_event_index` even though this tenant has not yet
 /// projected it into its own `valid_events` scope. Replay those shared events
 /// locally so same-workspace joins converge without waiting for a redundant
 /// network fetch that negentropy will not request.
@@ -77,13 +77,13 @@ fn replay_existing_workspace_shared_events_for_tenant(
         }
     }
 
-    // Source 2: Canonical shared blobs in neg_items that siblings haven't
+    // Source 2: Canonical shared blobs in shared_event_index that siblings haven't
     // projected yet (e.g. blocked on key_secret). These are needed because
     // the new tenant's projector may succeed where siblings are still
     // waiting (e.g. key_secret materializes via cascade during this replay).
     let mut ni_stmt = db.prepare(
         "SELECT ni.id
-         FROM neg_items ni
+         FROM shared_event_index ni
          WHERE ni.workspace_id = ?1
          ORDER BY ni.ts ASC, ni.id ASC",
     )?;

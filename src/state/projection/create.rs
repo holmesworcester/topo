@@ -5,7 +5,8 @@ use super::apply::project_one;
 use super::decision::ProjectionDecision;
 use crate::crypto::{event_id_to_base64, hash_event, EventId};
 use crate::db::store::{
-    insert_event, insert_neg_item_if_shared, insert_recorded_event, lookup_workspace_id,
+    insert_event, insert_recorded_event, insert_shared_event_index_entry_if_shared,
+    lookup_workspace_id,
 };
 use crate::event_modules::EncryptedEvent;
 use crate::event_modules::{self as events, registry, ParsedEvent, TransportPrivacy};
@@ -126,7 +127,7 @@ fn publish_live_hints_after_commit(
     }
 }
 
-/// Shared helper: hash blob, write to events/neg_items/recorded_events (no projection).
+/// Shared helper: hash blob, write to events/shared_event_index/recorded_events (no projection).
 /// Returns a `StoredBlob` with the event_id and any live hints to publish.
 /// Callers must invoke `project_stored_event` to trigger projection.
 fn store_blob_only(
@@ -161,11 +162,17 @@ fn store_blob_only(
     };
 
     if let Some(ref ws_id) = ws_id_for_neg {
-        insert_neg_item_if_shared(conn, meta.share_scope, created_at_ms, &event_id, ws_id)
-            .map_err(|e| CreateEventError::DbError(e.to_string()))?;
+        insert_shared_event_index_entry_if_shared(
+            conn,
+            meta.share_scope,
+            created_at_ms,
+            &event_id,
+            ws_id,
+        )
+        .map_err(|e| CreateEventError::DbError(e.to_string()))?;
     } else if meta.share_scope == crate::event_modules::registry::ShareScope::Shared {
         tracing::warn!(
-            "no accepted workspace binding for {}, shared event {} missing from neg_items",
+            "no accepted workspace binding for {}, shared event {} missing from shared_event_index",
             recorded_by,
             crate::crypto::event_id_to_base64(&event_id)
         );
@@ -278,7 +285,7 @@ where
     outcome.outcome.into_result()
 }
 
-/// Shared helper: hash blob, write to events/neg_items/recorded_events, project via project_one.
+/// Shared helper: hash blob, write to events/shared_event_index/recorded_events, project via project_one.
 fn store_blob_and_project(
     conn: &Connection,
     recorded_by: &str,
@@ -289,7 +296,7 @@ fn store_blob_and_project(
     store_blob_then_project_with(conn, recorded_by, blob, meta, created_at_ms, |_, _| Ok(()))
 }
 
-/// Create a new event: encode, hash, write to events/neg_items/recorded_events,
+/// Create a new event: encode, hash, write to events/shared_event_index/recorded_events,
 /// then project via `project_one`. Returns the event_id on success.
 pub fn create_event_synchronous(
     conn: &Connection,

@@ -13,7 +13,8 @@ use tracing::{error, info, warn};
 use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::db::open_connection;
 use crate::db::store::{
-    lookup_workspace_id, SQL_INSERT_EVENT, SQL_INSERT_NEG_ITEM, SQL_INSERT_RECORDED_EVENT,
+    lookup_workspace_id, SQL_INSERT_EVENT, SQL_INSERT_RECORDED_EVENT,
+    SQL_INSERT_SHARED_EVENT_INDEX_ENTRY,
 };
 use crate::event_modules::{self as events, registry};
 use crate::state::live_hints;
@@ -169,10 +170,10 @@ pub fn batch_writer(
         }
     };
 
-    let mut neg_items_stmt = match db.prepare(SQL_INSERT_NEG_ITEM) {
+    let mut shared_event_index_stmt = match db.prepare(SQL_INSERT_SHARED_EVENT_INDEX_ENTRY) {
         Ok(stmt) => stmt,
         Err(e) => {
-            error!("Failed to prepare neg_items statement: {}", e);
+            error!("Failed to prepare shared_event_index statement: {}", e);
             return;
         }
     };
@@ -271,7 +272,7 @@ pub fn batch_writer(
             &batch,
             reg,
             &mut workspace_cache,
-            &mut neg_items_stmt,
+            &mut shared_event_index_stmt,
             &mut recorded_stmt,
             &mut events_stmt,
             &mut enqueue_stmt,
@@ -323,9 +324,9 @@ pub fn ingest_now(db_path: &str, mut batch: Vec<IngestItem>) -> Result<usize, St
     }
 
     let db = open_connection(db_path).map_err(|e| format!("open ingest db: {e}"))?;
-    let mut neg_items_stmt = db
-        .prepare(SQL_INSERT_NEG_ITEM)
-        .map_err(|e| format!("prepare neg_items statement: {e}"))?;
+    let mut shared_event_index_stmt = db
+        .prepare(SQL_INSERT_SHARED_EVENT_INDEX_ENTRY)
+        .map_err(|e| format!("prepare shared_event_index statement: {e}"))?;
     let mut recorded_stmt = db
         .prepare(SQL_INSERT_RECORDED_EVENT)
         .map_err(|e| format!("prepare recorded_events statement: {e}"))?;
@@ -373,7 +374,7 @@ pub fn ingest_now(db_path: &str, mut batch: Vec<IngestItem>) -> Result<usize, St
         &batch,
         reg,
         &mut workspace_cache,
-        &mut neg_items_stmt,
+        &mut shared_event_index_stmt,
         &mut recorded_stmt,
         &mut events_stmt,
         &mut enqueue_stmt,

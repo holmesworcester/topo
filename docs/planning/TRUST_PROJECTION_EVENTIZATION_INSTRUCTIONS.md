@@ -88,7 +88,7 @@ Mapping:
 
 ### Usually NOT event-projection (keep operational/local)
 1. queue/lease state: `project_queue`, `egress_queue`, `wanted_events`
-2. reconciliation caches: `neg_items`
+2. reconciliation caches: `shared_event_index`
 3. runtime observations/telemetry: `peer_endpoint_observations`, `intro_attempts`, `peer_transport_bindings`
 4. transport certificate/key cache (`local_transport_creds`) and local routing cache (`local_transport_targets`) when they are derivable from event-projected signer state
 

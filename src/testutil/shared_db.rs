@@ -1,6 +1,6 @@
-use super::*;
-use super::peer::Peer;
 use super::fingerprint::verify_projection_invariants;
+use super::peer::Peer;
+use super::*;
 
 fn record_shared_db_events_for_tenant(
     db: &rusqlite::Connection,
@@ -74,7 +74,10 @@ pub(super) fn copy_projected_events_for_tenant(
     }
 }
 
-pub(super) fn list_shared_event_ids_for_tenant(db: &rusqlite::Connection, tenant_id: &str) -> Vec<EventId> {
+pub(super) fn list_shared_event_ids_for_tenant(
+    db: &rusqlite::Connection,
+    tenant_id: &str,
+) -> Vec<EventId> {
     db.prepare(
         "SELECT re.event_id
          FROM recorded_events re
@@ -616,7 +619,7 @@ pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_workspaces: &[(Strin
 // WHITE-BOX: deliberately copies events DB-to-DB for dedup/overlap benchmarks
 // ---------------------------------------------------------------------------
 
-/// Copy all events and neg_items from a source peer's database to target peers.
+/// Copy all events and shared_event_index from a source peer's database to target peers.
 ///
 /// This creates identical data at each target so that concurrent sync tests can
 /// verify dedup behavior when multiple sources offer the same events.
@@ -648,11 +651,11 @@ pub fn clone_events_to(source: &Peer, targets: &[&Peer]) {
         .collect::<Result<Vec<_>, _>>()
         .expect("failed to collect events");
 
-    // Read all neg_items (including workspace_id)
-    let mut neg_stmt = src_db
-        .prepare("SELECT workspace_id, ts, id FROM neg_items")
-        .expect("failed to prepare neg_items query");
-    let neg_items: Vec<(String, i64, Vec<u8>)> = neg_stmt
+    // Read all shared_event_index (including workspace_id)
+    let mut shared_event_index_stmt = src_db
+        .prepare("SELECT workspace_id, ts, id FROM shared_event_index")
+        .expect("failed to prepare shared_event_index query");
+    let shared_event_index: Vec<(String, i64, Vec<u8>)> = shared_event_index_stmt
         .query_map([], |row| {
             Ok((
                 row.get::<_, String>(0)?,
@@ -660,13 +663,13 @@ pub fn clone_events_to(source: &Peer, targets: &[&Peer]) {
                 row.get::<_, Vec<u8>>(2)?,
             ))
         })
-        .expect("failed to query neg_items")
+        .expect("failed to query shared_event_index")
         .collect::<Result<Vec<_>, _>>()
-        .expect("failed to collect neg_items");
+        .expect("failed to collect shared_event_index");
 
     for target in targets {
         let tgt_db = open_connection(&target.db_path).expect("failed to open target db");
-        // Use target's workspace_id so neg_items entries match the target's
+        // Use target's workspace_id so shared_event_index entries match the target's
         // neg_storage scope and don't create duplicates when the target later
         // receives the same events from sync (which inserts with target ws_id).
         let tgt_ws_id = crate::db::store::lookup_workspace_id(&tgt_db, &target.identity);
@@ -680,16 +683,15 @@ pub fn clone_events_to(source: &Peer, targets: &[&Peer]) {
             ).expect("failed to insert event");
         }
 
-        for (_workspace_id, ts, id) in &neg_items {
+        for (_workspace_id, ts, id) in &shared_event_index {
             tgt_db
                 .execute(
-                    "INSERT OR IGNORE INTO neg_items (workspace_id, ts, id) VALUES (?1, ?2, ?3)",
+                    "INSERT OR IGNORE INTO shared_event_index (workspace_id, ts, id) VALUES (?1, ?2, ?3)",
                     rusqlite::params![&tgt_ws_id, ts, id.as_slice()],
                 )
-                .expect("failed to insert neg_item");
+                .expect("failed to insert shared_event_index entry");
         }
 
         tgt_db.execute("COMMIT", []).expect("failed to commit");
     }
 }
-
