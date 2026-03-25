@@ -101,6 +101,9 @@ async fn run_dependency_control_loop(
                     | Frame::NegMsg { .. }
                     | Frame::DiscoveryHints { .. }
                     | Frame::IntroOffer { .. }
+                    | Frame::OpenSessionAuthPeerShared { .. }
+                    | Frame::OpenSessionAuthInvite { .. }
+                    | Frame::OpenSessionAuthAck { .. }
                     | Frame::Event { .. } => {}
                 }
             }

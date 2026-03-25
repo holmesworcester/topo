@@ -26,6 +26,7 @@ use crate::db::open_connection;
 use crate::db::transport_creds::discover_local_tenants;
 use crate::db::transport_trust::list_active_invite_bootstrap_targets;
 use crate::event_modules::workspace::invite_link::parse_bootstrap_address;
+use crate::transport::resolve_bootstrap_inviter_peer_id;
 
 // ---------------------------------------------------------------------------
 // Discovery dispatch (PeerDispatcher)
@@ -150,10 +151,19 @@ pub(crate) fn load_bootstrap_targets(
     tenant_ids: &[String],
 ) -> Result<Vec<(String, String, String, SocketAddr)>, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
+    let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
     let mut seen: HashSet<(String, String, SocketAddr)> = HashSet::new();
     let mut out = Vec::new();
     for tenant_id in tenant_ids {
         for target in list_active_invite_bootstrap_targets(&db, tenant_id)? {
+            if bootstrap_target_superseded_by_observed_endpoint(
+                &db,
+                tenant_id,
+                &target.invite_event_id,
+                now_ms,
+            )? {
+                continue;
+            }
             let addr_text = target.bootstrap_addr;
             match parse_bootstrap_address(&addr_text).and_then(|addr| addr.to_socket_addr()) {
                 Ok(addr) => {
@@ -269,6 +279,29 @@ pub(crate) fn load_observed_endpoint_targets(
     Ok(out)
 }
 
+fn bootstrap_target_superseded_by_observed_endpoint(
+    conn: &rusqlite::Connection,
+    tenant_id: &str,
+    invite_event_id: &str,
+    now_ms: i64,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let Some(peer_id) = resolve_bootstrap_inviter_peer_id(conn, tenant_id, invite_event_id)? else {
+        return Ok(false);
+    };
+    let has_live_observation: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM peer_endpoint_observations
+             WHERE recorded_by = ?1
+               AND via_peer_id = ?2
+               AND expires_at > ?3
+         )",
+        rusqlite::params![tenant_id, peer_id, now_ms],
+        |row| row.get(0),
+    )?;
+    Ok(has_live_observation)
+}
+
 /// Collect all observed-endpoint reconnect targets across all local tenants.
 pub(crate) fn collect_all_observed_endpoint_targets(
     db_path: &str,
@@ -362,6 +395,7 @@ mod tests {
     use crate::db::open_in_memory;
     use crate::db::schema::create_tables;
     use crate::db::{transport_creds, transport_trust};
+    use crate::event_modules::{encode_event, ParsedEvent, UserInviteEvent};
 
     fn seed_direct_bootstrap_tenant(
         conn: &rusqlite::Connection,
@@ -745,6 +779,9 @@ mod tests {
         let remote_pubkey = [0x44; 32];
         let remote_transport_fingerprint = spki_fingerprint_from_ed25519_pubkey(&remote_pubkey);
         let remote_peer_id = hex::encode(remote_transport_fingerprint);
+        let remote_daemon_fingerprint = [0xAA; 32];
+        let signer_event_id = [0x55; 32];
+        let signer_event_id_b64 = crate::crypto::event_id_to_base64(&signer_event_id);
         transport_trust::record_invite_bootstrap_trust(
             &conn,
             tenant_id,
@@ -752,7 +789,30 @@ mod tests {
             invite_event_id,
             &format!("ws-{tenant_id}"),
             "10.0.0.1:4433",
-            &remote_transport_fingerprint,
+            &remote_daemon_fingerprint,
+        )
+        .unwrap();
+        let invite_blob = encode_event(&ParsedEvent::UserInvite(UserInviteEvent {
+            created_at_ms: 1,
+            public_key: [0x11; 32],
+            workspace_id: [0x22; 32],
+            authority_event_id: [0x33; 32],
+            signed_by: signer_event_id,
+            signer_type: 5,
+            signature: [0u8; 64],
+        }))
+        .unwrap();
+        conn.execute(
+            "INSERT INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                invite_event_id,
+                "user_invite_shared",
+                invite_blob,
+                "shared",
+                1_i64,
+                1_i64
+            ],
         )
         .unwrap();
 
@@ -762,7 +822,7 @@ mod tests {
              VALUES (?1, ?2, ?3, ?4, ?5)",
             rusqlite::params![
                 tenant_id,
-                "ps-remote-observed",
+                signer_event_id_b64,
                 remote_pubkey.as_slice(),
                 remote_transport_fingerprint.as_slice(),
                 "remote-device",
@@ -783,20 +843,13 @@ mod tests {
             ],
         )
         .unwrap();
-
-        transport_trust::consume_bootstrap_for_transport_fingerprint(
-            &conn,
-            tenant_id,
-            &remote_transport_fingerprint,
-        )
-        .unwrap();
         drop(conn);
 
         let bootstrap_targets =
             load_bootstrap_targets(db_path.to_str().unwrap(), &[tenant_id.to_string()]).unwrap();
         assert!(
             bootstrap_targets.is_empty(),
-            "bootstrap targets should be cleared after peer_shared supersession"
+            "bootstrap targets should be suppressed once a canonical observed endpoint exists"
         );
 
         let observed_targets =

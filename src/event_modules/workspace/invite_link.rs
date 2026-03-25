@@ -7,7 +7,7 @@ use crate::crypto::EventId;
 
 const INVITE_PREFIX: &str = "topo://invite/";
 const LINK_PREFIX: &str = "topo://link/";
-const INVITE_LINK_VERSION: u8 = 4;
+const INVITE_LINK_VERSION: u8 = 5;
 
 /// Default QUIC sync port — omitted from display strings when matched.
 pub const DEFAULT_PORT: u16 = 4433;
@@ -248,7 +248,7 @@ pub struct ParsedInviteLink {
     pub workspace_id: EventId,
     pub invite_type: InviteType,
     pub bootstrap_addrs: Vec<BootstrapAddress>,
-    pub bootstrap_spki_fingerprint: [u8; 32],
+    pub daemon_spki_fingerprint: [u8; 32],
 }
 
 impl ParsedInviteLink {
@@ -278,16 +278,16 @@ pub enum InviteLinkError {
 }
 
 // ---------------------------------------------------------------------------
-// Plaintext invite link format (v4)
+// Plaintext invite link format (v5)
 //
 // All fields are hex-encoded and slash-delimited with self-explanatory labels.
 // No spaces, no base64 — fully readable and continuously linkifiable.
 //
 // User invite:
-//   topo://invite/v4/user/INVITE_ID.<hex64>/INVITE_PRIVKEY.<hex64>/WORKSPACE.<hex64>/PEER_SPKI_PUBKEY.<hex64>/ADDRESS.<a1>,<a2>
+//   topo://invite/v5/user/INVITE_ID.<hex64>/INVITE_PRIVKEY.<hex64>/WORKSPACE.<hex64>/DAEMON_SPKI_PUBKEY.<hex64>/ADDRESS.<a1>,<a2>
 //
 // Device-link invite:
-//   topo://link/v4/device_link/INVITE_ID.<hex64>/INVITE_PRIVKEY.<hex64>/WORKSPACE.<hex64>/USER_ID.<hex64>/PEER_SPKI_PUBKEY.<hex64>/ADDRESS.<a1>,<a2>
+//   topo://link/v5/device_link/INVITE_ID.<hex64>/INVITE_PRIVKEY.<hex64>/WORKSPACE.<hex64>/USER_ID.<hex64>/DAEMON_SPKI_PUBKEY.<hex64>/ADDRESS.<a1>,<a2>
 //
 // `ADDRESS.` may be empty, representing an invite that relies entirely on
 // later discovery/recovery rather than embedded bootstrap endpoints.
@@ -301,7 +301,7 @@ pub enum InviteLinkError {
 pub fn create_invite_link(
     invite: &InviteData,
     bootstrap_addrs: &[BootstrapAddress],
-    bootstrap_spki: &[u8; 32],
+    daemon_spki: &[u8; 32],
 ) -> Result<String, InviteLinkError> {
     for addr in bootstrap_addrs {
         addr.validate()?;
@@ -319,7 +319,7 @@ pub fn create_invite_link(
     let addr_tokens: Vec<String> = bootstrap_addrs.iter().map(|a| a.to_link_token()).collect();
 
     Ok(format!(
-        "{prefix}v{ver}/{kind}/INVITE_ID.{eid}/INVITE_PRIVKEY.{key}/WORKSPACE.{wid}{uid}/PEER_SPKI_PUBKEY.{spki}/ADDRESS.{addrs}",
+        "{prefix}v{ver}/{kind}/INVITE_ID.{eid}/INVITE_PRIVKEY.{key}/WORKSPACE.{wid}{uid}/DAEMON_SPKI_PUBKEY.{spki}/ADDRESS.{addrs}",
         prefix = prefix,
         ver = INVITE_LINK_VERSION,
         kind = kind_str,
@@ -327,7 +327,7 @@ pub fn create_invite_link(
         key = hex::encode(invite.invite_key.to_bytes()),
         wid = hex::encode(invite.workspace_id),
         uid = user_segment.as_deref().unwrap_or(""),
-        spki = hex::encode(bootstrap_spki),
+        spki = hex::encode(daemon_spki),
         addrs = addr_tokens.join(","),
     ))
 }
@@ -392,7 +392,7 @@ pub fn parse_invite_link(link: &str) -> Result<ParsedInviteLink, InviteLinkError
     let invite_event_id = require_hex32("INVITE_ID.", "invite_event_id")?;
     let invite_private_key = require_hex32("INVITE_PRIVKEY.", "invite_private_key")?;
     let workspace_id = require_hex32("WORKSPACE.", "workspace_id")?;
-    let bootstrap_spki_fingerprint = require_hex32("PEER_SPKI_PUBKEY.", "bootstrap_spki")?;
+    let daemon_spki_fingerprint = require_hex32("DAEMON_SPKI_PUBKEY.", "daemon_spki")?;
 
     // Addresses
     let addr_str = find_field("ADDRESS.")
@@ -436,7 +436,7 @@ pub fn parse_invite_link(link: &str) -> Result<ParsedInviteLink, InviteLinkError
         workspace_id,
         invite_type,
         bootstrap_addrs,
-        bootstrap_spki_fingerprint,
+        daemon_spki_fingerprint,
     })
 }
 
@@ -456,7 +456,7 @@ pub fn rewrite_bootstrap_addrs(
         workspace_id: parsed.workspace_id,
         invite_type: parsed.invite_type,
     };
-    create_invite_link(&invite_data, new_addrs, &parsed.bootstrap_spki_fingerprint)
+    create_invite_link(&invite_data, new_addrs, &parsed.daemon_spki_fingerprint)
 }
 
 /// Detect non-loopback IPv4/IPv6 addresses on this machine, suitable for
@@ -514,7 +514,7 @@ mod tests {
         assert!(link.contains("/INVITE_ID."));
         assert!(link.contains("/INVITE_PRIVKEY."));
         assert!(link.contains("/WORKSPACE."));
-        assert!(link.contains("/PEER_SPKI_PUBKEY."));
+        assert!(link.contains("/DAEMON_SPKI_PUBKEY."));
         assert!(link.contains("/ADDRESS."));
         assert!(!link.contains(' '));
 
@@ -524,7 +524,7 @@ mod tests {
         assert_eq!(parsed.invite_private_key, invite.invite_key.to_bytes());
         assert_eq!(parsed.workspace_id, invite.workspace_id);
         assert_eq!(parsed.bootstrap_addrs, bootstrap_addrs);
-        assert_eq!(parsed.bootstrap_spki_fingerprint, bootstrap_spki);
+        assert_eq!(parsed.daemon_spki_fingerprint, bootstrap_spki);
         assert!(matches!(parsed.invite_type, InviteType::User));
     }
 
@@ -589,7 +589,7 @@ mod tests {
         assert_eq!(parsed.invite_private_key, invite.invite_key.to_bytes());
         assert_eq!(parsed.workspace_id, invite.workspace_id);
         assert_eq!(parsed.bootstrap_addrs, bootstrap_addrs);
-        assert_eq!(parsed.bootstrap_spki_fingerprint, bootstrap_spki);
+        assert_eq!(parsed.daemon_spki_fingerprint, bootstrap_spki);
         match parsed.invite_type {
             InviteType::DeviceLink {
                 user_event_id: parsed_user_event_id,
@@ -681,7 +681,7 @@ mod tests {
         assert!(link.ends_with("/ADDRESS."));
         let parsed = parse_invite_link(&link).unwrap();
         assert!(parsed.bootstrap_addrs.is_empty());
-        assert_eq!(parsed.bootstrap_spki_fingerprint, bootstrap_spki);
+        assert_eq!(parsed.daemon_spki_fingerprint, bootstrap_spki);
     }
 
     #[test]

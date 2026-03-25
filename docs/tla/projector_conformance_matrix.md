@@ -208,10 +208,10 @@ both `pass` and `break` polarity unless waived.
 
 | spec_id | source | check_id | layer | test_id | polarity |
 |---------|--------|----------|-------|---------|----------|
-| SPEC_ETT_INBOUND_01 | InvInboundAdmittedAuthorized | CHK_ETT_INBOUND_EXACT_TARGET | runtime_unit | runtime::peering::loops::accept::tests::requested_tenant_auth_accepts_when_that_tenant_authorizes_remote_peer | pass |
-| SPEC_ETT_INBOUND_01 | InvInboundAdmittedAuthorized | CHK_ETT_INBOUND_EXACT_TARGET | runtime_unit | runtime::peering::loops::accept::tests::requested_tenant_auth_does_not_fallback_to_other_authorizing_tenants | break |
-| SPEC_ETT_CROSS_TENANT_01 | InvNoCrossTenantFallback | CHK_ETT_NO_CROSS_TENANT_FALLBACK | runtime_unit | runtime::peering::loops::accept::tests::requested_tenant_auth_accepts_when_that_tenant_authorizes_remote_peer | pass |
-| SPEC_ETT_CROSS_TENANT_01 | InvNoCrossTenantFallback | CHK_ETT_NO_CROSS_TENANT_FALLBACK | runtime_unit | runtime::peering::loops::accept::tests::requested_tenant_auth_does_not_fallback_to_other_authorizing_tenants | break |
+| SPEC_ETT_INBOUND_01 | InvInboundAdmittedAuthorized | CHK_ETT_INBOUND_EXACT_TARGET | runtime_unit | runtime::transport::session_auth::tests::open_session_auth_peer_shared_accepts_authorized_target_tenant | pass |
+| SPEC_ETT_INBOUND_01 | InvInboundAdmittedAuthorized | CHK_ETT_INBOUND_EXACT_TARGET | runtime_unit | runtime::transport::session_auth::tests::open_session_auth_peer_shared_rejects_when_only_other_tenant_authorizes_remote_peer | break |
+| SPEC_ETT_CROSS_TENANT_01 | InvNoCrossTenantFallback | CHK_ETT_NO_CROSS_TENANT_FALLBACK | runtime_unit | runtime::transport::session_auth::tests::open_session_auth_peer_shared_accepts_authorized_target_tenant | pass |
+| SPEC_ETT_CROSS_TENANT_01 | InvNoCrossTenantFallback | CHK_ETT_NO_CROSS_TENANT_FALLBACK | runtime_unit | runtime::transport::session_auth::tests::open_session_auth_peer_shared_rejects_when_only_other_tenant_authorizes_remote_peer | break |
 | SPEC_ETT_OUTBOUND_01 | InvOutboundConnectedAuthorized | CHK_ETT_OUTBOUND_EXACT_REMOTE | runtime_unit | runtime::transport::tests::test_server_verifier_requires_exact_transport_target_sni | pass |
 | SPEC_ETT_OUTBOUND_01 | InvOutboundConnectedAuthorized | CHK_ETT_OUTBOUND_EXACT_REMOTE | runtime_unit | runtime::transport::tests::test_server_verifier_rejects_mismatched_exact_transport_target | break |
 

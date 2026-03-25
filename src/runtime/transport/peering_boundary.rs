@@ -5,9 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
-use std::sync::Arc;
 
-use ed25519_dalek::SigningKey;
 use rusqlite::OptionalExtension;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
 
@@ -22,12 +20,14 @@ use crate::protocol::{encode_frame, Frame};
 use super::connection_lifecycle::{
     accept_peer, dial_peer, ConnectedPeer, ConnectionLifecycleError,
 };
-use super::multi_workspace::TransportTargetCertResolver;
 use super::session_factory::{
     accept_session_io, open_dependency_session_io, open_session_io, InboundSessionState,
     SessionClass, SessionOpenError,
 };
-use super::{create_single_port_endpoint, workspace_client_config, DynamicAllowFn};
+use super::{
+    create_single_port_endpoint_with_identity, ensure_daemon_identity_from_db,
+    load_daemon_identity_from_db, workspace_client_config_with_identity,
+};
 
 pub type TransportEndpoint = quinn::Endpoint;
 pub type TransportConnection = quinn::Connection;
@@ -89,6 +89,11 @@ impl SessionProvider {
         self.connection.clone()
     }
 
+    pub fn with_peer_id(mut self, peer_id: String) -> Self {
+        self.peer_id = peer_id;
+        self
+    }
+
     pub async fn next_session(&self) -> Result<SessionEnvelope, SessionOpenError> {
         let (session_id, class, io) = match self.mode {
             SessionOpenMode::Outbound => {
@@ -111,41 +116,17 @@ impl SessionProvider {
 
 pub fn create_runtime_endpoint_for_tenants(
     bind_addr: SocketAddr,
-    cert_resolver: Arc<TransportTargetCertResolver>,
     db_path: &str,
-    default_client_cert: CertificateDer<'static>,
-    default_client_key: PrivatePkcs8KeyDer<'static>,
 ) -> Result<TransportEndpoint, Box<dyn std::error::Error + Send + Sync>> {
-    // Dynamic allow: queries projected trust rows on each TLS handshake.
-    // No frozen tenant list, and no local-tenant discovery on the auth path.
-    // Inbound auth is now the node-scoped SQL predicate:
-    // "does any local tenant currently authorize this fingerprint?"
-    let db_path = db_path.to_string();
-    let dynamic_allow: Arc<DynamicAllowFn> = Arc::new(move |peer_fp: &[u8; 32]| {
-        let db = open_connection(&db_path)?;
-        is_authorized_for_node(&db, peer_fp)
-    });
-
-    create_single_port_endpoint(
-        bind_addr,
-        cert_resolver,
-        dynamic_allow,
-        default_client_cert,
-        default_client_key,
-    )
+    let (_daemon_peer_id, cert_der, key_der) = load_daemon_identity_from_db(db_path)?;
+    create_single_port_endpoint_with_identity(bind_addr, cert_der, key_der)
 }
 
 pub fn build_tenant_client_config_from_creds(
-    db_path: &str,
-    tenant_id: &str,
     cert_der: CertificateDer<'static>,
     key_der: PrivatePkcs8KeyDer<'static>,
 ) -> Result<TransportClientConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let db_path = db_path.to_string();
-    let tenant_id = tenant_id.to_string();
-    let tenant_allow: Arc<DynamicAllowFn> =
-        Arc::new(move |peer_fp: &[u8; 32]| tenant_trusts_peer(&db_path, &tenant_id, *peer_fp));
-    workspace_client_config(cert_der, key_der, tenant_allow)
+    workspace_client_config_with_identity(cert_der, key_der)
 }
 
 pub fn build_tenant_client_config_from_db(
@@ -153,35 +134,31 @@ pub fn build_tenant_client_config_from_db(
     tenant_id: &str,
 ) -> Result<TransportClientConfig, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
-    let tenants = discover_local_tenants(&db)?;
-    let tenant = tenants
+    let tenant_exists = discover_local_tenants(&db)?
         .into_iter()
-        .find(|t| t.peer_id == tenant_id)
-        .ok_or_else(|| format!("local creds missing for tenant {}", tenant_id))?;
-    let cert_der = tenant.cert_der;
-    let key_der = tenant.key_der;
+        .any(|tenant| tenant.peer_id == tenant_id);
     drop(db);
 
-    let cert_der = CertificateDer::from(cert_der);
-    let key_der = PrivatePkcs8KeyDer::from(key_der);
-    build_tenant_client_config_from_creds(db_path, tenant_id, cert_der, key_der)
+    if !tenant_exists {
+        return Err(format!("local creds missing for tenant {}", tenant_id).into());
+    }
+
+    let (_daemon_peer_id, cert_der, key_der) = ensure_daemon_identity_from_db(db_path)?;
+    build_tenant_client_config_from_creds(cert_der, key_der)
 }
 
 fn build_bootstrap_fallback_config_from_key_bytes(
-    db_path: &str,
-    tenant_id: &str,
+    _db_path: &str,
+    _tenant_id: &str,
     key_bytes: Vec<u8>,
 ) -> Result<Option<TransportClientConfig>, Box<dyn std::error::Error + Send + Sync>> {
     if key_bytes.len() != 32 {
         return Ok(None);
     }
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&key_bytes);
-    let signing_key = SigningKey::from_bytes(&key);
-    let (cert_der, key_der) =
-        crate::transport::generate_self_signed_cert_from_signing_key(&signing_key)?;
-    let cfg = build_tenant_client_config_from_creds(db_path, tenant_id, cert_der, key_der)?;
-    Ok(Some(cfg))
+    // Daemon-scoped transport no longer derives a bootstrap-only client cert
+    // from invite secrets. Invite bootstrap now authenticates in the first
+    // encrypted session-auth frame instead.
+    Ok(None)
 }
 
 /// Build an optional bootstrap-fallback client config for a tenant + invite.
@@ -273,6 +250,45 @@ pub fn node_trusts_peer(
 ) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
     is_authorized_for_node(&db, &peer_fp)
+}
+
+pub fn tenant_trusts_daemon_peer(
+    db_path: &str,
+    tenant_id: &str,
+    daemon_fp: [u8; 32],
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let db = open_connection(db_path)?;
+    if is_authorized_for_tenant(&db, tenant_id, &daemon_fp)? {
+        return Ok(true);
+    }
+
+    let mut stmt = db.prepare(
+        "SELECT peer_id
+         FROM peer_transport_bindings
+         WHERE recorded_by = ?1
+           AND spki_fingerprint = ?2",
+    )?;
+    let peer_ids = stmt
+        .query_map(rusqlite::params![tenant_id, daemon_fp.as_slice()], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    for peer_id in peer_ids {
+        let Ok(bytes) = hex::decode(&peer_id) else {
+            continue;
+        };
+        if bytes.len() != 32 {
+            continue;
+        }
+        let mut peer_fp = [0u8; 32];
+        peer_fp.copy_from_slice(&bytes);
+        if is_authorized_for_tenant(&db, tenant_id, &peer_fp)? {
+            return Ok(true);
+        }
+    }
+
+    Ok(false)
 }
 
 pub fn resolve_trusting_tenant(
@@ -537,7 +553,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_fallback_client_config_present_when_active_invite_secret_exists() {
+    fn bootstrap_fallback_client_config_absent_when_active_invite_secret_exists() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("fallback_cfg.sqlite3");
         let db = open_connection(&db_path).unwrap();
@@ -580,8 +596,8 @@ mod tests {
         )
         .expect("fallback config query should succeed");
         assert!(
-            cfg.is_some(),
-            "active invite_secret should yield fallback config"
+            cfg.is_none(),
+            "daemon-scoped transport should not derive bootstrap-only client configs"
         );
     }
 
@@ -605,7 +621,7 @@ mod tests {
     }
 
     #[test]
-    fn bootstrap_fallback_client_config_for_invite_is_invite_specific() {
+    fn bootstrap_fallback_client_config_for_invite_returns_none_under_daemon_transport() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("fallback_cfg_specific.sqlite3");
         let db = open_connection(&db_path).unwrap();
@@ -657,8 +673,14 @@ mod tests {
             "invite-b",
         )
         .expect("invite-b fallback should query");
-        assert!(cfg_a.is_some(), "invite-a fallback must resolve");
-        assert!(cfg_b.is_some(), "invite-b fallback must resolve");
+        assert!(
+            cfg_a.is_none(),
+            "invite-a should not produce a transport-level bootstrap fallback config"
+        );
+        assert!(
+            cfg_b.is_none(),
+            "invite-b should not produce a transport-level bootstrap fallback config"
+        );
     }
 
     #[tokio::test]

@@ -13,7 +13,7 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cli_harness::{
     accept_invite_with_identity_on_running_daemon, create_invite_with_spki,
-    create_workspace_with_details, daemon_listen_addr, daemon_transport_fingerprint,
+    create_workspace_with_details, daemon_identity_fingerprint, daemon_listen_addr,
     ensure_active_peer, generate_messages, message_count_sql, random_port,
     start_daemon_with_options, stop_daemon, wait_for_daemon_stopped, DaemonOptions,
 };
@@ -246,7 +246,7 @@ fn run_tiered_window_bench() {
     let invite_link = create_invite_with_spki(
         &alice_db,
         &invite_addr,
-        Some(&daemon_transport_fingerprint(&alice_db)),
+        Some(&daemon_identity_fingerprint(&alice_db)),
     );
     let mut bob_daemon = start_daemon_with_options(
         &bob_db,

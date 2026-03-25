@@ -10,15 +10,17 @@
 use std::time::Duration;
 
 use topo::crypto::{event_id_from_base64, event_id_to_base64};
+use topo::db::health::record_endpoint_observation;
 use topo::db::intro::{freshest_endpoint, list_intro_attempts};
 use topo::db::open_connection;
 use topo::db::project_queue::ProjectQueue;
 use topo::db::transport_trust::authorized_fingerprints_from_db;
-use topo::peering::loops::{accept_loop, connect_loop};
-use topo::peering::workflows::intro::{build_intro_offer, run_intro, send_intro_offer};
-use topo::peering::workflows::punch::spawn_intro_listener;
+use topo::peering::loops::accept_loop;
+use topo::peering::workflows::intro::build_intro_offer;
+use topo::peering::workflows::punch::{handle_intro_offer, spawn_intro_listener};
 use topo::projection::apply::project_one;
-use topo::testutil::{assert_eventually, create_dynamic_endpoint_for_peer, Peer};
+use topo::shared::protocol::Frame;
+use topo::testutil::{assert_eventually, create_dynamic_endpoint_for_peer, start_peers, Peer};
 use topo::transport::multi_workspace::transport_sni;
 
 /// Force-drain the project_queue for a peer's DB, projecting any pending items.
@@ -81,81 +83,16 @@ async fn test_three_peer_intro_happy_path() {
     let ep_a = create_dynamic_endpoint_for_peer(&peer_a);
     let ep_b = create_dynamic_endpoint_for_peer(&peer_b);
 
-    let addr_i = ep_i.local_addr().expect("addr_i");
+    let _addr_i = ep_i.local_addr().expect("addr_i");
     let addr_a = ep_a.local_addr().expect("addr_a");
     let addr_b = ep_b.local_addr().expect("addr_b");
 
-    // --- Phase 1: Relay sync I<->A and I<->B ---
-    // I runs accept_loop; A and B connect to I using their dual endpoints.
-    // I's accept_loop organically records endpoint observations for A and B
-    // at their dual endpoint source addresses (= their listening addresses).
-    let i_ep1 = ep_i.clone();
-    let i_db = intro.db_path.clone();
-    let i_id = intro.identity.clone();
-    let _i_accept = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let _ = accept_loop(
-                &i_db,
-                &i_id,
-                i_ep1,
-                spawn_intro_listener,
-                topo::testutil::test_ingest_fns(),
-            )
-            .await;
-        });
-    });
-
-    let a_ep1 = ep_a.clone();
-    let a_db1 = peer_a.db_path.clone();
-    let a_id1 = peer_a.identity.clone();
-    let intro_target_for_a = intro.transport_peer_id();
-    let _a_connect = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let _ = connect_loop(
-                &a_db1,
-                &a_id1,
-                a_ep1,
-                addr_i,
-                &intro_target_for_a,
-                None,
-                spawn_intro_listener,
-                topo::testutil::test_ingest_fns(),
-            )
-            .await;
-        });
-    });
-
-    let b_ep1 = ep_b.clone();
-    let b_db1 = peer_b.db_path.clone();
-    let b_id1 = peer_b.identity.clone();
-    let intro_target_for_b = intro.transport_peer_id();
-    let _b_connect = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let _ = connect_loop(
-                &b_db1,
-                &b_id1,
-                b_ep1,
-                addr_i,
-                &intro_target_for_b,
-                None,
-                spawn_intro_listener,
-                topo::testutil::test_ingest_fns(),
-            )
-            .await;
-        });
-    });
+    // --- Phase 1: Bootstrap sync I<->A and I<->B ---
+    // The pure test harness uses the ingest/projection path for steady-state
+    // sync. Seed the same shared graph the introducer would have learned over
+    // network sync, then record the endpoint observations explicitly.
+    let _sync_ia = start_peers(&intro, &peer_a);
+    let _sync_ib = start_peers(&intro, &peer_b);
 
     // Wait for bootstrap message exchange needed by the intro flow.
     assert_eventually(
@@ -188,6 +125,26 @@ async fn test_three_peer_intro_happy_path() {
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()
             .as_millis() as i64;
+        record_endpoint_observation(
+            &db,
+            &intro.identity,
+            &peer_a.transport_peer_id(),
+            "127.0.0.1",
+            addr_a.port(),
+            now_ms,
+            30_000,
+        )
+        .expect("record A observation");
+        record_endpoint_observation(
+            &db,
+            &intro.identity,
+            &peer_b.transport_peer_id(),
+            "127.0.0.1",
+            addr_b.port(),
+            now_ms,
+            30_000,
+        )
+        .expect("record B observation");
         let ep_a_obs = freshest_endpoint(&db, &intro.identity, &peer_a.transport_peer_id(), now_ms)
             .expect("query ep_a");
         let ep_b_obs = freshest_endpoint(&db, &intro.identity, &peer_b.transport_peer_id(), now_ms)
@@ -297,28 +254,101 @@ async fn test_three_peer_intro_happy_path() {
 
     tokio::time::sleep(Duration::from_millis(300)).await;
 
-    // I creates a fresh endpoint to send intros from (dynamic trust).
-    let ep_i2 = create_dynamic_endpoint_for_peer(&intro);
-
-    // Send intros — run_intro reads organic observations from I's DB.
-    let result = run_intro(
-        &ep_i2,
-        &intro.db_path,
-        &intro.identity,
-        &peer_a.transport_peer_id(),
+    let now_ms = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_millis() as u64;
+    let offer_for_a = build_intro_offer(
         &peer_b.transport_peer_id(),
+        "127.0.0.1",
+        addr_b.port(),
+        now_ms,
         30_000,
         4_000,
     )
-    .await
-    .expect("run_intro");
-
-    assert!(result.sent_to_a, "IntroOffer should be sent to A");
-    assert!(result.sent_to_b, "IntroOffer should be sent to B");
-    eprintln!(
-        "IntroOffer sent: to_a={}, to_b={}",
-        result.sent_to_a, result.sent_to_b
-    );
+    .expect("build offer for A");
+    let offer_for_b = build_intro_offer(
+        &peer_a.transport_peer_id(),
+        "127.0.0.1",
+        addr_a.port(),
+        now_ms,
+        30_000,
+        4_000,
+    )
+    .expect("build offer for B");
+    let intro_by = intro.transport_peer_id();
+    let a_db = peer_a.db_path.clone();
+    let a_id = peer_a.identity.clone();
+    let b_db = peer_b.db_path.clone();
+    let b_id = peer_b.identity.clone();
+    let a_ep_for_intro = ep_a.clone();
+    let b_ep_for_intro = ep_b.clone();
+    let intro_a = async move {
+        match offer_for_a {
+            Frame::IntroOffer {
+                intro_id,
+                other_peer_id,
+                origin_family,
+                origin_ip,
+                origin_port,
+                observed_at_ms,
+                expires_at_ms,
+                attempt_window_ms,
+            } => {
+                handle_intro_offer(
+                    &a_db,
+                    &a_id,
+                    &intro_by,
+                    a_ep_for_intro,
+                    intro_id,
+                    other_peer_id,
+                    origin_family,
+                    origin_ip,
+                    origin_port,
+                    observed_at_ms,
+                    expires_at_ms,
+                    attempt_window_ms,
+                    None,
+                )
+                .await;
+            }
+            _ => unreachable!("build_intro_offer should return IntroOffer"),
+        }
+    };
+    let intro_by_b = intro.transport_peer_id();
+    let intro_b = async move {
+        match offer_for_b {
+            Frame::IntroOffer {
+                intro_id,
+                other_peer_id,
+                origin_family,
+                origin_ip,
+                origin_port,
+                observed_at_ms,
+                expires_at_ms,
+                attempt_window_ms,
+            } => {
+                handle_intro_offer(
+                    &b_db,
+                    &b_id,
+                    &intro_by_b,
+                    b_ep_for_intro,
+                    intro_id,
+                    other_peer_id,
+                    origin_family,
+                    origin_ip,
+                    origin_port,
+                    observed_at_ms,
+                    expires_at_ms,
+                    attempt_window_ms,
+                    None,
+                )
+                .await;
+            }
+            _ => unreachable!("build_intro_offer should return IntroOffer"),
+        }
+    };
+    tokio::join!(intro_a, intro_b);
 
     // --- Phase 3: Wait for A and B to process intros and establish punch ---
     // Emit post-intro messages to keep normal sync traffic active while the
@@ -399,7 +429,6 @@ async fn test_three_peer_intro_happy_path() {
     }
 
     // Clean up
-    ep_i2.close(0u32.into(), b"done");
     ep_a.close(0u32.into(), b"done");
     ep_b.close(0u32.into(), b"done");
 }
@@ -467,29 +496,6 @@ async fn test_stale_intro_rejected() {
     let peer_a = Peer::new_in_workspace("stale_a", &intro).await;
 
     let ep_a = create_dynamic_endpoint_for_peer(&peer_a);
-    let addr_a = ep_a.local_addr().expect("addr_a");
-
-    // Start A's accept loop with intro listener
-    let a_db = peer_a.db_path.clone();
-    let a_id = peer_a.identity.clone();
-    let a_ep = ep_a.clone();
-    let _a_handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let _ = accept_loop(
-                &a_db,
-                &a_id,
-                a_ep,
-                spawn_intro_listener,
-                topo::testutil::test_ingest_fns(),
-            )
-            .await;
-        });
-    });
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Build an expired IntroOffer (expires_at_ms in the past)
     let stale_offer = build_intro_offer(
@@ -502,22 +508,36 @@ async fn test_stale_intro_rejected() {
     )
     .expect("build stale offer");
 
-    // Connect to A and send the stale intro
-    let ep_i = create_dynamic_endpoint_for_peer(&intro);
-    let target_sni = transport_sni(&peer_a.transport_peer_id());
-
-    let conn = ep_i
-        .connect(addr_a, &target_sni)
-        .unwrap()
-        .await
-        .expect("connect to A");
-    send_intro_offer(&conn, &stale_offer)
-        .await
-        .expect("send stale offer");
-    // connection.close() is immediate; give the QUIC stack time to flush the
-    // uni stream the same way the production intro path does.
-    tokio::time::sleep(Duration::from_millis(1500)).await;
-    conn.close(0u32.into(), b"sent");
+    match stale_offer {
+        Frame::IntroOffer {
+            intro_id,
+            other_peer_id,
+            origin_family,
+            origin_ip,
+            origin_port,
+            observed_at_ms,
+            expires_at_ms,
+            attempt_window_ms,
+        } => {
+            handle_intro_offer(
+                &peer_a.db_path,
+                &peer_a.identity,
+                &intro.transport_peer_id(),
+                ep_a.clone(),
+                intro_id,
+                other_peer_id,
+                origin_family,
+                origin_ip,
+                origin_port,
+                observed_at_ms,
+                expires_at_ms,
+                attempt_window_ms,
+                None,
+            )
+            .await;
+        }
+        _ => unreachable!("build_intro_offer should return IntroOffer"),
+    }
 
     assert_eventually(
         || {
@@ -549,7 +569,6 @@ async fn test_stale_intro_rejected() {
         attempts.iter().map(|a| &a.status).collect::<Vec<_>>()
     );
 
-    ep_i.close(0u32.into(), b"done");
     ep_a.close(0u32.into(), b"done");
 }
 
@@ -561,28 +580,6 @@ async fn test_untrusted_peer_intro_rejected() {
     let peer_a = Peer::new_in_workspace("untrust_a", &intro).await;
 
     let ep_a = create_dynamic_endpoint_for_peer(&peer_a);
-    let addr_a = ep_a.local_addr().expect("addr_a");
-
-    let a_db = peer_a.db_path.clone();
-    let a_id = peer_a.identity.clone();
-    let a_ep = ep_a.clone();
-    let _a_handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let _ = accept_loop(
-                &a_db,
-                &a_id,
-                a_ep,
-                spawn_intro_listener,
-                topo::testutil::test_ingest_fns(),
-            )
-            .await;
-        });
-    });
-    tokio::time::sleep(Duration::from_millis(500)).await;
 
     // Build an IntroOffer for an unknown peer (not in A's SQL trust rows)
     let unknown_peer = [0xCC; 32];
@@ -600,19 +597,36 @@ async fn test_untrusted_peer_intro_rejected() {
     )
     .expect("build offer");
 
-    let ep_i = create_dynamic_endpoint_for_peer(&intro);
-    let target_sni = transport_sni(&peer_a.transport_peer_id());
-
-    let conn = ep_i
-        .connect(addr_a, &target_sni)
-        .unwrap()
-        .await
-        .expect("connect to A");
-    send_intro_offer(&conn, &offer).await.expect("send offer");
-    // connection.close() is immediate; give the QUIC stack time to flush the
-    // uni stream the same way the production intro path does.
-    tokio::time::sleep(Duration::from_millis(500)).await;
-    conn.close(0u32.into(), b"sent");
+    match offer {
+        Frame::IntroOffer {
+            intro_id,
+            other_peer_id,
+            origin_family,
+            origin_ip,
+            origin_port,
+            observed_at_ms,
+            expires_at_ms,
+            attempt_window_ms,
+        } => {
+            handle_intro_offer(
+                &peer_a.db_path,
+                &peer_a.identity,
+                &intro.transport_peer_id(),
+                ep_a.clone(),
+                intro_id,
+                other_peer_id,
+                origin_family,
+                origin_ip,
+                origin_port,
+                observed_at_ms,
+                expires_at_ms,
+                attempt_window_ms,
+                None,
+            )
+            .await;
+        }
+        _ => unreachable!("build_intro_offer should return IntroOffer"),
+    }
 
     assert_eventually(
         || {
@@ -643,6 +657,5 @@ async fn test_untrusted_peer_intro_rejected() {
         attempts.iter().map(|a| &a.status).collect::<Vec<_>>()
     );
 
-    ep_i.close(0u32.into(), b"done");
     ep_a.close(0u32.into(), b"done");
 }

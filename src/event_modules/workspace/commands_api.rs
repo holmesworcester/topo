@@ -7,7 +7,6 @@ use super::commands::{
     join_workspace_as_new_user, persist_join_peer_secret, persist_link_peer_secret,
 };
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
-use crate::db::transport_creds;
 use crate::service::{open_db_for_peer, open_db_load};
 
 #[derive(Debug, Serialize, Deserialize)]
@@ -111,26 +110,14 @@ fn decode_hex32(
 
 fn resolve_invite_bootstrap_spki(
     db: &Connection,
-    recorded_by: &str,
     public_spki_hex: Option<&str>,
 ) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
     if let Some(spki_hex) = public_spki_hex {
         return decode_hex32(spki_hex, "SPKI");
     }
 
-    if let Some(target) = transport_creds::resolve_tenant_transport_target(db, recorded_by)? {
-        return decode_hex32(&target.transport_peer_id, "transport_peer_id");
-    }
-
-    if transport_creds::load_local_creds(db, recorded_by)?.is_some() {
-        return decode_hex32(recorded_by, "peer_id");
-    }
-
-    Err(format!(
-        "no local transport target is materialized for tenant {}; cannot create invite",
-        recorded_by
-    )
-    .into())
+    let (daemon_peer_id, _cert, _key) = crate::transport::ensure_daemon_identity(db)?;
+    decode_hex32(&daemon_peer_id, "daemon_peer_id")
 }
 
 // DB-path-level command wrappers (moved from service.rs)
@@ -169,6 +156,7 @@ fn create_invite_for_recorded_by(
     listen_port: u16,
     public_spki_hex: Option<&str>,
 ) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let _ = super::load_local_authoring_context(db, recorded_by)?;
     let ws_eid = super::resolve_workspace_for_peer(db, recorded_by)?;
     let (sender_peer_eid, sender_peer_key) =
         crate::event_modules::peer_shared::load_local_peer_signer_required(db, recorded_by)?;
@@ -180,7 +168,7 @@ fn create_invite_for_recorded_by(
             "Could not resolve admin event for local peer signer.".into()
         })?;
 
-    let bootstrap_spki = resolve_invite_bootstrap_spki(db, recorded_by, public_spki_hex)?;
+    let bootstrap_spki = resolve_invite_bootstrap_spki(db, public_spki_hex)?;
 
     let addrs = if bootstrap_addrs.is_empty() {
         let detected = super::invite_link::detect_bootstrap_addrs(listen_port);
@@ -317,7 +305,7 @@ fn prepare_invite_acceptance(
             &invite_eid_b64,
             &ws_b64,
             "",
-            &invite.bootstrap_spki_fingerprint,
+            &invite.daemon_spki_fingerprint,
         )?;
     } else {
         for addr in &invite.bootstrap_addrs {
@@ -327,7 +315,7 @@ fn prepare_invite_acceptance(
                 &invite_eid_b64,
                 &ws_b64,
                 &addr.to_bootstrap_addr_string(),
-                &invite.bootstrap_spki_fingerprint,
+                &invite.daemon_spki_fingerprint,
             )?;
         }
     }
@@ -456,6 +444,7 @@ pub fn create_device_link_for_peer(
     public_spki_hex: Option<&str>,
 ) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
+    let _ = super::load_local_authoring_context(&db, peer_id)?;
 
     let (sender_peer_eid, sender_peer_key) =
         crate::event_modules::peer_shared::load_local_peer_signer_required(&db, peer_id)?;
@@ -464,7 +453,7 @@ pub fn create_device_link_for_peer(
 
     let workspace_id = super::resolve_workspace_for_peer(&db, peer_id)?;
 
-    let bootstrap_spki = resolve_invite_bootstrap_spki(&db, peer_id, public_spki_hex)?;
+    let bootstrap_spki = resolve_invite_bootstrap_spki(&db, public_spki_hex)?;
 
     let addrs = if bootstrap_addrs.is_empty() {
         let detected = super::invite_link::detect_bootstrap_addrs(listen_port);
@@ -500,25 +489,21 @@ mod tests {
     use super::resolve_invite_bootstrap_spki;
     use crate::db::open_in_memory;
     use crate::db::schema::create_tables;
-    use crate::db::transport_creds::{
-        set_local_transport_target, store_local_creds_with_source, CRED_SOURCE_PEER_SHARED,
-    };
+    use crate::transport::ensure_daemon_identity;
 
     #[test]
-    fn resolve_invite_bootstrap_spki_prefers_current_transport_target() {
+    fn resolve_invite_bootstrap_spki_uses_daemon_identity_by_default() {
         let db = open_in_memory().expect("open in-memory db");
         create_tables(&db).expect("create tables");
+        let (daemon_peer_id, _cert, _key) =
+            ensure_daemon_identity(&db).expect("ensure daemon identity");
 
-        let tenant_id = hex::encode([0x11; 32]);
-        let target_id = hex::encode([0x22; 32]);
-
-        store_local_creds_with_source(&db, &target_id, b"cert", b"key", CRED_SOURCE_PEER_SHARED)
-            .expect("store target creds");
-        set_local_transport_target(&db, &tenant_id, &target_id, CRED_SOURCE_PEER_SHARED)
-            .expect("set local transport target");
-
-        let spki = resolve_invite_bootstrap_spki(&db, &tenant_id, None).expect("resolve spki");
-        assert_eq!(spki, [0x22; 32]);
+        let spki = resolve_invite_bootstrap_spki(&db, None).expect("resolve spki");
+        let expected: [u8; 32] = hex::decode(daemon_peer_id)
+            .unwrap()
+            .try_into()
+            .expect("daemon peer id bytes");
+        assert_eq!(spki, expected);
     }
 
     #[test]
@@ -527,21 +512,7 @@ mod tests {
         create_tables(&db).expect("create tables");
 
         let explicit = hex::encode([0x33; 32]);
-        let spki =
-            resolve_invite_bootstrap_spki(&db, "tenant", Some(&explicit)).expect("resolve spki");
+        let spki = resolve_invite_bootstrap_spki(&db, Some(&explicit)).expect("resolve spki");
         assert_eq!(spki, [0x33; 32]);
-    }
-
-    #[test]
-    fn resolve_invite_bootstrap_spki_falls_back_to_direct_peer_creds() {
-        let db = open_in_memory().expect("open in-memory db");
-        create_tables(&db).expect("create tables");
-
-        let tenant_id = hex::encode([0x44; 32]);
-        store_local_creds_with_source(&db, &tenant_id, b"cert", b"key", CRED_SOURCE_PEER_SHARED)
-            .expect("store direct creds");
-
-        let spki = resolve_invite_bootstrap_spki(&db, &tenant_id, None).expect("resolve spki");
-        assert_eq!(spki, [0x44; 32]);
     }
 }

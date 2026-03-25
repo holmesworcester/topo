@@ -110,7 +110,7 @@ These are required, not optional:
    - do not use pre-projection raw-blob capture tables as authority for accepted-workspace binding.
 11. Identity pre-derive.
    - `create_workspace`, `accept_invite`, and `accept_device_link` pre-derive the PeerShared key and write events under the final `recorded_by` from first write — no `finalize_identity`.
-   - invite acceptance / device link may install invite-derived bootstrap transport certs first, but tenant scope key remains final and projection later installs PeerShared-derived transport identity.
+   - invite acceptance / device link may still install invite-derived bootstrap tenant transport creds first, but the live QUIC handshake uses the daemon transport identity; tenant scope key remains final and projection later installs PeerShared-derived tenant transport identity.
    - connect loop resolves identity once per QUIC connection, not per session (identity transitions only happen during discrete CLI commands).
    - `create_workspace` is strictly tenant-scoped once local creds exist: `recorded_by` must match a known local tenant peer ID in `local_transport_creds`; unscoped aliases are rejected. Fresh DB bootstrap (no local creds) remains allowed.
 12. Transport fingerprint bridge.
@@ -131,7 +131,7 @@ Every CLI instance is a real peer-to-peer device. All user-facing commands go th
 1. **One CLI instance = one device**: each running `topo` process is a device with its own transport identity and persistent state.
 2. **Multiple tenants per device**: a single device can host many tenants, each participating in arbitrary (potentially overlapping) workspaces.
 3. **Zeroconf discovery**: mDNS/DNS-SD discovers peers on the same workspace on the local machine or LAN (enabled by default via `discovery` feature).
-4. **Single-port QUIC endpoint**: one shared endpoint serves all tenants via exact transport-target cert selection (SNI routing). Inbound handshakes use node-scoped trust only as a first gate; post-handshake admission resolves the requested local transport fingerprint through replay-derived local routing state and applies tenant-scoped trust. Each requested local transport fingerprint must resolve to exactly one tenant. Outbound dials use per-tenant client configs with exact remote fingerprint verification.
+4. **Single-port QUIC endpoint**: one shared endpoint serves all tenants with one daemon-scoped cert. Inbound handshakes use node-scoped daemon trust as a first gate; post-handshake admission reads one encrypted session-auth frame and applies tenant-scoped trust there. Outbound dials use the shared daemon identity with a fixed cover name and no sensitive SNI on the wire.
 5. **Shared batch writer**: all tenants on a device share one batch writer for projection, grouped by `recorded_by`.
 6. **Same-workspace shared-DB convergence**: if multiple local tenants share one DB and one workspace, shared events must fan out locally across sibling tenant scopes after local create or wire ingest, and newly accepted tenants/devices must replay already-present shared workspace history into their own scope.
 
