@@ -190,11 +190,13 @@ With `created_at_ms` in hints:
 
 ### Idea 5: Newest-first negentropy discovery
 
-The hot/cold window split is currently disabled (all rounds are Full).
-With forward-on-have handling live events and the download scheduler
-handling priority, negentropy just needs to discover everything — the
-scheduler decides what to request first. So this is already handled
-by idea 4 without changing negentropy.
+The current scheduler already reconciles a fixed ladder of `LastDay`,
+`LastWeek`, `LastTwelveWeeks`, and `Full`, with `LastDay` duplicated to
+all live peers and colder windows partitioned by peer rank. With
+forward-on-have handling live events and the download scheduler handling
+priority, negentropy just needs to discover the contents of the assigned
+range. Newest-first behavior is therefore mostly a scheduler concern, not
+something that requires a different negentropy backend.
 
 ### Idea 6: Subscription-aware projection priority
 

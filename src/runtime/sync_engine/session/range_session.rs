@@ -21,13 +21,11 @@ pub struct RangeReceiveResult {
     pub path: Option<PathBuf>,
 }
 
-pub type RangeStorage = NegentropyStorageVector;
-
-pub fn load_range_storage(
+pub fn load_shared_event_index_slice(
     conn: &Connection,
     workspace_id: &str,
     range: SyncWindow,
-) -> Result<RangeStorage, String> {
+) -> Result<NegentropyStorageVector, String> {
     let mut stmt = conn
         .prepare(
             "SELECT ts, id

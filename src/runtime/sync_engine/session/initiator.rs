@@ -11,7 +11,7 @@ use crate::runtime::peering::loops::live_connection_peer_ids;
 use crate::runtime::SyncStats;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::range_session::{
-    load_range_storage, send_have_events, spawn_receive_log_task,
+    load_shared_event_index_slice, send_have_events, spawn_receive_log_task,
 };
 use crate::sync::session::receive_log::{
     enqueue_receive_log_ingest, note_hot_receive_finished, note_hot_receive_started,
@@ -19,7 +19,7 @@ use crate::sync::session::receive_log::{
 use crate::sync::session::windowing::{
     encode_initial_neg_open, is_hot_window, mark_outbound_window_completed, select_outbound_window,
 };
-use crate::sync::session::INITIAL_CONTROL_PROGRESS_TIMEOUT;
+use crate::sync::session::{INITIAL_CONTROL_PROGRESS_TIMEOUT, NEGENTROPY_FRAME_SIZE_LIMIT};
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 use negentropy::{Id, Negentropy};
 
@@ -124,9 +124,8 @@ where
         &live_peer_ids,
         crate::db::queue::current_timestamp_ms(),
     );
-    let storage = load_range_storage(&db, &ws_id, range)?;
-    let mut neg =
-        Negentropy::borrowed(&storage, crate::sync::session::negentropy_frame_size(range))?;
+    let storage = load_shared_event_index_slice(&db, &ws_id, range)?;
+    let mut neg = Negentropy::borrowed(&storage, NEGENTROPY_FRAME_SIZE_LIMIT)?;
     let initial_msg = encode_initial_neg_open(range, neg.initiate()?);
 
     control.send(&Frame::NegOpen { msg: initial_msg }).await?;

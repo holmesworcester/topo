@@ -1,8 +1,6 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::db::open_connection;
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncWindowKind {
     Full = 0,
@@ -26,7 +24,6 @@ const HOUR_MS: i64 = 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 const WEEK_MS: i64 = 7 * DAY_MS;
 const TWELVE_WEEK_MS: i64 = 12 * WEEK_MS;
-const COLD_PARTITION_MAX_LOCAL_MESSAGES: i64 = 64;
 const TIER_ORDER: [SyncWindowKind; 4] = [
     SyncWindowKind::LastDay,
     SyncWindowKind::LastWeek,
@@ -102,14 +99,12 @@ pub fn select_outbound_window(
     let anchor_now_ms = *planner.cycle_anchor_now_ms.get_or_insert(now_ms);
     let idx = planner.next_idx % TIER_ORDER.len();
     let kind = TIER_ORDER[idx];
-    let partition_cold = should_partition_cold_windows(db_path);
     assign_window(
         window_for_kind(kind, anchor_now_ms),
         kind,
         peer_id,
         live_peer_ids,
         anchor_now_ms,
-        partition_cold,
     )
 }
 
@@ -207,12 +202,8 @@ fn assign_window(
     peer_id: &str,
     live_peer_ids: &[String],
     now_ms: i64,
-    partition_cold: bool,
 ) -> SyncWindow {
     if is_hot_window(kind) {
-        return window;
-    }
-    if !partition_cold {
         return window;
     }
     let peers = normalized_live_peers(peer_id, live_peer_ids);
@@ -220,16 +211,6 @@ fn assign_window(
         return window;
     };
     partition_window(window, peer_rank, peers.len(), now_ms)
-}
-
-fn should_partition_cold_windows(db_path: &str) -> bool {
-    let Ok(db) = open_connection(db_path) else {
-        return true;
-    };
-    let message_count: i64 = db
-        .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
-        .unwrap_or(0);
-    message_count <= COLD_PARTITION_MAX_LOCAL_MESSAGES
 }
 
 impl SyncWindow {

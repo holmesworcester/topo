@@ -10,13 +10,13 @@ use crate::protocol::{neg_id_to_event_id, Frame};
 use crate::runtime::SyncStats;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::range_session::{
-    load_range_storage, send_have_events, spawn_receive_log_task,
+    load_shared_event_index_slice, send_have_events, spawn_receive_log_task,
 };
 use crate::sync::session::receive_log::{
     enqueue_receive_log_ingest, note_hot_receive_finished, note_hot_receive_started,
 };
 use crate::sync::session::windowing::{decode_initial_neg_open, is_hot_window};
-use crate::sync::session::INITIAL_CONTROL_PROGRESS_TIMEOUT;
+use crate::sync::session::{INITIAL_CONTROL_PROGRESS_TIMEOUT, NEGENTROPY_FRAME_SIZE_LIMIT};
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 use negentropy::{Id, Negentropy};
 
@@ -119,9 +119,8 @@ where
             recorded_by
         )
     })?;
-    let storage = load_range_storage(&db, &ws_id, range)?;
-    let mut neg =
-        Negentropy::borrowed(&storage, crate::sync::session::negentropy_frame_size(range))?;
+    let storage = load_shared_event_index_slice(&db, &ws_id, range)?;
+    let mut neg = Negentropy::borrowed(&storage, NEGENTROPY_FRAME_SIZE_LIMIT)?;
 
     let mut have_ids = Vec::<Id>::new();
     let mut need_ids = Vec::<Id>::new();
