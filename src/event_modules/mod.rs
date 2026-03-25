@@ -10,6 +10,7 @@ pub mod key_shared;
 pub mod layout;
 pub mod message;
 pub mod message_deletion;
+pub mod operational;
 pub mod peer_invite_shared;
 pub mod peer_secret;
 pub mod peer_shared;
@@ -88,6 +89,21 @@ pub const EVENT_TYPE_BENCH_DEP: u8 = 26;
 pub const EVENT_TYPE_PEER_SECRET: u8 = 27;
 pub const EVENT_TYPE_INVITE_SECRET: u8 = 28;
 pub const EVENT_TYPE_TENANT: u8 = 29;
+pub const EVENT_TYPE_CONNECTION_PLANNED: u8 = 30;
+pub const EVENT_TYPE_CONNECTION_PLAN_TRANSITIONED: u8 = 31;
+pub const EVENT_TYPE_CLIENT_STARTED: u8 = 32;
+pub const EVENT_TYPE_CLIENT_ACTIVATED: u8 = 33;
+pub const EVENT_TYPE_CLIENT_STOPPED: u8 = 34;
+pub const EVENT_TYPE_MDNS_PEER_OBSERVED: u8 = 35;
+pub const EVENT_TYPE_OUTBOUND_CONNECTION_AUTHENTICATED: u8 = 36;
+pub const EVENT_TYPE_OUTBOUND_CONNECTION_FAILED: u8 = 37;
+pub const EVENT_TYPE_OUTBOUND_CONNECTION_CLOSED: u8 = 38;
+pub const EVENT_TYPE_INBOUND_CONNECTION_AUTHENTICATED: u8 = 39;
+pub const EVENT_TYPE_INBOUND_CONNECTION_REJECTED: u8 = 40;
+pub const EVENT_TYPE_INBOUND_CONNECTION_CLOSED: u8 = 41;
+pub const EVENT_TYPE_SYNC_ROUND_STARTED: u8 = 42;
+pub const EVENT_TYPE_SYNC_ROUND_COMPLETED: u8 = 43;
+pub const EVENT_TYPE_CLIENT_IDLE_RESERVED: u8 = 44;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -118,6 +134,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     tenant::ensure_schema(conn)?;
     peer_secret::ensure_schema(conn)?;
     invite_secret::ensure_schema(conn)?;
+    operational::ensure_schema(conn)?;
     crate::state::subscriptions::ensure_schema(conn)?;
     Ok(())
 }
@@ -143,6 +160,33 @@ pub enum ParsedEvent {
     BenchDep(BenchDepEvent),
     PeerSecret(PeerSecretEvent),
     InviteSecret(InviteSecretEvent),
+    ConnectionPlanned(operational::connection_planned::ConnectionPlannedEvent),
+    ConnectionPlanTransitioned(
+        operational::connection_plan_transitioned::ConnectionPlanTransitionedEvent,
+    ),
+    ClientStarted(operational::client_started::ClientStartedEvent),
+    ClientActivated(operational::client_activated::ClientActivatedEvent),
+    ClientStopped(operational::client_stopped::ClientStoppedEvent),
+    ClientIdleReserved(operational::client_idle_reserved::ClientIdleReservedEvent),
+    MdnsPeerObserved(operational::mdns_peer_observed::MdnsPeerObservedEvent),
+    OutboundConnectionAuthenticated(
+        operational::outbound_connection_authenticated::OutboundConnectionAuthenticatedEvent,
+    ),
+    OutboundConnectionFailed(
+        operational::outbound_connection_failed::OutboundConnectionFailedEvent,
+    ),
+    OutboundConnectionClosed(
+        operational::outbound_connection_closed::OutboundConnectionClosedEvent,
+    ),
+    InboundConnectionAuthenticated(
+        operational::inbound_connection_authenticated::InboundConnectionAuthenticatedEvent,
+    ),
+    InboundConnectionRejected(
+        operational::inbound_connection_rejected::InboundConnectionRejectedEvent,
+    ),
+    InboundConnectionClosed(operational::inbound_connection_closed::InboundConnectionClosedEvent),
+    SyncRoundStarted(operational::sync_round_started::SyncRoundStartedEvent),
+    SyncRoundCompleted(operational::sync_round_completed::SyncRoundCompletedEvent),
 }
 
 impl ParsedEvent {
@@ -167,6 +211,21 @@ impl ParsedEvent {
             ParsedEvent::BenchDep(b) => b.created_at_ms,
             ParsedEvent::PeerSecret(l) => l.created_at_ms,
             ParsedEvent::InviteSecret(k) => k.created_at_ms,
+            ParsedEvent::ConnectionPlanned(c) => c.created_at_ms,
+            ParsedEvent::ConnectionPlanTransitioned(c) => c.created_at_ms,
+            ParsedEvent::ClientStarted(c) => c.created_at_ms,
+            ParsedEvent::ClientActivated(c) => c.created_at_ms,
+            ParsedEvent::ClientStopped(c) => c.created_at_ms,
+            ParsedEvent::ClientIdleReserved(c) => c.created_at_ms,
+            ParsedEvent::MdnsPeerObserved(c) => c.created_at_ms,
+            ParsedEvent::OutboundConnectionAuthenticated(c) => c.created_at_ms,
+            ParsedEvent::OutboundConnectionFailed(c) => c.created_at_ms,
+            ParsedEvent::OutboundConnectionClosed(c) => c.created_at_ms,
+            ParsedEvent::InboundConnectionAuthenticated(c) => c.created_at_ms,
+            ParsedEvent::InboundConnectionRejected(c) => c.created_at_ms,
+            ParsedEvent::InboundConnectionClosed(c) => c.created_at_ms,
+            ParsedEvent::SyncRoundStarted(c) => c.created_at_ms,
+            ParsedEvent::SyncRoundCompleted(c) => c.created_at_ms,
         }
     }
 
@@ -228,6 +287,27 @@ impl ParsedEvent {
             ParsedEvent::BenchDep(b) => b.dep_ids.iter().map(|id| ("dep_id", *id)).collect(),
             ParsedEvent::PeerSecret(p) => vec![("signer_event_id", p.signer_event_id)],
             ParsedEvent::InviteSecret(_) => vec![],
+            ParsedEvent::ConnectionPlanned(_) => vec![],
+            ParsedEvent::ConnectionPlanTransitioned(c) => {
+                vec![("basis_event_id", c.basis_event_id)]
+            }
+            ParsedEvent::ClientStarted(_) => vec![],
+            ParsedEvent::ClientActivated(c) => vec![("basis_event_id", c.basis_event_id)],
+            ParsedEvent::ClientStopped(c) => vec![("basis_event_id", c.basis_event_id)],
+            ParsedEvent::ClientIdleReserved(_) => vec![],
+            ParsedEvent::MdnsPeerObserved(_) => vec![],
+            ParsedEvent::OutboundConnectionAuthenticated(c) => {
+                vec![("basis_event_id", c.basis_event_id)]
+            }
+            ParsedEvent::OutboundConnectionFailed(c) => vec![("basis_event_id", c.basis_event_id)],
+            ParsedEvent::OutboundConnectionClosed(c) => vec![("basis_event_id", c.basis_event_id)],
+            ParsedEvent::InboundConnectionAuthenticated(c) => {
+                vec![("basis_event_id", c.basis_event_id)]
+            }
+            ParsedEvent::InboundConnectionRejected(c) => vec![("basis_event_id", c.basis_event_id)],
+            ParsedEvent::InboundConnectionClosed(c) => vec![("basis_event_id", c.basis_event_id)],
+            ParsedEvent::SyncRoundStarted(c) => vec![("basis_event_id", c.basis_event_id)],
+            ParsedEvent::SyncRoundCompleted(c) => vec![("basis_event_id", c.basis_event_id)],
         }
     }
 
@@ -252,6 +332,25 @@ impl ParsedEvent {
             ParsedEvent::BenchDep(_) => EVENT_TYPE_BENCH_DEP,
             ParsedEvent::PeerSecret(_) => EVENT_TYPE_PEER_SECRET,
             ParsedEvent::InviteSecret(_) => EVENT_TYPE_INVITE_SECRET,
+            ParsedEvent::ConnectionPlanned(_) => EVENT_TYPE_CONNECTION_PLANNED,
+            ParsedEvent::ConnectionPlanTransitioned(_) => EVENT_TYPE_CONNECTION_PLAN_TRANSITIONED,
+            ParsedEvent::ClientStarted(_) => EVENT_TYPE_CLIENT_STARTED,
+            ParsedEvent::ClientActivated(_) => EVENT_TYPE_CLIENT_ACTIVATED,
+            ParsedEvent::ClientStopped(_) => EVENT_TYPE_CLIENT_STOPPED,
+            ParsedEvent::ClientIdleReserved(_) => EVENT_TYPE_CLIENT_IDLE_RESERVED,
+            ParsedEvent::MdnsPeerObserved(_) => EVENT_TYPE_MDNS_PEER_OBSERVED,
+            ParsedEvent::OutboundConnectionAuthenticated(_) => {
+                EVENT_TYPE_OUTBOUND_CONNECTION_AUTHENTICATED
+            }
+            ParsedEvent::OutboundConnectionFailed(_) => EVENT_TYPE_OUTBOUND_CONNECTION_FAILED,
+            ParsedEvent::OutboundConnectionClosed(_) => EVENT_TYPE_OUTBOUND_CONNECTION_CLOSED,
+            ParsedEvent::InboundConnectionAuthenticated(_) => {
+                EVENT_TYPE_INBOUND_CONNECTION_AUTHENTICATED
+            }
+            ParsedEvent::InboundConnectionRejected(_) => EVENT_TYPE_INBOUND_CONNECTION_REJECTED,
+            ParsedEvent::InboundConnectionClosed(_) => EVENT_TYPE_INBOUND_CONNECTION_CLOSED,
+            ParsedEvent::SyncRoundStarted(_) => EVENT_TYPE_SYNC_ROUND_STARTED,
+            ParsedEvent::SyncRoundCompleted(_) => EVENT_TYPE_SYNC_ROUND_COMPLETED,
         }
     }
 
@@ -277,7 +376,22 @@ impl ParsedEvent {
             | ParsedEvent::Tenant(_)
             | ParsedEvent::BenchDep(_)
             | ParsedEvent::PeerSecret(_)
-            | ParsedEvent::InviteSecret(_) => None,
+            | ParsedEvent::InviteSecret(_)
+            | ParsedEvent::ConnectionPlanned(_)
+            | ParsedEvent::ConnectionPlanTransitioned(_)
+            | ParsedEvent::ClientStarted(_)
+            | ParsedEvent::ClientActivated(_)
+            | ParsedEvent::ClientStopped(_)
+            | ParsedEvent::ClientIdleReserved(_)
+            | ParsedEvent::MdnsPeerObserved(_)
+            | ParsedEvent::OutboundConnectionAuthenticated(_)
+            | ParsedEvent::OutboundConnectionFailed(_)
+            | ParsedEvent::OutboundConnectionClosed(_)
+            | ParsedEvent::InboundConnectionAuthenticated(_)
+            | ParsedEvent::InboundConnectionRejected(_)
+            | ParsedEvent::InboundConnectionClosed(_)
+            | ParsedEvent::SyncRoundStarted(_)
+            | ParsedEvent::SyncRoundCompleted(_) => None,
         }
     }
 
@@ -303,6 +417,21 @@ impl ParsedEvent {
             ParsedEvent::PeerSecret(e) => e.human_fields(),
             ParsedEvent::Tenant(e) => e.human_fields(),
             ParsedEvent::InviteSecret(e) => e.human_fields(),
+            ParsedEvent::ConnectionPlanned(e) => e.human_fields(),
+            ParsedEvent::ConnectionPlanTransitioned(e) => e.human_fields(),
+            ParsedEvent::ClientStarted(e) => e.human_fields(),
+            ParsedEvent::ClientActivated(e) => e.human_fields(),
+            ParsedEvent::ClientStopped(e) => e.human_fields(),
+            ParsedEvent::ClientIdleReserved(e) => e.human_fields(),
+            ParsedEvent::MdnsPeerObserved(e) => e.human_fields(),
+            ParsedEvent::OutboundConnectionAuthenticated(e) => e.human_fields(),
+            ParsedEvent::OutboundConnectionFailed(e) => e.human_fields(),
+            ParsedEvent::OutboundConnectionClosed(e) => e.human_fields(),
+            ParsedEvent::InboundConnectionAuthenticated(e) => e.human_fields(),
+            ParsedEvent::InboundConnectionRejected(e) => e.human_fields(),
+            ParsedEvent::InboundConnectionClosed(e) => e.human_fields(),
+            ParsedEvent::SyncRoundStarted(e) => e.human_fields(),
+            ParsedEvent::SyncRoundCompleted(e) => e.human_fields(),
         }
     }
 }
@@ -392,6 +521,21 @@ pub fn registry() -> &'static EventRegistry {
             &bench_dep::BENCH_DEP_META,
             &peer_secret::PEER_SECRET_META,
             &invite_secret::INVITE_SECRET_META,
+            &operational::connection_planned::CONNECTION_PLANNED_META,
+            &operational::connection_plan_transitioned::CONNECTION_PLAN_TRANSITIONED_META,
+            &operational::client_started::CLIENT_STARTED_META,
+            &operational::client_activated::CLIENT_ACTIVATED_META,
+            &operational::client_stopped::CLIENT_STOPPED_META,
+            &operational::client_idle_reserved::CLIENT_IDLE_RESERVED_META,
+            &operational::mdns_peer_observed::MDNS_PEER_OBSERVED_META,
+            &operational::outbound_connection_authenticated::OUTBOUND_CONNECTION_AUTHENTICATED_META,
+            &operational::outbound_connection_failed::OUTBOUND_CONNECTION_FAILED_META,
+            &operational::outbound_connection_closed::OUTBOUND_CONNECTION_CLOSED_META,
+            &operational::inbound_connection_authenticated::INBOUND_CONNECTION_AUTHENTICATED_META,
+            &operational::inbound_connection_rejected::INBOUND_CONNECTION_REJECTED_META,
+            &operational::inbound_connection_closed::INBOUND_CONNECTION_CLOSED_META,
+            &operational::sync_round_started::SYNC_ROUND_STARTED_META,
+            &operational::sync_round_completed::SYNC_ROUND_COMPLETED_META,
         ])
     })
 }

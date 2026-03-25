@@ -117,6 +117,10 @@ mod tests {
         assert!(tables.contains(&"project_queue".to_string()));
         assert!(tables.contains(&"bootstrap_context".to_string()));
         assert!(tables.contains(&"event_timeline".to_string()));
+        assert!(tables.contains(&"client_runtime_history".to_string()));
+        assert!(tables.contains(&"connection_plan_history".to_string()));
+        assert!(tables.contains(&"sync_round_history".to_string()));
+        assert!(tables.contains(&"sync_window_state_history".to_string()));
 
         // Event-owned tables
         assert!(tables.contains(&"workspaces".to_string()));

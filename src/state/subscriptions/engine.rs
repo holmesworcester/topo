@@ -146,6 +146,21 @@ fn parsed_event_type_name(parsed: &ParsedEvent) -> &'static str {
         ParsedEvent::BenchDep(_) => "bench_dep",
         ParsedEvent::PeerSecret(_) => "peer_secret",
         ParsedEvent::InviteSecret(_) => "invite_secret",
+        ParsedEvent::ConnectionPlanned(_) => "connection_planned",
+        ParsedEvent::ConnectionPlanTransitioned(_) => "connection_plan_transitioned",
+        ParsedEvent::ClientStarted(_) => "client_started",
+        ParsedEvent::ClientActivated(_) => "client_activated",
+        ParsedEvent::ClientStopped(_) => "client_stopped",
+        ParsedEvent::ClientIdleReserved(_) => "client_idle_reserved",
+        ParsedEvent::MdnsPeerObserved(_) => "mdns_peer_observed",
+        ParsedEvent::OutboundConnectionAuthenticated(_) => "outbound_connection_authenticated",
+        ParsedEvent::OutboundConnectionFailed(_) => "outbound_connection_failed",
+        ParsedEvent::OutboundConnectionClosed(_) => "outbound_connection_closed",
+        ParsedEvent::InboundConnectionAuthenticated(_) => "inbound_connection_authenticated",
+        ParsedEvent::InboundConnectionRejected(_) => "inbound_connection_rejected",
+        ParsedEvent::InboundConnectionClosed(_) => "inbound_connection_closed",
+        ParsedEvent::SyncRoundStarted(_) => "sync_round_started",
+        ParsedEvent::SyncRoundCompleted(_) => "sync_round_completed",
     }
 }
 

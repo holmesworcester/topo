@@ -107,13 +107,16 @@ pub mod fixtures {
         }
     }
 
-    /// Assert that write_ops contain an InsertOrIgnore to the given table.
+    /// Assert that write_ops contain any write targeting the given table.
     pub fn assert_writes_to_table(result: &ProjectorResult, table: &str) {
         assert!(
-            result.write_ops.iter().any(|op| matches!(
-                op, WriteOp::InsertOrIgnore { table: t, .. } if *t == table
-            )),
-            "expected InsertOrIgnore to table '{}', ops: {:?}",
+            result.write_ops.iter().any(|op| match op {
+                WriteOp::InsertOrIgnore { table: t, .. } => *t == table,
+                WriteOp::InsertOrReplace { table: t, .. } => *t == table,
+                WriteOp::Update { table: t, .. } => *t == table,
+                WriteOp::Delete { table: t, .. } => *t == table,
+            }),
+            "expected write to table '{}', ops: {:?}",
             table,
             result.write_ops
         );
@@ -124,6 +127,8 @@ pub mod fixtures {
         assert!(
             !result.write_ops.iter().any(|op| match op {
                 WriteOp::InsertOrIgnore { table: t, .. } => *t == table,
+                WriteOp::InsertOrReplace { table: t, .. } => *t == table,
+                WriteOp::Update { table: t, .. } => *t == table,
                 WriteOp::Delete { table: t, .. } => *t == table,
             }),
             "expected no write to table '{}', but found one",

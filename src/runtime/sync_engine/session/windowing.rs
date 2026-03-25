@@ -1,7 +1,7 @@
-use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
-
 use crate::db::open_connection;
+use crate::event_modules::operational::sync_window_selected::{
+    self as sync_window_selected, PlannerStateRow,
+};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncWindowKind {
@@ -40,34 +40,17 @@ struct PlannerState {
     cycle_anchor_now_ms: Option<i64>,
 }
 
-fn planner_state() -> &'static Mutex<HashMap<String, PlannerState>> {
-    static STATE: OnceLock<Mutex<HashMap<String, PlannerState>>> = OnceLock::new();
-    STATE.get_or_init(|| Mutex::new(HashMap::new()))
-}
-
-fn planner_key(db_path: &str, recorded_by: &str, peer_id: &str) -> String {
-    format!("{db_path}|{recorded_by}|{peer_id}")
-}
-
-fn state_for<'a>(
-    state: &'a mut HashMap<String, PlannerState>,
-    db_path: &str,
-    recorded_by: &str,
-    peer_id: &str,
-) -> &'a mut PlannerState {
-    state
-        .entry(planner_key(db_path, recorded_by, peer_id))
-        .or_insert(PlannerState {
-            next_idx: 0,
-            cycle_anchor_now_ms: None,
-        })
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SelectedOutboundWindow {
+    pub window: SyncWindow,
+    pub planner_next_idx_before: usize,
+    pub planner_cycle_anchor_now_ms: Option<i64>,
 }
 
 pub fn reset_outbound_window_state(db_path: &str, recorded_by: &str, peer_id: &str) {
-    let mut state = planner_state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    state.remove(&planner_key(db_path, recorded_by, peer_id));
+    with_planner_db(db_path, |db| {
+        sync_window_selected::delete(db, recorded_by, peer_id)
+    });
 }
 
 pub fn prime_outbound_window_kind(
@@ -76,16 +59,21 @@ pub fn prime_outbound_window_kind(
     peer_id: &str,
     kind: SyncWindowKind,
 ) {
-    let mut state = planner_state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let planner = state_for(&mut state, db_path, recorded_by, peer_id);
     let idx = TIER_ORDER
         .iter()
         .position(|candidate| *candidate == kind)
         .unwrap_or(0);
-    planner.next_idx = idx;
-    planner.cycle_anchor_now_ms = None;
+    with_planner_db(db_path, |db| {
+        sync_window_selected::store(
+            db,
+            recorded_by,
+            peer_id,
+            PlannerStateRow {
+                next_idx: idx,
+                cycle_anchor_now_ms: None,
+            },
+        )
+    });
 }
 
 pub fn select_outbound_window(
@@ -95,22 +83,38 @@ pub fn select_outbound_window(
     live_peer_ids: &[String],
     now_ms: i64,
 ) -> SyncWindow {
-    let mut state = planner_state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let planner = state_for(&mut state, db_path, recorded_by, peer_id);
-    let anchor_now_ms = *planner.cycle_anchor_now_ms.get_or_insert(now_ms);
+    select_outbound_window_with_planner(db_path, recorded_by, peer_id, live_peer_ids, now_ms).window
+}
+
+pub fn select_outbound_window_with_planner(
+    db_path: &str,
+    recorded_by: &str,
+    peer_id: &str,
+    live_peer_ids: &[String],
+    now_ms: i64,
+) -> SelectedOutboundWindow {
+    let mut planner = load_planner_state(db_path, recorded_by, peer_id);
+    let anchor_now_ms = planner.cycle_anchor_now_ms.unwrap_or(now_ms);
+    if planner.cycle_anchor_now_ms.is_none() {
+        planner.cycle_anchor_now_ms = Some(anchor_now_ms);
+        store_planner_state(db_path, recorded_by, peer_id, planner);
+    }
     let idx = planner.next_idx % TIER_ORDER.len();
     let kind = TIER_ORDER[idx];
     let partition_cold = should_partition_cold_windows(db_path);
-    assign_window(
+    let window = assign_window(
         window_for_kind(kind, anchor_now_ms),
         kind,
         peer_id,
         live_peer_ids,
         anchor_now_ms,
         partition_cold,
-    )
+    );
+    SelectedOutboundWindow {
+        window,
+        planner_next_idx_before: idx,
+        planner_cycle_anchor_now_ms: Some(anchor_now_ms),
+    }
 }
 
 pub fn mark_outbound_window_completed(
@@ -119,14 +123,55 @@ pub fn mark_outbound_window_completed(
     peer_id: &str,
     _window: SyncWindow,
 ) {
-    let mut state = planner_state()
-        .lock()
-        .unwrap_or_else(|poisoned| poisoned.into_inner());
-    let planner = state_for(&mut state, db_path, recorded_by, peer_id);
+    let mut planner = load_planner_state(db_path, recorded_by, peer_id);
     planner.next_idx = (planner.next_idx + 1) % TIER_ORDER.len();
     if planner.next_idx == 0 {
         planner.cycle_anchor_now_ms = None;
     }
+    store_planner_state(db_path, recorded_by, peer_id, planner);
+}
+
+fn load_planner_state(db_path: &str, recorded_by: &str, peer_id: &str) -> PlannerState {
+    with_planner_db_result(db_path, |db| {
+        sync_window_selected::load(db, recorded_by, peer_id)
+    })
+    .map(|row| PlannerState {
+        next_idx: row.next_idx,
+        cycle_anchor_now_ms: row.cycle_anchor_now_ms,
+    })
+    .unwrap_or(PlannerState {
+        next_idx: 0,
+        cycle_anchor_now_ms: None,
+    })
+}
+
+fn store_planner_state(db_path: &str, recorded_by: &str, peer_id: &str, state: PlannerState) {
+    with_planner_db(db_path, |db| {
+        sync_window_selected::store(
+            db,
+            recorded_by,
+            peer_id,
+            PlannerStateRow {
+                next_idx: state.next_idx,
+                cycle_anchor_now_ms: state.cycle_anchor_now_ms,
+            },
+        )
+    });
+}
+
+fn with_planner_db<F>(db_path: &str, op: F)
+where
+    F: FnOnce(&rusqlite::Connection) -> rusqlite::Result<()>,
+{
+    let _ = with_planner_db_result(db_path, op);
+}
+
+fn with_planner_db_result<T, F>(db_path: &str, op: F) -> Option<T>
+where
+    F: FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
+{
+    let db = open_connection(db_path).ok()?;
+    op(&db).ok()
 }
 
 fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
@@ -309,21 +354,32 @@ pub fn decode_initial_neg_open(msg: &[u8]) -> Result<(SyncWindow, &[u8]), String
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::{open_connection, schema::create_tables};
+
+    fn temp_db_path(label: &str) -> (tempfile::TempDir, String) {
+        let dir = tempfile::Builder::new().prefix(label).tempdir().unwrap();
+        let path = dir.path().join("sync-window.sqlite");
+        let path_str = path.to_string_lossy().to_string();
+        let conn = open_connection(&path_str).unwrap();
+        create_tables(&conn).unwrap();
+        drop(conn);
+        (dir, path_str)
+    }
 
     #[test]
     fn range_scheduler_round_robins_windows() {
-        let db_path = "/tmp/window-round-robin";
+        let (_dir, db_path) = temp_db_path("window-round-robin");
         let recorded_by = "tenant-a";
         let peer_id = "peer-a";
         let live_peers = vec![peer_id.to_string()];
-        reset_outbound_window_state(db_path, recorded_by, peer_id);
+        reset_outbound_window_state(&db_path, recorded_by, peer_id);
 
         let kinds: Vec<SyncWindowKind> = (0..8)
             .map(|_| {
                 let window =
-                    select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 1_000_000);
+                    select_outbound_window(&db_path, recorded_by, peer_id, &live_peers, 1_000_000);
                 let kind = window.kind;
-                mark_outbound_window_completed(db_path, recorded_by, peer_id, window);
+                mark_outbound_window_completed(&db_path, recorded_by, peer_id, window);
                 kind
             })
             .collect();
@@ -365,30 +421,30 @@ mod tests {
 
     #[test]
     fn hot_windows_are_duplicated_across_live_peers() {
-        let db_path = "/tmp/window-hot-dup";
+        let (_dir, db_path) = temp_db_path("window-hot-dup");
         let recorded_by = "tenant-a";
         let peer_a = "peer-a";
         let peer_b = "peer-b";
         let live_peers = vec![peer_a.to_string(), peer_b.to_string()];
-        reset_outbound_window_state(db_path, recorded_by, peer_a);
-        reset_outbound_window_state(db_path, recorded_by, peer_b);
+        reset_outbound_window_state(&db_path, recorded_by, peer_a);
+        reset_outbound_window_state(&db_path, recorded_by, peer_b);
 
-        let day_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
-        let day_b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
+        let day_a = select_outbound_window(&db_path, recorded_by, peer_a, &live_peers, 1_000_000);
+        let day_b = select_outbound_window(&db_path, recorded_by, peer_b, &live_peers, 1_000_000);
         assert_eq!(day_a, day_b);
     }
 
     #[test]
     fn range_scheduler_uses_stable_cycle_anchor_across_window_steps() {
-        let db_path = "/tmp/window-cycle-anchor";
+        let (_dir, db_path) = temp_db_path("window-cycle-anchor");
         let recorded_by = "tenant-a";
         let peer_id = "peer-a";
         let live_peers = vec![peer_id.to_string()];
-        reset_outbound_window_state(db_path, recorded_by, peer_id);
+        reset_outbound_window_state(&db_path, recorded_by, peer_id);
 
-        let day = select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 1_000_000);
-        mark_outbound_window_completed(db_path, recorded_by, peer_id, day);
-        let week = select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 2_000_000);
+        let day = select_outbound_window(&db_path, recorded_by, peer_id, &live_peers, 1_000_000);
+        mark_outbound_window_completed(&db_path, recorded_by, peer_id, day);
+        let week = select_outbound_window(&db_path, recorded_by, peer_id, &live_peers, 2_000_000);
 
         assert_eq!(day.kind, SyncWindowKind::LastDay);
         assert_eq!(week.kind, SyncWindowKind::LastWeek);
@@ -397,23 +453,23 @@ mod tests {
 
     #[test]
     fn cold_windows_partition_by_live_peer_rank() {
-        let db_path = "/tmp/window-partition";
+        let (_dir, db_path) = temp_db_path("window-partition");
         let recorded_by = "tenant-a";
         let peer_a = "peer-a";
         let peer_b = "peer-b";
         let live_peers = vec![peer_a.to_string(), peer_b.to_string()];
-        reset_outbound_window_state(db_path, recorded_by, peer_a);
-        reset_outbound_window_state(db_path, recorded_by, peer_b);
+        reset_outbound_window_state(&db_path, recorded_by, peer_a);
+        reset_outbound_window_state(&db_path, recorded_by, peer_b);
 
         for _ in 0..1 {
-            let a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
-            let b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
-            mark_outbound_window_completed(db_path, recorded_by, peer_a, a);
-            mark_outbound_window_completed(db_path, recorded_by, peer_b, b);
+            let a = select_outbound_window(&db_path, recorded_by, peer_a, &live_peers, 1_000_000);
+            let b = select_outbound_window(&db_path, recorded_by, peer_b, &live_peers, 1_000_000);
+            mark_outbound_window_completed(&db_path, recorded_by, peer_a, a);
+            mark_outbound_window_completed(&db_path, recorded_by, peer_b, b);
         }
 
-        let week_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 1_000_000);
-        let week_b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 1_000_000);
+        let week_a = select_outbound_window(&db_path, recorded_by, peer_a, &live_peers, 1_000_000);
+        let week_b = select_outbound_window(&db_path, recorded_by, peer_b, &live_peers, 1_000_000);
 
         assert_eq!(week_a.kind, SyncWindowKind::LastWeek);
         assert_eq!(week_b.kind, SyncWindowKind::LastWeek);
@@ -426,32 +482,32 @@ mod tests {
 
     #[test]
     fn cold_windows_expand_when_live_peer_set_shrinks() {
-        let db_path = "/tmp/window-peer-loss";
+        let (_dir, db_path) = temp_db_path("window-peer-loss");
         let recorded_by = "tenant-a";
         let peer_a = "peer-a";
         let peer_b = "peer-b";
-        reset_outbound_window_state(db_path, recorded_by, peer_a);
-        reset_outbound_window_state(db_path, recorded_by, peer_b);
+        reset_outbound_window_state(&db_path, recorded_by, peer_a);
+        reset_outbound_window_state(&db_path, recorded_by, peer_b);
 
         for _ in 0..1 {
             let a = select_outbound_window(
-                db_path,
+                &db_path,
                 recorded_by,
                 peer_a,
                 &[peer_a.to_string(), peer_b.to_string()],
                 1_000_000,
             );
-            mark_outbound_window_completed(db_path, recorded_by, peer_a, a);
+            mark_outbound_window_completed(&db_path, recorded_by, peer_a, a);
         }
         let split_week = select_outbound_window(
-            db_path,
+            &db_path,
             recorded_by,
             peer_a,
             &[peer_a.to_string(), peer_b.to_string()],
             1_000_000,
         );
         let single_week = select_outbound_window(
-            db_path,
+            &db_path,
             recorded_by,
             peer_a,
             &[peer_a.to_string()],
@@ -467,7 +523,7 @@ mod tests {
 
     #[test]
     fn full_range_partitions_cover_without_overlap() {
-        let db_path = "/tmp/window-full-cover";
+        let (_dir, db_path) = temp_db_path("window-full-cover");
         let recorded_by = "tenant-a";
         let peers = vec![
             "peer-a".to_string(),
@@ -477,19 +533,19 @@ mod tests {
         ];
         let now_ms = 4 * TWELVE_WEEK_MS;
         for peer in &peers {
-            reset_outbound_window_state(db_path, recorded_by, peer);
+            reset_outbound_window_state(&db_path, recorded_by, peer);
         }
 
         for peer in &peers {
             for _ in 0..3 {
-                let window = select_outbound_window(db_path, recorded_by, peer, &peers, now_ms);
-                mark_outbound_window_completed(db_path, recorded_by, peer, window);
+                let window = select_outbound_window(&db_path, recorded_by, peer, &peers, now_ms);
+                mark_outbound_window_completed(&db_path, recorded_by, peer, window);
             }
         }
 
         let mut full_windows: Vec<SyncWindow> = peers
             .iter()
-            .map(|peer| select_outbound_window(db_path, recorded_by, peer, &peers, now_ms))
+            .map(|peer| select_outbound_window(&db_path, recorded_by, peer, &peers, now_ms))
             .collect();
         full_windows.sort_by_key(|window| window.ts_min());
 
@@ -517,5 +573,29 @@ mod tests {
 
         assert_eq!(decoded_window, window);
         assert_eq!(inner, payload.as_slice());
+    }
+
+    #[test]
+    fn planner_state_is_persisted_in_sqlite() {
+        let (_dir, db_path) = temp_db_path("window-state-sqlite");
+        let recorded_by = "tenant-a";
+        let peer_id = "peer-a";
+        let live_peers = vec![peer_id.to_string()];
+
+        let first = select_outbound_window(&db_path, recorded_by, peer_id, &live_peers, 1_000_000);
+        assert_eq!(first.kind, SyncWindowKind::LastDay);
+
+        let db = open_connection(&db_path).unwrap();
+        let anchored = sync_window_selected::load(&db, recorded_by, peer_id).unwrap();
+        assert_eq!(anchored.next_idx, 0);
+        assert_eq!(anchored.cycle_anchor_now_ms, Some(1_000_000));
+        drop(db);
+
+        mark_outbound_window_completed(&db_path, recorded_by, peer_id, first);
+
+        let db = open_connection(&db_path).unwrap();
+        let completed = sync_window_selected::load(&db, recorded_by, peer_id).unwrap();
+        assert_eq!(completed.next_idx, 1);
+        assert_eq!(completed.cycle_anchor_now_ms, Some(1_000_000));
     }
 }

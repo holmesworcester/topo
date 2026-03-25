@@ -174,6 +174,37 @@ both `pass` and `break` polarity unless waived.
 | SPEC_PENDING_SOURCE_01 | InvPendingBootstrapTrustSource | CHK_UI_PENDING_SOURCE | projector_unit | user_invite_projector_tests::tests::test_user_invite_no_pending_when_not_local | break |
 | SPEC_WS_DEP_01 | InvAllValidRequireWorkspace | CHK_WS_DEP_REQUIRED | pipeline_integration | apply::tests::test_project_message_valid | pass |
 | SPEC_WS_DEP_01 | InvAllValidRequireWorkspace | CHK_WS_DEP_REQUIRED | pipeline_integration | apply::tests::test_project_reaction_blocked | break |
+| SPEC_LOC_CONN_PLAN_01 | LocalOperationalCausality::InvEventDepsSatisfied | CHK_DEP_PRESENCE | pipeline_integration | event_modules::operational::connection_plan_transitioned::tests::create_transitioned_appends_deferred_snapshot | pass |
+| SPEC_LOC_CONN_PLAN_01 | LocalOperationalCausality::InvEventDepsSatisfied | CHK_DEP_PRESENCE | pipeline_integration | event_modules::operational::connection_plan_transitioned::tests::create_transitioned_blocks_without_basis_event | break |
+| SPEC_LOC_CONN_PLAN_02 | NON_MODELED::operational_input_validation | CHK_LOC_CONN_PLAN_INPUT | projector_unit | event_modules::operational::connection_planned::tests::create_connection_planned_projects_history_and_due_view | pass |
+| SPEC_LOC_CONN_PLAN_02 | NON_MODELED::operational_input_validation | CHK_LOC_CONN_PLAN_INPUT | projector_unit | event_modules::operational::connection_planned::tests::create_connection_planned_rejects_invalid_remote_addr | break |
+| SPEC_LOC_CONN_PLAN_03 | NON_MODELED::latest_basis_guard | CHK_LOC_CONN_LATEST_BASIS | projector_unit | event_modules::operational::connection_plan_transitioned::tests::create_transitioned_appends_deferred_snapshot | pass |
+| SPEC_LOC_CONN_PLAN_03 | NON_MODELED::latest_basis_guard | CHK_LOC_CONN_LATEST_BASIS | projector_unit | event_modules::operational::connection_plan_transitioned::tests::stale_transition_is_rejected | break |
+| SPEC_LOC_CLIENT_LIFECYCLE_01 | LocalOperationalCausality::InvEventDepsSatisfied | CHK_DEP_PRESENCE | pipeline_integration | event_modules::operational::client_lifecycle::tests::lifecycle_events_project_history_and_latest_state | pass |
+| SPEC_LOC_CLIENT_LIFECYCLE_01 | LocalOperationalCausality::InvEventDepsSatisfied | CHK_DEP_PRESENCE | pipeline_integration | event_modules::operational::client_lifecycle::tests::activation_blocks_without_started_run | break |
+| SPEC_LOC_CLIENT_LIFECYCLE_02 | NON_MODELED::latest_basis_guard | CHK_LOC_CLIENT_LATEST_BASIS | projector_unit | event_modules::operational::client_lifecycle::tests::lifecycle_events_project_history_and_latest_state | pass |
+| SPEC_LOC_CLIENT_LIFECYCLE_02 | NON_MODELED::latest_basis_guard | CHK_LOC_CLIENT_LATEST_BASIS | projector_unit | event_modules::operational::client_lifecycle::tests::stale_client_transition_is_rejected | break |
+| SPEC_LOC_CLIENT_IDLE_01 | NON_MODELED::operational_input_validation | CHK_LOC_CLIENT_IDLE_INPUT | projector_unit | event_modules::operational::client_idle_reserved::tests::client_idle_reserved_projects_idle_state | pass |
+| SPEC_LOC_CLIENT_IDLE_01 | NON_MODELED::operational_input_validation | CHK_LOC_CLIENT_IDLE_INPUT | projector_unit | event_modules::operational::client_idle_reserved::tests::client_idle_reserved_rejects_invalid_reserved_port | break |
+| SPEC_LOC_MDNS_01 | NON_MODELED::operational_input_validation | CHK_LOC_MDNS_INPUT | projector_unit | event_modules::operational::mdns_peer_observed::tests::mdns_peer_observed_projects_history_and_emits_connection_plan | pass |
+| SPEC_LOC_MDNS_01 | NON_MODELED::operational_input_validation | CHK_LOC_MDNS_INPUT | projector_unit | event_modules::operational::mdns_peer_observed::tests::mdns_peer_observed_rejects_invalid_addr | break |
+| SPEC_LOC_CONN_OBS_01 | NON_MODELED::latest_basis_guard | CHK_LOC_CONN_LATEST_BASIS | projector_unit | event_modules::operational::outbound_connection_authenticated::tests::authenticated_projects_connection_history_and_endpoint_rows | pass |
+| SPEC_LOC_CONN_OBS_01 | NON_MODELED::latest_basis_guard | CHK_LOC_CONN_LATEST_BASIS | projector_unit | event_modules::operational::outbound_connection_authenticated::tests::authenticated_rejects_stale_basis | break |
+| SPEC_LOC_CONN_OBS_01 | NON_MODELED::latest_basis_guard | CHK_LOC_CONN_LATEST_BASIS | projector_unit | event_modules::operational::outbound_connection_failed::tests::failed_projects_history_row | pass |
+| SPEC_LOC_CONN_OBS_01 | NON_MODELED::latest_basis_guard | CHK_LOC_CONN_LATEST_BASIS | projector_unit | event_modules::operational::outbound_connection_failed::tests::failed_rejects_stale_basis | break |
+| SPEC_LOC_CONN_OBS_01 | NON_MODELED::latest_basis_guard | CHK_LOC_CONN_LATEST_BASIS | projector_unit | event_modules::operational::outbound_connection_closed::tests::closed_projects_history_row | pass |
+| SPEC_LOC_CONN_OBS_01 | NON_MODELED::latest_basis_guard | CHK_LOC_CONN_LATEST_BASIS | projector_unit | event_modules::operational::outbound_connection_closed::tests::closed_rejects_stale_basis | break |
+| SPEC_LOC_INBOUND_CONN_01 | NON_MODELED::latest_basis_guard | CHK_LOC_CLIENT_LATEST_BASIS | projector_unit | event_modules::operational::inbound_connection_authenticated::tests::authenticated_projects_connection_history_and_endpoint_rows | pass |
+| SPEC_LOC_INBOUND_CONN_01 | NON_MODELED::latest_basis_guard | CHK_LOC_CLIENT_LATEST_BASIS | projector_unit | event_modules::operational::inbound_connection_authenticated::tests::authenticated_rejects_stale_basis | break |
+| SPEC_LOC_INBOUND_CONN_01 | NON_MODELED::latest_basis_guard | CHK_LOC_CLIENT_LATEST_BASIS | projector_unit | event_modules::operational::inbound_connection_rejected::tests::rejected_projects_history_row | pass |
+| SPEC_LOC_INBOUND_CONN_01 | NON_MODELED::latest_basis_guard | CHK_LOC_CLIENT_LATEST_BASIS | projector_unit | event_modules::operational::inbound_connection_rejected::tests::rejected_rejects_stale_basis | break |
+| SPEC_LOC_INBOUND_CONN_02 | NON_MODELED::latest_basis_guard | CHK_LOC_INBOUND_LATEST_BASIS | projector_unit | event_modules::operational::inbound_connection_closed::tests::closed_projects_history_row | pass |
+| SPEC_LOC_INBOUND_CONN_02 | NON_MODELED::latest_basis_guard | CHK_LOC_INBOUND_LATEST_BASIS | projector_unit | event_modules::operational::inbound_connection_closed::tests::closed_rejects_stale_basis | break |
+| SPEC_LOC_SYNC_ROUND_01 | NON_MODELED::latest_basis_guard | CHK_LOC_SYNC_CONN_LATEST_BASIS | projector_unit | event_modules::operational::sync_round_started::tests::started_projects_history_row | pass |
+| SPEC_LOC_SYNC_ROUND_01 | NON_MODELED::latest_basis_guard | CHK_LOC_SYNC_CONN_LATEST_BASIS | projector_unit | event_modules::operational::sync_round_started::tests::responder_started_accepts_inbound_basis | pass |
+| SPEC_LOC_SYNC_ROUND_01 | NON_MODELED::latest_basis_guard | CHK_LOC_SYNC_CONN_LATEST_BASIS | projector_unit | event_modules::operational::sync_round_started::tests::started_rejects_stale_basis | break |
+| SPEC_LOC_SYNC_ROUND_02 | NON_MODELED::latest_basis_guard | CHK_LOC_SYNC_ROUND_LATEST_BASIS | projector_unit | event_modules::operational::sync_round_completed::tests::completed_projects_history_and_advances_planner_state | pass |
+| SPEC_LOC_SYNC_ROUND_02 | NON_MODELED::latest_basis_guard | CHK_LOC_SYNC_ROUND_LATEST_BASIS | projector_unit | event_modules::operational::sync_round_completed::tests::completed_rejects_stale_basis | break |
 
 ## TransportCredentialLifecycle Invariants
 

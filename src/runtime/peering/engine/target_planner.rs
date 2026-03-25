@@ -25,6 +25,9 @@ use tracing::warn;
 use crate::db::open_connection;
 use crate::db::transport_creds::discover_local_tenants;
 use crate::db::transport_trust::list_active_invite_bootstrap_targets;
+use crate::event_modules::operational::connection_planned::{
+    bootstrap_connection_id, known_peer_connection_id,
+};
 use crate::event_modules::workspace::invite_link::parse_bootstrap_address;
 
 // ---------------------------------------------------------------------------
@@ -114,30 +117,6 @@ pub(crate) fn normalize_discovered_addr_for_local_bind(
         discovered,
         force_loopback,
     )
-}
-
-// ---------------------------------------------------------------------------
-// Unified dispatch-keying for bootstrap + discovery ingestion
-// ---------------------------------------------------------------------------
-
-pub(crate) fn bootstrap_dispatch_key(
-    tenant_id: &str,
-    transport_peer_id: &str,
-    remote: SocketAddr,
-) -> String {
-    format!("{tenant_id}@bootstrap:{transport_peer_id}@{remote}")
-}
-
-pub(crate) fn bootstrap_dispatch_key_prefix(tenant_id: &str, transport_peer_id: &str) -> String {
-    format!("{tenant_id}@bootstrap:{transport_peer_id}@")
-}
-
-pub(crate) fn known_peer_dispatch_key(tenant_id: &str, transport_peer_id: &str) -> String {
-    format!("{}@peer:{}", tenant_id, transport_peer_id)
-}
-
-pub(crate) fn discovery_dispatch_key(tenant_id: &str, transport_peer_id: &str) -> String {
-    known_peer_dispatch_key(tenant_id, transport_peer_id)
 }
 
 // ---------------------------------------------------------------------------
@@ -307,7 +286,7 @@ pub(crate) fn dispatch_bootstrap_target(
     transport_peer_id: &str,
     remote: SocketAddr,
 ) -> bool {
-    let key = bootstrap_dispatch_key(tenant_id, transport_peer_id, remote);
+    let key = bootstrap_connection_id(tenant_id, transport_peer_id, remote);
     let (action, _cancel_rx) = dispatcher.dispatch(&key, remote);
     matches!(
         action,
@@ -325,7 +304,7 @@ pub(crate) fn dispatch_known_peer_target(
     transport_peer_id: &str,
     remote: SocketAddr,
 ) -> bool {
-    let key = known_peer_dispatch_key(tenant_id, transport_peer_id);
+    let key = known_peer_connection_id(tenant_id, transport_peer_id);
     let (action, _cancel_rx) = dispatcher.dispatch(&key, remote);
     matches!(
         action,
@@ -1071,17 +1050,6 @@ mod tests {
             targets.len(),
             2,
             "second target appears after second trust row"
-        );
-    }
-
-    #[test]
-    fn test_bootstrap_dispatch_key_is_remote_scoped() {
-        let peer_id = format!("{:064x}", 7);
-        let a = bootstrap_dispatch_key("tenant-a", &peer_id, addr(4433));
-        let b = bootstrap_dispatch_key("tenant-a", &peer_id, addr(4434));
-        assert_ne!(
-            a, b,
-            "distinct bootstrap addresses for the same peer must not cancel each other"
         );
     }
 
