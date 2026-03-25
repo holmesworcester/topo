@@ -2,9 +2,11 @@
 //!
 //! Runtime worker ownership is centralized in `supervisor.rs`.
 
+mod bootstrap_auth;
 mod discovery;
 mod startup;
 pub(crate) mod supervisor;
+pub(crate) mod target_dispatch;
 pub(crate) mod target_planner;
 
 use std::net::SocketAddr;
