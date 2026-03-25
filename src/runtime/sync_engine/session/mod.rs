@@ -8,8 +8,7 @@ pub mod receive_log;
 pub mod responder;
 pub mod windowing;
 
-use crate::sync::session::windowing::{SyncWindow, SyncWindowKind};
-use crate::tuning::low_mem_mode;
+use crate::sync::session::windowing::SyncWindow;
 
 pub use initiator::run_sync_initiator;
 pub use responder::run_sync_responder;
@@ -19,16 +18,10 @@ pub use responder::run_sync_responder;
 // ---------------------------------------------------------------------------
 
 /// Negentropy frame size limit.
-/// Low-memory mode only shrinks colder / larger windows; day+week keep the
-/// normal frame size so hot sync throughput does not pay the penalty.
-pub(super) fn negentropy_frame_size(window: SyncWindow) -> u64 {
-    if !low_mem_mode() {
-        return 256 * 1024;
-    }
-    match window.kind {
-        SyncWindowKind::LastDay | SyncWindowKind::LastWeek => 256 * 1024,
-        SyncWindowKind::LastTwelveWeeks | SyncWindowKind::Full => 16 * 1024,
-    }
+/// All windows now use the same in-memory storage path, so there is no longer
+/// a low-memory cold-range special case here.
+pub(super) fn negentropy_frame_size(_window: SyncWindow) -> u64 {
+    256 * 1024
 }
 /// Maximum time a session may sit without any initial control-round progress.
 /// If a session never gets past the first negentropy exchange, restarting it is
@@ -39,6 +32,7 @@ pub(super) const INITIAL_CONTROL_PROGRESS_TIMEOUT: std::time::Duration =
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::sync::session::windowing::SyncWindowKind;
 
     fn window(kind: SyncWindowKind) -> SyncWindow {
         SyncWindow {
@@ -49,7 +43,7 @@ mod tests {
     }
 
     #[test]
-    fn lowmem_keeps_hot_frame_size_large() {
+    fn frame_size_is_uniform_across_windows() {
         std::env::set_var("LOW_MEM_IOS", "1");
         assert_eq!(
             negentropy_frame_size(window(SyncWindowKind::LastDay)),
@@ -61,11 +55,11 @@ mod tests {
         );
         assert_eq!(
             negentropy_frame_size(window(SyncWindowKind::LastTwelveWeeks)),
-            16 * 1024
+            256 * 1024
         );
         assert_eq!(
             negentropy_frame_size(window(SyncWindowKind::Full)),
-            16 * 1024
+            256 * 1024
         );
         std::env::remove_var("LOW_MEM_IOS");
     }

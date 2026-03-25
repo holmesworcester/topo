@@ -215,9 +215,10 @@ Medium-high effort but reduces write amplification permanently.
 
 ### Idea 8: Defer neg_items to incremental rebuild
 
-Track last-synced rowid in `neg_meta`. Before each negentropy round,
-bulk-insert new events from the events table. Moves the cost from the
-hot ingest path to the observer loop.
+Track a dedicated runtime checkpoint for the last scanned shared event,
+then bulk-insert new entries into `neg_items` from the shared event
+stream before each negentropy round. Moves the cost from the hot ingest
+path to the observer loop.
 
 **Caveat**: must handle multi-workspace DBs correctly. The current
 prototype stamps every event with one `workspace_id`, which is not

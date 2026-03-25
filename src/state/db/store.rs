@@ -43,17 +43,8 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
             PRIMARY KEY (workspace_id, ts, id)
         ) WITHOUT ROWID;
 
-        CREATE TABLE IF NOT EXISTS neg_blocks (
-            block_idx INTEGER PRIMARY KEY,
-            ts INTEGER NOT NULL,
-            id BLOB NOT NULL,
-            count INTEGER NOT NULL
-        );
-
-        CREATE TABLE IF NOT EXISTS neg_meta (
-            key TEXT PRIMARY KEY,
-            value INTEGER NOT NULL
-        );
+        DROP TABLE IF EXISTS neg_blocks;
+        DROP TABLE IF EXISTS neg_meta;
         ",
     )?;
     Ok(())
@@ -375,5 +366,43 @@ mod tests {
             crate::event_modules::EVENT_TYPE_MESSAGE
         );
         assert_eq!(summary.encoded_size_bytes, blob.len() as u32);
+    }
+
+    #[test]
+    fn test_ensure_schema_drops_stale_negentropy_tables() {
+        let conn = setup();
+        conn.execute_batch(
+            "
+            CREATE TABLE neg_blocks (
+                block_idx INTEGER PRIMARY KEY,
+                ts INTEGER NOT NULL,
+                id BLOB NOT NULL
+            );
+            CREATE TABLE neg_meta (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+            );
+            ",
+        )
+        .unwrap();
+
+        ensure_schema(&conn).unwrap();
+
+        let neg_blocks_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='neg_blocks'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let neg_meta_exists: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sqlite_master WHERE type='table' AND name='neg_meta'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(neg_blocks_exists, 0);
+        assert_eq!(neg_meta_exists, 0);
     }
 }

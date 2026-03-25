@@ -1332,7 +1332,7 @@ Baseline implementation:
 4. Outbound scheduling currently round-robins those windows per `(db_path, peer_id)`.
 5. Range data transfer streams raw length-delimited blob records (`[u32 len][blob]`) after reconciliation for that range.
 6. Multi-source coordination does not replace negentropy; future smarter range balancing will still consume range-local membership discovered by negentropy.
-7. The older SQLite-backed negentropy storage remains in-tree, but the active range path uses the in-memory vector-backed storage built directly from `neg_items`.
+7. The current range path uses only the in-memory vector-backed storage built directly from `neg_items`; the older SQLite-backed storage path has been removed.
 
 Primary code references:
 1. `src/runtime/sync_engine/session/range_session.rs`

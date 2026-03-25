@@ -86,9 +86,11 @@ fn wait_for_endpoint_observation(db_path: &str, remote_peer_id: &str, timeout: D
             .as_millis() as i64;
         let conn = open_connection(db_path).expect("open db");
         let pending_rows: i64 = conn
-            .query_row("SELECT COUNT(*) FROM pending_invite_bootstrap_trust", [], |row| {
-                row.get(0)
-            })
+            .query_row(
+                "SELECT COUNT(*) FROM pending_invite_bootstrap_trust",
+                [],
+                |row| row.get(0),
+            )
             .expect("count pending_invite_bootstrap_trust");
         let observed_rows: i64 = conn
             .query_row(
@@ -100,8 +102,8 @@ fn wait_for_endpoint_observation(db_path: &str, remote_peer_id: &str, timeout: D
                 |row| row.get(0),
             )
             .expect("count peer_endpoint_observations");
-        let local_tenants = topo::db::transport_creds::discover_local_tenants(&conn)
-            .unwrap_or_default();
+        let local_tenants =
+            topo::db::transport_creds::discover_local_tenants(&conn).unwrap_or_default();
         let single_tenant_transport_ready = if local_tenants.len() == 1 {
             local_tenants[0].transport_peer_id == local_tenants[0].peer_id
         } else {
@@ -2660,12 +2662,7 @@ fn test_cli_shared_db_same_workspace_accepts_distinct_explicit_invites() {
     wait_for_username_peer_id(&shared_db, "bob-alpha", timeout_ms);
     wait_for_username_peer_id(&shared_db, "carol-alpha", timeout_ms);
     assert_event_visible_for_username(&shared_db, "bob-alpha", &alpha_bootstrap_eid, timeout_ms);
-    assert_event_visible_for_username(
-        &shared_db,
-        "carol-alpha",
-        &alpha_bootstrap_eid,
-        timeout_ms,
-    );
+    assert_event_visible_for_username(&shared_db, "carol-alpha", &alpha_bootstrap_eid, timeout_ms);
 
     let bob_alpha_tenant = "bob-alpha/bob-terminal";
     let carol_alpha_tenant = "carol-alpha/carol-terminal";

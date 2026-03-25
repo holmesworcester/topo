@@ -37,7 +37,6 @@ In scope:
 - `src/state/db/project_queue.rs`
 - `src/state/db/store.rs`
 - `src/state/projection/create.rs`
-- `src/runtime/sync_engine/negentropy_sqlite.rs`
 - `src/runtime/sync_engine/session/{initiator.rs,responder.rs,data_plane.rs,logging.rs,windowing.rs}`
 - `src/state/pipeline/{mod.rs,phases.rs}`
 - `src/shared/tuning.rs`
@@ -206,7 +205,7 @@ End-to-end validation is not complete until:
 - SC1: `tests/double_send_test.rs` now reproduces the old failure mode against the daemon runtime and passes at `1.00x` duplication after leased egress was added. `egress_queue` unit coverage proves concurrent claims do not return the same row twice.
 - SC2: `tests/cli_test.rs::test_cli_live_message_during_large_file_sync` proves a message becomes visible on Bob while the file is still incomplete.
 - SC3: `egress_queue` unit coverage plus `projection/create.rs` direct enqueue path prove newly-created shared events enter peer egress queues immediately.
-- SC4: `windowing.rs` and `negentropy_sqlite.rs` tests cover the `Full`/`Hot`/`Cold` envelope and range-filtered storage.
+- SC4: `windowing.rs` and range-storage tests cover the `Full`/`Hot`/`Cold` envelope and range-filtered storage.
 - SC5: `project_queue` and pipeline unit tests cover foreground-vs-bulk ordering; the CLI file-sync test provides end-to-end confirmation that bulk slices do not monopolize visibility.
 - SC6: `sync_contract_tests`, targeted CLI regressions, the full CLI suite, and the full `cargo test -q` suite pass on this branch.
 

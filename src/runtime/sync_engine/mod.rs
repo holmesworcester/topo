@@ -1,7 +1,5 @@
-pub mod negentropy_sqlite;
 pub mod runtime;
 pub mod session;
 pub mod session_handler;
 
-pub use negentropy_sqlite::NegentropyStorageSqlite;
 pub use session_handler::SyncConnectionHandler;
