@@ -1,24 +1,16 @@
 # Local Operational Runtime Completion Execution Plan
 
-Date: 2026-03-25  
-Source branch: `codex/local-operational-runtime-align`  
-Source branch tip commit: `4a7e3a3363c2baf1588ddefdfcdbdc5d26caa54d`  
-Planning branch: `codex/local-operational-runtime-roadmap`  
-Planning worktree: `/home/holmes/poc-7/.codex-worktrees/local-operational-runtime-roadmap`
+Date: 2026-03-25
+Source branch: `codex/local-operational-runtime-align`
+Implementation branch: `codex/local-operational-runtime-roadmap`
+Implementation worktree: `/home/holmes/poc-7/.codex-worktrees/local-operational-runtime-roadmap`
 
 ## Snapshot Note
 
-This planning worktree is based on the current tip commit of
-`codex/local-operational-runtime-align`.
-
-It does **not** include the uncommitted working-tree state from
-`/home/holmes/poc-7/.codex-worktrees/local-operational-runtime-align`.
-
-Any implementation agent using this roadmap must either:
-
-1. rebase/cherry-pick onto the latest implementation branch state before
-   starting, or
-2. explicitly decide to execute from the tip-commit-only snapshot above.
+This branch includes the cherry-picked baseline from
+`codex/local-operational-runtime-align` plus all roadmap implementation
+commits. The implementation is in progress — see the gaps document for
+current phase status.
 
 ## Worktree Rule
 

@@ -11,9 +11,8 @@ use crate::contracts::peering_contract::SessionDirection;
 use crate::event_modules::operational::outbound_connection_closed::record_outbound_connection_closed;
 use crate::event_modules::operational::outbound_connection_failed::{
     check_stale_dial_state, describe_connect_failure, dial_provider_with_bootstrap_policy,
-    failure_kind, is_stale_dial_failure, observe_outbound_authenticated_connection,
-    record_outbound_connection_failed, should_warn_for_connect_failure,
-    OutboundConnectionObservation,
+    failure_kind, observe_outbound_authenticated_connection, record_outbound_connection_failed,
+    should_warn_for_connect_failure, OutboundConnectionObservation,
 };
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::state::startup_reconcile::run_startup_preflight;
@@ -171,10 +170,29 @@ async fn connect_loop_inner(
     sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sni = transport_sni(remote_transport_peer_id);
-    // In-memory counters are a fallback for the legacy path (no connection_plan_id).
-    // When a plan id is present, stale-dial state is derived from projected history.
-    let mut fallback_has_connected_once = false;
-    let mut fallback_stale_failures: u32 = 0;
+
+    // Ensure a connection plan exists. If the caller didn't provide one,
+    // create an ephemeral plan so the event-owned stale-dial path always
+    // applies. No in-memory counters — all retry state is projected.
+    let connection_plan_id = match connection_plan_id {
+        Some(id) => id,
+        None => {
+            use crate::event_modules::operational::connection_planned::{
+                discovery_connection_id, record_connection_planned, ConnectionPlanSourceKind,
+            };
+            let conn_id = discovery_connection_id(recorded_by, remote_transport_peer_id);
+            let _ = record_connection_planned(
+                db_path,
+                recorded_by,
+                remote_transport_peer_id,
+                remote,
+                ConnectionPlanSourceKind::Discovery,
+                None,
+            );
+            conn_id
+        }
+    };
+
     let mut warning_gate = RepeatedWarningGate::new(REPEATED_WARNING_WINDOW);
     loop {
         if shutdown.is_cancelled() {
@@ -195,68 +213,37 @@ async fn connect_loop_inner(
         } {
             Ok(outcome) => outcome,
             Err(failure) => {
+                // Record failure as an event.
                 let message = describe_connect_failure(remote, &failure.error);
-                if let Some(connection_plan_id) = connection_plan_id.as_deref() {
-                    if let Err(err) = record_outbound_connection_failed(
-                        db_path,
-                        connection_plan_id,
-                        failure_kind(&failure.error),
-                        Some(message.as_str()),
-                        failure.used_bootstrap_fallback,
-                    ) {
-                        warn!(
-                            "failed to record outbound_connection_failed for {}: {}",
-                            connection_plan_id, err
-                        );
-                    }
+                if let Err(err) = record_outbound_connection_failed(
+                    db_path,
+                    &connection_plan_id,
+                    failure_kind(&failure.error),
+                    Some(message.as_str()),
+                    failure.used_bootstrap_fallback,
+                ) {
+                    warn!(
+                        "failed to record outbound_connection_failed for {}: {}",
+                        connection_plan_id, err
+                    );
                 }
 
-                // Derive stale-dial state from projected history when plan is available,
-                // otherwise fall back to in-memory counters.
-                let (has_connected_once, stale_terminal) =
-                    if let Some(connection_plan_id) = connection_plan_id.as_deref() {
-                        match check_stale_dial_state(
-                            db_path,
-                            connection_plan_id,
-                            STALE_DIAL_FAILURE_THRESHOLD,
-                        ) {
-                            Ok(state) => (state.has_connected_once, state.terminal_stale_count),
-                            Err(err) => {
-                                warn!(
-                                    "failed to check stale dial state for {}: {}",
-                                    connection_plan_id, err
-                                );
-                                // Degrade gracefully to in-memory counters
-                                if is_stale_dial_failure(&failure.error) {
-                                    fallback_stale_failures += 1;
-                                } else {
-                                    fallback_stale_failures = 0;
-                                }
-                                let terminal = if fallback_stale_failures
-                                    >= STALE_DIAL_FAILURE_THRESHOLD
-                                {
-                                    Some(fallback_stale_failures)
-                                } else {
-                                    None
-                                };
-                                (fallback_has_connected_once, terminal)
-                            }
-                        }
-                    } else {
-                        // Legacy path: no plan id, use in-memory counters
-                        if is_stale_dial_failure(&failure.error) {
-                            fallback_stale_failures += 1;
-                        } else {
-                            fallback_stale_failures = 0;
-                        }
-                        let terminal =
-                            if fallback_stale_failures >= STALE_DIAL_FAILURE_THRESHOLD {
-                                Some(fallback_stale_failures)
-                            } else {
-                                None
-                            };
-                        (fallback_has_connected_once, terminal)
-                    };
+                // Derive stale-dial state entirely from projected history.
+                let stale_state = check_stale_dial_state(
+                    db_path,
+                    &connection_plan_id,
+                    STALE_DIAL_FAILURE_THRESHOLD,
+                );
+                let (has_connected_once, stale_terminal) = match stale_state {
+                    Ok(state) => (state.has_connected_once, state.terminal_stale_count),
+                    Err(err) => {
+                        warn!(
+                            "failed to check stale dial state for {}: {}",
+                            connection_plan_id, err
+                        );
+                        (false, None)
+                    }
+                };
 
                 let warn_on_startup_stale_failure = bootstrap_fallback_client_config.is_some();
                 if (should_warn_for_connect_failure(has_connected_once, &failure.error)
@@ -285,8 +272,6 @@ async fn connect_loop_inner(
                 continue;
             }
         };
-        fallback_has_connected_once = true;
-        fallback_stale_failures = 0;
         warning_gate.clear();
         let provider = dial_outcome.provider;
         let used_bootstrap_fallback = dial_outcome.used_bootstrap_fallback;
@@ -297,7 +282,7 @@ async fn connect_loop_inner(
             recorded_by,
             &peer_id,
             &connection,
-            connection_plan_id.as_deref(),
+            Some(connection_plan_id.as_str()),
             used_bootstrap_fallback,
         ) {
             Ok(OutboundConnectionObservation::Authenticated { lease, peer_fp }) => (lease, peer_fp),
@@ -380,19 +365,17 @@ async fn connect_loop_inner(
             shutdown.clone(),
         )
         .await;
-        if let Some(connection_plan_id) = connection_plan_id.as_deref() {
-            if let Err(err) = record_outbound_connection_closed(
-                db_path,
-                connection_plan_id,
-                &peer_id,
-                connection.remote_address(),
-                outcome.close_reason(),
-            ) {
-                warn!(
-                    "failed to record outbound_connection_closed for {}: {}",
-                    connection_plan_id, err
-                );
-            }
+        if let Err(err) = record_outbound_connection_closed(
+            db_path,
+            &connection_plan_id,
+            &peer_id,
+            connection.remote_address(),
+            outcome.close_reason(),
+        ) {
+            warn!(
+                "failed to record outbound_connection_closed for {}: {}",
+                connection_plan_id, err
+            );
         }
         drop(connection_lease);
     }
@@ -451,7 +434,7 @@ mod tests {
         let err = crate::transport::ConnectionLifecycleError::Dial(
             "handshake to 127.0.0.1:4433: timed out".to_string(),
         );
-        assert!(is_stale_dial_failure(&err));
+        assert!(crate::event_modules::operational::outbound_connection_failed::is_stale_dial_failure(&err));
     }
 
     #[test]
@@ -459,7 +442,7 @@ mod tests {
         let err = crate::transport::ConnectionLifecycleError::DialTrustRejected(
             "handshake to 127.0.0.1:4433: trust_rejected".to_string(),
         );
-        assert!(!is_stale_dial_failure(&err));
+        assert!(!crate::event_modules::operational::outbound_connection_failed::is_stale_dial_failure(&err));
     }
 
     #[test]
