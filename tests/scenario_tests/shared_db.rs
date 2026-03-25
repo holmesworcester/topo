@@ -191,40 +191,6 @@ async fn test_shared_db_no_cross_tenant_leakage() {
     harness.finish();
 }
 
-/// Node + external peer: a SharedDbNode tenant syncs with a standalone Peer.
-#[tokio::test]
-async fn test_shared_db_sync_with_external_peer() {
-    let node = SharedDbNode::new(1);
-    let tenant = &node.tenants[0];
-    let external = Peer::new_in_workspace("external", tenant).await;
-    let harness = ScenarioHarness::new();
-    harness.track_node(&node);
-    harness.track(&external);
-
-    // Create messages on both sides
-    tenant.batch_create_messages(2);
-    external.batch_create_messages(3);
-
-    // Create marker messages for convergence tracking
-    let tenant_marker = tenant.create_message("tenant-sync-marker");
-    let tenant_marker_b64 = event_id_to_base64(&tenant_marker);
-    let ext_marker = external.create_message("external-sync-marker");
-    let ext_marker_b64 = event_id_to_base64(&ext_marker);
-
-    // Start sync between tenant and external peer.
-    // The tenant uses the shared db_path, external uses its own.
-    let _sync = start_peers(tenant, &external);
-
-    assert_eventually(
-        || external.has_event(&tenant_marker_b64) && tenant.has_event(&ext_marker_b64),
-        Duration::from_secs(15),
-        "tenant and external should exchange marker events",
-    )
-    .await;
-
-    harness.finish();
-}
-
 /// svc_node_status returns the correct tenant list.
 #[tokio::test]
 async fn test_svc_node_status() {

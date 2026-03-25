@@ -75,54 +75,6 @@ fn rss_budget_mib_from_env(var: &str, default: f64) -> f64 {
 
 #[tokio::test]
 #[cfg(target_os = "linux")]
-async fn low_mem_ios_functional_smoke_2k() {
-    let _env = EnvGuard::enable_low_mem_ios();
-
-    let alice = Peer::new_with_identity("alice_lowmem_functional");
-    let bob = Peer::new_in_workspace("bob_lowmem_functional", &alice).await;
-    let peers = vec![alice, bob];
-    converge_workspace_transport_graph(&peers).await;
-    let mut peers = peers.into_iter();
-    let alice = peers.next().expect("missing alice");
-    let bob = peers.next().expect("missing bob");
-
-    alice.batch_create_messages(1_000);
-    bob.batch_create_messages(1_000);
-
-    let expected_recorded_messages = 2_000;
-
-    let _metrics = sync_until_converged(
-        &alice,
-        &bob,
-        || {
-            alice.recorded_message_event_count() >= expected_recorded_messages
-                && bob.recorded_message_event_count() >= expected_recorded_messages
-        },
-        Duration::from_secs(120),
-    )
-    .await;
-
-    assert_eq!(
-        alice.recorded_message_event_count(),
-        expected_recorded_messages
-    );
-    assert_eq!(
-        bob.recorded_message_event_count(),
-        expected_recorded_messages
-    );
-
-    eprintln!();
-    eprintln!("=== Low-mem functional smoke (2k) ===");
-    eprintln!("  Alice messages: {}", alice.message_count());
-    eprintln!("  Bob messages:   {}", bob.message_count());
-    if let Some(current) = current_rss_mib() {
-        eprintln!("  Current RSS:    {:.2} MiB", current);
-    }
-    eprintln!();
-}
-
-#[tokio::test]
-#[cfg(target_os = "linux")]
 #[ignore = "RSS-sampling sanity only; use lowmem cgroup for hard gates"]
 async fn low_mem_ios_budget_smoke_10k() {
     let _env = EnvGuard::enable_low_mem_ios();

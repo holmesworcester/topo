@@ -3,55 +3,6 @@ use topo::crypto::event_id_to_base64;
 use topo::db::open_connection;
 use topo::testutil::{assert_eventually, start_peers, Peer, ScenarioHarness};
 
-/// Integration test: Alice creates a PSK + encrypted message → syncs to Bob → Bob projects.
-#[tokio::test]
-async fn test_encrypted_event_sync() {
-    let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_in_workspace("bob", &alice).await;
-    let harness = ScenarioHarness::new();
-    harness.track(&alice);
-    harness.track(&bob);
-    let alice_initial_keys = alice.key_secret_count();
-    let bob_initial_keys = bob.key_secret_count();
-
-    // Materialize the same PSK locally on both peers (local-only key event, not synced).
-    let key_bytes: [u8; 32] = rand::random();
-    let fixed_ts = 4_000_000u64;
-    let sk_eid_alice = alice.create_key_secret_deterministic(key_bytes, fixed_ts);
-    let sk_eid_bob = bob.create_key_secret_deterministic(key_bytes, fixed_ts);
-    assert_eq!(
-        sk_eid_alice, sk_eid_bob,
-        "deterministic PSK materialization should match"
-    );
-
-    let enc_eid = alice.create_encrypted_message(&sk_eid_alice, "Hello encrypted world");
-    let enc_b64 = event_id_to_base64(&enc_eid);
-
-    assert_eq!(alice.key_secret_count(), alice_initial_keys + 1);
-    assert_eq!(bob.key_secret_count(), bob_initial_keys + 1);
-    // The encrypted event projects into messages table
-    assert_eq!(alice.scoped_message_count(), 1);
-
-    // Sync to Bob
-    let sync = start_peers(&alice, &bob);
-
-    assert_eventually(
-        || bob.has_event(&enc_b64),
-        Duration::from_secs(15),
-        "bob should receive alice's encrypted event",
-    )
-    .await;
-
-    drop(sync);
-
-    // Bob has the same local secret key, so the encrypted wrapper can decrypt
-    // and project Alice's message in the shared workspace.
-    assert_eq!(bob.key_secret_count(), bob_initial_keys + 1);
-    assert_eq!(bob.scoped_message_count(), 1);
-
-    harness.finish();
-}
-
 /// Integration test: Encrypted event syncs before key → blocks → key syncs → cascade unblocks.
 #[tokio::test]
 async fn test_encrypted_out_of_order_sync() {

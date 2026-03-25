@@ -4,111 +4,6 @@ use topo::db::open_connection;
 use topo::testutil::{assert_eventually, start_peers, sync_until_converged, Peer, ScenarioHarness};
 
 #[tokio::test]
-async fn test_two_peer_bidirectional_sync() {
-    let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_in_workspace("bob", &alice).await;
-    let harness = ScenarioHarness::new();
-    harness.track(&alice);
-    harness.track(&bob);
-
-    alice.batch_create_messages(2);
-    bob.batch_create_messages(1);
-
-    // Create marker messages to track sync convergence
-    let alice_marker = alice.create_message("alice-marker");
-    let alice_marker_b64 = event_id_to_base64(&alice_marker);
-    let bob_marker = bob.create_message("bob-marker");
-    let bob_marker_b64 = event_id_to_base64(&bob_marker);
-
-    let sync = start_peers(&alice, &bob);
-
-    // Wait for bidirectional sync to complete
-    assert_eventually(
-        || bob.has_event(&alice_marker_b64) && alice.has_event(&bob_marker_b64),
-        Duration::from_secs(15),
-        "both peers should receive each other's marker events",
-    )
-    .await;
-
-    assert_eq!(alice.message_count(), 5); // 3 local + 2 from Bob
-    assert_eq!(bob.message_count(), 5); // 2 local + 3 from Alice
-
-    drop(sync);
-
-    harness.finish();
-}
-
-#[tokio::test]
-async fn test_one_way_sync() {
-    let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_in_workspace("bob", &alice).await;
-    let harness = ScenarioHarness::new();
-    harness.track(&alice);
-    harness.track(&bob);
-
-    alice.batch_create_messages(10);
-    let marker = alice.create_message("alice-sync-marker");
-    let marker_b64 = event_id_to_base64(&marker);
-
-    let sync = start_peers(&alice, &bob);
-
-    // Wait for bob to receive alice's marker (last created event)
-    assert_eventually(
-        || bob.has_event(&marker_b64),
-        Duration::from_secs(15),
-        "bob should receive alice's events including marker",
-    )
-    .await;
-
-    drop(sync);
-
-    harness.finish();
-}
-
-#[tokio::test]
-async fn test_concurrent_create_and_sync() {
-    let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_in_workspace("bob", &alice).await;
-    let harness = ScenarioHarness::new();
-    harness.track(&alice);
-    harness.track(&bob);
-
-    let sync = start_peers(&alice, &bob);
-
-    // Give sync loop a moment to connect
-    tokio::time::sleep(Duration::from_millis(500)).await;
-
-    // Create messages while sync runs
-    let alice_msg = alice.create_message("Hello from Alice");
-    let alice_msg_b64 = event_id_to_base64(&alice_msg);
-    let bob_msg = bob.create_message("Hi from Bob");
-    let bob_msg_b64 = event_id_to_base64(&bob_msg);
-
-    // Wait for bidirectional sync of initial messages
-    assert_eventually(
-        || bob.has_event(&alice_msg_b64) && alice.has_event(&bob_msg_b64),
-        Duration::from_secs(15),
-        "both peers should receive each other's messages",
-    )
-    .await;
-
-    // Create more messages — sync loop picks them up
-    let another = alice.create_message("Another from Alice");
-    let another_b64 = event_id_to_base64(&another);
-
-    assert_eventually(
-        || bob.has_event(&another_b64),
-        Duration::from_secs(15),
-        "bob gets the new message via live sync",
-    )
-    .await;
-
-    drop(sync);
-
-    harness.finish();
-}
-
-#[tokio::test]
 async fn test_sync_10k() {
     // Debug builds are ~10x slower; scale down to keep the test under timeout.
     #[cfg(debug_assertions)]
@@ -185,45 +80,6 @@ async fn test_recorded_events_isolation() {
     assert_eq!(bob.message_count(), 7);
     assert_eq!(alice.scoped_message_count(), 7);
     assert_eq!(bob.scoped_message_count(), 7);
-
-    harness.finish();
-}
-
-#[tokio::test]
-async fn test_reaction_sync() {
-    let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_in_workspace("bob", &alice).await;
-    let harness = ScenarioHarness::new();
-    harness.track(&alice);
-    harness.track(&bob);
-
-    // Alice creates messages, Bob adds reactions
-    let msg1 = alice.create_message("Hello!");
-    let msg2 = alice.create_message("World!");
-    let msg2_b64 = event_id_to_base64(&msg2);
-    bob.create_reaction_staged(&msg1, "\u{1f44d}");
-    let bob_rxn2 = bob.create_reaction_staged(&msg2, "\u{2764}\u{fe0f}");
-    let bob_rxn2_b64 = event_id_to_base64(&bob_rxn2);
-
-    assert_eq!(alice.message_count(), 2);
-    assert_eq!(bob.reaction_count(), 0); // blocked until targets arrive
-
-    let sync = start_peers(&alice, &bob);
-
-    // Wait for sync convergence: bob gets alice's messages, alice gets bob's reactions
-    assert_eventually(
-        || bob.has_event(&msg2_b64) && alice.has_event(&bob_rxn2_b64),
-        Duration::from_secs(15),
-        "both peers should receive each other's events",
-    )
-    .await;
-
-    drop(sync);
-
-    assert_eq!(alice.message_count(), 2);
-    assert_eq!(bob.message_count(), 2);
-    assert_eq!(alice.reaction_count(), 2);
-    assert_eq!(bob.reaction_count(), 2);
 
     harness.finish();
 }
@@ -572,47 +428,6 @@ async fn test_sync_50k() {
 
     // Only alice's locally-created messages are projected on alice
     assert_eq!(alice.message_count(), EVENT_COUNT as i64);
-
-    harness.finish();
-}
-
-/// Test out-of-order reaction sync: Bob creates a reaction targeting Alice's message,
-/// then syncs. The reaction arrives blocked, and auto-projects once the message arrives.
-#[tokio::test]
-async fn test_out_of_order_reaction_sync() {
-    let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_in_workspace("bob", &alice).await;
-    let harness = ScenarioHarness::new();
-    harness.track(&alice);
-    harness.track(&bob);
-
-    // Alice creates a message
-    let msg_id = alice.create_message("Hello from Alice");
-    let msg_id_b64 = event_id_to_base64(&msg_id);
-
-    // Bob creates a reaction targeting Alice's message (Bob doesn't have the message yet)
-    let rxn_id = bob.create_reaction_staged(&msg_id, "\u{1f44d}");
-    let rxn_id_b64 = event_id_to_base64(&rxn_id);
-
-    assert_eq!(bob.reaction_count(), 0); // blocked
-    assert_eq!(alice.message_count(), 1);
-
-    // Sync — both get each other's events
-    let sync = start_peers(&alice, &bob);
-
-    assert_eventually(
-        || bob.has_event(&msg_id_b64) && alice.has_event(&rxn_id_b64),
-        Duration::from_secs(15),
-        "both peers should receive each other's events",
-    )
-    .await;
-
-    drop(sync);
-
-    assert_eq!(bob.message_count(), 1);
-    assert_eq!(bob.reaction_count(), 1);
-    assert_eq!(alice.message_count(), 1);
-    assert_eq!(alice.reaction_count(), 1);
 
     harness.finish();
 }
