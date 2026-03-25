@@ -1,7 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 
-use serde::Serialize;
 use serde_json::json;
 use tracing::warn;
 
@@ -14,12 +13,9 @@ use crate::db::sync_log::{
     load_config, NewSyncRun, NewSyncRunEvent,
 };
 use crate::protocol::Frame;
+use crate::runtime::sync_engine::negentropy_debug::{parse_neg_payload, MAX_CAPTURE_IDS};
 use crate::runtime::SyncStats;
 use crate::tuning::low_mem_mode;
-
-const NEG_FINGERPRINT_SIZE: usize = 16;
-const NEG_ID_SIZE: usize = 32;
-const MAX_CAPTURE_IDS: usize = 32;
 
 #[derive(Clone, Copy)]
 pub enum LogLane {
@@ -53,217 +49,6 @@ impl LogDir {
 
 fn short_peer(peer_hex: &str) -> String {
     peer_hex.chars().take(16).collect()
-}
-
-#[derive(Serialize)]
-struct NegEntry {
-    bound_ts: String,
-    bound_id_prefix: String,
-    mode: String,
-    fingerprint_hex: Option<String>,
-    id_count: Option<usize>,
-    ids: Option<Vec<String>>,
-    ids_truncated: bool,
-}
-
-#[derive(Serialize)]
-struct NegPayloadSummary {
-    protocol: Option<u64>,
-    entry_count: usize,
-    skip_count: usize,
-    fingerprint_count: usize,
-    idlist_count: usize,
-    entries: Vec<NegEntry>,
-    parse_error: Option<String>,
-}
-
-fn decode_var_int(encoded: &mut &[u8]) -> Result<u64, String> {
-    if encoded.is_empty() {
-        return Err("unexpected EOF while decoding varint".to_string());
-    }
-
-    let mut res = 0u64;
-    let mut consumed = 0usize;
-    for byte in encoded.iter() {
-        consumed += 1;
-        res = (res << 7) | (*byte as u64 & 0b0111_1111);
-        if (byte & 0b1000_0000) == 0 {
-            *encoded = &encoded[consumed..];
-            return Ok(res);
-        }
-        if consumed >= 10 {
-            return Err("varint too long".to_string());
-        }
-    }
-
-    Err("unterminated varint".to_string())
-}
-
-fn take_bytes<'a>(encoded: &'a mut &[u8], n: usize) -> Result<&'a [u8], String> {
-    if encoded.len() < n {
-        return Err(format!(
-            "unexpected EOF while decoding payload (need {}, have {})",
-            n,
-            encoded.len()
-        ));
-    }
-    let out = &encoded[..n];
-    *encoded = &encoded[n..];
-    Ok(out)
-}
-
-fn parse_neg_payload(msg: &[u8], capture_full_ids: bool) -> NegPayloadSummary {
-    let mut payload = msg;
-    let mut entries = Vec::new();
-    let mut skip_count = 0usize;
-    let mut fingerprint_count = 0usize;
-    let mut idlist_count = 0usize;
-    let mut parse_error = None;
-    let mut protocol = None;
-
-    if !payload.is_empty() {
-        protocol = Some(payload[0] as u64);
-        payload = &payload[1..];
-    } else {
-        parse_error = Some("empty negentropy payload".to_string());
-    }
-
-    let mut last_ts = 0u64;
-
-    while parse_error.is_none() && !payload.is_empty() {
-        let ts_enc = match decode_var_int(&mut payload) {
-            Ok(v) => v,
-            Err(e) => {
-                parse_error = Some(e);
-                break;
-            }
-        };
-        let mut ts = if ts_enc == 0 { u64::MAX } else { ts_enc - 1 };
-        ts = ts.saturating_add(last_ts);
-        last_ts = ts;
-
-        let id_len = match decode_var_int(&mut payload) {
-            Ok(v) => v as usize,
-            Err(e) => {
-                parse_error = Some(e);
-                break;
-            }
-        };
-        let id_prefix = match take_bytes(&mut payload, id_len) {
-            Ok(v) => hex::encode(v),
-            Err(e) => {
-                parse_error = Some(e);
-                break;
-            }
-        };
-
-        let mode = match decode_var_int(&mut payload) {
-            Ok(v) => v,
-            Err(e) => {
-                parse_error = Some(e);
-                break;
-            }
-        };
-
-        match mode {
-            0 => {
-                skip_count += 1;
-                entries.push(NegEntry {
-                    bound_ts: if ts == u64::MAX {
-                        "MAX".to_string()
-                    } else {
-                        ts.to_string()
-                    },
-                    bound_id_prefix: id_prefix,
-                    mode: "Skip".to_string(),
-                    fingerprint_hex: None,
-                    id_count: None,
-                    ids: None,
-                    ids_truncated: false,
-                });
-            }
-            1 => {
-                let fp = match take_bytes(&mut payload, NEG_FINGERPRINT_SIZE) {
-                    Ok(v) => hex::encode(v),
-                    Err(e) => {
-                        parse_error = Some(e);
-                        break;
-                    }
-                };
-                fingerprint_count += 1;
-                entries.push(NegEntry {
-                    bound_ts: if ts == u64::MAX {
-                        "MAX".to_string()
-                    } else {
-                        ts.to_string()
-                    },
-                    bound_id_prefix: id_prefix,
-                    mode: "Fingerprint".to_string(),
-                    fingerprint_hex: Some(fp),
-                    id_count: None,
-                    ids: None,
-                    ids_truncated: false,
-                });
-            }
-            2 => {
-                let total = match decode_var_int(&mut payload) {
-                    Ok(v) => v as usize,
-                    Err(e) => {
-                        parse_error = Some(e);
-                        break;
-                    }
-                };
-                let mut ids = Vec::new();
-                let keep = if capture_full_ids {
-                    total
-                } else {
-                    total.min(MAX_CAPTURE_IDS)
-                };
-                for idx in 0..total {
-                    let id = match take_bytes(&mut payload, NEG_ID_SIZE) {
-                        Ok(v) => v,
-                        Err(e) => {
-                            parse_error = Some(e);
-                            break;
-                        }
-                    };
-                    if idx < keep {
-                        ids.push(hex::encode(id));
-                    }
-                }
-                if parse_error.is_some() {
-                    break;
-                }
-                idlist_count += 1;
-                entries.push(NegEntry {
-                    bound_ts: if ts == u64::MAX {
-                        "MAX".to_string()
-                    } else {
-                        ts.to_string()
-                    },
-                    bound_id_prefix: id_prefix,
-                    mode: "IdList".to_string(),
-                    fingerprint_hex: None,
-                    id_count: Some(total),
-                    ids: Some(ids),
-                    ids_truncated: !capture_full_ids && total > MAX_CAPTURE_IDS,
-                });
-            }
-            other => {
-                parse_error = Some(format!("unexpected mode {}", other));
-            }
-        }
-    }
-
-    NegPayloadSummary {
-        protocol,
-        entry_count: entries.len(),
-        skip_count,
-        fingerprint_count,
-        idlist_count,
-        entries,
-        parse_error,
-    }
 }
 
 fn frame_detail_json(frame: &Frame, capture_full_ids: bool) -> Option<String> {

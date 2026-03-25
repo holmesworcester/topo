@@ -20,7 +20,16 @@ pub(crate) const ACCEPTED_INVITE_BOOTSTRAP_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 // - pending_invite_bootstrap_trust.expected_bootstrap_spki_fingerprint (pending bootstrap)
 //
 // Observation telemetry (peer_transport_bindings) is intentionally excluded.
-const TENANT_AUTHORIZED_FINGERPRINTS_SQL: &str = "
+//
+// The CTE body that unions these three sources is shared across multiple
+// queries via macros below. Each query composes the shared CTE prefix with
+// a variant-specific outer SELECT/WHERE suffix using concat!().
+
+/// Tenant-scoped authorized transport CTE (params: ?1 = recorded_by).
+/// Produces rows of (spki_fingerprint BLOB, expires_at INTEGER|NULL).
+macro_rules! tenant_authorized_cte {
+    () => {
+        "
     WITH authorized_transport_rows AS (
         SELECT
             p.transport_fingerprint AS spki_fingerprint,
@@ -59,12 +68,17 @@ const TENANT_AUTHORIZED_FINGERPRINTS_SQL: &str = "
         WHERE t.recorded_by = ?1
           AND length(t.expected_bootstrap_spki_fingerprint) = 32
     )
-    SELECT DISTINCT spki_fingerprint
-    FROM authorized_transport_rows
-    WHERE expires_at IS NULL OR expires_at > ?2
-";
+    "
+    };
+}
 
-const TENANT_AUTHORIZATION_EXISTS_SQL: &str = "
+/// Tenant-scoped authorized transport CTE with fingerprint equality filter
+/// (params: ?1 = recorded_by, ?2 = spki_fingerprint).
+/// Produces rows of (spki_fingerprint BLOB, expires_at INTEGER|NULL).
+/// Each UNION branch is narrowed to a single fingerprint for early pruning.
+macro_rules! tenant_authorized_cte_for_fingerprint {
+    () => {
+        "
     WITH authorized_transport_rows AS (
         SELECT
             p.transport_fingerprint AS spki_fingerprint,
@@ -106,21 +120,22 @@ const TENANT_AUTHORIZATION_EXISTS_SQL: &str = "
           AND length(t.expected_bootstrap_spki_fingerprint) = 32
           AND t.expected_bootstrap_spki_fingerprint = ?2
     )
-    SELECT EXISTS(
-        SELECT 1
-        FROM authorized_transport_rows
-        WHERE expires_at IS NULL OR expires_at > ?3
-    )
-";
+    "
+    };
+}
 
-const TENANT_HAS_ANY_AUTHORIZED_FINGERPRINT_SQL: &str = "
+/// Node-scoped authorized transport CTE (no tenant filter).
+/// Produces rows of (tenant_id TEXT, spki_fingerprint BLOB, expires_at INTEGER|NULL).
+macro_rules! node_authorized_cte {
+    () => {
+        "
     WITH authorized_transport_rows AS (
         SELECT
+            p.recorded_by AS tenant_id,
             p.transport_fingerprint AS spki_fingerprint,
             NULL AS expires_at
         FROM peers_shared p
-        WHERE p.recorded_by = ?1
-          AND length(p.transport_fingerprint) = 32
+        WHERE length(p.transport_fingerprint) = 32
           AND NOT EXISTS (
               SELECT 1 FROM removed_entities r
               WHERE r.recorded_by = p.recorded_by
@@ -137,27 +152,49 @@ const TENANT_HAS_ANY_AUTHORIZED_FINGERPRINT_SQL: &str = "
         UNION
 
         SELECT
+            t.recorded_by AS tenant_id,
             t.bootstrap_spki_fingerprint AS spki_fingerprint,
             t.expires_at AS expires_at
         FROM invite_bootstrap_trust t
-        WHERE t.recorded_by = ?1
-          AND length(t.bootstrap_spki_fingerprint) = 32
+        WHERE length(t.bootstrap_spki_fingerprint) = 32
 
         UNION
 
         SELECT
+            t.recorded_by AS tenant_id,
             t.expected_bootstrap_spki_fingerprint AS spki_fingerprint,
             t.expires_at AS expires_at
         FROM pending_invite_bootstrap_trust t
-        WHERE t.recorded_by = ?1
-          AND length(t.expected_bootstrap_spki_fingerprint) = 32
+        WHERE length(t.expected_bootstrap_spki_fingerprint) = 32
     )
-    SELECT EXISTS(
+    "
+    };
+}
+
+const TENANT_AUTHORIZED_FINGERPRINTS_SQL: &str = concat!(
+    tenant_authorized_cte!(),
+    "SELECT DISTINCT spki_fingerprint
+    FROM authorized_transport_rows
+    WHERE expires_at IS NULL OR expires_at > ?2"
+);
+
+const TENANT_AUTHORIZATION_EXISTS_SQL: &str = concat!(
+    tenant_authorized_cte_for_fingerprint!(),
+    "SELECT EXISTS(
+        SELECT 1
+        FROM authorized_transport_rows
+        WHERE expires_at IS NULL OR expires_at > ?3
+    )"
+);
+
+const TENANT_HAS_ANY_AUTHORIZED_FINGERPRINT_SQL: &str = concat!(
+    tenant_authorized_cte!(),
+    "SELECT EXISTS(
         SELECT 1
         FROM authorized_transport_rows
         WHERE expires_at IS NULL OR expires_at > ?2
-    )
-";
+    )"
+);
 
 const TENANT_AUTHORIZED_TRANSPORT_ROWS_SQL: &str = "
     WITH authorized_transport_rows AS (
@@ -246,99 +283,25 @@ const TENANT_AUTHORIZED_TRANSPORT_ROWS_SQL: &str = "
         COALESCE(peer_shared_event_id, invite_accepted_event_id, invite_event_id, '') ASC
 ";
 
-const NODE_AUTHORIZATION_EXISTS_SQL: &str = "
-    WITH authorized_transport_rows AS (
-        SELECT
-            p.recorded_by AS tenant_id,
-            p.transport_fingerprint AS spki_fingerprint,
-            NULL AS expires_at
-        FROM peers_shared p
-        WHERE length(p.transport_fingerprint) = 32
-          AND NOT EXISTS (
-              SELECT 1 FROM removed_entities r
-              WHERE r.recorded_by = p.recorded_by
-                AND r.target_event_id = p.event_id
-          )
-          AND NOT EXISTS (
-              SELECT 1 FROM removed_entities r
-              WHERE r.recorded_by = p.recorded_by
-                AND p.user_event_id IS NOT NULL
-                AND r.target_event_id = p.user_event_id
-                AND r.removal_type = 'user'
-          )
-
-        UNION
-
-        SELECT
-            t.recorded_by AS tenant_id,
-            t.bootstrap_spki_fingerprint AS spki_fingerprint,
-            t.expires_at AS expires_at
-        FROM invite_bootstrap_trust t
-        WHERE length(t.bootstrap_spki_fingerprint) = 32
-
-        UNION
-
-        SELECT
-            t.recorded_by AS tenant_id,
-            t.expected_bootstrap_spki_fingerprint AS spki_fingerprint,
-            t.expires_at AS expires_at
-        FROM pending_invite_bootstrap_trust t
-        WHERE length(t.expected_bootstrap_spki_fingerprint) = 32
-    )
-    SELECT EXISTS(
+const NODE_AUTHORIZATION_EXISTS_SQL: &str = concat!(
+    node_authorized_cte!(),
+    "SELECT EXISTS(
         SELECT 1
         FROM authorized_transport_rows
         WHERE spki_fingerprint = ?1
           AND (expires_at IS NULL OR expires_at > ?2)
-    )
-";
+    )"
+);
 
-const NODE_AUTHORIZING_TENANT_SQL: &str = "
-    WITH authorized_transport_rows AS (
-        SELECT
-            p.recorded_by AS tenant_id,
-            p.transport_fingerprint AS spki_fingerprint,
-            NULL AS expires_at
-        FROM peers_shared p
-        WHERE length(p.transport_fingerprint) = 32
-          AND NOT EXISTS (
-              SELECT 1 FROM removed_entities r
-              WHERE r.recorded_by = p.recorded_by
-                AND r.target_event_id = p.event_id
-          )
-          AND NOT EXISTS (
-              SELECT 1 FROM removed_entities r
-              WHERE r.recorded_by = p.recorded_by
-                AND p.user_event_id IS NOT NULL
-                AND r.target_event_id = p.user_event_id
-                AND r.removal_type = 'user'
-          )
-
-        UNION
-
-        SELECT
-            t.recorded_by AS tenant_id,
-            t.bootstrap_spki_fingerprint AS spki_fingerprint,
-            t.expires_at AS expires_at
-        FROM invite_bootstrap_trust t
-        WHERE length(t.bootstrap_spki_fingerprint) = 32
-
-        UNION
-
-        SELECT
-            t.recorded_by AS tenant_id,
-            t.expected_bootstrap_spki_fingerprint AS spki_fingerprint,
-            t.expires_at AS expires_at
-        FROM pending_invite_bootstrap_trust t
-        WHERE length(t.expected_bootstrap_spki_fingerprint) = 32
-    )
-    SELECT tenant_id
+const NODE_AUTHORIZING_TENANT_SQL: &str = concat!(
+    node_authorized_cte!(),
+    "SELECT tenant_id
     FROM authorized_transport_rows
     WHERE spki_fingerprint = ?1
       AND (expires_at IS NULL OR expires_at > ?2)
     ORDER BY tenant_id ASC
-    LIMIT 1
-";
+    LIMIT 1"
+);
 
 fn decode_32_byte_blob(blob: Vec<u8>) -> Option<[u8; 32]> {
     if blob.len() != 32 {
