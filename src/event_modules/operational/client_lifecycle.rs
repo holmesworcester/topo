@@ -184,6 +184,12 @@ pub fn start_runtime(
         tenant_count: tenant_count as u64,
     });
     let event_id = create_event_synchronous(conn, &client_id, &event)?;
+
+    // Enable durable jobs for this client run.
+    if let Err(e) = super::durable_jobs::enable_default_jobs(conn, &client_id) {
+        tracing::warn!("failed to enable durable jobs for {}: {}", client_id, e);
+    }
+
     Ok(ClientRun {
         client_id,
         run_id: event_id_to_base64(&event_id),
@@ -233,6 +239,16 @@ pub fn mark_runtime_stopped(
         stop_reason: stop_reason.to_string(),
     });
     let _ = create_event_synchronous(conn, &run.client_id, &event)?;
+
+    // Suppress durable jobs when runtime stops.
+    if let Err(e) = super::durable_jobs::disable_all_jobs(conn, &run.client_id) {
+        tracing::warn!(
+            "failed to disable durable jobs for {}: {}",
+            run.client_id,
+            e
+        );
+    }
+
     Ok(())
 }
 
@@ -608,6 +624,25 @@ mod tests {
             desired_runtime_action(state.as_ref(), false),
             DesiredRuntimeAction::IdleNoTenants
         );
+    }
+
+    #[test]
+    fn start_runtime_enables_durable_jobs_stop_disables() {
+        let conn = setup();
+        let db_path = "/tmp/topo-client-jobs.db";
+        let client_id = client_id_for_db_path(db_path);
+
+        let run = start_runtime(&conn, db_path, addr(7000), Some(addr(7001)), 1).unwrap();
+
+        let due = super::super::durable_jobs::poll_due_jobs(&conn, 20).unwrap();
+        assert_eq!(due.len(), 4, "start_runtime should enable 4 default jobs");
+        assert!(due.iter().all(|j| j.client_id == client_id));
+
+        mark_runtime_active(&conn, &run, addr(7443), 1).unwrap();
+        mark_runtime_stopped(&conn, &run, "test_shutdown").unwrap();
+
+        let due_after = super::super::durable_jobs::poll_due_jobs(&conn, 20).unwrap();
+        assert!(due_after.is_empty(), "stop should disable all jobs");
     }
 
     #[test]

@@ -7,6 +7,7 @@ pub(crate) mod common;
 pub mod connection_plan_transitioned;
 pub mod connection_planned;
 pub mod connection_runtime;
+pub mod durable_jobs;
 pub mod inbound_connection_authenticated;
 pub mod inbound_connection_closed;
 pub mod inbound_connection_rejected;
@@ -31,6 +32,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     inbound_connection_closed::ensure_schema(conn)?;
     connection_planned::ensure_schema(conn)?;
     connection_plan_transitioned::ensure_schema(conn)?;
+    durable_jobs::ensure_schema(conn)?;
     mdns_peer_observed::ensure_schema(conn)?;
     outbound_connection_authenticated::ensure_schema(conn)?;
     outbound_connection_failed::ensure_schema(conn)?;
