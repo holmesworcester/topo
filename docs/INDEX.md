@@ -105,6 +105,9 @@ Historical feedback artifacts, completed execution plans, and superseded plannin
 | [archive/04_event_legacy_prune_plan.md](archive/04_event_legacy_prune_plan.md) | Historical: legacy event surface pruning |
 | [archive/05_docs_archive_hygiene_plan.md](archive/05_docs_archive_hygiene_plan.md) | Historical: docs archive hygiene |
 | [archive/06_misplaced_and_superfluous_cleanup_handoff.md](archive/06_misplaced_and_superfluous_cleanup_handoff.md) | Historical: misplaced cleanup handoff |
+| [archive/CLAUDE_PERF_TASK.md](archive/CLAUDE_PERF_TASK.md) | Historical: perf follow-up handoff |
+| [archive/HANDOFF_DOWNLOAD_SIMPLIFY.md](archive/HANDOFF_DOWNLOAD_SIMPLIFY.md) | Historical: download simplification handoff |
+| [archive/REALISTIC_NETWORK_PERF_HANDOFF.md](archive/REALISTIC_NETWORK_PERF_HANDOFF.md) | Historical: realistic-network perf investigation handoff |
 
 ## Other Directories
 
