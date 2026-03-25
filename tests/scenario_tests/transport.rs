@@ -3,7 +3,7 @@ use std::time::Duration;
 
 use topo::crypto::event_id_to_base64;
 use topo::db::open_connection;
-use topo::peering::loops::{accept_loop, connect_loop_with_coordination_until_cancel};
+use topo::peering::loops::{accept_loop, connect_loop, ConnectLoopConfig};
 use topo::testutil::{
     assert_eventually, create_dynamic_endpoint_for_peer, noop_intro_spawner, test_ingest_fns, Peer,
     ScenarioHarness,
@@ -96,17 +96,21 @@ async fn test_bidirectional_connect_loops_do_not_deadlock_peer_session_gate() {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let _ = connect_loop_with_coordination_until_cancel(
-                &alice_connect_db,
-                &alice_connect_id,
-                alice_connect_ep,
-                bob_addr,
-                &bob_target,
-                None,
-                noop_intro_spawner,
-                test_ingest_fns(),
-                alice_connect_cancel,
-            )
+            let _ = connect_loop(ConnectLoopConfig {
+                db_path: alice_connect_db.clone(),
+                recorded_by: alice_connect_id.clone(),
+                endpoint: alice_connect_ep,
+                remote: bob_addr,
+                remote_transport_peer_id: bob_target.clone(),
+                client_config: None,
+                intro_spawner: noop_intro_spawner,
+                ingest: test_ingest_fns(),
+                shutdown: Some(alice_connect_cancel),
+                bootstrap_fallback_client_config: None,
+                sync_control: None,
+                auth_plan: None,
+                expected_remote_daemon_peer_id: None,
+            })
             .await;
         });
     });
@@ -121,17 +125,21 @@ async fn test_bidirectional_connect_loops_do_not_deadlock_peer_session_gate() {
             .build()
             .unwrap();
         rt.block_on(async move {
-            let _ = connect_loop_with_coordination_until_cancel(
-                &bob_connect_db,
-                &bob_connect_id,
-                bob_connect_ep,
-                alice_addr,
-                &alice_target,
-                None,
-                noop_intro_spawner,
-                test_ingest_fns(),
-                bob_connect_cancel,
-            )
+            let _ = connect_loop(ConnectLoopConfig {
+                db_path: bob_connect_db.clone(),
+                recorded_by: bob_connect_id.clone(),
+                endpoint: bob_connect_ep,
+                remote: alice_addr,
+                remote_transport_peer_id: alice_target.clone(),
+                client_config: None,
+                intro_spawner: noop_intro_spawner,
+                ingest: test_ingest_fns(),
+                shutdown: Some(bob_connect_cancel),
+                bootstrap_fallback_client_config: None,
+                sync_control: None,
+                auth_plan: None,
+                expected_remote_daemon_peer_id: None,
+            })
             .await;
         });
     });

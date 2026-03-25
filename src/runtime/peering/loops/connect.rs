@@ -35,8 +35,33 @@ const STALE_DIAL_FAILURE_THRESHOLD: u32 = 8;
 const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
 
 // ---------------------------------------------------------------------------
-// Connect loops
+// Connect loop
 // ---------------------------------------------------------------------------
+
+/// Configuration for the outbound connect loop.
+///
+/// Required fields describe the peer to connect to. Optional fields control
+/// cancellation, bootstrap fallback, and sync control integration.
+pub struct ConnectLoopConfig {
+    pub db_path: String,
+    pub recorded_by: String,
+    pub endpoint: TransportEndpoint,
+    pub remote: SocketAddr,
+    pub remote_transport_peer_id: String,
+    pub client_config: Option<TransportClientConfig>,
+    pub intro_spawner: IntroSpawnerFn,
+    pub ingest: IngestFns,
+    /// Cancellation token; if omitted a no-op token is used.
+    pub shutdown: Option<CancellationToken>,
+    /// Fallback TLS config for bootstrap-phase dials.
+    pub bootstrap_fallback_client_config: Option<TransportClientConfig>,
+    /// Sync control registry for manual trigger support.
+    pub sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
+    /// Session auth plan; defaults to PeerShared targeting remote_transport_peer_id.
+    pub auth_plan: Option<OutboundSessionAuthPlan>,
+    /// Expected remote daemon peer ID; defaults to remote_transport_peer_id.
+    pub expected_remote_daemon_peer_id: Option<String>,
+}
 
 /// Connect to a remote peer and run initiator sync over that connection.
 ///
@@ -46,246 +71,32 @@ const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
 ///
 /// When `client_config` is `Some`, outbound dials present the correct per-tenant
 /// cert and tenant-scoped trust.
-///
 pub async fn connect_loop(
-    db_path: &str,
-    recorded_by: &str,
-    endpoint: TransportEndpoint,
-    remote: SocketAddr,
-    remote_peer_id: &str,
-    client_config: Option<TransportClientConfig>,
-    intro_spawner: IntroSpawnerFn,
-    ingest: IngestFns,
+    config: ConnectLoopConfig,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    connect_loop_with_auth(
-        db_path,
-        recorded_by,
-        endpoint,
-        remote,
-        remote_peer_id,
-        remote_peer_id,
-        OutboundSessionAuthPlan::PeerShared {
-            target_peer_id: remote_peer_id.to_string(),
-        },
-        client_config,
-        intro_spawner,
-        ingest,
-    )
-    .await
-}
+    let tenants = vec![config.recorded_by.clone()];
+    run_startup_preflight(&config.db_path, &tenants, config.ingest)?;
 
-pub async fn connect_loop_with_auth(
-    db_path: &str,
-    recorded_by: &str,
-    endpoint: TransportEndpoint,
-    remote: SocketAddr,
-    remote_peer_id: &str,
-    expected_remote_daemon_peer_id: &str,
-    auth_plan: OutboundSessionAuthPlan,
-    client_config: Option<TransportClientConfig>,
-    intro_spawner: IntroSpawnerFn,
-    ingest: IngestFns,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    connect_loop_with_coordination_with_auth(
-        db_path,
-        recorded_by,
-        endpoint,
-        remote,
-        remote_peer_id,
-        expected_remote_daemon_peer_id,
-        auth_plan,
-        client_config,
-        intro_spawner,
-        ingest,
-    )
-    .await
-}
-
-pub async fn connect_loop_with_coordination(
-    db_path: &str,
-    recorded_by: &str,
-    endpoint: TransportEndpoint,
-    remote: SocketAddr,
-    remote_peer_id: &str,
-    client_config: Option<TransportClientConfig>,
-    intro_spawner: IntroSpawnerFn,
-    ingest: IngestFns,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    connect_loop_with_coordination_with_auth(
-        db_path,
-        recorded_by,
-        endpoint,
-        remote,
-        remote_peer_id,
-        remote_peer_id,
-        OutboundSessionAuthPlan::PeerShared {
-            target_peer_id: remote_peer_id.to_string(),
-        },
-        client_config,
-        intro_spawner,
-        ingest,
-    )
-    .await
-}
-
-pub async fn connect_loop_with_coordination_with_auth(
-    db_path: &str,
-    recorded_by: &str,
-    endpoint: TransportEndpoint,
-    remote: SocketAddr,
-    remote_peer_id: &str,
-    expected_remote_daemon_peer_id: &str,
-    auth_plan: OutboundSessionAuthPlan,
-    client_config: Option<TransportClientConfig>,
-    intro_spawner: IntroSpawnerFn,
-    ingest: IngestFns,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    connect_loop_with_coordination_until_cancel_with_auth(
-        db_path,
-        recorded_by,
-        endpoint,
-        remote,
-        remote_peer_id,
-        expected_remote_daemon_peer_id,
-        auth_plan,
-        client_config,
-        intro_spawner,
-        ingest,
-        CancellationToken::new(),
-    )
-    .await
-}
-
-pub async fn connect_loop_with_coordination_until_cancel(
-    db_path: &str,
-    recorded_by: &str,
-    endpoint: TransportEndpoint,
-    remote: SocketAddr,
-    remote_peer_id: &str,
-    client_config: Option<TransportClientConfig>,
-    intro_spawner: IntroSpawnerFn,
-    ingest: IngestFns,
-    shutdown: CancellationToken,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    connect_loop_with_coordination_until_cancel_with_auth(
-        db_path,
-        recorded_by,
-        endpoint,
-        remote,
-        remote_peer_id,
-        remote_peer_id,
-        OutboundSessionAuthPlan::PeerShared {
-            target_peer_id: remote_peer_id.to_string(),
-        },
-        client_config,
-        intro_spawner,
-        ingest,
-        shutdown,
-    )
-    .await
-}
-
-pub async fn connect_loop_with_coordination_until_cancel_with_auth(
-    db_path: &str,
-    recorded_by: &str,
-    endpoint: TransportEndpoint,
-    remote: SocketAddr,
-    remote_peer_id: &str,
-    expected_remote_daemon_peer_id: &str,
-    auth_plan: OutboundSessionAuthPlan,
-    client_config: Option<TransportClientConfig>,
-    intro_spawner: IntroSpawnerFn,
-    ingest: IngestFns,
-    shutdown: CancellationToken,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    connect_loop_with_coordination_until_cancel_with_fallback_with_auth(
-        db_path,
-        recorded_by,
-        endpoint,
-        remote,
-        remote_peer_id,
-        expected_remote_daemon_peer_id,
-        auth_plan,
-        client_config,
-        intro_spawner,
-        ingest,
-        shutdown,
-        None,
-        None,
-    )
-    .await
-}
-
-/// Coordinated connect loop with explicit cancellation and an optional
-/// bootstrap-fallback client config.
-pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
-    db_path: &str,
-    recorded_by: &str,
-    endpoint: TransportEndpoint,
-    remote: SocketAddr,
-    remote_peer_id: &str,
-    client_config: Option<TransportClientConfig>,
-    intro_spawner: IntroSpawnerFn,
-    ingest: IngestFns,
-    shutdown: CancellationToken,
-    bootstrap_fallback_client_config: Option<TransportClientConfig>,
-    sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    connect_loop_with_coordination_until_cancel_with_fallback_with_auth(
-        db_path,
-        recorded_by,
-        endpoint,
-        remote,
-        remote_peer_id,
-        remote_peer_id,
-        OutboundSessionAuthPlan::PeerShared {
-            target_peer_id: remote_peer_id.to_string(),
-        },
-        client_config,
-        intro_spawner,
-        ingest,
-        shutdown,
-        bootstrap_fallback_client_config,
-        sync_control,
-    )
-    .await
-}
-
-pub async fn connect_loop_with_coordination_until_cancel_with_fallback_with_auth(
-    db_path: &str,
-    recorded_by: &str,
-    endpoint: TransportEndpoint,
-    remote: SocketAddr,
-    remote_peer_id: &str,
-    expected_remote_daemon_peer_id: &str,
-    auth_plan: OutboundSessionAuthPlan,
-    client_config: Option<TransportClientConfig>,
-    intro_spawner: IntroSpawnerFn,
-    ingest: IngestFns,
-    shutdown: CancellationToken,
-    bootstrap_fallback_client_config: Option<TransportClientConfig>,
-    sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let tenants = vec![recorded_by.to_string()];
-    run_startup_preflight(db_path, &tenants, ingest)?;
-
+    let shutdown = config.shutdown.unwrap_or_default();
     // Use LocalSet so the intro listener (spawn_intro_listener uses spawn_local)
     // can run on the same runtime that drives the endpoint I/O.
     let local = tokio::task::LocalSet::new();
     local
         .run_until(connect_loop_inner(
-            db_path,
-            recorded_by,
-            endpoint,
-            remote,
-            remote_peer_id,
-            expected_remote_daemon_peer_id,
-            auth_plan,
-            client_config,
-            intro_spawner,
+            &config.db_path,
+            &config.recorded_by,
+            config.endpoint,
+            config.remote,
+            &config.remote_transport_peer_id,
+            config.expected_remote_daemon_peer_id.as_deref().unwrap_or(&config.remote_transport_peer_id),
+            config.auth_plan.unwrap_or_else(|| OutboundSessionAuthPlan::PeerShared {
+                target_peer_id: config.remote_transport_peer_id.clone(),
+            }),
+            config.client_config,
+            config.intro_spawner,
             shutdown,
-            bootstrap_fallback_client_config,
-            sync_control,
+            config.bootstrap_fallback_client_config,
+            config.sync_control,
         ))
         .await
 }

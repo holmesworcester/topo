@@ -15,9 +15,9 @@ use topo::db::intro::{freshest_endpoint, list_intro_attempts};
 use topo::db::open_connection;
 use topo::db::project_queue::ProjectQueue;
 use topo::db::transport_trust::authorized_fingerprints_from_db;
-use topo::peering::loops::accept_loop;
-use topo::peering::workflows::intro::build_intro_offer;
-use topo::peering::workflows::punch::{handle_intro_offer, spawn_intro_listener};
+use topo::peering::loops::{accept_loop, connect_loop, ConnectLoopConfig};
+use topo::peering::workflows::intro::{build_intro_offer, run_intro, send_intro_offer};
+use topo::peering::workflows::punch::spawn_intro_listener;
 use topo::projection::apply::project_one;
 use topo::shared::protocol::Frame;
 use topo::testutil::{assert_eventually, create_dynamic_endpoint_for_peer, start_peers, Peer};
@@ -87,12 +87,87 @@ async fn test_three_peer_intro_happy_path() {
     let addr_a = ep_a.local_addr().expect("addr_a");
     let addr_b = ep_b.local_addr().expect("addr_b");
 
-    // --- Phase 1: Bootstrap sync I<->A and I<->B ---
-    // The pure test harness uses the ingest/projection path for steady-state
-    // sync. Seed the same shared graph the introducer would have learned over
-    // network sync, then record the endpoint observations explicitly.
-    let _sync_ia = start_peers(&intro, &peer_a);
-    let _sync_ib = start_peers(&intro, &peer_b);
+    // --- Phase 1: Relay sync I<->A and I<->B ---
+    // I runs accept_loop; A and B connect to I using their dual endpoints.
+    // I's accept_loop organically records endpoint observations for A and B
+    // at their dual endpoint source addresses (= their listening addresses).
+    let i_ep1 = ep_i.clone();
+    let i_db = intro.db_path.clone();
+    let i_id = intro.identity.clone();
+    let _i_accept = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let _ = accept_loop(
+                &i_db,
+                &i_id,
+                i_ep1,
+                spawn_intro_listener,
+                topo::testutil::test_ingest_fns(),
+            )
+            .await;
+        });
+    });
+
+    let a_ep1 = ep_a.clone();
+    let a_db1 = peer_a.db_path.clone();
+    let a_id1 = peer_a.identity.clone();
+    let intro_target_for_a = intro.transport_peer_id();
+    let _a_connect = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let _ = connect_loop(ConnectLoopConfig {
+                db_path: a_db1.clone(),
+                recorded_by: a_id1.clone(),
+                endpoint: a_ep1,
+                remote: addr_i,
+                remote_transport_peer_id: intro_target_for_a.clone(),
+                client_config: None,
+                intro_spawner: spawn_intro_listener,
+                ingest: topo::testutil::test_ingest_fns(),
+                shutdown: None,
+                bootstrap_fallback_client_config: None,
+                sync_control: None,
+                auth_plan: None,
+                expected_remote_daemon_peer_id: None,
+            })
+            .await;
+        });
+    });
+
+    let b_ep1 = ep_b.clone();
+    let b_db1 = peer_b.db_path.clone();
+    let b_id1 = peer_b.identity.clone();
+    let intro_target_for_b = intro.transport_peer_id();
+    let _b_connect = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let _ = connect_loop(ConnectLoopConfig {
+                db_path: b_db1.clone(),
+                recorded_by: b_id1.clone(),
+                endpoint: b_ep1,
+                remote: addr_i,
+                remote_transport_peer_id: intro_target_for_b.clone(),
+                client_config: None,
+                intro_spawner: spawn_intro_listener,
+                ingest: topo::testutil::test_ingest_fns(),
+                shutdown: None,
+                bootstrap_fallback_client_config: None,
+                sync_control: None,
+                auth_plan: None,
+                expected_remote_daemon_peer_id: None,
+            })
+            .await;
+        });
+    });
 
     // Wait for bootstrap message exchange needed by the intro flow.
     assert_eventually(
