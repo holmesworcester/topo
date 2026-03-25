@@ -509,10 +509,42 @@ async fn run_bootstrap_refresher(
     db_path: String,
     shutdown: CancellationToken,
 ) -> Result<(), String> {
+    use crate::event_modules::operational::durable_jobs::{
+        complete_job, next_due_at, poll_due_jobs, DurableJobKind,
+    };
     let mut warning_gate = RepeatedWarningGate::new(Duration::from_secs(300));
     loop {
         if shutdown.is_cancelled() {
             break;
+        }
+
+        // Check if the bootstrap refresh job is due. If not, sleep until it
+        // is, or fall back to a 1s poll. This replaces the old fixed-cadence
+        // `tokio::time::sleep(1000ms)` with durable-job-driven timing.
+        let sleep_ms = {
+            let conn = open_connection(&db_path).map_err(|e| e.to_string())?;
+            let due = poll_due_jobs(&conn, 1)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|j| j.kind == DurableJobKind::BootstrapRefresh);
+            if due.is_none() {
+                let next = next_due_at(&conn).map_err(|e| e.to_string())?;
+                let now = crate::db::queue::current_timestamp_ms();
+                let wait = next.map(|t| (t - now).max(50)).unwrap_or(1000);
+                drop(conn);
+                wait as u64
+            } else {
+                drop(conn);
+                0
+            }
+        };
+
+        if sleep_ms > 0 {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
+            }
+            continue;
         }
 
         match collect_all_bootstrap_targets(&db_path) {
@@ -542,9 +574,14 @@ async fn run_bootstrap_refresher(
             }
         }
 
+        // Mark the job as completed — advances next_due_at_ms by interval.
+        if let Ok(conn) = open_connection(&db_path) {
+            let _ = complete_job(&conn, &client_id_for_db(&db_path), DurableJobKind::BootstrapRefresh);
+        }
+
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
     }
 
@@ -555,10 +592,39 @@ async fn run_observed_endpoint_refresher(
     db_path: String,
     shutdown: CancellationToken,
 ) -> Result<(), String> {
+    use crate::event_modules::operational::durable_jobs::{
+        complete_job, next_due_at, poll_due_jobs, DurableJobKind,
+    };
     let mut warning_gate = RepeatedWarningGate::new(Duration::from_secs(300));
     loop {
         if shutdown.is_cancelled() {
             break;
+        }
+
+        let sleep_ms = {
+            let conn = open_connection(&db_path).map_err(|e| e.to_string())?;
+            let due = poll_due_jobs(&conn, 1)
+                .map_err(|e| e.to_string())?
+                .into_iter()
+                .find(|j| j.kind == DurableJobKind::ObservedEndpointRefresh);
+            if due.is_none() {
+                let next = next_due_at(&conn).map_err(|e| e.to_string())?;
+                let now = crate::db::queue::current_timestamp_ms();
+                let wait = next.map(|t| (t - now).max(50)).unwrap_or(1000);
+                drop(conn);
+                wait as u64
+            } else {
+                drop(conn);
+                0
+            }
+        };
+
+        if sleep_ms > 0 {
+            tokio::select! {
+                _ = shutdown.cancelled() => break,
+                _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
+            }
+            continue;
         }
 
         match collect_all_observed_endpoint_targets(&db_path) {
@@ -585,13 +651,25 @@ async fn run_observed_endpoint_refresher(
             }
         }
 
+        if let Ok(conn) = open_connection(&db_path) {
+            let _ = complete_job(
+                &conn,
+                &client_id_for_db(&db_path),
+                DurableJobKind::ObservedEndpointRefresh,
+            );
+        }
+
         tokio::select! {
             _ = shutdown.cancelled() => break,
-            _ = tokio::time::sleep(Duration::from_millis(1000)) => {}
+            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
     }
 
     Ok(())
+}
+
+fn client_id_for_db(db_path: &str) -> String {
+    crate::event_modules::operational::client_lifecycle::client_id_for_db_path(db_path)
 }
 
 #[cfg(feature = "discovery")]
