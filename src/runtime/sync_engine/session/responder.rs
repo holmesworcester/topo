@@ -6,6 +6,13 @@ use crate::db::{
     open_connection,
     store::{lookup_workspace_id, Store},
 };
+use crate::event_modules::operational::client_lifecycle::client_id_for_db_path;
+use crate::event_modules::operational::sync_round_completed::{
+    create_sync_round_completed, SyncRoundOutcome,
+};
+use crate::event_modules::operational::sync_round_started::{
+    create_sync_round_started, load_inbound_basis_for_peer, SyncRoundRole,
+};
 use crate::protocol::{neg_id_to_event_id, Frame};
 use crate::runtime::SyncStats;
 use crate::sync::session::logging::SyncRunRxCapture;
@@ -119,82 +126,142 @@ where
             recorded_by
         )
     })?;
-    let storage = load_range_storage(&db, &ws_id, range)?;
-    let mut neg =
-        Negentropy::borrowed(&storage, crate::sync::session::negentropy_frame_size(range))?;
-
-    let mut have_ids = Vec::<Id>::new();
-    let mut need_ids = Vec::<Id>::new();
-    let mut next_query = Some(neg_msg.to_vec());
-    loop {
-        let query = if let Some(query) = next_query.take() {
-            query
-        } else {
-            let next =
-                tokio::time::timeout(INITIAL_CONTROL_PROGRESS_TIMEOUT, control.recv()).await??;
-            let Frame::NegMsg { msg } = next else {
-                return Err("responder expected follow-up NegMsg".into());
-            };
-            msg
-        };
-        if query.is_empty() {
-            break;
-        }
-        let response = neg.reconcile_with_diff(&query, &mut have_ids, &mut need_ids)?;
-        control.send(&Frame::NegMsg { msg: response }).await?;
-        control.flush().await?;
-    }
-    have_ids.sort_unstable();
-    have_ids.dedup();
-    need_ids.sort_unstable();
-    need_ids.dedup();
-    drain_manual_commands(peer_id, &mut command_rx, &mut pending_round_replies);
-    reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);
-
-    let hot_receive = is_hot_window(range.kind);
-    if hot_receive {
-        note_hot_receive_started(db_path);
-    }
-    let receive_task = spawn_receive_log_task(
-        data_recv,
-        db_path.to_string(),
-        recorded_by.to_string(),
+    let client_id = client_id_for_db_path(db_path);
+    let basis = load_inbound_basis_for_peer(&db, &client_id, recorded_by, peer_id)?
+        .ok_or_else(|| format!("no live inbound connection basis for peer {peer_id}"))?;
+    let round_started = create_sync_round_started(
+        &db,
+        &client_id,
+        crate::crypto::event_id_from_base64(&basis.event_id)
+            .ok_or_else(|| format!("invalid inbound basis event id {}", basis.event_id))?,
+        &basis.connection_id,
+        recorded_by,
+        peer_id,
         session_id,
-        ingress_source_tag.to_string(),
-        activity_timeout,
-        rx_capture,
-    );
+        SyncRoundRole::Responder,
+        &format!("{:?}", range.kind).to_ascii_lowercase(),
+        range.ts_min(),
+        range.ts_max_exclusive(),
+        None,
+        None,
+    )?;
+    let storage = load_range_storage(&db, &ws_id, range)?;
+    let round_result: Result<SyncStats, Box<dyn std::error::Error + Send + Sync>> = async {
+        let mut neg =
+            Negentropy::borrowed(&storage, crate::sync::session::negentropy_frame_size(range))?;
 
-    let store = Store::new(&db);
-    let (events_sent, bytes_sent) = send_have_events(&store, &mut data_send, &have_ids).await?;
-    drop(data_send);
+        let mut have_ids = Vec::<Id>::new();
+        let mut need_ids = Vec::<Id>::new();
+        let mut next_query = Some(neg_msg.to_vec());
+        loop {
+            let query = if let Some(query) = next_query.take() {
+                query
+            } else {
+                let next = tokio::time::timeout(INITIAL_CONTROL_PROGRESS_TIMEOUT, control.recv())
+                    .await??;
+                let Frame::NegMsg { msg } = next else {
+                    return Err("responder expected follow-up NegMsg".into());
+                };
+                msg
+            };
+            if query.is_empty() {
+                break;
+            }
+            let response = neg.reconcile_with_diff(&query, &mut have_ids, &mut need_ids)?;
+            control.send(&Frame::NegMsg { msg: response }).await?;
+            control.flush().await?;
+        }
+        have_ids.sort_unstable();
+        have_ids.dedup();
+        need_ids.sort_unstable();
+        need_ids.dedup();
+        drain_manual_commands(peer_id, &mut command_rx, &mut pending_round_replies);
+        reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);
 
-    let received = match receive_task.await {
-        Ok(result) => {
-            if hot_receive {
-                note_hot_receive_finished(db_path);
-            }
-            result.map_err(|e| format!("receive log task: {e}"))?
+        let hot_receive = is_hot_window(range.kind);
+        if hot_receive {
+            note_hot_receive_started(db_path);
         }
-        Err(e) => {
-            if hot_receive {
-                note_hot_receive_finished(db_path);
+        let receive_task = spawn_receive_log_task(
+            data_recv,
+            db_path.to_string(),
+            recorded_by.to_string(),
+            session_id,
+            ingress_source_tag.to_string(),
+            activity_timeout,
+            rx_capture,
+        );
+
+        let store = Store::new(&db);
+        let (events_sent, bytes_sent) = send_have_events(&store, &mut data_send, &have_ids).await?;
+        drop(data_send);
+
+        let received = match receive_task.await {
+            Ok(result) => {
+                if hot_receive {
+                    note_hot_receive_finished(db_path);
+                }
+                result.map_err(|e| format!("receive log task: {e}"))?
             }
-            return Err(format!("receive log task join: {e}").into());
+            Err(e) => {
+                if hot_receive {
+                    note_hot_receive_finished(db_path);
+                }
+                return Err(format!("receive log task join: {e}").into());
+            }
+        };
+        if let Some(path) = received.path.clone() {
+            enqueue_receive_log_ingest(db_path, path);
         }
-    };
-    if let Some(path) = received.path.clone() {
-        enqueue_receive_log_ingest(db_path, path);
+        drain_manual_commands(peer_id, &mut command_rx, &mut pending_round_replies);
+        reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);
+
+        Ok(SyncStats {
+            events_sent,
+            events_received: received.events_received,
+            neg_rounds: 1,
+            bytes_sent,
+            bytes_received: received.bytes_received,
+            duration_ms: start.elapsed().as_millis(),
+        })
     }
-    drain_manual_commands(peer_id, &mut command_rx, &mut pending_round_replies);
-    reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);
+    .await;
 
-    Ok(SyncStats {
-        events_sent,
-        events_received: received.events_received,
-        neg_rounds: 1,
-        bytes_sent,
-        bytes_received: received.bytes_received,
-        duration_ms: start.elapsed().as_millis(),
-    })
+    let completion = match &round_result {
+        Ok(stats) => create_sync_round_completed(
+            &db,
+            &client_id,
+            round_started,
+            SyncRoundOutcome::Ok,
+            None,
+            stats.events_sent as i64,
+            stats.events_received as i64,
+            stats.neg_rounds as i64,
+            stats.bytes_sent as i64,
+            stats.bytes_received as i64,
+            stats.duration_ms as i64,
+        ),
+        Err(err) => create_sync_round_completed(
+            &db,
+            &client_id,
+            round_started,
+            SyncRoundOutcome::Error,
+            Some(&err.to_string()),
+            0,
+            0,
+            0,
+            0,
+            0,
+            start.elapsed().as_millis() as i64,
+        ),
+    };
+    if let Err(err) = completion {
+        tracing::warn!(
+            "failed to author sync_round_completed for session {}: {}",
+            session_id,
+            err
+        );
+    }
+
+    round_result
 }

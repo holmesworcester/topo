@@ -11,6 +11,7 @@ pub enum SqlVal {
     Text(String),
     Int(i64),
     Blob(Vec<u8>),
+    Null,
 }
 
 /// A single idempotent database write operation returned by a pure projector.
@@ -21,6 +22,24 @@ pub enum WriteOp {
         table: &'static str,
         columns: Vec<&'static str>,
         values: Vec<SqlVal>,
+    },
+    /// INSERT OR REPLACE INTO table (columns...) VALUES (values...).
+    ///
+    /// Operational local-event projections use this for durable current-state
+    /// tables whose truth should be replaced by the latest authored event.
+    InsertOrReplace {
+        table: &'static str,
+        columns: Vec<&'static str>,
+        values: Vec<SqlVal>,
+    },
+    /// UPDATE table SET col1 = v1, col2 = v2 ... WHERE key1 = w1 AND key2 = w2 ...
+    ///
+    /// Operational transition events use this for durable current-state rows
+    /// whose identity is stable but whose status fields advance over time.
+    Update {
+        table: &'static str,
+        assignments: Vec<(&'static str, SqlVal)>,
+        where_clause: Vec<(&'static str, SqlVal)>,
     },
     /// DELETE FROM table WHERE col1 = v1 AND col2 = v2 ...
     Delete {
@@ -52,6 +71,10 @@ pub enum EmitCommand {
     /// Emit a canonical deterministic event blob through the normal event
     /// pipeline (events + recorded_events + project_one).
     EmitDeterministicBlob { blob: Vec<u8> },
+    /// Wake the thin runtime reconciler for a specific connection plan.
+    WakeConnectionPlan { connection_id: String },
+    /// Wake the thin runtime reconciler for a specific client runtime.
+    WakeClientRuntime { client_id: String },
 }
 
 /// The pure projector contract: everything a projector returns.
@@ -226,6 +249,42 @@ pub struct ContextSnapshot {
     /// True when peer_shared transport creds are already active for this tenant.
     /// Used to prevent bootstrap-identity re-install attempts after convergence.
     pub peer_shared_transport_identity_active: bool,
+
+    /// Latest append-only client runtime snapshot loaded for an operational
+    /// lifecycle transition event.
+    pub client_runtime_snapshot: Option<ClientRuntimeSnapshot>,
+    /// Populated when a client lifecycle transition was authored from a stale
+    /// basis event rather than the latest run snapshot.
+    pub client_runtime_basis_mismatch_reason: Option<String>,
+
+    /// Latest append-only connection-plan snapshot loaded for an operational
+    /// planning transition event.
+    pub connection_plan_snapshot: Option<ConnectionPlanSnapshot>,
+    /// Populated when a connection-plan transition was authored from a stale
+    /// basis event rather than the latest plan snapshot.
+    pub connection_plan_basis_mismatch_reason: Option<String>,
+
+    /// Latest append-only inbound-connection snapshot loaded for an
+    /// operational lifecycle event.
+    pub inbound_connection_snapshot: Option<InboundConnectionSnapshot>,
+    /// Populated when an inbound-connection lifecycle event was authored from
+    /// a stale basis event rather than the latest connection snapshot.
+    pub inbound_connection_basis_mismatch_reason: Option<String>,
+
+    /// Connection basis snapshot for sync-round start events. This may come
+    /// from outbound or inbound authenticated connection history, depending on
+    /// which local stream authored the round.
+    pub sync_connection_snapshot: Option<SyncConnectionSnapshot>,
+    /// Populated when a sync-round start event was authored from a stale
+    /// connection basis rather than the latest connection leaf.
+    pub sync_connection_basis_mismatch_reason: Option<String>,
+
+    /// Latest append-only sync-round snapshot loaded for a sync-round
+    /// completion event.
+    pub sync_round_snapshot: Option<SyncRoundSnapshot>,
+    /// Populated when a sync-round completion event was authored from a stale
+    /// basis event rather than the latest round snapshot.
+    pub sync_round_basis_mismatch_reason: Option<String>,
 }
 
 /// Unwrapped symmetric key material derived from KeyShared.
@@ -241,4 +300,88 @@ pub struct BootstrapContextSnapshot {
     pub workspace_id: String,
     pub bootstrap_addrs: Vec<String>,
     pub bootstrap_spki_fingerprint: [u8; 32],
+}
+
+#[derive(Debug, Clone)]
+pub struct ClientRuntimeSnapshot {
+    pub event_id: String,
+    pub client_id: String,
+    pub run_id: String,
+    pub db_path: String,
+    pub configured_bind_addr: String,
+    pub reserved_bind_addr: Option<String>,
+    pub listen_addr: Option<String>,
+    pub runtime_status: String,
+    pub tenant_count: i64,
+    pub started_at_ms: i64,
+    pub activated_at_ms: Option<i64>,
+    pub stopped_at_ms: Option<i64>,
+    pub stop_reason: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct ConnectionPlanSnapshot {
+    pub event_id: String,
+    pub tenant_id: String,
+    pub connection_id: String,
+    pub remote_peer_id: String,
+    pub remote_addr: String,
+    pub source_kind: String,
+    pub invite_event_id: Option<String>,
+    pub plan_status: String,
+    pub decision_reason: Option<String>,
+    pub basis_event_id: Option<String>,
+    pub next_attempt_not_before_ms: Option<i64>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct InboundConnectionSnapshot {
+    pub event_id: String,
+    pub recorded_by: String,
+    pub tenant_id: Option<String>,
+    pub connection_id: String,
+    pub lifecycle_kind: String,
+    pub requested_local_transport_peer_id: Option<String>,
+    pub remote_peer_id: String,
+    pub remote_addr: String,
+    pub basis_event_id: String,
+    pub rejection_kind: Option<String>,
+    pub detail: Option<String>,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncConnectionSnapshot {
+    pub event_id: String,
+    pub recorded_by: String,
+    pub tenant_id: String,
+    pub connection_id: String,
+    pub lifecycle_kind: String,
+    pub remote_peer_id: String,
+    pub remote_addr: String,
+    pub created_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+pub struct SyncRoundSnapshot {
+    pub event_id: String,
+    pub round_id: String,
+    pub recorded_by: String,
+    pub tenant_id: String,
+    pub connection_id: String,
+    pub peer_id: String,
+    pub session_id: i64,
+    pub round_role: String,
+    pub window_kind: String,
+    pub ts_min_inclusive_ms: Option<i64>,
+    pub ts_max_exclusive_ms: Option<i64>,
+    pub planner_next_idx_before: Option<i64>,
+    pub planner_cycle_anchor_now_ms: Option<i64>,
+    pub lifecycle_kind: String,
+    pub outcome: Option<String>,
+    pub detail: Option<String>,
+    pub basis_event_id: String,
+    pub created_at_ms: i64,
 }

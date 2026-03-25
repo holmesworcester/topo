@@ -7,6 +7,7 @@ use std::time::Duration;
 use tokio_util::sync::CancellationToken;
 
 use topo::contracts::peering_contract::{SessionDirection, SessionHandler};
+use topo::db::open_connection;
 use topo::sync::session_handler::SyncConnectionHandler;
 
 use crate::fake_session_io::{create_test_db, fake_session_io_pair, run_local, test_session_meta};
@@ -110,6 +111,63 @@ async fn responder_cancellation_terminates_handler() {
             result.is_err(),
             "cancelled responder session should return error"
         );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn mid_session_cancellation_records_cancelled_round_completion() {
+    run_local(async {
+        let (db_path, _tmpdir) = create_test_db("test-tenant");
+        let handler = SyncConnectionHandler::outbound(db_path.clone(), 30);
+        let meta = test_session_meta(SessionDirection::Outbound);
+        let session_id = meta.session_id as i64;
+        let tenant_id = meta.tenant.0.clone();
+        let cancel = CancellationToken::new();
+
+        let (fake_io, mut peer) = fake_session_io_pair(meta.session_id);
+
+        let cancel_clone = cancel.clone();
+        let handler_task = tokio::task::spawn_local(async move {
+            handler
+                .on_session(meta, Box::new(fake_io), cancel_clone)
+                .await
+        });
+
+        let _ = peer
+            .recv_control_msg_timeout(Duration::from_secs(5))
+            .await
+            .expect("expected initial NegOpen");
+        cancel.cancel();
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handler_task)
+            .await
+            .expect("handler did not terminate after cancellation")
+            .expect("handler panicked");
+        assert!(result.is_err(), "cancelled session should return error");
+
+        let conn = open_connection(&db_path).expect("open db");
+        let round_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM sync_round_history WHERE recorded_by = ?1 AND session_id = ?2",
+                rusqlite::params![tenant_id, session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(round_rows, 2, "expected started + completed round rows");
+
+        let outcome: String = conn
+            .query_row(
+                "SELECT outcome
+                 FROM sync_round_history
+                 WHERE recorded_by = ?1 AND session_id = ?2 AND lifecycle_kind = 'completed'
+                 ORDER BY created_at DESC, event_id DESC
+                 LIMIT 1",
+                rusqlite::params!["test-tenant", session_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(outcome, "cancelled");
     })
     .await;
 }

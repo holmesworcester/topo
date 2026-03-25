@@ -1592,12 +1592,14 @@ fn run_sync_log_action(
 }
 
 struct ManagedRuntime {
+    db_path: String,
     tenant_states: Vec<RuntimeTenantState>,
     shutdown_notify: Arc<tokio::sync::Notify>,
     handle: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
     /// Shared cert resolver — kept so new tenants can register certs
     /// on the live endpoint without restarting.
     cert_resolver: Arc<topo::transport::multi_workspace::TransportTargetCertResolver>,
+    client_run: topo::event_modules::operational::client_lifecycle::ClientRun,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -1739,12 +1741,36 @@ fn register_new_tenant_certs(
 }
 
 async fn stop_runtime(runtime: ManagedRuntime) {
+    let db_path = runtime.db_path.clone();
+    let client_run = runtime.client_run.clone();
     runtime.shutdown_notify.notify_one();
-    match tokio::time::timeout(Duration::from_secs(5), runtime.handle).await {
-        Ok(Ok(Ok(()))) => {}
-        Ok(Ok(Err(e))) => tracing::warn!("runtime exited with error during stop: {}", e),
-        Ok(Err(e)) => tracing::warn!("runtime task join error during stop: {}", e),
-        Err(_) => tracing::warn!("timed out waiting for runtime to stop"),
+    let stop_reason = match tokio::time::timeout(Duration::from_secs(5), runtime.handle).await {
+        Ok(Ok(Ok(()))) => "graceful_shutdown",
+        Ok(Ok(Err(e))) => {
+            tracing::warn!("runtime exited with error during stop: {}", e);
+            "runtime_error_during_stop"
+        }
+        Ok(Err(e)) => {
+            tracing::warn!("runtime task join error during stop: {}", e);
+            "runtime_join_error_during_stop"
+        }
+        Err(_) => {
+            tracing::warn!("timed out waiting for runtime to stop");
+            "runtime_stop_timeout"
+        }
+    };
+    if let Ok(conn) = open_connection(&db_path) {
+        if let Err(err) = topo::event_modules::operational::client_lifecycle::mark_runtime_stopped(
+            &conn,
+            &client_run,
+            stop_reason,
+        ) {
+            tracing::warn!(
+                "failed to record client runtime stop for run {}: {}",
+                client_run.run_id,
+                err
+            );
+        }
     }
 }
 
@@ -1822,7 +1848,8 @@ fn spawn_runtime(
     bind: SocketAddr,
     state: Arc<DaemonState>,
     tenant_states: Vec<RuntimeTenantState>,
-) -> ManagedRuntime {
+    client_run: topo::event_modules::operational::client_lifecycle::ClientRun,
+) -> Result<ManagedRuntime, Box<dyn std::error::Error + Send + Sync>> {
     // Runtime is Active only after listen_addr is reported.
     // Clear stale UPnP result — the port may change across restarts.
     *state.runtime_state.write().unwrap() = RuntimeState::IdleNoTenants;
@@ -1836,9 +1863,14 @@ fn spawn_runtime(
     let runtime_shutdown = Arc::new(tokio::sync::Notify::new());
     let runtime_shutdown_for_task = runtime_shutdown.clone();
     let db_for_task = db_path.to_string();
+    let conn = open_connection(db_path)?;
+    create_tables(&conn)?;
 
     let (net_tx, net_rx) = tokio::sync::oneshot::channel::<topo::node::NodeRuntimeNetInfo>();
     let state_for_net = state.clone();
+    let db_for_net = db_path.to_string();
+    let client_run_for_net = client_run.clone();
+    let tenant_count = tenant_states.len();
     tokio::spawn(async move {
         if let Ok(info) = net_rx.await {
             println!("Build: {}", env!("TOPO_GIT_HASH"));
@@ -1846,6 +1878,31 @@ fn spawn_runtime(
             let listen_addr = info.listen_addr.parse::<SocketAddr>().ok();
             *state_for_net.runtime_net.write().unwrap() = Some(info);
             *state_for_net.runtime_state.write().unwrap() = RuntimeState::Active;
+            if let Some(listen_addr) = listen_addr {
+                match open_connection(&db_for_net) {
+                    Ok(conn) => {
+                        if let Err(err) =
+                            topo::event_modules::operational::client_lifecycle::mark_runtime_active(
+                                &conn,
+                                &client_run_for_net,
+                                listen_addr,
+                                tenant_count,
+                            )
+                        {
+                            tracing::warn!(
+                                "failed to record client runtime active for run {}: {}",
+                                client_run_for_net.run_id,
+                                err
+                            );
+                        }
+                    }
+                    Err(err) => tracing::warn!(
+                        "failed to open DB while recording runtime active for run {}: {}",
+                        client_run_for_net.run_id,
+                        err
+                    ),
+                }
+            }
             if *state_for_net.upnp_enabled.read().unwrap() {
                 if let Some(listen_addr) = listen_addr {
                     let refresh_state = state_for_net.clone();
@@ -1870,12 +1927,14 @@ fn spawn_runtime(
         .await
     });
 
-    ManagedRuntime {
+    Ok(ManagedRuntime {
+        db_path: db_path.to_string(),
         tenant_states,
         shutdown_notify: runtime_shutdown,
         handle,
         cert_resolver,
-    }
+        client_run,
+    })
 }
 
 async fn reevaluate_runtime(
@@ -1891,11 +1950,44 @@ async fn reevaluate_runtime(
         .unwrap_or(false)
     {
         let finished = active_runtime.take().unwrap();
+        let finished_db_path = finished.db_path.clone();
+        let finished_client_run = finished.client_run.clone();
         match finished.handle.await {
-            Ok(Ok(())) => {}
+            Ok(Ok(())) => {
+                if let Ok(conn) = open_connection(&finished_db_path) {
+                    if let Err(err) =
+                        topo::event_modules::operational::client_lifecycle::mark_runtime_stopped(
+                            &conn,
+                            &finished_client_run,
+                            "runtime_finished_ok",
+                        )
+                    {
+                        tracing::warn!(
+                            "failed to record runtime finish for run {}: {}",
+                            finished_client_run.run_id,
+                            err
+                        );
+                    }
+                }
+            }
             Ok(Err(e)) => {
                 let msg = e.to_string();
                 let m = msg.to_ascii_lowercase();
+                if let Ok(conn) = open_connection(&finished_db_path) {
+                    if let Err(err) =
+                        topo::event_modules::operational::client_lifecycle::mark_runtime_stopped(
+                            &conn,
+                            &finished_client_run,
+                            "runtime_exited_with_error",
+                        )
+                    {
+                        tracing::warn!(
+                            "failed to record runtime error exit for run {}: {}",
+                            finished_client_run.run_id,
+                            err
+                        );
+                    }
+                }
                 if m.contains("address already in use")
                     || m.contains("os error 98")  // Linux EADDRINUSE
                     || m.contains("os error 48")  // macOS EADDRINUSE
@@ -1926,7 +2018,24 @@ async fn reevaluate_runtime(
                     );
                 }
             }
-            Err(e) => tracing::warn!("Runtime task join error: {}", e),
+            Err(e) => {
+                if let Ok(conn) = open_connection(&finished_db_path) {
+                    if let Err(err) =
+                        topo::event_modules::operational::client_lifecycle::mark_runtime_stopped(
+                            &conn,
+                            &finished_client_run,
+                            "runtime_task_join_error",
+                        )
+                    {
+                        tracing::warn!(
+                            "failed to record runtime join error for run {}: {}",
+                            finished_client_run.run_id,
+                            err
+                        );
+                    }
+                }
+                tracing::warn!("Runtime task join error: {}", e)
+            }
         }
         *state.runtime_net.write().unwrap() = None;
         clear_upnp_report(&state);
@@ -1944,6 +2053,13 @@ async fn reevaluate_runtime(
         }
     };
 
+    let client_id =
+        topo::event_modules::operational::client_lifecycle::client_id_for_db_path(db_path);
+    let conn = open_connection(db_path)?;
+    create_tables(&conn)?;
+    let lifecycle_state =
+        topo::event_modules::operational::client_lifecycle::load_state(&conn, &client_id)?;
+
     if tenant_states.is_empty() {
         if let Some(runtime) = active_runtime.take() {
             stop_runtime(runtime).await;
@@ -1953,10 +2069,64 @@ async fn reevaluate_runtime(
             *state.resolved_bind_addr.write().unwrap() = Some(resolved_bind);
             *idle_bind_reservation = Some(reservation);
         }
+        if let Some(resolved_bind) = *state.resolved_bind_addr.read().unwrap() {
+            let conn = open_connection(db_path)?;
+            create_tables(&conn)?;
+            topo::event_modules::operational::client_lifecycle::record_idle_bind_reservation(
+                &conn,
+                db_path,
+                bind,
+                resolved_bind,
+                tenant_states.len(),
+            )?;
+        }
         *state.runtime_state.write().unwrap() = RuntimeState::IdleNoTenants;
         *state.runtime_net.write().unwrap() = None;
         clear_upnp_report(&state);
         return Ok(());
+    }
+
+    if active_runtime.is_none() {
+        match lifecycle_state.as_ref().map(|row| row.runtime_status) {
+            Some(
+                topo::event_modules::operational::client_lifecycle::ClientRuntimeStatus::Starting,
+            ) => {
+                if let Some(run_id) = lifecycle_state
+                    .as_ref()
+                    .and_then(|row| row.current_run_id.clone())
+                {
+                    tracing::info!(
+                        "activating peering runtime from projected client_started run {} ({} tenant(s))",
+                        run_id,
+                        tenant_states.len()
+                    );
+                    *active_runtime = Some(spawn_runtime(
+                        db_path,
+                        bind,
+                        state.clone(),
+                        tenant_states.clone(),
+                        topo::event_modules::operational::client_lifecycle::ClientRun {
+                            client_id: client_id.clone(),
+                            run_id,
+                        },
+                    )?);
+                }
+            }
+            Some(
+                topo::event_modules::operational::client_lifecycle::ClientRuntimeStatus::Active,
+            ) => {}
+            _ => {
+                let reserved_bind = *state.resolved_bind_addr.read().unwrap();
+                topo::event_modules::operational::client_lifecycle::start_runtime(
+                    &conn,
+                    db_path,
+                    bind,
+                    reserved_bind,
+                    tenant_states.len(),
+                )?;
+                return Ok(());
+            }
+        }
     }
 
     let change = match active_runtime.as_ref() {
@@ -1967,15 +2137,13 @@ async fn reevaluate_runtime(
     match change {
         TenantChangeKind::NoChange => {}
         TenantChangeKind::NeedsFreshStart => {
+            if active_runtime.is_none() {
+                return Ok(());
+            }
             if let Some(runtime) = active_runtime.take() {
                 stop_runtime(runtime).await;
             }
             let _ = idle_bind_reservation.take();
-            tracing::info!(
-                "activating peering runtime ({} tenant(s))",
-                tenant_states.len()
-            );
-            *active_runtime = Some(spawn_runtime(db_path, bind, state, tenant_states));
         }
         TenantChangeKind::NewTenantsAdded { new_tenants } => {
             // Register new tenant certs on the live endpoint — no restart needed.
@@ -2007,11 +2175,6 @@ async fn reevaluate_runtime(
                 stop_runtime(runtime).await;
             }
             let _ = idle_bind_reservation.take();
-            tracing::info!(
-                "restarting peering runtime after tenant transport identity change ({} tenant(s))",
-                tenant_states.len()
-            );
-            *active_runtime = Some(spawn_runtime(db_path, bind, state, tenant_states));
         }
     }
 
@@ -2030,6 +2193,7 @@ async fn run_runtime_manager(
     let mut idle_bind_reservation = Some(idle_bind_reservation);
     let mut interval = tokio::time::interval(Duration::from_millis(500));
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+    let (mut wake_rx, _wake_guard) = topo::state::operational_wake::register(db_path);
 
     reevaluate_runtime(
         db_path,
@@ -2063,6 +2227,22 @@ async fn run_runtime_manager(
                     &mut idle_bind_reservation,
                 )
                 .await?;
+            }
+            wake = wake_rx.recv() => {
+                match wake {
+                    Ok(topo::state::operational_wake::OperationalWake::ClientRuntime { .. }) => {
+                        reevaluate_runtime(
+                            db_path,
+                            bind,
+                            state.clone(),
+                            &mut active_runtime,
+                            &mut idle_bind_reservation,
+                        )
+                        .await?;
+                    }
+                    Ok(_) => {}
+                    Err(_) => {}
+                }
             }
             _ = interval.tick() => {
                 reevaluate_runtime(
@@ -2164,6 +2344,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let shutdown_notify = Arc::new(tokio::sync::Notify::new());
             let state = Arc::new(DaemonState::new(db));
             *state.resolved_bind_addr.write().unwrap() = Some(resolved_bind);
+            let conn = open_connection(db).map_err(|e| friendly_db_error(db, e))?;
+            topo::event_modules::operational::client_lifecycle::record_idle_bind_reservation(
+                &conn,
+                db,
+                bind,
+                resolved_bind,
+                0,
+            )?;
 
             // Start RPC server in a background thread
             let rpc_shutdown = shutdown.clone();

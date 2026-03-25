@@ -4,30 +4,27 @@ use std::net::SocketAddr;
 use std::time::Duration;
 
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::warn;
 
 use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
-use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
-use crate::db::open_connection;
-use crate::db::transport_trust::record_transport_binding;
+use crate::event_modules::operational::outbound_connection_closed::record_outbound_connection_closed;
+use crate::event_modules::operational::outbound_connection_failed::{
+    describe_connect_failure, dial_provider_with_bootstrap_policy, failure_kind,
+    is_stale_dial_failure, observe_outbound_authenticated_connection,
+    record_outbound_connection_failed, should_warn_for_connect_failure,
+    OutboundConnectionObservation,
+};
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
+use crate::state::startup_reconcile::run_startup_preflight;
 use crate::sync::session::dependency_session::spawn_outbound_dependency_session;
 use crate::sync::session::windowing::reset_outbound_window_state;
 use crate::sync::SyncConnectionHandler;
 use crate::transport::multi_workspace::transport_sni;
-use crate::transport::{
-    derive_bootstrap_dial_context, dial_session_provider, BootstrapDialMode,
-    ConnectionLifecycleError, SessionProvider, TransportClientConfig, TransportEndpoint,
-};
+use crate::transport::{TransportClientConfig, TransportEndpoint};
 
-use super::supervisor::{
-    run_startup_preflight, supervise_connection_sessions, SessionTenantResolver,
-};
-use super::{
-    claim_live_connection_slot, current_timestamp_ms, peer_fingerprint_from_hex, IntroSpawnerFn,
-    CONNECT_RETRY_DELAY, ENDPOINT_TTL_MS, SYNC_SESSION_TIMEOUT_SECS,
-};
+use super::supervisor::{supervise_connection_sessions, SessionTenantResolver};
+use super::{IntroSpawnerFn, CONNECT_RETRY_DELAY, SYNC_SESSION_TIMEOUT_SECS};
 
 const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
 const STALE_DIAL_FAILURE_THRESHOLD: u32 = 8;
@@ -116,6 +113,7 @@ pub async fn connect_loop_with_coordination_until_cancel(
         shutdown,
         None,
         None,
+        None,
     )
     .await
 }
@@ -133,6 +131,7 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
     ingest: IngestFns,
     shutdown: CancellationToken,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
+    connection_plan_id: Option<String>,
     sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tenants = vec![recorded_by.to_string()];
@@ -152,6 +151,7 @@ pub async fn connect_loop_with_coordination_until_cancel_with_fallback(
             intro_spawner,
             shutdown,
             bootstrap_fallback_client_config,
+            connection_plan_id,
             sync_control,
         ))
         .await
@@ -167,11 +167,11 @@ async fn connect_loop_inner(
     intro_spawner: IntroSpawnerFn,
     shutdown: CancellationToken,
     bootstrap_fallback_client_config: Option<TransportClientConfig>,
+    connection_plan_id: Option<String>,
     sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let sni = transport_sni(remote_transport_peer_id);
     let mut has_connected_once = false;
-    let mut announced_connecting = false;
     let mut consecutive_stale_dial_failures: u32 = 0;
     let mut warning_gate = RepeatedWarningGate::new(REPEATED_WARNING_WINDOW);
     loop {
@@ -179,15 +179,11 @@ async fn connect_loop_inner(
             break;
         }
 
-        if !announced_connecting {
-            info!("Connecting to {}...", remote);
-            announced_connecting = true;
-        }
         let dial_outcome = match tokio::select! {
             _ = shutdown.cancelled() => {
                 break;
             }
-            outcome = dial_provider_ongoing_first(
+            outcome = dial_provider_with_bootstrap_policy(
                 &endpoint,
                 remote,
                 &sni,
@@ -196,17 +192,31 @@ async fn connect_loop_inner(
             ) => outcome,
         } {
             Ok(outcome) => outcome,
-            Err(e) => {
-                let message = describe_connect_failure(remote, &e);
+            Err(failure) => {
+                let message = describe_connect_failure(remote, &failure.error);
+                if let Some(connection_plan_id) = connection_plan_id.as_deref() {
+                    if let Err(err) = record_outbound_connection_failed(
+                        db_path,
+                        connection_plan_id,
+                        failure_kind(&failure.error),
+                        Some(message.as_str()),
+                        failure.used_bootstrap_fallback,
+                    ) {
+                        warn!(
+                            "failed to record outbound_connection_failed for {}: {}",
+                            connection_plan_id, err
+                        );
+                    }
+                }
                 let warn_on_startup_stale_failure = bootstrap_fallback_client_config.is_some();
-                if (should_warn_for_connect_failure(has_connected_once, &e)
+                if (should_warn_for_connect_failure(has_connected_once, &failure.error)
                     || warn_on_startup_stale_failure)
                     && warning_gate.should_emit(message.clone())
                     && should_emit_globally(format!("connect:{message}"))
                 {
                     warn!("{}", message);
                 }
-                if is_stale_dial_failure(&e) {
+                if is_stale_dial_failure(&failure.error) {
                     consecutive_stale_dial_failures += 1;
                     if consecutive_stale_dial_failures >= STALE_DIAL_FAILURE_THRESHOLD {
                         // Startup dials suppress noisy one-off stale-target warnings before the
@@ -219,7 +229,10 @@ async fn connect_loop_inner(
                         }
                         return Err(std::io::Error::other(format!(
                             "{} remote={} failures={} last_error={}",
-                            STALE_DIAL_TARGET_MARKER, remote, consecutive_stale_dial_failures, e
+                            STALE_DIAL_TARGET_MARKER,
+                            remote,
+                            consecutive_stale_dial_failures,
+                            failure.error
                         ))
                         .into());
                     }
@@ -234,90 +247,62 @@ async fn connect_loop_inner(
             }
         };
         has_connected_once = true;
-        announced_connecting = false;
         consecutive_stale_dial_failures = 0;
         warning_gate.clear();
         let provider = dial_outcome.provider;
         let used_bootstrap_fallback = dial_outcome.used_bootstrap_fallback;
         let connection = provider.connection();
         let peer_id = provider.peer_id().to_string();
-        let peer_fp = match peer_fingerprint_from_hex(&peer_id) {
-            Some(fp) => fp,
-            None => {
-                let message = format!(
-                    "Could not decode peer fingerprint from identity {}, retrying...",
-                    &peer_id[..16.min(peer_id.len())]
-                );
-                if warning_gate.should_emit(message.clone())
-                    && should_emit_globally(format!("connect:{message}"))
-                {
-                    warn!("{}", message);
-                }
-                tokio::select! {
-                    _ = shutdown.cancelled() => break,
-                    _ = tokio::time::sleep(CONNECT_RETRY_DELAY) => {}
-                }
-                continue;
-            }
-        };
-        let connection_lease = match claim_live_connection_slot(
+        let (connection_lease, peer_fp) = match observe_outbound_authenticated_connection(
             db_path,
             recorded_by,
             &peer_id,
-            SessionDirection::Outbound,
-            connection.clone(),
+            &connection,
+            connection_plan_id.as_deref(),
+            used_bootstrap_fallback,
         ) {
-            super::LiveConnectionClaim::Acquired(lease) => Some(lease),
-            super::LiveConnectionClaim::Occupied(occupied) => {
-                info!(
-                    "Closing duplicate outbound connection to {} (active_direction={:?}, preferred_direction={:?})",
-                    peer_id,
-                    occupied.active_direction,
-                    occupied.preferred_direction
-                );
+            Ok(OutboundConnectionObservation::Authenticated { lease, peer_fp }) => (lease, peer_fp),
+            Ok(OutboundConnectionObservation::Occupied { released }) => {
                 connection.close(0u32.into(), b"duplicate peer connection");
                 tokio::select! {
                     _ = shutdown.cancelled() => break,
-                    _ = occupied.released.notified() => {}
+                    _ = released.notified() => {}
+                    _ = tokio::time::sleep(CONNECT_RETRY_DELAY) => {}
+                }
+                continue;
+            }
+            Ok(OutboundConnectionObservation::Retry { detail }) => {
+                if warning_gate.should_emit(detail.clone())
+                    && should_emit_globally(format!("connect:{detail}"))
+                {
+                    warn!("{}", detail);
+                }
+                connection.close(1u32.into(), b"invalid peer fingerprint");
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
+                    _ = tokio::time::sleep(CONNECT_RETRY_DELAY) => {}
+                }
+                continue;
+            }
+            Err(err) => {
+                warn!(
+                    "failed to observe outbound authenticated connection remote={} plan={:?}: {}",
+                    remote, connection_plan_id, err
+                );
+                connection.close(1u32.into(), b"outbound connection event authoring failed");
+                tokio::select! {
+                    _ = shutdown.cancelled() => break,
                     _ = tokio::time::sleep(CONNECT_RETRY_DELAY) => {}
                 }
                 continue;
             }
         };
-        info!(
-            "Connected to {} on connection {}",
-            peer_id,
-            connection.stable_id()
-        );
         // Handler state is scoped to this authenticated connection so any
         // connection-lifetime sync state is dropped when the connection is.
         let initiator_handler =
             SyncConnectionHandler::outbound(db_path.to_string(), SYNC_SESSION_TIMEOUT_SECS)
                 .with_sync_control(sync_control.clone());
         reset_outbound_window_state(db_path, recorded_by, &peer_id);
-
-        // Record endpoint observation, transport binding, and purge expired
-        {
-            let remote_addr = connection.remote_address();
-            let now = current_timestamp_ms();
-            if let Ok(db) = open_connection(db_path) {
-                let _ = record_endpoint_observation(
-                    &db,
-                    recorded_by,
-                    &peer_id,
-                    &remote_addr.ip().to_string(),
-                    remote_addr.port(),
-                    now,
-                    ENDPOINT_TTL_MS,
-                );
-                // Record transport binding (peer_id is hex SPKI fingerprint)
-                let _ = record_transport_binding(&db, recorded_by, &peer_id, &peer_fp);
-                let purged = purge_expired_endpoints(&db, now).unwrap_or(0);
-                if purged > 0 {
-                    info!("Purged {} expired endpoint observations", purged);
-                }
-            }
-        }
 
         // Spawn intro listener for uni-streams on this connection
         let _intro_handle = intro_spawner(
@@ -356,164 +341,24 @@ async fn connect_loop_inner(
             shutdown.clone(),
         )
         .await;
+        if let Some(connection_plan_id) = connection_plan_id.as_deref() {
+            if let Err(err) = record_outbound_connection_closed(
+                db_path,
+                connection_plan_id,
+                &peer_id,
+                connection.remote_address(),
+                "session_ended",
+            ) {
+                warn!(
+                    "failed to record outbound_connection_closed for {}: {}",
+                    connection_plan_id, err
+                );
+            }
+        }
         drop(connection_lease);
     }
 
     Ok(())
-}
-
-/// Produce a human-readable diagnosis for a connection failure.
-fn describe_connect_failure(remote: SocketAddr, err: &ConnectionLifecycleError) -> String {
-    match err {
-        ConnectionLifecycleError::DialTrustRejected(msg) => {
-            // Extract the fingerprint from "trust_rejected: peer fingerprint <hex> not in authorized set"
-            let fp = msg
-                .split("peer fingerprint ")
-                .nth(1)
-                .and_then(|s| s.split_whitespace().next())
-                .unwrap_or("unknown");
-            format!(
-                "Certificate mismatch connecting to {}: TLS fingerprint {} is not trusted. \
-                 Either (a) the remote peer's certificate does not match the expected fingerprint, \
-                 or (b) the remote rejected our certificate. This usually means: (1) transport \
-                 identity has not been derived yet (bootstrap in progress), (2) the invite was \
-                 created by a different peer, or (3) a certificate was rotated",
-                remote, fp
-            )
-        }
-        ConnectionLifecycleError::Dial(msg) => {
-            let m = msg.to_ascii_lowercase();
-            if m.contains("connection refused") {
-                format!(
-                    "Connection refused by {}: nothing is listening on that address. \
-                     Is the peer's daemon running? (start it with: topo start)",
-                    remote
-                )
-            } else if m.contains("timed out") || m.contains("timeout") {
-                format!(
-                    "Connection to {} timed out: the peer may be offline, \
-                     behind a firewall, or the address may be stale",
-                    remote
-                )
-            } else if m.contains("network is unreachable") || m.contains("no route to host") {
-                format!(
-                    "Cannot reach {}: network is unreachable. Check that the peer's \
-                     address is correct and that you have network connectivity to it",
-                    remote
-                )
-            } else if m.contains("host unreachable") || m.contains("unreachable") {
-                format!(
-                    "Host {} is unreachable. The address may be on a different network \
-                     or the peer may be offline",
-                    remote
-                )
-            } else {
-                format!("Failed to connect to {}: {}", remote, msg)
-            }
-        }
-        ConnectionLifecycleError::Accept(msg) => {
-            format!(
-                "Unexpected accept error during outbound dial to {}: {}",
-                remote, msg
-            )
-        }
-        ConnectionLifecycleError::MissingPeerIdentity => {
-            format!(
-                "Connected to {} but peer did not present a TLS certificate. \
-                 This should not happen with a topo peer — the remote may not be a topo node",
-                remote
-            )
-        }
-    }
-}
-
-fn is_stale_dial_failure(err: &ConnectionLifecycleError) -> bool {
-    match err {
-        ConnectionLifecycleError::Dial(msg) => {
-            let m = msg.to_ascii_lowercase();
-            m.contains("timed out")
-                || m.contains("timeout")
-                || m.contains("connection refused")
-                || m.contains("network is unreachable")
-                || m.contains("no route to host")
-                || m.contains("unreachable")
-        }
-        ConnectionLifecycleError::DialTrustRejected(_) => false,
-        ConnectionLifecycleError::Accept(_) | ConnectionLifecycleError::MissingPeerIdentity => {
-            false
-        }
-    }
-}
-
-fn should_warn_for_connect_failure(
-    has_connected_once: bool,
-    err: &ConnectionLifecycleError,
-) -> bool {
-    has_connected_once || !is_stale_dial_failure(err)
-}
-
-struct DialOutcome {
-    provider: SessionProvider,
-    used_bootstrap_fallback: bool,
-}
-
-async fn dial_provider_ongoing_first(
-    endpoint: &TransportEndpoint,
-    remote: SocketAddr,
-    sni: &str,
-    ongoing_client_config: Option<&TransportClientConfig>,
-    bootstrap_fallback_client_config: Option<&TransportClientConfig>,
-) -> Result<DialOutcome, ConnectionLifecycleError> {
-    match dial_session_provider(endpoint, remote, sni, ongoing_client_config).await {
-        Ok(provider) => Ok(DialOutcome {
-            provider,
-            used_bootstrap_fallback: false,
-        }),
-        Err(primary_err) => {
-            let decision = derive_bootstrap_dial_context(
-                Some(&primary_err),
-                bootstrap_fallback_client_config.is_some(),
-            );
-            if decision.mode != BootstrapDialMode::BootstrapFallback {
-                return Err(primary_err);
-            }
-            let Some(fallback_cfg) = bootstrap_fallback_client_config else {
-                return Err(primary_err);
-            };
-            info!(
-                "Primary mTLS dial to {} rejected by trust policy; retrying with bootstrap fallback cert",
-                remote
-            );
-            match dial_session_provider(endpoint, remote, sni, Some(fallback_cfg)).await {
-                Ok(provider) => Ok(DialOutcome {
-                    provider,
-                    used_bootstrap_fallback: true,
-                }),
-                Err(fallback_err) => {
-                    // If the fallback error is a stale-dial indicator (timeout,
-                    // unreachable, etc.), return it so is_stale_dial_failure()
-                    // can count it toward the threshold.  Otherwise prefer the
-                    // primary trust-rejection for human-readable diagnostics.
-                    if is_stale_dial_failure(&fallback_err) {
-                        Err(ConnectionLifecycleError::Dial(format!(
-                            "primary and bootstrap-fallback dials both failed to {}: \
-                             primary: {}, fallback: {}",
-                            remote, primary_err, fallback_err
-                        )))
-                    } else if matches!(primary_err, ConnectionLifecycleError::DialTrustRejected(_))
-                    {
-                        Err(primary_err)
-                    } else {
-                        Err(ConnectionLifecycleError::Dial(format!(
-                            "primary and bootstrap-fallback dials both failed to {}: \
-                             primary: {}, fallback: {}",
-                            remote, primary_err, fallback_err
-                        )))
-                    }
-                }
-            }
-        }
-    }
 }
 
 #[cfg(test)]
@@ -522,41 +367,57 @@ mod tests {
 
     #[test]
     fn fallback_policy_allows_typed_trust_rejection_with_fallback_cfg() {
-        let err = ConnectionLifecycleError::DialTrustRejected(
+        let err = crate::transport::ConnectionLifecycleError::DialTrustRejected(
             "handshake to 127.0.0.1:4433: trust_rejected: peer fingerprint deadbeef not in authorized set".to_string()
         );
-        let decision = derive_bootstrap_dial_context(Some(&err), true);
-        assert_eq!(decision.mode, BootstrapDialMode::BootstrapFallback);
+        assert_eq!(
+            crate::event_modules::operational::outbound_connection_failed::bootstrap_fallback_mode(
+                Some(&err),
+                true,
+            ),
+            crate::transport::BootstrapDialMode::BootstrapFallback
+        );
     }
 
     #[test]
     fn fallback_policy_denies_generic_dial_errors() {
-        let err = ConnectionLifecycleError::Dial(
+        let err = crate::transport::ConnectionLifecycleError::Dial(
             "handshake to 127.0.0.1:4433: connection refused".to_string(),
         );
-        let decision = derive_bootstrap_dial_context(Some(&err), true);
-        assert_eq!(decision.mode, BootstrapDialMode::Deny);
+        assert_eq!(
+            crate::event_modules::operational::outbound_connection_failed::bootstrap_fallback_mode(
+                Some(&err),
+                true,
+            ),
+            crate::transport::BootstrapDialMode::Deny
+        );
     }
 
     #[test]
     fn fallback_policy_denies_trust_rejection_without_cfg() {
-        let err = ConnectionLifecycleError::DialTrustRejected(
+        let err = crate::transport::ConnectionLifecycleError::DialTrustRejected(
             "handshake to 127.0.0.1:4433: trust_rejected: peer fingerprint deadbeef not in authorized set".to_string()
         );
-        let decision = derive_bootstrap_dial_context(Some(&err), false);
-        assert_eq!(decision.mode, BootstrapDialMode::Deny);
+        assert_eq!(
+            crate::event_modules::operational::outbound_connection_failed::bootstrap_fallback_mode(
+                Some(&err),
+                false,
+            ),
+            crate::transport::BootstrapDialMode::Deny
+        );
     }
 
     #[test]
     fn stale_classifier_marks_timeout_like_dial_errors() {
-        let err =
-            ConnectionLifecycleError::Dial("handshake to 127.0.0.1:4433: timed out".to_string());
+        let err = crate::transport::ConnectionLifecycleError::Dial(
+            "handshake to 127.0.0.1:4433: timed out".to_string(),
+        );
         assert!(is_stale_dial_failure(&err));
     }
 
     #[test]
     fn stale_classifier_does_not_mark_trust_rejections() {
-        let err = ConnectionLifecycleError::DialTrustRejected(
+        let err = crate::transport::ConnectionLifecycleError::DialTrustRejected(
             "handshake to 127.0.0.1:4433: trust_rejected".to_string(),
         );
         assert!(!is_stale_dial_failure(&err));
@@ -564,7 +425,7 @@ mod tests {
 
     #[test]
     fn startup_stale_dial_failures_do_not_warn_before_first_connection() {
-        let err = ConnectionLifecycleError::Dial(
+        let err = crate::transport::ConnectionLifecycleError::Dial(
             "handshake to 127.0.0.1:4433: connection refused".to_string(),
         );
         assert!(!should_warn_for_connect_failure(false, &err));
@@ -572,7 +433,7 @@ mod tests {
 
     #[test]
     fn post_connect_stale_dial_failures_warn() {
-        let err = ConnectionLifecycleError::Dial(
+        let err = crate::transport::ConnectionLifecycleError::Dial(
             "handshake to 127.0.0.1:4433: connection refused".to_string(),
         );
         assert!(should_warn_for_connect_failure(true, &err));
@@ -580,7 +441,7 @@ mod tests {
 
     #[test]
     fn non_stale_connect_failures_still_warn_at_startup() {
-        let err = ConnectionLifecycleError::DialTrustRejected(
+        let err = crate::transport::ConnectionLifecycleError::DialTrustRejected(
             "handshake to 127.0.0.1:4433: trust_rejected".to_string(),
         );
         assert!(should_warn_for_connect_failure(false, &err));

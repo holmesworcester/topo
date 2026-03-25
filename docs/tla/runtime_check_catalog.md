@@ -59,6 +59,14 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_PS_PENDING_CONSUME | state/db/transport_trust::consume_bootstrap_for_peer_shared | InvPendingConsumedByPeerShared | transport_credential |
 | CHK_PS_PENDING_BOOTSTRAP_CONSUME | state/db/transport_trust::consume_bootstrap_for_peer_shared | InvPendingBootstrapTrustConsumedByPeerShared | transport_credential |
 | CHK_UI_PENDING_SOURCE | event_modules/user_invite::project_pure | InvPendingBootstrapTrustSource | projector_local |
+| CHK_LOC_CONN_PLAN_INPUT | event_modules/operational/connection_planned::project_pure | NON_MODELED::operational_input_validation | projector_local |
+| CHK_LOC_CONN_LATEST_BASIS | event_modules/operational/connection_plan_transitioned::build_projector_context + project_pure + event_modules/operational/outbound_connection_authenticated::build_projector_context + project_pure + event_modules/operational/outbound_connection_failed::build_projector_context + project_pure + event_modules/operational/outbound_connection_closed::build_projector_context + project_pure | NON_MODELED::latest_basis_guard | projector_local |
+| CHK_LOC_CLIENT_LATEST_BASIS | event_modules/operational/client_activated::build_projector_context + event_modules/operational/client_stopped::build_projector_context + event_modules/operational/inbound_connection_authenticated::build_projector_context + project_pure + event_modules/operational/inbound_connection_rejected::build_projector_context + project_pure | NON_MODELED::latest_basis_guard | projector_local |
+| CHK_LOC_CLIENT_IDLE_INPUT | event_modules/operational/client_idle_reserved::project_pure | NON_MODELED::operational_input_validation | projector_local |
+| CHK_LOC_INBOUND_LATEST_BASIS | event_modules/operational/inbound_connection_closed::build_projector_context + project_pure | NON_MODELED::latest_basis_guard | projector_local |
+| CHK_LOC_MDNS_INPUT | event_modules/operational/mdns_peer_observed::project_pure | NON_MODELED::operational_input_validation | projector_local |
+| CHK_LOC_SYNC_CONN_LATEST_BASIS | event_modules/operational/sync_round_started::build_projector_context + project_pure | NON_MODELED::latest_basis_guard | projector_local |
+| CHK_LOC_SYNC_ROUND_LATEST_BASIS | event_modules/operational/sync_round_completed::build_projector_context + project_pure | NON_MODELED::latest_basis_guard | projector_local |
 
 ## Wire Validation Checks
 

@@ -33,9 +33,87 @@ pub(crate) fn execute_write_ops(
                             SqlVal::Text(s) => Box::new(s.clone()),
                             SqlVal::Int(i) => Box::new(*i),
                             SqlVal::Blob(b) => Box::new(b.clone()),
+                            SqlVal::Null => Box::new(rusqlite::types::Null),
                         }
                     })
                     .collect();
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| &**p).collect();
+                conn.execute(&sql, param_refs.as_slice())?;
+            }
+            WriteOp::InsertOrReplace {
+                table,
+                columns,
+                values,
+            } => {
+                let cols = columns.join(", ");
+                let placeholders: Vec<String> =
+                    (1..=values.len()).map(|i| format!("?{}", i)).collect();
+                let sql = format!(
+                    "INSERT OR REPLACE INTO {} ({}) VALUES ({})",
+                    table,
+                    cols,
+                    placeholders.join(", ")
+                );
+                let params: Vec<Box<dyn rusqlite::types::ToSql>> = values
+                    .iter()
+                    .map(|v| -> Box<dyn rusqlite::types::ToSql> {
+                        match v {
+                            SqlVal::Text(s) => Box::new(s.clone()),
+                            SqlVal::Int(i) => Box::new(*i),
+                            SqlVal::Blob(b) => Box::new(b.clone()),
+                            SqlVal::Null => Box::new(rusqlite::types::Null),
+                        }
+                    })
+                    .collect();
+                let param_refs: Vec<&dyn rusqlite::types::ToSql> =
+                    params.iter().map(|p| &**p).collect();
+                conn.execute(&sql, param_refs.as_slice())?;
+            }
+            WriteOp::Update {
+                table,
+                assignments,
+                where_clause,
+            } => {
+                let set_clause: Vec<String> = assignments
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (col, _))| format!("{} = ?{}", col, i + 1))
+                    .collect();
+                let where_offset = assignments.len();
+                let conditions: Vec<String> = where_clause
+                    .iter()
+                    .enumerate()
+                    .map(|(i, (col, _))| format!("{} = ?{}", col, where_offset + i + 1))
+                    .collect();
+                let sql = format!(
+                    "UPDATE {} SET {} WHERE {}",
+                    table,
+                    set_clause.join(", "),
+                    conditions.join(" AND ")
+                );
+                let params: Vec<Box<dyn rusqlite::types::ToSql>> =
+                    assignments
+                        .iter()
+                        .map(|(_, v)| -> Box<dyn rusqlite::types::ToSql> {
+                            match v {
+                                SqlVal::Text(s) => Box::new(s.clone()),
+                                SqlVal::Int(i) => Box::new(*i),
+                                SqlVal::Blob(b) => Box::new(b.clone()),
+                                SqlVal::Null => Box::new(rusqlite::types::Null),
+                            }
+                        })
+                        .chain(where_clause.iter().map(
+                            |(_, v)| -> Box<dyn rusqlite::types::ToSql> {
+                                match v {
+                                    SqlVal::Text(s) => Box::new(s.clone()),
+                                    SqlVal::Int(i) => Box::new(*i),
+                                    SqlVal::Blob(b) => Box::new(b.clone()),
+                                    SqlVal::Null => Box::new(rusqlite::types::Null),
+                                }
+                            },
+                        ))
+                        .collect();
                 let param_refs: Vec<&dyn rusqlite::types::ToSql> =
                     params.iter().map(|p| &**p).collect();
                 conn.execute(&sql, param_refs.as_slice())?;
@@ -57,6 +135,7 @@ pub(crate) fn execute_write_ops(
                             SqlVal::Text(s) => Box::new(s.clone()),
                             SqlVal::Int(i) => Box::new(*i),
                             SqlVal::Blob(b) => Box::new(b.clone()),
+                            SqlVal::Null => Box::new(rusqlite::types::Null),
                         }
                     })
                     .collect();
@@ -165,6 +244,22 @@ pub(crate) fn execute_emit_commands(
             }
             EmitCommand::EmitDeterministicBlob { blob } => {
                 let _ = crate::projection::emit::emit_deterministic_blob(conn, recorded_by, blob)?;
+            }
+            EmitCommand::WakeConnectionPlan { connection_id } => {
+                crate::state::operational_wake::publish_from_connection(
+                    conn,
+                    crate::state::operational_wake::OperationalWake::ConnectionPlan {
+                        connection_id: connection_id.clone(),
+                    },
+                );
+            }
+            EmitCommand::WakeClientRuntime { client_id } => {
+                crate::state::operational_wake::publish_from_connection(
+                    conn,
+                    crate::state::operational_wake::OperationalWake::ClientRuntime {
+                        client_id: client_id.clone(),
+                    },
+                );
             }
         }
     }

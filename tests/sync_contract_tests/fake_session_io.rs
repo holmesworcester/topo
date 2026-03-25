@@ -496,6 +496,83 @@ pub fn create_test_db(tenant_id: &str) -> (String, tempfile::TempDir) {
     )
     .expect("insert accepted workspace binding");
 
+    let peer_id = hex::encode([0xABu8; 32]);
+    let remote_addr: std::net::SocketAddr = "127.0.0.1:9999".parse().unwrap();
+    let local_transport_peer_id = "cd".repeat(32);
+
+    let planned = topo::event_modules::operational::connection_planned::create_connection_planned(
+        &conn,
+        tenant_id,
+        &peer_id,
+        remote_addr,
+        topo::event_modules::operational::connection_planned::ConnectionPlanSourceKind::Discovery,
+        None,
+    )
+    .expect("create outbound connection plan")
+    .expect("connection plan should exist");
+    let connection_id =
+        topo::event_modules::operational::connection_planned::discovery_connection_id(
+            tenant_id, &peer_id,
+        );
+    let active =
+        topo::event_modules::operational::connection_plan_transitioned::create_connection_plan_transitioned(
+            &conn,
+            tenant_id,
+            planned,
+            &connection_id,
+            topo::event_modules::operational::connection_planned::ConnectionPlanStatus::Active,
+            Some("test_setup"),
+            0,
+        )
+        .expect("activate outbound connection plan");
+    topo::event_modules::operational::outbound_connection_authenticated::create_outbound_connection_authenticated(
+        &conn,
+        tenant_id,
+        active,
+        &connection_id,
+        &peer_id,
+        remote_addr,
+        false,
+    )
+    .expect("create outbound connection auth");
+
+    let run = topo::event_modules::operational::client_lifecycle::start_runtime(
+        &conn,
+        &db_path_str,
+        "127.0.0.1:7443".parse().unwrap(),
+        Some("127.0.0.1:7443".parse().unwrap()),
+        1,
+    )
+    .expect("create client_started");
+    topo::event_modules::operational::client_lifecycle::mark_runtime_active(
+        &conn,
+        &run,
+        "127.0.0.1:7443".parse().unwrap(),
+        1,
+    )
+    .expect("create client_activated");
+    let client_state =
+        topo::event_modules::operational::client_lifecycle::load_state(&conn, &run.client_id)
+            .expect("load client runtime state")
+            .expect("client runtime state should exist");
+    let inbound_basis = topo::crypto::event_id_from_base64(&client_state.latest_event_id)
+        .expect("decode latest client event id");
+    topo::event_modules::operational::inbound_connection_authenticated::create_inbound_connection_authenticated(
+        &conn,
+        &run.client_id,
+        tenant_id,
+        inbound_basis,
+        &topo::event_modules::operational::inbound_connection_authenticated::inbound_connection_id(
+            &local_transport_peer_id,
+            &peer_id,
+            1,
+        ),
+        &local_transport_peer_id,
+        &peer_id,
+        remote_addr,
+    )
+    .expect("create inbound connection auth");
+
     drop(conn);
     (db_path_str, tmpdir)
 }
