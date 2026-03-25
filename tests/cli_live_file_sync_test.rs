@@ -40,6 +40,13 @@ fn test_cli_live_message_during_large_file_sync() {
     accept_invite(&bob_db, &invite_link);
     let _bob = start_daemon(&bob_db);
 
+    // Readiness gate: confirm the restarted daemons have an active sync path
+    // before starting the large transfer. Without this, the "mid-flight"
+    // assertion can spend its entire timeout budget waiting for the initial
+    // session to come up under full-suite load.
+    let gate_eid = send_message(&alice_db, "pre-live-file-gate");
+    assert_eventually(&bob_db, &format!("has_event:{} >= 1", gate_eid), 30_000);
+
     let expected_total_file_slices = std::fs::metadata(&source_path)
         .unwrap()
         .len()
