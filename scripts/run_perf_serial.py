@@ -31,10 +31,7 @@ SUMMARY_PATTERN = re.compile(
     r"BOB_PEAK_RSS_MIB=|MAX_BOB_TOTAL_MIB=|MAX_BOB_TOTAL_KB=|LOWMEM_BUDGET_KB=|"
     r"PASS_UNDER_24MB=|CGROUP_ENFORCED=|"
     r"CGROUP_LIMIT_KB=|CGROUP_OOM=|CGROUP_OOM_KILL=|MAX_BOB_ANON_KB=|"
-    r"MAX_BOB_ANON_UNLABELED_KB=|MAX_BOB_DB_SHM_KB=|MAX_BOB_DB_WAL_KB=|"
-    r"MAX_SQLITE_MEM_CUR=|MAX_SQLITE_MEM_HIGH=|MAX_MALL_ARENA=|MAX_MALL_USED=|"
-    r"MAX_MALL_FREE=|MAX_MALL_MMAP=|MAX_INIT_WANTED=|MAX_INIT_NEED_QUEUE=|"
-    r"MAX_DATA_EVENTS_INGESTED=|MAX_DATA_BLOB=|MEMTRACE_PRESENT=)"
+    r"MAX_BOB_ANON_UNLABELED_KB=|MAX_BOB_DB_SHM_KB=|MAX_BOB_DB_WAL_KB=)"
 )
 
 
@@ -467,7 +464,7 @@ class PerfRunner:
             ],
         )
         self.run_delivery_latency_test(
-            "Delivery Latency Gate (2 msg/s, 15s, forward-on-have)",
+            "Delivery Latency Gate (2 msg/s, 15s, current path)",
             "perf_two_peer_delivery_latency_gate",
             extra_env={
                 "TOPO_PERF_PRELOAD_MESSAGES": "0",
@@ -478,23 +475,7 @@ class PerfRunner:
             summary_file="two-peer-gate-pre0-m2-s15-w6.summary",
         )
         self.run_delivery_latency_test(
-            "Delivery Latency: forward-on-have only (2 msg/s, 15s)",
-            "perf_delivery_forward_only",
-            summary_file="two-peer-forward-pre0-m2-s15-w6.summary",
-        )
-        self.run_delivery_latency_test(
-            "Delivery Latency: negentropy only, 5s rounds (2 msg/s, 15s)",
-            "perf_delivery_negentropy_only",
-            extra_env={"TOPO_FORWARD_ON_HAVE": "0"},
-            summary_file="two-peer-negentropy-pre0-m2-s15-w6.summary",
-        )
-        self.run_delivery_latency_test(
-            "Delivery Latency: both, production mode (2 msg/s, 15s)",
-            "perf_delivery_both",
-            summary_file="two-peer-both-pre0-m2-s15-w6.summary",
-        )
-        self.run_delivery_latency_test(
-            "Delivery Latency (10 msg/s, 20s, forward-on-have)",
+            "Delivery Latency (10 msg/s, 20s, current path)",
             "perf_two_peer_delivery_latency_over_time",
             extra_env={
                 "TOPO_PERF_PRELOAD_MESSAGES": "0",
@@ -631,7 +612,6 @@ class PerfRunner:
             "--test-threads=1",
         ]
         env = extra_env or {}
-        env.setdefault("TOPO_FORWARD_ON_HAVE", "1")
         env.setdefault("TOPO_PERF_STAGE_BREAKDOWN", "1")
         summary_path = (
             self.repo_root / f"target/perf-results/{summary_file}"

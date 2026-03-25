@@ -10,8 +10,9 @@ use crate::contracts::peering_contract::{
 use crate::crypto::{hash_event, EventId};
 use crate::db::{open_connection, store::Store};
 use crate::protocol::{encode_frame, parse_frame, Frame};
+use crate::runtime::sync_engine::dependency_fetch;
 use crate::runtime::transport::open_outbound_dependency_session;
-use crate::state::{dependency_fetch, pipeline::ingest_now};
+use crate::state::pipeline::ingest_now;
 use crate::transport::TransportConnection;
 
 const DEPENDENCY_BATCH_CAP: usize = 16;

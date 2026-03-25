@@ -21,7 +21,7 @@ fn sync_control_test_lock() -> std::sync::MutexGuard<'static, ()> {
 }
 
 // ---------------------------------------------------------------------------
-// SC1: Policy show — default is all-auto
+// SC1: Policy show — default is both-auto
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -56,15 +56,10 @@ fn test_sync_policy_show_default() {
         "expected 'responses:' field:\n{}",
         stdout
     );
-    assert!(
-        stdout.contains("forward_on_have:"),
-        "expected 'forward_on_have:' field:\n{}",
-        stdout
-    );
     let auto_count = stdout.matches("auto").count();
     assert!(
-        auto_count >= 3,
-        "all three fields should default to 'auto' (found {}):\n{}",
+        auto_count >= 2,
+        "both fields should default to 'auto' (found {}):\n{}",
         auto_count,
         stdout
     );
@@ -106,12 +101,18 @@ fn test_sync_policy_set_requests_manual() {
         "output should contain 'manual':\n{}",
         set_stdout
     );
-    // Unset fields should still be auto
-    let auto_count = set_stdout.matches("auto").count();
     assert!(
-        auto_count >= 2,
-        "unset fields should remain 'auto' (found {}):\n{}",
-        auto_count,
+        set_stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("requests:") && line.contains("manual")),
+        "requests lane should update to manual:\n{}",
+        set_stdout
+    );
+    assert!(
+        set_stdout
+            .lines()
+            .any(|line| line.trim_start().starts_with("responses:") && line.contains("auto")),
+        "unset responses lane should remain auto:\n{}",
         set_stdout
     );
 
@@ -127,7 +128,7 @@ fn test_sync_policy_set_requests_manual() {
 }
 
 // ---------------------------------------------------------------------------
-// SC1: Policy set — all three to disabled, then restore
+// SC1: Policy set — both lanes to disabled, then restore
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -149,16 +150,14 @@ fn test_sync_policy_set_all_disabled_then_restore() {
             "disabled",
             "--responses",
             "disabled",
-            "--forward-on-have",
-            "disabled",
         ],
     );
     assert!(set.status.success());
     let stdout = String::from_utf8_lossy(&set.stdout);
     let disabled_count = stdout.matches("disabled").count();
     assert!(
-        disabled_count >= 3,
-        "all three fields should show 'disabled' (found {}):\n{}",
+        disabled_count >= 2,
+        "both fields should show 'disabled' (found {}):\n{}",
         disabled_count,
         stdout
     );
@@ -174,16 +173,14 @@ fn test_sync_policy_set_all_disabled_then_restore() {
             "auto",
             "--responses",
             "auto",
-            "--forward-on-have",
-            "auto",
         ],
     );
     assert!(restore.status.success());
     let restore_stdout = String::from_utf8_lossy(&restore.stdout);
     let auto_count = restore_stdout.matches("auto").count();
     assert!(
-        auto_count >= 3,
-        "restored should show 3x 'auto' (found {}):\n{}",
+        auto_count >= 2,
+        "restored should show 2x 'auto' (found {}):\n{}",
         auto_count,
         restore_stdout
     );
@@ -287,6 +284,28 @@ fn wait_for_sync_request_all(db: &str, timeout: Duration) -> String {
     }
 }
 
+fn wait_for_live_sync_session(db: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = topo_cmd(db, &["sync", "request", "all"]);
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if !stdout.contains("(no live sessions)") && !stdout.contains("(no peers)") {
+                return;
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "live sync session never became available within {:?}\nstdout: {}\nstderr: {}",
+                timeout,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 // ---------------------------------------------------------------------------
 // SC2 / SC3 / SC4: Two-peer round, request, and disabled-refusal
 // ---------------------------------------------------------------------------
@@ -306,6 +325,7 @@ fn test_sync_round_and_request_with_live_peer() {
     let _bob_daemon = start_daemon(&bob_db);
 
     wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
 
     // SC2: sync round all
     let round_stdout = wait_for_sync_round_all(&bob_db, Duration::from_secs(30));

@@ -54,7 +54,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 use tracing::warn;
 
-use crate::runtime::repeated_warning::should_emit_globally;
+use crate::runtime::diagnostics::repeated_warning::should_emit_globally;
 use crate::tuning::{low_mem_mode, max_recv_buffer};
 
 pub type DynamicAllowFn =
@@ -566,15 +566,11 @@ pub fn requested_server_name_from_connection(conn: &quinn::Connection) -> Option
     handshake.server_name.clone()
 }
 
-/// Create a single-port dual-role QUIC endpoint that serves multiple workspaces.
+/// Legacy compatibility wrapper for tests that still pass resolver/allow arguments.
 ///
-/// Server side: uses `TransportTargetCertResolver` to select the correct cert based
-/// on the client's SNI. Client side: uses a default client config with the
-/// first local transport cert (outbound connections use `connect_with()` for
-/// per-tenant config).
-///
-/// Trust verification is via a dynamic allow function that checks across
-/// all local tenants.
+/// The active runtime uses one daemon transport identity per endpoint. This helper
+/// now ignores the resolver and allow closure and simply builds the endpoint from
+/// the provided identity.
 pub fn create_single_port_endpoint(
     bind_addr: SocketAddr,
     _cert_resolver: Arc<multi_workspace::TransportTargetCertResolver>,

@@ -142,8 +142,8 @@ check_no_match 'workspace::commands::add_device_to_workspace' "$PIPELINE_PATH"
 check_no_match 'testutil::bootstrap' "$PEERING_PATH"
 check_no_match 'testutil::bootstrap' "$SERVICE_PATH"
 check_no_match 'testutil::bootstrap' "$PIPELINE_PATH"
-# peering/workflows must not contain bootstrap module (moved to testutil)
-check_no_match 'mod bootstrap' src/runtime/peering/workflows/
+# peering/traversal must not contain bootstrap module (moved to testutil)
+check_no_match 'mod bootstrap' src/runtime/peering/traversal/
 
 # -- event pipeline phase boundary checks --
 check_only_allowed 'project_one\(' "$PIPELINE_PATH" '^src/state/pipeline/(effects|drain)\.rs:'
@@ -190,8 +190,8 @@ check_no_match 'peer_identity_from_connection' "$PEERING_PATH"
 check_no_match 'endpoint\.connect_with\(' src/runtime/peering/loops/
 check_no_match 'endpoint\.connect\(' src/runtime/peering/loops/
 check_no_match 'endpoint\.accept\(' src/runtime/peering/loops/
-check_no_match 'endpoint\.connect_with\(' src/runtime/peering/workflows/
-check_no_match 'endpoint\.connect\(' src/runtime/peering/workflows/
+check_no_match 'endpoint\.connect_with\(' src/runtime/peering/traversal/
+check_no_match 'endpoint\.connect\(' src/runtime/peering/traversal/
 
 # -- coordinated-download-only initiator enforcement --
 check_no_match 'coordination:\s*Option<(&|Arc<)PeerCoord' src/

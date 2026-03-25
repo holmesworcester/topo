@@ -4,6 +4,10 @@
 //! - startup preflight/recovery
 //! - one long-lived sync connection scope per authenticated connection
 
+use std::collections::HashMap;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, Instant};
+
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
@@ -13,8 +17,7 @@ use crate::db::health::purge_expired_endpoints;
 use crate::db::open_connection;
 use crate::db::project_queue::ProjectQueue;
 use crate::db::schema::create_tables;
-use crate::runtime::build_mismatch::note_build_mismatch;
-use crate::runtime::repeated_warning::should_emit_globally;
+use crate::runtime::diagnostics::repeated_warning::should_emit_globally;
 use crate::sync::session::dependency_session::run_dependency_session;
 use crate::sync::session::receive_log::recover_receive_logs;
 use crate::sync::SyncConnectionHandler;
@@ -22,6 +25,22 @@ use crate::transport::session_factory::extract_build_mismatch_reason;
 use crate::transport::{SessionClass, SessionProvider};
 
 use super::{current_timestamp_ms, drain_batch_size, run_session};
+
+const RECENT_BUILD_MISMATCH_WINDOW: Duration = Duration::from_secs(300);
+
+fn note_build_mismatch(peer_id: &str, _reason: &str) {
+    static RECENT_BUILD_MISMATCHES: OnceLock<Mutex<HashMap<String, Instant>>> = OnceLock::new();
+
+    let registry = RECENT_BUILD_MISMATCHES.get_or_init(|| Mutex::new(HashMap::new()));
+    let now = Instant::now();
+    let mut entries = registry
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    entries.retain(|_, last_seen| {
+        now.saturating_duration_since(*last_seen) < RECENT_BUILD_MISMATCH_WINDOW
+    });
+    entries.insert(peer_id.to_string(), now);
+}
 
 /// How a session loop resolves the tenant (`recorded_by`) for each session.
 pub(super) enum SessionTenantResolver {

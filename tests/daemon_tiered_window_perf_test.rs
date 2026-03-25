@@ -52,18 +52,14 @@ fn env_bool(name: &str) -> bool {
 }
 
 fn inherited_tier_env() -> Vec<(String, String)> {
-    [
-        "TOPO_GENERATE_MESSAGE_SPREAD_MS",
-        "TOPO_FORWARD_ON_HAVE",
-        "TOPO_EVENT_TIMELINE",
-    ]
-    .into_iter()
-    .filter_map(|key| {
-        std::env::var(key)
-            .ok()
-            .map(|value| (key.to_string(), value))
-    })
-    .collect()
+    ["TOPO_GENERATE_MESSAGE_SPREAD_MS", "TOPO_EVENT_TIMELINE"]
+        .into_iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| (key.to_string(), value))
+        })
+        .collect()
 }
 
 fn tier_role_env(base: &[(String, String)], lowmem: bool) -> Vec<(String, String)> {
@@ -193,7 +189,6 @@ fn run_tiered_window_bench() {
         "TOPO_GENERATE_MESSAGE_SPREAD_MS",
         THREE_YEARS_MS.to_string(),
     );
-    std::env::set_var("TOPO_FORWARD_ON_HAVE", "1");
     std::env::set_var("TOPO_EVENT_TIMELINE", "1");
     std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "persist,projection");
 

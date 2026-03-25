@@ -16,12 +16,18 @@ use topo::db::open_connection;
 use topo::db::project_queue::ProjectQueue;
 use topo::db::transport_trust::authorized_fingerprints_from_db;
 use topo::peering::loops::{accept_loop, connect_loop, ConnectLoopConfig};
-use topo::peering::workflows::intro::{build_intro_offer, run_intro, send_intro_offer};
-use topo::peering::workflows::punch::spawn_intro_listener;
+use topo::peering::traversal::intro::build_intro_offer;
+use topo::peering::traversal::punch::{handle_intro_offer, spawn_intro_listener};
 use topo::projection::apply::project_one;
 use topo::shared::protocol::Frame;
 use topo::testutil::{assert_eventually, create_dynamic_endpoint_for_peer, start_peers, Peer};
-use topo::transport::multi_workspace::transport_sni;
+use topo::transport::COVER_SERVER_NAME;
+
+fn daemon_peer_id(peer: &Peer) -> String {
+    topo::transport::load_daemon_identity_from_db(&peer.db_path)
+        .expect("load test daemon identity")
+        .0
+}
 
 /// Force-drain the project_queue for a peer's DB, projecting any pending items.
 /// This handles the race where the batch_writer committed events but hasn't
@@ -114,7 +120,8 @@ async fn test_three_peer_intro_happy_path() {
     let a_ep1 = ep_a.clone();
     let a_db1 = peer_a.db_path.clone();
     let a_id1 = peer_a.identity.clone();
-    let intro_target_for_a = intro.transport_peer_id();
+    let intro_target_for_a = intro.identity.clone();
+    let intro_daemon_for_a = daemon_peer_id(&intro);
     let _a_connect = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -134,7 +141,7 @@ async fn test_three_peer_intro_happy_path() {
                 bootstrap_fallback_client_config: None,
                 sync_control: None,
                 auth_plan: None,
-                expected_remote_daemon_peer_id: None,
+                expected_remote_daemon_peer_id: Some(intro_daemon_for_a.clone()),
             })
             .await;
         });
@@ -143,7 +150,8 @@ async fn test_three_peer_intro_happy_path() {
     let b_ep1 = ep_b.clone();
     let b_db1 = peer_b.db_path.clone();
     let b_id1 = peer_b.identity.clone();
-    let intro_target_for_b = intro.transport_peer_id();
+    let intro_target_for_b = intro.identity.clone();
+    let intro_daemon_for_b = daemon_peer_id(&intro);
     let _b_connect = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -163,7 +171,7 @@ async fn test_three_peer_intro_happy_path() {
                 bootstrap_fallback_client_config: None,
                 sync_control: None,
                 auth_plan: None,
-                expected_remote_daemon_peer_id: None,
+                expected_remote_daemon_peer_id: Some(intro_daemon_for_b.clone()),
             })
             .await;
         });
@@ -203,7 +211,7 @@ async fn test_three_peer_intro_happy_path() {
         record_endpoint_observation(
             &db,
             &intro.identity,
-            &peer_a.transport_peer_id(),
+            &peer_a.identity,
             "127.0.0.1",
             addr_a.port(),
             now_ms,
@@ -213,17 +221,17 @@ async fn test_three_peer_intro_happy_path() {
         record_endpoint_observation(
             &db,
             &intro.identity,
-            &peer_b.transport_peer_id(),
+            &peer_b.identity,
             "127.0.0.1",
             addr_b.port(),
             now_ms,
             30_000,
         )
         .expect("record B observation");
-        let ep_a_obs = freshest_endpoint(&db, &intro.identity, &peer_a.transport_peer_id(), now_ms)
-            .expect("query ep_a");
-        let ep_b_obs = freshest_endpoint(&db, &intro.identity, &peer_b.transport_peer_id(), now_ms)
-            .expect("query ep_b");
+        let ep_a_obs =
+            freshest_endpoint(&db, &intro.identity, &peer_a.identity, now_ms).expect("query ep_a");
+        let ep_b_obs =
+            freshest_endpoint(&db, &intro.identity, &peer_b.identity, now_ms).expect("query ep_b");
         assert!(
             ep_a_obs.is_some(),
             "I should have organic endpoint observation for A"
@@ -334,7 +342,8 @@ async fn test_three_peer_intro_happy_path() {
         .unwrap()
         .as_millis() as u64;
     let offer_for_a = build_intro_offer(
-        &peer_b.transport_peer_id(),
+        &peer_b.identity,
+        &daemon_peer_id(&peer_b),
         "127.0.0.1",
         addr_b.port(),
         now_ms,
@@ -343,7 +352,8 @@ async fn test_three_peer_intro_happy_path() {
     )
     .expect("build offer for A");
     let offer_for_b = build_intro_offer(
-        &peer_a.transport_peer_id(),
+        &peer_a.identity,
+        &daemon_peer_id(&peer_a),
         "127.0.0.1",
         addr_a.port(),
         now_ms,
@@ -351,7 +361,7 @@ async fn test_three_peer_intro_happy_path() {
         4_000,
     )
     .expect("build offer for B");
-    let intro_by = intro.transport_peer_id();
+    let intro_by = intro.identity.clone();
     let a_db = peer_a.db_path.clone();
     let a_id = peer_a.identity.clone();
     let b_db = peer_b.db_path.clone();
@@ -363,6 +373,7 @@ async fn test_three_peer_intro_happy_path() {
             Frame::IntroOffer {
                 intro_id,
                 other_peer_id,
+                other_daemon_peer_id,
                 origin_family,
                 origin_ip,
                 origin_port,
@@ -377,6 +388,7 @@ async fn test_three_peer_intro_happy_path() {
                     a_ep_for_intro,
                     intro_id,
                     other_peer_id,
+                    other_daemon_peer_id,
                     origin_family,
                     origin_ip,
                     origin_port,
@@ -390,12 +402,13 @@ async fn test_three_peer_intro_happy_path() {
             _ => unreachable!("build_intro_offer should return IntroOffer"),
         }
     };
-    let intro_by_b = intro.transport_peer_id();
+    let intro_by_b = intro.identity.clone();
     let intro_b = async move {
         match offer_for_b {
             Frame::IntroOffer {
                 intro_id,
                 other_peer_id,
+                other_daemon_peer_id,
                 origin_family,
                 origin_ip,
                 origin_port,
@@ -410,6 +423,7 @@ async fn test_three_peer_intro_happy_path() {
                     b_ep_for_intro,
                     intro_id,
                     other_peer_id,
+                    other_daemon_peer_id,
                     origin_family,
                     origin_ip,
                     origin_port,
@@ -544,9 +558,8 @@ async fn test_dynamic_trust_rejects_unknown_peer() {
     // Unknown peer tries to connect to A — should fail at TLS handshake
     // because A's dynamic trust lookup finds no matching row.
     let ep_unknown = create_dynamic_endpoint_for_peer(&unknown);
-    let target_sni = transport_sni(&peer_a.transport_peer_id());
     let result = ep_unknown
-        .connect(addr_a, &target_sni)
+        .connect(addr_a, COVER_SERVER_NAME)
         .expect("initiate connect")
         .await;
 
@@ -575,6 +588,7 @@ async fn test_stale_intro_rejected() {
     // Build an expired IntroOffer (expires_at_ms in the past)
     let stale_offer = build_intro_offer(
         &hex::encode([0xBBu8; 32]), // some peer
+        &hex::encode([0xBBu8; 32]),
         "10.0.0.99",
         9999,
         1000, // observed long ago
@@ -587,6 +601,7 @@ async fn test_stale_intro_rejected() {
         Frame::IntroOffer {
             intro_id,
             other_peer_id,
+            other_daemon_peer_id,
             origin_family,
             origin_ip,
             origin_port,
@@ -597,10 +612,11 @@ async fn test_stale_intro_rejected() {
             handle_intro_offer(
                 &peer_a.db_path,
                 &peer_a.identity,
-                &intro.transport_peer_id(),
+                &intro.identity,
                 ep_a.clone(),
                 intro_id,
                 other_peer_id,
+                other_daemon_peer_id,
                 origin_family,
                 origin_ip,
                 origin_port,
@@ -664,6 +680,7 @@ async fn test_untrusted_peer_intro_rejected() {
         .as_millis() as u64;
     let offer = build_intro_offer(
         &hex::encode(unknown_peer),
+        &hex::encode(unknown_peer),
         "10.0.0.50",
         5000,
         now_ms,
@@ -676,6 +693,7 @@ async fn test_untrusted_peer_intro_rejected() {
         Frame::IntroOffer {
             intro_id,
             other_peer_id,
+            other_daemon_peer_id,
             origin_family,
             origin_ip,
             origin_port,
@@ -686,10 +704,11 @@ async fn test_untrusted_peer_intro_rejected() {
             handle_intro_offer(
                 &peer_a.db_path,
                 &peer_a.identity,
-                &intro.transport_peer_id(),
+                &intro.identity,
                 ep_a.clone(),
                 intro_id,
                 other_peer_id,
+                other_daemon_peer_id,
                 origin_family,
                 origin_ip,
                 origin_port,

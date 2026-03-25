@@ -9,7 +9,7 @@ set -euo pipefail
 # Outputs:
 # - per-run artifacts under target/lowmem
 # - receiver RSS/smaps maxima
-# - LOW_MEM_MEMTRACE-derived queue/backpressure maxima
+# - current queue/backpressure maxima
 # - "big users" summary for quick bottleneck diagnosis
 
 MODE="${1:-all}"
@@ -38,7 +38,6 @@ LARGE_TIMEOUT_SECS="${LOWMEM_LARGE_TIMEOUT_SECS:-3600}"
 LARGE_MARKER_MESSAGES="${LOWMEM_DELTA_MARKER_MESSAGES:-3}"
 LARGE_PREFLIGHT_EVENTS="${LOWMEM_BASELINE_PREFLIGHT_EVENTS:-1000}"
 
-LOWMEM_MEMTRACE_ENABLED="${LOW_MEM_MEMTRACE:-1}"
 LOWMEM_DAEMON_RUST_LOG="${LOWMEM_DAEMON_RUST_LOG:-info}"
 LOWMEM_BUDGET_KB="${LOWMEM_BUDGET_KB:-24576}"
 LOWMEM_CGROUP_ENFORCE="${LOWMEM_CGROUP_ENFORCE:-0}"
@@ -685,201 +684,10 @@ wait_for_file_slice_count() {
 
 run_smoke() {
   banner "Stage 1 - Smoke (10k total)"
-  LOW_MEM_MEMTRACE="${LOWMEM_MEMTRACE_ENABLED}" \
   LOW_MEM_IOS_SMOKE_EVENTS_PER_PEER="${SMOKE_EVENTS_PER_PEER}" \
   LOW_MEM_IOS_BUDGET_MIB="${SMOKE_BUDGET_MIB}" \
   TOPO_CMD_TIMEOUT_SECS="${TOPO_CMD_TIMEOUT_SECS}" \
   "${SCRIPT_ROOT}/scripts/run_lowmem_regimen.sh" smoke
-}
-
-summarize_memtrace() {
-  local memtrace_log="$1"
-  local out_file="$2"
-
-  if [ ! -s "${memtrace_log}" ]; then
-    cat > "${out_file}" <<'EOF'
-MEMTRACE_PRESENT=0
-MAX_INIT_WANTED=0
-MAX_INIT_PENDING_HAVE=0
-MAX_INIT_FALLBACK_NEED=0
-MAX_INIT_HAVE_CAP=0
-MAX_INIT_NEED_CAP=0
-MAX_INIT_PENDING_HAVE_CAP=0
-MAX_INIT_FALLBACK_CAP=0
-MAX_INIT_NEED_QUEUE=0
-MAX_INIT_INGEST_USED=0
-MAX_INIT_INGEST_CAP=0
-MAX_RESP_INGEST_USED=0
-MAX_RESP_INGEST_CAP=0
-MAX_DATA_INGEST_USED=0
-MAX_DATA_INGEST_CAP=0
-MAX_DATA_EVENTS_INGESTED=0
-MAX_DATA_BLOB=0
-MAX_SQLITE_MEM_CUR=0
-MAX_SQLITE_MEM_HIGH=0
-MAX_SQLITE_PCACHE_OVFL_CUR=0
-MAX_SQLITE_PCACHE_OVFL_HIGH=0
-MAX_INIT_DB_MAIN_CACHE=0
-MAX_INIT_DB_MAIN_SCHEMA=0
-MAX_INIT_DB_MAIN_STMT=0
-MAX_INIT_DB_NEG_CACHE=0
-MAX_INIT_DB_NEG_SCHEMA=0
-MAX_INIT_DB_NEG_STMT=0
-MAX_RESP_DB_CACHE=0
-MAX_RESP_DB_SCHEMA=0
-MAX_RESP_DB_STMT=0
-MAX_MALL_ARENA=0
-MAX_MALL_USED=0
-MAX_MALL_FREE=0
-MAX_MALL_MMAP=0
-EOF
-    return 0
-  fi
-
-  awk '
-    /LOWMEM_MEMTRACE initiator/ {
-      for (i=1; i<=NF; i++) {
-        if ($i ~ /^wanted=/) {
-          split($i,a,"="); if (a[2] > max_init_wanted) max_init_wanted = a[2]
-        } else if ($i ~ /^pending_have=/) {
-          split($i,a,"="); if (a[2] > max_init_pending_have) max_init_pending_have = a[2]
-        } else if ($i ~ /^fallback_need=/) {
-          split($i,a,"="); if (a[2] > max_init_fallback_need) max_init_fallback_need = a[2]
-        } else if ($i ~ /^have_cap=/) {
-          split($i,a,"="); if (a[2] > max_init_have_cap) max_init_have_cap = a[2]
-        } else if ($i ~ /^need_cap=/) {
-          split($i,a,"="); if (a[2] > max_init_need_cap) max_init_need_cap = a[2]
-        } else if ($i ~ /^pending_have_cap=/) {
-          split($i,a,"="); if (a[2] > max_init_pending_have_cap) max_init_pending_have_cap = a[2]
-        } else if ($i ~ /^fallback_cap=/) {
-          split($i,a,"="); if (a[2] > max_init_fallback_cap) max_init_fallback_cap = a[2]
-        } else if ($i ~ /^need_queue=/) {
-          split($i,a,"="); if (a[2] > max_init_need_queue) max_init_need_queue = a[2]
-        } else if ($i ~ /^ingest_used=/) {
-          split($i,a,"="); split(a[2],b,"/")
-          used = b[1] + 0; cap = b[2] + 0
-          if (used > max_init_ingest_used) {
-            max_init_ingest_used = used
-            max_init_ingest_cap = cap
-          }
-        } else if ($i ~ /^sqlite_mem_cur=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_sqlite_mem_cur) max_sqlite_mem_cur = a[2]
-        } else if ($i ~ /^sqlite_mem_high=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_sqlite_mem_high) max_sqlite_mem_high = a[2]
-        } else if ($i ~ /^sqlite_pcache_ovfl_cur=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_sqlite_pcache_ovfl_cur) max_sqlite_pcache_ovfl_cur = a[2]
-        } else if ($i ~ /^sqlite_pcache_ovfl_high=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_sqlite_pcache_ovfl_high) max_sqlite_pcache_ovfl_high = a[2]
-        } else if ($i ~ /^db_main_cache=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_init_db_main_cache) max_init_db_main_cache = a[2]
-        } else if ($i ~ /^db_main_schema=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_init_db_main_schema) max_init_db_main_schema = a[2]
-        } else if ($i ~ /^db_main_stmt=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_init_db_main_stmt) max_init_db_main_stmt = a[2]
-        } else if ($i ~ /^db_neg_cache=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_init_db_neg_cache) max_init_db_neg_cache = a[2]
-        } else if ($i ~ /^db_neg_schema=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_init_db_neg_schema) max_init_db_neg_schema = a[2]
-        } else if ($i ~ /^db_neg_stmt=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_init_db_neg_stmt) max_init_db_neg_stmt = a[2]
-        } else if ($i ~ /^mall_arena=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_mall_arena) max_mall_arena = a[2]
-        } else if ($i ~ /^mall_used=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_mall_used) max_mall_used = a[2]
-        } else if ($i ~ /^mall_free=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_mall_free) max_mall_free = a[2]
-        } else if ($i ~ /^mall_mmap=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_mall_mmap) max_mall_mmap = a[2]
-        }
-      }
-    }
-    /LOWMEM_MEMTRACE responder/ {
-      for (i=1; i<=NF; i++) {
-        if ($i ~ /^ingest_used=/) {
-          split($i,a,"="); split(a[2],b,"/")
-          used = b[1] + 0; cap = b[2] + 0
-          if (used > max_resp_ingest_used) {
-            max_resp_ingest_used = used
-            max_resp_ingest_cap = cap
-          }
-        } else if ($i ~ /^sqlite_mem_cur=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_sqlite_mem_cur) max_sqlite_mem_cur = a[2]
-        } else if ($i ~ /^sqlite_mem_high=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_sqlite_mem_high) max_sqlite_mem_high = a[2]
-        } else if ($i ~ /^sqlite_pcache_ovfl_cur=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_sqlite_pcache_ovfl_cur) max_sqlite_pcache_ovfl_cur = a[2]
-        } else if ($i ~ /^sqlite_pcache_ovfl_high=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_sqlite_pcache_ovfl_high) max_sqlite_pcache_ovfl_high = a[2]
-        } else if ($i ~ /^db_cache=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_resp_db_cache) max_resp_db_cache = a[2]
-        } else if ($i ~ /^db_schema=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_resp_db_schema) max_resp_db_schema = a[2]
-        } else if ($i ~ /^db_stmt=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_resp_db_stmt) max_resp_db_stmt = a[2]
-        } else if ($i ~ /^mall_arena=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_mall_arena) max_mall_arena = a[2]
-        } else if ($i ~ /^mall_used=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_mall_used) max_mall_used = a[2]
-        } else if ($i ~ /^mall_free=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_mall_free) max_mall_free = a[2]
-        } else if ($i ~ /^mall_mmap=/) {
-          split($i,a,"="); if ((a[2] + 0) >= 0 && a[2] > max_mall_mmap) max_mall_mmap = a[2]
-        }
-      }
-    }
-    /LOWMEM_MEMTRACE data_rx/ {
-      for (i=1; i<=NF; i++) {
-        if ($i ~ /^ingest_used=/) {
-          split($i,a,"="); split(a[2],b,"/")
-          used = b[1] + 0; cap = b[2] + 0
-          if (used > max_data_ingest_used) {
-            max_data_ingest_used = used
-            max_data_ingest_cap = cap
-          }
-        } else if ($i ~ /^events_ingested=/) {
-          split($i,a,"="); if (a[2] > max_data_events) max_data_events = a[2]
-        } else if ($i ~ /^max_blob=/) {
-          split($i,a,"="); if (a[2] > max_data_blob) max_data_blob = a[2]
-        }
-      }
-    }
-    END {
-      printf "MEMTRACE_PRESENT=1\n"
-      printf "MAX_INIT_WANTED=%d\n", max_init_wanted
-      printf "MAX_INIT_PENDING_HAVE=%d\n", max_init_pending_have
-      printf "MAX_INIT_FALLBACK_NEED=%d\n", max_init_fallback_need
-      printf "MAX_INIT_HAVE_CAP=%d\n", max_init_have_cap
-      printf "MAX_INIT_NEED_CAP=%d\n", max_init_need_cap
-      printf "MAX_INIT_PENDING_HAVE_CAP=%d\n", max_init_pending_have_cap
-      printf "MAX_INIT_FALLBACK_CAP=%d\n", max_init_fallback_cap
-      printf "MAX_INIT_NEED_QUEUE=%d\n", max_init_need_queue
-      printf "MAX_INIT_INGEST_USED=%d\n", max_init_ingest_used
-      printf "MAX_INIT_INGEST_CAP=%d\n", max_init_ingest_cap
-      printf "MAX_RESP_INGEST_USED=%d\n", max_resp_ingest_used
-      printf "MAX_RESP_INGEST_CAP=%d\n", max_resp_ingest_cap
-      printf "MAX_DATA_INGEST_USED=%d\n", max_data_ingest_used
-      printf "MAX_DATA_INGEST_CAP=%d\n", max_data_ingest_cap
-      printf "MAX_DATA_EVENTS_INGESTED=%d\n", max_data_events
-      printf "MAX_DATA_BLOB=%d\n", max_data_blob
-      printf "MAX_SQLITE_MEM_CUR=%d\n", max_sqlite_mem_cur
-      printf "MAX_SQLITE_MEM_HIGH=%d\n", max_sqlite_mem_high
-      printf "MAX_SQLITE_PCACHE_OVFL_CUR=%d\n", max_sqlite_pcache_ovfl_cur
-      printf "MAX_SQLITE_PCACHE_OVFL_HIGH=%d\n", max_sqlite_pcache_ovfl_high
-      printf "MAX_INIT_DB_MAIN_CACHE=%d\n", max_init_db_main_cache
-      printf "MAX_INIT_DB_MAIN_SCHEMA=%d\n", max_init_db_main_schema
-      printf "MAX_INIT_DB_MAIN_STMT=%d\n", max_init_db_main_stmt
-      printf "MAX_INIT_DB_NEG_CACHE=%d\n", max_init_db_neg_cache
-      printf "MAX_INIT_DB_NEG_SCHEMA=%d\n", max_init_db_neg_schema
-      printf "MAX_INIT_DB_NEG_STMT=%d\n", max_init_db_neg_stmt
-      printf "MAX_RESP_DB_CACHE=%d\n", max_resp_db_cache
-      printf "MAX_RESP_DB_SCHEMA=%d\n", max_resp_db_schema
-      printf "MAX_RESP_DB_STMT=%d\n", max_resp_db_stmt
-      printf "MAX_MALL_ARENA=%d\n", max_mall_arena
-      printf "MAX_MALL_USED=%d\n", max_mall_used
-      printf "MAX_MALL_FREE=%d\n", max_mall_free
-      printf "MAX_MALL_MMAP=%d\n", max_mall_mmap
-    }
-  ' "${memtrace_log}" > "${out_file}"
 }
 
 run_asymmetric() {
@@ -891,8 +699,6 @@ run_asymmetric() {
   local samples_log="${run_dir}/samples.log"
   local bob_smaps_log="${run_dir}/bob_smaps.log"
   local bob_anon_regions="${run_dir}/bob_anon_regions.txt"
-  local memtrace_log="${run_dir}/memtrace.log"
-  local memtrace_summary="${run_dir}/memtrace_summary.env"
   local summary_file="${run_dir}/summary.txt"
   local alice_pid=""
   local bob_pid=""
@@ -945,15 +751,11 @@ run_asymmetric() {
 
   LOW_MEM_IOS=1 \
   LOW_MEM_WAL_CAP_MIB="${WAL_CAP_MIB}" \
-  LOW_MEM_MEMTRACE="${LOWMEM_MEMTRACE_ENABLED}" \
-  LOW_MEM_MEMTRACE_FILE="${memtrace_log}" \
   start_daemon --db "${bob_db}"
   wait_for_socket "${bob_db}" 30
   log_note "${harness_log}" "bob restarted in lowmem mode"
   LOW_MEM_IOS=1 \
   LOW_MEM_WAL_CAP_MIB="${WAL_CAP_MIB}" \
-  LOW_MEM_MEMTRACE="${LOWMEM_MEMTRACE_ENABLED}" \
-  LOW_MEM_MEMTRACE_FILE="${memtrace_log}" \
   run_topo --db "${bob_db}" accept \
     "${invite_link}" \
     --username "bob" \
@@ -1055,10 +857,6 @@ $(awk '
 ' "${bob_smaps_log}")
 EOF
 
-  summarize_memtrace "${memtrace_log}" "${memtrace_summary}"
-  # shellcheck disable=SC1090
-  source "${memtrace_summary}"
-
   local anon_pct
   if [ "${max_total}" -gt 0 ]; then
     anon_pct=$(( (100 * max_anon) / max_total ))
@@ -1080,16 +878,7 @@ EOF
     cgroup_path="${bob_cgroup}"
   fi
 
-  local sqlite_mem_kb mall_arena_kb mall_used_kb mall_free_kb mall_mmap_kb anon_minus_sqlite_kb max_total_mib
-  sqlite_mem_kb=$(( (MAX_SQLITE_MEM_CUR + 1023) / 1024 ))
-  mall_arena_kb=$(( (MAX_MALL_ARENA + 1023) / 1024 ))
-  mall_used_kb=$(( (MAX_MALL_USED + 1023) / 1024 ))
-  mall_free_kb=$(( (MAX_MALL_FREE + 1023) / 1024 ))
-  mall_mmap_kb=$(( (MAX_MALL_MMAP + 1023) / 1024 ))
-  anon_minus_sqlite_kb=$(( max_anon - sqlite_mem_kb ))
-  if [ "${anon_minus_sqlite_kb}" -lt 0 ]; then
-    anon_minus_sqlite_kb=0
-  fi
+  local max_total_mib
   max_total_mib="$(awk -v kb="${max_total}" 'BEGIN { printf "%.2f", kb / 1024.0 }')"
 
   {
@@ -1123,41 +912,6 @@ EOF
     echo "CGROUP_OOM_KILL=${cgroup_oom_kill}"
     echo "CGROUP_PATH=${cgroup_path}"
     echo "MAX_BOB_ANON_PCT=${anon_pct}"
-    echo "MEMTRACE_PRESENT=${MEMTRACE_PRESENT}"
-    echo "MAX_INIT_WANTED=${MAX_INIT_WANTED}"
-    echo "MAX_INIT_PENDING_HAVE=${MAX_INIT_PENDING_HAVE}"
-    echo "MAX_INIT_FALLBACK_NEED=${MAX_INIT_FALLBACK_NEED}"
-    echo "MAX_INIT_HAVE_CAP=${MAX_INIT_HAVE_CAP}"
-    echo "MAX_INIT_NEED_CAP=${MAX_INIT_NEED_CAP}"
-    echo "MAX_INIT_PENDING_HAVE_CAP=${MAX_INIT_PENDING_HAVE_CAP}"
-    echo "MAX_INIT_FALLBACK_CAP=${MAX_INIT_FALLBACK_CAP}"
-    echo "MAX_INIT_NEED_QUEUE=${MAX_INIT_NEED_QUEUE}"
-    echo "MAX_INIT_INGEST_USED=${MAX_INIT_INGEST_USED}"
-    echo "MAX_INIT_INGEST_CAP=${MAX_INIT_INGEST_CAP}"
-    echo "MAX_RESP_INGEST_USED=${MAX_RESP_INGEST_USED}"
-    echo "MAX_RESP_INGEST_CAP=${MAX_RESP_INGEST_CAP}"
-    echo "MAX_DATA_INGEST_USED=${MAX_DATA_INGEST_USED}"
-    echo "MAX_DATA_INGEST_CAP=${MAX_DATA_INGEST_CAP}"
-    echo "MAX_DATA_EVENTS_INGESTED=${MAX_DATA_EVENTS_INGESTED}"
-    echo "MAX_DATA_BLOB=${MAX_DATA_BLOB}"
-    echo "MAX_SQLITE_MEM_CUR=${MAX_SQLITE_MEM_CUR}"
-    echo "MAX_SQLITE_MEM_HIGH=${MAX_SQLITE_MEM_HIGH}"
-    echo "MAX_SQLITE_PCACHE_OVFL_CUR=${MAX_SQLITE_PCACHE_OVFL_CUR}"
-    echo "MAX_SQLITE_PCACHE_OVFL_HIGH=${MAX_SQLITE_PCACHE_OVFL_HIGH}"
-    echo "MAX_INIT_DB_MAIN_CACHE=${MAX_INIT_DB_MAIN_CACHE}"
-    echo "MAX_INIT_DB_MAIN_SCHEMA=${MAX_INIT_DB_MAIN_SCHEMA}"
-    echo "MAX_INIT_DB_MAIN_STMT=${MAX_INIT_DB_MAIN_STMT}"
-    echo "MAX_INIT_DB_NEG_CACHE=${MAX_INIT_DB_NEG_CACHE}"
-    echo "MAX_INIT_DB_NEG_SCHEMA=${MAX_INIT_DB_NEG_SCHEMA}"
-    echo "MAX_INIT_DB_NEG_STMT=${MAX_INIT_DB_NEG_STMT}"
-    echo "MAX_RESP_DB_CACHE=${MAX_RESP_DB_CACHE}"
-    echo "MAX_RESP_DB_SCHEMA=${MAX_RESP_DB_SCHEMA}"
-    echo "MAX_RESP_DB_STMT=${MAX_RESP_DB_STMT}"
-    echo "MAX_MALL_ARENA=${MAX_MALL_ARENA}"
-    echo "MAX_MALL_USED=${MAX_MALL_USED}"
-    echo "MAX_MALL_FREE=${MAX_MALL_FREE}"
-    echo "MAX_MALL_MMAP=${MAX_MALL_MMAP}"
-    echo "MAX_BOB_ANON_MINUS_SQLITE_KB=${anon_minus_sqlite_kb}"
   } > "${summary_file}"
 
   banner "Summary"
@@ -1166,20 +920,8 @@ EOF
   echo
   echo "Big Users (heuristic):"
   echo "1) Receiver anonymous memory: ${max_anon} KB (${anon_pct}% of total ${max_total} KB)"
-  echo "2) SQLite tracked heap (process-global): ${MAX_SQLITE_MEM_CUR} bytes (~${sqlite_mem_kb} KB)"
-  echo "3) Receiver anon minus tracked SQLite heap: ${anon_minus_sqlite_kb} KB"
-  echo "3a) Anon breakdown (unlabeled/heap/stack/named/[bracket-other]): ${max_anon_unlabeled}/${max_anon_heap}/${max_anon_stack}/${max_anon_named}/${max_anon_other_bracket} KB"
-  echo "3b) glibc allocator (arena/used/free/mmap): ${mall_arena_kb}/${mall_used_kb}/${mall_free_kb}/${mall_mmap_kb} KB"
-  if [ "${MAX_RESP_INGEST_CAP}" -gt 0 ]; then
-    echo "4) Responder ingest queue pressure: ${MAX_RESP_INGEST_USED}/${MAX_RESP_INGEST_CAP}"
-  fi
-  if [ "${MAX_DATA_INGEST_CAP}" -gt 0 ]; then
-    echo "5) Data receiver ingest queue pressure: ${MAX_DATA_INGEST_USED}/${MAX_DATA_INGEST_CAP}"
-  fi
-  echo "6) Receiver wanted backlog peak: ${MAX_INIT_WANTED}"
-  echo "7) Initiator vector caps (have/need/pending/fallback): ${MAX_INIT_HAVE_CAP}/${MAX_INIT_NEED_CAP}/${MAX_INIT_PENDING_HAVE_CAP}/${MAX_INIT_FALLBACK_CAP}"
-  echo "7a) Deferred need queue peak (DB-backed): ${MAX_INIT_NEED_QUEUE}"
-  echo "8) Receiver db-shm peak: ${max_db_shm} KB (non-dominant if small)"
+  echo "2) Anon breakdown (unlabeled/heap/stack/named/[bracket-other]): ${max_anon_unlabeled}/${max_anon_heap}/${max_anon_stack}/${max_anon_named}/${max_anon_other_bracket} KB"
+  echo "3) Receiver db-shm peak: ${max_db_shm} KB"
   if [ -s "${bob_anon_regions}" ]; then
     echo "Top anonymous regions by RSS:"
     sed -n '1,5p' "${bob_anon_regions}"
@@ -1190,7 +932,6 @@ EOF
   echo "  ${samples_log}"
   echo "  ${bob_smaps_log}"
   echo "  ${bob_anon_regions}"
-  echo "  ${memtrace_log}"
 
   if [ "${cgroup_oom_kill}" -gt 0 ]; then
     echo "error: receiver exceeded enforced cgroup limit (${cgroup_limit_kb} KB) and was OOM-killed" >&2
@@ -1208,8 +949,6 @@ run_large_delta() {
   local samples_log="${run_dir}/samples.log"
   local bob_smaps_log="${run_dir}/bob_smaps.log"
   local bob_anon_regions="${run_dir}/bob_anon_regions.txt"
-  local memtrace_log="${run_dir}/memtrace.log"
-  local memtrace_summary="${run_dir}/memtrace_summary.env"
   local summary_file="${run_dir}/summary.txt"
   local alice_pid=""
   local bob_pid=""
@@ -1361,8 +1100,6 @@ run_large_delta() {
 
   LOW_MEM_IOS=1 \
   LOW_MEM_WAL_CAP_MIB="${WAL_CAP_MIB}" \
-  LOW_MEM_MEMTRACE="${LOWMEM_MEMTRACE_ENABLED}" \
-  LOW_MEM_MEMTRACE_FILE="${memtrace_log}" \
   start_daemon --db "${bob_db}"
   wait_for_socket "${bob_db}" 30
 
@@ -1503,10 +1240,6 @@ $(awk '
 ' "${bob_smaps_log}")
 EOF
 
-  summarize_memtrace "${memtrace_log}" "${memtrace_summary}"
-  # shellcheck disable=SC1090
-  source "${memtrace_summary}"
-
   local anon_pct
   if [ "${max_total}" -gt 0 ]; then
     anon_pct=$(( (100 * max_anon) / max_total ))
@@ -1528,16 +1261,7 @@ EOF
     cgroup_path="${bob_cgroup}"
   fi
 
-  local sqlite_mem_kb mall_arena_kb mall_used_kb mall_free_kb mall_mmap_kb anon_minus_sqlite_kb max_total_mib
-  sqlite_mem_kb=$(( (MAX_SQLITE_MEM_CUR + 1023) / 1024 ))
-  mall_arena_kb=$(( (MAX_MALL_ARENA + 1023) / 1024 ))
-  mall_used_kb=$(( (MAX_MALL_USED + 1023) / 1024 ))
-  mall_free_kb=$(( (MAX_MALL_FREE + 1023) / 1024 ))
-  mall_mmap_kb=$(( (MAX_MALL_MMAP + 1023) / 1024 ))
-  anon_minus_sqlite_kb=$(( max_anon - sqlite_mem_kb ))
-  if [ "${anon_minus_sqlite_kb}" -lt 0 ]; then
-    anon_minus_sqlite_kb=0
-  fi
+  local max_total_mib
   max_total_mib="$(awk -v kb="${max_total}" 'BEGIN { printf "%.2f", kb / 1024.0 }')"
 
   {
@@ -1587,41 +1311,6 @@ EOF
     echo "CGROUP_OOM_KILL=${cgroup_oom_kill}"
     echo "CGROUP_PATH=${cgroup_path}"
     echo "MAX_BOB_ANON_PCT=${anon_pct}"
-    echo "MEMTRACE_PRESENT=${MEMTRACE_PRESENT}"
-    echo "MAX_INIT_WANTED=${MAX_INIT_WANTED}"
-    echo "MAX_INIT_PENDING_HAVE=${MAX_INIT_PENDING_HAVE}"
-    echo "MAX_INIT_FALLBACK_NEED=${MAX_INIT_FALLBACK_NEED}"
-    echo "MAX_INIT_HAVE_CAP=${MAX_INIT_HAVE_CAP}"
-    echo "MAX_INIT_NEED_CAP=${MAX_INIT_NEED_CAP}"
-    echo "MAX_INIT_PENDING_HAVE_CAP=${MAX_INIT_PENDING_HAVE_CAP}"
-    echo "MAX_INIT_FALLBACK_CAP=${MAX_INIT_FALLBACK_CAP}"
-    echo "MAX_INIT_NEED_QUEUE=${MAX_INIT_NEED_QUEUE}"
-    echo "MAX_INIT_INGEST_USED=${MAX_INIT_INGEST_USED}"
-    echo "MAX_INIT_INGEST_CAP=${MAX_INIT_INGEST_CAP}"
-    echo "MAX_RESP_INGEST_USED=${MAX_RESP_INGEST_USED}"
-    echo "MAX_RESP_INGEST_CAP=${MAX_RESP_INGEST_CAP}"
-    echo "MAX_DATA_INGEST_USED=${MAX_DATA_INGEST_USED}"
-    echo "MAX_DATA_INGEST_CAP=${MAX_DATA_INGEST_CAP}"
-    echo "MAX_DATA_EVENTS_INGESTED=${MAX_DATA_EVENTS_INGESTED}"
-    echo "MAX_DATA_BLOB=${MAX_DATA_BLOB}"
-    echo "MAX_SQLITE_MEM_CUR=${MAX_SQLITE_MEM_CUR}"
-    echo "MAX_SQLITE_MEM_HIGH=${MAX_SQLITE_MEM_HIGH}"
-    echo "MAX_SQLITE_PCACHE_OVFL_CUR=${MAX_SQLITE_PCACHE_OVFL_CUR}"
-    echo "MAX_SQLITE_PCACHE_OVFL_HIGH=${MAX_SQLITE_PCACHE_OVFL_HIGH}"
-    echo "MAX_INIT_DB_MAIN_CACHE=${MAX_INIT_DB_MAIN_CACHE}"
-    echo "MAX_INIT_DB_MAIN_SCHEMA=${MAX_INIT_DB_MAIN_SCHEMA}"
-    echo "MAX_INIT_DB_MAIN_STMT=${MAX_INIT_DB_MAIN_STMT}"
-    echo "MAX_INIT_DB_NEG_CACHE=${MAX_INIT_DB_NEG_CACHE}"
-    echo "MAX_INIT_DB_NEG_SCHEMA=${MAX_INIT_DB_NEG_SCHEMA}"
-    echo "MAX_INIT_DB_NEG_STMT=${MAX_INIT_DB_NEG_STMT}"
-    echo "MAX_RESP_DB_CACHE=${MAX_RESP_DB_CACHE}"
-    echo "MAX_RESP_DB_SCHEMA=${MAX_RESP_DB_SCHEMA}"
-    echo "MAX_RESP_DB_STMT=${MAX_RESP_DB_STMT}"
-    echo "MAX_MALL_ARENA=${MAX_MALL_ARENA}"
-    echo "MAX_MALL_USED=${MAX_MALL_USED}"
-    echo "MAX_MALL_FREE=${MAX_MALL_FREE}"
-    echo "MAX_MALL_MMAP=${MAX_MALL_MMAP}"
-    echo "MAX_BOB_ANON_MINUS_SQLITE_KB=${anon_minus_sqlite_kb}"
   } > "${summary_file}"
 
   banner "Summary"
@@ -1630,20 +1319,8 @@ EOF
   echo
   echo "Big Users (heuristic):"
   echo "1) Receiver anonymous memory: ${max_anon} KB (${anon_pct}% of total ${max_total} KB)"
-  echo "2) SQLite tracked heap (process-global): ${MAX_SQLITE_MEM_CUR} bytes (~${sqlite_mem_kb} KB)"
-  echo "3) Receiver anon minus tracked SQLite heap: ${anon_minus_sqlite_kb} KB"
-  echo "3a) Anon breakdown (unlabeled/heap/stack/named/[bracket-other]): ${max_anon_unlabeled}/${max_anon_heap}/${max_anon_stack}/${max_anon_named}/${max_anon_other_bracket} KB"
-  echo "3b) glibc allocator (arena/used/free/mmap): ${mall_arena_kb}/${mall_used_kb}/${mall_free_kb}/${mall_mmap_kb} KB"
-  if [ "${MAX_RESP_INGEST_CAP}" -gt 0 ]; then
-    echo "4) Responder ingest queue pressure: ${MAX_RESP_INGEST_USED}/${MAX_RESP_INGEST_CAP}"
-  fi
-  if [ "${MAX_DATA_INGEST_CAP}" -gt 0 ]; then
-    echo "5) Data receiver ingest queue pressure: ${MAX_DATA_INGEST_USED}/${MAX_DATA_INGEST_CAP}"
-  fi
-  echo "6) Receiver wanted backlog peak: ${MAX_INIT_WANTED}"
-  echo "7) Initiator vector caps (have/need/pending/fallback): ${MAX_INIT_HAVE_CAP}/${MAX_INIT_NEED_CAP}/${MAX_INIT_PENDING_HAVE_CAP}/${MAX_INIT_FALLBACK_CAP}"
-  echo "7a) Deferred need queue peak (DB-backed): ${MAX_INIT_NEED_QUEUE}"
-  echo "8) Receiver db-shm peak: ${max_db_shm} KB (non-dominant if small)"
+  echo "2) Anon breakdown (unlabeled/heap/stack/named/[bracket-other]): ${max_anon_unlabeled}/${max_anon_heap}/${max_anon_stack}/${max_anon_named}/${max_anon_other_bracket} KB"
+  echo "3) Receiver db-shm peak: ${max_db_shm} KB"
   if [ -s "${bob_anon_regions}" ]; then
     echo "Top anonymous regions by RSS:"
     sed -n '1,5p' "${bob_anon_regions}"
@@ -1654,7 +1331,6 @@ EOF
   echo "  ${samples_log}"
   echo "  ${bob_smaps_log}"
   echo "  ${bob_anon_regions}"
-  echo "  ${memtrace_log}"
 
   if [ "${cgroup_oom_kill}" -gt 0 ]; then
     echo "error: receiver exceeded enforced cgroup limit (${cgroup_limit_kb} KB) and was OOM-killed" >&2
@@ -1708,7 +1384,6 @@ echo "  LOWMEM_DELTA_FILE_MIB=${LARGE_DELTA_FILE_MIB}"
 echo "  LOWMEM_LARGE_TIMEOUT_SECS=${LARGE_TIMEOUT_SECS}"
 echo "  LOWMEM_DELTA_MARKER_MESSAGES=${LARGE_MARKER_MESSAGES}"
 echo "  LOW_MEM_WAL_CAP_MIB=${WAL_CAP_MIB}"
-echo "  LOW_MEM_MEMTRACE=${LOWMEM_MEMTRACE_ENABLED}"
 echo "  LOWMEM_DAEMON_RUST_LOG=${LOWMEM_DAEMON_RUST_LOG}"
 echo "  LOWMEM_BUDGET_KB=${LOWMEM_BUDGET_KB}"
 echo "  LOWMEM_CGROUP_ENFORCE=${LOWMEM_CGROUP_ENFORCE}"

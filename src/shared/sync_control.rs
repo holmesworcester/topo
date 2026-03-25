@@ -4,7 +4,7 @@ use serde::{Deserialize, Serialize};
 use std::fmt;
 use std::str::FromStr;
 
-/// Sync policy mode for a single lane (requests, responses, forward_on_have).
+/// Sync policy mode for a single lane (requests, responses).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SyncPolicyMode {
@@ -51,12 +51,11 @@ impl FromStr for SyncPolicyMode {
     }
 }
 
-/// Per-tenant sync policy controlling three sync lanes.
+/// Per-tenant sync policy controlling request and response lanes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct TenantSyncPolicy {
     pub requests: SyncPolicyMode,
     pub responses: SyncPolicyMode,
-    pub forward_on_have: SyncPolicyMode,
 }
 
 impl Default for TenantSyncPolicy {
@@ -64,7 +63,6 @@ impl Default for TenantSyncPolicy {
         TenantSyncPolicy {
             requests: SyncPolicyMode::Auto,
             responses: SyncPolicyMode::Auto,
-            forward_on_have: SyncPolicyMode::Auto,
         }
     }
 }
@@ -78,7 +76,6 @@ mod tests {
         let policy = TenantSyncPolicy::default();
         assert_eq!(policy.requests, SyncPolicyMode::Auto);
         assert_eq!(policy.responses, SyncPolicyMode::Auto);
-        assert_eq!(policy.forward_on_have, SyncPolicyMode::Auto);
     }
 
     #[test]
@@ -120,7 +117,6 @@ mod tests {
         let policy = TenantSyncPolicy {
             requests: SyncPolicyMode::Manual,
             responses: SyncPolicyMode::Disabled,
-            forward_on_have: SyncPolicyMode::Auto,
         };
         let json = serde_json::to_string(&policy).unwrap();
         let parsed: TenantSyncPolicy = serde_json::from_str(&json).unwrap();

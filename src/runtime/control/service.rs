@@ -9,12 +9,10 @@ use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::EventId;
-use crate::db::{
-    open_connection, schema::create_tables, transport_trust::is_authorized_for_tenant,
-};
+use crate::db::{open_connection, schema::create_tables};
 use crate::event_modules::peer_shared;
-use crate::transport::create_dual_endpoint_dynamic;
-use crate::transport::identity::{load_transport_cert_required, load_transport_peer_id};
+use crate::transport::create_runtime_endpoint_for_tenants;
+use crate::transport::identity::load_transport_peer_id;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -211,24 +209,11 @@ pub async fn svc_intro(
     ttl_ms: u64,
     attempt_window_ms: u32,
 ) -> ServiceResult<bool> {
-    use std::sync::Arc;
-
-    let conn = open_connection(db_path)?;
-    create_tables(&conn)?;
-    let (recorded_by, cert, key) = load_transport_cert_required(&conn)?;
+    let (recorded_by, conn) = open_db_load(db_path)?;
     drop(conn);
+    let endpoint = create_runtime_endpoint_for_tenants("0.0.0.0:0".parse().unwrap(), db_path)?;
 
-    // Dynamic trust lookup from SQL at handshake time
-    let db_path_for_lookup = db_path.to_string();
-    let recorded_by_for_lookup = recorded_by.clone();
-    let dynamic_allow = Arc::new(move |peer_fp: &[u8; 32]| {
-        let db = open_connection(&db_path_for_lookup)?;
-        is_authorized_for_tenant(&db, &recorded_by_for_lookup, peer_fp)
-    });
-    let endpoint =
-        create_dual_endpoint_dynamic("0.0.0.0:0".parse().unwrap(), cert, key, dynamic_allow)?;
-
-    let result = crate::peering::workflows::intro::run_intro(
+    let result = crate::peering::traversal::intro::run_intro(
         &endpoint,
         db_path,
         &recorded_by,

@@ -34,7 +34,7 @@ use tracing::warn;
 use crate::contracts::peering_contract::{
     PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId, TransportSessionIo,
 };
-use crate::runtime::repeated_warning::should_emit_globally;
+use crate::runtime::diagnostics::repeated_warning::should_emit_globally;
 use crate::sync::SyncConnectionHandler;
 use crate::transport::session_factory::extract_build_mismatch_reason;
 

@@ -18,7 +18,7 @@ use topo::db::transport_creds::discover_local_tenants;
 use topo::db::{friendly_db_error, open_connection, schema::create_tables, sync_log};
 use topo::rpc::catalog;
 use topo::rpc::client::{rpc_call, rpc_call_raw, RpcClientError};
-use topo::rpc::protocol::{ForwardAction, RpcMethod, UpnpAction, PROTOCOL_VERSION};
+use topo::rpc::protocol::{RpcMethod, UpnpAction, PROTOCOL_VERSION};
 use topo::rpc::server::{run_rpc_server, DaemonState, RuntimeState};
 use topo::service;
 use topo::tuning::apply_low_mem_allocator_tuning;
@@ -431,12 +431,6 @@ enum Commands {
         action: Option<UpnpCommand>,
     },
 
-    /// Enable, disable, or query forward-on-have live hint delivery.
-    Forward {
-        #[command(subcommand)]
-        action: Option<ForwardCommand>,
-    },
-
     /// Manual sync controls: policy, round, request
     #[command(
         name = "sync",
@@ -495,16 +489,6 @@ enum UpnpCommand {
 }
 
 #[derive(Subcommand)]
-enum ForwardCommand {
-    /// Enable forward-on-have live hint delivery.
-    Enable,
-    /// Disable forward-on-have live hint delivery.
-    Disable,
-    /// Show the current forward-on-have status.
-    Status,
-}
-
-#[derive(Subcommand)]
 enum SyncAction {
     /// Manage sync policy (show or set)
     Policy {
@@ -546,9 +530,6 @@ enum SyncPolicyAction {
         /// Responses lane mode (auto, manual, disabled)
         #[arg(long)]
         responses: Option<String>,
-        /// Forward-on-have lane mode (auto, manual, disabled)
-        #[arg(long)]
-        forward_on_have: Option<String>,
     },
 }
 
@@ -1595,9 +1576,6 @@ struct ManagedRuntime {
     tenant_states: Vec<RuntimeTenantState>,
     shutdown_notify: Arc<tokio::sync::Notify>,
     handle: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
-    /// Shared cert resolver — kept so new tenants can register certs
-    /// on the live endpoint without restarting.
-    cert_resolver: Arc<topo::transport::multi_workspace::TransportTargetCertResolver>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -1631,7 +1609,7 @@ enum TenantChangeKind {
     NoChange,
     /// No runtime exists yet — need a fresh start.
     NeedsFreshStart,
-    /// New tenants added but existing ones unchanged — register certs only.
+    /// New tenants added — restart to rebuild tenant configs and runtime workers.
     NewTenantsAdded {
         new_tenants: Vec<RuntimeTenantState>,
     },
@@ -1678,64 +1656,6 @@ fn classify_tenant_change(
     } else {
         TenantChangeKind::NewTenantsAdded { new_tenants }
     }
-}
-
-/// Register certs for newly added tenants on the live cert resolver.
-///
-/// Returns the peer_ids of tenants that were successfully registered.
-/// Callers should only mark these as "known" in their tenant state so
-/// that failed registrations are retried on the next reevaluation.
-fn register_new_tenant_certs(
-    db_path: &str,
-    new_tenants: &[RuntimeTenantState],
-    cert_resolver: &topo::transport::multi_workspace::TransportTargetCertResolver,
-) -> Vec<String> {
-    let mut registered = Vec::new();
-    let provider = rustls::crypto::ring::default_provider();
-    let db = match open_connection(db_path) {
-        Ok(db) => db,
-        Err(e) => {
-            tracing::warn!("Failed to open DB for new tenant cert registration: {}", e);
-            return registered;
-        }
-    };
-    let all_tenants = match discover_local_tenants(&db) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!("Failed to discover tenants for cert registration: {}", e);
-            return registered;
-        }
-    };
-    drop(db);
-
-    for new_t in new_tenants {
-        let Some(tenant_info) = all_tenants.iter().find(|t| t.peer_id == new_t.peer_id) else {
-            continue;
-        };
-        let cert_der = rustls::pki_types::CertificateDer::from(tenant_info.cert_der.clone());
-        let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(tenant_info.key_der.clone());
-        let ck =
-            match rustls::sign::CertifiedKey::from_der(vec![cert_der], key_der.into(), &provider) {
-                Ok(ck) => Arc::new(ck),
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to build CertifiedKey for new tenant {}: {}",
-                        &new_t.peer_id[..16.min(new_t.peer_id.len())],
-                        e
-                    );
-                    continue;
-                }
-            };
-        let sni = topo::transport::multi_workspace::transport_sni(&tenant_info.transport_peer_id);
-        cert_resolver.add(sni.clone(), ck);
-        registered.push(new_t.peer_id.clone());
-        tracing::info!(
-            "Registered new tenant {} on live endpoint (transport_sni={})",
-            &new_t.peer_id[..16.min(new_t.peer_id.len())],
-            sni
-        );
-    }
-    registered
 }
 
 async fn stop_runtime(runtime: ManagedRuntime) {
@@ -1829,10 +1749,6 @@ fn spawn_runtime(
     *state.runtime_net.write().unwrap() = None;
     clear_upnp_report(&state);
 
-    let cert_resolver =
-        Arc::new(topo::transport::multi_workspace::TransportTargetCertResolver::new());
-    let cert_resolver_for_task = cert_resolver.clone();
-
     let runtime_shutdown = Arc::new(tokio::sync::Notify::new());
     let runtime_shutdown_for_task = runtime_shutdown.clone();
     let db_for_task = db_path.to_string();
@@ -1864,7 +1780,6 @@ fn spawn_runtime(
             bind,
             net_tx,
             runtime_shutdown_for_task,
-            cert_resolver_for_task,
             Some(sync_control_for_task),
         )
         .await
@@ -1874,7 +1789,6 @@ fn spawn_runtime(
         tenant_states,
         shutdown_notify: runtime_shutdown,
         handle,
-        cert_resolver,
     }
 }
 
@@ -1978,29 +1892,15 @@ async fn reevaluate_runtime(
             *active_runtime = Some(spawn_runtime(db_path, bind, state, tenant_states));
         }
         TenantChangeKind::NewTenantsAdded { new_tenants } => {
-            // Register new tenant certs on the live endpoint — no restart needed.
-            if let Some(runtime) = active_runtime.as_mut() {
-                let registered =
-                    register_new_tenant_certs(db_path, &new_tenants, &runtime.cert_resolver);
-                // Only add successfully registered tenants to the known set.
-                // Failed ones remain "new" so the next reevaluation retries them.
-                for r in &registered {
-                    if let Some(ts) = tenant_states.iter().find(|t| t.peer_id == *r) {
-                        if !runtime.tenant_states.iter().any(|t| t.peer_id == *r) {
-                            runtime.tenant_states.push(ts.clone());
-                        }
-                    }
-                }
-                runtime.tenant_states.sort();
-                runtime.tenant_states.dedup();
-                if !registered.is_empty() {
-                    tracing::info!(
-                        "registered {} new tenant(s) on live endpoint ({} total)",
-                        registered.len(),
-                        runtime.tenant_states.len()
-                    );
-                }
+            if let Some(runtime) = active_runtime.take() {
+                stop_runtime(runtime).await;
             }
+            let _ = idle_bind_reservation.take();
+            tracing::info!(
+                "restarting peering runtime after {} new tenant(s) were added",
+                new_tenants.len()
+            );
+            *active_runtime = Some(spawn_runtime(db_path, bind, state, tenant_states));
         }
         TenantChangeKind::TransportIdentityChanged => {
             if let Some(runtime) = active_runtime.take() {
@@ -2157,8 +2057,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // and the daemon keeps its chosen port even while idle.
             let (idle_bind_reservation, resolved_bind) =
                 reserve_idle_bind(bind, start_uses_default_bind)?;
-
-            topo::state::live_hints::init_forward_on_have_from_env();
 
             let shutdown = Arc::new(AtomicBool::new(false));
             let shutdown_notify = Arc::new(tokio::sync::Notify::new());
@@ -3309,24 +3207,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
-        Commands::Forward { action } => {
-            let action = match action.unwrap_or(ForwardCommand::Status) {
-                ForwardCommand::Enable => ForwardAction::Enable,
-                ForwardCommand::Disable => ForwardAction::Disable,
-                ForwardCommand::Status => ForwardAction::Status,
-            };
-            let data = rpc_require_daemon(
-                db,
-                socket_override.as_deref(),
-                RpcMethod::Forward { action },
-            )?;
-            let enabled = data["forward_on_have"].as_bool().unwrap_or(false);
-            println!(
-                "forward-on-have: {}",
-                if enabled { "enabled" } else { "disabled" }
-            );
-        }
-
         Commands::Sync { action } => {
             let sock_ref = socket_override.as_deref();
             match action {
@@ -3343,17 +3223,12 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         "  responses:       {}",
                         data["responses"].as_str().unwrap_or("auto")
                     );
-                    println!(
-                        "  forward_on_have: {}",
-                        data["forward_on_have"].as_str().unwrap_or("auto")
-                    );
                 }
                 SyncAction::Policy {
                     action:
                         SyncPolicyAction::Set {
                             requests,
                             responses,
-                            forward_on_have,
                         },
                 } => {
                     let data = rpc_require_daemon(
@@ -3362,7 +3237,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         RpcMethod::SyncPolicySet {
                             requests,
                             responses,
-                            forward_on_have,
                         },
                     )?;
                     println!("SYNC POLICY (updated):");
@@ -3373,10 +3247,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     println!(
                         "  responses:       {}",
                         data["responses"].as_str().unwrap_or("auto")
-                    );
-                    println!(
-                        "  forward_on_have: {}",
-                        data["forward_on_have"].as_str().unwrap_or("auto")
                     );
                 }
                 SyncAction::Round { target } => match target {

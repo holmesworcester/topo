@@ -11,7 +11,7 @@ use crate::contracts::peering_contract::SessionDirection;
 use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
 use crate::db::transport_trust::record_transport_binding;
-use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
+use crate::runtime::diagnostics::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::session::dependency_session::spawn_outbound_dependency_session;
 use crate::sync::session::windowing::reset_outbound_window_state;
 use crate::sync::SyncConnectionHandler;

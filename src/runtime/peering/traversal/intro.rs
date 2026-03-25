@@ -9,13 +9,15 @@ use tracing::{info, warn};
 
 use crate::protocol::Frame;
 use crate::transport::{
-    dial_session_peer, multi_workspace::transport_sni, send_intro_offer_frame, TransportConnection,
-    TransportEndpoint,
+    dial_session_provider, resolve_bound_daemon_peer_id, send_intro_offer_frame,
+    send_outbound_session_auth, OutboundSessionAuthPlan, TransportConnection, TransportEndpoint,
+    COVER_SERVER_NAME,
 };
 
 /// Build an IntroOffer message for `recipient` about `other_peer`.
 pub fn build_intro_offer(
     other_peer_id_hex: &str,
+    other_daemon_peer_id_hex: &str,
     origin_ip: &str,
     origin_port: u16,
     observed_at_ms: u64,
@@ -32,6 +34,16 @@ pub fn build_intro_offer(
     }
     let mut other_peer_id = [0u8; 32];
     other_peer_id.copy_from_slice(&other_peer_bytes);
+    let other_daemon_peer_bytes = hex::decode(other_daemon_peer_id_hex)?;
+    if other_daemon_peer_bytes.len() != 32 {
+        return Err(format!(
+            "other_daemon_peer_id must be 32 bytes, got {}",
+            other_daemon_peer_bytes.len()
+        )
+        .into());
+    }
+    let mut other_daemon_peer_id = [0u8; 32];
+    other_daemon_peer_id.copy_from_slice(&other_daemon_peer_bytes);
 
     let ip: IpAddr = origin_ip.parse()?;
     let (origin_family, origin_ip_bytes) = match ip {
@@ -49,6 +61,7 @@ pub fn build_intro_offer(
     Ok(Frame::IntroOffer {
         intro_id,
         other_peer_id,
+        other_daemon_peer_id,
         origin_family,
         origin_ip: origin_ip_bytes,
         origin_port,
@@ -85,6 +98,20 @@ pub async fn run_intro(
         .as_millis() as i64;
 
     let db = open_connection(db_path)?;
+    let daemon_a =
+        resolve_bound_daemon_peer_id(&db, recorded_by, peer_a_hex)?.ok_or_else(|| {
+            format!(
+            "no bound daemon fingerprint for peer A ({}); intro requires a daemon-scoped binding",
+            &peer_a_hex[..16]
+        )
+        })?;
+    let daemon_b =
+        resolve_bound_daemon_peer_id(&db, recorded_by, peer_b_hex)?.ok_or_else(|| {
+            format!(
+            "no bound daemon fingerprint for peer B ({}); intro requires a daemon-scoped binding",
+            &peer_b_hex[..16]
+        )
+        })?;
 
     // Look up freshest endpoint for each peer
     let ep_a = freshest_endpoint(&db, recorded_by, peer_a_hex, now_ms)?.ok_or_else(|| {
@@ -105,6 +132,7 @@ pub async fn run_intro(
     // Build IntroOffer for A about B
     let offer_for_a = build_intro_offer(
         peer_b_hex,
+        &daemon_b,
         &ep_b.0,
         ep_b.1,
         ep_b.2 as u64,
@@ -114,6 +142,7 @@ pub async fn run_intro(
     // Build IntroOffer for B about A
     let offer_for_b = build_intro_offer(
         peer_a_hex,
+        &daemon_a,
         &ep_a.0,
         ep_a.1,
         ep_a.2 as u64,
@@ -131,7 +160,17 @@ pub async fn run_intro(
     };
 
     // Send to A
-    match send_intro_to_peer(endpoint, addr_a, peer_a_hex, &offer_for_a).await {
+    match send_intro_to_peer(
+        endpoint,
+        db_path,
+        recorded_by,
+        addr_a,
+        peer_a_hex,
+        &daemon_a,
+        &offer_for_a,
+    )
+    .await
+    {
         Ok(()) => {
             info!("Sent IntroOffer to peer A at {}", addr_a);
             result.sent_to_a = true;
@@ -143,7 +182,17 @@ pub async fn run_intro(
     }
 
     // Send to B
-    match send_intro_to_peer(endpoint, addr_b, peer_b_hex, &offer_for_b).await {
+    match send_intro_to_peer(
+        endpoint,
+        db_path,
+        recorded_by,
+        addr_b,
+        peer_b_hex,
+        &daemon_b,
+        &offer_for_b,
+    )
+    .await
+    {
         Ok(()) => {
             info!("Sent IntroOffer to peer B at {}", addr_b);
             result.sent_to_b = true;
@@ -159,23 +208,37 @@ pub async fn run_intro(
 
 async fn send_intro_to_peer(
     endpoint: &TransportEndpoint,
+    db_path: &str,
+    recorded_by: &str,
     addr: SocketAddr,
     target_peer_id_hex: &str,
+    target_daemon_peer_id_hex: &str,
     offer: &Frame,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let target_sni = transport_sni(target_peer_id_hex);
-    let connected = tokio::time::timeout(
+    let mut provider = tokio::time::timeout(
         Duration::from_secs(5),
-        dial_session_peer(endpoint, addr, &target_sni, None),
+        dial_session_provider(endpoint, addr, COVER_SERVER_NAME, None),
     )
     .await
     .map_err(|_| "connection timeout")??;
-    send_intro_offer(&connected.connection, offer).await?;
+    let connection = provider.connection();
+    let auth_result = send_outbound_session_auth(
+        &connection,
+        db_path,
+        recorded_by,
+        Some(target_daemon_peer_id_hex),
+        &OutboundSessionAuthPlan::PeerShared {
+            target_peer_id: target_peer_id_hex.to_string(),
+        },
+    )
+    .await?;
+    provider = provider.with_peer_id(auth_result.session_peer_id);
+    send_intro_offer(&provider.connection(), offer).await?;
     // Yield to let the QUIC stack flush the uni stream data before closing.
     // connection.close() is immediate and discards unsent data; 200ms gives
     // the reliable-delivery layer time to retransmit if needed.
     tokio::time::sleep(Duration::from_millis(200)).await;
-    connected.connection.close(0u32.into(), b"intro-sent");
+    provider.connection().close(0u32.into(), b"intro-sent");
     Ok(())
 }
 

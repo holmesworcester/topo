@@ -985,25 +985,15 @@ Profiling evidence: 500k one-way sync improved from 170.93s (2,925 msgs/s) to 10
 
 Note: wrapping all projection writes in a single transaction was attempted first but abandoned — it caused ~0.06% of events to be left unprojected at 500k scale due to cascade_unblocked bulk cleanup interacting with the transaction scope.
 
-### 10.0.2 Implemented: forward-on-have live hint bus
+### 10.0.2 Removed: forward-on-have live hint bus
 
-**Problem.** Negentropy discovery runs on a periodic interval (default 100 ms, tunable via `TOPO_DISCOVERY_ROUND_GAP_MS`). Even with tiered discovery active, a freshly created message would otherwise wait for the next scheduled round before the remote peer discovers it.
+The old `forward_on_have` / `live_hints` path has been retired. The active design is range-owned negentropy plus immediate dependency repair:
 
-**Design.** Each time the persist phase newly inserts a shared canonical event it publishes a `LiveHint { event_id, source_peer_id, tenant_id }` entry to a per-`(db_path, tenant_id)` tokio broadcast channel (`src/state/live_hints.rs`). Active initiator and responder sessions subscribe on startup. Each control-loop tick (1 ms poll) the session drains up to `need_chunk()` hints from its receiver and emits `DiscoveryHints` immediately on the control stream. Those hints are grouped by the same age-derived priority lanes used by tiered discovery, so a new message lands in the hour/day/week/month/full ordering naturally. Self-hint filtering: hints tagged with the receiving peer's own ID are skipped. Drain cap: the loop tracks `drained` (total items consumed, including filtered ones) and breaks at `need_chunk()` so a backlog of self-hints or duplicates cannot stall the control loop.
+- new canonical events become visible on the next discovery round,
+- projection blocking emits direct source-peer dependency fetches through `src/runtime/sync_engine/dependency_fetch.rs`,
+- there is no runtime broadcast bus or separate forward-only control lane.
 
-**Measured delivery latency** (in-process loopback, `TOPO_FORWARD_ON_HAVE=1`, no preload):
-
-| Discovery mode | avg | p95 | worst |
-|----------------|-----|-----|-------|
-| forward-on-have only | 2.7 ms | 4 ms | 5 ms |
-| negentropy only (5 s rounds) | 2,561 ms | 4,813 ms | 4,833 ms |
-| **both (production)** | **3.2 ms** | **4 ms** | **5 ms** |
-
-**Key files:**
-- `src/state/live_hints.rs` — broadcast bus, `LiveHint` type, `subscribe()`, `publish_from_connection()`
-- `src/runtime/sync_engine/session/control_plane.rs` — `send_forward_on_have_hints()`, `send_discovery_hints_for_event_ids()`
-- `src/testutil/mod.rs` — `start_peers_runtime_affine()`
-- `tests/multi_peer_delivery_latency_perf_test.rs` — perf harness with per-event stage timing
+The sync policy surface now only controls `requests` and `responses`.
 
 `low_mem_ios` requirements:
 - target steady-state RSS at or below `24 MiB` during sustained sync/projection.

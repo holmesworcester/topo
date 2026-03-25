@@ -6,11 +6,12 @@
 
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Mutex, OnceLock};
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 use topo::testutil::DaemonGuard;
 
@@ -28,6 +29,35 @@ fn daemon_log_registry() -> &'static Mutex<HashMap<String, (PathBuf, PathBuf)>> 
     DAEMON_LOG_REGISTRY.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
+struct InProcessNetworkTestLease {
+    _guard: std::sync::MutexGuard<'static, ()>,
+}
+
+fn inprocess_network_test_mutex() -> &'static Mutex<()> {
+    static INPROCESS_NETWORK_TEST_MUTEX: OnceLock<Mutex<()>> = OnceLock::new();
+    INPROCESS_NETWORK_TEST_MUTEX.get_or_init(|| Mutex::new(()))
+}
+
+thread_local! {
+    static INPROCESS_NETWORK_TEST_LEASE: RefCell<Option<Weak<InProcessNetworkTestLease>>> =
+        const { RefCell::new(None) };
+}
+
+fn acquire_inprocess_network_test_lease() -> Arc<InProcessNetworkTestLease> {
+    INPROCESS_NETWORK_TEST_LEASE.with(|slot| {
+        if let Some(existing) = slot.borrow().as_ref().and_then(Weak::upgrade) {
+            return existing;
+        }
+        let lease = Arc::new(InProcessNetworkTestLease {
+            _guard: inprocess_network_test_mutex()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner()),
+        });
+        *slot.borrow_mut() = Some(Arc::downgrade(&lease));
+        lease
+    })
+}
+
 /// RAII guard for a daemon started by the test harness.
 ///
 /// Owns the child process and cleans it up on drop:
@@ -39,15 +69,21 @@ pub struct HarnessDaemon {
     child: Option<std::process::Child>,
     db_path: String,
     socket_path: PathBuf,
+    _network_test_lease: Arc<InProcessNetworkTestLease>,
 }
 
 impl HarnessDaemon {
-    pub fn new(child: std::process::Child, db: &str) -> Self {
+    fn new(
+        child: std::process::Child,
+        db: &str,
+        network_test_lease: Arc<InProcessNetworkTestLease>,
+    ) -> Self {
         let socket_path = topo::service::socket_path_for_db(db);
         Self {
             child: Some(child),
             db_path: db.to_string(),
             socket_path,
+            _network_test_lease: network_test_lease,
         }
     }
 
@@ -451,6 +487,7 @@ pub fn start_discovery_daemon_on_port(db: &str, port: u16) -> HarnessDaemon {
 /// Start a daemon with full control over options.
 pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> HarnessDaemon {
     hold_network_test_binary_lock();
+    let network_test_lease = acquire_inprocess_network_test_lease();
     let socket = socket_path_for_db(db);
     let bind_ip = opts.bind_ip.as_deref().unwrap_or("127.0.0.1");
     let requested_bind_addr = match opts.bind_port {
@@ -518,11 +555,6 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> HarnessDaemo
                 cmd.env(key, value);
             }
         }
-
-        // Enable forward-on-have by default — this is the production configuration.
-        // Tests that need negentropy-only behavior can override via extra_env.
-        cmd.env("TOPO_FORWARD_ON_HAVE", "1");
-
         if opts.disable_placeholder_autodial {
             cmd.env("TOPO_DISABLE_PLACEHOLDER_AUTODIAL", "1");
         }
@@ -635,7 +667,7 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> HarnessDaemo
                     .lock()
                     .unwrap()
                     .insert(db.to_string(), (stdout_path.clone(), stderr_path.clone()));
-                return HarnessDaemon::new(child, db);
+                return HarnessDaemon::new(child, db, network_test_lease);
             }
             if rpc_start.elapsed().as_secs() >= 5 {
                 let _ = child.kill();

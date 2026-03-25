@@ -16,7 +16,6 @@ use tracing::info;
 use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::peering::loops::IntroSpawnerFn;
 use crate::runtime::sync_control::SyncControlRegistry;
-use crate::transport::multi_workspace::TransportTargetCertResolver;
 
 use startup::setup_endpoint_and_tenants;
 
@@ -41,7 +40,6 @@ pub async fn run_node(
     shutdown_notify: Arc<tokio::sync::Notify>,
     intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
-    cert_resolver: Arc<TransportTargetCertResolver>,
     sync_control: Option<Arc<SyncControlRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let startup::StartupResult {
@@ -50,7 +48,7 @@ pub async fn run_node(
         tenants,
         tenant_client_configs,
         local_transport_peer_ids,
-    } = setup_endpoint_and_tenants(db_path, bind, net_info_tx, cert_resolver)?;
+    } = setup_endpoint_and_tenants(db_path, bind, net_info_tx)?;
 
     let mut runtime_supervisor = supervisor::RuntimeSupervisor::new(
         db_path.to_string(),

@@ -1350,7 +1350,6 @@ fn dispatch(
         RpcMethod::SyncPolicySet {
             requests,
             responses,
-            forward_on_have,
         } => match state.require_active_peer() {
             Ok(tenant_id) => {
                 use crate::shared::sync_control::SyncPolicyMode;
@@ -1368,11 +1367,7 @@ fn dispatch(
                     Ok(v) => v,
                     Err(e) => return RpcResponse::error(e),
                 };
-                let foh = match parse(forward_on_have) {
-                    Ok(v) => v,
-                    Err(e) => return RpcResponse::error(e),
-                };
-                match state.sync_control.update_policy(&tenant_id, r, resp, foh) {
+                match state.sync_control.update_policy(&tenant_id, r, resp) {
                     Ok(policy) => RpcResponse::success(policy),
                     Err(e) => RpcResponse::error(e),
                 }
@@ -1416,24 +1411,6 @@ fn dispatch(
             },
             Err(e) => RpcResponse::error(e),
         },
-
-        RpcMethod::Forward { action } => {
-            use crate::state::live_hints;
-            match action {
-                ForwardAction::Enable => {
-                    live_hints::set_forward_on_have(true);
-                    RpcResponse::success(serde_json::json!({ "forward_on_have": true }))
-                }
-                ForwardAction::Disable => {
-                    live_hints::set_forward_on_have(false);
-                    RpcResponse::success(serde_json::json!({ "forward_on_have": false }))
-                }
-                ForwardAction::Status => {
-                    let enabled = live_hints::forward_on_have_enabled();
-                    RpcResponse::success(serde_json::json!({ "forward_on_have": enabled }))
-                }
-            }
-        }
 
         RpcMethod::Intro {
             peer_a,

@@ -13,7 +13,7 @@ Primary source modules:
 - `src/runtime/transport/*`
 - `src/state/pipeline/*`
 - `src/state/projection/apply/*`
-- `src/state/dependency_fetch.rs`
+- `src/runtime/sync_engine/dependency_fetch.rs`
 - `src/state/db/{project_queue.rs,transport_trust.rs}`
 
 ## 0) RPC Dispatch And Event Locality

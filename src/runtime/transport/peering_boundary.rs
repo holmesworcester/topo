@@ -701,6 +701,7 @@ mod tests {
         let intro = Frame::IntroOffer {
             intro_id: [0x11; 16],
             other_peer_id: [0x22; 32],
+            other_daemon_peer_id: [0x33; 32],
             origin_family: 4,
             origin_ip: [0; 16],
             origin_port: 4433,

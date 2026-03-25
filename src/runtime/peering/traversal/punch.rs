@@ -18,9 +18,9 @@ use crate::db::{
 use crate::protocol::Frame;
 use crate::sync::SyncConnectionHandler;
 use crate::transport::{
-    dial_session_provider, multi_workspace::transport_sni, read_intro_offer_frame,
-    tenant_trusts_peer, SessionProvider, TransportClientConfig, TransportConnection,
-    TransportEndpoint,
+    dial_session_provider, read_intro_offer_frame, send_outbound_session_auth, tenant_trusts_peer,
+    OutboundSessionAuthPlan, SessionProvider, TransportClientConfig, TransportConnection,
+    TransportEndpoint, COVER_SERVER_NAME,
 };
 
 const ENDPOINT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
@@ -56,6 +56,7 @@ pub async fn handle_intro_offer(
     endpoint: TransportEndpoint,
     intro_id: [u8; 16],
     other_peer_id: [u8; 32],
+    other_daemon_peer_id: [u8; 32],
     origin_family: u8,
     origin_ip: [u8; 16],
     origin_port: u16,
@@ -70,6 +71,7 @@ pub async fn handle_intro_offer(
         .as_millis() as i64;
 
     let other_peer_hex = hex::encode(other_peer_id);
+    let other_daemon_peer_hex = hex::encode(other_daemon_peer_id);
 
     // Validate expiry
     if now_ms > expires_at_ms as i64 {
@@ -187,19 +189,17 @@ pub async fn handle_intro_offer(
 
         // Use per-tenant config when available (node multi-tenant path).
         // Fallback to endpoint default for single-tenant test endpoints.
-        let target_sni = transport_sni(&other_peer_hex);
         match tokio::time::timeout(
             pace,
-            dial_session_provider(&endpoint, addr, &target_sni, client_config.as_ref()),
+            dial_session_provider(&endpoint, addr, COVER_SERVER_NAME, client_config.as_ref()),
         )
         .await
         {
-            Ok(Ok(provider)) => {
-                // Verify peer identity matches expected
-                if provider.peer_id() != other_peer_hex {
+            Ok(Ok(mut provider)) => {
+                if provider.peer_id() != other_daemon_peer_hex {
                     warn!(
-                        "Punch connected but wrong peer: expected {}, got {}",
-                        &other_peer_hex[..16],
+                        "Punch connected but wrong daemon: expected {}, got {}",
+                        &other_daemon_peer_hex[..16],
                         &provider.peer_id()[..16.min(provider.peer_id().len())]
                     );
                     update_status(
@@ -207,14 +207,42 @@ pub async fn handle_intro_offer(
                         recorded_by,
                         &intro_id,
                         "failed",
-                        Some("wrong peer identity"),
+                        Some("wrong daemon identity"),
                     );
                     return;
                 }
+                let connection = provider.connection();
+                let auth_result = match send_outbound_session_auth(
+                    &connection,
+                    db_path,
+                    recorded_by,
+                    Some(&other_daemon_peer_hex),
+                    &OutboundSessionAuthPlan::PeerShared {
+                        target_peer_id: other_peer_hex.clone(),
+                    },
+                )
+                .await
+                {
+                    Ok(auth_result) => auth_result,
+                    Err(err) => {
+                        warn!("Punch connected but session auth failed: {}", err);
+                        update_status(
+                            db_path,
+                            recorded_by,
+                            &intro_id,
+                            "failed",
+                            Some("tenant auth failed"),
+                        );
+                        connection.close(1u32.into(), b"punch session auth failed");
+                        return;
+                    }
+                };
+                provider = provider.with_peer_id(auth_result.session_peer_id.clone());
 
                 info!(
-                    "Hole punch succeeded! Direct connection to {}",
-                    &other_peer_hex[..16]
+                    "Hole punch succeeded! Direct connection to {} via daemon {}",
+                    &other_peer_hex[..16],
+                    &other_daemon_peer_hex[..16]
                 );
                 update_status(db_path, recorded_by, &intro_id, "connected", None);
 
@@ -339,6 +367,7 @@ pub fn spawn_intro_listener(
                 Frame::IntroOffer {
                     intro_id,
                     other_peer_id,
+                    other_daemon_peer_id,
                     origin_family,
                     origin_ip,
                     origin_port,
@@ -367,6 +396,7 @@ pub fn spawn_intro_listener(
                             endpoint,
                             intro_id,
                             other_peer_id,
+                            other_daemon_peer_id,
                             origin_family,
                             origin_ip,
                             origin_port,

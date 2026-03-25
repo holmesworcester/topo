@@ -8,14 +8,12 @@ use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::store::lookup_workspace_id;
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::{self as events, registry::EventRegistry, ShareScope};
-use crate::state::live_hints::{source_peer_id_from_source_tag, LiveHintEvent};
 use crate::state::shared_workspace_fanout::SharedEventFanout;
 
 #[derive(Debug, Default, Clone, PartialEq, Eq)]
 pub(super) struct PersistPhaseOutput {
     pub persisted_event_ids: Vec<EventId>,
     pub tenants_seen: HashSet<String>,
-    pub live_hints: Vec<LiveHintEvent>,
     pub shared_event_fanouts: Vec<SharedEventFanout>,
 }
 
@@ -40,7 +38,6 @@ pub(super) fn run_persist_phase(
     let mut persist_output = PersistPhaseOutput {
         persisted_event_ids: Vec::with_capacity(batch.len()),
         tenants_seen: HashSet::new(),
-        live_hints: Vec::new(),
         shared_event_fanouts: Vec::new(),
     };
 
@@ -105,7 +102,7 @@ pub(super) fn run_persist_phase(
                     }
 
                     let recorded_at = current_timestamp_ms();
-                    let recorded_inserted = match recorded_stmt.execute(rusqlite::params![
+                    let _recorded_inserted = match recorded_stmt.execute(rusqlite::params![
                         recorded_by,
                         &event_id_b64,
                         recorded_at,
@@ -141,13 +138,6 @@ pub(super) fn run_persist_phase(
 
                     persist_output.tenants_seen.insert(recorded_by.clone());
                     persist_output.persisted_event_ids.push(*event_id);
-                    if recorded_inserted && meta.share_scope == ShareScope::Shared {
-                        persist_output.live_hints.push(LiveHintEvent {
-                            tenant_id: recorded_by.clone(),
-                            event_id: *event_id,
-                            source_peer_id: source_peer_id_from_source_tag(source_tag),
-                        });
-                    }
                     if meta.share_scope == ShareScope::Shared {
                         if let Some(workspace_id) = if meta.type_name == "workspace" {
                             Some(event_id_b64.clone())
@@ -256,13 +246,5 @@ mod tests {
             )
             .unwrap();
         assert_eq!(priority_lane, 2);
-        assert_eq!(
-            output.live_hints,
-            vec![LiveHintEvent {
-                tenant_id: "peer-alpha".to_string(),
-                event_id,
-                source_peer_id: None,
-            }]
-        );
     }
 }

@@ -8,9 +8,10 @@
 use crate::protocol::{parse_frame, Frame};
 
 /// IntroOffer fixed wire size:
-/// type(1) + intro_id(16) + other_peer_id(32) + family(1) + ip(16)
-/// + port(2) + observed_at_ms(8) + expires_at_ms(8) + attempt_window_ms(4).
-pub const INTRO_OFFER_WIRE_BYTES: usize = 88;
+/// type(1) + intro_id(16) + other_peer_id(32) + other_daemon_peer_id(32)
+/// + family(1) + ip(16) + port(2) + observed_at_ms(8) + expires_at_ms(8)
+/// + attempt_window_ms(4).
+pub const INTRO_OFFER_WIRE_BYTES: usize = 120;
 
 /// Accept one uni stream and parse one IntroOffer-sized frame.
 ///
@@ -39,7 +40,7 @@ mod tests {
     use crate::protocol::{encode_frame, Frame};
     use crate::transport::{
         create_dual_endpoint, extract_spki_fingerprint, generate_self_signed_cert,
-        multi_workspace::transport_sni,
+        COVER_SERVER_NAME,
     };
 
     use super::accept_and_read_intro;
@@ -57,7 +58,6 @@ mod tests {
         let server_fp = extract_spki_fingerprint(server_cert.as_ref())?;
         let (client_cert, client_key) = generate_self_signed_cert()?;
         let client_fp = extract_spki_fingerprint(client_cert.as_ref())?;
-        let server_peer_id = hex::encode(server_fp);
 
         let server_allowed: Arc<crate::transport::DynamicAllowFn> =
             Arc::new(move |candidate| Ok(candidate == &client_fp));
@@ -90,8 +90,7 @@ mod tests {
 
         let client_ep_connect = client_ep.clone();
         let client_connect = async move {
-            let connecting =
-                client_ep_connect.connect(server_addr, &transport_sni(&server_peer_id))?;
+            let connecting = client_ep_connect.connect(server_addr, COVER_SERVER_NAME)?;
             let conn = connecting.await?;
             Ok::<quinn::Connection, Box<dyn std::error::Error + Send + Sync>>(conn)
         };
@@ -111,6 +110,7 @@ mod tests {
         let intro = Frame::IntroOffer {
             intro_id: [0x11; 16],
             other_peer_id: [0x22; 32],
+            other_daemon_peer_id: [0x33; 32],
             origin_family: 4,
             origin_ip: [0; 16],
             origin_port: 4433,

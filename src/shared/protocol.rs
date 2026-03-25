@@ -87,6 +87,7 @@ pub enum Frame {
     IntroOffer {
         intro_id: [u8; 16],
         other_peer_id: [u8; 32],
+        other_daemon_peer_id: [u8; 32],
         origin_family: u8,
         origin_ip: [u8; 16],
         origin_port: u16,
@@ -225,9 +226,10 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
         }
         MSG_TYPE_INTRO_OFFER => {
             // Fixed layout: type(1) + intro_id(16) + other_peer_id(32)
+            //   + other_daemon_peer_id(32)
             //   + origin_family(1) + origin_ip(16) + origin_port(2)
-            //   + observed_at_ms(8) + expires_at_ms(8) + attempt_window_ms(4) = 88
-            const INTRO_OFFER_SIZE: usize = 1 + 16 + 32 + 1 + 16 + 2 + 8 + 8 + 4;
+            //   + observed_at_ms(8) + expires_at_ms(8) + attempt_window_ms(4) = 120
+            const INTRO_OFFER_SIZE: usize = 1 + 16 + 32 + 32 + 1 + 16 + 2 + 8 + 8 + 4;
             if input.len() < INTRO_OFFER_SIZE {
                 return Err(ParseError::InsufficientData);
             }
@@ -237,6 +239,9 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
             pos += 16;
             let mut other_peer_id = [0u8; 32];
             other_peer_id.copy_from_slice(&input[pos..pos + 32]);
+            pos += 32;
+            let mut other_daemon_peer_id = [0u8; 32];
+            other_daemon_peer_id.copy_from_slice(&input[pos..pos + 32]);
             pos += 32;
             let origin_family = input[pos];
             pos += 1;
@@ -256,6 +261,7 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
                 Frame::IntroOffer {
                     intro_id,
                     other_peer_id,
+                    other_daemon_peer_id,
                     origin_family,
                     origin_ip,
                     origin_port,
@@ -420,6 +426,7 @@ pub fn encode_frame(msg: &Frame) -> Vec<u8> {
         Frame::IntroOffer {
             intro_id,
             other_peer_id,
+            other_daemon_peer_id,
             origin_family,
             origin_ip,
             origin_port,
@@ -427,10 +434,11 @@ pub fn encode_frame(msg: &Frame) -> Vec<u8> {
             expires_at_ms,
             attempt_window_ms,
         } => {
-            let mut buf = Vec::with_capacity(88);
+            let mut buf = Vec::with_capacity(120);
             buf.push(MSG_TYPE_INTRO_OFFER);
             buf.extend_from_slice(intro_id);
             buf.extend_from_slice(other_peer_id);
+            buf.extend_from_slice(other_daemon_peer_id);
             buf.push(*origin_family);
             buf.extend_from_slice(origin_ip);
             buf.extend_from_slice(&origin_port.to_le_bytes());
@@ -580,6 +588,7 @@ mod tests {
         let msg = Frame::IntroOffer {
             intro_id: [0xAA; 16],
             other_peer_id: [0xBB; 32],
+            other_daemon_peer_id: [0xCC; 32],
             origin_family: 4,
             origin_ip: {
                 // IPv4 192.168.1.100 mapped to 16-byte field
@@ -596,9 +605,9 @@ mod tests {
             attempt_window_ms: 4000,
         };
         let encoded = encode_frame(&msg);
-        assert_eq!(encoded.len(), 88); // type(1) + fixed payload(87)
+        assert_eq!(encoded.len(), 120); // type(1) + fixed payload(119)
         let (parsed, consumed) = parse_frame(&encoded).unwrap();
-        assert_eq!(consumed, 88);
+        assert_eq!(consumed, 120);
         assert_eq!(parsed, msg);
     }
 
@@ -607,6 +616,7 @@ mod tests {
         let msg = Frame::IntroOffer {
             intro_id: [0x01; 16],
             other_peer_id: [0x02; 32],
+            other_daemon_peer_id: [0x03; 32],
             origin_family: 6,
             origin_ip: [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
             origin_port: 443,
@@ -615,9 +625,9 @@ mod tests {
             attempt_window_ms: 10000,
         };
         let encoded = encode_frame(&msg);
-        assert_eq!(encoded.len(), 88);
+        assert_eq!(encoded.len(), 120);
         let (parsed, consumed) = parse_frame(&encoded).unwrap();
-        assert_eq!(consumed, 88);
+        assert_eq!(consumed, 120);
         assert_eq!(parsed, msg);
     }
 
@@ -627,7 +637,7 @@ mod tests {
         let result = parse_frame(&[MSG_TYPE_INTRO_OFFER]);
         assert_eq!(result, Err(ParseError::InsufficientData));
 
-        // Partial payload (50 of 87 needed)
+        // Partial payload (50 of 119 needed)
         let mut buf = vec![MSG_TYPE_INTRO_OFFER];
         buf.extend_from_slice(&[0u8; 50]);
         let result = parse_frame(&buf);

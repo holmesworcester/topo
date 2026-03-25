@@ -113,18 +113,11 @@ impl SyncControlRegistry {
         tenant_id: &str,
         requests: Option<SyncPolicyMode>,
         responses: Option<SyncPolicyMode>,
-        forward_on_have: Option<SyncPolicyMode>,
     ) -> Result<TenantSyncPolicy, String> {
         let conn = crate::db::open_connection(&self.db_path).map_err(|e| e.to_string())?;
         crate::db::sync_control::ensure_schema(&conn).map_err(|e| e.to_string())?;
-        let updated = crate::db::sync_control::update_policy(
-            &conn,
-            tenant_id,
-            requests,
-            responses,
-            forward_on_have,
-        )
-        .map_err(|e| e.to_string())?;
+        let updated = crate::db::sync_control::update_policy(&conn, tenant_id, requests, responses)
+            .map_err(|e| e.to_string())?;
         self.notify_policy_watchers(tenant_id, &updated);
         Ok(updated)
     }
@@ -490,7 +483,7 @@ mod tests {
 
         // Update
         let p2 = registry
-            .update_policy("t1", Some(SyncPolicyMode::Manual), None, None)
+            .update_policy("t1", Some(SyncPolicyMode::Manual), None)
             .unwrap();
         assert_eq!(p2.requests, SyncPolicyMode::Manual);
         assert_eq!(p2.responses, SyncPolicyMode::Auto);

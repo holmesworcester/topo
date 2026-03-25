@@ -35,7 +35,7 @@ use crate::peering::loops::{
     accept_loop_until_cancel, connect_loop, preferred_connection_direction, ConnectLoopConfig,
     IntroSpawnerFn,
 };
-use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
+use crate::runtime::diagnostics::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::transport::{
     build_tenant_bootstrap_fallback_client_config_for_invite_from_db,
     build_tenant_client_config_from_db, resolve_bound_daemon_peer_id, OutboundSessionAuthPlan,

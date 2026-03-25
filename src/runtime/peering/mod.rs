@@ -2,7 +2,7 @@ pub mod discovery;
 pub mod engine;
 pub mod loops;
 pub mod nat;
-pub mod workflows;
+pub mod traversal;
 
 pub use engine as runtime;
 

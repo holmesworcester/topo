@@ -4,7 +4,8 @@ use super::super::signer::{resolve_signer_key, verify_ed25519_signature, SignerR
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::{registry, ParsedEvent, TransportPrivacy};
-use crate::state::{dependency_fetch, live_hints::source_peer_id_from_source_tag};
+use crate::runtime::sync_engine::dependency_fetch;
+use crate::runtime::sync_engine::dependency_fetch::source_peer_id_from_source_tag;
 use rusqlite::{Connection, OptionalExtension};
 use std::time::{SystemTime, UNIX_EPOCH};
 

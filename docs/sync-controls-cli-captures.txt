@@ -1,45 +1,37 @@
 Sync Controls CLI Session Captures
 ===================================
 
-1. Show default policy (all auto)
+1. Show default policy (both auto)
 
     $ topo sync policy show
-    {
-      "requests": "auto",
-      "responses": "auto",
-      "forward_on_have": "auto"
-    }
+    SYNC POLICY:
+      requests:        auto
+      responses:       auto
 
 2. Set requests to manual
 
     $ topo sync policy set --requests manual
-    {
-      "requests": "manual",
-      "responses": "auto",
-      "forward_on_have": "auto"
-    }
+    SYNC POLICY (updated):
+      requests:        manual
+      responses:       auto
 
-3. Set all lanes to disabled
+3. Set both lanes to disabled
 
-    $ topo sync policy set --requests disabled --responses disabled --forward-on-have disabled
-    {
-      "requests": "disabled",
-      "responses": "disabled",
-      "forward_on_have": "disabled"
-    }
+    $ topo sync policy set --requests disabled --responses disabled
+    SYNC POLICY (updated):
+      requests:        disabled
+      responses:       disabled
 
-4. Restore all lanes to auto
+4. Restore both lanes to auto
 
-    $ topo sync policy set --requests auto --responses auto --forward-on-have auto
-    {
-      "requests": "auto",
-      "responses": "auto",
-      "forward_on_have": "auto"
-    }
+    $ topo sync policy set --requests auto --responses auto
+    SYNC POLICY (updated):
+      requests:        auto
+      responses:       auto
 
 5. Trigger round for specific peer
 
-    $ topo sync round --peer abc123
+    $ topo sync round peer abc123
     peer: abc123deadbeef...
     observed_ids: 3
       aabbccdd...
@@ -48,7 +40,7 @@ Sync Controls CLI Session Captures
 
 6. Trigger round for all peers
 
-    $ topo sync round --all
+    $ topo sync round all
     peer: abc123deadbeef...
     observed_ids: 2
       aabbccdd...
@@ -56,14 +48,14 @@ Sync Controls CLI Session Captures
 
 7. Trigger request for specific peer
 
-    $ topo sync request --peer abc123
+    $ topo sync request peer abc123
     peer: abc123deadbeef...
     requested_ids: 1
       aabbccdd...
 
 8. Trigger request for all peers
 
-    $ topo sync request --all
+    $ topo sync request all
     peer: abc123deadbeef...
     requested_ids: 1
       aabbccdd...
@@ -71,7 +63,7 @@ Sync Controls CLI Session Captures
 9. Request when disabled returns reason
 
     $ topo sync policy set --requests disabled
-    $ topo sync request --peer abc123
+    $ topo sync request peer abc123
     peer: abc123
     reason: requests lane is disabled by policy
     requested_ids: 0

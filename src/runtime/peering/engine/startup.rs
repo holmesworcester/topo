@@ -1,4 +1,4 @@
-//! Endpoint creation, tenant discovery, and cert resolver setup.
+//! Endpoint creation, tenant discovery, and daemon transport setup.
 //!
 //! Extracts the startup phase of `run_node`: discovers local tenants, verifies
 //! local/runtime tenant state, loads the singleton daemon transport identity,
@@ -34,7 +34,6 @@ pub(crate) fn setup_endpoint_and_tenants(
     db_path: &str,
     bind: SocketAddr,
     net_info_tx: tokio::sync::oneshot::Sender<NodeRuntimeNetInfo>,
-    _cert_resolver: std::sync::Arc<crate::transport::multi_workspace::TransportTargetCertResolver>,
 ) -> Result<StartupResult, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
     create_tables(&db)?;
