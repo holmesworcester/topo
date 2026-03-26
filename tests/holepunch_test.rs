@@ -7,8 +7,17 @@
 //! On localhost there's no NAT, so the "punch" is a regular connect.
 //! This tests the full IntroOffer send/receive/validate/dial/sync path.
 
+mod cli_harness;
+
+use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
+use cli_harness::{
+    accept_invite_with_identity_on_running_daemon, create_invite_with_spki,
+    daemon_identity_fingerprint, daemon_listen_addr, hold_network_test_lock_for_binary,
+    start_daemon, wait_for_active_tenant_ready, wait_for_daemon_stopped,
+    wait_for_live_sync_session, HarnessDaemon,
+};
 use topo::crypto::{event_id_from_base64, event_id_to_base64};
 use topo::db::health::record_endpoint_observation;
 use topo::db::intro::{freshest_endpoint, list_intro_attempts};
@@ -20,8 +29,17 @@ use topo::peering::traversal::intro::build_intro_offer;
 use topo::peering::traversal::punch::{handle_intro_offer, spawn_intro_listener};
 use topo::projection::apply::project_one;
 use topo::shared::protocol::Frame;
-use topo::testutil::{assert_eventually, create_dynamic_endpoint_for_peer, start_peers, Peer};
-use topo::transport::COVER_SERVER_NAME;
+use topo::testutil::{assert_eventually, create_dynamic_endpoint_for_peer, Peer};
+
+const TEST_COVER_SERVER_NAME: &str = "daemon.topo.invalid";
+
+fn holepunch_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    hold_network_test_lock_for_binary();
+    LOCK.get_or_init(|| Mutex::new(()))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+}
 
 fn daemon_peer_id(peer: &Peer) -> String {
     topo::transport::load_daemon_identity_from_db(&peer.db_path)
@@ -45,6 +63,54 @@ fn drain_project_queue(db_path: &str, identity: &str) {
     });
 }
 
+fn bootstrap_joined_peer_via_daemon(
+    name: &str,
+    device_name: &str,
+    creator: &Peer,
+    creator_daemon: &HarnessDaemon,
+) -> Peer {
+    let _ = creator_daemon;
+    wait_for_active_tenant_ready(&creator.db_path, Duration::from_secs(30));
+
+    let tempdir = tempfile::tempdir().expect("create joiner tempdir");
+    let db_path = tempdir
+        .path()
+        .join(format!("{name}.db"))
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let invite_link = create_invite_with_spki(
+        &creator.db_path,
+        &daemon_listen_addr(&creator.db_path),
+        Some(&daemon_identity_fingerprint(&creator.db_path)),
+    );
+
+    let joiner_daemon = start_daemon(&db_path);
+    accept_invite_with_identity_on_running_daemon(
+        &db_path,
+        &invite_link,
+        name,
+        device_name,
+        Duration::from_secs(30),
+    );
+    wait_for_active_tenant_ready(&db_path, Duration::from_secs(60));
+    wait_for_live_sync_session(&creator.db_path, Duration::from_secs(60));
+    wait_for_live_sync_session(&db_path, Duration::from_secs(60));
+
+    drop(joiner_daemon);
+    wait_for_daemon_stopped(&db_path, Duration::from_secs(10));
+
+    Peer::from_bootstrapped_db(name, db_path, tempdir)
+}
+
+fn bootstrap_intro_workspace(name: &str) -> (Peer, HarnessDaemon) {
+    let intro = Peer::new_with_identity(name);
+    let daemon = start_daemon(&intro.db_path);
+    wait_for_active_tenant_ready(&intro.db_path, Duration::from_secs(30));
+    (intro, daemon)
+}
+
 /// Functional intro test with realistic transport trust and endpoint discovery.
 ///
 /// All three peers share the same workspace so identity chains validate
@@ -60,10 +126,14 @@ fn drain_project_queue(db_path: &str, identity: &str) {
 /// 3. A and B dial each other using identity-derived trust and sync messages
 #[tokio::test]
 async fn test_three_peer_intro_happy_path() {
+    let _guard = holepunch_test_lock();
+
     // Intro creates the workspace; A and B join it so all share one trust root.
-    let intro = Peer::new_with_identity("introducer");
-    let peer_a = Peer::new_in_workspace("peer_a", &intro).await;
-    let peer_b = Peer::new_in_workspace("peer_b", &intro).await;
+    let (intro, intro_daemon) = bootstrap_intro_workspace("introducer");
+    let peer_a = bootstrap_joined_peer_via_daemon("peer_a", "peer-a-box", &intro, &intro_daemon);
+    let peer_b = bootstrap_joined_peer_via_daemon("peer_b", "peer-b-box", &intro, &intro_daemon);
+    drop(intro_daemon);
+    wait_for_daemon_stopped(&intro.db_path, Duration::from_secs(10));
 
     // Each peer creates a unique event to sync.
     let a_bootstrap_msg = peer_a.create_message("peer_a bootstrap message");
@@ -89,7 +159,7 @@ async fn test_three_peer_intro_happy_path() {
     let ep_a = create_dynamic_endpoint_for_peer(&peer_a);
     let ep_b = create_dynamic_endpoint_for_peer(&peer_b);
 
-    let _addr_i = ep_i.local_addr().expect("addr_i");
+    let addr_i = ep_i.local_addr().expect("addr_i");
     let addr_a = ep_a.local_addr().expect("addr_a");
     let addr_b = ep_b.local_addr().expect("addr_b");
 
@@ -559,7 +629,7 @@ async fn test_dynamic_trust_rejects_unknown_peer() {
     // because A's dynamic trust lookup finds no matching row.
     let ep_unknown = create_dynamic_endpoint_for_peer(&unknown);
     let result = ep_unknown
-        .connect(addr_a, COVER_SERVER_NAME)
+        .connect(addr_a, TEST_COVER_SERVER_NAME)
         .expect("initiate connect")
         .await;
 
@@ -580,8 +650,11 @@ async fn test_dynamic_trust_rejects_unknown_peer() {
 /// Expired expires_at_ms should result in status='expired'.
 #[tokio::test]
 async fn test_stale_intro_rejected() {
-    let intro = Peer::new_with_identity("stale_introducer");
-    let peer_a = Peer::new_in_workspace("stale_a", &intro).await;
+    let _guard = holepunch_test_lock();
+    let (intro, intro_daemon) = bootstrap_intro_workspace("stale_introducer");
+    let peer_a = bootstrap_joined_peer_via_daemon("stale_a", "stale-a-box", &intro, &intro_daemon);
+    drop(intro_daemon);
+    wait_for_daemon_stopped(&intro.db_path, Duration::from_secs(10));
 
     let ep_a = create_dynamic_endpoint_for_peer(&peer_a);
 
@@ -667,8 +740,12 @@ async fn test_stale_intro_rejected() {
 /// other_peer_id not in authorized set.
 #[tokio::test]
 async fn test_untrusted_peer_intro_rejected() {
-    let intro = Peer::new_with_identity("untrust_introducer");
-    let peer_a = Peer::new_in_workspace("untrust_a", &intro).await;
+    let _guard = holepunch_test_lock();
+    let (intro, intro_daemon) = bootstrap_intro_workspace("untrust_introducer");
+    let peer_a =
+        bootstrap_joined_peer_via_daemon("untrust_a", "untrust-a-box", &intro, &intro_daemon);
+    drop(intro_daemon);
+    wait_for_daemon_stopped(&intro.db_path, Duration::from_secs(10));
 
     let ep_a = create_dynamic_endpoint_for_peer(&peer_a);
 

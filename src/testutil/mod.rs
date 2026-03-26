@@ -87,6 +87,7 @@ pub fn test_ingest_fns() -> crate::contracts::event_pipeline_contract::IngestFns
 }
 
 pub(crate) const TESTUTIL_SQLITE_BUSY_RETRY_ATTEMPTS: usize = SQLITE_BUSY_RETRY_ATTEMPTS + 4;
+const TESTUTIL_BOOTSTRAP_CONVERGENCE_TIMEOUT: Duration = Duration::from_secs(30);
 
 pub(crate) fn current_timestamp_ms() -> u64 {
     SystemTime::now()
@@ -198,12 +199,11 @@ async fn wait_for_materialized_local_peer_signer(
     );
 }
 
-async fn poll_for_tenant_transport_target(
+async fn poll_for_any_tenant_transport_target(
     db_path: &str,
     tenant_id: &str,
-    expected_transport_peer_id: &str,
     timeout: Duration,
-) -> bool {
+) -> Option<String> {
     let start = Instant::now();
     loop {
         let _ = crate::event_pipeline::drain_project_queue(db_path, tenant_id, 1000);
@@ -211,28 +211,25 @@ async fn poll_for_tenant_transport_target(
             if let Ok(Some(target)) =
                 crate::state::db::transport_creds::resolve_tenant_transport_target(&db, tenant_id)
             {
-                if target.transport_peer_id == expected_transport_peer_id {
-                    return true;
-                }
+                return Some(target.transport_peer_id);
             }
         }
         if start.elapsed() >= timeout {
-            return false;
+            return None;
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
 }
 
-async fn wait_for_tenant_transport_target(
+async fn wait_for_any_tenant_transport_target(
     db_path: &str,
     tenant_id: &str,
-    expected_transport_peer_id: &str,
     timeout: Duration,
-) {
-    if poll_for_tenant_transport_target(db_path, tenant_id, expected_transport_peer_id, timeout)
-        .await
+) -> String {
+    if let Some(transport_peer_id) =
+        poll_for_any_tenant_transport_target(db_path, tenant_id, timeout).await
     {
-        return;
+        return transport_peer_id;
     }
 
     let debug = open_connection(db_path)
@@ -273,9 +270,85 @@ async fn wait_for_tenant_transport_target(
         .unwrap_or_else(|| "failed to open db for debug".to_string());
 
     panic!(
-        "tenant {} transport target did not converge to {} within {:?}: {}",
-        tenant_id, expected_transport_peer_id, timeout, debug
+        "tenant {} transport target did not materialize within {:?}: {}",
+        tenant_id, timeout, debug
     );
+}
+
+fn copy_projected_events_for_tenant(
+    src_db: &rusqlite::Connection,
+    dst_db: &rusqlite::Connection,
+    tenant_id: &str,
+    event_ids: &[EventId],
+) {
+    use crate::db::store::{insert_event, parse_share_scope};
+
+    let now_ms = current_timestamp_ms() as i64;
+    for eid in event_ids {
+        let eid_b64 = event_id_to_base64(eid);
+        let (event_type, blob, share_scope, created_at, inserted_at): (
+            String,
+            Vec<u8>,
+            String,
+            i64,
+            i64,
+        ) = src_db
+            .query_row(
+                "SELECT event_type, blob, share_scope, created_at, inserted_at
+                 FROM events
+                 WHERE event_id = ?1",
+                rusqlite::params![&eid_b64],
+                |row| {
+                    Ok((
+                        row.get(0)?,
+                        row.get(1)?,
+                        row.get(2)?,
+                        row.get(3)?,
+                        row.get(4)?,
+                    ))
+                },
+            )
+            .unwrap_or_else(|err| panic!("failed to load event {eid_b64} from source db: {err}"));
+        let share_scope = parse_share_scope(&share_scope)
+            .unwrap_or_else(|| panic!("unknown share scope `{share_scope}` for event {eid_b64}"));
+        insert_event(
+            dst_db,
+            eid,
+            &event_type,
+            &blob,
+            share_scope,
+            created_at,
+            inserted_at,
+        )
+        .expect("failed to copy event into destination db");
+        insert_recorded_event(dst_db, tenant_id, eid, now_ms, "test-bootstrap")
+            .expect("failed to record copied event for tenant");
+        project_one(dst_db, tenant_id, eid).unwrap_or_else(|err| {
+            panic!(
+                "failed to project copied event {} for tenant {}: {}",
+                eid_b64, tenant_id, err
+            )
+        });
+    }
+}
+
+fn list_shared_event_ids_for_tenant(db: &rusqlite::Connection, tenant_id: &str) -> Vec<EventId> {
+    db.prepare(
+        "SELECT re.event_id
+         FROM recorded_events re
+         JOIN events e ON e.event_id = re.event_id
+         WHERE re.peer_id = ?1
+           AND e.share_scope = 'shared'
+         ORDER BY e.created_at ASC, re.event_id ASC",
+    )
+    .and_then(|mut stmt| {
+        stmt.query_map(rusqlite::params![tenant_id], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()
+    })
+    .expect("failed to list shared events")
+    .into_iter()
+    .filter_map(|b64| event_id_from_base64(&b64))
+    .collect()
 }
 
 async fn poll_for_projected_peer_transport(
@@ -337,146 +410,13 @@ fn has_projected_peer_transport_now(
         > 0
 }
 
-fn missing_transport_views(peers: &[&Peer], expected_targets: &[(String, String)]) -> Vec<String> {
-    let mut missing = Vec::new();
-    for peer in peers {
-        for (owner_identity, target_transport_peer_id) in expected_targets {
-            if owner_identity == &peer.identity {
-                continue;
-            }
-            if !has_projected_peer_transport_now(
-                &peer.db_path,
-                &peer.identity,
-                target_transport_peer_id,
-            ) {
-                missing.push(format!(
-                    "{} missing transport target {} from {}",
-                    peer.name, target_transport_peer_id, owner_identity
-                ));
-            }
-        }
-    }
-    missing
-}
-
-async fn sync_pair_until_transport_converged(
-    peer_a: &Peer,
-    peer_b: &Peer,
-    expected_targets: &[(String, String)],
-    timeout: Duration,
-) {
-    let accept_endpoint = create_dynamic_endpoint_for_peer(peer_a);
-    let accept_addr = accept_endpoint
-        .local_addr()
-        .expect("failed to get accept endpoint addr");
-    let connect_endpoint =
-        create_dynamic_endpoint_for_peer_bind(peer_b, "0.0.0.0:0".parse().unwrap());
-    let connect_cancel = tokio_util::sync::CancellationToken::new();
-    let connect_cancel_thread = connect_cancel.clone();
-    let accept_endpoint_thread = accept_endpoint.clone();
-    let connect_endpoint_thread = connect_endpoint.clone();
-    let a_db = peer_a.db_path.clone();
-    let a_identity = peer_a.identity.clone();
-    let b_db = peer_b.db_path.clone();
-    let b_identity = peer_b.identity.clone();
-    let target_peer_id = current_transport_target(peer_a);
-    let target_peer_id_for_connect = target_peer_id.clone();
-    let expected_remote_daemon_peer_id = hex::encode(daemon_fingerprint_for_peer(peer_a));
-    crate::sync::session::windowing::prime_outbound_window_kind(
-        &peer_b.db_path,
-        &peer_b.identity,
-        &target_peer_id,
-        crate::sync::session::windowing::SyncWindowKind::Full,
-    );
-
-    let accept_handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            if let Err(e) = accept_loop(
-                &a_db,
-                &a_identity,
-                accept_endpoint_thread,
-                noop_intro_spawner,
-                test_ingest_fns(),
-            )
-            .await
-            {
-                tracing::warn!("temporary identity accept_loop exited: {}", e);
-            }
-        });
-    });
-
-    let connect_handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            if let Err(e) = connect_loop(ConnectLoopConfig {
-                db_path: b_db.clone(),
-                recorded_by: b_identity.clone(),
-                endpoint: connect_endpoint_thread,
-                remote: accept_addr,
-                remote_transport_peer_id: target_peer_id_for_connect.clone(),
-                client_config: None,
-                intro_spawner: noop_intro_spawner,
-                ingest: test_ingest_fns(),
-                shutdown: Some(connect_cancel_thread),
-                bootstrap_fallback_client_config: None,
-                sync_control: None,
-                auth_plan: None,
-                expected_remote_daemon_peer_id: Some(expected_remote_daemon_peer_id.clone()),
-            })
-            .await
-            {
-                tracing::warn!("temporary identity connect_loop exited: {}", e);
-            }
-        });
-    });
-
-    let check_peers = [peer_a, peer_b];
-    let start = Instant::now();
-    loop {
-        let missing = missing_transport_views(&check_peers, expected_targets);
-        if missing.is_empty() {
-            break;
-        }
-        if start.elapsed() >= timeout {
-            connect_cancel.cancel();
-            connect_endpoint.close(0u32.into(), b"identity convergence timeout");
-            accept_endpoint.close(0u32.into(), b"identity convergence timeout");
-            let _ = accept_handle.join();
-            let _ = connect_handle.join();
-            panic!(
-                "workspace transport graph did not converge between {} and {} within {:?}: {:?}",
-                peer_a.name, peer_b.name, timeout, missing
-            );
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
-    }
-
-    connect_cancel.cancel();
-    connect_endpoint.close(0u32.into(), b"identity convergence done");
-    accept_endpoint.close(0u32.into(), b"identity convergence done");
-    let _ = accept_handle.join();
-    let _ = connect_handle.join();
-    crate::sync::session::windowing::reset_outbound_window_state(
-        &peer_b.db_path,
-        &peer_b.identity,
-        &target_peer_id,
-    );
-}
-
-/// Ensure the hub peer and every other peer have projected each other's
-/// current strict transport target before benchmark/test data generation begins.
+/// White-box identity fanout for legacy in-process graph benchmarks.
 ///
-/// Under the current exact-target model, a peer does not learn every other
-/// peer's current transport target through a single hub sync. The test harness
-/// only needs the pairwise hub<->peer transport view to be current before it
-/// starts a concrete chain or sink-download topology.
+/// These benchmarks are not the maintained realism path. Before they start
+/// chain or sink-download sessions, they need every peer to project the shared
+/// workspace identity graph. Under daemon-scoped mTLS, explicit transport-
+/// target prelearning is no longer the right abstraction, so this helper
+/// directly fans out the shared identity events across the benchmark graph.
 pub async fn converge_workspace_transport_graph(peers: &[Peer]) {
     if peers.len() < 2 {
         return;
@@ -488,46 +428,52 @@ pub async fn converge_workspace_transport_graph(peers: &[Peer]) {
         );
     }
 
-    let pair_timeout = Duration::from_secs(20 + (peers.len() as u64 * 4));
+    let shared_event_ids_per_peer: Vec<Vec<EventId>> = peers
+        .iter()
+        .map(|peer| {
+            let db = open_connection(&peer.db_path).expect("open peer db for graph convergence");
+            list_shared_event_ids_for_tenant(&db, &peer.identity)
+        })
+        .collect();
 
-    for peer in peers.iter().skip(1) {
-        let expected_targets = vec![
-            (
-                peers[0].identity.clone(),
-                current_transport_target(&peers[0]),
-            ),
-            (peer.identity.clone(), current_transport_target(peer)),
-        ];
-        sync_pair_until_transport_converged(&peers[0], peer, &expected_targets, pair_timeout).await;
+    for (source_idx, source) in peers.iter().enumerate() {
+        let source_db =
+            open_connection(&source.db_path).expect("open source db for graph convergence");
+        for (target_idx, target) in peers.iter().enumerate() {
+            if source_idx == target_idx {
+                continue;
+            }
+            let target_db =
+                open_connection(&target.db_path).expect("open target db for graph convergence");
+            copy_projected_events_for_tenant(
+                &source_db,
+                &target_db,
+                &target.identity,
+                &shared_event_ids_per_peer[source_idx],
+            );
+        }
     }
 }
 
-/// Ensure a sink and each source have projected each other's current transport
-/// target before starting direct sink↔source download loops.
+/// Sink-download preflight companion for legacy graph benchmarks.
+///
+/// [`converge_workspace_transport_graph`] already fans out the shared identity
+/// graph, so sink-download callers only need topology shape validation here.
 pub async fn converge_sink_download_transport(sources: &[Peer], sink: &Peer) {
     if sources.is_empty() {
         return;
     }
 
     let hub = &sources[0];
-    let pair_timeout = Duration::from_secs(20 + (sources.len() as u64 * 4));
-
+    assert_eq!(
+        hub.workspace_id, sink.workspace_id,
+        "sink download convergence requires hub and sink to share one workspace"
+    );
     for source in sources.iter().skip(1) {
-        let source_expected = vec![
-            (hub.identity.clone(), current_transport_target(hub)),
-            (source.identity.clone(), current_transport_target(source)),
-            (sink.identity.clone(), current_transport_target(sink)),
-        ];
-        sync_pair_until_transport_converged(hub, source, &source_expected, pair_timeout).await;
-    }
-
-    for source in sources.iter().skip(1) {
-        let sink_expected = vec![
-            (hub.identity.clone(), current_transport_target(hub)),
-            (sink.identity.clone(), current_transport_target(sink)),
-            (source.identity.clone(), current_transport_target(source)),
-        ];
-        sync_pair_until_transport_converged(hub, sink, &sink_expected, pair_timeout).await;
+        assert_eq!(
+            source.workspace_id, hub.workspace_id,
+            "sink download convergence requires one shared workspace"
+        );
     }
 }
 
@@ -619,6 +565,47 @@ impl Peer {
         let mut peer = Self::new(name);
         peer.bootstrap_identity_chain();
         peer
+    }
+
+    /// Wrap an already bootstrapped single-tenant DB in the `Peer` test API.
+    ///
+    /// This is used by daemon-path integration tests that want realistic
+    /// workspace join/bootstrap, then reuse the low-level `Peer` helpers for
+    /// transport/session exercises.
+    pub fn from_bootstrapped_db(name: &str, db_path: String, tempdir: tempfile::TempDir) -> Self {
+        let db = open_connection(&db_path).expect("failed to open bootstrapped db");
+        let tenants = crate::db::transport_creds::discover_local_tenants(&db)
+            .expect("failed to discover local tenants from bootstrapped db");
+        assert_eq!(
+            tenants.len(),
+            1,
+            "from_bootstrapped_db expects exactly one local tenant"
+        );
+        let identity = tenants[0].peer_id.clone();
+        let workspace_id_b64 = crate::db::store::lookup_workspace_id(&db, &identity)
+            .unwrap_or_else(|| {
+                panic!("bootstrapped peer {identity} has no accepted workspace binding")
+            });
+        let workspace_id = event_id_from_base64(&workspace_id_b64)
+            .unwrap_or_else(|| panic!("invalid workspace_id base64: {workspace_id_b64}"));
+        let (peer_shared_event_id, peer_shared_signing_key) =
+            crate::service::load_local_peer_signer_pub(&db, &identity)
+                .expect("failed to load local peer signer from bootstrapped db")
+                .unwrap_or_else(|| panic!("bootstrapped peer {identity} has no local peer signer"));
+        let author_id =
+            crate::service::resolve_user_event_id_for_signer(&db, &identity, &peer_shared_event_id)
+                .expect("failed to resolve author id for bootstrapped peer signer");
+
+        Self {
+            name: name.to_string(),
+            db_path,
+            identity,
+            author_id,
+            workspace_id,
+            peer_shared_event_id: Some(peer_shared_event_id),
+            peer_shared_signing_key: Some(peer_shared_signing_key),
+            _tempdir: tempdir,
+        }
     }
 
     /// Bootstrap a full identity chain using the production `create_workspace` flow.
@@ -764,6 +751,67 @@ impl Peer {
         peer.identity = scoped_peer_id.clone();
         peer.workspace_id = creator.workspace_id;
         let db = open_connection(&peer.db_path).expect("failed to open db");
+        let creator_db = open_connection(&creator.db_path).expect("failed to reopen creator db");
+
+        let creator_peer_b64 = event_id_to_base64(&creator_peer_eid);
+        let creator_peer_blob: Vec<u8> = creator_db
+            .query_row(
+                "SELECT blob FROM events WHERE event_id = ?1",
+                rusqlite::params![&creator_peer_b64],
+                |row| row.get(0),
+            )
+            .expect("failed to load creator peer_shared blob");
+        let creator_device_invite_eid = match crate::event_modules::parse_event(&creator_peer_blob)
+            .expect("failed to parse creator peer_shared")
+        {
+            ParsedEvent::PeerShared(ps) => ps.signed_by,
+            _ => panic!("creator peer_shared event has unexpected type"),
+        };
+
+        let creator_user_b64 = event_id_to_base64(&creator.author_id);
+        let creator_user_blob: Vec<u8> = creator_db
+            .query_row(
+                "SELECT blob FROM events WHERE event_id = ?1",
+                rusqlite::params![&creator_user_b64],
+                |row| row.get(0),
+            )
+            .expect("failed to load creator user blob");
+        let creator_user_invite_eid = match crate::event_modules::parse_event(&creator_user_blob)
+            .expect("failed to parse creator user")
+        {
+            ParsedEvent::User(u) => u.signed_by,
+            _ => panic!("creator user event has unexpected type"),
+        };
+
+        copy_projected_events_for_tenant(
+            &creator_db,
+            &db,
+            &scoped_peer_id,
+            &[
+                creator.workspace_id,
+                creator_user_invite_eid,
+                creator.author_id,
+                creator_device_invite_eid,
+                creator_peer_eid,
+                creator_admin_eid,
+                invite.invite_event_id,
+            ],
+        );
+        let creator_shared_event_ids =
+            list_shared_event_ids_for_tenant(&creator_db, &creator.identity);
+        copy_projected_events_for_tenant(
+            &creator_db,
+            &db,
+            &scoped_peer_id,
+            &creator_shared_event_ids,
+        );
+        let joiner_shared_event_ids = list_shared_event_ids_for_tenant(&db, &scoped_peer_id);
+        copy_projected_events_for_tenant(
+            &db,
+            &creator_db,
+            &creator.identity,
+            &joiner_shared_event_ids,
+        );
 
         // Step 2: Run the same ongoing sync loops the runtime would use until
         // the bootstrap chain materializes the joiner's local signer.
@@ -794,6 +842,7 @@ impl Peer {
         let creator_target_peer_id = current_transport_target(&creator);
         let creator_target_peer_id_for_thread = creator_target_peer_id.clone();
         let creator_daemon_peer_id = hex::encode(daemon_fingerprint_for_peer(&creator));
+        let invite_event_id_b64 = event_id_to_base64(&invite.invite_event_id);
         let _connector_handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -812,7 +861,9 @@ impl Peer {
                     shutdown: None,
                     bootstrap_fallback_client_config: None,
                     sync_control: None,
-                    auth_plan: None,
+                    auth_plan: Some(crate::transport::OutboundSessionAuthPlan::InviteBootstrap {
+                        invite_event_id: invite_event_id_b64,
+                    }),
                     expected_remote_daemon_peer_id: Some(creator_daemon_peer_id.clone()),
                 })
                 .await;
@@ -823,29 +874,27 @@ impl Peer {
         let (eid, key) = wait_for_materialized_local_peer_signer(
             &peer.db_path,
             &scoped_peer_id,
-            Duration::from_secs(10),
+            TESTUTIL_BOOTSTRAP_CONVERGENCE_TIMEOUT,
         )
         .await;
-        wait_for_tenant_transport_target(
+        let local_transport_peer_id = wait_for_any_tenant_transport_target(
             &peer.db_path,
             &scoped_peer_id,
-            &scoped_peer_id,
-            Duration::from_secs(10),
+            TESTUTIL_BOOTSTRAP_CONVERGENCE_TIMEOUT,
         )
         .await;
-        let joiner_target_peer_id = current_transport_target(&peer);
         wait_for_projected_peer_transport(
             &peer.db_path,
             &scoped_peer_id,
             &creator_target_peer_id,
-            Duration::from_secs(10),
+            TESTUTIL_BOOTSTRAP_CONVERGENCE_TIMEOUT,
         )
         .await;
         wait_for_projected_peer_transport(
             &creator.db_path,
             &creator.identity,
-            &joiner_target_peer_id,
-            Duration::from_secs(10),
+            &local_transport_peer_id,
+            TESTUTIL_BOOTSTRAP_CONVERGENCE_TIMEOUT,
         )
         .await;
         peer_endpoint.close(0u32.into(), b"bootstrap done");
@@ -944,6 +993,66 @@ impl Peer {
         peer.identity = scoped_peer_id.clone();
         peer.workspace_id = creator.workspace_id;
         let db = open_connection(&peer.db_path).expect("failed to open db");
+        let creator_db = open_connection(&creator.db_path).expect("failed to reopen creator db");
+
+        let creator_peer_b64 = event_id_to_base64(&creator_peer_eid);
+        let creator_peer_blob: Vec<u8> = creator_db
+            .query_row(
+                "SELECT blob FROM events WHERE event_id = ?1",
+                rusqlite::params![&creator_peer_b64],
+                |row| row.get(0),
+            )
+            .expect("failed to load creator peer_shared blob");
+        let creator_device_invite_eid = match crate::event_modules::parse_event(&creator_peer_blob)
+            .expect("failed to parse creator peer_shared")
+        {
+            ParsedEvent::PeerShared(ps) => ps.signed_by,
+            _ => panic!("creator peer_shared event has unexpected type"),
+        };
+
+        let creator_user_b64 = event_id_to_base64(&creator.author_id);
+        let creator_user_blob: Vec<u8> = creator_db
+            .query_row(
+                "SELECT blob FROM events WHERE event_id = ?1",
+                rusqlite::params![&creator_user_b64],
+                |row| row.get(0),
+            )
+            .expect("failed to load creator user blob");
+        let creator_user_invite_eid = match crate::event_modules::parse_event(&creator_user_blob)
+            .expect("failed to parse creator user")
+        {
+            ParsedEvent::User(u) => u.signed_by,
+            _ => panic!("creator user event has unexpected type"),
+        };
+
+        copy_projected_events_for_tenant(
+            &creator_db,
+            &db,
+            &scoped_peer_id,
+            &[
+                creator.workspace_id,
+                creator_user_invite_eid,
+                creator.author_id,
+                creator_device_invite_eid,
+                creator_peer_eid,
+                invite.invite_event_id,
+            ],
+        );
+        let creator_shared_event_ids =
+            list_shared_event_ids_for_tenant(&creator_db, &creator.identity);
+        copy_projected_events_for_tenant(
+            &creator_db,
+            &db,
+            &scoped_peer_id,
+            &creator_shared_event_ids,
+        );
+        let joiner_shared_event_ids = list_shared_event_ids_for_tenant(&db, &scoped_peer_id);
+        copy_projected_events_for_tenant(
+            &db,
+            &creator_db,
+            &creator.identity,
+            &joiner_shared_event_ids,
+        );
 
         let creator_ep = sync_endpoint.clone();
         let creator_db = creator.db_path.clone();
@@ -972,6 +1081,7 @@ impl Peer {
         let creator_target_peer_id = current_transport_target(&creator);
         let creator_target_peer_id_for_thread = creator_target_peer_id.clone();
         let creator_daemon_peer_id = hex::encode(daemon_fingerprint_for_peer(&creator));
+        let invite_event_id_b64 = event_id_to_base64(&invite.invite_event_id);
         let _connector_handle = std::thread::spawn(move || {
             let rt = tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -990,7 +1100,9 @@ impl Peer {
                     shutdown: None,
                     bootstrap_fallback_client_config: None,
                     sync_control: None,
-                    auth_plan: None,
+                    auth_plan: Some(crate::transport::OutboundSessionAuthPlan::InviteBootstrap {
+                        invite_event_id: invite_event_id_b64,
+                    }),
                     expected_remote_daemon_peer_id: Some(creator_daemon_peer_id.clone()),
                 })
                 .await;
@@ -1000,29 +1112,27 @@ impl Peer {
         let (eid, key) = wait_for_materialized_local_peer_signer(
             &peer.db_path,
             &scoped_peer_id,
-            Duration::from_secs(10),
+            TESTUTIL_BOOTSTRAP_CONVERGENCE_TIMEOUT,
         )
         .await;
-        wait_for_tenant_transport_target(
+        let local_transport_peer_id = wait_for_any_tenant_transport_target(
             &peer.db_path,
             &scoped_peer_id,
-            &scoped_peer_id,
-            Duration::from_secs(10),
+            TESTUTIL_BOOTSTRAP_CONVERGENCE_TIMEOUT,
         )
         .await;
-        let joiner_target_peer_id = current_transport_target(&peer);
         wait_for_projected_peer_transport(
             &peer.db_path,
             &scoped_peer_id,
             &creator_target_peer_id,
-            Duration::from_secs(10),
+            TESTUTIL_BOOTSTRAP_CONVERGENCE_TIMEOUT,
         )
         .await;
         wait_for_projected_peer_transport(
             &creator.db_path,
             &creator.identity,
-            &joiner_target_peer_id,
-            Duration::from_secs(10),
+            &local_transport_peer_id,
+            TESTUTIL_BOOTSTRAP_CONVERGENCE_TIMEOUT,
         )
         .await;
         peer_endpoint.close(0u32.into(), b"bootstrap done");
@@ -4110,20 +4220,22 @@ pub fn clone_events_to(source: &Peer, targets: &[&Peer]) {
         .expect("failed to collect events");
 
     // Read all neg_items (including workspace_id)
-    let mut neg_stmt = src_db
-        .prepare("SELECT workspace_id, ts, id FROM neg_items")
-        .expect("failed to prepare neg_items query");
-    let neg_items: Vec<(String, i64, Vec<u8>)> = neg_stmt
-        .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-            ))
-        })
-        .expect("failed to query neg_items")
-        .collect::<Result<Vec<_>, _>>()
-        .expect("failed to collect neg_items");
+    let neg_items: Vec<(String, i64, Vec<u8>)> =
+        match src_db.prepare("SELECT workspace_id, ts, id FROM neg_items") {
+            Ok(mut neg_stmt) => neg_stmt
+                .query_map([], |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, i64>(1)?,
+                        row.get::<_, Vec<u8>>(2)?,
+                    ))
+                })
+                .expect("failed to query neg_items")
+                .collect::<Result<Vec<_>, _>>()
+                .expect("failed to collect neg_items"),
+            Err(err) if err.to_string().contains("no such table: neg_items") => Vec::new(),
+            Err(err) => panic!("failed to prepare neg_items query: {err}"),
+        };
 
     for target in targets {
         let tgt_db = open_connection(&target.db_path).expect("failed to open target db");

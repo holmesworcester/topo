@@ -88,10 +88,15 @@ pub async fn connect_loop(
             config.endpoint,
             config.remote,
             &config.remote_transport_peer_id,
-            config.expected_remote_daemon_peer_id.as_deref().unwrap_or(&config.remote_transport_peer_id),
-            config.auth_plan.unwrap_or_else(|| OutboundSessionAuthPlan::PeerShared {
-                target_peer_id: config.remote_transport_peer_id.clone(),
-            }),
+            config
+                .expected_remote_daemon_peer_id
+                .as_deref()
+                .unwrap_or(&config.remote_transport_peer_id),
+            config
+                .auth_plan
+                .unwrap_or_else(|| OutboundSessionAuthPlan::PeerShared {
+                    target_peer_id: config.remote_transport_peer_id.clone(),
+                }),
             config.client_config,
             config.intro_spawner,
             shutdown,

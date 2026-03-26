@@ -44,8 +44,18 @@ fn test_cli_live_message_during_large_file_sync() {
     // before starting the large transfer. Without this, the "mid-flight"
     // assertion can spend its entire timeout budget waiting for the initial
     // session to come up under full-suite load.
-    let gate_eid = send_message(&alice_db, "pre-live-file-gate");
-    assert_eventually(&bob_db, &format!("has_event:{} >= 1", gate_eid), 30_000);
+    wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
+    let gate_content = "pre-live-file-gate";
+    let _gate_eid = send_message(&alice_db, gate_content);
+    let _ = assert_value_eventually(
+        Duration::from_secs(30),
+        Duration::from_millis(100),
+        "pre-transfer gate message becomes visible on Bob",
+        || get_messages_raw(&bob_db),
+        |messages_stdout| messages_stdout.contains(gate_content),
+    );
 
     let expected_total_file_slices = std::fs::metadata(&source_path)
         .unwrap()
@@ -89,6 +99,8 @@ fn test_cli_live_message_during_large_file_sync() {
             *raw_file_slice_count > 0 && *raw_file_slice_count < expected_total_file_slices
         },
     );
+    wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
 
     let live_contents = [
         "live message during file download #1",
