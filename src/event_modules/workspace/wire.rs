@@ -1,22 +1,20 @@
-use crate::event_modules::layout::common::{
-    read_text_slot, write_text_slot, COMMON_HEADER_BYTES, NAME_BYTES,
+use crate::event_modules::layout::common::NAME_BYTES;
+use crate::event_modules::layout::field_spec::{
+    decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue,
 };
 use crate::event_modules::registry::{EventTypeMeta, ShareScope};
 use crate::event_modules::{EventError, ParsedEvent, EVENT_TYPE_WORKSPACE};
 
 // ─── Layout (owned by this module) ───
 
+pub const WORKSPACE_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("public_key"),
+    FieldSpec::Text("name", NAME_BYTES),
+];
+
 /// Workspace (type 8): type(1) + created_at(8) + public_key(32) + name(64) = 105
-pub const WORKSPACE_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + NAME_BYTES;
-
-mod workspace_offsets {
-    pub const TYPE_CODE: usize = 0;
-    pub const CREATED_AT: usize = 1;
-    pub const PUBLIC_KEY: usize = 9;
-    pub const NAME: usize = 41;
-}
-
-use workspace_offsets as off;
+pub const WORKSPACE_WIRE_SIZE: usize = wire_size_for_fields(WORKSPACE_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct WorkspaceEvent {
@@ -40,38 +38,12 @@ impl super::super::Describe for WorkspaceEvent {
 /// [9..41]  public_key (32 bytes)
 /// [41..105] name (64 bytes, UTF-8 zero-padded)
 pub fn parse_workspace(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < WORKSPACE_WIRE_SIZE {
-        return Err(EventError::TooShort {
-            expected: WORKSPACE_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > WORKSPACE_WIRE_SIZE {
-        return Err(EventError::TrailingData {
-            expected: WORKSPACE_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob[0] != EVENT_TYPE_WORKSPACE {
-        return Err(EventError::WrongType {
-            expected: EVENT_TYPE_WORKSPACE,
-            actual: blob[0],
-        });
-    }
-
-    let created_at_ms =
-        u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
-
-    let mut public_key = [0u8; 32];
-    public_key.copy_from_slice(&blob[off::PUBLIC_KEY..off::NAME]);
-
-    let name =
-        read_text_slot(&blob[off::NAME..off::NAME + NAME_BYTES]).map_err(EventError::TextSlot)?;
+    let values = decode_fields(EVENT_TYPE_WORKSPACE, WORKSPACE_FIELDS, blob)?;
 
     Ok(ParsedEvent::Workspace(WorkspaceEvent {
-        created_at_ms,
-        public_key,
-        name,
+        created_at_ms: values[0].as_timestamp().unwrap(),
+        public_key: values[1].as_event_id().unwrap(),
+        name: values[2].as_text().unwrap().to_string(),
     }))
 }
 
@@ -81,13 +53,13 @@ pub fn encode_workspace(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = vec![0u8; WORKSPACE_WIRE_SIZE];
-    buf[off::TYPE_CODE] = EVENT_TYPE_WORKSPACE;
-    buf[off::CREATED_AT..off::PUBLIC_KEY].copy_from_slice(&ws.created_at_ms.to_le_bytes());
-    buf[off::PUBLIC_KEY..off::NAME].copy_from_slice(&ws.public_key);
-    write_text_slot(&ws.name, &mut buf[off::NAME..off::NAME + NAME_BYTES])
-        .map_err(EventError::TextSlot)?;
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(ws.created_at_ms),
+        FieldValue::EventId(ws.public_key),
+        FieldValue::Text(ws.name.clone()),
+    ];
+
+    Ok(encode_fields(EVENT_TYPE_WORKSPACE, WORKSPACE_FIELDS, &values)?)
 }
 
 pub static WORKSPACE_META: EventTypeMeta = EventTypeMeta {
@@ -109,11 +81,12 @@ pub static WORKSPACE_META: EventTypeMeta = EventTypeMeta {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
-    use crate::event_modules::layout;
+    use crate::event_modules::layout::field_spec::field_offset;
     #[test]
     fn offsets_consistent() {
+        // name field starts at offset 41, name(64) ends at 105 = WORKSPACE_WIRE_SIZE
         assert_eq!(
-            workspace_offsets::NAME + layout::common::NAME_BYTES,
+            field_offset(WORKSPACE_FIELDS, 2) + NAME_BYTES,
             WORKSPACE_WIRE_SIZE
         );
     }

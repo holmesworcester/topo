@@ -1,11 +1,22 @@
-use super::super::layout::common::{COMMON_HEADER_BYTES, SIGNATURE_TRAILER_BYTES};
+use super::super::layout::field_spec::{
+    decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue,
+};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{EventError, ParsedEvent, EVENT_TYPE_USER_INVITE};
 
+pub const USER_INVITE_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("public_key"),
+    FieldSpec::EventId("workspace_id"),
+    FieldSpec::EventId("authority_event_id"),
+    FieldSpec::EventId("signed_by"),
+    FieldSpec::U8("signer_type"),
+    FieldSpec::FixedBytes("signature", 64),
+];
+
 /// UserInvite (type 10): type(1) + created_at(8) + public_key(32) + workspace_id(32)
 /// + authority_event_id(32) + signed_by(32) + signer_type(1) + signature(64) = 202
-pub const USER_INVITE_WIRE_SIZE: usize =
-    COMMON_HEADER_BYTES + 32 + 32 + 32 + SIGNATURE_TRAILER_BYTES;
+pub const USER_INVITE_WIRE_SIZE: usize = wire_size_for_fields(USER_INVITE_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserInviteEvent {
@@ -31,51 +42,28 @@ impl super::super::Describe for UserInviteEvent {
 }
 
 pub fn parse_user_invite(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < USER_INVITE_WIRE_SIZE {
-        return Err(EventError::TooShort {
-            expected: USER_INVITE_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > USER_INVITE_WIRE_SIZE {
-        return Err(EventError::TrailingData {
-            expected: USER_INVITE_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob[0] != EVENT_TYPE_USER_INVITE {
-        return Err(EventError::WrongType {
-            expected: EVENT_TYPE_USER_INVITE,
-            actual: blob[0],
-        });
-    }
+    let values = decode_fields(EVENT_TYPE_USER_INVITE, USER_INVITE_FIELDS, blob)?;
 
-    let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
-    let mut public_key = [0u8; 32];
-    public_key.copy_from_slice(&blob[9..41]);
-    let mut workspace_id = [0u8; 32];
-    workspace_id.copy_from_slice(&blob[41..73]);
-    let mut authority_event_id = [0u8; 32];
-    authority_event_id.copy_from_slice(&blob[73..105]);
-    let mut signed_by = [0u8; 32];
-    signed_by.copy_from_slice(&blob[105..137]);
-    let signer_type = blob[137];
+    let signer_type = values[5].as_u8().unwrap();
     if signer_type != 1 && signer_type != 5 {
         return Err(EventError::InvalidMetadata(
             "user_invite signer_type must be 1 (workspace) or 5 (peer_shared)",
         ));
     }
-    let mut signature = [0u8; 64];
-    signature.copy_from_slice(&blob[138..202]);
 
     Ok(ParsedEvent::UserInvite(UserInviteEvent {
-        created_at_ms,
-        public_key,
-        workspace_id,
-        authority_event_id,
-        signed_by,
+        created_at_ms: values[0].as_timestamp().unwrap(),
+        public_key: values[1].as_event_id().unwrap(),
+        workspace_id: values[2].as_event_id().unwrap(),
+        authority_event_id: values[3].as_event_id().unwrap(),
+        signed_by: values[4].as_event_id().unwrap(),
         signer_type,
-        signature,
+        signature: {
+            let bytes = values[6].as_fixed_bytes().unwrap();
+            let mut sig = [0u8; 64];
+            sig.copy_from_slice(bytes);
+            sig
+        },
     }))
 }
 
@@ -84,16 +72,18 @@ pub fn encode_user_invite(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::UserInvite(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    let mut buf = Vec::with_capacity(USER_INVITE_WIRE_SIZE);
-    buf.push(EVENT_TYPE_USER_INVITE);
-    buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
-    buf.extend_from_slice(&e.public_key);
-    buf.extend_from_slice(&e.workspace_id);
-    buf.extend_from_slice(&e.authority_event_id);
-    buf.extend_from_slice(&e.signed_by);
-    buf.push(e.signer_type);
-    buf.extend_from_slice(&e.signature);
-    Ok(buf)
+
+    let values = vec![
+        FieldValue::Timestamp(e.created_at_ms),
+        FieldValue::EventId(e.public_key),
+        FieldValue::EventId(e.workspace_id),
+        FieldValue::EventId(e.authority_event_id),
+        FieldValue::EventId(e.signed_by),
+        FieldValue::U8(e.signer_type),
+        FieldValue::FixedBytes(e.signature.to_vec()),
+    ];
+
+    Ok(encode_fields(EVENT_TYPE_USER_INVITE, USER_INVITE_FIELDS, &values)?)
 }
 
 pub static USER_INVITE_META: EventTypeMeta = EventTypeMeta {
@@ -115,12 +105,14 @@ pub static USER_INVITE_META: EventTypeMeta = EventTypeMeta {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::event_modules::layout::field_spec::field_offset;
 
     #[test]
     fn parse_user_invite_accepts_workspace_signer_type() {
+        let st_off = field_offset(USER_INVITE_FIELDS, 5);
         let mut blob = vec![0u8; USER_INVITE_WIRE_SIZE];
         blob[0] = EVENT_TYPE_USER_INVITE;
-        blob[137] = 1;
+        blob[st_off] = 1;
 
         assert!(matches!(
             parse_user_invite(&blob),
@@ -130,9 +122,10 @@ mod tests {
 
     #[test]
     fn parse_user_invite_accepts_peer_shared_signer_type() {
+        let st_off = field_offset(USER_INVITE_FIELDS, 5);
         let mut blob = vec![0u8; USER_INVITE_WIRE_SIZE];
         blob[0] = EVENT_TYPE_USER_INVITE;
-        blob[137] = 5;
+        blob[st_off] = 5;
 
         assert!(matches!(
             parse_user_invite(&blob),
@@ -142,9 +135,10 @@ mod tests {
 
     #[test]
     fn parse_user_invite_rejects_wrong_signer_type() {
+        let st_off = field_offset(USER_INVITE_FIELDS, 5);
         let mut blob = vec![0u8; USER_INVITE_WIRE_SIZE];
         blob[0] = EVENT_TYPE_USER_INVITE;
-        blob[137] = 4;
+        blob[st_off] = 4;
 
         let err = parse_user_invite(&blob).expect_err("should reject wrong signer type");
         assert!(matches!(err, EventError::InvalidMetadata(_)));

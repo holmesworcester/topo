@@ -1,8 +1,16 @@
-use super::layout::common::COMMON_HEADER_BYTES;
+use super::layout::field_spec::{
+    decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue,
+};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_INVITE_SECRET};
 
-pub const INVITE_SECRET_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32;
+pub const INVITE_SECRET_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("invite_event_id"),
+    FieldSpec::EventId("private_key_bytes"),
+];
+
+pub const INVITE_SECRET_WIRE_SIZE: usize = wire_size_for_fields(INVITE_SECRET_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InviteSecretEvent {
@@ -24,35 +32,12 @@ impl super::Describe for InviteSecretEvent {
 }
 
 pub fn parse_invite_secret(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < INVITE_SECRET_WIRE_SIZE {
-        return Err(EventError::TooShort {
-            expected: INVITE_SECRET_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > INVITE_SECRET_WIRE_SIZE {
-        return Err(EventError::TrailingData {
-            expected: INVITE_SECRET_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob[0] != EVENT_TYPE_INVITE_SECRET {
-        return Err(EventError::WrongType {
-            expected: EVENT_TYPE_INVITE_SECRET,
-            actual: blob[0],
-        });
-    }
-
-    let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
-    let mut invite_event_id = [0u8; 32];
-    invite_event_id.copy_from_slice(&blob[9..41]);
-    let mut private_key_bytes = [0u8; 32];
-    private_key_bytes.copy_from_slice(&blob[41..73]);
+    let values = decode_fields(EVENT_TYPE_INVITE_SECRET, INVITE_SECRET_FIELDS, blob)?;
 
     Ok(ParsedEvent::InviteSecret(InviteSecretEvent {
-        created_at_ms,
-        invite_event_id,
-        private_key_bytes,
+        created_at_ms: values[0].as_timestamp().unwrap(),
+        invite_event_id: values[1].as_event_id().unwrap(),
+        private_key_bytes: values[2].as_event_id().unwrap(),
     }))
 }
 
@@ -61,12 +46,14 @@ pub fn encode_invite_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
         ParsedEvent::InviteSecret(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    let mut buf = Vec::with_capacity(INVITE_SECRET_WIRE_SIZE);
-    buf.push(EVENT_TYPE_INVITE_SECRET);
-    buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
-    buf.extend_from_slice(&e.invite_event_id);
-    buf.extend_from_slice(&e.private_key_bytes);
-    Ok(buf)
+
+    let values = vec![
+        FieldValue::Timestamp(e.created_at_ms),
+        FieldValue::EventId(e.invite_event_id),
+        FieldValue::EventId(e.private_key_bytes),
+    ];
+
+    Ok(encode_fields(EVENT_TYPE_INVITE_SECRET, INVITE_SECRET_FIELDS, &values)?)
 }
 
 pub fn deterministic_invite_secret_created_at_ms(

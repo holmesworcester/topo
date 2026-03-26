@@ -1,28 +1,24 @@
-use super::super::layout::common::{
-    read_text_slot, write_text_slot, COMMON_HEADER_BYTES, NAME_BYTES, SIGNATURE_TRAILER_BYTES,
+use super::super::layout::common::NAME_BYTES;
+use super::super::layout::field_spec::{
+    decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue,
 };
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{EventError, ParsedEvent, EVENT_TYPE_PEER_SHARED};
 
+pub const PEER_SHARED_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("public_key"),
+    FieldSpec::EventId("user_event_id"),
+    FieldSpec::Text("device_name", NAME_BYTES),
+    FieldSpec::EventId("signed_by"),
+    FieldSpec::U8("signer_type"),
+    FieldSpec::FixedBytes("signature", 64),
+];
+
 /// PeerShared (type 16):
 /// type(1) + created_at(8) + public_key(32) + user_event_id(32)
 /// + device_name(64) + signed_by(32) + signer_type(1) + signature(64) = 234
-pub const PEER_SHARED_WIRE_SIZE: usize =
-    COMMON_HEADER_BYTES + 32 + 32 + NAME_BYTES + SIGNATURE_TRAILER_BYTES;
-
-mod peer_shared_offsets {
-    use super::super::super::layout::common::NAME_BYTES;
-    pub const TYPE_CODE: usize = 0;
-    pub const CREATED_AT: usize = 1;
-    pub const PUBLIC_KEY: usize = 9;
-    pub const USER_EVENT_ID: usize = 41;
-    pub const DEVICE_NAME: usize = 73;
-    pub const SIGNED_BY: usize = 73 + NAME_BYTES;
-    pub const SIGNER_TYPE: usize = SIGNED_BY + 32;
-    pub const SIGNATURE: usize = SIGNER_TYPE + 1;
-}
-
-use peer_shared_offsets as off;
+pub const PEER_SHARED_WIRE_SIZE: usize = wire_size_for_fields(PEER_SHARED_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeerSharedEvent {
@@ -45,54 +41,28 @@ impl super::super::Describe for PeerSharedEvent {
 }
 
 pub fn parse_peer_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < PEER_SHARED_WIRE_SIZE {
-        return Err(EventError::TooShort {
-            expected: PEER_SHARED_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > PEER_SHARED_WIRE_SIZE {
-        return Err(EventError::TrailingData {
-            expected: PEER_SHARED_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob[0] != EVENT_TYPE_PEER_SHARED {
-        return Err(EventError::WrongType {
-            expected: EVENT_TYPE_PEER_SHARED,
-            actual: blob[0],
-        });
-    }
+    let values = decode_fields(EVENT_TYPE_PEER_SHARED, PEER_SHARED_FIELDS, blob)?;
 
-    let created_at_ms =
-        u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
-    let mut public_key = [0u8; 32];
-    public_key.copy_from_slice(&blob[off::PUBLIC_KEY..off::USER_EVENT_ID]);
-    let mut user_event_id = [0u8; 32];
-    user_event_id.copy_from_slice(&blob[off::USER_EVENT_ID..off::DEVICE_NAME]);
-
-    let device_name = read_text_slot(&blob[off::DEVICE_NAME..off::DEVICE_NAME + NAME_BYTES])
-        .map_err(EventError::TextSlot)?;
-
-    let mut signed_by = [0u8; 32];
-    signed_by.copy_from_slice(&blob[off::SIGNED_BY..off::SIGNER_TYPE]);
-    let signer_type = blob[off::SIGNER_TYPE];
+    let signer_type = values[5].as_u8().unwrap();
     if signer_type != 3 {
         return Err(EventError::InvalidMetadata(
             "peer_shared signer_type must be 3 (peer_invite_shared)",
         ));
     }
-    let mut signature = [0u8; 64];
-    signature.copy_from_slice(&blob[off::SIGNATURE..off::SIGNATURE + 64]);
 
     Ok(ParsedEvent::PeerShared(PeerSharedEvent {
-        created_at_ms,
-        public_key,
-        user_event_id,
-        device_name,
-        signed_by,
+        created_at_ms: values[0].as_timestamp().unwrap(),
+        public_key: values[1].as_event_id().unwrap(),
+        user_event_id: values[2].as_event_id().unwrap(),
+        device_name: values[3].as_text().unwrap().to_string(),
+        signed_by: values[4].as_event_id().unwrap(),
         signer_type,
-        signature,
+        signature: {
+            let bytes = values[6].as_fixed_bytes().unwrap();
+            let mut sig = [0u8; 64];
+            sig.copy_from_slice(bytes);
+            sig
+        },
     }))
 }
 
@@ -101,20 +71,18 @@ pub fn encode_peer_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::PeerShared(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    let mut buf = vec![0u8; PEER_SHARED_WIRE_SIZE];
-    buf[off::TYPE_CODE] = EVENT_TYPE_PEER_SHARED;
-    buf[off::CREATED_AT..off::PUBLIC_KEY].copy_from_slice(&e.created_at_ms.to_le_bytes());
-    buf[off::PUBLIC_KEY..off::USER_EVENT_ID].copy_from_slice(&e.public_key);
-    buf[off::USER_EVENT_ID..off::DEVICE_NAME].copy_from_slice(&e.user_event_id);
-    write_text_slot(
-        &e.device_name,
-        &mut buf[off::DEVICE_NAME..off::DEVICE_NAME + NAME_BYTES],
-    )
-    .map_err(EventError::TextSlot)?;
-    buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&e.signed_by);
-    buf[off::SIGNER_TYPE] = e.signer_type;
-    buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&e.signature);
-    Ok(buf)
+
+    let values = vec![
+        FieldValue::Timestamp(e.created_at_ms),
+        FieldValue::EventId(e.public_key),
+        FieldValue::EventId(e.user_event_id),
+        FieldValue::Text(e.device_name.clone()),
+        FieldValue::EventId(e.signed_by),
+        FieldValue::U8(e.signer_type),
+        FieldValue::FixedBytes(e.signature.to_vec()),
+    ];
+
+    Ok(encode_fields(EVENT_TYPE_PEER_SHARED, PEER_SHARED_FIELDS, &values)?)
 }
 
 pub static PEER_SHARED_META: EventTypeMeta = EventTypeMeta {
@@ -136,11 +104,12 @@ pub static PEER_SHARED_META: EventTypeMeta = EventTypeMeta {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+    use crate::event_modules::layout::field_spec::field_offset;
     use crate::event_modules::{encode_event, parse_event};
 
     #[test]
     fn offsets_consistent() {
-        assert_eq!(peer_shared_offsets::SIGNATURE + 64, PEER_SHARED_WIRE_SIZE);
+        assert_eq!(field_offset(PEER_SHARED_FIELDS, 6) + 64, PEER_SHARED_WIRE_SIZE);
     }
 
     #[test]
@@ -162,9 +131,10 @@ mod layout_tests {
 
     #[test]
     fn parse_peer_shared_rejects_wrong_signer_type() {
+        let signer_type_offset = field_offset(PEER_SHARED_FIELDS, 5);
         let mut blob = vec![0u8; PEER_SHARED_WIRE_SIZE];
         blob[0] = EVENT_TYPE_PEER_SHARED;
-        blob[off::SIGNER_TYPE] = 5;
+        blob[signer_type_offset] = 5;
 
         let err = parse_peer_shared(&blob).expect_err("should reject wrong signer type");
         assert!(matches!(err, EventError::InvalidMetadata(_)));

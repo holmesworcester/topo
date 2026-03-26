@@ -1,14 +1,26 @@
-use super::layout::common::{COMMON_HEADER_BYTES, SIGNATURE_TRAILER_BYTES};
+use super::layout::field_spec::{
+    decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue,
+};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_KEY_SHARED};
 
 // ─── Layout (owned by this module) ───
 
+pub const KEY_SHARED_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("key_event_id"),
+    FieldSpec::EventId("recipient_event_id"),
+    FieldSpec::EventId("unwrap_key_event_id"),
+    FieldSpec::EventId("wrapped_key"),
+    FieldSpec::EventId("signed_by"),
+    FieldSpec::U8("signer_type"),
+    FieldSpec::FixedBytes("signature", 64),
+];
+
 /// KeyShared (type 22): type(1) + created_at(8) + key_event_id(32) + recipient_event_id(32)
 ///                        + unwrap_key_event_id(32) + wrapped_key(32) + signed_by(32)
 ///                        + signer_type(1) + signature(64) = 234
-pub const KEY_SHARED_WIRE_SIZE: usize =
-    COMMON_HEADER_BYTES + 32 + 32 + 32 + 32 + SIGNATURE_TRAILER_BYTES;
+pub const KEY_SHARED_WIRE_SIZE: usize = wire_size_for_fields(KEY_SHARED_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeySharedEvent {
@@ -42,49 +54,22 @@ impl super::Describe for KeySharedEvent {
 /// [169]        signer_type (1 byte)
 /// [170..234]   signature (64 bytes)
 pub fn parse_key_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < KEY_SHARED_WIRE_SIZE {
-        return Err(EventError::TooShort {
-            expected: KEY_SHARED_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > KEY_SHARED_WIRE_SIZE {
-        return Err(EventError::TrailingData {
-            expected: KEY_SHARED_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob[0] != EVENT_TYPE_KEY_SHARED {
-        return Err(EventError::WrongType {
-            expected: EVENT_TYPE_KEY_SHARED,
-            actual: blob[0],
-        });
-    }
-
-    let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
-    let mut key_event_id = [0u8; 32];
-    key_event_id.copy_from_slice(&blob[9..41]);
-    let mut recipient_event_id = [0u8; 32];
-    recipient_event_id.copy_from_slice(&blob[41..73]);
-    let mut unwrap_key_event_id = [0u8; 32];
-    unwrap_key_event_id.copy_from_slice(&blob[73..105]);
-    let mut wrapped_key = [0u8; 32];
-    wrapped_key.copy_from_slice(&blob[105..137]);
-    let mut signed_by = [0u8; 32];
-    signed_by.copy_from_slice(&blob[137..169]);
-    let signer_type = blob[169];
-    let mut signature = [0u8; 64];
-    signature.copy_from_slice(&blob[170..234]);
+    let values = decode_fields(EVENT_TYPE_KEY_SHARED, KEY_SHARED_FIELDS, blob)?;
 
     Ok(ParsedEvent::KeyShared(KeySharedEvent {
-        created_at_ms,
-        key_event_id,
-        recipient_event_id,
-        unwrap_key_event_id,
-        wrapped_key,
-        signed_by,
-        signer_type,
-        signature,
+        created_at_ms: values[0].as_timestamp().unwrap(),
+        key_event_id: values[1].as_event_id().unwrap(),
+        recipient_event_id: values[2].as_event_id().unwrap(),
+        unwrap_key_event_id: values[3].as_event_id().unwrap(),
+        wrapped_key: values[4].as_event_id().unwrap(),
+        signed_by: values[5].as_event_id().unwrap(),
+        signer_type: values[6].as_u8().unwrap(),
+        signature: {
+            let bytes = values[7].as_fixed_bytes().unwrap();
+            let mut sig = [0u8; 64];
+            sig.copy_from_slice(bytes);
+            sig
+        },
     }))
 }
 
@@ -93,17 +78,19 @@ pub fn encode_key_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::KeyShared(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    let mut buf = Vec::with_capacity(KEY_SHARED_WIRE_SIZE);
-    buf.push(EVENT_TYPE_KEY_SHARED);
-    buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
-    buf.extend_from_slice(&e.key_event_id);
-    buf.extend_from_slice(&e.recipient_event_id);
-    buf.extend_from_slice(&e.unwrap_key_event_id);
-    buf.extend_from_slice(&e.wrapped_key);
-    buf.extend_from_slice(&e.signed_by);
-    buf.push(e.signer_type);
-    buf.extend_from_slice(&e.signature);
-    Ok(buf)
+
+    let values = vec![
+        FieldValue::Timestamp(e.created_at_ms),
+        FieldValue::EventId(e.key_event_id),
+        FieldValue::EventId(e.recipient_event_id),
+        FieldValue::EventId(e.unwrap_key_event_id),
+        FieldValue::EventId(e.wrapped_key),
+        FieldValue::EventId(e.signed_by),
+        FieldValue::U8(e.signer_type),
+        FieldValue::FixedBytes(e.signature.to_vec()),
+    ];
+
+    Ok(encode_fields(EVENT_TYPE_KEY_SHARED, KEY_SHARED_FIELDS, &values)?)
 }
 
 // === Projector (event-module locality) ===

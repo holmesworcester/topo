@@ -1,26 +1,23 @@
-use super::super::layout::common::{
-    read_text_slot, write_text_slot, COMMON_HEADER_BYTES, NAME_BYTES, SIGNATURE_TRAILER_BYTES,
+use super::super::layout::common::NAME_BYTES;
+use super::super::layout::field_spec::{
+    decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue,
 };
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{EventError, ParsedEvent, EVENT_TYPE_USER};
 
+pub const USER_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("public_key"),
+    FieldSpec::Text("username", NAME_BYTES),
+    FieldSpec::EventId("signed_by"),
+    FieldSpec::U8("signer_type"),
+    FieldSpec::FixedBytes("signature", 64),
+];
+
 /// User (type 14):
 /// type(1) + created_at(8) + public_key(32) + username(64)
 /// + signed_by(32) + signer_type(1) + signature(64) = 202
-pub const USER_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + NAME_BYTES + SIGNATURE_TRAILER_BYTES;
-
-mod user_offsets {
-    use super::super::super::layout::common::NAME_BYTES;
-    pub const TYPE_CODE: usize = 0;
-    pub const CREATED_AT: usize = 1;
-    pub const PUBLIC_KEY: usize = 9;
-    pub const USERNAME: usize = 41;
-    pub const SIGNED_BY: usize = 41 + NAME_BYTES;
-    pub const SIGNER_TYPE: usize = SIGNED_BY + 32;
-    pub const SIGNATURE: usize = SIGNER_TYPE + 1;
-}
-
-use user_offsets as off;
+pub const USER_WIRE_SIZE: usize = wire_size_for_fields(USER_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct UserEvent {
@@ -42,51 +39,27 @@ impl super::super::Describe for UserEvent {
 }
 
 pub fn parse_user(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < USER_WIRE_SIZE {
-        return Err(EventError::TooShort {
-            expected: USER_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > USER_WIRE_SIZE {
-        return Err(EventError::TrailingData {
-            expected: USER_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob[0] != EVENT_TYPE_USER {
-        return Err(EventError::WrongType {
-            expected: EVENT_TYPE_USER,
-            actual: blob[0],
-        });
-    }
+    let values = decode_fields(EVENT_TYPE_USER, USER_FIELDS, blob)?;
 
-    let created_at_ms =
-        u64::from_le_bytes(blob[off::CREATED_AT..off::PUBLIC_KEY].try_into().unwrap());
-    let mut public_key = [0u8; 32];
-    public_key.copy_from_slice(&blob[off::PUBLIC_KEY..off::USERNAME]);
-
-    let username = read_text_slot(&blob[off::USERNAME..off::USERNAME + NAME_BYTES])
-        .map_err(EventError::TextSlot)?;
-
-    let mut signed_by = [0u8; 32];
-    signed_by.copy_from_slice(&blob[off::SIGNED_BY..off::SIGNER_TYPE]);
-    let signer_type = blob[off::SIGNER_TYPE];
+    let signer_type = values[4].as_u8().unwrap();
     if signer_type != 2 {
         return Err(EventError::InvalidMetadata(
             "user signer_type must be 2 (user_invite_shared)",
         ));
     }
-    let mut signature = [0u8; 64];
-    signature.copy_from_slice(&blob[off::SIGNATURE..off::SIGNATURE + 64]);
 
     Ok(ParsedEvent::User(UserEvent {
-        created_at_ms,
-        public_key,
-        username,
-        signed_by,
+        created_at_ms: values[0].as_timestamp().unwrap(),
+        public_key: values[1].as_event_id().unwrap(),
+        username: values[2].as_text().unwrap().to_string(),
+        signed_by: values[3].as_event_id().unwrap(),
         signer_type,
-        signature,
+        signature: {
+            let bytes = values[5].as_fixed_bytes().unwrap();
+            let mut sig = [0u8; 64];
+            sig.copy_from_slice(bytes);
+            sig
+        },
     }))
 }
 
@@ -95,19 +68,17 @@ pub fn encode_user(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         ParsedEvent::User(v) => v,
         _ => return Err(EventError::WrongVariant),
     };
-    let mut buf = vec![0u8; USER_WIRE_SIZE];
-    buf[off::TYPE_CODE] = EVENT_TYPE_USER;
-    buf[off::CREATED_AT..off::PUBLIC_KEY].copy_from_slice(&e.created_at_ms.to_le_bytes());
-    buf[off::PUBLIC_KEY..off::USERNAME].copy_from_slice(&e.public_key);
-    write_text_slot(
-        &e.username,
-        &mut buf[off::USERNAME..off::USERNAME + NAME_BYTES],
-    )
-    .map_err(EventError::TextSlot)?;
-    buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&e.signed_by);
-    buf[off::SIGNER_TYPE] = e.signer_type;
-    buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&e.signature);
-    Ok(buf)
+
+    let values = vec![
+        FieldValue::Timestamp(e.created_at_ms),
+        FieldValue::EventId(e.public_key),
+        FieldValue::Text(e.username.clone()),
+        FieldValue::EventId(e.signed_by),
+        FieldValue::U8(e.signer_type),
+        FieldValue::FixedBytes(e.signature.to_vec()),
+    ];
+
+    Ok(encode_fields(EVENT_TYPE_USER, USER_FIELDS, &values)?)
 }
 
 pub static USER_META: EventTypeMeta = EventTypeMeta {
@@ -129,11 +100,12 @@ pub static USER_META: EventTypeMeta = EventTypeMeta {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+    use crate::event_modules::layout::field_spec::field_offset;
     use crate::event_modules::{encode_event, parse_event};
 
     #[test]
     fn offsets_consistent() {
-        assert_eq!(user_offsets::SIGNATURE + 64, USER_WIRE_SIZE);
+        assert_eq!(field_offset(USER_FIELDS, 5) + 64, USER_WIRE_SIZE);
     }
 
     #[test]
@@ -154,9 +126,10 @@ mod layout_tests {
 
     #[test]
     fn parse_user_rejects_wrong_signer_type() {
+        let signer_type_offset = field_offset(USER_FIELDS, 4);
         let mut blob = vec![0u8; USER_WIRE_SIZE];
         blob[0] = EVENT_TYPE_USER;
-        blob[off::SIGNER_TYPE] = 1;
+        blob[signer_type_offset] = 1;
 
         let err = parse_user(&blob).expect_err("should reject wrong signer type");
         assert!(matches!(err, EventError::InvalidMetadata(_)));

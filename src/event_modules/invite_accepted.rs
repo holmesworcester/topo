@@ -1,12 +1,21 @@
-use super::layout::common::COMMON_HEADER_BYTES;
+use super::layout::field_spec::{
+    decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue,
+};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_INVITE_ACCEPTED};
 
 // ─── Layout (owned by this module) ───
 
+pub const INVITE_ACCEPTED_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("tenant_event_id"),
+    FieldSpec::EventId("invite_event_id"),
+    FieldSpec::EventId("workspace_id"),
+];
+
 /// InviteAccepted (type 9): type(1) + created_at(8) + tenant_event_id(32) + invite_event_id(32)
 /// + workspace_id(32) = 105
-pub const INVITE_ACCEPTED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + 32 + 32;
+pub const INVITE_ACCEPTED_WIRE_SIZE: usize = wire_size_for_fields(INVITE_ACCEPTED_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InviteAcceptedEvent {
@@ -35,40 +44,13 @@ impl super::Describe for InviteAcceptedEvent {
 /// [41..73] invite_event_id (32 bytes)
 /// [73..105] workspace_id (32 bytes)
 pub fn parse_invite_accepted(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < INVITE_ACCEPTED_WIRE_SIZE {
-        return Err(EventError::TooShort {
-            expected: INVITE_ACCEPTED_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > INVITE_ACCEPTED_WIRE_SIZE {
-        return Err(EventError::TrailingData {
-            expected: INVITE_ACCEPTED_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob[0] != EVENT_TYPE_INVITE_ACCEPTED {
-        return Err(EventError::WrongType {
-            expected: EVENT_TYPE_INVITE_ACCEPTED,
-            actual: blob[0],
-        });
-    }
-
-    let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
-    let mut tenant_event_id = [0u8; 32];
-    tenant_event_id.copy_from_slice(&blob[9..41]);
-
-    let mut invite_event_id = [0u8; 32];
-    invite_event_id.copy_from_slice(&blob[41..73]);
-
-    let mut workspace_id = [0u8; 32];
-    workspace_id.copy_from_slice(&blob[73..105]);
+    let values = decode_fields(EVENT_TYPE_INVITE_ACCEPTED, INVITE_ACCEPTED_FIELDS, blob)?;
 
     Ok(ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-        created_at_ms,
-        tenant_event_id,
-        invite_event_id,
-        workspace_id,
+        created_at_ms: values[0].as_timestamp().unwrap(),
+        tenant_event_id: values[1].as_event_id().unwrap(),
+        invite_event_id: values[2].as_event_id().unwrap(),
+        workspace_id: values[3].as_event_id().unwrap(),
     }))
 }
 
@@ -78,13 +60,14 @@ pub fn encode_invite_accepted(event: &ParsedEvent) -> Result<Vec<u8>, EventError
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = Vec::with_capacity(INVITE_ACCEPTED_WIRE_SIZE);
-    buf.push(EVENT_TYPE_INVITE_ACCEPTED);
-    buf.extend_from_slice(&ia.created_at_ms.to_le_bytes());
-    buf.extend_from_slice(&ia.tenant_event_id);
-    buf.extend_from_slice(&ia.invite_event_id);
-    buf.extend_from_slice(&ia.workspace_id);
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(ia.created_at_ms),
+        FieldValue::EventId(ia.tenant_event_id),
+        FieldValue::EventId(ia.invite_event_id),
+        FieldValue::EventId(ia.workspace_id),
+    ];
+
+    Ok(encode_fields(EVENT_TYPE_INVITE_ACCEPTED, INVITE_ACCEPTED_FIELDS, &values)?)
 }
 
 // === Projector (event-module locality) ===

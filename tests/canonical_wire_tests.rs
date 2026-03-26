@@ -6,7 +6,8 @@ use topo::event_modules::layout::common::{
     encrypted_inner_wire_size, encrypted_wire_size, ENCRYPTED_HEADER_BYTES,
 };
 use topo::event_modules::message::layout::offsets as message_offsets;
-use topo::event_modules::reaction::offsets as reaction_offsets;
+use topo::event_modules::layout::field_spec::field_offset;
+use topo::event_modules::reaction::wire::REACTION_FIELDS;
 use topo::event_modules::{
     self as events, BenchDepEvent, EncryptedEvent, EventError, FileEvent, FileSliceEvent,
     MessageEvent, ParsedEvent, ReactionEvent,
@@ -266,7 +267,7 @@ fn nonzero_padding_reaction_emoji() {
         signature: [0u8; 64],
     });
     let mut blob = events::encode_event(&rxn).unwrap();
-    let emoji_start = reaction_offsets::EMOJI;
+    let emoji_start = field_offset(REACTION_FIELDS, 3); // emoji field
     blob[emoji_start + 2] = 0xFF; // after "x\0"
     let err = events::parse_event(&blob).unwrap_err();
     assert!(matches!(err, EventError::TextSlot(_)));
@@ -353,7 +354,7 @@ fn malformed_utf8_reaction_emoji() {
         signature: [0u8; 64],
     });
     let mut blob = events::encode_event(&rxn).unwrap();
-    let emoji_start = reaction_offsets::EMOJI;
+    let emoji_start = field_offset(REACTION_FIELDS, 3); // emoji field
     blob[emoji_start] = 0xFF;
     blob[emoji_start + 1] = 0xFE;
     let err = events::parse_event(&blob).unwrap_err();

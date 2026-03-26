@@ -1,8 +1,15 @@
-use super::layout::common::COMMON_HEADER_BYTES;
+use super::layout::field_spec::{
+    decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue,
+};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_TENANT};
 
-pub const TENANT_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32;
+pub const TENANT_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("public_key"),
+];
+
+pub const TENANT_WIRE_SIZE: usize = wire_size_for_fields(TENANT_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct TenantEvent {
@@ -25,32 +32,11 @@ impl super::Describe for TenantEvent {
 }
 
 pub fn parse_tenant(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < TENANT_WIRE_SIZE {
-        return Err(EventError::TooShort {
-            expected: TENANT_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > TENANT_WIRE_SIZE {
-        return Err(EventError::TrailingData {
-            expected: TENANT_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob[0] != EVENT_TYPE_TENANT {
-        return Err(EventError::WrongType {
-            expected: EVENT_TYPE_TENANT,
-            actual: blob[0],
-        });
-    }
-
-    let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
-    let mut public_key = [0u8; 32];
-    public_key.copy_from_slice(&blob[9..41]);
+    let values = decode_fields(EVENT_TYPE_TENANT, TENANT_FIELDS, blob)?;
 
     Ok(ParsedEvent::Tenant(TenantEvent {
-        created_at_ms,
-        public_key,
+        created_at_ms: values[0].as_timestamp().unwrap(),
+        public_key: values[1].as_event_id().unwrap(),
     }))
 }
 
@@ -60,11 +46,12 @@ pub fn encode_tenant(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = Vec::with_capacity(TENANT_WIRE_SIZE);
-    buf.push(EVENT_TYPE_TENANT);
-    buf.extend_from_slice(&e.created_at_ms.to_le_bytes());
-    buf.extend_from_slice(&e.public_key);
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(e.created_at_ms),
+        FieldValue::EventId(e.public_key),
+    ];
+
+    Ok(encode_fields(EVENT_TYPE_TENANT, TENANT_FIELDS, &values)?)
 }
 
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};

@@ -1,4 +1,6 @@
-use super::super::layout::common::{COMMON_HEADER_BYTES, SIGNATURE_TRAILER_BYTES};
+use super::super::layout::field_spec::{
+    decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue,
+};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{EventError, ParsedEvent, EVENT_TYPE_FILE_SLICE};
 
@@ -7,23 +9,19 @@ use super::super::{EventError, ParsedEvent, EVENT_TYPE_FILE_SLICE};
 /// FileSlice: canonical fixed ciphertext size (256 KiB)
 pub const FILE_SLICE_CIPHERTEXT_BYTES: usize = 262_144;
 
+pub const FILE_SLICE_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("file_id"),
+    FieldSpec::U32("slice_number"),
+    FieldSpec::FixedBytes("ciphertext", 262_144),
+    FieldSpec::EventId("signed_by"),
+    FieldSpec::U8("signer_type"),
+    FieldSpec::FixedBytes("signature", 64),
+];
+
 /// FileSlice (type 25): type(1) + created_at(8) + file_id(32) + slice_number(4)
 ///   + ciphertext(262144) + signed_by(32) + signer_type(1) + signature(64) = 262286
-pub const FILE_SLICE_WIRE_SIZE: usize =
-    COMMON_HEADER_BYTES + 32 + 4 + FILE_SLICE_CIPHERTEXT_BYTES + SIGNATURE_TRAILER_BYTES;
-
-mod file_slice_offsets {
-    pub const TYPE_CODE: usize = 0;
-    pub const CREATED_AT: usize = 1;
-    pub const FILE_ID: usize = 9;
-    pub const SLICE_NUMBER: usize = 41;
-    pub const CIPHERTEXT: usize = 45;
-    pub const SIGNED_BY: usize = 45 + super::FILE_SLICE_CIPHERTEXT_BYTES; // 262189
-    pub const SIGNER_TYPE: usize = SIGNED_BY + 32; // 262221
-    pub const SIGNATURE: usize = SIGNER_TYPE + 1; // 262222
-}
-
-use file_slice_offsets as off;
+pub const FILE_SLICE_WIRE_SIZE: usize = wire_size_for_fields(FILE_SLICE_FIELDS);
 
 /// Maximum ciphertext size per file slice: canonical fixed 256 KiB.
 /// Final plaintext chunks are zero-padded before encryption.
@@ -52,51 +50,25 @@ impl super::super::Describe for FileSliceEvent {
 }
 
 pub fn parse_file_slice(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < FILE_SLICE_WIRE_SIZE {
-        return Err(EventError::TooShort {
-            expected: FILE_SLICE_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > FILE_SLICE_WIRE_SIZE {
-        return Err(EventError::TrailingData {
-            expected: FILE_SLICE_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob[0] != EVENT_TYPE_FILE_SLICE {
-        return Err(EventError::WrongType {
-            expected: EVENT_TYPE_FILE_SLICE,
-            actual: blob[0],
-        });
-    }
+    let mut values = decode_fields(EVENT_TYPE_FILE_SLICE, FILE_SLICE_FIELDS, blob)?;
 
-    let created_at_ms = u64::from_le_bytes(blob[off::CREATED_AT..off::FILE_ID].try_into().unwrap());
-
-    let mut file_id = [0u8; 32];
-    file_id.copy_from_slice(&blob[off::FILE_ID..off::SLICE_NUMBER]);
-
-    let slice_number =
-        u32::from_le_bytes(blob[off::SLICE_NUMBER..off::CIPHERTEXT].try_into().unwrap());
-
-    let ciphertext = blob[off::CIPHERTEXT..off::CIPHERTEXT + FILE_SLICE_CIPHERTEXT_BYTES].to_vec();
-
-    let mut signed_by = [0u8; 32];
-    signed_by.copy_from_slice(&blob[off::SIGNED_BY..off::SIGNER_TYPE]);
-
-    let signer_type = blob[off::SIGNER_TYPE];
-
-    let mut signature = [0u8; 64];
-    signature.copy_from_slice(&blob[off::SIGNATURE..off::SIGNATURE + 64]);
+    // Move the large ciphertext vec out to avoid a 256 KiB copy.
+    let ciphertext = match std::mem::replace(&mut values[3], FieldValue::Bool(false)) {
+        FieldValue::FixedBytes(v) => v,
+        _ => unreachable!("decode_fields guarantees FixedBytes for FixedBytes spec"),
+    };
+    let sig_bytes = values[6].as_fixed_bytes().unwrap();
+    let mut sig = [0u8; 64];
+    sig.copy_from_slice(sig_bytes);
 
     Ok(ParsedEvent::FileSlice(FileSliceEvent {
-        created_at_ms,
-        file_id,
-        slice_number,
+        created_at_ms: values[0].as_timestamp().unwrap(),
+        file_id: values[1].as_event_id().unwrap(),
+        slice_number: values[2].as_u32().unwrap(),
         ciphertext,
-        signed_by,
-        signer_type,
-        signature,
+        signed_by: values[4].as_event_id().unwrap(),
+        signer_type: values[5].as_u8().unwrap(),
+        signature: sig,
     }))
 }
 
@@ -110,19 +82,17 @@ pub fn encode_file_slice(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         return Err(EventError::ContentTooLong(fs.ciphertext.len()));
     }
 
-    let mut buf = vec![0u8; FILE_SLICE_WIRE_SIZE];
+    let values = vec![
+        FieldValue::Timestamp(fs.created_at_ms),
+        FieldValue::EventId(fs.file_id),
+        FieldValue::U32(fs.slice_number),
+        FieldValue::FixedBytes(fs.ciphertext.clone()),
+        FieldValue::EventId(fs.signed_by),
+        FieldValue::U8(fs.signer_type),
+        FieldValue::FixedBytes(fs.signature.to_vec()),
+    ];
 
-    buf[off::TYPE_CODE] = EVENT_TYPE_FILE_SLICE;
-    buf[off::CREATED_AT..off::FILE_ID].copy_from_slice(&fs.created_at_ms.to_le_bytes());
-    buf[off::FILE_ID..off::SLICE_NUMBER].copy_from_slice(&fs.file_id);
-    buf[off::SLICE_NUMBER..off::CIPHERTEXT].copy_from_slice(&fs.slice_number.to_le_bytes());
-    buf[off::CIPHERTEXT..off::CIPHERTEXT + FILE_SLICE_CIPHERTEXT_BYTES]
-        .copy_from_slice(&fs.ciphertext);
-    buf[off::SIGNED_BY..off::SIGNER_TYPE].copy_from_slice(&fs.signed_by);
-    buf[off::SIGNER_TYPE] = fs.signer_type;
-    buf[off::SIGNATURE..off::SIGNATURE + 64].copy_from_slice(&fs.signature);
-
-    Ok(buf)
+    Ok(encode_fields(EVENT_TYPE_FILE_SLICE, FILE_SLICE_FIELDS, &values)?)
 }
 
 pub static FILE_SLICE_META: EventTypeMeta = EventTypeMeta {
@@ -144,9 +114,10 @@ pub static FILE_SLICE_META: EventTypeMeta = EventTypeMeta {
 #[cfg(test)]
 mod layout_tests {
     use super::*;
+    use crate::event_modules::layout::field_spec::field_offset;
 
     #[test]
     fn offsets_consistent() {
-        assert_eq!(file_slice_offsets::SIGNATURE + 64, FILE_SLICE_WIRE_SIZE);
+        assert_eq!(field_offset(FILE_SLICE_FIELDS, 6) + 64, FILE_SLICE_WIRE_SIZE);
     }
 }

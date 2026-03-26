@@ -1,12 +1,19 @@
-use super::layout::common::COMMON_HEADER_BYTES;
+use super::layout::field_spec::{
+    decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue,
+};
 use super::registry::{EventTypeMeta, ShareScope};
 use super::{EventError, ParsedEvent, EVENT_TYPE_KEY_SECRET};
 use crate::crypto::EventId;
 
 // ─── Layout (owned by this module) ───
 
+pub const KEY_SECRET_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("key_bytes"),
+];
+
 /// Secret (type 6): type(1) + created_at(8) + key_bytes(32) = 41
-pub const KEY_SECRET_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32;
+pub const KEY_SECRET_WIRE_SIZE: usize = wire_size_for_fields(KEY_SECRET_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeySecretEvent {
@@ -25,33 +32,11 @@ impl super::Describe for KeySecretEvent {
 /// [1..9]   created_at_ms (u64 LE)
 /// [9..41]  key_bytes (32 bytes)
 pub fn parse_key_secret(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < KEY_SECRET_WIRE_SIZE {
-        return Err(EventError::TooShort {
-            expected: KEY_SECRET_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > KEY_SECRET_WIRE_SIZE {
-        return Err(EventError::TrailingData {
-            expected: KEY_SECRET_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob[0] != EVENT_TYPE_KEY_SECRET {
-        return Err(EventError::WrongType {
-            expected: EVENT_TYPE_KEY_SECRET,
-            actual: blob[0],
-        });
-    }
-
-    let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
-
-    let mut key_bytes = [0u8; 32];
-    key_bytes.copy_from_slice(&blob[9..41]);
+    let values = decode_fields(EVENT_TYPE_KEY_SECRET, KEY_SECRET_FIELDS, blob)?;
 
     Ok(ParsedEvent::KeySecret(KeySecretEvent {
-        created_at_ms,
-        key_bytes,
+        created_at_ms: values[0].as_timestamp().unwrap(),
+        key_bytes: values[1].as_event_id().unwrap(),
     }))
 }
 
@@ -61,11 +46,12 @@ pub fn encode_key_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = Vec::with_capacity(KEY_SECRET_WIRE_SIZE);
-    buf.push(EVENT_TYPE_KEY_SECRET);
-    buf.extend_from_slice(&sk.created_at_ms.to_le_bytes());
-    buf.extend_from_slice(&sk.key_bytes);
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(sk.created_at_ms),
+        FieldValue::EventId(sk.key_bytes),
+    ];
+
+    Ok(encode_fields(EVENT_TYPE_KEY_SECRET, KEY_SECRET_FIELDS, &values)?)
 }
 
 /// Deterministic timestamp derivation for key materialized Secret events.
