@@ -4,7 +4,7 @@ use rusqlite::{Connection, ErrorCode, OptionalExtension, Result as SqliteResult}
 ///
 /// This prototype intentionally does not support backward migration from older
 /// schema layouts. Existing DBs from prior epochs must be recreated.
-const PROTOTYPE_SCHEMA_EPOCH: i64 = 6;
+const PROTOTYPE_SCHEMA_EPOCH: i64 = 7;
 
 fn table_exists(conn: &Connection, table_name: &str) -> SqliteResult<bool> {
     conn.query_row(
@@ -147,6 +147,25 @@ mod tests {
             .query_row("SELECT COUNT(*) FROM schema_epoch", [], |row| row.get(0))
             .unwrap();
         assert_eq!(count, 1);
+    }
+
+    #[test]
+    fn test_shared_event_index_requires_explicit_workspace_id() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let err = conn
+            .execute(
+                "INSERT INTO shared_event_index (ts, id) VALUES (?1, zeroblob(32))",
+                rusqlite::params![0i64],
+            )
+            .unwrap_err();
+        let msg = err.to_string();
+        assert!(
+            msg.contains("NOT NULL") || msg.contains("workspace_id"),
+            "unexpected error: {}",
+            msg
+        );
     }
 
     #[test]

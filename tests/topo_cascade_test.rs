@@ -30,25 +30,36 @@ fn setup() -> (Connection, NamedTempFile) {
     (conn, tmp)
 }
 
-fn insert_event_raw(conn: &Connection, recorded_by: &str, blob: &[u8]) -> EventId {
+fn insert_event_raw(
+    conn: &Connection,
+    recorded_by: &str,
+    workspace_id: &str,
+    blob: &[u8],
+) -> EventId {
     let event_id = hash_event(blob);
     let event_id_b64 = event_id_to_base64(&event_id);
     let ts = now_ms();
     let type_code = blob[0];
-    let type_name = events::registry()
+    let meta = events::registry()
         .lookup(type_code)
-        .map(|m| m.type_name)
-        .unwrap_or("unknown");
+        .expect("unknown event type for raw insert");
 
     conn.execute(
         "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-         VALUES (?1, ?2, ?3, 'shared', ?4, ?5)",
-        rusqlite::params![&event_id_b64, type_name, blob, ts as i64, ts as i64],
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            &event_id_b64,
+            meta.type_name,
+            blob,
+            meta.share_scope.as_str(),
+            ts as i64,
+            ts as i64
+        ],
     )
     .unwrap();
     conn.execute(
-        "INSERT OR IGNORE INTO shared_event_index (ts, id) VALUES (?1, ?2)",
-        rusqlite::params![ts as i64, event_id.as_slice()],
+        "INSERT OR IGNORE INTO shared_event_index (workspace_id, ts, id) VALUES (?1, ?2, ?3)",
+        rusqlite::params![workspace_id, ts as i64, event_id.as_slice()],
     )
     .unwrap();
     conn.execute(
@@ -80,6 +91,7 @@ fn run_topo_cascade(n: usize) {
     let deps_per_event = 10usize;
     let (conn, _tmp) = setup();
     let recorded_by = "peer1";
+    let workspace_id = "bench-workspace";
 
     // === Setup phase ===
     let setup_start = Instant::now();
@@ -116,7 +128,7 @@ fn run_topo_cascade(n: usize) {
     // Insert all events into the database in a single transaction.
     conn.execute_batch("BEGIN").unwrap();
     for i in 0..n {
-        insert_event_raw(&conn, recorded_by, &blobs[i]);
+        insert_event_raw(&conn, recorded_by, workspace_id, &blobs[i]);
     }
     conn.execute_batch("COMMIT").unwrap();
     drop(blobs); // Free ~172 bytes × N of heap after insertion; data lives in SQLite now.

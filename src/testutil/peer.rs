@@ -1324,8 +1324,8 @@ impl Peer {
 
             // Insert into events, shared_event_index, recorded_events — all use the
             // same created_at that is embedded in the blob so that the
-            // shared_event_index (ts, id) key matches what a receiving batch_writer
-            // would extract from the blob.
+            // shared_event_index (workspace_id, ts, id) key matches what a
+            // receiving batch_writer would extract from the blob.
             db.execute(
                 "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
                  VALUES (?1, ?2, ?3, 'shared', ?4, ?5)",

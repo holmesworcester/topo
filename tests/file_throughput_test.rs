@@ -35,28 +35,46 @@ fn setup() -> (Connection, NamedTempFile) {
     (conn, tmp)
 }
 
-/// Insert a blob into events + shared_event_index + recorded_events.
-fn insert_event_raw(conn: &Connection, recorded_by: &str, blob: &[u8]) -> EventId {
+/// Insert a blob into events + optional shared_event_index + recorded_events.
+fn insert_event_raw(
+    conn: &Connection,
+    recorded_by: &str,
+    blob: &[u8],
+    workspace_id: Option<&str>,
+) -> EventId {
     let event_id = hash_event(blob);
     let event_id_b64 = event_id_to_base64(&event_id);
     let ts = now_ms();
     let type_code = blob[0];
-    let type_name = events::registry()
+    let meta = events::registry()
         .lookup(type_code)
-        .map(|m| m.type_name)
-        .unwrap_or("unknown");
+        .expect("unknown event type for raw insert");
 
     conn.execute(
         "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-         VALUES (?1, ?2, ?3, 'shared', ?4, ?5)",
-        rusqlite::params![&event_id_b64, type_name, blob, ts as i64, ts as i64],
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        rusqlite::params![
+            &event_id_b64,
+            meta.type_name,
+            blob,
+            meta.share_scope.as_str(),
+            ts as i64,
+            ts as i64
+        ],
     )
     .unwrap();
-    conn.execute(
-        "INSERT OR IGNORE INTO shared_event_index (ts, id) VALUES (?1, ?2)",
-        rusqlite::params![ts as i64, event_id.as_slice()],
-    )
-    .unwrap();
+    if meta.share_scope == events::ShareScope::Shared {
+        let ws_id = if meta.type_name == "workspace" {
+            event_id_b64.as_str()
+        } else {
+            workspace_id.expect("shared event insert requires workspace_id")
+        };
+        conn.execute(
+            "INSERT OR IGNORE INTO shared_event_index (workspace_id, ts, id) VALUES (?1, ?2, ?3)",
+            rusqlite::params![ws_id, ts as i64, event_id.as_slice()],
+        )
+        .unwrap();
+    }
     conn.execute(
         "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
          VALUES (?1, ?2, ?3, 'test')",
@@ -89,7 +107,7 @@ fn make_identity_chain(
         public_key: peer_key.verifying_key().to_bytes(),
     });
     let tenant_blob = events::encode_event(&tenant).unwrap();
-    let tenant_eid = insert_event_raw(conn, recorded_by, &tenant_blob);
+    let tenant_eid = insert_event_raw(conn, recorded_by, &tenant_blob, None);
     project_one(conn, recorded_by, &tenant_eid).unwrap();
 
     let workspace_key = SigningKey::generate(&mut rng);
@@ -99,8 +117,9 @@ fn make_identity_chain(
         name: "bench".to_string(),
     });
     let net_blob = events::encode_event(&net).unwrap();
-    let net_eid = insert_event_raw(conn, recorded_by, &net_blob);
+    let net_eid = insert_event_raw(conn, recorded_by, &net_blob, None);
     let workspace_id = net_eid;
+    let workspace_id_b64 = event_id_to_base64(&workspace_id);
 
     let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
         created_at_ms: now_ms(),
@@ -109,7 +128,7 @@ fn make_identity_chain(
         workspace_id,
     });
     let ia_blob = events::encode_event(&ia).unwrap();
-    let ia_eid = insert_event_raw(conn, recorded_by, &ia_blob);
+    let ia_eid = insert_event_raw(conn, recorded_by, &ia_blob, None);
     project_one(conn, recorded_by, &ia_eid).unwrap();
     project_one(conn, recorded_by, &net_eid).unwrap();
 
@@ -125,7 +144,7 @@ fn make_identity_chain(
     });
     let mut uib_blob = events::encode_event(&uib).unwrap();
     sign_blob(&workspace_key, &mut uib_blob);
-    let uib_eid = insert_event_raw(conn, recorded_by, &uib_blob);
+    let uib_eid = insert_event_raw(conn, recorded_by, &uib_blob, Some(&workspace_id_b64));
     project_one(conn, recorded_by, &uib_eid).unwrap();
 
     let user_key = SigningKey::generate(&mut rng);
@@ -139,7 +158,7 @@ fn make_identity_chain(
     });
     let mut ub_blob = events::encode_event(&ub).unwrap();
     sign_blob(&invite_key, &mut ub_blob);
-    let ub_eid = insert_event_raw(conn, recorded_by, &ub_blob);
+    let ub_eid = insert_event_raw(conn, recorded_by, &ub_blob, Some(&workspace_id_b64));
     project_one(conn, recorded_by, &ub_eid).unwrap();
 
     let device_invite_key = SigningKey::generate(&mut rng);
@@ -153,7 +172,7 @@ fn make_identity_chain(
     });
     let mut dif_blob = events::encode_event(&dif).unwrap();
     sign_blob(&user_key, &mut dif_blob);
-    let dif_eid = insert_event_raw(conn, recorded_by, &dif_blob);
+    let dif_eid = insert_event_raw(conn, recorded_by, &dif_blob, Some(&workspace_id_b64));
     project_one(conn, recorded_by, &dif_eid).unwrap();
 
     let peer_shared_key = SigningKey::generate(&mut rng);
@@ -168,7 +187,7 @@ fn make_identity_chain(
     });
     let mut psf_blob = events::encode_event(&psf).unwrap();
     sign_blob(&device_invite_key, &mut psf_blob);
-    let psf_eid = insert_event_raw(conn, recorded_by, &psf_blob);
+    let psf_eid = insert_event_raw(conn, recorded_by, &psf_blob, Some(&workspace_id_b64));
     project_one(conn, recorded_by, &psf_eid).unwrap();
 
     (psf_eid, peer_shared_key, ub_eid, workspace_id)
@@ -185,7 +204,7 @@ fn create_prereqs(conn: &Connection, recorded_by: &str) -> (EventId, EventId, Ev
         key_bytes: [0xBB; 32],
     });
     let sk_blob = events::encode_event(&sk).unwrap();
-    let sk_eid = insert_event_raw(conn, recorded_by, &sk_blob);
+    let sk_eid = insert_event_raw(conn, recorded_by, &sk_blob, None);
     project_one(conn, recorded_by, &sk_eid).unwrap();
 
     // Signed message inside the current encrypted-wrapper path.

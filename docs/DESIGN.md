@@ -711,7 +711,7 @@ Rules:
 
 This preserves scoped reads/writes while keeping the schema ergonomic.
 
-**Known limitation:** `shared_event_index` is one shared physical table. Negentropy reads are workspace-scoped (`workspace_id = ? OR workspace_id = ''`), so tenants do not enumerate other tenants' non-empty workspace buckets. Remaining leakage risk is limited to rows with empty `workspace_id` during bootstrap/pre-anchor windows. In this document, **pseudonym isolation** means preventing any cross-tenant metadata correlation at the node level; full pseudonym isolation still requires separate node instances on separate network paths.
+**Known limitation:** `shared_event_index` is one shared physical table keyed by `workspace_id`, not by tenant. Negentropy reads one explicit workspace bucket at a time. Production create/ingest paths only index shared events when they have an explicit workspace binding, so empty workspace buckets are not part of the runtime design. In this document, **pseudonym isolation** means preventing any cross-tenant metadata correlation at the node level; full pseudonym isolation still requires separate node instances on separate network paths.
 
 ## 3.2.1 Functional multitenancy: one node, N tenants
 

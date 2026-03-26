@@ -37,7 +37,7 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         CREATE INDEX IF NOT EXISTS idx_recorded_peer_order ON recorded_events(peer_id, id);
 
         CREATE TABLE IF NOT EXISTS shared_event_index (
-            workspace_id TEXT NOT NULL DEFAULT '',
+            workspace_id TEXT NOT NULL,
             ts INTEGER NOT NULL,
             id BLOB NOT NULL,
             PRIMARY KEY (workspace_id, ts, id)
