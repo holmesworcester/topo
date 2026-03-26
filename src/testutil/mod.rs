@@ -2768,6 +2768,55 @@ pub fn verify_projection_invariants(peer: &Peer) {
 }
 
 // ---------------------------------------------------------------------------
+// Public replay API for CLI `topo replay` command
+// ---------------------------------------------------------------------------
+
+/// Result of a single replay pass, suitable for serialization.
+#[derive(Debug, serde::Serialize)]
+pub struct ReplayResult {
+    pub pass: String,
+    pub event_count: usize,
+    pub fingerprint: String,
+}
+
+/// Run a single replay pass on the given DB and return the result.
+/// `pass` must be one of: "forward", "idempotent", "reverse", "shuffle".
+pub fn run_replay_pass(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    pass: &str,
+) -> Result<ReplayResult, String> {
+    let fp = match pass {
+        "forward" => {
+            replay_and_fingerprint(db, recorded_by, "ORDER BY created_at ASC, event_id ASC")
+        }
+        "idempotent" => replay_no_clear_and_fingerprint(db, recorded_by),
+        "reverse" => {
+            replay_and_fingerprint(db, recorded_by, "ORDER BY created_at DESC, event_id DESC")
+        }
+        "shuffle" => replay_shuffled_and_fingerprint(db, recorded_by),
+        other => {
+            return Err(format!(
+                "unknown replay pass: '{}' (expected: forward, idempotent, reverse, shuffle)",
+                other
+            ))
+        }
+    };
+    let event_count: usize = db
+        .query_row(
+            "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get::<_, i64>(0),
+        )
+        .unwrap_or(0) as usize;
+    Ok(ReplayResult {
+        pass: pass.to_string(),
+        event_count,
+        fingerprint: hex(&fp.overall),
+    })
+}
+
+// ---------------------------------------------------------------------------
 // REALISM SYNC HELPERS
 // ---------------------------------------------------------------------------
 

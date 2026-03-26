@@ -1467,6 +1467,19 @@ fn dispatch(
             Err(e) => RpcResponse::error(e),
         },
 
+        RpcMethod::Replay { pass } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => {
+                    match crate::testutil::run_replay_pass(&db, &recorded_by, &pass) {
+                        Ok(result) => RpcResponse::success(result),
+                        Err(e) => RpcResponse::error(e),
+                    }
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+
         RpcMethod::Intro {
             peer_a,
             peer_b,

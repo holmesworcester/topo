@@ -2208,6 +2208,7 @@ fn catalog_drift_test_method_count_matches_protocol() {
         "View",
         "EventList",
         "Stats",
+        "Replay",
         "Intro",
     ];
 

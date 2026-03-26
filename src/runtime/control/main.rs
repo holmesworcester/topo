@@ -918,6 +918,30 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
+        Commands::Replay { pass, json } => {
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::Replay { pass: pass.clone() },
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data).unwrap_or_default()
+                );
+            } else {
+                println!("REPLAY {} ({}):", pass, db);
+                println!(
+                    "  Events:      {}",
+                    data["event_count"].as_u64().unwrap_or(0)
+                );
+                println!(
+                    "  Fingerprint: {}",
+                    data["fingerprint"].as_str().unwrap_or("unknown")
+                );
+            }
+        }
+
         Commands::Workspaces => {
             let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Workspaces)?;
             println!("WORKSPACES ({}):", db);

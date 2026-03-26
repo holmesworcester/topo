@@ -214,6 +214,10 @@ pub enum RpcMethod {
 
     /// Return all projection table counts for the active tenant.
     Stats,
+    /// Run a replay pass (forward/idempotent/reverse/shuffle) and return the fingerprint.
+    Replay {
+        pass: String,
+    },
 
     /// Run intro: connect peer_a and peer_b via this node.
     Intro {

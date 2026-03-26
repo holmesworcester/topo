@@ -273,6 +273,12 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"Stats"}"#,
     },
     MethodInfo {
+        name: "Replay",
+        purpose: "Run a replay pass and return the projection fingerprint",
+        params: params!["pass", "string", true, None],
+        example_json: r#"{"type":"Replay","pass":"forward"}"#,
+    },
+    MethodInfo {
         name: "Intro",
         purpose: "Run intro: connect two peers via this node",
         params: params![

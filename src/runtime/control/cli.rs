@@ -221,6 +221,15 @@ pub(crate) enum Commands {
         json: bool,
     },
 
+    /// Run a replay pass: clear projections, reproject, return fingerprint
+    Replay {
+        /// Pass type: forward, idempotent, reverse, shuffle
+        pass: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// List workspaces from projection
     Workspaces,
 
