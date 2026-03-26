@@ -3,42 +3,15 @@ use crate::event_modules::operational::sync_window_selected::{
     self as sync_window_selected, PlannerStateRow,
 };
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum SyncWindowKind {
-    Full = 0,
-    LastDay = 1,
-    LastWeek = 2,
-    LastTwelveWeeks = 3,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct SyncWindow {
-    pub kind: SyncWindowKind,
-    pub ts_min_inclusive_ms: Option<i64>,
-    pub ts_max_exclusive_ms: Option<i64>,
-}
+// Re-export types from the event family module — they are the source of truth.
+pub use crate::event_modules::operational::sync_window_selected::{
+    is_hot_window, SyncWindow, SyncWindowKind,
+};
 
 const WINDOW_MAGIC: &[u8; 4] = b"P7SW";
 const WINDOW_VERSION: u8 = 2;
 const NONE_TS_SENTINEL: i64 = i64::MIN;
-const ALL_START_MS: i64 = 0;
-const HOUR_MS: i64 = 60 * 60 * 1000;
-const DAY_MS: i64 = 24 * HOUR_MS;
-const WEEK_MS: i64 = 7 * DAY_MS;
-const TWELVE_WEEK_MS: i64 = 12 * WEEK_MS;
 const COLD_PARTITION_MAX_LOCAL_MESSAGES: i64 = 64;
-const TIER_ORDER: [SyncWindowKind; 4] = [
-    SyncWindowKind::LastDay,
-    SyncWindowKind::LastWeek,
-    SyncWindowKind::LastTwelveWeeks,
-    SyncWindowKind::Full,
-];
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct PlannerState {
-    next_idx: usize,
-    cycle_anchor_now_ms: Option<i64>,
-}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SelectedOutboundWindow {
@@ -48,9 +21,9 @@ pub struct SelectedOutboundWindow {
 }
 
 pub fn reset_outbound_window_state(db_path: &str, recorded_by: &str, peer_id: &str) {
-    with_planner_db(db_path, |db| {
-        sync_window_selected::delete(db, recorded_by, peer_id)
-    });
+    if let Ok(db) = open_connection(db_path) {
+        let _ = sync_window_selected::delete(&db, recorded_by, peer_id);
+    }
 }
 
 pub fn prime_outbound_window_kind(
@@ -59,21 +32,22 @@ pub fn prime_outbound_window_kind(
     peer_id: &str,
     kind: SyncWindowKind,
 ) {
+    use crate::event_modules::operational::sync_window_selected::TIER_ORDER;
     let idx = TIER_ORDER
         .iter()
         .position(|candidate| *candidate == kind)
         .unwrap_or(0);
-    with_planner_db(db_path, |db| {
-        sync_window_selected::store(
-            db,
+    if let Ok(db) = open_connection(db_path) {
+        let _ = sync_window_selected::store(
+            &db,
             recorded_by,
             peer_id,
             PlannerStateRow {
                 next_idx: idx,
                 cycle_anchor_now_ms: None,
             },
-        )
-    });
+        );
+    }
 }
 
 pub fn select_outbound_window(
@@ -94,26 +68,17 @@ pub fn select_outbound_window_with_planner(
     now_ms: i64,
 ) -> SelectedOutboundWindow {
     let mut planner = load_planner_state(db_path, recorded_by, peer_id);
-    let anchor_now_ms = planner.cycle_anchor_now_ms.unwrap_or(now_ms);
     if planner.cycle_anchor_now_ms.is_none() {
-        planner.cycle_anchor_now_ms = Some(anchor_now_ms);
+        planner.cycle_anchor_now_ms = Some(now_ms);
         store_planner_state(db_path, recorded_by, peer_id, planner);
     }
-    let idx = planner.next_idx % TIER_ORDER.len();
-    let kind = TIER_ORDER[idx];
     let partition_cold = should_partition_cold_windows(db_path);
-    let window = assign_window(
-        window_for_kind(kind, anchor_now_ms),
-        kind,
-        peer_id,
-        live_peer_ids,
-        anchor_now_ms,
-        partition_cold,
-    );
+    let (window, _kind) =
+        sync_window_selected::select_next_window(&planner, peer_id, live_peer_ids, now_ms, partition_cold);
     SelectedOutboundWindow {
         window,
-        planner_next_idx_before: idx,
-        planner_cycle_anchor_now_ms: Some(anchor_now_ms),
+        planner_next_idx_before: planner.next_idx,
+        planner_cycle_anchor_now_ms: planner.cycle_anchor_now_ms,
     }
 }
 
@@ -123,148 +88,21 @@ pub fn mark_outbound_window_completed(
     peer_id: &str,
     _window: SyncWindow,
 ) {
-    let mut planner = load_planner_state(db_path, recorded_by, peer_id);
-    planner.next_idx = (planner.next_idx + 1) % TIER_ORDER.len();
-    if planner.next_idx == 0 {
-        planner.cycle_anchor_now_ms = None;
+    let planner = load_planner_state(db_path, recorded_by, peer_id);
+    let advanced = sync_window_selected::advance_planner(&planner);
+    store_planner_state(db_path, recorded_by, peer_id, advanced);
+}
+
+fn load_planner_state(db_path: &str, recorded_by: &str, peer_id: &str) -> PlannerStateRow {
+    let db = open_connection(db_path).ok();
+    db.and_then(|db| sync_window_selected::load(&db, recorded_by, peer_id).ok())
+        .unwrap_or_default()
+}
+
+fn store_planner_state(db_path: &str, recorded_by: &str, peer_id: &str, state: PlannerStateRow) {
+    if let Ok(db) = open_connection(db_path) {
+        let _ = sync_window_selected::store(&db, recorded_by, peer_id, state);
     }
-    store_planner_state(db_path, recorded_by, peer_id, planner);
-}
-
-fn load_planner_state(db_path: &str, recorded_by: &str, peer_id: &str) -> PlannerState {
-    with_planner_db_result(db_path, |db| {
-        sync_window_selected::load(db, recorded_by, peer_id)
-    })
-    .map(|row| PlannerState {
-        next_idx: row.next_idx,
-        cycle_anchor_now_ms: row.cycle_anchor_now_ms,
-    })
-    .unwrap_or(PlannerState {
-        next_idx: 0,
-        cycle_anchor_now_ms: None,
-    })
-}
-
-fn store_planner_state(db_path: &str, recorded_by: &str, peer_id: &str, state: PlannerState) {
-    with_planner_db(db_path, |db| {
-        sync_window_selected::store(
-            db,
-            recorded_by,
-            peer_id,
-            PlannerStateRow {
-                next_idx: state.next_idx,
-                cycle_anchor_now_ms: state.cycle_anchor_now_ms,
-            },
-        )
-    });
-}
-
-fn with_planner_db<F>(db_path: &str, op: F)
-where
-    F: FnOnce(&rusqlite::Connection) -> rusqlite::Result<()>,
-{
-    let _ = with_planner_db_result(db_path, op);
-}
-
-fn with_planner_db_result<T, F>(db_path: &str, op: F) -> Option<T>
-where
-    F: FnOnce(&rusqlite::Connection) -> rusqlite::Result<T>,
-{
-    let db = open_connection(db_path).ok()?;
-    op(&db).ok()
-}
-
-fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
-    match kind {
-        SyncWindowKind::Full => SyncWindow {
-            kind,
-            ts_min_inclusive_ms: Some(ALL_START_MS),
-            ts_max_exclusive_ms: Some(now_ms - TWELVE_WEEK_MS),
-        },
-        SyncWindowKind::LastDay => SyncWindow {
-            kind,
-            ts_min_inclusive_ms: Some(now_ms - DAY_MS),
-            ts_max_exclusive_ms: None,
-        },
-        SyncWindowKind::LastWeek => SyncWindow {
-            kind,
-            ts_min_inclusive_ms: Some(now_ms - WEEK_MS),
-            ts_max_exclusive_ms: Some(now_ms - DAY_MS),
-        },
-        SyncWindowKind::LastTwelveWeeks => SyncWindow {
-            kind,
-            ts_min_inclusive_ms: Some(now_ms - TWELVE_WEEK_MS),
-            ts_max_exclusive_ms: Some(now_ms - WEEK_MS),
-        },
-    }
-}
-
-pub fn is_hot_window(kind: SyncWindowKind) -> bool {
-    matches!(kind, SyncWindowKind::LastDay)
-}
-
-fn normalized_live_peers(peer_id: &str, live_peer_ids: &[String]) -> Vec<String> {
-    let mut peers = live_peer_ids.to_vec();
-    if !peers.iter().any(|candidate| candidate == peer_id) {
-        peers.push(peer_id.to_string());
-    }
-    peers.sort();
-    peers.dedup();
-    peers
-}
-
-fn partition_window_bounds(window: SyncWindow, now_ms: i64) -> Option<(i64, i64)> {
-    let start = window.ts_min()?;
-    let end = window.ts_max_exclusive().unwrap_or(now_ms);
-    (start < end).then_some((start, end))
-}
-
-fn partition_window(
-    window: SyncWindow,
-    peer_rank: usize,
-    peer_count: usize,
-    now_ms: i64,
-) -> SyncWindow {
-    if peer_count <= 1 {
-        return window;
-    }
-    let Some((start, end)) = partition_window_bounds(window, now_ms) else {
-        return window;
-    };
-    let width = end.saturating_sub(start);
-    if width <= 1 {
-        return window;
-    }
-
-    let oldest_slot = peer_count.saturating_sub(peer_rank + 1);
-    let slice_start = start + (width * oldest_slot as i64) / peer_count as i64;
-    let slice_end = start + (width * (oldest_slot + 1) as i64) / peer_count as i64;
-    SyncWindow {
-        kind: window.kind,
-        ts_min_inclusive_ms: Some(slice_start),
-        ts_max_exclusive_ms: Some(slice_end.max(slice_start)),
-    }
-}
-
-fn assign_window(
-    window: SyncWindow,
-    kind: SyncWindowKind,
-    peer_id: &str,
-    live_peer_ids: &[String],
-    now_ms: i64,
-    partition_cold: bool,
-) -> SyncWindow {
-    if is_hot_window(kind) {
-        return window;
-    }
-    if !partition_cold {
-        return window;
-    }
-    let peers = normalized_live_peers(peer_id, live_peer_ids);
-    let Some(peer_rank) = peers.iter().position(|candidate| candidate == peer_id) else {
-        return window;
-    };
-    partition_window(window, peer_rank, peers.len(), now_ms)
 }
 
 fn should_partition_cold_windows(db_path: &str) -> bool {
@@ -275,16 +113,6 @@ fn should_partition_cold_windows(db_path: &str) -> bool {
         .query_row("SELECT COUNT(*) FROM messages", [], |row| row.get(0))
         .unwrap_or(0);
     message_count <= COLD_PARTITION_MAX_LOCAL_MESSAGES
-}
-
-impl SyncWindow {
-    pub fn ts_min(self) -> Option<i64> {
-        self.ts_min_inclusive_ms
-    }
-
-    pub fn ts_max_exclusive(self) -> Option<i64> {
-        self.ts_max_exclusive_ms
-    }
 }
 
 pub fn encode_initial_neg_open(window: SyncWindow, inner: Vec<u8>) -> Vec<u8> {
@@ -355,6 +183,15 @@ pub fn decode_initial_neg_open(msg: &[u8]) -> Result<(SyncWindow, &[u8]), String
 mod tests {
     use super::*;
     use crate::db::{open_connection, schema::create_tables};
+    // Import policy functions from the event family for test assertions
+    use crate::event_modules::operational::sync_window_selected::{
+        select_next_window, advance_planner, window_for_kind, TIER_ORDER,
+    };
+
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+    const WEEK_MS: i64 = 7 * DAY_MS;
+    const TWELVE_WEEK_MS: i64 = 12 * WEEK_MS;
+    const ALL_START_MS: i64 = 0;
 
     fn temp_db_path(label: &str) -> (tempfile::TempDir, String) {
         let dir = tempfile::Builder::new().prefix(label).tempdir().unwrap();

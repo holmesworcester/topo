@@ -3,6 +3,165 @@ use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 use crate::db::queue::with_sqlite_busy_retry;
 use crate::projection::contract::{SqlVal, WriteOp};
 
+// ---------------------------------------------------------------------------
+// Sync window types and selection policy (event-family-owned)
+// ---------------------------------------------------------------------------
+
+const HOUR_MS: i64 = 60 * 60 * 1000;
+const DAY_MS: i64 = 24 * HOUR_MS;
+const WEEK_MS: i64 = 7 * DAY_MS;
+const TWELVE_WEEK_MS: i64 = 12 * WEEK_MS;
+const ALL_START_MS: i64 = 0;
+
+pub const TIER_ORDER: [SyncWindowKind; 4] = [
+    SyncWindowKind::LastDay,
+    SyncWindowKind::LastWeek,
+    SyncWindowKind::LastTwelveWeeks,
+    SyncWindowKind::Full,
+];
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncWindowKind {
+    Full = 0,
+    LastDay = 1,
+    LastWeek = 2,
+    LastTwelveWeeks = 3,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SyncWindow {
+    pub kind: SyncWindowKind,
+    pub ts_min_inclusive_ms: Option<i64>,
+    pub ts_max_exclusive_ms: Option<i64>,
+}
+
+impl SyncWindow {
+    pub fn ts_min(self) -> Option<i64> {
+        self.ts_min_inclusive_ms
+    }
+    pub fn ts_max_exclusive(self) -> Option<i64> {
+        self.ts_max_exclusive_ms
+    }
+}
+
+pub fn is_hot_window(kind: SyncWindowKind) -> bool {
+    matches!(kind, SyncWindowKind::LastDay)
+}
+
+/// Pure selection: given planner state + context, deterministically select
+/// the next sync window. No I/O. This is the event-family-owned policy.
+pub fn select_next_window(
+    planner: &PlannerStateRow,
+    peer_id: &str,
+    live_peer_ids: &[String],
+    now_ms: i64,
+    partition_cold: bool,
+) -> (SyncWindow, SyncWindowKind) {
+    let anchor_now_ms = planner.cycle_anchor_now_ms.unwrap_or(now_ms);
+    let idx = planner.next_idx % TIER_ORDER.len();
+    let kind = TIER_ORDER[idx];
+    let base = window_for_kind(kind, anchor_now_ms);
+    let window = assign_window(base, kind, peer_id, live_peer_ids, anchor_now_ms, partition_cold);
+    (window, kind)
+}
+
+/// Advance planner state after a round completes.
+pub fn advance_planner(planner: &PlannerStateRow) -> PlannerStateRow {
+    let next_idx = (planner.next_idx + 1) % TIER_ORDER.len();
+    PlannerStateRow {
+        next_idx,
+        cycle_anchor_now_ms: if next_idx == 0 {
+            None
+        } else {
+            planner.cycle_anchor_now_ms
+        },
+    }
+}
+
+pub fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
+    match kind {
+        SyncWindowKind::Full => SyncWindow {
+            kind,
+            ts_min_inclusive_ms: Some(ALL_START_MS),
+            ts_max_exclusive_ms: Some(now_ms - TWELVE_WEEK_MS),
+        },
+        SyncWindowKind::LastDay => SyncWindow {
+            kind,
+            ts_min_inclusive_ms: Some(now_ms - DAY_MS),
+            ts_max_exclusive_ms: None,
+        },
+        SyncWindowKind::LastWeek => SyncWindow {
+            kind,
+            ts_min_inclusive_ms: Some(now_ms - WEEK_MS),
+            ts_max_exclusive_ms: Some(now_ms - DAY_MS),
+        },
+        SyncWindowKind::LastTwelveWeeks => SyncWindow {
+            kind,
+            ts_min_inclusive_ms: Some(now_ms - TWELVE_WEEK_MS),
+            ts_max_exclusive_ms: Some(now_ms - WEEK_MS),
+        },
+    }
+}
+
+fn normalized_live_peers(peer_id: &str, live_peer_ids: &[String]) -> Vec<String> {
+    let mut peers = live_peer_ids.to_vec();
+    if !peers.iter().any(|candidate| candidate == peer_id) {
+        peers.push(peer_id.to_string());
+    }
+    peers.sort();
+    peers.dedup();
+    peers
+}
+
+fn assign_window(
+    window: SyncWindow,
+    kind: SyncWindowKind,
+    peer_id: &str,
+    live_peer_ids: &[String],
+    now_ms: i64,
+    partition_cold: bool,
+) -> SyncWindow {
+    if is_hot_window(kind) {
+        return window;
+    }
+    if !partition_cold {
+        return window;
+    }
+    let peers = normalized_live_peers(peer_id, live_peer_ids);
+    let Some(peer_rank) = peers.iter().position(|candidate| candidate == peer_id) else {
+        return window;
+    };
+    partition_window(window, peer_rank, peers.len(), now_ms)
+}
+
+fn partition_window(
+    window: SyncWindow,
+    peer_rank: usize,
+    peer_count: usize,
+    now_ms: i64,
+) -> SyncWindow {
+    if peer_count <= 1 {
+        return window;
+    }
+    let start = window.ts_min().unwrap_or(0);
+    let end = window.ts_max_exclusive().unwrap_or(now_ms);
+    if start >= end {
+        return window;
+    }
+    let width = end.saturating_sub(start);
+    if width <= 1 {
+        return window;
+    }
+    let oldest_slot = peer_count.saturating_sub(peer_rank + 1);
+    let slice_start = start + (width * oldest_slot as i64) / peer_count as i64;
+    let slice_end = start + (width * (oldest_slot + 1) as i64) / peer_count as i64;
+    SyncWindow {
+        kind: window.kind,
+        ts_min_inclusive_ms: Some(slice_start),
+        ts_max_exclusive_ms: Some(slice_end.max(slice_start)),
+    }
+}
+
 /// Durable planner state owned by the future local `sync_window_selected`
 /// operational event family.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
