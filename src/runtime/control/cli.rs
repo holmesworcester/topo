@@ -596,7 +596,14 @@ pub(crate) enum EventAction {
     /// Show event dependency tree (requires running daemon)
     Tree,
     /// List all events with their dependencies (requires running daemon)
-    List,
+    List {
+        /// Print one event ID per line (sorted), no other fields
+        #[arg(long)]
+        ids_only: bool,
+        /// Print a BLAKE2b fingerprint of the sorted event ID set
+        #[arg(long)]
+        fingerprint: bool,
+    },
     /// Show or set event display mode (tree, list, off)
     Display {
         /// Mode to set (tree, list, off). Omit to show current mode.

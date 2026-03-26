@@ -712,10 +712,37 @@ pub(crate) fn run_event_action(
             topo::display::print_event_tree(&resp.events);
             Ok(())
         }
-        EventAction::List => {
+        EventAction::List {
+            ids_only,
+            fingerprint,
+        } => {
             let data = rpc_require_daemon(db, socket, RpcMethod::EventList)?;
             let resp: service::EventListResponse = serde_json::from_value(data)?;
-            topo::display::print_event_list(&resp.events);
+            if fingerprint || ids_only {
+                let mut ids: Vec<String> =
+                    resp.events.iter().map(|e| e.id.clone()).collect();
+                ids.sort();
+                if fingerprint {
+                    use blake2::digest::consts::U32;
+                    use blake2::{Blake2b, Digest};
+                    type Blake2b256 = Blake2b<U32>;
+                    let mut hasher = Blake2b256::new();
+                    for id in &ids {
+                        hasher.update(id.as_bytes());
+                        hasher.update(b"\n");
+                    }
+                    let result: [u8; 32] = hasher.finalize().into();
+                    println!("EVENT IDS ({}):", ids.len());
+                    println!("  fingerprint: {}", hex::encode(result));
+                } else {
+                    println!("EVENT IDS ({}):", ids.len());
+                    for id in &ids {
+                        println!("  {}", id);
+                    }
+                }
+            } else {
+                topo::display::print_event_list(&resp.events);
+            }
             Ok(())
         }
         EventAction::Display { mode } => {
