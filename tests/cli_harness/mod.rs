@@ -2553,3 +2553,111 @@ pub fn topo_assert_eventually(db: &str, predicate: &str, timeout_ms: u64) -> Out
         ],
     )
 }
+
+// ---------------------------------------------------------------------------
+// Stats + Replay helpers (Phase 7 test migration)
+// ---------------------------------------------------------------------------
+
+/// Run `topo stats --json` and parse the result as a JSON Value.
+pub fn stats_json(db: &str) -> serde_json::Value {
+    let out = Command::new(bin())
+        .args(["--db", db, "stats", "--json"])
+        .output()
+        .expect("failed to run topo stats --json");
+    assert!(
+        out.status.success(),
+        "topo stats --json failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(stdout.trim()).expect("failed to parse stats JSON")
+}
+
+/// Run all 4 replay passes and assert fingerprints match.
+/// Returns the shared fingerprint string.
+pub fn assert_replay_pass(db: &str) -> String {
+    let passes = ["forward", "idempotent", "reverse", "shuffle"];
+    let mut fingerprints: Vec<(String, String)> = Vec::new();
+    for pass in &passes {
+        let out = Command::new(bin())
+            .args(["--db", db, "replay", pass, "--json"])
+            .output()
+            .unwrap_or_else(|e| panic!("failed to run topo replay {}: {}", pass, e));
+        assert!(
+            out.status.success(),
+            "topo replay {} failed: {}",
+            pass,
+            String::from_utf8_lossy(&out.stderr)
+        );
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let data: serde_json::Value =
+            serde_json::from_str(stdout.trim()).expect("failed to parse replay JSON");
+        let fp = data["fingerprint"]
+            .as_str()
+            .expect("missing fingerprint field")
+            .to_string();
+        fingerprints.push((pass.to_string(), fp));
+    }
+    let base_fp = &fingerprints[0].1;
+    for (pass, fp) in &fingerprints[1..] {
+        assert_eq!(
+            base_fp, fp,
+            "replay fingerprint mismatch: forward={} vs {}={}",
+            base_fp, pass, fp
+        );
+    }
+    base_fp.clone()
+}
+
+/// Run `topo event blocked --json` and return parsed array.
+pub fn event_blocked_json(db: &str) -> Vec<serde_json::Value> {
+    let out = Command::new(bin())
+        .args(["--db", db, "event", "blocked", "--json"])
+        .output()
+        .expect("failed to run topo event blocked --json");
+    assert!(
+        out.status.success(),
+        "topo event blocked --json failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(stdout.trim()).unwrap_or_default()
+}
+
+/// Run `topo event list --fingerprint` and return the fingerprint string.
+pub fn event_list_fingerprint(db: &str) -> String {
+    let out = Command::new(bin())
+        .args(["--db", db, "event", "list", "--fingerprint"])
+        .output()
+        .expect("failed to run topo event list --fingerprint");
+    assert!(
+        out.status.success(),
+        "topo event list --fingerprint failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    for line in stdout.lines() {
+        if let Some(fp) = line.trim().strip_prefix("fingerprint: ") {
+            return fp.to_string();
+        }
+    }
+    panic!(
+        "no fingerprint line in event list --fingerprint output: {}",
+        stdout
+    );
+}
+
+/// Run `topo connections --json` and return parsed array.
+pub fn connections_json(db: &str) -> Vec<serde_json::Value> {
+    let out = Command::new(bin())
+        .args(["--db", db, "connections", "--json"])
+        .output()
+        .expect("failed to run topo connections --json");
+    assert!(
+        out.status.success(),
+        "topo connections --json failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(stdout.trim()).unwrap_or_default()
+}
