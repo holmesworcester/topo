@@ -225,6 +225,13 @@ pub enum RpcMethod {
         pass: String,
     },
 
+    /// Browse for peers via mDNS discovery.
+    #[cfg(feature = "discovery")]
+    Discover {
+        #[serde(default = "default_discover_timeout_ms")]
+        timeout_ms: u64,
+    },
+
     /// Run intro: connect peer_a and peer_b via this node.
     Intro {
         peer_a: String,
@@ -258,6 +265,11 @@ pub enum ForwardAction {
 
 fn default_forward_action() -> ForwardAction {
     ForwardAction::Status
+}
+
+#[cfg(feature = "discovery")]
+fn default_discover_timeout_ms() -> u64 {
+    5000
 }
 
 fn default_intro_ttl_ms() -> u64 {

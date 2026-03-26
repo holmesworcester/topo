@@ -291,6 +291,12 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"Replay","pass":"forward"}"#,
     },
     MethodInfo {
+        name: "Discover",
+        purpose: "Browse for peers via mDNS discovery",
+        params: params!["timeout_ms", "u64", false, Some("5000")],
+        example_json: r#"{"type":"Discover","timeout_ms":5000}"#,
+    },
+    MethodInfo {
         name: "Intro",
         purpose: "Run intro: connect two peers via this node",
         params: params![

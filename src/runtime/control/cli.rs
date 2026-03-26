@@ -364,6 +364,17 @@ pub(crate) enum Commands {
         action: Option<ForwardCommand>,
     },
 
+    /// Browse for peers via mDNS discovery
+    #[cfg(feature = "discovery")]
+    Discover {
+        /// Browse timeout in milliseconds
+        #[arg(long, default_value = "5000")]
+        timeout_ms: u64,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Manual sync controls: policy, round, request
     #[command(
         name = "sync",

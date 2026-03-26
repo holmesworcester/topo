@@ -1532,6 +1532,48 @@ fn dispatch(
             Err(e) => RpcResponse::error(e),
         },
 
+        #[cfg(feature = "discovery")]
+        RpcMethod::Discover { timeout_ms } => match state.require_active_peer() {
+            Ok(peer_id) => {
+                use crate::peering::discovery::{local_non_loopback_ipv4, TenantDiscovery};
+                let advertise_ip = match local_non_loopback_ipv4() {
+                    Some(ip) => ip,
+                    None => return RpcResponse::error("no routable IP for mDNS"),
+                };
+                let local_ids: std::collections::HashSet<String> =
+                    [peer_id.clone()].into_iter().collect();
+                match TenantDiscovery::new(&peer_id, 1, local_ids, &advertise_ip) {
+                    Ok(disc) => match disc.browse() {
+                        Ok(rx) => {
+                            let deadline = std::time::Instant::now()
+                                + std::time::Duration::from_millis(timeout_ms);
+                            let mut results = Vec::new();
+                            let mut seen = std::collections::HashSet::new();
+                            while std::time::Instant::now() < deadline {
+                                match rx.recv_timeout(std::time::Duration::from_millis(200)) {
+                                    Ok(peer) => {
+                                        if seen.insert(peer.peer_id.clone()) {
+                                            results.push(serde_json::json!({
+                                                "peer_id": peer.peer_id,
+                                                "addr": peer.addr.ip().to_string(),
+                                                "port": peer.addr.port(),
+                                            }));
+                                        }
+                                    }
+                                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
+                                    Err(_) => break,
+                                }
+                            }
+                            RpcResponse::success(results)
+                        }
+                        Err(e) => RpcResponse::error(format!("mDNS browse failed: {}", e)),
+                    },
+                    Err(e) => RpcResponse::error(format!("mDNS init failed: {}", e)),
+                }
+            }
+            Err(e) => RpcResponse::error(e),
+        },
+
         RpcMethod::Intro {
             peer_a,
             peer_b,
