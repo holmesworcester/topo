@@ -2211,6 +2211,7 @@ fn catalog_drift_test_method_count_matches_protocol() {
         "EventTimeline",
         "Stats",
         "Replay",
+        "Connections",
         "Discover",
         "Intro",
     ];

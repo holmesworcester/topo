@@ -1532,6 +1532,34 @@ fn dispatch(
             Err(e) => RpcResponse::error(e),
         },
 
+        RpcMethod::Connections => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .unwrap_or_default()
+                        .as_millis() as i64;
+                    match crate::db::health::list_live_endpoint_targets(&db, &recorded_by, now_ms) {
+                        Ok(targets) => {
+                            let items: Vec<serde_json::Value> = targets
+                                .into_iter()
+                                .map(|t| {
+                                    serde_json::json!({
+                                        "peer_id": t.via_peer_id,
+                                        "addr": format!("{}:{}", t.origin_ip, t.origin_port),
+                                    })
+                                })
+                                .collect();
+                            RpcResponse::success(items)
+                        }
+                        Err(e) => RpcResponse::error(e.to_string()),
+                    }
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+
         #[cfg(feature = "discovery")]
         RpcMethod::Discover { timeout_ms } => match state.require_active_peer() {
             Ok(peer_id) => {

@@ -225,6 +225,9 @@ pub enum RpcMethod {
         pass: String,
     },
 
+    /// List recent/active peer connections from endpoint observations.
+    Connections,
+
     /// Browse for peers via mDNS discovery.
     #[cfg(feature = "discovery")]
     Discover {

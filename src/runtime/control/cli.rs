@@ -364,6 +364,13 @@ pub(crate) enum Commands {
         action: Option<ForwardCommand>,
     },
 
+    /// List recent/active peer connections
+    Connections {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// Browse for peers via mDNS discovery
     #[cfg(feature = "discovery")]
     Discover {

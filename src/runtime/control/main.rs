@@ -1407,6 +1407,32 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             );
         }
 
+        Commands::Connections { json } => {
+            let data =
+                rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Connections)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data).unwrap_or_default()
+                );
+            } else if let Some(items) = data.as_array() {
+                println!("CONNECTIONS ({}):", items.len());
+                if items.is_empty() {
+                    println!("  (none)");
+                } else {
+                    for (i, item) in items.iter().enumerate() {
+                        let pid = item["peer_id"].as_str().unwrap_or("");
+                        println!(
+                            "  {}. {} at {}",
+                            i + 1,
+                            &pid[..pid.len().min(16)],
+                            item["addr"].as_str().unwrap_or("")
+                        );
+                    }
+                }
+            }
+        }
+
         #[cfg(feature = "discovery")]
         Commands::Discover { timeout_ms, json } => {
             let data = rpc_require_daemon(
