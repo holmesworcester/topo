@@ -212,6 +212,9 @@ pub enum RpcMethod {
     /// Trigger a request refill for all connected peers.
     SyncRequestAll,
 
+    /// Return all projection table counts for the active tenant.
+    Stats,
+
     /// Run intro: connect peer_a and peer_b via this node.
     Intro {
         peer_a: String,

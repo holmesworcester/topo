@@ -2207,6 +2207,7 @@ fn catalog_drift_test_method_count_matches_protocol() {
         "Upnp",
         "View",
         "EventList",
+        "Stats",
         "Intro",
     ];
 

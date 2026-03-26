@@ -889,6 +889,35 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
+        Commands::Stats { json } => {
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Stats)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data).unwrap_or_default()
+                );
+            } else {
+                println!("STATS ({}):", db);
+                let f = |key: &str| data[key].as_i64().unwrap_or(0);
+                println!("  Messages:              {}", f("message_count"));
+                println!("  Reactions:             {}", f("reaction_count"));
+                println!("  Deleted messages:      {}", f("deleted_message_count"));
+                println!("  Users:                 {}", f("user_count"));
+                println!("  Peers:                 {}", f("peer_count"));
+                println!("  Admins:                {}", f("admin_count"));
+                println!("  Workspaces:            {}", f("workspace_count"));
+                println!("  User invites:          {}", f("user_invite_count"));
+                println!("  Device invites:        {}", f("device_invite_count"));
+                println!("  Key secrets:           {}", f("key_secret_count"));
+                println!("  Events:                {}", f("event_count"));
+                println!("  Recorded events:       {}", f("recorded_event_count"));
+                println!("  Valid events:          {}", f("valid_event_count"));
+                println!("  Blocked events:        {}", f("blocked_event_count"));
+                println!("  Rejected events:       {}", f("rejected_event_count"));
+                println!("  Endpoint observations: {}", f("endpoint_observation_count"));
+            }
+        }
+
         Commands::Workspaces => {
             let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Workspaces)?;
             println!("WORKSPACES ({}):", db);

@@ -267,6 +267,12 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"EventList"}"#,
     },
     MethodInfo {
+        name: "Stats",
+        purpose: "Return all projection table counts for the active tenant",
+        params: PARAM_NONE,
+        example_json: r#"{"type":"Stats"}"#,
+    },
+    MethodInfo {
         name: "Intro",
         purpose: "Run intro: connect two peers via this node",
         params: params![

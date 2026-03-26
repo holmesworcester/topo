@@ -1435,6 +1435,38 @@ fn dispatch(
             }
         }
 
+        RpcMethod::Stats => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => {
+                    let count = |sql: &str, param: &str| -> i64 {
+                        db.query_row(sql, rusqlite::params![param], |r| r.get(0))
+                            .unwrap_or(0)
+                    };
+                    let resp = serde_json::json!({
+                        "message_count": message::count(&db, &recorded_by).unwrap_or(0),
+                        "reaction_count": reaction::count(&db, &recorded_by).unwrap_or(0),
+                        "deleted_message_count": count("SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1", &recorded_by),
+                        "user_count": user::count(&db, &recorded_by).unwrap_or(0),
+                        "peer_count": peer_shared::count(&db, &recorded_by).unwrap_or(0),
+                        "admin_count": crate::event_modules::admin::count(&db, &recorded_by).unwrap_or(0),
+                        "workspace_count": count("SELECT COUNT(*) FROM workspaces WHERE recorded_by = ?1", &recorded_by),
+                        "user_invite_count": count("SELECT COUNT(*) FROM user_invites WHERE recorded_by = ?1", &recorded_by),
+                        "device_invite_count": count("SELECT COUNT(*) FROM device_invites WHERE recorded_by = ?1", &recorded_by),
+                        "key_secret_count": count("SELECT COUNT(*) FROM key_secrets WHERE recorded_by = ?1", &recorded_by),
+                        "event_count": db.query_row("SELECT COUNT(*) FROM events", [], |r| r.get::<_, i64>(0)).unwrap_or(0),
+                        "recorded_event_count": count("SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1", &recorded_by),
+                        "valid_event_count": count("SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1", &recorded_by),
+                        "blocked_event_count": crate::db::health::blocked_event_count(&db, &recorded_by).unwrap_or(0),
+                        "rejected_event_count": count("SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1", &recorded_by),
+                        "endpoint_observation_count": count("SELECT COUNT(*) FROM peer_endpoint_observations WHERE recorded_by = ?1", &recorded_by),
+                    });
+                    RpcResponse::success(resp)
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+
         RpcMethod::Intro {
             peer_a,
             peer_b,

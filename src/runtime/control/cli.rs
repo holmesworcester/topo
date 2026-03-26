@@ -214,6 +214,13 @@ pub(crate) enum Commands {
         summary: bool,
     },
 
+    /// Show all projection table counts
+    Stats {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+
     /// List workspaces from projection
     Workspaces,
 

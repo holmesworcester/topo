@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::crypto::event_id_to_base64;
 use crate::db::{open_connection, schema::create_tables, timeline::EventTimeline};
-use crate::event_modules::{message, reaction};
+use crate::event_modules::{admin, message, peer_shared, reaction, user};
 use crate::transport::identity::load_transport_peer_id;
 
 // ---------------------------------------------------------------------------
@@ -114,6 +114,83 @@ pub fn query_field(
         "recorded_events_count" => db
             .query_row(
                 "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("query failed: {}", e)),
+        "user_count" => {
+            user::count(db, recorded_by).map_err(|e| format!("query failed: {}", e))
+        }
+        "peer_count" => {
+            peer_shared::count(db, recorded_by).map_err(|e| format!("query failed: {}", e))
+        }
+        "admin_count" => {
+            admin::count(db, recorded_by).map_err(|e| format!("query failed: {}", e))
+        }
+        "deleted_message_count" => db
+            .query_row(
+                "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("query failed: {}", e)),
+        "workspace_count" => db
+            .query_row(
+                "SELECT COUNT(*) FROM workspaces WHERE recorded_by = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("query failed: {}", e)),
+        "user_invite_count" => db
+            .query_row(
+                "SELECT COUNT(*) FROM user_invites WHERE recorded_by = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("query failed: {}", e)),
+        "device_invite_count" => db
+            .query_row(
+                "SELECT COUNT(*) FROM device_invites WHERE recorded_by = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("query failed: {}", e)),
+        "key_secret_count" => db
+            .query_row(
+                "SELECT COUNT(*) FROM key_secrets WHERE recorded_by = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("query failed: {}", e)),
+        "event_count" => db
+            .query_row("SELECT COUNT(*) FROM events", [], |row| row.get(0))
+            .map_err(|e| format!("query failed: {}", e)),
+        "recorded_event_count" => db
+            .query_row(
+                "SELECT COUNT(*) FROM recorded_events WHERE peer_id = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("query failed: {}", e)),
+        "valid_event_count" => db
+            .query_row(
+                "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("query failed: {}", e)),
+        "blocked_event_count" => crate::db::health::blocked_event_count(db, recorded_by)
+            .map_err(|e| format!("query failed: {}", e)),
+        "rejected_event_count" => db
+            .query_row(
+                "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .map_err(|e| format!("query failed: {}", e)),
+        "endpoint_observation_count" => db
+            .query_row(
+                "SELECT COUNT(*) FROM peer_endpoint_observations WHERE recorded_by = ?1",
                 rusqlite::params![recorded_by],
                 |row| row.get(0),
             )
