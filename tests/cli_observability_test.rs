@@ -269,13 +269,17 @@ fn test_event_fingerprints_converge_after_sync() {
     assert_eventually(&alice_db, "message_count == 10", timeout_ms);
     assert_eventually(&bob_db, "message_count == 10", timeout_ms);
 
-    // Fingerprints won't be identical because each peer has local-scope events
-    // (InviteAccepted, SecretKey, PeerSecret). But both should be non-empty
-    // and stable.
-    let fp_a = event_list_fingerprint(&alice_db);
-    let fp_b = event_list_fingerprint(&bob_db);
-    assert!(!fp_a.is_empty());
-    assert!(!fp_b.is_empty());
+    // Both peers should produce identical event fingerprints for the shared
+    // event set. Local-scope events (InviteAccepted, SecretKey, PeerSecret)
+    // are included in both fingerprints but each peer has its own — so we
+    // can't compare directly. Instead, verify each fingerprint is stable
+    // by re-querying and comparing to itself.
+    let fp_a1 = event_list_fingerprint(&alice_db);
+    let fp_a2 = event_list_fingerprint(&alice_db);
+    assert_eq!(fp_a1, fp_a2, "Alice's fingerprint should be stable across queries");
+    let fp_b1 = event_list_fingerprint(&bob_db);
+    let fp_b2 = event_list_fingerprint(&bob_db);
+    assert_eq!(fp_b1, fp_b2, "Bob's fingerprint should be stable across queries");
 }
 
 // ---------------------------------------------------------------------------
@@ -835,10 +839,12 @@ fn test_sub_persists_across_daemon_restart() {
     );
 }
 
-/// Encrypted message triggers subscription with decrypted content.
-/// Replaces: scenario_tests/subscription::test_encrypted_message_triggers_subscription
+/// Encrypted message appears in subscription feed after cross-peer sync.
+/// Note: this tests the cleartext CLI send path, not the internal encrypted
+/// event path. The internal test_encrypted_message_triggers_subscription
+/// remains in scenario_tests/subscription.rs for the encryption-specific path.
 #[test]
-fn test_sub_receives_encrypted_message() {
+fn test_sub_receives_synced_message() {
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
@@ -906,28 +912,31 @@ fn test_event_timeline_shows_delivery_timestamps() {
     let event_id = send_message(&alice_db, "timeline test message");
     assert_eventually(&bob_db, "message_count == 1", timeout_ms);
 
-    // Check timeline on Bob for Alice's event
-    // event_id from send_message is hex — we need to pass it as-is to timeline
+    // Check timeline on Bob for Alice's event.
+    // send_message returns hex event_id; convert to base64 for the timeline lookup.
+    let eid_bytes = hex::decode(&event_id).expect("event_id should be valid hex");
+    let eid_b64 = topo::crypto::event_id_to_base64(
+        &<[u8; 32]>::try_from(eid_bytes.as_slice()).expect("event_id should be 32 bytes"),
+    );
+
     let out = std::process::Command::new(bin())
-        .args(["--db", &bob_db, "event", "timeline", &event_id, "--json"])
+        .args(["--db", &bob_db, "event", "timeline", &eid_b64, "--json"])
         .output()
         .expect("event timeline failed");
-    // If the event ID format doesn't match, the command returns an error
-    // but the functionality is proved if message_count converges
-    if out.status.success() {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let data: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
-        // Verify timestamps exist and are ordered
-        if let (Some(recv), Some(stored), Some(proj)) = (
-            data["first_received_at_ms"].as_i64(),
-            data["first_stored_at_ms"].as_i64(),
-            data["projected_at_ms"].as_i64(),
-        ) {
-            assert!(recv > 0, "first_received_at should be positive");
-            assert!(stored >= recv, "stored should be >= received");
-            assert!(proj >= stored, "projected should be >= stored");
-        }
-    }
+    assert!(
+        out.status.success(),
+        "event timeline should succeed for synced event: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let data: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    // Verify timestamps exist and are ordered
+    let recv = data["first_received_at_ms"].as_i64().expect("missing first_received_at_ms");
+    let stored = data["first_stored_at_ms"].as_i64().expect("missing first_stored_at_ms");
+    let proj = data["projected_at_ms"].as_i64().expect("missing projected_at_ms");
+    assert!(recv > 0, "first_received_at should be positive");
+    assert!(stored >= recv, "stored ({}) should be >= received ({})", stored, recv);
+    assert!(proj >= stored, "projected ({}) should be >= stored ({})", proj, stored);
 }
 
 // ---------------------------------------------------------------------------
@@ -1545,13 +1554,13 @@ fn test_discover_finds_peer_via_mdns() {
     let timeout_ms = 60000;
 
     create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
+    let _alice = start_discovery_daemon(&alice_db);
     wait_for_daemon_ready(&alice_db, Duration::from_secs(10));
     let alice_addr = daemon_listen_addr(&alice_db);
     let invite = create_invite(&alice_db, &alice_addr);
 
     accept_invite(&bob_db, &invite);
-    let _bob = start_daemon(&bob_db);
+    let _bob = start_discovery_daemon(&bob_db);
     wait_for_daemon_ready(&bob_db, Duration::from_secs(10));
 
     assert_eventually(&alice_db, "peer_count == 2", timeout_ms);
@@ -1561,13 +1570,14 @@ fn test_discover_finds_peer_via_mdns() {
         .args(["--db", &alice_db, "discover", "--timeout-ms", "10000", "--json"])
         .output()
         .expect("discover failed");
-    if out.status.success() {
-        let stdout = String::from_utf8_lossy(&out.stdout);
-        let data: Vec<serde_json::Value> = serde_json::from_str(stdout.trim()).unwrap_or_default();
-        // We expect to discover at least one peer (possibly Bob)
-        // mDNS discovery is non-deterministic in CI, so just verify the command works
-        eprintln!("discover found {} peers", data.len());
-    }
+    assert!(
+        out.status.success(),
+        "discover command should succeed with discovery-enabled daemons: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let data: Vec<serde_json::Value> = serde_json::from_str(stdout.trim()).unwrap_or_default();
+    eprintln!("discover found {} peers", data.len());
 }
 
 // =============================================================================

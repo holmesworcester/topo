@@ -1,6 +1,61 @@
+use std::time::Duration;
 use topo::crypto::event_id_to_base64;
 use topo::db::open_connection;
-use topo::testutil::{Peer, ScenarioHarness};
+use topo::testutil::{assert_eventually, start_peers, Peer, ScenarioHarness};
+
+/// Integration test: Encrypted event syncs before key → blocks → key syncs → cascade unblocks.
+#[tokio::test]
+async fn test_encrypted_out_of_order_sync() {
+    let alice = Peer::new_with_identity("alice");
+    let bob = Peer::new_in_workspace("bob", &alice).await;
+    let harness = ScenarioHarness::new();
+    harness.track(&alice);
+    harness.track(&bob);
+    let bob_initial_keys = bob.key_secret_count();
+
+    let key_bytes: [u8; 32] = rand::random();
+    let fixed_ts = 5_000_000u64;
+    let sk_eid = alice.create_key_secret_deterministic(key_bytes, fixed_ts);
+    let enc_eid = alice.create_encrypted_message(&sk_eid, "Out of order encrypted");
+    let enc_b64 = event_id_to_base64(&enc_eid);
+    let alice_msg = alice.create_message("Normal message");
+    let alice_msg_b64 = event_id_to_base64(&alice_msg);
+    let bob_msg = bob.create_message("Bob's message");
+    let bob_msg_b64 = event_id_to_base64(&bob_msg);
+
+    let sync1 = start_peers(&alice, &bob);
+    assert_eventually(
+        || {
+            bob.has_event(&enc_b64)
+                && bob.has_event(&alice_msg_b64)
+                && alice.has_event(&bob_msg_b64)
+        },
+        Duration::from_secs(15),
+        "phase 1: both peers should have synced shared events",
+    )
+    .await;
+    drop(sync1);
+
+    assert_eq!(bob.key_secret_count(), bob_initial_keys);
+    assert_eq!(bob.scoped_message_count(), 2);
+    let bob_db = open_connection(&bob.db_path).expect("open bob db");
+    let blocked_before: i64 = bob_db
+        .query_row(
+            "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1",
+            rusqlite::params![&bob.identity],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(blocked_before >= 1, "encrypted wrapper should be blocked until key appears");
+
+    let sk_eid_bob = bob.create_key_secret_deterministic(key_bytes, fixed_ts);
+    assert_eq!(sk_eid_bob, sk_eid);
+    assert_eq!(bob.key_secret_count(), bob_initial_keys + 1);
+    assert_eq!(bob.scoped_message_count(), 3);
+    assert_eq!(alice.scoped_message_count(), 3);
+
+    harness.finish();
+}
 
 #[tokio::test]
 async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
