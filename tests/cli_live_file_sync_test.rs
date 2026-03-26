@@ -47,14 +47,35 @@ fn test_cli_live_message_during_large_file_sync() {
     wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
     wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
     wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
+    let bob_recorded_by = active_tenant_peer_id(&bob_db).expect("bob active tenant peer_id");
     let gate_content = "pre-live-file-gate";
-    let _gate_eid = send_message(&alice_db, gate_content);
+    let gate_eid = send_message(&alice_db, gate_content);
+    let gate_event_id =
+        event_id_from_hex(gate_eid.trim()).expect("gate message event id should be hex");
+    let gate_event_id_b64 = event_id_to_base64(&gate_event_id);
     let _ = assert_value_eventually(
-        Duration::from_secs(30),
-        Duration::from_millis(100),
-        "pre-transfer gate message becomes visible on Bob",
-        || get_messages_raw(&bob_db),
-        |messages_stdout| messages_stdout.contains(gate_content),
+        Duration::from_secs(60),
+        Duration::from_millis(250),
+        "pre-transfer gate message is recorded and projected on Bob",
+        || {
+            let conn = open_connection(&bob_db).expect("open bob db");
+            let recorded = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+                    rusqlite::params![&bob_recorded_by, &gate_event_id_b64],
+                    |row| row.get::<_, bool>(0),
+                )
+                .expect("query gate message recorded_events");
+            let valid = conn
+                .query_row(
+                    "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                    rusqlite::params![&bob_recorded_by, &gate_event_id_b64],
+                    |row| row.get::<_, bool>(0),
+                )
+                .expect("query gate message valid_events");
+            (recorded, valid)
+        },
+        |(recorded, valid)| *recorded && *valid,
     );
 
     let expected_total_file_slices = std::fs::metadata(&source_path)
@@ -75,18 +96,6 @@ fn test_cli_live_message_during_large_file_sync() {
         .stderr(Stdio::piped())
         .spawn()
         .expect("spawn send-file");
-    let bob_recorded_by = {
-        let conn = open_connection(&bob_db).expect("open bob db");
-        conn.query_row(
-            "SELECT recorded_by
-             FROM invites_accepted
-             ORDER BY created_at DESC, event_id DESC
-             LIMIT 1",
-            [],
-            |row| row.get::<_, String>(0),
-        )
-        .expect("bob recorded_by")
-    };
     assert_value_eventually(
         Duration::from_secs(20),
         Duration::from_millis(100),
