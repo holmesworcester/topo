@@ -1,28 +1,21 @@
 use rusqlite::Connection;
 
-use super::super::layout::common::COMMON_HEADER_BYTES;
+use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{Describe, EventError, ParsedEvent, EVENT_TYPE_CLIENT_IDLE_RESERVED};
-use super::common::{
-    expect_wire, fresh_blob, read_created_at_ms, read_text, read_u64, write_text, write_u64,
-};
+
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 
 pub const CLIENT_DB_PATH_BYTES: usize = 384;
 pub const CLIENT_SOCKET_ADDR_BYTES: usize = 96;
-pub const CLIENT_IDLE_RESERVED_WIRE_SIZE: usize = COMMON_HEADER_BYTES
-    + CLIENT_DB_PATH_BYTES
-    + CLIENT_SOCKET_ADDR_BYTES
-    + CLIENT_SOCKET_ADDR_BYTES
-    + 8;
-
-mod offsets {
-    pub const CREATED_AT: usize = 1;
-    pub const DB_PATH: usize = 9;
-    pub const CONFIGURED_BIND_ADDR: usize = DB_PATH + super::CLIENT_DB_PATH_BYTES;
-    pub const RESERVED_BIND_ADDR: usize = CONFIGURED_BIND_ADDR + super::CLIENT_SOCKET_ADDR_BYTES;
-    pub const TENANT_COUNT: usize = RESERVED_BIND_ADDR + super::CLIENT_SOCKET_ADDR_BYTES;
-}
+pub const CLIENT_IDLE_RESERVED_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::Text("db_path", CLIENT_DB_PATH_BYTES),
+    FieldSpec::Text("configured_bind_addr", CLIENT_SOCKET_ADDR_BYTES),
+    FieldSpec::Text("reserved_bind_addr", CLIENT_SOCKET_ADDR_BYTES),
+    FieldSpec::U64("tenant_count"),
+];
+pub const CLIENT_IDLE_RESERVED_WIRE_SIZE: usize = wire_size_for_fields(CLIENT_IDLE_RESERVED_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientIdleReservedEvent {
@@ -49,17 +42,12 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 pub fn parse_client_idle_reserved(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    expect_wire(
-        blob,
-        EVENT_TYPE_CLIENT_IDLE_RESERVED,
-        CLIENT_IDLE_RESERVED_WIRE_SIZE,
-    )?;
-    let created_at_ms = read_created_at_ms(blob, offsets::CREATED_AT..offsets::DB_PATH);
-    let db_path = read_text(&blob[offsets::DB_PATH..offsets::CONFIGURED_BIND_ADDR])?;
-    let configured_bind_addr =
-        read_text(&blob[offsets::CONFIGURED_BIND_ADDR..offsets::RESERVED_BIND_ADDR])?;
-    let reserved_bind_addr = read_text(&blob[offsets::RESERVED_BIND_ADDR..offsets::TENANT_COUNT])?;
-    let tenant_count = read_u64(&blob[offsets::TENANT_COUNT..offsets::TENANT_COUNT + 8]);
+    let values = decode_fields(EVENT_TYPE_CLIENT_IDLE_RESERVED, CLIENT_IDLE_RESERVED_FIELDS, blob)?;
+    let created_at_ms = values[0].as_timestamp().unwrap();
+    let db_path = values[1].as_text().unwrap().to_string();
+    let configured_bind_addr = values[2].as_text().unwrap().to_string();
+    let reserved_bind_addr = values[3].as_text().unwrap().to_string();
+    let tenant_count = values[4].as_u64().unwrap();
 
     Ok(ParsedEvent::ClientIdleReserved(ClientIdleReservedEvent {
         created_at_ms,
@@ -76,29 +64,14 @@ pub fn encode_client_idle_reserved(event: &ParsedEvent) -> Result<Vec<u8>, Event
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = fresh_blob(
-        EVENT_TYPE_CLIENT_IDLE_RESERVED,
-        CLIENT_IDLE_RESERVED_WIRE_SIZE,
-        offsets::CREATED_AT..offsets::DB_PATH,
-        reserved.created_at_ms,
-    );
-    write_text(
-        &mut buf[offsets::DB_PATH..offsets::CONFIGURED_BIND_ADDR],
-        &reserved.db_path,
-    )?;
-    write_text(
-        &mut buf[offsets::CONFIGURED_BIND_ADDR..offsets::RESERVED_BIND_ADDR],
-        &reserved.configured_bind_addr,
-    )?;
-    write_text(
-        &mut buf[offsets::RESERVED_BIND_ADDR..offsets::TENANT_COUNT],
-        &reserved.reserved_bind_addr,
-    )?;
-    write_u64(
-        &mut buf[offsets::TENANT_COUNT..offsets::TENANT_COUNT + 8],
-        reserved.tenant_count,
-    );
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(reserved.created_at_ms),
+        FieldValue::Text(reserved.db_path.clone()),
+        FieldValue::Text(reserved.configured_bind_addr.clone()),
+        FieldValue::Text(reserved.reserved_bind_addr.clone()),
+        FieldValue::U64(reserved.tenant_count),
+    ];
+    Ok(encode_fields(EVENT_TYPE_CLIENT_IDLE_RESERVED, CLIENT_IDLE_RESERVED_FIELDS, &values)?)
 }
 
 fn validate_reserved(event: &ClientIdleReservedEvent) -> Result<(), String> {

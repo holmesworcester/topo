@@ -1,31 +1,21 @@
 use rusqlite::Connection;
 
-use super::super::layout::common::COMMON_HEADER_BYTES;
+use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{Describe, EventError, ParsedEvent, EVENT_TYPE_CLIENT_STARTED};
-use super::common::{
-    expect_wire, fresh_blob, read_created_at_ms, read_optional_text, read_text, read_u64,
-    write_optional_text, write_text, write_u64,
-};
+
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 
 pub const CLIENT_DB_PATH_BYTES: usize = 384;
 pub const CLIENT_SOCKET_ADDR_BYTES: usize = 96;
-pub const CLIENT_STARTED_WIRE_SIZE: usize = COMMON_HEADER_BYTES
-    + CLIENT_DB_PATH_BYTES
-    + CLIENT_SOCKET_ADDR_BYTES
-    + CLIENT_SOCKET_ADDR_BYTES
-    + 8;
-
-mod client_started_offsets {
-    pub const CREATED_AT: usize = 1;
-    pub const DB_PATH: usize = 9;
-    pub const CONFIGURED_BIND_ADDR: usize = DB_PATH + super::CLIENT_DB_PATH_BYTES;
-    pub const RESERVED_BIND_ADDR: usize = CONFIGURED_BIND_ADDR + super::CLIENT_SOCKET_ADDR_BYTES;
-    pub const TENANT_COUNT: usize = RESERVED_BIND_ADDR + super::CLIENT_SOCKET_ADDR_BYTES;
-}
-
-use client_started_offsets as off;
+pub const CLIENT_STARTED_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::Text("db_path", CLIENT_DB_PATH_BYTES),
+    FieldSpec::Text("configured_bind_addr", CLIENT_SOCKET_ADDR_BYTES),
+    FieldSpec::OptionalText("reserved_bind_addr", CLIENT_SOCKET_ADDR_BYTES),
+    FieldSpec::U64("tenant_count"),
+];
+pub const CLIENT_STARTED_WIRE_SIZE: usize = wire_size_for_fields(CLIENT_STARTED_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientStartedEvent {
@@ -81,14 +71,12 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 pub fn parse_client_started(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    expect_wire(blob, EVENT_TYPE_CLIENT_STARTED, CLIENT_STARTED_WIRE_SIZE)?;
-
-    let created_at_ms = read_created_at_ms(blob, off::CREATED_AT..off::DB_PATH);
-    let db_path = read_text(&blob[off::DB_PATH..off::CONFIGURED_BIND_ADDR])?;
-    let configured_bind_addr =
-        read_text(&blob[off::CONFIGURED_BIND_ADDR..off::RESERVED_BIND_ADDR])?;
-    let reserved_bind_addr = read_optional_text(&blob[off::RESERVED_BIND_ADDR..off::TENANT_COUNT])?;
-    let tenant_count = read_u64(&blob[off::TENANT_COUNT..off::TENANT_COUNT + 8]);
+    let values = decode_fields(EVENT_TYPE_CLIENT_STARTED, CLIENT_STARTED_FIELDS, blob)?;
+    let created_at_ms = values[0].as_timestamp().unwrap();
+    let db_path = values[1].as_text().unwrap().to_string();
+    let configured_bind_addr = values[2].as_text().unwrap().to_string();
+    let reserved_bind_addr = values[3].as_optional_text().unwrap().map(str::to_string);
+    let tenant_count = values[4].as_u64().unwrap();
 
     Ok(ParsedEvent::ClientStarted(ClientStartedEvent {
         created_at_ms,
@@ -105,29 +93,14 @@ pub fn encode_client_started(event: &ParsedEvent) -> Result<Vec<u8>, EventError>
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = fresh_blob(
-        EVENT_TYPE_CLIENT_STARTED,
-        CLIENT_STARTED_WIRE_SIZE,
-        off::CREATED_AT..off::DB_PATH,
-        started.created_at_ms,
-    );
-    write_text(
-        &mut buf[off::DB_PATH..off::CONFIGURED_BIND_ADDR],
-        &started.db_path,
-    )?;
-    write_text(
-        &mut buf[off::CONFIGURED_BIND_ADDR..off::RESERVED_BIND_ADDR],
-        &started.configured_bind_addr,
-    )?;
-    write_optional_text(
-        &mut buf[off::RESERVED_BIND_ADDR..off::TENANT_COUNT],
-        started.reserved_bind_addr.as_deref(),
-    )?;
-    write_u64(
-        &mut buf[off::TENANT_COUNT..off::TENANT_COUNT + 8],
-        started.tenant_count,
-    );
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(started.created_at_ms),
+        FieldValue::Text(started.db_path.clone()),
+        FieldValue::Text(started.configured_bind_addr.clone()),
+        FieldValue::OptionalText(started.reserved_bind_addr.clone()),
+        FieldValue::U64(started.tenant_count),
+    ];
+    Ok(encode_fields(EVENT_TYPE_CLIENT_STARTED, CLIENT_STARTED_FIELDS, &values)?)
 }
 
 fn validate_started(event: &ClientStartedEvent) -> Result<(), String> {

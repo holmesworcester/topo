@@ -12,7 +12,7 @@ pub use queries::{
     ReactionRow, ReactionWithAuthor,
 };
 pub use wire::{
-    encode_reaction, offsets, parse_reaction, ReactionEvent, REACTION_TYPE_META, REACTION_WIRE_SIZE,
+    encode_reaction, parse_reaction, ReactionEvent, REACTION_TYPE_META, REACTION_WIRE_SIZE,
 };
 
 use rusqlite::Connection;

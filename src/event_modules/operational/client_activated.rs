@@ -1,26 +1,19 @@
 use rusqlite::Connection;
 
-use super::super::layout::common::COMMON_HEADER_BYTES;
+use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{Describe, EventError, ParsedEvent, EVENT_TYPE_CLIENT_ACTIVATED};
 use super::client_started::CLIENT_SOCKET_ADDR_BYTES;
-use super::common::{
-    expect_wire, fresh_blob, read_created_at_ms, read_event_id, read_text, read_u64,
-    write_event_id, write_text, write_u64,
-};
+
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 
-pub const CLIENT_ACTIVATED_WIRE_SIZE: usize =
-    COMMON_HEADER_BYTES + 32 + CLIENT_SOCKET_ADDR_BYTES + 8;
-
-mod client_activated_offsets {
-    pub const CREATED_AT: usize = 1;
-    pub const BASIS_EVENT_ID: usize = 9;
-    pub const LISTEN_ADDR: usize = BASIS_EVENT_ID + 32;
-    pub const TENANT_COUNT: usize = LISTEN_ADDR + super::CLIENT_SOCKET_ADDR_BYTES;
-}
-
-use client_activated_offsets as off;
+pub const CLIENT_ACTIVATED_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("basis_event_id"),
+    FieldSpec::Text("listen_addr", CLIENT_SOCKET_ADDR_BYTES),
+    FieldSpec::U64("tenant_count"),
+];
+pub const CLIENT_ACTIVATED_WIRE_SIZE: usize = wire_size_for_fields(CLIENT_ACTIVATED_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientActivatedEvent {
@@ -48,15 +41,11 @@ pub fn ensure_schema(_conn: &Connection) -> rusqlite::Result<()> {
 }
 
 pub fn parse_client_activated(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    expect_wire(
-        blob,
-        EVENT_TYPE_CLIENT_ACTIVATED,
-        CLIENT_ACTIVATED_WIRE_SIZE,
-    )?;
-    let created_at_ms = read_created_at_ms(blob, off::CREATED_AT..off::BASIS_EVENT_ID);
-    let basis_event_id = read_event_id(&blob[off::BASIS_EVENT_ID..off::LISTEN_ADDR]);
-    let listen_addr = read_text(&blob[off::LISTEN_ADDR..off::TENANT_COUNT])?;
-    let tenant_count = read_u64(&blob[off::TENANT_COUNT..off::TENANT_COUNT + 8]);
+    let values = decode_fields(EVENT_TYPE_CLIENT_ACTIVATED, CLIENT_ACTIVATED_FIELDS, blob)?;
+    let created_at_ms = values[0].as_timestamp().unwrap();
+    let basis_event_id = values[1].as_event_id().unwrap();
+    let listen_addr = values[2].as_text().unwrap().to_string();
+    let tenant_count = values[3].as_u64().unwrap();
 
     Ok(ParsedEvent::ClientActivated(ClientActivatedEvent {
         created_at_ms,
@@ -72,25 +61,13 @@ pub fn encode_client_activated(event: &ParsedEvent) -> Result<Vec<u8>, EventErro
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = fresh_blob(
-        EVENT_TYPE_CLIENT_ACTIVATED,
-        CLIENT_ACTIVATED_WIRE_SIZE,
-        off::CREATED_AT..off::BASIS_EVENT_ID,
-        activated.created_at_ms,
-    );
-    write_event_id(
-        &mut buf[off::BASIS_EVENT_ID..off::LISTEN_ADDR],
-        &activated.basis_event_id,
-    );
-    write_text(
-        &mut buf[off::LISTEN_ADDR..off::TENANT_COUNT],
-        &activated.listen_addr,
-    )?;
-    write_u64(
-        &mut buf[off::TENANT_COUNT..off::TENANT_COUNT + 8],
-        activated.tenant_count,
-    );
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(activated.created_at_ms),
+        FieldValue::EventId(activated.basis_event_id),
+        FieldValue::Text(activated.listen_addr.clone()),
+        FieldValue::U64(activated.tenant_count),
+    ];
+    Ok(encode_fields(EVENT_TYPE_CLIENT_ACTIVATED, CLIENT_ACTIVATED_FIELDS, &values)?)
 }
 
 pub fn build_projector_context(

@@ -1,12 +1,10 @@
 //! Golden-byte, negative parse, and idempotent encode/decode tests
 //! for all canonical event types with fixed wire layouts.
 
-use topo::event_modules::file::file_offsets;
 use topo::event_modules::layout::common::{
     encrypted_inner_wire_size, encrypted_wire_size, ENCRYPTED_HEADER_BYTES,
 };
-use topo::event_modules::message::layout::offsets as message_offsets;
-use topo::event_modules::reaction::offsets as reaction_offsets;
+use topo::event_modules::layout::field_spec::field_offset;
 use topo::event_modules::{
     self as events, BenchDepEvent, EncryptedEvent, EventError, FileEvent, FileSliceEvent,
     MessageEvent, ParsedEvent, ReactionEvent,
@@ -45,13 +43,14 @@ fn golden_bytes_message() {
     // content: "Hi" + zero padding
     assert_eq!(&blob[73..75], b"Hi");
     assert!(blob[75..73 + 1024].iter().all(|&b| b == 0));
-    // signed_by
-    let sb_start = message_offsets::SIGNED_BY;
+    // signed_by (field index 4 in MESSAGE_FIELDS)
+    let sb_start = field_offset(events::message::wire::MESSAGE_FIELDS, 4);
     assert_eq!(&blob[sb_start..sb_start + 32], &[0xCC; 32]);
-    // signer_type
-    assert_eq!(blob[message_offsets::SIGNER_TYPE], 5);
-    // signature
-    let sig_start = message_offsets::SIGNATURE;
+    // signer_type (field index 5)
+    let st_start = field_offset(events::message::wire::MESSAGE_FIELDS, 5);
+    assert_eq!(blob[st_start], 5);
+    // signature (field index 6)
+    let sig_start = field_offset(events::message::wire::MESSAGE_FIELDS, 6);
     assert_eq!(&blob[sig_start..sig_start + 64], &[0xDD; 64]);
 }
 
@@ -248,7 +247,7 @@ fn nonzero_padding_message_content() {
     });
     let mut blob = events::encode_event(&msg).unwrap();
     // Inject non-zero byte after NUL in content slot
-    let content_start = message_offsets::CONTENT;
+    let content_start = field_offset(events::message::wire::MESSAGE_FIELDS, 3);
     blob[content_start + 2] = 0xFF; // byte after "a\0" should be 0
     let err = events::parse_event(&blob).unwrap_err();
     assert!(matches!(err, EventError::TextSlot(_)));
@@ -266,7 +265,7 @@ fn nonzero_padding_reaction_emoji() {
         signature: [0u8; 64],
     });
     let mut blob = events::encode_event(&rxn).unwrap();
-    let emoji_start = reaction_offsets::EMOJI;
+    let emoji_start = field_offset(events::reaction::wire::REACTION_FIELDS, 3);
     blob[emoji_start + 2] = 0xFF; // after "x\0"
     let err = events::parse_event(&blob).unwrap_err();
     assert!(matches!(err, EventError::TextSlot(_)));
@@ -290,7 +289,7 @@ fn nonzero_padding_attachment_filename() {
         signature: [0u8; 64],
     });
     let mut blob = events::encode_event(&att).unwrap();
-    let fn_start = file_offsets::FILENAME;
+    let fn_start = field_offset(events::file::wire::FILE_FIELDS, 8);
     blob[fn_start + 2] = 0xFF;
     let err = events::parse_event(&blob).unwrap_err();
     assert!(matches!(err, EventError::TextSlot(_)));
@@ -314,7 +313,7 @@ fn nonzero_padding_attachment_mime() {
         signature: [0u8; 64],
     });
     let mut blob = events::encode_event(&att).unwrap();
-    let mime_start = file_offsets::MIME_TYPE;
+    let mime_start = field_offset(events::file::wire::FILE_FIELDS, 9);
     blob[mime_start + 2] = 0xFF;
     let err = events::parse_event(&blob).unwrap_err();
     assert!(matches!(err, EventError::TextSlot(_)));
@@ -334,7 +333,7 @@ fn malformed_utf8_message_content() {
         signature: [0u8; 64],
     });
     let mut blob = events::encode_event(&msg).unwrap();
-    let content_start = message_offsets::CONTENT;
+    let content_start = field_offset(events::message::wire::MESSAGE_FIELDS, 3);
     blob[content_start] = 0xFF; // invalid UTF-8 lead byte
     blob[content_start + 1] = 0xFE;
     let err = events::parse_event(&blob).unwrap_err();
@@ -353,7 +352,7 @@ fn malformed_utf8_reaction_emoji() {
         signature: [0u8; 64],
     });
     let mut blob = events::encode_event(&rxn).unwrap();
-    let emoji_start = reaction_offsets::EMOJI;
+    let emoji_start = field_offset(events::reaction::wire::REACTION_FIELDS, 3);
     blob[emoji_start] = 0xFF;
     blob[emoji_start + 1] = 0xFE;
     let err = events::parse_event(&blob).unwrap_err();

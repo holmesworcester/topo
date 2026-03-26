@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use rusqlite::Connection;
 
-use super::super::layout::common::{read_text_slot, write_text_slot, COMMON_HEADER_BYTES};
+use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{
     Describe, EventError, ParsedEvent, EVENT_TYPE_CONNECTION_PLAN_TRANSITIONED,
@@ -18,22 +18,15 @@ use crate::projection::create::{create_event_synchronous, CreateEventError};
 const OUTBOUND_CONNECTION_ENDPOINT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 pub const OUTBOUND_REMOTE_PEER_ID_BYTES: usize = 64;
 pub const OUTBOUND_REMOTE_ADDR_BYTES: usize = 96;
-pub const OUTBOUND_CONNECTION_AUTHENTICATED_WIRE_SIZE: usize = COMMON_HEADER_BYTES
-    + 32
-    + CONNECTION_ID_BYTES
-    + OUTBOUND_REMOTE_PEER_ID_BYTES
-    + OUTBOUND_REMOTE_ADDR_BYTES
-    + 1;
-
-mod offsets {
-    pub const TYPE_CODE: usize = 0;
-    pub const CREATED_AT: usize = 1;
-    pub const BASIS_EVENT_ID: usize = 9;
-    pub const CONNECTION_ID: usize = BASIS_EVENT_ID + 32;
-    pub const REMOTE_PEER_ID: usize = CONNECTION_ID + super::CONNECTION_ID_BYTES;
-    pub const REMOTE_ADDR: usize = REMOTE_PEER_ID + super::OUTBOUND_REMOTE_PEER_ID_BYTES;
-    pub const USED_BOOTSTRAP_FALLBACK: usize = REMOTE_ADDR + super::OUTBOUND_REMOTE_ADDR_BYTES;
-}
+pub const OUTBOUND_CONNECTION_AUTHENTICATED_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("basis_event_id"),
+    FieldSpec::Text("connection_id", CONNECTION_ID_BYTES),
+    FieldSpec::Text("remote_peer_id", OUTBOUND_REMOTE_PEER_ID_BYTES),
+    FieldSpec::Text("remote_addr", OUTBOUND_REMOTE_ADDR_BYTES),
+    FieldSpec::Bool("used_bootstrap_fallback"),
+];
+pub const OUTBOUND_CONNECTION_AUTHENTICATED_WIRE_SIZE: usize = wire_size_for_fields(OUTBOUND_CONNECTION_AUTHENTICATED_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundConnectionAuthenticatedEvent {
@@ -88,39 +81,13 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 pub fn parse_outbound_connection_authenticated(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < OUTBOUND_CONNECTION_AUTHENTICATED_WIRE_SIZE {
-        return Err(EventError::TooShort {
-            expected: OUTBOUND_CONNECTION_AUTHENTICATED_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > OUTBOUND_CONNECTION_AUTHENTICATED_WIRE_SIZE {
-        return Err(EventError::TrailingData {
-            expected: OUTBOUND_CONNECTION_AUTHENTICATED_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob[offsets::TYPE_CODE] != EVENT_TYPE_OUTBOUND_CONNECTION_AUTHENTICATED {
-        return Err(EventError::WrongType {
-            expected: EVENT_TYPE_OUTBOUND_CONNECTION_AUTHENTICATED,
-            actual: blob[offsets::TYPE_CODE],
-        });
-    }
-
-    let created_at_ms = u64::from_le_bytes(
-        blob[offsets::CREATED_AT..offsets::BASIS_EVENT_ID]
-            .try_into()
-            .unwrap(),
-    );
-    let mut basis_event_id = [0u8; 32];
-    basis_event_id.copy_from_slice(&blob[offsets::BASIS_EVENT_ID..offsets::CONNECTION_ID]);
-    let connection_id = read_text_slot(&blob[offsets::CONNECTION_ID..offsets::REMOTE_PEER_ID])
-        .map_err(EventError::TextSlot)?;
-    let remote_peer_id = read_text_slot(&blob[offsets::REMOTE_PEER_ID..offsets::REMOTE_ADDR])
-        .map_err(EventError::TextSlot)?;
-    let remote_addr = read_text_slot(&blob[offsets::REMOTE_ADDR..offsets::USED_BOOTSTRAP_FALLBACK])
-        .map_err(EventError::TextSlot)?;
-    let used_bootstrap_fallback = blob[offsets::USED_BOOTSTRAP_FALLBACK] != 0;
+    let values = decode_fields(EVENT_TYPE_OUTBOUND_CONNECTION_AUTHENTICATED, OUTBOUND_CONNECTION_AUTHENTICATED_FIELDS, blob)?;
+    let created_at_ms = values[0].as_timestamp().unwrap();
+    let basis_event_id = values[1].as_event_id().unwrap();
+    let connection_id = values[2].as_text().unwrap().to_string();
+    let remote_peer_id = values[3].as_text().unwrap().to_string();
+    let remote_addr = values[4].as_text().unwrap().to_string();
+    let used_bootstrap_fallback = values[5].as_bool().unwrap();
 
     Ok(ParsedEvent::OutboundConnectionAuthenticated(
         OutboundConnectionAuthenticatedEvent {
@@ -142,29 +109,15 @@ pub fn encode_outbound_connection_authenticated(
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = vec![0u8; OUTBOUND_CONNECTION_AUTHENTICATED_WIRE_SIZE];
-    buf[offsets::TYPE_CODE] = EVENT_TYPE_OUTBOUND_CONNECTION_AUTHENTICATED;
-    buf[offsets::CREATED_AT..offsets::BASIS_EVENT_ID]
-        .copy_from_slice(&authenticated.created_at_ms.to_le_bytes());
-    buf[offsets::BASIS_EVENT_ID..offsets::CONNECTION_ID]
-        .copy_from_slice(&authenticated.basis_event_id);
-    write_text_slot(
-        &authenticated.connection_id,
-        &mut buf[offsets::CONNECTION_ID..offsets::REMOTE_PEER_ID],
-    )
-    .map_err(EventError::TextSlot)?;
-    write_text_slot(
-        &authenticated.remote_peer_id,
-        &mut buf[offsets::REMOTE_PEER_ID..offsets::REMOTE_ADDR],
-    )
-    .map_err(EventError::TextSlot)?;
-    write_text_slot(
-        &authenticated.remote_addr,
-        &mut buf[offsets::REMOTE_ADDR..offsets::USED_BOOTSTRAP_FALLBACK],
-    )
-    .map_err(EventError::TextSlot)?;
-    buf[offsets::USED_BOOTSTRAP_FALLBACK] = authenticated.used_bootstrap_fallback as u8;
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(authenticated.created_at_ms),
+        FieldValue::EventId(authenticated.basis_event_id),
+        FieldValue::Text(authenticated.connection_id.clone()),
+        FieldValue::Text(authenticated.remote_peer_id.clone()),
+        FieldValue::Text(authenticated.remote_addr.clone()),
+        FieldValue::Bool(authenticated.used_bootstrap_fallback),
+    ];
+    Ok(encode_fields(EVENT_TYPE_OUTBOUND_CONNECTION_AUTHENTICATED, OUTBOUND_CONNECTION_AUTHENTICATED_FIELDS, &values)?)
 }
 
 fn validate(event: &OutboundConnectionAuthenticatedEvent) -> Result<[u8; 32], String> {

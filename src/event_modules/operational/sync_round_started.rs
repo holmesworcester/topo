@@ -1,6 +1,6 @@
 use rusqlite::{Connection, OptionalExtension};
 
-use super::super::layout::common::COMMON_HEADER_BYTES;
+use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{
     Describe, EventError, ParsedEvent, EVENT_TYPE_INBOUND_CONNECTION_AUTHENTICATED,
@@ -16,34 +16,23 @@ const CONNECTION_ID_BYTES: usize = 256;
 const TENANT_ID_BYTES: usize = 64;
 const PEER_ID_BYTES: usize = 64;
 const WINDOW_KIND_BYTES: usize = 16;
-const SYNC_ROUND_STARTED_WIRE_SIZE: usize = COMMON_HEADER_BYTES
-    + 32
-    + CONNECTION_ID_BYTES
-    + TENANT_ID_BYTES
-    + PEER_ID_BYTES
-    + 8
-    + 1
-    + WINDOW_KIND_BYTES
-    + 8
-    + 8
-    + 8
-    + 8;
 const NONE_TS_SENTINEL: i64 = i64::MIN;
 
-mod offsets {
-    pub const CREATED_AT: usize = 1;
-    pub const BASIS_EVENT_ID: usize = 9;
-    pub const CONNECTION_ID: usize = BASIS_EVENT_ID + 32;
-    pub const TENANT_ID: usize = CONNECTION_ID + super::CONNECTION_ID_BYTES;
-    pub const PEER_ID: usize = TENANT_ID + super::TENANT_ID_BYTES;
-    pub const SESSION_ID: usize = PEER_ID + super::PEER_ID_BYTES;
-    pub const ROUND_ROLE: usize = SESSION_ID + 8;
-    pub const WINDOW_KIND: usize = ROUND_ROLE + 1;
-    pub const TS_MIN: usize = WINDOW_KIND + super::WINDOW_KIND_BYTES;
-    pub const TS_MAX: usize = TS_MIN + 8;
-    pub const PLANNER_NEXT_IDX_BEFORE: usize = TS_MAX + 8;
-    pub const PLANNER_CYCLE_ANCHOR_NOW_MS: usize = PLANNER_NEXT_IDX_BEFORE + 8;
-}
+pub const SYNC_ROUND_STARTED_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("basis_event_id"),
+    FieldSpec::Text("connection_id", CONNECTION_ID_BYTES),
+    FieldSpec::Text("tenant_id", TENANT_ID_BYTES),
+    FieldSpec::Text("peer_id", PEER_ID_BYTES),
+    FieldSpec::U64("session_id"),
+    FieldSpec::U8("round_role"),
+    FieldSpec::Text("window_kind", WINDOW_KIND_BYTES),
+    FieldSpec::I64("ts_min_inclusive_ms"),
+    FieldSpec::I64("ts_max_exclusive_ms"),
+    FieldSpec::I64("planner_next_idx_before"),
+    FieldSpec::I64("planner_cycle_anchor_now_ms"),
+];
+const SYNC_ROUND_STARTED_WIRE_SIZE: usize = wire_size_for_fields(SYNC_ROUND_STARTED_FIELDS);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncRoundRole {
@@ -433,38 +422,24 @@ pub fn load_inbound_basis_for_peer(
 }
 
 pub fn parse_sync_round_started(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    super::common::expect_wire(
-        blob,
-        EVENT_TYPE_SYNC_ROUND_STARTED,
-        SYNC_ROUND_STARTED_WIRE_SIZE,
-    )?;
-
-    let created_at_ms =
-        super::common::read_created_at_ms(blob, offsets::CREATED_AT..offsets::BASIS_EVENT_ID);
-    let basis_event_id =
-        super::common::read_event_id(&blob[offsets::BASIS_EVENT_ID..offsets::CONNECTION_ID]);
-    let connection_id =
-        super::common::read_text(&blob[offsets::CONNECTION_ID..offsets::TENANT_ID])?;
-    let tenant_id = super::common::read_text(&blob[offsets::TENANT_ID..offsets::PEER_ID])?;
-    let peer_id = super::common::read_text(&blob[offsets::PEER_ID..offsets::SESSION_ID])?;
-    let session_id = super::common::read_u64(&blob[offsets::SESSION_ID..offsets::ROUND_ROLE]);
-    let round_role = SyncRoundRole::from_code(blob[offsets::ROUND_ROLE])
+    let values = decode_fields(EVENT_TYPE_SYNC_ROUND_STARTED, SYNC_ROUND_STARTED_FIELDS, blob)?;
+    let created_at_ms = values[0].as_timestamp().unwrap();
+    let basis_event_id = values[1].as_event_id().unwrap();
+    let connection_id = values[2].as_text().unwrap().to_string();
+    let tenant_id = values[3].as_text().unwrap().to_string();
+    let peer_id = values[4].as_text().unwrap().to_string();
+    let session_id = values[5].as_u64().unwrap();
+    let round_role = SyncRoundRole::from_code(values[6].as_u8().unwrap())
         .ok_or(EventError::InvalidMetadata("invalid sync round role"))?;
-    let window_kind = super::common::read_text(&blob[offsets::WINDOW_KIND..offsets::TS_MIN])?;
-    let ts_min_inclusive_ms =
-        super::common::read_optional_i64(&blob[offsets::TS_MIN..offsets::TS_MAX], NONE_TS_SENTINEL);
-    let ts_max_exclusive_ms = super::common::read_optional_i64(
-        &blob[offsets::TS_MAX..offsets::PLANNER_NEXT_IDX_BEFORE],
-        NONE_TS_SENTINEL,
-    );
-    let planner_next_idx_before = super::common::read_optional_i64(
-        &blob[offsets::PLANNER_NEXT_IDX_BEFORE..offsets::PLANNER_CYCLE_ANCHOR_NOW_MS],
-        NONE_TS_SENTINEL,
-    );
-    let planner_cycle_anchor_now_ms = super::common::read_optional_i64(
-        &blob[offsets::PLANNER_CYCLE_ANCHOR_NOW_MS..offsets::PLANNER_CYCLE_ANCHOR_NOW_MS + 8],
-        NONE_TS_SENTINEL,
-    );
+    let window_kind = values[7].as_text().unwrap().to_string();
+    let ts_min_raw = values[8].as_i64().unwrap();
+    let ts_min_inclusive_ms = (ts_min_raw != NONE_TS_SENTINEL).then_some(ts_min_raw);
+    let ts_max_raw = values[9].as_i64().unwrap();
+    let ts_max_exclusive_ms = (ts_max_raw != NONE_TS_SENTINEL).then_some(ts_max_raw);
+    let pnib_raw = values[10].as_i64().unwrap();
+    let planner_next_idx_before = (pnib_raw != NONE_TS_SENTINEL).then_some(pnib_raw);
+    let pcan_raw = values[11].as_i64().unwrap();
+    let planner_cycle_anchor_now_ms = (pcan_raw != NONE_TS_SENTINEL).then_some(pcan_raw);
 
     Ok(ParsedEvent::SyncRoundStarted(SyncRoundStartedEvent {
         created_at_ms,
@@ -481,67 +456,28 @@ pub fn parse_sync_round_started(blob: &[u8]) -> Result<ParsedEvent, EventError> 
         planner_cycle_anchor_now_ms,
     }))
 }
-
 pub fn encode_sync_round_started(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let started = match event {
         ParsedEvent::SyncRoundStarted(event) => event,
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = super::common::fresh_blob(
-        EVENT_TYPE_SYNC_ROUND_STARTED,
-        SYNC_ROUND_STARTED_WIRE_SIZE,
-        offsets::CREATED_AT..offsets::BASIS_EVENT_ID,
-        started.created_at_ms,
-    );
-    super::common::write_event_id(
-        &mut buf[offsets::BASIS_EVENT_ID..offsets::CONNECTION_ID],
-        &started.basis_event_id,
-    );
-    super::common::write_text(
-        &mut buf[offsets::CONNECTION_ID..offsets::TENANT_ID],
-        &started.connection_id,
-    )?;
-    super::common::write_text(
-        &mut buf[offsets::TENANT_ID..offsets::PEER_ID],
-        &started.tenant_id,
-    )?;
-    super::common::write_text(
-        &mut buf[offsets::PEER_ID..offsets::SESSION_ID],
-        &started.peer_id,
-    )?;
-    super::common::write_u64(
-        &mut buf[offsets::SESSION_ID..offsets::ROUND_ROLE],
-        started.session_id,
-    );
-    buf[offsets::ROUND_ROLE] = started.round_role.code();
-    super::common::write_text(
-        &mut buf[offsets::WINDOW_KIND..offsets::TS_MIN],
-        &started.window_kind,
-    )?;
-    super::common::write_optional_i64(
-        &mut buf[offsets::TS_MIN..offsets::TS_MAX],
-        started.ts_min_inclusive_ms,
-        NONE_TS_SENTINEL,
-    );
-    super::common::write_optional_i64(
-        &mut buf[offsets::TS_MAX..offsets::PLANNER_NEXT_IDX_BEFORE],
-        started.ts_max_exclusive_ms,
-        NONE_TS_SENTINEL,
-    );
-    super::common::write_optional_i64(
-        &mut buf[offsets::PLANNER_NEXT_IDX_BEFORE..offsets::PLANNER_CYCLE_ANCHOR_NOW_MS],
-        started.planner_next_idx_before,
-        NONE_TS_SENTINEL,
-    );
-    super::common::write_optional_i64(
-        &mut buf[offsets::PLANNER_CYCLE_ANCHOR_NOW_MS..offsets::PLANNER_CYCLE_ANCHOR_NOW_MS + 8],
-        started.planner_cycle_anchor_now_ms,
-        NONE_TS_SENTINEL,
-    );
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(started.created_at_ms),
+        FieldValue::EventId(started.basis_event_id),
+        FieldValue::Text(started.connection_id.clone()),
+        FieldValue::Text(started.tenant_id.clone()),
+        FieldValue::Text(started.peer_id.clone()),
+        FieldValue::U64(started.session_id),
+        FieldValue::U8(started.round_role.code()),
+        FieldValue::Text(started.window_kind.clone()),
+        FieldValue::I64(started.ts_min_inclusive_ms.unwrap_or(NONE_TS_SENTINEL)),
+        FieldValue::I64(started.ts_max_exclusive_ms.unwrap_or(NONE_TS_SENTINEL)),
+        FieldValue::I64(started.planner_next_idx_before.unwrap_or(NONE_TS_SENTINEL)),
+        FieldValue::I64(started.planner_cycle_anchor_now_ms.unwrap_or(NONE_TS_SENTINEL)),
+    ];
+    Ok(encode_fields(EVENT_TYPE_SYNC_ROUND_STARTED, SYNC_ROUND_STARTED_FIELDS, &values)?)
 }
-
 fn validate(event: &SyncRoundStartedEvent) -> Result<(), String> {
     if event.connection_id.trim().is_empty() {
         return Err("sync_round_started requires non-empty connection_id".to_string());

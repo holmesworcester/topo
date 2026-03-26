@@ -3,16 +3,13 @@ use std::sync::Arc;
 
 use rusqlite::Connection;
 
-use super::super::layout::common::COMMON_HEADER_BYTES;
+use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{
     Describe, EventError, ParsedEvent, EVENT_TYPE_CONNECTION_PLAN_TRANSITIONED,
     EVENT_TYPE_OUTBOUND_CONNECTION_FAILED,
 };
-use super::common::{
-    expect_wire, fresh_blob, read_created_at_ms, read_event_id, read_flag, read_optional_text,
-    read_text, write_event_id, write_flag, write_optional_text, write_text,
-};
+
 use super::connection_planned::{
     require_current_plan_basis, CONNECTION_ID_BYTES, CONNECTION_PLANNED_META,
 };
@@ -32,17 +29,15 @@ use super::connection_runtime::{
 
 pub const FAILURE_KIND_BYTES: usize = 64;
 pub const FAILURE_DETAIL_BYTES: usize = 128;
-pub const OUTBOUND_CONNECTION_FAILED_WIRE_SIZE: usize =
-    COMMON_HEADER_BYTES + 32 + CONNECTION_ID_BYTES + FAILURE_KIND_BYTES + FAILURE_DETAIL_BYTES + 1;
-
-mod offsets {
-    pub const CREATED_AT: usize = 1;
-    pub const BASIS_EVENT_ID: usize = 9;
-    pub const CONNECTION_ID: usize = BASIS_EVENT_ID + 32;
-    pub const FAILURE_KIND: usize = CONNECTION_ID + super::CONNECTION_ID_BYTES;
-    pub const DETAIL: usize = FAILURE_KIND + super::FAILURE_KIND_BYTES;
-    pub const USED_BOOTSTRAP_FALLBACK: usize = DETAIL + super::FAILURE_DETAIL_BYTES;
-}
+pub const OUTBOUND_CONNECTION_FAILED_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("basis_event_id"),
+    FieldSpec::Text("connection_id", CONNECTION_ID_BYTES),
+    FieldSpec::Text("failure_kind", FAILURE_KIND_BYTES),
+    FieldSpec::OptionalText("detail", FAILURE_DETAIL_BYTES),
+    FieldSpec::Bool("used_bootstrap_fallback"),
+];
+pub const OUTBOUND_CONNECTION_FAILED_WIRE_SIZE: usize = wire_size_for_fields(OUTBOUND_CONNECTION_FAILED_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundConnectionFailedEvent {
@@ -348,17 +343,13 @@ pub fn failure_kind(err: &ConnectionLifecycleError) -> &'static str {
 }
 
 pub fn parse_outbound_connection_failed(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    expect_wire(
-        blob,
-        EVENT_TYPE_OUTBOUND_CONNECTION_FAILED,
-        OUTBOUND_CONNECTION_FAILED_WIRE_SIZE,
-    )?;
-    let created_at_ms = read_created_at_ms(blob, offsets::CREATED_AT..offsets::BASIS_EVENT_ID);
-    let basis_event_id = read_event_id(&blob[offsets::BASIS_EVENT_ID..offsets::CONNECTION_ID]);
-    let connection_id = read_text(&blob[offsets::CONNECTION_ID..offsets::FAILURE_KIND])?;
-    let failure_kind = read_text(&blob[offsets::FAILURE_KIND..offsets::DETAIL])?;
-    let detail = read_optional_text(&blob[offsets::DETAIL..offsets::USED_BOOTSTRAP_FALLBACK])?;
-    let used_bootstrap_fallback = read_flag(blob, offsets::USED_BOOTSTRAP_FALLBACK);
+    let values = decode_fields(EVENT_TYPE_OUTBOUND_CONNECTION_FAILED, OUTBOUND_CONNECTION_FAILED_FIELDS, blob)?;
+    let created_at_ms = values[0].as_timestamp().unwrap();
+    let basis_event_id = values[1].as_event_id().unwrap();
+    let connection_id = values[2].as_text().unwrap().to_string();
+    let failure_kind = values[3].as_text().unwrap().to_string();
+    let detail = values[4].as_optional_text().unwrap().map(str::to_string);
+    let used_bootstrap_fallback = values[5].as_bool().unwrap();
 
     Ok(ParsedEvent::OutboundConnectionFailed(
         OutboundConnectionFailedEvent {
@@ -378,34 +369,15 @@ pub fn encode_outbound_connection_failed(event: &ParsedEvent) -> Result<Vec<u8>,
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = fresh_blob(
-        EVENT_TYPE_OUTBOUND_CONNECTION_FAILED,
-        OUTBOUND_CONNECTION_FAILED_WIRE_SIZE,
-        offsets::CREATED_AT..offsets::BASIS_EVENT_ID,
-        failed.created_at_ms,
-    );
-    write_event_id(
-        &mut buf[offsets::BASIS_EVENT_ID..offsets::CONNECTION_ID],
-        &failed.basis_event_id,
-    );
-    write_text(
-        &mut buf[offsets::CONNECTION_ID..offsets::FAILURE_KIND],
-        &failed.connection_id,
-    )?;
-    write_text(
-        &mut buf[offsets::FAILURE_KIND..offsets::DETAIL],
-        &failed.failure_kind,
-    )?;
-    write_optional_text(
-        &mut buf[offsets::DETAIL..offsets::USED_BOOTSTRAP_FALLBACK],
-        failed.detail.as_deref(),
-    )?;
-    write_flag(
-        &mut buf,
-        offsets::USED_BOOTSTRAP_FALLBACK,
-        failed.used_bootstrap_fallback,
-    );
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(failed.created_at_ms),
+        FieldValue::EventId(failed.basis_event_id),
+        FieldValue::Text(failed.connection_id.clone()),
+        FieldValue::Text(failed.failure_kind.clone()),
+        FieldValue::OptionalText(failed.detail.clone()),
+        FieldValue::Bool(failed.used_bootstrap_fallback),
+    ];
+    Ok(encode_fields(EVENT_TYPE_OUTBOUND_CONNECTION_FAILED, OUTBOUND_CONNECTION_FAILED_FIELDS, &values)?)
 }
 
 fn validate(event: &OutboundConnectionFailedEvent) -> Result<(), String> {

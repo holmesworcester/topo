@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 
-use super::super::layout::common::COMMON_HEADER_BYTES;
+use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{Describe, EventError, ParsedEvent, EVENT_TYPE_CONNECTION_PLANNED};
 use crate::db::open_connection;
@@ -18,23 +18,15 @@ pub const CONNECTION_PEER_ID_BYTES: usize = 64;
 pub const CONNECTION_REMOTE_ADDR_BYTES: usize = 96;
 pub const CONNECTION_INVITE_EVENT_ID_BYTES: usize = 64;
 
-pub const CONNECTION_PLANNED_WIRE_SIZE: usize = COMMON_HEADER_BYTES
-    + CONNECTION_ID_BYTES
-    + CONNECTION_PEER_ID_BYTES
-    + CONNECTION_REMOTE_ADDR_BYTES
-    + 1
-    + CONNECTION_INVITE_EVENT_ID_BYTES;
-
-mod connection_planned_offsets {
-    pub const CREATED_AT: usize = 1;
-    pub const CONNECTION_ID: usize = 9;
-    pub const REMOTE_PEER_ID: usize = CONNECTION_ID + super::CONNECTION_ID_BYTES;
-    pub const REMOTE_ADDR: usize = REMOTE_PEER_ID + super::CONNECTION_PEER_ID_BYTES;
-    pub const SOURCE_KIND: usize = REMOTE_ADDR + super::CONNECTION_REMOTE_ADDR_BYTES;
-    pub const INVITE_EVENT_ID: usize = SOURCE_KIND + 1;
-}
-
-use connection_planned_offsets as off;
+pub const CONNECTION_PLANNED_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::Text("connection_id", CONNECTION_ID_BYTES),
+    FieldSpec::Text("remote_peer_id", CONNECTION_PEER_ID_BYTES),
+    FieldSpec::Text("remote_addr", CONNECTION_REMOTE_ADDR_BYTES),
+    FieldSpec::U8("source_kind"),
+    FieldSpec::OptionalText("invite_event_id", CONNECTION_INVITE_EVENT_ID_BYTES),
+];
+pub const CONNECTION_PLANNED_WIRE_SIZE: usize = wire_size_for_fields(CONNECTION_PLANNED_FIELDS);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ConnectionPlanSourceKind {
@@ -262,23 +254,15 @@ fn connection_id_for_target(
 }
 
 pub fn parse_connection_planned(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    super::common::expect_wire(
-        blob,
-        EVENT_TYPE_CONNECTION_PLANNED,
-        CONNECTION_PLANNED_WIRE_SIZE,
-    )?;
-
-    let created_at_ms =
-        super::common::read_created_at_ms(blob, off::CREATED_AT..off::CONNECTION_ID);
-    let connection_id = super::common::read_text(&blob[off::CONNECTION_ID..off::REMOTE_PEER_ID])?;
-    let remote_peer_id = super::common::read_text(&blob[off::REMOTE_PEER_ID..off::REMOTE_ADDR])?;
-    let remote_addr = super::common::read_text(&blob[off::REMOTE_ADDR..off::SOURCE_KIND])?;
-    let source_kind = ConnectionPlanSourceKind::from_code(blob[off::SOURCE_KIND]).ok_or(
+    let values = decode_fields(EVENT_TYPE_CONNECTION_PLANNED, CONNECTION_PLANNED_FIELDS, blob)?;
+    let created_at_ms = values[0].as_timestamp().unwrap();
+    let connection_id = values[1].as_text().unwrap().to_string();
+    let remote_peer_id = values[2].as_text().unwrap().to_string();
+    let remote_addr = values[3].as_text().unwrap().to_string();
+    let source_kind = ConnectionPlanSourceKind::from_code(values[4].as_u8().unwrap()).ok_or(
         EventError::InvalidMetadata("invalid connection plan source kind"),
     )?;
-    let invite_event_id = super::common::read_optional_text(
-        &blob[off::INVITE_EVENT_ID..off::INVITE_EVENT_ID + CONNECTION_INVITE_EVENT_ID_BYTES],
-    )?;
+    let invite_event_id = values[5].as_optional_text().unwrap().map(str::to_string);
 
     Ok(ParsedEvent::ConnectionPlanned(ConnectionPlannedEvent {
         created_at_ms,
@@ -296,30 +280,15 @@ pub fn encode_connection_planned(event: &ParsedEvent) -> Result<Vec<u8>, EventEr
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = super::common::fresh_blob(
-        EVENT_TYPE_CONNECTION_PLANNED,
-        CONNECTION_PLANNED_WIRE_SIZE,
-        off::CREATED_AT..off::CONNECTION_ID,
-        planned.created_at_ms,
-    );
-    super::common::write_text(
-        &mut buf[off::CONNECTION_ID..off::REMOTE_PEER_ID],
-        &planned.connection_id,
-    )?;
-    super::common::write_text(
-        &mut buf[off::REMOTE_PEER_ID..off::REMOTE_ADDR],
-        &planned.remote_peer_id,
-    )?;
-    super::common::write_text(
-        &mut buf[off::REMOTE_ADDR..off::SOURCE_KIND],
-        &planned.remote_addr,
-    )?;
-    buf[off::SOURCE_KIND] = planned.source_kind.code();
-    super::common::write_optional_text(
-        &mut buf[off::INVITE_EVENT_ID..off::INVITE_EVENT_ID + CONNECTION_INVITE_EVENT_ID_BYTES],
-        planned.invite_event_id.as_deref(),
-    )?;
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(planned.created_at_ms),
+        FieldValue::Text(planned.connection_id.clone()),
+        FieldValue::Text(planned.remote_peer_id.clone()),
+        FieldValue::Text(planned.remote_addr.clone()),
+        FieldValue::U8(planned.source_kind.code()),
+        FieldValue::OptionalText(planned.invite_event_id.clone()),
+    ];
+    Ok(encode_fields(EVENT_TYPE_CONNECTION_PLANNED, CONNECTION_PLANNED_FIELDS, &values)?)
 }
 
 fn validate_planned(event: &ConnectionPlannedEvent) -> Result<(), String> {

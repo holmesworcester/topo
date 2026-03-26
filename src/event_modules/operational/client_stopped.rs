@@ -1,24 +1,18 @@
 use rusqlite::Connection;
 
-use super::super::layout::common::COMMON_HEADER_BYTES;
+use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{Describe, EventError, ParsedEvent, EVENT_TYPE_CLIENT_STOPPED};
-use super::common::{
-    expect_wire, fresh_blob, read_created_at_ms, read_event_id, read_text, write_event_id,
-    write_text,
-};
+
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 
 pub const CLIENT_STOP_REASON_BYTES: usize = 128;
-pub const CLIENT_STOPPED_WIRE_SIZE: usize = COMMON_HEADER_BYTES + 32 + CLIENT_STOP_REASON_BYTES;
-
-mod client_stopped_offsets {
-    pub const CREATED_AT: usize = 1;
-    pub const BASIS_EVENT_ID: usize = 9;
-    pub const STOP_REASON: usize = BASIS_EVENT_ID + 32;
-}
-
-use client_stopped_offsets as off;
+pub const CLIENT_STOPPED_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("basis_event_id"),
+    FieldSpec::Text("stop_reason", CLIENT_STOP_REASON_BYTES),
+];
+pub const CLIENT_STOPPED_WIRE_SIZE: usize = wire_size_for_fields(CLIENT_STOPPED_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ClientStoppedEvent {
@@ -44,11 +38,10 @@ pub fn ensure_schema(_conn: &Connection) -> rusqlite::Result<()> {
 }
 
 pub fn parse_client_stopped(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    expect_wire(blob, EVENT_TYPE_CLIENT_STOPPED, CLIENT_STOPPED_WIRE_SIZE)?;
-    let created_at_ms = read_created_at_ms(blob, off::CREATED_AT..off::BASIS_EVENT_ID);
-    let basis_event_id = read_event_id(&blob[off::BASIS_EVENT_ID..off::STOP_REASON]);
-    let stop_reason =
-        read_text(&blob[off::STOP_REASON..off::STOP_REASON + CLIENT_STOP_REASON_BYTES])?;
+    let values = decode_fields(EVENT_TYPE_CLIENT_STOPPED, CLIENT_STOPPED_FIELDS, blob)?;
+    let created_at_ms = values[0].as_timestamp().unwrap();
+    let basis_event_id = values[1].as_event_id().unwrap();
+    let stop_reason = values[2].as_text().unwrap().to_string();
 
     Ok(ParsedEvent::ClientStopped(ClientStoppedEvent {
         created_at_ms,
@@ -63,21 +56,12 @@ pub fn encode_client_stopped(event: &ParsedEvent) -> Result<Vec<u8>, EventError>
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = fresh_blob(
-        EVENT_TYPE_CLIENT_STOPPED,
-        CLIENT_STOPPED_WIRE_SIZE,
-        off::CREATED_AT..off::BASIS_EVENT_ID,
-        stopped.created_at_ms,
-    );
-    write_event_id(
-        &mut buf[off::BASIS_EVENT_ID..off::STOP_REASON],
-        &stopped.basis_event_id,
-    );
-    write_text(
-        &mut buf[off::STOP_REASON..off::STOP_REASON + CLIENT_STOP_REASON_BYTES],
-        &stopped.stop_reason,
-    )?;
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(stopped.created_at_ms),
+        FieldValue::EventId(stopped.basis_event_id),
+        FieldValue::Text(stopped.stop_reason.clone()),
+    ];
+    Ok(encode_fields(EVENT_TYPE_CLIENT_STOPPED, CLIENT_STOPPED_FIELDS, &values)?)
 }
 
 pub fn build_projector_context(

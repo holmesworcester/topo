@@ -1,20 +1,18 @@
 use rusqlite::Connection;
 
-use super::super::layout::common::COMMON_HEADER_BYTES;
+use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{Describe, EventError, ParsedEvent, EVENT_TYPE_JOB_DUE};
-use super::common::{expect_wire, fresh_blob, read_created_at_ms, read_text, write_text};
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 
 pub const JOB_KIND_BYTES: usize = 64;
 pub const CLIENT_ID_BYTES: usize = 256;
-pub const JOB_DUE_WIRE_SIZE: usize = COMMON_HEADER_BYTES + JOB_KIND_BYTES + CLIENT_ID_BYTES;
-
-mod offsets {
-    pub const CREATED_AT: usize = 1;
-    pub const JOB_KIND: usize = 9;
-    pub const CLIENT_ID: usize = JOB_KIND + super::JOB_KIND_BYTES;
-}
+pub const JOB_DUE_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::Text("job_kind", JOB_KIND_BYTES),
+    FieldSpec::Text("client_id", CLIENT_ID_BYTES),
+];
+pub const JOB_DUE_WIRE_SIZE: usize = wire_size_for_fields(JOB_DUE_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct JobDueEvent {
@@ -49,10 +47,10 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 pub fn parse_job_due(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    expect_wire(blob, EVENT_TYPE_JOB_DUE, JOB_DUE_WIRE_SIZE)?;
-    let created_at_ms = read_created_at_ms(blob, offsets::CREATED_AT..offsets::JOB_KIND);
-    let job_kind = read_text(&blob[offsets::JOB_KIND..offsets::CLIENT_ID])?;
-    let client_id = read_text(&blob[offsets::CLIENT_ID..offsets::CLIENT_ID + CLIENT_ID_BYTES])?;
+    let values = decode_fields(EVENT_TYPE_JOB_DUE, JOB_DUE_FIELDS, blob)?;
+    let created_at_ms = values[0].as_timestamp().unwrap();
+    let job_kind = values[1].as_text().unwrap().to_string();
+    let client_id = values[2].as_text().unwrap().to_string();
 
     Ok(ParsedEvent::JobDue(JobDueEvent {
         created_at_ms,
@@ -67,21 +65,12 @@ pub fn encode_job_due(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = fresh_blob(
-        EVENT_TYPE_JOB_DUE,
-        JOB_DUE_WIRE_SIZE,
-        offsets::CREATED_AT..offsets::JOB_KIND,
-        due.created_at_ms,
-    );
-    write_text(
-        &mut buf[offsets::JOB_KIND..offsets::CLIENT_ID],
-        &due.job_kind,
-    )?;
-    write_text(
-        &mut buf[offsets::CLIENT_ID..offsets::CLIENT_ID + CLIENT_ID_BYTES],
-        &due.client_id,
-    )?;
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(due.created_at_ms),
+        FieldValue::Text(due.job_kind.clone()),
+        FieldValue::Text(due.client_id.clone()),
+    ];
+    Ok(encode_fields(EVENT_TYPE_JOB_DUE, JOB_DUE_FIELDS, &values)?)
 }
 
 fn validate(event: &JobDueEvent) -> Result<(), String> {

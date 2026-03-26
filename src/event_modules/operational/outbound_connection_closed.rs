@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use rusqlite::Connection;
 
-use super::super::layout::common::{read_text_slot, write_text_slot, COMMON_HEADER_BYTES};
+use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{
     Describe, EventError, ParsedEvent, EVENT_TYPE_CONNECTION_PLAN_TRANSITIONED,
@@ -18,22 +18,15 @@ use crate::projection::create::{create_event_synchronous, CreateEventError};
 pub const CLOSE_REASON_BYTES: usize = 128;
 pub const OUTBOUND_REMOTE_PEER_ID_BYTES: usize = 64;
 pub const OUTBOUND_REMOTE_ADDR_BYTES: usize = 96;
-pub const OUTBOUND_CONNECTION_CLOSED_WIRE_SIZE: usize = COMMON_HEADER_BYTES
-    + 32
-    + CONNECTION_ID_BYTES
-    + OUTBOUND_REMOTE_PEER_ID_BYTES
-    + OUTBOUND_REMOTE_ADDR_BYTES
-    + CLOSE_REASON_BYTES;
-
-mod offsets {
-    pub const TYPE_CODE: usize = 0;
-    pub const CREATED_AT: usize = 1;
-    pub const BASIS_EVENT_ID: usize = 9;
-    pub const CONNECTION_ID: usize = BASIS_EVENT_ID + 32;
-    pub const REMOTE_PEER_ID: usize = CONNECTION_ID + super::CONNECTION_ID_BYTES;
-    pub const REMOTE_ADDR: usize = REMOTE_PEER_ID + super::OUTBOUND_REMOTE_PEER_ID_BYTES;
-    pub const CLOSE_REASON: usize = REMOTE_ADDR + super::OUTBOUND_REMOTE_ADDR_BYTES;
-}
+pub const OUTBOUND_CONNECTION_CLOSED_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("basis_event_id"),
+    FieldSpec::Text("connection_id", CONNECTION_ID_BYTES),
+    FieldSpec::Text("remote_peer_id", OUTBOUND_REMOTE_PEER_ID_BYTES),
+    FieldSpec::Text("remote_addr", OUTBOUND_REMOTE_ADDR_BYTES),
+    FieldSpec::Text("close_reason", CLOSE_REASON_BYTES),
+];
+pub const OUTBOUND_CONNECTION_CLOSED_WIRE_SIZE: usize = wire_size_for_fields(OUTBOUND_CONNECTION_CLOSED_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OutboundConnectionClosedEvent {
@@ -65,41 +58,13 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 pub fn parse_outbound_connection_closed(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < OUTBOUND_CONNECTION_CLOSED_WIRE_SIZE {
-        return Err(EventError::TooShort {
-            expected: OUTBOUND_CONNECTION_CLOSED_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > OUTBOUND_CONNECTION_CLOSED_WIRE_SIZE {
-        return Err(EventError::TrailingData {
-            expected: OUTBOUND_CONNECTION_CLOSED_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob[offsets::TYPE_CODE] != EVENT_TYPE_OUTBOUND_CONNECTION_CLOSED {
-        return Err(EventError::WrongType {
-            expected: EVENT_TYPE_OUTBOUND_CONNECTION_CLOSED,
-            actual: blob[offsets::TYPE_CODE],
-        });
-    }
-
-    let created_at_ms = u64::from_le_bytes(
-        blob[offsets::CREATED_AT..offsets::BASIS_EVENT_ID]
-            .try_into()
-            .unwrap(),
-    );
-    let mut basis_event_id = [0u8; 32];
-    basis_event_id.copy_from_slice(&blob[offsets::BASIS_EVENT_ID..offsets::CONNECTION_ID]);
-    let connection_id = read_text_slot(&blob[offsets::CONNECTION_ID..offsets::REMOTE_PEER_ID])
-        .map_err(EventError::TextSlot)?;
-    let remote_peer_id = read_text_slot(&blob[offsets::REMOTE_PEER_ID..offsets::REMOTE_ADDR])
-        .map_err(EventError::TextSlot)?;
-    let remote_addr = read_text_slot(&blob[offsets::REMOTE_ADDR..offsets::CLOSE_REASON])
-        .map_err(EventError::TextSlot)?;
-    let close_reason =
-        read_text_slot(&blob[offsets::CLOSE_REASON..offsets::CLOSE_REASON + CLOSE_REASON_BYTES])
-            .map_err(EventError::TextSlot)?;
+    let values = decode_fields(EVENT_TYPE_OUTBOUND_CONNECTION_CLOSED, OUTBOUND_CONNECTION_CLOSED_FIELDS, blob)?;
+    let created_at_ms = values[0].as_timestamp().unwrap();
+    let basis_event_id = values[1].as_event_id().unwrap();
+    let connection_id = values[2].as_text().unwrap().to_string();
+    let remote_peer_id = values[3].as_text().unwrap().to_string();
+    let remote_addr = values[4].as_text().unwrap().to_string();
+    let close_reason = values[5].as_text().unwrap().to_string();
 
     Ok(ParsedEvent::OutboundConnectionClosed(
         OutboundConnectionClosedEvent {
@@ -112,41 +77,22 @@ pub fn parse_outbound_connection_closed(blob: &[u8]) -> Result<ParsedEvent, Even
         },
     ))
 }
-
 pub fn encode_outbound_connection_closed(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let closed = match event {
         ParsedEvent::OutboundConnectionClosed(event) => event,
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = vec![0u8; OUTBOUND_CONNECTION_CLOSED_WIRE_SIZE];
-    buf[offsets::TYPE_CODE] = EVENT_TYPE_OUTBOUND_CONNECTION_CLOSED;
-    buf[offsets::CREATED_AT..offsets::BASIS_EVENT_ID]
-        .copy_from_slice(&closed.created_at_ms.to_le_bytes());
-    buf[offsets::BASIS_EVENT_ID..offsets::CONNECTION_ID].copy_from_slice(&closed.basis_event_id);
-    write_text_slot(
-        &closed.connection_id,
-        &mut buf[offsets::CONNECTION_ID..offsets::REMOTE_PEER_ID],
-    )
-    .map_err(EventError::TextSlot)?;
-    write_text_slot(
-        &closed.remote_peer_id,
-        &mut buf[offsets::REMOTE_PEER_ID..offsets::REMOTE_ADDR],
-    )
-    .map_err(EventError::TextSlot)?;
-    write_text_slot(
-        &closed.remote_addr,
-        &mut buf[offsets::REMOTE_ADDR..offsets::CLOSE_REASON],
-    )
-    .map_err(EventError::TextSlot)?;
-    write_text_slot(
-        &closed.close_reason,
-        &mut buf[offsets::CLOSE_REASON..offsets::CLOSE_REASON + CLOSE_REASON_BYTES],
-    )
-    .map_err(EventError::TextSlot)?;
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(closed.created_at_ms),
+        FieldValue::EventId(closed.basis_event_id),
+        FieldValue::Text(closed.connection_id.clone()),
+        FieldValue::Text(closed.remote_peer_id.clone()),
+        FieldValue::Text(closed.remote_addr.clone()),
+        FieldValue::Text(closed.close_reason.clone()),
+    ];
+    Ok(encode_fields(EVENT_TYPE_OUTBOUND_CONNECTION_CLOSED, OUTBOUND_CONNECTION_CLOSED_FIELDS, &values)?)
 }
-
 fn validate(event: &OutboundConnectionClosedEvent) -> Result<(), String> {
     if event.connection_id.trim().is_empty() {
         return Err("outbound_connection_closed requires non-empty connection_id".to_string());

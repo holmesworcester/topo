@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use rusqlite::Connection;
 
-use super::super::layout::common::COMMON_HEADER_BYTES;
+use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{Describe, EventError, ParsedEvent, EVENT_TYPE_MDNS_PEER_OBSERVED};
 use super::connection_planned::{emit_deterministic_connection_planned, ConnectionPlanSourceKind};
@@ -13,16 +13,12 @@ use crate::projection::create::{create_event_synchronous, CreateEventError};
 
 pub const MDNS_PEER_ID_BYTES: usize = 64;
 pub const MDNS_ADDR_BYTES: usize = 96;
-pub const MDNS_PEER_OBSERVED_WIRE_SIZE: usize =
-    COMMON_HEADER_BYTES + MDNS_PEER_ID_BYTES + MDNS_ADDR_BYTES;
-
-mod mdns_peer_observed_offsets {
-    pub const CREATED_AT: usize = 1;
-    pub const PEER_ID: usize = 9;
-    pub const ADDR: usize = PEER_ID + super::MDNS_PEER_ID_BYTES;
-}
-
-use mdns_peer_observed_offsets as off;
+pub const MDNS_PEER_OBSERVED_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::Text("peer_id", MDNS_PEER_ID_BYTES),
+    FieldSpec::Text("addr", MDNS_ADDR_BYTES),
+];
+pub const MDNS_PEER_OBSERVED_WIRE_SIZE: usize = wire_size_for_fields(MDNS_PEER_OBSERVED_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MdnsPeerObservedEvent {
@@ -59,15 +55,10 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 pub fn parse_mdns_peer_observed(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    super::common::expect_wire(
-        blob,
-        EVENT_TYPE_MDNS_PEER_OBSERVED,
-        MDNS_PEER_OBSERVED_WIRE_SIZE,
-    )?;
-
-    let created_at_ms = super::common::read_created_at_ms(blob, off::CREATED_AT..off::PEER_ID);
-    let peer_id = super::common::read_text(&blob[off::PEER_ID..off::ADDR])?;
-    let addr = super::common::read_text(&blob[off::ADDR..off::ADDR + MDNS_ADDR_BYTES])?;
+    let values = decode_fields(EVENT_TYPE_MDNS_PEER_OBSERVED, MDNS_PEER_OBSERVED_FIELDS, blob)?;
+    let created_at_ms = values[0].as_timestamp().unwrap();
+    let peer_id = values[1].as_text().unwrap().to_string();
+    let addr = values[2].as_text().unwrap().to_string();
 
     Ok(ParsedEvent::MdnsPeerObserved(MdnsPeerObservedEvent {
         created_at_ms,
@@ -82,18 +73,12 @@ pub fn encode_mdns_peer_observed(event: &ParsedEvent) -> Result<Vec<u8>, EventEr
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = super::common::fresh_blob(
-        EVENT_TYPE_MDNS_PEER_OBSERVED,
-        MDNS_PEER_OBSERVED_WIRE_SIZE,
-        off::CREATED_AT..off::PEER_ID,
-        observed.created_at_ms,
-    );
-    super::common::write_text(&mut buf[off::PEER_ID..off::ADDR], &observed.peer_id)?;
-    super::common::write_text(
-        &mut buf[off::ADDR..off::ADDR + MDNS_ADDR_BYTES],
-        &observed.addr,
-    )?;
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(observed.created_at_ms),
+        FieldValue::Text(observed.peer_id.clone()),
+        FieldValue::Text(observed.addr.clone()),
+    ];
+    Ok(encode_fields(EVENT_TYPE_MDNS_PEER_OBSERVED, MDNS_PEER_OBSERVED_FIELDS, &values)?)
 }
 
 fn validate(event: &MdnsPeerObservedEvent) -> Result<(), String> {

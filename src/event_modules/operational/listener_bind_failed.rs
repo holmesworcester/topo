@@ -1,27 +1,22 @@
 use rusqlite::Connection;
 
-use super::super::layout::common::COMMON_HEADER_BYTES;
+use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{Describe, EventError, ParsedEvent, EVENT_TYPE_LISTENER_BIND_FAILED};
 use super::client_started::CLIENT_SOCKET_ADDR_BYTES;
-use super::common::{
-    expect_wire, fresh_blob, read_created_at_ms, read_event_id, read_optional_text, read_text,
-    write_event_id, write_optional_text, write_text,
-};
+
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 
 pub const ERROR_KIND_BYTES: usize = 64;
 pub const ERROR_DETAIL_BYTES: usize = 128;
-pub const LISTENER_BIND_FAILED_WIRE_SIZE: usize =
-    COMMON_HEADER_BYTES + 32 + CLIENT_SOCKET_ADDR_BYTES + ERROR_KIND_BYTES + ERROR_DETAIL_BYTES;
-
-mod offsets {
-    pub const CREATED_AT: usize = 1;
-    pub const BASIS_EVENT_ID: usize = 9;
-    pub const BIND_ADDR: usize = BASIS_EVENT_ID + 32;
-    pub const ERROR_KIND: usize = BIND_ADDR + super::CLIENT_SOCKET_ADDR_BYTES;
-    pub const DETAIL: usize = ERROR_KIND + super::ERROR_KIND_BYTES;
-}
+pub const LISTENER_BIND_FAILED_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("basis_event_id"),
+    FieldSpec::Text("bind_addr", CLIENT_SOCKET_ADDR_BYTES),
+    FieldSpec::Text("error_kind", ERROR_KIND_BYTES),
+    FieldSpec::OptionalText("detail", ERROR_DETAIL_BYTES),
+];
+pub const LISTENER_BIND_FAILED_WIRE_SIZE: usize = wire_size_for_fields(LISTENER_BIND_FAILED_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ListenerBindFailedEvent {
@@ -55,17 +50,12 @@ pub fn ensure_schema(_conn: &Connection) -> rusqlite::Result<()> {
 }
 
 pub fn parse_listener_bind_failed(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    expect_wire(
-        blob,
-        EVENT_TYPE_LISTENER_BIND_FAILED,
-        LISTENER_BIND_FAILED_WIRE_SIZE,
-    )?;
-    let created_at_ms = read_created_at_ms(blob, offsets::CREATED_AT..offsets::BASIS_EVENT_ID);
-    let basis_event_id = read_event_id(&blob[offsets::BASIS_EVENT_ID..offsets::BIND_ADDR]);
-    let bind_addr = read_text(&blob[offsets::BIND_ADDR..offsets::ERROR_KIND])?;
-    let error_kind = read_text(&blob[offsets::ERROR_KIND..offsets::DETAIL])?;
-    let detail =
-        read_optional_text(&blob[offsets::DETAIL..offsets::DETAIL + ERROR_DETAIL_BYTES])?;
+    let values = decode_fields(EVENT_TYPE_LISTENER_BIND_FAILED, LISTENER_BIND_FAILED_FIELDS, blob)?;
+    let created_at_ms = values[0].as_timestamp().unwrap();
+    let basis_event_id = values[1].as_event_id().unwrap();
+    let bind_addr = values[2].as_text().unwrap().to_string();
+    let error_kind = values[3].as_text().unwrap().to_string();
+    let detail = values[4].as_optional_text().unwrap().map(str::to_string);
 
     Ok(ParsedEvent::ListenerBindFailed(ListenerBindFailedEvent {
         created_at_ms,
@@ -82,29 +72,14 @@ pub fn encode_listener_bind_failed(event: &ParsedEvent) -> Result<Vec<u8>, Event
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = fresh_blob(
-        EVENT_TYPE_LISTENER_BIND_FAILED,
-        LISTENER_BIND_FAILED_WIRE_SIZE,
-        offsets::CREATED_AT..offsets::BASIS_EVENT_ID,
-        failed.created_at_ms,
-    );
-    write_event_id(
-        &mut buf[offsets::BASIS_EVENT_ID..offsets::BIND_ADDR],
-        &failed.basis_event_id,
-    );
-    write_text(
-        &mut buf[offsets::BIND_ADDR..offsets::ERROR_KIND],
-        &failed.bind_addr,
-    )?;
-    write_text(
-        &mut buf[offsets::ERROR_KIND..offsets::DETAIL],
-        &failed.error_kind,
-    )?;
-    write_optional_text(
-        &mut buf[offsets::DETAIL..offsets::DETAIL + ERROR_DETAIL_BYTES],
-        failed.detail.as_deref(),
-    )?;
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(failed.created_at_ms),
+        FieldValue::EventId(failed.basis_event_id),
+        FieldValue::Text(failed.bind_addr.clone()),
+        FieldValue::Text(failed.error_kind.clone()),
+        FieldValue::OptionalText(failed.detail.clone()),
+    ];
+    Ok(encode_fields(EVENT_TYPE_LISTENER_BIND_FAILED, LISTENER_BIND_FAILED_FIELDS, &values)?)
 }
 
 fn validate(event: &ListenerBindFailedEvent) -> Result<(), String> {

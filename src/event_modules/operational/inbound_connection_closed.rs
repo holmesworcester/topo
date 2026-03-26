@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-use super::super::layout::common::{read_text_slot, write_text_slot, COMMON_HEADER_BYTES};
+use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{Describe, EventError, ParsedEvent, EVENT_TYPE_INBOUND_CONNECTION_CLOSED};
 use crate::db::open_connection;
@@ -8,20 +8,13 @@ use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, Writ
 use crate::projection::create::{create_event_synchronous, CreateEventError};
 
 pub const INBOUND_CLOSE_DETAIL_BYTES: usize = 160;
-pub const INBOUND_CONNECTION_CLOSED_WIRE_SIZE: usize = COMMON_HEADER_BYTES
-    + 32
-    + super::inbound_connection_authenticated::INBOUND_CONNECTION_ID_BYTES
-    + INBOUND_CLOSE_DETAIL_BYTES;
-
-mod offsets {
-    pub const TYPE_CODE: usize = 0;
-    pub const CREATED_AT: usize = 1;
-    pub const BASIS_EVENT_ID: usize = 9;
-    pub const CONNECTION_ID: usize = BASIS_EVENT_ID + 32;
-    pub const DETAIL: usize =
-        CONNECTION_ID
-            + crate::event_modules::operational::inbound_connection_authenticated::INBOUND_CONNECTION_ID_BYTES;
-}
+pub const INBOUND_CONNECTION_CLOSED_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("basis_event_id"),
+    FieldSpec::Text("connection_id", super::inbound_connection_authenticated::INBOUND_CONNECTION_ID_BYTES),
+    FieldSpec::OptionalText("detail", INBOUND_CLOSE_DETAIL_BYTES),
+];
+pub const INBOUND_CONNECTION_CLOSED_WIRE_SIZE: usize = wire_size_for_fields(INBOUND_CONNECTION_CLOSED_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundConnectionClosedEvent {
@@ -51,46 +44,12 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     super::inbound_connection_authenticated::ensure_schema(conn)
 }
 
-fn parse_optional_text(raw: String) -> Option<String> {
-    if raw.is_empty() {
-        None
-    } else {
-        Some(raw)
-    }
-}
-
 pub fn parse_inbound_connection_closed(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < INBOUND_CONNECTION_CLOSED_WIRE_SIZE {
-        return Err(EventError::TooShort {
-            expected: INBOUND_CONNECTION_CLOSED_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > INBOUND_CONNECTION_CLOSED_WIRE_SIZE {
-        return Err(EventError::TrailingData {
-            expected: INBOUND_CONNECTION_CLOSED_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob[offsets::TYPE_CODE] != EVENT_TYPE_INBOUND_CONNECTION_CLOSED {
-        return Err(EventError::WrongType {
-            expected: EVENT_TYPE_INBOUND_CONNECTION_CLOSED,
-            actual: blob[offsets::TYPE_CODE],
-        });
-    }
-
-    let created_at_ms = u64::from_le_bytes(
-        blob[offsets::CREATED_AT..offsets::BASIS_EVENT_ID]
-            .try_into()
-            .unwrap(),
-    );
-    let mut basis_event_id = [0u8; 32];
-    basis_event_id.copy_from_slice(&blob[offsets::BASIS_EVENT_ID..offsets::CONNECTION_ID]);
-    let connection_id = read_text_slot(&blob[offsets::CONNECTION_ID..offsets::DETAIL])
-        .map_err(EventError::TextSlot)?;
-    let detail = parse_optional_text(
-        read_text_slot(&blob[offsets::DETAIL..]).map_err(EventError::TextSlot)?,
-    );
+    let values = decode_fields(EVENT_TYPE_INBOUND_CONNECTION_CLOSED, INBOUND_CONNECTION_CLOSED_FIELDS, blob)?;
+    let created_at_ms = values[0].as_timestamp().unwrap();
+    let basis_event_id = values[1].as_event_id().unwrap();
+    let connection_id = values[2].as_text().unwrap().to_string();
+    let detail = values[3].as_optional_text().unwrap().map(str::to_string);
 
     Ok(ParsedEvent::InboundConnectionClosed(
         InboundConnectionClosedEvent {
@@ -101,31 +60,20 @@ pub fn parse_inbound_connection_closed(blob: &[u8]) -> Result<ParsedEvent, Event
         },
     ))
 }
-
 pub fn encode_inbound_connection_closed(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let closed = match event {
         ParsedEvent::InboundConnectionClosed(event) => event,
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = vec![0u8; INBOUND_CONNECTION_CLOSED_WIRE_SIZE];
-    buf[offsets::TYPE_CODE] = EVENT_TYPE_INBOUND_CONNECTION_CLOSED;
-    buf[offsets::CREATED_AT..offsets::BASIS_EVENT_ID]
-        .copy_from_slice(&closed.created_at_ms.to_le_bytes());
-    buf[offsets::BASIS_EVENT_ID..offsets::CONNECTION_ID].copy_from_slice(&closed.basis_event_id);
-    write_text_slot(
-        &closed.connection_id,
-        &mut buf[offsets::CONNECTION_ID..offsets::DETAIL],
-    )
-    .map_err(EventError::TextSlot)?;
-    write_text_slot(
-        closed.detail.as_deref().unwrap_or(""),
-        &mut buf[offsets::DETAIL..],
-    )
-    .map_err(EventError::TextSlot)?;
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(closed.created_at_ms),
+        FieldValue::EventId(closed.basis_event_id),
+        FieldValue::Text(closed.connection_id.clone()),
+        FieldValue::OptionalText(closed.detail.clone()),
+    ];
+    Ok(encode_fields(EVENT_TYPE_INBOUND_CONNECTION_CLOSED, INBOUND_CONNECTION_CLOSED_FIELDS, &values)?)
 }
-
 pub fn build_projector_context(
     conn: &Connection,
     recorded_by: &str,

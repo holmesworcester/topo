@@ -4,7 +4,7 @@ pub mod wire;
 
 // Re-export stable public API so callers import from `event_modules::file`.
 pub use projector::project_pure;
-pub use wire::{encode_file, file_offsets, parse_file, FileEvent, FILE_META, FILE_WIRE_SIZE};
+pub use wire::{encode_file, parse_file, FileEvent, FILE_META, FILE_WIRE_SIZE};
 
 use rusqlite::Connection;
 

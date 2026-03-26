@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-use super::super::layout::common::COMMON_HEADER_BYTES;
+use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{Describe, EventError, ParsedEvent, EVENT_TYPE_CONNECTION_PLAN_TRANSITIONED};
 use super::connection_planned::{
@@ -11,19 +11,15 @@ use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, Writ
 use crate::projection::create::CreateEventError;
 
 pub const CONNECTION_TRANSITION_REASON_BYTES: usize = 128;
-pub const CONNECTION_PLAN_TRANSITIONED_WIRE_SIZE: usize =
-    COMMON_HEADER_BYTES + 32 + CONNECTION_ID_BYTES + 1 + 8 + CONNECTION_TRANSITION_REASON_BYTES;
-
-mod connection_plan_transitioned_offsets {
-    pub const CREATED_AT: usize = 1;
-    pub const BASIS_EVENT_ID: usize = 9;
-    pub const CONNECTION_ID: usize = BASIS_EVENT_ID + 32;
-    pub const STATUS: usize = CONNECTION_ID + super::CONNECTION_ID_BYTES;
-    pub const RETRY_AFTER_MS: usize = STATUS + 1;
-    pub const REASON: usize = RETRY_AFTER_MS + 8;
-}
-
-use connection_plan_transitioned_offsets as off;
+pub const CONNECTION_PLAN_TRANSITIONED_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("basis_event_id"),
+    FieldSpec::Text("connection_id", CONNECTION_ID_BYTES),
+    FieldSpec::U8("status"),
+    FieldSpec::U64("retry_after_ms"),
+    FieldSpec::OptionalText("reason", CONNECTION_TRANSITION_REASON_BYTES),
+];
+pub const CONNECTION_PLAN_TRANSITIONED_WIRE_SIZE: usize = wire_size_for_fields(CONNECTION_PLAN_TRANSITIONED_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ConnectionPlanTransitionedEvent {
@@ -79,24 +75,15 @@ pub fn ensure_schema(_conn: &Connection) -> rusqlite::Result<()> {
 }
 
 pub fn parse_connection_plan_transitioned(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    super::common::expect_wire(
-        blob,
-        EVENT_TYPE_CONNECTION_PLAN_TRANSITIONED,
-        CONNECTION_PLAN_TRANSITIONED_WIRE_SIZE,
-    )?;
-
-    let created_at_ms =
-        super::common::read_created_at_ms(blob, off::CREATED_AT..off::BASIS_EVENT_ID);
-    let basis_event_id =
-        super::common::read_event_id(&blob[off::BASIS_EVENT_ID..off::CONNECTION_ID]);
-    let connection_id = super::common::read_text(&blob[off::CONNECTION_ID..off::STATUS])?;
-    let new_status = status_from_code(blob[off::STATUS]).ok_or(EventError::InvalidMetadata(
+    let values = decode_fields(EVENT_TYPE_CONNECTION_PLAN_TRANSITIONED, CONNECTION_PLAN_TRANSITIONED_FIELDS, blob)?;
+    let created_at_ms = values[0].as_timestamp().unwrap();
+    let basis_event_id = values[1].as_event_id().unwrap();
+    let connection_id = values[2].as_text().unwrap().to_string();
+    let new_status = status_from_code(values[3].as_u8().unwrap()).ok_or(EventError::InvalidMetadata(
         "invalid connection plan status",
     ))?;
-    let retry_after_ms = super::common::read_u64(&blob[off::RETRY_AFTER_MS..off::REASON]);
-    let decision_reason = super::common::read_optional_text(
-        &blob[off::REASON..off::REASON + CONNECTION_TRANSITION_REASON_BYTES],
-    )?;
+    let retry_after_ms = values[4].as_u64().unwrap();
+    let decision_reason = values[5].as_optional_text().unwrap().map(str::to_string);
 
     Ok(ParsedEvent::ConnectionPlanTransitioned(
         ConnectionPlanTransitionedEvent {
@@ -116,30 +103,15 @@ pub fn encode_connection_plan_transitioned(event: &ParsedEvent) -> Result<Vec<u8
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = super::common::fresh_blob(
-        EVENT_TYPE_CONNECTION_PLAN_TRANSITIONED,
-        CONNECTION_PLAN_TRANSITIONED_WIRE_SIZE,
-        off::CREATED_AT..off::BASIS_EVENT_ID,
-        transitioned.created_at_ms,
-    );
-    super::common::write_event_id(
-        &mut buf[off::BASIS_EVENT_ID..off::CONNECTION_ID],
-        &transitioned.basis_event_id,
-    );
-    super::common::write_text(
-        &mut buf[off::CONNECTION_ID..off::STATUS],
-        &transitioned.connection_id,
-    )?;
-    buf[off::STATUS] = status_code(transitioned.new_status);
-    super::common::write_u64(
-        &mut buf[off::RETRY_AFTER_MS..off::REASON],
-        transitioned.retry_after_ms,
-    );
-    super::common::write_optional_text(
-        &mut buf[off::REASON..off::REASON + CONNECTION_TRANSITION_REASON_BYTES],
-        transitioned.decision_reason.as_deref(),
-    )?;
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(transitioned.created_at_ms),
+        FieldValue::EventId(transitioned.basis_event_id),
+        FieldValue::Text(transitioned.connection_id.clone()),
+        FieldValue::U8(status_code(transitioned.new_status)),
+        FieldValue::U64(transitioned.retry_after_ms),
+        FieldValue::OptionalText(transitioned.decision_reason.clone()),
+    ];
+    Ok(encode_fields(EVENT_TYPE_CONNECTION_PLAN_TRANSITIONED, CONNECTION_PLAN_TRANSITIONED_FIELDS, &values)?)
 }
 
 fn validate_transition(event: &ConnectionPlanTransitionedEvent) -> Result<(), String> {

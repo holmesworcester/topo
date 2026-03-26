@@ -1,4 +1,4 @@
-use super::super::layout::common::{COMMON_HEADER_BYTES, SIGNATURE_TRAILER_BYTES};
+use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{EventError, ParsedEvent, EVENT_TYPE_MESSAGE_DELETION};
 
@@ -20,8 +20,15 @@ impl super::super::Describe for MessageDeletionEvent {
 
 /// MessageDeletion (type 7): type(1) + created_at(8) + target_event_id(32) + author_id(32)
 ///                          + signed_by(32) + signer_type(1) + signature(64) = 170
-pub const MESSAGE_DELETION_WIRE_SIZE: usize =
-    COMMON_HEADER_BYTES + 32 + 32 + SIGNATURE_TRAILER_BYTES;
+pub const MESSAGE_DELETION_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("target_event_id"),
+    FieldSpec::EventId("author_id"),
+    FieldSpec::EventId("signed_by"),
+    FieldSpec::U8("signer_type"),
+    FieldSpec::FixedBytes("signature", 64),
+];
+pub const MESSAGE_DELETION_WIRE_SIZE: usize = wire_size_for_fields(MESSAGE_DELETION_FIELDS);
 
 /// Wire format (170 bytes fixed, signed):
 /// [0]      type_code = 7
@@ -33,40 +40,14 @@ pub const MESSAGE_DELETION_WIRE_SIZE: usize =
 /// [105]     signer_type (1 byte)
 /// [106..170] signature (64 bytes)
 pub fn parse_message_deletion(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < MESSAGE_DELETION_WIRE_SIZE {
-        return Err(EventError::TooShort {
-            expected: MESSAGE_DELETION_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > MESSAGE_DELETION_WIRE_SIZE {
-        return Err(EventError::TrailingData {
-            expected: MESSAGE_DELETION_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob[0] != EVENT_TYPE_MESSAGE_DELETION {
-        return Err(EventError::WrongType {
-            expected: EVENT_TYPE_MESSAGE_DELETION,
-            actual: blob[0],
-        });
-    }
-
-    let created_at_ms = u64::from_le_bytes(blob[1..9].try_into().unwrap());
-
-    let mut target_event_id = [0u8; 32];
-    target_event_id.copy_from_slice(&blob[9..41]);
-
-    let mut author_id = [0u8; 32];
-    author_id.copy_from_slice(&blob[41..73]);
-
-    let mut signed_by = [0u8; 32];
-    signed_by.copy_from_slice(&blob[73..105]);
-
-    let signer_type = blob[105];
-
+    let values = decode_fields(EVENT_TYPE_MESSAGE_DELETION, MESSAGE_DELETION_FIELDS, blob)?;
+    let created_at_ms = values[0].as_timestamp().unwrap();
+    let target_event_id = values[1].as_event_id().unwrap();
+    let author_id = values[2].as_event_id().unwrap();
+    let signed_by = values[3].as_event_id().unwrap();
+    let signer_type = values[4].as_u8().unwrap();
     let mut signature = [0u8; 64];
-    signature.copy_from_slice(&blob[106..170]);
+    signature.copy_from_slice(values[5].as_fixed_bytes().unwrap());
 
     Ok(ParsedEvent::MessageDeletion(MessageDeletionEvent {
         created_at_ms,
@@ -84,15 +65,15 @@ pub fn encode_message_deletion(event: &ParsedEvent) -> Result<Vec<u8>, EventErro
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = Vec::with_capacity(MESSAGE_DELETION_WIRE_SIZE);
-    buf.push(EVENT_TYPE_MESSAGE_DELETION);
-    buf.extend_from_slice(&del.created_at_ms.to_le_bytes());
-    buf.extend_from_slice(&del.target_event_id);
-    buf.extend_from_slice(&del.author_id);
-    buf.extend_from_slice(&del.signed_by);
-    buf.push(del.signer_type);
-    buf.extend_from_slice(&del.signature);
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(del.created_at_ms),
+        FieldValue::EventId(del.target_event_id),
+        FieldValue::EventId(del.author_id),
+        FieldValue::EventId(del.signed_by),
+        FieldValue::U8(del.signer_type),
+        FieldValue::FixedBytes(del.signature.to_vec()),
+    ];
+    Ok(encode_fields(EVENT_TYPE_MESSAGE_DELETION, MESSAGE_DELETION_FIELDS, &values)?)
 }
 
 pub static MESSAGE_DELETION_META: EventTypeMeta = EventTypeMeta {

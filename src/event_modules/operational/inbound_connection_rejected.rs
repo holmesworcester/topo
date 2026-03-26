@@ -2,7 +2,7 @@ use std::net::SocketAddr;
 
 use rusqlite::Connection;
 
-use super::super::layout::common::{read_text_slot, write_text_slot, COMMON_HEADER_BYTES};
+use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{Describe, EventError, ParsedEvent, EVENT_TYPE_INBOUND_CONNECTION_REJECTED};
 use crate::crypto::event_id_to_base64;
@@ -12,33 +12,18 @@ use crate::projection::create::{create_event_synchronous, CreateEventError};
 
 pub const INBOUND_REJECTION_KIND_BYTES: usize = 64;
 pub const INBOUND_REJECTION_DETAIL_BYTES: usize = 160;
-pub const INBOUND_CONNECTION_REJECTED_WIRE_SIZE: usize = COMMON_HEADER_BYTES
-    + 32
-    + super::inbound_connection_authenticated::INBOUND_CONNECTION_ID_BYTES
-    + super::inbound_connection_authenticated::INBOUND_TENANT_ID_BYTES
-    + super::inbound_connection_authenticated::INBOUND_REQUESTED_LOCAL_PEER_ID_BYTES
-    + super::inbound_connection_authenticated::INBOUND_REMOTE_PEER_ID_BYTES
-    + super::inbound_connection_authenticated::INBOUND_REMOTE_ADDR_BYTES
-    + INBOUND_REJECTION_KIND_BYTES
-    + INBOUND_REJECTION_DETAIL_BYTES;
-
-mod offsets {
-    pub const TYPE_CODE: usize = 0;
-    pub const CREATED_AT: usize = 1;
-    pub const BASIS_EVENT_ID: usize = 9;
-    pub const CONNECTION_ID: usize = BASIS_EVENT_ID + 32;
-    pub const TENANT_ID: usize =
-        CONNECTION_ID + crate::event_modules::operational::inbound_connection_authenticated::INBOUND_CONNECTION_ID_BYTES;
-    pub const REQUESTED_LOCAL_TRANSPORT_PEER_ID: usize =
-        TENANT_ID + crate::event_modules::operational::inbound_connection_authenticated::INBOUND_TENANT_ID_BYTES;
-    pub const REMOTE_PEER_ID: usize = REQUESTED_LOCAL_TRANSPORT_PEER_ID
-        + crate::event_modules::operational::inbound_connection_authenticated::INBOUND_REQUESTED_LOCAL_PEER_ID_BYTES;
-    pub const REMOTE_ADDR: usize = REMOTE_PEER_ID
-        + crate::event_modules::operational::inbound_connection_authenticated::INBOUND_REMOTE_PEER_ID_BYTES;
-    pub const REJECTION_KIND: usize = REMOTE_ADDR
-        + crate::event_modules::operational::inbound_connection_authenticated::INBOUND_REMOTE_ADDR_BYTES;
-    pub const DETAIL: usize = REJECTION_KIND + super::INBOUND_REJECTION_KIND_BYTES;
-}
+pub const INBOUND_CONNECTION_REJECTED_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("basis_event_id"),
+    FieldSpec::Text("connection_id", super::inbound_connection_authenticated::INBOUND_CONNECTION_ID_BYTES),
+    FieldSpec::OptionalText("tenant_id", super::inbound_connection_authenticated::INBOUND_TENANT_ID_BYTES),
+    FieldSpec::OptionalText("requested_local_transport_peer_id", super::inbound_connection_authenticated::INBOUND_REQUESTED_LOCAL_PEER_ID_BYTES),
+    FieldSpec::Text("remote_peer_id", super::inbound_connection_authenticated::INBOUND_REMOTE_PEER_ID_BYTES),
+    FieldSpec::Text("remote_addr", super::inbound_connection_authenticated::INBOUND_REMOTE_ADDR_BYTES),
+    FieldSpec::Text("rejection_kind", INBOUND_REJECTION_KIND_BYTES),
+    FieldSpec::OptionalText("detail", INBOUND_REJECTION_DETAIL_BYTES),
+];
+pub const INBOUND_CONNECTION_REJECTED_WIRE_SIZE: usize = wire_size_for_fields(INBOUND_CONNECTION_REJECTED_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct InboundConnectionRejectedEvent {
@@ -82,60 +67,17 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     super::inbound_connection_authenticated::ensure_schema(conn)
 }
 
-fn parse_optional_text(raw: String) -> Option<String> {
-    if raw.is_empty() {
-        None
-    } else {
-        Some(raw)
-    }
-}
-
 pub fn parse_inbound_connection_rejected(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < INBOUND_CONNECTION_REJECTED_WIRE_SIZE {
-        return Err(EventError::TooShort {
-            expected: INBOUND_CONNECTION_REJECTED_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > INBOUND_CONNECTION_REJECTED_WIRE_SIZE {
-        return Err(EventError::TrailingData {
-            expected: INBOUND_CONNECTION_REJECTED_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob[offsets::TYPE_CODE] != EVENT_TYPE_INBOUND_CONNECTION_REJECTED {
-        return Err(EventError::WrongType {
-            expected: EVENT_TYPE_INBOUND_CONNECTION_REJECTED,
-            actual: blob[offsets::TYPE_CODE],
-        });
-    }
-
-    let created_at_ms = u64::from_le_bytes(
-        blob[offsets::CREATED_AT..offsets::BASIS_EVENT_ID]
-            .try_into()
-            .unwrap(),
-    );
-    let mut basis_event_id = [0u8; 32];
-    basis_event_id.copy_from_slice(&blob[offsets::BASIS_EVENT_ID..offsets::CONNECTION_ID]);
-    let connection_id = read_text_slot(&blob[offsets::CONNECTION_ID..offsets::TENANT_ID])
-        .map_err(EventError::TextSlot)?;
-    let tenant_id = parse_optional_text(
-        read_text_slot(&blob[offsets::TENANT_ID..offsets::REQUESTED_LOCAL_TRANSPORT_PEER_ID])
-            .map_err(EventError::TextSlot)?,
-    );
-    let requested_local_transport_peer_id = parse_optional_text(
-        read_text_slot(&blob[offsets::REQUESTED_LOCAL_TRANSPORT_PEER_ID..offsets::REMOTE_PEER_ID])
-            .map_err(EventError::TextSlot)?,
-    );
-    let remote_peer_id = read_text_slot(&blob[offsets::REMOTE_PEER_ID..offsets::REMOTE_ADDR])
-        .map_err(EventError::TextSlot)?;
-    let remote_addr = read_text_slot(&blob[offsets::REMOTE_ADDR..offsets::REJECTION_KIND])
-        .map_err(EventError::TextSlot)?;
-    let rejection_kind = read_text_slot(&blob[offsets::REJECTION_KIND..offsets::DETAIL])
-        .map_err(EventError::TextSlot)?;
-    let detail = parse_optional_text(
-        read_text_slot(&blob[offsets::DETAIL..]).map_err(EventError::TextSlot)?,
-    );
+    let values = decode_fields(EVENT_TYPE_INBOUND_CONNECTION_REJECTED, INBOUND_CONNECTION_REJECTED_FIELDS, blob)?;
+    let created_at_ms = values[0].as_timestamp().unwrap();
+    let basis_event_id = values[1].as_event_id().unwrap();
+    let connection_id = values[2].as_text().unwrap().to_string();
+    let tenant_id = values[3].as_optional_text().unwrap().map(str::to_string);
+    let requested_local_transport_peer_id = values[4].as_optional_text().unwrap().map(str::to_string);
+    let remote_peer_id = values[5].as_text().unwrap().to_string();
+    let remote_addr = values[6].as_text().unwrap().to_string();
+    let rejection_kind = values[7].as_text().unwrap().to_string();
+    let detail = values[8].as_optional_text().unwrap().map(str::to_string);
 
     Ok(ParsedEvent::InboundConnectionRejected(
         InboundConnectionRejectedEvent {
@@ -151,59 +93,25 @@ pub fn parse_inbound_connection_rejected(blob: &[u8]) -> Result<ParsedEvent, Eve
         },
     ))
 }
-
 pub fn encode_inbound_connection_rejected(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let rejected = match event {
         ParsedEvent::InboundConnectionRejected(event) => event,
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = vec![0u8; INBOUND_CONNECTION_REJECTED_WIRE_SIZE];
-    buf[offsets::TYPE_CODE] = EVENT_TYPE_INBOUND_CONNECTION_REJECTED;
-    buf[offsets::CREATED_AT..offsets::BASIS_EVENT_ID]
-        .copy_from_slice(&rejected.created_at_ms.to_le_bytes());
-    buf[offsets::BASIS_EVENT_ID..offsets::CONNECTION_ID].copy_from_slice(&rejected.basis_event_id);
-    write_text_slot(
-        &rejected.connection_id,
-        &mut buf[offsets::CONNECTION_ID..offsets::TENANT_ID],
-    )
-    .map_err(EventError::TextSlot)?;
-    write_text_slot(
-        rejected.tenant_id.as_deref().unwrap_or(""),
-        &mut buf[offsets::TENANT_ID..offsets::REQUESTED_LOCAL_TRANSPORT_PEER_ID],
-    )
-    .map_err(EventError::TextSlot)?;
-    write_text_slot(
-        rejected
-            .requested_local_transport_peer_id
-            .as_deref()
-            .unwrap_or(""),
-        &mut buf[offsets::REQUESTED_LOCAL_TRANSPORT_PEER_ID..offsets::REMOTE_PEER_ID],
-    )
-    .map_err(EventError::TextSlot)?;
-    write_text_slot(
-        &rejected.remote_peer_id,
-        &mut buf[offsets::REMOTE_PEER_ID..offsets::REMOTE_ADDR],
-    )
-    .map_err(EventError::TextSlot)?;
-    write_text_slot(
-        &rejected.remote_addr,
-        &mut buf[offsets::REMOTE_ADDR..offsets::REJECTION_KIND],
-    )
-    .map_err(EventError::TextSlot)?;
-    write_text_slot(
-        &rejected.rejection_kind,
-        &mut buf[offsets::REJECTION_KIND..offsets::DETAIL],
-    )
-    .map_err(EventError::TextSlot)?;
-    write_text_slot(
-        rejected.detail.as_deref().unwrap_or(""),
-        &mut buf[offsets::DETAIL..],
-    )
-    .map_err(EventError::TextSlot)?;
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(rejected.created_at_ms),
+        FieldValue::EventId(rejected.basis_event_id),
+        FieldValue::Text(rejected.connection_id.clone()),
+        FieldValue::OptionalText(rejected.tenant_id.clone()),
+        FieldValue::OptionalText(rejected.requested_local_transport_peer_id.clone()),
+        FieldValue::Text(rejected.remote_peer_id.clone()),
+        FieldValue::Text(rejected.remote_addr.clone()),
+        FieldValue::Text(rejected.rejection_kind.clone()),
+        FieldValue::OptionalText(rejected.detail.clone()),
+    ];
+    Ok(encode_fields(EVENT_TYPE_INBOUND_CONNECTION_REJECTED, INBOUND_CONNECTION_REJECTED_FIELDS, &values)?)
 }
-
 fn validate(event: &InboundConnectionRejectedEvent) -> Result<(), String> {
     if event.connection_id.trim().is_empty() {
         return Err("inbound_connection_rejected requires non-empty connection_id".to_string());

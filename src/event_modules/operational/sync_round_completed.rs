@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-use super::super::layout::common::{read_text_slot, write_text_slot, COMMON_HEADER_BYTES};
+use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{
     Describe, EventError, ParsedEvent, EVENT_TYPE_SYNC_ROUND_COMPLETED,
@@ -12,22 +12,19 @@ use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, Writ
 use crate::projection::create::{create_event_synchronous, CreateEventError};
 
 const DETAIL_BYTES: usize = 160;
-const SYNC_ROUND_COMPLETED_WIRE_SIZE: usize =
-    COMMON_HEADER_BYTES + 32 + 1 + DETAIL_BYTES + 8 + 8 + 8 + 8 + 8 + 8;
-
-mod offsets {
-    pub const TYPE_CODE: usize = 0;
-    pub const CREATED_AT: usize = 1;
-    pub const BASIS_EVENT_ID: usize = 9;
-    pub const OUTCOME: usize = BASIS_EVENT_ID + 32;
-    pub const DETAIL: usize = OUTCOME + 1;
-    pub const EVENTS_SENT: usize = DETAIL + super::DETAIL_BYTES;
-    pub const EVENTS_RECEIVED: usize = EVENTS_SENT + 8;
-    pub const NEG_ROUNDS: usize = EVENTS_RECEIVED + 8;
-    pub const BYTES_SENT: usize = NEG_ROUNDS + 8;
-    pub const BYTES_RECEIVED: usize = BYTES_SENT + 8;
-    pub const DURATION_MS: usize = BYTES_RECEIVED + 8;
-}
+pub const SYNC_ROUND_COMPLETED_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("basis_event_id"),
+    FieldSpec::U8("outcome"),
+    FieldSpec::OptionalText("detail", DETAIL_BYTES),
+    FieldSpec::I64("events_sent"),
+    FieldSpec::I64("events_received"),
+    FieldSpec::I64("neg_rounds"),
+    FieldSpec::I64("bytes_sent"),
+    FieldSpec::I64("bytes_received"),
+    FieldSpec::I64("duration_ms"),
+];
+const SYNC_ROUND_COMPLETED_WIRE_SIZE: usize = wire_size_for_fields(SYNC_ROUND_COMPLETED_FIELDS);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncRoundOutcome {
@@ -104,114 +101,52 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 pub fn parse_sync_round_completed(blob: &[u8]) -> Result<ParsedEvent, EventError> {
-    if blob.len() < SYNC_ROUND_COMPLETED_WIRE_SIZE {
-        return Err(EventError::TooShort {
-            expected: SYNC_ROUND_COMPLETED_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob.len() > SYNC_ROUND_COMPLETED_WIRE_SIZE {
-        return Err(EventError::TrailingData {
-            expected: SYNC_ROUND_COMPLETED_WIRE_SIZE,
-            actual: blob.len(),
-        });
-    }
-    if blob[offsets::TYPE_CODE] != EVENT_TYPE_SYNC_ROUND_COMPLETED {
-        return Err(EventError::WrongType {
-            expected: EVENT_TYPE_SYNC_ROUND_COMPLETED,
-            actual: blob[offsets::TYPE_CODE],
-        });
-    }
-
-    let created_at_ms = u64::from_le_bytes(
-        blob[offsets::CREATED_AT..offsets::BASIS_EVENT_ID]
-            .try_into()
-            .unwrap(),
-    );
-    let mut basis_event_id = [0u8; 32];
-    basis_event_id.copy_from_slice(&blob[offsets::BASIS_EVENT_ID..offsets::OUTCOME]);
-    let outcome = SyncRoundOutcome::from_code(blob[offsets::OUTCOME])
+    let values = decode_fields(EVENT_TYPE_SYNC_ROUND_COMPLETED, SYNC_ROUND_COMPLETED_FIELDS, blob)?;
+    let created_at_ms = values[0].as_timestamp().unwrap();
+    let basis_event_id = values[1].as_event_id().unwrap();
+    let outcome = SyncRoundOutcome::from_code(values[2].as_u8().unwrap())
         .ok_or(EventError::InvalidMetadata("invalid sync round outcome"))?;
-    let detail = {
-        let raw = read_text_slot(&blob[offsets::DETAIL..offsets::EVENTS_SENT])
-            .map_err(EventError::TextSlot)?;
-        if raw.is_empty() {
-            None
-        } else {
-            Some(raw)
-        }
-    };
+    let detail = values[3].as_optional_text().unwrap().map(str::to_string);
+    let events_sent = values[4].as_i64().unwrap();
+    let events_received = values[5].as_i64().unwrap();
+    let neg_rounds = values[6].as_i64().unwrap();
+    let bytes_sent = values[7].as_i64().unwrap();
+    let bytes_received = values[8].as_i64().unwrap();
+    let duration_ms = values[9].as_i64().unwrap();
 
     Ok(ParsedEvent::SyncRoundCompleted(SyncRoundCompletedEvent {
         created_at_ms,
         basis_event_id,
         outcome,
         detail,
-        events_sent: i64::from_le_bytes(
-            blob[offsets::EVENTS_SENT..offsets::EVENTS_RECEIVED]
-                .try_into()
-                .unwrap(),
-        ),
-        events_received: i64::from_le_bytes(
-            blob[offsets::EVENTS_RECEIVED..offsets::NEG_ROUNDS]
-                .try_into()
-                .unwrap(),
-        ),
-        neg_rounds: i64::from_le_bytes(
-            blob[offsets::NEG_ROUNDS..offsets::BYTES_SENT]
-                .try_into()
-                .unwrap(),
-        ),
-        bytes_sent: i64::from_le_bytes(
-            blob[offsets::BYTES_SENT..offsets::BYTES_RECEIVED]
-                .try_into()
-                .unwrap(),
-        ),
-        bytes_received: i64::from_le_bytes(
-            blob[offsets::BYTES_RECEIVED..offsets::DURATION_MS]
-                .try_into()
-                .unwrap(),
-        ),
-        duration_ms: i64::from_le_bytes(
-            blob[offsets::DURATION_MS..offsets::DURATION_MS + 8]
-                .try_into()
-                .unwrap(),
-        ),
+        events_sent,
+        events_received,
+        neg_rounds,
+        bytes_sent,
+        bytes_received,
+        duration_ms,
     }))
 }
-
 pub fn encode_sync_round_completed(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let completed = match event {
         ParsedEvent::SyncRoundCompleted(event) => event,
         _ => return Err(EventError::WrongVariant),
     };
 
-    let mut buf = vec![0u8; SYNC_ROUND_COMPLETED_WIRE_SIZE];
-    buf[offsets::TYPE_CODE] = EVENT_TYPE_SYNC_ROUND_COMPLETED;
-    buf[offsets::CREATED_AT..offsets::BASIS_EVENT_ID]
-        .copy_from_slice(&completed.created_at_ms.to_le_bytes());
-    buf[offsets::BASIS_EVENT_ID..offsets::OUTCOME].copy_from_slice(&completed.basis_event_id);
-    buf[offsets::OUTCOME] = completed.outcome.code();
-    write_text_slot(
-        completed.detail.as_deref().unwrap_or(""),
-        &mut buf[offsets::DETAIL..offsets::EVENTS_SENT],
-    )
-    .map_err(EventError::TextSlot)?;
-    buf[offsets::EVENTS_SENT..offsets::EVENTS_RECEIVED]
-        .copy_from_slice(&completed.events_sent.to_le_bytes());
-    buf[offsets::EVENTS_RECEIVED..offsets::NEG_ROUNDS]
-        .copy_from_slice(&completed.events_received.to_le_bytes());
-    buf[offsets::NEG_ROUNDS..offsets::BYTES_SENT]
-        .copy_from_slice(&completed.neg_rounds.to_le_bytes());
-    buf[offsets::BYTES_SENT..offsets::BYTES_RECEIVED]
-        .copy_from_slice(&completed.bytes_sent.to_le_bytes());
-    buf[offsets::BYTES_RECEIVED..offsets::DURATION_MS]
-        .copy_from_slice(&completed.bytes_received.to_le_bytes());
-    buf[offsets::DURATION_MS..offsets::DURATION_MS + 8]
-        .copy_from_slice(&completed.duration_ms.to_le_bytes());
-    Ok(buf)
+    let values = vec![
+        FieldValue::Timestamp(completed.created_at_ms),
+        FieldValue::EventId(completed.basis_event_id),
+        FieldValue::U8(completed.outcome.code()),
+        FieldValue::OptionalText(completed.detail.clone()),
+        FieldValue::I64(completed.events_sent),
+        FieldValue::I64(completed.events_received),
+        FieldValue::I64(completed.neg_rounds),
+        FieldValue::I64(completed.bytes_sent),
+        FieldValue::I64(completed.bytes_received),
+        FieldValue::I64(completed.duration_ms),
+    ];
+    Ok(encode_fields(EVENT_TYPE_SYNC_ROUND_COMPLETED, SYNC_ROUND_COMPLETED_FIELDS, &values)?)
 }
-
 fn validate(event: &SyncRoundCompletedEvent) -> Result<(), String> {
     if event.events_sent < 0
         || event.events_received < 0
