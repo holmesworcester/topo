@@ -694,11 +694,23 @@ async fn run_target_dispatcher(
 ) -> Result<(), String> {
     let mut dispatcher = PeerDispatcher::new();
     let mut tenant_contexts = tenant_contexts;
-    let mut active_workers: HashMap<String, ActiveConnectWorker> = HashMap::new();
+    let mut reconciler = super::reconciler::ConnectionReconciler::new();
     let (mut wake_rx, _wake_guard) = crate::state::operational_wake::register(&db_path);
 
     loop {
-        reap_finished_connect_workers(&db_path, &mut active_workers, &mut dispatcher).await;
+        {
+            let finished = reconciler.reap_finished();
+            for conn_id in &finished {
+                dispatcher.forget(conn_id);
+                let _ = emit_connection_plan_transition(
+                    &db_path,
+                    conn_id,
+                    ConnectionPlanStatus::Finished,
+                    "worker_completed",
+                    0,
+                );
+            }
+        }
         let conn = open_connection(&db_path).map_err(|e| e.to_string())?;
         let claimed = load_due_effects(&conn, 16).map_err(|e| e.to_string())?;
         drop(conn);
@@ -767,7 +779,7 @@ async fn run_target_dispatcher(
 
             if matches!(target.source_kind, ConnectionPlanSourceKind::Bootstrap) {
                 let known_peer_key = target.known_peer_key();
-                if active_workers.contains_key(&known_peer_key) {
+                if reconciler.has_worker(&known_peer_key) {
                     // Query the existing plan's source_kind from projected state
                     // instead of keeping it in the worker handle.
                     let existing_source = {
@@ -794,7 +806,7 @@ async fn run_target_dispatcher(
                 }
             }
 
-            if active_workers.contains_key(&connection_plan_id) {
+            if reconciler.has_worker(&connection_plan_id) {
                 let existing_source = {
                     let conn = open_connection(&db_path).map_err(|e| e.to_string())?;
                     load_connection_plan(&conn, &connection_plan_id)
@@ -852,16 +864,23 @@ async fn run_target_dispatcher(
                 ConnectionPlanSourceKind::ObservedPeer | ConnectionPlanSourceKind::Discovery
             ) {
                 let prefix = target.bootstrap_worker_prefix();
-                cancel_bootstrap_workers_for_prefix(
-                    &db_path,
-                    &mut active_workers,
-                    &mut dispatcher,
-                    &prefix,
-                )
-                .await;
+                for key in reconciler.keys_with_prefix(&prefix) {
+                    if let Some(handle) = reconciler.take(&key) {
+                        let _ = emit_connection_plan_transition(
+                            &db_path,
+                            &key,
+                            ConnectionPlanStatus::Superseded,
+                            "steady_state_target_replaced_bootstrap",
+                            0,
+                        );
+                        handle.cancel.cancel();
+                        let _ = tokio::task::spawn_blocking(move || { let _ = handle.join.join(); }).await;
+                        dispatcher.forget(&key);
+                    }
+                }
             }
 
-            if let Some(existing) = active_workers.remove(&connection_plan_id) {
+            if let Some(existing) = reconciler.take(&connection_plan_id) {
                 let _ = emit_connection_plan_transition(
                     &db_path,
                     &connection_plan_id,
@@ -870,7 +889,7 @@ async fn run_target_dispatcher(
                     0,
                 );
                 existing.cancel.cancel();
-                join_connect_worker(existing).await;
+                let _ = tokio::task::spawn_blocking(move || { let _ = existing.join.join(); }).await;
             }
 
             let context = if let Some(context) = tenant_contexts.get(&target.tenant_id).cloned() {
@@ -957,9 +976,9 @@ async fn run_target_dispatcher(
                 }
             });
 
-            active_workers.insert(
+            reconciler.register(
                 connection_plan_id.clone(),
-                ActiveConnectWorker {
+                super::reconciler::WorkerHandle {
                     cancel: worker_cancel,
                     join: worker,
                 },
@@ -974,9 +993,12 @@ async fn run_target_dispatcher(
         }
     }
 
-    for (_, worker) in active_workers {
-        worker.cancel.cancel();
-        join_connect_worker(worker).await;
+    for (_, handle) in reconciler.drain() {
+        handle.cancel.cancel();
+        let _ = tokio::task::spawn_blocking(move || {
+            let _ = handle.join.join();
+        })
+        .await;
     }
 
     Ok(())

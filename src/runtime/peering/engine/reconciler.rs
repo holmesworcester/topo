@@ -102,9 +102,28 @@ impl ConnectionReconciler {
         }
     }
 
+    /// Remove and return a worker handle, if it exists.
+    pub fn take(&mut self, connection_id: &str) -> Option<WorkerHandle> {
+        self.handles.remove(connection_id)
+    }
+
+    /// Return connection_ids matching a prefix.
+    pub fn keys_with_prefix(&self, prefix: &str) -> Vec<String> {
+        self.handles
+            .keys()
+            .filter(|k| k.starts_with(prefix))
+            .cloned()
+            .collect()
+    }
+
     /// Number of active workers.
     pub fn worker_count(&self) -> usize {
         self.handles.len()
+    }
+
+    /// Iterate over all handles for shutdown.
+    pub fn drain(&mut self) -> impl Iterator<Item = (String, WorkerHandle)> + '_ {
+        self.handles.drain()
     }
 }
 
