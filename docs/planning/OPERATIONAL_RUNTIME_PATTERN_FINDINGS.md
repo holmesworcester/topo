@@ -130,10 +130,44 @@ The complexity lives in the event families (which define the projected
 tables and the policy queries) and in the projectors (which maintain
 the invariants). The runtime is just a reconciliation loop.
 
+## Latest Findings
+
+### Sync window selection moved to event family
+
+The pure sync window selection logic (TIER_ORDER, window_for_kind,
+assign_window, partition_window, select_next_window, advance_planner)
+moved from `windowing.rs` (runtime) to `sync_window_selected.rs` (event
+family). The runtime retains only I/O wrappers and wire protocol encoding.
+This reduced windowing.rs from 601 to 438 lines.
+
+### Generic job-driven refresh executor
+
+The two near-identical 62-line refresher loops (bootstrap, observed-endpoint)
+collapsed into a single 40-line `run_job_driven_refresh`. Adding new
+job-driven behaviors only requires: a pure refresh function + a DurableJobKind.
+
+### Target dispatcher: where the reconciler pattern hits its limit
+
+The `active_workers` HashMap in `run_target_dispatcher` carries `source_kind`
+alongside `cancel`/`join`. This is used for precedence checks: "does an
+existing worker with higher source_kind exist for this connection slot?"
+
+The reconciler pattern (`ConnectionReconciler`) separates handles from policy
+fields. But precedence checks currently reach into the handle map for
+`source_kind`. The fix: query `connection_plan_history` for the existing plan's
+`source_kind` instead of the worker handle. This is the right direction but
+requires careful attention — the precedence check happens inside the dispatch
+loop where an extra SQLite query per candidate adds latency.
+
+The pragmatic answer: move `source_kind` out of `ActiveConnectWorker` by
+querying the plan row, then the reconciler can replace the HashMap cleanly.
+This is the next concrete step.
+
 ## Recommendations
 
-1. **Land FieldSpec on master** — done
-2. **Extract the reconciler pattern** as a standalone improvement
+1. **FieldSpec landed on master** — done
+2. **Extract the reconciler pattern** as a standalone improvement —
+   query plan status for source_kind, then the reconciler replaces active_workers
 3. **Keep live_connection_slots in memory** — it's legitimate process state
 4. **Batch operational event authoring** — don't open a connection per event
 5. **Don't pursue multi-client replay** until bilateral IDs are integrated
