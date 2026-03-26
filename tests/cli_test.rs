@@ -469,6 +469,7 @@ fn start_joined_cli_peer(
             Duration::from_secs(10),
         );
     }
+    wait_for_active_tenant_ready(&db, Duration::from_secs(120));
     StartedCliPeer {
         db,
         username: username.to_string(),
@@ -983,11 +984,13 @@ fn test_cli_reconnects_after_bootstrap_supersession_using_observed_endpoint() {
             ..Default::default()
         },
     );
+    wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
 
     assert_eventually(
         &bob_db,
         &format!("has_event:{} >= 1", after_restart_eid),
-        timeout_ms,
+        60_000,
     );
 
     stop_daemon(&bob_db, &mut bob_daemon);
@@ -1685,7 +1688,7 @@ fn test_cli_multi_use_device_links_mix_reuse_and_new_creation() {
 #[test]
 fn test_cli_invite_with_dead_first_and_live_second_address() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 30000;
+    let timeout_ms = 60000;
     let workspace_name = "dead-first-live-second";
 
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();

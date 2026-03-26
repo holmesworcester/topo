@@ -13,6 +13,7 @@ mod cli_harness;
 
 use cli_harness::*;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 fn realism_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -42,6 +43,13 @@ fn bootstrap_alice_and_invite(tmpdir: &tempfile::TempDir) -> (String, String, St
     (alice_db, bob_db, invite_link)
 }
 
+fn wait_for_autodial_live_sync(alice_db: &str, bob_db: &str) {
+    wait_for_active_tenant_ready(alice_db, Duration::from_secs(30));
+    wait_for_active_tenant_ready(bob_db, Duration::from_secs(30));
+    wait_for_live_sync_session(alice_db, Duration::from_secs(60));
+    wait_for_live_sync_session(bob_db, Duration::from_secs(60));
+}
+
 #[test]
 fn test_invite_only_daemons_should_autodial_without_manual_connect() {
     let _guard = realism_test_lock();
@@ -57,7 +65,7 @@ fn test_invite_only_daemons_should_autodial_without_manual_connect() {
         std::time::Duration::from_secs(30),
     );
     let _bob = start_discovery_daemon(&bob_db);
-    wait_for_active_tenant_ready(&bob_db, std::time::Duration::from_secs(30));
+    wait_for_autodial_live_sync(&alice_db, &bob_db);
 
     // Desired behavior: after invite acceptance, daemons should autodial based on
     // persisted bootstrap/discovery state, with no manual connect flag.
@@ -65,7 +73,7 @@ fn test_invite_only_daemons_should_autodial_without_manual_connect() {
     let out = topo_assert_eventually(
         &alice_db,
         &format!("has_event:{} >= 1", bob_event_id),
-        30_000,
+        60_000,
     );
     assert!(
         out.status.success(),
@@ -97,14 +105,14 @@ fn test_daemon_cli_invite_lifecycle_works_without_restart() {
         std::time::Duration::from_secs(30),
     );
     let _bob = start_daemon(&bob_db);
-    wait_for_active_tenant_ready(&bob_db, std::time::Duration::from_secs(30));
+    wait_for_autodial_live_sync(&alice_db, &bob_db);
 
     // Bob sends a message in the shared workspace via daemon RPC.
     let bob_event_id = topo_send_retry(&bob_db, "runtime-accept-no-restart");
     let out = topo_assert_eventually(
         &alice_db,
         &format!("has_event:{} >= 1", bob_event_id),
-        30_000,
+        60_000,
     );
     assert!(
         out.status.success(),

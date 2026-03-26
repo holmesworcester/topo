@@ -12,7 +12,8 @@ use std::time::{Duration, Instant};
 use cli_harness::{
     accept_invite_with_identity, assert_eventually, create_invite_with_spki, create_workspace,
     daemon_identity_fingerprint, daemon_listen_addr, ensure_active_peer, generate_messages,
-    message_count_sql, start_daemon, topo_cmd, wait_for_daemon_stopped, HarnessDaemon,
+    message_count_sql, start_daemon, topo_cmd, wait_for_daemon_stopped, wait_for_live_sync_session,
+    HarnessDaemon,
 };
 
 struct SharedWorkspaceBench {
@@ -56,6 +57,8 @@ impl SharedWorkspaceBench {
 
         ensure_active_peer(&alice_db, Duration::from_secs(10));
         ensure_active_peer(&bob_db, Duration::from_secs(10));
+        wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
+        wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
 
         Self {
             _tmpdir: tmpdir,

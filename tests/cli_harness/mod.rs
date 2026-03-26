@@ -1137,6 +1137,34 @@ pub fn active_tenant_peer_id(db: &str) -> Option<String> {
     }
 }
 
+/// Wait until `sync request all` sees at least one live session.
+pub fn wait_for_live_sync_session(db: &str, timeout: Duration) {
+    let deadline = Instant::now() + timeout;
+    loop {
+        let out = Command::new(bin())
+            .args(["--db", db, "sync", "request", "all"])
+            .output()
+            .expect("failed to run sync request all");
+        if out.status.success() {
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            if !stdout.contains("(no live sessions)") && !stdout.contains("(no peers)") {
+                return;
+            }
+        }
+        if Instant::now() >= deadline {
+            panic!(
+                "live sync session never became available within {:?} (db={})\nstdout: {}\nstderr: {}\n{}",
+                timeout,
+                db,
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr),
+                daemon_debug_context(db)
+            );
+        }
+        std::thread::sleep(Duration::from_millis(250));
+    }
+}
+
 /// Send a message via daemon RPC, retrying transient errors.
 pub fn send_message(db: &str, content: &str) -> String {
     let send_timeout = Duration::from_secs(60);

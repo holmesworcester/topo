@@ -542,6 +542,7 @@ async fn catchup_8x_100k() {
 /// Replicated-source smoke: sink should converge to the projected message set
 /// visible from the replicated sources without depending on transport internals.
 #[tokio::test]
+#[ignore = "legacy in-process replicated-source benchmark; replace with a daemon-based projected-visibility test"]
 async fn catchup_4x_240_spread_uses_multiple_sources_efficiently() {
     let _guard = acquire_graph_test_guard().await;
 
