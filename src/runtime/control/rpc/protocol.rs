@@ -188,6 +188,12 @@ pub enum RpcMethod {
         prefix: String,
         depth: usize,
     },
+    /// List blocked events with their missing dependencies.
+    EventBlocked,
+    /// Show delivery timeline for a specific event.
+    EventTimeline {
+        event_id: String,
+    },
     /// Show the current sync policy for the active tenant.
     SyncPolicyShow,
     /// Set sync policy fields for the active tenant.

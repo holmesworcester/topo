@@ -740,6 +740,77 @@ pub(crate) fn run_event_action(
             }
             Ok(())
         }
+        EventAction::Blocked { json } => {
+            let data = rpc_require_daemon(db, socket, RpcMethod::EventBlocked)?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data).unwrap_or_default()
+                );
+            } else if let Some(items) = data.as_array() {
+                println!("BLOCKED EVENTS ({}):", items.len());
+                if items.is_empty() {
+                    println!("  (none)");
+                } else {
+                    // Group by event_id
+                    let mut current_eid = String::new();
+                    let mut idx = 0;
+                    for item in items {
+                        let eid = item["event_id"].as_str().unwrap_or("");
+                        if eid != current_eid {
+                            idx += 1;
+                            current_eid = eid.to_string();
+                            println!(
+                                "  {}. {}",
+                                idx,
+                                &eid[..eid.len().min(12)]
+                            );
+                        }
+                        println!(
+                            "       {} {}",
+                            item["dep"].as_str().unwrap_or(""),
+                            &item["blocker_event_id"]
+                                .as_str()
+                                .unwrap_or("")[..item["blocker_event_id"]
+                                .as_str()
+                                .unwrap_or("")
+                                .len()
+                                .min(12)]
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
+        EventAction::Timeline { event_id, json } => {
+            let data =
+                rpc_require_daemon(db, socket, RpcMethod::EventTimeline { event_id })?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data).unwrap_or_default()
+                );
+            } else {
+                let eid = data["event_id"].as_str().unwrap_or("?");
+                println!("TIMELINE ({}):", &eid[..eid.len().min(12)]);
+                if let Some(v) = data["first_received_at_ms"].as_i64() {
+                    println!("  First received:  {} ms", v);
+                }
+                if let Some(v) = data["first_stored_at_ms"].as_i64() {
+                    println!("  First stored:    {} ms", v);
+                }
+                if let Some(v) = data["blocked_at_ms"].as_i64() {
+                    println!("  Blocked at:      {} ms", v);
+                }
+                if let Some(v) = data["unblocked_at_ms"].as_i64() {
+                    println!("  Unblocked at:    {} ms", v);
+                }
+                if let Some(v) = data["projected_at_ms"].as_i64() {
+                    println!("  Projected at:    {} ms", v);
+                }
+            }
+            Ok(())
+        }
         EventAction::Show { prefix } => {
             let data = rpc_require_daemon(db, socket, RpcMethod::EventShow { prefix })?;
             let resp: service::EventListResponse = serde_json::from_value(data)?;

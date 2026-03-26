@@ -1435,6 +1435,58 @@ fn dispatch(
             }
         }
 
+        RpcMethod::EventBlocked => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => {
+                    let mut stmt = db
+                        .prepare(
+                            "SELECT event_id, blocker_event_id, dep_relationship
+                             FROM blocked_event_deps
+                             WHERE peer_id = ?1
+                             ORDER BY event_id",
+                        )
+                        .unwrap();
+                    let rows = stmt
+                        .query_map(rusqlite::params![&recorded_by], |row| {
+                            Ok(serde_json::json!({
+                                "event_id": row.get::<_, String>(0)?,
+                                "blocker_event_id": row.get::<_, String>(1)?,
+                                "dep": row.get::<_, String>(2)?,
+                            }))
+                        })
+                        .unwrap()
+                        .collect::<Result<Vec<_>, _>>()
+                        .unwrap_or_default();
+                    RpcResponse::success(rows)
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+
+        RpcMethod::EventTimeline { event_id } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok((_recorded_by, db)) => {
+                    let tl = crate::db::timeline::EventTimeline::new(&db);
+                    match tl.load(&event_id) {
+                        Ok(Some(row)) => RpcResponse::success(serde_json::json!({
+                            "event_id": row.event_id,
+                            "first_received_at_ms": row.first_received_at,
+                            "first_stored_at_ms": row.first_stored_at,
+                            "blocked_at_ms": row.blocked_at,
+                            "unblocked_at_ms": row.unblocked_at,
+                            "unblocked_by_event_id": row.unblocked_by_event_id,
+                            "projected_at_ms": row.projected_at,
+                        })),
+                        Ok(None) => RpcResponse::error(format!("no timeline entry for event {}", event_id)),
+                        Err(e) => RpcResponse::error(e.to_string()),
+                    }
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+
         RpcMethod::Stats => match state.require_active_peer() {
             Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
                 Ok((recorded_by, db)) => {

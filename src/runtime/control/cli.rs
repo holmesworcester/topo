@@ -602,6 +602,20 @@ pub(crate) enum EventAction {
         /// Mode to set (tree, list, off). Omit to show current mode.
         mode: Option<String>,
     },
+    /// List blocked events with their missing dependencies
+    Blocked {
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
+    /// Show delivery timeline for a specific event
+    Timeline {
+        /// Event ID (base64 or hex prefix)
+        event_id: String,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show details for events matching an ID prefix
     Show {
         /// Event ID prefix (first few characters of base64 ID)

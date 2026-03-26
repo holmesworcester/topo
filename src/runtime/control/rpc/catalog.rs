@@ -273,6 +273,18 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"Stats"}"#,
     },
     MethodInfo {
+        name: "EventBlocked",
+        purpose: "List blocked events with their missing dependencies",
+        params: PARAM_NONE,
+        example_json: r#"{"type":"EventBlocked"}"#,
+    },
+    MethodInfo {
+        name: "EventTimeline",
+        purpose: "Show delivery timeline for a specific event",
+        params: params!["event_id", "string", true, None],
+        example_json: r#"{"type":"EventTimeline","event_id":"<base64>"}"#,
+    },
+    MethodInfo {
         name: "Replay",
         purpose: "Run a replay pass and return the projection fingerprint",
         params: params!["pass", "string", true, None],
