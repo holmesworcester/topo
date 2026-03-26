@@ -2088,9 +2088,8 @@ fn test_shared_db_tenant_list_count() {
                 .lines()
                 .filter(|line| {
                     let t = line.trim_start();
-                    t.find('.').map_or(false, |dot| {
-                        t[..dot].chars().all(|c| c.is_ascii_digit())
-                    })
+                    t.find('.')
+                        .is_some_and(|dot| t[..dot].chars().all(|c| c.is_ascii_digit()))
                 })
                 .count();
             if count >= 2 {

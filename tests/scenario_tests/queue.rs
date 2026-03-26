@@ -44,7 +44,7 @@ async fn test_project_queue_drain_after_batch() {
         .drain(&alice.identity, |conn, eid_b64| {
             if let Some(eid) = event_id_from_base64(eid_b64) {
                 project_one(conn, &alice.identity, &eid)
-                    .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+                    .map_err(|e| e.to_string())?;
             }
             Ok(())
         })
