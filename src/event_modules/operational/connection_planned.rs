@@ -670,6 +670,65 @@ pub fn record_connection_planned(
     .map_err(|e| e.to_string())
 }
 
+/// Return connection_ids that are in `active` status (worker should be running).
+/// The runtime uses this instead of maintaining an in-memory worker map to
+/// decide which connections are expected to be active.
+pub fn load_active_connections(conn: &Connection) -> SqliteResult<Vec<String>> {
+    with_sqlite_busy_retry(|| {
+        let mut stmt = conn.prepare(
+            "SELECT DISTINCT h.connection_id
+             FROM connection_plan_history h
+             WHERE h.plan_status = 'active'
+               AND NOT EXISTS (
+                   SELECT 1
+                   FROM connection_plan_history newer
+                   WHERE newer.tenant_id = h.tenant_id
+                     AND newer.connection_id = h.connection_id
+                     AND newer.basis_event_id = h.event_id
+               )",
+        )?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        rows.collect()
+    })
+}
+
+/// Check if a connection is currently live (authenticated but not yet closed)
+/// based on projected outbound_connection_history.
+pub fn is_connection_live(conn: &Connection, connection_id: &str) -> SqliteResult<bool> {
+    with_sqlite_busy_retry(|| {
+        conn.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM outbound_connection_history h
+                WHERE h.connection_id = ?1
+                  AND h.lifecycle_kind = 'authenticated'
+                  AND NOT EXISTS (
+                      SELECT 1 FROM outbound_connection_history later
+                      WHERE later.connection_id = h.connection_id
+                        AND later.lifecycle_kind IN ('closed', 'failed')
+                        AND later.created_at > h.created_at
+                  )
+            )",
+            params![connection_id],
+            |row| row.get(0),
+        )
+    })
+}
+
+/// Return connection_ids that need workers spawned: plans that are due and
+/// not already in `active` status.
+pub fn load_connections_needing_workers(
+    conn: &Connection,
+    active_connection_ids: &[String],
+    limit: usize,
+) -> SqliteResult<Vec<ConnectionPlanEffect>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
+    let mut effects = load_due_effects(conn, limit)?;
+    effects.retain(|e| !active_connection_ids.contains(&e.connection_id));
+    Ok(effects)
+}
+
 pub fn load_due_effects(
     conn: &Connection,
     limit: usize,

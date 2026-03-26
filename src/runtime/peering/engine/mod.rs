@@ -3,6 +3,7 @@
 //! Runtime worker ownership is centralized in `supervisor.rs`.
 
 mod discovery;
+pub(crate) mod reconciler;
 mod startup;
 pub(crate) mod supervisor;
 pub(crate) mod target_planner;
