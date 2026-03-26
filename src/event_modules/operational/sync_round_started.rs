@@ -1,6 +1,6 @@
 use rusqlite::{Connection, OptionalExtension};
 
-use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
+use super::super::layout::field_spec::{decode_fields, encode_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{
     Describe, EventError, ParsedEvent, EVENT_TYPE_INBOUND_CONNECTION_AUTHENTICATED,
@@ -32,8 +32,6 @@ pub const SYNC_ROUND_STARTED_FIELDS: &[FieldSpec] = &[
     FieldSpec::I64("planner_next_idx_before"),
     FieldSpec::I64("planner_cycle_anchor_now_ms"),
 ];
-const SYNC_ROUND_STARTED_WIRE_SIZE: usize = wire_size_for_fields(SYNC_ROUND_STARTED_FIELDS);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncRoundRole {
     Initiator,

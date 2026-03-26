@@ -24,18 +24,13 @@ use super::target_planner::{
     normalize_discovered_addr_for_local_bind, PeerDispatcher,
 };
 use crate::contracts::event_pipeline_contract::IngestFns;
-use crate::contracts::peering_contract::SessionDirection;
 use crate::db::open_connection;
-use crate::db::transport_creds::{
-    resolve_tenant_transport_target, TenantInfo, CRED_SOURCE_BOOTSTRAP,
-};
-use crate::db::transport_trust::is_peer_shared_transport_fingerprint;
+use crate::db::transport_creds::TenantInfo;
 use crate::event_modules::operational::connection_plan_transitioned::record_connection_plan_transition;
 use crate::event_modules::operational::connection_planned::{
     dispatch_target_from_row, existing_source_has_higher_precedence, load as load_connection_plan,
     load_due_effects, record_connection_planned, ConnectionPlanSourceKind, ConnectionPlanStatus,
 };
-use crate::event_modules::operational::connection_runtime::preferred_connection_direction;
 #[cfg(feature = "discovery")]
 use crate::event_modules::operational::mdns_peer_observed::record_mdns_peer_observed;
 use crate::peering::loops::{
@@ -117,13 +112,6 @@ struct TargetIngressEvent {
     tenant_id: String,
     remote: SocketAddr,
     source: TargetIngressSource,
-}
-
-struct ActiveConnectWorker {
-    cancel: CancellationToken,
-    join: std::thread::JoinHandle<()>,
-    // source_kind removed — precedence is now derived from
-    // connection_plan_history via load_connection_plan().source_kind
 }
 
 fn author_connection_planned(db_path: &str, event: &TargetIngressEvent) {
@@ -1004,6 +992,15 @@ async fn run_target_dispatcher(
     Ok(())
 }
 
+#[cfg(test)]
+use crate::contracts::peering_contract::SessionDirection;
+#[cfg(test)]
+use crate::db::transport_creds::{resolve_tenant_transport_target, CRED_SOURCE_BOOTSTRAP};
+#[cfg(test)]
+use crate::db::transport_trust::is_peer_shared_transport_fingerprint;
+#[cfg(test)]
+use crate::event_modules::operational::connection_runtime::preferred_connection_direction;
+
 // Test-only legacy helper — production code uses
 // connection_planned::should_activate_plan from the event family.
 #[cfg(test)]
@@ -1127,65 +1124,6 @@ fn should_initiate_connect_for_source_with_db(
             }
         }
         ConnectionPlanSourceKind::ObservedPeer | ConnectionPlanSourceKind::Bootstrap => true,
-    }
-}
-
-async fn join_connect_worker(worker: ActiveConnectWorker) {
-    let _ = tokio::task::spawn_blocking(move || {
-        let _ = worker.join.join();
-    })
-    .await;
-}
-
-async fn cancel_bootstrap_workers_for_prefix(
-    db_path: &str,
-    active_workers: &mut HashMap<String, ActiveConnectWorker>,
-    dispatcher: &mut PeerDispatcher,
-    prefix: &str,
-) {
-    let keys: Vec<String> = active_workers
-        .keys()
-        .filter(|key| key.starts_with(prefix))
-        .cloned()
-        .collect();
-    for key in keys {
-        if let Some(worker) = active_workers.remove(&key) {
-            let _ = emit_connection_plan_transition(
-                db_path,
-                &key,
-                ConnectionPlanStatus::Superseded,
-                "steady_state_target_replaced_bootstrap",
-                0,
-            );
-            worker.cancel.cancel();
-            join_connect_worker(worker).await;
-            dispatcher.forget(&key);
-        }
-    }
-}
-
-async fn reap_finished_connect_workers(
-    db_path: &str,
-    active_workers: &mut HashMap<String, ActiveConnectWorker>,
-    dispatcher: &mut PeerDispatcher,
-) {
-    let finished_keys: Vec<String> = active_workers
-        .iter()
-        .filter_map(|(key, worker)| worker.join.is_finished().then_some(key.clone()))
-        .collect();
-
-    for key in finished_keys {
-        if let Some(worker) = active_workers.remove(&key) {
-            join_connect_worker(worker).await;
-            dispatcher.forget(&key);
-            let _ = emit_connection_plan_transition(
-                db_path,
-                &key,
-                ConnectionPlanStatus::Finished,
-                "connect_worker_exited",
-                1_000,
-            );
-        }
     }
 }
 

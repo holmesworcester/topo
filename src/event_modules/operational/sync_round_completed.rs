@@ -1,6 +1,6 @@
 use rusqlite::Connection;
 
-use super::super::layout::field_spec::{decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue};
+use super::super::layout::field_spec::{decode_fields, encode_fields, FieldSpec, FieldValue};
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{
     Describe, EventError, ParsedEvent, EVENT_TYPE_SYNC_ROUND_COMPLETED,
@@ -24,8 +24,6 @@ pub const SYNC_ROUND_COMPLETED_FIELDS: &[FieldSpec] = &[
     FieldSpec::I64("bytes_received"),
     FieldSpec::I64("duration_ms"),
 ];
-const SYNC_ROUND_COMPLETED_WIRE_SIZE: usize = wire_size_for_fields(SYNC_ROUND_COMPLETED_FIELDS);
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncRoundOutcome {
     Ok,

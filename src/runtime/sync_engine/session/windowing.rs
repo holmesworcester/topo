@@ -184,9 +184,7 @@ mod tests {
     use super::*;
     use crate::db::{open_connection, schema::create_tables};
     // Import policy functions from the event family for test assertions
-    use crate::event_modules::operational::sync_window_selected::{
-        select_next_window, advance_planner, window_for_kind, TIER_ORDER,
-    };
+    use crate::event_modules::operational::sync_window_selected::window_for_kind;
 
     const DAY_MS: i64 = 24 * 60 * 60 * 1000;
     const WEEK_MS: i64 = 7 * DAY_MS;

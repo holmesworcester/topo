@@ -17,10 +17,8 @@ use std::collections::HashMap;
 
 use tokio_util::sync::CancellationToken;
 
-use crate::event_modules::operational::connection_planned::{
-    load_active_connections, load_connections_needing_workers, load_due_effects,
-    ConnectionPlanEffect,
-};
+#[cfg(test)]
+use crate::event_modules::operational::connection_planned::ConnectionPlanEffect;
 
 /// A thin handle to an OS worker. This is the only process-local state
 /// the reconciler needs — it holds the cancellation token and join handle
@@ -59,13 +57,6 @@ impl ConnectionReconciler {
         finished
     }
 
-    /// Cancel a specific worker by connection_id.
-    pub fn cancel(&mut self, connection_id: &str) {
-        if let Some(handle) = self.handles.get(connection_id) {
-            handle.cancel.cancel();
-        }
-    }
-
     /// Register a newly spawned worker.
     pub fn register(&mut self, connection_id: String, handle: WorkerHandle) {
         self.handles.insert(connection_id, handle);
@@ -78,6 +69,7 @@ impl ConnectionReconciler {
 
     /// Return connection_ids that have handles but shouldn't be active
     /// according to projected state.
+    #[cfg(test)]
     pub fn workers_to_cancel(&self, desired_active: &[String]) -> Vec<String> {
         self.handles
             .keys()
@@ -87,19 +79,13 @@ impl ConnectionReconciler {
     }
 
     /// Return due effects that need new workers (not already handled).
+    #[cfg(test)]
     pub fn effects_needing_spawn(&self, effects: &[ConnectionPlanEffect]) -> Vec<ConnectionPlanEffect> {
         effects
             .iter()
             .filter(|e| !self.handles.contains_key(&e.connection_id))
             .cloned()
             .collect()
-    }
-
-    /// Cancel all workers (shutdown).
-    pub fn cancel_all(&mut self) {
-        for (_, handle) in &self.handles {
-            handle.cancel.cancel();
-        }
     }
 
     /// Remove and return a worker handle, if it exists.
@@ -114,11 +100,6 @@ impl ConnectionReconciler {
             .filter(|k| k.starts_with(prefix))
             .cloned()
             .collect()
-    }
-
-    /// Number of active workers.
-    pub fn worker_count(&self) -> usize {
-        self.handles.len()
     }
 
     /// Iterate over all handles for shutdown.
@@ -136,18 +117,21 @@ impl ConnectionReconciler {
 ///     reconciler.reap_finished();
 ///
 ///     // 2. Query desired state from SQLite
-///     let active = load_active_connections(&conn)?;
 ///     let due = load_due_effects(&conn, 16)?;
 ///
 ///     // 3. Cancel workers that shouldn't be running
-///     for id in reconciler.workers_to_cancel(&active) {
-///         reconciler.cancel(&id);
+///     for id in excess_ids {
+///         if let Some(handle) = reconciler.take(&id) {
+///             handle.cancel.cancel();
+///         }
 ///     }
 ///
 ///     // 4. Spawn workers for due effects not yet handled
-///     for effect in reconciler.effects_needing_spawn(&due) {
-///         let handle = spawn_connect_worker(...);
-///         reconciler.register(effect.connection_id, handle);
+///     for effect in &due {
+///         if !reconciler.has_worker(&effect.connection_id) {
+///             let handle = spawn_connect_worker(...);
+///             reconciler.register(effect.connection_id, handle);
+///         }
 ///     }
 ///
 ///     // 5. Sleep until next due time or wake event
