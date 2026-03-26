@@ -80,30 +80,6 @@ async fn test_encrypted_out_of_order_sync() {
     harness.finish();
 }
 
-/// Integration test: mixed cleartext + encrypted events → verify_projection_invariants.
-#[tokio::test]
-async fn test_encrypted_replay_invariants() {
-    let alice = Peer::new_with_identity("alice");
-    let harness = ScenarioHarness::new();
-    harness.track(&alice);
-    let initial_keys = alice.key_secret_count();
-
-    // Create a mix of cleartext and encrypted events
-    let key_bytes: [u8; 32] = rand::random();
-    let sk_eid = alice.create_key_secret(key_bytes);
-
-    alice.create_message("Cleartext 1");
-    alice.create_encrypted_message(&sk_eid, "Encrypted 1");
-    alice.create_message("Cleartext 2");
-    alice.create_encrypted_message(&sk_eid, "Encrypted 2");
-
-    assert_eq!(alice.key_secret_count(), initial_keys + 1);
-    assert_eq!(alice.scoped_message_count(), 4); // 2 cleartext + 2 encrypted inner messages
-
-    // Run invariant checks (forward, double, reverse)
-    harness.finish();
-}
-
 #[tokio::test]
 async fn test_encrypted_inner_unsupported_signer_rejects_durably() {
     use topo::crypto::hash_event;

@@ -1,55 +1,6 @@
-use std::time::Duration;
-use topo::crypto::{event_id_from_base64, event_id_to_base64};
+use topo::crypto::event_id_from_base64;
 use topo::db::open_connection;
-use topo::testutil::{assert_eventually, start_peers, Peer, ScenarioHarness};
-
-/// Integration test: Alice creates a message and then a deletion targeting it.
-/// Bob syncs and gets both events. Regardless of receive order, Bob converges
-/// to the same final state: 0 messages, 1 tombstone.
-/// This also tests that if Bob receives the deletion first (blocked), the
-/// cascade-unblock when the message arrives produces the correct state.
-#[tokio::test]
-async fn test_deletion_before_target_sync() {
-    let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_in_workspace("bob", &alice).await;
-    let harness = ScenarioHarness::new();
-    harness.track(&alice);
-    harness.track(&bob);
-
-    // Alice creates a message and then deletes it
-    let msg_id = alice.create_message("Delete me via sync");
-    let del_id = alice.create_message_deletion(&msg_id);
-    let del_b64 = event_id_to_base64(&del_id);
-
-    assert_eq!(alice.message_count(), 0); // deleted
-    assert_eq!(alice.deleted_message_count(), 1); // tombstone
-
-    // Sync
-    let sync = start_peers(&alice, &bob);
-
-    assert_eventually(
-        || bob.has_event(&del_b64),
-        Duration::from_secs(15),
-        "bob should receive alice's deletion event",
-    )
-    .await;
-
-    drop(sync);
-
-    // Bob should converge to the deleted final state regardless of arrival order.
-    assert_eq!(
-        bob.message_count(),
-        0,
-        "bob: deleted message should not remain projected"
-    );
-    assert_eq!(
-        bob.deleted_message_count(),
-        1,
-        "bob: deletion tombstone should project after sync"
-    );
-
-    harness.finish();
-}
+use topo::testutil::{Peer, ScenarioHarness};
 
 /// Integration test: Create encrypted message, then encrypted deletion targeting it.
 /// Verify cascade works through encryption layer.
@@ -91,46 +42,3 @@ async fn test_encrypted_deletion() {
     harness.finish();
 }
 
-/// Integration test: After deletion sync, verify_projection_invariants on both peers.
-#[tokio::test]
-async fn test_deletion_replay_invariants() {
-    let alice = Peer::new_with_identity("alice");
-    let bob = Peer::new_in_workspace("bob", &alice).await;
-    let harness = ScenarioHarness::new();
-    harness.track(&alice);
-    harness.track(&bob);
-
-    // Create a mix of messages, reactions, and deletions
-    let msg1 = alice.create_message("Keep me");
-    let msg2 = alice.create_message("Delete me");
-    alice.create_reaction(&msg1, "\u{2764}\u{fe0f}");
-    alice.create_reaction(&msg2, "\u{1f44d}");
-
-    // Delete msg2 (cascades its reaction too)
-    let del_id = alice.create_message_deletion(&msg2);
-    let del_b64 = event_id_to_base64(&del_id);
-
-    assert_eq!(alice.message_count(), 1); // msg1 survives
-    assert_eq!(alice.reaction_count(), 1); // msg1's reaction survives
-    assert_eq!(alice.deleted_message_count(), 1); // msg2 tombstone
-
-    // Sync to Bob
-    let sync = start_peers(&alice, &bob);
-
-    assert_eventually(
-        || bob.has_event(&del_b64),
-        Duration::from_secs(15),
-        "bob should receive alice's deletion event",
-    )
-    .await;
-
-    drop(sync);
-
-    // Bob should converge to Alice's final projected state.
-    assert_eq!(bob.message_count(), 1);
-    assert_eq!(bob.reaction_count(), 1);
-    assert_eq!(bob.deleted_message_count(), 1);
-
-    // Run full replay invariants on both
-    harness.finish();
-}

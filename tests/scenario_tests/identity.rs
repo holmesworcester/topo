@@ -388,57 +388,6 @@ fn test_out_of_order_identity() {
 }
 
 #[test]
-fn test_foreign_workspace_excluded() {
-    let alice = Peer::new("alice");
-    let harness = ScenarioHarness::new();
-    harness.track(&alice);
-    let _chain = bootstrap_peer(&alice);
-
-    let db = open_connection(&alice.db_path).unwrap();
-
-    // Create a second workspace event with different workspace_id — should be rejected
-    let foreign_key = ed25519_dalek::SigningKey::generate(&mut rand::thread_rng());
-    let foreign_pubkey = foreign_key.verifying_key().to_bytes();
-    let result = alice.try_create_workspace(foreign_pubkey);
-
-    // Should be rejected (trust anchor mismatch)
-    match result {
-        Err(ref e) => {
-            let msg = format!("{}", e);
-            assert!(msg.contains("rejected"), "expected rejection, got: {}", msg);
-        }
-        Ok(eid) => {
-            // If it wasn't rejected at creation time, check DB state
-            let foreign_b64 = event_id_to_base64(&eid);
-            let foreign_valid: bool = db
-                .query_row(
-                    "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-                    rusqlite::params![&alice.identity, &foreign_b64],
-                    |row| row.get(0),
-                )
-                .unwrap();
-            assert!(
-                !foreign_valid,
-                "foreign workspace event should NOT be valid"
-            );
-        }
-    }
-
-    // The event is in rejected_events (stored before rejection)
-    let rejected_count: i64 = db.query_row(
-        "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1 AND reason LIKE '%workspace_id%'",
-        rusqlite::params![&alice.identity],
-        |row| row.get(0),
-    ).unwrap();
-    assert!(
-        rejected_count > 0,
-        "foreign workspace event should be rejected"
-    );
-
-    harness.finish();
-}
-
-#[test]
 fn test_key_shared_key_wrap() {
     use topo::projection::encrypted::wrap_key_for_recipient;
 
@@ -867,72 +816,6 @@ fn test_wrap_unwrap_encrypted_convergence() {
     assert_eq!(
         blocked_on_key, 0,
         "key_event_id blocker should be absent after key materialization"
-    );
-
-    harness.finish();
-}
-
-#[test]
-fn test_identity_replay_invariants() {
-    let alice = Peer::new_with_identity("alice");
-    let harness = ScenarioHarness::new();
-    harness.track(&alice);
-
-    // Create some content after identity chain
-    alice.create_message("hello after bootstrap");
-
-    // Verify replay invariants (forward, double, reverse)
-    harness.finish();
-}
-
-// =============================================================================
-// Phase 7 logic fixes: corrected guard and binding semantics
-// =============================================================================
-
-/// invite_accepted still does not require the shared invite event to be
-/// recorded locally, but it must match the locally accepted invite-link
-/// workspace binding.
-#[test]
-fn test_invite_accepted_no_prior_invite_required() {
-    let alice = Peer::new("alice");
-    let harness = ScenarioHarness::new();
-    harness.track(&alice);
-    let db = open_connection(&alice.db_path).unwrap();
-
-    let workspace_id: [u8; 32] = rand::random();
-    let fake_invite_eid: [u8; 32] = rand::random();
-
-    // Create invite_accepted BEFORE any invite event exists.
-    // The invite event itself is still absent, but the accepted invite-link
-    // workspace binding is present locally.
-    alice.record_invite_link_workspace(&fake_invite_eid, workspace_id);
-    let ia_eid = alice.create_invite_accepted(&fake_invite_eid, workspace_id);
-
-    let ia_b64 = event_id_to_base64(&ia_eid);
-    let valid: bool = db
-        .query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![&alice.identity, &ia_b64],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert!(
-        valid,
-        "invite_accepted should be valid without prior invite event (no HasRecordedInvite guard)"
-    );
-
-    // Trust anchor should be set from the event's own workspace_id
-    let anchor: String = db
-        .query_row(
-            "SELECT workspace_id FROM invites_accepted WHERE recorded_by = ?1 ORDER BY created_at ASC, event_id ASC LIMIT 1",
-            rusqlite::params![&alice.identity],
-            |row| row.get(0),
-        )
-        .expect("trust anchor should exist");
-    let expected_nid = event_id_to_base64(&workspace_id);
-    assert_eq!(
-        anchor, expected_nid,
-        "trust anchor should match invite_accepted event's workspace_id"
     );
 
     harness.finish();

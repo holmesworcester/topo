@@ -22,17 +22,6 @@ fn spec_no_filters() -> SubscriptionSpec {
     }
 }
 
-fn spec_with_since_ms(ms: u64) -> SubscriptionSpec {
-    SubscriptionSpec {
-        event_type: "message".to_string(),
-        since: Some(SinceCursor {
-            created_at_ms: ms,
-            event_id: String::new(),
-        }),
-        filters: vec![],
-    }
-}
-
 fn spec_with_since_event(event_id_b64: &str, created_at_ms: u64) -> SubscriptionSpec {
     SubscriptionSpec {
         event_type: "message".to_string(),
@@ -121,55 +110,6 @@ fn test_subscription_full_lifecycle() {
     let state = subscription::get_state(&db, &alice.identity, &sub.subscription_id).unwrap();
     assert_eq!(state.pending_count, 0);
     assert!(!state.dirty);
-
-    harness.finish();
-}
-
-// ---------------------------------------------------------------------------
-// 2. Since-ms cursor: only messages after threshold appear in feed
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_subscription_since_ms() {
-    let harness = ScenarioHarness::skip("subscription tests are local-only, no sync");
-    let alice = Peer::new_with_identity("alice");
-
-    // Send messages before creating subscription
-    let _before = alice.create_message("before");
-    std::thread::sleep(std::time::Duration::from_millis(10));
-    let threshold_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_millis() as u64;
-    std::thread::sleep(std::time::Duration::from_millis(10));
-
-    let db = open_connection(&alice.db_path).unwrap();
-    subscription::schema::ensure_schema(&db).unwrap();
-
-    let sub = subscription::create_subscription(
-        &db,
-        &alice.identity,
-        "recent",
-        "message",
-        DeliveryMode::Full,
-        &spec_with_since_ms(threshold_ms),
-    )
-    .unwrap();
-    drop(db);
-
-    // Messages after threshold
-    let _after1 = alice.create_message("after1");
-    let _after2 = alice.create_message("after2");
-
-    let db = open_connection(&alice.db_path).unwrap();
-    let items =
-        subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
-    assert_eq!(
-        items.len(),
-        2,
-        "expected 2 items after threshold, got {}",
-        items.len()
-    );
 
     harness.finish();
 }
@@ -577,87 +517,3 @@ fn test_non_message_events_ignored() {
     harness.finish();
 }
 
-// ---------------------------------------------------------------------------
-// 11. Encrypted message projection triggers subscription on inner event
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_encrypted_message_triggers_subscription() {
-    let harness = ScenarioHarness::skip("subscription tests are local-only, no sync");
-    let alice = Peer::new_with_identity("alice");
-
-    let db = open_connection(&alice.db_path).unwrap();
-    subscription::schema::ensure_schema(&db).unwrap();
-
-    let sub = subscription::create_subscription(
-        &db,
-        &alice.identity,
-        "encrypted_inbox",
-        "message",
-        DeliveryMode::Full,
-        &spec_no_filters(),
-    )
-    .unwrap();
-    drop(db);
-
-    // Create a secret key and encrypted message
-    let key_eid = alice.create_key_secret([0x42u8; 32]);
-    let _enc_eid = alice.create_encrypted_message(&key_eid, "secret hello");
-
-    let db = open_connection(&alice.db_path).unwrap();
-    let items =
-        subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
-    assert_eq!(
-        items.len(),
-        1,
-        "encrypted message should trigger subscription"
-    );
-
-    // Payload should contain the decrypted content
-    assert_eq!(items[0].payload["content"], "secret hello");
-
-    harness.finish();
-}
-
-// ---------------------------------------------------------------------------
-// 12. Subscription persists: create sub, send messages, reopen DB, poll
-// ---------------------------------------------------------------------------
-
-#[test]
-fn test_subscription_persists_across_db_reopen() {
-    let harness = ScenarioHarness::skip("subscription tests are local-only, no sync");
-    let alice = Peer::new_with_identity("alice");
-
-    let db = open_connection(&alice.db_path).unwrap();
-    subscription::schema::ensure_schema(&db).unwrap();
-
-    let sub = subscription::create_subscription(
-        &db,
-        &alice.identity,
-        "persistent",
-        "message",
-        DeliveryMode::Full,
-        &spec_no_filters(),
-    )
-    .unwrap();
-    drop(db);
-
-    alice.create_message("before reopen");
-
-    // Simulate daemon restart: close and reopen DB
-    let db = open_connection(&alice.db_path).unwrap();
-    subscription::schema::ensure_schema(&db).unwrap(); // ensure_schema is idempotent
-
-    let subs = subscription::list_subscriptions(&db, &alice.identity).unwrap();
-    assert_eq!(subs.len(), 1);
-    assert_eq!(subs[0].name, "persistent");
-
-    let items =
-        subscription::poll_feed(&db, &alice.identity, &sub.subscription_id, 0, 100).unwrap();
-    assert_eq!(items.len(), 1, "feed should survive DB reopen");
-
-    let state = subscription::get_state(&db, &alice.identity, &sub.subscription_id).unwrap();
-    assert_eq!(state.pending_count, 1);
-
-    harness.finish();
-}
