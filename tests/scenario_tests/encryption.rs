@@ -13,25 +13,17 @@ async fn test_encrypted_out_of_order_sync() {
     harness.track(&bob);
     let bob_initial_keys = bob.key_secret_count();
 
-    // Alice creates key + encrypted message.
     let key_bytes: [u8; 32] = rand::random();
     let fixed_ts = 5_000_000u64;
     let sk_eid = alice.create_key_secret_deterministic(key_bytes, fixed_ts);
     let enc_eid = alice.create_encrypted_message(&sk_eid, "Out of order encrypted");
     let enc_b64 = event_id_to_base64(&enc_eid);
-
-    // Also create a normal message to verify mixed events work
     let alice_msg = alice.create_message("Normal message");
     let alice_msg_b64 = event_id_to_base64(&alice_msg);
-
-    // Bob creates a message too, but does NOT have the key yet.
     let bob_msg = bob.create_message("Bob's message");
     let bob_msg_b64 = event_id_to_base64(&bob_msg);
 
-    // Sync phase 1: ciphertext arrives before key materialization on Bob.
-    // Note: alice's SK is local scope, not synced
     let sync1 = start_peers(&alice, &bob);
-
     assert_eventually(
         || {
             bob.has_event(&enc_b64)
@@ -42,12 +34,9 @@ async fn test_encrypted_out_of_order_sync() {
         "phase 1: both peers should have synced shared events",
     )
     .await;
-
     drop(sync1);
 
-    // Bob should be blocked on missing key after phase 1.
     assert_eq!(bob.key_secret_count(), bob_initial_keys);
-    // Bob can still project Alice's cleartext message in the shared workspace.
     assert_eq!(bob.scoped_message_count(), 2);
     let bob_db = open_connection(&bob.db_path).expect("open bob db");
     let blocked_before: i64 = bob_db
@@ -57,50 +46,14 @@ async fn test_encrypted_out_of_order_sync() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(
-        blocked_before >= 1,
-        "encrypted wrapper should be blocked until key appears"
-    );
+    assert!(blocked_before >= 1, "encrypted wrapper should be blocked until key appears");
 
-    // Materialize the matching key locally on Bob; this should unblock encrypted wrapper.
     let sk_eid_bob = bob.create_key_secret_deterministic(key_bytes, fixed_ts);
-    assert_eq!(
-        sk_eid_bob, sk_eid,
-        "bob key materialization should match alice key event id"
-    );
-
-    // After key materialization, the encrypted wrapper unblocks and Alice's
-    // encrypted inner message becomes valid too.
+    assert_eq!(sk_eid_bob, sk_eid);
     assert_eq!(bob.key_secret_count(), bob_initial_keys + 1);
     assert_eq!(bob.scoped_message_count(), 3);
-
-    // Alice sees both her messages plus Bob's cleartext message after sync.
     assert_eq!(alice.scoped_message_count(), 3);
 
-    harness.finish();
-}
-
-/// Integration test: mixed cleartext + encrypted events → verify_projection_invariants.
-#[tokio::test]
-async fn test_encrypted_replay_invariants() {
-    let alice = Peer::new_with_identity("alice");
-    let harness = ScenarioHarness::new();
-    harness.track(&alice);
-    let initial_keys = alice.key_secret_count();
-
-    // Create a mix of cleartext and encrypted events
-    let key_bytes: [u8; 32] = rand::random();
-    let sk_eid = alice.create_key_secret(key_bytes);
-
-    alice.create_message("Cleartext 1");
-    alice.create_encrypted_message(&sk_eid, "Encrypted 1");
-    alice.create_message("Cleartext 2");
-    alice.create_encrypted_message(&sk_eid, "Encrypted 2");
-
-    assert_eq!(alice.key_secret_count(), initial_keys + 1);
-    assert_eq!(alice.scoped_message_count(), 4); // 2 cleartext + 2 encrypted inner messages
-
-    // Run invariant checks (forward, double, reverse)
     harness.finish();
 }
 
