@@ -122,7 +122,8 @@ struct TargetIngressEvent {
 struct ActiveConnectWorker {
     cancel: CancellationToken,
     join: std::thread::JoinHandle<()>,
-    source_kind: ConnectionPlanSourceKind,
+    // source_kind removed — precedence is now derived from
+    // connection_plan_history via load_connection_plan().source_kind
 }
 
 fn author_connection_planned(db_path: &str, event: &TargetIngressEvent) {
@@ -766,11 +767,42 @@ async fn run_target_dispatcher(
 
             if matches!(target.source_kind, ConnectionPlanSourceKind::Bootstrap) {
                 let known_peer_key = target.known_peer_key();
-                if let Some(existing) = active_workers.get(&known_peer_key) {
-                    if existing_source_has_higher_precedence(
-                        existing.source_kind,
-                        target.source_kind,
-                    ) {
+                if active_workers.contains_key(&known_peer_key) {
+                    // Query the existing plan's source_kind from projected state
+                    // instead of keeping it in the worker handle.
+                    let existing_source = {
+                        let conn = open_connection(&db_path).map_err(|e| e.to_string())?;
+                        load_connection_plan(&conn, &known_peer_key)
+                            .map_err(|e| e.to_string())?
+                            .map(|plan| plan.source_kind)
+                    };
+                    if let Some(existing_source) = existing_source {
+                        if existing_source_has_higher_precedence(
+                            existing_source,
+                            target.source_kind,
+                        ) {
+                            let _ = emit_connection_plan_transition(
+                                &db_path,
+                                &connection_plan_id,
+                                ConnectionPlanStatus::Deferred,
+                                "existing_worker_has_higher_precedence",
+                                1_000,
+                            );
+                            continue;
+                        }
+                    }
+                }
+            }
+
+            if active_workers.contains_key(&connection_plan_id) {
+                let existing_source = {
+                    let conn = open_connection(&db_path).map_err(|e| e.to_string())?;
+                    load_connection_plan(&conn, &connection_plan_id)
+                        .map_err(|e| e.to_string())?
+                        .map(|plan| plan.source_kind)
+                };
+                if let Some(existing_source) = existing_source {
+                    if existing_source_has_higher_precedence(existing_source, target.source_kind) {
                         let _ = emit_connection_plan_transition(
                             &db_path,
                             &connection_plan_id,
@@ -780,19 +812,6 @@ async fn run_target_dispatcher(
                         );
                         continue;
                     }
-                }
-            }
-
-            if let Some(existing) = active_workers.get(&connection_plan_id) {
-                if existing_source_has_higher_precedence(existing.source_kind, target.source_kind) {
-                    let _ = emit_connection_plan_transition(
-                        &db_path,
-                        &connection_plan_id,
-                        ConnectionPlanStatus::Deferred,
-                        "existing_worker_has_higher_precedence",
-                        1_000,
-                    );
-                    continue;
                 }
             }
 
@@ -943,7 +962,6 @@ async fn run_target_dispatcher(
                 ActiveConnectWorker {
                     cancel: worker_cancel,
                     join: worker,
-                    source_kind: target.source_kind,
                 },
             );
             let _ = emit_connection_plan_transition(
