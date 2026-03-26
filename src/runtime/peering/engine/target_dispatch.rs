@@ -18,8 +18,8 @@ use super::bootstrap_auth::{
     should_initiate_connect_for_source_with_db, BootstrapSessionFallback,
 };
 use super::target_planner::{
-    bootstrap_dispatch_key, bootstrap_dispatch_key_prefix, dispatch_bootstrap_target,
-    dispatch_discovery_target, dispatch_observed_endpoint_target, discovery_dispatch_key,
+    bootstrap_dispatch_key, bootstrap_dispatch_key_prefix, discovery_dispatch_key,
+    dispatch_bootstrap_target, dispatch_discovery_target, dispatch_observed_endpoint_target,
     PeerDispatcher,
 };
 use crate::contracts::event_pipeline_contract::IngestFns;
@@ -645,7 +645,9 @@ mod tests {
     use super::*;
     use crate::db::open_connection;
     use crate::db::schema::create_tables;
-    use crate::db::transport_creds::{set_local_transport_target, CRED_SOURCE_BOOTSTRAP, CRED_SOURCE_PEER_SHARED};
+    use crate::db::transport_creds::{
+        set_local_transport_target, CRED_SOURCE_BOOTSTRAP, CRED_SOURCE_PEER_SHARED,
+    };
 
     #[test]
     fn discovery_and_observed_targets_follow_preferred_side_gate() {

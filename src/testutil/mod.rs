@@ -277,7 +277,7 @@ fn copy_projected_events_for_tenant(
 ) {
     use crate::db::store::{insert_event, parse_share_scope};
 
-    let now_ms = current_timestamp_ms() as i64;
+    let now_ms = current_timestamp_ms_u64() as i64;
     for eid in event_ids {
         let eid_b64 = event_id_to_base64(eid);
         let (event_type, blob, share_scope, created_at, inserted_at): (
@@ -524,6 +524,21 @@ pub struct Peer {
     _tempdir: tempfile::TempDir,
 }
 
+fn install_test_daemon_identity(peer: &Peer) {
+    let db = open_connection(&peer.db_path).expect("failed to open db for daemon identity");
+    let (cert, key) = peer.cert_and_key();
+    let peer_id = hex::encode(
+        extract_spki_fingerprint(cert.as_ref()).expect("failed to fingerprint test daemon cert"),
+    );
+    crate::db::daemon_identity::store(
+        &db,
+        &peer_id,
+        cert.as_ref(),
+        key.secret_pkcs8_der().as_ref(),
+    )
+    .expect("failed to store test daemon identity");
+}
+
 impl Peer {
     /// Create a new peer with a fresh temp database (no identity chain).
     pub fn new(name: &str) -> Self {
@@ -592,7 +607,7 @@ impl Peer {
             crate::service::resolve_user_event_id_for_signer(&db, &identity, &peer_shared_event_id)
                 .expect("failed to resolve author id for bootstrapped peer signer");
 
-        Self {
+        let peer = Self {
             name: name.to_string(),
             db_path,
             identity,
@@ -601,7 +616,9 @@ impl Peer {
             peer_shared_event_id: Some(peer_shared_event_id),
             peer_shared_signing_key: Some(peer_shared_signing_key),
             _tempdir: tempdir,
-        }
+        };
+        install_test_daemon_identity(&peer);
+        peer
     }
 
     /// Bootstrap a full identity chain using the production `create_workspace` flow.
@@ -637,6 +654,7 @@ impl Peer {
         }
         self.peer_shared_event_id = Some(result.peer_shared_event_id);
         self.peer_shared_signing_key = Some(result.peer_shared_key);
+        install_test_daemon_identity(self);
     }
 
     /// Create a new peer that joins an existing workspace created by `creator`
@@ -903,6 +921,7 @@ impl Peer {
         {
             peer.author_id = uid;
         }
+        install_test_daemon_identity(&peer);
 
         peer
     }
@@ -1141,6 +1160,7 @@ impl Peer {
         {
             peer.author_id = uid;
         }
+        install_test_daemon_identity(&peer);
 
         peer
     }
@@ -2793,7 +2813,7 @@ fn replay_shuffled_and_fingerprint(
     recorded_by: &str,
 ) -> ProjectionFingerprint {
     use crate::crypto::event_id_from_base64;
-    use rand::seq::SliceRandom;
+    use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 
     // Collect event IDs in canonical order, then shuffle
     let query = "SELECT e.event_id FROM events e
@@ -2808,18 +2828,43 @@ fn replay_shuffled_and_fingerprint(
         .collect::<Result<Vec<_>, _>>()
         .expect("failed to collect events");
 
-    event_ids.shuffle(&mut rand::thread_rng());
+    let mut rng = StdRng::seed_from_u64(0);
+    event_ids.shuffle(&mut rng);
 
     clear_projection_tables(db, recorded_by);
 
-    // Re-project in shuffled order
-    for eid_b64 in &event_ids {
-        if let Some(eid) = event_id_from_base64(eid_b64) {
-            let _ = project_one(db, recorded_by, &eid);
+    let mut last = None;
+    for _ in 0..8 {
+        for eid_b64 in &event_ids {
+            if let Some(eid) = event_id_from_base64(eid_b64) {
+                let _ = project_one(db, recorded_by, &eid);
+            }
         }
+        let fp = compute_projection_fingerprint(db, recorded_by);
+        if last
+            .as_ref()
+            .is_some_and(|prev: &ProjectionFingerprint| prev.overall == fp.overall)
+        {
+            return fp;
+        }
+        last = Some(fp);
     }
 
-    compute_projection_fingerprint(db, recorded_by)
+    last.expect("shuffled replay fingerprint missing final state")
+}
+
+fn drain_replay_projection_until_idle(db_path: &str, recorded_by: &str) {
+    const MAX_DRAIN_PASSES: usize = 64;
+    for _ in 0..MAX_DRAIN_PASSES {
+        let drained = crate::event_pipeline::drain_project_queue(db_path, recorded_by, 1000);
+        if drained == 0 {
+            return;
+        }
+    }
+    panic!(
+        "projection queue did not drain to idle during replay for tenant '{}'",
+        recorded_by
+    );
 }
 
 /// Verify projection invariants for a peer using deterministic fingerprints
@@ -2837,7 +2882,9 @@ pub fn verify_projection_invariants(peer: &Peer) {
     let orig = compute_projection_fingerprint(&db, &peer.identity);
 
     // 1. Forward replay (reproject invariance: wipe + reproject yields same state)
-    let fwd = replay_and_fingerprint(&db, &peer.identity, "ORDER BY created_at ASC, event_id ASC");
+    let _ = replay_and_fingerprint(&db, &peer.identity, "ORDER BY created_at ASC, event_id ASC");
+    drain_replay_projection_until_idle(&peer.db_path, &peer.identity);
+    let fwd = compute_projection_fingerprint(&db, &peer.identity);
     assert!(
         orig.overall == fwd.overall,
         "Forward replay fingerprint mismatch for peer '{}':\n{}",
@@ -2846,7 +2893,9 @@ pub fn verify_projection_invariants(peer: &Peer) {
     );
 
     // 2. Idempotency: re-project on top of existing projected state (no clear)
-    let idem = replay_no_clear_and_fingerprint(&db, &peer.identity);
+    let _ = replay_no_clear_and_fingerprint(&db, &peer.identity);
+    drain_replay_projection_until_idle(&peer.db_path, &peer.identity);
+    let idem = compute_projection_fingerprint(&db, &peer.identity);
     assert!(
         fwd.overall == idem.overall,
         "Idempotency replay fingerprint mismatch for peer '{}':\n{}",
@@ -2855,11 +2904,13 @@ pub fn verify_projection_invariants(peer: &Peer) {
     );
 
     // 3. Reverse-order replay
-    let rev = replay_and_fingerprint(
+    let _ = replay_and_fingerprint(
         &db,
         &peer.identity,
         "ORDER BY created_at DESC, event_id DESC",
     );
+    drain_replay_projection_until_idle(&peer.db_path, &peer.identity);
+    let rev = compute_projection_fingerprint(&db, &peer.identity);
     assert!(
         fwd.overall == rev.overall,
         "Reverse replay fingerprint mismatch for peer '{}':\n{}",
@@ -2868,7 +2919,9 @@ pub fn verify_projection_invariants(peer: &Peer) {
     );
 
     // 4. Shuffle-reorder replay (PLAN §12.4 item 5: out-of-order ingest converges)
-    let shuf = replay_shuffled_and_fingerprint(&db, &peer.identity);
+    let _ = replay_shuffled_and_fingerprint(&db, &peer.identity);
+    drain_replay_projection_until_idle(&peer.db_path, &peer.identity);
+    let shuf = compute_projection_fingerprint(&db, &peer.identity);
     assert!(
         fwd.overall == shuf.overall,
         "Shuffle-reorder replay fingerprint mismatch for peer '{}':\n{}",
@@ -2878,6 +2931,7 @@ pub fn verify_projection_invariants(peer: &Peer) {
 
     // Restore forward projection for subsequent assertions
     let _ = replay_and_fingerprint(&db, &peer.identity, "ORDER BY created_at ASC, event_id ASC");
+    drain_replay_projection_until_idle(&peer.db_path, &peer.identity);
 }
 
 // ---------------------------------------------------------------------------
@@ -2937,6 +2991,26 @@ fn current_transport_target(peer: &Peer) -> String {
     peer.transport_peer_id()
 }
 
+fn current_session_target(peer: &Peer) -> crate::transport::OutboundSessionAuthPlan {
+    crate::transport::OutboundSessionAuthPlan::PeerShared {
+        target_peer_id: peer.identity.clone(),
+    }
+}
+
+fn daemon_identity_for_peer(
+    peer: &Peer,
+) -> (String, CertificateDer<'static>, PrivatePkcs8KeyDer<'static>) {
+    crate::transport::load_daemon_identity_from_db(&peer.db_path)
+        .expect("failed to load test daemon identity")
+}
+
+fn daemon_fingerprint_for_peer(peer: &Peer) -> [u8; 32] {
+    let (peer_id, _cert, _key) = daemon_identity_for_peer(peer);
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(peer_id, &mut out).expect("invalid daemon fingerprint encoding");
+    out
+}
+
 /// Start sync between two peers in the same workspace with projected trust.
 ///
 /// Both peers must already have each other's PeerShared events projected from
@@ -2945,84 +3019,7 @@ pub fn start_peers(
     peer_a: &Peer,
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
-    crate::state::live_hints::init_forward_on_have_from_env();
-    let (cert_a, key_a) = peer_a.cert_and_key();
-    let (cert_b, key_b) = peer_b.cert_and_key();
-    let a_trusts_b = peer_b.spki_fingerprint();
-    let b_trusts_a = peer_a.spki_fingerprint();
-
-    let allow_a: Arc<crate::transport::DynamicAllowFn> =
-        Arc::new(move |peer_fp: &[u8; 32]| Ok(peer_fp == &a_trusts_b));
-    let allow_b: Arc<crate::transport::DynamicAllowFn> =
-        Arc::new(move |peer_fp: &[u8; 32]| Ok(peer_fp == &b_trusts_a));
-
-    let listener_endpoint =
-        create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert_a, key_a, allow_a)
-            .expect("failed to create dynamic dual endpoint for A");
-
-    let listener_addr = listener_endpoint
-        .local_addr()
-        .expect("failed to get listener addr");
-
-    let connector_endpoint =
-        create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert_b, key_b, allow_b)
-            .expect("failed to create dual endpoint for B");
-
-    let a_db = peer_a.db_path.clone();
-    let a_identity = peer_a.identity.clone();
-    let b_db = peer_b.db_path.clone();
-    let b_identity = peer_b.identity.clone();
-    let target_peer_id = current_transport_target(peer_a);
-
-    let a_handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            if let Err(e) = accept_loop(
-                &a_db,
-                &a_identity,
-                listener_endpoint,
-                noop_intro_spawner,
-                test_ingest_fns(),
-            )
-            .await
-            {
-                tracing::warn!("accept_loop exited: {}", e);
-            }
-        });
-    });
-
-    let b_handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            if let Err(e) = connect_loop(ConnectLoopConfig {
-                db_path: b_db.clone(),
-                recorded_by: b_identity.clone(),
-                endpoint: connector_endpoint,
-                remote: listener_addr,
-                remote_transport_peer_id: target_peer_id.clone(),
-                client_config: None,
-                intro_spawner: noop_intro_spawner,
-                ingest: test_ingest_fns(),
-                shutdown: None,
-                bootstrap_fallback_client_config: None,
-                sync_control: None,
-                auth_plan: None,
-                expected_remote_daemon_peer_id: None,
-            })
-            .await
-            {
-                tracing::warn!("connect_loop exited: {}", e);
-            }
-        });
-    });
-
-    (a_handle, b_handle)
+    start_peers_runtime_affine(peer_a, peer_b)
 }
 
 /// Like `start_peers` but creates Quinn endpoints on the session threads.
@@ -3038,15 +3035,17 @@ pub fn start_peers_runtime_affine(
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
     crate::state::live_hints::init_forward_on_have_from_env();
-    let (cert_a, key_a) = peer_a.cert_and_key();
-    let (cert_b, key_b) = peer_b.cert_and_key();
-    let a_trusts_b = peer_b.spki_fingerprint();
-    let b_trusts_a = peer_a.spki_fingerprint();
+    let (daemon_peer_id_a, cert_a, key_a) = daemon_identity_for_peer(peer_a);
+    let (_daemon_peer_id_b, cert_b, key_b) = daemon_identity_for_peer(peer_b);
+    let a_trusts_b = daemon_fingerprint_for_peer(peer_b);
+    let b_trusts_a = daemon_fingerprint_for_peer(peer_a);
     let a_db = peer_a.db_path.clone();
     let a_identity = peer_a.identity.clone();
     let b_db = peer_b.db_path.clone();
     let b_identity = peer_b.identity.clone();
     let target_peer_id = current_transport_target(peer_a);
+    let target_session = current_session_target(peer_a);
+    let expected_remote_daemon_peer_id = daemon_peer_id_a.clone();
     let (addr_tx, addr_rx) = std::sync::mpsc::channel::<SocketAddr>();
 
     let a_handle = std::thread::spawn(move || {
@@ -3102,8 +3101,8 @@ pub fn start_peers_runtime_affine(
                 shutdown: None,
                 bootstrap_fallback_client_config: None,
                 sync_control: None,
-                auth_plan: None,
-                expected_remote_daemon_peer_id: None,
+                auth_plan: Some(target_session.clone()),
+                expected_remote_daemon_peer_id: Some(expected_remote_daemon_peer_id.clone()),
             })
             .await
             {
@@ -3173,6 +3172,7 @@ pub fn start_peers_dynamic(
     let b_db = peer_b.db_path.clone();
     let b_identity = peer_b.identity.clone();
     let target_peer_id = current_transport_target(peer_a);
+    let target_session = current_session_target(peer_a);
     let a_handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Builder::new_current_thread()
             .enable_all()
@@ -3211,7 +3211,7 @@ pub fn start_peers_dynamic(
                 shutdown: None,
                 bootstrap_fallback_client_config: None,
                 sync_control: None,
-                auth_plan: None,
+                auth_plan: Some(target_session.clone()),
                 expected_remote_daemon_peer_id: None,
             })
             .await
@@ -3423,6 +3423,7 @@ pub fn start_chain(peers: &[Peer]) -> ChainHandles {
         let identity = peers[i].identity.clone();
         let remote = server_addrs[idx];
         let target_peer_id = current_transport_target(&peers[idx]);
+        let target_session = current_session_target(&peers[idx]);
         let shutdown = tokio_util::sync::CancellationToken::new();
         connect_shutdowns.push(shutdown.clone());
         endpoints.push(endpoint.clone());
@@ -3444,7 +3445,7 @@ pub fn start_chain(peers: &[Peer]) -> ChainHandles {
                     shutdown: Some(shutdown),
                     bootstrap_fallback_client_config: None,
                     sync_control: None,
-                    auth_plan: None,
+                    auth_plan: Some(target_session.clone()),
                     expected_remote_daemon_peer_id: None,
                 })
                 .await
@@ -3590,11 +3591,12 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
             client_endpoint,
             source_addrs[i],
             current_transport_target(&sources[i]),
+            current_session_target(&sources[i]),
         ));
     }
 
     let mut connect_shutdowns = Vec::new();
-    for (endpoint, remote, target_peer_id) in sink_connectors {
+    for (endpoint, remote, target_peer_id, target_session) in sink_connectors {
         let shutdown = tokio_util::sync::CancellationToken::new();
         connect_shutdowns.push(shutdown.clone());
         let sink_db = sink.db_path.clone();
@@ -3617,7 +3619,7 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
                     shutdown: Some(shutdown),
                     bootstrap_fallback_client_config: None,
                     sync_control: None,
-                    auth_plan: None,
+                    auth_plan: Some(target_session.clone()),
                     expected_remote_daemon_peer_id: None,
                 })
                 .await;

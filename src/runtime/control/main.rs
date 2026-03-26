@@ -914,7 +914,10 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 println!("  Valid events:          {}", f("valid_event_count"));
                 println!("  Blocked events:        {}", f("blocked_event_count"));
                 println!("  Rejected events:       {}", f("rejected_event_count"));
-                println!("  Endpoint observations: {}", f("endpoint_observation_count"));
+                println!(
+                    "  Endpoint observations: {}",
+                    f("endpoint_observation_count")
+                );
             }
         }
 
@@ -1408,8 +1411,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         }
 
         Commands::Connections { json } => {
-            let data =
-                rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Connections)?;
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Connections)?;
             if json {
                 println!(
                     "{}",

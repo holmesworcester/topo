@@ -403,9 +403,10 @@ async fn test_shared_db_three_tenants_same_workspace_matrix() {
 
 /// Real-network intersection test: a multitenant shared-DB node hosts two
 /// tenants in the same workspace, then an external peer joins that workspace
-/// via the production invite/bootstrap flow. The non-inviter shared-DB tenant
-/// and the external peer must converge through real sync and then communicate
-/// directly.
+/// via the production invite/bootstrap flow. Initial convergence happens over
+/// the inviter/root tenant's live sync path on the shared daemon; once the
+/// shared workspace fanout settles, the non-inviter sibling must also be able
+/// to communicate directly with the external peer.
 #[tokio::test]
 async fn test_shared_db_three_peer_same_workspace_real_network_direct_sync() {
     let mut node = SharedDbNode::new(1);
@@ -425,7 +426,6 @@ async fn test_shared_db_three_peer_same_workspace_real_network_direct_sync() {
     let external_marker_b64 = event_id_to_base64(&external_marker);
 
     let _sync_root_external = start_peers(root, &external);
-    let _sync_sibling_external = start_peers(sibling, &external);
 
     assert_eventually(
         || {

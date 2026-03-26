@@ -719,8 +719,7 @@ pub(crate) fn run_event_action(
             let data = rpc_require_daemon(db, socket, RpcMethod::EventList)?;
             let resp: service::EventListResponse = serde_json::from_value(data)?;
             if fingerprint || ids_only {
-                let mut ids: Vec<String> =
-                    resp.events.iter().map(|e| e.id.clone()).collect();
+                let mut ids: Vec<String> = resp.events.iter().map(|e| e.id.clone()).collect();
                 ids.sort();
                 if fingerprint {
                     use blake2::digest::consts::U32;
@@ -787,18 +786,13 @@ pub(crate) fn run_event_action(
                         if eid != current_eid {
                             idx += 1;
                             current_eid = eid.to_string();
-                            println!(
-                                "  {}. {}",
-                                idx,
-                                &eid[..eid.len().min(12)]
-                            );
+                            println!("  {}. {}", idx, &eid[..eid.len().min(12)]);
                         }
                         println!(
                             "       {} {}",
                             item["dep"].as_str().unwrap_or(""),
-                            &item["blocker_event_id"]
-                                .as_str()
-                                .unwrap_or("")[..item["blocker_event_id"]
+                            &item["blocker_event_id"].as_str().unwrap_or("")[..item
+                                ["blocker_event_id"]
                                 .as_str()
                                 .unwrap_or("")
                                 .len()
@@ -810,8 +804,7 @@ pub(crate) fn run_event_action(
             Ok(())
         }
         EventAction::Timeline { event_id, json } => {
-            let data =
-                rpc_require_daemon(db, socket, RpcMethod::EventTimeline { event_id })?;
+            let data = rpc_require_daemon(db, socket, RpcMethod::EventTimeline { event_id })?;
             if json {
                 println!(
                     "{}",

@@ -167,7 +167,12 @@ pub fn set_enabled(
         .execute(
             "UPDATE local_subscriptions SET enabled = ?3, updated_at_ms = ?4
              WHERE recorded_by = ?1 AND subscription_id = ?2",
-            rusqlite::params![recorded_by, subscription_id, enabled, current_timestamp_ms()],
+            rusqlite::params![
+                recorded_by,
+                subscription_id,
+                enabled,
+                current_timestamp_ms()
+            ],
         )
         .map_err(|e| e.to_string())?;
     if rows == 0 {

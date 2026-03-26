@@ -20,8 +20,8 @@ mod supervisor;
 
 // Re-export public API so callers can still `use crate::peering::loops::*`.
 pub use accept::{accept_loop, accept_loop_until_cancel};
-pub use connect::{connect_loop, ConnectLoopConfig};
 pub(crate) use connect::STALE_DIAL_TARGET_MARKER;
+pub use connect::{connect_loop, ConnectLoopConfig};
 
 use std::collections::HashMap;
 use std::net::SocketAddr;

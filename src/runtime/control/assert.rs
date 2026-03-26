@@ -118,15 +118,11 @@ pub fn query_field(
                 |row| row.get(0),
             )
             .map_err(|e| format!("query failed: {}", e)),
-        "user_count" => {
-            user::count(db, recorded_by).map_err(|e| format!("query failed: {}", e))
-        }
+        "user_count" => user::count(db, recorded_by).map_err(|e| format!("query failed: {}", e)),
         "peer_count" => {
             peer_shared::count(db, recorded_by).map_err(|e| format!("query failed: {}", e))
         }
-        "admin_count" => {
-            admin::count(db, recorded_by).map_err(|e| format!("query failed: {}", e))
-        }
+        "admin_count" => admin::count(db, recorded_by).map_err(|e| format!("query failed: {}", e)),
         "deleted_message_count" => db
             .query_row(
                 "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1",

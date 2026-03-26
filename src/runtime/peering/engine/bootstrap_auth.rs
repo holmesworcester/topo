@@ -202,7 +202,9 @@ pub(super) fn should_initiate_connect_for_source_with_db(
 
 #[cfg(test)]
 mod tests {
+    use super::super::target_dispatch::should_ignore_target_event;
     use super::*;
+    use crate::contracts::peering_contract::SessionDirection;
     use crate::db::open_connection;
     use crate::db::schema::create_tables;
     use crate::db::transport_creds::{set_local_transport_target, CRED_SOURCE_PEER_SHARED};
@@ -210,8 +212,6 @@ mod tests {
         record_invite_bootstrap_trust, record_pending_invite_bootstrap_trust,
     };
     use crate::peering::loops::preferred_connection_direction;
-    use crate::contracts::peering_contract::SessionDirection;
-    use super::super::target_dispatch::should_ignore_target_event;
 
     #[test]
     fn bootstrap_authorized_discovery_targets_override_preferred_side_gate() {

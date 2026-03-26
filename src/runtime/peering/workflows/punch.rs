@@ -14,7 +14,6 @@ use crate::db::{
     health::record_endpoint_observation,
     intro::{insert_intro_attempt, intro_already_seen, update_intro_status},
     open_connection,
-    transport_trust::record_transport_binding,
 };
 use crate::protocol::Frame;
 use crate::sync::SyncConnectionHandler;
@@ -146,14 +145,6 @@ pub async fn handle_intro_offer(
             return;
         }
     };
-
-    // Intro offers carry the target daemon identity needed by daemon-scoped
-    // transport. Record a local observation binding so the subsequent direct
-    // dial can pass transport admission if the introduced peer is otherwise
-    // authorized for this tenant.
-    if let Ok(db) = open_connection(db_path) {
-        let _ = record_transport_binding(&db, recorded_by, &other_peer_hex, &other_daemon_peer_id);
-    }
 
     // Record as received
     let _ = try_record_intro(

@@ -27,9 +27,7 @@ use super::target_planner::{
 };
 use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::db::transport_creds::TenantInfo;
-use crate::peering::loops::{
-    accept_loop_until_cancel, short_peer_id, IntroSpawnerFn,
-};
+use crate::peering::loops::{accept_loop_until_cancel, short_peer_id, IntroSpawnerFn};
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::transport::{TenantClientConfigs, TransportEndpoint};
 

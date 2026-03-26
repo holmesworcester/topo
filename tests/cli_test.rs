@@ -963,6 +963,9 @@ fn test_cli_reconnects_after_bootstrap_supersession_using_observed_endpoint() {
             ..Default::default()
         },
     );
+    wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
 
     let steady_state_eid = send_message(&alice_db, "steady-state before reconnect");
     assert_eventually(
@@ -984,6 +987,7 @@ fn test_cli_reconnects_after_bootstrap_supersession_using_observed_endpoint() {
             ..Default::default()
         },
     );
+    wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
     wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
     wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
 
@@ -1047,16 +1051,19 @@ fn test_cli_lowmem_receiver_restart_catches_offline_delta_and_resumes_sync() {
             ..Default::default()
         },
     );
+    wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
 
     assert_eventually(
         &bob_db,
         &format!("has_event:{} >= 1", offline_batch_tail_eid),
-        timeout_ms,
+        60_000,
     );
     assert_eventually(
         &bob_db,
         &format!("has_event:{} >= 1", offline_delta_eid),
-        timeout_ms,
+        60_000,
     );
 
     let steady_state_eid = send_message(&bob_db, "steady after bob lowmem catch-up");

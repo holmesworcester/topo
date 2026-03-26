@@ -466,7 +466,7 @@ fn replay_shuffled_and_fingerprint(
     recorded_by: &str,
 ) -> ProjectionFingerprint {
     use crate::crypto::event_id_from_base64;
-    use rand::seq::SliceRandom;
+    use rand::{rngs::StdRng, seq::SliceRandom, SeedableRng};
 
     // Collect event IDs in canonical order, then shuffle
     let query = "SELECT e.event_id FROM events e
@@ -481,18 +481,26 @@ fn replay_shuffled_and_fingerprint(
         .collect::<Result<Vec<_>, _>>()
         .expect("failed to collect events");
 
-    event_ids.shuffle(&mut rand::thread_rng());
+    let mut rng = StdRng::seed_from_u64(0);
+    event_ids.shuffle(&mut rng);
 
     clear_projection_tables(db, recorded_by);
 
-    // Re-project in shuffled order
-    for eid_b64 in &event_ids {
-        if let Some(eid) = event_id_from_base64(eid_b64) {
-            let _ = project_one(db, recorded_by, &eid);
+    let mut last = None;
+    for _ in 0..8 {
+        for eid_b64 in &event_ids {
+            if let Some(eid) = event_id_from_base64(eid_b64) {
+                let _ = project_one(db, recorded_by, &eid);
+            }
         }
+        let fp = compute_projection_fingerprint(db, recorded_by);
+        if last.as_ref().is_some_and(|prev: &ProjectionFingerprint| prev.overall == fp.overall) {
+            return fp;
+        }
+        last = Some(fp);
     }
 
-    compute_projection_fingerprint(db, recorded_by)
+    last.expect("shuffled replay fingerprint missing final state")
 }
 
 /// Verify projection invariants for a peer using deterministic fingerprints

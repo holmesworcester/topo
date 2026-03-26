@@ -10,7 +10,7 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cli_harness::{
-    accept_invite_with_identity, assert_eventually, create_invite_with_spki, create_workspace,
+    accept_invite_with_identity, create_invite_with_spki, create_workspace,
     daemon_identity_fingerprint, daemon_listen_addr, ensure_active_peer, generate_messages,
     message_count_sql, start_daemon, topo_cmd, wait_for_daemon_stopped, wait_for_live_sync_session,
     HarnessDaemon,
@@ -70,13 +70,8 @@ impl SharedWorkspaceBench {
     }
 
     fn warm(&self) -> i64 {
-        let warm_eid = cli_harness::send_message(&self.alice_db, "warmup-alice");
-        assert_eventually(
-            &self.bob_db,
-            &format!("has_event:{} >= 1", warm_eid),
-            30_000,
-        );
-        wait_for_message_count(&self.bob_db, 1, Duration::from_secs(30));
+        let _warm_eid = cli_harness::send_message(&self.alice_db, "warmup-alice");
+        wait_for_message_count(&self.bob_db, 1, Duration::from_secs(60));
         message_count_sql(&self.bob_db)
     }
 

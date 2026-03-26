@@ -145,7 +145,9 @@ impl BootstrapAddress {
     }
 }
 
-pub fn parse_bootstrap_address(bootstrap_addr: &str) -> Result<BootstrapAddress, BootstrapAddressError> {
+pub fn parse_bootstrap_address(
+    bootstrap_addr: &str,
+) -> Result<BootstrapAddress, BootstrapAddressError> {
     // Try full socket addr first (e.g. "1.2.3.4:5555", "[::1]:5555")
     if let Ok(sock) = bootstrap_addr.parse::<SocketAddr>() {
         return Ok(match sock.ip() {

@@ -306,6 +306,8 @@ fn test_sync_round_and_request_with_live_peer() {
     let _bob_daemon = start_daemon(&bob_db);
 
     wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
 
     // SC2: sync round all
     let round_stdout = wait_for_sync_round_all(&bob_db, Duration::from_secs(30));

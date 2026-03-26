@@ -15,23 +15,22 @@ use std::time::Duration;
 use cli_harness::{
     accept_invite_with_identity_on_running_daemon, create_invite_with_spki,
     daemon_identity_fingerprint, daemon_listen_addr, hold_network_test_lock_for_binary,
-    start_daemon, wait_for_active_tenant_ready, wait_for_daemon_stopped,
+    send_message, start_daemon, wait_for_active_tenant_ready, wait_for_daemon_stopped,
     wait_for_live_sync_session, HarnessDaemon,
 };
-use topo::crypto::{event_id_from_base64, event_id_to_base64};
+use topo::crypto::event_id_from_base64;
 use topo::db::health::record_endpoint_observation;
 use topo::db::intro::{freshest_endpoint, list_intro_attempts};
 use topo::db::open_connection;
 use topo::db::project_queue::ProjectQueue;
 use topo::db::transport_trust::authorized_fingerprints_from_db;
-use topo::peering::loops::{accept_loop, connect_loop, ConnectLoopConfig};
-use topo::peering::workflows::intro::{build_intro_offer, run_intro, send_intro_offer};
-use topo::peering::workflows::punch::spawn_intro_listener;
+use topo::peering::loops::accept_loop;
+use topo::peering::workflows::intro::build_intro_offer;
+use topo::peering::workflows::punch::{handle_intro_offer, spawn_intro_listener};
 use topo::projection::apply::project_one;
 use topo::shared::protocol::Frame;
 use topo::testutil::{assert_eventually, create_dynamic_endpoint_for_peer, Peer};
-
-const TEST_COVER_SERVER_NAME: &str = "daemon.topo.invalid";
+use topo::transport::multi_workspace::transport_sni;
 
 fn holepunch_test_lock() -> std::sync::MutexGuard<'static, ()> {
     static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
@@ -39,12 +38,6 @@ fn holepunch_test_lock() -> std::sync::MutexGuard<'static, ()> {
     LOCK.get_or_init(|| Mutex::new(()))
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner())
-}
-
-fn daemon_peer_id(peer: &Peer) -> String {
-    topo::transport::load_daemon_identity_from_db(&peer.db_path)
-        .expect("load test daemon identity")
-        .0
 }
 
 /// Force-drain the project_queue for a peer's DB, projecting any pending items.
@@ -104,6 +97,70 @@ fn bootstrap_joined_peer_via_daemon(
     Peer::from_bootstrapped_db(name, db_path, tempdir)
 }
 
+struct BootstrappedDaemonPeer {
+    name: String,
+    db_path: String,
+    tempdir: tempfile::TempDir,
+    daemon: HarnessDaemon,
+}
+
+impl BootstrappedDaemonPeer {
+    fn stop_into_peer(self) -> Peer {
+        let BootstrappedDaemonPeer {
+            name,
+            db_path,
+            tempdir,
+            daemon,
+        } = self;
+        drop(daemon);
+        wait_for_daemon_stopped(&db_path, Duration::from_secs(10));
+        Peer::from_bootstrapped_db(&name, db_path, tempdir)
+    }
+}
+
+fn bootstrap_joined_peer_with_running_daemon(
+    name: &str,
+    device_name: &str,
+    creator: &Peer,
+    creator_daemon: &HarnessDaemon,
+) -> BootstrappedDaemonPeer {
+    let _ = creator_daemon;
+    wait_for_active_tenant_ready(&creator.db_path, Duration::from_secs(30));
+
+    let tempdir = tempfile::tempdir().expect("create joiner tempdir");
+    let db_path = tempdir
+        .path()
+        .join(format!("{name}.db"))
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let invite_link = create_invite_with_spki(
+        &creator.db_path,
+        &daemon_listen_addr(&creator.db_path),
+        Some(&daemon_identity_fingerprint(&creator.db_path)),
+    );
+
+    let joiner_daemon = start_daemon(&db_path);
+    accept_invite_with_identity_on_running_daemon(
+        &db_path,
+        &invite_link,
+        name,
+        device_name,
+        Duration::from_secs(30),
+    );
+    wait_for_active_tenant_ready(&db_path, Duration::from_secs(60));
+    wait_for_live_sync_session(&creator.db_path, Duration::from_secs(60));
+    wait_for_live_sync_session(&db_path, Duration::from_secs(60));
+
+    BootstrappedDaemonPeer {
+        name: name.to_string(),
+        db_path,
+        tempdir,
+        daemon: joiner_daemon,
+    }
+}
+
 fn bootstrap_intro_workspace(name: &str) -> (Peer, HarnessDaemon) {
     let intro = Peer::new_with_identity(name);
     let daemon = start_daemon(&intro.db_path);
@@ -130,146 +187,66 @@ async fn test_three_peer_intro_happy_path() {
 
     // Intro creates the workspace; A and B join it so all share one trust root.
     let (intro, intro_daemon) = bootstrap_intro_workspace("introducer");
-    let peer_a = bootstrap_joined_peer_via_daemon("peer_a", "peer-a-box", &intro, &intro_daemon);
-    let peer_b = bootstrap_joined_peer_via_daemon("peer_b", "peer-b-box", &intro, &intro_daemon);
+    let peer_a_live =
+        bootstrap_joined_peer_with_running_daemon("peer_a", "peer-a-box", &intro, &intro_daemon);
+    let peer_b_live =
+        bootstrap_joined_peer_with_running_daemon("peer_b", "peer-b-box", &intro, &intro_daemon);
+
+    let a_bootstrap_eid = send_message(&peer_a_live.db_path, "peer_a bootstrap message");
+    let b_bootstrap_eid = send_message(&peer_b_live.db_path, "peer_b bootstrap message");
+    let i_bootstrap_eid = send_message(&intro.db_path, "introducer bootstrap message");
+
+    cli_harness::assert_eventually(
+        &intro.db_path,
+        &format!("has_event:{} >= 1", a_bootstrap_eid),
+        60_000,
+    );
+    cli_harness::assert_eventually(
+        &intro.db_path,
+        &format!("has_event:{} >= 1", b_bootstrap_eid),
+        60_000,
+    );
+    cli_harness::assert_eventually(
+        &peer_a_live.db_path,
+        &format!("has_event:{} >= 1", i_bootstrap_eid),
+        60_000,
+    );
+    cli_harness::assert_eventually(
+        &peer_b_live.db_path,
+        &format!("has_event:{} >= 1", i_bootstrap_eid),
+        60_000,
+    );
+    cli_harness::assert_eventually(
+        &peer_a_live.db_path,
+        &format!("has_event:{} >= 1", b_bootstrap_eid),
+        60_000,
+    );
+    cli_harness::assert_eventually(
+        &peer_b_live.db_path,
+        &format!("has_event:{} >= 1", a_bootstrap_eid),
+        60_000,
+    );
+
     drop(intro_daemon);
     wait_for_daemon_stopped(&intro.db_path, Duration::from_secs(10));
-
-    // Each peer creates a unique event to sync.
-    let a_bootstrap_msg = peer_a.create_message("peer_a bootstrap message");
-    let b_bootstrap_msg = peer_b.create_message("peer_b bootstrap message");
-    let i_bootstrap_msg = intro.create_message("introducer bootstrap message");
-    let a_bootstrap_b64 = event_id_to_base64(&a_bootstrap_msg);
-    let b_bootstrap_b64 = event_id_to_base64(&b_bootstrap_msg);
-    let i_bootstrap_b64 = event_id_to_base64(&i_bootstrap_msg);
-
-    let fp_i = intro.spki_fingerprint();
-    let fp_a = peer_a.spki_fingerprint();
-    let fp_b = peer_b.spki_fingerprint();
+    let peer_a = peer_a_live.stop_into_peer();
+    let peer_b = peer_b_live.stop_into_peer();
 
     // Trust is derived from PeerShared events synced during workspace join.
     // All peers share the same workspace, so identity chains project trust
     // entries at each peer after sync without any manual trust seeding.
+    let fp_i = intro.spki_fingerprint();
+    let fp_a = peer_a.spki_fingerprint();
+    let fp_b = peer_b.spki_fingerprint();
 
-    // Create dynamic dual endpoints for all three peers.
-    // Trust is resolved from SQL at each TLS handshake (production behavior).
-    // Dual endpoints use the same port for connect and accept, so I's organic
-    // endpoint observations from Phase 1 sync point to A and B's listening addresses.
-    let ep_i = create_dynamic_endpoint_for_peer(&intro);
+    // Create the fresh dynamic dual endpoints used for the actual intro/punch
+    // flow. We record their addresses below so the introducer can target them.
     let ep_a = create_dynamic_endpoint_for_peer(&peer_a);
     let ep_b = create_dynamic_endpoint_for_peer(&peer_b);
-
-    let addr_i = ep_i.local_addr().expect("addr_i");
     let addr_a = ep_a.local_addr().expect("addr_a");
     let addr_b = ep_b.local_addr().expect("addr_b");
 
-    // --- Phase 1: Relay sync I<->A and I<->B ---
-    // I runs accept_loop; A and B connect to I using their dual endpoints.
-    // I's accept_loop organically records endpoint observations for A and B
-    // at their dual endpoint source addresses (= their listening addresses).
-    let i_ep1 = ep_i.clone();
-    let i_db = intro.db_path.clone();
-    let i_id = intro.identity.clone();
-    let _i_accept = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let _ = accept_loop(
-                &i_db,
-                &i_id,
-                i_ep1,
-                spawn_intro_listener,
-                topo::testutil::test_ingest_fns(),
-            )
-            .await;
-        });
-    });
-
-    let a_ep1 = ep_a.clone();
-    let a_db1 = peer_a.db_path.clone();
-    let a_id1 = peer_a.identity.clone();
-    let intro_target_for_a = intro.transport_peer_id();
-    let _a_connect = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let _ = connect_loop(ConnectLoopConfig {
-                db_path: a_db1.clone(),
-                recorded_by: a_id1.clone(),
-                endpoint: a_ep1,
-                remote: addr_i,
-                remote_transport_peer_id: intro_target_for_a.clone(),
-                client_config: None,
-                intro_spawner: spawn_intro_listener,
-                ingest: topo::testutil::test_ingest_fns(),
-                shutdown: None,
-                bootstrap_fallback_client_config: None,
-                sync_control: None,
-                auth_plan: None,
-                expected_remote_daemon_peer_id: None,
-            })
-            .await;
-        });
-    });
-
-    let b_ep1 = ep_b.clone();
-    let b_db1 = peer_b.db_path.clone();
-    let b_id1 = peer_b.identity.clone();
-    let intro_target_for_b = intro.transport_peer_id();
-    let _b_connect = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            let _ = connect_loop(ConnectLoopConfig {
-                db_path: b_db1.clone(),
-                recorded_by: b_id1.clone(),
-                endpoint: b_ep1,
-                remote: addr_i,
-                remote_transport_peer_id: intro_target_for_b.clone(),
-                client_config: None,
-                intro_spawner: spawn_intro_listener,
-                ingest: topo::testutil::test_ingest_fns(),
-                shutdown: None,
-                bootstrap_fallback_client_config: None,
-                sync_control: None,
-                auth_plan: None,
-                expected_remote_daemon_peer_id: None,
-            })
-            .await;
-        });
-    });
-
-    // Wait for bootstrap message exchange needed by the intro flow.
-    assert_eventually(
-        || {
-            intro.has_event(&a_bootstrap_b64)
-                && intro.has_event(&b_bootstrap_b64)
-                && peer_a.has_event(&i_bootstrap_b64)
-                && peer_b.has_event(&i_bootstrap_b64)
-                && peer_a.has_event(&b_bootstrap_b64)
-                && peer_b.has_event(&a_bootstrap_b64)
-        },
-        Duration::from_secs(20),
-        &format!(
-            "bootstrap exchange (I_has_A={}, I_has_B={}, A_has_I={}, B_has_I={}, A_has_B={}, B_has_A={})",
-            intro.has_event(&a_bootstrap_b64),
-            intro.has_event(&b_bootstrap_b64),
-            peer_a.has_event(&i_bootstrap_b64),
-            peer_b.has_event(&i_bootstrap_b64),
-            peer_a.has_event(&b_bootstrap_b64),
-            peer_b.has_event(&a_bootstrap_b64)
-        ),
-    )
-    .await;
-
-    // Verify I has organic endpoint observations for A and B that match
-    // their actual dual endpoint addresses (no manual observation writes).
+    // Record the A/B addresses the introducer should hand out during Phase 2.
     {
         let db = open_connection(&intro.db_path).expect("open intro db");
         let now_ms = std::time::SystemTime::now()
@@ -353,11 +330,6 @@ async fn test_three_peer_intro_happy_path() {
         )
         .await;
     }
-
-    // Close I's endpoint to stop Phase 1 sync sessions.
-    // A and B's connect_loop threads will fail to reconnect (expected).
-    ep_i.close(0u32.into(), b"phase1-done");
-    tokio::time::sleep(Duration::from_millis(300)).await;
 
     // --- Phase 2: I sends IntroOffer to A and B ---
     // A and B's dual endpoints are still alive at the same addresses.
@@ -620,8 +592,9 @@ async fn test_dynamic_trust_rejects_unknown_peer() {
     // Unknown peer tries to connect to A — should fail at TLS handshake
     // because A's dynamic trust lookup finds no matching row.
     let ep_unknown = create_dynamic_endpoint_for_peer(&unknown);
+    let target_sni = transport_sni(&peer_a.transport_peer_id());
     let result = ep_unknown
-        .connect(addr_a, TEST_COVER_SERVER_NAME)
+        .connect(addr_a, &target_sni)
         .expect("initiate connect")
         .await;
 

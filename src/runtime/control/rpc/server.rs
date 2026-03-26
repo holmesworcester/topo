@@ -1478,7 +1478,9 @@ fn dispatch(
                             "unblocked_by_event_id": row.unblocked_by_event_id,
                             "projected_at_ms": row.projected_at,
                         })),
-                        Ok(None) => RpcResponse::error(format!("no timeline entry for event {}", event_id)),
+                        Ok(None) => {
+                            RpcResponse::error(format!("no timeline entry for event {}", event_id))
+                        }
                         Err(e) => RpcResponse::error(e.to_string()),
                     }
                 }
