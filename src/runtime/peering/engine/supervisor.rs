@@ -505,12 +505,19 @@ fn transition_state(_state: RuntimeState, event: RuntimeEvent) -> RuntimeState {
     }
 }
 
-async fn run_bootstrap_refresher(
+/// Generic durable-job-driven refresh loop. Replaces per-job async loops
+/// with a single executor that: polls for due job → runs the refresh
+/// function → marks complete. The refresh function authors events; this
+/// loop only handles timing and error suppression.
+async fn run_job_driven_refresh(
     db_path: String,
+    job_kind: crate::event_modules::operational::durable_jobs::DurableJobKind,
+    label: &str,
+    refresh: impl Fn(&str) -> Result<(), String>,
     shutdown: CancellationToken,
 ) -> Result<(), String> {
     use crate::event_modules::operational::durable_jobs::{
-        complete_job, next_due_at, poll_due_jobs, DurableJobKind,
+        complete_job, next_due_at, poll_due_jobs,
     };
     let mut warning_gate = RepeatedWarningGate::new(Duration::from_secs(300));
     loop {
@@ -518,23 +525,17 @@ async fn run_bootstrap_refresher(
             break;
         }
 
-        // Check if the bootstrap refresh job is due. If not, sleep until it
-        // is, or fall back to a 1s poll. This replaces the old fixed-cadence
-        // `tokio::time::sleep(1000ms)` with durable-job-driven timing.
         let sleep_ms = {
             let conn = open_connection(&db_path).map_err(|e| e.to_string())?;
-            let due = poll_due_jobs(&conn, 1)
+            let is_due = poll_due_jobs(&conn, 1)
                 .map_err(|e| e.to_string())?
-                .into_iter()
-                .find(|j| j.kind == DurableJobKind::BootstrapRefresh);
-            if due.is_none() {
+                .iter()
+                .any(|j| j.kind == job_kind);
+            if !is_due {
                 let next = next_due_at(&conn).map_err(|e| e.to_string())?;
                 let now = crate::db::queue::current_timestamp_ms();
-                let wait = next.map(|t| (t - now).max(50)).unwrap_or(1000);
-                drop(conn);
-                wait as u64
+                next.map(|t| (t - now).max(50)).unwrap_or(1000) as u64
             } else {
-                drop(conn);
                 0
             }
         };
@@ -547,25 +548,10 @@ async fn run_bootstrap_refresher(
             continue;
         }
 
-        match collect_all_bootstrap_targets(&db_path) {
-            Ok(targets) => {
-                warning_gate.clear();
-                for (tenant_id, peer_id, invite_event_id, remote) in targets {
-                    author_connection_planned(
-                        &db_path,
-                        &TargetIngressEvent {
-                            tenant_id,
-                            remote,
-                            source: TargetIngressSource::Bootstrap {
-                                peer_id,
-                                invite_event_id,
-                            },
-                        },
-                    );
-                }
-            }
+        match refresh(&db_path) {
+            Ok(()) => warning_gate.clear(),
             Err(e) => {
-                let message = format!("BOOTSTRAP AUTODIAL REFRESH failed: {}", e);
+                let message = format!("{label} failed: {e}");
                 if warning_gate.should_emit(message.clone())
                     && should_emit_globally(format!("engine:{message}"))
                 {
@@ -574,9 +560,8 @@ async fn run_bootstrap_refresher(
             }
         }
 
-        // Mark the job as completed — advances next_due_at_ms by interval.
         if let Ok(conn) = open_connection(&db_path) {
-            let _ = complete_job(&conn, &client_id_for_db(&db_path), DurableJobKind::BootstrapRefresh);
+            let _ = complete_job(&conn, &client_id_for_db(&db_path), job_kind);
         }
 
         tokio::select! {
@@ -584,88 +569,70 @@ async fn run_bootstrap_refresher(
             _ = tokio::time::sleep(Duration::from_millis(50)) => {}
         }
     }
-
     Ok(())
+}
+
+fn refresh_bootstrap_targets(db_path: &str) -> Result<(), String> {
+    for (tenant_id, peer_id, invite_event_id, remote) in
+        collect_all_bootstrap_targets(db_path).map_err(|e| e.to_string())?
+    {
+        author_connection_planned(
+            db_path,
+            &TargetIngressEvent {
+                tenant_id,
+                remote,
+                source: TargetIngressSource::Bootstrap {
+                    peer_id,
+                    invite_event_id,
+                },
+            },
+        );
+    }
+    Ok(())
+}
+
+fn refresh_observed_endpoint_targets(db_path: &str) -> Result<(), String> {
+    for (tenant_id, peer_id, remote) in
+        collect_all_observed_endpoint_targets(db_path).map_err(|e| e.to_string())?
+    {
+        author_connection_planned(
+            db_path,
+            &TargetIngressEvent {
+                tenant_id,
+                remote,
+                source: TargetIngressSource::ObservedPeer { peer_id },
+            },
+        );
+    }
+    Ok(())
+}
+
+async fn run_bootstrap_refresher(
+    db_path: String,
+    shutdown: CancellationToken,
+) -> Result<(), String> {
+    run_job_driven_refresh(
+        db_path,
+        crate::event_modules::operational::durable_jobs::DurableJobKind::BootstrapRefresh,
+        "BOOTSTRAP AUTODIAL REFRESH",
+        refresh_bootstrap_targets,
+        shutdown,
+    )
+    .await
 }
 
 async fn run_observed_endpoint_refresher(
     db_path: String,
     shutdown: CancellationToken,
 ) -> Result<(), String> {
-    use crate::event_modules::operational::durable_jobs::{
-        complete_job, next_due_at, poll_due_jobs, DurableJobKind,
-    };
-    let mut warning_gate = RepeatedWarningGate::new(Duration::from_secs(300));
-    loop {
-        if shutdown.is_cancelled() {
-            break;
-        }
-
-        let sleep_ms = {
-            let conn = open_connection(&db_path).map_err(|e| e.to_string())?;
-            let due = poll_due_jobs(&conn, 1)
-                .map_err(|e| e.to_string())?
-                .into_iter()
-                .find(|j| j.kind == DurableJobKind::ObservedEndpointRefresh);
-            if due.is_none() {
-                let next = next_due_at(&conn).map_err(|e| e.to_string())?;
-                let now = crate::db::queue::current_timestamp_ms();
-                let wait = next.map(|t| (t - now).max(50)).unwrap_or(1000);
-                drop(conn);
-                wait as u64
-            } else {
-                drop(conn);
-                0
-            }
-        };
-
-        if sleep_ms > 0 {
-            tokio::select! {
-                _ = shutdown.cancelled() => break,
-                _ = tokio::time::sleep(Duration::from_millis(sleep_ms)) => {}
-            }
-            continue;
-        }
-
-        match collect_all_observed_endpoint_targets(&db_path) {
-            Ok(targets) => {
-                warning_gate.clear();
-                for (tenant_id, peer_id, remote) in targets {
-                    author_connection_planned(
-                        &db_path,
-                        &TargetIngressEvent {
-                            tenant_id,
-                            remote,
-                            source: TargetIngressSource::ObservedPeer { peer_id },
-                        },
-                    );
-                }
-            }
-            Err(e) => {
-                let message = format!("OBSERVED ENDPOINT REFRESH failed: {}", e);
-                if warning_gate.should_emit(message.clone())
-                    && should_emit_globally(format!("engine:{message}"))
-                {
-                    warn!("{}", message);
-                }
-            }
-        }
-
-        if let Ok(conn) = open_connection(&db_path) {
-            let _ = complete_job(
-                &conn,
-                &client_id_for_db(&db_path),
-                DurableJobKind::ObservedEndpointRefresh,
-            );
-        }
-
-        tokio::select! {
-            _ = shutdown.cancelled() => break,
-            _ = tokio::time::sleep(Duration::from_millis(50)) => {}
-        }
-    }
-
-    Ok(())
+    run_job_driven_refresh(
+        db_path,
+        crate::event_modules::operational::durable_jobs::DurableJobKind::ObservedEndpointRefresh,
+        "OBSERVED ENDPOINT REFRESH",
+        refresh_observed_endpoint_targets,
+        shutdown,
+    )
+    .await
 }
 
 fn client_id_for_db(db_path: &str) -> String {
