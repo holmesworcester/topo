@@ -8,6 +8,30 @@ use rusqlite::Connection;
 use super::cascade::cascade_unblocked;
 use super::stages::{record_rejection, run_dep_and_projection_stages};
 
+fn event_is_still_recorded(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, event_id_b64],
+        |row| row.get(0),
+    )
+}
+
+fn event_is_valid_for_peer(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, event_id_b64],
+        |row| row.get(0),
+    )
+}
+
 /// Single-event projection step (no cascade).
 ///
 /// Executes the 7-step projection algorithm for one event:
@@ -105,6 +129,14 @@ pub(crate) fn project_one_step(
         _ => {}
     }
 
+    // The projector may have hard-purged this event inside the current
+    // transaction (for example, a message arriving after a prior tombstone).
+    // In that case, projection succeeded but there is nothing left to mark
+    // valid or deliver to subscriptions for this tenant.
+    if !event_is_still_recorded(conn, recorded_by, &event_id_b64)? {
+        return Ok((ProjectionDecision::Valid, Some(parsed)));
+    }
+
     // 7. Write terminal state + subscription hook atomically.
     //    Wrapped in a savepoint so that if the subscription hook fails, the
     //    valid_events row is also rolled back. This prevents a crash window
@@ -167,10 +199,14 @@ pub fn project_one(
     recorded_by: &str,
     event_id: &EventId,
 ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
-    let (decision, parsed) = project_one_step(conn, recorded_by, event_id)?;
-    if matches!(decision, ProjectionDecision::Valid) {
-        let event_id_b64 = event_id_to_base64(event_id);
-        cascade_unblocked(conn, recorded_by, &event_id_b64, parsed.as_ref())?;
-    }
-    Ok(decision)
+    crate::db::queue::with_immediate_tx_result(conn, || {
+        let (decision, parsed) = project_one_step(conn, recorded_by, event_id)?;
+        if matches!(decision, ProjectionDecision::Valid) {
+            let event_id_b64 = event_id_to_base64(event_id);
+            if event_is_valid_for_peer(conn, recorded_by, &event_id_b64)? {
+                cascade_unblocked(conn, recorded_by, &event_id_b64, parsed.as_ref())?;
+            }
+        }
+        Ok(decision)
+    })
 }

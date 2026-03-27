@@ -96,7 +96,11 @@ pub fn encode_bench_dep(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         FieldValue::FixedBytes(b.payload.to_vec()),
     ];
 
-    Ok(encode_fields(EVENT_TYPE_BENCH_DEP, BENCH_DEP_FIELDS, &values)?)
+    Ok(encode_fields(
+        EVENT_TYPE_BENCH_DEP,
+        BENCH_DEP_FIELDS,
+        &values,
+    )?)
 }
 
 // === Projector (event-module locality) ===

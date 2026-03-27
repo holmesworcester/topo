@@ -6,6 +6,18 @@ use crate::event_modules::ParsedEvent;
 use crate::state::shared_workspace_fanout::fanout_stored_shared_event_immediate;
 use rusqlite::Connection;
 
+fn event_is_valid_for_peer(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+) -> Result<bool, rusqlite::Error> {
+    conn.query_row(
+        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, event_id_b64],
+        |row| row.get(0),
+    )
+}
+
 /// After projecting an event, cascade-unblock dependents using Kahn's algorithm.
 ///
 /// Guard retries (InviteAccepted → workspace retries, File →
@@ -91,7 +103,9 @@ fn cascade_unblocked_inner(
             if let Some(event_id) = event_id_from_base64(eid_b64) {
                 let (decision, _parsed) =
                     super::project_one::project_one_step(conn, recorded_by, &event_id)?;
-                if matches!(decision, ProjectionDecision::Valid) {
+                if matches!(decision, ProjectionDecision::Valid)
+                    && event_is_valid_for_peer(conn, recorded_by, eid_b64)?
+                {
                     // Fan out newly valid shared events to same-workspace siblings
                     let _ = fanout_stored_shared_event_immediate(conn, recorded_by, &event_id);
                     worklist.push(eid_b64.clone());

@@ -13,6 +13,7 @@ mod tests {
     use topo::event_modules::message_deletion::project_pure;
     use topo::event_modules::message_deletion::MessageDeletionEvent;
     use topo::event_modules::ParsedEvent;
+    use topo::projection::contract::EmitCommand;
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "del_event_1";
@@ -46,6 +47,12 @@ mod tests {
             result.write_ops.len() >= 3,
             "expected intent + tombstone + cascade ops"
         );
+        assert_emits_command(&result, "HardPurgeMessageGraph", |cmd| {
+            matches!(
+                cmd,
+                EmitCommand::HardPurgeMessageGraph { message_event_id } if message_event_id == &b64(&[1u8; 32])
+            )
+        });
     }
 
     // ── SPEC_DEL_AUTHOR_01: break (wrong author) ──
@@ -103,6 +110,12 @@ mod tests {
         assert_valid(&result);
         // Should still record intent
         assert_writes_to_table(&result, "deletion_intents");
+        assert_emits_command(&result, "HardPurgeMessageGraph", |cmd| {
+            matches!(
+                cmd,
+                EmitCommand::HardPurgeMessageGraph { message_event_id } if message_event_id == &b64(&[1u8; 32])
+            )
+        });
     }
 
     // ── CHK_DEL_IDEMPOTENT: break (tombstoned but wrong author) ──

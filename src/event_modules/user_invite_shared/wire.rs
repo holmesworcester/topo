@@ -83,7 +83,11 @@ pub fn encode_user_invite(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         FieldValue::FixedBytes(e.signature.to_vec()),
     ];
 
-    Ok(encode_fields(EVENT_TYPE_USER_INVITE, USER_INVITE_FIELDS, &values)?)
+    Ok(encode_fields(
+        EVENT_TYPE_USER_INVITE,
+        USER_INVITE_FIELDS,
+        &values,
+    )?)
 }
 
 pub static USER_INVITE_META: EventTypeMeta = EventTypeMeta {

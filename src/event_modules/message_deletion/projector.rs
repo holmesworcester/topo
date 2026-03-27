@@ -1,6 +1,6 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 
 /// Pure projector: MessageDeletion -> two-stage deletion intent + tombstone model.
 ///
@@ -55,13 +55,18 @@ pub fn project_pure(
             values: vec![
                 SqlVal::Text(recorded_by.to_string()),
                 SqlVal::Text("message".to_string()),
-                SqlVal::Text(target_b64),
+                SqlVal::Text(target_b64.clone()),
                 SqlVal::Text(event_id_b64.to_string()),
                 SqlVal::Text(del_author_b64),
                 SqlVal::Int(del.created_at_ms as i64),
             ],
         }];
-        return ProjectorResult::valid(ops);
+        return ProjectorResult::valid_with_commands(
+            ops,
+            vec![EmitCommand::HardPurgeMessageGraph {
+                message_event_id: target_b64,
+            }],
+        );
     }
 
     // Always record deletion intent (idempotent via INSERT OR IGNORE)
@@ -124,11 +129,16 @@ pub fn project_pure(
             table: "reactions",
             where_clause: vec![
                 ("recorded_by", SqlVal::Text(recorded_by.to_string())),
-                ("target_event_id", SqlVal::Text(target_b64)),
+                ("target_event_id", SqlVal::Text(target_b64.clone())),
             ],
         });
 
-        return ProjectorResult::valid(ops);
+        return ProjectorResult::valid_with_commands(
+            ops,
+            vec![EmitCommand::HardPurgeMessageGraph {
+                message_event_id: target_b64,
+            }],
+        );
     }
 
     // Target doesn't exist yet - only record intent.

@@ -124,6 +124,7 @@ mod tests {
         assert!(tables.contains(&"messages".to_string()));
         assert!(tables.contains(&"reactions".to_string()));
         assert!(tables.contains(&"deletion_intents".to_string()));
+        assert!(tables.contains(&"deleted_files".to_string()));
 
         // Epoch-only startup guard
         assert!(tables.contains(&"schema_epoch".to_string()));

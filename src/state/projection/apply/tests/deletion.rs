@@ -436,6 +436,9 @@ fn test_deletion_convergence() {
     mark_valid_for_test(&conn, recorded_by, &net_eid, events::EVENT_TYPE_WORKSPACE);
 
     // Project in reverse order: del first (intent-only), then rxn (dep-blocks on msg), then msg (tombstones + unblocks rxn)
+    insert_event_raw(&conn, recorded_by, &msg_blob);
+    insert_event_raw(&conn, recorded_by, &rxn_blob);
+    insert_event_raw(&conn, recorded_by, &del_blob);
     project_one(&conn, recorded_by, &del_eid).unwrap();
     project_one(&conn, recorded_by, &rxn_eid).unwrap();
     project_one(&conn, recorded_by, &msg_eid).unwrap();
@@ -661,6 +664,9 @@ fn test_deletion_invariant_order_convergence_identical_state() {
         rusqlite::params![recorded_by],
     )
     .unwrap();
+
+    insert_event_raw(&conn, recorded_by, &msg_blob);
+    insert_event_raw(&conn, recorded_by, &del_blob);
 
     // Project in reverse: delete first, then message
     project_one(&conn, recorded_by, &del_eid).unwrap();
@@ -913,4 +919,910 @@ fn test_deletion_invariant_monotonic() {
         tombstone, 1,
         "tombstone must exist for delete-before-create"
     );
+}
+
+#[test]
+fn test_hard_purge_removes_message_graph_and_auxiliary_rows() {
+    let conn = setup();
+    let recorded_by = "peer-hard-purge";
+    let _workspace_eid = setup_workspace_event(&conn, recorded_by);
+    let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+    let key_event_id = ensure_test_content_key(&conn, recorded_by);
+
+    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "purge graph");
+    let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+    project_one(&conn, recorded_by, &msg_eid).unwrap();
+
+    let (_rxn, rxn_blob) = make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "🔥");
+    let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
+    project_one(&conn, recorded_by, &rxn_eid).unwrap();
+
+    let (file_event, file_blob) =
+        make_attachment_signed(&signing_key, &signer_eid, &msg_eid, &key_event_id);
+    let file_id = match &file_event {
+        ParsedEvent::File(file) => file.file_id,
+        other => panic!("expected file event, got {:?}", other),
+    };
+    let file_eid = insert_event_raw(&conn, recorded_by, &file_blob);
+    project_one(&conn, recorded_by, &file_eid).unwrap();
+
+    let (_slice, slice_blob) = make_file_slice(&signing_key, &signer_eid, file_id, 0, b"slice-0");
+    let slice_eid = insert_event_raw(&conn, recorded_by, &slice_blob);
+    project_one(&conn, recorded_by, &slice_eid).unwrap();
+
+    let msg_b64 = event_id_to_base64(&msg_eid);
+    let rxn_b64 = event_id_to_base64(&rxn_eid);
+    let file_b64 = event_id_to_base64(&file_eid);
+    let slice_b64 = event_id_to_base64(&slice_eid);
+    let file_id_b64 = event_id_to_base64(&file_id);
+
+    crate::db::local_client_ops::insert(&conn, recorded_by, "op-msg", &msg_eid, "send", 10)
+        .unwrap();
+    crate::db::local_client_ops::insert(&conn, recorded_by, "op-rxn", &rxn_eid, "react", 11)
+        .unwrap();
+    crate::db::local_client_ops::insert(&conn, recorded_by, "op-file", &file_eid, "send-file", 12)
+        .unwrap();
+    crate::db::local_client_ops::insert(
+        &conn,
+        recorded_by,
+        "op-slice",
+        &slice_eid,
+        "file-slice",
+        13,
+    )
+    .unwrap();
+
+    conn.execute(
+        "INSERT INTO local_subscription_state
+         (recorded_by, subscription_id, next_seq, pending_count, dirty, latest_event_id, latest_created_at_ms, updated_at_ms)
+         VALUES (?1, 'purge-sub', 5, 4, 1, ?2, 99, 99)",
+        rusqlite::params![recorded_by, &slice_b64],
+    )
+    .unwrap();
+    for (seq, event_type, event_id) in [
+        (1_i64, "message", msg_b64.clone()),
+        (2_i64, "reaction", rxn_b64.clone()),
+        (3_i64, "file", file_b64.clone()),
+        (4_i64, "file_slice", slice_b64.clone()),
+    ] {
+        conn.execute(
+            "INSERT INTO local_subscription_feed
+             (recorded_by, subscription_id, seq, event_type, event_id, created_at_ms, payload_json, emitted_at_ms)
+             VALUES (?1, 'purge-sub', ?2, ?3, ?4, 1, '{}', 1)",
+            rusqlite::params![recorded_by, seq, event_type, event_id],
+        )
+        .unwrap();
+    }
+
+    for event_id in [&msg_eid, &rxn_eid, &file_eid, &slice_eid] {
+        conn.execute(
+            "INSERT INTO pending_shared_fanouts (origin_peer_id, workspace_id, event_id)
+             VALUES (?1, '', ?2)",
+            rusqlite::params![recorded_by, &event_id[..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO deferred_need_events (peer_id, id, first_seen_at)
+             VALUES (?1, ?2, 1)",
+            rusqlite::params![recorded_by, &event_id[..]],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO sync_run_rx_events (run_id, event_id) VALUES (1, ?1)",
+            rusqlite::params![event_id_to_base64(event_id)],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT OR REPLACE INTO event_timeline
+             (event_id, first_received_at, first_stored_at, blocked_at, unblocked_at, unblocked_by_event_id, projected_at)
+             VALUES (?1, 1, 1, NULL, NULL, NULL, 1)",
+            rusqlite::params![event_id_to_base64(event_id)],
+        )
+        .unwrap();
+    }
+    conn.execute(
+        "INSERT INTO event_timeline
+         (event_id, first_received_at, first_stored_at, blocked_at, unblocked_at, unblocked_by_event_id, projected_at)
+         VALUES ('other-event', 1, 1, NULL, NULL, ?1, NULL)",
+        rusqlite::params![&msg_b64],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO file_slice_guard_blocks (peer_id, file_id, event_id)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![recorded_by, &file_id_b64, &slice_b64],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO blocked_event_deps (peer_id, event_id, blocker_event_id)
+         VALUES (?1, ?2, ?3)",
+        rusqlite::params![recorded_by, &rxn_b64, &msg_b64],
+    )
+    .unwrap();
+
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
+    let del_b64 = event_id_to_base64(&del_eid);
+    assert_eq!(
+        project_one(&conn, recorded_by, &del_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let deleted_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(deleted_count, 1, "tombstone must remain after purge");
+
+    let intent_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM deletion_intents
+             WHERE recorded_by = ?1 AND target_kind = 'message' AND target_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(intent_count, 1, "deletion intent must remain after purge");
+
+    let deletion_valid: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &del_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(deletion_valid, "deletion event itself must remain valid");
+
+    for event_id in [&msg_b64, &rxn_b64, &file_b64, &slice_b64] {
+        let still_recorded: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !still_recorded,
+            "hard purge must remove recorded event {}",
+            event_id
+        );
+
+        let still_valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !still_valid,
+            "hard purge must remove valid row {}",
+            event_id
+        );
+
+        let still_global: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+                rusqlite::params![event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !still_global,
+            "hard purge must remove event blob {}",
+            event_id
+        );
+
+        let still_timeline: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM event_timeline WHERE event_id = ?1",
+                rusqlite::params![event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !still_timeline,
+            "hard purge must remove event_timeline row {}",
+            event_id
+        );
+    }
+
+    let message_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(message_rows, 0);
+
+    let reaction_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1 AND target_event_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(reaction_rows, 0);
+
+    let file_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(file_rows, 0);
+
+    let slice_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM file_slices WHERE recorded_by = ?1 AND file_id = ?2",
+            rusqlite::params![recorded_by, &file_id_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(slice_rows, 0);
+
+    let guard_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM file_slice_guard_blocks WHERE peer_id = ?1 AND file_id = ?2",
+            rusqlite::params![recorded_by, &file_id_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(guard_rows, 0);
+
+    let client_ops_left: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM local_client_ops WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(client_ops_left, 0, "purge must remove client-op mappings");
+
+    let feed_rows_left: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM local_subscription_feed WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        feed_rows_left, 0,
+        "purge must remove subscription feed rows"
+    );
+
+    let sub_state: (i64, i64, i64, String) = conn
+        .query_row(
+            "SELECT next_seq, pending_count, dirty, latest_event_id
+             FROM local_subscription_state
+             WHERE recorded_by = ?1 AND subscription_id = 'purge-sub'",
+            rusqlite::params![recorded_by],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+        )
+        .unwrap();
+    assert_eq!(sub_state.0, 5, "purge must not rewind next_seq");
+    assert_eq!(sub_state.1, 0, "purge must clear pending_count");
+    assert_eq!(sub_state.2, 0, "purge must clear dirty when feed empties");
+    assert_eq!(sub_state.3, "", "purge must clear latest_event_id");
+
+    let shared_fanouts_left: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pending_shared_fanouts WHERE origin_peer_id = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(shared_fanouts_left, 0);
+
+    let deferred_need_left: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM deferred_need_events WHERE peer_id = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(deferred_need_left, 0);
+
+    let sync_rx_left: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM sync_run_rx_events WHERE event_id IN (?1, ?2, ?3, ?4)",
+            rusqlite::params![&msg_b64, &rxn_b64, &file_b64, &slice_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(sync_rx_left, 0);
+
+    let other_unblocked_by: Option<String> = conn
+        .query_row(
+            "SELECT unblocked_by_event_id FROM event_timeline WHERE event_id = 'other-event'",
+            [],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        other_unblocked_by, None,
+        "purge must clear dangling unblocked_by_event_id references"
+    );
+}
+
+#[test]
+fn test_delete_before_create_hard_purges_arriving_message_event() {
+    let conn = setup();
+    let recorded_by = "peer-delete-before-create";
+    let _workspace_eid = setup_workspace_event(&conn, recorded_by);
+    let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+
+    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "arrives after delete");
+    let msg_eid = canonical_test_event_id(&conn, recorded_by, &msg_blob);
+    let msg_b64 = event_id_to_base64(&msg_eid);
+
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
+    project_one(&conn, recorded_by, &del_eid).unwrap();
+
+    let inserted_msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+    assert_eq!(inserted_msg_eid, msg_eid);
+    assert_eq!(
+        project_one(&conn, recorded_by, &msg_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let message_still_recorded: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !message_still_recorded,
+        "message arriving after tombstone must be purged from recorded_events"
+    );
+
+    let message_valid: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !message_valid,
+        "hard-purged message must not be left in valid_events"
+    );
+
+    let message_global: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+            rusqlite::params![&msg_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!message_global, "hard-purged message blob must be removed");
+
+    let tombstone_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        tombstone_count, 1,
+        "tombstone must remain for purged message"
+    );
+}
+
+#[test]
+fn test_replaying_deletion_on_existing_tombstone_repurges_legacy_material() {
+    let conn = setup();
+    let recorded_by = "peer-legacy-cleanup";
+    let _workspace_eid = setup_workspace_event(&conn, recorded_by);
+    let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+
+    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "legacy leftovers");
+    let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+    project_one(&conn, recorded_by, &msg_eid).unwrap();
+
+    let (_rxn, rxn_blob) = make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "🧹");
+    let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
+    project_one(&conn, recorded_by, &rxn_eid).unwrap();
+
+    let msg_b64 = event_id_to_base64(&msg_eid);
+    let rxn_b64 = event_id_to_base64(&rxn_eid);
+    let legacy_del_b64 = event_id_to_base64(&[0xD1; 32]);
+    let author_b64 = event_id_to_base64(&user_for_signer(&signer_eid));
+
+    conn.execute(
+        "INSERT INTO deleted_messages
+         (recorded_by, message_id, deletion_event_id, author_id, deleted_at)
+         VALUES (?1, ?2, ?3, ?4, 1)",
+        rusqlite::params![recorded_by, &msg_b64, &legacy_del_b64, &author_b64],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT INTO deletion_intents
+         (recorded_by, target_kind, target_id, deletion_event_id, author_id, created_at)
+         VALUES (?1, 'message', ?2, ?3, ?4, 1)",
+        rusqlite::params![recorded_by, &msg_b64, &legacy_del_b64, &author_b64],
+    )
+    .unwrap();
+
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
+    project_one(&conn, recorded_by, &del_eid).unwrap();
+
+    let msg_left: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !msg_left,
+        "replayed deletion must purge legacy message event"
+    );
+
+    let rxn_left: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &rxn_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !rxn_left,
+        "replayed deletion must purge legacy dependent event"
+    );
+
+    let tombstone_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(tombstone_count, 1, "legacy tombstone must remain stable");
+}
+
+#[test]
+fn test_reaction_arriving_after_tombstone_is_hard_purged() {
+    let conn = setup();
+    let recorded_by = "peer-late-reaction";
+    let _workspace_eid = setup_workspace_event(&conn, recorded_by);
+    let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+
+    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "target");
+    let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+    project_one(&conn, recorded_by, &msg_eid).unwrap();
+
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
+    project_one(&conn, recorded_by, &del_eid).unwrap();
+
+    let (_rxn, rxn_blob) = make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "❌");
+    let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
+    let rxn_b64 = event_id_to_base64(&rxn_eid);
+    assert_eq!(
+        project_one(&conn, recorded_by, &rxn_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let rxn_recorded: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &rxn_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!rxn_recorded, "late reaction must be hard-purged");
+
+    let rxn_valid: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &rxn_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!rxn_valid, "late reaction must not survive in valid_events");
+
+    let rxn_global: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+            rusqlite::params![&rxn_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!rxn_global, "late reaction blob must be purged");
+}
+
+#[test]
+fn test_file_arriving_after_tombstone_is_hard_purged_and_tracks_deleted_file() {
+    let conn = setup();
+    let recorded_by = "peer-late-file";
+    let _workspace_eid = setup_workspace_event(&conn, recorded_by);
+    let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+    let key_event_id = ensure_test_content_key(&conn, recorded_by);
+
+    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "target");
+    let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+    project_one(&conn, recorded_by, &msg_eid).unwrap();
+
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
+    project_one(&conn, recorded_by, &del_eid).unwrap();
+
+    let (file_event, file_blob) =
+        make_attachment_signed(&signing_key, &signer_eid, &msg_eid, &key_event_id);
+    let file_id = match &file_event {
+        ParsedEvent::File(file) => file.file_id,
+        other => panic!("expected file event, got {:?}", other),
+    };
+    let file_id_b64 = event_id_to_base64(&file_id);
+    let file_eid = insert_event_raw(&conn, recorded_by, &file_blob);
+    let file_b64 = event_id_to_base64(&file_eid);
+    assert_eq!(
+        project_one(&conn, recorded_by, &file_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let file_recorded: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &file_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!file_recorded, "late file must be hard-purged");
+
+    let file_valid: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &file_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!file_valid, "late file must not survive in valid_events");
+
+    let file_global: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+            rusqlite::params![&file_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!file_global, "late file blob must be purged");
+
+    let deleted_file_mapping: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM deleted_files
+             WHERE recorded_by = ?1 AND file_id = ?2 AND message_id = ?3",
+            rusqlite::params![recorded_by, &file_id_b64, event_id_to_base64(&msg_eid)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        deleted_file_mapping, 1,
+        "late file purge must persist deleted_files mapping"
+    );
+}
+
+#[test]
+fn test_file_slice_dependents_of_deleted_message_are_hard_purged_before_and_after_mapping() {
+    let conn = setup();
+    let recorded_by = "peer-late-file-slice";
+    let _workspace_eid = setup_workspace_event(&conn, recorded_by);
+    let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+    let key_event_id = ensure_test_content_key(&conn, recorded_by);
+
+    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "target");
+    let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+    project_one(&conn, recorded_by, &msg_eid).unwrap();
+
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
+    project_one(&conn, recorded_by, &del_eid).unwrap();
+
+    let (file_event, file_blob) =
+        make_attachment_signed(&signing_key, &signer_eid, &msg_eid, &key_event_id);
+    let file_id = match &file_event {
+        ParsedEvent::File(file) => file.file_id,
+        other => panic!("expected file event, got {:?}", other),
+    };
+    let file_id_b64 = event_id_to_base64(&file_id);
+
+    let (_early_slice, early_slice_blob) =
+        make_file_slice(&signing_key, &signer_eid, file_id, 0, b"slice-before-file");
+    let early_slice_eid = insert_event_raw(&conn, recorded_by, &early_slice_blob);
+    assert!(matches!(
+        project_one(&conn, recorded_by, &early_slice_eid).unwrap(),
+        ProjectionDecision::Block { .. }
+    ));
+    let early_slice_b64 = event_id_to_base64(&early_slice_eid);
+
+    let guard_rows_before: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM file_slice_guard_blocks WHERE peer_id = ?1 AND file_id = ?2",
+            rusqlite::params![recorded_by, &file_id_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        guard_rows_before, 1,
+        "late slice should guard-block before deleted_files mapping exists"
+    );
+
+    let file_eid = insert_event_raw(&conn, recorded_by, &file_blob);
+    let file_b64 = event_id_to_base64(&file_eid);
+    assert_eq!(
+        project_one(&conn, recorded_by, &file_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let deleted_file_mapping: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM deleted_files
+             WHERE recorded_by = ?1 AND file_id = ?2 AND message_id = ?3",
+            rusqlite::params![recorded_by, &file_id_b64, event_id_to_base64(&msg_eid)],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        deleted_file_mapping, 1,
+        "purge must retain deleted_files map"
+    );
+
+    for event_id in [&file_b64, &early_slice_b64] {
+        let still_recorded: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !still_recorded,
+            "deleted-message dependent {} must be purged from recorded_events",
+            event_id
+        );
+
+        let still_valid: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !still_valid,
+            "deleted-message dependent {} must not survive in valid_events",
+            event_id
+        );
+
+        let still_global: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+                rusqlite::params![event_id],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert!(
+            !still_global,
+            "deleted-message dependent {} must be purged from events",
+            event_id
+        );
+    }
+
+    let guard_rows_after_file: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM file_slice_guard_blocks WHERE peer_id = ?1 AND file_id = ?2",
+            rusqlite::params![recorded_by, &file_id_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        guard_rows_after_file, 0,
+        "late file purge must clear existing file_slice guard blocks"
+    );
+
+    let (_late_slice, late_slice_blob) =
+        make_file_slice(&signing_key, &signer_eid, file_id, 1, b"slice-after-file");
+    let late_slice_eid = insert_event_raw(&conn, recorded_by, &late_slice_blob);
+    let late_slice_b64 = event_id_to_base64(&late_slice_eid);
+    assert_eq!(
+        project_one(&conn, recorded_by, &late_slice_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let late_slice_recorded: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &late_slice_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !late_slice_recorded,
+        "late file_slice after deleted_files mapping must be hard-purged"
+    );
+
+    let late_slice_valid: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &late_slice_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !late_slice_valid,
+        "late file_slice after deleted_files mapping must not survive in valid_events"
+    );
+
+    let late_slice_global: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
+            rusqlite::params![&late_slice_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !late_slice_global,
+        "late file_slice after deleted_files mapping must be purged from events"
+    );
+
+    let guard_rows_final: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM file_slice_guard_blocks WHERE peer_id = ?1 AND file_id = ?2",
+            rusqlite::params![recorded_by, &file_id_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        guard_rows_final, 0,
+        "deleted-file fast path must not create new guard blocks"
+    );
+}
+
+#[test]
+fn test_hard_purge_failure_rolls_back_and_retries_from_project_queue() {
+    let conn = setup();
+    let recorded_by = "peer-purge-retry";
+    let _workspace_eid = setup_workspace_event(&conn, recorded_by);
+    let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+
+    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "retry purge");
+    let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+    project_one(&conn, recorded_by, &msg_eid).unwrap();
+
+    let (_rxn, rxn_blob) = make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "↩");
+    let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
+    project_one(&conn, recorded_by, &rxn_eid).unwrap();
+
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
+    let del_b64 = event_id_to_base64(&del_eid);
+    let msg_b64 = event_id_to_base64(&msg_eid);
+    let rxn_b64 = event_id_to_base64(&rxn_eid);
+
+    let pq = crate::state::db::project_queue::ProjectQueue::new(&conn);
+    pq.enqueue(recorded_by, &del_b64).unwrap();
+
+    crate::state::projection::purge::set_test_fail_after_steps(Some(2));
+    let drained = pq
+        .drain_with_limit(recorded_by, 1, |db, event_id_b64| {
+            let event_id =
+                crate::crypto::event_id_from_base64(event_id_b64).expect("decode queued event id");
+            project_one(db, recorded_by, &event_id).map(|_| ())
+        })
+        .unwrap();
+    crate::state::projection::purge::set_test_fail_after_steps(None);
+    assert_eq!(drained, 0, "failed purge must not count as a success");
+
+    let message_still_present: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        message_still_present,
+        "failed purge must roll back message removal"
+    );
+
+    let reaction_still_present: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &rxn_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        reaction_still_present,
+        "failed purge must roll back dependent removal"
+    );
+
+    let tombstone_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        tombstone_count, 0,
+        "failed purge must roll back tombstone write"
+    );
+
+    let deletion_valid: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &del_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !deletion_valid,
+        "failed purge must roll back deletion event terminal state"
+    );
+
+    let attempts: i64 = conn
+        .query_row(
+            "SELECT attempts FROM project_queue WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &del_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(attempts, 1, "failed purge must schedule a retry");
+
+    conn.execute(
+        "UPDATE project_queue SET available_at = 0, lease_until = NULL WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, &del_b64],
+    )
+    .unwrap();
+
+    let drained = pq
+        .drain_with_limit(recorded_by, 1, |db, event_id_b64| {
+            let event_id =
+                crate::crypto::event_id_from_base64(event_id_b64).expect("decode queued event id");
+            project_one(db, recorded_by, &event_id).map(|_| ())
+        })
+        .unwrap();
+    assert_eq!(
+        drained, 1,
+        "retry should succeed once purge no longer fails"
+    );
+
+    let message_left: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!message_left, "successful retry must purge message");
+
+    let reaction_left: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &rxn_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(!reaction_left, "successful retry must purge dependent");
+
+    let queue_left: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM project_queue WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &del_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(queue_left, 0, "successful retry must dequeue the deletion");
 }

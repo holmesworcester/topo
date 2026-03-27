@@ -8,7 +8,7 @@ pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    _ctx: &ContextSnapshot,
+    ctx: &ContextSnapshot,
 ) -> ProjectorResult {
     let att = match parsed {
         ParsedEvent::File(a) => a,
@@ -19,6 +19,23 @@ pub fn project_pure(
     let file_id_b64 = event_id_to_base64(&att.file_id);
     let key_event_id_b64 = event_id_to_base64(&att.key_event_id);
     let signer_event_id_b64 = event_id_to_base64(&att.signed_by);
+
+    if ctx.target_message_deleted {
+        return ProjectorResult::valid_with_commands(
+            vec![WriteOp::InsertOrIgnore {
+                table: "deleted_files",
+                columns: vec!["recorded_by", "file_id", "message_id"],
+                values: vec![
+                    SqlVal::Text(recorded_by.to_string()),
+                    SqlVal::Text(file_id_b64),
+                    SqlVal::Text(message_id_b64.clone()),
+                ],
+            }],
+            vec![EmitCommand::HardPurgeMessageGraph {
+                message_event_id: message_id_b64,
+            }],
+        );
+    }
 
     let ops = vec![WriteOp::InsertOrIgnore {
         table: "files",

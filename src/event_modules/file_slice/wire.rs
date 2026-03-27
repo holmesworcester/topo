@@ -92,7 +92,11 @@ pub fn encode_file_slice(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         FieldValue::FixedBytes(fs.signature.to_vec()),
     ];
 
-    Ok(encode_fields(EVENT_TYPE_FILE_SLICE, FILE_SLICE_FIELDS, &values)?)
+    Ok(encode_fields(
+        EVENT_TYPE_FILE_SLICE,
+        FILE_SLICE_FIELDS,
+        &values,
+    )?)
 }
 
 pub static FILE_SLICE_META: EventTypeMeta = EventTypeMeta {
@@ -118,6 +122,9 @@ mod layout_tests {
 
     #[test]
     fn offsets_consistent() {
-        assert_eq!(field_offset(FILE_SLICE_FIELDS, 6) + 64, FILE_SLICE_WIRE_SIZE);
+        assert_eq!(
+            field_offset(FILE_SLICE_FIELDS, 6) + 64,
+            FILE_SLICE_WIRE_SIZE
+        );
     }
 }

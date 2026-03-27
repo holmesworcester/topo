@@ -10,7 +10,7 @@ mod tests {
     use topo::event_modules::message::project_pure;
     use topo::event_modules::message::MessageEvent;
     use topo::event_modules::ParsedEvent;
-    use topo::projection::contract::DeletionIntentInfo;
+    use topo::projection::contract::{DeletionIntentInfo, EmitCommand};
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "msg_event_1";
@@ -72,6 +72,12 @@ mod tests {
         // Should write to deleted_messages, not messages
         assert_writes_to_table(&result, "deleted_messages");
         assert_no_write_to_table(&result, "messages");
+        assert_emits_command(&result, "HardPurgeMessageGraph", |cmd| {
+            matches!(
+                cmd,
+                EmitCommand::HardPurgeMessageGraph { message_event_id } if message_event_id == EVENT_ID
+            )
+        });
     }
 
     // ── CHK_MSG_DELETE_BEFORE_CREATE: break (wrong-author intent ignored) ──

@@ -303,6 +303,14 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 | NON_MODELED::author_constraint | message deletion rejects non-author tombstones |
 | InvAllValidRequireWorkspace | test_bootstrap_sequence: non-local events require workspace valid |
 | InvMessageWorkspace | Message projection requires workspace (workspace_event_id dep) |
+| InvDeleteIntentSource | `message_deletion` can project before the target message exists and must leave durable delete intent state |
+| InvDeleteIntentNoLiveMessage | delete-before-create convergence leaves no live `message` row once delete intent exists |
+| InvDeletedMessageSource | `deleted_messages` tombstones can only come from projected `message_deletion` |
+| InvDeletedMessagePurgesLiveGraph | deleted message graphs leave no live `message`, `message_reaction`, or `message_attachment` rows |
+| InvReactionTombstoneBypass | deleted-message tombstones satisfy the reaction message-edge for self-purge |
+| InvAttachmentTombstoneBypass | deleted-message tombstones satisfy the attachment message-edge for self-purge |
+| InvDeletedFilePurgesLiveSlice | deleted file mappings leave no live descriptor or `file_slice` rows |
+| InvDeletePurgeAtomic | delete projector writes and purge effects occur atomically at the live-state boundary |
 | InvEncryptedKey | Encrypted content requires valid secret dependency |
 | InvSecretSharedKey | KeyShared key_event_id must match deterministic unwrapped key_secret event id |
 | InvFileSliceAuth | FileSlice and MessageAttachment for the same file must share the same signer |
@@ -419,6 +427,10 @@ TLC status (run on 2026-02-17, post-transport-identity-unification):
    - passes (no invariant violations).
    - model simplified: rotation/revocation removed (POC single-credential-per-peer),
      `transportKeyTrust` renamed to `peerSharedTrust`.
+3. `java -cp /tmp/tla2tools.jar tlc2.TLC -config event_graph_schema_delete_fast.cfg EventGraphSchema`:
+   - passes (no invariant violations).
+   - deletion-focused EventGraphSchema run covering `message`, `message_deletion`,
+     `message_reaction`, `message_attachment`, and `file_slice` hard-purge invariants.
 
 ### collapse-single-tenant per-tenant outbound trust (2026-02-17)
 

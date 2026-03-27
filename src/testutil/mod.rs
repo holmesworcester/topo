@@ -2382,6 +2382,12 @@ const FINGERPRINT_TABLES: &[FingerprintTable] = &[
         columns: None,
     },
     FingerprintTable {
+        name: "deleted_files",
+        scope: Scope::RecordedBy,
+        order: "ORDER BY file_id",
+        columns: None,
+    },
+    FingerprintTable {
         name: "files",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
@@ -2639,6 +2645,11 @@ fn clear_projection_tables(db: &rusqlite::Connection, recorded_by: &str) {
         rusqlite::params![recorded_by],
     )
     .expect("failed to clear deleted_messages");
+    db.execute(
+        "DELETE FROM deleted_files WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+    )
+    .expect("failed to clear deleted_files");
     db.execute(
         "DELETE FROM files WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],
@@ -4181,7 +4192,13 @@ pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_workspaces: &[(Strin
     }
 
     // Verify no unexpected peer_ids in projection tables
-    for table in &["messages", "reactions", "key_secrets", "deleted_messages"] {
+    for table in &[
+        "messages",
+        "reactions",
+        "key_secrets",
+        "deleted_messages",
+        "deleted_files",
+    ] {
         let query = format!("SELECT DISTINCT recorded_by FROM {}", table);
         let mut stmt = db.prepare(&query).expect("failed to prepare");
         let found_ids: Vec<String> = stmt
@@ -4538,6 +4555,7 @@ mod fingerprint_tests {
             "reactions",
             "key_secrets",
             "deleted_messages",
+            "deleted_files",
             "files",
             "file_slices",
             "workspaces",

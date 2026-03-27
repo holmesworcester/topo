@@ -1,6 +1,6 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 
 /// Pure projector: Reaction → reactions table insert.
 ///
@@ -29,7 +29,12 @@ pub fn project_pure(
 
     // Check deletion state — skip if target is tombstoned or has deletion intent
     if ctx.target_message_deleted {
-        return ProjectorResult::valid(vec![]); // valid event, no row written
+        return ProjectorResult::valid_with_commands(
+            vec![],
+            vec![EmitCommand::HardPurgeMessageGraph {
+                message_event_id: target_id_b64,
+            }],
+        );
     }
 
     let author_id_b64 = event_id_to_base64(&rxn.author_id);

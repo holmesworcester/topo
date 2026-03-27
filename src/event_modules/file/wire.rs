@@ -13,19 +13,19 @@ pub const FILE_FILENAME_BYTES: usize = 255;
 pub const FILE_MIME_BYTES: usize = 128;
 
 pub const FILE_FIELDS: &[FieldSpec] = &[
-    FieldSpec::Timestamp("created_at_ms"),     // 0
-    FieldSpec::EventId("message_id"),          // 1
-    FieldSpec::EventId("file_id"),             // 2
-    FieldSpec::U64("blob_bytes"),              // 3
-    FieldSpec::U32("total_slices"),            // 4
-    FieldSpec::U32("slice_bytes"),             // 5
-    FieldSpec::EventId("root_hash"),           // 6
-    FieldSpec::EventId("key_event_id"),        // 7
-    FieldSpec::Text("filename", 255),          // 8
-    FieldSpec::Text("mime_type", 128),         // 9
-    FieldSpec::EventId("signed_by"),           // 10
-    FieldSpec::U8("signer_type"),              // 11
-    FieldSpec::FixedBytes("signature", 64),    // 12
+    FieldSpec::Timestamp("created_at_ms"),  // 0
+    FieldSpec::EventId("message_id"),       // 1
+    FieldSpec::EventId("file_id"),          // 2
+    FieldSpec::U64("blob_bytes"),           // 3
+    FieldSpec::U32("total_slices"),         // 4
+    FieldSpec::U32("slice_bytes"),          // 5
+    FieldSpec::EventId("root_hash"),        // 6
+    FieldSpec::EventId("key_event_id"),     // 7
+    FieldSpec::Text("filename", 255),       // 8
+    FieldSpec::Text("mime_type", 128),      // 9
+    FieldSpec::EventId("signed_by"),        // 10
+    FieldSpec::U8("signer_type"),           // 11
+    FieldSpec::FixedBytes("signature", 64), // 12
 ];
 
 /// File (type 24): type(1) + created_at(8) + message_id(32) + file_id(32)
@@ -222,7 +222,7 @@ pub static FILE_META: EventTypeMeta = EventTypeMeta {
     parse: parse_file,
     encode: encode_file,
     projector: super::projector::project_pure,
-    context_loader: crate::event_modules::registry::load_empty_context,
+    context_loader: super::projection_context::build_projector_context,
 };
 
 #[cfg(test)]

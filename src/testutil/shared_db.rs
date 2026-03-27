@@ -596,7 +596,13 @@ pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_workspaces: &[(Strin
     }
 
     // Verify no unexpected peer_ids in projection tables
-    for table in &["messages", "reactions", "key_secrets", "deleted_messages"] {
+    for table in &[
+        "messages",
+        "reactions",
+        "key_secrets",
+        "deleted_messages",
+        "deleted_files",
+    ] {
         let query = format!("SELECT DISTINCT recorded_by FROM {}", table);
         let mut stmt = db.prepare(&query).expect("failed to prepare");
         let found_ids: Vec<String> = stmt

@@ -51,7 +51,11 @@ pub fn encode_key_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         FieldValue::EventId(sk.key_bytes),
     ];
 
-    Ok(encode_fields(EVENT_TYPE_KEY_SECRET, KEY_SECRET_FIELDS, &values)?)
+    Ok(encode_fields(
+        EVENT_TYPE_KEY_SECRET,
+        KEY_SECRET_FIELDS,
+        &values,
+    )?)
 }
 
 /// Deterministic timestamp derivation for key materialized Secret events.

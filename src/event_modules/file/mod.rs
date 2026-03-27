@@ -1,3 +1,4 @@
+mod projection_context;
 pub mod projector;
 pub mod queries;
 pub mod wire;
@@ -31,6 +32,15 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             ON files(recorded_by, message_id);
         CREATE INDEX IF NOT EXISTS idx_files_file_id
             ON files(recorded_by, file_id);
+
+        CREATE TABLE IF NOT EXISTS deleted_files (
+            recorded_by TEXT NOT NULL,
+            file_id TEXT NOT NULL,
+            message_id TEXT NOT NULL,
+            PRIMARY KEY (recorded_by, file_id)
+        );
+        CREATE INDEX IF NOT EXISTS idx_deleted_files_message
+            ON deleted_files(recorded_by, message_id);
         ",
     )?;
     Ok(())

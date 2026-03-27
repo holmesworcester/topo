@@ -118,11 +118,35 @@ fn load_recorded_source_peer_id(
     Ok(source_tag.and_then(|source_tag| source_peer_id_from_source_tag(&source_tag)))
 }
 
+fn tombstone_satisfies_message_dep(
+    conn: &Connection,
+    recorded_by: &str,
+    parsed: &ParsedEvent,
+    field_name: &str,
+    dep_b64: &str,
+) -> Result<bool, rusqlite::Error> {
+    let is_deleted_message_target = matches!(
+        (parsed, field_name),
+        (ParsedEvent::Reaction(_), "target_event_id") | (ParsedEvent::File(_), "message_id")
+    );
+    if !is_deleted_message_target {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT COUNT(*) > 0
+         FROM deleted_messages
+         WHERE recorded_by = ?1 AND message_id = ?2",
+        rusqlite::params![recorded_by, dep_b64],
+        |row| row.get(0),
+    )
+}
+
 /// Check that each dep's type code matches the allowed types for that dep field.
 /// Returns Some(reason) if a type mismatch is found, None if all pass.
 pub(crate) fn check_dep_types(
     conn: &Connection,
     recorded_by: &str,
+    parsed: &ParsedEvent,
     deps: &[(&str, EventId)],
     type_codes: &[&[u8]],
 ) -> Result<Option<String>, Box<dyn std::error::Error>> {
@@ -135,10 +159,20 @@ pub(crate) fn check_dep_types(
         let actual_type = match load_valid_semantic_type_code(conn, recorded_by, &dep_b64) {
             Ok(Some(code)) => code,
             Ok(None) => {
+                let tombstone_satisfies_dep_type = tombstone_satisfies_message_dep(
+                    conn,
+                    recorded_by,
+                    parsed,
+                    field_name,
+                    &dep_b64,
+                )?;
+                if tombstone_satisfies_dep_type {
+                    continue;
+                }
                 return Ok(Some(format!(
                     "dep {} missing tenant-scoped semantic type record",
                     field_name
-                )))
+                )));
             }
             Err(e) => return Err(e),
         };
@@ -175,10 +209,11 @@ pub(crate) fn check_deps_and_block(
     conn: &Connection,
     recorded_by: &str,
     event_id_b64: &str,
+    parsed: &ParsedEvent,
     deps: &[(&str, EventId)],
 ) -> Result<Option<ProjectionDecision>, Box<dyn std::error::Error>> {
     let mut missing = Vec::new();
-    for (_field_name, dep_id) in deps {
+    for (field_name, dep_id) in deps {
         let dep_b64 = event_id_to_base64(dep_id);
         let dep_valid: bool = conn.query_row(
             "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
@@ -186,6 +221,11 @@ pub(crate) fn check_deps_and_block(
             |row| row.get(0),
         )?;
         if !dep_valid {
+            let tombstone_satisfies_dep =
+                tombstone_satisfies_message_dep(conn, recorded_by, parsed, field_name, &dep_b64)?;
+            if tombstone_satisfies_dep {
+                continue;
+            }
             missing.push(*dep_id);
         }
     }
@@ -321,6 +361,7 @@ pub(crate) fn apply_projection(
 mod tests {
     use super::*;
     use crate::db::{open_connection, schema::create_tables};
+    use crate::event_modules::BenchDepEvent;
 
     fn setup_file_db() -> (tempfile::TempDir, String, Connection) {
         let dir = tempfile::tempdir().unwrap();
@@ -334,6 +375,14 @@ mod tests {
         let mut id = [0u8; 32];
         id[0] = byte;
         id
+    }
+
+    fn unrelated_parsed() -> ParsedEvent {
+        ParsedEvent::BenchDep(BenchDepEvent {
+            created_at_ms: 1,
+            dep_ids: vec![],
+            payload: [0u8; 16],
+        })
     }
 
     #[tokio::test]
@@ -350,8 +399,14 @@ mod tests {
         .unwrap();
 
         let (mut rx, _guard) = dependency_fetch::register(&db_path, "tenant-a", "peer-z");
-        let decision =
-            check_deps_and_block(&conn, "tenant-a", &blocked_b64, &[("dep", missing)]).unwrap();
+        let decision = check_deps_and_block(
+            &conn,
+            "tenant-a",
+            &blocked_b64,
+            &unrelated_parsed(),
+            &[("dep", missing)],
+        )
+        .unwrap();
         assert!(matches!(decision, Some(ProjectionDecision::Block { .. })));
         assert_eq!(rx.recv().await, Some(vec![missing]));
     }
@@ -370,8 +425,14 @@ mod tests {
         .unwrap();
 
         let (mut rx, _guard) = dependency_fetch::register(&db_path, "tenant-a", "peer-z");
-        let decision =
-            check_deps_and_block(&conn, "tenant-a", &blocked_b64, &[("dep", missing)]).unwrap();
+        let decision = check_deps_and_block(
+            &conn,
+            "tenant-a",
+            &blocked_b64,
+            &unrelated_parsed(),
+            &[("dep", missing)],
+        )
+        .unwrap();
         assert!(matches!(decision, Some(ProjectionDecision::Block { .. })));
         assert!(
             tokio::time::timeout(std::time::Duration::from_millis(10), rx.recv())
@@ -407,7 +468,7 @@ pub(crate) fn run_dep_and_projection_stages(
     }
 
     let deps = parsed.dep_field_values();
-    if let Some(block) = check_deps_and_block(conn, recorded_by, event_id_b64, &deps)? {
+    if let Some(block) = check_deps_and_block(conn, recorded_by, event_id_b64, parsed, &deps)? {
         return Ok((block, None));
     }
 
@@ -417,7 +478,7 @@ pub(crate) fn run_dep_and_projection_stages(
             .ok_or_else(|| format!("unknown type code {}", parsed.event_type_code()))?;
         if !meta.dep_field_type_codes.is_empty() {
             if let Some(reason) =
-                check_dep_types(conn, recorded_by, &deps, meta.dep_field_type_codes)?
+                check_dep_types(conn, recorded_by, parsed, &deps, meta.dep_field_type_codes)?
             {
                 return Ok((ProjectionDecision::Reject { reason }, None));
             }

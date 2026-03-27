@@ -713,11 +713,21 @@ pub(crate) fn run_event_action(
             Ok(())
         }
         EventAction::List {
+            event_type,
             ids_only,
             fingerprint,
         } => {
             let data = rpc_require_daemon(db, socket, RpcMethod::EventList)?;
-            let resp: service::EventListResponse = serde_json::from_value(data)?;
+            let mut resp: service::EventListResponse = serde_json::from_value(data)?;
+            if let Some(event_type) = event_type {
+                resp.events.retain(|e| {
+                    e.event_type == event_type
+                        || e.decrypted_inner
+                            .as_ref()
+                            .map(|inner| inner.inner_type == event_type)
+                            .unwrap_or(false)
+                });
+            }
             if fingerprint || ids_only {
                 let mut ids: Vec<String> = resp.events.iter().map(|e| e.id.clone()).collect();
                 ids.sort();

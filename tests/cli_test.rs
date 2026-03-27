@@ -3074,6 +3074,463 @@ fn test_cli_react_by_message_number() {
 }
 
 #[test]
+fn test_cli_delete_message_purges_message_and_reaction_from_event_commands() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("delete_purge_event_list.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    send_message(&db, "purge me from event list");
+    assert_now(&db, "message_count == 1");
+
+    let react_out = Command::new(bin())
+        .args(["--db", &db, "react", "fire", "1"])
+        .output()
+        .expect("react to first message");
+    assert!(
+        react_out.status.success(),
+        "react failed: {}",
+        String::from_utf8_lossy(&react_out.stderr)
+    );
+    assert_now(&db, "reaction_count == 1");
+
+    let recorded_by = active_tenant_peer_id(&db).expect("active tenant");
+    let conn = open_connection(&db).unwrap();
+    let msg_eid: String = conn
+        .query_row(
+            "SELECT message_id
+             FROM messages
+             WHERE recorded_by = ?1
+             ORDER BY created_at DESC, message_id DESC
+             LIMIT 1",
+            rusqlite::params![&recorded_by],
+            |row| row.get(0),
+        )
+        .expect("message event id");
+    let reaction_eid: String = conn
+        .query_row(
+            "SELECT event_id
+             FROM reactions
+             WHERE recorded_by = ?1
+             ORDER BY created_at DESC, event_id DESC
+             LIMIT 1",
+            rusqlite::params![&recorded_by],
+            |row| row.get(0),
+        )
+        .expect("reaction event id");
+
+    let ids_before = Command::new(bin())
+        .args(["--db", &db, "event", "list", "--ids-only"])
+        .output()
+        .expect("event list ids before delete");
+    assert!(
+        ids_before.status.success(),
+        "event list before delete failed: {}",
+        String::from_utf8_lossy(&ids_before.stderr)
+    );
+    let ids_before_stdout = String::from_utf8_lossy(&ids_before.stdout);
+    assert!(
+        ids_before_stdout.contains(&msg_eid),
+        "event list should include message event before delete:\n{}",
+        ids_before_stdout
+    );
+    assert!(
+        ids_before_stdout.contains(&reaction_eid),
+        "event list should include reaction event before delete:\n{}",
+        ids_before_stdout
+    );
+
+    let show_before = Command::new(bin())
+        .args(["--db", &db, "event", "show", &msg_eid[..12]])
+        .output()
+        .expect("event show before delete");
+    assert!(show_before.status.success());
+    let show_before_stdout = String::from_utf8_lossy(&show_before.stdout);
+    assert!(
+        !show_before_stdout.contains("No events matching that prefix."),
+        "event show should resolve the message before delete:\n{}",
+        show_before_stdout
+    );
+
+    let delete_out = Command::new(bin())
+        .args(["--db", &db, "delete-message", "1"])
+        .output()
+        .expect("delete-message");
+    assert!(
+        delete_out.status.success(),
+        "delete-message failed: {}",
+        String::from_utf8_lossy(&delete_out.stderr)
+    );
+
+    assert_now(&db, "message_count == 0");
+    assert_now(&db, "reaction_count == 0");
+    assert_now(&db, &format!("has_event:{} == 0", msg_eid));
+    assert_now(&db, &format!("has_event:{} == 0", reaction_eid));
+
+    let conn = open_connection(&db).unwrap();
+    let message_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+            rusqlite::params![&recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let reaction_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM reactions WHERE recorded_by = ?1",
+            rusqlite::params![&recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let deletion_eid: String = conn
+        .query_row(
+            "SELECT deletion_event_id
+             FROM deleted_messages
+             WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![&recorded_by, &msg_eid],
+            |row| row.get(0),
+        )
+        .expect("deletion event id");
+    assert_eq!(message_rows, 0, "message row should be purged");
+    assert_eq!(reaction_rows, 0, "reaction row should be purged");
+
+    let show_msg_after = Command::new(bin())
+        .args(["--db", &db, "event", "show", &msg_eid[..12]])
+        .output()
+        .expect("event show message after delete");
+    assert!(show_msg_after.status.success());
+    assert!(
+        String::from_utf8_lossy(&show_msg_after.stdout).contains("No events matching that prefix."),
+        "message event should be absent from event show after delete:\n{}",
+        String::from_utf8_lossy(&show_msg_after.stdout)
+    );
+
+    let show_rxn_after = Command::new(bin())
+        .args(["--db", &db, "event", "show", &reaction_eid[..12]])
+        .output()
+        .expect("event show reaction after delete");
+    assert!(show_rxn_after.status.success());
+    assert!(
+        String::from_utf8_lossy(&show_rxn_after.stdout).contains("No events matching that prefix."),
+        "reaction event should be absent from event show after delete:\n{}",
+        String::from_utf8_lossy(&show_rxn_after.stdout)
+    );
+
+    let ids_after = Command::new(bin())
+        .args(["--db", &db, "event", "list", "--ids-only"])
+        .output()
+        .expect("event list ids after delete");
+    assert!(
+        ids_after.status.success(),
+        "event list after delete failed: {}",
+        String::from_utf8_lossy(&ids_after.stderr)
+    );
+    let ids_after_stdout = String::from_utf8_lossy(&ids_after.stdout);
+    assert!(
+        !ids_after_stdout.contains(&msg_eid),
+        "event list should not include message event after purge:\n{}",
+        ids_after_stdout
+    );
+    assert!(
+        !ids_after_stdout.contains(&reaction_eid),
+        "event list should not include reaction event after purge:\n{}",
+        ids_after_stdout
+    );
+
+    let deletion_ids = Command::new(bin())
+        .args([
+            "--db",
+            &db,
+            "event",
+            "list",
+            "--type",
+            "message_deletion",
+            "--ids-only",
+        ])
+        .output()
+        .expect("event list ids for message_deletion");
+    assert!(
+        deletion_ids.status.success(),
+        "event list --type message_deletion failed: {}",
+        String::from_utf8_lossy(&deletion_ids.stderr)
+    );
+    let deletion_ids_stdout = String::from_utf8_lossy(&deletion_ids.stdout);
+    assert!(
+        deletion_ids_stdout.contains("EVENT IDS (1):"),
+        "filtered event list should show exactly one deletion event:\n{}",
+        deletion_ids_stdout
+    );
+    assert!(
+        deletion_ids_stdout.contains(&deletion_eid),
+        "filtered event list should include deletion event:\n{}",
+        deletion_ids_stdout
+    );
+    assert!(
+        !deletion_ids_stdout.contains(&msg_eid),
+        "filtered deletion list should not include purged message event:\n{}",
+        deletion_ids_stdout
+    );
+    assert!(
+        !deletion_ids_stdout.contains(&reaction_eid),
+        "filtered deletion list should not include purged reaction event:\n{}",
+        deletion_ids_stdout
+    );
+}
+
+#[test]
+fn test_cli_delete_message_purges_file_and_file_slice_from_event_commands() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("delete_purge_file_event_list.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    let file_path = tmpdir.path().join("purge-me.txt");
+    std::fs::write(&file_path, "purge attachment\n").unwrap();
+
+    create_workspace(&db);
+    let _daemon = start_daemon(&db);
+
+    let send_eid = send_file(&db, "message with attachment", file_path.to_str().unwrap());
+    assert!(
+        !send_eid.is_empty(),
+        "send-file should return a message event id"
+    );
+    assert_now(&db, "message_count == 1");
+
+    let recorded_by = active_tenant_peer_id(&db).expect("active tenant");
+    let (msg_eid, file_eid) = {
+        let conn = open_connection(&db).unwrap();
+        let msg_eid = conn
+            .query_row(
+                "SELECT message_id
+                 FROM messages
+                 WHERE recorded_by = ?1
+                 ORDER BY created_at DESC, message_id DESC
+                 LIMIT 1",
+                rusqlite::params![&recorded_by],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("message event id");
+        let file_eid = conn
+            .query_row(
+                "SELECT event_id
+                 FROM files
+                 WHERE recorded_by = ?1
+                 ORDER BY created_at DESC, event_id DESC
+                 LIMIT 1",
+                rusqlite::params![&recorded_by],
+                |row| row.get::<_, String>(0),
+            )
+            .expect("file event id");
+        (msg_eid, file_eid)
+    };
+
+    let (file_id, slice_eid) = {
+        let deadline = Instant::now() + Duration::from_secs(30);
+        loop {
+            let conn = open_connection(&db).unwrap();
+            let row = conn
+                .query_row(
+                    "SELECT f.file_id, s.event_id
+                     FROM files f
+                     JOIN file_slices s
+                       ON s.recorded_by = f.recorded_by AND s.file_id = f.file_id
+                     WHERE f.recorded_by = ?1 AND f.event_id = ?2
+                     ORDER BY s.slice_number ASC
+                     LIMIT 1",
+                    rusqlite::params![&recorded_by, &file_eid],
+                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                )
+                .ok();
+            if let Some(row) = row {
+                break row;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "timed out waiting for file_slice row for descriptor {} (send-file returned message {})",
+                file_eid,
+                send_eid
+            );
+            std::thread::sleep(Duration::from_millis(50));
+        }
+    };
+
+    let ids_before = Command::new(bin())
+        .args(["--db", &db, "event", "list", "--ids-only"])
+        .output()
+        .expect("event list ids before delete");
+    assert!(
+        ids_before.status.success(),
+        "event list before delete failed: {}",
+        String::from_utf8_lossy(&ids_before.stderr)
+    );
+    let ids_before_stdout = String::from_utf8_lossy(&ids_before.stdout);
+    for event_id in [&msg_eid, &file_eid, &slice_eid] {
+        assert!(
+            ids_before_stdout.contains(event_id),
+            "event list should include {} before delete:\n{}",
+            event_id,
+            ids_before_stdout
+        );
+    }
+
+    for event_id in [&msg_eid, &file_eid, &slice_eid] {
+        let show_before = Command::new(bin())
+            .args(["--db", &db, "event", "show", &event_id[..12]])
+            .output()
+            .expect("event show before delete");
+        assert!(show_before.status.success());
+        assert!(
+            !String::from_utf8_lossy(&show_before.stdout)
+                .contains("No events matching that prefix."),
+            "event show should resolve {} before delete:\n{}",
+            event_id,
+            String::from_utf8_lossy(&show_before.stdout)
+        );
+    }
+
+    let delete_out = Command::new(bin())
+        .args(["--db", &db, "delete-message", "1"])
+        .output()
+        .expect("delete-message");
+    assert!(
+        delete_out.status.success(),
+        "delete-message failed: {}",
+        String::from_utf8_lossy(&delete_out.stderr)
+    );
+
+    assert_now(&db, "message_count == 0");
+    for event_id in [&msg_eid, &file_eid, &slice_eid] {
+        assert_now(&db, &format!("has_event:{} == 0", event_id));
+    }
+
+    let conn = open_connection(&db).unwrap();
+    let message_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+            rusqlite::params![&recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let file_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM files WHERE recorded_by = ?1",
+            rusqlite::params![&recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let slice_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM file_slices WHERE recorded_by = ?1",
+            rusqlite::params![&recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let deleted_file_rows: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM deleted_files WHERE recorded_by = ?1 AND file_id = ?2",
+            rusqlite::params![&recorded_by, &file_id],
+            |row| row.get(0),
+        )
+        .unwrap();
+    let deletion_eid: String = conn
+        .query_row(
+            "SELECT deletion_event_id
+             FROM deleted_messages
+             WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![&recorded_by, &msg_eid],
+            |row| row.get(0),
+        )
+        .expect("deletion event id");
+    assert_eq!(message_rows, 0, "message row should be purged");
+    assert_eq!(file_rows, 0, "file descriptor row should be purged");
+    assert_eq!(slice_rows, 0, "file slice row should be purged");
+    assert_eq!(
+        deleted_file_rows, 1,
+        "deleted_files mapping should remain for late slice handling"
+    );
+
+    for event_id in [&msg_eid, &file_eid, &slice_eid] {
+        let show_after = Command::new(bin())
+            .args(["--db", &db, "event", "show", &event_id[..12]])
+            .output()
+            .expect("event show after delete");
+        assert!(show_after.status.success());
+        assert!(
+            String::from_utf8_lossy(&show_after.stdout).contains("No events matching that prefix."),
+            "event {} should be absent from event show after purge:\n{}",
+            event_id,
+            String::from_utf8_lossy(&show_after.stdout)
+        );
+    }
+
+    let ids_after = Command::new(bin())
+        .args(["--db", &db, "event", "list", "--ids-only"])
+        .output()
+        .expect("event list ids after delete");
+    assert!(
+        ids_after.status.success(),
+        "event list after delete failed: {}",
+        String::from_utf8_lossy(&ids_after.stderr)
+    );
+    let ids_after_stdout = String::from_utf8_lossy(&ids_after.stdout);
+    for event_id in [&msg_eid, &file_eid, &slice_eid] {
+        assert!(
+            !ids_after_stdout.contains(event_id),
+            "event list should not include {} after purge:\n{}",
+            event_id,
+            ids_after_stdout
+        );
+    }
+
+    let deletion_ids = Command::new(bin())
+        .args([
+            "--db",
+            &db,
+            "event",
+            "list",
+            "--type",
+            "message_deletion",
+            "--ids-only",
+        ])
+        .output()
+        .expect("event list ids for message_deletion");
+    assert!(
+        deletion_ids.status.success(),
+        "event list --type message_deletion failed: {}",
+        String::from_utf8_lossy(&deletion_ids.stderr)
+    );
+    let deletion_ids_stdout = String::from_utf8_lossy(&deletion_ids.stdout);
+    assert!(
+        deletion_ids_stdout.contains("EVENT IDS (1):"),
+        "filtered event list should show exactly one deletion event:\n{}",
+        deletion_ids_stdout
+    );
+    assert!(
+        deletion_ids_stdout.contains(&deletion_eid),
+        "filtered event list should include deletion event:\n{}",
+        deletion_ids_stdout
+    );
+    for event_id in [&msg_eid, &file_eid, &slice_eid] {
+        assert!(
+            !deletion_ids_stdout.contains(event_id),
+            "filtered deletion list should not include purged event {}:\n{}",
+            event_id,
+            deletion_ids_stdout
+        );
+    }
+}
+
+#[test]
 fn test_cli_messages_include_reactions() {
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir

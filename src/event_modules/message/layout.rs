@@ -30,8 +30,8 @@ pub mod offsets {
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use super::super::super::layout::field_spec::field_offset;
+    use super::*;
     #[test]
     fn offsets_consistent() {
         assert_eq!(offsets::SIGNATURE + 64, MESSAGE_WIRE_SIZE);

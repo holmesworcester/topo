@@ -47,7 +47,7 @@ EXTENDS Naturals, FiniteSets
 
 CONSTANTS ActiveEvents, Peers, Workspaces
 
-VARIABLES recorded, valid, trustAnchor,
+VARIABLES recorded, valid, deletionIntent, deletedMessage, deletedFile, trustAnchor,
           inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
           inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
           peerPrivkeyCarriedSigner,
@@ -204,10 +204,11 @@ RawDeps(e) ==
        [] e = PeerPrivkey -> {}
        [] e = InvitePrivkey -> {}
 
-       \* Content: message depends on workspace; reaction/deletion depend on message
+       \* Content: message depends on workspace; reaction depends on message.
+       \* message_deletion records intent first and may converge before target exists.
        [] e = Message -> {Workspace}
        [] e = MessageReaction -> {Message}
-       [] e = MessageDeletion -> {Message}
+       [] e = MessageDeletion -> {}
        [] e = MessageAttachment -> {Message, Secret}
        [] e = FileSlice -> {}
 
@@ -271,6 +272,27 @@ ResolveWorkspace(p, deps) ==
 \* Combined peer-resolved dependencies: structural + signer.
 PeerDeps(p, e) == ResolveWorkspace(p, RawDeps(e) \cup SignerDep(e))
 
+\* Post-tombstone dependency view used by projection.
+\* reaction/message_attachment may proceed once the target message is tombstoned.
+DeleteAwareRawDeps(p, e) ==
+    LET deps == ResolveWorkspace(p, RawDeps(e))
+    IN CASE e = MessageReaction /\ deletedMessage[p] -> deps \ {Message}
+       [] e = MessageAttachment /\ deletedMessage[p] -> deps \ {Message}
+       [] OTHER -> deps
+
+DeleteAwarePeerDeps(p, e) ==
+    DeleteAwareRawDeps(p, e) \cup ResolveWorkspace(p, SignerDep(e))
+
+FileSliceGuardSatisfied(p) ==
+    deletedFile[p] \/ MessageAttachment \in valid[p]
+
+ShouldPersistDeletedFile(p) ==
+    deletedFile[p] \/ MessageAttachment \in recorded[p]
+
+MessageGraphPurgeSet(p) ==
+    {Message, MessageReaction, MessageAttachment}
+    \cup (IF ShouldPersistDeletedFile(p) THEN {FileSlice} ELSE {})
+
 \* ---- Guards ----
 
 \* Workspace events require matching trust anchor binding.
@@ -298,6 +320,9 @@ TrustedPeerSet(p) ==
 Init ==
     /\ recorded = [p \in Peers |-> {}]
     /\ valid = [p \in Peers |-> {}]
+    /\ deletionIntent = [p \in Peers |-> FALSE]
+    /\ deletedMessage = [p \in Peers |-> FALSE]
+    /\ deletedFile = [p \in Peers |-> FALSE]
     /\ trustAnchor = [p \in Peers |-> "none"]
     /\ inviteCarriedWorkspace = [p \in Peers |-> "none"]
     /\ inviteCarriedBootstrapPeer = [p \in Peers |-> "none"]
@@ -348,7 +373,8 @@ Record(p, e) ==
        THEN \E dp \in Peers:
             peerSharedDerivedPeer' = [peerSharedDerivedPeer EXCEPT ![p] = dp]
        ELSE UNCHANGED peerSharedDerivedPeer
-    /\ UNCHANGED <<valid, trustAnchor, bootstrapTrustPeer, peerSharedTrustPeer, connState>>
+    /\ UNCHANGED <<valid, deletionIntent, deletedMessage, deletedFile,
+                  trustAnchor, bootstrapTrustPeer, peerSharedTrustPeer, connState>>
 
 \* invite_accepted binds the trust anchor from its accepted invite-link workspace.
 \* First-write-wins: if trust anchor is already set to a different workspace,
@@ -358,7 +384,8 @@ Project(p, e) ==
     /\ e \in EVENTS
     /\ e \in recorded[p]
     /\ e \notin valid[p]
-    /\ PeerDeps(p, e) \subseteq valid[p]
+    /\ DeleteAwarePeerDeps(p, e) \subseteq valid[p]
+    /\ IF e = FileSlice THEN FileSliceGuardSatisfied(p) ELSE TRUE
     /\ IF e = PeerPrivkey
        THEN peerPrivkeyCarriedSigner[p] \in valid[p]
        ELSE TRUE
@@ -382,7 +409,47 @@ Project(p, e) ==
     /\ IF e = PeerShared /\ peerSharedTrustPeer[p] /= "none"
        THEN peerSharedTrustPeer[p] = peerSharedDerivedPeer[p]
        ELSE TRUE
-    /\ valid' = [valid EXCEPT ![p] = @ \cup {e}]
+    /\ LET purgeOnDeletion == e = MessageDeletion /\ Message \in valid[p]
+           purgeOnMessageArrival == e = Message /\ deletionIntent[p]
+           purgeLateReaction == e = MessageReaction /\ deletedMessage[p]
+           purgeLateAttachment == e = MessageAttachment /\ deletedMessage[p]
+           purgeLateSlice == e = FileSlice /\ deletedFile[p]
+           purgeMessageGraph == MessageGraphPurgeSet(p)
+           nextValid ==
+               IF purgeOnDeletion
+               THEN (valid[p] \ purgeMessageGraph) \cup {e}
+               ELSE IF purgeOnMessageArrival
+               THEN valid[p] \ purgeMessageGraph
+               ELSE IF purgeLateReaction
+               THEN valid[p] \ {MessageReaction}
+               ELSE IF purgeLateAttachment
+               THEN valid[p] \ {MessageAttachment, FileSlice}
+               ELSE IF purgeLateSlice
+               THEN valid[p] \ {FileSlice}
+               ELSE valid[p] \cup {e}
+           nextRecorded ==
+               IF purgeOnDeletion
+               THEN recorded[p] \ purgeMessageGraph
+               ELSE IF purgeOnMessageArrival
+               THEN recorded[p] \ purgeMessageGraph
+               ELSE IF purgeLateReaction
+               THEN recorded[p] \ {MessageReaction}
+               ELSE IF purgeLateAttachment
+               THEN recorded[p] \ {MessageAttachment, FileSlice}
+               ELSE IF purgeLateSlice
+               THEN recorded[p] \ {FileSlice}
+               ELSE recorded[p]
+           markDeletedMessage == purgeOnDeletion \/ purgeOnMessageArrival
+           markDeletedFile ==
+               purgeLateAttachment
+               \/ ((purgeOnDeletion \/ purgeOnMessageArrival) /\ ShouldPersistDeletedFile(p))
+           nextDeletionIntent ==
+               IF e = MessageDeletion THEN TRUE ELSE deletionIntent[p]
+        IN /\ valid' = [valid EXCEPT ![p] = nextValid]
+           /\ recorded' = [recorded EXCEPT ![p] = nextRecorded]
+           /\ deletionIntent' = [deletionIntent EXCEPT ![p] = nextDeletionIntent]
+           /\ deletedMessage' = [deletedMessage EXCEPT ![p] = @ \/ markDeletedMessage]
+           /\ deletedFile' = [deletedFile EXCEPT ![p] = @ \/ markDeletedFile]
     \* Trust anchor binding: deterministic from event-carried workspace_id.
     /\ trustAnchor' =
         IF e = InviteAccepted /\ trustAnchor[p] = "none"
@@ -402,13 +469,13 @@ Project(p, e) ==
         IF e = PeerShared /\ pendingBootstrapTrustPeer[p] = peerSharedDerivedPeer[p]
         THEN [pendingBootstrapTrustPeer EXCEPT ![p] = "none"]
         ELSE pendingBootstrapTrustPeer
-    /\ UNCHANGED <<recorded, inviteCarriedWorkspace, inviteCarriedBootstrapPeer,
+    /\ UNCHANGED <<inviteCarriedWorkspace, inviteCarriedBootstrapPeer,
                   inviteCarriedPendingPeer, peerPrivkeyCarriedSigner,
                   invitePrivkeyCarriedInvite,
                   secretSharedCarriedInvite, peerSharedDerivedPeer, connState>>
 
 Stutter ==
-    UNCHANGED <<recorded, valid, trustAnchor,
+    UNCHANGED <<recorded, valid, deletionIntent, deletedMessage, deletedFile, trustAnchor,
                 inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
                 inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
                 peerPrivkeyCarriedSigner,
@@ -420,14 +487,14 @@ Stutter ==
 \* Models the upgrade from invite-labeled to peer-labeled connection.
 \* Only active when InviteAccepted is in EVENTS.
 
-allVars == <<recorded, valid, trustAnchor,
+allVars == <<recorded, valid, deletionIntent, deletedMessage, deletedFile, trustAnchor,
              inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
              inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
              peerPrivkeyCarriedSigner,
              invitePrivkeyCarriedInvite, secretSharedCarriedInvite,
              peerSharedDerivedPeer, peerSharedTrustPeer, connState>>
 
-nonConnVars == <<recorded, valid, trustAnchor,
+nonConnVars == <<recorded, valid, deletionIntent, deletedMessage, deletedFile, trustAnchor,
                  inviteCarriedWorkspace, inviteCarriedBootstrapPeer, bootstrapTrustPeer,
                  inviteCarriedPendingPeer, pendingBootstrapTrustPeer,
                  peerPrivkeyCarriedSigner,
@@ -480,6 +547,9 @@ TypeOK ==
     /\ recorded \in [Peers -> SUBSET EVENTS]
     /\ valid \in [Peers -> SUBSET EVENTS]
     /\ \A p \in Peers: valid[p] \subseteq recorded[p]
+    /\ deletionIntent \in [Peers -> BOOLEAN]
+    /\ deletedMessage \in [Peers -> BOOLEAN]
+    /\ deletedFile \in [Peers -> BOOLEAN]
     /\ trustAnchor \in [Peers -> Workspaces \cup {"none"}]
     /\ inviteCarriedWorkspace \in [Peers -> Workspaces \cup {"none"}]
     /\ inviteCarriedBootstrapPeer \in [Peers -> Peers \cup {"none"}]
@@ -692,6 +762,55 @@ InvFileSliceAuth ==
         (FileSlice \in valid[p] /\ MessageAttachment \in valid[p])
             => (PeerShared \in valid[p])
     ELSE TRUE
+
+\* A deletion intent can only come from a projected message_deletion event.
+InvDeleteIntentSource ==
+    \A p \in Peers:
+        deletionIntent[p] => MessageDeletion \in valid[p]
+
+\* Once delete intent exists, the live message row can no longer survive.
+InvDeleteIntentNoLiveMessage ==
+    \A p \in Peers:
+        deletionIntent[p] => Message \notin valid[p]
+
+\* A tombstoned message is always backed by a projected delete intent.
+InvDeletedMessageSource ==
+    \A p \in Peers:
+        deletedMessage[p] => (deletionIntent[p] /\ MessageDeletion \in valid[p])
+
+\* A deleted message cannot leave live message/reaction/attachment rows behind.
+InvDeletedMessagePurgesLiveGraph ==
+    \A p \in Peers:
+        deletedMessage[p] =>
+            /\ Message \notin valid[p]
+            /\ MessageReaction \notin valid[p]
+            /\ MessageAttachment \notin valid[p]
+
+\* Deleted-message tombstones satisfy the message edge for late reactions.
+InvReactionTombstoneBypass ==
+    \A p \in Peers:
+        deletedMessage[p] => Message \notin DeleteAwareRawDeps(p, MessageReaction)
+
+\* Deleted-message tombstones satisfy the message edge for late attachments.
+InvAttachmentTombstoneBypass ==
+    \A p \in Peers:
+        deletedMessage[p] => Message \notin DeleteAwareRawDeps(p, MessageAttachment)
+
+\* Once a deleted file mapping exists, neither the descriptor nor its slices remain live.
+InvDeletedFilePurgesLiveSlice ==
+    \A p \in Peers:
+        deletedFile[p] =>
+            /\ MessageAttachment \notin valid[p]
+            /\ FileSlice \notin valid[p]
+
+\* Projection of deletion + purge is atomic at the live-state boundary.
+InvDeletePurgeAtomic ==
+    \A p \in Peers:
+        deletedMessage[p] =>
+            /\ Message \notin valid[p]
+            /\ MessageReaction \notin valid[p]
+            /\ MessageAttachment \notin valid[p]
+            /\ (deletedFile[p] => FileSlice \notin valid[p])
 
 \* ---- Connection state machine invariants ----
 

@@ -36,6 +36,9 @@ pub enum WriteOp {
 /// event identity for idempotence.
 #[derive(Debug, Clone, PartialEq)]
 pub enum EmitCommand {
+    /// Hard-purge a tombstoned message event and all discovered dependents for
+    /// the current tenant inside the current projection transaction.
+    HardPurgeMessageGraph { message_event_id: String },
     /// Re-project a specific workspace event after accepted-workspace binding was set.
     /// Emitted by invite_accepted when it knows the workspace_id.
     /// Flows through normal projection + cascade.
@@ -179,6 +182,10 @@ pub struct ContextSnapshot {
     /// (row in deleted_messages). Note: pending deletion_intents are NOT
     /// included — an unverified intent does not mean the message is deleted.
     pub target_message_deleted: bool,
+
+    /// For File/FileSlice: if the file_id is already known to belong to a
+    /// tombstoned message graph, this carries the root message event id.
+    pub deleted_file_message_id: Option<String>,
 
     /// For KeyShared: DH-unwrapped key material, if available.
     pub unwrapped_secret_material: Option<UnwrappedSecretMaterial>,

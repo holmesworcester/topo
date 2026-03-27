@@ -717,12 +717,14 @@ fn dispatch(
             Err(e) => RpcResponse::error(e),
         },
         RpcMethod::Files { limit } => {
-            with_active_peer_db(state, |_peer_id, recorded_by, db| {
-                match file::queries::list_files(db, recorded_by, limit) {
+            with_active_peer_db(
+                state,
+                |_peer_id, recorded_by, db| match file::queries::list_files(db, recorded_by, limit)
+                {
                     Ok(data) => RpcResponse::success(data),
                     Err(e) => RpcResponse::error(e.to_string()),
-                }
-            })
+                },
+            )
         }
         RpcMethod::SaveFile {
             target,
@@ -809,25 +811,19 @@ fn dispatch(
             }
             Err(e) => RpcResponse::error(e.to_string()),
         },
-        RpcMethod::TransportAuth => {
-            with_active_peer_db(state, |_peer_id, recorded_by, db| {
-                match crate::state::db::transport_trust::list_authorized_transport_rows(
-                    db,
-                    recorded_by,
-                ) {
-                    Ok(rows) => RpcResponse::success(serde_json::json!(rows)),
-                    Err(e) => RpcResponse::error(e.to_string()),
-                }
-            })
-        }
-        RpcMethod::Messages { limit } => {
-            with_active_peer_db(state, |_peer_id, recorded_by, db| {
-                match message::list(db, recorded_by, limit) {
-                    Ok(data) => RpcResponse::success(data),
-                    Err(e) => RpcResponse::error(e.to_string()),
-                }
-            })
-        }
+        RpcMethod::TransportAuth => with_active_peer_db(state, |_peer_id, recorded_by, db| {
+            match crate::state::db::transport_trust::list_authorized_transport_rows(db, recorded_by)
+            {
+                Ok(rows) => RpcResponse::success(serde_json::json!(rows)),
+                Err(e) => RpcResponse::error(e.to_string()),
+            }
+        }),
+        RpcMethod::Messages { limit } => with_active_peer_db(state, |_peer_id, recorded_by, db| {
+            match message::list(db, recorded_by, limit) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            }
+        }),
         RpcMethod::Status => {
             let with_runtime_state = |data: workspace::StatusResponse| {
                 let mut json = serde_json::to_value(data).unwrap_or(serde_json::Value::Null);
@@ -994,20 +990,21 @@ fn dispatch(
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }),
-        RpcMethod::Keys { summary } => {
-            with_active_peer_db(state, |_peer_id, recorded_by, db| {
-                match workspace::keys(db, recorded_by, summary) {
-                    Ok(data) => RpcResponse::success(data),
-                    Err(e) => RpcResponse::error(e.to_string()),
-                }
-            })
-        }
-        RpcMethod::Peers => with_active_peer_db(state, |_peer_id, recorded_by, db| {
-            match peer_shared::list_peers(db, recorded_by) {
+        RpcMethod::Keys { summary } => with_active_peer_db(state, |_peer_id, recorded_by, db| {
+            match workspace::keys(db, recorded_by, summary) {
                 Ok(data) => RpcResponse::success(data),
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }),
+        RpcMethod::Peers => {
+            with_active_peer_db(
+                state,
+                |_peer_id, recorded_by, db| match peer_shared::list_peers(db, recorded_by) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+            )
+        }
         RpcMethod::Workspaces => match crate::db::open_connection(db_path) {
             Ok(db) => {
                 let _ = crate::db::schema::create_tables(&db);
@@ -1275,12 +1272,15 @@ fn dispatch(
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }
-        RpcMethod::Identity => with_active_peer_db(state, |peer_id, _recorded_by, db| {
-            match peer_shared::identity(db, peer_id) {
-                Ok(data) => RpcResponse::success(data),
-                Err(e) => RpcResponse::error(e.to_string()),
-            }
-        }),
+        RpcMethod::Identity => {
+            with_active_peer_db(
+                state,
+                |peer_id, _recorded_by, db| match peer_shared::identity(db, peer_id) {
+                    Ok(data) => RpcResponse::success(data),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
+            )
+        }
         RpcMethod::AcceptInvite {
             invite,
             username,
@@ -1631,22 +1631,25 @@ fn dispatch(
                 }
             })
         }
-        RpcMethod::EventShow { prefix } => {
-            with_active_peer_db(state, |_peer_id, recorded_by, db| {
-                match service::svc_event_show(db, recorded_by, &prefix) {
-                    Ok(data) => RpcResponse::success(data),
-                    Err(e) => RpcResponse::error(e.to_string()),
-                }
-            })
-        }
-        RpcMethod::EventDeps { prefix, depth } => {
-            with_active_peer_db(state, |_peer_id, recorded_by, db| {
-                match service::svc_event_deps(db, recorded_by, &prefix, depth) {
-                    Ok(data) => RpcResponse::success(data),
-                    Err(e) => RpcResponse::error(e.to_string()),
-                }
-            })
-        }
+        RpcMethod::EventShow { prefix } => with_active_peer_db(
+            state,
+            |_peer_id, recorded_by, db| match service::svc_event_show(db, recorded_by, &prefix) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+        ),
+        RpcMethod::EventDeps { prefix, depth } => with_active_peer_db(
+            state,
+            |_peer_id, recorded_by, db| match service::svc_event_deps(
+                db,
+                recorded_by,
+                &prefix,
+                depth,
+            ) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+        ),
 
         // ----- Subscription commands -----
         RpcMethod::SubCreate {
@@ -1760,49 +1763,73 @@ fn dispatch(
                 Err(e) => RpcResponse::error(e),
             }
         }),
-        RpcMethod::SubDisable { subscription_id } => {
-            with_active_peer_db(state, |_peer_id, recorded_by, db| {
-                match subscriptions::set_enabled(db, recorded_by, &subscription_id, false) {
-                    Ok(()) => RpcResponse::success(serde_json::json!({"disabled": true})),
-                    Err(e) => RpcResponse::error(e),
-                }
-            })
-        }
-        RpcMethod::SubEnable { subscription_id } => {
-            with_active_peer_db(state, |_peer_id, recorded_by, db| {
-                match subscriptions::set_enabled(db, recorded_by, &subscription_id, true) {
-                    Ok(()) => RpcResponse::success(serde_json::json!({"enabled": true})),
-                    Err(e) => RpcResponse::error(e),
-                }
-            })
-        }
+        RpcMethod::SubDisable { subscription_id } => with_active_peer_db(
+            state,
+            |_peer_id, recorded_by, db| match subscriptions::set_enabled(
+                db,
+                recorded_by,
+                &subscription_id,
+                false,
+            ) {
+                Ok(()) => RpcResponse::success(serde_json::json!({"disabled": true})),
+                Err(e) => RpcResponse::error(e),
+            },
+        ),
+        RpcMethod::SubEnable { subscription_id } => with_active_peer_db(
+            state,
+            |_peer_id, recorded_by, db| match subscriptions::set_enabled(
+                db,
+                recorded_by,
+                &subscription_id,
+                true,
+            ) {
+                Ok(()) => RpcResponse::success(serde_json::json!({"enabled": true})),
+                Err(e) => RpcResponse::error(e),
+            },
+        ),
         RpcMethod::SubPoll {
             subscription_id,
             after_seq,
             limit,
-        } => with_active_peer_db(state, |_peer_id, recorded_by, db| {
-            match subscriptions::poll_feed(db, recorded_by, &subscription_id, after_seq, limit) {
+        } => with_active_peer_db(
+            state,
+            |_peer_id, recorded_by, db| match subscriptions::poll_feed(
+                db,
+                recorded_by,
+                &subscription_id,
+                after_seq,
+                limit,
+            ) {
                 Ok(items) => RpcResponse::success(items),
                 Err(e) => RpcResponse::error(e),
-            }
-        }),
+            },
+        ),
         RpcMethod::SubAck {
             subscription_id,
             through_seq,
-        } => with_active_peer_db(state, |_peer_id, recorded_by, db| {
-            match subscriptions::ack_feed(db, recorded_by, &subscription_id, through_seq) {
+        } => with_active_peer_db(
+            state,
+            |_peer_id, recorded_by, db| match subscriptions::ack_feed(
+                db,
+                recorded_by,
+                &subscription_id,
+                through_seq,
+            ) {
                 Ok(()) => RpcResponse::success(serde_json::json!({"acked": true})),
                 Err(e) => RpcResponse::error(e),
-            }
-        }),
-        RpcMethod::SubState { subscription_id } => {
-            with_active_peer_db(state, |_peer_id, recorded_by, db| {
-                match subscriptions::get_state(db, recorded_by, &subscription_id) {
-                    Ok(state) => RpcResponse::success(state),
-                    Err(e) => RpcResponse::error(e),
-                }
-            })
-        }
+            },
+        ),
+        RpcMethod::SubState { subscription_id } => with_active_peer_db(
+            state,
+            |_peer_id, recorded_by, db| match subscriptions::get_state(
+                db,
+                recorded_by,
+                &subscription_id,
+            ) {
+                Ok(state) => RpcResponse::success(state),
+                Err(e) => RpcResponse::error(e),
+            },
+        ),
     }
 }
 

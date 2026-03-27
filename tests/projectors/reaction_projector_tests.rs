@@ -10,6 +10,7 @@ mod tests {
     use topo::event_modules::reaction::project_pure;
     use topo::event_modules::reaction::ReactionEvent;
     use topo::event_modules::ParsedEvent;
+    use topo::projection::contract::EmitCommand;
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "rxn_event_1";
@@ -66,5 +67,11 @@ mod tests {
             result.write_ops.is_empty(),
             "should produce no write ops when target deleted"
         );
+        assert_emits_command(&result, "HardPurgeMessageGraph", |cmd| {
+            matches!(
+                cmd,
+                EmitCommand::HardPurgeMessageGraph { message_event_id } if message_event_id == &b64(&[1u8; 32])
+            )
+        });
     }
 }

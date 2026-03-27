@@ -81,7 +81,11 @@ pub fn encode_device_invite(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
         FieldValue::FixedBytes(e.signature.to_vec()),
     ];
 
-    Ok(encode_fields(EVENT_TYPE_DEVICE_INVITE, DEVICE_INVITE_FIELDS, &values)?)
+    Ok(encode_fields(
+        EVENT_TYPE_DEVICE_INVITE,
+        DEVICE_INVITE_FIELDS,
+        &values,
+    )?)
 }
 
 pub static DEVICE_INVITE_META: EventTypeMeta = EventTypeMeta {
