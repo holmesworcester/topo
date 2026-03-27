@@ -936,7 +936,8 @@ Fields include:
 - `accepted_workspace_id` — accepted workspace binding for this tenant
 - `target_message_author` / `target_tombstone_author` — for deletion auth
 - `deletion_intents` — pre-existing deletion intents (for delete-before-create convergence)
-- `target_message_deleted` — for reaction skip-on-delete
+- `target_message_deleted` — for reaction/file skip-on-delete
+- `deleted_file_message_id` — root deleted-message id for late `file_slice` arrivals after descriptor purge
 - `file_descriptors` / `existing_file_slice` / `current_transport_key_event_id` — for FileSlice authorization, duplicate detection, and wrapper-key matching
 - `bootstrap_context` — local bootstrap context (addr + SPKI) for invite trust materialization
 - `is_local_create` — whether the event was locally created (from `recorded_events.source`); gates pending bootstrap trust `InsertOrIgnore` writes so only the invite creator materializes pending trust
@@ -1013,10 +1014,10 @@ The `MessageDeletion` projector always emits an idempotent `deletion_intent` wri
 by `(recorded_by, target_kind="message", target_id)`. This records the intent to delete
 regardless of whether the target message exists yet.
 
-**Stage 2: tombstone + cascade.**
+**Stage 2: tombstone + hard purge.**
 - If the target message exists in projected state, the projector also emits tombstone
-  (`deleted_messages`) write ops and cascade deletes (`messages`, `reactions`) in the same
-  apply batch.
+  (`deleted_messages`) write ops, live-view cleanup (`messages`, `reactions`), and a
+  `HardPurgeMessageGraph` follow-up in the same projection transaction.
 - If the target does not exist yet, only the intent is recorded. No imperative retries.
 
 **Delete-before-create convergence:**
@@ -1028,12 +1029,29 @@ identical final state regardless of arrival order.
 **Monotonic deletion state:**
 - `active → tombstoned` is allowed.
 - `tombstoned → active` is never allowed by replay.
-- Physical row removal is a separate compaction concern; projector semantics prefer tombstones.
+- Minimal tombstones remain (`deletion_intents`, `deleted_messages`, and `deleted_files`).
+- Deleted event material does not remain in `events`, tenant-scoped event tables, or live projections after a successful purge.
 
 **Cleanup fanout:**
 Reaction cleanup on message delete is represented as explicit deterministic `Delete` WriteOps
-in the `ProjectorResult`, not hidden side effects. Reactions arriving after their target
-message is deleted (or has a deletion intent) are structurally valid but produce no row.
+in the `ProjectorResult`, not hidden side effects. The hard-purge follow-up then removes the
+deleted message graph from event storage and dependent projection rows (`reactions`, `files`,
+`file_slices`, queue rows, blocked rows, subscription feed rows, fanout rows, and orphaned
+global event blobs when no tenant still references them).
+
+**Late dependent arrivals:**
+- `message` after prior intent: tombstones immediately, then purges itself.
+- `reaction` / `file` after prior tombstone: dependency checks treat the deleted message as
+  satisfied for the message-target edge, the projector emits `HardPurgeMessageGraph`, and the
+  event purges itself in the current transaction.
+- `file_slice` after descriptor purge: purge persists a minimal `deleted_files(file_id -> message_id)`
+  map, so the `file_slice` projector can recognize the deleted graph even when the original
+  descriptor row is already gone and purge the slice immediately.
+
+**Atomicity + retry:**
+`project_one` owns the transaction boundary for the projector writes, emitted purge command,
+terminal `valid_events` insert, and cascade. If any purge deletion or postcondition check fails,
+the whole transaction rolls back and the normal `project_queue` retry path runs later.
 
 ### Replay/reorder/idempotence deletion invariants
 
@@ -1043,7 +1061,7 @@ These invariants are enforced by tests (`test_deletion_invariant_*`):
 2. **Order convergence:** Delete-before-create produces identical tombstone rows as create-before-delete.
 3. **Replay invariance:** Full forward replay from event log reproduces identical tombstone state.
 4. **Auth determinism:** Authorization failure paths are deterministic from projected context snapshot.
-5. **Cleanup completeness:** No live reactions remain for tombstoned messages; no query can surface deleted entities.
+5. **Cleanup completeness:** No live reactions, file descriptors, or file slices remain for tombstoned messages; no query can surface deleted entities.
 6. **Command idempotence:** `deletion_intent` identities are stable (derived from event identity); re-running does not mutate final state.
 7. **Monotonicity:** Once tombstoned, a message cannot revert to active state.
 

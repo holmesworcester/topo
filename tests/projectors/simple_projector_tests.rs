@@ -1,5 +1,4 @@
-//! Pure projector conformance tests for simple projectors that do straight inserts
-//! with no guards beyond type matching.
+//! Pure projector conformance tests for mostly simple projectors.
 //!
 //! Covers: User, Admin, KeySecret, File, BenchDep.
 
@@ -135,6 +134,39 @@ mod tests {
         assert_writes_to_table(&result, "files");
         assert_emits_command(&result, "RetryFileSliceGuards", |c| {
             matches!(c, EmitCommand::RetryFileSliceGuards { .. })
+        });
+    }
+
+    #[test]
+    fn test_file_skips_when_target_message_deleted() {
+        use topo::event_modules::file::{project_pure, FileEvent};
+        let message_id = [1u8; 32];
+        let file_id = [2u8; 32];
+        let parsed = ParsedEvent::File(FileEvent {
+            created_at_ms: 8000,
+            message_id,
+            file_id,
+            blob_bytes: 1024,
+            total_slices: 1,
+            slice_bytes: 262144,
+            root_hash: [3u8; 32],
+            key_event_id: [4u8; 32],
+            filename: "test.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+            signed_by: [5u8; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx_with_target_message_deleted());
+        assert_valid(&result);
+        assert_no_write_to_table(&result, "files");
+        assert_writes_to_table(&result, "deleted_files");
+        assert_emits_command(&result, "HardPurgeMessageGraph", |cmd| {
+            matches!(
+                cmd,
+                EmitCommand::HardPurgeMessageGraph { message_event_id }
+                    if message_event_id == &b64(&message_id)
+            )
         });
     }
 

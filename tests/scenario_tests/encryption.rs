@@ -46,7 +46,10 @@ async fn test_encrypted_out_of_order_sync() {
             |row| row.get(0),
         )
         .unwrap();
-    assert!(blocked_before >= 1, "encrypted wrapper should be blocked until key appears");
+    assert!(
+        blocked_before >= 1,
+        "encrypted wrapper should be blocked until key appears"
+    );
 
     let sk_eid_bob = bob.create_key_secret_deterministic(key_bytes, fixed_ts);
     assert_eq!(sk_eid_bob, sk_eid);

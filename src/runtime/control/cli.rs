@@ -238,7 +238,7 @@ pub(crate) enum Commands {
 
     /// Event inspection commands (tree, list)
     #[command(
-        after_help = "Examples:\n  topo event tree     # show event dependency tree\n  topo event list     # list all events with dependencies"
+        after_help = "Examples:\n  topo event tree                           # show event dependency tree\n  topo event list                           # list all events with dependencies\n  topo event list --type message_deletion   # list only deletion events"
     )]
     Event {
         #[command(subcommand)]
@@ -615,6 +615,9 @@ pub(crate) enum EventAction {
     Tree,
     /// List all events with their dependencies (requires running daemon)
     List {
+        /// Filter by exact event type (for example: message_deletion)
+        #[arg(long = "type")]
+        event_type: Option<String>,
         /// Print one event ID per line (sorted), no other fields
         #[arg(long)]
         ids_only: bool,

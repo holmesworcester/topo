@@ -55,7 +55,11 @@ pub fn encode_peer_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         FieldValue::EventId(e.private_key_bytes),
     ];
 
-    Ok(encode_fields(EVENT_TYPE_PEER_SECRET, PEER_SECRET_FIELDS, &values)?)
+    Ok(encode_fields(
+        EVENT_TYPE_PEER_SECRET,
+        PEER_SECRET_FIELDS,
+        &values,
+    )?)
 }
 
 // === Projector (event-module locality) ===

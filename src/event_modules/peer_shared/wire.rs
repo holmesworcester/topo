@@ -82,7 +82,11 @@ pub fn encode_peer_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         FieldValue::FixedBytes(e.signature.to_vec()),
     ];
 
-    Ok(encode_fields(EVENT_TYPE_PEER_SHARED, PEER_SHARED_FIELDS, &values)?)
+    Ok(encode_fields(
+        EVENT_TYPE_PEER_SHARED,
+        PEER_SHARED_FIELDS,
+        &values,
+    )?)
 }
 
 pub static PEER_SHARED_META: EventTypeMeta = EventTypeMeta {
@@ -109,7 +113,10 @@ mod layout_tests {
 
     #[test]
     fn offsets_consistent() {
-        assert_eq!(field_offset(PEER_SHARED_FIELDS, 6) + 64, PEER_SHARED_WIRE_SIZE);
+        assert_eq!(
+            field_offset(PEER_SHARED_FIELDS, 6) + 64,
+            PEER_SHARED_WIRE_SIZE
+        );
     }
 
     #[test]

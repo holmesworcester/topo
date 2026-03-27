@@ -545,23 +545,27 @@ Two-stage model so deletes stay deterministic when events arrive out of order:
 
 1. `MessageDeletion` projector emits an idempotent `deletion_intent` write keyed by
    `(recorded_by, target_kind="message", target_id)`.
-2. If target exists in projected state, projector also emits tombstone + cascade delete
-   WriteOps in same apply batch.
+2. If target exists in projected state, projector also emits tombstone + live-view cleanup
+   WriteOps plus a `HardPurgeMessageGraph` follow-up in the same projection transaction.
 3. If target does not exist yet, projector only records intent; no imperative retries.
 4. Target-creation projectors check for matching `deletion_intent` rows in their
    `ContextSnapshot` and immediately tombstone on first materialization, using the
    original deletion event's identity for replay invariance.
-5. Cleanup work (message delete → reaction tombstones) is explicit `Delete` WriteOps.
+5. Cleanup work (message delete → live `messages`/`reactions` deletes) is explicit `Delete` WriteOps.
 6. Deletion state is monotonic: `active → tombstoned` allowed, `tombstoned → active` forbidden.
-7. Physical row removal is a separate compaction concern.
+7. Hard purge removes deleted event blobs and dependent rows in the same projection transaction; only minimal tombstones remain (`deletion_intents`, `deleted_messages`, `deleted_files`).
+8. Late `reaction` / `file` arrivals on tombstoned messages bypass only the deleted message dep edge, emit `HardPurgeMessageGraph`, and purge themselves atomically.
+9. Late `file_slice` arrivals rely on the persisted `deleted_files(file_id -> message_id)` mapping so they still purge after the original file descriptor row has already been removed.
+10. If hard purge or verification fails, the whole projection transaction rolls back and the normal queue retry path handles it later.
 
 Deletion invariants validated by tests:
 1. Duplicate replay leaves state unchanged after first application.
 2. Delete-before-create converges to identical final state as create-before-delete.
 3. Full replay reproduces identical tombstone state.
 4. Authorization failure paths are deterministic from projected context.
-5. No live reactions remain for tombstoned message.
-6. Command execution idempotence: intent identities are stable, re-running does not mutate state.
+5. No live reactions, file descriptors, or file slices remain for a tombstoned message.
+6. Late dependents (`reaction`, `file`, `file_slice`) on an already tombstoned message purge themselves instead of surviving in recorded/live state.
+7. Command execution idempotence: intent identities are stable, re-running does not mutate state.
 
 ## 6.2 Dependency handling (blocked-edge + header first)
 

@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, FileDescriptorInfo};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 fn is_file_slice_transport_blob(blob: &[u8]) -> bool {
     crate::event_modules::outer_semantic_type_code(blob)
@@ -24,6 +24,16 @@ pub fn build_projector_context(
 
     let mut ctx = ContextSnapshot::default();
     let file_id_b64 = event_id_to_base64(&fs.file_id);
+
+    ctx.deleted_file_message_id = conn
+        .query_row(
+            "SELECT message_id
+             FROM deleted_files
+             WHERE recorded_by = ?1 AND file_id = ?2",
+            rusqlite::params![recorded_by, &file_id_b64],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
 
     let mut desc_stmt = conn.prepare(
         "SELECT event_id, signer_event_id, key_event_id

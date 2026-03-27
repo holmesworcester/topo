@@ -1,6 +1,6 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 
 /// Pure projector: Message -> messages table insert.
 ///
@@ -58,7 +58,12 @@ pub fn project_pure(
             ],
         }];
         // Structurally valid (the event itself is fine), but tombstoned.
-        return ProjectorResult::valid(ops);
+        return ProjectorResult::valid_with_commands(
+            ops,
+            vec![EmitCommand::HardPurgeMessageGraph {
+                message_event_id: event_id_b64.to_string(),
+            }],
+        );
     }
     // No matching-author intent found - materialize the message normally.
     // Any wrong-author intents are stale and ignored.

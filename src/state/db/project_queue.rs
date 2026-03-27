@@ -398,10 +398,10 @@ impl<'a> ProjectQueue<'a> {
     /// Like `drain` but with a configurable claim batch size.
     ///
     /// Projects a claimed batch, then dequeues all successes in one
-    /// transaction. Projection itself runs in autocommit mode so that
-    /// side effects from failed projections (e.g. blocked_event_deps rows
-    /// needed for cascade-unblock) are preserved. The batched dequeue
-    /// at the end amortizes DELETE overhead.
+    /// transaction. Each individual projection attempt owns its own
+    /// transaction boundary, so successful block/valid/reject side effects
+    /// commit atomically while projection errors roll back fully and retry.
+    /// The batched dequeue at the end amortizes DELETE overhead.
     pub fn drain_with_limit<F>(
         &self,
         peer_id: &str,

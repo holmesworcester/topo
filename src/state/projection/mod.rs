@@ -4,4 +4,5 @@ pub mod create;
 pub mod decision;
 pub mod emit;
 pub mod encrypted;
+pub mod purge;
 pub mod signer;

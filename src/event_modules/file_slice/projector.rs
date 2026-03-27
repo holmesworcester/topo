@@ -22,6 +22,15 @@ pub fn project_pure(
         _ => return ProjectorResult::reject("not a file_slice event".to_string()),
     };
 
+    if let Some(message_event_id) = ctx.deleted_file_message_id.as_deref() {
+        return ProjectorResult::valid_with_commands(
+            Vec::new(),
+            vec![EmitCommand::HardPurgeMessageGraph {
+                message_event_id: message_event_id.to_string(),
+            }],
+        );
+    }
+
     let file_id_b64 = event_id_to_base64(&fs.file_id);
     let slice_signer_b64 = event_id_to_base64(&fs.signed_by);
 

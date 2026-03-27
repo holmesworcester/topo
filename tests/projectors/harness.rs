@@ -48,6 +48,22 @@ pub mod fixtures {
         }
     }
 
+    /// ContextSnapshot with target message deletion state set.
+    pub fn ctx_with_target_message_deleted() -> ContextSnapshot {
+        ContextSnapshot {
+            target_message_deleted: true,
+            ..Default::default()
+        }
+    }
+
+    /// ContextSnapshot with deleted file → root message mapping set.
+    pub fn ctx_with_deleted_file_message(message_id_b64: &str) -> ContextSnapshot {
+        ContextSnapshot {
+            deleted_file_message_id: Some(message_id_b64.to_string()),
+            ..Default::default()
+        }
+    }
+
     /// ContextSnapshot with bootstrap context and is_local_create flag.
     pub fn ctx_with_bootstrap(workspace_id: &str, is_local: bool) -> ContextSnapshot {
         ContextSnapshot {

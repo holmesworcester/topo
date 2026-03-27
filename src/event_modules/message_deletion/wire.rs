@@ -75,7 +75,11 @@ pub fn encode_message_deletion(event: &ParsedEvent) -> Result<Vec<u8>, EventErro
         FieldValue::FixedBytes(del.signature.to_vec()),
     ];
 
-    Ok(encode_fields(EVENT_TYPE_MESSAGE_DELETION, MESSAGE_DELETION_FIELDS, &values)?)
+    Ok(encode_fields(
+        EVENT_TYPE_MESSAGE_DELETION,
+        MESSAGE_DELETION_FIELDS,
+        &values,
+    )?)
 }
 
 pub static MESSAGE_DELETION_META: EventTypeMeta = EventTypeMeta {

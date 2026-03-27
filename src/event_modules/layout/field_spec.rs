@@ -97,38 +97,71 @@ pub enum FieldValue {
 
 impl FieldValue {
     pub fn as_timestamp(&self) -> Option<u64> {
-        match self { Self::Timestamp(v) => Some(*v), _ => None }
+        match self {
+            Self::Timestamp(v) => Some(*v),
+            _ => None,
+        }
     }
     pub fn as_event_id(&self) -> Option<[u8; 32]> {
-        match self { Self::EventId(v) => Some(*v), _ => None }
+        match self {
+            Self::EventId(v) => Some(*v),
+            _ => None,
+        }
     }
     pub fn as_text(&self) -> Option<&str> {
-        match self { Self::Text(v) => Some(v), _ => None }
+        match self {
+            Self::Text(v) => Some(v),
+            _ => None,
+        }
     }
     pub fn as_optional_text(&self) -> Option<Option<&str>> {
-        match self { Self::OptionalText(v) => Some(v.as_deref()), _ => None }
+        match self {
+            Self::OptionalText(v) => Some(v.as_deref()),
+            _ => None,
+        }
     }
     pub fn as_bool(&self) -> Option<bool> {
-        match self { Self::Bool(v) => Some(*v), _ => None }
+        match self {
+            Self::Bool(v) => Some(*v),
+            _ => None,
+        }
     }
     pub fn as_u8(&self) -> Option<u8> {
-        match self { Self::U8(v) => Some(*v), _ => None }
+        match self {
+            Self::U8(v) => Some(*v),
+            _ => None,
+        }
     }
     pub fn as_u32(&self) -> Option<u32> {
-        match self { Self::U32(v) => Some(*v), _ => None }
+        match self {
+            Self::U32(v) => Some(*v),
+            _ => None,
+        }
     }
     pub fn as_u64(&self) -> Option<u64> {
-        match self { Self::U64(v) => Some(*v), _ => None }
+        match self {
+            Self::U64(v) => Some(*v),
+            _ => None,
+        }
     }
     pub fn as_i64(&self) -> Option<i64> {
-        match self { Self::I64(v) => Some(*v), _ => None }
+        match self {
+            Self::I64(v) => Some(*v),
+            _ => None,
+        }
     }
     pub fn as_fixed_bytes(&self) -> Option<&[u8]> {
-        match self { Self::FixedBytes(v) => Some(v), _ => None }
+        match self {
+            Self::FixedBytes(v) => Some(v),
+            _ => None,
+        }
     }
     /// Move the inner Vec out of a FixedBytes value, avoiding a copy.
     pub fn into_fixed_bytes(self) -> Option<Vec<u8>> {
-        match self { Self::FixedBytes(v) => Some(v), _ => None }
+        match self {
+            Self::FixedBytes(v) => Some(v),
+            _ => None,
+        }
     }
 }
 
@@ -205,15 +238,9 @@ pub fn decode_fields(
             }
             FieldSpec::Bool(_) => FieldValue::Bool(slice[0] != 0),
             FieldSpec::U8(_) => FieldValue::U8(slice[0]),
-            FieldSpec::U32(_) => {
-                FieldValue::U32(u32::from_le_bytes(slice.try_into().unwrap()))
-            }
-            FieldSpec::U64(_) => {
-                FieldValue::U64(u64::from_le_bytes(slice.try_into().unwrap()))
-            }
-            FieldSpec::I64(_) => {
-                FieldValue::I64(i64::from_le_bytes(slice.try_into().unwrap()))
-            }
+            FieldSpec::U32(_) => FieldValue::U32(u32::from_le_bytes(slice.try_into().unwrap())),
+            FieldSpec::U64(_) => FieldValue::U64(u64::from_le_bytes(slice.try_into().unwrap())),
+            FieldSpec::I64(_) => FieldValue::I64(i64::from_le_bytes(slice.try_into().unwrap())),
             FieldSpec::FixedBytes(_, _) => FieldValue::FixedBytes(slice.to_vec()),
         };
         values.push(value);
@@ -255,8 +282,7 @@ pub fn encode_fields(
                 write_text_slot(v, slot).map_err(EncodeError::TextSlot)?;
             }
             (FieldSpec::OptionalText(_, _), FieldValue::OptionalText(v)) => {
-                write_text_slot(v.as_deref().unwrap_or(""), slot)
-                    .map_err(EncodeError::TextSlot)?;
+                write_text_slot(v.as_deref().unwrap_or(""), slot).map_err(EncodeError::TextSlot)?;
             }
             (FieldSpec::Bool(_), FieldValue::Bool(v)) => {
                 slot[0] = *v as u8;
@@ -373,7 +399,10 @@ impl std::fmt::Display for EncodeError {
             }
             Self::TextSlot(e) => write!(f, "text slot error: {e}"),
             Self::FixedBytesMismatch { expected, actual } => {
-                write!(f, "fixed bytes size mismatch: expected {expected}, got {actual}")
+                write!(
+                    f,
+                    "fixed bytes size mismatch: expected {expected}, got {actual}"
+                )
             }
             Self::TypeMismatch { field_name } => {
                 write!(f, "type mismatch for field {field_name}")
@@ -404,8 +433,8 @@ mod tests {
 
     #[test]
     fn field_offsets_match_reaction() {
-        assert_eq!(field_offset(REACTION_FIELDS, 0), 1);  // created_at_ms
-        assert_eq!(field_offset(REACTION_FIELDS, 1), 9);  // target_event_id
+        assert_eq!(field_offset(REACTION_FIELDS, 0), 1); // created_at_ms
+        assert_eq!(field_offset(REACTION_FIELDS, 1), 9); // target_event_id
         assert_eq!(field_offset(REACTION_FIELDS, 2), 41); // author_id
         assert_eq!(field_offset(REACTION_FIELDS, 3), 73); // emoji
         assert_eq!(field_offset(REACTION_FIELDS, 4), 137); // signed_by
@@ -437,7 +466,13 @@ mod tests {
     fn decode_rejects_wrong_type() {
         let blob = vec![0u8; 234];
         let err = decode_fields(2, REACTION_FIELDS, &blob).unwrap_err();
-        assert!(matches!(err, DecodeError::WrongType { expected: 2, actual: 0 }));
+        assert!(matches!(
+            err,
+            DecodeError::WrongType {
+                expected: 2,
+                actual: 0
+            }
+        ));
     }
 
     #[test]
@@ -532,10 +567,7 @@ mod tests {
 
     #[test]
     fn i64_roundtrip() {
-        const FIELDS: &[FieldSpec] = &[
-            FieldSpec::Timestamp("ts"),
-            FieldSpec::I64("val"),
-        ];
+        const FIELDS: &[FieldSpec] = &[FieldSpec::Timestamp("ts"), FieldSpec::I64("val")];
         let values = vec![FieldValue::Timestamp(1), FieldValue::I64(-42)];
         let blob = encode_fields(88, FIELDS, &values).unwrap();
         let decoded = decode_fields(88, FIELDS, &blob).unwrap();
@@ -544,10 +576,7 @@ mod tests {
 
     #[test]
     fn u32_roundtrip() {
-        const FIELDS: &[FieldSpec] = &[
-            FieldSpec::Timestamp("ts"),
-            FieldSpec::U32("val"),
-        ];
+        const FIELDS: &[FieldSpec] = &[FieldSpec::Timestamp("ts"), FieldSpec::U32("val")];
         let values = vec![FieldValue::Timestamp(1), FieldValue::U32(999_999)];
         let blob = encode_fields(77, FIELDS, &values).unwrap();
         let decoded = decode_fields(77, FIELDS, &blob).unwrap();
@@ -556,22 +585,29 @@ mod tests {
 
     #[test]
     fn encode_rejects_fixed_bytes_size_mismatch() {
-        const FIELDS: &[FieldSpec] = &[
-            FieldSpec::Timestamp("ts"),
-            FieldSpec::FixedBytes("sig", 64),
-        ];
+        const FIELDS: &[FieldSpec] =
+            &[FieldSpec::Timestamp("ts"), FieldSpec::FixedBytes("sig", 64)];
         let values = vec![
             FieldValue::Timestamp(1),
             FieldValue::FixedBytes(vec![0; 32]), // wrong size: 32 instead of 64
         ];
         let err = encode_fields(50, FIELDS, &values).unwrap_err();
-        assert!(matches!(err, EncodeError::FixedBytesMismatch { expected: 64, actual: 32 }));
+        assert!(matches!(
+            err,
+            EncodeError::FixedBytesMismatch {
+                expected: 64,
+                actual: 32
+            }
+        ));
     }
 
     #[test]
     fn encode_error_maps_fixed_bytes_mismatch_to_content_too_long() {
         use crate::event_modules::EventError;
-        let err = EncodeError::FixedBytesMismatch { expected: 64, actual: 32 };
+        let err = EncodeError::FixedBytesMismatch {
+            expected: 64,
+            actual: 32,
+        };
         let event_err: EventError = err.into();
         assert!(matches!(event_err, EventError::ContentTooLong(64)));
     }

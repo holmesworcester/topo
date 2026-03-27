@@ -5,8 +5,8 @@ use topo::event_modules::file::file_offsets;
 use topo::event_modules::layout::common::{
     encrypted_inner_wire_size, encrypted_wire_size, ENCRYPTED_HEADER_BYTES,
 };
-use topo::event_modules::message::layout::offsets as message_offsets;
 use topo::event_modules::layout::field_spec::field_offset;
+use topo::event_modules::message::layout::offsets as message_offsets;
 use topo::event_modules::reaction::wire::REACTION_FIELDS;
 use topo::event_modules::{
     self as events, BenchDepEvent, EncryptedEvent, EventError, FileEvent, FileSliceEvent,

@@ -67,7 +67,11 @@ pub fn encode_invite_accepted(event: &ParsedEvent) -> Result<Vec<u8>, EventError
         FieldValue::EventId(ia.workspace_id),
     ];
 
-    Ok(encode_fields(EVENT_TYPE_INVITE_ACCEPTED, INVITE_ACCEPTED_FIELDS, &values)?)
+    Ok(encode_fields(
+        EVENT_TYPE_INVITE_ACCEPTED,
+        INVITE_ACCEPTED_FIELDS,
+        &values,
+    )?)
 }
 
 // === Projector (event-module locality) ===

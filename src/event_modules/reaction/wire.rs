@@ -78,7 +78,11 @@ pub fn encode_reaction(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         FieldValue::FixedBytes(rxn.signature.to_vec()),
     ];
 
-    Ok(encode_fields(EVENT_TYPE_REACTION, REACTION_FIELDS, &values)?)
+    Ok(encode_fields(
+        EVENT_TYPE_REACTION,
+        REACTION_FIELDS,
+        &values,
+    )?)
 }
 
 pub static REACTION_TYPE_META: EventTypeMeta = EventTypeMeta {

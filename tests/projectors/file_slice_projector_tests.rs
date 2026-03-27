@@ -47,6 +47,34 @@ mod tests {
         );
     }
 
+    #[test]
+    fn test_file_slice_skips_when_file_graph_deleted() {
+        let parsed = make_file_slice([1u8; 32], [3u8; 32]);
+        let root_message = b64(&[9u8; 32]);
+        let ctx = ctx_with_deleted_file_message(&root_message);
+
+        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        assert_valid(&result);
+        assert!(
+            result.write_ops.is_empty(),
+            "deleted-file fast path should not write file_slices rows"
+        );
+        assert_emits_command(&result, "HardPurgeMessageGraph", |cmd| {
+            matches!(
+                cmd,
+                EmitCommand::HardPurgeMessageGraph { message_event_id }
+                    if message_event_id == &root_message
+            )
+        });
+        assert!(
+            !result
+                .emit_commands
+                .iter()
+                .any(|c| matches!(c, EmitCommand::RecordFileSliceGuardBlock { .. })),
+            "deleted-file fast path should not emit guard blocks"
+        );
+    }
+
     // ── SPEC_FILE_AUTH_02: pass ──
 
     #[test]

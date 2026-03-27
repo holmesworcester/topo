@@ -77,6 +77,13 @@ pub(crate) fn execute_emit_commands(
 ) -> Result<(), Box<dyn std::error::Error>> {
     for cmd in commands {
         match cmd {
+            EmitCommand::HardPurgeMessageGraph { message_event_id } => {
+                crate::state::projection::purge::hard_purge_deleted_message_graph(
+                    conn,
+                    recorded_by,
+                    message_event_id,
+                )?;
+            }
             EmitCommand::RetryWorkspaceEvent { workspace_id } => {
                 // Re-project the specific workspace event now that a trust anchor exists.
                 // The workspace_id IS the event_id for workspace events.

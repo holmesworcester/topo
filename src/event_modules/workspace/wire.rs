@@ -59,7 +59,11 @@ pub fn encode_workspace(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         FieldValue::Text(ws.name.clone()),
     ];
 
-    Ok(encode_fields(EVENT_TYPE_WORKSPACE, WORKSPACE_FIELDS, &values)?)
+    Ok(encode_fields(
+        EVENT_TYPE_WORKSPACE,
+        WORKSPACE_FIELDS,
+        &values,
+    )?)
 }
 
 pub static WORKSPACE_META: EventTypeMeta = EventTypeMeta {

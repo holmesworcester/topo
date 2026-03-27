@@ -28,8 +28,8 @@ both `pass` and `break` polarity unless waived.
 | SPEC_WS_SINGLE_01 | InvSingleWorkspace | CHK_WS_INSERT | projector_unit | workspace_projector_tests::tests::test_workspace_insert_or_ignore | pass |
 | SPEC_WS_SINGLE_01 | InvSingleWorkspace | CHK_WS_INSERT | projector_unit | workspace_projector_tests::tests::test_workspace_rejects_anchor_mismatch | break |
 | SPEC_ANCHOR_IMMUTABLE_01 | InvTrustAnchorImmutable | CHK_IA_TRUST_ANCHOR_WRITE | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_writes_workspace_binding | pass |
-| SPEC_ANCHOR_IMMUTABLE_01 | InvTrustAnchorImmutable | CHK_IA_TRUST_ANCHOR_CONFLICT | scenario_integration | identity::test_trust_anchor_immutability | break |
-| SPEC_ANCHOR_IMMUTABLE_01 | InvTrustAnchorImmutable | CHK_IA_WINNER_ORDER | scenario_integration | identity::test_trust_anchor_immutability | break |
+| SPEC_ANCHOR_IMMUTABLE_01 | InvTrustAnchorImmutable | CHK_IA_TRUST_ANCHOR_CONFLICT | scenario_integration | cli_observability_test::test_trust_anchor_second_workspace_does_not_project | break |
+| SPEC_ANCHOR_IMMUTABLE_01 | InvTrustAnchorImmutable | CHK_IA_WINNER_ORDER | scenario_integration | cli_observability_test::test_trust_anchor_second_workspace_does_not_project | break |
 | SPEC_ANCHOR_SOURCE_01 | InvTrustAnchorSource | CHK_IA_TRUST_ANCHOR_WRITE | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_writes_workspace_binding | pass |
 | SPEC_ANCHOR_SOURCE_01 | InvTrustAnchorSource | CHK_IA_ANCHOR_SOURCE | projector_unit | invite_accepted_projector_tests::tests::test_invite_accepted_writes_workspace_binding | pass |
 | SPEC_ANCHOR_SOURCE_01 | InvTrustAnchorSource | CHK_WS_TRUST_ANCHOR_BLOCK | projector_unit | workspace_projector_tests::tests::test_workspace_blocks_without_trust_anchor | break |
@@ -119,25 +119,37 @@ both `pass` and `break` polarity unless waived.
 | SPEC_FILE_AUTH_02 | InvFileSliceAuth | CHK_FS_SIGNER_MISMATCH | projector_unit | file_slice_projector_tests::tests::test_file_slice_rejects_signer_mismatch | break |
 | SPEC_FILE_AUTH_02 | InvFileSliceAuth | CHK_FS_INSERT | projector_unit | file_slice_projector_tests::tests::test_file_slice_valid | pass |
 | SPEC_DEL_AUTHOR_01 | NON_MODELED::author_constraint | CHK_DEL_WRONG_AUTHOR | projector_unit | message_deletion_projector_tests::tests::test_deletion_rejects_wrong_author | break |
-| SPEC_DEL_AUTHOR_01 | NON_MODELED::author_constraint | CHK_DEL_TOMBSTONE | projector_unit | message_deletion_projector_tests::tests::test_deletion_valid | pass |
+| SPEC_DEL_AUTHOR_01 | InvDeletedMessageSource | CHK_DEL_TOMBSTONE | projector_unit | message_deletion_projector_tests::tests::test_deletion_valid | pass |
 | SPEC_RXN_SIGNER_01 | InvSigner (reaction) | CHK_RXN_SIGNER_USER_MISMATCH | projector_unit | reaction_projector_tests::tests::test_reaction_rejects_signer_user_mismatch | break |
 | SPEC_RXN_SIGNER_01 | InvSigner (reaction) | CHK_RXN_INSERT | projector_unit | reaction_projector_tests::tests::test_reaction_valid | pass |
-| SPEC_RXN_SKIP_DEL_01 | (post-tombstone) | CHK_RXN_SKIP_DELETED | projector_unit | reaction_projector_tests::tests::test_reaction_skips_when_target_deleted | pass |
-| SPEC_RXN_SKIP_DEL_01 | (post-tombstone) | CHK_RXN_SKIP_DELETED | projector_unit | reaction_projector_tests::tests::test_reaction_valid | break |
+| SPEC_RXN_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_RXN_SKIP_DELETED | projector_unit | reaction_projector_tests::tests::test_reaction_skips_when_target_deleted | pass |
+| SPEC_RXN_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_RXN_SKIP_DELETED | projector_unit | reaction_projector_tests::tests::test_reaction_valid | break |
+| SPEC_RXN_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_RXN_HARD_PURGE | projector_unit | reaction_projector_tests::tests::test_reaction_skips_when_target_deleted | pass |
+| SPEC_RXN_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_RXN_HARD_PURGE | projector_unit | reaction_projector_tests::tests::test_reaction_valid | break |
 | SPEC_MSG_INSERT_01 | InvMessageWorkspace | CHK_MSG_INSERT | projector_unit | message_projector_tests::tests::test_message_valid | pass |
 | SPEC_MSG_INSERT_01 | InvMessageWorkspace | CHK_MSG_INSERT | projector_unit | message_projector_tests::tests::test_message_rejects_signer_user_mismatch | break |
-| SPEC_MSG_DEL_BEFORE_01 | (convergence) | CHK_MSG_DELETE_BEFORE_CREATE | projector_unit | message_projector_tests::tests::test_message_tombstoned_by_deletion_intent | pass |
-| SPEC_MSG_DEL_BEFORE_01 | (convergence) | CHK_MSG_DELETE_BEFORE_CREATE | projector_unit | message_projector_tests::tests::test_message_valid | break |
+| SPEC_MSG_DEL_BEFORE_01 | InvDeleteIntentNoLiveMessage | CHK_MSG_DELETE_BEFORE_CREATE | projector_unit | message_projector_tests::tests::test_message_tombstoned_by_deletion_intent | pass |
+| SPEC_MSG_DEL_BEFORE_01 | InvDeleteIntentNoLiveMessage | CHK_MSG_DELETE_BEFORE_CREATE | projector_unit | message_projector_tests::tests::test_message_valid | break |
+| SPEC_MSG_DEL_BEFORE_01 | InvDeletePurgeAtomic | CHK_MSG_HARD_PURGE | projector_unit | message_projector_tests::tests::test_message_tombstoned_by_deletion_intent | pass |
+| SPEC_MSG_DEL_BEFORE_01 | InvDeletePurgeAtomic | CHK_MSG_HARD_PURGE | projector_unit | message_projector_tests::tests::test_message_valid | break |
+| SPEC_MA_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_FILE_HARD_PURGE | projector_unit | simple_projector_tests::tests::test_file_skips_when_target_message_deleted | pass |
+| SPEC_MA_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_FILE_HARD_PURGE | projector_unit | simple_projector_tests::tests::test_file_valid | break |
 | SPEC_DEL_SIGNER_01 | InvSigner (deletion) | CHK_DEL_SIGNER_USER_MISMATCH | projector_unit | message_deletion_projector_tests::tests::test_deletion_rejects_signer_user_mismatch | break |
 | SPEC_DEL_SIGNER_01 | InvSigner (deletion) | CHK_DEL_SIGNER_USER_MISMATCH | projector_unit | message_deletion_projector_tests::tests::test_deletion_valid | pass |
 | SPEC_DEL_NON_MSG_01 | (type constraint) | CHK_DEL_NON_MESSAGE | projector_unit | message_deletion_projector_tests::tests::test_deletion_rejects_non_message_target | break |
 | SPEC_DEL_NON_MSG_01 | (type constraint) | CHK_DEL_NON_MESSAGE | projector_unit | message_deletion_projector_tests::tests::test_deletion_valid | pass |
-| SPEC_DEL_INTENT_01 | (convergence) | CHK_DEL_INTENT | projector_unit | message_deletion_projector_tests::tests::test_deletion_intent_only_when_no_target | pass |
-| SPEC_DEL_INTENT_01 | (convergence) | CHK_DEL_INTENT | projector_unit | message_deletion_projector_tests::tests::test_deletion_valid | break |
+| SPEC_DEL_INTENT_01 | InvDeleteIntentSource | CHK_DEL_INTENT | projector_unit | message_deletion_projector_tests::tests::test_deletion_intent_only_when_no_target | pass |
+| SPEC_DEL_INTENT_01 | InvDeleteIntentSource | CHK_DEL_INTENT | projector_unit | message_deletion_projector_tests::tests::test_deletion_valid | break |
 | SPEC_DEL_IDEMPOTENT_01 | (idempotent) | CHK_DEL_IDEMPOTENT | projector_unit | message_deletion_projector_tests::tests::test_deletion_idempotent_when_tombstoned | pass |
 | SPEC_DEL_IDEMPOTENT_01 | (idempotent) | CHK_DEL_IDEMPOTENT | projector_unit | message_deletion_projector_tests::tests::test_deletion_valid | break |
+| SPEC_DEL_AUTHOR_01 | InvDeletePurgeAtomic | CHK_DEL_HARD_PURGE | projector_unit | message_deletion_projector_tests::tests::test_deletion_valid | pass |
+| SPEC_DEL_AUTHOR_01 | InvDeletePurgeAtomic | CHK_DEL_HARD_PURGE | projector_unit | message_deletion_projector_tests::tests::test_deletion_intent_only_when_no_target | break |
+| SPEC_DEL_IDEMPOTENT_01 | InvDeletePurgeAtomic | CHK_DEL_HARD_PURGE | projector_unit | message_deletion_projector_tests::tests::test_deletion_idempotent_when_tombstoned | pass |
+| SPEC_DEL_IDEMPOTENT_01 | InvDeletePurgeAtomic | CHK_DEL_HARD_PURGE | projector_unit | message_deletion_projector_tests::tests::test_deletion_intent_only_when_no_target | break |
 | SPEC_FS_IDEMPOTENT_01 | (idempotent) | CHK_FS_IDEMPOTENT | projector_unit | file_slice_projector_tests::tests::test_file_slice_idempotent_replay | pass |
 | SPEC_FS_IDEMPOTENT_01 | (idempotent) | CHK_FS_IDEMPOTENT | projector_unit | file_slice_projector_tests::tests::test_file_slice_valid | break |
+| SPEC_FS_SKIP_DEL_01 | InvDeletedFilePurgesLiveSlice | CHK_FS_HARD_PURGE | projector_unit | file_slice_projector_tests::tests::test_file_slice_skips_when_file_graph_deleted | pass |
+| SPEC_FS_SKIP_DEL_01 | InvDeletedFilePurgesLiveSlice | CHK_FS_HARD_PURGE | projector_unit | file_slice_projector_tests::tests::test_file_slice_blocks_no_descriptor | break |
 | SPEC_FS_SLOT_01 | (slot uniqueness) | CHK_FS_SLOT_CONFLICT | projector_unit | file_slice_projector_tests::tests::test_file_slice_rejects_slot_conflict | break |
 | SPEC_FS_SLOT_01 | (slot uniqueness) | CHK_FS_SLOT_CONFLICT | projector_unit | file_slice_projector_tests::tests::test_file_slice_valid | pass |
 | SPEC_ADM_INSERT_01 | InvAdminChain | CHK_ADM_INSERT | projector_unit | simple_projector_tests::tests::test_admin_valid | pass |
@@ -164,6 +176,27 @@ both `pass` and `break` polarity unless waived.
 | SPEC_DISPATCH_01 | (registry) | CHK_DISPATCH_UNKNOWN_TYPE | pipeline_integration | apply::tests::core_projection::test_retired_type3_peer_key_blob_rejected | break |
 | SPEC_REJECTION_01 | (durable rejection) | CHK_REJECTION_RECORD | pipeline_integration | apply::tests::file_slice::test_file_slice_invalid_signature_rejects | pass |
 | SPEC_REJECTION_01 | (durable rejection) | CHK_REJECTION_RECORD | pipeline_integration | apply::tests::core_projection::test_project_message_valid | break |
+| SPEC_MA_SKIP_DEL_01 | InvAttachmentTombstoneBypass | CHK_FILE_TOMBSTONE_DEP_OK | pipeline_integration | apply::tests::deletion::test_file_arriving_after_tombstone_is_hard_purged_and_tracks_deleted_file | pass |
+| SPEC_MA_SKIP_DEL_01 | InvAttachmentTombstoneBypass | CHK_FILE_TOMBSTONE_DEP_OK | pipeline_integration | apply::tests::file_slice::test_attachment_blocks_on_missing_message | break |
+| SPEC_MA_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_FILE_HARD_PURGE | pipeline_integration | apply::tests::deletion::test_file_arriving_after_tombstone_is_hard_purged_and_tracks_deleted_file | pass |
+| SPEC_MA_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_FILE_HARD_PURGE | pipeline_integration | apply::tests::file_slice::test_project_attachment_valid | break |
+| SPEC_RXN_SKIP_DEL_01 | InvReactionTombstoneBypass | CHK_RXN_TOMBSTONE_DEP_OK | pipeline_integration | apply::tests::deletion::test_reaction_arriving_after_tombstone_is_hard_purged | pass |
+| SPEC_RXN_SKIP_DEL_01 | InvReactionTombstoneBypass | CHK_RXN_TOMBSTONE_DEP_OK | pipeline_integration | apply::tests::core_projection::test_project_reaction_blocked | break |
+| SPEC_FS_SKIP_DEL_01 | InvDeletedFilePurgesLiveSlice | CHK_FS_HARD_PURGE | pipeline_integration | apply::tests::deletion::test_file_slice_dependents_of_deleted_message_are_hard_purged_before_and_after_mapping | pass |
+| SPEC_FS_SKIP_DEL_01 | InvDeletedFilePurgesLiveSlice | CHK_FS_HARD_PURGE | pipeline_integration | apply::tests::file_slice::test_file_slice_valid | break |
+| SPEC_PROJECTION_TX_01 | InvDeletePurgeAtomic | CHK_PROJECTION_TX_ATOMIC | pipeline_integration | apply::tests::deletion::test_hard_purge_failure_rolls_back_and_retries_from_project_queue | pass |
+| SPEC_PROJECTION_TX_01 | InvDeletePurgeAtomic | CHK_PROJECTION_TX_ATOMIC | pipeline_integration | apply::tests::deletion::test_hard_purge_failure_rolls_back_and_retries_from_project_queue | break |
+| SPEC_DEL_INTENT_01 | InvDeleteIntentSource | CHK_DEL_INTENT | tla_safety | tlc::EventGraphSchema::event_graph_schema_delete_fast.cfg | pass |
+| SPEC_DEL_AUTHOR_01 | InvDeletedMessageSource | CHK_DEL_TOMBSTONE | tla_safety | tlc::EventGraphSchema::event_graph_schema_delete_fast.cfg | pass |
+| SPEC_DEL_AUTHOR_01 | InvDeletePurgeAtomic | CHK_DEL_HARD_PURGE | tla_safety | tlc::EventGraphSchema::event_graph_schema_delete_fast.cfg | pass |
+| SPEC_MSG_DEL_BEFORE_01 | InvDeleteIntentNoLiveMessage | CHK_MSG_DELETE_BEFORE_CREATE | tla_safety | tlc::EventGraphSchema::event_graph_schema_delete_fast.cfg | pass |
+| SPEC_MSG_DEL_BEFORE_01 | InvDeletePurgeAtomic | CHK_MSG_HARD_PURGE | tla_safety | tlc::EventGraphSchema::event_graph_schema_delete_fast.cfg | pass |
+| SPEC_MA_SKIP_DEL_01 | InvAttachmentTombstoneBypass | CHK_FILE_TOMBSTONE_DEP_OK | tla_safety | tlc::EventGraphSchema::event_graph_schema_delete_fast.cfg | pass |
+| SPEC_MA_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_FILE_HARD_PURGE | tla_safety | tlc::EventGraphSchema::event_graph_schema_delete_fast.cfg | pass |
+| SPEC_RXN_SKIP_DEL_01 | InvReactionTombstoneBypass | CHK_RXN_TOMBSTONE_DEP_OK | tla_safety | tlc::EventGraphSchema::event_graph_schema_delete_fast.cfg | pass |
+| SPEC_RXN_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_RXN_HARD_PURGE | tla_safety | tlc::EventGraphSchema::event_graph_schema_delete_fast.cfg | pass |
+| SPEC_FS_SKIP_DEL_01 | InvDeletedFilePurgesLiveSlice | CHK_FS_HARD_PURGE | tla_safety | tlc::EventGraphSchema::event_graph_schema_delete_fast.cfg | pass |
+| SPEC_PROJECTION_TX_01 | InvDeletePurgeAtomic | CHK_PROJECTION_TX_ATOMIC | tla_safety | tlc::EventGraphSchema::event_graph_schema_delete_fast.cfg | pass |
 | SPEC_BOOTSTRAP_TRUST_CONSUME_01 | InvBootstrapTrustConsumedByPeerShared | CHK_PS_BOOTSTRAP_TRUST_CONSUME | transport_credential | state::db::transport_trust::tests::test_invite_bootstrap_superseded_when_peer_shared_exists | pass |
 | SPEC_BOOTSTRAP_TRUST_CONSUME_01 | InvBootstrapTrustConsumedByPeerShared | CHK_PS_BOOTSTRAP_TRUST_CONSUME | transport_credential | state::db::transport_trust::tests::test_invite_bootstrap_trust_in_authorized_fingerprints | break |
 | SPEC_PENDING_CONSUME_02 | InvPendingConsumedByPeerShared | CHK_PS_PENDING_CONSUME | transport_credential | state::db::transport_trust::tests::test_pending_invite_bootstrap_superseded_when_peer_shared_exists | pass |

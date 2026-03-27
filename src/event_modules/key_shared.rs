@@ -90,7 +90,11 @@ pub fn encode_key_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         FieldValue::FixedBytes(e.signature.to_vec()),
     ];
 
-    Ok(encode_fields(EVENT_TYPE_KEY_SHARED, KEY_SHARED_FIELDS, &values)?)
+    Ok(encode_fields(
+        EVENT_TYPE_KEY_SHARED,
+        KEY_SHARED_FIELDS,
+        &values,
+    )?)
 }
 
 // === Projector (event-module locality) ===

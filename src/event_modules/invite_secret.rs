@@ -53,7 +53,11 @@ pub fn encode_invite_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
         FieldValue::EventId(e.private_key_bytes),
     ];
 
-    Ok(encode_fields(EVENT_TYPE_INVITE_SECRET, INVITE_SECRET_FIELDS, &values)?)
+    Ok(encode_fields(
+        EVENT_TYPE_INVITE_SECRET,
+        INVITE_SECRET_FIELDS,
+        &values,
+    )?)
 }
 
 pub fn deterministic_invite_secret_created_at_ms(
