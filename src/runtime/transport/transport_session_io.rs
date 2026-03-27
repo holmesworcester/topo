@@ -15,6 +15,7 @@ pub const DEFAULT_SYNC_FRAME_MAX_BYTES: usize = (4 * 1024 * 1024) + 5;
 pub struct QuicTransportSessionIo<C: StreamConn, S: StreamSend, R: StreamRecv> {
     session_id: u64,
     max_frame_size: usize,
+    control_recv_limit: usize,
     conn: DualConnection<C, S, R>,
 }
 
@@ -23,6 +24,7 @@ impl<C: StreamConn, S: StreamSend, R: StreamRecv> QuicTransportSessionIo<C, S, R
         Self {
             session_id,
             max_frame_size: DEFAULT_SYNC_FRAME_MAX_BYTES,
+            control_recv_limit: DEFAULT_SYNC_FRAME_MAX_BYTES,
             conn,
         }
     }
@@ -35,6 +37,7 @@ impl<C: StreamConn, S: StreamSend, R: StreamRecv> QuicTransportSessionIo<C, S, R
         Self {
             session_id,
             max_frame_size,
+            control_recv_limit: max_frame_size,
             conn,
         }
     }
@@ -185,6 +188,49 @@ where
         self.max_frame_size
     }
 
+    fn swap_control_recv_limit(&mut self, new_limit: usize) -> usize {
+        let old_limit = self.control_recv_limit;
+        self.control_recv_limit = new_limit;
+        let _ = self.conn.control.swap_recv_limit(new_limit);
+        old_limit
+    }
+
+    async fn recv_control_frame(&mut self) -> Result<Vec<u8>, TransportSessionIoError> {
+        let msg = self
+            .conn
+            .control
+            .recv()
+            .await
+            .map_err(|e| map_connection_error(e, self.control_recv_limit))?;
+        Ok(encode_frame(&msg))
+    }
+
+    async fn send_control_frame(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<(), TransportSessionIoError> {
+        if frame.len() > self.max_frame_size {
+            return Err(TransportSessionIoError::FrameTooLarge {
+                len: frame.len(),
+                max: self.max_frame_size,
+            });
+        }
+        let msg = decode_exact_frame(frame, self.max_frame_size)?;
+        self.conn
+            .control
+            .send(&msg)
+            .await
+            .map_err(|e| map_connection_error(e, self.max_frame_size))
+    }
+
+    async fn flush_control(&mut self) -> Result<(), TransportSessionIoError> {
+        self.conn
+            .control
+            .flush()
+            .await
+            .map_err(|e| map_connection_error(e, self.max_frame_size))
+    }
+
     fn split(self: Box<Self>) -> TransportSessionIoParts {
         let max = self.max_frame_size;
         let conn = self.conn;
@@ -243,6 +289,10 @@ mod tests {
 
     #[async_trait]
     impl StreamConn for MockControl {
+        fn swap_recv_limit(&mut self, _new_limit: usize) -> usize {
+            usize::MAX
+        }
+
         async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
             self.state
                 .lock()

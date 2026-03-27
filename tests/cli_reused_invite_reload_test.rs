@@ -77,11 +77,12 @@ fn dial_peer_for_tenant(
     db_path: &str,
     tenant_id: &str,
     remote: SocketAddr,
-    remote_peer_id: &str,
+    remote_daemon_peer_id: &str,
+    remote_session_peer_id: &str,
 ) -> Result<String, String> {
     let client_config = topo::transport::build_tenant_client_config_from_db(db_path, tenant_id)
         .map_err(|e| e.to_string())?;
-    let sni = topo::transport::multi_workspace::transport_sni(remote_peer_id);
+    let sni = topo::transport::multi_workspace::transport_sni(remote_daemon_peer_id);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -91,25 +92,32 @@ fn dial_peer_for_tenant(
         let endpoint =
             quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).map_err(|e| e.to_string())?;
         let result = async {
-            let connected =
-                topo::transport::dial_peer(&endpoint, remote, &sni, Some(&client_config))
+            let daemon_connection =
+                topo::transport::dial_daemon_connection(&endpoint, remote, &sni, Some(&client_config))
                     .await
                     .map_err(|e| e.to_string())?;
+            let raw_connection = daemon_connection.connection();
+            let actual_remote_daemon_peer_id = daemon_connection.remote_daemon_peer_id().to_string();
+            let mut session = daemon_connection
+                .open_outbound_session(topo::transport::SessionClass::Range)
+                .await
+                .map_err(|e| e.to_string())?;
             let auth_result = topo::transport::send_outbound_session_auth(
-                &connected.connection,
+                session.io.as_mut(),
                 db_path,
                 tenant_id,
-                None,
+                &actual_remote_daemon_peer_id,
+                Some(remote_daemon_peer_id),
                 &topo::transport::OutboundSessionAuthPlan::PeerShared {
-                    target_peer_id: remote_peer_id.to_string(),
+                    target_peer_id: remote_session_peer_id.to_string(),
                 },
             )
             .await
             .map_err(|e| e.to_string())?;
             let close_probe =
-                tokio::time::timeout(Duration::from_millis(250), connected.connection.closed())
+                tokio::time::timeout(Duration::from_millis(250), raw_connection.closed())
                     .await;
-            connected.connection.close(0u32.into(), b"test done");
+            raw_connection.close(0u32.into(), b"test done");
             endpoint.close(0u32.into(), b"test done");
             match close_probe {
                 Ok(err) => Err(format!("connection closed after session auth: {err}")),
@@ -125,14 +133,21 @@ fn wait_for_direct_trust_dial(
     db_path: &str,
     tenant_id: &str,
     remote: SocketAddr,
-    remote_peer_id: &str,
+    remote_daemon_peer_id: &str,
+    remote_session_peer_id: &str,
     expected_peer_id: &str,
     timeout_ms: u64,
 ) {
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     let last_error = loop {
-        match dial_peer_for_tenant(db_path, tenant_id, remote, remote_peer_id) {
+        match dial_peer_for_tenant(
+            db_path,
+            tenant_id,
+            remote,
+            remote_daemon_peer_id,
+            remote_session_peer_id,
+        ) {
             Ok(peer_id) => {
                 assert_eq!(
                     peer_id, expected_peer_id,
@@ -267,6 +282,7 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
         timeout_ms,
     );
     let bob_peer_id = peer_id_for_username(&bob_db, "bob");
+    let carol_daemon_peer_id = daemon_identity_fingerprint(&carol_db);
     let carol_addr: SocketAddr = daemon_listen_addr(&carol_db)
         .parse()
         .expect("carol listen addr");
@@ -274,6 +290,7 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
         &bob_db,
         &bob_peer_id,
         carol_addr,
+        &carol_daemon_peer_id,
         &carol_join.peer_id,
         &carol_join.peer_id,
         timeout_ms,

@@ -79,6 +79,13 @@ pub struct TransportSessionIoParts {
 pub trait TransportSessionIo: Send {
     fn session_id(&self) -> u64;
     fn max_frame_size(&self) -> usize;
+    fn swap_control_recv_limit(&mut self, new_limit: usize) -> usize;
+    async fn recv_control_frame(&mut self) -> Result<Vec<u8>, TransportSessionIoError>;
+    async fn send_control_frame(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<(), TransportSessionIoError>;
+    async fn flush_control(&mut self) -> Result<(), TransportSessionIoError>;
     /// Split into independent control, data-send, and data-recv handles.
     /// Consuming `self` allows the data-recv handle to be moved to a spawned task.
     fn split(self: Box<Self>) -> TransportSessionIoParts;

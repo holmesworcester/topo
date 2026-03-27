@@ -338,11 +338,12 @@ fn dial_peer_for_tenant(
     db_path: &str,
     tenant_id: &str,
     remote: SocketAddr,
-    remote_peer_id: &str,
+    remote_daemon_peer_id: &str,
+    remote_session_peer_id: &str,
 ) -> Result<String, String> {
     let client_config = topo::transport::build_tenant_client_config_from_db(db_path, tenant_id)
         .map_err(|e| e.to_string())?;
-    let sni = topo::transport::multi_workspace::transport_sni(remote_peer_id);
+    let sni = topo::transport::multi_workspace::transport_sni(remote_daemon_peer_id);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -352,25 +353,32 @@ fn dial_peer_for_tenant(
         let endpoint =
             quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).map_err(|e| e.to_string())?;
         let result = async {
-            let connected =
-                topo::transport::dial_peer(&endpoint, remote, &sni, Some(&client_config))
+            let daemon_connection =
+                topo::transport::dial_daemon_connection(&endpoint, remote, &sni, Some(&client_config))
                     .await
                     .map_err(|e| e.to_string())?;
+            let raw_connection = daemon_connection.connection();
+            let actual_remote_daemon_peer_id = daemon_connection.remote_daemon_peer_id().to_string();
+            let mut session = daemon_connection
+                .open_outbound_session(topo::transport::SessionClass::Range)
+                .await
+                .map_err(|e| e.to_string())?;
             let auth_result = topo::transport::send_outbound_session_auth(
-                &connected.connection,
+                session.io.as_mut(),
                 db_path,
                 tenant_id,
-                None,
+                &actual_remote_daemon_peer_id,
+                Some(remote_daemon_peer_id),
                 &topo::transport::OutboundSessionAuthPlan::PeerShared {
-                    target_peer_id: remote_peer_id.to_string(),
+                    target_peer_id: remote_session_peer_id.to_string(),
                 },
             )
             .await
             .map_err(|e| e.to_string())?;
             let close_probe =
-                tokio::time::timeout(Duration::from_millis(250), connected.connection.closed())
+                tokio::time::timeout(Duration::from_millis(250), raw_connection.closed())
                     .await;
-            connected.connection.close(0u32.into(), b"test done");
+            raw_connection.close(0u32.into(), b"test done");
             endpoint.close(0u32.into(), b"test done");
             match close_probe {
                 Ok(err) => Err(format!("connection closed after session auth: {err}")),
@@ -386,14 +394,21 @@ fn wait_for_direct_trust_dial(
     db_path: &str,
     tenant_id: &str,
     remote: SocketAddr,
-    remote_peer_id: &str,
+    remote_daemon_peer_id: &str,
+    remote_session_peer_id: &str,
     expected_peer_id: &str,
     timeout_ms: u64,
 ) {
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     let last_error = loop {
-        match dial_peer_for_tenant(db_path, tenant_id, remote, remote_peer_id) {
+        match dial_peer_for_tenant(
+            db_path,
+            tenant_id,
+            remote,
+            remote_daemon_peer_id,
+            remote_session_peer_id,
+        ) {
             Ok(peer_id) => {
                 assert_eq!(
                     peer_id, expected_peer_id,
@@ -419,13 +434,20 @@ fn assert_direct_dial_never_succeeds(
     db_path: &str,
     tenant_id: &str,
     remote: SocketAddr,
-    remote_peer_id: &str,
+    remote_daemon_peer_id: &str,
+    remote_session_peer_id: &str,
     timeout_ms: u64,
 ) {
     let start = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
     while start.elapsed() < timeout {
-        if let Ok(peer_id) = dial_peer_for_tenant(db_path, tenant_id, remote, remote_peer_id) {
+        if let Ok(peer_id) = dial_peer_for_tenant(
+            db_path,
+            tenant_id,
+            remote,
+            remote_daemon_peer_id,
+            remote_session_peer_id,
+        ) {
             panic!(
                 "direct dial to {} as tenant {} unexpectedly succeeded with peer {}",
                 remote, tenant_id, peer_id
@@ -2822,6 +2844,8 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
     let yuki_peer_id = wait_for_username_peer_id(&shared_db, "yuki-zeta", timeout_ms);
     let dave_peer_id = wait_for_username_peer_id(&dave.db, "dave-alpha", timeout_ms);
     let emma_peer_id = wait_for_username_peer_id(&emma.db, "emma-zeta", timeout_ms);
+    let dave_daemon_peer_id = daemon_identity_fingerprint(&dave.db);
+    let emma_daemon_peer_id = daemon_identity_fingerprint(&emma.db);
     let dave_addr: SocketAddr = daemon_listen_addr(&dave.db)
         .parse()
         .expect("dave listen addr");
@@ -2833,6 +2857,7 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
         &shared_db,
         &bob_peer_id,
         dave_addr,
+        &dave_daemon_peer_id,
         &dave_peer_id,
         &dave_peer_id,
         timeout_ms,
@@ -2841,12 +2866,27 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
         &shared_db,
         &yuki_peer_id,
         emma_addr,
+        &emma_daemon_peer_id,
         &emma_peer_id,
         &emma_peer_id,
         timeout_ms,
     );
-    assert_direct_dial_never_succeeds(&shared_db, &bob_peer_id, emma_addr, &emma_peer_id, 5000);
-    assert_direct_dial_never_succeeds(&shared_db, &yuki_peer_id, dave_addr, &dave_peer_id, 5000);
+    assert_direct_dial_never_succeeds(
+        &shared_db,
+        &bob_peer_id,
+        emma_addr,
+        &emma_daemon_peer_id,
+        &emma_peer_id,
+        5000,
+    );
+    assert_direct_dial_never_succeeds(
+        &shared_db,
+        &yuki_peer_id,
+        dave_addr,
+        &dave_daemon_peer_id,
+        &dave_peer_id,
+        5000,
+    );
 
     assert_peers_eventually_include(
         &shared_db,

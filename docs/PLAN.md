@@ -111,7 +111,7 @@ These are required, not optional:
 11. Identity pre-derive.
    - `create_workspace`, `accept_invite`, and `accept_device_link` pre-derive the PeerShared key and write events under the final `recorded_by` from first write — no `finalize_identity`.
    - invite acceptance / device link may still install invite-derived bootstrap tenant transport creds first, but the live QUIC handshake uses the daemon transport identity; tenant scope key remains final and projection later installs PeerShared-derived tenant transport identity.
-   - connect loop resolves identity once per QUIC connection, not per session (identity transitions only happen during discrete CLI commands).
+   - raw QUIC connections are daemon-scoped, while peer/device identity resolves per logical session via `OpenSessionAuth*`; one live daemon connection may host many tenant/workspace sessions over time.
    - `create_workspace` is strictly tenant-scoped once local creds exist: `recorded_by` must match a known local tenant peer ID in `local_transport_creds`; unscoped aliases are rejected. Fresh DB bootstrap (no local creds) remains allowed.
 12. Transport fingerprint bridge.
    - `peer_shared` projection materializes deterministic `peers_shared.transport_fingerprint` and indexes `(recorded_by, transport_fingerprint)`.
@@ -132,8 +132,27 @@ Every CLI instance is a real peer-to-peer device. All user-facing commands go th
 2. **Multiple tenants per device**: a single device can host many tenants, each participating in arbitrary (potentially overlapping) workspaces.
 3. **Zeroconf discovery**: mDNS/DNS-SD discovers peers on the same workspace on the local machine or LAN (enabled by default via `discovery` feature).
 4. **Single-port QUIC endpoint**: one shared endpoint serves all tenants with one daemon-scoped cert. Inbound handshakes use node-scoped daemon trust as a first gate; post-handshake admission reads one encrypted session-auth frame and applies tenant-scoped trust there. Outbound dials use the shared daemon identity with a fixed cover name and no sensitive SNI on the wire.
+   - the raw daemon connection is shared across tenants; range sync and dependency repair run as separate authenticated logical sessions on that one connection.
+   - same-workspace sibling tenants should reuse the same daemon connection, not compete with extra QUIC congestion controllers to the same remote daemon.
 5. **Shared batch writer**: all tenants on a device share one batch writer for projection, grouped by `recorded_by`.
 6. **Same-workspace shared-DB convergence**: if multiple local tenants share one DB and one workspace, shared events must fan out locally across sibling tenant scopes after local create or wire ingest, and newly accepted tenants/devices must replay already-present shared workspace history into their own scope.
+
+## 2.4 Rejected Alternative: Fully Sessionless Signed Control
+
+We also considered removing daemon-to-daemon logical sessions entirely and instead signing every control message individually, routing by signer/workspace mapping at ingest time.
+
+Pros:
+- simpler connection sharing model,
+- no explicit session-open state,
+- easier to reason about stateless control handlers in isolation.
+
+Cons:
+- negentropy and dependency repair still need round correlation, replay windows, and response matching, so the design is not truly stateless in practice,
+- asymmetric verification would move onto the hot path for every control message instead of once per logical session,
+- larger signed envelopes would be paid repeatedly for the same peer/workspace conversation,
+- prioritized lanes become harder because admission and replay protection have to be re-solved per message rather than once per session.
+
+Current plan: keep daemon-scoped QUIC connections plus authenticated logical sessions inside them. That pays the signature cost once per session, preserves explicit priority lanes, and still allows many tenants to share one raw connection.
 
 ---
 
@@ -1102,15 +1121,15 @@ Required changes from the 1:1 sync model:
    `mpsc::Sender` to the batch_writer across connections.
 3. **Connection idempotency after auth.** Bootstrap trust targets, observed endpoints,
    and mDNS discovery are all hint sources for `ensure_connected(peer)`, not separate
-   owners. Once the peer fingerprint is known, they share one peer-scoped dispatch key.
-   Locally the runtime keeps at most one live connection slot per
-   `(db_path, recorded_by, peer_id)` only when that remote fingerprint is already backed
-   by projected `peers_shared` state for the tenant. Bootstrap-only invite aliases stay
-   exempt so reused invites/device links can bootstrap multiple eventual peers. The
-   deterministic preferred direction is the lexicographically lower peer dialing
-   outbound; if a preferred-direction duplicate arrives it replaces the non-preferred
-   live connection.
-4. **PeerReplicator split per authenticated peer slot.** Each peer slot owns two
+   owners. Once the remote daemon fingerprint is known, they share one daemon-scoped
+   dispatch key. Locally the runtime keeps at most one live daemon connection slot per
+   `(db_path, remote_daemon_peer_id)`, and all tenant/workspace work reuses that raw
+   connection by opening authenticated logical sessions inside it. Bootstrap-only invite
+   aliases stay exempt at the target-planning layer so reused invites/device links can
+   still bootstrap multiple eventual peers. The deterministic preferred direction is the
+   lexicographically lower daemon id dialing outbound; if a preferred-direction duplicate
+   arrives it replaces the non-preferred daemon connection.
+4. **PeerReplicator split per authenticated peer/workspace session slot.** Each slot owns two
    internal loops:
    - an **observer loop** (lower-rate) that runs Negentropy on connect/full-sync,
      `dirty_hot`, cold-timer, backlog-exhaustion, or source-set-change triggers and
@@ -1158,7 +1177,8 @@ Test families (in `sync_graph_test.rs`):
   ingest share from `recorded_events.source` attribution (>=5% per source).
 
 Invariants this model is meant to preserve:
-- at most one steady-state live connection slot per authenticated peer,
+- at most one steady-state live daemon connection slot per remote daemon,
+- any number of authenticated logical sessions may share that daemon connection over time,
 - no balancing logic is embedded in Negentropy,
 - the sink can keep active peers busy whenever candidate supply exists,
 - a slow source does not own events by fiat; another candidate can be used as soon
@@ -1547,7 +1567,7 @@ Detailed architecture and invariants are documented in [DESIGN.md](./DESIGN.md) 
 2. no cross-tenant projection/query leakage regression,
 3. no reintroduction of event-count-based convergence assertions,
 4. no bypass of workspace command ownership boundaries,
-5. no reintroduction of duplicate live peer connections/workers for the same authenticated peer.
+5. no reintroduction of duplicate live daemon connections/workers for the same remote daemon.
 
 ## 17.3 Validation suite expectations
 

@@ -11,9 +11,12 @@ use crate::crypto::{hash_event, EventId};
 use crate::db::queue::current_timestamp_ms;
 use crate::db::{open_connection, store::Store};
 use crate::protocol::{encode_frame, parse_frame, Frame};
-use crate::runtime::transport::open_outbound_dependency_session;
+use crate::runtime::transport::{
+    open_outbound_dependency_session, resolve_outbound_session_auth_plan,
+    send_outbound_session_auth,
+};
 use crate::state::{dependency_fetch, pipeline::ingest_now};
-use crate::transport::TransportConnection;
+use crate::transport::{DaemonConnection, OutboundSessionAuthPlan};
 
 const DEPENDENCY_BATCH_CAP: usize = 16;
 const REQUEST_BATCH_CAP: usize = 64;
@@ -245,36 +248,72 @@ pub async fn run_dependency_session(
 }
 
 pub fn spawn_outbound_dependency_session(
-    connection: TransportConnection,
+    daemon_connection: DaemonConnection,
     db_path: String,
     recorded_by: String,
-    peer_id: String,
-    remote_addr: std::net::SocketAddr,
+    remote_session_peer_id: String,
+    auth_plan: OutboundSessionAuthPlan,
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async move {
-        let (session_id, io) = match open_outbound_dependency_session(&connection).await {
+        let (session_id, mut io) = match open_outbound_dependency_session(&daemon_connection).await {
             Ok(opened) => opened,
             Err(err) => {
                 warn!(
-                    "dependency session open failed for peer {}: {}",
-                    peer_id, err
+                    "dependency session open failed for daemon {}: {}",
+                    daemon_connection.remote_daemon_peer_id(),
+                    err
+                );
+                return;
+            }
+        };
+        let effective_auth_plan = open_connection(&db_path)
+            .ok()
+            .and_then(|conn| {
+                resolve_outbound_session_auth_plan(
+                    &conn,
+                    &recorded_by,
+                    &remote_session_peer_id,
+                    daemon_connection.remote_daemon_peer_id(),
+                    &auth_plan,
+                )
+                .ok()
+            })
+            .unwrap_or_else(|| auth_plan.clone());
+        let auth_result = match send_outbound_session_auth(
+            io.as_mut(),
+            &db_path,
+            &recorded_by,
+            daemon_connection.remote_daemon_peer_id(),
+            Some(daemon_connection.remote_daemon_peer_id()),
+            &effective_auth_plan,
+        )
+        .await
+        {
+            Ok(auth_result) => auth_result,
+            Err(err) => {
+                warn!(
+                    "dependency session auth failed for daemon {} tenant={}: {}",
+                    daemon_connection.remote_daemon_peer_id(),
+                    recorded_by,
+                    err
                 );
                 return;
             }
         };
         info!(
-            "Starting dependency session {} peer={} remote={}",
+            "Starting dependency session {} peer={} daemon={} remote={}",
             session_id,
-            &peer_id[..16.min(peer_id.len())],
-            remote_addr
+            &auth_result.session_peer_id[..16.min(auth_result.session_peer_id.len())],
+            daemon_connection.remote_daemon_peer_id(),
+            daemon_connection.remote_addr()
         );
         if let Err(err) = run_dependency_session(
             io,
             db_path,
             recorded_by,
-            peer_id.clone(),
-            remote_addr,
+            auth_result.session_peer_id.clone(),
+            daemon_connection.remote_addr(),
             shutdown,
         )
         .await
@@ -282,7 +321,7 @@ pub fn spawn_outbound_dependency_session(
             warn!(
                 "dependency session {} ended with error peer={}: {}",
                 session_id,
-                &peer_id[..16.min(peer_id.len())],
+                &auth_result.session_peer_id[..16.min(auth_result.session_peer_id.len())],
                 err
             );
         }

@@ -11,16 +11,15 @@ use super::TRUST_REJECTION_MARKER;
 use crate::transport::peer_identity_from_connection;
 
 /// A successful transport connection with verified peer identity.
-pub struct ConnectedPeer {
+pub struct ConnectedDaemon {
     pub connection: quinn::Connection,
-    /// Hex-encoded peer certificate SPKI fingerprint (transport identity).
-    pub peer_id: String,
+    /// Hex-encoded daemon certificate SPKI fingerprint.
+    pub daemon_peer_id: String,
 }
 
-impl ConnectedPeer {
-    /// Canonical transport-facing name for `peer_id`.
-    pub fn transport_fingerprint(&self) -> &str {
-        &self.peer_id
+impl ConnectedDaemon {
+    pub fn remote_daemon_peer_id(&self) -> &str {
+        &self.daemon_peer_id
     }
 }
 
@@ -36,24 +35,24 @@ pub enum ConnectionLifecycleError {
     MissingPeerIdentity,
 }
 
-fn into_connected_peer(
+fn into_connected_daemon(
     connection: quinn::Connection,
-) -> Result<ConnectedPeer, ConnectionLifecycleError> {
-    let transport_fingerprint = peer_identity_from_connection(&connection)
+) -> Result<ConnectedDaemon, ConnectionLifecycleError> {
+    let daemon_peer_id = peer_identity_from_connection(&connection)
         .ok_or(ConnectionLifecycleError::MissingPeerIdentity)?;
-    Ok(ConnectedPeer {
+    Ok(ConnectedDaemon {
         connection,
-        peer_id: transport_fingerprint,
+        daemon_peer_id,
     })
 }
 
 /// Dial a remote endpoint and return a connection with extracted peer identity.
-pub async fn dial_peer(
+pub async fn dial_daemon(
     endpoint: &quinn::Endpoint,
     remote: SocketAddr,
     sni: &str,
     client_config: Option<&quinn::ClientConfig>,
-) -> Result<ConnectedPeer, ConnectionLifecycleError> {
+) -> Result<ConnectedDaemon, ConnectionLifecycleError> {
     let connecting = if let Some(cfg) = client_config {
         endpoint.connect_with(cfg.clone(), remote, sni)
     } else {
@@ -70,15 +69,15 @@ pub async fn dial_peer(
         }
     })?;
 
-    into_connected_peer(connection)
+    into_connected_daemon(connection)
 }
 
 /// Accept the next inbound connection and extract peer identity.
 ///
 /// Returns `Ok(None)` when the endpoint is closed.
-pub async fn accept_peer(
+pub async fn accept_daemon(
     endpoint: &quinn::Endpoint,
-) -> Result<Option<ConnectedPeer>, ConnectionLifecycleError> {
+) -> Result<Option<ConnectedDaemon>, ConnectionLifecycleError> {
     let incoming = match endpoint.accept().await {
         Some(incoming) => incoming,
         None => return Ok(None),
@@ -86,7 +85,7 @@ pub async fn accept_peer(
     let connection = incoming
         .await
         .map_err(|e| ConnectionLifecycleError::Accept(e.to_string()))?;
-    Ok(Some(into_connected_peer(connection)?))
+    Ok(Some(into_connected_daemon(connection)?))
 }
 
 #[cfg(test)]
@@ -95,7 +94,7 @@ mod tests {
     use std::sync::Arc;
     use std::time::Duration;
 
-    use super::{accept_peer, dial_peer};
+    use super::{accept_daemon, dial_daemon};
     use crate::transport::{
         create_dual_endpoint, extract_spki_fingerprint, generate_self_signed_cert,
         multi_workspace::transport_sni,
@@ -147,17 +146,17 @@ mod tests {
         let server_sni = transport_sni(&server_peer_id);
 
         let (accepted_res, dialed_res) = tokio::join!(
-            accept_peer(&server_ep),
-            dial_peer(&client_ep, server_addr, &server_sni, None)
+            accept_daemon(&server_ep),
+            dial_daemon(&client_ep, server_addr, &server_sni, None)
         );
 
         let accepted = accepted_res
-            .expect("accept_peer")
+            .expect("accept_daemon")
             .expect("accepted connection");
-        let dialed = dialed_res.expect("dial_peer");
+        let dialed = dialed_res.expect("dial_daemon");
 
-        assert_eq!(accepted.peer_id, client_peer_id);
-        assert_eq!(dialed.peer_id, server_peer_id);
+        assert_eq!(accepted.daemon_peer_id, client_peer_id);
+        assert_eq!(dialed.daemon_peer_id, server_peer_id);
     }
 
     #[tokio::test]
@@ -166,7 +165,7 @@ mod tests {
             endpoint_pair().await.expect("endpoint pair");
         server_ep.close(0u32.into(), b"test-close");
 
-        let result = tokio::time::timeout(Duration::from_secs(1), accept_peer(&server_ep))
+        let result = tokio::time::timeout(Duration::from_secs(1), accept_daemon(&server_ep))
             .await
             .expect("accept timeout")
             .expect("accept result");
@@ -174,7 +173,7 @@ mod tests {
         assert!(
             result.is_none(),
             "closed endpoint should return None, got {:?}",
-            result.as_ref().map(|p| &p.peer_id)
+            result.as_ref().map(|p| &p.daemon_peer_id)
         );
     }
 }

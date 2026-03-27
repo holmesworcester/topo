@@ -33,6 +33,10 @@ struct ControlAdapter {
 
 #[async_trait]
 impl StreamConn for ControlAdapter {
+    fn swap_recv_limit(&mut self, _new_limit: usize) -> usize {
+        usize::MAX
+    }
+
     async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
         let frame = encode_frame(msg);
         if let Some(c) = &self.capture {

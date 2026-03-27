@@ -35,9 +35,11 @@ use tracing::warn;
 use crate::contracts::peering_contract::{
     PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId, TransportSessionIo,
 };
+use crate::db::open_connection;
 use crate::runtime::repeated_warning::should_emit_globally;
 use crate::sync::SyncConnectionHandler;
 use crate::transport::session_factory::extract_build_mismatch_reason;
+use crate::transport::DaemonConnection;
 
 // ---------------------------------------------------------------------------
 // Types
@@ -50,9 +52,7 @@ pub type IntroSpawnerFn = fn(
     crate::transport::TransportConnection,
     String,
     String,
-    String,
     crate::transport::TransportEndpoint,
-    Option<crate::transport::TransportClientConfig>,
 ) -> tokio::task::JoinHandle<()>;
 
 // ---------------------------------------------------------------------------
@@ -114,40 +114,99 @@ fn connection_direction_rank(
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
-struct LiveConnectionKey {
+struct LiveDaemonConnectionKey {
     db_path: String,
-    recorded_by: String,
-    peer_id: String,
+    remote_daemon_peer_id: String,
+    pending_bootstrap_remote_addr: Option<SocketAddr>,
 }
 
-struct LiveConnectionSlot {
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+struct LiveSessionPeerKey {
+    db_path: String,
+    tenant_id: String,
+    remote_session_peer_id: String,
+}
+
+struct LiveDaemonConnectionSlot {
     claim_id: u64,
     direction: SessionDirection,
     direction_rank: u8,
-    connection: crate::transport::TransportConnection,
+    daemon_connection: DaemonConnection,
     released: Arc<tokio::sync::Notify>,
 }
 
-fn live_connection_slots() -> &'static Mutex<HashMap<LiveConnectionKey, LiveConnectionSlot>> {
-    static LIVE_CONNECTION_SLOTS: OnceLock<Mutex<HashMap<LiveConnectionKey, LiveConnectionSlot>>> =
-        OnceLock::new();
-    LIVE_CONNECTION_SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
+fn live_daemon_connection_slots(
+) -> &'static Mutex<HashMap<LiveDaemonConnectionKey, LiveDaemonConnectionSlot>> {
+    static LIVE_DAEMON_CONNECTION_SLOTS: OnceLock<
+        Mutex<HashMap<LiveDaemonConnectionKey, LiveDaemonConnectionSlot>>,
+    > = OnceLock::new();
+    LIVE_DAEMON_CONNECTION_SLOTS.get_or_init(|| Mutex::new(HashMap::new()))
 }
 
-fn next_live_connection_claim_id() -> u64 {
+fn next_live_daemon_connection_claim_id() -> u64 {
     static NEXT_CLAIM_ID: AtomicU64 = AtomicU64::new(1);
     NEXT_CLAIM_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-pub(crate) struct LiveConnectionLease {
-    key: LiveConnectionKey,
+fn has_active_pending_bootstrap_alias(db_path: &str, remote_daemon_peer_id: &str) -> bool {
+    let Ok(fp_bytes) = hex::decode(remote_daemon_peer_id) else {
+        return false;
+    };
+    if fp_bytes.len() != 32 {
+        return false;
+    }
+    let Ok(db) = open_connection(db_path) else {
+        return false;
+    };
+    let now_ms = current_timestamp_ms();
+    db.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM pending_invite_bootstrap_trust
+             WHERE expected_bootstrap_spki_fingerprint = ?1
+               AND expires_at > ?2
+         )",
+        rusqlite::params![fp_bytes, now_ms],
+        |row| row.get::<_, bool>(0),
+    )
+    .unwrap_or(false)
+}
+
+fn live_daemon_connection_key(
+    db_path: &str,
+    remote_daemon_peer_id: &str,
+    remote_addr: SocketAddr,
+) -> LiveDaemonConnectionKey {
+    LiveDaemonConnectionKey {
+        db_path: db_path.to_string(),
+        remote_daemon_peer_id: remote_daemon_peer_id.to_string(),
+        pending_bootstrap_remote_addr: has_active_pending_bootstrap_alias(
+            db_path,
+            remote_daemon_peer_id,
+        )
+        .then_some(remote_addr),
+    }
+}
+
+fn live_session_peer_counts() -> &'static Mutex<HashMap<LiveSessionPeerKey, usize>> {
+    static LIVE_SESSION_PEER_COUNTS: OnceLock<Mutex<HashMap<LiveSessionPeerKey, usize>>> =
+        OnceLock::new();
+    LIVE_SESSION_PEER_COUNTS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) struct LiveDaemonConnectionLease {
+    key: LiveDaemonConnectionKey,
     claim_id: u64,
 }
 
-impl Drop for LiveConnectionLease {
+pub(crate) struct LiveSessionPeerLease {
+    key: LiveSessionPeerKey,
+}
+
+impl Drop for LiveDaemonConnectionLease {
     fn drop(&mut self) {
         let released = {
-            let mut slots = live_connection_slots()
+            let mut slots = live_daemon_connection_slots()
                 .lock()
                 .unwrap_or_else(|poison| poison.into_inner());
             match slots.get(&self.key) {
@@ -166,39 +225,57 @@ impl Drop for LiveConnectionLease {
     }
 }
 
-pub(crate) struct LiveConnectionOccupied {
+impl Drop for LiveSessionPeerLease {
+    fn drop(&mut self) {
+        let mut counts = live_session_peer_counts()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let remove = match counts.get_mut(&self.key) {
+            Some(count) if *count > 1 => {
+                *count -= 1;
+                false
+            }
+            Some(_) => true,
+            None => false,
+        };
+        if remove {
+            counts.remove(&self.key);
+        }
+    }
+}
+
+pub(crate) struct LiveDaemonConnectionOccupied {
     pub preferred_direction: Option<SessionDirection>,
     pub active_direction: SessionDirection,
-    pub released: Arc<tokio::sync::Notify>,
+    pub daemon_connection: DaemonConnection,
 }
 
-pub(crate) enum LiveConnectionClaim {
-    Acquired(LiveConnectionLease),
-    Occupied(LiveConnectionOccupied),
+pub(crate) enum LiveDaemonConnectionClaim {
+    Acquired(LiveDaemonConnectionLease),
+    Occupied(LiveDaemonConnectionOccupied),
 }
 
-pub(crate) fn claim_live_connection_slot(
+pub(crate) fn claim_live_daemon_connection_slot(
     db_path: &str,
-    recorded_by: &str,
-    peer_id: &str,
+    local_daemon_peer_id: &str,
+    remote_daemon_peer_id: &str,
     direction: SessionDirection,
-    connection: crate::transport::TransportConnection,
-) -> LiveConnectionClaim {
-    let key = LiveConnectionKey {
-        db_path: db_path.to_string(),
-        recorded_by: recorded_by.to_string(),
-        peer_id: peer_id.to_string(),
-    };
-    let direction_rank = connection_direction_rank(recorded_by, peer_id, direction);
-    let preferred_direction = preferred_connection_direction(recorded_by, peer_id);
-    let claim_id = next_live_connection_claim_id();
+    daemon_connection: DaemonConnection,
+) -> LiveDaemonConnectionClaim {
+    let key = live_daemon_connection_key(
+        db_path,
+        remote_daemon_peer_id,
+        daemon_connection.remote_addr(),
+    );
+    let direction_rank =
+        connection_direction_rank(local_daemon_peer_id, remote_daemon_peer_id, direction);
+    let preferred_direction =
+        preferred_connection_direction(local_daemon_peer_id, remote_daemon_peer_id);
+    let claim_id = next_live_daemon_connection_claim_id();
 
-    let mut replaced: Option<(
-        crate::transport::TransportConnection,
-        Arc<tokio::sync::Notify>,
-    )> = None;
+    let mut replaced: Option<(DaemonConnection, Arc<tokio::sync::Notify>)> = None;
     let claim = {
-        let mut slots = live_connection_slots()
+        let mut slots = live_daemon_connection_slots()
             .lock()
             .unwrap_or_else(|poison| poison.into_inner());
         match slots.get_mut(&key) {
@@ -206,56 +283,111 @@ pub(crate) fn claim_live_connection_slot(
                 let released = Arc::new(tokio::sync::Notify::new());
                 slots.insert(
                     key.clone(),
-                    LiveConnectionSlot {
+                    LiveDaemonConnectionSlot {
                         claim_id,
                         direction,
                         direction_rank,
-                        connection,
+                        daemon_connection,
                         released,
                     },
                 );
-                LiveConnectionClaim::Acquired(LiveConnectionLease { key, claim_id })
+                LiveDaemonConnectionClaim::Acquired(LiveDaemonConnectionLease { key, claim_id })
             }
-            Some(existing) if direction_rank > existing.direction_rank => {
+            Some(existing)
+                if direction_rank > existing.direction_rank
+                    || existing
+                        .daemon_connection
+                        .connection()
+                        .close_reason()
+                        .is_some()
+                    || (existing.direction == direction
+                        && existing.daemon_connection.remote_addr()
+                            != daemon_connection.remote_addr()) =>
+            {
                 let released = Arc::new(tokio::sync::Notify::new());
-                replaced = Some((existing.connection.clone(), existing.released.clone()));
-                *existing = LiveConnectionSlot {
+                replaced = Some((existing.daemon_connection.clone(), existing.released.clone()));
+                *existing = LiveDaemonConnectionSlot {
                     claim_id,
                     direction,
                     direction_rank,
-                    connection,
+                    daemon_connection,
                     released,
                 };
-                LiveConnectionClaim::Acquired(LiveConnectionLease { key, claim_id })
+                LiveDaemonConnectionClaim::Acquired(LiveDaemonConnectionLease { key, claim_id })
             }
-            Some(existing) => LiveConnectionClaim::Occupied(LiveConnectionOccupied {
+            Some(existing) => LiveDaemonConnectionClaim::Occupied(LiveDaemonConnectionOccupied {
                 preferred_direction,
                 active_direction: existing.direction,
-                released: existing.released.clone(),
+                daemon_connection: existing.daemon_connection.clone(),
             }),
         }
     };
 
     if let Some((existing_connection, released)) = replaced {
-        existing_connection.close(0u32.into(), b"replaced by preferred peer connection");
+        existing_connection
+            .connection()
+            .close(0u32.into(), b"replaced by preferred daemon connection");
         released.notify_waiters();
     }
 
     claim
 }
 
-pub(crate) fn live_connection_peer_ids(db_path: &str, recorded_by: &str) -> Vec<String> {
-    let slots = live_connection_slots()
+pub(crate) fn live_daemon_connection(
+    db_path: &str,
+    remote_daemon_peer_id: &str,
+    remote_addr: SocketAddr,
+) -> Option<DaemonConnection> {
+    let slots = live_daemon_connection_slots()
         .lock()
         .unwrap_or_else(|poison| poison.into_inner());
-    let mut peer_ids: Vec<String> = slots
+    slots
+        .iter()
+        .find_map(|(key, slot)| {
+            (key.db_path == db_path
+                && key.remote_daemon_peer_id == remote_daemon_peer_id
+                && key.pending_bootstrap_remote_addr == Some(remote_addr))
+                .then(|| slot.daemon_connection.clone())
+        })
+        .or_else(|| {
+            slots.iter().find_map(|(key, slot)| {
+                (key.db_path == db_path
+                    && key.remote_daemon_peer_id == remote_daemon_peer_id
+                    && key.pending_bootstrap_remote_addr.is_none())
+                    .then(|| slot.daemon_connection.clone())
+            })
+        })
+}
+
+pub(crate) fn claim_live_session_peer(
+    db_path: &str,
+    tenant_id: &str,
+    remote_session_peer_id: &str,
+) -> LiveSessionPeerLease {
+    let key = LiveSessionPeerKey {
+        db_path: db_path.to_string(),
+        tenant_id: tenant_id.to_string(),
+        remote_session_peer_id: remote_session_peer_id.to_string(),
+    };
+    let mut counts = live_session_peer_counts()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    *counts.entry(key.clone()).or_insert(0) += 1;
+    LiveSessionPeerLease { key }
+}
+
+pub(crate) fn live_session_peer_ids(db_path: &str, tenant_id: &str) -> Vec<String> {
+    let counts = live_session_peer_counts()
+        .lock()
+        .unwrap_or_else(|poison| poison.into_inner());
+    let mut remote_session_peer_ids: Vec<String> = counts
         .keys()
-        .filter(|key| key.db_path == db_path && key.recorded_by == recorded_by)
-        .map(|key| key.peer_id.clone())
+        .filter(|key| key.db_path == db_path && key.tenant_id == tenant_id)
+        .map(|key| key.remote_session_peer_id.clone())
         .collect();
-    peer_ids.sort();
-    peer_ids.dedup();
-    peer_ids
+    remote_session_peer_ids.sort();
+    remote_session_peer_ids.dedup();
+    remote_session_peer_ids
 }
 
 // ---------------------------------------------------------------------------
@@ -317,7 +449,22 @@ pub(super) use crate::tuning::drain_batch_size;
 
 #[cfg(test)]
 mod tests {
-    use super::{preferred_connection_direction, SessionDirection};
+    use std::sync::Arc;
+    use std::time::Duration;
+
+    use super::{
+        claim_live_daemon_connection_slot, claim_live_session_peer, live_daemon_connection,
+        live_session_peer_ids, preferred_connection_direction, LiveDaemonConnectionClaim,
+        SessionDirection,
+    };
+    use crate::db::open_connection;
+    use crate::db::schema::create_tables;
+    use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
+    use crate::transport::{
+        accept_daemon_connection, create_dual_endpoint, dial_daemon_connection,
+        extract_spki_fingerprint, generate_self_signed_cert,
+        multi_workspace::transport_sni,
+    };
 
     #[test]
     fn preferred_connection_direction_is_symmetric() {
@@ -346,5 +493,291 @@ mod tests {
     #[test]
     fn preferred_connection_direction_returns_none_for_invalid_peer_ids() {
         assert_eq!(preferred_connection_direction("not-hex", "also-bad"), None);
+    }
+
+    #[test]
+    fn live_session_peers_are_tracked_by_tenant_and_deduped() {
+        let db_path = "/tmp/live-session-peer-tracking.db";
+        let tenant_a = format!("{:064x}", 1);
+        let tenant_b = format!("{:064x}", 2);
+        let peer = format!("{:064x}", 3);
+
+        assert!(live_session_peer_ids(db_path, &tenant_a).is_empty());
+
+        let lease_a1 = claim_live_session_peer(db_path, &tenant_a, &peer);
+        let lease_a2 = claim_live_session_peer(db_path, &tenant_a, &peer);
+        let _lease_b = claim_live_session_peer(db_path, &tenant_b, &peer);
+
+        assert_eq!(live_session_peer_ids(db_path, &tenant_a), vec![peer.clone()]);
+        assert_eq!(live_session_peer_ids(db_path, &tenant_b), vec![peer.clone()]);
+
+        drop(lease_a1);
+        assert_eq!(live_session_peer_ids(db_path, &tenant_a), vec![peer.clone()]);
+
+        drop(lease_a2);
+        assert!(live_session_peer_ids(db_path, &tenant_a).is_empty());
+        assert_eq!(live_session_peer_ids(db_path, &tenant_b), vec![peer]);
+    }
+
+    #[tokio::test]
+    async fn inbound_reconnect_from_new_remote_addr_replaces_stale_slot() {
+        let (server_cert, server_key) = generate_self_signed_cert().expect("server cert");
+        let (client_cert, client_key) = generate_self_signed_cert().expect("client cert");
+
+        let server_fp = extract_spki_fingerprint(server_cert.as_ref()).expect("server fp");
+        let client_fp = extract_spki_fingerprint(client_cert.as_ref()).expect("client fp");
+        let server_peer_id = hex::encode(server_fp);
+        let client_peer_id = hex::encode(client_fp);
+
+        let allow_client: Arc<
+            dyn Fn(&[u8; 32]) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
+                + Send
+                + Sync,
+        > =
+            Arc::new(move |candidate| Ok(candidate == &client_fp));
+        let allow_server: Arc<
+            dyn Fn(&[u8; 32]) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
+                + Send
+                + Sync,
+        > =
+            Arc::new(move |candidate| Ok(candidate == &server_fp));
+
+        let server_ep = create_dual_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cert,
+            server_key,
+            allow_client,
+        )
+        .expect("server endpoint");
+        let client_ep_a = create_dual_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            client_cert.clone(),
+            client_key.clone_key(),
+            allow_server.clone(),
+        )
+        .expect("client endpoint a");
+        let client_ep_b = create_dual_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            client_cert,
+            client_key,
+            allow_server,
+        )
+        .expect("client endpoint b");
+
+        let server_addr = server_ep.local_addr().expect("server addr");
+        let server_sni = transport_sni(&server_peer_id);
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tmpdir.path().join("live-daemon-slot.db");
+        let db_str = db_path.to_str().expect("db path");
+
+        let (accepted_a, _) = tokio::join!(
+            accept_daemon_connection(&server_ep),
+            dial_daemon_connection(&client_ep_a, server_addr, &server_sni, None),
+        );
+        let accepted_a = accepted_a
+            .expect("accept a")
+            .expect("accepted daemon connection a");
+        let lease_a = match claim_live_daemon_connection_slot(
+            db_str,
+            &server_peer_id,
+            &client_peer_id,
+            SessionDirection::Inbound,
+            accepted_a.clone(),
+        ) {
+            LiveDaemonConnectionClaim::Acquired(lease) => lease,
+            LiveDaemonConnectionClaim::Occupied(_) => panic!("first inbound connection should acquire slot"),
+        };
+
+        let first_remote_addr = accepted_a.remote_addr();
+
+        let (accepted_b, _) = tokio::join!(
+            accept_daemon_connection(&server_ep),
+            dial_daemon_connection(&client_ep_b, server_addr, &server_sni, None),
+        );
+        let accepted_b = accepted_b
+            .expect("accept b")
+            .expect("accepted daemon connection b");
+        let second_remote_addr = accepted_b.remote_addr();
+        assert_ne!(
+            first_remote_addr, second_remote_addr,
+            "test requires reconnect to arrive from a fresh remote address"
+        );
+
+        let lease_b = match claim_live_daemon_connection_slot(
+            db_str,
+            &server_peer_id,
+            &client_peer_id,
+            SessionDirection::Inbound,
+            accepted_b.clone(),
+        ) {
+            LiveDaemonConnectionClaim::Acquired(lease) => lease,
+            LiveDaemonConnectionClaim::Occupied(_) => {
+                panic!("fresh inbound reconnect should replace stale slot")
+            }
+        };
+
+        let live = live_daemon_connection(db_str, &client_peer_id, second_remote_addr)
+            .expect("live slot");
+        assert_eq!(live.remote_addr(), second_remote_addr);
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if accepted_a.connection().close_reason().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("replaced connection closed");
+
+        drop(lease_a);
+        drop(lease_b);
+        client_ep_a.close(0u32.into(), b"test close");
+        client_ep_b.close(0u32.into(), b"test close");
+        server_ep.close(0u32.into(), b"test close");
+    }
+
+    #[tokio::test]
+    async fn pending_bootstrap_aliases_do_not_share_live_daemon_slot() {
+        let (server_cert, server_key) = generate_self_signed_cert().expect("server cert");
+        let (client_cert, client_key) = generate_self_signed_cert().expect("client cert");
+
+        let server_fp = extract_spki_fingerprint(server_cert.as_ref()).expect("server fp");
+        let client_fp = extract_spki_fingerprint(client_cert.as_ref()).expect("client fp");
+        let server_peer_id = hex::encode(server_fp);
+        let client_peer_id = hex::encode(client_fp);
+
+        let allow_client: Arc<
+            dyn Fn(&[u8; 32]) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
+                + Send
+                + Sync,
+        > =
+            Arc::new(move |candidate| Ok(candidate == &client_fp));
+        let allow_server: Arc<
+            dyn Fn(&[u8; 32]) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
+                + Send
+                + Sync,
+        > =
+            Arc::new(move |candidate| Ok(candidate == &server_fp));
+
+        let server_ep = create_dual_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            server_cert,
+            server_key,
+            allow_client,
+        )
+        .expect("server endpoint");
+        let client_ep_a = create_dual_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            client_cert.clone(),
+            client_key.clone_key(),
+            allow_server.clone(),
+        )
+        .expect("client endpoint a");
+        let client_ep_b = create_dual_endpoint(
+            "127.0.0.1:0".parse().unwrap(),
+            client_cert,
+            client_key,
+            allow_server,
+        )
+        .expect("client endpoint b");
+
+        let server_addr = server_ep.local_addr().expect("server addr");
+        let server_sni = transport_sni(&server_peer_id);
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tmpdir.path().join("bootstrap-alias-slot.db");
+        let db_str = db_path.to_str().expect("db path");
+        let db = open_connection(db_str).expect("open db");
+        create_tables(&db).expect("create tables");
+        record_pending_invite_bootstrap_trust(
+            &db,
+            "tenant-a",
+            "invite-event",
+            "workspace",
+            &client_fp,
+        )
+        .expect("record pending bootstrap trust");
+        drop(db);
+
+        let (accepted_a, dialed_a) = tokio::join!(
+            accept_daemon_connection(&server_ep),
+            dial_daemon_connection(&client_ep_a, server_addr, &server_sni, None),
+        );
+        let accepted_a = accepted_a
+            .expect("accept a")
+            .expect("accepted daemon connection a");
+        let dialed_a = dialed_a.expect("dial a");
+        let first_remote_addr = accepted_a.remote_addr();
+        let lease_a = match claim_live_daemon_connection_slot(
+            db_str,
+            &server_peer_id,
+            &client_peer_id,
+            SessionDirection::Inbound,
+            accepted_a.clone(),
+        ) {
+            LiveDaemonConnectionClaim::Acquired(lease) => lease,
+            LiveDaemonConnectionClaim::Occupied(_) => {
+                panic!("first bootstrap alias should acquire slot")
+            }
+        };
+
+        let (accepted_b, dialed_b) = tokio::join!(
+            accept_daemon_connection(&server_ep),
+            dial_daemon_connection(&client_ep_b, server_addr, &server_sni, None),
+        );
+        let accepted_b = accepted_b
+            .expect("accept b")
+            .expect("accepted daemon connection b");
+        let dialed_b = dialed_b.expect("dial b");
+        let second_remote_addr = accepted_b.remote_addr();
+        assert_ne!(
+            first_remote_addr, second_remote_addr,
+            "test requires a distinct remote address for the second bootstrap alias",
+        );
+
+        let lease_b = match claim_live_daemon_connection_slot(
+            db_str,
+            &server_peer_id,
+            &client_peer_id,
+            SessionDirection::Inbound,
+            accepted_b.clone(),
+        ) {
+            LiveDaemonConnectionClaim::Acquired(lease) => lease,
+            LiveDaemonConnectionClaim::Occupied(_) => {
+                panic!("bootstrap alias from a different remote address should keep its own slot")
+            }
+        };
+
+        let first_live = live_daemon_connection(db_str, &client_peer_id, first_remote_addr)
+            .expect("first live slot");
+        let second_live = live_daemon_connection(db_str, &client_peer_id, second_remote_addr)
+            .expect("second live slot");
+        assert_eq!(first_live.remote_addr(), first_remote_addr);
+        assert_eq!(second_live.remote_addr(), second_remote_addr);
+
+        let db = open_connection(db_str).expect("open db");
+        db.execute("DELETE FROM pending_invite_bootstrap_trust", [])
+            .expect("clear pending bootstrap trust");
+        drop(db);
+
+        let first_live_after_clear = live_daemon_connection(db_str, &client_peer_id, first_remote_addr)
+            .expect("first live slot after clear");
+        let second_live_after_clear = live_daemon_connection(db_str, &client_peer_id, second_remote_addr)
+            .expect("second live slot after clear");
+        assert_eq!(first_live_after_clear.remote_addr(), first_remote_addr);
+        assert_eq!(second_live_after_clear.remote_addr(), second_remote_addr);
+        assert!(
+            accepted_a.connection().close_reason().is_none(),
+            "first bootstrap alias connection should stay open"
+        );
+
+        drop(lease_a);
+        drop(lease_b);
+        drop(dialed_a);
+        drop(dialed_b);
+        client_ep_a.close(0u32.into(), b"test close");
+        client_ep_b.close(0u32.into(), b"test close");
+        server_ep.close(0u32.into(), b"test close");
     }
 }

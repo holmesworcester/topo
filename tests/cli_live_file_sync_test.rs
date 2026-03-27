@@ -9,6 +9,7 @@ use topo::db::open_connection;
 
 #[test]
 fn test_cli_live_message_during_large_file_sync() {
+    hold_network_test_lock_for_binary();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir
         .path()

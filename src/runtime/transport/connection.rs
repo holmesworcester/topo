@@ -10,6 +10,7 @@ use crate::tuning::max_recv_buffer;
 /// Async stream connection abstraction for sync protocol.
 #[async_trait]
 pub trait StreamConn {
+    fn swap_recv_limit(&mut self, new_limit: usize) -> usize;
     async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError>;
     async fn flush(&mut self) -> Result<(), ConnectionError>;
     async fn recv(&mut self) -> Result<Frame, ConnectionError>;
@@ -35,6 +36,7 @@ pub struct Connection {
     send: SendStream,
     recv: RecvStream,
     recv_buffer: Vec<u8>,
+    recv_limit: usize,
 }
 
 /// Send-only QUIC stream wrapper
@@ -97,7 +99,14 @@ impl Connection {
             send,
             recv,
             recv_buffer: Vec::with_capacity(4096),
+            recv_limit: max_recv_buffer(),
         }
+    }
+
+    pub fn swap_recv_limit(&mut self, new_limit: usize) -> usize {
+        let old_limit = self.recv_limit;
+        self.recv_limit = new_limit;
+        old_limit
     }
 
     /// Send a sync message
@@ -132,7 +141,7 @@ impl Connection {
                 }
             }
 
-            if self.recv_buffer.len() > max_recv_buffer() {
+            if self.recv_buffer.len() > self.recv_limit {
                 return Err(ConnectionError::Parse(ParseError::EventTooLarge(
                     self.recv_buffer.len(),
                 )));
@@ -232,6 +241,10 @@ impl RecvConnection {
 
 #[async_trait]
 impl StreamConn for Connection {
+    fn swap_recv_limit(&mut self, new_limit: usize) -> usize {
+        Connection::swap_recv_limit(self, new_limit)
+    }
+
     async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
         Connection::send(self, msg).await
     }
