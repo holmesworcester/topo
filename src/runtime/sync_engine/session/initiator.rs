@@ -7,7 +7,7 @@ use crate::db::{
     store::{lookup_workspace_id, Store},
 };
 use crate::protocol::{neg_id_to_event_id, Frame};
-use crate::runtime::peering::loops::live_connection_peer_ids;
+use crate::runtime::peering::loops::live_session_peer_ids;
 use crate::runtime::SyncStats;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::range_session::{
@@ -116,7 +116,7 @@ where
             recorded_by
         )
     })?;
-    let live_peer_ids = live_connection_peer_ids(db_path, recorded_by);
+    let live_peer_ids = live_session_peer_ids(db_path, recorded_by);
     let range = select_outbound_window(
         db_path,
         recorded_by,

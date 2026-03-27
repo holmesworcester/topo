@@ -96,8 +96,10 @@ impl Default for FakeIoConfig {
 pub struct FakeTransportSessionIo {
     session_id: u64,
     max_frame_size: usize,
+    control_recv_limit: usize,
     config: FakeIoConfig,
     closed: Arc<AtomicBool>,
+    ctrl_recv_count: u64,
     // Control: handler receives from ctrl_in_rx, sends to ctrl_out_tx
     ctrl_in_rx: Option<mpsc::Receiver<Vec<u8>>>,
     ctrl_out_tx: Option<mpsc::Sender<Vec<u8>>>,
@@ -155,8 +157,10 @@ fn build_fake_session_io(
     let io = FakeTransportSessionIo {
         session_id,
         max_frame_size: config.max_frame_size,
+        control_recv_limit: config.max_frame_size,
         config,
         closed: closed.clone(),
+        ctrl_recv_count: 0,
         ctrl_in_rx: Some(ctrl_to_handler_rx),
         ctrl_out_tx: Some(ctrl_from_handler_tx),
         data_out_tx: Some(data_from_handler_tx),
@@ -351,6 +355,69 @@ impl TransportSessionIo for FakeTransportSessionIo {
 
     fn max_frame_size(&self) -> usize {
         self.max_frame_size
+    }
+
+    fn swap_control_recv_limit(&mut self, new_limit: usize) -> usize {
+        let old_limit = self.control_recv_limit;
+        self.control_recv_limit = new_limit;
+        old_limit
+    }
+
+    async fn recv_control_frame(&mut self) -> Result<Vec<u8>, TransportSessionIoError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TransportSessionIoError::ConnectionLost);
+        }
+        if let Some(delay) = self.config.frame_delay {
+            tokio::time::sleep(delay).await;
+        }
+        if self.ctrl_recv_count == 0 {
+            if let Some(ProtocolViolation::GarbageControlFrame) = &self.config.inject_protocol_violation
+            {
+                self.ctrl_recv_count += 1;
+                return Ok(GARBAGE_CONTROL_FRAME.to_vec());
+            }
+        }
+
+        let frame = self
+            .ctrl_in_rx
+            .as_mut()
+            .expect("control receive stream missing")
+            .recv()
+            .await
+            .ok_or(TransportSessionIoError::ConnectionLost)?;
+        if frame.len() > self.control_recv_limit {
+            return Err(TransportSessionIoError::FrameTooLarge {
+                len: frame.len(),
+                max: self.control_recv_limit,
+            });
+        }
+        self.ctrl_recv_count += 1;
+        Ok(frame)
+    }
+
+    async fn send_control_frame(
+        &mut self,
+        frame: &[u8],
+    ) -> Result<(), TransportSessionIoError> {
+        if self.closed.load(Ordering::Acquire) {
+            return Err(TransportSessionIoError::ConnectionLost);
+        }
+        if frame.len() > self.max_frame_size {
+            return Err(TransportSessionIoError::FrameTooLarge {
+                len: frame.len(),
+                max: self.max_frame_size,
+            });
+        }
+        self.ctrl_out_tx
+            .as_mut()
+            .expect("control send stream missing")
+            .send(frame.to_vec())
+            .await
+            .map_err(|_| TransportSessionIoError::ConnectionLost)
+    }
+
+    async fn flush_control(&mut self) -> Result<(), TransportSessionIoError> {
+        Ok(())
     }
 
     fn split(self: Box<Self>) -> TransportSessionIoParts {

@@ -15,12 +15,15 @@ use crate::db::{
     intro::{insert_intro_attempt, intro_already_seen, update_intro_status},
     open_connection,
 };
+use crate::db::transport_creds::discover_local_tenants;
+use crate::db::transport_trust::record_transport_binding;
 use crate::protocol::Frame;
 use crate::sync::SyncConnectionHandler;
 use crate::transport::{
-    dial_session_provider, multi_workspace::transport_sni, read_intro_offer_frame,
-    tenant_trusts_peer, SessionProvider, TransportClientConfig, TransportConnection,
-    TransportEndpoint,
+    build_tenant_client_config_from_db, dial_session_provider, multi_workspace::transport_sni,
+    read_intro_offer_frame, send_outbound_session_auth, tenant_trusts_daemon_peer,
+    tenant_trusts_peer, OutboundSessionAuthPlan, SessionProvider, TransportClientConfig,
+    TransportConnection, TransportEndpoint,
 };
 
 const ENDPOINT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
@@ -195,25 +198,9 @@ pub async fn handle_intro_offer(
         .await
         {
             Ok(Ok(provider)) => {
-                // Verify peer identity matches expected
-                if provider.peer_id() != other_peer_hex {
-                    warn!(
-                        "Punch connected but wrong peer: expected {}, got {}",
-                        &other_peer_hex[..16],
-                        &provider.peer_id()[..16.min(provider.peer_id().len())]
-                    );
-                    update_status(
-                        db_path,
-                        recorded_by,
-                        &intro_id,
-                        "failed",
-                        Some("wrong peer identity"),
-                    );
-                    return;
-                }
-
                 info!(
-                    "Hole punch succeeded! Direct connection to {}",
+                    "Hole punch connected to daemon {} for peer {}",
+                    &provider.peer_id()[..16.min(provider.peer_id().len())],
                     &other_peer_hex[..16]
                 );
                 update_status(db_path, recorded_by, &intro_id, "connected", None);
@@ -265,7 +252,7 @@ async fn run_sync_on_punched_connection(
     recorded_by: &str,
     peer_id: &str,
 ) {
-    let session = match provider.next_session().await {
+    let mut session = match provider.next_session().await {
         Ok(s) => s,
         Err(e) => {
             warn!("Failed to open streams on punched connection: {}", e);
@@ -273,14 +260,51 @@ async fn run_sync_on_punched_connection(
         }
     };
 
-    let peer_fp = match hex::decode(peer_id) {
+    let auth_result = match send_outbound_session_auth(
+        session.io.as_mut(),
+        db_path,
+        recorded_by,
+        provider.remote_daemon_peer_id(),
+        Some(provider.remote_daemon_peer_id()),
+        &OutboundSessionAuthPlan::PeerShared {
+            target_peer_id: peer_id.to_string(),
+        },
+    )
+    .await
+    {
+        Ok(auth_result) => auth_result,
+        Err(e) => {
+            warn!("Punched session auth failed: {}", e);
+            return;
+        }
+    };
+
+    if let Ok(remote_daemon_peer_id) = hex::decode(&auth_result.remote_daemon_peer_id) {
+        if remote_daemon_peer_id.len() == 32 {
+            let mut daemon_fp = [0u8; 32];
+            daemon_fp.copy_from_slice(&remote_daemon_peer_id);
+            if let Ok(db) = open_connection(db_path) {
+                let _ = record_transport_binding(
+                    &db,
+                    recorded_by,
+                    &auth_result.session_peer_id,
+                    &daemon_fp,
+                );
+            }
+        }
+    }
+
+    let peer_fp = match hex::decode(&auth_result.session_peer_id) {
         Ok(bytes) if bytes.len() == 32 => {
             let mut fp = [0u8; 32];
             fp.copy_from_slice(&bytes);
             fp
         }
         _ => {
-            warn!("Punched sync error: invalid peer id {}", peer_id);
+            warn!(
+                "Punched sync error: invalid authenticated peer id {}",
+                auth_result.session_peer_id
+            );
             return;
         }
     };
@@ -316,10 +340,8 @@ async fn run_sync_on_punched_connection(
 pub fn spawn_intro_listener(
     connection: TransportConnection,
     db_path: String,
-    recorded_by: String,
     introduced_by: String,
     endpoint: TransportEndpoint,
-    client_config: Option<TransportClientConfig>,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async move {
         loop {
@@ -352,31 +374,60 @@ pub fn spawn_intro_listener(
                         hex::encode(&other_peer_id[..8])
                     );
 
-                    let db_path = db_path.clone();
-                    let recorded_by = recorded_by.clone();
-                    let introduced_by = introduced_by.clone();
-                    let endpoint = endpoint.clone();
-                    let cfg = client_config.clone();
-                    // Spawn punch attempt as a local task — runs on the same
-                    // LocalSet / runtime that owns the endpoint I/O driver.
-                    tokio::task::spawn_local(async move {
-                        handle_intro_offer(
-                            &db_path,
-                            &recorded_by,
-                            &introduced_by,
-                            endpoint,
-                            intro_id,
-                            other_peer_id,
-                            origin_family,
-                            origin_ip,
-                            origin_port,
-                            observed_at_ms,
-                            expires_at_ms,
-                            attempt_window_ms,
-                            cfg,
-                        )
-                        .await;
-                    });
+                    let daemon_fp = hex::decode(&introduced_by)
+                        .ok()
+                        .and_then(|bytes| {
+                            if bytes.len() == 32 {
+                                let mut fp = [0u8; 32];
+                                fp.copy_from_slice(&bytes);
+                                Some(fp)
+                            } else {
+                                None
+                            }
+                        });
+                    let candidate_tenants = open_connection(&db_path)
+                        .ok()
+                        .and_then(|db| discover_local_tenants(&db).ok())
+                        .unwrap_or_default();
+
+                    for tenant in candidate_tenants {
+                        if !tenant_trusts_peer(&db_path, &tenant.peer_id, other_peer_id)
+                            .unwrap_or(false)
+                        {
+                            continue;
+                        }
+                        if let Some(daemon_fp) = daemon_fp {
+                            if !tenant_trusts_daemon_peer(&db_path, &tenant.peer_id, daemon_fp)
+                                .unwrap_or(false)
+                            {
+                                continue;
+                            }
+                        }
+
+                        let db_path = db_path.clone();
+                        let recorded_by = tenant.peer_id.clone();
+                        let introduced_by = introduced_by.clone();
+                        let endpoint = endpoint.clone();
+                        let cfg = build_tenant_client_config_from_db(&db_path, &recorded_by).ok();
+                        tokio::task::spawn_local(async move {
+                            handle_intro_offer(
+                                &db_path,
+                                &recorded_by,
+                                &introduced_by,
+                                endpoint,
+                                intro_id,
+                                other_peer_id,
+                                origin_family,
+                                origin_ip,
+                                origin_port,
+                                observed_at_ms,
+                                expires_at_ms,
+                                attempt_window_ms,
+                                cfg,
+                            )
+                            .await;
+                        });
+                    }
                 }
                 _ => {
                     // Not an IntroOffer, ignore

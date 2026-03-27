@@ -130,6 +130,45 @@ fn preferred_outbound_only_peer_id(source: &TargetIngressSource) -> Option<&str>
     }
 }
 
+fn select_outbound_session_auth_plan(
+    source: &TargetIngressSource,
+    tenant_in_bootstrap_phase: bool,
+    bootstrap_session_fallback: Option<&BootstrapSessionFallback>,
+) -> OutboundSessionAuthPlan {
+    match source {
+        TargetIngressSource::Bootstrap { .. } => {
+            let fallback = bootstrap_session_fallback
+                .expect("bootstrap source must always have a bootstrap session fallback");
+            OutboundSessionAuthPlan::InviteBootstrap {
+                invite_event_id: fallback.invite_event_id.clone(),
+            }
+        }
+        TargetIngressSource::ObservedPeer { peer_id } => {
+            if let Some(fallback) = bootstrap_session_fallback {
+                OutboundSessionAuthPlan::InviteBootstrap {
+                    invite_event_id: fallback.invite_event_id.clone(),
+                }
+            } else {
+                OutboundSessionAuthPlan::PeerShared {
+                    target_peer_id: peer_id.clone(),
+                }
+            }
+        }
+        TargetIngressSource::Discovery { peer_id } => {
+            if tenant_in_bootstrap_phase {
+                if let Some(fallback) = bootstrap_session_fallback {
+                    return OutboundSessionAuthPlan::InviteBootstrap {
+                        invite_event_id: fallback.invite_event_id.clone(),
+                    };
+                }
+            }
+            OutboundSessionAuthPlan::PeerShared {
+                target_peer_id: peer_id.clone(),
+            }
+        }
+    }
+}
+
 pub(super) fn should_initiate_connect_for_source(
     tenant_id: &str,
     source: &TargetIngressSource,
@@ -472,27 +511,11 @@ pub(super) async fn run_target_dispatcher(
             continue;
         };
         let tenant_in_bootstrap_phase = is_tenant_in_bootstrap_phase(&db_path, &event.tenant_id);
-        let auth_plan = if matches!(event.source, TargetIngressSource::Bootstrap { .. })
-            || (tenant_in_bootstrap_phase && bootstrap_session_fallback.is_some())
-        {
-            let Some(fallback) = bootstrap_session_fallback.as_ref() else {
-                unreachable!("bootstrap source must always have a bootstrap session fallback")
-            };
-            OutboundSessionAuthPlan::InviteBootstrap {
-                invite_event_id: fallback.invite_event_id.clone(),
-            }
-        } else {
-            let peer_id = match &event.source {
-                TargetIngressSource::ObservedPeer { peer_id }
-                | TargetIngressSource::Discovery { peer_id } => peer_id,
-                TargetIngressSource::Bootstrap { .. } => {
-                    unreachable!("bootstrap source handled by invite bootstrap auth")
-                }
-            };
-            OutboundSessionAuthPlan::PeerShared {
-                target_peer_id: peer_id.clone(),
-            }
-        };
+        let auth_plan = select_outbound_session_auth_plan(
+            &event.source,
+            tenant_in_bootstrap_phase,
+            bootstrap_session_fallback.as_ref(),
+        );
         info!(
             "Spawning connect worker key={} tenant={} remote={} source={:?}",
             dispatch_key,
@@ -581,7 +604,7 @@ async fn run_connect_worker(
             recorded_by: tenant_id.clone(),
             endpoint: endpoint.clone(),
             remote,
-            remote_transport_peer_id: remote_peer_id.clone(),
+            remote_session_peer_id: remote_peer_id.clone(),
             client_config: Some(context.client_config.clone()),
             intro_spawner,
             ingest,
@@ -768,6 +791,44 @@ mod tests {
         assert!(
             !should_keep_existing_bootstrap_worker(db_str, tenant, &existing, &observed),
             "after bootstrap, observed reconnects may replace stale bootstrap workers"
+        );
+    }
+
+    #[test]
+    fn observed_reconnects_keep_bootstrap_session_auth_until_bootstrap_trust_is_gone() {
+        let fallback = BootstrapSessionFallback {
+            daemon_peer_id: "daemon".to_string(),
+            invite_event_id: "invite".to_string(),
+        };
+        let source = TargetIngressSource::ObservedPeer {
+            peer_id: "peer".to_string(),
+        };
+
+        assert_eq!(
+            select_outbound_session_auth_plan(&source, false, Some(&fallback)),
+            OutboundSessionAuthPlan::InviteBootstrap {
+                invite_event_id: "invite".to_string(),
+            },
+            "observed reconnects must keep invite auth while accepted bootstrap trust still exists"
+        );
+    }
+
+    #[test]
+    fn discovery_without_local_bootstrap_phase_uses_peer_shared_auth() {
+        let fallback = BootstrapSessionFallback {
+            daemon_peer_id: "daemon".to_string(),
+            invite_event_id: "invite".to_string(),
+        };
+        let source = TargetIngressSource::Discovery {
+            peer_id: "peer".to_string(),
+        };
+
+        assert_eq!(
+            select_outbound_session_auth_plan(&source, false, Some(&fallback)),
+            OutboundSessionAuthPlan::PeerShared {
+                target_peer_id: "peer".to_string(),
+            },
+            "broad discovery should not revive invite auth after the local bootstrap phase ends"
         );
     }
 }

@@ -168,16 +168,14 @@ check_no_match 'QuicTransportSessionIo::new' "$PEERING_PATH"
 check_no_match 'open_bi(' "$PEERING_PATH"
 check_no_match 'accept_bi(' "$PEERING_PATH"
 # peering must not call low-level dial/accept lifecycle helpers directly
-check_no_match 'dial_peer\(' "$PEERING_PATH"
-check_no_match 'accept_peer\(' "$PEERING_PATH"
+check_no_match 'dial_daemon\(' "$PEERING_PATH"
+check_no_match 'accept_daemon\(' "$PEERING_PATH"
 # peering must not open session streams directly via session_factory
 check_no_match 'session_factory::open_session_io' "$PEERING_PATH"
 check_no_match 'session_factory::accept_session_io' "$PEERING_PATH"
 # peering loops must consume the provider seam (not peer/open split calls)
 check_no_match 'dial_session_peer\(' src/runtime/peering/loops/
 check_no_match 'accept_session_peer\(' src/runtime/peering/loops/
-check_no_match 'open_outbound_session\(' "$PEERING_PATH"
-check_no_match 'open_inbound_session\(' "$PEERING_PATH"
 # peering must not use quinn stream types (SendStream/RecvStream)
 check_no_match 'quinn::SendStream' "$PEERING_PATH"
 check_no_match 'quinn::RecvStream' "$PEERING_PATH"
@@ -219,13 +217,13 @@ check_required 'open_session_io' "${TRANSPORT_PATH}session_factory.rs"
 check_required 'accept_session_io' "${TRANSPORT_PATH}session_factory.rs"
 check_required 'DualConnection::new' "${TRANSPORT_PATH}session_factory.rs"
 # transport connection lifecycle helpers must own dial/accept + peer identity
-check_required 'pub async fn dial_peer' "${TRANSPORT_PATH}connection_lifecycle.rs"
-check_required 'pub async fn accept_peer' "${TRANSPORT_PATH}connection_lifecycle.rs"
+check_required 'pub async fn dial_daemon' "${TRANSPORT_PATH}connection_lifecycle.rs"
+check_required 'pub async fn accept_daemon' "${TRANSPORT_PATH}connection_lifecycle.rs"
 # transport peering boundary must provide orchestration-facing helpers
-check_required 'pub struct SessionProvider' "${TRANSPORT_PATH}peering_boundary.rs"
+check_required 'pub struct DaemonConnection' "${TRANSPORT_PATH}peering_boundary.rs"
 check_required 'pub struct SessionEnvelope' "${TRANSPORT_PATH}peering_boundary.rs"
-check_required 'pub async fn dial_session_provider' "${TRANSPORT_PATH}peering_boundary.rs"
-check_required 'pub async fn accept_session_provider' "${TRANSPORT_PATH}peering_boundary.rs"
+check_required 'pub async fn dial_daemon_connection' "${TRANSPORT_PATH}peering_boundary.rs"
+check_required 'pub async fn accept_daemon_connection' "${TRANSPORT_PATH}peering_boundary.rs"
 check_required 'pub async fn next_session' "${TRANSPORT_PATH}peering_boundary.rs"
 check_required 'pub fn create_runtime_endpoint_for_tenants' "${TRANSPORT_PATH}peering_boundary.rs"
 check_required 'pub fn build_tenant_client_config_from_db' "${TRANSPORT_PATH}peering_boundary.rs"

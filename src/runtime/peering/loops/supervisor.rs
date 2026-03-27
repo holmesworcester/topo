@@ -2,40 +2,33 @@
 //!
 //! This module owns shared loop orchestration:
 //! - startup preflight/recovery
-//! - one long-lived sync connection scope per authenticated connection
+//! - inbound logical-session supervision on a shared daemon connection
 
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
 use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
-use crate::db::health::purge_expired_endpoints;
+use crate::db::health::{purge_expired_endpoints, record_endpoint_observation};
 use crate::db::open_connection;
 use crate::db::project_queue::ProjectQueue;
 use crate::db::schema::create_tables;
+use crate::db::transport_trust::record_transport_binding;
 use crate::runtime::build_mismatch::note_build_mismatch;
 use crate::runtime::repeated_warning::should_emit_globally;
 use crate::sync::session::dependency_session::run_dependency_session;
 use crate::sync::session::receive_log::recover_receive_logs;
 use crate::sync::SyncConnectionHandler;
 use crate::transport::session_factory::extract_build_mismatch_reason;
-use crate::transport::{SessionClass, SessionProvider};
+use crate::transport::{
+    read_inbound_session_auth_for_connection, send_inbound_session_auth_ack, DaemonConnection,
+    SessionClass,
+};
 
-use super::{current_timestamp_ms, drain_batch_size, run_session, short_peer_id};
-
-/// How a session loop resolves the tenant (`recorded_by`) for each session.
-pub(super) enum SessionTenantResolver {
-    /// Use a fixed tenant for all sessions on this connection.
-    Fixed(String),
-}
-
-impl SessionTenantResolver {
-    fn resolve(&self, _db_path: &str) -> String {
-        match self {
-            Self::Fixed(tenant_id) => tenant_id.clone(),
-        }
-    }
-}
+use super::{
+    current_timestamp_ms, drain_batch_size, peer_fingerprint_from_hex, run_session, short_peer_id,
+    ENDPOINT_TTL_MS,
+};
 
 /// Shared startup preflight:
 /// - `create_tables`
@@ -73,10 +66,6 @@ pub(super) fn run_startup_preflight(
     }
 
     let batch_sz = drain_batch_size();
-    // Drain origin queues first before we recover pending fanouts.
-    // Note: `tenant_ids` includes accepted tenants using bootstrap
-    // transport identity (via discover_local_tenants fallback), so
-    // seed replay work enqueued before a crash is recovered here.
     for tenant_id in tenant_ids {
         let drained = (ingest.drain_queue)(db_path, tenant_id, batch_sz);
         if drained > 0 {
@@ -88,9 +77,6 @@ pub(super) fn run_startup_preflight(
         }
     }
 
-    // Recover any pending shared-event fanouts from a prior crash.
-    // This runs after draining origin queues so fanout recovery sees
-    // the latest projection state.
     match crate::state::shared_workspace_fanout::take_pending_fanouts(&db) {
         Ok(pending) if !pending.is_empty() => {
             info!("Recovering {} pending shared-event fanouts", pending.len());
@@ -112,7 +98,6 @@ pub(super) fn run_startup_preflight(
                     }
                 }
             }
-            // Drain sibling queues that were just enqueued by recovery.
             for tenant_id in tenant_ids {
                 let drained = (ingest.drain_queue)(db_path, tenant_id, batch_sz);
                 if drained > 0 {
@@ -131,54 +116,50 @@ pub(super) fn run_startup_preflight(
     Ok(())
 }
 
-/// Shared per-connection supervision loop for both connect and accept modes.
-pub(super) async fn supervise_connection_sessions(
+pub(super) async fn supervise_inbound_daemon_connection(
     db_path: &str,
-    peer_id: &str,
-    peer_fp: [u8; 32],
-    provider: &SessionProvider,
+    daemon_connection: &DaemonConnection,
     handler: &SyncConnectionHandler,
-    direction: SessionDirection,
-    tenant_resolver: &SessionTenantResolver,
     shutdown: CancellationToken,
 ) {
-    let connection = provider.connection();
-    let recorded_by = tenant_resolver.resolve(db_path);
+    let connection = daemon_connection.connection();
+    let remote_daemon_peer_id = daemon_connection.remote_daemon_peer_id().to_string();
+
     loop {
         if shutdown.is_cancelled() {
             connection.close(0u32.into(), b"runtime shutdown");
             return;
         }
 
-        let session = match tokio::select! {
+        let mut session = match tokio::select! {
             _ = shutdown.cancelled() => {
                 connection.close(0u32.into(), b"runtime shutdown");
                 return;
             }
-            session = provider.next_session() => session,
+            session = daemon_connection.accept_inbound_session() => session,
         } {
             Ok(session) => session,
             Err(e) => {
                 if let Some(reason) = extract_build_mismatch_reason(&e.to_string()) {
-                    note_build_mismatch(peer_id, reason);
+                    note_build_mismatch(&remote_daemon_peer_id, reason);
                     let key = format!(
-                        "session-build-mismatch:{:?}:{}:{}",
-                        direction, recorded_by, peer_id
+                        "session-build-mismatch:{:?}:{}",
+                        SessionDirection::Inbound,
+                        remote_daemon_peer_id
                     );
                     if should_emit_globally(key) {
                         warn!(
                             "Peer {} rejected {:?} session on connection {}: {}",
-                            short_peer_id(peer_id),
-                            direction,
+                            short_peer_id(&remote_daemon_peer_id),
+                            SessionDirection::Inbound,
                             connection.stable_id(),
                             reason
                         );
                     }
                 } else {
                     info!(
-                        "Connection {} dropped while opening {:?} session: {}",
+                        "Connection {} dropped while accepting inbound session: {}",
                         connection.stable_id(),
-                        direction,
                         e
                     );
                 }
@@ -186,11 +167,78 @@ pub(super) async fn supervise_connection_sessions(
             }
         };
 
-        let session_start = std::time::Instant::now();
+        let auth_context = match read_inbound_session_auth_for_connection(
+            session.io.as_mut(),
+            db_path,
+            daemon_connection,
+        )
+        .await
+        {
+            Ok(auth_context) => auth_context,
+            Err(err) => {
+                warn!(
+                    "Inbound session {} auth failed on connection {} daemon={}: {}",
+                    session.session_id,
+                    connection.stable_id(),
+                    short_peer_id(&remote_daemon_peer_id),
+                    err
+                );
+                continue;
+            }
+        };
+        if let Err(err) =
+            send_inbound_session_auth_ack(session.io.as_mut(), &auth_context.tenant_id).await
+        {
+            warn!(
+                "Inbound session {} ack failed on connection {} daemon={}: {}",
+                session.session_id,
+                connection.stable_id(),
+                short_peer_id(&remote_daemon_peer_id),
+                err
+            );
+            continue;
+        }
+
+        let peer_fp = match peer_fingerprint_from_hex(&auth_context.remote_peer_id) {
+            Some(peer_fp) => peer_fp,
+            None => {
+                warn!(
+                    "Inbound session {} used invalid remote peer id {}",
+                    session.session_id,
+                    short_peer_id(&auth_context.remote_peer_id)
+                );
+                continue;
+            }
+        };
+
+        let now = current_timestamp_ms();
+        if let Ok(db) = open_connection(db_path) {
+            let _ = record_endpoint_observation(
+                &db,
+                &auth_context.tenant_id,
+                &auth_context.remote_peer_id,
+                &session.remote_addr.ip().to_string(),
+                session.remote_addr.port(),
+                now,
+                ENDPOINT_TTL_MS,
+            );
+            if let Some(remote_daemon_fp) =
+                peer_fingerprint_from_hex(daemon_connection.remote_daemon_peer_id())
+            {
+                let _ = record_transport_binding(
+                    &db,
+                    &auth_context.tenant_id,
+                    &auth_context.remote_peer_id,
+                    &remote_daemon_fp,
+                );
+            }
+        }
+
         if session.class == SessionClass::Dependency {
+            let session_start = std::time::Instant::now();
             let db_path = db_path.to_string();
-            let recorded_by = recorded_by.clone();
-            let peer_id = peer_id.to_string();
+            let recorded_by = auth_context.tenant_id.clone();
+            let peer_id = auth_context.remote_peer_id.clone();
             let remote_addr = session.remote_addr;
             let dep_shutdown = shutdown.child_token();
             tokio::task::spawn_local(async move {
@@ -210,46 +258,58 @@ pub(super) async fn supervise_connection_sessions(
                         short_peer_id(&peer_id),
                         err
                     );
+                } else {
+                    info!(
+                        "Dependency session {} finished in {}ms peer={}",
+                        session.session_id,
+                        session_start.elapsed().as_millis(),
+                        short_peer_id(&peer_id)
+                    );
                 }
             });
             continue;
         }
-        info!(
-            "Starting session {} ({:?}) on connection {}",
-            session.session_id,
-            direction,
-            connection.stable_id()
-        );
-
-        let session_ok = run_session(
-            handler,
-            session.session_id,
-            session.io,
-            &recorded_by,
-            peer_fp,
-            session.remote_addr,
-            direction,
-            db_path,
-        )
-        .await;
 
         info!(
-            "Session {} ({:?}) on connection {} finished in {}ms",
+            "Starting inbound session {} on connection {} tenant={} peer={} daemon={}",
             session.session_id,
-            direction,
             connection.stable_id(),
-            session_start.elapsed().as_millis()
+            short_peer_id(&auth_context.tenant_id),
+            short_peer_id(&auth_context.remote_peer_id),
+            short_peer_id(&remote_daemon_peer_id)
         );
 
-        if !session_ok {
-            tokio::select! {
-                _ = shutdown.cancelled() => {
-                    connection.close(0u32.into(), b"runtime shutdown");
-                    return;
-                }
-                _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+        let handler = handler.clone();
+        let db_path = db_path.to_string();
+        let tenant_id = auth_context.tenant_id.clone();
+        let remote_peer_id = auth_context.remote_peer_id.clone();
+        let session_start = std::time::Instant::now();
+        let connection_id = connection.stable_id();
+        tokio::task::spawn_local(async move {
+            let session_ok = run_session(
+                &handler,
+                session.session_id,
+                session.io,
+                &tenant_id,
+                peer_fp,
+                session.remote_addr,
+                SessionDirection::Inbound,
+                &db_path,
+            )
+            .await;
+
+            info!(
+                "Inbound session {} on connection {} finished in {}ms peer={}",
+                session.session_id,
+                connection_id,
+                session_start.elapsed().as_millis(),
+                short_peer_id(&remote_peer_id)
+            );
+
+            if !session_ok {
+                tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
-        }
+        });
     }
 }
 
@@ -292,12 +352,6 @@ mod tests {
         run_startup_preflight(db_path.to_str().unwrap(), &tenants, ingest).unwrap();
 
         assert_eq!(DRAIN_CALLS.load(Ordering::Relaxed), tenants.len());
-    }
-
-    #[test]
-    fn fixed_tenant_resolver_always_returns_same_value() {
-        let resolver = SessionTenantResolver::Fixed("tenant-fixed".to_string());
-        assert_eq!(resolver.resolve("/tmp/does-not-matter"), "tenant-fixed");
     }
 
     #[test]

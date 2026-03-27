@@ -5,6 +5,7 @@
 
 use std::collections::HashMap;
 use std::net::SocketAddr;
+use std::sync::{Arc, Mutex};
 
 use rusqlite::OptionalExtension;
 use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
@@ -18,7 +19,7 @@ use crate::db::transport_trust::{
 use crate::protocol::{encode_frame, Frame};
 
 use super::connection_lifecycle::{
-    accept_peer, dial_peer, ConnectedPeer, ConnectionLifecycleError,
+    accept_daemon, dial_daemon, ConnectedDaemon, ConnectionLifecycleError,
 };
 use super::session_factory::{
     accept_session_io, open_dependency_session_io, open_session_io, InboundSessionState,
@@ -34,51 +35,60 @@ pub type TransportConnection = quinn::Connection;
 pub type TransportClientConfig = quinn::ClientConfig;
 pub type TenantClientConfigs = HashMap<String, TransportClientConfig>;
 
-#[derive(Clone, Copy)]
-enum SessionOpenMode {
-    Outbound,
-    Inbound,
-}
-
-/// Transport-owned provider for one long-lived sync control/data lane pair over
-/// one QUIC connection.
+/// Shared daemon-to-daemon QUIC connection that can both accept inbound
+/// logical sessions and open outbound logical sessions.
 ///
-/// Peering orchestration uses this to avoid touching stream-open details.
 #[derive(Clone)]
-pub struct SessionProvider {
+pub struct DaemonConnection {
     connection: TransportConnection,
-    /// Hex-encoded peer certificate SPKI fingerprint.
-    peer_id: String,
-    mode: SessionOpenMode,
+    remote_daemon_peer_id: String,
     inbound_state: InboundSessionState,
+    accepted_bootstrap_auth: AcceptedBootstrapAuthCache,
 }
 
-/// One ready-to-run sync connection scope from a [`SessionProvider`].
+#[derive(Clone, Default)]
+struct AcceptedBootstrapAuthCache {
+    inner: Arc<Mutex<HashMap<(String, String), String>>>,
+}
+
+/// One ready-to-run logical session scope from a [`DaemonConnection`].
 pub struct SessionEnvelope {
-    /// Hex-encoded peer certificate SPKI fingerprint.
-    pub peer_id: String,
+    /// Hex-encoded remote daemon certificate SPKI fingerprint.
+    pub remote_daemon_peer_id: String,
     pub remote_addr: SocketAddr,
     pub session_id: u64,
     pub class: SessionClass,
     pub io: Box<dyn TransportSessionIo>,
 }
 
-impl SessionProvider {
-    fn from_connected(connected: ConnectedPeer, mode: SessionOpenMode) -> Self {
+#[derive(Clone, Copy)]
+enum SessionProviderMode {
+    Initiator,
+    Acceptor,
+}
+
+#[derive(Clone)]
+pub struct SessionProvider {
+    daemon_connection: DaemonConnection,
+    mode: SessionProviderMode,
+}
+
+impl DaemonConnection {
+    fn from_connected(connected: ConnectedDaemon) -> Self {
         Self {
             connection: connected.connection,
-            peer_id: connected.peer_id,
-            mode,
+            remote_daemon_peer_id: connected.daemon_peer_id,
             inbound_state: InboundSessionState::default(),
+            accepted_bootstrap_auth: AcceptedBootstrapAuthCache::default(),
         }
     }
 
-    pub fn peer_id(&self) -> &str {
-        &self.peer_id
+    pub fn remote_daemon_peer_id(&self) -> &str {
+        &self.remote_daemon_peer_id
     }
 
-    pub fn transport_fingerprint(&self) -> &str {
-        &self.peer_id
+    pub fn peer_id(&self) -> &str {
+        self.remote_daemon_peer_id()
     }
 
     pub fn remote_addr(&self) -> SocketAddr {
@@ -89,28 +99,104 @@ impl SessionProvider {
         self.connection.clone()
     }
 
-    pub fn with_peer_id(mut self, peer_id: String) -> Self {
-        self.peer_id = peer_id;
-        self
+    pub fn remember_accepted_bootstrap_auth(
+        &self,
+        invite_event_id: &str,
+        source_peer_id: &str,
+        tenant_id: &str,
+    ) {
+        let mut cache = self
+            .accepted_bootstrap_auth
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cache.insert(
+            (invite_event_id.to_string(), source_peer_id.to_string()),
+            tenant_id.to_string(),
+        );
     }
 
-    pub async fn next_session(&self) -> Result<SessionEnvelope, SessionOpenError> {
-        let (session_id, class, io) = match self.mode {
-            SessionOpenMode::Outbound => {
-                let (session_id, io) = open_session_io(&self.connection).await?;
-                (session_id, SessionClass::Range, io)
-            }
-            SessionOpenMode::Inbound => {
-                accept_session_io(&self.connection, &self.inbound_state).await?
-            }
+    pub fn accepted_bootstrap_tenant(
+        &self,
+        invite_event_id: &str,
+        source_peer_id: &str,
+    ) -> Option<String> {
+        let cache = self
+            .accepted_bootstrap_auth
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cache
+            .get(&(invite_event_id.to_string(), source_peer_id.to_string()))
+            .cloned()
+    }
+
+    pub async fn open_outbound_session(
+        &self,
+        class: SessionClass,
+    ) -> Result<SessionEnvelope, SessionOpenError> {
+        let (session_id, io) = match class {
+            SessionClass::Range => open_session_io(&self.connection).await?,
+            SessionClass::Dependency => open_dependency_session_io(&self.connection).await?,
         };
         Ok(SessionEnvelope {
-            peer_id: self.peer_id.clone(),
+            remote_daemon_peer_id: self.remote_daemon_peer_id.clone(),
             remote_addr: self.connection.remote_address(),
             session_id,
             class,
             io,
         })
+    }
+
+    pub async fn accept_inbound_session(&self) -> Result<SessionEnvelope, SessionOpenError> {
+        let (session_id, class, io) = accept_session_io(&self.connection, &self.inbound_state).await?;
+        Ok(SessionEnvelope {
+            remote_daemon_peer_id: self.remote_daemon_peer_id.clone(),
+            remote_addr: self.connection.remote_address(),
+            session_id,
+            class,
+            io,
+        })
+    }
+
+    pub async fn next_session(&self) -> Result<SessionEnvelope, SessionOpenError> {
+        self.open_outbound_session(SessionClass::Range).await
+    }
+}
+
+impl SessionProvider {
+    fn new(daemon_connection: DaemonConnection, mode: SessionProviderMode) -> Self {
+        Self {
+            daemon_connection,
+            mode,
+        }
+    }
+
+    pub fn peer_id(&self) -> &str {
+        self.daemon_connection.peer_id()
+    }
+
+    pub fn remote_daemon_peer_id(&self) -> &str {
+        self.daemon_connection.remote_daemon_peer_id()
+    }
+
+    pub fn remote_addr(&self) -> SocketAddr {
+        self.daemon_connection.remote_addr()
+    }
+
+    pub fn connection(&self) -> TransportConnection {
+        self.daemon_connection.connection()
+    }
+
+    pub async fn next_session(&self) -> Result<SessionEnvelope, SessionOpenError> {
+        match self.mode {
+            SessionProviderMode::Initiator => {
+                self.daemon_connection
+                    .open_outbound_session(SessionClass::Range)
+                    .await
+            }
+            SessionProviderMode::Acceptor => self.daemon_connection.accept_inbound_session().await,
+        }
     }
 }
 
@@ -312,13 +398,48 @@ pub fn resolve_authorizing_tenant_from_db(
     resolve_authorizing_tenant(&db, &peer_fp)
 }
 
+pub async fn dial_daemon_peer(
+    endpoint: &TransportEndpoint,
+    remote: SocketAddr,
+    sni: &str,
+    client_config: Option<&TransportClientConfig>,
+) -> Result<ConnectedDaemon, ConnectionLifecycleError> {
+    dial_daemon(endpoint, remote, sni, client_config).await
+}
+
+pub async fn dial_daemon_connection(
+    endpoint: &TransportEndpoint,
+    remote: SocketAddr,
+    sni: &str,
+    client_config: Option<&TransportClientConfig>,
+) -> Result<DaemonConnection, ConnectionLifecycleError> {
+    let connected = dial_daemon_peer(endpoint, remote, sni, client_config).await?;
+    Ok(DaemonConnection::from_connected(connected))
+}
+
+pub async fn accept_daemon_peer(
+    endpoint: &TransportEndpoint,
+) -> Result<Option<ConnectedDaemon>, ConnectionLifecycleError> {
+    accept_daemon(endpoint).await
+}
+
+pub async fn accept_daemon_connection(
+    endpoint: &TransportEndpoint,
+) -> Result<Option<DaemonConnection>, ConnectionLifecycleError> {
+    let connected = match accept_daemon_peer(endpoint).await? {
+        Some(c) => c,
+        None => return Ok(None),
+    };
+    Ok(Some(DaemonConnection::from_connected(connected)))
+}
+
 pub async fn dial_session_peer(
     endpoint: &TransportEndpoint,
     remote: SocketAddr,
     sni: &str,
     client_config: Option<&TransportClientConfig>,
-) -> Result<ConnectedPeer, ConnectionLifecycleError> {
-    dial_peer(endpoint, remote, sni, client_config).await
+) -> Result<ConnectedDaemon, ConnectionLifecycleError> {
+    dial_daemon_peer(endpoint, remote, sni, client_config).await
 }
 
 pub async fn dial_session_provider(
@@ -327,60 +448,61 @@ pub async fn dial_session_provider(
     sni: &str,
     client_config: Option<&TransportClientConfig>,
 ) -> Result<SessionProvider, ConnectionLifecycleError> {
-    let connected = dial_session_peer(endpoint, remote, sni, client_config).await?;
-    Ok(SessionProvider::from_connected(
-        connected,
-        SessionOpenMode::Outbound,
-    ))
+    dial_daemon_connection(endpoint, remote, sni, client_config)
+        .await
+        .map(|daemon_connection| SessionProvider::new(daemon_connection, SessionProviderMode::Initiator))
 }
 
 pub async fn accept_session_peer(
     endpoint: &TransportEndpoint,
-) -> Result<Option<ConnectedPeer>, ConnectionLifecycleError> {
-    accept_peer(endpoint).await
+) -> Result<Option<ConnectedDaemon>, ConnectionLifecycleError> {
+    accept_daemon_peer(endpoint).await
 }
 
 pub async fn accept_session_provider(
     endpoint: &TransportEndpoint,
 ) -> Result<Option<SessionProvider>, ConnectionLifecycleError> {
-    let connected = match accept_session_peer(endpoint).await? {
-        Some(c) => c,
-        None => return Ok(None),
-    };
-    Ok(Some(SessionProvider::from_connected(
-        connected,
-        SessionOpenMode::Inbound,
-    )))
+    accept_daemon_connection(endpoint)
+        .await
+        .map(|maybe_connection| {
+            maybe_connection.map(|daemon_connection| {
+                SessionProvider::new(daemon_connection, SessionProviderMode::Acceptor)
+            })
+        })
 }
 
-pub fn outbound_session_provider_for_connection(
+pub fn shared_daemon_connection_for_connection(
     connection: TransportConnection,
-    peer_id: String,
-) -> SessionProvider {
-    SessionProvider {
+    remote_daemon_peer_id: String,
+) -> DaemonConnection {
+    DaemonConnection {
         connection,
-        peer_id,
-        mode: SessionOpenMode::Outbound,
+        remote_daemon_peer_id,
         inbound_state: InboundSessionState::default(),
+        accepted_bootstrap_auth: AcceptedBootstrapAuthCache::default(),
     }
 }
 
 pub async fn open_outbound_session(
-    conn: &TransportConnection,
+    conn: &DaemonConnection,
 ) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError> {
-    open_session_io(conn).await
+    let session = conn.open_outbound_session(SessionClass::Range).await?;
+    Ok((session.session_id, session.io))
 }
 
 pub async fn open_outbound_dependency_session(
-    conn: &TransportConnection,
+    conn: &DaemonConnection,
 ) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError> {
-    open_dependency_session_io(conn).await
+    let session = conn.open_outbound_session(SessionClass::Dependency).await?;
+    Ok((session.session_id, session.io))
 }
 
 pub async fn open_inbound_session(
-    conn: &TransportConnection,
+    conn: &DaemonConnection,
 ) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError> {
-    let (session_id, _class, io) = accept_session_io(conn, &InboundSessionState::default()).await?;
+    let session = conn.accept_inbound_session().await?;
+    let session_id = session.session_id;
+    let io = session.io;
     Ok((session_id, io))
 }
 
@@ -695,8 +817,8 @@ mod tests {
         );
         let accepted = accepted_res.expect("accept").expect("accepted");
         let dialed = dialed_res.expect("dial");
-        assert_eq!(accepted.peer_id, client_peer_id);
-        assert_eq!(dialed.peer_id, server_peer_id);
+        assert_eq!(accepted.daemon_peer_id, client_peer_id);
+        assert_eq!(dialed.daemon_peer_id, server_peer_id);
 
         let intro = Frame::IntroOffer {
             intro_id: [0x11; 16],

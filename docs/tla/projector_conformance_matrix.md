@@ -262,9 +262,9 @@ both `pass` and `break` polarity unless waived.
 | SPEC_BR_ALLOWED_AUTH_01 | BrInv_AllowedPeerMatchesAuthDecision | CHK_BRIDGE_ALLOWED_PEER_AUTH | runtime_unit | state::db::transport_trust::tests::test_is_authorized_for_tenant_checks_all_sources | pass |
 | SPEC_BR_ALLOWED_AUTH_01 | BrInv_AllowedPeerMatchesAuthDecision | CHK_BRIDGE_ALLOWED_PEER_AUTH | runtime_unit | state::db::transport_trust::tests::test_is_authorized_for_tenant_checks_all_sources | break |
 | SPEC_BR_ONGOING_PREF_01 | BrInv_OngoingPreferred | CHK_BRIDGE_ONGOING_PREFERENCE | runtime_unit | bootstrap_dial_context::tests::primary_success_is_ongoing_mode | pass |
-| SPEC_BR_ONGOING_PREF_01 | BrInv_OngoingPreferred | CHK_BRIDGE_ONGOING_PREFERENCE | runtime_unit | connect::tests::fallback_policy_allows_typed_trust_rejection_with_fallback_cfg | break |
-| SPEC_BR_FALLBACK_01 | BrInv_BootstrapFallbackOnlyWhenNeeded | CHK_BRIDGE_BOOTSTRAP_FALLBACK | runtime_unit | connect::tests::fallback_policy_allows_typed_trust_rejection_with_fallback_cfg | pass |
-| SPEC_BR_FALLBACK_01 | BrInv_BootstrapFallbackOnlyWhenNeeded | CHK_BRIDGE_BOOTSTRAP_FALLBACK | runtime_unit | connect::tests::fallback_policy_denies_generic_dial_errors | break |
+| SPEC_BR_ONGOING_PREF_01 | BrInv_OngoingPreferred | CHK_BRIDGE_ONGOING_PREFERENCE | runtime_unit | bootstrap_dial_context::tests::trust_rejection_with_fallback_uses_bootstrap_mode | break |
+| SPEC_BR_FALLBACK_01 | BrInv_BootstrapFallbackOnlyWhenNeeded | CHK_BRIDGE_BOOTSTRAP_FALLBACK | runtime_unit | bootstrap_dial_context::tests::trust_rejection_with_fallback_uses_bootstrap_mode | pass |
+| SPEC_BR_FALLBACK_01 | BrInv_BootstrapFallbackOnlyWhenNeeded | CHK_BRIDGE_BOOTSTRAP_FALLBACK | runtime_unit | bootstrap_dial_context::tests::non_trust_errors_do_not_use_fallback | break |
 | SPEC_BR_CTX_DET_01 | BrInv_BootstrapContextDeterministic | CHK_BRIDGE_BOOTSTRAP_CTX_DETERMINISM | runtime_unit | bootstrap_dial_context::tests::decision_is_deterministic_for_same_inputs | pass |
 | SPEC_BR_CTX_DET_01 | BrInv_BootstrapContextDeterministic | CHK_BRIDGE_BOOTSTRAP_CTX_DETERMINISM | runtime_unit | bootstrap_dial_context::tests::non_trust_errors_do_not_use_fallback | break |
 | SPEC_BR_SEC_CONN_01 | BrSec_ConnectionRequiresAuthorization | CHK_BRIDGE_SEC_CONN_AUTHZ | bridge_integration | tlc::UnifiedBridge::unified_bridge_fix_repro.cfg | pass |

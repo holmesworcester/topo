@@ -8,6 +8,7 @@ use crate::crypto::{
     verify_ed25519_signature,
 };
 use crate::db::open_connection;
+use crate::contracts::peering_contract::TransportSessionIo;
 use crate::db::transport_trust::is_authorized_for_tenant;
 use crate::event_modules::{parse_event, ParsedEvent};
 use crate::protocol::{
@@ -15,7 +16,7 @@ use crate::protocol::{
     OpenSessionAuthPeerShared,
 };
 
-use super::{load_daemon_identity_from_db, peer_identity_from_connection};
+use super::{load_daemon_identity_from_db, DaemonConnection};
 
 pub const MAX_SESSION_AUTH_TTL_MS: u64 = 5 * 60 * 1000;
 const SESSION_AUTH_CLOCK_SKEW_MS: u64 = 30 * 1000;
@@ -200,54 +201,77 @@ fn load_peer_shared_signer_public_key(
     Ok(key_arr)
 }
 
-fn resolve_pending_bootstrap_tenant(
+fn resolve_bootstrap_session_tenant(
     conn: &Connection,
     invite_event_id_b64: &str,
+    remote_daemon_peer_id: &[u8; 32],
 ) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
     let now = now_ms()? as i64;
-    let mut stmt = conn.prepare(
+    let mut tenant_ids = {
+        let mut stmt = conn.prepare(
+            "SELECT recorded_by
+             FROM pending_invite_bootstrap_trust
+             WHERE invite_event_id = ?1
+               AND expires_at > ?2",
+        )?;
+        let rows = stmt
+            .query_map(params![invite_event_id_b64, now], |row| row.get::<_, String>(0))?
+            .collect::<Result<Vec<_>, _>>()?;
+        rows
+    };
+
+    let mut accepted_stmt = conn.prepare(
         "SELECT recorded_by
-         FROM pending_invite_bootstrap_trust
+         FROM invite_bootstrap_trust
          WHERE invite_event_id = ?1
-           AND expires_at > ?2
-         ORDER BY recorded_by ASC",
+           AND bootstrap_spki_fingerprint = ?2
+           AND expires_at > ?3",
     )?;
-    let tenant_ids = stmt
-        .query_map(params![invite_event_id_b64, now], |row| {
-            row.get::<_, String>(0)
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    tenant_ids.extend(
+        accepted_stmt
+            .query_map(
+                params![invite_event_id_b64, remote_daemon_peer_id.as_slice(), now],
+                |row| row.get::<_, String>(0),
+            )?
+            .collect::<Result<Vec<_>, _>>()?,
+    );
+    tenant_ids.sort();
+    tenant_ids.dedup();
+
     match tenant_ids.as_slice() {
         [] => Err(format!(
-            "no active pending bootstrap trust for invite {}",
-            invite_event_id_b64
+            "no active bootstrap trust for invite {} and daemon {}",
+            invite_event_id_b64,
+            hex::encode(remote_daemon_peer_id)
         )
         .into()),
         [tenant_id] => Ok(tenant_id.clone()),
         _ => Err(format!(
-            "invite {} resolves to multiple local tenants; bootstrap auth is ambiguous",
-            invite_event_id_b64
+            "invite {} and daemon {} resolve to multiple local tenants; bootstrap auth is ambiguous",
+            invite_event_id_b64,
+            hex::encode(remote_daemon_peer_id)
         )
         .into()),
     }
 }
 
 async fn send_auth_frame(
-    conn: &quinn::Connection,
+    io: &mut dyn TransportSessionIo,
     frame: &Frame,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let encoded = encode_frame(frame);
-    let mut send = conn.open_uni().await?;
-    send.write_all(&encoded).await?;
-    send.finish()?;
+    io.send_control_frame(&encoded).await?;
+    io.flush_control().await?;
     Ok(())
 }
 
 async fn read_auth_ack(
-    conn: &quinn::Connection,
+    io: &mut dyn TransportSessionIo,
 ) -> Result<OpenSessionAuthAck, Box<dyn std::error::Error + Send + Sync>> {
-    let mut recv = conn.accept_uni().await?;
-    let bytes = recv.read_to_end(MAX_SESSION_AUTH_FRAME_BYTES).await?;
+    let previous_recv_limit = io.swap_control_recv_limit(MAX_SESSION_AUTH_FRAME_BYTES);
+    let bytes = io.recv_control_frame().await;
+    io.swap_control_recv_limit(previous_recv_limit);
+    let bytes = bytes?;
     let (frame, consumed) = parse_frame(&bytes)?;
     if consumed != bytes.len() {
         return Err("session auth ack frame contained trailing bytes".into());
@@ -259,12 +283,12 @@ async fn read_auth_ack(
 }
 
 pub(crate) async fn send_inbound_session_auth_ack(
-    conn: &quinn::Connection,
+    io: &mut dyn TransportSessionIo,
     tenant_id: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let target_tenant_id = decode_hex32(tenant_id, "tenant_id")?;
     send_auth_frame(
-        conn,
+        io,
         &Frame::OpenSessionAuthAck {
             ack: OpenSessionAuthAck { target_tenant_id },
         },
@@ -273,14 +297,13 @@ pub(crate) async fn send_inbound_session_auth_ack(
 }
 
 pub async fn send_outbound_session_auth(
-    conn: &quinn::Connection,
+    io: &mut dyn TransportSessionIo,
     db_path: &str,
     recorded_by: &str,
+    actual_remote_daemon_peer_id: &str,
     expected_remote_daemon_peer_id: Option<&str>,
     plan: &OutboundSessionAuthPlan,
 ) -> Result<OutboundSessionAuthResult, Box<dyn std::error::Error + Send + Sync>> {
-    let actual_remote_daemon_peer_id =
-        peer_identity_from_connection(conn).ok_or("missing remote daemon identity from TLS")?;
     if let Some(expected) = expected_remote_daemon_peer_id {
         if expected != actual_remote_daemon_peer_id {
             return Err(format!(
@@ -325,8 +348,8 @@ pub async fn send_outbound_session_auth(
             };
             let signing_bytes = encode_peer_shared_signing_bytes(&auth);
             auth.signature = sign_event_bytes(&signing_key, &signing_bytes);
-            send_auth_frame(conn, &Frame::OpenSessionAuthPeerShared { auth }).await?;
-            let ack = read_auth_ack(conn).await?;
+            send_auth_frame(io, &Frame::OpenSessionAuthPeerShared { auth }).await?;
+            let ack = read_auth_ack(io).await?;
             let ack_target_tenant_id = hex::encode(ack.target_tenant_id);
             if ack_target_tenant_id != *target_peer_id {
                 return Err(format!(
@@ -338,7 +361,7 @@ pub async fn send_outbound_session_auth(
             Ok(OutboundSessionAuthResult {
                 session_peer_id: ack_target_tenant_id.clone(),
                 canonical_remote_peer_id: Some(ack_target_tenant_id),
-                remote_daemon_peer_id: actual_remote_daemon_peer_id,
+                remote_daemon_peer_id: actual_remote_daemon_peer_id.to_string(),
                 used_bootstrap_auth: false,
             })
         }
@@ -364,32 +387,34 @@ pub async fn send_outbound_session_auth(
             };
             let signing_bytes = encode_invite_signing_bytes(&auth);
             auth.signature = sign_event_bytes(&invite_signing_key, &signing_bytes);
-            send_auth_frame(conn, &Frame::OpenSessionAuthInvite { auth }).await?;
-            let ack = read_auth_ack(conn).await?;
+            send_auth_frame(io, &Frame::OpenSessionAuthInvite { auth }).await?;
+            let ack = read_auth_ack(io).await?;
             let canonical_remote_peer_id = hex::encode(ack.target_tenant_id);
             Ok(OutboundSessionAuthResult {
                 session_peer_id: canonical_remote_peer_id.clone(),
                 canonical_remote_peer_id: Some(canonical_remote_peer_id),
-                remote_daemon_peer_id: actual_remote_daemon_peer_id,
+                remote_daemon_peer_id: actual_remote_daemon_peer_id.to_string(),
                 used_bootstrap_auth: true,
             })
         }
     }
 }
 
-pub async fn read_inbound_session_auth(
-    conn: &quinn::Connection,
+async fn read_inbound_session_auth_inner(
+    io: &mut dyn TransportSessionIo,
     db_path: &str,
+    actual_remote_daemon_peer_id: &str,
+    daemon_connection: Option<&DaemonConnection>,
 ) -> Result<InboundSessionAuthContext, Box<dyn std::error::Error + Send + Sync>> {
-    let mut recv = conn.accept_uni().await?;
-    let bytes = recv.read_to_end(MAX_SESSION_AUTH_FRAME_BYTES).await?;
+    let previous_recv_limit = io.swap_control_recv_limit(MAX_SESSION_AUTH_FRAME_BYTES);
+    let bytes = io.recv_control_frame().await;
+    io.swap_control_recv_limit(previous_recv_limit);
+    let bytes = bytes?;
     let (frame, consumed) = parse_frame(&bytes)?;
     if consumed != bytes.len() {
         return Err("session auth frame contained trailing bytes".into());
     }
 
-    let actual_remote_daemon_peer_id =
-        peer_identity_from_connection(conn).ok_or("missing remote daemon identity from TLS")?;
     let actual_remote_daemon_peer_id_raw =
         decode_hex32(&actual_remote_daemon_peer_id, "remote daemon peer id")?;
     let (local_daemon_peer_id, _cert, _key) = load_daemon_identity_from_db(db_path)?;
@@ -428,7 +453,7 @@ pub async fn read_inbound_session_auth(
             Ok(InboundSessionAuthContext {
                 tenant_id,
                 remote_peer_id,
-                remote_daemon_peer_id: actual_remote_daemon_peer_id,
+                remote_daemon_peer_id: actual_remote_daemon_peer_id.to_string(),
                 used_bootstrap_auth: false,
             })
         }
@@ -448,21 +473,62 @@ pub async fn read_inbound_session_auth(
                 );
             }
             let invite_event_id_b64 = event_id_to_base64(&auth.target_invite_event_id);
-            let tenant_id = resolve_pending_bootstrap_tenant(&db, &invite_event_id_b64)?;
+            let remote_peer_id = hex::encode(auth.source_peer_id);
+            let tenant_id = match resolve_bootstrap_session_tenant(
+                &db,
+                &invite_event_id_b64,
+                &actual_remote_daemon_peer_id_raw,
+            ) {
+                Ok(tenant_id) => tenant_id,
+                Err(err) => daemon_connection
+                    .and_then(|conn| {
+                        conn.accepted_bootstrap_tenant(&invite_event_id_b64, &remote_peer_id)
+                    })
+                    .ok_or(err)?,
+            };
             let invite_public_key = load_invite_public_key(&db, &invite_event_id_b64)?;
             let signing_bytes = encode_invite_signing_bytes(&auth);
             if !verify_ed25519_signature(&invite_public_key, &signing_bytes, &auth.signature) {
                 return Err("session auth invite signature verification failed".into());
             }
+            if let Some(conn) = daemon_connection {
+                conn.remember_accepted_bootstrap_auth(
+                    &invite_event_id_b64,
+                    &remote_peer_id,
+                    &tenant_id,
+                );
+            }
             Ok(InboundSessionAuthContext {
                 tenant_id,
-                remote_peer_id: hex::encode(auth.source_peer_id),
-                remote_daemon_peer_id: actual_remote_daemon_peer_id,
+                remote_peer_id,
+                remote_daemon_peer_id: actual_remote_daemon_peer_id.to_string(),
                 used_bootstrap_auth: true,
             })
         }
         other => Err(format!("expected session auth frame, got {other:?}").into()),
     }
+}
+
+pub async fn read_inbound_session_auth(
+    io: &mut dyn TransportSessionIo,
+    db_path: &str,
+    actual_remote_daemon_peer_id: &str,
+) -> Result<InboundSessionAuthContext, Box<dyn std::error::Error + Send + Sync>> {
+    read_inbound_session_auth_inner(io, db_path, actual_remote_daemon_peer_id, None).await
+}
+
+pub async fn read_inbound_session_auth_for_connection(
+    io: &mut dyn TransportSessionIo,
+    db_path: &str,
+    daemon_connection: &DaemonConnection,
+) -> Result<InboundSessionAuthContext, Box<dyn std::error::Error + Send + Sync>> {
+    read_inbound_session_auth_inner(
+        io,
+        db_path,
+        daemon_connection.remote_daemon_peer_id(),
+        Some(daemon_connection),
+    )
+    .await
 }
 
 pub fn resolve_bound_daemon_peer_id(
@@ -488,6 +554,101 @@ pub fn resolve_bound_daemon_peer_id(
             hex::encode(arr)
         })
     }))
+}
+
+fn has_active_local_bootstrap_session_auth(
+    conn: &Connection,
+    recorded_by: &str,
+    invite_event_id_b64: &str,
+    actual_remote_daemon_peer_id: &str,
+) -> Result<bool, Box<dyn std::error::Error + Send + Sync>> {
+    let now = now_ms()? as i64;
+    let remote_daemon_peer_id = decode_hex32(
+        actual_remote_daemon_peer_id,
+        "actual remote daemon peer id",
+    )?;
+    let has_pending: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM pending_invite_bootstrap_trust
+             WHERE recorded_by = ?1
+               AND invite_event_id = ?2
+               AND expires_at > ?3
+         )",
+        params![recorded_by, invite_event_id_b64, now],
+        |row| row.get(0),
+    )?;
+    if has_pending {
+        return Ok(true);
+    }
+
+    let has_accepted: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM invite_bootstrap_trust
+             WHERE recorded_by = ?1
+               AND invite_event_id = ?2
+               AND bootstrap_spki_fingerprint = ?3
+               AND expires_at > ?4
+         )",
+        params![
+            recorded_by,
+            invite_event_id_b64,
+            remote_daemon_peer_id.as_slice(),
+            now
+        ],
+        |row| row.get(0),
+    )?;
+    Ok(has_accepted)
+}
+
+pub fn resolve_outbound_session_auth_plan(
+    conn: &Connection,
+    recorded_by: &str,
+    remote_session_peer_id: &str,
+    actual_remote_daemon_peer_id: &str,
+    requested_plan: &OutboundSessionAuthPlan,
+) -> Result<OutboundSessionAuthPlan, Box<dyn std::error::Error + Send + Sync>> {
+    match requested_plan {
+        OutboundSessionAuthPlan::PeerShared { .. } => Ok(requested_plan.clone()),
+        OutboundSessionAuthPlan::InviteBootstrap { invite_event_id } => {
+            if has_active_local_bootstrap_session_auth(
+                conn,
+                recorded_by,
+                invite_event_id,
+                actual_remote_daemon_peer_id,
+            )? {
+                return Ok(requested_plan.clone());
+            }
+
+            let Some(bound_daemon_peer_id) =
+                resolve_bound_daemon_peer_id(conn, recorded_by, remote_session_peer_id)?
+            else {
+                return Ok(requested_plan.clone());
+            };
+            if bound_daemon_peer_id != actual_remote_daemon_peer_id {
+                return Ok(requested_plan.clone());
+            }
+
+            let Ok(remote_session_peer_id_raw) =
+                decode_hex32(remote_session_peer_id, "remote session peer id")
+            else {
+                return Ok(requested_plan.clone());
+            };
+            if !is_authorized_for_tenant(conn, recorded_by, &remote_session_peer_id_raw)? {
+                return Ok(requested_plan.clone());
+            }
+            if crate::event_modules::peer_shared::load_local_peer_signer_required(conn, recorded_by)
+                .is_ok()
+            {
+                Ok(OutboundSessionAuthPlan::PeerShared {
+                    target_peer_id: remote_session_peer_id.to_string(),
+                })
+            } else {
+                Ok(requested_plan.clone())
+            }
+        }
+    }
 }
 
 pub fn resolve_bootstrap_inviter_peer_id(
@@ -571,8 +732,13 @@ mod tests {
     use crate::crypto::{event_id_to_base64, spki_fingerprint_from_ed25519_pubkey};
     use crate::db::open_connection;
     use crate::db::schema::create_tables;
+    use crate::db::transport_trust::{
+        record_invite_bootstrap_trust, record_pending_invite_bootstrap_trust,
+        record_transport_binding,
+    };
+    use crate::event_modules::{encode_event, ParsedEvent, UserInviteEvent};
     use crate::transport::{
-        accept_session_provider, dial_session_provider, extract_spki_fingerprint,
+        accept_daemon_connection, dial_daemon_connection, extract_spki_fingerprint,
         generate_self_signed_cert, COVER_SERVER_NAME,
     };
 
@@ -645,6 +811,43 @@ mod tests {
         .expect("insert peers_shared auth row");
     }
 
+    fn insert_event_blob(
+        db_path: &str,
+        event_id_b64: &str,
+        event_type: &str,
+        blob: Vec<u8>,
+    ) {
+        let db = open_connection(db_path).expect("open events db");
+        db.execute(
+            "INSERT INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![event_id_b64, event_type, blob, "shared", 1_i64, 1_i64],
+        )
+        .expect("insert event blob");
+    }
+
+    fn insert_invite_secret(
+        db_path: &str,
+        recorded_by: &str,
+        invite_event_id_b64: &str,
+        private_key: [u8; 32],
+    ) {
+        let db = open_connection(db_path).expect("open invite secret db");
+        db.execute(
+            "INSERT INTO invite_secrets
+             (recorded_by, event_id, invite_event_id, private_key, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            params![
+                recorded_by,
+                format!("invite-secret-{invite_event_id_b64}"),
+                invite_event_id_b64,
+                private_key.to_vec(),
+                1_i64
+            ],
+        )
+        .expect("insert invite secret");
+    }
+
     async fn connect_test_daemons(
         server_cert: CertificateDer<'static>,
         server_key: PrivatePkcs8KeyDer<'static>,
@@ -654,8 +857,8 @@ mod tests {
         (
             quinn::Endpoint,
             quinn::Endpoint,
-            quinn::Connection,
-            quinn::Connection,
+            crate::transport::DaemonConnection,
+            crate::transport::DaemonConnection,
             SocketAddr,
         ),
         Box<dyn std::error::Error + Send + Sync>,
@@ -673,8 +876,8 @@ mod tests {
         let client_cfg = workspace_client_config_with_identity(client_cert, client_key)?;
         let server_addr = server_ep.local_addr()?;
         let (accepted, dialed) = tokio::join!(
-            accept_session_provider(&server_ep),
-            dial_session_provider(
+            accept_daemon_connection(&server_ep),
+            dial_daemon_connection(
                 &client_ep,
                 server_addr,
                 COVER_SERVER_NAME,
@@ -686,8 +889,8 @@ mod tests {
         Ok((
             server_ep,
             client_ep,
-            accepted.connection(),
-            dialed.connection(),
+            accepted,
+            dialed,
             server_addr,
         ))
     }
@@ -734,27 +937,39 @@ mod tests {
             &source_peer_id_raw,
         );
 
-        let (_server_ep, _client_ep, server_conn, client_conn, _server_addr) =
+        let (_server_ep, _client_ep, server_daemon, client_daemon, _server_addr) =
             connect_test_daemons(server_cert, server_key, client_cert, client_key)
                 .await
                 .expect("connect daemon endpoints");
+        let (server_session_res, client_session_res) = tokio::join!(
+            server_daemon.accept_inbound_session(),
+            client_daemon.open_outbound_session(crate::transport::SessionClass::Range)
+        );
+        let mut server_session = server_session_res.expect("accept inbound session");
+        let mut client_session = client_session_res.expect("open outbound session");
 
         let auth_plan = OutboundSessionAuthPlan::PeerShared {
             target_peer_id: target_tenant_id.clone(),
         };
         let (outbound, inbound) = tokio::join!(
             send_outbound_session_auth(
-                &client_conn,
+                client_session.io.as_mut(),
                 client_db_path.to_str().unwrap(),
                 &source_peer_id,
+                client_daemon.remote_daemon_peer_id(),
                 Some(&server_daemon_peer_id),
                 &auth_plan,
             ),
             async {
                 let inbound =
-                    read_inbound_session_auth(&server_conn, server_db_path.to_str().unwrap())
-                        .await?;
-                send_inbound_session_auth_ack(&server_conn, &inbound.tenant_id).await?;
+                    read_inbound_session_auth(
+                        server_session.io.as_mut(),
+                        server_db_path.to_str().unwrap(),
+                        server_daemon.remote_daemon_peer_id(),
+                    )
+                    .await?;
+                send_inbound_session_auth_ack(server_session.io.as_mut(), &inbound.tenant_id)
+                    .await?;
                 Ok::<_, Box<dyn std::error::Error + Send + Sync>>(inbound)
             },
         );
@@ -817,27 +1032,41 @@ mod tests {
             &source_peer_id_raw,
         );
 
-        let (_server_ep, _client_ep, server_conn, client_conn, _server_addr) =
+        let (_server_ep, _client_ep, server_daemon, client_daemon, _server_addr) =
             connect_test_daemons(server_cert, server_key, client_cert, client_key)
                 .await
                 .expect("connect daemon endpoints");
+        let (server_session_res, client_session_res) = tokio::join!(
+            server_daemon.accept_inbound_session(),
+            client_daemon.open_outbound_session(crate::transport::SessionClass::Range)
+        );
+        let mut server_session = server_session_res.expect("accept inbound session");
+        let mut client_session = client_session_res.expect("open outbound session");
 
         let auth_plan = OutboundSessionAuthPlan::PeerShared {
             target_peer_id: requested_tenant_id.clone(),
         };
         let (outbound, inbound) = tokio::join!(
             send_outbound_session_auth(
-                &client_conn,
+                client_session.io.as_mut(),
                 client_db_path.to_str().unwrap(),
                 &source_peer_id,
+                client_daemon.remote_daemon_peer_id(),
                 Some(&server_daemon_peer_id),
                 &auth_plan,
             ),
             async {
                 let inbound =
-                    read_inbound_session_auth(&server_conn, server_db_path.to_str().unwrap()).await;
+                    read_inbound_session_auth(
+                        server_session.io.as_mut(),
+                        server_db_path.to_str().unwrap(),
+                        server_daemon.remote_daemon_peer_id(),
+                    )
+                    .await;
                 if inbound.is_err() {
-                    server_conn.close(1u32.into(), b"expected auth rejection");
+                    server_daemon
+                        .connection()
+                        .close(1u32.into(), b"expected auth rejection");
                 }
                 inbound
             },
@@ -847,7 +1076,8 @@ mod tests {
             outbound_err.to_string().contains("expected auth rejection")
                 || outbound_err
                     .to_string()
-                    .contains("Connection lost while waiting for peer"),
+                    .contains("Connection lost while waiting for peer")
+                || outbound_err.to_string().contains("connection lost"),
             "unexpected outbound auth error: {outbound_err}"
         );
         let err = inbound.expect_err("wrong target tenant must be rejected");
@@ -855,5 +1085,383 @@ mod tests {
             err.to_string().contains("is not projected in tenant"),
             "unexpected auth error: {err}"
         );
+    }
+
+    #[test]
+    fn resolve_outbound_session_auth_plan_keeps_bootstrap_without_peer_shared_authorization() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("client.sqlite3");
+        let (cert, key) = generate_self_signed_cert().unwrap();
+        let _daemon_peer_id =
+            store_test_daemon_identity(db_path.to_str().unwrap(), &cert, &key);
+
+        let recorded_by = hex::encode([0x11; 32]);
+        let remote_session_peer_id = hex::encode([0x22; 32]);
+        let remote_daemon_peer_id = hex::encode([0x33; 32]);
+        let db = open_connection(db_path.to_str().unwrap()).unwrap();
+        record_transport_binding(
+            &db,
+            &recorded_by,
+            &remote_session_peer_id,
+            &[0x33; 32],
+        )
+        .unwrap();
+
+        let plan = resolve_outbound_session_auth_plan(
+            &db,
+            &recorded_by,
+            &remote_session_peer_id,
+            &remote_daemon_peer_id,
+            &OutboundSessionAuthPlan::InviteBootstrap {
+                invite_event_id: "invite".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan,
+            OutboundSessionAuthPlan::InviteBootstrap {
+                invite_event_id: "invite".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_outbound_session_auth_plan_upgrades_after_binding_auth_and_local_signer_exist() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("client.sqlite3");
+        let (cert, key) = generate_self_signed_cert().unwrap();
+        let _daemon_peer_id =
+            store_test_daemon_identity(db_path.to_str().unwrap(), &cert, &key);
+
+        let local_signing_key = SigningKey::from_bytes(&[0x44; 32]);
+        let local_public_key = local_signing_key.verifying_key().to_bytes();
+        let recorded_by_raw = spki_fingerprint_from_ed25519_pubkey(&local_public_key);
+        let recorded_by = hex::encode(recorded_by_raw);
+        let signer_event_id = [0x55; 32];
+        let remote_session_peer_id = hex::encode([0x66; 32]);
+        let remote_daemon_peer_id = hex::encode([0x77; 32]);
+
+        insert_local_peer_secret(
+            db_path.to_str().unwrap(),
+            &recorded_by,
+            &signer_event_id,
+            &local_signing_key,
+        );
+        insert_authorized_peer_shared(
+            db_path.to_str().unwrap(),
+            &recorded_by,
+            &signer_event_id,
+            &local_public_key,
+            &recorded_by_raw,
+        );
+        insert_authorized_peer_shared(
+            db_path.to_str().unwrap(),
+            &recorded_by,
+            &[0x88; 32],
+            &[0x88; 32],
+            &[0x66; 32],
+        );
+
+        let db = open_connection(db_path.to_str().unwrap()).unwrap();
+        record_transport_binding(
+            &db,
+            &recorded_by,
+            &remote_session_peer_id,
+            &[0x77; 32],
+        )
+        .unwrap();
+
+        let plan = resolve_outbound_session_auth_plan(
+            &db,
+            &recorded_by,
+            &remote_session_peer_id,
+            &remote_daemon_peer_id,
+            &OutboundSessionAuthPlan::InviteBootstrap {
+                invite_event_id: "invite".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan,
+            OutboundSessionAuthPlan::PeerShared {
+                target_peer_id: remote_session_peer_id,
+            }
+        );
+    }
+
+    #[tokio::test]
+    async fn invite_bootstrap_auth_stays_valid_for_later_sessions_on_same_daemon_connection() {
+        let server_temp = tempfile::tempdir().unwrap();
+        let client_temp = tempfile::tempdir().unwrap();
+        let server_db_path = server_temp.path().join("server.sqlite3");
+        let client_db_path = client_temp.path().join("client.sqlite3");
+
+        let (server_cert, server_key) = generate_self_signed_cert().unwrap();
+        let (client_cert, client_key) = generate_self_signed_cert().unwrap();
+        let server_daemon_peer_id =
+            store_test_daemon_identity(server_db_path.to_str().unwrap(), &server_cert, &server_key);
+        let client_daemon_peer_id =
+            store_test_daemon_identity(client_db_path.to_str().unwrap(), &client_cert, &client_key);
+
+        let source_signing_key = SigningKey::from_bytes(&[0x31; 32]);
+        let source_public_key = source_signing_key.verifying_key().to_bytes();
+        let source_peer_id_raw = spki_fingerprint_from_ed25519_pubkey(&source_public_key);
+        let source_peer_id = hex::encode(source_peer_id_raw);
+        let signer_event_id = [0x32; 32];
+        let target_tenant_id = hex::encode([0x33; 32]);
+
+        let invite_signing_key = SigningKey::from_bytes(&[0x41; 32]);
+        let invite_event_id_raw = [0x42; 32];
+        let invite_event_id_b64 = event_id_to_base64(&invite_event_id_raw);
+        let invite_blob = encode_event(&ParsedEvent::UserInvite(UserInviteEvent {
+            created_at_ms: 1,
+            public_key: invite_signing_key.verifying_key().to_bytes(),
+            workspace_id: [0x43; 32],
+            authority_event_id: [0x44; 32],
+            signed_by: [0x45; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
+        }))
+        .expect("encode invite");
+
+        insert_local_peer_secret(
+            client_db_path.to_str().unwrap(),
+            &source_peer_id,
+            &signer_event_id,
+            &source_signing_key,
+        );
+        insert_event_blob(
+            client_db_path.to_str().unwrap(),
+            &invite_event_id_b64,
+            "user_invite_shared",
+            invite_blob.clone(),
+        );
+        insert_event_blob(
+            server_db_path.to_str().unwrap(),
+            &invite_event_id_b64,
+            "user_invite_shared",
+            invite_blob,
+        );
+        insert_invite_secret(
+            client_db_path.to_str().unwrap(),
+            &source_peer_id,
+            &invite_event_id_b64,
+            invite_signing_key.to_bytes(),
+        );
+
+        let server_db = open_connection(server_db_path.to_str().unwrap()).unwrap();
+        record_pending_invite_bootstrap_trust(
+            &server_db,
+            &target_tenant_id,
+            &invite_event_id_b64,
+            "workspace",
+            &source_peer_id_raw,
+        )
+        .unwrap();
+        drop(server_db);
+
+        let (_server_ep, _client_ep, server_daemon, client_daemon, _server_addr) =
+            connect_test_daemons(server_cert, server_key, client_cert, client_key)
+                .await
+                .expect("connect daemon endpoints");
+
+        let auth_plan = OutboundSessionAuthPlan::InviteBootstrap {
+            invite_event_id: invite_event_id_b64.clone(),
+        };
+
+        let (server_session_res, client_session_res) = tokio::join!(
+            server_daemon.accept_inbound_session(),
+            client_daemon.open_outbound_session(crate::transport::SessionClass::Range)
+        );
+        let mut server_session = server_session_res.expect("accept first inbound session");
+        let mut client_session = client_session_res.expect("open first outbound session");
+        let (first_outbound, first_inbound) = tokio::join!(
+            send_outbound_session_auth(
+                client_session.io.as_mut(),
+                client_db_path.to_str().unwrap(),
+                &source_peer_id,
+                client_daemon.remote_daemon_peer_id(),
+                Some(&server_daemon_peer_id),
+                &auth_plan,
+            ),
+            async {
+                let inbound = read_inbound_session_auth_for_connection(
+                    server_session.io.as_mut(),
+                    server_db_path.to_str().unwrap(),
+                    &server_daemon,
+                )
+                .await?;
+                send_inbound_session_auth_ack(server_session.io.as_mut(), &inbound.tenant_id)
+                    .await?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(inbound)
+            },
+        );
+        let first_outbound = first_outbound.expect("first outbound invite auth");
+        let first_inbound = first_inbound.expect("first inbound invite auth");
+        assert!(first_outbound.used_bootstrap_auth);
+        assert!(first_inbound.used_bootstrap_auth);
+        assert_eq!(first_inbound.tenant_id, target_tenant_id);
+        assert_eq!(first_inbound.remote_daemon_peer_id, client_daemon_peer_id);
+
+        let server_db = open_connection(server_db_path.to_str().unwrap()).unwrap();
+        server_db
+            .execute("DELETE FROM pending_invite_bootstrap_trust", [])
+            .unwrap();
+        drop(server_db);
+
+        let (server_session_res, client_session_res) = tokio::join!(
+            server_daemon.accept_inbound_session(),
+            client_daemon.open_outbound_session(crate::transport::SessionClass::Range)
+        );
+        let mut server_session = server_session_res.expect("accept second inbound session");
+        let mut client_session = client_session_res.expect("open second outbound session");
+        let (second_outbound, second_inbound) = tokio::join!(
+            send_outbound_session_auth(
+                client_session.io.as_mut(),
+                client_db_path.to_str().unwrap(),
+                &source_peer_id,
+                client_daemon.remote_daemon_peer_id(),
+                Some(&server_daemon_peer_id),
+                &auth_plan,
+            ),
+            async {
+                let inbound = read_inbound_session_auth_for_connection(
+                    server_session.io.as_mut(),
+                    server_db_path.to_str().unwrap(),
+                    &server_daemon,
+                )
+                .await?;
+                send_inbound_session_auth_ack(server_session.io.as_mut(), &inbound.tenant_id)
+                    .await?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(inbound)
+            },
+        );
+        let second_outbound = second_outbound.expect("second outbound invite auth");
+        let second_inbound = second_inbound.expect("second inbound invite auth");
+        assert!(second_outbound.used_bootstrap_auth);
+        assert!(second_inbound.used_bootstrap_auth);
+        assert_eq!(second_inbound.tenant_id, target_tenant_id);
+    }
+
+    #[tokio::test]
+    async fn invite_bootstrap_auth_accepts_accepted_bootstrap_trust_without_pending_row() {
+        let server_temp = tempfile::tempdir().unwrap();
+        let client_temp = tempfile::tempdir().unwrap();
+        let server_db_path = server_temp.path().join("server.sqlite3");
+        let client_db_path = client_temp.path().join("client.sqlite3");
+
+        let (server_cert, server_key) = generate_self_signed_cert().unwrap();
+        let (client_cert, client_key) = generate_self_signed_cert().unwrap();
+        let server_daemon_peer_id =
+            store_test_daemon_identity(server_db_path.to_str().unwrap(), &server_cert, &server_key);
+        let client_daemon_peer_id =
+            store_test_daemon_identity(client_db_path.to_str().unwrap(), &client_cert, &client_key);
+        let client_daemon_peer_id_raw =
+            decode_hex32(&client_daemon_peer_id, "client daemon peer id").unwrap();
+
+        let source_signing_key = SigningKey::from_bytes(&[0x51; 32]);
+        let source_public_key = source_signing_key.verifying_key().to_bytes();
+        let source_peer_id_raw = spki_fingerprint_from_ed25519_pubkey(&source_public_key);
+        let source_peer_id = hex::encode(source_peer_id_raw);
+        let signer_event_id = [0x52; 32];
+        let target_tenant_id = hex::encode([0x53; 32]);
+
+        let invite_signing_key = SigningKey::from_bytes(&[0x61; 32]);
+        let invite_event_id_raw = [0x62; 32];
+        let invite_event_id_b64 = event_id_to_base64(&invite_event_id_raw);
+        let invite_blob = encode_event(&ParsedEvent::UserInvite(UserInviteEvent {
+            created_at_ms: 1,
+            public_key: invite_signing_key.verifying_key().to_bytes(),
+            workspace_id: [0x63; 32],
+            authority_event_id: [0x64; 32],
+            signed_by: [0x65; 32],
+            signer_type: 5,
+            signature: [0u8; 64],
+        }))
+        .expect("encode invite");
+
+        insert_local_peer_secret(
+            client_db_path.to_str().unwrap(),
+            &source_peer_id,
+            &signer_event_id,
+            &source_signing_key,
+        );
+        insert_event_blob(
+            client_db_path.to_str().unwrap(),
+            &invite_event_id_b64,
+            "user_invite_shared",
+            invite_blob.clone(),
+        );
+        insert_event_blob(
+            server_db_path.to_str().unwrap(),
+            &invite_event_id_b64,
+            "user_invite_shared",
+            invite_blob,
+        );
+        insert_invite_secret(
+            client_db_path.to_str().unwrap(),
+            &source_peer_id,
+            &invite_event_id_b64,
+            invite_signing_key.to_bytes(),
+        );
+
+        let server_db = open_connection(server_db_path.to_str().unwrap()).unwrap();
+        record_invite_bootstrap_trust(
+            &server_db,
+            &target_tenant_id,
+            "invite-accepted",
+            &invite_event_id_b64,
+            "workspace",
+            "",
+            &client_daemon_peer_id_raw,
+        )
+        .unwrap();
+        drop(server_db);
+
+        let (_server_ep, _client_ep, server_daemon, client_daemon, _server_addr) =
+            connect_test_daemons(server_cert, server_key, client_cert, client_key)
+                .await
+                .expect("connect daemon endpoints");
+
+        let (server_session_res, client_session_res) = tokio::join!(
+            server_daemon.accept_inbound_session(),
+            client_daemon.open_outbound_session(crate::transport::SessionClass::Range)
+        );
+        let mut server_session = server_session_res.expect("accept inbound session");
+        let mut client_session = client_session_res.expect("open outbound session");
+        let auth_plan = OutboundSessionAuthPlan::InviteBootstrap {
+            invite_event_id: invite_event_id_b64.clone(),
+        };
+
+        let (outbound, inbound) = tokio::join!(
+            send_outbound_session_auth(
+                client_session.io.as_mut(),
+                client_db_path.to_str().unwrap(),
+                &source_peer_id,
+                client_daemon.remote_daemon_peer_id(),
+                Some(&server_daemon_peer_id),
+                &auth_plan,
+            ),
+            async {
+                let inbound = read_inbound_session_auth(
+                    server_session.io.as_mut(),
+                    server_db_path.to_str().unwrap(),
+                    server_daemon.remote_daemon_peer_id(),
+                )
+                .await?;
+                send_inbound_session_auth_ack(server_session.io.as_mut(), &inbound.tenant_id)
+                    .await?;
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(inbound)
+            },
+        );
+
+        let outbound = outbound.expect("outbound invite auth");
+        let inbound = inbound.expect("inbound invite auth");
+        assert!(outbound.used_bootstrap_auth);
+        assert!(inbound.used_bootstrap_auth);
+        assert_eq!(inbound.tenant_id, target_tenant_id);
+        assert_eq!(inbound.remote_daemon_peer_id, client_daemon_peer_id);
     }
 }
