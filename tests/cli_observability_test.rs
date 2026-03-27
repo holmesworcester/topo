@@ -49,11 +49,7 @@ fn poll_sub_json(db: &str, name: &str) -> Vec<serde_json::Value> {
 #[test]
 fn test_stats_after_create_workspace() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("stats.db").to_str().unwrap().to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-    wait_for_daemon_ready(&db, Duration::from_secs(10));
+    let (db, _daemon) = setup_single_peer(&tmpdir, "stats");
 
     assert_now(&db, "workspace_count == 1");
     assert_now(&db, "user_count == 1");
@@ -72,23 +68,7 @@ fn test_stats_after_create_workspace() {
 #[test]
 fn test_stats_after_invite_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout_ms = 60000;
-
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
-    wait_for_daemon_ready(&alice_db, Duration::from_secs(10));
-    let alice_addr = daemon_listen_addr(&alice_db);
-    let invite = create_invite(&alice_db, &alice_addr);
-
-    accept_invite(&bob_db, &invite);
-    let _bob = start_daemon(&bob_db);
-    wait_for_daemon_ready(&bob_db, Duration::from_secs(10));
-
-    // Wait for identity convergence
-    assert_eventually(&alice_db, "peer_count == 2", timeout_ms);
-    assert_eventually(&bob_db, "peer_count == 2", timeout_ms);
+    let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // Both should have full identity state
     assert_now(&alice_db, "user_count == 2");
@@ -108,23 +88,8 @@ fn test_stats_after_invite_sync() {
 #[test]
 fn test_stats_message_counts_after_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 60000;
-
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
-    wait_for_daemon_ready(&alice_db, Duration::from_secs(10));
-    let alice_addr = daemon_listen_addr(&alice_db);
-    let invite = create_invite(&alice_db, &alice_addr);
-
-    accept_invite(&bob_db, &invite);
-    let _bob = start_daemon(&bob_db);
-    wait_for_daemon_ready(&bob_db, Duration::from_secs(10));
-
-    // Wait for identity sync
-    assert_eventually(&alice_db, "peer_count == 2", timeout_ms);
-    assert_eventually(&bob_db, "peer_count == 2", timeout_ms);
+    let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // Send messages from both sides
     send_message(&alice_db, "Hello from Alice");
@@ -146,11 +111,7 @@ fn test_stats_message_counts_after_sync() {
 #[test]
 fn test_replay_invariants_after_create_workspace() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("replay.db").to_str().unwrap().to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-    wait_for_daemon_ready(&db, Duration::from_secs(10));
+    let (db, _daemon) = setup_single_peer(&tmpdir, "replay");
 
     // Send a few messages to create projection state
     send_message(&db, "message one");
@@ -166,22 +127,8 @@ fn test_replay_invariants_after_create_workspace() {
 #[test]
 fn test_replay_invariants_after_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 60000;
-
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
-    wait_for_daemon_ready(&alice_db, Duration::from_secs(10));
-    let alice_addr = daemon_listen_addr(&alice_db);
-    let invite = create_invite(&alice_db, &alice_addr);
-
-    accept_invite(&bob_db, &invite);
-    let bob = start_daemon(&bob_db);
-    wait_for_daemon_ready(&bob_db, Duration::from_secs(10));
-
-    assert_eventually(&alice_db, "peer_count == 2", timeout_ms);
-    assert_eventually(&bob_db, "peer_count == 2", timeout_ms);
+    let (alice_db, bob_db, _alice, bob) = setup_two_peers(&tmpdir);
 
     send_message(&alice_db, "Alice says hi");
     send_message(&bob_db, "Bob says hi");
@@ -209,22 +156,8 @@ fn test_replay_invariants_after_sync() {
 #[test]
 fn test_no_blocked_events_after_converged_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 60000;
-
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
-    wait_for_daemon_ready(&alice_db, Duration::from_secs(10));
-    let alice_addr = daemon_listen_addr(&alice_db);
-    let invite = create_invite(&alice_db, &alice_addr);
-
-    accept_invite(&bob_db, &invite);
-    let _bob = start_daemon(&bob_db);
-    wait_for_daemon_ready(&bob_db, Duration::from_secs(10));
-
-    assert_eventually(&alice_db, "peer_count == 2", timeout_ms);
-    assert_eventually(&bob_db, "peer_count == 2", timeout_ms);
+    let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     send_message(&alice_db, "test message");
     assert_eventually(&bob_db, "message_count == 1", timeout_ms);
@@ -244,22 +177,8 @@ fn test_no_blocked_events_after_converged_sync() {
 #[test]
 fn test_event_fingerprints_converge_after_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 60000;
-
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
-    wait_for_daemon_ready(&alice_db, Duration::from_secs(10));
-    let alice_addr = daemon_listen_addr(&alice_db);
-    let invite = create_invite(&alice_db, &alice_addr);
-
-    accept_invite(&bob_db, &invite);
-    let _bob = start_daemon(&bob_db);
-    wait_for_daemon_ready(&bob_db, Duration::from_secs(10));
-
-    assert_eventually(&alice_db, "peer_count == 2", timeout_ms);
-    assert_eventually(&bob_db, "peer_count == 2", timeout_ms);
+    let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // Send messages both directions
     for i in 0..5 {
@@ -291,22 +210,8 @@ fn test_event_fingerprints_converge_after_sync() {
 #[test]
 fn test_connections_visible_after_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 60000;
-
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
-    wait_for_daemon_ready(&alice_db, Duration::from_secs(10));
-    let alice_addr = daemon_listen_addr(&alice_db);
-    let invite = create_invite(&alice_db, &alice_addr);
-
-    accept_invite(&bob_db, &invite);
-    let _bob = start_daemon(&bob_db);
-    wait_for_daemon_ready(&bob_db, Duration::from_secs(10));
-
-    assert_eventually(&alice_db, "peer_count == 2", timeout_ms);
-    assert_eventually(&bob_db, "peer_count == 2", timeout_ms);
+    let (alice_db, _bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // After sync, at least one side should have endpoint observations
     assert_eventually(&alice_db, "endpoint_observation_count >= 1", timeout_ms);
@@ -333,22 +238,8 @@ fn test_connections_visible_after_sync() {
 #[test]
 fn test_deletion_converges_via_cli() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 60000;
-
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
-    wait_for_daemon_ready(&alice_db, Duration::from_secs(10));
-    let alice_addr = daemon_listen_addr(&alice_db);
-    let invite = create_invite(&alice_db, &alice_addr);
-
-    accept_invite(&bob_db, &invite);
-    let _bob = start_daemon(&bob_db);
-    wait_for_daemon_ready(&bob_db, Duration::from_secs(10));
-
-    assert_eventually(&alice_db, "peer_count == 2", timeout_ms);
-    assert_eventually(&bob_db, "peer_count == 2", timeout_ms);
+    let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // Alice sends a message and a reaction
     send_message(&alice_db, "delete me");
@@ -376,11 +267,7 @@ fn test_deletion_converges_via_cli() {
 #[test]
 fn test_stats_json_has_all_fields() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("stats-json.db").to_str().unwrap().to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-    wait_for_daemon_ready(&db, Duration::from_secs(10));
+    let (db, _daemon) = setup_single_peer(&tmpdir, "stats-json");
 
     let stats = stats_json(&db);
     let expected_fields = [
@@ -419,20 +306,7 @@ fn test_stats_json_has_all_fields() {
 #[test]
 fn test_non_admin_cannot_create_invite() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout_ms = 60000;
-
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
-    wait_for_daemon_ready(&alice_db, Duration::from_secs(10));
-    let alice_addr = daemon_listen_addr(&alice_db);
-    let invite = create_invite(&alice_db, &alice_addr);
-
-    accept_invite(&bob_db, &invite);
-    let _bob = start_daemon(&bob_db);
-    wait_for_daemon_ready(&bob_db, Duration::from_secs(10));
-    assert_eventually(&bob_db, "peer_count == 2", timeout_ms);
+    let (_alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // Bob (non-admin) tries to create an invite — should fail
     let out = std::process::Command::new(bin())
@@ -467,22 +341,8 @@ fn test_non_admin_cannot_create_invite() {
 #[test]
 fn test_reactions_unblock_after_dep_arrives() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 60000;
-
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
-    wait_for_daemon_ready(&alice_db, Duration::from_secs(10));
-    let alice_addr = daemon_listen_addr(&alice_db);
-    let invite = create_invite(&alice_db, &alice_addr);
-
-    accept_invite(&bob_db, &invite);
-    let _bob = start_daemon(&bob_db);
-    wait_for_daemon_ready(&bob_db, Duration::from_secs(10));
-
-    assert_eventually(&alice_db, "peer_count == 2", timeout_ms);
-    assert_eventually(&bob_db, "peer_count == 2", timeout_ms);
+    let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // Alice sends 3 messages
     send_message(&alice_db, "First");
@@ -759,11 +619,7 @@ fn test_parallel_device_links_converge() {
 #[test]
 fn test_sub_since_ms_filters_old_messages() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("sub-since.db").to_str().unwrap().to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-    wait_for_daemon_ready(&db, Duration::from_secs(10));
+    let (db, _daemon) = setup_single_peer(&tmpdir, "sub-since");
 
     // Send messages before the cursor
     send_message(&db, "old message 1");
@@ -802,22 +658,10 @@ fn test_sub_since_ms_filters_old_messages() {
 #[test]
 fn test_sub_persists_across_daemon_restart() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("sub-persist.db").to_str().unwrap().to_string();
-
-    create_workspace(&db);
-    let daemon = start_daemon(&db);
-    wait_for_daemon_ready(&db, Duration::from_secs(10));
+    let (db, daemon) = setup_single_peer(&tmpdir, "sub-persist");
 
     // Create subscription and send messages
-    let out = std::process::Command::new(bin())
-        .args([
-            "--db", &db, "sub", "create",
-            "--name", "persist-test",
-            "--event-type", "message",
-        ])
-        .output()
-        .expect("sub create failed");
-    assert!(out.status.success());
+    sub_create(&db, "persist-test", "message");
 
     send_message(&db, "before restart");
 
@@ -846,33 +690,11 @@ fn test_sub_persists_across_daemon_restart() {
 #[test]
 fn test_sub_receives_synced_message() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 60000;
-
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
-    wait_for_daemon_ready(&alice_db, Duration::from_secs(10));
-    let alice_addr = daemon_listen_addr(&alice_db);
-    let invite = create_invite(&alice_db, &alice_addr);
-
-    accept_invite(&bob_db, &invite);
-    let _bob = start_daemon(&bob_db);
-    wait_for_daemon_ready(&bob_db, Duration::from_secs(10));
-
-    assert_eventually(&alice_db, "peer_count == 2", timeout_ms);
-    assert_eventually(&bob_db, "peer_count == 2", timeout_ms);
+    let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // Create subscription on Bob
-    let out = std::process::Command::new(bin())
-        .args([
-            "--db", &bob_db, "sub", "create",
-            "--name", "inbox",
-            "--event-type", "message",
-        ])
-        .output()
-        .expect("sub create failed");
-    assert!(out.status.success());
+    sub_create(&bob_db, "inbox", "message");
 
     // Alice sends a message (encrypted via the production path)
     send_message(&alice_db, "secret hello from alice");
@@ -899,22 +721,8 @@ fn test_sub_receives_synced_message() {
 #[test]
 fn test_event_timeline_shows_delivery_timestamps() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 60000;
-
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
-    wait_for_daemon_ready(&alice_db, Duration::from_secs(10));
-    let alice_addr = daemon_listen_addr(&alice_db);
-    let invite = create_invite(&alice_db, &alice_addr);
-
-    accept_invite(&bob_db, &invite);
-    let _bob = start_daemon(&bob_db);
-    wait_for_daemon_ready(&bob_db, Duration::from_secs(10));
-
-    assert_eventually(&alice_db, "peer_count == 2", timeout_ms);
-    assert_eventually(&bob_db, "peer_count == 2", timeout_ms);
+    let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     let event_id = send_message(&alice_db, "timeline test message");
     assert_eventually(&bob_db, "message_count == 1", timeout_ms);
@@ -955,22 +763,8 @@ fn test_event_timeline_shows_delivery_timestamps() {
 #[test]
 fn test_large_sync_convergence() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 120000;
-
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
-    wait_for_daemon_ready(&alice_db, Duration::from_secs(10));
-    let alice_addr = daemon_listen_addr(&alice_db);
-    let invite = create_invite(&alice_db, &alice_addr);
-
-    accept_invite(&bob_db, &invite);
-    let _bob = start_daemon(&bob_db);
-    wait_for_daemon_ready(&bob_db, Duration::from_secs(10));
-
-    assert_eventually(&alice_db, "peer_count == 2", timeout_ms);
-    assert_eventually(&bob_db, "peer_count == 2", timeout_ms);
+    let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // Generate 200 messages on Alice
     let out = std::process::Command::new(bin())
@@ -994,22 +788,10 @@ fn test_large_sync_convergence() {
 #[test]
 fn test_cli_subscription_full_lifecycle() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("sub-lifecycle.db").to_str().unwrap().to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-    wait_for_daemon_ready(&db, Duration::from_secs(10));
+    let (db, _daemon) = setup_single_peer(&tmpdir, "sub-lifecycle");
 
     // Create subscription before any messages
-    let out = std::process::Command::new(bin())
-        .args(["--db", &db, "sub", "create", "--name", "inbox", "--event-type", "message"])
-        .output()
-        .expect("sub create failed");
-    assert!(
-        out.status.success(),
-        "sub create failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    sub_create(&db, "inbox", "message");
 
     // Send 3 messages
     send_message(&db, "hello");
@@ -1030,22 +812,12 @@ fn test_cli_subscription_full_lifecycle() {
     assert!(payload0["event_id"].is_string(), "full mode payload should have event_id");
 
     // Check state: pending_count == 3, dirty == true
-    let out = std::process::Command::new(bin())
-        .args(["--db", &db, "sub", "state", "inbox", "--json"])
-        .output()
-        .expect("sub state failed");
-    assert!(out.status.success(), "sub state failed: {}", String::from_utf8_lossy(&out.stderr));
-    let state: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    let state = sub_state_json(&db, "inbox");
     assert_eq!(state["pending_count"].as_i64().unwrap_or(-1), 3, "pending_count should be 3");
     assert!(state["dirty"].as_bool().unwrap_or(false), "dirty should be true");
 
     // Ack through seq 2
-    let out = std::process::Command::new(bin())
-        .args(["--db", &db, "sub", "ack", "inbox", "--through-seq", "2"])
-        .output()
-        .expect("sub ack failed");
-    assert!(out.status.success(), "sub ack failed: {}", String::from_utf8_lossy(&out.stderr));
+    sub_ack(&db, "inbox", 2);
 
     // Poll again — only seq 3 remains
     let items = poll_sub_json(&db, "inbox");
@@ -1053,20 +825,10 @@ fn test_cli_subscription_full_lifecycle() {
     assert_eq!(items[0]["seq"].as_i64().unwrap_or(-1), 3);
 
     // Ack seq 3
-    let out = std::process::Command::new(bin())
-        .args(["--db", &db, "sub", "ack", "inbox", "--through-seq", "3"])
-        .output()
-        .expect("sub ack failed");
-    assert!(out.status.success(), "sub ack failed: {}", String::from_utf8_lossy(&out.stderr));
+    sub_ack(&db, "inbox", 3);
 
     // State: pending_count == 0
-    let out = std::process::Command::new(bin())
-        .args(["--db", &db, "sub", "state", "inbox", "--json"])
-        .output()
-        .expect("sub state failed");
-    assert!(out.status.success());
-    let state: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    let state = sub_state_json(&db, "inbox");
     assert_eq!(state["pending_count"].as_i64().unwrap_or(-1), 0, "pending_count should be 0");
 }
 
@@ -1075,11 +837,7 @@ fn test_cli_subscription_full_lifecycle() {
 #[test]
 fn test_cli_subscription_since_event_id() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("sub-since-eid.db").to_str().unwrap().to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-    wait_for_daemon_ready(&db, Duration::from_secs(10));
+    let (db, _daemon) = setup_single_peer(&tmpdir, "sub-since-eid");
 
     // Send a cursor message and get its event_id (hex)
     let cursor_event_id = send_message(&db, "cursor");
@@ -1120,28 +878,10 @@ fn test_cli_subscription_since_event_id() {
 #[test]
 fn test_cli_subscription_has_changed_mode() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("sub-has-changed.db").to_str().unwrap().to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-    wait_for_daemon_ready(&db, Duration::from_secs(10));
+    let (db, _daemon) = setup_single_peer(&tmpdir, "sub-has-changed");
 
     // Create has_changed subscription
-    let out = std::process::Command::new(bin())
-        .args([
-            "--db", &db,
-            "sub", "create",
-            "--name", "changed",
-            "--event-type", "message",
-            "--delivery", "has_changed",
-        ])
-        .output()
-        .expect("sub create failed");
-    assert!(
-        out.status.success(),
-        "sub create failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    sub_create_with_delivery(&db, "changed", "message", "has_changed");
 
     // Send 5 messages
     for i in 0..5 {
@@ -1153,13 +893,7 @@ fn test_cli_subscription_has_changed_mode() {
     assert_eq!(items.len(), 0, "has_changed mode should not produce feed rows");
 
     // State: pending_count == 5, dirty == true
-    let out = std::process::Command::new(bin())
-        .args(["--db", &db, "sub", "state", "changed", "--json"])
-        .output()
-        .expect("sub state failed");
-    assert!(out.status.success());
-    let state: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    let state = sub_state_json(&db, "changed");
     assert_eq!(
         state["pending_count"].as_i64().unwrap_or(-1),
         5,
@@ -1168,19 +902,9 @@ fn test_cli_subscription_has_changed_mode() {
     assert!(state["dirty"].as_bool().unwrap_or(false), "dirty should be true");
 
     // Ack resets the state
-    let out = std::process::Command::new(bin())
-        .args(["--db", &db, "sub", "ack", "changed", "--through-seq", "0"])
-        .output()
-        .expect("sub ack failed");
-    assert!(out.status.success());
+    sub_ack(&db, "changed", 0);
 
-    let out = std::process::Command::new(bin())
-        .args(["--db", &db, "sub", "state", "changed", "--json"])
-        .output()
-        .expect("sub state failed");
-    assert!(out.status.success());
-    let state: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    let state = sub_state_json(&db, "changed");
     assert_eq!(
         state["pending_count"].as_i64().unwrap_or(-1),
         0,
@@ -1194,18 +918,10 @@ fn test_cli_subscription_has_changed_mode() {
 #[test]
 fn test_cli_subscription_filter_by_author() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("sub-filter-author.db").to_str().unwrap().to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-    wait_for_daemon_ready(&db, Duration::from_secs(10));
+    let (db, _daemon) = setup_single_peer(&tmpdir, "sub-filter-author");
 
     // Send one message first (no filter sub yet) to learn alice's author_id
-    let unfiltered_sub_out = std::process::Command::new(bin())
-        .args(["--db", &db, "sub", "create", "--name", "probe", "--event-type", "message"])
-        .output()
-        .expect("sub create probe failed");
-    assert!(unfiltered_sub_out.status.success());
+    sub_create(&db, "probe", "message");
 
     send_message(&db, "probe message");
 
@@ -1253,11 +969,7 @@ fn test_cli_subscription_filter_by_author() {
 #[test]
 fn test_cli_subscription_filter_rejects_non_matching_author() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("sub-filter-fake.db").to_str().unwrap().to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-    wait_for_daemon_ready(&db, Duration::from_secs(10));
+    let (db, _daemon) = setup_single_peer(&tmpdir, "sub-filter-fake");
 
     // Build spec JSON with a filter for a fake author (all 0xFF bytes, base64-encoded
     // using STANDARD encoding to match event_id_to_base64 in crypto::mod.rs).
@@ -1300,28 +1012,10 @@ fn test_cli_subscription_filter_rejects_non_matching_author() {
 #[test]
 fn test_cli_subscription_id_delivery_mode() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("sub-id-mode.db").to_str().unwrap().to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-    wait_for_daemon_ready(&db, Duration::from_secs(10));
+    let (db, _daemon) = setup_single_peer(&tmpdir, "sub-id-mode");
 
     // Create id-mode subscription
-    let out = std::process::Command::new(bin())
-        .args([
-            "--db", &db,
-            "sub", "create",
-            "--name", "ids",
-            "--event-type", "message",
-            "--delivery", "id",
-        ])
-        .output()
-        .expect("sub create failed");
-    assert!(
-        out.status.success(),
-        "sub create failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    sub_create_with_delivery(&db, "ids", "message", "id");
 
     send_message(&db, "hello");
 
@@ -1343,29 +1037,13 @@ fn test_cli_subscription_id_delivery_mode() {
 #[test]
 fn test_cli_disabled_subscription_skipped() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("sub-disable.db").to_str().unwrap().to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-    wait_for_daemon_ready(&db, Duration::from_secs(10));
+    let (db, _daemon) = setup_single_peer(&tmpdir, "sub-disable");
 
     // Create subscription
-    let out = std::process::Command::new(bin())
-        .args(["--db", &db, "sub", "create", "--name", "inbox", "--event-type", "message"])
-        .output()
-        .expect("sub create failed");
-    assert!(out.status.success());
+    sub_create(&db, "inbox", "message");
 
     // Disable subscription
-    let out = std::process::Command::new(bin())
-        .args(["--db", &db, "sub", "disable", "inbox"])
-        .output()
-        .expect("sub disable failed");
-    assert!(
-        out.status.success(),
-        "sub disable failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    sub_disable(&db, "inbox");
 
     // Send while disabled — should not be delivered
     send_message(&db, "should not be delivered");
@@ -1374,15 +1052,7 @@ fn test_cli_disabled_subscription_skipped() {
     assert_eq!(items.len(), 0, "disabled sub should not receive events");
 
     // Re-enable
-    let out = std::process::Command::new(bin())
-        .args(["--db", &db, "sub", "enable", "inbox"])
-        .output()
-        .expect("sub enable failed");
-    assert!(
-        out.status.success(),
-        "sub enable failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
+    sub_enable(&db, "inbox");
 
     // Send after re-enable — should be delivered
     send_message(&db, "should be delivered");
@@ -1396,32 +1066,12 @@ fn test_cli_disabled_subscription_skipped() {
 #[test]
 fn test_cli_multiple_subscriptions_independent() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("sub-multi.db").to_str().unwrap().to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-    wait_for_daemon_ready(&db, Duration::from_secs(10));
+    let (db, _daemon) = setup_single_peer(&tmpdir, "sub-multi");
 
     // Create three subscriptions
-    for (name, delivery) in [("full-sub", "full"), ("id-sub", "id"), ("changed-sub", "has_changed")]
-    {
-        let out = std::process::Command::new(bin())
-            .args([
-                "--db", &db,
-                "sub", "create",
-                "--name", name,
-                "--event-type", "message",
-                "--delivery", delivery,
-            ])
-            .output()
-            .expect("sub create failed");
-        assert!(
-            out.status.success(),
-            "sub create {} failed: {}",
-            name,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
+    sub_create_with_delivery(&db, "full-sub", "message", "full");
+    sub_create_with_delivery(&db, "id-sub", "message", "id");
+    sub_create_with_delivery(&db, "changed-sub", "message", "has_changed");
 
     send_message(&db, "shared event");
 
@@ -1445,13 +1095,7 @@ fn test_cli_multiple_subscriptions_independent() {
     let changed_items = poll_sub_json(&db, "changed-sub");
     assert_eq!(changed_items.len(), 0, "has_changed sub should have no feed items");
 
-    let out = std::process::Command::new(bin())
-        .args(["--db", &db, "sub", "state", "changed-sub", "--json"])
-        .output()
-        .expect("sub state failed");
-    assert!(out.status.success());
-    let state: serde_json::Value =
-        serde_json::from_str(String::from_utf8_lossy(&out.stdout).trim()).unwrap();
+    let state = sub_state_json(&db, "changed-sub");
     assert_eq!(
         state["pending_count"].as_i64().unwrap_or(-1),
         1,
@@ -1464,18 +1108,10 @@ fn test_cli_multiple_subscriptions_independent() {
 #[test]
 fn test_cli_feed_ordering_deterministic() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("sub-order.db").to_str().unwrap().to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-    wait_for_daemon_ready(&db, Duration::from_secs(10));
+    let (db, _daemon) = setup_single_peer(&tmpdir, "sub-order");
 
     // Create subscription
-    let out = std::process::Command::new(bin())
-        .args(["--db", &db, "sub", "create", "--name", "ordered", "--event-type", "message"])
-        .output()
-        .expect("sub create failed");
-    assert!(out.status.success());
+    sub_create(&db, "ordered", "message");
 
     // Send 10 messages
     for i in 0..10 {
@@ -1504,23 +1140,10 @@ fn test_cli_feed_ordering_deterministic() {
 #[test]
 fn test_cli_non_message_events_ignored() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir.path().join("sub-non-msg.db").to_str().unwrap().to_string();
-
-    create_workspace(&db);
-    let _daemon = start_daemon(&db);
-    wait_for_daemon_ready(&db, Duration::from_secs(10));
+    let (db, _daemon) = setup_single_peer(&tmpdir, "sub-non-msg");
 
     // Create message subscription
-    let out = std::process::Command::new(bin())
-        .args([
-            "--db", &db,
-            "sub", "create",
-            "--name", "messages-only",
-            "--event-type", "message",
-        ])
-        .output()
-        .expect("sub create failed");
-    assert!(out.status.success());
+    sub_create(&db, "messages-only", "message");
 
     // Send a message then a reaction
     let msg_event_id = send_message(&db, "hello");
@@ -1676,22 +1299,8 @@ fn test_discover_finds_peer_via_mdns() {
 #[ignore = "resource-intensive: 20 bidirectional messages via 2 daemons; run explicitly"]
 fn test_zero_loss_stress_converges() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 120000;
-
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
-    wait_for_daemon_ready(&alice_db, Duration::from_secs(10));
-    let alice_addr = daemon_listen_addr(&alice_db);
-    let invite = create_invite(&alice_db, &alice_addr);
-
-    accept_invite(&bob_db, &invite);
-    let _bob = start_daemon(&bob_db);
-    wait_for_daemon_ready(&bob_db, Duration::from_secs(10));
-
-    assert_eventually(&alice_db, "peer_count == 2", timeout_ms);
-    assert_eventually(&bob_db, "peer_count == 2", timeout_ms);
+    let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // Send 10 messages from each side via the normal send path
     for i in 0..10 {
@@ -1721,22 +1330,8 @@ fn test_zero_loss_stress_converges() {
 #[test]
 fn test_recorded_at_monotonicity_via_replay() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 60000;
-
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
-    wait_for_daemon_ready(&alice_db, Duration::from_secs(10));
-    let alice_addr = daemon_listen_addr(&alice_db);
-    let invite = create_invite(&alice_db, &alice_addr);
-
-    accept_invite(&bob_db, &invite);
-    let bob = start_daemon(&bob_db);
-    wait_for_daemon_ready(&bob_db, Duration::from_secs(10));
-
-    assert_eventually(&alice_db, "peer_count == 2", timeout_ms);
-    assert_eventually(&bob_db, "peer_count == 2", timeout_ms);
+    let (alice_db, bob_db, _alice, bob) = setup_two_peers(&tmpdir);
 
     // Send messages with small delays to exercise recorded_at ordering
     send_message(&alice_db, "first");
@@ -1768,22 +1363,8 @@ fn test_recorded_at_monotonicity_via_replay() {
 #[test]
 fn test_local_only_events_not_synced_via_cli() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 60000;
-
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
-    wait_for_daemon_ready(&alice_db, Duration::from_secs(10));
-    let alice_addr = daemon_listen_addr(&alice_db);
-    let invite = create_invite(&alice_db, &alice_addr);
-
-    accept_invite(&bob_db, &invite);
-    let _bob = start_daemon(&bob_db);
-    wait_for_daemon_ready(&bob_db, Duration::from_secs(10));
-
-    assert_eventually(&alice_db, "peer_count == 2", timeout_ms);
-    assert_eventually(&bob_db, "peer_count == 2", timeout_ms);
+    let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // Alice sends a message
     send_message(&alice_db, "normal message from alice");
@@ -1928,22 +1509,7 @@ fn test_trust_anchor_second_workspace_does_not_project() {
 #[test]
 fn test_non_admin_cannot_create_device_link() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
-    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout_ms = 60000;
-
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
-    wait_for_daemon_ready(&alice_db, Duration::from_secs(10));
-    let alice_addr = daemon_listen_addr(&alice_db);
-    let invite = create_invite(&alice_db, &alice_addr);
-
-    accept_invite(&bob_db, &invite);
-    let _bob = start_daemon(&bob_db);
-    wait_for_daemon_ready(&bob_db, Duration::from_secs(10));
-
-    // Wait for Bob to be fully joined
-    assert_eventually(&bob_db, "peer_count == 2", timeout_ms);
+    let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // Record device_invite_count before the attempt
     let stats_before = stats_json(&alice_db);
