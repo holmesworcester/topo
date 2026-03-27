@@ -1367,22 +1367,6 @@ impl Peer {
 
     /// Create an encrypted MessageDeletion event.
     /// Returns the encrypted event ID. Requires identity chain.
-    pub fn create_encrypted_deletion(
-        &self,
-        key_event_id: &EventId,
-        target_event_id: &EventId,
-    ) -> EventId {
-        let inner = ParsedEvent::MessageDeletion(MessageDeletionEvent {
-            created_at_ms: current_timestamp_ms_u64(),
-            target_event_id: *target_event_id,
-            author_id: self.author_id,
-            signed_by: self.signer_eid(),
-            signer_type: 5,
-            signature: [0u8; 64],
-        });
-        self.create_encrypted_signed_event_synchronous(key_event_id, &inner)
-    }
-
     // --- Identity event helpers ---
 
     /// Create a Workspace event. Returns the event ID.
@@ -2061,32 +2045,6 @@ impl Peer {
         .expect("collect source histogram")
     }
 
-    /// Return sorted set of all store IDs (base64-encoded).
-    pub fn store_ids(&self) -> std::collections::BTreeSet<String> {
-        let db = open_connection(&self.db_path).expect("failed to open db");
-        let mut stmt = db
-            .prepare("SELECT event_id FROM events ORDER BY event_id")
-            .expect("prepare");
-        let ids = stmt
-            .query_map([], |row| row.get::<_, String>(0))
-            .expect("query")
-            .collect::<Result<std::collections::BTreeSet<_>, _>>()
-            .expect("collect");
-        ids
-    }
-
-    /// Return sorted set of all shared-scope store IDs (base64-encoded).
-    pub fn shared_store_ids(&self) -> std::collections::BTreeSet<String> {
-        let db = open_connection(&self.db_path).expect("failed to open db");
-        let mut stmt = db
-            .prepare("SELECT event_id FROM events WHERE share_scope = 'shared' ORDER BY event_id")
-            .expect("prepare");
-        stmt.query_map([], |row| row.get::<_, String>(0))
-            .expect("query")
-            .collect::<Result<std::collections::BTreeSet<_>, _>>()
-            .expect("collect")
-    }
-
     /// Return sorted set of event IDs for a specific `event_type`.
     pub fn event_ids_by_type(&self, event_type: &str) -> std::collections::BTreeSet<String> {
         let db = open_connection(&self.db_path).expect("failed to open db");
@@ -2196,66 +2154,11 @@ impl Peer {
         .unwrap_or(0)
     }
 
-    /// Count workspaces projected for this peer.
-    pub fn workspace_count(&self) -> i64 {
-        let db = open_connection(&self.db_path).expect("failed to open db");
-        db.query_row(
-            "SELECT COUNT(*) FROM workspaces WHERE recorded_by = ?1",
-            rusqlite::params![&self.identity],
-            |row| row.get(0),
-        )
-        .unwrap_or(0)
-    }
-
-    /// Count user invites projected for this peer.
-    pub fn user_invite_count(&self) -> i64 {
-        let db = open_connection(&self.db_path).expect("failed to open db");
-        db.query_row(
-            "SELECT COUNT(*) FROM user_invites WHERE recorded_by = ?1",
-            rusqlite::params![&self.identity],
-            |row| row.get(0),
-        )
-        .unwrap_or(0)
-    }
-
-    /// Count users projected for this peer.
-    pub fn user_count(&self) -> i64 {
-        let db = open_connection(&self.db_path).expect("failed to open db");
-        db.query_row(
-            "SELECT COUNT(*) FROM users WHERE recorded_by = ?1",
-            rusqlite::params![&self.identity],
-            |row| row.get(0),
-        )
-        .unwrap_or(0)
-    }
-
     /// Count device invites projected for this peer.
     pub fn device_invite_count(&self) -> i64 {
         let db = open_connection(&self.db_path).expect("failed to open db");
         db.query_row(
             "SELECT COUNT(*) FROM device_invites WHERE recorded_by = ?1",
-            rusqlite::params![&self.identity],
-            |row| row.get(0),
-        )
-        .unwrap_or(0)
-    }
-
-    /// Count peers_shared projected for this peer.
-    pub fn peer_shared_count(&self) -> i64 {
-        let db = open_connection(&self.db_path).expect("failed to open db");
-        db.query_row(
-            "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
-            rusqlite::params![&self.identity],
-            |row| row.get(0),
-        )
-        .unwrap_or(0)
-    }
-
-    /// Count admins projected for this peer.
-    pub fn admin_count(&self) -> i64 {
-        let db = open_connection(&self.db_path).expect("failed to open db");
-        db.query_row(
-            "SELECT COUNT(*) FROM admins WHERE recorded_by = ?1",
             rusqlite::params![&self.identity],
             |row| row.get(0),
         )

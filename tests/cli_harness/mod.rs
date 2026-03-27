@@ -2555,6 +2555,150 @@ pub fn topo_assert_eventually(db: &str, predicate: &str, timeout_ms: u64) -> Out
 }
 
 // ---------------------------------------------------------------------------
+// Setup helpers to DRY two-peer / single-peer boilerplate
+// ---------------------------------------------------------------------------
+
+/// Two-peer workspace with identity convergence confirmed.
+/// Returns (alice_db, bob_db, alice_daemon, bob_daemon).
+pub fn setup_two_peers(
+    tmpdir: &tempfile::TempDir,
+) -> (String, String, HarnessDaemon, HarnessDaemon) {
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+
+    create_workspace(&alice_db);
+    let alice = start_daemon(&alice_db);
+    wait_for_daemon_ready(&alice_db, std::time::Duration::from_secs(10));
+    let alice_addr = daemon_listen_addr(&alice_db);
+    let invite = create_invite(&alice_db, &alice_addr);
+
+    accept_invite(&bob_db, &invite);
+    let bob = start_daemon(&bob_db);
+    wait_for_daemon_ready(&bob_db, std::time::Duration::from_secs(10));
+
+    assert_eventually(&alice_db, "peer_count == 2", 60000);
+    assert_eventually(&bob_db, "peer_count == 2", 60000);
+
+    (alice_db, bob_db, alice, bob)
+}
+
+/// Single-peer workspace with daemon running.
+/// Returns (db_path, daemon).
+pub fn setup_single_peer(
+    tmpdir: &tempfile::TempDir,
+    name: &str,
+) -> (String, HarnessDaemon) {
+    let db = tmpdir
+        .path()
+        .join(format!("{}.db", name))
+        .to_str()
+        .unwrap()
+        .to_string();
+    create_workspace(&db);
+    let daemon = start_daemon(&db);
+    wait_for_daemon_ready(&db, std::time::Duration::from_secs(10));
+    (db, daemon)
+}
+
+// ---------------------------------------------------------------------------
+// Subscription CLI helpers
+// ---------------------------------------------------------------------------
+
+/// Create a subscription with default options.
+pub fn sub_create(db: &str, name: &str, event_type: &str) {
+    let out = Command::new(bin())
+        .args(["--db", db, "sub", "create", "--name", name, "--event-type", event_type])
+        .output()
+        .expect("sub create failed");
+    assert!(
+        out.status.success(),
+        "sub create {} failed: {}",
+        name,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Create a subscription with delivery mode.
+pub fn sub_create_with_delivery(db: &str, name: &str, event_type: &str, delivery: &str) {
+    let out = Command::new(bin())
+        .args([
+            "--db", db, "sub", "create",
+            "--name", name,
+            "--event-type", event_type,
+            "--delivery", delivery,
+        ])
+        .output()
+        .expect("sub create failed");
+    assert!(
+        out.status.success(),
+        "sub create {} (delivery={}) failed: {}",
+        name, delivery,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Ack a subscription through a given seq number.
+pub fn sub_ack(db: &str, name: &str, through_seq: u64) {
+    let out = Command::new(bin())
+        .args([
+            "--db", db, "sub", "ack", name,
+            "--through-seq", &through_seq.to_string(),
+        ])
+        .output()
+        .expect("sub ack failed");
+    assert!(
+        out.status.success(),
+        "sub ack {} through {} failed: {}",
+        name, through_seq,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Get subscription state as JSON.
+pub fn sub_state_json(db: &str, name: &str) -> serde_json::Value {
+    let out = Command::new(bin())
+        .args(["--db", db, "sub", "state", name, "--json"])
+        .output()
+        .expect("sub state failed");
+    assert!(
+        out.status.success(),
+        "sub state {} --json failed: {}",
+        name,
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    serde_json::from_str(stdout.trim()).unwrap_or_default()
+}
+
+/// Disable a subscription.
+pub fn sub_disable(db: &str, name: &str) {
+    let out = Command::new(bin())
+        .args(["--db", db, "sub", "disable", "--sub", name])
+        .output()
+        .expect("sub disable failed");
+    assert!(
+        out.status.success(),
+        "sub disable {} failed: {}",
+        name,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Enable a subscription.
+pub fn sub_enable(db: &str, name: &str) {
+    let out = Command::new(bin())
+        .args(["--db", db, "sub", "enable", "--sub", name])
+        .output()
+        .expect("sub enable failed");
+    assert!(
+        out.status.success(),
+        "sub enable {} failed: {}",
+        name,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Stats + Replay helpers (Phase 7 test migration)
 // ---------------------------------------------------------------------------
 
