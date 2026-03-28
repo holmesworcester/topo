@@ -212,6 +212,46 @@ pub fn keys(
     })
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct ContentKeysResponse {
+    pub key_secret_count: i64,
+    pub latest_key_event_id: Option<String>,
+    pub keys: Vec<String>,
+}
+
+pub fn content_keys(
+    db: &Connection,
+    recorded_by: &str,
+    summary: bool,
+) -> Result<ContentKeysResponse, rusqlite::Error> {
+    let key_secret_count: i64 = db.query_row(
+        "SELECT COUNT(*) FROM key_secrets WHERE recorded_by = ?1",
+        rusqlite::params![recorded_by],
+        |row| row.get(0),
+    )?;
+
+    let mut stmt = db.prepare(
+        "SELECT ks.event_id
+         FROM key_secrets ks
+         JOIN events e
+           ON e.event_id = ks.event_id
+         WHERE ks.recorded_by = ?1
+         ORDER BY e.created_at DESC, ks.event_id DESC",
+    )?;
+    let keys = stmt
+        .query_map(rusqlite::params![recorded_by], |row| {
+            row.get::<_, String>(0)
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    let latest_key_event_id = keys.first().cloned();
+
+    Ok(ContentKeysResponse {
+        key_secret_count,
+        latest_key_event_id,
+        keys: if summary { Vec::new() } else { keys },
+    })
+}
+
 // ---------------------------------------------------------------------------
 // View types and functions (moved from service.rs)
 // ---------------------------------------------------------------------------

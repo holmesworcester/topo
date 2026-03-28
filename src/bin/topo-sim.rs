@@ -1,4 +1,7 @@
-use topo::sim::{FakeTopologyPreference, PlannerMode, PlannerSimulation};
+use topo::sim::{
+    emit_key_requests_for_dbs, emit_key_shared_responses_for_dbs, FakeTopologyPreference,
+    KeyResponsePolicy, PlannerMode, PlannerSimulation,
+};
 
 #[derive(Debug, Clone, Copy)]
 enum ModeArg {
@@ -56,6 +59,7 @@ struct Config {
     rounds: u32,
     mode: ModeArg,
     topology: TopologyArg,
+    repair_run: bool,
 }
 
 impl Default for Config {
@@ -65,6 +69,7 @@ impl Default for Config {
             rounds: 1,
             mode: ModeArg::Planner,
             topology: TopologyArg::Graph,
+            repair_run: false,
         }
     }
 }
@@ -100,6 +105,9 @@ fn parse_args() -> Result<Config, String> {
                     .ok_or_else(|| "--topology requires a value".to_string())?;
                 config.topology = TopologyArg::parse(&value)?;
             }
+            "--repair-run" => {
+                config.repair_run = true;
+            }
             other => return Err(format!("unknown arg `{other}`")),
         }
     }
@@ -111,12 +119,27 @@ fn parse_args() -> Result<Config, String> {
 
 fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let config = parse_args()?;
+    let repair_stats = if config.repair_run {
+        let request_stats = emit_key_requests_for_dbs(&config.dbs)?;
+        let response_stats =
+            emit_key_shared_responses_for_dbs(&config.dbs, KeyResponsePolicy::BestObservedOnly)?;
+        Some(serde_json::json!({
+            "request_stats": request_stats,
+            "response_stats": response_stats,
+        }))
+    } else {
+        None
+    };
     let report = PlannerSimulation::with_mode_and_topology(
         config.dbs,
         config.mode.as_planner_mode(),
         config.topology.as_fake_topology(),
     )
     .run_rounds(config.rounds)?;
-    println!("{}", serde_json::to_string_pretty(&report)?);
+    let mut value = serde_json::to_value(&report)?;
+    if let Some(repair_stats) = repair_stats {
+        value["repair_stats"] = repair_stats;
+    }
+    println!("{}", serde_json::to_string_pretty(&value)?);
     Ok(())
 }

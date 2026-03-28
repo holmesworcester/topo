@@ -6,17 +6,19 @@
 #[cfg(test)]
 mod tests {
     use crate::harness::fixtures::*;
-    use topo::event_modules::key_request::{project_pure, KeyRequestEvent};
+    use topo::event_modules::key_request::{delivery_target_id, project_pure, KeyRequestEvent};
     use topo::event_modules::ParsedEvent;
     use topo::projection::contract::ContextSnapshot;
 
     const PEER: &str = "peer_alice";
 
-    fn make_key_request() -> ParsedEvent {
+    fn make_key_request(frontier_hash: [u8; 32], delivery_target_id: [u8; 32]) -> ParsedEvent {
         ParsedEvent::KeyRequest(KeyRequestEvent {
             created_at_ms: 7_000,
             blocked_event_id: [1u8; 32],
             key_event_id: [2u8; 32],
+            frontier_hash,
+            delivery_target_id,
             recipient_event_id: [3u8; 32],
             unwrap_key_event_id: [4u8; 32],
             signed_by: [5u8; 32],
@@ -27,13 +29,30 @@ mod tests {
 
     #[test]
     fn test_key_request_valid() {
-        let parsed = make_key_request();
+        let frontier_hash = [9u8; 32];
+        let parsed = make_key_request(
+            frontier_hash,
+            delivery_target_id(&[2u8; 32], &frontier_hash, &[3u8; 32], &[4u8; 32]),
+        );
         let event_id = b64(&[9u8; 32]);
         let ctx = ContextSnapshot::default();
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
         assert_writes_to_table(&result, "key_requests");
+    }
+
+    #[test]
+    fn test_key_request_rejects_delivery_target_mismatch() {
+        let parsed = make_key_request([9u8; 32], [8u8; 32]);
+        let event_id = b64(&[7u8; 32]);
+        let ctx = ContextSnapshot::default();
+
+        let result = project_pure(PEER, &event_id, &parsed, &ctx);
+        assert_reject_contains(
+            &result,
+            "delivery_target_id does not match key request target",
+        );
     }
 
     #[test]

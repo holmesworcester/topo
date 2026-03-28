@@ -799,8 +799,9 @@ pub(super) fn load_local_peer_signer(
 
 pub use super::commands_api::{
     accept_device_link, accept_invite, create_device_link_for_peer, create_invite_for_db,
-    create_invite_for_peer, create_invite_with_spki, create_workspace_for_db,
-    AcceptDeviceLinkResponse, AcceptInviteResponse, CreateInviteResponse, CreateWorkspaceResponse,
+    create_invite_for_peer, create_invite_with_spki, create_workspace_for_db, rotate_key_for_db,
+    rotate_key_for_peer, AcceptDeviceLinkResponse, AcceptInviteResponse, CreateInviteResponse,
+    CreateWorkspaceResponse, RotateKeyResponse,
 };
 
 #[cfg(test)]

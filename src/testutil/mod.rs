@@ -1623,9 +1623,23 @@ impl Peer {
         peer_shared_event_id: &EventId,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
+        let frontier_hash = crate::event_modules::removal::frontier_hash_from_refs(&[]);
+        let delivery_target_id = crate::event_modules::key_request::delivery_target_id(
+            key_event_id,
+            &frontier_hash,
+            recipient_event_id,
+            unwrap_key_event_id,
+        );
         let evt = ParsedEvent::KeyShared(KeySharedEvent {
             created_at_ms: current_timestamp_ms_u64(),
             key_event_id: *key_event_id,
+            frontier_count: 0,
+            frontier_ref_1: [0u8; 32],
+            frontier_ref_2: [0u8; 32],
+            frontier_ref_3: [0u8; 32],
+            frontier_ref_4: [0u8; 32],
+            frontier_hash,
+            delivery_target_id,
             recipient_event_id: *recipient_event_id,
             unwrap_key_event_id: *unwrap_key_event_id,
             wrapped_key,

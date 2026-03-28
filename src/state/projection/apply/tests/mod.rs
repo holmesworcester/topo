@@ -8,9 +8,9 @@ use crate::db::{
 };
 use crate::event_modules::{
     self as events, registry, BenchDepEvent, EncryptedEvent, FileEvent, FileSliceEvent,
-    KeySecretEvent, KeySharedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent, ReactionEvent,
-    WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_FILE_SLICE, EVENT_TYPE_MESSAGE,
-    EVENT_TYPE_MESSAGE_DELETION, EVENT_TYPE_REACTION,
+    KeyRequestEvent, KeySecretEvent, KeySharedEvent, MessageDeletionEvent, MessageEvent,
+    ParsedEvent, ReactionEvent, WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_FILE_SLICE,
+    EVENT_TYPE_MESSAGE, EVENT_TYPE_MESSAGE_DELETION, EVENT_TYPE_REACTION,
 };
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::encrypted::encrypt_event_blob;
@@ -34,6 +34,7 @@ mod encryption;
 mod file_slice;
 mod identity;
 mod invite;
+mod removal_rotation;
 mod tenant;
 
 fn now_ms() -> u64 {

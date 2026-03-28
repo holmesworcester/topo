@@ -133,6 +133,8 @@ fn parsed_event_type_name(parsed: &ParsedEvent) -> &'static str {
         ParsedEvent::File(_) => "file",
         ParsedEvent::Workspace(_) => "workspace",
         ParsedEvent::InviteAccepted(_) => "invite_accepted",
+        ParsedEvent::Removal(_) => "removal",
+        ParsedEvent::KeyRotation(_) => "key_rotation",
         ParsedEvent::User(_) => "user",
         ParsedEvent::UserInvite(_) => "user_invite_shared",
         ParsedEvent::DeviceInvite(_) => "peer_invite_shared",

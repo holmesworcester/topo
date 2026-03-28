@@ -77,6 +77,53 @@ fn tenant_index_for_peer_id(db_path: &str, peer_id: &str) -> usize {
         .expect("peer id should appear in tenant scopes")
 }
 
+fn create_invite_via_cli(db_path: &str) -> String {
+    let addr = format!("127.0.0.1:{}", random_port());
+    let output = topo_cmd(db_path, &["invite", "--public-addr", &addr]);
+    assert!(
+        output.status.success(),
+        "invite failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    String::from_utf8_lossy(&output.stdout)
+        .lines()
+        .find(|line| line.starts_with("topo://"))
+        .expect("invite output should contain invite link")
+        .trim()
+        .to_string()
+}
+
+fn topo_sim_repair_run(dbs: &[&str]) -> (u64, u64) {
+    let mut cmd = Command::new(env!("CARGO_BIN_EXE_topo-sim"));
+    cmd.arg("--mode")
+        .arg("nearest-neighbor-no-auth")
+        .arg("--topology")
+        .arg("graph")
+        .arg("--rounds")
+        .arg("0")
+        .arg("--repair-run");
+    for db in dbs {
+        cmd.arg("--db").arg(db);
+    }
+    let output = cmd.output().expect("run topo-sim repair-run");
+    assert!(
+        output.status.success(),
+        "topo-sim repair-run failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.stdout).expect("parse topo-sim repair-run json");
+    let requests = json["repair_stats"]["request_stats"]["emitted_requests"]
+        .as_u64()
+        .unwrap_or(0);
+    let responses = json["repair_stats"]["response_stats"]["emitted_responses"]
+        .as_u64()
+        .unwrap_or(0);
+    (requests, responses)
+}
+
 fn wait_for_endpoint_observation(db_path: &str, remote_peer_id: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -353,12 +400,17 @@ fn dial_peer_for_tenant(
         let endpoint =
             quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).map_err(|e| e.to_string())?;
         let result = async {
-            let daemon_connection =
-                topo::transport::dial_daemon_connection(&endpoint, remote, &sni, Some(&client_config))
-                    .await
-                    .map_err(|e| e.to_string())?;
+            let daemon_connection = topo::transport::dial_daemon_connection(
+                &endpoint,
+                remote,
+                &sni,
+                Some(&client_config),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
             let raw_connection = daemon_connection.connection();
-            let actual_remote_daemon_peer_id = daemon_connection.remote_daemon_peer_id().to_string();
+            let actual_remote_daemon_peer_id =
+                daemon_connection.remote_daemon_peer_id().to_string();
             let mut session = daemon_connection
                 .open_outbound_session(topo::transport::SessionClass::Range)
                 .await
@@ -376,8 +428,7 @@ fn dial_peer_for_tenant(
             .await
             .map_err(|e| e.to_string())?;
             let close_probe =
-                tokio::time::timeout(Duration::from_millis(250), raw_connection.closed())
-                    .await;
+                tokio::time::timeout(Duration::from_millis(250), raw_connection.closed()).await;
             raw_connection.close(0u32.into(), b"test done");
             endpoint.close(0u32.into(), b"test done");
             match close_probe {
@@ -1118,6 +1169,147 @@ fn test_cli_send_and_messages() {
     assert_eq!(messages.len(), 2);
     assert!(messages.contains(&"First message".to_string()));
     assert!(messages.contains(&"Second message".to_string()));
+}
+
+#[test]
+fn test_cli_invitee_decrypts_recent_history_from_invite_targeted_key_shares() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("invite-history.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+
+    create_workspace(&db);
+    let mut daemon = start_daemon(&db);
+
+    send_message(&db, "history-0");
+    let (_rotation_1, _proactive_1) = rotate_key(&db);
+    send_message(&db, "history-1");
+    let (_rotation_2, _proactive_2) = rotate_key(&db);
+    send_message(&db, "history-2");
+
+    let invite_link = create_invite_via_cli(&db);
+    accept_invite_with_identity_on_running_daemon(
+        &db,
+        &invite_link,
+        "recent-joiner",
+        "recent-device",
+        Duration::from_secs(10),
+    );
+
+    assert_now(&db, "key_secret_count == 3");
+    assert_now(&db, "message_count == 3");
+
+    let key_ids = get_content_key_ids(&db);
+    assert_eq!(
+        key_ids.len(),
+        3,
+        "invitee should materialize all recent keys"
+    );
+
+    let messages = get_messages(&db);
+    assert!(
+        messages.contains(&"history-0".to_string()),
+        "invitee should decrypt earliest recent message from invite-targeted share"
+    );
+    assert!(
+        messages.contains(&"history-1".to_string()),
+        "invitee should decrypt rotated message from invite-targeted share"
+    );
+    assert!(
+        messages.contains(&"history-2".to_string()),
+        "invitee should decrypt latest message from invite-targeted share"
+    );
+
+    stop_daemon(&db, &mut daemon);
+}
+
+#[test]
+fn test_cli_invite_history_cap_then_repair_run_recovers_older_history() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("invite-history-cap.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let history_cap = topo::event_modules::workspace::identity_ops::INVITE_HISTORY_KEY_CAP;
+    let total_keys = history_cap + 4;
+
+    create_workspace(&db);
+    let mut daemon = start_daemon(&db);
+
+    send_message(&db, "history-000");
+    for idx in 1..total_keys {
+        let (_rotation_event_id, _proactive_shares) = rotate_key(&db);
+        send_message(&db, &format!("history-{idx:03}"));
+    }
+
+    let invite_link = create_invite_via_cli(&db);
+    accept_invite_with_identity_on_running_daemon(
+        &db,
+        &invite_link,
+        "cap-joiner",
+        "cap-device",
+        Duration::from_secs(20),
+    );
+
+    assert_now(&db, &format!("key_secret_count == {}", history_cap));
+    assert_now(&db, &format!("message_count == {}", history_cap));
+    assert_now(&db, "blocked_event_count >= 1");
+
+    let before_repair = topo_cmd(&db, &["messages", "--limit", "0"]);
+    assert!(
+        before_repair.status.success(),
+        "messages before repair failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&before_repair.stdout),
+        String::from_utf8_lossy(&before_repair.stderr)
+    );
+    let before_text = String::from_utf8_lossy(&before_repair.stdout);
+    assert!(
+        before_text.contains(&format!("history-{:03}", total_keys - 1)),
+        "latest in-cap history should be visible before repair"
+    );
+    assert!(
+        !before_text.contains("history-000"),
+        "oldest out-of-cap history should remain blocked before repair"
+    );
+
+    stop_daemon(&db, &mut daemon);
+    let (requests, responses) = topo_sim_repair_run(&[&db]);
+    assert!(
+        requests > 0,
+        "topo-sim repair-run should emit at least one key_request"
+    );
+    assert!(
+        responses > 0,
+        "topo-sim repair-run should emit at least one key_shared response"
+    );
+
+    daemon = start_daemon(&db);
+    wait_for_daemon_ready(&db, Duration::from_secs(10));
+    use_tenant_for_username(&db, "cap-joiner");
+    wait_for_active_tenant_ready(&db, Duration::from_secs(10));
+
+    assert_eventually(&db, &format!("key_secret_count == {}", total_keys), 20_000);
+    assert_eventually(&db, &format!("message_count == {}", total_keys), 20_000);
+
+    let after_repair = topo_cmd(&db, &["messages", "--limit", "0"]);
+    assert!(
+        after_repair.status.success(),
+        "messages after repair failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&after_repair.stdout),
+        String::from_utf8_lossy(&after_repair.stderr)
+    );
+    let after_text = String::from_utf8_lossy(&after_repair.stdout);
+    assert!(
+        after_text.contains("history-000"),
+        "oldest out-of-cap history should decrypt after topo-sim repair-run"
+    );
+
+    stop_daemon(&db, &mut daemon);
 }
 
 #[test]

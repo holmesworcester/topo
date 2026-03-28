@@ -1,6 +1,8 @@
 use super::*;
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::{open_in_memory, schema::create_tables};
+use crate::event_modules::{parse_event, ParsedEvent, RemovalEvent};
+use crate::projection::create::create_signed_event_synchronous;
 use ed25519_dalek::SigningKey;
 
 fn peer_id_for_signing_key(key: &SigningKey) -> String {
@@ -24,6 +26,59 @@ fn record_invite_link_workspace(
         &[0xAB; 32],
     )
     .expect("record invite-link workspace binding");
+}
+
+fn create_local_removal(
+    conn: &rusqlite::Connection,
+    recorded_by: &str,
+    signer_event_id: &EventId,
+    signing_key: &SigningKey,
+    removed_member_ref: EventId,
+    parent_refs: &[EventId],
+) -> EventId {
+    let slots = crate::event_modules::removal::canonicalize_frontier_refs(parent_refs)
+        .expect("canonical removal frontier refs");
+    assert!(
+        slots.len() <= crate::event_modules::removal::MAX_REMOVAL_FRONTIER_REFS,
+        "test frontier should fit in event slots"
+    );
+    let mut parent_slots = [[0u8; 32]; crate::event_modules::removal::MAX_REMOVAL_FRONTIER_REFS];
+    for (slot, event_id) in parent_slots.iter_mut().zip(slots.iter()) {
+        *slot = *event_id;
+    }
+    let removal = ParsedEvent::Removal(RemovalEvent {
+        created_at_ms: 9_000,
+        removed_member_ref,
+        parent_count: slots.len() as u8,
+        parent_1: parent_slots[0],
+        parent_2: parent_slots[1],
+        parent_3: parent_slots[2],
+        parent_4: parent_slots[3],
+        frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&slots),
+        removed_by: *signer_event_id,
+        signed_by: *signer_event_id,
+        signer_type: 5,
+        signature: [0u8; 64],
+    });
+    create_signed_event_synchronous(conn, recorded_by, &removal, signing_key)
+        .expect("create signed removal")
+}
+
+fn encrypted_wrapper_key_event_id(
+    conn: &rusqlite::Connection,
+    wrapper_event_id: &EventId,
+) -> EventId {
+    let blob: Vec<u8> = conn
+        .query_row(
+            "SELECT blob FROM events WHERE event_id = ?1",
+            rusqlite::params![event_id_to_base64(wrapper_event_id)],
+            |row| row.get(0),
+        )
+        .expect("load encrypted wrapper blob");
+    match parse_event(&blob).expect("parse encrypted wrapper") {
+        ParsedEvent::Encrypted(enc) => enc.key_event_id,
+        other => panic!("expected encrypted wrapper, got {:?}", other),
+    }
 }
 
 #[test]
@@ -457,5 +512,115 @@ fn add_device_replays_existing_same_workspace_shared_events_for_new_device() {
     assert_eq!(
         blocked_count, 0,
         "device link should not leave blocked local events"
+    );
+}
+
+#[test]
+fn send_rotates_on_new_local_removal_frontier_and_reuses_frontier_key() {
+    let conn = open_in_memory().expect("open in-memory db");
+    create_tables(&conn).expect("create tables");
+
+    let workspace =
+        create_workspace(&conn, "bootstrap", "ws", "alice", "laptop").expect("create workspace");
+    let recorded_by = peer_id_for_signing_key(&workspace.peer_shared_key);
+    let author_id: EventId = conn
+        .query_row(
+            "SELECT event_id FROM users WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
+            rusqlite::params![&recorded_by],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
+        .expect("creator user event");
+
+    let root_key = crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+        &conn,
+        &recorded_by,
+    )
+    .expect("root content key");
+    let root_wrapper = crate::event_modules::message::commands::create(
+        &conn,
+        &recorded_by,
+        &workspace.peer_shared_event_id,
+        &workspace.peer_shared_key,
+        10_000,
+        crate::event_modules::message::commands::CreateMessageCmd {
+            workspace_id: workspace.workspace_id,
+            author_id,
+            content: "before-removal".to_string(),
+        },
+    )
+    .expect("create message before removal");
+    assert_eq!(
+        encrypted_wrapper_key_event_id(&conn, &root_wrapper),
+        root_key,
+        "message before removal should use the existing root-frontier key"
+    );
+
+    let removal_event_id = create_local_removal(
+        &conn,
+        &recorded_by,
+        &workspace.peer_shared_event_id,
+        &workspace.peer_shared_key,
+        [0x55; 32],
+        &[],
+    );
+
+    let first_post_removal_wrapper = crate::event_modules::message::commands::create(
+        &conn,
+        &recorded_by,
+        &workspace.peer_shared_event_id,
+        &workspace.peer_shared_key,
+        11_000,
+        crate::event_modules::message::commands::CreateMessageCmd {
+            workspace_id: workspace.workspace_id,
+            author_id,
+            content: "after-removal-1".to_string(),
+        },
+    )
+    .expect("create first post-removal message");
+    let frontier_key = encrypted_wrapper_key_event_id(&conn, &first_post_removal_wrapper);
+    assert_ne!(
+        frontier_key, root_key,
+        "message send must rotate to a new key once the local removal frontier advances"
+    );
+
+    let expected_frontier_hash =
+        event_id_to_base64(&crate::event_modules::removal::frontier_hash_from_refs(&[
+            removal_event_id,
+        ]));
+    let stored_frontier_hash: String = conn
+        .query_row(
+            "SELECT frontier_hash
+             FROM key_rotations
+             WHERE recorded_by = ?1 AND key_event_id = ?2
+             ORDER BY rowid DESC
+             LIMIT 1",
+            rusqlite::params![&recorded_by, event_id_to_base64(&frontier_key)],
+            |row| row.get(0),
+        )
+        .expect("query post-removal key frontier");
+    assert_eq!(
+        stored_frontier_hash, expected_frontier_hash,
+        "rotated key must be stamped with the sender's current removal frontier"
+    );
+
+    let second_post_removal_wrapper = crate::event_modules::message::commands::create(
+        &conn,
+        &recorded_by,
+        &workspace.peer_shared_event_id,
+        &workspace.peer_shared_key,
+        12_000,
+        crate::event_modules::message::commands::CreateMessageCmd {
+            workspace_id: workspace.workspace_id,
+            author_id,
+            content: "after-removal-2".to_string(),
+        },
+    )
+    .expect("create second post-removal message");
+    assert_eq!(
+        encrypted_wrapper_key_event_id(&conn, &second_post_removal_wrapper),
+        frontier_key,
+        "once a key exists for the current frontier, later sends should reuse it"
     );
 }

@@ -34,6 +34,13 @@ pub struct AcceptDeviceLinkResponse {
     pub peer_shared_event_id: String,
 }
 
+#[derive(Debug, Serialize, Deserialize)]
+pub struct RotateKeyResponse {
+    pub key_event_id: String,
+    pub rotation_event_id: String,
+    pub proactive_share_count: usize,
+}
+
 fn signer_is_admin(
     db: &Connection,
     recorded_by: &str,
@@ -199,6 +206,19 @@ fn create_invite_for_recorded_by(
     })
 }
 
+fn rotate_key_for_recorded_by(
+    db: &Connection,
+    recorded_by: &str,
+) -> Result<RotateKeyResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let _ = super::load_local_authoring_context(db, recorded_by)?;
+    let result = super::identity_ops::rotate_content_key_for_peer(db, recorded_by)?;
+    Ok(RotateKeyResponse {
+        key_event_id: event_id_to_base64(&result.key_event_id),
+        rotation_event_id: event_id_to_base64(&result.rotation_event_id),
+        proactive_share_count: result.proactive_share_count,
+    })
+}
+
 pub fn create_invite_for_db(
     db_path: &str,
     bootstrap_addrs: &[super::invite_link::BootstrapAddress],
@@ -209,6 +229,16 @@ pub fn create_invite_for_db(
             format!("No transport identity: {}", e).into()
         })?;
     create_invite_for_recorded_by(&db, &recorded_by, bootstrap_addrs, listen_port, None)
+}
+
+pub fn rotate_key_for_db(
+    db_path: &str,
+) -> Result<RotateKeyResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (recorded_by, db) =
+        open_db_load(db_path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("No transport identity: {}", e).into()
+        })?;
+    rotate_key_for_recorded_by(&db, &recorded_by)
 }
 
 /// Create invite with an explicit SPKI hex.
@@ -242,6 +272,14 @@ pub fn create_invite_for_peer(
 ) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
     create_invite_for_recorded_by(&db, peer_id, bootstrap_addrs, listen_port, public_spki_hex)
+}
+
+pub fn rotate_key_for_peer(
+    db_path: &str,
+    peer_id: &str,
+) -> Result<RotateKeyResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
+    rotate_key_for_recorded_by(&db, peer_id)
 }
 
 struct PreparedInviteAcceptance {

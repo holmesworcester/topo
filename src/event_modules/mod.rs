@@ -6,6 +6,7 @@ pub mod file_slice;
 pub mod invite_accepted;
 pub mod invite_secret;
 pub mod key_request;
+pub mod key_rotation;
 pub mod key_secret;
 pub mod key_shared;
 pub mod layout;
@@ -16,6 +17,7 @@ pub mod peer_secret;
 pub mod peer_shared;
 pub mod reaction;
 pub mod registry;
+pub mod removal;
 pub mod tenant;
 pub mod user;
 pub mod user_invite_shared;
@@ -56,6 +58,7 @@ pub use file_slice::FileSliceEvent;
 pub use invite_accepted::InviteAcceptedEvent;
 pub use invite_secret::InviteSecretEvent;
 pub use key_request::KeyRequestEvent;
+pub use key_rotation::KeyRotationEvent;
 pub use key_secret::KeySecretEvent;
 pub use key_shared::KeySharedEvent;
 pub use message::MessageEvent;
@@ -65,6 +68,7 @@ pub use peer_secret::PeerSecretEvent;
 pub use peer_shared::PeerSharedEvent;
 pub use reaction::ReactionEvent;
 pub use registry::{EventRegistry, EventTypeMeta, ShareScope, TransportPrivacy};
+pub use removal::RemovalEvent;
 pub use tenant::TenantEvent;
 pub use user::UserEvent;
 pub use user_invite_shared::UserInviteEvent;
@@ -91,6 +95,8 @@ pub const EVENT_TYPE_PEER_SECRET: u8 = 27;
 pub const EVENT_TYPE_INVITE_SECRET: u8 = 28;
 pub const EVENT_TYPE_TENANT: u8 = 29;
 pub const EVENT_TYPE_KEY_REQUEST: u8 = 30;
+pub const EVENT_TYPE_REMOVAL: u8 = 31;
+pub const EVENT_TYPE_KEY_ROTATION: u8 = 32;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -119,6 +125,8 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     key_secret::ensure_schema(conn)?;
     key_shared::ensure_schema(conn)?;
     key_request::ensure_schema(conn)?;
+    removal::ensure_schema(conn)?;
+    key_rotation::ensure_schema(conn)?;
     tenant::ensure_schema(conn)?;
     peer_secret::ensure_schema(conn)?;
     invite_secret::ensure_schema(conn)?;
@@ -135,6 +143,8 @@ pub enum ParsedEvent {
     MessageDeletion(MessageDeletionEvent),
     Workspace(WorkspaceEvent),
     InviteAccepted(InviteAcceptedEvent),
+    Removal(RemovalEvent),
+    KeyRotation(KeyRotationEvent),
     KeyRequest(KeyRequestEvent),
     UserInvite(UserInviteEvent),
     DeviceInvite(DeviceInviteEvent),
@@ -160,6 +170,8 @@ impl ParsedEvent {
             ParsedEvent::MessageDeletion(d) => d.created_at_ms,
             ParsedEvent::Workspace(w) => w.created_at_ms,
             ParsedEvent::InviteAccepted(a) => a.created_at_ms,
+            ParsedEvent::Removal(r) => r.created_at_ms,
+            ParsedEvent::KeyRotation(k) => k.created_at_ms,
             ParsedEvent::KeyRequest(k) => k.created_at_ms,
             ParsedEvent::UserInvite(u) => u.created_at_ms,
             ParsedEvent::DeviceInvite(d) => d.created_at_ms,
@@ -193,6 +205,43 @@ impl ParsedEvent {
             ParsedEvent::MessageDeletion(d) => vec![("signed_by", d.signed_by)],
             ParsedEvent::Workspace(_) => vec![],
             ParsedEvent::InviteAccepted(a) => vec![("tenant_event_id", a.tenant_event_id)],
+            ParsedEvent::Removal(r) => {
+                let slots = [r.parent_1, r.parent_2, r.parent_3, r.parent_4];
+                let mut deps = removal::frontier_refs_from_slots(r.parent_count, &slots)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, id)| match idx {
+                        0 => ("parent_1", id),
+                        1 => ("parent_2", id),
+                        2 => ("parent_3", id),
+                        _ => ("parent_4", id),
+                    })
+                    .collect::<Vec<_>>();
+                deps.push(("signed_by", r.signed_by));
+                deps
+            }
+            ParsedEvent::KeyRotation(k) => {
+                let slots = [
+                    k.frontier_ref_1,
+                    k.frontier_ref_2,
+                    k.frontier_ref_3,
+                    k.frontier_ref_4,
+                ];
+                let mut deps = removal::frontier_refs_from_slots(k.frontier_count, &slots)
+                    .unwrap_or_default()
+                    .into_iter()
+                    .enumerate()
+                    .map(|(idx, id)| match idx {
+                        0 => ("frontier_ref_1", id),
+                        1 => ("frontier_ref_2", id),
+                        2 => ("frontier_ref_3", id),
+                        _ => ("frontier_ref_4", id),
+                    })
+                    .collect::<Vec<_>>();
+                deps.push(("signed_by", k.signed_by));
+                deps
+            }
             ParsedEvent::KeyRequest(k) => vec![("signed_by", k.signed_by)],
             ParsedEvent::UserInvite(u) => {
                 vec![
@@ -220,10 +269,27 @@ impl ParsedEvent {
                 ]
             }
             ParsedEvent::KeyShared(s) => {
-                vec![
-                    ("recipient_event_id", s.recipient_event_id),
-                    ("signed_by", s.signed_by),
-                ]
+                let slots = [
+                    s.frontier_ref_1,
+                    s.frontier_ref_2,
+                    s.frontier_ref_3,
+                    s.frontier_ref_4,
+                ];
+                let mut deps = vec![("recipient_event_id", s.recipient_event_id)];
+                deps.extend(
+                    removal::frontier_refs_from_slots(s.frontier_count, &slots)
+                        .unwrap_or_default()
+                        .into_iter()
+                        .enumerate()
+                        .map(|(idx, id)| match idx {
+                            0 => ("frontier_ref_1", id),
+                            1 => ("frontier_ref_2", id),
+                            2 => ("frontier_ref_3", id),
+                            _ => ("frontier_ref_4", id),
+                        }),
+                );
+                deps.push(("signed_by", s.signed_by));
+                deps
             }
             ParsedEvent::Tenant(_) => vec![],
             ParsedEvent::File(a) => vec![
@@ -247,6 +313,8 @@ impl ParsedEvent {
             ParsedEvent::MessageDeletion(_) => EVENT_TYPE_MESSAGE_DELETION,
             ParsedEvent::Workspace(_) => EVENT_TYPE_WORKSPACE,
             ParsedEvent::InviteAccepted(_) => EVENT_TYPE_INVITE_ACCEPTED,
+            ParsedEvent::Removal(_) => EVENT_TYPE_REMOVAL,
+            ParsedEvent::KeyRotation(_) => EVENT_TYPE_KEY_ROTATION,
             ParsedEvent::KeyRequest(_) => EVENT_TYPE_KEY_REQUEST,
             ParsedEvent::UserInvite(_) => EVENT_TYPE_USER_INVITE,
             ParsedEvent::DeviceInvite(_) => EVENT_TYPE_DEVICE_INVITE,
@@ -273,6 +341,8 @@ impl ParsedEvent {
             ParsedEvent::PeerShared(p) => Some((p.signed_by, p.signer_type)),
             ParsedEvent::Admin(a) => Some((a.signed_by, a.signer_type)),
             ParsedEvent::KeyShared(s) => Some((s.signed_by, s.signer_type)),
+            ParsedEvent::Removal(r) => Some((r.signed_by, r.signer_type)),
+            ParsedEvent::KeyRotation(k) => Some((k.signed_by, k.signer_type)),
             ParsedEvent::KeyRequest(k) => Some((k.signed_by, k.signer_type)),
             ParsedEvent::FileSlice(f) => Some((f.signed_by, f.signer_type)),
             ParsedEvent::Message(m) => Some((m.signed_by, m.signer_type)),
@@ -300,6 +370,8 @@ impl ParsedEvent {
             ParsedEvent::MessageDeletion(e) => e.human_fields(),
             ParsedEvent::Workspace(e) => e.human_fields(),
             ParsedEvent::InviteAccepted(e) => e.human_fields(),
+            ParsedEvent::Removal(e) => e.human_fields(),
+            ParsedEvent::KeyRotation(e) => e.human_fields(),
             ParsedEvent::KeyRequest(e) => e.human_fields(),
             ParsedEvent::UserInvite(e) => e.human_fields(),
             ParsedEvent::DeviceInvite(e) => e.human_fields(),
@@ -390,6 +462,8 @@ pub fn registry() -> &'static EventRegistry {
             &message_deletion::MESSAGE_DELETION_META,
             &workspace::WORKSPACE_META,
             &invite_accepted::INVITE_ACCEPTED_META,
+            &removal::REMOVAL_META,
+            &key_rotation::KEY_ROTATION_META,
             &key_request::KEY_REQUEST_META,
             &user_invite_shared::USER_INVITE_META,
             &peer_invite_shared::DEVICE_INVITE_META,

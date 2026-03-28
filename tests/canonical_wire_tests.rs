@@ -2,6 +2,7 @@
 //! for all canonical event types with fixed wire layouts.
 
 use topo::event_modules::file::file_offsets;
+use topo::event_modules::key_request::delivery_target_id;
 use topo::event_modules::layout::common::{
     encrypted_inner_wire_size, encrypted_wire_size, ENCRYPTED_HEADER_BYTES,
 };
@@ -10,7 +11,7 @@ use topo::event_modules::message::layout::offsets as message_offsets;
 use topo::event_modules::reaction::wire::REACTION_FIELDS;
 use topo::event_modules::{
     self as events, BenchDepEvent, EncryptedEvent, EventError, FileEvent, FileSliceEvent,
-    KeyRequestEvent, MessageEvent, ParsedEvent, ReactionEvent,
+    KeyRequestEvent, KeySharedEvent, MessageEvent, ParsedEvent, ReactionEvent,
 };
 
 // ─── Golden-byte tests ───
@@ -151,10 +152,18 @@ fn golden_bytes_bench_dep() {
 
 #[test]
 fn golden_bytes_key_request() {
+    let frontier_hash = [0x23; 32];
     let kr = ParsedEvent::KeyRequest(KeyRequestEvent {
         created_at_ms: 7000,
         blocked_event_id: [0x11; 32],
         key_event_id: [0x22; 32],
+        frontier_hash,
+        delivery_target_id: delivery_target_id(
+            &[0x22; 32],
+            &frontier_hash,
+            &[0x33; 32],
+            &[0x44; 32],
+        ),
         recipient_event_id: [0x33; 32],
         unwrap_key_event_id: [0x44; 32],
         signed_by: [0x55; 32],
@@ -166,11 +175,60 @@ fn golden_bytes_key_request() {
     assert_eq!(blob[0], 30);
     assert_eq!(&blob[9..41], &[0x11; 32]);
     assert_eq!(&blob[41..73], &[0x22; 32]);
-    assert_eq!(&blob[73..105], &[0x33; 32]);
-    assert_eq!(&blob[105..137], &[0x44; 32]);
-    assert_eq!(&blob[137..169], &[0x55; 32]);
-    assert_eq!(blob[169], 5);
-    assert_eq!(&blob[170..234], &[0x66; 64]);
+    assert_eq!(&blob[73..105], &frontier_hash);
+    assert_eq!(
+        &blob[105..137],
+        &delivery_target_id(&[0x22; 32], &frontier_hash, &[0x33; 32], &[0x44; 32])
+    );
+    assert_eq!(&blob[137..169], &[0x33; 32]);
+    assert_eq!(&blob[169..201], &[0x44; 32]);
+    assert_eq!(&blob[201..233], &[0x55; 32]);
+    assert_eq!(blob[233], 5);
+    assert_eq!(&blob[234..298], &[0x66; 64]);
+}
+
+#[test]
+fn golden_bytes_key_shared() {
+    let frontier_hash = topo::event_modules::removal::frontier_hash_from_refs(&[]);
+    let ks = ParsedEvent::KeyShared(KeySharedEvent {
+        created_at_ms: 6000,
+        key_event_id: [0x21; 32],
+        frontier_count: 0,
+        frontier_ref_1: [0u8; 32],
+        frontier_ref_2: [0u8; 32],
+        frontier_ref_3: [0u8; 32],
+        frontier_ref_4: [0u8; 32],
+        frontier_hash,
+        delivery_target_id: delivery_target_id(
+            &[0x21; 32],
+            &frontier_hash,
+            &[0x31; 32],
+            &[0x41; 32],
+        ),
+        recipient_event_id: [0x31; 32],
+        unwrap_key_event_id: [0x41; 32],
+        wrapped_key: [0x51; 32],
+        signed_by: [0x61; 32],
+        signer_type: 5,
+        signature: [0x71; 64],
+    });
+    let blob = events::encode_event(&ks).unwrap();
+    assert_eq!(blob.len(), events::key_shared::KEY_SHARED_WIRE_SIZE);
+    assert_eq!(blob[0], 22);
+    assert_eq!(&blob[9..41], &[0x21; 32]);
+    assert_eq!(blob[41], 0);
+    assert!(blob[42..170].iter().all(|&b| b == 0));
+    assert_eq!(&blob[170..202], &frontier_hash);
+    assert_eq!(
+        &blob[202..234],
+        &delivery_target_id(&[0x21; 32], &frontier_hash, &[0x31; 32], &[0x41; 32])
+    );
+    assert_eq!(&blob[234..266], &[0x31; 32]);
+    assert_eq!(&blob[266..298], &[0x41; 32]);
+    assert_eq!(&blob[298..330], &[0x51; 32]);
+    assert_eq!(&blob[330..362], &[0x61; 32]);
+    assert_eq!(blob[362], 5);
+    assert_eq!(&blob[363..427], &[0x71; 64]);
 }
 
 // ─── Negative parse tests: truncation ───
@@ -238,10 +296,13 @@ fn truncation_bench_dep() {
 
 #[test]
 fn truncation_key_request() {
+    let frontier_hash = [4u8; 32];
     let kr = ParsedEvent::KeyRequest(KeyRequestEvent {
         created_at_ms: 100,
         blocked_event_id: [0u8; 32],
         key_event_id: [1u8; 32],
+        frontier_hash,
+        delivery_target_id: delivery_target_id(&[1u8; 32], &frontier_hash, &[2u8; 32], &[3u8; 32]),
         recipient_event_id: [2u8; 32],
         unwrap_key_event_id: [3u8; 32],
         signed_by: [4u8; 32],
@@ -249,6 +310,31 @@ fn truncation_key_request() {
         signature: [0u8; 64],
     });
     let blob = events::encode_event(&kr).unwrap();
+    let err = events::parse_event(&blob[..blob.len() - 1]).unwrap_err();
+    assert!(matches!(err, EventError::TooShort { .. }));
+}
+
+#[test]
+fn truncation_key_shared() {
+    let frontier_hash = topo::event_modules::removal::frontier_hash_from_refs(&[]);
+    let ks = ParsedEvent::KeyShared(KeySharedEvent {
+        created_at_ms: 100,
+        key_event_id: [1u8; 32],
+        frontier_count: 0,
+        frontier_ref_1: [0u8; 32],
+        frontier_ref_2: [0u8; 32],
+        frontier_ref_3: [0u8; 32],
+        frontier_ref_4: [0u8; 32],
+        frontier_hash,
+        delivery_target_id: delivery_target_id(&[1u8; 32], &frontier_hash, &[2u8; 32], &[3u8; 32]),
+        recipient_event_id: [2u8; 32],
+        unwrap_key_event_id: [3u8; 32],
+        wrapped_key: [4u8; 32],
+        signed_by: [5u8; 32],
+        signer_type: 5,
+        signature: [6u8; 64],
+    });
+    let blob = events::encode_event(&ks).unwrap();
     let err = events::parse_event(&blob[..blob.len() - 1]).unwrap_err();
     assert!(matches!(err, EventError::TooShort { .. }));
 }
@@ -690,14 +776,49 @@ fn idempotent_bench_dep_full() {
 
 #[test]
 fn idempotent_key_request() {
+    let frontier_hash = [33u8; 32];
     assert_idempotent(&ParsedEvent::KeyRequest(KeyRequestEvent {
         created_at_ms: 1_234,
         blocked_event_id: [29u8; 32],
         key_event_id: [30u8; 32],
+        frontier_hash,
+        delivery_target_id: delivery_target_id(
+            &[30u8; 32],
+            &frontier_hash,
+            &[31u8; 32],
+            &[32u8; 32],
+        ),
         recipient_event_id: [31u8; 32],
         unwrap_key_event_id: [32u8; 32],
         signed_by: [33u8; 32],
         signer_type: 5,
         signature: [34u8; 64],
+    }));
+}
+
+#[test]
+fn idempotent_key_shared() {
+    let frontier_hash = topo::event_modules::removal::frontier_hash_from_refs(&[]);
+    assert_idempotent(&ParsedEvent::KeyShared(KeySharedEvent {
+        created_at_ms: 1_235,
+        key_event_id: [36u8; 32],
+        frontier_count: 0,
+        frontier_ref_1: [0u8; 32],
+        frontier_ref_2: [0u8; 32],
+        frontier_ref_3: [0u8; 32],
+        frontier_ref_4: [0u8; 32],
+        frontier_hash,
+        delivery_target_id: delivery_target_id(
+            &[36u8; 32],
+            &frontier_hash,
+            &[37u8; 32],
+            &[38u8; 32],
+        ),
+        recipient_event_id: [37u8; 32],
+        unwrap_key_event_id: [38u8; 32],
+        wrapped_key: [39u8; 32],
+        signed_by: [40u8; 32],
+        signer_type: 5,
+        signature: [41u8; 64],
     }));
 }

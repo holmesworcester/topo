@@ -2,6 +2,7 @@ pub mod clock;
 pub mod hash_graph;
 pub mod key_repair;
 pub mod knowledge;
+pub mod large_graph_sample;
 pub mod pair_sync;
 #[allow(dead_code)]
 mod peer_db_bridge;
@@ -14,11 +15,16 @@ pub mod virtual_daemon;
 
 pub use clock::SimTime;
 pub use key_repair::{
-    create_encrypted_message_with_key, emit_key_requests_for_dbs,
-    emit_key_shared_responses_for_dbs, seed_deterministic_key_secret, KeyRepairEmitStats,
+    create_encrypted_message_with_key, create_key_rotation, create_removal,
+    emit_key_requests_for_dbs, emit_key_requests_for_peers, emit_key_shared_responses_for_dbs,
+    emit_key_shared_responses_for_peers, seed_deterministic_key_secret, KeyRepairEmitStats,
     KeyResponsePolicy,
 };
 pub use knowledge::{exact_matrix_bytes, SparseKnowledge};
+pub use large_graph_sample::{
+    run_large_graph_sampled_decrypt_trial, LargeGraphSampleDecryptConfig,
+    LargeGraphSampleDecryptPeerReport, LargeGraphSampleDecryptReport,
+};
 pub use pair_sync::{
     plan_pair_sync_intents, run_pair_sync_session, PairSyncDirectionStats, PairSyncIntent,
     PairSyncSessionStats, SimPeerNode,

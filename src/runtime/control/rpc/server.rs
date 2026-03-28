@@ -996,6 +996,13 @@ fn dispatch(
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }),
+        RpcMethod::ContentKeys { summary } => with_active_peer_db(
+            state,
+            |_peer_id, recorded_by, db| match workspace::content_keys(db, recorded_by, summary) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+        ),
         RpcMethod::Peers => {
             with_active_peer_db(
                 state,
@@ -1113,6 +1120,16 @@ fn dispatch(
                     Err(e) => RpcResponse::error(e.to_string()),
                 }
             }
+            Err(e) => RpcResponse::error(e),
+        },
+        RpcMethod::RotateKey => match state.require_active_peer() {
+            Ok(peer_id) => match workspace::commands::rotate_key_for_peer(db_path, &peer_id) {
+                Ok(data) => {
+                    state.notify_runtime_recheck();
+                    RpcResponse::success(data)
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
             Err(e) => RpcResponse::error(e),
         },
         RpcMethod::Upnp { action } => match action {

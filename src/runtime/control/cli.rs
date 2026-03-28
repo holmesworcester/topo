@@ -214,6 +214,14 @@ pub(crate) enum Commands {
         summary: bool,
     },
 
+    /// List local content/decryption keys
+    #[command(name = "content-keys")]
+    ContentKeys {
+        /// Show summary only
+        #[arg(long)]
+        summary: bool,
+    },
+
     /// Show all projection table counts
     Stats {
         /// Output as JSON
@@ -279,6 +287,10 @@ pub(crate) enum Commands {
         #[arg(long)]
         public_spki: Option<String>,
     },
+
+    /// Rotate to a fresh content key for the active workspace
+    #[command(name = "rotate-key")]
+    RotateKey,
 
     /// Create a device link invite for the active peer's user
     Link {

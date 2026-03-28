@@ -13,10 +13,10 @@ pub mod wire;
 pub use authoring::{load_local_authoring_context, LocalAuthoringContext};
 pub use projector::project_pure;
 pub use queries::{
-    keys, list, list_all_items, list_items, list_tenants_for_display, name,
-    resolve_workspace_for_peer, status, view, view_for_peer, KeysResponse, StatusResponse,
-    ViewFileSummary, ViewMessage, ViewReaction, ViewResponse, ViewTenant, WorkspaceItem,
-    WorkspaceRow,
+    content_keys, keys, list, list_all_items, list_items, list_tenants_for_display, name,
+    resolve_workspace_for_peer, status, view, view_for_peer, ContentKeysResponse, KeysResponse,
+    StatusResponse, ViewFileSummary, ViewMessage, ViewReaction, ViewResponse, ViewTenant,
+    WorkspaceItem, WorkspaceRow,
 };
 pub use wire::{
     encode_workspace, parse_workspace, WorkspaceEvent, WORKSPACE_META, WORKSPACE_WIRE_SIZE,

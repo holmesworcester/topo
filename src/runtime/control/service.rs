@@ -149,10 +149,11 @@ pub use crate::event_modules::reaction::{ReactResponse, ReactionItem};
 pub use crate::event_modules::user::UserItem;
 pub use crate::event_modules::workspace::commands::{
     AcceptDeviceLinkResponse, AcceptInviteResponse, CreateInviteResponse, CreateWorkspaceResponse,
+    RotateKeyResponse,
 };
 pub use crate::event_modules::workspace::{
-    KeysResponse, StatusResponse, ViewMessage, ViewReaction, ViewResponse, ViewTenant,
-    WorkspaceItem,
+    ContentKeysResponse, KeysResponse, StatusResponse, ViewMessage, ViewReaction, ViewResponse,
+    ViewTenant, WorkspaceItem,
 };
 
 // ---------------------------------------------------------------------------

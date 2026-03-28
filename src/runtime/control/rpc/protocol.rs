@@ -74,6 +74,9 @@ pub enum RpcMethod {
     Keys {
         summary: bool,
     },
+    ContentKeys {
+        summary: bool,
+    },
     Workspaces,
     IntroAttempts {
         peer: Option<String>,
@@ -84,6 +87,7 @@ pub enum RpcMethod {
         #[serde(default)]
         public_spki: Option<String>,
     },
+    RotateKey,
     AcceptInvite {
         invite: String,
         username: String,

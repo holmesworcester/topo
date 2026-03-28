@@ -154,6 +154,12 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"Keys","summary":true}"#,
     },
     MethodInfo {
+        name: "ContentKeys",
+        purpose: "List local content/decryption keys",
+        params: params!["summary", "bool", true, None],
+        example_json: r#"{"type":"ContentKeys","summary":true}"#,
+    },
+    MethodInfo {
         name: "Workspaces",
         purpose: "List workspaces from projection",
         params: PARAM_NONE,
@@ -173,6 +179,12 @@ static CATALOG: &[MethodInfo] = &[
             "public_spki", "string?", false, None
         ],
         example_json: r#"{"type":"CreateInvite"}"#,
+    },
+    MethodInfo {
+        name: "RotateKey",
+        purpose: "Create a new content key and frontier-bound key_rotation for the active workspace",
+        params: PARAM_NONE,
+        example_json: r#"{"type":"RotateKey"}"#,
     },
     MethodInfo {
         name: "AcceptInvite",

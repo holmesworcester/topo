@@ -10,6 +10,16 @@ fn topo_sim_bin() -> String {
 }
 
 fn run_topo_sim(dbs: &[String], mode: &str, topology: &str, rounds: u32) -> serde_json::Value {
+    run_topo_sim_with_options(dbs, mode, topology, rounds, false)
+}
+
+fn run_topo_sim_with_options(
+    dbs: &[String],
+    mode: &str,
+    topology: &str,
+    rounds: u32,
+    repair_run: bool,
+) -> serde_json::Value {
     let mut cmd = Command::new(topo_sim_bin());
     cmd.arg("--mode")
         .arg(mode)
@@ -17,6 +27,9 @@ fn run_topo_sim(dbs: &[String], mode: &str, topology: &str, rounds: u32) -> serd
         .arg(topology)
         .arg("--rounds")
         .arg(rounds.to_string());
+    if repair_run {
+        cmd.arg("--repair-run");
+    }
     for db in dbs {
         cmd.arg("--db").arg(db);
     }
@@ -169,4 +182,30 @@ fn topo_sim_fake_graph_propagates_one_message_to_all_peers_within_bounded_rounds
     for db in &dbs {
         assert_message_count_with_running_daemon(db, 1);
     }
+}
+
+#[test]
+fn topo_sim_repair_run_is_sim_only_and_reports_stats() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("single.db")
+        .to_string_lossy()
+        .into_owned();
+    create_workspace(&db);
+
+    let report = run_topo_sim_with_options(&[db], "nearest-neighbor-no-auth", "graph", 0, true);
+    assert!(report.get("repair_stats").is_some());
+    assert_eq!(
+        report["repair_stats"]["request_stats"]["emitted_requests"]
+            .as_u64()
+            .unwrap_or_default(),
+        0
+    );
+    assert_eq!(
+        report["repair_stats"]["response_stats"]["emitted_responses"]
+            .as_u64()
+            .unwrap_or_default(),
+        0
+    );
 }

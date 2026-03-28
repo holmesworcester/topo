@@ -8,6 +8,8 @@ pub const KEY_REQUEST_FIELDS: &[FieldSpec] = &[
     FieldSpec::Timestamp("created_at_ms"),
     FieldSpec::EventId("blocked_event_id"),
     FieldSpec::EventId("key_event_id"),
+    FieldSpec::EventId("frontier_hash"),
+    FieldSpec::EventId("delivery_target_id"),
     FieldSpec::EventId("recipient_event_id"),
     FieldSpec::EventId("unwrap_key_event_id"),
     FieldSpec::EventId("signed_by"),
@@ -16,8 +18,9 @@ pub const KEY_REQUEST_FIELDS: &[FieldSpec] = &[
 ];
 
 /// KeyRequest (type 30): type(1) + created_at(8) + blocked_event_id(32)
-///   + key_event_id(32) + recipient_event_id(32) + unwrap_key_event_id(32)
-///   + signed_by(32) + signer_type(1) + signature(64) = 234
+///   + key_event_id(32) + frontier_hash(32) + delivery_target_id(32)
+///   + recipient_event_id(32) + unwrap_key_event_id(32)
+///   + signed_by(32) + signer_type(1) + signature(64) = 298
 pub const KEY_REQUEST_WIRE_SIZE: usize = wire_size_for_fields(KEY_REQUEST_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -25,6 +28,8 @@ pub struct KeyRequestEvent {
     pub created_at_ms: u64,
     pub blocked_event_id: [u8; 32],
     pub key_event_id: [u8; 32],
+    pub frontier_hash: [u8; 32],
+    pub delivery_target_id: [u8; 32],
     pub recipient_event_id: [u8; 32],
     pub unwrap_key_event_id: [u8; 32],
     pub signed_by: [u8; 32],
@@ -40,13 +45,36 @@ impl super::Describe for KeyRequestEvent {
                 super::short_id_b64(&self.blocked_event_id),
             ),
             ("key_event_id", super::short_id_b64(&self.key_event_id)),
+            ("frontier_hash", super::short_id_b64(&self.frontier_hash)),
         ]
     }
+}
+
+pub fn delivery_target_id(
+    key_event_id: &[u8; 32],
+    frontier_hash: &[u8; 32],
+    recipient_event_id: &[u8; 32],
+    unwrap_key_event_id: &[u8; 32],
+) -> [u8; 32] {
+    use blake2::digest::consts::U32;
+    use blake2::{Blake2b, Digest};
+
+    let mut hasher = Blake2b::<U32>::new();
+    hasher.update(b"poc7-key-delivery-target-v1");
+    hasher.update(key_event_id);
+    hasher.update(frontier_hash);
+    hasher.update(recipient_event_id);
+    hasher.update(unwrap_key_event_id);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest[..32]);
+    out
 }
 
 pub fn deterministic_key_request_created_at_ms(
     blocked_event_id: &[u8; 32],
     key_event_id: &[u8; 32],
+    frontier_hash: &[u8; 32],
     recipient_event_id: &[u8; 32],
     unwrap_key_event_id: &[u8; 32],
     signed_by: &[u8; 32],
@@ -58,6 +86,7 @@ pub fn deterministic_key_request_created_at_ms(
     hasher.update(b"poc7-key-request-created-at-v1");
     hasher.update(blocked_event_id);
     hasher.update(key_event_id);
+    hasher.update(frontier_hash);
     hasher.update(recipient_event_id);
     hasher.update(unwrap_key_event_id);
     hasher.update(signed_by);
@@ -73,12 +102,14 @@ pub fn parse_key_request(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         created_at_ms: values[0].as_timestamp().unwrap(),
         blocked_event_id: values[1].as_event_id().unwrap(),
         key_event_id: values[2].as_event_id().unwrap(),
-        recipient_event_id: values[3].as_event_id().unwrap(),
-        unwrap_key_event_id: values[4].as_event_id().unwrap(),
-        signed_by: values[5].as_event_id().unwrap(),
-        signer_type: values[6].as_u8().unwrap(),
+        frontier_hash: values[3].as_event_id().unwrap(),
+        delivery_target_id: values[4].as_event_id().unwrap(),
+        recipient_event_id: values[5].as_event_id().unwrap(),
+        unwrap_key_event_id: values[6].as_event_id().unwrap(),
+        signed_by: values[7].as_event_id().unwrap(),
+        signer_type: values[8].as_u8().unwrap(),
         signature: {
-            let bytes = values[7].as_fixed_bytes().unwrap();
+            let bytes = values[9].as_fixed_bytes().unwrap();
             let mut sig = [0u8; 64];
             sig.copy_from_slice(bytes);
             sig
@@ -96,6 +127,8 @@ pub fn encode_key_request(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         FieldValue::Timestamp(kr.created_at_ms),
         FieldValue::EventId(kr.blocked_event_id),
         FieldValue::EventId(kr.key_event_id),
+        FieldValue::EventId(kr.frontier_hash),
+        FieldValue::EventId(kr.delivery_target_id),
         FieldValue::EventId(kr.recipient_event_id),
         FieldValue::EventId(kr.unwrap_key_event_id),
         FieldValue::EventId(kr.signed_by),
@@ -122,6 +155,8 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             event_id TEXT NOT NULL,
             blocked_event_id TEXT NOT NULL,
             key_event_id TEXT NOT NULL,
+            frontier_hash TEXT NOT NULL,
+            delivery_target_id TEXT NOT NULL,
             recipient_event_id TEXT NOT NULL,
             unwrap_key_event_id TEXT NOT NULL,
             requester_signer_event_id TEXT NOT NULL,
@@ -142,6 +177,17 @@ pub fn project_pure(
         ParsedEvent::KeyRequest(v) => v,
         _ => return ProjectorResult::reject("not a key_request event".to_string()),
     };
+    let expected_delivery_target_id = delivery_target_id(
+        &kr.key_event_id,
+        &kr.frontier_hash,
+        &kr.recipient_event_id,
+        &kr.unwrap_key_event_id,
+    );
+    if kr.delivery_target_id != expected_delivery_target_id {
+        return ProjectorResult::reject(
+            "delivery_target_id does not match key request target".to_string(),
+        );
+    }
 
     let ops = vec![WriteOp::InsertOrIgnore {
         table: "key_requests",
@@ -150,6 +196,8 @@ pub fn project_pure(
             "event_id",
             "blocked_event_id",
             "key_event_id",
+            "frontier_hash",
+            "delivery_target_id",
             "recipient_event_id",
             "unwrap_key_event_id",
             "requester_signer_event_id",
@@ -159,6 +207,8 @@ pub fn project_pure(
             SqlVal::Text(event_id_b64.to_string()),
             SqlVal::Text(event_id_to_base64(&kr.blocked_event_id)),
             SqlVal::Text(event_id_to_base64(&kr.key_event_id)),
+            SqlVal::Text(event_id_to_base64(&kr.frontier_hash)),
+            SqlVal::Text(event_id_to_base64(&kr.delivery_target_id)),
             SqlVal::Text(event_id_to_base64(&kr.recipient_event_id)),
             SqlVal::Text(event_id_to_base64(&kr.unwrap_key_event_id)),
             SqlVal::Text(event_id_to_base64(&kr.signed_by)),

@@ -56,6 +56,18 @@ pub fn connected_hash_graph_neighbors(keys: &[[u8; 32]], degree: usize) -> Vec<V
     neighbors
 }
 
+pub fn synthetic_hash_graph_key(seed: u64) -> [u8; 32] {
+    let mut out = [0u8; 32];
+    let mut cursor = 0usize;
+    let mut value = seed;
+    for _ in 0..4 {
+        value = splitmix64(value);
+        out[cursor..cursor + 8].copy_from_slice(&value.to_be_bytes());
+        cursor += 8;
+    }
+    out
+}
+
 fn seed_from_key(key: [u8; 32]) -> u64 {
     let mut words = [0u64; 4];
     for (idx, chunk) in key.chunks_exact(8).enumerate() {
@@ -118,14 +130,6 @@ mod tests {
     }
 
     fn synthetic_hash_key(seed: u64) -> [u8; 32] {
-        let mut out = [0u8; 32];
-        let mut cursor = 0usize;
-        let mut value = seed.wrapping_add(1);
-        for _ in 0..4 {
-            value = splitmix64(value);
-            out[cursor..cursor + 8].copy_from_slice(&value.to_be_bytes());
-            cursor += 8;
-        }
-        out
+        synthetic_hash_graph_key(seed.wrapping_add(1))
     }
 }

@@ -8,9 +8,9 @@ Design and implement the next encryption PoC around these primitives:
 2. key rotations point at a removal frontier,
 3. the remover performs a constant-capped proactive first send,
 4. missing recipients recover keys via signed request/response repair,
-5. every invite carries a constant-capped wrapped history bundle,
+5. every invite carries a constant-capped recent history as separate wrapped deliveries,
 6. key delivery authorization depends on the removal frontier,
-7. active invite-event public keys are included in proactive sharing.
+7. non-expired invite-event public keys are subscribed to future proactive sharing.
 
 The primary goal is not cryptographic novelty. The goal is a coherent event and
 projection model that is:
@@ -30,10 +30,11 @@ deliberately includes success criteria, checks, and end-to-end validation cases.
 - Durable removal and rotation events.
 - Durable or TTL-bounded request/response events for key repair.
 - Frontier-bound authorization for proactive shares and repair responses.
-- Invite bundles that carry a capped historical key window.
+- Invite-targeted historical `key_shared` deliveries for a capped recent key window.
 - Projection and unblock behavior for encrypted events that arrive before keys.
 - Partition-healing behavior, including invites unknown to one partition.
-- Simulation and CLI-driven tests that show repair propagation and denial after removal.
+- Simulation and CLI-driven tests that show proactive coverage, repair propagation,
+  and denial after removal.
 
 ### Out of scope
 
@@ -90,7 +91,7 @@ Add a durable `KeyRotation` event:
 The remover then performs a proactive first send with a hard cap:
 
 - proactive targets:
-  - all active invite-event public keys in the active set
+  - all non-expired invite-event public keys in the active set
   - subject to a constant byte/count cap
 - if the active invite-key set exceeds the cap:
   - prioritize the active set by recency / current-online heuristic
@@ -151,17 +152,33 @@ Response events are signed wrapped-key deliveries bound to the same target:
   - valid only if recipient is eligible at the bound frontier
   - TTL matches the request TTL for the same repair episode
 
-### 7. Invite Bundle
+### 7. Invite Historical Deliveries
 
-Every invite should carry a capped historical key bundle:
+Every invite should carry a capped recent history as separate `KeyShared`
+deliveries targeted to the invite event:
 
 - include the most recent historical key deliveries up to a constant cap
+- emit them as separate frontier-bound `KeyShared` events
 - wrap them to the invite-event public key(s)
 - omit older history once the cap is reached
 - older missing keys are recovered later through the same `KeyRequest` path
 
 This gives async joiners a large but bounded no-repair history window, while
-keeping invite size predictable.
+keeping invite creation and sync behavior predictable.
+
+### 8. Invite Subscription for Future Proactive Sharing
+
+Non-expired invite-event public keys should be treated as proactive recipients
+for future rotations until the invite ages out.
+
+For the PoC, define:
+
+- `INVITE_HISTORY_KEY_CAP = 100`
+- `INVITE_ACTIVE_TTL_MS` as a shared constant
+- `invite is active` iff `invite.created_at_ms + INVITE_ACTIVE_TTL_MS > now`
+
+This predicate must be derivable from shared invite events alone. It must not
+depend on local-only acceptance state.
 
 ## Projection Model
 
@@ -235,15 +252,19 @@ response authorization predicate and part of the request target.
 
 The proactive send should target:
 
-- all active invite-event public keys in the active set,
+- all non-expired invite-event public keys in the active set,
 - subject to a constant cap.
 
-The active set may be approximated by:
+The active set should be derived from:
 
-- recently online,
-- recently synced,
-- recently messaged,
-- recently joined.
+- non-expired user invites,
+- non-expired device invites,
+- optional recency ordering heuristics only when the set exceeds the cap.
+
+For this PoC, prefer a deterministic ordering:
+
+- newest active invite first,
+- tie-break by invite event id.
 
 ### Constant cap
 
@@ -265,11 +286,16 @@ The cap must be stable enough that simulation and CLI tests can reason about it.
 ### Rule
 
 Every invite includes the most recent capped historical key deliveries for that
-invite’s public keys.
+invite’s public keys, emitted as separate `KeyShared` events at invite
+creation time.
 
 ### Expected outcomes
 
-- if a joiner syncs only recent history, invite bundle is often enough
+- if a joiner syncs only recent history, invite-targeted shares are enough
+- if a joiner joins after recent rotations, those keys are already proactively
+  wrapped to the invite and can sync before or during join
+- after join and recent sync, the invitee should already decrypt recent history
+  without sending any `KeyRequest`
 - if a joiner backfills beyond the cap, they emit `KeyRequest`s for older keys
 - if the invite reaches one partition before the other, the joiner can still
   heal later after partitions merge
@@ -314,6 +340,16 @@ Expected result:
 
 ## Test Plan
 
+Prefer validation through existing daemon control surfaces over raw DB
+inspection wherever possible:
+
+- `topo messages`
+- `topo keys`
+- `topo stats`
+- `topo assert-now`
+- `topo assert-eventually`
+- matching RPC methods when JSON-level assertions are easier
+
 ## Success Criteria
 
 ### SC1. Frontier-bound delivery is explicit and executable
@@ -348,20 +384,24 @@ End-to-end validation:
 - sender posts after removal-driven rotation
 - removed user syncs, blocks, requests, retries, and still never decrypts
 
-### SC3. Active invite-event pubkeys receive proactive sharing
+### SC3. Non-expired invite-event pubkeys receive proactive sharing
 
-The remover’s first send must proactively wrap to active invite-event public keys.
+The remover’s first send must proactively wrap to non-expired invite-event
+public keys, and future rotations must continue doing so while those invites
+remain active.
 
 Checks:
 
-- scenario test with active invite pubkeys under the cap
-- scenario test with active invite pubkeys above the cap
+- scenario test with non-expired invite pubkeys under the cap
+- scenario test with non-expired invite pubkeys above the cap
+- scenario test with expired invite pubkeys excluded
 - assert proactive share count equals all active invite keys when under cap
 - assert capped selection when over cap
 
 End-to-end validation:
 
 - active recent joiner receives the new key without needing repair
+- same invite keeps receiving proactive shares for later rotations until expiry
 
 ### SC4. Missing keys recover through request/response
 
@@ -395,22 +435,45 @@ End-to-end validation:
 
 - star and graph sim runs show bounded duplicate propagation and stable winner selection
 
-### SC6. Invite bundles cap history but still permit eventual recovery
+### SC6. Invite-targeted recent history works without repair and older history still recovers
 
-Joiners must receive a capped recent history from the invite and repair older
-history on demand.
+Joiners must receive the most recent capped key window from the invite as
+separate `KeyShared` events, decrypt recent history without repair, and repair
+older history on demand.
 
 Checks:
 
-- scenario test: recent messages decrypt from invite bundle alone
+- scenario test: last `100` recent keys are emitted as separate invite-targeted
+  `KeyShared` events
+- scenario test: recent messages decrypt from invite-targeted shares alone
 - scenario test: older messages beyond cap emit `KeyRequest`
 - scenario test: older requests eventually resolve after repair
 
 End-to-end validation:
 
-- joiner views recent history immediately and older history after repair
+- joiner joins, syncs, and views recent history immediately without repair
+- joiner then backfills older history and repairs only the out-of-cap keys
 
-### SC7. Partitions heal correctly
+### SC7. CLI / RPC observability proves proactive coverage and repair behavior
+
+The PoC must be testable through existing daemon control surfaces wherever
+possible.
+
+Checks:
+
+- `topo messages` or RPC `Messages` proves whether messages decrypt
+- `topo keys` / RPC `Keys` proves whether recent invite-targeted keys are present
+- `topo stats` / `Status` / `AssertNow` proves `key_secret_count` and message counts
+- add one explicit repair enable/disable control so tests can compare
+  proactive-only behavior against proactive+repair behavior
+
+End-to-end validation:
+
+- with repair disabled, recent joiner still reads in-cap history
+- with repair disabled, out-of-cap history remains blocked
+- with repair enabled again, out-of-cap history recovers
+
+### SC8. Partitions heal correctly
 
 Partitions with invite asymmetry must still converge after healing.
 
@@ -435,7 +498,8 @@ End-to-end validation:
 - `key_response_valid_for_matching_frontier`
 - `key_response_rejects_frontier_mismatch`
 - `key_response_rejects_removed_recipient`
-- `invite_bundle_compacts_to_history_cap`
+- `invite_history_delivery_compacts_to_cap`
+- `invite_history_delivery_skips_expired_invites_for_future_rotations`
 
 ### Projection-path integration tests
 
@@ -449,9 +513,12 @@ End-to-end validation:
 - removal rotates once and proactively shares under cap
 - active invite pubkey under cap receives proactive share
 - over-cap cold peer repairs by request
-- invite bundle provides recent history without repair
+- invite-targeted recent `KeyShared` events provide recent history without repair
 - older history requires request/response
 - removed user cannot decrypt post-removal message
+- repair-disabled mode proves recent history still decrypts from proactive invite shares
+- repair-disabled mode proves older out-of-cap history remains blocked
+- repair-enabled mode then proves the same older history recovers
 
 ### topo-sim tests
 
@@ -475,6 +542,7 @@ End-to-end validation:
 4. remover emits `KeyRotation`
 5. remover proactively shares to active invite pubkeys up to cap
 6. active recipients decrypt next message without repair
+7. existing non-expired invites stay subscribed for later rotations until expiry
 
 ### E2E 2. Repair after missing proactive share
 
@@ -483,6 +551,15 @@ End-to-end validation:
 3. recipient blocks and emits `KeyRequest`
 4. best responder emits `KeyResponse`
 5. recipient decrypts and unblocks
+
+### E2E 2a. Join without requesting for recent history
+
+1. create more than one recent rotation before invite acceptance
+2. create a new invite
+3. emit the last `100` invite-targeted `KeyShared` deliveries as separate events
+4. sync the invite and those recent `KeyShared` events to the invitee before or during join
+5. join the invitee
+6. verify via `topo keys`, `topo messages`, and `topo stats` that recent history decrypts with no `KeyRequest`
 
 ### E2E 3. Removed user denial
 
@@ -500,6 +577,15 @@ End-to-end validation:
 4. partitions heal
 5. invite and frontier state converge
 6. joiner repairs missing keys and decrypts allowed history
+
+### E2E 5. CLI-visible proactive vs repair comparison
+
+1. create a room with more than `100` historical rotations
+2. create a fresh invite and join it
+3. run with repair disabled
+4. verify recent history decrypts and older history does not
+5. re-enable repair
+6. verify older history becomes readable after request/response
 
 ## Implementation Phases
 
@@ -527,30 +613,35 @@ Exit criteria:
 
 ### Phase 3. Proactive share and active invite pubkeys
 
-- define active invite-key selection
+- define active invite-key selection from shared non-expired invite events
 - implement capped proactive delivery generation
 - add stats/metrics for proactive hit rate
+- add repair enable/disable control for CLI/scenario tests
 
 Exit criteria:
 
 - under-cap active invite keys all covered
 - over-cap selection is deterministic and measurable
+- expired invites stop receiving future proactive shares
 
 ### Phase 4. Invite bundle history window
 
-- add capped historical key wrapping into invite creation
+- replace one-key invite wrap with capped recent invite-targeted `KeyShared` history
 - add join-path projection and lazy backfill
 
 Exit criteria:
 
-- recent history works without repair
+- recent in-cap history works without repair
 - older history repairs correctly
+- invitee can sync the recent invite-targeted key history before or during join
 
 ### Phase 5. Partition and scale validation
 
 - extend topo-sim scenarios for invite asymmetry
 - add star/graph amplification measurements
 - add removal denial and healing scenarios
+- add CLI-shaped E2E scenarios that use `topo messages`, `topo keys`, `topo stats`,
+  and `topo assert-*` for verification
 
 Exit criteria:
 
@@ -568,6 +659,7 @@ Exit criteria:
    - partition healing,
    - removed-user denial.
 4. Benchmark output comparing repair traffic against proactive-only sharing.
+5. CLI-visible proof that recent invite-targeted shares decrypt on join without repair.
 
 ## Recommended First Slice
 
@@ -579,6 +671,7 @@ Implement the minimum path in this order:
 4. frontier-bound `KeyResponse` / extended `key_shared`
 5. removed-recipient denial test
 6. capped proactive active-invite sharing
-7. invite history cap
+7. invite history cap as separate invite-targeted `KeyShared` events
+8. CLI / repair-toggle validation path
 
 That yields the core correctness properties before any large-scale tuning.

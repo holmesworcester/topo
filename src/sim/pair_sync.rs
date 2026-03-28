@@ -7,7 +7,7 @@ use crate::crypto::hash_event;
 use crate::db::open_connection;
 use crate::event_modules::{self as events, ParsedEvent};
 use crate::event_pipeline::ingest_now;
-use crate::sim::key_repair::{key_shared_target, response_rank, RepairTarget};
+use crate::sim::key_repair::{key_request_target, key_shared_target, response_rank, RepairTarget};
 use crate::sim::query_snapshot::{ImportedConnectTarget, ImportedPeerState};
 use crate::state::db::transport_creds::resolve_tenant_transport_target;
 
@@ -79,6 +79,7 @@ pub struct PairSyncDirectionStats {
     pub transferred_events: usize,
     pub transferred_bytes: u64,
     pub transferred_key_request_events: usize,
+    pub suppressed_key_request_events: usize,
     pub transferred_key_shared_events: usize,
     pub suppressed_key_shared_events: usize,
     pub transferred_event_ids: Vec<String>,
@@ -213,6 +214,7 @@ fn collect_shared_events_one_way(
 
     let known_dest_events = recorded_event_ids(&dest, dest_recorded_by)?;
     let winning_key_shared_events = winning_key_shared_event_ids(&source, source_recorded_by)?;
+    let observed_key_shared_targets = observed_key_shared_targets(&source, source_recorded_by)?;
     let source_tag = format!(
         "quic_recv:{}@sim",
         source_transport_peer_id(&source, source_recorded_by)?
@@ -222,6 +224,7 @@ fn collect_shared_events_one_way(
     let mut transferred_event_ids = Vec::new();
     let mut transferred_bytes = 0u64;
     let mut transferred_key_request_events = 0usize;
+    let mut suppressed_key_request_events = 0usize;
     let mut transferred_key_shared_events = 0usize;
     let mut suppressed_key_shared_events = 0usize;
     let mut batch = Vec::<IngestItem>::new();
@@ -248,6 +251,13 @@ fn collect_shared_events_one_way(
             continue;
         }
         if event_type == "key_request" {
+            let Ok(ParsedEvent::KeyRequest(event)) = events::parse_event(&blob) else {
+                continue;
+            };
+            if observed_key_shared_targets.contains(&key_request_target(&event)) {
+                suppressed_key_request_events = suppressed_key_request_events.saturating_add(1);
+                continue;
+            }
             transferred_key_request_events = transferred_key_request_events.saturating_add(1);
         } else if event_type == "key_shared" {
             if !winning_key_shared_events.contains(&event_id) {
@@ -277,6 +287,7 @@ fn collect_shared_events_one_way(
             transferred_events: transferred_event_ids.len(),
             transferred_bytes,
             transferred_key_request_events,
+            suppressed_key_request_events,
             transferred_key_shared_events,
             suppressed_key_shared_events,
             transferred_event_ids,
@@ -324,6 +335,33 @@ fn winning_key_shared_event_ids(
         .into_values()
         .map(|(_, _, event_id)| event_id)
         .collect())
+}
+
+fn observed_key_shared_targets(
+    conn: &rusqlite::Connection,
+    recorded_by: &str,
+) -> PairSyncResult<BTreeSet<RepairTarget>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.blob
+         FROM recorded_events re
+         JOIN events e ON e.event_id = re.event_id
+         WHERE re.peer_id = ?1
+           AND e.event_type = 'key_shared'
+         ORDER BY re.id ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
+        row.get::<_, Vec<u8>>(0)
+    })?;
+
+    let mut out = BTreeSet::new();
+    for row in rows {
+        let blob = row?;
+        let Ok(ParsedEvent::KeyShared(event)) = events::parse_event(&blob) else {
+            continue;
+        };
+        out.insert(key_shared_target(&event));
+    }
+    Ok(out)
 }
 
 fn apply_prepared_direction(direction: &PreparedPairSyncDirection) -> PairSyncResult<()> {

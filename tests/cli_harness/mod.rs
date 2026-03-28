@@ -1216,6 +1216,34 @@ pub fn send_message(db: &str, content: &str) -> String {
     }
 }
 
+pub fn rotate_key(db: &str) -> (String, u64) {
+    ensure_active_peer(db, Duration::from_secs(10));
+    let output = Command::new(bin())
+        .arg("--db")
+        .arg(db)
+        .arg("rotate-key")
+        .output()
+        .expect("failed to run rotate-key");
+    assert!(
+        output.status.success(),
+        "rotate-key failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let rotation_event_id = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("rotation_event_id:"))
+        .expect("rotate-key output missing rotation_event_id")
+        .to_string();
+    let proactive_shares = stdout
+        .lines()
+        .find_map(|line| line.strip_prefix("proactive_shares:"))
+        .and_then(|value| value.parse::<u64>().ok())
+        .unwrap_or(0);
+    (rotation_event_id, proactive_shares)
+}
+
 /// Create an invite via daemon RPC. Returns the `topo://` invite link.
 pub fn create_invite(db: &str, bootstrap_addr: &str) -> String {
     create_invite_with_spki(db, bootstrap_addr, None)
@@ -1991,6 +2019,27 @@ pub fn get_messages(db: &str) -> Vec<String> {
             } else {
                 None
             }
+        })
+        .collect()
+}
+
+pub fn get_content_keys_raw(db: &str) -> String {
+    let output = Command::new(bin())
+        .arg("--db")
+        .arg(db)
+        .arg("content-keys")
+        .output()
+        .expect("failed to run content-keys");
+    String::from_utf8_lossy(&output.stdout).to_string()
+}
+
+pub fn get_content_key_ids(db: &str) -> Vec<String> {
+    let text = get_content_keys_raw(db);
+    text.lines()
+        .filter_map(|line| {
+            line.trim()
+                .strip_prefix("key ")
+                .map(|value| value.to_string())
         })
         .collect()
 }

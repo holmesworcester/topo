@@ -1,14 +1,23 @@
+use super::key_request::delivery_target_id;
 use super::layout::field_spec::{
     decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue,
 };
 use super::registry::{EventTypeMeta, ShareScope};
+use super::removal::{
+    frontier_hash_from_refs, frontier_refs_from_slots, validate_canonical_frontier_refs,
+};
 use super::{EventError, ParsedEvent, EVENT_TYPE_KEY_SHARED};
-
-// ─── Layout (owned by this module) ───
 
 pub const KEY_SHARED_FIELDS: &[FieldSpec] = &[
     FieldSpec::Timestamp("created_at_ms"),
     FieldSpec::EventId("key_event_id"),
+    FieldSpec::U8("frontier_count"),
+    FieldSpec::EventId("frontier_ref_1"),
+    FieldSpec::EventId("frontier_ref_2"),
+    FieldSpec::EventId("frontier_ref_3"),
+    FieldSpec::EventId("frontier_ref_4"),
+    FieldSpec::EventId("frontier_hash"),
+    FieldSpec::EventId("delivery_target_id"),
     FieldSpec::EventId("recipient_event_id"),
     FieldSpec::EventId("unwrap_key_event_id"),
     FieldSpec::EventId("wrapped_key"),
@@ -17,20 +26,28 @@ pub const KEY_SHARED_FIELDS: &[FieldSpec] = &[
     FieldSpec::FixedBytes("signature", 64),
 ];
 
-/// KeyShared (type 22): type(1) + created_at(8) + key_event_id(32) + recipient_event_id(32)
-///                        + unwrap_key_event_id(32) + wrapped_key(32) + signed_by(32)
-///                        + signer_type(1) + signature(64) = 234
+/// KeyShared (type 22): type(1) + created_at(8) + key_event_id(32) + frontier_count(1)
+///   + frontier_ref_1..4(128) + frontier_hash(32) + delivery_target_id(32)
+///   + recipient_event_id(32) + unwrap_key_event_id(32) + wrapped_key(32)
+///   + signed_by(32) + signer_type(1) + signature(64) = 427
 pub const KEY_SHARED_WIRE_SIZE: usize = wire_size_for_fields(KEY_SHARED_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct KeySharedEvent {
     pub created_at_ms: u64,
-    pub key_event_id: [u8; 32],        // dep: Secret event
-    pub recipient_event_id: [u8; 32],  // dep: invite event of recipient
-    pub unwrap_key_event_id: [u8; 32], // dep: local InviteSecret event (recipient side)
-    pub wrapped_key: [u8; 32],         // key bytes wrapped for recipient
-    pub signed_by: [u8; 32],           // signer event_id (PeerShared event — sender)
-    pub signer_type: u8,               // 5 = peer_shared
+    pub key_event_id: [u8; 32],
+    pub frontier_count: u8,
+    pub frontier_ref_1: [u8; 32],
+    pub frontier_ref_2: [u8; 32],
+    pub frontier_ref_3: [u8; 32],
+    pub frontier_ref_4: [u8; 32],
+    pub frontier_hash: [u8; 32],
+    pub delivery_target_id: [u8; 32],
+    pub recipient_event_id: [u8; 32],
+    pub unwrap_key_event_id: [u8; 32],
+    pub wrapped_key: [u8; 32],
+    pub signed_by: [u8; 32],
+    pub signer_type: u8,
     pub signature: [u8; 64],
 }
 
@@ -38,34 +55,32 @@ impl super::Describe for KeySharedEvent {
     fn human_fields(&self) -> Vec<(&'static str, String)> {
         vec![
             ("key_event_id", super::short_id_b64(&self.key_event_id)),
+            ("frontier_hash", super::short_id_b64(&self.frontier_hash)),
             ("wrapped_key", super::trunc_hex(&self.wrapped_key, 16)),
         ]
     }
 }
 
-/// Wire format (234 bytes fixed):
-/// [0]          type_code = 22
-/// [1..9]       created_at_ms (u64 LE)
-/// [9..41]      key_event_id (32 bytes)
-/// [41..73]     recipient_event_id (32 bytes)
-/// [73..105]    unwrap_key_event_id (32 bytes)
-/// [105..137]   wrapped_key (32 bytes)
-/// [137..169]   signed_by (32 bytes)
-/// [169]        signer_type (1 byte)
-/// [170..234]   signature (64 bytes)
 pub fn parse_key_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let values = decode_fields(EVENT_TYPE_KEY_SHARED, KEY_SHARED_FIELDS, blob)?;
 
     Ok(ParsedEvent::KeyShared(KeySharedEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         key_event_id: values[1].as_event_id().unwrap(),
-        recipient_event_id: values[2].as_event_id().unwrap(),
-        unwrap_key_event_id: values[3].as_event_id().unwrap(),
-        wrapped_key: values[4].as_event_id().unwrap(),
-        signed_by: values[5].as_event_id().unwrap(),
-        signer_type: values[6].as_u8().unwrap(),
+        frontier_count: values[2].as_u8().unwrap(),
+        frontier_ref_1: values[3].as_event_id().unwrap(),
+        frontier_ref_2: values[4].as_event_id().unwrap(),
+        frontier_ref_3: values[5].as_event_id().unwrap(),
+        frontier_ref_4: values[6].as_event_id().unwrap(),
+        frontier_hash: values[7].as_event_id().unwrap(),
+        delivery_target_id: values[8].as_event_id().unwrap(),
+        recipient_event_id: values[9].as_event_id().unwrap(),
+        unwrap_key_event_id: values[10].as_event_id().unwrap(),
+        wrapped_key: values[11].as_event_id().unwrap(),
+        signed_by: values[12].as_event_id().unwrap(),
+        signer_type: values[13].as_u8().unwrap(),
         signature: {
-            let bytes = values[7].as_fixed_bytes().unwrap();
+            let bytes = values[14].as_fixed_bytes().unwrap();
             let mut sig = [0u8; 64];
             sig.copy_from_slice(bytes);
             sig
@@ -82,6 +97,13 @@ pub fn encode_key_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     let values = vec![
         FieldValue::Timestamp(e.created_at_ms),
         FieldValue::EventId(e.key_event_id),
+        FieldValue::U8(e.frontier_count),
+        FieldValue::EventId(e.frontier_ref_1),
+        FieldValue::EventId(e.frontier_ref_2),
+        FieldValue::EventId(e.frontier_ref_3),
+        FieldValue::EventId(e.frontier_ref_4),
+        FieldValue::EventId(e.frontier_hash),
+        FieldValue::EventId(e.delivery_target_id),
         FieldValue::EventId(e.recipient_event_id),
         FieldValue::EventId(e.unwrap_key_event_id),
         FieldValue::EventId(e.wrapped_key),
@@ -97,8 +119,6 @@ pub fn encode_key_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     )?)
 }
 
-// === Projector (event-module locality) ===
-
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 use crate::projection::encrypted::unwrap_key_from_sender;
@@ -112,6 +132,13 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             recorded_by TEXT NOT NULL,
             event_id TEXT NOT NULL,
             key_event_id TEXT NOT NULL,
+            frontier_count INTEGER NOT NULL,
+            frontier_ref_1 TEXT NOT NULL,
+            frontier_ref_2 TEXT NOT NULL,
+            frontier_ref_3 TEXT NOT NULL,
+            frontier_ref_4 TEXT NOT NULL,
+            frontier_hash TEXT NOT NULL,
+            delivery_target_id TEXT NOT NULL,
             recipient_event_id TEXT NOT NULL,
             wrapped_key BLOB NOT NULL,
             PRIMARY KEY (recorded_by, event_id)
@@ -121,7 +148,6 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     Ok(())
 }
 
-/// Build projector-local context for KeyShared projection.
 pub fn build_projector_context(
     conn: &Connection,
     recorded_by: &str,
@@ -180,7 +206,6 @@ pub fn build_projector_context(
     })
 }
 
-/// Pure projector: KeyShared → key_shared table.
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
@@ -192,7 +217,41 @@ pub fn project_pure(
         _ => return ProjectorResult::reject("not a key_shared event".to_string()),
     };
 
+    let slots = [
+        ss.frontier_ref_1,
+        ss.frontier_ref_2,
+        ss.frontier_ref_3,
+        ss.frontier_ref_4,
+    ];
+    let refs = match frontier_refs_from_slots(ss.frontier_count, &slots) {
+        Ok(refs) => refs,
+        Err(reason) => return ProjectorResult::reject(reason),
+    };
+    if let Err(reason) = validate_canonical_frontier_refs(&refs) {
+        return ProjectorResult::reject(reason);
+    }
+    let expected_frontier_hash = frontier_hash_from_refs(&refs);
+    if ss.frontier_hash != expected_frontier_hash {
+        return ProjectorResult::reject(
+            "frontier_hash does not match key_shared frontier".to_string(),
+        );
+    }
+
+    let expected_delivery_target_id = delivery_target_id(
+        &ss.key_event_id,
+        &ss.frontier_hash,
+        &ss.recipient_event_id,
+        &ss.unwrap_key_event_id,
+    );
+    if ss.delivery_target_id != expected_delivery_target_id {
+        return ProjectorResult::reject(
+            "delivery_target_id does not match key_shared target".to_string(),
+        );
+    }
+
     let key_b64 = event_id_to_base64(&ss.key_event_id);
+    let frontier_b64 = event_id_to_base64(&ss.frontier_hash);
+    let delivery_target_b64 = event_id_to_base64(&ss.delivery_target_id);
     let recipient_b64 = event_id_to_base64(&ss.recipient_event_id);
 
     let ops = vec![WriteOp::InsertOrIgnore {
@@ -201,6 +260,13 @@ pub fn project_pure(
             "recorded_by",
             "event_id",
             "key_event_id",
+            "frontier_count",
+            "frontier_ref_1",
+            "frontier_ref_2",
+            "frontier_ref_3",
+            "frontier_ref_4",
+            "frontier_hash",
+            "delivery_target_id",
             "recipient_event_id",
             "wrapped_key",
         ],
@@ -208,6 +274,13 @@ pub fn project_pure(
             SqlVal::Text(recorded_by.to_string()),
             SqlVal::Text(event_id_b64.to_string()),
             SqlVal::Text(key_b64),
+            SqlVal::Int(ss.frontier_count as i64),
+            SqlVal::Text(event_id_to_base64(&ss.frontier_ref_1)),
+            SqlVal::Text(event_id_to_base64(&ss.frontier_ref_2)),
+            SqlVal::Text(event_id_to_base64(&ss.frontier_ref_3)),
+            SqlVal::Text(event_id_to_base64(&ss.frontier_ref_4)),
+            SqlVal::Text(frontier_b64),
+            SqlVal::Text(delivery_target_b64),
             SqlVal::Text(recipient_b64),
             SqlVal::Blob(ss.wrapped_key.to_vec()),
         ],
@@ -247,11 +320,15 @@ pub static KEY_SHARED_META: EventTypeMeta = EventTypeMeta {
     type_name: "key_shared",
     projection_table: "key_shared",
     share_scope: ShareScope::Shared,
-    // `unwrap_key_event_id` points at recipient-local invite_secret material.
-    // Non-recipient peers legitimately never have that event, so treating it
-    // as a universal hard dependency wedges shared observers on foreign links.
-    dep_fields: &["recipient_event_id", "signed_by"],
-    dep_field_type_codes: &[&[10, 12], &[]],
+    dep_fields: &[
+        "recipient_event_id",
+        "frontier_ref_1",
+        "frontier_ref_2",
+        "frontier_ref_3",
+        "frontier_ref_4",
+        "signed_by",
+    ],
+    dep_field_type_codes: &[&[10, 12], &[], &[], &[], &[], &[]],
     signer_required: true,
     signature_byte_len: 64,
     encryptable: false,

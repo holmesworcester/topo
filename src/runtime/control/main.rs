@@ -889,6 +889,31 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         }
 
+        Commands::ContentKeys { summary } => {
+            let data = rpc_require_daemon(
+                db,
+                socket_override.as_deref(),
+                RpcMethod::ContentKeys { summary },
+            )?;
+            println!("CONTENT KEYS ({}):", db);
+            println!(
+                "  Count: {}",
+                data["key_secret_count"].as_i64().unwrap_or_default()
+            );
+            if let Some(latest) = data["latest_key_event_id"].as_str() {
+                println!("  Latest: {}", short_id(latest));
+            }
+            if !summary {
+                if let Some(keys) = data["keys"].as_array() {
+                    for key in keys {
+                        if let Some(key_id) = key.as_str() {
+                            println!("    key {}", short_id(key_id));
+                        }
+                    }
+                }
+            }
+        }
+
         Commands::Stats { json } => {
             let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Stats)?;
             if json {
@@ -1100,6 +1125,22 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 eprintln!("Created invite #{}", num);
             }
             maybe_show_created_events(db, &data);
+        }
+
+        Commands::RotateKey => {
+            let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::RotateKey)?;
+            println!(
+                "Rotated key: {}",
+                short_id(data["key_event_id"].as_str().unwrap_or(""))
+            );
+            println!(
+                "rotation_event_id:{}",
+                data["rotation_event_id"].as_str().unwrap_or("")
+            );
+            println!(
+                "proactive_shares:{}",
+                data["proactive_share_count"].as_u64().unwrap_or_default()
+            );
         }
 
         Commands::Link {

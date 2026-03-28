@@ -229,6 +229,7 @@ fn rpc_all_methods_serialize() {
         RpcMethod::Reactions,
         RpcMethod::Users,
         RpcMethod::Keys { summary: true },
+        RpcMethod::ContentKeys { summary: true },
         RpcMethod::Workspaces,
         RpcMethod::IntroAttempts {
             peer: Some("peer1".into()),
@@ -246,6 +247,7 @@ fn rpc_all_methods_serialize() {
             public_addr: Some("127.0.0.1:4433".to_string()),
             public_spki: None,
         },
+        RpcMethod::RotateKey,
         RpcMethod::CreateDeviceLink {
             public_addr: Some("127.0.0.1:4433".to_string()),
             public_spki: None,

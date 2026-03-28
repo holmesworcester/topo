@@ -120,6 +120,7 @@ pub struct PlannerSimulation {
     db_paths: Vec<String>,
     mode: PlannerMode,
     fake_topology: FakeTopologyPreference,
+    explicit_fake_pairs: Option<Vec<(String, String)>>,
 }
 
 impl PlannerSimulation {
@@ -159,7 +160,30 @@ impl PlannerSimulation {
             db_paths: out,
             mode,
             fake_topology,
+            explicit_fake_pairs: None,
         }
+    }
+
+    pub fn with_explicit_fake_pairs<I, S, P, L, R>(db_paths: I, explicit_fake_pairs: P) -> Self
+    where
+        I: IntoIterator<Item = S>,
+        S: Into<String>,
+        P: IntoIterator<Item = (L, R)>,
+        L: Into<String>,
+        R: Into<String>,
+    {
+        let mut sim = Self::with_mode_and_topology(
+            db_paths,
+            PlannerMode::NearestNeighborNoAuth,
+            FakeTopologyPreference::Graph,
+        );
+        sim.explicit_fake_pairs = Some(
+            explicit_fake_pairs
+                .into_iter()
+                .map(|(left, right)| (left.into(), right.into()))
+                .collect(),
+        );
+        sim
     }
 
     pub fn imported_nodes(&self) -> PlannerResult<Vec<SimPeerNode>> {
@@ -187,7 +211,13 @@ impl PlannerSimulation {
                     })
                 })
                 .collect::<Vec<_>>(),
-            PlannerMode::NearestNeighborNoAuth => fake_no_auth_intents(&nodes, self.fake_topology),
+            PlannerMode::NearestNeighborNoAuth => {
+                if let Some(explicit_fake_pairs) = &self.explicit_fake_pairs {
+                    fake_explicit_intents(&nodes, explicit_fake_pairs)
+                } else {
+                    fake_no_auth_intents(&nodes, self.fake_topology)
+                }
+            }
         };
         let mut grouped = BTreeMap::<PairKey, Vec<PairSyncIntent>>::new();
         for intent in intents {
@@ -305,6 +335,29 @@ fn fake_no_auth_intents(
     }
 }
 
+fn fake_explicit_intents(
+    nodes: &[SimPeerNode],
+    explicit_pairs: &[(String, String)],
+) -> Vec<PairSyncIntent> {
+    let by_recorded_by = nodes
+        .iter()
+        .map(|node| (node.recorded_by.clone(), node))
+        .collect::<BTreeMap<_, _>>();
+    let mut out = Vec::new();
+    for (left, right) in explicit_pairs {
+        let (Some(left_node), Some(right_node)) =
+            (by_recorded_by.get(left), by_recorded_by.get(right))
+        else {
+            continue;
+        };
+        if left == right {
+            continue;
+        }
+        out.push(fake_intent(left_node, right_node, "fake_explicit_no_auth"));
+    }
+    out
+}
+
 fn fake_star_intents(nodes: &[SimPeerNode]) -> Vec<PairSyncIntent> {
     let Some(hub) = nodes.first() else {
         return Vec::new();
@@ -409,5 +462,29 @@ mod tests {
         assert_eq!(intents[0].target_recorded_by, hex_id(0));
         assert_eq!(intents[1].initiator_recorded_by, hex_id(2));
         assert_eq!(intents[1].target_recorded_by, hex_id(0));
+    }
+
+    #[test]
+    fn fake_explicit_pairs_use_exact_requested_edges() {
+        let nodes = vec![
+            node(&hex_id(0)),
+            node(&hex_id(1)),
+            node(&hex_id(2)),
+            node(&hex_id(3)),
+        ];
+        let intents = fake_explicit_intents(
+            &nodes,
+            &[
+                (hex_id(0), hex_id(2)),
+                (hex_id(1), hex_id(3)),
+                (hex_id(9), hex_id(1)),
+            ],
+        );
+
+        assert_eq!(intents.len(), 2);
+        assert_eq!(intents[0].initiator_recorded_by, hex_id(0));
+        assert_eq!(intents[0].target_recorded_by, hex_id(2));
+        assert_eq!(intents[1].initiator_recorded_by, hex_id(1));
+        assert_eq!(intents[1].target_recorded_by, hex_id(3));
     }
 }

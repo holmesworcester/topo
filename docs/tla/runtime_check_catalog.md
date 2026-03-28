@@ -34,6 +34,16 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_DEL_HARD_PURGE | event_modules/message_deletion::project_pure | InvDeletePurgeAtomic | projector_local |
 | CHK_SS_INSERT | event_modules/secret_shared::project_pure | InvSecretSharedKey | projector_local |
 | CHK_KR_INSERT | event_modules/key_request::project_pure | NON_MODELED::repair_request_primitive | projector_local |
+| CHK_KR_TARGET_BINDING | event_modules/key_request::project_pure | NON_MODELED::repair_target_binding | projector_local |
+| CHK_KS_TARGET_BINDING | event_modules/key_shared::project_pure | NON_MODELED::repair_target_binding | projector_local |
+| CHK_KS_FRONTIER_HASH | event_modules/key_shared::project_pure | NON_MODELED::repair_response_frontier_hash | projector_local |
+| CHK_KS_FRONTIER_ORDER | event_modules/key_shared::project_pure | NON_MODELED::repair_response_frontier_canonical_order | projector_local |
+| CHK_RM_SIGNER_BINDING | event_modules/removal::project_pure | NON_MODELED::remover_self_binding | projector_local |
+| CHK_RM_FRONTIER_HASH | event_modules/removal::project_pure | NON_MODELED::removal_frontier_hash | projector_local |
+| CHK_RM_FRONTIER_ORDER | event_modules/removal::project_pure | NON_MODELED::removal_frontier_canonical_order | projector_local |
+| CHK_KROT_SIGNER_BINDING | event_modules/key_rotation::project_pure | NON_MODELED::rotation_self_binding | projector_local |
+| CHK_KROT_FRONTIER_HASH | event_modules/key_rotation::project_pure | NON_MODELED::rotation_frontier_hash | projector_local |
+| CHK_KROT_FRONTIER_ORDER | event_modules/key_rotation::project_pure | NON_MODELED::rotation_frontier_canonical_order | projector_local |
 | CHK_FS_GUARD_BLOCK | event_modules/file_slice::project_pure | InvFileSliceAuth | projector_local |
 | CHK_FS_HARD_PURGE | event_modules/file_slice::project_pure | InvDeletedFilePurgesLiveSlice | projector_local |
 | CHK_FS_SIGNER_MISMATCH | event_modules/file_slice::project_pure | InvFileSliceAuth | projector_local |
