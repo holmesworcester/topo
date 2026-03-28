@@ -1,4 +1,3 @@
-mod projection_context;
 pub mod projector;
 pub mod wire;
 

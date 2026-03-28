@@ -1,6 +1,14 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::queries::define_query_context_loader;
+
+define_query_context_loader!(
+    build_projector_context,
+    MessageDeletion,
+    load_message_deletion_context,
+    "message_deletion"
+);
 
 /// Pure projector: MessageDeletion -> two-stage deletion intent + tombstone model.
 ///

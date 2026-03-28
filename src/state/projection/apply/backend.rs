@@ -1,11 +1,11 @@
 use crate::crypto::EventId;
 use crate::db::queue::current_timestamp_ms;
 use crate::db::timeline::EventTimeline;
-use crate::event_modules::{EventTypeMeta, ParsedEvent};
-use crate::projection::contract::{ContextSnapshot, EmitCommand, WriteOp};
+use crate::event_modules::ParsedEvent;
+use crate::projection::contract::{EmitCommand, WriteOp};
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::encrypted::project_encrypted;
-use crate::projection::queries::SqliteProjectionQueries;
+use crate::projection::queries::ProjectionQueries;
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
 use rusqlite::Connection;
 
@@ -14,7 +14,7 @@ use super::write_exec::{execute_emit_commands, execute_write_ops};
 
 pub(crate) type ProjectionApplyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
-pub(crate) trait ProjectionBackend {
+pub(crate) trait ProjectionBackend: ProjectionQueries {
     fn already_processed(
         &self,
         recorded_by: &str,
@@ -60,14 +60,6 @@ pub(crate) trait ProjectionBackend {
         encrypted: &crate::event_modules::EncryptedEvent,
     ) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>)>;
 
-    fn load_context(
-        &self,
-        meta: &'static EventTypeMeta,
-        recorded_by: &str,
-        event_id_b64: &str,
-        parsed: &ParsedEvent,
-    ) -> ProjectionApplyResult<ContextSnapshot>;
-
     fn execute_write_ops(&self, ops: &[WriteOp]) -> ProjectionApplyResult<()>;
 
     fn execute_emit_commands(
@@ -86,23 +78,13 @@ pub(crate) trait ProjectionBackend {
     ) -> ProjectionApplyResult<()>;
 }
 
-pub(crate) struct SqliteProjectionBackend<'a> {
-    conn: &'a Connection,
-}
-
-impl<'a> SqliteProjectionBackend<'a> {
-    pub(crate) fn new(conn: &'a Connection) -> Self {
-        Self { conn }
-    }
-}
-
-impl ProjectionBackend for SqliteProjectionBackend<'_> {
+impl ProjectionBackend for Connection {
     fn already_processed(
         &self,
         recorded_by: &str,
         event_id_b64: &str,
     ) -> ProjectionApplyResult<bool> {
-        let already_valid: bool = self.conn.query_row(
+        let already_valid: bool = self.query_row(
             "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, event_id_b64],
             |row| row.get(0),
@@ -111,7 +93,7 @@ impl ProjectionBackend for SqliteProjectionBackend<'_> {
             return Ok(true);
         }
 
-        let already_rejected: bool = self.conn.query_row(
+        let already_rejected: bool = self.query_row(
             "SELECT COUNT(*) > 0 FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, event_id_b64],
             |row| row.get(0),
@@ -121,7 +103,6 @@ impl ProjectionBackend for SqliteProjectionBackend<'_> {
 
     fn load_blob(&self, event_id_b64: &str) -> ProjectionApplyResult<Option<Vec<u8>>> {
         let blob = self
-            .conn
             .query_row(
                 "SELECT blob FROM events WHERE event_id = ?1",
                 rusqlite::params![event_id_b64],
@@ -141,7 +122,7 @@ impl ProjectionBackend for SqliteProjectionBackend<'_> {
         event_id_b64: &str,
         reason: &str,
     ) -> ProjectionApplyResult<()> {
-        record_rejection(self.conn, recorded_by, event_id_b64, reason);
+        record_rejection(self, recorded_by, event_id_b64, reason);
         Ok(())
     }
 
@@ -152,7 +133,7 @@ impl ProjectionBackend for SqliteProjectionBackend<'_> {
         parsed: &ParsedEvent,
         deps: &[(&str, EventId)],
     ) -> ProjectionApplyResult<Option<ProjectionDecision>> {
-        check_deps_and_block(self.conn, recorded_by, event_id_b64, parsed, deps)
+        check_deps_and_block(self, recorded_by, event_id_b64, parsed, deps)
     }
 
     fn check_dep_types(
@@ -162,7 +143,7 @@ impl ProjectionBackend for SqliteProjectionBackend<'_> {
         deps: &[(&str, EventId)],
         type_codes: &[&[u8]],
     ) -> ProjectionApplyResult<Option<String>> {
-        check_dep_types(self.conn, recorded_by, parsed, deps, type_codes)
+        check_dep_types(self, recorded_by, parsed, deps, type_codes)
     }
 
     fn resolve_signer_key(
@@ -171,7 +152,7 @@ impl ProjectionBackend for SqliteProjectionBackend<'_> {
         signer_type: u8,
         signer_event_id: &[u8; 32],
     ) -> ProjectionApplyResult<SignerResolution> {
-        resolve_signer_key(self.conn, recorded_by, signer_type, signer_event_id)
+        resolve_signer_key(self, recorded_by, signer_type, signer_event_id)
     }
 
     fn project_encrypted(
@@ -180,22 +161,11 @@ impl ProjectionBackend for SqliteProjectionBackend<'_> {
         event_id_b64: &str,
         encrypted: &crate::event_modules::EncryptedEvent,
     ) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>)> {
-        project_encrypted(self.conn, recorded_by, event_id_b64, encrypted)
-    }
-
-    fn load_context(
-        &self,
-        meta: &'static EventTypeMeta,
-        recorded_by: &str,
-        event_id_b64: &str,
-        parsed: &ParsedEvent,
-    ) -> ProjectionApplyResult<ContextSnapshot> {
-        let queries = SqliteProjectionQueries::new(self.conn);
-        (meta.context_loader)(&queries, recorded_by, event_id_b64, parsed)
+        project_encrypted(self, recorded_by, event_id_b64, encrypted)
     }
 
     fn execute_write_ops(&self, ops: &[WriteOp]) -> ProjectionApplyResult<()> {
-        execute_write_ops(self.conn, ops)
+        execute_write_ops(self, ops)
     }
 
     fn execute_emit_commands(
@@ -203,12 +173,11 @@ impl ProjectionBackend for SqliteProjectionBackend<'_> {
         recorded_by: &str,
         commands: &[EmitCommand],
     ) -> ProjectionApplyResult<()> {
-        execute_emit_commands(self.conn, recorded_by, commands)
+        execute_emit_commands(self, recorded_by, commands)
     }
 
     fn mark_guard_blocked(&self, event_id_b64: &str) -> ProjectionApplyResult<()> {
-        let _ =
-            EventTimeline::new(self.conn).mark_blocked_b64(event_id_b64, current_timestamp_ms());
+        let _ = EventTimeline::new(self).mark_blocked_b64(event_id_b64, current_timestamp_ms());
         Ok(())
     }
 
@@ -222,7 +191,7 @@ impl ProjectionBackend for SqliteProjectionBackend<'_> {
         // transaction (for example, content arriving after a tombstone).
         // In that case projection succeeded but there is nothing left to
         // mark valid or deliver to subscriptions.
-        let still_recorded: bool = self.conn.query_row(
+        let still_recorded: bool = self.query_row(
             "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, event_id_b64],
             |row| row.get(0),
@@ -231,36 +200,36 @@ impl ProjectionBackend for SqliteProjectionBackend<'_> {
             return Ok(());
         }
 
-        self.conn.execute_batch("SAVEPOINT project_valid")?;
+        self.execute_batch("SAVEPOINT project_valid")?;
         let commit_result = (|| -> ProjectionApplyResult<()> {
             let semantic_type_code = i64::from(sub_event.event_type_code());
-            self.conn.execute(
+            self.execute(
                 "INSERT OR IGNORE INTO valid_events (peer_id, event_id, semantic_type_code)
                  VALUES (?1, ?2, ?3)",
                 rusqlite::params![recorded_by, event_id_b64, semantic_type_code],
             )?;
 
             crate::state::subscriptions::on_projected_event(
-                self.conn,
+                self,
                 recorded_by,
                 event_id_b64,
                 sub_event,
             )
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
 
-            let _ = EventTimeline::new(self.conn)
-                .mark_projected_b64(event_id_b64, current_timestamp_ms());
+            let _ =
+                EventTimeline::new(self).mark_projected_b64(event_id_b64, current_timestamp_ms());
             Ok(())
         })();
 
         match commit_result {
             Ok(()) => {
-                self.conn.execute_batch("RELEASE project_valid")?;
+                self.execute_batch("RELEASE project_valid")?;
                 Ok(())
             }
             Err(err) => {
-                let _ = self.conn.execute_batch("ROLLBACK TO project_valid");
-                let _ = self.conn.execute_batch("RELEASE project_valid");
+                let _ = self.execute_batch("ROLLBACK TO project_valid");
+                let _ = self.execute_batch("RELEASE project_valid");
                 Err(err)
             }
         }
@@ -369,16 +338,6 @@ mod tests {
             Err("fake backend does not support encrypted projection".into())
         }
 
-        fn load_context(
-            &self,
-            _meta: &'static EventTypeMeta,
-            _recorded_by: &str,
-            _event_id_b64: &str,
-            _parsed: &ParsedEvent,
-        ) -> ProjectionApplyResult<ContextSnapshot> {
-            Ok(ContextSnapshot::default())
-        }
-
         fn execute_write_ops(&self, _ops: &[WriteOp]) -> ProjectionApplyResult<()> {
             *self.write_batches.borrow_mut() += 1;
             Ok(())
@@ -413,11 +372,120 @@ mod tests {
         }
     }
 
+    impl ProjectionQueries for FakeProjectionBackend {
+        fn load_workspace_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _workspace: &crate::event_modules::WorkspaceEvent,
+        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
+            Ok(ContextSnapshot::default())
+        }
+
+        fn load_admin_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _admin: &crate::event_modules::AdminEvent,
+        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
+            Ok(ContextSnapshot::default())
+        }
+
+        fn load_peer_shared_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _peer_shared: &crate::event_modules::PeerSharedEvent,
+        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
+            Ok(ContextSnapshot::default())
+        }
+
+        fn load_user_invite_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _user_invite: &crate::event_modules::UserInviteEvent,
+        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
+            Ok(ContextSnapshot::default())
+        }
+
+        fn load_device_invite_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _device_invite: &crate::event_modules::DeviceInviteEvent,
+        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
+            Ok(ContextSnapshot::default())
+        }
+
+        fn load_message_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _message: &crate::event_modules::MessageEvent,
+        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
+            Ok(ContextSnapshot::default())
+        }
+
+        fn load_message_deletion_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _message_deletion: &crate::event_modules::MessageDeletionEvent,
+        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
+            Ok(ContextSnapshot::default())
+        }
+
+        fn load_reaction_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _reaction: &crate::event_modules::ReactionEvent,
+        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
+            Ok(ContextSnapshot::default())
+        }
+
+        fn load_file_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _file: &crate::event_modules::FileEvent,
+        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
+            Ok(ContextSnapshot::default())
+        }
+
+        fn load_file_slice_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _file_slice: &crate::event_modules::FileSliceEvent,
+        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
+            Ok(ContextSnapshot::default())
+        }
+
+        fn load_invite_accepted_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _invite_accepted: &crate::event_modules::InviteAcceptedEvent,
+        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
+            Ok(ContextSnapshot::default())
+        }
+
+        fn load_key_shared_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _key_shared: &crate::event_modules::KeySharedEvent,
+        ) -> crate::projection::queries::ProjectionQueryResult<ContextSnapshot> {
+            Ok(ContextSnapshot::default())
+        }
+    }
+
     #[test]
-    fn sqlite_backend_loads_empty_context_via_registry_loader() {
+    fn sqlite_backend_exposes_registry_context_queries() {
         let conn = crate::db::open_in_memory().unwrap();
         crate::db::schema::create_tables(&conn).unwrap();
-        let backend = SqliteProjectionBackend::new(&conn);
         let parsed = ParsedEvent::Tenant(TenantEvent {
             created_at_ms: 1,
             public_key: [7u8; 32],
@@ -425,9 +493,7 @@ mod tests {
         let meta = crate::event_modules::registry()
             .lookup(crate::event_modules::EVENT_TYPE_TENANT)
             .unwrap();
-        let ctx = backend
-            .load_context(meta, "peer-a", "event-a", &parsed)
-            .unwrap();
+        let ctx = (meta.context_loader)(&conn, "peer-a", "event-a", &parsed).unwrap();
         assert!(ctx.accepted_workspace_id.is_none());
         assert!(ctx.signer_user_mismatch_reason.is_none());
         assert!(ctx.deletion_intents.is_empty());

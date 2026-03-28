@@ -103,15 +103,31 @@ pub trait ProjectionQueries {
     ) -> ProjectionQueryResult<ContextSnapshot>;
 }
 
-pub(crate) struct SqliteProjectionQueries<'a> {
-    conn: &'a Connection,
+/// Declare a projector-local context loader that downcasts ParsedEvent to the
+/// expected variant and forwards to the matching ProjectionQueries method.
+macro_rules! define_query_context_loader {
+    ($fn_name:ident, $variant:ident, $query_method:ident, $label:literal) => {
+        pub fn $fn_name(
+            queries: &dyn $crate::projection::queries::ProjectionQueries,
+            recorded_by: &str,
+            event_id_b64: &str,
+            parsed: &$crate::event_modules::ParsedEvent,
+        ) -> Result<$crate::projection::contract::ContextSnapshot, Box<dyn std::error::Error>> {
+            let event = match parsed {
+                $crate::event_modules::ParsedEvent::$variant(event) => event,
+                _ => {
+                    return Err(
+                        concat!($label, " context loader called for non-", $label, " event").into(),
+                    )
+                }
+            };
+
+            queries.$query_method(recorded_by, event_id_b64, event)
+        }
+    };
 }
 
-impl<'a> SqliteProjectionQueries<'a> {
-    pub(crate) fn new(conn: &'a Connection) -> Self {
-        Self { conn }
-    }
-}
+pub(crate) use define_query_context_loader;
 
 fn load_bootstrap_context_snapshot(
     conn: &Connection,
@@ -269,14 +285,14 @@ fn bootstrap_spki_already_peer_shared(
     )
 }
 
-impl ProjectionQueries for SqliteProjectionQueries<'_> {
+impl ProjectionQueries for Connection {
     fn load_workspace_context(
         &self,
         recorded_by: &str,
         _event_id_b64: &str,
         _workspace: &WorkspaceEvent,
     ) -> ProjectionQueryResult<ContextSnapshot> {
-        let accepted_workspace_id = match self.conn.query_row(
+        let accepted_workspace_id = match self.query_row(
             "SELECT workspace_id
              FROM invites_accepted
              WHERE recorded_by = ?1
@@ -304,7 +320,6 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
     ) -> ProjectionQueryResult<ContextSnapshot> {
         let user_event_id_b64 = event_id_to_base64(&admin.user_event_id);
         let user_public_key: Option<Vec<u8>> = self
-            .conn
             .query_row(
                 "SELECT public_key FROM users WHERE recorded_by = ?1 AND event_id = ?2",
                 rusqlite::params![recorded_by, &user_event_id_b64],
@@ -344,7 +359,7 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
         peer_shared: &PeerSharedEvent,
     ) -> ProjectionQueryResult<ContextSnapshot> {
         let signed_by_b64 = event_id_to_base64(&peer_shared.signed_by);
-        let blob = load_valid_event_blob(self.conn, recorded_by, &signed_by_b64)?;
+        let blob = load_valid_event_blob(self, recorded_by, &signed_by_b64)?;
         let Some(blob) = blob else {
             return Ok(ContextSnapshot {
                 peer_shared_user_mismatch_reason: Some(format!(
@@ -380,7 +395,7 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
 
         Ok(ContextSnapshot {
             peer_shared_user_mismatch_reason: peer_shared_user_mismatch_reason(
-                self.conn,
+                self,
                 recorded_by,
                 &device_invite,
                 &peer_shared.user_event_id,
@@ -397,7 +412,7 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
     ) -> ProjectionQueryResult<ContextSnapshot> {
         let mut ctx = ContextSnapshot::default();
 
-        ctx.is_local_create = match self.conn.query_row(
+        ctx.is_local_create = match self.query_row(
             "SELECT source FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, event_id_b64],
             |row| row.get::<_, String>(0),
@@ -409,7 +424,7 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
         if user_invite.signer_type == 5 {
             let signer_b64 = event_id_to_base64(&user_invite.signed_by);
             let authority_b64 = event_id_to_base64(&user_invite.authority_event_id);
-            let authority_matches_signer: bool = self.conn.query_row(
+            let authority_matches_signer: bool = self.query_row(
                 "SELECT EXISTS(
                      SELECT 1
                      FROM peers_shared ps
@@ -429,8 +444,7 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
             ctx.invite_authority_matches_signer = Some(authority_matches_signer);
         }
 
-        ctx.bootstrap_context =
-            load_bootstrap_context_snapshot(self.conn, recorded_by, event_id_b64)?;
+        ctx.bootstrap_context = load_bootstrap_context_snapshot(self, recorded_by, event_id_b64)?;
         Ok(ctx)
     }
 
@@ -442,7 +456,7 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
     ) -> ProjectionQueryResult<ContextSnapshot> {
         let mut ctx = ContextSnapshot::default();
 
-        ctx.is_local_create = match self.conn.query_row(
+        ctx.is_local_create = match self.query_row(
             "SELECT source FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, event_id_b64],
             |row| row.get::<_, String>(0),
@@ -454,7 +468,7 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
         if device_invite.signer_type == 5 {
             let signer_b64 = event_id_to_base64(&device_invite.signed_by);
             let authority_b64 = event_id_to_base64(&device_invite.authority_event_id);
-            let authority_matches_signer: bool = self.conn.query_row(
+            let authority_matches_signer: bool = self.query_row(
                 "SELECT EXISTS(
                      SELECT 1
                      FROM peers_shared
@@ -468,8 +482,7 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
             ctx.invite_authority_matches_signer = Some(authority_matches_signer);
         }
 
-        ctx.bootstrap_context =
-            load_bootstrap_context_snapshot(self.conn, recorded_by, event_id_b64)?;
+        ctx.bootstrap_context = load_bootstrap_context_snapshot(self, recorded_by, event_id_b64)?;
         Ok(ctx)
     }
 
@@ -479,14 +492,10 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
         event_id_b64: &str,
         message: &MessageEvent,
     ) -> ProjectionQueryResult<ContextSnapshot> {
-        let signer_user_mismatch_reason = signer_user_mismatch_reason(
-            self.conn,
-            recorded_by,
-            &message.signed_by,
-            &message.author_id,
-        )?;
+        let signer_user_mismatch_reason =
+            signer_user_mismatch_reason(self, recorded_by, &message.signed_by, &message.author_id)?;
 
-        let mut stmt = self.conn.prepare_cached(
+        let mut stmt = self.prepare_cached(
             "SELECT deletion_event_id, author_id, created_at
              FROM deletion_intents
              WHERE recorded_by = ?1
@@ -519,7 +528,7 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
     ) -> ProjectionQueryResult<ContextSnapshot> {
         let mut ctx = ContextSnapshot::default();
         ctx.signer_user_mismatch_reason = signer_user_mismatch_reason(
-            self.conn,
+            self,
             recorded_by,
             &message_deletion.signed_by,
             &message_deletion.author_id,
@@ -527,7 +536,6 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
 
         let target_b64 = event_id_to_base64(&message_deletion.target_event_id);
         ctx.target_tombstone_author = self
-            .conn
             .query_row(
                 "SELECT author_id FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
                 rusqlite::params![recorded_by, &target_b64],
@@ -536,7 +544,6 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
             .optional()?;
 
         ctx.target_message_author = self
-            .conn
             .query_row(
                 "SELECT author_id FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
                 rusqlite::params![recorded_by, &target_b64],
@@ -545,7 +552,7 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
             .optional()?;
 
         if ctx.target_message_author.is_none() && ctx.target_tombstone_author.is_none() {
-            ctx.target_is_non_message = self.conn.query_row(
+            ctx.target_is_non_message = self.query_row(
                 "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
                 rusqlite::params![recorded_by, &target_b64],
                 |row| row.get(0),
@@ -562,13 +569,13 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
         reaction: &ReactionEvent,
     ) -> ProjectionQueryResult<ContextSnapshot> {
         let target_b64 = event_id_to_base64(&reaction.target_event_id);
-        let target_message_deleted = self.conn.query_row(
+        let target_message_deleted = self.query_row(
             "SELECT COUNT(*) > 0 FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
             rusqlite::params![recorded_by, &target_b64],
             |row| row.get(0),
         )?;
         let signer_user_mismatch_reason = signer_user_mismatch_reason(
-            self.conn,
+            self,
             recorded_by,
             &reaction.signed_by,
             &reaction.author_id,
@@ -588,7 +595,7 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
         file: &FileEvent,
     ) -> ProjectionQueryResult<ContextSnapshot> {
         let message_id_b64 = event_id_to_base64(&file.message_id);
-        let target_message_deleted: bool = self.conn.query_row(
+        let target_message_deleted: bool = self.query_row(
             "SELECT COUNT(*) > 0
              FROM deleted_messages
              WHERE recorded_by = ?1 AND message_id = ?2",
@@ -596,7 +603,6 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
             |row| row.get(0),
         )?;
         let deleted_file_message_id = self
-            .conn
             .query_row(
                 "SELECT message_id
                  FROM deleted_files
@@ -623,7 +629,6 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
         let file_id_b64 = event_id_to_base64(&file_slice.file_id);
 
         ctx.deleted_file_message_id = self
-            .conn
             .query_row(
                 "SELECT message_id
                  FROM deleted_files
@@ -633,7 +638,7 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
             )
             .optional()?;
 
-        let mut desc_stmt = self.conn.prepare(
+        let mut desc_stmt = self.prepare(
             "SELECT event_id, signer_event_id, key_event_id
              FROM files
              WHERE recorded_by = ?1 AND file_id = ?2
@@ -649,7 +654,7 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        ctx.existing_file_slice = match self.conn.query_row(
+        ctx.existing_file_slice = match self.query_row(
             "SELECT event_id, descriptor_event_id
              FROM file_slices
              WHERE recorded_by = ?1 AND file_id = ?2 AND slice_number = ?3",
@@ -674,7 +679,7 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
         let invite_event_id_b64 = event_id_to_base64(&invite_accepted.invite_event_id);
         let workspace_id_b64 = event_id_to_base64(&invite_accepted.workspace_id);
 
-        ctx.has_local_invite_secret = self.conn.query_row(
+        ctx.has_local_invite_secret = self.query_row(
             "SELECT EXISTS(
                      SELECT 1
                      FROM invite_secrets
@@ -686,11 +691,9 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
             |row| row.get(0),
         )?;
         ctx.peer_shared_transport_identity_active =
-            peer_has_creds_with_source(self.conn, recorded_by, CRED_SOURCE_PEER_SHARED)
-                .unwrap_or(false);
+            peer_has_creds_with_source(self, recorded_by, CRED_SOURCE_PEER_SHARED).unwrap_or(false);
 
-        if let Some(bc) =
-            load_bootstrap_context_snapshot(self.conn, recorded_by, &invite_event_id_b64)?
+        if let Some(bc) = load_bootstrap_context_snapshot(self, recorded_by, &invite_event_id_b64)?
         {
             if bc.workspace_id != workspace_id_b64 {
                 ctx.invite_accepted_link_workspace_mismatch_reason = Some(
@@ -699,7 +702,7 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
                 );
             }
             ctx.bootstrap_spki_already_peer_shared = bootstrap_spki_already_peer_shared(
-                self.conn,
+                self,
                 recorded_by,
                 &bc.bootstrap_spki_fingerprint,
             )?;
@@ -724,7 +727,6 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
         let unwrap_key_b64 = event_id_to_base64(&key_shared.unwrap_key_event_id);
 
         let invite_secret_row: Option<Vec<u8>> = self
-            .conn
             .query_row(
                 "SELECT private_key
                  FROM invite_secrets
@@ -749,7 +751,7 @@ impl ProjectionQueries for SqliteProjectionQueries<'_> {
         let local_signing_key = SigningKey::from_bytes(&key_arr);
 
         let sender_key = match resolve_signer_key(
-            self.conn,
+            self,
             recorded_by,
             key_shared.signer_type,
             &key_shared.signed_by,

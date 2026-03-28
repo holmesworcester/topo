@@ -1,5 +1,13 @@
 use crate::event_modules::ParsedEvent;
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::queries::define_query_context_loader;
+
+define_query_context_loader!(
+    build_projector_context,
+    Workspace,
+    load_workspace_context,
+    "workspace"
+);
 
 /// Pure projector: Workspace guard — accepted-invite binding must match workspace event_id.
 /// Returns Block if no accepted binding yet, Reject if mismatch.

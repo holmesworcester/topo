@@ -1,6 +1,14 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::queries::define_query_context_loader;
+
+define_query_context_loader!(
+    build_projector_context,
+    PeerShared,
+    load_peer_shared_context,
+    "peer_shared"
+);
 
 /// Pure projector: PeerShared -> peers_shared table.
 ///

@@ -1,5 +1,4 @@
 pub mod commands;
-mod projection_context;
 pub mod projector;
 pub mod queries;
 pub mod wire;

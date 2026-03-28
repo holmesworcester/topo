@@ -6,9 +6,7 @@ use serde::Serialize;
 
 use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::crypto::{event_id_from_base64, event_id_to_base64, hash_event, EventId};
-use crate::event_modules::{
-    self as events, parse_event, EncryptedEvent, EventTypeMeta, ParsedEvent,
-};
+use crate::event_modules::{self as events, parse_event, EncryptedEvent, ParsedEvent};
 use crate::projection::apply::{
     project_one::project_one_step_with_backend, run_dep_and_projection_stages_with_backend,
     ProjectionApplyResult, ProjectionBackend,
@@ -1388,16 +1386,6 @@ impl ProjectionBackend for NodeBehaviorEngine {
         )?;
         let inner = matches!(decision, ProjectionDecision::Valid).then_some(inner_parsed);
         Ok((decision, inner))
-    }
-
-    fn load_context(
-        &self,
-        meta: &'static EventTypeMeta,
-        recorded_by: &str,
-        event_id_b64: &str,
-        parsed: &ParsedEvent,
-    ) -> ProjectionApplyResult<ContextSnapshot> {
-        (meta.context_loader)(self, recorded_by, event_id_b64, parsed)
     }
 
     fn execute_write_ops(&self, ops: &[WriteOp]) -> ProjectionApplyResult<()> {

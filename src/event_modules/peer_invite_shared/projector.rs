@@ -1,5 +1,13 @@
 use super::super::ParsedEvent;
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::queries::define_query_context_loader;
+
+define_query_context_loader!(
+    build_projector_context,
+    DeviceInvite,
+    load_device_invite_context,
+    "device_invite"
+);
 
 /// Pure projector: DeviceInvite -> device_invites table.
 /// When bootstrap_context is available and this event is locally created,

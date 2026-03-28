@@ -1,5 +1,5 @@
 use super::super::decision::ProjectionDecision;
-use super::backend::{ProjectionApplyResult, ProjectionBackend, SqliteProjectionBackend};
+use super::backend::{ProjectionApplyResult, ProjectionBackend};
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::event_modules::{self as events, ParsedEvent};
 use rusqlite::Connection;
@@ -41,8 +41,7 @@ pub(crate) fn project_one_step(
     recorded_by: &str,
     event_id: &EventId,
 ) -> Result<(ProjectionDecision, Option<ParsedEvent>), Box<dyn std::error::Error>> {
-    let backend = SqliteProjectionBackend::new(conn);
-    project_one_step_with_backend(&backend, recorded_by, event_id)
+    project_one_step_with_backend(conn, recorded_by, event_id)
 }
 
 pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(

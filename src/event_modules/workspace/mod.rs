@@ -4,7 +4,6 @@ pub mod commands;
 mod commands_api;
 pub mod identity_ops;
 pub mod invite_link;
-mod projection_context;
 pub mod projector;
 pub mod queries;
 pub mod wire;

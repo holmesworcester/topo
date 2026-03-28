@@ -1,6 +1,6 @@
 use super::super::decision::ProjectionDecision;
 use super::super::signer::{verify_ed25519_signature, SignerResolution};
-use super::backend::{ProjectionApplyResult, ProjectionBackend, SqliteProjectionBackend};
+use super::backend::{ProjectionApplyResult, ProjectionBackend};
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::queue::current_timestamp_ms;
 use crate::db::timeline::EventTimeline;
@@ -271,9 +271,8 @@ pub(crate) fn apply_projection(
     parsed: &ParsedEvent,
     current_transport_key_event_id: Option<&str>,
 ) -> Result<(ProjectionDecision, Option<ParsedEvent>), Box<dyn std::error::Error>> {
-    let backend = SqliteProjectionBackend::new(conn);
     apply_projection_with_backend(
-        &backend,
+        conn,
         recorded_by,
         event_id_b64,
         blob,
@@ -352,7 +351,7 @@ pub(crate) fn apply_projection_with_backend<B: ProjectionBackend>(
     }
 
     // Build projector context via event-module-owned loader.
-    let mut ctx = backend.load_context(meta, recorded_by, event_id_b64, parsed)?;
+    let mut ctx = (meta.context_loader)(backend, recorded_by, event_id_b64, parsed)?;
     ctx.current_transport_key_event_id = current_transport_key_event_id.map(ToOwned::to_owned);
 
     // Dispatch to pure projector
@@ -482,9 +481,8 @@ pub(crate) fn run_dep_and_projection_stages(
     enforce_dep_types: bool,
     current_transport_key_event_id: Option<&str>,
 ) -> Result<(ProjectionDecision, Option<ParsedEvent>), Box<dyn std::error::Error>> {
-    let backend = SqliteProjectionBackend::new(conn);
     run_dep_and_projection_stages_with_backend(
-        &backend,
+        conn,
         recorded_by,
         event_id_b64,
         blob,

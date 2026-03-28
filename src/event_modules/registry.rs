@@ -46,7 +46,8 @@ pub struct EventTypeMeta {
     /// via registry lookup — no central match statement required.
     pub projector: fn(&str, &str, &ParsedEvent, &ContextSnapshot) -> ProjectorResult,
     /// Module-owned projector context loader. Projector-specific context queries
-    /// belong in the owning event module, not in shared apply code.
+    /// belong with the owning event module's projection surface, not in shared
+    /// apply code.
     pub context_loader: fn(
         &dyn ProjectionQueries,
         &str,

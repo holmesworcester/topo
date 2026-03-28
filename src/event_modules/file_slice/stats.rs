@@ -1,28 +1,10 @@
 use std::collections::HashMap;
 
-use super::super::ParsedEvent;
-use crate::projection::contract::ContextSnapshot;
-use crate::projection::queries::ProjectionQueries;
 use rusqlite::Connection;
 
 fn is_file_slice_transport_blob(blob: &[u8]) -> bool {
     crate::event_modules::outer_semantic_type_code(blob)
         == Some(crate::event_modules::EVENT_TYPE_FILE_SLICE)
-}
-
-/// Build projector-local context for FileSlice projection.
-pub fn build_projector_context(
-    queries: &dyn ProjectionQueries,
-    recorded_by: &str,
-    event_id_b64: &str,
-    parsed: &ParsedEvent,
-) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
-    let file_slice = match parsed {
-        ParsedEvent::FileSlice(file_slice) => file_slice,
-        _ => return Err("file_slice context loader called for non-file_slice event".into()),
-    };
-
-    queries.load_file_slice_context(recorded_by, event_id_b64, file_slice)
 }
 
 /// Query file-slice event counts grouped by ingest source.

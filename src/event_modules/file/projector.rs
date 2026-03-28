@@ -1,6 +1,9 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::queries::define_query_context_loader;
+
+define_query_context_loader!(build_projector_context, File, load_file_context, "file");
 
 /// Pure projector: File → files table insert.
 /// Emits RetryFileSliceGuards command so pending file_slices can unblock.

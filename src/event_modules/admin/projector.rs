@@ -1,5 +1,8 @@
 use super::super::ParsedEvent;
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::queries::define_query_context_loader;
+
+define_query_context_loader!(build_projector_context, Admin, load_admin_context, "admin");
 
 /// Pure projector: Admin -> admins table.
 pub fn project_pure(
