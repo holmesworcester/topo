@@ -96,8 +96,45 @@ fn load_valid_semantic_type_code(
             )?;
             Ok(Some(code))
         }
-        None => Ok(None),
+        None => {
+            if global_endpoint_shared_is_valid(conn, dep_b64)? {
+                return Ok(Some(crate::event_modules::EVENT_TYPE_ENDPOINT_SHARED));
+            }
+            Ok(None)
+        }
     }
+}
+
+fn global_endpoint_shared_is_valid(
+    conn: &Connection,
+    dep_b64: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM endpoints_shared
+             WHERE event_id = ?1
+         )",
+        rusqlite::params![dep_b64],
+        |row| row.get(0),
+    )?;
+    Ok(present)
+}
+
+fn dep_is_satisfied_for_scope(
+    conn: &Connection,
+    recorded_by: &str,
+    dep_b64: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let dep_valid: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, dep_b64],
+        |row| row.get(0),
+    )?;
+    if dep_valid {
+        return Ok(true);
+    }
+    global_endpoint_shared_is_valid(conn, dep_b64)
 }
 
 fn load_recorded_source_peer_id(
@@ -215,11 +252,7 @@ pub(crate) fn check_deps_and_block(
     let mut missing = Vec::new();
     for (field_name, dep_id) in deps {
         let dep_b64 = event_id_to_base64(dep_id);
-        let dep_valid: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &dep_b64],
-            |row| row.get(0),
-        )?;
+        let dep_valid = dep_is_satisfied_for_scope(conn, recorded_by, &dep_b64)?;
         if !dep_valid {
             let tombstone_satisfies_dep =
                 tombstone_satisfies_message_dep(conn, recorded_by, parsed, field_name, &dep_b64)?;

@@ -64,7 +64,7 @@ pub fn assert_identity_eventually_materialized(db_path: &str, timeout_ms: u64) {
         if identity.status.success()
             && stdout.contains("Transport:")
             && !stdout.contains("User:      (none)")
-            && !stdout.contains("Peer:      (none)")
+            && !stdout.contains("Account:   (none)")
         {
             return;
         }

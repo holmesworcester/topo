@@ -159,6 +159,11 @@ pub struct ContextSnapshot {
     /// authorized by the signing device-invite chain.
     pub peer_shared_user_mismatch_reason: Option<String>,
 
+    /// For PeerShared/AccountShared: the referenced endpoint_shared root must
+    /// already be projected, and this carries the bound endpoint_id when so.
+    pub peer_shared_endpoint_id: Option<String>,
+    pub peer_shared_endpoint_binding_reason: Option<String>,
+
     /// For Admin: the claimed `public_key` must match the referenced
     /// `users.public_key` for `user_event_id`.
     pub admin_user_key_mismatch_reason: Option<String>,

@@ -6,8 +6,9 @@ edition = "2021"
 [dependencies]
 rusqlite = { version = "0.31", features = ["bundled"] }
 nom = "7.1"
-quinn = "0.11"
+iroh = { version = "0.97.0", default-features = false, features = ["address-lookup-mdns", "portmapper"] }
 tokio = { version = "1", features = ["full"] }
+tokio-stream = "0.1"
 tokio-util = "0.7"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
 blake2 = "0.10"
@@ -32,13 +33,11 @@ tempfile = "3"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 libc = "0.2"
-mdns-sd = { version = "0.11", optional = true }
-igd-next = { version = "0.15", features = ["aio_tokio"] }
 if-addrs = "0.13"
 
 [features]
 default = ["discovery"]
-discovery = ["mdns-sd"]
+discovery = []
 
 [[bin]]
 name = "topo"

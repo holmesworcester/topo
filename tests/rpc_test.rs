@@ -230,9 +230,6 @@ fn rpc_all_methods_serialize() {
         RpcMethod::Users,
         RpcMethod::Keys { summary: true },
         RpcMethod::Workspaces,
-        RpcMethod::IntroAttempts {
-            peer: Some("peer1".into()),
-        },
         RpcMethod::Shutdown,
         RpcMethod::Tenants,
         RpcMethod::UseTenant { index: 1 },
@@ -261,9 +258,6 @@ fn rpc_all_methods_serialize() {
             devicename: "device".into(),
         },
         RpcMethod::Peers,
-        RpcMethod::Upnp {
-            action: UpnpAction::Enable,
-        },
         RpcMethod::SubCreate {
             name: "inbox".into(),
             event_type: "message".into(),
@@ -773,8 +767,9 @@ fn daemon_status_includes_runtime_net_info() {
     );
 
     assert!(
-        runtime.get("upnp").is_none() || runtime["upnp"].is_null(),
-        "upnp should not be present before running topo upnp"
+        runtime["published_addrs"].is_array(),
+        "runtime.published_addrs should be an array, got: {:?}",
+        runtime
     );
 }
 
@@ -909,154 +904,6 @@ fn daemon_start_falls_back_when_default_port_is_already_taken() {
         active_addr.port(),
         4433,
         "daemon should avoid the default port when it is already taken"
-    );
-
-    stop_daemon(&db, &mut daemon);
-}
-
-#[test]
-fn upnp_on_empty_daemon_works_without_workspace() {
-    let (_dir, db) = temp_db();
-    let socket = socket_path_for_db(&db);
-    let bind = free_udp_bind_addr();
-
-    let mut daemon = DaemonGuard::new(
-        Command::new(bin())
-            .args(["--db", &db, "start", "--bind", &bind])
-            .spawn()
-            .unwrap(),
-    );
-    wait_for_socket(&socket);
-    let _ = wait_for_runtime_state(&socket, "IdleNoTenants", Duration::from_secs(10));
-
-    // UPnP mode should enable successfully even without a workspace.
-    let out = Command::new(bin())
-        .args(["--db", &db, "upnp"])
-        .output()
-        .unwrap();
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    assert!(
-        out.status.success(),
-        "upnp should succeed on empty daemon, got stderr: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    assert!(
-        stdout.contains("enabled"),
-        "expected upnp enable output, got: {}",
-        stdout
-    );
-    let status = status_via_rpc(&socket);
-    assert_eq!(status["runtime"]["upnp_enabled"], true);
-    assert!(
-        status["runtime"].get("upnp").is_none() || status["runtime"]["upnp"].is_null(),
-        "idle daemon should not have a runtime mapping report yet: {}",
-        status
-    );
-
-    stop_daemon(&db, &mut daemon);
-}
-
-#[test]
-fn upnp_enabled_before_workspace_creation_refreshes_when_runtime_starts() {
-    let (_dir, db) = temp_db();
-    let socket = socket_path_for_db(&db);
-    let bind = free_udp_bind_addr();
-
-    let mut daemon = DaemonGuard::new(
-        Command::new(bin())
-            .args(["--db", &db, "start", "--bind", &bind])
-            .spawn()
-            .unwrap(),
-    );
-    wait_for_socket(&socket);
-    let _ = wait_for_runtime_state(&socket, "IdleNoTenants", Duration::from_secs(10));
-
-    let out = Command::new(bin())
-        .args(["--db", &db, "upnp"])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "upnp enable should succeed before workspace creation: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let out = Command::new(bin())
-        .args(["create-workspace", "--db", &db])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "create-workspace failed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-
-    let _ = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
-    let deadline = std::time::Instant::now() + Duration::from_secs(10);
-    let status = loop {
-        let data = status_via_rpc(&socket);
-        if data["runtime"]["upnp_enabled"].as_bool() == Some(true)
-            && data["runtime"]["upnp"]["status"].as_str().is_some()
-        {
-            break data;
-        }
-        assert!(
-            std::time::Instant::now() < deadline,
-            "timed out waiting for UPnP refresh after runtime activation: {}",
-            data
-        );
-        std::thread::sleep(Duration::from_millis(100));
-    };
-    assert_eq!(status["runtime"]["upnp_enabled"], true);
-    assert_eq!(status["runtime"]["upnp"]["status"], "not_attempted");
-
-    stop_daemon(&db, &mut daemon);
-}
-
-#[test]
-fn upnp_mode_resets_on_daemon_restart() {
-    let (_dir, db) = temp_db();
-    let socket = socket_path_for_db(&db);
-    let bind = free_udp_bind_addr();
-
-    create_workspace(&db);
-
-    let mut daemon = DaemonGuard::new(
-        Command::new(bin())
-            .args(["--db", &db, "start", "--bind", &bind])
-            .spawn()
-            .unwrap(),
-    );
-    wait_for_socket(&socket);
-    let _ = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
-
-    let out = Command::new(bin())
-        .args(["--db", &db, "upnp"])
-        .output()
-        .unwrap();
-    assert!(
-        out.status.success(),
-        "upnp enable should succeed: {}",
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let status = status_via_rpc(&socket);
-    assert_eq!(status["runtime"]["upnp_enabled"], true);
-
-    stop_daemon(&db, &mut daemon);
-
-    let mut daemon = DaemonGuard::new(
-        Command::new(bin())
-            .args(["--db", &db, "start", "--bind", &bind])
-            .spawn()
-            .unwrap(),
-    );
-    wait_for_socket(&socket);
-    let status = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
-    assert_eq!(status["runtime"]["upnp_enabled"], false);
-    assert!(
-        status["runtime"].get("upnp").is_none() || status["runtime"]["upnp"].is_null(),
-        "restart should clear prior UPnP report: {}",
-        status
     );
 
     stop_daemon(&db, &mut daemon);
@@ -1720,7 +1567,7 @@ fn rpc_identity_command() {
         "should contain Transport line"
     );
     assert!(stdout.contains("User:"), "should contain User line");
-    assert!(stdout.contains("Peer:"), "should contain Peer line");
+    assert!(stdout.contains("Account:"), "should contain Account line");
 }
 
 #[test]
@@ -2192,7 +2039,6 @@ fn catalog_drift_test_method_count_matches_protocol() {
         "Users",
         "Keys",
         "Workspaces",
-        "IntroAttempts",
         "CreateInvite",
         "AcceptInvite",
         "CreateDeviceLink",
@@ -2204,7 +2050,6 @@ fn catalog_drift_test_method_count_matches_protocol() {
         "ActiveTenant",
         "CreateWorkspace",
         "Peers",
-        "Upnp",
         "View",
         "EventList",
         "EventBlocked",
@@ -2213,7 +2058,6 @@ fn catalog_drift_test_method_count_matches_protocol() {
         "Replay",
         "Connections",
         "Discover",
-        "Intro",
     ];
 
     for method in &known_methods {

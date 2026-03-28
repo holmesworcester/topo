@@ -7,12 +7,9 @@ use ed25519_dalek::SigningKey;
 use serde::{Deserialize, Serialize};
 
 use crate::crypto::EventId;
-use crate::db::{
-    open_connection, schema::create_tables, transport_trust::is_authorized_for_tenant,
-};
+use crate::db::{open_connection, schema::create_tables};
 use crate::event_modules::peer_shared;
-use crate::transport::create_dual_endpoint_dynamic;
-use crate::transport::identity::{load_transport_cert_required, load_transport_peer_id};
+use crate::transport::load_daemon_identity;
 
 // ---------------------------------------------------------------------------
 // Error type
@@ -98,9 +95,9 @@ pub fn open_db_load(
         return Err("no active tenant — run `topo tenant use <N>`".into());
     }
 
-    // Fresh DB / pre-workspace state: fall back to singleton transport identity.
-    let transport_peer_id = load_transport_peer_id(&conn)?;
-    Ok((transport_peer_id, conn))
+    // Fresh DB / pre-workspace state: fall back to the daemon-scoped endpoint id.
+    let endpoint_id = load_daemon_identity(&conn)?.0;
+    Ok((endpoint_id, conn))
 }
 
 /// Open DB for a specific peer_id (used when daemon provides the active peer).
@@ -121,18 +118,6 @@ pub fn open_db_for_peer(
 pub struct NodeTenantItem {
     pub peer_id: String,
     pub workspace_id: String,
-}
-
-#[derive(Debug, Serialize, Deserialize)]
-pub struct IntroAttemptItem {
-    pub intro_id: String,
-    pub other_peer_id: String,
-    pub introduced_by_peer_id: String,
-    pub origin_ip: String,
-    pub origin_port: u16,
-    pub status: String,
-    pub error: Option<String>,
-    pub created_at: i64,
 }
 
 // ---------------------------------------------------------------------------
@@ -193,59 +178,6 @@ pub fn svc_node_status(db_path: &str) -> ServiceResult<Vec<NodeTenantItem>> {
             workspace_id: t.workspace_id,
         })
         .collect())
-}
-
-pub async fn svc_intro(
-    db_path: &str,
-    peer_a: &str,
-    peer_b: &str,
-    ttl_ms: u64,
-    attempt_window_ms: u32,
-) -> ServiceResult<bool> {
-    use std::sync::Arc;
-
-    let conn = open_connection(db_path)?;
-    create_tables(&conn)?;
-    let (recorded_by, cert, key) = load_transport_cert_required(&conn)?;
-    drop(conn);
-
-    // Dynamic trust lookup from SQL at handshake time
-    let db_path_for_lookup = db_path.to_string();
-    let recorded_by_for_lookup = recorded_by.clone();
-    let dynamic_allow = Arc::new(move |peer_fp: &[u8; 32]| {
-        let db = open_connection(&db_path_for_lookup)?;
-        is_authorized_for_tenant(&db, &recorded_by_for_lookup, peer_fp)
-    });
-    let endpoint =
-        create_dual_endpoint_dynamic("0.0.0.0:0".parse().unwrap(), cert, key, dynamic_allow)?;
-
-    let result = crate::peering::workflows::intro::run_intro(
-        &endpoint,
-        db_path,
-        &recorded_by,
-        peer_a,
-        peer_b,
-        ttl_ms,
-        attempt_window_ms,
-    )
-    .await
-    .map_err(|e| ServiceError(format!("{}", e)))?;
-
-    endpoint.close(0u32.into(), b"done");
-
-    if result.sent_to_a && result.sent_to_b {
-        Ok(true)
-    } else {
-        let errors: Vec<String> = result.errors.iter().map(|e| e.to_string()).collect();
-        if !result.sent_to_a && !result.sent_to_b {
-            Err(ServiceError(format!(
-                "Failed to send to both peers: {}",
-                errors.join("; ")
-            )))
-        } else {
-            Err(ServiceError(format!("Partial send: {}", errors.join("; "))))
-        }
-    }
 }
 
 // ---------------------------------------------------------------------------

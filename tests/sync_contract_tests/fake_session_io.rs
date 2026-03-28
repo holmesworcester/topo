@@ -371,7 +371,8 @@ impl TransportSessionIo for FakeTransportSessionIo {
             tokio::time::sleep(delay).await;
         }
         if self.ctrl_recv_count == 0 {
-            if let Some(ProtocolViolation::GarbageControlFrame) = &self.config.inject_protocol_violation
+            if let Some(ProtocolViolation::GarbageControlFrame) =
+                &self.config.inject_protocol_violation
             {
                 self.ctrl_recv_count += 1;
                 return Ok(GARBAGE_CONTROL_FRAME.to_vec());
@@ -395,10 +396,7 @@ impl TransportSessionIo for FakeTransportSessionIo {
         Ok(frame)
     }
 
-    async fn send_control_frame(
-        &mut self,
-        frame: &[u8],
-    ) -> Result<(), TransportSessionIoError> {
+    async fn send_control_frame(&mut self, frame: &[u8]) -> Result<(), TransportSessionIoError> {
         if self.closed.load(Ordering::Acquire) {
             return Err(TransportSessionIoError::ConnectionLost);
         }

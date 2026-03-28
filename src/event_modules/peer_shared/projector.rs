@@ -30,9 +30,20 @@ pub fn project_pure(
     if let Some(reason) = &ctx.peer_shared_user_mismatch_reason {
         return ProjectorResult::reject(reason.clone());
     }
+    let Some(endpoint_id) = ctx.peer_shared_endpoint_id.as_ref() else {
+        return ProjectorResult::reject(
+            ctx.peer_shared_endpoint_binding_reason
+                .clone()
+                .unwrap_or_else(|| "peer_shared missing endpoint_shared binding".to_string()),
+        );
+    };
 
     let user_event_id_b64 = event_id_to_base64(user_event_id);
     let transport_fingerprint = crate::crypto::spki_fingerprint_from_ed25519_pubkey(public_key);
+    let endpoint_shared_event_id_b64 = match parsed {
+        ParsedEvent::PeerShared(p) => event_id_to_base64(&p.endpoint_shared_event_id),
+        _ => unreachable!(),
+    };
     let ops = vec![WriteOp::InsertOrIgnore {
         table: "peers_shared",
         columns: vec![
@@ -40,6 +51,8 @@ pub fn project_pure(
             "event_id",
             "public_key",
             "transport_fingerprint",
+            "endpoint_shared_event_id",
+            "endpoint_id",
             "user_event_id",
             "device_name",
         ],
@@ -48,6 +61,8 @@ pub fn project_pure(
             SqlVal::Text(event_id_b64.to_string()),
             SqlVal::Blob(public_key.to_vec()),
             SqlVal::Blob(transport_fingerprint.to_vec()),
+            SqlVal::Text(endpoint_shared_event_id_b64),
+            SqlVal::Text(endpoint_id.clone()),
             SqlVal::Text(user_event_id_b64),
             SqlVal::Text(device_name.to_string()),
         ],
@@ -66,6 +81,7 @@ mod projector_tests {
             created_at_ms: 1,
             public_key: [5u8; 32],
             user_event_id: [6u8; 32],
+            endpoint_shared_event_id: [8u8; 32],
             device_name: "phone".to_string(),
             signed_by: [7u8; 32],
             signer_type: 3,
@@ -79,7 +95,10 @@ mod projector_tests {
             "peer1",
             "peer-shared-event",
             &peer_shared_event(),
-            &ContextSnapshot::default(),
+            &ContextSnapshot {
+                peer_shared_endpoint_id: Some("endpoint-1".to_string()),
+                ..ContextSnapshot::default()
+            },
         );
         assert!(matches!(
             result.decision,
@@ -118,7 +137,29 @@ mod projector_tests {
             "peer1",
             "workspace-event",
             &other,
-            &ContextSnapshot::default(),
+            &ContextSnapshot {
+                peer_shared_endpoint_id: Some("endpoint-1".to_string()),
+                ..ContextSnapshot::default()
+            },
+        );
+        assert!(matches!(
+            result.decision,
+            crate::projection::decision::ProjectionDecision::Reject { .. }
+        ));
+    }
+
+    #[test]
+    fn test_peer_shared_rejects_missing_endpoint_binding() {
+        let result = project_pure(
+            "peer1",
+            "peer-shared-event",
+            &peer_shared_event(),
+            &ContextSnapshot {
+                peer_shared_endpoint_binding_reason: Some(
+                    "no projected endpoint_shared row for abc".to_string(),
+                ),
+                ..ContextSnapshot::default()
+            },
         );
         assert!(matches!(
             result.decision,

@@ -72,6 +72,7 @@ pub struct JoinChain {
     pub user_key: SigningKey,
     pub device_invite_event_id: EventId,
     pub device_invite_key: SigningKey,
+    pub endpoint_shared_event_id: EventId,
     pub peer_shared_event_id: EventId,
     pub peer_shared_key: SigningKey,
     pub invite_accepted_event_id: EventId,
@@ -80,6 +81,7 @@ pub struct JoinChain {
 
 /// Result of accepting a device link invite.
 pub struct LinkChain {
+    pub endpoint_shared_event_id: EventId,
     pub peer_shared_event_id: EventId,
     pub peer_shared_key: SigningKey,
     pub invite_accepted_event_id: EventId,

@@ -10,12 +10,14 @@ use crate::contracts::peering_contract::{
 use crate::crypto::{hash_event, EventId};
 use crate::db::queue::current_timestamp_ms;
 use crate::db::{open_connection, store::Store};
+use crate::peering::loops::evict_live_daemon_connection;
 use crate::protocol::{encode_frame, parse_frame, Frame};
 use crate::runtime::transport::{
     open_outbound_dependency_session, resolve_outbound_session_auth_plan,
     send_outbound_session_auth,
 };
 use crate::state::{dependency_fetch, pipeline::ingest_now};
+use crate::sync::session::range_session::load_shared_send_batch_with_endpoint_deps;
 use crate::transport::{DaemonConnection, OutboundSessionAuthPlan};
 
 const DEPENDENCY_BATCH_CAP: usize = 16;
@@ -36,6 +38,19 @@ fn decode_exact_frame(frame: &[u8]) -> Result<Frame, String> {
 
 fn io_error(label: &str, err: TransportSessionIoError) -> String {
     format!("{label}: {err}")
+}
+
+fn should_evict_closed_daemon_connection(
+    daemon_connection: &DaemonConnection,
+    message: &str,
+) -> bool {
+    let lower = message.to_ascii_lowercase();
+    (lower.contains("connection lost")
+        || lower.contains("closed by peer")
+        || lower.contains("application closed")
+        || lower.contains("broken pipe")
+        || lower.contains("reset by peer"))
+        && daemon_connection.connection().close_reason().is_some()
 }
 
 fn make_ingest_item(
@@ -97,8 +112,7 @@ async fn run_dependency_control_loop(
                     Frame::NegOpen { .. }
                     | Frame::NegMsg { .. }
                     | Frame::DiscoveryHints { .. }
-                    | Frame::IntroOffer { .. }
-                    | Frame::OpenSessionAuthPeerShared { .. }
+                    | Frame::OpenSessionRoute { .. }
                     | Frame::OpenSessionAuthInvite { .. }
                     | Frame::OpenSessionAuthAck { .. }
                     | Frame::Event { .. } => {}
@@ -133,13 +147,8 @@ async fn run_dependency_response_sender(
         ids.sort_unstable();
         ids.dedup();
         for chunk in ids.chunks(REQUEST_BATCH_CAP) {
-            let blobs = store
-                .get_shared_batch(chunk)
-                .map_err(|e| format!("load dependency response batch: {e}"))?;
-            for event_id in chunk {
-                let Some(blob) = blobs.get(event_id) else {
-                    continue;
-                };
+            let ordered = load_shared_send_batch_with_endpoint_deps(&store, chunk)?;
+            for (_event_id, blob) in ordered {
                 data_send
                     .send(&encode_frame(&Frame::Event { blob: blob.clone() }))
                     .await
@@ -256,9 +265,20 @@ pub fn spawn_outbound_dependency_session(
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async move {
-        let (session_id, mut io) = match open_outbound_dependency_session(&daemon_connection).await {
+        let (session_id, mut io) = match open_outbound_dependency_session(&daemon_connection).await
+        {
             Ok(opened) => opened,
             Err(err) => {
+                if should_evict_closed_daemon_connection(&daemon_connection, &err.to_string()) {
+                    daemon_connection
+                        .connection()
+                        .close(0u32.into(), b"dependency session open lost connection");
+                    evict_live_daemon_connection(
+                        &db_path,
+                        daemon_connection.remote_daemon_peer_id(),
+                        daemon_connection.connection().stable_id(),
+                    );
+                }
                 warn!(
                     "dependency session open failed for daemon {}: {}",
                     daemon_connection.remote_daemon_peer_id(),
@@ -284,6 +304,7 @@ pub fn spawn_outbound_dependency_session(
             io.as_mut(),
             &db_path,
             &recorded_by,
+            Some(&daemon_connection),
             daemon_connection.remote_daemon_peer_id(),
             Some(daemon_connection.remote_daemon_peer_id()),
             &effective_auth_plan,
@@ -292,6 +313,16 @@ pub fn spawn_outbound_dependency_session(
         {
             Ok(auth_result) => auth_result,
             Err(err) => {
+                if should_evict_closed_daemon_connection(&daemon_connection, &err.to_string()) {
+                    daemon_connection
+                        .connection()
+                        .close(0u32.into(), b"dependency session auth lost connection");
+                    evict_live_daemon_connection(
+                        &db_path,
+                        daemon_connection.remote_daemon_peer_id(),
+                        daemon_connection.connection().stable_id(),
+                    );
+                }
                 warn!(
                     "dependency session auth failed for daemon {} tenant={}: {}",
                     daemon_connection.remote_daemon_peer_id(),

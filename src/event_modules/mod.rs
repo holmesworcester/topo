@@ -1,6 +1,8 @@
 pub mod admin;
 pub mod bench_dep;
 pub mod encrypted;
+pub mod endpoint_secret;
+pub mod endpoint_shared;
 pub mod file;
 pub mod file_slice;
 pub mod invite_accepted;
@@ -50,6 +52,8 @@ pub fn trunc_hex(bytes: &[u8], max_hex_chars: usize) -> String {
 pub use admin::AdminEvent;
 pub use bench_dep::BenchDepEvent;
 pub use encrypted::EncryptedEvent;
+pub use endpoint_secret::EndpointSecretEvent;
+pub use endpoint_shared::EndpointSharedEvent;
 pub use file::FileEvent;
 pub use file_slice::FileSliceEvent;
 pub use invite_accepted::InviteAcceptedEvent;
@@ -88,6 +92,8 @@ pub const EVENT_TYPE_BENCH_DEP: u8 = 26;
 pub const EVENT_TYPE_PEER_SECRET: u8 = 27;
 pub const EVENT_TYPE_INVITE_SECRET: u8 = 28;
 pub const EVENT_TYPE_TENANT: u8 = 29;
+pub const EVENT_TYPE_ENDPOINT_SECRET: u8 = 30;
+pub const EVENT_TYPE_ENDPOINT_SHARED: u8 = 31;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -118,6 +124,8 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     tenant::ensure_schema(conn)?;
     peer_secret::ensure_schema(conn)?;
     invite_secret::ensure_schema(conn)?;
+    endpoint_secret::ensure_schema(conn)?;
+    endpoint_shared::ensure_schema(conn)?;
     crate::state::subscriptions::ensure_schema(conn)?;
     Ok(())
 }
@@ -143,6 +151,8 @@ pub enum ParsedEvent {
     BenchDep(BenchDepEvent),
     PeerSecret(PeerSecretEvent),
     InviteSecret(InviteSecretEvent),
+    EndpointSecret(EndpointSecretEvent),
+    EndpointShared(EndpointSharedEvent),
 }
 
 impl ParsedEvent {
@@ -167,6 +177,8 @@ impl ParsedEvent {
             ParsedEvent::BenchDep(b) => b.created_at_ms,
             ParsedEvent::PeerSecret(l) => l.created_at_ms,
             ParsedEvent::InviteSecret(k) => k.created_at_ms,
+            ParsedEvent::EndpointSecret(e) => e.created_at_ms,
+            ParsedEvent::EndpointShared(e) => e.created_at_ms,
         }
     }
 
@@ -203,6 +215,7 @@ impl ParsedEvent {
             ParsedEvent::PeerShared(p) => {
                 vec![
                     ("user_event_id", p.user_event_id),
+                    ("endpoint_shared_event_id", p.endpoint_shared_event_id),
                     ("signed_by", p.signed_by),
                 ]
             }
@@ -228,6 +241,8 @@ impl ParsedEvent {
             ParsedEvent::BenchDep(b) => b.dep_ids.iter().map(|id| ("dep_id", *id)).collect(),
             ParsedEvent::PeerSecret(p) => vec![("signer_event_id", p.signer_event_id)],
             ParsedEvent::InviteSecret(_) => vec![],
+            ParsedEvent::EndpointSecret(_) => vec![],
+            ParsedEvent::EndpointShared(_) => vec![],
         }
     }
 
@@ -252,6 +267,8 @@ impl ParsedEvent {
             ParsedEvent::BenchDep(_) => EVENT_TYPE_BENCH_DEP,
             ParsedEvent::PeerSecret(_) => EVENT_TYPE_PEER_SECRET,
             ParsedEvent::InviteSecret(_) => EVENT_TYPE_INVITE_SECRET,
+            ParsedEvent::EndpointSecret(_) => EVENT_TYPE_ENDPOINT_SECRET,
+            ParsedEvent::EndpointShared(_) => EVENT_TYPE_ENDPOINT_SHARED,
         }
     }
 
@@ -277,7 +294,9 @@ impl ParsedEvent {
             | ParsedEvent::Tenant(_)
             | ParsedEvent::BenchDep(_)
             | ParsedEvent::PeerSecret(_)
-            | ParsedEvent::InviteSecret(_) => None,
+            | ParsedEvent::InviteSecret(_)
+            | ParsedEvent::EndpointSecret(_)
+            | ParsedEvent::EndpointShared(_) => None,
         }
     }
 
@@ -303,6 +322,8 @@ impl ParsedEvent {
             ParsedEvent::PeerSecret(e) => e.human_fields(),
             ParsedEvent::Tenant(e) => e.human_fields(),
             ParsedEvent::InviteSecret(e) => e.human_fields(),
+            ParsedEvent::EndpointSecret(e) => e.human_fields(),
+            ParsedEvent::EndpointShared(e) => e.human_fields(),
         }
     }
 }
@@ -392,6 +413,8 @@ pub fn registry() -> &'static EventRegistry {
             &bench_dep::BENCH_DEP_META,
             &peer_secret::PEER_SECRET_META,
             &invite_secret::INVITE_SECRET_META,
+            &endpoint_secret::ENDPOINT_SECRET_META,
+            &endpoint_shared::ENDPOINT_SHARED_META,
         ])
     })
 }
@@ -449,12 +472,14 @@ mod tests {
     #[test]
     fn test_registry_encryptable_coverage() {
         let reg = registry();
-        let encryptable_codes: Vec<u8> = (1..=29u8)
+        let encryptable_codes: Vec<u8> = (1..=31u8)
             .filter(|c| reg.lookup(*c).is_some_and(|m| m.encryptable))
             .collect();
         assert_eq!(encryptable_codes, vec![1, 2, 6, 7, 24, 25]);
 
-        for code in [5, 8, 9, 10, 12, 14, 16, 18, 20, 21, 22, 26, 27, 28, 29] {
+        for code in [
+            5, 8, 9, 10, 12, 14, 16, 18, 20, 21, 22, 26, 27, 28, 29, 30, 31,
+        ] {
             if let Some(meta) = reg.lookup(code) {
                 assert!(
                     !meta.encryptable,
@@ -472,7 +497,7 @@ mod tests {
     #[test]
     fn test_registry_transport_privacy_coverage() {
         let reg = registry();
-        let required_codes: Vec<u8> = (1..=29u8)
+        let required_codes: Vec<u8> = (1..=31u8)
             .filter(|c| {
                 reg.lookup(*c)
                     .is_some_and(|m| m.transport_privacy() == TransportPrivacy::RequireEncrypted)
@@ -487,7 +512,9 @@ mod tests {
             TransportPrivacy::Optional
         );
 
-        for code in [5, 8, 9, 10, 12, 14, 16, 18, 20, 21, 22, 26, 27, 28, 29] {
+        for code in [
+            5, 8, 9, 10, 12, 14, 16, 18, 20, 21, 22, 26, 27, 28, 29, 30, 31,
+        ] {
             if let Some(meta) = reg.lookup(code) {
                 assert_eq!(
                     meta.transport_privacy(),

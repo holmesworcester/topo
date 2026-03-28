@@ -1,9 +1,8 @@
-//! Peering runtime: daemon lifecycle, discovery, and peer dispatch.
+//! Peering runtime: daemon lifecycle and peer dispatch.
 //!
 //! Runtime worker ownership is centralized in `supervisor.rs`.
 
 mod bootstrap_auth;
-mod discovery;
 mod startup;
 pub(crate) mod supervisor;
 pub(crate) mod target_dispatch;
@@ -16,9 +15,8 @@ use serde::{Deserialize, Serialize};
 use tracing::info;
 
 use crate::contracts::event_pipeline_contract::IngestFns;
-use crate::peering::loops::IntroSpawnerFn;
 use crate::runtime::sync_control::SyncControlRegistry;
-use crate::transport::multi_workspace::TransportTargetCertResolver;
+use crate::transport::TransportEndpoint;
 
 use startup::setup_endpoint_and_tenants;
 
@@ -27,9 +25,16 @@ use startup::setup_endpoint_and_tenants;
 pub struct NodeRuntimeNetInfo {
     /// Actual bound listen address (after OS port assignment).
     pub listen_addr: String,
-    /// Last UPnP port mapping report for the active daemon runtime, if any.
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub upnp: Option<crate::peering::nat::upnp::UpnpMappingReport>,
+    /// Hex-encoded daemon-scoped iroh endpoint id.
+    pub daemon_peer_id: String,
+    /// Current direct addresses published by the endpoint.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub published_addrs: Vec<String>,
+    /// Whether daemon-scoped mDNS discovery is mounted on the endpoint.
+    pub mdns_enabled: bool,
+    /// Live endpoint handle for RPC surfaces such as `discover` and `status`.
+    #[serde(skip_serializing, skip_deserializing, default)]
+    pub endpoint: Option<TransportEndpoint>,
 }
 
 /// Run the sync node.
@@ -41,27 +46,16 @@ pub async fn run_node(
     bind: SocketAddr,
     net_info_tx: tokio::sync::oneshot::Sender<NodeRuntimeNetInfo>,
     shutdown_notify: Arc<tokio::sync::Notify>,
-    intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
-    cert_resolver: Arc<TransportTargetCertResolver>,
     sync_control: Option<Arc<SyncControlRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let startup::StartupResult {
-        endpoint,
-        local_addr,
-        tenants,
-        tenant_client_configs,
-        local_transport_peer_ids,
-    } = setup_endpoint_and_tenants(db_path, bind, net_info_tx, cert_resolver)?;
+    let startup::StartupResult { endpoint, tenants } =
+        setup_endpoint_and_tenants(db_path, bind, net_info_tx).await?;
 
     let mut runtime_supervisor = supervisor::RuntimeSupervisor::new(
         db_path.to_string(),
         endpoint,
-        local_addr,
         tenants,
-        tenant_client_configs,
-        local_transport_peer_ids,
-        intro_spawner,
         ingest,
         sync_control,
     );

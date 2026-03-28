@@ -175,11 +175,21 @@ fn make_identity_chain(
     let dif_eid = insert_event_raw(conn, recorded_by, &dif_blob, Some(&workspace_id_b64));
     project_one(conn, recorded_by, &dif_eid).unwrap();
 
+    let endpoint_key = SigningKey::generate(&mut rng);
+    let endpoint_event = topo::event_modules::endpoint_shared::deterministic_endpoint_shared_event(
+        endpoint_key.to_bytes(),
+    );
+    let endpoint_id = hex::encode(endpoint_key.verifying_key().to_bytes());
+    let endpoint_blob = events::encode_event(&endpoint_event).unwrap();
+    let endpoint_eid = insert_event_raw(conn, &endpoint_id, &endpoint_blob, None);
+    project_one(conn, &endpoint_id, &endpoint_eid).unwrap();
+
     let peer_shared_key = SigningKey::generate(&mut rng);
     let psf = ParsedEvent::PeerShared(PeerSharedEvent {
         created_at_ms: now_ms(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
         user_event_id: ub_eid,
+        endpoint_shared_event_id: endpoint_eid,
         device_name: "bench-device".to_string(),
         signed_by: dif_eid,
         signer_type: 3,

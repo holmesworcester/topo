@@ -106,7 +106,9 @@ fn emit_deterministic_blob_in_tx(
                 &event_id,
                 &ws_id,
             )?;
-        } else if meta.share_scope == crate::event_modules::registry::ShareScope::Shared {
+        } else if meta.share_scope == crate::event_modules::registry::ShareScope::Shared
+            && meta.type_name != "endpoint_shared"
+        {
             tracing::warn!(
                 "no accepted workspace binding for {}, shared event {} missing from shared_event_index",
                 recorded_by,

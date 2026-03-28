@@ -1,8 +1,5 @@
-pub mod bootstrap;
-
 pub(crate) use std::net::SocketAddr;
 use std::process::Child;
-pub(crate) use std::sync::Arc;
 pub(crate) use std::time::{Duration, Instant};
 
 /// RAII guard that kills a daemon process on drop, preventing leaked processes
@@ -62,20 +59,10 @@ pub(crate) use crate::state::db::queue::SQLITE_BUSY_RETRY_ATTEMPTS;
 pub(crate) use crate::state::db::queue::SQLITE_BUSY_RETRY_BASE_MS;
 pub(crate) use crate::transport::identity::{ensure_transport_peer_id, load_transport_cert};
 pub(crate) use crate::transport::{
-    create_dual_endpoint, create_dual_endpoint_dynamic, extract_spki_fingerprint,
+    create_runtime_endpoint_for_tenants, extract_spki_fingerprint, TransportEndpoint,
 };
 pub(crate) use ed25519_dalek::SigningKey;
 pub(crate) use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
-
-/// No-op intro spawner for tests that don't need holepunch.
-pub fn noop_intro_spawner(
-    _conn: quinn::Connection,
-    _db_path: String,
-    _peer_id: String,
-    _endpoint: quinn::Endpoint,
-) -> tokio::task::JoinHandle<()> {
-    tokio::task::spawn_local(async {})
-}
 
 /// Convenience: production `IngestFns` for tests.
 pub fn test_ingest_fns() -> crate::contracts::event_pipeline_contract::IngestFns {
@@ -524,17 +511,7 @@ pub struct Peer {
 
 fn install_test_daemon_identity(peer: &Peer) {
     let db = open_connection(&peer.db_path).expect("failed to open db for daemon identity");
-    let (cert, key) = peer.cert_and_key();
-    let peer_id = hex::encode(
-        extract_spki_fingerprint(cert.as_ref()).expect("failed to fingerprint test daemon cert"),
-    );
-    crate::db::daemon_identity::store(
-        &db,
-        &peer_id,
-        cert.as_ref(),
-        key.secret_pkcs8_der().as_ref(),
-    )
-    .expect("failed to store test daemon identity");
+    crate::transport::ensure_daemon_identity(&db).expect("failed to ensure test daemon identity");
 }
 
 impl Peer {
@@ -740,7 +717,7 @@ impl Peer {
         // Start a real dynamic-trust sync endpoint for the creator and use its
         // address in the invite link. The same endpoint then serves the
         // bootstrap sync loops below.
-        let sync_endpoint = create_dynamic_endpoint_for_peer(creator);
+        let sync_endpoint = create_dynamic_endpoint_for_peer(creator).await;
         let sync_addr = sync_endpoint.local_addr().expect("failed to get sync addr");
 
         // Build invite link with creator's bootstrap address and SPKI
@@ -836,18 +813,11 @@ impl Peer {
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                let _ = accept_loop(
-                    &creator_db,
-                    &creator_id,
-                    creator_ep,
-                    noop_intro_spawner,
-                    test_ingest_fns(),
-                )
-                .await;
+                let _ = accept_loop(&creator_db, &creator_id, creator_ep, test_ingest_fns()).await;
             });
         });
 
-        let peer_endpoint = create_dynamic_endpoint_for_peer(&peer);
+        let peer_endpoint = create_dynamic_endpoint_for_peer(&peer).await;
         let peer_ep = peer_endpoint.clone();
         let peer_db = peer.db_path.clone();
         let peer_id = scoped_peer_id.clone();
@@ -865,13 +835,10 @@ impl Peer {
                     db_path: peer_db.clone(),
                     recorded_by: peer_id.clone(),
                     endpoint: peer_ep,
-                    remote: sync_addr,
+                    remote: Some(sync_addr),
                     remote_session_peer_id: creator_target_peer_id_for_thread.clone(),
-                    client_config: None,
-                    intro_spawner: noop_intro_spawner,
                     ingest: test_ingest_fns(),
                     shutdown: None,
-                    bootstrap_fallback_client_config: None,
                     sync_control: None,
                     auth_plan: Some(crate::transport::OutboundSessionAuthPlan::InviteBootstrap {
                         invite_event_id: invite_event_id_b64,
@@ -986,7 +953,7 @@ impl Peer {
         .expect("failed to record pending bootstrap trust");
         drop(creator_db);
 
-        let sync_endpoint = create_dynamic_endpoint_for_peer(creator);
+        let sync_endpoint = create_dynamic_endpoint_for_peer(creator).await;
         let sync_addr = sync_endpoint.local_addr().expect("failed to get sync addr");
 
         let creator_spki = creator.spki_fingerprint();
@@ -1076,18 +1043,11 @@ impl Peer {
                 .build()
                 .unwrap();
             rt.block_on(async move {
-                let _ = accept_loop(
-                    &creator_db,
-                    &creator_id,
-                    creator_ep,
-                    noop_intro_spawner,
-                    test_ingest_fns(),
-                )
-                .await;
+                let _ = accept_loop(&creator_db, &creator_id, creator_ep, test_ingest_fns()).await;
             });
         });
 
-        let peer_endpoint = create_dynamic_endpoint_for_peer(&peer);
+        let peer_endpoint = create_dynamic_endpoint_for_peer(&peer).await;
         let peer_ep = peer_endpoint.clone();
         let peer_db = peer.db_path.clone();
         let peer_id = scoped_peer_id.clone();
@@ -1105,13 +1065,10 @@ impl Peer {
                     db_path: peer_db.clone(),
                     recorded_by: peer_id.clone(),
                     endpoint: peer_ep,
-                    remote: sync_addr,
+                    remote: Some(sync_addr),
                     remote_session_peer_id: creator_target_peer_id_for_thread.clone(),
-                    client_config: None,
-                    intro_spawner: noop_intro_spawner,
                     ingest: test_ingest_fns(),
                     shutdown: None,
-                    bootstrap_fallback_client_config: None,
                     sync_control: None,
                     auth_plan: Some(crate::transport::OutboundSessionAuthPlan::InviteBootstrap {
                         invite_event_id: invite_event_id_b64,
@@ -1578,10 +1535,20 @@ impl Peer {
         user_event_id: &EventId,
     ) -> EventId {
         let db = open_connection(&self.db_path).expect("failed to open db");
+        crate::transport::ensure_daemon_identity(&db).expect("ensure endpoint identity");
+        let endpoint_shared_event_id =
+            crate::event_modules::endpoint_shared::load_local_endpoint_shared(&db)
+                .expect("load endpoint_shared")
+                .expect("endpoint_shared row")
+                .event_id;
+        let endpoint_shared_event_id =
+            crate::crypto::event_id_from_base64(&endpoint_shared_event_id)
+                .expect("decode endpoint_shared event id");
         let evt = ParsedEvent::PeerShared(PeerSharedEvent {
             created_at_ms: current_timestamp_ms_u64(),
             public_key: peer_shared_public_key,
             user_event_id: *user_event_id,
+            endpoint_shared_event_id,
             device_name: "test-device".to_string(),
             signed_by: *device_invite_event_id,
             signer_type: 3,
@@ -2923,6 +2890,86 @@ fn daemon_fingerprint_for_peer(peer: &Peer) -> [u8; 32] {
     out
 }
 
+fn spawn_accept_loop_with_runtime_endpoint(
+    db_path: String,
+    identity: String,
+    bind_addr: SocketAddr,
+    label: String,
+) -> (std::thread::JoinHandle<()>, TransportEndpoint, SocketAddr) {
+    let (endpoint_tx, endpoint_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let endpoint = create_runtime_endpoint_for_tenants(bind_addr, &db_path)
+                .await
+                .expect("failed to create iroh accept endpoint");
+            let listen_addr = endpoint.local_addr().expect("failed to get listener addr");
+            endpoint_tx
+                .send((endpoint.clone(), listen_addr))
+                .expect("accept endpoint channel closed");
+            if let Err(e) = accept_loop(&db_path, &identity, endpoint, test_ingest_fns()).await {
+                tracing::warn!("{} exited: {}", label, e);
+            }
+        });
+    });
+    let (endpoint, listen_addr) = endpoint_rx.recv().expect("accept endpoint not received");
+    (handle, endpoint, listen_addr)
+}
+
+fn spawn_connect_loop_with_runtime_endpoint(
+    db_path: String,
+    recorded_by: String,
+    bind_addr: SocketAddr,
+    remote: SocketAddr,
+    remote_session_peer_id: String,
+    auth_plan: crate::transport::OutboundSessionAuthPlan,
+    expected_remote_daemon_peer_id: Option<String>,
+    label: String,
+) -> (
+    std::thread::JoinHandle<()>,
+    TransportEndpoint,
+    tokio_util::sync::CancellationToken,
+) {
+    let shutdown = tokio_util::sync::CancellationToken::new();
+    let shutdown_for_thread = shutdown.clone();
+    let (endpoint_tx, endpoint_rx) = std::sync::mpsc::channel();
+    let handle = std::thread::spawn(move || {
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .unwrap();
+        rt.block_on(async move {
+            let endpoint = create_runtime_endpoint_for_tenants(bind_addr, &db_path)
+                .await
+                .expect("failed to create iroh connect endpoint");
+            endpoint_tx
+                .send(endpoint.clone())
+                .expect("connect endpoint channel closed");
+            if let Err(e) = connect_loop(ConnectLoopConfig {
+                db_path: db_path.clone(),
+                recorded_by: recorded_by.clone(),
+                endpoint,
+                remote: Some(remote),
+                remote_session_peer_id,
+                ingest: test_ingest_fns(),
+                shutdown: Some(shutdown_for_thread),
+                sync_control: None,
+                auth_plan: Some(auth_plan),
+                expected_remote_daemon_peer_id,
+            })
+            .await
+            {
+                tracing::warn!("{} exited: {}", label, e);
+            }
+        });
+    });
+    let endpoint = endpoint_rx.recv().expect("connect endpoint not received");
+    (handle, endpoint, shutdown)
+}
+
 /// Start sync between two peers in the same workspace with projected trust.
 ///
 /// Both peers must already have each other's PeerShared events projected from
@@ -2936,21 +2983,16 @@ pub fn start_peers(
 
 /// Like `start_peers` but creates Quinn endpoints on the session threads.
 ///
-/// Quinn's `EndpointDriver` I/O task is spawned on whatever tokio runtime is
-/// current when the endpoint is constructed.  `start_peers` creates endpoints
-/// on the *caller's* runtime, so if the caller later blocks that runtime (e.g.
-/// with `thread::sleep`), all QUIC I/O stalls.  This variant defers endpoint
-/// construction to each session thread's own `current_thread` runtime, ensuring
-/// the I/O driver is always being polled while the session is active.
+/// The iroh endpoint owns transport tasks that should stay on the runtime that
+/// created them. This variant defers endpoint construction to each session
+/// thread's own `current_thread` runtime so transport work stays local to the
+/// thread driving the loop.
 pub fn start_peers_runtime_affine(
     peer_a: &Peer,
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
     crate::state::live_hints::init_forward_on_have_from_env();
-    let (daemon_peer_id_a, cert_a, key_a) = daemon_identity_for_peer(peer_a);
-    let (_daemon_peer_id_b, cert_b, key_b) = daemon_identity_for_peer(peer_b);
-    let a_trusts_b = daemon_fingerprint_for_peer(peer_b);
-    let b_trusts_a = daemon_fingerprint_for_peer(peer_a);
+    let (daemon_peer_id_a, _, _) = daemon_identity_for_peer(peer_a);
     let a_db = peer_a.db_path.clone();
     let a_identity = peer_a.identity.clone();
     let b_db = peer_b.db_path.clone();
@@ -2966,23 +3008,16 @@ pub fn start_peers_runtime_affine(
             .build()
             .unwrap();
         rt.block_on(async move {
-            let allow_a: Arc<crate::transport::DynamicAllowFn> =
-                Arc::new(move |peer_fp: &[u8; 32]| Ok(peer_fp == &a_trusts_b));
             let listener_endpoint =
-                create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert_a, key_a, allow_a)
+                create_runtime_endpoint_for_tenants("127.0.0.1:0".parse().unwrap(), &a_db)
+                    .await
                     .expect("failed to create listener endpoint");
             let listener_addr = listener_endpoint
                 .local_addr()
                 .expect("failed to get listener addr");
             addr_tx.send(listener_addr).expect("addr channel closed");
-            if let Err(e) = accept_loop(
-                &a_db,
-                &a_identity,
-                listener_endpoint,
-                noop_intro_spawner,
-                test_ingest_fns(),
-            )
-            .await
+            if let Err(e) =
+                accept_loop(&a_db, &a_identity, listener_endpoint, test_ingest_fns()).await
             {
                 tracing::warn!("accept_loop exited: {}", e);
             }
@@ -2996,22 +3031,18 @@ pub fn start_peers_runtime_affine(
             .build()
             .unwrap();
         rt.block_on(async move {
-            let allow_b: Arc<crate::transport::DynamicAllowFn> =
-                Arc::new(move |peer_fp: &[u8; 32]| Ok(peer_fp == &b_trusts_a));
             let connector_endpoint =
-                create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert_b, key_b, allow_b)
+                create_runtime_endpoint_for_tenants("127.0.0.1:0".parse().unwrap(), &b_db)
+                    .await
                     .expect("failed to create connector endpoint");
             if let Err(e) = connect_loop(ConnectLoopConfig {
                 db_path: b_db.clone(),
                 recorded_by: b_identity.clone(),
                 endpoint: connector_endpoint,
-                remote: listener_addr,
+                remote: Some(listener_addr),
                 remote_session_peer_id: target_peer_id.clone(),
-                client_config: None,
-                intro_spawner: noop_intro_spawner,
                 ingest: test_ingest_fns(),
                 shutdown: None,
-                bootstrap_fallback_client_config: None,
                 sync_control: None,
                 auth_plan: Some(target_session.clone()),
                 expected_remote_daemon_peer_id: Some(expected_remote_daemon_peer_id.clone()),
@@ -3031,137 +3062,27 @@ pub fn start_peers_runtime_affine(
 /// behavior (`is_authorized_for_tenant`). Caller must already have real invite/bootstrap
 /// trust or steady-state peer trust projected in SQL.
 ///
-/// REALISM HELPER: production-matching dynamic trust. Used in holepunch
-/// integration tests.
+/// REALISM HELPER: production-matching dynamic trust for networked sync tests.
 pub fn start_peers_dynamic(
     peer_a: &Peer,
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
-    crate::state::live_hints::init_forward_on_have_from_env();
-    use crate::db::transport_trust::is_authorized_for_tenant;
-
-    let (cert_a, key_a) = peer_a.cert_and_key();
-    let (cert_b, key_b) = peer_b.cert_and_key();
-
-    let a_db_path = peer_a.db_path.clone();
-    let a_recorded_by = peer_a.identity.clone();
-    let dynamic_allow_a: Arc<crate::transport::DynamicAllowFn> =
-        Arc::new(move |peer_fp: &[u8; 32]| {
-            let db = open_connection(&a_db_path)?;
-            is_authorized_for_tenant(&db, &a_recorded_by, peer_fp)
-        });
-
-    let b_db_path = peer_b.db_path.clone();
-    let b_recorded_by = peer_b.identity.clone();
-    let dynamic_allow_b: Arc<crate::transport::DynamicAllowFn> =
-        Arc::new(move |peer_fp: &[u8; 32]| {
-            let db = open_connection(&b_db_path)?;
-            is_authorized_for_tenant(&db, &b_recorded_by, peer_fp)
-        });
-
-    let listener_endpoint = create_dual_endpoint_dynamic(
-        "127.0.0.1:0".parse().unwrap(),
-        cert_a,
-        key_a,
-        dynamic_allow_a,
-    )
-    .expect("failed to create dynamic dual endpoint for A");
-
-    let listener_addr = listener_endpoint
-        .local_addr()
-        .expect("failed to get listener addr");
-
-    let connector_endpoint = create_dual_endpoint_dynamic(
-        "127.0.0.1:0".parse().unwrap(),
-        cert_b,
-        key_b,
-        dynamic_allow_b,
-    )
-    .expect("failed to create dynamic dual endpoint for B");
-
-    let a_db = peer_a.db_path.clone();
-    let a_identity = peer_a.identity.clone();
-    let b_db = peer_b.db_path.clone();
-    let b_identity = peer_b.identity.clone();
-    let target_peer_id = current_transport_target(peer_a);
-    let target_session = current_session_target(peer_a);
-    let a_handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            if let Err(e) = accept_loop(
-                &a_db,
-                &a_identity,
-                listener_endpoint,
-                noop_intro_spawner,
-                test_ingest_fns(),
-            )
-            .await
-            {
-                tracing::warn!("accept_loop exited: {}", e);
-            }
-        });
-    });
-
-    let b_handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            if let Err(e) = connect_loop(ConnectLoopConfig {
-                db_path: b_db.clone(),
-                recorded_by: b_identity.clone(),
-                endpoint: connector_endpoint,
-                remote: listener_addr,
-                remote_session_peer_id: target_peer_id.clone(),
-                client_config: None,
-                intro_spawner: noop_intro_spawner,
-                ingest: test_ingest_fns(),
-                shutdown: None,
-                bootstrap_fallback_client_config: None,
-                sync_control: None,
-                auth_plan: Some(target_session.clone()),
-                expected_remote_daemon_peer_id: None,
-            })
-            .await
-            {
-                tracing::warn!("connect_loop exited: {}", e);
-            }
-        });
-    });
-
-    (a_handle, b_handle)
+    start_peers_runtime_affine(peer_a, peer_b)
 }
 
-/// Create a QUIC endpoint with dynamic DB trust lookup for a test peer.
-/// Returns the endpoint (dual-role: accepts and connects).
-/// Trust is resolved from SQL at each TLS handshake, matching production behavior.
-pub fn create_dynamic_endpoint_for_peer(peer: &Peer) -> quinn::Endpoint {
-    create_dynamic_endpoint_for_peer_bind(peer, "127.0.0.1:0".parse().unwrap())
+/// Create a daemon-scoped iroh endpoint for a test peer.
+pub async fn create_dynamic_endpoint_for_peer(peer: &Peer) -> TransportEndpoint {
+    create_dynamic_endpoint_for_peer_bind(peer, "127.0.0.1:0".parse().unwrap()).await
 }
 
-/// Like [`create_dynamic_endpoint_for_peer`] but with a caller-specified bind
-/// address. Use `0.0.0.0:0` when mDNS-resolved addresses may be non-loopback.
-pub fn create_dynamic_endpoint_for_peer_bind(
+/// Like [`create_dynamic_endpoint_for_peer`] but with a caller-specified bind address.
+pub async fn create_dynamic_endpoint_for_peer_bind(
     peer: &Peer,
     bind_addr: std::net::SocketAddr,
-) -> quinn::Endpoint {
-    use crate::db::transport_trust::is_authorized_for_tenant;
-
-    let (cert, key) = peer.cert_and_key();
-    let db_path = peer.db_path.clone();
-    let recorded_by = peer.identity.clone();
-    let dynamic_allow: Arc<crate::transport::DynamicAllowFn> =
-        Arc::new(move |peer_fp: &[u8; 32]| {
-            let db = open_connection(&db_path)?;
-            is_authorized_for_tenant(&db, &recorded_by, peer_fp)
-        });
-
-    create_dual_endpoint_dynamic(bind_addr, cert, key, dynamic_allow)
-        .expect("failed to create dynamic endpoint for peer")
+) -> TransportEndpoint {
+    create_runtime_endpoint_for_tenants(bind_addr, &peer.db_path)
+        .await
+        .expect("failed to create iroh endpoint for peer")
 }
 
 /// Start sync, wait for a caller-defined convergence check, return metrics.
@@ -3221,7 +3142,7 @@ where
 
 pub struct ChainHandles {
     pub thread_handles: Vec<std::thread::JoinHandle<()>>,
-    pub endpoints: Vec<quinn::Endpoint>,
+    pub endpoints: Vec<TransportEndpoint>,
     pub connect_shutdowns: Vec<tokio_util::sync::CancellationToken>,
 }
 
@@ -3252,7 +3173,6 @@ impl Drop for ChainHandles {
 /// - P_{i+1} runs connect_loop (client) to P_i
 pub fn start_chain(peers: &[Peer]) -> ChainHandles {
     crate::state::live_hints::init_forward_on_have_from_env();
-    use crate::db::transport_trust::is_authorized_for_tenant;
 
     let n = peers.len();
     assert!(n >= 2, "chain requires at least 2 peers");
@@ -3263,109 +3183,39 @@ pub fn start_chain(peers: &[Peer]) -> ChainHandles {
         );
     }
 
-    // Create server endpoints for peers 0..n-2 with dynamic trust
-    let mut server_addrs: Vec<SocketAddr> = Vec::new();
-    let mut server_endpoints: Vec<quinn::Endpoint> = Vec::new();
-    for i in 0..n - 1 {
-        let (cert, key) = peers[i].cert_and_key();
-        let db_path = peers[i].db_path.clone();
-        let recorded_by = peers[i].identity.clone();
-        let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
-            let db = open_connection(&db_path)?;
-            is_authorized_for_tenant(&db, &recorded_by, fp)
-        });
-        let endpoint =
-            create_dual_endpoint_dynamic("127.0.0.1:0".parse().unwrap(), cert, key, allow_fn)
-                .expect("failed to create chain server endpoint");
-        let addr = endpoint.local_addr().expect("failed to get local addr");
-        server_addrs.push(addr);
-        server_endpoints.push(endpoint);
-    }
-
-    // Create client endpoints for peers 1..n-1 with dynamic trust
-    let mut client_endpoints: Vec<quinn::Endpoint> = Vec::new();
-    for i in 1..n {
-        let (cert, key) = peers[i].cert_and_key();
-        let db_path = peers[i].db_path.clone();
-        let recorded_by = peers[i].identity.clone();
-        let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
-            let db = open_connection(&db_path)?;
-            is_authorized_for_tenant(&db, &recorded_by, fp)
-        });
-        let endpoint =
-            create_dual_endpoint_dynamic("0.0.0.0:0".parse().unwrap(), cert, key, allow_fn)
-                .expect("failed to create chain client endpoint");
-        client_endpoints.push(endpoint);
-    }
-
     let mut handles = Vec::new();
     let mut endpoints = Vec::new();
-
-    // Spawn accept_loop for peers 0..n-2
-    for (i, endpoint) in server_endpoints.into_iter().enumerate() {
-        endpoints.push(endpoint.clone());
-        let db_path = peers[i].db_path.clone();
-        let identity = peers[i].identity.clone();
-        handles.push(std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                if let Err(e) = accept_loop(
-                    &db_path,
-                    &identity,
-                    endpoint,
-                    noop_intro_spawner,
-                    test_ingest_fns(),
-                )
-                .await
-                {
-                    tracing::warn!("chain accept_loop[{}] exited: {}", i, e);
-                }
-            });
-        }));
+    // Create server endpoints for peers 0..n-2 with dynamic trust
+    let mut server_addrs: Vec<SocketAddr> = Vec::new();
+    for i in 0..n - 1 {
+        let (handle, endpoint, addr) = spawn_accept_loop_with_runtime_endpoint(
+            peers[i].db_path.clone(),
+            peers[i].identity.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+            format!("chain accept_loop[{i}]"),
+        );
+        handles.push(handle);
+        endpoints.push(endpoint);
+        server_addrs.push(addr);
     }
 
     // Spawn connect_loop for peers 1..n-1
     let mut connect_shutdowns = Vec::new();
-    for (idx, endpoint) in client_endpoints.into_iter().enumerate() {
+    for idx in 0..n - 1 {
         let i = idx + 1;
-        let db_path = peers[i].db_path.clone();
-        let identity = peers[i].identity.clone();
-        let remote = server_addrs[idx];
-        let target_peer_id = current_transport_target(&peers[idx]);
-        let target_session = current_session_target(&peers[idx]);
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        connect_shutdowns.push(shutdown.clone());
-        endpoints.push(endpoint.clone());
-        handles.push(std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                if let Err(e) = connect_loop(ConnectLoopConfig {
-                    db_path: db_path.clone(),
-                    recorded_by: identity.clone(),
-                    endpoint,
-                    remote,
-                    remote_session_peer_id: target_peer_id.clone(),
-                    client_config: None,
-                    intro_spawner: noop_intro_spawner,
-                    ingest: test_ingest_fns(),
-                    shutdown: Some(shutdown),
-                    bootstrap_fallback_client_config: None,
-                    sync_control: None,
-                    auth_plan: Some(target_session.clone()),
-                    expected_remote_daemon_peer_id: None,
-                })
-                .await
-                {
-                    tracing::warn!("chain connect_loop[{}] exited: {}", i, e);
-                }
-            });
-        }));
+        let (handle, endpoint, shutdown) = spawn_connect_loop_with_runtime_endpoint(
+            peers[i].db_path.clone(),
+            peers[i].identity.clone(),
+            "0.0.0.0:0".parse().unwrap(),
+            server_addrs[idx],
+            current_transport_target(&peers[idx]),
+            current_session_target(&peers[idx]),
+            None,
+            format!("chain connect_loop[{i}]"),
+        );
+        connect_shutdowns.push(shutdown);
+        endpoints.push(endpoint);
+        handles.push(handle);
     }
 
     ChainHandles {
@@ -3437,106 +3287,39 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
         );
     }
 
-    let (sink_cert, sink_key) = sink.cert_and_key();
-
     let mut handles = Vec::new();
     let mut source_addrs = Vec::new();
     let mut source_endpoints = Vec::new();
     let mut client_endpoints = Vec::new();
-    let sink_spki = sink.spki_fingerprint();
+    let mut connect_shutdowns = Vec::new();
 
-    // Start accept_loop for each source with explicit sink trust.
-    for source in sources {
-        let (cert, key) = source.cert_and_key();
-        let trusted_sink_spki = sink_spki;
-        let allow_fn: Arc<crate::transport::DynamicAllowFn> =
-            Arc::new(move |fp: &[u8; 32]| Ok(fp == &trusted_sink_spki));
-        let server_endpoint =
-            create_dual_endpoint("127.0.0.1:0".parse().unwrap(), cert, key, allow_fn)
-                .expect("failed to create source server endpoint");
-        let addr = server_endpoint
-            .local_addr()
-            .expect("failed to get source addr");
+    // Start accept_loop for each source.
+    for (idx, source) in sources.iter().enumerate() {
+        let (handle, endpoint, addr) = spawn_accept_loop_with_runtime_endpoint(
+            source.db_path.clone(),
+            source.identity.clone(),
+            "127.0.0.1:0".parse().unwrap(),
+            format!("source accept_loop[{idx}]"),
+        );
+        handles.push(handle);
         source_addrs.push(addr);
-        source_endpoints.push(server_endpoint.clone());
-
-        let db_path = source.db_path.clone();
-        let identity = source.identity.clone();
-        handles.push(std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                if let Err(e) = accept_loop(
-                    &db_path,
-                    &identity,
-                    server_endpoint,
-                    noop_intro_spawner,
-                    test_ingest_fns(),
-                )
-                .await
-                {
-                    tracing::warn!("source accept_loop exited: {}", e);
-                }
-            });
-        }));
+        source_endpoints.push(endpoint);
     }
 
-    // Build per-source client endpoints for the sink with explicit source trust.
-    // These are driven by coordinated connect loops (runtime-faithful path).
-    let mut sink_connectors = Vec::new();
-    for (i, source) in sources.iter().enumerate() {
-        let trusted_source_spki = source.spki_fingerprint();
-        let allow_fn: Arc<crate::transport::DynamicAllowFn> =
-            Arc::new(move |fp: &[u8; 32]| Ok(fp == &trusted_source_spki));
-        let client_endpoint = create_dual_endpoint(
+    for (i, _source) in sources.iter().enumerate() {
+        let (handle, endpoint, shutdown) = spawn_connect_loop_with_runtime_endpoint(
+            sink.db_path.clone(),
+            sink.identity.clone(),
             "0.0.0.0:0".parse().unwrap(),
-            sink_cert.clone(),
-            sink_key.clone_key(),
-            allow_fn,
-        )
-        .expect("failed to create sink client endpoint");
-        client_endpoints.push(client_endpoint.clone());
-
-        sink_connectors.push((
-            client_endpoint,
             source_addrs[i],
             current_transport_target(&sources[i]),
             current_session_target(&sources[i]),
-        ));
-    }
-
-    let mut connect_shutdowns = Vec::new();
-    for (endpoint, remote, target_peer_id, target_session) in sink_connectors {
-        let shutdown = tokio_util::sync::CancellationToken::new();
-        connect_shutdowns.push(shutdown.clone());
-        let sink_db = sink.db_path.clone();
-        let sink_identity = sink.identity.clone();
-        handles.push(std::thread::spawn(move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .unwrap();
-            rt.block_on(async move {
-                let _ = connect_loop(ConnectLoopConfig {
-                    db_path: sink_db.clone(),
-                    recorded_by: sink_identity.clone(),
-                    endpoint,
-                    remote,
-                    remote_session_peer_id: target_peer_id.clone(),
-                    client_config: None,
-                    intro_spawner: noop_intro_spawner,
-                    ingest: test_ingest_fns(),
-                    shutdown: Some(shutdown),
-                    bootstrap_fallback_client_config: None,
-                    sync_control: None,
-                    auth_plan: Some(target_session.clone()),
-                    expected_remote_daemon_peer_id: None,
-                })
-                .await;
-            });
-        }));
+            None,
+            format!("sink connect_loop[{i}]"),
+        );
+        handles.push(handle);
+        client_endpoints.push(endpoint);
+        connect_shutdowns.push(shutdown);
     }
     SinkDownloadHandles {
         thread_handles: handles,
@@ -3552,42 +3335,12 @@ pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkD
 /// The caller must have already established real projected trust for every
 /// inbound peer that will connect to this sink.
 pub fn start_sink_accept(sink: &Peer) -> (std::thread::JoinHandle<()>, SocketAddr) {
-    use crate::db::transport_trust::is_authorized_for_tenant;
-
-    let (cert, key) = sink.cert_and_key();
-    let sink_db_path = sink.db_path.clone();
-    let sink_recorded_by = sink.identity.clone();
-    let allow_fn: Arc<crate::transport::DynamicAllowFn> = Arc::new(move |fp: &[u8; 32]| {
-        let db = open_connection(&sink_db_path)?;
-        is_authorized_for_tenant(&db, &sink_recorded_by, fp)
-    });
-    let endpoint =
-        create_dual_endpoint_dynamic("127.0.0.1:0".parse().unwrap(), cert, key, allow_fn)
-            .expect("failed to create sink server endpoint");
-    let addr = endpoint.local_addr().expect("failed to get sink addr");
-
-    let db_path = sink.db_path.clone();
-    let identity = sink.identity.clone();
-    let handle = std::thread::spawn(move || {
-        let rt = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .unwrap();
-        rt.block_on(async move {
-            if let Err(e) = accept_loop(
-                &db_path,
-                &identity,
-                endpoint,
-                noop_intro_spawner,
-                test_ingest_fns(),
-            )
-            .await
-            {
-                tracing::warn!("sink accept_loop exited: {}", e);
-            }
-        });
-    });
-
+    let (handle, _endpoint, addr) = spawn_accept_loop_with_runtime_endpoint(
+        sink.db_path.clone(),
+        sink.identity.clone(),
+        "127.0.0.1:0".parse().unwrap(),
+        "sink accept_loop".to_string(),
+    );
     (handle, addr)
 }
 
@@ -4476,7 +4229,6 @@ mod fingerprint_tests {
             "blocked_events",
             "project_queue",
             "peer_endpoint_observations",
-            "intro_attempts",
             "peer_transport_bindings",
             "invite_bootstrap_trust",
             "pending_invite_bootstrap_trust",

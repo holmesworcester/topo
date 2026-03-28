@@ -307,6 +307,8 @@ fn workspace_id_for_stored_shared_event(
 
     let workspace_id = if event_type == "workspace" {
         event_id_b64
+    } else if event_type == "endpoint_shared" {
+        return Ok(None);
     } else if let Some(workspace_id) = lookup_workspace_id(conn, recorded_by) {
         workspace_id
     } else {

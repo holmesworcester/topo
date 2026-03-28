@@ -5,7 +5,7 @@ use crate::db::timeline::EventTimeline;
 use crate::event_modules::{self as events, ParsedEvent};
 use rusqlite::Connection;
 
-use super::cascade::cascade_unblocked;
+use super::cascade::{cascade_unblocked, cascade_unblocked_global};
 use super::stages::{record_rejection, run_dep_and_projection_stages};
 
 fn event_is_still_recorded(
@@ -205,6 +205,9 @@ pub fn project_one(
             let event_id_b64 = event_id_to_base64(event_id);
             if event_is_valid_for_peer(conn, recorded_by, &event_id_b64)? {
                 cascade_unblocked(conn, recorded_by, &event_id_b64, parsed.as_ref())?;
+                if matches!(parsed.as_ref(), Some(ParsedEvent::EndpointShared(_))) {
+                    cascade_unblocked_global(conn, &event_id_b64)?;
+                }
             }
         }
         Ok(decision)

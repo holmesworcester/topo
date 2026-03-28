@@ -3,37 +3,143 @@
 //! Peering code should use these helpers/types rather than importing QUIC
 //! concrete types or transport trust internals directly.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::io;
 use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
-use rusqlite::OptionalExtension;
-use rustls::pki_types::{CertificateDer, PrivatePkcs8KeyDer};
+use iroh::address_lookup::MdnsAddressLookup;
 
 use crate::contracts::peering_contract::TransportSessionIo;
 use crate::db::open_connection;
-use crate::db::transport_creds::discover_local_tenants;
 use crate::db::transport_trust::{
     is_authorized_for_node, is_authorized_for_tenant, resolve_authorizing_tenant,
 };
-use crate::protocol::{encode_frame, Frame};
 
 use super::connection_lifecycle::{
     accept_daemon, dial_daemon, ConnectedDaemon, ConnectionLifecycleError,
 };
+use super::session_carrier::SessionCarrier;
 use super::session_factory::{
-    accept_session_io, open_dependency_session_io, open_session_io, InboundSessionState,
-    SessionClass, SessionOpenError,
+    accept_session_io, open_session_io_for_class, InboundSessionState, SessionClass,
+    SessionOpenError,
 };
-use super::{
-    create_single_port_endpoint_with_identity, ensure_daemon_identity_from_db,
-    load_daemon_identity_from_db, workspace_client_config_with_identity,
-};
+use super::{ensure_daemon_identity_from_db, load_daemon_iroh_secret_key_from_db};
 
-pub type TransportEndpoint = quinn::Endpoint;
-pub type TransportConnection = quinn::Connection;
-pub type TransportClientConfig = quinn::ClientConfig;
-pub type TenantClientConfigs = HashMap<String, TransportClientConfig>;
+pub const TOPO_ALPN: &[u8] = b"topo/p7/1";
+
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            let lowered = value.to_ascii_lowercase();
+            lowered == "1" || lowered == "true" || lowered == "yes"
+        })
+        .unwrap_or(false)
+}
+
+#[derive(Clone, Debug)]
+pub struct TransportEndpoint {
+    pub(crate) inner: iroh::Endpoint,
+    local_addr: SocketAddr,
+    mdns: Option<MdnsAddressLookup>,
+}
+
+impl TransportEndpoint {
+    pub fn new(inner: iroh::Endpoint, mdns: Option<MdnsAddressLookup>) -> io::Result<Self> {
+        let local_addr = inner
+            .bound_sockets()
+            .into_iter()
+            .find(|addr| addr.is_ipv4())
+            .or_else(|| inner.bound_sockets().into_iter().next())
+            .ok_or_else(|| io::Error::other("iroh endpoint has no bound sockets"))?;
+        Ok(Self {
+            inner,
+            local_addr,
+            mdns,
+        })
+    }
+
+    pub fn local_addr(&self) -> io::Result<SocketAddr> {
+        Ok(self.local_addr)
+    }
+
+    pub fn daemon_peer_id(&self) -> String {
+        hex::encode(self.inner.id().as_bytes())
+    }
+
+    pub fn endpoint_addr(&self) -> iroh::EndpointAddr {
+        self.inner.addr()
+    }
+
+    pub fn mdns_lookup(&self) -> Option<MdnsAddressLookup> {
+        self.mdns.clone()
+    }
+
+    pub fn close(&self, _error_code: iroh::endpoint::VarInt, _reason: &[u8]) {
+        let endpoint = self.inner.clone();
+        if let Ok(handle) = tokio::runtime::Handle::try_current() {
+            handle.spawn(async move {
+                endpoint.close().await;
+            });
+        } else {
+            let _ = std::thread::spawn(move || {
+                if let Ok(rt) = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                {
+                    rt.block_on(endpoint.close());
+                }
+            });
+        }
+    }
+}
+
+#[derive(Clone)]
+pub struct TransportConnection {
+    pub(crate) inner: iroh::endpoint::Connection,
+    remote_addr: SocketAddr,
+}
+
+impl TransportConnection {
+    pub(crate) fn new(inner: iroh::endpoint::Connection, remote_addr: SocketAddr) -> Self {
+        Self { inner, remote_addr }
+    }
+
+    pub fn stable_id(&self) -> usize {
+        self.inner.stable_id()
+    }
+
+    pub fn remote_address(&self) -> SocketAddr {
+        self.remote_addr
+    }
+
+    pub fn close(&self, error_code: iroh::endpoint::VarInt, reason: &[u8]) {
+        self.inner.close(error_code, reason);
+    }
+
+    pub fn close_reason(&self) -> Option<String> {
+        self.inner.close_reason().map(|reason| reason.to_string())
+    }
+}
+
+#[async_trait::async_trait]
+impl SessionCarrier for TransportConnection {
+    type BiSend = iroh::endpoint::SendStream;
+    type BiRecv = iroh::endpoint::RecvStream;
+
+    async fn open_bi(&self) -> Result<(Self::BiSend, Self::BiRecv), String> {
+        self.inner.open_bi().await.map_err(|e| e.to_string())
+    }
+
+    async fn accept_bi(&self) -> Result<(Self::BiSend, Self::BiRecv), String> {
+        self.inner.accept_bi().await.map_err(|e| e.to_string())
+    }
+
+    fn close_with_reason(&self, error_code: u32, reason: &[u8]) {
+        self.inner.close(error_code.into(), reason);
+    }
+}
 
 /// Shared daemon-to-daemon QUIC connection that can both accept inbound
 /// logical sessions and open outbound logical sessions.
@@ -42,13 +148,19 @@ pub type TenantClientConfigs = HashMap<String, TransportClientConfig>;
 pub struct DaemonConnection {
     connection: TransportConnection,
     remote_daemon_peer_id: String,
-    inbound_state: InboundSessionState,
+    inbound_state: InboundSessionState<iroh::endpoint::SendStream, iroh::endpoint::RecvStream>,
     accepted_bootstrap_auth: AcceptedBootstrapAuthCache,
+    admitted_session_routes: AdmittedSessionRouteCache,
 }
 
 #[derive(Clone, Default)]
 struct AcceptedBootstrapAuthCache {
     inner: Arc<Mutex<HashMap<(String, String), String>>>,
+}
+
+#[derive(Clone, Default)]
+struct AdmittedSessionRouteCache {
+    inner: Arc<Mutex<HashSet<(String, String)>>>,
 }
 
 /// One ready-to-run logical session scope from a [`DaemonConnection`].
@@ -80,6 +192,7 @@ impl DaemonConnection {
             remote_daemon_peer_id: connected.daemon_peer_id,
             inbound_state: InboundSessionState::default(),
             accepted_bootstrap_auth: AcceptedBootstrapAuthCache::default(),
+            admitted_session_routes: AdmittedSessionRouteCache::default(),
         }
     }
 
@@ -131,14 +244,29 @@ impl DaemonConnection {
             .cloned()
     }
 
+    pub fn remember_admitted_session_route(&self, tenant_id: &str, remote_peer_id: &str) {
+        let mut cache = self
+            .admitted_session_routes
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cache.insert((tenant_id.to_string(), remote_peer_id.to_string()));
+    }
+
+    pub fn admits_session_route(&self, tenant_id: &str, remote_peer_id: &str) -> bool {
+        let cache = self
+            .admitted_session_routes
+            .inner
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        cache.contains(&(tenant_id.to_string(), remote_peer_id.to_string()))
+    }
+
     pub async fn open_outbound_session(
         &self,
         class: SessionClass,
     ) -> Result<SessionEnvelope, SessionOpenError> {
-        let (session_id, io) = match class {
-            SessionClass::Range => open_session_io(&self.connection).await?,
-            SessionClass::Dependency => open_dependency_session_io(&self.connection).await?,
-        };
+        let (session_id, io) = open_session_io_for_class(&self.connection, class).await?;
         Ok(SessionEnvelope {
             remote_daemon_peer_id: self.remote_daemon_peer_id.clone(),
             remote_addr: self.connection.remote_address(),
@@ -149,7 +277,8 @@ impl DaemonConnection {
     }
 
     pub async fn accept_inbound_session(&self) -> Result<SessionEnvelope, SessionOpenError> {
-        let (session_id, class, io) = accept_session_io(&self.connection, &self.inbound_state).await?;
+        let (session_id, class, io) =
+            accept_session_io(&self.connection, &self.inbound_state).await?;
         Ok(SessionEnvelope {
             remote_daemon_peer_id: self.remote_daemon_peer_id.clone(),
             remote_addr: self.connection.remote_address(),
@@ -200,125 +329,27 @@ impl SessionProvider {
     }
 }
 
-pub fn create_runtime_endpoint_for_tenants(
+pub async fn create_runtime_endpoint_for_tenants(
     bind_addr: SocketAddr,
     db_path: &str,
 ) -> Result<TransportEndpoint, Box<dyn std::error::Error + Send + Sync>> {
-    let (_daemon_peer_id, cert_der, key_der) = load_daemon_identity_from_db(db_path)?;
-    create_single_port_endpoint_with_identity(bind_addr, cert_der, key_der)
-}
-
-pub fn build_tenant_client_config_from_creds(
-    cert_der: CertificateDer<'static>,
-    key_der: PrivatePkcs8KeyDer<'static>,
-) -> Result<TransportClientConfig, Box<dyn std::error::Error + Send + Sync>> {
-    workspace_client_config_with_identity(cert_der, key_der)
-}
-
-pub fn build_tenant_client_config_from_db(
-    db_path: &str,
-    tenant_id: &str,
-) -> Result<TransportClientConfig, Box<dyn std::error::Error + Send + Sync>> {
-    let db = open_connection(db_path)?;
-    let tenant_exists = discover_local_tenants(&db)?
-        .into_iter()
-        .any(|tenant| tenant.peer_id == tenant_id);
-    drop(db);
-
-    if !tenant_exists {
-        return Err(format!("local creds missing for tenant {}", tenant_id).into());
-    }
-
-    let (_daemon_peer_id, cert_der, key_der) = ensure_daemon_identity_from_db(db_path)?;
-    build_tenant_client_config_from_creds(cert_der, key_der)
-}
-
-fn build_bootstrap_fallback_config_from_key_bytes(
-    _db_path: &str,
-    _tenant_id: &str,
-    key_bytes: Vec<u8>,
-) -> Result<Option<TransportClientConfig>, Box<dyn std::error::Error + Send + Sync>> {
-    if key_bytes.len() != 32 {
-        return Ok(None);
-    }
-    // Daemon-scoped transport no longer derives a bootstrap-only client cert
-    // from invite secrets. Invite bootstrap now authenticates in the first
-    // encrypted session-auth frame instead.
-    Ok(None)
-}
-
-/// Build an optional bootstrap-fallback client config for a tenant + invite.
-///
-/// Fallback identity is derived from projected `invite_secret` key material
-/// that matches this tenant/invite and still has active invite_bootstrap_trust.
-pub fn build_tenant_bootstrap_fallback_client_config_for_invite_from_db(
-    db_path: &str,
-    tenant_id: &str,
-    invite_event_id_b64: &str,
-) -> Result<Option<TransportClientConfig>, Box<dyn std::error::Error + Send + Sync>> {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis() as i64;
-    let db = open_connection(db_path)?;
-    let key_bytes: Option<Vec<u8>> = db
-        .query_row(
-            "SELECT private_key
-             FROM invite_secrets s
-             WHERE s.recorded_by = ?1
-               AND s.invite_event_id = ?2
-               AND length(private_key) = 32
-               AND EXISTS (
-                   SELECT 1
-                   FROM invite_bootstrap_trust t
-                   WHERE t.recorded_by = s.recorded_by
-                     AND t.invite_event_id = s.invite_event_id
-                     AND t.expires_at > ?3
-               )
-             ORDER BY s.created_at DESC, s.event_id DESC
-             LIMIT 1",
-            rusqlite::params![tenant_id, invite_event_id_b64, now_ms],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(key_bytes) = key_bytes else {
-        return Ok(None);
+    let _ = ensure_daemon_identity_from_db(db_path)?;
+    let secret_key = load_daemon_iroh_secret_key_from_db(db_path)?;
+    let endpoint = iroh::Endpoint::empty_builder()
+        .secret_key(secret_key)
+        .alpns(vec![TOPO_ALPN.to_vec()])
+        .relay_mode(iroh::endpoint::default_relay_mode())
+        .bind_addr(bind_addr)?
+        .bind()
+        .await?;
+    let mdns = if env_flag("TOPO_DISABLE_DISCOVERY") {
+        None
+    } else {
+        let mdns = MdnsAddressLookup::builder().build(endpoint.id())?;
+        endpoint.address_lookup()?.add(mdns.clone());
+        Some(mdns)
     };
-    build_bootstrap_fallback_config_from_key_bytes(db_path, tenant_id, key_bytes)
-}
-
-/// Build an optional bootstrap-fallback client config for a tenant.
-///
-/// Selects the latest active invite_bootstrap_trust row and resolves matching
-/// invite_secret key material for that invite.
-pub fn build_tenant_bootstrap_fallback_client_config_from_db(
-    db_path: &str,
-    tenant_id: &str,
-) -> Result<Option<TransportClientConfig>, Box<dyn std::error::Error + Send + Sync>> {
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)?
-        .as_millis() as i64;
-    let db = open_connection(db_path)?;
-    let invite_event_id_b64: Option<String> = db
-        .query_row(
-            "SELECT invite_event_id
-             FROM invite_bootstrap_trust
-            WHERE recorded_by = ?1
-               AND expires_at > ?2
-             ORDER BY accepted_at DESC, invite_accepted_event_id DESC
-             LIMIT 1",
-            rusqlite::params![tenant_id, now_ms],
-            |row| row.get(0),
-        )
-        .optional()?;
-    drop(db);
-    let Some(invite_event_id_b64) = invite_event_id_b64 else {
-        return Ok(None);
-    };
-    build_tenant_bootstrap_fallback_client_config_for_invite_from_db(
-        db_path,
-        tenant_id,
-        &invite_event_id_b64,
-    )
+    TransportEndpoint::new(endpoint, mdns).map_err(Into::into)
 }
 
 pub fn tenant_trusts_peer(
@@ -349,15 +380,17 @@ pub fn tenant_trusts_daemon_peer(
     }
 
     let mut stmt = db.prepare(
-        "SELECT peer_id
-         FROM peer_transport_bindings
+        "SELECT lower(hex(transport_fingerprint))
+         FROM peers_shared
          WHERE recorded_by = ?1
-           AND spki_fingerprint = ?2",
+           AND endpoint_id = ?2
+           AND length(transport_fingerprint) = 32",
     )?;
     let peer_ids = stmt
-        .query_map(rusqlite::params![tenant_id, daemon_fp.as_slice()], |row| {
-            row.get::<_, String>(0)
-        })?
+        .query_map(
+            rusqlite::params![tenant_id, hex::encode(daemon_fp)],
+            |row| row.get::<_, String>(0),
+        )?
         .collect::<Result<Vec<_>, _>>()?;
 
     for peer_id in peer_ids {
@@ -398,23 +431,37 @@ pub fn resolve_authorizing_tenant_from_db(
     resolve_authorizing_tenant(&db, &peer_fp)
 }
 
+pub async fn dial_daemon_peer_target(
+    endpoint: &TransportEndpoint,
+    remote: Option<SocketAddr>,
+    sni: &str,
+) -> Result<ConnectedDaemon, ConnectionLifecycleError> {
+    dial_daemon(endpoint, remote, sni).await
+}
+
+pub async fn dial_daemon_connection_target(
+    endpoint: &TransportEndpoint,
+    remote: Option<SocketAddr>,
+    sni: &str,
+) -> Result<DaemonConnection, ConnectionLifecycleError> {
+    let connected = dial_daemon_peer_target(endpoint, remote, sni).await?;
+    Ok(DaemonConnection::from_connected(connected))
+}
+
 pub async fn dial_daemon_peer(
     endpoint: &TransportEndpoint,
     remote: SocketAddr,
     sni: &str,
-    client_config: Option<&TransportClientConfig>,
 ) -> Result<ConnectedDaemon, ConnectionLifecycleError> {
-    dial_daemon(endpoint, remote, sni, client_config).await
+    dial_daemon_peer_target(endpoint, Some(remote), sni).await
 }
 
 pub async fn dial_daemon_connection(
     endpoint: &TransportEndpoint,
     remote: SocketAddr,
     sni: &str,
-    client_config: Option<&TransportClientConfig>,
 ) -> Result<DaemonConnection, ConnectionLifecycleError> {
-    let connected = dial_daemon_peer(endpoint, remote, sni, client_config).await?;
-    Ok(DaemonConnection::from_connected(connected))
+    dial_daemon_connection_target(endpoint, Some(remote), sni).await
 }
 
 pub async fn accept_daemon_peer(
@@ -437,20 +484,20 @@ pub async fn dial_session_peer(
     endpoint: &TransportEndpoint,
     remote: SocketAddr,
     sni: &str,
-    client_config: Option<&TransportClientConfig>,
 ) -> Result<ConnectedDaemon, ConnectionLifecycleError> {
-    dial_daemon_peer(endpoint, remote, sni, client_config).await
+    dial_daemon_peer_target(endpoint, Some(remote), sni).await
 }
 
 pub async fn dial_session_provider(
     endpoint: &TransportEndpoint,
     remote: SocketAddr,
     sni: &str,
-    client_config: Option<&TransportClientConfig>,
 ) -> Result<SessionProvider, ConnectionLifecycleError> {
-    dial_daemon_connection(endpoint, remote, sni, client_config)
+    dial_daemon_connection_target(endpoint, Some(remote), sni)
         .await
-        .map(|daemon_connection| SessionProvider::new(daemon_connection, SessionProviderMode::Initiator))
+        .map(|daemon_connection| {
+            SessionProvider::new(daemon_connection, SessionProviderMode::Initiator)
+        })
 }
 
 pub async fn accept_session_peer(
@@ -480,6 +527,7 @@ pub fn shared_daemon_connection_for_connection(
         remote_daemon_peer_id,
         inbound_state: InboundSessionState::default(),
         accepted_bootstrap_auth: AcceptedBootstrapAuthCache::default(),
+        admitted_session_routes: AdmittedSessionRouteCache::default(),
     }
 }
 
@@ -506,34 +554,12 @@ pub async fn open_inbound_session(
     Ok((session_id, io))
 }
 
-pub async fn read_intro_offer_frame(
-    conn: &TransportConnection,
-) -> Result<Option<Frame>, Box<dyn std::error::Error + Send + Sync>> {
-    super::intro_io::accept_and_read_intro(conn).await
-}
-
-pub async fn send_intro_offer_frame(
-    conn: &TransportConnection,
-    msg: &Frame,
-) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let encoded = encode_frame(msg);
-    let mut send_stream = conn.open_uni().await?;
-    send_stream.write_all(&encoded).await?;
-    send_stream.finish()?;
-    Ok(())
-}
-
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
-    use std::sync::Arc;
 
-    use crate::db::open_connection;
-    use crate::db::schema::create_tables;
-    use crate::db::transport_creds::store_local_creds;
-    use crate::db::transport_trust::record_pending_invite_bootstrap_trust;
     use crate::transport::{
-        create_dual_endpoint, extract_spki_fingerprint, generate_self_signed_cert,
+        create_runtime_endpoint_for_tenants, load_daemon_identity_from_db,
         multi_workspace::transport_sni,
     };
 
@@ -541,6 +567,7 @@ mod tests {
 
     async fn endpoint_pair() -> Result<
         (
+            tempfile::TempDir,
             TransportEndpoint,
             TransportEndpoint,
             SocketAddr,
@@ -549,33 +576,24 @@ mod tests {
         ),
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        let (server_cert, server_key) = generate_self_signed_cert()?;
-        let (client_cert, client_key) = generate_self_signed_cert()?;
-
-        let server_fp = extract_spki_fingerprint(server_cert.as_ref())?;
-        let client_fp = extract_spki_fingerprint(client_cert.as_ref())?;
-        let server_peer_id = hex::encode(server_fp);
-        let client_peer_id = hex::encode(client_fp);
-
-        let allow_client: Arc<crate::transport::DynamicAllowFn> =
-            Arc::new(move |candidate| Ok(candidate == &client_fp));
-        let allow_server: Arc<crate::transport::DynamicAllowFn> =
-            Arc::new(move |candidate| Ok(candidate == &server_fp));
-
-        let server_ep = create_dual_endpoint(
+        let temp = tempfile::tempdir()?;
+        let server_db = temp.path().join("server.sqlite3");
+        let client_db = temp.path().join("client.sqlite3");
+        let server_ep = create_runtime_endpoint_for_tenants(
             "127.0.0.1:0".parse().unwrap(),
-            server_cert,
-            server_key,
-            allow_client,
-        )?;
-        let client_ep = create_dual_endpoint(
+            server_db.to_str().unwrap(),
+        )
+        .await?;
+        let client_ep = create_runtime_endpoint_for_tenants(
             "127.0.0.1:0".parse().unwrap(),
-            client_cert,
-            client_key,
-            allow_server,
-        )?;
+            client_db.to_str().unwrap(),
+        )
+        .await?;
         let server_addr = server_ep.local_addr()?;
+        let server_peer_id = load_daemon_identity_from_db(server_db.to_str().unwrap())?.0;
+        let client_peer_id = load_daemon_identity_from_db(client_db.to_str().unwrap())?.0;
         Ok((
+            temp,
             server_ep,
             client_ep,
             server_addr,
@@ -584,259 +602,19 @@ mod tests {
         ))
     }
 
-    #[test]
-    fn trust_resolution_uses_sql_state() {
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("trust.sqlite3");
-        let db = open_connection(&db_path).unwrap();
-        create_tables(&db).unwrap();
-
-        let allowed = [0xAB; 32];
-        record_pending_invite_bootstrap_trust(&db, "tenant-a", "invite-1", "ws-1", &allowed)
-            .unwrap();
-        drop(db);
-
-        assert!(
-            tenant_trusts_peer(db_path.to_str().unwrap(), "tenant-a", allowed).unwrap(),
-            "tenant-a should trust pending bootstrap spki"
-        );
-        assert!(
-            node_trusts_peer(db_path.to_str().unwrap(), allowed).unwrap(),
-            "node should trust pending bootstrap spki via projected trust rows"
-        );
-        assert!(
-            !tenant_trusts_peer(db_path.to_str().unwrap(), "tenant-a", [0xCD; 32]).unwrap(),
-            "unlisted peer must be denied"
-        );
-        assert!(
-            !node_trusts_peer(db_path.to_str().unwrap(), [0xCD; 32]).unwrap(),
-            "node must deny unlisted peer"
-        );
-
-        let tenants = vec!["tenant-x".to_string(), "tenant-a".to_string()];
-        let resolved =
-            resolve_trusting_tenant(db_path.to_str().unwrap(), &tenants, allowed).unwrap();
-        assert_eq!(resolved, Some("tenant-a".to_string()));
-        let resolved_node =
-            resolve_authorizing_tenant_from_db(db_path.to_str().unwrap(), allowed).unwrap();
-        assert_eq!(resolved_node, Some("tenant-a".to_string()));
-    }
-
-    #[test]
-    fn tenant_client_config_from_db_requires_local_creds() {
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("client_config.sqlite3");
-        let db = open_connection(&db_path).unwrap();
-        create_tables(&db).unwrap();
-        drop(db);
-
-        let err = build_tenant_client_config_from_db(db_path.to_str().unwrap(), "missing-tenant")
-            .unwrap_err();
-        assert!(
-            err.to_string().contains("local creds missing"),
-            "unexpected error: {}",
-            err
-        );
-
-        let db = open_connection(&db_path).unwrap();
-        let (cert, key) = generate_self_signed_cert().unwrap();
-        store_local_creds(
-            &db,
-            "tenant-a",
-            cert.as_ref(),
-            key.secret_pkcs8_der().as_ref(),
-        )
-        .unwrap();
-        crate::db::transport_creds::set_local_transport_target(
-            &db,
-            "tenant-a",
-            "tenant-a",
-            crate::db::transport_creds::CRED_SOURCE_PEER_SHARED,
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO invites_accepted
-             (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![
-                "tenant-a",
-                "ia-a",
-                "tenant-a-eid",
-                "invite-a",
-                "ws-1",
-                1_i64
-            ],
-        )
-        .unwrap();
-        drop(db);
-
-        build_tenant_client_config_from_db(db_path.to_str().unwrap(), "tenant-a")
-            .expect("tenant config should build from stored creds");
-    }
-
-    #[test]
-    fn bootstrap_fallback_client_config_absent_when_active_invite_secret_exists() {
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("fallback_cfg.sqlite3");
-        let db = open_connection(&db_path).unwrap();
-        create_tables(&db).unwrap();
-
-        db.execute(
-            "INSERT INTO invite_secrets
-             (recorded_by, event_id, invite_event_id, private_key, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params![
-                "tenant-a",
-                "invite-secret-eid",
-                "invite-a",
-                vec![7u8; 32],
-                12345_i64
-            ],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO invite_bootstrap_trust
-             (recorded_by, invite_accepted_event_id, invite_event_id, workspace_id, bootstrap_addr, bootstrap_spki_fingerprint, accepted_at, expires_at)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-            rusqlite::params![
-                "tenant-a",
-                "ia-a",
-                "invite-a",
-                "ws-a",
-                "127.0.0.1:4433",
-                vec![9u8; 32],
-                1_i64,
-                i64::MAX
-            ],
-        )
-        .unwrap();
-        drop(db);
-
-        let cfg = build_tenant_bootstrap_fallback_client_config_from_db(
-            db_path.to_str().unwrap(),
-            "tenant-a",
-        )
-        .expect("fallback config query should succeed");
-        assert!(
-            cfg.is_none(),
-            "daemon-scoped transport should not derive bootstrap-only client configs"
-        );
-    }
-
-    #[test]
-    fn bootstrap_fallback_client_config_absent_without_active_invite_secret() {
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("fallback_cfg_empty.sqlite3");
-        let db = open_connection(&db_path).unwrap();
-        create_tables(&db).unwrap();
-        drop(db);
-
-        let cfg = build_tenant_bootstrap_fallback_client_config_from_db(
-            db_path.to_str().unwrap(),
-            "tenant-a",
-        )
-        .expect("fallback config query should succeed");
-        assert!(
-            cfg.is_none(),
-            "no active invite_secret means no fallback config"
-        );
-    }
-
-    #[test]
-    fn bootstrap_fallback_client_config_for_invite_returns_none_under_daemon_transport() {
-        let temp = tempfile::tempdir().unwrap();
-        let db_path = temp.path().join("fallback_cfg_specific.sqlite3");
-        let db = open_connection(&db_path).unwrap();
-        create_tables(&db).unwrap();
-
-        db.execute(
-            "INSERT INTO invite_secrets
-             (recorded_by, event_id, invite_event_id, private_key, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["tenant-a", "secret-a", "invite-a", vec![7u8; 32], 100_i64],
-        )
-        .unwrap();
-        db.execute(
-            "INSERT INTO invite_secrets
-             (recorded_by, event_id, invite_event_id, private_key, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["tenant-a", "secret-b", "invite-b", vec![8u8; 32], 200_i64],
-        )
-        .unwrap();
-        for (ia, invite) in [("ia-a", "invite-a"), ("ia-b", "invite-b")] {
-            db.execute(
-                "INSERT INTO invite_bootstrap_trust
-                 (recorded_by, invite_accepted_event_id, invite_event_id, workspace_id, bootstrap_addr, bootstrap_spki_fingerprint, accepted_at, expires_at)
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
-                rusqlite::params![
-                    "tenant-a",
-                    ia,
-                    invite,
-                    "ws-a",
-                    "127.0.0.1:4433",
-                    vec![9u8; 32],
-                    1_i64,
-                    i64::MAX
-                ],
-            )
-            .unwrap();
-        }
-        drop(db);
-
-        let cfg_a = build_tenant_bootstrap_fallback_client_config_for_invite_from_db(
-            db_path.to_str().unwrap(),
-            "tenant-a",
-            "invite-a",
-        )
-        .expect("invite-a fallback should query");
-        let cfg_b = build_tenant_bootstrap_fallback_client_config_for_invite_from_db(
-            db_path.to_str().unwrap(),
-            "tenant-a",
-            "invite-b",
-        )
-        .expect("invite-b fallback should query");
-        assert!(
-            cfg_a.is_none(),
-            "invite-a should not produce a transport-level bootstrap fallback config"
-        );
-        assert!(
-            cfg_b.is_none(),
-            "invite-b should not produce a transport-level bootstrap fallback config"
-        );
-    }
-
     #[tokio::test]
-    async fn boundary_wrappers_cover_dial_accept_and_intro_roundtrip() {
-        let (server_ep, client_ep, server_addr, server_peer_id, client_peer_id) =
+    async fn boundary_wrappers_cover_dial_and_accept() {
+        let (_temp, server_ep, client_ep, server_addr, server_peer_id, client_peer_id) =
             endpoint_pair().await.expect("endpoint pair");
         let server_sni = transport_sni(&server_peer_id);
 
         let (accepted_res, dialed_res) = tokio::join!(
             accept_session_peer(&server_ep),
-            dial_session_peer(&client_ep, server_addr, &server_sni, None)
+            dial_session_peer(&client_ep, server_addr, &server_sni)
         );
         let accepted = accepted_res.expect("accept").expect("accepted");
         let dialed = dialed_res.expect("dial");
         assert_eq!(accepted.daemon_peer_id, client_peer_id);
         assert_eq!(dialed.daemon_peer_id, server_peer_id);
-
-        let intro = Frame::IntroOffer {
-            intro_id: [0x11; 16],
-            other_peer_id: [0x22; 32],
-            origin_family: 4,
-            origin_ip: [0; 16],
-            origin_port: 4433,
-            observed_at_ms: 10,
-            expires_at_ms: 100,
-            attempt_window_ms: 50,
-        };
-        send_intro_offer_frame(&dialed.connection, &intro)
-            .await
-            .expect("send intro");
-        let read = read_intro_offer_frame(&accepted.connection)
-            .await
-            .expect("read intro result")
-            .expect("intro frame");
-        assert_eq!(read, intro);
     }
 }

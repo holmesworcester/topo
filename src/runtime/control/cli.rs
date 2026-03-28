@@ -245,30 +245,6 @@ pub(crate) enum Commands {
         action: EventAction,
     },
 
-    /// Send intro offers to two peers so they can hole-punch a direct connection
-    Intro {
-        /// Peer A hex SPKI fingerprint
-        #[arg(long)]
-        peer_a: String,
-        /// Peer B hex SPKI fingerprint
-        #[arg(long)]
-        peer_b: String,
-        /// Intro TTL in milliseconds
-        #[arg(long, default_value = "30000")]
-        ttl_ms: u64,
-        /// Attempt window in milliseconds
-        #[arg(long, default_value = "4000")]
-        attempt_window_ms: u32,
-    },
-
-    /// Show intro attempt records
-    #[command(name = "intro-attempts")]
-    IntroAttempts {
-        /// Filter by peer SPKI fingerprint (hex)
-        #[arg(long)]
-        peer: Option<String>,
-    },
-
     /// Create a user invite link for the active workspace
     #[command(name = "invite")]
     CreateInvite {
@@ -351,13 +327,6 @@ pub(crate) enum Commands {
         action: RpcAction,
     },
 
-    /// Enable, disable, or inspect runtime-managed UPnP port forwarding.
-    /// Mapping attempts are ephemeral daemon state and reset on restart.
-    Upnp {
-        #[command(subcommand)]
-        action: Option<UpnpCommand>,
-    },
-
     /// Enable, disable, or query forward-on-have live hint delivery.
     Forward {
         #[command(subcommand)]
@@ -427,16 +396,6 @@ pub(crate) enum RpcAction {
         #[arg(long, group = "input")]
         stdin: bool,
     },
-}
-
-#[derive(Subcommand, Clone, Copy)]
-pub(crate) enum UpnpCommand {
-    /// Enable UPnP mode and refresh the active runtime mapping now.
-    Enable,
-    /// Disable UPnP mode and stop advertising any prior UPnP address.
-    Disable,
-    /// Show the current UPnP mode and last mapping result.
-    Status,
 }
 
 #[derive(Subcommand)]

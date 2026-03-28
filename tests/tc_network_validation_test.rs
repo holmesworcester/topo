@@ -23,7 +23,6 @@ mod perf_network_shaper;
 mod tc_network_shaper;
 
 use std::error::Error;
-use std::sync::Arc;
 use std::time::Duration;
 
 use perf_network_shaper::NetworkProfile;
@@ -31,8 +30,8 @@ use tc_network_shaper::{tc_shaping_available, TcLoopbackShaper};
 use topo::protocol::{encode_frame, parse_frame, Frame};
 use topo::transport::multi_workspace::transport_sni;
 use topo::transport::{
-    accept_session_provider, create_dual_endpoint, dial_session_provider, extract_spki_fingerprint,
-    generate_self_signed_cert, SessionProvider,
+    accept_session_provider, create_runtime_endpoint_for_tenants, dial_session_provider,
+    load_daemon_identity_from_db, SessionProvider,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -50,29 +49,20 @@ struct TcConnectedProviders {
 /// Unlike the UDP-shaper variant, both endpoints connect directly to each
 /// other — shaping is done by the kernel qdisc, not by a proxy.
 async fn connect_with_tc(profile: NetworkProfile) -> TestResult<TcConnectedProviders> {
-    let (server_cert, server_key) = generate_self_signed_cert()?;
-    let server_fp = extract_spki_fingerprint(server_cert.as_ref())?;
-    let (client_cert, client_key) = generate_self_signed_cert()?;
-    let client_fp = extract_spki_fingerprint(client_cert.as_ref())?;
-    let server_peer_id = hex::encode(server_fp);
-
-    let server_allowed: Arc<topo::transport::DynamicAllowFn> =
-        Arc::new(move |candidate| Ok(candidate == &client_fp));
-    let client_allowed: Arc<topo::transport::DynamicAllowFn> =
-        Arc::new(move |candidate| Ok(candidate == &server_fp));
-
-    let server_ep = create_dual_endpoint(
+    let temp = tempfile::tempdir()?;
+    let server_db = temp.path().join("server.sqlite3");
+    let client_db = temp.path().join("client.sqlite3");
+    let server_ep = create_runtime_endpoint_for_tenants(
         "127.0.0.1:0".parse().unwrap(),
-        server_cert,
-        server_key,
-        server_allowed,
-    )?;
-    let client_ep = create_dual_endpoint(
+        server_db.to_str().unwrap(),
+    )
+    .await?;
+    let client_ep = create_runtime_endpoint_for_tenants(
         "127.0.0.1:0".parse().unwrap(),
-        client_cert,
-        client_key,
-        client_allowed,
-    )?;
+        client_db.to_str().unwrap(),
+    )
+    .await?;
+    let server_peer_id = load_daemon_identity_from_db(server_db.to_str().unwrap())?.0;
 
     let server_addr = server_ep.local_addr()?;
     let client_addr = client_ep.local_addr()?;
@@ -91,7 +81,7 @@ async fn connect_with_tc(profile: NetworkProfile) -> TestResult<TcConnectedProvi
     let sni = transport_sni(&server_peer_id);
     let (server_provider_result, client_provider_result) = tokio::join!(
         accept_session_provider(&server_ep),
-        dial_session_provider(&client_ep, server_addr, &sni, None)
+        dial_session_provider(&client_ep, server_addr, &sni)
     );
     let server_provider = server_provider_result?
         .ok_or_else(|| "server endpoint closed before accepting".to_string())?;

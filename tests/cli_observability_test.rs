@@ -195,10 +195,16 @@ fn test_event_fingerprints_converge_after_sync() {
     // by re-querying and comparing to itself.
     let fp_a1 = event_list_fingerprint(&alice_db);
     let fp_a2 = event_list_fingerprint(&alice_db);
-    assert_eq!(fp_a1, fp_a2, "Alice's fingerprint should be stable across queries");
+    assert_eq!(
+        fp_a1, fp_a2,
+        "Alice's fingerprint should be stable across queries"
+    );
     let fp_b1 = event_list_fingerprint(&bob_db);
     let fp_b2 = event_list_fingerprint(&bob_db);
-    assert_eq!(fp_b1, fp_b2, "Bob's fingerprint should be stable across queries");
+    assert_eq!(
+        fp_b1, fp_b2,
+        "Bob's fingerprint should be stable across queries"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -427,7 +433,10 @@ fn test_cross_workspace_counts_isolated() {
     // Fingerprints should differ between workspaces
     let fp_a = event_list_fingerprint(&ws_a1);
     let fp_b = event_list_fingerprint(&ws_b1);
-    assert_ne!(fp_a, fp_b, "different workspaces should have different event fingerprints");
+    assert_ne!(
+        fp_a, fp_b,
+        "different workspaces should have different event fingerprints"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -478,7 +487,12 @@ fn test_foreign_workspace_rejected_at_transport() {
 fn test_three_peer_device_link_then_user_invite() {
     let tmpdir = tempfile::tempdir().unwrap();
     let phone_db = tmpdir.path().join("phone.db").to_str().unwrap().to_string();
-    let laptop_db = tmpdir.path().join("laptop.db").to_str().unwrap().to_string();
+    let laptop_db = tmpdir
+        .path()
+        .join("laptop.db")
+        .to_str()
+        .unwrap()
+        .to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 60000;
 
@@ -527,8 +541,18 @@ fn test_three_peer_device_link_then_user_invite() {
 fn test_chained_device_links_converge() {
     let tmpdir = tempfile::tempdir().unwrap();
     let phone_db = tmpdir.path().join("phone.db").to_str().unwrap().to_string();
-    let laptop_db = tmpdir.path().join("laptop.db").to_str().unwrap().to_string();
-    let tablet_db = tmpdir.path().join("tablet.db").to_str().unwrap().to_string();
+    let laptop_db = tmpdir
+        .path()
+        .join("laptop.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let tablet_db = tmpdir
+        .path()
+        .join("tablet.db")
+        .to_str()
+        .unwrap()
+        .to_string();
     let timeout_ms = 60000;
 
     create_workspace(&phone_db);
@@ -570,12 +594,25 @@ fn test_chained_device_links_converge() {
 /// Phone links both laptop and tablet independently. The two non-root devices
 /// can sync directly after convergence.
 /// Replaces: scenario_tests/identity_sync::test_three_peer_parallel_device_links_enable_direct_sync_between_non_inviters
+/// Also serves as the CLI merge gate for the relay-backed `iroh` path:
+/// two peers that only met through a third peer can still exchange data once
+/// workspace trust converges.
 #[test]
 fn test_parallel_device_links_converge() {
     let tmpdir = tempfile::tempdir().unwrap();
     let phone_db = tmpdir.path().join("phone.db").to_str().unwrap().to_string();
-    let laptop_db = tmpdir.path().join("laptop.db").to_str().unwrap().to_string();
-    let tablet_db = tmpdir.path().join("tablet.db").to_str().unwrap().to_string();
+    let laptop_db = tmpdir
+        .path()
+        .join("laptop.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let tablet_db = tmpdir
+        .path()
+        .join("tablet.db")
+        .to_str()
+        .unwrap()
+        .to_string();
     let timeout_ms = 60000;
 
     create_workspace(&phone_db);
@@ -633,11 +670,16 @@ fn test_sub_since_ms_filters_old_messages() {
     // Create subscription with since-ms cursor
     let out = std::process::Command::new(bin())
         .args([
-            "--db", &db,
-            "sub", "create",
-            "--name", "recent",
-            "--event-type", "message",
-            "--since-ms", &now_ms.to_string(),
+            "--db",
+            &db,
+            "sub",
+            "create",
+            "--name",
+            "recent",
+            "--event-type",
+            "message",
+            "--since-ms",
+            &now_ms.to_string(),
         ])
         .output()
         .expect("sub create failed");
@@ -650,7 +692,12 @@ fn test_sub_since_ms_filters_old_messages() {
 
     // Poll — should only see the 3 new messages
     let items = poll_sub_json(&db, "recent");
-    assert_eq!(items.len(), 3, "should see only 3 new messages, got {}", items.len());
+    assert_eq!(
+        items.len(),
+        3,
+        "should see only 3 new messages, got {}",
+        items.len()
+    );
 }
 
 /// Subscription persists across daemon restart.
@@ -704,7 +751,10 @@ fn test_sub_receives_synced_message() {
     // The production send path encrypts via the workspace content key;
     // the subscription engine decrypts the inner event before delivering.
     let items = poll_sub_json(&bob_db, "inbox");
-    assert!(!items.is_empty(), "subscription should receive the encrypted message");
+    assert!(
+        !items.is_empty(),
+        "subscription should receive the encrypted message"
+    );
     let content = items[0]["payload"]["content"].as_str().unwrap_or("");
     assert_eq!(
         content, "secret hello from alice",
@@ -746,12 +796,28 @@ fn test_event_timeline_shows_delivery_timestamps() {
     let stdout = String::from_utf8_lossy(&out.stdout);
     let data: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
     // Verify timestamps exist and are ordered
-    let recv = data["first_received_at_ms"].as_i64().expect("missing first_received_at_ms");
-    let stored = data["first_stored_at_ms"].as_i64().expect("missing first_stored_at_ms");
-    let proj = data["projected_at_ms"].as_i64().expect("missing projected_at_ms");
+    let recv = data["first_received_at_ms"]
+        .as_i64()
+        .expect("missing first_received_at_ms");
+    let stored = data["first_stored_at_ms"]
+        .as_i64()
+        .expect("missing first_stored_at_ms");
+    let proj = data["projected_at_ms"]
+        .as_i64()
+        .expect("missing projected_at_ms");
     assert!(recv > 0, "first_received_at should be positive");
-    assert!(stored >= recv, "stored ({}) should be >= received ({})", stored, recv);
-    assert!(proj >= stored, "projected ({}) should be >= stored ({})", proj, stored);
+    assert!(
+        stored >= recv,
+        "stored ({}) should be >= received ({})",
+        stored,
+        recv
+    );
+    assert!(
+        proj >= stored,
+        "projected ({}) should be >= stored ({})",
+        proj,
+        stored
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -801,27 +867,60 @@ fn test_cli_subscription_full_lifecycle() {
     // Poll — expect 3 items with ascending seq 1, 2, 3
     let items = poll_sub_json(&db, "inbox");
     assert_eq!(items.len(), 3, "expected 3 feed items, got {}", items.len());
-    assert_eq!(items[0]["seq"].as_i64().unwrap_or(-1), 1, "first item seq should be 1");
-    assert_eq!(items[1]["seq"].as_i64().unwrap_or(-1), 2, "second item seq should be 2");
-    assert_eq!(items[2]["seq"].as_i64().unwrap_or(-1), 3, "third item seq should be 3");
+    assert_eq!(
+        items[0]["seq"].as_i64().unwrap_or(-1),
+        1,
+        "first item seq should be 1"
+    );
+    assert_eq!(
+        items[1]["seq"].as_i64().unwrap_or(-1),
+        2,
+        "second item seq should be 2"
+    );
+    assert_eq!(
+        items[2]["seq"].as_i64().unwrap_or(-1),
+        3,
+        "third item seq should be 3"
+    );
 
     // Full mode: payload contains content, author_id, event_id
     let payload0 = &items[0]["payload"];
-    assert!(payload0["content"].is_string(), "full mode payload should have content");
-    assert!(payload0["author_id"].is_string(), "full mode payload should have author_id");
-    assert!(payload0["event_id"].is_string(), "full mode payload should have event_id");
+    assert!(
+        payload0["content"].is_string(),
+        "full mode payload should have content"
+    );
+    assert!(
+        payload0["author_id"].is_string(),
+        "full mode payload should have author_id"
+    );
+    assert!(
+        payload0["event_id"].is_string(),
+        "full mode payload should have event_id"
+    );
 
     // Check state: pending_count == 3, dirty == true
     let state = sub_state_json(&db, "inbox");
-    assert_eq!(state["pending_count"].as_i64().unwrap_or(-1), 3, "pending_count should be 3");
-    assert!(state["dirty"].as_bool().unwrap_or(false), "dirty should be true");
+    assert_eq!(
+        state["pending_count"].as_i64().unwrap_or(-1),
+        3,
+        "pending_count should be 3"
+    );
+    assert!(
+        state["dirty"].as_bool().unwrap_or(false),
+        "dirty should be true"
+    );
 
     // Ack through seq 2
     sub_ack(&db, "inbox", 2);
 
     // Poll again — only seq 3 remains
     let items = poll_sub_json(&db, "inbox");
-    assert_eq!(items.len(), 1, "expected 1 item after acking seq 2, got {}", items.len());
+    assert_eq!(
+        items.len(),
+        1,
+        "expected 1 item after acking seq 2, got {}",
+        items.len()
+    );
     assert_eq!(items[0]["seq"].as_i64().unwrap_or(-1), 3);
 
     // Ack seq 3
@@ -829,7 +928,11 @@ fn test_cli_subscription_full_lifecycle() {
 
     // State: pending_count == 0
     let state = sub_state_json(&db, "inbox");
-    assert_eq!(state["pending_count"].as_i64().unwrap_or(-1), 0, "pending_count should be 0");
+    assert_eq!(
+        state["pending_count"].as_i64().unwrap_or(-1),
+        0,
+        "pending_count should be 0"
+    );
 }
 
 /// Subscription with since_event_id cursor: cursor event is excluded, subsequent events appear.
@@ -845,11 +948,16 @@ fn test_cli_subscription_since_event_id() {
     // Create subscription with since_event_id set to cursor (hex format is accepted)
     let out = std::process::Command::new(bin())
         .args([
-            "--db", &db,
-            "sub", "create",
-            "--name", "from-cursor",
-            "--event-type", "message",
-            "--since-event-id", &cursor_event_id,
+            "--db",
+            &db,
+            "sub",
+            "create",
+            "--name",
+            "from-cursor",
+            "--event-type",
+            "message",
+            "--since-event-id",
+            &cursor_event_id,
         ])
         .output()
         .expect("sub create failed");
@@ -890,7 +998,11 @@ fn test_cli_subscription_has_changed_mode() {
 
     // Poll — no feed rows for has_changed mode
     let items = poll_sub_json(&db, "changed");
-    assert_eq!(items.len(), 0, "has_changed mode should not produce feed rows");
+    assert_eq!(
+        items.len(),
+        0,
+        "has_changed mode should not produce feed rows"
+    );
 
     // State: pending_count == 5, dirty == true
     let state = sub_state_json(&db, "changed");
@@ -899,7 +1011,10 @@ fn test_cli_subscription_has_changed_mode() {
         5,
         "pending_count should be 5"
     );
-    assert!(state["dirty"].as_bool().unwrap_or(false), "dirty should be true");
+    assert!(
+        state["dirty"].as_bool().unwrap_or(false),
+        "dirty should be true"
+    );
 
     // Ack resets the state
     sub_ack(&db, "changed", 0);
@@ -926,7 +1041,10 @@ fn test_cli_subscription_filter_by_author() {
     send_message(&db, "probe message");
 
     let probe_items = poll_sub_json(&db, "probe");
-    assert!(!probe_items.is_empty(), "probe sub should have at least one item");
+    assert!(
+        !probe_items.is_empty(),
+        "probe sub should have at least one item"
+    );
     let author_id = probe_items[0]["payload"]["author_id"]
         .as_str()
         .expect("probe item should have author_id")
@@ -942,11 +1060,16 @@ fn test_cli_subscription_filter_by_author() {
     // Create filtered subscription
     let out = std::process::Command::new(bin())
         .args([
-            "--db", &db,
-            "sub", "create",
-            "--name", "alice-only",
-            "--event-type", "message",
-            "--spec", &spec_json,
+            "--db",
+            &db,
+            "sub",
+            "create",
+            "--name",
+            "alice-only",
+            "--event-type",
+            "message",
+            "--spec",
+            &spec_json,
         ])
         .output()
         .expect("sub create failed");
@@ -961,7 +1084,12 @@ fn test_cli_subscription_filter_by_author() {
 
     // Poll filtered sub — should have exactly 1 item (the one sent after creation)
     let items = poll_sub_json(&db, "alice-only");
-    assert_eq!(items.len(), 1, "author filter should match exactly 1 message, got {}", items.len());
+    assert_eq!(
+        items.len(),
+        1,
+        "author filter should match exactly 1 message, got {}",
+        items.len()
+    );
 }
 
 /// Author filter with fake author: subscription receives nothing.
@@ -986,11 +1114,16 @@ fn test_cli_subscription_filter_rejects_non_matching_author() {
 
     let out = std::process::Command::new(bin())
         .args([
-            "--db", &db,
-            "sub", "create",
-            "--name", "nobody",
-            "--event-type", "message",
-            "--spec", &spec_json,
+            "--db",
+            &db,
+            "sub",
+            "create",
+            "--name",
+            "nobody",
+            "--event-type",
+            "message",
+            "--spec",
+            &spec_json,
         ])
         .output()
         .expect("sub create failed");
@@ -1004,7 +1137,11 @@ fn test_cli_subscription_filter_rejects_non_matching_author() {
 
     // Poll — alice's message should not pass the fake-author filter
     let items = poll_sub_json(&db, "nobody");
-    assert_eq!(items.len(), 0, "filter for fake author should produce no feed items");
+    assert_eq!(
+        items.len(),
+        0,
+        "filter for fake author should produce no feed items"
+    );
 }
 
 /// id delivery mode: feed items have event_id but no content field.
@@ -1024,8 +1161,14 @@ fn test_cli_subscription_id_delivery_mode() {
 
     // Id mode payload has event_id and created_at_ms, but NOT content
     let payload = &items[0]["payload"];
-    assert!(payload["event_id"].is_string(), "id mode should have event_id");
-    assert!(payload["created_at_ms"].is_number(), "id mode should have created_at_ms");
+    assert!(
+        payload["event_id"].is_string(),
+        "id mode should have event_id"
+    );
+    assert!(
+        payload["created_at_ms"].is_number(),
+        "id mode should have created_at_ms"
+    );
     assert!(
         payload.get("content").is_none() || payload["content"].is_null(),
         "id mode should NOT have content field"
@@ -1058,7 +1201,11 @@ fn test_cli_disabled_subscription_skipped() {
     send_message(&db, "should be delivered");
 
     let items = poll_sub_json(&db, "inbox");
-    assert_eq!(items.len(), 1, "re-enabled sub should receive the new event");
+    assert_eq!(
+        items.len(),
+        1,
+        "re-enabled sub should receive the new event"
+    );
 }
 
 /// Three independent subscriptions (full, id, has_changed) each receive the same event.
@@ -1087,13 +1234,23 @@ fn test_cli_multiple_subscriptions_independent() {
     let id_items = poll_sub_json(&db, "id-sub");
     assert_eq!(id_items.len(), 1, "id sub should have 1 item");
     let id_payload = &id_items[0]["payload"];
-    assert!(id_payload["event_id"].is_string(), "id sub item should have event_id");
-    let has_content = id_payload.get("content").map(|v| !v.is_null()).unwrap_or(false);
+    assert!(
+        id_payload["event_id"].is_string(),
+        "id sub item should have event_id"
+    );
+    let has_content = id_payload
+        .get("content")
+        .map(|v| !v.is_null())
+        .unwrap_or(false);
     assert!(!has_content, "id sub item should NOT have content");
 
     // has_changed sub: no feed items, but state shows pending_count == 1
     let changed_items = poll_sub_json(&db, "changed-sub");
-    assert_eq!(changed_items.len(), 0, "has_changed sub should have no feed items");
+    assert_eq!(
+        changed_items.len(),
+        0,
+        "has_changed sub should have no feed items"
+    );
 
     let state = sub_state_json(&db, "changed-sub");
     assert_eq!(
@@ -1162,11 +1319,19 @@ fn test_cli_non_message_events_ignored() {
 
     // Poll — only the message should appear, not the reaction
     let items = poll_sub_json(&db, "messages-only");
-    assert_eq!(items.len(), 1, "only the message should appear in a message sub, got {}", items.len());
+    assert_eq!(
+        items.len(),
+        1,
+        "only the message should appear in a message sub, got {}",
+        items.len()
+    );
 
     // Verify the item is indeed a message (not a reaction)
     let event_type = items[0]["event_type"].as_str().unwrap_or("unknown");
-    assert_eq!(event_type, "message", "feed item event_type should be 'message'");
+    assert_eq!(
+        event_type, "message",
+        "feed item event_type should be 'message'"
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -1197,7 +1362,14 @@ fn test_discover_finds_peer_via_mdns() {
 
     // Alice discovers Bob via mDNS
     let out = std::process::Command::new(bin())
-        .args(["--db", &alice_db, "discover", "--timeout-ms", "10000", "--json"])
+        .args([
+            "--db",
+            &alice_db,
+            "discover",
+            "--timeout-ms",
+            "10000",
+            "--json",
+        ])
         .output()
         .expect("discover failed");
     assert!(
@@ -1471,11 +1643,14 @@ fn test_trust_anchor_second_workspace_does_not_project() {
     // the existing tenant's trust anchor.
     let accept_out = std::process::Command::new(bin())
         .args([
-            "--db", &bob_db,
+            "--db",
+            &bob_db,
             "accept",
             &invite_b,
-            "--username", "bob-b",
-            "--devicename", "device-b",
+            "--username",
+            "bob-b",
+            "--devicename",
+            "device-b",
         ])
         .output()
         .expect("failed to run accept for workspace B");
@@ -1519,11 +1694,7 @@ fn test_non_admin_cannot_create_device_link() {
     // The `link` command attempts to create a DeviceInvite signed by Bob's peer key,
     // but targeted at Alice's user — this must be rejected as a cross-user device link.
     let out = std::process::Command::new(bin())
-        .args([
-            "--db", &bob_db,
-            "link",
-            "--public-addr", "127.0.0.1:9999",
-        ])
+        .args(["--db", &bob_db, "link", "--public-addr", "127.0.0.1:9999"])
         .output()
         .expect("failed to run topo link");
 
@@ -1535,8 +1706,7 @@ fn test_non_admin_cannot_create_device_link() {
         // Give sync a moment to propagate
         std::thread::sleep(Duration::from_secs(1));
         let stats_after = stats_json(&alice_db);
-        let alice_device_invites_after =
-            stats_after["device_invite_count"].as_i64().unwrap_or(0);
+        let alice_device_invites_after = stats_after["device_invite_count"].as_i64().unwrap_or(0);
         // Alice's count should not increase due to Bob's link command
         assert!(
             alice_device_invites_after <= alice_device_invites_before + 1,
@@ -1565,9 +1735,24 @@ fn test_non_admin_cannot_create_device_link() {
 #[test]
 fn test_shared_db_two_workspaces_same_daemon_isolation() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let shared_db = tmpdir.path().join("shared.db").to_str().unwrap().to_string();
-    let remote_a_db = tmpdir.path().join("remote_a.db").to_str().unwrap().to_string();
-    let remote_b_db = tmpdir.path().join("remote_b.db").to_str().unwrap().to_string();
+    let shared_db = tmpdir
+        .path()
+        .join("shared.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let remote_a_db = tmpdir
+        .path()
+        .join("remote_a.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let remote_b_db = tmpdir
+        .path()
+        .join("remote_b.db")
+        .to_str()
+        .unwrap()
+        .to_string();
     let timeout_ms = 60000;
 
     // Create workspace A on the shared DB
@@ -1617,7 +1802,12 @@ fn test_shared_db_two_workspaces_same_daemon_isolation() {
 #[test]
 fn test_shared_db_tenant_list_count() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let shared_db = tmpdir.path().join("shared.db").to_str().unwrap().to_string();
+    let shared_db = tmpdir
+        .path()
+        .join("shared.db")
+        .to_str()
+        .unwrap()
+        .to_string();
     let ws2_db = tmpdir.path().join("ws2.db").to_str().unwrap().to_string();
     let timeout_ms = 30000;
 
@@ -1637,10 +1827,13 @@ fn test_shared_db_tenant_list_count() {
     let accept_out = std::process::Command::new(bin())
         .args([
             "accept",
-            "--db", &shared_db,
+            "--db",
+            &shared_db,
             &invite2,
-            "--username", "user2",
-            "--devicename", "device2",
+            "--username",
+            "user2",
+            "--devicename",
+            "device2",
         ])
         .output()
         .expect("accept invite2 failed");
@@ -1750,7 +1943,12 @@ fn test_shared_db_no_cross_tenant_message_leakage() {
 #[test]
 fn test_shared_db_same_workspace_two_tenants_see_all_messages() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let shared_db = tmpdir.path().join("shared.db").to_str().unwrap().to_string();
+    let shared_db = tmpdir
+        .path()
+        .join("shared.db")
+        .to_str()
+        .unwrap()
+        .to_string();
     let peer2_db = tmpdir.path().join("peer2.db").to_str().unwrap().to_string();
     let timeout_ms = 60000;
 
@@ -1901,8 +2099,18 @@ fn test_shared_db_three_tenants_same_workspace() {
 fn test_shared_db_three_peer_same_workspace_external_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
     let root_db = tmpdir.path().join("root.db").to_str().unwrap().to_string();
-    let sibling_db = tmpdir.path().join("sibling.db").to_str().unwrap().to_string();
-    let external_db = tmpdir.path().join("external.db").to_str().unwrap().to_string();
+    let sibling_db = tmpdir
+        .path()
+        .join("sibling.db")
+        .to_str()
+        .unwrap()
+        .to_string();
+    let external_db = tmpdir
+        .path()
+        .join("external.db")
+        .to_str()
+        .unwrap()
+        .to_string();
     let timeout_ms = 60000;
 
     // Root creates workspace
@@ -1957,7 +2165,12 @@ fn test_shared_db_cross_workspace_external_isolation() {
     let tmpdir = tempfile::tempdir().unwrap();
     let ws_a_db = tmpdir.path().join("ws_a.db").to_str().unwrap().to_string();
     let ws_b_db = tmpdir.path().join("ws_b.db").to_str().unwrap().to_string();
-    let external_db = tmpdir.path().join("external.db").to_str().unwrap().to_string();
+    let external_db = tmpdir
+        .path()
+        .join("external.db")
+        .to_str()
+        .unwrap()
+        .to_string();
     let timeout_ms = 60000;
 
     // Workspace A
@@ -2016,7 +2229,12 @@ fn test_mdns_multitenant_self_filtering() {
     let tmpdir = tempfile::tempdir().unwrap();
     let ws_a_db = tmpdir.path().join("ws_a.db").to_str().unwrap().to_string();
     let ws_b_db = tmpdir.path().join("ws_b.db").to_str().unwrap().to_string();
-    let observer_db = tmpdir.path().join("observer.db").to_str().unwrap().to_string();
+    let observer_db = tmpdir
+        .path()
+        .join("observer.db")
+        .to_str()
+        .unwrap()
+        .to_string();
     let timeout_ms = 60000;
 
     // Workspace A: creates workspace, observer joins
@@ -2052,9 +2270,11 @@ fn test_mdns_multitenant_self_filtering() {
     // so just verify the command works and log results.
     let discover_out = std::process::Command::new(bin())
         .args([
-            "--db", &observer_db,
+            "--db",
+            &observer_db,
             "discover",
-            "--timeout-ms", "5000",
+            "--timeout-ms",
+            "5000",
             "--json",
         ])
         .output()
@@ -2062,8 +2282,7 @@ fn test_mdns_multitenant_self_filtering() {
 
     if discover_out.status.success() {
         let stdout = String::from_utf8_lossy(&discover_out.stdout);
-        let peers: Vec<serde_json::Value> =
-            serde_json::from_str(stdout.trim()).unwrap_or_default();
+        let peers: Vec<serde_json::Value> = serde_json::from_str(stdout.trim()).unwrap_or_default();
         eprintln!(
             "mdns multitenant: observer discovered {} peer(s)",
             peers.len()

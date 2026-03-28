@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -241,6 +242,23 @@ pub fn hold_network_test_lock_for_binary() {
     hold_network_test_binary_lock();
 }
 
+fn hold_network_test_thread_lock() {
+    static THREAD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    thread_local! {
+        static THREAD_GUARD: RefCell<Option<std::sync::MutexGuard<'static, ()>>> = const {
+            RefCell::new(None)
+        };
+    }
+
+    let lock = THREAD_LOCK.get_or_init(|| Mutex::new(()));
+    THREAD_GUARD.with(|slot| {
+        if slot.borrow().is_none() {
+            let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot.borrow_mut() = Some(guard);
+        }
+    });
+}
+
 pub struct LocalTenantInfo {
     pub peer_id: String,
     pub workspace_id: String,
@@ -451,6 +469,7 @@ pub fn start_discovery_daemon_on_port(db: &str, port: u16) -> HarnessDaemon {
 /// Start a daemon with full control over options.
 pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> HarnessDaemon {
     hold_network_test_binary_lock();
+    hold_network_test_thread_lock();
     let socket = socket_path_for_db(db);
     let bind_ip = opts.bind_ip.as_deref().unwrap_or("127.0.0.1");
     let requested_bind_addr = match opts.bind_port {
@@ -2584,10 +2603,7 @@ pub fn setup_two_peers(
 
 /// Single-peer workspace with daemon running.
 /// Returns (db_path, daemon).
-pub fn setup_single_peer(
-    tmpdir: &tempfile::TempDir,
-    name: &str,
-) -> (String, HarnessDaemon) {
+pub fn setup_single_peer(tmpdir: &tempfile::TempDir, name: &str) -> (String, HarnessDaemon) {
     let db = tmpdir
         .path()
         .join(format!("{}.db", name))
@@ -2607,7 +2623,16 @@ pub fn setup_single_peer(
 /// Create a subscription with default options.
 pub fn sub_create(db: &str, name: &str, event_type: &str) {
     let out = Command::new(bin())
-        .args(["--db", db, "sub", "create", "--name", name, "--event-type", event_type])
+        .args([
+            "--db",
+            db,
+            "sub",
+            "create",
+            "--name",
+            name,
+            "--event-type",
+            event_type,
+        ])
         .output()
         .expect("sub create failed");
     assert!(
@@ -2622,17 +2647,24 @@ pub fn sub_create(db: &str, name: &str, event_type: &str) {
 pub fn sub_create_with_delivery(db: &str, name: &str, event_type: &str, delivery: &str) {
     let out = Command::new(bin())
         .args([
-            "--db", db, "sub", "create",
-            "--name", name,
-            "--event-type", event_type,
-            "--delivery", delivery,
+            "--db",
+            db,
+            "sub",
+            "create",
+            "--name",
+            name,
+            "--event-type",
+            event_type,
+            "--delivery",
+            delivery,
         ])
         .output()
         .expect("sub create failed");
     assert!(
         out.status.success(),
         "sub create {} (delivery={}) failed: {}",
-        name, delivery,
+        name,
+        delivery,
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -2641,15 +2673,21 @@ pub fn sub_create_with_delivery(db: &str, name: &str, event_type: &str, delivery
 pub fn sub_ack(db: &str, name: &str, through_seq: u64) {
     let out = Command::new(bin())
         .args([
-            "--db", db, "sub", "ack", name,
-            "--through-seq", &through_seq.to_string(),
+            "--db",
+            db,
+            "sub",
+            "ack",
+            name,
+            "--through-seq",
+            &through_seq.to_string(),
         ])
         .output()
         .expect("sub ack failed");
     assert!(
         out.status.success(),
         "sub ack {} through {} failed: {}",
-        name, through_seq,
+        name,
+        through_seq,
         String::from_utf8_lossy(&out.stderr)
     );
 }

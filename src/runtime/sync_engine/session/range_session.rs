@@ -6,6 +6,7 @@ use rusqlite::Connection;
 
 use crate::crypto::{event_id_to_base64, hash_event, EventId};
 use crate::db::store::Store;
+use crate::event_modules::{parse_event, ParsedEvent};
 use crate::protocol::neg_id_to_event_id;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::receive_log::ReceiveLogWriter;
@@ -70,6 +71,65 @@ pub fn load_shared_event_index_slice(
     Ok(storage)
 }
 
+pub fn load_shared_send_batch_with_endpoint_deps(
+    store: &Store<'_>,
+    ids: &[EventId],
+) -> Result<Vec<(EventId, Vec<u8>)>, String> {
+    if ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let base_blobs = store
+        .get_shared_batch(ids)
+        .map_err(|e| format!("load shared batch: {e}"))?;
+
+    let mut endpoint_dep_ids = Vec::new();
+    let mut requested = std::collections::HashSet::with_capacity(ids.len());
+    for event_id in ids {
+        requested.insert(*event_id);
+        let Some(blob) = base_blobs.get(event_id) else {
+            continue;
+        };
+        let ParsedEvent::PeerShared(peer_shared) =
+            parse_event(blob).map_err(|e| format!("parse shared batch event: {e}"))?
+        else {
+            continue;
+        };
+        if !requested.contains(&peer_shared.endpoint_shared_event_id) {
+            endpoint_dep_ids.push(peer_shared.endpoint_shared_event_id);
+        }
+    }
+    endpoint_dep_ids.sort_unstable();
+    endpoint_dep_ids.dedup();
+
+    let dep_blobs = store
+        .get_shared_batch(&endpoint_dep_ids)
+        .map_err(|e| format!("load peer_shared endpoint dep batch: {e}"))?;
+
+    let mut emitted = std::collections::HashSet::with_capacity(ids.len() + dep_blobs.len());
+    let mut ordered = Vec::with_capacity(ids.len() + dep_blobs.len());
+
+    for event_id in ids {
+        let Some(blob) = base_blobs.get(event_id) else {
+            continue;
+        };
+        if let ParsedEvent::PeerShared(peer_shared) =
+            parse_event(blob).map_err(|e| format!("parse shared batch event: {e}"))?
+        {
+            if let Some(dep_blob) = dep_blobs.get(&peer_shared.endpoint_shared_event_id) {
+                if emitted.insert(peer_shared.endpoint_shared_event_id) {
+                    ordered.push((peer_shared.endpoint_shared_event_id, dep_blob.clone()));
+                }
+            }
+        }
+        if emitted.insert(*event_id) {
+            ordered.push((*event_id, blob.clone()));
+        }
+    }
+
+    Ok(ordered)
+}
+
 pub async fn send_have_events<S>(
     store: &Store<'_>,
     data_send: &mut S,
@@ -86,18 +146,13 @@ where
     let mut bytes_sent = 0u64;
     let event_ids: Vec<EventId> = have_ids.iter().map(neg_id_to_event_id).collect();
     for chunk in event_ids.chunks(64) {
-        let blobs = store
-            .get_shared_batch(chunk)
-            .map_err(|e| format!("load shared batch for range send: {e}"))?;
+        let ordered = load_shared_send_batch_with_endpoint_deps(store, chunk)?;
         let mut payload = Vec::new();
-        for event_id in chunk {
-            let Some(blob) = blobs.get(event_id) else {
-                continue;
-            };
+        for (_event_id, blob) in ordered {
             let blob_len = u32::try_from(blob.len())
                 .map_err(|_| format!("range event too large: {} bytes", blob.len()))?;
             payload.extend_from_slice(&blob_len.to_le_bytes());
-            payload.extend_from_slice(blob);
+            payload.extend_from_slice(&blob);
             events_sent += 1;
             bytes_sent += blob.len() as u64;
         }
@@ -188,4 +243,121 @@ where
             path: writer.finish()?,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::crypto::hash_event;
+    use crate::db::open_in_memory;
+    use crate::db::schema::create_tables;
+    use crate::db::store::insert_event;
+    use crate::event_modules::{
+        encode_event, endpoint_shared, registry::ShareScope, ParsedEvent, PeerSharedEvent,
+    };
+
+    #[test]
+    fn shared_send_batch_includes_endpoint_shared_before_peer_shared() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let endpoint_event = endpoint_shared::deterministic_endpoint_shared_event([0x11; 32]);
+        let endpoint_blob = encode_event(&endpoint_event).unwrap();
+        let endpoint_event_id = hash_event(&endpoint_blob);
+        insert_event(
+            &conn,
+            &endpoint_event_id,
+            "endpoint_shared",
+            &endpoint_blob,
+            ShareScope::Shared,
+            1,
+            1,
+        )
+        .unwrap();
+
+        let peer_shared_event = ParsedEvent::PeerShared(PeerSharedEvent {
+            created_at_ms: 2,
+            public_key: [0x22; 32],
+            user_event_id: [0x33; 32],
+            endpoint_shared_event_id: endpoint_event_id,
+            device_name: "device".to_string(),
+            signed_by: [0x44; 32],
+            signer_type: 3,
+            signature: [0u8; 64],
+        });
+        let peer_shared_blob = encode_event(&peer_shared_event).unwrap();
+        let peer_shared_event_id = hash_event(&peer_shared_blob);
+        insert_event(
+            &conn,
+            &peer_shared_event_id,
+            "peer_shared",
+            &peer_shared_blob,
+            ShareScope::Shared,
+            2,
+            2,
+        )
+        .unwrap();
+
+        let store = Store::new(&conn);
+        let ordered =
+            load_shared_send_batch_with_endpoint_deps(&store, &[peer_shared_event_id]).unwrap();
+
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].0, endpoint_event_id);
+        assert_eq!(ordered[1].0, peer_shared_event_id);
+    }
+
+    #[test]
+    fn shared_send_batch_dedupes_requested_endpoint_shared() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+
+        let endpoint_event = endpoint_shared::deterministic_endpoint_shared_event([0x55; 32]);
+        let endpoint_blob = encode_event(&endpoint_event).unwrap();
+        let endpoint_event_id = hash_event(&endpoint_blob);
+        insert_event(
+            &conn,
+            &endpoint_event_id,
+            "endpoint_shared",
+            &endpoint_blob,
+            ShareScope::Shared,
+            1,
+            1,
+        )
+        .unwrap();
+
+        let peer_shared_event = ParsedEvent::PeerShared(PeerSharedEvent {
+            created_at_ms: 2,
+            public_key: [0x66; 32],
+            user_event_id: [0x77; 32],
+            endpoint_shared_event_id: endpoint_event_id,
+            device_name: "device".to_string(),
+            signed_by: [0x88; 32],
+            signer_type: 3,
+            signature: [0u8; 64],
+        });
+        let peer_shared_blob = encode_event(&peer_shared_event).unwrap();
+        let peer_shared_event_id = hash_event(&peer_shared_blob);
+        insert_event(
+            &conn,
+            &peer_shared_event_id,
+            "peer_shared",
+            &peer_shared_blob,
+            ShareScope::Shared,
+            2,
+            2,
+        )
+        .unwrap();
+
+        let store = Store::new(&conn);
+        let ordered = load_shared_send_batch_with_endpoint_deps(
+            &store,
+            &[endpoint_event_id, peer_shared_event_id],
+        )
+        .unwrap();
+
+        assert_eq!(ordered.len(), 2);
+        assert_eq!(ordered[0].0, endpoint_event_id);
+        assert_eq!(ordered[1].0, peer_shared_event_id);
+    }
 }

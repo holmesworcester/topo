@@ -50,12 +50,13 @@ This PoC exists to prove the practicality of a principled approach that uses [ev
 * **Dependency and blocking can fit product needs** - The dependency graph can be whatever it needs to, to fit features like "don't display messages until you know their username" or "display messages immediately with a placeholder username". Dependency is **NOT** hard-wired into the syncing protocol or document store, as with OrtbitDB or Automerge.
 * **Complex, secure deletion** - It is straightforward to reliably implement things like "delete this message, its attachments, and reactions" or the kind of key purging you'd need for data-layer forward secrecy. 
 * **It works in an iOS NSE** - At least, it works on Linux under the same 24MB memory limit imposed by iOS on background-wakeup Notification Service Extensions. TODO: real proof on iOS.
-* **We can use conventional networking primitives** - We can control standard QUIC libraries (e.g. quinn in Rust) sufficiently to initiate mTLS sessions based on peer identity established by our event graph, and route to different workspaces on the same endpoint. We can even do mDNS local discovery and holepunching!
-* **No separate STUN/TURN required** - If we need to for product reasons (unclear still, as it may make more sense to rely on cloud nodes or user-community-furnished high availability non-NAT nodes) we can holepunch by aiming QUIC attempts at each other after an in-band introduction signal from a mutually available peer, as opposed to using separate protocols/infra for ICE/STUN/TURN.
-* **Multitenancy can be built-in** - We can use event sourcing and workspace differentiation via mTLS to make multitenancy a first-class thing, serve many Slack-like workspaces at the same cloud endpoint, and offer multi-account UIs out-of-the-box. Tenant creation and lifecycle management are event-based and deterministic like everything else.
+* **We can use conventional networking primitives** - We can use a daemon-scoped QUIC runtime (`iroh`) to authenticate remote daemons, route different workspaces over one shared connection, and get local mDNS discovery plus NAT/path management without keeping bespoke glue.
+* **No separate STUN/TURN required** - relay-backed `iroh` provides rendezvous, NAT traversal, and fallback transport directly, so we do not need a bespoke `topo` intro/hole-punch protocol on top.
+* **Multitenancy can be built-in** - We can use event sourcing and workspace differentiation via daemon-scoped transport plus workspace-scoped routed sessions to make multitenancy a first-class thing, serve many Slack-like workspaces at the same cloud endpoint, and offer multi-account UIs out-of-the-box. Tenant creation and lifecycle management are event-based and deterministic like everything else.
 * **Regular (fixed-length) wire formats** - [Langsec](https://langsec.org/) counsels that parsers can be made much more secure when data type complexity is limited, with regular (fixed-length-field) wire formats being the most tractable for secure parsing and formal verification. We keep our wire formats fixed-length.
 * **Keys can just be dependencies** - There are no special queues for events with missing signer or decryption keys: these are just declared dependencies (key material is stored in events with id's) and block/unblock accordingly.
 * **Canonical event naming** - For local/shared pairs, use `*_secret` / `*_shared` names (`peer_secret`/`peer_shared`, `invite_secret` + invite shared events, `key_secret`/`key_shared`). Avoid ad-hoc aliases.
+* **Terminology migration** - The design now uses `account` for the workspace-scoped app principal and `endpoint` for the daemon-scoped transport principal. The current wire/schema event name remains `peer_shared` for compatibility, but conceptually it is today's `account_shared`.
 * **Project-to-own-table rule** - Event projectors write to their own event table. They may read dependency-event tables as projection context, but cross-event side effects must flow through emitted events (or explicit runtime intents), not direct ad-hoc writes into other event tables. (Operational non-event tables, such as bootstrap trust bridges, are separate.)
 * **Realistic testing** - We can run realistic tests locally with deterministic simulation of the event pipeline. Tests can check that for all relevant scenarios, reverse or adversarial reorderings of events and duplicated event replays all will yield the same state.
 
@@ -64,7 +65,7 @@ This PoC exists to prove the practicality of a principled approach that uses [ev
 The design goal is to keep protocol behavior auditable while still supporting real-time chat behavior and agent-friendly automation:
 
 1. canonical data stays event-sourced and replayable,
-2. transport and sync are real (QUIC + mTLS), not simulator paths,
+2. transport and sync are real (daemon-scoped `iroh` QUIC), not simulator paths,
 3. projection logic is deterministic and convergent,
 4. CLI workflows remain synchronous enough for imperative command chains.
 
@@ -99,7 +100,7 @@ Transport security is a consumer of the auth event graph, not a bootstrap substi
 3. `peer_shared` projection and deterministic `transport_fingerprint` materialization,
 4. bootstrap trust rows (`invite_bootstrap_trust`, `pending_invite_bootstrap_trust`) as projection-owned state.
 
-Only after those exist should strict QUIC+mTLS transport auth be added. Do not introduce placeholder manual pinning, file allowlists, or test-only trust seeding as a temporary transport authority. If the identity chain and projected trust graph are not present yet, transport hardening is not ready to start.
+Only after those exist should strict daemon transport auth be added. Do not introduce placeholder manual pinning, file allowlists, or test-only trust seeding as a temporary transport authority. If the identity chain and projected trust graph are not present yet, transport hardening is not ready to start.
 
 ### Device Linking Uses The Same Story
 
@@ -107,19 +108,30 @@ Linking a second device follows the invite pattern with `peer_invite_shared` and
 
 ### Peer Discovery Provides Candidates, Not Authority
 
-Local networking uses mDNS/DNS-SD to discover candidate endpoints per tenant. Those advertisements are treated as unauthenticated hints. They can influence "who to try dialing" but never "who is trusted." Actual authority remains event-sourced and projection-backed: after QUIC+mTLS handshake identifies the remote transport identity, tenant trust checks decide whether the session is allowed to proceed. We rely on a `public-addr` CLI parameter to discover remote peers; in production we expect always-on cloud or non-NAT nodes to be the discoverable peers.
+Local networking uses daemon-scoped `iroh` mDNS to discover candidate endpoints. Those advertisements are treated as unauthenticated hints. They can influence "who to try dialing" but never "who is trusted." Actual authority remains event-sourced and projection-backed: after the daemon handshake identifies the remote transport identity, tenant trust checks decide whether the session is allowed to proceed. We rely on invite/bootstrap addresses, optional local mDNS discovery, and `iroh`'s relay-backed rendezvous/path management rather than a custom intro protocol.
 
 For simplicity, discovery is allowed to remain narrower than steady-state direct trust during bootstrap. In particular, a bootstrap-mode node may only have connectivity to the inviter (or whatever peer supplied the invite bootstrap transport identity) until steady-state transport fingerprints converge through sync; this is an acceptable tradeoff if it keeps transport targeting and authorization strictly fingerprint-based rather than introducing broader workspace-wide admission.
 
 ### Connection Establishment And Endpoint Behavior
 
-Transport runs over QUIC with mTLS, while canonical event authenticity comes from event signatures and dependency validation. We intentionally force cloud-style multitenancy into the core runtime model: one daemon, one UDP port, many local tenants, each with its own workspace binding and trust state. That same mechanism is what enables a Slack/Discord-like local client to host many accounts/workspaces without spinning up one endpoint per account.
+Transport runs over daemon-scoped `iroh` QUIC, while canonical event authenticity comes from event signatures and dependency validation. We intentionally force cloud-style multitenancy into the core runtime model: one daemon, one UDP port, many local tenants, each with its own workspace binding and trust state. That same mechanism is what enables a Slack/Discord-like local client to host many accounts/workspaces without spinning up one endpoint per account.
 
-At daemon startup, local tenants are still discovered from event-projected identity/trust state plus replay-derived tenant session-auth state, but the live QUIC endpoint is now daemon-scoped. The runtime ensures one persistent daemon cert/key in `daemon_transport_identity`, builds one shared endpoint from that identity, and disables sensitive SNI on the wire. Quinn still requires a `server_name` parameter for dials, so the runtime uses one fixed cover name rather than embedding tenant or peer identity in handshake metadata.
+At daemon startup, local tenants are still discovered from event-projected identity/trust state plus replay-derived tenant session-auth state, but the live QUIC endpoint is now daemon-scoped. The runtime ensures one local `endpoint_secret` root event under `recorded_by = endpoint_id`, replays that `iroh::SecretKey`, and builds one shared `iroh::Endpoint` from it. This endpoint root may exist before any workspace is created or any invite is accepted. Outbound dials use daemon `EndpointId` plus explicit/bootstrap/observed addresses; no tenant or workspace identity appears in handshake metadata.
 
 Invite creation follows the daemon-scoped rule. If a user or device-link invite does not override `public_spki`, the invite link embeds the daemon transport fingerprint, not the tenant's current local peer/device fingerprint. Bootstrap targeting is therefore "dial daemon D and redeem invite I", not "dial exact tenant session-auth identity T".
 
-Handshake verification is split into two layers. First, rustls checks that the presented remote daemon certificate fingerprint is currently authorized by projected trust rows at node scope. Then, after the encrypted channel exists, each logical session starts with an `OpenSessionAuth*` control frame. Steady-state sessions use a `peer_shared` signature over `(source_peer_id, target_tenant_id, signer_event_id, local_daemon_peer_id, remote_daemon_peer_id, expires_at_ms)`, while bootstrap sessions use the invite key over `(source_peer_id, source_peer_public_key, target_invite_event_id, local_daemon_peer_id, remote_daemon_peer_id, expires_at_ms)`. The accept boundary rejects before any sync work starts unless that encrypted session-auth frame resolves to exactly one authorized tenant.
+Handshake verification is split into two layers, but only one of them is currently authoritative. First, `iroh` authenticates the remote daemon `EndpointId` and establishes the encrypted daemon connection. We do not currently require a pre-handshake secret gate. Instead, the connection is quarantined until the first logical session proves either an admitted `OpenSessionRoute { source_peer_id, target_tenant_id }` or a valid `OpenSessionAuthInvite`. If that proof does not arrive quickly, or it resolves to anything other than one exact authorized tenant/workspace scope, the daemon connection is closed before any sync work starts.
+
+The stricter target for the next auth cleanup is narrower than the current transitional runtime:
+
+1. `endpoint_secret` stays the replay root for the daemon-scoped `iroh` endpoint and may exist before any workspace.
+2. `endpoint_shared` is now a self-signed shared event in endpoint scope (`recorded_by = endpoint_id`), published from that replay root and identifying the daemon transport principal by its public `EndpointId`.
+3. `invite_accepted` is the local accepted-workspace binding that breaks the bootstrap cycle.
+4. Unknown endpoints must not be admitted because of any node-global bootstrap window or because some unrelated peer is still unbound.
+5. Instead, bootstrap admission should accept only one exact proof scope: `(invite, local account/workspace, remote account, actual remote endpoint)`.
+6. Steady-state sessions are already `OpenSessionRoute` only. Bootstrap or new-workspace admission uses `OpenSessionAuthInvite` until `account` events (currently `peer_shared`) depend on `endpoint_shared` directly.
+
+This target is captured in the focused TLA safety model [`EndpointBootstrapRoute.tla`](./tla/EndpointBootstrapRoute.tla). That model checks the exact bootstrap and route safety properties before we remove the current bridge code.
 
 This also covers the hard case where multiple local identities on the same endpoint belong to the same workspace. One daemon-to-daemon QUIC connection can carry multiple tenant/workspace sessions over time, and tenant trust sets may overlap in value, but session admission remains tenant-scoped because each logical session names the exact tenant/workspace scope to bind. Range sync and dependency repair are separate session classes on that shared daemon connection, so recent-history control traffic can stay responsive without paying for a second QUIC congestion controller to the same daemon.
 
@@ -127,7 +139,7 @@ This also covers the hard case where multiple local identities on the same endpo
 
 We considered an alternative where there are no daemon-to-daemon logical sessions and every control message is individually signed and verified before being acted on, with ingest routing by signer/workspace mapping.
 
-The attraction is real: connection sharing becomes simpler, and there is less explicit session-open state. But for the active negentropy/dependency design it is not actually stateless. We still need round correlation, replay protection, response matching, and prioritized control/data handling. Putting asymmetric verification on every control message would move more crypto onto the hot path while still leaving per-round state in the sync engine. The current design therefore keeps one daemon-scoped QUIC connection and uses signed session-open once per logical session instead of once per control message.
+The attraction is real: connection sharing becomes simpler, and there is less explicit session-open state. But for the active negentropy/dependency design it is not actually stateless. We still need round correlation, replay protection, response matching, and prioritized control/data handling. Putting asymmetric verification on every control message would move more crypto onto the hot path while still leaving per-round state in the sync engine. The current design therefore keeps one daemon-scoped QUIC connection and uses one routed session-open per logical session, with signatures only when bootstrap or new-scope admission is required.
 
 ### Sync And Convergence
 
@@ -390,7 +402,7 @@ Deterministic emitted-event exception:
 2. those types omit `signed_by`, `signer_type`, and `signature` by schema,
 3. they are validated by deterministic-derivation checks instead of signature checks.
 
-No per-event transit wrapper is used; transit encryption is handled by QUIC/mTLS.
+No per-event transit wrapper is used; transit encryption is handled by the daemon-scoped QUIC transport.
 
 ## 1.4 Sync frame header (`payload_len`) rationale
 
@@ -409,7 +421,7 @@ Safety rule:
 
 ## 1.5 Sync session classes and stream separation
 
-One authenticated QUIC connection can host two sync session classes:
+One authenticated daemon connection can host two sync session classes:
 
 1. `Range` sessions for bulk catchup,
 2. `Dependency` sessions for targeted blocker repair.
@@ -431,19 +443,19 @@ Current shape:
 
 # 2. Transport and Session Identity
 
-Transport identity is derived from event-layer peer identity:
+Transport identity is split from event-layer peer identity:
 
-1. **Transport identity** (mTLS scope): daemon-scoped cert/key material in `daemon_transport_identity`, plus replay-derived tenant session-auth creds/fingerprints in `local_transport_creds` / `local_transport_targets`. Both use SPKI-derived `peer_id` fingerprints, but only the daemon cert terminates QUIC handshakes.
+1. **Transport identity** (daemon transport scope): daemon-scoped `iroh::SecretKey` material replayed from the local `endpoint_secret` event, plus replay-derived tenant session-routing/auth state in `local_transport_creds` / `local_transport_targets`. Both use SPKI-derived `peer_id` fingerprints, but only the daemon endpoint identity authenticates daemon-to-daemon QUIC connections.
 2. **Event-graph identity** (identity layer scope): Ed25519 keys, signer chains, accepted workspace bindings (`invites_accepted`), and identity events (types 8-22). Owned by event modules (for example `src/event_modules/workspace/*`, `src/event_modules/invite_accepted.rs`, `src/event_modules/peer_shared/*`, `src/event_modules/peer_secret.rs`) and executed through the generic projection pipeline (`src/state/projection/apply/*`).
 
-Tenant-scoped peer/device fingerprints remain deterministically derived from PeerShared Ed25519 signing keys via `spki_fingerprint_from_ed25519_pubkey()`. Legacy schema/table names still say `transport_fingerprint` / `local_transport_*`, but in the current design those rows are session-auth peer identity state, not the live QUIC handshake identity. The QUIC daemon cert is separate, random self-signed node identity used only for daemon-to-daemon channel authentication.
+Tenant-scoped peer/device fingerprints remain deterministically derived from PeerShared Ed25519 signing keys via `spki_fingerprint_from_ed25519_pubkey()`. Legacy schema/table names still say `transport_fingerprint` / `local_transport_*`, but in the current design those rows are tenant session-routing/auth identity state, not the live daemon handshake identity. The live transport identity is a daemon-scoped `iroh` endpoint id replayed from `endpoint_secret`; the stored self-signed cert remains compatibility state, not tenant identity on the wire.
 
-## 2.1 QUIC + mTLS
+## 2.1 Iroh + QUIC
 
-All peer transport uses QUIC with daemon-scoped mTLS plus tenant-scoped encrypted session auth, both driven by projected trust rows.
+All peer transport uses one daemon-scoped `iroh` endpoint plus tenant-scoped routed sessions, both driven by projected trust rows.
 
 Rules:
-1. each daemon profile has persistent daemon cert/private key material,
+1. each daemon profile has persistent daemon transport identity material replayed from `endpoint_secret`,
 2. peer allow/deny policy is based on SQL trust state:
    - PeerShared-derived transport fingerprints from projected `peers_shared.transport_fingerprint` rows (deterministically computed from PeerShared public key at projection time),
    - `invite_bootstrap_trust` rows produced by projection from `InviteAccepted` events + local `bootstrap_context`,
@@ -455,9 +467,9 @@ Rules:
 
 Transport peer identity is split:
 
-1. `daemon_peer_id = hex(BLAKE2b-256(daemon_cert_SPKI))`,
+1. `daemon_peer_id = endpoint_id = hex(iroh_secret.public())`, where `iroh_secret` comes from the local `endpoint_secret` event and that event is scoped under `recorded_by = endpoint_id`,
 2. `peer_shared` projection materializes `peers_shared.transport_fingerprint` as the deterministic tenant/peer transport fingerprint and indexes `(recorded_by, transport_fingerprint)`,
-3. the `peer_transport_bindings` table is observation telemetry keyed by `(recorded_by, peer_id)`, where `recorded_by` is the local tenant key and `peer_id` is the remote tenant/peer transport fingerprint; `spki_fingerprint` stores the remote daemon fingerprint observed on the authenticated QUIC channel,
+3. the `peer_transport_bindings` table is observation telemetry keyed by `(recorded_by, peer_id)`, where `recorded_by` is the local tenant key and `peer_id` is the remote tenant/peer transport fingerprint; `spki_fingerprint` stores the remote daemon fingerprint observed on the authenticated daemon channel,
 4. `invite_bootstrap_trust` stores accepted invite-link bootstrap tuples
    (`bootstrap_addr`, daemon SPKI) used before steady-state peer bindings appear,
 5. `pending_invite_bootstrap_trust` stores inviter-side expected invitee SPKI
@@ -478,6 +490,13 @@ Why this is SQL-first:
 Conceptually:
 `TrustedPeerSet = PeerShared_SPKIs ∪ invite_bootstrap_trust ∪ pending_invite_bootstrap_trust`.
 
+This union is still the current transitional implementation. The stricter target is different:
+
+- bootstrap proof is a narrow connection-scoped admission path, not a broad node-wide trust source,
+- `endpoint_shared` becomes the steady-state transport authority in the auth graph,
+- route admission depends on exact `(remote account, remote endpoint)` graph state,
+- eventual convergence comes from retries after projection catches up, not permissive trust widening.
+
 ### Transport identity materialization boundary
 
 Transport cert/key materialization is isolated behind a typed contract:
@@ -488,7 +507,7 @@ Transport cert/key materialization is isolated behind a typed contract:
 - **Event modules** emit `ApplyTransportIdentityIntent` commands (e.g., `peer_secret` projector for PeerShared signers).
 - **Projection pipeline** (`write_exec.rs`) routes intents through the adapter.
 - **Downgrade guard**: bootstrap install is rejected once a PeerShared-derived identity has been installed (`BootstrapAfterPeerSharedDenied`), enforcing one-way transition.
-- **Credential source tracking**: `local_transport_creds.source` records `random | bootstrap | peershared` for tenant identity/trust diagnostics, while the live daemon QUIC identity is stored separately in `daemon_transport_identity`.
+- **Credential source tracking**: `local_transport_creds.source` records `random | bootstrap | peershared` for tenant identity/trust diagnostics, while the live daemon QUIC identity is stored separately in the projected `endpoint_secrets` table.
 - **Boundary enforcement**: layered controls enforce this boundary:
   1. typed intent contract (`TransportIdentityIntent`),
   2. single adapter implementation (`ConcreteTransportIdentityAdapter`),
@@ -519,15 +538,14 @@ Content events (Message, Reaction, MessageDeletion) declare `author_id` as a dep
 Direct peer-to-peer connectivity through NAT is a transport optimization, not a canonical protocol concern.
 
 Principles:
-1. Hole punch is opportunistic — sync via normal-operation set reconciliation and an intermediary peer is always the fallback.
-2. Introduction data (endpoint observations, IntroOffers) is runtime protocol state, not canonical events.
-3. The introducer role is a behavior of any peer that has active connections to multiple other peers — it is not a special node type.
-4. Punch success depends on NAT behavior (EIM = endpoint-independent mapping). Symmetric/port-dependent NATs will not work with the current approach.
+1. NAT traversal and rendezvous are transport concerns owned by `iroh`, not by a bespoke Topo protocol.
+2. Runtime observations (endpoint observations, peer→daemon bindings) are local orchestration state, not canonical events.
+3. Direct-connect success is opportunistic. Relay-backed connectivity and ordinary set reconciliation are always valid fallbacks.
+4. The runtime may still record observed addresses and daemon bindings for reconnect efficiency, but it does not run an explicit introduction API or maintain a parallel punch protocol.
 
 ### Endpoint observations
 
-When a peer accepts or establishes a QUIC connection, it records the remote peer's observed `(ip, port)` in the `peer_endpoint_observations` table with a TTL.
-After a successful hole-punched connection, it also records the punched peer's observed endpoint so that peer can be introduced to others later.
+When a peer accepts or establishes a daemon connection, it records the remote peer's observed `(ip, port)` in the `peer_endpoint_observations` table with a TTL. Those rows are reconnect hints and observability data only; they do not authorize trust.
 
 Rules:
 1. Observations are append-only with `INSERT OR IGNORE`.
@@ -535,67 +553,37 @@ Rules:
 3. Observations expire via `expires_at` and are periodically purged.
 4. Observations are scoped by `recorded_by` (the observer) and `via_peer_id` (the observed peer).
 
-### Introduction protocol
+### Relay-backed connectivity
 
-An introducer sends `IntroOffer` messages to two peers so they can attempt a direct connection:
+The daemon runtime relies on `iroh` for:
 
-1. The introducer looks up the freshest non-expired endpoint observation for each peer.
-2. It sends each peer an `IntroOffer` containing the other peer's `(peer_id, ip, port, observed_at, expires_at, attempt_window_ms)`.
-3. IntroOffers are sent on uni-directional QUIC streams (not bi-directional sync streams).
-4. IntroOffers are 88 bytes fixed-size and contain a 16-byte random `intro_id` for deduplication.
+1. relay registration and relay-assisted rendezvous,
+2. hole-punch timing and NAT traversal when relays are available,
+3. direct-path upgrade and path maintenance after the daemon connection exists,
+4. stream multiplexing for range/dependency/control work on the shared daemon connection.
 
-Receiver validation:
-1. Expired offers are dropped and recorded as `expired`.
-2. Offers for peers outside the current projected authorized-fingerprint set are rejected.
-3. Duplicate `intro_id` values are silently skipped per `(recorded_by, intro_id)`.
-4. `intro_attempts` rows currently have no TTL purge; dedupe horizon is DB-retention lifetime in this POC.
+There is no longer a `topo intro` command or `IntroOffer` wire frame in the target runtime. If two peers can reach each other only through a relay, sync still proceeds on the same daemon-scoped `iroh` connection surface; if a direct path becomes possible later, `iroh` upgrades the connection itself.
 
-### Hole punch dial protocol
+### Transport-owned port mapping
 
-After receiving a valid IntroOffer, the peer attempts paced QUIC connections to the introduced peer's observed address:
-
-1. Dial attempts are paced at 200ms intervals within the `attempt_window_ms` (default 4s). The 200ms pace is the current implementation default and can be promoted to a tuning knob if field data requires it.
-2. Each attempt uses `endpoint.connect()` on the same QUIC endpoint (sharing the UDP socket and local port).
-3. On successful connection, the peer verifies the remote peer's identity matches the expected `other_peer_id`.
-4. On identity match, a normal sync connection run starts on the punched connection.
-5. The attempt lifecycle is recorded in `intro_attempts` with status transitions: `received → dialing → connected | failed | expired | rejected`.
-
-NAT traversal relies on simultaneous open: both peers dial each other at roughly the same time, creating outgoing NAT mappings that allow the other's packets through.
-
-Timing uses local monotonic timers for pacing and local wall-clock checks for offer expiry. The protocol does not require GPS-grade or globally synchronized clocks; skew mainly affects whether a borderline-stale offer is attempted vs dropped.
-
-### Explicit intro API
-
-Introductions are explicit and one-shot:
-
-1. An operator (or external job) calls `topo intro --peer-a <fpA> --peer-b <fpB>`.
-2. The command looks up freshest non-expired endpoint observations for both peers.
-3. It sends IntroOffers to both peers on the same QUIC endpoint socket.
-4. The daemon does not run background peer-pair selection or automatic intro scheduling
-
-Selection logic ("who to intro, when to retry") is intentionally out of scope for the proof-of-concept; application developers can tailor solutions to their needs.
-
-### UPnP port mapping (operator-invoked)
-
-UPnP/IGD mapping is an optional transport reachability aid, separate from canonical protocol state.
+Best-effort port mapping is now transport-owned through `iroh`'s portmapper, not a bespoke `topo upnp` control surface.
 
 Rules:
-1. mapping is invoked explicitly via `topo upnp` (daemon RPC `Upnp`) using the daemon's actual bound QUIC listen address.
-2. result is a structured status report: `success | failed | not_attempted` with mapped external port/IP and optional gateway/error fields.
-3. loopback-bound listeners produce `not_attempted`; routable mapping requires non-loopback bind (`0.0.0.0` or explicit LAN IP).
-4. if mapping succeeds but the external IP is not publicly routable, runtime flags `double_nat = true` and warns.
-5. UPnP outcome is informational runtime metadata (`NodeRuntimeNetInfo.upnp`) and does not modify trust/projection/signature semantics.
+1. mapping is opportunistic transport runtime behavior, not canonical protocol state,
+2. explicit bootstrap addresses remain valid even when mapping fails or is unavailable,
+3. mapping outcome must never modify trust/projection/signature semantics.
 
 ### Testing
 
 Test the feature with both local integration tests and Linux netns NAT simulation:
 
-1. `cargo test --test holepunch_test`
-2. `cargo test test_record_endpoint_observation`
-3. `cargo build --release`
-4. `sudo tests/netns_nat_test.sh --cone` (expected pass)
-5. `sudo tests/netns_nat_test.sh --symmetric` (expected fail)
-6. `sudo tests/netns_nat_test.sh --cleanup`
+1. `cargo test --test cli_test -- --test-threads=1`
+2. `cargo test --test cli_observability_test test_parallel_device_links_converge -- --test-threads=1`
+3. `cargo test test_record_endpoint_observation`
+4. `cargo build --release`
+5. `sudo tests/netns_nat_test.sh --cone` (expected pass)
+6. `sudo tests/netns_nat_test.sh --symmetric` (expected pass via relay fallback)
+7. `sudo tests/netns_nat_test.sh --cleanup`
 
 Netns runbook notes:
 1. The script creates five namespaces (`hp_i`, `hp_na`, `hp_nb`, `hp_a`, `hp_b`) and a public bridge.
@@ -746,32 +734,31 @@ Why this state is part of discovery:
 The node daemon (`run_node`) operates as follows:
 
 1. Discover all local tenants from the DB.
-2. Ensure one persistent daemon transport identity and create a **single** QUIC endpoint from that daemon cert.
+2. Ensure one persistent daemon transport identity and create a **single** `iroh::Endpoint` from that daemon key.
 3. Run one accept loop over that shared endpoint; each accepted daemon connection claims or reuses one daemon-scoped live slot keyed by remote daemon id.
-4. Each live daemon connection runs one inbound session supervisor that accepts logical sessions, reads per-session `OpenSessionAuth*`, resolves the tenant from local SQL state, and lets only that tenant authorize the authenticated remote peer.
-5. Tenant work does not own the raw QUIC connection. Outbound range/dependency work reuses the live daemon connection for that remote daemon and opens authenticated logical sessions inside it.
-6. Optionally: per-tenant mDNS advertisement and peer discovery.
+4. Each live daemon connection runs one inbound session supervisor that accepts logical sessions, reads `OpenSessionRoute` or bootstrap/fallback proof, resolves the tenant from local SQL state, and lets only that tenant authorize the authenticated remote peer.
+5. Tenant work does not own the raw QUIC connection. Outbound range/dependency work reuses the live daemon connection for that remote daemon and opens routed logical sessions inside it; bootstrap/new-workspace admission pays the signed proof only when extending scope.
+6. Optional local discovery is daemon-scoped `iroh` mDNS. `topo discover` subscribes to that stream. The current branch also accepts n0 relays for wide-area rendezvous and hole-punch timing instead of running a custom intro protocol.
 
 ### Single-port multi-tenant endpoint
 
-All tenants on a device share a single UDP port and one daemon cert. Outbound dials use a fixed cover name and disable sensitive SNI on the wire. Tenant routing is no longer a TLS handshake concern; it happens in the first control frame of each logical session. Same-workspace sibling tenants and reused bootstrap/device-link sessions should therefore share the same daemon connection whenever they are talking to the same remote daemon.
+All tenants on a device share a single UDP port and one daemon endpoint id. Outbound dials use explicit/bootstrap/observed addresses, local `iroh` mDNS lookup, and relay-backed `iroh` connectivity. Tenant routing is no longer a handshake concern; it happens in the first control frame of each logical session. Same-workspace sibling tenants and reused bootstrap/device-link sessions should therefore share the same daemon connection whenever they are talking to the same remote daemon.
 
 ### Per-tenant dynamic trust
 
-The single QUIC endpoint uses a node-scoped union trust closure that accepts a handshake only if **some** local tenant currently authorizes the remote daemon fingerprint. Post-handshake, each logical session begins with one encrypted session-auth frame that resolves the target tenant. That tenant must be unique, and only that tenant's `is_authorized_for_tenant` result may admit the session. The trust closure queries three trust sources for each tenant's `recorded_by`:
-- **PeerShared-derived transport fingerprints** (primary steady-state; from projected `peers_shared.transport_fingerprint`),
-- `invite_bootstrap_trust` rows (accepted invite-link bootstrap, TTL-bounded),
-- `pending_invite_bootstrap_trust` rows (inviter-side pre-handshake, TTL-bounded).
+The single daemon endpoint no longer uses a pre-handshake tenant trust gate. Any remote daemon that speaks the `iroh/topo` ALPN can complete the daemon handshake, but the connection is not admitted for application work until the first logical session proves one exact tenant/workspace scope. That proof is either:
+- `OpenSessionRoute`, which is accepted only if local projected state already binds `(tenant_id, remote_account_id)` to the actual connected daemon, or
+- `OpenSessionAuthInvite`, which is accepted only if the invite proof validates and the projected bootstrap trust rows resolve to exactly one tenant for the actual connected daemon.
 
-Trust checks are **tenant-scoped** (`recorded_by`-partitioned). Value-level trust-set overlap is allowed on the remote side (the same remote peer or daemon SPKI may appear in multiple tenants' trust rows), but session admission still requires one unique tenant binding from the encrypted auth frame. Another tenant's trust must never satisfy that frame. `invites_accepted` is read during startup tenant discovery, while raw daemon connection admission uses node-scoped daemon trust first and per-session authorization uses `is_authorized_for_tenant` over PeerShared/bootstrap trust tables second.
+Trust checks remain **tenant-scoped** (`recorded_by`-partitioned). Value-level trust-set overlap is allowed on the remote side, but session admission still requires one unique tenant binding from the routed/bootstrap preface. Another tenant's trust must never satisfy that frame. This remains transitional until endpoint identity is first-class event-graph state; the current branch removes the permissive handshake shortcuts first and keeps bootstrap proof as the only way an unknown daemon can become useful.
 
-`local_transport_targets` is not a new authority source. It remains replay-derived tenant identity state for projected trust, discovery, and bootstrap lineage: local event projection emits transport identity intents, the transport adapter materializes tenant session-auth cert/key bytes, and that successful apply updates the tenant's current peer/device fingerprint. Replaying local event state rebuilds both `local_transport_creds` and `local_transport_targets`, but the live QUIC endpoint uses `daemon_transport_identity` rather than those tenant rows.
+`local_transport_targets` is not a new authority source. It remains replay-derived tenant identity state for projected trust, discovery, and bootstrap lineage: local event projection emits transport identity intents, the transport adapter materializes tenant session-auth identity state, and that successful apply updates the tenant's current peer/device fingerprint. Replaying local event state rebuilds both `local_transport_creds` and `local_transport_targets`, but the live daemon endpoint uses `endpoint_secret` rather than those tenant rows.
 
 Discovery-only invite acceptance may still persist an empty `bootstrap_addr` marker row so the bootstrap SPKI remains available in projected state. That row is a projection marker only; it must never create an autodial target or be treated like a concrete bootstrap endpoint.
 
 ### User removal is out of scope
 
-This PoC does not implement `PeerRemoved`, `UserRemoved`, or a `ban` command. Safe user/device removal requires coordinated group key agreement plus key rotation so future ciphertext is no longer available to the removed member. We intentionally defer that work here and keep transport trust/session logic limited to invite/bootstrap trust and steady-state `PeerShared` trust.
+This PoC does not implement `PeerRemoved`, `UserRemoved`, or a `ban` command. Safe user/device removal requires coordinated group key agreement plus key rotation so future ciphertext is no longer available to the removed member. When removal is added back, it must revoke any admitted `(tenant_id, remote_peer_id)` routes on live daemon connections and close the daemon connection entirely if no tenant scopes remain; we must not rely on ingest rejection alone. We intentionally defer that work here and keep transport trust/session logic limited to invite/bootstrap trust and steady-state `PeerShared` trust.
 
 ### Receive logs and immediate ingest
 
@@ -798,32 +785,28 @@ the same canonical/projector pipeline after the durable handoff point.
 
 ### Session-auth credential storage
 
-Tenant peer/device cert/key **DER** (ASN.1 Distinguished Encoding Rules) blobs live exclusively in the legacy-named `local_transport_creds` SQLite table (with `source` marker: `random | bootstrap | peershared`). No cert files exist on disk. These rows are stored during identity bootstrap as tenant session-auth identity state; they do not create the shared QUIC endpoint. The live endpoint is built from `daemon_transport_identity`, while `local_transport_creds` and `local_transport_targets` track which peer/device fingerprint a tenant can authenticate as when opening `OpenSessionAuth*`. Bootstrap identity install is one-way gated: after a PeerShared install, bootstrap install is denied. This keeps all node state in one database file.
+Tenant peer/device cert/key **DER** (ASN.1 Distinguished Encoding Rules) blobs live exclusively in the legacy-named `local_transport_creds` SQLite table (with `source` marker: `random | bootstrap | peershared`). No cert files exist on disk. These rows are stored during identity bootstrap as tenant session-routing/auth identity state; they do not create the shared daemon endpoint. The live endpoint is built from replayed `endpoint_secret`, while `local_transport_creds` and `local_transport_targets` track which peer/device fingerprint a tenant can route as when opening steady-state `OpenSessionRoute` sessions or bootstrap `OpenSessionAuth*` sessions. Bootstrap identity install is one-way gated: after a PeerShared install, bootstrap install is denied. This keeps all node state in one database file.
 
-## 3.2.2 LAN peer discovery (mDNS/DNS-SD)
+## 3.2.2 LAN peer discovery (`iroh` mDNS)
 
-Multi-tenant nodes advertise each tenant on the local network under the `_topo._udp.local.` service type. Each tenant registers a separate mDNS service instance with its actual bound port and full transport `peer_id` (SPKI-derived fingerprint) in a TXT property.
+Local discovery now uses `iroh`'s daemon-scoped mDNS lookup. One daemon advertises one daemon endpoint id plus its current reachable socket addresses on the local network, and `topo discover` subscribes to the same `iroh` mDNS stream the runtime uses for discovery hints.
 
 Discovery rules:
-1. **Self-filtering**: the browser receives the full set of local tenant peer/device IDs and filters them out, preventing unnecessary local connections.
-2. **Trust gating**: discovered peers are only dialed if they pass the tenant's dynamic trust check.
-3. **Address churn**: when a previously-discovered peer re-advertises at a different address, the old `connect_loop` is cancelled via a `watch` channel and a new one is spawned.
+1. **Self-filtering**: the browser filters out the local daemon endpoint id, preventing unnecessary self-connects.
+2. **Trust gating**: discovered daemons are candidate addresses only; actual admission still requires daemon auth plus tenant-scoped routed/bootstrap session checks.
+3. **Address churn**: when a previously-discovered daemon re-advertises at a different address, `iroh` updates the candidate address set and the runtime reuses the same daemon-scoped live slot keyed by remote daemon id.
+4. **Current branch uses n0 relays for rendezvous**: local discovery still works without them, but the direct-connect timing/hole-punch job is delegated to `iroh` relay-backed transport rather than a custom intro protocol.
 
 mDNS authenticity model (POC):
-1. mDNS advertisements are treated as unauthenticated discovery hints (address + claimed peer_id),
-2. an attacker can spoof mDNS TXT records and cause extra dial attempts,
-3. spoofed advertisements cannot bypass identity/auth: session acceptance still requires mTLS identity and tenant-scoped `is_authorized_for_tenant` trust checks,
-4. authoritative peer identity for the session is the TLS/SPKI-derived peer fingerprint observed at handshake, not the mDNS TXT claim.
+1. mDNS advertisements are treated as unauthenticated discovery hints (address + claimed daemon endpoint id),
+2. an attacker can spoof mDNS data and cause extra dial attempts,
+3. spoofed advertisements cannot bypass identity/auth: session acceptance still requires authenticated daemon identity and tenant-scoped `is_authorized_for_tenant` + route checks,
+4. authoritative identity for the session is the authenticated remote daemon id observed at handshake, not the mDNS advertisement claim.
 
 Out-of-scope note (current POC):
 1. there is still no transport/session-level intra-daemon peering path for two local tenants in the same workspace,
-2. because self-filtering excludes local peer IDs, local tenants do not discover/connect to each other through mDNS,
-3. same-workspace tenants that share one DB instead converge through projection-layer replay/fanout of shared canonical events,
-4. adding explicit intra-instance transport delivery may still be desirable future work, but it is not required for the current design baseline.
-
-DNS label constraint: peer IDs (64 hex chars) are truncated to 59 chars in the mDNS instance name (62 total with `p7-` prefix, under the 63-byte DNS label limit). The full peer ID is always in the TXT property for exact matching.
-
-Same-host daemon discovery: when two daemons run on the same machine bound to `127.0.0.1`, they advertise a routable (non-loopback) IP via mDNS because multicast DNS does not discover services advertised on loopback addresses. The browse side compensates with `normalize_discovered_addr_for_local_bind`, which rewrites discovered non-loopback addresses back to loopback when the local daemon is bound to loopback. The advertise IP is always provided explicitly by the caller (`run_node`); discovery internals perform no implicit address inference.
+2. same-workspace tenants that share one DB instead converge through projection-layer replay/fanout of shared canonical events,
+3. adding explicit intra-instance transport delivery may still be desirable future work, but it is not required for the current design baseline.
 
 ## 3.2.3 Peering runtime loop model
 
@@ -832,23 +815,24 @@ Runtime flow reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) sections `1` 
 The production peering runtime follows a single conceptual loop:
 
 1. **Projected SQLite state**: invite_bootstrap_trust rows, PeerShared-derived trust, endpoint observations.
-2. **Target planner** (`runtime::peering::engine::target_planner`): single-owner module for all dial target planning. Bootstrap trust rows now surface the authenticated bootstrap transport fingerprint, so bootstrap, observed endpoints, and mDNS discovery all collapse onto one exact transport-target dispatch key per `(tenant_id, target_transport_fingerprint)`.
+2. **Target planner** (`runtime::peering::engine::target_planner`): single-owner module for all dial target planning. Bootstrap trust rows now surface the authenticated bootstrap transport fingerprint, so bootstrap, observed endpoints, and `iroh` mDNS discovery all collapse onto one exact transport-target dispatch key per `(tenant_id, target_transport_fingerprint)`. Relay-backed `iroh` connectivity sits under that planner; there is no separate intro path.
 3. **Supervisor layer**: startup preflight + loop orchestration live in the peering supervisor. Connectivity inputs are hints to `ensure_connected(peer)`, not independent long-lived owners.
-4. **Dial/accept loops**: `connect_loop` (outbound tenant work) and `accept_loop` (raw inbound daemon connections) are separate long-running loops coordinated by shared projected state and cancellation/watch channels. QUIC dial/accept + daemon identity extraction flows through `transport::connection_lifecycle`, and stream wiring flows through `transport::session_factory`.
-5. **Live daemon slot**: after mTLS identity extraction, the runtime claims at most one local live daemon connection slot per `(db_path, remote_daemon_peer_id)`. Duplicates are closed instead of starting overlapping sync ownership. If both directions appear, the deterministic preferred direction is the lexicographically lower daemon id dialing outbound and the higher daemon id retaining inbound; a preferred-direction connection replaces a non-preferred one.
-6. **Logical session auth and runners**: tenant work reuses the live daemon connection and opens logical range/dependency sessions. Each session begins with `OpenSessionAuth*`, then runs through `SyncConnectionHandler` or the dependency fast path.
+4. **Dial/accept loops**: `connect_loop` (outbound tenant work) and `accept_loop` (raw inbound daemon connections) are separate long-running loops coordinated by shared projected state and cancellation/watch channels. `iroh` dial/accept + daemon identity extraction flows through `transport::connection_lifecycle`, and stream wiring flows through `transport::session_factory`.
+5. **Live daemon slot**: after daemon identity extraction, the runtime claims at most one local live daemon connection slot per `(db_path, remote_daemon_peer_id)`. Duplicates are closed instead of starting overlapping sync ownership. If both directions appear, the deterministic preferred direction is the lexicographically lower daemon id dialing outbound and the higher daemon id retaining inbound; a preferred-direction connection replaces a non-preferred one.
+6. **Logical session auth and runners**: tenant work reuses the live daemon connection and opens logical range/dependency sessions. Steady-state sessions begin with `OpenSessionRoute`; bootstrap or new-workspace sessions use `OpenSessionAuthInvite`, then run through `SyncConnectionHandler` or the dependency fast path.
+
+Known drawback: because there is no pre-handshake secret gate today, anyone who learns the daemon's `iroh` address or relay-reachable endpoint can touch the unauthenticated `iroh/topo` surface. They still cannot authenticate into a workspace without a valid route or invite proof, but they can force the first-session timeout path and probe for bugs in `iroh` itself or in our own session/bootstrap parsing and admission logic. This is an intentional simplicity tradeoff in the current design, not a claim that the exposed pre-proof surface is zero.
 7. **Ingest boundary**: range sessions write `ReceiveLog` files and dependency sessions call `ingest_now`; both converge through the same canonical/projector path.
 8. **Projected SQLite state**: projection cascade updates trust rows, completing the loop.
 
 ### Module ownership
 
-- **Target planning**: `src/runtime/peering/engine/target_planner.rs` — the single source of truth for dial target decisions. Bootstrap autodial and mDNS discovery both route through this module.
-- **Transport connection lifecycle**: `src/runtime/transport/connection_lifecycle.rs` — sole owner of QUIC `connect/accept` and daemon TLS identity extraction for peering paths (`dial_daemon`, `accept_daemon`).
-- **Transport session factory**: `src/runtime/transport/session_factory.rs` — sole owner of QUIC stream opening and `DualConnection` / `QuicTransportSessionIo` construction. Provides `open_session_io()` and `accept_session_io()` that return `(session_id, Box<dyn TransportSessionIo>)`.
+- **Target planning**: `src/runtime/peering/engine/target_planner.rs` — the single source of truth for dial target decisions. Bootstrap autodial, observed endpoints, and mDNS discovery all route through this module.
+- **Transport connection lifecycle**: `src/runtime/transport/connection_lifecycle.rs` — sole owner of `iroh` `connect/accept` and daemon identity extraction for peering paths (`dial_daemon`, `accept_daemon`).
+- **Transport session factory**: `src/runtime/transport/session_factory.rs` — sole owner of stream opening and `TransportSessionIo` construction over `iroh` bi streams. Provides `open_session_io()` and `accept_session_io()` that return `(session_id, Box<dyn TransportSessionIo>)`.
 - **Transport session I/O adapter**: `src/runtime/transport/transport_session_io.rs` — sole owner of frame boundary validation (`parse_frame` exact-consumption), max-frame-size enforcement, and mapping between QUIC stream errors and `TransportSessionIoError`.
 - **Live connection ownership**: `src/runtime/peering/loops/mod.rs` — owns the per-daemon live connection slot registry and deterministic preferred-direction rule used by both outbound and inbound loops.
 - **Peering orchestration seam**: `src/runtime/peering/loops/mod.rs::run_session` — wires session metadata, peer-removal cancellation, and the session handler together. Receives pre-built `TransportSessionIo` from the transport session factory.
-- **Bootstrap test helpers**: `src/testutil/bootstrap.rs` — test-only. Production runtime never depends on these; bootstrap progression is driven by the autodial loop polling projected SQL state.
 
 ### Event-sourced authority boundary (peering)
 

@@ -149,7 +149,7 @@ fn maybe_init_tracing() {
     }
     INIT.get_or_init(|| {
         let filter = std::env::var("TOPO_PERF_TRACE_FILTER")
-            .unwrap_or_else(|_| "info,quinn=warn,rustls=warn".to_string());
+            .unwrap_or_else(|_| "info,iroh=warn,rustls=warn".to_string());
         let _ = tracing_subscriber::fmt()
             .with_env_filter(tracing_subscriber::EnvFilter::new(filter))
             .with_writer(std::io::stderr)

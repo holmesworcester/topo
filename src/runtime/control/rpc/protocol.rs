@@ -75,9 +75,6 @@ pub enum RpcMethod {
         summary: bool,
     },
     Workspaces,
-    IntroAttempts {
-        peer: Option<String>,
-    },
     CreateInvite {
         #[serde(default)]
         public_addr: Option<String>,
@@ -123,11 +120,6 @@ pub enum RpcMethod {
     },
     /// List all known peers with local/remote status and endpoint info.
     Peers,
-    /// Enable, disable, or inspect runtime-managed UPnP port mapping.
-    Upnp {
-        #[serde(default = "default_upnp_action")]
-        action: UpnpAction,
-    },
     /// Enable, disable, or inspect forward-on-have live hint delivery.
     Forward {
         #[serde(default = "default_forward_action")]
@@ -234,28 +226,6 @@ pub enum RpcMethod {
         #[serde(default = "default_discover_timeout_ms")]
         timeout_ms: u64,
     },
-
-    /// Run intro: connect peer_a and peer_b via this node.
-    Intro {
-        peer_a: String,
-        peer_b: String,
-        #[serde(default = "default_intro_ttl_ms")]
-        ttl_ms: u64,
-        #[serde(default = "default_intro_attempt_window_ms")]
-        attempt_window_ms: u32,
-    },
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum UpnpAction {
-    Enable,
-    Disable,
-    Status,
-}
-
-fn default_upnp_action() -> UpnpAction {
-    UpnpAction::Enable
 }
 
 #[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
@@ -275,12 +245,6 @@ fn default_discover_timeout_ms() -> u64 {
     5000
 }
 
-fn default_intro_ttl_ms() -> u64 {
-    30000
-}
-fn default_intro_attempt_window_ms() -> u32 {
-    4000
-}
 fn default_workspace_name() -> String {
     "workspace".to_string()
 }

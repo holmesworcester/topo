@@ -478,10 +478,12 @@ fn test_full_bootstrap_progression_from_projected_sql_state() {
 
     let peer_shared_key = SigningKey::generate(&mut rng);
     let peer_shared_pub = peer_shared_key.verifying_key().to_bytes();
+    let endpoint_shared_event_id = ensure_test_endpoint_shared(&conn);
     let psf = PeerSharedEvent {
         created_at_ms: now_ms(),
         public_key: peer_shared_pub,
         user_event_id: ub_eid,
+        endpoint_shared_event_id,
         device_name: "device1".to_string(),
         signed_by: dif_eid,
         signer_type: 3,

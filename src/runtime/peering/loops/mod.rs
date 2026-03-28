@@ -41,20 +41,6 @@ use crate::transport::session_factory::extract_build_mismatch_reason;
 use crate::transport::DaemonConnection;
 
 // ---------------------------------------------------------------------------
-// Types
-// ---------------------------------------------------------------------------
-
-/// Function that spawns an intro listener for holepunch handling on a QUIC connection.
-/// Injected by the composition root so peering/ doesn't depend on sync::punch.
-///
-pub type IntroSpawnerFn = fn(
-    crate::transport::TransportConnection,
-    String,
-    String,
-    crate::transport::TransportEndpoint,
-) -> tokio::task::JoinHandle<()>;
-
-// ---------------------------------------------------------------------------
 // Tuning constants (orchestration-level only; session constants live in
 // sync::session)
 // ---------------------------------------------------------------------------
@@ -100,18 +86,6 @@ pub(crate) fn preferred_connection_direction(
     })
 }
 
-fn connection_direction_rank(
-    local_peer_id: &str,
-    remote_peer_id: &str,
-    direction: SessionDirection,
-) -> u8 {
-    match preferred_connection_direction(local_peer_id, remote_peer_id) {
-        Some(preferred) if preferred == direction => 2,
-        Some(_) => 0,
-        None => 1,
-    }
-}
-
 #[derive(Clone, Debug, PartialEq, Eq, Hash)]
 struct LiveDaemonConnectionKey {
     db_path: String,
@@ -128,7 +102,6 @@ struct LiveSessionPeerKey {
 struct LiveDaemonConnectionSlot {
     claim_id: u64,
     direction: SessionDirection,
-    direction_rank: u8,
     daemon_connection: DaemonConnection,
     released: Arc<tokio::sync::Notify>,
 }
@@ -146,7 +119,10 @@ fn next_live_daemon_connection_claim_id() -> u64 {
     NEXT_CLAIM_ID.fetch_add(1, Ordering::Relaxed)
 }
 
-fn live_daemon_connection_key(db_path: &str, remote_daemon_peer_id: &str) -> LiveDaemonConnectionKey {
+fn live_daemon_connection_key(
+    db_path: &str,
+    remote_daemon_peer_id: &str,
+) -> LiveDaemonConnectionKey {
     LiveDaemonConnectionKey {
         db_path: db_path.to_string(),
         remote_daemon_peer_id: remote_daemon_peer_id.to_string(),
@@ -228,8 +204,6 @@ pub(crate) fn claim_live_daemon_connection_slot(
     daemon_connection: DaemonConnection,
 ) -> LiveDaemonConnectionClaim {
     let key = live_daemon_connection_key(db_path, remote_daemon_peer_id);
-    let direction_rank =
-        connection_direction_rank(local_daemon_peer_id, remote_daemon_peer_id, direction);
     let preferred_direction =
         preferred_connection_direction(local_daemon_peer_id, remote_daemon_peer_id);
     let claim_id = next_live_daemon_connection_claim_id();
@@ -247,7 +221,6 @@ pub(crate) fn claim_live_daemon_connection_slot(
                     LiveDaemonConnectionSlot {
                         claim_id,
                         direction,
-                        direction_rank,
                         daemon_connection,
                         released,
                     },
@@ -255,22 +228,22 @@ pub(crate) fn claim_live_daemon_connection_slot(
                 LiveDaemonConnectionClaim::Acquired(LiveDaemonConnectionLease { key, claim_id })
             }
             Some(existing)
-                if direction_rank > existing.direction_rank
-                    || existing
-                        .daemon_connection
-                        .connection()
-                        .close_reason()
-                        .is_some()
-                    || (existing.direction == direction
-                        && existing.daemon_connection.remote_addr()
-                            != daemon_connection.remote_addr()) =>
+                if existing
+                    .daemon_connection
+                    .connection()
+                    .close_reason()
+                    .is_some()
+                    || existing.daemon_connection.remote_addr()
+                        != daemon_connection.remote_addr() =>
             {
                 let released = Arc::new(tokio::sync::Notify::new());
-                replaced = Some((existing.daemon_connection.clone(), existing.released.clone()));
+                replaced = Some((
+                    existing.daemon_connection.clone(),
+                    existing.released.clone(),
+                ));
                 *existing = LiveDaemonConnectionSlot {
                     claim_id,
                     direction,
-                    direction_rank,
                     daemon_connection,
                     released,
                 };
@@ -298,13 +271,53 @@ pub(crate) fn live_daemon_connection(
     db_path: &str,
     remote_daemon_peer_id: &str,
 ) -> Option<DaemonConnection> {
-    let slots = live_daemon_connection_slots()
-        .lock()
-        .unwrap_or_else(|poison| poison.into_inner());
-    slots.iter().find_map(|(key, slot)| {
-        (key.db_path == db_path && key.remote_daemon_peer_id == remote_daemon_peer_id)
-            .then(|| slot.daemon_connection.clone())
-    })
+    let key = live_daemon_connection_key(db_path, remote_daemon_peer_id);
+    let (connection, released) = {
+        let mut slots = live_daemon_connection_slots()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let should_remove = slots
+            .get(&key)
+            .map(|slot| slot.daemon_connection.connection().close_reason().is_some())
+            .unwrap_or(false);
+        if should_remove {
+            (None, slots.remove(&key).map(|slot| slot.released))
+        } else {
+            (
+                slots.get(&key).map(|slot| slot.daemon_connection.clone()),
+                None,
+            )
+        }
+    };
+    if let Some(released) = released {
+        released.notify_waiters();
+    }
+    connection
+}
+
+pub(crate) fn evict_live_daemon_connection(
+    db_path: &str,
+    remote_daemon_peer_id: &str,
+    stable_id: usize,
+) {
+    let key = live_daemon_connection_key(db_path, remote_daemon_peer_id);
+    let released = {
+        let mut slots = live_daemon_connection_slots()
+            .lock()
+            .unwrap_or_else(|poison| poison.into_inner());
+        let should_remove = slots
+            .get(&key)
+            .map(|slot| slot.daemon_connection.connection().stable_id() == stable_id)
+            .unwrap_or(false);
+        if should_remove {
+            slots.remove(&key).map(|slot| slot.released)
+        } else {
+            None
+        }
+    };
+    if let Some(released) = released {
+        released.notify_waiters();
+    }
 }
 
 pub(crate) fn claim_live_session_peer(
@@ -397,7 +410,6 @@ pub(super) use crate::tuning::drain_batch_size;
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
     use std::time::Duration;
 
     use super::{
@@ -407,9 +419,8 @@ mod tests {
     };
     use crate::db::schema::create_tables;
     use crate::transport::{
-        accept_daemon_connection, create_dual_endpoint, dial_daemon_connection,
-        extract_spki_fingerprint, generate_self_signed_cert,
-        multi_workspace::transport_sni,
+        accept_daemon_connection, create_runtime_endpoint_for_tenants, dial_daemon_connection,
+        load_daemon_identity_from_db, multi_workspace::transport_sni,
     };
 
     #[test]
@@ -454,11 +465,20 @@ mod tests {
         let lease_a2 = claim_live_session_peer(db_path, &tenant_a, &peer);
         let _lease_b = claim_live_session_peer(db_path, &tenant_b, &peer);
 
-        assert_eq!(live_session_peer_ids(db_path, &tenant_a), vec![peer.clone()]);
-        assert_eq!(live_session_peer_ids(db_path, &tenant_b), vec![peer.clone()]);
+        assert_eq!(
+            live_session_peer_ids(db_path, &tenant_a),
+            vec![peer.clone()]
+        );
+        assert_eq!(
+            live_session_peer_ids(db_path, &tenant_b),
+            vec![peer.clone()]
+        );
 
         drop(lease_a1);
-        assert_eq!(live_session_peer_ids(db_path, &tenant_a), vec![peer.clone()]);
+        assert_eq!(
+            live_session_peer_ids(db_path, &tenant_a),
+            vec![peer.clone()]
+        );
 
         drop(lease_a2);
         assert!(live_session_peer_ids(db_path, &tenant_a).is_empty());
@@ -467,58 +487,42 @@ mod tests {
 
     #[tokio::test]
     async fn inbound_reconnect_from_new_remote_addr_replaces_stale_slot() {
-        let (server_cert, server_key) = generate_self_signed_cert().expect("server cert");
-        let (client_cert, client_key) = generate_self_signed_cert().expect("client cert");
-
-        let server_fp = extract_spki_fingerprint(server_cert.as_ref()).expect("server fp");
-        let client_fp = extract_spki_fingerprint(client_cert.as_ref()).expect("client fp");
-        let server_peer_id = hex::encode(server_fp);
-        let client_peer_id = hex::encode(client_fp);
-
-        let allow_client: Arc<
-            dyn Fn(&[u8; 32]) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
-                + Send
-                + Sync,
-        > =
-            Arc::new(move |candidate| Ok(candidate == &client_fp));
-        let allow_server: Arc<
-            dyn Fn(&[u8; 32]) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
-                + Send
-                + Sync,
-        > =
-            Arc::new(move |candidate| Ok(candidate == &server_fp));
-
-        let server_ep = create_dual_endpoint(
+        let temp = tempfile::tempdir().expect("tempdir");
+        let server_db = temp.path().join("server.sqlite3");
+        let client_db = temp.path().join("client.sqlite3");
+        let server_ep = create_runtime_endpoint_for_tenants(
             "127.0.0.1:0".parse().unwrap(),
-            server_cert,
-            server_key,
-            allow_client,
+            server_db.to_str().unwrap(),
         )
+        .await
         .expect("server endpoint");
-        let client_ep_a = create_dual_endpoint(
+        let client_ep_a = create_runtime_endpoint_for_tenants(
             "127.0.0.1:0".parse().unwrap(),
-            client_cert.clone(),
-            client_key.clone_key(),
-            allow_server.clone(),
+            client_db.to_str().unwrap(),
         )
+        .await
         .expect("client endpoint a");
-        let client_ep_b = create_dual_endpoint(
+        let client_ep_b = create_runtime_endpoint_for_tenants(
             "127.0.0.1:0".parse().unwrap(),
-            client_cert,
-            client_key,
-            allow_server,
+            client_db.to_str().unwrap(),
         )
+        .await
         .expect("client endpoint b");
+        let server_peer_id = load_daemon_identity_from_db(server_db.to_str().unwrap())
+            .expect("server daemon identity")
+            .0;
+        let client_peer_id = load_daemon_identity_from_db(client_db.to_str().unwrap())
+            .expect("client daemon identity")
+            .0;
 
         let server_addr = server_ep.local_addr().expect("server addr");
         let server_sni = transport_sni(&server_peer_id);
-        let tmpdir = tempfile::tempdir().expect("tempdir");
-        let db_path = tmpdir.path().join("live-daemon-slot.db");
+        let db_path = temp.path().join("live-daemon-slot.db");
         let db_str = db_path.to_str().expect("db path");
 
         let (accepted_a, _) = tokio::join!(
             accept_daemon_connection(&server_ep),
-            dial_daemon_connection(&client_ep_a, server_addr, &server_sni, None),
+            dial_daemon_connection(&client_ep_a, server_addr, &server_sni),
         );
         let accepted_a = accepted_a
             .expect("accept a")
@@ -531,14 +535,16 @@ mod tests {
             accepted_a.clone(),
         ) {
             LiveDaemonConnectionClaim::Acquired(lease) => lease,
-            LiveDaemonConnectionClaim::Occupied(_) => panic!("first inbound connection should acquire slot"),
+            LiveDaemonConnectionClaim::Occupied(_) => {
+                panic!("first inbound connection should acquire slot")
+            }
         };
 
         let first_remote_addr = accepted_a.remote_addr();
 
         let (accepted_b, _) = tokio::join!(
             accept_daemon_connection(&server_ep),
-            dial_daemon_connection(&client_ep_b, server_addr, &server_sni, None),
+            dial_daemon_connection(&client_ep_b, server_addr, &server_sni),
         );
         let accepted_b = accepted_b
             .expect("accept b")
@@ -562,8 +568,7 @@ mod tests {
             }
         };
 
-        let live = live_daemon_connection(db_str, &client_peer_id)
-            .expect("live slot");
+        let live = live_daemon_connection(db_str, &client_peer_id).expect("live slot");
         assert_eq!(live.remote_addr(), second_remote_addr);
 
         tokio::time::timeout(Duration::from_secs(1), async {
@@ -586,53 +591,37 @@ mod tests {
 
     #[tokio::test]
     async fn pending_bootstrap_aliases_share_live_daemon_slot() {
-        let (server_cert, server_key) = generate_self_signed_cert().expect("server cert");
-        let (client_cert, client_key) = generate_self_signed_cert().expect("client cert");
-
-        let server_fp = extract_spki_fingerprint(server_cert.as_ref()).expect("server fp");
-        let client_fp = extract_spki_fingerprint(client_cert.as_ref()).expect("client fp");
-        let server_peer_id = hex::encode(server_fp);
-        let client_peer_id = hex::encode(client_fp);
-
-        let allow_client: Arc<
-            dyn Fn(&[u8; 32]) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
-                + Send
-                + Sync,
-        > =
-            Arc::new(move |candidate| Ok(candidate == &client_fp));
-        let allow_server: Arc<
-            dyn Fn(&[u8; 32]) -> Result<bool, Box<dyn std::error::Error + Send + Sync>>
-                + Send
-                + Sync,
-        > =
-            Arc::new(move |candidate| Ok(candidate == &server_fp));
-
-        let server_ep = create_dual_endpoint(
+        let temp = tempfile::tempdir().expect("tempdir");
+        let server_db = temp.path().join("server.sqlite3");
+        let client_db = temp.path().join("client.sqlite3");
+        let server_ep = create_runtime_endpoint_for_tenants(
             "127.0.0.1:0".parse().unwrap(),
-            server_cert,
-            server_key,
-            allow_client,
+            server_db.to_str().unwrap(),
         )
+        .await
         .expect("server endpoint");
-        let client_ep_a = create_dual_endpoint(
+        let client_ep_a = create_runtime_endpoint_for_tenants(
             "127.0.0.1:0".parse().unwrap(),
-            client_cert.clone(),
-            client_key.clone_key(),
-            allow_server.clone(),
+            client_db.to_str().unwrap(),
         )
+        .await
         .expect("client endpoint a");
-        let client_ep_b = create_dual_endpoint(
+        let client_ep_b = create_runtime_endpoint_for_tenants(
             "127.0.0.1:0".parse().unwrap(),
-            client_cert,
-            client_key,
-            allow_server,
+            client_db.to_str().unwrap(),
         )
+        .await
         .expect("client endpoint b");
+        let server_peer_id = load_daemon_identity_from_db(server_db.to_str().unwrap())
+            .expect("server daemon identity")
+            .0;
+        let client_peer_id = load_daemon_identity_from_db(client_db.to_str().unwrap())
+            .expect("client daemon identity")
+            .0;
 
         let server_addr = server_ep.local_addr().expect("server addr");
         let server_sni = transport_sni(&server_peer_id);
-        let tmpdir = tempfile::tempdir().expect("tempdir");
-        let db_path = tmpdir.path().join("bootstrap-alias-slot.db");
+        let db_path = temp.path().join("bootstrap-alias-slot.db");
         let db_str = db_path.to_str().expect("db path");
         let db = crate::db::open_connection(db_str).expect("open db");
         create_tables(&db).expect("create tables");
@@ -640,7 +629,7 @@ mod tests {
 
         let (accepted_a, dialed_a) = tokio::join!(
             accept_daemon_connection(&server_ep),
-            dial_daemon_connection(&client_ep_a, server_addr, &server_sni, None),
+            dial_daemon_connection(&client_ep_a, server_addr, &server_sni),
         );
         let accepted_a = accepted_a
             .expect("accept a")
@@ -662,7 +651,7 @@ mod tests {
 
         let (accepted_b, dialed_b) = tokio::join!(
             accept_daemon_connection(&server_ep),
-            dial_daemon_connection(&client_ep_b, server_addr, &server_sni, None),
+            dial_daemon_connection(&client_ep_b, server_addr, &server_sni),
         );
         let accepted_b = accepted_b
             .expect("accept b")
@@ -687,8 +676,7 @@ mod tests {
             }
         };
 
-        let live = live_daemon_connection(db_str, &client_peer_id)
-            .expect("second live slot");
+        let live = live_daemon_connection(db_str, &client_peer_id).expect("second live slot");
         assert_eq!(live.remote_addr(), second_remote_addr);
 
         tokio::time::timeout(Duration::from_secs(1), async {

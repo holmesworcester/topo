@@ -10,7 +10,7 @@
 //! stays in service.
 
 use ed25519_dalek::SigningKey;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use super::identity_ops::{self as ops, InviteBootstrapContext, JoinChain, LinkChain};
 use std::collections::HashSet;
@@ -29,6 +29,49 @@ use crate::projection::create::{
 };
 use crate::state::db::queue::current_timestamp_ms_u64;
 use crate::state::live_hints::{self, LiveHintEvent};
+use crate::transport::ensure_daemon_identity;
+
+fn index_endpoint_shared_for_workspace(
+    db: &Connection,
+    recorded_by: &str,
+    workspace_id: &EventId,
+    endpoint_shared_event_id: &EventId,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let endpoint_shared_event_id_b64 = event_id_to_base64(endpoint_shared_event_id);
+    let workspace_id_b64 = event_id_to_base64(workspace_id);
+    let created_at_ms: i64 = db.query_row(
+        "SELECT created_at
+         FROM events
+         WHERE event_id = ?1
+           AND event_type = 'endpoint_shared'
+           AND share_scope = 'shared'
+         LIMIT 1",
+        rusqlite::params![&endpoint_shared_event_id_b64],
+        |row| row.get(0),
+    )?;
+    crate::db::store::insert_shared_event_index_entry_if_shared(
+        db,
+        crate::event_modules::ShareScope::Shared,
+        created_at_ms,
+        endpoint_shared_event_id,
+        &workspace_id_b64,
+    )?;
+    crate::state::shared_workspace_fanout::fanout_shared_event_immediate(
+        db,
+        recorded_by,
+        &workspace_id_b64,
+        endpoint_shared_event_id,
+    )?;
+    crate::state::live_hints::publish_from_connection(
+        db,
+        &[LiveHintEvent {
+            tenant_id: recorded_by.to_string(),
+            event_id: *endpoint_shared_event_id,
+            source_peer_id: None,
+        }],
+    );
+    Ok(())
+}
 
 /// In a shared DB, sibling tenants can already have the workspace's shared
 /// event history in `events`/`shared_event_index` even though this tenant has not yet
@@ -95,8 +138,20 @@ fn replay_existing_workspace_shared_events_for_tenant(
             continue;
         }
         let eid_b64 = event_id_to_base64(&eid);
-        let has_eligible_recorder: bool = db
+        let event_type: Option<String> = db
             .query_row(
+                "SELECT event_type
+                 FROM events
+                 WHERE event_id = ?1
+                 LIMIT 1",
+                rusqlite::params![&eid_b64],
+                |row| row.get(0),
+            )
+            .ok();
+        let has_eligible_recorder = if event_type.as_deref() == Some("endpoint_shared") {
+            true
+        } else {
+            db.query_row(
                 "SELECT EXISTS (
                     SELECT 1 FROM recorded_events re
                     JOIN invites_accepted ia
@@ -107,7 +162,8 @@ fn replay_existing_workspace_shared_events_for_tenant(
                 rusqlite::params![&workspace_id_b64, &eid_b64, recorded_by],
                 |row| row.get(0),
             )
-            .unwrap_or(false);
+            .unwrap_or(false)
+        };
         if has_eligible_recorder {
             seen.insert(eid);
             event_ids.push(eid);
@@ -118,28 +174,50 @@ fn replay_existing_workspace_shared_events_for_tenant(
     let recorded_at = current_timestamp_ms_u64() as i64;
     let publish_after_commit = db.is_autocommit();
     let mut live_hints = Vec::new();
+    let replay_targets: Vec<(EventId, String)> = event_ids
+        .iter()
+        .map(|event_id| {
+            let event_id_b64 = event_id_to_base64(event_id);
+            let endpoint_id = db
+                .query_row(
+                    "SELECT endpoint_id
+                     FROM endpoints_shared
+                     WHERE event_id = ?1
+                     LIMIT 1",
+                    rusqlite::params![&event_id_b64],
+                    |row| row.get::<_, String>(0),
+                )
+                .optional()?;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>((
+                *event_id,
+                endpoint_id.unwrap_or_else(|| recorded_by.to_string()),
+            ))
+        })
+        .collect::<Result<Vec<_>, _>>()?;
 
     // Phase 1: Durably record and enqueue ALL events before projecting any.
     // Wrapped in a savepoint so a crash mid-loop cannot leave partial
     // recorded_events without matching project_queue entries.
     // Uses SAVEPOINT (not BEGIN) to nest safely inside caller transactions.
     db.execute_batch("SAVEPOINT replay_seed")?;
-    for event_id in &event_ids {
+    for (event_id, replay_recorded_by) in &replay_targets {
         if insert_recorded_event_checked(
             db,
-            recorded_by,
+            replay_recorded_by,
             event_id,
             recorded_at,
             "same_workspace_seed",
         )? {
-            live_hints.push(LiveHintEvent {
-                tenant_id: recorded_by.to_string(),
-                event_id: *event_id,
-                source_peer_id: None,
-            });
+            if replay_recorded_by == recorded_by {
+                live_hints.push(LiveHintEvent {
+                    tenant_id: recorded_by.to_string(),
+                    event_id: *event_id,
+                    source_peer_id: None,
+                });
+            }
         }
         let event_id_b64 = event_id_to_base64(event_id);
-        let _ = pq.enqueue(recorded_by, &event_id_b64);
+        let _ = pq.enqueue(replay_recorded_by, &event_id_b64);
     }
     db.execute_batch("RELEASE replay_seed")?;
     if publish_after_commit {
@@ -153,15 +231,15 @@ fn replay_existing_workspace_shared_events_for_tenant(
     // Rejected events are left in the queue for startup drain retry to
     // handle transient failures that may resolve with more context.
     let mut replayed = 0usize;
-    for event_id in &event_ids {
-        let decision = project_one(db, recorded_by, event_id)
+    for (event_id, replay_recorded_by) in &replay_targets {
+        let decision = project_one(db, replay_recorded_by, event_id)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
         let event_id_b64 = event_id_to_base64(event_id);
         match decision {
             crate::projection::decision::ProjectionDecision::Valid
             | crate::projection::decision::ProjectionDecision::AlreadyProcessed
             | crate::projection::decision::ProjectionDecision::Block { .. } => {
-                let _ = pq.mark_done(recorded_by, &event_id_b64);
+                let _ = pq.mark_done(replay_recorded_by, &event_id_b64);
                 replayed += 1;
             }
             crate::projection::decision::ProjectionDecision::Reject { .. } => {
@@ -195,6 +273,7 @@ fn emit_peer_secret(
 /// Result of creating a new workspace (full identity chain bootstrap).
 pub struct CreateWorkspaceResult {
     pub workspace_id: EventId,
+    pub endpoint_shared_event_id: EventId,
     pub peer_shared_event_id: EventId,
     pub peer_shared_key: SigningKey,
 }
@@ -223,6 +302,13 @@ pub fn create_workspace(
     // passing its recorded_by. User-facing create-workspace paths pass an
     // unbound bootstrap alias so they always mint a new tenant.
     if let Some((eid, signing_key)) = load_local_peer_signer(db, recorded_by)? {
+        let endpoint_shared_event_id =
+            crate::event_modules::endpoint_shared::load_local_endpoint_shared(db)?
+                .ok_or("endpoint_shared missing after local signer reuse")?
+                .event_id;
+        let endpoint_shared_event_id =
+            crate::crypto::event_id_from_base64(&endpoint_shared_event_id)
+                .ok_or("invalid endpoint_shared event_id")?;
         let workspace_id = db
             .query_row(
                 "SELECT workspace_id
@@ -238,6 +324,7 @@ pub fn create_workspace(
             .unwrap_or([0u8; 32]);
         return Ok(CreateWorkspaceResult {
             workspace_id,
+            endpoint_shared_event_id,
             peer_shared_event_id: eid,
             peer_shared_key: signing_key,
         });
@@ -281,6 +368,13 @@ fn create_workspace_inner(
     device_name: &str,
 ) -> Result<CreateWorkspaceResult, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
+    let _ = ensure_daemon_identity(db)?;
+    let endpoint_shared_event_id =
+        crate::event_modules::endpoint_shared::load_local_endpoint_shared(db)?
+            .ok_or("endpoint_shared missing after ensure_daemon_identity")?
+            .event_id;
+    let endpoint_shared_event_id = crate::crypto::event_id_from_base64(&endpoint_shared_event_id)
+        .ok_or("invalid endpoint_shared event_id")?;
 
     // Pre-derive peer_id from PeerShared key so all events are written under
     // the correct recorded_by from the start (no finalize_identity needed).
@@ -374,12 +468,14 @@ fn create_workspace_inner(
         created_at_ms: current_timestamp_ms_u64(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
         user_event_id: ub_eid,
+        endpoint_shared_event_id,
         device_name: device_name.to_string(),
         signed_by: dif_eid,
         signer_type: 3,
         signature: [0u8; 64],
     });
     let psf_eid = create_signed_event_synchronous(db, &derived_peer_id, &psf, &device_invite_key)?;
+    index_endpoint_shared_for_workspace(db, &derived_peer_id, &ws_eid, &endpoint_shared_event_id)?;
 
     // 11. Emit peer_secret for peer_shared signer key only.
     // Transport identity is already installed, so all writes use derived_peer_id.
@@ -390,6 +486,7 @@ fn create_workspace_inner(
 
     Ok(CreateWorkspaceResult {
         workspace_id: ws_eid,
+        endpoint_shared_event_id,
         peer_shared_event_id: psf_eid,
         peer_shared_key,
     })
@@ -457,6 +554,13 @@ fn join_workspace_inner(
     peer_shared_key: SigningKey,
 ) -> Result<JoinChain, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
+    let _ = ensure_daemon_identity(db)?;
+    let endpoint_shared_event_id =
+        crate::event_modules::endpoint_shared::load_local_endpoint_shared(db)?
+            .ok_or("endpoint_shared missing after ensure_daemon_identity")?
+            .event_id;
+    let endpoint_shared_event_id = crate::crypto::event_id_from_base64(&endpoint_shared_event_id)
+        .ok_or("invalid endpoint_shared event_id")?;
     let tenant_event_id = ops::ensure_local_tenant_event(db, recorded_by, &peer_shared_key)?;
 
     // Persist deterministic invite_secret material. This is the key event
@@ -515,6 +619,7 @@ fn join_workspace_inner(
         created_at_ms: current_timestamp_ms_u64(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
         user_event_id,
+        endpoint_shared_event_id,
         device_name: device_name.to_string(),
         signed_by: device_invite_event_id,
         signer_type: 3,
@@ -526,6 +631,7 @@ fn join_workspace_inner(
         &psf_evt,
         &device_invite_key,
     ))?;
+    index_endpoint_shared_for_workspace(db, recorded_by, &workspace_id, &endpoint_shared_event_id)?;
 
     // 5. Key unwrap is dep-driven via:
     //    key_shared --deps on invite_secret--> deterministic secret emit.
@@ -537,6 +643,7 @@ fn join_workspace_inner(
         user_key,
         device_invite_event_id,
         device_invite_key,
+        endpoint_shared_event_id,
         peer_shared_event_id,
         peer_shared_key,
         invite_accepted_event_id,
@@ -586,6 +693,13 @@ pub fn add_device_to_workspace(
     device_name: &str,
     peer_shared_key: SigningKey,
 ) -> Result<LinkChain, Box<dyn std::error::Error + Send + Sync>> {
+    let _ = ensure_daemon_identity(db)?;
+    let endpoint_shared_event_id =
+        crate::event_modules::endpoint_shared::load_local_endpoint_shared(db)?
+            .ok_or("endpoint_shared missing after ensure_daemon_identity")?
+            .event_id;
+    let endpoint_shared_event_id = crate::crypto::event_id_from_base64(&endpoint_shared_event_id)
+        .ok_or("invalid endpoint_shared event_id")?;
     let tenant_event_id = ops::ensure_local_tenant_event(db, recorded_by, &peer_shared_key)?;
 
     // Persist deterministic invite_secret material so invite_accepted projection
@@ -610,6 +724,7 @@ pub fn add_device_to_workspace(
         created_at_ms: current_timestamp_ms_u64(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
         user_event_id,
+        endpoint_shared_event_id,
         device_name: device_name.to_string(),
         signed_by: *device_invite_event_id,
         signer_type: 3,
@@ -621,8 +736,10 @@ pub fn add_device_to_workspace(
         &psf_evt,
         device_invite_key,
     ))?;
+    index_endpoint_shared_for_workspace(db, recorded_by, &workspace_id, &endpoint_shared_event_id)?;
 
     Ok(LinkChain {
+        endpoint_shared_event_id,
         peer_shared_event_id,
         peer_shared_key,
         invite_accepted_event_id,

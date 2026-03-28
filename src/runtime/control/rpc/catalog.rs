@@ -160,12 +160,6 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"Workspaces"}"#,
     },
     MethodInfo {
-        name: "IntroAttempts",
-        purpose: "Show intro attempt records",
-        params: params!["peer", "string?", false, None],
-        example_json: r#"{"type":"IntroAttempts","peer":null}"#,
-    },
-    MethodInfo {
         name: "CreateInvite",
         purpose: "Create a user invite link for the active workspace",
         params: params![
@@ -249,12 +243,6 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"Peers"}"#,
     },
     MethodInfo {
-        name: "Upnp",
-        purpose: "Enable, disable, or inspect runtime-managed UPnP port mapping",
-        params: params!["action", "string", false, Some("\"enable\"")],
-        example_json: r#"{"type":"Upnp","action":"status"}"#,
-    },
-    MethodInfo {
         name: "View",
         purpose: "Combined view: sidebar + messages with inline reactions",
         params: params!["limit", "usize", false, Some("50")],
@@ -301,17 +289,6 @@ static CATALOG: &[MethodInfo] = &[
         purpose: "Browse for peers via mDNS discovery",
         params: params!["timeout_ms", "u64", false, Some("5000")],
         example_json: r#"{"type":"Discover","timeout_ms":5000}"#,
-    },
-    MethodInfo {
-        name: "Intro",
-        purpose: "Run intro: connect two peers via this node",
-        params: params![
-            "peer_a", "string", true, None;
-            "peer_b", "string", true, None;
-            "ttl_ms", "u64", false, Some("30000");
-            "attempt_window_ms", "u32", false, Some("4000")
-        ],
-        example_json: r#"{"type":"Intro","peer_a":"<hex-spki>","peer_b":"<hex-spki>"}"#,
     },
 ];
 

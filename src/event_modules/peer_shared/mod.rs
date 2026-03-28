@@ -37,6 +37,8 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             event_id TEXT NOT NULL,
             public_key BLOB NOT NULL,
             transport_fingerprint BLOB,
+            endpoint_shared_event_id TEXT,
+            endpoint_id TEXT,
             user_event_id TEXT,
             device_name TEXT,
             PRIMARY KEY (recorded_by, event_id)
@@ -49,10 +51,21 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             [],
         )?;
     }
+    if !column_exists(conn, "peers_shared", "endpoint_shared_event_id")? {
+        conn.execute(
+            "ALTER TABLE peers_shared ADD COLUMN endpoint_shared_event_id TEXT",
+            [],
+        )?;
+    }
+    if !column_exists(conn, "peers_shared", "endpoint_id")? {
+        conn.execute("ALTER TABLE peers_shared ADD COLUMN endpoint_id TEXT", [])?;
+    }
     conn.execute_batch(
         "
         CREATE INDEX IF NOT EXISTS idx_peers_shared_transport_fingerprint
             ON peers_shared(recorded_by, transport_fingerprint);
+        CREATE INDEX IF NOT EXISTS idx_peers_shared_endpoint_id
+            ON peers_shared(recorded_by, endpoint_id);
         ",
     )?;
     Ok(())

@@ -1,6 +1,5 @@
 use async_trait::async_trait;
-use quinn::{RecvStream, SendStream};
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::protocol::ParseError;
 use crate::protocol::{encode_frame, parse_frame, Frame};
@@ -31,22 +30,22 @@ pub trait StreamRecv {
     async fn recv_chunk(&mut self) -> Result<Vec<u8>, ConnectionError>;
 }
 
-/// Bidirectional QUIC stream wrapper for sync protocol
-pub struct Connection {
-    send: SendStream,
-    recv: RecvStream,
+/// Bidirectional stream wrapper for sync protocol.
+pub struct Connection<S, R> {
+    send: S,
+    recv: R,
     recv_buffer: Vec<u8>,
     recv_limit: usize,
 }
 
-/// Send-only QUIC stream wrapper
-pub struct SendConnection {
-    send: SendStream,
+/// Send-only stream wrapper.
+pub struct SendConnection<S> {
+    send: S,
 }
 
-/// Recv-only QUIC stream wrapper
-pub struct RecvConnection {
-    recv: RecvStream,
+/// Recv-only stream wrapper.
+pub struct RecvConnection<R> {
+    recv: R,
     recv_buffer: Vec<u8>,
 }
 
@@ -54,33 +53,21 @@ pub struct RecvConnection {
 ///
 /// Control carries session protocol messages. Data carries event blobs.
 /// This keeps bulk transfer from blocking session progress.
-pub struct DualConnection<
-    C: StreamConn = Connection,
-    S: StreamSend = SendConnection,
-    R: StreamRecv = RecvConnection,
-> {
+pub struct DualConnection<C: StreamConn, S: StreamSend, R: StreamRecv> {
     pub control: C,
     pub data_send: S,
     pub data_recv: R,
 }
 
-impl DualConnection<Connection, SendConnection, RecvConnection> {
-    /// Create from two bi-directional stream pairs (control first, data second)
-    pub fn new(
-        control_send: SendStream,
-        control_recv: RecvStream,
-        data_send: SendStream,
-        data_recv: RecvStream,
-    ) -> Self {
+impl<C: StreamConn, S: StreamSend, R: StreamRecv> DualConnection<C, S, R> {
+    pub fn from_parts(control: C, data_send: S, data_recv: R) -> Self {
         Self {
-            control: Connection::new(control_send, control_recv),
-            data_send: SendConnection::new(data_send),
-            data_recv: RecvConnection::new(data_recv),
+            control,
+            data_send,
+            data_recv,
         }
     }
-}
 
-impl<C: StreamConn, S: StreamSend, R: StreamRecv> DualConnection<C, S, R> {
     /// Flush control stream
     pub async fn flush_control(&mut self) -> Result<(), ConnectionError> {
         self.control.flush().await
@@ -92,9 +79,8 @@ impl<C: StreamConn, S: StreamSend, R: StreamRecv> DualConnection<C, S, R> {
     }
 }
 
-impl Connection {
-    /// Create a new connection from quinn streams
-    pub fn new(send: SendStream, recv: RecvStream) -> Self {
+impl<S, R> Connection<S, R> {
+    pub fn new(send: S, recv: R) -> Self {
         Self {
             send,
             recv,
@@ -102,7 +88,13 @@ impl Connection {
             recv_limit: max_recv_buffer(),
         }
     }
+}
 
+impl<S, R> Connection<S, R>
+where
+    S: AsyncWrite + Unpin + Send,
+    R: AsyncRead + Unpin + Send,
+{
     pub fn swap_recv_limit(&mut self, new_limit: usize) -> usize {
         let old_limit = self.recv_limit;
         self.recv_limit = new_limit;
@@ -149,25 +141,25 @@ impl Connection {
 
             // Read more data
             let mut buf = [0u8; 4096];
-            let chunk = self.recv.read(&mut buf).await?;
-
-            match chunk {
-                Some(n) if n > 0 => {
-                    self.recv_buffer.extend_from_slice(&buf[..n]);
-                }
-                _ => {
-                    return Err(ConnectionError::Closed);
-                }
+            let n = self.recv.read(&mut buf).await?;
+            if n == 0 {
+                return Err(ConnectionError::Closed);
             }
+            self.recv_buffer.extend_from_slice(&buf[..n]);
         }
     }
 }
 
-impl SendConnection {
-    pub fn new(send: SendStream) -> Self {
+impl<S> SendConnection<S> {
+    pub fn new(send: S) -> Self {
         Self { send }
     }
+}
 
+impl<S> SendConnection<S>
+where
+    S: AsyncWrite + Unpin + Send,
+{
     pub async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
         let data = encode_frame(msg);
         self.send_bytes(&data).await
@@ -184,14 +176,19 @@ impl SendConnection {
     }
 }
 
-impl RecvConnection {
-    pub fn new(recv: RecvStream) -> Self {
+impl<R> RecvConnection<R> {
+    pub fn new(recv: R) -> Self {
         Self {
             recv,
             recv_buffer: Vec::with_capacity(4096),
         }
     }
+}
 
+impl<R> RecvConnection<R>
+where
+    R: AsyncRead + Unpin + Send,
+{
     pub async fn recv(&mut self) -> Result<Frame, ConnectionError> {
         loop {
             if !self.recv_buffer.is_empty() {
@@ -214,33 +211,32 @@ impl RecvConnection {
             }
 
             let mut buf = [0u8; 4096];
-            let chunk = self.recv.read(&mut buf).await?;
-            match chunk {
-                Some(n) if n > 0 => {
-                    self.recv_buffer.extend_from_slice(&buf[..n]);
-                }
-                _ => {
-                    return Err(ConnectionError::Closed);
-                }
+            let n = self.recv.read(&mut buf).await?;
+            if n == 0 {
+                return Err(ConnectionError::Closed);
             }
+            self.recv_buffer.extend_from_slice(&buf[..n]);
         }
     }
 
     pub async fn recv_chunk(&mut self) -> Result<Vec<u8>, ConnectionError> {
         let mut buf = vec![0u8; 64 * 1024];
-        let chunk = self.recv.read(&mut buf).await?;
-        match chunk {
-            Some(n) if n > 0 => {
-                buf.truncate(n);
-                Ok(buf)
-            }
-            _ => Err(ConnectionError::Closed),
+        let n = self.recv.read(&mut buf).await?;
+        if n == 0 {
+            Err(ConnectionError::Closed)
+        } else {
+            buf.truncate(n);
+            Ok(buf)
         }
     }
 }
 
 #[async_trait]
-impl StreamConn for Connection {
+impl<S, R> StreamConn for Connection<S, R>
+where
+    S: AsyncWrite + Unpin + Send + 'static,
+    R: AsyncRead + Unpin + Send + 'static,
+{
     fn swap_recv_limit(&mut self, new_limit: usize) -> usize {
         Connection::swap_recv_limit(self, new_limit)
     }
@@ -259,7 +255,10 @@ impl StreamConn for Connection {
 }
 
 #[async_trait]
-impl StreamSend for SendConnection {
+impl<S> StreamSend for SendConnection<S>
+where
+    S: AsyncWrite + Unpin + Send + 'static,
+{
     async fn send(&mut self, msg: &Frame) -> Result<(), ConnectionError> {
         SendConnection::send(self, msg).await
     }
@@ -274,7 +273,10 @@ impl StreamSend for SendConnection {
 }
 
 #[async_trait]
-impl StreamRecv for RecvConnection {
+impl<R> StreamRecv for RecvConnection<R>
+where
+    R: AsyncRead + Unpin + Send + 'static,
+{
     async fn recv(&mut self) -> Result<Frame, ConnectionError> {
         RecvConnection::recv(self).await
     }
@@ -287,9 +289,7 @@ impl StreamRecv for RecvConnection {
 #[derive(Debug)]
 pub enum ConnectionError {
     Io(std::io::Error),
-    Quinn(quinn::WriteError),
-    QuinnRead(quinn::ReadError),
-    QuinnClose(quinn::ClosedStream),
+    Transport(String),
     Parse(ParseError),
     Closed,
 }
@@ -298,9 +298,7 @@ impl std::fmt::Display for ConnectionError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             ConnectionError::Io(e) => write!(f, "IO error: {}", e),
-            ConnectionError::Quinn(e) => write!(f, "Quinn write error: {}", e),
-            ConnectionError::QuinnRead(e) => write!(f, "Quinn read error: {}", e),
-            ConnectionError::QuinnClose(e) => write!(f, "Quinn close error: {}", e),
+            ConnectionError::Transport(e) => write!(f, "Transport error: {}", e),
             ConnectionError::Parse(e) => write!(f, "Parse error: {}", e),
             ConnectionError::Closed => write!(f, "Connection closed"),
         }
@@ -312,24 +310,6 @@ impl std::error::Error for ConnectionError {}
 impl From<std::io::Error> for ConnectionError {
     fn from(e: std::io::Error) -> Self {
         ConnectionError::Io(e)
-    }
-}
-
-impl From<quinn::WriteError> for ConnectionError {
-    fn from(e: quinn::WriteError) -> Self {
-        ConnectionError::Quinn(e)
-    }
-}
-
-impl From<quinn::ReadError> for ConnectionError {
-    fn from(e: quinn::ReadError) -> Self {
-        ConnectionError::QuinnRead(e)
-    }
-}
-
-impl From<quinn::ClosedStream> for ConnectionError {
-    fn from(e: quinn::ClosedStream) -> Self {
-        ConnectionError::QuinnClose(e)
     }
 }
 

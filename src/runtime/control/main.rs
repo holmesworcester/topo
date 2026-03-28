@@ -14,7 +14,7 @@ use tracing_subscriber::FmtSubscriber;
 use topo::db::{friendly_db_error, open_connection, schema::create_tables};
 use topo::rpc::catalog;
 use topo::rpc::client::{rpc_call, rpc_call_raw, RpcClientError};
-use topo::rpc::protocol::{ForwardAction, RpcMethod, UpnpAction, PROTOCOL_VERSION};
+use topo::rpc::protocol::{ForwardAction, RpcMethod, PROTOCOL_VERSION};
 use topo::rpc::server::{run_rpc_server, DaemonState};
 use topo::service;
 use topo::tuning::apply_low_mem_allocator_tuning;
@@ -401,7 +401,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 short_id(data["user_event_id"].as_str().unwrap_or(""))
             );
             println!(
-                "  peer:    {}",
+                "  account: {}",
                 short_id(data["peer_shared_event_id"].as_str().unwrap_or(""))
             );
             maybe_show_created_events(db, &data);
@@ -447,7 +447,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let source = row["source"].as_str().unwrap_or("unknown");
                         println!("  {} [{}]", transport_peer_id, source);
                         if let Some(event_id) = row["peer_shared_event_id"].as_str() {
-                            println!("    peer_shared_event: {}", short_id(event_id));
+                            println!("    account_shared_event: {}", short_id(event_id));
                         }
                         if let Some(user_event_id) = row["user_event_id"].as_str() {
                             println!("    user_event: {}", short_id(user_event_id));
@@ -586,56 +586,39 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     "  Listen:    {}",
                     rt["listen_addr"].as_str().unwrap_or("unknown")
                 );
-                let upnp_enabled = rt["upnp_enabled"].as_bool().unwrap_or(false);
-                if let Some(upnp) = rt.get("upnp") {
-                    let status = upnp["status"].as_str().unwrap_or("not_attempted");
-                    match status {
-                        "success" => {
-                            let ext_port = upnp["mapped_external_port"]
-                                .as_u64()
-                                .map(|p| p.to_string())
-                                .unwrap_or_else(|| "?".into());
-                            let ext_ip = upnp["external_ip"].as_str().unwrap_or("unknown");
-                            let nat_tag = if upnp["double_nat"].as_bool().unwrap_or(false) {
-                                " (double-NAT!)"
-                            } else {
-                                ""
-                            };
-                            println!(
-                                "  UPnP:      {} success udp external_port={} external_ip={}{}",
-                                if upnp_enabled { "enabled" } else { "disabled" },
-                                ext_port,
-                                ext_ip,
-                                nat_tag
-                            );
-                        }
-                        "failed" => {
-                            let err = upnp["error"].as_str().unwrap_or("unknown");
-                            println!(
-                                "  UPnP:      {} failed ({})",
-                                if upnp_enabled { "enabled" } else { "disabled" },
-                                err
-                            );
-                        }
-                        "not_attempted" => {
-                            let err = upnp["error"].as_str().unwrap_or("unknown");
-                            println!(
-                                "  UPnP:      {} not attempted ({})",
-                                if upnp_enabled { "enabled" } else { "disabled" },
-                                err
-                            );
-                        }
-                        _ => {
-                            println!(
-                                "  UPnP:      {} not attempted",
-                                if upnp_enabled { "enabled" } else { "disabled" }
-                            );
-                        }
+                if let Some(endpoint_id) = rt["endpoint_id"]
+                    .as_str()
+                    .or_else(|| rt["daemon_peer_id"].as_str())
+                {
+                    println!("  Endpoint:  {}", short_id(endpoint_id));
+                    let endpoint_shared = rt["endpoint_shared_id"]
+                        .as_str()
+                        .map(short_id)
+                        .unwrap_or("pending");
+                    println!("  Shared:    {}", endpoint_shared);
+                }
+                if let Some(endpoint_secret_event_id) = rt["endpoint_secret_event_id"].as_str() {
+                    println!("  Root:      {}", short_id(endpoint_secret_event_id));
+                }
+                println!(
+                    "  Discovery: {}",
+                    if rt["mdns_enabled"].as_bool().unwrap_or(false) {
+                        "mdns"
+                    } else {
+                        "disabled"
                     }
-                } else if upnp_enabled {
-                    println!("  UPnP:      enabled (awaiting active runtime)");
-                } else {
-                    println!("  UPnP:      disabled");
+                );
+                if let Some(addrs) = rt["published_addrs"].as_array() {
+                    if addrs.is_empty() {
+                        println!("  Addrs:     (none)");
+                    } else {
+                        let rendered = addrs
+                            .iter()
+                            .filter_map(|addr| addr.as_str())
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        println!("  Addrs:     {}", rendered);
+                    }
                 }
             }
             if data.get("runtime").is_none() {
@@ -645,7 +628,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 } else {
                     println!("  Listen:    (starting)");
                 }
-                println!("  UPnP:      not attempted");
+                println!("  Discovery: disabled");
             }
             if let Some(tenants) = data["tenants"].as_array() {
                 if !tenants.is_empty() {
@@ -979,6 +962,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                         let username = item["username"].as_str().unwrap_or("");
                         let is_local = item["local"].as_bool().unwrap_or(false);
                         let endpoint = item["endpoint"].as_str();
+                        let endpoint_id = item["endpoint_id"].as_str();
 
                         let label = if !username.is_empty() && !device_name.is_empty() {
                             format!("{}@{}", username, device_name)
@@ -990,13 +974,18 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             String::new()
                         };
 
-                        let location = if is_local {
-                            "local".to_string()
+                        let mut tags = Vec::new();
+                        if is_local {
+                            tags.push("local".to_string());
                         } else if let Some(ep) = endpoint {
-                            ep.to_string()
+                            tags.push(ep.to_string());
                         } else {
-                            "remote".to_string()
-                        };
+                            tags.push("remote".to_string());
+                        }
+                        if let Some(epid) = endpoint_id {
+                            tags.push(format!("endpoint={}", short_id(epid)));
+                        }
+                        let location = tags.join(" ");
 
                         if label.is_empty() {
                             println!("  {}. {} [{}]", i + 1, short_id(peer_id), location);
@@ -1018,69 +1007,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
 
         Commands::Event { action } => {
             run_event_action(db, socket_override.as_deref(), action)?;
-        }
-
-        Commands::Intro {
-            peer_a,
-            peer_b,
-            ttl_ms,
-            attempt_window_ms,
-        } => {
-            let data = rpc_require_daemon(
-                db,
-                socket_override.as_deref(),
-                RpcMethod::Intro {
-                    peer_a,
-                    peer_b,
-                    ttl_ms,
-                    attempt_window_ms,
-                },
-            )?;
-            if data
-                .get("sent_to_both")
-                .and_then(|v| v.as_bool())
-                .unwrap_or(false)
-            {
-                println!("Intro sent to both peers");
-            } else {
-                eprintln!("Intro failed: {}", data);
-                std::process::exit(1);
-            }
-        }
-
-        Commands::IntroAttempts { peer } => {
-            let data = rpc_require_daemon(
-                db,
-                socket_override.as_deref(),
-                RpcMethod::IntroAttempts { peer },
-            )?;
-            if let Some(items) = data.as_array() {
-                if items.is_empty() {
-                    println!("No intro attempts recorded.");
-                } else {
-                    for r in items {
-                        let intro_id = r["intro_id"].as_str().unwrap_or("");
-                        println!("  intro_id:  {}...", &intro_id[..intro_id.len().min(16)]);
-                        let peer_id = r["other_peer_id"].as_str().unwrap_or("");
-                        println!("  peer:      {}", &peer_id[..peer_id.len().min(16)]);
-                        let intro_by = r["introduced_by_peer_id"].as_str().unwrap_or("");
-                        println!("  via:       {}", &intro_by[..intro_by.len().min(16)]);
-                        println!(
-                            "  endpoint:  {}:{}",
-                            r["origin_ip"].as_str().unwrap_or(""),
-                            r["origin_port"]
-                        );
-                        println!("  status:    {}", r["status"].as_str().unwrap_or(""));
-                        if let Some(err) = r["error"].as_str() {
-                            println!("  error:     {}", err);
-                        }
-                        println!("  created:   {}", r["created_at"]);
-                        println!();
-                    }
-                }
-            } else {
-                println!("No intro attempts recorded.");
-            }
         }
 
         Commands::CreateInvite {
@@ -1146,8 +1072,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 None => println!("  User:      (none)"),
             }
             match data["peer_shared_event_id"].as_str() {
-                Some(pid) => println!("  Peer:      {}", &pid[..pid.len().min(16)]),
-                None => println!("  Peer:      (none)"),
+                Some(pid) => println!("  Account:   {}", &pid[..pid.len().min(16)]),
+                None => println!("  Account:   (none)"),
             }
         }
 
@@ -1339,59 +1265,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         },
 
-        Commands::Upnp { action } => {
-            let action = match action.unwrap_or(UpnpCommand::Enable) {
-                UpnpCommand::Enable => UpnpAction::Enable,
-                UpnpCommand::Disable => UpnpAction::Disable,
-                UpnpCommand::Status => UpnpAction::Status,
-            };
-            let data =
-                rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Upnp { action })?;
-            let enabled = data["enabled"].as_bool().unwrap_or(false);
-            let status = data["status"].as_str().unwrap_or("unknown");
-            match status {
-                "success" => {
-                    let ext_port = data["mapped_external_port"]
-                        .as_u64()
-                        .map(|p| p.to_string())
-                        .unwrap_or_else(|| "?".into());
-                    let ext_ip = data["external_ip"].as_str().unwrap_or("unknown");
-                    println!(
-                        "upnp: {} success udp external_port={} external_ip={}",
-                        if enabled { "enabled" } else { "disabled" },
-                        ext_port,
-                        ext_ip
-                    );
-                    if data["double_nat"].as_bool().unwrap_or(false) {
-                        println!("warning: double-NAT detected \u{2014} external IP {} is not publicly routable; port forwarding may not be reachable from the internet", ext_ip);
-                    }
-                }
-                "failed" => {
-                    let err = data["error"].as_str().unwrap_or("unknown reason");
-                    println!(
-                        "upnp: {} failed ({})",
-                        if enabled { "enabled" } else { "disabled" },
-                        err
-                    );
-                }
-                "not_attempted" => {
-                    let err = data["error"].as_str().unwrap_or("unknown reason");
-                    if enabled {
-                        println!("upnp: enabled ({})", err);
-                    } else {
-                        println!("upnp: disabled");
-                    }
-                }
-                other => {
-                    println!(
-                        "upnp: {} {}",
-                        if enabled { "enabled" } else { "disabled" },
-                        other
-                    );
-                }
-            }
-        }
-
         Commands::Forward { action } => {
             let action = match action.unwrap_or(ForwardCommand::Status) {
                 ForwardCommand::Enable => ForwardAction::Enable,
@@ -1453,7 +1326,14 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     println!("  (none)");
                 } else {
                     for (i, item) in items.iter().enumerate() {
-                        let pid = item["peer_id"].as_str().unwrap_or("");
+                        let pid = item["daemon_peer_id"]
+                            .as_str()
+                            .or_else(|| item["peer_id"].as_str())
+                            .unwrap_or("");
+                        let shared_workspaces = item["shared_workspace_ids"]
+                            .as_array()
+                            .map(|items| items.len())
+                            .unwrap_or(0);
                         println!(
                             "  {}. {} at {}:{}",
                             i + 1,
@@ -1461,6 +1341,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             item["addr"].as_str().unwrap_or(""),
                             item["port"]
                         );
+                        if shared_workspaces > 0 {
+                            println!("     shared workspaces: {}", shared_workspaces);
+                        }
                     }
                 }
             }
