@@ -1,12 +1,28 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
+use crate::tuning::low_mem_mode;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncWindowKind {
     Full = 0,
     LastDay = 1,
     LastWeek = 2,
     LastTwelveWeeks = 3,
+}
+
+pub fn encode_sync_window_kind(kind: SyncWindowKind) -> u8 {
+    kind as u8
+}
+
+pub fn decode_sync_window_kind(kind: u8) -> Result<SyncWindowKind, String> {
+    match kind {
+        0 => Ok(SyncWindowKind::Full),
+        1 => Ok(SyncWindowKind::LastDay),
+        2 => Ok(SyncWindowKind::LastWeek),
+        3 => Ok(SyncWindowKind::LastTwelveWeeks),
+        other => Err(format!("unsupported sync window kind {}", other)),
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -24,17 +40,19 @@ const HOUR_MS: i64 = 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 const WEEK_MS: i64 = 7 * DAY_MS;
 const TWELVE_WEEK_MS: i64 = 12 * WEEK_MS;
-const TIER_ORDER: [SyncWindowKind; 4] = [
+const DEFAULT_TIER_ORDER: [SyncWindowKind; 4] = [
     SyncWindowKind::LastDay,
     SyncWindowKind::LastWeek,
     SyncWindowKind::LastTwelveWeeks,
     SyncWindowKind::Full,
 ];
+const LOW_MEM_TIER_ORDER: [SyncWindowKind; 2] = [SyncWindowKind::LastDay, SyncWindowKind::LastWeek];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct PlannerState {
     next_idx: usize,
     cycle_anchor_now_ms: Option<i64>,
+    restrict_to_low_mem_windows: bool,
 }
 
 fn planner_state() -> &'static Mutex<HashMap<String, PlannerState>> {
@@ -57,7 +75,16 @@ fn state_for<'a>(
         .or_insert(PlannerState {
             next_idx: 0,
             cycle_anchor_now_ms: None,
+            restrict_to_low_mem_windows: false,
         })
+}
+
+fn planner_tier_order(planner: &PlannerState) -> &'static [SyncWindowKind] {
+    if low_mem_mode() || planner.restrict_to_low_mem_windows {
+        &LOW_MEM_TIER_ORDER
+    } else {
+        &DEFAULT_TIER_ORDER
+    }
 }
 
 pub fn reset_outbound_window_state(db_path: &str, recorded_by: &str, peer_id: &str) {
@@ -77,7 +104,8 @@ pub fn prime_outbound_window_kind(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let planner = state_for(&mut state, db_path, recorded_by, peer_id);
-    let idx = TIER_ORDER
+    let tier_order = planner_tier_order(planner);
+    let idx = tier_order
         .iter()
         .position(|candidate| *candidate == kind)
         .unwrap_or(0);
@@ -96,9 +124,10 @@ pub fn select_outbound_window(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let planner = state_for(&mut state, db_path, recorded_by, peer_id);
+    let tier_order = planner_tier_order(planner);
     let anchor_now_ms = *planner.cycle_anchor_now_ms.get_or_insert(now_ms);
-    let idx = planner.next_idx % TIER_ORDER.len();
-    let kind = TIER_ORDER[idx];
+    let idx = planner.next_idx % tier_order.len();
+    let kind = tier_order[idx];
     assign_window(
         window_for_kind(kind, anchor_now_ms),
         kind,
@@ -118,10 +147,21 @@ pub fn mark_outbound_window_completed(
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
     let planner = state_for(&mut state, db_path, recorded_by, peer_id);
-    planner.next_idx = (planner.next_idx + 1) % TIER_ORDER.len();
+    let tier_order = planner_tier_order(planner);
+    planner.next_idx = (planner.next_idx + 1) % tier_order.len();
     if planner.next_idx == 0 {
         planner.cycle_anchor_now_ms = None;
     }
+}
+
+pub fn restrict_outbound_windows_to_last_week(db_path: &str, recorded_by: &str, peer_id: &str) {
+    let mut state = planner_state()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let planner = state_for(&mut state, db_path, recorded_by, peer_id);
+    planner.restrict_to_low_mem_windows = true;
+    planner.next_idx %= LOW_MEM_TIER_ORDER.len();
+    planner.cycle_anchor_now_ms = None;
 }
 
 fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
@@ -151,6 +191,10 @@ fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
 
 pub fn is_hot_window(kind: SyncWindowKind) -> bool {
     matches!(kind, SyncWindowKind::LastDay)
+}
+
+pub fn is_low_mem_allowed_window(kind: SyncWindowKind) -> bool {
+    matches!(kind, SyncWindowKind::LastDay | SyncWindowKind::LastWeek)
 }
 
 fn normalized_live_peers(peer_id: &str, live_peer_ids: &[String]) -> Vec<String> {
@@ -260,13 +304,7 @@ pub fn decode_initial_neg_open(msg: &[u8]) -> Result<(SyncWindow, &[u8]), String
     if version != WINDOW_VERSION {
         return Err(format!("unsupported sync window version {}", version));
     }
-    let kind = match msg[5] {
-        0 => SyncWindowKind::Full,
-        1 => SyncWindowKind::LastDay,
-        2 => SyncWindowKind::LastWeek,
-        3 => SyncWindowKind::LastTwelveWeeks,
-        other => return Err(format!("unsupported sync window kind {}", other)),
-    };
+    let kind = decode_sync_window_kind(msg[5])?;
     let ts_min = i64::from_le_bytes(
         msg[6..14]
             .try_into()
@@ -290,6 +328,27 @@ pub fn decode_initial_neg_open(msg: &[u8]) -> Result<(SyncWindow, &[u8]), String
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    struct EnvGuard {
+        prev_low_mem_ios: Option<String>,
+    }
+
+    impl EnvGuard {
+        fn enable_low_mem_ios() -> Self {
+            let prev_low_mem_ios = std::env::var("LOW_MEM_IOS").ok();
+            std::env::set_var("LOW_MEM_IOS", "1");
+            Self { prev_low_mem_ios }
+        }
+    }
+
+    impl Drop for EnvGuard {
+        fn drop(&mut self) {
+            match &self.prev_low_mem_ios {
+                Some(v) => std::env::set_var("LOW_MEM_IOS", v),
+                None => std::env::remove_var("LOW_MEM_IOS"),
+            }
+        }
+    }
 
     #[test]
     fn range_scheduler_round_robins_windows() {
@@ -325,6 +384,70 @@ mod tests {
     }
 
     #[test]
+    fn lowmem_range_scheduler_round_robins_day_and_week_only() {
+        let _env = EnvGuard::enable_low_mem_ios();
+        let db_path = "/tmp/window-round-robin-lowmem";
+        let recorded_by = "tenant-a";
+        let peer_id = "peer-a";
+        let live_peers = vec![peer_id.to_string()];
+        reset_outbound_window_state(db_path, recorded_by, peer_id);
+
+        let kinds: Vec<SyncWindowKind> = (0..6)
+            .map(|_| {
+                let window =
+                    select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 1_000_000);
+                let kind = window.kind;
+                mark_outbound_window_completed(db_path, recorded_by, peer_id, window);
+                kind
+            })
+            .collect();
+
+        assert_eq!(
+            kinds,
+            vec![
+                SyncWindowKind::LastDay,
+                SyncWindowKind::LastWeek,
+                SyncWindowKind::LastDay,
+                SyncWindowKind::LastWeek,
+                SyncWindowKind::LastDay,
+                SyncWindowKind::LastWeek,
+            ]
+        );
+    }
+
+    #[test]
+    fn peer_restricted_to_lowmem_windows_round_robins_day_and_week_only() {
+        let db_path = "/tmp/window-round-robin-remote-lowmem";
+        let recorded_by = "tenant-a";
+        let peer_id = "peer-a";
+        let live_peers = vec![peer_id.to_string()];
+        reset_outbound_window_state(db_path, recorded_by, peer_id);
+        restrict_outbound_windows_to_last_week(db_path, recorded_by, peer_id);
+
+        let kinds: Vec<SyncWindowKind> = (0..6)
+            .map(|_| {
+                let window =
+                    select_outbound_window(db_path, recorded_by, peer_id, &live_peers, 1_000_000);
+                let kind = window.kind;
+                mark_outbound_window_completed(db_path, recorded_by, peer_id, window);
+                kind
+            })
+            .collect();
+
+        assert_eq!(
+            kinds,
+            vec![
+                SyncWindowKind::LastDay,
+                SyncWindowKind::LastWeek,
+                SyncWindowKind::LastDay,
+                SyncWindowKind::LastWeek,
+                SyncWindowKind::LastDay,
+                SyncWindowKind::LastWeek,
+            ]
+        );
+    }
+
+    #[test]
     fn scheduler_uses_adjacent_non_full_windows() {
         let day = window_for_kind(SyncWindowKind::LastDay, 1_000_000);
         let week = window_for_kind(SyncWindowKind::LastWeek, 1_000_000);
@@ -342,6 +465,14 @@ mod tests {
 
         assert_eq!(full.ts_min(), Some(ALL_START_MS));
         assert_eq!(full.ts_max_exclusive(), Some(1_000_000 - TWELVE_WEEK_MS));
+    }
+
+    #[test]
+    fn lowmem_allows_only_day_and_week_windows() {
+        assert!(is_low_mem_allowed_window(SyncWindowKind::LastDay));
+        assert!(is_low_mem_allowed_window(SyncWindowKind::LastWeek));
+        assert!(!is_low_mem_allowed_window(SyncWindowKind::LastTwelveWeeks));
+        assert!(!is_low_mem_allowed_window(SyncWindowKind::Full));
     }
 
     #[test]

@@ -164,6 +164,14 @@ fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> S
                 )
             }
         }
+        "RangePolicyReject" => {
+            let rejected = v["rejected_window_kind"].as_u64().unwrap_or(0);
+            let oldest_allowed = v["oldest_allowed_window_kind"].as_u64().unwrap_or(0);
+            format!(
+                " detail=range_policy(rejected_kind={} oldest_allowed_kind={})",
+                rejected, oldest_allowed
+            )
+        }
         "Event" => {
             let eid = v["event_id"].as_str().unwrap_or("");
             let blob_len = v["blob_len"].as_u64().unwrap_or(0);

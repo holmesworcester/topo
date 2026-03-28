@@ -121,7 +121,14 @@ async fn normal_roundtrip_stays_healthy_until_cancel() {
         let storage = empty_negentropy_storage();
         let mut neg =
             negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
-        let initial_msg = neg.initiate().unwrap();
+        let initial_msg = topo::sync::session::windowing::encode_initial_neg_open(
+            topo::sync::session::windowing::SyncWindow {
+                kind: topo::sync::session::windowing::SyncWindowKind::LastDay,
+                ts_min_inclusive_ms: Some(0),
+                ts_max_exclusive_ms: None,
+            },
+            neg.initiate().unwrap(),
+        );
         peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
             .await;
 
@@ -325,7 +332,14 @@ async fn fragmented_data_frames_handler_completes() {
         let storage = empty_negentropy_storage();
         let mut neg =
             negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
-        let initial_msg = neg.initiate().unwrap();
+        let initial_msg = topo::sync::session::windowing::encode_initial_neg_open(
+            topo::sync::session::windowing::SyncWindow {
+                kind: topo::sync::session::windowing::SyncWindowKind::LastDay,
+                ts_min_inclusive_ms: Some(0),
+                ts_max_exclusive_ms: None,
+            },
+            neg.initiate().unwrap(),
+        );
         peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
             .await;
 

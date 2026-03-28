@@ -12,6 +12,7 @@ pub const MSG_TYPE_NEG_OPEN: u8 = 0x10; // Initial negentropy message
 pub const MSG_TYPE_NEG_MSG: u8 = 0x11; // Negentropy response
 pub const MSG_TYPE_REQUEST_IDS: u8 = 0x12; // Sink request: source should send these IDs
 pub const MSG_TYPE_DISCOVERY_HINTS: u8 = 0x14; // Discovery hint: peer is missing these IDs
+pub const MSG_TYPE_RANGE_POLICY_REJECT: u8 = 0x15; // Peer explicitly rejects a sync window policy
 pub const MSG_TYPE_EVENT: u8 = 0x03; // Event blob (variable length)
 pub const MSG_TYPE_INTRO_OFFER: u8 = 0x30; // Intro offer for hole punching
 pub const MSG_TYPE_OPEN_SESSION_AUTH_PEER_SHARED: u8 = 0x31;
@@ -81,6 +82,12 @@ pub enum Frame {
     DiscoveryHints {
         priority_lane: u8,
         hints: Vec<DiscoveryHint>,
+    },
+    /// Peer explicitly rejected the requested sync window and advertises the
+    /// oldest window kind it is willing to accept.
+    RangePolicyReject {
+        rejected_window_kind: u8,
+        oldest_allowed_window_kind: u8,
     },
     /// Send full event blob (variable length)
     Event {
@@ -208,6 +215,19 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
                     hints,
                 },
                 total_size,
+            ))
+        }
+        MSG_TYPE_RANGE_POLICY_REJECT => {
+            const RANGE_POLICY_REJECT_SIZE: usize = 3;
+            if input.len() < RANGE_POLICY_REJECT_SIZE {
+                return Err(ParseError::InsufficientData);
+            }
+            Ok((
+                Frame::RangePolicyReject {
+                    rejected_window_kind: input[1],
+                    oldest_allowed_window_kind: input[2],
+                },
+                RANGE_POLICY_REJECT_SIZE,
             ))
         }
         MSG_TYPE_EVENT => {
@@ -411,6 +431,16 @@ pub fn encode_frame(msg: &Frame) -> Vec<u8> {
                 buf.extend_from_slice(&hint.encoded_size_bytes.to_le_bytes());
                 buf.extend_from_slice(&hint.created_at_ms.to_le_bytes());
             }
+            buf
+        }
+        Frame::RangePolicyReject {
+            rejected_window_kind,
+            oldest_allowed_window_kind,
+        } => {
+            let mut buf = Vec::with_capacity(3);
+            buf.push(MSG_TYPE_RANGE_POLICY_REJECT);
+            buf.push(*rejected_window_kind);
+            buf.push(*oldest_allowed_window_kind);
             buf
         }
         Frame::Event { blob } => {
@@ -763,6 +793,18 @@ mod tests {
                     created_at_ms: 2_000,
                 },
             ],
+        };
+        let encoded = encode_frame(&msg);
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_range_policy_reject_roundtrip() {
+        let msg = Frame::RangePolicyReject {
+            rejected_window_kind: 3,
+            oldest_allowed_window_kind: 2,
         };
         let encoded = encode_frame(&msg);
         let (parsed, consumed) = parse_frame(&encoded).unwrap();

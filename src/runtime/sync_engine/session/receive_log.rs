@@ -236,6 +236,12 @@ impl ReceiveLogWriter {
         }
         Ok(Some(self.path))
     }
+
+    pub fn abort(self) {
+        let path = self.path;
+        drop(self.file);
+        let _ = fs::remove_file(path);
+    }
 }
 
 pub fn receive_log_dir(db_path: &str) -> PathBuf {
