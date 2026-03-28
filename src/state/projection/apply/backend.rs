@@ -5,6 +5,7 @@ use crate::event_modules::{EventTypeMeta, ParsedEvent};
 use crate::projection::contract::{ContextSnapshot, EmitCommand, WriteOp};
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::encrypted::project_encrypted;
+use crate::projection::queries::SqliteProjectionQueries;
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
 use rusqlite::Connection;
 
@@ -189,7 +190,8 @@ impl ProjectionBackend for SqliteProjectionBackend<'_> {
         event_id_b64: &str,
         parsed: &ParsedEvent,
     ) -> ProjectionApplyResult<ContextSnapshot> {
-        (meta.context_loader)(self.conn, recorded_by, event_id_b64, parsed)
+        let queries = SqliteProjectionQueries::new(self.conn);
+        (meta.context_loader)(&queries, recorded_by, event_id_b64, parsed)
     }
 
     fn execute_write_ops(&self, ops: &[WriteOp]) -> ProjectionApplyResult<()> {

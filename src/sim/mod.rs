@@ -3,6 +3,7 @@ pub mod hash_graph;
 pub mod key_repair;
 pub mod knowledge;
 pub mod large_graph_sample;
+pub mod node_behavior;
 pub mod pair_sync;
 #[allow(dead_code)]
 mod peer_db_bridge;
@@ -25,6 +26,10 @@ pub use large_graph_sample::{
     run_large_graph_sampled_decrypt_trial, LargeGraphSampleDecryptConfig,
     LargeGraphSampleDecryptPeerReport, LargeGraphSampleDecryptReport,
 };
+pub use node_behavior::{
+    sqlite_behavior_summary, BehaviorRow, BehaviorValue, EventProjectionFilter, NodeBehaviorEngine,
+    NodeBehaviorSummary,
+};
 pub use pair_sync::{
     plan_pair_sync_intents, run_pair_sync_session, PairSyncDirectionStats, PairSyncIntent,
     PairSyncSessionStats, SimPeerNode,
@@ -35,9 +40,9 @@ pub use planner_runner::{
 };
 pub use query_snapshot::{
     import_local_tenants_from_db, import_peer_state, snapshot_messages_via_rpc,
-    snapshot_replayed_peer, snapshot_replayed_peer_to_path, ImportedBootstrapTarget,
-    ImportedConnectTarget, ImportedKnownEvent, ImportedObservedTarget, ImportedPeerState,
-    QuerySnapshot,
+    snapshot_replayed_peer, snapshot_replayed_peer_to_path, ImportedBootstrapContextRow,
+    ImportedBootstrapTarget, ImportedConnectTarget, ImportedKnownEvent, ImportedObservedTarget,
+    ImportedPeerState, QuerySnapshot,
 };
 pub use runner::{PeerSimulationState, Simulation, SimulationReport, SimulationSummary};
 pub use scenario::{

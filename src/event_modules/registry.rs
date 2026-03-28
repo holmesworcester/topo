@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use super::{EventError, ParsedEvent};
 use crate::projection::contract::{ContextSnapshot, ProjectorResult};
-use rusqlite::Connection;
+use crate::projection::queries::ProjectionQueries;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareScope {
@@ -48,7 +48,7 @@ pub struct EventTypeMeta {
     /// Module-owned projector context loader. Projector-specific context queries
     /// belong in the owning event module, not in shared apply code.
     pub context_loader: fn(
-        &Connection,
+        &dyn ProjectionQueries,
         &str,
         &str,
         &ParsedEvent,
@@ -58,7 +58,7 @@ pub struct EventTypeMeta {
 /// Default context loader for event types whose projectors do not require
 /// additional DB-derived context.
 pub fn load_empty_context(
-    _conn: &Connection,
+    _queries: &dyn ProjectionQueries,
     _recorded_by: &str,
     _event_id_b64: &str,
     _parsed: &ParsedEvent,

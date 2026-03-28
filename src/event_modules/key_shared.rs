@@ -121,8 +121,7 @@ pub fn encode_key_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::encrypted::unwrap_key_from_sender;
-use crate::projection::signer::{resolve_signer_key, SignerResolution};
+use crate::projection::queries::ProjectionQueries;
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -149,9 +148,9 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 }
 
 pub fn build_projector_context(
-    conn: &Connection,
+    queries: &dyn ProjectionQueries,
     recorded_by: &str,
-    _event_id_b64: &str,
+    event_id_b64: &str,
     parsed: &ParsedEvent,
 ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
     let ss = match parsed {
@@ -159,51 +158,7 @@ pub fn build_projector_context(
         _ => return Err("key_shared context loader called for non-key_shared event".into()),
     };
 
-    let recipient_b64 = event_id_to_base64(&ss.recipient_event_id);
-    let unwrap_key_b64 = event_id_to_base64(&ss.unwrap_key_event_id);
-
-    let invite_secret_row: Option<Vec<u8>> = conn
-        .query_row(
-            "SELECT private_key
-             FROM invite_secrets
-             WHERE recorded_by = ?1
-               AND event_id = ?2
-               AND invite_event_id = ?3
-             LIMIT 1",
-            rusqlite::params![recorded_by, &unwrap_key_b64, &recipient_b64],
-            |row| row.get(0),
-        )
-        .ok();
-
-    let private_key_bytes = match invite_secret_row {
-        Some(v) => v,
-        None => return Ok(ContextSnapshot::default()),
-    };
-    if private_key_bytes.len() != 32 {
-        return Ok(ContextSnapshot::default());
-    }
-
-    let mut key_arr = [0u8; 32];
-    key_arr.copy_from_slice(&private_key_bytes);
-    let local_signing_key = ed25519_dalek::SigningKey::from_bytes(&key_arr);
-
-    let sender_key = match resolve_signer_key(conn, recorded_by, ss.signer_type, &ss.signed_by) {
-        Ok(SignerResolution::Found(k)) => k,
-        _ => return Ok(ContextSnapshot::default()),
-    };
-    let sender_pub = match ed25519_dalek::VerifyingKey::from_bytes(&sender_key) {
-        Ok(vk) => vk,
-        Err(_) => return Ok(ContextSnapshot::default()),
-    };
-
-    let plaintext_key = unwrap_key_from_sender(&local_signing_key, &sender_pub, &ss.wrapped_key);
-
-    Ok(ContextSnapshot {
-        unwrapped_secret_material: Some(crate::projection::contract::UnwrappedSecretMaterial {
-            key_bytes: plaintext_key,
-        }),
-        ..ContextSnapshot::default()
-    })
+    queries.load_key_shared_context(recorded_by, event_id_b64, ss)
 }
 
 pub fn project_pure(

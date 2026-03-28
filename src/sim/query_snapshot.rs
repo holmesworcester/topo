@@ -66,6 +66,15 @@ pub struct ImportedConnectTarget {
     pub invite_event_id: Option<String>,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ImportedBootstrapContextRow {
+    pub invite_event_id: String,
+    pub workspace_id: String,
+    pub bootstrap_addr: String,
+    pub bootstrap_spki_fingerprint: Vec<u8>,
+    pub observed_at: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct ImportedPeerState {
     pub recorded_by: String,
@@ -75,6 +84,7 @@ pub struct ImportedPeerState {
     pub local_transport_source: Option<String>,
     pub authorized_transport_rows: Vec<AuthorizedTransportRow>,
     pub bootstrap_targets: Vec<ImportedBootstrapTarget>,
+    pub bootstrap_context_rows: Vec<ImportedBootstrapContextRow>,
     pub observed_targets: Vec<ImportedObservedTarget>,
     pub connect_targets: Vec<ImportedConnectTarget>,
     pub known_events: Vec<ImportedKnownEvent>,
@@ -159,6 +169,23 @@ pub fn import_peer_state(
             bootstrap_addr: target.bootstrap_addr,
         })
         .collect::<Vec<_>>();
+    let mut bootstrap_context_stmt = conn.prepare(
+        "SELECT invite_event_id, workspace_id, bootstrap_addr, bootstrap_spki_fingerprint, observed_at
+         FROM bootstrap_context
+         WHERE recorded_by = ?1
+         ORDER BY observed_at ASC, rowid ASC",
+    )?;
+    let bootstrap_context_rows = bootstrap_context_stmt
+        .query_map(rusqlite::params![recorded_by], |row| {
+            Ok(ImportedBootstrapContextRow {
+                invite_event_id: row.get(0)?,
+                workspace_id: row.get(1)?,
+                bootstrap_addr: row.get(2)?,
+                bootstrap_spki_fingerprint: row.get(3)?,
+                observed_at: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
     let observed_targets =
         load_observed_endpoint_targets(source_db_path, &[recorded_by.to_string()])?
             .into_iter()
@@ -232,6 +259,7 @@ pub fn import_peer_state(
         local_transport_source: local_target.as_ref().map(|target| target.source.clone()),
         authorized_transport_rows,
         bootstrap_targets,
+        bootstrap_context_rows,
         observed_targets,
         connect_targets,
         known_events,

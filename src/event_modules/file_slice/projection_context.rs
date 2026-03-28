@@ -1,9 +1,9 @@
 use std::collections::HashMap;
 
 use super::super::ParsedEvent;
-use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{ContextSnapshot, FileDescriptorInfo};
-use rusqlite::{Connection, OptionalExtension};
+use crate::projection::contract::ContextSnapshot;
+use crate::projection::queries::ProjectionQueries;
+use rusqlite::Connection;
 
 fn is_file_slice_transport_blob(blob: &[u8]) -> bool {
     crate::event_modules::outer_semantic_type_code(blob)
@@ -12,58 +12,17 @@ fn is_file_slice_transport_blob(blob: &[u8]) -> bool {
 
 /// Build projector-local context for FileSlice projection.
 pub fn build_projector_context(
-    conn: &Connection,
+    queries: &dyn ProjectionQueries,
     recorded_by: &str,
-    _event_id_b64: &str,
+    event_id_b64: &str,
     parsed: &ParsedEvent,
 ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
-    let fs = match parsed {
-        ParsedEvent::FileSlice(fs) => fs,
+    let file_slice = match parsed {
+        ParsedEvent::FileSlice(file_slice) => file_slice,
         _ => return Err("file_slice context loader called for non-file_slice event".into()),
     };
 
-    let mut ctx = ContextSnapshot::default();
-    let file_id_b64 = event_id_to_base64(&fs.file_id);
-
-    ctx.deleted_file_message_id = conn
-        .query_row(
-            "SELECT message_id
-             FROM deleted_files
-             WHERE recorded_by = ?1 AND file_id = ?2",
-            rusqlite::params![recorded_by, &file_id_b64],
-            |row| row.get::<_, String>(0),
-        )
-        .optional()?;
-
-    let mut desc_stmt = conn.prepare(
-        "SELECT event_id, signer_event_id, key_event_id
-         FROM files
-         WHERE recorded_by = ?1 AND file_id = ?2
-         ORDER BY created_at ASC, event_id ASC",
-    )?;
-    ctx.file_descriptors = desc_stmt
-        .query_map(rusqlite::params![recorded_by, &file_id_b64], |row| {
-            Ok(FileDescriptorInfo {
-                event_id: row.get::<_, String>(0)?,
-                signer_event_id: row.get::<_, String>(1)?,
-                key_event_id: row.get::<_, String>(2)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
-
-    ctx.existing_file_slice = match conn.query_row(
-        "SELECT event_id, descriptor_event_id
-         FROM file_slices
-         WHERE recorded_by = ?1 AND file_id = ?2 AND slice_number = ?3",
-        rusqlite::params![recorded_by, &file_id_b64, fs.slice_number as i64],
-        |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
-    ) {
-        Ok(v) => Some(v),
-        Err(rusqlite::Error::QueryReturnedNoRows) => None,
-        Err(e) => return Err(e.into()),
-    };
-
-    Ok(ctx)
+    queries.load_file_slice_context(recorded_by, event_id_b64, file_slice)
 }
 
 /// Query file-slice event counts grouped by ingest source.
@@ -86,7 +45,7 @@ pub fn file_slice_event_counts_by_source(
         )
         .expect("failed to prepare file_slice_event_counts_by_source");
     let rows = stmt
-        .query_map(rusqlite::params![recorded_by], |row| {
+        .query_map(rusqlite::params![recorded_by], |row: &rusqlite::Row<'_>| {
             Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
         })
         .expect("failed to query file_slice_event_counts_by_source");
@@ -110,7 +69,7 @@ pub fn file_slice_event_count(conn: &Connection, recorded_by: &str) -> i64 {
              JOIN recorded_events re ON e.event_id = re.event_id AND re.peer_id = ?1",
         )
         .expect("failed to prepare file_slice_event_count");
-    stmt.query_map(rusqlite::params![recorded_by], |row| {
+    stmt.query_map(rusqlite::params![recorded_by], |row: &rusqlite::Row<'_>| {
         row.get::<_, Vec<u8>>(0)
     })
     .expect("failed to query file_slice_event_count")
