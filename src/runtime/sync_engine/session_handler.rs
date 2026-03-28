@@ -249,8 +249,11 @@ impl SessionHandler for SyncConnectionHandler {
             None => (None, None),
         };
 
+        // No hard total-session timeout.  Liveness is enforced at each phase:
+        //   - Negentropy control: INITIAL_CONTROL_PROGRESS_TIMEOUT (5 s per message)
+        //   - Data receive: activity_timeout (idle between chunks)
+        // A session that is still transferring data should never be killed.
         let mut stats: Option<crate::runtime::SyncStats> = None;
-        let session_timeout = std::time::Duration::from_secs(self.timeout_secs.saturating_add(10));
         let result = match (self.direction, meta.direction) {
             (SessionDirection::Outbound, SessionDirection::Outbound) => {
                 info!(
@@ -273,14 +276,8 @@ impl SessionHandler for SyncConnectionHandler {
                 tokio::pin!(run);
                 let run_result: Result<crate::runtime::SyncStats, String> = tokio::select! {
                     _ = cancel.cancelled() => Err(format!("session {} cancelled", meta.session_id)),
-                    result = tokio::time::timeout(session_timeout, &mut run) => {
-                        match result {
-                            Ok(result) => result.map_err(|e| format!("initiator sync failed: {e}")),
-                            Err(_) => Err(format!(
-                                "initiator sync timed out after {}s",
-                                session_timeout.as_secs()
-                            )),
-                        }
+                    result = &mut run => {
+                        result.map_err(|e| format!("initiator sync failed: {e}"))
                     },
                 };
                 match run_result {
@@ -312,15 +309,8 @@ impl SessionHandler for SyncConnectionHandler {
                 tokio::pin!(run);
                 let run_result: Result<crate::runtime::SyncStats, String> = tokio::select! {
                     _ = cancel.cancelled() => Err(format!("session {} cancelled", meta.session_id)),
-                    result = tokio::time::timeout(session_timeout, &mut run) => {
-                        match result {
-                            Ok(result) => result
-                                .map_err(|e| format!("responder sync failed: {e}")),
-                            Err(_) => Err(format!(
-                                "responder sync timed out after {}s",
-                                session_timeout.as_secs()
-                            )),
-                        }
+                    result = &mut run => {
+                        result.map_err(|e| format!("responder sync failed: {e}"))
                     },
                 };
                 match run_result {

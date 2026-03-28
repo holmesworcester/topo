@@ -9,8 +9,11 @@ use crate::protocol::{encode_frame, parse_frame, Frame};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
 
-/// Largest legal sync frame today is NegOpen/NegMsg: 1 byte tag + 4 byte len + 4 MiB payload.
-pub const DEFAULT_SYNC_FRAME_MAX_BYTES: usize = (4 * 1024 * 1024) + 5;
+/// Largest legal sync frame: tag(1) + len(4) + payload.  With negentropy
+/// frame_size_limit=0 (unlimited), reconciliation messages can reach ~16 MB for
+/// 500k fully-divergent items.  128 MiB leaves headroom without OOM risk (the
+/// recv buffer grows lazily).
+pub const DEFAULT_SYNC_FRAME_MAX_BYTES: usize = (128 * 1024 * 1024) + 5;
 
 pub struct QuicTransportSessionIo<C: StreamConn, S: StreamSend, R: StreamRecv> {
     session_id: u64,

@@ -62,7 +62,12 @@ pub type IntroSpawnerFn = fn(
 /// Endpoint observation TTL: 24 hours in milliseconds.
 pub(super) const ENDPOINT_TTL_MS: i64 = 24 * 60 * 60 * 1000;
 
-/// Long-lived sync-session activity timeout for initiator and responder (seconds).
+/// Activity timeout for sync data transfer (seconds).
+///
+/// Used as the idle timeout between data chunks in the receive task.  If no
+/// data arrives for this long, the receive side treats the transfer as stalled.
+/// This is NOT a total session timeout — sessions run until completion as long
+/// as data keeps flowing.
 pub const SYNC_SESSION_TIMEOUT_SECS: u64 = 60;
 
 /// Sleep after a failed QUIC connection attempt before retrying.

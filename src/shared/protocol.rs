@@ -18,8 +18,11 @@ pub const MSG_TYPE_OPEN_SESSION_AUTH_PEER_SHARED: u8 = 0x31;
 pub const MSG_TYPE_OPEN_SESSION_AUTH_INVITE: u8 = 0x32;
 pub const MSG_TYPE_OPEN_SESSION_AUTH_ACK: u8 = 0x33;
 
-/// Max negentropy message payload: 4 MiB (generous for large reconciliation rounds)
-const MAX_NEG_MSG_BYTES: usize = 4 * 1024 * 1024;
+/// Max negentropy message payload.  With frame_size_limit=0 (unlimited), the
+/// negentropy library may produce multi-MB messages for large divergent sets
+/// (e.g. 500k items ≈ 18 MB of IdLists in worst case).  128 MiB leaves ample
+/// headroom without risking OOM from a single malformed frame.
+const MAX_NEG_MSG_BYTES: usize = 128 * 1024 * 1024;
 /// Max number of IDs or discovery hints carried in one control-plane frame.
 const MAX_ID_LIST_ENTRIES: usize = 100_000;
 const DISCOVERY_HINT_WIRE_BYTES: usize = 32 + 1 + 4 + 8;

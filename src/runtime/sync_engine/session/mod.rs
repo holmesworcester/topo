@@ -16,7 +16,13 @@ pub use responder::run_sync_responder;
 // ---------------------------------------------------------------------------
 
 /// Negentropy frame size limit for all range sessions.
-pub(super) const NEGENTROPY_FRAME_SIZE_LIMIT: u64 = 256 * 1024;
+///
+/// Set to 0 (unlimited) because we run over QUIC streams which handle flow
+/// control natively.  A non-zero limit forces the protocol into many small
+/// round-trips (one per 256 KB of reconciliation data), causing multi-session
+/// churn at scale.  With 0, the full reconciliation completes in 3-5 rounds
+/// regardless of set size.
+pub(super) const NEGENTROPY_FRAME_SIZE_LIMIT: u64 = 0;
 /// Maximum time a session may sit without any initial control-round progress.
 /// If a session never gets past the first negentropy exchange, restarting it is
 /// better than blocking the connection supervisor for the full activity timeout.
