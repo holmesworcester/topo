@@ -176,10 +176,33 @@ where
                         buffer.drain(..offset);
                     }
                 }
-                Ok(Err(ConnectionError::Closed)) => break,
-                Ok(Err(_)) => break,
-                Err(_) => break,
+                Ok(Err(ConnectionError::Closed)) => {
+                    if !buffer.is_empty() {
+                        writer.abort();
+                        return Err("range data stream closed with a truncated record".to_string());
+                    }
+                    break;
+                }
+                Ok(Err(err)) => {
+                    writer.abort();
+                    return Err(format!(
+                        "range data receive aborted after {} events: {}",
+                        events_received, err
+                    ));
+                }
+                Err(_) => {
+                    writer.abort();
+                    return Err(format!(
+                        "range data receive timed out after {} events",
+                        events_received
+                    ));
+                }
             }
+        }
+
+        if !buffer.is_empty() {
+            writer.abort();
+            return Err("range data stream ended with a truncated record".to_string());
         }
 
         Ok(RangeReceiveResult {
@@ -188,4 +211,81 @@ where
             path: writer.finish()?,
         })
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::VecDeque;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::transport::connection::ConnectionError;
+
+    fn encode_blob_record(blob: &[u8]) -> Vec<u8> {
+        let mut out = Vec::with_capacity(4 + blob.len());
+        out.extend_from_slice(&(blob.len() as u32).to_le_bytes());
+        out.extend_from_slice(blob);
+        out
+    }
+
+    struct FakeRecv {
+        chunks: Arc<Mutex<VecDeque<Result<Vec<u8>, ConnectionError>>>>,
+    }
+
+    #[async_trait]
+    impl StreamRecv for FakeRecv {
+        async fn recv(&mut self) -> Result<crate::protocol::Frame, ConnectionError> {
+            Err(ConnectionError::Closed)
+        }
+
+        async fn recv_chunk(&mut self) -> Result<Vec<u8>, ConnectionError> {
+            self.chunks
+                .lock()
+                .unwrap()
+                .pop_front()
+                .unwrap_or(Err(ConnectionError::Closed))
+        }
+    }
+
+    #[tokio::test]
+    async fn receive_log_task_errors_on_midstream_receive_failure() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let recv = FakeRecv {
+            chunks: Arc::new(Mutex::new(VecDeque::from(vec![
+                Ok(encode_blob_record(b"one")),
+                Err(ConnectionError::Io(std::io::Error::other("boom"))),
+            ]))),
+        };
+
+        let task = spawn_receive_log_task(
+            recv,
+            db_path.to_str().unwrap().to_string(),
+            "tenant-a".to_string(),
+            77,
+            "peer-x".to_string(),
+            Duration::from_secs(1),
+            None,
+        );
+        let result = task.await.unwrap();
+        let err = match result {
+            Ok(_) => panic!("midstream receive failure should abort the range"),
+            Err(err) => err,
+        };
+        assert!(err.contains("range data receive aborted"));
+
+        let log_dir = db_path.with_extension("receive-logs");
+        let leftovers: Vec<_> = std::fs::read_dir(&log_dir)
+            .ok()
+            .into_iter()
+            .flat_map(|entries| entries.filter_map(Result::ok))
+            .collect();
+        assert!(
+            leftovers.is_empty(),
+            "aborted receive should not leave partial receive logs behind"
+        );
+    }
 }

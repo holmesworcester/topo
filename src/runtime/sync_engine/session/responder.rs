@@ -15,9 +15,13 @@ use crate::sync::session::range_session::{
 use crate::sync::session::receive_log::{
     enqueue_receive_log_ingest, note_hot_receive_finished, note_hot_receive_started,
 };
-use crate::sync::session::windowing::{decode_initial_neg_open, is_hot_window};
+use crate::sync::session::windowing::{
+    decode_initial_neg_open, encode_sync_window_kind, is_hot_window, is_low_mem_allowed_window,
+    SyncWindowKind,
+};
 use crate::sync::session::{INITIAL_CONTROL_PROGRESS_TIMEOUT, NEGENTROPY_FRAME_SIZE_LIMIT};
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
+use crate::tuning::low_mem_mode;
 use negentropy::{Id, Negentropy};
 
 type ManualRoundReply =
@@ -111,6 +115,23 @@ where
         return Err("responder expected NegOpen".into());
     };
     let (range, neg_msg) = decode_initial_neg_open(&msg)?;
+    if low_mem_mode() && !is_low_mem_allowed_window(range.kind) {
+        control
+            .send(&Frame::RangePolicyReject {
+                rejected_window_kind: encode_sync_window_kind(range.kind),
+                oldest_allowed_window_kind: encode_sync_window_kind(SyncWindowKind::LastWeek),
+            })
+            .await?;
+        control.flush().await?;
+        return Ok(SyncStats {
+            events_sent: 0,
+            events_received: 0,
+            neg_rounds: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            duration_ms: start.elapsed().as_millis(),
+        });
+    }
 
     let db = open_connection(db_path)?;
     let ws_id = lookup_workspace_id(&db, recorded_by).ok_or_else(|| {

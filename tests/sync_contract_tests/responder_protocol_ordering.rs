@@ -6,19 +6,51 @@ use tokio_util::sync::CancellationToken;
 
 use topo::contracts::peering_contract::{SessionDirection, SessionHandler};
 use topo::protocol::Frame;
+use topo::sync::session::windowing::{
+    encode_initial_neg_open, encode_sync_window_kind, SyncWindow, SyncWindowKind,
+};
 use topo::sync::session_handler::SyncConnectionHandler;
 
 use crate::fake_session_io::{
     create_test_db, empty_negentropy_storage, fake_session_io_pair, run_local, test_session_meta,
 };
 
+struct EnvGuard {
+    prev_low_mem_ios: Option<String>,
+}
+
+impl EnvGuard {
+    fn enable_low_mem_ios() -> Self {
+        let prev_low_mem_ios = std::env::var("LOW_MEM_IOS").ok();
+        std::env::set_var("LOW_MEM_IOS", "1");
+        Self { prev_low_mem_ios }
+    }
+}
+
+impl Drop for EnvGuard {
+    fn drop(&mut self) {
+        match &self.prev_low_mem_ios {
+            Some(v) => std::env::set_var("LOW_MEM_IOS", v),
+            None => std::env::remove_var("LOW_MEM_IOS"),
+        }
+    }
+}
+
 async fn drive_empty_inbound_round(peer: &mut crate::fake_session_io::FakePeerSide) {
     let storage = empty_negentropy_storage();
     let mut neg = negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
-    peer.send_control_msg(&Frame::NegOpen {
-        msg: neg.initiate().unwrap(),
-    })
-    .await;
+    // Use a LastDay window header so this works even when LOW_MEM_IOS=1 leaks
+    // from a concurrent test (low-mem responders reject Full/LastTwelveWeeks).
+    let initial_msg = encode_initial_neg_open(
+        SyncWindow {
+            kind: SyncWindowKind::LastDay,
+            ts_min_inclusive_ms: Some(0),
+            ts_max_exclusive_ms: None,
+        },
+        neg.initiate().unwrap(),
+    );
+    peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
+        .await;
 
     loop {
         let Some(frame) = peer
@@ -40,6 +72,65 @@ async fn drive_empty_inbound_round(peer: &mut crate::fake_session_io::FakePeerSi
         }
         break;
     }
+}
+
+#[tokio::test]
+async fn lowmem_responder_rejects_ranges_beyond_last_week() {
+    run_local(async {
+        let _env = EnvGuard::enable_low_mem_ios();
+        let (db_path, _tmpdir) = create_test_db("test-tenant");
+        let handler = SyncConnectionHandler::responder(db_path, 30);
+        let meta = test_session_meta(SessionDirection::Inbound);
+        let cancel = CancellationToken::new();
+
+        let (fake_io, mut peer) = fake_session_io_pair(meta.session_id);
+        let handler_task = tokio::task::spawn_local({
+            let cancel = cancel.clone();
+            async move { handler.on_session(meta, Box::new(fake_io), cancel).await }
+        });
+
+        let storage = empty_negentropy_storage();
+        let mut neg =
+            negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
+        let initial_msg = encode_initial_neg_open(
+            SyncWindow {
+                kind: SyncWindowKind::LastTwelveWeeks,
+                ts_min_inclusive_ms: Some(0),
+                ts_max_exclusive_ms: Some(1_000_000),
+            },
+            neg.initiate().unwrap(),
+        );
+        peer.send_control_msg(&Frame::NegOpen { msg: initial_msg })
+            .await;
+
+        let reply = peer
+            .recv_control_msg_timeout(Duration::from_secs(2))
+            .await
+            .expect("lowmem responder should emit an explicit rejection marker");
+        assert_eq!(
+            reply,
+            Frame::RangePolicyReject {
+                rejected_window_kind: encode_sync_window_kind(SyncWindowKind::LastTwelveWeeks),
+                oldest_allowed_window_kind: encode_sync_window_kind(SyncWindowKind::LastWeek),
+            }
+        );
+
+        let result = tokio::time::timeout(Duration::from_secs(5), handler_task)
+            .await
+            .expect("handler timed out on lowmem range rejection")
+            .expect("handler panicked");
+        assert!(
+            result.is_ok(),
+            "lowmem responder should end the rejected range session cleanly: {result:?}"
+        );
+        assert!(
+            peer.recv_data_msg_timeout(Duration::from_millis(250))
+                .await
+                .is_none(),
+            "rejected session should not send data"
+        );
+    })
+    .await;
 }
 
 #[tokio::test]

@@ -5,7 +5,10 @@ use tokio_util::sync::CancellationToken;
 
 use topo::contracts::peering_contract::{SessionDirection, SessionHandler};
 use topo::protocol::Frame;
-use topo::sync::session::windowing::decode_initial_neg_open;
+use topo::sync::session::windowing::{
+    decode_initial_neg_open, encode_sync_window_kind, prime_outbound_window_kind,
+    reset_outbound_window_state, SyncWindowKind,
+};
 use topo::sync::session_handler::SyncConnectionHandler;
 
 use crate::fake_session_io::{
@@ -136,6 +139,95 @@ async fn initiator_rejects_inbound_direction() {
                 .contains("initiator handler cannot run inbound sessions"),
             "expected role/direction mismatch error"
         );
+    })
+    .await;
+}
+
+#[tokio::test]
+async fn initiator_clamps_future_windows_after_explicit_last_week_policy_reject() {
+    // Ensure LOW_MEM_IOS is unset so the planner allows LastTwelveWeeks for
+    // priming.  Another concurrent test may have set it via EnvGuard.
+    std::env::remove_var("LOW_MEM_IOS");
+    run_local(async {
+        let (db_path, _tmpdir) = create_test_db("test-tenant");
+        let handler = SyncConnectionHandler::outbound(db_path.clone(), 30);
+        let meta = test_session_meta(SessionDirection::Outbound);
+        let peer_id = hex::encode(meta.peer.0);
+        let cancel = CancellationToken::new();
+
+        reset_outbound_window_state(&db_path, "test-tenant", &peer_id);
+        prime_outbound_window_kind(
+            &db_path,
+            "test-tenant",
+            &peer_id,
+            SyncWindowKind::LastTwelveWeeks,
+        );
+
+        let (fake_io_1, mut peer_1) = fake_session_io_pair(meta.session_id);
+        let handler_task_1 = tokio::task::spawn_local({
+            let handler = handler.clone();
+            let cancel = cancel.clone();
+            let meta = meta.clone();
+            async move { handler.on_session(meta, Box::new(fake_io_1), cancel).await }
+        });
+
+        let first_open = peer_1
+            .recv_control_msg_timeout(Duration::from_secs(5))
+            .await
+            .expect("expected first outbound NegOpen");
+        let (first_window, _msg) = decode_initial_neg_open(match &first_open {
+            Frame::NegOpen { msg } => msg,
+            other => panic!("expected NegOpen frame, got {other:?}"),
+        })
+        .expect("decode first NegOpen header");
+        assert_eq!(first_window.kind, SyncWindowKind::LastTwelveWeeks);
+        peer_1
+            .send_control_msg(&Frame::RangePolicyReject {
+                rejected_window_kind: encode_sync_window_kind(SyncWindowKind::LastTwelveWeeks),
+                oldest_allowed_window_kind: encode_sync_window_kind(SyncWindowKind::LastWeek),
+            })
+            .await;
+
+        let first_result = tokio::time::timeout(Duration::from_secs(5), handler_task_1)
+            .await
+            .expect("initiator timed out on explicit range policy reject")
+            .expect("initiator task panicked");
+        assert!(
+            first_result.is_ok(),
+            "initiator should treat the explicit last-week policy reject as a clean adaptation: {first_result:?}"
+        );
+
+        let meta_2 = test_session_meta(SessionDirection::Outbound);
+        let (fake_io_2, mut peer_2) = fake_session_io_pair(meta_2.session_id);
+        let handler_task_2 = tokio::task::spawn_local({
+            let handler = handler.clone();
+            let cancel = cancel.clone();
+            async move { handler.on_session(meta_2, Box::new(fake_io_2), cancel).await }
+        });
+
+        let second_open = peer_2
+            .recv_control_msg_timeout(Duration::from_secs(5))
+            .await
+            .expect("expected second outbound NegOpen");
+        let (second_window, _msg) = decode_initial_neg_open(match &second_open {
+            Frame::NegOpen { msg } => msg,
+            other => panic!("expected NegOpen frame, got {other:?}"),
+        })
+        .expect("decode second NegOpen header");
+        assert!(
+            matches!(
+                second_window.kind,
+                SyncWindowKind::LastDay | SyncWindowKind::LastWeek
+            ),
+            "after explicit last-week policy reject, initiator should only request day/week windows, got {:?}",
+            second_window.kind
+        );
+
+        cancel.cancel();
+        peer_1.force_close();
+        peer_2.force_close();
+        handler_task_2.abort();
+        let _ = handler_task_2.await;
     })
     .await;
 }

@@ -17,7 +17,9 @@ use crate::sync::session::receive_log::{
     enqueue_receive_log_ingest, note_hot_receive_finished, note_hot_receive_started,
 };
 use crate::sync::session::windowing::{
-    encode_initial_neg_open, is_hot_window, mark_outbound_window_completed, select_outbound_window,
+    decode_sync_window_kind, encode_initial_neg_open, is_hot_window, is_low_mem_allowed_window,
+    mark_outbound_window_completed, restrict_outbound_windows_to_last_week, select_outbound_window,
+    SyncWindowKind,
 };
 use crate::sync::session::{INITIAL_CONTROL_PROGRESS_TIMEOUT, NEGENTROPY_FRAME_SIZE_LIMIT};
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
@@ -136,8 +138,39 @@ where
     loop {
         let response =
             tokio::time::timeout(INITIAL_CONTROL_PROGRESS_TIMEOUT, control.recv()).await??;
-        let Frame::NegMsg { msg } = response else {
-            return Err("initiator expected NegMsg response".into());
+        let msg = match response {
+            Frame::NegMsg { msg } => msg,
+            Frame::RangePolicyReject {
+                rejected_window_kind,
+                oldest_allowed_window_kind,
+            } => {
+                let rejected_kind = decode_sync_window_kind(rejected_window_kind)
+                    .map_err(|e| format!("initiator received invalid rejected window kind: {e}"))?;
+                let oldest_allowed_kind =
+                    decode_sync_window_kind(oldest_allowed_window_kind).map_err(|e| {
+                        format!("initiator received invalid oldest allowed window kind: {e}")
+                    })?;
+                if rejected_kind == range.kind
+                    && oldest_allowed_kind == SyncWindowKind::LastWeek
+                    && !is_low_mem_allowed_window(range.kind)
+                {
+                    restrict_outbound_windows_to_last_week(db_path, recorded_by, peer_id);
+                    return Ok(SyncStats {
+                        events_sent: 0,
+                        events_received: 0,
+                        neg_rounds: 0,
+                        bytes_sent: 0,
+                        bytes_received: 0,
+                        duration_ms: start.elapsed().as_millis(),
+                    });
+                }
+                return Err(format!(
+                    "initiator received unsupported range policy reject: rejected={rejected_kind:?} oldest_allowed={oldest_allowed_kind:?} current={:?}",
+                    range.kind
+                )
+                .into());
+            }
+            _ => return Err("initiator expected NegMsg response".into()),
         };
 
         match neg.reconcile_with_ids(&msg, &mut have_ids, &mut need_ids)? {
