@@ -20,6 +20,7 @@ pub fn event_type_note(type_name: &str) -> Option<&'static str> {
         "peer_shared" => Some("registers a device"),
         "admin" => Some("grants admin rights"),
         "key_secret" => Some("stores a local encryption key"),
+        "key_request" => Some("requests an encryption key"),
         "key_shared" => Some("shares an encryption key"),
         "encrypted" => Some("encrypts an inner event"),
         "message" => Some("sends a message"),

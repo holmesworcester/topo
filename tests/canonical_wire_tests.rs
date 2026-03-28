@@ -10,7 +10,7 @@ use topo::event_modules::message::layout::offsets as message_offsets;
 use topo::event_modules::reaction::wire::REACTION_FIELDS;
 use topo::event_modules::{
     self as events, BenchDepEvent, EncryptedEvent, EventError, FileEvent, FileSliceEvent,
-    MessageEvent, ParsedEvent, ReactionEvent,
+    KeyRequestEvent, MessageEvent, ParsedEvent, ReactionEvent,
 };
 
 // ─── Golden-byte tests ───
@@ -149,6 +149,30 @@ fn golden_bytes_bench_dep() {
     assert_eq!(&blob[329..345], &[0xCC; 16]);
 }
 
+#[test]
+fn golden_bytes_key_request() {
+    let kr = ParsedEvent::KeyRequest(KeyRequestEvent {
+        created_at_ms: 7000,
+        blocked_event_id: [0x11; 32],
+        key_event_id: [0x22; 32],
+        recipient_event_id: [0x33; 32],
+        unwrap_key_event_id: [0x44; 32],
+        signed_by: [0x55; 32],
+        signer_type: 5,
+        signature: [0x66; 64],
+    });
+    let blob = events::encode_event(&kr).unwrap();
+    assert_eq!(blob.len(), events::key_request::KEY_REQUEST_WIRE_SIZE);
+    assert_eq!(blob[0], 30);
+    assert_eq!(&blob[9..41], &[0x11; 32]);
+    assert_eq!(&blob[41..73], &[0x22; 32]);
+    assert_eq!(&blob[73..105], &[0x33; 32]);
+    assert_eq!(&blob[105..137], &[0x44; 32]);
+    assert_eq!(&blob[137..169], &[0x55; 32]);
+    assert_eq!(blob[169], 5);
+    assert_eq!(&blob[170..234], &[0x66; 64]);
+}
+
 // ─── Negative parse tests: truncation ───
 
 #[test]
@@ -208,6 +232,23 @@ fn truncation_bench_dep() {
         payload: [0u8; 16],
     });
     let blob = events::encode_event(&bd).unwrap();
+    let err = events::parse_event(&blob[..blob.len() - 1]).unwrap_err();
+    assert!(matches!(err, EventError::TooShort { .. }));
+}
+
+#[test]
+fn truncation_key_request() {
+    let kr = ParsedEvent::KeyRequest(KeyRequestEvent {
+        created_at_ms: 100,
+        blocked_event_id: [0u8; 32],
+        key_event_id: [1u8; 32],
+        recipient_event_id: [2u8; 32],
+        unwrap_key_event_id: [3u8; 32],
+        signed_by: [4u8; 32],
+        signer_type: 5,
+        signature: [0u8; 64],
+    });
+    let blob = events::encode_event(&kr).unwrap();
     let err = events::parse_event(&blob[..blob.len() - 1]).unwrap_err();
     assert!(matches!(err, EventError::TooShort { .. }));
 }
@@ -644,5 +685,19 @@ fn idempotent_bench_dep_full() {
         created_at_ms: 900,
         dep_ids: vec![[0xFF; 32]; 10],
         payload: [0xEE; 16],
+    }));
+}
+
+#[test]
+fn idempotent_key_request() {
+    assert_idempotent(&ParsedEvent::KeyRequest(KeyRequestEvent {
+        created_at_ms: 1_234,
+        blocked_event_id: [29u8; 32],
+        key_event_id: [30u8; 32],
+        recipient_event_id: [31u8; 32],
+        unwrap_key_event_id: [32u8; 32],
+        signed_by: [33u8; 32],
+        signer_type: 5,
+        signature: [34u8; 64],
     }));
 }

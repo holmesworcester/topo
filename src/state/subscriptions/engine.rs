@@ -140,6 +140,7 @@ fn parsed_event_type_name(parsed: &ParsedEvent) -> &'static str {
         ParsedEvent::Admin(_) => "admin",
         ParsedEvent::Encrypted(_) => "encrypted",
         ParsedEvent::KeySecret(_) => "key_secret",
+        ParsedEvent::KeyRequest(_) => "key_request",
         ParsedEvent::KeyShared(_) => "key_shared",
         ParsedEvent::Tenant(_) => "tenant",
         ParsedEvent::FileSlice(_) => "file_slice",

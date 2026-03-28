@@ -1,0 +1,569 @@
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
+
+use ed25519_dalek::VerifyingKey;
+use rusqlite::Connection;
+use serde::Serialize;
+
+use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
+use crate::db::open_connection;
+use crate::event_modules::key_request::{deterministic_key_request_created_at_ms, KeyRequestEvent};
+use crate::event_modules::key_secret::{
+    deterministic_key_secret_event, deterministic_key_secret_event_id,
+};
+use crate::event_modules::key_shared::KeySharedEvent;
+use crate::event_modules::workspace::load_local_authoring_context;
+use crate::event_modules::{self as events, ParsedEvent};
+use crate::projection::create::{
+    create_encrypted_event_synchronous, create_event_synchronous, create_signed_event_synchronous,
+};
+use crate::projection::encrypted::wrap_key_for_recipient;
+use crate::projection::signer::sign_event_bytes;
+use crate::state::db::transport_creds::discover_local_tenants;
+
+type SimResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+pub enum KeyResponsePolicy {
+    AllEligible,
+    BestObservedOnly,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct KeyRepairEmitStats {
+    pub scanned_peers: usize,
+    pub emitted_requests: usize,
+    pub emitted_responses: usize,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub(crate) struct RepairTarget {
+    key_event_id: EventId,
+    recipient_event_id: EventId,
+    unwrap_key_event_id: EventId,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct RequestRow {
+    blocked_event_id: EventId,
+    target: RepairTarget,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct KeySharedSummary {
+    event_id: EventId,
+    target: RepairTarget,
+    signer_event_id: EventId,
+}
+
+pub fn seed_deterministic_key_secret(
+    db_path: &str,
+    recorded_by: &str,
+    key_bytes: [u8; 32],
+) -> SimResult<EventId> {
+    let conn = open_connection(db_path)?;
+    crate::db::schema::create_tables(&conn)?;
+    let event = deterministic_key_secret_event(key_bytes);
+    let expected = deterministic_key_secret_event_id(&key_bytes);
+    let created = create_event_synchronous(&conn, recorded_by, &event)?;
+    if created != expected {
+        return Err("deterministic key_secret event_id mismatch".into());
+    }
+    Ok(created)
+}
+
+pub fn create_encrypted_message_with_key(
+    db_path: &str,
+    recorded_by: &str,
+    key_event_id: &EventId,
+    content: &str,
+) -> SimResult<EventId> {
+    let conn = open_connection(db_path)?;
+    crate::db::schema::create_tables(&conn)?;
+    let authoring = load_local_authoring_context(&conn, recorded_by)?;
+    let inner = ParsedEvent::Message(crate::event_modules::MessageEvent {
+        created_at_ms: crate::state::db::queue::current_timestamp_ms_u64(),
+        workspace_id: authoring.workspace_id,
+        author_id: authoring.author_id,
+        content: content.to_string(),
+        signed_by: authoring.signer_event_id,
+        signer_type: 5,
+        signature: [0u8; 64],
+    });
+    Ok(create_encrypted_event_synchronous(
+        &conn,
+        recorded_by,
+        key_event_id,
+        &inner,
+        Some(&authoring.signing_key),
+    )?)
+}
+
+pub fn emit_key_requests_for_dbs(db_paths: &[String]) -> SimResult<KeyRepairEmitStats> {
+    let mut stats = KeyRepairEmitStats::default();
+    for db_path in db_paths {
+        let conn = open_connection(db_path)?;
+        crate::db::schema::create_tables(&conn)?;
+        let tenants = discover_local_tenants(&conn)?;
+        drop(conn);
+        for tenant in tenants {
+            stats.scanned_peers = stats.scanned_peers.saturating_add(1);
+            stats.emitted_requests = stats
+                .emitted_requests
+                .saturating_add(emit_key_requests_for_peer(db_path, &tenant.peer_id)?);
+        }
+    }
+    Ok(stats)
+}
+
+pub fn emit_key_shared_responses_for_dbs(
+    db_paths: &[String],
+    policy: KeyResponsePolicy,
+) -> SimResult<KeyRepairEmitStats> {
+    let mut stats = KeyRepairEmitStats::default();
+    for db_path in db_paths {
+        let conn = open_connection(db_path)?;
+        crate::db::schema::create_tables(&conn)?;
+        let tenants = discover_local_tenants(&conn)?;
+        drop(conn);
+        for tenant in tenants {
+            stats.scanned_peers = stats.scanned_peers.saturating_add(1);
+            stats.emitted_responses =
+                stats
+                    .emitted_responses
+                    .saturating_add(emit_key_shared_responses_for_peer(
+                        db_path,
+                        &tenant.peer_id,
+                        policy,
+                    )?);
+        }
+    }
+    Ok(stats)
+}
+
+fn emit_key_requests_for_peer(db_path: &str, recorded_by: &str) -> SimResult<usize> {
+    let conn = open_connection(db_path)?;
+    crate::db::schema::create_tables(&conn)?;
+    let blocked = blocked_encrypted_events(&conn, recorded_by)?;
+    if blocked.is_empty() {
+        return Ok(0);
+    }
+    let authoring = load_local_authoring_context(&conn, recorded_by)?;
+    let (recipient_event_id, unwrap_key_event_id) =
+        local_repair_recipient_material(&conn, recorded_by)?;
+    let mut emitted = 0usize;
+
+    for (blocked_event_id, key_event_id) in blocked {
+        let created_at_ms = deterministic_key_request_created_at_ms(
+            &blocked_event_id,
+            &key_event_id,
+            &recipient_event_id,
+            &unwrap_key_event_id,
+            &authoring.signer_event_id,
+        );
+        let request = ParsedEvent::KeyRequest(KeyRequestEvent {
+            created_at_ms,
+            blocked_event_id,
+            key_event_id,
+            recipient_event_id,
+            unwrap_key_event_id,
+            signed_by: authoring.signer_event_id,
+            signer_type: 5,
+            signature: [0u8; 64],
+        });
+        let event_id = signed_event_id(&request, &authoring.signing_key)?;
+        let event_id_b64 = event_id_to_base64(&event_id);
+        let existed_before: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
+            rusqlite::params![&event_id_b64],
+            |row| row.get(0),
+        )?;
+        let _ =
+            create_signed_event_synchronous(&conn, recorded_by, &request, &authoring.signing_key)?;
+        if !existed_before {
+            emitted = emitted.saturating_add(1);
+        }
+    }
+
+    Ok(emitted)
+}
+
+fn emit_key_shared_responses_for_peer(
+    db_path: &str,
+    recorded_by: &str,
+    policy: KeyResponsePolicy,
+) -> SimResult<usize> {
+    let conn = open_connection(db_path)?;
+    crate::db::schema::create_tables(&conn)?;
+    let authoring = load_local_authoring_context(&conn, recorded_by)?;
+    let known_responses = known_key_shared_summaries(&conn, recorded_by)?;
+    let repaired_key_ids = repaired_key_ids_for_local_recipient(&conn, recorded_by)?;
+    let mut best_rank_by_target = BTreeMap::<RepairTarget, ([u8; 32], EventId, EventId)>::new();
+    for response in known_responses {
+        let rank = response_rank(response.target, response.signer_event_id);
+        best_rank_by_target
+            .entry(response.target)
+            .and_modify(|best| {
+                if (rank, response.signer_event_id, response.event_id) < (best.0, best.1, best.2) {
+                    *best = (rank, response.signer_event_id, response.event_id);
+                }
+            })
+            .or_insert((rank, response.signer_event_id, response.event_id));
+    }
+
+    let requests = known_key_requests(&conn, recorded_by)?;
+    let mut emitted = 0usize;
+    for request in requests {
+        if !has_local_key_material(&conn, recorded_by, &request.target.key_event_id)? {
+            continue;
+        }
+        if repaired_key_ids.contains(&request.target.key_event_id) {
+            continue;
+        }
+
+        let local_rank = response_rank(request.target, authoring.signer_event_id);
+        if policy == KeyResponsePolicy::BestObservedOnly {
+            if let Some((best_rank, best_signer, best_event_id)) =
+                best_rank_by_target.get(&request.target)
+            {
+                let local_event_id = signed_event_id(
+                    &build_key_shared_response(&conn, recorded_by, &authoring, request)?,
+                    &authoring.signing_key,
+                )?;
+                if (*best_rank, *best_signer, *best_event_id)
+                    < (local_rank, authoring.signer_event_id, local_event_id)
+                {
+                    continue;
+                }
+            }
+        }
+
+        let response = build_key_shared_response(&conn, recorded_by, &authoring, request)?;
+        let event_id = signed_event_id(&response, &authoring.signing_key)?;
+        let event_id_b64 = event_id_to_base64(&event_id);
+        let existed_before: bool = conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
+            rusqlite::params![&event_id_b64],
+            |row| row.get(0),
+        )?;
+        let _ =
+            create_signed_event_synchronous(&conn, recorded_by, &response, &authoring.signing_key)?;
+        if !existed_before {
+            emitted = emitted.saturating_add(1);
+        }
+    }
+
+    Ok(emitted)
+}
+
+fn repaired_key_ids_for_local_recipient(
+    conn: &Connection,
+    recorded_by: &str,
+) -> SimResult<BTreeSet<EventId>> {
+    let Ok((recipient_event_id, _)) = local_repair_recipient_material(conn, recorded_by) else {
+        return Ok(BTreeSet::new());
+    };
+    let recipient_event_id_b64 = event_id_to_base64(&recipient_event_id);
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT key_event_id
+         FROM key_shared
+         WHERE recorded_by = ?1
+           AND recipient_event_id = ?2",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![recorded_by, &recipient_event_id_b64],
+        |row| row.get::<_, String>(0),
+    )?;
+    let mut out = BTreeSet::new();
+    for row in rows {
+        let key_event_id_b64 = row?;
+        if let Some(key_event_id) = event_id_from_base64(&key_event_id_b64) {
+            out.insert(key_event_id);
+        }
+    }
+    Ok(out)
+}
+
+fn blocked_encrypted_events(
+    conn: &Connection,
+    recorded_by: &str,
+) -> SimResult<Vec<(EventId, EventId)>> {
+    let mut stmt = conn.prepare(
+        "SELECT be.event_id, e.blob
+         FROM blocked_events be
+         JOIN events e ON e.event_id = be.event_id
+         WHERE be.peer_id = ?1
+           AND e.event_type = 'encrypted'
+         ORDER BY e.created_at ASC, e.event_id ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+
+    let mut out = Vec::new();
+    for row in rows {
+        let (event_id_b64, blob) = row?;
+        let Some(blocked_event_id) = event_id_from_base64(&event_id_b64) else {
+            continue;
+        };
+        let Ok(ParsedEvent::Encrypted(enc)) = events::parse_event(&blob) else {
+            continue;
+        };
+        out.push((blocked_event_id, enc.key_event_id));
+    }
+    Ok(out)
+}
+
+fn local_repair_recipient_material(
+    conn: &Connection,
+    recorded_by: &str,
+) -> SimResult<(EventId, EventId)> {
+    let invite_event_id_b64: String = conn.query_row(
+        "SELECT invite_event_id
+         FROM invites_accepted
+         WHERE recorded_by = ?1
+         ORDER BY created_at ASC, event_id ASC
+         LIMIT 1",
+        rusqlite::params![recorded_by],
+        |row| row.get(0),
+    )?;
+    let invite_secret_event_id_b64: String = conn.query_row(
+        "SELECT event_id
+         FROM invite_secrets
+         WHERE recorded_by = ?1
+           AND invite_event_id = ?2
+         ORDER BY created_at ASC, event_id ASC
+         LIMIT 1",
+        rusqlite::params![recorded_by, &invite_event_id_b64],
+        |row| row.get(0),
+    )?;
+    let recipient_event_id =
+        event_id_from_base64(&invite_event_id_b64).ok_or("invalid invite_event_id base64")?;
+    let unwrap_key_event_id = event_id_from_base64(&invite_secret_event_id_b64)
+        .ok_or("invalid invite_secret.event_id base64")?;
+    Ok((recipient_event_id, unwrap_key_event_id))
+}
+
+fn known_key_requests(conn: &Connection, recorded_by: &str) -> SimResult<Vec<RequestRow>> {
+    let mut stmt = conn.prepare(
+        "SELECT blocked_event_id, key_event_id, recipient_event_id, unwrap_key_event_id
+         FROM key_requests
+         WHERE recorded_by = ?1
+         ORDER BY rowid ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (blocked_b64, key_b64, recipient_b64, unwrap_b64) = row?;
+        let Some(blocked_event_id) = event_id_from_base64(&blocked_b64) else {
+            continue;
+        };
+        let Some(key_event_id) = event_id_from_base64(&key_b64) else {
+            continue;
+        };
+        let Some(recipient_event_id) = event_id_from_base64(&recipient_b64) else {
+            continue;
+        };
+        let Some(unwrap_key_event_id) = event_id_from_base64(&unwrap_b64) else {
+            continue;
+        };
+        out.push(RequestRow {
+            blocked_event_id,
+            target: RepairTarget {
+                key_event_id,
+                recipient_event_id,
+                unwrap_key_event_id,
+            },
+        });
+    }
+    Ok(out)
+}
+
+fn known_key_shared_summaries(
+    conn: &Connection,
+    recorded_by: &str,
+) -> SimResult<Vec<KeySharedSummary>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.event_id, e.blob
+         FROM recorded_events re
+         JOIN events e ON e.event_id = re.event_id
+         WHERE re.peer_id = ?1
+           AND e.event_type = 'key_shared'
+         ORDER BY re.id ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+    let mut out = Vec::new();
+    for row in rows {
+        let (event_id_b64, blob) = row?;
+        let Some(event_id) = event_id_from_base64(&event_id_b64) else {
+            continue;
+        };
+        let Ok(ParsedEvent::KeyShared(ks)) = events::parse_event(&blob) else {
+            continue;
+        };
+        out.push(KeySharedSummary {
+            event_id,
+            target: RepairTarget {
+                key_event_id: ks.key_event_id,
+                recipient_event_id: ks.recipient_event_id,
+                unwrap_key_event_id: ks.unwrap_key_event_id,
+            },
+            signer_event_id: ks.signed_by,
+        });
+    }
+    Ok(out)
+}
+
+fn has_local_key_material(
+    conn: &Connection,
+    recorded_by: &str,
+    key_event_id: &EventId,
+) -> SimResult<bool> {
+    let key_event_id_b64 = event_id_to_base64(key_event_id);
+    Ok(conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1 FROM key_secrets
+             WHERE recorded_by = ?1 AND event_id = ?2
+         )",
+        rusqlite::params![recorded_by, &key_event_id_b64],
+        |row| row.get(0),
+    )?)
+}
+
+fn build_key_shared_response(
+    conn: &Connection,
+    recorded_by: &str,
+    authoring: &crate::event_modules::workspace::LocalAuthoringContext,
+    request: RequestRow,
+) -> SimResult<ParsedEvent> {
+    let key_event_id_b64 = event_id_to_base64(&request.target.key_event_id);
+    let key_bytes: Vec<u8> = conn.query_row(
+        "SELECT key_bytes
+         FROM key_secrets
+         WHERE recorded_by = ?1 AND event_id = ?2
+         LIMIT 1",
+        rusqlite::params![recorded_by, &key_event_id_b64],
+        |row| row.get(0),
+    )?;
+    if key_bytes.len() != 32 {
+        return Err("corrupt key_bytes in key_secrets".into());
+    }
+    let mut plaintext_key = [0u8; 32];
+    plaintext_key.copy_from_slice(&key_bytes);
+
+    let recipient_key = request_recipient_verifying_key(conn, &request.target.recipient_event_id)?;
+    let wrapped_key =
+        wrap_key_for_recipient(&authoring.signing_key, &recipient_key, &plaintext_key);
+
+    let created_at_ms = deterministic_response_created_at_ms(
+        &request.blocked_event_id,
+        &request.target.key_event_id,
+        &request.target.recipient_event_id,
+        &request.target.unwrap_key_event_id,
+        &authoring.signer_event_id,
+    );
+
+    Ok(ParsedEvent::KeyShared(KeySharedEvent {
+        created_at_ms,
+        key_event_id: request.target.key_event_id,
+        recipient_event_id: request.target.recipient_event_id,
+        unwrap_key_event_id: request.target.unwrap_key_event_id,
+        wrapped_key,
+        signed_by: authoring.signer_event_id,
+        signer_type: 5,
+        signature: [0u8; 64],
+    }))
+}
+
+fn request_recipient_verifying_key(
+    conn: &Connection,
+    recipient_event_id: &EventId,
+) -> SimResult<VerifyingKey> {
+    let recipient_event_id_b64 = event_id_to_base64(recipient_event_id);
+    let blob: Vec<u8> = conn.query_row(
+        "SELECT blob FROM events WHERE event_id = ?1",
+        rusqlite::params![&recipient_event_id_b64],
+        |row| row.get(0),
+    )?;
+    let parsed = events::parse_event(&blob)?;
+    let public_key = match parsed {
+        ParsedEvent::UserInvite(evt) => evt.public_key,
+        ParsedEvent::DeviceInvite(evt) => evt.public_key,
+        _ => return Err("recipient_event_id is not an invite event".into()),
+    };
+    Ok(VerifyingKey::from_bytes(&public_key)?)
+}
+
+fn deterministic_response_created_at_ms(
+    blocked_event_id: &[u8; 32],
+    key_event_id: &[u8; 32],
+    recipient_event_id: &[u8; 32],
+    unwrap_key_event_id: &[u8; 32],
+    signed_by: &[u8; 32],
+) -> u64 {
+    use blake2::digest::consts::U8;
+    use blake2::{Blake2b, Digest};
+
+    let mut hasher = Blake2b::<U8>::new();
+    hasher.update(b"poc7-key-response-created-at-v1");
+    hasher.update(blocked_event_id);
+    hasher.update(key_event_id);
+    hasher.update(recipient_event_id);
+    hasher.update(unwrap_key_event_id);
+    hasher.update(signed_by);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(out)
+}
+
+fn signed_event_id(
+    event: &ParsedEvent,
+    signing_key: &ed25519_dalek::SigningKey,
+) -> SimResult<EventId> {
+    let type_code = event.event_type_code();
+    let sig_len = events::registry()
+        .lookup(type_code)
+        .ok_or("unknown event type for signing")?
+        .signature_byte_len;
+    let mut blob = events::encode_event(event)?;
+    if sig_len > 0 {
+        let blob_len = blob.len();
+        let sig = sign_event_bytes(signing_key, &blob[..blob_len - sig_len]);
+        blob[blob_len - sig_len..].copy_from_slice(&sig);
+    }
+    Ok(crate::crypto::hash_event(&blob))
+}
+
+pub(crate) fn response_rank(target: RepairTarget, signer_event_id: EventId) -> [u8; 32] {
+    use blake2::digest::consts::U32;
+    use blake2::{Blake2b, Digest};
+
+    let mut hasher = Blake2b::<U32>::new();
+    hasher.update(b"poc7-key-response-rank-v1");
+    hasher.update(target.key_event_id);
+    hasher.update(target.recipient_event_id);
+    hasher.update(target.unwrap_key_event_id);
+    hasher.update(signer_event_id);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 32];
+    out.copy_from_slice(&digest[..32]);
+    out
+}
+
+pub(crate) fn key_shared_target(event: &KeySharedEvent) -> RepairTarget {
+    RepairTarget {
+        key_event_id: event.key_event_id,
+        recipient_event_id: event.recipient_event_id,
+        unwrap_key_event_id: event.unwrap_key_event_id,
+    }
+}

@@ -235,6 +235,7 @@ mod tests {
         use super::super::super::file_slice::FILE_SLICE_WIRE_SIZE;
         use super::super::super::invite_accepted::INVITE_ACCEPTED_WIRE_SIZE;
         use super::super::super::invite_secret::INVITE_SECRET_WIRE_SIZE;
+        use super::super::super::key_request::KEY_REQUEST_WIRE_SIZE;
         use super::super::super::key_secret::KEY_SECRET_WIRE_SIZE;
         use super::super::super::key_shared::KEY_SHARED_WIRE_SIZE;
         use super::super::super::message::MESSAGE_WIRE_SIZE;
@@ -264,6 +265,7 @@ mod tests {
         assert_eq!(TENANT_WIRE_SIZE, 41);
         assert_eq!(KEY_SHARED_WIRE_SIZE, 234);
         assert_eq!(INVITE_SECRET_WIRE_SIZE, 73);
+        assert_eq!(KEY_REQUEST_WIRE_SIZE, 234);
         assert_eq!(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE, 138);
     }
 

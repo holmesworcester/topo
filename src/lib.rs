@@ -1,6 +1,7 @@
 pub mod event_modules;
 pub mod runtime;
 pub mod shared;
+pub mod sim;
 pub mod state;
 pub mod testutil;
 

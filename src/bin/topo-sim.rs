@@ -1,0 +1,122 @@
+use topo::sim::{FakeTopologyPreference, PlannerMode, PlannerSimulation};
+
+#[derive(Debug, Clone, Copy)]
+enum ModeArg {
+    Planner,
+    NearestNeighborNoAuth,
+}
+
+impl ModeArg {
+    fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "planner" => Ok(Self::Planner),
+            "nearest-neighbor-no-auth" => Ok(Self::NearestNeighborNoAuth),
+            other => Err(format!(
+                "unsupported --mode `{other}`; use `planner` or `nearest-neighbor-no-auth`"
+            )),
+        }
+    }
+
+    fn as_planner_mode(self) -> PlannerMode {
+        match self {
+            Self::Planner => PlannerMode::RealConnectTargets,
+            Self::NearestNeighborNoAuth => PlannerMode::NearestNeighborNoAuth,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+enum TopologyArg {
+    Graph,
+    Star,
+}
+
+impl TopologyArg {
+    fn parse(s: &str) -> Result<Self, String> {
+        match s {
+            "graph" => Ok(Self::Graph),
+            "star" => Ok(Self::Star),
+            other => Err(format!(
+                "unsupported --topology `{other}`; use `graph` or `star`"
+            )),
+        }
+    }
+
+    fn as_fake_topology(self) -> FakeTopologyPreference {
+        match self {
+            Self::Graph => FakeTopologyPreference::Graph,
+            Self::Star => FakeTopologyPreference::Star,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct Config {
+    dbs: Vec<String>,
+    rounds: u32,
+    mode: ModeArg,
+    topology: TopologyArg,
+}
+
+impl Default for Config {
+    fn default() -> Self {
+        Self {
+            dbs: Vec::new(),
+            rounds: 1,
+            mode: ModeArg::Planner,
+            topology: TopologyArg::Graph,
+        }
+    }
+}
+
+fn parse_args() -> Result<Config, String> {
+    let mut config = Config::default();
+    let mut args = std::env::args().skip(1);
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "--db" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--db requires a value".to_string())?;
+                config.dbs.push(value);
+            }
+            "--rounds" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--rounds requires a value".to_string())?;
+                config.rounds = value
+                    .parse::<u32>()
+                    .map_err(|err| format!("parse --rounds: {err}"))?;
+            }
+            "--mode" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--mode requires a value".to_string())?;
+                config.mode = ModeArg::parse(&value)?;
+            }
+            "--topology" => {
+                let value = args
+                    .next()
+                    .ok_or_else(|| "--topology requires a value".to_string())?;
+                config.topology = TopologyArg::parse(&value)?;
+            }
+            other => return Err(format!("unknown arg `{other}`")),
+        }
+    }
+    if config.dbs.is_empty() {
+        return Err("provide at least one --db PATH".to_string());
+    }
+    Ok(config)
+}
+
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let config = parse_args()?;
+    let report = PlannerSimulation::with_mode_and_topology(
+        config.dbs,
+        config.mode.as_planner_mode(),
+        config.topology.as_fake_topology(),
+    )
+    .run_rounds(config.rounds)?;
+    println!("{}", serde_json::to_string_pretty(&report)?);
+    Ok(())
+}

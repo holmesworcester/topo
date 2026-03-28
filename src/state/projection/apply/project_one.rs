@@ -1,24 +1,11 @@
 use super::super::decision::ProjectionDecision;
+use super::backend::{ProjectionApplyResult, ProjectionBackend, SqliteProjectionBackend};
 use crate::crypto::{event_id_to_base64, EventId};
-use crate::db::queue::current_timestamp_ms;
-use crate::db::timeline::EventTimeline;
 use crate::event_modules::{self as events, ParsedEvent};
 use rusqlite::Connection;
 
 use super::cascade::cascade_unblocked;
-use super::stages::{record_rejection, run_dep_and_projection_stages};
-
-fn event_is_still_recorded(
-    conn: &Connection,
-    recorded_by: &str,
-    event_id_b64: &str,
-) -> Result<bool, rusqlite::Error> {
-    conn.query_row(
-        "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![recorded_by, event_id_b64],
-        |row| row.get(0),
-    )
-}
+use super::stages::run_dep_and_projection_stages_with_backend;
 
 fn event_is_valid_for_peer(
     conn: &Connection,
@@ -54,41 +41,30 @@ pub(crate) fn project_one_step(
     recorded_by: &str,
     event_id: &EventId,
 ) -> Result<(ProjectionDecision, Option<ParsedEvent>), Box<dyn std::error::Error>> {
+    let backend = SqliteProjectionBackend::new(conn);
+    project_one_step_with_backend(&backend, recorded_by, event_id)
+}
+
+pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
+    backend: &B,
+    recorded_by: &str,
+    event_id: &EventId,
+) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>)> {
     let event_id_b64 = event_id_to_base64(event_id);
 
     // 1. Check terminal state — already processed (valid)?
-    let already: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![recorded_by, &event_id_b64],
-        |row| row.get(0),
-    )?;
-    if already {
-        return Ok((ProjectionDecision::AlreadyProcessed, None));
-    }
-
-    // 1b. Check terminal state — already rejected?
-    let already_rejected: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
-        rusqlite::params![recorded_by, &event_id_b64],
-        |row| row.get(0),
-    )?;
-    if already_rejected {
+    if backend.already_processed(recorded_by, &event_id_b64)? {
         return Ok((ProjectionDecision::AlreadyProcessed, None));
     }
 
     // 2. Load blob from events table
-    let blob: Vec<u8> = match conn.query_row(
-        "SELECT blob FROM events WHERE event_id = ?1",
-        rusqlite::params![&event_id_b64],
-        |row| row.get(0),
-    ) {
-        Ok(b) => b,
-        Err(rusqlite::Error::QueryReturnedNoRows) => {
+    let blob: Vec<u8> = match backend.load_blob(&event_id_b64)? {
+        Some(b) => b,
+        None => {
             let reason = format!("event {} not found in events table", event_id_b64);
-            record_rejection(conn, recorded_by, &event_id_b64, &reason);
+            backend.record_rejection(recorded_by, &event_id_b64, &reason)?;
             return Ok((ProjectionDecision::Reject { reason }, None));
         }
-        Err(e) => return Err(e.into()),
     };
 
     // 3. Parse via registry
@@ -96,15 +72,15 @@ pub(crate) fn project_one_step(
         Ok(p) => p,
         Err(e) => {
             let reason = format!("parse error: {}", e);
-            record_rejection(conn, recorded_by, &event_id_b64, &reason);
+            backend.record_rejection(recorded_by, &event_id_b64, &reason)?;
             return Ok((ProjectionDecision::Reject { reason }, None));
         }
     };
 
     // 4-6. Shared dep/signer/projection stages
     // For encrypted events, inner_parsed contains the decrypted inner event.
-    let (decision, inner_parsed) = run_dep_and_projection_stages(
-        conn,
+    let (decision, inner_parsed) = run_dep_and_projection_stages_with_backend(
+        backend,
         recorded_by,
         &event_id_b64,
         &blob,
@@ -115,66 +91,21 @@ pub(crate) fn project_one_step(
     )?;
     match &decision {
         ProjectionDecision::Reject { ref reason } => {
-            record_rejection(conn, recorded_by, &event_id_b64, reason);
+            backend.record_rejection(recorded_by, &event_id_b64, reason)?;
             return Ok((decision, Some(parsed)));
         }
         ProjectionDecision::Block { ref missing } => {
             // Dependency-stage block rows are written in check_deps_and_block().
             // Projector-level guard blocks (missing == []) rely on emitted commands.
-            let _ =
-                EventTimeline::new(conn).mark_blocked_b64(&event_id_b64, current_timestamp_ms());
+            backend.mark_guard_blocked(&event_id_b64)?;
             let _ = missing;
             return Ok((decision, Some(parsed)));
         }
         _ => {}
     }
 
-    // The projector may have hard-purged this event inside the current
-    // transaction (for example, a message arriving after a prior tombstone).
-    // In that case, projection succeeded but there is nothing left to mark
-    // valid or deliver to subscriptions for this tenant.
-    if !event_is_still_recorded(conn, recorded_by, &event_id_b64)? {
-        return Ok((ProjectionDecision::Valid, Some(parsed)));
-    }
-
-    // 7. Write terminal state + subscription hook atomically.
-    //    Wrapped in a savepoint so that if the subscription hook fails, the
-    //    valid_events row is also rolled back. This prevents a crash window
-    //    where an event is marked valid but subscriptions never receive it.
-    conn.execute_batch("SAVEPOINT project_valid")?;
-    let commit_result = (|| -> Result<(), Box<dyn std::error::Error>> {
-        let sub_event = inner_parsed.as_ref().unwrap_or(&parsed);
-        let semantic_type_code = i64::from(sub_event.event_type_code());
-        conn.execute(
-            "INSERT OR IGNORE INTO valid_events (peer_id, event_id, semantic_type_code)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![recorded_by, &event_id_b64, semantic_type_code],
-        )?;
-
-        // 8. Subscription hook: evaluate active subscriptions for this event.
-        //    For encrypted events, use the decrypted inner event for matching.
-        crate::state::subscriptions::on_projected_event(
-            conn,
-            recorded_by,
-            &event_id_b64,
-            sub_event,
-        )
-        .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
-        let _ = EventTimeline::new(conn).mark_projected_b64(&event_id_b64, current_timestamp_ms());
-
-        Ok(())
-    })();
-
-    match commit_result {
-        Ok(()) => {
-            conn.execute_batch("RELEASE project_valid")?;
-        }
-        Err(e) => {
-            let _ = conn.execute_batch("ROLLBACK TO project_valid");
-            let _ = conn.execute_batch("RELEASE project_valid");
-            return Err(e);
-        }
-    }
+    let sub_event = inner_parsed.as_ref().unwrap_or(&parsed);
+    backend.finalize_valid_projection(recorded_by, &event_id_b64, sub_event)?;
 
     Ok((ProjectionDecision::Valid, Some(parsed)))
 }

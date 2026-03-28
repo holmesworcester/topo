@@ -114,6 +114,8 @@ both `pass` and `break` polarity unless waived.
 | SPEC_ENCRYPTED_ADMISSIBLE_01 | (admissibility) | CHK_ENCRYPTED_ADMISSIBLE | pipeline_integration | apply::tests::encryption::test_encrypted_message_valid | pass |
 | SPEC_SECRET_SHARED_KEY_01 | InvSecretSharedKey | CHK_SS_INSERT | projector_unit | key_shared_projector_tests::tests::test_key_shared_valid | pass |
 | SPEC_SECRET_SHARED_KEY_01 | InvSecretSharedKey | CHK_SS_INSERT | projector_unit | key_shared_projector_tests::tests::test_key_shared_rejects_key_event_id_mismatch | break |
+| SPEC_KR_INSERT_01 | NON_MODELED::repair_request_primitive | CHK_KR_INSERT | projector_unit | key_request_projector_tests::tests::test_key_request_valid | pass |
+| SPEC_KR_INSERT_01 | NON_MODELED::repair_request_primitive | CHK_KR_INSERT | projector_unit | key_request_projector_tests::tests::test_key_request_rejects_non_key_request_event | break |
 | SPEC_FILE_AUTH_01 | InvFileSliceAuth | CHK_FS_GUARD_BLOCK | projector_unit | file_slice_projector_tests::tests::test_file_slice_blocks_no_descriptor | break |
 | SPEC_FILE_AUTH_01 | InvFileSliceAuth | CHK_FS_INSERT | projector_unit | file_slice_projector_tests::tests::test_file_slice_valid | pass |
 | SPEC_FILE_AUTH_02 | InvFileSliceAuth | CHK_FS_SIGNER_MISMATCH | projector_unit | file_slice_projector_tests::tests::test_file_slice_rejects_signer_mismatch | break |

@@ -170,7 +170,7 @@ fn classify_bootstrap_discovery_auth(
     }
 }
 
-pub(super) fn should_initiate_connect_for_source_with_db(
+pub(crate) fn should_initiate_connect_for_source_with_db(
     db_path: &str,
     tenant_id: &str,
     source: &TargetIngressSource,

@@ -1,0 +1,185 @@
+use super::layout::field_spec::{
+    decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue,
+};
+use super::registry::{EventTypeMeta, ShareScope};
+use super::{EventError, ParsedEvent, EVENT_TYPE_KEY_REQUEST};
+
+pub const KEY_REQUEST_FIELDS: &[FieldSpec] = &[
+    FieldSpec::Timestamp("created_at_ms"),
+    FieldSpec::EventId("blocked_event_id"),
+    FieldSpec::EventId("key_event_id"),
+    FieldSpec::EventId("recipient_event_id"),
+    FieldSpec::EventId("unwrap_key_event_id"),
+    FieldSpec::EventId("signed_by"),
+    FieldSpec::U8("signer_type"),
+    FieldSpec::FixedBytes("signature", 64),
+];
+
+/// KeyRequest (type 30): type(1) + created_at(8) + blocked_event_id(32)
+///   + key_event_id(32) + recipient_event_id(32) + unwrap_key_event_id(32)
+///   + signed_by(32) + signer_type(1) + signature(64) = 234
+pub const KEY_REQUEST_WIRE_SIZE: usize = wire_size_for_fields(KEY_REQUEST_FIELDS);
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KeyRequestEvent {
+    pub created_at_ms: u64,
+    pub blocked_event_id: [u8; 32],
+    pub key_event_id: [u8; 32],
+    pub recipient_event_id: [u8; 32],
+    pub unwrap_key_event_id: [u8; 32],
+    pub signed_by: [u8; 32],
+    pub signer_type: u8,
+    pub signature: [u8; 64],
+}
+
+impl super::Describe for KeyRequestEvent {
+    fn human_fields(&self) -> Vec<(&'static str, String)> {
+        vec![
+            (
+                "blocked_event_id",
+                super::short_id_b64(&self.blocked_event_id),
+            ),
+            ("key_event_id", super::short_id_b64(&self.key_event_id)),
+        ]
+    }
+}
+
+pub fn deterministic_key_request_created_at_ms(
+    blocked_event_id: &[u8; 32],
+    key_event_id: &[u8; 32],
+    recipient_event_id: &[u8; 32],
+    unwrap_key_event_id: &[u8; 32],
+    signed_by: &[u8; 32],
+) -> u64 {
+    use blake2::digest::consts::U8;
+    use blake2::{Blake2b, Digest};
+
+    let mut hasher = Blake2b::<U8>::new();
+    hasher.update(b"poc7-key-request-created-at-v1");
+    hasher.update(blocked_event_id);
+    hasher.update(key_event_id);
+    hasher.update(recipient_event_id);
+    hasher.update(unwrap_key_event_id);
+    hasher.update(signed_by);
+    let digest = hasher.finalize();
+    let mut out = [0u8; 8];
+    out.copy_from_slice(&digest[..8]);
+    u64::from_le_bytes(out)
+}
+
+pub fn parse_key_request(blob: &[u8]) -> Result<ParsedEvent, EventError> {
+    let values = decode_fields(EVENT_TYPE_KEY_REQUEST, KEY_REQUEST_FIELDS, blob)?;
+    Ok(ParsedEvent::KeyRequest(KeyRequestEvent {
+        created_at_ms: values[0].as_timestamp().unwrap(),
+        blocked_event_id: values[1].as_event_id().unwrap(),
+        key_event_id: values[2].as_event_id().unwrap(),
+        recipient_event_id: values[3].as_event_id().unwrap(),
+        unwrap_key_event_id: values[4].as_event_id().unwrap(),
+        signed_by: values[5].as_event_id().unwrap(),
+        signer_type: values[6].as_u8().unwrap(),
+        signature: {
+            let bytes = values[7].as_fixed_bytes().unwrap();
+            let mut sig = [0u8; 64];
+            sig.copy_from_slice(bytes);
+            sig
+        },
+    }))
+}
+
+pub fn encode_key_request(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
+    let kr = match event {
+        ParsedEvent::KeyRequest(v) => v,
+        _ => return Err(EventError::WrongVariant),
+    };
+
+    let values = vec![
+        FieldValue::Timestamp(kr.created_at_ms),
+        FieldValue::EventId(kr.blocked_event_id),
+        FieldValue::EventId(kr.key_event_id),
+        FieldValue::EventId(kr.recipient_event_id),
+        FieldValue::EventId(kr.unwrap_key_event_id),
+        FieldValue::EventId(kr.signed_by),
+        FieldValue::U8(kr.signer_type),
+        FieldValue::FixedBytes(kr.signature.to_vec()),
+    ];
+
+    Ok(encode_fields(
+        EVENT_TYPE_KEY_REQUEST,
+        KEY_REQUEST_FIELDS,
+        &values,
+    )?)
+}
+
+use crate::crypto::event_id_to_base64;
+use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use rusqlite::Connection;
+
+pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
+    conn.execute_batch(
+        "
+        CREATE TABLE IF NOT EXISTS key_requests (
+            recorded_by TEXT NOT NULL,
+            event_id TEXT NOT NULL,
+            blocked_event_id TEXT NOT NULL,
+            key_event_id TEXT NOT NULL,
+            recipient_event_id TEXT NOT NULL,
+            unwrap_key_event_id TEXT NOT NULL,
+            requester_signer_event_id TEXT NOT NULL,
+            PRIMARY KEY (recorded_by, event_id)
+        );
+        ",
+    )?;
+    Ok(())
+}
+
+pub fn project_pure(
+    recorded_by: &str,
+    event_id_b64: &str,
+    parsed: &ParsedEvent,
+    _ctx: &ContextSnapshot,
+) -> ProjectorResult {
+    let kr = match parsed {
+        ParsedEvent::KeyRequest(v) => v,
+        _ => return ProjectorResult::reject("not a key_request event".to_string()),
+    };
+
+    let ops = vec![WriteOp::InsertOrIgnore {
+        table: "key_requests",
+        columns: vec![
+            "recorded_by",
+            "event_id",
+            "blocked_event_id",
+            "key_event_id",
+            "recipient_event_id",
+            "unwrap_key_event_id",
+            "requester_signer_event_id",
+        ],
+        values: vec![
+            SqlVal::Text(recorded_by.to_string()),
+            SqlVal::Text(event_id_b64.to_string()),
+            SqlVal::Text(event_id_to_base64(&kr.blocked_event_id)),
+            SqlVal::Text(event_id_to_base64(&kr.key_event_id)),
+            SqlVal::Text(event_id_to_base64(&kr.recipient_event_id)),
+            SqlVal::Text(event_id_to_base64(&kr.unwrap_key_event_id)),
+            SqlVal::Text(event_id_to_base64(&kr.signed_by)),
+        ],
+    }];
+
+    ProjectorResult::valid(ops)
+}
+
+pub static KEY_REQUEST_META: EventTypeMeta = EventTypeMeta {
+    type_code: EVENT_TYPE_KEY_REQUEST,
+    type_name: "key_request",
+    projection_table: "key_requests",
+    share_scope: ShareScope::Shared,
+    dep_fields: &["signed_by"],
+    dep_field_type_codes: &[&[]],
+    signer_required: true,
+    signature_byte_len: 64,
+    encryptable: false,
+    parse: parse_key_request,
+    encode: encode_key_request,
+    projector: project_pure,
+    context_loader: crate::event_modules::registry::load_empty_context,
+};

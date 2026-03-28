@@ -1833,6 +1833,15 @@ fn dispatch(
     }
 }
 
+/// Invoke the real RPC dispatch path in-process without Unix socket framing.
+///
+/// This is the seam used by virtual-daemon tests and simulator control code.
+pub fn dispatch_rpc_method(state: &DaemonState, method: RpcMethod) -> RpcResponse {
+    let shutdown = std::sync::atomic::AtomicBool::new(false);
+    let shutdown_notify = tokio::sync::Notify::new();
+    dispatch(state, method, &shutdown, &shutdown_notify)
+}
+
 #[cfg(test)]
 mod tests {
     use super::{merge_upnp_bootstrap_addr, resolve_bootstrap_from_upnp};

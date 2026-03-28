@@ -2584,10 +2584,7 @@ pub fn setup_two_peers(
 
 /// Single-peer workspace with daemon running.
 /// Returns (db_path, daemon).
-pub fn setup_single_peer(
-    tmpdir: &tempfile::TempDir,
-    name: &str,
-) -> (String, HarnessDaemon) {
+pub fn setup_single_peer(tmpdir: &tempfile::TempDir, name: &str) -> (String, HarnessDaemon) {
     let db = tmpdir
         .path()
         .join(format!("{}.db", name))
@@ -2607,7 +2604,16 @@ pub fn setup_single_peer(
 /// Create a subscription with default options.
 pub fn sub_create(db: &str, name: &str, event_type: &str) {
     let out = Command::new(bin())
-        .args(["--db", db, "sub", "create", "--name", name, "--event-type", event_type])
+        .args([
+            "--db",
+            db,
+            "sub",
+            "create",
+            "--name",
+            name,
+            "--event-type",
+            event_type,
+        ])
         .output()
         .expect("sub create failed");
     assert!(
@@ -2622,17 +2628,24 @@ pub fn sub_create(db: &str, name: &str, event_type: &str) {
 pub fn sub_create_with_delivery(db: &str, name: &str, event_type: &str, delivery: &str) {
     let out = Command::new(bin())
         .args([
-            "--db", db, "sub", "create",
-            "--name", name,
-            "--event-type", event_type,
-            "--delivery", delivery,
+            "--db",
+            db,
+            "sub",
+            "create",
+            "--name",
+            name,
+            "--event-type",
+            event_type,
+            "--delivery",
+            delivery,
         ])
         .output()
         .expect("sub create failed");
     assert!(
         out.status.success(),
         "sub create {} (delivery={}) failed: {}",
-        name, delivery,
+        name,
+        delivery,
         String::from_utf8_lossy(&out.stderr)
     );
 }
@@ -2641,15 +2654,21 @@ pub fn sub_create_with_delivery(db: &str, name: &str, event_type: &str, delivery
 pub fn sub_ack(db: &str, name: &str, through_seq: u64) {
     let out = Command::new(bin())
         .args([
-            "--db", db, "sub", "ack", name,
-            "--through-seq", &through_seq.to_string(),
+            "--db",
+            db,
+            "sub",
+            "ack",
+            name,
+            "--through-seq",
+            &through_seq.to_string(),
         ])
         .output()
         .expect("sub ack failed");
     assert!(
         out.status.success(),
         "sub ack {} through {} failed: {}",
-        name, through_seq,
+        name,
+        through_seq,
         String::from_utf8_lossy(&out.stderr)
     );
 }

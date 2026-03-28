@@ -1,0 +1,404 @@
+use std::collections::{BTreeSet, HashMap};
+
+use serde::Serialize;
+
+use crate::contracts::event_pipeline_contract::IngestItem;
+use crate::crypto::hash_event;
+use crate::db::open_connection;
+use crate::event_modules::{self as events, ParsedEvent};
+use crate::event_pipeline::ingest_now;
+use crate::sim::key_repair::{key_shared_target, response_rank, RepairTarget};
+use crate::sim::query_snapshot::{ImportedConnectTarget, ImportedPeerState};
+use crate::state::db::transport_creds::resolve_tenant_transport_target;
+
+type PairSyncResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedPairSyncDirection {
+    pub(crate) stats: PairSyncDirectionStats,
+    pub(crate) dest_db_path: String,
+    pub(crate) batch: Vec<IngestItem>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedPairSyncSession {
+    pub(crate) left_to_right: PreparedPairSyncDirection,
+    pub(crate) right_to_left: PreparedPairSyncDirection,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SimPeerNode {
+    pub db_path: String,
+    pub recorded_by: String,
+    pub daemon_peer_id: Option<String>,
+    pub local_transport_peer_id: Option<String>,
+    pub connect_targets: Vec<ImportedConnectTarget>,
+}
+
+impl SimPeerNode {
+    pub fn from_imported(db_path: &str, imported: &ImportedPeerState) -> Self {
+        Self {
+            db_path: db_path.to_string(),
+            recorded_by: imported.recorded_by.clone(),
+            daemon_peer_id: imported.daemon_peer_id.clone(),
+            local_transport_peer_id: imported.local_transport_peer_id.clone(),
+            connect_targets: imported.connect_targets.clone(),
+        }
+    }
+
+    fn identity_keys(&self) -> BTreeSet<String> {
+        let mut out = BTreeSet::new();
+        out.insert(self.recorded_by.clone());
+        if let Some(daemon_peer_id) = &self.daemon_peer_id {
+            out.insert(daemon_peer_id.clone());
+        }
+        if let Some(local_transport_peer_id) = &self.local_transport_peer_id {
+            out.insert(local_transport_peer_id.clone());
+        }
+        out
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct PairSyncIntent {
+    pub initiator_db_path: String,
+    pub initiator_recorded_by: String,
+    pub target_db_path: String,
+    pub target_recorded_by: String,
+    pub target_transport_peer_id: String,
+    pub source: String,
+    pub invite_event_id: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct PairSyncDirectionStats {
+    pub source_db_path: String,
+    pub source_recorded_by: String,
+    pub dest_db_path: String,
+    pub dest_recorded_by: String,
+    pub transferred_events: usize,
+    pub transferred_bytes: u64,
+    pub transferred_key_request_events: usize,
+    pub transferred_key_shared_events: usize,
+    pub suppressed_key_shared_events: usize,
+    pub transferred_event_ids: Vec<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize)]
+pub struct PairSyncSessionStats {
+    pub left_to_right: PairSyncDirectionStats,
+    pub right_to_left: PairSyncDirectionStats,
+}
+
+pub fn plan_pair_sync_intents(peers: &[SimPeerNode]) -> Vec<PairSyncIntent> {
+    let mut identities: HashMap<String, Vec<usize>> = HashMap::new();
+    for (idx, peer) in peers.iter().enumerate() {
+        for key in peer.identity_keys() {
+            identities.entry(key).or_default().push(idx);
+        }
+    }
+
+    let mut intents = Vec::new();
+    let mut seen = BTreeSet::new();
+    for initiator in peers {
+        for target in &initiator.connect_targets {
+            let Some(matches) = identities.get(&target.transport_peer_id) else {
+                continue;
+            };
+            for target_idx in matches {
+                let target_peer = &peers[*target_idx];
+                if initiator.db_path == target_peer.db_path
+                    && initiator.recorded_by == target_peer.recorded_by
+                {
+                    continue;
+                }
+                let key = (
+                    initiator.db_path.clone(),
+                    initiator.recorded_by.clone(),
+                    target_peer.db_path.clone(),
+                    target_peer.recorded_by.clone(),
+                    target.transport_peer_id.clone(),
+                    target.source.clone(),
+                    target.invite_event_id.clone(),
+                );
+                if !seen.insert(key) {
+                    continue;
+                }
+                intents.push(PairSyncIntent {
+                    initiator_db_path: initiator.db_path.clone(),
+                    initiator_recorded_by: initiator.recorded_by.clone(),
+                    target_db_path: target_peer.db_path.clone(),
+                    target_recorded_by: target_peer.recorded_by.clone(),
+                    target_transport_peer_id: target.transport_peer_id.clone(),
+                    source: target.source.clone(),
+                    invite_event_id: target.invite_event_id.clone(),
+                });
+            }
+        }
+    }
+
+    intents.sort_by(|left, right| {
+        (
+            &left.initiator_recorded_by,
+            &left.target_recorded_by,
+            &left.source,
+        )
+            .cmp(&(
+                &right.initiator_recorded_by,
+                &right.target_recorded_by,
+                &right.source,
+            ))
+    });
+    intents
+}
+
+pub fn run_pair_sync_session(
+    left_db_path: &str,
+    left_recorded_by: &str,
+    right_db_path: &str,
+    right_recorded_by: &str,
+) -> PairSyncResult<PairSyncSessionStats> {
+    let prepared = prepare_pair_sync_session(
+        left_db_path,
+        left_recorded_by,
+        right_db_path,
+        right_recorded_by,
+    )?;
+    apply_prepared_pair_sync_session(prepared)
+}
+
+pub(crate) fn prepare_pair_sync_session(
+    left_db_path: &str,
+    left_recorded_by: &str,
+    right_db_path: &str,
+    right_recorded_by: &str,
+) -> PairSyncResult<PreparedPairSyncSession> {
+    Ok(PreparedPairSyncSession {
+        left_to_right: collect_shared_events_one_way(
+            left_db_path,
+            left_recorded_by,
+            right_db_path,
+            right_recorded_by,
+        )?,
+        right_to_left: collect_shared_events_one_way(
+            right_db_path,
+            right_recorded_by,
+            left_db_path,
+            left_recorded_by,
+        )?,
+    })
+}
+
+pub(crate) fn apply_prepared_pair_sync_session(
+    prepared: PreparedPairSyncSession,
+) -> PairSyncResult<PairSyncSessionStats> {
+    apply_prepared_direction(&prepared.left_to_right)?;
+    apply_prepared_direction(&prepared.right_to_left)?;
+    Ok(PairSyncSessionStats {
+        left_to_right: prepared.left_to_right.stats,
+        right_to_left: prepared.right_to_left.stats,
+    })
+}
+
+fn collect_shared_events_one_way(
+    source_db_path: &str,
+    source_recorded_by: &str,
+    dest_db_path: &str,
+    dest_recorded_by: &str,
+) -> PairSyncResult<PreparedPairSyncDirection> {
+    let source = open_connection(source_db_path)?;
+    crate::db::schema::create_tables(&source)?;
+    let dest = open_connection(dest_db_path)?;
+    crate::db::schema::create_tables(&dest)?;
+
+    let known_dest_events = recorded_event_ids(&dest, dest_recorded_by)?;
+    let winning_key_shared_events = winning_key_shared_event_ids(&source, source_recorded_by)?;
+    let source_tag = format!(
+        "quic_recv:{}@sim",
+        source_transport_peer_id(&source, source_recorded_by)?
+    );
+    let now_ms = crate::db::queue::current_timestamp_ms();
+
+    let mut transferred_event_ids = Vec::new();
+    let mut transferred_bytes = 0u64;
+    let mut transferred_key_request_events = 0usize;
+    let mut transferred_key_shared_events = 0usize;
+    let mut suppressed_key_shared_events = 0usize;
+    let mut batch = Vec::<IngestItem>::new();
+
+    let mut stmt = source.prepare(
+        "SELECT e.event_id, e.event_type, e.blob
+         FROM recorded_events re
+         JOIN events e ON e.event_id = re.event_id
+         WHERE re.peer_id = ?1
+           AND e.share_scope = 'shared'
+         ORDER BY e.created_at ASC, e.event_id ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![source_recorded_by], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, Vec<u8>>(2)?,
+        ))
+    })?;
+
+    for row in rows {
+        let (event_id, event_type, blob) = row?;
+        if known_dest_events.contains(&event_id) {
+            continue;
+        }
+        if event_type == "key_request" {
+            transferred_key_request_events = transferred_key_request_events.saturating_add(1);
+        } else if event_type == "key_shared" {
+            if !winning_key_shared_events.contains(&event_id) {
+                suppressed_key_shared_events = suppressed_key_shared_events.saturating_add(1);
+                continue;
+            }
+            transferred_key_shared_events = transferred_key_shared_events.saturating_add(1);
+        }
+        transferred_bytes = transferred_bytes.saturating_add(blob.len() as u64);
+        transferred_event_ids.push(event_id);
+        batch.push((
+            hash_event(&blob),
+            blob,
+            dest_recorded_by.to_string(),
+            source_tag.clone(),
+            now_ms,
+            now_ms,
+        ));
+    }
+
+    Ok(PreparedPairSyncDirection {
+        stats: PairSyncDirectionStats {
+            source_db_path: source_db_path.to_string(),
+            source_recorded_by: source_recorded_by.to_string(),
+            dest_db_path: dest_db_path.to_string(),
+            dest_recorded_by: dest_recorded_by.to_string(),
+            transferred_events: transferred_event_ids.len(),
+            transferred_bytes,
+            transferred_key_request_events,
+            transferred_key_shared_events,
+            suppressed_key_shared_events,
+            transferred_event_ids,
+        },
+        dest_db_path: dest_db_path.to_string(),
+        batch,
+    })
+}
+
+fn winning_key_shared_event_ids(
+    conn: &rusqlite::Connection,
+    recorded_by: &str,
+) -> PairSyncResult<BTreeSet<String>> {
+    let mut stmt = conn.prepare(
+        "SELECT e.event_id, e.blob
+         FROM recorded_events re
+         JOIN events e ON e.event_id = re.event_id
+         WHERE re.peer_id = ?1
+           AND e.event_type = 'key_shared'
+         ORDER BY re.id ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+    })?;
+
+    let mut best_by_target = HashMap::<RepairTarget, ([u8; 32], [u8; 32], String)>::new();
+    for row in rows {
+        let (event_id, blob) = row?;
+        let Ok(ParsedEvent::KeyShared(event)) = events::parse_event(&blob) else {
+            continue;
+        };
+        let target = key_shared_target(&event);
+        let rank = response_rank(target, event.signed_by);
+        best_by_target
+            .entry(target)
+            .and_modify(|best| {
+                if (rank, event.signed_by, event_id.as_str()) < (best.0, best.1, best.2.as_str()) {
+                    *best = (rank, event.signed_by, event_id.clone());
+                }
+            })
+            .or_insert((rank, event.signed_by, event_id));
+    }
+
+    Ok(best_by_target
+        .into_values()
+        .map(|(_, _, event_id)| event_id)
+        .collect())
+}
+
+fn apply_prepared_direction(direction: &PreparedPairSyncDirection) -> PairSyncResult<()> {
+    if !direction.batch.is_empty() {
+        let _ = ingest_now(&direction.dest_db_path, direction.batch.clone())?;
+    }
+    Ok(())
+}
+
+fn recorded_event_ids(
+    conn: &rusqlite::Connection,
+    recorded_by: &str,
+) -> Result<BTreeSet<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare(
+        "SELECT event_id
+         FROM recorded_events
+         WHERE peer_id = ?1",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
+        row.get::<_, String>(0)
+    })?;
+    rows.collect::<Result<BTreeSet<_>, _>>()
+}
+
+fn source_transport_peer_id(
+    conn: &rusqlite::Connection,
+    recorded_by: &str,
+) -> PairSyncResult<String> {
+    if let Some(target) = resolve_tenant_transport_target(conn, recorded_by)? {
+        return Ok(target.transport_peer_id);
+    }
+    if let Some(row) = crate::db::daemon_identity::load(conn)? {
+        return Ok(row.peer_id);
+    }
+    Ok(recorded_by.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn imported(
+        recorded_by: &str,
+        daemon_peer_id: Option<&str>,
+        connect_to: &[&str],
+    ) -> SimPeerNode {
+        SimPeerNode {
+            db_path: format!("/tmp/{recorded_by}.db"),
+            recorded_by: recorded_by.to_string(),
+            daemon_peer_id: daemon_peer_id.map(ToString::to_string),
+            local_transport_peer_id: Some(recorded_by.to_string()),
+            connect_targets: connect_to
+                .iter()
+                .map(|peer_id| ImportedConnectTarget {
+                    source: "bootstrap".into(),
+                    transport_peer_id: (*peer_id).to_string(),
+                    remote: "127.0.0.1:4242".into(),
+                    invite_event_id: Some("invite".into()),
+                })
+                .collect(),
+        }
+    }
+
+    #[test]
+    fn planner_matches_connect_targets_against_multiple_peer_identity_keys() {
+        let alice = imported("alice-tenant", Some("alice-daemon"), &[]);
+        let bob = imported("bob-tenant", Some("bob-daemon"), &["alice-daemon"]);
+        let carol = imported("carol-tenant", Some("carol-daemon"), &["bob-tenant"]);
+
+        let intents = plan_pair_sync_intents(&[alice, bob, carol]);
+
+        assert_eq!(intents.len(), 2);
+        assert_eq!(intents[0].initiator_recorded_by, "bob-tenant");
+        assert_eq!(intents[0].target_recorded_by, "alice-tenant");
+        assert_eq!(intents[1].initiator_recorded_by, "carol-tenant");
+        assert_eq!(intents[1].target_recorded_by, "bob-tenant");
+    }
+}

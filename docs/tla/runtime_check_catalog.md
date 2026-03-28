@@ -33,6 +33,7 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_DEL_IDEMPOTENT | event_modules/message_deletion::project_pure | NON_MODELED::idempotent_replay | projector_local |
 | CHK_DEL_HARD_PURGE | event_modules/message_deletion::project_pure | InvDeletePurgeAtomic | projector_local |
 | CHK_SS_INSERT | event_modules/secret_shared::project_pure | InvSecretSharedKey | projector_local |
+| CHK_KR_INSERT | event_modules/key_request::project_pure | NON_MODELED::repair_request_primitive | projector_local |
 | CHK_FS_GUARD_BLOCK | event_modules/file_slice::project_pure | InvFileSliceAuth | projector_local |
 | CHK_FS_HARD_PURGE | event_modules/file_slice::project_pure | InvDeletedFilePurgesLiveSlice | projector_local |
 | CHK_FS_SIGNER_MISMATCH | event_modules/file_slice::project_pure | InvFileSliceAuth | projector_local |

@@ -17,6 +17,7 @@ const CANONICAL_EVENT_FILES: &[&str] = &[
     "src/event_modules/bench_dep.rs",
     "src/event_modules/message_deletion/wire.rs",
     "src/event_modules/key_secret.rs",
+    "src/event_modules/key_request.rs",
     "src/event_modules/key_shared.rs",
     "src/event_modules/workspace/wire.rs",
     "src/event_modules/invite_accepted.rs",
@@ -122,8 +123,8 @@ fn all_registered_types_have_fixed_wire_size() {
     // For each type code 1..=29, verify the registry has an entry
     // and encoding produces a deterministic-length blob.
     let reg = registry();
-    for code in 1u8..=29 {
-        if matches!(code, 3 | 4 | 11 | 13 | 15 | 17 | 19 | 20 | 21 | 23 | 29) {
+    for code in 1u8..=30 {
+        if matches!(code, 3 | 4 | 11 | 13 | 15 | 17 | 19 | 20 | 21 | 23) {
             continue; // removed/unused gaps in type code allocation
         }
         let meta = reg.lookup(code);
@@ -135,7 +136,7 @@ fn all_registered_types_have_fixed_wire_size() {
     }
 
     // Verify encrypted wire size is deterministic for all encryptable inner types
-    let encryptable_codes: Vec<u8> = (1..=29u8)
+    let encryptable_codes: Vec<u8> = (1..=30u8)
         .filter(|c| reg.lookup(*c).map_or(false, |m| m.encryptable))
         .collect();
 

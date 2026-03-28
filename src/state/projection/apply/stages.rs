@@ -1,6 +1,6 @@
 use super::super::decision::ProjectionDecision;
-use super::super::encrypted::project_encrypted;
-use super::super::signer::{resolve_signer_key, verify_ed25519_signature, SignerResolution};
+use super::super::signer::{verify_ed25519_signature, SignerResolution};
+use super::backend::{ProjectionApplyResult, ProjectionBackend, SqliteProjectionBackend};
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::queue::current_timestamp_ms;
 use crate::db::timeline::EventTimeline;
@@ -9,7 +9,6 @@ use crate::state::{dependency_fetch, live_hints::source_peer_id_from_source_tag}
 use rusqlite::{Connection, OptionalExtension};
 
 use super::dispatch::dispatch_pure_projector;
-use super::write_exec::{execute_emit_commands, execute_write_ops};
 
 fn semantic_type_code_for_parsed(parsed: &ParsedEvent) -> u8 {
     match parsed {
@@ -263,6 +262,7 @@ pub(crate) fn check_deps_and_block(
 /// This is the core of the pure functional projector architecture: projectors
 /// are pure functions over (event, context snapshot) that return deterministic
 /// write_ops and emit_commands. The apply engine executes them.
+#[allow(dead_code)]
 pub(crate) fn apply_projection(
     conn: &Connection,
     recorded_by: &str,
@@ -271,6 +271,25 @@ pub(crate) fn apply_projection(
     parsed: &ParsedEvent,
     current_transport_key_event_id: Option<&str>,
 ) -> Result<(ProjectionDecision, Option<ParsedEvent>), Box<dyn std::error::Error>> {
+    let backend = SqliteProjectionBackend::new(conn);
+    apply_projection_with_backend(
+        &backend,
+        recorded_by,
+        event_id_b64,
+        blob,
+        parsed,
+        current_transport_key_event_id,
+    )
+}
+
+pub(crate) fn apply_projection_with_backend<B: ProjectionBackend>(
+    backend: &B,
+    recorded_by: &str,
+    event_id_b64: &str,
+    blob: &[u8],
+    parsed: &ParsedEvent,
+    current_transport_key_event_id: Option<&str>,
+) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>)> {
     let meta = registry()
         .lookup(parsed.event_type_code())
         .ok_or_else(|| format!("unknown type code {}", parsed.event_type_code()))?;
@@ -281,7 +300,7 @@ pub(crate) fn apply_projection(
         let (signer_event_id, signer_type) = parsed
             .signer_fields()
             .ok_or("signer_required but no signer_fields")?;
-        let resolution = resolve_signer_key(conn, recorded_by, signer_type, &signer_event_id)?;
+        let resolution = backend.resolve_signer_key(recorded_by, signer_type, &signer_event_id)?;
         match resolution {
             SignerResolution::NotFound => {
                 return Ok((
@@ -328,12 +347,12 @@ pub(crate) fn apply_projection(
     // Returns (decision, Some(inner_parsed)) so the caller can fire the
     // subscription hook after the valid_events write.
     if let ParsedEvent::Encrypted(enc) = parsed {
-        let (decision, inner) = project_encrypted(conn, recorded_by, event_id_b64, enc)?;
+        let (decision, inner) = backend.project_encrypted(recorded_by, event_id_b64, enc)?;
         return Ok((decision, inner));
     }
 
     // Build projector context via event-module-owned loader.
-    let mut ctx = (meta.context_loader)(conn, recorded_by, event_id_b64, parsed)?;
+    let mut ctx = backend.load_context(meta, recorded_by, event_id_b64, parsed)?;
     ctx.current_transport_key_event_id = current_transport_key_event_id.map(ToOwned::to_owned);
 
     // Dispatch to pure projector
@@ -345,11 +364,11 @@ pub(crate) fn apply_projection(
     // - Reject / AlreadyProcessed: no side effects.
     match result.decision {
         ProjectionDecision::Valid => {
-            execute_write_ops(conn, &result.write_ops)?;
-            execute_emit_commands(conn, recorded_by, &result.emit_commands)?;
+            backend.execute_write_ops(&result.write_ops)?;
+            backend.execute_emit_commands(recorded_by, &result.emit_commands)?;
         }
         ProjectionDecision::Block { .. } => {
-            execute_emit_commands(conn, recorded_by, &result.emit_commands)?;
+            backend.execute_emit_commands(recorded_by, &result.emit_commands)?;
         }
         ProjectionDecision::Reject { .. } | ProjectionDecision::AlreadyProcessed => {}
     }
@@ -463,12 +482,35 @@ pub(crate) fn run_dep_and_projection_stages(
     enforce_dep_types: bool,
     current_transport_key_event_id: Option<&str>,
 ) -> Result<(ProjectionDecision, Option<ParsedEvent>), Box<dyn std::error::Error>> {
+    let backend = SqliteProjectionBackend::new(conn);
+    run_dep_and_projection_stages_with_backend(
+        &backend,
+        recorded_by,
+        event_id_b64,
+        blob,
+        parsed,
+        is_encrypted_transport,
+        enforce_dep_types,
+        current_transport_key_event_id,
+    )
+}
+
+pub(crate) fn run_dep_and_projection_stages_with_backend<B: ProjectionBackend>(
+    backend: &B,
+    recorded_by: &str,
+    event_id_b64: &str,
+    blob: &[u8],
+    parsed: &ParsedEvent,
+    is_encrypted_transport: bool,
+    enforce_dep_types: bool,
+    current_transport_key_event_id: Option<&str>,
+) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>)> {
     if let Err(reason) = check_transport_privacy(parsed, is_encrypted_transport) {
         return Ok((ProjectionDecision::Reject { reason }, None));
     }
 
     let deps = parsed.dep_field_values();
-    if let Some(block) = check_deps_and_block(conn, recorded_by, event_id_b64, parsed, &deps)? {
+    if let Some(block) = backend.check_deps_and_block(recorded_by, event_id_b64, &deps)? {
         return Ok((block, None));
     }
 
@@ -477,16 +519,14 @@ pub(crate) fn run_dep_and_projection_stages(
             .lookup(parsed.event_type_code())
             .ok_or_else(|| format!("unknown type code {}", parsed.event_type_code()))?;
         if !meta.dep_field_type_codes.is_empty() {
-            if let Some(reason) =
-                check_dep_types(conn, recorded_by, parsed, &deps, meta.dep_field_type_codes)?
-            {
+            if let Some(reason) = backend.check_dep_types(recorded_by, &deps, meta.dep_field_type_codes)? {
                 return Ok((ProjectionDecision::Reject { reason }, None));
             }
         }
     }
 
-    apply_projection(
-        conn,
+    apply_projection_with_backend(
+        backend,
         recorded_by,
         event_id_b64,
         blob,

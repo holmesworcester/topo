@@ -5,6 +5,7 @@ pub mod file;
 pub mod file_slice;
 pub mod invite_accepted;
 pub mod invite_secret;
+pub mod key_request;
 pub mod key_secret;
 pub mod key_shared;
 pub mod layout;
@@ -54,6 +55,7 @@ pub use file::FileEvent;
 pub use file_slice::FileSliceEvent;
 pub use invite_accepted::InviteAcceptedEvent;
 pub use invite_secret::InviteSecretEvent;
+pub use key_request::KeyRequestEvent;
 pub use key_secret::KeySecretEvent;
 pub use key_shared::KeySharedEvent;
 pub use message::MessageEvent;
@@ -88,6 +90,7 @@ pub const EVENT_TYPE_BENCH_DEP: u8 = 26;
 pub const EVENT_TYPE_PEER_SECRET: u8 = 27;
 pub const EVENT_TYPE_INVITE_SECRET: u8 = 28;
 pub const EVENT_TYPE_TENANT: u8 = 29;
+pub const EVENT_TYPE_KEY_REQUEST: u8 = 30;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
@@ -115,6 +118,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
     file_slice::ensure_schema(conn)?;
     key_secret::ensure_schema(conn)?;
     key_shared::ensure_schema(conn)?;
+    key_request::ensure_schema(conn)?;
     tenant::ensure_schema(conn)?;
     peer_secret::ensure_schema(conn)?;
     invite_secret::ensure_schema(conn)?;
@@ -131,6 +135,7 @@ pub enum ParsedEvent {
     MessageDeletion(MessageDeletionEvent),
     Workspace(WorkspaceEvent),
     InviteAccepted(InviteAcceptedEvent),
+    KeyRequest(KeyRequestEvent),
     UserInvite(UserInviteEvent),
     DeviceInvite(DeviceInviteEvent),
     User(UserEvent),
@@ -155,6 +160,7 @@ impl ParsedEvent {
             ParsedEvent::MessageDeletion(d) => d.created_at_ms,
             ParsedEvent::Workspace(w) => w.created_at_ms,
             ParsedEvent::InviteAccepted(a) => a.created_at_ms,
+            ParsedEvent::KeyRequest(k) => k.created_at_ms,
             ParsedEvent::UserInvite(u) => u.created_at_ms,
             ParsedEvent::DeviceInvite(d) => d.created_at_ms,
             ParsedEvent::User(u) => u.created_at_ms,
@@ -187,6 +193,7 @@ impl ParsedEvent {
             ParsedEvent::MessageDeletion(d) => vec![("signed_by", d.signed_by)],
             ParsedEvent::Workspace(_) => vec![],
             ParsedEvent::InviteAccepted(a) => vec![("tenant_event_id", a.tenant_event_id)],
+            ParsedEvent::KeyRequest(k) => vec![("signed_by", k.signed_by)],
             ParsedEvent::UserInvite(u) => {
                 vec![
                     ("authority_event_id", u.authority_event_id),
@@ -240,6 +247,7 @@ impl ParsedEvent {
             ParsedEvent::MessageDeletion(_) => EVENT_TYPE_MESSAGE_DELETION,
             ParsedEvent::Workspace(_) => EVENT_TYPE_WORKSPACE,
             ParsedEvent::InviteAccepted(_) => EVENT_TYPE_INVITE_ACCEPTED,
+            ParsedEvent::KeyRequest(_) => EVENT_TYPE_KEY_REQUEST,
             ParsedEvent::UserInvite(_) => EVENT_TYPE_USER_INVITE,
             ParsedEvent::DeviceInvite(_) => EVENT_TYPE_DEVICE_INVITE,
             ParsedEvent::User(_) => EVENT_TYPE_USER,
@@ -265,6 +273,7 @@ impl ParsedEvent {
             ParsedEvent::PeerShared(p) => Some((p.signed_by, p.signer_type)),
             ParsedEvent::Admin(a) => Some((a.signed_by, a.signer_type)),
             ParsedEvent::KeyShared(s) => Some((s.signed_by, s.signer_type)),
+            ParsedEvent::KeyRequest(k) => Some((k.signed_by, k.signer_type)),
             ParsedEvent::FileSlice(f) => Some((f.signed_by, f.signer_type)),
             ParsedEvent::Message(m) => Some((m.signed_by, m.signer_type)),
             ParsedEvent::Reaction(r) => Some((r.signed_by, r.signer_type)),
@@ -291,6 +300,7 @@ impl ParsedEvent {
             ParsedEvent::MessageDeletion(e) => e.human_fields(),
             ParsedEvent::Workspace(e) => e.human_fields(),
             ParsedEvent::InviteAccepted(e) => e.human_fields(),
+            ParsedEvent::KeyRequest(e) => e.human_fields(),
             ParsedEvent::UserInvite(e) => e.human_fields(),
             ParsedEvent::DeviceInvite(e) => e.human_fields(),
             ParsedEvent::User(e) => e.human_fields(),
@@ -380,6 +390,7 @@ pub fn registry() -> &'static EventRegistry {
             &message_deletion::MESSAGE_DELETION_META,
             &workspace::WORKSPACE_META,
             &invite_accepted::INVITE_ACCEPTED_META,
+            &key_request::KEY_REQUEST_META,
             &user_invite_shared::USER_INVITE_META,
             &peer_invite_shared::DEVICE_INVITE_META,
             &user::USER_META,
