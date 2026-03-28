@@ -1,15 +1,14 @@
 mod perf_network_shaper;
 
 use std::error::Error;
-use std::sync::Arc;
 use std::time::Duration;
 
 use perf_network_shaper::{NetworkProfile, UdpTrafficShaper};
 use topo::protocol::{encode_frame, parse_frame, Frame};
 use topo::transport::multi_workspace::transport_sni;
 use topo::transport::{
-    accept_session_provider, create_dual_endpoint, dial_session_provider, extract_spki_fingerprint,
-    generate_self_signed_cert, SessionProvider,
+    accept_session_provider, create_runtime_endpoint_for_tenants, dial_session_provider,
+    load_daemon_identity_from_db, SessionProvider,
 };
 
 type TestResult<T = ()> = Result<T, Box<dyn Error + Send + Sync>>;
@@ -61,29 +60,20 @@ fn shaping_profile(
 async fn connect_session_providers(
     profile: Option<NetworkProfile>,
 ) -> TestResult<ConnectedProviders> {
-    let (server_cert, server_key) = generate_self_signed_cert()?;
-    let server_fp = extract_spki_fingerprint(server_cert.as_ref())?;
-    let (client_cert, client_key) = generate_self_signed_cert()?;
-    let client_fp = extract_spki_fingerprint(client_cert.as_ref())?;
-    let server_peer_id = hex::encode(server_fp);
-
-    let server_allowed: Arc<topo::transport::DynamicAllowFn> =
-        Arc::new(move |candidate| Ok(candidate == &client_fp));
-    let client_allowed: Arc<topo::transport::DynamicAllowFn> =
-        Arc::new(move |candidate| Ok(candidate == &server_fp));
-
-    let server_ep = create_dual_endpoint(
+    let temp = tempfile::tempdir()?;
+    let server_db = temp.path().join("server.sqlite3");
+    let client_db = temp.path().join("client.sqlite3");
+    let server_ep = create_runtime_endpoint_for_tenants(
         "127.0.0.1:0".parse().unwrap(),
-        server_cert,
-        server_key,
-        server_allowed,
-    )?;
-    let client_ep = create_dual_endpoint(
+        server_db.to_str().unwrap(),
+    )
+    .await?;
+    let client_ep = create_runtime_endpoint_for_tenants(
         "127.0.0.1:0".parse().unwrap(),
-        client_cert,
-        client_key,
-        client_allowed,
-    )?;
+        client_db.to_str().unwrap(),
+    )
+    .await?;
+    let server_peer_id = load_daemon_identity_from_db(server_db.to_str().unwrap())?.0;
 
     let server_addr = server_ep.local_addr()?;
     let client_addr = client_ep.local_addr()?;
@@ -96,7 +86,7 @@ async fn connect_session_providers(
 
     let (server_provider_result, client_provider_result) = tokio::join!(
         accept_session_provider(&server_ep),
-        dial_session_provider(&client_ep, remote_addr, &sni, None)
+        dial_session_provider(&client_ep, remote_addr, &sni)
     );
     let server_provider = server_provider_result?
         .ok_or_else(|| "server endpoint closed before accepting session provider".to_string())?;
@@ -156,7 +146,7 @@ async fn exercise_roundtrip_sessions(
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn direct_quinn_repeated_sessions_succeed() -> TestResult {
+async fn direct_repeated_sessions_succeed() -> TestResult {
     let providers =
         tokio::time::timeout(Duration::from_secs(10), connect_session_providers(None)).await??;
     tokio::time::timeout(
@@ -168,7 +158,7 @@ async fn direct_quinn_repeated_sessions_succeed() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn neutral_proxy_quinn_repeated_sessions_succeed() -> TestResult {
+async fn neutral_proxy_repeated_sessions_succeed() -> TestResult {
     let providers = tokio::time::timeout(
         Duration::from_secs(10),
         connect_session_providers(Some(shaping_profile("neutral", 1_000.0, 0, 0, 0.0))),
@@ -183,7 +173,7 @@ async fn neutral_proxy_quinn_repeated_sessions_succeed() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn latency_only_proxy_quinn_repeated_sessions_succeed() -> TestResult {
+async fn latency_only_proxy_repeated_sessions_succeed() -> TestResult {
     let providers = tokio::time::timeout(
         Duration::from_secs(10),
         connect_session_providers(Some(shaping_profile("latency-only", 1_000.0, 80, 0, 0.0))),
@@ -198,7 +188,7 @@ async fn latency_only_proxy_quinn_repeated_sessions_succeed() -> TestResult {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn bandwidth_only_proxy_quinn_repeated_sessions_succeed() -> TestResult {
+async fn bandwidth_only_proxy_repeated_sessions_succeed() -> TestResult {
     let providers = tokio::time::timeout(
         Duration::from_secs(10),
         connect_session_providers(Some(shaping_profile("bandwidth-only", 2.0, 0, 0, 0.0))),
@@ -226,7 +216,7 @@ async fn bandwidth_only_proxy_quinn_repeated_sessions_succeed() -> TestResult {
 /// This proves the shaper itself adds no material overhead when not impeding traffic.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn zero_impairment_proxy_matches_direct_speed() -> TestResult {
-    // Same workload as direct_quinn_repeated_sessions_succeed: 5 rounds × 32 KiB.
+    // Same workload as direct_repeated_sessions_succeed: 5 rounds × 32 KiB.
     let providers = tokio::time::timeout(
         Duration::from_secs(10),
         connect_session_providers(Some(shaping_profile(

@@ -541,6 +541,8 @@ fn test_file_slice_wrong_signer_rejected() {
     let dif_a_eid = insert_event_raw(&conn, recorded_by, &dif_a_blob);
     project_one(&conn, recorded_by, &dif_a_eid).unwrap();
 
+    let endpoint_shared_event_id = ensure_test_endpoint_shared(&conn);
+
     // 6a. PeerShared A (signed by device_invite_a)
     let signer_key_a = SigningKey::generate(&mut rng);
     let peer_pub_a = signer_key_a.verifying_key().to_bytes();
@@ -548,6 +550,7 @@ fn test_file_slice_wrong_signer_rejected() {
         created_at_ms: now_ms(),
         public_key: peer_pub_a,
         user_event_id: ub_eid,
+        endpoint_shared_event_id,
         device_name: "device-a".to_string(),
         signed_by: dif_a_eid,
         signer_type: 3,
@@ -584,6 +587,7 @@ fn test_file_slice_wrong_signer_rejected() {
         created_at_ms: now_ms(),
         public_key: peer_pub_b,
         user_event_id: ub_eid,
+        endpoint_shared_event_id,
         device_name: "device-b".to_string(),
         signed_by: dif_b_eid,
         signer_type: 3,

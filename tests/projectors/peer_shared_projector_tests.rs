@@ -22,6 +22,7 @@ mod tests {
             created_at_ms: 10000,
             public_key,
             user_event_id,
+            endpoint_shared_event_id: [7u8; 32],
             device_name: "device-1".to_string(),
             signed_by: [3u8; 32],
             signer_type: 3,
@@ -34,7 +35,8 @@ mod tests {
     #[test]
     fn test_peer_shared_writes_row() {
         let parsed = make_peer_shared([5u8; 32], [6u8; 32]);
-        let ctx = empty_ctx();
+        let mut ctx = empty_ctx();
+        ctx.peer_shared_endpoint_id = Some("endpoint-1".to_string());
         let event_id = b64(&[21u8; 32]);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
@@ -49,7 +51,8 @@ mod tests {
         let pk = [5u8; 32];
         let user_eid = [6u8; 32];
         let parsed = make_peer_shared(pk, user_eid);
-        let ctx = empty_ctx();
+        let mut ctx = empty_ctx();
+        ctx.peer_shared_endpoint_id = Some("endpoint-1".to_string());
         let event_id = b64(&[22u8; 32]);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
@@ -95,7 +98,8 @@ mod tests {
     fn test_peer_shared_preserves_bootstrap_trust() {
         let pk = [5u8; 32];
         let parsed = make_peer_shared(pk, [6u8; 32]);
-        let ctx = empty_ctx();
+        let mut ctx = empty_ctx();
+        ctx.peer_shared_endpoint_id = Some("endpoint-1".to_string());
         let event_id = b64(&[23u8; 32]);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
@@ -122,7 +126,9 @@ mod tests {
         let parsed = make_peer_shared(pk, [8u8; 32]);
         let event_id = b64(&[25u8; 32]);
 
-        let result = project_pure(recorded_by, &event_id, &parsed, &empty_ctx());
+        let mut ctx = empty_ctx();
+        ctx.peer_shared_endpoint_id = Some("endpoint-1".to_string());
+        let result = project_pure(recorded_by, &event_id, &parsed, &ctx);
         assert_valid(&result);
 
         let insert = result.write_ops.iter().find(|op| {

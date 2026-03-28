@@ -14,10 +14,9 @@ pub const MSG_TYPE_REQUEST_IDS: u8 = 0x12; // Sink request: source should send t
 pub const MSG_TYPE_DISCOVERY_HINTS: u8 = 0x14; // Discovery hint: peer is missing these IDs
 pub const MSG_TYPE_RANGE_POLICY_REJECT: u8 = 0x15; // Peer explicitly rejects a sync window policy
 pub const MSG_TYPE_EVENT: u8 = 0x03; // Event blob (variable length)
-pub const MSG_TYPE_INTRO_OFFER: u8 = 0x30; // Intro offer for hole punching
-pub const MSG_TYPE_OPEN_SESSION_AUTH_PEER_SHARED: u8 = 0x31;
-pub const MSG_TYPE_OPEN_SESSION_AUTH_INVITE: u8 = 0x32;
-pub const MSG_TYPE_OPEN_SESSION_AUTH_ACK: u8 = 0x33;
+pub const MSG_TYPE_OPEN_SESSION_AUTH_INVITE: u8 = 0x31;
+pub const MSG_TYPE_OPEN_SESSION_AUTH_ACK: u8 = 0x32;
+pub const MSG_TYPE_OPEN_SESSION_ROUTE: u8 = 0x33;
 
 /// Max negentropy message payload.  With frame_size_limit=0 (unlimited), the
 /// negentropy library may produce multi-MB messages for large divergent sets
@@ -37,17 +36,6 @@ pub struct DiscoveryHint {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OpenSessionAuthPeerShared {
-    pub source_peer_id: [u8; 32],
-    pub target_tenant_id: [u8; 32],
-    pub signer_event_id: EventId,
-    pub local_daemon_peer_id: [u8; 32],
-    pub remote_daemon_peer_id: [u8; 32],
-    pub expires_at_ms: u64,
-    pub signature: [u8; 64],
-}
-
-#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenSessionAuthInvite {
     pub source_peer_id: [u8; 32],
     pub source_peer_public_key: [u8; 32],
@@ -60,6 +48,12 @@ pub struct OpenSessionAuthInvite {
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenSessionAuthAck {
+    pub target_tenant_id: [u8; 32],
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OpenSessionRoute {
+    pub source_peer_id: [u8; 32],
     pub target_tenant_id: [u8; 32],
 }
 
@@ -93,25 +87,14 @@ pub enum Frame {
     Event {
         blob: Vec<u8>,
     },
-    /// Intro offer for QUIC hole punching via a third peer
-    IntroOffer {
-        intro_id: [u8; 16],
-        other_peer_id: [u8; 32],
-        origin_family: u8,
-        origin_ip: [u8; 16],
-        origin_port: u16,
-        observed_at_ms: u64,
-        expires_at_ms: u64,
-        attempt_window_ms: u32,
-    },
-    OpenSessionAuthPeerShared {
-        auth: OpenSessionAuthPeerShared,
-    },
     OpenSessionAuthInvite {
         auth: OpenSessionAuthInvite,
     },
     OpenSessionAuthAck {
         ack: OpenSessionAuthAck,
+    },
+    OpenSessionRoute {
+        route: OpenSessionRoute,
     },
 }
 
@@ -246,91 +229,6 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
             let blob = input[5..total_size].to_vec();
             Ok((Frame::Event { blob }, total_size))
         }
-        MSG_TYPE_INTRO_OFFER => {
-            // Fixed layout: type(1) + intro_id(16) + other_peer_id(32)
-            //   + origin_family(1) + origin_ip(16) + origin_port(2)
-            //   + observed_at_ms(8) + expires_at_ms(8) + attempt_window_ms(4) = 88
-            const INTRO_OFFER_SIZE: usize = 1 + 16 + 32 + 1 + 16 + 2 + 8 + 8 + 4;
-            if input.len() < INTRO_OFFER_SIZE {
-                return Err(ParseError::InsufficientData);
-            }
-            let mut pos = 1;
-            let mut intro_id = [0u8; 16];
-            intro_id.copy_from_slice(&input[pos..pos + 16]);
-            pos += 16;
-            let mut other_peer_id = [0u8; 32];
-            other_peer_id.copy_from_slice(&input[pos..pos + 32]);
-            pos += 32;
-            let origin_family = input[pos];
-            pos += 1;
-            let mut origin_ip = [0u8; 16];
-            origin_ip.copy_from_slice(&input[pos..pos + 16]);
-            pos += 16;
-            let origin_port = u16::from_le_bytes([input[pos], input[pos + 1]]);
-            pos += 2;
-            let observed_at_ms = u64::from_le_bytes(input[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-            let expires_at_ms = u64::from_le_bytes(input[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-            let attempt_window_ms = u32::from_le_bytes(input[pos..pos + 4].try_into().unwrap());
-            pos += 4;
-            debug_assert_eq!(pos, INTRO_OFFER_SIZE);
-            Ok((
-                Frame::IntroOffer {
-                    intro_id,
-                    other_peer_id,
-                    origin_family,
-                    origin_ip,
-                    origin_port,
-                    observed_at_ms,
-                    expires_at_ms,
-                    attempt_window_ms,
-                },
-                INTRO_OFFER_SIZE,
-            ))
-        }
-        MSG_TYPE_OPEN_SESSION_AUTH_PEER_SHARED => {
-            const AUTH_SIZE: usize = 1 + 32 + 32 + 32 + 32 + 32 + 8 + 64;
-            if input.len() < AUTH_SIZE {
-                return Err(ParseError::InsufficientData);
-            }
-            let mut pos = 1;
-            let mut source_peer_id = [0u8; 32];
-            source_peer_id.copy_from_slice(&input[pos..pos + 32]);
-            pos += 32;
-            let mut target_tenant_id = [0u8; 32];
-            target_tenant_id.copy_from_slice(&input[pos..pos + 32]);
-            pos += 32;
-            let mut signer_event_id = [0u8; 32];
-            signer_event_id.copy_from_slice(&input[pos..pos + 32]);
-            pos += 32;
-            let mut local_daemon_peer_id = [0u8; 32];
-            local_daemon_peer_id.copy_from_slice(&input[pos..pos + 32]);
-            pos += 32;
-            let mut remote_daemon_peer_id = [0u8; 32];
-            remote_daemon_peer_id.copy_from_slice(&input[pos..pos + 32]);
-            pos += 32;
-            let expires_at_ms = u64::from_le_bytes(input[pos..pos + 8].try_into().unwrap());
-            pos += 8;
-            let mut signature = [0u8; 64];
-            signature.copy_from_slice(&input[pos..pos + 64]);
-            pos += 64;
-            debug_assert_eq!(pos, AUTH_SIZE);
-            Ok((
-                Frame::OpenSessionAuthPeerShared {
-                    auth: OpenSessionAuthPeerShared {
-                        source_peer_id,
-                        target_tenant_id,
-                        signer_event_id,
-                        local_daemon_peer_id,
-                        remote_daemon_peer_id,
-                        expires_at_ms,
-                        signature,
-                    },
-                },
-                AUTH_SIZE,
-            ))
-        }
         MSG_TYPE_OPEN_SESSION_AUTH_INVITE => {
             const AUTH_SIZE: usize = 1 + 32 + 32 + 32 + 32 + 32 + 8 + 64;
             if input.len() < AUTH_SIZE {
@@ -385,6 +283,25 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
                     ack: OpenSessionAuthAck { target_tenant_id },
                 },
                 ACK_SIZE,
+            ))
+        }
+        MSG_TYPE_OPEN_SESSION_ROUTE => {
+            const ROUTE_SIZE: usize = 1 + 32 + 32;
+            if input.len() < ROUTE_SIZE {
+                return Err(ParseError::InsufficientData);
+            }
+            let mut source_peer_id = [0u8; 32];
+            source_peer_id.copy_from_slice(&input[1..33]);
+            let mut target_tenant_id = [0u8; 32];
+            target_tenant_id.copy_from_slice(&input[33..65]);
+            Ok((
+                Frame::OpenSessionRoute {
+                    route: OpenSessionRoute {
+                        source_peer_id,
+                        target_tenant_id,
+                    },
+                },
+                ROUTE_SIZE,
             ))
         }
         _ => Err(ParseError::UnknownType(msg_type)),
@@ -450,40 +367,6 @@ pub fn encode_frame(msg: &Frame) -> Vec<u8> {
             buf.extend_from_slice(blob);
             buf
         }
-        Frame::IntroOffer {
-            intro_id,
-            other_peer_id,
-            origin_family,
-            origin_ip,
-            origin_port,
-            observed_at_ms,
-            expires_at_ms,
-            attempt_window_ms,
-        } => {
-            let mut buf = Vec::with_capacity(88);
-            buf.push(MSG_TYPE_INTRO_OFFER);
-            buf.extend_from_slice(intro_id);
-            buf.extend_from_slice(other_peer_id);
-            buf.push(*origin_family);
-            buf.extend_from_slice(origin_ip);
-            buf.extend_from_slice(&origin_port.to_le_bytes());
-            buf.extend_from_slice(&observed_at_ms.to_le_bytes());
-            buf.extend_from_slice(&expires_at_ms.to_le_bytes());
-            buf.extend_from_slice(&attempt_window_ms.to_le_bytes());
-            buf
-        }
-        Frame::OpenSessionAuthPeerShared { auth } => {
-            let mut buf = Vec::with_capacity(1 + 32 + 32 + 32 + 32 + 32 + 8 + 64);
-            buf.push(MSG_TYPE_OPEN_SESSION_AUTH_PEER_SHARED);
-            buf.extend_from_slice(&auth.source_peer_id);
-            buf.extend_from_slice(&auth.target_tenant_id);
-            buf.extend_from_slice(&auth.signer_event_id);
-            buf.extend_from_slice(&auth.local_daemon_peer_id);
-            buf.extend_from_slice(&auth.remote_daemon_peer_id);
-            buf.extend_from_slice(&auth.expires_at_ms.to_le_bytes());
-            buf.extend_from_slice(&auth.signature);
-            buf
-        }
         Frame::OpenSessionAuthInvite { auth } => {
             let mut buf = Vec::with_capacity(1 + 32 + 32 + 32 + 32 + 32 + 8 + 64);
             buf.push(MSG_TYPE_OPEN_SESSION_AUTH_INVITE);
@@ -500,6 +383,13 @@ pub fn encode_frame(msg: &Frame) -> Vec<u8> {
             let mut buf = Vec::with_capacity(1 + 32);
             buf.push(MSG_TYPE_OPEN_SESSION_AUTH_ACK);
             buf.extend_from_slice(&ack.target_tenant_id);
+            buf
+        }
+        Frame::OpenSessionRoute { route } => {
+            let mut buf = Vec::with_capacity(1 + 32 + 32);
+            buf.push(MSG_TYPE_OPEN_SESSION_ROUTE);
+            buf.extend_from_slice(&route.source_peer_id);
+            buf.extend_from_slice(&route.target_tenant_id);
             buf
         }
     }
@@ -609,84 +499,6 @@ mod tests {
         assert_eq!(result, Err(ParseError::UnknownType(0xFF)));
     }
     #[test]
-    fn test_intro_offer_roundtrip() {
-        let msg = Frame::IntroOffer {
-            intro_id: [0xAA; 16],
-            other_peer_id: [0xBB; 32],
-            origin_family: 4,
-            origin_ip: {
-                // IPv4 192.168.1.100 mapped to 16-byte field
-                let mut ip = [0u8; 16];
-                ip[12] = 192;
-                ip[13] = 168;
-                ip[14] = 1;
-                ip[15] = 100;
-                ip
-            },
-            origin_port: 12345,
-            observed_at_ms: 1700000000000,
-            expires_at_ms: 1700000030000,
-            attempt_window_ms: 4000,
-        };
-        let encoded = encode_frame(&msg);
-        assert_eq!(encoded.len(), 88); // type(1) + fixed payload(87)
-        let (parsed, consumed) = parse_frame(&encoded).unwrap();
-        assert_eq!(consumed, 88);
-        assert_eq!(parsed, msg);
-    }
-
-    #[test]
-    fn test_intro_offer_ipv6_roundtrip() {
-        let msg = Frame::IntroOffer {
-            intro_id: [0x01; 16],
-            other_peer_id: [0x02; 32],
-            origin_family: 6,
-            origin_ip: [0xFE, 0x80, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 1],
-            origin_port: 443,
-            observed_at_ms: u64::MAX - 1,
-            expires_at_ms: u64::MAX,
-            attempt_window_ms: 10000,
-        };
-        let encoded = encode_frame(&msg);
-        assert_eq!(encoded.len(), 88);
-        let (parsed, consumed) = parse_frame(&encoded).unwrap();
-        assert_eq!(consumed, 88);
-        assert_eq!(parsed, msg);
-    }
-
-    #[test]
-    fn test_intro_offer_insufficient_data() {
-        // Just the type byte, no payload
-        let result = parse_frame(&[MSG_TYPE_INTRO_OFFER]);
-        assert_eq!(result, Err(ParseError::InsufficientData));
-
-        // Partial payload (50 of 87 needed)
-        let mut buf = vec![MSG_TYPE_INTRO_OFFER];
-        buf.extend_from_slice(&[0u8; 50]);
-        let result = parse_frame(&buf);
-        assert_eq!(result, Err(ParseError::InsufficientData));
-    }
-
-    #[test]
-    fn test_open_session_auth_peer_shared_roundtrip() {
-        let msg = Frame::OpenSessionAuthPeerShared {
-            auth: OpenSessionAuthPeerShared {
-                source_peer_id: [0x11; 32],
-                target_tenant_id: [0x22; 32],
-                signer_event_id: [0x33; 32],
-                local_daemon_peer_id: [0x44; 32],
-                remote_daemon_peer_id: [0x55; 32],
-                expires_at_ms: 123456789,
-                signature: [0x66; 64],
-            },
-        };
-        let encoded = encode_frame(&msg);
-        let (parsed, consumed) = parse_frame(&encoded).unwrap();
-        assert_eq!(consumed, encoded.len());
-        assert_eq!(parsed, msg);
-    }
-
-    #[test]
     fn test_open_session_auth_invite_roundtrip() {
         let msg = Frame::OpenSessionAuthInvite {
             auth: OpenSessionAuthInvite {
@@ -710,6 +522,20 @@ mod tests {
         let msg = Frame::OpenSessionAuthAck {
             ack: OpenSessionAuthAck {
                 target_tenant_id: [0x77; 32],
+            },
+        };
+        let encoded = encode_frame(&msg);
+        let (parsed, consumed) = parse_frame(&encoded).unwrap();
+        assert_eq!(consumed, encoded.len());
+        assert_eq!(parsed, msg);
+    }
+
+    #[test]
+    fn test_open_session_route_roundtrip() {
+        let msg = Frame::OpenSessionRoute {
+            route: OpenSessionRoute {
+                source_peer_id: [0x11; 32],
+                target_tenant_id: [0x22; 32],
             },
         };
         let encoded = encode_frame(&msg);

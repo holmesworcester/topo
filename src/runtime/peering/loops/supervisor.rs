@@ -30,6 +30,8 @@ use super::{
     ENDPOINT_TTL_MS,
 };
 
+const FIRST_SESSION_AUTH_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// Shared startup preflight:
 /// - `create_tables`
 /// - purge expired endpoint observations
@@ -124,6 +126,7 @@ pub(super) async fn supervise_inbound_daemon_connection(
 ) {
     let connection = daemon_connection.connection();
     let remote_daemon_peer_id = daemon_connection.remote_daemon_peer_id().to_string();
+    let mut connection_admitted = false;
 
     loop {
         if shutdown.is_cancelled() {
@@ -131,50 +134,99 @@ pub(super) async fn supervise_inbound_daemon_connection(
             return;
         }
 
-        let mut session = match tokio::select! {
-            _ = shutdown.cancelled() => {
-                connection.close(0u32.into(), b"runtime shutdown");
-                return;
+        let session_result = if connection_admitted {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    connection.close(0u32.into(), b"runtime shutdown");
+                    return;
+                }
+                session = daemon_connection.accept_inbound_session() => Ok(session),
             }
-            session = daemon_connection.accept_inbound_session() => session,
-        } {
-            Ok(session) => session,
-            Err(e) => {
-                if let Some(reason) = extract_build_mismatch_reason(&e.to_string()) {
-                    note_build_mismatch(&remote_daemon_peer_id, reason);
-                    let key = format!(
-                        "session-build-mismatch:{:?}:{}",
-                        SessionDirection::Inbound,
-                        remote_daemon_peer_id
-                    );
-                    if should_emit_globally(key) {
-                        warn!(
-                            "Peer {} rejected {:?} session on connection {}: {}",
-                            short_peer_id(&remote_daemon_peer_id),
+        } else {
+            tokio::select! {
+                _ = shutdown.cancelled() => {
+                    connection.close(0u32.into(), b"runtime shutdown");
+                    return;
+                }
+                session = tokio::time::timeout(
+                    FIRST_SESSION_AUTH_TIMEOUT,
+                    daemon_connection.accept_inbound_session(),
+                ) => {
+                    match session {
+                        Ok(session) => Ok(session),
+                        Err(_) => Err("first session auth timeout".to_string()),
+                    }
+                }
+            }
+        };
+        let mut session = match session_result {
+            Ok(session) => match session {
+                Ok(session) => session,
+                Err(e) => {
+                    if let Some(reason) = extract_build_mismatch_reason(&e.to_string()) {
+                        note_build_mismatch(&remote_daemon_peer_id, reason);
+                        let key = format!(
+                            "session-build-mismatch:{:?}:{}",
                             SessionDirection::Inbound,
+                            remote_daemon_peer_id
+                        );
+                        if should_emit_globally(key) {
+                            warn!(
+                                "Peer {} rejected {:?} session on connection {}: {}",
+                                short_peer_id(&remote_daemon_peer_id),
+                                SessionDirection::Inbound,
+                                connection.stable_id(),
+                                reason
+                            );
+                        }
+                    } else {
+                        info!(
+                            "Connection {} dropped while accepting inbound session: {}",
                             connection.stable_id(),
-                            reason
+                            e
                         );
                     }
-                } else {
-                    info!(
-                        "Connection {} dropped while accepting inbound session: {}",
-                        connection.stable_id(),
-                        e
-                    );
+                    return;
                 }
+            },
+            Err(message) => {
+                warn!(
+                    "Closing unauthenticated daemon connection {} daemon={}: {}",
+                    connection.stable_id(),
+                    short_peer_id(&remote_daemon_peer_id),
+                    message
+                );
+                connection.close(1u32.into(), message.as_bytes());
                 return;
             }
         };
 
-        let auth_context = match read_inbound_session_auth_for_connection(
+        let auth_future = read_inbound_session_auth_for_connection(
             session.io.as_mut(),
             db_path,
             daemon_connection,
-        )
-        .await
-        {
-            Ok(auth_context) => auth_context,
+        );
+        let auth_context = if connection_admitted {
+            auth_future.await
+        } else {
+            match tokio::time::timeout(FIRST_SESSION_AUTH_TIMEOUT, auth_future).await {
+                Ok(result) => result,
+                Err(_) => {
+                    let message = format!(
+                        "Inbound session {} auth timed out on connection {} daemon={}",
+                        session.session_id,
+                        connection.stable_id(),
+                        short_peer_id(&remote_daemon_peer_id)
+                    );
+                    warn!("{}", message);
+                    connection.close(1u32.into(), b"session auth timeout");
+                    return;
+                }
+            }
+        };
+
+        let auth_context = match auth_context {
+            Ok(session) => session,
             Err(err) => {
                 warn!(
                     "Inbound session {} auth failed on connection {} daemon={}: {}",
@@ -183,9 +235,14 @@ pub(super) async fn supervise_inbound_daemon_connection(
                     short_peer_id(&remote_daemon_peer_id),
                     err
                 );
+                if !connection_admitted {
+                    connection.close(1u32.into(), b"session auth rejected");
+                    return;
+                }
                 continue;
             }
         };
+        connection_admitted = true;
         if let Err(err) =
             send_inbound_session_auth_ack(session.io.as_mut(), &auth_context.tenant_id).await
         {

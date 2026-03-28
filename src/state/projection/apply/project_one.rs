@@ -4,7 +4,7 @@ use crate::crypto::{event_id_to_base64, EventId};
 use crate::event_modules::{self as events, ParsedEvent};
 use rusqlite::Connection;
 
-use super::cascade::cascade_unblocked;
+use super::cascade::{cascade_unblocked, cascade_unblocked_global};
 use super::stages::run_dep_and_projection_stages_with_backend;
 
 fn event_is_valid_for_peer(
@@ -51,7 +51,6 @@ pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
 ) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>)> {
     let event_id_b64 = event_id_to_base64(event_id);
 
-    // 1. Check terminal state — already processed (valid)?
     if backend.already_processed(recorded_by, &event_id_b64)? {
         return Ok((ProjectionDecision::AlreadyProcessed, None));
     }
@@ -94,8 +93,6 @@ pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
             return Ok((decision, Some(parsed)));
         }
         ProjectionDecision::Block { ref missing } => {
-            // Dependency-stage block rows are written in check_deps_and_block().
-            // Projector-level guard blocks (missing == []) rely on emitted commands.
             backend.mark_guard_blocked(&event_id_b64)?;
             let _ = missing;
             return Ok((decision, Some(parsed)));
@@ -135,6 +132,9 @@ pub fn project_one(
             let event_id_b64 = event_id_to_base64(event_id);
             if event_is_valid_for_peer(conn, recorded_by, &event_id_b64)? {
                 cascade_unblocked(conn, recorded_by, &event_id_b64, parsed.as_ref())?;
+                if matches!(parsed.as_ref(), Some(ParsedEvent::EndpointShared(_))) {
+                    cascade_unblocked_global(conn, &event_id_b64)?;
+                }
             }
         }
         Ok(decision)

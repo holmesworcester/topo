@@ -75,6 +75,11 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_PS_PENDING_CONSUME | state/db/transport_trust::consume_bootstrap_for_peer_shared | InvPendingConsumedByPeerShared | transport_credential |
 | CHK_PS_PENDING_BOOTSTRAP_CONSUME | state/db/transport_trust::consume_bootstrap_for_peer_shared | InvPendingBootstrapTrustConsumedByPeerShared | transport_credential |
 | CHK_UI_PENDING_SOURCE | event_modules/user_invite::project_pure | InvPendingBootstrapTrustSource | projector_local |
+| CHK_ES_INSERT | event_modules/endpoint_secret::project_pure | NON_MODELED::local_endpoint_root | projector_local |
+| CHK_ES_SCOPE_MATCH | event_modules/endpoint_secret::project_pure | NON_MODELED::endpoint_scope_match | projector_local |
+| CHK_EPS_INSERT | event_modules/endpoint_shared::project_pure | NON_MODELED::shared_endpoint_projection | projector_local |
+| CHK_EPS_SCOPE_MATCH | event_modules/endpoint_shared::project_pure | NON_MODELED::endpoint_shared_scope_match | projector_local |
+| CHK_EPS_SELF_SIG | event_modules/endpoint_shared::project_pure | NON_MODELED::endpoint_shared_self_auth | projector_local |
 
 ## Wire Validation Checks
 
@@ -128,9 +133,9 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_BRIDGE_ROW_TO_RUNTIME_TRUST | projection/trust_store + runtime/transport | BrInv_RowToMaterializedExactness | unified_bridge |
 | CHK_BRIDGE_PENDING_LOCAL_CREATE | event_modules/user_invite + event_modules/device_invite | BrInv_PendingOnlyOnInviter | unified_bridge |
 | CHK_BRIDGE_ALLOWED_PEER_AUTH | runtime/transport/authz | BrInv_AllowedPeerMatchesAuthDecision | unified_bridge |
-| CHK_BRIDGE_ONGOING_PREFERENCE | runtime/transport/bootstrap_dial_context + runtime/peering/loops/connect | BrInv_OngoingPreferred | unified_bridge |
-| CHK_BRIDGE_BOOTSTRAP_FALLBACK | runtime/transport/bootstrap_dial_context + runtime/peering/loops/connect | BrInv_BootstrapFallbackOnlyWhenNeeded | unified_bridge |
-| CHK_BRIDGE_BOOTSTRAP_CTX_DETERMINISM | runtime/transport/bootstrap_dial_context + runtime/peering/loops/connect | BrInv_BootstrapContextDeterministic | unified_bridge |
+| CHK_BRIDGE_ONGOING_PREFERENCE | runtime/peering/engine/target_dispatch | BrInv_OngoingPreferred | unified_bridge |
+| CHK_BRIDGE_BOOTSTRAP_FALLBACK | runtime/peering/engine/bootstrap_auth + runtime/peering/engine/target_dispatch | BrInv_BootstrapFallbackOnlyWhenNeeded | unified_bridge |
+| CHK_BRIDGE_BOOTSTRAP_CTX_DETERMINISM | runtime/peering/engine/bootstrap_auth | BrInv_BootstrapContextDeterministic | unified_bridge |
 | CHK_BRIDGE_BOOTSTRAP_PROGRESS | runtime/peering/bootstrap + sync loops | BrLive_BootstrapConnectEventually | unified_bridge |
 | CHK_BRIDGE_UPGRADE_PROGRESS | runtime/peering/loops/connect | BrLive_PeerUpgradeEventually | unified_bridge |
 | CHK_BRIDGE_SYNC_COMPLETION_PROGRESS | runtime/sync + projection/apply | BrLive_BootstrapCompletionSyncEventually | unified_bridge |
@@ -140,13 +145,19 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_BRIDGE_SEC_SOURCE_BINDING | runtime/transport + projection/trust_store | BrSec_SourceBindingConsistency | unified_bridge |
 | CHK_BRIDGE_SEC_IDENTITY_COLLISION | transport/identity_adapter + transport_creds | BrSec_NoIdentityCollisionInAuthPath | unified_bridge |
 
+## Endpoint Bootstrap Route Checks
+
+| check_id | owner | tla_guard_id | category |
+|----------|-------|-------------|----------|
+| CHK_ENDPOINT_BOOTSTRAP_PROOF_SCOPE | runtime/transport/session_auth | InvBootstrapAdmissionProofScoped | endpoint_bootstrap_route |
+
 ## Exact Transport Targeting Checks
 
 | check_id | owner | tla_guard_id | category |
 |----------|-------|-------------|----------|
 | CHK_ETT_INBOUND_EXACT_TARGET | runtime/transport/session_auth + runtime/peering/loops/accept | InvInboundAdmittedAuthorized | exact_transport_targeting |
 | CHK_ETT_NO_CROSS_TENANT_FALLBACK | runtime/transport/session_auth + runtime/peering/loops/accept | InvNoCrossTenantFallback | exact_transport_targeting |
-| CHK_ETT_OUTBOUND_EXACT_REMOTE | runtime/peering/loops/connect + runtime/transport | InvOutboundConnectedAuthorized | exact_transport_targeting |
+| CHK_ETT_OUTBOUND_EXACT_REMOTE | runtime/transport/connection_lifecycle | InvOutboundConnectedAuthorized | exact_transport_targeting |
 
 ## Replay/Order Checks
 

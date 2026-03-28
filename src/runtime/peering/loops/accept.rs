@@ -10,15 +10,10 @@ use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::contracts::peering_contract::SessionDirection;
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
 use crate::sync::SyncConnectionHandler;
-use crate::transport::{
-    accept_daemon_connection, load_daemon_identity_from_db, TransportClientConfig,
-    TransportEndpoint,
-};
+use crate::transport::{accept_daemon_connection, load_daemon_identity_from_db, TransportEndpoint};
 
 use super::supervisor::{run_startup_preflight, supervise_inbound_daemon_connection};
-use super::{
-    claim_live_daemon_connection_slot, IntroSpawnerFn, SYNC_SESSION_TIMEOUT_SECS,
-};
+use super::{claim_live_daemon_connection_slot, SYNC_SESSION_TIMEOUT_SECS};
 
 const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
 
@@ -26,7 +21,6 @@ pub async fn accept_loop(
     db_path: &str,
     recorded_by: &str,
     endpoint: TransportEndpoint,
-    intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let tenant_ids = vec![recorded_by.to_string()];
@@ -35,8 +29,6 @@ pub async fn accept_loop(
         &tenant_ids,
         endpoint,
         CancellationToken::new(),
-        std::collections::HashMap::new(),
-        intro_spawner,
         ingest,
         None,
     )
@@ -48,8 +40,6 @@ pub async fn accept_loop_until_cancel(
     tenant_peer_ids: &[String],
     endpoint: TransportEndpoint,
     shutdown: CancellationToken,
-    tenant_client_configs: std::collections::HashMap<String, TransportClientConfig>,
-    intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -58,8 +48,6 @@ pub async fn accept_loop_until_cancel(
         tenant_peer_ids,
         endpoint,
         shutdown,
-        tenant_client_configs,
-        intro_spawner,
         ingest,
         sync_control,
     )
@@ -71,8 +59,6 @@ async fn accept_loop_until_cancel_inner(
     tenant_peer_ids: &[String],
     endpoint: TransportEndpoint,
     shutdown: CancellationToken,
-    _tenant_client_configs: std::collections::HashMap<String, TransportClientConfig>,
-    intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
@@ -138,8 +124,6 @@ async fn accept_loop_until_cancel_inner(
 
         let db_path_owned = db_path.to_string();
         let daemon_connection_owned = daemon_connection.clone();
-        let intro_endpoint = endpoint.clone();
-        let remote_daemon_peer_id_owned = remote_daemon_peer_id.clone();
         let worker_shutdown = shutdown.child_token();
         let worker_cancel = worker_shutdown.clone();
         let sync_control_clone = sync_control.clone();
@@ -152,13 +136,6 @@ async fn accept_loop_until_cancel_inner(
                 .expect("accept connection worker runtime");
             let local = tokio::task::LocalSet::new();
             runtime.block_on(local.run_until(async move {
-                intro_spawner(
-                    connection.clone(),
-                    db_path_owned.clone(),
-                    remote_daemon_peer_id_owned,
-                    intro_endpoint,
-                );
-
                 let responder_handler = SyncConnectionHandler::responder(
                     db_path_owned.clone(),
                     SYNC_SESSION_TIMEOUT_SECS,
@@ -198,18 +175,7 @@ async fn accept_loop_until_cancel_inner(
 fn describe_accept_failure(err: &crate::transport::ConnectionLifecycleError) -> String {
     let msg = err.to_string();
     let m = msg.to_ascii_lowercase();
-    if m.contains("trust_rejected") {
-        let fp = msg
-            .split("peer fingerprint ")
-            .nth(1)
-            .and_then(|s| s.split_whitespace().next())
-            .unwrap_or("unknown");
-        format!(
-            "Rejected incoming daemon connection: remote daemon presented TLS fingerprint {} \
-             which is not trusted by any local workspace.",
-            fp
-        )
-    } else if m.contains("connection reset") {
+    if m.contains("connection reset") {
         "Incoming daemon connection was reset before handshake completed".to_string()
     } else {
         format!("Failed to accept incoming daemon connection: {}", msg)

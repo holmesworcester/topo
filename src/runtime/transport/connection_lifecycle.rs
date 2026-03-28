@@ -7,12 +7,11 @@ use std::net::SocketAddr;
 
 use thiserror::Error;
 
-use super::TRUST_REJECTION_MARKER;
-use crate::transport::peer_identity_from_connection;
+use super::{TransportConnection, TransportEndpoint, TOPO_ALPN};
 
 /// A successful transport connection with verified peer identity.
 pub struct ConnectedDaemon {
-    pub connection: quinn::Connection,
+    pub connection: TransportConnection,
     /// Hex-encoded daemon certificate SPKI fingerprint.
     pub daemon_peer_id: String,
 }
@@ -27,19 +26,62 @@ impl ConnectedDaemon {
 pub enum ConnectionLifecycleError {
     #[error("dial failed: {0}")]
     Dial(String),
-    #[error("dial rejected by trust policy: {0}")]
-    DialTrustRejected(String),
     #[error("accept failed: {0}")]
     Accept(String),
-    #[error("missing peer identity from TLS session")]
+    #[error("missing peer identity from transport session")]
     MissingPeerIdentity,
 }
 
+fn endpoint_id_from_target(target: &str) -> Result<iroh::EndpointId, ConnectionLifecycleError> {
+    let endpoint_id_hex = super::multi_workspace::parse_transport_sni(target)
+        .map(|parsed| parsed.transport_peer_id)
+        .unwrap_or_else(|| target.to_ascii_lowercase());
+    let mut bytes = [0u8; 32];
+    hex::decode_to_slice(&endpoint_id_hex, &mut bytes).map_err(|_| {
+        ConnectionLifecycleError::Dial(format!(
+            "invalid remote daemon id '{endpoint_id_hex}': expected 32-byte hex"
+        ))
+    })?;
+    iroh::EndpointId::from_bytes(&bytes).map_err(|_| {
+        ConnectionLifecycleError::Dial(format!(
+            "invalid remote daemon id '{endpoint_id_hex}': not a valid iroh endpoint id"
+        ))
+    })
+}
+
+fn ip_socket_addr(
+    addr: iroh::endpoint::IncomingAddr,
+) -> Result<SocketAddr, ConnectionLifecycleError> {
+    match addr {
+        iroh::endpoint::IncomingAddr::Ip(addr) => Ok(addr),
+        other => Err(ConnectionLifecycleError::Accept(format!(
+            "unsupported non-IP incoming address: {other:?}"
+        ))),
+    }
+}
+
+fn connection_socket_addr(
+    connection: &iroh::endpoint::Connection,
+) -> Result<SocketAddr, ConnectionLifecycleError> {
+    if let Some(path) = connection.to_info().selected_path() {
+        if let iroh::TransportAddr::Ip(addr) = path.remote_addr() {
+            return Ok(*addr);
+        }
+    }
+    for path in connection.paths() {
+        if let iroh::TransportAddr::Ip(addr) = path.remote_addr() {
+            return Ok(*addr);
+        }
+    }
+    Err(ConnectionLifecycleError::Dial(
+        "connected but no direct IP path was available".to_string(),
+    ))
+}
+
 fn into_connected_daemon(
-    connection: quinn::Connection,
+    connection: TransportConnection,
 ) -> Result<ConnectedDaemon, ConnectionLifecycleError> {
-    let daemon_peer_id = peer_identity_from_connection(&connection)
-        .ok_or(ConnectionLifecycleError::MissingPeerIdentity)?;
+    let daemon_peer_id = hex::encode(connection.inner.remote_id().as_bytes());
     Ok(ConnectedDaemon {
         connection,
         daemon_peer_id,
@@ -48,89 +90,88 @@ fn into_connected_daemon(
 
 /// Dial a remote endpoint and return a connection with extracted peer identity.
 pub async fn dial_daemon(
-    endpoint: &quinn::Endpoint,
-    remote: SocketAddr,
+    endpoint: &TransportEndpoint,
+    remote: Option<SocketAddr>,
     sni: &str,
-    client_config: Option<&quinn::ClientConfig>,
 ) -> Result<ConnectedDaemon, ConnectionLifecycleError> {
-    let connecting = if let Some(cfg) = client_config {
-        endpoint.connect_with(cfg.clone(), remote, sni)
-    } else {
-        endpoint.connect(remote, sni)
-    }
-    .map_err(|e| ConnectionLifecycleError::Dial(format!("initiate to {remote}: {e}")))?;
-
-    let connection = connecting.await.map_err(|e| {
-        let msg = format!("handshake to {remote}: {e}");
-        if msg.contains(TRUST_REJECTION_MARKER) {
-            ConnectionLifecycleError::DialTrustRejected(msg)
-        } else {
-            ConnectionLifecycleError::Dial(msg)
+    let endpoint_id = endpoint_id_from_target(sni)?;
+    let target = remote
+        .map(|remote| remote.to_string())
+        .unwrap_or_else(|| hex::encode(endpoint_id.as_bytes()));
+    let endpoint_addr = match remote {
+        Some(remote) => {
+            iroh::EndpointAddr::from_parts(endpoint_id, [iroh::TransportAddr::Ip(remote)])
         }
-    })?;
-
-    into_connected_daemon(connection)
+        None => endpoint_id.into(),
+    };
+    let connection = endpoint
+        .inner
+        .connect(endpoint_addr, TOPO_ALPN)
+        .await
+        .map_err(|e| ConnectionLifecycleError::Dial(format!("connect to {target}: {e}")))?;
+    let remote_addr = connection_socket_addr(&connection)?;
+    into_connected_daemon(TransportConnection::new(connection, remote_addr))
 }
 
 /// Accept the next inbound connection and extract peer identity.
 ///
 /// Returns `Ok(None)` when the endpoint is closed.
 pub async fn accept_daemon(
-    endpoint: &quinn::Endpoint,
+    endpoint: &TransportEndpoint,
 ) -> Result<Option<ConnectedDaemon>, ConnectionLifecycleError> {
-    let incoming = match endpoint.accept().await {
-        Some(incoming) => incoming,
-        None => return Ok(None),
+    let Some(incoming) = endpoint.inner.accept().await else {
+        return Ok(None);
     };
+    let remote_addr = ip_socket_addr(incoming.remote_addr())?;
     let connection = incoming
         .await
         .map_err(|e| ConnectionLifecycleError::Accept(e.to_string()))?;
-    Ok(Some(into_connected_daemon(connection)?))
+    Ok(Some(into_connected_daemon(TransportConnection::new(
+        connection,
+        remote_addr,
+    ))?))
 }
 
 #[cfg(test)]
 mod tests {
     use std::net::SocketAddr;
-    use std::sync::Arc;
     use std::time::Duration;
 
     use super::{accept_daemon, dial_daemon};
     use crate::transport::{
-        create_dual_endpoint, extract_spki_fingerprint, generate_self_signed_cert,
-        multi_workspace::transport_sni,
+        create_runtime_endpoint_for_tenants, load_daemon_identity_from_db,
+        multi_workspace::transport_sni, TransportEndpoint,
     };
 
     async fn endpoint_pair() -> Result<
-        (quinn::Endpoint, quinn::Endpoint, SocketAddr, String, String),
+        (
+            tempfile::TempDir,
+            TransportEndpoint,
+            TransportEndpoint,
+            SocketAddr,
+            String,
+            String,
+        ),
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        let (server_cert, server_key) = generate_self_signed_cert()?;
-        let (client_cert, client_key) = generate_self_signed_cert()?;
-
-        let server_fp = extract_spki_fingerprint(server_cert.as_ref())?;
-        let client_fp = extract_spki_fingerprint(client_cert.as_ref())?;
-        let server_peer_id = hex::encode(server_fp);
-        let client_peer_id = hex::encode(client_fp);
-
-        let allow_client: Arc<crate::transport::DynamicAllowFn> =
-            Arc::new(move |candidate| Ok(candidate == &client_fp));
-        let allow_server: Arc<crate::transport::DynamicAllowFn> =
-            Arc::new(move |candidate| Ok(candidate == &server_fp));
-
-        let server_ep = create_dual_endpoint(
+        let temp = tempfile::tempdir()?;
+        let server_db = temp.path().join("server.sqlite3");
+        let client_db = temp.path().join("client.sqlite3");
+        let server_ep = create_runtime_endpoint_for_tenants(
             "127.0.0.1:0".parse().unwrap(),
-            server_cert,
-            server_key,
-            allow_client,
-        )?;
-        let client_ep = create_dual_endpoint(
+            server_db.to_str().unwrap(),
+        )
+        .await?;
+        let client_ep = create_runtime_endpoint_for_tenants(
             "127.0.0.1:0".parse().unwrap(),
-            client_cert,
-            client_key,
-            allow_server,
-        )?;
+            client_db.to_str().unwrap(),
+        )
+        .await?;
         let server_addr = server_ep.local_addr()?;
+        let server_peer_id = load_daemon_identity_from_db(server_db.to_str().unwrap())?.0;
+        let client_peer_id = load_daemon_identity_from_db(client_db.to_str().unwrap())?.0;
         Ok((
+            temp,
             server_ep,
             client_ep,
             server_addr,
@@ -141,13 +182,13 @@ mod tests {
 
     #[tokio::test]
     async fn dial_and_accept_extract_expected_peer_ids() {
-        let (server_ep, client_ep, server_addr, server_peer_id, client_peer_id) =
+        let (_temp, server_ep, client_ep, server_addr, server_peer_id, client_peer_id) =
             endpoint_pair().await.expect("endpoint pair");
         let server_sni = transport_sni(&server_peer_id);
 
         let (accepted_res, dialed_res) = tokio::join!(
             accept_daemon(&server_ep),
-            dial_daemon(&client_ep, server_addr, &server_sni, None)
+            dial_daemon(&client_ep, Some(server_addr), &server_sni)
         );
 
         let accepted = accepted_res
@@ -161,7 +202,7 @@ mod tests {
 
     #[tokio::test]
     async fn accept_peer_returns_none_when_endpoint_closed() {
-        let (server_ep, _client_ep, _server_addr, _server_peer_id, _client_peer_id) =
+        let (_temp, server_ep, _client_ep, _server_addr, _server_peer_id, _client_peer_id) =
             endpoint_pair().await.expect("endpoint pair");
         server_ep.close(0u32.into(), b"test-close");
 
@@ -175,5 +216,26 @@ mod tests {
             "closed endpoint should return None, got {:?}",
             result.as_ref().map(|p| &p.daemon_peer_id)
         );
+    }
+
+    #[tokio::test]
+    async fn dial_daemon_rejects_invalid_remote_daemon_id() {
+        let (_temp, _server_ep, client_ep, _server_addr, _server_peer_id, _client_peer_id) =
+            endpoint_pair().await.expect("endpoint pair");
+
+        let err = match dial_daemon(&client_ep, None, "not-a-valid-endpoint-id").await {
+            Ok(_) => panic!("invalid target should fail before dialing"),
+            Err(err) => err,
+        };
+
+        match err {
+            super::ConnectionLifecycleError::Dial(message) => {
+                assert!(
+                    message.contains("invalid remote daemon id"),
+                    "unexpected dial error: {message}"
+                );
+            }
+            other => panic!("expected dial error, got {other:?}"),
+        }
     }
 }

@@ -11,9 +11,6 @@ pub(crate) struct ManagedRuntime {
     pub tenant_states: Vec<RuntimeTenantState>,
     pub shutdown_notify: Arc<tokio::sync::Notify>,
     pub handle: tokio::task::JoinHandle<Result<(), Box<dyn std::error::Error + Send + Sync>>>,
-    /// Shared cert resolver — kept so new tenants can register certs
-    /// on the live endpoint without restarting.
-    pub cert_resolver: Arc<topo::transport::multi_workspace::TransportTargetCertResolver>,
 }
 
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
@@ -96,64 +93,6 @@ pub(crate) fn classify_tenant_change(
     }
 }
 
-/// Register certs for newly added tenants on the live cert resolver.
-///
-/// Returns the peer_ids of tenants that were successfully registered.
-/// Callers should only mark these as "known" in their tenant state so
-/// that failed registrations are retried on the next reevaluation.
-pub(crate) fn register_new_tenant_certs(
-    db_path: &str,
-    new_tenants: &[RuntimeTenantState],
-    cert_resolver: &topo::transport::multi_workspace::TransportTargetCertResolver,
-) -> Vec<String> {
-    let mut registered = Vec::new();
-    let provider = rustls::crypto::ring::default_provider();
-    let db = match open_connection(db_path) {
-        Ok(db) => db,
-        Err(e) => {
-            tracing::warn!("Failed to open DB for new tenant cert registration: {}", e);
-            return registered;
-        }
-    };
-    let all_tenants = match discover_local_tenants(&db) {
-        Ok(t) => t,
-        Err(e) => {
-            tracing::warn!("Failed to discover tenants for cert registration: {}", e);
-            return registered;
-        }
-    };
-    drop(db);
-
-    for new_t in new_tenants {
-        let Some(tenant_info) = all_tenants.iter().find(|t| t.peer_id == new_t.peer_id) else {
-            continue;
-        };
-        let cert_der = rustls::pki_types::CertificateDer::from(tenant_info.cert_der.clone());
-        let key_der = rustls::pki_types::PrivatePkcs8KeyDer::from(tenant_info.key_der.clone());
-        let ck =
-            match rustls::sign::CertifiedKey::from_der(vec![cert_der], key_der.into(), &provider) {
-                Ok(ck) => Arc::new(ck),
-                Err(e) => {
-                    tracing::warn!(
-                        "Failed to build CertifiedKey for new tenant {}: {}",
-                        &new_t.peer_id[..16.min(new_t.peer_id.len())],
-                        e
-                    );
-                    continue;
-                }
-            };
-        let sni = topo::transport::multi_workspace::transport_sni(&tenant_info.transport_peer_id);
-        cert_resolver.add(sni.clone(), ck);
-        registered.push(new_t.peer_id.clone());
-        tracing::info!(
-            "Registered new tenant {} on live endpoint (transport_sni={})",
-            &new_t.peer_id[..16.min(new_t.peer_id.len())],
-            sni
-        );
-    }
-    registered
-}
-
 pub(crate) async fn stop_runtime(runtime: ManagedRuntime) {
     runtime.shutdown_notify.notify_one();
     match tokio::time::timeout(Duration::from_secs(5), runtime.handle).await {
@@ -192,50 +131,6 @@ pub(crate) fn reserve_idle_bind(
     }
 }
 
-pub(crate) fn clear_upnp_report(state: &DaemonState) {
-    *state.upnp_result.write().unwrap() = None;
-    if let Some(ref mut info) = *state.runtime_net.write().unwrap() {
-        info.upnp = None;
-    }
-}
-
-pub(crate) async fn refresh_upnp_mapping_for_runtime(
-    state: Arc<DaemonState>,
-    listen_addr: SocketAddr,
-) {
-    let report =
-        topo::peering::nat::upnp::attempt_udp_port_mapping(listen_addr, Duration::from_secs(10))
-            .await;
-
-    if !*state.upnp_enabled.read().unwrap() {
-        return;
-    }
-
-    let runtime_port_matches = state
-        .runtime_net
-        .read()
-        .unwrap()
-        .as_ref()
-        .and_then(|info| info.listen_addr.parse::<SocketAddr>().ok())
-        .map(|addr| addr.port() == listen_addr.port())
-        .unwrap_or(false);
-    if !runtime_port_matches {
-        return;
-    }
-
-    *state.upnp_result.write().unwrap() = Some(report.clone());
-    if let Some(ref mut info) = *state.runtime_net.write().unwrap() {
-        let info_port_matches = info
-            .listen_addr
-            .parse::<SocketAddr>()
-            .map(|addr| addr.port() == listen_addr.port())
-            .unwrap_or(false);
-        if info_port_matches {
-            info.upnp = Some(report);
-        }
-    }
-}
-
 pub(crate) fn spawn_runtime(
     db_path: &str,
     bind: SocketAddr,
@@ -243,14 +138,8 @@ pub(crate) fn spawn_runtime(
     tenant_states: Vec<RuntimeTenantState>,
 ) -> ManagedRuntime {
     // Runtime is Active only after listen_addr is reported.
-    // Clear stale UPnP result — the port may change across restarts.
     *state.runtime_state.write().unwrap() = RuntimeState::IdleNoTenants;
     *state.runtime_net.write().unwrap() = None;
-    clear_upnp_report(&state);
-
-    let cert_resolver =
-        Arc::new(topo::transport::multi_workspace::TransportTargetCertResolver::new());
-    let cert_resolver_for_task = cert_resolver.clone();
 
     let runtime_shutdown = Arc::new(tokio::sync::Notify::new());
     let runtime_shutdown_for_task = runtime_shutdown.clone();
@@ -262,17 +151,8 @@ pub(crate) fn spawn_runtime(
         if let Ok(info) = net_rx.await {
             println!("Build: {}", env!("TOPO_GIT_HASH"));
             println!("listen: {}", info.listen_addr);
-            let listen_addr = info.listen_addr.parse::<SocketAddr>().ok();
             *state_for_net.runtime_net.write().unwrap() = Some(info);
             *state_for_net.runtime_state.write().unwrap() = RuntimeState::Active;
-            if *state_for_net.upnp_enabled.read().unwrap() {
-                if let Some(listen_addr) = listen_addr {
-                    let refresh_state = state_for_net.clone();
-                    tokio::spawn(async move {
-                        refresh_upnp_mapping_for_runtime(refresh_state, listen_addr).await;
-                    });
-                }
-            }
         }
     });
 
@@ -283,7 +163,6 @@ pub(crate) fn spawn_runtime(
             bind,
             net_tx,
             runtime_shutdown_for_task,
-            cert_resolver_for_task,
             Some(sync_control_for_task),
         )
         .await
@@ -293,7 +172,6 @@ pub(crate) fn spawn_runtime(
         tenant_states,
         shutdown_notify: runtime_shutdown,
         handle,
-        cert_resolver,
     }
 }
 
@@ -348,7 +226,6 @@ pub(crate) async fn reevaluate_runtime(
             Err(e) => tracing::warn!("Runtime task join error: {}", e),
         }
         *state.runtime_net.write().unwrap() = None;
-        clear_upnp_report(&state);
     }
 
     let tenant_states = match discover_runtime_tenant_states(db_path) {
@@ -374,7 +251,6 @@ pub(crate) async fn reevaluate_runtime(
         }
         *state.runtime_state.write().unwrap() = RuntimeState::IdleNoTenants;
         *state.runtime_net.write().unwrap() = None;
-        clear_upnp_report(&state);
         return Ok(());
     }
 
@@ -397,28 +273,13 @@ pub(crate) async fn reevaluate_runtime(
             *active_runtime = Some(spawn_runtime(db_path, bind, state, tenant_states));
         }
         TenantChangeKind::NewTenantsAdded { new_tenants } => {
-            // Register new tenant certs on the live endpoint — no restart needed.
             if let Some(runtime) = active_runtime.as_mut() {
-                let registered =
-                    register_new_tenant_certs(db_path, &new_tenants, &runtime.cert_resolver);
-                // Only add successfully registered tenants to the known set.
-                // Failed ones remain "new" so the next reevaluation retries them.
-                for r in &registered {
-                    if let Some(ts) = tenant_states.iter().find(|t| t.peer_id == *r) {
-                        if !runtime.tenant_states.iter().any(|t| t.peer_id == *r) {
-                            runtime.tenant_states.push(ts.clone());
-                        }
-                    }
-                }
-                runtime.tenant_states.sort();
-                runtime.tenant_states.dedup();
-                if !registered.is_empty() {
-                    tracing::info!(
-                        "registered {} new tenant(s) on live endpoint ({} total)",
-                        registered.len(),
-                        runtime.tenant_states.len()
-                    );
-                }
+                runtime.tenant_states = tenant_states;
+                tracing::info!(
+                    "runtime tenant set grew by {} tenant(s) without restart ({} total)",
+                    new_tenants.len(),
+                    runtime.tenant_states.len()
+                );
             }
         }
         TenantChangeKind::TransportIdentityChanged => {

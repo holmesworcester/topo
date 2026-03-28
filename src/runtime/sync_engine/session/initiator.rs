@@ -146,8 +146,8 @@ where
             } => {
                 let rejected_kind = decode_sync_window_kind(rejected_window_kind)
                     .map_err(|e| format!("initiator received invalid rejected window kind: {e}"))?;
-                let oldest_allowed_kind =
-                    decode_sync_window_kind(oldest_allowed_window_kind).map_err(|e| {
+                let oldest_allowed_kind = decode_sync_window_kind(oldest_allowed_window_kind)
+                    .map_err(|e| {
                         format!("initiator received invalid oldest allowed window kind: {e}")
                     })?;
                 if rejected_kind == range.kind

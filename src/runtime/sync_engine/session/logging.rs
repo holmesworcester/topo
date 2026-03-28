@@ -126,8 +126,7 @@ fn frame_detail_json(frame: &Frame, capture_full_ids: bool) -> Option<String> {
             }))
             .ok()
         }
-        Frame::IntroOffer { .. }
-        | Frame::OpenSessionAuthPeerShared { .. }
+        Frame::OpenSessionRoute { .. }
         | Frame::OpenSessionAuthInvite { .. }
         | Frame::OpenSessionAuthAck { .. } => None,
     }
@@ -141,8 +140,7 @@ fn frame_type(frame: &Frame) -> &'static str {
         Frame::DiscoveryHints { .. } => "DiscoveryHints",
         Frame::RangePolicyReject { .. } => "RangePolicyReject",
         Frame::Event { .. } => "Event",
-        Frame::IntroOffer { .. } => "IntroOffer",
-        Frame::OpenSessionAuthPeerShared { .. } => "OpenSessionAuthPeerShared",
+        Frame::OpenSessionRoute { .. } => "OpenSessionRoute",
         Frame::OpenSessionAuthInvite { .. } => "OpenSessionAuthInvite",
         Frame::OpenSessionAuthAck { .. } => "OpenSessionAuthAck",
     }

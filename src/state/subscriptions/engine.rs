@@ -149,6 +149,8 @@ fn parsed_event_type_name(parsed: &ParsedEvent) -> &'static str {
         ParsedEvent::BenchDep(_) => "bench_dep",
         ParsedEvent::PeerSecret(_) => "peer_secret",
         ParsedEvent::InviteSecret(_) => "invite_secret",
+        ParsedEvent::EndpointSecret(_) => "endpoint_secret",
+        ParsedEvent::EndpointShared(_) => "endpoint_shared",
     }
 }
 

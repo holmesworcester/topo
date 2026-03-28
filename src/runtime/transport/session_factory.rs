@@ -5,10 +5,14 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
-use tokio::io::AsyncWriteExt;
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::contracts::peering_contract::{next_session_id, TransportSessionIo};
 
+use super::{
+    connection::{Connection, RecvConnection, SendConnection},
+    session_carrier::SessionCarrier,
+};
 use super::{DualConnection, QuicTransportSessionIo};
 
 const SESSION_STREAM_HEADER_MAGIC: [u8; 4] = *b"P7SS";
@@ -136,18 +140,42 @@ impl SessionClass {
     }
 }
 
-type BiStream = (quinn::SendStream, quinn::RecvStream);
+type BiStream<S, R> = (S, R);
 
-#[derive(Default)]
-struct PendingInboundSession {
+struct PendingInboundSession<S, R> {
     class: Option<SessionClass>,
-    control: Option<BiStream>,
-    data: Option<BiStream>,
+    control: Option<BiStream<S, R>>,
+    data: Option<BiStream<S, R>>,
 }
 
-#[derive(Default, Clone)]
-pub struct InboundSessionState {
-    pending: Arc<Mutex<HashMap<u64, PendingInboundSession>>>,
+pub struct InboundSessionState<S, R> {
+    pending: Arc<Mutex<HashMap<u64, PendingInboundSession<S, R>>>>,
+}
+
+impl<S, R> Default for PendingInboundSession<S, R> {
+    fn default() -> Self {
+        Self {
+            class: None,
+            control: None,
+            data: None,
+        }
+    }
+}
+
+impl<S, R> Default for InboundSessionState<S, R> {
+    fn default() -> Self {
+        Self {
+            pending: Arc::new(Mutex::new(HashMap::new())),
+        }
+    }
+}
+
+impl<S, R> Clone for InboundSessionState<S, R> {
+    fn clone(&self) -> Self {
+        Self {
+            pending: Arc::clone(&self.pending),
+        }
+    }
 }
 
 /// Error from session stream opening.
@@ -170,12 +198,15 @@ impl std::fmt::Display for SessionOpenError {
 
 impl std::error::Error for SessionOpenError {}
 
-async fn write_session_stream_header(
-    send: &mut quinn::SendStream,
+async fn write_session_stream_header<W>(
+    send: &mut W,
     session_id: u64,
     class: SessionClass,
     kind: SessionStreamKind,
-) -> Result<(), SessionOpenError> {
+) -> Result<(), SessionOpenError>
+where
+    W: AsyncWrite + Unpin + Send,
+{
     let mut header = [0u8; SESSION_STREAM_HEADER_LEN];
     header[..4].copy_from_slice(&SESSION_STREAM_HEADER_MAGIC);
     header[4] = SESSION_STREAM_HEADER_VERSION;
@@ -192,9 +223,12 @@ async fn write_session_stream_header(
     Ok(())
 }
 
-async fn read_session_stream_header(
-    recv: &mut quinn::RecvStream,
-) -> Result<(u64, SessionClass, SessionStreamKind), SessionOpenError> {
+async fn read_session_stream_header<R>(
+    recv: &mut R,
+) -> Result<(u64, SessionClass, SessionStreamKind), SessionOpenError>
+where
+    R: AsyncRead + Unpin + Send,
+{
     // Read first 7 bytes to check magic + version before committing to full read.
     let mut prefix = [0u8; 7];
     recv.read_exact(&mut prefix)
@@ -235,21 +269,21 @@ async fn read_session_stream_header(
     Ok((u64::from_be_bytes(session_id_bytes), class, kind))
 }
 
-struct CompletedInboundSession {
+struct CompletedInboundSession<S, R> {
     session_id: u64,
     class: SessionClass,
-    control: BiStream,
-    data: BiStream,
+    control: BiStream<S, R>,
+    data: BiStream<S, R>,
 }
 
-fn insert_pending_stream(
-    state: &InboundSessionState,
+fn insert_pending_stream<S, R>(
+    state: &InboundSessionState<S, R>,
     session_id: u64,
     class: SessionClass,
     kind: SessionStreamKind,
-    send: quinn::SendStream,
-    recv: quinn::RecvStream,
-) -> Result<Option<CompletedInboundSession>, SessionOpenError> {
+    send: S,
+    recv: R,
+) -> Result<Option<CompletedInboundSession<S, R>>, SessionOpenError> {
     let mut pending = state
         .pending
         .lock()
@@ -290,15 +324,18 @@ fn insert_pending_stream(
     }
 }
 
-pub async fn open_session_io_for_class(
-    conn: &quinn::Connection,
+pub async fn open_session_io_for_class<C>(
+    conn: &C,
     class: SessionClass,
-) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError> {
+) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError>
+where
+    C: SessionCarrier,
+{
     let session_id = next_session_id();
     let (mut ctrl_send, ctrl_recv) = conn
         .open_bi()
         .await
-        .map_err(|e| SessionOpenError::ConnectionLost(format!("control open: {e}")))?;
+        .map_err(SessionOpenError::ConnectionLost)?;
     write_session_stream_header(
         &mut ctrl_send,
         session_id,
@@ -309,55 +346,67 @@ pub async fn open_session_io_for_class(
     let (mut data_send, data_recv) = conn
         .open_bi()
         .await
-        .map_err(|e| SessionOpenError::ConnectionLost(format!("data open: {e}")))?;
+        .map_err(SessionOpenError::ConnectionLost)?;
     write_session_stream_header(&mut data_send, session_id, class, SessionStreamKind::Data).await?;
-    let dual = DualConnection::new(ctrl_send, ctrl_recv, data_send, data_recv);
+    let dual = DualConnection::from_parts(
+        Connection::new(ctrl_send, ctrl_recv),
+        SendConnection::new(data_send),
+        RecvConnection::new(data_recv),
+    );
     let io = QuicTransportSessionIo::new(session_id, dual);
     Ok((session_id, Box::new(io)))
 }
 
 /// Open two bidirectional streams (control + data) as a range session.
-pub async fn open_session_io(
-    conn: &quinn::Connection,
-) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError> {
+pub async fn open_range_session_io<C>(
+    conn: &C,
+) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError>
+where
+    C: SessionCarrier,
+{
     open_session_io_for_class(conn, SessionClass::Range).await
 }
 
 /// Open two bidirectional streams (control + data) as a dependency session.
-pub async fn open_dependency_session_io(
-    conn: &quinn::Connection,
-) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError> {
+pub async fn open_dependency_session_io<C>(
+    conn: &C,
+) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError>
+where
+    C: SessionCarrier,
+{
     open_session_io_for_class(conn, SessionClass::Dependency).await
 }
 
 /// Accept two bidirectional streams (control + data) as responder and wrap
 /// into a `TransportSessionIo`. Returns `(session_id, class, io)`.
-pub async fn accept_session_io(
-    conn: &quinn::Connection,
-    state: &InboundSessionState,
-) -> Result<(u64, SessionClass, Box<dyn TransportSessionIo>), SessionOpenError> {
+pub async fn accept_session_io<C>(
+    conn: &C,
+    state: &InboundSessionState<C::BiSend, C::BiRecv>,
+) -> Result<(u64, SessionClass, Box<dyn TransportSessionIo>), SessionOpenError>
+where
+    C: SessionCarrier,
+{
     loop {
         let (send, mut recv) = conn
             .accept_bi()
             .await
-            .map_err(|e| SessionOpenError::ConnectionLost(format!("stream accept: {e}")))?;
+            .map_err(SessionOpenError::ConnectionLost)?;
         let (session_id, class, kind) = match read_session_stream_header(&mut recv).await {
             Ok(header) => header,
             Err(SessionOpenError::Protocol(message))
                 if extract_build_mismatch_reason(&message).is_some() =>
             {
                 let reason = connection_close_reason(&message);
-                conn.close(1u32.into(), &reason);
+                conn.close_with_reason(1, &reason);
                 return Err(SessionOpenError::Protocol(message));
             }
             Err(err) => return Err(err),
         };
         if let Some(complete) = insert_pending_stream(state, session_id, class, kind, send, recv)? {
-            let dual = DualConnection::new(
-                complete.control.0,
-                complete.control.1,
-                complete.data.0,
-                complete.data.1,
+            let dual = DualConnection::from_parts(
+                Connection::new(complete.control.0, complete.control.1),
+                SendConnection::new(complete.data.0),
+                RecvConnection::new(complete.data.1),
             );
             let io = QuicTransportSessionIo::new(complete.session_id, dual);
             return Ok((complete.session_id, complete.class, Box::new(io)));
@@ -367,18 +416,18 @@ pub async fn accept_session_io(
 
 #[cfg(test)]
 mod tests {
-    use std::sync::Arc;
-
     use tokio::io::AsyncWriteExt;
 
     use crate::protocol::{encode_frame, parse_frame, Frame};
+    use crate::runtime::transport::session_carrier::SessionCarrier;
     use crate::transport::{
-        create_dual_endpoint, extract_spki_fingerprint, generate_self_signed_cert,
-        multi_workspace::transport_sni,
+        accept_daemon_connection, create_runtime_endpoint_for_tenants, dial_daemon_connection,
+        load_daemon_identity_from_db, multi_workspace::transport_sni, TransportConnection,
+        TransportEndpoint,
     };
 
     use super::{
-        accept_session_io, local_commit_hash_str, local_commit_subject, open_session_io,
+        accept_session_io, local_commit_hash_str, local_commit_subject, open_range_session_io,
         write_session_stream_header, InboundSessionState, SessionClass, SessionOpenError,
         SessionStreamKind, BUILD_MISMATCH_PREFIX, SESSION_STREAM_HEADER_LEN,
         SESSION_STREAM_HEADER_MAGIC, SESSION_STREAM_HEADER_VERSION,
@@ -386,66 +435,47 @@ mod tests {
 
     async fn connected_pair() -> Result<
         (
-            quinn::Endpoint,
-            quinn::Connection,
-            quinn::Endpoint,
-            quinn::Connection,
+            tempfile::TempDir,
+            TransportEndpoint,
+            TransportConnection,
+            TransportEndpoint,
+            TransportConnection,
         ),
         Box<dyn std::error::Error + Send + Sync>,
     > {
-        let (server_cert, server_key) = generate_self_signed_cert()?;
-        let server_fp = extract_spki_fingerprint(server_cert.as_ref())?;
-        let (client_cert, client_key) = generate_self_signed_cert()?;
-        let client_fp = extract_spki_fingerprint(client_cert.as_ref())?;
-        let server_peer_id = hex::encode(server_fp);
-
-        let server_allowed: Arc<crate::transport::DynamicAllowFn> =
-            Arc::new(move |candidate| Ok(candidate == &client_fp));
-        let client_allowed: Arc<crate::transport::DynamicAllowFn> =
-            Arc::new(move |candidate| Ok(candidate == &server_fp));
-
-        let server_ep = create_dual_endpoint(
+        let temp = tempfile::tempdir()?;
+        let server_db = temp.path().join("server.sqlite3");
+        let client_db = temp.path().join("client.sqlite3");
+        let server_ep = create_runtime_endpoint_for_tenants(
             "127.0.0.1:0".parse().unwrap(),
-            server_cert,
-            server_key,
-            server_allowed,
-        )?;
-        let client_ep = create_dual_endpoint(
+            server_db.to_str().unwrap(),
+        )
+        .await?;
+        let client_ep = create_runtime_endpoint_for_tenants(
             "127.0.0.1:0".parse().unwrap(),
-            client_cert,
-            client_key,
-            client_allowed,
-        )?;
+            client_db.to_str().unwrap(),
+        )
+        .await?;
 
         let server_addr = server_ep.local_addr()?;
-        let server_ep_accept = server_ep.clone();
-        let server_accept = async move {
-            let incoming = server_ep_accept
-                .accept()
-                .await
-                .ok_or_else(|| "server endpoint closed unexpectedly".to_string())?;
-            let conn = incoming.await?;
-            Ok::<quinn::Connection, Box<dyn std::error::Error + Send + Sync>>(conn)
-        };
+        let server_peer_id = load_daemon_identity_from_db(server_db.to_str().unwrap())?.0;
+        let server_sni = transport_sni(&server_peer_id);
 
-        let client_ep_connect = client_ep.clone();
-        let client_connect = async move {
-            let connecting =
-                client_ep_connect.connect(server_addr, &transport_sni(&server_peer_id))?;
-            let conn = connecting.await?;
-            Ok::<quinn::Connection, Box<dyn std::error::Error + Send + Sync>>(conn)
-        };
+        let (server_conn_res, client_conn_res) = tokio::join!(
+            accept_daemon_connection(&server_ep),
+            dial_daemon_connection(&client_ep, server_addr, &server_sni)
+        );
+        let server_conn = server_conn_res?
+            .expect("server accepted connection")
+            .connection();
+        let client_conn = client_conn_res?.connection();
 
-        let (server_conn_res, client_conn_res) = tokio::join!(server_accept, client_connect);
-        let server_conn = server_conn_res?;
-        let client_conn = client_conn_res?;
-
-        Ok((server_ep, server_conn, client_ep, client_conn))
+        Ok((temp, server_ep, server_conn, client_ep, client_conn))
     }
 
     #[tokio::test]
     async fn open_session_io_succeeds_when_peer_accepts_streams() {
-        let (_server_ep, server_conn, _client_ep, client_conn) =
+        let (_temp, _server_ep, server_conn, _client_ep, client_conn) =
             connected_pair().await.expect("connected pair");
 
         let server_accept_task = tokio::task::spawn(async move {
@@ -460,9 +490,9 @@ mod tests {
             Ok::<(), String>(())
         });
 
-        let (client_session_id, client_io) = open_session_io(&client_conn)
+        let (client_session_id, client_io) = open_range_session_io(&client_conn)
             .await
-            .expect("open_session_io");
+            .expect("open_range_session_io");
         assert!(client_session_id > 0);
         drop(client_io);
 
@@ -474,13 +504,14 @@ mod tests {
 
     #[tokio::test]
     async fn accept_session_io_succeeds_when_peer_preopens_streams() {
-        let (_server_ep, server_conn, _client_ep, client_conn) =
+        let (_temp, _server_ep, server_conn, _client_ep, client_conn) =
             connected_pair().await.expect("connected pair");
         let inbound_state = InboundSessionState::default();
 
         // Pre-open the two bi streams the responder expects.
         let session_id = 77;
-        let (mut ctrl_send, _ctrl_recv) = client_conn.open_bi().await.expect("open control bi");
+        let (mut ctrl_send, _ctrl_recv) =
+            client_conn.inner.open_bi().await.expect("open control bi");
         write_session_stream_header(
             &mut ctrl_send,
             session_id,
@@ -489,7 +520,7 @@ mod tests {
         )
         .await
         .expect("write control header");
-        let (mut data_send, _data_recv) = client_conn.open_bi().await.expect("open data bi");
+        let (mut data_send, _data_recv) = client_conn.inner.open_bi().await.expect("open data bi");
         write_session_stream_header(
             &mut data_send,
             session_id,
@@ -510,7 +541,7 @@ mod tests {
 
     #[tokio::test]
     async fn accept_session_io_pairs_interleaved_streams_by_session_header() {
-        let (_server_ep, server_conn, _client_ep, client_conn) =
+        let (_temp, _server_ep, server_conn, _client_ep, client_conn) =
             connected_pair().await.expect("connected pair");
         let inbound_state = InboundSessionState::default();
 
@@ -521,7 +552,8 @@ mod tests {
         let data_a = Frame::Event { blob: vec![0xa1] };
         let data_b = Frame::Event { blob: vec![0xb2] };
 
-        let (mut ctrl_a_send, _ctrl_a_recv) = client_conn.open_bi().await.expect("open ctrl a");
+        let (mut ctrl_a_send, _ctrl_a_recv) =
+            client_conn.inner.open_bi().await.expect("open ctrl a");
         write_session_stream_header(
             &mut ctrl_a_send,
             session_a,
@@ -536,7 +568,8 @@ mod tests {
             .expect("write ctrl a frame");
         ctrl_a_send.flush().await.expect("flush ctrl a frame");
 
-        let (mut ctrl_b_send, _ctrl_b_recv) = client_conn.open_bi().await.expect("open ctrl b");
+        let (mut ctrl_b_send, _ctrl_b_recv) =
+            client_conn.inner.open_bi().await.expect("open ctrl b");
         write_session_stream_header(
             &mut ctrl_b_send,
             session_b,
@@ -551,7 +584,8 @@ mod tests {
             .expect("write ctrl b frame");
         ctrl_b_send.flush().await.expect("flush ctrl b frame");
 
-        let (mut data_a_send, _data_a_recv) = client_conn.open_bi().await.expect("open data a");
+        let (mut data_a_send, _data_a_recv) =
+            client_conn.inner.open_bi().await.expect("open data a");
         write_session_stream_header(
             &mut data_a_send,
             session_a,
@@ -566,7 +600,8 @@ mod tests {
             .expect("write data a frame");
         data_a_send.flush().await.expect("flush data a frame");
 
-        let (mut data_b_send, _data_b_recv) = client_conn.open_bi().await.expect("open data b");
+        let (mut data_b_send, _data_b_recv) =
+            client_conn.inner.open_bi().await.expect("open data b");
         write_session_stream_header(
             &mut data_b_send,
             session_b,
@@ -620,12 +655,12 @@ mod tests {
 
     #[tokio::test]
     async fn open_session_io_returns_error_after_connection_close() {
-        let (_server_ep, _server_conn, _client_ep, client_conn) =
+        let (_temp, _server_ep, _server_conn, _client_ep, client_conn) =
             connected_pair().await.expect("connected pair");
         client_conn.close(0u32.into(), b"test-close");
         tokio::time::sleep(std::time::Duration::from_millis(25)).await;
 
-        let err = match open_session_io(&client_conn).await {
+        let err = match open_range_session_io(&client_conn).await {
             Ok(_) => panic!("expected stream open failure after close"),
             Err(err) => err,
         };
@@ -641,7 +676,7 @@ mod tests {
 
     #[tokio::test]
     async fn accept_session_io_reports_build_mismatch_and_closes_with_reason() {
-        let (_server_ep, server_conn, _client_ep, client_conn) =
+        let (_temp, _server_ep, server_conn, _client_ep, client_conn) =
             connected_pair().await.expect("connected pair");
         let inbound_state = InboundSessionState::default();
 
@@ -651,7 +686,8 @@ mod tests {
             *b"deadbeef"
         };
 
-        let (mut ctrl_send, _ctrl_recv) = client_conn.open_bi().await.expect("open control bi");
+        let (mut ctrl_send, _ctrl_recv) =
+            client_conn.inner.open_bi().await.expect("open control bi");
         let mut header = [0u8; SESSION_STREAM_HEADER_LEN];
         header[..4].copy_from_slice(&SESSION_STREAM_HEADER_MAGIC);
         header[4] = SESSION_STREAM_HEADER_VERSION;
@@ -693,11 +729,14 @@ mod tests {
             "expected remote hash in mismatch message: {message}"
         );
 
-        let closed = tokio::time::timeout(std::time::Duration::from_secs(2), client_conn.closed())
-            .await
-            .expect("client should observe connection close");
+        let closed = tokio::time::timeout(
+            std::time::Duration::from_secs(2),
+            client_conn.inner.closed(),
+        )
+        .await
+        .expect("client should observe connection close");
         match closed {
-            quinn::ConnectionError::ApplicationClosed(close) => {
+            iroh::endpoint::ConnectionError::ApplicationClosed(close) => {
                 let reason = String::from_utf8_lossy(close.reason.as_ref());
                 assert!(
                     reason.contains(BUILD_MISMATCH_PREFIX),

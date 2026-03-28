@@ -56,7 +56,6 @@ Library-level integration tests using `Peer` + `ScenarioHarness` (no CLI binary)
 | `projectors/` | Pure projector conformance tests (no I/O) |
 | `sync_contract_tests/` | Sync protocol correctness via `FakeSessionIo` (no QUIC) |
 | `identity_transport_contract_tests/` | Transport identity adapter conformance |
-| `holepunch_test.rs` | QUIC holepunch intro flow |
 | `daemon_perf_test.rs` | Daemon-based sync throughput benchmarks (warm-start timing, per-daemon VmHWM) |
 | `daemon_realistic_network_perf_test.rs` | Daemon-based sync throughput matrix over shaped realistic WAN profiles (`cable`, `dsl`, `mobile`, `slow-mobile`, `starlink`) |
 | `sync_graph_test.rs` | Legacy in-process chain and catchup benchmarks |
@@ -88,13 +87,13 @@ sudo tests/netns_cheat_proof_realism_test.sh
 
 ### `netns_nat_test.sh`
 
-QUIC holepunch through simulated NAT (cone and symmetric modes) using
-network namespaces and iptables.
+Relay-backed `iroh` sync through simulated NAT (cone and symmetric modes)
+using network namespaces and iptables/nftables.
 
 ```bash
 cargo build --release
 sudo tests/netns_nat_test.sh              # cone NAT (expected PASS)
-sudo tests/netns_nat_test.sh --symmetric  # symmetric NAT (expected FAIL)
+sudo tests/netns_nat_test.sh --symmetric  # symmetric NAT (expected PASS via relay fallback)
 sudo tests/netns_nat_test.sh --cleanup    # remove leftover namespaces
 ```
 

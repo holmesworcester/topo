@@ -350,13 +350,23 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
     let dif_eid =
         create_signed_event_synchronous(conn, recorded_by, &dif_event, &user_key).unwrap();
 
-    // 7. PeerShared (signed by device_invite key)
+    // 7. EndpointShared (self-signed, endpoint-scoped)
+    let endpoint_key = SigningKey::generate(&mut rng);
+    let endpoint_event = crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event(
+        endpoint_key.to_bytes(),
+    );
+    let endpoint_id = hex::encode(endpoint_key.verifying_key().to_bytes());
+    let endpoint_shared_event_id =
+        create_event_synchronous(conn, &endpoint_id, &endpoint_event).unwrap();
+
+    // 8. PeerShared (signed by device_invite key)
     let peer_shared_key = SigningKey::generate(&mut rng);
     let peer_shared_pub = peer_shared_key.verifying_key().to_bytes();
     let psf = PeerSharedEvent {
         created_at_ms: now_ms(),
         public_key: peer_shared_pub,
         user_event_id: ub_eid,
+        endpoint_shared_event_id,
         device_name: "device".to_string(),
         signed_by: dif_eid,
         signer_type: 3,
@@ -378,7 +388,7 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
 /// before any create helper writes or retries projection.
 pub(super) fn build_identity_chain_deferred(
     _recorded_by: &str,
-) -> (EventId, SigningKey, Vec<(EventId, Vec<u8>)>) {
+) -> (EventId, SigningKey, Vec<(String, EventId, Vec<u8>)>) {
     let mut rng = rand::thread_rng();
 
     // 1. Local tenant root
@@ -460,13 +470,23 @@ pub(super) fn build_identity_chain_deferred(
     sign_blob(&user_key, &mut dif_blob);
     let dif_eid = hash_event(&dif_blob);
 
-    // 7. PeerShared (signed by device_invite key)
+    // 7. EndpointShared (self-signed, endpoint-scoped)
+    let endpoint_key = SigningKey::generate(&mut rng);
+    let endpoint_event = crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event(
+        endpoint_key.to_bytes(),
+    );
+    let endpoint_blob = events::encode_event(&endpoint_event).unwrap();
+    let endpoint_eid = hash_event(&endpoint_blob);
+    let endpoint_recorded_by = hex::encode(endpoint_key.verifying_key().to_bytes());
+
+    // 8. PeerShared (signed by device_invite key)
     let peer_shared_key = SigningKey::generate(&mut rng);
     let peer_shared_pub = peer_shared_key.verifying_key().to_bytes();
     let psf = PeerSharedEvent {
         created_at_ms: now_ms(),
         public_key: peer_shared_pub,
         user_event_id: ub_eid,
+        endpoint_shared_event_id: endpoint_eid,
         device_name: "device".to_string(),
         signed_by: dif_eid,
         signer_type: 3,
@@ -481,13 +501,14 @@ pub(super) fn build_identity_chain_deferred(
 
     // Return blobs in dependency order.
     let chain_blobs = vec![
-        (tenant_eid, tenant_blob),
-        (ia_eid, ia_blob),
-        (net_eid, net_blob),
-        (uib_eid, uib_blob),
-        (ub_eid, ub_blob),
-        (dif_eid, dif_blob),
-        (psf_eid, psf_blob),
+        (_recorded_by.to_string(), tenant_eid, tenant_blob),
+        (_recorded_by.to_string(), ia_eid, ia_blob),
+        (_recorded_by.to_string(), net_eid, net_blob),
+        (_recorded_by.to_string(), uib_eid, uib_blob),
+        (_recorded_by.to_string(), ub_eid, ub_blob),
+        (_recorded_by.to_string(), dif_eid, dif_blob),
+        (endpoint_recorded_by, endpoint_eid, endpoint_blob),
+        (_recorded_by.to_string(), psf_eid, psf_blob),
     ];
 
     (psf_eid, peer_shared_key, chain_blobs)
@@ -496,10 +517,10 @@ pub(super) fn build_identity_chain_deferred(
 /// Insert and project all events from a deferred identity chain.
 pub(super) fn insert_and_project_identity_chain(
     conn: &Connection,
-    recorded_by: &str,
-    chain_blobs: &[(EventId, Vec<u8>)],
+    _recorded_by: &str,
+    chain_blobs: &[(String, EventId, Vec<u8>)],
 ) {
-    for (eid, blob) in chain_blobs {
+    for (recorded_by, eid, blob) in chain_blobs {
         insert_event_raw(conn, recorded_by, blob);
         project_one(conn, recorded_by, eid).unwrap();
     }
@@ -510,6 +531,15 @@ pub(super) fn sign_blob(key: &SigningKey, blob: &mut Vec<u8>) {
     let len = blob.len();
     let sig = sign_event_bytes(key, &blob[..len - 64]);
     blob[len - 64..].copy_from_slice(&sig);
+}
+
+pub(super) fn ensure_test_endpoint_shared(conn: &Connection) -> EventId {
+    let endpoint_key = SigningKey::generate(&mut rand::thread_rng());
+    let endpoint_id = hex::encode(endpoint_key.verifying_key().to_bytes());
+    let event = crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event(
+        endpoint_key.to_bytes(),
+    );
+    create_event_synchronous(conn, &endpoint_id, &event).unwrap()
 }
 
 fn make_message_signed(

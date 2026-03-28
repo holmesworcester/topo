@@ -604,11 +604,11 @@ fn test_source_isomorphism_reverse_order_replay() {
     // --- Path A: Forward order (in-order projection) ---
     let conn_a = setup();
     let (signer_a, key_a, chain_a) = build_identity_chain_deferred(recorded_by);
-    for (_eid, blob) in &chain_a {
-        insert_event_raw(&conn_a, recorded_by, blob);
+    for (event_recorded_by, _eid, blob) in &chain_a {
+        insert_event_raw(&conn_a, event_recorded_by, blob);
     }
-    for (eid, _blob) in &chain_a {
-        project_one(&conn_a, recorded_by, eid).unwrap();
+    for (event_recorded_by, eid, _blob) in &chain_a {
+        project_one(&conn_a, event_recorded_by, eid).unwrap();
     }
 
     let (_msg_a, msg_blob_a) = make_message_signed(&key_a, &signer_a, "rev msg");
@@ -628,8 +628,8 @@ fn test_source_isomorphism_reverse_order_replay() {
     let (signer_b, key_b, chain_b) = build_identity_chain_deferred(recorded_by);
 
     // Insert all identity chain events
-    for (_eid, blob) in &chain_b {
-        insert_event_raw(&conn_b, recorded_by, blob);
+    for (event_recorded_by, _eid, blob) in &chain_b {
+        insert_event_raw(&conn_b, event_recorded_by, blob);
     }
 
     // Create content events using the same chain
@@ -646,8 +646,8 @@ fn test_source_isomorphism_reverse_order_replay() {
     project_one(&conn_b, recorded_by, &del_eid_b).unwrap();
     project_one(&conn_b, recorded_by, &rxn_eid_b).unwrap();
     project_one(&conn_b, recorded_by, &msg_eid_b).unwrap();
-    for (eid, _blob) in chain_b.iter().rev() {
-        project_one(&conn_b, recorded_by, eid).unwrap();
+    for (event_recorded_by, eid, _blob) in chain_b.iter().rev() {
+        project_one(&conn_b, event_recorded_by, eid).unwrap();
     }
 
     // --- Compare ---

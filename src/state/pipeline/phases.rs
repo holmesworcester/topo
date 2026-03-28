@@ -19,6 +19,17 @@ pub(super) struct PersistPhaseOutput {
     pub shared_event_fanouts: Vec<SharedEventFanout>,
 }
 
+fn ingest_recorded_by_for_blob(recorded_by: &str, blob: &[u8]) -> String {
+    match crate::event_modules::parse_event(blob) {
+        Ok(crate::event_modules::ParsedEvent::EndpointShared(event)) => {
+            crate::event_modules::endpoint_shared::endpoint_id_from_public_key_bytes(
+                &event.public_key,
+            )
+        }
+        _ => recorded_by.to_string(),
+    }
+}
+
 pub(super) fn run_persist_phase(
     db: &Connection,
     batch: &[IngestItem],
@@ -38,6 +49,7 @@ pub(super) fn run_persist_phase(
     };
 
     for (event_id, blob, recorded_by, source_tag, received_at_ms, first_stored_at_ms) in batch {
+        let effective_recorded_by = ingest_recorded_by_for_blob(recorded_by, blob);
         let event_id_b64 = event_id_to_base64(event_id);
         let _ = timeline.mark_received_and_stored_b64(
             &event_id_b64,
@@ -57,13 +69,15 @@ pub(super) fn run_persist_phase(
                             Some(cached.clone())
                         } else if meta.type_name == "workspace" {
                             Some(event_id_b64.clone())
-                        } else if let Some(ws) = lookup_workspace_id(db, recorded_by) {
-                            workspace_cache.insert(recorded_by.clone(), ws.clone());
+                        } else if meta.type_name == "endpoint_shared" {
+                            None
+                        } else if let Some(ws) = lookup_workspace_id(db, &effective_recorded_by) {
+                            workspace_cache.insert(effective_recorded_by.clone(), ws.clone());
                             Some(ws)
                         } else {
                             tracing::warn!(
                                 "no accepted workspace binding for {}, skipping shared_event_index for {}",
-                                recorded_by,
+                                effective_recorded_by,
                                 event_id_b64
                             );
                             None
@@ -99,7 +113,7 @@ pub(super) fn run_persist_phase(
 
                     let recorded_at = current_timestamp_ms();
                     let recorded_inserted = match recorded_stmt.execute(rusqlite::params![
-                        recorded_by,
+                        &effective_recorded_by,
                         &event_id_b64,
                         recorded_at,
                         source_tag
@@ -123,7 +137,7 @@ pub(super) fn run_persist_phase(
                         1
                     };
                     if let Err(e) = enqueue_stmt.execute(rusqlite::params![
-                        recorded_by,
+                        &effective_recorded_by,
                         &event_id_b64,
                         current_timestamp_ms(),
                         priority_lane,
@@ -132,23 +146,29 @@ pub(super) fn run_persist_phase(
                         tracing::warn!("project_queue enqueue error for {}: {}", event_id_b64, e);
                     }
 
-                    persist_output.tenants_seen.insert(recorded_by.clone());
+                    persist_output
+                        .tenants_seen
+                        .insert(effective_recorded_by.clone());
                     persist_output.persisted_event_ids.push(*event_id);
-                    if recorded_inserted && meta.share_scope == ShareScope::Shared {
+                    if recorded_inserted
+                        && meta.share_scope == ShareScope::Shared
+                        && meta.type_name != "endpoint_shared"
+                    {
                         persist_output.live_hints.push(LiveHintEvent {
-                            tenant_id: recorded_by.clone(),
+                            tenant_id: effective_recorded_by.clone(),
                             event_id: *event_id,
                             source_peer_id: source_peer_id_from_source_tag(source_tag),
                         });
                     }
-                    if meta.share_scope == ShareScope::Shared {
+                    if meta.share_scope == ShareScope::Shared && meta.type_name != "endpoint_shared"
+                    {
                         if let Some(workspace_id) = if meta.type_name == "workspace" {
                             Some(event_id_b64.clone())
                         } else {
-                            lookup_workspace_id(db, recorded_by)
+                            lookup_workspace_id(db, &effective_recorded_by)
                         } {
                             persist_output.shared_event_fanouts.push(SharedEventFanout {
-                                origin_peer_id: recorded_by.clone(),
+                                origin_peer_id: effective_recorded_by.clone(),
                                 workspace_id,
                                 event_id: *event_id,
                             });

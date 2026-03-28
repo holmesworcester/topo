@@ -32,6 +32,30 @@ pub(crate) fn cascade_unblocked(
     cascade_unblocked_inner(conn, recorded_by, blocker_b64)
 }
 
+pub(crate) fn cascade_unblocked_global(
+    conn: &Connection,
+    blocker_b64: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let peers: Vec<String> = {
+        let mut stmt = conn.prepare_cached(
+            "SELECT DISTINCT peer_id
+             FROM blocked_event_deps
+             WHERE blocker_event_id = ?1
+             ORDER BY peer_id ASC",
+        )?;
+        let mut rows = stmt.query(rusqlite::params![blocker_b64])?;
+        let mut peers = Vec::new();
+        while let Some(row) = rows.next()? {
+            peers.push(row.get::<_, String>(0)?);
+        }
+        peers
+    };
+    for peer_id in peers {
+        cascade_unblocked_inner(conn, &peer_id, blocker_b64)?;
+    }
+    Ok(())
+}
+
 fn cascade_unblocked_inner(
     conn: &Connection,
     recorded_by: &str,

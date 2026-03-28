@@ -17,7 +17,7 @@ pub fn event_type_note(type_name: &str) -> Option<&'static str> {
         "user_invite_shared" => Some("invites a user"),
         "peer_invite_shared" => Some("invites a device"),
         "user" => Some("registers the user"),
-        "peer_shared" => Some("registers a device"),
+        "peer_shared" => Some("registers an account device"),
         "admin" => Some("grants admin rights"),
         "key_secret" => Some("stores a local encryption key"),
         "key_request" => Some("requests an encryption key"),
@@ -31,6 +31,8 @@ pub fn event_type_note(type_name: &str) -> Option<&'static str> {
         "tenant" => Some("creates local tenant identity"),
         "peer_secret" => Some("stores a local signing key"),
         "invite_secret" => Some("stores a local invite key"),
+        "endpoint_secret" => Some("stores the local iroh endpoint root"),
+        "endpoint_shared" => Some("publishes the shared iroh endpoint identity"),
         _ => None,
     }
 }

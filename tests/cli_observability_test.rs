@@ -594,6 +594,9 @@ fn test_chained_device_links_converge() {
 /// Phone links both laptop and tablet independently. The two non-root devices
 /// can sync directly after convergence.
 /// Replaces: scenario_tests/identity_sync::test_three_peer_parallel_device_links_enable_direct_sync_between_non_inviters
+/// Also serves as the CLI merge gate for the relay-backed `iroh` path:
+/// two peers that only met through a third peer can still exchange data once
+/// workspace trust converges.
 #[test]
 fn test_parallel_device_links_converge() {
     let tmpdir = tempfile::tempdir().unwrap();

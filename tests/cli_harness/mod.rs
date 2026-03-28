@@ -6,6 +6,7 @@
 
 #![allow(dead_code)]
 
+use std::cell::RefCell;
 use std::collections::HashMap;
 use std::path::PathBuf;
 use std::process::{Command, Output, Stdio};
@@ -241,6 +242,23 @@ pub fn hold_network_test_lock_for_binary() {
     hold_network_test_binary_lock();
 }
 
+fn hold_network_test_thread_lock() {
+    static THREAD_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    thread_local! {
+        static THREAD_GUARD: RefCell<Option<std::sync::MutexGuard<'static, ()>>> = const {
+            RefCell::new(None)
+        };
+    }
+
+    let lock = THREAD_LOCK.get_or_init(|| Mutex::new(()));
+    THREAD_GUARD.with(|slot| {
+        if slot.borrow().is_none() {
+            let guard = lock.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            *slot.borrow_mut() = Some(guard);
+        }
+    });
+}
+
 pub struct LocalTenantInfo {
     pub peer_id: String,
     pub workspace_id: String,
@@ -451,6 +469,7 @@ pub fn start_discovery_daemon_on_port(db: &str, port: u16) -> HarnessDaemon {
 /// Start a daemon with full control over options.
 pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> HarnessDaemon {
     hold_network_test_binary_lock();
+    hold_network_test_thread_lock();
     let socket = socket_path_for_db(db);
     let bind_ip = opts.bind_ip.as_deref().unwrap_or("127.0.0.1");
     let requested_bind_addr = match opts.bind_port {

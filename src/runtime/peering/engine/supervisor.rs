@@ -5,11 +5,8 @@
 //! - accept loop
 //! - unified target ingress/dispatch
 //! - bootstrap refresher
-//! - observed-endpoint refresher
-//! - discovery ingress workers (feature-gated)
+//! - known-peer refresher
 
-use std::collections::HashSet;
-use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -18,18 +15,13 @@ use tokio::task::JoinSet;
 use tokio_util::sync::CancellationToken;
 use tracing::{info, warn};
 
-use super::target_dispatch::{
-    build_tenant_contexts, run_target_dispatcher, TargetIngressEvent, TargetIngressSource,
-};
-use super::target_planner::{
-    collect_all_bootstrap_targets, collect_all_observed_endpoint_targets,
-    normalize_discovered_addr_for_local_bind,
-};
+use super::target_dispatch::{run_target_dispatcher, TargetIngressEvent, TargetIngressSource};
+use super::target_planner::{collect_all_bootstrap_targets, collect_all_known_peer_targets};
 use crate::contracts::event_pipeline_contract::IngestFns;
 use crate::db::transport_creds::TenantInfo;
-use crate::peering::loops::{accept_loop_until_cancel, short_peer_id, IntroSpawnerFn};
+use crate::peering::loops::accept_loop_until_cancel;
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
-use crate::transport::{TenantClientConfigs, TransportEndpoint};
+use crate::transport::TransportEndpoint;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum RuntimeState {
@@ -48,9 +40,7 @@ enum WorkerKind {
     AcceptLoop,
     TargetDispatcher,
     BootstrapRefresher,
-    ObservedEndpointRefresher,
-    #[cfg(feature = "discovery")]
-    DiscoveryIngress,
+    KnownPeerRefresher,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -75,11 +65,7 @@ enum WorkerExitDisposition {
 pub(crate) struct RuntimeSupervisor {
     db_path: String,
     endpoint: TransportEndpoint,
-    local_addr: SocketAddr,
     tenants: Vec<TenantInfo>,
-    tenant_client_configs: TenantClientConfigs,
-    local_peer_ids: HashSet<String>,
-    intro_spawner: IntroSpawnerFn,
     ingest: IngestFns,
     state: RuntimeState,
     sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
@@ -90,22 +76,14 @@ impl RuntimeSupervisor {
     pub(crate) fn new(
         db_path: String,
         endpoint: TransportEndpoint,
-        local_addr: SocketAddr,
         tenants: Vec<TenantInfo>,
-        tenant_client_configs: TenantClientConfigs,
-        local_peer_ids: HashSet<String>,
-        intro_spawner: IntroSpawnerFn,
         ingest: IngestFns,
         sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
     ) -> Self {
         Self {
             db_path,
             endpoint,
-            local_addr,
             tenants,
-            tenant_client_configs,
-            local_peer_ids,
-            intro_spawner,
             ingest,
             state: RuntimeState::IdleNoTenants,
             sync_control,
@@ -126,17 +104,12 @@ impl RuntimeSupervisor {
         let mut workers = JoinSet::<WorkerExit>::new();
 
         let tenant_ids: Vec<String> = self.tenants.iter().map(|t| t.peer_id.clone()).collect();
-        let tenant_contexts = build_tenant_contexts(&self.db_path, &tenant_ids);
-
         let (target_tx, target_rx) = mpsc::unbounded_channel::<TargetIngressEvent>();
 
-        // Accept worker: inbound transport sessions for all known tenants.
         {
             let db_path = self.db_path.clone();
             let endpoint = self.endpoint.clone();
             let tenant_ids = tenant_ids.clone();
-            let tenant_cfgs = self.tenant_client_configs.clone();
-            let intro_spawner = self.intro_spawner;
             let ingest = self.ingest;
             let cancel = root_cancel.child_token();
             let sync_control = self.sync_control.clone();
@@ -151,8 +124,6 @@ impl RuntimeSupervisor {
                         &tenant_ids,
                         endpoint,
                         cancel,
-                        tenant_cfgs,
-                        intro_spawner,
                         ingest,
                         sync_control,
                     )
@@ -162,11 +133,9 @@ impl RuntimeSupervisor {
             );
         }
 
-        // Unified target dispatcher: one owner for connect-loop worker lifecycle.
         {
             let db_path = self.db_path.clone();
             let endpoint = self.endpoint.clone();
-            let intro_spawner = self.intro_spawner;
             let ingest = self.ingest;
             let cancel = root_cancel.child_token();
             let sync_control = self.sync_control.clone();
@@ -179,9 +148,7 @@ impl RuntimeSupervisor {
                     run_target_dispatcher(
                         db_path,
                         endpoint,
-                        intro_spawner,
                         ingest,
-                        tenant_contexts,
                         target_rx,
                         cancel,
                         sync_control,
@@ -191,7 +158,6 @@ impl RuntimeSupervisor {
             );
         }
 
-        // Bootstrap refresher emits into unified target ingress channel.
         if env_flag("TOPO_DISABLE_PLACEHOLDER_AUTODIAL") {
             warn!("BOOTSTRAP AUTODIAL DISABLED by TOPO_DISABLE_PLACEHOLDER_AUTODIAL");
         } else {
@@ -211,42 +177,19 @@ impl RuntimeSupervisor {
             let db_path = self.db_path.clone();
             let ingress = target_tx.clone();
             let cancel = root_cancel.child_token();
+            let discovery_disabled = env_flag("TOPO_DISABLE_DISCOVERY");
+            if discovery_disabled {
+                warn!("iroh address lookup disabled by TOPO_DISABLE_DISCOVERY");
+            }
             spawn_worker(
                 &mut workers,
-                WorkerKind::ObservedEndpointRefresher,
-                "observed-endpoint-refresher",
+                WorkerKind::KnownPeerRefresher,
+                "known-peer-refresher",
                 cancel.clone(),
-                async move { run_observed_endpoint_refresher(db_path, ingress, cancel).await },
+                async move {
+                    run_known_peer_refresher(db_path, ingress, cancel, discovery_disabled).await
+                },
             );
-        }
-
-        #[cfg(feature = "discovery")]
-        let mut discovery_handles = Vec::new();
-
-        #[cfg(feature = "discovery")]
-        if env_flag("TOPO_DISABLE_DISCOVERY") {
-            warn!("mDNS discovery disabled by TOPO_DISABLE_DISCOVERY");
-        } else {
-            let setup = super::discovery::prepare_mdns_discovery(
-                &self.tenants,
-                self.local_addr,
-                &self.local_peer_ids,
-                &self.tenant_client_configs,
-            );
-            discovery_handles = setup.handles;
-
-            for source in setup.ingress_sources {
-                let ingress = target_tx.clone();
-                let cancel = root_cancel.child_token();
-                let worker_name = format!("discovery-ingress-{}", short_peer_id(&source.tenant_id));
-                spawn_worker(
-                    &mut workers,
-                    WorkerKind::DiscoveryIngress,
-                    worker_name,
-                    cancel.clone(),
-                    async move { run_discovery_ingress_worker(source, ingress, cancel).await },
-                );
-            }
         }
 
         let mut fatal_error: Option<String> = None;
@@ -284,7 +227,6 @@ impl RuntimeSupervisor {
 
         root_cancel.cancel();
         self.endpoint.close(0u32.into(), b"runtime shutdown");
-
         drop(target_tx);
 
         while let Some(joined) = workers.join_next().await {
@@ -305,9 +247,6 @@ impl RuntimeSupervisor {
                 }
             }
         }
-
-        #[cfg(feature = "discovery")]
-        drop(discovery_handles);
 
         if let Some(err) = fatal_error {
             return Err(err.into());
@@ -353,9 +292,7 @@ fn worker_failure_policy(kind: WorkerKind) -> WorkerFailurePolicy {
         WorkerKind::AcceptLoop
         | WorkerKind::TargetDispatcher
         | WorkerKind::BootstrapRefresher
-        | WorkerKind::ObservedEndpointRefresher => WorkerFailurePolicy::FailRuntime,
-        #[cfg(feature = "discovery")]
-        WorkerKind::DiscoveryIngress => WorkerFailurePolicy::FailRuntime,
+        | WorkerKind::KnownPeerRefresher => WorkerFailurePolicy::FailRuntime,
     }
 }
 
@@ -383,8 +320,6 @@ fn transition_state(_state: RuntimeState, event: RuntimeEvent) -> RuntimeState {
         RuntimeEvent::ShutdownRequested => RuntimeState::IdleNoTenants,
     }
 }
-
-// ---- Refresher loops -----------------------------------------------------
 
 async fn run_bootstrap_refresher(
     db_path: String,
@@ -435,10 +370,11 @@ async fn run_bootstrap_refresher(
     Ok(())
 }
 
-async fn run_observed_endpoint_refresher(
+async fn run_known_peer_refresher(
     db_path: String,
     ingress_tx: mpsc::UnboundedSender<TargetIngressEvent>,
     shutdown: CancellationToken,
+    discovery_disabled: bool,
 ) -> Result<(), String> {
     let mut warning_gate = RepeatedWarningGate::new(Duration::from_secs(300));
     loop {
@@ -446,15 +382,18 @@ async fn run_observed_endpoint_refresher(
             break;
         }
 
-        match collect_all_observed_endpoint_targets(&db_path) {
+        match collect_all_known_peer_targets(&db_path) {
             Ok(targets) => {
                 warning_gate.clear();
                 for (tenant_id, peer_id, remote) in targets {
+                    if discovery_disabled && remote.is_none() {
+                        continue;
+                    }
                     if ingress_tx
                         .send(TargetIngressEvent {
                             tenant_id,
                             remote,
-                            source: TargetIngressSource::ObservedPeer { peer_id },
+                            source: TargetIngressSource::KnownPeer { peer_id },
                         })
                         .is_err()
                     {
@@ -463,7 +402,7 @@ async fn run_observed_endpoint_refresher(
                 }
             }
             Err(e) => {
-                let message = format!("OBSERVED ENDPOINT REFRESH failed: {}", e);
+                let message = format!("KNOWN PEER REFRESH failed: {}", e);
                 if warning_gate.should_emit(message.clone())
                     && should_emit_globally(format!("engine:{message}"))
                 {
@@ -481,52 +420,6 @@ async fn run_observed_endpoint_refresher(
     Ok(())
 }
 
-// ---- Discovery ingress ---------------------------------------------------
-
-#[cfg(feature = "discovery")]
-async fn run_discovery_ingress_worker(
-    source: super::discovery::DiscoveryIngressSource,
-    ingress_tx: mpsc::UnboundedSender<TargetIngressEvent>,
-    shutdown: CancellationToken,
-) -> Result<(), String> {
-    tokio::task::spawn_blocking(move || {
-        use std::sync::mpsc::RecvTimeoutError;
-
-        loop {
-            if shutdown.is_cancelled() {
-                break;
-            }
-
-            match source.rx.recv_timeout(Duration::from_millis(250)) {
-                Ok(peer) => {
-                    let dial_addr =
-                        normalize_discovered_addr_for_local_bind(source.local_listen_ip, peer.addr);
-                    if ingress_tx
-                        .send(TargetIngressEvent {
-                            tenant_id: source.tenant_id.clone(),
-                            remote: dial_addr,
-                            source: TargetIngressSource::Discovery {
-                                peer_id: peer.peer_id,
-                            },
-                        })
-                        .is_err()
-                    {
-                        break;
-                    }
-                }
-                Err(RecvTimeoutError::Timeout) => continue,
-                Err(RecvTimeoutError::Disconnected) => break,
-            }
-        }
-
-        Ok::<(), String>(())
-    })
-    .await
-    .map_err(|e| format!("discovery ingress worker join error: {}", e))?
-}
-
-// ---- Tests ---------------------------------------------------------------
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -543,52 +436,6 @@ mod tests {
     }
 
     #[test]
-    fn transition_to_idle_when_no_tenants() {
-        assert_eq!(
-            transition_state(RuntimeState::Active, RuntimeEvent::TenantSetChanged(0)),
-            RuntimeState::IdleNoTenants
-        );
-    }
-
-    #[test]
-    fn shutdown_event_forces_idle_state() {
-        assert_eq!(
-            transition_state(RuntimeState::Active, RuntimeEvent::ShutdownRequested),
-            RuntimeState::IdleNoTenants
-        );
-    }
-
-    #[test]
-    fn cancelled_worker_exit_is_expected() {
-        let exit = WorkerExit {
-            kind: WorkerKind::AcceptLoop,
-            name: "accept".to_string(),
-            result: Ok(()),
-            cancelled: true,
-        };
-        match classify_worker_exit(&exit) {
-            WorkerExitDisposition::Expected => {}
-            other => panic!("unexpected classification: {:?}", other),
-        }
-    }
-
-    #[test]
-    fn accept_worker_unexpected_exit_is_fatal() {
-        let exit = WorkerExit {
-            kind: WorkerKind::AcceptLoop,
-            name: "accept".to_string(),
-            result: Ok(()),
-            cancelled: false,
-        };
-        match classify_worker_exit(&exit) {
-            WorkerExitDisposition::Fatal(msg) => {
-                assert!(msg.contains("exited unexpectedly"));
-            }
-            other => panic!("unexpected classification: {:?}", other),
-        }
-    }
-
-    #[test]
     fn worker_failure_policy_is_explicit_per_kind() {
         assert_eq!(
             worker_failure_policy(WorkerKind::AcceptLoop),
@@ -599,7 +446,7 @@ mod tests {
             WorkerFailurePolicy::FailRuntime
         );
         assert_eq!(
-            worker_failure_policy(WorkerKind::ObservedEndpointRefresher),
+            worker_failure_policy(WorkerKind::KnownPeerRefresher),
             WorkerFailurePolicy::FailRuntime
         );
     }

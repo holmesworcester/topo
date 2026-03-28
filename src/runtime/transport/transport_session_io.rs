@@ -67,12 +67,8 @@ fn map_connection_error(err: ConnectionError, max_frame_size: usize) -> Transpor
         ConnectionError::Closed => TransportSessionIoError::ConnectionLost,
         ConnectionError::Parse(parse) => map_parse_error(parse, max_frame_size),
         ConnectionError::Io(e) => TransportSessionIoError::Internal(format!("io: {e}")),
-        ConnectionError::Quinn(e) => TransportSessionIoError::Internal(format!("quinn write: {e}")),
-        ConnectionError::QuinnRead(e) => {
-            TransportSessionIoError::Internal(format!("quinn read: {e}"))
-        }
-        ConnectionError::QuinnClose(e) => {
-            TransportSessionIoError::Internal(format!("quinn close: {e}"))
+        ConnectionError::Transport(e) => {
+            TransportSessionIoError::Internal(format!("transport: {e}"))
         }
     }
 }
@@ -208,10 +204,7 @@ where
         Ok(encode_frame(&msg))
     }
 
-    async fn send_control_frame(
-        &mut self,
-        frame: &[u8],
-    ) -> Result<(), TransportSessionIoError> {
+    async fn send_control_frame(&mut self, frame: &[u8]) -> Result<(), TransportSessionIoError> {
         if frame.len() > self.max_frame_size {
             return Err(TransportSessionIoError::FrameTooLarge {
                 len: frame.len(),

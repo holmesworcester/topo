@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 #
-# NAT hole-punch integration test using Linux network namespaces.
+# Relay-backed NAT integration test using Linux network namespaces.
 #
 # Topology:
 #   ns_a (10.1.0.2) -- ns_nat_a (10.1.0.1 / 10.100.0.10) --+
@@ -10,7 +10,7 @@
 #
 # Modes:
 #   cone      (default): endpoint-independent mapping, expected PASS
-#   symmetric           : endpoint-dependent mapping, expected FAIL
+#   symmetric           : endpoint-dependent mapping, expected PASS via relay fallback
 #
 # Usage:
 #   sudo tests/netns_nat_test.sh
@@ -52,7 +52,15 @@ clean_namespaces() {
     for ns in ${PREFIX}_i ${PREFIX}_na ${PREFIX}_nb ${PREFIX}_a ${PREFIX}_b; do
         ip netns del "$ns" 2>/dev/null || true
     done
-    ip link del "${PREFIX}_pub" 2>/dev/null || true
+    for link in \
+        "${PREFIX}_pub" \
+        "${PREFIX}_vi" "${PREFIX}_vi_br" \
+        "${PREFIX}_vna" "${PREFIX}_vna_br" \
+        "${PREFIX}_vnb" "${PREFIX}_vnb_br" \
+        "${PREFIX}_va" "${PREFIX}_va_nat" \
+        "${PREFIX}_vb" "${PREFIX}_vb_nat"; do
+        ip link del "$link" 2>/dev/null || true
+    done
 }
 
 # Must run as root for netns/nft/tc
@@ -246,8 +254,27 @@ DB_I="$TMPDIR/i.db"
 DB_A="$TMPDIR/a.db"
 DB_B="$TMPDIR/b.db"
 
-# Introducer workspace bootstrap
-"$BIN" send "hello from I" --db "$DB_I" >/dev/null
+log "Starting introducer I..."
+ip netns exec "${PREFIX}_i" env RUST_LOG=info "$BIN" start \
+    --bind 10.100.0.1:4433 \
+    --db "$DB_I" \
+    >"$TMPDIR/i.log" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 1 50); do
+    if "$BIN" status --db "$DB_I" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.2
+done
+"$BIN" status --db "$DB_I" >/dev/null 2>&1 || fail "introducer daemon did not become ready"
+
+log "Creating introducer workspace..."
+"$BIN" create-workspace \
+    --db "$DB_I" \
+    --workspace-name "hp-nat" \
+    --username "introducer" \
+    --device-name "nat-i" \
+    >/dev/null
 
 # Realistic out-of-band data: invite links only.
 INV_A=$("$BIN" invite --db "$DB_I" --public-addr "10.100.0.1:4433" | grep '^topo://')
@@ -258,13 +285,33 @@ INV_B=$("$BIN" invite --db "$DB_I" --public-addr "10.100.0.1:4433" | grep '^topo
 # ---------------------------------------------------------------------------
 # Start daemons
 # ---------------------------------------------------------------------------
-log "Starting introducer I..."
-ip netns exec "${PREFIX}_i" env RUST_LOG=info "$BIN" sync \
-    --bind 10.100.0.1:4433 \
-    --db "$DB_I" \
-    >"$TMPDIR/i.log" 2>&1 &
+log "Starting peer A (behind NAT)..."
+ip netns exec "${PREFIX}_a" env RUST_LOG=info "$BIN" start \
+    --bind 0.0.0.0:4433 \
+    --db "$DB_A" \
+    >"$TMPDIR/a.log" 2>&1 &
 PIDS+=($!)
-sleep 0.5
+for _ in $(seq 1 50); do
+    if "$BIN" status --db "$DB_A" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.2
+done
+"$BIN" status --db "$DB_A" >/dev/null 2>&1 || fail "peer A daemon did not become ready"
+
+log "Starting peer B (behind NAT)..."
+ip netns exec "${PREFIX}_b" env RUST_LOG=info "$BIN" start \
+    --bind 0.0.0.0:4433 \
+    --db "$DB_B" \
+    >"$TMPDIR/b.log" 2>&1 &
+PIDS+=($!)
+for _ in $(seq 1 50); do
+    if "$BIN" status --db "$DB_B" >/dev/null 2>&1; then
+        break
+    fi
+    sleep 0.2
+done
+"$BIN" status --db "$DB_B" >/dev/null 2>&1 || fail "peer B daemon did not become ready"
 
 # Accept invites from segmented peers (bootstrap over NAT to introducer).
 ip netns exec "${PREFIX}_a" "$BIN" accept \
@@ -280,9 +327,14 @@ ip netns exec "${PREFIX}_b" "$BIN" accept \
     --devicename "nat-b" \
     >/dev/null
 
-FP_I=$("$BIN" transport-identity --db "$DB_I" 2>/dev/null)
-FP_A=$("$BIN" transport-identity --db "$DB_A" 2>/dev/null)
-FP_B=$("$BIN" transport-identity --db "$DB_B" 2>/dev/null)
+"$BIN" assert-eventually "peer_count >= 2" --db "$DB_A" --timeout-ms 30000 >/dev/null
+"$BIN" assert-eventually "peer_count >= 2" --db "$DB_B" --timeout-ms 30000 >/dev/null
+"$BIN" assert-eventually "peer_count >= 3" --db "$DB_I" --timeout-ms 30000 >/dev/null
+
+FP_I=$("$BIN" identity --db "$DB_I" 2>/dev/null | sed -n 's/^  Transport: //p' | head -n1)
+FP_A=$("$BIN" identity --db "$DB_A" 2>/dev/null | sed -n 's/^  Transport: //p' | head -n1)
+FP_B=$("$BIN" identity --db "$DB_B" 2>/dev/null | sed -n 's/^  Transport: //p' | head -n1)
+[[ -n "$FP_I" && -n "$FP_A" && -n "$FP_B" ]] || fail "failed to resolve transport fingerprints"
 log "I = ${FP_I:0:16}..."
 log "A = ${FP_A:0:16}..."
 log "B = ${FP_B:0:16}..."
@@ -296,90 +348,35 @@ if [[ -z "$MSG_A_EID" || -z "$MSG_B_EID" ]]; then
     fail "Failed to parse seed message event IDs"
 fi
 
-log "Starting peer A (behind NAT)..."
-ip netns exec "${PREFIX}_a" env RUST_LOG=info "$BIN" sync \
-    --bind 0.0.0.0:4433 \
-    --db "$DB_A" \
-    >"$TMPDIR/a.log" 2>&1 &
-PIDS+=($!)
-
-log "Starting peer B (behind NAT)..."
-ip netns exec "${PREFIX}_b" env RUST_LOG=info "$BIN" sync \
-    --bind 0.0.0.0:4433 \
-    --db "$DB_B" \
-    >"$TMPDIR/b.log" 2>&1 &
-PIDS+=($!)
-
 # ---------------------------------------------------------------------------
 # Phase 1: Relay sync convergence
 # ---------------------------------------------------------------------------
 log "Waiting for relay sync convergence (cross-peer message IDs)..."
-if ! "$BIN" assert-eventually "has_event:${MSG_B_EID} >= 1" --db "$DB_A" --timeout-ms 20000 2>/dev/null; then
+if ! "$BIN" assert-eventually "has_event:${MSG_B_EID} >= 1" --db "$DB_A" --timeout-ms 60000 2>/dev/null; then
     fail "A did not receive B's seed message via relay"
 fi
-if ! "$BIN" assert-eventually "has_event:${MSG_A_EID} >= 1" --db "$DB_B" --timeout-ms 20000 2>/dev/null; then
+if ! "$BIN" assert-eventually "has_event:${MSG_A_EID} >= 1" --db "$DB_B" --timeout-ms 60000 2>/dev/null; then
     fail "B did not receive A's seed message via relay"
 fi
 log "Relay sync OK: A/B observed each other's seed message IDs"
 
 # ---------------------------------------------------------------------------
-# Phase 2: Explicit intro API calls + punch polling
+# Phase 2: Ongoing relay-backed sync under NAT
 # ---------------------------------------------------------------------------
-log "Sending explicit Intro API calls from introducer and waiting for punch..."
-PUNCH_DEADLINE=$((SECONDS + 45))
-PUNCH_OK=false
-NEXT_INTRO_AT=0
-INTRO_CALLS=0
+log "Verifying ongoing sync after both peers are live behind NAT..."
+SEND_A2_OUT=$("$BIN" send "relay-followup-from-A" --db "$DB_A")
+SEND_B2_OUT=$("$BIN" send "relay-followup-from-B" --db "$DB_B")
+DIRECT_A_EID=$(echo "$SEND_A2_OUT" | sed -n 's/^event_id://p' | tail -n1)
+DIRECT_B_EID=$(echo "$SEND_B2_OUT" | sed -n 's/^event_id://p' | tail -n1)
+if [[ -z "$DIRECT_A_EID" || -z "$DIRECT_B_EID" ]]; then
+    fail "Failed to parse relay follow-up message event IDs"
+fi
 
-while [[ $SECONDS -lt $PUNCH_DEADLINE ]]; do
-    if [[ $SECONDS -ge $NEXT_INTRO_AT ]]; then
-        if ip netns exec "${PREFIX}_i" env RUST_LOG=info "$BIN" intro \
-            --db "$DB_I" \
-            --peer-a "$FP_A" --peer-b "$FP_B" \
-            --ttl-ms 30000 --attempt-window-ms 5000 \
-            >>"$TMPDIR/i_intro.log" 2>&1; then
-            INTRO_CALLS=$((INTRO_CALLS + 1))
-        fi
-        NEXT_INTRO_AT=$((SECONDS + 2))
-    fi
-
-    A_STATUS=$("$BIN" intro-attempts --db "$DB_A" 2>/dev/null || true)
-    B_STATUS=$("$BIN" intro-attempts --db "$DB_B" 2>/dev/null || true)
-
-    A_CONNECTED=$(echo "$A_STATUS" | grep -c "connected" || true)
-    B_CONNECTED=$(echo "$B_STATUS" | grep -c "connected" || true)
-
-    if [[ "$A_CONNECTED" -gt 0 ]] || [[ "$B_CONNECTED" -gt 0 ]]; then
-        PUNCH_OK=true
-        break
-    fi
-
-    if (( SECONDS % 5 == 0 )); then
-        log "  ... intro_calls=$INTRO_CALLS, waiting for connected intro_attempt"
-    fi
-
-    sleep 1
-done
-
-# ---------------------------------------------------------------------------
-# Phase 3: If punch connected, verify direct sync with new messages
-# ---------------------------------------------------------------------------
-if $PUNCH_OK; then
-    log "Punch connected! Verifying direct sync..."
-    SEND_A2_OUT=$("$BIN" send "direct-from-A" --db "$DB_A")
-    SEND_B2_OUT=$("$BIN" send "direct-from-B" --db "$DB_B")
-    DIRECT_A_EID=$(echo "$SEND_A2_OUT" | sed -n 's/^event_id://p' | tail -n1)
-    DIRECT_B_EID=$(echo "$SEND_B2_OUT" | sed -n 's/^event_id://p' | tail -n1)
-    if [[ -z "$DIRECT_A_EID" || -z "$DIRECT_B_EID" ]]; then
-        fail "Failed to parse direct message event IDs"
-    fi
-
-    if ! "$BIN" assert-eventually "has_event:${DIRECT_B_EID} >= 1" --db "$DB_A" --timeout-ms 15000 2>/dev/null; then
-        fail "A did not receive B's direct message after punch"
-    fi
-    if ! "$BIN" assert-eventually "has_event:${DIRECT_A_EID} >= 1" --db "$DB_B" --timeout-ms 15000 2>/dev/null; then
-        fail "B did not receive A's direct message after punch"
-    fi
+if ! "$BIN" assert-eventually "has_event:${DIRECT_B_EID} >= 1" --db "$DB_A" --timeout-ms 30000 2>/dev/null; then
+    fail "A did not receive B's follow-up message under NAT"
+fi
+if ! "$BIN" assert-eventually "has_event:${DIRECT_A_EID} >= 1" --db "$DB_B" --timeout-ms 30000 2>/dev/null; then
+    fail "B did not receive A's follow-up message under NAT"
 fi
 
 # ---------------------------------------------------------------------------
@@ -387,33 +384,10 @@ fi
 # ---------------------------------------------------------------------------
 echo ""
 echo "=========================================="
-echo "  NAT Hole Punch Test Results"
+echo "  NAT Relay Test Results"
 echo "=========================================="
 echo "  mode: $MODE"
-echo "  intro_calls: $INTRO_CALLS"
-
-echo "  A intro attempts:"
-"$BIN" intro-attempts --db "$DB_A" 2>/dev/null | sed 's/^/    /' || true
-echo ""
-echo "  B intro attempts:"
-"$BIN" intro-attempts --db "$DB_B" 2>/dev/null | sed 's/^/    /' || true
-echo ""
-
-echo "  I intro log:"
-grep -i "intro\|punch\|IntroOffer" "$TMPDIR/i.log" "$TMPDIR/i_intro.log" 2>/dev/null | tail -15 | sed 's/^/    /' || echo "    (none)"
-echo ""
-echo "  A intro log:"
-grep -i "intro\|punch\|IntroOffer" "$TMPDIR/a.log" 2>/dev/null | tail -10 | sed 's/^/    /' || echo "    (none)"
-echo ""
-echo "  B intro log:"
-grep -i "intro\|punch\|IntroOffer" "$TMPDIR/b.log" 2>/dev/null | tail -10 | sed 's/^/    /' || echo "    (none)"
-echo ""
-
-if $PUNCH_OK; then
-    echo -e "  ${GREEN}Observed connected intro_attempt (hole punch succeeded)${NC}"
-else
-    echo -e "  ${YELLOW}No connected intro_attempt observed within deadline${NC}"
-fi
+echo "  sync path: relay-backed iroh transport"
 
 if $HAS_CONNTRACK; then
     echo ""
@@ -425,14 +399,7 @@ if $HAS_CONNTRACK; then
 fi
 
 EXPECTED="PASS"
-if [[ "$MODE" == "symmetric" ]]; then
-    EXPECTED="FAIL"
-fi
-
-ACTUAL="FAIL"
-if $PUNCH_OK; then
-    ACTUAL="PASS"
-fi
+ACTUAL="PASS"
 
 echo ""
 echo "  expected=$EXPECTED actual=$ACTUAL"
@@ -450,9 +417,6 @@ else
     echo ""
     echo "  Last 40 lines of I log:"
     tail -40 "$TMPDIR/i.log" 2>/dev/null | sed 's/^/    /'
-    echo ""
-    echo "  Last 40 lines of I intro log:"
-    tail -40 "$TMPDIR/i_intro.log" 2>/dev/null | sed 's/^/    /'
     echo ""
     echo "  Last 40 lines of A log:"
     tail -40 "$TMPDIR/a.log" 2>/dev/null | sed 's/^/    /'

@@ -18,34 +18,46 @@ use crate::sync::session::windowing::reset_outbound_window_state;
 use crate::sync::SyncConnectionHandler;
 use crate::transport::session_factory::extract_build_mismatch_reason;
 use crate::transport::{
-    derive_bootstrap_dial_context, dial_daemon_connection, load_daemon_identity_from_db,
-    resolve_outbound_session_auth_plan, send_outbound_session_auth, BootstrapDialMode,
-    ConnectionLifecycleError, DaemonConnection, OutboundSessionAuthPlan, SessionClass,
-    TransportClientConfig, TransportEndpoint, COVER_SERVER_NAME,
+    dial_daemon_connection_target, load_daemon_identity_from_db,
+    resolve_outbound_session_auth_plan, send_outbound_session_auth, ConnectionLifecycleError,
+    DaemonConnection, OutboundSessionAuthPlan, SessionClass, TransportEndpoint,
 };
 
 use super::supervisor::{run_startup_preflight, supervise_inbound_daemon_connection};
 use super::{
     claim_live_daemon_connection_slot, claim_live_session_peer, current_timestamp_ms,
-    live_daemon_connection, peer_fingerprint_from_hex, IntroSpawnerFn, CONNECT_RETRY_DELAY,
-    ENDPOINT_TTL_MS, SYNC_SESSION_TIMEOUT_SECS,
+    evict_live_daemon_connection, live_daemon_connection, peer_fingerprint_from_hex,
+    CONNECT_RETRY_DELAY, ENDPOINT_TTL_MS, SYNC_SESSION_TIMEOUT_SECS,
 };
 
 pub(crate) const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
 const STALE_DIAL_FAILURE_THRESHOLD: u32 = 8;
 const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
 
+fn is_connection_lost_message(message: &str) -> bool {
+    let lower = message.to_ascii_lowercase();
+    lower.contains("connection lost")
+        || lower.contains("closed by peer")
+        || lower.contains("application closed")
+        || lower.contains("broken pipe")
+        || lower.contains("reset by peer")
+}
+
+fn should_evict_closed_daemon_connection(
+    daemon_connection: &DaemonConnection,
+    message: &str,
+) -> bool {
+    is_connection_lost_message(message) && daemon_connection.connection().close_reason().is_some()
+}
+
 pub struct ConnectLoopConfig {
     pub db_path: String,
     pub recorded_by: String,
     pub endpoint: TransportEndpoint,
-    pub remote: SocketAddr,
+    pub remote: Option<SocketAddr>,
     pub remote_session_peer_id: String,
-    pub client_config: Option<TransportClientConfig>,
-    pub intro_spawner: IntroSpawnerFn,
     pub ingest: IngestFns,
     pub shutdown: Option<CancellationToken>,
-    pub bootstrap_fallback_client_config: Option<TransportClientConfig>,
     pub sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
     pub auth_plan: Option<OutboundSessionAuthPlan>,
     pub expected_remote_daemon_peer_id: Option<String>,
@@ -72,13 +84,12 @@ pub async fn connect_loop(
                 .expected_remote_daemon_peer_id
                 .as_deref()
                 .unwrap_or(&config.remote_session_peer_id),
-            config.auth_plan.unwrap_or_else(|| OutboundSessionAuthPlan::PeerShared {
-                target_peer_id: config.remote_session_peer_id.clone(),
-            }),
-            config.client_config,
-            config.intro_spawner,
+            config
+                .auth_plan
+                .unwrap_or_else(|| OutboundSessionAuthPlan::PeerShared {
+                    target_peer_id: config.remote_session_peer_id.clone(),
+                }),
             shutdown,
-            config.bootstrap_fallback_client_config,
             config.sync_control,
         ))
         .await
@@ -90,14 +101,11 @@ async fn connect_loop_inner(
     recorded_by: &str,
     local_daemon_peer_id: &str,
     endpoint: TransportEndpoint,
-    remote: SocketAddr,
+    remote: Option<SocketAddr>,
     remote_session_peer_id: &str,
     expected_remote_daemon_peer_id: &str,
     auth_plan: OutboundSessionAuthPlan,
-    client_config: Option<TransportClientConfig>,
-    intro_spawner: IntroSpawnerFn,
     shutdown: CancellationToken,
-    bootstrap_fallback_client_config: Option<TransportClientConfig>,
     sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let mut has_connected_once = false;
@@ -107,21 +115,23 @@ async fn connect_loop_inner(
     let mut last_outbound_window_scope = None;
     let mut live_session_peer_registration = None;
 
+    let remote_target = describe_remote_target(remote, expected_remote_daemon_peer_id);
+
     loop {
         if shutdown.is_cancelled() {
             break;
         }
 
-        let daemon_connection =
-            if let Some(existing) = live_daemon_connection(db_path, expected_remote_daemon_peer_id)
+        let daemon_connection = if let Some(existing) =
+            live_daemon_connection(db_path, expected_remote_daemon_peer_id)
         {
             existing
         } else {
             if !announced_connecting {
                 info!(
-                    "Connecting daemon {} at {}...",
+                    "Connecting daemon {} via {}...",
                     super::short_peer_id(expected_remote_daemon_peer_id),
-                    remote
+                    remote_target
                 );
                 announced_connecting = true;
             }
@@ -133,16 +143,14 @@ async fn connect_loop_inner(
                 outcome = dial_daemon_ongoing_first(
                     &endpoint,
                     remote,
-                    COVER_SERVER_NAME,
-                    client_config.as_ref(),
-                    bootstrap_fallback_client_config.as_ref(),
+                    expected_remote_daemon_peer_id,
                 ) => outcome,
             } {
                 Ok(outcome) => outcome,
                 Err(e) => {
-                    let message = describe_connect_failure(remote, &e);
-                    let warn_on_startup_stale_failure = bootstrap_fallback_client_config.is_some()
-                        || matches!(auth_plan, OutboundSessionAuthPlan::InviteBootstrap { .. });
+                    let message = describe_connect_failure(&remote_target, &e);
+                    let warn_on_startup_stale_failure =
+                        matches!(auth_plan, OutboundSessionAuthPlan::InviteBootstrap { .. });
                     if (should_warn_for_connect_failure(has_connected_once, &e)
                         || warn_on_startup_stale_failure)
                         && warning_gate.should_emit(message.clone())
@@ -160,7 +168,10 @@ async fn connect_loop_inner(
                             }
                             return Err(std::io::Error::other(format!(
                                 "{} remote={} failures={} last_error={}",
-                                STALE_DIAL_TARGET_MARKER, remote, consecutive_stale_dial_failures, e
+                                STALE_DIAL_TARGET_MARKER,
+                                remote_target,
+                                consecutive_stale_dial_failures,
+                                e
                             ))
                             .into());
                         }
@@ -191,8 +202,6 @@ async fn connect_loop_inner(
                     spawn_daemon_connection_worker(
                         daemon_connection.clone(),
                         db_path.to_string(),
-                        endpoint.clone(),
-                        intro_spawner,
                         shutdown.child_token(),
                         sync_control.clone(),
                         connection_lease,
@@ -237,6 +246,16 @@ async fn connect_loop_inner(
                     if let Some(reason) = extract_build_mismatch_reason(&err.to_string()) {
                         note_build_mismatch(daemon_connection.remote_daemon_peer_id(), reason);
                     }
+                    if should_evict_closed_daemon_connection(&daemon_connection, &err.to_string()) {
+                        daemon_connection
+                            .connection()
+                            .close(0u32.into(), b"outbound session open lost connection");
+                        evict_live_daemon_connection(
+                            db_path,
+                            daemon_connection.remote_daemon_peer_id(),
+                            connection_id,
+                        );
+                    }
                     dependency_shutdown.cancel();
                     break;
                 }
@@ -260,6 +279,7 @@ async fn connect_loop_inner(
                 session.io.as_mut(),
                 db_path,
                 recorded_by,
+                Some(&daemon_connection),
                 daemon_connection.remote_daemon_peer_id(),
                 Some(expected_remote_daemon_peer_id),
                 &effective_auth_plan,
@@ -268,7 +288,18 @@ async fn connect_loop_inner(
             {
                 Ok(auth_result) => auth_result,
                 Err(e) => {
-                    let message = describe_session_auth_failure(remote, remote_session_peer_id, &*e);
+                    if should_evict_closed_daemon_connection(&daemon_connection, &e.to_string()) {
+                        daemon_connection
+                            .connection()
+                            .close(0u32.into(), b"outbound session auth lost connection");
+                        evict_live_daemon_connection(
+                            db_path,
+                            daemon_connection.remote_daemon_peer_id(),
+                            connection_id,
+                        );
+                    }
+                    let message =
+                        describe_session_auth_failure(&remote_target, remote_session_peer_id, &*e);
                     if warning_gate.should_emit(message.clone())
                         && should_emit_globally(format!("connect:{message}"))
                     {
@@ -359,11 +390,9 @@ async fn connect_loop_inner(
     Ok(())
 }
 
-fn spawn_daemon_connection_worker(
+pub(super) fn spawn_daemon_connection_worker(
     daemon_connection: DaemonConnection,
     db_path: String,
-    endpoint: TransportEndpoint,
-    intro_spawner: IntroSpawnerFn,
     shutdown: CancellationToken,
     sync_control: Option<std::sync::Arc<crate::runtime::sync_control::SyncControlRegistry>>,
     connection_lease: super::LiveDaemonConnectionLease,
@@ -376,13 +405,6 @@ fn spawn_daemon_connection_worker(
             .expect("connect daemon worker runtime");
         let local = tokio::task::LocalSet::new();
         runtime.block_on(local.run_until(async move {
-            intro_spawner(
-                daemon_connection.connection(),
-                db_path.clone(),
-                daemon_connection.remote_daemon_peer_id().to_string(),
-                endpoint,
-            );
-
             let responder_handler =
                 SyncConnectionHandler::responder(db_path.clone(), SYNC_SESSION_TIMEOUT_SECS)
                     .with_sync_control(sync_control.clone());
@@ -415,7 +437,8 @@ fn record_authenticated_outbound_session(
             ENDPOINT_TTL_MS,
         );
         if let Some(ref canonical_remote_peer_id) = auth_result.canonical_remote_peer_id {
-            if let Some(remote_daemon_fp) = peer_fingerprint_from_hex(&auth_result.remote_daemon_peer_id)
+            if let Some(remote_daemon_fp) =
+                peer_fingerprint_from_hex(&auth_result.remote_daemon_peer_id)
             {
                 let _ = record_transport_binding(
                     &db,
@@ -429,23 +452,28 @@ fn record_authenticated_outbound_session(
     }
 }
 
-fn describe_connect_failure(remote: SocketAddr, err: &ConnectionLifecycleError) -> String {
+fn describe_remote_target(
+    remote: Option<SocketAddr>,
+    expected_remote_daemon_peer_id: &str,
+) -> String {
+    match remote {
+        Some(remote) => remote.to_string(),
+        None => format!(
+            "iroh lookup for {}",
+            super::short_peer_id(expected_remote_daemon_peer_id)
+        ),
+    }
+}
+
+fn describe_connect_failure(remote: &str, err: &ConnectionLifecycleError) -> String {
     match err {
-        ConnectionLifecycleError::DialTrustRejected(msg) => {
-            let fp = msg
-                .split("peer fingerprint ")
-                .nth(1)
-                .and_then(|s| s.split_whitespace().next())
-                .unwrap_or("unknown");
-            format!(
-                "Certificate mismatch connecting to {}: TLS fingerprint {} is not trusted.",
-                remote, fp
-            )
-        }
         ConnectionLifecycleError::Dial(msg) => {
             let m = msg.to_ascii_lowercase();
             if m.contains("connection refused") {
-                format!("Connection refused by {}: nothing is listening there", remote)
+                format!(
+                    "Connection refused by {}: nothing is listening there",
+                    remote
+                )
             } else if m.contains("timed out") || m.contains("timeout") {
                 format!(
                     "Connection to {} timed out: the peer may be offline or unreachable",
@@ -460,7 +488,10 @@ fn describe_connect_failure(remote: SocketAddr, err: &ConnectionLifecycleError) 
             }
         }
         ConnectionLifecycleError::Accept(msg) => {
-            format!("Unexpected accept error during outbound dial to {}: {}", remote, msg)
+            format!(
+                "Unexpected accept error during outbound dial to {}: {}",
+                remote, msg
+            )
         }
         ConnectionLifecycleError::MissingPeerIdentity => {
             format!(
@@ -472,7 +503,7 @@ fn describe_connect_failure(remote: SocketAddr, err: &ConnectionLifecycleError) 
 }
 
 fn describe_session_auth_failure(
-    remote: SocketAddr,
+    remote: &str,
     remote_peer_id: &str,
     err: &(dyn std::error::Error + Send + Sync),
 ) -> String {
@@ -503,7 +534,6 @@ fn is_stale_dial_failure(err: &ConnectionLifecycleError) -> bool {
                 || m.contains("no route to host")
                 || m.contains("unreachable")
         }
-        ConnectionLifecycleError::DialTrustRejected(_) => false,
         ConnectionLifecycleError::Accept(_) | ConnectionLifecycleError::MissingPeerIdentity => {
             false
         }
@@ -523,27 +553,9 @@ struct DialOutcome {
 
 async fn dial_daemon_ongoing_first(
     endpoint: &TransportEndpoint,
-    remote: SocketAddr,
+    remote: Option<SocketAddr>,
     sni: &str,
-    ongoing_client_config: Option<&TransportClientConfig>,
-    bootstrap_fallback_client_config: Option<&TransportClientConfig>,
 ) -> Result<DialOutcome, ConnectionLifecycleError> {
-    match dial_daemon_connection(endpoint, remote, sni, ongoing_client_config).await {
-        Ok(daemon_connection) => Ok(DialOutcome { daemon_connection }),
-        Err(primary_err) => {
-            let decision = derive_bootstrap_dial_context(
-                Some(&primary_err),
-                bootstrap_fallback_client_config.is_some(),
-            );
-            if decision.mode != BootstrapDialMode::BootstrapFallback {
-                return Err(primary_err);
-            }
-            let Some(fallback_cfg) = bootstrap_fallback_client_config else {
-                return Err(primary_err);
-            };
-            let daemon_connection =
-                dial_daemon_connection(endpoint, remote, sni, Some(fallback_cfg)).await?;
-            Ok(DialOutcome { daemon_connection })
-        }
-    }
+    let daemon_connection = dial_daemon_connection_target(endpoint, remote, sni).await?;
+    Ok(DialOutcome { daemon_connection })
 }

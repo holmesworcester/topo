@@ -3,7 +3,7 @@
 //! Connection count is bounded by a semaphore to prevent local connection-flood
 //! pressure (feedback item 2).
 
-use std::collections::HashSet;
+use std::collections::BTreeSet;
 use std::io::Write;
 use std::net::SocketAddr;
 use std::os::unix::net::UnixListener;
@@ -20,6 +20,7 @@ use crate::node::NodeRuntimeNetInfo;
 use crate::rpc::protocol::*;
 use crate::service;
 use crate::state::subscriptions;
+use crate::transport::TransportEndpoint;
 
 /// Maximum concurrent RPC connections the server will handle.
 /// Additional connections block until a slot is freed.
@@ -54,17 +55,13 @@ pub struct DaemonState {
     pub active_peer: RwLock<Option<String>>,
     /// Runtime lifecycle state.
     pub runtime_state: RwLock<RuntimeState>,
-    /// Runtime networking info (listen addr, UPnP result). Set once the
-    /// QUIC endpoint is bound; UPnP result is populated while UPnP mode is enabled.
+    /// Runtime networking info and live endpoint handle, set once the daemon
+    /// runtime has bound its `iroh` endpoint.
     pub runtime_net: RwLock<Option<NodeRuntimeNetInfo>>,
     /// The daemon's resolved bind address, set as soon as startup reserves the
     /// UDP socket. This survives the idle-no-tenants phase before runtime
     /// activation reports `runtime_net.listen_addr`.
     pub resolved_bind_addr: RwLock<Option<SocketAddr>>,
-    /// Whether runtime-managed UPnP mode is enabled for this daemon session.
-    pub upnp_enabled: RwLock<bool>,
-    /// Last UPnP mapping report for the active runtime session.
-    pub upnp_result: RwLock<Option<crate::peering::nat::upnp::UpnpMappingReport>>,
     /// Wake-up trigger for runtime state reevaluation after tenant-changing commands.
     pub runtime_recheck: Notify,
     /// Invite/link strings stored by number (index+1 = invite ref number).
@@ -94,6 +91,7 @@ impl DaemonState {
         let active = match crate::db::open_connection(db_path) {
             Ok(conn) => {
                 let _ = crate::db::schema::create_tables(&conn);
+                let _ = crate::transport::ensure_daemon_identity(&conn);
                 match discover_tenant_scopes(&conn) {
                     Ok(tenants) if tenants.len() == 1 => Some(tenants[0].tenant_id.clone()),
                     Ok(_) => None,
@@ -109,8 +107,6 @@ impl DaemonState {
             runtime_state: RwLock::new(RuntimeState::IdleNoTenants),
             runtime_net: RwLock::new(None),
             resolved_bind_addr: RwLock::new(None),
-            upnp_enabled: RwLock::new(false),
-            upnp_result: RwLock::new(None),
             runtime_recheck: Notify::new(),
             invite_refs: RwLock::new(Vec::new()),
             sync_control: Arc::new(crate::runtime::sync_control::SyncControlRegistry::new(
@@ -134,6 +130,14 @@ impl DaemonState {
     fn effective_listen_addr(&self) -> Option<SocketAddr> {
         self.runtime_listen_addr()
             .or_else(|| *self.resolved_bind_addr.read().unwrap())
+    }
+
+    fn runtime_endpoint(&self) -> Option<TransportEndpoint> {
+        self.runtime_net
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|info| info.endpoint.clone())
     }
 
     fn require_active_peer(&self) -> Result<String, String> {
@@ -327,101 +331,134 @@ fn handle_connection(
     Ok(())
 }
 
-fn resolve_bootstrap_from_upnp(
-    upnp: &crate::peering::nat::upnp::UpnpMappingReport,
-) -> Result<String, String> {
-    if upnp.status != crate::peering::nat::upnp::UpnpMappingStatus::Success {
-        let status = match &upnp.status {
-            crate::peering::nat::upnp::UpnpMappingStatus::Success => "success",
-            crate::peering::nat::upnp::UpnpMappingStatus::Failed => "failed",
-            crate::peering::nat::upnp::UpnpMappingStatus::NotAttempted => "not_attempted",
-        };
-        let reason = upnp.error.as_deref().unwrap_or("unknown");
-        return Err(format!(
-            "no bootstrap address — UPnP status is {} ({}) — provide --bootstrap or run `topo upnp` first",
-            status, reason
-        ));
-    }
-
-    let (ip, port) = match (upnp.external_ip.as_deref(), upnp.mapped_external_port) {
-        (Some(ip), Some(port)) => (ip, port),
-        _ => {
-            return Err(
-                "no bootstrap address — provide --bootstrap or run `topo upnp` first".to_string(),
-            )
-        }
-    };
-
-    let parsed_ip: std::net::IpAddr = ip.parse().map_err(|_| {
-        format!(
-            "UPnP external IP is malformed ({}) — provide --bootstrap explicitly",
-            ip
-        )
-    })?;
-    if !crate::peering::nat::upnp::is_public_internet_ip(parsed_ip) {
-        return Err(format!(
-            "UPnP external IP {} is not publicly routable — provide --bootstrap explicitly",
-            ip
-        ));
-    }
-
-    Ok(std::net::SocketAddr::new(parsed_ip, port).to_string())
+fn env_flag(name: &str) -> bool {
+    std::env::var(name)
+        .ok()
+        .map(|value| {
+            let lowered = value.to_ascii_lowercase();
+            lowered == "1" || lowered == "true" || lowered == "yes"
+        })
+        .unwrap_or(false)
 }
 
-fn upnp_response_data(
-    enabled: bool,
-    report: Option<&crate::peering::nat::upnp::UpnpMappingReport>,
-    fallback_error: &str,
-) -> serde_json::Value {
-    let mut data = serde_json::Map::new();
-    data.insert("enabled".into(), serde_json::Value::Bool(enabled));
-    if let Some(report) = report {
-        if let Ok(serde_json::Value::Object(fields)) = serde_json::to_value(report) {
-            for (key, value) in fields {
-                data.insert(key, value);
-            }
-        }
-    } else {
-        data.insert("status".into(), serde_json::json!("not_attempted"));
-        data.insert("error".into(), serde_json::json!(fallback_error));
+fn is_link_local(ip: &std::net::IpAddr) -> bool {
+    match ip {
+        std::net::IpAddr::V4(v4) => v4.is_link_local(),
+        std::net::IpAddr::V6(v6) => v6.segments()[0] & 0xffc0 == 0xfe80,
     }
-    serde_json::Value::Object(data)
 }
 
-fn merge_upnp_bootstrap_addr(
-    mut addrs: Vec<crate::event_modules::workspace::invite_link::BootstrapAddress>,
-    upnp: Option<&crate::peering::nat::upnp::UpnpMappingReport>,
+fn endpoint_bootstrap_addrs(
+    endpoint: &TransportEndpoint,
 ) -> Vec<crate::event_modules::workspace::invite_link::BootstrapAddress> {
-    let mut seen: HashSet<String> = addrs
-        .iter()
-        .map(|addr| addr.to_bootstrap_addr_string())
-        .collect();
-    if let Some(report) = upnp {
-        match resolve_bootstrap_from_upnp(report) {
-            Ok(addr) => {
-                match crate::event_modules::workspace::invite_link::parse_bootstrap_address(&addr) {
-                    Ok(parsed) => {
-                        let key = parsed.to_bootstrap_addr_string();
-                        if seen.insert(key) {
-                            addrs.push(parsed);
-                        }
-                    }
-                    Err(e) => warn!("ignoring invalid UPnP bootstrap address {}: {}", addr, e),
+    let include_loopback = env_flag("TOPO_TEST_DISCOVERY_LOOPBACK");
+    let mut addrs = Vec::new();
+    let mut seen = BTreeSet::new();
+    for addr in endpoint.endpoint_addr().ip_addrs().copied() {
+        let ip = addr.ip();
+        if ip.is_unspecified() {
+            continue;
+        }
+        if ip.is_loopback() && !include_loopback {
+            continue;
+        }
+        if is_link_local(&ip) {
+            continue;
+        }
+        let bootstrap = match ip {
+            std::net::IpAddr::V4(ip) => {
+                crate::event_modules::workspace::invite_link::BootstrapAddress::Ipv4 {
+                    ip,
+                    port: addr.port(),
                 }
             }
-            Err(e) if report.status == crate::peering::nat::upnp::UpnpMappingStatus::Success => {
-                warn!("ignoring unusable UPnP mapping result: {}", e);
+            std::net::IpAddr::V6(ip) => {
+                crate::event_modules::workspace::invite_link::BootstrapAddress::Ipv6 {
+                    ip,
+                    port: addr.port(),
+                }
             }
-            Err(_) => {}
+        };
+        let key = bootstrap.to_bootstrap_addr_string();
+        if seen.insert(key) {
+            addrs.push(bootstrap);
         }
     }
     addrs
+}
+
+fn runtime_status_value(state: &DaemonState) -> Option<serde_json::Value> {
+    if let Some(mut info) = state.runtime_net.read().unwrap().clone() {
+        if let Some(endpoint) = info.endpoint.as_ref() {
+            if let Ok(listen_addr) = endpoint.local_addr() {
+                info.listen_addr = listen_addr.to_string();
+            }
+            info.daemon_peer_id = endpoint.daemon_peer_id();
+            info.published_addrs = endpoint_bootstrap_addrs(endpoint)
+                .into_iter()
+                .map(|addr| addr.to_bootstrap_addr_string())
+                .collect();
+            info.mdns_enabled = endpoint.mdns_lookup().is_some();
+        }
+        let mut value = serde_json::to_value(info).ok()?;
+        let endpoint_id = value["daemon_peer_id"]
+            .as_str()
+            .map(ToString::to_string)
+            .unwrap_or_default();
+        value["endpoint_id"] = serde_json::json!(endpoint_id);
+        value["endpoint_shared_id"] = serde_json::Value::Null;
+        if let Ok(db) = crate::db::open_connection(&state.db_path) {
+            let _ = crate::db::schema::create_tables(&db);
+            if let Ok(Some(secret_row)) =
+                crate::event_modules::endpoint_secret::load_local_endpoint_secret(&db)
+            {
+                value["endpoint_secret_event_id"] = serde_json::json!(secret_row.event_id);
+            }
+            if let Ok(Some(shared_row)) =
+                crate::event_modules::endpoint_shared::load_local_endpoint_shared(&db)
+            {
+                value["endpoint_shared_id"] = serde_json::json!(shared_row.event_id);
+            }
+        }
+        return Some(value);
+    }
+
+    let addr = (*state.resolved_bind_addr.read().unwrap())?;
+    let mut value = serde_json::json!({
+        "listen_addr": addr.to_string(),
+        "published_addrs": Vec::<String>::new(),
+        "mdns_enabled": false,
+        "endpoint_shared_id": serde_json::Value::Null,
+    });
+    if let Ok(db) = crate::db::open_connection(&state.db_path) {
+        let _ = crate::db::schema::create_tables(&db);
+        if let Ok(Some(secret_row)) =
+            crate::event_modules::endpoint_secret::load_local_endpoint_secret(&db)
+        {
+            value["daemon_peer_id"] = serde_json::json!(secret_row.endpoint_id.clone());
+            value["endpoint_id"] = serde_json::json!(secret_row.endpoint_id);
+            value["endpoint_secret_event_id"] = serde_json::json!(secret_row.event_id);
+        }
+        if let Ok(Some(shared_row)) =
+            crate::event_modules::endpoint_shared::load_local_endpoint_shared(&db)
+        {
+            value["endpoint_shared_id"] = serde_json::json!(shared_row.event_id);
+        }
+    }
+    Some(value)
 }
 
 fn autodetect_bootstrap_addrs(
     state: &DaemonState,
     listen_addr: SocketAddr,
 ) -> Result<Vec<crate::event_modules::workspace::invite_link::BootstrapAddress>, String> {
+    if let Some(endpoint) = state.runtime_endpoint() {
+        let detected = endpoint_bootstrap_addrs(&endpoint);
+        if !detected.is_empty() {
+            return Ok(detected);
+        }
+    }
+
     let detected = if listen_addr.ip().is_unspecified() {
         // Wildcard bind (0.0.0.0 / ::) — enumerate all non-loopback interfaces.
         crate::event_modules::workspace::invite_link::detect_bootstrap_addrs(listen_addr.port())
@@ -443,14 +480,53 @@ fn autodetect_bootstrap_addrs(
         };
         vec![addr]
     };
-    let merged = merge_upnp_bootstrap_addr(detected, state.upnp_result.read().unwrap().as_ref());
-    if merged.is_empty() {
+    if detected.is_empty() {
         return Err(
-            "No non-loopback addresses detected and no active UPnP address available. Provide public_addr explicitly."
-                .to_string(),
+            "No usable endpoint addresses detected. Provide public_addr explicitly.".to_string(),
         );
     }
-    Ok(merged)
+    Ok(detected)
+}
+
+fn daemon_scope_annotations(
+    conn: &rusqlite::Connection,
+    daemon_peer_id: &str,
+) -> Result<(Vec<String>, Vec<String>, Vec<String>), rusqlite::Error> {
+    let daemon_fp = match hex::decode(daemon_peer_id) {
+        Ok(bytes) if bytes.len() == 32 => bytes,
+        _ => return Ok((Vec::new(), Vec::new(), Vec::new())),
+    };
+    let mut stmt = conn.prepare(
+        "SELECT DISTINCT ia.recorded_by, ia.workspace_id, b.peer_id
+         FROM peer_transport_bindings b
+         JOIN invites_accepted ia
+           ON ia.recorded_by = b.recorded_by
+         WHERE b.spki_fingerprint = ?1
+         ORDER BY ia.workspace_id, ia.recorded_by, b.peer_id",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![daemon_fp], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, String>(2)?,
+            ))
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let mut local_tenants = BTreeSet::new();
+    let mut workspace_ids = BTreeSet::new();
+    let mut peer_ids = BTreeSet::new();
+    for (tenant_id, workspace_id, peer_id) in rows {
+        local_tenants.insert(tenant_id);
+        workspace_ids.insert(workspace_id);
+        peer_ids.insert(peer_id);
+    }
+    Ok((
+        local_tenants.into_iter().collect(),
+        workspace_ids.into_iter().collect(),
+        peer_ids.into_iter().collect(),
+    ))
 }
 
 /// Best-effort store of client_op_id → event_id mapping. Failures are logged but don't
@@ -830,53 +906,8 @@ fn dispatch(
                 json["daemon_db_path"] = serde_json::json!(db_path);
                 json["runtime_state"] =
                     serde_json::json!(state.runtime_state.read().unwrap().as_str());
-                if let Some(net_info) = state.runtime_net.read().unwrap().as_ref() {
-                    if let Ok(net_val) = serde_json::to_value(net_info) {
-                        json["runtime"] = net_val;
-                    }
-                }
-                let upnp_enabled = *state.upnp_enabled.read().unwrap();
-                // When the runtime isn't active, synthesize a minimal "runtime"
-                // block from early-bound listen addr and UPnP mode state so that
-                // `topo status` always shows networking info.
-                if json.get("runtime").is_none() {
-                    let resolved_bind = state.resolved_bind_addr.read().unwrap();
-                    let upnp = state.upnp_result.read().unwrap();
-                    if resolved_bind.is_some() || upnp.is_some() || upnp_enabled {
-                        let mut rt = serde_json::Map::new();
-                        if let Some(addr) = *resolved_bind {
-                            rt.insert(
-                                "listen_addr".into(),
-                                serde_json::Value::String(addr.to_string()),
-                            );
-                        }
-                        rt.insert("upnp_enabled".into(), serde_json::Value::Bool(upnp_enabled));
-                        if let Some(ref report) = *upnp {
-                            if let Ok(v) = serde_json::to_value(report) {
-                                rt.insert("upnp".into(), v);
-                            }
-                        }
-                        json["runtime"] = serde_json::Value::Object(rt);
-                    }
-                } else if let Some(rt) = json.get_mut("runtime") {
-                    rt["upnp_enabled"] = serde_json::Value::Bool(upnp_enabled);
-                    // Runtime is active but UPnP might only be in daemon-level state
-                    // (e.g. while a refresh task is still writing the latest report).
-                    // Only inject if the port matches the current listen address.
-                    if rt.get("upnp").is_none() {
-                        if let Some(ref report) = *state.upnp_result.read().unwrap() {
-                            let port_matches = rt["listen_addr"]
-                                .as_str()
-                                .and_then(|a| a.parse::<std::net::SocketAddr>().ok())
-                                .map(|a| a.port() == report.requested_external_port)
-                                .unwrap_or(false);
-                            if port_matches {
-                                if let Ok(v) = serde_json::to_value(report) {
-                                    rt["upnp"] = v;
-                                }
-                            }
-                        }
-                    }
+                if let Some(runtime) = runtime_status_value(state) {
+                    json["runtime"] = runtime;
                 }
                 RpcResponse {
                     version: crate::rpc::protocol::PROTOCOL_VERSION,
@@ -919,6 +950,23 @@ fn dispatch(
                 },
             }
         }
+        RpcMethod::ContentKeys { summary } => with_active_peer_db(
+            state,
+            |_peer_id, recorded_by, db| match workspace::content_keys(db, recorded_by, summary) {
+                Ok(data) => RpcResponse::success(data),
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+        ),
+        RpcMethod::RotateKey => match state.require_active_peer() {
+            Ok(peer_id) => match workspace::commands::rotate_key_for_peer(db_path, &peer_id) {
+                Ok(data) => {
+                    state.notify_runtime_recheck();
+                    RpcResponse::success(data)
+                }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
         RpcMethod::AssertNow { predicate } => {
             // Use active tenant if selected, otherwise fall back to
             // transport-scope resolution so pre-workspace daemons work.
@@ -996,13 +1044,6 @@ fn dispatch(
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }),
-        RpcMethod::ContentKeys { summary } => with_active_peer_db(
-            state,
-            |_peer_id, recorded_by, db| match workspace::content_keys(db, recorded_by, summary) {
-                Ok(data) => RpcResponse::success(data),
-                Err(e) => RpcResponse::error(e.to_string()),
-            },
-        ),
         RpcMethod::Peers => {
             with_active_peer_db(
                 state,
@@ -1022,29 +1063,6 @@ fn dispatch(
             }
             Err(e) => RpcResponse::error(e.to_string()),
         },
-        RpcMethod::IntroAttempts { peer } => {
-            with_active_peer_db(state, |_peer_id, recorded_by, db| {
-                match crate::db::intro::list_intro_attempts(db, recorded_by, peer.as_deref()) {
-                    Ok(rows) => {
-                        let items: Vec<service::IntroAttemptItem> = rows
-                            .into_iter()
-                            .map(|r| service::IntroAttemptItem {
-                                intro_id: hex::encode(&r.intro_id),
-                                other_peer_id: r.other_peer_id,
-                                introduced_by_peer_id: r.introduced_by_peer_id,
-                                origin_ip: r.origin_ip,
-                                origin_port: r.origin_port,
-                                status: r.status,
-                                error: r.error,
-                                created_at: r.created_at,
-                            })
-                            .collect();
-                        RpcResponse::success(items)
-                    }
-                    Err(e) => RpcResponse::error(e.to_string()),
-                }
-            })
-        }
         RpcMethod::CreateInvite {
             public_addr,
             public_spki,
@@ -1121,79 +1139,6 @@ fn dispatch(
                 }
             }
             Err(e) => RpcResponse::error(e),
-        },
-        RpcMethod::RotateKey => match state.require_active_peer() {
-            Ok(peer_id) => match workspace::commands::rotate_key_for_peer(db_path, &peer_id) {
-                Ok(data) => {
-                    state.notify_runtime_recheck();
-                    RpcResponse::success(data)
-                }
-                Err(e) => RpcResponse::error(e.to_string()),
-            },
-            Err(e) => RpcResponse::error(e),
-        },
-        RpcMethod::Upnp { action } => match action {
-            UpnpAction::Disable => {
-                *state.upnp_enabled.write().unwrap() = false;
-                *state.upnp_result.write().unwrap() = None;
-                if let Some(ref mut info) = *state.runtime_net.write().unwrap() {
-                    info.upnp = None;
-                }
-                RpcResponse::success(upnp_response_data(false, None, "disabled"))
-            }
-            UpnpAction::Status => {
-                let enabled = *state.upnp_enabled.read().unwrap();
-                let report = state.upnp_result.read().unwrap().clone();
-                let fallback = if enabled {
-                    "runtime not active yet; mapping will be attempted when runtime starts"
-                } else {
-                    "disabled"
-                };
-                RpcResponse::success(upnp_response_data(enabled, report.as_ref(), fallback))
-            }
-            UpnpAction::Enable => {
-                *state.upnp_enabled.write().unwrap() = true;
-                let listen_addr = match state.runtime_net.read().unwrap().as_ref() {
-                    Some(info) => match info.listen_addr.parse::<std::net::SocketAddr>() {
-                        Ok(addr) => Some(addr),
-                        Err(e) => {
-                            return RpcResponse::error(format!("invalid listen addr: {}", e));
-                        }
-                    },
-                    None => None,
-                };
-                let Some(listen_addr) = listen_addr else {
-                    *state.upnp_result.write().unwrap() = None;
-                    return RpcResponse::success(upnp_response_data(
-                        true,
-                        None,
-                        "runtime not active yet; mapping will be attempted when runtime starts",
-                    ));
-                };
-                let rt = match tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                {
-                    Ok(rt) => rt,
-                    Err(e) => return RpcResponse::error(format!("failed to start runtime: {}", e)),
-                };
-                let report = rt.block_on(crate::peering::nat::upnp::attempt_udp_port_mapping(
-                    listen_addr,
-                    std::time::Duration::from_secs(10),
-                ));
-                *state.upnp_result.write().unwrap() = Some(report.clone());
-                if let Some(ref mut ni) = *state.runtime_net.write().unwrap() {
-                    let runtime_port = ni
-                        .listen_addr
-                        .parse::<std::net::SocketAddr>()
-                        .map(|a| a.port())
-                        .unwrap_or(0);
-                    if runtime_port == listen_addr.port() {
-                        ni.upnp = Some(report.clone());
-                    }
-                }
-                RpcResponse::success(upnp_response_data(true, Some(&report), "enabled"))
-            }
         },
         RpcMethod::CreateDeviceLink {
             public_addr,
@@ -1554,68 +1499,79 @@ fn dispatch(
         },
 
         #[cfg(feature = "discovery")]
-        RpcMethod::Discover { timeout_ms } => match state.require_active_peer() {
-            Ok(peer_id) => {
-                use crate::peering::discovery::{local_non_loopback_ipv4, TenantDiscovery};
-                let advertise_ip = match local_non_loopback_ipv4() {
-                    Some(ip) => ip,
-                    None => return RpcResponse::error("no routable IP for mDNS"),
-                };
-                let local_ids: std::collections::HashSet<String> =
-                    [peer_id.clone()].into_iter().collect();
-                match TenantDiscovery::new(&peer_id, 1, local_ids, &advertise_ip) {
-                    Ok(disc) => match disc.browse() {
-                        Ok(rx) => {
-                            let deadline = std::time::Instant::now()
-                                + std::time::Duration::from_millis(timeout_ms);
-                            let mut results = Vec::new();
-                            let mut seen = std::collections::HashSet::new();
-                            while std::time::Instant::now() < deadline {
-                                match rx.recv_timeout(std::time::Duration::from_millis(200)) {
-                                    Ok(peer) => {
-                                        if seen.insert(peer.peer_id.clone()) {
-                                            results.push(serde_json::json!({
-                                                "peer_id": peer.peer_id,
-                                                "addr": peer.addr.ip().to_string(),
-                                                "port": peer.addr.port(),
-                                            }));
-                                        }
-                                    }
-                                    Err(std::sync::mpsc::RecvTimeoutError::Timeout) => continue,
-                                    Err(_) => break,
+        RpcMethod::Discover { timeout_ms } => {
+            let Some(endpoint) = state.runtime_endpoint() else {
+                return RpcResponse::error("runtime not active — no live iroh endpoint");
+            };
+            let Some(mdns) = endpoint.mdns_lookup() else {
+                return RpcResponse::error("mDNS discovery is disabled for this daemon");
+            };
+            let db = match crate::db::open_connection(db_path) {
+                Ok(db) => db,
+                Err(e) => return RpcResponse::error(e.to_string()),
+            };
+            if let Err(e) = crate::db::schema::create_tables(&db) {
+                return RpcResponse::error(e.to_string());
+            }
+
+            let rt = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(rt) => rt,
+                Err(e) => return RpcResponse::error(format!("failed to start runtime: {}", e)),
+            };
+
+            use tokio_stream::StreamExt;
+            let local_daemon_peer_id = endpoint.daemon_peer_id();
+            let result = rt.block_on(async move {
+                let mut events = mdns.subscribe().await;
+                let deadline =
+                    tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms);
+                let mut discovered = std::collections::BTreeMap::new();
+                loop {
+                    tokio::select! {
+                        _ = tokio::time::sleep_until(deadline) => break,
+                        event = events.next() => match event {
+                            Some(iroh::address_lookup::DiscoveryEvent::Discovered { endpoint_info, .. }) => {
+                                let daemon_peer_id = hex::encode(endpoint_info.endpoint_id.as_bytes());
+                                if daemon_peer_id != local_daemon_peer_id {
+                                    discovered.insert(daemon_peer_id, endpoint_info);
                                 }
                             }
-                            RpcResponse::success(results)
+                            Some(iroh::address_lookup::DiscoveryEvent::Expired { endpoint_id }) => {
+                                discovered.remove(&hex::encode(endpoint_id.as_bytes()));
+                            }
+                            None => break,
                         }
-                        Err(e) => RpcResponse::error(format!("mDNS browse failed: {}", e)),
-                    },
-                    Err(e) => RpcResponse::error(format!("mDNS init failed: {}", e)),
+                    }
                 }
-            }
-            Err(e) => RpcResponse::error(e),
-        },
+                discovered
+            });
 
-        RpcMethod::Intro {
-            peer_a,
-            peer_b,
-            ttl_ms,
-            attempt_window_ms,
-        } => match tokio::runtime::Handle::try_current() {
-            Ok(handle) => {
-                match handle.block_on(service::svc_intro(
-                    db_path,
-                    &peer_a,
-                    &peer_b,
-                    ttl_ms,
-                    attempt_window_ms,
-                )) {
-                    Ok(true) => RpcResponse::success(serde_json::json!({"sent_to_both": true})),
-                    Ok(false) => RpcResponse::error("partial send"),
-                    Err(e) => RpcResponse::error(e.to_string()),
-                }
+            let mut results = Vec::new();
+            for (daemon_peer_id, endpoint_info) in result {
+                let addrs: Vec<String> =
+                    endpoint_info.ip_addrs().map(ToString::to_string).collect();
+                let primary = endpoint_info.ip_addrs().next().copied();
+                let (local_tenant_ids, shared_workspace_ids, known_peer_ids) =
+                    match daemon_scope_annotations(&db, &daemon_peer_id) {
+                        Ok(scopes) => scopes,
+                        Err(e) => return RpcResponse::error(e.to_string()),
+                    };
+                results.push(serde_json::json!({
+                    "peer_id": daemon_peer_id,
+                    "daemon_peer_id": daemon_peer_id,
+                    "addr": primary.map(|addr| addr.ip().to_string()).unwrap_or_default(),
+                    "port": primary.map(|addr| addr.port()).unwrap_or_default(),
+                    "addrs": addrs,
+                    "local_tenant_ids": local_tenant_ids,
+                    "shared_workspace_ids": shared_workspace_ids,
+                    "known_peer_ids": known_peer_ids,
+                }));
             }
-            Err(_) => RpcResponse::error("no tokio runtime available for async intro"),
-        },
+            RpcResponse::success(results)
+        }
 
         RpcMethod::EventList => match crate::db::open_connection(db_path) {
             Ok(db) => {
@@ -1857,96 +1813,4 @@ pub fn dispatch_rpc_method(state: &DaemonState, method: RpcMethod) -> RpcRespons
     let shutdown = std::sync::atomic::AtomicBool::new(false);
     let shutdown_notify = tokio::sync::Notify::new();
     dispatch(state, method, &shutdown, &shutdown_notify)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::{merge_upnp_bootstrap_addr, resolve_bootstrap_from_upnp};
-    use crate::event_modules::workspace::invite_link::parse_bootstrap_address;
-    use crate::peering::nat::upnp::{UpnpMappingReport, UpnpMappingStatus};
-
-    fn mk_report(
-        status: UpnpMappingStatus,
-        external_ip: Option<&str>,
-        mapped_external_port: Option<u16>,
-        error: Option<&str>,
-    ) -> UpnpMappingReport {
-        UpnpMappingReport {
-            status,
-            protocol: "udp".to_string(),
-            local_addr: "192.168.1.20:4433".to_string(),
-            requested_external_port: 4433,
-            mapped_external_port,
-            external_ip: external_ip.map(|s| s.to_string()),
-            gateway: Some("192.168.1.1:1900".to_string()),
-            error: error.map(|s| s.to_string()),
-            double_nat: false,
-        }
-    }
-
-    #[test]
-    fn bootstrap_resolution_rejects_non_success_status() {
-        let report = mk_report(
-            UpnpMappingStatus::NotAttempted,
-            None,
-            None,
-            Some("listen address is loopback"),
-        );
-        let err = resolve_bootstrap_from_upnp(&report).unwrap_err();
-        assert!(err.contains("UPnP status is not_attempted"));
-    }
-
-    #[test]
-    fn bootstrap_resolution_formats_ipv6_with_brackets() {
-        let report = mk_report(
-            UpnpMappingStatus::Success,
-            Some("2001:4860:4860::8888"),
-            Some(4433),
-            None,
-        );
-        let addr = resolve_bootstrap_from_upnp(&report).unwrap();
-        assert_eq!(addr, "[2001:4860:4860::8888]:4433");
-    }
-
-    #[test]
-    fn bootstrap_resolution_rejects_non_public_ip() {
-        let report = mk_report(
-            UpnpMappingStatus::Success,
-            Some("10.0.0.8"),
-            Some(4433),
-            None,
-        );
-        let err = resolve_bootstrap_from_upnp(&report).unwrap_err();
-        assert!(err.contains("not publicly routable"));
-    }
-
-    #[test]
-    fn upnp_bootstrap_addr_is_appended_to_detected_addrs() {
-        let report = mk_report(
-            UpnpMappingStatus::Success,
-            Some("8.8.4.4"),
-            Some(55000),
-            None,
-        );
-        let detected = vec![parse_bootstrap_address("192.168.1.20:4433").unwrap()];
-        let merged = merge_upnp_bootstrap_addr(detected, Some(&report));
-        let addr_strings: Vec<String> = merged
-            .into_iter()
-            .map(|addr| addr.to_bootstrap_addr_string())
-            .collect();
-        assert_eq!(addr_strings, vec!["192.168.1.20", "8.8.4.4:55000"]);
-    }
-
-    #[test]
-    fn upnp_bootstrap_addr_is_deduplicated_against_detected_addrs() {
-        let report = mk_report(
-            UpnpMappingStatus::Success,
-            Some("8.8.4.4"),
-            Some(55000),
-            None,
-        );
-        let detected = vec![parse_bootstrap_address("8.8.4.4:55000").unwrap()];
-        let merged = merge_upnp_bootstrap_addr(detected, Some(&report));
-        assert_eq!(merged.len(), 1, "UPnP address should not be duplicated");
-    }
 }

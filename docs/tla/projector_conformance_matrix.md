@@ -48,6 +48,14 @@ both `pass` and `break` polarity unless waived.
 | SPEC_PENDING_TRUST_01 | InvPendingBootstrapTrustSource | CHK_UI_PENDING_BOOTSTRAP_SRC | projector_unit | user_invite_projector_tests::tests::test_user_invite_no_pending_when_not_local | break |
 | SPEC_PENDING_TRUST_02 | InvPendingBootstrapTrustSource | CHK_DI_PENDING_BOOTSTRAP_SRC | projector_unit | device_invite_projector_tests::tests::test_device_invite_writes_pending_trust | pass |
 | SPEC_PENDING_TRUST_02 | InvPendingBootstrapTrustSource | CHK_DI_PENDING_BOOTSTRAP_SRC | projector_unit | device_invite_projector_tests::tests::test_device_invite_no_pending_when_not_local | break |
+| SPEC_ENDPOINT_SECRET_01 | NON_MODELED::local_endpoint_root | CHK_ES_INSERT | pipeline_integration | apply::tests::identity::test_endpoint_secret_projects_under_endpoint_scope | waiver:local_root_only |
+| SPEC_ENDPOINT_SECRET_02 | NON_MODELED::endpoint_scope_match | CHK_ES_SCOPE_MATCH | pipeline_integration | apply::tests::identity::test_endpoint_secret_rejects_mismatched_scope | waiver:scope_guard_only |
+| SPEC_ENDPOINT_SHARED_01 | NON_MODELED::shared_endpoint_projection | CHK_EPS_INSERT | pipeline_integration | apply::tests::identity::test_endpoint_shared_projects_under_endpoint_scope | pass |
+| SPEC_ENDPOINT_SHARED_01 | NON_MODELED::shared_endpoint_projection | CHK_EPS_INSERT | pipeline_integration | apply::tests::identity::test_endpoint_shared_rejects_invalid_signature | break |
+| SPEC_ENDPOINT_SHARED_02 | NON_MODELED::endpoint_shared_scope_match | CHK_EPS_SCOPE_MATCH | pipeline_integration | apply::tests::identity::test_endpoint_shared_projects_under_endpoint_scope | pass |
+| SPEC_ENDPOINT_SHARED_02 | NON_MODELED::endpoint_shared_scope_match | CHK_EPS_SCOPE_MATCH | pipeline_integration | apply::tests::identity::test_endpoint_shared_rejects_mismatched_scope | break |
+| SPEC_ENDPOINT_SHARED_03 | NON_MODELED::endpoint_shared_self_auth | CHK_EPS_SELF_SIG | pipeline_integration | apply::tests::identity::test_endpoint_shared_projects_under_endpoint_scope | pass |
+| SPEC_ENDPOINT_SHARED_03 | NON_MODELED::endpoint_shared_self_auth | CHK_EPS_SELF_SIG | pipeline_integration | apply::tests::identity::test_endpoint_shared_rejects_invalid_signature | break |
 | SPEC_PENDING_INVITER_01 | InvPendingTrustOnlyOnInviter | CHK_UI_PENDING_TRUST | projector_unit | user_invite_projector_tests::tests::test_user_invite_no_pending_when_not_local | break |
 | SPEC_PENDING_INVITER_01 | InvPendingTrustOnlyOnInviter | CHK_UI_PENDING_TRUST | projector_unit | user_invite_projector_tests::tests::test_user_invite_writes_pending_trust | pass |
 | SPEC_PENDING_INVITER_02 | InvPendingTrustOnlyOnInviter | CHK_DI_PENDING_TRUST | projector_unit | device_invite_projector_tests::tests::test_device_invite_no_pending_when_not_local | break |
@@ -279,12 +287,12 @@ both `pass` and `break` polarity unless waived.
 
 | spec_id | source | check_id | layer | test_id | polarity |
 |---------|--------|----------|-------|---------|----------|
-| SPEC_ETT_INBOUND_01 | InvInboundAdmittedAuthorized | CHK_ETT_INBOUND_EXACT_TARGET | runtime_unit | runtime::transport::session_auth::tests::open_session_auth_peer_shared_accepts_authorized_target_tenant | pass |
-| SPEC_ETT_INBOUND_01 | InvInboundAdmittedAuthorized | CHK_ETT_INBOUND_EXACT_TARGET | runtime_unit | runtime::transport::session_auth::tests::open_session_auth_peer_shared_rejects_when_only_other_tenant_authorizes_remote_peer | break |
-| SPEC_ETT_CROSS_TENANT_01 | InvNoCrossTenantFallback | CHK_ETT_NO_CROSS_TENANT_FALLBACK | runtime_unit | runtime::transport::session_auth::tests::open_session_auth_peer_shared_accepts_authorized_target_tenant | pass |
-| SPEC_ETT_CROSS_TENANT_01 | InvNoCrossTenantFallback | CHK_ETT_NO_CROSS_TENANT_FALLBACK | runtime_unit | runtime::transport::session_auth::tests::open_session_auth_peer_shared_rejects_when_only_other_tenant_authorizes_remote_peer | break |
-| SPEC_ETT_OUTBOUND_01 | InvOutboundConnectedAuthorized | CHK_ETT_OUTBOUND_EXACT_REMOTE | runtime_unit | runtime::transport::tests::test_server_verifier_requires_exact_transport_target_sni | pass |
-| SPEC_ETT_OUTBOUND_01 | InvOutboundConnectedAuthorized | CHK_ETT_OUTBOUND_EXACT_REMOTE | runtime_unit | runtime::transport::tests::test_server_verifier_rejects_mismatched_exact_transport_target | break |
+| SPEC_ETT_INBOUND_01 | InvInboundAdmittedAuthorized | CHK_ETT_INBOUND_EXACT_TARGET | runtime_unit | runtime::transport::session_auth::tests::open_session_route_accepts_known_daemon_binding_without_local_signer | pass |
+| SPEC_ETT_INBOUND_01 | InvInboundAdmittedAuthorized | CHK_ETT_INBOUND_EXACT_TARGET | runtime_unit | runtime::transport::session_auth::tests::open_session_route_rejects_when_only_other_tenant_authorizes_remote_peer | break |
+| SPEC_ETT_CROSS_TENANT_01 | InvNoCrossTenantFallback | CHK_ETT_NO_CROSS_TENANT_FALLBACK | runtime_unit | runtime::transport::session_auth::tests::open_session_route_accepts_known_daemon_binding_without_local_signer | pass |
+| SPEC_ETT_CROSS_TENANT_01 | InvNoCrossTenantFallback | CHK_ETT_NO_CROSS_TENANT_FALLBACK | runtime_unit | runtime::transport::session_auth::tests::open_session_route_rejects_when_only_other_tenant_authorizes_remote_peer | break |
+| SPEC_ETT_OUTBOUND_01 | InvOutboundConnectedAuthorized | CHK_ETT_OUTBOUND_EXACT_REMOTE | runtime_unit | connection_lifecycle::tests::dial_and_accept_extract_expected_peer_ids | pass |
+| SPEC_ETT_OUTBOUND_01 | InvOutboundConnectedAuthorized | CHK_ETT_OUTBOUND_EXACT_REMOTE | runtime_unit | connection_lifecycle::tests::dial_daemon_rejects_invalid_remote_daemon_id | break |
 
 ## UnifiedBridge Invariants
 
@@ -299,15 +307,15 @@ both `pass` and `break` polarity unless waived.
 | SPEC_BR_ALLOWED_AUTH_01 | BrInv_AllowedPeerMatchesAuthDecision | CHK_BRIDGE_ALLOWED_PEER_AUTH | bridge_integration | tlc::UnifiedBridge::unified_bridge_fix_repro.cfg | pass |
 | SPEC_BR_ALLOWED_AUTH_01 | BrInv_AllowedPeerMatchesAuthDecision | CHK_BRIDGE_ALLOWED_PEER_AUTH | runtime_unit | state::db::transport_trust::tests::test_is_authorized_for_tenant_checks_all_sources | pass |
 | SPEC_BR_ALLOWED_AUTH_01 | BrInv_AllowedPeerMatchesAuthDecision | CHK_BRIDGE_ALLOWED_PEER_AUTH | runtime_unit | state::db::transport_trust::tests::test_is_authorized_for_tenant_checks_all_sources | break |
-| SPEC_BR_ONGOING_PREF_01 | BrInv_OngoingPreferred | CHK_BRIDGE_ONGOING_PREFERENCE | runtime_unit | bootstrap_dial_context::tests::primary_success_is_ongoing_mode | pass |
-| SPEC_BR_ONGOING_PREF_01 | BrInv_OngoingPreferred | CHK_BRIDGE_ONGOING_PREFERENCE | runtime_unit | bootstrap_dial_context::tests::trust_rejection_with_fallback_uses_bootstrap_mode | break |
-| SPEC_BR_FALLBACK_01 | BrInv_BootstrapFallbackOnlyWhenNeeded | CHK_BRIDGE_BOOTSTRAP_FALLBACK | runtime_unit | bootstrap_dial_context::tests::trust_rejection_with_fallback_uses_bootstrap_mode | pass |
-| SPEC_BR_FALLBACK_01 | BrInv_BootstrapFallbackOnlyWhenNeeded | CHK_BRIDGE_BOOTSTRAP_FALLBACK | runtime_unit | bootstrap_dial_context::tests::non_trust_errors_do_not_use_fallback | break |
-| SPEC_BR_CTX_DET_01 | BrInv_BootstrapContextDeterministic | CHK_BRIDGE_BOOTSTRAP_CTX_DETERMINISM | runtime_unit | bootstrap_dial_context::tests::decision_is_deterministic_for_same_inputs | pass |
-| SPEC_BR_CTX_DET_01 | BrInv_BootstrapContextDeterministic | CHK_BRIDGE_BOOTSTRAP_CTX_DETERMINISM | runtime_unit | bootstrap_dial_context::tests::non_trust_errors_do_not_use_fallback | break |
+| SPEC_BR_ONGOING_PREF_01 | BrInv_OngoingPreferred | CHK_BRIDGE_ONGOING_PREFERENCE | runtime_unit | target_dispatch::tests::known_peer_targets_follow_preferred_side_gate | pass |
+| SPEC_BR_ONGOING_PREF_01 | BrInv_OngoingPreferred | CHK_BRIDGE_ONGOING_PREFERENCE | runtime_unit | target_dispatch::tests::known_peer_targets_follow_preferred_side_gate | break |
+| SPEC_BR_FALLBACK_01 | BrInv_BootstrapFallbackOnlyWhenNeeded | CHK_BRIDGE_BOOTSTRAP_FALLBACK | runtime_unit | bootstrap_auth::tests::known_peer_uses_bootstrap_fallback_when_available | pass |
+| SPEC_BR_FALLBACK_01 | BrInv_BootstrapFallbackOnlyWhenNeeded | CHK_BRIDGE_BOOTSTRAP_FALLBACK | runtime_unit | bootstrap_auth::tests::known_peer_without_bootstrap_fallback_keeps_preferred_side_gate | break |
+| SPEC_BR_CTX_DET_01 | BrInv_BootstrapContextDeterministic | CHK_BRIDGE_BOOTSTRAP_CTX_DETERMINISM | runtime_unit | bootstrap_auth::tests::bootstrap_session_fallback_is_deterministic_for_single_row | pass |
+| SPEC_BR_CTX_DET_01 | BrInv_BootstrapContextDeterministic | CHK_BRIDGE_BOOTSTRAP_CTX_DETERMINISM | runtime_unit | bootstrap_auth::tests::bootstrap_session_fallback_returns_none_when_ambiguous | break |
 | SPEC_BR_SEC_CONN_01 | BrSec_ConnectionRequiresAuthorization | CHK_BRIDGE_SEC_CONN_AUTHZ | bridge_integration | tlc::UnifiedBridge::unified_bridge_fix_repro.cfg | pass |
-| SPEC_BR_SEC_CONN_01 | BrSec_ConnectionRequiresAuthorization | CHK_BRIDGE_SEC_CONN_AUTHZ | runtime_unit | runtime::transport::peering_boundary::tests::trust_resolution_uses_sql_state | pass |
-| SPEC_BR_SEC_CONN_01 | BrSec_ConnectionRequiresAuthorization | CHK_BRIDGE_SEC_CONN_AUTHZ | runtime_unit | runtime::transport::peering_boundary::tests::trust_resolution_uses_sql_state | break |
+| SPEC_BR_SEC_CONN_01 | BrSec_ConnectionRequiresAuthorization | CHK_BRIDGE_SEC_CONN_AUTHZ | runtime_unit | runtime::transport::session_auth::tests::invite_bootstrap_auth_accepts_accepted_bootstrap_trust_without_pending_row | pass |
+| SPEC_BR_SEC_CONN_01 | BrSec_ConnectionRequiresAuthorization | CHK_BRIDGE_SEC_CONN_AUTHZ | runtime_unit | runtime::transport::session_auth::tests::invite_bootstrap_auth_rejects_when_bootstrap_trust_targets_other_daemon | break |
 | SPEC_BR_SEC_PROV_01 | BrSec_NoTrustWithoutProvenance | CHK_BRIDGE_SEC_TRUST_PROVENANCE | bridge_integration | tlc::UnifiedBridge::unified_bridge_fix_repro.cfg | pass |
 | SPEC_BR_SEC_PROV_01 | BrSec_NoTrustWithoutProvenance | CHK_BRIDGE_SEC_TRUST_PROVENANCE | runtime_unit | state::db::transport_trust::tests::test_invite_bootstrap_trust_in_authorized_fingerprints | pass |
 | SPEC_BR_SEC_PROV_01 | BrSec_NoTrustWithoutProvenance | CHK_BRIDGE_SEC_TRUST_PROVENANCE | runtime_unit | state::db::transport_trust::tests::test_binding_alone_not_in_authorized_fingerprints | break |
@@ -325,6 +333,13 @@ both `pass` and `break` polarity unless waived.
 | SPEC_BR_LIVE_UPGRADE_01 | BrLive_PeerUpgradeEventually | CHK_BRIDGE_UPGRADE_PROGRESS | tla_liveness | — | waiver:liveness_counterexamples_tracked_in_bug_cfg |
 | SPEC_BR_LIVE_SYNC_01 | BrLive_BootstrapCompletionSyncEventually | CHK_BRIDGE_SYNC_COMPLETION_PROGRESS | tla_liveness | tlc::UnifiedBridge::unified_bridge_progress_fast.cfg | pass |
 | SPEC_BR_LIVE_SYNC_01 | BrLive_BootstrapCompletionSyncEventually | CHK_BRIDGE_SYNC_COMPLETION_PROGRESS | tla_liveness | — | waiver:liveness_counterexamples_tracked_in_bug_cfg |
+
+## EndpointBootstrapRoute Invariants
+
+| spec_id | source | check_id | layer | test_id | polarity |
+|---------|--------|----------|-------|---------|----------|
+| SPEC_EP_BOOTSTRAP_SCOPE_01 | InvBootstrapAdmissionProofScoped | CHK_ENDPOINT_BOOTSTRAP_PROOF_SCOPE | runtime_unit | runtime::transport::session_auth::tests::invite_bootstrap_auth_accepts_accepted_bootstrap_trust_without_pending_row | pass |
+| SPEC_EP_BOOTSTRAP_SCOPE_01 | InvBootstrapAdmissionProofScoped | CHK_ENDPOINT_BOOTSTRAP_PROOF_SCOPE | runtime_unit | runtime::transport::session_auth::tests::invite_bootstrap_auth_rejects_when_bootstrap_trust_targets_other_daemon | break |
 
 ## Replay/Order Conformance
 

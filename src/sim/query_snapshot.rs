@@ -199,7 +199,9 @@ pub fn import_peer_state(
     for (_, transport_peer_id, invite_event_id, remote) in
         load_bootstrap_targets(source_db_path, &[recorded_by.to_string()])?
     {
-        let remote = remote.to_string();
+        let remote = remote
+            .map(|remote| remote.to_string())
+            .unwrap_or_else(|| "lookup".to_string());
         if seen_connect_targets.insert((
             "bootstrap".to_string(),
             transport_peer_id.clone(),

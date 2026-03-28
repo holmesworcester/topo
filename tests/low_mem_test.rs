@@ -208,7 +208,12 @@ fn run_lowmem_delta_budget_case(
     let delta_timeout = timeout_for_events(baseline_events + delta_events, 300);
     wait_for_message_count(&alice_db, expected_total, delta_timeout);
     wait_for_message_count(&bob_db, expected_total, delta_timeout);
-    wait_for_message_count_since(&alice_db, week_cutoff_ms, expected_alice_recent, delta_timeout);
+    wait_for_message_count_since(
+        &alice_db,
+        week_cutoff_ms,
+        expected_alice_recent,
+        delta_timeout,
+    );
     wait_for_message_count_since(&bob_db, week_cutoff_ms, expected_recent, delta_timeout);
 
     let bob_peak = peak_rss_mib_for_pid(bob_pid).expect("bob daemon VmHWM unavailable");

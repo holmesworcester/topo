@@ -281,6 +281,8 @@ pub struct PeerItem {
     pub user_event_id: String,
     /// True if this peer has local transport credentials (i.e. is a local tenant).
     pub local: bool,
+    /// Most recently bound remote endpoint id, if any.
+    pub endpoint_id: Option<String>,
     /// Most recently observed endpoint address, if any.
     pub endpoint: Option<String>,
 }
@@ -305,6 +307,7 @@ pub fn list_peers(db: &Connection, recorded_by: &str) -> Result<Vec<PeerItem>, r
                 SELECT 1 FROM local_transport_creds c
                 WHERE c.peer_id = lower(hex(ps.transport_fingerprint))
             ) AS is_local,
+            ps.endpoint_id AS endpoint_id,
             (
                 SELECT e.origin_ip || ':' || e.origin_port
                 FROM peer_endpoint_observations e
@@ -329,7 +332,8 @@ pub fn list_peers(db: &Connection, recorded_by: &str) -> Result<Vec<PeerItem>, r
                 username: row.get(2)?,
                 user_event_id: row.get(3)?,
                 local: row.get(4)?,
-                endpoint: row.get(5)?,
+                endpoint_id: row.get(5)?,
+                endpoint: row.get(6)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -506,6 +510,38 @@ mod tests {
         let peers = list_peers(&conn, recorded_by).unwrap();
         assert_eq!(peers.len(), 1);
         assert_eq!(peers[0].endpoint.as_deref(), Some("10.0.0.5:4433"));
+    }
+
+    #[test]
+    fn list_peers_includes_remote_endpoint_id_binding() {
+        let conn = open_in_memory().expect("open in-memory db");
+        create_tables(&conn).expect("create tables");
+
+        let recorded_by = "tenant-a";
+        let remote_tf: [u8; 32] = [0x55; 32];
+        let remote_tf_hex = hex::encode(remote_tf);
+        let remote_endpoint: [u8; 32] = [0x66; 32];
+
+        conn.execute(
+            "INSERT INTO peers_shared (recorded_by, event_id, public_key, transport_fingerprint, device_name)
+             VALUES (?1, 'peer-z', X'5555555555555555555555555555555555555555555555555555555555555555', ?2, 'device-z')",
+            rusqlite::params![recorded_by, remote_tf.as_slice()],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO peer_transport_bindings (recorded_by, peer_id, spki_fingerprint, bound_at)
+             VALUES (?1, ?2, ?3, 12345)",
+            rusqlite::params![recorded_by, remote_tf_hex, remote_endpoint.as_slice()],
+        )
+        .unwrap();
+
+        let peers = list_peers(&conn, recorded_by).unwrap();
+        assert_eq!(peers.len(), 1);
+        let expected_endpoint_id = hex::encode(remote_endpoint);
+        assert_eq!(
+            peers[0].endpoint_id.as_deref(),
+            Some(expected_endpoint_id.as_str())
+        );
     }
 
     #[test]

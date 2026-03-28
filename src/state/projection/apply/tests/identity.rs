@@ -1,4 +1,334 @@
 use super::*;
+use rusqlite::OptionalExtension;
+
+#[test]
+fn test_endpoint_secret_projects_under_endpoint_scope() {
+    let conn = setup();
+    let private_key_bytes = [0x11u8; 32];
+    let endpoint_id = crate::event_modules::endpoint_secret::endpoint_id_from_private_key_bytes(
+        &private_key_bytes,
+    );
+    let event = crate::event_modules::endpoint_secret::deterministic_endpoint_secret_event(
+        private_key_bytes,
+    );
+    let event_id = create_event_synchronous(&conn, &endpoint_id, &event).unwrap();
+
+    let stored: (String, String) = conn
+        .query_row(
+            "SELECT endpoint_id, event_id FROM endpoint_secrets LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored.0, endpoint_id);
+    assert_eq!(stored.1, event_id_to_base64(&event_id));
+}
+
+#[test]
+fn test_endpoint_secret_rejects_mismatched_scope() {
+    let conn = setup();
+    let private_key_bytes = [0x22u8; 32];
+    let event = crate::event_modules::endpoint_secret::deterministic_endpoint_secret_event(
+        private_key_bytes,
+    );
+    let blob = events::encode_event(&event).unwrap();
+    let event_id = insert_event_raw(&conn, "wrong-endpoint-scope", &blob);
+
+    let result = project_one(&conn, "wrong-endpoint-scope", &event_id).unwrap();
+    match result {
+        ProjectionDecision::Reject { reason } => {
+            assert!(
+                reason.contains("endpoint_secret recorded_by must equal endpoint_id"),
+                "reason: {}",
+                reason
+            );
+        }
+        other => panic!("expected Reject, got {:?}", other),
+    }
+
+    let event_id_b64 = event_id_to_base64(&event_id);
+    let rej_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params!["wrong-endpoint-scope", &event_id_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rej_count, 1, "rejected_events row must be recorded");
+}
+
+#[test]
+fn test_endpoint_shared_projects_under_endpoint_scope() {
+    let conn = setup();
+    let private_key_bytes = [0x33u8; 32];
+    let endpoint_id = crate::event_modules::endpoint_secret::endpoint_id_from_private_key_bytes(
+        &private_key_bytes,
+    );
+    let event = crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event(
+        private_key_bytes,
+    );
+    let event_id = create_event_synchronous(&conn, &endpoint_id, &event).unwrap();
+
+    let stored: (String, String) = conn
+        .query_row(
+            "SELECT endpoint_id, event_id FROM endpoints_shared LIMIT 1",
+            [],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(stored.0, endpoint_id);
+    assert_eq!(stored.1, event_id_to_base64(&event_id));
+}
+
+#[test]
+fn test_endpoint_shared_rejects_mismatched_scope() {
+    let conn = setup();
+    let event =
+        crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event([0x44u8; 32]);
+    let blob = events::encode_event(&event).unwrap();
+    let event_id = insert_event_raw(&conn, "wrong-endpoint-scope", &blob);
+
+    let result = project_one(&conn, "wrong-endpoint-scope", &event_id).unwrap();
+    match result {
+        ProjectionDecision::Reject { reason } => {
+            assert!(
+                reason.contains("endpoint_shared recorded_by must equal endpoint_id"),
+                "reason: {}",
+                reason
+            );
+        }
+        other => panic!("expected Reject, got {:?}", other),
+    }
+
+    let event_id_b64 = event_id_to_base64(&event_id);
+    let rej_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params!["wrong-endpoint-scope", &event_id_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rej_count, 1, "rejected_events row must be recorded");
+}
+
+#[test]
+fn test_endpoint_shared_rejects_invalid_signature() {
+    let conn = setup();
+    let private_key_bytes = [0x55u8; 32];
+    let endpoint_id = crate::event_modules::endpoint_secret::endpoint_id_from_private_key_bytes(
+        &private_key_bytes,
+    );
+    let mut blob = events::encode_event(
+        &crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event(
+            private_key_bytes,
+        ),
+    )
+    .unwrap();
+    let last = blob.len() - 1;
+    blob[last] ^= 0x01;
+    let event_id = insert_event_raw(&conn, &endpoint_id, &blob);
+
+    let result = project_one(&conn, &endpoint_id, &event_id).unwrap();
+    match result {
+        ProjectionDecision::Reject { reason } => {
+            assert!(
+                reason.contains("endpoint_shared self-signature verification failed"),
+                "reason: {}",
+                reason
+            );
+        }
+        other => panic!("expected Reject, got {:?}", other),
+    }
+
+    let event_id_b64 = event_id_to_base64(&event_id);
+    let rej_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&endpoint_id, &event_id_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rej_count, 1, "rejected_events row must be recorded");
+}
+
+#[test]
+fn test_peer_shared_blocks_when_endpoint_shared_missing() {
+    let conn = setup();
+    let recorded_by = "peer1";
+    let mut rng = rand::thread_rng();
+
+    let (workspace_eid, workspace_key) = setup_workspace_anchor(&conn, recorded_by);
+    let (invite_eid, invite_key) =
+        create_bootstrap_user_invite(&conn, recorded_by, workspace_eid, &workspace_key);
+    let (user_eid, user_key) =
+        project_valid_user_from_invite(&conn, recorded_by, invite_eid, &invite_key, "alice");
+    let (device_invite_eid, device_invite_key) =
+        project_valid_bootstrap_device_invite(&conn, recorded_by, user_eid, &user_key);
+
+    let endpoint_key = SigningKey::generate(&mut rng);
+    let endpoint_event = crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event(
+        endpoint_key.to_bytes(),
+    );
+    let endpoint_eid = crate::crypto::hash_event(&events::encode_event(&endpoint_event).unwrap());
+
+    let peer_shared = ParsedEvent::PeerShared(crate::event_modules::PeerSharedEvent {
+        created_at_ms: now_ms(),
+        public_key: SigningKey::generate(&mut rng).verifying_key().to_bytes(),
+        user_event_id: user_eid,
+        endpoint_shared_event_id: endpoint_eid,
+        device_name: "device".to_string(),
+        signed_by: device_invite_eid,
+        signer_type: 3,
+        signature: [0u8; 64],
+    });
+    let mut peer_shared_blob = events::encode_event(&peer_shared).unwrap();
+    sign_blob(&device_invite_key, &mut peer_shared_blob);
+    let peer_shared_eid = insert_event_raw(&conn, recorded_by, &peer_shared_blob);
+
+    match project_one(&conn, recorded_by, &peer_shared_eid).unwrap() {
+        ProjectionDecision::Block { missing } => {
+            assert!(
+                missing.contains(&endpoint_eid),
+                "missing deps should include endpoint_shared"
+            );
+        }
+        other => panic!("expected Block, got {:?}", other),
+    }
+}
+
+#[test]
+fn test_peer_shared_unblocks_after_endpoint_shared_projects() {
+    let conn = setup();
+    let recorded_by = "peer1";
+    let mut rng = rand::thread_rng();
+
+    let (workspace_eid, workspace_key) = setup_workspace_anchor(&conn, recorded_by);
+    let (invite_eid, invite_key) =
+        create_bootstrap_user_invite(&conn, recorded_by, workspace_eid, &workspace_key);
+    let (user_eid, user_key) =
+        project_valid_user_from_invite(&conn, recorded_by, invite_eid, &invite_key, "alice");
+    let (device_invite_eid, device_invite_key) =
+        project_valid_bootstrap_device_invite(&conn, recorded_by, user_eid, &user_key);
+
+    let endpoint_key = SigningKey::generate(&mut rng);
+    let endpoint_event = crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event(
+        endpoint_key.to_bytes(),
+    );
+    let endpoint_blob = events::encode_event(&endpoint_event).unwrap();
+    let endpoint_eid = crate::crypto::hash_event(&endpoint_blob);
+    let endpoint_id = hex::encode(endpoint_key.verifying_key().to_bytes());
+
+    let peer_shared = ParsedEvent::PeerShared(crate::event_modules::PeerSharedEvent {
+        created_at_ms: now_ms(),
+        public_key: SigningKey::generate(&mut rng).verifying_key().to_bytes(),
+        user_event_id: user_eid,
+        endpoint_shared_event_id: endpoint_eid,
+        device_name: "device".to_string(),
+        signed_by: device_invite_eid,
+        signer_type: 3,
+        signature: [0u8; 64],
+    });
+    let mut peer_shared_blob = events::encode_event(&peer_shared).unwrap();
+    sign_blob(&device_invite_key, &mut peer_shared_blob);
+    let peer_shared_eid = insert_event_raw(&conn, recorded_by, &peer_shared_blob);
+
+    assert!(matches!(
+        project_one(&conn, recorded_by, &peer_shared_eid).unwrap(),
+        ProjectionDecision::Block { .. }
+    ));
+
+    insert_event_raw(&conn, &endpoint_id, &endpoint_blob);
+    assert_eq!(
+        project_one(&conn, &endpoint_id, &endpoint_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let peer_shared_eid_b64 = event_id_to_base64(&peer_shared_eid);
+    let projected: (String, String) = conn
+        .query_row(
+            "SELECT endpoint_id, endpoint_shared_event_id
+             FROM peers_shared
+             WHERE recorded_by = ?1
+               AND event_id = ?2",
+            rusqlite::params![recorded_by, &peer_shared_eid_b64],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )
+        .unwrap();
+    assert_eq!(projected.0, endpoint_id);
+    assert_eq!(projected.1, event_id_to_base64(&endpoint_eid));
+}
+
+#[test]
+fn test_ingest_endpoint_shared_normalizes_to_endpoint_scope() {
+    let dir = tempfile::tempdir().unwrap();
+    let db_path = dir.path().join("endpoint-ingest.db");
+    let conn = crate::db::open_connection(db_path.to_str().unwrap()).unwrap();
+    crate::db::schema::create_tables(&conn).unwrap();
+    drop(conn);
+
+    let endpoint_key = SigningKey::generate(&mut rand::thread_rng());
+    let endpoint_event = crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event(
+        endpoint_key.to_bytes(),
+    );
+    let endpoint_blob = events::encode_event(&endpoint_event).unwrap();
+    let endpoint_eid = crate::crypto::hash_event(&endpoint_blob);
+    let endpoint_id = hex::encode(endpoint_key.verifying_key().to_bytes());
+
+    crate::state::pipeline::ingest_now(
+        db_path.to_str().unwrap(),
+        vec![(
+            endpoint_eid,
+            endpoint_blob,
+            "tenant-a".to_string(),
+            "sync".to_string(),
+            0,
+            0,
+        )],
+    )
+    .unwrap();
+
+    let conn = crate::db::open_connection(db_path.to_str().unwrap()).unwrap();
+    let endpoint_eid_b64 = event_id_to_base64(&endpoint_eid);
+    let normalized_recorded: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0
+             FROM recorded_events
+             WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![&endpoint_id, &endpoint_eid_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        normalized_recorded,
+        "endpoint_shared should record under endpoint scope"
+    );
+
+    let tenant_recorded: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0
+             FROM recorded_events
+             WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params!["tenant-a", &endpoint_eid_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !tenant_recorded,
+        "endpoint_shared should not remain recorded under tenant scope"
+    );
+
+    let projected: Option<String> = conn
+        .query_row(
+            "SELECT endpoint_id
+             FROM endpoints_shared
+             WHERE event_id = ?1",
+            rusqlite::params![&endpoint_eid_b64],
+            |row| row.get(0),
+        )
+        .optional()
+        .unwrap();
+    assert_eq!(projected.as_deref(), Some(endpoint_id.as_str()));
+}
 
 #[test]
 fn test_unsupported_signer_type_rejects() {
@@ -195,11 +525,13 @@ fn project_valid_peer_shared_for_user(
     device_name: &str,
 ) -> (EventId, SigningKey) {
     let mut rng = rand::thread_rng();
+    let endpoint_shared_event_id = ensure_test_endpoint_shared(conn);
     let peer_shared_key = SigningKey::generate(&mut rng);
     let peer_shared = ParsedEvent::PeerShared(crate::event_modules::PeerSharedEvent {
         created_at_ms: now_ms(),
         public_key: peer_shared_key.verifying_key().to_bytes(),
         user_event_id,
+        endpoint_shared_event_id,
         device_name: device_name.to_string(),
         signed_by: device_invite_eid,
         signer_type: 3,
@@ -268,6 +600,7 @@ fn test_peer_shared_rejects_wrong_signer_family_at_projection() {
         created_at_ms: now_ms(),
         public_key: [1u8; 32],
         user_event_id: [2u8; 32],
+        endpoint_shared_event_id: [4u8; 32],
         device_name: "device".to_string(),
         signed_by: [3u8; 32],
         signer_type: 5,
@@ -437,6 +770,7 @@ fn test_peer_shared_rejects_bootstrap_user_mismatch() {
     let conn = setup();
     let recorded_by = "peer1";
     let mut rng = rand::thread_rng();
+    let endpoint_shared_event_id = ensure_test_endpoint_shared(&conn);
 
     let (workspace_eid, workspace_key) = setup_workspace_anchor(&conn, recorded_by);
     let (invite_a_eid, invite_a_key) =
@@ -455,6 +789,7 @@ fn test_peer_shared_rejects_bootstrap_user_mismatch() {
         created_at_ms: now_ms(),
         public_key: SigningKey::generate(&mut rng).verifying_key().to_bytes(),
         user_event_id: user_b_eid,
+        endpoint_shared_event_id,
         device_name: "device".to_string(),
         signed_by: device_invite_eid,
         signer_type: 3,
@@ -476,6 +811,7 @@ fn test_peer_shared_rejects_peer_signed_device_link_user_mismatch() {
     let conn = setup();
     let recorded_by = "peer1";
     let mut rng = rand::thread_rng();
+    let endpoint_shared_event_id = ensure_test_endpoint_shared(&conn);
 
     let (workspace_eid, workspace_key) = setup_workspace_anchor(&conn, recorded_by);
     let (invite_a_eid, invite_a_key) =
@@ -499,6 +835,7 @@ fn test_peer_shared_rejects_peer_signed_device_link_user_mismatch() {
         created_at_ms: now_ms(),
         public_key: admin_peer_shared_key.verifying_key().to_bytes(),
         user_event_id: user_a_eid,
+        endpoint_shared_event_id,
         device_name: "laptop".to_string(),
         signed_by: bootstrap_device_invite_eid,
         signer_type: 3,
@@ -538,6 +875,7 @@ fn test_peer_shared_rejects_peer_signed_device_link_user_mismatch() {
         created_at_ms: now_ms(),
         public_key: SigningKey::generate(&mut rng).verifying_key().to_bytes(),
         user_event_id: user_b_eid,
+        endpoint_shared_event_id,
         device_name: "phone".to_string(),
         signed_by: link_device_invite_eid,
         signer_type: 3,

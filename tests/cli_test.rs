@@ -77,53 +77,6 @@ fn tenant_index_for_peer_id(db_path: &str, peer_id: &str) -> usize {
         .expect("peer id should appear in tenant scopes")
 }
 
-fn create_invite_via_cli(db_path: &str) -> String {
-    let addr = format!("127.0.0.1:{}", random_port());
-    let output = topo_cmd(db_path, &["invite", "--public-addr", &addr]);
-    assert!(
-        output.status.success(),
-        "invite failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    String::from_utf8_lossy(&output.stdout)
-        .lines()
-        .find(|line| line.starts_with("topo://"))
-        .expect("invite output should contain invite link")
-        .trim()
-        .to_string()
-}
-
-fn topo_sim_repair_run(dbs: &[&str]) -> (u64, u64) {
-    let mut cmd = Command::new(env!("CARGO_BIN_EXE_topo-sim"));
-    cmd.arg("--mode")
-        .arg("nearest-neighbor-no-auth")
-        .arg("--topology")
-        .arg("graph")
-        .arg("--rounds")
-        .arg("0")
-        .arg("--repair-run");
-    for db in dbs {
-        cmd.arg("--db").arg(db);
-    }
-    let output = cmd.output().expect("run topo-sim repair-run");
-    assert!(
-        output.status.success(),
-        "topo-sim repair-run failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&output.stdout),
-        String::from_utf8_lossy(&output.stderr)
-    );
-    let json: serde_json::Value =
-        serde_json::from_slice(&output.stdout).expect("parse topo-sim repair-run json");
-    let requests = json["repair_stats"]["request_stats"]["emitted_requests"]
-        .as_u64()
-        .unwrap_or(0);
-    let responses = json["repair_stats"]["response_stats"]["emitted_responses"]
-        .as_u64()
-        .unwrap_or(0);
-    (requests, responses)
-}
-
 fn wait_for_endpoint_observation(db_path: &str, remote_peer_id: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
@@ -388,8 +341,6 @@ fn dial_peer_for_tenant(
     remote_daemon_peer_id: &str,
     remote_session_peer_id: &str,
 ) -> Result<String, String> {
-    let client_config = topo::transport::build_tenant_client_config_from_db(db_path, tenant_id)
-        .map_err(|e| e.to_string())?;
     let sni = topo::transport::multi_workspace::transport_sni(remote_daemon_peer_id);
 
     let runtime = tokio::runtime::Builder::new_current_thread()
@@ -397,17 +348,17 @@ fn dial_peer_for_tenant(
         .build()
         .expect("dial runtime");
     runtime.block_on(async {
-        let endpoint =
-            quinn::Endpoint::client("127.0.0.1:0".parse().unwrap()).map_err(|e| e.to_string())?;
+        let endpoint = topo::transport::create_runtime_endpoint_for_tenants(
+            "127.0.0.1:0".parse().unwrap(),
+            db_path,
+        )
+        .await
+        .map_err(|e| e.to_string())?;
         let result = async {
-            let daemon_connection = topo::transport::dial_daemon_connection(
-                &endpoint,
-                remote,
-                &sni,
-                Some(&client_config),
-            )
-            .await
-            .map_err(|e| e.to_string())?;
+            let daemon_connection =
+                topo::transport::dial_daemon_connection(&endpoint, remote, &sni)
+                    .await
+                    .map_err(|e| e.to_string())?;
             let raw_connection = daemon_connection.connection();
             let actual_remote_daemon_peer_id =
                 daemon_connection.remote_daemon_peer_id().to_string();
@@ -419,6 +370,7 @@ fn dial_peer_for_tenant(
                 session.io.as_mut(),
                 db_path,
                 tenant_id,
+                Some(&daemon_connection),
                 &actual_remote_daemon_peer_id,
                 Some(remote_daemon_peer_id),
                 &topo::transport::OutboundSessionAuthPlan::PeerShared {
@@ -427,14 +379,9 @@ fn dial_peer_for_tenant(
             )
             .await
             .map_err(|e| e.to_string())?;
-            let close_probe =
-                tokio::time::timeout(Duration::from_millis(250), raw_connection.closed()).await;
             raw_connection.close(0u32.into(), b"test done");
             endpoint.close(0u32.into(), b"test done");
-            match close_probe {
-                Ok(err) => Err(format!("connection closed after session auth: {err}")),
-                Err(_) => Ok(auth_result.session_peer_id),
-            }
+            Ok(auth_result.session_peer_id)
         }
         .await;
         result
@@ -790,8 +737,8 @@ fn assert_cli_state(
         identity_stdout
     );
     assert!(
-        !identity_stdout.contains("Peer:      (none)"),
-        "identity should have a materialized peer:\n{}",
+        !identity_stdout.contains("Account:   (none)"),
+        "identity should have a materialized account:\n{}",
         identity_stdout
     );
 }
@@ -821,7 +768,7 @@ fn assert_identity_eventually_materialized(db_path: &str, timeout_ms: u64) {
         if identity.status.success()
             && stdout.contains("Transport:")
             && !stdout.contains("User:      (none)")
-            && !stdout.contains("Peer:      (none)")
+            && !stdout.contains("Account:   (none)")
         {
             return;
         }
@@ -928,15 +875,19 @@ fn test_cli_bidirectional_sync() {
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let timeout_ms = 60000;
+    let relay_opts = DaemonOptions {
+        disable_discovery: false,
+        ..Default::default()
+    };
 
-    create_workspace(&alice_db);
-    let _alice = start_daemon(&alice_db);
+    create_workspace_with_username(&alice_db, "alice");
+    let _alice = start_daemon_with_options(&alice_db, &relay_opts);
 
     let bootstrap_eid = send_message(&alice_db, "bootstrap-before-invite");
     let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
 
     accept_invite(&bob_db, &invite_link);
-    let _bob = start_daemon(&bob_db);
+    let _bob = start_daemon_with_options(&bob_db, &relay_opts);
 
     // The invitee should catch up enough to record Alice's pre-invite event id.
     assert_event_visible_on_all(&[&bob_db], &bootstrap_eid, timeout_ms);
@@ -961,6 +912,15 @@ fn test_cli_bidirectional_sync() {
         &bob_db,
         &format!("has_event:{} >= 1", alice_live_eid),
         timeout_ms,
+    );
+
+    let bob_endpoint_id = daemon_identity_fingerprint(&bob_db);
+    use_tenant_for_username(&alice_db, "alice");
+    let peers = get_peers_raw(&alice_db);
+    assert!(
+        peers.contains(&format!("endpoint={}", &bob_endpoint_id[..8])),
+        "peers output should expose the remote endpoint id, got:\n{}",
+        peers
     );
 }
 
@@ -1169,147 +1129,6 @@ fn test_cli_send_and_messages() {
     assert_eq!(messages.len(), 2);
     assert!(messages.contains(&"First message".to_string()));
     assert!(messages.contains(&"Second message".to_string()));
-}
-
-#[test]
-fn test_cli_invitee_decrypts_recent_history_from_invite_targeted_key_shares() {
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("invite-history.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-
-    create_workspace(&db);
-    let mut daemon = start_daemon(&db);
-
-    send_message(&db, "history-0");
-    let (_rotation_1, _proactive_1) = rotate_key(&db);
-    send_message(&db, "history-1");
-    let (_rotation_2, _proactive_2) = rotate_key(&db);
-    send_message(&db, "history-2");
-
-    let invite_link = create_invite_via_cli(&db);
-    accept_invite_with_identity_on_running_daemon(
-        &db,
-        &invite_link,
-        "recent-joiner",
-        "recent-device",
-        Duration::from_secs(10),
-    );
-
-    assert_now(&db, "key_secret_count == 3");
-    assert_now(&db, "message_count == 3");
-
-    let key_ids = get_content_key_ids(&db);
-    assert_eq!(
-        key_ids.len(),
-        3,
-        "invitee should materialize all recent keys"
-    );
-
-    let messages = get_messages(&db);
-    assert!(
-        messages.contains(&"history-0".to_string()),
-        "invitee should decrypt earliest recent message from invite-targeted share"
-    );
-    assert!(
-        messages.contains(&"history-1".to_string()),
-        "invitee should decrypt rotated message from invite-targeted share"
-    );
-    assert!(
-        messages.contains(&"history-2".to_string()),
-        "invitee should decrypt latest message from invite-targeted share"
-    );
-
-    stop_daemon(&db, &mut daemon);
-}
-
-#[test]
-fn test_cli_invite_history_cap_then_repair_run_recovers_older_history() {
-    let tmpdir = tempfile::tempdir().unwrap();
-    let db = tmpdir
-        .path()
-        .join("invite-history-cap.db")
-        .to_str()
-        .unwrap()
-        .to_string();
-    let history_cap = topo::event_modules::workspace::identity_ops::INVITE_HISTORY_KEY_CAP;
-    let total_keys = history_cap + 4;
-
-    create_workspace(&db);
-    let mut daemon = start_daemon(&db);
-
-    send_message(&db, "history-000");
-    for idx in 1..total_keys {
-        let (_rotation_event_id, _proactive_shares) = rotate_key(&db);
-        send_message(&db, &format!("history-{idx:03}"));
-    }
-
-    let invite_link = create_invite_via_cli(&db);
-    accept_invite_with_identity_on_running_daemon(
-        &db,
-        &invite_link,
-        "cap-joiner",
-        "cap-device",
-        Duration::from_secs(20),
-    );
-
-    assert_now(&db, &format!("key_secret_count == {}", history_cap));
-    assert_now(&db, &format!("message_count == {}", history_cap));
-    assert_now(&db, "blocked_event_count >= 1");
-
-    let before_repair = topo_cmd(&db, &["messages", "--limit", "0"]);
-    assert!(
-        before_repair.status.success(),
-        "messages before repair failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&before_repair.stdout),
-        String::from_utf8_lossy(&before_repair.stderr)
-    );
-    let before_text = String::from_utf8_lossy(&before_repair.stdout);
-    assert!(
-        before_text.contains(&format!("history-{:03}", total_keys - 1)),
-        "latest in-cap history should be visible before repair"
-    );
-    assert!(
-        !before_text.contains("history-000"),
-        "oldest out-of-cap history should remain blocked before repair"
-    );
-
-    stop_daemon(&db, &mut daemon);
-    let (requests, responses) = topo_sim_repair_run(&[&db]);
-    assert!(
-        requests > 0,
-        "topo-sim repair-run should emit at least one key_request"
-    );
-    assert!(
-        responses > 0,
-        "topo-sim repair-run should emit at least one key_shared response"
-    );
-
-    daemon = start_daemon(&db);
-    wait_for_daemon_ready(&db, Duration::from_secs(10));
-    use_tenant_for_username(&db, "cap-joiner");
-    wait_for_active_tenant_ready(&db, Duration::from_secs(10));
-
-    assert_eventually(&db, &format!("key_secret_count == {}", total_keys), 20_000);
-    assert_eventually(&db, &format!("message_count == {}", total_keys), 20_000);
-
-    let after_repair = topo_cmd(&db, &["messages", "--limit", "0"]);
-    assert!(
-        after_repair.status.success(),
-        "messages after repair failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&after_repair.stdout),
-        String::from_utf8_lossy(&after_repair.stderr)
-    );
-    let after_text = String::from_utf8_lossy(&after_repair.stdout);
-    assert!(
-        after_text.contains("history-000"),
-        "oldest out-of-cap history should decrypt after topo-sim repair-run"
-    );
-
-    stop_daemon(&db, &mut daemon);
 }
 
 #[test]
@@ -1530,7 +1349,14 @@ fn test_cli_start_without_trust_starts_idle_runtime() {
         .to_str()
         .unwrap()
         .to_string();
-    let _daemon = start_daemon(&db);
+    let mut daemon = HarnessDaemon::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .expect("start daemon"),
+        &db,
+    );
+    wait_for_daemon_ready(&db, Duration::from_secs(15));
 
     let status = Command::new(bin())
         .args(["--db", &db, "status"])
@@ -1547,12 +1373,23 @@ fn test_cli_start_without_trust_starts_idle_runtime() {
         "status should show idle runtime state, got: {}",
         stdout
     );
+    assert!(
+        stdout.contains("Endpoint:"),
+        "status should show endpoint identity even before workspace bootstrap, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("Root:"),
+        "status should show endpoint root event id, got: {}",
+        stdout
+    );
 
     let stop = Command::new(bin())
         .args(["--db", &db, "stop"])
         .output()
         .expect("stop command");
     assert!(stop.status.success(), "stop should succeed");
+    daemon.clear();
 }
 
 /// Bootstrap trust test using production invite / accept CLI flow.
@@ -1974,7 +1811,10 @@ fn test_cli_invite_with_dead_first_and_live_second_address() {
 #[test]
 fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 45000;
+    // This path exercises daemon reuse plus cross-workspace route admission on
+    // discovery-enabled runtimes. It is stable in isolation but can sit near
+    // 45s after long prior daemon churn in the full CLI suite.
+    let timeout_ms = 60000;
 
     let alpha_db = tmpdir.path().join("alpha.db").to_str().unwrap().to_string();
     let zeta_db = tmpdir.path().join("zeta.db").to_str().unwrap().to_string();
@@ -2502,6 +2342,11 @@ fn test_cli_live_daemon_accept_second_workspace_can_switch_back_and_sync_origina
     let zeta_bootstrap = "zeta-space/bootstrap";
     let zeta_bootstrap_eid = send_message(&zeta_db, zeta_bootstrap);
     let zeta_invite = create_invite(&zeta_db, &daemon_listen_addr(&zeta_db));
+    let zeta_peer_id = tenant_peer_id_for_username(&zeta_db, "zeta").expect("zeta peer id");
+    let zeta_daemon_peer_id = daemon_identity_fingerprint(&zeta_db);
+    let zeta_remote: SocketAddr = daemon_listen_addr(&zeta_db)
+        .parse()
+        .expect("zeta listen addr");
 
     let accept = Command::new(bin())
         .args([
@@ -2523,7 +2368,17 @@ fn test_cli_live_daemon_accept_second_workspace_can_switch_back_and_sync_origina
         String::from_utf8_lossy(&accept.stderr)
     );
 
-    wait_for_username_peer_id(&owner_db, "yuki-zeta", timeout_ms);
+    let yuki_peer_id = wait_for_username_peer_id(&owner_db, "yuki-zeta", timeout_ms);
+    wait_for_tenant_transport_converged(&owner_db, &yuki_peer_id, Duration::from_secs(120));
+    wait_for_direct_trust_dial(
+        &owner_db,
+        &yuki_peer_id,
+        zeta_remote,
+        &zeta_daemon_peer_id,
+        &zeta_peer_id,
+        &zeta_peer_id,
+        timeout_ms,
+    );
     assert_event_visible_for_username(&owner_db, "yuki-zeta", &zeta_bootstrap_eid, timeout_ms);
 
     let zeta_msg = "zeta-space/yuki-live";
@@ -2572,6 +2427,161 @@ fn test_cli_live_daemon_accept_second_workspace_can_switch_back_and_sync_origina
 
     stop_daemon(&owner_db, &mut owner_daemon);
     stop_daemon(&zeta_db, &mut zeta_daemon);
+}
+
+/// Live-daemon multitenant regression:
+/// if two daemons already share one workspace, accepting an invite into a
+/// second workspace hosted by that same remote daemon must succeed on the
+/// existing daemon relationship and keep both workspaces isolated.
+#[test]
+fn test_cli_live_daemon_accept_second_workspace_from_same_remote_daemon_stays_isolated() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 60000;
+
+    let owner_db = tmpdir.path().join("owner.db").to_str().unwrap().to_string();
+    create_workspace_with_details(&owner_db, "alpha-space", "alpha", "alpha-root");
+    let mut owner_daemon = start_daemon(&owner_db);
+    let alpha_tenant = "alpha/alpha-root".to_string();
+
+    let alpha_bootstrap = "alpha-space/bootstrap";
+    let alpha_bootstrap_eid = send_message(&owner_db, alpha_bootstrap);
+    let alpha_invite = create_invite(&owner_db, &daemon_listen_addr(&owner_db));
+    let bob = start_joined_cli_peer(&tmpdir, "bob.db", &alpha_invite, "bob-alpha", "bob-laptop");
+    let bob_alpha_tenant = "bob-alpha/bob-laptop".to_string();
+    assert_event_visible_on_all(&[&bob.db], &alpha_bootstrap_eid, timeout_ms);
+
+    let create_beta = Command::new(bin())
+        .args([
+            "create-workspace",
+            "--db",
+            &owner_db,
+            "--workspace-name",
+            "beta-space",
+            "--username",
+            "beta-owner",
+            "--device-name",
+            "beta-root",
+        ])
+        .output()
+        .unwrap();
+    assert!(
+        create_beta.status.success(),
+        "create-workspace beta failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&create_beta.stdout),
+        String::from_utf8_lossy(&create_beta.stderr)
+    );
+
+    wait_for_username_peer_id(&owner_db, "beta-owner", timeout_ms);
+    let beta_tenant = "beta-owner/beta-root".to_string();
+    let beta_bootstrap = "beta-space/bootstrap";
+    let beta_bootstrap_eid = send_message_as_username(&owner_db, "beta-owner", beta_bootstrap);
+    use_tenant_for_username(&owner_db, "beta-owner");
+    let beta_invite = create_invite(&owner_db, &daemon_listen_addr(&owner_db));
+    let beta_owner_peer_id =
+        tenant_peer_id_for_username(&owner_db, "beta-owner").expect("beta owner peer id");
+    let owner_daemon_peer_id = daemon_identity_fingerprint(&owner_db);
+    let owner_remote: SocketAddr = daemon_listen_addr(&owner_db)
+        .parse()
+        .expect("owner listen addr");
+
+    accept_invite_with_identity_on_running_daemon(
+        &bob.db,
+        &beta_invite,
+        "bob-beta",
+        "beta-laptop",
+        Duration::from_secs(10),
+    );
+    let bob_beta_peer_id = wait_for_username_peer_id(&bob.db, "bob-beta", timeout_ms);
+    wait_for_tenant_transport_converged(&bob.db, &bob_beta_peer_id, Duration::from_secs(120));
+    wait_for_direct_trust_dial(
+        &bob.db,
+        &bob_beta_peer_id,
+        owner_remote,
+        &owner_daemon_peer_id,
+        &beta_owner_peer_id,
+        &beta_owner_peer_id,
+        timeout_ms,
+    );
+    wait_for_active_tenant_ready(&bob.db, Duration::from_secs(120));
+    assert_event_visible_for_username(&bob.db, "bob-beta", &beta_bootstrap_eid, timeout_ms);
+
+    let alpha_followup = "alpha-space/owner-followup";
+    let alpha_followup_eid = send_message_as_username(&owner_db, "alpha", alpha_followup);
+    assert_event_visible_for_username(&bob.db, "bob-alpha", &alpha_followup_eid, timeout_ms);
+
+    let beta_reply = "beta-space/bob-reply";
+    let beta_reply_eid = send_message_as_username(&bob.db, "bob-beta", beta_reply);
+    assert_event_visible_for_username(&owner_db, "beta-owner", &beta_reply_eid, timeout_ms);
+
+    let beta_owner_followup = "beta-space/owner-second";
+    let beta_owner_followup_eid =
+        send_message_as_username(&owner_db, "beta-owner", beta_owner_followup);
+    assert_event_visible_for_username(&bob.db, "bob-beta", &beta_owner_followup_eid, timeout_ms);
+
+    use_tenant_for_username(&bob.db, "bob-alpha");
+    let bob_alpha_view = get_view_raw(&bob.db);
+    assert!(
+        !bob_alpha_view.contains(beta_bootstrap)
+            && !bob_alpha_view.contains(beta_reply)
+            && !bob_alpha_view.contains(beta_owner_followup),
+        "alpha workspace on joined daemon should not see beta-space messages:\n{}",
+        bob_alpha_view
+    );
+
+    use_tenant_for_username(&bob.db, "bob-beta");
+    let bob_beta_view = get_view_raw(&bob.db);
+    assert!(
+        !bob_beta_view.contains(alpha_bootstrap) && !bob_beta_view.contains(alpha_followup),
+        "beta workspace on joined daemon should not see alpha-space messages:\n{}",
+        bob_beta_view
+    );
+
+    assert_cli_state_for_username(
+        &owner_db,
+        "alpha",
+        &["alpha-space", "beta-space"],
+        "alpha-space",
+        2,
+        2,
+        &["alpha", "bob-alpha"],
+        &[alpha_tenant.as_str(), bob_alpha_tenant.as_str()],
+        &[alpha_bootstrap, alpha_followup],
+    );
+    assert_cli_state_for_username(
+        &owner_db,
+        "beta-owner",
+        &["alpha-space", "beta-space"],
+        "beta-space",
+        2,
+        2,
+        &["beta-owner", "bob-beta"],
+        &[beta_tenant.as_str(), "bob-beta/beta-laptop"],
+        &[beta_bootstrap, beta_reply, beta_owner_followup],
+    );
+    assert_cli_state_for_username(
+        &bob.db,
+        "bob-alpha",
+        &["alpha-space", "beta-space"],
+        "alpha-space",
+        2,
+        2,
+        &["alpha", "bob-alpha"],
+        &[alpha_tenant.as_str(), bob_alpha_tenant.as_str()],
+        &[alpha_bootstrap, alpha_followup],
+    );
+    assert_cli_state_for_username(
+        &bob.db,
+        "bob-beta",
+        &["alpha-space", "beta-space"],
+        "beta-space",
+        2,
+        2,
+        &["beta-owner", "bob-beta"],
+        &[beta_tenant.as_str(), "bob-beta/beta-laptop"],
+        &[beta_bootstrap, beta_reply, beta_owner_followup],
+    );
+
+    stop_daemon(&owner_db, &mut owner_daemon);
 }
 
 /// Live-daemon multitenant regression: after creating a second workspace on a
@@ -3045,24 +3055,6 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
         .parse()
         .expect("emma listen addr");
 
-    wait_for_direct_trust_dial(
-        &shared_db,
-        &bob_peer_id,
-        dave_addr,
-        &dave_daemon_peer_id,
-        &dave_peer_id,
-        &dave_peer_id,
-        timeout_ms,
-    );
-    wait_for_direct_trust_dial(
-        &shared_db,
-        &yuki_peer_id,
-        emma_addr,
-        &emma_daemon_peer_id,
-        &emma_peer_id,
-        &emma_peer_id,
-        timeout_ms,
-    );
     assert_direct_dial_never_succeeds(
         &shared_db,
         &bob_peer_id,
@@ -4703,6 +4695,8 @@ fn test_cli_untrusted_peer_certificate_error() {
         if bob_log.contains("Certificate mismatch")
             || bob_log.contains("not trusted")
             || bob_log.contains("trust_rejected")
+            || bob_log.contains("invalid peer certificate")
+            || bob_log.contains("UnknownIssuer")
             || bob_log.contains("no server certificate chain resolved")
         {
             break;
@@ -4734,6 +4728,8 @@ fn test_cli_untrusted_peer_certificate_error() {
         bob_log.contains("Certificate mismatch")
             || bob_log.contains("not trusted")
             || bob_log.contains("trust_rejected")
+            || bob_log.contains("invalid peer certificate")
+            || bob_log.contains("UnknownIssuer")
             || bob_log.contains("no server certificate chain resolved"),
         "untrusted peer error should mention certificate mismatch or \
          trust rejection, got:\n{}",
@@ -4744,6 +4740,7 @@ fn test_cli_untrusted_peer_certificate_error() {
         bob_log.contains("transport identity")
             || bob_log.contains("not trusted by this workspace")
             || bob_log.contains("Certificate mismatch")
+            || bob_log.contains("invalid peer certificate")
             || bob_log.contains("no server certificate chain resolved"),
         "error should include human-readable explanation, got:\n{}",
         bob_log

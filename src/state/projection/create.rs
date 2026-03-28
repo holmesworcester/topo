@@ -170,7 +170,9 @@ fn store_blob_only(
             ws_id,
         )
         .map_err(|e| CreateEventError::DbError(e.to_string()))?;
-    } else if meta.share_scope == crate::event_modules::registry::ShareScope::Shared {
+    } else if meta.share_scope == crate::event_modules::registry::ShareScope::Shared
+        && meta.type_name != "endpoint_shared"
+    {
         tracing::warn!(
             "no accepted workspace binding for {}, shared event {} missing from shared_event_index",
             recorded_by,
@@ -741,11 +743,21 @@ mod tests {
         });
         let dif_eid = create_signed_event_synchronous(conn, recorded_by, &dif, &user_key).unwrap();
 
+        let endpoint_key = SigningKey::generate(&mut rng);
+        let endpoint_event =
+            crate::event_modules::endpoint_shared::deterministic_endpoint_shared_event(
+                endpoint_key.to_bytes(),
+            );
+        let endpoint_id = hex::encode(endpoint_key.verifying_key().to_bytes());
+        let endpoint_shared_event_id =
+            create_event_synchronous(conn, &endpoint_id, &endpoint_event).unwrap();
+
         let peer_shared_key = SigningKey::generate(&mut rng);
         let psf = ParsedEvent::PeerShared(PeerSharedEvent {
             created_at_ms: now_ms(),
             public_key: peer_shared_key.verifying_key().to_bytes(),
             user_event_id: ub_eid,
+            endpoint_shared_event_id,
             device_name: "test-device".to_string(),
             signed_by: dif_eid,
             signer_type: 3,

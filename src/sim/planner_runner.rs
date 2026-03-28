@@ -315,10 +315,7 @@ fn pair_intent_source(intent: &PairSyncIntent) -> Option<TargetIngressSource> {
             daemon_peer_id: intent.target_transport_peer_id.clone(),
             invite_event_id: intent.invite_event_id.clone().unwrap_or_default(),
         }),
-        "observed" => Some(TargetIngressSource::ObservedPeer {
-            peer_id: intent.target_transport_peer_id.clone(),
-        }),
-        "discovery" => Some(TargetIngressSource::Discovery {
+        "observed" | "discovery" => Some(TargetIngressSource::KnownPeer {
             peer_id: intent.target_transport_peer_id.clone(),
         }),
         _ => None,

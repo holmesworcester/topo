@@ -301,6 +301,9 @@ The following parser-level canonicalization guarantees are enforced in Rust but 
 | InvAdminChain | test_bootstrap_sequence: Admin requires User valid |
 | InvForeignWorkspaceExcluded | test_foreign_workspace_excluded |
 | NON_MODELED::author_constraint | message deletion rejects non-author tombstones |
+| NON_MODELED::shared_endpoint_projection | endpoint_shared projector materializes a self-authenticating shared endpoint row |
+| NON_MODELED::endpoint_shared_scope_match | endpoint_shared recorded_by must equal the published endpoint_id |
+| NON_MODELED::endpoint_shared_self_auth | endpoint_shared self-signature must validate against the endpoint public key |
 | InvAllValidRequireWorkspace | test_bootstrap_sequence: non-local events require workspace valid |
 | InvMessageWorkspace | Message projection requires workspace (workspace_event_id dep) |
 | InvDeleteIntentSource | `message_deletion` can project before the target message exists and must leave durable delete intent state |
@@ -382,6 +385,19 @@ progress properties over bootstrap/upgrade/fallback behavior.
 | BrLive_BootstrapConnectEventually | CHK_BRIDGE_BOOTSTRAP_PROGRESS |
 | BrLive_PeerUpgradeEventually | CHK_BRIDGE_UPGRADE_PROGRESS |
 | BrLive_BootstrapCompletionSyncEventually | CHK_BRIDGE_SYNC_COMPLETION_PROGRESS |
+
+### EndpointBootstrapRoute safety target (2026-03-28)
+
+`EndpointBootstrapRoute.tla` is the focused safety model for the stricter
+daemon-scoped `iroh` auth target:
+1. `endpoint_secret` exists before workspace/account state,
+2. `invite_accepted` breaks the accepted-workspace cycle,
+3. bootstrap admission is exact and proof-scoped,
+4. steady-state routing is graph-scoped.
+
+| UnifiedBridge invariant/property | Runtime check / implementation owner |
+|----------------------------------|--------------------------------------|
+| InvBootstrapAdmissionProofScoped | CHK_ENDPOINT_BOOTSTRAP_PROOF_SCOPE (runtime/transport/session_auth) |
 
 ### Multi-tenant trust scoping (collapse-single-tenant, 2026-02-17)
 

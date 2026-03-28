@@ -1,8 +1,8 @@
 use crate::crypto::event_id_to_base64;
 use crate::event_modules::{
-    parse_event, AdminEvent, DeviceInviteEvent, FileEvent, FileSliceEvent, InviteAcceptedEvent,
-    KeySharedEvent, MessageDeletionEvent, MessageEvent, ParsedEvent, PeerSharedEvent,
-    ReactionEvent, UserInviteEvent, WorkspaceEvent,
+    endpoint_shared::load_endpoint_shared_by_event_id, parse_event, AdminEvent, DeviceInviteEvent,
+    FileEvent, FileSliceEvent, InviteAcceptedEvent, KeySharedEvent, MessageDeletionEvent,
+    MessageEvent, ParsedEvent, PeerSharedEvent, ReactionEvent, UserInviteEvent, WorkspaceEvent,
 };
 use crate::projection::contract::{
     BootstrapContextSnapshot, ContextSnapshot, DeletionIntentInfo, FileDescriptorInfo,
@@ -393,6 +393,12 @@ impl ProjectionQueries for Connection {
             }
         };
 
+        let endpoint_shared_event_id_b64 =
+            event_id_to_base64(&peer_shared.endpoint_shared_event_id);
+        let endpoint_shared_row =
+            load_endpoint_shared_by_event_id(self.conn, &endpoint_shared_event_id_b64)
+                .map_err(|e| -> Box<dyn std::error::Error> { e })?;
+
         Ok(ContextSnapshot {
             peer_shared_user_mismatch_reason: peer_shared_user_mismatch_reason(
                 self,
@@ -400,6 +406,16 @@ impl ProjectionQueries for Connection {
                 &device_invite,
                 &peer_shared.user_event_id,
             )?,
+            peer_shared_endpoint_id: endpoint_shared_row
+                .as_ref()
+                .map(|row| row.endpoint_id.clone()),
+            peer_shared_endpoint_binding_reason: match endpoint_shared_row {
+                Some(_) => None,
+                None => Some(format!(
+                    "no projected endpoint_shared row for {}",
+                    endpoint_shared_event_id_b64
+                )),
+            },
             ..ContextSnapshot::default()
         })
     }
