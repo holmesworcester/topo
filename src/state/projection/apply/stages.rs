@@ -510,7 +510,7 @@ pub(crate) fn run_dep_and_projection_stages_with_backend<B: ProjectionBackend>(
     }
 
     let deps = parsed.dep_field_values();
-    if let Some(block) = backend.check_deps_and_block(recorded_by, event_id_b64, &deps)? {
+    if let Some(block) = backend.check_deps_and_block(recorded_by, event_id_b64, parsed, &deps)? {
         return Ok((block, None));
     }
 
@@ -519,7 +519,9 @@ pub(crate) fn run_dep_and_projection_stages_with_backend<B: ProjectionBackend>(
             .lookup(parsed.event_type_code())
             .ok_or_else(|| format!("unknown type code {}", parsed.event_type_code()))?;
         if !meta.dep_field_type_codes.is_empty() {
-            if let Some(reason) = backend.check_dep_types(recorded_by, &deps, meta.dep_field_type_codes)? {
+            if let Some(reason) =
+                backend.check_dep_types(recorded_by, parsed, &deps, meta.dep_field_type_codes)?
+            {
                 return Ok((ProjectionDecision::Reject { reason }, None));
             }
         }

@@ -12,11 +12,11 @@ use crate::crypto::{hash_event, EventId};
 use crate::db::queue::current_timestamp_ms;
 use crate::db::{open_connection, store::Store};
 use crate::protocol::{encode_frame, parse_frame, Frame};
+use crate::runtime::sync_engine::runtime::DependencySessionStats;
 use crate::runtime::transport::{
     open_outbound_dependency_session, resolve_outbound_session_auth_plan,
     send_outbound_session_auth,
 };
-use crate::runtime::sync_engine::runtime::DependencySessionStats;
 use crate::state::{dependency_fetch, pipeline::ingest_now};
 use crate::transport::{DaemonConnection, OutboundSessionAuthPlan};
 
@@ -348,7 +348,8 @@ pub fn spawn_outbound_dependency_session(
     shutdown: CancellationToken,
 ) -> tokio::task::JoinHandle<()> {
     tokio::task::spawn_local(async move {
-        let (session_id, mut io) = match open_outbound_dependency_session(&daemon_connection).await {
+        let (session_id, mut io) = match open_outbound_dependency_session(&daemon_connection).await
+        {
             Ok(opened) => opened,
             Err(err) => {
                 warn!(

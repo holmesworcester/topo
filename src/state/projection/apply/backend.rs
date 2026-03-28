@@ -33,12 +33,14 @@ pub(crate) trait ProjectionBackend {
         &self,
         recorded_by: &str,
         event_id_b64: &str,
+        parsed: &ParsedEvent,
         deps: &[(&str, EventId)],
     ) -> ProjectionApplyResult<Option<ProjectionDecision>>;
 
     fn check_dep_types(
         &self,
         recorded_by: &str,
+        parsed: &ParsedEvent,
         deps: &[(&str, EventId)],
         type_codes: &[&[u8]],
     ) -> ProjectionApplyResult<Option<String>>;
@@ -146,18 +148,20 @@ impl ProjectionBackend for SqliteProjectionBackend<'_> {
         &self,
         recorded_by: &str,
         event_id_b64: &str,
+        parsed: &ParsedEvent,
         deps: &[(&str, EventId)],
     ) -> ProjectionApplyResult<Option<ProjectionDecision>> {
-        check_deps_and_block(self.conn, recorded_by, event_id_b64, deps)
+        check_deps_and_block(self.conn, recorded_by, event_id_b64, parsed, deps)
     }
 
     fn check_dep_types(
         &self,
         recorded_by: &str,
+        parsed: &ParsedEvent,
         deps: &[(&str, EventId)],
         type_codes: &[&[u8]],
     ) -> ProjectionApplyResult<Option<String>> {
-        check_dep_types(self.conn, recorded_by, deps, type_codes)
+        check_dep_types(self.conn, recorded_by, parsed, deps, type_codes)
     }
 
     fn resolve_signer_key(
@@ -329,6 +333,7 @@ mod tests {
             &self,
             _recorded_by: &str,
             _event_id_b64: &str,
+            _parsed: &ParsedEvent,
             _deps: &[(&str, EventId)],
         ) -> ProjectionApplyResult<Option<ProjectionDecision>> {
             Ok(None)
@@ -337,6 +342,7 @@ mod tests {
         fn check_dep_types(
             &self,
             _recorded_by: &str,
+            _parsed: &ParsedEvent,
             _deps: &[(&str, EventId)],
             _type_codes: &[&[u8]],
         ) -> ProjectionApplyResult<Option<String>> {
