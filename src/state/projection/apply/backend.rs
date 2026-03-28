@@ -30,6 +30,13 @@ pub(crate) trait ProjectionBackend: ProjectionQueries {
         reason: &str,
     ) -> ProjectionApplyResult<()>;
 
+    fn record_block(
+        &self,
+        recorded_by: &str,
+        event_id_b64: &str,
+        missing: &[EventId],
+    ) -> ProjectionApplyResult<()>;
+
     fn check_deps_and_block(
         &self,
         recorded_by: &str,
@@ -123,6 +130,16 @@ impl ProjectionBackend for Connection {
         reason: &str,
     ) -> ProjectionApplyResult<()> {
         record_rejection(self, recorded_by, event_id_b64, reason);
+        Ok(())
+    }
+
+    fn record_block(
+        &self,
+        recorded_by: &str,
+        event_id_b64: &str,
+        missing: &[EventId],
+    ) -> ProjectionApplyResult<()> {
+        super::stages::record_block_rows(self, recorded_by, event_id_b64, missing)?;
         Ok(())
     }
 
@@ -239,7 +256,7 @@ impl ProjectionBackend for Connection {
 #[cfg(test)]
 mod tests {
     use std::cell::RefCell;
-    use std::collections::HashMap;
+    use std::collections::{BTreeSet, HashMap};
 
     use crate::crypto::{event_id_to_base64, hash_event};
     use crate::event_modules::{encode_event, ParsedEvent, TenantEvent};
@@ -252,6 +269,8 @@ mod tests {
     struct FakeProjectionBackend {
         blobs: HashMap<String, Vec<u8>>,
         rejections: RefCell<Vec<(String, String, String)>>,
+        blocked_event_deps: RefCell<HashMap<String, BTreeSet<String>>>,
+        blocked_events: RefCell<HashMap<String, i64>>,
         guard_blocked: RefCell<Vec<String>>,
         valid_marked: RefCell<Vec<String>>,
         write_batches: RefCell<usize>,
@@ -265,6 +284,8 @@ mod tests {
             Self {
                 blobs,
                 rejections: RefCell::new(Vec::new()),
+                blocked_event_deps: RefCell::new(HashMap::new()),
+                blocked_events: RefCell::new(HashMap::new()),
                 guard_blocked: RefCell::new(Vec::new()),
                 valid_marked: RefCell::new(Vec::new()),
                 write_batches: RefCell::new(0),
@@ -297,6 +318,31 @@ mod tests {
                 event_id_b64.to_string(),
                 reason.to_string(),
             ));
+            Ok(())
+        }
+
+        fn record_block(
+            &self,
+            _recorded_by: &str,
+            event_id_b64: &str,
+            missing: &[EventId],
+        ) -> ProjectionApplyResult<()> {
+            let mut deduped = missing.to_vec();
+            deduped.sort_unstable();
+            deduped.dedup();
+            let deps_remaining = {
+                let mut blockers_by_event = self.blocked_event_deps.borrow_mut();
+                let blockers = blockers_by_event
+                    .entry(event_id_b64.to_string())
+                    .or_default();
+                for dep_id in &deduped {
+                    blockers.insert(event_id_to_base64(dep_id));
+                }
+                blockers.len() as i64
+            };
+            self.blocked_events
+                .borrow_mut()
+                .insert(event_id_b64.to_string(), deps_remaining);
             Ok(())
         }
 
@@ -494,6 +540,9 @@ mod tests {
             .lookup(crate::event_modules::EVENT_TYPE_TENANT)
             .unwrap();
         let ctx = (meta.context_loader)(&conn, "peer-a", "event-a", &parsed).unwrap();
+        let crate::projection::queries::ContextLoadResult::Ready(ctx) = ctx else {
+            panic!("expected ready context");
+        };
         assert!(ctx.accepted_workspace_id.is_none());
         assert!(ctx.signer_user_mismatch_reason.is_none());
         assert!(ctx.deletion_intents.is_empty());

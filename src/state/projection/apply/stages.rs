@@ -5,6 +5,7 @@ use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::queue::current_timestamp_ms;
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::{registry, ParsedEvent, TransportPrivacy};
+use crate::projection::queries::ContextLoadResult;
 use crate::state::{dependency_fetch, live_hints::source_peer_id_from_source_tag};
 use rusqlite::{Connection, OptionalExtension};
 
@@ -266,6 +267,21 @@ pub(crate) fn check_deps_and_block(
         return Ok(None);
     }
 
+    record_block_rows(conn, recorded_by, event_id_b64, &missing)?;
+    if let Some(source_peer_id) = load_recorded_source_peer_id(conn, recorded_by, event_id_b64)? {
+        dependency_fetch::publish_from_connection(conn, recorded_by, &source_peer_id, &missing);
+    }
+
+    Ok(Some(ProjectionDecision::Block { missing }))
+}
+
+pub(crate) fn record_block_rows(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+    missing: &[EventId],
+) -> Result<(), Box<dyn std::error::Error>> {
+    let mut missing = missing.to_vec();
     missing.sort_unstable();
     missing.dedup();
     for dep_id in &missing {
@@ -282,11 +298,7 @@ pub(crate) fn check_deps_and_block(
         rusqlite::params![recorded_by, event_id_b64, missing.len() as i64],
     )?;
     let _ = EventTimeline::new(conn).mark_blocked_b64(event_id_b64, current_timestamp_ms());
-    if let Some(source_peer_id) = load_recorded_source_peer_id(conn, recorded_by, event_id_b64)? {
-        dependency_fetch::publish_from_connection(conn, recorded_by, &source_peer_id, &missing);
-    }
-
-    Ok(Some(ProjectionDecision::Block { missing }))
+    Ok(())
 }
 
 /// Shared projection helper: verify signer (if required), build context snapshot,
@@ -384,7 +396,18 @@ pub(crate) fn apply_projection_with_backend<B: ProjectionBackend>(
     }
 
     // Build projector context via event-module-owned loader.
-    let mut ctx = (meta.context_loader)(backend, recorded_by, event_id_b64, parsed)?;
+    let mut ctx = match (meta.context_loader)(backend, recorded_by, event_id_b64, parsed)? {
+        ContextLoadResult::Ready(ctx) => ctx,
+        ContextLoadResult::Block { missing } => {
+            if !missing.is_empty() {
+                backend.record_block(recorded_by, event_id_b64, &missing)?;
+            }
+            return Ok((ProjectionDecision::Block { missing }, None));
+        }
+        ContextLoadResult::Reject { reason } => {
+            return Ok((ProjectionDecision::Reject { reason }, None));
+        }
+    };
     ctx.current_transport_key_event_id = current_transport_key_event_id.map(ToOwned::to_owned);
 
     // Dispatch to pure projector

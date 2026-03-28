@@ -10,8 +10,8 @@
 #[cfg(test)]
 mod tests {
     use crate::harness::fixtures::*;
-    use topo::event_modules::message_deletion::project_pure;
     use topo::event_modules::message_deletion::MessageDeletionEvent;
+    use topo::event_modules::message_deletion::{build_projector_context, project_pure};
     use topo::event_modules::ParsedEvent;
     use topo::projection::contract::EmitCommand;
 
@@ -137,9 +137,11 @@ mod tests {
     #[test]
     fn test_deletion_rejects_signer_user_mismatch() {
         let parsed = make_deletion([1u8; 32], [2u8; 32]);
-        let ctx = ctx_with_signer_mismatch("signer peer not linked to author user");
+        let queries = queries_with_ctx(ctx_with_signer_mismatch(
+            "signer peer not linked to author user",
+        ));
 
-        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
-        assert_reject_contains(&result, "signer peer not linked to author user");
+        let result = build_projector_context(&queries, PEER, EVENT_ID, &parsed).unwrap();
+        assert_context_reject_contains(&result, "signer peer not linked to author user");
     }
 }

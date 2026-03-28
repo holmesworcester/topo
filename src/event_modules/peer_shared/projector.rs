@@ -1,14 +1,32 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::queries::define_query_context_loader;
+use crate::projection::queries::{ContextLoadResult, ProjectionQueries};
 
-define_query_context_loader!(
-    build_projector_context,
-    PeerShared,
-    load_peer_shared_context,
-    "peer_shared"
-);
+pub fn build_projector_context(
+    queries: &dyn ProjectionQueries,
+    recorded_by: &str,
+    event_id_b64: &str,
+    parsed: &ParsedEvent,
+) -> Result<ContextLoadResult, Box<dyn std::error::Error>> {
+    let peer_shared = match parsed {
+        ParsedEvent::PeerShared(peer_shared) => peer_shared,
+        _ => return Err("peer_shared context loader called for non-peer_shared event".into()),
+    };
+
+    let ctx = queries.load_peer_shared_context(recorded_by, event_id_b64, peer_shared)?;
+    if let Some(reason) = &ctx.peer_shared_user_mismatch_reason {
+        return Ok(ContextLoadResult::reject(reason.clone()));
+    }
+    if ctx.peer_shared_endpoint_id.is_none() {
+        return Ok(ContextLoadResult::reject(
+            ctx.peer_shared_endpoint_binding_reason
+                .clone()
+                .unwrap_or_else(|| "peer_shared missing endpoint_shared binding".to_string()),
+        ));
+    }
+    Ok(ContextLoadResult::ready(ctx))
+}
 
 /// Pure projector: PeerShared -> peers_shared table.
 ///
@@ -35,16 +53,10 @@ pub fn project_pure(
         ParsedEvent::PeerShared(p) => (&p.public_key, &p.user_event_id, &p.device_name),
         _ => return ProjectorResult::reject("not a peer_shared event".to_string()),
     };
-    if let Some(reason) = &ctx.peer_shared_user_mismatch_reason {
-        return ProjectorResult::reject(reason.clone());
-    }
-    let Some(endpoint_id) = ctx.peer_shared_endpoint_id.as_ref() else {
-        return ProjectorResult::reject(
-            ctx.peer_shared_endpoint_binding_reason
-                .clone()
-                .unwrap_or_else(|| "peer_shared missing endpoint_shared binding".to_string()),
-        );
-    };
+    let endpoint_id = ctx
+        .peer_shared_endpoint_id
+        .as_ref()
+        .expect("peer_shared context loader guarantees endpoint binding");
 
     let user_event_id_b64 = event_id_to_base64(user_event_id);
     let transport_fingerprint = crate::crypto::spki_fingerprint_from_ed25519_pubkey(public_key);
@@ -116,25 +128,6 @@ mod projector_tests {
     }
 
     #[test]
-    fn test_peer_shared_rejects_authorized_user_mismatch() {
-        let result = project_pure(
-            "peer1",
-            "peer-shared-event",
-            &peer_shared_event(),
-            &ContextSnapshot {
-                peer_shared_user_mismatch_reason: Some(
-                    "peer_shared signer authorizes user a but event claims b".to_string(),
-                ),
-                ..ContextSnapshot::default()
-            },
-        );
-        assert!(matches!(
-            result.decision,
-            crate::projection::decision::ProjectionDecision::Reject { .. }
-        ));
-    }
-
-    #[test]
     fn test_peer_shared_rejects_non_peer_shared_event() {
         let other = ParsedEvent::Workspace(WorkspaceEvent {
             created_at_ms: 1,
@@ -147,25 +140,6 @@ mod projector_tests {
             &other,
             &ContextSnapshot {
                 peer_shared_endpoint_id: Some("endpoint-1".to_string()),
-                ..ContextSnapshot::default()
-            },
-        );
-        assert!(matches!(
-            result.decision,
-            crate::projection::decision::ProjectionDecision::Reject { .. }
-        ));
-    }
-
-    #[test]
-    fn test_peer_shared_rejects_missing_endpoint_binding() {
-        let result = project_pure(
-            "peer1",
-            "peer-shared-event",
-            &peer_shared_event(),
-            &ContextSnapshot {
-                peer_shared_endpoint_binding_reason: Some(
-                    "no projected endpoint_shared row for abc".to_string(),
-                ),
                 ..ContextSnapshot::default()
             },
         );

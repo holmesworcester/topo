@@ -1,4 +1,4 @@
-use crate::crypto::event_id_to_base64;
+use crate::crypto::{event_id_to_base64, EventId};
 use crate::event_modules::{
     endpoint_shared::load_endpoint_shared_by_event_id, parse_event, AdminEvent, DeviceInviteEvent,
     FileEvent, FileSliceEvent, InviteAcceptedEvent, KeySharedEvent, MessageDeletionEvent,
@@ -16,6 +16,29 @@ use ed25519_dalek::{SigningKey, VerifyingKey};
 use rusqlite::{Connection, OptionalExtension};
 
 pub(crate) type ProjectionQueryResult<T> = Result<T, Box<dyn std::error::Error>>;
+
+#[derive(Debug, Clone)]
+pub enum ContextLoadResult {
+    Ready(ContextSnapshot),
+    Block { missing: Vec<EventId> },
+    Reject { reason: String },
+}
+
+impl ContextLoadResult {
+    pub fn ready(ctx: ContextSnapshot) -> Self {
+        Self::Ready(ctx)
+    }
+
+    pub fn block(missing: Vec<EventId>) -> Self {
+        Self::Block { missing }
+    }
+
+    pub fn reject(reason: impl Into<String>) -> Self {
+        Self::Reject {
+            reason: reason.into(),
+        }
+    }
+}
 
 pub trait ProjectionQueries {
     fn load_workspace_context(
@@ -112,7 +135,7 @@ macro_rules! define_query_context_loader {
             recorded_by: &str,
             event_id_b64: &str,
             parsed: &$crate::event_modules::ParsedEvent,
-        ) -> Result<$crate::projection::contract::ContextSnapshot, Box<dyn std::error::Error>> {
+        ) -> Result<$crate::projection::queries::ContextLoadResult, Box<dyn std::error::Error>> {
             let event = match parsed {
                 $crate::event_modules::ParsedEvent::$variant(event) => event,
                 _ => {
@@ -122,7 +145,9 @@ macro_rules! define_query_context_loader {
                 }
             };
 
-            queries.$query_method(recorded_by, event_id_b64, event)
+            Ok($crate::projection::queries::ContextLoadResult::ready(
+                queries.$query_method(recorded_by, event_id_b64, event)?,
+            ))
         }
     };
 }

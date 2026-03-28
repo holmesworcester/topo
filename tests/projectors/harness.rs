@@ -5,15 +5,146 @@
 
 #[cfg(test)]
 pub mod fixtures {
+    use topo::event_modules::{
+        AdminEvent, DeviceInviteEvent, FileEvent, FileSliceEvent, InviteAcceptedEvent,
+        KeySharedEvent, MessageDeletionEvent, MessageEvent, PeerSharedEvent, ReactionEvent,
+        UserInviteEvent, WorkspaceEvent,
+    };
     use topo::projection::contract::{
         BootstrapContextSnapshot, ContextSnapshot, EmitCommand, FileDescriptorInfo,
         ProjectorResult, WriteOp,
     };
     use topo::projection::decision::ProjectionDecision;
+    use topo::projection::queries::{ContextLoadResult, ProjectionQueries};
+
+    #[derive(Clone)]
+    pub struct FixtureProjectionQueries {
+        ctx: ContextSnapshot,
+    }
+
+    impl FixtureProjectionQueries {
+        pub fn new(ctx: ContextSnapshot) -> Self {
+            Self { ctx }
+        }
+    }
+
+    impl ProjectionQueries for FixtureProjectionQueries {
+        fn load_workspace_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _workspace: &WorkspaceEvent,
+        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+            Ok(self.ctx.clone())
+        }
+
+        fn load_admin_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _admin: &AdminEvent,
+        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+            Ok(self.ctx.clone())
+        }
+
+        fn load_peer_shared_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _peer_shared: &PeerSharedEvent,
+        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+            Ok(self.ctx.clone())
+        }
+
+        fn load_user_invite_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _user_invite: &UserInviteEvent,
+        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+            Ok(self.ctx.clone())
+        }
+
+        fn load_device_invite_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _device_invite: &DeviceInviteEvent,
+        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+            Ok(self.ctx.clone())
+        }
+
+        fn load_message_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _message: &MessageEvent,
+        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+            Ok(self.ctx.clone())
+        }
+
+        fn load_message_deletion_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _message_deletion: &MessageDeletionEvent,
+        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+            Ok(self.ctx.clone())
+        }
+
+        fn load_reaction_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _reaction: &ReactionEvent,
+        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+            Ok(self.ctx.clone())
+        }
+
+        fn load_file_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _file: &FileEvent,
+        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+            Ok(self.ctx.clone())
+        }
+
+        fn load_file_slice_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _file_slice: &FileSliceEvent,
+        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+            Ok(self.ctx.clone())
+        }
+
+        fn load_invite_accepted_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _invite_accepted: &InviteAcceptedEvent,
+        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+            Ok(self.ctx.clone())
+        }
+
+        fn load_key_shared_context(
+            &self,
+            _recorded_by: &str,
+            _event_id_b64: &str,
+            _key_shared: &KeySharedEvent,
+        ) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+            Ok(self.ctx.clone())
+        }
+    }
 
     /// Default ContextSnapshot with all fields at their zero/empty/false defaults.
     pub fn empty_ctx() -> ContextSnapshot {
         ContextSnapshot::default()
+    }
+
+    pub fn queries_with_ctx(ctx: ContextSnapshot) -> FixtureProjectionQueries {
+        FixtureProjectionQueries::new(ctx)
     }
 
     /// ContextSnapshot with trust anchor set to the given workspace_id base64.
@@ -177,5 +308,34 @@ pub mod fixtures {
             "expected no emit commands, got: {:?}",
             result.emit_commands
         );
+    }
+
+    pub fn assert_context_block(result: &ContextLoadResult) {
+        assert!(
+            matches!(result, ContextLoadResult::Block { .. }),
+            "expected ContextLoadResult::Block, got {:?}",
+            result
+        );
+    }
+
+    pub fn assert_context_reject_contains(result: &ContextLoadResult, substring: &str) {
+        match result {
+            ContextLoadResult::Reject { reason } => {
+                assert!(
+                    reason.contains(substring),
+                    "expected context rejection containing '{}', got '{}'",
+                    substring,
+                    reason
+                );
+            }
+            other => panic!("expected ContextLoadResult::Reject, got {:?}", other),
+        }
+    }
+
+    pub fn expect_context_ready(result: ContextLoadResult) -> ContextSnapshot {
+        match result {
+            ContextLoadResult::Ready(ctx) => ctx,
+            other => panic!("expected ContextLoadResult::Ready, got {:?}", other),
+        }
     }
 }

@@ -152,13 +152,15 @@ pub fn build_projector_context(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+) -> Result<crate::projection::queries::ContextLoadResult, Box<dyn std::error::Error>> {
     let ss = match parsed {
         ParsedEvent::KeyShared(ss) => ss,
         _ => return Err("key_shared context loader called for non-key_shared event".into()),
     };
 
-    queries.load_key_shared_context(recorded_by, event_id_b64, ss)
+    Ok(crate::projection::queries::ContextLoadResult::ready(
+        queries.load_key_shared_context(recorded_by, event_id_b64, ss)?,
+    ))
 }
 
 pub fn project_pure(

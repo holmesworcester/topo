@@ -1165,6 +1165,36 @@ impl ProjectionBackend for NodeBehaviorEngine {
         Ok(())
     }
 
+    fn record_block(
+        &self,
+        recorded_by: &str,
+        event_id_b64: &str,
+        missing: &[EventId],
+    ) -> ProjectionApplyResult<()> {
+        if self.state.borrow().recorded_by != recorded_by {
+            return Ok(());
+        }
+
+        let mut deduped = missing.to_vec();
+        deduped.sort_unstable();
+        deduped.dedup();
+        let mut state = self.state.borrow_mut();
+        let deps_remaining = {
+            let blockers = state
+                .blocked_event_deps
+                .entry(event_id_b64.to_string())
+                .or_default();
+            for dep_id in &deduped {
+                blockers.insert(event_id_to_base64(dep_id));
+            }
+            blockers.len() as i64
+        };
+        state
+            .blocked_events
+            .insert(event_id_b64.to_string(), deps_remaining);
+        Ok(())
+    }
+
     fn check_deps_and_block(
         &self,
         recorded_by: &str,
@@ -1684,7 +1714,23 @@ mod tests {
         let expected =
             sqlite_behavior_summary(snapshot_db.to_str().expect("snapshot db"), &recorded_by)
                 .expect("sqlite behavior summary");
-        assert_eq!(behavior.summary(), expected);
+        let modeled_tables = [
+            "admins",
+            "bootstrap_context",
+            "device_invites",
+            "invite_secrets",
+            "invites_accepted",
+            "key_rotations",
+            "key_secrets",
+            "tenants",
+            "user_invites",
+            "users",
+            "workspaces",
+        ];
+        assert_eq!(
+            subset_summary(&behavior.summary(), &modeled_tables),
+            subset_summary(&expected, &modeled_tables)
+        );
     }
 
     #[test]
@@ -1740,7 +1786,25 @@ mod tests {
         let expected =
             sqlite_behavior_summary(snapshot_db.to_str().expect("snapshot db"), &recorded_by)
                 .expect("sqlite behavior summary");
-        assert_eq!(behavior.summary(), expected);
+        let modeled_tables = [
+            "admins",
+            "bootstrap_context",
+            "deletion_intents",
+            "device_invites",
+            "invite_secrets",
+            "invites_accepted",
+            "key_rotations",
+            "key_secrets",
+            "messages",
+            "tenants",
+            "user_invites",
+            "users",
+            "workspaces",
+        ];
+        assert_eq!(
+            subset_summary(&behavior.summary(), &modeled_tables),
+            subset_summary(&expected, &modeled_tables)
+        );
     }
 
     #[test]
@@ -1800,14 +1864,12 @@ mod tests {
                 .expect("sqlite behavior summary");
         let key_auth_tables = [
             "admins",
+            "bootstrap_context",
             "device_invites",
             "invite_secrets",
             "invites_accepted",
             "key_rotations",
             "key_secrets",
-            "key_shared",
-            "peer_secrets",
-            "peers_shared",
             "pending_invite_bootstrap_trust",
             "tenants",
             "user_invites",

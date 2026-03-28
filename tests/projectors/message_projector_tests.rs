@@ -7,8 +7,8 @@
 #[cfg(test)]
 mod tests {
     use crate::harness::fixtures::*;
-    use topo::event_modules::message::project_pure;
     use topo::event_modules::message::MessageEvent;
+    use topo::event_modules::message::{build_projector_context, project_pure};
     use topo::event_modules::ParsedEvent;
     use topo::projection::contract::{DeletionIntentInfo, EmitCommand};
 
@@ -45,10 +45,12 @@ mod tests {
     #[test]
     fn test_message_rejects_signer_user_mismatch() {
         let parsed = make_message([2u8; 32]);
-        let ctx = ctx_with_signer_mismatch("signer peer not linked to author user");
+        let queries = queries_with_ctx(ctx_with_signer_mismatch(
+            "signer peer not linked to author user",
+        ));
 
-        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
-        assert_reject_contains(&result, "signer peer not linked to author user");
+        let result = build_projector_context(&queries, PEER, EVENT_ID, &parsed).unwrap();
+        assert_context_reject_contains(&result, "signer peer not linked to author user");
     }
 
     // ── CHK_MSG_DELETE_BEFORE_CREATE: pass (tombstone on arrival) ──

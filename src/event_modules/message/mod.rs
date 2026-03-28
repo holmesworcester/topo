@@ -12,7 +12,7 @@ pub use commands::{
     CreateMessageDeletionCmd, DeleteResponse, GenerateFilesResponse, GenerateResponse,
     SendFileResponse,
 };
-pub use projector::project_pure;
+pub use projector::{build_projector_context, project_pure};
 pub use queries::{count, list, list_deleted_ids, list_rows, resolve, resolve_number, MessageRow};
 pub use wire::{encode_message, parse_message, MessageEvent, MESSAGE_META, MESSAGE_WIRE_SIZE};
 

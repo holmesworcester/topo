@@ -107,7 +107,7 @@ pub fn build_projector_context(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
+) -> Result<crate::projection::queries::ContextLoadResult, Box<dyn std::error::Error>> {
     let ia = match parsed {
         ParsedEvent::InviteAccepted(ia) => ia,
         _ => {
@@ -117,7 +117,9 @@ pub fn build_projector_context(
         }
     };
 
-    queries.load_invite_accepted_context(recorded_by, event_id_b64, ia)
+    Ok(crate::projection::queries::ContextLoadResult::ready(
+        queries.load_invite_accepted_context(recorded_by, event_id_b64, ia)?,
+    ))
 }
 
 /// Pure projector: InviteAccepted — local trust-anchor binding.

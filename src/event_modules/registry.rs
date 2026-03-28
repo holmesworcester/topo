@@ -2,7 +2,7 @@ use std::collections::HashMap;
 
 use super::{EventError, ParsedEvent};
 use crate::projection::contract::{ContextSnapshot, ProjectorResult};
-use crate::projection::queries::ProjectionQueries;
+use crate::projection::queries::{ContextLoadResult, ProjectionQueries};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ShareScope {
@@ -53,7 +53,7 @@ pub struct EventTypeMeta {
         &str,
         &str,
         &ParsedEvent,
-    ) -> Result<ContextSnapshot, Box<dyn std::error::Error>>,
+    ) -> Result<ContextLoadResult, Box<dyn std::error::Error>>,
 }
 
 /// Default context loader for event types whose projectors do not require
@@ -63,8 +63,8 @@ pub fn load_empty_context(
     _recorded_by: &str,
     _event_id_b64: &str,
     _parsed: &ParsedEvent,
-) -> Result<ContextSnapshot, Box<dyn std::error::Error>> {
-    Ok(ContextSnapshot::default())
+) -> Result<ContextLoadResult, Box<dyn std::error::Error>> {
+    Ok(ContextLoadResult::ready(ContextSnapshot::default()))
 }
 
 pub struct EventRegistry {

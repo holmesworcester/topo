@@ -5,7 +5,7 @@ pub mod wire;
 
 // Re-export stable public API so callers import from `event_modules::reaction`.
 pub use commands::{create, react, react_for_peer, CreateReactionCmd, ReactResponse};
-pub use projector::project_pure;
+pub use projector::{build_projector_context, project_pure};
 pub use queries::{
     count, list, list_for_message, list_for_message_with_authors, list_rows, ReactionItem,
     ReactionRow, ReactionWithAuthor,

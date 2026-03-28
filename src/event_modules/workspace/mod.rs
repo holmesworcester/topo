@@ -10,7 +10,7 @@ pub mod wire;
 
 // Re-export stable public API so callers import from `event_modules::workspace`.
 pub use authoring::{load_local_authoring_context, LocalAuthoringContext};
-pub use projector::project_pure;
+pub use projector::{build_projector_context, project_pure};
 pub use queries::{
     content_keys, keys, list, list_all_items, list_items, list_tenants_for_display, name,
     resolve_workspace_for_peer, status, view, view_for_peer, ContentKeysResponse, KeysResponse,

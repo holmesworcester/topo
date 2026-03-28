@@ -1,23 +1,36 @@
 use super::super::ParsedEvent;
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::queries::define_query_context_loader;
+use crate::projection::queries::{ContextLoadResult, ProjectionQueries};
 
-define_query_context_loader!(build_projector_context, Admin, load_admin_context, "admin");
+pub fn build_projector_context(
+    queries: &dyn ProjectionQueries,
+    recorded_by: &str,
+    event_id_b64: &str,
+    parsed: &ParsedEvent,
+) -> Result<ContextLoadResult, Box<dyn std::error::Error>> {
+    let admin = match parsed {
+        ParsedEvent::Admin(admin) => admin,
+        _ => return Err("admin context loader called for non-admin event".into()),
+    };
+
+    let ctx = queries.load_admin_context(recorded_by, event_id_b64, admin)?;
+    if let Some(reason) = &ctx.admin_user_key_mismatch_reason {
+        return Ok(ContextLoadResult::reject(reason.clone()));
+    }
+    Ok(ContextLoadResult::ready(ctx))
+}
 
 /// Pure projector: Admin -> admins table.
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    ctx: &ContextSnapshot,
+    _ctx: &ContextSnapshot,
 ) -> ProjectorResult {
     let public_key = match parsed {
         ParsedEvent::Admin(a) => &a.public_key,
         _ => return ProjectorResult::reject("not an admin event".to_string()),
     };
-    if let Some(reason) = &ctx.admin_user_key_mismatch_reason {
-        return ProjectorResult::reject(reason.clone());
-    }
 
     let ops = vec![WriteOp::InsertOrIgnore {
         table: "admins",
@@ -60,25 +73,6 @@ mod projector_tests {
             crate::projection::decision::ProjectionDecision::Valid
         ));
         assert_eq!(result.write_ops.len(), 1);
-    }
-
-    #[test]
-    fn test_admin_rejects_user_key_mismatch() {
-        let result = project_pure(
-            "peer1",
-            "admin-event",
-            &admin_event(),
-            &ContextSnapshot {
-                admin_user_key_mismatch_reason: Some(
-                    "admin public_key does not match user public_key".to_string(),
-                ),
-                ..ContextSnapshot::default()
-            },
-        );
-        assert!(matches!(
-            result.decision,
-            crate::projection::decision::ProjectionDecision::Reject { .. }
-        ));
     }
 
     #[test]

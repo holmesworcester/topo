@@ -1,14 +1,29 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::queries::define_query_context_loader;
+use crate::projection::queries::{ContextLoadResult, ProjectionQueries};
 
-define_query_context_loader!(
-    build_projector_context,
-    MessageDeletion,
-    load_message_deletion_context,
-    "message_deletion"
-);
+pub fn build_projector_context(
+    queries: &dyn ProjectionQueries,
+    recorded_by: &str,
+    event_id_b64: &str,
+    parsed: &ParsedEvent,
+) -> Result<ContextLoadResult, Box<dyn std::error::Error>> {
+    let message_deletion = match parsed {
+        ParsedEvent::MessageDeletion(message_deletion) => message_deletion,
+        _ => {
+            return Err(
+                "message_deletion context loader called for non-message_deletion event".into(),
+            )
+        }
+    };
+
+    let ctx = queries.load_message_deletion_context(recorded_by, event_id_b64, message_deletion)?;
+    if let Some(reason) = &ctx.signer_user_mismatch_reason {
+        return Ok(ContextLoadResult::reject(reason.clone()));
+    }
+    Ok(ContextLoadResult::ready(ctx))
+}
 
 /// Pure projector: MessageDeletion -> two-stage deletion intent + tombstone model.
 ///
@@ -28,10 +43,6 @@ pub fn project_pure(
         ParsedEvent::MessageDeletion(d) => d,
         _ => return ProjectorResult::reject("not a message_deletion event".to_string()),
     };
-
-    if let Some(reason) = &ctx.signer_user_mismatch_reason {
-        return ProjectorResult::reject(reason.clone());
-    }
 
     let target_b64 = event_id_to_base64(&del.target_event_id);
     let del_author_b64 = event_id_to_base64(&del.author_id);

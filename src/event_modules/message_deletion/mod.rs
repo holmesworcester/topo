@@ -5,7 +5,7 @@ pub mod wire;
 
 // Re-export stable public API so callers import from `event_modules::message_deletion`.
 pub use commands::{create, delete_message, CreateMessageDeletionCmd};
-pub use projector::project_pure;
+pub use projector::{build_projector_context, project_pure};
 pub use queries::list_deleted_ids;
 pub use wire::{
     encode_message_deletion, parse_message_deletion, MessageDeletionEvent, MESSAGE_DELETION_META,

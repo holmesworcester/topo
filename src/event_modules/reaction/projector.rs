@@ -1,14 +1,25 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::queries::define_query_context_loader;
+use crate::projection::queries::{ContextLoadResult, ProjectionQueries};
 
-define_query_context_loader!(
-    build_projector_context,
-    Reaction,
-    load_reaction_context,
-    "reaction"
-);
+pub fn build_projector_context(
+    queries: &dyn ProjectionQueries,
+    recorded_by: &str,
+    event_id_b64: &str,
+    parsed: &ParsedEvent,
+) -> Result<ContextLoadResult, Box<dyn std::error::Error>> {
+    let reaction = match parsed {
+        ParsedEvent::Reaction(reaction) => reaction,
+        _ => return Err("reaction context loader called for non-reaction event".into()),
+    };
+
+    let ctx = queries.load_reaction_context(recorded_by, event_id_b64, reaction)?;
+    if let Some(reason) = &ctx.signer_user_mismatch_reason {
+        return Ok(ContextLoadResult::reject(reason.clone()));
+    }
+    Ok(ContextLoadResult::ready(ctx))
+}
 
 /// Pure projector: Reaction → reactions table insert.
 ///
@@ -27,10 +38,6 @@ pub fn project_pure(
 
     if rxn.emoji.trim().is_empty() {
         return ProjectorResult::reject("reaction content must not be empty".to_string());
-    }
-
-    if let Some(reason) = &ctx.signer_user_mismatch_reason {
-        return ProjectorResult::reject(reason.clone());
     }
 
     let target_id_b64 = event_id_to_base64(&rxn.target_event_id);

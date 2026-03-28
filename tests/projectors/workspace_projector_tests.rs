@@ -8,7 +8,7 @@
 #[cfg(test)]
 mod tests {
     use crate::harness::fixtures::*;
-    use topo::event_modules::workspace::{project_pure, WorkspaceEvent};
+    use topo::event_modules::workspace::{build_projector_context, project_pure, WorkspaceEvent};
     use topo::event_modules::ParsedEvent;
 
     const PEER: &str = "peer_alice";
@@ -28,7 +28,10 @@ mod tests {
         let ws_id = [1u8; 32];
         let ws_id_b64 = b64(&ws_id);
         let parsed = make_workspace([2u8; 32]);
-        let ctx = ctx_with_anchor(&ws_id_b64);
+        let queries = queries_with_ctx(ctx_with_anchor(&ws_id_b64));
+        let ctx = expect_context_ready(
+            build_projector_context(&queries, PEER, &ws_id_b64, &parsed).unwrap(),
+        );
 
         let result = project_pure(PEER, &ws_id_b64, &parsed, &ctx);
         assert_valid(&result);
@@ -43,10 +46,10 @@ mod tests {
         let ws_id = [1u8; 32];
         let ws_id_b64 = b64(&ws_id);
         let parsed = make_workspace([2u8; 32]);
-        let ctx = empty_ctx(); // no trust anchor
+        let queries = queries_with_ctx(empty_ctx());
 
-        let result = project_pure(PEER, &ws_id_b64, &parsed, &ctx);
-        assert_block(&result);
+        let result = build_projector_context(&queries, PEER, &ws_id_b64, &parsed).unwrap();
+        assert_context_block(&result);
     }
 
     // ── SPEC_WS_ANCHOR_02: break ──
@@ -57,10 +60,10 @@ mod tests {
         let ws_id_b64 = b64(&ws_id);
         let other_anchor = b64(&[99u8; 32]);
         let parsed = make_workspace([2u8; 32]);
-        let ctx = ctx_with_anchor(&other_anchor);
+        let queries = queries_with_ctx(ctx_with_anchor(&other_anchor));
 
-        let result = project_pure(PEER, &ws_id_b64, &parsed, &ctx);
-        assert_reject_contains(&result, "does not match accepted invite binding");
+        let result = build_projector_context(&queries, PEER, &ws_id_b64, &parsed).unwrap();
+        assert_context_reject_contains(&result, "does not match accepted invite binding");
     }
 
     // ── SPEC_WS_SINGLE_01: pass (InsertOrIgnore ensures at-most-one) ──
@@ -70,7 +73,10 @@ mod tests {
         let ws_id = [1u8; 32];
         let ws_id_b64 = b64(&ws_id);
         let parsed = make_workspace([2u8; 32]);
-        let ctx = ctx_with_anchor(&ws_id_b64);
+        let queries = queries_with_ctx(ctx_with_anchor(&ws_id_b64));
+        let ctx = expect_context_ready(
+            build_projector_context(&queries, PEER, &ws_id_b64, &parsed).unwrap(),
+        );
 
         let result = project_pure(PEER, &ws_id_b64, &parsed, &ctx);
         assert_valid(&result);
