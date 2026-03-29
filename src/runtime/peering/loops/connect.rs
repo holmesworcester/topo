@@ -55,6 +55,7 @@ pub struct ConnectLoopConfig {
     pub recorded_by: String,
     pub endpoint: TransportEndpoint,
     pub remote: Option<SocketAddr>,
+    pub relay_url: Option<String>,
     pub remote_session_peer_id: String,
     pub ingest: IngestFns,
     pub shutdown: Option<CancellationToken>,
@@ -79,6 +80,7 @@ pub async fn connect_loop(
             &local_daemon_peer_id,
             config.endpoint,
             config.remote,
+            config.relay_url.as_deref(),
             &config.remote_session_peer_id,
             config
                 .expected_remote_daemon_peer_id
@@ -102,6 +104,7 @@ async fn connect_loop_inner(
     local_daemon_peer_id: &str,
     endpoint: TransportEndpoint,
     remote: Option<SocketAddr>,
+    relay_url: Option<&str>,
     remote_session_peer_id: &str,
     expected_remote_daemon_peer_id: &str,
     auth_plan: OutboundSessionAuthPlan,
@@ -115,7 +118,7 @@ async fn connect_loop_inner(
     let mut last_outbound_window_scope = None;
     let mut live_session_peer_registration = None;
 
-    let remote_target = describe_remote_target(remote, expected_remote_daemon_peer_id);
+    let remote_target = describe_remote_target(remote, relay_url, expected_remote_daemon_peer_id);
 
     loop {
         if shutdown.is_cancelled() {
@@ -143,6 +146,7 @@ async fn connect_loop_inner(
                 outcome = dial_daemon_ongoing_first(
                     &endpoint,
                     remote,
+                    relay_url,
                     expected_remote_daemon_peer_id,
                 ) => outcome,
             } {
@@ -353,8 +357,9 @@ async fn connect_loop_inner(
                 db_path,
                 recorded_by,
                 &auth_result,
-                &session.remote_addr,
+                session.remote_addr,
             );
+            let session_remote_label = session.remote_label.clone();
 
             let session_ok = super::run_session(
                 &initiator_handler,
@@ -362,7 +367,7 @@ async fn connect_loop_inner(
                 session.io,
                 recorded_by,
                 peer_fp,
-                session.remote_addr,
+                session_remote_label,
                 SessionDirection::Outbound,
                 db_path,
             )
@@ -423,19 +428,21 @@ fn record_authenticated_outbound_session(
     db_path: &str,
     recorded_by: &str,
     auth_result: &crate::transport::OutboundSessionAuthResult,
-    remote_addr: &SocketAddr,
+    remote_addr: Option<SocketAddr>,
 ) {
     let now = current_timestamp_ms();
     if let Ok(db) = open_connection(db_path) {
-        let _ = record_endpoint_observation(
-            &db,
-            recorded_by,
-            &auth_result.session_peer_id,
-            &remote_addr.ip().to_string(),
-            remote_addr.port(),
-            now,
-            ENDPOINT_TTL_MS,
-        );
+        if let Some(remote_addr) = remote_addr {
+            let _ = record_endpoint_observation(
+                &db,
+                recorded_by,
+                &auth_result.session_peer_id,
+                &remote_addr.ip().to_string(),
+                remote_addr.port(),
+                now,
+                ENDPOINT_TTL_MS,
+            );
+        }
         if let Some(ref canonical_remote_peer_id) = auth_result.canonical_remote_peer_id {
             if let Some(remote_daemon_fp) =
                 peer_fingerprint_from_hex(&auth_result.remote_daemon_peer_id)
@@ -454,14 +461,21 @@ fn record_authenticated_outbound_session(
 
 fn describe_remote_target(
     remote: Option<SocketAddr>,
+    relay_url: Option<&str>,
     expected_remote_daemon_peer_id: &str,
 ) -> String {
     match remote {
         Some(remote) => remote.to_string(),
-        None => format!(
-            "iroh lookup for {}",
-            super::short_peer_id(expected_remote_daemon_peer_id)
-        ),
+        None => match relay_url {
+            Some(relay_url) => format!(
+                "iroh relay {relay_url} for {}",
+                super::short_peer_id(expected_remote_daemon_peer_id)
+            ),
+            None => format!(
+                "iroh lookup for {}",
+                super::short_peer_id(expected_remote_daemon_peer_id)
+            ),
+        },
     }
 }
 
@@ -554,8 +568,9 @@ struct DialOutcome {
 async fn dial_daemon_ongoing_first(
     endpoint: &TransportEndpoint,
     remote: Option<SocketAddr>,
+    relay_url: Option<&str>,
     sni: &str,
 ) -> Result<DialOutcome, ConnectionLifecycleError> {
-    let daemon_connection = dial_daemon_connection_target(endpoint, remote, sni).await?;
+    let daemon_connection = dial_daemon_connection_target(endpoint, remote, relay_url, sni).await?;
     Ok(DialOutcome { daemon_connection })
 }

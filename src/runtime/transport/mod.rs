@@ -7,7 +7,6 @@ pub mod identity_adapter;
 pub mod multi_workspace;
 pub mod peering_boundary;
 pub mod session_auth;
-pub mod session_carrier;
 pub mod session_factory;
 pub mod transport_session_io;
 

@@ -335,11 +335,12 @@ async fn run_bootstrap_refresher(
         match collect_all_bootstrap_targets(&db_path) {
             Ok(targets) => {
                 warning_gate.clear();
-                for (tenant_id, peer_id, invite_event_id, remote) in targets {
+                for (tenant_id, peer_id, invite_event_id, remote, relay_url) in targets {
                     if ingress_tx
                         .send(TargetIngressEvent {
                             tenant_id,
                             remote,
+                            relay_url,
                             source: TargetIngressSource::Bootstrap {
                                 daemon_peer_id: peer_id,
                                 invite_event_id,
@@ -393,6 +394,7 @@ async fn run_known_peer_refresher(
                         .send(TargetIngressEvent {
                             tenant_id,
                             remote,
+                            relay_url: None,
                             source: TargetIngressSource::KnownPeer { peer_id },
                         })
                         .is_err()

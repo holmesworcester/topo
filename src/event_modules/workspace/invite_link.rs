@@ -13,7 +13,8 @@ pub use super::bootstrap_address::{
 
 const INVITE_PREFIX: &str = "topo://invite/";
 const LINK_PREFIX: &str = "topo://link/";
-const INVITE_LINK_VERSION: u8 = 5;
+const INVITE_LINK_VERSION: u8 = 6;
+const LEGACY_INVITE_LINK_VERSION: u8 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InviteLinkKind {
@@ -39,7 +40,8 @@ pub struct ParsedInviteLink {
     pub workspace_id: EventId,
     pub invite_type: InviteType,
     pub bootstrap_addrs: Vec<BootstrapAddress>,
-    pub daemon_spki_fingerprint: [u8; 32],
+    pub endpoint_id: [u8; 32],
+    pub relay_url: Option<String>,
 }
 
 impl ParsedInviteLink {
@@ -75,19 +77,21 @@ impl From<BootstrapAddressError> for InviteLinkError {
 }
 
 // ---------------------------------------------------------------------------
-// Plaintext invite link format (v5)
+// Plaintext invite link format (v6)
 //
 // All fields are hex-encoded and slash-delimited with self-explanatory labels.
 // No spaces, no base64 — fully readable and continuously linkifiable.
 //
 // User invite:
-//   topo://invite/v5/user/INVITE_ID.<hex64>/INVITE_PRIVKEY.<hex64>/WORKSPACE.<hex64>/DAEMON_SPKI_PUBKEY.<hex64>/ADDRESS.<a1>,<a2>
+//   topo://invite/v6/user/INVITE_ID.<hex64>/INVITE_PRIVKEY.<hex64>/WORKSPACE.<hex64>/ENDPOINT_ID.<hex64>/RELAY_URL.<hex(url)>/ADDRESS.<a1>,<a2>
 //
 // Device-link invite:
-//   topo://link/v5/device_link/INVITE_ID.<hex64>/INVITE_PRIVKEY.<hex64>/WORKSPACE.<hex64>/USER_ID.<hex64>/DAEMON_SPKI_PUBKEY.<hex64>/ADDRESS.<a1>,<a2>
+//   topo://link/v6/device_link/INVITE_ID.<hex64>/INVITE_PRIVKEY.<hex64>/WORKSPACE.<hex64>/USER_ID.<hex64>/ENDPOINT_ID.<hex64>/RELAY_URL.<hex(url)>/ADDRESS.<a1>,<a2>
 //
-// `ADDRESS.` may be empty, representing an invite that relies entirely on
-// later discovery/recovery rather than embedded bootstrap endpoints.
+// `RELAY_URL.` is optional. When present, an invite can bootstrap over iroh
+// relay/rendezvous even if `ADDRESS.` is empty. `ADDRESS.` may be empty,
+// representing an invite that relies on relay or later discovery/recovery
+// rather than embedded direct bootstrap endpoints.
 //
 // Address tokens: port omitted when default 4433.  IPv6 is fully expanded
 // as 8 dash-separated groups of 4 hex digits (no brackets) to stay
@@ -98,7 +102,16 @@ impl From<BootstrapAddressError> for InviteLinkError {
 pub fn create_invite_link(
     invite: &InviteData,
     bootstrap_addrs: &[BootstrapAddress],
-    daemon_spki: &[u8; 32],
+    endpoint_id: &[u8; 32],
+) -> Result<String, InviteLinkError> {
+    create_invite_link_with_relay(invite, bootstrap_addrs, endpoint_id, None)
+}
+
+pub fn create_invite_link_with_relay(
+    invite: &InviteData,
+    bootstrap_addrs: &[BootstrapAddress],
+    endpoint_id: &[u8; 32],
+    relay_url: Option<&str>,
 ) -> Result<String, InviteLinkError> {
     for addr in bootstrap_addrs {
         addr.validate()?;
@@ -114,9 +127,12 @@ pub fn create_invite_link(
     };
 
     let addr_tokens: Vec<String> = bootstrap_addrs.iter().map(|a| a.to_link_token()).collect();
+    let relay_segment = relay_url
+        .map(|url| format!("/RELAY_URL.{}", hex::encode(url.as_bytes())))
+        .unwrap_or_default();
 
     Ok(format!(
-        "{prefix}v{ver}/{kind}/INVITE_ID.{eid}/INVITE_PRIVKEY.{key}/WORKSPACE.{wid}{uid}/DAEMON_SPKI_PUBKEY.{spki}/ADDRESS.{addrs}",
+        "{prefix}v{ver}/{kind}/INVITE_ID.{eid}/INVITE_PRIVKEY.{key}/WORKSPACE.{wid}{uid}/ENDPOINT_ID.{endpoint_id}{relay}/ADDRESS.{addrs}",
         prefix = prefix,
         ver = INVITE_LINK_VERSION,
         kind = kind_str,
@@ -124,7 +140,8 @@ pub fn create_invite_link(
         key = hex::encode(invite.invite_key.to_bytes()),
         wid = hex::encode(invite.workspace_id),
         uid = user_segment.as_deref().unwrap_or(""),
-        spki = hex::encode(daemon_spki),
+        endpoint_id = hex::encode(endpoint_id),
+        relay = relay_segment,
         addrs = addr_tokens.join(","),
     ))
 }
@@ -148,7 +165,7 @@ pub fn parse_invite_link(link: &str) -> Result<ParsedInviteLink, InviteLinkError
         .strip_prefix('v')
         .and_then(|v| v.parse().ok())
         .ok_or_else(|| InviteLinkError::Decode(format!("bad version: {}", version_str)))?;
-    if version != INVITE_LINK_VERSION {
+    if version != INVITE_LINK_VERSION && version != LEGACY_INVITE_LINK_VERSION {
         return Err(InviteLinkError::InvalidPayload(format!(
             "unsupported version {}",
             version
@@ -189,7 +206,32 @@ pub fn parse_invite_link(link: &str) -> Result<ParsedInviteLink, InviteLinkError
     let invite_event_id = require_hex32("INVITE_ID.", "invite_event_id")?;
     let invite_private_key = require_hex32("INVITE_PRIVKEY.", "invite_private_key")?;
     let workspace_id = require_hex32("WORKSPACE.", "workspace_id")?;
-    let daemon_spki_fingerprint = require_hex32("DAEMON_SPKI_PUBKEY.", "daemon_spki")?;
+    let endpoint_id = find_field("ENDPOINT_ID.")
+        .map(|hex_str| {
+            let bytes = hex::decode(hex_str)
+                .map_err(|e| InviteLinkError::Decode(format!("endpoint_id: {}", e)))?;
+            if bytes.len() != 32 {
+                return Err(InviteLinkError::InvalidPayload(format!(
+                    "endpoint_id must be 32 bytes, got {}",
+                    bytes.len()
+                )));
+            }
+            let mut arr = [0u8; 32];
+            arr.copy_from_slice(&bytes);
+            Ok(arr)
+        })
+        .transpose()?
+        .or_else(|| require_hex32("DAEMON_SPKI_PUBKEY.", "daemon_spki").ok())
+        .ok_or_else(|| InviteLinkError::Decode("missing endpoint_id".to_string()))?;
+    let relay_url = find_field("RELAY_URL.")
+        .map(|hex_str| {
+            let bytes = hex::decode(hex_str)
+                .map_err(|e| InviteLinkError::Decode(format!("relay_url: {}", e)))?;
+            String::from_utf8(bytes).map_err(|e| {
+                InviteLinkError::InvalidPayload(format!("relay_url is not utf-8: {e}"))
+            })
+        })
+        .transpose()?;
 
     // Addresses
     let addr_str = find_field("ADDRESS.")
@@ -233,7 +275,8 @@ pub fn parse_invite_link(link: &str) -> Result<ParsedInviteLink, InviteLinkError
         workspace_id,
         invite_type,
         bootstrap_addrs,
-        daemon_spki_fingerprint,
+        endpoint_id,
+        relay_url,
     })
 }
 
@@ -253,7 +296,12 @@ pub fn rewrite_bootstrap_addrs(
         workspace_id: parsed.workspace_id,
         invite_type: parsed.invite_type,
     };
-    create_invite_link(&invite_data, new_addrs, &parsed.daemon_spki_fingerprint)
+    create_invite_link_with_relay(
+        &invite_data,
+        new_addrs,
+        &parsed.endpoint_id,
+        parsed.relay_url.as_deref(),
+    )
 }
 
 #[cfg(test)]
@@ -272,14 +320,14 @@ mod tests {
             ip: "127.0.0.1".parse().unwrap(),
             port: 4433,
         }];
-        let bootstrap_spki = [4u8; 32];
-        let link = create_invite_link(&invite, &bootstrap_addrs, &bootstrap_spki).unwrap();
+        let endpoint_id = [4u8; 32];
+        let link = create_invite_link(&invite, &bootstrap_addrs, &endpoint_id).unwrap();
         assert!(link.starts_with(INVITE_PREFIX));
         // Verify plaintext fields are visible
         assert!(link.contains("/INVITE_ID."));
         assert!(link.contains("/INVITE_PRIVKEY."));
         assert!(link.contains("/WORKSPACE."));
-        assert!(link.contains("/DAEMON_SPKI_PUBKEY."));
+        assert!(link.contains("/ENDPOINT_ID."));
         assert!(link.contains("/ADDRESS."));
         assert!(!link.contains(' '));
 
@@ -289,7 +337,8 @@ mod tests {
         assert_eq!(parsed.invite_private_key, invite.invite_key.to_bytes());
         assert_eq!(parsed.workspace_id, invite.workspace_id);
         assert_eq!(parsed.bootstrap_addrs, bootstrap_addrs);
-        assert_eq!(parsed.daemon_spki_fingerprint, bootstrap_spki);
+        assert_eq!(parsed.endpoint_id, endpoint_id);
+        assert_eq!(parsed.relay_url, None);
         assert!(matches!(parsed.invite_type, InviteType::User));
     }
 
@@ -315,8 +364,8 @@ mod tests {
                 port: 7443,
             },
         ];
-        let bootstrap_spki = [13u8; 32];
-        let link = create_invite_link(&invite, &bootstrap_addrs, &bootstrap_spki).unwrap();
+        let endpoint_id = [13u8; 32];
+        let link = create_invite_link(&invite, &bootstrap_addrs, &endpoint_id).unwrap();
         let parsed = parse_invite_link(&link).unwrap();
         assert_eq!(parsed.bootstrap_addrs.len(), 3);
         assert_eq!(parsed.bootstrap_addrs, bootstrap_addrs);
@@ -343,8 +392,8 @@ mod tests {
             ip: "127.0.0.1".parse().unwrap(),
             port: 5555,
         }];
-        let bootstrap_spki = [8u8; 32];
-        let link = create_invite_link(&invite, &bootstrap_addrs, &bootstrap_spki).unwrap();
+        let endpoint_id = [8u8; 32];
+        let link = create_invite_link(&invite, &bootstrap_addrs, &endpoint_id).unwrap();
         assert!(link.starts_with(LINK_PREFIX));
         assert!(link.contains("/USER_ID."));
 
@@ -354,7 +403,8 @@ mod tests {
         assert_eq!(parsed.invite_private_key, invite.invite_key.to_bytes());
         assert_eq!(parsed.workspace_id, invite.workspace_id);
         assert_eq!(parsed.bootstrap_addrs, bootstrap_addrs);
-        assert_eq!(parsed.daemon_spki_fingerprint, bootstrap_spki);
+        assert_eq!(parsed.endpoint_id, endpoint_id);
+        assert_eq!(parsed.relay_url, None);
         match parsed.invite_type {
             InviteType::DeviceLink {
                 user_event_id: parsed_user_event_id,
@@ -373,12 +423,12 @@ mod tests {
             workspace_id: [13u8; 32],
             invite_type: InviteType::User,
         };
-        let bootstrap_spki = [14u8; 32];
+        let endpoint_id = [14u8; 32];
         let addrs = vec![BootstrapAddress::Ipv6 {
             ip: "2001:4860:4860::8888".parse().unwrap(),
             port: 4433,
         }];
-        let link = create_invite_link(&invite, &addrs, &bootstrap_spki).unwrap();
+        let link = create_invite_link(&invite, &addrs, &endpoint_id).unwrap();
         // Link should NOT contain brackets
         assert!(!link.contains('['));
         assert!(!link.contains(']'));
@@ -401,12 +451,12 @@ mod tests {
             workspace_id: [17u8; 32],
             invite_type: InviteType::User,
         };
-        let bootstrap_spki = [18u8; 32];
+        let endpoint_id = [18u8; 32];
         let addrs = vec![BootstrapAddress::Ipv6 {
             ip: "::1".parse().unwrap(),
             port: 7443,
         }];
-        let link = create_invite_link(&invite, &addrs, &bootstrap_spki).unwrap();
+        let link = create_invite_link(&invite, &addrs, &endpoint_id).unwrap();
         assert!(!link.contains('['));
         assert!(!link.contains(']'));
         assert!(link.contains("0000-0000-0000-0000-0000-0000-0000-0001_7443"));
@@ -422,12 +472,12 @@ mod tests {
             workspace_id: [23u8; 32],
             invite_type: InviteType::User,
         };
-        let bootstrap_spki = [24u8; 32];
+        let endpoint_id = [24u8; 32];
         let addrs = vec![BootstrapAddress::Hostname {
             host: "example.com".to_string(),
             port: 7000,
         }];
-        let link = create_invite_link(&invite, &addrs, &bootstrap_spki).unwrap();
+        let link = create_invite_link(&invite, &addrs, &endpoint_id).unwrap();
         let parsed = parse_invite_link(&link).unwrap();
         assert_eq!(parsed.bootstrap_addrs, addrs);
         assert_eq!(parsed.bootstrap_addr_strings(), vec!["example.com:7000"]);
@@ -441,12 +491,13 @@ mod tests {
             workspace_id: [3u8; 32],
             invite_type: InviteType::User,
         };
-        let bootstrap_spki = [4u8; 32];
-        let link = create_invite_link(&invite, &[], &bootstrap_spki).unwrap();
+        let endpoint_id = [4u8; 32];
+        let link = create_invite_link(&invite, &[], &endpoint_id).unwrap();
         assert!(link.ends_with("/ADDRESS."));
         let parsed = parse_invite_link(&link).unwrap();
         assert!(parsed.bootstrap_addrs.is_empty());
-        assert_eq!(parsed.daemon_spki_fingerprint, bootstrap_spki);
+        assert_eq!(parsed.endpoint_id, endpoint_id);
+        assert_eq!(parsed.relay_url, None);
     }
 
     #[test]
@@ -508,8 +559,8 @@ mod tests {
             ip: "192.168.1.1".parse().unwrap(),
             port: 4433,
         }];
-        let spki = [0xdd; 32];
-        let link = create_invite_link(&invite, &addrs, &spki).unwrap();
+        let endpoint_id = [0xdd; 32];
+        let link = create_invite_link(&invite, &addrs, &endpoint_id).unwrap();
 
         // The link should contain readable hex for all fields
         assert!(link.contains(&hex::encode([0xaa; 32])));
@@ -536,5 +587,46 @@ mod tests {
         assert!(!link.contains('~'));
         assert!(!link.contains('{'));
         assert!(!link.contains('}'));
+    }
+
+    #[test]
+    fn test_relay_url_roundtrip_with_empty_addrs() {
+        let invite = InviteData {
+            invite_event_id: [1u8; 32],
+            invite_key: SigningKey::from_bytes(&[2u8; 32]),
+            workspace_id: [3u8; 32],
+            invite_type: InviteType::User,
+        };
+        let endpoint_id = [4u8; 32];
+        let relay_url = "https://usw1-1.relay.n0.iroh-canary.iroh.link./";
+        let link =
+            create_invite_link_with_relay(&invite, &[], &endpoint_id, Some(relay_url)).unwrap();
+        assert!(link.contains("/RELAY_URL."));
+
+        let parsed = parse_invite_link(&link).expect("parse relay invite link");
+        assert!(parsed.bootstrap_addrs.is_empty());
+        assert_eq!(parsed.endpoint_id, endpoint_id);
+        assert_eq!(parsed.relay_url.as_deref(), Some(relay_url));
+    }
+
+    #[test]
+    fn test_legacy_v5_daemon_spki_link_still_parses() {
+        let link = format!(
+            "{prefix}v5/user/INVITE_ID.{invite}/INVITE_PRIVKEY.{key}/WORKSPACE.{workspace}/DAEMON_SPKI_PUBKEY.{endpoint}/ADDRESS.",
+            prefix = INVITE_PREFIX,
+            invite = hex::encode([1u8; 32]),
+            key = hex::encode([2u8; 32]),
+            workspace = hex::encode([3u8; 32]),
+            endpoint = hex::encode([4u8; 32]),
+        );
+
+        let parsed = parse_invite_link(&link).expect("parse legacy v5 invite link");
+        assert_eq!(parsed.kind, InviteLinkKind::User);
+        assert_eq!(parsed.invite_event_id, [1u8; 32]);
+        assert_eq!(parsed.invite_private_key, [2u8; 32]);
+        assert_eq!(parsed.workspace_id, [3u8; 32]);
+        assert_eq!(parsed.endpoint_id, [4u8; 32]);
+        assert!(parsed.bootstrap_addrs.is_empty());
+        assert_eq!(parsed.relay_url, None);
     }
 }

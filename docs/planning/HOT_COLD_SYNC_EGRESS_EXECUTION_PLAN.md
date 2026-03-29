@@ -184,7 +184,7 @@ Executed verification:
 cargo test -q --lib state::db::project_queue
 cargo test -q --lib state::pipeline
 cargo test -q --lib runtime::sync_engine::session::windowing
-cargo test -q --test scenario_tests queue -- --nocapture
+cargo test -q project_queue::tests::test_enqueue_batch -- --nocapture
 cargo test -q --test double_send_test -- --nocapture --test-threads=1
 cargo test -q --test cli_test test_cli_live_message_during_large_file_sync -- --nocapture --test-threads=1
 cargo test -q --test sync_contract_tests

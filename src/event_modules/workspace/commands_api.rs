@@ -108,23 +108,23 @@ fn decode_hex32(
 ) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
     let bytes = hex::decode(value)?;
     if bytes.len() != 32 {
-        return Err(format!("{what} is not valid 32-byte hex SPKI").into());
+        return Err(format!("{what} is not valid 32-byte hex endpoint id").into());
     }
     let mut arr = [0u8; 32];
     arr.copy_from_slice(&bytes);
     Ok(arr)
 }
 
-fn resolve_invite_bootstrap_spki(
+fn resolve_invite_bootstrap_endpoint_id(
     db: &Connection,
-    public_spki_hex: Option<&str>,
+    public_endpoint_id_hex: Option<&str>,
 ) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
-    if let Some(spki_hex) = public_spki_hex {
-        return decode_hex32(spki_hex, "SPKI");
+    if let Some(endpoint_id_hex) = public_endpoint_id_hex {
+        return decode_hex32(endpoint_id_hex, "endpoint_id");
     }
 
     let (daemon_peer_id, _cert, _key) = crate::transport::ensure_daemon_identity(db)?;
-    decode_hex32(&daemon_peer_id, "daemon_peer_id")
+    decode_hex32(&daemon_peer_id, "daemon_endpoint_id")
 }
 
 // DB-path-level command wrappers (moved from service.rs)
@@ -162,6 +162,7 @@ fn create_invite_for_recorded_by(
     bootstrap_addrs: &[super::invite_link::BootstrapAddress],
     listen_port: u16,
     public_spki_hex: Option<&str>,
+    relay_url: Option<&str>,
 ) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
     let _ = super::load_local_authoring_context(db, recorded_by)?;
     let ws_eid = super::resolve_workspace_for_peer(db, recorded_by)?;
@@ -175,9 +176,9 @@ fn create_invite_for_recorded_by(
             "Could not resolve admin event for local peer signer.".into()
         })?;
 
-    let bootstrap_spki = resolve_invite_bootstrap_spki(db, public_spki_hex)?;
+    let bootstrap_endpoint_id = resolve_invite_bootstrap_endpoint_id(db, public_spki_hex)?;
 
-    let addrs = if bootstrap_addrs.is_empty() {
+    let addrs = if bootstrap_addrs.is_empty() && relay_url.is_none() {
         let detected = super::invite_link::detect_bootstrap_addrs(listen_port);
         if detected.is_empty() {
             return Err(
@@ -197,7 +198,8 @@ fn create_invite_for_recorded_by(
         &admin_event_id,
         &ws_eid,
         &addrs,
-        &bootstrap_spki,
+        &bootstrap_endpoint_id,
+        relay_url,
     )?;
 
     Ok(CreateInviteResponse {
@@ -228,7 +230,7 @@ pub fn create_invite_for_db(
         open_db_load(db_path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("No transport identity: {}", e).into()
         })?;
-    create_invite_for_recorded_by(&db, &recorded_by, bootstrap_addrs, listen_port, None)
+    create_invite_for_recorded_by(&db, &recorded_by, bootstrap_addrs, listen_port, None, None)
 }
 
 pub fn rotate_key_for_db(
@@ -257,6 +259,7 @@ pub fn create_invite_with_spki(
         bootstrap_addrs,
         crate::event_modules::workspace::invite_link::DEFAULT_PORT,
         Some(public_spki_hex),
+        None,
     )
 }
 
@@ -269,9 +272,17 @@ pub fn create_invite_for_peer(
     bootstrap_addrs: &[super::invite_link::BootstrapAddress],
     listen_port: u16,
     public_spki_hex: Option<&str>,
+    relay_url: Option<&str>,
 ) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
-    create_invite_for_recorded_by(&db, peer_id, bootstrap_addrs, listen_port, public_spki_hex)
+    create_invite_for_recorded_by(
+        &db,
+        peer_id,
+        bootstrap_addrs,
+        listen_port,
+        public_spki_hex,
+        relay_url,
+    )
 }
 
 pub fn rotate_key_for_peer(
@@ -330,32 +341,43 @@ fn prepare_invite_acceptance(
     };
 
     // Record bootstrap context before accept so InviteAccepted projection can
-    // materialize trust rows for this tenant. When the invite carries no
-    // bootstrap addresses, persist one empty-address marker row so discovery
-    // recovery can still use the invite SPKI without generating a bootstrap
-    // autodial target.
+    // materialize trust rows for this tenant. Prefer explicit bootstrap
+    // addresses when present; use the relay hint only for endpoint-id-only
+    // invites so bootstrap planning does not race duplicate transports to the
+    // same remote daemon.
     let invite_eid_b64 = event_id_to_base64(&invite_event_id);
     let ws_b64 = event_id_to_base64(&workspace_id);
+    for addr in &invite.bootstrap_addrs {
+        crate::db::transport_trust::append_bootstrap_context(
+            &db,
+            &derived_peer_id,
+            &invite_eid_b64,
+            &ws_b64,
+            &addr.to_bootstrap_addr_string(),
+            &invite.endpoint_id,
+        )?;
+    }
     if invite.bootstrap_addrs.is_empty() {
+        if let Some(relay_url) = invite.relay_url.as_deref() {
+            crate::db::transport_trust::append_bootstrap_context(
+                &db,
+                &derived_peer_id,
+                &invite_eid_b64,
+                &ws_b64,
+                relay_url,
+                &invite.endpoint_id,
+            )?;
+        }
+    }
+    if invite.bootstrap_addrs.is_empty() && invite.relay_url.is_none() {
         crate::db::transport_trust::append_bootstrap_context(
             &db,
             &derived_peer_id,
             &invite_eid_b64,
             &ws_b64,
             "",
-            &invite.daemon_spki_fingerprint,
+            &invite.endpoint_id,
         )?;
-    } else {
-        for addr in &invite.bootstrap_addrs {
-            crate::db::transport_trust::append_bootstrap_context(
-                &db,
-                &derived_peer_id,
-                &invite_eid_b64,
-                &ws_b64,
-                &addr.to_bootstrap_addr_string(),
-                &invite.daemon_spki_fingerprint,
-            )?;
-        }
     }
 
     Ok(PreparedInviteAcceptance {
@@ -480,6 +502,7 @@ pub fn create_device_link_for_peer(
     bootstrap_addrs: &[super::invite_link::BootstrapAddress],
     listen_port: u16,
     public_spki_hex: Option<&str>,
+    relay_url: Option<&str>,
 ) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (_recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
     let _ = super::load_local_authoring_context(&db, peer_id)?;
@@ -491,9 +514,9 @@ pub fn create_device_link_for_peer(
 
     let workspace_id = super::resolve_workspace_for_peer(&db, peer_id)?;
 
-    let bootstrap_spki = resolve_invite_bootstrap_spki(&db, public_spki_hex)?;
+    let bootstrap_endpoint_id = resolve_invite_bootstrap_endpoint_id(&db, public_spki_hex)?;
 
-    let addrs = if bootstrap_addrs.is_empty() {
+    let addrs = if bootstrap_addrs.is_empty() && relay_url.is_none() {
         let detected = super::invite_link::detect_bootstrap_addrs(listen_port);
         if detected.is_empty() {
             return Err(
@@ -513,7 +536,8 @@ pub fn create_device_link_for_peer(
         &user_event_id,
         &workspace_id,
         &addrs,
-        &bootstrap_spki,
+        &bootstrap_endpoint_id,
+        relay_url,
     )?;
 
     Ok(CreateInviteResponse {
@@ -524,33 +548,35 @@ pub fn create_device_link_for_peer(
 
 #[cfg(test)]
 mod tests {
-    use super::resolve_invite_bootstrap_spki;
+    use super::resolve_invite_bootstrap_endpoint_id;
     use crate::db::open_in_memory;
     use crate::db::schema::create_tables;
     use crate::transport::ensure_daemon_identity;
 
     #[test]
-    fn resolve_invite_bootstrap_spki_uses_daemon_identity_by_default() {
+    fn resolve_invite_bootstrap_endpoint_id_uses_daemon_identity_by_default() {
         let db = open_in_memory().expect("open in-memory db");
         create_tables(&db).expect("create tables");
         let (daemon_peer_id, _cert, _key) =
             ensure_daemon_identity(&db).expect("ensure daemon identity");
 
-        let spki = resolve_invite_bootstrap_spki(&db, None).expect("resolve spki");
+        let endpoint_id =
+            resolve_invite_bootstrap_endpoint_id(&db, None).expect("resolve endpoint id");
         let expected: [u8; 32] = hex::decode(daemon_peer_id)
             .unwrap()
             .try_into()
             .expect("daemon peer id bytes");
-        assert_eq!(spki, expected);
+        assert_eq!(endpoint_id, expected);
     }
 
     #[test]
-    fn resolve_invite_bootstrap_spki_accepts_explicit_override() {
+    fn resolve_invite_bootstrap_endpoint_id_accepts_explicit_override() {
         let db = open_in_memory().expect("open in-memory db");
         create_tables(&db).expect("create tables");
 
         let explicit = hex::encode([0x33; 32]);
-        let spki = resolve_invite_bootstrap_spki(&db, Some(&explicit)).expect("resolve spki");
-        assert_eq!(spki, [0x33; 32]);
+        let endpoint_id = resolve_invite_bootstrap_endpoint_id(&db, Some(&explicit))
+            .expect("resolve endpoint id");
+        assert_eq!(endpoint_id, [0x33; 32]);
     }
 }

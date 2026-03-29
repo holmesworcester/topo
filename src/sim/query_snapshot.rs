@@ -196,12 +196,14 @@ pub fn import_peer_state(
             .collect::<Vec<_>>();
     let mut connect_targets = Vec::new();
     let mut seen_connect_targets = BTreeSet::new();
-    for (_, transport_peer_id, invite_event_id, remote) in
+    for (_, transport_peer_id, invite_event_id, remote, relay_url) in
         load_bootstrap_targets(source_db_path, &[recorded_by.to_string()])?
     {
-        let remote = remote
-            .map(|remote| remote.to_string())
-            .unwrap_or_else(|| "lookup".to_string());
+        let remote = match (remote, relay_url) {
+            (Some(remote), _) => remote.to_string(),
+            (None, Some(relay_url)) => format!("relay:{relay_url}"),
+            (None, None) => "lookup".to_string(),
+        };
         if seen_connect_targets.insert((
             "bootstrap".to_string(),
             transport_peer_id.clone(),

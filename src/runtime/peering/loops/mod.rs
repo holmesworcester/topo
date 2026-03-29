@@ -24,7 +24,6 @@ pub(crate) use connect::STALE_DIAL_TARGET_MARKER;
 pub use connect::{connect_loop, ConnectLoopConfig};
 
 use std::collections::HashMap;
-use std::net::SocketAddr;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
@@ -372,7 +371,7 @@ pub(super) async fn run_session(
     io: Box<dyn TransportSessionIo>,
     tenant_id: &str,
     peer_fp: [u8; 32],
-    remote_addr: SocketAddr,
+    remote_addr: String,
     direction: SessionDirection,
     _db_path: &str,
 ) -> bool {

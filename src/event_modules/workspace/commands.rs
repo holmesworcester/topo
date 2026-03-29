@@ -784,6 +784,7 @@ pub fn create_user_invite(
     workspace_id: &EventId,
     bootstrap_addrs: &[super::invite_link::BootstrapAddress],
     bootstrap_spki: &[u8; 32],
+    relay_url: Option<&str>,
 ) -> Result<InviteResult, Box<dyn std::error::Error + Send + Sync>> {
     let _ = ops::ensure_content_key_for_peer(db, recorded_by)?;
 
@@ -805,8 +806,12 @@ pub fn create_user_invite(
         Some(&ctx),
     )?;
 
-    let invite_link =
-        super::invite_link::create_invite_link(&invite, bootstrap_addrs, bootstrap_spki)?;
+    let invite_link = super::invite_link::create_invite_link_with_relay(
+        &invite,
+        bootstrap_addrs,
+        bootstrap_spki,
+        relay_url,
+    )?;
 
     Ok(InviteResult {
         invite_link,
@@ -829,6 +834,7 @@ pub fn create_device_link_invite(
     workspace_id: &EventId,
     bootstrap_addrs: &[super::invite_link::BootstrapAddress],
     bootstrap_spki: &[u8; 32],
+    relay_url: Option<&str>,
 ) -> Result<InviteResult, Box<dyn std::error::Error + Send + Sync>> {
     let addr_strings: Vec<String> = bootstrap_addrs
         .iter()
@@ -848,8 +854,12 @@ pub fn create_device_link_invite(
         Some(&ctx),
     )?;
 
-    let invite_link =
-        super::invite_link::create_invite_link(&invite, bootstrap_addrs, bootstrap_spki)?;
+    let invite_link = super::invite_link::create_invite_link_with_relay(
+        &invite,
+        bootstrap_addrs,
+        bootstrap_spki,
+        relay_url,
+    )?;
 
     Ok(InviteResult {
         invite_link,

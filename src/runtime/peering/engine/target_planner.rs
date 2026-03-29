@@ -31,7 +31,14 @@ pub(crate) enum DispatchAction {
 
 /// Tracks outbound targets and manages cancellation of stale connect loops.
 pub(crate) struct PeerDispatcher {
-    pub(crate) known: HashMap<String, (Option<SocketAddr>, tokio::sync::watch::Sender<()>)>,
+    pub(crate) known: HashMap<
+        String,
+        (
+            Option<SocketAddr>,
+            Option<String>,
+            tokio::sync::watch::Sender<()>,
+        ),
+    >,
 }
 
 impl PeerDispatcher {
@@ -45,9 +52,10 @@ impl PeerDispatcher {
         &mut self,
         key: &str,
         addr: Option<SocketAddr>,
+        relay_url: Option<&str>,
     ) -> (DispatchAction, Option<tokio::sync::watch::Receiver<()>>) {
-        if let Some((prev_addr, _)) = self.known.get(key) {
-            if *prev_addr == addr {
+        if let Some((prev_addr, prev_relay_url, _)) = self.known.get(key) {
+            if *prev_addr == addr && prev_relay_url.as_deref() == relay_url {
                 return (DispatchAction::Skip, None);
             }
         }
@@ -58,7 +66,10 @@ impl PeerDispatcher {
             DispatchAction::Connect
         };
         let (cancel_tx, cancel_rx) = tokio::sync::watch::channel(());
-        self.known.insert(key.to_string(), (addr, cancel_tx));
+        self.known.insert(
+            key.to_string(),
+            (addr, relay_url.map(str::to_string), cancel_tx),
+        );
         (action, Some(cancel_rx))
     }
 
@@ -71,10 +82,16 @@ pub(crate) fn bootstrap_dispatch_key(
     tenant_id: &str,
     transport_peer_id: &str,
     remote: Option<SocketAddr>,
+    relay_url: Option<&str>,
 ) -> String {
     match remote {
         Some(remote) => format!("{tenant_id}@bootstrap:{transport_peer_id}@{remote}"),
-        None => format!("{tenant_id}@bootstrap:{transport_peer_id}@lookup"),
+        None => match relay_url {
+            Some(relay_url) => {
+                format!("{tenant_id}@bootstrap:{transport_peer_id}@relay:{relay_url}")
+            }
+            None => format!("{tenant_id}@bootstrap:{transport_peer_id}@lookup"),
+        },
     }
 }
 
@@ -90,12 +107,12 @@ pub(crate) fn load_bootstrap_targets(
     db_path: &str,
     tenant_ids: &[String],
 ) -> Result<
-    Vec<(String, String, String, Option<SocketAddr>)>,
+    Vec<(String, String, String, Option<SocketAddr>, Option<String>)>,
     Box<dyn std::error::Error + Send + Sync>,
 > {
     let db = open_connection(db_path)?;
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
-    let mut seen: HashSet<(String, String, Option<SocketAddr>)> = HashSet::new();
+    let mut seen: HashSet<(String, String, Option<SocketAddr>, Option<String>)> = HashSet::new();
     let mut out = Vec::new();
 
     for tenant_id in tenant_ids {
@@ -109,13 +126,28 @@ pub(crate) fn load_bootstrap_targets(
                 continue;
             }
 
-            let remote = if target.bootstrap_addr.trim().is_empty() {
-                None
+            let (remote, relay_url) = if target.bootstrap_addr.trim().is_empty() {
+                (None, None)
+            } else if target.bootstrap_addr.starts_with("https://")
+                || target.bootstrap_addr.starts_with("http://")
+            {
+                match target.bootstrap_addr.parse::<iroh::RelayUrl>() {
+                    Ok(_) => (None, Some(target.bootstrap_addr.clone())),
+                    Err(e) => {
+                        warn!(
+                            "Skipping invalid invite bootstrap relay_url '{}' for tenant {}: {}",
+                            target.bootstrap_addr,
+                            &tenant_id[..16.min(tenant_id.len())],
+                            e
+                        );
+                        continue;
+                    }
+                }
             } else {
                 match parse_bootstrap_address(&target.bootstrap_addr)
                     .and_then(|addr| addr.to_socket_addr())
                 {
-                    Ok(addr) => Some(addr),
+                    Ok(addr) => (Some(addr), None),
                     Err(e) => {
                         warn!(
                             "Skipping invalid/unresolvable invite bootstrap_addr '{}' for tenant {}: {}",
@@ -128,13 +160,19 @@ pub(crate) fn load_bootstrap_targets(
                 }
             };
 
-            let key = (tenant_id.clone(), target.transport_peer_id.clone(), remote);
+            let key = (
+                tenant_id.clone(),
+                target.transport_peer_id.clone(),
+                remote,
+                relay_url.clone(),
+            );
             if seen.insert(key.clone()) {
                 out.push((
                     tenant_id.clone(),
                     target.transport_peer_id,
                     target.invite_event_id,
                     key.2,
+                    key.3,
                 ));
             }
         }
@@ -146,7 +184,7 @@ pub(crate) fn load_bootstrap_targets(
 pub(crate) fn collect_all_bootstrap_targets(
     db_path: &str,
 ) -> Result<
-    Vec<(String, String, String, Option<SocketAddr>)>,
+    Vec<(String, String, String, Option<SocketAddr>, Option<String>)>,
     Box<dyn std::error::Error + Send + Sync>,
 > {
     let db = open_connection(db_path)?;
@@ -283,9 +321,10 @@ pub(crate) fn dispatch_bootstrap_target(
     tenant_id: &str,
     transport_peer_id: &str,
     remote: Option<SocketAddr>,
+    relay_url: Option<&str>,
 ) -> bool {
-    let key = bootstrap_dispatch_key(tenant_id, transport_peer_id, remote);
-    let (action, _cancel_rx) = dispatcher.dispatch(&key, remote);
+    let key = bootstrap_dispatch_key(tenant_id, transport_peer_id, remote, relay_url);
+    let (action, _cancel_rx) = dispatcher.dispatch(&key, remote, relay_url);
     matches!(action, DispatchAction::Connect | DispatchAction::Reconnect)
 }
 
@@ -296,7 +335,7 @@ pub(crate) fn dispatch_known_peer_target(
     remote: Option<SocketAddr>,
 ) -> bool {
     let key = known_peer_dispatch_key(tenant_id, transport_peer_id);
-    let (action, _cancel_rx) = dispatcher.dispatch(&key, remote);
+    let (action, _cancel_rx) = dispatcher.dispatch(&key, remote, None);
     matches!(action, DispatchAction::Connect | DispatchAction::Reconnect)
 }
 
@@ -312,22 +351,22 @@ mod tests {
         let addr_b: SocketAddr = "127.0.0.1:2222".parse().unwrap();
 
         assert_eq!(
-            dispatcher.dispatch(key, Some(addr_a)).0,
+            dispatcher.dispatch(key, Some(addr_a), None).0,
             DispatchAction::Connect
         );
         assert_eq!(
-            dispatcher.dispatch(key, Some(addr_a)).0,
+            dispatcher.dispatch(key, Some(addr_a), None).0,
             DispatchAction::Skip
         );
         assert_eq!(
-            dispatcher.dispatch(key, Some(addr_b)).0,
+            dispatcher.dispatch(key, Some(addr_b), None).0,
             DispatchAction::Reconnect
         );
     }
 
     #[test]
     fn bootstrap_lookup_key_is_stable_without_address() {
-        let key = bootstrap_dispatch_key("tenant", "peer", None);
+        let key = bootstrap_dispatch_key("tenant", "peer", None, None);
         assert_eq!(key, "tenant@bootstrap:peer@lookup");
     }
 }

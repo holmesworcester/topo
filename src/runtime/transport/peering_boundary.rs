@@ -19,10 +19,9 @@ use crate::db::transport_trust::{
 use super::connection_lifecycle::{
     accept_daemon, dial_daemon, ConnectedDaemon, ConnectionLifecycleError,
 };
-use super::session_carrier::SessionCarrier;
 use super::session_factory::{
-    accept_session_io, open_session_io_for_class, InboundSessionState, SessionClass,
-    SessionOpenError,
+    accept_session_io, open_session_io_for_class, InboundSessionState, SessionCarrier,
+    SessionClass, SessionOpenError,
 };
 use super::{ensure_daemon_identity_from_db, load_daemon_iroh_secret_key_from_db};
 
@@ -98,11 +97,11 @@ impl TransportEndpoint {
 #[derive(Clone)]
 pub struct TransportConnection {
     pub(crate) inner: iroh::endpoint::Connection,
-    remote_addr: SocketAddr,
+    remote_addr: Option<SocketAddr>,
 }
 
 impl TransportConnection {
-    pub(crate) fn new(inner: iroh::endpoint::Connection, remote_addr: SocketAddr) -> Self {
+    pub(crate) fn new(inner: iroh::endpoint::Connection, remote_addr: Option<SocketAddr>) -> Self {
         Self { inner, remote_addr }
     }
 
@@ -110,8 +109,18 @@ impl TransportConnection {
         self.inner.stable_id()
     }
 
-    pub fn remote_address(&self) -> SocketAddr {
+    pub fn remote_address(&self) -> Option<SocketAddr> {
         self.remote_addr
+    }
+
+    pub fn remote_label(&self) -> String {
+        if let Some(remote_addr) = self.remote_addr {
+            return remote_addr.to_string();
+        }
+        if let Some(path) = self.inner.to_info().selected_path() {
+            return format!("{:?}", path.remote_addr());
+        }
+        hex::encode(self.inner.remote_id().as_bytes())
     }
 
     pub fn close(&self, error_code: iroh::endpoint::VarInt, reason: &[u8]) {
@@ -167,7 +176,8 @@ struct AdmittedSessionRouteCache {
 pub struct SessionEnvelope {
     /// Hex-encoded remote daemon certificate SPKI fingerprint.
     pub remote_daemon_peer_id: String,
-    pub remote_addr: SocketAddr,
+    pub remote_addr: Option<SocketAddr>,
+    pub remote_label: String,
     pub session_id: u64,
     pub class: SessionClass,
     pub io: Box<dyn TransportSessionIo>,
@@ -204,8 +214,12 @@ impl DaemonConnection {
         self.remote_daemon_peer_id()
     }
 
-    pub fn remote_addr(&self) -> SocketAddr {
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
         self.connection.remote_address()
+    }
+
+    pub fn remote_label(&self) -> String {
+        self.connection.remote_label()
     }
 
     pub fn connection(&self) -> TransportConnection {
@@ -270,6 +284,7 @@ impl DaemonConnection {
         Ok(SessionEnvelope {
             remote_daemon_peer_id: self.remote_daemon_peer_id.clone(),
             remote_addr: self.connection.remote_address(),
+            remote_label: self.connection.remote_label(),
             session_id,
             class,
             io,
@@ -282,6 +297,7 @@ impl DaemonConnection {
         Ok(SessionEnvelope {
             remote_daemon_peer_id: self.remote_daemon_peer_id.clone(),
             remote_addr: self.connection.remote_address(),
+            remote_label: self.connection.remote_label(),
             session_id,
             class,
             io,
@@ -309,8 +325,12 @@ impl SessionProvider {
         self.daemon_connection.remote_daemon_peer_id()
     }
 
-    pub fn remote_addr(&self) -> SocketAddr {
+    pub fn remote_addr(&self) -> Option<SocketAddr> {
         self.daemon_connection.remote_addr()
+    }
+
+    pub fn remote_label(&self) -> String {
+        self.daemon_connection.remote_label()
     }
 
     pub fn connection(&self) -> TransportConnection {
@@ -434,17 +454,19 @@ pub fn resolve_authorizing_tenant_from_db(
 pub async fn dial_daemon_peer_target(
     endpoint: &TransportEndpoint,
     remote: Option<SocketAddr>,
+    relay_url: Option<&str>,
     sni: &str,
 ) -> Result<ConnectedDaemon, ConnectionLifecycleError> {
-    dial_daemon(endpoint, remote, sni).await
+    dial_daemon(endpoint, remote, relay_url, sni).await
 }
 
 pub async fn dial_daemon_connection_target(
     endpoint: &TransportEndpoint,
     remote: Option<SocketAddr>,
+    relay_url: Option<&str>,
     sni: &str,
 ) -> Result<DaemonConnection, ConnectionLifecycleError> {
-    let connected = dial_daemon_peer_target(endpoint, remote, sni).await?;
+    let connected = dial_daemon_peer_target(endpoint, remote, relay_url, sni).await?;
     Ok(DaemonConnection::from_connected(connected))
 }
 
@@ -453,7 +475,7 @@ pub async fn dial_daemon_peer(
     remote: SocketAddr,
     sni: &str,
 ) -> Result<ConnectedDaemon, ConnectionLifecycleError> {
-    dial_daemon_peer_target(endpoint, Some(remote), sni).await
+    dial_daemon_peer_target(endpoint, Some(remote), None, sni).await
 }
 
 pub async fn dial_daemon_connection(
@@ -461,7 +483,7 @@ pub async fn dial_daemon_connection(
     remote: SocketAddr,
     sni: &str,
 ) -> Result<DaemonConnection, ConnectionLifecycleError> {
-    dial_daemon_connection_target(endpoint, Some(remote), sni).await
+    dial_daemon_connection_target(endpoint, Some(remote), None, sni).await
 }
 
 pub async fn accept_daemon_peer(
@@ -485,7 +507,7 @@ pub async fn dial_session_peer(
     remote: SocketAddr,
     sni: &str,
 ) -> Result<ConnectedDaemon, ConnectionLifecycleError> {
-    dial_daemon_peer_target(endpoint, Some(remote), sni).await
+    dial_daemon_peer_target(endpoint, Some(remote), None, sni).await
 }
 
 pub async fn dial_session_provider(
@@ -493,7 +515,7 @@ pub async fn dial_session_provider(
     remote: SocketAddr,
     sni: &str,
 ) -> Result<SessionProvider, ConnectionLifecycleError> {
-    dial_daemon_connection_target(endpoint, Some(remote), sni)
+    dial_daemon_connection_target(endpoint, Some(remote), None, sni)
         .await
         .map(|daemon_connection| {
             SessionProvider::new(daemon_connection, SessionProviderMode::Initiator)

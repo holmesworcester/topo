@@ -5,14 +5,12 @@
 use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 
+use async_trait::async_trait;
 use tokio::io::{AsyncRead, AsyncReadExt, AsyncWrite, AsyncWriteExt};
 
 use crate::contracts::peering_contract::{next_session_id, TransportSessionIo};
 
-use super::{
-    connection::{Connection, RecvConnection, SendConnection},
-    session_carrier::SessionCarrier,
-};
+use super::connection::{Connection, RecvConnection, SendConnection};
 use super::{DualConnection, QuicTransportSessionIo};
 
 const SESSION_STREAM_HEADER_MAGIC: [u8; 4] = *b"P7SS";
@@ -22,6 +20,17 @@ const SESSION_STREAM_HEADER_LEN: usize = 23;
 const BUILD_MISMATCH_PREFIX: &str =
     "Version negotiation is out of scope for this PoC -- builds must be from the same commit.";
 const CONNECTION_CLOSE_REASON_LIMIT: usize = 900;
+
+/// Transport connection operations needed by session setup.
+#[async_trait]
+pub trait SessionCarrier: Clone + Send + Sync + 'static {
+    type BiSend: AsyncWrite + Unpin + Send + 'static;
+    type BiRecv: AsyncRead + Unpin + Send + 'static;
+
+    async fn open_bi(&self) -> Result<(Self::BiSend, Self::BiRecv), String>;
+    async fn accept_bi(&self) -> Result<(Self::BiSend, Self::BiRecv), String>;
+    fn close_with_reason(&self, error_code: u32, reason: &[u8]);
+}
 
 /// Build commit hash embedded at compile time (8 ASCII hex chars, zero-padded).
 fn local_commit_hash() -> [u8; 8] {
@@ -419,7 +428,6 @@ mod tests {
     use tokio::io::AsyncWriteExt;
 
     use crate::protocol::{encode_frame, parse_frame, Frame};
-    use crate::runtime::transport::session_carrier::SessionCarrier;
     use crate::transport::{
         accept_daemon_connection, create_runtime_endpoint_for_tenants, dial_daemon_connection,
         load_daemon_identity_from_db, multi_workspace::transport_sni, TransportConnection,
@@ -428,8 +436,8 @@ mod tests {
 
     use super::{
         accept_session_io, local_commit_hash_str, local_commit_subject, open_range_session_io,
-        write_session_stream_header, InboundSessionState, SessionClass, SessionOpenError,
-        SessionStreamKind, BUILD_MISMATCH_PREFIX, SESSION_STREAM_HEADER_LEN,
+        write_session_stream_header, InboundSessionState, SessionCarrier, SessionClass,
+        SessionOpenError, SessionStreamKind, BUILD_MISMATCH_PREFIX, SESSION_STREAM_HEADER_LEN,
         SESSION_STREAM_HEADER_MAGIC, SESSION_STREAM_HEADER_VERSION,
     };
 

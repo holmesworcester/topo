@@ -47,6 +47,7 @@ pub(crate) enum TargetIngressSource {
 pub(crate) struct TargetIngressEvent {
     pub(crate) tenant_id: String,
     pub(crate) remote: Option<SocketAddr>,
+    pub(crate) relay_url: Option<String>,
     pub(crate) source: TargetIngressSource,
 }
 
@@ -145,12 +146,24 @@ fn known_peer_key_for_event(event: &TargetIngressEvent) -> String {
     }
 }
 
-fn format_target(remote: Option<SocketAddr>, daemon_peer_id: Option<&str>) -> String {
+fn format_target(
+    remote: Option<SocketAddr>,
+    relay_url: Option<&str>,
+    daemon_peer_id: Option<&str>,
+) -> String {
     match remote {
         Some(remote) => remote.to_string(),
-        None => daemon_peer_id
-            .map(|peer_id| format!("lookup({})", short_peer_id(peer_id)))
-            .unwrap_or_else(|| "lookup".to_string()),
+        None => {
+            if let Some(relay_url) = relay_url {
+                daemon_peer_id
+                    .map(|peer_id| format!("relay({relay_url}, {})", short_peer_id(peer_id)))
+                    .unwrap_or_else(|| format!("relay({relay_url})"))
+            } else {
+                daemon_peer_id
+                    .map(|peer_id| format!("lookup({})", short_peer_id(peer_id)))
+                    .unwrap_or_else(|| "lookup".to_string())
+            }
+        }
     }
 }
 
@@ -218,9 +231,12 @@ pub(super) async fn run_target_dispatcher(
         reap_finished_connect_workers(&mut active_workers, &mut dispatcher).await;
 
         let dispatch_key = match &event.source {
-            TargetIngressSource::Bootstrap { daemon_peer_id, .. } => {
-                bootstrap_dispatch_key(&event.tenant_id, daemon_peer_id, event.remote)
-            }
+            TargetIngressSource::Bootstrap { daemon_peer_id, .. } => bootstrap_dispatch_key(
+                &event.tenant_id,
+                daemon_peer_id,
+                event.remote,
+                event.relay_url.as_deref(),
+            ),
             TargetIngressSource::KnownPeer { peer_id } => {
                 known_peer_dispatch_key(&event.tenant_id, peer_id)
             }
@@ -277,6 +293,7 @@ pub(super) async fn run_target_dispatcher(
                 &event.tenant_id,
                 daemon_peer_id,
                 event.remote,
+                event.relay_url.as_deref(),
             ),
             TargetIngressSource::KnownPeer { peer_id } => {
                 dispatch_known_peer_target(&mut dispatcher, &event.tenant_id, peer_id, event.remote)
@@ -331,7 +348,11 @@ pub(super) async fn run_target_dispatcher(
         let auth_plan =
             select_outbound_session_auth_plan(&event.source, bootstrap_session_fallback.as_ref());
         let worker_cancel = shutdown.child_token();
-        let target_label = format_target(event.remote, Some(&expected_remote_daemon_peer_id));
+        let target_label = format_target(
+            event.remote,
+            event.relay_url.as_deref(),
+            Some(&expected_remote_daemon_peer_id),
+        );
 
         if matches!(event.source, TargetIngressSource::KnownPeer { .. })
             && !is_tenant_in_bootstrap_phase(&db_path, &event.tenant_id)
@@ -354,6 +375,7 @@ pub(super) async fn run_target_dispatcher(
             let db_path = db_path.clone();
             let tenant_id = event.tenant_id.clone();
             let remote = event.remote;
+            let relay_url = event.relay_url.clone();
             let remote_peer_id = remote_peer_id.clone();
             let expected_remote_daemon_peer_id = expected_remote_daemon_peer_id.clone();
             let auth_plan = auth_plan.clone();
@@ -370,6 +392,7 @@ pub(super) async fn run_target_dispatcher(
                     db_path,
                     tenant_id,
                     remote,
+                    relay_url,
                     remote_peer_id,
                     expected_remote_daemon_peer_id,
                     auth_plan,
@@ -405,6 +428,7 @@ async fn run_connect_worker(
     db_path: String,
     tenant_id: String,
     remote: Option<SocketAddr>,
+    relay_url: Option<String>,
     remote_peer_id: String,
     expected_remote_daemon_peer_id: String,
     auth_plan: OutboundSessionAuthPlan,
@@ -425,6 +449,7 @@ async fn run_connect_worker(
             recorded_by: tenant_id.clone(),
             endpoint: endpoint.clone(),
             remote,
+            relay_url: relay_url.clone(),
             remote_session_peer_id: remote_peer_id.clone(),
             ingest,
             shutdown: Some(shutdown.clone()),

@@ -721,10 +721,10 @@ impl Peer {
         let sync_addr = sync_endpoint.local_addr().expect("failed to get sync addr");
 
         // Build invite link with creator's bootstrap address and SPKI
-        let creator_spki = creator.spki_fingerprint();
+        let creator_endpoint_id = daemon_fingerprint_for_peer(creator);
         let bootstrap_addr = parse_bootstrap_address(&sync_addr.to_string())
             .expect("failed to parse bootstrap addr");
-        let invite_link = create_invite_link(&invite, &[bootstrap_addr], &creator_spki)
+        let invite_link = create_invite_link(&invite, &[bootstrap_addr], &creator_endpoint_id)
             .expect("failed to create invite link");
 
         // Step 1: Accept invite — stores events (may block), materializes bootstrap trust
@@ -836,6 +836,7 @@ impl Peer {
                     recorded_by: peer_id.clone(),
                     endpoint: peer_ep,
                     remote: Some(sync_addr),
+                    relay_url: None,
                     remote_session_peer_id: creator_target_peer_id_for_thread.clone(),
                     ingest: test_ingest_fns(),
                     shutdown: None,
@@ -956,10 +957,10 @@ impl Peer {
         let sync_endpoint = create_dynamic_endpoint_for_peer(creator).await;
         let sync_addr = sync_endpoint.local_addr().expect("failed to get sync addr");
 
-        let creator_spki = creator.spki_fingerprint();
+        let creator_endpoint_id = daemon_fingerprint_for_peer(creator);
         let bootstrap_addr = parse_bootstrap_address(&sync_addr.to_string())
             .expect("failed to parse bootstrap addr");
-        let invite_link = create_invite_link(&invite, &[bootstrap_addr], &creator_spki)
+        let invite_link = create_invite_link(&invite, &[bootstrap_addr], &creator_endpoint_id)
             .expect("failed to create device-link invite link");
 
         let result = crate::event_modules::workspace::commands::accept_device_link(
@@ -1066,6 +1067,7 @@ impl Peer {
                     recorded_by: peer_id.clone(),
                     endpoint: peer_ep,
                     remote: Some(sync_addr),
+                    relay_url: None,
                     remote_session_peer_id: creator_target_peer_id_for_thread.clone(),
                     ingest: test_ingest_fns(),
                     shutdown: None,
@@ -2967,6 +2969,7 @@ fn spawn_connect_loop_with_runtime_endpoint(
                 recorded_by: recorded_by.clone(),
                 endpoint,
                 remote: Some(remote),
+                relay_url: None,
                 remote_session_peer_id,
                 ingest: test_ingest_fns(),
                 shutdown: Some(shutdown_for_thread),
@@ -3054,6 +3057,7 @@ pub fn start_peers_runtime_affine(
                 recorded_by: b_identity.clone(),
                 endpoint: connector_endpoint,
                 remote: Some(listener_addr),
+                relay_url: None,
                 remote_session_peer_id: target_peer_id.clone(),
                 ingest: test_ingest_fns(),
                 shutdown: None,

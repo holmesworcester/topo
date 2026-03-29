@@ -1331,13 +1331,6 @@ pub fn create_device_link_with_spki(
         .to_string()
 }
 
-fn invite_has_empty_bootstrap_addrs(invite_link: &str) -> bool {
-    matches!(
-        topo::event_modules::workspace::invite_link::parse_invite_link(invite_link),
-        Ok(invite) if invite.bootstrap_addrs.is_empty()
-    )
-}
-
 /// Accept an invite via daemon RPC using a temporary daemon.
 /// Waits for tenant discovery and stops the daemon cleanly afterward.
 pub fn accept_invite(db: &str, invite_link: &str) {
@@ -1383,11 +1376,7 @@ fn accept_invite_with_identity_inner(
     accept_timeout: Duration,
     wait_for_transport_convergence: bool,
 ) {
-    let mut tmp_daemon = if invite_has_empty_bootstrap_addrs(invite_link) {
-        start_discovery_daemon(db)
-    } else {
-        start_daemon(db)
-    };
+    let mut tmp_daemon = start_daemon(db);
     accept_invite_with_identity_on_running_daemon(
         db,
         invite_link,
@@ -1395,7 +1384,7 @@ fn accept_invite_with_identity_inner(
         devicename,
         accept_timeout,
     );
-    if wait_for_transport_convergence && !invite_has_empty_bootstrap_addrs(invite_link) {
+    if wait_for_transport_convergence {
         let accepted_peer_id = active_tenant_peer_id(db)
             .expect("accepted invite should set the new tenant active on the running daemon");
         wait_for_tenant_transport_converged(db, &accepted_peer_id, accept_timeout);
@@ -1457,17 +1446,11 @@ pub fn accept_device_link_with_name_and_timeout(
     devicename: &str,
     accept_timeout: Duration,
 ) {
-    let mut tmp_daemon = if invite_has_empty_bootstrap_addrs(invite_link) {
-        start_discovery_daemon(db)
-    } else {
-        start_daemon(db)
-    };
+    let mut tmp_daemon = start_daemon(db);
     accept_device_link_with_name_on_running_daemon(db, invite_link, devicename, accept_timeout);
-    if !invite_has_empty_bootstrap_addrs(invite_link) {
-        let accepted_peer_id = active_tenant_peer_id(db)
-            .expect("accepted device link should set the new tenant active on the running daemon");
-        wait_for_tenant_transport_converged(db, &accepted_peer_id, accept_timeout);
-    }
+    let accepted_peer_id = active_tenant_peer_id(db)
+        .expect("accepted device link should set the new tenant active on the running daemon");
+    wait_for_tenant_transport_converged(db, &accepted_peer_id, accept_timeout);
     stop_daemon(db, &mut tmp_daemon);
     wait_for_daemon_stopped(db, Duration::from_secs(10));
 }

@@ -270,15 +270,17 @@ pub(super) async fn supervise_inbound_daemon_connection(
 
         let now = current_timestamp_ms();
         if let Ok(db) = open_connection(db_path) {
-            let _ = record_endpoint_observation(
-                &db,
-                &auth_context.tenant_id,
-                &auth_context.remote_peer_id,
-                &session.remote_addr.ip().to_string(),
-                session.remote_addr.port(),
-                now,
-                ENDPOINT_TTL_MS,
-            );
+            if let Some(remote_addr) = session.remote_addr {
+                let _ = record_endpoint_observation(
+                    &db,
+                    &auth_context.tenant_id,
+                    &auth_context.remote_peer_id,
+                    &remote_addr.ip().to_string(),
+                    remote_addr.port(),
+                    now,
+                    ENDPOINT_TTL_MS,
+                );
+            }
             if let Some(remote_daemon_fp) =
                 peer_fingerprint_from_hex(daemon_connection.remote_daemon_peer_id())
             {
@@ -297,6 +299,7 @@ pub(super) async fn supervise_inbound_daemon_connection(
             let recorded_by = auth_context.tenant_id.clone();
             let peer_id = auth_context.remote_peer_id.clone();
             let remote_addr = session.remote_addr;
+            let remote_label = session.remote_label.clone();
             let dep_shutdown = shutdown.child_token();
             tokio::task::spawn_local(async move {
                 if let Err(err) = run_dependency_session(
@@ -305,6 +308,7 @@ pub(super) async fn supervise_inbound_daemon_connection(
                     recorded_by,
                     peer_id.clone(),
                     remote_addr,
+                    remote_label,
                     dep_shutdown,
                 )
                 .await
@@ -340,6 +344,7 @@ pub(super) async fn supervise_inbound_daemon_connection(
         let db_path = db_path.to_string();
         let tenant_id = auth_context.tenant_id.clone();
         let remote_peer_id = auth_context.remote_peer_id.clone();
+        let remote_label = session.remote_label.clone();
         let session_start = std::time::Instant::now();
         let connection_id = connection.stable_id();
         tokio::task::spawn_local(async move {
@@ -349,7 +354,7 @@ pub(super) async fn supervise_inbound_daemon_connection(
                 session.io,
                 &tenant_id,
                 peer_fp,
-                session.remote_addr,
+                remote_label,
                 SessionDirection::Inbound,
                 &db_path,
             )

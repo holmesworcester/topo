@@ -217,10 +217,12 @@ pub async fn run_dependency_session(
     db_path: String,
     recorded_by: String,
     peer_id: String,
-    remote_addr: std::net::SocketAddr,
+    remote_addr: Option<std::net::SocketAddr>,
+    remote_label: String,
     cancel: CancellationToken,
 ) -> Result<(), String> {
-    let source_tag = format!("quic_recv:{}@{}", peer_id, remote_addr);
+    let _ = remote_addr;
+    let source_tag = format!("quic_recv:{}@{}", peer_id, remote_label);
     let (request_rx, _guard) = dependency_fetch::register(&db_path, &recorded_by, &peer_id);
     let parts = io.split();
     let (response_tx, response_rx) = mpsc::channel::<Vec<EventId>>(RESPONSE_QUEUE_CAP);
@@ -338,7 +340,7 @@ pub fn spawn_outbound_dependency_session(
             session_id,
             &auth_result.session_peer_id[..16.min(auth_result.session_peer_id.len())],
             daemon_connection.remote_daemon_peer_id(),
-            daemon_connection.remote_addr()
+            daemon_connection.remote_label()
         );
         if let Err(err) = run_dependency_session(
             io,
@@ -346,6 +348,7 @@ pub fn spawn_outbound_dependency_session(
             recorded_by,
             auth_result.session_peer_id.clone(),
             daemon_connection.remote_addr(),
+            daemon_connection.remote_label(),
             shutdown,
         )
         .await

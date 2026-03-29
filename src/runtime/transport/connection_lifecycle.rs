@@ -49,33 +49,18 @@ fn endpoint_id_from_target(target: &str) -> Result<iroh::EndpointId, ConnectionL
     })
 }
 
-fn ip_socket_addr(
-    addr: iroh::endpoint::IncomingAddr,
-) -> Result<SocketAddr, ConnectionLifecycleError> {
-    match addr {
-        iroh::endpoint::IncomingAddr::Ip(addr) => Ok(addr),
-        other => Err(ConnectionLifecycleError::Accept(format!(
-            "unsupported non-IP incoming address: {other:?}"
-        ))),
-    }
-}
-
-fn connection_socket_addr(
-    connection: &iroh::endpoint::Connection,
-) -> Result<SocketAddr, ConnectionLifecycleError> {
+fn connection_socket_addr(connection: &iroh::endpoint::Connection) -> Option<SocketAddr> {
     if let Some(path) = connection.to_info().selected_path() {
         if let iroh::TransportAddr::Ip(addr) = path.remote_addr() {
-            return Ok(*addr);
+            return Some(*addr);
         }
     }
     for path in connection.paths() {
         if let iroh::TransportAddr::Ip(addr) = path.remote_addr() {
-            return Ok(*addr);
+            return Some(*addr);
         }
     }
-    Err(ConnectionLifecycleError::Dial(
-        "connected but no direct IP path was available".to_string(),
-    ))
+    None
 }
 
 fn into_connected_daemon(
@@ -92,24 +77,43 @@ fn into_connected_daemon(
 pub async fn dial_daemon(
     endpoint: &TransportEndpoint,
     remote: Option<SocketAddr>,
+    relay_url: Option<&str>,
     sni: &str,
 ) -> Result<ConnectedDaemon, ConnectionLifecycleError> {
     let endpoint_id = endpoint_id_from_target(sni)?;
-    let target = remote
-        .map(|remote| remote.to_string())
-        .unwrap_or_else(|| hex::encode(endpoint_id.as_bytes()));
-    let endpoint_addr = match remote {
-        Some(remote) => {
-            iroh::EndpointAddr::from_parts(endpoint_id, [iroh::TransportAddr::Ip(remote)])
+    let relay_url_str = relay_url;
+    let relay_url = relay_url_str
+        .map(|relay_url| relay_url.parse::<iroh::RelayUrl>())
+        .transpose()
+        .map_err(|e| {
+            ConnectionLifecycleError::Dial(format!("invalid relay url '{relay_url_str:?}': {e}"))
+        })?;
+    let target = match (remote, relay_url.as_ref()) {
+        (Some(remote), Some(relay_url)) => format!("{remote} via {relay_url}"),
+        (Some(remote), None) => remote.to_string(),
+        (None, Some(relay_url)) => {
+            format!("{} via {relay_url}", hex::encode(endpoint_id.as_bytes()))
         }
-        None => endpoint_id.into(),
+        (None, None) => hex::encode(endpoint_id.as_bytes()),
+    };
+    let mut transport_addrs = Vec::new();
+    if let Some(remote) = remote {
+        transport_addrs.push(iroh::TransportAddr::Ip(remote));
+    }
+    if let Some(relay_url) = relay_url {
+        transport_addrs.push(iroh::TransportAddr::Relay(relay_url));
+    }
+    let endpoint_addr = if transport_addrs.is_empty() {
+        endpoint_id.into()
+    } else {
+        iroh::EndpointAddr::from_parts(endpoint_id, transport_addrs)
     };
     let connection = endpoint
         .inner
         .connect(endpoint_addr, TOPO_ALPN)
         .await
         .map_err(|e| ConnectionLifecycleError::Dial(format!("connect to {target}: {e}")))?;
-    let remote_addr = connection_socket_addr(&connection)?;
+    let remote_addr = connection_socket_addr(&connection);
     into_connected_daemon(TransportConnection::new(connection, remote_addr))
 }
 
@@ -122,10 +126,10 @@ pub async fn accept_daemon(
     let Some(incoming) = endpoint.inner.accept().await else {
         return Ok(None);
     };
-    let remote_addr = ip_socket_addr(incoming.remote_addr())?;
     let connection = incoming
         .await
         .map_err(|e| ConnectionLifecycleError::Accept(e.to_string()))?;
+    let remote_addr = connection_socket_addr(&connection);
     Ok(Some(into_connected_daemon(TransportConnection::new(
         connection,
         remote_addr,
@@ -188,7 +192,7 @@ mod tests {
 
         let (accepted_res, dialed_res) = tokio::join!(
             accept_daemon(&server_ep),
-            dial_daemon(&client_ep, Some(server_addr), &server_sni)
+            dial_daemon(&client_ep, Some(server_addr), None, &server_sni)
         );
 
         let accepted = accepted_res
@@ -223,7 +227,7 @@ mod tests {
         let (_temp, _server_ep, client_ep, _server_addr, _server_peer_id, _client_peer_id) =
             endpoint_pair().await.expect("endpoint pair");
 
-        let err = match dial_daemon(&client_ep, None, "not-a-valid-endpoint-id").await {
+        let err = match dial_daemon(&client_ep, None, None, "not-a-valid-endpoint-id").await {
             Ok(_) => panic!("invalid target should fail before dialing"),
             Err(err) => err,
         };

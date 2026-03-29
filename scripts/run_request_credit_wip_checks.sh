@@ -13,8 +13,8 @@ cargo test -q --test sync_contract_tests -- --nocapture
 echo "[3/9] cargo test -q --test double_send_test duplicate_sends_stay_below_regression_threshold"
 cargo test -q --test double_send_test duplicate_sends_stay_below_regression_threshold -- --nocapture --test-threads=1
 
-echo "[4/9] cargo test -q --test scenario_tests queue::test_egress_queue_lifecycle"
-cargo test -q --test scenario_tests queue::test_egress_queue_lifecycle -- --nocapture
+echo "[4/9] cargo test -q project_queue::tests::test_enqueue_batch"
+cargo test -q project_queue::tests::test_enqueue_batch -- --nocapture
 
 echo "[5/9] cargo +stable test --release --test sync_graph_test catchup_non_uniform_sources"
 cargo +stable test --release --test sync_graph_test catchup_non_uniform_sources -- --nocapture --test-threads=1

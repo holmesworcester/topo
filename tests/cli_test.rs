@@ -62,8 +62,12 @@ fn create_user_invite_link_for_test_peer(creator: &Peer, bootstrap_addr: &str) -
     .expect("create user invite");
     let bootstrap_addr =
         parse_bootstrap_address(bootstrap_addr).expect("parse bootstrap address for invite link");
-    create_invite_link(&invite, &[bootstrap_addr], &creator.spki_fingerprint())
-        .expect("create invite link")
+    let (endpoint_id, _cert, _key) =
+        topo::transport::load_daemon_identity_from_db(&creator.db_path)
+            .expect("load creator daemon identity");
+    let mut endpoint_id_bytes = [0u8; 32];
+    hex::decode_to_slice(endpoint_id, &mut endpoint_id_bytes).expect("decode creator endpoint id");
+    create_invite_link(&invite, &[bootstrap_addr], &endpoint_id_bytes).expect("create invite link")
 }
 
 fn tenant_index_for_peer_id(db_path: &str, peer_id: &str) -> usize {
@@ -463,32 +467,14 @@ fn start_joined_cli_peer(
     device_name: &str,
 ) -> StartedCliPeer {
     let db = tmpdir.path().join(db_name).to_str().unwrap().to_string();
-    let empty_bootstrap = matches!(
-        parse_invite_link(invite_link),
-        Ok(invite) if invite.bootstrap_addrs.is_empty()
+    let daemon = start_daemon(&db);
+    accept_invite_with_identity_on_running_daemon(
+        &db,
+        invite_link,
+        username,
+        device_name,
+        Duration::from_secs(10),
     );
-    let daemon = if empty_bootstrap {
-        let daemon = start_discovery_daemon(&db);
-        accept_invite_with_identity_on_running_daemon(
-            &db,
-            invite_link,
-            username,
-            device_name,
-            Duration::from_secs(10),
-        );
-        daemon
-    } else {
-        start_daemon(&db)
-    };
-    if !empty_bootstrap {
-        accept_invite_with_identity_on_running_daemon(
-            &db,
-            invite_link,
-            username,
-            device_name,
-            Duration::from_secs(10),
-        );
-    }
     wait_for_active_tenant_ready(&db, Duration::from_secs(120));
     StartedCliPeer {
         db,
@@ -506,30 +492,13 @@ fn start_linked_cli_peer(
     device_name: &str,
 ) -> StartedCliPeer {
     let db = tmpdir.path().join(db_name).to_str().unwrap().to_string();
-    let empty_bootstrap = matches!(
-        parse_invite_link(invite_link),
-        Ok(invite) if invite.bootstrap_addrs.is_empty()
+    let daemon = start_daemon(&db);
+    accept_device_link_with_name_on_running_daemon(
+        &db,
+        invite_link,
+        device_name,
+        Duration::from_secs(10),
     );
-    let daemon = if empty_bootstrap {
-        let daemon = start_discovery_daemon(&db);
-        accept_device_link_with_name_on_running_daemon(
-            &db,
-            invite_link,
-            device_name,
-            Duration::from_secs(10),
-        );
-        daemon
-    } else {
-        start_daemon(&db)
-    };
-    if !empty_bootstrap {
-        accept_device_link_with_name_on_running_daemon(
-            &db,
-            invite_link,
-            device_name,
-            Duration::from_secs(10),
-        );
-    }
     wait_for_active_tenant_ready(&db, Duration::from_secs(120));
     wait_for_active_tenant_transport_converged(&db, Duration::from_secs(120));
     StartedCliPeer {
@@ -921,6 +890,51 @@ fn test_cli_bidirectional_sync() {
         peers.contains(&format!("endpoint={}", &bob_endpoint_id[..8])),
         "peers output should expose the remote endpoint id, got:\n{}",
         peers
+    );
+}
+
+#[test]
+fn test_cli_bidirectional_sync_with_empty_bootstrap_addrs_uses_relay_bootstrap() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+    let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+    let timeout_ms = 60000;
+
+    create_workspace(&alice_db);
+    let _alice = start_daemon(&alice_db);
+
+    let bootstrap_eid = send_message(&alice_db, "bootstrap-before-empty-address-invite");
+    let original_invite = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
+    let invite_link = rewrite_bootstrap_addrs(&original_invite, &[])
+        .expect("rewrite invite with no bootstrap addrs");
+    let parsed = parse_invite_link(&invite_link).expect("parse empty-address invite");
+    assert!(
+        parsed.bootstrap_addrs.is_empty(),
+        "invite should not carry explicit bootstrap addresses"
+    );
+    assert!(
+        parsed.relay_url.is_some(),
+        "invite should carry a relay bootstrap hint when direct addresses are removed"
+    );
+
+    accept_invite(&bob_db, &invite_link);
+    let _bob = start_daemon(&bob_db);
+
+    assert_event_visible_on_all(&[&bob_db], &bootstrap_eid, timeout_ms);
+    assert_identity_eventually_materialized(&bob_db, timeout_ms);
+
+    let alice_live_eid = send_message(&alice_db, "alice-live-no-bootstrap-addr");
+    assert_eventually(
+        &bob_db,
+        &format!("has_event:{} >= 1", alice_live_eid),
+        timeout_ms,
+    );
+
+    let bob_live_eid = send_message(&bob_db, "bob-live-no-bootstrap-addr");
+    assert_eventually(
+        &alice_db,
+        &format!("has_event:{} >= 1", bob_live_eid),
+        timeout_ms,
     );
 }
 

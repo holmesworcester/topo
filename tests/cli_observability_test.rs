@@ -732,8 +732,8 @@ fn test_sub_persists_across_daemon_restart() {
 
 /// Encrypted message appears in subscription feed after cross-peer sync.
 /// Note: this tests the cleartext CLI send path, not the internal encrypted
-/// event path. The internal test_encrypted_message_triggers_subscription
-/// remains in scenario_tests/subscription.rs for the encryption-specific path.
+/// event path. The encryption-specific projector and subscription edge cases
+/// live in unit coverage rather than the retired scenario harness.
 #[test]
 fn test_sub_receives_synced_message() {
     let tmpdir = tempfile::tempdir().unwrap();

@@ -1081,7 +1081,7 @@ fn test_list_active_invite_bootstrap_targets_latest_row_wins_per_invite() {
 }
 
 #[test]
-fn test_list_active_invite_bootstrap_targets_ignores_empty_discovery_markers() {
+fn test_list_active_invite_bootstrap_targets_keep_empty_endpoint_only_markers() {
     let conn = open_in_memory().unwrap();
     create_tables(&conn).unwrap();
 
@@ -1100,15 +1100,51 @@ fn test_list_active_invite_bootstrap_targets_ignores_empty_discovery_markers() {
     .unwrap();
 
     let targets = list_active_invite_bootstrap_targets(&conn, recorded_by).unwrap();
-    assert!(
-        targets.is_empty(),
-        "empty bootstrap_addr rows are discovery-only markers and must not create autodial targets"
+    assert_eq!(
+        targets.len(),
+        1,
+        "empty bootstrap_addr rows still carry a dialable endpoint id"
     );
+    assert_eq!(targets[0].invite_event_id, "invite-empty");
+    assert_eq!(targets[0].transport_peer_id, hex::encode(spki));
+    assert_eq!(targets[0].bootstrap_addr, "");
 
     let addrs = list_active_invite_bootstrap_addrs(&conn, recorded_by).unwrap();
     assert!(
         addrs.is_empty(),
-        "empty bootstrap_addr rows must not surface as active autodial addresses"
+        "endpoint-only targets must not surface as explicit bootstrap addresses"
+    );
+}
+
+#[test]
+fn test_list_active_invite_bootstrap_targets_keep_relay_hints_but_hide_from_explicit_addrs() {
+    let conn = open_in_memory().unwrap();
+    create_tables(&conn).unwrap();
+
+    let recorded_by = "joiner_targets_relay";
+    let endpoint_id: [u8; 32] = [0x61; 32];
+    let relay_url = "https://usw1-1.relay.n0.iroh-canary.iroh.link./";
+
+    record_invite_bootstrap_trust(
+        &conn,
+        recorded_by,
+        "ia-relay",
+        "invite-relay",
+        "ws-1",
+        relay_url,
+        &endpoint_id,
+    )
+    .unwrap();
+
+    let targets = list_active_invite_bootstrap_targets(&conn, recorded_by).unwrap();
+    assert_eq!(targets.len(), 1);
+    assert_eq!(targets[0].bootstrap_addr, relay_url);
+    assert_eq!(targets[0].transport_peer_id, hex::encode(endpoint_id));
+
+    let addrs = list_active_invite_bootstrap_addrs(&conn, recorded_by).unwrap();
+    assert!(
+        addrs.is_empty(),
+        "relay hints are not explicit direct addrs"
     );
 }
 

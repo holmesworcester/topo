@@ -10,6 +10,7 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
+use std::time::Duration;
 
 use serde::Serialize;
 use tokio::sync::Notify;
@@ -448,6 +449,39 @@ fn runtime_status_value(state: &DaemonState) -> Option<serde_json::Value> {
     Some(value)
 }
 
+fn runtime_relay_url(state: &DaemonState) -> Option<String> {
+    let endpoint = state.runtime_endpoint()?;
+    let waited = std::thread::spawn({
+        let endpoint = endpoint.clone();
+        move || {
+            let rt = tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+                .ok()?;
+            rt.block_on(async {
+                let _ = tokio::time::timeout(Duration::from_secs(3), endpoint.inner.online()).await;
+            });
+            endpoint
+                .endpoint_addr()
+                .relay_urls()
+                .next()
+                .cloned()
+                .map(|url| url.to_string())
+        }
+    })
+    .join()
+    .ok()
+    .flatten();
+    waited.or_else(|| {
+        endpoint
+            .endpoint_addr()
+            .relay_urls()
+            .next()
+            .cloned()
+            .map(|url| url.to_string())
+    })
+}
+
 fn autodetect_bootstrap_addrs(
     state: &DaemonState,
     listen_addr: SocketAddr,
@@ -699,7 +733,12 @@ fn dispatch(
                         )
                     });
                     let mut resp_json = serde_json::to_value(&resp).unwrap();
-                    let bootstrap_addrs = autodetect_bootstrap_addrs(state, listen_addr);
+                    let relay_url = runtime_relay_url(state);
+                    let bootstrap_addrs = match autodetect_bootstrap_addrs(state, listen_addr) {
+                        Ok(addrs) => Ok(addrs),
+                        Err(e) if relay_url.is_some() => Ok(Vec::new()),
+                        Err(e) => Err(e),
+                    };
                     match bootstrap_addrs.and_then(|addrs| {
                         workspace::commands::create_invite_for_peer(
                             db_path,
@@ -707,6 +746,7 @@ fn dispatch(
                             &addrs,
                             listen_addr.port(),
                             None,
+                            relay_url.as_deref(),
                         )
                         .map_err(|e| e.to_string())
                     }) {
@@ -1089,9 +1129,11 @@ fn dispatch(
                     }
                     None => vec![],
                 };
+                let relay_url = runtime_relay_url(state);
                 let bootstrap_addrs = if explicit_addrs.is_empty() {
                     match autodetect_bootstrap_addrs(state, listen_addr) {
                         Ok(addrs) => addrs,
+                        Err(e) if relay_url.is_some() => Vec::new(),
                         Err(e) => return RpcResponse::error(e),
                     }
                 } else {
@@ -1106,6 +1148,7 @@ fn dispatch(
                     &bootstrap_addrs,
                     listen_addr.port(),
                     public_spki.as_deref(),
+                    relay_url.as_deref(),
                 );
                 match result {
                     Ok(data) => {
@@ -1162,9 +1205,11 @@ fn dispatch(
                         }
                         None => vec![],
                     };
+                    let relay_url = runtime_relay_url(state);
                     let bootstrap_addrs = if explicit_addrs.is_empty() {
                         match autodetect_bootstrap_addrs(state, listen_addr) {
                             Ok(addrs) => addrs,
+                            Err(e) if relay_url.is_some() => Vec::new(),
                             Err(e) => return RpcResponse::error(e),
                         }
                     } else {
@@ -1176,6 +1221,7 @@ fn dispatch(
                         &bootstrap_addrs,
                         listen_addr.port(),
                         public_spki.as_deref(),
+                        relay_url.as_deref(),
                     ) {
                         Ok(data) => {
                             let invite_eid_b64 = data.invite_event_id.clone();

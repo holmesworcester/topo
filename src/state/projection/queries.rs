@@ -396,7 +396,7 @@ impl ProjectionQueries for Connection {
         let endpoint_shared_event_id_b64 =
             event_id_to_base64(&peer_shared.endpoint_shared_event_id);
         let endpoint_shared_row =
-            load_endpoint_shared_by_event_id(self.conn, &endpoint_shared_event_id_b64)
+            load_endpoint_shared_by_event_id(self, &endpoint_shared_event_id_b64)
                 .map_err(|e| -> Box<dyn std::error::Error> { e })?;
 
         Ok(ContextSnapshot {

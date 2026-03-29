@@ -121,7 +121,7 @@ impl SharedWorkspaceBench {
                     &parsed_invite.invite_event_id,
                 ),
                 bootstrap_addr: network_path.bootstrap_addr.clone(),
-                bootstrap_spki_hex: hex::encode(parsed_invite.daemon_spki_fingerprint),
+                bootstrap_spki_hex: hex::encode(parsed_invite.endpoint_id),
             })
         } else {
             None

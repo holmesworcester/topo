@@ -1,7 +1,6 @@
 use std::sync::atomic::{AtomicU64, Ordering};
 
 use async_trait::async_trait;
-use std::net::SocketAddr;
 use tokio_util::sync::CancellationToken;
 
 static NEXT_SESSION_ID: AtomicU64 = AtomicU64::new(1);
@@ -28,7 +27,7 @@ pub struct SessionMeta {
     pub session_id: u64,
     pub tenant: TenantId,
     pub peer: PeerFingerprint,
-    pub remote_addr: SocketAddr,
+    pub remote_addr: String,
     pub direction: SessionDirection,
 }
 

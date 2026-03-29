@@ -574,7 +574,7 @@ pub fn test_session_meta(
         session_id: next_session_id(),
         tenant: TenantId("test-tenant".into()),
         peer: PeerFingerprint([0xABu8; 32]),
-        remote_addr: "127.0.0.1:9999".parse().unwrap(),
+        remote_addr: "127.0.0.1:9999".to_string(),
         direction,
     }
 }

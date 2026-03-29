@@ -768,6 +768,12 @@ pub fn list_active_invite_bootstrap_addrs(
     let mut out = Vec::new();
     let mut seen = std::collections::HashSet::new();
     for target in list_active_invite_bootstrap_targets(conn, recorded_by)? {
+        if target.bootstrap_addr.is_empty()
+            || target.bootstrap_addr.starts_with("https://")
+            || target.bootstrap_addr.starts_with("http://")
+        {
+            continue;
+        }
         if seen.insert(target.bootstrap_addr.clone()) {
             out.push(target.bootstrap_addr);
         }
@@ -784,8 +790,11 @@ pub struct InviteBootstrapTarget {
 
 /// List active invite bootstrap targets for a tenant, keyed by invite_event_id.
 ///
-/// Returns all non-expired addresses. When multiple invite acceptances exist
-/// for the same invite_event_id, only addresses from the newest acceptance win.
+/// Returns all non-expired bootstrap targets. The address may be empty, in
+/// which case the target is endpoint-id only and the runtime should let iroh
+/// bootstrap through relay/rendezvous instead of a direct socket address.
+/// When multiple invite acceptances exist for the same invite_event_id, only
+/// targets from the newest acceptance win.
 pub fn list_active_invite_bootstrap_targets(
     conn: &Connection,
     recorded_by: &str,
@@ -796,14 +805,12 @@ pub fn list_active_invite_bootstrap_targets(
            FROM invite_bootstrap_trust t
           WHERE t.recorded_by = ?1
             AND t.expires_at > ?2
-            AND t.bootstrap_addr <> ''
             AND t.invite_accepted_event_id = (
                 SELECT t2.invite_accepted_event_id
                   FROM invite_bootstrap_trust t2
                  WHERE t2.recorded_by = t.recorded_by
                    AND t2.invite_event_id = t.invite_event_id
                    AND t2.expires_at > ?2
-                   AND t2.bootstrap_addr <> ''
                  ORDER BY t2.accepted_at DESC, t2.invite_accepted_event_id DESC
                  LIMIT 1
             )

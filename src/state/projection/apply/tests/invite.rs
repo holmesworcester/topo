@@ -2,6 +2,72 @@ use super::*;
 
 // ── SPEC_DEPS_02: Dep type mismatch rejects ──
 
+#[test]
+fn test_raw_unprojected_invite_blob_does_not_materialize_trust() {
+    let conn = setup();
+    let recorded_by = "peer1";
+
+    // Simulate raw ingress that writes directly to events/recorded_events but never
+    // runs projection. Presence in storage alone must not create any trust rows.
+    let fake_workspace_id: [u8; 32] = [0xAA; 32];
+    let mut fake_blob = vec![10u8]; // user_invite_shared type code
+    fake_blob.extend_from_slice(&[0u8; 40]); // created_at_ms(8) + public_key(32)
+    fake_blob.extend_from_slice(&fake_workspace_id); // workspace_id bytes
+    fake_blob.extend_from_slice(&[0u8; 97]); // rest of the fixed-size blob
+
+    let fake_eid = crate::crypto::hash_event(&fake_blob);
+    let fake_b64 = event_id_to_base64(&fake_eid);
+
+    conn.execute(
+        "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+         VALUES (?1, 'user_invite_shared', ?2, 'shared', 0, 0)",
+        rusqlite::params![&fake_b64, &fake_blob],
+    )
+    .unwrap();
+    conn.execute(
+        "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
+         VALUES (?1, ?2, 0, 'test')",
+        rusqlite::params![recorded_by, &fake_b64],
+    )
+    .unwrap();
+
+    let accepted_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM invites_accepted WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        accepted_count, 0,
+        "raw blob presence alone must not create accepted-workspace bindings"
+    );
+
+    let pending_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM pending_invite_bootstrap_trust WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        pending_count, 0,
+        "raw blob presence alone must not create pending bootstrap trust"
+    );
+
+    let accepted_bootstrap_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM invite_bootstrap_trust WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        accepted_bootstrap_count, 0,
+        "raw blob presence alone must not create accepted bootstrap trust"
+    );
+}
+
 /// TLA conformance: check_dep_types rejects when a reaction's target_event_id
 /// points to a non-message event (e.g., workspace type 8 instead of message type 1).
 #[test]

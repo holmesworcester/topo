@@ -118,6 +118,7 @@ fn create_user_invite_materializes_pending_bootstrap_trust_via_projection() {
         &workspace.workspace_id,
         &bootstrap_addrs,
         &bootstrap_spki,
+        None,
     )
     .expect("create user invite");
 
@@ -196,6 +197,7 @@ fn create_device_link_materializes_pending_bootstrap_trust_via_projection() {
         &workspace.workspace_id,
         &bootstrap_addrs,
         &bootstrap_spki,
+        None,
     )
     .expect("create device link");
 

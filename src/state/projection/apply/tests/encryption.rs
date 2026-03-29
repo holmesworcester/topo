@@ -989,6 +989,54 @@ fn test_encrypted_inner_invalid_signature_rejects() {
     );
 }
 
+#[test]
+fn test_encrypted_inner_unsupported_signer_type_rejects_durably() {
+    let conn = setup();
+    let recorded_by = "peer1";
+    let _ws = setup_workspace_event(&conn, recorded_by);
+    let (signer_eid, _signing_key, key_bytes, sk_eid) = setup_encryption_ctx(&conn, recorded_by);
+
+    let msg = MessageEvent {
+        created_at_ms: now_ms(),
+        workspace_id: [1u8; 32],
+        author_id: user_for_signer(&signer_eid),
+        content: "bad signer type".to_string(),
+        signed_by: signer_eid,
+        signer_type: 255,
+        signature: [0u8; 64],
+    };
+    let event = ParsedEvent::Message(msg);
+    let msg_blob = events::encode_event(&event).unwrap();
+
+    let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+    let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
+    let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
+
+    match result {
+        ProjectionDecision::Reject { reason } => {
+            assert!(
+                reason.contains("unsupported signer_type")
+                    || reason.contains("signer resolution failed"),
+                "unexpected rejection reason: {reason}"
+            );
+        }
+        other => panic!("expected Reject, got {:?}", other),
+    }
+
+    let enc_b64 = event_id_to_base64(&enc_eid);
+    let rejected: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &enc_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(rejected, 1, "rejected encrypted wrapper must be recorded");
+
+    let result2 = project_one(&conn, recorded_by, &enc_eid).unwrap();
+    assert_eq!(result2, ProjectionDecision::AlreadyProcessed);
+}
+
 // --- Identity-inside-encrypted rejection ---
 
 #[test]
