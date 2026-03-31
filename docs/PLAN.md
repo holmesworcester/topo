@@ -1711,3 +1711,35 @@ Plan-level enforcement remains:
 4. local-only subscription lifecycle/feed storage stays in `src/state/subscriptions/*` (not `event_modules/*`),
 5. event-specific subscription matching/payload shaping stays in `event_modules/<type>/subscription_filter.rs` (or `subscription_filters.rs`),
 6. module boundary checks stay automated in CI where available.
+
+## 21. Automatic misbehavior detection and removal (TODO)
+
+Verus formal verification (verus-proofs/src/bug_hunt.rs) identified that workspace
+members with tampered clients can perform detectable misbehavior. The system should
+automatically detect and respond to such behavior.
+
+### Phase 1: Wrong-author deletion intent cleanup
+- GC `deletion_intent` rows where the referenced deletion event was rejected
+- Prevents unbounded storage growth from wrong-author deletion spam
+
+### Phase 2: Misbehavior flagging
+- When `MessageDeletion` projector detects author mismatch, record the
+  `signed_by` peer as misbehaving in a new `misbehavior_log` table
+- When signature verification fails for a signed event, log the source peer
+
+### Phase 3: Automatic removal
+- When a peer accumulates N misbehavior incidents, emit a `Removal` event
+  targeting that peer (requires admin authority on the removing device)
+- The removal propagates via normal event sync, revoking transport trust
+  across all peers in the workspace
+
+### Phase 4: Session-level re-authorization
+- Periodic re-authorization checks during long-running sync sessions
+  to close the TOCTOU window between auth check and data exchange
+- Bootstrap auth cache entries should carry TTL matching the DB trust TTL
+
+### Phase 5: Bootstrap cache TTL enforcement
+- Add `created_at` timestamp to `AcceptedBootstrapAuthCache` entries in
+  `DaemonConnection` (peering_boundary.rs)
+- Check TTL on cache lookup; expire entries older than bootstrap trust TTL
+- Prevents long-lived QUIC connections from bypassing expired DB trust

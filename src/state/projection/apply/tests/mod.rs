@@ -36,6 +36,7 @@ mod identity;
 mod invite;
 mod removal_rotation;
 mod tenant;
+mod verus_findings;
 
 fn now_ms() -> u64 {
     SystemTime::now()

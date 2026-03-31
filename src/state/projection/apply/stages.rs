@@ -284,6 +284,16 @@ pub(crate) fn record_block_rows(
     let mut missing = missing.to_vec();
     missing.sort_unstable();
     missing.dedup();
+
+    // Clean stale dep edges from prior blocks before recording new ones.
+    // This prevents deps_remaining from desyncing with the actual edge set
+    // when an event is re-blocked with a different set of missing deps
+    // (e.g., dep-unblock → guard-block → re-dep-block via retry command).
+    conn.execute(
+        "DELETE FROM blocked_event_deps WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, event_id_b64],
+    )?;
+
     for dep_id in &missing {
         let dep_b64 = event_id_to_base64(dep_id);
         conn.execute(
@@ -292,8 +302,12 @@ pub(crate) fn record_block_rows(
             rusqlite::params![recorded_by, event_id_b64, &dep_b64],
         )?;
     }
+
+    // Use INSERT OR REPLACE so deps_remaining is always updated to match
+    // the current missing set, even if a prior blocked_events row exists
+    // with a stale counter from an earlier block.
     conn.execute(
-        "INSERT OR IGNORE INTO blocked_events (peer_id, event_id, deps_remaining)
+        "INSERT OR REPLACE INTO blocked_events (peer_id, event_id, deps_remaining)
          VALUES (?1, ?2, ?3)",
         rusqlite::params![recorded_by, event_id_b64, missing.len() as i64],
     )?;

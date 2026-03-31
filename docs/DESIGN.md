@@ -2002,3 +2002,37 @@ This appendix holds concrete Rust file/module references so conceptual sections 
 6. Transport cert/key install/load helpers: `src/runtime/transport/identity.rs`
 7. Trust SQL tables + helpers: `src/state/db/transport_trust.rs`
 8. Boundary guard script: `scripts/check_boundary_imports.sh`
+
+## 15.4 Formal verification (Verus)
+
+Machine-checked proofs live in `verus-proofs/`. Run via `scripts/run_verus_proofs.sh`.
+
+## 16. TODO: Automatic misbehavior detection and participant removal
+
+### 16.1 Wrong-author deletion as detectable misbehavior
+
+A `MessageDeletion` event contains `author_id` inside the encrypted wrapper (not
+visible without the content key). The projector rejects deletions where
+`del.author_id` does not match the target message's author. However, the
+`deletion_intent` row is recorded before this check (intent-only path for
+delete-before-create convergence), and wrong-author intents are never cleaned up.
+
+Since `MessageDeletion` events are signed by `signed_by` (the sender's peer identity)
+and encrypted, a wrong-author deletion can only be created by a workspace member
+with a tampered or broken client. This is detectable misbehavior:
+
+1. **Detection**: When a deletion projector sees `author_id != target_message_author`,
+   record the misbehaving `signed_by` peer identity.
+2. **Response**: Emit a `Removal` event targeting the misbehaving peer. This revokes
+   their transport authorization via the `removed_entities` table.
+3. **Cleanup**: Garbage-collect `deletion_intent` rows where the referenced deletion
+   event has been rejected (wrong-author or wrong-type).
+
+### 16.2 Other detectable misbehavior patterns
+
+Future work should detect and respond to:
+
+- Events with invalid signatures (already rejected, but the source peer could be flagged)
+- Events with forged `signed_by` fields (peer claims to be someone else)
+- Excessive event volume from a single peer (rate limiting / DoS protection)
+- Events referencing non-existent or unauthorized workspace_ids
