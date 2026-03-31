@@ -395,12 +395,18 @@ pub async fn create_runtime_endpoint_for_tenants(
 /// Shrinks per-connection buffer allocations.  This trades peak throughput
 /// for a smaller RSS footprint — acceptable for iOS NSE where we only need
 /// to sync recent messages, not sustain bulk transfer rates.
+///
+/// Note: `receive_window` (512 KiB) is less than `max_streams *
+/// stream_receive_window` (5 × 256 KiB = 1.25 MiB), so under concurrent
+/// load the connection-level cap limits effective per-stream throughput.
+/// This is intentional — we prefer a hard memory ceiling over peak
+/// per-stream bandwidth.
 fn low_mem_quic_transport_config() -> iroh::endpoint::QuicTransportConfig {
     iroh::endpoint::QuicTransportConfig::builder()
         .max_concurrent_bidi_streams(VarInt::from_u32(4))
         .max_concurrent_uni_streams(VarInt::from_u32(1))
         .stream_receive_window(VarInt::from_u32(256 * 1024)) // 256 KiB (default ~1 MiB)
-        .receive_window(VarInt::from_u32(512 * 1024))        // 512 KiB (default ~8 MiB)
+        .receive_window(VarInt::from_u32(512 * 1024))        // 512 KiB connection cap
         .send_window(512 * 1024)                              // 512 KiB (default ~8 MiB)
         .build()
 }

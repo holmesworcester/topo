@@ -2,7 +2,12 @@
 //!
 //! Measures VmRSS at each stage to determine how much memory iroh itself
 //! consumes vs what our relay/portmapper/mDNS configuration adds.
+//!
+//! These tests are diagnostic only (no assertions).  They require network
+//! access for relay stages and read /proc which is Linux-only.
+//! Run explicitly: `cargo test --release --test iroh_mem_test -- --ignored --nocapture`
 
+#[cfg(target_os = "linux")]
 fn rss_mib() -> f64 {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     for line in status.lines() {
@@ -15,6 +20,7 @@ fn rss_mib() -> f64 {
     0.0
 }
 
+#[cfg(target_os = "linux")]
 fn peak_rss_mib() -> f64 {
     let status = std::fs::read_to_string("/proc/self/status").unwrap_or_default();
     for line in status.lines() {
@@ -29,6 +35,7 @@ fn peak_rss_mib() -> f64 {
 
 #[test]
 #[cfg(target_os = "linux")]
+#[ignore = "diagnostic; requires network for relay stages"]
 fn iroh_memory_isolation() {
     let rt = tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -137,6 +144,7 @@ fn iroh_memory_isolation() {
 /// Measure with multi-threaded runtime (matching daemon)
 #[test]
 #[cfg(target_os = "linux")]
+#[ignore = "diagnostic; requires network for relay stages"]
 fn iroh_memory_isolation_multithread() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
