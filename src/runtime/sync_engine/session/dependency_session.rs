@@ -17,7 +17,9 @@ use crate::runtime::transport::{
     send_outbound_session_auth,
 };
 use crate::state::{dependency_fetch, pipeline::ingest_now};
-use crate::sync::session::range_session::load_shared_send_batch_with_endpoint_deps;
+use crate::sync::session::range_session::{
+    load_shared_send_batch_with_prefetched_deps, SharedSendBudget,
+};
 use crate::transport::{DaemonConnection, OutboundSessionAuthPlan};
 
 const DEPENDENCY_BATCH_CAP: usize = 16;
@@ -147,9 +149,16 @@ async fn run_dependency_response_sender(
         }
         ids.sort_unstable();
         ids.dedup();
+        let mut emitted = std::collections::HashSet::new();
+        let mut budget = SharedSendBudget::from_tuning();
         for chunk in ids.chunks(REQUEST_BATCH_CAP) {
-            let ordered = load_shared_send_batch_with_endpoint_deps(&store, chunk)?;
-            for (_event_id, blob) in ordered {
+            let batch = load_shared_send_batch_with_prefetched_deps(
+                &store,
+                chunk,
+                &mut emitted,
+                &mut budget,
+            )?;
+            for (_event_id, blob) in batch.ordered {
                 data_send
                     .send(&encode_frame(&Frame::Event { blob: blob.clone() }))
                     .await
