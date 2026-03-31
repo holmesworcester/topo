@@ -2009,30 +2009,87 @@ Machine-checked proofs live in `verus-proofs/`. Run via `scripts/run_verus_proof
 
 ## 16. TODO: Automatic misbehavior detection and participant removal
 
-### 16.1 Wrong-author deletion as detectable misbehavior
+### 16.1 author_id redundancy and the signer→user derivation
 
-A `MessageDeletion` event contains `author_id` inside the encrypted wrapper (not
-visible without the content key). The projector rejects deletions where
-`del.author_id` does not match the target message's author. However, the
-`deletion_intent` row is recorded before this check (intent-only path for
-delete-before-create convergence), and wrong-author intents are never cleaned up.
+`MessageDeletion.author_id` is inside the encrypted wrapper alongside `signed_by`.
+The `signer_user_mismatch_reason` check (queries.rs:173) resolves `signed_by` →
+`peers_shared.user_event_id` and rejects if it doesn't match `author_id`. This
+means:
 
-Since `MessageDeletion` events are signed by `signed_by` (the sender's peer identity)
-and encrypted, a wrong-author deletion can only be created by a workspace member
-with a tampered or broken client. This is detectable misbehavior:
+- **`author_id` is derivable from `signed_by`** via the peers_shared→user mapping.
+  It is redundant for authorization purposes — the signer identity outside the
+  ciphertext already determines who the author is.
+- **`author_id` exists for cross-device deletion**: multiple peer devices share the
+  same user identity. A deletion from device B for a message sent by device A is
+  valid because both devices map to the same user_event_id. The `author_id` field
+  makes this explicit in the wire format without requiring a DB lookup during
+  delete-before-create intent matching.
+- **The signer_user_mismatch check makes wrong-author deletion impossible for
+  authorization bypass**: a peer can only claim authorship of its own user. The
+  only "wrong-author" scenario is a peer targeting a message owned by a *different
+  user* — this is correctly rejected when the target message arrives, but the
+  deletion_intent row persists as a storage leak.
 
-1. **Detection**: When a deletion projector sees `author_id != target_message_author`,
-   record the misbehaving `signed_by` peer identity.
-2. **Response**: Emit a `Removal` event targeting the misbehaving peer. This revokes
-   their transport authorization via the `removed_entities` table.
-3. **Cleanup**: Garbage-collect `deletion_intent` rows where the referenced deletion
-   event has been rejected (wrong-author or wrong-type).
+**TODO**: Consider removing `author_id` from the wire format entirely and deriving
+it from `signed_by → peers_shared.user_event_id` at projection time. This would
+eliminate the redundancy and the storage leak (no intent recorded until the user
+mapping is verified). The trade-off is an extra DB lookup during intent matching.
 
-### 16.2 Other detectable misbehavior patterns
+### 16.2 Deletion intent storage leak
 
-Future work should detect and respond to:
+When a workspace member creates a `MessageDeletion` targeting a message they don't
+own, the `signer_user_mismatch` check passes (the peer IS who they claim to be),
+but the `deletion_intent.author_id` won't match the target message's author when it
+arrives. The intent row persists in `deletion_intents` indefinitely — it is never
+garbage-collected because no code path removes unmatched intents.
 
-- Events with invalid signatures (already rejected, but the source peer could be flagged)
-- Events with forged `signed_by` fields (peer claims to be someone else)
+This is a low-severity DoS vector: a compromised workspace member can create
+unlimited deletion_intent rows. The mitigation is periodic GC of intents whose
+referenced deletion event has been rejected.
+
+### 16.3 Block-side command idempotency requirement (Finding 6)
+
+The apply engine executes `emit_commands` for both Valid AND Block decisions
+(stages.rs apply_projection). For Block decisions, this means commands execute on
+**every re-block attempt**, not just the first. Currently all Block-side commands
+use INSERT OR IGNORE and are idempotent:
+
+- `RecordFileSliceGuardBlock`: INSERT OR IGNORE into file_slice_guard_blocks
+
+Any future Block-side command MUST be idempotent, or the apply engine must add a
+"first-block-only" guard. This is a latent hazard, not a current bug.
+
+### 16.4 FileSlice guard-blocking: purpose and design
+
+**Purpose**: FileSlice events must be validated against their parent File descriptor
+(signer match, encryption key match). The File descriptor's event_id is not known
+at parse time — it's discovered by looking up the file_id in the projected files
+table. If the File hasn't been projected yet, the FileSlice cannot be validated.
+
+**Current mechanism** (guard-block pattern):
+1. FileSlice projector checks `ctx.file_descriptors` — empty means no File yet
+2. Returns `Block{missing: []}` + `EmitCommand::RecordFileSliceGuardBlock{file_id}`
+3. Guard row written to `file_slice_guard_blocks` table
+4. When File projects, emits `EmitCommand::RetryFileSliceGuards{file_id}`
+5. Retry command reads guard table, deletes entries, calls `project_one` for each
+
+**Problems with current approach**:
+- Empty-missing Block has no cascade recovery (Finding 2) — relies solely on retry
+- Guard-block commands execute on every re-block attempt (Finding 6)
+- Separate table + command mechanism duplicates dep-blocking infrastructure
+
+**TODO: Unify guard-blocking with dep-blocking**: Use the file_id as a synthetic
+blocker key in `blocked_event_deps`. When File projects, post-projection cascade
+looks up events blocked on the file_id (in addition to the File's event_id). This
+eliminates the guard table, the retry commands, and the empty-missing Block pattern.
+Trade-off: cascade must support non-event-id blocker keys.
+
+### 16.5 Detectable misbehavior patterns
+
+Future work should detect and auto-respond to:
+
+- Wrong-author deletions (deletion's author doesn't match target message author)
+- Events with invalid signatures (signer key not found or signature verification fails)
+- Events with forged signed_by fields (peer claims to be a different peer)
 - Excessive event volume from a single peer (rate limiting / DoS protection)
-- Events referencing non-existent or unauthorized workspace_ids
+- Events referencing unauthorized workspace_ids
