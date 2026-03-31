@@ -30,6 +30,9 @@ pub mod sync_protocol;
 pub mod connection_security;
 pub mod data_ingestion;
 
+// Bug-hunting proofs
+pub mod bug_hunt;
+
 verus! {
     proof fn system_invariants_hold() { }
 }
