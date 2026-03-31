@@ -1827,8 +1827,9 @@ fn test_cli_multitenant_multiworkspace_induction_with_reuse() {
     let tmpdir = tempfile::tempdir().unwrap();
     // This path exercises daemon reuse plus cross-workspace route admission on
     // discovery-enabled runtimes. It is stable in isolation but can sit near
-    // 45s after long prior daemon churn in the full CLI suite.
-    let timeout_ms = 60000;
+    // 45-55s after long prior daemon churn in the full CLI suite, so give it
+    // extra headroom to avoid order-dependent transport flakes.
+    let timeout_ms = 120000;
 
     let alpha_db = tmpdir.path().join("alpha.db").to_str().unwrap().to_string();
     let zeta_db = tmpdir.path().join("zeta.db").to_str().unwrap().to_string();
