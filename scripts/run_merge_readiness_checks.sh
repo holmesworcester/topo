@@ -59,6 +59,7 @@ case "$mode" in
         "$0" targeted
         "$0" full-cli
         run cargo test -q --manifest-path "$MANIFEST"
+        run "$ROOT/scripts/run_verus_proofs.sh"
         ;;
     *)
         usage
