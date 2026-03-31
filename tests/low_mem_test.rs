@@ -321,6 +321,85 @@ fn run_lowmem_fresh_sync(label: &str, events: usize, history_span: &str) -> f64 
     bob_peak
 }
 
+/// Like `run_lowmem_fresh_sync` but with a pre-synced baseline.
+/// Alice generates `baseline_events` (365d span), syncs to Bob in normal mode,
+/// then Bob restarts in lowmem and receives `delta_events` (6d span).
+fn run_lowmem_delta_sync(label: &str, baseline_events: usize, delta_events: usize) -> f64 {
+    let tmpdir = tempfile::tempdir().expect("create tempdir");
+    let alice_db = tmpdir.path().join(format!("{label}-alice.db"));
+    let bob_db = tmpdir.path().join(format!("{label}-bob.db"));
+    let alice_db = alice_db.to_str().unwrap().to_string();
+    let bob_db = bob_db.to_str().unwrap().to_string();
+
+    create_workspace_with_details(&alice_db, "lowmem", "alice", "desktop");
+    let mut alice_daemon = start_daemon_with_options(
+        &alice_db,
+        &DaemonOptions {
+            disable_discovery: true,
+            ..Default::default()
+        },
+    );
+    ensure_active_peer(&alice_db, Duration::from_secs(10));
+    wait_for_active_tenant_ready(&alice_db, Duration::from_secs(60));
+
+    // Generate baseline events spread across a year.
+    generate_messages_with_span(&alice_db, baseline_events, "365d");
+    wait_for_message_count(
+        &alice_db,
+        baseline_events as i64,
+        timeout_for_events(baseline_events, 300),
+    );
+
+    // Join Bob and sync baseline in normal mode.
+    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
+    accept_invite(&bob_db, &invite_link);
+    let mut bob_daemon = start_daemon_with_options(
+        &bob_db,
+        &DaemonOptions {
+            disable_discovery: true,
+            ..Default::default()
+        },
+    );
+    ensure_active_peer(&bob_db, Duration::from_secs(10));
+    wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
+    wait_for_message_count(
+        &bob_db,
+        baseline_events as i64,
+        timeout_for_events(baseline_events, 600),
+    );
+
+    // Stop Bob and restart in lowmem.
+    stop_daemon(&bob_db, &mut bob_daemon);
+    wait_for_daemon_stopped(&bob_db, Duration::from_secs(10));
+    bob_daemon = restart_receiver_lowmem(&bob_db);
+    let bob_pid = bob_daemon.child().id();
+    ensure_active_peer(&bob_db, Duration::from_secs(10));
+    wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
+
+    // Generate delta events within the lowmem sync window.
+    generate_messages_with_span(&alice_db, delta_events, "6d");
+    let expected_total = (baseline_events + delta_events) as i64;
+    wait_for_message_count(&alice_db, expected_total, timeout_for_events(delta_events, 120));
+    // Bob should reach expected total: baseline was already synced, only the
+    // delta needs to arrive over the lowmem window.
+    let delta_timeout = timeout_for_events(delta_events, 300);
+    wait_for_message_count(&bob_db, expected_total, delta_timeout);
+
+    let bob_peak = peak_rss_mib_for_pid(bob_pid).unwrap_or(0.0);
+    let bob_total = message_count_sql(&bob_db);
+    eprintln!(
+        "  {label:>20}: baseline={baseline_events:>7} delta={delta_events:>7} \
+         bob_total={bob_total:>7} bob_peak_rss={bob_peak:.1} MiB"
+    );
+    stop_daemon(&bob_db, &mut bob_daemon);
+    stop_daemon(&alice_db, &mut alice_daemon);
+    bob_peak
+}
+
 /// Hard gate: lowmem receiver syncing 20k recent events must stay under 24 MiB.
 /// This runs as part of the default test suite (not ignored).
 #[test]
@@ -331,6 +410,34 @@ fn lowmem_20k_fresh_sync_under_budget() {
     assert!(
         bob_peak <= budget_mib,
         "lowmem 20k fresh sync exceeded {budget_mib} MiB budget: peak={bob_peak:.1} MiB"
+    );
+}
+
+/// Guard: lowmem receiver with 50k baseline syncing 1k recent delta must stay
+/// under 24 MiB.  Protects against regressions in the baseline-holding path
+/// (negentropy storage, index queries, idle daemon overhead).
+#[test]
+#[cfg(target_os = "linux")]
+fn lowmem_50k_baseline_1k_delta_under_budget() {
+    let budget_mib = 24.0;
+    let bob_peak = run_lowmem_delta_sync("gate-50k-base", 50_000, 1_000);
+    assert!(
+        bob_peak <= budget_mib,
+        "lowmem 50k+1k delta sync exceeded {budget_mib} MiB budget: peak={bob_peak:.1} MiB"
+    );
+}
+
+/// Guard: lowmem receiver syncing 40k recent events on a small baseline must
+/// stay under 24 MiB.  Protects against per-event memory growth during the
+/// data-plane receive/ingest path.
+#[test]
+#[cfg(target_os = "linux")]
+fn lowmem_100_baseline_40k_delta_under_budget() {
+    let budget_mib = 24.0;
+    let bob_peak = run_lowmem_delta_sync("gate-40k-delta", 100, 40_000);
+    assert!(
+        bob_peak <= budget_mib,
+        "lowmem 100+40k delta sync exceeded {budget_mib} MiB budget: peak={bob_peak:.1} MiB"
     );
 }
 
