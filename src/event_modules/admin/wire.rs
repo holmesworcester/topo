@@ -76,7 +76,7 @@ pub fn encode_admin(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     Ok(encode_fields(EVENT_TYPE_ADMIN, ADMIN_FIELDS, &values)?)
 }
 
-pub static ADMIN_META: EventTypeMeta = EventTypeMeta {
+pub static ADMIN_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_ADMIN,
     type_name: "admin",
     projection_table: "admins",

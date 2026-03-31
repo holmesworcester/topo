@@ -250,7 +250,7 @@ pub fn project_pure(
     }])
 }
 
-pub static REMOVAL_META: EventTypeMeta = EventTypeMeta {
+pub static REMOVAL_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_REMOVAL,
     type_name: "removal",
     projection_table: "removals",

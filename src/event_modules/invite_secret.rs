@@ -151,7 +151,7 @@ pub fn project_pure(
     }])
 }
 
-pub static INVITE_SECRET_META: EventTypeMeta = EventTypeMeta {
+pub static INVITE_SECRET_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_INVITE_SECRET,
     type_name: "invite_secret",
     projection_table: "invite_secrets",

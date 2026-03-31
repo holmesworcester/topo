@@ -3,13 +3,11 @@ use crate::db::queue::current_timestamp_ms;
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::ParsedEvent;
 use crate::projection::contract::{EmitCommand, WriteOp};
-use crate::projection::decision::ProjectionDecision;
-use crate::projection::encrypted::project_encrypted;
 use crate::projection::queries::ProjectionQueries;
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
 use rusqlite::Connection;
 
-use super::stages::{check_dep_types, check_deps_and_block, record_rejection};
+use super::stages::record_rejection;
 use super::write_exec::{execute_emit_commands, execute_write_ops};
 
 pub(crate) type ProjectionApplyResult<T> = Result<T, Box<dyn std::error::Error>>;
@@ -37,35 +35,12 @@ pub(crate) trait ProjectionBackend: ProjectionQueries {
         missing: &[EventId],
     ) -> ProjectionApplyResult<()>;
 
-    fn check_deps_and_block(
-        &self,
-        recorded_by: &str,
-        event_id_b64: &str,
-        parsed: &ParsedEvent,
-        deps: &[(&str, EventId)],
-    ) -> ProjectionApplyResult<Option<ProjectionDecision>>;
-
-    fn check_dep_types(
-        &self,
-        recorded_by: &str,
-        parsed: &ParsedEvent,
-        deps: &[(&str, EventId)],
-        type_codes: &[&[u8]],
-    ) -> ProjectionApplyResult<Option<String>>;
-
     fn resolve_signer_key(
         &self,
         recorded_by: &str,
         signer_type: u8,
         signer_event_id: &[u8; 32],
     ) -> ProjectionApplyResult<SignerResolution>;
-
-    fn project_encrypted(
-        &self,
-        recorded_by: &str,
-        event_id_b64: &str,
-        encrypted: &crate::event_modules::EncryptedEvent,
-    ) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>)>;
 
     fn execute_write_ops(&self, ops: &[WriteOp]) -> ProjectionApplyResult<()>;
 
@@ -140,27 +115,17 @@ impl ProjectionBackend for Connection {
         missing: &[EventId],
     ) -> ProjectionApplyResult<()> {
         super::stages::record_block_rows(self, recorded_by, event_id_b64, missing)?;
+        if let Some(source_peer_id) =
+            super::stages::load_recorded_source_peer_id(self, recorded_by, event_id_b64)?
+        {
+            crate::state::dependency_fetch::publish_from_connection(
+                self,
+                recorded_by,
+                &source_peer_id,
+                missing,
+            );
+        }
         Ok(())
-    }
-
-    fn check_deps_and_block(
-        &self,
-        recorded_by: &str,
-        event_id_b64: &str,
-        parsed: &ParsedEvent,
-        deps: &[(&str, EventId)],
-    ) -> ProjectionApplyResult<Option<ProjectionDecision>> {
-        check_deps_and_block(self, recorded_by, event_id_b64, parsed, deps)
-    }
-
-    fn check_dep_types(
-        &self,
-        recorded_by: &str,
-        parsed: &ParsedEvent,
-        deps: &[(&str, EventId)],
-        type_codes: &[&[u8]],
-    ) -> ProjectionApplyResult<Option<String>> {
-        check_dep_types(self, recorded_by, parsed, deps, type_codes)
     }
 
     fn resolve_signer_key(
@@ -170,15 +135,6 @@ impl ProjectionBackend for Connection {
         signer_event_id: &[u8; 32],
     ) -> ProjectionApplyResult<SignerResolution> {
         resolve_signer_key(self, recorded_by, signer_type, signer_event_id)
-    }
-
-    fn project_encrypted(
-        &self,
-        recorded_by: &str,
-        event_id_b64: &str,
-        encrypted: &crate::event_modules::EncryptedEvent,
-    ) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>)> {
-        project_encrypted(self, recorded_by, event_id_b64, encrypted)
     }
 
     fn execute_write_ops(&self, ops: &[WriteOp]) -> ProjectionApplyResult<()> {
@@ -262,6 +218,7 @@ mod tests {
     use crate::event_modules::{encode_event, ParsedEvent, TenantEvent};
     use crate::projection::contract::{ContextSnapshot, EmitCommand, WriteOp};
     use crate::projection::decision::ProjectionDecision;
+    use crate::projection::queries::{DepLoadResult, ProjectionQueryResult};
 
     use super::*;
     use crate::projection::apply::project_one::project_one_step_with_backend;
@@ -346,26 +303,6 @@ mod tests {
             Ok(())
         }
 
-        fn check_deps_and_block(
-            &self,
-            _recorded_by: &str,
-            _event_id_b64: &str,
-            _parsed: &ParsedEvent,
-            _deps: &[(&str, EventId)],
-        ) -> ProjectionApplyResult<Option<ProjectionDecision>> {
-            Ok(None)
-        }
-
-        fn check_dep_types(
-            &self,
-            _recorded_by: &str,
-            _parsed: &ParsedEvent,
-            _deps: &[(&str, EventId)],
-            _type_codes: &[&[u8]],
-        ) -> ProjectionApplyResult<Option<String>> {
-            Ok(None)
-        }
-
         fn resolve_signer_key(
             &self,
             _recorded_by: &str,
@@ -373,15 +310,6 @@ mod tests {
             _signer_event_id: &[u8; 32],
         ) -> ProjectionApplyResult<SignerResolution> {
             Ok(SignerResolution::NotFound)
-        }
-
-        fn project_encrypted(
-            &self,
-            _recorded_by: &str,
-            _event_id_b64: &str,
-            _encrypted: &crate::event_modules::EncryptedEvent,
-        ) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>)> {
-            Err("fake backend does not support encrypted projection".into())
         }
 
         fn execute_write_ops(&self, _ops: &[WriteOp]) -> ProjectionApplyResult<()> {
@@ -419,6 +347,24 @@ mod tests {
     }
 
     impl ProjectionQueries for FakeProjectionBackend {
+        fn load_dep_result(
+            &self,
+            _recorded_by: &str,
+            _parsed: &ParsedEvent,
+            _field_name: &str,
+            _dep_id: &EventId,
+        ) -> ProjectionQueryResult<DepLoadResult> {
+            Ok(DepLoadResult::missing())
+        }
+
+        fn load_key_secret_bytes(
+            &self,
+            _recorded_by: &str,
+            _key_event_id: &[u8; 32],
+        ) -> ProjectionQueryResult<Option<[u8; 32]>> {
+            Ok(None)
+        }
+
         fn load_workspace_context(
             &self,
             _recorded_by: &str,

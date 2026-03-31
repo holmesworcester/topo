@@ -209,7 +209,7 @@ pub fn encode_file(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     Ok(encode_fields(EVENT_TYPE_FILE, FILE_FIELDS, &values)?)
 }
 
-pub static FILE_META: EventTypeMeta = EventTypeMeta {
+pub static FILE_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_FILE,
     type_name: "file",
     projection_table: "files",

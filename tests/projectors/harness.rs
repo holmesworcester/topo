@@ -15,7 +15,7 @@ pub mod fixtures {
         ProjectorResult, WriteOp,
     };
     use topo::projection::decision::ProjectionDecision;
-    use topo::projection::queries::{ContextLoadResult, ProjectionQueries};
+    use topo::projection::queries::{ContextLoadResult, DepLoadResult, ProjectionQueries};
 
     #[derive(Clone)]
     pub struct FixtureProjectionQueries {
@@ -29,6 +29,24 @@ pub mod fixtures {
     }
 
     impl ProjectionQueries for FixtureProjectionQueries {
+        fn load_dep_result(
+            &self,
+            _recorded_by: &str,
+            _parsed: &topo::event_modules::ParsedEvent,
+            _field_name: &str,
+            _dep_id: &[u8; 32],
+        ) -> Result<DepLoadResult, Box<dyn std::error::Error>> {
+            Ok(DepLoadResult::ready(None))
+        }
+
+        fn load_key_secret_bytes(
+            &self,
+            _recorded_by: &str,
+            _key_event_id: &[u8; 32],
+        ) -> Result<Option<[u8; 32]>, Box<dyn std::error::Error>> {
+            Ok(None)
+        }
+
         fn load_workspace_context(
             &self,
             _recorded_by: &str,

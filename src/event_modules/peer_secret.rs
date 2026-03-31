@@ -129,7 +129,7 @@ pub fn project_pure(
     )
 }
 
-pub static PEER_SECRET_META: EventTypeMeta = EventTypeMeta {
+pub static PEER_SECRET_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_PEER_SECRET,
     type_name: "peer_secret",
     projection_table: "peer_secrets",

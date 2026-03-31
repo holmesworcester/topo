@@ -66,7 +66,7 @@ pub fn encode_workspace(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     )?)
 }
 
-pub static WORKSPACE_META: EventTypeMeta = EventTypeMeta {
+pub static WORKSPACE_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_WORKSPACE,
     type_name: "workspace",
     projection_table: "workspaces",

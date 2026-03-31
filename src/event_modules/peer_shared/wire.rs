@@ -94,7 +94,7 @@ pub fn encode_peer_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     )?)
 }
 
-pub static PEER_SHARED_META: EventTypeMeta = EventTypeMeta {
+pub static PEER_SHARED_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_PEER_SHARED,
     type_name: "peer_shared",
     projection_table: "peers_shared",

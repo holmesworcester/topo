@@ -90,7 +90,7 @@ pub fn encode_user_invite(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     )?)
 }
 
-pub static USER_INVITE_META: EventTypeMeta = EventTypeMeta {
+pub static USER_INVITE_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_USER_INVITE,
     type_name: "user_invite_shared",
     projection_table: "user_invites",

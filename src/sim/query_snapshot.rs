@@ -77,6 +77,7 @@ pub struct ImportedBootstrapContextRow {
 
 #[derive(Clone, Debug)]
 pub struct ImportedPeerState {
+    pub db_path: String,
     pub recorded_by: String,
     pub workspace_id: Option<String>,
     pub daemon_peer_id: Option<String>,
@@ -88,6 +89,7 @@ pub struct ImportedPeerState {
     pub observed_targets: Vec<ImportedObservedTarget>,
     pub connect_targets: Vec<ImportedConnectTarget>,
     pub known_events: Vec<ImportedKnownEvent>,
+    pub ambient_shared_events: Vec<ImportedKnownEvent>,
 }
 
 impl ImportedPeerState {
@@ -253,7 +255,32 @@ pub fn import_peer_state(
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
+    let known_event_ids = known_events
+        .iter()
+        .map(|event| event.event_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut ambient_stmt = conn.prepare(
+        "SELECT event_id, created_at, blob
+         FROM events
+         WHERE share_scope = 'shared'
+         ORDER BY created_at ASC, event_id ASC",
+    )?;
+    let ambient_shared_events = ambient_stmt
+        .query_map([], |row| {
+            Ok(ImportedKnownEvent {
+                event_id: row.get(0)?,
+                source: "ambient_shared".to_string(),
+                created_at_ms: row.get(1)?,
+                blob: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|event| !known_event_ids.contains(&event.event_id))
+        .collect::<Vec<_>>();
+
     Ok(ImportedPeerState {
+        db_path: source_db_path.to_string(),
         recorded_by: recorded_by.to_string(),
         workspace_id,
         daemon_peer_id,
@@ -267,6 +294,7 @@ pub fn import_peer_state(
         observed_targets,
         connect_targets,
         known_events,
+        ambient_shared_events,
     })
 }
 

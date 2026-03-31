@@ -85,7 +85,7 @@ pub fn encode_reaction(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     )?)
 }
 
-pub static REACTION_TYPE_META: EventTypeMeta = EventTypeMeta {
+pub static REACTION_TYPE_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_REACTION,
     type_name: "reaction",
     projection_table: "reactions",

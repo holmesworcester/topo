@@ -81,7 +81,7 @@ pub fn encode_user(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     Ok(encode_fields(EVENT_TYPE_USER, USER_FIELDS, &values)?)
 }
 
-pub static USER_META: EventTypeMeta = EventTypeMeta {
+pub static USER_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_USER,
     type_name: "user",
     projection_table: "users",

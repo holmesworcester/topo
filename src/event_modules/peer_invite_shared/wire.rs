@@ -88,7 +88,7 @@ pub fn encode_device_invite(event: &ParsedEvent) -> Result<Vec<u8>, EventError> 
     )?)
 }
 
-pub static DEVICE_INVITE_META: EventTypeMeta = EventTypeMeta {
+pub static DEVICE_INVITE_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_DEVICE_INVITE,
     type_name: "peer_invite_shared",
     projection_table: "device_invites",

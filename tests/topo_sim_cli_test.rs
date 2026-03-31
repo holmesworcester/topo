@@ -10,7 +10,7 @@ fn topo_sim_bin() -> String {
 }
 
 fn run_topo_sim(dbs: &[String], mode: &str, topology: &str, rounds: u32) -> serde_json::Value {
-    run_topo_sim_with_options(dbs, mode, topology, rounds, false)
+    run_topo_sim_with_options(dbs, mode, topology, rounds, false, &[])
 }
 
 fn run_topo_sim_with_options(
@@ -19,6 +19,7 @@ fn run_topo_sim_with_options(
     topology: &str,
     rounds: u32,
     repair_run: bool,
+    extra_args: &[&str],
 ) -> serde_json::Value {
     let mut cmd = Command::new(topo_sim_bin());
     cmd.arg("--mode")
@@ -30,6 +31,7 @@ fn run_topo_sim_with_options(
     if repair_run {
         cmd.arg("--repair-run");
     }
+    cmd.args(extra_args);
     for db in dbs {
         cmd.arg("--db").arg(db);
     }
@@ -132,6 +134,73 @@ fn topo_sim_rejects_missing_db_and_bad_topology() {
 }
 
 #[test]
+fn topo_sim_behavior_engine_runs_fake_topology_and_reports_filters() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let dbs = create_invited_peer_dbs(&tmpdir, 4);
+
+    let report = run_topo_sim_with_options(
+        &dbs,
+        "nearest-neighbor-no-auth",
+        "graph",
+        1,
+        false,
+        &[
+            "--engine",
+            "behavior",
+            "--block-type-code",
+            "1",
+            "--block-type-code",
+            "99",
+        ],
+    );
+    assert_eq!(report["engine"], "behavior");
+    assert_eq!(report["blocked_type_codes"], serde_json::json!([1, 99]));
+    assert_eq!(report["rounds"][0]["mode"], "NearestNeighborNoAuth");
+    assert_eq!(report["rounds"][0]["fake_topology"], "Graph");
+    assert!(
+        report["rounds"][0]["sessions_executed"]
+            .as_u64()
+            .unwrap_or(0)
+            >= 1,
+        "behavior engine graph topology should execute at least one simulated pair sync"
+    );
+}
+
+#[test]
+fn topo_sim_behavior_engine_rejects_planner_mode() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let db = tmpdir
+        .path()
+        .join("single.db")
+        .to_string_lossy()
+        .into_owned();
+    create_workspace(&db);
+
+    let out = Command::new(topo_sim_bin())
+        .args([
+            "--mode",
+            "planner",
+            "--topology",
+            "graph",
+            "--engine",
+            "behavior",
+            "--db",
+            &db,
+        ])
+        .output()
+        .expect("run topo-sim with unsupported behavior/planner combo");
+    assert!(!out.status.success());
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stderr.contains("behavior engine currently supports only --mode nearest-neighbor-no-auth")
+            || stdout.contains(
+                "behavior engine currently supports only --mode nearest-neighbor-no-auth"
+            )
+    );
+}
+
+#[test]
 fn topo_sim_fake_star_propagates_one_message_to_all_peers_in_one_round() {
     let tmpdir = tempfile::tempdir().unwrap();
     let dbs = create_invited_peer_dbs(&tmpdir, 4);
@@ -194,7 +263,8 @@ fn topo_sim_repair_run_is_sim_only_and_reports_stats() {
         .into_owned();
     create_workspace(&db);
 
-    let report = run_topo_sim_with_options(&[db], "nearest-neighbor-no-auth", "graph", 0, true);
+    let report =
+        run_topo_sim_with_options(&[db], "nearest-neighbor-no-auth", "graph", 0, true, &[]);
     assert!(report.get("repair_stats").is_some());
     assert_eq!(
         report["repair_stats"]["request_stats"]["emitted_requests"]

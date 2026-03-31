@@ -5,7 +5,7 @@ use crate::event_modules::{self as events, ParsedEvent};
 use rusqlite::Connection;
 
 use super::cascade::{cascade_unblocked, cascade_unblocked_global};
-use super::stages::run_dep_and_projection_stages_with_backend;
+use super::stages::apply_projection_with_backend;
 
 fn event_is_valid_for_peer(
     conn: &Connection,
@@ -25,9 +25,9 @@ fn event_is_valid_for_peer(
 ///   1. Terminal-state check (already valid or rejected → AlreadyProcessed)
 ///   2. Load blob from events table
 ///   3. Parse via registry
-///   4. Dependency presence check (write block rows if missing)
-///   5. Dependency type-code validation
-///   6. Signer verification + per-event projector dispatch
+///   4. Generic tri-state prereq/context load
+///   5. Generic signer verification + envelope recursion
+///   6. Per-event projector dispatch
 ///   7. Write valid_events terminal row
 ///
 /// Returns the decision and the parsed event (if available).
@@ -75,18 +75,10 @@ pub(crate) fn project_one_step_with_backend<B: ProjectionBackend>(
         }
     };
 
-    // 4-6. Shared dep/signer/projection stages
+    // 4-6. Shared prereq/signer/projection stages
     // For encrypted events, inner_parsed contains the decrypted inner event.
-    let (decision, inner_parsed) = run_dep_and_projection_stages_with_backend(
-        backend,
-        recorded_by,
-        &event_id_b64,
-        &blob,
-        &parsed,
-        false,
-        true, // canonical cleartext flow enforces dep type constraints
-        None,
-    )?;
+    let (decision, inner_parsed) =
+        apply_projection_with_backend(backend, recorded_by, &event_id_b64, &blob, &parsed, None)?;
     match &decision {
         ProjectionDecision::Reject { ref reason } => {
             backend.record_rejection(recorded_by, &event_id_b64, reason)?;

@@ -272,7 +272,7 @@ pub fn project_pure(
     )
 }
 
-pub static KEY_SHARED_META: EventTypeMeta = EventTypeMeta {
+pub static KEY_SHARED_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_KEY_SHARED,
     type_name: "key_shared",
     projection_table: "key_shared",

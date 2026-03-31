@@ -121,7 +121,7 @@ pub fn project_pure(
     ProjectorResult::valid(vec![])
 }
 
-pub static BENCH_DEP_META: EventTypeMeta = EventTypeMeta {
+pub static BENCH_DEP_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_BENCH_DEP,
     type_name: "bench_dep_perf_testing",
     projection_table: "valid_events",

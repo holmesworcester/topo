@@ -277,7 +277,7 @@ pub fn project_pure(
     }])
 }
 
-pub static ENDPOINT_SHARED_META: EventTypeMeta = EventTypeMeta {
+pub static ENDPOINT_SHARED_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_ENDPOINT_SHARED,
     type_name: "endpoint_shared",
     projection_table: "endpoints_shared",

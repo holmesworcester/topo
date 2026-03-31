@@ -1,4 +1,5 @@
 use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
 use topo::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use topo::db::open_connection;
@@ -32,19 +33,171 @@ fn create_invite(daemon: &VirtualDaemon, public_addr: &str) -> String {
         .to_string()
 }
 
-fn snapshot_has_message_content(daemon: &VirtualDaemon, content: &str) -> bool {
+fn emit_key_requests_retry(db_paths: &[String]) -> topo::sim::KeyRepairEmitStats {
+    let start = Instant::now();
+    loop {
+        match emit_key_requests_for_dbs(db_paths) {
+            Ok(stats) => return stats,
+            Err(err) => {
+                let message = err.to_string();
+                let retryable = message.contains("workspace has not completed initial sync yet")
+                    || message.contains("blocked on");
+                if retryable && start.elapsed() < Duration::from_secs(10) {
+                    let _ = PlannerSimulation::new(db_paths.to_vec()).tick();
+                    std::thread::sleep(Duration::from_millis(50));
+                    continue;
+                }
+                panic!("emit key requests: {message}");
+            }
+        }
+    }
+}
+
+fn wait_for_authoring_ready(daemon: &VirtualDaemon, bootstrap_db_paths: &[String]) {
     let recorded_by = active_peer_id(daemon);
-    let snapshot =
-        topo::sim::snapshot_replayed_peer(daemon.db_path(), &recorded_by).expect("peer snapshot");
-    let messages = snapshot
-        .daemon()
+    let start = Instant::now();
+    loop {
+        let conn = open_connection(daemon.db_path()).expect("open db");
+        if topo::event_modules::workspace::load_local_authoring_context(&conn, &recorded_by).is_ok()
+        {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timed out waiting for authoring readiness on {} (invites_accepted={}, workspaces={}, users={}, peers_shared={}, peer_secrets={}, recorded_peer_secret_events={}, blocked_events={}, blocked_details={:?})",
+            daemon.db_path(),
+            conn.query_row(
+                "SELECT COUNT(*) FROM invites_accepted WHERE recorded_by = ?1",
+                rusqlite::params![&recorded_by],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap_or(-1),
+            conn.query_row(
+                "SELECT COUNT(*) FROM workspaces WHERE recorded_by = ?1",
+                rusqlite::params![&recorded_by],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap_or(-1),
+            conn.query_row(
+                "SELECT COUNT(*) FROM users WHERE recorded_by = ?1",
+                rusqlite::params![&recorded_by],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap_or(-1),
+            conn.query_row(
+                "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
+                rusqlite::params![&recorded_by],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap_or(-1),
+            conn.query_row(
+                "SELECT COUNT(*) FROM peer_secrets WHERE recorded_by = ?1",
+                rusqlite::params![&recorded_by],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap_or(-1),
+            conn.query_row(
+                "SELECT COUNT(*)
+                 FROM recorded_events re
+                 JOIN events e ON e.event_id = re.event_id
+                 WHERE re.peer_id = ?1
+                   AND e.event_type = 'peer_secret'",
+                rusqlite::params![&recorded_by],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap_or(-1),
+            conn.query_row(
+                "SELECT COUNT(*) FROM blocked_events WHERE peer_id = ?1",
+                rusqlite::params![&recorded_by],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap_or(-1),
+            {
+                let mut stmt = conn
+                    .prepare(
+                        "SELECT be.event_id, e.event_type
+                         FROM blocked_events be
+                         JOIN events e ON e.event_id = be.event_id
+                         WHERE be.peer_id = ?1
+                         ORDER BY be.event_id ASC
+                         LIMIT 8",
+                    )
+                    .expect("prepare blocked details");
+                let rows = stmt
+                    .query_map(rusqlite::params![&recorded_by], |row| {
+                        Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+                    })
+                    .expect("query blocked details")
+                    .collect::<Result<Vec<_>, _>>()
+                    .expect("collect blocked details");
+                rows
+            },
+        );
+        if !bootstrap_db_paths.is_empty() {
+            let _ = PlannerSimulation::new(bootstrap_db_paths.to_vec()).tick();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
+fn snapshot_has_message_content(daemon: &VirtualDaemon, content: &str) -> bool {
+    let messages = daemon
         .call_ok_value(RpcMethod::Messages { limit: 100 })
-        .expect("messages via snapshot rpc");
+        .expect("messages via daemon rpc");
     messages["messages"]
         .as_array()
         .expect("messages array")
         .iter()
         .any(|message| message["content"].as_str() == Some(content))
+}
+
+fn recorded_event_count(db_path: &str, recorded_by: &str, event_id: &EventId) -> i64 {
+    let conn = open_connection(db_path).expect("open db");
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM recorded_events
+         WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, event_id_to_base64(event_id)],
+        |row| row.get::<_, i64>(0),
+    )
+    .expect("recorded event count")
+}
+
+fn valid_event_count(db_path: &str, recorded_by: &str, event_id: &EventId) -> i64 {
+    let conn = open_connection(db_path).expect("open db");
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM valid_events
+         WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, event_id_to_base64(event_id)],
+        |row| row.get::<_, i64>(0),
+    )
+    .expect("valid event count")
+}
+
+fn blocked_event_count(db_path: &str, recorded_by: &str, event_id: &EventId) -> i64 {
+    let conn = open_connection(db_path).expect("open db");
+    conn.query_row(
+        "SELECT COUNT(*)
+         FROM blocked_events
+         WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, event_id_to_base64(event_id)],
+        |row| row.get::<_, i64>(0),
+    )
+    .expect("blocked event count")
+}
+
+fn rejected_event_reason(db_path: &str, recorded_by: &str, event_id: &EventId) -> Option<String> {
+    let conn = open_connection(db_path).expect("open db");
+    conn.query_row(
+        "SELECT reason
+         FROM rejected_events
+         WHERE peer_id = ?1 AND event_id = ?2
+         LIMIT 1",
+        rusqlite::params![recorded_by, event_id_to_base64(event_id)],
+        |row| row.get::<_, String>(0),
+    )
+    .ok()
 }
 
 fn local_repair_recipient_material(daemon: &VirtualDaemon) -> (EventId, EventId) {
@@ -288,6 +441,14 @@ fn run_key_repair_benchmark(policy: KeyResponsePolicy) -> RepairBenchmark {
         .tick()
         .expect("bootstrap round");
     assert_eq!(bootstrap.unique_pairs, 4);
+    let bootstrap_follow_up = PlannerSimulation::new(db_paths.clone())
+        .tick()
+        .expect("bootstrap follow-up round");
+    assert_eq!(bootstrap_follow_up.unique_pairs, 4);
+    wait_for_authoring_ready(&bob, &db_paths);
+    wait_for_authoring_ready(&carol, &db_paths);
+    wait_for_authoring_ready(&dave, &db_paths);
+    wait_for_authoring_ready(&erin, &db_paths);
 
     let alice_peer = active_peer_id(&alice);
     let bob_peer = active_peer_id(&bob);
@@ -324,13 +485,50 @@ fn run_key_repair_benchmark(policy: KeyResponsePolicy) -> RepairBenchmark {
     .tick()
     .expect("message propagation round to requesters");
     assert_eq!(message_round_to_requesters.unique_pairs, 4);
-    assert!(snapshot_has_message_content(&bob, content));
+    assert!(
+        snapshot_has_message_content(&bob, content),
+        "bob missing content after message rounds: to_hub={:?} to_requesters={:?} bob_recorded_encrypted={} bob_valid_encrypted={} bob_blocked_encrypted={} bob_rejected_encrypted={:?} bob_messages={} bob_users={} bob_peers_shared={} bob_snapshot_messages={}",
+        message_round_to_hub,
+        message_round_to_requesters,
+        recorded_event_count(&db_paths[1], &bob_peer, &encrypted_event_id),
+        valid_event_count(&db_paths[1], &bob_peer, &encrypted_event_id),
+        blocked_event_count(&db_paths[1], &bob_peer, &encrypted_event_id),
+        rejected_event_reason(&db_paths[1], &bob_peer, &encrypted_event_id),
+        {
+            let conn = open_connection(&db_paths[1]).expect("open bob db");
+            conn.query_row(
+                "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+                rusqlite::params![&bob_peer],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("bob message count")
+        },
+        {
+            let conn = open_connection(&db_paths[1]).expect("open bob db");
+            conn.query_row(
+                "SELECT COUNT(*) FROM users WHERE recorded_by = ?1",
+                rusqlite::params![&bob_peer],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("bob user count")
+        },
+        {
+            let conn = open_connection(&db_paths[1]).expect("open bob db");
+            conn.query_row(
+                "SELECT COUNT(*) FROM peers_shared WHERE recorded_by = ?1",
+                rusqlite::params![&bob_peer],
+                |row| row.get::<_, i64>(0),
+            )
+            .expect("bob peer_shared count")
+        },
+        bob.call_ok_value(RpcMethod::Messages { limit: 100 }).expect("bob messages"),
+    );
     assert!(!snapshot_has_message_content(&carol, content));
     assert!(!snapshot_has_message_content(&dave, content));
     assert!(!snapshot_has_message_content(&erin, content));
 
     let mut benchmark = RepairBenchmark::default();
-    let _requests = emit_key_requests_for_dbs(&db_paths).expect("emit key requests");
+    let _requests = emit_key_requests_retry(&db_paths);
     let request_round = PlannerSimulation::with_mode_and_topology(
         fake_star_db_paths.clone(),
         PlannerMode::NearestNeighborNoAuth,
@@ -584,6 +782,9 @@ fn removed_peer_does_not_receive_key_shared_response_for_frontier() {
         .tick()
         .expect("bootstrap follow-up round");
     assert_eq!(bootstrap_follow_up.unique_pairs, 3);
+    wait_for_authoring_ready(&bob, &db_paths);
+    wait_for_authoring_ready(&carol, &db_paths);
+    wait_for_authoring_ready(&dave, &db_paths);
 
     let alice_peer = active_peer_id(&alice);
     let bob_peer = active_peer_id(&bob);
@@ -632,7 +833,7 @@ fn removed_peer_does_not_receive_key_shared_response_for_frontier() {
     assert!(!snapshot_has_message_content(&carol, content));
     assert!(!snapshot_has_message_content(&dave, content));
 
-    let request_stats = emit_key_requests_for_dbs(&db_paths).expect("emit key requests");
+    let request_stats = emit_key_requests_retry(&db_paths);
     assert_eq!(
         request_stats.emitted_requests, 2,
         "only the two blocked non-holders should request"
@@ -689,8 +890,7 @@ fn removed_peer_does_not_receive_key_shared_response_for_frontier() {
         "allowed recipient should receive a key_shared"
     );
 
-    let rerequest_stats =
-        emit_key_requests_for_dbs(&db_paths).expect("emit follow-up key requests");
+    let rerequest_stats = emit_key_requests_retry(&db_paths);
     assert!(
         rerequest_stats.emitted_requests <= 1,
         "once any response exists, request suppression may collapse follow-up retries: {rerequest_stats:?}"
@@ -781,6 +981,9 @@ fn holder_with_request_before_removal_emits_no_response_until_frontier_arrives()
         .tick()
         .expect("bootstrap follow-up round");
     assert_eq!(bootstrap_follow_up.unique_pairs, 3);
+    wait_for_authoring_ready(&bob, &db_paths);
+    wait_for_authoring_ready(&carol, &db_paths);
+    wait_for_authoring_ready(&dave, &db_paths);
 
     let alice_peer = active_peer_id(&alice);
     let bob_peer = active_peer_id(&bob);
@@ -819,7 +1022,7 @@ fn holder_with_request_before_removal_emits_no_response_until_frontier_arrives()
         "carol should have the encrypted message but still be blocked before repair"
     );
 
-    let request_stats = emit_key_requests_for_dbs(&db_paths).expect("emit key requests");
+    let request_stats = emit_key_requests_retry(&db_paths);
     assert_eq!(request_stats.emitted_requests, 1);
     let request_event_id = newest_key_request_event_id(&db_paths[2], &carol_peer, &alice_key);
 

@@ -206,7 +206,7 @@ pub fn project_pure(
     }])
 }
 
-pub static ENDPOINT_SECRET_META: EventTypeMeta = EventTypeMeta {
+pub static ENDPOINT_SECRET_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_ENDPOINT_SECRET,
     type_name: "endpoint_secret",
     projection_table: "endpoint_secrets",

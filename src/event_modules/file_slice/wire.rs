@@ -99,7 +99,7 @@ pub fn encode_file_slice(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     )?)
 }
 
-pub static FILE_SLICE_META: EventTypeMeta = EventTypeMeta {
+pub static FILE_SLICE_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_FILE_SLICE,
     type_name: "file_slice",
     projection_table: "file_slices",

@@ -1,13 +1,34 @@
 use super::super::ParsedEvent;
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::queries::define_query_context_loader;
+use crate::projection::queries::{ContextLoadResult, ProjectionQueries};
 
-define_query_context_loader!(
-    build_projector_context,
-    DeviceInvite,
-    load_device_invite_context,
-    "device_invite"
-);
+pub fn build_projector_context(
+    queries: &dyn ProjectionQueries,
+    recorded_by: &str,
+    event_id_b64: &str,
+    parsed: &ParsedEvent,
+) -> Result<ContextLoadResult, Box<dyn std::error::Error>> {
+    let device_invite = match parsed {
+        ParsedEvent::DeviceInvite(device_invite) => device_invite,
+        _ => return Err("device_invite context loader called for non-device_invite event".into()),
+    };
+
+    let ctx = queries.load_device_invite_context(recorded_by, event_id_b64, device_invite)?;
+    match device_invite.signer_type {
+        4 if device_invite.authority_event_id != device_invite.signed_by => {
+            Ok(ContextLoadResult::reject(
+                "bootstrap device_invite authority must match signer user event",
+            ))
+        }
+        5 if ctx.invite_authority_matches_signer != Some(true) => Ok(ContextLoadResult::reject(
+            "peer-signed device_invite authority does not match signer user identity",
+        )),
+        4 | 5 => Ok(ContextLoadResult::ready(ctx)),
+        _ => Ok(ContextLoadResult::reject(
+            "unsupported device_invite signer_type",
+        )),
+    }
+}
 
 /// Pure projector: DeviceInvite -> device_invites table.
 /// When bootstrap_context is available and this event is locally created,
@@ -18,33 +39,10 @@ pub fn project_pure(
     parsed: &ParsedEvent,
     ctx: &ContextSnapshot,
 ) -> ProjectorResult {
-    let (public_key, created_at_ms, signer_type, signed_by, authority_event_id) = match parsed {
-        ParsedEvent::DeviceInvite(di) => (
-            &di.public_key,
-            di.created_at_ms as i64,
-            di.signer_type,
-            di.signed_by,
-            di.authority_event_id,
-        ),
+    let (public_key, created_at_ms) = match parsed {
+        ParsedEvent::DeviceInvite(di) => (&di.public_key, di.created_at_ms as i64),
         _ => return ProjectorResult::reject("not a device_invite event".to_string()),
     };
-
-    if signer_type == 4 {
-        if authority_event_id != signed_by {
-            return ProjectorResult::reject(
-                "bootstrap device_invite authority must match signer user event".to_string(),
-            );
-        }
-    } else if signer_type == 5 {
-        if ctx.invite_authority_matches_signer != Some(true) {
-            return ProjectorResult::reject(
-                "peer-signed device_invite authority does not match signer user identity"
-                    .to_string(),
-            );
-        }
-    } else {
-        return ProjectorResult::reject("unsupported device_invite signer_type".to_string());
-    }
 
     let mut ops = vec![WriteOp::InsertOrIgnore {
         table: "device_invites",

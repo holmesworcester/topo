@@ -117,9 +117,13 @@ pub fn build_projector_context(
         }
     };
 
-    Ok(crate::projection::queries::ContextLoadResult::ready(
-        queries.load_invite_accepted_context(recorded_by, event_id_b64, ia)?,
-    ))
+    let ctx = queries.load_invite_accepted_context(recorded_by, event_id_b64, ia)?;
+    if let Some(reason) = &ctx.invite_accepted_link_workspace_mismatch_reason {
+        return Ok(crate::projection::queries::ContextLoadResult::reject(
+            reason.clone(),
+        ));
+    }
+    Ok(crate::projection::queries::ContextLoadResult::ready(ctx))
 }
 
 /// Pure projector: InviteAccepted — local trust-anchor binding.
@@ -141,10 +145,6 @@ pub fn project_pure(
         ParsedEvent::InviteAccepted(a) => a,
         _ => return ProjectorResult::reject("not an invite_accepted event".to_string()),
     };
-
-    if let Some(reason) = &ctx.invite_accepted_link_workspace_mismatch_reason {
-        return ProjectorResult::reject(reason.clone());
-    }
 
     let invite_eid_b64 = event_id_to_base64(&ia.invite_event_id);
     let workspace_id_b64 = event_id_to_base64(&ia.workspace_id);
@@ -222,7 +222,7 @@ pub fn project_pure(
 
     ProjectorResult::valid_with_commands(ops, commands)
 }
-pub static INVITE_ACCEPTED_META: EventTypeMeta = EventTypeMeta {
+pub static INVITE_ACCEPTED_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_INVITE_ACCEPTED,
     type_name: "invite_accepted",
     projection_table: "invites_accepted",

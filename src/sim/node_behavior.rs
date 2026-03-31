@@ -6,17 +6,15 @@ use serde::Serialize;
 
 use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::crypto::{event_id_from_base64, event_id_to_base64, hash_event, EventId};
-use crate::event_modules::{self as events, parse_event, EncryptedEvent, ParsedEvent};
+use crate::event_modules::{self as events, parse_event, ParsedEvent};
 use crate::projection::apply::{
-    project_one::project_one_step_with_backend, run_dep_and_projection_stages_with_backend,
-    ProjectionApplyResult, ProjectionBackend,
+    project_one::project_one_step_with_backend, ProjectionApplyResult, ProjectionBackend,
 };
 use crate::projection::contract::{
     ContextSnapshot, DeletionIntentInfo, EmitCommand, FileDescriptorInfo, SqlVal, WriteOp,
 };
 use crate::projection::decision::ProjectionDecision;
-use crate::projection::encrypted::decrypt_event_blob;
-use crate::projection::queries::{ProjectionQueries, ProjectionQueryResult};
+use crate::projection::queries::{DepLoadResult, ProjectionQueries, ProjectionQueryResult};
 use crate::projection::signer::SignerResolution;
 use crate::sim::query_snapshot::ImportedPeerState;
 
@@ -186,42 +184,76 @@ impl NodeBehaviorEngine {
                     rows.sort();
                 }
             }
+            for ambient in &imported.ambient_shared_events {
+                state
+                    .events
+                    .entry(ambient.event_id.clone())
+                    .or_insert_with(|| StoredEvent {
+                        blob: ambient.blob.clone(),
+                    });
+            }
         }
+        let mut pending_projection = Vec::new();
         for known in &imported.known_events {
             let event_id =
                 event_id_from_base64(&known.event_id).ok_or("invalid imported event id")?;
-            engine.ingest_item((
-                event_id,
-                known.blob.clone(),
-                imported.recorded_by.clone(),
-                known.source.clone(),
-                known.created_at_ms,
-                known.created_at_ms,
-            ))?;
+            engine.store_recorded_item(&event_id, &known.blob, &known.source)?;
+            pending_projection.push(event_id);
+        }
+        for event_id in pending_projection {
+            let blob = engine
+                .load_blob(&event_id_to_base64(&event_id))?
+                .ok_or("stored imported event missing blob")?;
+            let parsed = events::parse_event(&blob)?;
+            if !engine.filter.blocks(parsed.event_type_code()) {
+                let _ = engine.project_and_cascade(&event_id)?;
+            }
+        }
+        Ok(engine)
+    }
+
+    pub fn seed_imported(
+        imported: &ImportedPeerState,
+        filter: EventProjectionFilter,
+        summary: &NodeBehaviorSummary,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let engine = Self::with_filter(&imported.recorded_by, filter);
+        {
+            let mut state = engine.state.borrow_mut();
+            state.local_transport_peer_id = imported.local_transport_peer_id.clone();
+            state.local_transport_source = imported.local_transport_source.clone();
+            for ambient in &imported.ambient_shared_events {
+                state
+                    .events
+                    .entry(ambient.event_id.clone())
+                    .or_insert_with(|| StoredEvent {
+                        blob: ambient.blob.clone(),
+                    });
+            }
+            for known in &imported.known_events {
+                state
+                    .events
+                    .entry(known.event_id.clone())
+                    .or_insert_with(|| StoredEvent {
+                        blob: known.blob.clone(),
+                    });
+                state
+                    .recorded_events
+                    .entry(known.event_id.clone())
+                    .or_insert_with(|| StoredRecordedEvent {
+                        source: known.source.clone(),
+                    });
+            }
+            seed_state_from_summary(&mut state, summary)?;
         }
         Ok(engine)
     }
 
     pub fn ingest_item(&self, item: IngestItem) -> Result<(), Box<dyn std::error::Error>> {
         let (event_id, blob, _recorded_by, source, _created_at_ms, _inserted_at_ms) = item;
-        let event_id_b64 = event_id_to_base64(&event_id);
+        self.store_recorded_item(&event_id, &blob, &source)?;
+
         let parsed = events::parse_event(&blob)?;
-        let _meta = events::registry()
-            .lookup(parsed.event_type_code())
-            .ok_or("unknown event type")?;
-
-        {
-            let mut state = self.state.borrow_mut();
-            state
-                .events
-                .entry(event_id_b64.clone())
-                .or_insert_with(|| StoredEvent { blob: blob.clone() });
-            state
-                .recorded_events
-                .entry(event_id_b64.clone())
-                .or_insert_with(|| StoredRecordedEvent { source });
-        }
-
         if !self.filter.blocks(parsed.event_type_code()) {
             self.project_and_cascade(&event_id)?;
         }
@@ -332,6 +364,126 @@ impl NodeBehaviorEngine {
         }
     }
 
+    pub fn recorded_by(&self) -> String {
+        self.state.borrow().recorded_by.clone()
+    }
+
+    pub fn transport_peer_id(&self) -> String {
+        let state = self.state.borrow();
+        state
+            .local_transport_peer_id
+            .clone()
+            .unwrap_or_else(|| state.recorded_by.clone())
+    }
+
+    pub fn recorded_event_ids(&self) -> BTreeSet<String> {
+        self.state
+            .borrow()
+            .recorded_events
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    pub fn shared_recorded_events(
+        &self,
+    ) -> Result<Vec<(String, String, i64, Vec<u8>)>, Box<dyn std::error::Error>> {
+        let state = self.state.borrow();
+        let mut out = Vec::new();
+        for event_id in state.recorded_events.keys() {
+            let Some(event) = state.events.get(event_id) else {
+                continue;
+            };
+            let parsed = events::parse_event(&event.blob)?;
+            let Some(meta) = events::registry().lookup(parsed.event_type_code()) else {
+                continue;
+            };
+            if meta.share_scope != events::ShareScope::Shared {
+                continue;
+            }
+            out.push((
+                event_id.clone(),
+                meta.type_name.to_string(),
+                events::extract_created_at_ms(&event.blob).unwrap_or(0) as i64,
+                event.blob.clone(),
+            ));
+        }
+        out.sort_by(|left, right| (left.2, &left.0).cmp(&(right.2, &right.0)));
+        Ok(out)
+    }
+
+    pub fn transferable_shared_event(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<(String, String, i64, Vec<u8>)>, Box<dyn std::error::Error>> {
+        let state = self.state.borrow();
+        let Some(event) = state.events.get(event_id) else {
+            return Ok(None);
+        };
+        let parsed = events::parse_event(&event.blob)?;
+        let Some(meta) = events::registry().lookup(parsed.event_type_code()) else {
+            return Ok(None);
+        };
+        if meta.share_scope != events::ShareScope::Shared {
+            return Ok(None);
+        }
+        Ok(Some((
+            event_id.to_string(),
+            meta.type_name.to_string(),
+            events::extract_created_at_ms(&event.blob).unwrap_or(0) as i64,
+            event.blob.clone(),
+        )))
+    }
+
+    pub fn apply_transferred_batch(
+        &self,
+        source_tag: &str,
+        blobs: Vec<Vec<u8>>,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut pending_projection = Vec::new();
+        let mut ingested = 0usize;
+        for blob in blobs {
+            let event_id = hash_event(&blob);
+            self.store_recorded_item(&event_id, &blob, source_tag)?;
+            pending_projection.push((event_id, blob));
+            ingested = ingested.saturating_add(1);
+        }
+        for (event_id, blob) in pending_projection {
+            let parsed = events::parse_event(&blob)?;
+            if !self.filter.blocks(parsed.event_type_code()) {
+                self.project_and_cascade(&event_id)?;
+            }
+        }
+        Ok(ingested)
+    }
+
+    fn store_recorded_item(
+        &self,
+        event_id: &EventId,
+        blob: &[u8],
+        source: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let event_id_b64 = event_id_to_base64(event_id);
+        let parsed = events::parse_event(blob)?;
+        let _meta = events::registry()
+            .lookup(parsed.event_type_code())
+            .ok_or("unknown event type")?;
+        let mut state = self.state.borrow_mut();
+        state
+            .events
+            .entry(event_id_b64.clone())
+            .or_insert_with(|| StoredEvent {
+                blob: blob.to_vec(),
+            });
+        state
+            .recorded_events
+            .entry(event_id_b64)
+            .or_insert_with(|| StoredRecordedEvent {
+                source: source.to_string(),
+            });
+        Ok(())
+    }
+
     fn project_and_cascade(
         &self,
         event_id: &EventId,
@@ -397,6 +549,76 @@ impl NodeBehaviorEngine {
         }
         Ok(())
     }
+}
+
+fn seed_state_from_summary(
+    state: &mut NodeBehaviorData,
+    summary: &NodeBehaviorSummary,
+) -> Result<(), Box<dyn std::error::Error>> {
+    state.tables.clear();
+    state.valid_events.clear();
+    state.rejected_events.clear();
+    state.blocked_events.clear();
+    state.blocked_event_deps.clear();
+
+    for (table, rows) in &summary.tables {
+        match table.as_str() {
+            "valid_events" => {
+                for row in rows {
+                    let Some(event_id) = row_text(row, "event_id") else {
+                        continue;
+                    };
+                    let semantic_type_code = row_int(row, "semantic_type_code");
+                    state
+                        .valid_events
+                        .insert(event_id.to_string(), semantic_type_code);
+                }
+            }
+            "rejected_events" => {
+                for row in rows {
+                    let (Some(event_id), Some(reason)) =
+                        (row_text(row, "event_id"), row_text(row, "reason"))
+                    else {
+                        continue;
+                    };
+                    state
+                        .rejected_events
+                        .insert(event_id.to_string(), reason.to_string());
+                }
+            }
+            "blocked_events" => {
+                for row in rows {
+                    let (Some(event_id), Some(deps_remaining)) =
+                        (row_text(row, "event_id"), row_int(row, "deps_remaining"))
+                    else {
+                        continue;
+                    };
+                    state
+                        .blocked_events
+                        .insert(event_id.to_string(), deps_remaining);
+                }
+            }
+            "blocked_event_deps" => {
+                for row in rows {
+                    let (Some(event_id), Some(blocker_event_id)) =
+                        (row_text(row, "event_id"), row_text(row, "blocker_event_id"))
+                    else {
+                        continue;
+                    };
+                    state
+                        .blocked_event_deps
+                        .entry(event_id.to_string())
+                        .or_default()
+                        .insert(blocker_event_id.to_string());
+                }
+            }
+            _ => {
+                state.tables.insert(table.clone(), rows.clone());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn row_text<'a>(row: &'a BehaviorRow, column: &str) -> Option<&'a str> {
@@ -467,6 +689,31 @@ fn rows_for_recorded_matching<'a>(
 
 fn has_valid_event(state: &NodeBehaviorData, recorded_by: &str, event_id_b64: &str) -> bool {
     state.recorded_by == recorded_by && state.valid_events.contains_key(event_id_b64)
+}
+
+fn tombstone_satisfies_message_dep_behavior(
+    state: &NodeBehaviorData,
+    recorded_by: &str,
+    parsed: &ParsedEvent,
+    field_name: &str,
+    dep_b64: &str,
+) -> bool {
+    let is_deleted_message_target = matches!(
+        (parsed, field_name),
+        (ParsedEvent::Reaction(_), "target_event_id") | (ParsedEvent::File(_), "message_id")
+    );
+    if !is_deleted_message_target {
+        return false;
+    }
+    rows_for_recorded_matching(
+        state,
+        "deleted_messages",
+        recorded_by,
+        &[("message_id", dep_b64)],
+    )
+    .into_iter()
+    .next()
+    .is_some()
 }
 
 fn valid_event_blob(
@@ -630,6 +877,57 @@ fn resolve_signer_key_behavior(
 }
 
 impl ProjectionQueries for NodeBehaviorEngine {
+    fn load_dep_result(
+        &self,
+        recorded_by: &str,
+        parsed: &ParsedEvent,
+        field_name: &str,
+        dep_id: &EventId,
+    ) -> ProjectionQueryResult<DepLoadResult> {
+        let state = self.state.borrow();
+        if state.recorded_by != recorded_by {
+            return Ok(DepLoadResult::missing());
+        }
+        let dep_b64 = event_id_to_base64(dep_id);
+        if state.valid_events.contains_key(&dep_b64) {
+            let semantic_type_code = state
+                .valid_events
+                .get(&dep_b64)
+                .and_then(|value| value.and_then(|code| u8::try_from(code).ok()));
+            return Ok(DepLoadResult::ready(semantic_type_code));
+        }
+        if state.tables.get("endpoints_shared").is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row_text(row, "event_id") == Some(&dep_b64))
+        }) {
+            return Ok(DepLoadResult::ready(Some(
+                crate::event_modules::EVENT_TYPE_ENDPOINT_SHARED,
+            )));
+        }
+        if tombstone_satisfies_message_dep_behavior(
+            &state,
+            recorded_by,
+            parsed,
+            field_name,
+            &dep_b64,
+        ) {
+            return Ok(DepLoadResult::ready(None));
+        }
+        Ok(DepLoadResult::missing())
+    }
+
+    fn load_key_secret_bytes(
+        &self,
+        recorded_by: &str,
+        key_event_id: &[u8; 32],
+    ) -> ProjectionQueryResult<Option<[u8; 32]>> {
+        Ok(key_secret_bytes(
+            &self.state.borrow(),
+            recorded_by,
+            key_event_id,
+        ))
+    }
+
     fn load_workspace_context(
         &self,
         recorded_by: &str,
@@ -1195,81 +1493,6 @@ impl ProjectionBackend for NodeBehaviorEngine {
         Ok(())
     }
 
-    fn check_deps_and_block(
-        &self,
-        recorded_by: &str,
-        event_id_b64: &str,
-        _parsed: &ParsedEvent,
-        deps: &[(&str, EventId)],
-    ) -> ProjectionApplyResult<Option<ProjectionDecision>> {
-        let state = self.state.borrow();
-        if state.recorded_by != recorded_by {
-            return Ok(None);
-        }
-        let mut missing = Vec::new();
-        for (_, dep_id) in deps {
-            let dep_b64 = event_id_to_base64(dep_id);
-            if !state.valid_events.contains_key(&dep_b64) {
-                missing.push(*dep_id);
-            }
-        }
-        drop(state);
-        if missing.is_empty() {
-            return Ok(None);
-        }
-
-        missing.sort_unstable();
-        missing.dedup();
-        let mut state = self.state.borrow_mut();
-        let deps_remaining = {
-            let blockers = state
-                .blocked_event_deps
-                .entry(event_id_b64.to_string())
-                .or_default();
-            for dep_id in &missing {
-                blockers.insert(event_id_to_base64(dep_id));
-            }
-            blockers.len() as i64
-        };
-        state
-            .blocked_events
-            .insert(event_id_b64.to_string(), deps_remaining);
-        Ok(Some(ProjectionDecision::Block { missing }))
-    }
-
-    fn check_dep_types(
-        &self,
-        _recorded_by: &str,
-        _parsed: &ParsedEvent,
-        deps: &[(&str, EventId)],
-        type_codes: &[&[u8]],
-    ) -> ProjectionApplyResult<Option<String>> {
-        let state = self.state.borrow();
-        for (idx, (field_name, dep_id)) in deps.iter().enumerate() {
-            let allowed = type_codes.get(idx).copied().unwrap_or(&[]);
-            if allowed.is_empty() {
-                continue;
-            }
-            let dep_b64 = event_id_to_base64(dep_id);
-            let actual = match state.valid_events.get(&dep_b64).and_then(|v| *v) {
-                Some(code) => u8::try_from(code).map_err(|_| "semantic type out of range")?,
-                None => {
-                    return Ok(Some(format!(
-                        "dep {} missing tenant-scoped semantic type record",
-                        field_name
-                    )))
-                }
-            };
-            if !allowed.contains(&actual) {
-                return Ok(Some(format!(
-                    "dep {} has semantic type code {} but expected one of {:?}",
-                    field_name, actual, allowed
-                )));
-            }
-        }
-        Ok(None)
-    }
-
     fn resolve_signer_key(
         &self,
         recorded_by: &str,
@@ -1316,106 +1539,6 @@ impl ProjectionBackend for NodeBehaviorEngine {
         let mut public_key = [0u8; 32];
         public_key.copy_from_slice(&blob[9..41]);
         Ok(SignerResolution::Found(public_key))
-    }
-
-    fn project_encrypted(
-        &self,
-        recorded_by: &str,
-        event_id_b64: &str,
-        encrypted: &EncryptedEvent,
-    ) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>)> {
-        let Some(key_bytes) =
-            key_secret_bytes(&self.state.borrow(), recorded_by, &encrypted.key_event_id)
-        else {
-            return Ok((
-                ProjectionDecision::Reject {
-                    reason: "secret key not found in key_secrets table".to_string(),
-                },
-                None,
-            ));
-        };
-        let plaintext = match decrypt_event_blob(
-            &key_bytes,
-            &encrypted.nonce,
-            &encrypted.ciphertext,
-            &encrypted.auth_tag,
-        ) {
-            Ok(v) => v,
-            Err(_) => {
-                return Ok((
-                    ProjectionDecision::Reject {
-                        reason: "decryption failed (wrong key or corrupted)".to_string(),
-                    },
-                    None,
-                ))
-            }
-        };
-        let inner_parsed = match events::parse_event(&plaintext) {
-            Ok(v) => v,
-            Err(err) => {
-                return Ok((
-                    ProjectionDecision::Reject {
-                        reason: format!("inner event parse error: {}", err),
-                    },
-                    None,
-                ))
-            }
-        };
-        if inner_parsed.event_type_code() != encrypted.inner_type_code {
-            return Ok((
-                ProjectionDecision::Reject {
-                    reason: format!(
-                        "inner type mismatch: outer declares {}, inner is {}",
-                        encrypted.inner_type_code,
-                        inner_parsed.event_type_code()
-                    ),
-                },
-                None,
-            ));
-        }
-        if encrypted.inner_type_code == events::EVENT_TYPE_ENCRYPTED {
-            return Ok((
-                ProjectionDecision::Reject {
-                    reason: "nested encryption not allowed".to_string(),
-                },
-                None,
-            ));
-        }
-        let Some(inner_meta) = events::registry().lookup(inner_parsed.event_type_code()) else {
-            return Ok((
-                ProjectionDecision::Reject {
-                    reason: format!(
-                        "event type {} is not admissible inside encrypted wrappers",
-                        inner_parsed.event_type_code()
-                    ),
-                },
-                None,
-            ));
-        };
-        if !inner_meta.encryptable {
-            return Ok((
-                ProjectionDecision::Reject {
-                    reason: format!(
-                        "event type {} is not admissible inside encrypted wrappers",
-                        inner_parsed.event_type_code()
-                    ),
-                },
-                None,
-            ));
-        }
-        let transport_key_event_id_b64 = event_id_to_base64(&encrypted.key_event_id);
-        let (decision, _) = run_dep_and_projection_stages_with_backend(
-            self,
-            recorded_by,
-            event_id_b64,
-            &plaintext,
-            &inner_parsed,
-            true,
-            true,
-            Some(&transport_key_event_id_b64),
-        )?;
-        let inner = matches!(decision, ProjectionDecision::Valid).then_some(inner_parsed);
-        Ok((decision, inner))
     }
 
     fn execute_write_ops(&self, ops: &[WriteOp]) -> ProjectionApplyResult<()> {

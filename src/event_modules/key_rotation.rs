@@ -183,7 +183,7 @@ pub fn project_pure(
     }])
 }
 
-pub static KEY_ROTATION_META: EventTypeMeta = EventTypeMeta {
+pub static KEY_ROTATION_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_KEY_ROTATION,
     type_name: "key_rotation",
     projection_table: "key_rotations",

@@ -131,7 +131,7 @@ pub fn project_pure(
     ProjectorResult::valid(ops)
 }
 
-pub static KEY_SECRET_META: EventTypeMeta = EventTypeMeta {
+pub static KEY_SECRET_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_KEY_SECRET,
     type_name: "key_secret",
     projection_table: "key_secrets",

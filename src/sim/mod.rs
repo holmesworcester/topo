@@ -1,4 +1,7 @@
+pub mod behavior_pair_sync;
+pub mod behavior_planner;
 pub mod clock;
+pub mod fake_topology;
 pub mod hash_graph;
 pub mod key_repair;
 pub mod knowledge;
@@ -14,7 +17,13 @@ pub mod scenario;
 pub mod topology;
 pub mod virtual_daemon;
 
+pub use behavior_pair_sync::{
+    plan_behavior_pair_sync_intents, run_behavior_pair_sync_session, BehaviorPairSyncIntent,
+    BehaviorSimPeerNode,
+};
+pub use behavior_planner::BehaviorPlannerSimulation;
 pub use clock::SimTime;
+pub use fake_topology::FakeTopologyPreference;
 pub use key_repair::{
     create_encrypted_message_with_key, create_key_rotation, create_removal,
     emit_key_requests_for_dbs, emit_key_requests_for_peers, emit_key_shared_responses_for_dbs,
@@ -35,8 +44,8 @@ pub use pair_sync::{
     PairSyncSessionStats, SimPeerNode,
 };
 pub use planner_runner::{
-    FakeTopologyPreference, PlannedPairSession, PlannerImportedNode, PlannerMode,
-    PlannerRoundReport, PlannerRunReport, PlannerSimulation,
+    PlannedPairSession, PlannerImportedNode, PlannerMode, PlannerRoundReport, PlannerRunReport,
+    PlannerSimulation,
 };
 pub use query_snapshot::{
     import_local_tenants_from_db, import_peer_state, snapshot_messages_via_rpc,

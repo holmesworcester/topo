@@ -59,7 +59,7 @@ pub fn encode_message(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     Ok(encode_fields(EVENT_TYPE_MESSAGE, MESSAGE_FIELDS, &values)?)
 }
 
-pub static MESSAGE_META: EventTypeMeta = EventTypeMeta {
+pub static MESSAGE_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_MESSAGE,
     type_name: "message",
     projection_table: "messages",

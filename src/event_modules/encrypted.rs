@@ -166,7 +166,7 @@ pub fn project_pure(
     ProjectorResult::reject("encrypted events should not reach projector dispatch".to_string())
 }
 
-pub static ENCRYPTED_META: EventTypeMeta = EventTypeMeta {
+pub static ENCRYPTED_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_ENCRYPTED,
     type_name: "encrypted",
     projection_table: "",

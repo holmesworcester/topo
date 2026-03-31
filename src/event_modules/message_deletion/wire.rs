@@ -82,7 +82,7 @@ pub fn encode_message_deletion(event: &ParsedEvent) -> Result<Vec<u8>, EventErro
     )?)
 }
 
-pub static MESSAGE_DELETION_META: EventTypeMeta = EventTypeMeta {
+pub static MESSAGE_DELETION_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_MESSAGE_DELETION,
     type_name: "message_deletion",
     projection_table: "deleted_messages",

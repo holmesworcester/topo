@@ -33,6 +33,12 @@ impl ContextLoadResult {
         Self::Block { missing }
     }
 
+    pub fn block_guard() -> Self {
+        Self::Block {
+            missing: Vec::new(),
+        }
+    }
+
     pub fn reject(reason: impl Into<String>) -> Self {
         Self::Reject {
             reason: reason.into(),
@@ -40,7 +46,37 @@ impl ContextLoadResult {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepLoadResult {
+    Ready { semantic_type_code: Option<u8> },
+    Missing,
+}
+
+impl DepLoadResult {
+    pub fn ready(semantic_type_code: Option<u8>) -> Self {
+        Self::Ready { semantic_type_code }
+    }
+
+    pub fn missing() -> Self {
+        Self::Missing
+    }
+}
+
 pub trait ProjectionQueries {
+    fn load_dep_result(
+        &self,
+        recorded_by: &str,
+        parsed: &ParsedEvent,
+        field_name: &str,
+        dep_id: &EventId,
+    ) -> ProjectionQueryResult<DepLoadResult>;
+
+    fn load_key_secret_bytes(
+        &self,
+        recorded_by: &str,
+        key_event_id: &[u8; 32],
+    ) -> ProjectionQueryResult<Option<[u8; 32]>>;
+
     fn load_workspace_context(
         &self,
         recorded_by: &str,
@@ -153,6 +189,134 @@ macro_rules! define_query_context_loader {
 }
 
 pub(crate) use define_query_context_loader;
+
+fn semantic_type_code_for_parsed(parsed: &ParsedEvent) -> u8 {
+    match parsed {
+        ParsedEvent::Encrypted(enc) => enc.inner_type_code,
+        _ => parsed.event_type_code(),
+    }
+}
+
+fn derive_semantic_type_code_from_blob(
+    blob: &[u8],
+) -> Result<Option<u8>, Box<dyn std::error::Error>> {
+    let parsed = match parse_event(blob) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(crate::event_modules::outer_semantic_type_code(blob)),
+    };
+    Ok(Some(semantic_type_code_for_parsed(&parsed)))
+}
+
+fn global_endpoint_shared_is_valid(
+    conn: &Connection,
+    dep_b64: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM endpoints_shared
+             WHERE event_id = ?1
+         )",
+        rusqlite::params![dep_b64],
+        |row| row.get(0),
+    )?;
+    Ok(present)
+}
+
+fn load_valid_semantic_type_code(
+    conn: &Connection,
+    recorded_by: &str,
+    dep_b64: &str,
+) -> Result<Option<u8>, Box<dyn std::error::Error>> {
+    let stored: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT semantic_type_code
+             FROM valid_events
+             WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, dep_b64],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    match stored {
+        Some(Some(code)) => {
+            let code = u8::try_from(code).map_err(|_| {
+                format!(
+                    "semantic_type_code {} out of range for event {}",
+                    code, dep_b64
+                )
+            })?;
+            Ok(Some(code))
+        }
+        Some(None) => {
+            let blob: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT blob FROM events WHERE event_id = ?1",
+                    rusqlite::params![dep_b64],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(blob) = blob else {
+                return Ok(None);
+            };
+            let Some(code) = derive_semantic_type_code_from_blob(&blob)? else {
+                return Ok(None);
+            };
+            conn.execute(
+                "UPDATE valid_events
+                 SET semantic_type_code = ?3
+                 WHERE peer_id = ?1 AND event_id = ?2 AND semantic_type_code IS NULL",
+                rusqlite::params![recorded_by, dep_b64, i64::from(code)],
+            )?;
+            Ok(Some(code))
+        }
+        None => {
+            if global_endpoint_shared_is_valid(conn, dep_b64)? {
+                return Ok(Some(crate::event_modules::EVENT_TYPE_ENDPOINT_SHARED));
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn dep_is_satisfied_for_scope(
+    conn: &Connection,
+    recorded_by: &str,
+    dep_b64: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let dep_valid: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, dep_b64],
+        |row| row.get(0),
+    )?;
+    if dep_valid {
+        return Ok(true);
+    }
+    global_endpoint_shared_is_valid(conn, dep_b64)
+}
+
+fn tombstone_satisfies_message_dep(
+    conn: &Connection,
+    recorded_by: &str,
+    parsed: &ParsedEvent,
+    field_name: &str,
+    dep_b64: &str,
+) -> Result<bool, rusqlite::Error> {
+    let is_deleted_message_target = matches!(
+        (parsed, field_name),
+        (ParsedEvent::Reaction(_), "target_event_id") | (ParsedEvent::File(_), "message_id")
+    );
+    if !is_deleted_message_target {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT COUNT(*) > 0
+         FROM deleted_messages
+         WHERE recorded_by = ?1 AND message_id = ?2",
+        rusqlite::params![recorded_by, dep_b64],
+        |row| row.get(0),
+    )
+}
 
 fn load_bootstrap_context_snapshot(
     conn: &Connection,
@@ -311,6 +475,51 @@ fn bootstrap_spki_already_peer_shared(
 }
 
 impl ProjectionQueries for Connection {
+    fn load_dep_result(
+        &self,
+        recorded_by: &str,
+        parsed: &ParsedEvent,
+        field_name: &str,
+        dep_id: &EventId,
+    ) -> ProjectionQueryResult<DepLoadResult> {
+        let dep_b64 = event_id_to_base64(dep_id);
+        if dep_is_satisfied_for_scope(self, recorded_by, &dep_b64)? {
+            return Ok(DepLoadResult::ready(load_valid_semantic_type_code(
+                self,
+                recorded_by,
+                &dep_b64,
+            )?));
+        }
+        if tombstone_satisfies_message_dep(self, recorded_by, parsed, field_name, &dep_b64)? {
+            return Ok(DepLoadResult::ready(None));
+        }
+        Ok(DepLoadResult::missing())
+    }
+
+    fn load_key_secret_bytes(
+        &self,
+        recorded_by: &str,
+        key_event_id: &[u8; 32],
+    ) -> ProjectionQueryResult<Option<[u8; 32]>> {
+        let key_b64 = event_id_to_base64(key_event_id);
+        let key_bytes: Option<Vec<u8>> = self
+            .query_row(
+                "SELECT key_bytes FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, key_b64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(key_bytes) = key_bytes else {
+            return Ok(None);
+        };
+        if key_bytes.len() != 32 {
+            return Ok(None);
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&key_bytes);
+        Ok(Some(out))
+    }
+
     fn load_workspace_context(
         &self,
         recorded_by: &str,
