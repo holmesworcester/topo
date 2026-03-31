@@ -1,7 +1,8 @@
 //! Formal verification proofs for the Topo event-sourced pipeline.
 //!
-//! 7 modules model the core pipeline logic, 5 modules model extended properties.
-//! All proofs assume external dependencies (SQLite, crypto) behave correctly.
+//! Core: projection decisions, pipeline, projectors, cascade, dispatch, commands
+//! Extended: context loading, project_one algorithm, tenant isolation, files, idempotency
+//! Security: session auth, transport trust, sync protocol, connections, data ingestion
 
 use vstd::prelude::*;
 
@@ -21,6 +22,13 @@ pub mod tenant_isolation;
 pub mod file_projectors;
 pub mod idempotency;
 pub mod persist_phase;
+
+// Security proofs
+pub mod session_auth;
+pub mod transport_trust;
+pub mod sync_protocol;
+pub mod connection_security;
+pub mod data_ingestion;
 
 verus! {
     proof fn system_invariants_hold() { }
