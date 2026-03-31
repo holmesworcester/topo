@@ -9,9 +9,11 @@ use std::net::SocketAddr;
 use std::sync::{Arc, Mutex};
 
 use iroh::address_lookup::MdnsAddressLookup;
+use iroh::endpoint::VarInt;
 
 use crate::contracts::peering_contract::TransportSessionIo;
 use crate::db::open_connection;
+use crate::tuning::low_mem_mode;
 use crate::db::transport_trust::{
     is_authorized_for_node, is_authorized_for_tenant, resolve_authorizing_tenant,
 };
@@ -355,14 +357,30 @@ pub async fn create_runtime_endpoint_for_tenants(
 ) -> Result<TransportEndpoint, Box<dyn std::error::Error + Send + Sync>> {
     let _ = ensure_daemon_identity_from_db(db_path)?;
     let secret_key = load_daemon_iroh_secret_key_from_db(db_path)?;
-    let endpoint = iroh::Endpoint::empty_builder()
+    let mut builder = iroh::Endpoint::empty_builder()
         .secret_key(secret_key)
-        .alpns(vec![TOPO_ALPN.to_vec()])
-        .relay_mode(iroh::endpoint::default_relay_mode())
+        .alpns(vec![TOPO_ALPN.to_vec()]);
+
+    if low_mem_mode() {
+        // In low-memory mode (iOS NSE, 24 MiB budget), disable relay client and
+        // portmapper to avoid ~7 MiB of resident overhead from relay connections,
+        // mDNS multicast state, and UPnP probing.  Direct peer-to-peer still
+        // works; only wide-area relay-assisted connectivity is lost.
+        builder = builder
+            .relay_mode(iroh::endpoint::RelayMode::Disabled)
+            .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+            .transport_config(low_mem_quic_transport_config());
+    } else {
+        builder = builder
+            .relay_mode(iroh::endpoint::default_relay_mode());
+    }
+
+    let endpoint = builder
         .bind_addr(bind_addr)?
         .bind()
         .await?;
-    let mdns = if env_flag("TOPO_DISABLE_DISCOVERY") {
+
+    let mdns = if env_flag("TOPO_DISABLE_DISCOVERY") || low_mem_mode() {
         None
     } else {
         let mdns = MdnsAddressLookup::builder().build(endpoint.id())?;
@@ -370,6 +388,27 @@ pub async fn create_runtime_endpoint_for_tenants(
         Some(mdns)
     };
     TransportEndpoint::new(endpoint, mdns).map_err(Into::into)
+}
+
+/// Reduced QUIC transport configuration for low-memory mode.
+///
+/// Shrinks per-connection buffer allocations.  This trades peak throughput
+/// for a smaller RSS footprint — acceptable for iOS NSE where we only need
+/// to sync recent messages, not sustain bulk transfer rates.
+///
+/// Note: `receive_window` (512 KiB) is less than `max_streams *
+/// stream_receive_window` (5 × 256 KiB = 1.25 MiB), so under concurrent
+/// load the connection-level cap limits effective per-stream throughput.
+/// This is intentional — we prefer a hard memory ceiling over peak
+/// per-stream bandwidth.
+fn low_mem_quic_transport_config() -> iroh::endpoint::QuicTransportConfig {
+    iroh::endpoint::QuicTransportConfig::builder()
+        .max_concurrent_bidi_streams(VarInt::from_u32(4))
+        .max_concurrent_uni_streams(VarInt::from_u32(1))
+        .stream_receive_window(VarInt::from_u32(256 * 1024)) // 256 KiB (default ~1 MiB)
+        .receive_window(VarInt::from_u32(512 * 1024))        // 512 KiB connection cap
+        .send_window(512 * 1024)                              // 512 KiB (default ~8 MiB)
+        .build()
 }
 
 pub fn tenant_trusts_peer(

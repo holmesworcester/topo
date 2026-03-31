@@ -46,6 +46,28 @@ path = "src/runtime/control/main.rs"
 [dev-dependencies]
 
 # Crypto deps are orders of magnitude slower in debug mode; optimize them even in tests.
+[profile.release]
+opt-level = "s"       # Optimize for size — reduces mapped code pages in RSS
+lto = "thin"          # Cross-crate inlining + dead code elimination
+strip = "symbols"     # Strip debug symbols from binary
+codegen-units = 1     # Single codegen unit for better optimization
+
+# Keep crypto crates at full speed even under size-optimized release profile.
+[profile.release.package.ed25519-dalek]
+opt-level = 3
+[profile.release.package.curve25519-dalek]
+opt-level = 3
+[profile.release.package.blake2]
+opt-level = 3
+[profile.release.package.sha2]
+opt-level = 3
+[profile.release.package.aes-gcm]
+opt-level = 3
+[profile.release.package.aes]
+opt-level = 3
+[profile.release.package.ring]
+opt-level = 3
+
 [profile.dev.package.ed25519-dalek]
 opt-level = 3
 
