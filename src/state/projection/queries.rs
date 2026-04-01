@@ -680,17 +680,25 @@ impl ProjectionQueries for Connection {
             .optional()?;
 
         let mut desc_stmt = self.prepare(
-            "SELECT event_id, signer_event_id, key_event_id
+            "SELECT event_id, signer_event_id, key_event_id, root_hash, blob_bytes, slice_bytes
              FROM files
              WHERE recorded_by = ?1 AND file_id = ?2
              ORDER BY created_at ASC, event_id ASC",
         )?;
         ctx.file_descriptors = desc_stmt
             .query_map(rusqlite::params![recorded_by, &file_id_b64], |row| {
+                let root_hash_blob: Vec<u8> = row.get(3)?;
+                let mut root_hash = [0u8; 32];
+                if root_hash_blob.len() == 32 {
+                    root_hash.copy_from_slice(&root_hash_blob);
+                }
                 Ok(FileDescriptorInfo {
                     event_id: row.get::<_, String>(0)?,
                     signer_event_id: row.get::<_, String>(1)?,
                     key_event_id: row.get::<_, String>(2)?,
+                    root_hash,
+                    blob_bytes: row.get::<_, i64>(4)? as u64,
+                    slice_bytes: row.get::<_, i64>(5)? as u32,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;

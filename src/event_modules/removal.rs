@@ -1,6 +1,3 @@
-use blake2::digest::consts::U32;
-use blake2::{Blake2b, Digest};
-
 use super::layout::field_spec::{
     decode_fields, encode_fields, wire_size_for_fields, FieldSpec, FieldValue,
 };
@@ -57,16 +54,13 @@ impl super::Describe for RemovalEvent {
 pub fn frontier_hash_from_refs(refs: &[[u8; 32]]) -> [u8; 32] {
     let mut sorted = refs.to_vec();
     sorted.sort_unstable();
-    let mut hasher = Blake2b::<U32>::new();
+    let mut hasher = blake3::Hasher::new();
     hasher.update(b"poc7-removal-frontier-v1");
-    hasher.update([sorted.len() as u8]);
+    hasher.update(&[sorted.len() as u8]);
     for event_id in &sorted {
         hasher.update(event_id);
     }
-    let digest = hasher.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest[..32]);
-    out
+    *hasher.finalize().as_bytes()
 }
 
 pub fn canonicalize_frontier_refs(refs: &[[u8; 32]]) -> Result<Vec<[u8; 32]>, String> {

@@ -732,15 +732,12 @@ pub(crate) fn run_event_action(
                 let mut ids: Vec<String> = resp.events.iter().map(|e| e.id.clone()).collect();
                 ids.sort();
                 if fingerprint {
-                    use blake2::digest::consts::U32;
-                    use blake2::{Blake2b, Digest};
-                    type Blake2b256 = Blake2b<U32>;
-                    let mut hasher = Blake2b256::new();
+                    let mut hasher = blake3::Hasher::new();
                     for id in &ids {
                         hasher.update(id.as_bytes());
                         hasher.update(b"\n");
                     }
-                    let result: [u8; 32] = hasher.finalize().into();
+                    let result: [u8; 32] = *hasher.finalize().as_bytes();
                     println!("EVENT IDS ({}):", ids.len());
                     println!("  fingerprint: {}", hex::encode(result));
                 } else {

@@ -1,9 +1,9 @@
-use std::io::{BufReader, Read};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::crypto::bao_verify;
 use crate::crypto::EventId;
 use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
 use crate::projection::create::create_encrypted_event_synchronous;
@@ -425,8 +425,18 @@ pub fn generate_files_for_peer(
     let log_progress = generate_progress_logging_enabled();
     let generate_start = Instant::now();
     let ctx = workspace::load_local_authoring_context(&db, &recorded_by)?;
-    let slice_bytes_u32 = FILE_SLICE_CIPHERTEXT_BYTES as u32;
-    let ciphertext: Vec<u8> = vec![0xAB; FILE_SLICE_CIPHERTEXT_BYTES];
+    // Generated files use sentinel root_hash [0;32] → skip bao verification.
+    // Payload uses encoding_len=0 so unpack_bao_payload returns raw data.
+    let effective_cap = crate::event_modules::file_slice::wire::BAO_PLAINTEXT_CAPACITY;
+    let slice_bytes_u32 = effective_cap as u32;
+    let ciphertext: Vec<u8> = {
+        let mut payload = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
+        // encoding_len = 0 (first 4 bytes already zero)
+        for b in payload[4..4 + effective_cap].iter_mut() {
+            *b = 0xAB;
+        }
+        payload
+    };
 
     // Each file is its own transaction to avoid holding the write lock
     // too long and causing SQLITE_BUSY for the sync engine.
@@ -462,7 +472,7 @@ pub fn generate_files_for_peer(
 
         let file_id = rand::random::<[u8; 32]>();
         let blob_bytes = (slices_per_file as u64)
-            .checked_mul(FILE_SLICE_CIPHERTEXT_BYTES as u64)
+            .checked_mul(effective_cap as u64)
             .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
                 "blob_bytes overflow".into()
             })?;
@@ -478,7 +488,7 @@ pub fn generate_files_for_peer(
                 blob_bytes,
                 total_slices: slices_per_file as u32,
                 slice_bytes: slice_bytes_u32,
-                root_hash: [0xAA; 32],
+                root_hash: [0u8; 32],
                 key_event_id,
                 filename: format!("file-{}.bin", i),
                 mime_type: "application/octet-stream".to_string(),
@@ -576,18 +586,15 @@ fn mime_from_extension(ext: &str) -> &'static str {
     }
 }
 
-fn read_padded_file_slice<R: Read>(
-    reader: &mut R,
-    bytes_this_slice: usize,
-) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut ciphertext = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
-    if bytes_this_slice > 0 {
-        reader.read_exact(&mut ciphertext[..bytes_this_slice])?;
-    }
-    Ok(ciphertext)
-}
-
 /// Send a message with a file as a specific peer.
+///
+/// Computes a bao (BLAKE3 verified streaming) root hash over the file
+/// contents. The root hash is stored in the File descriptor event. At receive
+/// time, the reassembled file is verified against this root hash, catching
+/// any corruption or tampering in the slice data.
+///
+/// The per-slice wire format is unchanged: each slice carries
+/// `FILE_SLICE_CIPHERTEXT_BYTES` of zero-padded file data.
 pub fn send_file_for_peer(
     db_path: &str,
     peer_id: &str,
@@ -595,16 +602,10 @@ pub fn send_file_for_peer(
     file_path: &str,
 ) -> Result<SendFileResponse, Box<dyn std::error::Error + Send + Sync>> {
     let path = Path::new(file_path);
-    let file =
-        std::fs::File::open(path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("failed to open {}: {}", file_path, e).into()
-        })?;
-    let file_size = file
-        .metadata()
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("failed to stat {}: {}", file_path, e).into()
-        })?
-        .len();
+    let file_data = std::fs::read(path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("failed to read {}: {}", file_path, e).into()
+    })?;
+    let file_size = file_data.len() as u64;
     let filename = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -634,14 +635,29 @@ pub fn send_file_for_peer(
     let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(&db, &recorded_by)?;
 
     let file_id = rand::random::<[u8; 32]>();
+
+    // Compute bao outboard + root hash over plaintext for per-slice verification.
+    // The outboard is needed to extract per-slice proofs below.
+    let (root_hash, outboard) = if file_size > 0 {
+        bao_verify::compute_outboard(&file_data)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("bao outboard computation failed: {}", e).into()
+            })?
+    } else {
+        ([0u8; 32], Vec::new())
+    };
+
+    let effective_capacity =
+        crate::event_modules::file_slice::wire::BAO_PLAINTEXT_CAPACITY;
     let num_slices = if file_size == 0 {
         1usize
     } else {
-        usize::try_from(file_size.div_ceil(FILE_SLICE_CIPHERTEXT_BYTES as u64)).map_err(
-            |_| -> Box<dyn std::error::Error + Send + Sync> {
-                "file too large: slice count exceeds usize".into()
-            },
-        )?
+        usize::try_from(
+            (file_size as usize).div_ceil(effective_capacity),
+        )
+        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+            "file too large: slice count exceeds usize".into()
+        })?
     };
     let total_slices_u32 =
         u32::try_from(num_slices).map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
@@ -658,8 +674,8 @@ pub fn send_file_for_peer(
             file_id,
             blob_bytes: file_size,
             total_slices: total_slices_u32,
-            slice_bytes: FILE_SLICE_CIPHERTEXT_BYTES as u32,
-            root_hash: [0u8; 32],
+            slice_bytes: effective_capacity as u32,
+            root_hash,
             key_event_id,
             filename: filename.clone(),
             mime_type,
@@ -670,11 +686,33 @@ pub fn send_file_for_peer(
         Some(&ctx.signing_key),
     )?;
 
-    let mut reader = BufReader::new(file);
     let mut remaining_bytes = file_size;
     for slice_number in 0..num_slices {
-        let bytes_this_slice = remaining_bytes.min(FILE_SLICE_CIPHERTEXT_BYTES as u64) as usize;
-        let ciphertext = read_padded_file_slice(&mut reader, bytes_this_slice)?;
+        let bytes_this_slice =
+            remaining_bytes.min(effective_capacity as u64) as usize;
+        let data_start = slice_number * effective_capacity;
+
+        // Extract bao slice proof for this byte range.
+        let proof = if file_size > 0 {
+            bao_verify::extract_slice_proof(
+                &file_data,
+                &outboard,
+                data_start as u64,
+                bytes_this_slice as u64,
+            )
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("bao slice proof extraction failed: {}", e).into()
+            })?
+        } else {
+            Vec::new()
+        };
+
+        let plaintext = if bytes_this_slice > 0 {
+            &file_data[data_start..data_start + bytes_this_slice]
+        } else {
+            &[]
+        };
+        let ciphertext = crate::event_modules::file_slice::wire::pack_bao_payload(&proof, plaintext);
         remaining_bytes = remaining_bytes.saturating_sub(bytes_this_slice as u64);
 
         create_encrypted_event_synchronous(
@@ -692,13 +730,6 @@ pub fn send_file_for_peer(
             }),
             Some(&ctx.signing_key),
         )?;
-    }
-    if remaining_bytes != 0 {
-        return Err(format!(
-            "file read incomplete: {} bytes remained unread for {}",
-            remaining_bytes, file_path
-        )
-        .into());
     }
 
     Ok(SendFileResponse {

@@ -60,15 +60,12 @@ pub fn encode_key_secret(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
 /// Deterministic timestamp derivation for key materialized Secret events.
 pub fn deterministic_key_secret_created_at_ms(key_bytes: &[u8; 32]) -> u64 {
-    use blake2::digest::consts::U8;
-    use blake2::{Blake2b, Digest};
-
-    let mut hasher = Blake2b::<U8>::new();
+    let mut hasher = blake3::Hasher::new();
     hasher.update(b"poc7-content-key-created-at-v1");
     hasher.update(key_bytes);
     let digest = hasher.finalize();
     let mut out = [0u8; 8];
-    out.copy_from_slice(&digest[..8]);
+    out.copy_from_slice(&digest.as_bytes()[..8]);
     u64::from_le_bytes(out)
 }
 

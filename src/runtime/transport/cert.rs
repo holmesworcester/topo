@@ -1,5 +1,3 @@
-use blake2::digest::consts::U32;
-use blake2::{Blake2b, Digest};
 use ed25519_dalek::pkcs8::EncodePrivateKey;
 use ed25519_dalek::{SigningKey, VerifyingKey};
 use rand::rngs::OsRng;
@@ -89,7 +87,7 @@ pub fn validate_cert_key_match(
     Ok(())
 }
 
-/// Compute the SPKI fingerprint (BLAKE2b-256) from raw Ed25519 public key bytes.
+/// Compute the SPKI fingerprint (BLAKE3) from raw Ed25519 public key bytes.
 ///
 /// Constructs the DER-encoded SubjectPublicKeyInfo for Ed25519 and hashes it.
 /// This gives the same result as `extract_spki_fingerprint` on a cert generated
@@ -98,19 +96,14 @@ pub fn spki_fingerprint_from_ed25519_pubkey(pubkey: &[u8; 32]) -> [u8; 32] {
     crate::crypto::spki_fingerprint_from_ed25519_pubkey(pubkey)
 }
 
-/// Extract SPKI from a DER-encoded certificate and hash it with BLAKE2b-256.
+/// Extract SPKI from a DER-encoded certificate and hash it with BLAKE3.
 pub fn extract_spki_fingerprint(
     cert_der: &[u8],
 ) -> Result<[u8; 32], Box<dyn std::error::Error + Send + Sync>> {
     let (_, cert) = X509Certificate::from_der(cert_der)
         .map_err(|e| format!("failed to parse X.509 certificate: {}", e))?;
     let spki_bytes = cert.public_key().raw;
-    let mut hasher = Blake2b::<U32>::new();
-    hasher.update(spki_bytes);
-    let result = hasher.finalize();
-    let mut fingerprint = [0u8; 32];
-    fingerprint.copy_from_slice(&result);
-    Ok(fingerprint)
+    Ok(*blake3::hash(spki_bytes).as_bytes())
 }
 
 #[cfg(test)]

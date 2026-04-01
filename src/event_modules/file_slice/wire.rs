@@ -115,6 +115,52 @@ pub static FILE_SLICE_META: EventTypeMeta = EventTypeMeta {
     context_loader: super::projector::build_projector_context,
 };
 
+/// Maximum bao encoding overhead per slice (tree nodes interleaved with data).
+///
+/// For plaintext ≤ 245 KiB, the overhead is ≤ ~16 KiB.  We budget 17 KiB
+/// to leave margin for large files with deep trees.
+pub const BAO_ENCODING_BUDGET: usize = 17 * 1024;
+
+/// Plaintext capacity per slice after reserving room for the bao encoding
+/// header (4 bytes) and tree overhead.
+pub const BAO_PLAINTEXT_CAPACITY: usize = FILE_SLICE_CIPHERTEXT_BYTES - 4 - BAO_ENCODING_BUDGET;
+
+/// Pack a bao slice encoding into the fixed-size ciphertext field.
+///
+/// Format: `[encoding_len: u32 LE][bao slice encoding, zero-padded]`.
+/// The bao slice encoding contains the plaintext data interleaved with
+/// BLAKE3 tree verification nodes (~6% overhead).
+pub fn pack_bao_payload(bao_encoding: &[u8], _plaintext: &[u8]) -> Vec<u8> {
+    let enc_len = bao_encoding.len() as u32;
+    let mut payload = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
+    payload[0..4].copy_from_slice(&enc_len.to_le_bytes());
+    let copy_len = bao_encoding.len().min(FILE_SLICE_CIPHERTEXT_BYTES - 4);
+    payload[4..4 + copy_len].copy_from_slice(&bao_encoding[..copy_len]);
+    payload
+}
+
+/// Unpack a bao payload.  Returns (bao_encoding, raw_data_fallback).
+///
+/// If `encoding_len == 0`, the payload has no bao encoding and the raw
+/// plaintext starts at offset 4 (legacy/generated data).
+pub fn unpack_bao_payload(payload: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    if payload.len() < 4 {
+        return (Vec::new(), payload.to_vec());
+    }
+    let enc_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    if enc_len == 0 {
+        return (Vec::new(), payload[4..].to_vec());
+    }
+    let end = (4 + enc_len).min(payload.len());
+    let encoding = payload[4..end].to_vec();
+    (encoding, Vec::new())
+}
+
+/// Effective plaintext capacity per slice (convenience alias).
+pub fn effective_plaintext_capacity(_bao_overhead: usize) -> usize {
+    BAO_PLAINTEXT_CAPACITY
+}
+
 #[cfg(test)]
 mod layout_tests {
     use super::*;

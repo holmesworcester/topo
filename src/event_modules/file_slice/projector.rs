@@ -1,4 +1,6 @@
 use super::super::ParsedEvent;
+use super::wire::{unpack_bao_payload, FILE_SLICE_CIPHERTEXT_BYTES};
+use crate::crypto::bao_verify;
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
 use crate::projection::queries::define_query_context_loader;
@@ -69,6 +71,24 @@ pub fn project_pure(
                 "file_slice wrapper key {} does not match file descriptor key {}",
                 wrapper_key_event_id, descriptor.key_event_id
             ));
+        }
+    }
+
+    // Verify bao slice encoding if root_hash is present (non-zero sentinel).
+    if descriptor.root_hash != [0u8; 32] && fs.ciphertext.len() == FILE_SLICE_CIPHERTEXT_BYTES {
+        let (bao_encoding, _) = unpack_bao_payload(&fs.ciphertext);
+        if !bao_encoding.is_empty() {
+            let slice_start = fs.slice_number as u64 * descriptor.slice_bytes as u64;
+            let remaining = descriptor.blob_bytes.saturating_sub(slice_start);
+            let slice_len = remaining.min(descriptor.slice_bytes as u64);
+            if let Err(e) =
+                bao_verify::verify_slice(&descriptor.root_hash, &bao_encoding, slice_start, slice_len)
+            {
+                return ProjectorResult::reject(format!(
+                    "bao verification failed for slice {}: {}",
+                    fs.slice_number, e
+                ));
+            }
         }
     }
 
