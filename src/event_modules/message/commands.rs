@@ -139,9 +139,6 @@ pub fn create(
         workspace_id: cmd.workspace_id,
         author_id: cmd.author_id,
         content: cmd.content,
-        signed_by: *signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
     let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)?;
     let eid = create_encrypted_event_synchronous(
@@ -149,7 +146,7 @@ pub fn create(
         recorded_by,
         &key_event_id,
         &msg,
-        Some(signing_key),
+        Some((signer_eid, signing_key)),
     )?;
     Ok(eid)
 }
@@ -206,9 +203,6 @@ pub fn create_deletion(
         created_at_ms,
         target_event_id: cmd.target_event_id,
         author_id: cmd.author_id,
-        signed_by: *signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
     let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)?;
     let eid = create_encrypted_event_synchronous(
@@ -216,7 +210,7 @@ pub fn create_deletion(
         recorded_by,
         &key_event_id,
         &del,
-        Some(signing_key),
+        Some((signer_eid, signing_key)),
     )?;
     Ok(eid)
 }
@@ -492,11 +486,8 @@ pub fn generate_files_for_peer(
                 key_event_id,
                 filename: format!("file-{}.bin", i),
                 mime_type: "application/octet-stream".to_string(),
-                signed_by: ctx.signer_event_id,
-                signer_type: 5,
-                signature: [0u8; 64],
             }),
-            Some(&ctx.signing_key),
+            Some((&ctx.signer_event_id, &ctx.signing_key)),
         )
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("create file error: {}", e).into()
@@ -512,11 +503,8 @@ pub fn generate_files_for_peer(
                     file_id,
                     slice_number: slice_number as u32,
                     ciphertext: ciphertext.clone(),
-                    signed_by: ctx.signer_event_id,
-                    signer_type: 5,
-                    signature: [0u8; 64],
                 }),
-                Some(&ctx.signing_key),
+                Some((&ctx.signer_event_id, &ctx.signing_key)),
             )
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("create file_slice error: {}", e).into()
@@ -600,11 +588,13 @@ pub fn send_file_for_peer(
     peer_id: &str,
     content: &str,
     file_path: &str,
+    add_bad_slices: usize,
 ) -> Result<SendFileResponse, Box<dyn std::error::Error + Send + Sync>> {
     let path = Path::new(file_path);
-    let file_data = std::fs::read(path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-        format!("failed to read {}: {}", file_path, e).into()
-    })?;
+    let file_data =
+        std::fs::read(path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("failed to read {}: {}", file_path, e).into()
+        })?;
     let file_size = file_data.len() as u64;
     let filename = path
         .file_name()
@@ -639,25 +629,24 @@ pub fn send_file_for_peer(
     // Compute bao outboard + root hash over plaintext for per-slice verification.
     // The outboard is needed to extract per-slice proofs below.
     let (root_hash, outboard) = if file_size > 0 {
-        bao_verify::compute_outboard(&file_data)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        bao_verify::compute_outboard(&file_data).map_err(
+            |e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("bao outboard computation failed: {}", e).into()
-            })?
+            },
+        )?
     } else {
         ([0u8; 32], Vec::new())
     };
 
-    let effective_capacity =
-        crate::event_modules::file_slice::wire::BAO_PLAINTEXT_CAPACITY;
+    let effective_capacity = crate::event_modules::file_slice::wire::BAO_PLAINTEXT_CAPACITY;
     let num_slices = if file_size == 0 {
         1usize
     } else {
-        usize::try_from(
-            (file_size as usize).div_ceil(effective_capacity),
-        )
-        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
-            "file too large: slice count exceeds usize".into()
-        })?
+        usize::try_from((file_size as usize).div_ceil(effective_capacity)).map_err(
+            |_| -> Box<dyn std::error::Error + Send + Sync> {
+                "file too large: slice count exceeds usize".into()
+            },
+        )?
     };
     let total_slices_u32 =
         u32::try_from(num_slices).map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
@@ -679,17 +668,13 @@ pub fn send_file_for_peer(
             key_event_id,
             filename: filename.clone(),
             mime_type,
-            signed_by: ctx.signer_event_id,
-            signer_type: 5,
-            signature: [0u8; 64],
         }),
-        Some(&ctx.signing_key),
+        Some((&ctx.signer_event_id, &ctx.signing_key)),
     )?;
 
     let mut remaining_bytes = file_size;
     for slice_number in 0..num_slices {
-        let bytes_this_slice =
-            remaining_bytes.min(effective_capacity as u64) as usize;
+        let bytes_this_slice = remaining_bytes.min(effective_capacity as u64) as usize;
         let data_start = slice_number * effective_capacity;
 
         // Extract bao slice proof for this byte range.
@@ -712,7 +697,8 @@ pub fn send_file_for_peer(
         } else {
             &[]
         };
-        let ciphertext = crate::event_modules::file_slice::wire::pack_bao_payload(&proof, plaintext);
+        let ciphertext =
+            crate::event_modules::file_slice::wire::pack_bao_payload(&proof, plaintext);
         remaining_bytes = remaining_bytes.saturating_sub(bytes_this_slice as u64);
 
         create_encrypted_event_synchronous(
@@ -724,11 +710,28 @@ pub fn send_file_for_peer(
                 file_id,
                 slice_number: slice_number as u32,
                 ciphertext,
-                signed_by: ctx.signer_event_id,
-                signer_type: 5,
-                signature: [0u8; 64],
             }),
-            Some(&ctx.signing_key),
+            Some((&ctx.signer_event_id, &ctx.signing_key)),
+        )?;
+    }
+    for bad_idx in 0..add_bad_slices {
+        let slice_number = total_slices_u32.checked_add(bad_idx as u32).ok_or_else(
+            || -> Box<dyn std::error::Error + Send + Sync> {
+                "too many bad slices: slice number exceeds u32".into()
+            },
+        )?;
+        let ciphertext = vec![(bad_idx as u8).wrapping_add(0xA5); FILE_SLICE_CIPHERTEXT_BYTES];
+        create_encrypted_event_synchronous(
+            &db,
+            &recorded_by,
+            &key_event_id,
+            &ParsedEvent::FileSlice(FileSliceEvent {
+                created_at_ms: current_timestamp_ms_u64(),
+                file_id,
+                slice_number,
+                ciphertext,
+            }),
+            Some((&ctx.signer_event_id, &ctx.signing_key)),
         )?;
     }
 

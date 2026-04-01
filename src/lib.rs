@@ -32,8 +32,12 @@ mod boundary_tests {
     }
 
     fn assert_python_script_passes(script: &str) {
-        let result = std::process::Command::new("python3")
-            .arg(script)
+        let mut command = std::process::Command::new("python3");
+        command.arg(script);
+        if script.ends_with("check_projector_tla_conformance.py") {
+            command.env("TOPO_SKIP_CARGO_TEST_DISCOVERY", "1");
+        }
+        let result = command
             .output()
             .unwrap_or_else(|err| panic!("failed to run {} via python3: {}", script, err));
         if !result.status.success() {

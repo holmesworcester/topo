@@ -140,6 +140,7 @@ fn parsed_event_type_name(parsed: &ParsedEvent) -> &'static str {
         ParsedEvent::DeviceInvite(_) => "peer_invite_shared",
         ParsedEvent::PeerShared(_) => "peer_shared",
         ParsedEvent::Admin(_) => "admin",
+        ParsedEvent::Signed(_) => "signed",
         ParsedEvent::Encrypted(_) => "encrypted",
         ParsedEvent::KeySecret(_) => "key_secret",
         ParsedEvent::KeyRequest(_) => "key_request",

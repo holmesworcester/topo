@@ -13,10 +13,10 @@ use iroh::endpoint::VarInt;
 
 use crate::contracts::peering_contract::TransportSessionIo;
 use crate::db::open_connection;
-use crate::tuning::low_mem_mode;
 use crate::db::transport_trust::{
     is_authorized_for_node, is_authorized_for_tenant, resolve_authorizing_tenant,
 };
+use crate::tuning::low_mem_mode;
 
 use super::connection_lifecycle::{
     accept_daemon, dial_daemon, ConnectedDaemon, ConnectionLifecycleError,
@@ -388,14 +388,10 @@ pub async fn create_runtime_endpoint_for_tenants(
             .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
             .transport_config(low_mem_quic_transport_config());
     } else {
-        builder = builder
-            .relay_mode(iroh::endpoint::default_relay_mode());
+        builder = builder.relay_mode(iroh::endpoint::default_relay_mode());
     }
 
-    let endpoint = builder
-        .bind_addr(bind_addr)?
-        .bind()
-        .await?;
+    let endpoint = builder.bind_addr(bind_addr)?.bind().await?;
 
     let mdns = if env_flag("TOPO_DISABLE_DISCOVERY") || low_mem_mode() {
         None
@@ -423,8 +419,8 @@ fn low_mem_quic_transport_config() -> iroh::endpoint::QuicTransportConfig {
         .max_concurrent_bidi_streams(VarInt::from_u32(4))
         .max_concurrent_uni_streams(VarInt::from_u32(1))
         .stream_receive_window(VarInt::from_u32(256 * 1024)) // 256 KiB (default ~1 MiB)
-        .receive_window(VarInt::from_u32(512 * 1024))        // 512 KiB connection cap
-        .send_window(512 * 1024)                              // 512 KiB (default ~8 MiB)
+        .receive_window(VarInt::from_u32(512 * 1024)) // 512 KiB connection cap
+        .send_window(512 * 1024) // 512 KiB (default ~8 MiB)
         .build()
 }
 

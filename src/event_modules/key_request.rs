@@ -12,15 +12,11 @@ pub const KEY_REQUEST_FIELDS: &[FieldSpec] = &[
     FieldSpec::EventId("delivery_target_id"),
     FieldSpec::EventId("recipient_event_id"),
     FieldSpec::EventId("unwrap_key_event_id"),
-    FieldSpec::EventId("signed_by"),
-    FieldSpec::U8("signer_type"),
-    FieldSpec::FixedBytes("signature", 64),
 ];
 
 /// KeyRequest (type 30): type(1) + created_at(8) + blocked_event_id(32)
 ///   + key_event_id(32) + frontier_hash(32) + delivery_target_id(32)
-///   + recipient_event_id(32) + unwrap_key_event_id(32)
-///   + signed_by(32) + signer_type(1) + signature(64) = 298
+///   + recipient_event_id(32) + unwrap_key_event_id(32) = 201
 pub const KEY_REQUEST_WIRE_SIZE: usize = wire_size_for_fields(KEY_REQUEST_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -32,9 +28,6 @@ pub struct KeyRequestEvent {
     pub delivery_target_id: [u8; 32],
     pub recipient_event_id: [u8; 32],
     pub unwrap_key_event_id: [u8; 32],
-    pub signed_by: [u8; 32],
-    pub signer_type: u8,
-    pub signature: [u8; 64],
 }
 
 impl super::Describe for KeyRequestEvent {
@@ -71,7 +64,7 @@ pub fn deterministic_key_request_created_at_ms(
     frontier_hash: &[u8; 32],
     recipient_event_id: &[u8; 32],
     unwrap_key_event_id: &[u8; 32],
-    signed_by: &[u8; 32],
+    requester_signer_event_id: &[u8; 32],
 ) -> u64 {
     let mut hasher = blake3::Hasher::new();
     hasher.update(b"poc7-key-request-created-at-v1");
@@ -80,7 +73,7 @@ pub fn deterministic_key_request_created_at_ms(
     hasher.update(frontier_hash);
     hasher.update(recipient_event_id);
     hasher.update(unwrap_key_event_id);
-    hasher.update(signed_by);
+    hasher.update(requester_signer_event_id);
     let digest = hasher.finalize();
     let mut out = [0u8; 8];
     out.copy_from_slice(&digest.as_bytes()[..8]);
@@ -97,14 +90,6 @@ pub fn parse_key_request(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         delivery_target_id: values[4].as_event_id().unwrap(),
         recipient_event_id: values[5].as_event_id().unwrap(),
         unwrap_key_event_id: values[6].as_event_id().unwrap(),
-        signed_by: values[7].as_event_id().unwrap(),
-        signer_type: values[8].as_u8().unwrap(),
-        signature: {
-            let bytes = values[9].as_fixed_bytes().unwrap();
-            let mut sig = [0u8; 64];
-            sig.copy_from_slice(bytes);
-            sig
-        },
     }))
 }
 
@@ -122,9 +107,6 @@ pub fn encode_key_request(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         FieldValue::EventId(kr.delivery_target_id),
         FieldValue::EventId(kr.recipient_event_id),
         FieldValue::EventId(kr.unwrap_key_event_id),
-        FieldValue::EventId(kr.signed_by),
-        FieldValue::U8(kr.signer_type),
-        FieldValue::FixedBytes(kr.signature.to_vec()),
     ];
 
     Ok(encode_fields(
@@ -162,7 +144,7 @@ pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    _ctx: &ContextSnapshot,
+    ctx: &ContextSnapshot,
 ) -> ProjectorResult {
     let kr = match parsed {
         ParsedEvent::KeyRequest(v) => v,
@@ -179,6 +161,10 @@ pub fn project_pure(
             "delivery_target_id does not match key request target".to_string(),
         );
     }
+
+    let Some(current_signer) = ctx.current_signer.as_ref() else {
+        return ProjectorResult::reject("key_request missing current signer envelope".to_string());
+    };
 
     let ops = vec![WriteOp::InsertOrIgnore {
         table: "key_requests",
@@ -202,22 +188,22 @@ pub fn project_pure(
             SqlVal::Text(event_id_to_base64(&kr.delivery_target_id)),
             SqlVal::Text(event_id_to_base64(&kr.recipient_event_id)),
             SqlVal::Text(event_id_to_base64(&kr.unwrap_key_event_id)),
-            SqlVal::Text(event_id_to_base64(&kr.signed_by)),
+            SqlVal::Text(current_signer.event_id.clone()),
         ],
     }];
 
     ProjectorResult::valid(ops)
 }
 
-pub static KEY_REQUEST_META: EventTypeMeta = EventTypeMeta {
+pub static KEY_REQUEST_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_KEY_REQUEST,
     type_name: "key_request",
     projection_table: "key_requests",
     share_scope: ShareScope::Shared,
-    dep_fields: &["signed_by"],
-    dep_field_type_codes: &[&[]],
+    dep_fields: &[],
+    dep_field_type_codes: &[],
     signer_required: true,
-    signature_byte_len: 64,
+    signature_byte_len: 0,
     encryptable: false,
     parse: parse_key_request,
     encode: encode_key_request,

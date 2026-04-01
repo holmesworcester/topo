@@ -11,6 +11,7 @@ mod tests {
     use topo::event_modules::reaction::{build_projector_context, project_pure};
     use topo::event_modules::ParsedEvent;
     use topo::projection::contract::EmitCommand;
+    use topo::projection::queries::ProjectionFrameContext;
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "rxn_event_1";
@@ -21,9 +22,6 @@ mod tests {
             target_event_id: [1u8; 32],
             author_id: [2u8; 32],
             emoji: "👍".to_string(),
-            signed_by: [3u8; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
         })
     }
 
@@ -49,7 +47,14 @@ mod tests {
             "signer peer not linked to author user",
         ));
 
-        let result = build_projector_context(&queries, PEER, EVENT_ID, &parsed).unwrap();
+        let result = build_projector_context(
+            &queries,
+            &ProjectionFrameContext::default(),
+            PEER,
+            EVENT_ID,
+            &parsed,
+        )
+        .unwrap();
         assert_context_reject_contains(&result, "signer peer not linked to author user");
     }
 

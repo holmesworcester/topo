@@ -9,8 +9,7 @@ mod tests {
     use crate::harness::fixtures::*;
     use topo::event_modules::key_rotation::{project_pure, KeyRotationEvent};
     use topo::event_modules::removal::frontier_hash_from_refs;
-    use topo::event_modules::{ParsedEvent, TenantEvent};
-    use topo::projection::contract::ContextSnapshot;
+    use topo::event_modules::{ParsedEvent, TenantEvent, EVENT_TYPE_KEY_ROTATION};
 
     const PEER: &str = "peer_alice";
 
@@ -20,7 +19,6 @@ mod tests {
         frontier_ref_2: [u8; 32],
         frontier_hash: [u8; 32],
         rotated_by: [u8; 32],
-        signed_by: [u8; 32],
     ) -> ParsedEvent {
         ParsedEvent::KeyRotation(KeyRotationEvent {
             created_at_ms: 8_000,
@@ -32,9 +30,6 @@ mod tests {
             frontier_ref_4: [0u8; 32],
             frontier_hash,
             rotated_by,
-            signed_by,
-            signer_type: 5,
-            signature: [0u8; 64],
         })
     }
 
@@ -47,10 +42,9 @@ mod tests {
             [0u8; 32],
             frontier_hash_from_refs(&[]),
             signer,
-            signer,
         );
         let event_id = b64(&[7u8; 32]);
-        let ctx = ContextSnapshot::default();
+        let ctx = ctx_with_current_signer(&b64(&signer), EVENT_TYPE_KEY_ROTATION);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
@@ -66,10 +60,9 @@ mod tests {
             [3u8; 32],
             frontier_hash_from_refs(&[[2u8; 32], [3u8; 32]]),
             signer,
-            signer,
         );
         let event_id = b64(&[8u8; 32]);
-        let ctx = ContextSnapshot::default();
+        let ctx = ctx_with_current_signer(&b64(&signer), EVENT_TYPE_KEY_ROTATION);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
@@ -84,21 +77,20 @@ mod tests {
             [0u8; 32],
             frontier_hash_from_refs(&[[2u8; 32]]),
             [8u8; 32],
-            [9u8; 32],
         );
         let event_id = b64(&[6u8; 32]);
-        let ctx = ContextSnapshot::default();
+        let ctx = ctx_with_current_signer(&b64(&[88u8; 32]), EVENT_TYPE_KEY_ROTATION);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
-        assert_reject_contains(&result, "rotated_by must equal signed_by");
+        assert_reject_contains(&result, "rotated_by must equal current signer");
     }
 
     #[test]
     fn test_key_rotation_rejects_frontier_hash_mismatch() {
         let signer = [9u8; 32];
-        let parsed = make_key_rotation(1, [2u8; 32], [0u8; 32], [7u8; 32], signer, signer);
+        let parsed = make_key_rotation(1, [2u8; 32], [0u8; 32], [7u8; 32], signer);
         let event_id = b64(&[5u8; 32]);
-        let ctx = ContextSnapshot::default();
+        let ctx = ctx_with_current_signer(&b64(&signer), EVENT_TYPE_KEY_ROTATION);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_reject_contains(&result, "frontier_hash does not match frontier refs");
@@ -113,10 +105,9 @@ mod tests {
             [2u8; 32],
             frontier_hash_from_refs(&[[2u8; 32], [3u8; 32]]),
             signer,
-            signer,
         );
         let event_id = b64(&[3u8; 32]);
-        let ctx = ContextSnapshot::default();
+        let ctx = ctx_with_current_signer(&b64(&signer), EVENT_TYPE_KEY_ROTATION);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_reject_contains(&result, "frontier refs must be sorted in canonical order");
@@ -129,7 +120,7 @@ mod tests {
             public_key: [7u8; 32],
         });
         let event_id = b64(&[4u8; 32]);
-        let ctx = ContextSnapshot::default();
+        let ctx = ctx_with_current_signer(&b64(&[9u8; 32]), EVENT_TYPE_KEY_ROTATION);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_reject_contains(&result, "not a key_rotation event");

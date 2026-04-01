@@ -535,6 +535,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::SendFile {
             content,
             file,
+            add_bad_slices,
             client_op_id,
         } => {
             let file_path = resolve_send_file_path(file)?;
@@ -544,6 +545,7 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 RpcMethod::SendFile {
                     content: content.clone(),
                     file_path,
+                    add_bad_slices,
                     client_op_id,
                 },
             )?;

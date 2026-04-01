@@ -13,24 +13,21 @@ pub const FILE_FILENAME_BYTES: usize = 255;
 pub const FILE_MIME_BYTES: usize = 128;
 
 pub const FILE_FIELDS: &[FieldSpec] = &[
-    FieldSpec::Timestamp("created_at_ms"),  // 0
-    FieldSpec::EventId("message_id"),       // 1
-    FieldSpec::EventId("file_id"),          // 2
-    FieldSpec::U64("blob_bytes"),           // 3
-    FieldSpec::U32("total_slices"),         // 4
-    FieldSpec::U32("slice_bytes"),          // 5
-    FieldSpec::EventId("root_hash"),        // 6
-    FieldSpec::EventId("key_event_id"),     // 7
-    FieldSpec::Text("filename", 255),       // 8
-    FieldSpec::Text("mime_type", 128),      // 9
-    FieldSpec::EventId("signed_by"),        // 10
-    FieldSpec::U8("signer_type"),           // 11
-    FieldSpec::FixedBytes("signature", 64), // 12
+    FieldSpec::Timestamp("created_at_ms"), // 0
+    FieldSpec::EventId("message_id"),      // 1
+    FieldSpec::EventId("file_id"),         // 2
+    FieldSpec::U64("blob_bytes"),          // 3
+    FieldSpec::U32("total_slices"),        // 4
+    FieldSpec::U32("slice_bytes"),         // 5
+    FieldSpec::EventId("root_hash"),       // 6
+    FieldSpec::EventId("key_event_id"),    // 7
+    FieldSpec::Text("filename", 255),      // 8
+    FieldSpec::Text("mime_type", 128),     // 9
 ];
 
 /// File (type 24): type(1) + created_at(8) + message_id(32) + file_id(32)
 ///   + blob_bytes(8) + total_slices(4) + slice_bytes(4) + root_hash(32) + key_event_id(32)
-///   + filename(255) + mime_type(128) + signed_by(32) + signer_type(1) + signature(64) = 633
+///   + filename(255) + mime_type(128) = 536
 pub const FILE_WIRE_SIZE: usize = wire_size_for_fields(FILE_FIELDS);
 
 /// Offset constants kept for external test use (canonical_wire_tests.rs).
@@ -47,9 +44,6 @@ pub mod file_offsets {
     pub const KEY_EVENT_ID: usize = 121;
     pub const FILENAME: usize = 153;
     pub const MIME_TYPE: usize = 153 + super::FILE_FILENAME_BYTES; // 408
-    pub const SIGNED_BY: usize = MIME_TYPE + super::FILE_MIME_BYTES; // 536
-    pub const SIGNER_TYPE: usize = SIGNED_BY + 32; // 568
-    pub const SIGNATURE: usize = SIGNER_TYPE + 1; // 569
 
     /// Verify offsets match field_spec at test time.
     #[cfg(test)]
@@ -66,9 +60,6 @@ pub mod file_offsets {
         assert_eq!(KEY_EVENT_ID, field_offset(FILE_FIELDS, 7));
         assert_eq!(FILENAME, field_offset(FILE_FIELDS, 8));
         assert_eq!(MIME_TYPE, field_offset(FILE_FIELDS, 9));
-        assert_eq!(SIGNED_BY, field_offset(FILE_FIELDS, 10));
-        assert_eq!(SIGNER_TYPE, field_offset(FILE_FIELDS, 11));
-        assert_eq!(SIGNATURE, field_offset(FILE_FIELDS, 12));
     }
 }
 
@@ -84,9 +75,6 @@ pub struct FileEvent {
     pub key_event_id: [u8; 32],
     pub filename: String,
     pub mime_type: String,
-    pub signed_by: [u8; 32],
-    pub signer_type: u8,
-    pub signature: [u8; 64],
 }
 
 impl super::super::Describe for FileEvent {
@@ -115,9 +103,6 @@ impl super::super::Describe for FileEvent {
 /// [121..153]     key_event_id (32 bytes)
 /// [153..408]     filename (255 bytes, UTF-8 zero-padded)
 /// [408..536]     mime_type (128 bytes, UTF-8 zero-padded)
-/// [536..568]     signed_by (32 bytes)
-/// [568]          signer_type (1 byte)
-/// [569..633]     signature (64 bytes)
 pub fn parse_file(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let values = decode_fields(EVENT_TYPE_FILE, FILE_FIELDS, blob)?;
 
@@ -138,14 +123,6 @@ pub fn parse_file(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         key_event_id: values[7].as_event_id().unwrap(),
         filename: values[8].as_text().unwrap().to_string(),
         mime_type: values[9].as_text().unwrap().to_string(),
-        signed_by: values[10].as_event_id().unwrap(),
-        signer_type: values[11].as_u8().unwrap(),
-        signature: {
-            let bytes = values[12].as_fixed_bytes().unwrap();
-            let mut sig = [0u8; 64];
-            sig.copy_from_slice(bytes);
-            sig
-        },
     }))
 }
 
@@ -201,23 +178,20 @@ pub fn encode_file(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         FieldValue::EventId(att.key_event_id),
         FieldValue::Text(att.filename.clone()),
         FieldValue::Text(att.mime_type.clone()),
-        FieldValue::EventId(att.signed_by),
-        FieldValue::U8(att.signer_type),
-        FieldValue::FixedBytes(att.signature.to_vec()),
     ];
 
     Ok(encode_fields(EVENT_TYPE_FILE, FILE_FIELDS, &values)?)
 }
 
-pub static FILE_META: EventTypeMeta = EventTypeMeta {
+pub static FILE_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_FILE,
     type_name: "file",
     projection_table: "files",
     share_scope: ShareScope::Shared,
-    dep_fields: &["message_id", "key_event_id", "signed_by"],
-    dep_field_type_codes: &[&[1], &[6], &[]],
+    dep_fields: &["message_id", "key_event_id"],
+    dep_field_type_codes: &[&[1], &[6]],
     signer_required: true,
-    signature_byte_len: 64,
+    signature_byte_len: 0,
     encryptable: true,
     parse: parse_file,
     encode: encode_file,
@@ -230,7 +204,7 @@ mod layout_tests {
     use super::*;
     #[test]
     fn offsets_consistent() {
-        assert_eq!(file_offsets::SIGNATURE + 64, FILE_WIRE_SIZE);
+        assert_eq!(file_offsets::MIME_TYPE + FILE_MIME_BYTES, FILE_WIRE_SIZE);
     }
     #[test]
     fn offsets_match_field_spec() {

@@ -39,11 +39,14 @@ fn test_encrypted_message_valid() {
     // Create identity chain for signing the inner message
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
 
-    // Create signed inner message
-    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "encrypted hello");
-
-    // Encrypt it
-    let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+    let msg = ParsedEvent::Message(MessageEvent {
+        created_at_ms: now_ms(),
+        workspace_id: [1u8; 32],
+        author_id: user_for_signer(&signer_eid),
+        content: "encrypted hello".to_string(),
+    });
+    let enc_blob =
+        make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &msg, &key_bytes, &sk_eid);
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
@@ -75,8 +78,14 @@ fn test_encrypted_blocks_on_missing_key() {
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
 
     // Create encrypted event referencing the missing key
-    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "blocked encrypted");
-    let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+    let msg = ParsedEvent::Message(MessageEvent {
+        created_at_ms: now_ms(),
+        workspace_id: [1u8; 32],
+        author_id: user_for_signer(&signer_eid),
+        content: "blocked encrypted".to_string(),
+    });
+    let enc_blob =
+        make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &msg, &key_bytes, &sk_eid);
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
@@ -104,8 +113,14 @@ fn test_encrypted_unblocks_when_key_arrives() {
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
 
     // Insert encrypted event first (before key)
-    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "out of order encrypted");
-    let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+    let msg = ParsedEvent::Message(MessageEvent {
+        created_at_ms: now_ms(),
+        workspace_id: [1u8; 32],
+        author_id: user_for_signer(&signer_eid),
+        content: "out of order encrypted".to_string(),
+    });
+    let enc_blob =
+        make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &msg, &key_bytes, &sk_eid);
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
     // Project → Block
@@ -158,8 +173,14 @@ fn test_encrypted_wrong_key_rejects() {
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
 
     // Encrypt with key A but reference key B
-    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "wrong key test");
-    let (_enc, enc_blob) = make_encrypted_event(&key_a, &msg_blob, EVENT_TYPE_MESSAGE, &sk_b_eid);
+    let msg = ParsedEvent::Message(MessageEvent {
+        created_at_ms: now_ms(),
+        workspace_id: [1u8; 32],
+        author_id: user_for_signer(&signer_eid),
+        content: "wrong key test".to_string(),
+    });
+    let enc_blob =
+        make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &msg, &key_a, &sk_b_eid);
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
@@ -234,7 +255,8 @@ fn test_encrypted_nested_rejects() {
     // inner_type_code=5 (encrypted) is now rejected at parser level
     // (encrypted_inner_wire_size returns None). Construct raw blob manually.
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
-    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "nested inner");
+    let msg = raw_message_event(&signer_eid, "nested inner");
+    let msg_blob = events::encode_event(&msg).unwrap();
     let (_inner_enc, inner_enc_blob) =
         make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
 
@@ -277,9 +299,9 @@ fn test_encrypted_inner_dep_blocks() {
 
     // Create encrypted reaction with missing target
     let fake_target = [88u8; 32];
-    let (_rxn, rxn_blob) =
-        make_reaction_signed(&signing_key, &signer_eid, &fake_target, "\u{1f44d}");
-    let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &rxn_blob, 2, &sk_eid);
+    let rxn = raw_reaction_event(&signer_eid, &fake_target, "\u{1f44d}");
+    let enc_blob =
+        make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &rxn, &key_bytes, &sk_eid);
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
@@ -318,14 +340,15 @@ fn test_encrypted_inner_dep_unblocks() {
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
 
     // Create target message (pre-compute but don't insert yet)
-    let (_msg, msg_blob) =
-        make_message_signed(&signing_key, &signer_eid, "target for encrypted rxn");
+    let msg = raw_message_event(&signer_eid, "target for encrypted rxn");
+    let msg_blob =
+        make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &msg, &key_bytes, &sk_eid);
     let msg_eid = canonical_test_event_id(&conn, recorded_by, &msg_blob);
 
     // Create encrypted reaction targeting the message
-    let (_rxn, rxn_blob) =
-        make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "\u{2764}\u{fe0f}");
-    let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &rxn_blob, 2, &sk_eid);
+    let rxn = raw_reaction_event(&signer_eid, &msg_eid, "\u{2764}\u{fe0f}");
+    let enc_blob =
+        make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &rxn, &key_bytes, &sk_eid);
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
     // Project → Block on inner dep (message)
@@ -369,8 +392,9 @@ fn test_encrypted_rejection_recorded_durably() {
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
 
     // Encrypt with key A, reference key B → decryption fails
-    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "will be rejected");
-    let (_enc, enc_blob) = make_encrypted_event(&key_a, &msg_blob, EVENT_TYPE_MESSAGE, &sk_b_eid);
+    let msg = raw_message_event(&signer_eid, "will be rejected");
+    let enc_blob =
+        make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &msg, &key_a, &sk_b_eid);
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
@@ -406,9 +430,9 @@ fn test_encrypted_cross_tenant_isolation() {
     let (signer_eid, signing_key) = make_identity_chain(&conn, tenant_a);
 
     // Create encrypted message referencing that key
-    let (_msg, msg_blob) =
-        make_message_signed(&signing_key, &signer_eid, "tenant-scoped encryption");
-    let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+    let msg = raw_message_event(&signer_eid, "tenant-scoped encryption");
+    let enc_blob =
+        make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &msg, &key_bytes, &sk_eid);
     let enc_eid = insert_event_raw(&conn, tenant_a, &enc_blob);
 
     // Project for tenant_a → Valid
@@ -419,12 +443,13 @@ fn test_encrypted_cross_tenant_isolation() {
     insert_recorded_event(&conn, tenant_b, &enc_eid, now_ms() as i64, "test").unwrap();
     insert_recorded_event(&conn, tenant_b, &sk_eid, now_ms() as i64, "test").unwrap();
 
-    // Project encrypted event for tenant_b → Block (key not valid for B)
+    // Project encrypted event for tenant_b → Block on missing outer signer
+    // before it can even reach the encrypted wrapper key dependency.
     let r_b = project_one(&conn, tenant_b, &enc_eid).unwrap();
     match r_b {
         ProjectionDecision::Block { missing } => {
             assert_eq!(missing.len(), 1);
-            assert_eq!(missing[0], sk_eid);
+            assert_eq!(missing[0], signer_eid);
         }
         other => panic!("expected Block for tenant_b, got {:?}", other),
     }
@@ -451,6 +476,50 @@ fn setup_encryption_ctx(
     (signer_eid, signing_key, key_bytes, sk_eid)
 }
 
+fn raw_message_event(signer_eid: &EventId, content: &str) -> ParsedEvent {
+    ParsedEvent::Message(MessageEvent {
+        created_at_ms: now_ms(),
+        workspace_id: [1u8; 32],
+        author_id: user_for_signer(signer_eid),
+        content: content.to_string(),
+    })
+}
+
+fn raw_reaction_event(signer_eid: &EventId, target: &EventId, emoji: &str) -> ParsedEvent {
+    ParsedEvent::Reaction(ReactionEvent {
+        created_at_ms: now_ms(),
+        target_event_id: *target,
+        author_id: user_for_signer(signer_eid),
+        emoji: emoji.to_string(),
+    })
+}
+
+fn raw_deletion_event(signer_eid: &EventId, target: &EventId, author_id: [u8; 32]) -> ParsedEvent {
+    let resolved_author_id = if author_id == [2u8; 32] {
+        user_for_signer(signer_eid)
+    } else {
+        author_id
+    };
+    ParsedEvent::MessageDeletion(MessageDeletionEvent {
+        created_at_ms: now_ms(),
+        target_event_id: *target,
+        author_id: resolved_author_id,
+    })
+}
+
+fn raw_file_slice_event(
+    file_id: [u8; 32],
+    slice_number: u32,
+    _ciphertext_seed: &[u8],
+) -> ParsedEvent {
+    ParsedEvent::FileSlice(FileSliceEvent {
+        created_at_ms: now_ms(),
+        file_id,
+        slice_number,
+        ciphertext: make_valid_file_slice_ciphertext(file_id, slice_number, 204800, 65536),
+    })
+}
+
 // --- Message parity ---
 
 #[test]
@@ -470,9 +539,9 @@ fn test_encrypted_parity_message_projected_state() {
     assert_eq!(r_direct, ProjectionDecision::Valid);
 
     // Encrypted message with same content
-    let (_msg2, msg2_blob) = make_message_signed(&signing_key, &signer_eid, "encrypted hello");
-    let (_enc, enc_blob) =
-        make_encrypted_event(&key_bytes, &msg2_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+    let msg2 = raw_message_event(&signer_eid, "encrypted hello");
+    let enc_blob =
+        make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &msg2, &key_bytes, &sk_eid);
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
     let r_enc = project_one(&conn, recorded_by, &enc_eid).unwrap();
     assert_eq!(r_enc, ProjectionDecision::Valid);
@@ -548,10 +617,9 @@ fn test_encrypted_parity_reaction_projected_state() {
     assert_eq!(r_direct, ProjectionDecision::Valid);
 
     // Encrypted reaction
-    let (_rxn2, rxn2_blob) =
-        make_reaction_signed(&signing_key, &signer_eid, &msg_eid, "\u{2764}\u{fe0f}");
-    let (_enc, enc_blob) =
-        make_encrypted_event(&key_bytes, &rxn2_blob, EVENT_TYPE_REACTION, &sk_eid);
+    let rxn2 = raw_reaction_event(&signer_eid, &msg_eid, "\u{2764}\u{fe0f}");
+    let enc_blob =
+        make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &rxn2, &key_bytes, &sk_eid);
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
     let r_enc = project_one(&conn, recorded_by, &enc_eid).unwrap();
     assert_eq!(r_enc, ProjectionDecision::Valid);
@@ -597,17 +665,16 @@ fn test_encrypted_parity_deletion_valid() {
     let (signer_eid, signing_key, key_bytes, sk_eid) = setup_encryption_ctx(&conn, recorded_by);
 
     // Create and project a message (will be deleted by encrypted deletion)
-    let (_msg, msg_blob) =
-        make_message_signed(&signing_key, &signer_eid, "to be deleted via encrypted");
+    let msg = raw_message_event(&signer_eid, "to be deleted via encrypted");
+    let msg_blob =
+        make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &msg, &key_bytes, &sk_eid);
     let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
     project_one(&conn, recorded_by, &msg_eid).unwrap();
 
     // Create deletion event (author_id = [2;32] matches message author)
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
-
-    // Encrypt the deletion
-    let (_enc, enc_blob) =
-        make_encrypted_event(&key_bytes, &del_blob, EVENT_TYPE_MESSAGE_DELETION, &sk_eid);
+    let del = raw_deletion_event(&signer_eid, &msg_eid, [2u8; 32]);
+    let enc_blob =
+        make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &del, &key_bytes, &sk_eid);
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
     assert_eq!(result, ProjectionDecision::Valid);
@@ -656,9 +723,9 @@ fn test_encrypted_parity_deletion_intent_only() {
 
     // Create deletion targeting a non-existent message
     let fake_target = [77u8; 32];
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &fake_target, [2u8; 32]);
-    let (_enc, enc_blob) =
-        make_encrypted_event(&key_bytes, &del_blob, EVENT_TYPE_MESSAGE_DELETION, &sk_eid);
+    let del = raw_deletion_event(&signer_eid, &fake_target, [2u8; 32]);
+    let enc_blob =
+        make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &del, &key_bytes, &sk_eid);
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
 
@@ -712,15 +779,9 @@ fn test_encrypted_parity_file_slice_valid() {
     );
 
     // Create and encrypt file_slice
-    let (_fs, fs_blob) = make_file_slice(
-        &signing_key,
-        &signer_eid,
-        file_id,
-        0,
-        b"encrypted slice data",
-    );
-    let (_enc, enc_blob) =
-        make_encrypted_event(&key_bytes, &fs_blob, EVENT_TYPE_FILE_SLICE, &sk_eid);
+    let fs = raw_file_slice_event(file_id, 0, b"encrypted slice data");
+    let enc_blob =
+        make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &fs, &key_bytes, &sk_eid);
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
     assert_eq!(result, ProjectionDecision::Valid);
@@ -755,8 +816,7 @@ fn test_encrypted_file_slice_rejects_wrapper_key_mismatch() {
     let conn = setup();
     let recorded_by = "peer1";
     let _ws = setup_workspace_event(&conn, recorded_by);
-    let (signer_eid, signing_key, _key_a_bytes, sk_a_eid) =
-        setup_encryption_ctx(&conn, recorded_by);
+    let (signer_eid, signing_key, key_a_bytes, sk_a_eid) = setup_encryption_ctx(&conn, recorded_by);
 
     let key_b_bytes: [u8; 32] = rand::random();
     let (_sk_b, sk_b_blob) = make_key_secret(key_b_bytes);
@@ -766,7 +826,14 @@ fn test_encrypted_file_slice_rejects_wrapper_key_mismatch() {
         ProjectionDecision::Valid
     );
 
-    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "parent for mismatch");
+    let msg = raw_message_event(&signer_eid, "parent for mismatch");
+    let msg_blob = make_signed_encrypted_blob_with_key(
+        &signing_key,
+        &signer_eid,
+        &msg,
+        &test_content_key_bytes(),
+        &test_content_key_event_id(),
+    );
     let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
     assert_eq!(
         project_one(&conn, recorded_by, &msg_eid).unwrap(),
@@ -785,21 +852,28 @@ fn test_encrypted_file_slice_rejects_wrapper_key_mismatch() {
         key_event_id: sk_a_eid,
         filename: "mismatch.bin".to_string(),
         mime_type: "application/octet-stream".to_string(),
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     };
-    let mut file_blob = events::encode_event(&ParsedEvent::File(file)).unwrap();
-    sign_blob(&signing_key, &mut file_blob);
+    let file_blob = make_signed_encrypted_blob_with_key(
+        &signing_key,
+        &signer_eid,
+        &ParsedEvent::File(file),
+        &key_a_bytes,
+        &sk_a_eid,
+    );
     let file_eid = insert_event_raw(&conn, recorded_by, &file_blob);
     assert_eq!(
         project_one(&conn, recorded_by, &file_eid).unwrap(),
         ProjectionDecision::Valid
     );
 
-    let (_fs, fs_blob) = make_file_slice(&signing_key, &signer_eid, file_id, 0, b"wrong key");
-    let (_enc, enc_blob) =
-        make_encrypted_event(&key_b_bytes, &fs_blob, EVENT_TYPE_FILE_SLICE, &sk_b_eid);
+    let fs = raw_file_slice_event(file_id, 0, b"wrong key");
+    let enc_blob = make_signed_encrypted_blob_with_key(
+        &signing_key,
+        &signer_eid,
+        &fs,
+        &key_b_bytes,
+        &sk_b_eid,
+    );
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
     match project_one(&conn, recorded_by, &enc_eid).unwrap() {
@@ -838,9 +912,9 @@ fn test_encrypted_parity_file_slice_guard_blocks() {
 
     // No descriptor — file_slice should guard-block
     let file_id = [88u8; 32];
-    let (_fs, fs_blob) = make_file_slice(&signing_key, &signer_eid, file_id, 0, b"no descriptor");
-    let (_enc, enc_blob) =
-        make_encrypted_event(&key_bytes, &fs_blob, EVENT_TYPE_FILE_SLICE, &sk_eid);
+    let fs = raw_file_slice_event(file_id, 0, b"no descriptor");
+    let enc_blob =
+        make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &fs, &key_bytes, &sk_eid);
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
 
@@ -870,9 +944,8 @@ fn test_encrypted_parity_file_slice_guard_blocks() {
 
 #[test]
 fn test_encrypted_inner_signer_dep_missing_blocks() {
-    // Encrypted message where the inner event references a signer that
-    // doesn't exist. Should reject (not block) since signer resolution
-    // fails after deps are satisfied.
+    // Encrypted message whose signed envelope references a signer event that
+    // doesn't exist. The wrapper should block on the missing signer dep.
     let conn = setup();
     let recorded_by = "peer1";
     let _ws = setup_workspace_event(&conn, recorded_by);
@@ -883,26 +956,24 @@ fn test_encrypted_inner_signer_dep_missing_blocks() {
     let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
     project_one(&conn, recorded_by, &sk_eid).unwrap();
 
-    // Create message signed with a key whose signer event doesn't exist
-    // in valid_events (using a fabricated signer_eid)
+    // Create a signed encrypted message whose signer event doesn't exist in
+    // valid_events (using a fabricated signer_eid).
     let mut rng = rand::thread_rng();
     let orphan_key = SigningKey::generate(&mut rng);
     let fake_signer_eid = [0xDD; 32];
-    let msg = MessageEvent {
+    let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: now_ms(),
         workspace_id: [1u8; 32],
-        author_id: [2u8; 32],
+        author_id: [0xEE; 32],
         content: "orphan signer".to_string(),
-        signed_by: fake_signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
-    };
-    let event = ParsedEvent::Message(msg);
-    let mut msg_blob = events::encode_event(&event).unwrap();
-    sign_blob(&orphan_key, &mut msg_blob);
-
-    // Encrypt it
-    let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+    });
+    let enc_blob = make_signed_encrypted_blob_with_key(
+        &orphan_key,
+        &fake_signer_eid,
+        &msg,
+        &key_bytes,
+        &sk_eid,
+    );
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
     // The inner message deps include signer_eid as a dep. Since that dep
@@ -945,20 +1016,9 @@ fn test_encrypted_inner_invalid_signature_rejects() {
     // Create message but sign with a DIFFERENT key
     let mut rng = rand::thread_rng();
     let wrong_key = SigningKey::generate(&mut rng);
-    let msg = MessageEvent {
-        created_at_ms: now_ms(),
-        workspace_id: [1u8; 32],
-        author_id: user_for_signer(&signer_eid),
-        content: "bad sig".to_string(),
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
-    };
-    let event = ParsedEvent::Message(msg);
-    let mut msg_blob = events::encode_event(&event).unwrap();
-    sign_blob(&wrong_key, &mut msg_blob);
-
-    let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+    let msg = raw_message_event(&signer_eid, "bad sig");
+    let enc_blob =
+        make_signed_encrypted_blob_with_key(&wrong_key, &signer_eid, &msg, &key_bytes, &sk_eid);
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
 
@@ -994,21 +1054,35 @@ fn test_encrypted_inner_unsupported_signer_type_rejects_durably() {
     let conn = setup();
     let recorded_by = "peer1";
     let _ws = setup_workspace_event(&conn, recorded_by);
-    let (signer_eid, _signing_key, key_bytes, sk_eid) = setup_encryption_ctx(&conn, recorded_by);
+    let (_, _, key_bytes, sk_eid) = setup_encryption_ctx(&conn, recorded_by);
 
-    let msg = MessageEvent {
+    let mut rng = rand::thread_rng();
+    let unsupported_signer = ParsedEvent::BenchDep(BenchDepEvent {
+        created_at_ms: now_ms(),
+        dep_ids: Vec::new(),
+        payload: [0u8; 16],
+    });
+    let unsupported_signer_blob = events::encode_event(&unsupported_signer).unwrap();
+    let unsupported_signer_eid = insert_event_raw(&conn, recorded_by, &unsupported_signer_blob);
+    assert_eq!(
+        project_one(&conn, recorded_by, &unsupported_signer_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let msg = ParsedEvent::Message(MessageEvent {
         created_at_ms: now_ms(),
         workspace_id: [1u8; 32],
-        author_id: user_for_signer(&signer_eid),
+        author_id: [0xCC; 32],
         content: "bad signer type".to_string(),
-        signed_by: signer_eid,
-        signer_type: 255,
-        signature: [0u8; 64],
-    };
-    let event = ParsedEvent::Message(msg);
-    let msg_blob = events::encode_event(&event).unwrap();
-
-    let (_enc, enc_blob) = make_encrypted_event(&key_bytes, &msg_blob, EVENT_TYPE_MESSAGE, &sk_eid);
+    });
+    let unsupported_key = SigningKey::generate(&mut rng);
+    let enc_blob = make_signed_encrypted_blob_with_key(
+        &unsupported_key,
+        &unsupported_signer_eid,
+        &msg,
+        &key_bytes,
+        &sk_eid,
+    );
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
 
@@ -1016,7 +1090,9 @@ fn test_encrypted_inner_unsupported_signer_type_rejects_durably() {
         ProjectionDecision::Reject { reason } => {
             assert!(
                 reason.contains("unsupported signer_type")
-                    || reason.contains("signer resolution failed"),
+                    || reason.contains("signer resolution failed")
+                    || reason.contains("dep signer_event_id has semantic type code")
+                    || reason.contains("dep signed_by has semantic type code"),
                 "unexpected rejection reason: {reason}"
             );
         }
@@ -1047,23 +1123,15 @@ fn test_encrypted_identity_event_rejects() {
     let recorded_by = "peer1";
     let key_bytes: [u8; 32] = rand::random();
 
-    let (_sk, sk_blob) = make_key_secret(key_bytes);
-    let sk_eid = insert_event_raw(&conn, recorded_by, &sk_blob);
-    project_one(&conn, recorded_by, &sk_eid).unwrap();
+    let (signer_eid, signing_key, key_bytes, sk_eid) = setup_encryption_ctx(&conn, recorded_by);
 
-    // Create a workspace event and encrypt it
     let ws = ParsedEvent::Workspace(WorkspaceEvent {
         created_at_ms: now_ms(),
         public_key: [0xBB; 32],
         name: "workspace".to_string(),
     });
-    let ws_blob = events::encode_event(&ws).unwrap();
-    let (_enc, enc_blob) = make_encrypted_event(
-        &key_bytes,
-        &ws_blob,
-        crate::event_modules::EVENT_TYPE_WORKSPACE,
-        &sk_eid,
-    );
+    let enc_blob =
+        make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &ws, &key_bytes, &sk_eid);
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
 

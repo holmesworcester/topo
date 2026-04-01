@@ -63,12 +63,8 @@ pub fn verify_slice(
     slice_len: u64,
 ) -> io::Result<Vec<u8>> {
     let hash = bao::Hash::from(*root_hash);
-    let mut decoder = bao::decode::SliceDecoder::new(
-        Cursor::new(proof),
-        &hash,
-        slice_start,
-        slice_len,
-    );
+    let mut decoder =
+        bao::decode::SliceDecoder::new(Cursor::new(proof), &hash, slice_start, slice_len);
     let mut output = Vec::new();
     decoder.read_to_end(&mut output)?;
     Ok(output)
@@ -131,7 +127,9 @@ mod tests {
 
     #[test]
     fn measure_proof_overhead() {
-        use crate::event_modules::file_slice::wire::{BAO_PLAINTEXT_CAPACITY, FILE_SLICE_CIPHERTEXT_BYTES};
+        use crate::event_modules::file_slice::wire::{
+            BAO_PLAINTEXT_CAPACITY, FILE_SLICE_CIPHERTEXT_BYTES,
+        };
 
         // Test with various file sizes to measure overhead scaling
         for file_size in [1_000_000usize, 10_000_000, 100_000_000] {
@@ -145,9 +143,17 @@ mod tests {
             let fits = proof.len() <= FILE_SLICE_CIPHERTEXT_BYTES - 4;
             eprintln!(
                 "  file={:.0}MB chunk={} proof={} overhead={} fits={}",
-                file_size as f64 / 1e6, chunk, proof.len(), overhead, fits
+                file_size as f64 / 1e6,
+                chunk,
+                proof.len(),
+                overhead,
+                fits
             );
-            assert!(fits, "bao encoding must fit in payload field for {}MB file", file_size / 1_000_000);
+            assert!(
+                fits,
+                "bao encoding must fit in payload field for {}MB file",
+                file_size / 1_000_000
+            );
         }
     }
 
@@ -168,13 +174,9 @@ mod tests {
             let data_start = i * eff_cap;
             let bytes_this = (file_size - data_start).min(eff_cap);
             // Extract bao slice encoding (contains data + tree nodes)
-            let encoding = extract_slice_proof(
-                &file_data,
-                &outboard,
-                data_start as u64,
-                bytes_this as u64,
-            )
-            .unwrap();
+            let encoding =
+                extract_slice_proof(&file_data, &outboard, data_start as u64, bytes_this as u64)
+                    .unwrap();
             let plaintext = &file_data[data_start..data_start + bytes_this];
 
             // Pack into fixed-size field
@@ -184,18 +186,9 @@ mod tests {
             // Unpack and verify (mirrors the projector + save path)
             let (enc_out, _) = unpack_bao_payload(&packed);
             assert!(!enc_out.is_empty(), "slice {} should have bao encoding", i);
-            let verified = verify_slice(
-                &root_hash,
-                &enc_out,
-                data_start as u64,
-                bytes_this as u64,
-            )
-            .unwrap();
-            assert_eq!(
-                &verified, plaintext,
-                "slice {} verified data mismatch",
-                i
-            );
+            let verified =
+                verify_slice(&root_hash, &enc_out, data_start as u64, bytes_this as u64).unwrap();
+            assert_eq!(&verified, plaintext, "slice {} verified data mismatch", i);
         }
     }
 

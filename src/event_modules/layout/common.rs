@@ -248,24 +248,24 @@ mod tests {
         use super::super::super::user_invite_shared::USER_INVITE_WIRE_SIZE;
         use super::super::super::workspace::WORKSPACE_WIRE_SIZE;
 
-        assert_eq!(MESSAGE_WIRE_SIZE, 1194);
-        assert_eq!(REACTION_WIRE_SIZE, 234);
-        assert_eq!(FILE_WIRE_SIZE, 633);
-        assert_eq!(FILE_SLICE_WIRE_SIZE, 262286);
+        assert_eq!(MESSAGE_WIRE_SIZE, 1097);
+        assert_eq!(REACTION_WIRE_SIZE, 137);
+        assert_eq!(FILE_WIRE_SIZE, 536);
+        assert_eq!(FILE_SLICE_WIRE_SIZE, 262189);
         assert_eq!(BENCH_DEP_WIRE_SIZE, 345);
         assert_eq!(WORKSPACE_WIRE_SIZE, 105);
-        assert_eq!(USER_WIRE_SIZE, 202);
-        assert_eq!(PEER_SHARED_WIRE_SIZE, 266);
+        assert_eq!(USER_WIRE_SIZE, 105);
+        assert_eq!(PEER_SHARED_WIRE_SIZE, 169);
         assert_eq!(KEY_SECRET_WIRE_SIZE, 41);
-        assert_eq!(MESSAGE_DELETION_WIRE_SIZE, 170);
+        assert_eq!(MESSAGE_DELETION_WIRE_SIZE, 73);
         assert_eq!(INVITE_ACCEPTED_WIRE_SIZE, 105);
-        assert_eq!(USER_INVITE_WIRE_SIZE, 202);
-        assert_eq!(DEVICE_INVITE_WIRE_SIZE, 170);
-        assert_eq!(ADMIN_WIRE_SIZE, 170);
+        assert_eq!(USER_INVITE_WIRE_SIZE, 105);
+        assert_eq!(DEVICE_INVITE_WIRE_SIZE, 73);
+        assert_eq!(ADMIN_WIRE_SIZE, 73);
         assert_eq!(TENANT_WIRE_SIZE, 41);
-        assert_eq!(KEY_SHARED_WIRE_SIZE, 427);
+        assert_eq!(KEY_SHARED_WIRE_SIZE, 330);
         assert_eq!(INVITE_SECRET_WIRE_SIZE, 73);
-        assert_eq!(KEY_REQUEST_WIRE_SIZE, 298);
+        assert_eq!(KEY_REQUEST_WIRE_SIZE, 201);
         assert_eq!(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE, 138);
     }
 
@@ -300,7 +300,7 @@ mod tests {
     fn test_encrypted_wire_size_message() {
         use super::super::super::message::wire::MESSAGE_WIRE_SIZE;
         use super::super::super::reaction::REACTION_WIRE_SIZE;
-        assert_eq!(encrypted_wire_size(MESSAGE_WIRE_SIZE), 1264);
-        assert_eq!(encrypted_wire_size(REACTION_WIRE_SIZE), 304);
+        assert_eq!(encrypted_wire_size(MESSAGE_WIRE_SIZE), 1167);
+        assert_eq!(encrypted_wire_size(REACTION_WIRE_SIZE), 207);
     }
 }

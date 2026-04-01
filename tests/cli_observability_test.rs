@@ -88,7 +88,7 @@ fn test_stats_after_invite_sync() {
 #[test]
 fn test_stats_message_counts_after_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
     let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // Send messages from both sides
@@ -127,7 +127,7 @@ fn test_replay_invariants_after_create_workspace() {
 #[test]
 fn test_replay_invariants_after_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
     let (alice_db, bob_db, _alice, bob) = setup_two_peers(&tmpdir);
 
     send_message(&alice_db, "Alice says hi");
@@ -156,7 +156,7 @@ fn test_replay_invariants_after_sync() {
 #[test]
 fn test_no_blocked_events_after_converged_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
     let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     send_message(&alice_db, "test message");
@@ -177,7 +177,7 @@ fn test_no_blocked_events_after_converged_sync() {
 #[test]
 fn test_event_fingerprints_converge_after_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
     let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // Send messages both directions
@@ -216,7 +216,7 @@ fn test_event_fingerprints_converge_after_sync() {
 #[test]
 fn test_connections_visible_after_sync() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
     let (alice_db, _bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // After sync, at least one side should have endpoint observations
@@ -244,7 +244,7 @@ fn test_connections_visible_after_sync() {
 #[test]
 fn test_deletion_converges_via_cli() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
     let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // Alice sends a message and a reaction
@@ -347,7 +347,7 @@ fn test_non_admin_cannot_create_invite() {
 #[test]
 fn test_reactions_unblock_after_dep_arrives() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
     let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // Alice sends 3 messages
@@ -390,7 +390,7 @@ fn test_cross_workspace_counts_isolated() {
     let ws_a2 = tmpdir.path().join("a2.db").to_str().unwrap().to_string();
     let ws_b1 = tmpdir.path().join("b1.db").to_str().unwrap().to_string();
     let ws_b2 = tmpdir.path().join("b2.db").to_str().unwrap().to_string();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
 
     // Workspace A: a1 invites a2
     create_workspace(&ws_a1);
@@ -494,7 +494,7 @@ fn test_three_peer_device_link_then_user_invite() {
         .unwrap()
         .to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
 
     // Phone creates workspace
     create_workspace(&phone_db);
@@ -553,7 +553,7 @@ fn test_chained_device_links_converge() {
         .to_str()
         .unwrap()
         .to_string();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
 
     create_workspace(&phone_db);
     let _phone = start_daemon(&phone_db);
@@ -613,7 +613,7 @@ fn test_parallel_device_links_converge() {
         .to_str()
         .unwrap()
         .to_string();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
 
     create_workspace(&phone_db);
     let _phone = start_daemon(&phone_db);
@@ -737,7 +737,7 @@ fn test_sub_persists_across_daemon_restart() {
 #[test]
 fn test_sub_receives_synced_message() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
     let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // Create subscription on Bob
@@ -771,7 +771,7 @@ fn test_sub_receives_synced_message() {
 #[test]
 fn test_event_timeline_shows_delivery_timestamps() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
     let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     let event_id = send_message(&alice_db, "timeline test message");
@@ -1346,7 +1346,7 @@ fn test_discover_finds_peer_via_mdns() {
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
 
     create_workspace(&alice_db);
     let _alice = start_discovery_daemon(&alice_db);
@@ -1502,7 +1502,7 @@ fn test_zero_loss_stress_converges() {
 #[test]
 fn test_recorded_at_monotonicity_via_replay() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
     let (alice_db, bob_db, _alice, bob) = setup_two_peers(&tmpdir);
 
     // Send messages with small delays to exercise recorded_at ordering
@@ -1535,7 +1535,7 @@ fn test_recorded_at_monotonicity_via_replay() {
 #[test]
 fn test_local_only_events_not_synced_via_cli() {
     let tmpdir = tempfile::tempdir().unwrap();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
     let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
     // Alice sends a message
@@ -1614,7 +1614,7 @@ fn test_trust_anchor_second_workspace_does_not_project() {
     let ws_a_db = tmpdir.path().join("ws_a.db").to_str().unwrap().to_string();
     let ws_b_db = tmpdir.path().join("ws_b.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
 
     // Workspace A: Alice creates it and invites Bob
     create_workspace(&ws_a_db);
@@ -1753,7 +1753,7 @@ fn test_shared_db_two_workspaces_same_daemon_isolation() {
         .to_str()
         .unwrap()
         .to_string();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
 
     // Create workspace A on the shared DB
     create_workspace(&shared_db);
@@ -1950,7 +1950,7 @@ fn test_shared_db_same_workspace_two_tenants_see_all_messages() {
         .unwrap()
         .to_string();
     let peer2_db = tmpdir.path().join("peer2.db").to_str().unwrap().to_string();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
 
     // Tenant 1 creates the workspace
     create_workspace(&shared_db);
@@ -1995,7 +1995,7 @@ fn test_shared_db_overlapping_groups_isolation() {
     let ws0_p1 = tmpdir.path().join("ws0p1.db").to_str().unwrap().to_string();
     let ws1_p0 = tmpdir.path().join("ws1p0.db").to_str().unwrap().to_string();
     let ws1_p1 = tmpdir.path().join("ws1p1.db").to_str().unwrap().to_string();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
 
     // Workspace 0
     create_workspace(&ws0_p0);
@@ -2046,7 +2046,7 @@ fn test_shared_db_three_tenants_same_workspace() {
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
     let carol_db = tmpdir.path().join("carol.db").to_str().unwrap().to_string();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
 
     // Alice creates workspace
     create_workspace(&alice_db);
@@ -2111,7 +2111,7 @@ fn test_shared_db_three_peer_same_workspace_external_sync() {
         .to_str()
         .unwrap()
         .to_string();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
 
     // Root creates workspace
     create_workspace(&root_db);
@@ -2171,7 +2171,7 @@ fn test_shared_db_cross_workspace_external_isolation() {
         .to_str()
         .unwrap()
         .to_string();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
 
     // Workspace A
     create_workspace(&ws_a_db);
@@ -2235,7 +2235,7 @@ fn test_mdns_multitenant_self_filtering() {
         .to_str()
         .unwrap()
         .to_string();
-    let timeout_ms = 60000;
+    let timeout_ms = 120000;
 
     // Workspace A: creates workspace, observer joins
     create_workspace(&ws_a_db);

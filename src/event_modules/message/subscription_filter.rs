@@ -97,9 +97,6 @@ mod tests {
             workspace_id: workspace,
             author_id: author,
             content: "hello".to_string(),
-            signed_by: [3u8; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
         })
     }
 

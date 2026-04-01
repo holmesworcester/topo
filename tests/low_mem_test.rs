@@ -419,7 +419,11 @@ fn run_lowmem_delta_sync(label: &str, baseline_events: usize, delta_events: usiz
     request_sync_all(&alice_db, Duration::from_secs(60));
     request_sync_all(&bob_db, Duration::from_secs(60));
     let expected_total = (baseline_events + delta_events) as i64;
-    wait_for_message_count(&alice_db, expected_total, timeout_for_events(delta_events, 120));
+    wait_for_message_count(
+        &alice_db,
+        expected_total,
+        timeout_for_events(delta_events, 120),
+    );
     // Bob should reach expected total: baseline was already synced, only the
     // delta needs to arrive over the lowmem window.
     let delta_timeout = timeout_for_events(delta_events, 300);

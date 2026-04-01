@@ -196,7 +196,6 @@ mod tests {
             encode_event, EncryptedEvent, MessageEvent, ParsedEvent, EVENT_TYPE_MESSAGE,
         };
         use crate::projection::encrypted::encrypt_event_blob;
-        use crate::projection::signer::sign_event_bytes;
         use crate::testutil::SharedDbNode;
 
         let mut node = SharedDbNode::new(2);
@@ -214,17 +213,8 @@ mod tests {
             workspace_id: origin.workspace_id,
             author_id: origin.author_id,
             content: "fanout-from-ingest".to_string(),
-            signed_by: origin.peer_shared_event_id.unwrap(),
-            signer_type: 5,
-            signature: [0u8; 64],
         });
-        let mut blob = encode_event(&msg).unwrap();
-        let sig = sign_event_bytes(
-            origin.peer_shared_signing_key.as_ref().unwrap(),
-            &blob[..blob.len() - 64],
-        );
-        let blob_len = blob.len();
-        blob[blob_len - 64..].copy_from_slice(&sig);
+        let inner_blob = crate::event_modules::encode_event(&msg).unwrap();
 
         let key_event_id =
             crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
@@ -245,7 +235,7 @@ mod tests {
             .unwrap();
         let mut key_arr = [0u8; 32];
         key_arr.copy_from_slice(&key_bytes);
-        let (nonce, ciphertext, auth_tag) = encrypt_event_blob(&key_arr, &blob).unwrap();
+        let (nonce, ciphertext, auth_tag) = encrypt_event_blob(&key_arr, &inner_blob).unwrap();
         let wrapper = ParsedEvent::Encrypted(EncryptedEvent {
             created_at_ms: 42,
             key_event_id,
@@ -254,7 +244,12 @@ mod tests {
             ciphertext,
             auth_tag,
         });
-        let blob = encode_event(&wrapper).unwrap();
+        let blob = crate::projection::create::encode_signed_wrapper_blob(
+            &wrapper,
+            &origin.peer_shared_event_id.unwrap(),
+            origin.peer_shared_signing_key.as_ref().unwrap(),
+        )
+        .unwrap();
         let event_id = hash_event(&blob);
         let event_id_b64 = event_id_to_base64(&event_id);
 

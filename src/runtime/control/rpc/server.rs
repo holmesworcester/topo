@@ -736,10 +736,17 @@ fn dispatch(
         RpcMethod::SendFile {
             content,
             file_path,
+            add_bad_slices,
             client_op_id,
         } => match state.require_active_peer() {
             Ok(peer_id) => {
-                match message::send_file_for_peer(db_path, &peer_id, &content, &file_path) {
+                match message::send_file_for_peer(
+                    db_path,
+                    &peer_id,
+                    &content,
+                    &file_path,
+                    add_bad_slices,
+                ) {
                     Ok(data) => {
                         store_client_op(
                             db_path,
@@ -1050,11 +1057,7 @@ fn dispatch(
                     }
                     None => vec![],
                 };
-                let relay_url = if explicit_addrs.is_empty() {
-                    runtime_relay_url_for_bootstrap(state)
-                } else {
-                    None
-                };
+                let relay_url = runtime_relay_url_for_bootstrap(state);
                 let result: Result<
                     workspace::commands::CreateInviteResponse,
                     Box<dyn std::error::Error + Send + Sync>,
@@ -1115,11 +1118,7 @@ fn dispatch(
                         }
                         None => vec![],
                     };
-                    let relay_url = if explicit_addrs.is_empty() {
-                        runtime_relay_url_for_bootstrap(state)
-                    } else {
-                        None
-                    };
+                    let relay_url = runtime_relay_url_for_bootstrap(state);
                     match workspace::commands::create_device_link_for_peer(
                         db_path,
                         &peer_id,

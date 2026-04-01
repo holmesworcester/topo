@@ -11,11 +11,13 @@ pub mod fixtures {
         UserInviteEvent, WorkspaceEvent,
     };
     use topo::projection::contract::{
-        BootstrapContextSnapshot, ContextSnapshot, EmitCommand, FileDescriptorInfo,
-        ProjectorResult, WriteOp,
+        BootstrapContextSnapshot, ContextSnapshot, CurrentSignerInfo, EmitCommand,
+        FileDescriptorInfo, ProjectorResult, WriteOp,
     };
     use topo::projection::decision::ProjectionDecision;
-    use topo::projection::queries::{ContextLoadResult, ProjectionQueries};
+    use topo::projection::queries::{
+        ContextLoadResult, DepLoadResult, ProjectionFrameContext, ProjectionQueries,
+    };
 
     #[derive(Clone)]
     pub struct FixtureProjectionQueries {
@@ -29,8 +31,27 @@ pub mod fixtures {
     }
 
     impl ProjectionQueries for FixtureProjectionQueries {
+        fn load_dep_result(
+            &self,
+            _recorded_by: &str,
+            _parsed: &topo::event_modules::ParsedEvent,
+            _field_name: &str,
+            _dep_id: &[u8; 32],
+        ) -> Result<DepLoadResult, Box<dyn std::error::Error>> {
+            Ok(DepLoadResult::ready(None))
+        }
+
+        fn load_key_secret_bytes(
+            &self,
+            _recorded_by: &str,
+            _key_event_id: &[u8; 32],
+        ) -> Result<Option<[u8; 32]>, Box<dyn std::error::Error>> {
+            Ok(None)
+        }
+
         fn load_workspace_context(
             &self,
+            _frame: &ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _workspace: &WorkspaceEvent,
@@ -40,6 +61,7 @@ pub mod fixtures {
 
         fn load_admin_context(
             &self,
+            _frame: &ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _admin: &AdminEvent,
@@ -49,6 +71,7 @@ pub mod fixtures {
 
         fn load_peer_shared_context(
             &self,
+            _frame: &ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _peer_shared: &PeerSharedEvent,
@@ -58,6 +81,7 @@ pub mod fixtures {
 
         fn load_user_invite_context(
             &self,
+            _frame: &ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _user_invite: &UserInviteEvent,
@@ -67,6 +91,7 @@ pub mod fixtures {
 
         fn load_device_invite_context(
             &self,
+            _frame: &ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _device_invite: &DeviceInviteEvent,
@@ -76,6 +101,7 @@ pub mod fixtures {
 
         fn load_message_context(
             &self,
+            _frame: &ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _message: &MessageEvent,
@@ -85,6 +111,7 @@ pub mod fixtures {
 
         fn load_message_deletion_context(
             &self,
+            _frame: &ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _message_deletion: &MessageDeletionEvent,
@@ -94,6 +121,7 @@ pub mod fixtures {
 
         fn load_reaction_context(
             &self,
+            _frame: &ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _reaction: &ReactionEvent,
@@ -103,6 +131,7 @@ pub mod fixtures {
 
         fn load_file_context(
             &self,
+            _frame: &ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _file: &FileEvent,
@@ -112,6 +141,7 @@ pub mod fixtures {
 
         fn load_file_slice_context(
             &self,
+            _frame: &ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _file_slice: &FileSliceEvent,
@@ -121,6 +151,7 @@ pub mod fixtures {
 
         fn load_invite_accepted_context(
             &self,
+            _frame: &ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _invite_accepted: &InviteAcceptedEvent,
@@ -130,6 +161,7 @@ pub mod fixtures {
 
         fn load_key_shared_context(
             &self,
+            _frame: &ProjectionFrameContext,
             _recorded_by: &str,
             _event_id_b64: &str,
             _key_shared: &KeySharedEvent,
@@ -183,6 +215,20 @@ pub mod fixtures {
     pub fn ctx_with_target_message_deleted() -> ContextSnapshot {
         ContextSnapshot {
             target_message_deleted: true,
+            ..Default::default()
+        }
+    }
+
+    /// ContextSnapshot with an explicit current signer envelope.
+    pub fn ctx_with_current_signer(
+        signer_event_id_b64: &str,
+        semantic_type_code: u8,
+    ) -> ContextSnapshot {
+        ContextSnapshot {
+            current_signer: Some(CurrentSignerInfo {
+                event_id: signer_event_id_b64.to_string(),
+                semantic_type_code,
+            }),
             ..Default::default()
         }
     }

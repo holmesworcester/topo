@@ -226,6 +226,7 @@ check_required 'pub async fn dial_daemon_connection' "${TRANSPORT_PATH}peering_b
 check_required 'pub async fn accept_daemon_connection' "${TRANSPORT_PATH}peering_boundary.rs"
 check_required 'pub async fn next_session' "${TRANSPORT_PATH}peering_boundary.rs"
 check_required 'pub async fn create_runtime_endpoint_for_tenants' "${TRANSPORT_PATH}peering_boundary.rs"
+check_required 'pub fn tenant_trusts_peer' "${TRANSPORT_PATH}peering_boundary.rs"
 
 # projection must route through materializer contract, not raw install fns
 check_required 'MaterializeTransportIdentity' "$PROJECTION_PATH"

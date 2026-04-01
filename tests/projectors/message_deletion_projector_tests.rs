@@ -14,6 +14,7 @@ mod tests {
     use topo::event_modules::message_deletion::{build_projector_context, project_pure};
     use topo::event_modules::ParsedEvent;
     use topo::projection::contract::EmitCommand;
+    use topo::projection::queries::ProjectionFrameContext;
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "del_event_1";
@@ -23,9 +24,6 @@ mod tests {
             created_at_ms: 5000,
             target_event_id: target,
             author_id: author,
-            signed_by: [3u8; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
         })
     }
 
@@ -141,7 +139,14 @@ mod tests {
             "signer peer not linked to author user",
         ));
 
-        let result = build_projector_context(&queries, PEER, EVENT_ID, &parsed).unwrap();
+        let result = build_projector_context(
+            &queries,
+            &ProjectionFrameContext::default(),
+            PEER,
+            EVENT_ID,
+            &parsed,
+        )
+        .unwrap();
         assert_context_reject_contains(&result, "signer peer not linked to author user");
     }
 }

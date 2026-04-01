@@ -24,9 +24,6 @@ mod tests {
             user_event_id,
             endpoint_shared_event_id: [7u8; 32],
             device_name: "device-1".to_string(),
-            signed_by: [3u8; 32],
-            signer_type: 3,
-            signature: [0u8; 64],
         })
     }
 

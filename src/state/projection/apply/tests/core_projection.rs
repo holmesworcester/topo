@@ -37,12 +37,8 @@ fn key_shared_does_not_block_non_recipient_observers_on_local_invite_secret() {
         // shared key wrapper row without blocking.
         unwrap_key_event_id: [0x55; 32],
         wrapped_key: [0x66; 32],
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let mut blob = events::encode_event(&key_shared).unwrap();
-    sign_blob(&signer_key, &mut blob);
+    let blob = sign_blob(&signer_key, &signer_eid, &key_shared);
     let key_shared_eid = insert_event_raw(&conn, recorded_by, &blob);
 
     let decision = project_one(&conn, recorded_by, &key_shared_eid).unwrap();
@@ -113,12 +109,8 @@ fn key_shared_blocks_on_missing_frontier_then_projects() {
         parent_4: [0u8; 32],
         frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&[]),
         removed_by: signer_eid,
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let mut removal_blob = events::encode_event(&removal).unwrap();
-    sign_blob(&signer_key, &mut removal_blob);
+    let removal_blob = sign_blob(&signer_key, &signer_eid, &removal);
     let removal_eid = canonical_test_event_id(&conn, recorded_by, &removal_blob);
 
     let frontier_hash = crate::event_modules::removal::frontier_hash_from_refs(&[removal_eid]);
@@ -140,12 +132,8 @@ fn key_shared_blocks_on_missing_frontier_then_projects() {
         recipient_event_id,
         unwrap_key_event_id: [0x55; 32],
         wrapped_key: [0x66; 32],
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let mut key_shared_blob = events::encode_event(&key_shared).unwrap();
-    sign_blob(&signer_key, &mut key_shared_blob);
+    let key_shared_blob = sign_blob(&signer_key, &signer_eid, &key_shared);
     let key_shared_eid = insert_event_raw(&conn, recorded_by, &key_shared_blob);
 
     let decision = project_one(&conn, recorded_by, &key_shared_eid).unwrap();
@@ -205,12 +193,8 @@ fn key_shared_rejects_unsorted_multi_parent_frontier_even_when_all_frontier_deps
         parent_4: [0u8; 32],
         frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&[]),
         removed_by: signer_eid,
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let mut left_blob = events::encode_event(&left_removal).unwrap();
-    sign_blob(&signer_key, &mut left_blob);
+    let left_blob = sign_blob(&signer_key, &signer_eid, &left_removal);
     let left_eid = insert_event_raw(&conn, recorded_by, &left_blob);
     assert_eq!(
         project_one(&conn, recorded_by, &left_eid).unwrap(),
@@ -227,12 +211,8 @@ fn key_shared_rejects_unsorted_multi_parent_frontier_even_when_all_frontier_deps
         parent_4: [0u8; 32],
         frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&[]),
         removed_by: signer_eid,
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let mut right_blob = events::encode_event(&right_removal).unwrap();
-    sign_blob(&signer_key, &mut right_blob);
+    let right_blob = sign_blob(&signer_key, &signer_eid, &right_removal);
     let right_eid = insert_event_raw(&conn, recorded_by, &right_blob);
     assert_eq!(
         project_one(&conn, recorded_by, &right_eid).unwrap(),
@@ -268,12 +248,8 @@ fn key_shared_rejects_unsorted_multi_parent_frontier_even_when_all_frontier_deps
         recipient_event_id,
         unwrap_key_event_id: [0x55; 32],
         wrapped_key: [0x66; 32],
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let mut key_shared_blob = events::encode_event(&key_shared).unwrap();
-    sign_blob(&signer_key, &mut key_shared_blob);
+    let key_shared_blob = sign_blob(&signer_key, &signer_eid, &key_shared);
     let key_shared_eid = insert_event_raw(&conn, recorded_by, &key_shared_blob);
 
     match project_one(&conn, recorded_by, &key_shared_eid).unwrap() {
@@ -308,12 +284,8 @@ fn test_project_key_request_valid_with_delivery_target_binding() {
         ),
         recipient_event_id: [0x33; 32],
         unwrap_key_event_id: [0x44; 32],
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let mut blob = events::encode_event(&key_request).unwrap();
-    sign_blob(&signer_key, &mut blob);
+    let blob = sign_blob(&signer_key, &signer_eid, &key_request);
     let key_request_eid = insert_event_raw(&conn, recorded_by, &blob);
 
     let decision = project_one(&conn, recorded_by, &key_request_eid).unwrap();
@@ -346,12 +318,8 @@ fn test_project_key_request_rejects_delivery_target_mismatch() {
         delivery_target_id: [0x99; 32],
         recipient_event_id: [0x33; 32],
         unwrap_key_event_id: [0x44; 32],
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let mut blob = events::encode_event(&key_request).unwrap();
-    sign_blob(&signer_key, &mut blob);
+    let blob = sign_blob(&signer_key, &signer_eid, &key_request);
     let key_request_eid = insert_event_raw(&conn, recorded_by, &blob);
 
     let decision = project_one(&conn, recorded_by, &key_request_eid).unwrap();
@@ -396,12 +364,8 @@ fn test_key_shared_rejects_delivery_target_mismatch_at_projection() {
         recipient_event_id,
         unwrap_key_event_id: [0x55; 32],
         wrapped_key: [0x66; 32],
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let mut blob = events::encode_event(&key_shared).unwrap();
-    sign_blob(&signer_key, &mut blob);
+    let blob = sign_blob(&signer_key, &signer_eid, &key_shared);
     let key_shared_eid = insert_event_raw(&conn, recorded_by, &blob);
 
     let decision = project_one(&conn, recorded_by, &key_shared_eid).unwrap();

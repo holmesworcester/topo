@@ -79,9 +79,21 @@ fn inspect_relevant_event(
     }
 
     let parsed = events::parse_event(blob)?;
+    inspect_relevant_parsed_event(conn, recorded_by, parsed)
+}
+
+fn inspect_relevant_parsed_event(
+    conn: &Connection,
+    recorded_by: &str,
+    parsed: ParsedEvent,
+) -> Result<Option<ParsedEvent>, Box<dyn std::error::Error>> {
     match parsed {
         ParsedEvent::Reaction(_) | ParsedEvent::File(_) | ParsedEvent::FileSlice(_) => {
             Ok(Some(parsed))
+        }
+        ParsedEvent::Signed(signed) => {
+            let inner = events::parse_event(&signed.payload)?;
+            inspect_relevant_parsed_event(conn, recorded_by, inner)
         }
         ParsedEvent::Encrypted(enc) => {
             let key_id_b64 = event_id_to_base64(&enc.key_event_id);
@@ -108,12 +120,7 @@ fn inspect_relevant_event(
                 return Ok(None);
             };
             let inner = events::parse_event(&plaintext)?;
-            match inner {
-                ParsedEvent::Reaction(_) | ParsedEvent::File(_) | ParsedEvent::FileSlice(_) => {
-                    Ok(Some(inner))
-                }
-                _ => Ok(None),
-            }
+            inspect_relevant_parsed_event(conn, recorded_by, inner)
         }
         _ => Ok(None),
     }

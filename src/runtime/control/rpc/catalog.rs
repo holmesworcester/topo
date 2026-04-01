@@ -54,9 +54,10 @@ static CATALOG: &[MethodInfo] = &[
         params: params![
             "content", "string", true, None;
             "file_path", "string", true, None;
+            "add_bad_slices", "usize", false, Some("0");
             "client_op_id", "string?", false, None
         ],
-        example_json: r#"{"type":"SendFile","content":"see attached","file_path":"/tmp/notes.txt","client_op_id":"op-456"}"#,
+        example_json: r#"{"type":"SendFile","content":"see attached","file_path":"/tmp/notes.txt","add_bad_slices":8,"client_op_id":"op-456"}"#,
     },
     MethodInfo {
         name: "Files",

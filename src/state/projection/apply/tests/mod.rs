@@ -14,10 +14,9 @@ use crate::event_modules::{
 };
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::encrypted::encrypt_event_blob;
-use crate::projection::signer::sign_event_bytes;
 use crate::state::projection::create::{
-    create_event_staged, create_event_synchronous, create_signed_event_synchronous, project_event,
-    store_event_only,
+    create_event_staged, create_event_synchronous, create_signed_event_synchronous,
+    encode_signed_wrapper_blob, project_event, store_event_only,
 };
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
@@ -158,6 +157,23 @@ pub(super) fn wrap_test_content_blob(conn: &Connection, recorded_by: &str, blob:
     events::encode_event(&wrapper).unwrap()
 }
 
+fn ensure_test_wrapper_key_for_blob(conn: &Connection, recorded_by: &str, blob: &[u8]) {
+    let encrypted = match events::parse_event(blob) {
+        Ok(ParsedEvent::Encrypted(encrypted)) => Some(encrypted),
+        Ok(ParsedEvent::Signed(signed)) => match events::parse_event(&signed.payload) {
+            Ok(ParsedEvent::Encrypted(encrypted)) => Some(encrypted),
+            _ => None,
+        },
+        _ => None,
+    };
+    let Some(encrypted) = encrypted else {
+        return;
+    };
+    if encrypted.key_event_id == test_content_key_event_id() {
+        let _ = ensure_test_content_key(conn, recorded_by);
+    }
+}
+
 pub(super) fn canonical_test_event_id(
     conn: &Connection,
     recorded_by: &str,
@@ -170,6 +186,7 @@ pub(super) fn canonical_test_event_id(
 /// batch_writer or create_event_synchronous does before calling project_one).
 pub(super) fn insert_event_raw(conn: &Connection, recorded_by: &str, blob: &[u8]) -> EventId {
     let blob = wrap_test_content_blob(conn, recorded_by, blob);
+    ensure_test_wrapper_key_for_blob(conn, recorded_by, &blob);
     let event_id = hash_event(&blob);
     let ts = now_ms();
     let type_code = blob[0];
@@ -313,13 +330,11 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
         public_key: invite_pub,
         workspace_id: net_eid,
         authority_event_id: net_eid,
-        signed_by: net_eid,
-        signer_type: 1,
-        signature: [0u8; 64],
     };
     let uib_event = ParsedEvent::UserInvite(uib);
     let uib_eid =
-        create_signed_event_synchronous(conn, recorded_by, &uib_event, &workspace_key).unwrap();
+        create_signed_event_synchronous(conn, recorded_by, &net_eid, &uib_event, &workspace_key)
+            .unwrap();
 
     // 5. User (signed by invite key)
     let user_key = SigningKey::generate(&mut rng);
@@ -328,13 +343,11 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
         created_at_ms: now_ms(),
         public_key: user_pub,
         username: "user".to_string(),
-        signed_by: uib_eid,
-        signer_type: 2,
-        signature: [0u8; 64],
     };
     let ub_event = ParsedEvent::User(ub);
     let ub_eid =
-        create_signed_event_synchronous(conn, recorded_by, &ub_event, &invite_key).unwrap();
+        create_signed_event_synchronous(conn, recorded_by, &uib_eid, &ub_event, &invite_key)
+            .unwrap();
 
     // 6. DeviceInvite (signed by user key)
     let device_invite_key = SigningKey::generate(&mut rng);
@@ -343,13 +356,10 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
         created_at_ms: now_ms(),
         public_key: device_invite_pub,
         authority_event_id: ub_eid,
-        signed_by: ub_eid,
-        signer_type: 4,
-        signature: [0u8; 64],
     };
     let dif_event = ParsedEvent::DeviceInvite(dif);
     let dif_eid =
-        create_signed_event_synchronous(conn, recorded_by, &dif_event, &user_key).unwrap();
+        create_signed_event_synchronous(conn, recorded_by, &ub_eid, &dif_event, &user_key).unwrap();
 
     // 7. EndpointShared (self-signed, endpoint-scoped)
     let endpoint_key = SigningKey::generate(&mut rng);
@@ -369,13 +379,16 @@ pub(super) fn make_identity_chain(conn: &Connection, recorded_by: &str) -> (Even
         user_event_id: ub_eid,
         endpoint_shared_event_id,
         device_name: "device".to_string(),
-        signed_by: dif_eid,
-        signer_type: 3,
-        signature: [0u8; 64],
     };
     let psf_event = ParsedEvent::PeerShared(psf);
-    let psf_eid =
-        create_signed_event_synchronous(conn, recorded_by, &psf_event, &device_invite_key).unwrap();
+    let psf_eid = create_signed_event_synchronous(
+        conn,
+        recorded_by,
+        &dif_eid,
+        &psf_event,
+        &device_invite_key,
+    )
+    .unwrap();
 
     register_signer_user(psf_eid, ub_eid);
     (psf_eid, peer_shared_key)
@@ -430,13 +443,9 @@ pub(super) fn build_identity_chain_deferred(
         public_key: invite_pub,
         workspace_id: net_eid,
         authority_event_id: net_eid,
-        signed_by: net_eid,
-        signer_type: 1,
-        signature: [0u8; 64],
     };
     let uib_event = ParsedEvent::UserInvite(uib);
-    let mut uib_blob = events::encode_event(&uib_event).unwrap();
-    sign_blob(&workspace_key, &mut uib_blob);
+    let uib_blob = sign_blob(&workspace_key, &net_eid, &uib_event);
     let uib_eid = hash_event(&uib_blob);
 
     // 5. User (signed by invite key)
@@ -446,13 +455,9 @@ pub(super) fn build_identity_chain_deferred(
         created_at_ms: now_ms(),
         public_key: user_pub,
         username: "user".to_string(),
-        signed_by: uib_eid,
-        signer_type: 2,
-        signature: [0u8; 64],
     };
     let ub_event = ParsedEvent::User(ub);
-    let mut ub_blob = events::encode_event(&ub_event).unwrap();
-    sign_blob(&invite_key, &mut ub_blob);
+    let ub_blob = sign_blob(&invite_key, &uib_eid, &ub_event);
     let ub_eid = hash_event(&ub_blob);
 
     // 6. DeviceInvite (signed by user key)
@@ -462,13 +467,9 @@ pub(super) fn build_identity_chain_deferred(
         created_at_ms: now_ms(),
         public_key: device_invite_pub,
         authority_event_id: ub_eid,
-        signed_by: ub_eid,
-        signer_type: 4,
-        signature: [0u8; 64],
     };
     let dif_event = ParsedEvent::DeviceInvite(dif);
-    let mut dif_blob = events::encode_event(&dif_event).unwrap();
-    sign_blob(&user_key, &mut dif_blob);
+    let dif_blob = sign_blob(&user_key, &ub_eid, &dif_event);
     let dif_eid = hash_event(&dif_blob);
 
     // 7. EndpointShared (self-signed, endpoint-scoped)
@@ -489,13 +490,9 @@ pub(super) fn build_identity_chain_deferred(
         user_event_id: ub_eid,
         endpoint_shared_event_id: endpoint_eid,
         device_name: "device".to_string(),
-        signed_by: dif_eid,
-        signer_type: 3,
-        signature: [0u8; 64],
     };
     let psf_event = ParsedEvent::PeerShared(psf);
-    let mut psf_blob = events::encode_event(&psf_event).unwrap();
-    sign_blob(&device_invite_key, &mut psf_blob);
+    let psf_blob = sign_blob(&device_invite_key, &dif_eid, &psf_event);
     let psf_eid = hash_event(&psf_blob);
 
     register_signer_user(psf_eid, ub_eid);
@@ -527,11 +524,13 @@ pub(super) fn insert_and_project_identity_chain(
     }
 }
 
-/// Helper: sign a blob in-place (overwrite last 64 bytes with Ed25519 signature).
-pub(super) fn sign_blob(key: &SigningKey, blob: &mut Vec<u8>) {
-    let len = blob.len();
-    let sig = sign_event_bytes(key, &blob[..len - 64]);
-    blob[len - 64..].copy_from_slice(&sig);
+/// Helper: wrap a parsed event in a Signed envelope and sign the outer blob.
+pub(super) fn sign_blob(
+    signing_key: &SigningKey,
+    signer_event_id: &EventId,
+    event: &ParsedEvent,
+) -> Vec<u8> {
+    encode_signed_wrapper_blob(event, signer_event_id, signing_key).unwrap()
 }
 
 pub(super) fn ensure_test_endpoint_shared(conn: &Connection) -> EventId {
@@ -554,15 +553,10 @@ fn make_message_signed(
         workspace_id: [1u8; 32],
         author_id,
         content: content.to_string(),
-        signed_by: *signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     };
     let event = ParsedEvent::Message(msg);
-    let mut blob = events::encode_event(&event).unwrap();
-    sign_blob(signing_key, &mut blob);
-    let parsed = events::parse_event(&blob).unwrap();
-    (parsed, blob)
+    let blob = make_signed_encrypted_blob(signing_key, signer_eid, &event);
+    (event, blob)
 }
 
 /// Convenience: create identity chain + signed message in one call.
@@ -588,15 +582,10 @@ pub(super) fn make_reaction_signed(
         target_event_id: *target,
         author_id,
         emoji: emoji.to_string(),
-        signed_by: *signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     };
     let event = ParsedEvent::Reaction(rxn);
-    let mut blob = events::encode_event(&event).unwrap();
-    sign_blob(signing_key, &mut blob);
-    let parsed = events::parse_event(&blob).unwrap();
-    (parsed, blob)
+    let blob = make_signed_encrypted_blob(signing_key, signer_eid, &event);
+    (event, blob)
 }
 
 /// Convenience: create identity chain + signed reaction.
@@ -626,15 +615,10 @@ pub(super) fn make_deletion_signed(
         created_at_ms: now_ms(),
         target_event_id: *target,
         author_id: resolved_author_id,
-        signed_by: *signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     };
     let event = ParsedEvent::MessageDeletion(del);
-    let mut blob = events::encode_event(&event).unwrap();
-    sign_blob(signing_key, &mut blob);
-    let parsed = events::parse_event(&blob).unwrap();
-    (parsed, blob)
+    let blob = make_signed_encrypted_blob(signing_key, signer_eid, &event);
+    (event, blob)
 }
 
 /// Create a signed attachment event blob.
@@ -644,29 +628,31 @@ pub(super) fn make_attachment_signed(
     message_id: &EventId,
     key_event_id: &EventId,
 ) -> (ParsedEvent, Vec<u8>) {
+    let file_id: [u8; 32] = rand::random();
+    let blob_bytes = 204800u64;
+    let slice_bytes = 65536u32;
     let att = FileEvent {
         created_at_ms: now_ms(),
         message_id: *message_id,
-        file_id: rand::random(),
-        blob_bytes: 204800,
-        total_slices: 4,
-        slice_bytes: 65536,
-        root_hash: [12u8; 32],
+        file_id,
+        blob_bytes,
+        total_slices: total_slices_for(blob_bytes, slice_bytes),
+        slice_bytes,
+        root_hash: deterministic_file_root_hash(file_id, blob_bytes),
         key_event_id: *key_event_id,
         filename: "photo.jpg".to_string(),
         mime_type: "image/jpeg".to_string(),
-        signed_by: *signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     };
     let event = ParsedEvent::File(att);
-    let mut blob = events::encode_event(&event).unwrap();
-    sign_blob(signing_key, &mut blob);
-    let parsed = events::parse_event(&blob).unwrap();
-    (parsed, blob)
+    let blob = make_signed_encrypted_blob(signing_key, signer_eid, &event);
+    (event, blob)
 }
 
 pub(super) fn setup() -> Connection {
+    signer_user_map()
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clear();
     let conn = open_in_memory().unwrap();
     create_tables(&conn).unwrap();
     conn
@@ -702,34 +688,99 @@ pub(super) fn make_encrypted_event(
     (enc, blob)
 }
 
+fn make_signed_encrypted_blob(
+    signing_key: &SigningKey,
+    signer_event_id: &EventId,
+    inner_event: &ParsedEvent,
+) -> Vec<u8> {
+    let inner_blob = events::encode_event(inner_event).unwrap();
+    let (_enc, enc_blob) = make_encrypted_event(
+        &test_content_key_bytes(),
+        &inner_blob,
+        inner_event.event_type_code(),
+        &test_content_key_event_id(),
+    );
+    let enc_event = events::parse_event(&enc_blob).unwrap();
+    encode_signed_wrapper_blob(&enc_event, signer_event_id, signing_key).unwrap()
+}
+
+pub(super) fn make_signed_encrypted_blob_with_key(
+    signing_key: &SigningKey,
+    signer_event_id: &EventId,
+    inner_event: &ParsedEvent,
+    key_bytes: &[u8; 32],
+    key_event_id: &EventId,
+) -> Vec<u8> {
+    let inner_blob = events::encode_event(inner_event).unwrap();
+    let (_enc, enc_blob) = make_encrypted_event(
+        key_bytes,
+        &inner_blob,
+        inner_event.event_type_code(),
+        key_event_id,
+    );
+    let enc_event = events::parse_event(&enc_blob).unwrap();
+    encode_signed_wrapper_blob(&enc_event, signer_event_id, signing_key).unwrap()
+}
+
 // === File attachment helpers ===
+
+fn total_slices_for(blob_bytes: u64, slice_bytes: u32) -> u32 {
+    blob_bytes.div_ceil(slice_bytes as u64) as u32
+}
+
+fn deterministic_file_plaintext(file_id: [u8; 32], blob_bytes: u64) -> Vec<u8> {
+    (0..blob_bytes as usize)
+        .map(|i| (i as u8).wrapping_add(file_id[i % file_id.len()]))
+        .collect()
+}
+
+pub(super) fn deterministic_file_root_hash(file_id: [u8; 32], blob_bytes: u64) -> [u8; 32] {
+    let plaintext = deterministic_file_plaintext(file_id, blob_bytes);
+    let (root_hash, _outboard) = crate::crypto::bao_verify::compute_outboard(&plaintext)
+        .expect("deterministic test file root hash should compute");
+    root_hash
+}
+
+pub(super) fn make_valid_file_slice_ciphertext(
+    file_id: [u8; 32],
+    slice_number: u32,
+    blob_bytes: u64,
+    slice_bytes: u32,
+) -> Vec<u8> {
+    let plaintext = deterministic_file_plaintext(file_id, blob_bytes);
+    let (_root_hash, outboard) = crate::crypto::bao_verify::compute_outboard(&plaintext)
+        .expect("deterministic test file outboard should compute");
+    let slice_start = slice_number as u64 * slice_bytes as u64;
+    let slice_len = blob_bytes
+        .saturating_sub(slice_start)
+        .min(slice_bytes as u64);
+    let proof = crate::crypto::bao_verify::extract_slice_proof(
+        &plaintext,
+        &outboard,
+        slice_start,
+        slice_len,
+    )
+    .expect("deterministic test file slice proof should extract");
+    crate::event_modules::file_slice::wire::pack_bao_payload(&proof, &plaintext)
+}
 
 pub(super) fn make_file_slice(
     signing_key: &SigningKey,
     signer_event_id: &EventId,
     file_id: [u8; 32],
     slice_number: u32,
-    ciphertext_seed: &[u8],
+    _ciphertext_seed: &[u8],
 ) -> (ParsedEvent, Vec<u8>) {
-    use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
-    // Pad to canonical fixed size (short seeds are zero-extended)
-    let mut ciphertext = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
-    let len = ciphertext_seed.len().min(FILE_SLICE_CIPHERTEXT_BYTES);
-    ciphertext[..len].copy_from_slice(&ciphertext_seed[..len]);
+    let ciphertext = make_valid_file_slice_ciphertext(file_id, slice_number, 204800, 65536);
     let fs = FileSliceEvent {
         created_at_ms: now_ms(),
         file_id,
         slice_number,
         ciphertext,
-        signed_by: *signer_event_id,
-        signer_type: 5,
-        signature: [0u8; 64],
     };
     let event = ParsedEvent::FileSlice(fs);
-    let mut blob = events::encode_event(&event).unwrap();
-    sign_blob(signing_key, &mut blob);
-    let parsed = events::parse_event(&blob).unwrap();
-    (parsed, blob)
+    let blob = make_signed_encrypted_blob(signing_key, signer_event_id, &event);
+    (event, blob)
 }
 
 /// Convenience: create identity chain + signed attachment.
@@ -740,26 +791,24 @@ pub(super) fn make_file(
     key_event_id: &EventId,
 ) -> (ParsedEvent, Vec<u8>) {
     let (signer_eid, signing_key) = make_identity_chain(conn, recorded_by);
+    let file_id = [42u8; 32];
+    let blob_bytes = 1024u64;
+    let slice_bytes = 1024u32;
     let att = FileEvent {
         created_at_ms: now_ms(),
         message_id: *message_id,
-        file_id: [42u8; 32],
-        blob_bytes: 1024,
-        total_slices: 1,
-        slice_bytes: 1024,
-        root_hash: [0xABu8; 32],
+        file_id,
+        blob_bytes,
+        total_slices: total_slices_for(blob_bytes, slice_bytes),
+        slice_bytes,
+        root_hash: deterministic_file_root_hash(file_id, blob_bytes),
         key_event_id: *key_event_id,
         filename: "test.bin".to_string(),
         mime_type: "application/octet-stream".to_string(),
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     };
     let event = ParsedEvent::File(att);
-    let mut blob = events::encode_event(&event).unwrap();
-    sign_blob(&signing_key, &mut blob);
-    let parsed = events::parse_event(&blob).unwrap();
-    (parsed, blob)
+    let blob = make_signed_encrypted_blob(&signing_key, &signer_eid, &event);
+    (event, blob)
 }
 
 /// Helper: create a File descriptor with a specific file_id and signer,
@@ -773,6 +822,8 @@ pub(super) fn setup_descriptor_for_file(
     file_id: [u8; 32],
     file_key_event_id: &EventId,
 ) -> EventId {
+    let blob_bytes = 204800u64;
+    let slice_bytes = 65536u32;
     // Create message (dep for attachment)
     let (_msg, msg_blob) =
         make_message_signed(signing_key, signer_eid, "parent msg for descriptor");
@@ -784,20 +835,16 @@ pub(super) fn setup_descriptor_for_file(
         created_at_ms: now_ms(),
         message_id: msg_eid,
         file_id,
-        blob_bytes: 204800,
-        total_slices: 4,
-        slice_bytes: 65536,
-        root_hash: [12u8; 32],
+        blob_bytes,
+        total_slices: total_slices_for(blob_bytes, slice_bytes),
+        slice_bytes,
+        root_hash: deterministic_file_root_hash(file_id, blob_bytes),
         key_event_id: *file_key_event_id,
         filename: "test.bin".to_string(),
         mime_type: "application/octet-stream".to_string(),
-        signed_by: *signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     };
     let event = ParsedEvent::File(att);
-    let mut blob = events::encode_event(&event).unwrap();
-    sign_blob(signing_key, &mut blob);
+    let blob = make_signed_encrypted_blob(signing_key, signer_eid, &event);
     let att_blob = blob;
     let att_eid = insert_event_raw(conn, recorded_by, &att_blob);
     let result = project_one(conn, recorded_by, &att_eid).unwrap();

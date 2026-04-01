@@ -7,8 +7,7 @@
 mod tests {
     use crate::harness::fixtures::*;
     use topo::event_modules::key_request::{delivery_target_id, project_pure, KeyRequestEvent};
-    use topo::event_modules::ParsedEvent;
-    use topo::projection::contract::ContextSnapshot;
+    use topo::event_modules::{ParsedEvent, EVENT_TYPE_KEY_REQUEST};
 
     const PEER: &str = "peer_alice";
 
@@ -21,9 +20,6 @@ mod tests {
             delivery_target_id,
             recipient_event_id: [3u8; 32],
             unwrap_key_event_id: [4u8; 32],
-            signed_by: [5u8; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
         })
     }
 
@@ -35,7 +31,7 @@ mod tests {
             delivery_target_id(&[2u8; 32], &frontier_hash, &[3u8; 32], &[4u8; 32]),
         );
         let event_id = b64(&[9u8; 32]);
-        let ctx = ContextSnapshot::default();
+        let ctx = ctx_with_current_signer(&event_id, EVENT_TYPE_KEY_REQUEST);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_valid(&result);
@@ -46,7 +42,7 @@ mod tests {
     fn test_key_request_rejects_delivery_target_mismatch() {
         let parsed = make_key_request([9u8; 32], [8u8; 32]);
         let event_id = b64(&[7u8; 32]);
-        let ctx = ContextSnapshot::default();
+        let ctx = ctx_with_current_signer(&event_id, EVENT_TYPE_KEY_REQUEST);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_reject_contains(
@@ -62,7 +58,7 @@ mod tests {
             public_key: [7u8; 32],
         });
         let event_id = b64(&[8u8; 32]);
-        let ctx = ContextSnapshot::default();
+        let ctx = ctx_with_current_signer(&event_id, EVENT_TYPE_KEY_REQUEST);
 
         let result = project_pure(PEER, &event_id, &parsed, &ctx);
         assert_reject_contains(&result, "not a key_request event");

@@ -41,7 +41,10 @@ pub fn project_pure(
     }
 
     let file_id_b64 = event_id_to_base64(&fs.file_id);
-    let slice_signer_b64 = event_id_to_base64(&fs.signed_by);
+    let Some(current_signer) = ctx.current_signer.as_ref() else {
+        return ProjectorResult::reject("file_slice missing current signer envelope".to_string());
+    };
+    let slice_signer_b64 = current_signer.event_id.clone();
 
     if ctx.file_descriptors.is_empty() {
         // No descriptor yet — block on file_id as a synthetic dep.
@@ -79,15 +82,20 @@ pub fn project_pure(
         let (bao_encoding, _) = unpack_bao_payload(&fs.ciphertext);
         if !bao_encoding.is_empty() {
             let slice_start = fs.slice_number as u64 * descriptor.slice_bytes as u64;
-            let remaining = descriptor.blob_bytes.saturating_sub(slice_start);
-            let slice_len = remaining.min(descriptor.slice_bytes as u64);
-            if let Err(e) =
-                bao_verify::verify_slice(&descriptor.root_hash, &bao_encoding, slice_start, slice_len)
-            {
-                return ProjectorResult::reject(format!(
-                    "bao verification failed for slice {}: {}",
-                    fs.slice_number, e
-                ));
+            if slice_start < descriptor.blob_bytes {
+                let remaining = descriptor.blob_bytes.saturating_sub(slice_start);
+                let slice_len = remaining.min(descriptor.slice_bytes as u64);
+                if let Err(e) = bao_verify::verify_slice(
+                    &descriptor.root_hash,
+                    &bao_encoding,
+                    slice_start,
+                    slice_len,
+                ) {
+                    return ProjectorResult::reject(format!(
+                        "bao verification failed for slice {}: {}",
+                        fs.slice_number, e
+                    ));
+                }
             }
         }
     }

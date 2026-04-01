@@ -86,6 +86,7 @@ pub struct ImportedEndpointSharedRow {
 
 #[derive(Clone, Debug)]
 pub struct ImportedPeerState {
+    pub db_path: String,
     pub recorded_by: String,
     pub workspace_id: Option<String>,
     pub daemon_peer_id: Option<String>,
@@ -98,6 +99,7 @@ pub struct ImportedPeerState {
     pub observed_targets: Vec<ImportedObservedTarget>,
     pub connect_targets: Vec<ImportedConnectTarget>,
     pub known_events: Vec<ImportedKnownEvent>,
+    pub ambient_shared_events: Vec<ImportedKnownEvent>,
 }
 
 impl ImportedPeerState {
@@ -292,7 +294,84 @@ pub fn import_peer_state(
         }
     }
 
+    let known_event_ids = known_events
+        .iter()
+        .map(|event| event.event_id.clone())
+        .collect::<BTreeSet<_>>();
+    let mut ambient_stmt = conn.prepare(
+        "SELECT event_id, created_at, blob
+         FROM events
+         WHERE share_scope = 'shared'
+         ORDER BY created_at ASC, event_id ASC",
+    )?;
+    let mut ambient_shared_events = ambient_stmt
+        .query_map([], |row| {
+            Ok(ImportedKnownEvent {
+                event_id: row.get(0)?,
+                source: "ambient_shared".to_string(),
+                created_at_ms: row.get(1)?,
+                blob: row.get(2)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?
+        .into_iter()
+        .filter(|event| !known_event_ids.contains(&event.event_id))
+        .collect::<Vec<_>>();
+
+    let mut ambient_event_ids = ambient_shared_events
+        .iter()
+        .map(|event| event.event_id.clone())
+        .collect::<BTreeSet<_>>();
+    if let Some(workspace_id) = &workspace_id {
+        let mut shared_index_stmt = conn.prepare(
+            "SELECT sei.id
+             FROM shared_event_index sei
+             WHERE sei.workspace_id = ?1
+             ORDER BY sei.ts ASC, sei.id ASC",
+        )?;
+        for row in shared_index_stmt.query_map(rusqlite::params![workspace_id], |row| {
+            row.get::<_, Vec<u8>>(0)
+        })? {
+            let id = row?;
+            if id.len() != 32 {
+                continue;
+            }
+            let mut event_id_bytes = [0u8; 32];
+            event_id_bytes.copy_from_slice(&id);
+            let event_id = crate::crypto::event_id_to_base64(&event_id_bytes);
+            let Some((created_at_ms, blob)) = conn
+                .query_row(
+                    "SELECT created_at, blob
+                     FROM events
+                     WHERE event_id = ?1",
+                    rusqlite::params![&event_id],
+                    |row| Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?)),
+                )
+                .ok()
+            else {
+                continue;
+            };
+            let event = ImportedKnownEvent {
+                event_id,
+                source: "shared_index".to_string(),
+                created_at_ms,
+                blob,
+            };
+            if known_event_ids.contains(&event.event_id)
+                || ambient_event_ids.contains(&event.event_id)
+            {
+                continue;
+            }
+            ambient_event_ids.insert(event.event_id.clone());
+            ambient_shared_events.push(event);
+        }
+        ambient_shared_events.sort_by(|left, right| {
+            (left.created_at_ms, &left.event_id).cmp(&(right.created_at_ms, &right.event_id))
+        });
+    }
+
     Ok(ImportedPeerState {
+        db_path: source_db_path.to_string(),
         recorded_by: recorded_by.to_string(),
         workspace_id,
         daemon_peer_id,
@@ -307,6 +386,7 @@ pub fn import_peer_state(
         observed_targets,
         connect_targets,
         known_events,
+        ambient_shared_events,
     })
 }
 
@@ -452,7 +532,17 @@ mod tests {
             .expect("event list via snapshot RPC");
 
         assert_eq!(messages, source_messages);
-        assert_eq!(stats, source_stats);
+        let snapshot_event_count = stats["event_count"].as_i64().expect("snapshot event_count");
+        let source_event_count = source_stats["event_count"]
+            .as_i64()
+            .expect("source event_count");
+        assert!(
+            snapshot_event_count >= source_event_count,
+            "snapshot must materialize at least the source event corpus"
+        );
+        let mut normalized_snapshot_stats = stats.clone();
+        normalized_snapshot_stats["event_count"] = source_stats["event_count"].clone();
+        assert_eq!(normalized_snapshot_stats, source_stats);
         assert_eq!(transport_auth, source_transport_auth);
         assert_eq!(users, source_users);
         assert_eq!(reactions, source_reactions);

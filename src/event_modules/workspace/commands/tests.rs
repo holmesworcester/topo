@@ -56,11 +56,8 @@ fn create_local_removal(
         parent_4: parent_slots[3],
         frontier_hash: crate::event_modules::removal::frontier_hash_from_refs(&slots),
         removed_by: *signer_event_id,
-        signed_by: *signer_event_id,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    create_signed_event_synchronous(conn, recorded_by, &removal, signing_key)
+    create_signed_event_synchronous(conn, recorded_by, signer_event_id, &removal, signing_key)
         .expect("create signed removal")
 }
 
@@ -77,6 +74,12 @@ fn encrypted_wrapper_key_event_id(
         .expect("load encrypted wrapper blob");
     match parse_event(&blob).expect("parse encrypted wrapper") {
         ParsedEvent::Encrypted(enc) => enc.key_event_id,
+        ParsedEvent::Signed(signed) => {
+            match parse_event(&signed.payload).expect("parse signed wrapper payload") {
+                ParsedEvent::Encrypted(enc) => enc.key_event_id,
+                other => panic!("expected signed encrypted wrapper, got {:?}", other),
+            }
+        }
         other => panic!("expected encrypted wrapper, got {:?}", other),
     }
 }

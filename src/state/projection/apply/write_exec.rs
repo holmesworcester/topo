@@ -103,7 +103,8 @@ pub(crate) fn execute_emit_commands(
                     }
                 }
             }
-            EmitCommand::RetryFileSliceGuards { .. } | EmitCommand::RecordFileSliceGuardBlock { .. } => {
+            EmitCommand::RetryFileSliceGuards { .. }
+            | EmitCommand::RecordFileSliceGuardBlock { .. } => {
                 // Legacy no-op: file_slice blocking now uses normal dep-blocking
                 // with file_id as the blocker key. cascade_file_id_if_file in
                 // cascade.rs handles unblocking when the File descriptor projects.

@@ -144,6 +144,12 @@ pub struct FileDescriptorInfo {
     pub slice_bytes: u32,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CurrentSignerInfo {
+    pub event_id: String,
+    pub semantic_type_code: u8,
+}
+
 /// Read-model snapshot passed to pure projectors for context queries.
 ///
 /// Projectors must not access the database directly. Instead, the pipeline
@@ -208,6 +214,8 @@ pub struct ContextSnapshot {
     pub existing_file_slice: Option<(String, String)>,
     /// For encrypted events: outer wrapper key_event_id, if present.
     pub current_transport_key_event_id: Option<String>,
+    /// For signed events: currently verified outer signer, if present.
+    pub current_signer: Option<CurrentSignerInfo>,
 
     /// For invite events (UserInvite, DeviceInvite, InviteAccepted):
     /// local bootstrap context if available. Populated from `bootstrap_context`

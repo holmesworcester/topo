@@ -10,9 +10,6 @@ pub struct MessageEvent {
     pub workspace_id: [u8; 32],
     pub author_id: [u8; 32],
     pub content: String,
-    pub signed_by: [u8; 32],
-    pub signer_type: u8,
-    pub signature: [u8; 64],
 }
 
 impl super::super::Describe for MessageEvent {
@@ -29,14 +26,6 @@ pub fn parse_message(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         workspace_id: values[1].as_event_id().unwrap(),
         author_id: values[2].as_event_id().unwrap(),
         content: values[3].as_text().unwrap().to_string(),
-        signed_by: values[4].as_event_id().unwrap(),
-        signer_type: values[5].as_u8().unwrap(),
-        signature: {
-            let bytes = values[6].as_fixed_bytes().unwrap();
-            let mut sig = [0u8; 64];
-            sig.copy_from_slice(bytes);
-            sig
-        },
     }))
 }
 
@@ -51,23 +40,20 @@ pub fn encode_message(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         FieldValue::EventId(msg.workspace_id),
         FieldValue::EventId(msg.author_id),
         FieldValue::Text(msg.content.clone()),
-        FieldValue::EventId(msg.signed_by),
-        FieldValue::U8(msg.signer_type),
-        FieldValue::FixedBytes(msg.signature.to_vec()),
     ];
 
     Ok(encode_fields(EVENT_TYPE_MESSAGE, MESSAGE_FIELDS, &values)?)
 }
 
-pub static MESSAGE_META: EventTypeMeta = EventTypeMeta {
+pub static MESSAGE_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_MESSAGE,
     type_name: "message",
     projection_table: "messages",
     share_scope: ShareScope::Shared,
-    dep_fields: &["author_id", "signed_by"],
-    dep_field_type_codes: &[&[14, 15], &[]],
+    dep_fields: &["author_id"],
+    dep_field_type_codes: &[&[14, 15]],
     signer_required: true,
-    signature_byte_len: 64,
+    signature_byte_len: 0,
     encryptable: true,
     parse: parse_message,
     encode: encode_message,

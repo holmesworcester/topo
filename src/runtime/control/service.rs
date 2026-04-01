@@ -238,73 +238,111 @@ fn build_event_list_items(
     use crate::event_modules::{parse_event, ParsedEvent};
 
     let registry = crate::event_modules::registry();
-    let mut events = Vec::new();
-    for (id_b64, event_type, blob, created_at_ms) in rows {
-        let parsed = parse_event(&blob);
+    fn base_event_view(
+        registry: &crate::event_modules::registry::EventRegistry,
+        parsed: &ParsedEvent,
+    ) -> (String, Vec<(String, String)>, Vec<(String, String)>) {
+        let event_type = registry
+            .lookup(parsed.event_type_code())
+            .map(|m| m.type_name.to_string())
+            .unwrap_or_else(|| "unknown".to_string());
+        let deps = parsed
+            .dep_field_values()
+            .into_iter()
+            .map(|(field, raw_id)| (field.to_string(), event_id_to_base64(&raw_id)))
+            .collect();
+        let fields = parsed
+            .human_fields()
+            .into_iter()
+            .map(|(k, v)| (k.to_string(), v))
+            .collect();
+        (event_type, deps, fields)
+    }
 
-        let deps: Vec<(String, String)> = match &parsed {
-            Ok(p) => p
-                .dep_field_values()
-                .into_iter()
-                .map(|(field, raw_id)| (field.to_string(), event_id_to_base64(&raw_id)))
-                .collect(),
-            Err(_) => Vec::new(),
-        };
-
-        let fields: Vec<(String, String)> = match &parsed {
-            Ok(p) => p
-                .human_fields()
-                .into_iter()
-                .map(|(k, v)| (k.to_string(), v))
-                .collect(),
-            Err(e) => vec![("parse_error".into(), format!("{}", e))],
-        };
-
-        // Attempt decryption for encrypted events.
-        let (decrypted_inner, deps) = if let Ok(ParsedEvent::Encrypted(enc)) = &parsed {
-            let key_id_b64 = event_id_to_base64(&enc.key_event_id);
-            match key_secrets.get(&key_id_b64).and_then(|key_bytes| {
-                if key_bytes.len() != 32 {
-                    return None;
+    fn inspect_event(
+        registry: &crate::event_modules::registry::EventRegistry,
+        parsed: &ParsedEvent,
+        key_secrets: &std::collections::HashMap<String, Vec<u8>>,
+    ) -> (
+        String,
+        Vec<(String, String)>,
+        Vec<(String, String)>,
+        Option<EventListDecrypted>,
+    ) {
+        match parsed {
+            ParsedEvent::Signed(signed) => {
+                let signer_dep = vec![(
+                    "signer_event_id".to_string(),
+                    event_id_to_base64(&signed.signer_event_id),
+                )];
+                match parse_event(&signed.payload) {
+                    Ok(inner) if inner.event_type_code() == signed.inner_type_code => {
+                        let (event_type, mut deps, fields, decrypted_inner) =
+                            inspect_event(registry, &inner, key_secrets);
+                        deps.extend(signer_dep);
+                        (event_type, deps, fields, decrypted_inner)
+                    }
+                    _ => {
+                        let (event_type, mut deps, fields) = base_event_view(registry, parsed);
+                        deps.extend(signer_dep);
+                        (event_type, deps, fields, None)
+                    }
                 }
-                let mut key_arr = [0u8; 32];
-                key_arr.copy_from_slice(key_bytes);
-                let plaintext =
-                    decrypt_event_blob(&key_arr, &enc.nonce, &enc.ciphertext, &enc.auth_tag)
-                        .ok()?;
-                let inner_parsed = parse_event(&plaintext).ok()?;
-                let inner_type_name = registry
-                    .lookup(inner_parsed.event_type_code())
-                    .map(|m| m.type_name)
-                    .unwrap_or("unknown");
-                let inner_deps: Vec<(String, String)> = inner_parsed
-                    .dep_field_values()
-                    .into_iter()
-                    .map(|(field, raw_id)| (field.to_string(), event_id_to_base64(&raw_id)))
-                    .collect();
-                Some((inner_type_name.to_string(), inner_deps, inner_parsed))
-            }) {
-                Some((inner_type_name, inner_deps, inner_parsed)) => {
-                    // Merge inner deps first, then outer deps (key_event_id).
-                    let mut merged_deps = inner_deps.clone();
-                    merged_deps.extend(deps);
-                    (
-                        Some(EventListDecrypted {
-                            inner_type: inner_type_name,
-                            deps: inner_deps,
-                            fields: inner_parsed
-                                .human_fields()
-                                .into_iter()
-                                .map(|(k, v)| (k.to_string(), v))
-                                .collect(),
-                        }),
-                        merged_deps,
-                    )
-                }
-                None => (None, deps),
             }
-        } else {
-            (None, deps)
+            ParsedEvent::Encrypted(enc) => {
+                let (event_type, outer_deps, fields) = base_event_view(registry, parsed);
+                let decrypted_inner = key_secrets
+                    .get(&event_id_to_base64(&enc.key_event_id))
+                    .and_then(|key_bytes| {
+                        if key_bytes.len() != 32 {
+                            return None;
+                        }
+                        let mut key_arr = [0u8; 32];
+                        key_arr.copy_from_slice(key_bytes);
+                        let plaintext = decrypt_event_blob(
+                            &key_arr,
+                            &enc.nonce,
+                            &enc.ciphertext,
+                            &enc.auth_tag,
+                        )
+                        .ok()?;
+                        let inner = parse_event(&plaintext).ok()?;
+                        (inner.event_type_code() == enc.inner_type_code).then_some(inner)
+                    })
+                    .map(|inner| {
+                        let (inner_type, inner_deps, inner_fields, _) =
+                            inspect_event(registry, &inner, key_secrets);
+                        EventListDecrypted {
+                            inner_type,
+                            deps: inner_deps,
+                            fields: inner_fields,
+                        }
+                    });
+                let mut deps = decrypted_inner
+                    .as_ref()
+                    .map(|inner| inner.deps.clone())
+                    .unwrap_or_default();
+                deps.extend(outer_deps);
+                (event_type, deps, fields, decrypted_inner)
+            }
+            _ => {
+                let (event_type, deps, fields) = base_event_view(registry, parsed);
+                (event_type, deps, fields, None)
+            }
+        }
+    }
+
+    let mut events = Vec::new();
+    for (id_b64, _event_type, blob, created_at_ms) in rows {
+        let parsed = parse_event(&blob);
+        let (event_type, deps, fields, decrypted_inner) = match &parsed {
+            Ok(p) => inspect_event(&registry, p, key_secrets),
+            Err(e) => (
+                "unknown".to_string(),
+                Vec::new(),
+                vec![("parse_error".into(), format!("{}", e))],
+                None,
+            ),
         };
 
         events.push(EventListItem {

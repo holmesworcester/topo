@@ -135,6 +135,14 @@ fn load_invite_public_key(
         |row| row.get(0),
     )?;
     match parse_event(&blob)? {
+        ParsedEvent::Signed(signed) => match parse_event(&signed.payload)? {
+            ParsedEvent::UserInvite(event) => Ok(event.public_key),
+            ParsedEvent::DeviceInvite(event) => Ok(event.public_key),
+            other => Err(format!(
+                "invite event {invite_event_id_b64} has wrong inner type: {other:?}"
+            )
+            .into()),
+        },
         ParsedEvent::UserInvite(event) => Ok(event.public_key),
         ParsedEvent::DeviceInvite(event) => Ok(event.public_key),
         other => {
@@ -713,8 +721,15 @@ pub fn resolve_bootstrap_inviter_peer_id(
     };
 
     let signer_event_id = match parse_event(&invite_blob)? {
-        ParsedEvent::UserInvite(event) if event.signer_type == 5 => event.signed_by,
-        ParsedEvent::DeviceInvite(event) if event.signer_type == 5 => event.signed_by,
+        ParsedEvent::Signed(event) => match parse_event(&event.payload)? {
+            ParsedEvent::UserInvite(_) | ParsedEvent::DeviceInvite(_) => event.signer_event_id,
+            other => {
+                return Err(format!(
+                    "invite event {invite_event_id_b64} has wrong inner type for bootstrap binding: {other:?}"
+                )
+                .into())
+            }
+        },
         ParsedEvent::UserInvite(_) | ParsedEvent::DeviceInvite(_) => return Ok(None),
         other => {
             return Err(format!(
@@ -740,6 +755,16 @@ pub fn resolve_bootstrap_inviter_peer_id(
             ParsedEvent::PeerShared(event) => Ok(Some(hex::encode(
                 spki_fingerprint_from_ed25519_pubkey(&event.public_key),
             ))),
+            ParsedEvent::Signed(signed) => match parse_event(&signed.payload)? {
+                ParsedEvent::PeerShared(event) => Ok(Some(hex::encode(
+                    spki_fingerprint_from_ed25519_pubkey(&event.public_key),
+                ))),
+                other => Err(format!(
+                    "invite signer {} resolved to non-peer_shared event: {other:?}",
+                    signer_event_id_b64
+                )
+                .into()),
+            },
             other => Err(format!(
                 "invite signer {} resolved to non-peer_shared event: {other:?}",
                 signer_event_id_b64
@@ -767,6 +792,7 @@ pub fn resolve_bootstrap_inviter_peer_id(
 mod tests {
     use ed25519_dalek::SigningKey;
     use rusqlite::params;
+    use tokio::time::{timeout, Duration};
 
     use crate::crypto::{event_id_to_base64, spki_fingerprint_from_ed25519_pubkey};
     use crate::db::open_connection;
@@ -1145,9 +1171,6 @@ mod tests {
             public_key: invite_signing_key.verifying_key().to_bytes(),
             workspace_id: [0x43; 32],
             authority_event_id: [0x44; 32],
-            signed_by: [0x45; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
         }))
         .expect("encode invite");
 
@@ -1302,9 +1325,6 @@ mod tests {
             public_key: invite_signing_key.verifying_key().to_bytes(),
             workspace_id: [0x63; 32],
             authority_event_id: [0x64; 32],
-            signed_by: [0x65; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
         }))
         .expect("encode invite");
 
@@ -1420,9 +1440,6 @@ mod tests {
             public_key: invite_signing_key.verifying_key().to_bytes(),
             workspace_id: [0x93; 32],
             authority_event_id: [0x94; 32],
-            signed_by: [0x95; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
         }))
         .expect("encode invite");
 
@@ -1580,45 +1597,66 @@ mod tests {
         .unwrap();
         drop(server_db);
 
-        let (_server_ep, _client_ep, server_daemon, client_daemon, _server_addr) =
+        let (_server_ep, _client_ep, server_daemon, client_daemon, _server_addr) = timeout(
+            Duration::from_secs(10),
             connect_test_daemons(
                 server_db_path.to_str().unwrap(),
                 client_db_path.to_str().unwrap(),
+            ),
+        )
+        .await
+        .expect("connect daemon endpoints timed out")
+        .expect("connect daemon endpoints");
+        let (server_session_res, client_session_res) = timeout(Duration::from_secs(10), async {
+            tokio::join!(
+                server_daemon.accept_inbound_session(),
+                client_daemon.open_outbound_session(crate::transport::SessionClass::Range)
             )
-            .await
-            .expect("connect daemon endpoints");
-        let (server_session_res, client_session_res) = tokio::join!(
-            server_daemon.accept_inbound_session(),
-            client_daemon.open_outbound_session(crate::transport::SessionClass::Range)
-        );
+        })
+        .await
+        .expect("open/accept session timed out");
         let mut server_session = server_session_res.expect("accept inbound session");
         let mut client_session = client_session_res.expect("open outbound session");
 
         let auth_plan = OutboundSessionAuthPlan::PeerShared {
             target_peer_id: target_tenant_id.clone(),
         };
-        let (outbound, inbound) = tokio::join!(
-            send_outbound_session_auth(
-                client_session.io.as_mut(),
-                client_db_path.to_str().unwrap(),
-                &source_peer_id,
-                Some(&client_daemon),
-                client_daemon.remote_daemon_peer_id(),
-                Some(&server_daemon_peer_id),
-                &auth_plan,
-            ),
-            async {
-                let inbound = read_inbound_session_auth_for_connection(
+        let outbound_fut = async {
+            timeout(
+                Duration::from_secs(10),
+                send_outbound_session_auth(
+                    client_session.io.as_mut(),
+                    client_db_path.to_str().unwrap(),
+                    &source_peer_id,
+                    Some(&client_daemon),
+                    client_daemon.remote_daemon_peer_id(),
+                    Some(&server_daemon_peer_id),
+                    &auth_plan,
+                ),
+            )
+            .await
+            .map_err(|_| "outbound route auth timed out")?
+        };
+        let inbound_fut = async {
+            let inbound = timeout(
+                Duration::from_secs(10),
+                read_inbound_session_auth_for_connection(
                     server_session.io.as_mut(),
                     server_db_path.to_str().unwrap(),
                     &server_daemon,
-                )
-                .await?;
-                send_inbound_session_auth_ack(server_session.io.as_mut(), &inbound.tenant_id)
-                    .await?;
-                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(inbound)
-            },
-        );
+                ),
+            )
+            .await
+            .map_err(|_| "inbound route auth timed out")??;
+            timeout(
+                Duration::from_secs(10),
+                send_inbound_session_auth_ack(server_session.io.as_mut(), &inbound.tenant_id),
+            )
+            .await
+            .map_err(|_| "inbound route auth ack timed out")??;
+            Ok::<_, Box<dyn std::error::Error + Send + Sync>>(inbound)
+        };
+        let (outbound, inbound) = tokio::join!(outbound_fut, inbound_fut);
 
         let outbound = outbound.expect("route-only outbound auth");
         let inbound = inbound.expect("route-only inbound auth");

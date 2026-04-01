@@ -1,9 +1,10 @@
 use super::super::ParsedEvent;
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::queries::{ContextLoadResult, ProjectionQueries};
+use crate::projection::queries::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 pub fn build_projector_context(
     queries: &dyn ProjectionQueries,
+    frame: &ProjectionFrameContext,
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
@@ -13,7 +14,7 @@ pub fn build_projector_context(
         _ => return Err("admin context loader called for non-admin event".into()),
     };
 
-    let ctx = queries.load_admin_context(recorded_by, event_id_b64, admin)?;
+    let ctx = queries.load_admin_context(frame, recorded_by, event_id_b64, admin)?;
     if let Some(reason) = &ctx.admin_user_key_mismatch_reason {
         return Ok(ContextLoadResult::reject(reason.clone()));
     }
@@ -49,16 +50,16 @@ mod projector_tests {
     use super::*;
     use crate::db::{open_in_memory, schema::create_tables};
     use crate::event_modules::{AdminEvent, ParsedEvent, WorkspaceEvent};
+    use crate::projection::contract::CurrentSignerInfo;
     use crate::projection::queries::ContextLoadResult;
+    use crate::projection::queries::ProjectionFrameContext;
+    use crate::event_modules::EVENT_TYPE_WORKSPACE;
 
     fn admin_event() -> ParsedEvent {
         ParsedEvent::Admin(AdminEvent {
             created_at_ms: 1,
             public_key: [9u8; 32],
             user_event_id: [7u8; 32],
-            signed_by: [8u8; 32],
-            signer_type: 1,
-            signature: [0u8; 64],
         })
     }
 
@@ -113,8 +114,16 @@ mod projector_tests {
         let ParsedEvent::Admin(admin) = admin_event() else {
             unreachable!();
         };
+        let frame = ProjectionFrameContext {
+            current_transport_key_event_id: None,
+            current_signer: Some(CurrentSignerInfo {
+                event_id: crate::crypto::event_id_to_base64(&[3u8; 32]),
+                semantic_type_code: EVENT_TYPE_WORKSPACE,
+            }),
+        };
         let loaded = build_projector_context(
             &conn,
+            &frame,
             recorded_by,
             "admin-event",
             &ParsedEvent::Admin(admin),

@@ -82,7 +82,7 @@ fn index_endpoint_shared_for_workspace(
 /// Only events already projected as valid by at least one existing workspace
 /// sibling are replayed. This keeps seed replay aligned with same-DB fanout
 /// behavior without needing a redundant network fetch.
-fn replay_existing_workspace_shared_events_for_tenant(
+pub(crate) fn replay_existing_workspace_shared_events_for_tenant(
     db: &Connection,
     recorded_by: &str,
     workspace_id: &EventId,
@@ -421,11 +421,9 @@ fn create_workspace_inner(
         public_key: invite_key.verifying_key().to_bytes(),
         workspace_id: ws_eid,
         authority_event_id: ws_eid,
-        signed_by: ws_eid,
-        signer_type: 1,
-        signature: [0u8; 64],
     });
-    let uib_eid = create_signed_event_synchronous(db, &derived_peer_id, &uib, &workspace_key)?;
+    let uib_eid =
+        create_signed_event_synchronous(db, &derived_peer_id, &ws_eid, &uib, &workspace_key)?;
 
     // 7. User (signed by invite_key)
     let user_key = SigningKey::generate(&mut rng);
@@ -433,23 +431,17 @@ fn create_workspace_inner(
         created_at_ms: current_timestamp_ms_u64(),
         public_key: user_key.verifying_key().to_bytes(),
         username: username.to_string(),
-        signed_by: uib_eid,
-        signer_type: 2,
-        signature: [0u8; 64],
     });
-    let ub_eid = create_signed_event_synchronous(db, &derived_peer_id, &ub, &invite_key)?;
+    let ub_eid = create_signed_event_synchronous(db, &derived_peer_id, &uib_eid, &ub, &invite_key)?;
 
     // 8. Admin (bootstrap grant for creator user; signed by workspace_key)
     let admin_evt = ParsedEvent::Admin(AdminEvent {
         created_at_ms: current_timestamp_ms_u64(),
         public_key: user_key.verifying_key().to_bytes(),
         user_event_id: ub_eid,
-        signed_by: ws_eid,
-        signer_type: 1,
-        signature: [0u8; 64],
     });
     let _admin_eid =
-        create_signed_event_synchronous(db, &derived_peer_id, &admin_evt, &workspace_key)?;
+        create_signed_event_synchronous(db, &derived_peer_id, &ws_eid, &admin_evt, &workspace_key)?;
 
     // 9. DeviceInvite (signed by user_key)
     let device_invite_key = SigningKey::generate(&mut rng);
@@ -457,11 +449,8 @@ fn create_workspace_inner(
         created_at_ms: current_timestamp_ms_u64(),
         public_key: device_invite_key.verifying_key().to_bytes(),
         authority_event_id: ub_eid,
-        signed_by: ub_eid,
-        signer_type: 4,
-        signature: [0u8; 64],
     });
-    let dif_eid = create_signed_event_synchronous(db, &derived_peer_id, &dif, &user_key)?;
+    let dif_eid = create_signed_event_synchronous(db, &derived_peer_id, &ub_eid, &dif, &user_key)?;
 
     // 10. PeerShared (signed by device_invite_key; key pre-generated above)
     let psf = ParsedEvent::PeerShared(PeerSharedEvent {
@@ -470,11 +459,9 @@ fn create_workspace_inner(
         user_event_id: ub_eid,
         endpoint_shared_event_id,
         device_name: device_name.to_string(),
-        signed_by: dif_eid,
-        signer_type: 3,
-        signature: [0u8; 64],
     });
-    let psf_eid = create_signed_event_synchronous(db, &derived_peer_id, &psf, &device_invite_key)?;
+    let psf_eid =
+        create_signed_event_synchronous(db, &derived_peer_id, &dif_eid, &psf, &device_invite_key)?;
     index_endpoint_shared_for_workspace(db, &derived_peer_id, &ws_eid, &endpoint_shared_event_id)?;
 
     // 11. Emit peer_secret for peer_shared signer key only.
@@ -586,13 +573,11 @@ fn join_workspace_inner(
         created_at_ms: current_timestamp_ms_u64(),
         public_key: user_key.verifying_key().to_bytes(),
         username: username.to_string(),
-        signed_by: *invite_event_id,
-        signer_type: 2,
-        signature: [0u8; 64],
     });
     let user_event_id = event_id_or_blocked(create_signed_event_synchronous(
         db,
         recorded_by,
+        invite_event_id,
         &ub_evt,
         invite_key,
     ))?;
@@ -603,13 +588,11 @@ fn join_workspace_inner(
         created_at_ms: current_timestamp_ms_u64(),
         public_key: device_invite_key.verifying_key().to_bytes(),
         authority_event_id: user_event_id,
-        signed_by: user_event_id,
-        signer_type: 4,
-        signature: [0u8; 64],
     });
     let device_invite_event_id = event_id_or_blocked(create_signed_event_synchronous(
         db,
         recorded_by,
+        &user_event_id,
         &dif_evt,
         &user_key,
     ))?;
@@ -621,13 +604,11 @@ fn join_workspace_inner(
         user_event_id,
         endpoint_shared_event_id,
         device_name: device_name.to_string(),
-        signed_by: device_invite_event_id,
-        signer_type: 3,
-        signature: [0u8; 64],
     });
     let peer_shared_event_id = event_id_or_blocked(create_signed_event_synchronous(
         db,
         recorded_by,
+        &device_invite_event_id,
         &psf_evt,
         &device_invite_key,
     ))?;
@@ -726,13 +707,11 @@ pub fn add_device_to_workspace(
         user_event_id,
         endpoint_shared_event_id,
         device_name: device_name.to_string(),
-        signed_by: *device_invite_event_id,
-        signer_type: 3,
-        signature: [0u8; 64],
     });
     let peer_shared_event_id = event_id_or_blocked(create_signed_event_synchronous(
         db,
         recorded_by,
+        device_invite_event_id,
         &psf_evt,
         device_invite_key,
     ))?;

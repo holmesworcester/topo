@@ -437,13 +437,9 @@ fn test_full_bootstrap_progression_from_projected_sql_state() {
         public_key: invite_pub,
         workspace_id: ws_eid,
         authority_event_id: ws_eid,
-        signed_by: ws_eid,
-        signer_type: 1,
-        signature: [0u8; 64],
     };
     let uib_event = ParsedEvent::UserInvite(uib);
-    let mut uib_blob = events::encode_event(&uib_event).unwrap();
-    sign_blob(&workspace_key, &mut uib_blob);
+    let uib_blob = sign_blob(&workspace_key, &ws_eid, &uib_event);
     let uib_eid = hash_event(&uib_blob);
 
     // Set up bootstrap context before InviteAccepted
@@ -508,13 +504,9 @@ fn test_full_bootstrap_progression_from_projected_sql_state() {
         created_at_ms: now_ms(),
         public_key: user_pub,
         username: "testuser".to_string(),
-        signed_by: uib_eid,
-        signer_type: 2,
-        signature: [0u8; 64],
     };
     let ub_event = ParsedEvent::User(ub);
-    let mut ub_blob = events::encode_event(&ub_event).unwrap();
-    sign_blob(&invite_key, &mut ub_blob);
+    let ub_blob = sign_blob(&invite_key, &uib_eid, &ub_event);
     let ub_eid = insert_event_raw(&conn, recorded_by, &ub_blob);
     assert_eq!(
         project_one(&conn, recorded_by, &ub_eid).unwrap(),
@@ -528,13 +520,9 @@ fn test_full_bootstrap_progression_from_projected_sql_state() {
         created_at_ms: now_ms(),
         public_key: device_invite_pub,
         authority_event_id: ub_eid,
-        signed_by: ub_eid,
-        signer_type: 4,
-        signature: [0u8; 64],
     };
     let dif_event = ParsedEvent::DeviceInvite(dif);
-    let mut dif_blob = events::encode_event(&dif_event).unwrap();
-    sign_blob(&user_key, &mut dif_blob);
+    let dif_blob = sign_blob(&user_key, &ub_eid, &dif_event);
     let dif_eid = insert_event_raw(&conn, recorded_by, &dif_blob);
     assert_eq!(
         project_one(&conn, recorded_by, &dif_eid).unwrap(),
@@ -551,13 +539,9 @@ fn test_full_bootstrap_progression_from_projected_sql_state() {
         user_event_id: ub_eid,
         endpoint_shared_event_id,
         device_name: "device1".to_string(),
-        signed_by: dif_eid,
-        signer_type: 3,
-        signature: [0u8; 64],
     };
     let psf_event = ParsedEvent::PeerShared(psf);
-    let mut psf_blob = events::encode_event(&psf_event).unwrap();
-    sign_blob(&device_invite_key, &mut psf_blob);
+    let psf_blob = sign_blob(&device_invite_key, &dif_eid, &psf_event);
     let psf_eid = insert_event_raw(&conn, recorded_by, &psf_blob);
     assert_eq!(
         project_one(&conn, recorded_by, &psf_eid).unwrap(),

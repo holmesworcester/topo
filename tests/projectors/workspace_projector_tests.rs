@@ -10,6 +10,7 @@ mod tests {
     use crate::harness::fixtures::*;
     use topo::event_modules::workspace::{build_projector_context, project_pure, WorkspaceEvent};
     use topo::event_modules::ParsedEvent;
+    use topo::projection::queries::ProjectionFrameContext;
 
     const PEER: &str = "peer_alice";
 
@@ -30,7 +31,14 @@ mod tests {
         let parsed = make_workspace([2u8; 32]);
         let queries = queries_with_ctx(ctx_with_anchor(&ws_id_b64));
         let ctx = expect_context_ready(
-            build_projector_context(&queries, PEER, &ws_id_b64, &parsed).unwrap(),
+            build_projector_context(
+                &queries,
+                &ProjectionFrameContext::default(),
+                PEER,
+                &ws_id_b64,
+                &parsed,
+            )
+            .unwrap(),
         );
 
         let result = project_pure(PEER, &ws_id_b64, &parsed, &ctx);
@@ -48,7 +56,14 @@ mod tests {
         let parsed = make_workspace([2u8; 32]);
         let queries = queries_with_ctx(empty_ctx());
 
-        let result = build_projector_context(&queries, PEER, &ws_id_b64, &parsed).unwrap();
+        let result = build_projector_context(
+            &queries,
+            &ProjectionFrameContext::default(),
+            PEER,
+            &ws_id_b64,
+            &parsed,
+        )
+        .unwrap();
         assert_context_block(&result);
     }
 
@@ -62,7 +77,14 @@ mod tests {
         let parsed = make_workspace([2u8; 32]);
         let queries = queries_with_ctx(ctx_with_anchor(&other_anchor));
 
-        let result = build_projector_context(&queries, PEER, &ws_id_b64, &parsed).unwrap();
+        let result = build_projector_context(
+            &queries,
+            &ProjectionFrameContext::default(),
+            PEER,
+            &ws_id_b64,
+            &parsed,
+        )
+        .unwrap();
         assert_context_reject_contains(&result, "does not match accepted invite binding");
     }
 
@@ -75,7 +97,14 @@ mod tests {
         let parsed = make_workspace([2u8; 32]);
         let queries = queries_with_ctx(ctx_with_anchor(&ws_id_b64));
         let ctx = expect_context_ready(
-            build_projector_context(&queries, PEER, &ws_id_b64, &parsed).unwrap(),
+            build_projector_context(
+                &queries,
+                &ProjectionFrameContext::default(),
+                PEER,
+                &ws_id_b64,
+                &parsed,
+            )
+            .unwrap(),
         );
 
         let result = project_pure(PEER, &ws_id_b64, &parsed, &ctx);

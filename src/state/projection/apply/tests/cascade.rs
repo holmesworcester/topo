@@ -160,17 +160,15 @@ fn test_encrypted_inner_dep_cascade_unblock() {
         target_event_id: msg_eid,
         author_id: user_for_signer(&signer_eid),
         emoji: "heart".to_string(),
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     };
     let rxn_event = ParsedEvent::Reaction(rxn);
-    let mut inner_blob = events::encode_event(&rxn_event).unwrap();
-    sign_blob(&signing_key, &mut inner_blob);
-
-    // Wrap in encrypted envelope
-    let (_enc, enc_blob) =
-        make_encrypted_event(&key_bytes, &inner_blob, EVENT_TYPE_REACTION, &sk_eid);
+    let enc_blob = make_signed_encrypted_blob_with_key(
+        &signing_key,
+        &signer_eid,
+        &rxn_event,
+        &key_bytes,
+        &sk_eid,
+    );
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
 
     // Project encrypted event — should block on missing key_event_id dep
@@ -295,17 +293,19 @@ fn test_file_slice_guard_retry_after_cascaded_attachment() {
         blob_bytes: 204800,
         total_slices: 4,
         slice_bytes: 65536,
-        root_hash: [12u8; 32],
+        root_hash: super::deterministic_file_root_hash(file_id, 204800),
         key_event_id: file_key_event_id,
         filename: "test.bin".to_string(),
         mime_type: "application/octet-stream".to_string(),
-        signed_by: signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     };
     let att_event = ParsedEvent::File(att);
-    let mut att_blob = events::encode_event(&att_event).unwrap();
-    sign_blob(&signing_key, &mut att_blob);
+    let att_blob = make_signed_encrypted_blob_with_key(
+        &signing_key,
+        &signer_eid,
+        &att_event,
+        &test_content_key_bytes(),
+        &test_content_key_event_id(),
+    );
     let att_eid = insert_event_raw(&conn, recorded_by, &att_blob);
     let r1 = project_one(&conn, recorded_by, &att_eid).unwrap();
     assert!(
@@ -506,9 +506,19 @@ fn test_source_isomorphism_encrypted_message() {
     let sk_eid_a = insert_event_raw(&conn_a, recorded_by, &sk_blob_a);
     project_one(&conn_a, recorded_by, &sk_eid_a).unwrap();
 
-    let (_msg_a, msg_blob_a) = make_message_signed(&signing_key_a, &signer_a, "enc msg");
-    let (_enc_a, enc_blob_a) =
-        make_encrypted_event(&key_bytes, &msg_blob_a, EVENT_TYPE_MESSAGE, &sk_eid_a);
+    let msg_a = ParsedEvent::Message(MessageEvent {
+        created_at_ms: now_ms(),
+        workspace_id: [1u8; 32],
+        author_id: user_for_signer(&signer_a),
+        content: "enc msg".to_string(),
+    });
+    let enc_blob_a = make_signed_encrypted_blob_with_key(
+        &signing_key_a,
+        &signer_a,
+        &msg_a,
+        &key_bytes,
+        &sk_eid_a,
+    );
     let enc_eid_a = insert_event_raw(&conn_a, recorded_by, &enc_blob_a);
     let r_a = project_one(&conn_a, recorded_by, &enc_eid_a).unwrap();
     assert_eq!(r_a, ProjectionDecision::Valid);
@@ -519,9 +529,19 @@ fn test_source_isomorphism_encrypted_message() {
     let (_sk_b, sk_blob_b) = make_key_secret(key_bytes);
     let sk_eid_b = insert_event_raw(&conn_b, recorded_by, &sk_blob_b);
 
-    let (_msg_b, msg_blob_b) = make_message_signed(&signing_key_b, &signer_b, "enc msg");
-    let (_enc_b, enc_blob_b) =
-        make_encrypted_event(&key_bytes, &msg_blob_b, EVENT_TYPE_MESSAGE, &sk_eid_b);
+    let msg_b = ParsedEvent::Message(MessageEvent {
+        created_at_ms: now_ms(),
+        workspace_id: [1u8; 32],
+        author_id: user_for_signer(&signer_b),
+        content: "enc msg".to_string(),
+    });
+    let enc_blob_b = make_signed_encrypted_blob_with_key(
+        &signing_key_b,
+        &signer_b,
+        &msg_b,
+        &key_bytes,
+        &sk_eid_b,
+    );
     let enc_eid_b = insert_event_raw(&conn_b, recorded_by, &enc_blob_b);
     let r_b = project_one(&conn_b, recorded_by, &enc_eid_b).unwrap();
     assert!(matches!(r_b, ProjectionDecision::Block { .. }));
@@ -764,9 +784,19 @@ fn test_source_isomorphism_encrypted_reaction_three_phase_cascade() {
     project_one(&conn_a, recorded_by, &msg_eid_a).unwrap();
 
     // Inner reaction blob
-    let (_rxn_a, rxn_blob_a) = make_reaction_signed(&signing_key_a, &signer_a, &msg_eid_a, "heart");
-    let (_enc_a, enc_blob_a) =
-        make_encrypted_event(&key_bytes, &rxn_blob_a, EVENT_TYPE_REACTION, &sk_eid_a);
+    let rxn_a = ParsedEvent::Reaction(ReactionEvent {
+        created_at_ms: now_ms(),
+        target_event_id: msg_eid_a,
+        author_id: user_for_signer(&signer_a),
+        emoji: "heart".to_string(),
+    });
+    let enc_blob_a = make_signed_encrypted_blob_with_key(
+        &signing_key_a,
+        &signer_a,
+        &rxn_a,
+        &key_bytes,
+        &sk_eid_a,
+    );
     let enc_eid_a = insert_event_raw(&conn_a, recorded_by, &enc_blob_a);
     let r_a = project_one(&conn_a, recorded_by, &enc_eid_a).unwrap();
     assert_eq!(r_a, ProjectionDecision::Valid);
@@ -782,9 +812,19 @@ fn test_source_isomorphism_encrypted_reaction_three_phase_cascade() {
     let (_msg_b, msg_blob_b) = make_message_signed(&signing_key_b, &signer_b, "enc rxn target");
     let msg_eid_b = insert_event_raw(&conn_b, recorded_by, &msg_blob_b);
 
-    let (_rxn_b, rxn_blob_b) = make_reaction_signed(&signing_key_b, &signer_b, &msg_eid_b, "heart");
-    let (_enc_b, enc_blob_b) =
-        make_encrypted_event(&key_bytes, &rxn_blob_b, EVENT_TYPE_REACTION, &sk_eid_b);
+    let rxn_b = ParsedEvent::Reaction(ReactionEvent {
+        created_at_ms: now_ms(),
+        target_event_id: msg_eid_b,
+        author_id: user_for_signer(&signer_b),
+        emoji: "heart".to_string(),
+    });
+    let enc_blob_b = make_signed_encrypted_blob_with_key(
+        &signing_key_b,
+        &signer_b,
+        &rxn_b,
+        &key_bytes,
+        &sk_eid_b,
+    );
     let enc_eid_b = insert_event_raw(&conn_b, recorded_by, &enc_blob_b);
 
     // Phase 1: Project encrypted — blocks on key

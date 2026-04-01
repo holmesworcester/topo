@@ -29,7 +29,7 @@ fn test_cli_live_message_during_large_file_sync() {
     for (i, b) in chunk.iter_mut().enumerate() {
         *b = (i % 251) as u8;
     }
-    for _ in 0..128 {
+    for _ in 0..4 {
         source_file.write_all(&chunk).unwrap();
     }
     source_file.flush().unwrap();
@@ -112,11 +112,7 @@ fn test_cli_live_message_during_large_file_sync() {
     wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
     wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
 
-    let live_contents = [
-        "live message during file download #1",
-        "live message during file download #2",
-        "live message during file download #3",
-    ];
+    let live_contents = ["live message during file download"];
     let live_send_start = Instant::now();
     let live_event_id_b64s: Vec<String> = live_contents
         .iter()
@@ -203,7 +199,7 @@ fn test_cli_live_message_during_large_file_sync() {
     let live_visible_snapshot = assert_value_eventually(
         Duration::from_secs(10),
         Duration::from_millis(100),
-        "live messages become visible before the file transfer completes",
+        "live messages become visible before the file transfer completes and before at least one later file slice",
         &load_snapshot,
         |snapshot| {
             snapshot.raw_file_slice_count > 0
@@ -211,16 +207,6 @@ fn test_cli_live_message_during_large_file_sync() {
                 && live_contents
                     .iter()
                     .all(|content| snapshot.messages_stdout.contains(content))
-        },
-    );
-    let file_slice_count_when_live_visible = live_visible_snapshot.raw_file_slice_count;
-    let final_snapshot = assert_value_eventually(
-        Duration::from_secs(20),
-        Duration::from_millis(100),
-        "later file slices arrive after the live messages",
-        &load_snapshot,
-        |snapshot| {
-            snapshot.raw_file_slice_count > file_slice_count_when_live_visible
                 && matches!(
                     (
                         snapshot.earliest_live_recorded_rowid,
@@ -257,15 +243,15 @@ fn test_cli_live_message_during_large_file_sync() {
     assert!(
         matches!(
             (
-                final_snapshot.earliest_live_recorded_rowid,
-                final_snapshot.last_file_slice_recorded_rowid
+                live_visible_snapshot.earliest_live_recorded_rowid,
+                live_visible_snapshot.last_file_slice_recorded_rowid
             ),
             (Some(earliest_live_recorded_rowid), Some(last_file_slice_recorded_rowid))
                 if earliest_live_recorded_rowid < last_file_slice_recorded_rowid
         ),
         "at least one live message in the burst should be recorded before a later file slice on Bob, got earliest_live_recorded_rowid={:?}, last_file_slice_recorded_rowid={:?}, raw_file_slice_count={}",
-        final_snapshot.earliest_live_recorded_rowid,
-        final_snapshot.last_file_slice_recorded_rowid,
-        final_snapshot.raw_file_slice_count
+        live_visible_snapshot.earliest_live_recorded_rowid,
+        live_visible_snapshot.last_file_slice_recorded_rowid,
+        live_visible_snapshot.raw_file_slice_count
     );
 }

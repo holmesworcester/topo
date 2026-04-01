@@ -21,15 +21,11 @@ pub const KEY_SHARED_FIELDS: &[FieldSpec] = &[
     FieldSpec::EventId("recipient_event_id"),
     FieldSpec::EventId("unwrap_key_event_id"),
     FieldSpec::EventId("wrapped_key"),
-    FieldSpec::EventId("signed_by"),
-    FieldSpec::U8("signer_type"),
-    FieldSpec::FixedBytes("signature", 64),
 ];
 
 /// KeyShared (type 22): type(1) + created_at(8) + key_event_id(32) + frontier_count(1)
 ///   + frontier_ref_1..4(128) + frontier_hash(32) + delivery_target_id(32)
-///   + recipient_event_id(32) + unwrap_key_event_id(32) + wrapped_key(32)
-///   + signed_by(32) + signer_type(1) + signature(64) = 427
+///   + recipient_event_id(32) + unwrap_key_event_id(32) + wrapped_key(32) = 330
 pub const KEY_SHARED_WIRE_SIZE: usize = wire_size_for_fields(KEY_SHARED_FIELDS);
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -46,9 +42,6 @@ pub struct KeySharedEvent {
     pub recipient_event_id: [u8; 32],
     pub unwrap_key_event_id: [u8; 32],
     pub wrapped_key: [u8; 32],
-    pub signed_by: [u8; 32],
-    pub signer_type: u8,
-    pub signature: [u8; 64],
 }
 
 impl super::Describe for KeySharedEvent {
@@ -77,14 +70,6 @@ pub fn parse_key_shared(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         recipient_event_id: values[9].as_event_id().unwrap(),
         unwrap_key_event_id: values[10].as_event_id().unwrap(),
         wrapped_key: values[11].as_event_id().unwrap(),
-        signed_by: values[12].as_event_id().unwrap(),
-        signer_type: values[13].as_u8().unwrap(),
-        signature: {
-            let bytes = values[14].as_fixed_bytes().unwrap();
-            let mut sig = [0u8; 64];
-            sig.copy_from_slice(bytes);
-            sig
-        },
     }))
 }
 
@@ -107,9 +92,6 @@ pub fn encode_key_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         FieldValue::EventId(e.recipient_event_id),
         FieldValue::EventId(e.unwrap_key_event_id),
         FieldValue::EventId(e.wrapped_key),
-        FieldValue::EventId(e.signed_by),
-        FieldValue::U8(e.signer_type),
-        FieldValue::FixedBytes(e.signature.to_vec()),
     ];
 
     Ok(encode_fields(
@@ -121,7 +103,7 @@ pub fn encode_key_shared(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::queries::ProjectionQueries;
+use crate::projection::queries::{ProjectionFrameContext, ProjectionQueries};
 use rusqlite::Connection;
 
 pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
@@ -149,6 +131,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 
 pub fn build_projector_context(
     queries: &dyn ProjectionQueries,
+    frame: &ProjectionFrameContext,
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
@@ -159,7 +142,7 @@ pub fn build_projector_context(
     };
 
     Ok(crate::projection::queries::ContextLoadResult::ready(
-        queries.load_key_shared_context(recorded_by, event_id_b64, ss)?,
+        queries.load_key_shared_context(frame, recorded_by, event_id_b64, ss)?,
     ))
 }
 
@@ -272,7 +255,7 @@ pub fn project_pure(
     )
 }
 
-pub static KEY_SHARED_META: EventTypeMeta = EventTypeMeta {
+pub static KEY_SHARED_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_KEY_SHARED,
     type_name: "key_shared",
     projection_table: "key_shared",
@@ -283,11 +266,10 @@ pub static KEY_SHARED_META: EventTypeMeta = EventTypeMeta {
         "frontier_ref_2",
         "frontier_ref_3",
         "frontier_ref_4",
-        "signed_by",
     ],
-    dep_field_type_codes: &[&[10, 12], &[], &[], &[], &[], &[]],
+    dep_field_type_codes: &[&[10, 12], &[], &[], &[], &[]],
     signer_required: true,
-    signature_byte_len: 64,
+    signature_byte_len: 0,
     encryptable: false,
     parse: parse_key_shared,
     encode: encode_key_shared,

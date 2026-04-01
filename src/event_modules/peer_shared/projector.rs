@@ -1,10 +1,11 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::queries::{ContextLoadResult, ProjectionQueries};
+use crate::projection::queries::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 pub fn build_projector_context(
     queries: &dyn ProjectionQueries,
+    frame: &ProjectionFrameContext,
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
@@ -14,7 +15,7 @@ pub fn build_projector_context(
         _ => return Err("peer_shared context loader called for non-peer_shared event".into()),
     };
 
-    let ctx = queries.load_peer_shared_context(recorded_by, event_id_b64, peer_shared)?;
+    let ctx = queries.load_peer_shared_context(frame, recorded_by, event_id_b64, peer_shared)?;
     if let Some(reason) = &ctx.peer_shared_user_mismatch_reason {
         return Ok(ContextLoadResult::reject(reason.clone()));
     }
@@ -95,10 +96,13 @@ pub fn project_pure(
 mod projector_tests {
     use super::*;
     use crate::db::{open_in_memory, schema::create_tables};
+    use crate::event_modules::EVENT_TYPE_DEVICE_INVITE;
     use crate::event_modules::ShareScope;
     use crate::event_modules::{encode_event, DeviceInviteEvent};
     use crate::event_modules::{ParsedEvent, PeerSharedEvent, WorkspaceEvent};
+    use crate::projection::contract::CurrentSignerInfo;
     use crate::projection::queries::ContextLoadResult;
+    use crate::projection::queries::ProjectionFrameContext;
 
     fn peer_shared_event() -> ParsedEvent {
         ParsedEvent::PeerShared(PeerSharedEvent {
@@ -107,9 +111,6 @@ mod projector_tests {
             user_event_id: [6u8; 32],
             endpoint_shared_event_id: [8u8; 32],
             device_name: "phone".to_string(),
-            signed_by: [7u8; 32],
-            signer_type: 3,
-            signature: [0u8; 64],
         })
     }
 
@@ -165,9 +166,6 @@ mod projector_tests {
             created_at_ms: 1,
             public_key: [4u8; 32],
             authority_event_id: [6u8; 32],
-            signed_by: [6u8; 32],
-            signer_type: 4,
-            signature: [0u8; 64],
         });
         let blob = encode_event(&event).expect("encode device invite");
         conn.execute(
@@ -197,8 +195,16 @@ mod projector_tests {
             }
         });
 
-        let loaded = build_projector_context(&conn, recorded_by, "peer-shared-event", &parsed)
-            .expect("load peer_shared context");
+        let frame = ProjectionFrameContext {
+            current_transport_key_event_id: None,
+            current_signer: Some(CurrentSignerInfo {
+                event_id: signer_event_id_b64.clone(),
+                semantic_type_code: EVENT_TYPE_DEVICE_INVITE,
+            }),
+        };
+        let loaded =
+            build_projector_context(&conn, &frame, recorded_by, "peer-shared-event", &parsed)
+                .expect("load peer_shared context");
         match loaded {
             ContextLoadResult::Reject { reason } => {
                 assert!(reason.contains("authorizes user"));

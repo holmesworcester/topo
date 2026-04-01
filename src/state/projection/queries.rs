@@ -1,12 +1,13 @@
-use crate::crypto::{event_id_to_base64, EventId};
+use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::event_modules::{
     endpoint_shared::load_endpoint_shared_by_event_id, parse_event, AdminEvent, DeviceInviteEvent,
     FileEvent, FileSliceEvent, InviteAcceptedEvent, KeySharedEvent, MessageDeletionEvent,
     MessageEvent, ParsedEvent, PeerSharedEvent, ReactionEvent, UserInviteEvent, WorkspaceEvent,
+    EVENT_TYPE_DEVICE_INVITE, EVENT_TYPE_PEER_SHARED, EVENT_TYPE_WORKSPACE,
 };
 use crate::projection::contract::{
-    BootstrapContextSnapshot, ContextSnapshot, DeletionIntentInfo, FileDescriptorInfo,
-    UnwrappedSecretMaterial,
+    BootstrapContextSnapshot, ContextSnapshot, CurrentSignerInfo, DeletionIntentInfo,
+    FileDescriptorInfo, UnwrappedSecretMaterial,
 };
 use crate::projection::encrypted::unwrap_key_from_sender;
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
@@ -33,6 +34,12 @@ impl ContextLoadResult {
         Self::Block { missing }
     }
 
+    pub fn block_guard() -> Self {
+        Self::Block {
+            missing: Vec::new(),
+        }
+    }
+
     pub fn reject(reason: impl Into<String>) -> Self {
         Self::Reject {
             reason: reason.into(),
@@ -40,9 +47,46 @@ impl ContextLoadResult {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DepLoadResult {
+    Ready { semantic_type_code: Option<u8> },
+    Missing,
+}
+
+impl DepLoadResult {
+    pub fn ready(semantic_type_code: Option<u8>) -> Self {
+        Self::Ready { semantic_type_code }
+    }
+
+    pub fn missing() -> Self {
+        Self::Missing
+    }
+}
+
+#[derive(Debug, Clone, Default)]
+pub struct ProjectionFrameContext {
+    pub current_transport_key_event_id: Option<String>,
+    pub current_signer: Option<CurrentSignerInfo>,
+}
+
 pub trait ProjectionQueries {
+    fn load_dep_result(
+        &self,
+        recorded_by: &str,
+        parsed: &ParsedEvent,
+        field_name: &str,
+        dep_id: &EventId,
+    ) -> ProjectionQueryResult<DepLoadResult>;
+
+    fn load_key_secret_bytes(
+        &self,
+        recorded_by: &str,
+        key_event_id: &[u8; 32],
+    ) -> ProjectionQueryResult<Option<[u8; 32]>>;
+
     fn load_workspace_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
         workspace: &WorkspaceEvent,
@@ -50,6 +94,7 @@ pub trait ProjectionQueries {
 
     fn load_admin_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
         admin: &AdminEvent,
@@ -57,6 +102,7 @@ pub trait ProjectionQueries {
 
     fn load_peer_shared_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
         peer_shared: &PeerSharedEvent,
@@ -64,6 +110,7 @@ pub trait ProjectionQueries {
 
     fn load_user_invite_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
         user_invite: &UserInviteEvent,
@@ -71,6 +118,7 @@ pub trait ProjectionQueries {
 
     fn load_device_invite_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
         device_invite: &DeviceInviteEvent,
@@ -78,6 +126,7 @@ pub trait ProjectionQueries {
 
     fn load_message_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
         message: &MessageEvent,
@@ -85,6 +134,7 @@ pub trait ProjectionQueries {
 
     fn load_message_deletion_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
         message_deletion: &MessageDeletionEvent,
@@ -92,6 +142,7 @@ pub trait ProjectionQueries {
 
     fn load_reaction_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
         reaction: &ReactionEvent,
@@ -99,6 +150,7 @@ pub trait ProjectionQueries {
 
     fn load_file_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
         file: &FileEvent,
@@ -106,6 +158,7 @@ pub trait ProjectionQueries {
 
     fn load_file_slice_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
         file_slice: &FileSliceEvent,
@@ -113,6 +166,7 @@ pub trait ProjectionQueries {
 
     fn load_invite_accepted_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
         invite_accepted: &InviteAcceptedEvent,
@@ -120,6 +174,7 @@ pub trait ProjectionQueries {
 
     fn load_key_shared_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
         key_shared: &KeySharedEvent,
@@ -132,6 +187,7 @@ macro_rules! define_query_context_loader {
     ($fn_name:ident, $variant:ident, $query_method:ident, $label:literal) => {
         pub fn $fn_name(
             queries: &dyn $crate::projection::queries::ProjectionQueries,
+            frame: &$crate::projection::queries::ProjectionFrameContext,
             recorded_by: &str,
             event_id_b64: &str,
             parsed: &$crate::event_modules::ParsedEvent,
@@ -146,13 +202,141 @@ macro_rules! define_query_context_loader {
             };
 
             Ok($crate::projection::queries::ContextLoadResult::ready(
-                queries.$query_method(recorded_by, event_id_b64, event)?,
+                queries.$query_method(frame, recorded_by, event_id_b64, event)?,
             ))
         }
     };
 }
 
 pub(crate) use define_query_context_loader;
+
+fn semantic_type_code_for_parsed(parsed: &ParsedEvent) -> u8 {
+    match parsed {
+        ParsedEvent::Encrypted(enc) => enc.inner_type_code,
+        _ => parsed.event_type_code(),
+    }
+}
+
+fn derive_semantic_type_code_from_blob(
+    blob: &[u8],
+) -> Result<Option<u8>, Box<dyn std::error::Error>> {
+    let parsed = match parse_event(blob) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(crate::event_modules::outer_semantic_type_code(blob)),
+    };
+    Ok(Some(semantic_type_code_for_parsed(&parsed)))
+}
+
+fn global_endpoint_shared_is_valid(
+    conn: &Connection,
+    dep_b64: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let present: bool = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM endpoints_shared
+             WHERE event_id = ?1
+         )",
+        rusqlite::params![dep_b64],
+        |row| row.get(0),
+    )?;
+    Ok(present)
+}
+
+fn load_valid_semantic_type_code(
+    conn: &Connection,
+    recorded_by: &str,
+    dep_b64: &str,
+) -> Result<Option<u8>, Box<dyn std::error::Error>> {
+    let stored: Option<Option<i64>> = conn
+        .query_row(
+            "SELECT semantic_type_code
+             FROM valid_events
+             WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, dep_b64],
+            |row| row.get(0),
+        )
+        .optional()?;
+
+    match stored {
+        Some(Some(code)) => {
+            let code = u8::try_from(code).map_err(|_| {
+                format!(
+                    "semantic_type_code {} out of range for event {}",
+                    code, dep_b64
+                )
+            })?;
+            Ok(Some(code))
+        }
+        Some(None) => {
+            let blob: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT blob FROM events WHERE event_id = ?1",
+                    rusqlite::params![dep_b64],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let Some(blob) = blob else {
+                return Ok(None);
+            };
+            let Some(code) = derive_semantic_type_code_from_blob(&blob)? else {
+                return Ok(None);
+            };
+            conn.execute(
+                "UPDATE valid_events
+                 SET semantic_type_code = ?3
+                 WHERE peer_id = ?1 AND event_id = ?2 AND semantic_type_code IS NULL",
+                rusqlite::params![recorded_by, dep_b64, i64::from(code)],
+            )?;
+            Ok(Some(code))
+        }
+        None => {
+            if global_endpoint_shared_is_valid(conn, dep_b64)? {
+                return Ok(Some(crate::event_modules::EVENT_TYPE_ENDPOINT_SHARED));
+            }
+            Ok(None)
+        }
+    }
+}
+
+fn dep_is_satisfied_for_scope(
+    conn: &Connection,
+    recorded_by: &str,
+    dep_b64: &str,
+) -> Result<bool, Box<dyn std::error::Error>> {
+    let dep_valid: bool = conn.query_row(
+        "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+        rusqlite::params![recorded_by, dep_b64],
+        |row| row.get(0),
+    )?;
+    if dep_valid {
+        return Ok(true);
+    }
+    global_endpoint_shared_is_valid(conn, dep_b64)
+}
+
+fn tombstone_satisfies_message_dep(
+    conn: &Connection,
+    recorded_by: &str,
+    parsed: &ParsedEvent,
+    field_name: &str,
+    dep_b64: &str,
+) -> Result<bool, rusqlite::Error> {
+    let is_deleted_message_target = matches!(
+        (parsed, field_name),
+        (ParsedEvent::Reaction(_), "target_event_id") | (ParsedEvent::File(_), "message_id")
+    );
+    if !is_deleted_message_target {
+        return Ok(false);
+    }
+    conn.query_row(
+        "SELECT COUNT(*) > 0
+         FROM deleted_messages
+         WHERE recorded_by = ?1 AND message_id = ?2",
+        rusqlite::params![recorded_by, dep_b64],
+        |row| row.get(0),
+    )
+}
 
 fn load_bootstrap_context_snapshot(
     conn: &Connection,
@@ -172,11 +356,20 @@ fn load_bootstrap_context_snapshot(
 
 fn signer_user_mismatch_reason(
     conn: &Connection,
+    frame: &ProjectionFrameContext,
     recorded_by: &str,
-    signed_by: &[u8; 32],
     author_id: &[u8; 32],
 ) -> Result<Option<String>, rusqlite::Error> {
-    let signed_by_b64 = event_id_to_base64(signed_by);
+    let Some(current_signer) = frame.current_signer.as_ref() else {
+        return Ok(Some("missing current signer envelope".to_string()));
+    };
+    if current_signer.semantic_type_code != EVENT_TYPE_PEER_SHARED {
+        return Ok(Some(format!(
+            "content signer must be peer_shared, got semantic type {}",
+            current_signer.semantic_type_code
+        )));
+    }
+    let signed_by_b64 = current_signer.event_id.clone();
     let author_id_b64 = event_id_to_base64(author_id);
 
     let peer_user_eid: String = match conn.query_row(
@@ -229,52 +422,73 @@ fn load_valid_event_blob(
 
 fn authorized_user_for_device_invite(
     conn: &Connection,
+    frame: &ProjectionFrameContext,
     recorded_by: &str,
-    device_invite: &DeviceInviteEvent,
 ) -> Result<Option<String>, rusqlite::Error> {
-    match device_invite.signer_type {
-        4 => Ok(Some(event_id_to_base64(&device_invite.authority_event_id))),
-        5 => {
-            let signer_b64 = event_id_to_base64(&device_invite.signed_by);
-            let signer_user_event_id: Option<String> = conn
-                .query_row(
-                    "SELECT COALESCE(user_event_id, '')
-                     FROM peers_shared
-                     WHERE recorded_by = ?1 AND event_id = ?2",
-                    rusqlite::params![recorded_by, &signer_b64],
-                    |row| row.get(0),
-                )
-                .optional()?;
-
-            let Some(signer_user_event_id) = signer_user_event_id else {
-                return Ok(Some(format!(
-                    "__ERROR__:no peers_shared row for device_invite signer {}",
-                    signer_b64
-                )));
-            };
-            if signer_user_event_id.is_empty() {
-                return Ok(Some(format!(
-                    "__ERROR__:device_invite signer {} has empty peers_shared.user_event_id",
-                    signer_b64
-                )));
-            }
-            Ok(Some(signer_user_event_id))
-        }
-        other => Ok(Some(format!(
-            "__ERROR__:unsupported device_invite signer_type {} for peer_shared authorization",
-            other
-        ))),
+    let Some(current_signer) = frame.current_signer.as_ref() else {
+        return Ok(Some(
+            "__ERROR__:missing current signer envelope for device_invite".to_string(),
+        ));
+    };
+    if current_signer.semantic_type_code != EVENT_TYPE_DEVICE_INVITE {
+        return Ok(Some(format!(
+            "__ERROR__:unsupported device_invite signer semantic type {} for peer_shared authorization",
+            current_signer.semantic_type_code
+        )));
     }
+
+    let signer_b64 = current_signer.event_id.clone();
+    let Some(blob) = load_valid_event_blob(conn, recorded_by, &signer_b64)? else {
+        return Ok(Some(format!(
+            "__ERROR__:no valid device_invite blob for signer {}",
+            signer_b64
+        )));
+    };
+
+    let device_invite = match parse_event(&blob) {
+        Ok(ParsedEvent::DeviceInvite(device_invite)) => device_invite,
+        Ok(ParsedEvent::Signed(signed)) => match parse_event(&signed.payload) {
+            Ok(ParsedEvent::DeviceInvite(device_invite)) => device_invite,
+            Ok(other) => {
+                return Ok(Some(format!(
+                    "__ERROR__:peer_shared signer {} resolved to unexpected event type {}",
+                    signer_b64,
+                    other.event_type_code()
+                )))
+            }
+            Err(err) => {
+                return Ok(Some(format!(
+                    "__ERROR__:failed to parse signed device_invite signer {}: {}",
+                    signer_b64, err
+                )))
+            }
+        },
+        Ok(other) => {
+            return Ok(Some(format!(
+                "__ERROR__:peer_shared signer {} resolved to unexpected event type {}",
+                signer_b64,
+                other.event_type_code()
+            )))
+        }
+        Err(err) => {
+            return Ok(Some(format!(
+                "__ERROR__:failed to parse device_invite signer {}: {}",
+                signer_b64, err
+            )))
+        }
+    };
+
+    Ok(Some(event_id_to_base64(&device_invite.authority_event_id)))
 }
 
 fn peer_shared_user_mismatch_reason(
     conn: &Connection,
+    frame: &ProjectionFrameContext,
     recorded_by: &str,
-    device_invite: &DeviceInviteEvent,
     user_event_id: &[u8; 32],
 ) -> Result<Option<String>, rusqlite::Error> {
     let claimed_user_b64 = event_id_to_base64(user_event_id);
-    let expected_user = authorized_user_for_device_invite(conn, recorded_by, device_invite)?;
+    let expected_user = authorized_user_for_device_invite(conn, frame, recorded_by)?;
 
     let Some(expected_user) = expected_user else {
         return Ok(None);
@@ -311,8 +525,56 @@ fn bootstrap_spki_already_peer_shared(
 }
 
 impl ProjectionQueries for Connection {
+    fn load_dep_result(
+        &self,
+        recorded_by: &str,
+        parsed: &ParsedEvent,
+        field_name: &str,
+        dep_id: &EventId,
+    ) -> ProjectionQueryResult<DepLoadResult> {
+        let dep_b64 = event_id_to_base64(dep_id);
+        if dep_is_satisfied_for_scope(self, recorded_by, &dep_b64)? {
+            return Ok(DepLoadResult::ready(load_valid_semantic_type_code(
+                self,
+                recorded_by,
+                &dep_b64,
+            )?));
+        }
+        if tombstone_satisfies_message_dep(self, recorded_by, parsed, field_name, &dep_b64)? {
+            return Ok(DepLoadResult::ready(Some(
+                crate::event_modules::EVENT_TYPE_MESSAGE,
+            )));
+        }
+        Ok(DepLoadResult::missing())
+    }
+
+    fn load_key_secret_bytes(
+        &self,
+        recorded_by: &str,
+        key_event_id: &[u8; 32],
+    ) -> ProjectionQueryResult<Option<[u8; 32]>> {
+        let key_b64 = event_id_to_base64(key_event_id);
+        let key_bytes: Option<Vec<u8>> = self
+            .query_row(
+                "SELECT key_bytes FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, key_b64],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let Some(key_bytes) = key_bytes else {
+            return Ok(None);
+        };
+        if key_bytes.len() != 32 {
+            return Ok(None);
+        }
+        let mut out = [0u8; 32];
+        out.copy_from_slice(&key_bytes);
+        Ok(Some(out))
+    }
+
     fn load_workspace_context(
         &self,
+        _frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         _workspace: &WorkspaceEvent,
@@ -339,10 +601,33 @@ impl ProjectionQueries for Connection {
 
     fn load_admin_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         admin: &AdminEvent,
     ) -> ProjectionQueryResult<ContextSnapshot> {
+        let mut ctx = ContextSnapshot::default();
+        match frame.current_signer.as_ref() {
+            Some(current_signer) if current_signer.semantic_type_code == EVENT_TYPE_WORKSPACE => {}
+            Some(current_signer) => {
+                return Ok(ContextSnapshot {
+                    admin_user_key_mismatch_reason: Some(format!(
+                        "admin signer must be workspace, got semantic type {}",
+                        current_signer.semantic_type_code
+                    )),
+                    ..ContextSnapshot::default()
+                });
+            }
+            None => {
+                return Ok(ContextSnapshot {
+                    admin_user_key_mismatch_reason: Some(
+                        "admin event missing current signer envelope".to_string(),
+                    ),
+                    ..ContextSnapshot::default()
+                });
+            }
+        }
+
         let user_event_id_b64 = event_id_to_base64(&admin.user_event_id);
         let user_public_key: Option<Vec<u8>> = self
             .query_row(
@@ -371,19 +656,36 @@ impl ProjectionQueries for Connection {
             Some(_) => None,
         };
 
-        Ok(ContextSnapshot {
-            admin_user_key_mismatch_reason,
-            ..ContextSnapshot::default()
-        })
+        ctx.admin_user_key_mismatch_reason = admin_user_key_mismatch_reason;
+        Ok(ctx)
     }
 
     fn load_peer_shared_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         peer_shared: &PeerSharedEvent,
     ) -> ProjectionQueryResult<ContextSnapshot> {
-        let signed_by_b64 = event_id_to_base64(&peer_shared.signed_by);
+        let Some(current_signer) = frame.current_signer.as_ref() else {
+            return Ok(ContextSnapshot {
+                peer_shared_user_mismatch_reason: Some(
+                    "peer_shared missing current signer envelope".to_string(),
+                ),
+                ..ContextSnapshot::default()
+            });
+        };
+        if current_signer.semantic_type_code != EVENT_TYPE_DEVICE_INVITE {
+            return Ok(ContextSnapshot {
+                peer_shared_user_mismatch_reason: Some(format!(
+                    "peer_shared signer must be device_invite, got semantic type {}",
+                    current_signer.semantic_type_code
+                )),
+                ..ContextSnapshot::default()
+            });
+        }
+
+        let signed_by_b64 = current_signer.event_id.clone();
         let blob = load_valid_event_blob(self, recorded_by, &signed_by_b64)?;
         let Some(blob) = blob else {
             return Ok(ContextSnapshot {
@@ -395,8 +697,30 @@ impl ProjectionQueries for Connection {
             });
         };
 
-        let device_invite = match parse_event(&blob) {
+        let _device_invite = match parse_event(&blob) {
             Ok(ParsedEvent::DeviceInvite(device_invite)) => device_invite,
+            Ok(ParsedEvent::Signed(signed)) => match parse_event(&signed.payload) {
+                Ok(ParsedEvent::DeviceInvite(device_invite)) => device_invite,
+                Ok(other) => {
+                    return Ok(ContextSnapshot {
+                        peer_shared_user_mismatch_reason: Some(format!(
+                            "peer_shared signer {} resolved to unexpected event type {}",
+                            signed_by_b64,
+                            other.event_type_code()
+                        )),
+                        ..ContextSnapshot::default()
+                    })
+                }
+                Err(err) => {
+                    return Ok(ContextSnapshot {
+                        peer_shared_user_mismatch_reason: Some(format!(
+                            "failed to parse signed device_invite signer {}: {}",
+                            signed_by_b64, err
+                        )),
+                        ..ContextSnapshot::default()
+                    })
+                }
+            },
             Ok(other) => {
                 return Ok(ContextSnapshot {
                     peer_shared_user_mismatch_reason: Some(format!(
@@ -427,8 +751,8 @@ impl ProjectionQueries for Connection {
         Ok(ContextSnapshot {
             peer_shared_user_mismatch_reason: peer_shared_user_mismatch_reason(
                 self,
+                frame,
                 recorded_by,
-                &device_invite,
                 &peer_shared.user_event_id,
             )?,
             peer_shared_endpoint_id: endpoint_shared_row
@@ -447,9 +771,10 @@ impl ProjectionQueries for Connection {
 
     fn load_user_invite_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
-        user_invite: &UserInviteEvent,
+        _user_invite: &UserInviteEvent,
     ) -> ProjectionQueryResult<ContextSnapshot> {
         let mut ctx = ContextSnapshot::default();
 
@@ -462,27 +787,29 @@ impl ProjectionQueries for Connection {
             Err(_) => false,
         };
 
-        if user_invite.signer_type == 5 {
-            let signer_b64 = event_id_to_base64(&user_invite.signed_by);
-            let authority_b64 = event_id_to_base64(&user_invite.authority_event_id);
-            let authority_matches_signer: bool = self.query_row(
-                "SELECT EXISTS(
-                     SELECT 1
-                     FROM peers_shared ps
-                     JOIN users u
-                       ON u.recorded_by = ps.recorded_by
-                      AND u.event_id = ps.user_event_id
-                     JOIN admins a
-                       ON a.recorded_by = u.recorded_by
-                      AND a.public_key = u.public_key
-                     WHERE ps.recorded_by = ?1
-                       AND ps.event_id = ?2
-                       AND a.event_id = ?3
-                 )",
-                rusqlite::params![recorded_by, signer_b64, authority_b64],
-                |row| row.get(0),
-            )?;
-            ctx.invite_authority_matches_signer = Some(authority_matches_signer);
+        if let Some(current_signer) = frame.current_signer.as_ref() {
+            if current_signer.semantic_type_code == EVENT_TYPE_PEER_SHARED {
+                let signer_b64 = current_signer.event_id.clone();
+                let authority_b64 = event_id_to_base64(&_user_invite.authority_event_id);
+                let authority_matches_signer: bool = self.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1
+                         FROM peers_shared ps
+                         JOIN users u
+                           ON u.recorded_by = ps.recorded_by
+                          AND u.event_id = ps.user_event_id
+                         JOIN admins a
+                           ON a.recorded_by = u.recorded_by
+                          AND a.public_key = u.public_key
+                         WHERE ps.recorded_by = ?1
+                           AND ps.event_id = ?2
+                           AND a.event_id = ?3
+                     )",
+                    rusqlite::params![recorded_by, signer_b64, authority_b64],
+                    |row| row.get(0),
+                )?;
+                ctx.invite_authority_matches_signer = Some(authority_matches_signer);
+            }
         }
 
         ctx.bootstrap_context = load_bootstrap_context_snapshot(self, recorded_by, event_id_b64)?;
@@ -491,6 +818,7 @@ impl ProjectionQueries for Connection {
 
     fn load_device_invite_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
         device_invite: &DeviceInviteEvent,
@@ -506,21 +834,23 @@ impl ProjectionQueries for Connection {
             Err(_) => false,
         };
 
-        if device_invite.signer_type == 5 {
-            let signer_b64 = event_id_to_base64(&device_invite.signed_by);
-            let authority_b64 = event_id_to_base64(&device_invite.authority_event_id);
-            let authority_matches_signer: bool = self.query_row(
-                "SELECT EXISTS(
-                     SELECT 1
-                     FROM peers_shared
-                     WHERE recorded_by = ?1
-                       AND event_id = ?2
-                       AND user_event_id = ?3
-                 )",
-                rusqlite::params![recorded_by, signer_b64, authority_b64],
-                |row| row.get(0),
-            )?;
-            ctx.invite_authority_matches_signer = Some(authority_matches_signer);
+        if let Some(current_signer) = frame.current_signer.as_ref() {
+            if current_signer.semantic_type_code == EVENT_TYPE_PEER_SHARED {
+                let signer_b64 = current_signer.event_id.clone();
+                let authority_b64 = event_id_to_base64(&device_invite.authority_event_id);
+                let authority_matches_signer: bool = self.query_row(
+                    "SELECT EXISTS(
+                         SELECT 1
+                         FROM peers_shared
+                         WHERE recorded_by = ?1
+                           AND event_id = ?2
+                           AND user_event_id = ?3
+                     )",
+                    rusqlite::params![recorded_by, signer_b64, authority_b64],
+                    |row| row.get(0),
+                )?;
+                ctx.invite_authority_matches_signer = Some(authority_matches_signer);
+            }
         }
 
         ctx.bootstrap_context = load_bootstrap_context_snapshot(self, recorded_by, event_id_b64)?;
@@ -529,12 +859,13 @@ impl ProjectionQueries for Connection {
 
     fn load_message_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
         message: &MessageEvent,
     ) -> ProjectionQueryResult<ContextSnapshot> {
         let signer_user_mismatch_reason =
-            signer_user_mismatch_reason(self, recorded_by, &message.signed_by, &message.author_id)?;
+            signer_user_mismatch_reason(self, frame, recorded_by, &message.author_id)?;
 
         let mut stmt = self.prepare_cached(
             "SELECT deletion_event_id, author_id, created_at
@@ -563,17 +894,14 @@ impl ProjectionQueries for Connection {
 
     fn load_message_deletion_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         message_deletion: &MessageDeletionEvent,
     ) -> ProjectionQueryResult<ContextSnapshot> {
         let mut ctx = ContextSnapshot::default();
-        ctx.signer_user_mismatch_reason = signer_user_mismatch_reason(
-            self,
-            recorded_by,
-            &message_deletion.signed_by,
-            &message_deletion.author_id,
-        )?;
+        ctx.signer_user_mismatch_reason =
+            signer_user_mismatch_reason(self, frame, recorded_by, &message_deletion.author_id)?;
 
         let target_b64 = event_id_to_base64(&message_deletion.target_event_id);
         ctx.target_tombstone_author = self
@@ -605,6 +933,7 @@ impl ProjectionQueries for Connection {
 
     fn load_reaction_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         reaction: &ReactionEvent,
@@ -615,12 +944,8 @@ impl ProjectionQueries for Connection {
             rusqlite::params![recorded_by, &target_b64],
             |row| row.get(0),
         )?;
-        let signer_user_mismatch_reason = signer_user_mismatch_reason(
-            self,
-            recorded_by,
-            &reaction.signed_by,
-            &reaction.author_id,
-        )?;
+        let signer_user_mismatch_reason =
+            signer_user_mismatch_reason(self, frame, recorded_by, &reaction.author_id)?;
 
         Ok(ContextSnapshot {
             signer_user_mismatch_reason,
@@ -631,6 +956,7 @@ impl ProjectionQueries for Connection {
 
     fn load_file_context(
         &self,
+        _frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         file: &FileEvent,
@@ -662,6 +988,7 @@ impl ProjectionQueries for Connection {
 
     fn load_file_slice_context(
         &self,
+        _frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         file_slice: &FileSliceEvent,
@@ -720,6 +1047,7 @@ impl ProjectionQueries for Connection {
 
     fn load_invite_accepted_context(
         &self,
+        _frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         invite_accepted: &InviteAcceptedEvent,
@@ -768,6 +1096,7 @@ impl ProjectionQueries for Connection {
 
     fn load_key_shared_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         key_shared: &KeySharedEvent,
@@ -795,20 +1124,22 @@ impl ProjectionQueries for Connection {
             return Ok(ContextSnapshot::default());
         }
 
+        let Some(current_signer) = frame.current_signer.as_ref() else {
+            return Ok(ContextSnapshot::default());
+        };
+        let Some(current_signer_event_id) = event_id_from_base64(&current_signer.event_id) else {
+            return Ok(ContextSnapshot::default());
+        };
+
         let mut key_arr = [0u8; 32];
         key_arr.copy_from_slice(&private_key_bytes);
         let local_signing_key = SigningKey::from_bytes(&key_arr);
 
-        let sender_key = match resolve_signer_key(
-            self,
-            recorded_by,
-            key_shared.signer_type,
-            &key_shared.signed_by,
-        )? {
+        let sender_key = match resolve_signer_key(self, recorded_by, &current_signer_event_id)? {
             SignerResolution::Found(k) => k,
             _ => return Ok(ContextSnapshot::default()),
         };
-        let sender_pub = match VerifyingKey::from_bytes(&sender_key) {
+        let sender_pub = match VerifyingKey::from_bytes(&sender_key.public_key) {
             Ok(vk) => vk,
             Err(_) => return Ok(ContextSnapshot::default()),
         };

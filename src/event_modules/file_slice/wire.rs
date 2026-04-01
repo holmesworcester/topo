@@ -14,13 +14,10 @@ pub const FILE_SLICE_FIELDS: &[FieldSpec] = &[
     FieldSpec::EventId("file_id"),
     FieldSpec::U32("slice_number"),
     FieldSpec::FixedBytes("ciphertext", 262_144),
-    FieldSpec::EventId("signed_by"),
-    FieldSpec::U8("signer_type"),
-    FieldSpec::FixedBytes("signature", 64),
 ];
 
 /// FileSlice (type 25): type(1) + created_at(8) + file_id(32) + slice_number(4)
-///   + ciphertext(262144) + signed_by(32) + signer_type(1) + signature(64) = 262286
+///   + ciphertext(262144) = 262189
 pub const FILE_SLICE_WIRE_SIZE: usize = wire_size_for_fields(FILE_SLICE_FIELDS);
 
 /// Maximum ciphertext size per file slice: canonical fixed 256 KiB.
@@ -34,9 +31,6 @@ pub struct FileSliceEvent {
     pub file_id: [u8; 32],
     pub slice_number: u32,
     pub ciphertext: Vec<u8>,
-    pub signed_by: [u8; 32],
-    pub signer_type: u8,
-    pub signature: [u8; 64],
 }
 
 impl super::super::Describe for FileSliceEvent {
@@ -57,18 +51,11 @@ pub fn parse_file_slice(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         FieldValue::FixedBytes(v) => v,
         _ => unreachable!("decode_fields guarantees FixedBytes for FixedBytes spec"),
     };
-    let sig_bytes = values[6].as_fixed_bytes().unwrap();
-    let mut sig = [0u8; 64];
-    sig.copy_from_slice(sig_bytes);
-
     Ok(ParsedEvent::FileSlice(FileSliceEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         file_id: values[1].as_event_id().unwrap(),
         slice_number: values[2].as_u32().unwrap(),
         ciphertext,
-        signed_by: values[4].as_event_id().unwrap(),
-        signer_type: values[5].as_u8().unwrap(),
-        signature: sig,
     }))
 }
 
@@ -87,9 +74,6 @@ pub fn encode_file_slice(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         FieldValue::EventId(fs.file_id),
         FieldValue::U32(fs.slice_number),
         FieldValue::FixedBytes(fs.ciphertext.clone()),
-        FieldValue::EventId(fs.signed_by),
-        FieldValue::U8(fs.signer_type),
-        FieldValue::FixedBytes(fs.signature.to_vec()),
     ];
 
     Ok(encode_fields(
@@ -99,15 +83,15 @@ pub fn encode_file_slice(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
     )?)
 }
 
-pub static FILE_SLICE_META: EventTypeMeta = EventTypeMeta {
+pub static FILE_SLICE_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_FILE_SLICE,
     type_name: "file_slice",
     projection_table: "file_slices",
     share_scope: ShareScope::Shared,
-    dep_fields: &["signed_by"],
-    dep_field_type_codes: &[&[]],
+    dep_fields: &[],
+    dep_field_type_codes: &[],
     signer_required: true,
-    signature_byte_len: 64,
+    signature_byte_len: 0,
     encryptable: true,
     parse: parse_file_slice,
     encode: encode_file_slice,
@@ -169,7 +153,7 @@ mod layout_tests {
     #[test]
     fn offsets_consistent() {
         assert_eq!(
-            field_offset(FILE_SLICE_FIELDS, 6) + 64,
+            field_offset(FILE_SLICE_FIELDS, 3) + FILE_SLICE_CIPHERTEXT_BYTES,
             FILE_SLICE_WIRE_SIZE
         );
     }

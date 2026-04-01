@@ -750,12 +750,8 @@ impl Peer {
                 |row| row.get(0),
             )
             .expect("failed to load creator peer_shared blob");
-        let creator_device_invite_eid = match crate::event_modules::parse_event(&creator_peer_blob)
-            .expect("failed to parse creator peer_shared")
-        {
-            ParsedEvent::PeerShared(ps) => ps.signed_by,
-            _ => panic!("creator peer_shared event has unexpected type"),
-        };
+        let creator_device_invite_eid =
+            Self::outer_signed_signer_event_id(&creator_peer_blob, "creator peer_shared");
 
         let creator_user_b64 = event_id_to_base64(&creator.author_id);
         let creator_user_blob: Vec<u8> = creator_db
@@ -765,12 +761,8 @@ impl Peer {
                 |row| row.get(0),
             )
             .expect("failed to load creator user blob");
-        let creator_user_invite_eid = match crate::event_modules::parse_event(&creator_user_blob)
-            .expect("failed to parse creator user")
-        {
-            ParsedEvent::User(u) => u.signed_by,
-            _ => panic!("creator user event has unexpected type"),
-        };
+        let creator_user_invite_eid =
+            Self::outer_signed_signer_event_id(&creator_user_blob, "creator user");
         let creator_endpoint_shared_event_id =
             crate::event_modules::endpoint_shared::load_local_endpoint_shared(&creator_db)
                 .expect("load creator endpoint_shared row")
@@ -1009,12 +1001,8 @@ impl Peer {
                 |row| row.get(0),
             )
             .expect("failed to load creator peer_shared blob");
-        let creator_device_invite_eid = match crate::event_modules::parse_event(&creator_peer_blob)
-            .expect("failed to parse creator peer_shared")
-        {
-            ParsedEvent::PeerShared(ps) => ps.signed_by,
-            _ => panic!("creator peer_shared event has unexpected type"),
-        };
+        let creator_device_invite_eid =
+            Self::outer_signed_signer_event_id(&creator_peer_blob, "creator peer_shared");
 
         let creator_user_b64 = event_id_to_base64(&creator.author_id);
         let creator_user_blob: Vec<u8> = creator_db
@@ -1024,12 +1012,8 @@ impl Peer {
                 |row| row.get(0),
             )
             .expect("failed to load creator user blob");
-        let creator_user_invite_eid = match crate::event_modules::parse_event(&creator_user_blob)
-            .expect("failed to parse creator user")
-        {
-            ParsedEvent::User(u) => u.signed_by,
-            _ => panic!("creator user event has unexpected type"),
-        };
+        let creator_user_invite_eid =
+            Self::outer_signed_signer_event_id(&creator_user_blob, "creator user");
         let creator_endpoint_shared_event_id =
             crate::event_modules::endpoint_shared::load_local_endpoint_shared(&creator_db)
                 .expect("load creator endpoint_shared row")
@@ -1185,6 +1169,13 @@ impl Peer {
             .expect("Peer has no identity chain; use new_with_identity()")
     }
 
+    fn outer_signed_signer_event_id(blob: &[u8], label: &str) -> EventId {
+        match crate::event_modules::parse_event(blob).expect("failed to parse signed wrapper") {
+            ParsedEvent::Signed(signed) => signed.signer_event_id,
+            other => panic!("{label} event has unexpected outer type: {other:?}"),
+        }
+    }
+
     /// Load (or generate) the transport certificate and private key for this peer.
     pub fn cert_and_key(&self) -> (CertificateDer<'static>, PrivatePkcs8KeyDer<'static>) {
         let db = open_connection(&self.db_path).expect("failed to open db");
@@ -1218,9 +1209,6 @@ impl Peer {
             workspace_id: self.workspace_id,
             author_id: self.author_id,
             content: content.to_string(),
-            signed_by: self.signer_eid(),
-            signer_type: 5,
-            signature: [0u8; 64],
         });
         self.create_encrypted_signed_event_synchronous(&self.content_key_event_id(&db), &inner)
     }
@@ -1234,9 +1222,6 @@ impl Peer {
             target_event_id: *target_event_id,
             author_id: self.author_id,
             emoji: emoji.to_string(),
-            signed_by: self.signer_eid(),
-            signer_type: 5,
-            signature: [0u8; 64],
         });
         self.create_encrypted_signed_event_synchronous(&self.content_key_event_id(&db), &inner)
     }
@@ -1250,16 +1235,13 @@ impl Peer {
             target_event_id: *target_event_id,
             author_id: self.author_id,
             emoji: emoji.to_string(),
-            signed_by: self.signer_eid(),
-            signer_type: 5,
-            signature: [0u8; 64],
         });
         create_encrypted_event_staged(
             &db,
             &self.identity,
             &self.content_key_event_id(&db),
             &inner,
-            Some(self.signing_key()),
+            Some((&self.signer_eid(), self.signing_key())),
         )
         .expect("failed to create staged encrypted reaction")
     }
@@ -1299,9 +1281,6 @@ impl Peer {
             workspace_id: self.workspace_id,
             author_id: self.author_id,
             content: content.to_string(),
-            signed_by: self.signer_eid(),
-            signer_type: 5,
-            signature: [0u8; 64],
         });
         // Sign the inner event, then encrypt the signed blob
         self.create_encrypted_signed_event_synchronous(key_event_id, &inner)
@@ -1328,7 +1307,7 @@ impl Peer {
                 &self.identity,
                 key_event_id,
                 inner_event,
-                Some(self.signing_key()),
+                Some((&self.signer_eid(), self.signing_key())),
             )) {
                 Ok(event_id) => return event_id,
                 Err(CreateEventError::DbError(err))
@@ -1365,9 +1344,6 @@ impl Peer {
             created_at_ms: current_timestamp_ms_u64(),
             target_event_id: *target_event_id,
             author_id: self.author_id,
-            signed_by: self.signer_eid(),
-            signer_type: 5,
-            signature: [0u8; 64],
         });
         self.create_encrypted_signed_event_synchronous(&self.content_key_event_id(&db), &inner)
     }
@@ -1495,11 +1471,8 @@ impl Peer {
             public_key,
             workspace_id: *workspace_id,
             authority_event_id: *workspace_id,
-            signed_by: *workspace_id,
-            signer_type: 1,
-            signature: [0u8; 64],
         });
-        create_signed_event_staged(&db, &self.identity, &evt, signing_key)
+        create_signed_event_staged(&db, &self.identity, workspace_id, &evt, signing_key)
             .expect("failed to create user_invite")
     }
 
@@ -1516,11 +1489,8 @@ impl Peer {
             public_key: invite_public_key,
             workspace_id: *workspace_id,
             authority_event_id: *workspace_id,
-            signed_by: *workspace_id,
-            signer_type: 1,
-            signature: [0u8; 64],
         });
-        create_signed_event_staged(&db, &self.identity, &evt, signing_key)
+        create_signed_event_staged(&db, &self.identity, workspace_id, &evt, signing_key)
             .expect("failed to create user_invite")
     }
 
@@ -1550,11 +1520,8 @@ impl Peer {
             created_at_ms: current_timestamp_ms_u64(),
             public_key: user_public_key,
             username: "test-user".to_string(),
-            signed_by: *user_invite_event_id,
-            signer_type: 2,
-            signature: [0u8; 64],
         });
-        create_signed_event_staged(&db, &self.identity, &evt, signing_key)
+        create_signed_event_staged(&db, &self.identity, user_invite_event_id, &evt, signing_key)
             .expect("failed to create user")
     }
 
@@ -1570,11 +1537,8 @@ impl Peer {
             created_at_ms: current_timestamp_ms_u64(),
             public_key: device_invite_public_key,
             authority_event_id: *user_event_id,
-            signed_by: *user_event_id,
-            signer_type: 4,
-            signature: [0u8; 64],
         });
-        create_signed_event_staged(&db, &self.identity, &evt, signing_key)
+        create_signed_event_staged(&db, &self.identity, user_event_id, &evt, signing_key)
             .expect("failed to create device_invite")
     }
 
@@ -1602,12 +1566,15 @@ impl Peer {
             user_event_id: *user_event_id,
             endpoint_shared_event_id,
             device_name: "test-device".to_string(),
-            signed_by: *device_invite_event_id,
-            signer_type: 3,
-            signature: [0u8; 64],
         });
-        create_signed_event_staged(&db, &self.identity, &evt, signing_key)
-            .expect("failed to create peer_shared")
+        create_signed_event_staged(
+            &db,
+            &self.identity,
+            device_invite_event_id,
+            &evt,
+            signing_key,
+        )
+        .expect("failed to create peer_shared")
     }
 
     /// Create an Admin event (signed by Workspace key, dep on User). Returns the event ID.
@@ -1623,11 +1590,8 @@ impl Peer {
             created_at_ms: current_timestamp_ms_u64(),
             public_key: admin_public_key,
             user_event_id: *user_event_id,
-            signed_by: *workspace_id,
-            signer_type: 1,
-            signature: [0u8; 64],
         });
-        create_signed_event_synchronous(&db, &self.identity, &evt, signing_key)
+        create_signed_event_synchronous(&db, &self.identity, workspace_id, &evt, signing_key)
             .expect("failed to create admin")
     }
 
@@ -1662,12 +1626,15 @@ impl Peer {
             recipient_event_id: *recipient_event_id,
             unwrap_key_event_id: *unwrap_key_event_id,
             wrapped_key,
-            signed_by: *peer_shared_event_id,
-            signer_type: 5,
-            signature: [0u8; 64],
         });
-        create_signed_event_synchronous(&db, &self.identity, &evt, signing_key)
-            .expect("failed to create key_shared")
+        create_signed_event_synchronous(
+            &db,
+            &self.identity,
+            peer_shared_event_id,
+            &evt,
+            signing_key,
+        )
+        .expect("failed to create key_shared")
     }
 
     /// Create multiple messages. Uses a transaction for speed at scale.
@@ -1682,16 +1649,13 @@ impl Peer {
                 workspace_id: self.workspace_id,
                 author_id: self.author_id,
                 content: format!("Message {} from {}", i, self.name),
-                signed_by: self.signer_eid(),
-                signer_type: 5,
-                signature: [0u8; 64],
             });
             event_id_or_blocked(create_encrypted_event_synchronous(
                 &db,
                 &self.identity,
                 &key_event_id,
                 &inner,
-                Some(self.signing_key()),
+                Some((&self.signer_eid(), self.signing_key())),
             ))
             .expect("failed to create batch message");
         }
@@ -1715,16 +1679,13 @@ impl Peer {
                 workspace_id: self.workspace_id,
                 author_id: self.author_id,
                 content: format!("Spread message {} from {}", i, self.name),
-                signed_by: self.signer_eid(),
-                signer_type: 5,
-                signature: [0u8; 64],
             });
             event_id_or_blocked(create_encrypted_event_synchronous(
                 &db,
                 &self.identity,
                 &key_event_id,
                 &inner,
-                Some(self.signing_key()),
+                Some((&self.signer_eid(), self.signing_key())),
             ))
             .expect("failed to create spread batch message");
         }
@@ -1738,7 +1699,6 @@ impl Peer {
     /// used for all slices. Requires identity chain (use new_with_identity).
     pub fn batch_create_file_slices(&self, total_slices: usize) -> [u8; 32] {
         use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
-        use crate::projection::signer::sign_event_bytes;
 
         let db = open_connection(&self.db_path).expect("failed to open db");
         let workspace_id = crate::db::store::lookup_workspace_id(&db, &self.identity)
@@ -1752,9 +1712,6 @@ impl Peer {
             workspace_id: self.workspace_id,
             author_id: self.author_id,
             content: format!("file-parent-{}", self.name),
-            signed_by: self.signer_eid(),
-            signer_type: 5,
-            signature: [0u8; 64],
         });
         let msg_eid = self.create_encrypted_signed_event_synchronous(&key_event_id, &msg);
 
@@ -1785,9 +1742,6 @@ impl Peer {
             key_event_id,
             filename: format!("bench-{}.bin", self.name),
             mime_type: "application/octet-stream".to_string(),
-            signed_by: self.signer_eid(),
-            signer_type: 5,
-            signature: [0u8; 64],
         });
         let _att_eid = self.create_encrypted_signed_event_synchronous(&key_event_id, &att);
 
@@ -1807,15 +1761,13 @@ impl Peer {
                 file_id,
                 slice_number: i,
                 ciphertext: ciphertext.clone(),
-                signed_by: self.signer_eid(),
-                signer_type: 5,
-                signature: [0u8; 64],
             });
-            let mut inner_blob =
-                crate::event_modules::encode_event(&fs).expect("failed to encode file_slice");
-            let blob_len = inner_blob.len();
-            let sig = sign_event_bytes(&signing_key, &inner_blob[..blob_len - 64]);
-            inner_blob[blob_len - 64..].copy_from_slice(&sig);
+            let inner_blob = crate::projection::create::encode_signed_wrapper_blob(
+                &fs,
+                &self.signer_eid(),
+                &signing_key,
+            )
+            .expect("failed to encode signed file_slice");
 
             let key_bytes: Vec<u8> = db
                 .query_row(
@@ -1949,25 +1901,27 @@ impl Peer {
             Some(db) => db,
             None => return -1,
         };
-        db.query_row(
-            "SELECT COUNT(*)
+        let mut stmt = match db.prepare(
+            "SELECT e.blob
              FROM recorded_events re
              JOIN events e ON e.event_id = re.event_id
-             WHERE re.peer_id = ?1
-               AND (
-                    e.event_type = 'message'
-                    OR (
-                        e.event_type = 'encrypted'
-                        AND substr(e.blob, 42, 1) = ?2
-                    )
-               )",
-            rusqlite::params![
-                &self.identity,
-                vec![crate::event_modules::EVENT_TYPE_MESSAGE]
-            ],
-            |row| row.get(0),
-        )
-        .unwrap_or(0)
+             WHERE re.peer_id = ?1",
+        ) {
+            Ok(stmt) => stmt,
+            Err(_) => return 0,
+        };
+        let rows = match stmt.query_map(rusqlite::params![&self.identity], |row| {
+            row.get::<_, Vec<u8>>(0)
+        }) {
+            Ok(rows) => rows,
+            Err(_) => return 0,
+        };
+        rows.filter_map(Result::ok)
+            .filter(|blob| {
+                crate::event_modules::outer_semantic_type_code(blob)
+                    == Some(crate::event_modules::EVENT_TYPE_MESSAGE)
+            })
+            .count() as i64
     }
 
     /// Count rows in the reactions projection table scoped to this peer.
@@ -2113,30 +2067,24 @@ impl Peer {
         let db = open_connection(&self.db_path).expect("failed to open db");
         let mut stmt = db
             .prepare(
-                "SELECT re.event_id
+                "SELECT re.event_id, e.blob
                  FROM recorded_events re
                  JOIN events e ON e.event_id = re.event_id
                  WHERE re.peer_id = ?1
-                   AND (
-                        e.event_type = 'message'
-                        OR (
-                            e.event_type = 'encrypted'
-                            AND substr(e.blob, 42, 1) = ?2
-                        )
-                   )
                  ORDER BY re.event_id",
             )
             .expect("prepare");
-        stmt.query_map(
-            rusqlite::params![
-                &self.identity,
-                vec![crate::event_modules::EVENT_TYPE_MESSAGE]
-            ],
-            |row| row.get::<_, String>(0),
-        )
+        stmt.query_map(rusqlite::params![&self.identity], |row| {
+            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        })
         .expect("query")
-        .collect::<Result<std::collections::BTreeSet<_>, _>>()
-        .expect("collect")
+        .filter_map(Result::ok)
+        .filter_map(|(event_id, blob)| {
+            (crate::event_modules::outer_semantic_type_code(&blob)
+                == Some(crate::event_modules::EVENT_TYPE_MESSAGE))
+            .then_some(event_id)
+        })
+        .collect()
     }
 
     /// Count messages scoped to this peer's recorded_by identity.
@@ -3450,6 +3398,13 @@ pub struct SharedDbNode {
 }
 
 impl SharedDbNode {
+    fn outer_signed_signer_event_id(blob: &[u8], label: &str) -> EventId {
+        match crate::event_modules::parse_event(blob).expect("failed to parse signed wrapper") {
+            ParsedEvent::Signed(signed) => signed.signer_event_id,
+            other => panic!("{label} event has unexpected outer type: {other:?}"),
+        }
+    }
+
     /// Create a shared-DB node with N tenants, each bootstrapped with a full identity chain.
     pub fn new(n: usize) -> Self {
         assert!(n >= 1, "need at least 1 tenant");
@@ -3622,12 +3577,8 @@ impl SharedDbNode {
                 |row| row.get(0),
             )
             .expect("failed to load creator peer_shared blob");
-        let creator_device_invite_eid = match crate::event_modules::parse_event(&creator_peer_blob)
-            .expect("failed to parse creator peer_shared")
-        {
-            ParsedEvent::PeerShared(ps) => ps.signed_by,
-            _ => panic!("creator peer_shared event has unexpected type"),
-        };
+        let creator_device_invite_eid =
+            Self::outer_signed_signer_event_id(&creator_peer_blob, "creator peer_shared");
 
         let creator_user_b64 = event_id_to_base64(&creator.author_id);
         let creator_user_blob: Vec<u8> = db
@@ -3637,12 +3588,8 @@ impl SharedDbNode {
                 |row| row.get(0),
             )
             .expect("failed to load creator user blob");
-        let creator_user_invite_eid = match crate::event_modules::parse_event(&creator_user_blob)
-            .expect("failed to parse creator user")
-        {
-            ParsedEvent::User(u) => u.signed_by,
-            _ => panic!("creator user event has unexpected type"),
-        };
+        let creator_user_invite_eid =
+            Self::outer_signed_signer_event_id(&creator_user_blob, "creator user");
 
         // Record prerequisites for this new tenant and project (white-box shared-DB prerequisite).
         record_shared_db_events_for_tenant(

@@ -3,8 +3,8 @@ use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 pub type EventId = [u8; 32];
 
-mod spki;
 pub mod bao_verify;
+mod spki;
 
 pub use spki::spki_fingerprint_from_ed25519_pubkey;
 

@@ -44,7 +44,10 @@ fn iroh_memory_isolation() {
 
     rt.block_on(async {
         let rss_before_anything = rss_mib();
-        eprintln!("  Before anything:       {:.1} MiB RSS", rss_before_anything);
+        eprintln!(
+            "  Before anything:       {:.1} MiB RSS",
+            rss_before_anything
+        );
 
         // Stage 1: Bare minimum iroh endpoint — no relay, no portmapper, no mDNS
         let secret_key = iroh::SecretKey::from_bytes(&rand::random());
@@ -133,10 +136,22 @@ fn iroh_memory_isolation() {
         let peak = peak_rss_mib();
         eprintln!();
         eprintln!("  === SUMMARY ===");
-        eprintln!("  Baseline process RSS:           {:.1} MiB", rss_before_anything);
-        eprintln!("  Minimal iroh endpoint cost:     +{:.1} MiB", rss_after_minimal - rss_before_anything);
-        eprintln!("  default_relay_mode() added:     +{:.1} MiB", rss_after_relay - rss_after_close_minimal);
-        eprintln!("  mDNS discovery added:           +{:.1} MiB", rss_after_full - rss_after_close_relay);
+        eprintln!(
+            "  Baseline process RSS:           {:.1} MiB",
+            rss_before_anything
+        );
+        eprintln!(
+            "  Minimal iroh endpoint cost:     +{:.1} MiB",
+            rss_after_minimal - rss_before_anything
+        );
+        eprintln!(
+            "  default_relay_mode() added:     +{:.1} MiB",
+            rss_after_relay - rss_after_close_minimal
+        );
+        eprintln!(
+            "  mDNS discovery added:           +{:.1} MiB",
+            rss_after_full - rss_after_close_relay
+        );
         eprintln!("  Peak RSS (VmHWM):               {:.1} MiB", peak);
     });
 }
