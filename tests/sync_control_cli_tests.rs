@@ -300,7 +300,7 @@ fn test_sync_round_and_request_with_live_peer() {
 
     create_workspace(&alice_db);
     let _alice_daemon = start_daemon(&alice_db);
-    let invite = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
+    let invite = create_invite_with_public_addr(&alice_db, &daemon_listen_addr(&alice_db));
 
     accept_invite(&bob_db, &invite);
     let _bob_daemon = start_daemon(&bob_db);

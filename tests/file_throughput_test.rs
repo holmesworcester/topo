@@ -181,7 +181,8 @@ fn make_identity_chain(
     );
     let endpoint_id = hex::encode(endpoint_key.verifying_key().to_bytes());
     let endpoint_blob = events::encode_event(&endpoint_event).unwrap();
-    let endpoint_eid = insert_event_raw(conn, &endpoint_id, &endpoint_blob, None);
+    let endpoint_eid =
+        insert_event_raw(conn, &endpoint_id, &endpoint_blob, Some(&workspace_id_b64));
     project_one(conn, &endpoint_id, &endpoint_eid).unwrap();
 
     let peer_shared_key = SigningKey::generate(&mut rng);

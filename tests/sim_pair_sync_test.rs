@@ -15,10 +15,10 @@ fn active_peer_id(daemon: &VirtualDaemon) -> String {
         .to_string()
 }
 
-fn create_invite(daemon: &VirtualDaemon, public_addr: &str) -> String {
+fn create_invite(daemon: &VirtualDaemon) -> String {
     daemon
         .call_ok_value(RpcMethod::CreateInvite {
-            public_addr: Some(public_addr.to_string()),
+            public_addr: None,
             public_spki: None,
         })
         .expect("create invite")["invite_link"]
@@ -27,10 +27,10 @@ fn create_invite(daemon: &VirtualDaemon, public_addr: &str) -> String {
         .to_string()
 }
 
-fn create_device_link(daemon: &VirtualDaemon, public_addr: &str) -> String {
+fn create_device_link(daemon: &VirtualDaemon) -> String {
     daemon
         .call_ok_value(RpcMethod::CreateDeviceLink {
-            public_addr: Some(public_addr.to_string()),
+            public_addr: None,
             public_spki: None,
         })
         .expect("create device link")["invite_link"]
@@ -103,6 +103,31 @@ fn import_node(daemon: &VirtualDaemon, recorded_by: &str) -> SimPeerNode {
     SimPeerNode::from_imported(daemon.db_path(), &imported)
 }
 
+fn authoring_ready(daemon: &VirtualDaemon) -> bool {
+    let conn = topo::db::open_connection(daemon.db_path()).expect("open db for authoring check");
+    let recorded_by = active_peer_id(daemon);
+    topo::event_modules::workspace::authoring::load_local_authoring_context(&conn, &recorded_by)
+        .is_ok()
+}
+
+fn run_pair_sync_until_authoring_ready(
+    left: &VirtualDaemon,
+    left_peer: &str,
+    right: &VirtualDaemon,
+    right_peer: &str,
+    ready_peer: &VirtualDaemon,
+) {
+    for _ in 0..4 {
+        if authoring_ready(ready_peer) {
+            return;
+        }
+        let intents =
+            plan_pair_sync_intents(&[import_node(left, left_peer), import_node(right, right_peer)]);
+        run_session_for_intent(intent_between(&intents, right_peer, left_peer));
+    }
+    panic!("authoring never materialized for {}", ready_peer.db_path());
+}
+
 fn intent_between<'a>(
     intents: &'a [PairSyncIntent],
     initiator_recorded_by: &str,
@@ -149,7 +174,7 @@ fn real_pair_sync_is_required_for_replication_between_virtual_daemon_nodes() {
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
     let alice_peer = active_peer_id(&alice);
 
-    let invite = create_invite(&alice, "127.0.0.1:4242");
+    let invite = create_invite(&alice);
     let accepted = bob.call(RpcMethod::AcceptInvite {
         invite,
         username: "bob".into(),
@@ -190,7 +215,7 @@ fn planner_drives_hop_by_hop_message_and_key_shared_propagation() {
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
     let phone_peer = active_peer_id(&phone);
 
-    let phone_link = create_device_link(&phone, "127.0.0.1:4242");
+    let phone_link = create_device_link(&phone);
     let phone_key_shared_ids = event_ids_of_type(&phone, "key_shared");
     assert!(
         !phone_key_shared_ids.is_empty(),
@@ -214,6 +239,7 @@ fn planner_drives_hop_by_hop_message_and_key_shared_propagation() {
     ]);
     let laptop_to_phone = intent_between(&phone_laptop_intents, &laptop_peer, &phone_peer);
     run_session_for_intent(laptop_to_phone);
+    run_pair_sync_until_authoring_ready(&phone, &phone_peer, &laptop, &laptop_peer, &laptop);
 
     assert_has_event(&laptop, &bootstrap_message);
     assert!(
@@ -226,7 +252,7 @@ fn planner_drives_hop_by_hop_message_and_key_shared_propagation() {
         "the first pair sync should replicate the phone's real key_shared events onto the laptop"
     );
 
-    let laptop_link = create_device_link(&laptop, "127.0.0.1:4343");
+    let laptop_link = create_device_link(&laptop);
     let accepted_tablet = tablet.call(RpcMethod::AcceptLink {
         invite: laptop_link,
         devicename: "tablet".into(),
@@ -237,6 +263,7 @@ fn planner_drives_hop_by_hop_message_and_key_shared_propagation() {
         accepted_tablet.error
     );
     let tablet_peer = active_peer_id(&tablet);
+    run_pair_sync_until_authoring_ready(&laptop, &laptop_peer, &tablet, &tablet_peer, &tablet);
 
     let routed_message = send_message(&phone, "phone-through-laptop");
     assert_lacks_event(&laptop, &routed_message);

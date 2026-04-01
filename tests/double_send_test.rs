@@ -10,10 +10,9 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use cli_harness::{
-    accept_invite_with_identity, create_invite_with_spki, create_workspace,
-    daemon_identity_fingerprint, daemon_listen_addr, ensure_active_peer, generate_messages,
-    message_count_sql, start_daemon, topo_cmd, wait_for_daemon_stopped, wait_for_live_sync_session,
-    HarnessDaemon,
+    accept_invite_with_identity, create_workspace, daemon_listen_addr, ensure_active_peer,
+    generate_messages, message_count_sql, start_daemon, topo_cmd, topo_create_invite_retry,
+    wait_for_daemon_stopped, wait_for_live_sync_session, HarnessDaemon,
 };
 
 struct SharedWorkspaceBench {
@@ -44,11 +43,7 @@ impl SharedWorkspaceBench {
         Self::enable_sync_logging_for_db(&alice_db);
         let alice_daemon = start_daemon(&alice_db);
 
-        let invite_link = create_invite_with_spki(
-            &alice_db,
-            &daemon_listen_addr(&alice_db),
-            Some(&daemon_identity_fingerprint(&alice_db)),
-        );
+        let invite_link = topo_create_invite_retry(&alice_db, &daemon_listen_addr(&alice_db));
         accept_invite_with_identity(&bob_db, &invite_link, "bob", "laptop");
         wait_for_daemon_stopped(&bob_db, Duration::from_secs(10));
         Self::enable_sync_logging_for_db(&bob_db);

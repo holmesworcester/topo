@@ -29,7 +29,7 @@ pub struct NodeRuntimeNetInfo {
     /// Hex-encoded daemon-scoped iroh endpoint id.
     pub daemon_peer_id: String,
     /// Current direct addresses published by the endpoint.
-    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    #[serde(default)]
     pub published_addrs: Vec<String>,
     /// Whether daemon-scoped mDNS discovery is mounted on the endpoint.
     pub mdns_enabled: bool,

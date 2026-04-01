@@ -44,11 +44,13 @@ pub(crate) enum TenantChangeKind {
     NoChange,
     /// No runtime exists yet — need a fresh start.
     NeedsFreshStart,
-    /// New tenants added but existing ones unchanged — register certs only.
+    /// Runtime can stay up and just refresh its discovered tenant metadata.
     NewTenantsAdded {
         new_tenants: Vec<RuntimeTenantState>,
     },
-    /// Existing tenant changed transport identity — must restart.
+    /// Existing tenant changed transport identity or the tenant set shrank.
+    /// With a daemon-scoped Iroh endpoint this no longer requires a runtime
+    /// restart; loops consult current DB state on refresh.
     TransportIdentityChanged,
 }
 
@@ -131,6 +133,18 @@ pub(crate) fn reserve_idle_bind(
     }
 }
 
+fn resolve_runtime_state_for_net_ready(db_path: &str, fallback: RuntimeState) -> RuntimeState {
+    discover_runtime_tenant_states(db_path)
+        .map(|states| {
+            if states.is_empty() {
+                RuntimeState::IdleNoTenants
+            } else {
+                RuntimeState::Active
+            }
+        })
+        .unwrap_or(fallback)
+}
+
 pub(crate) fn spawn_runtime(
     db_path: &str,
     bind: SocketAddr,
@@ -143,16 +157,34 @@ pub(crate) fn spawn_runtime(
 
     let runtime_shutdown = Arc::new(tokio::sync::Notify::new());
     let runtime_shutdown_for_task = runtime_shutdown.clone();
+    let runtime_shutdown_for_warmup = runtime_shutdown.clone();
     let db_for_task = db_path.to_string();
+    let db_for_net = db_path.to_string();
 
     let (net_tx, net_rx) = tokio::sync::oneshot::channel::<topo::node::NodeRuntimeNetInfo>();
     let state_for_net = state.clone();
+    let next_runtime_state = if tenant_states.is_empty() {
+        RuntimeState::IdleNoTenants
+    } else {
+        RuntimeState::Active
+    };
     tokio::spawn(async move {
         if let Ok(info) = net_rx.await {
+            if let Some(endpoint) = info.endpoint.clone() {
+                let shutdown = runtime_shutdown_for_warmup.clone();
+                tokio::spawn(async move {
+                    tokio::select! {
+                        _ = endpoint.warm_networking() => {}
+                        _ = shutdown.notified() => {}
+                    }
+                });
+            }
             println!("Build: {}", env!("TOPO_GIT_HASH"));
             println!("listen: {}", info.listen_addr);
             *state_for_net.runtime_net.write().unwrap() = Some(info);
-            *state_for_net.runtime_state.write().unwrap() = RuntimeState::Active;
+            let discovered_state =
+                resolve_runtime_state_for_net_ready(&db_for_net, next_runtime_state);
+            *state_for_net.runtime_state.write().unwrap() = discovered_state;
         }
     });
 
@@ -240,20 +272,6 @@ pub(crate) async fn reevaluate_runtime(
         }
     };
 
-    if tenant_states.is_empty() {
-        if let Some(runtime) = active_runtime.take() {
-            stop_runtime(runtime).await;
-        }
-        if idle_bind_reservation.is_none() {
-            let (reservation, resolved_bind) = reserve_idle_bind(bind, false)?;
-            *state.resolved_bind_addr.write().unwrap() = Some(resolved_bind);
-            *idle_bind_reservation = Some(reservation);
-        }
-        *state.runtime_state.write().unwrap() = RuntimeState::IdleNoTenants;
-        *state.runtime_net.write().unwrap() = None;
-        return Ok(());
-    }
-
     let change = match active_runtime.as_ref() {
         Some(runtime) => classify_tenant_change(&runtime.tenant_states, &tenant_states),
         None => TenantChangeKind::NeedsFreshStart,
@@ -275,6 +293,11 @@ pub(crate) async fn reevaluate_runtime(
         TenantChangeKind::NewTenantsAdded { new_tenants } => {
             if let Some(runtime) = active_runtime.as_mut() {
                 runtime.tenant_states = tenant_states;
+                *state.runtime_state.write().unwrap() = if runtime.tenant_states.is_empty() {
+                    RuntimeState::IdleNoTenants
+                } else {
+                    RuntimeState::Active
+                };
                 tracing::info!(
                     "runtime tenant set grew by {} tenant(s) without restart ({} total)",
                     new_tenants.len(),
@@ -283,15 +306,18 @@ pub(crate) async fn reevaluate_runtime(
             }
         }
         TenantChangeKind::TransportIdentityChanged => {
-            if let Some(runtime) = active_runtime.take() {
-                stop_runtime(runtime).await;
+            if let Some(runtime) = active_runtime.as_mut() {
+                runtime.tenant_states = tenant_states;
+                *state.runtime_state.write().unwrap() = if runtime.tenant_states.is_empty() {
+                    RuntimeState::IdleNoTenants
+                } else {
+                    RuntimeState::Active
+                };
+                tracing::info!(
+                    "runtime tenant transport identities changed; refreshed metadata in-place ({} tenant(s))",
+                    runtime.tenant_states.len()
+                );
             }
-            let _ = idle_bind_reservation.take();
-            tracing::info!(
-                "restarting peering runtime after tenant transport identity change ({} tenant(s))",
-                tenant_states.len()
-            );
-            *active_runtime = Some(spawn_runtime(db_path, bind, state, tenant_states));
         }
     }
 
@@ -459,6 +485,55 @@ mod tests {
         assert_eq!(
             states[0].transport_peer_id, tenant_peer_id,
             "runtime should switch to the final PeerShared transport identity once it exists"
+        );
+    }
+
+    #[test]
+    fn runtime_state_resolution_prefers_current_tenant_discovery_over_spawn_snapshot() {
+        let tmpdir = tempfile::tempdir().expect("tempdir");
+        let db_path = tmpdir.path().join("runtime-state-current-tenants.db");
+        let db_path = db_path.to_str().expect("db path").to_string();
+
+        let conn = open_connection(&db_path).expect("open db");
+        create_tables(&conn).expect("create tables");
+
+        let tenant_peer_id = "tenant-active-peer".to_string();
+        let workspace_id = "workspace-1";
+        conn.execute(
+            "INSERT INTO invites_accepted
+             (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                &tenant_peer_id,
+                "ia-1",
+                "tenant-evt-1",
+                "invite-1",
+                workspace_id,
+                1i64
+            ],
+        )
+        .expect("insert invites_accepted");
+        store_local_creds_with_source(
+            &conn,
+            &tenant_peer_id,
+            b"tenant-cert",
+            b"tenant-key",
+            CRED_SOURCE_PEER_SHARED,
+        )
+        .expect("store tenant creds");
+        set_local_transport_target(
+            &conn,
+            &tenant_peer_id,
+            &tenant_peer_id,
+            CRED_SOURCE_PEER_SHARED,
+        )
+        .expect("set tenant transport target");
+
+        let resolved = resolve_runtime_state_for_net_ready(&db_path, RuntimeState::IdleNoTenants);
+        assert_eq!(
+            resolved,
+            RuntimeState::Active,
+            "runtime net readiness should not keep the stale IdleNoTenants snapshot once tenants exist"
         );
     }
 }

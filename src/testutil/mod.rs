@@ -771,6 +771,14 @@ impl Peer {
             ParsedEvent::User(u) => u.signed_by,
             _ => panic!("creator user event has unexpected type"),
         };
+        let creator_endpoint_shared_event_id =
+            crate::event_modules::endpoint_shared::load_local_endpoint_shared(&creator_db)
+                .expect("load creator endpoint_shared row")
+                .expect("creator endpoint_shared row missing")
+                .event_id;
+        let creator_endpoint_shared_event_id =
+            event_id_from_base64(&creator_endpoint_shared_event_id)
+                .expect("decode creator endpoint_shared event id");
 
         copy_projected_events_for_tenant(
             &creator_db,
@@ -781,6 +789,7 @@ impl Peer {
                 creator_user_invite_eid,
                 creator.author_id,
                 creator_device_invite_eid,
+                creator_endpoint_shared_event_id,
                 creator_peer_eid,
                 creator_admin_eid,
                 invite.invite_event_id,
@@ -793,13 +802,6 @@ impl Peer {
             &db,
             &scoped_peer_id,
             &creator_shared_event_ids,
-        );
-        let joiner_shared_event_ids = list_shared_event_ids_for_tenant(&db, &scoped_peer_id);
-        copy_projected_events_for_tenant(
-            &db,
-            &creator_db,
-            &creator.identity,
-            &joiner_shared_event_ids,
         );
 
         // Step 2: Run the same ongoing sync loops the runtime would use until
@@ -857,23 +859,46 @@ impl Peer {
             TESTUTIL_BOOTSTRAP_CONVERGENCE_TIMEOUT,
         )
         .await;
-        let local_transport_peer_id = wait_for_any_tenant_transport_target(
+        let _local_transport_peer_id = wait_for_any_tenant_transport_target(
             &peer.db_path,
             &scoped_peer_id,
             TESTUTIL_BOOTSTRAP_CONVERGENCE_TIMEOUT,
         )
         .await;
+        let creator_db_conn =
+            open_connection(&creator.db_path).expect("failed to reopen creator db post-bootstrap");
+        let joiner_endpoint_shared_event_id =
+            crate::event_modules::endpoint_shared::load_local_endpoint_shared(&db)
+                .expect("load joiner endpoint_shared row")
+                .expect("joiner endpoint_shared row missing")
+                .event_id;
+        let joiner_endpoint_shared_event_id =
+            event_id_from_base64(&joiner_endpoint_shared_event_id)
+                .expect("decode joiner endpoint_shared event id");
+        copy_projected_events_for_tenant(
+            &db,
+            &creator_db_conn,
+            &creator.identity,
+            &[joiner_endpoint_shared_event_id],
+        );
+        let joiner_shared_event_ids = list_shared_event_ids_for_tenant(&db, &scoped_peer_id);
+        copy_projected_events_for_tenant(
+            &db,
+            &creator_db_conn,
+            &creator.identity,
+            &joiner_shared_event_ids,
+        );
         wait_for_projected_peer_transport(
             &peer.db_path,
             &scoped_peer_id,
-            &creator_target_peer_id,
+            &creator.identity,
             TESTUTIL_BOOTSTRAP_CONVERGENCE_TIMEOUT,
         )
         .await;
         wait_for_projected_peer_transport(
             &creator.db_path,
             &creator.identity,
-            &local_transport_peer_id,
+            &scoped_peer_id,
             TESTUTIL_BOOTSTRAP_CONVERGENCE_TIMEOUT,
         )
         .await;
@@ -1005,6 +1030,14 @@ impl Peer {
             ParsedEvent::User(u) => u.signed_by,
             _ => panic!("creator user event has unexpected type"),
         };
+        let creator_endpoint_shared_event_id =
+            crate::event_modules::endpoint_shared::load_local_endpoint_shared(&creator_db)
+                .expect("load creator endpoint_shared row")
+                .expect("creator endpoint_shared row missing")
+                .event_id;
+        let creator_endpoint_shared_event_id =
+            event_id_from_base64(&creator_endpoint_shared_event_id)
+                .expect("decode creator endpoint_shared event id");
 
         copy_projected_events_for_tenant(
             &creator_db,
@@ -1015,6 +1048,7 @@ impl Peer {
                 creator_user_invite_eid,
                 creator.author_id,
                 creator_device_invite_eid,
+                creator_endpoint_shared_event_id,
                 creator_peer_eid,
                 invite.invite_event_id,
             ],
@@ -1026,13 +1060,6 @@ impl Peer {
             &db,
             &scoped_peer_id,
             &creator_shared_event_ids,
-        );
-        let joiner_shared_event_ids = list_shared_event_ids_for_tenant(&db, &scoped_peer_id);
-        copy_projected_events_for_tenant(
-            &db,
-            &creator_db,
-            &creator.identity,
-            &joiner_shared_event_ids,
         );
 
         let creator_ep = sync_endpoint.clone();
@@ -1087,23 +1114,46 @@ impl Peer {
             TESTUTIL_BOOTSTRAP_CONVERGENCE_TIMEOUT,
         )
         .await;
-        let local_transport_peer_id = wait_for_any_tenant_transport_target(
+        let _local_transport_peer_id = wait_for_any_tenant_transport_target(
             &peer.db_path,
             &scoped_peer_id,
             TESTUTIL_BOOTSTRAP_CONVERGENCE_TIMEOUT,
         )
         .await;
+        let creator_db_conn =
+            open_connection(&creator.db_path).expect("failed to reopen creator db post-bootstrap");
+        let joiner_endpoint_shared_event_id =
+            crate::event_modules::endpoint_shared::load_local_endpoint_shared(&db)
+                .expect("load joiner endpoint_shared row")
+                .expect("joiner endpoint_shared row missing")
+                .event_id;
+        let joiner_endpoint_shared_event_id =
+            event_id_from_base64(&joiner_endpoint_shared_event_id)
+                .expect("decode joiner endpoint_shared event id");
+        copy_projected_events_for_tenant(
+            &db,
+            &creator_db_conn,
+            &creator.identity,
+            &[joiner_endpoint_shared_event_id],
+        );
+        let joiner_shared_event_ids = list_shared_event_ids_for_tenant(&db, &scoped_peer_id);
+        copy_projected_events_for_tenant(
+            &db,
+            &creator_db_conn,
+            &creator.identity,
+            &joiner_shared_event_ids,
+        );
         wait_for_projected_peer_transport(
             &peer.db_path,
             &scoped_peer_id,
-            &creator_target_peer_id,
+            &creator.identity,
             TESTUTIL_BOOTSTRAP_CONVERGENCE_TIMEOUT,
         )
         .await;
         wait_for_projected_peer_transport(
             &creator.db_path,
             &creator.identity,
-            &local_transport_peer_id,
+            &scoped_peer_id,
             TESTUTIL_BOOTSTRAP_CONVERGENCE_TIMEOUT,
         )
         .await;

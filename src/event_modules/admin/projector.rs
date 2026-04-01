@@ -47,7 +47,9 @@ pub fn project_pure(
 #[cfg(test)]
 mod projector_tests {
     use super::*;
+    use crate::db::{open_in_memory, schema::create_tables};
     use crate::event_modules::{AdminEvent, ParsedEvent, WorkspaceEvent};
+    use crate::projection::queries::ContextLoadResult;
 
     fn admin_event() -> ParsedEvent {
         ParsedEvent::Admin(AdminEvent {
@@ -92,5 +94,37 @@ mod projector_tests {
             result.decision,
             crate::projection::decision::ProjectionDecision::Reject { .. }
         ));
+    }
+
+    #[test]
+    fn test_admin_rejects_user_key_mismatch() {
+        let conn = open_in_memory().expect("open in-memory db");
+        create_tables(&conn).expect("create tables");
+
+        let recorded_by = "peer1";
+        let user_event_id_b64 = crate::crypto::event_id_to_base64(&[7u8; 32]);
+        conn.execute(
+            "INSERT INTO users (recorded_by, event_id, public_key, username)
+             VALUES (?1, ?2, ?3, 'alice')",
+            rusqlite::params![recorded_by, &user_event_id_b64, vec![1u8; 32]],
+        )
+        .expect("insert users row");
+
+        let ParsedEvent::Admin(admin) = admin_event() else {
+            unreachable!();
+        };
+        let loaded = build_projector_context(
+            &conn,
+            recorded_by,
+            "admin-event",
+            &ParsedEvent::Admin(admin),
+        )
+        .expect("load admin context");
+        match loaded {
+            ContextLoadResult::Reject { reason } => {
+                assert!(reason.contains("does not match user public_key"));
+            }
+            other => panic!("expected reject, got {other:?}"),
+        }
     }
 }

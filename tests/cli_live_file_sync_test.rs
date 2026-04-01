@@ -37,7 +37,7 @@ fn test_cli_live_message_during_large_file_sync() {
     create_workspace(&alice_db);
     let _alice = start_daemon(&alice_db);
 
-    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
+    let invite_link = create_invite_with_public_addr(&alice_db, &daemon_listen_addr(&alice_db));
     accept_invite(&bob_db, &invite_link);
     let _bob = start_daemon(&bob_db);
 

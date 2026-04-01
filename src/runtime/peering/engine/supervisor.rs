@@ -226,7 +226,7 @@ impl RuntimeSupervisor {
         }
 
         root_cancel.cancel();
-        self.endpoint.close(0u32.into(), b"runtime shutdown");
+        self.endpoint.close_gracefully().await;
         drop(target_tx);
 
         while let Some(joined) = workers.join_next().await {

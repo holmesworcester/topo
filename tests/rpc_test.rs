@@ -98,15 +98,6 @@ fn occupy_default_start_port() -> Option<std::net::UdpSocket> {
     }
 }
 
-fn extract_invite_link(stdout: &str) -> String {
-    stdout
-        .lines()
-        .find_map(|line| line.strip_prefix("invite:").map(str::trim))
-        .filter(|link| !link.is_empty())
-        .map(str::to_string)
-        .expect("expected invite line in command output")
-}
-
 // ---------------------------------------------------------------------------
 // 1. RPC protocol unit tests
 // ---------------------------------------------------------------------------
@@ -1081,27 +1072,17 @@ fn create_workspace_on_idle_daemon_uses_resolved_fallback_port_in_auto_invite() 
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
-    let invite_link = extract_invite_link(&String::from_utf8_lossy(&out.stdout));
+    let invite_link = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .find_map(|line| line.strip_prefix("invite:").map(str::trim))
+        .filter(|line| !line.is_empty())
+        .expect("expected invite line in create-workspace output")
+        .to_string();
     let parsed =
         topo::event_modules::workspace::invite_link::parse_invite_link(&invite_link).unwrap();
     assert!(
-        !parsed.bootstrap_addrs.is_empty(),
-        "auto-invite should include bootstrap addresses"
-    );
-    let invite_ports: Vec<u16> = parsed
-        .bootstrap_addrs
-        .iter()
-        .map(|addr| {
-            addr.to_socket_addr()
-                .expect("bootstrap addr should resolve")
-                .port()
-        })
-        .collect();
-    assert!(
-        invite_ports.iter().all(|port| *port == idle_listen.port()),
-        "auto-invite should use resolved listen port {}; got {:?}",
-        idle_listen.port(),
-        invite_ports
+        parsed.bootstrap_addrs.is_empty(),
+        "auto-invite should default to relay/lookup bootstrap, not embedded direct addresses"
     );
 
     let active_status = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
@@ -1116,6 +1097,124 @@ fn create_workspace_on_idle_daemon_uses_resolved_fallback_port_in_auto_invite() 
         "runtime activation should preserve the pre-resolved fallback port"
     );
 
+    stop_daemon(&db, &mut daemon);
+}
+
+#[test]
+fn create_invite_without_public_addr_omits_direct_bootstrap_addresses() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db = temp.path().join("invite-default.sqlite3");
+    let db = db.to_str().expect("db path").to_string();
+    let socket = socket_path_for_db(&db);
+
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .expect("spawn daemon"),
+    );
+    wait_for_socket(&socket);
+    let _ = wait_for_runtime_state(&socket, "IdleNoTenants", Duration::from_secs(10));
+
+    let create = Command::new(bin())
+        .args(["create-workspace", "--db", &db])
+        .output()
+        .expect("run create-workspace");
+    assert!(
+        create.status.success(),
+        "create-workspace failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&create.stdout),
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let out = Command::new(bin())
+        .args(["invite", "--db", &db])
+        .output()
+        .expect("run invite");
+    assert!(
+        out.status.success(),
+        "invite failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let invite_link = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("topo://"))
+        .expect("expected raw invite link in invite output")
+        .to_string();
+    let parsed =
+        topo::event_modules::workspace::invite_link::parse_invite_link(&invite_link).unwrap();
+    assert!(
+        parsed.bootstrap_addrs.is_empty(),
+        "default invite command should not embed direct bootstrap addresses"
+    );
+    assert!(
+        parsed.relay_url.is_some(),
+        "default invite command should wait for iroh relay bootstrap info"
+    );
+
+    let _ = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
+    stop_daemon(&db, &mut daemon);
+}
+
+#[test]
+fn create_device_link_without_public_addr_omits_direct_bootstrap_addresses() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let db = temp.path().join("device-link-default.sqlite3");
+    let db = db.to_str().expect("db path").to_string();
+    let socket = socket_path_for_db(&db);
+
+    let mut daemon = DaemonGuard::new(
+        Command::new(bin())
+            .args(["--db", &db, "start", "--bind", "127.0.0.1:0"])
+            .spawn()
+            .expect("spawn daemon"),
+    );
+    wait_for_socket(&socket);
+    let _ = wait_for_runtime_state(&socket, "IdleNoTenants", Duration::from_secs(10));
+
+    let create = Command::new(bin())
+        .args(["create-workspace", "--db", &db])
+        .output()
+        .expect("run create-workspace");
+    assert!(
+        create.status.success(),
+        "create-workspace failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&create.stdout),
+        String::from_utf8_lossy(&create.stderr)
+    );
+
+    let out = Command::new(bin())
+        .args(["link", "--db", &db])
+        .output()
+        .expect("run link");
+    assert!(
+        out.status.success(),
+        "link failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+
+    let invite_link = String::from_utf8_lossy(&out.stdout)
+        .lines()
+        .map(str::trim)
+        .find(|line| line.starts_with("topo://link/"))
+        .expect("expected raw device-link invite in link output")
+        .to_string();
+    let parsed =
+        topo::event_modules::workspace::invite_link::parse_invite_link(&invite_link).unwrap();
+    assert!(
+        parsed.bootstrap_addrs.is_empty(),
+        "default link command should not embed direct bootstrap addresses"
+    );
+    assert!(
+        parsed.relay_url.is_some(),
+        "default link command should wait for iroh relay bootstrap info"
+    );
+
+    let _ = wait_for_runtime_state(&socket, "Active", Duration::from_secs(10));
     stop_daemon(&db, &mut daemon);
 }
 
@@ -1775,8 +1874,13 @@ fn cli_peers_output_format() {
         stdout
     );
     assert!(
-        stdout.contains("[local]"),
-        "local peer should show [local] marker, got: {}",
+        stdout.contains("[local"),
+        "local peer should show [local ...] marker, got: {}",
+        stdout
+    );
+    assert!(
+        stdout.contains("endpoint="),
+        "peer listing should show endpoint id, got: {}",
         stdout
     );
     assert!(
@@ -1817,8 +1921,8 @@ fn rpc_methods_json_output() {
     let parsed: serde_json::Value = serde_json::from_str(&stdout).expect("should be valid JSON");
     let arr = parsed.as_array().expect("should be an array");
     assert!(
-        arr.len() >= 25,
-        "should list at least 25 methods, got {}",
+        arr.len() >= 40,
+        "should list at least 40 methods, got {}",
         arr.len()
     );
     for entry in arr {
@@ -2022,7 +2126,7 @@ fn rpc_call_no_input_fails() {
 fn catalog_drift_test_method_count_matches_protocol() {
     let catalog_names = topo::rpc::catalog::method_names();
 
-    let known_methods = vec![
+    let mut known_methods = vec![
         "Status",
         "Messages",
         "Send",
@@ -2040,8 +2144,10 @@ fn catalog_drift_test_method_count_matches_protocol() {
         "Reactions",
         "Users",
         "Keys",
+        "ContentKeys",
         "Workspaces",
         "CreateInvite",
+        "RotateKey",
         "AcceptInvite",
         "CreateDeviceLink",
         "AcceptLink",
@@ -2052,29 +2158,36 @@ fn catalog_drift_test_method_count_matches_protocol() {
         "ActiveTenant",
         "CreateWorkspace",
         "Peers",
+        "Forward",
         "View",
+        "SubCreate",
+        "SubList",
+        "SubDisable",
+        "SubEnable",
+        "SubPoll",
+        "SubAck",
+        "SubState",
         "EventList",
+        "EventListByIds",
+        "EventShow",
+        "EventDeps",
         "EventBlocked",
         "EventTimeline",
+        "SyncPolicyShow",
+        "SyncPolicySet",
+        "SyncRoundPeer",
+        "SyncRoundAll",
+        "SyncRequestPeer",
+        "SyncRequestAll",
         "Stats",
         "Replay",
         "Connections",
-        "Discover",
     ];
-
-    for method in &known_methods {
-        assert!(
-            catalog_names.contains(method),
-            "catalog missing method: {}",
-            method
-        );
-    }
+    #[cfg(feature = "discovery")]
+    known_methods.push("Discover");
     assert_eq!(
-        catalog_names.len(),
-        known_methods.len(),
-        "catalog has {} methods, protocol has {} — drift detected",
-        catalog_names.len(),
-        known_methods.len()
+        catalog_names, known_methods,
+        "catalog/protocol method list drift detected"
     );
 }
 

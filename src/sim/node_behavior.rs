@@ -186,6 +186,35 @@ impl NodeBehaviorEngine {
                     rows.sort();
                 }
             }
+            for row in &imported.endpoint_shared_rows {
+                let mut values = BTreeMap::new();
+                values.insert(
+                    "recorded_by".to_string(),
+                    BehaviorValue::Text(row.recorded_by.clone()),
+                );
+                values.insert(
+                    "event_id".to_string(),
+                    BehaviorValue::Text(row.event_id.clone()),
+                );
+                values.insert(
+                    "endpoint_id".to_string(),
+                    BehaviorValue::Text(row.endpoint_id.clone()),
+                );
+                values.insert(
+                    "public_key".to_string(),
+                    BehaviorValue::Blob(row.public_key.clone()),
+                );
+                values.insert("created_at".to_string(), BehaviorValue::Int(row.created_at));
+                let behavior_row = BehaviorRow { values };
+                let rows = state
+                    .tables
+                    .entry("endpoints_shared".to_string())
+                    .or_default();
+                if !rows.contains(&behavior_row) {
+                    rows.push(behavior_row);
+                    rows.sort();
+                }
+            }
         }
         for known in &imported.known_events {
             let event_id =
@@ -449,6 +478,20 @@ fn first_row_for_recorded<'a>(
         .find(|row| row_text(row, column) == Some(value))
 }
 
+fn first_row_for_table<'a>(
+    state: &'a NodeBehaviorData,
+    table: &str,
+    column: &str,
+    value: &str,
+) -> Option<&'a BehaviorRow> {
+    state
+        .tables
+        .get(table)
+        .into_iter()
+        .flat_map(|rows| rows.iter())
+        .find(|row| row_text(row, column) == Some(value))
+}
+
 fn rows_for_recorded_matching<'a>(
     state: &'a NodeBehaviorData,
     table: &str,
@@ -467,6 +510,10 @@ fn rows_for_recorded_matching<'a>(
 
 fn has_valid_event(state: &NodeBehaviorData, recorded_by: &str, event_id_b64: &str) -> bool {
     state.recorded_by == recorded_by && state.valid_events.contains_key(event_id_b64)
+}
+
+fn has_projected_endpoint_shared(state: &NodeBehaviorData, event_id_b64: &str) -> bool {
+    first_row_for_table(state, "endpoints_shared", "event_id", event_id_b64).is_some()
 }
 
 fn valid_event_blob(
@@ -580,6 +627,28 @@ fn signer_user_mismatch_reason_behavior(
         ));
     }
     None
+}
+
+fn tombstone_satisfies_message_dep_behavior(
+    state: &NodeBehaviorData,
+    recorded_by: &str,
+    parsed: &ParsedEvent,
+    field_name: &str,
+    dep_b64: &str,
+) -> bool {
+    let is_deleted_message_target = matches!(
+        (parsed, field_name),
+        (ParsedEvent::Reaction(_), "target_event_id") | (ParsedEvent::File(_), "message_id")
+    );
+    is_deleted_message_target
+        && first_row_for_recorded(
+            state,
+            "deleted_messages",
+            recorded_by,
+            "message_id",
+            dep_b64,
+        )
+        .is_some()
 }
 
 fn resolve_signer_key_behavior(
@@ -741,6 +810,14 @@ impl ProjectionQueries for NodeBehaviorEngine {
                 })
             }
         };
+        let endpoint_shared_event_id_b64 =
+            event_id_to_base64(&peer_shared.endpoint_shared_event_id);
+        let endpoint_shared_row = first_row_for_table(
+            &state,
+            "endpoints_shared",
+            "event_id",
+            &endpoint_shared_event_id_b64,
+        );
 
         let expected_user = match device_invite.signer_type {
             4 => Some(event_id_to_base64(&device_invite.authority_event_id)),
@@ -785,6 +862,15 @@ impl ProjectionQueries for NodeBehaviorEngine {
 
         Ok(ContextSnapshot {
             peer_shared_user_mismatch_reason,
+            peer_shared_endpoint_id: endpoint_shared_row
+                .and_then(|row| row_text(row, "endpoint_id").map(ToOwned::to_owned)),
+            peer_shared_endpoint_binding_reason: match endpoint_shared_row {
+                Some(_) => None,
+                None => Some(format!(
+                    "no projected endpoint_shared row for {}",
+                    endpoint_shared_event_id_b64
+                )),
+            },
             ..ContextSnapshot::default()
         })
     }
@@ -1199,7 +1285,7 @@ impl ProjectionBackend for NodeBehaviorEngine {
         &self,
         recorded_by: &str,
         event_id_b64: &str,
-        _parsed: &ParsedEvent,
+        parsed: &ParsedEvent,
         deps: &[(&str, EventId)],
     ) -> ProjectionApplyResult<Option<ProjectionDecision>> {
         let state = self.state.borrow();
@@ -1207,9 +1293,19 @@ impl ProjectionBackend for NodeBehaviorEngine {
             return Ok(None);
         }
         let mut missing = Vec::new();
-        for (_, dep_id) in deps {
+        for (field_name, dep_id) in deps {
             let dep_b64 = event_id_to_base64(dep_id);
-            if !state.valid_events.contains_key(&dep_b64) {
+            let dep_valid = state.valid_events.contains_key(&dep_b64)
+                || has_projected_endpoint_shared(&state, &dep_b64);
+            if !dep_valid
+                && !tombstone_satisfies_message_dep_behavior(
+                    &state,
+                    recorded_by,
+                    parsed,
+                    field_name,
+                    &dep_b64,
+                )
+            {
                 missing.push(*dep_id);
             }
         }
@@ -1239,8 +1335,8 @@ impl ProjectionBackend for NodeBehaviorEngine {
 
     fn check_dep_types(
         &self,
-        _recorded_by: &str,
-        _parsed: &ParsedEvent,
+        recorded_by: &str,
+        parsed: &ParsedEvent,
         deps: &[(&str, EventId)],
         type_codes: &[&[u8]],
     ) -> ProjectionApplyResult<Option<String>> {
@@ -1251,14 +1347,23 @@ impl ProjectionBackend for NodeBehaviorEngine {
                 continue;
             }
             let dep_b64 = event_id_to_base64(dep_id);
-            let actual = match state.valid_events.get(&dep_b64).and_then(|v| *v) {
-                Some(code) => u8::try_from(code).map_err(|_| "semantic type out of range")?,
-                None => {
-                    return Ok(Some(format!(
-                        "dep {} missing tenant-scoped semantic type record",
-                        field_name
-                    )))
-                }
+            let actual = if let Some(code) = state.valid_events.get(&dep_b64).and_then(|v| *v) {
+                u8::try_from(code).map_err(|_| "semantic type out of range")?
+            } else if has_projected_endpoint_shared(&state, &dep_b64) {
+                crate::event_modules::EVENT_TYPE_ENDPOINT_SHARED
+            } else if tombstone_satisfies_message_dep_behavior(
+                &state,
+                recorded_by,
+                parsed,
+                field_name,
+                &dep_b64,
+            ) {
+                continue;
+            } else {
+                return Ok(Some(format!(
+                    "dep {} missing tenant-scoped semantic type record",
+                    field_name
+                )));
             };
             if !allowed.contains(&actual) {
                 return Ok(Some(format!(
@@ -1720,10 +1825,8 @@ mod tests {
             "device_invites",
             "invite_secrets",
             "invites_accepted",
-            "key_rotations",
             "key_secrets",
             "tenants",
-            "user_invites",
             "users",
             "workspaces",
         ];
@@ -1793,11 +1896,9 @@ mod tests {
             "device_invites",
             "invite_secrets",
             "invites_accepted",
-            "key_rotations",
             "key_secrets",
             "messages",
             "tenants",
-            "user_invites",
             "users",
             "workspaces",
         ];
@@ -1868,11 +1969,9 @@ mod tests {
             "device_invites",
             "invite_secrets",
             "invites_accepted",
-            "key_rotations",
             "key_secrets",
             "pending_invite_bootstrap_trust",
             "tenants",
-            "user_invites",
             "users",
             "workspaces",
         ];

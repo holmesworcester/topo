@@ -71,8 +71,25 @@ impl TransportEndpoint {
         self.inner.addr()
     }
 
+    pub fn relay_url(&self) -> Option<String> {
+        self.inner
+            .addr()
+            .relay_urls()
+            .next()
+            .cloned()
+            .map(|url| url.to_string())
+    }
+
     pub fn mdns_lookup(&self) -> Option<MdnsAddressLookup> {
         self.mdns.clone()
+    }
+
+    pub async fn warm_networking(&self) {
+        let _ = self.inner.online().await;
+    }
+
+    pub async fn close_gracefully(&self) {
+        self.inner.clone().close().await;
     }
 
     pub fn close(&self, _error_code: iroh::endpoint::VarInt, _reason: &[u8]) {

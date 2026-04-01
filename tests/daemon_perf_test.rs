@@ -11,11 +11,10 @@ use std::time::{Duration, Instant};
 
 use cli_harness::{
     accept_invite_with_identity_on_running_daemon, accept_invite_with_identity_persisted_only,
-    assert_eventually, create_invite, create_invite_with_spki, create_workspace_with_details,
-    daemon_identity_fingerprint, daemon_listen_addr, ensure_active_peer, generate_messages,
-    get_users_raw, message_count_sql, peak_rss_mib_for_pid, send_message,
-    start_daemon_with_options, topo_cmd, wait_for_active_tenant_ready,
-    wait_for_tenant_ready_by_username, DaemonOptions, HarnessDaemon,
+    assert_eventually, create_invite, create_workspace_with_details, daemon_listen_addr,
+    ensure_active_peer, generate_messages, get_users_raw, message_count_sql, peak_rss_mib_for_pid,
+    send_message, start_daemon_with_options, topo_cmd, topo_create_invite_retry,
+    wait_for_active_tenant_ready, wait_for_tenant_ready_by_username, DaemonOptions, HarnessDaemon,
 };
 
 struct SharedWorkspaceBench {
@@ -53,11 +52,7 @@ impl SharedWorkspaceBench {
         let mut alice_daemon = start_perf_daemon(&alice_db, &tmpdir_path, "alice");
         let alice_pid = alice_daemon.child().id();
 
-        let invite_link = create_invite_with_spki(
-            &alice_db,
-            &daemon_listen_addr(&alice_db),
-            Some(&daemon_identity_fingerprint(&alice_db)),
-        );
+        let invite_link = topo_create_invite_retry(&alice_db, &daemon_listen_addr(&alice_db));
         accept_invite_direct(&bob_db, &invite_link, "bob", "laptop");
 
         let mut bob_daemon = start_perf_daemon(&bob_db, &tmpdir_path, "bob");

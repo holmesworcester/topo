@@ -75,6 +75,15 @@ pub struct ImportedBootstrapContextRow {
     pub observed_at: i64,
 }
 
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ImportedEndpointSharedRow {
+    pub recorded_by: String,
+    pub event_id: String,
+    pub endpoint_id: String,
+    pub public_key: Vec<u8>,
+    pub created_at: i64,
+}
+
 #[derive(Clone, Debug)]
 pub struct ImportedPeerState {
     pub recorded_by: String,
@@ -85,6 +94,7 @@ pub struct ImportedPeerState {
     pub authorized_transport_rows: Vec<AuthorizedTransportRow>,
     pub bootstrap_targets: Vec<ImportedBootstrapTarget>,
     pub bootstrap_context_rows: Vec<ImportedBootstrapContextRow>,
+    pub endpoint_shared_rows: Vec<ImportedEndpointSharedRow>,
     pub observed_targets: Vec<ImportedObservedTarget>,
     pub connect_targets: Vec<ImportedConnectTarget>,
     pub known_events: Vec<ImportedKnownEvent>,
@@ -186,6 +196,22 @@ pub fn import_peer_state(
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
+    let mut endpoint_shared_stmt = conn.prepare(
+        "SELECT recorded_by, event_id, endpoint_id, public_key, created_at
+         FROM endpoints_shared
+         ORDER BY created_at ASC, event_id ASC",
+    )?;
+    let endpoint_shared_rows = endpoint_shared_stmt
+        .query_map([], |row| {
+            Ok(ImportedEndpointSharedRow {
+                recorded_by: row.get(0)?,
+                event_id: row.get(1)?,
+                endpoint_id: row.get(2)?,
+                public_key: row.get(3)?,
+                created_at: row.get(4)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
     let observed_targets =
         load_observed_endpoint_targets(source_db_path, &[recorded_by.to_string()])?
             .into_iter()
@@ -235,23 +261,36 @@ pub fn import_peer_state(
         }
     }
 
-    let mut stmt = conn.prepare(
-        "SELECT e.event_id, re.source, e.created_at, e.blob
-         FROM recorded_events re
-         JOIN events e ON e.event_id = re.event_id
-         WHERE re.peer_id = ?1
-         ORDER BY re.id ASC",
-    )?;
-    let known_events = stmt
-        .query_map(rusqlite::params![recorded_by], |row| {
-            Ok(ImportedKnownEvent {
-                event_id: row.get(0)?,
-                source: row.get(1)?,
-                created_at_ms: row.get(2)?,
-                blob: row.get(3)?,
-            })
-        })?
-        .collect::<Result<Vec<_>, _>>()?;
+    let mut known_events = Vec::new();
+    let mut seen_known_event_ids = BTreeSet::new();
+    for scope in daemon_peer_id
+        .iter()
+        .map(String::as_str)
+        .chain(std::iter::once(recorded_by))
+    {
+        let mut stmt = conn.prepare(
+            "SELECT e.event_id, re.source, e.created_at, e.blob
+             FROM recorded_events re
+             JOIN events e ON e.event_id = re.event_id
+             WHERE re.peer_id = ?1
+             ORDER BY re.id ASC",
+        )?;
+        let scoped_rows = stmt
+            .query_map(rusqlite::params![scope], |row| {
+                Ok(ImportedKnownEvent {
+                    event_id: row.get(0)?,
+                    source: row.get(1)?,
+                    created_at_ms: row.get(2)?,
+                    blob: row.get(3)?,
+                })
+            })?
+            .collect::<Result<Vec<_>, _>>()?;
+        for known in scoped_rows {
+            if seen_known_event_ids.insert(known.event_id.clone()) {
+                known_events.push(known);
+            }
+        }
+    }
 
     Ok(ImportedPeerState {
         recorded_by: recorded_by.to_string(),
@@ -264,6 +303,7 @@ pub fn import_peer_state(
         authorized_transport_rows,
         bootstrap_targets,
         bootstrap_context_rows,
+        endpoint_shared_rows,
         observed_targets,
         connect_targets,
         known_events,
@@ -289,6 +329,18 @@ mod tests {
     use super::*;
     use crate::event_modules::workspace::commands::CreateInviteResponse;
 
+    fn daemon_transport_peer_id(daemon: &VirtualDaemon) -> String {
+        let conn = open_connection(daemon.db_path()).expect("open daemon db");
+        conn.query_row(
+            "SELECT peer_id
+             FROM daemon_transport_identity
+             WHERE singleton_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .expect("daemon transport peer id")
+    }
+
     #[test]
     fn replayed_peer_snapshot_supports_real_rpc_queries_and_local_writes() {
         let tmpdir = tempfile::tempdir().unwrap();
@@ -300,7 +352,7 @@ mod tests {
             username: "alice".into(),
             device_name: "laptop".into(),
         });
-        let creator_peer_id = create.expect("workspace creation through RPC")["peer_id"]
+        let _creator_peer_id = create.expect("workspace creation through RPC")["peer_id"]
             .as_str()
             .expect("creator peer id")
             .to_string();
@@ -329,8 +381,8 @@ mod tests {
         assert!(generate.ok, "generate failed: {:?}", generate.error);
 
         let invite = source_daemon.call(RpcMethod::CreateInvite {
-            public_addr: Some("127.0.0.1:4242".into()),
-            public_spki: Some(creator_peer_id),
+            public_addr: None,
+            public_spki: None,
         });
         assert!(invite.ok, "create invite failed: {:?}", invite.error);
 
@@ -419,7 +471,7 @@ mod tests {
             snapshot_send.error
         );
         let snapshot_invite = snapshot_daemon.call(RpcMethod::CreateInvite {
-            public_addr: Some("127.0.0.1:7777".into()),
+            public_addr: None,
             public_spki: None,
         });
         assert!(
@@ -437,22 +489,19 @@ mod tests {
         let creator = VirtualDaemon::new(creator_db.to_str().unwrap());
         let joiner = VirtualDaemon::new(joiner_db.to_str().unwrap());
 
-        let created = creator
+        let _created = creator
             .call_ok_value(RpcMethod::CreateWorkspace {
                 workspace_name: "sim".into(),
                 username: "alice".into(),
                 device_name: "laptop".into(),
             })
             .expect("creator workspace");
-        let creator_peer_id = created["peer_id"]
-            .as_str()
-            .expect("creator peer id")
-            .to_string();
+        let creator_transport_peer_id = daemon_transport_peer_id(&creator);
 
         let invite: CreateInviteResponse = creator
             .call_ok(RpcMethod::CreateInvite {
-                public_addr: Some("127.0.0.1:4242".into()),
-                public_spki: Some(creator_peer_id.clone()),
+                public_addr: None,
+                public_spki: None,
             })
             .expect("create invite");
 
@@ -492,35 +541,35 @@ mod tests {
                 .authorized_transport_rows
                 .iter()
                 .any(|row| row.source == "pending_bootstrap"),
-            "creator should authorize pending bootstrap invitee transport"
+            "addressless Iroh invites should retain creator-side pending bootstrap auth for bootstrap session admission"
         );
         assert!(
             joiner_import
                 .authorized_transport_rows
                 .iter()
                 .any(|row| row.source == "accepted_bootstrap"
-                    && row.transport_peer_id == creator_peer_id),
+                    && row.transport_peer_id == creator_transport_peer_id),
             "joiner should authorize creator bootstrap transport"
         );
         assert!(
             joiner_import.bootstrap_targets.iter().any(|target| {
-                target.transport_peer_id == creator_peer_id
-                    && target.bootstrap_addr == "127.0.0.1:4242"
+                target.transport_peer_id == creator_transport_peer_id
+                    && target.bootstrap_addr.is_empty()
             }),
-            "joiner should have a real bootstrap dial target to the creator"
+            "joiner should retain the Iroh bootstrap inviter identity without a direct address"
         );
         assert!(
             joiner_import.connect_targets.iter().any(|target| {
                 target.source == "bootstrap"
-                    && target.transport_peer_id == creator_peer_id
-                    && target.remote == "127.0.0.1:4242"
+                    && target.transport_peer_id == creator_transport_peer_id
+                    && target.remote == "lookup"
             }),
-            "joiner connect targets should come from the real bootstrap planner"
+            "joiner connect targets should come from the Iroh bootstrap lookup planner"
         );
         assert!(
             joiner_import
                 .connectable_transport_peer_ids()
-                .contains(&creator_peer_id),
+                .contains(&creator_transport_peer_id),
             "joiner outgoing connect set should include the creator transport peer"
         );
     }
@@ -532,17 +581,14 @@ mod tests {
         let export_db = tmpdir.path().join("user999999.db");
         let source_daemon = VirtualDaemon::new(source_db.to_str().unwrap());
 
-        let created = source_daemon
+        let _created = source_daemon
             .call_ok_value(RpcMethod::CreateWorkspace {
                 workspace_name: "snapshot".into(),
                 username: "alice".into(),
                 device_name: "laptop".into(),
             })
             .expect("workspace creation through RPC");
-        let creator_peer_id = created["peer_id"]
-            .as_str()
-            .expect("creator peer id")
-            .to_string();
+        let creator_transport_peer_id = daemon_transport_peer_id(&source_daemon);
 
         let recorded_by = source_daemon
             .call_ok_value(RpcMethod::ActiveTenant)
@@ -570,8 +616,8 @@ mod tests {
 
         let invite: CreateInviteResponse = exported
             .call_ok(RpcMethod::CreateInvite {
-                public_addr: Some("127.0.0.1:4242".into()),
-                public_spki: Some(creator_peer_id.clone()),
+                public_addr: None,
+                public_spki: None,
             })
             .expect("create invite on exported db");
         let accepted = exported
@@ -611,21 +657,21 @@ mod tests {
                 .authorized_transport_rows
                 .iter()
                 .any(|row| row.source == "accepted_bootstrap"
-                    && row.transport_peer_id == creator_peer_id),
+                    && row.transport_peer_id == creator_transport_peer_id),
             "joiner should import real accepted-bootstrap auth rows"
         );
         assert!(
             joiner_import.connect_targets.iter().any(|target| {
                 target.source == "bootstrap"
-                    && target.transport_peer_id == creator_peer_id
-                    && target.remote == "127.0.0.1:4242"
+                    && target.transport_peer_id == creator_transport_peer_id
+                    && target.remote == "lookup"
             }),
-            "joiner should import the real runtime bootstrap dial target"
+            "joiner should import the Iroh bootstrap lookup target"
         );
         assert!(
             joiner_import
                 .connectable_transport_peer_ids()
-                .contains(&creator_peer_id),
+                .contains(&creator_transport_peer_id),
             "joiner outgoing connect set should include the creator transport peer"
         );
 

@@ -38,10 +38,6 @@ pub(crate) async fn setup_endpoint_and_tenants(
     let tenants = discover_local_tenants(&db)?;
     drop(db);
 
-    if tenants.is_empty() {
-        return Err("local tenant set is empty".into());
-    }
-
     info!("Discovered {} local tenant(s)", tenants.len());
 
     let mut peer_to_workspace: HashMap<String, String> = HashMap::new();

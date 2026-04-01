@@ -9,7 +9,6 @@ use super::key_repair::{
     emit_key_shared_responses_for_peers, seed_deterministic_key_secret, KeyResponsePolicy,
 };
 use super::planner_runner::PlannerSimulation;
-use super::query_snapshot::snapshot_replayed_peer;
 use super::virtual_daemon::VirtualDaemon;
 use crate::rpc::protocol::RpcMethod;
 
@@ -160,7 +159,7 @@ pub fn run_large_graph_sampled_decrypt_trial(
 
     for &sample in &samples {
         let peer = actual.get(&sample).expect("sample actual peer");
-        if snapshot_has_message_content(&peer.daemon, &peer.recorded_by, &config.message_content)? {
+        if snapshot_has_message_content(&peer.daemon, &config.message_content)? {
             return Err(format!("sample {sample} decrypted before repair").into());
         }
     }
@@ -217,11 +216,7 @@ pub fn run_large_graph_sampled_decrypt_trial(
             let peer = actual
                 .get(&report.logical_peer)
                 .expect("sample actual peer for visibility");
-            if snapshot_has_message_content(
-                &peer.daemon,
-                &peer.recorded_by,
-                &config.message_content,
-            )? {
+            if snapshot_has_message_content(&peer.daemon, &config.message_content)? {
                 report.decrypted = true;
                 report.first_visible_round =
                     Some(max_message_distance + max_holder_distance + response_round);
@@ -250,15 +245,8 @@ pub fn run_large_graph_sampled_decrypt_trial(
     })
 }
 
-fn snapshot_has_message_content(
-    daemon: &VirtualDaemon,
-    recorded_by: &str,
-    content: &str,
-) -> SimResult<bool> {
-    let snapshot = snapshot_replayed_peer(daemon.db_path(), recorded_by)?;
-    let messages = snapshot
-        .daemon()
-        .call_ok_value(RpcMethod::Messages { limit: 100 })?;
+fn snapshot_has_message_content(daemon: &VirtualDaemon, content: &str) -> SimResult<bool> {
+    let messages = daemon.call_ok_value(RpcMethod::Messages { limit: 100 })?;
     Ok(messages["messages"]
         .as_array()
         .expect("messages array")
@@ -398,10 +386,7 @@ fn materialize_corridor_peers(
     for &logical in logical_nodes.iter().skip(1) {
         let db_path = base.join(format!("{logical:06}.db"));
         let daemon = VirtualDaemon::new(db_path.to_str().expect("peer db path utf8"));
-        let invite = create_invite(
-            &sender_daemon,
-            &format!("127.0.0.1:{}", 30_000 + (logical % 20_000)),
-        )?;
+        let invite = create_invite(&sender_daemon)?;
         let accepted = daemon.call(RpcMethod::AcceptInvite {
             invite,
             username: format!("user{logical}"),
@@ -429,9 +414,9 @@ fn active_peer_id(daemon: &VirtualDaemon) -> SimResult<String> {
         .to_string())
 }
 
-fn create_invite(daemon: &VirtualDaemon, public_addr: &str) -> SimResult<String> {
+fn create_invite(daemon: &VirtualDaemon) -> SimResult<String> {
     Ok(daemon.call_ok_value(RpcMethod::CreateInvite {
-        public_addr: Some(public_addr.to_string()),
+        public_addr: None,
         public_spki: None,
     })?["invite_link"]
         .as_str()

@@ -795,6 +795,7 @@ pub fn create_user_invite(
     let ctx = InviteBootstrapContext {
         bootstrap_addrs: &addr_strings,
         bootstrap_spki,
+        relay_url,
     };
     let invite = ops::create_user_invite_events_as_admin(
         db,
@@ -843,6 +844,7 @@ pub fn create_device_link_invite(
     let ctx = InviteBootstrapContext {
         bootstrap_addrs: &addr_strings,
         bootstrap_spki,
+        relay_url,
     };
     let invite = ops::create_device_link_invite_events_for_user(
         db,
