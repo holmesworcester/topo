@@ -425,8 +425,18 @@ pub fn generate_files_for_peer(
     let log_progress = generate_progress_logging_enabled();
     let generate_start = Instant::now();
     let ctx = workspace::load_local_authoring_context(&db, &recorded_by)?;
-    let slice_bytes_u32 = FILE_SLICE_CIPHERTEXT_BYTES as u32;
-    let ciphertext: Vec<u8> = vec![0xAB; FILE_SLICE_CIPHERTEXT_BYTES];
+    // Generated files use sentinel root_hash [0;32] → skip bao verification.
+    // Payload uses encoding_len=0 so unpack_bao_payload returns raw data.
+    let effective_cap = crate::event_modules::file_slice::wire::BAO_PLAINTEXT_CAPACITY;
+    let slice_bytes_u32 = effective_cap as u32;
+    let ciphertext: Vec<u8> = {
+        let mut payload = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
+        // encoding_len = 0 (first 4 bytes already zero)
+        for b in payload[4..4 + effective_cap].iter_mut() {
+            *b = 0xAB;
+        }
+        payload
+    };
 
     // Each file is its own transaction to avoid holding the write lock
     // too long and causing SQLITE_BUSY for the sync engine.
@@ -462,7 +472,7 @@ pub fn generate_files_for_peer(
 
         let file_id = rand::random::<[u8; 32]>();
         let blob_bytes = (slices_per_file as u64)
-            .checked_mul(FILE_SLICE_CIPHERTEXT_BYTES as u64)
+            .checked_mul(effective_cap as u64)
             .ok_or_else(|| -> Box<dyn std::error::Error + Send + Sync> {
                 "blob_bytes overflow".into()
             })?;
@@ -478,7 +488,7 @@ pub fn generate_files_for_peer(
                 blob_bytes,
                 total_slices: slices_per_file as u32,
                 slice_bytes: slice_bytes_u32,
-                root_hash: [0xAA; 32],
+                root_hash: [0u8; 32],
                 key_event_id,
                 filename: format!("file-{}.bin", i),
                 mime_type: "application/octet-stream".to_string(),
@@ -625,30 +635,34 @@ pub fn send_file_for_peer(
     let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(&db, &recorded_by)?;
 
     let file_id = rand::random::<[u8; 32]>();
+
+    // Compute bao outboard + root hash over plaintext for per-slice verification.
+    // The outboard is needed to extract per-slice proofs below.
+    let (root_hash, outboard) = if file_size > 0 {
+        bao_verify::compute_outboard(&file_data)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("bao outboard computation failed: {}", e).into()
+            })?
+    } else {
+        ([0u8; 32], Vec::new())
+    };
+
+    let effective_capacity =
+        crate::event_modules::file_slice::wire::BAO_PLAINTEXT_CAPACITY;
     let num_slices = if file_size == 0 {
         1usize
     } else {
-        usize::try_from(file_size.div_ceil(FILE_SLICE_CIPHERTEXT_BYTES as u64)).map_err(
-            |_| -> Box<dyn std::error::Error + Send + Sync> {
-                "file too large: slice count exceeds usize".into()
-            },
-        )?
+        usize::try_from(
+            (file_size as usize).div_ceil(effective_capacity),
+        )
+        .map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
+            "file too large: slice count exceeds usize".into()
+        })?
     };
     let total_slices_u32 =
         u32::try_from(num_slices).map_err(|_| -> Box<dyn std::error::Error + Send + Sync> {
             "file too large: slice count exceeds u32".into()
         })?;
-
-    // Compute bao root hash over file contents for integrity verification
-    let root_hash = if file_size > 0 {
-        let (rh, _outboard) = bao_verify::compute_outboard(&file_data)
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("bao root hash computation failed: {}", e).into()
-            })?;
-        rh
-    } else {
-        [0u8; 32]
-    };
 
     create_encrypted_event_synchronous(
         &db,
@@ -660,7 +674,7 @@ pub fn send_file_for_peer(
             file_id,
             blob_bytes: file_size,
             total_slices: total_slices_u32,
-            slice_bytes: FILE_SLICE_CIPHERTEXT_BYTES as u32,
+            slice_bytes: effective_capacity as u32,
             root_hash,
             key_event_id,
             filename: filename.clone(),
@@ -674,13 +688,31 @@ pub fn send_file_for_peer(
 
     let mut remaining_bytes = file_size;
     for slice_number in 0..num_slices {
-        let bytes_this_slice = remaining_bytes.min(FILE_SLICE_CIPHERTEXT_BYTES as u64) as usize;
-        let start = slice_number * FILE_SLICE_CIPHERTEXT_BYTES;
-        let mut ciphertext = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
-        if bytes_this_slice > 0 {
-            ciphertext[..bytes_this_slice]
-                .copy_from_slice(&file_data[start..start + bytes_this_slice]);
-        }
+        let bytes_this_slice =
+            remaining_bytes.min(effective_capacity as u64) as usize;
+        let data_start = slice_number * effective_capacity;
+
+        // Extract bao slice proof for this byte range.
+        let proof = if file_size > 0 {
+            bao_verify::extract_slice_proof(
+                &file_data,
+                &outboard,
+                data_start as u64,
+                bytes_this_slice as u64,
+            )
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("bao slice proof extraction failed: {}", e).into()
+            })?
+        } else {
+            Vec::new()
+        };
+
+        let plaintext = if bytes_this_slice > 0 {
+            &file_data[data_start..data_start + bytes_this_slice]
+        } else {
+            &[]
+        };
+        let ciphertext = crate::event_modules::file_slice::wire::pack_bao_payload(&proof, plaintext);
         remaining_bytes = remaining_bytes.saturating_sub(bytes_this_slice as u64);
 
         create_encrypted_event_synchronous(

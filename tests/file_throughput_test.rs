@@ -263,7 +263,7 @@ fn run_file_throughput(file_size_bytes: usize) {
             blob_bytes: file_size_bytes as u64,
             total_slices: total_slices as u32,
             slice_bytes: slice_size as u32,
-            root_hash: [0xAA; 32],
+            root_hash: [0u8; 32],
             key_event_id: sk_eid,
             filename: "bench.bin".to_string(),
             mime_type: "application/octet-stream".to_string(),

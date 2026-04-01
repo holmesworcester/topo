@@ -1,5 +1,5 @@
 use crate::crypto::{
-    b64_to_hex, bao_verify, decrypt_event_blob, event_id_from_hex, event_id_to_base64,
+    b64_to_hex, decrypt_event_blob, event_id_from_hex, event_id_to_base64,
 };
 use crate::event_modules::{parse_event, ParsedEvent};
 use rusqlite::Connection;
@@ -350,6 +350,9 @@ fn write_matching_file_slices<W: Write>(
     file_id_b64: &str,
     descriptor_event_id_b64: Option<&str>,
     expected_key_event_id_b64: &str,
+    root_hash_arr: &[u8; 32],
+    blob_bytes: i64,
+    slice_bytes: i64,
     writer: &mut W,
 ) -> Result<(i64, u64), Box<dyn std::error::Error + Send + Sync>> {
     let sql = if descriptor_event_id_b64.is_some() {
@@ -387,14 +390,37 @@ fn write_matching_file_slices<W: Write>(
             )
             .into());
         }
-        let payload = load_file_slice_payload(
+        let raw_payload = load_file_slice_payload(
             db,
             recorded_by,
             &slice_event_id_b64,
             expected_key_event_id_b64,
         )?;
-        writer.write_all(&payload)?;
-        bytes_written += payload.len() as u64;
+        // Unpack bao payload to get plaintext.
+        let (bao_encoding, raw_data) =
+            crate::event_modules::file_slice::wire::unpack_bao_payload(&raw_payload);
+        if !bao_encoding.is_empty() {
+            // Verified file: decode the bao slice encoding to extract plaintext.
+            // Already verified at projection time; this just extracts the data.
+            let slice_start = slices_seen as u64 * slice_bytes as u64;
+            let remaining = blob_bytes.saturating_sub(slice_start as i64) as u64;
+            let slice_len = remaining.min(slice_bytes as u64);
+            let plaintext = crate::crypto::bao_verify::verify_slice(
+                &root_hash_arr,
+                &bao_encoding,
+                slice_start,
+                slice_len,
+            )
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("bao decode slice {}: {}", slices_seen, e).into()
+            })?;
+            writer.write_all(&plaintext)?;
+            bytes_written += plaintext.len() as u64;
+        } else {
+            // Legacy/generated: raw plaintext directly after the 4-byte header.
+            writer.write_all(&raw_data)?;
+            bytes_written += raw_data.len() as u64;
+        }
         slices_seen += 1;
     }
 
@@ -410,15 +436,16 @@ pub fn save_file_by_selector(
     let file_event_id_b64 = resolve_file_selector_to_b64(db, recorded_by, selector)?;
     let file_event_id_hex = b64_to_hex(&file_event_id_b64);
 
-    let (file_id_b64, blob_bytes, total_slices, filename, key_event_id_b64, root_hash_blob): (
+    let (file_id_b64, blob_bytes, total_slices, filename, key_event_id_b64, root_hash_blob, slice_bytes): (
         String,
         i64,
         i64,
         String,
         String,
         Vec<u8>,
+        i64,
     ) = db.query_row(
-        "SELECT file_id, blob_bytes, total_slices, filename, key_event_id, root_hash
+        "SELECT file_id, blob_bytes, total_slices, filename, key_event_id, root_hash, slice_bytes
          FROM files
          WHERE recorded_by = ?1 AND event_id = ?2
          LIMIT 1",
@@ -431,22 +458,15 @@ pub fn save_file_by_selector(
                 row.get(3)?,
                 row.get(4)?,
                 row.get(5)?,
+                row.get(6)?,
             ))
         },
     )?;
 
-    // Extract root hash for whole-file bao verification
-    let root_hash: Option<[u8; 32]> = if root_hash_blob.len() == 32 {
-        let mut rh = [0u8; 32];
-        rh.copy_from_slice(&root_hash_blob);
-        if rh != [0u8; 32] {
-            Some(rh)
-        } else {
-            None
-        }
-    } else {
-        None
-    };
+    let mut root_hash_arr = [0u8; 32];
+    if root_hash_blob.len() == 32 {
+        root_hash_arr.copy_from_slice(&root_hash_blob);
+    }
 
     let out_path = Path::new(output_path);
     if let Some(parent) = out_path.parent() {
@@ -468,6 +488,9 @@ pub fn save_file_by_selector(
             &file_id_b64,
             Some(&file_event_id_b64),
             &key_event_id_b64,
+            &root_hash_arr,
+            blob_bytes,
+            slice_bytes,
             &mut writer,
         )?;
         if slices_written == 0 {
@@ -477,6 +500,9 @@ pub fn save_file_by_selector(
                 &file_id_b64,
                 None,
                 &key_event_id_b64,
+                &root_hash_arr,
+                blob_bytes,
+                slice_bytes,
                 &mut writer,
             )?;
         }
@@ -502,21 +528,9 @@ pub fn save_file_by_selector(
     temp_file.as_file_mut().set_len(expected_len)?;
     temp_file.as_file_mut().sync_all()?;
 
-    // Verify file integrity against bao root hash (if present).
-    // Uses streaming verification to avoid loading the whole file into memory.
-    if let Some(rh) = root_hash {
-        use std::io::{Seek, SeekFrom};
-        temp_file.as_file_mut().seek(SeekFrom::Start(0))?;
-        let verify_hash = bao_verify::compute_root_hash_streaming(temp_file.as_file_mut())?;
-        if verify_hash != rh {
-            return Err(format!(
-                "bao root hash mismatch: expected {}, got {}",
-                hex::encode(rh),
-                hex::encode(verify_hash)
-            )
-            .into());
-        }
-    }
+    // Per-slice bao verification happens at projection time (file_slice
+    // projector), so the save path is pure reassembly — no re-verification
+    // needed here.
 
     temp_file
         .persist(out_path)
@@ -576,8 +590,8 @@ mod tests {
         file_id: EventId,
         payload: &[u8],
     ) -> String {
-        let mut ciphertext = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
-        ciphertext[..payload.len()].copy_from_slice(payload);
+        let ciphertext =
+            crate::event_modules::file_slice::wire::pack_bao_payload(&[], payload);
         let inner = ParsedEvent::FileSlice(FileSliceEvent {
             created_at_ms: 1000,
             file_id,

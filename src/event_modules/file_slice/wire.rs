@@ -115,30 +115,50 @@ pub static FILE_SLICE_META: EventTypeMeta = EventTypeMeta {
     context_loader: super::projector::build_projector_context,
 };
 
-/// Pack a bao proof and plaintext data into the fixed-size ciphertext field.
-/// Format: [proof_len: u16 LE][proof bytes][file data, zero-padded]
-pub fn pack_bao_payload(proof: &[u8], plaintext: &[u8]) -> Vec<u8> {
-    let proof_len = proof.len() as u16;
+/// Maximum bao encoding overhead per slice (tree nodes interleaved with data).
+///
+/// For plaintext ≤ 245 KiB, the overhead is ≤ ~16 KiB.  We budget 17 KiB
+/// to leave margin for large files with deep trees.
+pub const BAO_ENCODING_BUDGET: usize = 17 * 1024;
+
+/// Plaintext capacity per slice after reserving room for the bao encoding
+/// header (4 bytes) and tree overhead.
+pub const BAO_PLAINTEXT_CAPACITY: usize = FILE_SLICE_CIPHERTEXT_BYTES - 4 - BAO_ENCODING_BUDGET;
+
+/// Pack a bao slice encoding into the fixed-size ciphertext field.
+///
+/// Format: `[encoding_len: u32 LE][bao slice encoding, zero-padded]`.
+/// The bao slice encoding contains the plaintext data interleaved with
+/// BLAKE3 tree verification nodes (~6% overhead).
+pub fn pack_bao_payload(bao_encoding: &[u8], _plaintext: &[u8]) -> Vec<u8> {
+    let enc_len = bao_encoding.len() as u32;
     let mut payload = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
-    payload[0..2].copy_from_slice(&proof_len.to_le_bytes());
-    payload[2..2 + proof.len()].copy_from_slice(proof);
-    let data_start = 2 + proof.len();
-    let data_len = plaintext.len().min(FILE_SLICE_CIPHERTEXT_BYTES - data_start);
-    payload[data_start..data_start + data_len].copy_from_slice(&plaintext[..data_len]);
+    payload[0..4].copy_from_slice(&enc_len.to_le_bytes());
+    let copy_len = bao_encoding.len().min(FILE_SLICE_CIPHERTEXT_BYTES - 4);
+    payload[4..4 + copy_len].copy_from_slice(&bao_encoding[..copy_len]);
     payload
 }
 
-/// Unpack a bao payload into (proof, plaintext_data).
+/// Unpack a bao payload.  Returns (bao_encoding, raw_data_fallback).
+///
+/// If `encoding_len == 0`, the payload has no bao encoding and the raw
+/// plaintext starts at offset 4 (legacy/generated data).
 pub fn unpack_bao_payload(payload: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    let proof_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
-    let proof = payload[2..2 + proof_len].to_vec();
-    let data = payload[2 + proof_len..].to_vec();
-    (proof, data)
+    if payload.len() < 4 {
+        return (Vec::new(), payload.to_vec());
+    }
+    let enc_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
+    if enc_len == 0 {
+        return (Vec::new(), payload[4..].to_vec());
+    }
+    let end = (4 + enc_len).min(payload.len());
+    let encoding = payload[4..end].to_vec();
+    (encoding, Vec::new())
 }
 
-/// Effective plaintext capacity per slice given a proof size.
-pub fn effective_plaintext_capacity(proof_len: usize) -> usize {
-    FILE_SLICE_CIPHERTEXT_BYTES - 2 - proof_len
+/// Effective plaintext capacity per slice (convenience alias).
+pub fn effective_plaintext_capacity(_bao_overhead: usize) -> usize {
+    BAO_PLAINTEXT_CAPACITY
 }
 
 #[cfg(test)]

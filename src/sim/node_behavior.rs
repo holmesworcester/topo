@@ -1098,6 +1098,9 @@ impl ProjectionQueries for NodeBehaviorEngine {
                     event_id: row_text(row, "event_id")?.to_string(),
                     signer_event_id: row_text(row, "signer_event_id")?.to_string(),
                     key_event_id: row_text(row, "key_event_id")?.to_string(),
+                    root_hash: [0u8; 32],
+                    blob_bytes: 0,
+                    slice_bytes: 0,
                 })
             })
             .collect();

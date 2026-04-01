@@ -136,6 +136,12 @@ pub struct FileDescriptorInfo {
     pub event_id: String,
     pub signer_event_id: String,
     pub key_event_id: String,
+    /// BLAKE3 bao root hash for content verification ([0;32] = no verification).
+    pub root_hash: [u8; 32],
+    /// Original file size in bytes.
+    pub blob_bytes: u64,
+    /// Effective plaintext bytes per slice.
+    pub slice_bytes: u32,
 }
 
 /// Read-model snapshot passed to pure projectors for context queries.

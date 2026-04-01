@@ -130,6 +130,76 @@ mod tests {
     }
 
     #[test]
+    fn measure_proof_overhead() {
+        use crate::event_modules::file_slice::wire::{BAO_PLAINTEXT_CAPACITY, FILE_SLICE_CIPHERTEXT_BYTES};
+
+        // Test with various file sizes to measure overhead scaling
+        for file_size in [1_000_000usize, 10_000_000, 100_000_000] {
+            let file_data: Vec<u8> = (0..file_size).map(|i| (i % 251) as u8).collect();
+            let (_, outboard) = compute_outboard(&file_data).unwrap();
+
+            let chunk = BAO_PLAINTEXT_CAPACITY;
+            let len = file_data.len().min(chunk);
+            let proof = extract_slice_proof(&file_data, &outboard, 0, len as u64).unwrap();
+            let overhead = proof.len() - len;
+            let fits = proof.len() <= FILE_SLICE_CIPHERTEXT_BYTES - 4;
+            eprintln!(
+                "  file={:.0}MB chunk={} proof={} overhead={} fits={}",
+                file_size as f64 / 1e6, chunk, proof.len(), overhead, fits
+            );
+            assert!(fits, "bao encoding must fit in payload field for {}MB file", file_size / 1_000_000);
+        }
+    }
+
+    #[test]
+    fn roundtrip_packed_payload() {
+        // Simulate the real send/receive flow: file data → outboard → per-slice
+        // bao encoding → pack into 262144-byte payload → unpack → verify.
+        use crate::event_modules::file_slice::wire::*;
+
+        let eff_cap = BAO_PLAINTEXT_CAPACITY;
+        let file_data: Vec<u8> = (0..600_000).map(|i| (i % 251) as u8).collect();
+        let file_size = file_data.len();
+        let (root_hash, outboard) = compute_outboard(&file_data).unwrap();
+
+        let num_slices = file_size.div_ceil(eff_cap);
+
+        for i in 0..num_slices {
+            let data_start = i * eff_cap;
+            let bytes_this = (file_size - data_start).min(eff_cap);
+            // Extract bao slice encoding (contains data + tree nodes)
+            let encoding = extract_slice_proof(
+                &file_data,
+                &outboard,
+                data_start as u64,
+                bytes_this as u64,
+            )
+            .unwrap();
+            let plaintext = &file_data[data_start..data_start + bytes_this];
+
+            // Pack into fixed-size field
+            let packed = pack_bao_payload(&encoding, plaintext);
+            assert_eq!(packed.len(), FILE_SLICE_CIPHERTEXT_BYTES);
+
+            // Unpack and verify (mirrors the projector + save path)
+            let (enc_out, _) = unpack_bao_payload(&packed);
+            assert!(!enc_out.is_empty(), "slice {} should have bao encoding", i);
+            let verified = verify_slice(
+                &root_hash,
+                &enc_out,
+                data_start as u64,
+                bytes_this as u64,
+            )
+            .unwrap();
+            assert_eq!(
+                &verified, plaintext,
+                "slice {} verified data mismatch",
+                i
+            );
+        }
+    }
+
+    #[test]
     fn empty_data() {
         let data = b"";
         let (root_hash, outboard) = compute_outboard(data).unwrap();
