@@ -1,9 +1,9 @@
-use std::io::{BufReader, Read};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
 use std::time::Instant;
 
+use crate::crypto::bao_verify;
 use crate::crypto::EventId;
 use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
 use crate::projection::create::create_encrypted_event_synchronous;
@@ -576,18 +576,15 @@ fn mime_from_extension(ext: &str) -> &'static str {
     }
 }
 
-fn read_padded_file_slice<R: Read>(
-    reader: &mut R,
-    bytes_this_slice: usize,
-) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
-    let mut ciphertext = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
-    if bytes_this_slice > 0 {
-        reader.read_exact(&mut ciphertext[..bytes_this_slice])?;
-    }
-    Ok(ciphertext)
-}
-
 /// Send a message with a file as a specific peer.
+///
+/// Computes a bao (BLAKE3 verified streaming) root hash over the file
+/// contents. The root hash is stored in the File descriptor event. At receive
+/// time, the reassembled file is verified against this root hash, catching
+/// any corruption or tampering in the slice data.
+///
+/// The per-slice wire format is unchanged: each slice carries
+/// `FILE_SLICE_CIPHERTEXT_BYTES` of zero-padded file data.
 pub fn send_file_for_peer(
     db_path: &str,
     peer_id: &str,
@@ -595,16 +592,10 @@ pub fn send_file_for_peer(
     file_path: &str,
 ) -> Result<SendFileResponse, Box<dyn std::error::Error + Send + Sync>> {
     let path = Path::new(file_path);
-    let file =
-        std::fs::File::open(path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("failed to open {}: {}", file_path, e).into()
-        })?;
-    let file_size = file
-        .metadata()
-        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("failed to stat {}: {}", file_path, e).into()
-        })?
-        .len();
+    let file_data = std::fs::read(path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+        format!("failed to read {}: {}", file_path, e).into()
+    })?;
+    let file_size = file_data.len() as u64;
     let filename = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -648,6 +639,17 @@ pub fn send_file_for_peer(
             "file too large: slice count exceeds u32".into()
         })?;
 
+    // Compute bao root hash over file contents for integrity verification
+    let root_hash = if file_size > 0 {
+        let (rh, _outboard) = bao_verify::compute_outboard(&file_data)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("bao root hash computation failed: {}", e).into()
+            })?;
+        rh
+    } else {
+        [0u8; 32]
+    };
+
     create_encrypted_event_synchronous(
         &db,
         &recorded_by,
@@ -659,7 +661,7 @@ pub fn send_file_for_peer(
             blob_bytes: file_size,
             total_slices: total_slices_u32,
             slice_bytes: FILE_SLICE_CIPHERTEXT_BYTES as u32,
-            root_hash: [0u8; 32],
+            root_hash,
             key_event_id,
             filename: filename.clone(),
             mime_type,
@@ -670,11 +672,15 @@ pub fn send_file_for_peer(
         Some(&ctx.signing_key),
     )?;
 
-    let mut reader = BufReader::new(file);
     let mut remaining_bytes = file_size;
     for slice_number in 0..num_slices {
         let bytes_this_slice = remaining_bytes.min(FILE_SLICE_CIPHERTEXT_BYTES as u64) as usize;
-        let ciphertext = read_padded_file_slice(&mut reader, bytes_this_slice)?;
+        let start = slice_number * FILE_SLICE_CIPHERTEXT_BYTES;
+        let mut ciphertext = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
+        if bytes_this_slice > 0 {
+            ciphertext[..bytes_this_slice]
+                .copy_from_slice(&file_data[start..start + bytes_this_slice]);
+        }
         remaining_bytes = remaining_bytes.saturating_sub(bytes_this_slice as u64);
 
         create_encrypted_event_synchronous(
@@ -692,13 +698,6 @@ pub fn send_file_for_peer(
             }),
             Some(&ctx.signing_key),
         )?;
-    }
-    if remaining_bytes != 0 {
-        return Err(format!(
-            "file read incomplete: {} bytes remained unread for {}",
-            remaining_bytes, file_path
-        )
-        .into());
     }
 
     Ok(SendFileResponse {

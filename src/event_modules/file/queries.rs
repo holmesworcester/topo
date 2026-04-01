@@ -1,4 +1,6 @@
-use crate::crypto::{b64_to_hex, decrypt_event_blob, event_id_from_hex, event_id_to_base64};
+use crate::crypto::{
+    b64_to_hex, bao_verify, decrypt_event_blob, event_id_from_hex, event_id_to_base64,
+};
 use crate::event_modules::{parse_event, ParsedEvent};
 use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
@@ -272,8 +274,8 @@ fn load_file_slice_payload(
 
     let parsed =
         parse_event(&blob).map_err(|e| format!("parse event {}: {}", slice_event_id_b64, e))?;
-    match parsed {
-        ParsedEvent::FileSlice(fs) => Ok(fs.ciphertext),
+    let raw_ciphertext = match parsed {
+        ParsedEvent::FileSlice(fs) => fs.ciphertext,
         ParsedEvent::Encrypted(enc) => {
             let key_event_id_b64 = event_id_to_base64(&enc.key_event_id);
             if key_event_id_b64 != expected_key_event_id_b64 {
@@ -307,31 +309,39 @@ fn load_file_slice_payload(
                     |e| format!("decrypt encrypted slice {}: {}", slice_event_id_b64, e),
                 )?;
             match parse_event(&plaintext) {
-                Ok(ParsedEvent::FileSlice(fs)) => Ok(fs.ciphertext),
-                Ok(other) => Err(format!(
-                    "slice event {} decrypted to unexpected type {}",
-                    slice_event_id_b64,
-                    crate::event_modules::registry()
-                        .lookup(other.event_type_code())
-                        .map(|m| m.type_name)
-                        .unwrap_or("unknown")
-                )
-                .into()),
+                Ok(ParsedEvent::FileSlice(fs)) => fs.ciphertext,
+                Ok(other) => {
+                    return Err(format!(
+                        "slice event {} decrypted to unexpected type {}",
+                        slice_event_id_b64,
+                        crate::event_modules::registry()
+                            .lookup(other.event_type_code())
+                            .map(|m| m.type_name)
+                            .unwrap_or("unknown")
+                    )
+                    .into())
+                }
                 Err(e) => {
-                    Err(format!("parse decrypted slice {}: {}", slice_event_id_b64, e).into())
+                    return Err(
+                        format!("parse decrypted slice {}: {}", slice_event_id_b64, e).into()
+                    )
                 }
             }
         }
-        other => Err(format!(
-            "slice event {} is not file_slice (got {})",
-            slice_event_id_b64,
-            crate::event_modules::registry()
-                .lookup(other.event_type_code())
-                .map(|m| m.type_name)
-                .unwrap_or("unknown")
-        )
-        .into()),
-    }
+        other => {
+            return Err(format!(
+                "slice event {} is not file_slice (got {})",
+                slice_event_id_b64,
+                crate::event_modules::registry()
+                    .lookup(other.event_type_code())
+                    .map(|m| m.type_name)
+                    .unwrap_or("unknown")
+            )
+            .into())
+        }
+    };
+
+    Ok(raw_ciphertext)
 }
 
 fn write_matching_file_slices<W: Write>(
@@ -400,14 +410,15 @@ pub fn save_file_by_selector(
     let file_event_id_b64 = resolve_file_selector_to_b64(db, recorded_by, selector)?;
     let file_event_id_hex = b64_to_hex(&file_event_id_b64);
 
-    let (file_id_b64, blob_bytes, total_slices, filename, key_event_id_b64): (
+    let (file_id_b64, blob_bytes, total_slices, filename, key_event_id_b64, root_hash_blob): (
         String,
         i64,
         i64,
         String,
         String,
+        Vec<u8>,
     ) = db.query_row(
-        "SELECT file_id, blob_bytes, total_slices, filename, key_event_id
+        "SELECT file_id, blob_bytes, total_slices, filename, key_event_id, root_hash
          FROM files
          WHERE recorded_by = ?1 AND event_id = ?2
          LIMIT 1",
@@ -419,9 +430,23 @@ pub fn save_file_by_selector(
                 row.get(2)?,
                 row.get(3)?,
                 row.get(4)?,
+                row.get(5)?,
             ))
         },
     )?;
+
+    // Extract root hash for whole-file bao verification
+    let root_hash: Option<[u8; 32]> = if root_hash_blob.len() == 32 {
+        let mut rh = [0u8; 32];
+        rh.copy_from_slice(&root_hash_blob);
+        if rh != [0u8; 32] {
+            Some(rh)
+        } else {
+            None
+        }
+    } else {
+        None
+    };
 
     let out_path = Path::new(output_path);
     if let Some(parent) = out_path.parent() {
@@ -476,6 +501,23 @@ pub fn save_file_by_selector(
     }
     temp_file.as_file_mut().set_len(expected_len)?;
     temp_file.as_file_mut().sync_all()?;
+
+    // Verify file integrity against bao root hash (if present).
+    // Uses streaming verification to avoid loading the whole file into memory.
+    if let Some(rh) = root_hash {
+        use std::io::{Seek, SeekFrom};
+        temp_file.as_file_mut().seek(SeekFrom::Start(0))?;
+        let verify_hash = bao_verify::compute_root_hash_streaming(temp_file.as_file_mut())?;
+        if verify_hash != rh {
+            return Err(format!(
+                "bao root hash mismatch: expected {}, got {}",
+                hex::encode(rh),
+                hex::encode(verify_hash)
+            )
+            .into());
+        }
+    }
+
     temp_file
         .persist(out_path)
         .map_err(|err| -> Box<dyn std::error::Error + Send + Sync> { err.error.into() })?;

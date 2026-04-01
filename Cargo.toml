@@ -11,7 +11,8 @@ tokio = { version = "1", features = ["full"] }
 tokio-stream = "0.1"
 tokio-util = "0.7"
 rustls = { version = "0.23", default-features = false, features = ["ring", "std"] }
-blake2 = "0.10"
+blake3 = "1"
+bao = "0.13"
 base64 = "0.21"
 rcgen = "0.12"
 hex = "0.4"
@@ -56,7 +57,7 @@ codegen-units = 1     # Single codegen unit for better optimization
 opt-level = 3
 [profile.release.package.curve25519-dalek]
 opt-level = 3
-[profile.release.package.blake2]
+[profile.release.package.blake3]
 opt-level = 3
 [profile.release.package.sha2]
 opt-level = 3
@@ -73,7 +74,7 @@ opt-level = 3
 [profile.dev.package.curve25519-dalek]
 opt-level = 3
 
-[profile.dev.package.blake2]
+[profile.dev.package.blake3]
 opt-level = 3
 
 [profile.dev.package.sha2]

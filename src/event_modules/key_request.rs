@@ -56,19 +56,13 @@ pub fn delivery_target_id(
     recipient_event_id: &[u8; 32],
     unwrap_key_event_id: &[u8; 32],
 ) -> [u8; 32] {
-    use blake2::digest::consts::U32;
-    use blake2::{Blake2b, Digest};
-
-    let mut hasher = Blake2b::<U32>::new();
+    let mut hasher = blake3::Hasher::new();
     hasher.update(b"poc7-key-delivery-target-v1");
     hasher.update(key_event_id);
     hasher.update(frontier_hash);
     hasher.update(recipient_event_id);
     hasher.update(unwrap_key_event_id);
-    let digest = hasher.finalize();
-    let mut out = [0u8; 32];
-    out.copy_from_slice(&digest[..32]);
-    out
+    *hasher.finalize().as_bytes()
 }
 
 pub fn deterministic_key_request_created_at_ms(
@@ -79,10 +73,7 @@ pub fn deterministic_key_request_created_at_ms(
     unwrap_key_event_id: &[u8; 32],
     signed_by: &[u8; 32],
 ) -> u64 {
-    use blake2::digest::consts::U8;
-    use blake2::{Blake2b, Digest};
-
-    let mut hasher = Blake2b::<U8>::new();
+    let mut hasher = blake3::Hasher::new();
     hasher.update(b"poc7-key-request-created-at-v1");
     hasher.update(blocked_event_id);
     hasher.update(key_event_id);
@@ -92,7 +83,7 @@ pub fn deterministic_key_request_created_at_ms(
     hasher.update(signed_by);
     let digest = hasher.finalize();
     let mut out = [0u8; 8];
-    out.copy_from_slice(&digest[..8]);
+    out.copy_from_slice(&digest.as_bytes()[..8]);
     u64::from_le_bytes(out)
 }
 

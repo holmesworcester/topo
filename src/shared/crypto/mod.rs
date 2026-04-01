@@ -1,24 +1,16 @@
 use aes_gcm::aead::Aead;
 use aes_gcm::{Aes256Gcm, KeyInit, Nonce};
-use blake2::digest::consts::U32;
-use blake2::{Blake2b, Digest};
 use ed25519_dalek::{Signature, Signer, SigningKey, Verifier, VerifyingKey};
 pub type EventId = [u8; 32];
 
 mod spki;
+pub mod bao_verify;
 
 pub use spki::spki_fingerprint_from_ed25519_pubkey;
 
-type Blake2b256 = Blake2b<U32>;
-
-/// Compute Blake2b-256 hash of data, returning 32-byte event ID
+/// Compute BLAKE3 hash of data, returning 32-byte event ID
 pub fn hash_event(data: &[u8]) -> EventId {
-    let mut hasher = Blake2b256::new();
-    hasher.update(data);
-    let result = hasher.finalize();
-    let mut id = [0u8; 32];
-    id.copy_from_slice(&result);
-    id
+    *blake3::hash(data).as_bytes()
 }
 
 /// Encode event ID as base64 for storage
@@ -138,14 +130,10 @@ fn derive_wrap_key(local_private: &SigningKey, remote_public: &VerifyingKey) -> 
     let shared_point = &remote_point * &local_scalar;
 
     // Hash to uniform 32-byte key with domain separation
-    let mut hasher = Blake2b256::new();
+    let mut hasher = blake3::Hasher::new();
     hasher.update(b"poc7-key-wrap-v1");
     hasher.update(shared_point.as_bytes());
-    let hash = hasher.finalize();
-
-    let mut key = [0u8; 32];
-    key.copy_from_slice(&hash);
-    key
+    *hasher.finalize().as_bytes()
 }
 
 /// Wrap a 32-byte secret key for a recipient identified by their Ed25519 public key.

@@ -2460,21 +2460,17 @@ fn hex(bytes: &[u8]) -> String {
 }
 
 /// Compute deterministic projection fingerprint for a tenant.
-/// Hashes all projection table rows using Blake2b-256 with type-tagged,
+/// Hashes all projection table rows using BLAKE3 with type-tagged,
 /// length-prefixed column encoding for unambiguous serialization.
 fn compute_projection_fingerprint(
     db: &rusqlite::Connection,
     recorded_by: &str,
 ) -> ProjectionFingerprint {
-    use blake2::digest::consts::U32;
-    use blake2::{Blake2b, Digest};
-    type Blake2b256 = Blake2b<U32>;
-
-    let mut overall = Blake2b256::new();
+    let mut overall = blake3::Hasher::new();
     let mut tables = Vec::with_capacity(FINGERPRINT_TABLES.len());
 
     for ft in FINGERPRINT_TABLES {
-        let mut table_hasher = Blake2b256::new();
+        let mut table_hasher = blake3::Hasher::new();
         // Domain separator: table name
         table_hasher.update(ft.name.as_bytes());
         table_hasher.update(b"\x00");
@@ -2528,9 +2524,7 @@ fn compute_projection_fingerprint(
             }
         }
 
-        let table_result = table_hasher.finalize();
-        let mut table_hash = [0u8; 32];
-        table_hash.copy_from_slice(&table_result);
+        let table_hash = *table_hasher.finalize().as_bytes();
 
         // Feed per-table hash into overall fingerprint
         overall.update(&table_hash);
@@ -2542,9 +2536,7 @@ fn compute_projection_fingerprint(
         });
     }
 
-    let result = overall.finalize();
-    let mut fp = [0u8; 32];
-    fp.copy_from_slice(&result);
+    let fp = *overall.finalize().as_bytes();
     ProjectionFingerprint {
         overall: fp,
         tables,

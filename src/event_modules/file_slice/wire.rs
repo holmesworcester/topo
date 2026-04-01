@@ -115,6 +115,32 @@ pub static FILE_SLICE_META: EventTypeMeta = EventTypeMeta {
     context_loader: super::projector::build_projector_context,
 };
 
+/// Pack a bao proof and plaintext data into the fixed-size ciphertext field.
+/// Format: [proof_len: u16 LE][proof bytes][file data, zero-padded]
+pub fn pack_bao_payload(proof: &[u8], plaintext: &[u8]) -> Vec<u8> {
+    let proof_len = proof.len() as u16;
+    let mut payload = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
+    payload[0..2].copy_from_slice(&proof_len.to_le_bytes());
+    payload[2..2 + proof.len()].copy_from_slice(proof);
+    let data_start = 2 + proof.len();
+    let data_len = plaintext.len().min(FILE_SLICE_CIPHERTEXT_BYTES - data_start);
+    payload[data_start..data_start + data_len].copy_from_slice(&plaintext[..data_len]);
+    payload
+}
+
+/// Unpack a bao payload into (proof, plaintext_data).
+pub fn unpack_bao_payload(payload: &[u8]) -> (Vec<u8>, Vec<u8>) {
+    let proof_len = u16::from_le_bytes([payload[0], payload[1]]) as usize;
+    let proof = payload[2..2 + proof_len].to_vec();
+    let data = payload[2 + proof_len..].to_vec();
+    (proof, data)
+}
+
+/// Effective plaintext capacity per slice given a proof size.
+pub fn effective_plaintext_capacity(proof_len: usize) -> usize {
+    FILE_SLICE_CIPHERTEXT_BYTES - 2 - proof_len
+}
+
 #[cfg(test)]
 mod layout_tests {
     use super::*;
