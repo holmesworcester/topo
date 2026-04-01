@@ -1546,16 +1546,17 @@ fn test_file_slice_dependents_of_deleted_message_are_hard_purged_before_and_afte
     ));
     let early_slice_b64 = event_id_to_base64(&early_slice_eid);
 
-    let guard_rows_before: i64 = conn
+    // File slice should be dep-blocked on file_id (no descriptor yet)
+    let dep_blocked_before: i64 = conn
         .query_row(
-            "SELECT COUNT(*) FROM file_slice_guard_blocks WHERE peer_id = ?1 AND file_id = ?2",
+            "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1 AND blocker_event_id = ?2",
             rusqlite::params![recorded_by, &file_id_b64],
             |row| row.get(0),
         )
         .unwrap();
     assert_eq!(
-        guard_rows_before, 1,
-        "late slice should guard-block before deleted_files mapping exists"
+        dep_blocked_before, 1,
+        "late slice should be dep-blocked on file_id before descriptor exists"
     );
 
     let file_eid = insert_event_raw(&conn, recorded_by, &file_blob);

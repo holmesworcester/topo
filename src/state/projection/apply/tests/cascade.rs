@@ -318,23 +318,25 @@ fn test_file_slice_guard_retry_after_cascaded_attachment() {
     let (_fs, fs_blob) = make_file_slice(&signing_key, &signer_eid, file_id, 0, b"slice data");
     let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
     let r2 = project_one(&conn, recorded_by, &fs_eid).unwrap();
-    // file_slice returns Block with empty missing (guard block) because no descriptor exists
+    // file_slice returns Block with file_id as the synthetic dep (no descriptor yet)
     assert!(
-        matches!(r2, ProjectionDecision::Block { ref missing } if missing.is_empty()),
-        "file_slice should be guard-blocked, got {:?}",
+        matches!(r2, ProjectionDecision::Block { ref missing } if !missing.is_empty()),
+        "file_slice should be blocked on file_id, got {:?}",
         r2
     );
 
-    // Verify file_slice is in guard block table
+    // Verify file_slice is blocked via blocked_event_deps with file_id as blocker
     let fs_b64 = event_id_to_base64(&fs_eid);
-    let guard_blocked: bool = conn
+    let file_id_b64 = event_id_to_base64(&file_id);
+    let dep_blocked: bool = conn
         .query_row(
-            "SELECT COUNT(*) > 0 FROM file_slice_guard_blocks WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, &fs_b64],
+            "SELECT COUNT(*) > 0 FROM blocked_event_deps
+             WHERE peer_id = ?1 AND event_id = ?2 AND blocker_event_id = ?3",
+            rusqlite::params![recorded_by, &fs_b64, &file_id_b64],
             |row| row.get(0),
         )
         .unwrap();
-    assert!(guard_blocked, "file_slice should be in guard_blocks table");
+    assert!(dep_blocked, "file_slice should be dep-blocked on file_id");
 
     // Now project message — should cascade: attachment unblocks, then guard retry unblocks file_slice
     project_one(&conn, recorded_by, &msg_eid).unwrap();

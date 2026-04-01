@@ -4,7 +4,7 @@ use crate::crypto::{event_id_to_base64, EventId};
 use crate::event_modules::{self as events, ParsedEvent};
 use rusqlite::Connection;
 
-use super::cascade::{cascade_unblocked, cascade_unblocked_global};
+use super::cascade::{cascade_file_id_if_file, cascade_unblocked, cascade_unblocked_global};
 use super::stages::run_dep_and_projection_stages_with_backend;
 
 fn event_is_valid_for_peer(
@@ -135,6 +135,9 @@ pub fn project_one(
                 if matches!(parsed.as_ref(), Some(ParsedEvent::EndpointShared(_))) {
                     cascade_unblocked_global(conn, &event_id_b64)?;
                 }
+                // File events: cascade on file_id to unblock file_slices
+                // that were blocked waiting for the descriptor.
+                cascade_file_id_if_file(conn, recorded_by, &event_id_b64)?;
             }
         }
         Ok(decision)

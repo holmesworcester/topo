@@ -103,41 +103,10 @@ pub(crate) fn execute_emit_commands(
                     }
                 }
             }
-            EmitCommand::RetryFileSliceGuards { file_id } => {
-                let fs_candidates: Vec<String> = {
-                    let mut stmt = conn.prepare(
-                        "SELECT event_id FROM file_slice_guard_blocks
-                         WHERE peer_id = ?1 AND file_id = ?2",
-                    )?;
-                    let mut rows = stmt.query(rusqlite::params![recorded_by, file_id])?;
-                    let mut result = Vec::new();
-                    while let Some(row) = rows.next()? {
-                        result.push(row.get::<_, String>(0)?);
-                    }
-                    result
-                };
-                for eid_b64 in fs_candidates {
-                    conn.execute(
-                        "DELETE FROM file_slice_guard_blocks WHERE peer_id = ?1 AND event_id = ?2",
-                        rusqlite::params![recorded_by, &eid_b64],
-                    )?;
-                    // Re-project: may go Valid, dep-blocked, or guard-blocked again.
-                    // Stale blocked_event_deps from prior dep-block→guard-block transitions
-                    // are cleaned up by cascade_unblocked_inner's bulk orphan cleanup
-                    // (DELETE WHERE event_id NOT IN blocked_events). We do NOT delete dep
-                    // edges here because project_one may write fresh dep edges if the event
-                    // re-enters dep-blocked state.
-                    if let Some(event_id) = event_id_from_base64(&eid_b64) {
-                        let _ = super::project_one(conn, recorded_by, &event_id)?;
-                    }
-                }
-            }
-            EmitCommand::RecordFileSliceGuardBlock { file_id, event_id } => {
-                conn.execute(
-                    "INSERT OR IGNORE INTO file_slice_guard_blocks (peer_id, file_id, event_id)
-                     VALUES (?1, ?2, ?3)",
-                    rusqlite::params![recorded_by, file_id, event_id],
-                )?;
+            EmitCommand::RetryFileSliceGuards { .. } | EmitCommand::RecordFileSliceGuardBlock { .. } => {
+                // Legacy no-op: file_slice blocking now uses normal dep-blocking
+                // with file_id as the blocker key. cascade_file_id_if_file in
+                // cascade.rs handles unblocking when the File descriptor projects.
             }
             EmitCommand::MaterializeTransportIdentity { spec } => {
                 use crate::contracts::transport_identity_contract::{

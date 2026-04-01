@@ -38,12 +38,11 @@ mod tests {
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_block(&result);
+        // FileSlice now dep-blocks on file_id (no guard table commands needed).
+        // The cascade algorithm resolves this when the File descriptor projects.
         assert!(
-            result
-                .emit_commands
-                .iter()
-                .any(|c| matches!(c, EmitCommand::RecordFileSliceGuardBlock { .. })),
-            "should emit RecordFileSliceGuardBlock on guard-block"
+            result.emit_commands.is_empty(),
+            "no emit commands needed — dep-blocking on file_id handles unblocking"
         );
     }
 

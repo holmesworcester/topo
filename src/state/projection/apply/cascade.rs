@@ -4,7 +4,7 @@ use crate::db::queue::current_timestamp_ms;
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::ParsedEvent;
 use crate::state::shared_workspace_fanout::fanout_stored_shared_event_immediate;
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 fn event_is_valid_for_peer(
     conn: &Connection,
@@ -52,6 +52,37 @@ pub(crate) fn cascade_unblocked_global(
     };
     for peer_id in peers {
         cascade_unblocked_inner(conn, &peer_id, blocker_b64)?;
+    }
+    Ok(())
+}
+
+/// Cascade on an arbitrary key in blocked_event_deps.blocker_event_id.
+/// Used for file_id cascade: file_slices block on file_id, resolved
+/// when the File descriptor projects.
+pub(crate) fn cascade_unblocked_on_key(
+    conn: &Connection,
+    recorded_by: &str,
+    key_b64: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    cascade_unblocked_inner(conn, recorded_by, key_b64)
+}
+
+/// If the just-projected event is a File, cascade on its file_id to
+/// unblock dependent file_slices. Queries the projected files table.
+pub(crate) fn cascade_file_id_if_file(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+) -> Result<(), Box<dyn std::error::Error>> {
+    let file_id: Option<String> = conn
+        .query_row(
+            "SELECT file_id FROM files WHERE recorded_by = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, event_id_b64],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if let Some(file_id) = file_id {
+        cascade_unblocked_on_key(conn, recorded_by, &file_id)?;
     }
     Ok(())
 }
@@ -123,7 +154,7 @@ fn cascade_unblocked_inner(
 
             // 4. Project this event via project_one_step (no recursive cascade).
             //    apply_projection (called by project_one_step) executes emit_commands,
-            //    which handles guard retries (RetryWorkspaceEvent, RetryFileSliceGuards).
+            //    which handles guard retries (RetryWorkspaceEvent).
             if let Some(event_id) = event_id_from_base64(eid_b64) {
                 let (decision, _parsed) =
                     super::project_one::project_one_step(conn, recorded_by, &event_id)?;
@@ -132,6 +163,8 @@ fn cascade_unblocked_inner(
                 {
                     // Fan out newly valid shared events to same-workspace siblings
                     let _ = fanout_stored_shared_event_immediate(conn, recorded_by, &event_id);
+                    // File events: cascade on file_id to unblock file_slices
+                    cascade_file_id_if_file(conn, recorded_by, eid_b64)?;
                     worklist.push(eid_b64.clone());
                 }
             }

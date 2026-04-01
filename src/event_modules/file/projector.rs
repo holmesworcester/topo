@@ -6,7 +6,7 @@ use crate::projection::queries::define_query_context_loader;
 define_query_context_loader!(build_projector_context, File, load_file_context, "file");
 
 /// Pure projector: File → files table insert.
-/// Emits RetryFileSliceGuards command so pending file_slices can unblock.
+/// File_slice unblocking is handled by cascade_file_id_if_file in cascade.rs.
 pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
@@ -74,10 +74,5 @@ pub fn project_pure(
         ],
     }];
 
-    ProjectorResult::valid_with_commands(
-        ops,
-        vec![EmitCommand::RetryFileSliceGuards {
-            file_id: file_id_b64,
-        }],
-    )
+    ProjectorResult::valid(ops)
 }

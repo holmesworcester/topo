@@ -170,6 +170,20 @@ fn collect_projection_dependents(
             changed |= manifest.add_event_id(row?);
         }
 
+        // Collect file_slices blocked on this file_id (dep-blocked with
+        // file_id as the blocker key in blocked_event_deps).
+        let mut stmt = conn.prepare(
+            "SELECT event_id
+             FROM blocked_event_deps
+             WHERE peer_id = ?1 AND blocker_event_id = ?2",
+        )?;
+        let rows = stmt.query_map(params![recorded_by, &file_id], |row| {
+            row.get::<_, String>(0)
+        })?;
+        for row in rows {
+            changed |= manifest.add_event_id(row?);
+        }
+        // Legacy: also check old guard table for pre-migration data.
         let mut stmt = conn.prepare(
             "SELECT event_id
              FROM file_slice_guard_blocks

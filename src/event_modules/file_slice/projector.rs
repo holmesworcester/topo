@@ -1,7 +1,6 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::decision::ProjectionDecision;
 use crate::projection::queries::define_query_context_loader;
 
 define_query_context_loader!(
@@ -43,15 +42,10 @@ pub fn project_pure(
     let slice_signer_b64 = event_id_to_base64(&fs.signed_by);
 
     if ctx.file_descriptors.is_empty() {
-        // No descriptor yet — guard-block
-        return ProjectorResult {
-            decision: ProjectionDecision::Block { missing: vec![] },
-            write_ops: Vec::new(),
-            emit_commands: vec![EmitCommand::RecordFileSliceGuardBlock {
-                file_id: file_id_b64,
-                event_id: event_id_b64.to_string(),
-            }],
-        };
+        // No descriptor yet — block on file_id as a synthetic dep.
+        // When the File event projects, cascade resolves events blocked
+        // on this file_id through the normal dep-unblocking path.
+        return ProjectorResult::block(vec![fs.file_id]);
     }
 
     if ctx.file_descriptors.len() > 1 {

@@ -436,7 +436,10 @@ pub(crate) fn apply_projection_with_backend<B: ProjectionBackend>(
             backend.execute_write_ops(&result.write_ops)?;
             backend.execute_emit_commands(recorded_by, &result.emit_commands)?;
         }
-        ProjectionDecision::Block { .. } => {
+        ProjectionDecision::Block { ref missing } => {
+            if !missing.is_empty() {
+                backend.record_block(recorded_by, event_id_b64, missing)?;
+            }
             backend.execute_emit_commands(recorded_by, &result.emit_commands)?;
         }
         ProjectionDecision::Reject { .. } | ProjectionDecision::AlreadyProcessed => {}

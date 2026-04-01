@@ -132,9 +132,12 @@ mod tests {
         let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
         assert_valid(&result);
         assert_writes_to_table(&result, "files");
-        assert_emits_command(&result, "RetryFileSliceGuards", |c| {
-            matches!(c, EmitCommand::RetryFileSliceGuards { .. })
-        });
+        // File_slice unblocking is now handled by cascade_file_id_if_file
+        // in cascade.rs, not by a RetryFileSliceGuards command.
+        assert!(
+            result.emit_commands.is_empty(),
+            "File projector should not emit commands (cascade handles file_slice unblocking)"
+        );
     }
 
     #[test]
