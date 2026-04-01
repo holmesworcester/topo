@@ -1184,6 +1184,19 @@ pub fn wait_for_live_sync_session(db: &str, timeout: Duration) {
     }
 }
 
+/// Trigger an on-demand sync across all live sessions, retrying transient
+/// daemon-startup and initial-sync states through the shared RPC helper.
+pub fn request_sync_all(db: &str, timeout: Duration) {
+    let out = topo_rpc_retry(db, &["sync", "request", "all"], timeout);
+    assert!(
+        out.status.success(),
+        "sync request all failed for db={}: stdout={} stderr={}",
+        db,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Send a message via daemon RPC, retrying transient errors.
 pub fn send_message(db: &str, content: &str) -> String {
     let send_timeout = Duration::from_secs(60);
@@ -1263,8 +1276,13 @@ pub fn rotate_key(db: &str) -> (String, u64) {
     (rotation_event_id, proactive_shares)
 }
 
-/// Create an invite via daemon RPC. Returns the `topo://` invite link.
+/// Create an invite via daemon RPC with an explicit direct bootstrap address.
 pub fn create_invite(db: &str, bootstrap_addr: &str) -> String {
+    create_invite_with_spki(db, bootstrap_addr, None)
+}
+
+/// Create an invite via daemon RPC with an explicit direct bootstrap address.
+pub fn create_invite_with_public_addr(db: &str, bootstrap_addr: &str) -> String {
     create_invite_with_spki(db, bootstrap_addr, None)
 }
 
@@ -1297,8 +1315,13 @@ pub fn create_invite_with_spki(
         .to_string()
 }
 
-/// Create a device-link invite via daemon RPC. Returns the `topo://link/` link.
+/// Create a device-link via daemon RPC with an explicit direct bootstrap address.
 pub fn create_device_link(db: &str, bootstrap_addr: &str) -> String {
+    create_device_link_with_spki(db, bootstrap_addr, None)
+}
+
+/// Create a device-link via daemon RPC with an explicit direct bootstrap address.
+pub fn create_device_link_with_public_addr(db: &str, bootstrap_addr: &str) -> String {
     create_device_link_with_spki(db, bootstrap_addr, None)
 }
 
@@ -2488,6 +2511,27 @@ pub fn topo_create_invite_retry(db: &str, bootstrap_addr: &str) -> String {
         .to_string()
 }
 
+/// Create a device-link via RPC with retry. Returns the device link.
+pub fn topo_create_device_link_retry(db: &str, bootstrap_addr: &str) -> String {
+    let out = topo_rpc_retry(
+        db,
+        &["link", "--public-addr", bootstrap_addr],
+        Duration::from_secs(3),
+    );
+    assert!(
+        out.status.success(),
+        "topo link failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    stdout
+        .lines()
+        .find(|line| line.starts_with("topo://link/"))
+        .expect("link output missing topo://link/ link")
+        .to_string()
+}
+
 /// Accept an invite via a temporary daemon and persist the resulting tenant.
 /// Realism tests use this when acceptance happens before the long-lived daemon
 /// starts; writability is asserted later through normal runtime behavior.
@@ -2506,19 +2550,31 @@ pub fn accept_invite_lightweight(db: &str, invite_link: &str) {
 
 /// Send a file via daemon RPC. Returns the event ID.
 pub fn send_file(db: &str, content: &str, file_path: &str) -> String {
+    send_file_with_bad_slices(db, content, file_path, 0)
+}
+
+/// Send a file via daemon RPC, optionally appending bogus extra slices.
+pub fn send_file_with_bad_slices(
+    db: &str,
+    content: &str,
+    file_path: &str,
+    add_bad_slices: usize,
+) -> String {
     let send_timeout = Duration::from_secs(60);
     ensure_active_peer(db, Duration::from_secs(10));
     let start = Instant::now();
     loop {
-        let output = Command::new(bin())
-            .arg("--db")
+        let mut cmd = Command::new(bin());
+        cmd.arg("--db")
             .arg(db)
             .arg("send-file")
             .arg(content)
             .arg("--file")
-            .arg(file_path)
-            .output()
-            .expect("failed to run send-file");
+            .arg(file_path);
+        if add_bad_slices > 0 {
+            cmd.arg("--add-bad-slices").arg(add_bad_slices.to_string());
+        }
+        let output = cmd.output().expect("failed to run send-file");
         if output.status.success() {
             let stdout = String::from_utf8_lossy(&output.stdout);
             return stdout
@@ -2556,6 +2612,20 @@ pub fn send_file(db: &str, content: &str, file_path: &str) -> String {
             db, stderr, readiness_debug
         );
     }
+}
+
+pub fn rpc_method_json(db: &str, method_json: &str) -> serde_json::Value {
+    let output = Command::new(bin())
+        .args(["--db", db, "rpc", "call", "--method-json", method_json])
+        .output()
+        .expect("failed to run topo rpc call");
+    assert!(
+        output.status.success(),
+        "topo rpc call failed: stdout={} stderr={}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr),
+    );
+    serde_json::from_slice(&output.stdout).expect("failed to parse topo rpc JSON")
 }
 
 /// Save a received file to disk via daemon RPC.

@@ -17,9 +17,7 @@ use topo::rpc::client::{rpc_call, rpc_call_raw, RpcClientError};
 use topo::rpc::protocol::{ForwardAction, RpcMethod, PROTOCOL_VERSION};
 use topo::rpc::server::{run_rpc_server, DaemonState};
 use topo::service;
-use topo::tuning::apply_low_mem_allocator_tuning;
-#[cfg(all(target_os = "linux", target_env = "gnu"))]
-use topo::tuning::low_mem_mode;
+use topo::tuning::{apply_low_mem_allocator_tuning, low_mem_mode};
 
 mod cli;
 mod commands;
@@ -105,10 +103,28 @@ fn maybe_reexec_low_mem_with_allocator_env() -> Result<(), Box<dyn std::error::E
 // Main entry point
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     maybe_reexec_low_mem_with_allocator_env()?;
     apply_low_mem_allocator_tuning();
+
+    let rt = if low_mem_mode() {
+        // One worker thread saves ~4 MiB of thread stacks and TLS vs the
+        // default (num_cpus workers).  Sync workers (accept_loop, dial_loop)
+        // spawn their own per-connection runtimes so the main loop only
+        // needs one thread for supervision, RPC, and iroh background tasks.
+        tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .enable_all()
+            .build()?
+    } else {
+        tokio::runtime::Builder::new_multi_thread()
+            .enable_all()
+            .build()?
+    };
+    rt.block_on(async_main())
+}
+
+async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let matches = Cli::command().get_matches();
     let start_uses_default_bind = matches
         .subcommand()
@@ -519,6 +535,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::SendFile {
             content,
             file,
+            add_bad_slices,
             client_op_id,
         } => {
             let file_path = resolve_send_file_path(file)?;
@@ -528,6 +545,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 RpcMethod::SendFile {
                     content: content.clone(),
                     file_path,
+                    add_bad_slices,
                     client_op_id,
                 },
             )?;

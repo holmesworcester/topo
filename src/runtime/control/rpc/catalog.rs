@@ -54,9 +54,10 @@ static CATALOG: &[MethodInfo] = &[
         params: params![
             "content", "string", true, None;
             "file_path", "string", true, None;
+            "add_bad_slices", "usize", false, Some("0");
             "client_op_id", "string?", false, None
         ],
-        example_json: r#"{"type":"SendFile","content":"see attached","file_path":"/tmp/notes.txt","client_op_id":"op-456"}"#,
+        example_json: r#"{"type":"SendFile","content":"see attached","file_path":"/tmp/notes.txt","add_bad_slices":8,"client_op_id":"op-456"}"#,
     },
     MethodInfo {
         name: "Files",
@@ -169,7 +170,7 @@ static CATALOG: &[MethodInfo] = &[
         name: "CreateInvite",
         purpose: "Create a user invite link for the active workspace",
         params: params![
-            "public_addr", "string?", false, Some("auto-detect");
+            "public_addr", "string?", false, Some("omitted");
             "public_spki", "string?", false, None
         ],
         example_json: r#"{"type":"CreateInvite"}"#,
@@ -194,7 +195,7 @@ static CATALOG: &[MethodInfo] = &[
         name: "CreateDeviceLink",
         purpose: "Create a device link invite for the active peer's user",
         params: params![
-            "public_addr", "string?", false, Some("auto-detect");
+            "public_addr", "string?", false, Some("omitted");
             "public_spki", "string?", false, None
         ],
         example_json: r#"{"type":"CreateDeviceLink"}"#,
@@ -255,10 +256,70 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"Peers"}"#,
     },
     MethodInfo {
+        name: "Forward",
+        purpose: "Enable, disable, or inspect forward-on-have live hint delivery",
+        params: params!["action", "ForwardAction", false, Some("\"status\"")],
+        example_json: r#"{"type":"Forward","action":"status"}"#,
+    },
+    MethodInfo {
         name: "View",
         purpose: "Combined view: sidebar + messages with inline reactions",
         params: params!["limit", "usize", false, Some("50")],
         example_json: r#"{"type":"View","limit":50}"#,
+    },
+    MethodInfo {
+        name: "SubCreate",
+        purpose: "Create a local subscription",
+        params: params![
+            "name", "string", true, None;
+            "event_type", "string", true, None;
+            "delivery_mode", "string", true, None;
+            "spec_json", "string", false, Some("\"\"")
+        ],
+        example_json: r#"{"type":"SubCreate","name":"msgs","event_type":"message","delivery_mode":"full","spec_json":""}"#,
+    },
+    MethodInfo {
+        name: "SubList",
+        purpose: "List all subscriptions for the active peer",
+        params: PARAM_NONE,
+        example_json: r#"{"type":"SubList"}"#,
+    },
+    MethodInfo {
+        name: "SubDisable",
+        purpose: "Disable a subscription",
+        params: params!["subscription_id", "string", true, None],
+        example_json: r#"{"type":"SubDisable","subscription_id":"sub-123"}"#,
+    },
+    MethodInfo {
+        name: "SubEnable",
+        purpose: "Enable a subscription",
+        params: params!["subscription_id", "string", true, None],
+        example_json: r#"{"type":"SubEnable","subscription_id":"sub-123"}"#,
+    },
+    MethodInfo {
+        name: "SubPoll",
+        purpose: "Poll feed items from a subscription",
+        params: params![
+            "subscription_id", "string", true, None;
+            "after_seq", "i64", false, Some("0");
+            "limit", "usize", false, Some("50")
+        ],
+        example_json: r#"{"type":"SubPoll","subscription_id":"sub-123","after_seq":0,"limit":50}"#,
+    },
+    MethodInfo {
+        name: "SubAck",
+        purpose: "Acknowledge feed items through a given seq",
+        params: params![
+            "subscription_id", "string", true, None;
+            "through_seq", "i64", true, None
+        ],
+        example_json: r#"{"type":"SubAck","subscription_id":"sub-123","through_seq":42}"#,
+    },
+    MethodInfo {
+        name: "SubState",
+        purpose: "Get subscription state (pending count, dirty flag, cursors)",
+        params: params!["subscription_id", "string", true, None],
+        example_json: r#"{"type":"SubState","subscription_id":"sub-123"}"#,
     },
     MethodInfo {
         name: "EventList",
@@ -267,10 +328,25 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"EventList"}"#,
     },
     MethodInfo {
-        name: "Stats",
-        purpose: "Return all projection table counts for the active tenant",
-        params: PARAM_NONE,
-        example_json: r#"{"type":"Stats"}"#,
+        name: "EventListByIds",
+        purpose: "List specific events by their IDs",
+        params: params!["ids", "string[]", true, None],
+        example_json: r#"{"type":"EventListByIds","ids":["evt1","evt2"]}"#,
+    },
+    MethodInfo {
+        name: "EventShow",
+        purpose: "Show events matching an ID prefix",
+        params: params!["prefix", "string", true, None],
+        example_json: r#"{"type":"EventShow","prefix":"abc123"}"#,
+    },
+    MethodInfo {
+        name: "EventDeps",
+        purpose: "Show reverse dependencies for an event prefix",
+        params: params![
+            "prefix", "string", true, None;
+            "depth", "usize", true, None
+        ],
+        example_json: r#"{"type":"EventDeps","prefix":"abc123","depth":3}"#,
     },
     MethodInfo {
         name: "EventBlocked",
@@ -285,6 +361,52 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"EventTimeline","event_id":"<base64>"}"#,
     },
     MethodInfo {
+        name: "SyncPolicyShow",
+        purpose: "Show the current sync policy for the active tenant",
+        params: PARAM_NONE,
+        example_json: r#"{"type":"SyncPolicyShow"}"#,
+    },
+    MethodInfo {
+        name: "SyncPolicySet",
+        purpose: "Set sync policy fields for the active tenant",
+        params: params![
+            "requests", "string?", false, Some("unchanged");
+            "responses", "string?", false, Some("unchanged");
+            "forward_on_have", "string?", false, Some("unchanged")
+        ],
+        example_json: r#"{"type":"SyncPolicySet","requests":"auto","responses":"manual","forward_on_have":"disabled"}"#,
+    },
+    MethodInfo {
+        name: "SyncRoundPeer",
+        purpose: "Trigger a negentropy round for a specific peer",
+        params: params!["peer", "string", true, None],
+        example_json: r#"{"type":"SyncRoundPeer","peer":"peer-id"}"#,
+    },
+    MethodInfo {
+        name: "SyncRoundAll",
+        purpose: "Trigger a negentropy round for all connected peers",
+        params: PARAM_NONE,
+        example_json: r#"{"type":"SyncRoundAll"}"#,
+    },
+    MethodInfo {
+        name: "SyncRequestPeer",
+        purpose: "Trigger a request refill for a specific peer",
+        params: params!["peer", "string", true, None],
+        example_json: r#"{"type":"SyncRequestPeer","peer":"peer-id"}"#,
+    },
+    MethodInfo {
+        name: "SyncRequestAll",
+        purpose: "Trigger a request refill for all connected peers",
+        params: PARAM_NONE,
+        example_json: r#"{"type":"SyncRequestAll"}"#,
+    },
+    MethodInfo {
+        name: "Stats",
+        purpose: "Return all projection table counts for the active tenant",
+        params: PARAM_NONE,
+        example_json: r#"{"type":"Stats"}"#,
+    },
+    MethodInfo {
         name: "Replay",
         purpose: "Run a replay pass and return the projection fingerprint",
         params: params!["pass", "string", true, None],
@@ -296,6 +418,7 @@ static CATALOG: &[MethodInfo] = &[
         params: PARAM_NONE,
         example_json: r#"{"type":"Connections"}"#,
     },
+    #[cfg(feature = "discovery")]
     MethodInfo {
         name: "Discover",
         purpose: "Browse for peers via mDNS discovery",

@@ -593,6 +593,7 @@ pub fn send_file_for_peer(
     peer_id: &str,
     content: &str,
     file_path: &str,
+    add_bad_slices: usize,
 ) -> Result<SendFileResponse, Box<dyn std::error::Error + Send + Sync>> {
     let path = Path::new(file_path);
     let file =
@@ -685,6 +686,29 @@ pub fn send_file_for_peer(
                 created_at_ms: current_timestamp_ms_u64(),
                 file_id,
                 slice_number: slice_number as u32,
+                ciphertext,
+                signed_by: ctx.signer_event_id,
+                signer_type: 5,
+                signature: [0u8; 64],
+            }),
+            Some(&ctx.signing_key),
+        )?;
+    }
+    for bad_idx in 0..add_bad_slices {
+        let slice_number = total_slices_u32.checked_add(bad_idx as u32).ok_or_else(
+            || -> Box<dyn std::error::Error + Send + Sync> {
+                "too many bad slices: slice number exceeds u32".into()
+            },
+        )?;
+        let ciphertext = vec![(bad_idx as u8).wrapping_add(0xA5); FILE_SLICE_CIPHERTEXT_BYTES];
+        create_encrypted_event_synchronous(
+            &db,
+            &recorded_by,
+            &key_event_id,
+            &ParsedEvent::FileSlice(FileSliceEvent {
+                created_at_ms: current_timestamp_ms_u64(),
+                file_id,
+                slice_number,
                 ciphertext,
                 signed_by: ctx.signer_event_id,
                 signer_type: 5,

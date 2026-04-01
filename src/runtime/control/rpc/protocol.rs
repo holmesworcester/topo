@@ -31,6 +31,8 @@ pub enum RpcMethod {
         content: String,
         file_path: String,
         #[serde(default)]
+        add_bad_slices: usize,
+        #[serde(default)]
         client_op_id: Option<String>,
     },
     Files {
