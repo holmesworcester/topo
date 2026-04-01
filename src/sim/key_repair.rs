@@ -84,6 +84,7 @@ pub fn seed_deterministic_key_secret(
     if created != expected {
         return Err("deterministic key_secret event_id mismatch".into());
     }
+    ensure_key_rotation_exists(&conn, recorded_by, &created)?;
     Ok(created)
 }
 

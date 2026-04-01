@@ -93,8 +93,13 @@ pub fn snapshot_peer_db_to_path(
     crate::db::schema::create_tables(&dest)?;
 
     dest.execute("BEGIN IMMEDIATE", [])?;
+    let daemon_endpoint_id = load_daemon_endpoint_id(&source)?;
+
     let copy_result = (|| -> BridgeResult<()> {
         copy_known_event_store(&source, &dest, recorded_by)?;
+        if let Some(endpoint_id) = daemon_endpoint_id.as_deref() {
+            copy_recorded_event_store_for_scope(&source, &dest, endpoint_id)?;
+        }
         copy_shared_event_index(&source, &dest, recorded_by)?;
         copy_invite_secrets(&source, &dest, recorded_by)?;
         copy_peer_secrets(&source, &dest, recorded_by)?;
@@ -115,6 +120,9 @@ pub fn snapshot_peer_db_to_path(
         }
     }
 
+    if let Some(endpoint_id) = daemon_endpoint_id.as_deref() {
+        replay_recorded_events_into_projection(&dest, dest_db_path, endpoint_id)?;
+    }
     replay_recorded_events_into_projection(&dest, dest_db_path, recorded_by)?;
     Ok(())
 }
@@ -199,7 +207,59 @@ fn collect_recorded_event_ids(
     rows.collect::<Result<Vec<_>, _>>()
 }
 
+fn load_daemon_endpoint_id(
+    source: &rusqlite::Connection,
+) -> Result<Option<String>, rusqlite::Error> {
+    use rusqlite::OptionalExtension;
+
+    let daemon_identity: Option<String> = source
+        .query_row(
+            "SELECT peer_id
+             FROM daemon_transport_identity
+             WHERE singleton_id = 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if daemon_identity.is_some() {
+        return Ok(daemon_identity);
+    }
+
+    let endpoint_secret: Option<String> = source
+        .query_row(
+            "SELECT endpoint_id
+             FROM endpoint_secrets
+             ORDER BY created_at ASC, event_id ASC
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if endpoint_secret.is_some() {
+        return Ok(endpoint_secret);
+    }
+
+    source
+        .query_row(
+            "SELECT endpoint_id
+             FROM endpoints_shared
+             ORDER BY created_at ASC, event_id ASC
+             LIMIT 1",
+            [],
+            |row| row.get(0),
+        )
+        .optional()
+}
+
 fn copy_known_event_store(
+    source: &rusqlite::Connection,
+    dest: &rusqlite::Connection,
+    recorded_by: &str,
+) -> Result<(), rusqlite::Error> {
+    copy_recorded_event_store_for_scope(source, dest, recorded_by)
+}
+
+fn copy_recorded_event_store_for_scope(
     source: &rusqlite::Connection,
     dest: &rusqlite::Connection,
     recorded_by: &str,
@@ -601,7 +661,7 @@ mod tests {
 
         let invite = snapshot_daemon
             .call_ok_value(RpcMethod::CreateInvite {
-                public_addr: Some("127.0.0.1:7777".into()),
+                public_addr: None,
                 public_spki: None,
             })
             .expect("create invite on snapshot");

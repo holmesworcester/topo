@@ -255,7 +255,7 @@ mod tests {
         assert_eq!(BENCH_DEP_WIRE_SIZE, 345);
         assert_eq!(WORKSPACE_WIRE_SIZE, 105);
         assert_eq!(USER_WIRE_SIZE, 202);
-        assert_eq!(PEER_SHARED_WIRE_SIZE, 234);
+        assert_eq!(PEER_SHARED_WIRE_SIZE, 266);
         assert_eq!(KEY_SECRET_WIRE_SIZE, 41);
         assert_eq!(MESSAGE_DELETION_WIRE_SIZE, 170);
         assert_eq!(INVITE_ACCEPTED_WIRE_SIZE, 105);
@@ -263,9 +263,9 @@ mod tests {
         assert_eq!(DEVICE_INVITE_WIRE_SIZE, 170);
         assert_eq!(ADMIN_WIRE_SIZE, 170);
         assert_eq!(TENANT_WIRE_SIZE, 41);
-        assert_eq!(KEY_SHARED_WIRE_SIZE, 234);
+        assert_eq!(KEY_SHARED_WIRE_SIZE, 427);
         assert_eq!(INVITE_SECRET_WIRE_SIZE, 73);
-        assert_eq!(KEY_REQUEST_WIRE_SIZE, 234);
+        assert_eq!(KEY_REQUEST_WIRE_SIZE, 298);
         assert_eq!(IDENTITY_PUBKEY_SIGNED_WIRE_SIZE, 138);
     }
 

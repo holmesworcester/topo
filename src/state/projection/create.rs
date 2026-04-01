@@ -765,6 +765,19 @@ mod tests {
         });
         let psf_eid =
             create_signed_event_synchronous(conn, recorded_by, &psf, &device_invite_key).unwrap();
+        conn.execute(
+            "INSERT INTO peer_secrets
+             (recorded_by, event_id, signer_event_id, private_key, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                recorded_by,
+                "peer-secret-row",
+                event_id_to_base64(&psf_eid),
+                peer_shared_key.to_bytes().to_vec(),
+                1_i64
+            ],
+        )
+        .unwrap();
 
         (psf_eid, peer_shared_key, ub_eid)
     }

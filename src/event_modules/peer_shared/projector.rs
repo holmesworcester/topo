@@ -94,7 +94,11 @@ pub fn project_pure(
 #[cfg(test)]
 mod projector_tests {
     use super::*;
+    use crate::db::{open_in_memory, schema::create_tables};
+    use crate::event_modules::ShareScope;
+    use crate::event_modules::{encode_event, DeviceInviteEvent};
     use crate::event_modules::{ParsedEvent, PeerSharedEvent, WorkspaceEvent};
+    use crate::projection::queries::ContextLoadResult;
 
     fn peer_shared_event() -> ParsedEvent {
         ParsedEvent::PeerShared(PeerSharedEvent {
@@ -147,5 +151,60 @@ mod projector_tests {
             result.decision,
             crate::projection::decision::ProjectionDecision::Reject { .. }
         ));
+    }
+
+    #[test]
+    fn test_peer_shared_rejects_authorized_user_mismatch() {
+        let conn = open_in_memory().expect("open in-memory db");
+        create_tables(&conn).expect("create tables");
+
+        let recorded_by = "peer1";
+        let signer_event_id = [7u8; 32];
+        let signer_event_id_b64 = crate::crypto::event_id_to_base64(&signer_event_id);
+        let event = ParsedEvent::DeviceInvite(DeviceInviteEvent {
+            created_at_ms: 1,
+            public_key: [4u8; 32],
+            authority_event_id: [6u8; 32],
+            signed_by: [6u8; 32],
+            signer_type: 4,
+            signature: [0u8; 64],
+        });
+        let blob = encode_event(&event).expect("encode device invite");
+        conn.execute(
+            "INSERT INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, 'device_invite', ?2, ?3, 1, 1)",
+            rusqlite::params![&signer_event_id_b64, blob, ShareScope::Shared.as_str()],
+        )
+        .expect("insert event blob");
+        conn.execute(
+            "INSERT INTO valid_events (peer_id, event_id)
+             VALUES (?1, ?2)",
+            rusqlite::params![recorded_by, &signer_event_id_b64],
+        )
+        .expect("insert valid event");
+        let endpoint_shared_event_id_b64 = crate::crypto::event_id_to_base64(&[8u8; 32]);
+        conn.execute(
+            "INSERT INTO endpoints_shared (recorded_by, event_id, endpoint_id, public_key, created_at)
+             VALUES (?1, ?2, 'endpoint-1', ?3, 1)",
+            rusqlite::params![recorded_by, &endpoint_shared_event_id_b64, vec![9u8; 32]],
+        )
+        .expect("insert endpoint_shared row");
+        let parsed = ParsedEvent::PeerShared(PeerSharedEvent {
+            user_event_id: [5u8; 32],
+            ..match peer_shared_event() {
+                ParsedEvent::PeerShared(event) => event,
+                _ => unreachable!(),
+            }
+        });
+
+        let loaded = build_projector_context(&conn, recorded_by, "peer-shared-event", &parsed)
+            .expect("load peer_shared context");
+        match loaded {
+            ContextLoadResult::Reject { reason } => {
+                assert!(reason.contains("authorizes user"));
+                assert!(reason.contains("event claims"));
+            }
+            other => panic!("expected reject, got {other:?}"),
+        }
     }
 }

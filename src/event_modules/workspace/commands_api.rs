@@ -154,13 +154,11 @@ pub fn create_workspace_for_db(
 }
 
 /// Create a user invite for the active workspace.
-///
-/// When `bootstrap_addrs` is empty, auto-detects non-loopback addresses.
 fn create_invite_for_recorded_by(
     db: &Connection,
     recorded_by: &str,
     bootstrap_addrs: &[super::invite_link::BootstrapAddress],
-    listen_port: u16,
+    _listen_port: u16,
     public_spki_hex: Option<&str>,
     relay_url: Option<&str>,
 ) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
@@ -178,17 +176,7 @@ fn create_invite_for_recorded_by(
 
     let bootstrap_endpoint_id = resolve_invite_bootstrap_endpoint_id(db, public_spki_hex)?;
 
-    let addrs = if bootstrap_addrs.is_empty() && relay_url.is_none() {
-        let detected = super::invite_link::detect_bootstrap_addrs(listen_port);
-        if detected.is_empty() {
-            return Err(
-                "No non-loopback addresses detected. Provide --public-addr explicitly.".into(),
-            );
-        }
-        detected
-    } else {
-        bootstrap_addrs.to_vec()
-    };
+    let addrs = bootstrap_addrs.to_vec();
 
     let result = create_user_invite(
         db,
@@ -264,8 +252,6 @@ pub fn create_invite_with_spki(
 }
 
 /// Create a user invite for a specific peer (daemon provides the peer_id).
-///
-/// When `bootstrap_addrs` is empty, auto-detects non-loopback addresses.
 pub fn create_invite_for_peer(
     db_path: &str,
     peer_id: &str,
@@ -494,13 +480,11 @@ pub fn accept_device_link(
 }
 
 /// Create a device link for a specific peer (daemon provides the peer_id).
-///
-/// When `bootstrap_addrs` is empty, auto-detects non-loopback addresses.
 pub fn create_device_link_for_peer(
     db_path: &str,
     peer_id: &str,
     bootstrap_addrs: &[super::invite_link::BootstrapAddress],
-    listen_port: u16,
+    _listen_port: u16,
     public_spki_hex: Option<&str>,
     relay_url: Option<&str>,
 ) -> Result<CreateInviteResponse, Box<dyn std::error::Error + Send + Sync>> {
@@ -516,17 +500,7 @@ pub fn create_device_link_for_peer(
 
     let bootstrap_endpoint_id = resolve_invite_bootstrap_endpoint_id(&db, public_spki_hex)?;
 
-    let addrs = if bootstrap_addrs.is_empty() && relay_url.is_none() {
-        let detected = super::invite_link::detect_bootstrap_addrs(listen_port);
-        if detected.is_empty() {
-            return Err(
-                "No non-loopback addresses detected. Provide --public-addr explicitly.".into(),
-            );
-        }
-        detected
-    } else {
-        bootstrap_addrs.to_vec()
-    };
+    let addrs = bootstrap_addrs.to_vec();
 
     let result = create_device_link_invite(
         &db,
@@ -548,9 +522,12 @@ pub fn create_device_link_for_peer(
 
 #[cfg(test)]
 mod tests {
+    use super::create_invite_for_peer;
+    use super::create_workspace_for_db;
     use super::resolve_invite_bootstrap_endpoint_id;
     use crate::db::open_in_memory;
     use crate::db::schema::create_tables;
+    use crate::event_modules::workspace::invite_link::parse_invite_link;
     use crate::transport::ensure_daemon_identity;
 
     #[test]
@@ -578,5 +555,34 @@ mod tests {
         let endpoint_id = resolve_invite_bootstrap_endpoint_id(&db, Some(&explicit))
             .expect("resolve endpoint id");
         assert_eq!(endpoint_id, [0x33; 32]);
+    }
+
+    #[test]
+    fn create_invite_for_peer_leaves_bootstrap_addresses_empty_by_default() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_path = temp.path().join("invite.sqlite3");
+        let db_path = db_path.to_str().expect("db path");
+        let workspace =
+            create_workspace_for_db(db_path, "alpha", "alice", "laptop").expect("create workspace");
+
+        let invite = create_invite_for_peer(
+            db_path,
+            &workspace.peer_id,
+            &[],
+            crate::event_modules::workspace::invite_link::DEFAULT_PORT,
+            None,
+            None,
+        )
+        .expect("create invite");
+
+        let parsed = parse_invite_link(&invite.invite_link).expect("parse invite");
+        assert!(
+            parsed.bootstrap_addrs.is_empty(),
+            "default invite should not embed direct bootstrap addresses"
+        );
+        assert!(
+            parsed.relay_url.is_none(),
+            "without a live runtime relay, the invite should remain endpoint-id only"
+        );
     }
 }

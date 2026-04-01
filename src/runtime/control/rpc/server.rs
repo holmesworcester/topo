@@ -3,6 +3,7 @@
 //! Connection count is bounded by a semaphore to prevent local connection-flood
 //! pressure (feedback item 2).
 
+use serde::Serialize;
 use std::collections::BTreeSet;
 use std::io::Write;
 use std::net::SocketAddr;
@@ -10,9 +11,7 @@ use std::os::unix::net::UnixListener;
 use std::path::Path;
 use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
 use std::sync::{Arc, RwLock};
-use std::time::Duration;
-
-use serde::Serialize;
+use std::time::{Duration, Instant};
 use tokio::sync::Notify;
 use tracing::{info, warn};
 
@@ -26,6 +25,8 @@ use crate::transport::TransportEndpoint;
 /// Maximum concurrent RPC connections the server will handle.
 /// Additional connections block until a slot is freed.
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
+const INVITE_RELAY_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
+const INVITE_RELAY_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 #[derive(Debug, Clone)]
 struct TenantScope {
@@ -118,19 +119,6 @@ impl DaemonState {
 
     pub fn notify_runtime_recheck(&self) {
         self.runtime_recheck.notify_waiters();
-    }
-
-    fn runtime_listen_addr(&self) -> Option<SocketAddr> {
-        self.runtime_net
-            .read()
-            .unwrap()
-            .as_ref()
-            .and_then(|info| info.listen_addr.parse::<SocketAddr>().ok())
-    }
-
-    fn effective_listen_addr(&self) -> Option<SocketAddr> {
-        self.runtime_listen_addr()
-            .or_else(|| *self.resolved_bind_addr.read().unwrap())
     }
 
     fn runtime_endpoint(&self) -> Option<TransportEndpoint> {
@@ -450,76 +438,25 @@ fn runtime_status_value(state: &DaemonState) -> Option<serde_json::Value> {
 }
 
 fn runtime_relay_url(state: &DaemonState) -> Option<String> {
-    let endpoint = state.runtime_endpoint()?;
-    let waited = std::thread::spawn({
-        let endpoint = endpoint.clone();
-        move || {
-            let rt = tokio::runtime::Builder::new_current_thread()
-                .enable_all()
-                .build()
-                .ok()?;
-            rt.block_on(async {
-                let _ = tokio::time::timeout(Duration::from_secs(3), endpoint.inner.online()).await;
-            });
-            endpoint
-                .endpoint_addr()
-                .relay_urls()
-                .next()
-                .cloned()
-                .map(|url| url.to_string())
-        }
-    })
-    .join()
-    .ok()
-    .flatten();
-    waited.or_else(|| {
-        endpoint
-            .endpoint_addr()
-            .relay_urls()
-            .next()
-            .cloned()
-            .map(|url| url.to_string())
-    })
+    state.runtime_endpoint()?.relay_url()
 }
 
-fn autodetect_bootstrap_addrs(
-    state: &DaemonState,
-    listen_addr: SocketAddr,
-) -> Result<Vec<crate::event_modules::workspace::invite_link::BootstrapAddress>, String> {
-    if let Some(endpoint) = state.runtime_endpoint() {
-        let detected = endpoint_bootstrap_addrs(&endpoint);
-        if !detected.is_empty() {
-            return Ok(detected);
+fn runtime_relay_url_for_bootstrap(state: &DaemonState) -> Option<String> {
+    state.notify_runtime_recheck();
+    let deadline = Instant::now() + INVITE_RELAY_WAIT_TIMEOUT;
+    loop {
+        if let Some(relay_url) = runtime_relay_url(state) {
+            return Some(relay_url);
         }
+        if Instant::now() >= deadline {
+            warn!(
+                "timed out waiting {:?} for iroh relay bootstrap info",
+                INVITE_RELAY_WAIT_TIMEOUT
+            );
+            return None;
+        }
+        std::thread::sleep(INVITE_RELAY_WAIT_POLL_INTERVAL);
     }
-
-    let detected = if listen_addr.ip().is_unspecified() {
-        // Wildcard bind (0.0.0.0 / ::) — enumerate all non-loopback interfaces.
-        crate::event_modules::workspace::invite_link::detect_bootstrap_addrs(listen_addr.port())
-    } else {
-        // Specific bind — use only the address we're actually listening on.
-        let addr = match listen_addr.ip() {
-            std::net::IpAddr::V4(v4) => {
-                crate::event_modules::workspace::invite_link::BootstrapAddress::Ipv4 {
-                    ip: v4,
-                    port: listen_addr.port(),
-                }
-            }
-            std::net::IpAddr::V6(v6) => {
-                crate::event_modules::workspace::invite_link::BootstrapAddress::Ipv6 {
-                    ip: v6,
-                    port: listen_addr.port(),
-                }
-            }
-        };
-        vec![addr]
-    };
-    if detected.is_empty() {
-        return Err(
-            "No usable endpoint addresses detected. Provide public_addr explicitly.".to_string(),
-        );
-    }
-    Ok(detected)
 }
 
 fn daemon_scope_annotations(
@@ -723,33 +660,22 @@ fn dispatch(
                     // Make it active immediately so follow-up CLI commands
                     // target the workspace the operator just created.
                     *state.active_peer.write().unwrap() = Some(resp.peer_id.clone());
-                    state.notify_runtime_recheck();
 
-                    // Auto-create an invite with detected IPs
-                    let listen_addr = state.effective_listen_addr().unwrap_or_else(|| {
-                        SocketAddr::new(
-                            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                            crate::event_modules::workspace::invite_link::DEFAULT_PORT,
-                        )
-                    });
+                    // Auto-create an iroh-first invite. Direct bootstrap
+                    // addresses are only embedded when the caller asks for
+                    // them explicitly via `--public-addr`.
                     let mut resp_json = serde_json::to_value(&resp).unwrap();
                     let relay_url = runtime_relay_url(state);
-                    let bootstrap_addrs = match autodetect_bootstrap_addrs(state, listen_addr) {
-                        Ok(addrs) => Ok(addrs),
-                        Err(e) if relay_url.is_some() => Ok(Vec::new()),
-                        Err(e) => Err(e),
-                    };
-                    match bootstrap_addrs.and_then(|addrs| {
-                        workspace::commands::create_invite_for_peer(
-                            db_path,
-                            &resp.peer_id,
-                            &addrs,
-                            listen_addr.port(),
-                            None,
-                            relay_url.as_deref(),
-                        )
-                        .map_err(|e| e.to_string())
-                    }) {
+                    match workspace::commands::create_invite_for_peer(
+                        db_path,
+                        &resp.peer_id,
+                        &[],
+                        crate::event_modules::workspace::invite_link::DEFAULT_PORT,
+                        None,
+                        relay_url.as_deref(),
+                    )
+                    .map_err(|e| e.to_string())
+                    {
                         Ok(invite) => {
                             if let Some(link) = serde_json::to_value(&invite)
                                 .ok()
@@ -776,6 +702,7 @@ fn dispatch(
                             }
                         }
                     }
+                    state.notify_runtime_recheck();
                     rpc_resp
                 }
                 Err(e) => RpcResponse::error(e.to_string()),
@@ -1108,12 +1035,6 @@ fn dispatch(
             public_spki,
         } => match state.require_active_peer() {
             Ok(peer_id) => {
-                let listen_addr = state.effective_listen_addr().unwrap_or_else(|| {
-                    SocketAddr::new(
-                        std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                        crate::event_modules::workspace::invite_link::DEFAULT_PORT,
-                    )
-                });
                 let explicit_addrs: Vec<
                     crate::event_modules::workspace::invite_link::BootstrapAddress,
                 > = match public_addr {
@@ -1129,15 +1050,10 @@ fn dispatch(
                     }
                     None => vec![],
                 };
-                let relay_url = runtime_relay_url(state);
-                let bootstrap_addrs = if explicit_addrs.is_empty() {
-                    match autodetect_bootstrap_addrs(state, listen_addr) {
-                        Ok(addrs) => addrs,
-                        Err(e) if relay_url.is_some() => Vec::new(),
-                        Err(e) => return RpcResponse::error(e),
-                    }
+                let relay_url = if explicit_addrs.is_empty() {
+                    runtime_relay_url_for_bootstrap(state)
                 } else {
-                    explicit_addrs
+                    None
                 };
                 let result: Result<
                     workspace::commands::CreateInviteResponse,
@@ -1145,8 +1061,8 @@ fn dispatch(
                 > = workspace::commands::create_invite_for_peer(
                     db_path,
                     &peer_id,
-                    &bootstrap_addrs,
-                    listen_addr.port(),
+                    &explicit_addrs,
+                    crate::event_modules::workspace::invite_link::DEFAULT_PORT,
                     public_spki.as_deref(),
                     relay_url.as_deref(),
                 );
@@ -1189,12 +1105,6 @@ fn dispatch(
         } => {
             match state.require_active_peer() {
                 Ok(peer_id) => {
-                    let listen_addr = state.effective_listen_addr().unwrap_or_else(|| {
-                        SocketAddr::new(
-                            std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED),
-                            crate::event_modules::workspace::invite_link::DEFAULT_PORT,
-                        )
-                    });
                     let explicit_addrs: Vec<crate::event_modules::workspace::invite_link::BootstrapAddress> =
                     match public_addr {
                         Some(ref addr) => {
@@ -1205,21 +1115,16 @@ fn dispatch(
                         }
                         None => vec![],
                     };
-                    let relay_url = runtime_relay_url(state);
-                    let bootstrap_addrs = if explicit_addrs.is_empty() {
-                        match autodetect_bootstrap_addrs(state, listen_addr) {
-                            Ok(addrs) => addrs,
-                            Err(e) if relay_url.is_some() => Vec::new(),
-                            Err(e) => return RpcResponse::error(e),
-                        }
+                    let relay_url = if explicit_addrs.is_empty() {
+                        runtime_relay_url_for_bootstrap(state)
                     } else {
-                        explicit_addrs
+                        None
                     };
                     match workspace::commands::create_device_link_for_peer(
                         db_path,
                         &peer_id,
-                        &bootstrap_addrs,
-                        listen_addr.port(),
+                        &explicit_addrs,
+                        crate::event_modules::workspace::invite_link::DEFAULT_PORT,
                         public_spki.as_deref(),
                         relay_url.as_deref(),
                     ) {

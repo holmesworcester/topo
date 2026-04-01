@@ -1184,6 +1184,19 @@ pub fn wait_for_live_sync_session(db: &str, timeout: Duration) {
     }
 }
 
+/// Trigger an on-demand sync across all live sessions, retrying transient
+/// daemon-startup and initial-sync states through the shared RPC helper.
+pub fn request_sync_all(db: &str, timeout: Duration) {
+    let out = topo_rpc_retry(db, &["sync", "request", "all"], timeout);
+    assert!(
+        out.status.success(),
+        "sync request all failed for db={}: stdout={} stderr={}",
+        db,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 /// Send a message via daemon RPC, retrying transient errors.
 pub fn send_message(db: &str, content: &str) -> String {
     let send_timeout = Duration::from_secs(60);
@@ -1263,8 +1276,13 @@ pub fn rotate_key(db: &str) -> (String, u64) {
     (rotation_event_id, proactive_shares)
 }
 
-/// Create an invite via daemon RPC. Returns the `topo://` invite link.
-pub fn create_invite(db: &str, bootstrap_addr: &str) -> String {
+/// Create an invite via daemon RPC using Iroh relay/bootstrap lookup only.
+pub fn create_invite(db: &str, _bootstrap_addr: &str) -> String {
+    topo_create_invite_retry(db, _bootstrap_addr)
+}
+
+/// Create an invite via daemon RPC with an explicit direct bootstrap address.
+pub fn create_invite_with_public_addr(db: &str, bootstrap_addr: &str) -> String {
     create_invite_with_spki(db, bootstrap_addr, None)
 }
 
@@ -1297,8 +1315,13 @@ pub fn create_invite_with_spki(
         .to_string()
 }
 
-/// Create a device-link invite via daemon RPC. Returns the `topo://link/` link.
-pub fn create_device_link(db: &str, bootstrap_addr: &str) -> String {
+/// Create a device-link via daemon RPC using Iroh relay/bootstrap lookup only.
+pub fn create_device_link(db: &str, _bootstrap_addr: &str) -> String {
+    topo_create_device_link_retry(db, _bootstrap_addr)
+}
+
+/// Create a device-link via daemon RPC with an explicit direct bootstrap address.
+pub fn create_device_link_with_public_addr(db: &str, bootstrap_addr: &str) -> String {
     create_device_link_with_spki(db, bootstrap_addr, None)
 }
 
@@ -2467,25 +2490,54 @@ pub fn topo_send_retry(db: &str, content: &str) -> String {
         .to_string()
 }
 
-/// Create an invite via RPC with retry. Returns the invite link.
-pub fn topo_create_invite_retry(db: &str, bootstrap_addr: &str) -> String {
-    let out = topo_rpc_retry(
-        db,
-        &["invite", "--public-addr", bootstrap_addr],
-        Duration::from_secs(3),
-    );
-    assert!(
-        out.status.success(),
-        "topo invite failed: stdout={} stderr={}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
-    let stdout = String::from_utf8_lossy(&out.stdout);
-    stdout
-        .lines()
-        .find(|line| line.starts_with("topo://"))
-        .expect("invite output missing topo:// link")
-        .to_string()
+/// Create an invite via RPC with retry using Iroh endpoint/relay bootstrap only.
+pub fn topo_create_invite_retry(db: &str, _bootstrap_addr: &str) -> String {
+    assert_value_eventually(
+        Duration::from_secs(30),
+        Duration::from_millis(500),
+        "invite link with Iroh relay bootstrap",
+        || {
+            let out = topo_rpc_retry(db, &["invite"], Duration::from_secs(3));
+            assert!(
+                out.status.success(),
+                "topo invite failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout
+                .lines()
+                .find(|line| line.starts_with("topo://"))
+                .expect("invite output missing topo:// link")
+                .to_string()
+        },
+        |invite_link| invite_link.contains("/RELAY_URL."),
+    )
+}
+
+/// Create a device-link via RPC with retry using Iroh endpoint/relay bootstrap only.
+pub fn topo_create_device_link_retry(db: &str, _bootstrap_addr: &str) -> String {
+    assert_value_eventually(
+        Duration::from_secs(30),
+        Duration::from_millis(500),
+        "device link with Iroh relay bootstrap",
+        || {
+            let out = topo_rpc_retry(db, &["link"], Duration::from_secs(3));
+            assert!(
+                out.status.success(),
+                "topo link failed: stdout={} stderr={}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            stdout
+                .lines()
+                .find(|line| line.starts_with("topo://link/"))
+                .expect("link output missing topo://link/ link")
+                .to_string()
+        },
+        |invite_link| invite_link.contains("/RELAY_URL."),
+    )
 }
 
 /// Accept an invite via a temporary daemon and persist the resulting tenant.

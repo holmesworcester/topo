@@ -20,10 +20,10 @@ fn active_peer_id(daemon: &VirtualDaemon) -> String {
         .to_string()
 }
 
-fn create_invite(daemon: &VirtualDaemon, public_addr: &str) -> String {
+fn create_invite(daemon: &VirtualDaemon) -> String {
     daemon
         .call_ok_value(RpcMethod::CreateInvite {
-            public_addr: Some(public_addr.to_string()),
+            public_addr: None,
             public_spki: None,
         })
         .expect("create invite")["invite_link"]
@@ -32,14 +32,23 @@ fn create_invite(daemon: &VirtualDaemon, public_addr: &str) -> String {
         .to_string()
 }
 
+fn assert_has_event(daemon: &VirtualDaemon, event_id: &str) {
+    let response = daemon.call(RpcMethod::AssertNow {
+        predicate: format!("has_event:{event_id} >= 1"),
+    });
+    assert!(
+        response.ok,
+        "expected daemon {} to have event {}: {:?}",
+        daemon.db_path(),
+        event_id,
+        response.error
+    );
+}
+
 fn snapshot_has_message_content(daemon: &VirtualDaemon, content: &str) -> bool {
-    let recorded_by = active_peer_id(daemon);
-    let snapshot =
-        topo::sim::snapshot_replayed_peer(daemon.db_path(), &recorded_by).expect("peer snapshot");
-    let messages = snapshot
-        .daemon()
+    let messages = daemon
         .call_ok_value(RpcMethod::Messages { limit: 100 })
-        .expect("messages via snapshot rpc");
+        .expect("messages via daemon rpc");
     messages["messages"]
         .as_array()
         .expect("messages array")
@@ -138,6 +147,30 @@ fn distinct_key_shared_events_for_key(db_paths: &[String], key_event_id_b64: &st
     seen.len()
 }
 
+fn authoring_ready(daemon: &VirtualDaemon) -> bool {
+    let conn = open_connection(daemon.db_path()).expect("open db for authoring check");
+    let recorded_by = active_peer_id(daemon);
+    topo::event_modules::workspace::authoring::load_local_authoring_context(&conn, &recorded_by)
+        .is_ok()
+}
+
+fn finish_bootstrap_until_authoring_ready(db_paths: &[String], ready_peers: &[&VirtualDaemon]) {
+    for _ in 0..4 {
+        if ready_peers.iter().all(|daemon| authoring_ready(daemon)) {
+            return;
+        }
+        PlannerSimulation::new(db_paths.to_vec())
+            .tick()
+            .expect("bootstrap follow-up round");
+    }
+    let pending = ready_peers
+        .iter()
+        .filter(|daemon| !authoring_ready(daemon))
+        .map(|daemon| daemon.db_path().to_string())
+        .collect::<Vec<_>>();
+    panic!("authoring never materialized for {:?}", pending);
+}
+
 fn distinct_key_shared_events_for_recipient(
     db_paths: &[String],
     key_event_id_b64: &str,
@@ -200,6 +233,46 @@ fn newest_key_request_event_id(
     event_id_from_base64(&event_id_b64).expect("key_request event id")
 }
 
+fn source_event_ids_in_dependency_order(
+    source_db_path: &str,
+    event_ids: &[EventId],
+) -> Vec<EventId> {
+    fn visit(
+        conn: &rusqlite::Connection,
+        event_id: EventId,
+        visited: &mut BTreeSet<EventId>,
+        ordered: &mut Vec<EventId>,
+    ) {
+        if !visited.insert(event_id) {
+            return;
+        }
+        let event_id_b64 = event_id_to_base64(&event_id);
+        let blob = conn
+            .query_row(
+                "SELECT blob FROM events WHERE event_id = ?1",
+                rusqlite::params![&event_id_b64],
+                |row| row.get::<_, Vec<u8>>(0),
+            )
+            .ok();
+        let Some(blob) = blob else {
+            return;
+        };
+        let parsed = topo::event_modules::parse_event(&blob).expect("parse source event");
+        for (_, dep_id) in parsed.dep_field_values() {
+            visit(conn, dep_id, visited, ordered);
+        }
+        ordered.push(event_id);
+    }
+
+    let conn = open_connection(source_db_path).expect("open source db for dependency closure");
+    let mut visited = BTreeSet::new();
+    let mut ordered = Vec::new();
+    for event_id in event_ids {
+        visit(&conn, *event_id, &mut visited, &mut ordered);
+    }
+    ordered
+}
+
 fn ingest_selected_events(
     dest_db_path: &str,
     dest_recorded_by: &str,
@@ -208,12 +281,12 @@ fn ingest_selected_events(
     source_db_path: &str,
 ) {
     let now_ms = current_timestamp_ms();
-    let batch = event_ids
-        .iter()
+    let batch = source_event_ids_in_dependency_order(source_db_path, event_ids)
+        .into_iter()
         .map(|event_id| {
             (
-                *event_id,
-                event_blob_by_id(source_db_path, event_id),
+                event_id,
+                event_blob_by_id(source_db_path, &event_id),
                 dest_recorded_by.to_string(),
                 source_tag.to_string(),
                 now_ms,
@@ -250,13 +323,13 @@ fn run_key_repair_benchmark(policy: KeyResponsePolicy) -> RepairBenchmark {
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
 
-    for (daemon, username, addr) in [
-        (&bob, "bob", "127.0.0.1:4242"),
-        (&carol, "carol", "127.0.0.1:4343"),
-        (&dave, "dave", "127.0.0.1:4444"),
-        (&erin, "erin", "127.0.0.1:4545"),
+    for (daemon, username) in [
+        (&bob, "bob"),
+        (&carol, "carol"),
+        (&dave, "dave"),
+        (&erin, "erin"),
     ] {
-        let invite = create_invite(&alice, addr);
+        let invite = create_invite(&alice);
         let accepted = daemon.call(RpcMethod::AcceptInvite {
             invite,
             username: username.into(),
@@ -288,6 +361,7 @@ fn run_key_repair_benchmark(policy: KeyResponsePolicy) -> RepairBenchmark {
         .tick()
         .expect("bootstrap round");
     assert_eq!(bootstrap.unique_pairs, 4);
+    finish_bootstrap_until_authoring_ready(&db_paths, &[&bob, &carol, &dave, &erin]);
 
     let alice_peer = active_peer_id(&alice);
     let bob_peer = active_peer_id(&bob);
@@ -324,7 +398,7 @@ fn run_key_repair_benchmark(policy: KeyResponsePolicy) -> RepairBenchmark {
     .tick()
     .expect("message propagation round to requesters");
     assert_eq!(message_round_to_requesters.unique_pairs, 4);
-    assert!(snapshot_has_message_content(&bob, content));
+    assert_has_event(&bob, &encrypted_event_id_b64);
     assert!(!snapshot_has_message_content(&carol, content));
     assert!(!snapshot_has_message_content(&dave, content));
     assert!(!snapshot_has_message_content(&erin, content));
@@ -545,12 +619,8 @@ fn removed_peer_does_not_receive_key_shared_response_for_frontier() {
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
 
-    for (daemon, username, addr) in [
-        (&bob, "bob", "127.0.0.1:4242"),
-        (&carol, "carol", "127.0.0.1:4343"),
-        (&dave, "dave", "127.0.0.1:4444"),
-    ] {
-        let invite = create_invite(&alice, addr);
+    for (daemon, username) in [(&bob, "bob"), (&carol, "carol"), (&dave, "dave")] {
+        let invite = create_invite(&alice);
         let accepted = daemon.call(RpcMethod::AcceptInvite {
             invite,
             username: username.into(),
@@ -580,10 +650,7 @@ fn removed_peer_does_not_receive_key_shared_response_for_frontier() {
         .tick()
         .expect("bootstrap round");
     assert_eq!(bootstrap.unique_pairs, 3);
-    let bootstrap_follow_up = PlannerSimulation::new(db_paths.clone())
-        .tick()
-        .expect("bootstrap follow-up round");
-    assert_eq!(bootstrap_follow_up.unique_pairs, 3);
+    finish_bootstrap_until_authoring_ready(&db_paths, &[&bob, &carol, &dave]);
 
     let alice_peer = active_peer_id(&alice);
     let bob_peer = active_peer_id(&bob);
@@ -607,8 +674,10 @@ fn removed_peer_does_not_receive_key_shared_response_for_frontier() {
             .expect("create key rotation");
 
     let content = "post-removal frontier repair";
-    create_encrypted_message_with_key(&db_paths[0], &alice_peer, &alice_key, content)
-        .expect("create encrypted message with rotated key");
+    let encrypted_event_id =
+        create_encrypted_message_with_key(&db_paths[0], &alice_peer, &alice_key, content)
+            .expect("create encrypted message with rotated key");
+    let encrypted_event_id_b64 = event_id_to_base64(&encrypted_event_id);
 
     let first_round = PlannerSimulation::with_mode_and_topology(
         fake_star_db_paths.clone(),
@@ -628,7 +697,7 @@ fn removed_peer_does_not_receive_key_shared_response_for_frontier() {
     .expect("second propagation round");
     assert_eq!(second_round.unique_pairs, 3);
 
-    assert!(snapshot_has_message_content(&bob, content));
+    assert_has_event(&bob, &encrypted_event_id_b64);
     assert!(!snapshot_has_message_content(&carol, content));
     assert!(!snapshot_has_message_content(&dave, content));
 
@@ -749,12 +818,8 @@ fn holder_with_request_before_removal_emits_no_response_until_frontier_arrives()
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
 
-    for (daemon, username, addr) in [
-        (&bob, "bob", "127.0.0.1:4242"),
-        (&carol, "carol", "127.0.0.1:4343"),
-        (&dave, "dave", "127.0.0.1:4444"),
-    ] {
-        let invite = create_invite(&alice, addr);
+    for (daemon, username) in [(&bob, "bob"), (&carol, "carol"), (&dave, "dave")] {
+        let invite = create_invite(&alice);
         let accepted = daemon.call(RpcMethod::AcceptInvite {
             invite,
             username: username.into(),
@@ -777,10 +842,7 @@ fn holder_with_request_before_removal_emits_no_response_until_frontier_arrives()
         .tick()
         .expect("bootstrap round");
     assert_eq!(bootstrap.unique_pairs, 3);
-    let bootstrap_follow_up = PlannerSimulation::new(db_paths.clone())
-        .tick()
-        .expect("bootstrap follow-up round");
-    assert_eq!(bootstrap_follow_up.unique_pairs, 3);
+    finish_bootstrap_until_authoring_ready(&db_paths, &[&bob, &carol, &dave]);
 
     let alice_peer = active_peer_id(&alice);
     let bob_peer = active_peer_id(&bob);
@@ -799,13 +861,14 @@ fn holder_with_request_before_removal_emits_no_response_until_frontier_arrives()
     let rotation_event_id =
         create_key_rotation(&db_paths[0], &alice_peer, &alice_key, &[removal_event_id])
             .expect("create key rotation");
-    create_encrypted_message_with_key(
+    let encrypted_event_id = create_encrypted_message_with_key(
         &db_paths[0],
         &alice_peer,
         &alice_key,
         "request-before-removal",
     )
     .expect("create encrypted message");
+    let encrypted_event_id_b64 = event_id_to_base64(&encrypted_event_id);
 
     let alice_to_carol = PlannerSimulation::with_explicit_fake_pairs(
         db_paths.clone(),
@@ -814,6 +877,7 @@ fn holder_with_request_before_removal_emits_no_response_until_frontier_arrives()
     .tick()
     .expect("alice->carol propagation");
     assert_eq!(alice_to_carol.unique_pairs, 1);
+    assert_has_event(&carol, &encrypted_event_id_b64);
     assert!(
         !snapshot_has_message_content(&carol, "request-before-removal"),
         "carol should have the encrypted message but still be blocked before repair"
@@ -850,6 +914,13 @@ fn holder_with_request_before_removal_emits_no_response_until_frontier_arrives()
         pre_frontier_response_stats.emitted_responses, 0,
         "holder must not respond when it has the request but not the removal frontier"
     );
+    let pre_frontier_rotation_count: i64 = bob_conn
+        .query_row(
+            "SELECT COUNT(*) FROM key_rotations WHERE recorded_by = ?1 AND key_event_id = ?2",
+            rusqlite::params![&bob_peer, &event_id_to_base64(&alice_key)],
+            |row| row.get(0),
+        )
+        .expect("bob key_rotation count before frontier");
 
     ingest_selected_events(
         &db_paths[1],
@@ -877,8 +948,9 @@ fn holder_with_request_before_removal_emits_no_response_until_frontier_arrives()
         "bob should project the inbound removal before responding"
     );
     assert_eq!(
-        bob_rotation_count, 1,
-        "bob should project the inbound key rotation before responding"
+        bob_rotation_count,
+        pre_frontier_rotation_count + 1,
+        "bob should project exactly one additional frontier rotation before responding"
     );
 
     let post_frontier_response_stats =

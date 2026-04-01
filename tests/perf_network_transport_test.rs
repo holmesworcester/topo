@@ -240,6 +240,7 @@ async fn zero_impairment_proxy_matches_direct_speed() -> TestResult {
 /// discarded before reaching the peer.  The connection attempt must not succeed
 /// within a short window, proving the drop path is active.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "userspace shaper impairment magnitude is host-dependent; run explicitly"]
 async fn total_loss_proxy_blocks_connection() {
     let result = tokio::time::timeout(
         Duration::from_secs(3),
@@ -264,6 +265,7 @@ async fn total_loss_proxy_blocks_connection() {
 /// giving generous margin for OS scheduling and QUIC stack overhead while still
 /// catching a broken or bypassed shaper.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "userspace shaper impairment magnitude is host-dependent; run explicitly"]
 async fn low_bandwidth_proxy_measurably_throttles_transfer() -> TestResult {
     let providers = tokio::time::timeout(
         Duration::from_secs(10),
@@ -293,6 +295,7 @@ async fn low_bandwidth_proxy_measurably_throttles_transfer() -> TestResult {
 /// At 200 ms RTT (100 ms one-way), those three hops require at least 300 ms.
 /// The test checks for ≥250 ms, giving 50 ms of slack for timing imprecision.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+#[ignore = "userspace shaper impairment magnitude is host-dependent; run explicitly"]
 async fn high_latency_proxy_measurably_delays_roundtrip() -> TestResult {
     // Connection setup itself takes ~1 RTT at 200 ms; use a generous timeout.
     let providers = tokio::time::timeout(

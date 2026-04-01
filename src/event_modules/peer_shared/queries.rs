@@ -307,7 +307,17 @@ pub fn list_peers(db: &Connection, recorded_by: &str) -> Result<Vec<PeerItem>, r
                 SELECT 1 FROM local_transport_creds c
                 WHERE c.peer_id = lower(hex(ps.transport_fingerprint))
             ) AS is_local,
-            ps.endpoint_id AS endpoint_id,
+            COALESCE(
+                ps.endpoint_id,
+                (
+                    SELECT lower(hex(b.spki_fingerprint))
+                    FROM peer_transport_bindings b
+                    WHERE b.recorded_by = ps.recorded_by
+                      AND b.peer_id = lower(hex(ps.transport_fingerprint))
+                    ORDER BY b.bound_at DESC
+                    LIMIT 1
+                )
+            ) AS endpoint_id,
             (
                 SELECT e.origin_ip || ':' || e.origin_port
                 FROM peer_endpoint_observations e

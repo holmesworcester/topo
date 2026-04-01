@@ -29,6 +29,8 @@ pub mod transport_trust;
 pub mod sync_protocol;
 pub mod connection_security;
 pub mod data_ingestion;
+pub mod sync_security;
+pub mod connection_lifecycle;
 
 // Bug-hunting proofs
 pub mod bug_hunt;

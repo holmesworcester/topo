@@ -119,7 +119,7 @@ mod layout_tests {
     #[test]
     fn offsets_consistent() {
         assert_eq!(
-            field_offset(PEER_SHARED_FIELDS, 6) + 64,
+            field_offset(PEER_SHARED_FIELDS, 7) + 64,
             PEER_SHARED_WIRE_SIZE
         );
     }

@@ -666,6 +666,7 @@ pub enum InviteType {
 pub struct InviteBootstrapContext<'a> {
     pub bootstrap_addrs: &'a [String],
     pub bootstrap_spki: &'a [u8; 32],
+    pub relay_url: Option<&'a str>,
 }
 
 /// Derive the expected bootstrap transport SPKI fingerprint for an invitee from
@@ -775,6 +776,16 @@ fn create_invite_event_with_optional_bootstrap_context(
                         &eid_b64,
                         &ws_b64,
                         addr,
+                        ctx.bootstrap_spki,
+                    )?;
+                }
+                if ctx.bootstrap_addrs.is_empty() {
+                    crate::db::transport_trust::append_bootstrap_context(
+                        conn,
+                        recorded_by,
+                        &eid_b64,
+                        &ws_b64,
+                        ctx.relay_url.unwrap_or(""),
                         ctx.bootstrap_spki,
                     )?;
                 }

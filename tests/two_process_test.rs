@@ -37,11 +37,7 @@ fn test_two_process_invite_and_sync() {
     );
 
     // Step 2: Alice creates an invite pointing to her sync address (via daemon RPC).
-    let invite_link = create_invite_with_spki(
-        &alice_db,
-        &daemon_listen_addr(&alice_db),
-        Some(&daemon_identity_fingerprint(&alice_db)),
-    );
+    let invite_link = topo_create_invite_retry(&alice_db, &daemon_listen_addr(&alice_db));
     assert!(
         invite_link.starts_with("topo://invite/"),
         "Expected topo://invite/ link, got: {}",

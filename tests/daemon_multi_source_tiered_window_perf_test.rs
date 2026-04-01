@@ -16,11 +16,11 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cli_harness::{
-    accept_invite_with_identity_on_running_daemon, active_tenant_peer_id, create_invite_with_spki,
-    create_workspace_with_details, daemon_identity_fingerprint, daemon_listen_addr,
-    daemon_transport_fingerprint, ensure_active_peer, generate_messages,
-    hold_network_test_lock_for_binary, send_message, start_daemon_with_options, stop_daemon,
-    topo_cmd, wait_for_active_tenant_ready, wait_for_daemon_stopped, DaemonOptions, HarnessDaemon,
+    accept_invite_with_identity_on_running_daemon, active_tenant_peer_id,
+    create_workspace_with_details, daemon_listen_addr, daemon_transport_fingerprint,
+    ensure_active_peer, generate_messages, hold_network_test_lock_for_binary, send_message,
+    start_daemon_with_options, stop_daemon, topo_cmd, topo_create_invite_retry,
+    wait_for_active_tenant_ready, wait_for_daemon_stopped, DaemonOptions, HarnessDaemon,
 };
 use daemon_perf_harness::write_summary;
 
@@ -483,11 +483,7 @@ fn create_online_community(
     ensure_active_peer(&hub_db, Duration::from_secs(10));
     wait_for_active_tenant_ready(&hub_db, Duration::from_secs(120));
 
-    let invite_link = create_invite_with_spki(
-        &hub_db,
-        &daemon_listen_addr(&hub_db),
-        Some(&daemon_identity_fingerprint(&hub_db)),
-    );
+    let invite_link = topo_create_invite_retry(&hub_db, &daemon_listen_addr(&hub_db));
 
     let mut nodes = Vec::with_capacity(peer_labels.len());
     nodes.push(Node {

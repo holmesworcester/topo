@@ -60,6 +60,21 @@ fn assert_event_visible_on_all(db_paths: &[&str], event_id: &str, timeout_ms: u6
     }
 }
 
+fn request_sync_all(db_path: &str) {
+    let out = topo_rpc_retry(
+        db_path,
+        &["sync", "request", "all"],
+        Duration::from_secs(30),
+    );
+    assert!(
+        out.status.success(),
+        "sync request all failed for db={}: stdout={} stderr={}",
+        db_path,
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
 #[test]
 fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
     hold_network_test_lock_for_binary();
@@ -103,7 +118,7 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
         },
     );
 
-    let reused_invite = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
+    let reused_invite = topo_create_invite_retry(&alice_db, &daemon_listen_addr(&alice_db));
     let bootstrap_peer_id = {
         let parsed = topo::event_modules::workspace::invite_link::parse_invite_link(&reused_invite)
             .expect("parse invite link");
@@ -166,8 +181,17 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
         topo::db::transport_creds::CRED_SOURCE_PEER_SHARED,
         timeout_ms,
     );
+    wait_for_tenant_transport_converged(
+        &carol_db,
+        &carol_join.peer_id,
+        Duration::from_millis(timeout_ms),
+    );
+    wait_for_live_sync_session(&carol_db, Duration::from_secs(30));
 
     let carol_eid = send_message(&carol_db, "reuse-live/carol-final");
+    for db_path in [&carol_db, &bob_db, &alice_db] {
+        request_sync_all(db_path);
+    }
     assert_event_visible_on_all(&[&alice_db, &bob_db, &carol_db], &carol_eid, timeout_ms);
 
     stop_daemon(&alice_db, &mut alice_daemon);

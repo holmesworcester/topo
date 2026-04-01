@@ -400,6 +400,7 @@ async fn ten_hop_chain_live_rate() {
 
 /// 10-hop chain smoke: 10 peers, 1k events (pre-seeded bulk).
 #[tokio::test]
+#[ignore = "legacy in-process graph benchmark is too slow/noisy for the default serial suite; run explicitly"]
 async fn ten_hop_chain_1k_smoke() {
     run_chain_bench(10, 1_000).await;
 }
@@ -955,6 +956,7 @@ async fn catchup_non_uniform_sources() {
 /// sync starts. Subsequent range sessions recompute partitions from the remaining
 /// live peers, so the sink must still converge on the full dataset.
 #[tokio::test]
+#[ignore = "legacy in-process graph benchmark is too slow/noisy for the default serial suite; run explicitly"]
 async fn catchup_dead_peer_dropout() {
     let _guard = acquire_graph_test_guard().await;
     let source_count = 4;

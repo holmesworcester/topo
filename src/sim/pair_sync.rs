@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 
 use crate::contracts::event_pipeline_contract::IngestItem;
@@ -212,7 +213,7 @@ fn collect_shared_events_one_way(
     let dest = open_connection(dest_db_path)?;
     crate::db::schema::create_tables(&dest)?;
 
-    let known_dest_events = recorded_event_ids(&dest, dest_recorded_by)?;
+    let known_dest_events = stored_event_ids(&dest)?;
     let winning_key_shared_events = winning_key_shared_event_ids(&source, source_recorded_by)?;
     let observed_key_shared_targets = observed_key_shared_targets(&source, source_recorded_by)?;
     let source_tag = format!(
@@ -228,6 +229,7 @@ fn collect_shared_events_one_way(
     let mut transferred_key_shared_events = 0usize;
     let mut suppressed_key_shared_events = 0usize;
     let mut batch = Vec::<IngestItem>::new();
+    let mut pending_event_ids = BTreeSet::new();
 
     let mut stmt = source.prepare(
         "SELECT e.event_id, e.event_type, e.blob
@@ -247,11 +249,36 @@ fn collect_shared_events_one_way(
 
     for row in rows {
         let (event_id, event_type, blob) = row?;
-        if known_dest_events.contains(&event_id) {
+        if known_dest_events.contains(&event_id) || pending_event_ids.contains(&event_id) {
             continue;
         }
+        let parsed = match events::parse_event(&blob) {
+            Ok(parsed) => parsed,
+            Err(_) => continue,
+        };
+        if let ParsedEvent::PeerShared(peer_shared) = &parsed {
+            let endpoint_shared_event_id =
+                crate::crypto::event_id_to_base64(&peer_shared.endpoint_shared_event_id);
+            if !known_dest_events.contains(&endpoint_shared_event_id)
+                && !pending_event_ids.contains(&endpoint_shared_event_id)
+            {
+                if let Some(dep_blob) = event_blob_by_id(&source, &endpoint_shared_event_id)? {
+                    transferred_bytes = transferred_bytes.saturating_add(dep_blob.len() as u64);
+                    transferred_event_ids.push(endpoint_shared_event_id.clone());
+                    batch.push((
+                        hash_event(&dep_blob),
+                        dep_blob,
+                        dest_recorded_by.to_string(),
+                        source_tag.clone(),
+                        now_ms,
+                        now_ms,
+                    ));
+                    pending_event_ids.insert(endpoint_shared_event_id);
+                }
+            }
+        }
         if event_type == "key_request" {
-            let Ok(ParsedEvent::KeyRequest(event)) = events::parse_event(&blob) else {
+            let ParsedEvent::KeyRequest(event) = &parsed else {
                 continue;
             };
             if observed_key_shared_targets.contains(&key_request_target(&event)) {
@@ -267,7 +294,7 @@ fn collect_shared_events_one_way(
             transferred_key_shared_events = transferred_key_shared_events.saturating_add(1);
         }
         transferred_bytes = transferred_bytes.saturating_add(blob.len() as u64);
-        transferred_event_ids.push(event_id);
+        transferred_event_ids.push(event_id.clone());
         batch.push((
             hash_event(&blob),
             blob,
@@ -276,6 +303,7 @@ fn collect_shared_events_one_way(
             now_ms,
             now_ms,
         ));
+        pending_event_ids.insert(event_id);
     }
 
     Ok(PreparedPairSyncDirection {
@@ -367,23 +395,42 @@ fn observed_key_shared_targets(
 fn apply_prepared_direction(direction: &PreparedPairSyncDirection) -> PairSyncResult<()> {
     if !direction.batch.is_empty() {
         let _ = ingest_now(&direction.dest_db_path, direction.batch.clone())?;
+        const MAX_DRAIN_PASSES: usize = 64;
+        for _ in 0..MAX_DRAIN_PASSES {
+            let drained = crate::event_pipeline::drain_project_queue(
+                &direction.dest_db_path,
+                &direction.stats.dest_recorded_by,
+                1000,
+            );
+            if drained == 0 {
+                return Ok(());
+            }
+        }
+        return Err(format!(
+            "projection queue did not drain for simulated tenant `{}`",
+            direction.stats.dest_recorded_by
+        )
+        .into());
     }
     Ok(())
 }
 
-fn recorded_event_ids(
-    conn: &rusqlite::Connection,
-    recorded_by: &str,
-) -> Result<BTreeSet<String>, rusqlite::Error> {
-    let mut stmt = conn.prepare(
-        "SELECT event_id
-         FROM recorded_events
-         WHERE peer_id = ?1",
-    )?;
-    let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
-        row.get::<_, String>(0)
-    })?;
+fn stored_event_ids(conn: &rusqlite::Connection) -> Result<BTreeSet<String>, rusqlite::Error> {
+    let mut stmt = conn.prepare("SELECT event_id FROM events")?;
+    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
     rows.collect::<Result<BTreeSet<_>, _>>()
+}
+
+fn event_blob_by_id(
+    conn: &rusqlite::Connection,
+    event_id: &str,
+) -> Result<Option<Vec<u8>>, rusqlite::Error> {
+    conn.query_row(
+        "SELECT blob FROM events WHERE event_id = ?1 LIMIT 1",
+        rusqlite::params![event_id],
+        |row| row.get::<_, Vec<u8>>(0),
+    )
+    .optional()
 }
 
 fn source_transport_peer_id(

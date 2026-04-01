@@ -31,7 +31,7 @@ fn bootstrap_alice_and_invite(tmpdir: &tempfile::TempDir) -> (String, String, St
     create_workspace(&alice_db);
 
     // Start Alice's daemon so we can create invites via RPC
-    let _alice_daemon = start_discovery_daemon(&alice_db);
+    let _alice_daemon = start_daemon(&alice_db);
 
     // Create invite via daemon RPC
     let invite_link = topo_create_invite_retry(&alice_db, &daemon_listen_addr(&alice_db));
@@ -56,7 +56,7 @@ fn test_invite_only_daemons_should_autodial_without_manual_connect() {
     let tmpdir = tempfile::tempdir().unwrap();
     let (alice_db, bob_db, invite_link) = bootstrap_alice_and_invite(&tmpdir);
 
-    let _alice = start_discovery_daemon(&alice_db);
+    let _alice = start_daemon(&alice_db);
     accept_invite_with_identity_persisted_only(
         &bob_db,
         &invite_link,
@@ -64,7 +64,7 @@ fn test_invite_only_daemons_should_autodial_without_manual_connect() {
         "device",
         std::time::Duration::from_secs(30),
     );
-    let _bob = start_discovery_daemon(&bob_db);
+    let _bob = start_daemon(&bob_db);
     wait_for_autodial_live_sync(&alice_db, &bob_db);
 
     // Desired behavior: after invite acceptance, daemons should autodial based on
@@ -92,7 +92,7 @@ fn test_daemon_cli_invite_lifecycle_works_without_restart() {
 
     // Create workspace for Alice and start her daemon.
     create_workspace(&alice_db);
-    let _alice = start_discovery_daemon(&alice_db);
+    let _alice = start_daemon(&alice_db);
 
     // Create invite while Alice's daemon is running (via RPC).
     let invite_link = topo_create_invite_retry(&alice_db, &daemon_listen_addr(&alice_db));

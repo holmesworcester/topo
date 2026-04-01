@@ -853,7 +853,7 @@ fn test_cli_bidirectional_sync() {
     let _alice = start_daemon_with_options(&alice_db, &relay_opts);
 
     let bootstrap_eid = send_message(&alice_db, "bootstrap-before-invite");
-    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
+    let invite_link = create_invite_with_public_addr(&alice_db, &daemon_listen_addr(&alice_db));
 
     accept_invite(&bob_db, &invite_link);
     let _bob = start_daemon_with_options(&bob_db, &relay_opts);
@@ -904,7 +904,7 @@ fn test_cli_bidirectional_sync_with_empty_bootstrap_addrs_uses_relay_bootstrap()
     let _alice = start_daemon(&alice_db);
 
     let bootstrap_eid = send_message(&alice_db, "bootstrap-before-empty-address-invite");
-    let original_invite = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
+    let original_invite = topo_create_invite_retry(&alice_db, &daemon_listen_addr(&alice_db));
     let invite_link = rewrite_bootstrap_addrs(&original_invite, &[])
         .expect("rewrite invite with no bootstrap addrs");
     let parsed = parse_invite_link(&invite_link).expect("parse empty-address invite");
@@ -1000,7 +1000,7 @@ fn test_cli_reconnects_after_bootstrap_supersession_using_observed_endpoint() {
         },
     );
     let alice_addr = daemon_listen_addr(&alice_db);
-    let invite_link = create_invite(&alice_db, &alice_addr);
+    let invite_link = create_invite_with_public_addr(&alice_db, &alice_addr);
 
     accept_invite(&bob_db, &invite_link);
     let mut bob_daemon = start_daemon_with_options(
@@ -1064,7 +1064,7 @@ fn test_cli_lowmem_receiver_restart_catches_offline_delta_and_resumes_sync() {
         },
     );
     let alice_addr = daemon_listen_addr(&alice_db);
-    let invite_link = create_invite(&alice_db, &alice_addr);
+    let invite_link = create_invite_with_public_addr(&alice_db, &alice_addr);
 
     accept_invite(&bob_db, &invite_link);
     let mut bob_daemon = start_daemon_with_options(
@@ -1294,7 +1294,7 @@ fn test_cli_file_upload_sync_and_save() {
     create_workspace(&alice_db);
     let _alice = start_daemon(&alice_db);
 
-    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
+    let invite_link = create_invite_with_public_addr(&alice_db, &daemon_listen_addr(&alice_db));
 
     accept_invite(&bob_db, &invite_link);
     let _bob = start_daemon(&bob_db);
@@ -2337,6 +2337,11 @@ fn test_cli_live_daemon_accept_second_workspace_can_switch_back_and_sync_origina
     create_workspace_with_details(&owner_db, "home-space", "home", "home-root");
     let mut owner_daemon = start_daemon(&owner_db);
     let home_tenant = "home/home-root".to_string();
+    let home_peer_id = tenant_peer_id_for_username(&owner_db, "home").expect("home peer id");
+    let owner_daemon_peer_id = daemon_identity_fingerprint(&owner_db);
+    let owner_remote: SocketAddr = daemon_listen_addr(&owner_db)
+        .parse()
+        .expect("owner listen addr");
 
     let home_bootstrap = "home-space/bootstrap";
     let home_bootstrap_eid = send_message(&owner_db, home_bootstrap);
@@ -2348,6 +2353,11 @@ fn test_cli_live_daemon_accept_second_workspace_can_switch_back_and_sync_origina
         "home-guest",
         "guest-laptop",
     );
+    let home_guest_peer_id = wait_for_username_peer_id(&home_guest.db, "home-guest", timeout_ms);
+    let home_guest_daemon_peer_id = daemon_identity_fingerprint(&home_guest.db);
+    let home_guest_remote: SocketAddr = daemon_listen_addr(&home_guest.db)
+        .parse()
+        .expect("home guest listen addr");
     assert_event_visible_on_all(&[&home_guest.db], &home_bootstrap_eid, timeout_ms);
 
     create_workspace_with_details(&zeta_db, "zeta-space", "zeta", "zeta-root");
@@ -2400,8 +2410,33 @@ fn test_cli_live_daemon_accept_second_workspace_can_switch_back_and_sync_origina
     let zeta_eid = send_message_as_username(&owner_db, "yuki-zeta", zeta_msg);
     assert_event_visible_on_all(&[&zeta_db], &zeta_eid, timeout_ms);
 
+    use_tenant_for_username(&owner_db, "home");
+    wait_for_direct_trust_dial(
+        &owner_db,
+        &home_peer_id,
+        home_guest_remote,
+        &home_guest_daemon_peer_id,
+        &home_guest_peer_id,
+        &home_guest_peer_id,
+        timeout_ms,
+    );
+    wait_for_direct_trust_dial(
+        &home_guest.db,
+        &home_guest_peer_id,
+        owner_remote,
+        &owner_daemon_peer_id,
+        &home_peer_id,
+        &home_peer_id,
+        timeout_ms,
+    );
+    wait_for_active_tenant_ready(&owner_db, Duration::from_secs(120));
+    wait_for_live_sync_session(&owner_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&home_guest.db, Duration::from_secs(60));
+
     let home_msg = "home-space/home-followup";
     let home_eid = send_message_as_username(&owner_db, "home", home_msg);
+    request_sync_all(&owner_db, Duration::from_secs(30));
+    request_sync_all(&home_guest.db, Duration::from_secs(30));
     assert_event_visible_on_all(&[&home_guest.db], &home_eid, timeout_ms);
 
     let home_guest_view = get_view_raw(&home_guest.db);
@@ -2463,6 +2498,10 @@ fn test_cli_live_daemon_accept_second_workspace_from_same_remote_daemon_stays_is
     let alpha_invite = create_invite(&owner_db, &daemon_listen_addr(&owner_db));
     let bob = start_joined_cli_peer(&tmpdir, "bob.db", &alpha_invite, "bob-alpha", "bob-laptop");
     let bob_alpha_tenant = "bob-alpha/bob-laptop".to_string();
+    let bob_daemon_peer_id = daemon_identity_fingerprint(&bob.db);
+    let bob_remote: SocketAddr = daemon_listen_addr(&bob.db)
+        .parse()
+        .expect("bob listen addr");
     assert_event_visible_on_all(&[&bob.db], &alpha_bootstrap_eid, timeout_ms);
 
     let create_beta = Command::new(bin())
@@ -2517,6 +2556,15 @@ fn test_cli_live_daemon_accept_second_workspace_from_same_remote_daemon_stays_is
         &beta_owner_peer_id,
         timeout_ms,
     );
+    wait_for_direct_trust_dial(
+        &owner_db,
+        &beta_owner_peer_id,
+        bob_remote,
+        &bob_daemon_peer_id,
+        &bob_beta_peer_id,
+        &bob_beta_peer_id,
+        timeout_ms,
+    );
     wait_for_active_tenant_ready(&bob.db, Duration::from_secs(120));
     assert_event_visible_for_username(&bob.db, "bob-beta", &beta_bootstrap_eid, timeout_ms);
 
@@ -2526,11 +2574,15 @@ fn test_cli_live_daemon_accept_second_workspace_from_same_remote_daemon_stays_is
 
     let beta_reply = "beta-space/bob-reply";
     let beta_reply_eid = send_message_as_username(&bob.db, "bob-beta", beta_reply);
+    request_sync_all(&bob.db, Duration::from_secs(30));
+    request_sync_all(&owner_db, Duration::from_secs(30));
     assert_event_visible_for_username(&owner_db, "beta-owner", &beta_reply_eid, timeout_ms);
 
     let beta_owner_followup = "beta-space/owner-second";
     let beta_owner_followup_eid =
         send_message_as_username(&owner_db, "beta-owner", beta_owner_followup);
+    request_sync_all(&owner_db, Duration::from_secs(30));
+    request_sync_all(&bob.db, Duration::from_secs(30));
     assert_event_visible_for_username(&bob.db, "bob-beta", &beta_owner_followup_eid, timeout_ms);
 
     use_tenant_for_username(&bob.db, "bob-alpha");
@@ -3005,14 +3057,16 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
         "yuki-terminal",
     );
     let _shared_daemon = start_daemon(&shared_db);
-    let alpha_transport_peer_id = daemon_transport_fingerprint(&alpha.db);
-    let zeta_transport_peer_id = daemon_transport_fingerprint(&zeta.db);
-    wait_for_endpoint_observation(
-        &shared_db,
-        &alpha_transport_peer_id,
-        Duration::from_secs(30),
-    );
-    wait_for_endpoint_observation(&shared_db, &zeta_transport_peer_id, Duration::from_secs(30));
+    let bob_peer_id = wait_for_username_peer_id(&shared_db, "bob-alpha", timeout_ms);
+    let yuki_peer_id = wait_for_username_peer_id(&shared_db, "yuki-zeta", timeout_ms);
+    use_tenant_for_username(&shared_db, "bob-alpha");
+    wait_for_active_tenant_ready(&shared_db, Duration::from_secs(120));
+    wait_for_tenant_transport_converged(&shared_db, &bob_peer_id, Duration::from_secs(120));
+    assert_event_visible_for_username(&shared_db, "bob-alpha", &alpha_bootstrap, timeout_ms);
+    use_tenant_for_username(&shared_db, "yuki-zeta");
+    wait_for_active_tenant_ready(&shared_db, Duration::from_secs(120));
+    wait_for_tenant_transport_converged(&shared_db, &yuki_peer_id, Duration::from_secs(120));
+    assert_event_visible_for_username(&shared_db, "yuki-zeta", &zeta_bootstrap, timeout_ms);
 
     let dave_alpha_invite = create_invite(&alpha.db, &daemon_listen_addr(&alpha.db));
     let emma_zeta_invite = create_invite(&zeta.db, &daemon_listen_addr(&zeta.db));
@@ -3026,7 +3080,6 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
     );
     let dave_tenant = dave.tenant_label();
     wait_for_active_tenant_ready(&dave.db, Duration::from_millis(timeout_ms));
-    wait_for_endpoint_observation(&dave.db, &alpha_transport_peer_id, Duration::from_secs(30));
 
     let emma = start_joined_cli_peer(
         &tmpdir,
@@ -3037,7 +3090,6 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
     );
     let emma_tenant = emma.tenant_label();
     wait_for_active_tenant_ready(&emma.db, Duration::from_millis(timeout_ms));
-    wait_for_endpoint_observation(&emma.db, &zeta_transport_peer_id, Duration::from_secs(30));
 
     let dave_alpha_msg = "alpha-space/dave-external";
     let dave_alpha_eid = send_message(&dave.db, dave_alpha_msg);
@@ -3057,8 +3109,6 @@ fn test_cli_shared_db_multitenant_cross_workspace_isolation() {
     let yuki_zeta_eid = send_message_as_username(&shared_db, "yuki-zeta", yuki_zeta_msg);
     assert_event_visible_on_all(&[&zeta.db, &emma.db], &yuki_zeta_eid, timeout_ms);
 
-    let bob_peer_id = wait_for_username_peer_id(&shared_db, "bob-alpha", timeout_ms);
-    let yuki_peer_id = wait_for_username_peer_id(&shared_db, "yuki-zeta", timeout_ms);
     let dave_peer_id = wait_for_username_peer_id(&dave.db, "dave-alpha", timeout_ms);
     let emma_peer_id = wait_for_username_peer_id(&emma.db, "emma-zeta", timeout_ms);
     let dave_daemon_peer_id = daemon_identity_fingerprint(&dave.db);
@@ -4171,13 +4221,16 @@ fn test_cli_files_and_save_file_roundtrip_after_sync() {
     create_workspace(&alice_db);
     let _alice = start_daemon(&alice_db);
 
-    let invite_link = create_invite(&alice_db, &daemon_listen_addr(&alice_db));
+    let invite_link = create_invite_with_public_addr(&alice_db, &daemon_listen_addr(&alice_db));
     accept_invite(&bob_db, &invite_link);
     let _bob = start_daemon(&bob_db);
 
     // Readiness gate: confirm daemons are connected and syncing before
     // sending the file. Without this, the file-transfer timeout burns
     // time waiting for the QUIC handshake under CPU pressure.
+    wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
+    wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
     let gate_eid = send_message(&alice_db, "pre-file-gate");
     assert_eventually(&bob_db, &format!("has_event:{} >= 1", gate_eid), timeout_ms);
 
@@ -4570,7 +4623,7 @@ fn test_cli_connect_to_dead_address_error() {
     create_workspace(&db_a);
     let _daemon_a = start_daemon(&db_a);
     let dead_port = random_port();
-    let invite = create_invite(&db_a, &format!("127.0.0.1:{}", dead_port));
+    let invite = create_invite_with_public_addr(&db_a, &format!("127.0.0.1:{}", dead_port));
     drop(_daemon_a); // Kill Alice's daemon so the address is dead.
 
     // Bob accepts the invite — daemon will try to connect to the dead address.

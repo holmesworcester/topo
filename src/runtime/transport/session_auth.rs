@@ -531,12 +531,24 @@ pub fn resolve_bound_daemon_peer_id(
 ) -> Result<Option<String>, Box<dyn std::error::Error + Send + Sync>> {
     let endpoint_id: Option<String> = conn
         .query_row(
-            "SELECT endpoint_id
-             FROM peers_shared
-             WHERE recorded_by = ?1
-               AND lower(hex(transport_fingerprint)) = ?2
-               AND endpoint_id IS NOT NULL
-             LIMIT 1",
+            "SELECT COALESCE(
+                 (
+                     SELECT endpoint_id
+                     FROM peers_shared
+                     WHERE recorded_by = ?1
+                       AND lower(hex(transport_fingerprint)) = ?2
+                       AND endpoint_id IS NOT NULL
+                     LIMIT 1
+                 ),
+                 (
+                     SELECT lower(hex(spki_fingerprint))
+                     FROM peer_transport_bindings
+                     WHERE recorded_by = ?1
+                       AND peer_id = ?2
+                     ORDER BY bound_at DESC
+                     LIMIT 1
+                 )
+             )",
             params![recorded_by, peer_id],
             |row| row.get(0),
         )

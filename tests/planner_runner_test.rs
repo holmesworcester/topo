@@ -1,7 +1,5 @@
 use topo::rpc::protocol::RpcMethod;
-use topo::sim::{
-    snapshot_replayed_peer, FakeTopologyPreference, PlannerMode, PlannerSimulation, VirtualDaemon,
-};
+use topo::sim::{FakeTopologyPreference, PlannerMode, PlannerSimulation, VirtualDaemon};
 
 fn active_peer_id(daemon: &VirtualDaemon) -> String {
     daemon
@@ -12,10 +10,10 @@ fn active_peer_id(daemon: &VirtualDaemon) -> String {
         .to_string()
 }
 
-fn create_invite(daemon: &VirtualDaemon, public_addr: &str) -> String {
+fn create_invite(daemon: &VirtualDaemon) -> String {
     daemon
         .call_ok_value(RpcMethod::CreateInvite {
-            public_addr: Some(public_addr.to_string()),
+            public_addr: None,
             public_spki: None,
         })
         .expect("create invite")["invite_link"]
@@ -24,10 +22,10 @@ fn create_invite(daemon: &VirtualDaemon, public_addr: &str) -> String {
         .to_string()
 }
 
-fn create_device_link(daemon: &VirtualDaemon, public_addr: &str) -> String {
+fn create_device_link(daemon: &VirtualDaemon) -> String {
     daemon
         .call_ok_value(RpcMethod::CreateDeviceLink {
-            public_addr: Some(public_addr.to_string()),
+            public_addr: None,
             public_spki: None,
         })
         .expect("create device link")["invite_link"]
@@ -95,18 +93,28 @@ fn assert_lacks_event(daemon: &VirtualDaemon, event_id: &str) {
     );
 }
 
-fn snapshot_has_message_content(daemon: &VirtualDaemon, content: &str) -> bool {
+fn authoring_ready(daemon: &VirtualDaemon) -> bool {
+    let conn = topo::db::open_connection(daemon.db_path()).expect("open db for authoring check");
     let recorded_by = active_peer_id(daemon);
-    let snapshot = snapshot_replayed_peer(daemon.db_path(), &recorded_by).expect("peer snapshot");
-    let messages = snapshot
-        .daemon()
-        .call_ok_value(RpcMethod::Messages { limit: 100 })
-        .expect("messages via snapshot rpc");
-    messages["messages"]
-        .as_array()
-        .expect("messages array")
+    topo::event_modules::workspace::authoring::load_local_authoring_context(&conn, &recorded_by)
+        .is_ok()
+}
+
+fn finish_bootstrap_until_authoring_ready(db_paths: &[String], ready_peers: &[&VirtualDaemon]) {
+    for _ in 0..4 {
+        if ready_peers.iter().all(|daemon| authoring_ready(daemon)) {
+            return;
+        }
+        PlannerSimulation::new(db_paths.to_vec())
+            .tick()
+            .expect("bootstrap follow-up round");
+    }
+    let pending = ready_peers
         .iter()
-        .any(|message| message["content"].as_str() == Some(content))
+        .filter(|daemon| !authoring_ready(daemon))
+        .map(|daemon| daemon.db_path().to_string())
+        .collect::<Vec<_>>();
+    panic!("authoring never materialized for {:?}", pending);
 }
 
 #[test]
@@ -164,7 +172,7 @@ fn nearest_neighbor_no_auth_uses_fake_topology_for_event_layer_valid_peers() {
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
 
-    let invite_bob = create_invite(&alice, "127.0.0.1:4242");
+    let invite_bob = create_invite(&alice);
     let accepted_bob = bob.call(RpcMethod::AcceptInvite {
         invite: invite_bob,
         username: "bob".into(),
@@ -176,7 +184,7 @@ fn nearest_neighbor_no_auth_uses_fake_topology_for_event_layer_valid_peers() {
         accepted_bob.error
     );
 
-    let invite_carol = create_invite(&alice, "127.0.0.1:4343");
+    let invite_carol = create_invite(&alice);
     let accepted_carol = carol.call(RpcMethod::AcceptInvite {
         invite: invite_carol,
         username: "carol".into(),
@@ -196,6 +204,14 @@ fn nearest_neighbor_no_auth_uses_fake_topology_for_event_layer_valid_peers() {
     .tick()
     .expect("bootstrap round using real connect targets");
     assert_eq!(bootstrap_report.unique_pairs, 2);
+    finish_bootstrap_until_authoring_ready(
+        &[
+            alice_db.to_string_lossy().into_owned(),
+            bob_db.to_string_lossy().into_owned(),
+            carol_db.to_string_lossy().into_owned(),
+        ],
+        &[&bob, &carol],
+    );
 
     let bob_message = send_message(&bob, "hello from bob");
     assert_lacks_event(&carol, &bob_message);
@@ -257,7 +273,7 @@ fn planner_runner_propagates_only_through_planned_pair_sessions() {
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
     let phone_peer = active_peer_id(&phone);
 
-    let phone_link = create_device_link(&phone, "127.0.0.1:4242");
+    let phone_link = create_device_link(&phone);
     let phone_key_shared_ids = event_ids_of_type(&phone, "key_shared");
     assert!(
         !phone_key_shared_ids.is_empty(),
@@ -282,9 +298,16 @@ fn planner_runner_propagates_only_through_planned_pair_sessions() {
     .tick()
     .expect("planner tick for initial phone-laptop bootstrap");
     assert_eq!(bootstrap_report.unique_pairs, 1);
+    finish_bootstrap_until_authoring_ready(
+        &[
+            phone_db.to_string_lossy().into_owned(),
+            laptop_db.to_string_lossy().into_owned(),
+        ],
+        &[&laptop],
+    );
     assert_has_event(&laptop, &bootstrap_message);
 
-    let laptop_link = create_device_link(&laptop, "127.0.0.1:4343");
+    let laptop_link = create_device_link(&laptop);
     let accepted_tablet = tablet.call(RpcMethod::AcceptLink {
         invite: laptop_link,
         devicename: "tablet".into(),
@@ -295,6 +318,14 @@ fn planner_runner_propagates_only_through_planned_pair_sessions() {
         accepted_tablet.error
     );
     let tablet_peer = active_peer_id(&tablet);
+    finish_bootstrap_until_authoring_ready(
+        &[
+            phone_db.to_string_lossy().into_owned(),
+            laptop_db.to_string_lossy().into_owned(),
+            tablet_db.to_string_lossy().into_owned(),
+        ],
+        &[&tablet],
+    );
 
     let routed_message = send_message(&phone, "phone-through-laptop");
     assert_lacks_event(&laptop, &routed_message);
@@ -368,7 +399,7 @@ fn nearest_neighbor_no_auth_propagates_key_shared_along_chain() {
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
 
-    let phone_link = create_device_link(&phone, "127.0.0.1:4242");
+    let phone_link = create_device_link(&phone);
     let phone_key_shared_ids = event_ids_of_type(&phone, "key_shared");
     assert!(
         !phone_key_shared_ids.is_empty(),
@@ -395,8 +426,15 @@ fn nearest_neighbor_no_auth_propagates_key_shared_along_chain() {
     .tick()
     .expect("nearest-neighbor bootstrap tick");
     assert_eq!(bootstrap_report.unique_pairs, 1);
+    finish_bootstrap_until_authoring_ready(
+        &[
+            phone_db.to_string_lossy().into_owned(),
+            laptop_db.to_string_lossy().into_owned(),
+        ],
+        &[&laptop],
+    );
 
-    let laptop_link = create_device_link(&laptop, "127.0.0.1:4343");
+    let laptop_link = create_device_link(&laptop);
     let accepted_tablet = tablet.call(RpcMethod::AcceptLink {
         invite: laptop_link,
         devicename: "tablet".into(),
@@ -405,6 +443,14 @@ fn nearest_neighbor_no_auth_propagates_key_shared_along_chain() {
         accepted_tablet.ok,
         "tablet accept link failed: {:?}",
         accepted_tablet.error
+    );
+    finish_bootstrap_until_authoring_ready(
+        &[
+            phone_db.to_string_lossy().into_owned(),
+            laptop_db.to_string_lossy().into_owned(),
+            tablet_db.to_string_lossy().into_owned(),
+        ],
+        &[&tablet],
     );
 
     let report = PlannerSimulation::with_mode_and_topology(
@@ -447,12 +493,8 @@ fn fake_star_message_reaches_all_peers_in_one_round() {
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
 
-    for (daemon, username, addr) in [
-        (&bob, "bob", "127.0.0.1:4242"),
-        (&carol, "carol", "127.0.0.1:4343"),
-        (&dave, "dave", "127.0.0.1:4444"),
-    ] {
-        let invite = create_invite(&alice, addr);
+    for (daemon, username) in [(&bob, "bob"), (&carol, "carol"), (&dave, "dave")] {
+        let invite = create_invite(&alice);
         let accepted = daemon.call(RpcMethod::AcceptInvite {
             invite,
             username: username.into(),
@@ -474,12 +516,21 @@ fn fake_star_message_reaches_all_peers_in_one_round() {
     .tick()
     .expect("bootstrap round");
     assert_eq!(bootstrap.unique_pairs, 3);
+    finish_bootstrap_until_authoring_ready(
+        &[
+            alice_db.to_string_lossy().into_owned(),
+            bob_db.to_string_lossy().into_owned(),
+            carol_db.to_string_lossy().into_owned(),
+            dave_db.to_string_lossy().into_owned(),
+        ],
+        &[&bob, &carol, &dave],
+    );
 
     let content = "hello whole chain";
-    let _message_id = send_message(&alice, content);
-    assert!(!snapshot_has_message_content(&bob, content));
-    assert!(!snapshot_has_message_content(&carol, content));
-    assert!(!snapshot_has_message_content(&dave, content));
+    let message_id = send_message(&alice, content);
+    assert_lacks_event(&bob, &message_id);
+    assert_lacks_event(&carol, &message_id);
+    assert_lacks_event(&dave, &message_id);
 
     let dbs = [
         alice_db.to_string_lossy().into_owned(),
@@ -498,9 +549,9 @@ fn fake_star_message_reaches_all_peers_in_one_round() {
     .tick()
     .expect("round 1");
     assert_eq!(round1.unique_pairs, 3);
-    assert!(snapshot_has_message_content(&bob, content));
-    assert!(snapshot_has_message_content(&carol, content));
-    assert!(snapshot_has_message_content(&dave, content));
+    assert_has_event(&bob, &message_id);
+    assert_has_event(&carol, &message_id);
+    assert_has_event(&dave, &message_id);
 
     let bob_arrival_ms = round_interval_ms;
     let carol_arrival_ms = round_interval_ms;
@@ -531,7 +582,7 @@ fn planner_runner_reimports_same_db_new_tenant_on_next_round() {
     assert_eq!(before_join.imported_nodes, 1);
     assert_eq!(before_join.sessions_executed, 0);
 
-    let invite = create_invite(&daemon, "127.0.0.1:4242");
+    let invite = create_invite(&daemon);
     let accepted = daemon.call_ok_value(RpcMethod::AcceptInvite {
         invite,
         username: "bob".into(),
