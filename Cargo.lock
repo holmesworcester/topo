@@ -3682,7 +3682,6 @@ dependencies = [
  "rcgen",
  "rusqlite",
  "rustls",
- "rustls-webpki",
  "serde",
  "serde_json",
  "tempfile",

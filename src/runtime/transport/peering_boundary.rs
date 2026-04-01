@@ -362,12 +362,12 @@ pub async fn create_runtime_endpoint_for_tenants(
         .alpns(vec![TOPO_ALPN.to_vec()]);
 
     if low_mem_mode() {
-        // In low-memory mode (iOS NSE, 24 MiB budget), disable relay client and
-        // portmapper to avoid ~7 MiB of resident overhead from relay connections,
-        // mDNS multicast state, and UPnP probing.  Direct peer-to-peer still
-        // works; only wide-area relay-assisted connectivity is lost.
+        // In low-memory mode (iOS NSE, 24 MiB budget), keep a single relay
+        // server for NAT traversal (adds ~1.3 MiB) but disable portmapper
+        // and mDNS to stay under budget.  A single relay is essential for
+        // reachability when both peers are behind NAT.
         builder = builder
-            .relay_mode(iroh::endpoint::RelayMode::Disabled)
+            .relay_mode(low_mem_relay_mode())
             .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
             .transport_config(low_mem_quic_transport_config());
     } else {
@@ -409,6 +409,20 @@ fn low_mem_quic_transport_config() -> iroh::endpoint::QuicTransportConfig {
         .receive_window(VarInt::from_u32(512 * 1024))        // 512 KiB connection cap
         .send_window(512 * 1024)                              // 512 KiB (default ~8 MiB)
         .build()
+}
+
+/// Single-relay mode for low-memory environments.
+///
+/// Uses only the first relay server from iroh's default production map
+/// instead of all of them.  This adds ~1.3 MiB of RSS (vs ~4 MiB for the
+/// full map) while preserving NAT traversal capability.
+fn low_mem_relay_mode() -> iroh::endpoint::RelayMode {
+    let default_map = iroh::endpoint::RelayMode::Default.relay_map();
+    let urls: Vec<iroh::RelayUrl> = default_map.urls();
+    match urls.into_iter().next() {
+        Some(url) => iroh::endpoint::RelayMode::custom(std::iter::once(url)),
+        None => iroh::endpoint::RelayMode::Disabled,
+    }
 }
 
 pub fn tenant_trusts_peer(
