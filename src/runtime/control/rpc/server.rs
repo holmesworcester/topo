@@ -736,10 +736,17 @@ fn dispatch(
         RpcMethod::SendFile {
             content,
             file_path,
+            add_bad_slices,
             client_op_id,
         } => match state.require_active_peer() {
             Ok(peer_id) => {
-                match message::send_file_for_peer(db_path, &peer_id, &content, &file_path) {
+                match message::send_file_for_peer(
+                    db_path,
+                    &peer_id,
+                    &content,
+                    &file_path,
+                    add_bad_slices,
+                ) {
                     Ok(data) => {
                         store_client_op(
                             db_path,

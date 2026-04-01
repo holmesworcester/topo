@@ -118,6 +118,9 @@ pub(crate) enum Commands {
         /// Path to file to attach (reads from stdin or uses placeholder if omitted)
         #[arg(long)]
         file: Option<String>,
+        /// Append bogus extra file_slice events after the real slices
+        #[arg(long, default_value_t = 0)]
+        add_bad_slices: usize,
         /// Client operation ID for local-echo reconciliation
         #[arg(long)]
         client_op_id: Option<String>,
