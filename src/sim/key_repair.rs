@@ -26,7 +26,6 @@ use crate::projection::create::{
     create_encrypted_event_synchronous, create_event_synchronous, create_signed_event_synchronous,
 };
 use crate::projection::encrypted::wrap_key_for_recipient;
-use crate::projection::signer::sign_event_bytes;
 use crate::state::db::transport_creds::discover_local_tenants;
 
 type SimResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
@@ -102,16 +101,13 @@ pub fn create_encrypted_message_with_key(
         workspace_id: authoring.workspace_id,
         author_id: authoring.author_id,
         content: content.to_string(),
-        signed_by: authoring.signer_event_id,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
     Ok(create_encrypted_event_synchronous(
         &conn,
         recorded_by,
         key_event_id,
         &inner,
-        Some(&authoring.signing_key),
+        Some((&authoring.signer_event_id, &authoring.signing_key)),
     )?)
 }
 
@@ -143,13 +139,11 @@ pub fn create_removal(
         parent_4: slots[3],
         frontier_hash: frontier_hash_from_refs(parent_refs),
         removed_by: authoring.signer_event_id,
-        signed_by: authoring.signer_event_id,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
     Ok(create_signed_event_synchronous(
         &conn,
         recorded_by,
+        &authoring.signer_event_id,
         &event,
         &authoring.signing_key,
     )?)
@@ -183,13 +177,11 @@ pub fn create_key_rotation(
         frontier_ref_4: slots[3],
         frontier_hash: frontier_hash_from_refs(frontier_refs),
         rotated_by: authoring.signer_event_id,
-        signed_by: authoring.signer_event_id,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
     Ok(create_signed_event_synchronous(
         &conn,
         recorded_by,
+        &authoring.signer_event_id,
         &event,
         &authoring.signing_key,
     )?)
@@ -305,19 +297,22 @@ fn emit_key_requests_for_peer(db_path: &str, recorded_by: &str) -> SimResult<usi
             delivery_target_id: target_id,
             recipient_event_id,
             unwrap_key_event_id,
-            signed_by: authoring.signer_event_id,
-            signer_type: 5,
-            signature: [0u8; 64],
         });
-        let event_id = signed_event_id(&request, &authoring.signing_key)?;
+        let event_id =
+            signed_event_id(&request, &authoring.signer_event_id, &authoring.signing_key)?;
         let event_id_b64 = event_id_to_base64(&event_id);
         let existed_before: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
             rusqlite::params![&event_id_b64],
             |row| row.get(0),
         )?;
-        let _ =
-            create_signed_event_synchronous(&conn, recorded_by, &request, &authoring.signing_key)?;
+        let _ = create_signed_event_synchronous(
+            &conn,
+            recorded_by,
+            &authoring.signer_event_id,
+            &request,
+            &authoring.signing_key,
+        )?;
         if !existed_before {
             emitted = emitted.saturating_add(1);
         }
@@ -369,6 +364,7 @@ fn emit_key_shared_responses_for_peer(
             {
                 let local_event_id = signed_event_id(
                     &build_key_shared_response(&conn, recorded_by, &authoring, request)?,
+                    &authoring.signer_event_id,
                     &authoring.signing_key,
                 )?;
                 if (*best_rank, *best_signer, *best_event_id)
@@ -380,15 +376,24 @@ fn emit_key_shared_responses_for_peer(
         }
 
         let response = build_key_shared_response(&conn, recorded_by, &authoring, request)?;
-        let event_id = signed_event_id(&response, &authoring.signing_key)?;
+        let event_id = signed_event_id(
+            &response,
+            &authoring.signer_event_id,
+            &authoring.signing_key,
+        )?;
         let event_id_b64 = event_id_to_base64(&event_id);
         let existed_before: bool = conn.query_row(
             "SELECT EXISTS(SELECT 1 FROM events WHERE event_id = ?1)",
             rusqlite::params![&event_id_b64],
             |row| row.get(0),
         )?;
-        let _ =
-            create_signed_event_synchronous(&conn, recorded_by, &response, &authoring.signing_key)?;
+        let _ = create_signed_event_synchronous(
+            &conn,
+            recorded_by,
+            &authoring.signer_event_id,
+            &response,
+            &authoring.signing_key,
+        )?;
         if !existed_before {
             emitted = emitted.saturating_add(1);
         }
@@ -434,7 +439,7 @@ fn blocked_encrypted_events(
          FROM blocked_events be
          JOIN events e ON e.event_id = be.event_id
          WHERE be.peer_id = ?1
-           AND e.event_type = 'encrypted'
+           AND e.event_type IN ('signed', 'encrypted')
          ORDER BY e.created_at ASC, e.event_id ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
@@ -447,7 +452,7 @@ fn blocked_encrypted_events(
         let Some(blocked_event_id) = event_id_from_base64(&event_id_b64) else {
             continue;
         };
-        let Ok(ParsedEvent::Encrypted(enc)) = events::parse_event(&blob) else {
+        let Ok(ParsedEvent::Encrypted(enc)) = parse_semantic_event(&blob) else {
             continue;
         };
         out.push((blocked_event_id, enc.key_event_id));
@@ -542,7 +547,6 @@ fn known_key_shared_summaries(
          FROM recorded_events re
          JOIN events e ON e.event_id = re.event_id
          WHERE re.peer_id = ?1
-           AND e.event_type = 'key_shared'
          ORDER BY re.id ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
@@ -554,7 +558,11 @@ fn known_key_shared_summaries(
         let Some(event_id) = event_id_from_base64(&event_id_b64) else {
             continue;
         };
-        let Ok(ParsedEvent::KeyShared(ks)) = events::parse_event(&blob) else {
+        let Ok(ParsedEvent::KeyShared(ks)) = parse_semantic_event(&blob) else {
+            continue;
+        };
+        let Some(signer_event_id) = crate::event_modules::signed::outer_signer_event_id(&blob)
+        else {
             continue;
         };
         out.push(KeySharedSummary {
@@ -565,10 +573,22 @@ fn known_key_shared_summaries(
                 recipient_event_id: ks.recipient_event_id,
                 unwrap_key_event_id: ks.unwrap_key_event_id,
             },
-            signer_event_id: ks.signed_by,
+            signer_event_id,
         });
     }
     Ok(out)
+}
+
+fn parse_semantic_event(blob: &[u8]) -> Result<ParsedEvent, crate::event_modules::EventError> {
+    let parsed = events::parse_event(blob)?;
+    unwrap_signed(parsed)
+}
+
+fn unwrap_signed(parsed: ParsedEvent) -> Result<ParsedEvent, crate::event_modules::EventError> {
+    match parsed {
+        ParsedEvent::Signed(signed) => unwrap_signed(events::parse_event(&signed.payload)?),
+        other => Ok(other),
+    }
 }
 
 fn has_local_key_material(
@@ -643,9 +663,6 @@ fn build_key_shared_response(
         recipient_event_id: request.target.recipient_event_id,
         unwrap_key_event_id: request.target.unwrap_key_event_id,
         wrapped_key,
-        signed_by: authoring.signer_event_id,
-        signer_type: 5,
-        signature: [0u8; 64],
     }))
 }
 
@@ -659,7 +676,7 @@ fn request_recipient_verifying_key(
         rusqlite::params![&recipient_event_id_b64],
         |row| row.get(0),
     )?;
-    let parsed = events::parse_event(&blob)?;
+    let parsed = parse_semantic_event(&blob)?;
     let public_key = match parsed {
         ParsedEvent::UserInvite(evt) => evt.public_key,
         ParsedEvent::DeviceInvite(evt) => evt.public_key,
@@ -695,19 +712,11 @@ fn deterministic_response_created_at_ms(
 
 fn signed_event_id(
     event: &ParsedEvent,
+    signer_event_id: &EventId,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> SimResult<EventId> {
-    let type_code = event.event_type_code();
-    let sig_len = events::registry()
-        .lookup(type_code)
-        .ok_or("unknown event type for signing")?
-        .signature_byte_len;
-    let mut blob = events::encode_event(event)?;
-    if sig_len > 0 {
-        let blob_len = blob.len();
-        let sig = sign_event_bytes(signing_key, &blob[..blob_len - sig_len]);
-        blob[blob_len - sig_len..].copy_from_slice(&sig);
-    }
+    let blob =
+        crate::projection::create::encode_signed_wrapper_blob(event, signer_event_id, signing_key)?;
     Ok(crate::crypto::hash_event(&blob))
 }
 
@@ -769,11 +778,14 @@ fn ensure_key_rotation_exists(
         frontier_ref_4: [0u8; 32],
         frontier_hash: frontier_hash_from_refs(&[]),
         rotated_by: authoring.signer_event_id,
-        signed_by: authoring.signer_event_id,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let _ = create_signed_event_synchronous(conn, recorded_by, &event, &authoring.signing_key)?;
+    let _ = create_signed_event_synchronous(
+        conn,
+        recorded_by,
+        &authoring.signer_event_id,
+        &event,
+        &authoring.signing_key,
+    )?;
     Ok(())
 }
 

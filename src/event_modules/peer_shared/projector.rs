@@ -1,10 +1,11 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::queries::{ContextLoadResult, ProjectionQueries};
+use crate::projection::queries::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 pub fn build_projector_context(
     queries: &dyn ProjectionQueries,
+    frame: &ProjectionFrameContext,
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
@@ -14,7 +15,7 @@ pub fn build_projector_context(
         _ => return Err("peer_shared context loader called for non-peer_shared event".into()),
     };
 
-    let ctx = queries.load_peer_shared_context(recorded_by, event_id_b64, peer_shared)?;
+    let ctx = queries.load_peer_shared_context(frame, recorded_by, event_id_b64, peer_shared)?;
     if let Some(reason) = &ctx.peer_shared_user_mismatch_reason {
         return Ok(ContextLoadResult::reject(reason.clone()));
     }
@@ -103,9 +104,6 @@ mod projector_tests {
             user_event_id: [6u8; 32],
             endpoint_shared_event_id: [8u8; 32],
             device_name: "phone".to_string(),
-            signed_by: [7u8; 32],
-            signer_type: 3,
-            signature: [0u8; 64],
         })
     }
 

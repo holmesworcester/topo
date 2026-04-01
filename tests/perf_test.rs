@@ -442,9 +442,6 @@ fn inject_messages_batched(
                 workspace_id,
                 author_id,
                 content: format!("Msg {} from {}", j, name),
-                signed_by: signer_eid,
-                signer_type: 5,
-                signature: [0u8; 64],
             });
             let mut created = None;
             for attempt in 0..8 {
@@ -453,7 +450,7 @@ fn inject_messages_batched(
                     recorded_by,
                     &key_event_id,
                     &msg,
-                    Some(signing_key),
+                    Some((&signer_eid, signing_key)),
                 ) {
                     Ok(event_id) => {
                         created = Some(event_id);

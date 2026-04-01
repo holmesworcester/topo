@@ -40,9 +40,6 @@ mod projector_tests {
             created_at_ms: 1,
             public_key: [7u8; 32],
             username: "alice".to_string(),
-            signed_by: [8u8; 32],
-            signer_type: 2,
-            signature: [0u8; 64],
         })
     }
 

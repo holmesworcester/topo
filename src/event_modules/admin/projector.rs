@@ -1,9 +1,10 @@
 use super::super::ParsedEvent;
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::queries::{ContextLoadResult, ProjectionQueries};
+use crate::projection::queries::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 pub fn build_projector_context(
     queries: &dyn ProjectionQueries,
+    frame: &ProjectionFrameContext,
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
@@ -13,7 +14,7 @@ pub fn build_projector_context(
         _ => return Err("admin context loader called for non-admin event".into()),
     };
 
-    let ctx = queries.load_admin_context(recorded_by, event_id_b64, admin)?;
+    let ctx = queries.load_admin_context(frame, recorded_by, event_id_b64, admin)?;
     if let Some(reason) = &ctx.admin_user_key_mismatch_reason {
         return Ok(ContextLoadResult::reject(reason.clone()));
     }
@@ -54,9 +55,6 @@ mod projector_tests {
             created_at_ms: 1,
             public_key: [9u8; 32],
             user_event_id: [7u8; 32],
-            signed_by: [8u8; 32],
-            signer_type: 1,
-            signature: [0u8; 64],
         })
     }
 

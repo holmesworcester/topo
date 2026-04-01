@@ -9,9 +9,12 @@
 mod tests {
     use crate::harness::fixtures::*;
     use topo::contracts::transport_identity_contract::TransportIdentitySpec;
-    use topo::event_modules::invite_accepted::{project_pure, InviteAcceptedEvent};
+    use topo::event_modules::invite_accepted::{
+        build_projector_context, project_pure, InviteAcceptedEvent,
+    };
     use topo::event_modules::ParsedEvent;
     use topo::projection::contract::{EmitCommand, SqlVal, WriteOp};
+    use topo::projection::queries::ProjectionFrameContext;
 
     const PEER: &str = "peer_joiner";
 
@@ -105,14 +108,20 @@ mod tests {
         ctx.invite_accepted_link_workspace_mismatch_reason = Some(
             "invite_accepted missing locally recorded invite-link workspace binding".to_string(),
         );
+        let queries = queries_with_ctx(ctx);
 
-        let result = project_pure(PEER, "event_ia_missing_link", &parsed, &ctx);
-        assert_reject_contains(
+        let result = build_projector_context(
+            &queries,
+            &ProjectionFrameContext::default(),
+            PEER,
+            "event_ia_missing_link",
+            &parsed,
+        )
+        .unwrap();
+        assert_context_reject_contains(
             &result,
             "missing locally recorded invite-link workspace binding",
         );
-        assert_no_write_to_table(&result, "invites_accepted");
-        assert_no_commands(&result);
     }
 
     #[test]
@@ -124,14 +133,20 @@ mod tests {
             "invite_accepted workspace_id does not match locally recorded invite-link workspace"
                 .to_string(),
         );
+        let queries = queries_with_ctx(ctx);
 
-        let result = project_pure(PEER, "event_ia_mismatch", &parsed, &ctx);
-        assert_reject_contains(
+        let result = build_projector_context(
+            &queries,
+            &ProjectionFrameContext::default(),
+            PEER,
+            "event_ia_mismatch",
+            &parsed,
+        )
+        .unwrap();
+        assert_context_reject_contains(
             &result,
             "workspace_id does not match locally recorded invite-link workspace",
         );
-        assert_no_write_to_table(&result, "invites_accepted");
-        assert_no_commands(&result);
     }
 
     #[test]

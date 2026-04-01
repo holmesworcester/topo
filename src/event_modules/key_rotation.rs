@@ -17,9 +17,6 @@ pub const KEY_ROTATION_FIELDS: &[FieldSpec] = &[
     FieldSpec::EventId("frontier_ref_4"),
     FieldSpec::EventId("frontier_hash"),
     FieldSpec::EventId("rotated_by"),
-    FieldSpec::EventId("signed_by"),
-    FieldSpec::U8("signer_type"),
-    FieldSpec::FixedBytes("signature", 64),
 ];
 
 pub const KEY_ROTATION_WIRE_SIZE: usize = wire_size_for_fields(KEY_ROTATION_FIELDS);
@@ -35,9 +32,6 @@ pub struct KeyRotationEvent {
     pub frontier_ref_4: [u8; 32],
     pub frontier_hash: [u8; 32],
     pub rotated_by: [u8; 32],
-    pub signed_by: [u8; 32],
-    pub signer_type: u8,
-    pub signature: [u8; 64],
 }
 
 impl super::Describe for KeyRotationEvent {
@@ -61,14 +55,6 @@ pub fn parse_key_rotation(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         frontier_ref_4: values[6].as_event_id().unwrap(),
         frontier_hash: values[7].as_event_id().unwrap(),
         rotated_by: values[8].as_event_id().unwrap(),
-        signed_by: values[9].as_event_id().unwrap(),
-        signer_type: values[10].as_u8().unwrap(),
-        signature: {
-            let bytes = values[11].as_fixed_bytes().unwrap();
-            let mut sig = [0u8; 64];
-            sig.copy_from_slice(bytes);
-            sig
-        },
     }))
 }
 
@@ -87,9 +73,6 @@ pub fn encode_key_rotation(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         FieldValue::EventId(rotation.frontier_ref_4),
         FieldValue::EventId(rotation.frontier_hash),
         FieldValue::EventId(rotation.rotated_by),
-        FieldValue::EventId(rotation.signed_by),
-        FieldValue::U8(rotation.signer_type),
-        FieldValue::FixedBytes(rotation.signature.to_vec()),
     ];
     Ok(encode_fields(
         EVENT_TYPE_KEY_ROTATION,
@@ -127,14 +110,19 @@ pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    _ctx: &ContextSnapshot,
+    ctx: &ContextSnapshot,
 ) -> ProjectorResult {
     let rotation = match parsed {
         ParsedEvent::KeyRotation(event) => event,
         _ => return ProjectorResult::reject("not a key_rotation event".to_string()),
     };
-    if rotation.rotated_by != rotation.signed_by {
-        return ProjectorResult::reject("rotated_by must equal signed_by".to_string());
+    let Some(current_signer) = ctx.current_signer.as_ref() else {
+        return ProjectorResult::reject("key_rotation missing current signer envelope".to_string());
+    };
+    if rotation.rotated_by
+        != crate::crypto::event_id_from_base64(&current_signer.event_id).unwrap_or([0u8; 32])
+    {
+        return ProjectorResult::reject("rotated_by must equal current signer".to_string());
     }
     let slots = [
         rotation.frontier_ref_1,
@@ -178,12 +166,12 @@ pub fn project_pure(
             SqlVal::Text(event_id_to_base64(&rotation.frontier_ref_2)),
             SqlVal::Text(event_id_to_base64(&rotation.frontier_ref_3)),
             SqlVal::Text(event_id_to_base64(&rotation.frontier_ref_4)),
-            SqlVal::Text(event_id_to_base64(&rotation.signed_by)),
+            SqlVal::Text(current_signer.event_id.clone()),
         ],
     }])
 }
 
-pub static KEY_ROTATION_META: EventTypeMeta = EventTypeMeta {
+pub static KEY_ROTATION_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_KEY_ROTATION,
     type_name: "key_rotation",
     projection_table: "key_rotations",
@@ -193,11 +181,10 @@ pub static KEY_ROTATION_META: EventTypeMeta = EventTypeMeta {
         "frontier_ref_2",
         "frontier_ref_3",
         "frontier_ref_4",
-        "signed_by",
     ],
-    dep_field_type_codes: &[&[], &[], &[], &[], &[]],
+    dep_field_type_codes: &[&[], &[], &[], &[]],
     signer_required: true,
-    signature_byte_len: 64,
+    signature_byte_len: 0,
     encryptable: false,
     parse: parse_key_rotation,
     encode: encode_key_rotation,
@@ -223,9 +210,6 @@ mod tests {
             frontier_ref_4: [0u8; 32],
             frontier_hash: frontier_hash_from_refs(&frontier_refs),
             rotated_by: [0x33; 32],
-            signed_by: [0x33; 32],
-            signer_type: 5,
-            signature: [0x44; 64],
         });
         let blob = encode_event(&event).unwrap();
         assert_eq!(blob.len(), KEY_ROTATION_WIRE_SIZE);

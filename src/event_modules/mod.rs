@@ -20,6 +20,7 @@ pub mod peer_shared;
 pub mod reaction;
 pub mod registry;
 pub mod removal;
+pub mod signed;
 pub mod tenant;
 pub mod user;
 pub mod user_invite_shared;
@@ -73,6 +74,7 @@ pub use peer_shared::PeerSharedEvent;
 pub use reaction::ReactionEvent;
 pub use registry::{EventRegistry, EventTypeMeta, ShareScope, TransportPrivacy};
 pub use removal::RemovalEvent;
+pub use signed::SignedEvent;
 pub use tenant::TenantEvent;
 pub use user::UserEvent;
 pub use user_invite_shared::UserInviteEvent;
@@ -103,12 +105,14 @@ pub const EVENT_TYPE_REMOVAL: u8 = 31;
 pub const EVENT_TYPE_KEY_ROTATION: u8 = 32;
 pub const EVENT_TYPE_ENDPOINT_SECRET: u8 = 33;
 pub const EVENT_TYPE_ENDPOINT_SHARED: u8 = 34;
+pub const EVENT_TYPE_SIGNED: u8 = 35;
 
 /// Max event blob size: 1 MiB
 pub const EVENT_MAX_BLOB_BYTES: usize = 1024 * 1024;
 
 pub fn outer_semantic_type_code(blob: &[u8]) -> Option<u8> {
     match blob.first().copied() {
+        Some(EVENT_TYPE_SIGNED) => signed::outer_payload(blob).and_then(outer_semantic_type_code),
         Some(EVENT_TYPE_ENCRYPTED) => encrypted::outer_inner_type_code(blob),
         Some(type_code) => Some(type_code),
         None => None,
@@ -146,6 +150,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 pub enum ParsedEvent {
     Message(MessageEvent),
     Reaction(ReactionEvent),
+    Signed(SignedEvent),
     Encrypted(EncryptedEvent),
     KeySecret(KeySecretEvent),
     MessageDeletion(MessageDeletionEvent),
@@ -175,6 +180,7 @@ impl ParsedEvent {
         match self {
             ParsedEvent::Message(m) => m.created_at_ms,
             ParsedEvent::Reaction(r) => r.created_at_ms,
+            ParsedEvent::Signed(s) => s.inner_created_at_ms,
             ParsedEvent::Encrypted(e) => e.created_at_ms,
             ParsedEvent::KeySecret(s) => s.created_at_ms,
             ParsedEvent::MessageDeletion(d) => d.created_at_ms,
@@ -206,20 +212,22 @@ impl ParsedEvent {
     /// Ordering is semantic: the most structural dep is listed first.
     pub fn dep_field_values(&self) -> Vec<(&'static str, [u8; 32])> {
         match self {
-            ParsedEvent::Message(m) => vec![("author_id", m.author_id), ("signed_by", m.signed_by)],
-            ParsedEvent::Reaction(r) => vec![
-                ("target_event_id", r.target_event_id),
-                ("author_id", r.author_id),
-                ("signed_by", r.signed_by),
-            ],
+            ParsedEvent::Message(m) => vec![("author_id", m.author_id)],
+            ParsedEvent::Reaction(r) => {
+                vec![
+                    ("target_event_id", r.target_event_id),
+                    ("author_id", r.author_id),
+                ]
+            }
+            ParsedEvent::Signed(s) => vec![("signed_by", s.signer_event_id)],
             ParsedEvent::Encrypted(e) => vec![("key_event_id", e.key_event_id)],
             ParsedEvent::KeySecret(_) => vec![],
-            ParsedEvent::MessageDeletion(d) => vec![("signed_by", d.signed_by)],
+            ParsedEvent::MessageDeletion(_) => vec![],
             ParsedEvent::Workspace(_) => vec![],
             ParsedEvent::InviteAccepted(a) => vec![("tenant_event_id", a.tenant_event_id)],
             ParsedEvent::Removal(r) => {
                 let slots = [r.parent_1, r.parent_2, r.parent_3, r.parent_4];
-                let mut deps = removal::frontier_refs_from_slots(r.parent_count, &slots)
+                let deps = removal::frontier_refs_from_slots(r.parent_count, &slots)
                     .unwrap_or_default()
                     .into_iter()
                     .enumerate()
@@ -230,7 +238,6 @@ impl ParsedEvent {
                         _ => ("parent_4", id),
                     })
                     .collect::<Vec<_>>();
-                deps.push(("signed_by", r.signed_by));
                 deps
             }
             ParsedEvent::KeyRotation(k) => {
@@ -240,7 +247,7 @@ impl ParsedEvent {
                     k.frontier_ref_3,
                     k.frontier_ref_4,
                 ];
-                let mut deps = removal::frontier_refs_from_slots(k.frontier_count, &slots)
+                let deps = removal::frontier_refs_from_slots(k.frontier_count, &slots)
                     .unwrap_or_default()
                     .into_iter()
                     .enumerate()
@@ -251,36 +258,19 @@ impl ParsedEvent {
                         _ => ("frontier_ref_4", id),
                     })
                     .collect::<Vec<_>>();
-                deps.push(("signed_by", k.signed_by));
                 deps
             }
-            ParsedEvent::KeyRequest(k) => vec![("signed_by", k.signed_by)],
-            ParsedEvent::UserInvite(u) => {
-                vec![
-                    ("authority_event_id", u.authority_event_id),
-                    ("signed_by", u.signed_by),
-                ]
-            }
-            ParsedEvent::DeviceInvite(d) => {
-                vec![
-                    ("authority_event_id", d.authority_event_id),
-                    ("signed_by", d.signed_by),
-                ]
-            }
-            ParsedEvent::User(u) => vec![("signed_by", u.signed_by)],
+            ParsedEvent::KeyRequest(_) => vec![],
+            ParsedEvent::UserInvite(u) => vec![("authority_event_id", u.authority_event_id)],
+            ParsedEvent::DeviceInvite(d) => vec![("authority_event_id", d.authority_event_id)],
+            ParsedEvent::User(_) => vec![],
             ParsedEvent::PeerShared(p) => {
                 vec![
                     ("user_event_id", p.user_event_id),
                     ("endpoint_shared_event_id", p.endpoint_shared_event_id),
-                    ("signed_by", p.signed_by),
                 ]
             }
-            ParsedEvent::Admin(a) => {
-                vec![
-                    ("user_event_id", a.user_event_id),
-                    ("signed_by", a.signed_by),
-                ]
-            }
+            ParsedEvent::Admin(a) => vec![("user_event_id", a.user_event_id)],
             ParsedEvent::KeyShared(s) => {
                 let slots = [
                     s.frontier_ref_1,
@@ -301,16 +291,14 @@ impl ParsedEvent {
                             _ => ("frontier_ref_4", id),
                         }),
                 );
-                deps.push(("signed_by", s.signed_by));
                 deps
             }
             ParsedEvent::Tenant(_) => vec![],
             ParsedEvent::File(a) => vec![
                 ("message_id", a.message_id),
                 ("key_event_id", a.key_event_id),
-                ("signed_by", a.signed_by),
             ],
-            ParsedEvent::FileSlice(f) => vec![("signed_by", f.signed_by)],
+            ParsedEvent::FileSlice(_) => vec![],
             ParsedEvent::BenchDep(b) => b.dep_ids.iter().map(|id| ("dep_id", *id)).collect(),
             ParsedEvent::PeerSecret(p) => vec![("signer_event_id", p.signer_event_id)],
             ParsedEvent::InviteSecret(_) => vec![],
@@ -323,6 +311,7 @@ impl ParsedEvent {
         match self {
             ParsedEvent::Message(_) => EVENT_TYPE_MESSAGE,
             ParsedEvent::Reaction(_) => EVENT_TYPE_REACTION,
+            ParsedEvent::Signed(_) => EVENT_TYPE_SIGNED,
             ParsedEvent::Encrypted(_) => EVENT_TYPE_ENCRYPTED,
             ParsedEvent::KeySecret(_) => EVENT_TYPE_KEY_SECRET,
             ParsedEvent::MessageDeletion(_) => EVENT_TYPE_MESSAGE_DELETION,
@@ -348,42 +337,12 @@ impl ParsedEvent {
         }
     }
 
-    /// Return signer info for signed event types: (signer_event_id, signer_type).
-    /// Returns None for unsigned types.
-    pub fn signer_fields(&self) -> Option<([u8; 32], u8)> {
-        match self {
-            ParsedEvent::UserInvite(u) => Some((u.signed_by, u.signer_type)),
-            ParsedEvent::DeviceInvite(d) => Some((d.signed_by, d.signer_type)),
-            ParsedEvent::User(u) => Some((u.signed_by, u.signer_type)),
-            ParsedEvent::PeerShared(p) => Some((p.signed_by, p.signer_type)),
-            ParsedEvent::Admin(a) => Some((a.signed_by, a.signer_type)),
-            ParsedEvent::KeyShared(s) => Some((s.signed_by, s.signer_type)),
-            ParsedEvent::Removal(r) => Some((r.signed_by, r.signer_type)),
-            ParsedEvent::KeyRotation(k) => Some((k.signed_by, k.signer_type)),
-            ParsedEvent::KeyRequest(k) => Some((k.signed_by, k.signer_type)),
-            ParsedEvent::FileSlice(f) => Some((f.signed_by, f.signer_type)),
-            ParsedEvent::Message(m) => Some((m.signed_by, m.signer_type)),
-            ParsedEvent::Reaction(r) => Some((r.signed_by, r.signer_type)),
-            ParsedEvent::MessageDeletion(d) => Some((d.signed_by, d.signer_type)),
-            ParsedEvent::File(a) => Some((a.signed_by, a.signer_type)),
-            ParsedEvent::Encrypted(_)
-            | ParsedEvent::KeySecret(_)
-            | ParsedEvent::Workspace(_)
-            | ParsedEvent::InviteAccepted(_)
-            | ParsedEvent::Tenant(_)
-            | ParsedEvent::BenchDep(_)
-            | ParsedEvent::PeerSecret(_)
-            | ParsedEvent::InviteSecret(_)
-            | ParsedEvent::EndpointSecret(_)
-            | ParsedEvent::EndpointShared(_) => None,
-        }
-    }
-
     /// Human-readable field descriptions for CLI display.
     pub fn human_fields(&self) -> Vec<(&'static str, String)> {
         match self {
             ParsedEvent::Message(e) => e.human_fields(),
             ParsedEvent::Reaction(e) => e.human_fields(),
+            ParsedEvent::Signed(e) => e.human_fields(),
             ParsedEvent::Encrypted(e) => e.human_fields(),
             ParsedEvent::KeySecret(e) => e.human_fields(),
             ParsedEvent::MessageDeletion(e) => e.human_fields(),
@@ -460,6 +419,9 @@ impl std::error::Error for EventError {}
 /// Extract created_at_ms from the common 9-byte prefix without full parsing.
 /// Returns None if blob is too short.
 pub fn extract_created_at_ms(blob: &[u8]) -> Option<u64> {
+    if blob.first().copied() == Some(EVENT_TYPE_SIGNED) {
+        return signed::outer_payload(blob).and_then(extract_created_at_ms);
+    }
     if blob.len() < 9 {
         return None;
     }
@@ -478,6 +440,7 @@ pub fn registry() -> &'static EventRegistry {
         EventRegistry::new(&[
             &message::MESSAGE_META,
             &reaction::REACTION_TYPE_META,
+            &signed::SIGNED_META,
             &encrypted::ENCRYPTED_META,
             &key_secret::KEY_SECRET_META,
             &message_deletion::MESSAGE_DELETION_META,
@@ -543,9 +506,6 @@ mod tests {
             created_at_ms: 500,
             public_key: [28u8; 32],
             username: "test-user".to_string(),
-            signed_by: [29u8; 32],
-            signer_type: 2,
-            signature: [30u8; 64],
         };
         let event = ParsedEvent::User(e);
         let blob = encode_event(&event).unwrap();
@@ -557,13 +517,13 @@ mod tests {
     #[test]
     fn test_registry_encryptable_coverage() {
         let reg = registry();
-        let encryptable_codes: Vec<u8> = (1..=34u8)
+        let encryptable_codes: Vec<u8> = (1..=35u8)
             .filter(|c| reg.lookup(*c).is_some_and(|m| m.encryptable))
             .collect();
         assert_eq!(encryptable_codes, vec![1, 2, 6, 7, 24, 25]);
 
         for code in [
-            5, 8, 9, 10, 12, 14, 16, 18, 22, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+            5, 8, 9, 10, 12, 14, 16, 18, 22, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
         ] {
             if let Some(meta) = reg.lookup(code) {
                 assert!(
@@ -582,7 +542,7 @@ mod tests {
     #[test]
     fn test_registry_transport_privacy_coverage() {
         let reg = registry();
-        let required_codes: Vec<u8> = (1..=34u8)
+        let required_codes: Vec<u8> = (1..=35u8)
             .filter(|c| {
                 reg.lookup(*c)
                     .is_some_and(|m| m.transport_privacy() == TransportPrivacy::RequireEncrypted)
@@ -598,7 +558,7 @@ mod tests {
         );
 
         for code in [
-            5, 8, 9, 10, 12, 14, 16, 18, 22, 26, 27, 28, 29, 30, 31, 32, 33, 34,
+            5, 8, 9, 10, 12, 14, 16, 18, 22, 26, 27, 28, 29, 30, 31, 32, 33, 34, 35,
         ] {
             if let Some(meta) = reg.lookup(code) {
                 assert_eq!(
@@ -610,15 +570,5 @@ mod tests {
                 );
             }
         }
-    }
-
-    #[test]
-    fn test_signer_fields_unsigned() {
-        let ws = ParsedEvent::Workspace(WorkspaceEvent {
-            created_at_ms: 100,
-            public_key: [0u8; 32],
-            name: "test-workspace".to_string(),
-        });
-        assert!(ws.signer_fields().is_none());
     }
 }

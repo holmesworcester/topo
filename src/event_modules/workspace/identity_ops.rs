@@ -337,14 +337,12 @@ fn ensure_rotation_for_key_frontier(
         frontier_ref_4: slots[3],
         frontier_hash,
         rotated_by: authoring.signer_event_id,
-        signed_by: authoring.signer_event_id,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
 
     Ok(create_signed_event_synchronous(
         conn,
         recorded_by,
+        &authoring.signer_event_id,
         &event,
         &authoring.signing_key,
     )?)
@@ -450,13 +448,11 @@ fn emit_key_shared_for_invite_target(
         recipient_event_id: *recipient_event_id,
         unwrap_key_event_id: *unwrap_key_event_id,
         wrapped_key: wrapped,
-        signed_by: *sender_peer_shared_event_id,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
     let created = event_id_or_blocked(create_signed_event_synchronous(
         conn,
         recorded_by,
+        sender_peer_shared_event_id,
         &event,
         sender_peer_shared_key,
     ))?;
@@ -754,6 +750,7 @@ pub(crate) fn store_invite_secret(
 fn create_invite_event_with_optional_bootstrap_context(
     conn: &Connection,
     recorded_by: &str,
+    signer_event_id: &EventId,
     event: &ParsedEvent,
     signer: &SigningKey,
     workspace_id: &EventId,
@@ -763,6 +760,7 @@ fn create_invite_event_with_optional_bootstrap_context(
         Ok(store_signed_event_then_project(
             conn,
             recorded_by,
+            signer_event_id,
             event,
             signer,
             |conn, event_id| {
@@ -785,6 +783,7 @@ fn create_invite_event_with_optional_bootstrap_context(
         Ok(create_signed_event_synchronous(
             conn,
             recorded_by,
+            signer_event_id,
             event,
             signer,
         )?)
@@ -807,7 +806,6 @@ pub(crate) fn create_user_invite_events_as_admin(
         admin_peer_shared_key,
         admin_peer_shared_event_id,
         admin_event_id,
-        5,
         workspace_id,
         Some(admin_peer_shared_key),
         Some(admin_peer_shared_event_id),
@@ -821,7 +819,6 @@ fn create_user_invite_events_with_signer(
     signer_key: &SigningKey,
     signer_event_id: &EventId,
     authority_event_id: &EventId,
-    signer_type: u8,
     workspace_id: &EventId,
     sender_peer_shared_key: Option<&SigningKey>,
     sender_peer_shared_event_id: Option<&EventId>,
@@ -836,14 +833,12 @@ fn create_user_invite_events_with_signer(
         public_key: invite_pub,
         workspace_id: *workspace_id,
         authority_event_id: *authority_event_id,
-        signed_by: *signer_event_id,
-        signer_type,
-        signature: [0u8; 64],
     });
 
     let invite_event_id = create_invite_event_with_optional_bootstrap_context(
         conn,
         recorded_by,
+        signer_event_id,
         &evt,
         signer_key,
         workspace_id,
@@ -886,7 +881,6 @@ pub(crate) fn create_device_link_invite_events_for_user(
         peer_shared_key,
         peer_shared_event_id,
         user_event_id,
-        5,
         user_event_id,
         workspace_id,
         bootstrap_ctx,
@@ -899,7 +893,6 @@ fn create_device_link_invite_events_with_signer(
     signer_key: &SigningKey,
     signer_event_id: &EventId,
     authority_event_id: &EventId,
-    signer_type: u8,
     user_event_id: &EventId,
     workspace_id: &EventId,
     bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
@@ -912,14 +905,12 @@ fn create_device_link_invite_events_with_signer(
         created_at_ms: current_timestamp_ms_u64(),
         public_key: device_invite_pub,
         authority_event_id: *authority_event_id,
-        signed_by: *signer_event_id,
-        signer_type,
-        signature: [0u8; 64],
     });
 
     let invite_event_id = create_invite_event_with_optional_bootstrap_context(
         conn,
         recorded_by,
+        signer_event_id,
         &evt,
         signer_key,
         workspace_id,

@@ -139,9 +139,6 @@ pub fn create(
         workspace_id: cmd.workspace_id,
         author_id: cmd.author_id,
         content: cmd.content,
-        signed_by: *signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
     let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)?;
     let eid = create_encrypted_event_synchronous(
@@ -149,7 +146,7 @@ pub fn create(
         recorded_by,
         &key_event_id,
         &msg,
-        Some(signing_key),
+        Some((signer_eid, signing_key)),
     )?;
     Ok(eid)
 }
@@ -206,9 +203,6 @@ pub fn create_deletion(
         created_at_ms,
         target_event_id: cmd.target_event_id,
         author_id: cmd.author_id,
-        signed_by: *signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
     let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)?;
     let eid = create_encrypted_event_synchronous(
@@ -216,7 +210,7 @@ pub fn create_deletion(
         recorded_by,
         &key_event_id,
         &del,
-        Some(signing_key),
+        Some((signer_eid, signing_key)),
     )?;
     Ok(eid)
 }
@@ -482,11 +476,8 @@ pub fn generate_files_for_peer(
                 key_event_id,
                 filename: format!("file-{}.bin", i),
                 mime_type: "application/octet-stream".to_string(),
-                signed_by: ctx.signer_event_id,
-                signer_type: 5,
-                signature: [0u8; 64],
             }),
-            Some(&ctx.signing_key),
+            Some((&ctx.signer_event_id, &ctx.signing_key)),
         )
         .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
             format!("create file error: {}", e).into()
@@ -502,11 +493,8 @@ pub fn generate_files_for_peer(
                     file_id,
                     slice_number: slice_number as u32,
                     ciphertext: ciphertext.clone(),
-                    signed_by: ctx.signer_event_id,
-                    signer_type: 5,
-                    signature: [0u8; 64],
                 }),
-                Some(&ctx.signing_key),
+                Some((&ctx.signer_event_id, &ctx.signing_key)),
             )
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("create file_slice error: {}", e).into()
@@ -664,11 +652,8 @@ pub fn send_file_for_peer(
             key_event_id,
             filename: filename.clone(),
             mime_type,
-            signed_by: ctx.signer_event_id,
-            signer_type: 5,
-            signature: [0u8; 64],
         }),
-        Some(&ctx.signing_key),
+        Some((&ctx.signer_event_id, &ctx.signing_key)),
     )?;
 
     let mut reader = BufReader::new(file);
@@ -687,11 +672,8 @@ pub fn send_file_for_peer(
                 file_id,
                 slice_number: slice_number as u32,
                 ciphertext,
-                signed_by: ctx.signer_event_id,
-                signer_type: 5,
-                signature: [0u8; 64],
             }),
-            Some(&ctx.signing_key),
+            Some((&ctx.signer_event_id, &ctx.signing_key)),
         )?;
     }
     for bad_idx in 0..add_bad_slices {
@@ -710,11 +692,8 @@ pub fn send_file_for_peer(
                 file_id,
                 slice_number,
                 ciphertext,
-                signed_by: ctx.signer_event_id,
-                signer_type: 5,
-                signature: [0u8; 64],
             }),
-            Some(&ctx.signing_key),
+            Some((&ctx.signer_event_id, &ctx.signing_key)),
         )?;
     }
     if remaining_bytes != 0 {

@@ -9,7 +9,6 @@ use super::key_repair::{
     emit_key_shared_responses_for_peers, seed_deterministic_key_secret, KeyResponsePolicy,
 };
 use super::planner_runner::PlannerSimulation;
-use super::query_snapshot::snapshot_replayed_peer;
 use super::virtual_daemon::VirtualDaemon;
 use crate::rpc::protocol::RpcMethod;
 
@@ -160,7 +159,7 @@ pub fn run_large_graph_sampled_decrypt_trial(
 
     for &sample in &samples {
         let peer = actual.get(&sample).expect("sample actual peer");
-        if snapshot_has_message_content(&peer.daemon, &peer.recorded_by, &config.message_content)? {
+        if daemon_has_message_content(&peer.daemon, &config.message_content)? {
             return Err(format!("sample {sample} decrypted before repair").into());
         }
     }
@@ -217,11 +216,7 @@ pub fn run_large_graph_sampled_decrypt_trial(
             let peer = actual
                 .get(&report.logical_peer)
                 .expect("sample actual peer for visibility");
-            if snapshot_has_message_content(
-                &peer.daemon,
-                &peer.recorded_by,
-                &config.message_content,
-            )? {
+            if daemon_has_message_content(&peer.daemon, &config.message_content)? {
                 report.decrypted = true;
                 report.first_visible_round =
                     Some(max_message_distance + max_holder_distance + response_round);
@@ -250,15 +245,8 @@ pub fn run_large_graph_sampled_decrypt_trial(
     })
 }
 
-fn snapshot_has_message_content(
-    daemon: &VirtualDaemon,
-    recorded_by: &str,
-    content: &str,
-) -> SimResult<bool> {
-    let snapshot = snapshot_replayed_peer(daemon.db_path(), recorded_by)?;
-    let messages = snapshot
-        .daemon()
-        .call_ok_value(RpcMethod::Messages { limit: 100 })?;
+fn daemon_has_message_content(daemon: &VirtualDaemon, content: &str) -> SimResult<bool> {
+    let messages = daemon.call_ok_value(RpcMethod::Messages { limit: 100 })?;
     Ok(messages["messages"]
         .as_array()
         .expect("messages array")

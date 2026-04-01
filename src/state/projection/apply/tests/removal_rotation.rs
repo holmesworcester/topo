@@ -27,12 +27,8 @@ fn make_signed_removal(
         parent_4: slots[3],
         frontier_hash: frontier_hash_override.unwrap_or_else(|| frontier_hash_from_refs(parents)),
         removed_by: *signer_eid,
-        signed_by: *signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let mut blob = events::encode_event(&event).unwrap();
-    sign_blob(signing_key, &mut blob);
+    let blob = sign_blob(signing_key, signer_eid, &event);
     let parsed = events::parse_event(&blob).unwrap();
     (parsed, blob)
 }
@@ -62,12 +58,8 @@ fn make_signed_key_rotation(
         frontier_ref_4: slots[3],
         frontier_hash: frontier_hash_override.unwrap_or_else(|| frontier_hash_from_refs(frontier)),
         rotated_by: *signer_eid,
-        signed_by: *signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let mut blob = events::encode_event(&event).unwrap();
-    sign_blob(signing_key, &mut blob);
+    let blob = sign_blob(signing_key, signer_eid, &event);
     let parsed = events::parse_event(&blob).unwrap();
     (parsed, blob)
 }

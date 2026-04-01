@@ -19,6 +19,7 @@ use topo::event_modules::{
 };
 use topo::projection::apply::project_one;
 use topo::projection::create::create_encrypted_event_synchronous;
+use topo::projection::create::create_signed_event_synchronous;
 use topo::projection::signer::sign_event_bytes;
 
 fn now_ms() -> u64 {
@@ -92,23 +93,13 @@ fn sign_blob(key: &SigningKey, blob: &mut Vec<u8>) {
     blob[len - 64..].copy_from_slice(&sig);
 }
 
-/// Bootstrap a full identity chain: Workspace → InviteAccepted → UserInvite →
-/// User → DeviceInvite → PeerShared. Returns
-/// (peer_shared_eid, signing_key, user_event_id, workspace_id).
+/// Bootstrap a minimal workspace bootstrap path. Returns
+/// (peer_shared_id, peer_shared_key, user_id, workspace_id).
 fn make_identity_chain(
     conn: &Connection,
     recorded_by: &str,
 ) -> (EventId, SigningKey, EventId, EventId) {
     let mut rng = rand::thread_rng();
-
-    let peer_key = SigningKey::generate(&mut rng);
-    let tenant = ParsedEvent::Tenant(TenantEvent {
-        created_at_ms: now_ms(),
-        public_key: peer_key.verifying_key().to_bytes(),
-    });
-    let tenant_blob = events::encode_event(&tenant).unwrap();
-    let tenant_eid = insert_event_raw(conn, recorded_by, &tenant_blob, None);
-    project_one(conn, recorded_by, &tenant_eid).unwrap();
 
     let workspace_key = SigningKey::generate(&mut rng);
     let net = ParsedEvent::Workspace(WorkspaceEvent {
@@ -117,63 +108,20 @@ fn make_identity_chain(
         name: "bench".to_string(),
     });
     let net_blob = events::encode_event(&net).unwrap();
-    let net_eid = insert_event_raw(conn, recorded_by, &net_blob, None);
+    let net_eid = hash_event(&net_blob);
+    let workspace_id_b64 = event_id_to_base64(&net_eid);
+    let net_eid = insert_event_raw(conn, recorded_by, &net_blob, Some(&workspace_id_b64));
     let workspace_id = net_eid;
-    let workspace_id_b64 = event_id_to_base64(&workspace_id);
-
-    let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-        created_at_ms: now_ms(),
-        tenant_event_id: tenant_eid,
-        invite_event_id: net_eid,
-        workspace_id,
-    });
-    let ia_blob = events::encode_event(&ia).unwrap();
-    let ia_eid = insert_event_raw(conn, recorded_by, &ia_blob, None);
-    project_one(conn, recorded_by, &ia_eid).unwrap();
-    project_one(conn, recorded_by, &net_eid).unwrap();
-
-    let invite_key = SigningKey::generate(&mut rng);
-    let uib = ParsedEvent::UserInvite(UserInviteEvent {
-        created_at_ms: now_ms(),
-        public_key: invite_key.verifying_key().to_bytes(),
-        workspace_id,
-        authority_event_id: workspace_id,
-        signed_by: net_eid,
-        signer_type: 1,
-        signature: [0u8; 64],
-    });
-    let mut uib_blob = events::encode_event(&uib).unwrap();
-    sign_blob(&workspace_key, &mut uib_blob);
-    let uib_eid = insert_event_raw(conn, recorded_by, &uib_blob, Some(&workspace_id_b64));
-    project_one(conn, recorded_by, &uib_eid).unwrap();
 
     let user_key = SigningKey::generate(&mut rng);
     let ub = ParsedEvent::User(UserEvent {
         created_at_ms: now_ms(),
         public_key: user_key.verifying_key().to_bytes(),
         username: "bench-user".to_string(),
-        signed_by: uib_eid,
-        signer_type: 2,
-        signature: [0u8; 64],
     });
-    let mut ub_blob = events::encode_event(&ub).unwrap();
-    sign_blob(&invite_key, &mut ub_blob);
+    let ub_blob = events::encode_event(&ub).unwrap();
     let ub_eid = insert_event_raw(conn, recorded_by, &ub_blob, Some(&workspace_id_b64));
     project_one(conn, recorded_by, &ub_eid).unwrap();
-
-    let device_invite_key = SigningKey::generate(&mut rng);
-    let dif = ParsedEvent::DeviceInvite(DeviceInviteEvent {
-        created_at_ms: now_ms(),
-        public_key: device_invite_key.verifying_key().to_bytes(),
-        authority_event_id: ub_eid,
-        signed_by: ub_eid,
-        signer_type: 4,
-        signature: [0u8; 64],
-    });
-    let mut dif_blob = events::encode_event(&dif).unwrap();
-    sign_blob(&user_key, &mut dif_blob);
-    let dif_eid = insert_event_raw(conn, recorded_by, &dif_blob, Some(&workspace_id_b64));
-    project_one(conn, recorded_by, &dif_eid).unwrap();
 
     let endpoint_key = SigningKey::generate(&mut rng);
     let endpoint_event = topo::event_modules::endpoint_shared::deterministic_endpoint_shared_event(
@@ -181,7 +129,8 @@ fn make_identity_chain(
     );
     let endpoint_id = hex::encode(endpoint_key.verifying_key().to_bytes());
     let endpoint_blob = events::encode_event(&endpoint_event).unwrap();
-    let endpoint_eid = insert_event_raw(conn, &endpoint_id, &endpoint_blob, None);
+    let endpoint_eid =
+        insert_event_raw(conn, &endpoint_id, &endpoint_blob, Some(&workspace_id_b64));
     project_one(conn, &endpoint_id, &endpoint_eid).unwrap();
 
     let peer_shared_key = SigningKey::generate(&mut rng);
@@ -191,12 +140,8 @@ fn make_identity_chain(
         user_event_id: ub_eid,
         endpoint_shared_event_id: endpoint_eid,
         device_name: "bench-device".to_string(),
-        signed_by: dif_eid,
-        signer_type: 3,
-        signature: [0u8; 64],
     });
-    let mut psf_blob = events::encode_event(&psf).unwrap();
-    sign_blob(&device_invite_key, &mut psf_blob);
+    let psf_blob = events::encode_event(&psf).unwrap();
     let psf_eid = insert_event_raw(conn, recorded_by, &psf_blob, Some(&workspace_id_b64));
     project_one(conn, recorded_by, &psf_eid).unwrap();
 
@@ -205,7 +150,7 @@ fn make_identity_chain(
 
 /// Create prerequisite events (identity chain, signed message, secret key) and return IDs + signing key.
 fn create_prereqs(conn: &Connection, recorded_by: &str) -> (EventId, EventId, EventId, SigningKey) {
-    let (signer_eid, signing_key, user_event_id, workspace_id) =
+    let (signer_eid, signing_key, _user_event_id, workspace_id) =
         make_identity_chain(conn, recorded_by);
 
     // Secret key (for attachment key_event_id dep)
@@ -225,13 +170,10 @@ fn create_prereqs(conn: &Connection, recorded_by: &str) -> (EventId, EventId, Ev
         &ParsedEvent::Message(MessageEvent {
             created_at_ms: now_ms(),
             workspace_id,
-            author_id: user_event_id,
+            author_id: signer_eid,
             content: "file parent".to_string(),
-            signed_by: signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64],
         }),
-        Some(&signing_key),
+        Some((&signer_eid, &signing_key)),
     )
     .unwrap();
 
@@ -266,11 +208,8 @@ fn run_file_throughput(file_size_bytes: usize) {
             key_event_id: sk_eid,
             filename: "bench.bin".to_string(),
             mime_type: "application/octet-stream".to_string(),
-            signed_by: signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64],
         }),
-        Some(&signing_key),
+        Some((&signer_eid, &signing_key)),
     )
     .unwrap();
 
@@ -290,11 +229,8 @@ fn run_file_throughput(file_size_bytes: usize) {
                 file_id,
                 slice_number: i,
                 ciphertext: ciphertext_template.clone(),
-                signed_by: signer_eid,
-                signer_type: 5,
-                signature: [0u8; 64],
             }),
-            Some(&signing_key),
+            Some((&signer_eid, &signing_key)),
         )
         .unwrap_or_else(|err| panic!("slice {} failed: {:?}", i, err));
     }

@@ -18,9 +18,6 @@ mod tests {
             created_at_ms: 9000,
             public_key,
             authority_event_id: [3u8; 32],
-            signed_by: [3u8; 32],
-            signer_type: 4,
-            signature: [0u8; 64],
         })
     }
 

@@ -11,21 +11,18 @@ mod tests {
     use crate::harness::fixtures::*;
     use topo::event_modules::file_slice::project_pure;
     use topo::event_modules::file_slice::FileSliceEvent;
-    use topo::event_modules::ParsedEvent;
+    use topo::event_modules::{ParsedEvent, EVENT_TYPE_FILE_SLICE};
     use topo::projection::contract::{EmitCommand, FileDescriptorInfo};
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "fs_event_1";
 
-    fn make_file_slice(file_id: [u8; 32], signed_by: [u8; 32]) -> ParsedEvent {
+    fn make_file_slice(file_id: [u8; 32]) -> ParsedEvent {
         ParsedEvent::FileSlice(FileSliceEvent {
             created_at_ms: 7000,
             file_id,
             slice_number: 0,
             ciphertext: vec![0u8; 262144],
-            signed_by,
-            signer_type: 5,
-            signature: [0u8; 64],
         })
     }
 
@@ -33,8 +30,12 @@ mod tests {
 
     #[test]
     fn test_file_slice_blocks_no_descriptor() {
-        let parsed = make_file_slice([1u8; 32], [3u8; 32]);
-        let ctx = empty_ctx(); // no file_descriptors
+        let parsed = make_file_slice([1u8; 32]);
+        let mut ctx = empty_ctx(); // no file_descriptors
+        ctx.current_signer = Some(topo::projection::contract::CurrentSignerInfo {
+            event_id: b64(&[3u8; 32]),
+            semantic_type_code: EVENT_TYPE_FILE_SLICE,
+        });
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_block(&result);
@@ -49,7 +50,7 @@ mod tests {
 
     #[test]
     fn test_file_slice_skips_when_file_graph_deleted() {
-        let parsed = make_file_slice([1u8; 32], [3u8; 32]);
+        let parsed = make_file_slice([1u8; 32]);
         let root_message = b64(&[9u8; 32]);
         let ctx = ctx_with_deleted_file_message(&root_message);
 
@@ -81,12 +82,16 @@ mod tests {
     fn test_file_slice_valid() {
         let signer = [3u8; 32];
         let signer_b64 = b64(&signer);
-        let parsed = make_file_slice([1u8; 32], signer);
-        let ctx = ctx_with_file_descriptors(vec![FileDescriptorInfo {
+        let parsed = make_file_slice([1u8; 32]);
+        let mut ctx = ctx_with_file_descriptors(vec![FileDescriptorInfo {
             event_id: "desc_1".to_string(),
             signer_event_id: signer_b64,
             key_event_id: "key_1".to_string(),
         }]);
+        ctx.current_signer = Some(topo::projection::contract::CurrentSignerInfo {
+            event_id: b64(&signer),
+            semantic_type_code: EVENT_TYPE_FILE_SLICE,
+        });
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
@@ -97,14 +102,17 @@ mod tests {
 
     #[test]
     fn test_file_slice_rejects_signer_mismatch() {
-        let signer = [3u8; 32];
         let different_signer_b64 = b64(&[99u8; 32]);
-        let parsed = make_file_slice([1u8; 32], signer);
-        let ctx = ctx_with_file_descriptors(vec![FileDescriptorInfo {
+        let parsed = make_file_slice([1u8; 32]);
+        let mut ctx = ctx_with_file_descriptors(vec![FileDescriptorInfo {
             event_id: "desc_1".to_string(),
             signer_event_id: different_signer_b64,
             key_event_id: "key_1".to_string(),
         }]);
+        ctx.current_signer = Some(topo::projection::contract::CurrentSignerInfo {
+            event_id: b64(&[3u8; 32]),
+            semantic_type_code: EVENT_TYPE_FILE_SLICE,
+        });
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_reject_contains(&result, "does not match file descriptor signer");
@@ -114,13 +122,17 @@ mod tests {
     fn test_file_slice_rejects_wrapper_key_mismatch() {
         let signer = [3u8; 32];
         let signer_b64 = b64(&signer);
-        let parsed = make_file_slice([1u8; 32], signer);
+        let parsed = make_file_slice([1u8; 32]);
         let ctx = topo::projection::contract::ContextSnapshot {
             file_descriptors: vec![FileDescriptorInfo {
                 event_id: "desc_1".to_string(),
                 signer_event_id: signer_b64,
                 key_event_id: "key_expected".to_string(),
             }],
+            current_signer: Some(topo::projection::contract::CurrentSignerInfo {
+                event_id: b64(&signer),
+                semantic_type_code: EVENT_TYPE_FILE_SLICE,
+            }),
             current_transport_key_event_id: Some("key_other".to_string()),
             ..Default::default()
         };
@@ -135,13 +147,17 @@ mod tests {
     fn test_file_slice_rejects_slot_conflict() {
         let signer = [3u8; 32];
         let signer_b64 = b64(&signer);
-        let parsed = make_file_slice([1u8; 32], signer);
+        let parsed = make_file_slice([1u8; 32]);
         let ctx = topo::projection::contract::ContextSnapshot {
             file_descriptors: vec![FileDescriptorInfo {
                 event_id: "desc_1".to_string(),
                 signer_event_id: signer_b64,
                 key_event_id: "key_1".to_string(),
             }],
+            current_signer: Some(topo::projection::contract::CurrentSignerInfo {
+                event_id: b64(&signer),
+                semantic_type_code: EVENT_TYPE_FILE_SLICE,
+            }),
             existing_file_slice: Some(("other_event".to_string(), "desc_1".to_string())),
             ..Default::default()
         };
@@ -156,13 +172,17 @@ mod tests {
     fn test_file_slice_idempotent_replay() {
         let signer = [3u8; 32];
         let signer_b64 = b64(&signer);
-        let parsed = make_file_slice([1u8; 32], signer);
+        let parsed = make_file_slice([1u8; 32]);
         let ctx = topo::projection::contract::ContextSnapshot {
             file_descriptors: vec![FileDescriptorInfo {
                 event_id: "desc_1".to_string(),
                 signer_event_id: signer_b64,
                 key_event_id: "key_1".to_string(),
             }],
+            current_signer: Some(topo::projection::contract::CurrentSignerInfo {
+                event_id: b64(&signer),
+                semantic_type_code: EVENT_TYPE_FILE_SLICE,
+            }),
             existing_file_slice: Some((EVENT_ID.to_string(), "desc_1".to_string())),
             ..Default::default()
         };

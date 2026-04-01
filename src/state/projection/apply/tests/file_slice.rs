@@ -497,13 +497,9 @@ fn test_file_slice_wrong_signer_rejected() {
         public_key: invite_pub,
         workspace_id: net_eid,
         authority_event_id: net_eid,
-        signed_by: net_eid,
-        signer_type: 1,
-        signature: [0u8; 64],
     };
     let uib_event = ParsedEvent::UserInvite(uib);
-    let mut uib_blob = events::encode_event(&uib_event).unwrap();
-    sign_blob(&workspace_key, &mut uib_blob);
+    let uib_blob = sign_blob(&workspace_key, &net_eid, &uib_event);
     let uib_eid = insert_event_raw(&conn, recorded_by, &uib_blob);
     project_one(&conn, recorded_by, &uib_eid).unwrap();
 
@@ -514,13 +510,9 @@ fn test_file_slice_wrong_signer_rejected() {
         created_at_ms: now_ms(),
         public_key: user_pub,
         username: "user".to_string(),
-        signed_by: uib_eid,
-        signer_type: 2,
-        signature: [0u8; 64],
     };
     let ub_event = ParsedEvent::User(ub);
-    let mut ub_blob = events::encode_event(&ub_event).unwrap();
-    sign_blob(&invite_key, &mut ub_blob);
+    let ub_blob = sign_blob(&invite_key, &uib_eid, &ub_event);
     let ub_eid = insert_event_raw(&conn, recorded_by, &ub_blob);
     project_one(&conn, recorded_by, &ub_eid).unwrap();
 
@@ -531,13 +523,9 @@ fn test_file_slice_wrong_signer_rejected() {
         created_at_ms: now_ms(),
         public_key: device_invite_pub_a,
         authority_event_id: ub_eid,
-        signed_by: ub_eid,
-        signer_type: 4,
-        signature: [0u8; 64],
     };
     let dif_a_event = ParsedEvent::DeviceInvite(dif_a);
-    let mut dif_a_blob = events::encode_event(&dif_a_event).unwrap();
-    sign_blob(&user_key, &mut dif_a_blob);
+    let dif_a_blob = sign_blob(&user_key, &ub_eid, &dif_a_event);
     let dif_a_eid = insert_event_raw(&conn, recorded_by, &dif_a_blob);
     project_one(&conn, recorded_by, &dif_a_eid).unwrap();
 
@@ -552,13 +540,9 @@ fn test_file_slice_wrong_signer_rejected() {
         user_event_id: ub_eid,
         endpoint_shared_event_id,
         device_name: "device-a".to_string(),
-        signed_by: dif_a_eid,
-        signer_type: 3,
-        signature: [0u8; 64],
     };
     let psf_a_event = ParsedEvent::PeerShared(psf_a);
-    let mut psf_a_blob = events::encode_event(&psf_a_event).unwrap();
-    sign_blob(&device_invite_key_a, &mut psf_a_blob);
+    let psf_a_blob = sign_blob(&device_invite_key_a, &dif_a_eid, &psf_a_event);
     let signer_a_eid = insert_event_raw(&conn, recorded_by, &psf_a_blob);
     project_one(&conn, recorded_by, &signer_a_eid).unwrap();
     register_signer_user(signer_a_eid, ub_eid);
@@ -570,13 +554,9 @@ fn test_file_slice_wrong_signer_rejected() {
         created_at_ms: now_ms(),
         public_key: device_invite_pub_b,
         authority_event_id: ub_eid,
-        signed_by: ub_eid,
-        signer_type: 4,
-        signature: [0u8; 64],
     };
     let dif_b_event = ParsedEvent::DeviceInvite(dif_b);
-    let mut dif_b_blob = events::encode_event(&dif_b_event).unwrap();
-    sign_blob(&user_key, &mut dif_b_blob);
+    let dif_b_blob = sign_blob(&user_key, &ub_eid, &dif_b_event);
     let dif_b_eid = insert_event_raw(&conn, recorded_by, &dif_b_blob);
     project_one(&conn, recorded_by, &dif_b_eid).unwrap();
 
@@ -589,13 +569,9 @@ fn test_file_slice_wrong_signer_rejected() {
         user_event_id: ub_eid,
         endpoint_shared_event_id,
         device_name: "device-b".to_string(),
-        signed_by: dif_b_eid,
-        signer_type: 3,
-        signature: [0u8; 64],
     };
     let psf_b_event = ParsedEvent::PeerShared(psf_b);
-    let mut psf_b_blob = events::encode_event(&psf_b_event).unwrap();
-    sign_blob(&device_invite_key_b, &mut psf_b_blob);
+    let psf_b_blob = sign_blob(&device_invite_key_b, &dif_b_eid, &psf_b_event);
     let signer_b_eid = insert_event_raw(&conn, recorded_by, &psf_b_blob);
     project_one(&conn, recorded_by, &signer_b_eid).unwrap();
     register_signer_user(signer_b_eid, ub_eid);

@@ -1,6 +1,7 @@
 use std::collections::BTreeMap;
 use std::path::Path;
 
+use rusqlite::OptionalExtension;
 use tempfile::TempDir;
 
 use crate::state::db::transport_creds::{load_local_creds, resolve_tenant_transport_target};
@@ -96,6 +97,8 @@ pub fn snapshot_peer_db_to_path(
     let copy_result = (|| -> BridgeResult<()> {
         copy_known_event_store(&source, &dest, recorded_by)?;
         copy_shared_event_index(&source, &dest, recorded_by)?;
+        copy_endpoint_shared_rows(&source, &dest)?;
+        copy_key_secrets(&source, &dest, recorded_by)?;
         copy_invite_secrets(&source, &dest, recorded_by)?;
         copy_peer_secrets(&source, &dest, recorded_by)?;
         copy_bootstrap_context(&source, &dest, recorded_by)?;
@@ -295,6 +298,45 @@ fn copy_shared_event_index(
     })?;
     for row in rows {
         let (workspace_id, ts, id) = row?;
+        let mut event_id_bytes = [0u8; 32];
+        if id.len() != event_id_bytes.len() {
+            continue;
+        }
+        event_id_bytes.copy_from_slice(&id);
+        let event_id = crate::crypto::event_id_to_base64(&event_id_bytes);
+        let Some((event_type, blob, share_scope, created_at, inserted_at)) = source
+            .query_row(
+                "SELECT event_type, blob, share_scope, created_at, inserted_at
+                 FROM events
+                 WHERE event_id = ?1",
+                rusqlite::params![&event_id],
+                |row| {
+                    Ok((
+                        row.get::<_, String>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, String>(2)?,
+                        row.get::<_, i64>(3)?,
+                        row.get::<_, i64>(4)?,
+                    ))
+                },
+            )
+            .optional()?
+        else {
+            continue;
+        };
+        dest.execute(
+            "INSERT OR IGNORE INTO events
+             (event_id, event_type, blob, share_scope, created_at, inserted_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                event_id,
+                event_type,
+                blob,
+                share_scope,
+                created_at,
+                inserted_at
+            ],
+        )?;
         dest.execute(
             "INSERT OR IGNORE INTO shared_event_index (workspace_id, ts, id)
              VALUES (?1, ?2, ?3)",
@@ -337,6 +379,67 @@ fn copy_invite_secrets(
                 private_key,
                 created_at
             ],
+        )?;
+    }
+    Ok(())
+}
+
+fn copy_endpoint_shared_rows(
+    source: &rusqlite::Connection,
+    dest: &rusqlite::Connection,
+) -> Result<(), rusqlite::Error> {
+    let mut stmt = source.prepare(
+        "SELECT recorded_by, event_id, endpoint_id, public_key, created_at
+         FROM endpoints_shared
+         ORDER BY created_at ASC, event_id ASC",
+    )?;
+    let rows = stmt.query_map([], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, String>(1)?,
+            row.get::<_, String>(2)?,
+            row.get::<_, Vec<u8>>(3)?,
+            row.get::<_, i64>(4)?,
+        ))
+    })?;
+    for row in rows {
+        let (recorded_by, event_id, endpoint_id, public_key, created_at) = row?;
+        dest.execute(
+            "INSERT OR IGNORE INTO endpoints_shared
+             (recorded_by, event_id, endpoint_id, public_key, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![recorded_by, event_id, endpoint_id, public_key, created_at],
+        )?;
+    }
+    Ok(())
+}
+
+fn copy_key_secrets(
+    source: &rusqlite::Connection,
+    dest: &rusqlite::Connection,
+    recorded_by: &str,
+) -> Result<(), rusqlite::Error> {
+    let mut stmt = source.prepare(
+        "SELECT event_id, key_bytes, created_at, recorded_by
+         FROM key_secrets
+         WHERE recorded_by = ?1
+         ORDER BY created_at ASC, event_id ASC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
+        Ok((
+            row.get::<_, String>(0)?,
+            row.get::<_, Vec<u8>>(1)?,
+            row.get::<_, i64>(2)?,
+            row.get::<_, String>(3)?,
+        ))
+    })?;
+    for row in rows {
+        let (event_id, key_bytes, created_at, recorded_by) = row?;
+        dest.execute(
+            "INSERT OR IGNORE INTO key_secrets
+             (event_id, key_bytes, created_at, recorded_by)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![event_id, key_bytes, created_at, recorded_by],
         )?;
     }
     Ok(())
@@ -549,8 +652,27 @@ fn replay_recorded_events_into_projection(
     for _ in 0..MAX_DRAIN_PASSES {
         let drained = crate::event_pipeline::drain_project_queue(dest_db_path, recorded_by, 1000);
         if drained == 0 {
-            return Ok(());
+            break;
         }
+    }
+
+    if let Some(workspace_id) = crate::db::store::lookup_workspace_id(dest, recorded_by)
+        .and_then(|workspace_id| crate::crypto::event_id_from_base64(&workspace_id))
+    {
+        let _ = crate::event_modules::workspace::commands::replay_existing_workspace_shared_events_for_tenant(
+            dest,
+            recorded_by,
+            &workspace_id,
+        )?;
+        for _ in 0..MAX_DRAIN_PASSES {
+            let drained =
+                crate::event_pipeline::drain_project_queue(dest_db_path, recorded_by, 1000);
+            if drained == 0 {
+                return Ok(());
+            }
+        }
+    } else {
+        return Ok(());
     }
 
     Err(format!(

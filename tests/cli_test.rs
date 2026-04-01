@@ -4376,9 +4376,9 @@ fn test_cli_event_list_shows_all_events() {
         "event-list should show workspace event, got:\n{}",
         stdout
     );
-    // Should show dep references with parenthesized IDs.
+    // Should show dependency references with labeled fields and parenthesized ids.
     assert!(
-        stdout.contains("signed_by:"),
+        stdout.contains("deps:") && stdout.contains("(") && stdout.contains(")"),
         "event-list should show dep fields, got:\n{}",
         stdout
     );
@@ -4465,10 +4465,12 @@ fn test_cli_event_tree_cross_refs_shown() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
 
-    // peer_shared has two deps (user_event_id + signed_by);
-    // the tree parent is user_event_id, so signed_by should appear as a cross-ref.
+    // peer_shared has multiple deps; the tree parent is user_event_id, so at
+    // least one remaining dep should appear as a cross-ref annotation.
     let has_cross_ref = stdout.lines().any(|line| {
-        line.contains("peer_shared") && line.contains("[") && line.contains("signed_by:")
+        line.contains("peer_shared")
+            && line.contains("[")
+            && (line.contains("signer_event_id:") || line.contains("signed_by:"))
     });
     assert!(
         has_cross_ref,

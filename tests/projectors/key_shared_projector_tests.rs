@@ -35,9 +35,6 @@ mod tests {
             recipient_event_id: [2u8; 32],
             unwrap_key_event_id: [3u8; 32],
             wrapped_key: [3u8; 32],
-            signed_by: [4u8; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
         })
     }
 

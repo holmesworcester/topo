@@ -40,7 +40,10 @@ pub fn project_pure(
     }
 
     let file_id_b64 = event_id_to_base64(&fs.file_id);
-    let slice_signer_b64 = event_id_to_base64(&fs.signed_by);
+    let Some(current_signer) = ctx.current_signer.as_ref() else {
+        return ProjectorResult::reject("file_slice missing current signer envelope".to_string());
+    };
+    let slice_signer_b64 = current_signer.event_id.clone();
 
     if ctx.file_descriptors.is_empty() {
         // No descriptor yet — guard-block

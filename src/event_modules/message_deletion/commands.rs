@@ -23,9 +23,6 @@ pub fn create(
         created_at_ms,
         target_event_id: cmd.target_event_id,
         author_id: cmd.author_id,
-        signed_by: *signer_eid,
-        signer_type: 5,
-        signature: [0u8; 64],
     });
     let key_event_id =
         super::super::workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)?;
@@ -34,7 +31,7 @@ pub fn create(
         recorded_by,
         &key_event_id,
         &del,
-        Some(signing_key),
+        Some((signer_eid, signing_key)),
     )?;
     Ok(eid)
 }

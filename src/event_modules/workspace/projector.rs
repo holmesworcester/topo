@@ -1,9 +1,10 @@
 use crate::event_modules::ParsedEvent;
 use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::queries::{ContextLoadResult, ProjectionQueries};
+use crate::projection::queries::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 pub fn build_projector_context(
     queries: &dyn ProjectionQueries,
+    frame: &ProjectionFrameContext,
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
@@ -13,7 +14,7 @@ pub fn build_projector_context(
         _ => return Err("workspace context loader called for non-workspace event".into()),
     };
 
-    let ctx = queries.load_workspace_context(recorded_by, event_id_b64, workspace)?;
+    let ctx = queries.load_workspace_context(frame, recorded_by, event_id_b64, workspace)?;
     match &ctx.accepted_workspace_id {
         None => Ok(ContextLoadResult::block(vec![])),
         Some(anchor_wid) if anchor_wid == event_id_b64 => Ok(ContextLoadResult::ready(ctx)),

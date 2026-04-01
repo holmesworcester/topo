@@ -403,6 +403,30 @@ fn load_file_slice_payload(
     ) -> Result<Vec<u8>, Box<dyn std::error::Error + Send + Sync>> {
         match parsed {
             ParsedEvent::FileSlice(fs) => Ok(fs.ciphertext),
+            ParsedEvent::Signed(signed) => {
+                let inner = parse_event(&signed.payload).map_err(|e| {
+                    format!(
+                        "parse signed payload for slice {}: {}",
+                        slice_event_id_b64, e
+                    )
+                })?;
+                if inner.event_type_code() != signed.inner_type_code {
+                    return Err(format!(
+                        "slice event {} inner type mismatch: signed wrapper declares {} but payload is {}",
+                        slice_event_id_b64,
+                        signed.inner_type_code,
+                        inner.event_type_code()
+                    )
+                    .into());
+                }
+                load_from_parsed(
+                    db,
+                    recorded_by,
+                    slice_event_id_b64,
+                    expected_key_event_id_b64,
+                    inner,
+                )
+            }
             ParsedEvent::Encrypted(enc) => {
                 let key_event_id_b64 = event_id_to_base64(&enc.key_event_id);
                 if key_event_id_b64 != expected_key_event_id_b64 {
@@ -472,7 +496,6 @@ fn load_file_slice_payload(
         rusqlite::params![slice_event_id_b64],
         |row| row.get(0),
     )?;
-
     let parsed =
         parse_event(&blob).map_err(|e| format!("parse event {}: {}", slice_event_id_b64, e))?;
     load_from_parsed(
@@ -695,24 +718,23 @@ mod tests {
         wrapper_key_event_id: EventId,
         key_bytes: [u8; 32],
         file_id: EventId,
+        slice_number: i64,
+        created_at_ms: i64,
         payload: &[u8],
     ) -> String {
         let mut ciphertext = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
         ciphertext[..payload.len()].copy_from_slice(payload);
         let inner = ParsedEvent::FileSlice(FileSliceEvent {
-            created_at_ms: 1000,
+            created_at_ms: created_at_ms as u64,
             file_id,
-            slice_number: 0,
+            slice_number: slice_number as u32,
             ciphertext,
-            signed_by: [8u8; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
         });
         let inner_blob = encode_event(&inner).unwrap();
         let (nonce, ciphertext, auth_tag) =
             crate::crypto::encrypt_event_blob(&key_bytes, &inner_blob).unwrap();
         let outer = ParsedEvent::Encrypted(EncryptedEvent {
-            created_at_ms: 1001,
+            created_at_ms: created_at_ms as u64,
             key_event_id: wrapper_key_event_id,
             inner_type_code: crate::event_modules::EVENT_TYPE_FILE_SLICE,
             nonce,
@@ -724,7 +746,14 @@ mod tests {
         db.execute(
             "INSERT INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-            rusqlite::params![&event_id_b64, "encrypted", blob, "shared", 1001i64, 1001i64],
+            rusqlite::params![
+                &event_id_b64,
+                "encrypted",
+                blob,
+                "shared",
+                created_at_ms,
+                created_at_ms
+            ],
         )
         .unwrap();
         event_id_b64
@@ -776,36 +805,73 @@ mod tests {
     #[test]
     fn test_slices_received_counts_correctly() {
         let db = setup_db();
+        let recorded_by = "peer1";
+        let file_id = [1u8; 32];
+        let file_id_b64 = event_id_to_base64(&file_id);
+        let key_event_id = [2u8; 32];
+        let key_bytes = [3u8; 32];
+        let key_event_id_b64 = insert_key_secret_row(&db, recorded_by, key_event_id, key_bytes);
         db.execute(
             "INSERT INTO files
              (recorded_by, event_id, message_id, file_id, blob_bytes, total_slices, slice_bytes, root_hash, key_event_id, filename, mime_type, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
-            rusqlite::params!["peer1", "evt1", "msg1", "file1", 524288, 2, 262144, &[0u8; 32] as &[u8], "key1", "big.bin", "application/octet-stream", 1000],
+            rusqlite::params![
+                recorded_by,
+                "evt1",
+                "msg1",
+                &file_id_b64,
+                524288,
+                2,
+                262144,
+                &[0u8; 32] as &[u8],
+                &key_event_id_b64,
+                "big.bin",
+                "application/octet-stream",
+                1000
+            ],
         ).unwrap();
-        // Insert 1 of 2 slices
+        let slice_evt1 = insert_encrypted_slice_event(
+            &db,
+            key_event_id,
+            key_bytes,
+            file_id,
+            0,
+            1001,
+            &[11u8; 262144],
+        );
         db.execute(
-            "INSERT INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["peer1", "file1", 0, "slice_evt1", 1001],
+            "INSERT INTO file_slices
+             (recorded_by, file_id, slice_number, event_id, created_at, descriptor_event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![recorded_by, &file_id_b64, 0, &slice_evt1, 1001, "evt1"],
         )
         .unwrap();
 
-        let result = list_for_message(&db, "peer1", "msg1").unwrap();
+        let result = list_for_message(&db, recorded_by, "msg1").unwrap();
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].total_slices, 2);
         assert_eq!(result[0].slices_received, 1);
         assert_eq!(result[0].downloaded_bytes, 262144);
         assert_eq!(result[0].download_rate_mib_s, None);
 
-        // Insert second slice
+        let slice_evt2 = insert_encrypted_slice_event(
+            &db,
+            key_event_id,
+            key_bytes,
+            file_id,
+            1,
+            1002,
+            &[12u8; 262144],
+        );
         db.execute(
-            "INSERT INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["peer1", "file1", 1, "slice_evt2", 1002],
+            "INSERT INTO file_slices
+             (recorded_by, file_id, slice_number, event_id, created_at, descriptor_event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![recorded_by, &file_id_b64, 1, &slice_evt2, 1002, "evt1"],
         )
         .unwrap();
 
-        let result = list_for_message(&db, "peer1", "msg1").unwrap();
+        let result = list_for_message(&db, recorded_by, "msg1").unwrap();
         assert_eq!(result[0].slices_received, 2);
         assert_eq!(result[0].downloaded_bytes, 524288);
         assert_eq!(result[0].download_rate_mib_s, None);
@@ -818,6 +884,12 @@ mod tests {
         };
 
         let db = setup_db();
+        let recorded_by = "peer1";
+        let file_id = [4u8; 32];
+        let file_id_b64 = event_id_to_base64(&file_id);
+        let key_event_id = [5u8; 32];
+        let key_bytes = [6u8; 32];
+        let key_event_id_b64 = insert_key_secret_row(&db, recorded_by, key_event_id, key_bytes);
 
         // Use a recent base timestamp so prune_locked (max_age_days) doesn't
         // discard the runs — the old hardcoded-1970 timestamps were silently
@@ -837,40 +909,74 @@ mod tests {
                 "peer1",
                 "evt1",
                 "msg1",
-                "file1",
+                &file_id_b64,
                 524288i64,
                 2i64,
                 262144i64,
                 &[0u8; 32] as &[u8],
-                "key1",
+                &key_event_id_b64,
                 "big.bin",
                 "application/octet-stream",
                 base
             ],
         )
         .unwrap();
+        let slice_evt1 = insert_encrypted_slice_event(
+            &db,
+            key_event_id,
+            key_bytes,
+            file_id,
+            0,
+            base + 2000,
+            &[21u8; 262144],
+        );
         db.execute(
-            "INSERT INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["peer1", "file1", 0i64, "slice_evt1", base + 2000],
+            "INSERT INTO file_slices
+             (recorded_by, file_id, slice_number, event_id, created_at, descriptor_event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                recorded_by,
+                &file_id_b64,
+                0i64,
+                &slice_evt1,
+                base + 2000,
+                "evt1"
+            ],
         )
         .unwrap();
+        let slice_evt2 = insert_encrypted_slice_event(
+            &db,
+            key_event_id,
+            key_bytes,
+            file_id,
+            1,
+            base + 3000,
+            &[22u8; 262144],
+        );
         db.execute(
-            "INSERT INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["peer1", "file1", 1i64, "slice_evt2", base + 3000],
+            "INSERT INTO file_slices
+             (recorded_by, file_id, slice_number, event_id, created_at, descriptor_event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                recorded_by,
+                &file_id_b64,
+                1i64,
+                &slice_evt2,
+                base + 3000,
+                "evt1"
+            ],
         )
         .unwrap();
         db.execute(
             "INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params!["peer1", "slice_evt1", base + 2000, "quic_recv:alice"],
+            rusqlite::params![recorded_by, &slice_evt1, base + 2000, "quic_recv:alice"],
         )
         .unwrap();
         db.execute(
             "INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
              VALUES (?1, ?2, ?3, ?4)",
-            rusqlite::params!["peer1", "slice_evt2", base + 3000, "quic_recv:bob"],
+            rusqlite::params![recorded_by, &slice_evt2, base + 3000, "quic_recv:bob"],
         )
         .unwrap();
 
@@ -881,7 +987,7 @@ mod tests {
             started_at_ms: base,
             ended_at_ms: base + 3500,
             session_id: 11,
-            tenant_id: "peer1".to_string(),
+            tenant_id: recorded_by.to_string(),
             peer_id: "remote-a".to_string(),
             direction: "inbound".to_string(),
             remote_addr: "127.0.0.1:4444".to_string(),
@@ -896,7 +1002,7 @@ mod tests {
             error: None,
         };
         let run_id_1 = insert_run_start(&db, &run1).unwrap();
-        insert_run_received_event(&db, run_id_1, "slice_evt1").unwrap();
+        insert_run_received_event(&db, run_id_1, &slice_evt1).unwrap();
 
         let final_run1 = NewSyncRun {
             outcome: "ok".to_string(),
@@ -910,7 +1016,7 @@ mod tests {
             started_at_ms: base + 1500,
             ended_at_ms: base + 3200,
             session_id: 12,
-            tenant_id: "peer1".to_string(),
+            tenant_id: recorded_by.to_string(),
             peer_id: "remote-b".to_string(),
             direction: "inbound".to_string(),
             remote_addr: "127.0.0.1:5555".to_string(),
@@ -925,7 +1031,7 @@ mod tests {
             error: None,
         };
         let run_id_2 = insert_run_start(&db, &run2).unwrap();
-        insert_run_received_event(&db, run_id_2, "slice_evt2").unwrap();
+        insert_run_received_event(&db, run_id_2, &slice_evt2).unwrap();
 
         let final_run2 = NewSyncRun {
             outcome: "ok".to_string(),
@@ -938,12 +1044,12 @@ mod tests {
         // last_slice_recorded_at_ms = base+3000 (from recorded_events)
         // elapsed = 3000ms, downloaded = 524288 bytes = 0.5 MiB
         // rate = 0.5 / 3.0 = 1/6 MiB/s
-        let by_message = list_for_message(&db, "peer1", "msg1").unwrap();
+        let by_message = list_for_message(&db, recorded_by, "msg1").unwrap();
         assert_eq!(by_message.len(), 1);
         assert_eq!(by_message[0].downloaded_bytes, 524288);
         approx_eq(by_message[0].download_rate_mib_s.unwrap(), 1.0 / 6.0);
 
-        let files = list_files(&db, "peer1", 10).unwrap();
+        let files = list_files(&db, recorded_by, 10).unwrap();
         assert_eq!(files.total, 1);
         assert_eq!(files.files[0].downloaded_bytes, 524288);
         approx_eq(files.files[0].download_rate_mib_s.unwrap(), 1.0 / 6.0);
@@ -952,45 +1058,85 @@ mod tests {
     #[test]
     fn test_downloaded_bytes_uses_actual_last_slice_size() {
         let db = setup_db();
+        let recorded_by = "peer1";
+        let file_id = [7u8; 32];
+        let file_id_b64 = event_id_to_base64(&file_id);
+        let key_event_id = [8u8; 32];
+        let key_bytes = [9u8; 32];
+        let key_event_id_b64 = insert_key_secret_row(&db, recorded_by, key_event_id, key_bytes);
         db.execute(
             "INSERT INTO files
              (recorded_by, event_id, message_id, file_id, blob_bytes, total_slices, slice_bytes, root_hash, key_event_id, filename, mime_type, created_at)
              VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
             rusqlite::params![
-                "peer1",
+                recorded_by,
                 "evt1",
                 "msg1",
-                "file1",
+                &file_id_b64,
                 300000i64,
                 2i64,
                 262144i64,
                 &[0u8; 32] as &[u8],
-                "key1",
+                &key_event_id_b64,
                 "odd.bin",
                 "application/octet-stream",
                 1000i64
             ],
         )
         .unwrap();
+        let slice_evt1 = insert_encrypted_slice_event(
+            &db,
+            key_event_id,
+            key_bytes,
+            file_id,
+            0,
+            1001,
+            &[31u8; 262144],
+        );
         db.execute(
-            "INSERT INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["peer1", "file1", 0i64, "slice_evt1", 1001i64],
+            "INSERT INTO file_slices
+             (recorded_by, file_id, slice_number, event_id, created_at, descriptor_event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                recorded_by,
+                &file_id_b64,
+                0i64,
+                &slice_evt1,
+                1001i64,
+                "evt1"
+            ],
         )
         .unwrap();
+        let slice_evt2 = insert_encrypted_slice_event(
+            &db,
+            key_event_id,
+            key_bytes,
+            file_id,
+            1,
+            1002,
+            &[32u8; 37_856],
+        );
         db.execute(
-            "INSERT INTO file_slices (recorded_by, file_id, slice_number, event_id, created_at)
-             VALUES (?1, ?2, ?3, ?4, ?5)",
-            rusqlite::params!["peer1", "file1", 1i64, "slice_evt2", 1002i64],
+            "INSERT INTO file_slices
+             (recorded_by, file_id, slice_number, event_id, created_at, descriptor_event_id)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                recorded_by,
+                &file_id_b64,
+                1i64,
+                &slice_evt2,
+                1002i64,
+                "evt1"
+            ],
         )
         .unwrap();
 
-        let by_message = list_for_message(&db, "peer1", "msg1").unwrap();
+        let by_message = list_for_message(&db, recorded_by, "msg1").unwrap();
         assert_eq!(by_message.len(), 1);
         assert_eq!(by_message[0].downloaded_bytes, 300000);
         assert_eq!(by_message[0].download_rate_mib_s, None);
 
-        let files = list_files(&db, "peer1", 10).unwrap();
+        let files = list_files(&db, recorded_by, 10).unwrap();
         assert_eq!(files.total, 1);
         assert_eq!(files.files[0].downloaded_bytes, 300000);
         assert!(files.files[0].complete);
@@ -1017,7 +1163,7 @@ mod tests {
         let key_event_id_b64 = insert_key_secret_row(&db, recorded_by, key_event_id, key_bytes);
         let payload = b"hello encrypted world";
         let slice_event_id_b64 =
-            insert_encrypted_slice_event(&db, key_event_id, key_bytes, file_id, payload);
+            insert_encrypted_slice_event(&db, key_event_id, key_bytes, file_id, 0, 1001, payload);
 
         db.execute(
             "INSERT INTO files
@@ -1092,6 +1238,8 @@ mod tests {
             wrapper_key_event_id,
             wrapper_key_bytes,
             file_id,
+            0,
+            1001,
             b"mismatch",
         );
 

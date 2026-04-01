@@ -21,7 +21,10 @@ pub fn project_pure(
     let message_id_b64 = event_id_to_base64(&att.message_id);
     let file_id_b64 = event_id_to_base64(&att.file_id);
     let key_event_id_b64 = event_id_to_base64(&att.key_event_id);
-    let signer_event_id_b64 = event_id_to_base64(&att.signed_by);
+    let Some(current_signer) = ctx.current_signer.as_ref() else {
+        return ProjectorResult::reject("file missing current signer envelope".to_string());
+    };
+    let signer_event_id_b64 = current_signer.event_id.clone();
 
     if ctx.target_message_deleted {
         return ProjectorResult::valid_with_commands(

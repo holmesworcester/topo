@@ -19,9 +19,6 @@ pub const REMOVAL_FIELDS: &[FieldSpec] = &[
     FieldSpec::EventId("parent_4"),
     FieldSpec::EventId("frontier_hash"),
     FieldSpec::EventId("removed_by"),
-    FieldSpec::EventId("signed_by"),
-    FieldSpec::U8("signer_type"),
-    FieldSpec::FixedBytes("signature", 64),
 ];
 
 pub const REMOVAL_WIRE_SIZE: usize = wire_size_for_fields(REMOVAL_FIELDS);
@@ -37,9 +34,6 @@ pub struct RemovalEvent {
     pub parent_4: [u8; 32],
     pub frontier_hash: [u8; 32],
     pub removed_by: [u8; 32],
-    pub signed_by: [u8; 32],
-    pub signer_type: u8,
-    pub signature: [u8; 64],
 }
 
 impl super::Describe for RemovalEvent {
@@ -132,14 +126,6 @@ pub fn parse_removal(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         parent_4: values[6].as_event_id().unwrap(),
         frontier_hash: values[7].as_event_id().unwrap(),
         removed_by: values[8].as_event_id().unwrap(),
-        signed_by: values[9].as_event_id().unwrap(),
-        signer_type: values[10].as_u8().unwrap(),
-        signature: {
-            let bytes = values[11].as_fixed_bytes().unwrap();
-            let mut sig = [0u8; 64];
-            sig.copy_from_slice(bytes);
-            sig
-        },
     }))
 }
 
@@ -158,9 +144,6 @@ pub fn encode_removal(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
         FieldValue::EventId(removal.parent_4),
         FieldValue::EventId(removal.frontier_hash),
         FieldValue::EventId(removal.removed_by),
-        FieldValue::EventId(removal.signed_by),
-        FieldValue::U8(removal.signer_type),
-        FieldValue::FixedBytes(removal.signature.to_vec()),
     ];
     Ok(encode_fields(EVENT_TYPE_REMOVAL, REMOVAL_FIELDS, &values)?)
 }
@@ -194,14 +177,19 @@ pub fn project_pure(
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
-    _ctx: &ContextSnapshot,
+    ctx: &ContextSnapshot,
 ) -> ProjectorResult {
     let removal = match parsed {
         ParsedEvent::Removal(event) => event,
         _ => return ProjectorResult::reject("not a removal event".to_string()),
     };
-    if removal.removed_by != removal.signed_by {
-        return ProjectorResult::reject("removed_by must equal signed_by".to_string());
+    let Some(current_signer) = ctx.current_signer.as_ref() else {
+        return ProjectorResult::reject("removal missing current signer envelope".to_string());
+    };
+    if removal.removed_by
+        != crate::crypto::event_id_from_base64(&current_signer.event_id).unwrap_or([0u8; 32])
+    {
+        return ProjectorResult::reject("removed_by must equal current signer".to_string());
     }
     let slots = [
         removal.parent_1,
@@ -245,20 +233,20 @@ pub fn project_pure(
             SqlVal::Text(event_id_to_base64(&removal.parent_2)),
             SqlVal::Text(event_id_to_base64(&removal.parent_3)),
             SqlVal::Text(event_id_to_base64(&removal.parent_4)),
-            SqlVal::Text(event_id_to_base64(&removal.signed_by)),
+            SqlVal::Text(current_signer.event_id.clone()),
         ],
     }])
 }
 
-pub static REMOVAL_META: EventTypeMeta = EventTypeMeta {
+pub static REMOVAL_META: EventTypeMeta = crate::event_modules::registry::event_type_meta! {
     type_code: EVENT_TYPE_REMOVAL,
     type_name: "removal",
     projection_table: "removals",
     share_scope: ShareScope::Shared,
-    dep_fields: &["parent_1", "parent_2", "parent_3", "parent_4", "signed_by"],
-    dep_field_type_codes: &[&[], &[], &[], &[], &[]],
+    dep_fields: &["parent_1", "parent_2", "parent_3", "parent_4"],
+    dep_field_type_codes: &[&[], &[], &[], &[]],
     signer_required: true,
-    signature_byte_len: 64,
+    signature_byte_len: 0,
     encryptable: false,
     parse: parse_removal,
     encode: encode_removal,
@@ -284,9 +272,6 @@ mod tests {
             parent_4: [0u8; 32],
             frontier_hash: frontier_hash_from_refs(&frontier_refs),
             removed_by: [0x44; 32],
-            signed_by: [0x44; 32],
-            signer_type: 5,
-            signature: [0x55; 64],
         });
         let blob = encode_event(&event).unwrap();
         assert_eq!(blob.len(), REMOVAL_WIRE_SIZE);

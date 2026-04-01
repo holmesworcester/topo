@@ -1,5 +1,6 @@
 use std::collections::{BTreeSet, HashMap};
 
+use rusqlite::OptionalExtension;
 use serde::Serialize;
 
 use crate::contracts::event_pipeline_contract::IngestItem;
@@ -12,6 +13,13 @@ use crate::sim::query_snapshot::{ImportedConnectTarget, ImportedPeerState};
 use crate::state::db::transport_creds::resolve_tenant_transport_target;
 
 type PairSyncResult<T> = Result<T, Box<dyn std::error::Error + Send + Sync>>;
+
+#[derive(Clone, Debug)]
+struct TransferableSharedEvent {
+    event_id: String,
+    created_at_ms: i64,
+    blob: Vec<u8>,
+}
 
 #[derive(Clone, Debug)]
 pub(crate) struct PreparedPairSyncDirection {
@@ -221,13 +229,12 @@ fn collect_shared_events_one_way(
     );
     let now_ms = crate::db::queue::current_timestamp_ms();
 
-    let mut transferred_event_ids = Vec::new();
-    let mut transferred_bytes = 0u64;
+    let mut primary_event_ids = Vec::new();
     let mut transferred_key_request_events = 0usize;
     let mut suppressed_key_request_events = 0usize;
     let mut transferred_key_shared_events = 0usize;
     let mut suppressed_key_shared_events = 0usize;
-    let mut batch = Vec::<IngestItem>::new();
+    let mut primary_events = Vec::<TransferableSharedEvent>::new();
 
     let mut stmt = source.prepare(
         "SELECT e.event_id, e.event_type, e.blob
@@ -246,37 +253,58 @@ fn collect_shared_events_one_way(
     })?;
 
     for row in rows {
-        let (event_id, event_type, blob) = row?;
+        let (event_id, _event_type, blob) = row?;
         if known_dest_events.contains(&event_id) {
             continue;
         }
-        if event_type == "key_request" {
-            let Ok(ParsedEvent::KeyRequest(event)) = events::parse_event(&blob) else {
-                continue;
-            };
-            if observed_key_shared_targets.contains(&key_request_target(&event)) {
-                suppressed_key_request_events = suppressed_key_request_events.saturating_add(1);
-                continue;
+        match semantic_parsed_event(&blob) {
+            Ok(ParsedEvent::KeyRequest(event)) => {
+                if observed_key_shared_targets.contains(&key_request_target(&event)) {
+                    suppressed_key_request_events = suppressed_key_request_events.saturating_add(1);
+                    continue;
+                }
+                transferred_key_request_events = transferred_key_request_events.saturating_add(1);
             }
-            transferred_key_request_events = transferred_key_request_events.saturating_add(1);
-        } else if event_type == "key_shared" {
-            if !winning_key_shared_events.contains(&event_id) {
-                suppressed_key_shared_events = suppressed_key_shared_events.saturating_add(1);
-                continue;
+            Ok(ParsedEvent::KeyShared(_)) => {
+                if !winning_key_shared_events.contains(&event_id) {
+                    suppressed_key_shared_events = suppressed_key_shared_events.saturating_add(1);
+                    continue;
+                }
+                transferred_key_shared_events = transferred_key_shared_events.saturating_add(1);
             }
-            transferred_key_shared_events = transferred_key_shared_events.saturating_add(1);
+            _ => {}
         }
-        transferred_bytes = transferred_bytes.saturating_add(blob.len() as u64);
-        transferred_event_ids.push(event_id);
-        batch.push((
-            hash_event(&blob),
+        primary_event_ids.push(event_id.clone());
+        primary_events.push(TransferableSharedEvent {
+            event_id,
+            created_at_ms: events::extract_created_at_ms(&blob).unwrap_or(0) as i64,
             blob,
-            dest_recorded_by.to_string(),
-            source_tag.clone(),
-            now_ms,
-            now_ms,
-        ));
+        });
     }
+
+    let transferable_events =
+        expand_transferable_shared_closure(&source, &known_dest_events, primary_events)?;
+    let transferred_event_ids = transferable_events
+        .iter()
+        .map(|event| event.event_id.clone())
+        .collect::<Vec<_>>();
+    let transferred_bytes = transferable_events
+        .iter()
+        .map(|event| event.blob.len() as u64)
+        .sum::<u64>();
+    let batch = transferable_events
+        .into_iter()
+        .map(|event| {
+            (
+                hash_event(&event.blob),
+                event.blob,
+                dest_recorded_by.to_string(),
+                source_tag.clone(),
+                now_ms,
+                now_ms,
+            )
+        })
+        .collect::<Vec<IngestItem>>();
 
     Ok(PreparedPairSyncDirection {
         stats: PairSyncDirectionStats {
@@ -297,6 +325,101 @@ fn collect_shared_events_one_way(
     })
 }
 
+fn expand_transferable_shared_closure(
+    source: &rusqlite::Connection,
+    known_dest_events: &BTreeSet<String>,
+    primary_events: Vec<TransferableSharedEvent>,
+) -> PairSyncResult<Vec<TransferableSharedEvent>> {
+    let mut by_event_id = BTreeSet::<String>::new();
+    let mut out = Vec::<TransferableSharedEvent>::new();
+    let mut pending = primary_events;
+
+    while let Some(event) = pending.pop() {
+        if known_dest_events.contains(&event.event_id)
+            || !by_event_id.insert(event.event_id.clone())
+        {
+            continue;
+        }
+        let parsed = match events::parse_event(&event.blob) {
+            Ok(parsed) => parsed,
+            Err(_) => {
+                out.push(event);
+                continue;
+            }
+        };
+
+        for (_field_name, dep_id) in recursive_dep_field_values(&parsed) {
+            let dep_id_b64 = crate::crypto::event_id_to_base64(&dep_id);
+            if known_dest_events.contains(&dep_id_b64) || by_event_id.contains(&dep_id_b64) {
+                continue;
+            }
+            let Some(dep_event) = load_transferable_shared_event(source, &dep_id_b64)? else {
+                continue;
+            };
+            pending.push(dep_event);
+        }
+
+        out.push(event);
+    }
+
+    out.sort_by(|left, right| {
+        (left.created_at_ms, &left.event_id).cmp(&(right.created_at_ms, &right.event_id))
+    });
+    Ok(out)
+}
+
+fn load_transferable_shared_event(
+    source: &rusqlite::Connection,
+    event_id_b64: &str,
+) -> PairSyncResult<Option<TransferableSharedEvent>> {
+    let row: Option<(String, Vec<u8>, i64)> = source
+        .query_row(
+            "SELECT event_type, blob, created_at
+             FROM events
+             WHERE event_id = ?1
+             LIMIT 1",
+            rusqlite::params![event_id_b64],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .optional()?;
+    let Some((_event_type, blob, created_at_ms)) = row else {
+        return Ok(None);
+    };
+    let Some(type_code) = events::extract_event_type(&blob) else {
+        return Ok(None);
+    };
+    let Some(meta) = events::registry().lookup(type_code) else {
+        return Ok(None);
+    };
+    if meta.share_scope != events::ShareScope::Shared {
+        return Ok(None);
+    }
+    Ok(Some(TransferableSharedEvent {
+        event_id: event_id_b64.to_string(),
+        created_at_ms,
+        blob,
+    }))
+}
+
+fn semantic_parsed_event(blob: &[u8]) -> PairSyncResult<ParsedEvent> {
+    let parsed = events::parse_event(blob)?;
+    match parsed {
+        ParsedEvent::Signed(signed) => semantic_parsed_event(&signed.payload),
+        other => Ok(other),
+    }
+}
+
+fn recursive_dep_field_values(parsed: &ParsedEvent) -> Vec<(&'static str, [u8; 32])> {
+    let mut deps = parsed.dep_field_values();
+    if let ParsedEvent::Signed(signed) = parsed {
+        deps.push(("signer_event_id", signed.signer_event_id));
+        if let Ok(inner) = semantic_parsed_event(&signed.payload) {
+            deps.extend(recursive_dep_field_values(&inner));
+        }
+    }
+    deps
+}
+
 fn winning_key_shared_event_ids(
     conn: &rusqlite::Connection,
     recorded_by: &str,
@@ -306,7 +429,6 @@ fn winning_key_shared_event_ids(
          FROM recorded_events re
          JOIN events e ON e.event_id = re.event_id
          WHERE re.peer_id = ?1
-           AND e.event_type = 'key_shared'
          ORDER BY re.id ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
@@ -316,19 +438,23 @@ fn winning_key_shared_event_ids(
     let mut best_by_target = HashMap::<RepairTarget, ([u8; 32], [u8; 32], String)>::new();
     for row in rows {
         let (event_id, blob) = row?;
-        let Ok(ParsedEvent::KeyShared(event)) = events::parse_event(&blob) else {
+        let Ok(ParsedEvent::KeyShared(event)) = semantic_parsed_event(&blob) else {
+            continue;
+        };
+        let Some(signer_event_id) = crate::event_modules::signed::outer_signer_event_id(&blob)
+        else {
             continue;
         };
         let target = key_shared_target(&event);
-        let rank = response_rank(target, event.signed_by);
+        let rank = response_rank(target, signer_event_id);
         best_by_target
             .entry(target)
             .and_modify(|best| {
-                if (rank, event.signed_by, event_id.as_str()) < (best.0, best.1, best.2.as_str()) {
-                    *best = (rank, event.signed_by, event_id.clone());
+                if (rank, signer_event_id, event_id.as_str()) < (best.0, best.1, best.2.as_str()) {
+                    *best = (rank, signer_event_id, event_id.clone());
                 }
             })
-            .or_insert((rank, event.signed_by, event_id));
+            .or_insert((rank, signer_event_id, event_id));
     }
 
     Ok(best_by_target
@@ -346,7 +472,6 @@ fn observed_key_shared_targets(
          FROM recorded_events re
          JOIN events e ON e.event_id = re.event_id
          WHERE re.peer_id = ?1
-           AND e.event_type = 'key_shared'
          ORDER BY re.id ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
@@ -356,7 +481,7 @@ fn observed_key_shared_targets(
     let mut out = BTreeSet::new();
     for row in rows {
         let blob = row?;
-        let Ok(ParsedEvent::KeyShared(event)) = events::parse_event(&blob) else {
+        let Ok(ParsedEvent::KeyShared(event)) = semantic_parsed_event(&blob) else {
             continue;
         };
         out.insert(key_shared_target(&event));

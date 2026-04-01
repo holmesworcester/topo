@@ -37,31 +37,37 @@ fn load_local_peer_signer_from_recorded_event(
     db: &Connection,
     recorded_by: &str,
 ) -> Result<Option<(EventId, SigningKey)>, Box<dyn std::error::Error + Send + Sync>> {
-    let blob: Option<Vec<u8>> = db
-        .query_row(
-            "SELECT e.blob
-             FROM recorded_events re
-             JOIN events e ON e.event_id = re.event_id
-             WHERE re.peer_id = ?1
-               AND e.event_type = 'peer_secret'
-             ORDER BY re.recorded_at DESC, re.id DESC
-             LIMIT 1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        )
-        .optional()?;
-    let Some(blob) = blob else {
-        return Ok(None);
-    };
-    match parse_event(&blob)? {
-        ParsedEvent::PeerSecret(event) => Ok(Some((
-            event.signer_event_id,
-            SigningKey::from_bytes(&event.private_key_bytes),
-        ))),
-        other => {
-            Err(format!("expected peer_secret event in recorded fallback, got {other:?}").into())
+    let mut stmt = db.prepare(
+        "SELECT e.blob
+         FROM recorded_events re
+         JOIN events e ON e.event_id = re.event_id
+         WHERE re.peer_id = ?1
+         ORDER BY re.recorded_at DESC, re.id DESC",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
+        row.get::<_, Vec<u8>>(0)
+    })?;
+    for row in rows {
+        let blob = row?;
+        match parse_event(&blob)? {
+            ParsedEvent::PeerSecret(event) => {
+                return Ok(Some((
+                    event.signer_event_id,
+                    SigningKey::from_bytes(&event.private_key_bytes),
+                )));
+            }
+            ParsedEvent::Signed(signed) => {
+                if let ParsedEvent::PeerSecret(event) = parse_event(&signed.payload)? {
+                    return Ok(Some((
+                        event.signer_event_id,
+                        SigningKey::from_bytes(&event.private_key_bytes),
+                    )));
+                }
+            }
+            _ => {}
         }
     }
+    Ok(None)
 }
 
 /// Load the local peer signer from peer_secrets.
@@ -146,10 +152,19 @@ pub fn resolve_user_event_id(
             format!("failed to parse signer event blob: {}", e).into()
         },
     )?;
-    if let crate::event_modules::ParsedEvent::PeerShared(ps) = parsed {
-        Ok(ps.user_event_id)
-    } else {
-        Err("signer event is not peer_shared".into())
+    match parsed {
+        crate::event_modules::ParsedEvent::PeerShared(ps) => Ok(ps.user_event_id),
+        crate::event_modules::ParsedEvent::Signed(signed) => {
+            match crate::event_modules::parse_event(&signed.payload).map_err(
+                |e| -> Box<dyn std::error::Error + Send + Sync> {
+                    format!("failed to parse signed signer payload: {}", e).into()
+                },
+            )? {
+                crate::event_modules::ParsedEvent::PeerShared(ps) => Ok(ps.user_event_id),
+                _ => Err("signer event is not peer_shared".into()),
+            }
+        }
+        _ => Err("signer event is not peer_shared".into()),
     }
 }
 
@@ -307,7 +322,17 @@ pub fn list_peers(db: &Connection, recorded_by: &str) -> Result<Vec<PeerItem>, r
                 SELECT 1 FROM local_transport_creds c
                 WHERE c.peer_id = lower(hex(ps.transport_fingerprint))
             ) AS is_local,
-            ps.endpoint_id AS endpoint_id,
+            COALESCE(
+                ps.endpoint_id,
+                (
+                    SELECT lower(hex(b.spki_fingerprint))
+                    FROM peer_transport_bindings b
+                    WHERE b.recorded_by = ps.recorded_by
+                      AND b.peer_id = lower(hex(ps.transport_fingerprint))
+                    ORDER BY b.bound_at DESC
+                    LIMIT 1
+                )
+            ) AS endpoint_id,
             (
                 SELECT e.origin_ip || ':' || e.origin_port
                 FROM peer_endpoint_observations e

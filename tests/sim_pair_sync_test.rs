@@ -1,5 +1,8 @@
 use std::collections::BTreeSet;
+use std::time::{Duration, Instant};
 
+use topo::db::open_connection;
+use topo::event_modules::{parse_event, registry, ParsedEvent};
 use topo::rpc::protocol::RpcMethod;
 use topo::sim::{
     import_peer_state, plan_pair_sync_intents, run_pair_sync_session, PairSyncIntent, SimPeerNode,
@@ -28,27 +31,51 @@ fn create_invite(daemon: &VirtualDaemon, public_addr: &str) -> String {
 }
 
 fn create_device_link(daemon: &VirtualDaemon, public_addr: &str) -> String {
-    daemon
-        .call_ok_value(RpcMethod::CreateDeviceLink {
+    let start = Instant::now();
+    loop {
+        let response = daemon.call(RpcMethod::CreateDeviceLink {
             public_addr: Some(public_addr.to_string()),
             public_spki: None,
-        })
-        .expect("create device link")["invite_link"]
-        .as_str()
-        .expect("device link")
-        .to_string()
+        });
+        if response.ok {
+            return response.data.as_ref().expect("device link payload")["invite_link"]
+                .as_str()
+                .expect("device link")
+                .to_string();
+        }
+        let error = response.error.clone().unwrap_or_default();
+        let retryable = error.contains("workspace has not completed initial sync yet")
+            || error.contains("blocked on");
+        if retryable && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        panic!("create device link: {:?}", response.error);
+    }
 }
 
 fn send_message(daemon: &VirtualDaemon, content: &str) -> String {
-    daemon
-        .call_ok_value(RpcMethod::Send {
+    let start = Instant::now();
+    loop {
+        let response = daemon.call(RpcMethod::Send {
             content: content.to_string(),
             client_op_id: None,
-        })
-        .expect("send message")["event_id"]
-        .as_str()
-        .expect("message event id")
-        .to_string()
+        });
+        if response.ok {
+            return response.data.as_ref().expect("send payload")["event_id"]
+                .as_str()
+                .expect("message event id")
+                .to_string();
+        }
+        let error = response.error.clone().unwrap_or_default();
+        let retryable = error.contains("workspace has not completed initial sync yet")
+            || error.contains("blocked on");
+        if retryable && start.elapsed() < Duration::from_secs(10) {
+            std::thread::sleep(Duration::from_millis(50));
+            continue;
+        }
+        panic!("send message: {:?}", response.error);
+    }
 }
 
 fn assert_has_event(daemon: &VirtualDaemon, event_id: &str) {
@@ -82,20 +109,31 @@ fn event_ids_of_type(daemon: &VirtualDaemon, event_type: &str) -> BTreeSet<Strin
     let recorded_by = active_peer_id(daemon);
     let mut stmt = conn
         .prepare(
-            "SELECT re.event_id
+            "SELECT re.event_id, e.blob
              FROM recorded_events re
              JOIN events e ON e.event_id = re.event_id
              WHERE re.peer_id = ?1
-               AND e.event_type = ?2
              ORDER BY re.id ASC",
         )
         .expect("prepare raw event scan");
-    stmt.query_map(rusqlite::params![recorded_by, event_type], |row| {
-        row.get::<_, String>(0)
+    stmt.query_map(rusqlite::params![recorded_by], |row| {
+        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
     })
     .expect("query raw event scan")
-    .collect::<Result<BTreeSet<_>, _>>()
-    .expect("collect raw event ids")
+    .filter_map(|row| {
+        let (event_id, blob) = row.expect("collect raw event ids");
+        let semantic = match parse_event(&blob).expect("parse raw event") {
+            ParsedEvent::Signed(signed) => {
+                parse_event(&signed.payload).expect("parse signed payload")
+            }
+            parsed => parsed,
+        };
+        registry()
+            .lookup(semantic.event_type_code())
+            .is_some_and(|meta| meta.type_name == event_type)
+            .then_some(event_id)
+    })
+    .collect()
 }
 
 fn import_node(daemon: &VirtualDaemon, recorded_by: &str) -> SimPeerNode {
@@ -132,6 +170,27 @@ fn run_session_for_intent(intent: &PairSyncIntent) {
     .expect("pair sync session");
 }
 
+fn wait_for_authoring_ready(daemon: &VirtualDaemon, bootstrap_db_paths: &[String]) {
+    let recorded_by = active_peer_id(daemon);
+    let start = Instant::now();
+    loop {
+        let conn = open_connection(daemon.db_path()).expect("open db");
+        if topo::event_modules::workspace::load_local_authoring_context(&conn, &recorded_by).is_ok()
+        {
+            return;
+        }
+        assert!(
+            start.elapsed() < Duration::from_secs(10),
+            "timed out waiting for authoring readiness on {}",
+            daemon.db_path()
+        );
+        if !bootstrap_db_paths.is_empty() {
+            let _ = topo::sim::PlannerSimulation::new(bootstrap_db_paths.to_vec()).tick();
+        }
+        std::thread::sleep(Duration::from_millis(50));
+    }
+}
+
 #[test]
 fn real_pair_sync_is_required_for_replication_between_virtual_daemon_nodes() {
     let tmpdir = tempfile::tempdir().unwrap();
@@ -148,6 +207,7 @@ fn real_pair_sync_is_required_for_replication_between_virtual_daemon_nodes() {
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
     let alice_peer = active_peer_id(&alice);
+    wait_for_authoring_ready(&alice, &[alice_db.to_string_lossy().into_owned()]);
 
     let invite = create_invite(&alice, "127.0.0.1:4242");
     let accepted = bob.call(RpcMethod::AcceptInvite {
@@ -189,6 +249,7 @@ fn planner_drives_hop_by_hop_message_and_key_shared_propagation() {
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
     let phone_peer = active_peer_id(&phone);
+    wait_for_authoring_ready(&phone, &[phone_db.to_string_lossy().into_owned()]);
 
     let phone_link = create_device_link(&phone, "127.0.0.1:4242");
     let phone_key_shared_ids = event_ids_of_type(&phone, "key_shared");
@@ -216,6 +277,13 @@ fn planner_drives_hop_by_hop_message_and_key_shared_propagation() {
     run_session_for_intent(laptop_to_phone);
 
     assert_has_event(&laptop, &bootstrap_message);
+    wait_for_authoring_ready(
+        &laptop,
+        &[
+            phone_db.to_string_lossy().into_owned(),
+            laptop_db.to_string_lossy().into_owned(),
+        ],
+    );
     assert!(
         phone_key_shared_ids.iter().all(|event_id| {
             let response = laptop.call(RpcMethod::AssertNow {

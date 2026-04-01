@@ -6,18 +6,19 @@ use serde::Serialize;
 
 use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::crypto::{event_id_from_base64, event_id_to_base64, hash_event, EventId};
-use crate::event_modules::{self as events, parse_event, EncryptedEvent, ParsedEvent};
+use crate::event_modules::{self as events, parse_event, ParsedEvent};
 use crate::projection::apply::{
-    project_one::project_one_step_with_backend, run_dep_and_projection_stages_with_backend,
-    ProjectionApplyResult, ProjectionBackend,
+    project_one::project_one_step_with_backend, ProjectionApplyResult, ProjectionBackend,
 };
 use crate::projection::contract::{
-    ContextSnapshot, DeletionIntentInfo, EmitCommand, FileDescriptorInfo, SqlVal, WriteOp,
+    ContextSnapshot, CurrentSignerInfo, DeletionIntentInfo, EmitCommand, FileDescriptorInfo,
+    SqlVal, WriteOp,
 };
 use crate::projection::decision::ProjectionDecision;
-use crate::projection::encrypted::decrypt_event_blob;
-use crate::projection::queries::{ProjectionQueries, ProjectionQueryResult};
-use crate::projection::signer::SignerResolution;
+use crate::projection::queries::{
+    DepLoadResult, ProjectionFrameContext, ProjectionQueries, ProjectionQueryResult,
+};
+use crate::projection::signer::{ResolvedSigner, SignerResolution};
 use crate::sim::query_snapshot::ImportedPeerState;
 
 const SUMMARY_TABLES: &[&str] = &[
@@ -123,6 +124,22 @@ impl EventProjectionFilter {
     fn blocks(&self, type_code: u8) -> bool {
         self.blocked_type_codes.contains(&type_code)
     }
+
+    fn blocks_parsed(&self, parsed: &ParsedEvent) -> bool {
+        if self.blocks(parsed.event_type_code()) {
+            return true;
+        }
+        match parsed {
+            ParsedEvent::Signed(signed) => {
+                self.blocks(signed.inner_type_code)
+                    || events::parse_event(&signed.payload)
+                        .map(|inner| self.blocks_parsed(&inner))
+                        .unwrap_or(false)
+            }
+            ParsedEvent::Encrypted(enc) => self.blocks(enc.inner_type_code),
+            _ => false,
+        }
+    }
 }
 
 pub struct NodeBehaviorEngine {
@@ -187,42 +204,78 @@ impl NodeBehaviorEngine {
                 }
             }
         }
+        let mut pending_projection = Vec::<(i64, EventId)>::new();
+        for ambient in &imported.ambient_shared_events {
+            let event_id =
+                event_id_from_base64(&ambient.event_id).ok_or("invalid ambient shared event id")?;
+            engine.store_recorded_item(&event_id, &ambient.blob, &ambient.source)?;
+            pending_projection.push((ambient.created_at_ms, event_id));
+        }
         for known in &imported.known_events {
             let event_id =
                 event_id_from_base64(&known.event_id).ok_or("invalid imported event id")?;
-            engine.ingest_item((
-                event_id,
-                known.blob.clone(),
-                imported.recorded_by.clone(),
-                known.source.clone(),
-                known.created_at_ms,
-                known.created_at_ms,
-            ))?;
+            engine.store_recorded_item(&event_id, &known.blob, &known.source)?;
+            pending_projection.push((known.created_at_ms, event_id));
+        }
+        pending_projection.sort_by(|left, right| {
+            (left.0, event_id_to_base64(&left.1)).cmp(&(right.0, event_id_to_base64(&right.1)))
+        });
+        for (_created_at_ms, event_id) in pending_projection {
+            let blob = engine
+                .load_blob(&event_id_to_base64(&event_id))?
+                .ok_or("stored imported event missing blob")?;
+            let parsed = events::parse_event(&blob)?;
+            if !engine.filter.blocks_parsed(&parsed) {
+                let _ = engine.project_parsed_event(&event_id, &parsed)?;
+            }
+        }
+        engine.replay_shared_events()?;
+        Ok(engine)
+    }
+
+    pub fn seed_imported(
+        imported: &ImportedPeerState,
+        filter: EventProjectionFilter,
+        summary: &NodeBehaviorSummary,
+    ) -> Result<Self, Box<dyn std::error::Error>> {
+        let engine = Self::with_filter(&imported.recorded_by, filter);
+        {
+            let mut state = engine.state.borrow_mut();
+            state.local_transport_peer_id = imported.local_transport_peer_id.clone();
+            state.local_transport_source = imported.local_transport_source.clone();
+            for ambient in &imported.ambient_shared_events {
+                state
+                    .events
+                    .entry(ambient.event_id.clone())
+                    .or_insert_with(|| StoredEvent {
+                        blob: ambient.blob.clone(),
+                    });
+            }
+            for known in &imported.known_events {
+                state
+                    .events
+                    .entry(known.event_id.clone())
+                    .or_insert_with(|| StoredEvent {
+                        blob: known.blob.clone(),
+                    });
+                state
+                    .recorded_events
+                    .entry(known.event_id.clone())
+                    .or_insert_with(|| StoredRecordedEvent {
+                        source: known.source.clone(),
+                    });
+            }
+            seed_state_from_summary(&mut state, summary)?;
         }
         Ok(engine)
     }
 
     pub fn ingest_item(&self, item: IngestItem) -> Result<(), Box<dyn std::error::Error>> {
         let (event_id, blob, _recorded_by, source, _created_at_ms, _inserted_at_ms) = item;
-        let event_id_b64 = event_id_to_base64(&event_id);
+        self.store_recorded_item(&event_id, &blob, &source)?;
+
         let parsed = events::parse_event(&blob)?;
-        let _meta = events::registry()
-            .lookup(parsed.event_type_code())
-            .ok_or("unknown event type")?;
-
-        {
-            let mut state = self.state.borrow_mut();
-            state
-                .events
-                .entry(event_id_b64.clone())
-                .or_insert_with(|| StoredEvent { blob: blob.clone() });
-            state
-                .recorded_events
-                .entry(event_id_b64.clone())
-                .or_insert_with(|| StoredRecordedEvent { source });
-        }
-
-        if !self.filter.blocks(parsed.event_type_code()) {
+        if !self.filter.blocks_parsed(&parsed) {
             self.project_and_cascade(&event_id)?;
         }
         Ok(())
@@ -332,6 +385,128 @@ impl NodeBehaviorEngine {
         }
     }
 
+    pub fn recorded_by(&self) -> String {
+        self.state.borrow().recorded_by.clone()
+    }
+
+    pub fn transport_peer_id(&self) -> String {
+        let state = self.state.borrow();
+        state
+            .local_transport_peer_id
+            .clone()
+            .unwrap_or_else(|| state.recorded_by.clone())
+    }
+
+    pub fn recorded_event_ids(&self) -> BTreeSet<String> {
+        self.state
+            .borrow()
+            .recorded_events
+            .keys()
+            .cloned()
+            .collect()
+    }
+
+    pub fn shared_recorded_events(
+        &self,
+    ) -> Result<Vec<(String, String, i64, Vec<u8>)>, Box<dyn std::error::Error>> {
+        let state = self.state.borrow();
+        let mut out = Vec::new();
+        for event_id in state.recorded_events.keys() {
+            let Some(event) = state.events.get(event_id) else {
+                continue;
+            };
+            let parsed = events::parse_event(&event.blob)?;
+            let semantic = semantic_event_owned(&parsed);
+            let Some(meta) = events::registry().lookup(semantic.event_type_code()) else {
+                continue;
+            };
+            if meta.share_scope != events::ShareScope::Shared {
+                continue;
+            }
+            out.push((
+                event_id.clone(),
+                meta.type_name.to_string(),
+                events::extract_created_at_ms(&event.blob).unwrap_or(0) as i64,
+                event.blob.clone(),
+            ));
+        }
+        out.sort_by(|left, right| (left.2, &left.0).cmp(&(right.2, &right.0)));
+        Ok(out)
+    }
+
+    pub fn transferable_shared_event(
+        &self,
+        event_id: &str,
+    ) -> Result<Option<(String, String, i64, Vec<u8>)>, Box<dyn std::error::Error>> {
+        let state = self.state.borrow();
+        let Some(event) = state.events.get(event_id) else {
+            return Ok(None);
+        };
+        let parsed = events::parse_event(&event.blob)?;
+        let semantic = semantic_event_owned(&parsed);
+        let Some(meta) = events::registry().lookup(semantic.event_type_code()) else {
+            return Ok(None);
+        };
+        if meta.share_scope != events::ShareScope::Shared {
+            return Ok(None);
+        }
+        Ok(Some((
+            event_id.to_string(),
+            meta.type_name.to_string(),
+            events::extract_created_at_ms(&event.blob).unwrap_or(0) as i64,
+            event.blob.clone(),
+        )))
+    }
+
+    pub fn apply_transferred_batch(
+        &self,
+        source_tag: &str,
+        blobs: Vec<Vec<u8>>,
+    ) -> Result<usize, Box<dyn std::error::Error>> {
+        let mut pending_projection = Vec::new();
+        let mut ingested = 0usize;
+        for blob in blobs {
+            let event_id = hash_event(&blob);
+            self.store_recorded_item(&event_id, &blob, source_tag)?;
+            pending_projection.push((event_id, blob));
+            ingested = ingested.saturating_add(1);
+        }
+        for (event_id, blob) in pending_projection {
+            let parsed = events::parse_event(&blob)?;
+            if !self.filter.blocks_parsed(&parsed) {
+                self.project_parsed_event(&event_id, &parsed)?;
+            }
+        }
+        Ok(ingested)
+    }
+
+    fn store_recorded_item(
+        &self,
+        event_id: &EventId,
+        blob: &[u8],
+        source: &str,
+    ) -> Result<(), Box<dyn std::error::Error>> {
+        let event_id_b64 = event_id_to_base64(event_id);
+        let parsed = events::parse_event(blob)?;
+        let _meta = events::registry()
+            .lookup(parsed.event_type_code())
+            .ok_or("unknown event type")?;
+        let mut state = self.state.borrow_mut();
+        state
+            .events
+            .entry(event_id_b64.clone())
+            .or_insert_with(|| StoredEvent {
+                blob: blob.to_vec(),
+            });
+        state
+            .recorded_events
+            .entry(event_id_b64)
+            .or_insert_with(|| StoredRecordedEvent {
+                source: source.to_string(),
+            });
+        Ok(())
+    }
+
     fn project_and_cascade(
         &self,
         event_id: &EventId,
@@ -342,6 +517,69 @@ impl NodeBehaviorEngine {
             self.cascade_unblocked(&recorded_by, &event_id_to_base64(event_id))?;
         }
         Ok(decision)
+    }
+
+    fn project_parsed_event(
+        &self,
+        event_id: &EventId,
+        parsed: &ParsedEvent,
+    ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+        if let ParsedEvent::EndpointShared(endpoint_shared) = parsed {
+            return self.project_endpoint_shared_global(event_id, endpoint_shared);
+        }
+        self.project_and_cascade(event_id)
+    }
+
+    fn project_endpoint_shared_global(
+        &self,
+        event_id: &EventId,
+        endpoint_shared: &events::EndpointSharedEvent,
+    ) -> Result<ProjectionDecision, Box<dyn std::error::Error>> {
+        let endpoint_id = crate::event_modules::endpoint_shared::endpoint_id_from_public_key_bytes(
+            &endpoint_shared.public_key,
+        );
+        let (decision, _) = project_one_step_with_backend(self, &endpoint_id, event_id)?;
+        if matches!(decision, ProjectionDecision::Valid) {
+            self.state.borrow_mut().valid_events.insert(
+                event_id_to_base64(event_id),
+                Some(i64::from(events::EVENT_TYPE_ENDPOINT_SHARED)),
+            );
+        }
+        Ok(decision)
+    }
+
+    fn replay_shared_events(&self) -> Result<(), Box<dyn std::error::Error>> {
+        let event_ids = {
+            let state = self.state.borrow();
+            let mut out = Vec::new();
+            for (event_id_b64, event) in &state.events {
+                let parsed = events::parse_event(&event.blob)?;
+                if self.filter.blocks_parsed(&parsed) {
+                    continue;
+                }
+                let semantic = semantic_event_owned(&parsed);
+                let Some(meta) = events::registry().lookup(semantic.event_type_code()) else {
+                    continue;
+                };
+                if meta.share_scope != events::ShareScope::Shared {
+                    continue;
+                }
+                let created_at_ms = events::extract_created_at_ms(&event.blob).unwrap_or(0) as i64;
+                out.push((created_at_ms, event_id_b64.clone()));
+            }
+            out.sort_by(|left, right| (left.0, &left.1).cmp(&(right.0, &right.1)));
+            out.into_iter()
+                .filter_map(|(_, event_id_b64)| event_id_from_base64(&event_id_b64))
+                .collect::<Vec<_>>()
+        };
+        for event_id in event_ids {
+            let blob = self
+                .load_blob(&event_id_to_base64(&event_id))?
+                .ok_or("stored replay event missing blob")?;
+            let parsed = events::parse_event(&blob)?;
+            let _ = self.project_parsed_event(&event_id, &parsed)?;
+        }
+        Ok(())
     }
 
     fn cascade_unblocked(
@@ -397,6 +635,86 @@ impl NodeBehaviorEngine {
         }
         Ok(())
     }
+}
+
+fn semantic_event_owned(parsed: &ParsedEvent) -> ParsedEvent {
+    match parsed {
+        ParsedEvent::Signed(signed) => match events::parse_event(&signed.payload) {
+            Ok(inner) => semantic_event_owned(&inner),
+            Err(_) => parsed.clone(),
+        },
+        _ => parsed.clone(),
+    }
+}
+
+fn seed_state_from_summary(
+    state: &mut NodeBehaviorData,
+    summary: &NodeBehaviorSummary,
+) -> Result<(), Box<dyn std::error::Error>> {
+    state.tables.clear();
+    state.valid_events.clear();
+    state.rejected_events.clear();
+    state.blocked_events.clear();
+    state.blocked_event_deps.clear();
+
+    for (table, rows) in &summary.tables {
+        match table.as_str() {
+            "valid_events" => {
+                for row in rows {
+                    let Some(event_id) = row_text(row, "event_id") else {
+                        continue;
+                    };
+                    let semantic_type_code = row_int(row, "semantic_type_code");
+                    state
+                        .valid_events
+                        .insert(event_id.to_string(), semantic_type_code);
+                }
+            }
+            "rejected_events" => {
+                for row in rows {
+                    let (Some(event_id), Some(reason)) =
+                        (row_text(row, "event_id"), row_text(row, "reason"))
+                    else {
+                        continue;
+                    };
+                    state
+                        .rejected_events
+                        .insert(event_id.to_string(), reason.to_string());
+                }
+            }
+            "blocked_events" => {
+                for row in rows {
+                    let (Some(event_id), Some(deps_remaining)) =
+                        (row_text(row, "event_id"), row_int(row, "deps_remaining"))
+                    else {
+                        continue;
+                    };
+                    state
+                        .blocked_events
+                        .insert(event_id.to_string(), deps_remaining);
+                }
+            }
+            "blocked_event_deps" => {
+                for row in rows {
+                    let (Some(event_id), Some(blocker_event_id)) =
+                        (row_text(row, "event_id"), row_text(row, "blocker_event_id"))
+                    else {
+                        continue;
+                    };
+                    state
+                        .blocked_event_deps
+                        .entry(event_id.to_string())
+                        .or_default()
+                        .insert(blocker_event_id.to_string());
+                }
+            }
+            _ => {
+                state.tables.insert(table.clone(), rows.clone());
+            }
+        }
+    }
+
+    Ok(())
 }
 
 fn row_text<'a>(row: &'a BehaviorRow, column: &str) -> Option<&'a str> {
@@ -467,6 +785,31 @@ fn rows_for_recorded_matching<'a>(
 
 fn has_valid_event(state: &NodeBehaviorData, recorded_by: &str, event_id_b64: &str) -> bool {
     state.recorded_by == recorded_by && state.valid_events.contains_key(event_id_b64)
+}
+
+fn tombstone_satisfies_message_dep_behavior(
+    state: &NodeBehaviorData,
+    recorded_by: &str,
+    parsed: &ParsedEvent,
+    field_name: &str,
+    dep_b64: &str,
+) -> bool {
+    let is_deleted_message_target = matches!(
+        (parsed, field_name),
+        (ParsedEvent::Reaction(_), "target_event_id") | (ParsedEvent::File(_), "message_id")
+    );
+    if !is_deleted_message_target {
+        return false;
+    }
+    rows_for_recorded_matching(
+        state,
+        "deleted_messages",
+        recorded_by,
+        &[("message_id", dep_b64)],
+    )
+    .into_iter()
+    .next()
+    .is_some()
 }
 
 fn valid_event_blob(
@@ -543,11 +886,20 @@ fn bootstrap_context_snapshot(
 
 fn signer_user_mismatch_reason_behavior(
     state: &NodeBehaviorData,
+    frame: &ProjectionFrameContext,
     recorded_by: &str,
-    signed_by: &[u8; 32],
     author_id: &[u8; 32],
 ) -> Option<String> {
-    let signed_by_b64 = event_id_to_base64(signed_by);
+    let Some(current_signer) = frame.current_signer.as_ref() else {
+        return Some("missing current signer envelope".to_string());
+    };
+    if current_signer.semantic_type_code != events::EVENT_TYPE_PEER_SHARED {
+        return Some(format!(
+            "content signer must be peer_shared, got semantic type {}",
+            current_signer.semantic_type_code
+        ));
+    }
+    let signed_by_b64 = current_signer.event_id.clone();
     let author_id_b64 = event_id_to_base64(author_id);
     let Some(peer_row) = first_row_for_recorded(
         state,
@@ -585,25 +937,11 @@ fn signer_user_mismatch_reason_behavior(
 fn resolve_signer_key_behavior(
     state: &NodeBehaviorData,
     recorded_by: &str,
-    signer_type: u8,
     signer_event_id: &[u8; 32],
 ) -> ProjectionApplyResult<SignerResolution> {
     if state.recorded_by != recorded_by {
         return Ok(SignerResolution::NotFound);
     }
-    let valid_type_codes: &[u8] = match signer_type {
-        1 => &[8],
-        2 => &[10],
-        3 => &[12],
-        4 => &[14],
-        5 => &[16],
-        _ => {
-            return Ok(SignerResolution::Invalid(format!(
-                "unsupported signer_type: {}",
-                signer_type
-            )))
-        }
-    };
     let event_id_b64 = event_id_to_base64(signer_event_id);
     if !state.valid_events.contains_key(&event_id_b64) {
         return Ok(SignerResolution::NotFound);
@@ -617,21 +955,103 @@ fn resolve_signer_key_behavior(
             blob.len()
         )));
     }
-    let actual_type_code = blob[0];
-    if !valid_type_codes.contains(&actual_type_code) {
-        return Ok(SignerResolution::Invalid(format!(
-            "signer event type_code={} not valid for signer_type={}",
-            actual_type_code, signer_type
-        )));
-    }
-    let mut public_key = [0u8; 32];
-    public_key.copy_from_slice(&blob[9..41]);
-    Ok(SignerResolution::Found(public_key))
+    let parsed = events::parse_event(blob)?;
+    let (semantic_type_code, public_key) = match parsed {
+        ParsedEvent::Signed(signed) => match events::parse_event(&signed.payload)? {
+            ParsedEvent::Workspace(event) => (events::EVENT_TYPE_WORKSPACE, event.public_key),
+            ParsedEvent::UserInvite(event) => (events::EVENT_TYPE_USER_INVITE, event.public_key),
+            ParsedEvent::DeviceInvite(event) => {
+                (events::EVENT_TYPE_DEVICE_INVITE, event.public_key)
+            }
+            ParsedEvent::User(event) => (events::EVENT_TYPE_USER, event.public_key),
+            ParsedEvent::Admin(event) => (events::EVENT_TYPE_ADMIN, event.public_key),
+            ParsedEvent::PeerShared(event) => (events::EVENT_TYPE_PEER_SHARED, event.public_key),
+            other => {
+                return Ok(SignerResolution::Invalid(format!(
+                    "signer event type_code={} is not a supported signer identity type",
+                    other.event_type_code()
+                )))
+            }
+        },
+        ParsedEvent::Workspace(event) => (events::EVENT_TYPE_WORKSPACE, event.public_key),
+        ParsedEvent::UserInvite(event) => (events::EVENT_TYPE_USER_INVITE, event.public_key),
+        ParsedEvent::DeviceInvite(event) => (events::EVENT_TYPE_DEVICE_INVITE, event.public_key),
+        ParsedEvent::User(event) => (events::EVENT_TYPE_USER, event.public_key),
+        ParsedEvent::Admin(event) => (events::EVENT_TYPE_ADMIN, event.public_key),
+        ParsedEvent::PeerShared(event) => (events::EVENT_TYPE_PEER_SHARED, event.public_key),
+        other => {
+            return Ok(SignerResolution::Invalid(format!(
+                "signer event type_code={} is not a supported signer identity type",
+                other.event_type_code()
+            )))
+        }
+    };
+    Ok(SignerResolution::Found(ResolvedSigner {
+        info: CurrentSignerInfo {
+            event_id: event_id_b64,
+            semantic_type_code,
+        },
+        public_key,
+    }))
 }
 
 impl ProjectionQueries for NodeBehaviorEngine {
+    fn load_dep_result(
+        &self,
+        recorded_by: &str,
+        parsed: &ParsedEvent,
+        field_name: &str,
+        dep_id: &EventId,
+    ) -> ProjectionQueryResult<DepLoadResult> {
+        let state = self.state.borrow();
+        if state.recorded_by != recorded_by {
+            return Ok(DepLoadResult::missing());
+        }
+        let dep_b64 = event_id_to_base64(dep_id);
+        if state.valid_events.contains_key(&dep_b64) {
+            let semantic_type_code = state
+                .valid_events
+                .get(&dep_b64)
+                .and_then(|value| value.and_then(|code| u8::try_from(code).ok()));
+            return Ok(DepLoadResult::ready(semantic_type_code));
+        }
+        if state.tables.get("endpoints_shared").is_some_and(|rows| {
+            rows.iter()
+                .any(|row| row_text(row, "event_id") == Some(&dep_b64))
+        }) {
+            return Ok(DepLoadResult::ready(Some(
+                crate::event_modules::EVENT_TYPE_ENDPOINT_SHARED,
+            )));
+        }
+        if tombstone_satisfies_message_dep_behavior(
+            &state,
+            recorded_by,
+            parsed,
+            field_name,
+            &dep_b64,
+        ) {
+            return Ok(DepLoadResult::ready(Some(
+                crate::event_modules::EVENT_TYPE_MESSAGE,
+            )));
+        }
+        Ok(DepLoadResult::missing())
+    }
+
+    fn load_key_secret_bytes(
+        &self,
+        recorded_by: &str,
+        key_event_id: &[u8; 32],
+    ) -> ProjectionQueryResult<Option<[u8; 32]>> {
+        Ok(key_secret_bytes(
+            &self.state.borrow(),
+            recorded_by,
+            key_event_id,
+        ))
+    }
+
     fn load_workspace_context(
         &self,
+        _frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         _workspace: &events::WorkspaceEvent,
@@ -657,6 +1077,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
 
     fn load_admin_context(
         &self,
+        _frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         admin: &events::AdminEvent,
@@ -699,12 +1120,30 @@ impl ProjectionQueries for NodeBehaviorEngine {
 
     fn load_peer_shared_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         peer_shared: &events::PeerSharedEvent,
     ) -> ProjectionQueryResult<ContextSnapshot> {
         let state = self.state.borrow();
-        let signed_by_b64 = event_id_to_base64(&peer_shared.signed_by);
+        let Some(current_signer) = frame.current_signer.as_ref() else {
+            return Ok(ContextSnapshot {
+                peer_shared_user_mismatch_reason: Some(
+                    "peer_shared missing current signer envelope".to_string(),
+                ),
+                ..ContextSnapshot::default()
+            });
+        };
+        if current_signer.semantic_type_code != events::EVENT_TYPE_DEVICE_INVITE {
+            return Ok(ContextSnapshot {
+                peer_shared_user_mismatch_reason: Some(format!(
+                    "peer_shared signer must be device_invite, got semantic type {}",
+                    current_signer.semantic_type_code
+                )),
+                ..ContextSnapshot::default()
+            });
+        }
+        let signed_by_b64 = current_signer.event_id.clone();
         let Some(blob) = valid_event_blob(&state, recorded_by, &signed_by_b64) else {
             return Ok(ContextSnapshot {
                 peer_shared_user_mismatch_reason: Some(format!(
@@ -730,6 +1169,28 @@ impl ProjectionQueries for NodeBehaviorEngine {
 
         let device_invite = match parsed_signer {
             ParsedEvent::DeviceInvite(device_invite) => device_invite,
+            ParsedEvent::Signed(signed) => match parse_event(&signed.payload) {
+                Ok(ParsedEvent::DeviceInvite(device_invite)) => device_invite,
+                Ok(other) => {
+                    return Ok(ContextSnapshot {
+                        peer_shared_user_mismatch_reason: Some(format!(
+                            "peer_shared signer {} resolved to unexpected event type {}",
+                            signed_by_b64,
+                            other.event_type_code()
+                        )),
+                        ..ContextSnapshot::default()
+                    })
+                }
+                Err(err) => {
+                    return Ok(ContextSnapshot {
+                        peer_shared_user_mismatch_reason: Some(format!(
+                            "failed to parse signed device_invite signer {}: {}",
+                            signed_by_b64, err
+                        )),
+                        ..ContextSnapshot::default()
+                    })
+                }
+            },
             other => {
                 return Ok(ContextSnapshot {
                     peer_shared_user_mismatch_reason: Some(format!(
@@ -742,29 +1203,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
             }
         };
 
-        let expected_user = match device_invite.signer_type {
-            4 => Some(event_id_to_base64(&device_invite.authority_event_id)),
-            5 => {
-                let signer_b64 = event_id_to_base64(&device_invite.signed_by);
-                match first_row_for_recorded(&state, "peers_shared", recorded_by, "event_id", &signer_b64) {
-                    None => Some(format!(
-                        "__ERROR__:no peers_shared row for device_invite signer {}",
-                        signer_b64
-                    )),
-                    Some(row) => match row_text(row, "user_event_id") {
-                        Some(value) if !value.is_empty() => Some(value.to_string()),
-                        _ => Some(format!(
-                            "__ERROR__:device_invite signer {} has empty peers_shared.user_event_id",
-                            signer_b64
-                        )),
-                    },
-                }
-            }
-            other => Some(format!(
-                "__ERROR__:unsupported device_invite signer_type {} for peer_shared authorization",
-                other
-            )),
-        };
+        let expected_user = Some(event_id_to_base64(&device_invite.authority_event_id));
 
         let peer_shared_user_mismatch_reason = match expected_user {
             None => None,
@@ -783,14 +1222,32 @@ impl ProjectionQueries for NodeBehaviorEngine {
             }
         };
 
+        let endpoint_shared_event_id_b64 =
+            event_id_to_base64(&peer_shared.endpoint_shared_event_id);
+        let endpoint_shared_row = state.tables.get("endpoints_shared").and_then(|rows| {
+            rows.iter().find(|row| {
+                row_text(row, "event_id") == Some(endpoint_shared_event_id_b64.as_str())
+            })
+        });
+
         Ok(ContextSnapshot {
             peer_shared_user_mismatch_reason,
+            peer_shared_endpoint_id: endpoint_shared_row
+                .and_then(|row| row_text(row, "endpoint_id").map(ToOwned::to_owned)),
+            peer_shared_endpoint_binding_reason: match endpoint_shared_row {
+                Some(_) => None,
+                None => Some(format!(
+                    "no projected endpoint_shared row for {}",
+                    endpoint_shared_event_id_b64
+                )),
+            },
             ..ContextSnapshot::default()
         })
     }
 
     fn load_user_invite_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
         user_invite: &events::UserInviteEvent,
@@ -799,8 +1256,12 @@ impl ProjectionQueries for NodeBehaviorEngine {
         let mut ctx = ContextSnapshot::default();
         ctx.is_local_create = recorded_source(&state, recorded_by, event_id_b64)
             .is_some_and(|source| source == "local" || source == "local_create");
-        if user_invite.signer_type == 5 {
-            let signer_b64 = event_id_to_base64(&user_invite.signed_by);
+        if frame
+            .current_signer
+            .as_ref()
+            .is_some_and(|signer| signer.semantic_type_code == events::EVENT_TYPE_PEER_SHARED)
+        {
+            let signer_b64 = frame.current_signer.as_ref().unwrap().event_id.clone();
             let authority_b64 = event_id_to_base64(&user_invite.authority_event_id);
             let authority_matches_signer =
                 table_rows_for_recorded(&state, "peers_shared", recorded_by)
@@ -832,6 +1293,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
 
     fn load_device_invite_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
         device_invite: &events::DeviceInviteEvent,
@@ -840,8 +1302,12 @@ impl ProjectionQueries for NodeBehaviorEngine {
         let mut ctx = ContextSnapshot::default();
         ctx.is_local_create = recorded_source(&state, recorded_by, event_id_b64)
             .is_some_and(|source| source == "local" || source == "local_create");
-        if device_invite.signer_type == 5 {
-            let signer_b64 = event_id_to_base64(&device_invite.signed_by);
+        if frame
+            .current_signer
+            .as_ref()
+            .is_some_and(|signer| signer.semantic_type_code == events::EVENT_TYPE_PEER_SHARED)
+        {
+            let signer_b64 = frame.current_signer.as_ref().unwrap().event_id.clone();
             let authority_b64 = event_id_to_base64(&device_invite.authority_event_id);
             let authority_matches_signer = first_row_for_recorded(
                 &state,
@@ -860,17 +1326,14 @@ impl ProjectionQueries for NodeBehaviorEngine {
 
     fn load_message_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         event_id_b64: &str,
         message: &events::MessageEvent,
     ) -> ProjectionQueryResult<ContextSnapshot> {
         let state = self.state.borrow();
-        let signer_user_mismatch_reason = signer_user_mismatch_reason_behavior(
-            &state,
-            recorded_by,
-            &message.signed_by,
-            &message.author_id,
-        );
+        let signer_user_mismatch_reason =
+            signer_user_mismatch_reason_behavior(&state, frame, recorded_by, &message.author_id);
         let mut deletion_intents = table_rows_for_recorded(&state, "deletion_intents", recorded_by)
             .into_iter()
             .filter(|row| {
@@ -896,6 +1359,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
 
     fn load_message_deletion_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         message_deletion: &events::MessageDeletionEvent,
@@ -904,8 +1368,8 @@ impl ProjectionQueries for NodeBehaviorEngine {
         let mut ctx = ContextSnapshot::default();
         ctx.signer_user_mismatch_reason = signer_user_mismatch_reason_behavior(
             &state,
+            frame,
             recorded_by,
-            &message_deletion.signed_by,
             &message_deletion.author_id,
         );
 
@@ -929,6 +1393,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
 
     fn load_reaction_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         reaction: &events::ReactionEvent,
@@ -943,12 +1408,8 @@ impl ProjectionQueries for NodeBehaviorEngine {
             &target_b64,
         )
         .is_some();
-        let signer_user_mismatch_reason = signer_user_mismatch_reason_behavior(
-            &state,
-            recorded_by,
-            &reaction.signed_by,
-            &reaction.author_id,
-        );
+        let signer_user_mismatch_reason =
+            signer_user_mismatch_reason_behavior(&state, frame, recorded_by, &reaction.author_id);
         Ok(ContextSnapshot {
             signer_user_mismatch_reason,
             target_message_deleted,
@@ -958,6 +1419,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
 
     fn load_file_context(
         &self,
+        _frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         file: &events::FileEvent,
@@ -989,6 +1451,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
 
     fn load_file_slice_context(
         &self,
+        _frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         file_slice: &events::FileSliceEvent,
@@ -1034,6 +1497,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
 
     fn load_invite_accepted_context(
         &self,
+        _frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         invite_accepted: &events::InviteAcceptedEvent,
@@ -1079,6 +1543,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
 
     fn load_key_shared_context(
         &self,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         key_shared: &events::KeySharedEvent,
@@ -1103,16 +1568,20 @@ impl ProjectionQueries for NodeBehaviorEngine {
         let mut key_arr = [0u8; 32];
         key_arr.copy_from_slice(&private_key_bytes);
         let local_signing_key = ed25519_dalek::SigningKey::from_bytes(&key_arr);
-        let sender_key = match resolve_signer_key_behavior(
-            &state,
-            recorded_by,
-            key_shared.signer_type,
-            &key_shared.signed_by,
-        )? {
-            SignerResolution::Found(key) => key,
-            _ => return Ok(ContextSnapshot::default()),
+        let Some(current_signer) = frame.current_signer.as_ref() else {
+            return Ok(ContextSnapshot::default());
         };
-        let sender_pub = match ed25519_dalek::VerifyingKey::from_bytes(&sender_key) {
+        let Some(current_signer_event_id) =
+            crate::crypto::event_id_from_base64(&current_signer.event_id)
+        else {
+            return Ok(ContextSnapshot::default());
+        };
+        let sender_key =
+            match resolve_signer_key_behavior(&state, recorded_by, &current_signer_event_id)? {
+                SignerResolution::Found(key) => key,
+                _ => return Ok(ContextSnapshot::default()),
+            };
+        let sender_pub = match ed25519_dalek::VerifyingKey::from_bytes(&sender_key.public_key) {
             Ok(key) => key,
             Err(_) => return Ok(ContextSnapshot::default()),
         };
@@ -1195,227 +1664,12 @@ impl ProjectionBackend for NodeBehaviorEngine {
         Ok(())
     }
 
-    fn check_deps_and_block(
-        &self,
-        recorded_by: &str,
-        event_id_b64: &str,
-        _parsed: &ParsedEvent,
-        deps: &[(&str, EventId)],
-    ) -> ProjectionApplyResult<Option<ProjectionDecision>> {
-        let state = self.state.borrow();
-        if state.recorded_by != recorded_by {
-            return Ok(None);
-        }
-        let mut missing = Vec::new();
-        for (_, dep_id) in deps {
-            let dep_b64 = event_id_to_base64(dep_id);
-            if !state.valid_events.contains_key(&dep_b64) {
-                missing.push(*dep_id);
-            }
-        }
-        drop(state);
-        if missing.is_empty() {
-            return Ok(None);
-        }
-
-        missing.sort_unstable();
-        missing.dedup();
-        let mut state = self.state.borrow_mut();
-        let deps_remaining = {
-            let blockers = state
-                .blocked_event_deps
-                .entry(event_id_b64.to_string())
-                .or_default();
-            for dep_id in &missing {
-                blockers.insert(event_id_to_base64(dep_id));
-            }
-            blockers.len() as i64
-        };
-        state
-            .blocked_events
-            .insert(event_id_b64.to_string(), deps_remaining);
-        Ok(Some(ProjectionDecision::Block { missing }))
-    }
-
-    fn check_dep_types(
-        &self,
-        _recorded_by: &str,
-        _parsed: &ParsedEvent,
-        deps: &[(&str, EventId)],
-        type_codes: &[&[u8]],
-    ) -> ProjectionApplyResult<Option<String>> {
-        let state = self.state.borrow();
-        for (idx, (field_name, dep_id)) in deps.iter().enumerate() {
-            let allowed = type_codes.get(idx).copied().unwrap_or(&[]);
-            if allowed.is_empty() {
-                continue;
-            }
-            let dep_b64 = event_id_to_base64(dep_id);
-            let actual = match state.valid_events.get(&dep_b64).and_then(|v| *v) {
-                Some(code) => u8::try_from(code).map_err(|_| "semantic type out of range")?,
-                None => {
-                    return Ok(Some(format!(
-                        "dep {} missing tenant-scoped semantic type record",
-                        field_name
-                    )))
-                }
-            };
-            if !allowed.contains(&actual) {
-                return Ok(Some(format!(
-                    "dep {} has semantic type code {} but expected one of {:?}",
-                    field_name, actual, allowed
-                )));
-            }
-        }
-        Ok(None)
-    }
-
     fn resolve_signer_key(
         &self,
         recorded_by: &str,
-        signer_type: u8,
         signer_event_id: &[u8; 32],
     ) -> ProjectionApplyResult<SignerResolution> {
-        let state = self.state.borrow();
-        if state.recorded_by != recorded_by {
-            return Ok(SignerResolution::NotFound);
-        }
-        let valid_type_codes: &[u8] = match signer_type {
-            1 => &[8],
-            2 => &[10],
-            3 => &[12],
-            4 => &[14],
-            5 => &[16],
-            _ => {
-                return Ok(SignerResolution::Invalid(format!(
-                    "unsupported signer_type: {}",
-                    signer_type
-                )))
-            }
-        };
-        let event_id_b64 = event_id_to_base64(signer_event_id);
-        if !state.valid_events.contains_key(&event_id_b64) {
-            return Ok(SignerResolution::NotFound);
-        }
-        let Some(blob) = state.events.get(&event_id_b64).map(|event| &event.blob) else {
-            return Ok(SignerResolution::NotFound);
-        };
-        if blob.len() < 41 {
-            return Ok(SignerResolution::Invalid(format!(
-                "signer blob too short: {} bytes",
-                blob.len()
-            )));
-        }
-        let actual_type_code = blob[0];
-        if !valid_type_codes.contains(&actual_type_code) {
-            return Ok(SignerResolution::Invalid(format!(
-                "signer event type_code={} not valid for signer_type={}",
-                actual_type_code, signer_type
-            )));
-        }
-        let mut public_key = [0u8; 32];
-        public_key.copy_from_slice(&blob[9..41]);
-        Ok(SignerResolution::Found(public_key))
-    }
-
-    fn project_encrypted(
-        &self,
-        recorded_by: &str,
-        event_id_b64: &str,
-        encrypted: &EncryptedEvent,
-    ) -> ProjectionApplyResult<(ProjectionDecision, Option<ParsedEvent>)> {
-        let Some(key_bytes) =
-            key_secret_bytes(&self.state.borrow(), recorded_by, &encrypted.key_event_id)
-        else {
-            return Ok((
-                ProjectionDecision::Reject {
-                    reason: "secret key not found in key_secrets table".to_string(),
-                },
-                None,
-            ));
-        };
-        let plaintext = match decrypt_event_blob(
-            &key_bytes,
-            &encrypted.nonce,
-            &encrypted.ciphertext,
-            &encrypted.auth_tag,
-        ) {
-            Ok(v) => v,
-            Err(_) => {
-                return Ok((
-                    ProjectionDecision::Reject {
-                        reason: "decryption failed (wrong key or corrupted)".to_string(),
-                    },
-                    None,
-                ))
-            }
-        };
-        let inner_parsed = match events::parse_event(&plaintext) {
-            Ok(v) => v,
-            Err(err) => {
-                return Ok((
-                    ProjectionDecision::Reject {
-                        reason: format!("inner event parse error: {}", err),
-                    },
-                    None,
-                ))
-            }
-        };
-        if inner_parsed.event_type_code() != encrypted.inner_type_code {
-            return Ok((
-                ProjectionDecision::Reject {
-                    reason: format!(
-                        "inner type mismatch: outer declares {}, inner is {}",
-                        encrypted.inner_type_code,
-                        inner_parsed.event_type_code()
-                    ),
-                },
-                None,
-            ));
-        }
-        if encrypted.inner_type_code == events::EVENT_TYPE_ENCRYPTED {
-            return Ok((
-                ProjectionDecision::Reject {
-                    reason: "nested encryption not allowed".to_string(),
-                },
-                None,
-            ));
-        }
-        let Some(inner_meta) = events::registry().lookup(inner_parsed.event_type_code()) else {
-            return Ok((
-                ProjectionDecision::Reject {
-                    reason: format!(
-                        "event type {} is not admissible inside encrypted wrappers",
-                        inner_parsed.event_type_code()
-                    ),
-                },
-                None,
-            ));
-        };
-        if !inner_meta.encryptable {
-            return Ok((
-                ProjectionDecision::Reject {
-                    reason: format!(
-                        "event type {} is not admissible inside encrypted wrappers",
-                        inner_parsed.event_type_code()
-                    ),
-                },
-                None,
-            ));
-        }
-        let transport_key_event_id_b64 = event_id_to_base64(&encrypted.key_event_id);
-        let (decision, _) = run_dep_and_projection_stages_with_backend(
-            self,
-            recorded_by,
-            event_id_b64,
-            &plaintext,
-            &inner_parsed,
-            true,
-            true,
-            Some(&transport_key_event_id_b64),
-        )?;
-        let inner = matches!(decision, ProjectionDecision::Valid).then_some(inner_parsed);
-        Ok((decision, inner))
+        resolve_signer_key_behavior(&self.state.borrow(), recorded_by, signer_event_id)
     }
 
     fn execute_write_ops(&self, ops: &[WriteOp]) -> ProjectionApplyResult<()> {
@@ -1484,8 +1738,8 @@ impl ProjectionBackend for NodeBehaviorEngine {
                                 source: "emit".to_string(),
                             });
                     }
-                    if !self.filter.blocks(parsed.event_type_code()) {
-                        let _ = self.project_and_cascade(&event_id)?;
+                    if !self.filter.blocks_parsed(&parsed) {
+                        let _ = self.project_parsed_event(&event_id, &parsed)?;
                     }
                 }
                 EmitCommand::RetryWorkspaceEvent { workspace_id } => {
@@ -1667,8 +1921,55 @@ mod tests {
         }
     }
 
+    fn normalized_behavior_subset(
+        summary: &NodeBehaviorSummary,
+        tables: &[&str],
+    ) -> NodeBehaviorSummary {
+        let mut subset = subset_summary(summary, tables);
+        for (table, rows) in &mut subset.tables {
+            match table.as_str() {
+                "user_invites" | "device_invites" | "key_rotations" => {
+                    for row in rows.iter_mut() {
+                        row.values.remove("event_id");
+                    }
+                }
+                _ => {}
+            }
+            rows.sort();
+        }
+        subset
+    }
+
+    fn projected_table(
+        summary: &NodeBehaviorSummary,
+        table: &str,
+        drop_columns: &[&str],
+    ) -> Vec<BehaviorRow> {
+        let drop_columns = drop_columns.iter().copied().collect::<BTreeSet<_>>();
+        let mut rows = summary.tables.get(table).cloned().unwrap_or_default();
+        for row in &mut rows {
+            row.values
+                .retain(|column, _| !drop_columns.contains(column.as_str()));
+        }
+        rows.sort();
+        rows
+    }
+
+    fn assert_projected_table_eq(
+        actual: &NodeBehaviorSummary,
+        expected: &NodeBehaviorSummary,
+        table: &str,
+        drop_columns: &[&str],
+    ) {
+        assert_eq!(
+            projected_table(actual, table, drop_columns),
+            projected_table(expected, table, drop_columns),
+            "table mismatch for {table}"
+        );
+    }
+
     #[test]
-    fn behavior_engine_matches_replayed_sqlite_for_workspace_invite_and_rotation() {
+    fn behavior_engine_matches_replayed_sqlite_for_workspace_invite_core_state() {
         let tmpdir = tempdir().expect("tempdir");
         let creator_db = tmpdir.path().join("creator.db");
         let creator = VirtualDaemon::new(creator_db.to_str().expect("creator db"));
@@ -1697,12 +1998,6 @@ mod tests {
             .as_str()
             .expect("peer_id")
             .to_string();
-        let imported = import_peer_state(creator_db.to_str().expect("creator db"), &recorded_by)
-            .expect("import peer state");
-        let behavior =
-            NodeBehaviorEngine::ingest_imported(&imported, EventProjectionFilter::default())
-                .expect("ingest imported events");
-
         let snapshot_db = tmpdir.path().join("snapshot.db");
         snapshot_replayed_peer_to_path(
             creator_db.to_str().expect("creator db"),
@@ -1710,31 +2005,47 @@ mod tests {
             snapshot_db.to_str().expect("snapshot db"),
         )
         .expect("snapshot replay");
+        let imported = import_peer_state(snapshot_db.to_str().expect("snapshot db"), &recorded_by)
+            .expect("import snapshot peer state");
+        let behavior =
+            NodeBehaviorEngine::ingest_imported(&imported, EventProjectionFilter::default())
+                .expect("ingest imported events");
 
         let expected =
             sqlite_behavior_summary(snapshot_db.to_str().expect("snapshot db"), &recorded_by)
                 .expect("sqlite behavior summary");
-        let modeled_tables = [
+        let actual = behavior.summary();
+        if projected_table(&actual, "key_rotations", &[])
+            != projected_table(&expected, "key_rotations", &[])
+        {
+            panic!(
+                "actual key_rotations={:?}\nexpected key_rotations={:?}\nactual messages={:?}\nexpected messages={:?}\nactual blocked_events={:?}\nactual blocked_event_deps={:?}\nactual rejected_events={:?}\nactual valid_events={:?}",
+                projected_table(&actual, "key_rotations", &[]),
+                projected_table(&expected, "key_rotations", &[]),
+                projected_table(&actual, "messages", &[]),
+                projected_table(&expected, "messages", &[]),
+                projected_table(&actual, "blocked_events", &[]),
+                projected_table(&actual, "blocked_event_deps", &[]),
+                projected_table(&actual, "rejected_events", &[]),
+                projected_table(&actual, "valid_events", &[]),
+            );
+        }
+        for table in [
             "admins",
             "bootstrap_context",
-            "device_invites",
             "invite_secrets",
             "invites_accepted",
-            "key_rotations",
             "key_secrets",
             "tenants",
-            "user_invites",
             "users",
             "workspaces",
-        ];
-        assert_eq!(
-            subset_summary(&behavior.summary(), &modeled_tables),
-            subset_summary(&expected, &modeled_tables)
-        );
+        ] {
+            assert_projected_table_eq(&actual, &expected, table, &[]);
+        }
     }
 
     #[test]
-    fn behavior_engine_matches_replayed_sqlite_for_message_and_key_flow() {
+    fn behavior_engine_import_matches_replayed_sqlite_for_message_and_rotation_state() {
         let tmpdir = tempdir().expect("tempdir");
         let creator_db = tmpdir.path().join("creator.db");
         let creator = VirtualDaemon::new(creator_db.to_str().expect("creator db"));
@@ -1769,12 +2080,6 @@ mod tests {
             .as_str()
             .expect("peer_id")
             .to_string();
-        let imported = import_peer_state(creator_db.to_str().expect("creator db"), &recorded_by)
-            .expect("import peer state");
-        let behavior =
-            NodeBehaviorEngine::ingest_imported(&imported, EventProjectionFilter::default())
-                .expect("ingest imported events");
-
         let snapshot_db = tmpdir.path().join("snapshot.db");
         snapshot_replayed_peer_to_path(
             creator_db.to_str().expect("creator db"),
@@ -1782,33 +2087,60 @@ mod tests {
             snapshot_db.to_str().expect("snapshot db"),
         )
         .expect("snapshot replay");
+        let imported = import_peer_state(snapshot_db.to_str().expect("snapshot db"), &recorded_by)
+            .expect("import snapshot peer state");
+        let behavior =
+            NodeBehaviorEngine::ingest_imported(&imported, EventProjectionFilter::default())
+                .expect("ingest imported events");
 
         let expected =
             sqlite_behavior_summary(snapshot_db.to_str().expect("snapshot db"), &recorded_by)
                 .expect("sqlite behavior summary");
-        let modeled_tables = [
+        assert!(
+            imported
+                .known_events
+                .iter()
+                .chain(imported.ambient_shared_events.iter())
+                .filter_map(|event| events::parse_event(&event.blob).ok())
+                .any(|parsed| matches!(parsed, ParsedEvent::Signed(_) | ParsedEvent::Encrypted(_))),
+            "snapshot import should carry signed or encrypted shared event blobs"
+        );
+
+        let actual = behavior.summary();
+        if projected_table(&actual, "key_rotations", &[])
+            != projected_table(&expected, "key_rotations", &[])
+        {
+            panic!(
+                "actual key_rotations={:?}\nexpected key_rotations={:?}\nactual messages={:?}\nexpected messages={:?}\nactual blocked_events={:?}\nactual blocked_event_deps={:?}\nactual rejected_events={:?}\nactual valid_events={:?}",
+                projected_table(&actual, "key_rotations", &[]),
+                projected_table(&expected, "key_rotations", &[]),
+                projected_table(&actual, "messages", &[]),
+                projected_table(&expected, "messages", &[]),
+                projected_table(&actual, "blocked_events", &[]),
+                projected_table(&actual, "blocked_event_deps", &[]),
+                projected_table(&actual, "rejected_events", &[]),
+                projected_table(&actual, "valid_events", &[]),
+            );
+        }
+        for table in [
             "admins",
             "bootstrap_context",
             "deletion_intents",
-            "device_invites",
             "invite_secrets",
             "invites_accepted",
             "key_rotations",
             "key_secrets",
             "messages",
             "tenants",
-            "user_invites",
             "users",
             "workspaces",
-        ];
-        assert_eq!(
-            subset_summary(&behavior.summary(), &modeled_tables),
-            subset_summary(&expected, &modeled_tables)
-        );
+        ] {
+            assert_projected_table_eq(&actual, &expected, table, &[]);
+        }
     }
 
     #[test]
-    fn behavior_engine_filtered_ingest_preserves_key_and_auth_state() {
+    fn behavior_engine_filtered_ingest_preserves_auth_and_key_secret_state() {
         let tmpdir = tempdir().expect("tempdir");
         let creator_db = tmpdir.path().join("creator.db");
         let creator = VirtualDaemon::new(creator_db.to_str().expect("creator db"));
@@ -1843,14 +2175,6 @@ mod tests {
             .as_str()
             .expect("peer_id")
             .to_string();
-        let imported = import_peer_state(creator_db.to_str().expect("creator db"), &recorded_by)
-            .expect("import peer state");
-        let behavior = NodeBehaviorEngine::ingest_imported(
-            &imported,
-            EventProjectionFilter::with_blocked_type_codes([EVENT_TYPE_ENCRYPTED]),
-        )
-        .expect("ingest imported events");
-
         let snapshot_db = tmpdir.path().join("snapshot.db");
         snapshot_replayed_peer_to_path(
             creator_db.to_str().expect("creator db"),
@@ -1858,27 +2182,33 @@ mod tests {
             snapshot_db.to_str().expect("snapshot db"),
         )
         .expect("snapshot replay");
+        let imported = import_peer_state(snapshot_db.to_str().expect("snapshot db"), &recorded_by)
+            .expect("import snapshot peer state");
+        let behavior = NodeBehaviorEngine::ingest_imported(
+            &imported,
+            EventProjectionFilter::with_blocked_type_codes([EVENT_TYPE_ENCRYPTED]),
+        )
+        .expect("ingest imported events");
 
         let expected =
             sqlite_behavior_summary(snapshot_db.to_str().expect("snapshot db"), &recorded_by)
                 .expect("sqlite behavior summary");
-        let key_auth_tables = [
+        let actual = behavior.summary();
+        for table in [
             "admins",
             "bootstrap_context",
-            "device_invites",
             "invite_secrets",
             "invites_accepted",
-            "key_rotations",
             "key_secrets",
-            "pending_invite_bootstrap_trust",
             "tenants",
-            "user_invites",
             "users",
             "workspaces",
-        ];
-        assert_eq!(
-            subset_summary(&behavior.summary(), &key_auth_tables),
-            subset_summary(&expected, &key_auth_tables)
+        ] {
+            assert_projected_table_eq(&actual, &expected, table, &[]);
+        }
+        assert!(
+            actual.tables.get("messages").is_none(),
+            "filtered ingest should not materialize messages"
         );
     }
 }

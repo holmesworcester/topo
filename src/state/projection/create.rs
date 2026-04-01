@@ -8,8 +8,8 @@ use crate::db::store::{
     insert_event, insert_recorded_event, insert_shared_event_index_entry_if_shared,
     lookup_workspace_id,
 };
-use crate::event_modules::EncryptedEvent;
 use crate::event_modules::{self as events, registry, ParsedEvent, TransportPrivacy};
+use crate::event_modules::{EncryptedEvent, SignedEvent};
 use crate::projection::encrypted::encrypt_event_blob;
 use crate::projection::signer::sign_event_bytes;
 use crate::state::live_hints::{self, LiveHintEvent};
@@ -318,34 +318,49 @@ pub fn create_event_synchronous(
     store_blob_and_project(conn, recorded_by, &blob, meta, created_at_ms)
 }
 
-/// Create a signed event: encode with zero-placeholder signature, sign the
-/// canonical bytes, overwrite signature, then store and project.
+pub(crate) fn encode_signed_wrapper_blob(
+    inner_event: &ParsedEvent,
+    signer_event_id: &EventId,
+    signing_key: &SigningKey,
+) -> Result<Vec<u8>, CreateEventError> {
+    if matches!(inner_event, ParsedEvent::Signed(_)) {
+        return Err(CreateEventError::EncodeError(
+            "nested Signed envelopes are not allowed".to_string(),
+        ));
+    }
+
+    let payload = events::encode_event(inner_event)
+        .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
+    let mut signed_blob = events::encode_event(&ParsedEvent::Signed(SignedEvent {
+        signer_event_id: *signer_event_id,
+        inner_type_code: inner_event.event_type_code(),
+        inner_created_at_ms: inner_event.created_at_ms(),
+        payload,
+        signature: [0u8; 64],
+    }))
+    .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
+    let sig = sign_event_bytes(signing_key, &signed_blob[..signed_blob.len() - 64]);
+    let sig_offset = signed_blob.len() - 64;
+    signed_blob[sig_offset..].copy_from_slice(&sig);
+    Ok(signed_blob)
+}
+
+/// Create a signed event by wrapping the inner event in a Signed envelope,
+/// signing the canonical wrapper bytes, then storing and projecting the outer blob.
 pub fn create_signed_event_synchronous(
     conn: &Connection,
     recorded_by: &str,
+    signer_event_id: &EventId,
     event: &ParsedEvent,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<EventId, CreateEventError> {
-    let mut blob =
-        events::encode_event(event).map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
+    let blob = encode_signed_wrapper_blob(event, signer_event_id, signing_key)?;
 
-    let type_code = event.event_type_code();
+    let type_code = events::EVENT_TYPE_SIGNED;
     let reg = registry();
     let meta = reg
         .lookup(type_code)
         .ok_or_else(|| CreateEventError::EncodeError(format!("unknown type code {}", type_code)))?;
-
-    if meta.signature_byte_len == 0 {
-        return Err(CreateEventError::EncodeError(
-            "create_signed_event_synchronous called for unsigned type".to_string(),
-        ));
-    }
-
-    let sig_len = meta.signature_byte_len;
-    let blob_len = blob.len();
-    let signing_bytes = &blob[..blob_len - sig_len];
-    let sig = sign_event_bytes(signing_key, signing_bytes);
-    blob[blob_len - sig_len..].copy_from_slice(&sig);
 
     let created_at_ms = event.created_at_ms() as i64;
     store_blob_and_project(conn, recorded_by, &blob, meta, created_at_ms)
@@ -358,29 +373,17 @@ pub fn create_signed_event_synchronous(
 pub fn store_signed_event_only(
     conn: &Connection,
     recorded_by: &str,
+    signer_event_id: &EventId,
     event: &ParsedEvent,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<EventId, CreateEventError> {
-    let mut blob =
-        events::encode_event(event).map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
+    let blob = encode_signed_wrapper_blob(event, signer_event_id, signing_key)?;
 
-    let type_code = event.event_type_code();
+    let type_code = events::EVENT_TYPE_SIGNED;
     let reg = registry();
     let meta = reg
         .lookup(type_code)
         .ok_or_else(|| CreateEventError::EncodeError(format!("unknown type code {}", type_code)))?;
-
-    if meta.signature_byte_len == 0 {
-        return Err(CreateEventError::EncodeError(
-            "store_signed_event_only called for unsigned type".to_string(),
-        ));
-    }
-
-    let sig_len = meta.signature_byte_len;
-    let blob_len = blob.len();
-    let signing_bytes = &blob[..blob_len - sig_len];
-    let sig = sign_event_bytes(signing_key, signing_bytes);
-    blob[blob_len - sig_len..].copy_from_slice(&sig);
 
     let created_at_ms = event.created_at_ms() as i64;
     let publish_after_commit = conn.is_autocommit();
@@ -405,6 +408,7 @@ pub fn store_signed_event_only(
 pub fn store_signed_event_then_project<F>(
     conn: &Connection,
     recorded_by: &str,
+    signer_event_id: &EventId,
     event: &ParsedEvent,
     signing_key: &ed25519_dalek::SigningKey,
     post_store: F,
@@ -412,26 +416,13 @@ pub fn store_signed_event_then_project<F>(
 where
     F: FnOnce(&Connection, &EventId) -> Result<(), CreateEventError>,
 {
-    let mut blob =
-        events::encode_event(event).map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
+    let blob = encode_signed_wrapper_blob(event, signer_event_id, signing_key)?;
 
-    let type_code = event.event_type_code();
+    let type_code = events::EVENT_TYPE_SIGNED;
     let reg = registry();
     let meta = reg
         .lookup(type_code)
         .ok_or_else(|| CreateEventError::EncodeError(format!("unknown type code {}", type_code)))?;
-
-    if meta.signature_byte_len == 0 {
-        return Err(CreateEventError::EncodeError(
-            "store_signed_event_then_project called for unsigned type".to_string(),
-        ));
-    }
-
-    let sig_len = meta.signature_byte_len;
-    let blob_len = blob.len();
-    let signing_bytes = &blob[..blob_len - sig_len];
-    let sig = sign_event_bytes(signing_key, signing_bytes);
-    blob[blob_len - sig_len..].copy_from_slice(&sig);
 
     let created_at_ms = event.created_at_ms() as i64;
     store_blob_then_project_with(conn, recorded_by, &blob, meta, created_at_ms, post_store)
@@ -490,14 +481,14 @@ pub fn project_event_staged(
 /// resolve encryption key from key_secrets, encrypt, build EncryptedEvent
 /// wrapper, then store and project.
 ///
-/// If `signing_key` is provided, the inner blob is signed before encryption
-/// (signature is inside the ciphertext — signer identity hidden from non-recipients).
+/// If signer info is provided, the encrypted wrapper is itself wrapped in an
+/// outer Signed envelope, producing Signed(Encrypted(inner)).
 pub fn create_encrypted_event_synchronous(
     conn: &Connection,
     recorded_by: &str,
     key_event_id: &EventId,
     inner_event: &ParsedEvent,
-    signing_key: Option<&SigningKey>,
+    signer: Option<(&EventId, &SigningKey)>,
 ) -> Result<EventId, CreateEventError> {
     let inner_meta = events::registry()
         .lookup(inner_event.event_type_code())
@@ -516,20 +507,10 @@ pub fn create_encrypted_event_synchronous(
     }
 
     // 1. Encode inner event
-    let mut inner_blob = events::encode_event(inner_event)
+    let inner_blob = events::encode_event(inner_event)
         .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
 
-    // 2. Sign inner blob if signing_key provided
-    if let Some(key) = signing_key {
-        let sig_len = inner_meta.signature_byte_len;
-        if sig_len > 0 {
-            let blob_len = inner_blob.len();
-            let sig = sign_event_bytes(key, &inner_blob[..blob_len - sig_len]);
-            inner_blob[blob_len - sig_len..].copy_from_slice(&sig);
-        }
-    }
-
-    // 3. Resolve encryption key from key_secrets table
+    // 2. Resolve encryption key from key_secrets table
     let key_b64 = event_id_to_base64(key_event_id);
     let key_bytes: Vec<u8> = conn
         .query_row(
@@ -548,11 +529,11 @@ pub fn create_encrypted_event_synchronous(
     let mut key_arr = [0u8; 32];
     key_arr.copy_from_slice(&key_bytes);
 
-    // 4. Encrypt
+    // 3. Encrypt
     let (nonce, ciphertext, auth_tag) = encrypt_event_blob(&key_arr, &inner_blob)
         .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
 
-    // 5. Build EncryptedEvent wrapper
+    // 4. Build EncryptedEvent wrapper
     let wrapper = ParsedEvent::Encrypted(EncryptedEvent {
         // Preserve the inner event's logical timestamp on the wrapper so
         // recency-based discovery/sync policies can prioritize encrypted
@@ -565,8 +546,17 @@ pub fn create_encrypted_event_synchronous(
         auth_tag,
     });
 
-    // 6. Use existing create_event_synchronous for the wrapper
-    create_event_synchronous(conn, recorded_by, &wrapper)
+    // 5. Store either the plaintext encrypted wrapper or Signed(Encrypted(inner)).
+    match signer {
+        Some((signer_event_id, signing_key)) => create_signed_event_synchronous(
+            conn,
+            recorded_by,
+            signer_event_id,
+            &wrapper,
+            signing_key,
+        ),
+        None => create_event_synchronous(conn, recorded_by, &wrapper),
+    }
 }
 
 /// Staged encrypted create: persist and enqueue an encrypted event even if its
@@ -577,14 +567,14 @@ pub fn create_encrypted_event_staged(
     recorded_by: &str,
     key_event_id: &EventId,
     inner_event: &ParsedEvent,
-    signing_key: Option<&SigningKey>,
+    signer: Option<(&EventId, &SigningKey)>,
 ) -> Result<EventId, CreateEventError> {
     event_id_or_blocked(create_encrypted_event_synchronous(
         conn,
         recorded_by,
         key_event_id,
         inner_event,
-        signing_key,
+        signer,
     ))
 }
 
@@ -607,12 +597,14 @@ pub fn create_event_staged(
 pub fn create_signed_event_staged(
     conn: &Connection,
     recorded_by: &str,
+    signer_event_id: &EventId,
     event: &ParsedEvent,
     signing_key: &ed25519_dalek::SigningKey,
 ) -> Result<EventId, CreateEventError> {
     event_id_or_blocked(create_signed_event_synchronous(
         conn,
         recorded_by,
+        signer_event_id,
         event,
         signing_key,
     ))
@@ -714,34 +706,28 @@ mod tests {
             public_key: invite_key.verifying_key().to_bytes(),
             workspace_id: net_eid,
             authority_event_id: net_eid,
-            signed_by: net_eid,
-            signer_type: 1,
-            signature: [0u8; 64],
         });
         let uib_eid =
-            create_signed_event_synchronous(conn, recorded_by, &uib, &workspace_key).unwrap();
+            create_signed_event_synchronous(conn, recorded_by, &net_eid, &uib, &workspace_key)
+                .unwrap();
 
         let user_key = SigningKey::generate(&mut rng);
         let ub = ParsedEvent::User(UserEvent {
             created_at_ms: now_ms(),
             public_key: user_key.verifying_key().to_bytes(),
             username: "test-user".to_string(),
-            signed_by: uib_eid,
-            signer_type: 2,
-            signature: [0u8; 64],
         });
-        let ub_eid = create_signed_event_synchronous(conn, recorded_by, &ub, &invite_key).unwrap();
+        let ub_eid =
+            create_signed_event_synchronous(conn, recorded_by, &uib_eid, &ub, &invite_key).unwrap();
 
         let device_invite_key = SigningKey::generate(&mut rng);
         let dif = ParsedEvent::DeviceInvite(DeviceInviteEvent {
             created_at_ms: now_ms(),
             public_key: device_invite_key.verifying_key().to_bytes(),
             authority_event_id: ub_eid,
-            signed_by: ub_eid,
-            signer_type: 4,
-            signature: [0u8; 64],
         });
-        let dif_eid = create_signed_event_synchronous(conn, recorded_by, &dif, &user_key).unwrap();
+        let dif_eid =
+            create_signed_event_synchronous(conn, recorded_by, &ub_eid, &dif, &user_key).unwrap();
 
         let endpoint_key = SigningKey::generate(&mut rng);
         let endpoint_event =
@@ -759,12 +745,24 @@ mod tests {
             user_event_id: ub_eid,
             endpoint_shared_event_id,
             device_name: "test-device".to_string(),
-            signed_by: dif_eid,
-            signer_type: 3,
-            signature: [0u8; 64],
         });
         let psf_eid =
-            create_signed_event_synchronous(conn, recorded_by, &psf, &device_invite_key).unwrap();
+            create_signed_event_synchronous(conn, recorded_by, &dif_eid, &psf, &device_invite_key)
+                .unwrap();
+
+        conn.execute(
+            "INSERT INTO peer_secrets
+             (recorded_by, event_id, signer_event_id, private_key, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)",
+            rusqlite::params![
+                recorded_by,
+                format!("test-peer-secret-{}", event_id_to_base64(&psf_eid)),
+                event_id_to_base64(&psf_eid),
+                peer_shared_key.to_bytes().to_vec(),
+                now_ms() as i64,
+            ],
+        )
+        .unwrap();
 
         (psf_eid, peer_shared_key, ub_eid)
     }
@@ -788,9 +786,6 @@ mod tests {
             workspace_id: net_eid,
             author_id: user_event_id,
             content: "hello".to_string(),
-            signed_by: signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64],
         });
 
         let eid = create_encrypted_event_synchronous(
@@ -798,7 +793,7 @@ mod tests {
             recorded_by,
             &key_event_id,
             &msg,
-            Some(&signing_key),
+            Some((&signer_eid, &signing_key)),
         )
         .unwrap();
         let eid_b64 = event_id_to_base64(&eid);
@@ -853,16 +848,13 @@ mod tests {
             workspace_id: net_eid,
             author_id: user_event_id,
             content: "target".to_string(),
-            signed_by: signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64],
         });
         let msg_eid = create_encrypted_event_synchronous(
             &conn,
             recorded_by,
             &key_event_id,
             &msg,
-            Some(&signing_key),
+            Some((&signer_eid, &signing_key)),
         )
         .unwrap();
 
@@ -871,16 +863,13 @@ mod tests {
             target_event_id: msg_eid,
             author_id: user_event_id,
             emoji: "\u{1f44d}".to_string(),
-            signed_by: signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64],
         });
         let rxn_eid = create_encrypted_event_synchronous(
             &conn,
             recorded_by,
             &key_event_id,
             &rxn,
-            Some(&signing_key),
+            Some((&signer_eid, &signing_key)),
         )
         .unwrap();
 
@@ -918,9 +907,6 @@ mod tests {
             target_event_id: fake_target,
             author_id: user_event_id,
             emoji: "\u{1f44d}".to_string(),
-            signed_by: signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64],
         });
 
         // Event is stored but blocked — returns Blocked error with event_id
@@ -929,7 +915,7 @@ mod tests {
             recorded_by,
             &key_event_id,
             &rxn,
-            Some(&signing_key),
+            Some((&signer_eid, &signing_key)),
         )
         .unwrap_err();
         let (eid, missing) = match err {
@@ -983,13 +969,11 @@ mod tests {
             workspace_id: [1u8; 32],
             author_id: user_event_id,
             content: "signed content".to_string(),
-            signed_by: signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64], // placeholder, will be overwritten
         });
 
-        let err = create_signed_event_synchronous(&conn, recorded_by, &msg, &signing_key)
-            .expect_err("plaintext content should be rejected");
+        let err =
+            create_signed_event_synchronous(&conn, recorded_by, &signer_eid, &msg, &signing_key)
+                .expect_err("plaintext content should be rejected");
         match err {
             CreateEventError::Rejected { reason, .. } => {
                 assert!(reason.contains("must be carried inside encrypted wrappers"));
@@ -1020,16 +1004,13 @@ mod tests {
             target_event_id: fake_target,
             author_id: user_event_id,
             emoji: "x".to_string(),
-            signed_by: signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64],
         });
         let result = create_encrypted_event_synchronous(
             &conn,
             recorded_by,
             &key_event_id,
             &rxn,
-            Some(&signing_key),
+            Some((&signer_eid, &signing_key)),
         );
         match result {
             Err(CreateEventError::Blocked { event_id, missing }) => {
@@ -1072,16 +1053,13 @@ mod tests {
             target_event_id: fake_target,
             author_id: user_event_id,
             emoji: "y".to_string(),
-            signed_by: signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64],
         });
         let eid = create_encrypted_event_staged(
             &conn,
             recorded_by,
             &key_event_id,
             &rxn,
-            Some(&signing_key),
+            Some((&signer_eid, &signing_key)),
         )
         .expect("staged API should return Ok even for blocked events");
 
@@ -1126,16 +1104,13 @@ mod tests {
             workspace_id: net_eid,
             author_id: user_event_id,
             content: "contract-valid".to_string(),
-            signed_by: signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64],
         });
         let result = create_encrypted_event_synchronous(
             &conn,
             recorded_by,
             &key_event_id,
             &msg,
-            Some(&signing_key),
+            Some((&signer_eid, &signing_key)),
         );
         assert!(
             result.is_ok(),
@@ -1178,16 +1153,13 @@ mod tests {
             target_event_id: fake_target,
             author_id: user_event_id,
             emoji: "z".to_string(),
-            signed_by: signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64],
         });
         let result = create_encrypted_event_synchronous(
             &conn,
             recorded_by,
             &key_event_id,
             &rxn,
-            Some(&signing_key),
+            Some((&signer_eid, &signing_key)),
         );
 
         match result {
@@ -1234,9 +1206,6 @@ mod tests {
             workspace_id: net_eid,
             author_id: user_event_id,
             content: "no origin recovery rows".to_string(),
-            signed_by: signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64],
         });
 
         let event_id = create_encrypted_event_synchronous(
@@ -1244,7 +1213,7 @@ mod tests {
             recorded_by,
             &key_event_id,
             &msg,
-            Some(&signing_key),
+            Some((&signer_eid, &signing_key)),
         )
         .unwrap();
 
@@ -1278,9 +1247,6 @@ mod tests {
             workspace_id: net_eid,
             author_id: user_event_id,
             content: "timestamp preserved".to_string(),
-            signed_by: signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64],
         });
 
         let event_id = create_encrypted_event_synchronous(
@@ -1288,7 +1254,7 @@ mod tests {
             recorded_by,
             &key_event_id,
             &msg,
-            Some(&signing_key),
+            Some((&signer_eid, &signing_key)),
         )
         .unwrap();
         let wrapper_blob: Vec<u8> = conn
@@ -1321,9 +1287,6 @@ mod tests {
             target_event_id: fake_target,
             author_id: user_event_id,
             emoji: "!".to_string(),
-            signed_by: signer_eid,
-            signer_type: 5,
-            signature: [0u8; 64],
         });
 
         let event_id = match create_encrypted_event_synchronous(
@@ -1331,7 +1294,7 @@ mod tests {
             recorded_by,
             &key_event_id,
             &rxn,
-            Some(&signing_key),
+            Some((&signer_eid, &signing_key)),
         ) {
             Err(CreateEventError::Blocked { event_id, missing }) => {
                 assert_eq!(missing, vec![fake_target]);

@@ -71,6 +71,23 @@ pub fn load_shared_event_index_slice(
     Ok(storage)
 }
 
+fn parse_peer_shared_endpoint_dep(blob: &[u8]) -> Result<Option<EventId>, String> {
+    match parse_event(blob).map_err(|e| format!("parse shared batch event: {e}"))? {
+        ParsedEvent::PeerShared(peer_shared) => Ok(Some(peer_shared.endpoint_shared_event_id)),
+        ParsedEvent::Signed(signed) => {
+            let inner = parse_event(&signed.payload)
+                .map_err(|e| format!("parse signed shared batch payload: {e}"))?;
+            match inner {
+                ParsedEvent::PeerShared(peer_shared) => {
+                    Ok(Some(peer_shared.endpoint_shared_event_id))
+                }
+                _ => Ok(None),
+            }
+        }
+        _ => Ok(None),
+    }
+}
+
 pub fn load_shared_send_batch_with_endpoint_deps(
     store: &Store<'_>,
     ids: &[EventId],
@@ -90,13 +107,10 @@ pub fn load_shared_send_batch_with_endpoint_deps(
         let Some(blob) = base_blobs.get(event_id) else {
             continue;
         };
-        let ParsedEvent::PeerShared(peer_shared) =
-            parse_event(blob).map_err(|e| format!("parse shared batch event: {e}"))?
-        else {
-            continue;
-        };
-        if !requested.contains(&peer_shared.endpoint_shared_event_id) {
-            endpoint_dep_ids.push(peer_shared.endpoint_shared_event_id);
+        if let Some(endpoint_dep_id) = parse_peer_shared_endpoint_dep(blob)? {
+            if !requested.contains(&endpoint_dep_id) {
+                endpoint_dep_ids.push(endpoint_dep_id);
+            }
         }
     }
     endpoint_dep_ids.sort_unstable();
@@ -113,12 +127,10 @@ pub fn load_shared_send_batch_with_endpoint_deps(
         let Some(blob) = base_blobs.get(event_id) else {
             continue;
         };
-        if let ParsedEvent::PeerShared(peer_shared) =
-            parse_event(blob).map_err(|e| format!("parse shared batch event: {e}"))?
-        {
-            if let Some(dep_blob) = dep_blobs.get(&peer_shared.endpoint_shared_event_id) {
-                if emitted.insert(peer_shared.endpoint_shared_event_id) {
-                    ordered.push((peer_shared.endpoint_shared_event_id, dep_blob.clone()));
+        if let Some(endpoint_dep_id) = parse_peer_shared_endpoint_dep(blob)? {
+            if let Some(dep_blob) = dep_blobs.get(&endpoint_dep_id) {
+                if emitted.insert(endpoint_dep_id) {
+                    ordered.push((endpoint_dep_id, dep_blob.clone()));
                 }
             }
         }
@@ -281,9 +293,6 @@ mod tests {
             user_event_id: [0x33; 32],
             endpoint_shared_event_id: endpoint_event_id,
             device_name: "device".to_string(),
-            signed_by: [0x44; 32],
-            signer_type: 3,
-            signature: [0u8; 64],
         });
         let peer_shared_blob = encode_event(&peer_shared_event).unwrap();
         let peer_shared_event_id = hash_event(&peer_shared_blob);
@@ -332,9 +341,6 @@ mod tests {
             user_event_id: [0x77; 32],
             endpoint_shared_event_id: endpoint_event_id,
             device_name: "device".to_string(),
-            signed_by: [0x88; 32],
-            signer_type: 3,
-            signature: [0u8; 64],
         });
         let peer_shared_blob = encode_event(&peer_shared_event).unwrap();
         let peer_shared_event_id = hash_event(&peer_shared_blob);

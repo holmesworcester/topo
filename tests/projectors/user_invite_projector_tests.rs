@@ -19,9 +19,6 @@ mod tests {
             public_key,
             workspace_id: [10u8; 32],
             authority_event_id: [10u8; 32],
-            signed_by: [10u8; 32],
-            signer_type: 1,
-            signature: [0u8; 64],
         })
     }
 

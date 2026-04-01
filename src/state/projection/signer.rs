@@ -2,12 +2,20 @@ use rusqlite::Connection;
 
 use crate::crypto::event_id_to_base64;
 pub use crate::crypto::{sign_event_bytes, verify_ed25519_signature};
+use crate::event_modules::{parse_event, ParsedEvent};
+use crate::projection::contract::CurrentSignerInfo;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedSigner {
+    pub info: CurrentSignerInfo,
+    pub public_key: [u8; 32],
+}
 
 /// Result of resolving a signer key from the database.
 #[derive(Debug, PartialEq)]
 pub enum SignerResolution {
     /// Key successfully resolved.
-    Found([u8; 32]),
+    Found(ResolvedSigner),
     /// Signer event not found (or not valid for this tenant).
     NotFound,
     /// Signer data is invalid (unsupported type, wrong event type, parse error).
@@ -22,24 +30,8 @@ pub enum SignerResolution {
 pub fn resolve_signer_key(
     conn: &Connection,
     recorded_by: &str,
-    signer_type: u8,
     signer_event_id: &[u8; 32],
 ) -> Result<SignerResolution, Box<dyn std::error::Error>> {
-    // Valid type codes for each signer_type
-    let valid_type_codes: &[u8] = match signer_type {
-        1 => &[8],  // Workspace
-        2 => &[10], // UserInvite
-        3 => &[12], // DeviceInvite
-        4 => &[14], // User
-        5 => &[16], // PeerShared
-        _ => {
-            return Ok(SignerResolution::Invalid(format!(
-                "unsupported signer_type: {}",
-                signer_type
-            )));
-        }
-    };
-
     let eid_b64 = event_id_to_base64(signer_event_id);
     let blob: Vec<u8> = match conn.query_row(
         "SELECT e.blob FROM events e
@@ -53,26 +45,79 @@ pub fn resolve_signer_key(
         Err(e) => return Err(e.into()),
     };
 
-    // All signer key events have public_key at blob[9..41].
-    // Minimum blob size for key extraction: 41 bytes.
-    if blob.len() < 41 {
-        return Ok(SignerResolution::Invalid(format!(
-            "signer blob too short: {} bytes",
-            blob.len()
-        )));
-    }
+    let parsed = match parse_event(&blob) {
+        Ok(parsed) => parsed,
+        Err(e) => {
+            return Ok(SignerResolution::Invalid(format!(
+                "failed to parse signer event {}: {}",
+                event_id_to_base64(signer_event_id),
+                e
+            )));
+        }
+    };
 
-    let actual_type_code = blob[0];
-    if !valid_type_codes.contains(&actual_type_code) {
-        return Ok(SignerResolution::Invalid(format!(
-            "signer event type_code={} not valid for signer_type={}",
-            actual_type_code, signer_type
-        )));
-    }
+    let (actual_type_code, public_key) = match parsed {
+        ParsedEvent::Signed(signed) => {
+            let inner = match parse_event(&signed.payload) {
+                Ok(inner) => inner,
+                Err(e) => {
+                    return Ok(SignerResolution::Invalid(format!(
+                        "failed to parse signed inner payload for signer event {}: {}",
+                        event_id_to_base64(signer_event_id),
+                        e
+                    )));
+                }
+            };
+            match signer_identity_from_parsed(&inner) {
+                Ok(identity) => identity,
+                Err(e) => return Ok(SignerResolution::Invalid(e.to_string())),
+            }
+        }
+        other => match signer_identity_from_parsed(&other) {
+            Ok(identity) => identity,
+            Err(e) => return Ok(SignerResolution::Invalid(e.to_string())),
+        },
+    };
 
-    let mut public_key = [0u8; 32];
-    public_key.copy_from_slice(&blob[9..41]);
-    Ok(SignerResolution::Found(public_key))
+    Ok(SignerResolution::Found(ResolvedSigner {
+        info: CurrentSignerInfo {
+            event_id: eid_b64,
+            semantic_type_code: actual_type_code,
+        },
+        public_key,
+    }))
+}
+
+fn signer_identity_from_parsed(
+    parsed: &ParsedEvent,
+) -> Result<(u8, [u8; 32]), Box<dyn std::error::Error>> {
+    let identity = match parsed {
+        ParsedEvent::Workspace(event) => {
+            (crate::event_modules::EVENT_TYPE_WORKSPACE, event.public_key)
+        }
+        ParsedEvent::UserInvite(event) => (
+            crate::event_modules::EVENT_TYPE_USER_INVITE,
+            event.public_key,
+        ),
+        ParsedEvent::DeviceInvite(event) => (
+            crate::event_modules::EVENT_TYPE_DEVICE_INVITE,
+            event.public_key,
+        ),
+        ParsedEvent::User(event) => (crate::event_modules::EVENT_TYPE_USER, event.public_key),
+        ParsedEvent::PeerShared(event) => (
+            crate::event_modules::EVENT_TYPE_PEER_SHARED,
+            event.public_key,
+        ),
+        ParsedEvent::Admin(event) => (crate::event_modules::EVENT_TYPE_ADMIN, event.public_key),
+        other => {
+            return Err(format!(
+                "signer event type_code={} is not a supported signer identity type",
+                other.event_type_code()
+            )
+            .into())
+        }
+    };
+    Ok(identity)
 }
 
 #[cfg(test)]
@@ -85,6 +130,7 @@ mod tests {
         store::{insert_event, insert_recorded_event},
     };
     use crate::event_modules::{encode_event, ParsedEvent, PeerSharedEvent};
+    use crate::projection::create::encode_signed_wrapper_blob;
     use ed25519_dalek::SigningKey;
     use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -177,15 +223,23 @@ mod tests {
             user_event_id: [0u8; 32],
             endpoint_shared_event_id: [0u8; 32],
             device_name: "test-device".to_string(),
-            signed_by: [1u8; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
         });
-        let blob = encode_event(&signer_event).unwrap();
+        let signer_wrapper_id = [7u8; 32];
+        let blob =
+            encode_signed_wrapper_blob(&signer_event, &signer_wrapper_id, &signing_key).unwrap();
         let event_id = insert_event_blob(&conn, recorded_by, &blob);
 
-        let result = resolve_signer_key(&conn, recorded_by, 5, &event_id).unwrap();
-        assert_eq!(result, SignerResolution::Found(public_key));
+        let result = resolve_signer_key(&conn, recorded_by, &event_id).unwrap();
+        assert_eq!(
+            result,
+            SignerResolution::Found(ResolvedSigner {
+                info: CurrentSignerInfo {
+                    event_id: event_id_to_base64(&event_id),
+                    semantic_type_code: crate::event_modules::EVENT_TYPE_PEER_SHARED,
+                },
+                public_key,
+            })
+        );
     }
 
     #[test]
@@ -193,7 +247,7 @@ mod tests {
         let conn = setup();
         let recorded_by = "peer1";
         let fake_id = [99u8; 32];
-        let result = resolve_signer_key(&conn, recorded_by, 5, &fake_id).unwrap();
+        let result = resolve_signer_key(&conn, recorded_by, &fake_id).unwrap();
         assert_eq!(result, SignerResolution::NotFound);
     }
 
@@ -207,17 +261,18 @@ mod tests {
             workspace_id: [1u8; 32],
             author_id: [2u8; 32],
             content: "not a key".to_string(),
-            signed_by: [0u8; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
         });
         let blob = encode_event(&msg).unwrap();
         let event_id = insert_event_blob(&conn, recorded_by, &blob);
 
-        let result = resolve_signer_key(&conn, recorded_by, 5, &event_id).unwrap();
+        let result = resolve_signer_key(&conn, recorded_by, &event_id).unwrap();
         match result {
             SignerResolution::Invalid(msg) => {
-                assert!(msg.contains("not valid for signer_type=5"), "msg: {}", msg);
+                assert!(
+                    msg.contains("not a supported signer identity type"),
+                    "msg: {}",
+                    msg
+                );
             }
             other => panic!("expected Invalid, got {:?}", other),
         }
@@ -227,11 +282,22 @@ mod tests {
     fn test_resolve_signer_key_unsupported_type() {
         let conn = setup();
         let recorded_by = "peer1";
-        let fake_id = [1u8; 32];
-        let result = resolve_signer_key(&conn, recorded_by, 255, &fake_id).unwrap();
+        use crate::event_modules::BenchDepEvent;
+        let unsupported = ParsedEvent::BenchDep(BenchDepEvent {
+            created_at_ms: now_ms(),
+            dep_ids: Vec::new(),
+            payload: [0u8; 16],
+        });
+        let blob = encode_event(&unsupported).unwrap();
+        let event_id = insert_event_blob(&conn, recorded_by, &blob);
+        let result = resolve_signer_key(&conn, recorded_by, &event_id).unwrap();
         match result {
             SignerResolution::Invalid(msg) => {
-                assert!(msg.contains("unsupported signer_type: 255"), "msg: {}", msg);
+                assert!(
+                    msg.contains("not a supported signer identity type"),
+                    "msg: {}",
+                    msg
+                );
             }
             other => panic!("expected Invalid, got {:?}", other),
         }
@@ -252,20 +318,28 @@ mod tests {
             user_event_id: [0u8; 32],
             endpoint_shared_event_id: [0u8; 32],
             device_name: "test-device".to_string(),
-            signed_by: [1u8; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
         });
-        let blob = encode_event(&signer_event).unwrap();
+        let signer_wrapper_id = [8u8; 32];
+        let blob =
+            encode_signed_wrapper_blob(&signer_event, &signer_wrapper_id, &signing_key).unwrap();
         // Insert and validate for tenant_a only
         let event_id = insert_event_blob(&conn, tenant_a, &blob);
 
         // tenant_a should find it
-        let result_a = resolve_signer_key(&conn, tenant_a, 5, &event_id).unwrap();
-        assert_eq!(result_a, SignerResolution::Found(public_key));
+        let result_a = resolve_signer_key(&conn, tenant_a, &event_id).unwrap();
+        assert_eq!(
+            result_a,
+            SignerResolution::Found(ResolvedSigner {
+                info: CurrentSignerInfo {
+                    event_id: event_id_to_base64(&event_id),
+                    semantic_type_code: crate::event_modules::EVENT_TYPE_PEER_SHARED,
+                },
+                public_key,
+            })
+        );
 
         // tenant_b should NOT find it (not in valid_events for tenant_b)
-        let result_b = resolve_signer_key(&conn, tenant_b, 5, &event_id).unwrap();
+        let result_b = resolve_signer_key(&conn, tenant_b, &event_id).unwrap();
         assert_eq!(result_b, SignerResolution::NotFound);
     }
 }

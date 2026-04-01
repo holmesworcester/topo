@@ -85,11 +85,10 @@ an explicit `NON_MODELED::<reason>` waiver.
 
 | check_id | owner | tla_guard_id | category |
 |----------|-------|-------------|----------|
-| CHK_UI_SIGNER_FAMILY | event_modules/user_invite::parse_user_invite | InvUserInviteChain | wire_validation |
-| CHK_DI_SIGNER_FAMILY | event_modules/device_invite::parse_device_invite | InvDeviceInviteChain | wire_validation |
-| CHK_USR_SIGNER_FAMILY | event_modules/user::parse_user | InvUserInviteChain | wire_validation |
-| CHK_PS_SIGNER_FAMILY | event_modules/peer_shared::parse_peer_shared | InvDeviceInviteChain | wire_validation |
-| CHK_ADM_SIGNER_FAMILY | event_modules/admin::parse_admin | InvAdminChain | wire_validation |
+| CHK_UI_SIGNER_FAMILY | event_modules/user_invite::build_projector_context | InvUserInviteChain | projector_local |
+| CHK_DI_SIGNER_FAMILY | event_modules/device_invite::build_projector_context | InvDeviceInviteChain | projector_local |
+| CHK_PS_SIGNER_FAMILY | event_modules/peer_shared::build_projector_context | InvDeviceInviteChain | projector_local |
+| CHK_ADM_SIGNER_FAMILY | event_modules/admin::build_projector_context | InvAdminChain | projector_local |
 
 ## Pipeline-Shared Checks
 

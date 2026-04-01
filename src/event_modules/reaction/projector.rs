@@ -1,10 +1,11 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
 use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::queries::{ContextLoadResult, ProjectionQueries};
+use crate::projection::queries::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
 pub fn build_projector_context(
     queries: &dyn ProjectionQueries,
+    frame: &ProjectionFrameContext,
     recorded_by: &str,
     event_id_b64: &str,
     parsed: &ParsedEvent,
@@ -14,7 +15,7 @@ pub fn build_projector_context(
         _ => return Err("reaction context loader called for non-reaction event".into()),
     };
 
-    let ctx = queries.load_reaction_context(recorded_by, event_id_b64, reaction)?;
+    let ctx = queries.load_reaction_context(frame, recorded_by, event_id_b64, reaction)?;
     if let Some(reason) = &ctx.signer_user_mismatch_reason {
         return Ok(ContextLoadResult::reject(reason.clone()));
     }

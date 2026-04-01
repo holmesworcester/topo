@@ -11,7 +11,7 @@ use topo::event_modules::message::layout::offsets as message_offsets;
 use topo::event_modules::reaction::wire::REACTION_FIELDS;
 use topo::event_modules::{
     self as events, BenchDepEvent, EncryptedEvent, EventError, FileEvent, FileSliceEvent,
-    KeyRequestEvent, KeySharedEvent, MessageEvent, ParsedEvent, ReactionEvent,
+    KeyRequestEvent, KeySharedEvent, MessageEvent, ParsedEvent, ReactionEvent, SignedEvent,
 };
 
 // ─── Golden-byte tests ───
@@ -19,63 +19,85 @@ use topo::event_modules::{
 // Each test constructs a known ParsedEvent, encodes it, and verifies specific
 // byte positions against expected values. This catches accidental offset drift.
 
+fn wrap_signed(inner: ParsedEvent, signer_event_id: [u8; 32], signature: [u8; 64]) -> ParsedEvent {
+    let payload = events::encode_event(&inner).unwrap();
+    ParsedEvent::Signed(SignedEvent {
+        signer_event_id,
+        inner_type_code: inner.event_type_code(),
+        inner_created_at_ms: inner.created_at_ms(),
+        payload,
+        signature,
+    })
+}
+
 #[test]
 fn golden_bytes_message() {
-    let msg = ParsedEvent::Message(MessageEvent {
+    let inner = ParsedEvent::Message(MessageEvent {
         created_at_ms: 0x0102030405060708,
         workspace_id: [0xAA; 32],
         author_id: [0xBB; 32],
         content: "Hi".to_string(),
-        signed_by: [0xCC; 32],
-        signer_type: 5,
-        signature: [0xDD; 64],
     });
-    let blob = events::encode_event(&msg).unwrap();
-    assert_eq!(blob.len(), events::message::MESSAGE_WIRE_SIZE);
+    let blob = events::encode_event(&wrap_signed(inner.clone(), [0xCC; 32], [0xDD; 64])).unwrap();
+    let inner_blob = events::encode_event(&inner).unwrap();
+    assert_eq!(
+        blob.len(),
+        1 + 32 + inner_blob.len() + 64,
+        "outer Signed envelope size"
+    );
 
+    assert_eq!(blob[0], events::EVENT_TYPE_SIGNED);
+    assert_eq!(&blob[1..33], &[0xCC; 32]);
+    assert_eq!(
+        &blob[33..33 + inner_blob.len()],
+        &inner_blob,
+        "inner payload should be embedded canonically"
+    );
+    let inner_start = 33;
     // Type code
-    assert_eq!(blob[0], 1);
+    assert_eq!(blob[inner_start], 1);
     // created_at_ms LE
     assert_eq!(
-        &blob[1..9],
+        &blob[inner_start + 1..inner_start + 9],
         &[0x08, 0x07, 0x06, 0x05, 0x04, 0x03, 0x02, 0x01]
     );
     // workspace_id
-    assert_eq!(&blob[9..41], &[0xAA; 32]);
+    assert_eq!(&blob[inner_start + 9..inner_start + 41], &[0xAA; 32]);
     // author_id
-    assert_eq!(&blob[41..73], &[0xBB; 32]);
+    assert_eq!(&blob[inner_start + 41..inner_start + 73], &[0xBB; 32]);
     // content: "Hi" + zero padding
-    assert_eq!(&blob[73..75], b"Hi");
-    assert!(blob[75..73 + 1024].iter().all(|&b| b == 0));
-    // signed_by
-    let sb_start = message_offsets::SIGNED_BY;
-    assert_eq!(&blob[sb_start..sb_start + 32], &[0xCC; 32]);
-    // signer_type
-    assert_eq!(blob[message_offsets::SIGNER_TYPE], 5);
-    // signature
-    let sig_start = message_offsets::SIGNATURE;
-    assert_eq!(&blob[sig_start..sig_start + 64], &[0xDD; 64]);
+    assert_eq!(&blob[inner_start + 73..inner_start + 75], b"Hi");
+    assert!(blob[inner_start + 75..inner_start + 73 + 1024]
+        .iter()
+        .all(|&b| b == 0));
+    assert_eq!(&blob[blob.len() - 64..], &[0xDD; 64]);
 }
 
 #[test]
 fn golden_bytes_reaction() {
-    let rxn = ParsedEvent::Reaction(ReactionEvent {
+    let inner = ParsedEvent::Reaction(ReactionEvent {
         created_at_ms: 1000,
         target_event_id: [0x11; 32],
         author_id: [0x22; 32],
         emoji: "\u{1f44d}".to_string(), // 👍 = 4 UTF-8 bytes
-        signed_by: [0x33; 32],
-        signer_type: 5,
-        signature: [0x44; 64],
     });
-    let blob = events::encode_event(&rxn).unwrap();
-    assert_eq!(blob.len(), events::reaction::REACTION_WIRE_SIZE);
-    assert_eq!(blob[0], 2);
-    assert_eq!(&blob[9..41], &[0x11; 32]);
-    assert_eq!(&blob[41..73], &[0x22; 32]);
+    let blob = events::encode_event(&wrap_signed(inner.clone(), [0x33; 32], [0x44; 64])).unwrap();
+    let inner_blob = events::encode_event(&inner).unwrap();
+    assert_eq!(blob[0], events::EVENT_TYPE_SIGNED);
+    assert_eq!(&blob[33..33 + inner_blob.len()], &inner_blob);
+    let inner_start = 33;
+    assert_eq!(blob[inner_start], 2);
+    assert_eq!(&blob[inner_start + 9..inner_start + 41], &[0x11; 32]);
+    assert_eq!(&blob[inner_start + 41..inner_start + 73], &[0x22; 32]);
     // emoji: 4 bytes of 👍 then zeros
-    assert_eq!(&blob[73..77], "\u{1f44d}".as_bytes());
-    assert!(blob[77..73 + 64].iter().all(|&b| b == 0));
+    assert_eq!(
+        &blob[inner_start + 73..inner_start + 77],
+        "\u{1f44d}".as_bytes()
+    );
+    assert!(blob[inner_start + 77..inner_start + 73 + 64]
+        .iter()
+        .all(|&b| b == 0));
+    assert_eq!(&blob[blob.len() - 64..], &[0x44; 64]);
 }
 
 #[test]
@@ -103,7 +125,7 @@ fn golden_bytes_encrypted() {
 
 #[test]
 fn golden_bytes_file() {
-    let att = ParsedEvent::File(FileEvent {
+    let inner = ParsedEvent::File(FileEvent {
         created_at_ms: 4000,
         message_id: [0x01; 32],
         file_id: [0x02; 32],
@@ -114,20 +136,30 @@ fn golden_bytes_file() {
         key_event_id: [0x04; 32],
         filename: "test.bin".to_string(),
         mime_type: "application/octet-stream".to_string(),
-        signed_by: [0x05; 32],
-        signer_type: 5,
-        signature: [0x06; 64],
     });
-    let blob = events::encode_event(&att).unwrap();
-    assert_eq!(blob.len(), events::file::FILE_WIRE_SIZE);
-    assert_eq!(blob[0], 24);
+    let blob = events::encode_event(&wrap_signed(inner.clone(), [0x05; 32], [0x06; 64])).unwrap();
+    let inner_blob = events::encode_event(&inner).unwrap();
+    assert_eq!(blob[0], events::EVENT_TYPE_SIGNED);
+    assert_eq!(&blob[33..33 + inner_blob.len()], &inner_blob);
+    let inner_start = 33;
+    assert_eq!(blob[inner_start], 24);
     // filename at offset 153
-    assert_eq!(&blob[153..161], b"test.bin");
-    assert!(blob[161..153 + 255].iter().all(|&b| b == 0));
+    assert_eq!(&blob[inner_start + 153..inner_start + 161], b"test.bin");
+    assert!(blob[inner_start + 161..inner_start + 153 + 255]
+        .iter()
+        .all(|&b| b == 0));
     // mime_type at offset 408
     let mime = b"application/octet-stream";
-    assert_eq!(&blob[408..408 + mime.len()], mime);
-    assert!(blob[408 + mime.len()..408 + 128].iter().all(|&b| b == 0));
+    assert_eq!(
+        &blob[inner_start + 408..inner_start + 408 + mime.len()],
+        mime
+    );
+    assert!(
+        blob[inner_start + 408 + mime.len()..inner_start + 408 + 128]
+            .iter()
+            .all(|&b| b == 0)
+    );
+    assert_eq!(&blob[blob.len() - 64..], &[0x06; 64]);
 }
 
 #[test]
@@ -153,7 +185,7 @@ fn golden_bytes_bench_dep() {
 #[test]
 fn golden_bytes_key_request() {
     let frontier_hash = [0x23; 32];
-    let kr = ParsedEvent::KeyRequest(KeyRequestEvent {
+    let inner = ParsedEvent::KeyRequest(KeyRequestEvent {
         created_at_ms: 7000,
         blocked_event_id: [0x11; 32],
         key_event_id: [0x22; 32],
@@ -166,31 +198,29 @@ fn golden_bytes_key_request() {
         ),
         recipient_event_id: [0x33; 32],
         unwrap_key_event_id: [0x44; 32],
-        signed_by: [0x55; 32],
-        signer_type: 5,
-        signature: [0x66; 64],
     });
-    let blob = events::encode_event(&kr).unwrap();
-    assert_eq!(blob.len(), events::key_request::KEY_REQUEST_WIRE_SIZE);
-    assert_eq!(blob[0], 30);
-    assert_eq!(&blob[9..41], &[0x11; 32]);
-    assert_eq!(&blob[41..73], &[0x22; 32]);
-    assert_eq!(&blob[73..105], &frontier_hash);
+    let blob = events::encode_event(&wrap_signed(inner.clone(), [0x55; 32], [0x66; 64])).unwrap();
+    let inner_blob = events::encode_event(&inner).unwrap();
+    assert_eq!(blob[0], events::EVENT_TYPE_SIGNED);
+    assert_eq!(&blob[33..33 + inner_blob.len()], &inner_blob);
+    let inner_start = 33;
+    assert_eq!(blob[inner_start], 30);
+    assert_eq!(&blob[inner_start + 9..inner_start + 41], &[0x11; 32]);
+    assert_eq!(&blob[inner_start + 41..inner_start + 73], &[0x22; 32]);
+    assert_eq!(&blob[inner_start + 73..inner_start + 105], &frontier_hash);
     assert_eq!(
-        &blob[105..137],
+        &blob[inner_start + 105..inner_start + 137],
         &delivery_target_id(&[0x22; 32], &frontier_hash, &[0x33; 32], &[0x44; 32])
     );
-    assert_eq!(&blob[137..169], &[0x33; 32]);
-    assert_eq!(&blob[169..201], &[0x44; 32]);
-    assert_eq!(&blob[201..233], &[0x55; 32]);
-    assert_eq!(blob[233], 5);
-    assert_eq!(&blob[234..298], &[0x66; 64]);
+    assert_eq!(&blob[inner_start + 137..inner_start + 169], &[0x33; 32]);
+    assert_eq!(&blob[inner_start + 169..inner_start + 201], &[0x44; 32]);
+    assert_eq!(&blob[blob.len() - 64..], &[0x66; 64]);
 }
 
 #[test]
 fn golden_bytes_key_shared() {
     let frontier_hash = topo::event_modules::removal::frontier_hash_from_refs(&[]);
-    let ks = ParsedEvent::KeyShared(KeySharedEvent {
+    let inner = ParsedEvent::KeyShared(KeySharedEvent {
         created_at_ms: 6000,
         key_event_id: [0x21; 32],
         frontier_count: 0,
@@ -208,43 +238,40 @@ fn golden_bytes_key_shared() {
         recipient_event_id: [0x31; 32],
         unwrap_key_event_id: [0x41; 32],
         wrapped_key: [0x51; 32],
-        signed_by: [0x61; 32],
-        signer_type: 5,
-        signature: [0x71; 64],
     });
-    let blob = events::encode_event(&ks).unwrap();
-    assert_eq!(blob.len(), events::key_shared::KEY_SHARED_WIRE_SIZE);
-    assert_eq!(blob[0], 22);
-    assert_eq!(&blob[9..41], &[0x21; 32]);
-    assert_eq!(blob[41], 0);
-    assert!(blob[42..170].iter().all(|&b| b == 0));
-    assert_eq!(&blob[170..202], &frontier_hash);
+    let blob = events::encode_event(&wrap_signed(inner.clone(), [0x61; 32], [0x71; 64])).unwrap();
+    let inner_blob = events::encode_event(&inner).unwrap();
+    assert_eq!(blob[0], events::EVENT_TYPE_SIGNED);
+    assert_eq!(&blob[33..33 + inner_blob.len()], &inner_blob);
+    let inner_start = 33;
+    assert_eq!(blob[inner_start], 22);
+    assert_eq!(&blob[inner_start + 9..inner_start + 41], &[0x21; 32]);
+    assert_eq!(blob[inner_start + 41], 0);
+    assert!(blob[inner_start + 42..inner_start + 170]
+        .iter()
+        .all(|&b| b == 0));
+    assert_eq!(&blob[inner_start + 170..inner_start + 202], &frontier_hash);
     assert_eq!(
-        &blob[202..234],
+        &blob[inner_start + 202..inner_start + 234],
         &delivery_target_id(&[0x21; 32], &frontier_hash, &[0x31; 32], &[0x41; 32])
     );
-    assert_eq!(&blob[234..266], &[0x31; 32]);
-    assert_eq!(&blob[266..298], &[0x41; 32]);
-    assert_eq!(&blob[298..330], &[0x51; 32]);
-    assert_eq!(&blob[330..362], &[0x61; 32]);
-    assert_eq!(blob[362], 5);
-    assert_eq!(&blob[363..427], &[0x71; 64]);
+    assert_eq!(&blob[inner_start + 234..inner_start + 266], &[0x31; 32]);
+    assert_eq!(&blob[inner_start + 266..inner_start + 298], &[0x41; 32]);
+    assert_eq!(&blob[inner_start + 298..inner_start + 330], &[0x51; 32]);
+    assert_eq!(&blob[blob.len() - 64..], &[0x71; 64]);
 }
 
 // ─── Negative parse tests: truncation ───
 
 #[test]
 fn truncation_message() {
-    let msg = ParsedEvent::Message(MessageEvent {
+    let inner = ParsedEvent::Message(MessageEvent {
         created_at_ms: 100,
         workspace_id: [0u8; 32],
         author_id: [0u8; 32],
         content: "".to_string(),
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let blob = events::encode_event(&msg).unwrap();
+    let blob = events::encode_event(&inner).unwrap();
     // Truncate by 1 byte
     let err = events::parse_event(&blob[..blob.len() - 1]).unwrap_err();
     assert!(matches!(err, EventError::TooShort { .. }));
@@ -252,16 +279,13 @@ fn truncation_message() {
 
 #[test]
 fn truncation_reaction() {
-    let rxn = ParsedEvent::Reaction(ReactionEvent {
+    let inner = ParsedEvent::Reaction(ReactionEvent {
         created_at_ms: 100,
         target_event_id: [0u8; 32],
         author_id: [0u8; 32],
         emoji: "x".to_string(),
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let blob = events::encode_event(&rxn).unwrap();
+    let blob = events::encode_event(&inner).unwrap();
     let err = events::parse_event(&blob[..blob.len() - 1]).unwrap_err();
     assert!(matches!(err, EventError::TooShort { .. }));
 }
@@ -297,7 +321,7 @@ fn truncation_bench_dep() {
 #[test]
 fn truncation_key_request() {
     let frontier_hash = [4u8; 32];
-    let kr = ParsedEvent::KeyRequest(KeyRequestEvent {
+    let inner = ParsedEvent::KeyRequest(KeyRequestEvent {
         created_at_ms: 100,
         blocked_event_id: [0u8; 32],
         key_event_id: [1u8; 32],
@@ -305,11 +329,8 @@ fn truncation_key_request() {
         delivery_target_id: delivery_target_id(&[1u8; 32], &frontier_hash, &[2u8; 32], &[3u8; 32]),
         recipient_event_id: [2u8; 32],
         unwrap_key_event_id: [3u8; 32],
-        signed_by: [4u8; 32],
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let blob = events::encode_event(&kr).unwrap();
+    let blob = events::encode_event(&inner).unwrap();
     let err = events::parse_event(&blob[..blob.len() - 1]).unwrap_err();
     assert!(matches!(err, EventError::TooShort { .. }));
 }
@@ -317,7 +338,7 @@ fn truncation_key_request() {
 #[test]
 fn truncation_key_shared() {
     let frontier_hash = topo::event_modules::removal::frontier_hash_from_refs(&[]);
-    let ks = ParsedEvent::KeyShared(KeySharedEvent {
+    let inner = ParsedEvent::KeyShared(KeySharedEvent {
         created_at_ms: 100,
         key_event_id: [1u8; 32],
         frontier_count: 0,
@@ -330,18 +351,15 @@ fn truncation_key_shared() {
         recipient_event_id: [2u8; 32],
         unwrap_key_event_id: [3u8; 32],
         wrapped_key: [4u8; 32],
-        signed_by: [5u8; 32],
-        signer_type: 5,
-        signature: [6u8; 64],
     });
-    let blob = events::encode_event(&ks).unwrap();
+    let blob = events::encode_event(&inner).unwrap();
     let err = events::parse_event(&blob[..blob.len() - 1]).unwrap_err();
     assert!(matches!(err, EventError::TooShort { .. }));
 }
 
 #[test]
 fn truncation_file() {
-    let att = ParsedEvent::File(FileEvent {
+    let inner = ParsedEvent::File(FileEvent {
         created_at_ms: 100,
         message_id: [0u8; 32],
         file_id: [0u8; 32],
@@ -352,11 +370,8 @@ fn truncation_file() {
         key_event_id: [0u8; 32],
         filename: "".to_string(),
         mime_type: "".to_string(),
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let blob = events::encode_event(&att).unwrap();
+    let blob = events::encode_event(&inner).unwrap();
     let err = events::parse_event(&blob[..blob.len() - 1]).unwrap_err();
     assert!(matches!(err, EventError::TooShort { .. }));
 }
@@ -365,16 +380,13 @@ fn truncation_file() {
 
 #[test]
 fn nonzero_padding_message_content() {
-    let msg = ParsedEvent::Message(MessageEvent {
+    let inner = ParsedEvent::Message(MessageEvent {
         created_at_ms: 100,
         workspace_id: [0u8; 32],
         author_id: [0u8; 32],
         content: "a".to_string(),
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let mut blob = events::encode_event(&msg).unwrap();
+    let mut blob = events::encode_event(&inner).unwrap();
     // Inject non-zero byte after NUL in content slot
     let content_start = message_offsets::CONTENT;
     blob[content_start + 2] = 0xFF; // byte after "a\0" should be 0
@@ -384,16 +396,13 @@ fn nonzero_padding_message_content() {
 
 #[test]
 fn nonzero_padding_reaction_emoji() {
-    let rxn = ParsedEvent::Reaction(ReactionEvent {
+    let inner = ParsedEvent::Reaction(ReactionEvent {
         created_at_ms: 100,
         target_event_id: [0u8; 32],
         author_id: [0u8; 32],
         emoji: "x".to_string(),
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let mut blob = events::encode_event(&rxn).unwrap();
+    let mut blob = events::encode_event(&inner).unwrap();
     let emoji_start = field_offset(REACTION_FIELDS, 3); // emoji field
     blob[emoji_start + 2] = 0xFF; // after "x\0"
     let err = events::parse_event(&blob).unwrap_err();
@@ -402,7 +411,7 @@ fn nonzero_padding_reaction_emoji() {
 
 #[test]
 fn nonzero_padding_attachment_filename() {
-    let att = ParsedEvent::File(FileEvent {
+    let inner = ParsedEvent::File(FileEvent {
         created_at_ms: 100,
         message_id: [0u8; 32],
         file_id: [0u8; 32],
@@ -413,11 +422,8 @@ fn nonzero_padding_attachment_filename() {
         key_event_id: [0u8; 32],
         filename: "a".to_string(),
         mime_type: "".to_string(),
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let mut blob = events::encode_event(&att).unwrap();
+    let mut blob = events::encode_event(&inner).unwrap();
     let fn_start = file_offsets::FILENAME;
     blob[fn_start + 2] = 0xFF;
     let err = events::parse_event(&blob).unwrap_err();
@@ -426,7 +432,7 @@ fn nonzero_padding_attachment_filename() {
 
 #[test]
 fn nonzero_padding_attachment_mime() {
-    let att = ParsedEvent::File(FileEvent {
+    let inner = ParsedEvent::File(FileEvent {
         created_at_ms: 100,
         message_id: [0u8; 32],
         file_id: [0u8; 32],
@@ -437,11 +443,8 @@ fn nonzero_padding_attachment_mime() {
         key_event_id: [0u8; 32],
         filename: "".to_string(),
         mime_type: "x".to_string(),
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let mut blob = events::encode_event(&att).unwrap();
+    let mut blob = events::encode_event(&inner).unwrap();
     let mime_start = file_offsets::MIME_TYPE;
     blob[mime_start + 2] = 0xFF;
     let err = events::parse_event(&blob).unwrap_err();
@@ -452,16 +455,13 @@ fn nonzero_padding_attachment_mime() {
 
 #[test]
 fn malformed_utf8_message_content() {
-    let msg = ParsedEvent::Message(MessageEvent {
+    let inner = ParsedEvent::Message(MessageEvent {
         created_at_ms: 100,
         workspace_id: [0u8; 32],
         author_id: [0u8; 32],
         content: "".to_string(),
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let mut blob = events::encode_event(&msg).unwrap();
+    let mut blob = events::encode_event(&inner).unwrap();
     let content_start = message_offsets::CONTENT;
     blob[content_start] = 0xFF; // invalid UTF-8 lead byte
     blob[content_start + 1] = 0xFE;
@@ -471,16 +471,13 @@ fn malformed_utf8_message_content() {
 
 #[test]
 fn malformed_utf8_reaction_emoji() {
-    let rxn = ParsedEvent::Reaction(ReactionEvent {
+    let inner = ParsedEvent::Reaction(ReactionEvent {
         created_at_ms: 100,
         target_event_id: [0u8; 32],
         author_id: [0u8; 32],
         emoji: "".to_string(),
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let mut blob = events::encode_event(&rxn).unwrap();
+    let mut blob = events::encode_event(&inner).unwrap();
     let emoji_start = field_offset(REACTION_FIELDS, 3); // emoji field
     blob[emoji_start] = 0xFF;
     blob[emoji_start + 1] = 0xFE;
@@ -492,16 +489,13 @@ fn malformed_utf8_reaction_emoji() {
 
 #[test]
 fn wrong_type_code_message() {
-    let msg = ParsedEvent::Message(MessageEvent {
+    let inner = ParsedEvent::Message(MessageEvent {
         created_at_ms: 100,
         workspace_id: [0u8; 32],
         author_id: [0u8; 32],
         content: "".to_string(),
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    let mut blob = events::encode_event(&msg).unwrap();
+    let mut blob = events::encode_event(&wrap_signed(inner, [0u8; 32], [0u8; 64])).unwrap();
     blob[0] = 99; // wrong type
     let err = events::parse_event(&blob).unwrap_err();
     assert!(matches!(err, EventError::UnknownType(99)));
@@ -559,9 +553,6 @@ fn file_slice_wrong_ciphertext_size_rejected() {
         file_id: [0u8; 32],
         slice_number: 0,
         ciphertext: vec![0u8; 1024], // not canonical 262144
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        signature: [0u8; 64],
     });
     assert!(events::encode_event(&fs).is_err());
 }
@@ -570,35 +561,29 @@ fn file_slice_wrong_ciphertext_size_rejected() {
 
 #[test]
 fn message_content_too_long() {
-    let msg = ParsedEvent::Message(MessageEvent {
+    let inner = ParsedEvent::Message(MessageEvent {
         created_at_ms: 100,
         workspace_id: [0u8; 32],
         author_id: [0u8; 32],
         content: "x".repeat(1025), // 1025 > 1024
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    assert!(events::encode_event(&msg).is_err());
+    assert!(events::encode_event(&inner).is_err());
 }
 
 #[test]
 fn reaction_emoji_too_long() {
-    let rxn = ParsedEvent::Reaction(ReactionEvent {
+    let inner = ParsedEvent::Reaction(ReactionEvent {
         created_at_ms: 100,
         target_event_id: [0u8; 32],
         author_id: [0u8; 32],
         emoji: "x".repeat(65), // 65 > 64
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    assert!(events::encode_event(&rxn).is_err());
+    assert!(events::encode_event(&inner).is_err());
 }
 
 #[test]
 fn attachment_filename_too_long() {
-    let att = ParsedEvent::File(FileEvent {
+    let inner = ParsedEvent::File(FileEvent {
         created_at_ms: 100,
         message_id: [0u8; 32],
         file_id: [0u8; 32],
@@ -609,16 +594,13 @@ fn attachment_filename_too_long() {
         key_event_id: [0u8; 32],
         filename: "x".repeat(256), // 256 > 255
         mime_type: "".to_string(),
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    assert!(events::encode_event(&att).is_err());
+    assert!(events::encode_event(&inner).is_err());
 }
 
 #[test]
 fn attachment_mime_too_long() {
-    let att = ParsedEvent::File(FileEvent {
+    let inner = ParsedEvent::File(FileEvent {
         created_at_ms: 100,
         message_id: [0u8; 32],
         file_id: [0u8; 32],
@@ -629,11 +611,8 @@ fn attachment_mime_too_long() {
         key_event_id: [0u8; 32],
         filename: "".to_string(),
         mime_type: "x".repeat(129), // 129 > 128
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        signature: [0u8; 64],
     });
-    assert!(events::encode_event(&att).is_err());
+    assert!(events::encode_event(&inner).is_err());
 }
 
 // ─── Idempotent encode/decode canonicalization tests ───
@@ -652,54 +631,58 @@ fn assert_idempotent(event: &ParsedEvent) {
 
 #[test]
 fn idempotent_message() {
-    assert_idempotent(&ParsedEvent::Message(MessageEvent {
-        created_at_ms: 1234567890123,
-        workspace_id: [1u8; 32],
-        author_id: [2u8; 32],
-        content: "Hello, world!".to_string(),
-        signed_by: [3u8; 32],
-        signer_type: 5,
-        signature: [4u8; 64],
-    }));
+    assert_idempotent(&wrap_signed(
+        ParsedEvent::Message(MessageEvent {
+            created_at_ms: 1234567890123,
+            workspace_id: [1u8; 32],
+            author_id: [2u8; 32],
+            content: "Hello, world!".to_string(),
+        }),
+        [3u8; 32],
+        [4u8; 64],
+    ));
 }
 
 #[test]
 fn idempotent_message_empty_content() {
-    assert_idempotent(&ParsedEvent::Message(MessageEvent {
-        created_at_ms: 100,
-        workspace_id: [0u8; 32],
-        author_id: [0u8; 32],
-        content: "".to_string(),
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        signature: [0u8; 64],
-    }));
+    assert_idempotent(&wrap_signed(
+        ParsedEvent::Message(MessageEvent {
+            created_at_ms: 100,
+            workspace_id: [0u8; 32],
+            author_id: [0u8; 32],
+            content: "".to_string(),
+        }),
+        [0u8; 32],
+        [0u8; 64],
+    ));
 }
 
 #[test]
 fn idempotent_message_max_content() {
-    assert_idempotent(&ParsedEvent::Message(MessageEvent {
-        created_at_ms: 100,
-        workspace_id: [0u8; 32],
-        author_id: [0u8; 32],
-        content: "x".repeat(1024),
-        signed_by: [0u8; 32],
-        signer_type: 5,
-        signature: [0u8; 64],
-    }));
+    assert_idempotent(&wrap_signed(
+        ParsedEvent::Message(MessageEvent {
+            created_at_ms: 100,
+            workspace_id: [0u8; 32],
+            author_id: [0u8; 32],
+            content: "x".repeat(1024),
+        }),
+        [0u8; 32],
+        [0u8; 64],
+    ));
 }
 
 #[test]
 fn idempotent_reaction() {
-    assert_idempotent(&ParsedEvent::Reaction(ReactionEvent {
-        created_at_ms: 200,
-        target_event_id: [5u8; 32],
-        author_id: [6u8; 32],
-        emoji: "\u{1f44d}".to_string(),
-        signed_by: [7u8; 32],
-        signer_type: 5,
-        signature: [8u8; 64],
-    }));
+    assert_idempotent(&wrap_signed(
+        ParsedEvent::Reaction(ReactionEvent {
+            created_at_ms: 200,
+            target_event_id: [5u8; 32],
+            author_id: [6u8; 32],
+            emoji: "\u{1f44d}".to_string(),
+        }),
+        [7u8; 32],
+        [8u8; 64],
+    ));
 }
 
 #[test]
@@ -717,21 +700,22 @@ fn idempotent_encrypted() {
 
 #[test]
 fn idempotent_file() {
-    assert_idempotent(&ParsedEvent::File(FileEvent {
-        created_at_ms: 500,
-        message_id: [15u8; 32],
-        file_id: [16u8; 32],
-        blob_bytes: 65536,
-        total_slices: 1,
-        slice_bytes: 65536,
-        root_hash: [17u8; 32],
-        key_event_id: [18u8; 32],
-        filename: "photo.jpg".to_string(),
-        mime_type: "image/jpeg".to_string(),
-        signed_by: [19u8; 32],
-        signer_type: 5,
-        signature: [20u8; 64],
-    }));
+    assert_idempotent(&wrap_signed(
+        ParsedEvent::File(FileEvent {
+            created_at_ms: 500,
+            message_id: [15u8; 32],
+            file_id: [16u8; 32],
+            blob_bytes: 65536,
+            total_slices: 1,
+            slice_bytes: 65536,
+            root_hash: [17u8; 32],
+            key_event_id: [18u8; 32],
+            filename: "photo.jpg".to_string(),
+            mime_type: "image/jpeg".to_string(),
+        }),
+        [19u8; 32],
+        [20u8; 64],
+    ));
 }
 
 #[test]
@@ -741,9 +725,6 @@ fn idempotent_file_slice() {
         file_id: [21u8; 32],
         slice_number: 42,
         ciphertext: vec![22u8; events::file_slice::FILE_SLICE_CIPHERTEXT_BYTES],
-        signed_by: [23u8; 32],
-        signer_type: 5,
-        signature: [24u8; 64],
     }));
 }
 
@@ -777,48 +758,50 @@ fn idempotent_bench_dep_full() {
 #[test]
 fn idempotent_key_request() {
     let frontier_hash = [33u8; 32];
-    assert_idempotent(&ParsedEvent::KeyRequest(KeyRequestEvent {
-        created_at_ms: 1_234,
-        blocked_event_id: [29u8; 32],
-        key_event_id: [30u8; 32],
-        frontier_hash,
-        delivery_target_id: delivery_target_id(
-            &[30u8; 32],
-            &frontier_hash,
-            &[31u8; 32],
-            &[32u8; 32],
-        ),
-        recipient_event_id: [31u8; 32],
-        unwrap_key_event_id: [32u8; 32],
-        signed_by: [33u8; 32],
-        signer_type: 5,
-        signature: [34u8; 64],
-    }));
+    assert_idempotent(&wrap_signed(
+        ParsedEvent::KeyRequest(KeyRequestEvent {
+            created_at_ms: 1_234,
+            blocked_event_id: [29u8; 32],
+            key_event_id: [30u8; 32],
+            frontier_hash,
+            delivery_target_id: delivery_target_id(
+                &[30u8; 32],
+                &frontier_hash,
+                &[31u8; 32],
+                &[32u8; 32],
+            ),
+            recipient_event_id: [31u8; 32],
+            unwrap_key_event_id: [32u8; 32],
+        }),
+        [33u8; 32],
+        [34u8; 64],
+    ));
 }
 
 #[test]
 fn idempotent_key_shared() {
     let frontier_hash = topo::event_modules::removal::frontier_hash_from_refs(&[]);
-    assert_idempotent(&ParsedEvent::KeyShared(KeySharedEvent {
-        created_at_ms: 1_235,
-        key_event_id: [36u8; 32],
-        frontier_count: 0,
-        frontier_ref_1: [0u8; 32],
-        frontier_ref_2: [0u8; 32],
-        frontier_ref_3: [0u8; 32],
-        frontier_ref_4: [0u8; 32],
-        frontier_hash,
-        delivery_target_id: delivery_target_id(
-            &[36u8; 32],
-            &frontier_hash,
-            &[37u8; 32],
-            &[38u8; 32],
-        ),
-        recipient_event_id: [37u8; 32],
-        unwrap_key_event_id: [38u8; 32],
-        wrapped_key: [39u8; 32],
-        signed_by: [40u8; 32],
-        signer_type: 5,
-        signature: [41u8; 64],
-    }));
+    assert_idempotent(&wrap_signed(
+        ParsedEvent::KeyShared(KeySharedEvent {
+            created_at_ms: 1_235,
+            key_event_id: [36u8; 32],
+            frontier_count: 0,
+            frontier_ref_1: [0u8; 32],
+            frontier_ref_2: [0u8; 32],
+            frontier_ref_3: [0u8; 32],
+            frontier_ref_4: [0u8; 32],
+            frontier_hash,
+            delivery_target_id: delivery_target_id(
+                &[36u8; 32],
+                &frontier_hash,
+                &[37u8; 32],
+                &[38u8; 32],
+            ),
+            recipient_event_id: [37u8; 32],
+            unwrap_key_event_id: [38u8; 32],
+            wrapped_key: [39u8; 32],
+        }),
+        [40u8; 32],
+        [41u8; 64],
+    ));
 }

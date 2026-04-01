@@ -6,6 +6,7 @@
 mod tests {
     use crate::harness::fixtures::*;
     use topo::event_modules::ParsedEvent;
+    use topo::event_modules::EVENT_TYPE_FILE;
     use topo::projection::contract::EmitCommand;
 
     const PEER: &str = "peer_alice";
@@ -28,9 +29,6 @@ mod tests {
             created_at_ms: 1000,
             public_key: [1u8; 32],
             username: "alice".to_string(),
-            signed_by: [2u8; 32],
-            signer_type: 2,
-            signature: [0u8; 64],
         });
         let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
         assert_valid(&result);
@@ -45,9 +43,6 @@ mod tests {
             created_at_ms: 1001,
             public_key: [1u8; 32],
             username: "alice".to_string(),
-            signed_by: [2u8; 32],
-            signer_type: 2,
-            signature: [0u8; 64],
         });
         let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
         assert_valid(&result);
@@ -70,9 +65,6 @@ mod tests {
             created_at_ms: 2000,
             public_key: [1u8; 32],
             user_event_id: [2u8; 32],
-            signed_by: [3u8; 32],
-            signer_type: 1,
-            signature: [0u8; 64],
         });
         let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
         assert_valid(&result);
@@ -125,11 +117,9 @@ mod tests {
             key_event_id: [4u8; 32],
             filename: "test.txt".to_string(),
             mime_type: "text/plain".to_string(),
-            signed_by: [5u8; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
         });
-        let result = project_pure(PEER, EVENT_ID, &parsed, &empty_ctx());
+        let ctx = ctx_with_current_signer(EVENT_ID, EVENT_TYPE_FILE);
+        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
         assert_writes_to_table(&result, "files");
         assert_emits_command(&result, "RetryFileSliceGuards", |c| {
@@ -153,11 +143,13 @@ mod tests {
             key_event_id: [4u8; 32],
             filename: "test.txt".to_string(),
             mime_type: "text/plain".to_string(),
-            signed_by: [5u8; 32],
-            signer_type: 5,
-            signature: [0u8; 64],
         });
-        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx_with_target_message_deleted());
+        let mut ctx = ctx_with_target_message_deleted();
+        ctx.current_signer = Some(topo::projection::contract::CurrentSignerInfo {
+            event_id: EVENT_ID.to_string(),
+            semantic_type_code: EVENT_TYPE_FILE,
+        });
+        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
         assert_no_write_to_table(&result, "files");
         assert_writes_to_table(&result, "deleted_files");

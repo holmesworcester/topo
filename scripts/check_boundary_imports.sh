@@ -215,7 +215,7 @@ check_required 'TransportIdentitySpec' "${TRANSPORT_PATH}identity_adapter.rs"
 # transport session factory must own stream wiring
 check_required 'open_session_io' "${TRANSPORT_PATH}session_factory.rs"
 check_required 'accept_session_io' "${TRANSPORT_PATH}session_factory.rs"
-check_required 'DualConnection::new' "${TRANSPORT_PATH}session_factory.rs"
+check_required 'DualConnection::from_parts' "${TRANSPORT_PATH}session_factory.rs"
 # transport connection lifecycle helpers must own dial/accept + peer identity
 check_required 'pub async fn dial_daemon' "${TRANSPORT_PATH}connection_lifecycle.rs"
 check_required 'pub async fn accept_daemon' "${TRANSPORT_PATH}connection_lifecycle.rs"
@@ -225,8 +225,8 @@ check_required 'pub struct SessionEnvelope' "${TRANSPORT_PATH}peering_boundary.r
 check_required 'pub async fn dial_daemon_connection' "${TRANSPORT_PATH}peering_boundary.rs"
 check_required 'pub async fn accept_daemon_connection' "${TRANSPORT_PATH}peering_boundary.rs"
 check_required 'pub async fn next_session' "${TRANSPORT_PATH}peering_boundary.rs"
-check_required 'pub fn create_runtime_endpoint_for_tenants' "${TRANSPORT_PATH}peering_boundary.rs"
-check_required 'pub fn build_tenant_client_config_from_db' "${TRANSPORT_PATH}peering_boundary.rs"
+check_required 'pub async fn create_runtime_endpoint_for_tenants' "${TRANSPORT_PATH}peering_boundary.rs"
+check_required 'pub fn tenant_trusts_peer' "${TRANSPORT_PATH}peering_boundary.rs"
 
 # projection must route through materializer contract, not raw install fns
 check_required 'MaterializeTransportIdentity' "$PROJECTION_PATH"
