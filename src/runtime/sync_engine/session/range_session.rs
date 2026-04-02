@@ -5,7 +5,7 @@ use std::time::Duration;
 use negentropy::{Id, NegentropyStorageVector};
 use rusqlite::Connection;
 
-use crate::crypto::{event_id_to_base64, hash_event, EventId};
+use crate::crypto::{event_id_from_base64, event_id_to_base64, hash_event, EventId};
 use crate::db::store::Store;
 use crate::event_modules::parse_event;
 use crate::protocol::neg_id_to_event_id;
@@ -278,6 +278,122 @@ pub fn load_shared_event_index_slice(
     Ok(storage)
 }
 
+pub fn load_claim_index_slice(
+    conn: &Connection,
+    workspace_id: &str,
+    shard_start_ms: i64,
+    now_ms: i64,
+) -> Result<NegentropyStorageVector, String> {
+    let claim_ids =
+        crate::db::dep_claims::list_live_claim_ids(conn, workspace_id, shard_start_ms, now_ms)
+            .map_err(|e| format!("load dep_claims shard rows: {e}"))?;
+    let mut storage = NegentropyStorageVector::new();
+    for event_id in claim_ids {
+        storage
+            .insert(0, Id::from_byte_array(event_id))
+            .map_err(|e| format!("insert dep claim negentropy item: {e}"))?;
+    }
+    storage
+        .seal()
+        .map_err(|e| format!("seal dep claim negentropy storage: {e}"))?;
+    Ok(storage)
+}
+
+pub fn load_shared_object_index_slice(
+    conn: &Connection,
+    workspace_id: &str,
+    range: SyncWindow,
+    claim_shard_starts: &[i64],
+    now_ms: i64,
+) -> Result<NegentropyStorageVector, String> {
+    let mut entries = Vec::<(u64, EventId)>::new();
+    let mut seen = HashSet::<EventId>::new();
+
+    let mut base_stmt = conn
+        .prepare(
+            "SELECT ts, id
+             FROM shared_event_index
+             WHERE workspace_id = :workspace_id
+               AND (:ts_min IS NULL OR ts >= :ts_min)
+               AND (:ts_max IS NULL OR ts < :ts_max)
+             ORDER BY ts, id",
+        )
+        .map_err(|e| format!("prepare shared object range query: {e}"))?;
+    let mut base_rows = base_stmt
+        .query(rusqlite::named_params! {
+            ":workspace_id": workspace_id,
+            ":ts_min": range.ts_min(),
+            ":ts_max": range.ts_max_exclusive(),
+        })
+        .map_err(|e| format!("query shared object range rows: {e}"))?;
+    while let Some(row) = base_rows
+        .next()
+        .map_err(|e| format!("iterate shared object range rows: {e}"))?
+    {
+        let ts: i64 = row
+            .get(0)
+            .map_err(|e| format!("read shared object ts: {e}"))?;
+        let id_blob: Vec<u8> = row
+            .get(1)
+            .map_err(|e| format!("read shared object id: {e}"))?;
+        if id_blob.len() != 32 {
+            continue;
+        }
+        let mut event_id = [0u8; 32];
+        event_id.copy_from_slice(&id_blob);
+        if seen.insert(event_id) {
+            entries.push((ts.max(0) as u64, event_id));
+        }
+    }
+
+    let mut claim_stmt = conn
+        .prepare(
+            "SELECT e.created_at, dc.event_id
+             FROM dep_claims dc
+             JOIN events e ON e.event_id = dc.event_id
+             WHERE dc.workspace_id = ?1
+               AND dc.shard_start_ms = ?2
+               AND (dc.strength >= 2 OR dc.expires_at_ms IS NULL OR dc.expires_at_ms > ?3)
+               AND e.share_scope = 'shared'
+             ORDER BY e.created_at, dc.event_id",
+        )
+        .map_err(|e| format!("prepare dep-claimed object query: {e}"))?;
+    for shard_start_ms in claim_shard_starts {
+        let mut claim_rows = claim_stmt
+            .query(rusqlite::params![workspace_id, shard_start_ms, now_ms])
+            .map_err(|e| format!("query dep-claimed object rows: {e}"))?;
+        while let Some(row) = claim_rows
+            .next()
+            .map_err(|e| format!("iterate dep-claimed object rows: {e}"))?
+        {
+            let ts: i64 = row
+                .get(0)
+                .map_err(|e| format!("read dep-claimed object ts: {e}"))?;
+            let event_id_b64: String = row
+                .get(1)
+                .map_err(|e| format!("read dep-claimed object id: {e}"))?;
+            let Some(event_id) = event_id_from_base64(&event_id_b64) else {
+                continue;
+            };
+            if seen.insert(event_id) {
+                entries.push((ts.max(0) as u64, event_id));
+            }
+        }
+    }
+
+    entries.sort_unstable_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+    let mut storage = NegentropyStorageVector::new();
+    for (ts, event_id) in entries {
+        storage
+            .insert(ts, Id::from_byte_array(event_id))
+            .map_err(|e| format!("insert shared object negentropy item: {e}"))?;
+    }
+    storage
+        .seal()
+        .map_err(|e| format!("seal shared object negentropy storage: {e}"))?;
+    Ok(storage)
+}
+
 pub async fn send_have_events<S>(
     store: &Store<'_>,
     data_send: &mut S,
@@ -402,11 +518,12 @@ mod tests {
     use crate::contracts::event_pipeline_contract::IngestItem;
     use crate::crypto::hash_event;
     use crate::db::schema::create_tables;
-    use crate::db::store::insert_event;
+    use crate::db::store::{insert_event, insert_shared_event_index_entry_if_shared};
     use crate::db::{open_connection, open_in_memory};
     use crate::event_modules::bench_dep::BenchDepEvent;
     use crate::event_modules::{encode_event, registry::ShareScope, ParsedEvent};
     use crate::state::{dependency_fetch, pipeline::ingest_now};
+    use negentropy::NegentropyStorageBase;
 
     fn insert_shared_blob(conn: &Connection, blob: &[u8], created_at_ms: i64) -> EventId {
         let event_id = hash_event(blob);
@@ -421,6 +538,34 @@ mod tests {
         )
         .unwrap();
         event_id
+    }
+
+    fn insert_indexed_shared_blob(
+        conn: &Connection,
+        workspace_id: &str,
+        blob: &[u8],
+        created_at_ms: i64,
+    ) -> EventId {
+        let event_id = insert_shared_blob(conn, blob, created_at_ms);
+        insert_shared_event_index_entry_if_shared(
+            conn,
+            ShareScope::Shared,
+            created_at_ms,
+            &event_id,
+            workspace_id,
+        )
+        .unwrap();
+        event_id
+    }
+
+    fn storage_ids(storage: &NegentropyStorageVector) -> Vec<EventId> {
+        let mut ids = Vec::new();
+        let size = storage.size().unwrap();
+        for idx in 0..size {
+            let item = storage.get_item(idx).unwrap().expect("storage item");
+            ids.push(*item.get_id().as_bytes());
+        }
+        ids
     }
 
     fn make_bench_dep_blob(created_at_ms: u64, dep_ids: Vec<EventId>, marker: u8) -> Vec<u8> {
@@ -576,6 +721,84 @@ mod tests {
                 .collect::<Vec<_>>(),
             vec![dep_2, dep_3, leaf]
         );
+    }
+
+    #[test]
+    fn claim_index_slice_skips_expired_soft_claims() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let workspace_id = "ws";
+        let shard_start_ms = crate::db::dep_claims::utc_day_start_ms(2 * 24 * 60 * 60 * 1000);
+        let live_soft = [1u8; 32];
+        let expired_soft = [2u8; 32];
+        let hard = [3u8; 32];
+        crate::db::dep_claims::upsert_soft_claims(
+            &conn,
+            workspace_id,
+            shard_start_ms,
+            &[live_soft],
+            Some("peer-a"),
+            100,
+            1_000,
+        )
+        .unwrap();
+        crate::db::dep_claims::upsert_soft_claims(
+            &conn,
+            workspace_id,
+            shard_start_ms,
+            &[expired_soft],
+            Some("peer-a"),
+            100,
+            150,
+        )
+        .unwrap();
+        crate::db::dep_claims::upsert_hard_claims(
+            &conn,
+            workspace_id,
+            shard_start_ms,
+            &[hard],
+            100,
+        )
+        .unwrap();
+
+        let storage = load_claim_index_slice(&conn, workspace_id, shard_start_ms, 500).unwrap();
+        assert_eq!(storage_ids(&storage), vec![live_soft, hard]);
+    }
+
+    #[test]
+    fn object_index_includes_locally_present_claimed_object_outside_root_range() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let workspace_id = "ws";
+        let shard_start_ms = crate::db::dep_claims::utc_day_start_ms(5 * 24 * 60 * 60 * 1000);
+        let dep = insert_indexed_shared_blob(
+            &conn,
+            workspace_id,
+            &make_bench_dep_blob(100, vec![], 1),
+            100,
+        );
+        let root_created_at = shard_start_ms + 500;
+        let root = insert_indexed_shared_blob(
+            &conn,
+            workspace_id,
+            &make_bench_dep_blob(root_created_at as u64, vec![dep], 2),
+            root_created_at,
+        );
+        crate::db::dep_claims::upsert_hard_claims(&conn, workspace_id, shard_start_ms, &[dep], 100)
+            .unwrap();
+
+        let range = SyncWindow {
+            kind: crate::sync::session::windowing::SyncWindowKind::LastDay,
+            ts_min_inclusive_ms: Some(shard_start_ms),
+            ts_max_exclusive_ms: Some(shard_start_ms + (24 * 60 * 60 * 1000)),
+        };
+        let base_storage = load_shared_event_index_slice(&conn, workspace_id, range).unwrap();
+        let object_storage =
+            load_shared_object_index_slice(&conn, workspace_id, range, &[shard_start_ms], 1_000)
+                .unwrap();
+
+        assert_eq!(storage_ids(&base_storage), vec![root]);
+        assert_eq!(storage_ids(&object_storage), vec![dep, root]);
     }
 
     #[tokio::test]

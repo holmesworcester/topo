@@ -105,6 +105,24 @@ pub fn sync_dep_prefetch_byte_cap() -> usize {
     }
 }
 
+pub fn sync_dep_claim_shard_cap() -> usize {
+    if let Some(v) = read_usize_env("TOPO_SYNC_DEP_CLAIM_SHARD_CAP") {
+        return v;
+    }
+    if low_mem_mode() {
+        2
+    } else {
+        8
+    }
+}
+
+pub fn sync_dep_claim_soft_ttl_ms() -> i64 {
+    if let Some(v) = read_usize_env("TOPO_SYNC_DEP_CLAIM_SOFT_TTL_MS") {
+        return i64::try_from(v).unwrap_or(i64::MAX).max(1);
+    }
+    14 * 24 * 60 * 60 * 1000
+}
+
 // -- Sync sessions --
 pub fn session_ingest_cap() -> usize {
     if low_mem_mode() {

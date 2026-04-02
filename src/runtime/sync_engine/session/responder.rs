@@ -10,18 +10,19 @@ use crate::protocol::{neg_id_to_event_id, Frame};
 use crate::runtime::SyncStats;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::range_session::{
-    load_shared_event_index_slice, send_have_events, spawn_receive_log_task,
+    load_claim_index_slice, load_shared_object_index_slice, send_have_events,
+    spawn_receive_log_task,
 };
 use crate::sync::session::receive_log::{
     enqueue_receive_log_ingest, note_hot_receive_finished, note_hot_receive_started,
 };
 use crate::sync::session::windowing::{
     decode_initial_neg_open, encode_sync_window_kind, is_hot_window, is_low_mem_allowed_window,
-    SyncWindowKind,
+    SyncNegPhase, SyncWindowKind,
 };
 use crate::sync::session::{INITIAL_CONTROL_PROGRESS_TIMEOUT, NEGENTROPY_FRAME_SIZE_LIMIT};
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
-use crate::tuning::low_mem_mode;
+use crate::tuning::{low_mem_mode, sync_dep_claim_soft_ttl_ms};
 use negentropy::{Id, Negentropy};
 
 type ManualRoundReply =
@@ -110,29 +111,6 @@ where
     let mut pending_round_replies = Vec::new();
     drain_manual_commands(peer_id, &mut command_rx, &mut pending_round_replies);
 
-    let initial = tokio::time::timeout(INITIAL_CONTROL_PROGRESS_TIMEOUT, control.recv()).await??;
-    let Frame::NegOpen { msg } = initial else {
-        return Err("responder expected NegOpen".into());
-    };
-    let (range, neg_msg) = decode_initial_neg_open(&msg)?;
-    if low_mem_mode() && !is_low_mem_allowed_window(range.kind) {
-        control
-            .send(&Frame::RangePolicyReject {
-                rejected_window_kind: encode_sync_window_kind(range.kind),
-                oldest_allowed_window_kind: encode_sync_window_kind(SyncWindowKind::LastWeek),
-            })
-            .await?;
-        control.flush().await?;
-        return Ok(SyncStats {
-            events_sent: 0,
-            events_received: 0,
-            neg_rounds: 0,
-            bytes_sent: 0,
-            bytes_received: 0,
-            duration_ms: start.elapsed().as_millis(),
-        });
-    }
-
     let db = open_connection(db_path)?;
     let ws_id = lookup_workspace_id(&db, recorded_by).ok_or_else(|| {
         format!(
@@ -140,34 +118,123 @@ where
             recorded_by
         )
     })?;
-    let storage = load_shared_event_index_slice(&db, &ws_id, range)?;
-    let mut neg = Negentropy::borrowed(&storage, NEGENTROPY_FRAME_SIZE_LIMIT)?;
-
+    let session_now_ms = crate::db::queue::current_timestamp_ms();
+    let soft_claim_expiry_ms = session_now_ms.saturating_add(sync_dep_claim_soft_ttl_ms());
+    let mut claim_shards = Vec::<i64>::new();
     let mut have_ids = Vec::<Id>::new();
     let mut need_ids = Vec::<Id>::new();
-    let mut next_query = Some(neg_msg.to_vec());
-    loop {
-        let query = if let Some(query) = next_query.take() {
-            query
-        } else {
-            let next =
-                tokio::time::timeout(INITIAL_CONTROL_PROGRESS_TIMEOUT, control.recv()).await??;
-            let Frame::NegMsg { msg } = next else {
-                return Err("responder expected follow-up NegMsg".into());
-            };
-            msg
+    let range = loop {
+        let initial =
+            tokio::time::timeout(INITIAL_CONTROL_PROGRESS_TIMEOUT, control.recv()).await??;
+        let Frame::NegOpen { msg } = initial else {
+            return Err("responder expected NegOpen".into());
         };
-        if query.is_empty() {
-            break;
+        let (phase, neg_msg) = decode_initial_neg_open(&msg)?;
+        match phase {
+            SyncNegPhase::ClaimsDayShard { shard_start_ms } => {
+                let storage = load_claim_index_slice(&db, &ws_id, shard_start_ms, session_now_ms)?;
+                let mut neg = Negentropy::borrowed(&storage, NEGENTROPY_FRAME_SIZE_LIMIT)?;
+                let mut phase_need_ids = Vec::<Id>::new();
+                let mut next_query = Some(neg_msg.to_vec());
+                loop {
+                    let query = if let Some(query) = next_query.take() {
+                        query
+                    } else {
+                        let next =
+                            tokio::time::timeout(INITIAL_CONTROL_PROGRESS_TIMEOUT, control.recv())
+                                .await??;
+                        let Frame::NegMsg { msg } = next else {
+                            return Err("responder expected follow-up claim NegMsg".into());
+                        };
+                        msg
+                    };
+                    if query.is_empty() {
+                        break;
+                    }
+                    let mut phase_have_ids = Vec::<Id>::new();
+                    let response =
+                        neg.reconcile_with_diff(&query, &mut phase_have_ids, &mut phase_need_ids)?;
+                    control.send(&Frame::NegMsg { msg: response }).await?;
+                    control.flush().await?;
+                }
+                phase_need_ids.sort_unstable();
+                phase_need_ids.dedup();
+                let learned_event_ids = phase_need_ids
+                    .iter()
+                    .map(neg_id_to_event_id)
+                    .collect::<Vec<_>>();
+                crate::db::dep_claims::upsert_soft_claims(
+                    &db,
+                    &ws_id,
+                    shard_start_ms,
+                    &learned_event_ids,
+                    Some(peer_id),
+                    session_now_ms,
+                    soft_claim_expiry_ms,
+                )?;
+                if !claim_shards.contains(&shard_start_ms) {
+                    claim_shards.push(shard_start_ms);
+                }
+            }
+            SyncNegPhase::ObjectsRange { window: range } => {
+                if low_mem_mode() && !is_low_mem_allowed_window(range.kind) {
+                    control
+                        .send(&Frame::RangePolicyReject {
+                            rejected_window_kind: encode_sync_window_kind(range.kind),
+                            oldest_allowed_window_kind: encode_sync_window_kind(
+                                SyncWindowKind::LastWeek,
+                            ),
+                        })
+                        .await?;
+                    control.flush().await?;
+                    return Ok(SyncStats {
+                        events_sent: 0,
+                        events_received: 0,
+                        neg_rounds: 0,
+                        bytes_sent: 0,
+                        bytes_received: 0,
+                        duration_ms: start.elapsed().as_millis(),
+                    });
+                }
+
+                let storage = load_shared_object_index_slice(
+                    &db,
+                    &ws_id,
+                    range,
+                    &claim_shards,
+                    session_now_ms,
+                )?;
+                let mut neg = Negentropy::borrowed(&storage, NEGENTROPY_FRAME_SIZE_LIMIT)?;
+                have_ids.clear();
+                need_ids.clear();
+                let mut next_query = Some(neg_msg.to_vec());
+                loop {
+                    let query = if let Some(query) = next_query.take() {
+                        query
+                    } else {
+                        let next =
+                            tokio::time::timeout(INITIAL_CONTROL_PROGRESS_TIMEOUT, control.recv())
+                                .await??;
+                        let Frame::NegMsg { msg } = next else {
+                            return Err("responder expected follow-up NegMsg".into());
+                        };
+                        msg
+                    };
+                    if query.is_empty() {
+                        break;
+                    }
+                    let response = neg.reconcile_with_diff(&query, &mut have_ids, &mut need_ids)?;
+                    control.send(&Frame::NegMsg { msg: response }).await?;
+                    control.flush().await?;
+                }
+                have_ids.sort_unstable();
+                have_ids.dedup();
+                need_ids.sort_unstable();
+                need_ids.dedup();
+                break range;
+            }
         }
-        let response = neg.reconcile_with_diff(&query, &mut have_ids, &mut need_ids)?;
-        control.send(&Frame::NegMsg { msg: response }).await?;
-        control.flush().await?;
-    }
-    have_ids.sort_unstable();
-    have_ids.dedup();
-    need_ids.sort_unstable();
-    need_ids.dedup();
+    };
     drain_manual_commands(peer_id, &mut command_rx, &mut pending_round_replies);
     reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);
 
@@ -212,7 +279,7 @@ where
     Ok(SyncStats {
         events_sent,
         events_received: received.events_received,
-        neg_rounds: 1,
+        neg_rounds: 1 + claim_shards.len() as u64,
         bytes_sent,
         bytes_received: received.bytes_received,
         duration_ms: start.elapsed().as_millis(),

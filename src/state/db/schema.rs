@@ -116,6 +116,7 @@ mod tests {
         assert!(tables.contains(&"events".to_string()));
         assert!(tables.contains(&"shared_event_index".to_string()));
         assert!(tables.contains(&"project_queue".to_string()));
+        assert!(tables.contains(&"dep_claims".to_string()));
         assert!(tables.contains(&"bootstrap_context".to_string()));
         assert!(tables.contains(&"event_timeline".to_string()));
 

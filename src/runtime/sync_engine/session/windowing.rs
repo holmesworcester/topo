@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
 
-use crate::tuning::low_mem_mode;
+use crate::tuning::{low_mem_mode, sync_dep_claim_shard_cap};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncWindowKind {
@@ -32,8 +32,16 @@ pub struct SyncWindow {
     pub ts_max_exclusive_ms: Option<i64>,
 }
 
-const WINDOW_MAGIC: &[u8; 4] = b"P7SW";
-const WINDOW_VERSION: u8 = 2;
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SyncNegPhase {
+    ClaimsDayShard { shard_start_ms: i64 },
+    ObjectsRange { window: SyncWindow },
+}
+
+const WINDOW_MAGIC: &[u8; 4] = b"P7SN";
+const WINDOW_VERSION: u8 = 3;
+const NEG_PHASE_CLAIMS_DAY_SHARD: u8 = 1;
+const NEG_PHASE_OBJECTS_RANGE: u8 = 2;
 const NONE_TS_SENTINEL: i64 = i64::MIN;
 const ALL_START_MS: i64 = 0;
 const HOUR_MS: i64 = 60 * 60 * 1000;
@@ -267,34 +275,70 @@ impl SyncWindow {
     }
 }
 
-pub fn encode_initial_neg_open(window: SyncWindow, inner: Vec<u8>) -> Vec<u8> {
-    let mut out = Vec::with_capacity(4 + 1 + 1 + 8 + 8 + inner.len());
+pub fn claim_shard_starts_for_window(window: SyncWindow, now_ms: i64) -> Vec<i64> {
+    let Some((start, end)) = partition_window_bounds(window, now_ms) else {
+        return Vec::new();
+    };
+    if start >= end {
+        return Vec::new();
+    }
+
+    let first_shard = crate::db::dep_claims::utc_day_start_ms(start);
+    let last_shard = crate::db::dep_claims::utc_day_start_ms(end.saturating_sub(1));
+    let shard_cap = sync_dep_claim_shard_cap();
+    let mut shards = Vec::new();
+    let mut shard = first_shard;
+    loop {
+        shards.push(shard);
+        if shards.len() > shard_cap {
+            return Vec::new();
+        }
+        if shard == last_shard {
+            return shards;
+        }
+        shard = shard.saturating_add(DAY_MS);
+    }
+}
+
+pub fn encode_initial_neg_open(phase: SyncNegPhase, inner: Vec<u8>) -> Vec<u8> {
+    let mut out = Vec::with_capacity(4 + 1 + 1 + 1 + 8 + 8 + inner.len());
     out.extend_from_slice(WINDOW_MAGIC);
     out.push(WINDOW_VERSION);
-    out.push(window.kind as u8);
-    out.extend_from_slice(
-        &window
-            .ts_min_inclusive_ms
-            .unwrap_or(NONE_TS_SENTINEL)
-            .to_le_bytes(),
-    );
-    out.extend_from_slice(
-        &window
-            .ts_max_exclusive_ms
-            .unwrap_or(NONE_TS_SENTINEL)
-            .to_le_bytes(),
-    );
+    match phase {
+        SyncNegPhase::ClaimsDayShard { shard_start_ms } => {
+            out.push(NEG_PHASE_CLAIMS_DAY_SHARD);
+            out.extend_from_slice(&shard_start_ms.to_le_bytes());
+        }
+        SyncNegPhase::ObjectsRange { window } => {
+            out.push(NEG_PHASE_OBJECTS_RANGE);
+            out.push(window.kind as u8);
+            out.extend_from_slice(
+                &window
+                    .ts_min_inclusive_ms
+                    .unwrap_or(NONE_TS_SENTINEL)
+                    .to_le_bytes(),
+            );
+            out.extend_from_slice(
+                &window
+                    .ts_max_exclusive_ms
+                    .unwrap_or(NONE_TS_SENTINEL)
+                    .to_le_bytes(),
+            );
+        }
+    }
     out.extend_from_slice(&inner);
     out
 }
 
-pub fn decode_initial_neg_open(msg: &[u8]) -> Result<(SyncWindow, &[u8]), String> {
-    if msg.len() < 22 || &msg[..4] != WINDOW_MAGIC {
+pub fn decode_initial_neg_open(msg: &[u8]) -> Result<(SyncNegPhase, &[u8]), String> {
+    if msg.len() < 6 || &msg[..4] != WINDOW_MAGIC {
         return Ok((
-            SyncWindow {
-                kind: SyncWindowKind::Full,
-                ts_min_inclusive_ms: None,
-                ts_max_exclusive_ms: None,
+            SyncNegPhase::ObjectsRange {
+                window: SyncWindow {
+                    kind: SyncWindowKind::Full,
+                    ts_min_inclusive_ms: None,
+                    ts_max_exclusive_ms: None,
+                },
             },
             msg,
         ));
@@ -304,25 +348,46 @@ pub fn decode_initial_neg_open(msg: &[u8]) -> Result<(SyncWindow, &[u8]), String
     if version != WINDOW_VERSION {
         return Err(format!("unsupported sync window version {}", version));
     }
-    let kind = decode_sync_window_kind(msg[5])?;
-    let ts_min = i64::from_le_bytes(
-        msg[6..14]
-            .try_into()
-            .map_err(|_| "sync window min header truncated".to_string())?,
-    );
-    let ts_max = i64::from_le_bytes(
-        msg[14..22]
-            .try_into()
-            .map_err(|_| "sync window max header truncated".to_string())?,
-    );
-    Ok((
-        SyncWindow {
-            kind,
-            ts_min_inclusive_ms: (ts_min != NONE_TS_SENTINEL).then_some(ts_min),
-            ts_max_exclusive_ms: (ts_max != NONE_TS_SENTINEL).then_some(ts_max),
-        },
-        &msg[22..],
-    ))
+    match msg[5] {
+        NEG_PHASE_CLAIMS_DAY_SHARD => {
+            if msg.len() < 14 {
+                return Err("sync claim shard header truncated".to_string());
+            }
+            let shard_start_ms = i64::from_le_bytes(
+                msg[6..14]
+                    .try_into()
+                    .map_err(|_| "sync claim shard header truncated".to_string())?,
+            );
+            Ok((SyncNegPhase::ClaimsDayShard { shard_start_ms }, &msg[14..]))
+        }
+        NEG_PHASE_OBJECTS_RANGE => {
+            if msg.len() < 23 {
+                return Err("sync window header truncated".to_string());
+            }
+            let kind = decode_sync_window_kind(msg[6])?;
+            let ts_min = i64::from_le_bytes(
+                msg[7..15]
+                    .try_into()
+                    .map_err(|_| "sync window min header truncated".to_string())?,
+            );
+            let ts_max = i64::from_le_bytes(
+                msg[15..23]
+                    .try_into()
+                    .map_err(|_| "sync window max header truncated".to_string())?,
+            );
+            Ok((
+                SyncNegPhase::ObjectsRange {
+                    window: SyncWindow {
+                        kind,
+                        ts_min_inclusive_ms: (ts_min != NONE_TS_SENTINEL).then_some(ts_min),
+                        ts_max_exclusive_ms: (ts_max != NONE_TS_SENTINEL).then_some(ts_max),
+                    },
+                },
+                &msg[23..],
+            ))
+        }
+        other => Err(format!("unsupported sync phase {}", other)),
+    }
 }
 
 #[cfg(test)]
@@ -617,6 +682,35 @@ mod tests {
     }
 
     #[test]
+    fn claim_shards_cover_small_window_in_utc_days() {
+        let window = SyncWindow {
+            kind: SyncWindowKind::LastWeek,
+            ts_min_inclusive_ms: Some(DAY_MS - 1),
+            ts_max_exclusive_ms: Some((3 * DAY_MS) + 1),
+        };
+        assert_eq!(
+            claim_shard_starts_for_window(window, 10 * DAY_MS),
+            vec![0, DAY_MS, 2 * DAY_MS, 3 * DAY_MS]
+        );
+    }
+
+    #[test]
+    fn claim_shards_skip_windows_over_configured_cap() {
+        let prev = std::env::var("TOPO_SYNC_DEP_CLAIM_SHARD_CAP").ok();
+        std::env::set_var("TOPO_SYNC_DEP_CLAIM_SHARD_CAP", "2");
+        let window = SyncWindow {
+            kind: SyncWindowKind::LastWeek,
+            ts_min_inclusive_ms: Some(0),
+            ts_max_exclusive_ms: Some(3 * DAY_MS),
+        };
+        assert!(claim_shard_starts_for_window(window, 10 * DAY_MS).is_empty());
+        match prev {
+            Some(v) => std::env::set_var("TOPO_SYNC_DEP_CLAIM_SHARD_CAP", v),
+            None => std::env::remove_var("TOPO_SYNC_DEP_CLAIM_SHARD_CAP"),
+        }
+    }
+
+    #[test]
     fn initial_neg_open_roundtrips_window_header() {
         let window = SyncWindow {
             kind: SyncWindowKind::LastWeek,
@@ -624,10 +718,31 @@ mod tests {
             ts_max_exclusive_ms: Some(456_789),
         };
         let payload = vec![1, 2, 3, 4];
-        let encoded = encode_initial_neg_open(window, payload.clone());
-        let (decoded_window, inner) = decode_initial_neg_open(&encoded).unwrap();
+        let encoded =
+            encode_initial_neg_open(SyncNegPhase::ObjectsRange { window }, payload.clone());
+        let (decoded_phase, inner) = decode_initial_neg_open(&encoded).unwrap();
 
-        assert_eq!(decoded_window, window);
+        assert_eq!(decoded_phase, SyncNegPhase::ObjectsRange { window });
+        assert_eq!(inner, payload.as_slice());
+    }
+
+    #[test]
+    fn initial_neg_open_roundtrips_claim_shard_header() {
+        let payload = vec![5, 6, 7];
+        let encoded = encode_initial_neg_open(
+            SyncNegPhase::ClaimsDayShard {
+                shard_start_ms: 42 * DAY_MS,
+            },
+            payload.clone(),
+        );
+        let (decoded_phase, inner) = decode_initial_neg_open(&encoded).unwrap();
+
+        assert_eq!(
+            decoded_phase,
+            SyncNegPhase::ClaimsDayShard {
+                shard_start_ms: 42 * DAY_MS,
+            }
+        );
         assert_eq!(inner, payload.as_slice());
     }
 }

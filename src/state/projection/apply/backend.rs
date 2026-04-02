@@ -1,5 +1,6 @@
-use crate::crypto::EventId;
+use crate::crypto::{event_id_from_base64, EventId};
 use crate::db::queue::current_timestamp_ms;
+use crate::db::store::lookup_workspace_id;
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::ParsedEvent;
 use crate::projection::contract::{EmitCommand, WriteOp};
@@ -7,10 +8,69 @@ use crate::projection::decision::ProjectionDecision;
 use crate::projection::encrypted::project_encrypted;
 use crate::projection::queries::ProjectionQueries;
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
-use rusqlite::Connection;
+use rusqlite::{Connection, OptionalExtension};
 
 use super::stages::{check_dep_types, check_deps_and_block, record_rejection};
 use super::write_exec::{execute_emit_commands, execute_write_ops};
+
+fn persist_shared_dep_claims(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id_b64: &str,
+    sub_event: &ParsedEvent,
+) -> ProjectionApplyResult<()> {
+    let is_shared: Option<bool> = conn
+        .query_row(
+            "SELECT share_scope = 'shared'
+             FROM events
+             WHERE event_id = ?1",
+            rusqlite::params![event_id_b64],
+            |row| row.get(0),
+        )
+        .optional()?;
+    if !matches!(is_shared, Some(true)) {
+        return Ok(());
+    }
+
+    let Some(workspace_id) = lookup_workspace_id(conn, recorded_by) else {
+        return Ok(());
+    };
+    let Some(event_id) = event_id_from_base64(event_id_b64) else {
+        return Err(format!("invalid projected event id: {event_id_b64}").into());
+    };
+
+    let dep_ids = sub_event
+        .dep_field_values()
+        .into_iter()
+        .map(|(_, dep_id)| dep_id)
+        .filter(|dep_id| !dep_id.iter().all(|byte| *byte == 0))
+        .collect::<Vec<_>>();
+    if dep_ids.is_empty() {
+        return Ok(());
+    }
+
+    let mut shard_starts = std::collections::BTreeSet::new();
+    shard_starts.insert(crate::db::dep_claims::utc_day_start_ms(
+        sub_event.created_at_ms() as i64,
+    ));
+    for shard_start_ms in
+        crate::db::dep_claims::list_hard_claim_shards_for_event(conn, &workspace_id, &event_id)?
+    {
+        shard_starts.insert(shard_start_ms);
+    }
+
+    let now_ms = current_timestamp_ms();
+    for shard_start_ms in shard_starts {
+        crate::db::dep_claims::upsert_hard_claims(
+            conn,
+            &workspace_id,
+            shard_start_ms,
+            &dep_ids,
+            now_ms,
+        )?;
+    }
+    Ok(())
+}
 
 pub(crate) type ProjectionApplyResult<T> = Result<T, Box<dyn std::error::Error>>;
 
@@ -233,6 +293,7 @@ impl ProjectionBackend for Connection {
                 sub_event,
             )
             .map_err(|e| -> Box<dyn std::error::Error> { e.into() })?;
+            persist_shared_dep_claims(self, recorded_by, event_id_b64, sub_event)?;
 
             let _ =
                 EventTimeline::new(self).mark_projected_b64(event_id_b64, current_timestamp_ms());

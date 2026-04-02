@@ -11,18 +11,20 @@ use crate::runtime::peering::loops::live_session_peer_ids;
 use crate::runtime::SyncStats;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::range_session::{
-    load_shared_event_index_slice, send_have_events, spawn_receive_log_task,
+    load_claim_index_slice, load_shared_object_index_slice, send_have_events,
+    spawn_receive_log_task,
 };
 use crate::sync::session::receive_log::{
     enqueue_receive_log_ingest, note_hot_receive_finished, note_hot_receive_started,
 };
 use crate::sync::session::windowing::{
-    decode_sync_window_kind, encode_initial_neg_open, is_hot_window, is_low_mem_allowed_window,
-    mark_outbound_window_completed, restrict_outbound_windows_to_last_week, select_outbound_window,
-    SyncWindowKind,
+    claim_shard_starts_for_window, decode_sync_window_kind, encode_initial_neg_open, is_hot_window,
+    is_low_mem_allowed_window, mark_outbound_window_completed,
+    restrict_outbound_windows_to_last_week, select_outbound_window, SyncNegPhase, SyncWindowKind,
 };
 use crate::sync::session::{INITIAL_CONTROL_PROGRESS_TIMEOUT, NEGENTROPY_FRAME_SIZE_LIMIT};
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
+use crate::tuning::sync_dep_claim_soft_ttl_ms;
 use negentropy::{Id, Negentropy};
 
 type ManualRoundReply =
@@ -118,17 +120,73 @@ where
             recorded_by
         )
     })?;
+    let session_now_ms = crate::db::queue::current_timestamp_ms();
     let live_peer_ids = live_session_peer_ids(db_path, recorded_by);
     let range = select_outbound_window(
         db_path,
         recorded_by,
         peer_id,
         &live_peer_ids,
-        crate::db::queue::current_timestamp_ms(),
+        session_now_ms,
     );
-    let storage = load_shared_event_index_slice(&db, &ws_id, range)?;
+    let claim_shards = claim_shard_starts_for_window(range, session_now_ms);
+    let soft_claim_expiry_ms = session_now_ms.saturating_add(sync_dep_claim_soft_ttl_ms());
+    for shard_start_ms in &claim_shards {
+        let storage = load_claim_index_slice(&db, &ws_id, *shard_start_ms, session_now_ms)?;
+        let mut neg = Negentropy::borrowed(&storage, NEGENTROPY_FRAME_SIZE_LIMIT)?;
+        let initial_msg = encode_initial_neg_open(
+            SyncNegPhase::ClaimsDayShard {
+                shard_start_ms: *shard_start_ms,
+            },
+            neg.initiate()?,
+        );
+        control.send(&Frame::NegOpen { msg: initial_msg }).await?;
+        control.flush().await?;
+
+        let mut learned_ids = Vec::<Id>::new();
+        loop {
+            let response =
+                tokio::time::timeout(INITIAL_CONTROL_PROGRESS_TIMEOUT, control.recv()).await??;
+            let Frame::NegMsg { msg } = response else {
+                return Err("initiator expected claim NegMsg response".into());
+            };
+            let mut have_ids = Vec::<Id>::new();
+            match neg.reconcile_with_ids(&msg, &mut have_ids, &mut learned_ids)? {
+                Some(next_msg) => {
+                    control.send(&Frame::NegMsg { msg: next_msg }).await?;
+                    control.flush().await?;
+                }
+                None => {
+                    control.send(&Frame::NegMsg { msg: Vec::new() }).await?;
+                    control.flush().await?;
+                    break;
+                }
+            }
+        }
+        learned_ids.sort_unstable();
+        learned_ids.dedup();
+        let learned_event_ids = learned_ids
+            .iter()
+            .map(neg_id_to_event_id)
+            .collect::<Vec<_>>();
+        crate::db::dep_claims::upsert_soft_claims(
+            &db,
+            &ws_id,
+            *shard_start_ms,
+            &learned_event_ids,
+            Some(peer_id),
+            session_now_ms,
+            soft_claim_expiry_ms,
+        )?;
+    }
+
+    let storage =
+        load_shared_object_index_slice(&db, &ws_id, range, &claim_shards, session_now_ms)?;
     let mut neg = Negentropy::borrowed(&storage, NEGENTROPY_FRAME_SIZE_LIMIT)?;
-    let initial_msg = encode_initial_neg_open(range, neg.initiate()?);
+    let initial_msg = encode_initial_neg_open(
+        SyncNegPhase::ObjectsRange { window: range },
+        neg.initiate()?,
+    );
 
     control.send(&Frame::NegOpen { msg: initial_msg }).await?;
     control.flush().await?;
@@ -179,8 +237,6 @@ where
                 control.flush().await?;
             }
             None => {
-                // Empty NegMsg is the explicit control-phase terminator for the
-                // simplified range session protocol.
                 control.send(&Frame::NegMsg { msg: Vec::new() }).await?;
                 control.flush().await?;
                 break;
@@ -237,7 +293,7 @@ where
     Ok(SyncStats {
         events_sent,
         events_received: received.events_received,
-        neg_rounds: 1,
+        neg_rounds: 1 + claim_shards.len() as u64,
         bytes_sent,
         bytes_received: received.bytes_received,
         duration_ms: start.elapsed().as_millis(),

@@ -30,6 +30,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 mod cascade;
 mod core_projection;
 mod deletion;
+mod dep_claims;
 mod encryption;
 mod file_slice;
 mod identity;
