@@ -53,8 +53,12 @@ fn finding_2_empty_missing_block_records_no_dep_edges_and_cascade_cannot_resolve
          (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
         rusqlite::params![
-            recorded_by, &ws_b64, &fake_tenant_eid, &fake_invite_eid,
-            &ws_b64, now_ms() as i64
+            recorded_by,
+            &ws_b64,
+            &fake_tenant_eid,
+            &fake_invite_eid,
+            &ws_b64,
+            now_ms() as i64
         ],
     )
     .unwrap();
@@ -189,7 +193,10 @@ fn finding_4_removal_revokes_transport_authorization() {
 
     // Authorized before removal
     let authorized_before = is_authorized_for_tenant(&conn, recorded_by, &transport_fp).unwrap();
-    assert!(authorized_before, "peer should be authorized before removal");
+    assert!(
+        authorized_before,
+        "peer should be authorized before removal"
+    );
 
     // Remove the peer
     let removal_eid = [0x99u8; 32];
@@ -238,9 +245,14 @@ fn finding_7_bootstrap_trust_expires_in_db_but_cache_has_no_ttl() {
           bootstrap_addr, bootstrap_spki_fingerprint, accepted_at, expires_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
-            recorded_by, &ia_b64, &invite_b64, &ws_b64,
-            "127.0.0.1:4433", bootstrap_fp.as_slice(),
-            now, expired_at
+            recorded_by,
+            &ia_b64,
+            &invite_b64,
+            &ws_b64,
+            "127.0.0.1:4433",
+            bootstrap_fp.as_slice(),
+            now,
+            expired_at
         ],
     )
     .unwrap();
@@ -262,9 +274,14 @@ fn finding_7_bootstrap_trust_expires_in_db_but_cache_has_no_ttl() {
           bootstrap_addr, bootstrap_spki_fingerprint, accepted_at, expires_at)
          VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
         rusqlite::params![
-            recorded_by, &active_ia_b64, &invite_b64, &ws_b64,
-            "127.0.0.1:4433", active_fp.as_slice(),
-            now, future_expiry
+            recorded_by,
+            &active_ia_b64,
+            &invite_b64,
+            &ws_b64,
+            "127.0.0.1:4433",
+            active_fp.as_slice(),
+            now,
+            future_expiry
         ],
     )
     .unwrap();

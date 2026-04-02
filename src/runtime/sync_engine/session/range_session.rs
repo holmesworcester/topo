@@ -1,4 +1,4 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -7,14 +7,12 @@ use rusqlite::Connection;
 
 use crate::crypto::{event_id_from_base64, event_id_to_base64, hash_event, EventId};
 use crate::db::store::Store;
-use crate::event_modules::parse_event;
 use crate::protocol::neg_id_to_event_id;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::receive_log::ReceiveLogWriter;
 use crate::sync::session::windowing::SyncWindow;
 use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
-use crate::tuning::{sync_dep_prefetch_byte_cap, sync_dep_prefetch_event_cap};
 
 const RANGE_DATA_RECORD_PREFIX_LEN: usize = 4;
 const SEND_HAVE_ROOT_BATCH_SIZE: usize = 64;
@@ -23,210 +21,6 @@ pub struct RangeReceiveResult {
     pub events_received: u64,
     pub bytes_received: u64,
     pub path: Option<PathBuf>,
-}
-
-#[derive(Debug, Clone)]
-struct SharedSendRecord {
-    blob: Vec<u8>,
-    created_at_ms: u64,
-    dep_ids: Vec<EventId>,
-}
-
-impl SharedSendRecord {
-    fn from_blob(blob: Vec<u8>) -> Result<Self, String> {
-        let parsed = parse_event(&blob).map_err(|e| format!("parse shared batch event: {e}"))?;
-        let created_at_ms = parsed.created_at_ms();
-        let dep_ids = parsed
-            .dep_field_values()
-            .into_iter()
-            .map(|(_, dep_id)| dep_id)
-            .filter(|dep_id| !is_zero_event_id(dep_id))
-            .collect();
-        Ok(Self {
-            blob,
-            created_at_ms,
-            dep_ids,
-        })
-    }
-}
-
-#[derive(Debug, Clone, Copy)]
-pub(crate) struct SharedSendBudget {
-    remaining_dep_events: usize,
-    remaining_dep_bytes: usize,
-}
-
-impl SharedSendBudget {
-    pub(crate) fn from_tuning() -> Self {
-        Self {
-            remaining_dep_events: sync_dep_prefetch_event_cap(),
-            remaining_dep_bytes: sync_dep_prefetch_byte_cap(),
-        }
-    }
-
-    #[cfg(test)]
-    fn new_for_tests(dep_events: usize, dep_bytes: usize) -> Self {
-        Self {
-            remaining_dep_events: dep_events,
-            remaining_dep_bytes: dep_bytes,
-        }
-    }
-
-    fn try_take_prefetch(&mut self, blob_len: usize) -> bool {
-        if self.remaining_dep_events == 0 || self.remaining_dep_bytes < blob_len {
-            return false;
-        }
-        self.remaining_dep_events -= 1;
-        self.remaining_dep_bytes -= blob_len;
-        true
-    }
-}
-
-#[derive(Debug, Default)]
-pub(crate) struct SharedSendBatch {
-    pub(crate) ordered: Vec<(EventId, Vec<u8>)>,
-    prefetched_dep_events: usize,
-    prefetched_dep_bytes: u64,
-}
-
-fn is_zero_event_id(event_id: &EventId) -> bool {
-    event_id.iter().all(|byte| *byte == 0)
-}
-
-fn sort_ids_by_recency(ids: &mut [EventId], cache: &HashMap<EventId, SharedSendRecord>) {
-    ids.sort_by(|left, right| {
-        let left_created_at = cache
-            .get(left)
-            .map(|record| record.created_at_ms)
-            .unwrap_or(0);
-        let right_created_at = cache
-            .get(right)
-            .map(|record| record.created_at_ms)
-            .unwrap_or(0);
-        right_created_at
-            .cmp(&left_created_at)
-            .then_with(|| right.cmp(left))
-    });
-}
-
-fn cache_shared_records(
-    store: &Store<'_>,
-    cache: &mut HashMap<EventId, SharedSendRecord>,
-    ids: &[EventId],
-) -> Result<(), String> {
-    let mut missing = Vec::new();
-    let mut queued = HashSet::new();
-    for event_id in ids {
-        if cache.contains_key(event_id) || !queued.insert(*event_id) {
-            continue;
-        }
-        missing.push(*event_id);
-    }
-    if missing.is_empty() {
-        return Ok(());
-    }
-
-    let blobs = store
-        .get_shared_batch(&missing)
-        .map_err(|e| format!("load shared batch: {e}"))?;
-    for (event_id, blob) in blobs {
-        cache.insert(event_id, SharedSendRecord::from_blob(blob)?);
-    }
-    Ok(())
-}
-
-fn append_shared_event_with_prefetched_deps(
-    store: &Store<'_>,
-    event_id: EventId,
-    cache: &mut HashMap<EventId, SharedSendRecord>,
-    emitted: &mut HashSet<EventId>,
-    visiting: &mut HashSet<EventId>,
-    budget: &mut SharedSendBudget,
-    batch: &mut SharedSendBatch,
-    requested_root: bool,
-) -> Result<(), String> {
-    if emitted.contains(&event_id) {
-        return Ok(());
-    }
-    if !visiting.insert(event_id) {
-        return Ok(());
-    }
-
-    cache_shared_records(store, cache, &[event_id])?;
-    let Some(record) = cache.get(&event_id).cloned() else {
-        visiting.remove(&event_id);
-        return Ok(());
-    };
-
-    if !requested_root && !budget.try_take_prefetch(record.blob.len()) {
-        visiting.remove(&event_id);
-        return Ok(());
-    }
-    if !requested_root {
-        batch.prefetched_dep_events = batch.prefetched_dep_events.saturating_add(1);
-        batch.prefetched_dep_bytes = batch
-            .prefetched_dep_bytes
-            .saturating_add(record.blob.len() as u64);
-    }
-
-    let mut dep_ids = record
-        .dep_ids
-        .iter()
-        .copied()
-        .filter(|dep_id| !emitted.contains(dep_id))
-        .collect::<Vec<_>>();
-    cache_shared_records(store, cache, &dep_ids)?;
-    dep_ids.retain(|dep_id| cache.contains_key(dep_id) && !emitted.contains(dep_id));
-    sort_ids_by_recency(&mut dep_ids, cache);
-    for dep_id in dep_ids {
-        append_shared_event_with_prefetched_deps(
-            store, dep_id, cache, emitted, visiting, budget, batch, false,
-        )?;
-    }
-
-    if emitted.insert(event_id) {
-        batch.ordered.push((event_id, record.blob));
-    }
-    visiting.remove(&event_id);
-    Ok(())
-}
-
-pub(crate) fn load_shared_send_batch_with_prefetched_deps(
-    store: &Store<'_>,
-    ids: &[EventId],
-    emitted: &mut HashSet<EventId>,
-    budget: &mut SharedSendBudget,
-) -> Result<SharedSendBatch, String> {
-    if ids.is_empty() {
-        return Ok(SharedSendBatch::default());
-    }
-
-    let mut cache = HashMap::new();
-    cache_shared_records(store, &mut cache, ids)?;
-
-    let mut requested_ids = ids
-        .iter()
-        .copied()
-        .filter(|event_id| cache.contains_key(event_id) && !emitted.contains(event_id))
-        .collect::<Vec<_>>();
-    sort_ids_by_recency(&mut requested_ids, &cache);
-
-    let mut visiting = HashSet::new();
-    let mut batch = SharedSendBatch::default();
-    for event_id in requested_ids {
-        append_shared_event_with_prefetched_deps(
-            store,
-            event_id,
-            &mut cache,
-            emitted,
-            &mut visiting,
-            budget,
-            &mut batch,
-            true,
-        )?;
-    }
-
-    Ok(batch)
 }
 
 pub fn load_shared_event_index_slice(
@@ -409,17 +203,19 @@ where
     let mut events_sent = 0u64;
     let mut bytes_sent = 0u64;
     let event_ids: Vec<EventId> = have_ids.iter().map(neg_id_to_event_id).collect();
-    let mut emitted = HashSet::new();
-    let mut budget = SharedSendBudget::from_tuning();
     for chunk in event_ids.chunks(SEND_HAVE_ROOT_BATCH_SIZE) {
-        let batch =
-            load_shared_send_batch_with_prefetched_deps(store, chunk, &mut emitted, &mut budget)?;
+        let blobs = store
+            .get_shared_batch(chunk)
+            .map_err(|e| format!("load shared batch: {e}"))?;
         let mut payload = Vec::new();
-        for (_event_id, blob) in batch.ordered {
+        for event_id in chunk {
+            let Some(blob) = blobs.get(event_id) else {
+                continue;
+            };
             let blob_len = u32::try_from(blob.len())
                 .map_err(|_| format!("range event too large: {} bytes", blob.len()))?;
             payload.extend_from_slice(&blob_len.to_le_bytes());
-            payload.extend_from_slice(&blob);
+            payload.extend_from_slice(blob);
             events_sent += 1;
             bytes_sent += blob.len() as u64;
         }
@@ -515,14 +311,14 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::contracts::event_pipeline_contract::IngestItem;
     use crate::crypto::hash_event;
+    use crate::db::open_in_memory;
     use crate::db::schema::create_tables;
     use crate::db::store::{insert_event, insert_shared_event_index_entry_if_shared};
-    use crate::db::{open_connection, open_in_memory};
     use crate::event_modules::bench_dep::BenchDepEvent;
     use crate::event_modules::{encode_event, registry::ShareScope, ParsedEvent};
-    use crate::state::{dependency_fetch, pipeline::ingest_now};
+    use crate::transport::connection::ConnectionError;
+    use async_trait::async_trait;
     use negentropy::NegentropyStorageBase;
 
     fn insert_shared_blob(conn: &Connection, blob: &[u8], created_at_ms: i64) -> EventId {
@@ -577,99 +373,31 @@ mod tests {
         .unwrap()
     }
 
-    fn make_ingest_batch(
-        recorded_by: &str,
-        source_tag: &str,
-        ordered: &[(EventId, Vec<u8>)],
-    ) -> Vec<IngestItem> {
-        ordered
-            .iter()
-            .enumerate()
-            .map(|(idx, (event_id, blob))| {
-                (
-                    *event_id,
-                    blob.clone(),
-                    recorded_by.to_string(),
-                    source_tag.to_string(),
-                    idx as i64,
-                    idx as i64,
-                )
-            })
-            .collect()
+    #[derive(Default)]
+    struct MockDataSend {
+        sent: Vec<Vec<u8>>,
+        flushes: usize,
     }
 
-    fn valid_event_count(conn: &Connection, recorded_by: &str) -> i64 {
-        conn.query_row(
-            "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
-            rusqlite::params![recorded_by],
-            |row| row.get(0),
-        )
-        .unwrap()
+    #[async_trait]
+    impl StreamSend for MockDataSend {
+        async fn send(&mut self, _msg: &crate::protocol::Frame) -> Result<(), ConnectionError> {
+            unreachable!("send_have_events uses send_bytes only")
+        }
+
+        async fn send_bytes(&mut self, bytes: &[u8]) -> Result<(), ConnectionError> {
+            self.sent.push(bytes.to_vec());
+            Ok(())
+        }
+
+        async fn flush(&mut self) -> Result<(), ConnectionError> {
+            self.flushes += 1;
+            Ok(())
+        }
     }
 
-    fn is_valid(conn: &Connection, recorded_by: &str, event_id: &EventId) -> bool {
-        conn.query_row(
-            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, crate::crypto::event_id_to_base64(event_id)],
-            |row| row.get(0),
-        )
-        .unwrap()
-    }
-
-    #[test]
-    fn shared_send_batch_includes_direct_dependency_before_root() {
-        let conn = open_in_memory().unwrap();
-        create_tables(&conn).unwrap();
-
-        let dep_event_id = insert_shared_blob(&conn, &make_bench_dep_blob(1, vec![], 1), 1);
-        let root_event_id =
-            insert_shared_blob(&conn, &make_bench_dep_blob(2, vec![dep_event_id], 2), 2);
-
-        let store = Store::new(&conn);
-        let mut emitted = HashSet::new();
-        let mut budget = SharedSendBudget::new_for_tests(8, 1024 * 1024);
-        let ordered = load_shared_send_batch_with_prefetched_deps(
-            &store,
-            &[root_event_id],
-            &mut emitted,
-            &mut budget,
-        )
-        .unwrap()
-        .ordered;
-
-        assert_eq!(ordered.len(), 2);
-        assert_eq!(ordered[0].0, dep_event_id);
-        assert_eq!(ordered[1].0, root_event_id);
-    }
-
-    #[test]
-    fn shared_send_batch_dedupes_requested_dependency() {
-        let conn = open_in_memory().unwrap();
-        create_tables(&conn).unwrap();
-
-        let dep_event_id = insert_shared_blob(&conn, &make_bench_dep_blob(1, vec![], 1), 1);
-        let root_event_id =
-            insert_shared_blob(&conn, &make_bench_dep_blob(2, vec![dep_event_id], 2), 2);
-
-        let store = Store::new(&conn);
-        let mut emitted = HashSet::new();
-        let mut budget = SharedSendBudget::new_for_tests(8, 1024 * 1024);
-        let ordered = load_shared_send_batch_with_prefetched_deps(
-            &store,
-            &[dep_event_id, root_event_id],
-            &mut emitted,
-            &mut budget,
-        )
-        .unwrap()
-        .ordered;
-
-        assert_eq!(ordered.len(), 2);
-        assert_eq!(ordered[0].0, dep_event_id);
-        assert_eq!(ordered[1].0, root_event_id);
-    }
-
-    #[test]
-    fn shared_send_batch_prefetches_recursive_bench_dep_chain() {
+    #[tokio::test]
+    async fn send_have_events_sends_exact_negotiated_ids_without_recursive_deps() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
 
@@ -678,49 +406,26 @@ mod tests {
         let leaf = insert_shared_blob(&conn, &make_bench_dep_blob(3, vec![mid], 3), 3);
 
         let store = Store::new(&conn);
-        let mut emitted = HashSet::new();
-        let mut budget = SharedSendBudget::new_for_tests(8, 1024 * 1024);
-        let batch =
-            load_shared_send_batch_with_prefetched_deps(&store, &[leaf], &mut emitted, &mut budget)
-                .unwrap();
+        let mut send = MockDataSend::default();
+        let have_ids = vec![Id::from_byte_array(leaf)];
+        let (events_sent, _bytes_sent) = send_have_events(&store, &mut send, &have_ids)
+            .await
+            .unwrap();
 
-        assert_eq!(batch.prefetched_dep_events, 2);
-        assert_eq!(
-            batch
-                .ordered
-                .iter()
-                .map(|(event_id, _)| *event_id)
-                .collect::<Vec<_>>(),
-            vec![root, mid, leaf]
-        );
-    }
+        assert_eq!(events_sent, 1);
+        assert_eq!(send.flushes, 1);
+        assert_eq!(send.sent.len(), 1);
 
-    #[test]
-    fn shared_send_batch_respects_prefetch_event_cap() {
-        let conn = open_in_memory().unwrap();
-        create_tables(&conn).unwrap();
-
-        let root = insert_shared_blob(&conn, &make_bench_dep_blob(1, vec![], 1), 1);
-        let dep_2 = insert_shared_blob(&conn, &make_bench_dep_blob(2, vec![root], 2), 2);
-        let dep_3 = insert_shared_blob(&conn, &make_bench_dep_blob(3, vec![dep_2], 3), 3);
-        let leaf = insert_shared_blob(&conn, &make_bench_dep_blob(4, vec![dep_3], 4), 4);
-
-        let store = Store::new(&conn);
-        let mut emitted = HashSet::new();
-        let mut budget = SharedSendBudget::new_for_tests(2, 1024 * 1024);
-        let batch =
-            load_shared_send_batch_with_prefetched_deps(&store, &[leaf], &mut emitted, &mut budget)
-                .unwrap();
-
-        assert_eq!(batch.prefetched_dep_events, 2);
-        assert_eq!(
-            batch
-                .ordered
-                .iter()
-                .map(|(event_id, _)| *event_id)
-                .collect::<Vec<_>>(),
-            vec![dep_2, dep_3, leaf]
-        );
+        let payload = &send.sent[0];
+        let mut offset = 0usize;
+        let blob = parse_next_blob_record(payload, &mut offset)
+            .unwrap()
+            .expect("range blob record");
+        let ParsedEvent::BenchDep(event) = crate::event_modules::parse_event(&blob).unwrap() else {
+            panic!("expected bench_dep")
+        };
+        assert_eq!(event.dep_ids, vec![mid]);
+        assert_eq!(parse_next_blob_record(payload, &mut offset).unwrap(), None);
     }
 
     #[test]
@@ -799,127 +504,5 @@ mod tests {
 
         assert_eq!(storage_ids(&base_storage), vec![root]);
         assert_eq!(storage_ids(&object_storage), vec![dep, root]);
-    }
-
-    #[tokio::test]
-    async fn prefetched_long_chain_projects_in_one_round_without_dependency_requests() {
-        let dir = tempfile::tempdir().unwrap();
-        let source_db_path = dir.path().join("source.db");
-        let dest_db_path = dir.path().join("dest.db");
-
-        let source_conn = open_connection(&source_db_path).unwrap();
-        let dest_conn = open_connection(&dest_db_path).unwrap();
-        create_tables(&source_conn).unwrap();
-        create_tables(&dest_conn).unwrap();
-
-        let mut prior = None;
-        for idx in 0..1000u64 {
-            let dep_ids = prior.into_iter().collect::<Vec<_>>();
-            let blob = make_bench_dep_blob(idx + 1, dep_ids, (idx % 251) as u8);
-            prior = Some(insert_shared_blob(&source_conn, &blob, (idx + 1) as i64));
-        }
-        let leaf = prior.expect("leaf");
-
-        let store = Store::new(&source_conn);
-        let mut emitted = HashSet::new();
-        let mut budget = SharedSendBudget::new_for_tests(1_500, 4 * 1024 * 1024);
-        let batch =
-            load_shared_send_batch_with_prefetched_deps(&store, &[leaf], &mut emitted, &mut budget)
-                .unwrap();
-
-        assert_eq!(batch.ordered.len(), 1000);
-
-        let dest_path = dest_db_path.to_string_lossy().to_string();
-        let (mut rx, _guard) = dependency_fetch::register(&dest_path, "tenant-a", "peer-z");
-        let persisted = ingest_now(
-            &dest_path,
-            make_ingest_batch("tenant-a", "quic_recv:peer-z@sim", &batch.ordered),
-        )
-        .unwrap();
-        assert_eq!(persisted, 1000);
-        assert_eq!(valid_event_count(&dest_conn, "tenant-a"), 1000);
-        assert!(is_valid(&dest_conn, "tenant-a", &leaf));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), rx.recv())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn capped_prefetch_converges_in_frontier_rounds_without_duplicate_requests() {
-        let dir = tempfile::tempdir().unwrap();
-        let source_db_path = dir.path().join("source-capped.db");
-        let dest_db_path = dir.path().join("dest-capped.db");
-
-        let source_conn = open_connection(&source_db_path).unwrap();
-        let dest_conn = open_connection(&dest_db_path).unwrap();
-        create_tables(&source_conn).unwrap();
-        create_tables(&dest_conn).unwrap();
-
-        let chain_len = 32usize;
-        let cap = 4usize;
-        let mut all_ids = Vec::with_capacity(chain_len);
-        let mut prior = None;
-        for idx in 0..chain_len {
-            let dep_ids = prior.into_iter().collect::<Vec<_>>();
-            let blob = make_bench_dep_blob((idx + 1) as u64, dep_ids, (idx % 251) as u8);
-            let event_id = insert_shared_blob(&source_conn, &blob, (idx + 1) as i64);
-            all_ids.push(event_id);
-            prior = Some(event_id);
-        }
-        let leaf = *all_ids.last().unwrap();
-
-        let dest_path = dest_db_path.to_string_lossy().to_string();
-        let store = Store::new(&source_conn);
-        let (mut rx, _guard) = dependency_fetch::register(&dest_path, "tenant-a", "peer-z");
-        let mut requested_frontiers = Vec::new();
-        let mut frontier = vec![leaf];
-
-        loop {
-            let mut emitted = HashSet::new();
-            let mut budget = SharedSendBudget::new_for_tests(cap, 4 * 1024 * 1024);
-            let batch = load_shared_send_batch_with_prefetched_deps(
-                &store,
-                &frontier,
-                &mut emitted,
-                &mut budget,
-            )
-            .unwrap();
-            ingest_now(
-                &dest_path,
-                make_ingest_batch("tenant-a", "quic_recv:peer-z@sim", &batch.ordered),
-            )
-            .unwrap();
-
-            if is_valid(&dest_conn, "tenant-a", &leaf) {
-                break;
-            }
-
-            let next_frontier =
-                tokio::time::timeout(std::time::Duration::from_millis(50), rx.recv())
-                    .await
-                    .expect("expected frontier dep request")
-                    .expect("dependency request payload");
-            assert_eq!(
-                next_frontier.len(),
-                1,
-                "expected one unresolved frontier id"
-            );
-            requested_frontiers.push(next_frontier[0]);
-            frontier = next_frontier;
-        }
-
-        let unique_frontiers = requested_frontiers.iter().copied().collect::<HashSet<_>>();
-        assert_eq!(unique_frontiers.len(), requested_frontiers.len());
-        let expected_follow_up_rounds = (chain_len - 1) / (cap + 1);
-        assert_eq!(requested_frontiers.len(), expected_follow_up_rounds);
-        assert_eq!(valid_event_count(&dest_conn, "tenant-a"), chain_len as i64);
-        assert!(is_valid(&dest_conn, "tenant-a", &leaf));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(20), rx.recv())
-                .await
-                .is_err()
-        );
     }
 }

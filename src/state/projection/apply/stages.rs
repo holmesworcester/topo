@@ -6,7 +6,6 @@ use crate::db::queue::current_timestamp_ms;
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::{registry, ParsedEvent, TransportPrivacy};
 use crate::projection::queries::ContextLoadResult;
-use crate::state::{dependency_fetch, live_hints::source_peer_id_from_source_tag};
 use rusqlite::{Connection, OptionalExtension};
 
 use super::dispatch::dispatch_pure_projector;
@@ -137,50 +136,6 @@ fn dep_is_satisfied_for_scope(
     global_endpoint_shared_is_valid(conn, dep_b64)
 }
 
-fn load_recorded_source_peer_id(
-    conn: &Connection,
-    recorded_by: &str,
-    event_id_b64: &str,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let source_tag: Option<String> = conn
-        .query_row(
-            "SELECT source
-             FROM recorded_events
-             WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, event_id_b64],
-            |row| row.get(0),
-        )
-        .optional()?
-        .flatten();
-    Ok(source_tag.and_then(|source_tag| source_peer_id_from_source_tag(&source_tag)))
-}
-
-fn event_blob_exists(
-    conn: &Connection,
-    event_id_b64: &str,
-) -> Result<bool, Box<dyn std::error::Error>> {
-    let present: bool = conn.query_row(
-        "SELECT COUNT(*) > 0 FROM events WHERE event_id = ?1",
-        rusqlite::params![event_id_b64],
-        |row| row.get(0),
-    )?;
-    Ok(present)
-}
-
-fn missing_deps_needing_fetch(
-    conn: &Connection,
-    missing: &[EventId],
-) -> Result<Vec<EventId>, Box<dyn std::error::Error>> {
-    let mut needed = Vec::new();
-    for dep_id in missing {
-        let dep_b64 = event_id_to_base64(dep_id);
-        if !event_blob_exists(conn, &dep_b64)? {
-            needed.push(*dep_id);
-        }
-    }
-    Ok(needed)
-}
-
 fn tombstone_satisfies_message_dep(
     conn: &Connection,
     recorded_by: &str,
@@ -294,11 +249,6 @@ pub(crate) fn check_deps_and_block(
     }
 
     record_block_rows(conn, recorded_by, event_id_b64, &missing)?;
-    if let Some(source_peer_id) = load_recorded_source_peer_id(conn, recorded_by, event_id_b64)? {
-        let needed = missing_deps_needing_fetch(conn, &missing)?;
-        dependency_fetch::publish_from_connection(conn, recorded_by, &source_peer_id, &needed);
-    }
-
     Ok(Some(ProjectionDecision::Block { missing }))
 }
 
@@ -478,12 +428,12 @@ mod tests {
     use crate::db::{open_connection, schema::create_tables};
     use crate::event_modules::BenchDepEvent;
 
-    fn setup_file_db() -> (tempfile::TempDir, String, Connection) {
+    fn setup_file_db() -> (tempfile::TempDir, Connection) {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("stages.db").to_string_lossy().to_string();
         let conn = open_connection(&db_path).unwrap();
         create_tables(&conn).unwrap();
-        (dir, db_path, conn)
+        (dir, conn)
     }
 
     fn event_id(byte: u8) -> EventId {
@@ -500,9 +450,9 @@ mod tests {
         })
     }
 
-    #[tokio::test]
-    async fn blocked_quic_event_emits_dependency_fetch_for_source_peer() {
-        let (_dir, db_path, conn) = setup_file_db();
+    #[test]
+    fn blocked_event_records_block_rows_without_source_specific_fetch() {
+        let (_dir, conn) = setup_file_db();
         let blocked = event_id(1);
         let missing = event_id(2);
         let blocked_b64 = event_id_to_base64(&blocked);
@@ -513,7 +463,6 @@ mod tests {
         )
         .unwrap();
 
-        let (mut rx, _guard) = dependency_fetch::register(&db_path, "tenant-a", "peer-z");
         let decision = check_deps_and_block(
             &conn,
             "tenant-a",
@@ -523,106 +472,24 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(decision, Some(ProjectionDecision::Block { .. })));
-        assert_eq!(rx.recv().await, Some(vec![missing]));
-    }
 
-    #[tokio::test]
-    async fn local_only_blocked_event_does_not_emit_dependency_fetch() {
-        let (_dir, db_path, conn) = setup_file_db();
-        let blocked = event_id(3);
-        let missing = event_id(4);
-        let blocked_b64 = event_id_to_base64(&blocked);
-        conn.execute(
-            "INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
-             VALUES (?1, ?2, 1, ?3)",
-            rusqlite::params!["tenant-a", &blocked_b64, "local_create"],
-        )
-        .unwrap();
-
-        let (mut rx, _guard) = dependency_fetch::register(&db_path, "tenant-a", "peer-z");
-        let decision = check_deps_and_block(
-            &conn,
-            "tenant-a",
-            &blocked_b64,
-            &unrelated_parsed(),
-            &[("dep", missing)],
-        )
-        .unwrap();
-        assert!(matches!(decision, Some(ProjectionDecision::Block { .. })));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(10), rx.recv())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn blocked_quic_event_skips_dependency_fetch_for_blob_already_present_locally() {
-        let (_dir, db_path, conn) = setup_file_db();
-        let blocked = event_id(5);
-        let present_missing = event_id(6);
-        let blocked_b64 = event_id_to_base64(&blocked);
-        conn.execute(
-            "INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
-             VALUES (?1, ?2, 1, ?3)",
-            rusqlite::params!["tenant-a", &blocked_b64, "quic_recv:peer-z@127.0.0.1:7777"],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-             VALUES (?1, 'bench_dep_perf_testing', x'1A', 'shared', 1, 1)",
-            rusqlite::params![event_id_to_base64(&present_missing)],
-        )
-        .unwrap();
-
-        let (mut rx, _guard) = dependency_fetch::register(&db_path, "tenant-a", "peer-z");
-        let decision = check_deps_and_block(
-            &conn,
-            "tenant-a",
-            &blocked_b64,
-            &unrelated_parsed(),
-            &[("dep", present_missing)],
-        )
-        .unwrap();
-        assert!(matches!(decision, Some(ProjectionDecision::Block { .. })));
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(10), rx.recv())
-                .await
-                .is_err()
-        );
-    }
-
-    #[tokio::test]
-    async fn blocked_quic_event_requests_only_absent_missing_deps() {
-        let (_dir, db_path, conn) = setup_file_db();
-        let blocked = event_id(7);
-        let absent_missing = event_id(8);
-        let present_missing = event_id(9);
-        let blocked_b64 = event_id_to_base64(&blocked);
-        conn.execute(
-            "INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
-             VALUES (?1, ?2, 1, ?3)",
-            rusqlite::params!["tenant-a", &blocked_b64, "quic_recv:peer-z@127.0.0.1:7777"],
-        )
-        .unwrap();
-        conn.execute(
-            "INSERT INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
-             VALUES (?1, 'bench_dep_perf_testing', x'1A', 'shared', 1, 1)",
-            rusqlite::params![event_id_to_base64(&present_missing)],
-        )
-        .unwrap();
-
-        let (mut rx, _guard) = dependency_fetch::register(&db_path, "tenant-a", "peer-z");
-        let decision = check_deps_and_block(
-            &conn,
-            "tenant-a",
-            &blocked_b64,
-            &unrelated_parsed(),
-            &[("present", present_missing), ("absent", absent_missing)],
-        )
-        .unwrap();
-        assert!(matches!(decision, Some(ProjectionDecision::Block { .. })));
-        assert_eq!(rx.recv().await, Some(vec![absent_missing]));
+        let blocked_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2",
+                rusqlite::params!["tenant-a", &blocked_b64],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let dep_rows: i64 = conn
+            .query_row(
+                "SELECT COUNT(*) FROM blocked_event_deps
+                 WHERE peer_id = ?1 AND event_id = ?2 AND blocker_event_id = ?3",
+                rusqlite::params!["tenant-a", &blocked_b64, event_id_to_base64(&missing)],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(blocked_rows, 1);
+        assert_eq!(dep_rows, 1);
     }
 }
 
