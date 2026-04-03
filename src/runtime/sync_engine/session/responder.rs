@@ -242,12 +242,16 @@ where
     if hot_receive {
         note_hot_receive_started(db_path);
     }
+    let receive_source_tag = crate::db::queue::source_tag_with_sync_window(
+        ingress_source_tag,
+        encode_sync_window_kind(range.kind),
+    );
     let receive_task = spawn_receive_log_task(
         data_recv,
         db_path.to_string(),
         recorded_by.to_string(),
         session_id,
-        ingress_source_tag.to_string(),
+        receive_source_tag,
         activity_timeout,
         rx_capture,
     );
@@ -271,7 +275,7 @@ where
         }
     };
     if let Some(path) = received.path.clone() {
-        enqueue_receive_log_ingest(db_path, path);
+        enqueue_receive_log_ingest(db_path, path, hot_receive);
     }
     drain_manual_commands(peer_id, &mut command_rx, &mut pending_round_replies);
     reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);

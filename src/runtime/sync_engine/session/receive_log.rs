@@ -87,7 +87,7 @@ pub fn note_hot_receive_finished(db_path: &str) {
     state.wake.notify_all();
 }
 
-pub fn enqueue_receive_log_ingest(db_path: &str, path: PathBuf) {
+pub fn enqueue_receive_log_ingest(db_path: &str, path: PathBuf, prioritize: bool) {
     let state = ingest_state(db_path);
     let mut spawn_worker = false;
     {
@@ -95,7 +95,11 @@ pub fn enqueue_receive_log_ingest(db_path: &str, path: PathBuf) {
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
-        inner.pending.push_back(path);
+        if prioritize {
+            inner.pending.push_front(path);
+        } else {
+            inner.pending.push_back(path);
+        }
         if !inner.worker_running {
             inner.worker_running = true;
             spawn_worker = true;
@@ -653,6 +657,61 @@ mod tests {
     }
 
     #[test]
+    fn prioritized_receive_logs_run_before_background_pending_logs() {
+        let dir = tempfile::tempdir().unwrap();
+        let db_path = dir.path().join("test.db");
+        let conn = open_connection(&db_path).unwrap();
+        create_tables(&conn).unwrap();
+
+        let mut cold_writer =
+            ReceiveLogWriter::open(db_path.to_str().unwrap(), "tenant-a", 10, "peer-x").unwrap();
+        let first_cold_blob = b"cold queued first 0000".to_vec();
+        let first_cold_id = event_id_to_base64(&hash_event(&first_cold_blob));
+        cold_writer.append_blob(&first_cold_blob).unwrap();
+        for idx in 1..1024u32 {
+            cold_writer
+                .append_blob(
+                    format!("cold queued first {idx:04}")
+                        .into_bytes()
+                        .as_slice(),
+                )
+                .unwrap();
+        }
+        let cold_path = cold_writer.finish().unwrap().unwrap();
+
+        let hot_blob = b"hot queued second".to_vec();
+        let hot_id = event_id_to_base64(&hash_event(&hot_blob));
+        let mut hot_writer =
+            ReceiveLogWriter::open(db_path.to_str().unwrap(), "tenant-a", 11, "peer-x").unwrap();
+        hot_writer.append_blob(&hot_blob).unwrap();
+        let hot_path = hot_writer.finish().unwrap().unwrap();
+
+        note_hot_receive_started(db_path.to_str().unwrap());
+        enqueue_receive_log_ingest(db_path.to_str().unwrap(), cold_path.clone(), false);
+        enqueue_receive_log_ingest(db_path.to_str().unwrap(), hot_path.clone(), true);
+        note_hot_receive_finished(db_path.to_str().unwrap());
+
+        let timeline = EventTimeline::new(&conn);
+        let deadline = Instant::now() + Duration::from_secs(5);
+        loop {
+            let hot_seen = timeline.load(&hot_id).unwrap().is_some();
+            let cold_seen = timeline.load(&first_cold_id).unwrap().is_some();
+            if hot_seen || cold_seen {
+                assert!(
+                    hot_seen,
+                    "background receive log became visible before the prioritized hot log"
+                );
+                break;
+            }
+            assert!(
+                Instant::now() < deadline,
+                "receive log ingest did not make progress"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+    }
+
+    #[test]
     fn background_ingest_waits_for_active_hot_receives() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("test.db");
@@ -667,7 +726,7 @@ mod tests {
         let path = writer.finish().unwrap().unwrap();
 
         note_hot_receive_started(db_path.to_str().unwrap());
-        enqueue_receive_log_ingest(db_path.to_str().unwrap(), path.clone());
+        enqueue_receive_log_ingest(db_path.to_str().unwrap(), path.clone(), false);
         std::thread::sleep(Duration::from_millis(150));
 
         let timeline = EventTimeline::new(&conn);

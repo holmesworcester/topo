@@ -17,6 +17,7 @@ use crate::db::store::{
     SQL_INSERT_SHARED_EVENT_INDEX_ENTRY,
 };
 use crate::event_modules::{self as events, registry};
+use crate::state::db::queue::classify_priority_from_blob_and_source;
 use crate::state::live_hints;
 use crate::tuning::{bulk_write_batch_cap, drain_batch_size, low_mem_mode, write_batch_cap};
 
@@ -31,18 +32,13 @@ fn ingest_is_bulk(item: &IngestItem) -> bool {
     events::outer_semantic_type_code(&item.1) == Some(events::EVENT_TYPE_FILE_SLICE)
 }
 
+fn ingest_priority_lane(item: &IngestItem) -> i64 {
+    let created_at = events::extract_created_at_ms(&item.1).unwrap_or_default() as i64;
+    classify_priority_from_blob_and_source(&item.1, &item.3, created_at).0
+}
+
 fn sort_ingest_batch(batch: &mut [IngestItem]) {
-    let mut foreground = Vec::with_capacity(batch.len());
-    let mut bulk = Vec::new();
-    for item in batch.iter().cloned() {
-        if ingest_is_bulk(&item) {
-            bulk.push(item);
-        } else {
-            foreground.push(item);
-        }
-    }
-    foreground.extend(bulk);
-    batch.clone_from_slice(&foreground);
+    batch.sort_by_key(ingest_priority_lane);
 }
 
 fn ingest_batch_cap(first: &IngestItem) -> usize {
@@ -401,6 +397,10 @@ mod tests {
     use super::phases::PersistPhaseOutput;
     use super::*;
     use crate::event_modules::{EVENT_TYPE_FILE_SLICE, EVENT_TYPE_MESSAGE};
+    use crate::state::db::queue::{
+        source_tag_with_sync_window, PRIORITY_LANE_BULK, PRIORITY_LANE_TIER_HOUR,
+        PRIORITY_LANE_TIER_WEEK,
+    };
 
     #[derive(Default)]
     struct RecordingExecutor {
@@ -425,13 +425,22 @@ mod tests {
     }
 
     fn make_ingest_item(type_code: u8, created_at: u64, marker: u8) -> IngestItem {
+        make_ingest_item_with_source(type_code, created_at, marker, "sync")
+    }
+
+    fn make_ingest_item_with_source(
+        type_code: u8,
+        created_at: u64,
+        marker: u8,
+        source_tag: &str,
+    ) -> IngestItem {
         let mut blob = vec![type_code];
         blob.extend_from_slice(&created_at.to_le_bytes());
         (
             [marker; 32],
             blob,
             "tenant-a".to_string(),
-            "sync".to_string(),
+            source_tag.to_string(),
             0,
             0,
         )
@@ -498,18 +507,24 @@ mod tests {
     }
 
     #[test]
-    fn ingest_sort_prefers_foreground_while_preserving_arrival_order() {
+    fn ingest_sort_prefers_hotter_ranges_before_older_ranges_and_bulk() {
+        let hot_tag = source_tag_with_sync_window("quic_recv:peer@127.0.0.1", 1);
+        let week_tag = source_tag_with_sync_window("quic_recv:peer@127.0.0.1", 3);
         let mut batch = vec![
             make_ingest_item(EVENT_TYPE_FILE_SLICE, 10, 1),
-            make_ingest_item(EVENT_TYPE_MESSAGE, 20, 2),
-            make_ingest_item(EVENT_TYPE_MESSAGE, 30, 3),
+            make_ingest_item_with_source(EVENT_TYPE_MESSAGE, 20, 2, &week_tag),
+            make_ingest_item_with_source(EVENT_TYPE_MESSAGE, 30, 3, &hot_tag),
+            make_ingest_item_with_source(EVENT_TYPE_MESSAGE, 40, 4, &hot_tag),
         ];
 
         sort_ingest_batch(&mut batch);
 
-        assert_eq!(batch[0].0, [2u8; 32]);
-        assert_eq!(batch[1].0, [3u8; 32]);
-        assert_eq!(batch[2].0, [1u8; 32]);
+        assert_eq!(ingest_priority_lane(&batch[0]), PRIORITY_LANE_TIER_HOUR);
+        assert_eq!(ingest_priority_lane(&batch[1]), PRIORITY_LANE_TIER_HOUR);
+        assert_eq!(ingest_priority_lane(&batch[2]), PRIORITY_LANE_TIER_WEEK);
+        assert_eq!(ingest_priority_lane(&batch[3]), PRIORITY_LANE_BULK);
+        assert_eq!(batch[0].0, [3u8; 32]);
+        assert_eq!(batch[1].0, [4u8; 32]);
     }
 
     #[test]

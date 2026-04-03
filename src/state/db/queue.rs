@@ -20,6 +20,7 @@ pub const PRIORITY_LANE_TIER_WEEK: i64 = 3;
 pub const PRIORITY_LANE_TIER_MONTH: i64 = 4;
 pub const PRIORITY_LANE_FOREGROUND: i64 = 5;
 pub const PRIORITY_LANE_BULK: i64 = 6;
+const SOURCE_TAG_SYNC_WINDOW_MARKER: &str = "|sync_window=";
 
 /// Queue health snapshot for observability.
 #[derive(Debug, Clone)]
@@ -43,15 +44,38 @@ pub fn current_timestamp_ms_u64() -> u64 {
         .as_millis() as u64
 }
 
-pub fn classify_priority_from_blob(blob: &[u8], created_at: i64) -> (i64, i64) {
+pub fn source_tag_with_sync_window(source_tag: &str, window_kind: u8) -> String {
+    format!("{source_tag}{SOURCE_TAG_SYNC_WINDOW_MARKER}{window_kind}")
+}
+
+pub fn priority_lane_from_source_tag(source_tag: &str) -> Option<i64> {
+    let (_, suffix) = source_tag.rsplit_once(SOURCE_TAG_SYNC_WINDOW_MARKER)?;
+    match suffix.parse::<u8>().ok()? {
+        1 => Some(PRIORITY_LANE_TIER_HOUR),
+        2 => Some(PRIORITY_LANE_TIER_DAY),
+        3 => Some(PRIORITY_LANE_TIER_WEEK),
+        0 => Some(PRIORITY_LANE_TIER_MONTH),
+        _ => None,
+    }
+}
+
+pub fn classify_priority_from_blob_and_source(
+    blob: &[u8],
+    source_tag: &str,
+    created_at: i64,
+) -> (i64, i64) {
     let lane = if crate::event_modules::outer_semantic_type_code(blob)
         == Some(crate::event_modules::EVENT_TYPE_FILE_SLICE)
     {
         PRIORITY_LANE_BULK
     } else {
-        PRIORITY_LANE_FOREGROUND
+        priority_lane_from_source_tag(source_tag).unwrap_or(PRIORITY_LANE_FOREGROUND)
     };
     (lane, created_at)
+}
+
+pub fn classify_priority_from_blob(blob: &[u8], created_at: i64) -> (i64, i64) {
+    classify_priority_from_blob_and_source(blob, "", created_at)
 }
 pub fn is_sqlite_busy(err: &rusqlite::Error) -> bool {
     match err {
@@ -178,6 +202,34 @@ mod tests {
         assert!(ts > 0);
         // Should be a reasonable epoch millis (after 2020)
         assert!(ts > 1_577_836_800_000);
+    }
+
+    #[test]
+    fn test_source_tag_window_round_trips_to_priority_lane() {
+        let source_tag = source_tag_with_sync_window("quic_recv:peer@127.0.0.1", 1);
+        assert_eq!(
+            priority_lane_from_source_tag(&source_tag),
+            Some(PRIORITY_LANE_TIER_HOUR)
+        );
+        assert_eq!(
+            priority_lane_from_source_tag("quic_recv:peer@127.0.0.1"),
+            None
+        );
+    }
+
+    #[test]
+    fn test_classify_priority_uses_sync_window_lane_for_foreground_only() {
+        let source_tag = source_tag_with_sync_window("quic_recv:peer@127.0.0.1", 2);
+        let message = [crate::event_modules::EVENT_TYPE_MESSAGE];
+        let file_slice = [crate::event_modules::EVENT_TYPE_FILE_SLICE];
+        assert_eq!(
+            classify_priority_from_blob_and_source(&message, &source_tag, 10),
+            (PRIORITY_LANE_TIER_DAY, 10)
+        );
+        assert_eq!(
+            classify_priority_from_blob_and_source(&file_slice, &source_tag, 10),
+            (PRIORITY_LANE_BULK, 10)
+        );
     }
 
     #[test]
