@@ -13,6 +13,10 @@ pub fn low_mem_memtrace() -> bool {
     read_bool_env("LOW_MEM_MEMTRACE")
 }
 
+pub fn sync_last_day_only() -> bool {
+    read_bool_env("TOPO_SYNC_LAST_DAY_ONLY")
+}
+
 pub fn read_bool_env(name: &str) -> bool {
     match std::env::var(name) {
         Ok(v) => v != "0" && v.to_lowercase() != "false",

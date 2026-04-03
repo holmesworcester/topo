@@ -67,6 +67,7 @@ fn inherited_tier_env() -> Vec<(String, String)> {
         "TOPO_GENERATE_MESSAGE_SPREAD_MS",
         "TOPO_FORWARD_ON_HAVE",
         "TOPO_EVENT_TIMELINE",
+        "TOPO_SYNC_LAST_DAY_ONLY",
     ]
     .into_iter()
     .filter_map(|key| {
@@ -251,7 +252,7 @@ fn write_summary(summary_key: &str, summary: &str) {
         .expect("write benchmark summary file");
 }
 
-fn run_tiered_window_bench(total_messages_override: Option<i64>) {
+fn run_tiered_window_bench(total_messages_override: Option<i64>, last_day_only: bool) {
     std::env::set_var(
         "TOPO_GENERATE_MESSAGE_SPREAD_MS",
         THREE_YEARS_MS.to_string(),
@@ -259,6 +260,12 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>) {
     std::env::set_var("TOPO_FORWARD_ON_HAVE", "1");
     std::env::set_var("TOPO_EVENT_TIMELINE", "1");
     std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "persist,projection");
+    let prev_sync_last_day_only = std::env::var("TOPO_SYNC_LAST_DAY_ONLY").ok();
+    if last_day_only {
+        std::env::set_var("TOPO_SYNC_LAST_DAY_ONLY", "1");
+    } else {
+        std::env::remove_var("TOPO_SYNC_LAST_DAY_ONLY");
+    }
 
     let total_messages = total_messages_override
         .unwrap_or_else(|| env_i64("TOPO_TIERED_SYNC_TOTAL_MESSAGES", 50_000));
@@ -358,72 +365,108 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>) {
     } else {
         metric_start_ms
     };
-    let week_projected_ms = if expected_week > 0 {
-        wait_for_message_count_since(
-            &bob_db,
-            week_cutoff,
-            expected_week,
-            Duration::from_secs(1200),
-        )
-    } else {
-        metric_start_ms
-    };
-    let twelve_week_projected_ms = if expected_twelve_weeks > 0 {
-        wait_for_message_count_since(
-            &bob_db,
-            twelve_week_cutoff,
-            expected_twelve_weeks,
-            Duration::from_secs(1200),
-        )
-    } else {
-        metric_start_ms
-    };
-    let full_projected_ms =
-        wait_for_message_count(&bob_db, total_messages, Duration::from_secs(1200));
-    let full_wall_secs = bench_start.elapsed().as_secs_f64();
+    let full_wall_secs;
+    let summary;
+    let summary_key;
 
     let day_timing = range_timing_sql(&bob_db, Some(day_cutoff));
-    let week_timing = range_timing_sql(&bob_db, Some(week_cutoff));
-    let twelve_week_timing = range_timing_sql(&bob_db, Some(twelve_week_cutoff));
-    let all_timing = range_timing_sql(&bob_db, None);
     let newest_timing = newest_message_timing_sql(&bob_db);
 
-    let summary = format!(
-        "=== tiered window catchup ===\n  Window ladder: LastDay -> LastWeek -> Last12Weeks -> Full\n  Messages preloaded on inviter: {total_messages}\n  Network profile: {}\n  Generated spread: 3 years\n  Aged auth deps: user={} peer_shared={}\n  Metric start: invite accept on running joiner daemon\n  Last day:      {} msgs durable in {:.2}s projected in {:.2}s\n  Last week:     {} msgs durable in {:.2}s projected in {:.2}s\n  Last 12 weeks: {} msgs durable in {:.2}s projected in {:.2}s\n  All:           {} msgs durable in {:.2}s projected in {:.2}s\n  Newest message: created_at={} durable in {:.2}s visible in {:.2}s\n  Full catchup wall: {:.2}s\n",
-        network_profile.map(|profile| profile.slug).unwrap_or("loopback"),
-        authoring_dep_timing.user_created_at_ms,
-        authoring_dep_timing.peer_shared_created_at_ms,
-        day_timing.count,
-        elapsed_secs(metric_start_ms, day_timing.first_stored_at_ms),
-        elapsed_secs(metric_start_ms, day_timing.projected_at_ms.or(Some(day_projected_ms))),
-        week_timing.count,
-        elapsed_secs(metric_start_ms, week_timing.first_stored_at_ms),
-        elapsed_secs(metric_start_ms, week_timing.projected_at_ms.or(Some(week_projected_ms))),
-        twelve_week_timing.count,
-        elapsed_secs(metric_start_ms, twelve_week_timing.first_stored_at_ms),
-        elapsed_secs(
-            metric_start_ms,
-            twelve_week_timing
-                .projected_at_ms
-                .or(Some(twelve_week_projected_ms))
-        ),
-        all_timing.count,
-        elapsed_secs(metric_start_ms, all_timing.first_stored_at_ms),
-        elapsed_secs(metric_start_ms, all_timing.projected_at_ms.or(Some(full_projected_ms))),
-        newest_timing.created_at_ms.unwrap_or_default(),
-        elapsed_secs(metric_start_ms, newest_timing.first_stored_at_ms),
-        elapsed_secs(metric_start_ms, newest_timing.projected_at_ms),
-        full_wall_secs,
-    );
+    if last_day_only {
+        full_wall_secs = bench_start.elapsed().as_secs_f64();
+        let visible_total = message_count_sql(&bob_db);
+        summary = format!(
+            "=== last-day-only catchup ===\n  Window ladder: LastDay only\n  Messages preloaded on inviter: {total_messages}\n  Network profile: {}\n  Generated spread: 3 years\n  Aged auth deps: user={} peer_shared={}\n  Metric start: invite accept on running joiner daemon\n  Last day:      {} msgs durable in {:.2}s projected in {:.2}s\n  Visible total: {} msgs\n  Newest message: created_at={} durable in {:.2}s visible in {:.2}s\n  Hot-range wall: {:.2}s\n",
+            network_profile.map(|profile| profile.slug).unwrap_or("loopback"),
+            authoring_dep_timing.user_created_at_ms,
+            authoring_dep_timing.peer_shared_created_at_ms,
+            day_timing.count,
+            elapsed_secs(metric_start_ms, day_timing.first_stored_at_ms),
+            elapsed_secs(metric_start_ms, day_timing.projected_at_ms.or(Some(day_projected_ms))),
+            visible_total,
+            newest_timing.created_at_ms.unwrap_or_default(),
+            elapsed_secs(metric_start_ms, newest_timing.first_stored_at_ms),
+            elapsed_secs(metric_start_ms, newest_timing.projected_at_ms),
+            full_wall_secs,
+        );
+        summary_key = format!(
+            "daemon_tiered_window_perf_test.last_day_only_{}_{}",
+            total_messages,
+            network_profile
+                .map(|profile| profile.slug)
+                .unwrap_or("loopback"),
+        );
+    } else {
+        let week_projected_ms = if expected_week > 0 {
+            wait_for_message_count_since(
+                &bob_db,
+                week_cutoff,
+                expected_week,
+                Duration::from_secs(1200),
+            )
+        } else {
+            metric_start_ms
+        };
+        let twelve_week_projected_ms = if expected_twelve_weeks > 0 {
+            wait_for_message_count_since(
+                &bob_db,
+                twelve_week_cutoff,
+                expected_twelve_weeks,
+                Duration::from_secs(1200),
+            )
+        } else {
+            metric_start_ms
+        };
+        let full_projected_ms =
+            wait_for_message_count(&bob_db, total_messages, Duration::from_secs(1200));
+        full_wall_secs = bench_start.elapsed().as_secs_f64();
+
+        let week_timing = range_timing_sql(&bob_db, Some(week_cutoff));
+        let twelve_week_timing = range_timing_sql(&bob_db, Some(twelve_week_cutoff));
+        let all_timing = range_timing_sql(&bob_db, None);
+
+        summary = format!(
+            "=== tiered window catchup ===\n  Window ladder: LastDay -> LastWeek -> Last12Weeks -> Full\n  Messages preloaded on inviter: {total_messages}\n  Network profile: {}\n  Generated spread: 3 years\n  Aged auth deps: user={} peer_shared={}\n  Metric start: invite accept on running joiner daemon\n  Last day:      {} msgs durable in {:.2}s projected in {:.2}s\n  Last week:     {} msgs durable in {:.2}s projected in {:.2}s\n  Last 12 weeks: {} msgs durable in {:.2}s projected in {:.2}s\n  All:           {} msgs durable in {:.2}s projected in {:.2}s\n  Newest message: created_at={} durable in {:.2}s visible in {:.2}s\n  Full catchup wall: {:.2}s\n",
+            network_profile.map(|profile| profile.slug).unwrap_or("loopback"),
+            authoring_dep_timing.user_created_at_ms,
+            authoring_dep_timing.peer_shared_created_at_ms,
+            day_timing.count,
+            elapsed_secs(metric_start_ms, day_timing.first_stored_at_ms),
+            elapsed_secs(metric_start_ms, day_timing.projected_at_ms.or(Some(day_projected_ms))),
+            week_timing.count,
+            elapsed_secs(metric_start_ms, week_timing.first_stored_at_ms),
+            elapsed_secs(metric_start_ms, week_timing.projected_at_ms.or(Some(week_projected_ms))),
+            twelve_week_timing.count,
+            elapsed_secs(metric_start_ms, twelve_week_timing.first_stored_at_ms),
+            elapsed_secs(
+                metric_start_ms,
+                twelve_week_timing
+                    .projected_at_ms
+                    .or(Some(twelve_week_projected_ms))
+            ),
+            all_timing.count,
+            elapsed_secs(metric_start_ms, all_timing.first_stored_at_ms),
+            elapsed_secs(metric_start_ms, all_timing.projected_at_ms.or(Some(full_projected_ms))),
+            newest_timing.created_at_ms.unwrap_or_default(),
+            elapsed_secs(metric_start_ms, newest_timing.first_stored_at_ms),
+            elapsed_secs(metric_start_ms, newest_timing.projected_at_ms),
+            full_wall_secs,
+        );
+        summary_key = format!(
+            "daemon_tiered_window_perf_test.disjoint_{}_{}",
+            total_messages,
+            network_profile
+                .map(|profile| profile.slug)
+                .unwrap_or("loopback"),
+        );
+    }
     eprintln!("\n{summary}");
-    let summary_key = format!(
-        "daemon_tiered_window_perf_test.disjoint_{}_{}",
-        total_messages,
-        network_profile
-            .map(|profile| profile.slug)
-            .unwrap_or("loopback"),
-    );
     write_summary(&summary_key, &summary);
+
+    match prev_sync_last_day_only {
+        Some(value) => std::env::set_var("TOPO_SYNC_LAST_DAY_ONLY", value),
+        None => std::env::remove_var("TOPO_SYNC_LAST_DAY_ONLY"),
+    }
 
     stop_daemon(&bob_db, &mut bob_daemon);
     wait_for_daemon_stopped(&bob_db, Duration::from_secs(10));
@@ -434,11 +477,17 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>) {
 #[test]
 #[ignore]
 fn perf_tiered_window_50k_parallel() {
-    run_tiered_window_bench(None);
+    run_tiered_window_bench(None, false);
 }
 
 #[test]
 #[ignore]
 fn perf_tiered_window_100k_parallel() {
-    run_tiered_window_bench(Some(100_000));
+    run_tiered_window_bench(Some(100_000), false);
+}
+
+#[test]
+#[ignore]
+fn perf_last_day_only_window_100k_parallel() {
+    run_tiered_window_bench(Some(100_000), true);
 }
