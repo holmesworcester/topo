@@ -42,6 +42,12 @@ pub(crate) enum Commands {
         /// Device name for this peer (defaults to system hostname)
         #[arg(long)]
         device_name: Option<String>,
+        /// Seed synthetic messages at workspace creation time
+        #[arg(long, default_value_t = 0)]
+        message_count: usize,
+        /// Historical age for the initial auth graph + seeded messages (for example 30d, 12w, 3y)
+        #[arg(long)]
+        network_age: Option<String>,
         /// Public address to embed in auto-generated invite link
         #[arg(long)]
         public_addr: Option<String>,
@@ -139,14 +145,6 @@ pub(crate) enum Commands {
 
     /// Show database status
     Status,
-
-    /// Generate test messages (uses active peer's workspace)
-    Generate {
-        #[arg(short, long, default_value = "100")]
-        count: usize,
-        #[arg(long, default_value = "3y")]
-        history_span: String,
-    },
 
     /// Generate synthetic file events (message + file + file slices)
     #[command(name = "generate-files")]

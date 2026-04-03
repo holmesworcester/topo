@@ -162,6 +162,8 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         workspace_name: "sim-large".to_string(),
         username: "alice".to_string(),
         device_name: "sim-daemon".to_string(),
+        message_count: config.messages,
+        network_age: Some("365d".to_string()),
     });
     let create_workspace_ms = create_started.elapsed().as_millis();
     if !create_workspace.ok {
@@ -174,21 +176,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         .into());
     }
 
-    let generate_started = Instant::now();
-    let generate = daemon.call(RpcMethod::Generate {
-        count: config.messages,
-        history_span: Some("365d".to_string()),
-    });
-    let generate_ms = generate_started.elapsed().as_millis();
-    if !generate.ok {
-        return Err(format!(
-            "Generate failed: {}",
-            generate
-                .error
-                .unwrap_or_else(|| "unknown error".to_string())
-        )
-        .into());
-    }
+    let generate_ms = create_workspace_ms;
 
     let stats = daemon.call_ok_value(RpcMethod::Stats)?;
     let observed_messages = stats["message_count"]
@@ -215,7 +203,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         daemon: serde_json::json!({
             "db_path": daemon.db_path(),
             "create_workspace_ok": create_workspace.ok,
-            "generate_ok": generate.ok,
+            "seeded_during_create": true,
             "stats": stats,
             "messages_preview": messages_preview,
         }),

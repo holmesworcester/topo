@@ -10,6 +10,8 @@ fn main() {
         workspace_name: "smoke-workspace".into(),
         username: "alice".into(),
         device_name: "laptop".into(),
+        message_count: 0,
+        network_age: None,
     });
     assert!(create.ok, "workspace creation failed: {:?}", create.error);
 

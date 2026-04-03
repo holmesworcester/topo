@@ -82,6 +82,102 @@ fn encrypted_wrapper_key_event_id(
 }
 
 #[test]
+fn create_workspace_with_seeded_history_ages_auth_chain_and_messages() {
+    let conn = open_in_memory().expect("open in-memory db");
+    create_tables(&conn).expect("create tables");
+
+    let end_at_ms = 90_u64 * 24 * 60 * 60 * 1000;
+    let network_age_ms = 30_u64 * 24 * 60 * 60 * 1000;
+    let workspace = create_workspace_with_options(
+        &conn,
+        "bootstrap",
+        "ws",
+        "alice",
+        "laptop",
+        CreateWorkspaceOptions {
+            message_count: 4,
+            network_age_ms: Some(network_age_ms),
+            end_at_ms: Some(end_at_ms),
+        },
+    )
+    .expect("create workspace with seeded history");
+    let peer_id = peer_id_for_signing_key(&workspace.peer_shared_key);
+    let network_start_ms = end_at_ms.saturating_sub(network_age_ms) as i64;
+
+    let message_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+            rusqlite::params![&peer_id],
+            |row| row.get(0),
+        )
+        .expect("count seeded messages");
+    assert_eq!(message_count, 4);
+
+    let user_event_id: String = conn
+        .query_row(
+            "SELECT u.event_id
+             FROM users u
+             JOIN events e ON e.event_id = u.event_id
+             WHERE u.recorded_by = ?1
+             ORDER BY e.created_at ASC, u.event_id ASC
+             LIMIT 1",
+            rusqlite::params![&peer_id],
+            |row| row.get(0),
+        )
+        .expect("load creator user event");
+    let user_created_at_ms: i64 = conn
+        .query_row(
+            "SELECT MIN(e.created_at)
+             FROM users u
+             JOIN events e ON e.event_id = u.event_id
+             WHERE u.recorded_by = ?1",
+            rusqlite::params![&peer_id],
+            |row| row.get(0),
+        )
+        .expect("load creator user timestamp");
+    let peer_shared_created_at_ms: i64 = conn
+        .query_row(
+            "SELECT MIN(e.created_at)
+             FROM peers_shared ps
+             JOIN events e ON e.event_id = ps.event_id
+             WHERE ps.recorded_by = ?1",
+            rusqlite::params![&peer_id],
+            |row| row.get(0),
+        )
+        .expect("load creator peer_shared timestamp");
+    let newest_message_author_id: String = conn
+        .query_row(
+            "SELECT author_id FROM messages WHERE recorded_by = ?1 ORDER BY created_at DESC, message_id DESC LIMIT 1",
+            rusqlite::params![&peer_id],
+            |row| row.get(0),
+        )
+        .expect("load newest message author");
+    let newest_message_created_at_ms: i64 = conn
+        .query_row(
+            "SELECT MAX(created_at) FROM messages WHERE recorded_by = ?1",
+            rusqlite::params![&peer_id],
+            |row| row.get(0),
+        )
+        .expect("load newest message timestamp");
+
+    assert_eq!(newest_message_author_id, user_event_id);
+    assert_eq!(newest_message_created_at_ms, end_at_ms as i64);
+    assert!(
+        user_created_at_ms >= network_start_ms && user_created_at_ms < network_start_ms + 16,
+        "user event should be near network start: user_created_at_ms={} network_start_ms={}",
+        user_created_at_ms,
+        network_start_ms
+    );
+    assert!(
+        peer_shared_created_at_ms >= network_start_ms
+            && peer_shared_created_at_ms < network_start_ms + 16,
+        "peer_shared event should be near network start: peer_shared_created_at_ms={} network_start_ms={}",
+        peer_shared_created_at_ms,
+        network_start_ms
+    );
+}
+
+#[test]
 fn create_user_invite_materializes_pending_bootstrap_trust_via_projection() {
     let conn = open_in_memory().expect("open in-memory db");
     create_tables(&conn).expect("create tables");

@@ -1678,6 +1678,8 @@ mod tests {
                 workspace_name: "sim".to_string(),
                 username: "alice".to_string(),
                 device_name: "laptop".to_string(),
+                message_count: 0,
+                network_age: None,
             })
             .expect("create workspace");
         creator
@@ -1744,6 +1746,8 @@ mod tests {
                 workspace_name: "sim".to_string(),
                 username: "alice".to_string(),
                 device_name: "laptop".to_string(),
+                message_count: 0,
+                network_age: None,
             })
             .expect("create workspace");
         creator
@@ -1818,6 +1822,8 @@ mod tests {
                 workspace_name: "sim".to_string(),
                 username: "alice".to_string(),
                 device_name: "laptop".to_string(),
+                message_count: 0,
+                network_age: None,
             })
             .expect("create workspace");
         creator

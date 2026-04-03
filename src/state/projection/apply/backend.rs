@@ -19,18 +19,19 @@ fn persist_shared_dep_claims(
     event_id_b64: &str,
     sub_event: &ParsedEvent,
 ) -> ProjectionApplyResult<()> {
-    let is_shared: Option<bool> = conn
+    let outer_blob: Option<Vec<u8>> = conn
         .query_row(
-            "SELECT share_scope = 'shared'
+            "SELECT blob
              FROM events
-             WHERE event_id = ?1",
+             WHERE event_id = ?1
+               AND share_scope = 'shared'",
             rusqlite::params![event_id_b64],
             |row| row.get(0),
         )
         .optional()?;
-    if !matches!(is_shared, Some(true)) {
+    let Some(outer_blob) = outer_blob else {
         return Ok(());
-    }
+    };
 
     let Some(workspace_id) = lookup_workspace_id(conn, recorded_by) else {
         return Ok(());
@@ -39,12 +40,19 @@ fn persist_shared_dep_claims(
         return Err(format!("invalid projected event id: {event_id_b64}").into());
     };
 
-    let dep_ids = sub_event
+    let mut dep_ids = sub_event
         .dep_field_values()
         .into_iter()
         .map(|(_, dep_id)| dep_id)
         .filter(|dep_id| !dep_id.iter().all(|byte| *byte == 0))
         .collect::<Vec<_>>();
+    if let Ok(ParsedEvent::Encrypted(encrypted)) = crate::event_modules::parse_event(&outer_blob) {
+        if !encrypted.key_event_id.iter().all(|byte| *byte == 0) {
+            dep_ids.push(encrypted.key_event_id);
+        }
+    }
+    dep_ids.sort_unstable();
+    dep_ids.dedup();
     if dep_ids.is_empty() {
         return Ok(());
     }

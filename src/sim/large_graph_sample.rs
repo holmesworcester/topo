@@ -381,6 +381,8 @@ fn materialize_corridor_peers(
         workspace_name: "sim".into(),
         username: format!("user{sender}"),
         device_name: "device".into(),
+        message_count: 0,
+        network_age: None,
     });
     if !created.ok {
         return Err(format!("sender workspace creation failed: {:?}", created.error).into());

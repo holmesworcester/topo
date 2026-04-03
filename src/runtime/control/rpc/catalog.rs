@@ -74,15 +74,6 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"SaveFile","target":"1","output_path":"/tmp/output.bin"}"#,
     },
     MethodInfo {
-        name: "Generate",
-        purpose: "Generate synthetic test messages",
-        params: params![
-            "count", "usize", true, None;
-            "history_span", "string", false, Some("3y")
-        ],
-        example_json: r#"{"type":"Generate","count":10,"history_span":"3y"}"#,
-    },
-    MethodInfo {
         name: "GenerateFiles",
         purpose: "Generate synthetic file events",
         params: params![
@@ -244,9 +235,11 @@ static CATALOG: &[MethodInfo] = &[
         params: params![
             "workspace_name", "string", false, Some("\"workspace\"");
             "username", "string", false, Some("\"user\"");
-            "device_name", "string", false, Some("\"device\"")
+            "device_name", "string", false, Some("\"device\"");
+            "message_count", "usize", false, Some("0");
+            "network_age", "string", false, Some("\"3y\"")
         ],
-        example_json: r#"{"type":"CreateWorkspace","workspace_name":"myws","username":"alice","device_name":"laptop"}"#,
+        example_json: r#"{"type":"CreateWorkspace","workspace_name":"myws","username":"alice","device_name":"laptop","message_count":1000,"network_age":"3y"}"#,
     },
     MethodInfo {
         name: "Peers",

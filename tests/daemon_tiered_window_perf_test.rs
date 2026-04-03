@@ -13,9 +13,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use cli_harness::{
     accept_invite_with_identity_on_running_daemon, create_invite_with_spki,
-    create_workspace_with_details, daemon_identity_fingerprint, daemon_listen_addr,
-    ensure_active_peer, generate_messages, message_count_sql, random_port,
-    start_daemon_with_options, stop_daemon, wait_for_daemon_stopped, DaemonOptions,
+    create_workspace_with_seeded_history, daemon_identity_fingerprint, daemon_listen_addr,
+    ensure_active_peer, message_count_sql, random_port, start_daemon_with_options, stop_daemon,
+    wait_for_daemon_stopped, DaemonOptions,
 };
 use perf_network_shaper::{NetworkProfile, UdpTrafficShaper, REALISTIC_NETWORK_PROFILES};
 
@@ -35,6 +35,11 @@ struct NewestMessageTiming {
     created_at_ms: Option<i64>,
     first_stored_at_ms: Option<i64>,
     projected_at_ms: Option<i64>,
+}
+
+struct AuthoringDepTiming {
+    user_created_at_ms: i64,
+    peer_shared_created_at_ms: i64,
 }
 
 fn current_timestamp_ms() -> i64 {
@@ -166,6 +171,33 @@ fn newest_message_timing_sql(db: &str) -> NewestMessageTiming {
     .expect("query newest_message_timing")
 }
 
+fn authoring_dep_timing_sql(db: &str) -> AuthoringDepTiming {
+    let conn = topo::db::open_connection(db).expect("open db for authoring_dep_timing");
+    let peer_id = cli_harness::active_tenant_peer_id(db).expect("active tenant peer id");
+    conn.query_row(
+        "SELECT COALESCE((
+                    SELECT MIN(e.created_at)
+                    FROM users u
+                    JOIN events e ON e.event_id = u.event_id
+                    WHERE u.recorded_by = ?1
+                ), 0),
+                COALESCE((
+                    SELECT MIN(e.created_at)
+                    FROM peers_shared ps
+                    JOIN events e ON e.event_id = ps.event_id
+                    WHERE ps.recorded_by = ?1
+                ), 0)",
+        rusqlite::params![peer_id],
+        |row| {
+            Ok(AuthoringDepTiming {
+                user_created_at_ms: row.get(0)?,
+                peer_shared_created_at_ms: row.get(1)?,
+            })
+        },
+    )
+    .expect("query authoring_dep_timing")
+}
+
 fn elapsed_secs(metric_start_ms: i64, ts_ms: Option<i64>) -> f64 {
     ts_ms
         .unwrap_or(metric_start_ms)
@@ -235,7 +267,14 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>) {
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
     let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
 
-    create_workspace_with_details(&alice_db, "workspace", "alice", "desktop");
+    create_workspace_with_seeded_history(
+        &alice_db,
+        "workspace",
+        "alice",
+        "desktop",
+        total_messages as usize,
+        Some("3y"),
+    );
     let inherited_env = inherited_tier_env();
     let mut alice_daemon = start_daemon_with_options(
         &alice_db,
@@ -246,14 +285,26 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>) {
         },
     );
     ensure_active_peer(&alice_db, Duration::from_secs(10));
-    generate_messages(&alice_db, total_messages as usize);
     assert!(
         message_count_sql(&alice_db) >= total_messages,
         "alice should have generated all messages"
     );
 
     let measurement_now_ms = current_timestamp_ms();
+    let authoring_dep_timing = authoring_dep_timing_sql(&alice_db);
     let day_cutoff = measurement_now_ms - DAY_MS;
+    assert!(
+        authoring_dep_timing.user_created_at_ms < day_cutoff,
+        "creator user event should be outside the hot last-day window: user_created_at_ms={} day_cutoff={}",
+        authoring_dep_timing.user_created_at_ms,
+        day_cutoff
+    );
+    assert!(
+        authoring_dep_timing.peer_shared_created_at_ms < day_cutoff,
+        "creator peer_shared event should be outside the hot last-day window: peer_shared_created_at_ms={} day_cutoff={}",
+        authoring_dep_timing.peer_shared_created_at_ms,
+        day_cutoff
+    );
     let week_cutoff = measurement_now_ms - WEEK_MS;
     let twelve_week_cutoff = measurement_now_ms - TWELVE_WEEK_MS;
     let expected_day = message_count_since_sql(&alice_db, day_cutoff);
@@ -338,8 +389,10 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>) {
     let newest_timing = newest_message_timing_sql(&bob_db);
 
     let summary = format!(
-        "=== tiered window catchup ===\n  Window ladder: LastDay -> LastWeek -> Last12Weeks -> Full\n  Messages preloaded on inviter: {total_messages}\n  Network profile: {}\n  Generated spread: 3 years\n  Metric start: invite accept on running joiner daemon\n  Last day:      {} msgs durable in {:.2}s projected in {:.2}s\n  Last week:     {} msgs durable in {:.2}s projected in {:.2}s\n  Last 12 weeks: {} msgs durable in {:.2}s projected in {:.2}s\n  All:           {} msgs durable in {:.2}s projected in {:.2}s\n  Newest message: created_at={} durable in {:.2}s visible in {:.2}s\n  Full catchup wall: {:.2}s\n",
+        "=== tiered window catchup ===\n  Window ladder: LastDay -> LastWeek -> Last12Weeks -> Full\n  Messages preloaded on inviter: {total_messages}\n  Network profile: {}\n  Generated spread: 3 years\n  Aged auth deps: user={} peer_shared={}\n  Metric start: invite accept on running joiner daemon\n  Last day:      {} msgs durable in {:.2}s projected in {:.2}s\n  Last week:     {} msgs durable in {:.2}s projected in {:.2}s\n  Last 12 weeks: {} msgs durable in {:.2}s projected in {:.2}s\n  All:           {} msgs durable in {:.2}s projected in {:.2}s\n  Newest message: created_at={} durable in {:.2}s visible in {:.2}s\n  Full catchup wall: {:.2}s\n",
         network_profile.map(|profile| profile.slug).unwrap_or("loopback"),
+        authoring_dep_timing.user_created_at_ms,
+        authoring_dep_timing.peer_shared_created_at_ms,
         day_timing.count,
         elapsed_secs(metric_start_ms, day_timing.first_stored_at_ms),
         elapsed_secs(metric_start_ms, day_timing.projected_at_ms.or(Some(day_projected_ms))),

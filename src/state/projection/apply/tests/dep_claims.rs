@@ -117,6 +117,52 @@ fn hard_claims_recurse_into_the_claiming_shard_after_projection() {
 }
 
 #[test]
+fn encrypted_shared_projection_claims_outer_key_event() {
+    let conn = open_in_memory().unwrap();
+    create_tables(&conn).unwrap();
+
+    let workspace = crate::event_modules::workspace::commands::create_workspace(
+        &conn,
+        "bootstrap",
+        "ws",
+        "alice",
+        "laptop",
+    )
+    .unwrap();
+    let recorded_by = hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
+        &workspace.peer_shared_key.verifying_key().to_bytes(),
+    ));
+    let ctx =
+        crate::event_modules::workspace::load_local_authoring_context(&conn, &recorded_by).unwrap();
+    let key_event_id = crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
+        &conn,
+        &recorded_by,
+    )
+    .unwrap();
+
+    let created_at_ms = 25_u64 * 24 * 60 * 60 * 1000;
+    let shard_start_ms = utc_day_start_ms(created_at_ms as i64);
+    let workspace_id = event_id_to_base64(&ctx.workspace_id);
+
+    crate::event_modules::message::commands::send(
+        &conn,
+        &recorded_by,
+        &ctx.signer_event_id,
+        &ctx.signing_key,
+        created_at_ms,
+        ctx.workspace_id,
+        ctx.author_id,
+        "hello",
+    )
+    .unwrap();
+
+    assert_eq!(
+        claim_count(&conn, &workspace_id, shard_start_ms, &key_event_id),
+        1
+    );
+}
+
+#[test]
 fn soft_claims_do_not_durably_recurse_into_the_claiming_shard() {
     let conn = open_in_memory().unwrap();
     create_tables(&conn).unwrap();

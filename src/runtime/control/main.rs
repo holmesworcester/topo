@@ -322,6 +322,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             workspace_name,
             username,
             device_name,
+            message_count,
+            network_age,
             public_addr,
         } => {
             let device_name = device_name.unwrap_or_else(system_hostname);
@@ -332,6 +334,8 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     workspace_name,
                     username,
                     device_name,
+                    message_count,
+                    network_age,
                 },
             )?;
             println!(
@@ -669,21 +673,6 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     }
                 }
             }
-        }
-
-        Commands::Generate {
-            count,
-            history_span,
-        } => {
-            let data = rpc_require_daemon(
-                db,
-                socket_override.as_deref(),
-                RpcMethod::Generate {
-                    count,
-                    history_span: Some(history_span),
-                },
-            )?;
-            println!("Generated {} messages in {}", data["count"], db);
         }
 
         Commands::GenerateFiles { count, size_mib } => {

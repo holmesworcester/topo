@@ -11,8 +11,8 @@ use std::time::{Duration, Instant};
 use cli_harness::{
     accept_invite, active_tenant_peer_id, create_invite, create_workspace_with_details,
     daemon_listen_addr, ensure_active_peer, message_count_sql, peak_rss_mib_for_pid,
-    start_daemon_with_options, stop_daemon, topo_cmd, wait_for_active_tenant_ready,
-    wait_for_daemon_stopped, wait_for_live_sync_session, DaemonOptions,
+    start_daemon_with_options, stop_daemon, wait_for_active_tenant_ready, wait_for_daemon_stopped,
+    wait_for_live_sync_session, DaemonOptions,
 };
 
 const WEEK_MS: i64 = 7 * 24 * 60 * 60 * 1000;
@@ -93,6 +93,7 @@ fn wait_for_message_count_since(db: &str, cutoff_ms: i64, expected: i64, timeout
 
 fn generate_messages_with_span(db: &str, count: usize, history_span: &str) {
     ensure_active_peer(db, Duration::from_secs(10));
+    let peer_id = cli_harness::active_tenant_peer_id(db).expect("active tenant peer id");
     let chunk_size = std::env::var("TOPO_TEST_GENERATE_CHUNK_SIZE")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -101,22 +102,13 @@ fn generate_messages_with_span(db: &str, count: usize, history_span: &str) {
     let mut remaining = count;
     while remaining > 0 {
         let next = remaining.min(chunk_size);
-        let output = topo_cmd(
+        topo::event_modules::message::commands::generate_for_peer(
             db,
-            &[
-                "generate",
-                "--count",
-                &next.to_string(),
-                "--history-span",
-                history_span,
-            ],
-        );
-        assert!(
-            output.status.success(),
-            "generate --history-span failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+            &peer_id,
+            next,
+            Some(history_span),
+        )
+        .expect("generate synthetic messages with span");
         remaining -= next;
     }
 }

@@ -351,6 +351,42 @@ pub fn svc_event_list(
     })
 }
 
+pub fn svc_event_list_head(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    limit: usize,
+) -> ServiceResult<EventListResponse> {
+    if limit == 0 {
+        return Ok(EventListResponse { events: vec![] });
+    }
+
+    let key_secrets = load_key_secrets(db, recorded_by);
+    let mut stmt = db.prepare(
+        "SELECT e.event_id, e.event_type, e.blob, e.created_at
+         FROM recorded_events re
+         JOIN events e ON e.event_id = re.event_id
+         WHERE re.peer_id = ?1",
+    )?;
+    let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
+        let id: String = row.get(0)?;
+        let etype: String = row.get(1)?;
+        let blob: Vec<u8> = row.get(2)?;
+        let created_at: i64 = row.get(3)?;
+        Ok((id, etype, blob, created_at as u64))
+    })?;
+
+    let mut raw_rows = Vec::new();
+    for row in rows {
+        raw_rows.push(row?);
+    }
+    raw_rows.sort_by(|left, right| left.3.cmp(&right.3).then_with(|| left.0.cmp(&right.0)));
+    raw_rows.truncate(limit);
+
+    Ok(EventListResponse {
+        events: build_event_list_items(raw_rows, &key_secrets),
+    })
+}
+
 /// List specific events by their base64-encoded IDs.
 pub fn svc_event_list_by_ids(
     db: &rusqlite::Connection,

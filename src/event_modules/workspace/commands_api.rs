@@ -3,8 +3,9 @@ use rusqlite::Connection;
 use serde::{Deserialize, Serialize};
 
 use super::commands::{
-    add_device_to_workspace, create_device_link_invite, create_user_invite, create_workspace,
-    join_workspace_as_new_user, persist_join_peer_secret, persist_link_peer_secret,
+    add_device_to_workspace, create_device_link_invite, create_user_invite,
+    create_workspace_with_options, join_workspace_as_new_user, persist_join_peer_secret,
+    persist_link_peer_secret, CreateWorkspaceOptions,
 };
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 use crate::service::{open_db_for_peer, open_db_load};
@@ -135,14 +136,44 @@ pub fn create_workspace_for_db(
     username: &str,
     device_name: &str,
 ) -> Result<CreateWorkspaceResponse, Box<dyn std::error::Error + Send + Sync>> {
+    create_workspace_for_db_with_seed(db_path, workspace_name, username, device_name, 0, None)
+}
+
+pub fn create_workspace_for_db_with_seed(
+    db_path: &str,
+    workspace_name: &str,
+    username: &str,
+    device_name: &str,
+    message_count: usize,
+    network_age: Option<&str>,
+) -> Result<CreateWorkspaceResponse, Box<dyn std::error::Error + Send + Sync>> {
     use crate::db::{open_connection, schema::create_tables};
 
     let conn = open_connection(db_path)?;
     create_tables(&conn)?;
 
+    let network_age_ms = match network_age.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(spec) => Some(
+            crate::event_modules::message::commands::parse_history_span_ms(spec)
+                .ok_or_else(|| format!("invalid network_age: {spec}"))?,
+        ),
+        None => None,
+    };
+
     // Workspace creation is tenant-agnostic at the control plane: it always
     // mints a fresh local tenant/workspace instead of reusing the active one.
-    let result = create_workspace(&conn, "bootstrap", workspace_name, username, device_name)?;
+    let result = create_workspace_with_options(
+        &conn,
+        "bootstrap",
+        workspace_name,
+        username,
+        device_name,
+        CreateWorkspaceOptions {
+            message_count,
+            network_age_ms,
+            end_at_ms: Some(crate::state::db::queue::current_timestamp_ms_u64()),
+        },
+    )?;
     let peer_id = hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
         &result.peer_shared_key.verifying_key().to_bytes(),
     ));

@@ -41,11 +41,6 @@ pub enum RpcMethod {
         target: String,
         output_path: String,
     },
-    Generate {
-        count: usize,
-        #[serde(default)]
-        history_span: Option<String>,
-    },
     GenerateFiles {
         count: usize,
         size_mib: usize,
@@ -121,6 +116,10 @@ pub enum RpcMethod {
         username: String,
         #[serde(default = "default_device_name")]
         device_name: String,
+        #[serde(default)]
+        message_count: usize,
+        #[serde(default)]
+        network_age: Option<String>,
     },
     /// List all known peers with local/remote status and endpoint info.
     Peers,

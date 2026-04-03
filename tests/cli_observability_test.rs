@@ -832,12 +832,8 @@ fn test_large_sync_convergence() {
     let timeout_ms = 120000;
     let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
 
-    // Generate 200 messages on Alice
-    let out = std::process::Command::new(bin())
-        .args(["--db", &alice_db, "generate", "--count", "200"])
-        .output()
-        .expect("generate failed");
-    assert!(out.status.success(), "generate failed");
+    // Seed 200 messages on Alice.
+    generate_messages(&alice_db, 200);
 
     // Bob converges on all messages
     assert_eventually(&bob_db, "message_count >= 200", timeout_ms);
