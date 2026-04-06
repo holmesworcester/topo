@@ -43,10 +43,6 @@ pub enum EmitCommand {
     /// Emitted by invite_accepted when it knows the workspace_id.
     /// Flows through normal projection + cascade.
     RetryWorkspaceEvent { workspace_id: String },
-    /// Retry file_slice guard-blocked events for a specific file_id.
-    RetryFileSliceGuards { file_id: String },
-    /// Record a guard-block for a file_slice awaiting its descriptor.
-    RecordFileSliceGuardBlock { file_id: String, event_id: String },
     /// Materialise a transport identity transition via the materializer boundary.
     /// Replaces the former ad-hoc RefreshTransportCreds marker.
     MaterializeTransportIdentity {
@@ -66,9 +62,7 @@ pub enum EmitCommand {
 /// They are only applied when `decision` is `Valid`.
 ///
 /// `emit_commands` are follow-on actions to run after write_ops commit.
-/// They are executed for:
-/// - `Valid` decisions (normal post-write follow-ons), and
-/// - `Block` decisions (block-side effects such as file-slice guard rows).
+/// They are executed for both `Valid` and `Block` decisions.
 #[derive(Debug, Clone)]
 pub struct ProjectorResult {
     pub decision: super::decision::ProjectionDecision,
@@ -134,6 +128,7 @@ pub struct DeletionIntentInfo {
 #[derive(Debug, Clone)]
 pub struct FileDescriptorInfo {
     pub event_id: String,
+    pub message_id: String,
     pub signer_event_id: String,
     pub key_event_id: String,
     /// BLAKE3 bao root hash for content verification ([0;32] = no verification).
@@ -200,20 +195,18 @@ pub struct ContextSnapshot {
     /// included — an unverified intent does not mean the message is deleted.
     pub target_message_deleted: bool,
 
-    /// For File/FileSlice: if the file_id is already known to belong to a
-    /// tombstoned message graph, this carries the root message event id.
-    pub deleted_file_message_id: Option<String>,
-
     /// For KeyShared: DH-unwrapped key material, if available.
     pub unwrapped_secret_material: Option<UnwrappedSecretMaterial>,
 
     /// For FileSlice: descriptor info for the file_id.
-    /// Empty vec means no descriptor exists yet (guard-block).
+    /// Empty vec means no descriptor exists yet (dep-block on file_id).
     pub file_descriptors: Vec<FileDescriptorInfo>,
     /// For FileSlice: existing slice info (event_id, descriptor_event_id) if slot occupied.
     pub existing_file_slice: Option<(String, String)>,
     /// For encrypted events: outer wrapper key_event_id, if present.
     pub current_transport_key_event_id: Option<String>,
+    /// For encrypted dependent events: outer wrapper owner_event_id, if present.
+    pub current_owner_event_id: Option<String>,
     /// For signed events: currently verified outer signer, if present.
     pub current_signer: Option<CurrentSignerInfo>,
 

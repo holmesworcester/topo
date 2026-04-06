@@ -41,6 +41,11 @@ pub fn project_pure(
     if msg.content.trim().is_empty() {
         return ProjectorResult::reject("message content must not be empty".to_string());
     }
+    if ctx.current_owner_event_id.is_some() {
+        return ProjectorResult::reject(
+            "message events must not carry outer owner_event_id".to_string(),
+        );
+    }
 
     let workspace_id_b64 = event_id_to_base64(&msg.workspace_id);
     let author_id_b64 = event_id_to_base64(&msg.author_id);

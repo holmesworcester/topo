@@ -6,7 +6,9 @@ use std::time::Instant;
 use crate::crypto::bao_verify;
 use crate::crypto::EventId;
 use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
-use crate::projection::create::create_encrypted_event_synchronous;
+use crate::projection::create::{
+    create_encrypted_event_synchronous, create_encrypted_event_synchronous_with_owner,
+};
 use crate::service::open_db_for_peer;
 use crate::state::db::queue::current_timestamp_ms_u64;
 use ed25519_dalek::SigningKey;
@@ -471,10 +473,11 @@ pub fn generate_files_for_peer(
                 "blob_bytes overflow".into()
             })?;
 
-        create_encrypted_event_synchronous(
+        create_encrypted_event_synchronous_with_owner(
             &db,
             &recorded_by,
             &key_event_id,
+            Some(&message_event_id),
             &ParsedEvent::File(FileEvent {
                 created_at_ms: current_timestamp_ms_u64(),
                 message_id: message_event_id,
@@ -494,10 +497,11 @@ pub fn generate_files_for_peer(
         })?;
 
         for slice_number in 0..slices_per_file {
-            create_encrypted_event_synchronous(
+            create_encrypted_event_synchronous_with_owner(
                 &db,
                 &recorded_by,
                 &key_event_id,
+                Some(&message_event_id),
                 &ParsedEvent::FileSlice(FileSliceEvent {
                     created_at_ms: current_timestamp_ms_u64(),
                     file_id,
@@ -653,10 +657,11 @@ pub fn send_file_for_peer(
             "file too large: slice count exceeds u32".into()
         })?;
 
-    create_encrypted_event_synchronous(
+    create_encrypted_event_synchronous_with_owner(
         &db,
         &recorded_by,
         &key_event_id,
+        Some(&message_event_id),
         &ParsedEvent::File(FileEvent {
             created_at_ms: current_timestamp_ms_u64(),
             message_id: message_event_id,
@@ -701,10 +706,11 @@ pub fn send_file_for_peer(
             crate::event_modules::file_slice::wire::pack_bao_payload(&proof, plaintext);
         remaining_bytes = remaining_bytes.saturating_sub(bytes_this_slice as u64);
 
-        create_encrypted_event_synchronous(
+        create_encrypted_event_synchronous_with_owner(
             &db,
             &recorded_by,
             &key_event_id,
+            Some(&message_event_id),
             &ParsedEvent::FileSlice(FileSliceEvent {
                 created_at_ms: current_timestamp_ms_u64(),
                 file_id,
@@ -721,10 +727,11 @@ pub fn send_file_for_peer(
             },
         )?;
         let ciphertext = vec![(bad_idx as u8).wrapping_add(0xA5); FILE_SLICE_CIPHERTEXT_BYTES];
-        create_encrypted_event_synchronous(
+        create_encrypted_event_synchronous_with_owner(
             &db,
             &recorded_by,
             &key_event_id,
+            Some(&message_event_id),
             &ParsedEvent::FileSlice(FileSliceEvent {
                 created_at_ms: current_timestamp_ms_u64(),
                 file_id,

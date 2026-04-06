@@ -158,6 +158,147 @@ fn test_encrypted_unblocks_when_key_arrives() {
 }
 
 #[test]
+fn test_encrypted_deleted_owner_fast_purges_without_key_resolution() {
+    let conn = setup();
+    let recorded_by = "peer-owner-fast-purge";
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
+    let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+
+    let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "target");
+    let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+    assert_eq!(
+        project_one(&conn, recorded_by, &msg_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
+    assert_eq!(
+        project_one(&conn, recorded_by, &del_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let reaction = ParsedEvent::Reaction(ReactionEvent {
+        created_at_ms: now_ms(),
+        target_event_id: msg_eid,
+        author_id: user_for_signer(&signer_eid),
+        emoji: "❌".to_string(),
+    });
+    let inner_blob = events::encode_event(&reaction).unwrap();
+    let missing_key_event_id = [0xA5; 32];
+    let (_enc, enc_blob) = make_encrypted_event_with_owner(
+        &[0x5A; 32],
+        &inner_blob,
+        EVENT_TYPE_REACTION,
+        &missing_key_event_id,
+        Some(&msg_eid),
+    );
+    let enc_event = events::parse_event(&enc_blob).unwrap();
+    let signed_blob = encode_signed_wrapper_blob(&enc_event, &signer_eid, &signing_key).unwrap();
+    let rxn_eid = insert_event_raw(&conn, recorded_by, &signed_blob);
+    let rxn_b64 = event_id_to_base64(&rxn_eid);
+
+    assert_eq!(
+        project_one(&conn, recorded_by, &rxn_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let still_recorded: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &rxn_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !still_recorded,
+        "owner-tombstoned encrypted dependent must hard-purge without waiting on key"
+    );
+
+    let still_blocked: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM blocked_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &rxn_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !still_blocked,
+        "owner-tombstoned encrypted dependent must not remain dep-blocked on missing key"
+    );
+
+    let still_valid: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &rxn_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(
+        !still_valid,
+        "hard-purged encrypted dependent must not be marked valid"
+    );
+}
+
+#[test]
+fn test_encrypted_reaction_rejects_outer_owner_mismatch() {
+    let conn = setup();
+    let recorded_by = "peer-owner-mismatch";
+    let _net_eid = setup_workspace_event(&conn, recorded_by);
+    let key_event_id = ensure_test_content_key(&conn, recorded_by);
+    let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+
+    let (_msg_a, msg_a_blob) = make_message_signed(&signing_key, &signer_eid, "message-a");
+    let msg_a_eid = insert_event_raw(&conn, recorded_by, &msg_a_blob);
+    assert_eq!(
+        project_one(&conn, recorded_by, &msg_a_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let (_msg_b, msg_b_blob) = make_message_signed(&signing_key, &signer_eid, "message-b");
+    let msg_b_eid = insert_event_raw(&conn, recorded_by, &msg_b_blob);
+    assert_eq!(
+        project_one(&conn, recorded_by, &msg_b_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let reaction = ParsedEvent::Reaction(ReactionEvent {
+        created_at_ms: now_ms(),
+        target_event_id: msg_a_eid,
+        author_id: user_for_signer(&signer_eid),
+        emoji: "🔥".to_string(),
+    });
+    let inner_blob = events::encode_event(&reaction).unwrap();
+    let (_enc, enc_blob) = make_encrypted_event_with_owner(
+        &test_content_key_bytes(),
+        &inner_blob,
+        EVENT_TYPE_REACTION,
+        &key_event_id,
+        Some(&msg_b_eid),
+    );
+    let enc_event = events::parse_event(&enc_blob).unwrap();
+    let signed_blob = encode_signed_wrapper_blob(&enc_event, &signer_eid, &signing_key).unwrap();
+    let rxn_eid = insert_event_raw(&conn, recorded_by, &signed_blob);
+    let rxn_b64 = event_id_to_base64(&rxn_eid);
+
+    match project_one(&conn, recorded_by, &rxn_eid).unwrap() {
+        ProjectionDecision::Reject { reason } => {
+            assert!(reason.contains("owner_event_id"), "reason: {}", reason);
+        }
+        other => panic!("expected Reject, got {:?}", other),
+    }
+
+    let rejected: bool = conn
+        .query_row(
+            "SELECT COUNT(*) > 0 FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, &rxn_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert!(rejected, "owner mismatch must be durably rejected");
+}
+
+#[test]
 fn test_encrypted_wrong_key_rejects() {
     let conn = setup();
     let recorded_by = "peer1";
@@ -215,6 +356,7 @@ fn test_encrypted_inner_type_mismatch_rejects() {
     let enc = ParsedEvent::Encrypted(EncryptedEvent {
         created_at_ms: now_ms(),
         key_event_id: sk_eid,
+        owner_event_id: crate::event_modules::encrypted::NO_OWNER_EVENT_ID,
         inner_type_code: EVENT_TYPE_REACTION, // declares reaction
         nonce,
         ciphertext, // 234 bytes, matches reaction wire size
@@ -254,7 +396,7 @@ fn test_encrypted_nested_rejects() {
 
     // inner_type_code=5 (encrypted) is now rejected at parser level
     // (encrypted_inner_wire_size returns None). Construct raw blob manually.
-    let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
+    let (signer_eid, _signing_key) = make_identity_chain(&conn, recorded_by);
     let msg = raw_message_event(&signer_eid, "nested inner");
     let msg_blob = events::encode_event(&msg).unwrap();
     let (_inner_enc, inner_enc_blob) =
@@ -902,15 +1044,15 @@ fn test_encrypted_file_slice_rejects_wrapper_key_mismatch() {
 }
 
 #[test]
-fn test_encrypted_parity_file_slice_guard_blocks() {
-    // Encrypted file_slice without a descriptor should guard-block,
-    // with block state anchored to outer encrypted event_id.
+fn test_encrypted_file_slice_blocks_on_missing_descriptor() {
+    // Encrypted file_slice without a descriptor should block on the synthetic
+    // file_id dependency until the descriptor arrives.
     let conn = setup();
     let recorded_by = "peer1";
     let _ws = setup_workspace_event(&conn, recorded_by);
     let (signer_eid, signing_key, key_bytes, sk_eid) = setup_encryption_ctx(&conn, recorded_by);
 
-    // No descriptor — file_slice should guard-block
+    // No descriptor — file_slice should block on file_id
     let file_id = [88u8; 32];
     let fs = raw_file_slice_event(file_id, 0, b"no descriptor");
     let enc_blob =
@@ -918,7 +1060,7 @@ fn test_encrypted_parity_file_slice_guard_blocks() {
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
     let result = project_one(&conn, recorded_by, &enc_eid).unwrap();
 
-    // Should block (guard-block returns Block with empty missing)
+    // Should block on the synthetic file_id dependency.
     assert!(
         matches!(result, ProjectionDecision::Block { .. }),
         "encrypted file_slice should block without descriptor, got {:?}",
@@ -1121,8 +1263,6 @@ fn test_encrypted_identity_event_rejects() {
     // with a clear reason about disallowed inner families.
     let conn = setup();
     let recorded_by = "peer1";
-    let key_bytes: [u8; 32] = rand::random();
-
     let (signer_eid, signing_key, key_bytes, sk_eid) = setup_encryption_ctx(&conn, recorded_by);
 
     let ws = ParsedEvent::Workspace(WorkspaceEvent {

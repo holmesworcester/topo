@@ -28,15 +28,6 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             ON file_slices(recorded_by, event_id);
         CREATE INDEX IF NOT EXISTS idx_file_slices_descriptor
             ON file_slices(recorded_by, descriptor_event_id);
-
-        CREATE TABLE IF NOT EXISTS file_slice_guard_blocks (
-            peer_id TEXT NOT NULL,
-            file_id TEXT NOT NULL,
-            event_id TEXT NOT NULL,
-            PRIMARY KEY (peer_id, event_id)
-        );
-        CREATE INDEX IF NOT EXISTS idx_file_slice_guard_blocks_file
-            ON file_slice_guard_blocks(peer_id, file_id);
         ",
     )?;
     Ok(())

@@ -1784,6 +1784,7 @@ impl Peer {
             let enc = ParsedEvent::Encrypted(crate::event_modules::EncryptedEvent {
                 created_at_ms: current_timestamp_ms_u64(),
                 key_event_id,
+                owner_event_id: msg_eid,
                 inner_type_code: crate::event_modules::EVENT_TYPE_FILE_SLICE,
                 nonce,
                 ciphertext,
@@ -2264,12 +2265,6 @@ const FINGERPRINT_TABLES: &[FingerprintTable] = &[
         columns: None,
     },
     FingerprintTable {
-        name: "deleted_files",
-        scope: Scope::RecordedBy,
-        order: "ORDER BY file_id",
-        columns: None,
-    },
-    FingerprintTable {
         name: "files",
         scope: Scope::RecordedBy,
         order: "ORDER BY event_id",
@@ -2519,11 +2514,6 @@ fn clear_projection_tables(db: &rusqlite::Connection, recorded_by: &str) {
         rusqlite::params![recorded_by],
     )
     .expect("failed to clear deleted_messages");
-    db.execute(
-        "DELETE FROM deleted_files WHERE recorded_by = ?1",
-        rusqlite::params![recorded_by],
-    )
-    .expect("failed to clear deleted_files");
     db.execute(
         "DELETE FROM files WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],
@@ -3853,13 +3843,7 @@ pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_workspaces: &[(Strin
     }
 
     // Verify no unexpected peer_ids in projection tables
-    for table in &[
-        "messages",
-        "reactions",
-        "key_secrets",
-        "deleted_messages",
-        "deleted_files",
-    ] {
+    for table in &["messages", "reactions", "key_secrets", "deleted_messages"] {
         let query = format!("SELECT DISTINCT recorded_by FROM {}", table);
         let mut stmt = db.prepare(&query).expect("failed to prepare");
         let found_ids: Vec<String> = stmt
@@ -4216,7 +4200,6 @@ mod fingerprint_tests {
             "reactions",
             "key_secrets",
             "deleted_messages",
-            "deleted_files",
             "files",
             "file_slices",
             "workspaces",
@@ -4240,7 +4223,6 @@ mod fingerprint_tests {
             "invite_bootstrap_trust",
             "pending_invite_bootstrap_trust",
             "local_transport_creds",
-            "file_slice_guard_blocks",
             "neg_items",
             "events",
             "recorded_events",

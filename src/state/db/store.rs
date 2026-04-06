@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 
 use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
-use crate::event_modules::ShareScope;
+use crate::event_modules::{self as events, ParsedEvent, ShareScope};
 
 pub const SQL_INSERT_EVENT: &str =
     "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
@@ -35,6 +35,35 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
             UNIQUE(peer_id, event_id)
         );
         CREATE INDEX IF NOT EXISTS idx_recorded_peer_order ON recorded_events(peer_id, id);
+
+        CREATE TABLE IF NOT EXISTS recorded_event_owners (
+            peer_id TEXT NOT NULL,
+            owner_event_id BLOB NOT NULL,
+            event_id TEXT NOT NULL,
+            PRIMARY KEY (peer_id, owner_event_id, event_id)
+        ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS idx_recorded_event_owners_event
+            ON recorded_event_owners(peer_id, event_id);
+
+        CREATE TRIGGER IF NOT EXISTS trg_recorded_events_owner_index_insert
+        AFTER INSERT ON recorded_events
+        BEGIN
+            INSERT OR IGNORE INTO recorded_event_owners (peer_id, owner_event_id, event_id)
+            SELECT NEW.peer_id, substr(e.blob, 42, 32), NEW.event_id
+            FROM events e
+            WHERE e.event_id = NEW.event_id
+              AND e.event_type = 'encrypted'
+              AND length(e.blob) >= 73
+              AND substr(e.blob, 42, 32) != zeroblob(32);
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_recorded_events_owner_index_delete
+        AFTER DELETE ON recorded_events
+        BEGIN
+            DELETE FROM recorded_event_owners
+            WHERE peer_id = OLD.peer_id
+              AND event_id = OLD.event_id;
+        END;
 
         CREATE TABLE IF NOT EXISTS shared_event_index (
             workspace_id TEXT NOT NULL,
@@ -114,6 +143,59 @@ pub fn lookup_workspace_id(conn: &Connection, peer_id: &str) -> Option<String> {
     .expect("lookup_workspace_id: unexpected DB error querying invites_accepted")
 }
 
+fn recorded_owner_event_id(conn: &Connection, event_id_b64: &str) -> SqliteResult<Option<EventId>> {
+    let blob: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT blob
+             FROM events
+             WHERE event_id = ?1",
+            params![event_id_b64],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(blob) = blob else {
+        return Ok(None);
+    };
+
+    let mut parsed = match events::parse_event(&blob) {
+        Ok(parsed) => parsed,
+        Err(_) => return Ok(None),
+    };
+    loop {
+        match parsed {
+            ParsedEvent::Signed(signed) => {
+                parsed = match events::parse_event(&signed.payload) {
+                    Ok(inner) => inner,
+                    Err(_) => return Ok(None),
+                };
+            }
+            ParsedEvent::Encrypted(enc) => {
+                if enc.owner_event_id == crate::event_modules::encrypted::NO_OWNER_EVENT_ID {
+                    return Ok(None);
+                }
+                return Ok(Some(enc.owner_event_id));
+            }
+            _ => return Ok(None),
+        }
+    }
+}
+
+fn index_recorded_event_owner(
+    conn: &Connection,
+    peer_id: &str,
+    event_id_b64: &str,
+) -> SqliteResult<()> {
+    let Some(owner_event_id) = recorded_owner_event_id(conn, event_id_b64)? else {
+        return Ok(());
+    };
+    conn.execute(
+        "INSERT OR IGNORE INTO recorded_event_owners (peer_id, owner_event_id, event_id)
+         VALUES (?1, ?2, ?3)",
+        params![peer_id, owner_event_id.as_slice(), event_id_b64],
+    )?;
+    Ok(())
+}
+
 pub fn insert_recorded_event(
     conn: &Connection,
     peer_id: &str,
@@ -126,6 +208,7 @@ pub fn insert_recorded_event(
         SQL_INSERT_RECORDED_EVENT,
         params![peer_id, &event_id_b64, recorded_at_ms, source],
     )?;
+    index_recorded_event_owner(conn, peer_id, &event_id_b64)?;
     Ok(())
 }
 
@@ -139,10 +222,14 @@ pub fn insert_recorded_event_checked(
     source: &str,
 ) -> SqliteResult<bool> {
     let event_id_b64 = event_id_to_base64(event_id);
-    Ok(conn.execute(
+    let inserted = conn.execute(
         SQL_INSERT_RECORDED_EVENT,
         params![peer_id, &event_id_b64, recorded_at_ms, source],
-    )? > 0)
+    )? > 0;
+    if inserted {
+        index_recorded_event_owner(conn, peer_id, &event_id_b64)?;
+    }
+    Ok(inserted)
 }
 
 /// Content-addressed blob storage backed by the `events` table.

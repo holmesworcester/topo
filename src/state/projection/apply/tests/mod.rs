@@ -9,8 +9,8 @@ use crate::db::{
 use crate::event_modules::{
     self as events, registry, BenchDepEvent, EncryptedEvent, FileEvent, FileSliceEvent,
     KeyRequestEvent, KeySecretEvent, KeySharedEvent, MessageDeletionEvent, MessageEvent,
-    ParsedEvent, ReactionEvent, WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_FILE_SLICE,
-    EVENT_TYPE_MESSAGE, EVENT_TYPE_MESSAGE_DELETION, EVENT_TYPE_REACTION,
+    ParsedEvent, ReactionEvent, WorkspaceEvent, EVENT_TYPE_ENCRYPTED, EVENT_TYPE_MESSAGE,
+    EVENT_TYPE_REACTION,
 };
 use crate::projection::decision::ProjectionDecision;
 use crate::projection::encrypted::encrypt_event_blob;
@@ -143,12 +143,17 @@ pub(super) fn wrap_test_content_blob(conn: &Connection, recorded_by: &str, blob:
 
     let key_event_id = ensure_test_content_key(conn, recorded_by);
     let (nonce, ciphertext, auth_tag) = encrypt_test_content_blob(blob);
-    let created_at_ms = events::parse_event(blob)
+    let parsed_event = events::parse_event(blob).ok();
+    let created_at_ms = parsed_event
+        .as_ref()
         .map(|event| event.created_at_ms())
-        .unwrap_or_else(|_| now_ms());
+        .unwrap_or_else(now_ms);
+    let owner_event_id = parsed_event.as_ref().and_then(derived_outer_owner_event_id);
     let wrapper = ParsedEvent::Encrypted(EncryptedEvent {
         created_at_ms,
         key_event_id,
+        owner_event_id: owner_event_id
+            .unwrap_or(crate::event_modules::encrypted::NO_OWNER_EVENT_ID),
         inner_type_code: type_code,
         nonce,
         ciphertext,
@@ -675,10 +680,23 @@ pub(super) fn make_encrypted_event(
     inner_type_code: u8,
     key_event_id: &EventId,
 ) -> (ParsedEvent, Vec<u8>) {
+    make_encrypted_event_with_owner(key_bytes, inner_blob, inner_type_code, key_event_id, None)
+}
+
+pub(super) fn make_encrypted_event_with_owner(
+    key_bytes: &[u8; 32],
+    inner_blob: &[u8],
+    inner_type_code: u8,
+    key_event_id: &EventId,
+    owner_event_id: Option<&EventId>,
+) -> (ParsedEvent, Vec<u8>) {
     let (nonce, ciphertext, auth_tag) = encrypt_event_blob(key_bytes, inner_blob).unwrap();
     let enc = ParsedEvent::Encrypted(EncryptedEvent {
         created_at_ms: now_ms(),
         key_event_id: *key_event_id,
+        owner_event_id: owner_event_id
+            .copied()
+            .unwrap_or(crate::event_modules::encrypted::NO_OWNER_EVENT_ID),
         inner_type_code,
         nonce,
         ciphertext,
@@ -688,17 +706,27 @@ pub(super) fn make_encrypted_event(
     (enc, blob)
 }
 
+fn derived_outer_owner_event_id(inner_event: &ParsedEvent) -> Option<EventId> {
+    match inner_event {
+        ParsedEvent::Reaction(rxn) => Some(rxn.target_event_id),
+        ParsedEvent::File(file) => Some(file.message_id),
+        _ => None,
+    }
+}
+
 fn make_signed_encrypted_blob(
     signing_key: &SigningKey,
     signer_event_id: &EventId,
     inner_event: &ParsedEvent,
 ) -> Vec<u8> {
     let inner_blob = events::encode_event(inner_event).unwrap();
-    let (_enc, enc_blob) = make_encrypted_event(
+    let owner_event_id = derived_outer_owner_event_id(inner_event);
+    let (_enc, enc_blob) = make_encrypted_event_with_owner(
         &test_content_key_bytes(),
         &inner_blob,
         inner_event.event_type_code(),
         &test_content_key_event_id(),
+        owner_event_id.as_ref(),
     );
     let enc_event = events::parse_event(&enc_blob).unwrap();
     encode_signed_wrapper_blob(&enc_event, signer_event_id, signing_key).unwrap()
@@ -712,11 +740,13 @@ pub(super) fn make_signed_encrypted_blob_with_key(
     key_event_id: &EventId,
 ) -> Vec<u8> {
     let inner_blob = events::encode_event(inner_event).unwrap();
-    let (_enc, enc_blob) = make_encrypted_event(
+    let owner_event_id = derived_outer_owner_event_id(inner_event);
+    let (_enc, enc_blob) = make_encrypted_event_with_owner(
         key_bytes,
         &inner_blob,
         inner_event.event_type_code(),
         key_event_id,
+        owner_event_id.as_ref(),
     );
     let enc_event = events::parse_event(&enc_blob).unwrap();
     encode_signed_wrapper_blob(&enc_event, signer_event_id, signing_key).unwrap()
@@ -780,6 +810,34 @@ pub(super) fn make_file_slice(
     };
     let event = ParsedEvent::FileSlice(fs);
     let blob = make_signed_encrypted_blob(signing_key, signer_event_id, &event);
+    (event, blob)
+}
+
+pub(super) fn make_file_slice_with_owner(
+    signing_key: &SigningKey,
+    signer_event_id: &EventId,
+    owner_event_id: &EventId,
+    file_id: [u8; 32],
+    slice_number: u32,
+    _ciphertext_seed: &[u8],
+) -> (ParsedEvent, Vec<u8>) {
+    let ciphertext = make_valid_file_slice_ciphertext(file_id, slice_number, 204800, 65536);
+    let event = ParsedEvent::FileSlice(FileSliceEvent {
+        created_at_ms: now_ms(),
+        file_id,
+        slice_number,
+        ciphertext,
+    });
+    let inner_blob = events::encode_event(&event).unwrap();
+    let (_enc, enc_blob) = make_encrypted_event_with_owner(
+        &test_content_key_bytes(),
+        &inner_blob,
+        event.event_type_code(),
+        &test_content_key_event_id(),
+        Some(owner_event_id),
+    );
+    let enc_event = events::parse_event(&enc_blob).unwrap();
+    let blob = encode_signed_wrapper_blob(&enc_event, signer_event_id, signing_key).unwrap();
     (event, blob)
 }
 

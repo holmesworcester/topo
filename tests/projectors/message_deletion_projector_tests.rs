@@ -149,4 +149,16 @@ mod tests {
         .unwrap();
         assert_context_reject_contains(&result, "signer peer not linked to author user");
     }
+
+    #[test]
+    fn test_deletion_rejects_outer_owner_event_id() {
+        let parsed = make_deletion([1u8; 32], [2u8; 32]);
+        let ctx = topo::projection::contract::ContextSnapshot {
+            current_owner_event_id: Some(b64(&[9u8; 32])),
+            ..Default::default()
+        };
+
+        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        assert_reject_contains(&result, "owner_event_id");
+    }
 }

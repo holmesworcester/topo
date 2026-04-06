@@ -49,6 +49,11 @@ pub fn project_pure(
         ParsedEvent::MessageDeletion(d) => d,
         _ => return ProjectorResult::reject("not a message_deletion event".to_string()),
     };
+    if ctx.current_owner_event_id.is_some() {
+        return ProjectorResult::reject(
+            "message_deletion events must not carry outer owner_event_id".to_string(),
+        );
+    }
 
     let target_b64 = event_id_to_base64(&del.target_event_id);
     let del_author_b64 = event_id_to_base64(&del.author_id);

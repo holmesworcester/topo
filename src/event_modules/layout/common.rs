@@ -31,13 +31,14 @@ pub const IDENTITY_PUBKEY_SIGNED_WIRE_SIZE: usize =
 // ─── Encrypted envelope helpers ───
 
 /// Encrypted (type 5) header before ciphertext:
-///   type(1) + created_at(8) + key_event_id(32) + inner_type_code(1) + nonce(12) = 54
-pub const ENCRYPTED_HEADER_BYTES: usize = COMMON_HEADER_BYTES + 32 + 1 + 12;
+///   type(1) + created_at(8) + key_event_id(32) + owner_event_id(32)
+///   + inner_type_code(1) + nonce(12) = 86
+pub const ENCRYPTED_HEADER_BYTES: usize = COMMON_HEADER_BYTES + 32 + 32 + 1 + 12;
 
 /// Encrypted (type 5) auth_tag after ciphertext: 16 bytes
 pub const ENCRYPTED_AUTH_TAG_BYTES: usize = 16;
 
-/// Encrypted (type 5) overhead around ciphertext: header(54) + auth_tag(16) = 70
+/// Encrypted (type 5) overhead around ciphertext: header(86) + auth_tag(16) = 102
 pub const ENCRYPTED_OVERHEAD_BYTES: usize = ENCRYPTED_HEADER_BYTES + ENCRYPTED_AUTH_TAG_BYTES;
 
 /// Compute the total encrypted event wire size for a given inner type wire size.
@@ -155,7 +156,7 @@ mod tests {
 
     #[test]
     fn test_encrypted_overhead() {
-        assert_eq!(ENCRYPTED_OVERHEAD_BYTES, 70);
+        assert_eq!(ENCRYPTED_OVERHEAD_BYTES, 102);
     }
 
     #[test]

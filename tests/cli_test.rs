@@ -3724,13 +3724,6 @@ fn test_cli_delete_message_purges_file_and_file_slice_from_event_commands() {
             |row| row.get(0),
         )
         .unwrap();
-    let deleted_file_rows: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM deleted_files WHERE recorded_by = ?1 AND file_id = ?2",
-            rusqlite::params![&recorded_by, &file_id],
-            |row| row.get(0),
-        )
-        .unwrap();
     let deletion_eid: String = conn
         .query_row(
             "SELECT deletion_event_id
@@ -3743,10 +3736,6 @@ fn test_cli_delete_message_purges_file_and_file_slice_from_event_commands() {
     assert_eq!(message_rows, 0, "message row should be purged");
     assert_eq!(file_rows, 0, "file descriptor row should be purged");
     assert_eq!(slice_rows, 0, "file slice row should be purged");
-    assert_eq!(
-        deleted_file_rows, 1,
-        "deleted_files mapping should remain for late slice handling"
-    );
 
     for event_id in [&msg_eid, &file_eid, &slice_eid] {
         let show_after = Command::new(bin())

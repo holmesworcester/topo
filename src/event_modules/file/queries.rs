@@ -762,7 +762,9 @@ mod tests {
         payload: &[u8],
     ) -> String {
         let mut ciphertext = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
-        let copy_len = payload.len().min(FILE_SLICE_CIPHERTEXT_BYTES.saturating_sub(4));
+        let copy_len = payload
+            .len()
+            .min(FILE_SLICE_CIPHERTEXT_BYTES.saturating_sub(4));
         ciphertext[4..4 + copy_len].copy_from_slice(&payload[..copy_len]);
         let inner = ParsedEvent::FileSlice(FileSliceEvent {
             created_at_ms: created_at_ms as u64,
@@ -776,6 +778,7 @@ mod tests {
         let outer = ParsedEvent::Encrypted(EncryptedEvent {
             created_at_ms: created_at_ms as u64,
             key_event_id: wrapper_key_event_id,
+            owner_event_id: crate::event_modules::encrypted::NO_OWNER_EVENT_ID,
             inner_type_code: crate::event_modules::EVENT_TYPE_FILE_SLICE,
             nonce,
             ciphertext,

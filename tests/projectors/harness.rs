@@ -49,6 +49,14 @@ pub mod fixtures {
             Ok(None)
         }
 
+        fn message_is_deleted(
+            &self,
+            _recorded_by: &str,
+            _message_id_b64: &str,
+        ) -> Result<bool, Box<dyn std::error::Error>> {
+            Ok(false)
+        }
+
         fn load_workspace_context(
             &self,
             _frame: &ProjectionFrameContext,
@@ -229,14 +237,6 @@ pub mod fixtures {
                 event_id: signer_event_id_b64.to_string(),
                 semantic_type_code,
             }),
-            ..Default::default()
-        }
-    }
-
-    /// ContextSnapshot with deleted file → root message mapping set.
-    pub fn ctx_with_deleted_file_message(message_id_b64: &str) -> ContextSnapshot {
-        ContextSnapshot {
-            deleted_file_message_id: Some(message_id_b64.to_string()),
             ..Default::default()
         }
     }

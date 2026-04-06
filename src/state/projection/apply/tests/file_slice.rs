@@ -73,10 +73,10 @@ fn test_file_slice_unblocks_when_signer_arrives() {
     assert!(matches!(result, ProjectionDecision::Block { .. }));
 
     // Insert and project the full identity chain — signer dep resolves,
-    // but file_slice will now guard-block on missing descriptor
+    // but file_slice still blocks on the missing file descriptor.
     insert_and_project_identity_chain(&conn, recorded_by, &chain_blobs);
 
-    // File slice should NOT yet be valid (guard-blocked on missing descriptor)
+    // File slice should NOT yet be valid (still blocked on missing descriptor)
     let fs_b64 = event_id_to_base64(&fs_eid);
     let valid_before_descriptor: bool = conn
         .query_row(
@@ -87,7 +87,7 @@ fn test_file_slice_unblocks_when_signer_arrives() {
         .unwrap();
     assert!(
         !valid_before_descriptor,
-        "file_slice should still be guard-blocked before descriptor"
+        "file_slice should still be blocked before descriptor"
     );
 
     // Now create the descriptor — this should cascade-unblock the file_slice

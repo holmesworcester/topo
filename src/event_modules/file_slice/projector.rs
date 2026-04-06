@@ -15,7 +15,7 @@ define_query_context_loader!(
 /// Pure projector: FileSlice → file_slices table insert.
 ///
 /// Uses ContextSnapshot.file_descriptors to determine authorization:
-/// - No descriptors → guard-block (emit RecordFileSliceGuardBlock command)
+/// - No descriptors → dep-block on file_id
 /// - Multiple descriptors → reject
 /// - Signer mismatch → reject
 /// - Encrypted wrapper key mismatch → reject
@@ -30,21 +30,24 @@ pub fn project_pure(
         ParsedEvent::FileSlice(f) => f,
         _ => return ProjectorResult::reject("not a file_slice event".to_string()),
     };
-
-    if let Some(message_event_id) = ctx.deleted_file_message_id.as_deref() {
-        return ProjectorResult::valid_with_commands(
-            Vec::new(),
-            vec![EmitCommand::HardPurgeMessageGraph {
-                message_event_id: message_event_id.to_string(),
-            }],
-        );
-    }
+    let owner_event_id_b64 = ctx.current_owner_event_id.as_deref();
 
     let file_id_b64 = event_id_to_base64(&fs.file_id);
     let Some(current_signer) = ctx.current_signer.as_ref() else {
         return ProjectorResult::reject("file_slice missing current signer envelope".to_string());
     };
     let slice_signer_b64 = current_signer.event_id.clone();
+
+    if ctx.target_message_deleted {
+        if let Some(message_event_id) = owner_event_id_b64 {
+            return ProjectorResult::valid_with_commands(
+                Vec::new(),
+                vec![EmitCommand::HardPurgeMessageGraph {
+                    message_event_id: message_event_id.to_string(),
+                }],
+            );
+        }
+    }
 
     if ctx.file_descriptors.is_empty() {
         // No descriptor yet — block on file_id as a synthetic dep.
@@ -62,6 +65,23 @@ pub fn project_pure(
     }
 
     let descriptor = &ctx.file_descriptors[0];
+    if ctx.target_message_deleted {
+        let message_event_id = owner_event_id_b64
+            .map(str::to_owned)
+            .unwrap_or_else(|| descriptor.message_id.clone());
+        return ProjectorResult::valid_with_commands(
+            Vec::new(),
+            vec![EmitCommand::HardPurgeMessageGraph { message_event_id }],
+        );
+    }
+    if let Some(owner_event_id_b64) = owner_event_id_b64 {
+        if descriptor.message_id != owner_event_id_b64 {
+            return ProjectorResult::reject(format!(
+                "file_slice owner_event_id {} does not match file descriptor message_id {}",
+                owner_event_id_b64, descriptor.message_id
+            ));
+        }
+    }
     if descriptor.signer_event_id != slice_signer_b64 {
         return ProjectorResult::reject(format!(
             "file_slice signer {} does not match file descriptor signer {}",

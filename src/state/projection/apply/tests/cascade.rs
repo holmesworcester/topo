@@ -270,10 +270,10 @@ fn test_invite_accepted_guard_retry_on_workspace() {
 }
 
 #[test]
-fn test_file_slice_guard_retry_after_cascaded_attachment() {
-    // FileSlice is guard-blocked waiting for descriptor (File).
-    // File is dep-blocked on a message. When the message projects,
-    // it cascades the attachment, which triggers guard retry on the file_slice.
+fn test_file_slice_dep_unblocks_after_cascaded_attachment() {
+    // FileSlice blocks on the synthetic file_id dependency until the
+    // descriptor (File) projects. File itself is dep-blocked on the
+    // message, so projecting the message must eventually unblock both.
     let conn = setup();
     let recorded_by = "peer1";
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
@@ -314,7 +314,7 @@ fn test_file_slice_guard_retry_after_cascaded_attachment() {
         r1
     );
 
-    // Create file_slice — guard-blocked (no descriptor yet)
+    // Create file_slice — dep-blocked on file_id (no descriptor yet)
     let (_fs, fs_blob) = make_file_slice(&signing_key, &signer_eid, file_id, 0, b"slice data");
     let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
     let r2 = project_one(&conn, recorded_by, &fs_eid).unwrap();

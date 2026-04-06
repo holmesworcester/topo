@@ -26,7 +26,6 @@ const SUMMARY_TABLES: &[&str] = &[
     "blocked_event_deps",
     "blocked_events",
     "bootstrap_context",
-    "deleted_files",
     "deleted_messages",
     "deletion_intents",
     "device_invites",
@@ -1089,6 +1088,19 @@ impl ProjectionQueries for NodeBehaviorEngine {
         ))
     }
 
+    fn message_is_deleted(
+        &self,
+        recorded_by: &str,
+        message_id_b64: &str,
+    ) -> ProjectionQueryResult<bool> {
+        let state = self.state.borrow();
+        Ok(
+            table_rows_for_recorded(&state, "deleted_messages", recorded_by)
+                .into_iter()
+                .any(|row| row_text(row, "message_id") == Some(message_id_b64)),
+        )
+    }
+
     fn load_workspace_context(
         &self,
         _frame: &ProjectionFrameContext,
@@ -1482,24 +1494,15 @@ impl ProjectionQueries for NodeBehaviorEngine {
             &message_id_b64,
         )
         .is_some();
-        let deleted_file_message_id = first_row_for_recorded(
-            &state,
-            "deleted_files",
-            recorded_by,
-            "file_id",
-            &event_id_to_base64(&file.file_id),
-        )
-        .and_then(|row| row_text(row, "message_id").map(ToOwned::to_owned));
         Ok(ContextSnapshot {
             target_message_deleted,
-            deleted_file_message_id,
             ..ContextSnapshot::default()
         })
     }
 
     fn load_file_slice_context(
         &self,
-        _frame: &ProjectionFrameContext,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         file_slice: &events::FileSliceEvent,
@@ -1507,20 +1510,23 @@ impl ProjectionQueries for NodeBehaviorEngine {
         let state = self.state.borrow();
         let file_id_b64 = event_id_to_base64(&file_slice.file_id);
         let mut ctx = ContextSnapshot::default();
-        ctx.deleted_file_message_id = first_row_for_recorded(
-            &state,
-            "deleted_files",
-            recorded_by,
-            "file_id",
-            &file_id_b64,
-        )
-        .and_then(|row| row_text(row, "message_id").map(ToOwned::to_owned));
+        if let Some(owner_event_id_b64) = frame.current_owner_event_id.as_deref() {
+            ctx.target_message_deleted = first_row_for_recorded(
+                &state,
+                "deleted_messages",
+                recorded_by,
+                "message_id",
+                owner_event_id_b64,
+            )
+            .is_some();
+        }
         ctx.file_descriptors = table_rows_for_recorded(&state, "files", recorded_by)
             .into_iter()
             .filter(|row| row_text(row, "file_id") == Some(&file_id_b64))
             .filter_map(|row| {
                 Some(FileDescriptorInfo {
                     event_id: row_text(row, "event_id")?.to_string(),
+                    message_id: row_text(row, "message_id")?.to_string(),
                     signer_event_id: row_text(row, "signer_event_id")?.to_string(),
                     key_event_id: row_text(row, "key_event_id")?.to_string(),
                     root_hash: [0u8; 32],
@@ -1529,6 +1535,18 @@ impl ProjectionQueries for NodeBehaviorEngine {
                 })
             })
             .collect();
+        if !ctx.target_message_deleted {
+            ctx.target_message_deleted = ctx.file_descriptors.iter().any(|descriptor| {
+                first_row_for_recorded(
+                    &state,
+                    "deleted_messages",
+                    recorded_by,
+                    "message_id",
+                    &descriptor.message_id,
+                )
+                .is_some()
+            });
+        }
         ctx.file_descriptors
             .sort_by(|left, right| left.event_id.cmp(&right.event_id));
         ctx.existing_file_slice = table_rows_for_recorded(&state, "file_slices", recorded_by)
@@ -1799,9 +1817,7 @@ impl ProjectionBackend for NodeBehaviorEngine {
                     }
                 }
                 EmitCommand::MaterializeTransportIdentity { .. }
-                | EmitCommand::HardPurgeMessageGraph { .. }
-                | EmitCommand::RetryFileSliceGuards { .. }
-                | EmitCommand::RecordFileSliceGuardBlock { .. } => {}
+                | EmitCommand::HardPurgeMessageGraph { .. } => {}
             }
         }
         Ok(())

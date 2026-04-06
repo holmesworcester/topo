@@ -504,7 +504,7 @@ Transport cert/key materialization is isolated behind a typed contract:
 - **`TransportIdentityIntent`** (enum): describes *what* identity change is needed (`InstallBootstrapIdentityFromInviteSecret` or `InstallPeerSharedIdentityFromSigner`).
 - **`TransportIdentityAdapter`** (trait): executes the intent against the DB. The sole concrete implementation (`ConcreteTransportIdentityAdapter` in `src/runtime/transport/identity_adapter.rs`) is the **only** code that calls raw install functions (`install_invite_bootstrap_transport_identity`, `install_peer_key_transport_identity`).
 - **Workspace command layer** (`accept_invite` / `accept_device_link`) still installs invite-derived tenant bootstrap identity via the adapter intent path (not raw transport calls), but that identity no longer terminates the live QUIC handshake.
-- **Event modules** emit `ApplyTransportIdentityIntent` commands (e.g., `peer_secret` projector for PeerShared signers).
+- **Event modules** emit `MaterializeTransportIdentity` commands (e.g., `peer_secret` projector for PeerShared signers).
 - **Projection pipeline** (`write_exec.rs`) routes intents through the adapter.
 - **Downgrade guard**: bootstrap install is rejected once a PeerShared-derived identity has been installed (`BootstrapAfterPeerSharedDenied`), enforcing one-way transition.
 - **Credential source tracking**: `local_transport_creds.source` records `random | bootstrap | peershared` for tenant identity/trust diagnostics, while the live daemon QUIC identity is stored separately in the projected `endpoint_secrets` table.
@@ -598,7 +598,7 @@ High-level identity operations are owned by event-module commands (`event_module
 
 **Bootstrap** (`workspace::commands::create_workspace`): creates the identity chain for a new workspace owner:
 Workspace → InviteAccepted (accepted workspace binding) → UserInvite → User → DeviceInvite → PeerShared + PeerSecret (`peer_shared` signer) + content key seed.
-The `peer_secret` event for the local `peer_shared` signer triggers `ApplyTransportIdentityIntent` on projection, installing a PeerShared-derived tenant session-auth identity under a legacy transport-named adapter boundary.
+The `peer_secret` event for the local `peer_shared` signer triggers `MaterializeTransportIdentity` on projection, installing a PeerShared-derived tenant session-auth identity under a legacy transport-named adapter boundary.
 Scope rule: `create_workspace` is tenant-agnostic at the CLI/RPC boundary. It always mints a fresh local tenant/workspace binding, even when the DB already has active tenants or transport credentials. Direct command internals may still pass an explicit `recorded_by` for tests or low-level idempotence, but operator-facing `topo create-workspace` must never collapse onto the active tenant.
 
 **Invite** (`workspace::commands::create_user_invite`): admin creates a UserInvite event and returns portable invite data (event ID + signing key + workspace ID). Wraps content key for invitee if sender keys are available.
@@ -632,7 +632,7 @@ so all events are written under the final peer_id from the start.
   authorization moves to the first encrypted `OpenSessionAuthInvite` frame,
   and the PeerShared-derived tenant session-auth identity replaces the
   bootstrap tenant identity later via projection cascade
-  (`ApplyTransportIdentityIntent::InstallPeerSharedIdentityFromSigner`).
+  (`TransportIdentitySpec::InstallPeerSharedIdentityFromSigner`).
 - **Connect loop**: daemon connection ownership is resolved once per QUIC
   connection, but outbound session auth is resolved per logical session.
   That lets bootstrap-derived auth naturally converge to steady-state
@@ -889,7 +889,7 @@ ProjectorResult {
 - `write_ops` are applied only when `decision` is `Valid`.
 - `emit_commands` are executed on:
   - `Valid` (normal post-write follow-ons),
-  - `Block` (block-side effects such as file-slice guard row recording).
+  - `Block` (if a projector ever emits an idempotent block-side follow-on).
 
 ### WriteOp types
 
@@ -898,10 +898,10 @@ ProjectorResult {
 
 ### EmitCommand types
 
-1. `RetryWorkspaceEvent { workspace_id }` — re-project the specific workspace event after accepted-workspace binding is written by `invite_accepted`.
-2. `RetryFileSliceGuards { file_id }` — re-project file_slice events after descriptor arrives.
-3. `RecordFileSliceGuardBlock { file_id, event_id }` — record guard-block for pending file_slices; consumed by `RetryFileSliceGuards` after descriptor projection (see section 12.2 file attachment flow and section 5.2 cascade lifecycle).
-4. `ApplyTransportIdentityIntent { intent }` — apply typed transport identity transitions through the `TransportIdentityAdapter` boundary.
+1. `HardPurgeMessageGraph { message_event_id }` — purge a tombstoned message and its discovered dependent graph in the current transaction.
+2. `RetryWorkspaceEvent { workspace_id }` — re-project the specific workspace event after accepted-workspace binding is written by `invite_accepted`.
+3. `MaterializeTransportIdentity { spec }` — apply typed transport identity transitions through the `TransportIdentityAdapter` boundary.
+4. `EmitDeterministicBlob { blob }` — emit a deterministic follow-on event through the normal event pipeline.
 
 Bootstrap trust materialization uses projector `WriteOp`s (not `EmitCommand`s):
 1. `user_invite_shared`/`peer_invite_shared` projectors write pending bootstrap trust rows when `is_local_create` and `bootstrap_context` are present,
@@ -928,8 +928,7 @@ Fields include:
 - `accepted_workspace_id` — accepted workspace binding for this tenant
 - `target_message_author` / `target_tombstone_author` — for deletion auth
 - `deletion_intents` — pre-existing deletion intents (for delete-before-create convergence)
-- `target_message_deleted` — for reaction/file skip-on-delete
-- `deleted_file_message_id` — root deleted-message id for late `file_slice` arrivals after descriptor purge
+- `target_message_deleted` — for message-owned dependent purge checks (`reaction`, `file`, `file_slice`)
 - `file_descriptors` / `existing_file_slice` / `current_transport_key_event_id` — for FileSlice authorization, duplicate detection, and wrapper-key matching
 - `bootstrap_context` — local bootstrap context (addr + SPKI) for invite trust materialization
 - `is_local_create` — whether the event was locally created (from `recorded_events.source`); gates pending bootstrap trust `InsertOrIgnore` writes so only the invite creator materializes pending trust
@@ -940,7 +939,7 @@ Encrypted key resolution/decryption is handled in the encrypted-wrapper stage (`
 
 After `write_ops` are applied transactionally, `emit_commands` are executed in order
 by explicit handlers in the pipeline. Commands may call `project_one` recursively
-(e.g., to retry guard-blocked events), which is safe because each re-projection goes
+(for example `RetryWorkspaceEvent`), which is safe because each re-projection goes
 through the same pure projector → apply engine path. Command identities are derived
 from event identity for idempotence — re-running the command executor does not mutate
 final state.
@@ -1021,7 +1020,7 @@ identical final state regardless of arrival order.
 **Monotonic deletion state:**
 - `active → tombstoned` is allowed.
 - `tombstoned → active` is never allowed by replay.
-- Minimal tombstones remain (`deletion_intents`, `deleted_messages`, and `deleted_files`).
+- Minimal tombstones remain (`deletion_intents` and `deleted_messages`).
 - Deleted event material does not remain in `events`, tenant-scoped event tables, or live projections after a successful purge.
 
 **Cleanup fanout:**
@@ -1036,9 +1035,13 @@ global event blobs when no tenant still references them).
 - `reaction` / `file` after prior tombstone: dependency checks treat the deleted message as
   satisfied for the message-target edge, the projector emits `HardPurgeMessageGraph`, and the
   event purges itself in the current transaction.
-- `file_slice` after descriptor purge: purge persists a minimal `deleted_files(file_id -> message_id)`
-  map, so the `file_slice` projector can recognize the deleted graph even when the original
-  descriptor row is already gone and purge the slice immediately.
+- encrypted dependents also carry outer `owner_event_id`, so a tombstoned owner graph can purge
+  them before decrypt or key wait.
+- purge discovers late encrypted dependents through `recorded_event_owners(peer_id, owner_event_id, event_id)`,
+  so it does not scan or decrypt tenant event blobs to find attachment/reaction tails.
+- `file_slice` is deleted by the same owner-message rule as `file`: the encrypted wrapper carries
+  the root message `owner_event_id`, so late slices purge against the message tombstone directly
+  instead of relying on a per-file deletion map.
 
 **Atomicity + retry:**
 `project_one` owns the transaction boundary for the projector writes, emitted purge command,
@@ -1154,29 +1157,33 @@ Tenant-scoped signer behavior: signer resolution and verification are scoped to 
 ## 6.1 Wrapper integration
 
 Encrypted wrapper is a normal event type in the same registry.
-It uses flat fields such as `key_event_id`, mandatory `inner_type_code`, `ciphertext`, and auth metadata.
+It uses flat fields such as `key_event_id`, optional outer `owner_event_id`,
+mandatory `inner_type_code`, `ciphertext`, and auth metadata.
 
 Wrapper field rule:
 1. `inner_type_code` is mandatory (fixed-width).
 2. ciphertext size is deterministic: derived from `inner_type_code` because all inner plaintext types have fixed wire sizes.
 3. no `ciphertext_len` field exists in the canonical wire format; the parser computes expected ciphertext size from `inner_type_code`.
 4. if we later adopt padded/opaque envelopes, this can be revisited deliberately.
+5. `owner_event_id` is zero for root/ownerless encrypted content (`message`, `message_deletion`), and carries the root message graph id for encrypted dependents (`reaction`, `file`, `file_slice`).
+6. dependent projectors must verify that any carried `owner_event_id` matches their inner message-graph linkage.
 
 ## 6.2 Projection adapter stage
 
 Projection flow:
 
 1. parse outer encrypted wrapper,
-2. resolve outer deps (including key dependency),
-3. if missing deps: block through normal dependency path (`blocked_event_deps` + `blocked_events`),
-4. verify envelope signature/auth,
-5. decrypt,
-6. decode inner event using normal registry,
-7. verify `inner_type_code` matches decoded inner event type (mismatch -> reject),
-8. reject nested encrypted wrapper,
-9. resolve inner deps via the same schema dependency engine (presence uses tenant-scoped `valid_events` and semantic dep typing reads tenant-scoped `valid_events.semantic_type_code`),
-10. run normal inner signer + projector stages, passing the outer wrapper `key_event_id` into projector context when a projector needs transport-level authorization checks,
-11. mark outer event valid only if inner projection succeeds.
+2. if `owner_event_id` names a tombstoned message graph and the wrapper carries a dependent inner type, emit hard purge immediately without waiting on key resolution or decrypt,
+3. resolve outer deps (including key dependency and, for dependents, `owner_event_id`),
+4. if missing deps: block through normal dependency path (`blocked_event_deps` + `blocked_events`),
+5. verify envelope signature/auth,
+6. decrypt,
+7. decode inner event using normal registry,
+8. verify `inner_type_code` matches decoded inner event type (mismatch -> reject),
+9. reject nested encrypted wrapper,
+10. resolve inner deps via the same schema dependency engine (presence uses tenant-scoped `valid_events` and semantic dep typing reads tenant-scoped `valid_events.semantic_type_code`),
+11. run normal inner signer + projector stages, passing the outer wrapper `key_event_id` into projector context when a projector needs transport-level authorization checks and the outer `owner_event_id` into projector context when a projector needs deletion-graph binding checks,
+12. mark outer event valid only if inner projection succeeds.
 
 Decryption is an adapter stage inside the same projection pipeline, not a second projection system.
 
@@ -1762,7 +1769,7 @@ Current baseline already includes reactions, message deletion, attachments, and 
 
 1. declaring schema + projection table metadata,
 2. using default **autowrite** where possible (projector returns deterministic `InsertOrIgnore` writes only, no emitted commands),
-3. introducing explicit special projector logic only when policy semantics require it (for example accepted-workspace retries, bootstrap trust supersession, deletion intent/tombstone coupling, or guard-block retry flows).
+3. introducing explicit special projector logic only when policy semantics require it (for example accepted-workspace retries, bootstrap trust supersession, or deletion intent/tombstone coupling).
 
 ## 12.2 File attachments and large payload flows
 
@@ -2050,39 +2057,28 @@ referenced deletion event has been rejected.
 ### 16.3 Block-side command idempotency requirement (Finding 6)
 
 The apply engine executes `emit_commands` for both Valid AND Block decisions
-(stages.rs apply_projection). For Block decisions, this means commands execute on
-**every re-block attempt**, not just the first. Currently all Block-side commands
-use INSERT OR IGNORE and are idempotent:
+(stages.rs apply_projection). We currently rely on this only for idempotent,
+policy-driven commands such as workspace retry. Any future Block-side command
+must be idempotent, or the apply engine must add a "first-block-only" guard.
 
-- `RecordFileSliceGuardBlock`: INSERT OR IGNORE into file_slice_guard_blocks
-
-Any future Block-side command MUST be idempotent, or the apply engine must add a
-"first-block-only" guard. This is a latent hazard, not a current bug.
-
-### 16.4 FileSlice guard-blocking: purpose and design
+### 16.4 FileSlice dep-blocking: purpose and design
 
 **Purpose**: FileSlice events must be validated against their parent File descriptor
 (signer match, encryption key match). The File descriptor's event_id is not known
 at parse time — it's discovered by looking up the file_id in the projected files
 table. If the File hasn't been projected yet, the FileSlice cannot be validated.
 
-**Current mechanism** (guard-block pattern):
+**Current mechanism** (synthetic dep-block pattern):
 1. FileSlice projector checks `ctx.file_descriptors` — empty means no File yet
-2. Returns `Block{missing: []}` + `EmitCommand::RecordFileSliceGuardBlock{file_id}`
-3. Guard row written to `file_slice_guard_blocks` table
-4. When File projects, emits `EmitCommand::RetryFileSliceGuards{file_id}`
-5. Retry command reads guard table, deletes entries, calls `project_one` for each
+2. It returns `Block{missing: [file_id]}` using the file_id as a synthetic blocker key
+3. When File projects, normal cascade also runs on the projected `file_id`
+4. The FileSlice retries through the same dep-unblock path as any other blocked event
 
-**Problems with current approach**:
-- Empty-missing Block has no cascade recovery (Finding 2) — relies solely on retry
-- Guard-block commands execute on every re-block attempt (Finding 6)
-- Separate table + command mechanism duplicates dep-blocking infrastructure
-
-**TODO: Unify guard-blocking with dep-blocking**: Use the file_id as a synthetic
-blocker key in `blocked_event_deps`. When File projects, post-projection cascade
-looks up events blocked on the file_id (in addition to the File's event_id). This
-eliminates the guard table, the retry commands, and the empty-missing Block pattern.
-Trade-off: cascade must support non-event-id blocker keys.
+Deletion stays separate from this descriptor wait:
+1. `file` and `file_slice` both carry the root message as outer `owner_event_id`
+2. a tombstoned owner message purges late encrypted attachments immediately
+3. purge finds late encrypted attachment blobs via `recorded_event_owners(owner_event_id, event_id)`
+4. no `deleted_files` table or file-slice-specific retry command is required
 
 ### 16.5 Detectable misbehavior patterns
 
