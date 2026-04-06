@@ -286,6 +286,17 @@ Sync keeps one long-lived request/response lane set per authenticated connection
 5. auth/removal-frontier and key ranges are scheduled ahead of hot message ranges,
 6. there is no per-round `Done` / `DataDone` / `DoneAck` completion handshake in live sync.
 
+### Range-fingerprint security note
+
+The active sync path still uses stock Negentropy-style range fingerprints, which
+is the simpler production choice today, but it has a known security caveat.
+
+1. The original [range-based set reconciliation paper](https://aljoscha-meyer.de/assets/landing/rbsr.pdf) and current stock Negentropy implementations use an algebraically composable fingerprint for each range.
+2. That hashing scheme admits attacker-chosen collision attacks: a malicious peer can interfere with syncing of other peers' events by causing unequal ranges to look equal and therefore preventing deeper reconciliation in those ranges.
+3. The known stronger alternative is [Range-Based Set Reconciliation without Homomorphic Fingerprints](https://aljoscha-meyer.de/assets/landing/rbsr_nonhomomorphic.pdf), which computes range fingerprints from a clamped Merkle tree instead of the classic additive / homomorphic-style fingerprint.
+4. The tradeoff is a somewhat slower initial per-session index build.
+5. Repo guidance for now: prefer rebuilding the in-memory Negentropy hash graph from `shared_event_index` on each range session instead of maintaining a persistent sync-side cache or Merkle index. The protocol leaves room for such caching later, but current experiments favored rebuild-per-session for simplicity and stability.
+
 ## 4.3 Transport regression checklist
 
 For any transport-affecting PR, require:
@@ -1016,6 +1027,15 @@ When investigating sync performance degradation at high cardinality (e.g. 500k+ 
 5. **Evidence artifact**: document baseline, profiling data, root-cause ranking, fix rationale, and post-fix comparison in `docs/planning/` for auditability.
 
 Operational constraint: serial perf measurements (`--test-threads=1`) must be used for tail profiling to avoid cross-test interference. Stale test processes (e.g. from timed-out `sync_graph_test`) must be killed before re-running, as they hold tmpfs resources and cause spurious failures.
+
+### 10.0.0 Negentropy graph maintenance posture
+
+Performance tuning should assume the current preferred maintenance model:
+
+1. Build the Negentropy hash graph in memory at range-session start from `shared_event_index`.
+2. Do not assume a persistent sync-side cache or Merkle tree is the default optimization path.
+3. If future work revisits a persisted auxiliary structure, it must beat rebuild-per-session on measured end-to-end stability and throughput, not just on isolated index-build cost.
+4. If future work adopts the non-homomorphic Merkle approach from [rbsr_nonhomomorphic.pdf](https://aljoscha-meyer.de/assets/landing/rbsr_nonhomomorphic.pdf), treat the extra initial build cost as an explicit security/performance tradeoff rather than a transparent drop-in.
 
 ### 10.0.1 Implemented: batch dequeue + deferred WAL checkpoint
 
