@@ -1,7 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use negentropy::{Id, NegentropyStorageVector};
+use negentropy::Id;
 use rusqlite::Connection;
 
 use crate::crypto::{event_id_to_base64, hash_event, EventId};
@@ -26,49 +26,8 @@ pub fn load_shared_event_index_slice(
     conn: &Connection,
     workspace_id: &str,
     range: SyncWindow,
-) -> Result<NegentropyStorageVector, String> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT ts, id
-             FROM shared_event_index
-             WHERE workspace_id = :workspace_id
-               AND (:ts_min IS NULL OR ts >= :ts_min)
-               AND (:ts_max IS NULL OR ts < :ts_max)
-             ORDER BY ts, id",
-        )
-        .map_err(|e| format!("prepare shared_event_index range query: {e}"))?;
-    let mut rows = stmt
-        .query(rusqlite::named_params! {
-            ":workspace_id": workspace_id,
-            ":ts_min": range.ts_min(),
-            ":ts_max": range.ts_max_exclusive(),
-        })
-        .map_err(|e| format!("query shared_event_index range rows: {e}"))?;
-
-    let mut storage = NegentropyStorageVector::new();
-    while let Some(row) = rows
-        .next()
-        .map_err(|e| format!("iterate shared_event_index range rows: {e}"))?
-    {
-        let ts: i64 = row
-            .get(0)
-            .map_err(|e| format!("read shared_event_index ts: {e}"))?;
-        let id_blob: Vec<u8> = row
-            .get(1)
-            .map_err(|e| format!("read shared_event_index id: {e}"))?;
-        if id_blob.len() != 32 {
-            continue;
-        }
-        let mut event_id = [0u8; 32];
-        event_id.copy_from_slice(&id_blob);
-        storage
-            .insert(ts.max(0) as u64, Id::from_byte_array(event_id))
-            .map_err(|e| format!("insert negentropy vector item: {e}"))?;
-    }
-    storage
-        .seal()
-        .map_err(|e| format!("seal negentropy vector storage: {e}"))?;
-    Ok(storage)
+) -> Result<crate::db::shared_event_merkle::SharedEventMerkleStorage, String> {
+    crate::db::shared_event_merkle::SharedEventMerkleStorage::load(conn, workspace_id, range)
 }
 
 fn parse_peer_shared_endpoint_dep(blob: &[u8]) -> Result<Option<EventId>, String> {

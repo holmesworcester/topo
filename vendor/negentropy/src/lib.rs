@@ -38,7 +38,7 @@ pub use self::error::Error;
 pub use self::id::Id;
 pub use self::storage::{NegentropyStorageBase, NegentropyStorageVector, Storage};
 use self::types::Mode;
-pub use self::types::{Bound, Item};
+pub use self::types::{Bound, Fingerprint, Item};
 
 const MAX_U64: u64 = u64::MAX;
 const BUCKETS: usize = 16;

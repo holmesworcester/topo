@@ -524,10 +524,7 @@ fn delete_global_rows(
             "DELETE FROM deferred_need_events WHERE id = ?1",
             params![event_bytes.as_slice()],
         )?;
-        conn.execute(
-            "DELETE FROM shared_event_index WHERE id = ?1",
-            params![event_bytes.as_slice()],
-        )?;
+        crate::db::store::delete_shared_event_index_entries_by_event_id(conn, &event_bytes)?;
     }
 
     for event_id in &manifest.event_ids {

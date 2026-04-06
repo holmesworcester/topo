@@ -87,12 +87,26 @@ pub fn insert_shared_event_index_entry_if_shared(
     workspace_id: &str,
 ) -> SqliteResult<()> {
     if share_scope == ShareScope::Shared {
-        conn.execute(
+        let inserted = conn.execute(
             SQL_INSERT_SHARED_EVENT_INDEX_ENTRY,
             params![workspace_id, created_at_ms, event_id.as_slice()],
-        )?;
+        )? > 0;
+        if inserted {
+            crate::state::db::shared_event_merkle::enqueue_pending_inserts(
+                conn,
+                workspace_id,
+                &[(created_at_ms, *event_id)],
+            )?;
+        }
     }
     Ok(())
+}
+
+pub fn delete_shared_event_index_entries_by_event_id(
+    conn: &Connection,
+    event_id: &EventId,
+) -> SqliteResult<()> {
+    crate::state::db::shared_event_merkle::delete_event_id(conn, event_id)
 }
 
 /// Look up the workspace_id (base64 event_id of the Workspace event)

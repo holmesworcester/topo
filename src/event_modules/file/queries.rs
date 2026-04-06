@@ -762,7 +762,9 @@ mod tests {
         payload: &[u8],
     ) -> String {
         let mut ciphertext = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
-        let copy_len = payload.len().min(FILE_SLICE_CIPHERTEXT_BYTES.saturating_sub(4));
+        let copy_len = payload
+            .len()
+            .min(FILE_SLICE_CIPHERTEXT_BYTES.saturating_sub(4));
         ciphertext[4..4 + copy_len].copy_from_slice(&payload[..copy_len]);
         let inner = ParsedEvent::FileSlice(FileSliceEvent {
             created_at_ms: created_at_ms as u64,
