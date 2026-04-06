@@ -1,5 +1,7 @@
 use super::*;
-use crate::db::dep_claims::{upsert_hard_claims, upsert_soft_claims, utc_day_start_ms};
+use crate::db::dep_claims::{
+    upsert_hard_claims, upsert_soft_claims, utc_day_start_ms, utc_week_start_ms,
+};
 use crate::db::store::{
     insert_event, insert_recorded_event, insert_shared_event_index_entry_if_shared,
 };
@@ -90,8 +92,10 @@ fn hard_claims_recurse_into_the_claiming_shard_after_projection() {
     let workspace_id = "workspace-1";
     bind_workspace(&conn, recorded_by, workspace_id);
 
-    let today_shard = utc_day_start_ms(10 * 24 * 60 * 60 * 1000);
-    let prior_day_start = today_shard - (24 * 60 * 60 * 1000);
+    let hot_day_start = utc_day_start_ms(11 * 24 * 60 * 60 * 1000);
+    let prior_day_start = hot_day_start - (24 * 60 * 60 * 1000);
+    let hot_week_start = utc_week_start_ms(hot_day_start);
+    let prior_week_start = utc_week_start_ms(prior_day_start);
     let dep = insert_shared_bench_dep(
         &conn,
         recorded_by,
@@ -113,14 +117,14 @@ fn hard_claims_recurse_into_the_claiming_shard_after_projection() {
         vec![dep],
         2,
     );
-    upsert_hard_claims(&conn, workspace_id, today_shard, &[claimed], 123).unwrap();
+    upsert_hard_claims(&conn, workspace_id, hot_week_start, &[claimed], 123).unwrap();
 
     assert_eq!(
         project_one(&conn, recorded_by, &claimed).unwrap(),
         ProjectionDecision::Valid
     );
-    assert_eq!(claim_count(&conn, workspace_id, today_shard, &dep), 1);
-    assert_eq!(claim_count(&conn, workspace_id, prior_day_start, &dep), 1);
+    assert_eq!(claim_count(&conn, workspace_id, hot_week_start, &dep), 1);
+    assert_eq!(claim_count(&conn, workspace_id, prior_week_start, &dep), 1);
 }
 
 #[test]
@@ -131,8 +135,9 @@ fn hot_root_claims_expand_through_already_projected_old_chain() {
     let workspace_id = "workspace-1";
     bind_workspace(&conn, recorded_by, workspace_id);
 
-    let today_shard = utc_day_start_ms(10 * 24 * 60 * 60 * 1000);
-    let prior_day_start = today_shard - (24 * 60 * 60 * 1000);
+    let hot_day_start = utc_day_start_ms(11 * 24 * 60 * 60 * 1000);
+    let prior_day_start = hot_day_start - (24 * 60 * 60 * 1000);
+    let hot_week_start = utc_week_start_ms(hot_day_start);
     let dep = insert_shared_bench_dep(
         &conn,
         recorded_by,
@@ -163,7 +168,7 @@ fn hot_root_claims_expand_through_already_projected_old_chain() {
         &conn,
         recorded_by,
         workspace_id,
-        (today_shard + 1_000) as u64,
+        (hot_day_start + 1_000) as u64,
         vec![claimed],
         3,
     );
@@ -172,8 +177,8 @@ fn hot_root_claims_expand_through_already_projected_old_chain() {
         ProjectionDecision::Valid
     );
 
-    assert_eq!(claim_count(&conn, workspace_id, today_shard, &claimed), 1);
-    assert_eq!(claim_count(&conn, workspace_id, today_shard, &dep), 1);
+    assert_eq!(claim_count(&conn, workspace_id, hot_week_start, &claimed), 1);
+    assert_eq!(claim_count(&conn, workspace_id, hot_week_start, &dep), 1);
 }
 
 #[test]
@@ -231,7 +236,7 @@ fn encrypted_shared_projection_claims_outer_key_event_and_existing_key_delivery(
     let ctx =
         crate::event_modules::workspace::load_local_authoring_context(&conn, &recorded_by).unwrap();
     let created_at_ms = 25_u64 * 24 * 60 * 60 * 1000;
-    let shard_start_ms = utc_day_start_ms(created_at_ms as i64);
+    let shard_start_ms = utc_week_start_ms(created_at_ms as i64);
     let workspace_id = event_id_to_base64(&ctx.workspace_id);
 
     crate::event_modules::message::commands::send(
@@ -264,8 +269,10 @@ fn soft_claims_do_not_durably_recurse_into_the_claiming_shard() {
     let workspace_id = "workspace-1";
     bind_workspace(&conn, recorded_by, workspace_id);
 
-    let today_shard = utc_day_start_ms(10 * 24 * 60 * 60 * 1000);
-    let prior_day_start = today_shard - (24 * 60 * 60 * 1000);
+    let hot_day_start = utc_day_start_ms(11 * 24 * 60 * 60 * 1000);
+    let prior_day_start = hot_day_start - (24 * 60 * 60 * 1000);
+    let hot_week_start = utc_week_start_ms(hot_day_start);
+    let prior_week_start = utc_week_start_ms(prior_day_start);
     let dep = insert_shared_bench_dep(
         &conn,
         recorded_by,
@@ -290,7 +297,7 @@ fn soft_claims_do_not_durably_recurse_into_the_claiming_shard() {
     upsert_soft_claims(
         &conn,
         workspace_id,
-        today_shard,
+        hot_week_start,
         &[claimed],
         Some("peer-z"),
         123,
@@ -302,6 +309,6 @@ fn soft_claims_do_not_durably_recurse_into_the_claiming_shard() {
         project_one(&conn, recorded_by, &claimed).unwrap(),
         ProjectionDecision::Valid
     );
-    assert_eq!(claim_count(&conn, workspace_id, today_shard, &dep), 0);
-    assert_eq!(claim_count(&conn, workspace_id, prior_day_start, &dep), 1);
+    assert_eq!(claim_count(&conn, workspace_id, hot_week_start, &dep), 0);
+    assert_eq!(claim_count(&conn, workspace_id, prior_week_start, &dep), 1);
 }

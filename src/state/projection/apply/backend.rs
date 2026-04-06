@@ -229,7 +229,7 @@ fn persist_shared_dep_claims(
     let dep_ids = direct_claim_seed_ids(&outer_event, sub_event);
 
     let mut shard_starts = BTreeSet::new();
-    shard_starts.insert(crate::db::dep_claims::utc_day_start_ms(
+    shard_starts.insert(crate::db::dep_claims::utc_week_start_ms(
         sub_event.created_at_ms() as i64,
     ));
     for shard_start_ms in

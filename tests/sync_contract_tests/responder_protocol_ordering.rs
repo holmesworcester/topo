@@ -40,7 +40,7 @@ async fn drive_empty_inbound_round(peer: &mut crate::fake_session_io::FakePeerSi
     let storage = empty_negentropy_storage();
     let mut neg = negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
     // Use a Today window header so this works even when LOW_MEM_IOS=1 leaks
-    // from a concurrent test (low-mem responders reject Full/LastTwelveWeeks).
+    // from a concurrent test (low-mem responders reject Full).
     let initial_msg = encode_initial_neg_open(
         SyncNegPhase::ObjectsRange {
             window: SyncWindow {
@@ -97,7 +97,7 @@ async fn lowmem_responder_rejects_ranges_beyond_last_week() {
         let initial_msg = encode_initial_neg_open(
             SyncNegPhase::ObjectsRange {
                 window: SyncWindow {
-                    kind: SyncWindowKind::LastTwelveWeeks,
+                    kind: SyncWindowKind::Full,
                     ts_min_inclusive_ms: Some(0),
                     ts_max_exclusive_ms: Some(1_000_000),
                 },
@@ -114,7 +114,7 @@ async fn lowmem_responder_rejects_ranges_beyond_last_week() {
         assert_eq!(
             reply,
             Frame::RangePolicyReject {
-                rejected_window_kind: encode_sync_window_kind(SyncWindowKind::LastTwelveWeeks),
+                rejected_window_kind: encode_sync_window_kind(SyncWindowKind::Full),
                 oldest_allowed_window_kind: encode_sync_window_kind(SyncWindowKind::LastWeek),
             }
         );

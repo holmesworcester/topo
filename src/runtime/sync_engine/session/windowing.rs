@@ -8,8 +8,8 @@ pub enum SyncWindowKind {
     Full = 0,
     Today = 1,
     Yesterday = 2,
-    LastWeek = 3,
-    LastTwelveWeeks = 4,
+    ThisWeek = 3,
+    LastWeek = 4,
 }
 
 pub fn encode_sync_window_kind(kind: SyncWindowKind) -> u8 {
@@ -21,8 +21,8 @@ pub fn decode_sync_window_kind(kind: u8) -> Result<SyncWindowKind, String> {
         0 => Ok(SyncWindowKind::Full),
         1 => Ok(SyncWindowKind::Today),
         2 => Ok(SyncWindowKind::Yesterday),
-        3 => Ok(SyncWindowKind::LastWeek),
-        4 => Ok(SyncWindowKind::LastTwelveWeeks),
+        3 => Ok(SyncWindowKind::ThisWeek),
+        4 => Ok(SyncWindowKind::LastWeek),
         other => Err(format!("unsupported sync window kind {}", other)),
     }
 }
@@ -36,30 +36,30 @@ pub struct SyncWindow {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SyncNegPhase {
-    ClaimsDayShard { shard_start_ms: i64 },
+    ClaimsWeekShard { shard_start_ms: i64 },
     ObjectsRange { window: SyncWindow },
 }
 
 const WINDOW_MAGIC: &[u8; 4] = b"P7SN";
-const WINDOW_VERSION: u8 = 4;
-const NEG_PHASE_CLAIMS_DAY_SHARD: u8 = 1;
+const WINDOW_VERSION: u8 = 5;
+const NEG_PHASE_CLAIMS_WEEK_SHARD: u8 = 1;
 const NEG_PHASE_OBJECTS_RANGE: u8 = 2;
 const NONE_TS_SENTINEL: i64 = i64::MIN;
 const ALL_START_MS: i64 = 0;
 const HOUR_MS: i64 = 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 const WEEK_MS: i64 = 7 * DAY_MS;
-const TWELVE_WEEK_MS: i64 = 12 * WEEK_MS;
 const DEFAULT_TIER_ORDER: [SyncWindowKind; 5] = [
     SyncWindowKind::Today,
     SyncWindowKind::Yesterday,
+    SyncWindowKind::ThisWeek,
     SyncWindowKind::LastWeek,
-    SyncWindowKind::LastTwelveWeeks,
     SyncWindowKind::Full,
 ];
-const LOW_MEM_TIER_ORDER: [SyncWindowKind; 3] = [
+const LOW_MEM_TIER_ORDER: [SyncWindowKind; 4] = [
     SyncWindowKind::Today,
     SyncWindowKind::Yesterday,
+    SyncWindowKind::ThisWeek,
     SyncWindowKind::LastWeek,
 ];
 const HOT_ONLY_TIER_ORDER: [SyncWindowKind; 2] = [SyncWindowKind::Today, SyncWindowKind::Yesterday];
@@ -184,11 +184,14 @@ pub fn restrict_outbound_windows_to_last_week(db_path: &str, recorded_by: &str, 
 
 fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
     let today_start_ms = crate::db::dep_claims::utc_day_start_ms(now_ms);
+    let yesterday_start_ms = today_start_ms - DAY_MS;
+    let this_week_start_ms = crate::db::dep_claims::utc_week_start_ms(now_ms);
+    let this_week_max_ms = yesterday_start_ms.max(this_week_start_ms);
     match kind {
         SyncWindowKind::Full => SyncWindow {
             kind,
             ts_min_inclusive_ms: Some(ALL_START_MS),
-            ts_max_exclusive_ms: Some(today_start_ms - TWELVE_WEEK_MS),
+            ts_max_exclusive_ms: Some(this_week_start_ms - WEEK_MS),
         },
         SyncWindowKind::Today => SyncWindow {
             kind,
@@ -197,18 +200,18 @@ fn window_for_kind(kind: SyncWindowKind, now_ms: i64) -> SyncWindow {
         },
         SyncWindowKind::Yesterday => SyncWindow {
             kind,
-            ts_min_inclusive_ms: Some(today_start_ms - DAY_MS),
+            ts_min_inclusive_ms: Some(yesterday_start_ms),
             ts_max_exclusive_ms: Some(today_start_ms),
+        },
+        SyncWindowKind::ThisWeek => SyncWindow {
+            kind,
+            ts_min_inclusive_ms: Some(this_week_start_ms),
+            ts_max_exclusive_ms: Some(this_week_max_ms),
         },
         SyncWindowKind::LastWeek => SyncWindow {
             kind,
-            ts_min_inclusive_ms: Some(today_start_ms - WEEK_MS),
-            ts_max_exclusive_ms: Some(today_start_ms - DAY_MS),
-        },
-        SyncWindowKind::LastTwelveWeeks => SyncWindow {
-            kind,
-            ts_min_inclusive_ms: Some(today_start_ms - TWELVE_WEEK_MS),
-            ts_max_exclusive_ms: Some(today_start_ms - WEEK_MS),
+            ts_min_inclusive_ms: Some(this_week_start_ms - WEEK_MS),
+            ts_max_exclusive_ms: Some(this_week_start_ms),
         },
     }
 }
@@ -220,7 +223,10 @@ pub fn is_hot_window(kind: SyncWindowKind) -> bool {
 pub fn is_low_mem_allowed_window(kind: SyncWindowKind) -> bool {
     matches!(
         kind,
-        SyncWindowKind::Today | SyncWindowKind::Yesterday | SyncWindowKind::LastWeek
+        SyncWindowKind::Today
+            | SyncWindowKind::Yesterday
+            | SyncWindowKind::ThisWeek
+            | SyncWindowKind::LastWeek
     )
 }
 
@@ -295,6 +301,9 @@ impl SyncWindow {
 }
 
 pub fn claim_shard_starts_for_window(window: SyncWindow, now_ms: i64) -> Vec<i64> {
+    if sync_dep_claim_shard_cap() == 0 {
+        return Vec::new();
+    }
     let Some((start, end)) = partition_window_bounds(window, now_ms) else {
         return Vec::new();
     };
@@ -302,8 +311,8 @@ pub fn claim_shard_starts_for_window(window: SyncWindow, now_ms: i64) -> Vec<i64
         return Vec::new();
     }
 
-    let first_shard = crate::db::dep_claims::utc_day_start_ms(start);
-    let last_shard = crate::db::dep_claims::utc_day_start_ms(end.saturating_sub(1));
+    let first_shard = crate::db::dep_claims::utc_week_start_ms(start);
+    let last_shard = crate::db::dep_claims::utc_week_start_ms(end.saturating_sub(1));
     let shard_cap = sync_dep_claim_shard_cap();
     let mut shards = Vec::new();
     let mut shard = first_shard;
@@ -315,7 +324,7 @@ pub fn claim_shard_starts_for_window(window: SyncWindow, now_ms: i64) -> Vec<i64
         if shard == last_shard {
             return shards;
         }
-        shard = shard.saturating_add(DAY_MS);
+        shard = shard.saturating_add(WEEK_MS);
     }
 }
 
@@ -324,8 +333,8 @@ pub fn encode_initial_neg_open(phase: SyncNegPhase, inner: Vec<u8>) -> Vec<u8> {
     out.extend_from_slice(WINDOW_MAGIC);
     out.push(WINDOW_VERSION);
     match phase {
-        SyncNegPhase::ClaimsDayShard { shard_start_ms } => {
-            out.push(NEG_PHASE_CLAIMS_DAY_SHARD);
+        SyncNegPhase::ClaimsWeekShard { shard_start_ms } => {
+            out.push(NEG_PHASE_CLAIMS_WEEK_SHARD);
             out.extend_from_slice(&shard_start_ms.to_le_bytes());
         }
         SyncNegPhase::ObjectsRange { window } => {
@@ -368,16 +377,16 @@ pub fn decode_initial_neg_open(msg: &[u8]) -> Result<(SyncNegPhase, &[u8]), Stri
         return Err(format!("unsupported sync window version {}", version));
     }
     match msg[5] {
-        NEG_PHASE_CLAIMS_DAY_SHARD => {
+        NEG_PHASE_CLAIMS_WEEK_SHARD => {
             if msg.len() < 14 {
-                return Err("sync claim shard header truncated".to_string());
+                return Err("sync claim week header truncated".to_string());
             }
             let shard_start_ms = i64::from_le_bytes(
                 msg[6..14]
                     .try_into()
-                    .map_err(|_| "sync claim shard header truncated".to_string())?,
+                    .map_err(|_| "sync claim week header truncated".to_string())?,
             );
-            Ok((SyncNegPhase::ClaimsDayShard { shard_start_ms }, &msg[14..]))
+            Ok((SyncNegPhase::ClaimsWeekShard { shard_start_ms }, &msg[14..]))
         }
         NEG_PHASE_OBJECTS_RANGE => {
             if msg.len() < 23 {
@@ -504,12 +513,12 @@ mod tests {
             vec![
                 SyncWindowKind::Today,
                 SyncWindowKind::Yesterday,
+                SyncWindowKind::ThisWeek,
                 SyncWindowKind::LastWeek,
-                SyncWindowKind::LastTwelveWeeks,
                 SyncWindowKind::Full,
                 SyncWindowKind::Today,
                 SyncWindowKind::Yesterday,
-                SyncWindowKind::LastWeek,
+                SyncWindowKind::ThisWeek,
             ]
         );
     }
@@ -568,10 +577,10 @@ mod tests {
             vec![
                 SyncWindowKind::Today,
                 SyncWindowKind::Yesterday,
+                SyncWindowKind::ThisWeek,
                 SyncWindowKind::LastWeek,
                 SyncWindowKind::Today,
                 SyncWindowKind::Yesterday,
-                SyncWindowKind::LastWeek,
             ]
         );
     }
@@ -601,10 +610,10 @@ mod tests {
             vec![
                 SyncWindowKind::Today,
                 SyncWindowKind::Yesterday,
+                SyncWindowKind::ThisWeek,
                 SyncWindowKind::LastWeek,
                 SyncWindowKind::Today,
                 SyncWindowKind::Yesterday,
-                SyncWindowKind::LastWeek,
             ]
         );
     }
@@ -612,37 +621,50 @@ mod tests {
     #[test]
     fn scheduler_uses_adjacent_non_full_windows() {
         let _env = EnvGuard::default_windows();
-        let now_ms = (100 * DAY_MS) + 123_456;
+        let now_ms = (106 * DAY_MS) + 123_456;
         let today_start = crate::db::dep_claims::utc_day_start_ms(now_ms);
+        let yesterday_start = today_start - DAY_MS;
+        let this_week_start = crate::db::dep_claims::utc_week_start_ms(now_ms);
         let today = window_for_kind(SyncWindowKind::Today, now_ms);
         let yesterday = window_for_kind(SyncWindowKind::Yesterday, now_ms);
-        let week = window_for_kind(SyncWindowKind::LastWeek, now_ms);
-        let twelve_weeks = window_for_kind(SyncWindowKind::LastTwelveWeeks, now_ms);
+        let this_week = window_for_kind(SyncWindowKind::ThisWeek, now_ms);
+        let last_week = window_for_kind(SyncWindowKind::LastWeek, now_ms);
         let full = window_for_kind(SyncWindowKind::Full, now_ms);
 
         assert_eq!(today.ts_min(), Some(today_start));
         assert_eq!(today.ts_max_exclusive(), Some(today_start + DAY_MS));
 
-        assert_eq!(yesterday.ts_min(), Some(today_start - DAY_MS));
+        assert_eq!(yesterday.ts_min(), Some(yesterday_start));
         assert_eq!(yesterday.ts_max_exclusive(), Some(today_start));
 
-        assert_eq!(week.ts_min(), Some(today_start - WEEK_MS));
-        assert_eq!(week.ts_max_exclusive(), Some(today_start - DAY_MS));
+        assert_eq!(this_week.ts_min(), Some(this_week_start));
+        assert_eq!(this_week.ts_max_exclusive(), Some(yesterday_start));
 
-        assert_eq!(twelve_weeks.ts_min(), Some(today_start - TWELVE_WEEK_MS));
-        assert_eq!(twelve_weeks.ts_max_exclusive(), Some(today_start - WEEK_MS));
+        assert_eq!(last_week.ts_min(), Some(this_week_start - WEEK_MS));
+        assert_eq!(last_week.ts_max_exclusive(), Some(this_week_start));
 
         assert_eq!(full.ts_min(), Some(ALL_START_MS));
-        assert_eq!(full.ts_max_exclusive(), Some(today_start - TWELVE_WEEK_MS));
+        assert_eq!(full.ts_max_exclusive(), Some(this_week_start - WEEK_MS));
     }
 
     #[test]
-    fn lowmem_allows_only_hot_and_last_week_windows() {
+    fn this_week_window_is_empty_until_day_before_yesterday_exists() {
+        let _env = EnvGuard::default_windows();
+        let now_ms = (103 * DAY_MS) + 123_456;
+        let this_week_start = crate::db::dep_claims::utc_week_start_ms(now_ms);
+        let this_week = window_for_kind(SyncWindowKind::ThisWeek, now_ms);
+
+        assert_eq!(this_week.ts_min(), Some(this_week_start));
+        assert_eq!(this_week.ts_max_exclusive(), Some(this_week_start));
+    }
+
+    #[test]
+    fn lowmem_allows_only_hot_and_recent_week_windows() {
         let _env = EnvGuard::default_windows();
         assert!(is_low_mem_allowed_window(SyncWindowKind::Today));
         assert!(is_low_mem_allowed_window(SyncWindowKind::Yesterday));
+        assert!(is_low_mem_allowed_window(SyncWindowKind::ThisWeek));
         assert!(is_low_mem_allowed_window(SyncWindowKind::LastWeek));
-        assert!(!is_low_mem_allowed_window(SyncWindowKind::LastTwelveWeeks));
         assert!(!is_low_mem_allowed_window(SyncWindowKind::Full));
     }
 
@@ -696,24 +718,25 @@ mod tests {
         reset_outbound_window_state(db_path, recorded_by, peer_a);
         reset_outbound_window_state(db_path, recorded_by, peer_b);
 
-        for _ in 0..2 {
-            let a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, 100 * DAY_MS);
-            let b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, 100 * DAY_MS);
+        let now_ms = 106 * DAY_MS;
+        for _ in 0..3 {
+            let a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, now_ms);
+            let b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, now_ms);
             mark_outbound_window_completed(db_path, recorded_by, peer_a, a);
             mark_outbound_window_completed(db_path, recorded_by, peer_b, b);
         }
 
-        let now_ms = 100 * DAY_MS;
         let week_a = select_outbound_window(db_path, recorded_by, peer_a, &live_peers, now_ms);
         let week_b = select_outbound_window(db_path, recorded_by, peer_b, &live_peers, now_ms);
+        let week_start = crate::db::dep_claims::utc_week_start_ms(now_ms);
 
         assert_eq!(week_a.kind, SyncWindowKind::LastWeek);
         assert_eq!(week_b.kind, SyncWindowKind::LastWeek);
         assert_eq!(week_a.ts_min(), week_b.ts_max_exclusive());
-        assert_eq!(week_a.ts_min(), Some(now_ms - (4 * DAY_MS)));
-        assert_eq!(week_a.ts_max_exclusive(), Some(now_ms - DAY_MS));
-        assert_eq!(week_b.ts_min(), Some(now_ms - WEEK_MS));
-        assert_eq!(week_b.ts_max_exclusive(), Some(now_ms - (4 * DAY_MS)));
+        assert_eq!(week_a.ts_min(), Some(week_start - (WEEK_MS / 2)));
+        assert_eq!(week_a.ts_max_exclusive(), Some(week_start));
+        assert_eq!(week_b.ts_min(), Some(week_start - WEEK_MS));
+        assert_eq!(week_b.ts_max_exclusive(), Some(week_start - (WEEK_MS / 2)));
     }
 
     #[test]
@@ -726,17 +749,17 @@ mod tests {
         reset_outbound_window_state(db_path, recorded_by, peer_a);
         reset_outbound_window_state(db_path, recorded_by, peer_b);
 
-        for _ in 0..2 {
+        let now_ms = 106 * DAY_MS;
+        for _ in 0..3 {
             let a = select_outbound_window(
                 db_path,
                 recorded_by,
                 peer_a,
                 &[peer_a.to_string(), peer_b.to_string()],
-                100 * DAY_MS,
+                now_ms,
             );
             mark_outbound_window_completed(db_path, recorded_by, peer_a, a);
         }
-        let now_ms = 100 * DAY_MS;
         let split_week = select_outbound_window(
             db_path,
             recorded_by,
@@ -746,12 +769,13 @@ mod tests {
         );
         let single_week =
             select_outbound_window(db_path, recorded_by, peer_a, &[peer_a.to_string()], now_ms);
+        let week_start = crate::db::dep_claims::utc_week_start_ms(now_ms);
 
         assert_eq!(split_week.kind, SyncWindowKind::LastWeek);
-        assert_eq!(split_week.ts_min(), Some(now_ms - (4 * DAY_MS)));
-        assert_eq!(split_week.ts_max_exclusive(), Some(now_ms - DAY_MS));
-        assert_eq!(single_week.ts_min(), Some(now_ms - WEEK_MS));
-        assert_eq!(single_week.ts_max_exclusive(), Some(now_ms - DAY_MS));
+        assert_eq!(split_week.ts_min(), Some(week_start - (WEEK_MS / 2)));
+        assert_eq!(split_week.ts_max_exclusive(), Some(week_start));
+        assert_eq!(single_week.ts_min(), Some(week_start - WEEK_MS));
+        assert_eq!(single_week.ts_max_exclusive(), Some(week_start));
     }
 
     #[test]
@@ -765,7 +789,7 @@ mod tests {
             "peer-c".to_string(),
             "peer-d".to_string(),
         ];
-        let now_ms = 4 * TWELVE_WEEK_MS;
+        let now_ms = 8 * WEEK_MS;
         for peer in &peers {
             reset_outbound_window_state(db_path, recorded_by, peer);
         }
@@ -787,7 +811,7 @@ mod tests {
         assert_eq!(full_windows[0].ts_min(), Some(ALL_START_MS));
         assert_eq!(
             full_windows[3].ts_max_exclusive(),
-            Some(crate::db::dep_claims::utc_day_start_ms(now_ms) - TWELVE_WEEK_MS)
+            Some(crate::db::dep_claims::utc_week_start_ms(now_ms) - WEEK_MS)
         );
         for pair in full_windows.windows(2) {
             assert_eq!(pair[0].ts_max_exclusive(), pair[1].ts_min());
@@ -795,17 +819,15 @@ mod tests {
     }
 
     #[test]
-    fn claim_shards_cover_small_window_in_utc_days() {
+    fn claim_shards_cover_windows_in_utc_weeks() {
         let _env = EnvGuard::default_windows();
+        let week_start = crate::db::dep_claims::utc_week_start_ms(10 * DAY_MS);
         let window = SyncWindow {
             kind: SyncWindowKind::LastWeek,
-            ts_min_inclusive_ms: Some(DAY_MS - 1),
-            ts_max_exclusive_ms: Some((3 * DAY_MS) + 1),
+            ts_min_inclusive_ms: Some(week_start + DAY_MS),
+            ts_max_exclusive_ms: Some(week_start + (3 * DAY_MS)),
         };
-        assert_eq!(
-            claim_shard_starts_for_window(window, 10 * DAY_MS),
-            vec![0, DAY_MS, 2 * DAY_MS, 3 * DAY_MS]
-        );
+        assert_eq!(claim_shard_starts_for_window(window, 10 * DAY_MS), vec![week_start]);
     }
 
     #[test]
@@ -814,9 +836,9 @@ mod tests {
         let prev = std::env::var("TOPO_SYNC_DEP_CLAIM_SHARD_CAP").ok();
         std::env::set_var("TOPO_SYNC_DEP_CLAIM_SHARD_CAP", "2");
         let window = SyncWindow {
-            kind: SyncWindowKind::LastWeek,
+            kind: SyncWindowKind::Full,
             ts_min_inclusive_ms: Some(0),
-            ts_max_exclusive_ms: Some(3 * DAY_MS),
+            ts_max_exclusive_ms: Some(3 * WEEK_MS),
         };
         assert!(claim_shard_starts_for_window(window, 10 * DAY_MS).is_empty());
         match prev {
@@ -847,8 +869,8 @@ mod tests {
         let _env = EnvGuard::default_windows();
         let payload = vec![5, 6, 7];
         let encoded = encode_initial_neg_open(
-            SyncNegPhase::ClaimsDayShard {
-                shard_start_ms: 42 * DAY_MS,
+            SyncNegPhase::ClaimsWeekShard {
+                shard_start_ms: 42 * WEEK_MS,
             },
             payload.clone(),
         );
@@ -856,8 +878,8 @@ mod tests {
 
         assert_eq!(
             decoded_phase,
-            SyncNegPhase::ClaimsDayShard {
-                shard_start_ms: 42 * DAY_MS,
+            SyncNegPhase::ClaimsWeekShard {
+                shard_start_ms: 42 * WEEK_MS,
             }
         );
         assert_eq!(inner, payload.as_slice());

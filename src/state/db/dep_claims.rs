@@ -5,6 +5,7 @@ use crate::crypto::{event_id_from_base64, event_id_to_base64, EventId};
 const CLAIM_STRENGTH_SOFT: i64 = 1;
 const CLAIM_STRENGTH_HARD: i64 = 2;
 const UTC_DAY_MS: i64 = 24 * 60 * 60 * 1000;
+const UTC_WEEK_DAYS: i64 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ClaimStrength {
@@ -45,6 +46,13 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
 
 pub fn utc_day_start_ms(ts_ms: i64) -> i64 {
     ts_ms - ts_ms.rem_euclid(UTC_DAY_MS)
+}
+
+pub fn utc_week_start_ms(ts_ms: i64) -> i64 {
+    let day_start_ms = utc_day_start_ms(ts_ms);
+    let days_since_epoch = day_start_ms.div_euclid(UTC_DAY_MS);
+    let weekday_from_monday = (days_since_epoch + 3).rem_euclid(UTC_WEEK_DAYS);
+    day_start_ms - (weekday_from_monday * UTC_DAY_MS)
 }
 
 pub fn upsert_hard_claims(
@@ -216,11 +224,20 @@ mod tests {
     }
 
     #[test]
+    fn utc_week_start_is_monday_at_boundaries() {
+        assert_eq!(utc_week_start_ms(0), -3 * UTC_DAY_MS);
+        assert_eq!(utc_week_start_ms(1), -3 * UTC_DAY_MS);
+        assert_eq!(utc_week_start_ms(4 * UTC_DAY_MS), 4 * UTC_DAY_MS);
+        assert_eq!(utc_week_start_ms((4 * UTC_DAY_MS) + 1), 4 * UTC_DAY_MS);
+        assert_eq!(utc_week_start_ms(-1), -3 * UTC_DAY_MS);
+    }
+
+    #[test]
     fn soft_claims_expire_but_hard_claims_remain_live() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let workspace_id = "ws";
-        let shard_start_ms = utc_day_start_ms(123_456_789);
+        let shard_start_ms = utc_week_start_ms(123_456_789);
         let soft = [1u8; 32];
         let hard = [2u8; 32];
 
@@ -251,7 +268,7 @@ mod tests {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let workspace_id = "ws";
-        let shard_start_ms = utc_day_start_ms(555_000);
+        let shard_start_ms = utc_week_start_ms(555_000);
         let event_id = [9u8; 32];
 
         upsert_hard_claims(&conn, workspace_id, shard_start_ms, &[event_id], 100).unwrap();
@@ -285,8 +302,8 @@ mod tests {
         create_tables(&conn).unwrap();
         let workspace_id = "ws";
         let event_id = [4u8; 32];
-        let shard_a = utc_day_start_ms(100);
-        let shard_b = utc_day_start_ms(86_400_100);
+        let shard_a = utc_week_start_ms(100);
+        let shard_b = utc_week_start_ms((7 * UTC_DAY_MS) + 100);
 
         upsert_hard_claims(&conn, workspace_id, shard_a, &[event_id], 100).unwrap();
         upsert_soft_claims(

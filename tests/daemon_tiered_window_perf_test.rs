@@ -1,5 +1,5 @@
 //! Tiered window catch-up benchmark:
-//! today -> yesterday -> last week -> last 12 weeks -> full history.
+//! today -> yesterday -> this week -> last week -> full history.
 //!
 //! Run with:
 //! `cargo test --release --test daemon_tiered_window_perf_test -- --ignored --nocapture --test-threads=1`
@@ -23,7 +23,6 @@ use perf_network_shaper::{NetworkProfile, UdpTrafficShaper, REALISTIC_NETWORK_PR
 const HOUR_MS: i64 = 60 * 60 * 1000;
 const DAY_MS: i64 = 24 * HOUR_MS;
 const WEEK_MS: i64 = 7 * DAY_MS;
-const TWELVE_WEEK_MS: i64 = 12 * WEEK_MS;
 const THREE_YEARS_MS: i64 = 3 * 365 * DAY_MS;
 
 struct RangeTiming {
@@ -399,8 +398,8 @@ fn run_tiered_window_bench(
     let newest_signer_chain = newest_message_signer_chain_timing_sql(&alice_db);
     let today_start_ms = utc_day_start_ms(measurement_now_ms);
     let yesterday_start_ms = today_start_ms - DAY_MS;
-    let week_start_ms = today_start_ms - WEEK_MS;
-    let twelve_week_start_ms = today_start_ms - TWELVE_WEEK_MS;
+    let this_week_start_ms = topo::db::dep_claims::utc_week_start_ms(measurement_now_ms);
+    let last_week_start_ms = this_week_start_ms - WEEK_MS;
     let tomorrow_start_ms = today_start_ms + DAY_MS;
     assert!(
         authoring_dep_timing.user_created_at_ms < yesterday_start_ms,
@@ -438,9 +437,10 @@ fn run_tiered_window_bench(
         measurement_now_ms,
         yesterday_start_ms
     );
-    let expected_week = message_count_in_range_sql(&alice_db, week_start_ms, yesterday_start_ms);
-    let expected_twelve_weeks =
-        message_count_in_range_sql(&alice_db, twelve_week_start_ms, week_start_ms);
+    let expected_this_week =
+        message_count_in_range_sql(&alice_db, this_week_start_ms, yesterday_start_ms);
+    let expected_last_week =
+        message_count_in_range_sql(&alice_db, last_week_start_ms, this_week_start_ms);
 
     let alice_direct_addr = daemon_listen_addr(&alice_db);
     let (invite_addr, bob_bind_addr, network_guard) = if let Some(profile) = network_profile {
@@ -564,19 +564,19 @@ fn run_tiered_window_bench(
                 .unwrap_or("loopback"),
         );
     } else {
-        let week_projected_ms = if expected_week > 0 {
+        let this_week_projected_ms = if expected_this_week > 0 {
             wait_for_message_count(
                 &bob_db,
-                expected_hot + expected_week,
+                expected_hot + expected_this_week,
                 Duration::from_secs(1200),
             )
         } else {
             metric_start_ms
         };
-        let twelve_week_projected_ms = if expected_twelve_weeks > 0 {
+        let last_week_projected_ms = if expected_last_week > 0 {
             wait_for_message_count(
                 &bob_db,
-                expected_hot + expected_week + expected_twelve_weeks,
+                expected_hot + expected_this_week + expected_last_week,
                 Duration::from_secs(1200),
             )
         } else {
@@ -586,14 +586,15 @@ fn run_tiered_window_bench(
             wait_for_message_count(&bob_db, total_messages, Duration::from_secs(1200));
         full_wall_secs = bench_start.elapsed().as_secs_f64();
 
-        let week_timing = range_timing_sql(&bob_db, Some(week_start_ms), Some(yesterday_start_ms));
-        let twelve_week_timing =
-            range_timing_sql(&bob_db, Some(twelve_week_start_ms), Some(week_start_ms));
+        let this_week_timing =
+            range_timing_sql(&bob_db, Some(this_week_start_ms), Some(yesterday_start_ms));
+        let last_week_timing =
+            range_timing_sql(&bob_db, Some(last_week_start_ms), Some(this_week_start_ms));
         let all_timing = range_timing_sql(&bob_db, None, None);
 
         summary = format!(
             "=== tiered window catchup ===
-  Window ladder: Today -> Yesterday -> LastWeek -> Last12Weeks -> Full
+  Window ladder: Today -> Yesterday -> ThisWeek -> LastWeek -> Full
   Messages preloaded on inviter: {total_messages}
   Network profile: {}
   Generated spread: 3 years
@@ -601,8 +602,8 @@ fn run_tiered_window_bench(
   Metric start: invite accept on running joiner daemon
   Today:         {} msgs durable in {:.2}s projected in {:.2}s
   Hot (2 days):  {} msgs durable in {:.2}s projected in {:.2}s
+  This week:     {} msgs durable in {:.2}s projected in {:.2}s
   Last week:     {} msgs durable in {:.2}s projected in {:.2}s
-  Last 12 weeks: {} msgs durable in {:.2}s projected in {:.2}s
   All:           {} msgs durable in {:.2}s projected in {:.2}s
   Newest message: created_at={} durable in {:.2}s visible in {:.2}s
   Full catchup wall: {:.2}s
@@ -622,19 +623,21 @@ fn run_tiered_window_bench(
                 metric_start_ms,
                 hot_timing.projected_at_ms.or(Some(hot_projected_ms))
             ),
-            week_timing.count,
-            elapsed_secs(metric_start_ms, week_timing.first_stored_at_ms),
+            this_week_timing.count,
+            elapsed_secs(metric_start_ms, this_week_timing.first_stored_at_ms),
             elapsed_secs(
                 metric_start_ms,
-                week_timing.projected_at_ms.or(Some(week_projected_ms))
-            ),
-            twelve_week_timing.count,
-            elapsed_secs(metric_start_ms, twelve_week_timing.first_stored_at_ms),
-            elapsed_secs(
-                metric_start_ms,
-                twelve_week_timing
+                this_week_timing
                     .projected_at_ms
-                    .or(Some(twelve_week_projected_ms))
+                    .or(Some(this_week_projected_ms))
+            ),
+            last_week_timing.count,
+            elapsed_secs(metric_start_ms, last_week_timing.first_stored_at_ms),
+            elapsed_secs(
+                metric_start_ms,
+                last_week_timing
+                    .projected_at_ms
+                    .or(Some(last_week_projected_ms))
             ),
             all_timing.count,
             elapsed_secs(metric_start_ms, all_timing.first_stored_at_ms),

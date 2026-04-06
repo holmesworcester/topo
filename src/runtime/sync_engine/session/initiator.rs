@@ -136,7 +136,7 @@ where
         let storage = load_claim_index_slice(&db, &ws_id, *shard_start_ms, session_now_ms)?;
         let mut neg = Negentropy::borrowed(&storage, NEGENTROPY_FRAME_SIZE_LIMIT)?;
         let initial_msg = encode_initial_neg_open(
-            SyncNegPhase::ClaimsDayShard {
+            SyncNegPhase::ClaimsWeekShard {
                 shard_start_ms: *shard_start_ms,
             },
             neg.initiate()?,

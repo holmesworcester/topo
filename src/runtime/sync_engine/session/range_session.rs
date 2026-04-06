@@ -433,7 +433,7 @@ mod tests {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let workspace_id = "ws";
-        let shard_start_ms = crate::db::dep_claims::utc_day_start_ms(2 * 24 * 60 * 60 * 1000);
+        let shard_start_ms = crate::db::dep_claims::utc_week_start_ms(2 * 24 * 60 * 60 * 1000);
         let live_soft = [1u8; 32];
         let expired_soft = [2u8; 32];
         let hard = [3u8; 32];
@@ -475,31 +475,32 @@ mod tests {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
         let workspace_id = "ws";
-        let shard_start_ms = crate::db::dep_claims::utc_day_start_ms(5 * 24 * 60 * 60 * 1000);
+        let root_day_start_ms = crate::db::dep_claims::utc_day_start_ms(5 * 24 * 60 * 60 * 1000);
+        let claim_week_start_ms = crate::db::dep_claims::utc_week_start_ms(root_day_start_ms);
         let dep = insert_indexed_shared_blob(
             &conn,
             workspace_id,
             &make_bench_dep_blob(100, vec![], 1),
             100,
         );
-        let root_created_at = shard_start_ms + 500;
+        let root_created_at = root_day_start_ms + 500;
         let root = insert_indexed_shared_blob(
             &conn,
             workspace_id,
             &make_bench_dep_blob(root_created_at as u64, vec![dep], 2),
             root_created_at,
         );
-        crate::db::dep_claims::upsert_hard_claims(&conn, workspace_id, shard_start_ms, &[dep], 100)
+        crate::db::dep_claims::upsert_hard_claims(&conn, workspace_id, claim_week_start_ms, &[dep], 100)
             .unwrap();
 
         let range = SyncWindow {
             kind: crate::sync::session::windowing::SyncWindowKind::Today,
-            ts_min_inclusive_ms: Some(shard_start_ms),
-            ts_max_exclusive_ms: Some(shard_start_ms + (24 * 60 * 60 * 1000)),
+            ts_min_inclusive_ms: Some(root_day_start_ms),
+            ts_max_exclusive_ms: Some(root_day_start_ms + (24 * 60 * 60 * 1000)),
         };
         let base_storage = load_shared_event_index_slice(&conn, workspace_id, range).unwrap();
         let object_storage =
-            load_shared_object_index_slice(&conn, workspace_id, range, &[shard_start_ms], 1_000)
+            load_shared_object_index_slice(&conn, workspace_id, range, &[claim_week_start_ms], 1_000)
                 .unwrap();
 
         assert_eq!(storage_ids(&base_storage), vec![root]);

@@ -145,8 +145,8 @@ async fn initiator_rejects_inbound_direction() {
 
 #[tokio::test]
 async fn initiator_clamps_future_windows_after_explicit_last_week_policy_reject() {
-    // Ensure LOW_MEM_IOS is unset so the planner allows LastTwelveWeeks for
-    // priming.  Another concurrent test may have set it via EnvGuard.
+    // Ensure LOW_MEM_IOS is unset so the planner allows Full for
+    // priming. Another concurrent test may have set it via EnvGuard.
     std::env::remove_var("LOW_MEM_IOS");
     run_local(async {
         let (db_path, _tmpdir) = create_test_db("test-tenant");
@@ -160,7 +160,7 @@ async fn initiator_clamps_future_windows_after_explicit_last_week_policy_reject(
             &db_path,
             "test-tenant",
             &peer_id,
-            SyncWindowKind::LastTwelveWeeks,
+            SyncWindowKind::Full,
         );
 
         let (fake_io_1, mut peer_1) = fake_session_io_pair(meta.session_id);
@@ -185,10 +185,10 @@ async fn initiator_clamps_future_windows_after_explicit_last_week_policy_reject(
         else {
             panic!("expected object-range phase");
         };
-        assert_eq!(first_window.kind, SyncWindowKind::LastTwelveWeeks);
+        assert_eq!(first_window.kind, SyncWindowKind::Full);
         peer_1
             .send_control_msg(&Frame::RangePolicyReject {
-                rejected_window_kind: encode_sync_window_kind(SyncWindowKind::LastTwelveWeeks),
+                rejected_window_kind: encode_sync_window_kind(SyncWindowKind::Full),
                 oldest_allowed_window_kind: encode_sync_window_kind(SyncWindowKind::LastWeek),
             })
             .await;
@@ -222,7 +222,7 @@ async fn initiator_clamps_future_windows_after_explicit_last_week_policy_reject(
             .expect("decode second NegOpen header")
             .0;
             match second_phase {
-                topo::sync::session::windowing::SyncNegPhase::ClaimsDayShard { .. } => {
+                topo::sync::session::windowing::SyncNegPhase::ClaimsWeekShard { .. } => {
                     peer_2
                         .send_control_msg(&Frame::NegMsg {
                             msg: empty_negentropy_response(second_open),
@@ -242,7 +242,10 @@ async fn initiator_clamps_future_windows_after_explicit_last_week_policy_reject(
         assert!(
             matches!(
                 second_window.kind,
-                SyncWindowKind::Today | SyncWindowKind::Yesterday | SyncWindowKind::LastWeek
+                SyncWindowKind::Today
+                    | SyncWindowKind::Yesterday
+                    | SyncWindowKind::ThisWeek
+                    | SyncWindowKind::LastWeek
             ),
             "after explicit last-week policy reject, initiator should only request day/week windows, got {:?}",
             second_window.kind

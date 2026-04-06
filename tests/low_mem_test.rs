@@ -291,8 +291,9 @@ fn run_lowmem_fresh_sync(label: &str, events: usize, history_span: &str) -> f64 
     wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
     wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
 
-    // For events within the lowmem sync range (LastDay + LastWeek), Bob should
-    // sync them all.  For events outside that range, Bob won't see them.
+    // For events within the lowmem sync range (Today + Yesterday + ThisWeek +
+    // LastWeek), Bob should sync them all. For events outside that range,
+    // Bob won't see them.
     let week_cutoff_ms = current_timestamp_ms() - WEEK_MS;
     let alice_recent = message_count_since_sql(&alice_db, week_cutoff_ms);
     let timeout = timeout_for_events(events, 300);

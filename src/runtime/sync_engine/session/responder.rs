@@ -131,7 +131,7 @@ where
         };
         let (phase, neg_msg) = decode_initial_neg_open(&msg)?;
         match phase {
-            SyncNegPhase::ClaimsDayShard { shard_start_ms } => {
+            SyncNegPhase::ClaimsWeekShard { shard_start_ms } => {
                 let storage = load_claim_index_slice(&db, &ws_id, shard_start_ms, session_now_ms)?;
                 let mut neg = Negentropy::borrowed(&storage, NEGENTROPY_FRAME_SIZE_LIMIT)?;
                 let mut phase_need_ids = Vec::<Id>::new();
