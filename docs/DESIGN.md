@@ -435,9 +435,9 @@ Current shape:
 1. a `Range` session uses one control stream plus one data stream and runs in two strict phases:
    - negentropy reconcile for one explicit range,
    - bulk event transfer for that same range,
-2. a `Dependency` session uses one control stream for `RequestIds` and one data stream for dependency `Event` replies,
-3. bulk range transfer does not use `ResponseCredit`, durable `wanted`, or a per-event request scheduler,
-4. the receiver writes bulk data to a `ReceiveLog`; dependency replies ingest immediately through the normal canonical path.
+2. bulk range transfer does not use `ResponseCredit`, durable `wanted`, or a per-event request scheduler,
+3. the receiver writes bulk data to a `ReceiveLog`; canonical ingest continues through the normal background path,
+4. auth and removal-frontier state are prioritized ahead of hot-range transfer so newly visible messages unblock without a separate dependency fast path.
 
 ---
 
@@ -819,10 +819,10 @@ The production peering runtime follows a single conceptual loop:
 3. **Supervisor layer**: startup preflight + loop orchestration live in the peering supervisor. Connectivity inputs are hints to `ensure_connected(peer)`, not independent long-lived owners.
 4. **Dial/accept loops**: `connect_loop` (outbound tenant work) and `accept_loop` (raw inbound daemon connections) are separate long-running loops coordinated by shared projected state and cancellation/watch channels. `iroh` dial/accept + daemon identity extraction flows through `transport::connection_lifecycle`, and stream wiring flows through `transport::session_factory`.
 5. **Live daemon slot**: after daemon identity extraction, the runtime claims at most one local live daemon connection slot per `(db_path, remote_daemon_peer_id)`. Duplicates are closed instead of starting overlapping sync ownership. If both directions appear, the deterministic preferred direction is the lexicographically lower daemon id dialing outbound and the higher daemon id retaining inbound; a preferred-direction connection replaces a non-preferred one.
-6. **Logical session auth and runners**: tenant work reuses the live daemon connection and opens logical range/dependency sessions. Steady-state sessions begin with `OpenSessionRoute`; bootstrap or new-workspace sessions use `OpenSessionAuthInvite`, then run through `SyncConnectionHandler` or the dependency fast path.
+6. **Logical session auth and runners**: tenant work reuses the live daemon connection and opens logical range sessions. Steady-state sessions begin with `OpenSessionRoute`; bootstrap or new-workspace sessions use `OpenSessionAuthInvite`, then run through `SyncConnectionHandler`.
 
 Known drawback: because there is no pre-handshake secret gate today, anyone who learns the daemon's `iroh` address or relay-reachable endpoint can touch the unauthenticated `iroh/topo` surface. They still cannot authenticate into a workspace without a valid route or invite proof, but they can force the first-session timeout path and probe for bugs in `iroh` itself or in our own session/bootstrap parsing and admission logic. This is an intentional simplicity tradeoff in the current design, not a claim that the exposed pre-proof surface is zero.
-7. **Ingest boundary**: range sessions write `ReceiveLog` files and dependency sessions call `ingest_now`; both converge through the same canonical/projector path.
+7. **Ingest boundary**: range sessions write `ReceiveLog` files, and replayed logs converge through the canonical/projector path.
 8. **Projected SQLite state**: projection cascade updates trust rows, completing the loop.
 
 ### Module ownership
@@ -1216,15 +1216,11 @@ Peer runtime worker shape:
    - exchange missing blobs on the data stream as raw length-delimited records,
    - append received blobs to a `ReceiveLog`,
    - finish the spool file before local canonical ingest continues in the background.
-2. dependency session:
-   - receive direct dependency requests on the control stream,
-   - send dependency replies on the data stream,
-   - ingest replies immediately through `ingest_now`.
-3. project worker/drain:
+2. project worker/drain:
    - claim `project_queue`,
    - run `project_one` in autocommit,
    - dequeue successes in batches and retry failures with backoff.
-4. cleanup worker:
+3. cleanup worker:
    - recover leftover receive logs,
    - reclaim expired leases,
    - purge stale operational rows and expired endpoint observations.
@@ -1246,12 +1242,11 @@ Bulk transfer is range-owned.
 7. on close or idle timeout, the log is finalized with `flush + sync_all`, the range session ends, and the log is queued for background canonical ingest,
 8. while a hot `LastDay` receive is active for a DB, bulk receive-log replay stays paused so download/store remains the priority path.
 
-Dependency repair is separate:
+Dependency repair happens through later prioritized range windows:
 
-1. projection blocking records the missing dep and source peer,
-2. the runtime publishes that dep to the live dependency session for the source peer,
-3. the peer replies with `Event` blobs,
-4. replies ingest immediately and may unblock waiting events.
+1. projection blocking records the missing dep locally,
+2. auth/removal-frontier and key lanes are synced before the hot `LastDay` window,
+3. older bulk windows continue the catchup once hot visibility is satisfied.
 
 ## 7.4 Dedupe and recovery
 
@@ -1282,7 +1277,7 @@ Can be eventual:
 The active implementation keeps coordination intentionally simple.
 
 1. there is one authenticated QUIC connection per peer,
-2. each peer can host multiple range sessions plus one dependency session,
+2. each peer hosts range sessions only; there is no separate dependency session,
 3. bulk scheduling is range-based, not event-based,
 4. newer ranges are favored by the fixed ladder order,
 5. true arbitrary-range splitting and cross-peer range balancing are future work.

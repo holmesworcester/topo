@@ -10,7 +10,6 @@ pub fn neg_id_to_event_id(id: &Id) -> EventId {
 /// Sync message types
 pub const MSG_TYPE_NEG_OPEN: u8 = 0x10; // Initial negentropy message
 pub const MSG_TYPE_NEG_MSG: u8 = 0x11; // Negentropy response
-pub const MSG_TYPE_REQUEST_IDS: u8 = 0x12; // Sink request: source should send these IDs
 pub const MSG_TYPE_DISCOVERY_HINTS: u8 = 0x14; // Discovery hint: peer is missing these IDs
 pub const MSG_TYPE_RANGE_POLICY_REJECT: u8 = 0x15; // Peer explicitly rejects a sync window policy
 pub const MSG_TYPE_EVENT: u8 = 0x03; // Event blob (variable length)
@@ -68,10 +67,6 @@ pub enum Frame {
     NegMsg {
         msg: Vec<u8>,
     },
-    /// Exact event IDs the sink is requesting from the source.
-    RequestIds {
-        ids: Vec<[u8; 32]>,
-    },
     /// Discovery hints describing events the peer appears to be missing.
     DiscoveryHints {
         priority_lane: u8,
@@ -127,28 +122,6 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
                 Frame::NegMsg { msg }
             };
             Ok((sync_msg, total_size))
-        }
-        MSG_TYPE_REQUEST_IDS => {
-            // Variable length: type(1) + count(4) + ids(count * 32)
-            if input.len() < 5 {
-                return Err(ParseError::InsufficientData);
-            }
-            let count = u32::from_le_bytes([input[1], input[2], input[3], input[4]]) as usize;
-            if count > MAX_ID_LIST_ENTRIES {
-                return Err(ParseError::TooManyIds(count));
-            }
-            let total_size = 5 + count * 32;
-            if input.len() < total_size {
-                return Err(ParseError::InsufficientData);
-            }
-            let mut ids = Vec::with_capacity(count);
-            for i in 0..count {
-                let start = 5 + i * 32;
-                let mut id = [0u8; 32];
-                id.copy_from_slice(&input[start..start + 32]);
-                ids.push(id);
-            }
-            Ok((Frame::RequestIds { ids }, total_size))
         }
         MSG_TYPE_DISCOVERY_HINTS => {
             if input.len() < 6 {
@@ -323,15 +296,6 @@ pub fn encode_frame(msg: &Frame) -> Vec<u8> {
             buf.push(MSG_TYPE_NEG_MSG);
             buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
             buf.extend_from_slice(data);
-            buf
-        }
-        Frame::RequestIds { ids } => {
-            let mut buf = Vec::with_capacity(5 + ids.len() * 32);
-            buf.push(MSG_TYPE_REQUEST_IDS);
-            buf.extend_from_slice(&(ids.len() as u32).to_le_bytes());
-            for id in ids {
-                buf.extend_from_slice(id);
-            }
             buf
         }
         Frame::DiscoveryHints {
@@ -574,31 +538,6 @@ mod tests {
         let (msg, consumed) = parse_frame(&buf).unwrap();
         assert_eq!(consumed, 5 + MAX_NEG_MSG_BYTES);
         assert!(matches!(msg, Frame::NegOpen { .. }));
-    }
-
-    #[test]
-    fn test_request_ids_too_many_ids() {
-        let oversized_count = (MAX_ID_LIST_ENTRIES + 1) as u32;
-        let mut buf = vec![MSG_TYPE_REQUEST_IDS];
-        buf.extend_from_slice(&oversized_count.to_le_bytes());
-        // Don't need full data — parser should reject based on count
-        let result = parse_frame(&buf);
-        assert_eq!(result, Err(ParseError::TooManyIds(MAX_ID_LIST_ENTRIES + 1)));
-    }
-
-    #[test]
-    fn test_request_ids_at_limit_ok() {
-        let max_count = MAX_ID_LIST_ENTRIES as u32;
-        let mut buf = vec![MSG_TYPE_REQUEST_IDS];
-        buf.extend_from_slice(&max_count.to_le_bytes());
-        buf.extend_from_slice(&vec![0u8; MAX_ID_LIST_ENTRIES * 32]);
-        let (msg, consumed) = parse_frame(&buf).unwrap();
-        assert_eq!(consumed, 5 + MAX_ID_LIST_ENTRIES * 32);
-        if let Frame::RequestIds { ids } = msg {
-            assert_eq!(ids.len(), MAX_ID_LIST_ENTRIES);
-        } else {
-            panic!("expected RequestIds");
-        }
     }
 
     #[test]

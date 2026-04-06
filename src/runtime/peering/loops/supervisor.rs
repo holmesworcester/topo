@@ -16,13 +16,11 @@ use crate::db::schema::create_tables;
 use crate::db::transport_trust::record_transport_binding;
 use crate::runtime::build_mismatch::note_build_mismatch;
 use crate::runtime::repeated_warning::should_emit_globally;
-use crate::sync::session::dependency_session::run_dependency_session;
 use crate::sync::session::receive_log::recover_receive_logs;
 use crate::sync::SyncConnectionHandler;
 use crate::transport::session_factory::extract_build_mismatch_reason;
 use crate::transport::{
     read_inbound_session_auth_for_connection, send_inbound_session_auth_ack, DaemonConnection,
-    SessionClass,
 };
 
 use super::{
@@ -291,44 +289,6 @@ pub(super) async fn supervise_inbound_daemon_connection(
                     &remote_daemon_fp,
                 );
             }
-        }
-
-        if session.class == SessionClass::Dependency {
-            let session_start = std::time::Instant::now();
-            let db_path = db_path.to_string();
-            let recorded_by = auth_context.tenant_id.clone();
-            let peer_id = auth_context.remote_peer_id.clone();
-            let remote_addr = session.remote_addr;
-            let remote_label = session.remote_label.clone();
-            let dep_shutdown = shutdown.child_token();
-            tokio::task::spawn_local(async move {
-                if let Err(err) = run_dependency_session(
-                    session.io,
-                    db_path,
-                    recorded_by,
-                    peer_id.clone(),
-                    remote_addr,
-                    remote_label,
-                    dep_shutdown,
-                )
-                .await
-                {
-                    warn!(
-                        "Dependency session {} error peer={}: {}",
-                        session.session_id,
-                        short_peer_id(&peer_id),
-                        err
-                    );
-                } else {
-                    info!(
-                        "Dependency session {} finished in {}ms peer={}",
-                        session.session_id,
-                        session_start.elapsed().as_millis(),
-                        short_peer_id(&peer_id)
-                    );
-                }
-            });
-            continue;
         }
 
         info!(

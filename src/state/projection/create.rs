@@ -168,6 +168,7 @@ fn store_blob_only(
             created_at_ms,
             &event_id,
             ws_id,
+            blob,
         )
         .map_err(|e| CreateEventError::DbError(e.to_string()))?;
     } else if meta.share_scope == crate::event_modules::registry::ShareScope::Shared

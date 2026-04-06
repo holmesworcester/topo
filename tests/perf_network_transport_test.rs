@@ -127,11 +127,20 @@ async fn exercise_roundtrip_sessions(
             }
         );
 
-        let request_ids = encode_frame(&Frame::RequestIds { ids: vec![] });
-        server_parts.control.send(&request_ids).await?;
+        let discovery_hints = encode_frame(&Frame::DiscoveryHints {
+            priority_lane: 0,
+            hints: vec![],
+        });
+        server_parts.control.send(&discovery_hints).await?;
         server_parts.control.flush().await?;
         let received = client_parts.control.recv().await?;
-        assert_eq!(parse_frame(&received)?.0, Frame::RequestIds { ids: vec![] });
+        assert_eq!(
+            parse_frame(&received)?.0,
+            Frame::DiscoveryHints {
+                priority_lane: 0,
+                hints: vec![],
+            }
+        );
 
         let payload = vec![round as u8; data_payload_len];
         let event = encode_frame(&Frame::Event {

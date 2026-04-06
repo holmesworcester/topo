@@ -7,4 +7,4 @@ pub mod sync_control;
 pub mod sync_engine;
 pub mod transport;
 
-pub use sync_engine::runtime::{DependencySessionStats, SyncStats};
+pub use sync_engine::runtime::SyncStats;

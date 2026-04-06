@@ -13,7 +13,6 @@ use crate::db::open_connection;
 use crate::db::transport_trust::record_transport_binding;
 use crate::runtime::build_mismatch::note_build_mismatch;
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
-use crate::sync::session::dependency_session::spawn_outbound_dependency_session;
 use crate::sync::session::windowing::reset_outbound_window_state;
 use crate::sync::SyncConnectionHandler;
 use crate::transport::session_factory::extract_build_mismatch_reason;
@@ -225,19 +224,9 @@ async fn connect_loop_inner(
         let initiator_handler =
             SyncConnectionHandler::outbound(db_path.to_string(), SYNC_SESSION_TIMEOUT_SECS)
                 .with_sync_control(sync_control.clone());
-        let dependency_shutdown = shutdown.child_token();
-        let _dependency_handle = spawn_outbound_dependency_session(
-            daemon_connection.clone(),
-            db_path.to_string(),
-            recorded_by.to_string(),
-            remote_session_peer_id.to_string(),
-            auth_plan.clone(),
-            dependency_shutdown.clone(),
-        );
 
         loop {
             if shutdown.is_cancelled() {
-                dependency_shutdown.cancel();
                 break;
             }
 
@@ -260,7 +249,6 @@ async fn connect_loop_inner(
                             connection_id,
                         );
                     }
-                    dependency_shutdown.cancel();
                     break;
                 }
             };
@@ -309,7 +297,6 @@ async fn connect_loop_inner(
                     {
                         warn!("{}", message);
                     }
-                    dependency_shutdown.cancel();
                     break;
                 }
             };
@@ -323,7 +310,6 @@ async fn connect_loop_inner(
                         super::short_peer_id(&peer_id),
                         super::short_peer_id(daemon_connection.remote_daemon_peer_id())
                     );
-                    dependency_shutdown.cancel();
                     break;
                 }
             };
@@ -376,7 +362,6 @@ async fn connect_loop_inner(
             if !session_ok {
                 tokio::select! {
                     _ = shutdown.cancelled() => {
-                        dependency_shutdown.cancel();
                         break;
                     }
                     _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}

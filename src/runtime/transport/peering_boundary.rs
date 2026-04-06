@@ -626,13 +626,6 @@ pub async fn open_outbound_session(
     Ok((session.session_id, session.io))
 }
 
-pub async fn open_outbound_dependency_session(
-    conn: &DaemonConnection,
-) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError> {
-    let session = conn.open_outbound_session(SessionClass::Dependency).await?;
-    Ok((session.session_id, session.io))
-}
-
 pub async fn open_inbound_session(
     conn: &DaemonConnection,
 ) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError> {
