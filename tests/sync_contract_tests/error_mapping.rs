@@ -122,10 +122,12 @@ async fn normal_roundtrip_stays_healthy_until_cancel() {
         let mut neg =
             negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
         let initial_msg = topo::sync::session::windowing::encode_initial_neg_open(
-            topo::sync::session::windowing::SyncWindow {
-                kind: topo::sync::session::windowing::SyncWindowKind::LastDay,
-                ts_min_inclusive_ms: Some(0),
-                ts_max_exclusive_ms: None,
+            topo::sync::session::windowing::SyncNegPhase::ObjectsRange {
+                window: topo::sync::session::windowing::SyncWindow {
+                    kind: topo::sync::session::windowing::SyncWindowKind::Today,
+                    ts_min_inclusive_ms: Some(0),
+                    ts_max_exclusive_ms: None,
+                },
             },
             neg.initiate().unwrap(),
         );
@@ -333,10 +335,12 @@ async fn fragmented_data_frames_handler_completes() {
         let mut neg =
             negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
         let initial_msg = topo::sync::session::windowing::encode_initial_neg_open(
-            topo::sync::session::windowing::SyncWindow {
-                kind: topo::sync::session::windowing::SyncWindowKind::LastDay,
-                ts_min_inclusive_ms: Some(0),
-                ts_max_exclusive_ms: None,
+            topo::sync::session::windowing::SyncNegPhase::ObjectsRange {
+                window: topo::sync::session::windowing::SyncWindow {
+                    kind: topo::sync::session::windowing::SyncWindowKind::Today,
+                    ts_min_inclusive_ms: Some(0),
+                    ts_max_exclusive_ms: None,
+                },
             },
             neg.initiate().unwrap(),
         );

@@ -7,7 +7,7 @@ use tokio_util::sync::CancellationToken;
 use topo::contracts::peering_contract::{SessionDirection, SessionHandler};
 use topo::protocol::Frame;
 use topo::sync::session::windowing::{
-    encode_initial_neg_open, encode_sync_window_kind, SyncWindow, SyncWindowKind,
+    encode_initial_neg_open, encode_sync_window_kind, SyncNegPhase, SyncWindow, SyncWindowKind,
 };
 use topo::sync::session_handler::SyncConnectionHandler;
 
@@ -39,13 +39,15 @@ impl Drop for EnvGuard {
 async fn drive_empty_inbound_round(peer: &mut crate::fake_session_io::FakePeerSide) {
     let storage = empty_negentropy_storage();
     let mut neg = negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
-    // Use a LastDay window header so this works even when LOW_MEM_IOS=1 leaks
+    // Use a Today window header so this works even when LOW_MEM_IOS=1 leaks
     // from a concurrent test (low-mem responders reject Full/LastTwelveWeeks).
     let initial_msg = encode_initial_neg_open(
-        SyncWindow {
-            kind: SyncWindowKind::LastDay,
-            ts_min_inclusive_ms: Some(0),
-            ts_max_exclusive_ms: None,
+        SyncNegPhase::ObjectsRange {
+            window: SyncWindow {
+                kind: SyncWindowKind::Today,
+                ts_min_inclusive_ms: Some(0),
+                ts_max_exclusive_ms: None,
+            },
         },
         neg.initiate().unwrap(),
     );
@@ -93,10 +95,12 @@ async fn lowmem_responder_rejects_ranges_beyond_last_week() {
         let mut neg =
             negentropy::Negentropy::new(negentropy::Storage::Borrowed(&storage), 0).unwrap();
         let initial_msg = encode_initial_neg_open(
-            SyncWindow {
-                kind: SyncWindowKind::LastTwelveWeeks,
-                ts_min_inclusive_ms: Some(0),
-                ts_max_exclusive_ms: Some(1_000_000),
+            SyncNegPhase::ObjectsRange {
+                window: SyncWindow {
+                    kind: SyncWindowKind::LastTwelveWeeks,
+                    ts_min_inclusive_ms: Some(0),
+                    ts_max_exclusive_ms: Some(1_000_000),
+                },
             },
             neg.initiate().unwrap(),
         );

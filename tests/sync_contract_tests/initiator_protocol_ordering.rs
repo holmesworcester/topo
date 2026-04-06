@@ -175,11 +175,16 @@ async fn initiator_clamps_future_windows_after_explicit_last_week_policy_reject(
             .recv_control_msg_timeout(Duration::from_secs(5))
             .await
             .expect("expected first outbound NegOpen");
-        let (first_window, _msg) = decode_initial_neg_open(match &first_open {
+        let (first_phase, _msg) = decode_initial_neg_open(match &first_open {
             Frame::NegOpen { msg } => msg,
             other => panic!("expected NegOpen frame, got {other:?}"),
         })
         .expect("decode first NegOpen header");
+        let topo::sync::session::windowing::SyncNegPhase::ObjectsRange { window: first_window } =
+            first_phase
+        else {
+            panic!("expected object-range phase");
+        };
         assert_eq!(first_window.kind, SyncWindowKind::LastTwelveWeeks);
         peer_1
             .send_control_msg(&Frame::RangePolicyReject {
@@ -205,19 +210,39 @@ async fn initiator_clamps_future_windows_after_explicit_last_week_policy_reject(
             async move { handler.on_session(meta_2, Box::new(fake_io_2), cancel).await }
         });
 
-        let second_open = peer_2
-            .recv_control_msg_timeout(Duration::from_secs(5))
-            .await
-            .expect("expected second outbound NegOpen");
-        let (second_window, _msg) = decode_initial_neg_open(match &second_open {
-            Frame::NegOpen { msg } => msg,
-            other => panic!("expected NegOpen frame, got {other:?}"),
-        })
-        .expect("decode second NegOpen header");
+        let second_window = loop {
+            let second_open = peer_2
+                .recv_control_msg_timeout(Duration::from_secs(5))
+                .await
+                .expect("expected second outbound NegOpen or claim shard");
+            let second_phase = decode_initial_neg_open(match &second_open {
+                Frame::NegOpen { msg } => msg,
+                other => panic!("expected NegOpen frame, got {other:?}"),
+            })
+            .expect("decode second NegOpen header")
+            .0;
+            match second_phase {
+                topo::sync::session::windowing::SyncNegPhase::ClaimsDayShard { .. } => {
+                    peer_2
+                        .send_control_msg(&Frame::NegMsg {
+                            msg: empty_negentropy_response(second_open),
+                        })
+                        .await;
+                    let terminator = peer_2
+                        .recv_control_msg_timeout(Duration::from_secs(5))
+                        .await
+                        .expect("expected claim-phase terminator");
+                    assert_eq!(terminator, Frame::NegMsg { msg: Vec::new() });
+                }
+                topo::sync::session::windowing::SyncNegPhase::ObjectsRange { window } => {
+                    break window;
+                }
+            }
+        };
         assert!(
             matches!(
                 second_window.kind,
-                SyncWindowKind::LastDay | SyncWindowKind::LastWeek
+                SyncWindowKind::Today | SyncWindowKind::Yesterday | SyncWindowKind::LastWeek
             ),
             "after explicit last-week policy reject, initiator should only request day/week windows, got {:?}",
             second_window.kind

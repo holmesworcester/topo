@@ -493,7 +493,7 @@ mod tests {
             .unwrap();
 
         let range = SyncWindow {
-            kind: crate::sync::session::windowing::SyncWindowKind::LastDay,
+            kind: crate::sync::session::windowing::SyncWindowKind::Today,
             ts_min_inclusive_ms: Some(shard_start_ms),
             ts_max_exclusive_ms: Some(shard_start_ms + (24 * 60 * 60 * 1000)),
         };
