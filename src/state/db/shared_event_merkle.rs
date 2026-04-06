@@ -1196,7 +1196,6 @@ mod tests {
                 ts,
                 &event_id,
                 workspace_id,
-                &[],
             )
             .unwrap();
             vector
@@ -1263,7 +1262,6 @@ mod tests {
                 ts,
                 &event_id,
                 workspace_id,
-                &[],
             )
             .unwrap();
         }

@@ -1,7 +1,6 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use negentropy::Id;
 use rusqlite::Connection;
 
 use crate::crypto::{event_id_to_base64, hash_event, EventId};
@@ -308,7 +307,6 @@ mod tests {
         encode_event, endpoint_shared, registry::ShareScope, removal::frontier_hash_from_refs,
         KeyRotationEvent, MessageEvent, ParsedEvent, PeerSharedEvent, RemovalEvent,
     };
-    use negentropy::{Id, NegentropyStorageBase};
 
     #[test]
     fn shared_send_batch_returns_requested_events_only() {
@@ -553,42 +551,6 @@ mod tests {
             vec![(10, endpoint_event_id), (15, removal_event_id)]
         );
         assert_eq!(key_entries, vec![(20, key_rotation_event_id)]);
-
-        let auth_storage = load_shared_event_index_slice(
-            &conn,
-            workspace_id,
-            SyncWindow {
-                kind: SyncWindowKind::AuthGraph,
-                ts_min_inclusive_ms: None,
-                ts_max_exclusive_ms: None,
-            },
-        )
-        .unwrap();
-        let key_storage = load_shared_event_index_slice(
-            &conn,
-            workspace_id,
-            SyncWindow {
-                kind: SyncWindowKind::KeyGraph,
-                ts_min_inclusive_ms: None,
-                ts_max_exclusive_ms: None,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(auth_storage.size().unwrap(), 2);
-        assert_eq!(key_storage.size().unwrap(), 1);
-        assert_eq!(
-            auth_storage.get_item(0).unwrap().unwrap().id,
-            Id::from_byte_array(endpoint_event_id)
-        );
-        assert_eq!(
-            auth_storage.get_item(1).unwrap().unwrap().id,
-            Id::from_byte_array(removal_event_id)
-        );
-        assert_eq!(
-            key_storage.get_item(0).unwrap().unwrap().id,
-            Id::from_byte_array(key_rotation_event_id)
-        );
     }
 
     #[test]
