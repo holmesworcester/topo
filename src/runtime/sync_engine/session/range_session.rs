@@ -1,6 +1,7 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
+use negentropy::{Id, NegentropyStorageVector};
 use rusqlite::Connection;
 
 use crate::crypto::{event_id_to_base64, hash_event, EventId};
@@ -111,13 +112,17 @@ pub fn load_shared_event_index_slice(
     conn: &Connection,
     workspace_id: &str,
     range: SyncWindow,
-) -> Result<crate::db::shared_event_merkle::SharedEventMerkleStorage, String> {
-    if shared_priority_lane(range.kind).is_some() {
-        let entries = load_shared_index_entries(conn, workspace_id, range)?;
-        crate::db::shared_event_merkle::SharedEventMerkleStorage::from_entries(&entries, range)
-    } else {
-        crate::db::shared_event_merkle::SharedEventMerkleStorage::load(conn, workspace_id, range)
+) -> Result<NegentropyStorageVector, String> {
+    let mut storage = NegentropyStorageVector::new();
+    for (ts, event_id) in load_shared_index_entries(conn, workspace_id, range)? {
+        storage
+            .insert(ts.max(0) as u64, Id::from_byte_array(event_id))
+            .map_err(|e| format!("insert negentropy vector item: {e}"))?;
     }
+    storage
+        .seal()
+        .map_err(|e| format!("seal negentropy vector storage: {e}"))?;
+    Ok(storage)
 }
 
 pub fn load_shared_send_batch(

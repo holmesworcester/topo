@@ -41,7 +41,6 @@ pub(super) fn run_persist_phase(
     enqueue_stmt: &mut rusqlite::Statement<'_>,
 ) -> PersistPhaseOutput {
     let timeline = EventTimeline::new(db);
-    let mut shared_index_inserts: HashMap<String, Vec<(i64, EventId)>> = HashMap::new();
     let mut persist_output = PersistPhaseOutput {
         persisted_event_ids: Vec::with_capacity(batch.len()),
         tenants_seen: HashSet::new(),
@@ -84,26 +83,18 @@ pub(super) fn run_persist_phase(
                             None
                         };
                         if let Some(ws_id) = ws_id {
-                            match shared_event_index_stmt.execute(rusqlite::params![
+                            if let Err(e) = shared_event_index_stmt.execute(rusqlite::params![
                                 &ws_id,
                                 created_at_ms as i64,
                                 event_id.as_slice()
                             ]) {
-                                Ok(rows) => {
-                                    if rows > 0 {
-                                        shared_index_inserts
-                                            .entry(ws_id.clone())
-                                            .or_default()
-                                            .push((created_at_ms as i64, *event_id));
-                                    }
-                                }
-                                Err(e) => {
-                                    tracing::warn!(
-                                        "shared_event_index insert error for {}: {}",
-                                        event_id_b64,
-                                        e
-                                    );
-                                }
+                                // Non-fatal: shared_event_index is a reconciliation cache;
+                                // event will be re-added on next sync session.
+                                tracing::warn!(
+                                    "shared_event_index insert error for {}: {}",
+                                    event_id_b64,
+                                    e
+                                );
                             }
                         }
                     }
@@ -199,20 +190,6 @@ pub(super) fn run_persist_phase(
             &persist_output.shared_event_fanouts,
         ) {
             tracing::warn!("persist_pending_fanouts error: {}", e);
-        }
-    }
-
-    for (workspace_id, items) in shared_index_inserts {
-        if let Err(e) = crate::state::db::shared_event_merkle::enqueue_pending_inserts(
-            db,
-            &workspace_id,
-            &items,
-        ) {
-            tracing::warn!(
-                "shared_event_merkle pending insert error for workspace {}: {}",
-                workspace_id,
-                e
-            );
         }
     }
 

@@ -6,7 +6,6 @@ pub mod need_queue;
 pub mod project_queue;
 pub mod queue;
 pub mod schema;
-pub mod shared_event_merkle;
 pub mod store;
 pub mod sync_control;
 pub mod sync_log;
@@ -104,7 +103,6 @@ use crate::tuning::low_mem_mode;
 
 pub fn ensure_infra_schema(conn: &Connection) -> SqliteResult<()> {
     store::ensure_schema(conn)?;
-    shared_event_merkle::ensure_schema(conn)?;
     daemon_identity::ensure_schema(conn)?;
     event_display::ensure_schema(conn)?;
     project_queue::ensure_schema(conn)?;
