@@ -572,7 +572,7 @@ env STAR_TOPOLOGY_LEAVES=50 STAR_TOPOLOGY_HUB_MESSAGES=1 STAR_TOPOLOGY_MESSAGES_
 2. **Reconciliation worker thread**: neg.reconcile() runs on a dedicated OS thread so egress drain continues during 100-400ms reconciliation calls
 3. **Immediate egress deletion**: sent items are deleted (not marked) to keep the egress table small during bulk transfers
 4. **Batch transactions**: BEGIN/COMMIT around event batches
-5. **Streaming pull dispatch**: RequestIds frames sent during reconciliation rounds, not deferred until reconciliation completes
+5. **Priority-first ranges**: auth/removal-frontier and key ranges are synced before hot message ranges
 6. **Inline projection**: project in same transaction as store
 7. **Coordinated download**: sink-driven round-based assignment avoids redundant transfers from overlapping sources
 

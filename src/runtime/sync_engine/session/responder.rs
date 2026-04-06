@@ -16,8 +16,8 @@ use crate::sync::session::receive_log::{
     enqueue_receive_log_ingest, note_hot_receive_finished, note_hot_receive_started,
 };
 use crate::sync::session::windowing::{
-    decode_initial_neg_open, encode_sync_window_kind, is_hot_window, is_low_mem_allowed_window,
-    SyncWindowKind,
+    decode_initial_neg_open, encode_sync_window_kind, is_low_mem_allowed_window,
+    is_priority_ingest_window, SyncWindowKind,
 };
 use crate::sync::session::{INITIAL_CONTROL_PROGRESS_TIMEOUT, NEGENTROPY_FRAME_SIZE_LIMIT};
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
@@ -171,7 +171,7 @@ where
     drain_manual_commands(peer_id, &mut command_rx, &mut pending_round_replies);
     reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);
 
-    let hot_receive = is_hot_window(range.kind);
+    let hot_receive = is_priority_ingest_window(range.kind);
     if hot_receive {
         note_hot_receive_started(db_path);
     }
@@ -186,7 +186,8 @@ where
     );
 
     let store = Store::new(&db);
-    let (events_sent, bytes_sent) = send_have_events(&store, &mut data_send, &have_ids).await?;
+    let (events_sent, bytes_sent) =
+        send_have_events(&store, &mut data_send, &have_ids, range).await?;
     drop(data_send);
 
     let received = match receive_task.await {

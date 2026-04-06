@@ -1,6 +1,5 @@
 //! Sync session logic: initiator and responder range sessions.
 
-pub mod dependency_session;
 pub mod initiator;
 pub mod logging;
 pub mod range_session;

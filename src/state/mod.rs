@@ -1,5 +1,4 @@
 pub mod db;
-pub mod dependency_fetch;
 pub mod live_hints;
 pub mod pipeline;
 pub mod projection;

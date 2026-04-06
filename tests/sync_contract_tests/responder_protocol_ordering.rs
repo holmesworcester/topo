@@ -189,31 +189,3 @@ async fn responder_rejects_outbound_direction() {
     })
     .await;
 }
-
-#[tokio::test]
-async fn responder_ignores_empty_request_ids_marker() {
-    run_local(async {
-        let (db_path, _tmpdir) = create_test_db("test-tenant");
-        let handler = SyncConnectionHandler::responder(db_path, 30);
-        let meta = test_session_meta(SessionDirection::Inbound);
-        let cancel = CancellationToken::new();
-
-        let (fake_io, mut peer) = fake_session_io_pair(meta.session_id);
-
-        tokio::task::spawn_local({
-            let cancel = cancel.clone();
-            async move {
-                let _ = handler.on_session(meta, Box::new(fake_io), cancel).await;
-            }
-        });
-
-        peer.send_control_msg(&Frame::RequestIds { ids: vec![] })
-            .await;
-
-        drive_empty_inbound_round(&mut peer).await;
-
-        cancel.cancel();
-        peer.force_close();
-    })
-    .await;
-}

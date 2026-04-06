@@ -114,16 +114,6 @@ impl ProjectionBackend for Connection {
         missing: &[EventId],
     ) -> ProjectionApplyResult<()> {
         super::stages::record_block_rows(self, recorded_by, event_id_b64, missing)?;
-        if let Some(source_peer_id) =
-            super::stages::load_recorded_source_peer_id(self, recorded_by, event_id_b64)?
-        {
-            crate::state::dependency_fetch::publish_from_connection(
-                self,
-                recorded_by,
-                &source_peer_id,
-                missing,
-            );
-        }
         Ok(())
     }
 

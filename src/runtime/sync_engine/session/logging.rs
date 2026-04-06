@@ -56,20 +56,6 @@ fn frame_detail_json(frame: &Frame, capture_full_ids: bool) -> Option<String> {
         Frame::NegOpen { msg } | Frame::NegMsg { msg } => {
             serde_json::to_string(&parse_neg_payload(msg, capture_full_ids)).ok()
         }
-        Frame::RequestIds { ids } => {
-            let keep = if capture_full_ids {
-                ids.len()
-            } else {
-                ids.len().min(MAX_CAPTURE_IDS)
-            };
-            let ids_hex: Vec<String> = ids.iter().take(keep).map(hex::encode).collect();
-            serde_json::to_string(&json!({
-                "id_count": ids.len(),
-                "ids": ids_hex,
-                "ids_truncated": !capture_full_ids && ids.len() > MAX_CAPTURE_IDS
-            }))
-            .ok()
-        }
         Frame::DiscoveryHints {
             priority_lane,
             hints,
@@ -136,7 +122,6 @@ fn frame_type(frame: &Frame) -> &'static str {
     match frame {
         Frame::NegOpen { .. } => "NegOpen",
         Frame::NegMsg { .. } => "NegMsg",
-        Frame::RequestIds { .. } => "RequestIds",
         Frame::DiscoveryHints { .. } => "DiscoveryHints",
         Frame::RangePolicyReject { .. } => "RangePolicyReject",
         Frame::Event { .. } => "Event",

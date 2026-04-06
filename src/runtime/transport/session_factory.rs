@@ -127,21 +127,18 @@ impl SessionStreamKind {
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum SessionClass {
     Range,
-    Dependency,
 }
 
 impl SessionClass {
     fn to_byte(self) -> u8 {
         match self {
             Self::Range => 0,
-            Self::Dependency => 1,
         }
     }
 
     fn from_byte(value: u8) -> Result<Self, SessionOpenError> {
         match value {
             0 => Ok(Self::Range),
-            1 => Ok(Self::Dependency),
             other => Err(SessionOpenError::Protocol(format!(
                 "invalid session class {other}"
             ))),
@@ -374,16 +371,6 @@ where
     C: SessionCarrier,
 {
     open_session_io_for_class(conn, SessionClass::Range).await
-}
-
-/// Open two bidirectional streams (control + data) as a dependency session.
-pub async fn open_dependency_session_io<C>(
-    conn: &C,
-) -> Result<(u64, Box<dyn TransportSessionIo>), SessionOpenError>
-where
-    C: SessionCarrier,
-{
-    open_session_io_for_class(conn, SessionClass::Dependency).await
 }
 
 /// Accept two bidirectional streams (control + data) as responder and wrap

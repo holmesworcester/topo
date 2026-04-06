@@ -13,7 +13,6 @@ Primary source modules:
 - `src/runtime/transport/*`
 - `src/state/pipeline/*`
 - `src/state/projection/apply/*`
-- `src/state/dependency_fetch.rs`
 - `src/state/db/{project_queue.rs,transport_trust.rs}`
 
 ## 0) RPC Dispatch And Event Locality
@@ -45,14 +44,11 @@ flowchart TD
     EP --> LIFE["connection lifecycle"]
     LIFE --> FACT["session factory"]
     FACT --> RANGE["Range session"]
-    FACT --> DEP["Dependency session"]
 
     RANGE --> LOG["ReceiveLog append"]
     LOG --> INGEST["ingest_event_log"]
-    DEP --> NOW["ingest_now"]
 
     INGEST --> STORE["persist + project_queue enqueue"]
-    NOW --> STORE
     STORE --> QDB[("project_queue")]
     QDB --> APPLY["project_one + cascade"]
     APPLY --> PDB
@@ -74,13 +70,7 @@ flowchart TD
     RECV --> LOG["ReceiveLog append"]
     LOG --> INGEST["ingest_event_log"]
     INGEST --> PROJ["project_one + cascade"]
-
-    FACT --> DEP["Dependency session"]
-    BLOCKED["blocked_event_deps"] --> DEP
-    DEP --> REQ["RequestIds"]
-    DEP --> REPLY["dependency Event replies"]
-    REPLY --> NOW["ingest_now"]
-    NOW --> PROJ
+    BLOCKED["blocked_event_deps"] --> WIN
 ```
 
 ## 3) High-Level Runtime Boundaries
@@ -236,7 +226,6 @@ flowchart TD
 - `service.rs helpers`: `open_db_*`, node status helpers, intro transport helper entry points.
 - `Persist + enqueue`: phase 1 persists events/recorded/sync state and enqueues `project_queue`.
 - `Range session`: one explicit range, one reconcile phase, one bulk transfer phase.
-- `Dependency session`: long-lived blocker-repair path using `RequestIds` plus `Event` replies.
 - `Shared event send`: `Store::get_shared(events) -> Frame::Event`.
 - `Projection tables`: projected read models (`messages`, `users`, `peers`, `channels`).
 - `Transport trust tables`: transport trust rows (`peer_shared`, invite bootstrap records).

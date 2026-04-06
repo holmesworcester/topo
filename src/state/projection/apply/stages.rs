@@ -8,8 +8,7 @@ use crate::event_modules::encrypted::NO_OWNER_EVENT_ID;
 use crate::event_modules::{registry, ParsedEvent, TransportPrivacy};
 use crate::projection::contract::EmitCommand;
 use crate::projection::queries::{ContextLoadResult, DepLoadResult, ProjectionFrameContext};
-use crate::state::live_hints::source_peer_id_from_source_tag;
-use rusqlite::{Connection, OptionalExtension};
+use rusqlite::Connection;
 
 use super::dispatch::dispatch_pure_projector;
 
@@ -34,24 +33,6 @@ fn check_transport_privacy(
         )),
         _ => Ok(()),
     }
-}
-
-pub(crate) fn load_recorded_source_peer_id(
-    conn: &Connection,
-    recorded_by: &str,
-    event_id_b64: &str,
-) -> Result<Option<String>, Box<dyn std::error::Error>> {
-    let source_tag: Option<String> = conn
-        .query_row(
-            "SELECT source
-             FROM recorded_events
-             WHERE peer_id = ?1 AND event_id = ?2",
-            rusqlite::params![recorded_by, event_id_b64],
-            |row| row.get(0),
-        )
-        .optional()?
-        .flatten();
-    Ok(source_tag.and_then(|source_tag| source_peer_id_from_source_tag(&source_tag)))
 }
 
 /// Record a rejected event durably so it is not re-processed on replay or cascade.
@@ -517,64 +498,31 @@ fn apply_projection_frame<B: ProjectionBackend>(
 
 #[cfg(test)]
 mod tests {
-    use super::*;
     use crate::db::{open_connection, schema::create_tables};
-    use crate::projection::apply::backend::ProjectionBackend;
-    use crate::state::dependency_fetch;
 
-    fn setup_file_db() -> (tempfile::TempDir, String, Connection) {
+    #[test]
+    fn creates_blocked_event_tables() {
         let dir = tempfile::tempdir().unwrap();
         let db_path = dir.path().join("stages.db").to_string_lossy().to_string();
         let conn = open_connection(&db_path).unwrap();
         create_tables(&conn).unwrap();
-        (dir, db_path, conn)
-    }
 
-    fn event_id(byte: u8) -> EventId {
-        let mut id = [0u8; 32];
-        id[0] = byte;
-        id
-    }
+        let blocked_events_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'blocked_events'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let blocked_event_deps_exists: bool = conn
+            .query_row(
+                "SELECT COUNT(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'blocked_event_deps'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
 
-    #[tokio::test]
-    async fn blocked_quic_event_emits_dependency_fetch_for_source_peer() {
-        let (_dir, db_path, conn) = setup_file_db();
-        let blocked = event_id(1);
-        let missing = event_id(2);
-        let blocked_b64 = event_id_to_base64(&blocked);
-        conn.execute(
-            "INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
-             VALUES (?1, ?2, 1, ?3)",
-            rusqlite::params!["tenant-a", &blocked_b64, "quic_recv:peer-z@127.0.0.1:7777"],
-        )
-        .unwrap();
-
-        let (mut rx, _guard): (tokio::sync::mpsc::UnboundedReceiver<Vec<EventId>>, _) =
-            dependency_fetch::register(&db_path, "tenant-a", "peer-z");
-        ProjectionBackend::record_block(&conn, "tenant-a", &blocked_b64, &[missing]).unwrap();
-        assert_eq!(rx.recv().await, Some(vec![missing]));
-    }
-
-    #[tokio::test]
-    async fn local_only_blocked_event_does_not_emit_dependency_fetch() {
-        let (_dir, db_path, conn) = setup_file_db();
-        let blocked = event_id(3);
-        let missing = event_id(4);
-        let blocked_b64 = event_id_to_base64(&blocked);
-        conn.execute(
-            "INSERT INTO recorded_events (peer_id, event_id, recorded_at, source)
-             VALUES (?1, ?2, 1, ?3)",
-            rusqlite::params!["tenant-a", &blocked_b64, "local_create"],
-        )
-        .unwrap();
-
-        let (mut rx, _guard): (tokio::sync::mpsc::UnboundedReceiver<Vec<EventId>>, _) =
-            dependency_fetch::register(&db_path, "tenant-a", "peer-z");
-        ProjectionBackend::record_block(&conn, "tenant-a", &blocked_b64, &[missing]).unwrap();
-        assert!(
-            tokio::time::timeout(std::time::Duration::from_millis(10), rx.recv())
-                .await
-                .is_err()
-        );
+        assert!(blocked_events_exists);
+        assert!(blocked_event_deps_exists);
     }
 }

@@ -216,6 +216,7 @@ pub(super) fn insert_event_raw(conn: &Connection, recorded_by: &str, blob: &[u8]
         ts as i64,
         &event_id,
         "",
+        &blob,
     )
     .unwrap();
     insert_recorded_event(conn, recorded_by, &event_id, ts as i64, "test").unwrap();

@@ -282,8 +282,8 @@ Sync keeps one long-lived request/response lane set per authenticated connection
 1. discovery remains round-scoped (`NegOpen` / `NegMsg` / `DiscoveryHints`),
 2. in tiered mode, outbound rounds cycle `last hour -> last day -> last week -> last month -> full`, then repeat; discovered events keep both a window-derived lane and `created_at_ms`,
 3. both sides send `DiscoveryHints` with real `encoded_size_bytes` so byte-credit accounting uses actual event sizes rather than a conservative floor,
-4. response credit and `RequestIds` requests are connection-scoped,
-5. the data stream carries only requested `Event` blobs,
+4. the data stream carries only `Event` blobs for the active range,
+5. auth/removal-frontier and key ranges are scheduled ahead of hot message ranges,
 6. there is no per-round `Done` / `DataDone` / `DoneAck` completion handshake in live sync.
 
 ## 4.3 Transport regression checklist
