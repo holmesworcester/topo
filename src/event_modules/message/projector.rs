@@ -52,11 +52,12 @@ pub fn project_pure(
 
     // Check for pre-existing deletion intents (delete-before-create convergence).
     // Multiple intents may exist (different deletion events targeting this message).
-    // Find the first one whose author matches the message author.
+    // Find the first one whose author matches the message author, or any admin
+    // wildcard intent.
     if let Some(intent) = ctx
         .deletion_intents
         .iter()
-        .find(|i| i.author_id == author_id_b64)
+        .find(|i| i.authorized_by_admin || i.author_id == author_id_b64)
     {
         // Message was already targeted for deletion before it arrived.
         // Record the tombstone immediately using the original deletion event ID
@@ -74,7 +75,7 @@ pub fn project_pure(
                 SqlVal::Text(recorded_by.to_string()),
                 SqlVal::Text(event_id_b64.to_string()),
                 SqlVal::Text(intent.deletion_event_id.clone()),
-                SqlVal::Text(intent.author_id.clone()),
+                SqlVal::Text(author_id_b64.clone()),
                 SqlVal::Int(intent.created_at),
             ],
         }];
@@ -86,8 +87,8 @@ pub fn project_pure(
             }],
         );
     }
-    // No matching-author intent found - materialize the message normally.
-    // Any wrong-author intents are stale and ignored.
+    // No matching-author/admin intent found - materialize the message normally.
+    // Any wrong-author peer intents are stale and ignored.
 
     let ops = vec![WriteOp::InsertOrIgnore {
         table: "messages",

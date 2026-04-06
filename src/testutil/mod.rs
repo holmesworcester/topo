@@ -1343,7 +1343,6 @@ impl Peer {
         let inner = ParsedEvent::MessageDeletion(MessageDeletionEvent {
             created_at_ms: current_timestamp_ms_u64(),
             target_event_id: *target_event_id,
-            author_id: self.author_id,
         });
         self.create_encrypted_signed_event_synchronous(&self.content_key_event_id(&db), &inner)
     }

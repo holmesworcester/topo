@@ -28,7 +28,7 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_RXN_HARD_PURGE | event_modules/reaction::project_pure | InvDeletedMessagePurgesLiveGraph | projector_local |
 | CHK_RXN_OWNER_MATCH | event_modules/reaction::project_pure | NON_MODELED::encrypted_owner_wrapper | projector_local |
 | CHK_RXN_INSERT | event_modules/reaction::project_pure | InvDeps | projector_local |
-| CHK_DEL_SIGNER_USER_MISMATCH | event_modules/message_deletion::project_pure | InvSigner | projector_local |
+| CHK_DEL_SIGNER_AUTH | event_modules/message_deletion::build_projector_context | InvSigner | projector_local |
 | CHK_DEL_OUTER_OWNER_ABSENT | event_modules/message_deletion::project_pure | NON_MODELED::encrypted_owner_wrapper | projector_local |
 | CHK_DEL_NON_MESSAGE | event_modules/message_deletion::project_pure | NON_MODELED::type_constraint | projector_local |
 | CHK_DEL_WRONG_AUTHOR | event_modules/message_deletion::project_pure | NON_MODELED::author_constraint | projector_local |

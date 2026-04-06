@@ -1720,7 +1720,7 @@ automatically detect and respond to such behavior.
 
 ### Phase 1: Wrong-author deletion intent cleanup
 - GC `deletion_intent` rows where the referenced deletion event was rejected
-- Prevents unbounded storage growth from wrong-author deletion spam
+- Prevents unbounded storage growth from wrong-author peer deletion spam
 
 ### Phase 2: Misbehavior flagging
 - When `MessageDeletion` projector detects author mismatch, record the

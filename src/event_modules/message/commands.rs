@@ -190,7 +190,6 @@ pub fn send(
 
 pub struct CreateMessageDeletionCmd {
     pub target_event_id: [u8; 32],
-    pub author_id: [u8; 32],
 }
 
 pub fn create_deletion(
@@ -204,7 +203,6 @@ pub fn create_deletion(
     let del = ParsedEvent::MessageDeletion(MessageDeletionEvent {
         created_at_ms,
         target_event_id: cmd.target_event_id,
-        author_id: cmd.author_id,
     });
     let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(db, recorded_by)?;
     let eid = create_encrypted_event_synchronous(
@@ -224,7 +222,6 @@ pub fn delete_message(
     signer_eid: &EventId,
     signing_key: &SigningKey,
     created_at_ms: u64,
-    author_id: [u8; 32],
     target_event_id: [u8; 32],
 ) -> Result<(String, String), String> {
     let event_id = create_deletion(
@@ -233,10 +230,7 @@ pub fn delete_message(
         signer_eid,
         signing_key,
         created_at_ms,
-        CreateMessageDeletionCmd {
-            target_event_id,
-            author_id,
-        },
+        CreateMessageDeletionCmd { target_event_id },
     )
     .map_err(|e| format!("{}", e))?;
 
@@ -309,7 +303,6 @@ pub fn delete_message_for_peer(
         &ctx.signer_event_id,
         &ctx.signing_key,
         current_timestamp_ms_u64(),
-        ctx.author_id,
         target_event_id,
     )
     .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.into() })?;

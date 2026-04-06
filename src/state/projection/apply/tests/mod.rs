@@ -609,17 +609,10 @@ pub(super) fn make_deletion_signed(
     signing_key: &SigningKey,
     signer_eid: &EventId,
     target: &EventId,
-    author_id: [u8; 32],
 ) -> (ParsedEvent, Vec<u8>) {
-    let resolved_author_id = if author_id == [2u8; 32] {
-        user_for_signer(signer_eid)
-    } else {
-        author_id
-    };
     let del = MessageDeletionEvent {
         created_at_ms: now_ms(),
         target_event_id: *target,
-        author_id: resolved_author_id,
     };
     let event = ParsedEvent::MessageDeletion(del);
     let blob = make_signed_encrypted_blob(signing_key, signer_eid, &event);

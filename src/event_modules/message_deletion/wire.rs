@@ -8,7 +8,6 @@ use super::super::{EventError, ParsedEvent, EVENT_TYPE_MESSAGE_DELETION};
 pub struct MessageDeletionEvent {
     pub created_at_ms: u64,
     pub target_event_id: [u8; 32], // message being deleted
-    pub author_id: [u8; 32],       // must match message author (enables cross-device deletion)
 }
 
 impl super::super::Describe for MessageDeletionEvent {
@@ -20,25 +19,21 @@ impl super::super::Describe for MessageDeletionEvent {
 pub const MESSAGE_DELETION_FIELDS: &[FieldSpec] = &[
     FieldSpec::Timestamp("created_at_ms"),
     FieldSpec::EventId("target_event_id"),
-    FieldSpec::EventId("author_id"),
 ];
 
-/// MessageDeletion (type 7): type(1) + created_at(8) + target_event_id(32) + author_id(32)
-///                          = 73
+/// MessageDeletion (type 7): type(1) + created_at(8) + target_event_id(32) = 41
 pub const MESSAGE_DELETION_WIRE_SIZE: usize = wire_size_for_fields(MESSAGE_DELETION_FIELDS);
 
-/// Wire format (170 bytes fixed, signed):
+/// Wire format (138 bytes fixed, signed):
 /// [0]      type_code = 7
 /// [1..9]   created_at_ms (u64 LE)
 /// [9..41]  target_event_id (32 bytes)
-/// [41..73] author_id (32 bytes)
 pub fn parse_message_deletion(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     let values = decode_fields(EVENT_TYPE_MESSAGE_DELETION, MESSAGE_DELETION_FIELDS, blob)?;
 
     Ok(ParsedEvent::MessageDeletion(MessageDeletionEvent {
         created_at_ms: values[0].as_timestamp().unwrap(),
         target_event_id: values[1].as_event_id().unwrap(),
-        author_id: values[2].as_event_id().unwrap(),
     }))
 }
 
@@ -51,7 +46,6 @@ pub fn encode_message_deletion(event: &ParsedEvent) -> Result<Vec<u8>, EventErro
     let values = vec![
         FieldValue::Timestamp(del.created_at_ms),
         FieldValue::EventId(del.target_event_id),
-        FieldValue::EventId(del.author_id),
     ];
 
     Ok(encode_fields(
@@ -66,8 +60,8 @@ pub static MESSAGE_DELETION_META: EventTypeMeta = crate::event_modules::registry
     type_name: "message_deletion",
     projection_table: "deleted_messages",
     share_scope: ShareScope::Shared,
-    // Two-stage deletion intent model: do not dep-block on target or author.
-    // The projector validates target/author from context and records intent first.
+    // Two-stage deletion intent model: do not dep-block on target.
+    // The projector validates target/signer from context and records intent first.
     dep_fields: &[],
     dep_field_type_codes: &[],
     signer_required: true,

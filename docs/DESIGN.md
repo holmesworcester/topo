@@ -531,7 +531,7 @@ As a placeholder, workspace, user, and device events carry a 64-byte cleartext n
 
 ### 2.3.2 Author dependency
 
-Content events (Message, Reaction, MessageDeletion) declare `author_id` as a dependency field pointing to User events (type 14). The dependency system blocks projection until the referenced User event exists, and the projector verifies that the signer's peer_shared `user_event_id` matches the claimed `author_id`. This enables direct `messages.author_id = users.event_id` JOINs for display name resolution.
+`Message` and `Reaction` declare `author_id` as a dependency field pointing to User events (type 14). The dependency system blocks projection until the referenced User event exists, and the projector verifies that the signer's peer_shared `user_event_id` matches the claimed `author_id`. `MessageDeletion` no longer carries an inner `author_id`; it derives delete authorization from the outer signer identity (`peer_shared` user or `admin`) plus the target message/tombstone author in projected state. This keeps display joins simple for live content while avoiding redundant delete-wire claims.
 
 ## 2.4 NAT traversal and hole punch
 
@@ -1002,8 +1002,10 @@ Deletion uses a two-stage model so deletes stay deterministic when events arrive
 
 **Stage 1: deletion_intent write.**
 The `MessageDeletion` projector always emits an idempotent `deletion_intent` write keyed
-by `(recorded_by, target_kind="message", target_id)`. This records the intent to delete
-regardless of whether the target message exists yet.
+by `(recorded_by, target_kind="message", target_id)`. For peer-signed deletes the intent
+stores the signer's derived user id; for admin-signed deletes it stores an explicit
+`authorized_by_admin` wildcard. This records the intent to delete regardless of whether the
+target message exists yet.
 
 **Stage 2: tombstone + hard purge.**
 - If the target message exists in projected state, the projector also emits tombstone
@@ -1014,8 +1016,8 @@ regardless of whether the target message exists yet.
 **Delete-before-create convergence:**
 Target-creation projectors (`project_message_pure`) check for matching `deletion_intent`
 rows in their context snapshot and immediately tombstone on first materialization. The
-tombstone row uses the original deletion event's ID and author from the intent, ensuring
-identical final state regardless of arrival order.
+tombstone row uses the original deletion event's ID and the arriving message's author,
+ensuring identical final state regardless of arrival order.
 
 **Monotonic deletion state:**
 - `active → tombstoned` is allowed.
@@ -2016,37 +2018,22 @@ Machine-checked proofs live in `verus-proofs/`. Run via `scripts/run_verus_proof
 
 ## 16. TODO: Automatic misbehavior detection and participant removal
 
-### 16.1 author_id redundancy and the signer→user derivation
+### 16.1 MessageDeletion signer-derived authorization
 
-`MessageDeletion.author_id` is inside the encrypted wrapper alongside `signed_by`.
-The `signer_user_mismatch_reason` check (queries.rs:173) resolves `signed_by` →
-`peers_shared.user_event_id` and rejects if it doesn't match `author_id`. This
-means:
+`MessageDeletion` now carries only `target_event_id` inside the encrypted payload.
+Authorization is derived from the outer signer identity:
 
-- **`author_id` is derivable from `signed_by`** via the peers_shared→user mapping.
-  It is redundant for authorization purposes — the signer identity outside the
-  ciphertext already determines who the author is.
-- **`author_id` exists for cross-device deletion**: multiple peer devices share the
-  same user identity. A deletion from device B for a message sent by device A is
-  valid because both devices map to the same user_event_id. The `author_id` field
-  makes this explicit in the wire format without requiring a DB lookup during
-  delete-before-create intent matching.
-- **The signer_user_mismatch check makes wrong-author deletion impossible for
-  authorization bypass**: a peer can only claim authorship of its own user. The
-  only "wrong-author" scenario is a peer targeting a message owned by a *different
-  user* — this is correctly rejected when the target message arrives, but the
-  deletion_intent row persists as a storage leak.
-
-**TODO**: Consider removing `author_id` from the wire format entirely and deriving
-it from `signed_by → peers_shared.user_event_id` at projection time. This would
-eliminate the redundancy and the storage leak (no intent recorded until the user
-mapping is verified). The trade-off is an extra DB lookup during intent matching.
+- a `peer_shared` signer resolves to `peers_shared.user_event_id` and may delete
+  messages authored by that same user, including cross-device deletes,
+- an `admin` signer may delete any message in the workspace,
+- delete-before-create uses the derived signer user id or an explicit admin wildcard
+  in `deletion_intents` rather than an inner `author_id` claim.
 
 ### 16.2 Deletion intent storage leak
 
 When a workspace member creates a `MessageDeletion` targeting a message they don't
-own, the `signer_user_mismatch` check passes (the peer IS who they claim to be),
-but the `deletion_intent.author_id` won't match the target message's author when it
+own, the signer-derived auth check succeeds for the peer itself, but the resulting
+`deletion_intent.author_id` still won't match the target message's author when it
 arrives. The intent row persists in `deletion_intents` indefinitely — it is never
 garbage-collected because no code path removes unmatched intents.
 

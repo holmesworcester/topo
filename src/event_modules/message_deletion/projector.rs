@@ -25,7 +25,7 @@ pub fn build_projector_context(
         event_id_b64,
         message_deletion,
     )?;
-    if let Some(reason) = &ctx.signer_user_mismatch_reason {
+    if let Some(reason) = &ctx.deletion_signer_reject_reason {
         return Ok(ContextLoadResult::reject(reason.clone()));
     }
     Ok(ContextLoadResult::ready(ctx))
@@ -56,7 +56,15 @@ pub fn project_pure(
     }
 
     let target_b64 = event_id_to_base64(&del.target_event_id);
-    let del_author_b64 = event_id_to_base64(&del.author_id);
+    let signer_user_b64 = ctx.deletion_signer_user_id.as_deref();
+    let is_admin = ctx.deletion_signer_is_admin;
+    let (intent_author_id, intent_authorized_by_admin) = if is_admin {
+        ("".to_string(), 1i64)
+    } else if let Some(user_id) = signer_user_b64 {
+        (user_id.to_string(), 0i64)
+    } else {
+        return ProjectorResult::reject("message_deletion signer authorization missing".to_string());
+    };
 
     // Type validation: reject if target is a known non-message event.
     if ctx.target_is_non_message {
@@ -65,9 +73,9 @@ pub fn project_pure(
 
     // Already tombstoned - verify author, return AlreadyProcessed
     if let Some(ref stored_author) = ctx.target_tombstone_author {
-        if stored_author != &del_author_b64 {
+        if !is_admin && Some(stored_author.as_str()) != signer_user_b64 {
             return ProjectorResult::reject(
-                "deletion author does not match message author".to_string(),
+                "deletion signer does not match message author".to_string(),
             );
         }
         // Deletion intent should still be recorded for idempotence,
@@ -80,6 +88,7 @@ pub fn project_pure(
                 "target_id",
                 "deletion_event_id",
                 "author_id",
+                "authorized_by_admin",
                 "created_at",
             ],
             values: vec![
@@ -87,7 +96,8 @@ pub fn project_pure(
                 SqlVal::Text("message".to_string()),
                 SqlVal::Text(target_b64.clone()),
                 SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Text(del_author_b64),
+                SqlVal::Text(intent_author_id),
+                SqlVal::Int(intent_authorized_by_admin),
                 SqlVal::Int(del.created_at_ms as i64),
             ],
         }];
@@ -108,6 +118,7 @@ pub fn project_pure(
             "target_id",
             "deletion_event_id",
             "author_id",
+            "authorized_by_admin",
             "created_at",
         ],
         values: vec![
@@ -115,16 +126,17 @@ pub fn project_pure(
             SqlVal::Text("message".to_string()),
             SqlVal::Text(target_b64.clone()),
             SqlVal::Text(event_id_b64.to_string()),
-            SqlVal::Text(del_author_b64.clone()),
+            SqlVal::Text(intent_author_id.clone()),
+            SqlVal::Int(intent_authorized_by_admin),
             SqlVal::Int(del.created_at_ms as i64),
         ],
     }];
 
     // Target exists - verify author, emit tombstone + cascade
     if let Some(ref msg_author) = ctx.target_message_author {
-        if msg_author != &del_author_b64 {
+        if !is_admin && Some(msg_author.as_str()) != signer_user_b64 {
             return ProjectorResult::reject(
-                "deletion author does not match message author".to_string(),
+                "deletion signer does not match message author".to_string(),
             );
         }
 
@@ -142,7 +154,7 @@ pub fn project_pure(
                 SqlVal::Text(recorded_by.to_string()),
                 SqlVal::Text(target_b64.clone()),
                 SqlVal::Text(event_id_b64.to_string()),
-                SqlVal::Text(del_author_b64),
+                SqlVal::Text(msg_author.clone()),
                 SqlVal::Int(del.created_at_ms as i64),
             ],
         });

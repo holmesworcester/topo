@@ -69,6 +69,7 @@ mod tests {
             deletion_intents: vec![DeletionIntentInfo {
                 deletion_event_id: "del_event_1".to_string(),
                 author_id: author_b64,
+                authorized_by_admin: false,
                 created_at: 2500,
             }],
             ..Default::default()
@@ -97,6 +98,7 @@ mod tests {
             deletion_intents: vec![DeletionIntentInfo {
                 deletion_event_id: "del_event_2".to_string(),
                 author_id: b64(&[99u8; 32]), // different author
+                authorized_by_admin: false,
                 created_at: 2500,
             }],
             ..Default::default()

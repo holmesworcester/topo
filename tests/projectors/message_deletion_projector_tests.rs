@@ -1,7 +1,7 @@
 //! Pure projector conformance tests for MessageDeletion (type 7).
 //!
 //! TLA+ guards tested:
-//!   SPEC_DEL_AUTHOR_01 — InvRemovalAdmin (author check: pass + break)
+//!   SPEC_DEL_SIGNER_01 — signer-derived deletion authorization
 //!   CHK_DEL_NON_MESSAGE — type constraint rejection
 //!   CHK_DEL_INTENT — intent always recorded
 //!   CHK_DEL_TOMBSTONE — tombstone + cascade when target exists
@@ -13,34 +13,33 @@ mod tests {
     use topo::event_modules::message_deletion::MessageDeletionEvent;
     use topo::event_modules::message_deletion::{build_projector_context, project_pure};
     use topo::event_modules::ParsedEvent;
-    use topo::projection::contract::EmitCommand;
+    use topo::projection::contract::{ContextSnapshot, EmitCommand};
     use topo::projection::queries::ProjectionFrameContext;
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "del_event_1";
 
-    fn make_deletion(target: [u8; 32], author: [u8; 32]) -> ParsedEvent {
+    fn make_deletion(target: [u8; 32]) -> ParsedEvent {
         ParsedEvent::MessageDeletion(MessageDeletionEvent {
             created_at_ms: 5000,
             target_event_id: target,
-            author_id: author,
         })
     }
 
-    // ── SPEC_DEL_AUTHOR_01: pass (matching author, target exists) ──
-
     #[test]
     fn test_deletion_valid() {
-        let author = [2u8; 32];
-        let author_b64 = b64(&author);
-        let parsed = make_deletion([1u8; 32], author);
-        let ctx = ctx_with_target_author(&author_b64);
+        let author_b64 = b64(&[2u8; 32]);
+        let parsed = make_deletion([1u8; 32]);
+        let ctx = ContextSnapshot {
+            target_message_author: Some(author_b64.clone()),
+            deletion_signer_user_id: Some(author_b64),
+            ..Default::default()
+        };
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
         assert_writes_to_table(&result, "deletion_intents");
         assert_writes_to_table(&result, "deleted_messages");
-        // Cascade: should also delete from messages and reactions
         assert!(
             result.write_ops.len() >= 3,
             "expected intent + tombstone + cascade ops"
@@ -53,24 +52,39 @@ mod tests {
         });
     }
 
-    // ── SPEC_DEL_AUTHOR_01: break (wrong author) ──
+    #[test]
+    fn test_deletion_valid_for_admin_signer() {
+        let parsed = make_deletion([1u8; 32]);
+        let ctx = ContextSnapshot {
+            target_message_author: Some(b64(&[9u8; 32])),
+            deletion_signer_is_admin: true,
+            ..Default::default()
+        };
+
+        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        assert_valid(&result);
+        assert_writes_to_table(&result, "deletion_intents");
+        assert_writes_to_table(&result, "deleted_messages");
+    }
 
     #[test]
     fn test_deletion_rejects_wrong_author() {
-        let author = [2u8; 32];
-        let parsed = make_deletion([1u8; 32], author);
-        let ctx = ctx_with_target_author(&b64(&[99u8; 32])); // different author
+        let parsed = make_deletion([1u8; 32]);
+        let ctx = ContextSnapshot {
+            target_message_author: Some(b64(&[99u8; 32])),
+            deletion_signer_user_id: Some(b64(&[2u8; 32])),
+            ..Default::default()
+        };
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_reject_contains(&result, "does not match message author");
     }
 
-    // ── CHK_DEL_NON_MESSAGE: break ──
-
     #[test]
     fn test_deletion_rejects_non_message_target() {
-        let parsed = make_deletion([1u8; 32], [2u8; 32]);
-        let ctx = topo::projection::contract::ContextSnapshot {
+        let parsed = make_deletion([1u8; 32]);
+        let ctx = ContextSnapshot {
+            deletion_signer_user_id: Some(b64(&[2u8; 32])),
             target_is_non_message: true,
             ..Default::default()
         };
@@ -79,12 +93,13 @@ mod tests {
         assert_reject_contains(&result, "non-message event");
     }
 
-    // ── CHK_DEL_INTENT: pass (target doesn't exist yet, only intent) ──
-
     #[test]
     fn test_deletion_intent_only_when_no_target() {
-        let parsed = make_deletion([1u8; 32], [2u8; 32]);
-        let ctx = empty_ctx(); // target not yet projected
+        let parsed = make_deletion([1u8; 32]);
+        let ctx = ContextSnapshot {
+            deletion_signer_user_id: Some(b64(&[2u8; 32])),
+            ..Default::default()
+        };
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
@@ -92,21 +107,18 @@ mod tests {
         assert_no_write_to_table(&result, "deleted_messages");
     }
 
-    // ── CHK_DEL_IDEMPOTENT: pass (already tombstoned, matching author) ──
-
     #[test]
     fn test_deletion_idempotent_when_tombstoned() {
-        let author = [2u8; 32];
-        let author_b64 = b64(&author);
-        let parsed = make_deletion([1u8; 32], author);
-        let ctx = topo::projection::contract::ContextSnapshot {
-            target_tombstone_author: Some(author_b64),
+        let author_b64 = b64(&[2u8; 32]);
+        let parsed = make_deletion([1u8; 32]);
+        let ctx = ContextSnapshot {
+            target_tombstone_author: Some(author_b64.clone()),
+            deletion_signer_user_id: Some(author_b64),
             ..Default::default()
         };
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
-        // Should still record intent
         assert_writes_to_table(&result, "deletion_intents");
         assert_emits_command(&result, "HardPurgeMessageGraph", |cmd| {
             matches!(
@@ -116,13 +128,12 @@ mod tests {
         });
     }
 
-    // ── CHK_DEL_IDEMPOTENT: break (tombstoned but wrong author) ──
-
     #[test]
     fn test_deletion_rejects_when_tombstoned_wrong_author() {
-        let parsed = make_deletion([1u8; 32], [2u8; 32]);
-        let ctx = topo::projection::contract::ContextSnapshot {
+        let parsed = make_deletion([1u8; 32]);
+        let ctx = ContextSnapshot {
             target_tombstone_author: Some(b64(&[99u8; 32])),
+            deletion_signer_user_id: Some(b64(&[2u8; 32])),
             ..Default::default()
         };
 
@@ -130,14 +141,15 @@ mod tests {
         assert_reject_contains(&result, "does not match message author");
     }
 
-    // ── CHK_DEL_SIGNER_USER_MISMATCH: break ──
-
     #[test]
-    fn test_deletion_rejects_signer_user_mismatch() {
-        let parsed = make_deletion([1u8; 32], [2u8; 32]);
-        let queries = queries_with_ctx(ctx_with_signer_mismatch(
-            "signer peer not linked to author user",
-        ));
+    fn test_deletion_rejects_invalid_signer_auth() {
+        let parsed = make_deletion([1u8; 32]);
+        let queries = queries_with_ctx(ContextSnapshot {
+            deletion_signer_reject_reason: Some(
+                "message_deletion signer must be peer_shared or admin".to_string(),
+            ),
+            ..Default::default()
+        });
 
         let result = build_projector_context(
             &queries,
@@ -147,13 +159,14 @@ mod tests {
             &parsed,
         )
         .unwrap();
-        assert_context_reject_contains(&result, "signer peer not linked to author user");
+        assert_context_reject_contains(&result, "peer_shared or admin");
     }
 
     #[test]
     fn test_deletion_rejects_outer_owner_event_id() {
-        let parsed = make_deletion([1u8; 32], [2u8; 32]);
-        let ctx = topo::projection::contract::ContextSnapshot {
+        let parsed = make_deletion([1u8; 32]);
+        let ctx = ContextSnapshot {
+            deletion_signer_user_id: Some(b64(&[2u8; 32])),
             current_owner_event_id: Some(b64(&[9u8; 32])),
             ..Default::default()
         };

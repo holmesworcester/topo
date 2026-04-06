@@ -951,6 +951,69 @@ fn signer_user_mismatch_reason_behavior(
     None
 }
 
+fn deletion_signer_context_behavior(
+    state: &NodeBehaviorData,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+) -> (Option<String>, bool, Option<String>) {
+    let Some(current_signer) = frame.current_signer.as_ref() else {
+        return (
+            None,
+            false,
+            Some("missing current signer envelope".to_string()),
+        );
+    };
+
+    match current_signer.semantic_type_code {
+        events::EVENT_TYPE_ADMIN => (None, true, None),
+        events::EVENT_TYPE_PEER_SHARED => {
+            let signed_by_b64 = current_signer.event_id.clone();
+            let Some(peer_row) = first_row_for_recorded(
+                state,
+                "peers_shared",
+                recorded_by,
+                "event_id",
+                &signed_by_b64,
+            ) else {
+                return (
+                    None,
+                    false,
+                    Some(format!("no peers_shared entry for signer {}", signed_by_b64)),
+                );
+            };
+            let Some(peer_user_eid) = row_text(peer_row, "user_event_id") else {
+                return (
+                    None,
+                    false,
+                    Some(format!(
+                        "peers_shared entry for signer {} has no user_event_id (legacy row)",
+                        signed_by_b64
+                    )),
+                );
+            };
+            if peer_user_eid.is_empty() {
+                return (
+                    None,
+                    false,
+                    Some(format!(
+                        "peers_shared entry for signer {} has no user_event_id (legacy row)",
+                        signed_by_b64
+                    )),
+                );
+            }
+            (Some(peer_user_eid.to_string()), false, None)
+        }
+        other => (
+            None,
+            false,
+            Some(format!(
+                "message_deletion signer must be peer_shared or admin, got semantic type {}",
+                other
+            )),
+        ),
+    }
+}
+
 fn tombstone_satisfies_message_dep_behavior(
     state: &NodeBehaviorData,
     recorded_by: &str,
@@ -1404,6 +1467,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
                 Some(DeletionIntentInfo {
                     deletion_event_id: row_text(row, "deletion_event_id")?.to_string(),
                     author_id: row_text(row, "author_id")?.to_string(),
+                    authorized_by_admin: row_int(row, "authorized_by_admin").unwrap_or(0) != 0,
                     created_at: row_int(row, "created_at")?,
                 })
             })
@@ -1426,12 +1490,11 @@ impl ProjectionQueries for NodeBehaviorEngine {
     ) -> ProjectionQueryResult<ContextSnapshot> {
         let state = self.state.borrow();
         let mut ctx = ContextSnapshot::default();
-        ctx.signer_user_mismatch_reason = signer_user_mismatch_reason_behavior(
-            &state,
-            frame,
-            recorded_by,
-            &message_deletion.author_id,
-        );
+        let (deletion_signer_user_id, deletion_signer_is_admin, deletion_signer_reject_reason) =
+            deletion_signer_context_behavior(&state, frame, recorded_by);
+        ctx.deletion_signer_user_id = deletion_signer_user_id;
+        ctx.deletion_signer_is_admin = deletion_signer_is_admin;
+        ctx.deletion_signer_reject_reason = deletion_signer_reject_reason;
 
         let target_b64 = event_id_to_base64(&message_deletion.target_event_id);
         ctx.target_tombstone_author = first_row_for_recorded(

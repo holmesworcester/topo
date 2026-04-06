@@ -1409,13 +1409,15 @@ fn test_post_tombstone_wrong_author_deletion_rejects() {
     project_one(&conn, recorded_by, &msg_eid).unwrap();
 
     // Delete with correct author → Valid
-    let (_del1, del1_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del1, del1_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del1_eid = insert_event_raw(&conn, recorded_by, &del1_blob);
     let r1 = project_one(&conn, recorded_by, &del1_eid).unwrap();
     assert_eq!(r1, ProjectionDecision::Valid);
 
-    // Second deletion with wrong author_id = [99u8; 32] — also signed
-    let (_del2, del2_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [99u8; 32]);
+    // Second deletion from a different peer_shared signer
+    let (wrong_signer_eid, wrong_signing_key) = make_identity_chain(&conn, recorded_by);
+    let (_del2, del2_blob) =
+        make_deletion_signed(&wrong_signing_key, &wrong_signer_eid, &msg_eid);
     let del2_eid = insert_event_raw(&conn, recorded_by, &del2_blob);
     let r2 = project_one(&conn, recorded_by, &del2_eid).unwrap();
 
@@ -1444,6 +1446,78 @@ fn test_post_tombstone_wrong_author_deletion_rejects() {
         )
         .unwrap();
     assert_eq!(rej_count, 1);
+}
+
+#[test]
+fn test_admin_signer_can_delete_other_users_message() {
+    let conn = setup();
+    let recorded_by = "peer1";
+
+    let (workspace_eid, workspace_key) = setup_workspace_anchor(&conn, recorded_by);
+    let (invite_eid, invite_key) =
+        create_bootstrap_user_invite(&conn, recorded_by, workspace_eid, &workspace_key);
+    let (admin_user_eid, admin_user_key) =
+        project_valid_user_from_invite(&conn, recorded_by, invite_eid, &invite_key, "admin-user");
+    let admin_eid = project_valid_admin_for_user(
+        &conn,
+        recorded_by,
+        workspace_eid,
+        &workspace_key,
+        admin_user_eid,
+        admin_user_key.verifying_key().to_bytes(),
+    );
+
+    let (msg_signer_eid, msg_signing_key) = make_identity_chain(&conn, recorded_by);
+    let (_msg, msg_blob) = make_message_signed(&msg_signing_key, &msg_signer_eid, "admin delete");
+    let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
+    assert_eq!(
+        project_one(&conn, recorded_by, &msg_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let del_event = ParsedEvent::MessageDeletion(crate::event_modules::MessageDeletionEvent {
+        created_at_ms: now_ms(),
+        target_event_id: msg_eid,
+    });
+    let del_blob = make_signed_encrypted_blob(&admin_user_key, &admin_eid, &del_event);
+    let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
+    assert_eq!(
+        project_one(&conn, recorded_by, &del_eid).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let msg_b64 = event_id_to_base64(&msg_eid);
+    let msg_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(msg_count, 0, "admin delete should purge live message row");
+
+    let tombstone_author: String = conn
+        .query_row(
+            "SELECT author_id FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(
+        tombstone_author,
+        event_id_to_base64(&user_for_signer(&msg_signer_eid)),
+        "tombstone should retain the original message author"
+    );
+
+    let admin_intent_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM deletion_intents
+             WHERE recorded_by = ?1 AND target_id = ?2 AND authorized_by_admin = 1",
+            rusqlite::params![recorded_by, &msg_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
+    assert_eq!(admin_intent_count, 1, "admin delete should record wildcard intent");
 }
 
 #[test]

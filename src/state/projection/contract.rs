@@ -122,6 +122,7 @@ impl ProjectorResult {
 pub struct DeletionIntentInfo {
     pub deletion_event_id: String,
     pub author_id: String,
+    pub authorized_by_admin: bool,
     pub created_at: i64,
 }
 
@@ -179,6 +180,12 @@ pub struct ContextSnapshot {
     pub target_message_author: Option<String>,
     /// For MessageDeletion: the author_id from an existing tombstone (if any).
     pub target_tombstone_author: Option<String>,
+    /// For MessageDeletion: resolved user identity for a peer_shared signer.
+    pub deletion_signer_user_id: Option<String>,
+    /// For MessageDeletion: whether the current signer is an admin event.
+    pub deletion_signer_is_admin: bool,
+    /// For MessageDeletion: signer-family or signer-resolution failure.
+    pub deletion_signer_reject_reason: Option<String>,
     /// For MessageDeletion: true if the target event_id is in valid_events but is NOT
     /// a message (no row in messages or deleted_messages). This means the deletion
     /// references a non-message event and should be rejected.
@@ -187,7 +194,7 @@ pub struct ContextSnapshot {
     /// For Message: pre-existing deletion intents for this message_id.
     /// Multiple intents may exist (one per deletion event targeting this message).
     /// Used for delete-before-create convergence — the message projector finds the
-    /// first intent whose author matches the message author.
+    /// first intent whose author matches the message author, or an admin-auth intent.
     pub deletion_intents: Vec<DeletionIntentInfo>,
 
     /// For Reaction: whether the target message has been tombstoned

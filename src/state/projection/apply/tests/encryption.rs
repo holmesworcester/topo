@@ -171,7 +171,7 @@ fn test_encrypted_deleted_owner_fast_purges_without_key_resolution() {
         ProjectionDecision::Valid
     );
 
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
     assert_eq!(
         project_one(&conn, recorded_by, &del_eid).unwrap(),
@@ -636,16 +636,10 @@ fn raw_reaction_event(signer_eid: &EventId, target: &EventId, emoji: &str) -> Pa
     })
 }
 
-fn raw_deletion_event(signer_eid: &EventId, target: &EventId, author_id: [u8; 32]) -> ParsedEvent {
-    let resolved_author_id = if author_id == [2u8; 32] {
-        user_for_signer(signer_eid)
-    } else {
-        author_id
-    };
+fn raw_deletion_event(_signer_eid: &EventId, target: &EventId) -> ParsedEvent {
     ParsedEvent::MessageDeletion(MessageDeletionEvent {
         created_at_ms: now_ms(),
         target_event_id: *target,
-        author_id: resolved_author_id,
     })
 }
 
@@ -814,7 +808,7 @@ fn test_encrypted_parity_deletion_valid() {
     project_one(&conn, recorded_by, &msg_eid).unwrap();
 
     // Create deletion event (author_id = [2;32] matches message author)
-    let del = raw_deletion_event(&signer_eid, &msg_eid, [2u8; 32]);
+    let del = raw_deletion_event(&signer_eid, &msg_eid);
     let enc_blob =
         make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &del, &key_bytes, &sk_eid);
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
@@ -865,7 +859,7 @@ fn test_encrypted_parity_deletion_intent_only() {
 
     // Create deletion targeting a non-existent message
     let fake_target = [77u8; 32];
-    let del = raw_deletion_event(&signer_eid, &fake_target, [2u8; 32]);
+    let del = raw_deletion_event(&signer_eid, &fake_target);
     let enc_blob =
         make_signed_encrypted_blob_with_key(&signing_key, &signer_eid, &del, &key_bytes, &sk_eid);
     let enc_eid = insert_event_raw(&conn, recorded_by, &enc_blob);
