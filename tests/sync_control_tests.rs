@@ -18,10 +18,6 @@ fn temp_db_path() -> (tempfile::TempDir, String) {
     (dir, path)
 }
 
-// -----------------------------------------------------------------------
-// SC1: Policy storage
-// -----------------------------------------------------------------------
-
 #[test]
 fn default_policy_is_all_auto() {
     let (_dir, path) = temp_db_path();
@@ -30,7 +26,6 @@ fn default_policy_is_all_auto() {
     assert_eq!(policy, TenantSyncPolicy::default());
     assert_eq!(policy.requests, SyncPolicyMode::Auto);
     assert_eq!(policy.responses, SyncPolicyMode::Auto);
-    assert_eq!(policy.forward_on_have, SyncPolicyMode::Auto);
 }
 
 #[test]
@@ -40,7 +35,6 @@ fn save_and_load_roundtrip() {
     let policy = TenantSyncPolicy {
         requests: SyncPolicyMode::Manual,
         responses: SyncPolicyMode::Disabled,
-        forward_on_have: SyncPolicyMode::Auto,
     };
     sync_control::save_policy(&conn, "tenant_a", &policy).unwrap();
     let loaded = sync_control::load_policy(&conn, "tenant_a").unwrap();
@@ -51,20 +45,12 @@ fn save_and_load_roundtrip() {
 fn update_policy_merges_fields() {
     let (_dir, path) = temp_db_path();
     let conn = open_connection(&path).unwrap();
-    sync_control::update_policy(&conn, "tenant_b", Some(SyncPolicyMode::Manual), None, None)
-        .unwrap();
+    sync_control::update_policy(&conn, "tenant_b", Some(SyncPolicyMode::Manual), None).unwrap();
     let p1 = sync_control::load_policy(&conn, "tenant_b").unwrap();
     assert_eq!(p1.requests, SyncPolicyMode::Manual);
     assert_eq!(p1.responses, SyncPolicyMode::Auto);
 
-    sync_control::update_policy(
-        &conn,
-        "tenant_b",
-        None,
-        Some(SyncPolicyMode::Disabled),
-        None,
-    )
-    .unwrap();
+    sync_control::update_policy(&conn, "tenant_b", None, Some(SyncPolicyMode::Disabled)).unwrap();
     let p2 = sync_control::load_policy(&conn, "tenant_b").unwrap();
     assert_eq!(p2.requests, SyncPolicyMode::Manual);
     assert_eq!(p2.responses, SyncPolicyMode::Disabled);
@@ -74,16 +60,8 @@ fn update_policy_merges_fields() {
 fn update_policy_is_tenant_scoped() {
     let (_dir, path) = temp_db_path();
     let conn = open_connection(&path).unwrap();
-    sync_control::update_policy(
-        &conn,
-        "tenant_x",
-        Some(SyncPolicyMode::Disabled),
-        None,
-        None,
-    )
-    .unwrap();
-    sync_control::update_policy(&conn, "tenant_y", None, Some(SyncPolicyMode::Manual), None)
-        .unwrap();
+    sync_control::update_policy(&conn, "tenant_x", Some(SyncPolicyMode::Disabled), None).unwrap();
+    sync_control::update_policy(&conn, "tenant_y", None, Some(SyncPolicyMode::Manual)).unwrap();
 
     let x = sync_control::load_policy(&conn, "tenant_x").unwrap();
     assert_eq!(x.requests, SyncPolicyMode::Disabled);
@@ -99,16 +77,11 @@ fn serde_roundtrip() {
     let policy = TenantSyncPolicy {
         requests: SyncPolicyMode::Manual,
         responses: SyncPolicyMode::Disabled,
-        forward_on_have: SyncPolicyMode::Auto,
     };
     let json = serde_json::to_string(&policy).unwrap();
     let parsed: TenantSyncPolicy = serde_json::from_str(&json).unwrap();
     assert_eq!(policy, parsed);
 }
-
-// -----------------------------------------------------------------------
-// SC4: Registry behavior
-// -----------------------------------------------------------------------
 
 #[test]
 fn registry_policy_load_returns_default() {
@@ -126,13 +99,11 @@ fn registry_update_policy_roundtrip() {
         .update_policy(
             "tenant_a",
             Some(SyncPolicyMode::Manual),
-            None,
             Some(SyncPolicyMode::Disabled),
         )
         .unwrap();
     assert_eq!(p.requests, SyncPolicyMode::Manual);
-    assert_eq!(p.responses, SyncPolicyMode::Auto);
-    assert_eq!(p.forward_on_have, SyncPolicyMode::Disabled);
+    assert_eq!(p.responses, SyncPolicyMode::Disabled);
 
     let loaded = registry.load_policy("tenant_a").unwrap();
     assert_eq!(loaded, p);
@@ -145,7 +116,6 @@ async fn registry_session_receives_command() {
 
     let mut session = registry.register_session("tenant1", "abcd1234peer", SessionRole::Initiator);
 
-    // Spawn a thread to simulate session loop receiving the command
     let handle = std::thread::spawn(move || {
         let rt = tokio::runtime::Runtime::new().unwrap();
         rt.block_on(async {
@@ -182,12 +152,10 @@ async fn registry_session_deregisters_on_drop() {
 
     {
         let _session = registry.register_session("tenant1", "abcd1234peer", SessionRole::Initiator);
-        // While session is alive, wrong prefix should fail
         let result = registry.trigger_round_for_peer("tenant1", "zzzz");
         assert!(result.is_err());
         assert!(result.unwrap_err().contains("no live session"));
     }
-    // After drop, correct prefix should also fail (session was deregistered)
     let result = registry.trigger_round_for_peer("tenant1", "abcd");
     assert!(result.is_err());
     assert!(result.unwrap_err().contains("no live session"));

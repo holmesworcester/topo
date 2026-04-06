@@ -6,8 +6,7 @@ Sync Controls CLI Session Captures
     $ topo sync policy show
     {
       "requests": "auto",
-      "responses": "auto",
-      "forward_on_have": "auto"
+      "responses": "auto"
     }
 
 2. Set requests to manual
@@ -15,26 +14,23 @@ Sync Controls CLI Session Captures
     $ topo sync policy set --requests manual
     {
       "requests": "manual",
-      "responses": "auto",
-      "forward_on_have": "auto"
+      "responses": "auto"
     }
 
-3. Set all lanes to disabled
+3. Set both lanes to disabled
 
-    $ topo sync policy set --requests disabled --responses disabled --forward-on-have disabled
+    $ topo sync policy set --requests disabled --responses disabled
     {
       "requests": "disabled",
-      "responses": "disabled",
-      "forward_on_have": "disabled"
+      "responses": "disabled"
     }
 
-4. Restore all lanes to auto
+4. Restore both lanes to auto
 
-    $ topo sync policy set --requests auto --responses auto --forward-on-have auto
+    $ topo sync policy set --requests auto --responses auto
     {
       "requests": "auto",
-      "responses": "auto",
-      "forward_on_have": "auto"
+      "responses": "auto"
     }
 
 5. Trigger round for specific peer

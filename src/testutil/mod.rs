@@ -397,7 +397,6 @@ fn has_projected_peer_transport_now(
 /// target prelearning is no longer the right abstraction, so this helper
 /// directly fans out the shared identity events across the benchmark graph.
 pub async fn converge_workspace_transport_graph(peers: &[Peer]) {
-    crate::state::live_hints::init_forward_on_have_from_env();
     if peers.len() < 2 {
         return;
     }
@@ -440,7 +439,6 @@ pub async fn converge_workspace_transport_graph(peers: &[Peer]) {
 /// [`converge_workspace_transport_graph`] already fans out the shared identity
 /// graph, so sink-download callers only need topology shape validation here.
 pub async fn converge_sink_download_transport(sources: &[Peer], sink: &Peer) {
-    crate::state::live_hints::init_forward_on_have_from_env();
     if sources.is_empty() {
         return;
     }
@@ -3008,7 +3006,6 @@ pub fn start_peers_runtime_affine(
     peer_a: &Peer,
     peer_b: &Peer,
 ) -> (std::thread::JoinHandle<()>, std::thread::JoinHandle<()>) {
-    crate::state::live_hints::init_forward_on_have_from_env();
     let (daemon_peer_id_a, _, _) = daemon_identity_for_peer(peer_a);
     let a_db = peer_a.db_path.clone();
     let a_identity = peer_a.identity.clone();
@@ -3190,8 +3187,6 @@ impl Drop for ChainHandles {
 /// - P_i runs accept_loop (server) for P_{i+1}
 /// - P_{i+1} runs connect_loop (client) to P_i
 pub fn start_chain(peers: &[Peer]) -> ChainHandles {
-    crate::state::live_hints::init_forward_on_have_from_env();
-
     let n = peers.len();
     assert!(n >= 2, "chain requires at least 2 peers");
     for peer in peers.iter().skip(1) {
@@ -3296,7 +3291,6 @@ impl Drop for SinkDownloadHandles {
 /// Like [`start_sink_download`] but returns [`SinkDownloadHandles`] with
 /// per-source shutdown control for simulating peer dropout.
 pub fn start_sink_download_with_shutdown(sources: &[Peer], sink: &Peer) -> SinkDownloadHandles {
-    crate::state::live_hints::init_forward_on_have_from_env();
     assert!(!sources.is_empty(), "need at least one source");
     for source in sources {
         assert_eq!(

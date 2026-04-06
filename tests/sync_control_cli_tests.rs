@@ -56,15 +56,10 @@ fn test_sync_policy_show_default() {
         "expected 'responses:' field:\n{}",
         stdout
     );
-    assert!(
-        stdout.contains("forward_on_have:"),
-        "expected 'forward_on_have:' field:\n{}",
-        stdout
-    );
     let auto_count = stdout.matches("auto").count();
     assert!(
-        auto_count >= 3,
-        "all three fields should default to 'auto' (found {}):\n{}",
+        auto_count >= 2,
+        "both fields should default to 'auto' (found {}):\n{}",
         auto_count,
         stdout
     );
@@ -109,8 +104,8 @@ fn test_sync_policy_set_requests_manual() {
     // Unset fields should still be auto
     let auto_count = set_stdout.matches("auto").count();
     assert!(
-        auto_count >= 2,
-        "unset fields should remain 'auto' (found {}):\n{}",
+        auto_count >= 1,
+        "unset field should remain 'auto' (found {}):\n{}",
         auto_count,
         set_stdout
     );
@@ -127,7 +122,7 @@ fn test_sync_policy_set_requests_manual() {
 }
 
 // ---------------------------------------------------------------------------
-// SC1: Policy set — all three to disabled, then restore
+// SC1: Policy set — both fields to disabled, then restore
 // ---------------------------------------------------------------------------
 
 #[test]
@@ -149,16 +144,14 @@ fn test_sync_policy_set_all_disabled_then_restore() {
             "disabled",
             "--responses",
             "disabled",
-            "--forward-on-have",
-            "disabled",
         ],
     );
     assert!(set.status.success());
     let stdout = String::from_utf8_lossy(&set.stdout);
     let disabled_count = stdout.matches("disabled").count();
     assert!(
-        disabled_count >= 3,
-        "all three fields should show 'disabled' (found {}):\n{}",
+        disabled_count >= 2,
+        "both fields should show 'disabled' (found {}):\n{}",
         disabled_count,
         stdout
     );
@@ -174,16 +167,14 @@ fn test_sync_policy_set_all_disabled_then_restore() {
             "auto",
             "--responses",
             "auto",
-            "--forward-on-have",
-            "auto",
         ],
     );
     assert!(restore.status.success());
     let restore_stdout = String::from_utf8_lossy(&restore.stdout);
     let auto_count = restore_stdout.matches("auto").count();
     assert!(
-        auto_count >= 3,
-        "restored should show 3x 'auto' (found {}):\n{}",
+        auto_count >= 2,
+        "restored should show 2x 'auto' (found {}):\n{}",
         auto_count,
         restore_stdout
     );

@@ -123,11 +123,6 @@ pub enum RpcMethod {
     },
     /// List all known peers with local/remote status and endpoint info.
     Peers,
-    /// Enable, disable, or inspect forward-on-have live hint delivery.
-    Forward {
-        #[serde(default = "default_forward_action")]
-        action: ForwardAction,
-    },
     /// Combined view: sidebar (workspace, users, tenants) + messages with inline reactions.
     View {
         #[serde(default = "default_view_limit")]
@@ -197,8 +192,6 @@ pub enum RpcMethod {
         requests: Option<String>,
         #[serde(default)]
         responses: Option<String>,
-        #[serde(default)]
-        forward_on_have: Option<String>,
     },
     /// Trigger a negentropy round for a specific peer.
     SyncRoundPeer {
@@ -229,18 +222,6 @@ pub enum RpcMethod {
         #[serde(default = "default_discover_timeout_ms")]
         timeout_ms: u64,
     },
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ForwardAction {
-    Enable,
-    Disable,
-    Status,
-}
-
-fn default_forward_action() -> ForwardAction {
-    ForwardAction::Status
 }
 
 #[cfg(feature = "discovery")]

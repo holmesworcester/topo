@@ -9,26 +9,23 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         "CREATE TABLE IF NOT EXISTS sync_control_policies (
             tenant_id TEXT PRIMARY KEY,
             requests TEXT NOT NULL DEFAULT 'auto',
-            responses TEXT NOT NULL DEFAULT 'auto',
-            forward_on_have TEXT NOT NULL DEFAULT 'auto'
+            responses TEXT NOT NULL DEFAULT 'auto'
         );",
     )
 }
 
 pub fn load_policy(conn: &Connection, tenant_id: &str) -> SqliteResult<TenantSyncPolicy> {
     let mut stmt = conn.prepare_cached(
-        "SELECT requests, responses, forward_on_have
+        "SELECT requests, responses
          FROM sync_control_policies
          WHERE tenant_id = ?1",
     )?;
     let result = stmt.query_row([tenant_id], |row| {
         let requests: String = row.get(0)?;
         let responses: String = row.get(1)?;
-        let forward_on_have: String = row.get(2)?;
         Ok(TenantSyncPolicy {
             requests: requests.parse().unwrap_or(SyncPolicyMode::Auto),
             responses: responses.parse().unwrap_or(SyncPolicyMode::Auto),
-            forward_on_have: forward_on_have.parse().unwrap_or(SyncPolicyMode::Auto),
         })
     });
     match result {
@@ -44,17 +41,15 @@ pub fn save_policy(
     policy: &TenantSyncPolicy,
 ) -> SqliteResult<TenantSyncPolicy> {
     conn.execute(
-        "INSERT INTO sync_control_policies (tenant_id, requests, responses, forward_on_have)
-         VALUES (?1, ?2, ?3, ?4)
+        "INSERT INTO sync_control_policies (tenant_id, requests, responses)
+         VALUES (?1, ?2, ?3)
          ON CONFLICT(tenant_id) DO UPDATE SET
              requests = excluded.requests,
-             responses = excluded.responses,
-             forward_on_have = excluded.forward_on_have",
+             responses = excluded.responses",
         rusqlite::params![
             tenant_id,
             policy.requests.as_str(),
             policy.responses.as_str(),
-            policy.forward_on_have.as_str(),
         ],
     )?;
     Ok(*policy)
@@ -65,7 +60,6 @@ pub fn update_policy(
     tenant_id: &str,
     requests: Option<SyncPolicyMode>,
     responses: Option<SyncPolicyMode>,
-    forward_on_have: Option<SyncPolicyMode>,
 ) -> SqliteResult<TenantSyncPolicy> {
     let mut policy = load_policy(conn, tenant_id)?;
     if let Some(r) = requests {
@@ -73,9 +67,6 @@ pub fn update_policy(
     }
     if let Some(r) = responses {
         policy.responses = r;
-    }
-    if let Some(f) = forward_on_have {
-        policy.forward_on_have = f;
     }
     save_policy(conn, tenant_id, &policy)
 }
@@ -97,7 +88,6 @@ mod tests {
         assert_eq!(policy, TenantSyncPolicy::default());
         assert_eq!(policy.requests, SyncPolicyMode::Auto);
         assert_eq!(policy.responses, SyncPolicyMode::Auto);
-        assert_eq!(policy.forward_on_have, SyncPolicyMode::Auto);
     }
 
     #[test]
@@ -106,7 +96,6 @@ mod tests {
         let policy = TenantSyncPolicy {
             requests: SyncPolicyMode::Manual,
             responses: SyncPolicyMode::Disabled,
-            forward_on_have: SyncPolicyMode::Auto,
         };
         save_policy(&conn, "tenant_b", &policy).unwrap();
         let loaded = load_policy(&conn, "tenant_b").unwrap();
@@ -116,17 +105,8 @@ mod tests {
     #[test]
     fn update_policy_is_tenant_scoped() {
         let conn = setup();
-        // Set tenant_x to manual requests
-        update_policy(&conn, "tenant_x", Some(SyncPolicyMode::Manual), None, None).unwrap();
-        // Set tenant_y to disabled responses
-        update_policy(
-            &conn,
-            "tenant_y",
-            None,
-            Some(SyncPolicyMode::Disabled),
-            None,
-        )
-        .unwrap();
+        update_policy(&conn, "tenant_x", Some(SyncPolicyMode::Manual), None).unwrap();
+        update_policy(&conn, "tenant_y", None, Some(SyncPolicyMode::Disabled)).unwrap();
 
         let x = load_policy(&conn, "tenant_x").unwrap();
         assert_eq!(x.requests, SyncPolicyMode::Manual);

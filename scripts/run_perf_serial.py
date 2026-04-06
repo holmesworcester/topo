@@ -467,7 +467,7 @@ class PerfRunner:
             ],
         )
         self.run_delivery_latency_test(
-            "Delivery Latency Gate (2 msg/s, 15s, forward-on-have)",
+            "Delivery Latency Gate (2 msg/s, 15s)",
             "perf_two_peer_delivery_latency_gate",
             extra_env={
                 "TOPO_PERF_PRELOAD_MESSAGES": "0",
@@ -478,23 +478,7 @@ class PerfRunner:
             summary_file="two-peer-gate-pre0-m2-s15-w6.summary",
         )
         self.run_delivery_latency_test(
-            "Delivery Latency: forward-on-have only (2 msg/s, 15s)",
-            "perf_delivery_forward_only",
-            summary_file="two-peer-forward-pre0-m2-s15-w6.summary",
-        )
-        self.run_delivery_latency_test(
-            "Delivery Latency: negentropy only, 5s rounds (2 msg/s, 15s)",
-            "perf_delivery_negentropy_only",
-            extra_env={"TOPO_FORWARD_ON_HAVE": "0"},
-            summary_file="two-peer-negentropy-pre0-m2-s15-w6.summary",
-        )
-        self.run_delivery_latency_test(
-            "Delivery Latency: both, production mode (2 msg/s, 15s)",
-            "perf_delivery_both",
-            summary_file="two-peer-both-pre0-m2-s15-w6.summary",
-        )
-        self.run_delivery_latency_test(
-            "Delivery Latency (10 msg/s, 20s, forward-on-have)",
+            "Delivery Latency (10 msg/s, 20s)",
             "perf_two_peer_delivery_latency_over_time",
             extra_env={
                 "TOPO_PERF_PRELOAD_MESSAGES": "0",
@@ -631,7 +615,6 @@ class PerfRunner:
             "--test-threads=1",
         ]
         env = extra_env or {}
-        env.setdefault("TOPO_FORWARD_ON_HAVE", "1")
         env.setdefault("TOPO_PERF_STAGE_BREAKDOWN", "1")
         summary_path = (
             self.repo_root / f"target/perf-results/{summary_file}"

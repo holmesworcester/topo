@@ -337,12 +337,6 @@ pub(crate) enum Commands {
         action: RpcAction,
     },
 
-    /// Enable, disable, or query forward-on-have live hint delivery.
-    Forward {
-        #[command(subcommand)]
-        action: Option<ForwardCommand>,
-    },
-
     /// List recent/active peer connections
     Connections {
         /// Output as JSON
@@ -409,16 +403,6 @@ pub(crate) enum RpcAction {
 }
 
 #[derive(Subcommand)]
-pub(crate) enum ForwardCommand {
-    /// Enable forward-on-have live hint delivery.
-    Enable,
-    /// Disable forward-on-have live hint delivery.
-    Disable,
-    /// Show the current forward-on-have status.
-    Status,
-}
-
-#[derive(Subcommand)]
 pub(crate) enum SyncAction {
     /// Manage sync policy (show or set)
     Policy {
@@ -460,9 +444,6 @@ pub(crate) enum SyncPolicyAction {
         /// Responses lane mode (auto, manual, disabled)
         #[arg(long)]
         responses: Option<String>,
-        /// Forward-on-have lane mode (auto, manual, disabled)
-        #[arg(long)]
-        forward_on_have: Option<String>,
     },
 }
 

@@ -65,7 +65,6 @@ fn env_bool(name: &str) -> bool {
 fn inherited_tier_env() -> Vec<(String, String)> {
     [
         "TOPO_GENERATE_MESSAGE_SPREAD_MS",
-        "TOPO_FORWARD_ON_HAVE",
         "TOPO_EVENT_TIMELINE",
         "TOPO_SYNC_LAST_DAY_ONLY",
     ]
@@ -285,7 +284,6 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool)
         "TOPO_GENERATE_MESSAGE_SPREAD_MS",
         THREE_YEARS_MS.to_string(),
     );
-    std::env::set_var("TOPO_FORWARD_ON_HAVE", "1");
     std::env::set_var("TOPO_EVENT_TIMELINE", "1");
     std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "persist,projection");
     let prev_sync_last_day_only = std::env::var("TOPO_SYNC_LAST_DAY_ONLY").ok();

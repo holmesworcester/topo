@@ -28,7 +28,6 @@ use crate::projection::create::{
     event_id_or_blocked, project_event,
 };
 use crate::state::db::queue::current_timestamp_ms_u64;
-use crate::state::live_hints::{self, LiveHintEvent};
 use crate::transport::ensure_daemon_identity;
 
 fn index_endpoint_shared_for_workspace(
@@ -62,14 +61,6 @@ fn index_endpoint_shared_for_workspace(
         &workspace_id_b64,
         endpoint_shared_event_id,
     )?;
-    crate::state::live_hints::publish_from_connection(
-        db,
-        &[LiveHintEvent {
-            tenant_id: recorded_by.to_string(),
-            event_id: *endpoint_shared_event_id,
-            source_peer_id: None,
-        }],
-    );
     Ok(())
 }
 
@@ -172,8 +163,6 @@ fn replay_existing_workspace_shared_events_for_tenant(
 
     let pq = crate::state::db::project_queue::ProjectQueue::new(db);
     let recorded_at = current_timestamp_ms_u64() as i64;
-    let publish_after_commit = db.is_autocommit();
-    let mut live_hints = Vec::new();
     let replay_targets: Vec<(EventId, String)> = event_ids
         .iter()
         .map(|event_id| {
@@ -207,22 +196,11 @@ fn replay_existing_workspace_shared_events_for_tenant(
             event_id,
             recorded_at,
             "same_workspace_seed",
-        )? {
-            if replay_recorded_by == recorded_by {
-                live_hints.push(LiveHintEvent {
-                    tenant_id: recorded_by.to_string(),
-                    event_id: *event_id,
-                    source_peer_id: None,
-                });
-            }
-        }
+        )? {}
         let event_id_b64 = event_id_to_base64(event_id);
         let _ = pq.enqueue(replay_recorded_by, &event_id_b64);
     }
     db.execute_batch("RELEASE replay_seed")?;
-    if publish_after_commit {
-        live_hints::publish_from_connection(db, &live_hints);
-    }
 
     // Phase 2: Project inline and clean up queue entries.
     // Blocked events (e.g. encrypted events whose key_secret hasn't been
