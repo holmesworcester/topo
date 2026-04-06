@@ -46,6 +46,7 @@ This PoC exists to prove the practicality of a principled approach that uses [ev
 * **Everything can be an event** - You can model all data, even file slices, as events, encrypt them, and store them all in SQLite.
 * **DAG for auth, invites, multi-device, historical key provision** - Complex relationships such as team auth, admin promotion, multi-use Signal-like invite links, signed events, multi-device support, and group key agreement with history-provision can be modeled as events that depend on prior events. (MLS-like TreeKEM schemes can be too, as a complexity-costly enhancement if needed.)
 * **Negentropy sync is fast enough for everything** - You can use range-based set reconcilation ("Negentropy") for syncing all events, whether files, messages, auth, whatever. Large event sets sync fast enough. File downloads are likely network-bound, not IO or CPU-bound.
+  - Security note: the classic RBSR / Negentropy family relies on algebraically composable range fingerprints. In the original [range-based set reconciliation paper](https://aljoscha-meyer.de/assets/landing/rbsr.pdf) and current stock implementations, that fingerprinting style admits attacker-chosen collision attacks that can let a malicious peer interfere with syncing of other peers' events by making unequal ranges appear equal. A stronger alternative is the Merkle-tree-based non-homomorphic construction in [Range-Based Set Reconciliation without Homomorphic Fingerprints](https://aljoscha-meyer.de/assets/landing/rbsr_nonhomomorphic.pdf), which trades somewhat slower index construction for ordinary cryptographic hash-collision assumptions.
 * **Topological sort makes order not matter** - We can receive data in any order we want because topological sort over large amounts of SQLite events is fast enough that we can block events with missing dependencies and unblock events when their dependencies come in. 
 * **Dependency and blocking can fit product needs** - The dependency graph can be whatever it needs to, to fit features like "don't display messages until you know their username" or "display messages immediately with a placeholder username". Dependency is **NOT** hard-wired into the syncing protocol or document store, as with OrtbitDB or Automerge.
 * **Complex, secure deletion** - It is straightforward to reliably implement things like "delete this message, its attachments, and reactions" or the kind of key purging you'd need for data-layer forward secrecy. 
@@ -1331,6 +1332,12 @@ The active branch chooses simpler boundaries over a global per-event planner:
 5. **Use stock negentropy directly.** The active path builds an in-memory
    vector from `shared_event_index` for the selected range instead of routing bulk sync
    through a bespoke request-credit scheduler.
+6. **Prefer session-local rebuilds over a persisted Negentropy index.** The
+   protocol can support a cached auxiliary structure, but current implementation
+   experience favors rebuilding the Negentropy hash graph for each range session
+   from `shared_event_index`. That path has been simpler and more stable than
+   trying to maintain a persistent sync-side cache or tree across writes and
+   deletes.
 
 ## 7.7 Negentropy implementation notes
 
@@ -1346,6 +1353,30 @@ Baseline implementation:
 5. Range data transfer streams raw length-delimited blob records (`[u32 len][blob]`) after reconciliation for that range.
 6. Multi-source coordination does not replace negentropy; future smarter range balancing will still consume range-local membership discovered by negentropy.
 7. The current range path uses only the in-memory vector-backed storage built directly from `shared_event_index`; the older SQLite-backed storage path has been removed.
+
+### 7.7.1 Fingerprint security note
+
+The current implementation choice is driven by engineering simplicity, not by a
+claim that the stock Negentropy fingerprint is the strongest possible design.
+
+1. The classic RBSR / Negentropy approach described in
+   [rbsr.pdf](https://aljoscha-meyer.de/assets/landing/rbsr.pdf) and used by
+   current implementations depends on an algebraically composable range
+   fingerprint.
+2. That fingerprinting style has a known attacker-chosen collision weakness: a
+   malicious peer can craft event sets whose fingerprints collide and thereby
+   suppress descent into ranges that contain other peers' events.
+3. The stronger known design is
+   [Range-Based Set Reconciliation without Homomorphic Fingerprints](https://aljoscha-meyer.de/assets/landing/rbsr_nonhomomorphic.pdf),
+   which derives range fingerprints from a clamped Merkle tree and reduces the
+   problem to ordinary hash-collision resistance.
+4. The practical tradeoff is a somewhat slower initial index build for each sync
+   session.
+5. Our current engineering conclusion is still to rebuild the session-local
+   Negentropy graph from `shared_event_index` on each range session. The design
+   leaves room for a future cached auxiliary structure, but experiments with
+   persisted sync-side caches/trees were more complex and less stable than the
+   rebuild-per-session path.
 
 Primary code references:
 1. `src/runtime/sync_engine/session/range_session.rs`
