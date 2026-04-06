@@ -4,6 +4,13 @@ use crate::db::store::{
     insert_event, insert_recorded_event, insert_shared_event_index_entry_if_shared,
 };
 use crate::event_modules::registry::ShareScope;
+use ed25519_dalek::SigningKey;
+
+fn peer_id_for_signing_key(key: &SigningKey) -> String {
+    hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
+        &key.verifying_key().to_bytes(),
+    ))
+}
 
 fn bind_workspace(conn: &Connection, recorded_by: &str, workspace_id: &str) {
     conn.execute(
@@ -117,7 +124,60 @@ fn hard_claims_recurse_into_the_claiming_shard_after_projection() {
 }
 
 #[test]
-fn encrypted_shared_projection_claims_outer_key_event() {
+fn hot_root_claims_expand_through_already_projected_old_chain() {
+    let conn = open_in_memory().unwrap();
+    create_tables(&conn).unwrap();
+    let recorded_by = "tenant-a";
+    let workspace_id = "workspace-1";
+    bind_workspace(&conn, recorded_by, workspace_id);
+
+    let today_shard = utc_day_start_ms(10 * 24 * 60 * 60 * 1000);
+    let prior_day_start = today_shard - (24 * 60 * 60 * 1000);
+    let dep = insert_shared_bench_dep(
+        &conn,
+        recorded_by,
+        workspace_id,
+        (prior_day_start + 1_000) as u64,
+        vec![],
+        1,
+    );
+    assert_eq!(
+        project_one(&conn, recorded_by, &dep).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let claimed = insert_shared_bench_dep(
+        &conn,
+        recorded_by,
+        workspace_id,
+        (prior_day_start + 2_000) as u64,
+        vec![dep],
+        2,
+    );
+    assert_eq!(
+        project_one(&conn, recorded_by, &claimed).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    let hot_root = insert_shared_bench_dep(
+        &conn,
+        recorded_by,
+        workspace_id,
+        (today_shard + 1_000) as u64,
+        vec![claimed],
+        3,
+    );
+    assert_eq!(
+        project_one(&conn, recorded_by, &hot_root).unwrap(),
+        ProjectionDecision::Valid
+    );
+
+    assert_eq!(claim_count(&conn, workspace_id, today_shard, &claimed), 1);
+    assert_eq!(claim_count(&conn, workspace_id, today_shard, &dep), 1);
+}
+
+#[test]
+fn encrypted_shared_projection_claims_outer_key_event_and_existing_key_delivery() {
     let conn = open_in_memory().unwrap();
     create_tables(&conn).unwrap();
 
@@ -129,17 +189,47 @@ fn encrypted_shared_projection_claims_outer_key_event() {
         "laptop",
     )
     .unwrap();
-    let recorded_by = hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
-        &workspace.peer_shared_key.verifying_key().to_bytes(),
-    ));
-    let ctx =
-        crate::event_modules::workspace::load_local_authoring_context(&conn, &recorded_by).unwrap();
+    let recorded_by = peer_id_for_signing_key(&workspace.peer_shared_key);
+    let creator_admin_eid: EventId = conn
+        .query_row(
+            "SELECT event_id FROM admins WHERE recorded_by = ?1 ORDER BY event_id ASC LIMIT 1",
+            rusqlite::params![&recorded_by],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
+        .expect("creator admin event");
     let key_event_id = crate::event_modules::workspace::identity_ops::ensure_content_key_for_peer(
         &conn,
         &recorded_by,
     )
     .unwrap();
+    crate::event_modules::workspace::commands::create_user_invite_raw(
+        &conn,
+        &recorded_by,
+        &workspace.peer_shared_key,
+        &workspace.peer_shared_event_id,
+        &creator_admin_eid,
+        &workspace.workspace_id,
+    )
+    .unwrap();
+    let key_shared_event_id: EventId = conn
+        .query_row(
+            "SELECT event_id
+             FROM key_shared
+             WHERE recorded_by = ?1
+               AND key_event_id = ?2
+             ORDER BY event_id ASC
+             LIMIT 1",
+            rusqlite::params![&recorded_by, event_id_to_base64(&key_event_id)],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
+        .expect("key_shared for current content key");
 
+    let ctx =
+        crate::event_modules::workspace::load_local_authoring_context(&conn, &recorded_by).unwrap();
     let created_at_ms = 25_u64 * 24 * 60 * 60 * 1000;
     let shard_start_ms = utc_day_start_ms(created_at_ms as i64);
     let workspace_id = event_id_to_base64(&ctx.workspace_id);
@@ -158,6 +248,10 @@ fn encrypted_shared_projection_claims_outer_key_event() {
 
     assert_eq!(
         claim_count(&conn, &workspace_id, shard_start_ms, &key_event_id),
+        1
+    );
+    assert_eq!(
+        claim_count(&conn, &workspace_id, shard_start_ms, &key_shared_event_id),
         1
     );
 }

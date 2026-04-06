@@ -1,4 +1,4 @@
-use crate::crypto::{event_id_from_base64, EventId};
+use crate::crypto::{decrypt_event_blob, event_id_from_base64, event_id_to_base64, EventId};
 use crate::db::queue::current_timestamp_ms;
 use crate::db::store::lookup_workspace_id;
 use crate::db::timeline::EventTimeline;
@@ -9,9 +9,194 @@ use crate::projection::encrypted::project_encrypted;
 use crate::projection::queries::ProjectionQueries;
 use crate::projection::signer::{resolve_signer_key, SignerResolution};
 use rusqlite::{Connection, OptionalExtension};
+use std::collections::{BTreeSet, HashSet, VecDeque};
 
 use super::stages::{check_dep_types, check_deps_and_block, record_rejection};
 use super::write_exec::{execute_emit_commands, execute_write_ops};
+
+fn is_zero_event_id(event_id: &EventId) -> bool {
+    event_id.iter().all(|byte| *byte == 0)
+}
+
+fn dedupe_dep_ids(mut dep_ids: Vec<EventId>) -> Vec<EventId> {
+    dep_ids.retain(|dep_id| !is_zero_event_id(dep_id));
+    dep_ids.sort_unstable();
+    dep_ids.dedup();
+    dep_ids
+}
+
+fn direct_claim_seed_ids(outer_event: &ParsedEvent, sub_event: &ParsedEvent) -> Vec<EventId> {
+    let mut dep_ids = sub_event
+        .dep_field_values()
+        .into_iter()
+        .map(|(_, dep_id)| dep_id)
+        .collect::<Vec<_>>();
+    if let ParsedEvent::Encrypted(encrypted) = outer_event {
+        dep_ids.push(encrypted.key_event_id);
+    }
+    dedupe_dep_ids(dep_ids)
+}
+
+fn load_locally_valid_shared_dep_ids(
+    conn: &Connection,
+    recorded_by: &str,
+    event_id: &EventId,
+) -> ProjectionApplyResult<Vec<EventId>> {
+    let event_id_b64 = event_id_to_base64(event_id);
+    let outer_blob: Option<Vec<u8>> = conn
+        .query_row(
+            "SELECT e.blob
+             FROM events e
+             JOIN valid_events v
+               ON v.event_id = e.event_id
+              AND v.peer_id = ?1
+             WHERE e.event_id = ?2
+               AND e.share_scope = 'shared'
+             LIMIT 1",
+            rusqlite::params![recorded_by, event_id_b64],
+            |row| row.get(0),
+        )
+        .optional()?;
+    let Some(outer_blob) = outer_blob else {
+        return Ok(Vec::new());
+    };
+
+    let outer_event = crate::event_modules::parse_event(&outer_blob)?;
+    let dep_ids = match outer_event {
+        ParsedEvent::Encrypted(encrypted) => {
+            let mut dep_ids = vec![encrypted.key_event_id];
+            let key_bytes: Option<Vec<u8>> = conn
+                .query_row(
+                    "SELECT key_bytes
+                     FROM key_secrets
+                     WHERE recorded_by = ?1
+                       AND event_id = ?2
+                     LIMIT 1",
+                    rusqlite::params![recorded_by, event_id_to_base64(&encrypted.key_event_id)],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            if let Some(key_bytes) = key_bytes {
+                if key_bytes.len() == 32 {
+                    let mut key_arr = [0u8; 32];
+                    key_arr.copy_from_slice(&key_bytes);
+                    if let Ok(plaintext) = decrypt_event_blob(
+                        &key_arr,
+                        &encrypted.nonce,
+                        &encrypted.ciphertext,
+                        &encrypted.auth_tag,
+                    ) {
+                        if let Ok(inner_event) = crate::event_modules::parse_event(&plaintext) {
+                            dep_ids.extend(
+                                inner_event
+                                    .dep_field_values()
+                                    .into_iter()
+                                    .map(|(_, dep_id)| dep_id),
+                            );
+                        }
+                    }
+                }
+            }
+            dep_ids
+        }
+        event => event
+            .dep_field_values()
+            .into_iter()
+            .map(|(_, dep_id)| dep_id)
+            .collect::<Vec<_>>(),
+    };
+
+    Ok(dedupe_dep_ids(dep_ids))
+}
+
+fn list_local_key_shared_event_ids_for_key(
+    conn: &Connection,
+    recorded_by: &str,
+    key_event_id: &EventId,
+) -> ProjectionApplyResult<Vec<EventId>> {
+    let mut stmt = conn.prepare(
+        "SELECT event_id
+         FROM key_shared
+         WHERE recorded_by = ?1
+           AND key_event_id = ?2
+         ORDER BY event_id",
+    )?;
+    let rows = stmt.query_map(
+        rusqlite::params![recorded_by, event_id_to_base64(key_event_id)],
+        |row| row.get::<_, String>(0),
+    )?;
+
+    let mut event_ids = Vec::new();
+    for row in rows {
+        let event_id_b64 = row?;
+        if let Some(event_id) = event_id_from_base64(&event_id_b64) {
+            event_ids.push(event_id);
+        }
+    }
+    Ok(event_ids)
+}
+
+fn hard_claim_exists(
+    conn: &Connection,
+    workspace_id: &str,
+    shard_start_ms: i64,
+    event_id: &EventId,
+) -> ProjectionApplyResult<bool> {
+    let exists = conn.query_row(
+        "SELECT EXISTS(
+             SELECT 1
+             FROM dep_claims
+             WHERE workspace_id = ?1
+               AND shard_start_ms = ?2
+               AND event_id = ?3
+               AND strength >= 2
+         )",
+        rusqlite::params![workspace_id, shard_start_ms, event_id_to_base64(event_id)],
+        |row| row.get(0),
+    )?;
+    Ok(exists)
+}
+
+fn expand_hard_claim_closure_for_shard(
+    conn: &Connection,
+    recorded_by: &str,
+    workspace_id: &str,
+    shard_start_ms: i64,
+    seed_ids: &[EventId],
+    updated_at_ms: i64,
+) -> ProjectionApplyResult<()> {
+    let mut queue = VecDeque::from(dedupe_dep_ids(seed_ids.to_vec()));
+    let mut seen = HashSet::<EventId>::new();
+
+    while let Some(event_id) = queue.pop_front() {
+        if !seen.insert(event_id) {
+            continue;
+        }
+
+        let already_hard = hard_claim_exists(conn, workspace_id, shard_start_ms, &event_id)?;
+        crate::db::dep_claims::upsert_hard_claims(
+            conn,
+            workspace_id,
+            shard_start_ms,
+            &[event_id],
+            updated_at_ms,
+        )?;
+        if already_hard {
+            continue;
+        }
+
+        for claimed_event_id in
+            list_local_key_shared_event_ids_for_key(conn, recorded_by, &event_id)?
+        {
+            queue.push_back(claimed_event_id);
+        }
+        for dep_id in load_locally_valid_shared_dep_ids(conn, recorded_by, &event_id)? {
+            queue.push_back(dep_id);
+        }
+    }
+
+    Ok(())
+}
 
 fn persist_shared_dep_claims(
     conn: &Connection,
@@ -40,24 +225,10 @@ fn persist_shared_dep_claims(
         return Err(format!("invalid projected event id: {event_id_b64}").into());
     };
 
-    let mut dep_ids = sub_event
-        .dep_field_values()
-        .into_iter()
-        .map(|(_, dep_id)| dep_id)
-        .filter(|dep_id| !dep_id.iter().all(|byte| *byte == 0))
-        .collect::<Vec<_>>();
-    if let Ok(ParsedEvent::Encrypted(encrypted)) = crate::event_modules::parse_event(&outer_blob) {
-        if !encrypted.key_event_id.iter().all(|byte| *byte == 0) {
-            dep_ids.push(encrypted.key_event_id);
-        }
-    }
-    dep_ids.sort_unstable();
-    dep_ids.dedup();
-    if dep_ids.is_empty() {
-        return Ok(());
-    }
+    let outer_event = crate::event_modules::parse_event(&outer_blob)?;
+    let dep_ids = direct_claim_seed_ids(&outer_event, sub_event);
 
-    let mut shard_starts = std::collections::BTreeSet::new();
+    let mut shard_starts = BTreeSet::new();
     shard_starts.insert(crate::db::dep_claims::utc_day_start_ms(
         sub_event.created_at_ms() as i64,
     ));
@@ -66,14 +237,37 @@ fn persist_shared_dep_claims(
     {
         shard_starts.insert(shard_start_ms);
     }
+    let mut key_claim_shards = BTreeSet::new();
+    if let ParsedEvent::KeyShared(key_shared) = &outer_event {
+        for shard_start_ms in crate::db::dep_claims::list_hard_claim_shards_for_event(
+            conn,
+            &workspace_id,
+            &key_shared.key_event_id,
+        )? {
+            key_claim_shards.insert(shard_start_ms);
+            shard_starts.insert(shard_start_ms);
+        }
+    }
+    if dep_ids.is_empty() && key_claim_shards.is_empty() {
+        return Ok(());
+    }
 
     let now_ms = current_timestamp_ms();
     for shard_start_ms in shard_starts {
-        crate::db::dep_claims::upsert_hard_claims(
+        let mut seed_ids = dep_ids.clone();
+        if key_claim_shards.contains(&shard_start_ms) {
+            seed_ids.push(event_id);
+        }
+        let seed_ids = dedupe_dep_ids(seed_ids);
+        if seed_ids.is_empty() {
+            continue;
+        }
+        expand_hard_claim_closure_for_shard(
             conn,
+            recorded_by,
             &workspace_id,
             shard_start_ms,
-            &dep_ids,
+            &seed_ids,
             now_ms,
         )?;
     }
