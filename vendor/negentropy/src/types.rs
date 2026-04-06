@@ -167,9 +167,16 @@ impl Deref for Fingerprint {
 }
 
 impl Fingerprint {
+    /// Return the raw fingerprint bytes.
     #[inline]
     pub fn to_bytes(self) -> [u8; FINGERPRINT_SIZE] {
         self.buf
+    }
+
+    /// Construct a fingerprint from raw bytes.
+    #[inline]
+    pub fn from_bytes(buf: [u8; FINGERPRINT_SIZE]) -> Self {
+        Self { buf }
     }
 }
 
