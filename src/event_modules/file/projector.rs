@@ -1,6 +1,6 @@
 use super::super::ParsedEvent;
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
 use crate::projection::queries::define_query_context_loader;
 
 define_query_context_loader!(build_projector_context, File, load_file_context, "file");
@@ -32,15 +32,6 @@ pub fn project_pure(
         return ProjectorResult::reject("file missing current signer envelope".to_string());
     };
     let signer_event_id_b64 = current_signer.event_id.clone();
-
-    if ctx.target_message_deleted {
-        return ProjectorResult::valid_with_commands(
-            Vec::new(),
-            vec![EmitCommand::HardPurgeMessageGraph {
-                message_event_id: message_id_b64,
-            }],
-        );
-    }
 
     let ops = vec![WriteOp::InsertOrIgnore {
         table: "files",

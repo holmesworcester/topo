@@ -3,7 +3,7 @@ mod stats;
 pub mod wire;
 
 // Re-export stable public API so callers import from `event_modules::file_slice`.
-pub use projector::project_pure;
+pub use projector::{build_projector_context, project_pure};
 pub use stats::{file_slice_event_count, file_slice_event_counts_by_source};
 pub use wire::{
     encode_file_slice, parse_file_slice, FileSliceEvent, FILE_SLICE_CIPHERTEXT_BYTES,

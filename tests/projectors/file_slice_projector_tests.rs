@@ -9,10 +9,11 @@
 #[cfg(test)]
 mod tests {
     use crate::harness::fixtures::*;
-    use topo::event_modules::file_slice::project_pure;
+    use topo::event_modules::file_slice::{build_projector_context, project_pure};
     use topo::event_modules::file_slice::FileSliceEvent;
     use topo::event_modules::{ParsedEvent, EVENT_TYPE_FILE_SLICE};
-    use topo::projection::contract::{EmitCommand, FileDescriptorInfo};
+    use topo::projection::contract::FileDescriptorInfo;
+    use topo::projection::queries::ProjectionFrameContext;
 
     const PEER: &str = "peer_alice";
     const EVENT_ID: &str = "fs_event_1";
@@ -65,11 +66,11 @@ mod tests {
     }
 
     #[test]
-    fn test_file_slice_skips_when_owner_message_deleted() {
+    fn test_file_slice_context_purges_when_owner_message_deleted() {
         let parsed = make_file_slice([1u8; 32]);
         let root_message = b64(&[9u8; 32]);
-        let ctx = topo::projection::contract::ContextSnapshot {
-            target_message_deleted: true,
+        let queries = queries_with_ctx(topo::projection::contract::ContextSnapshot {
+            purge_message_event_id: Some(root_message.clone()),
             file_descriptors: vec![descriptor(&root_message, &b64(&[3u8; 32]), "key_1")],
             current_owner_event_id: Some(root_message.clone()),
             current_signer: Some(topo::projection::contract::CurrentSignerInfo {
@@ -77,21 +78,44 @@ mod tests {
                 semantic_type_code: EVENT_TYPE_FILE_SLICE,
             }),
             ..Default::default()
-        };
-
-        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
-        assert_valid(&result);
-        assert!(
-            result.write_ops.is_empty(),
-            "deleted-file fast path should not write file_slices rows"
-        );
-        assert_emits_command(&result, "HardPurgeMessageGraph", |cmd| {
-            matches!(
-                cmd,
-                EmitCommand::HardPurgeMessageGraph { message_event_id }
-                    if message_event_id == &root_message
-            )
         });
+        let result = build_projector_context(
+            &queries,
+            &ProjectionFrameContext::default(),
+            PEER,
+            EVENT_ID,
+            &parsed,
+        )
+        .unwrap();
+
+        assert_context_purge(&result, &root_message);
+    }
+
+    #[test]
+    fn test_file_slice_context_ready_when_owner_message_live() {
+        let parsed = make_file_slice([1u8; 32]);
+        let root_message = b64(&[9u8; 32]);
+        let queries = queries_with_ctx(topo::projection::contract::ContextSnapshot {
+            file_descriptors: vec![descriptor(&root_message, &b64(&[3u8; 32]), "key_1")],
+            current_owner_event_id: Some(root_message),
+            current_signer: Some(topo::projection::contract::CurrentSignerInfo {
+                event_id: b64(&[3u8; 32]),
+                semantic_type_code: EVENT_TYPE_FILE_SLICE,
+            }),
+            ..Default::default()
+        });
+
+        let result = build_projector_context(
+            &queries,
+            &ProjectionFrameContext::default(),
+            PEER,
+            EVENT_ID,
+            &parsed,
+        )
+        .unwrap();
+
+        let ctx = expect_context_ready(result);
+        assert!(ctx.purge_message_event_id.is_none());
     }
 
     // ── SPEC_FILE_AUTH_02: pass ──

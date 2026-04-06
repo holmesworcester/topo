@@ -162,10 +162,10 @@ both `pass` and `break` polarity unless waived.
 | SPEC_DEL_AUTHOR_01 | InvDeletedMessageSource | CHK_DEL_TOMBSTONE | projector_unit | message_deletion_projector_tests::tests::test_deletion_valid | pass |
 | SPEC_RXN_SIGNER_01 | InvSigner (reaction) | CHK_RXN_SIGNER_USER_MISMATCH | projector_unit | reaction_projector_tests::tests::test_reaction_rejects_signer_user_mismatch | break |
 | SPEC_RXN_SIGNER_01 | InvSigner (reaction) | CHK_RXN_INSERT | projector_unit | reaction_projector_tests::tests::test_reaction_valid | pass |
-| SPEC_RXN_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_RXN_SKIP_DELETED | projector_unit | reaction_projector_tests::tests::test_reaction_skips_when_target_deleted | pass |
-| SPEC_RXN_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_RXN_SKIP_DELETED | projector_unit | reaction_projector_tests::tests::test_reaction_valid | break |
-| SPEC_RXN_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_RXN_HARD_PURGE | projector_unit | reaction_projector_tests::tests::test_reaction_skips_when_target_deleted | pass |
-| SPEC_RXN_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_RXN_HARD_PURGE | projector_unit | reaction_projector_tests::tests::test_reaction_valid | break |
+| SPEC_RXN_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_RXN_SKIP_DELETED | pipeline_integration | apply::tests::deletion::test_reaction_arriving_after_tombstone_is_hard_purged | pass |
+| SPEC_RXN_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_RXN_SKIP_DELETED | pipeline_integration | apply::tests::core_projection::test_project_reaction_valid | break |
+| SPEC_RXN_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_RXN_HARD_PURGE | pipeline_integration | apply::tests::deletion::test_reaction_arriving_after_tombstone_is_hard_purged | pass |
+| SPEC_RXN_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_RXN_HARD_PURGE | pipeline_integration | apply::tests::core_projection::test_project_reaction_valid | break |
 | SPEC_RXN_OWNER_01 | (owner wrapper) | CHK_RXN_OWNER_MATCH | projector_unit | reaction_projector_tests::tests::test_reaction_valid | pass |
 | SPEC_RXN_OWNER_01 | (owner wrapper) | CHK_RXN_OWNER_MATCH | projector_unit | reaction_projector_tests::tests::test_reaction_rejects_owner_mismatch | break |
 | SPEC_MSG_INSERT_01 | InvMessageWorkspace | CHK_MSG_INSERT | projector_unit | message_projector_tests::tests::test_message_valid | pass |
@@ -176,8 +176,8 @@ both `pass` and `break` polarity unless waived.
 | SPEC_MSG_DEL_BEFORE_01 | InvDeleteIntentNoLiveMessage | CHK_MSG_DELETE_BEFORE_CREATE | projector_unit | message_projector_tests::tests::test_message_valid | break |
 | SPEC_MSG_DEL_BEFORE_01 | InvDeletePurgeAtomic | CHK_MSG_HARD_PURGE | projector_unit | message_projector_tests::tests::test_message_tombstoned_by_deletion_intent | pass |
 | SPEC_MSG_DEL_BEFORE_01 | InvDeletePurgeAtomic | CHK_MSG_HARD_PURGE | projector_unit | message_projector_tests::tests::test_message_valid | break |
-| SPEC_MA_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_FILE_HARD_PURGE | projector_unit | simple_projector_tests::tests::test_file_skips_when_target_message_deleted | pass |
-| SPEC_MA_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_FILE_HARD_PURGE | projector_unit | simple_projector_tests::tests::test_file_valid | break |
+| SPEC_MA_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_FILE_HARD_PURGE | pipeline_integration | apply::tests::deletion::test_file_arriving_after_tombstone_is_hard_purged | pass |
+| SPEC_MA_SKIP_DEL_01 | InvDeletedMessagePurgesLiveGraph | CHK_FILE_HARD_PURGE | pipeline_integration | apply::tests::file_slice::test_project_attachment_valid | break |
 | SPEC_FILE_OWNER_01 | (owner wrapper) | CHK_FILE_OWNER_MATCH | projector_unit | simple_projector_tests::tests::test_file_valid | pass |
 | SPEC_FILE_OWNER_01 | (owner wrapper) | CHK_FILE_OWNER_MATCH | projector_unit | simple_projector_tests::tests::test_file_rejects_owner_mismatch | break |
 | SPEC_DEL_SIGNER_01 | InvSigner (deletion) | CHK_DEL_SIGNER_AUTH | projector_unit | message_deletion_projector_tests::tests::test_deletion_rejects_invalid_signer_auth | break |
@@ -196,8 +196,8 @@ both `pass` and `break` polarity unless waived.
 | SPEC_DEL_IDEMPOTENT_01 | InvDeletePurgeAtomic | CHK_DEL_HARD_PURGE | projector_unit | message_deletion_projector_tests::tests::test_deletion_intent_only_when_no_target | break |
 | SPEC_FS_IDEMPOTENT_01 | (idempotent) | CHK_FS_IDEMPOTENT | projector_unit | file_slice_projector_tests::tests::test_file_slice_idempotent_replay | pass |
 | SPEC_FS_IDEMPOTENT_01 | (idempotent) | CHK_FS_IDEMPOTENT | projector_unit | file_slice_projector_tests::tests::test_file_slice_valid | break |
-| SPEC_FS_SKIP_DEL_01 | InvDeletedFilePurgesLiveSlice | CHK_FS_HARD_PURGE | projector_unit | file_slice_projector_tests::tests::test_file_slice_skips_when_owner_message_deleted | pass |
-| SPEC_FS_SKIP_DEL_01 | InvDeletedFilePurgesLiveSlice | CHK_FS_HARD_PURGE | projector_unit | file_slice_projector_tests::tests::test_file_slice_blocks_no_descriptor | break |
+| SPEC_FS_SKIP_DEL_01 | InvDeletedFilePurgesLiveSlice | CHK_FS_HARD_PURGE | projector_unit | file_slice_projector_tests::tests::test_file_slice_context_purges_when_owner_message_deleted | pass |
+| SPEC_FS_SKIP_DEL_01 | InvDeletedFilePurgesLiveSlice | CHK_FS_HARD_PURGE | projector_unit | file_slice_projector_tests::tests::test_file_slice_context_ready_when_owner_message_live | break |
 | SPEC_FS_OWNER_01 | (owner wrapper) | CHK_FS_OWNER_MATCH | projector_unit | file_slice_projector_tests::tests::test_file_slice_valid | pass |
 | SPEC_FS_OWNER_01 | (owner wrapper) | CHK_FS_OWNER_MATCH | projector_unit | file_slice_projector_tests::tests::test_file_slice_rejects_owner_mismatch | break |
 | SPEC_FS_SLOT_01 | (slot uniqueness) | CHK_FS_SLOT_CONFLICT | projector_unit | file_slice_projector_tests::tests::test_file_slice_rejects_slot_conflict | break |

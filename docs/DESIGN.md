@@ -928,7 +928,7 @@ Fields include:
 - `accepted_workspace_id` — accepted workspace binding for this tenant
 - `target_message_author` / `target_tombstone_author` — for deletion auth
 - `deletion_intents` — pre-existing deletion intents (for delete-before-create convergence)
-- `target_message_deleted` — for message-owned dependent purge checks (`reaction`, `file`, `file_slice`)
+- `purge_message_event_id` — root message graph to hard-purge before projector dispatch when a dependent arrives after tombstone
 - `file_descriptors` / `existing_file_slice` / `current_transport_key_event_id` — for FileSlice authorization, duplicate detection, and wrapper-key matching
 - `bootstrap_context` — local bootstrap context (addr + SPKI) for invite trust materialization
 - `is_local_create` — whether the event was locally created (from `recorded_events.source`); gates pending bootstrap trust `InsertOrIgnore` writes so only the invite creator materializes pending trust
@@ -1002,15 +1002,15 @@ Deletion uses a two-stage model so deletes stay deterministic when events arrive
 
 **Stage 1: deletion_intent write.**
 The `MessageDeletion` projector always emits an idempotent `deletion_intent` write keyed
-by `(recorded_by, target_kind="message", target_id)`. For peer-signed deletes the intent
+by `(recorded_by, target_id)`. For peer-signed deletes the intent
 stores the signer's derived user id; for admin-signed deletes it stores an explicit
 `authorized_by_admin` wildcard. This records the intent to delete regardless of whether the
 target message exists yet.
 
 **Stage 2: tombstone + hard purge.**
 - If the target message exists in projected state, the projector also emits tombstone
-  (`deleted_messages`) write ops, live-view cleanup (`messages`, `reactions`), and a
-  `HardPurgeMessageGraph` follow-up in the same projection transaction.
+  (`deleted_messages`) write ops and a `HardPurgeMessageGraph` follow-up in the same
+  projection transaction.
 - If the target does not exist yet, only the intent is recorded. No imperative retries.
 
 **Delete-before-create convergence:**
@@ -1026,24 +1026,23 @@ ensuring identical final state regardless of arrival order.
 - Deleted event material does not remain in `events`, tenant-scoped event tables, or live projections after a successful purge.
 
 **Cleanup fanout:**
-Reaction cleanup on message delete is represented as explicit deterministic `Delete` WriteOps
-in the `ProjectorResult`, not hidden side effects. The hard-purge follow-up then removes the
-deleted message graph from event storage and dependent projection rows (`reactions`, `files`,
-`file_slices`, queue rows, blocked rows, subscription feed rows, fanout rows, and orphaned
-global event blobs when no tenant still references them).
+The hard-purge follow-up owns all live-state cleanup for a deleted message graph. It removes
+the deleted message graph from event storage and dependent projection rows (`messages`,
+`reactions`, `files`, `file_slices`, queue rows, blocked rows, subscription feed rows,
+fanout rows, and orphaned global event blobs when no tenant still references them).
 
 **Late dependent arrivals:**
 - `message` after prior intent: tombstones immediately, then purges itself.
-- `reaction` / `file` after prior tombstone: dependency checks treat the deleted message as
-  satisfied for the message-target edge, the projector emits `HardPurgeMessageGraph`, and the
-  event purges itself in the current transaction.
+- `reaction` / `file` after prior tombstone: prerequisite loading returns a terminal purge
+  outcome for the deleted owner message, so the event purges in the current transaction without
+  entering its projector.
 - encrypted dependents also carry outer `owner_event_id`, so a tombstoned owner graph can purge
   them before decrypt or key wait.
 - purge discovers late encrypted dependents through `recorded_event_owners(peer_id, owner_event_id, event_id)`,
   so it does not scan or decrypt tenant event blobs to find attachment/reaction tails.
-- `file_slice` is deleted by the same owner-message rule as `file`: the encrypted wrapper carries
-  the root message `owner_event_id`, so late slices purge against the message tombstone directly
-  instead of relying on a per-file deletion map.
+- `file_slice` is deleted by the same owner-message rule as `file`: its context loader returns a
+  terminal purge outcome when either the outer owner message or the resolved file descriptor's
+  message is already tombstoned.
 
 **Atomicity + retry:**
 `project_one` owns the transaction boundary for the projector writes, emitted purge command,

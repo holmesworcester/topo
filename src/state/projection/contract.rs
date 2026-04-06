@@ -197,10 +197,9 @@ pub struct ContextSnapshot {
     /// first intent whose author matches the message author, or an admin-auth intent.
     pub deletion_intents: Vec<DeletionIntentInfo>,
 
-    /// For Reaction: whether the target message has been tombstoned
-    /// (row in deleted_messages). Note: pending deletion_intents are NOT
-    /// included — an unverified intent does not mean the message is deleted.
-    pub target_message_deleted: bool,
+    /// For dependent event context loaders that must fast-purge before
+    /// projector dispatch, the root message graph to purge.
+    pub purge_message_event_id: Option<String>,
 
     /// For KeyShared: DH-unwrapped key material, if available.
     pub unwrapped_secret_material: Option<UnwrappedSecretMaterial>,

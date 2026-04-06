@@ -1014,18 +1014,20 @@ fn deletion_signer_context_behavior(
     }
 }
 
-fn tombstone_satisfies_message_dep_behavior(
+fn deleted_message_purges_dep_behavior(
     state: &NodeBehaviorData,
     recorded_by: &str,
     parsed: &ParsedEvent,
     field_name: &str,
     dep_b64: &str,
-) -> bool {
+) -> Option<String> {
     let is_deleted_message_target = matches!(
         (parsed, field_name),
-        (ParsedEvent::Reaction(_), "target_event_id") | (ParsedEvent::File(_), "message_id")
+        (ParsedEvent::Reaction(_), "target_event_id")
+            | (ParsedEvent::File(_), "message_id")
+            | (ParsedEvent::Encrypted(_), "owner_event_id")
     );
-    is_deleted_message_target
+    (is_deleted_message_target
         && first_row_for_recorded(
             state,
             "deleted_messages",
@@ -1033,7 +1035,8 @@ fn tombstone_satisfies_message_dep_behavior(
             "message_id",
             dep_b64,
         )
-        .is_some()
+        .is_some())
+    .then(|| dep_b64.to_string())
 }
 
 fn resolve_signer_key_behavior(
@@ -1125,16 +1128,14 @@ impl ProjectionQueries for NodeBehaviorEngine {
                 crate::event_modules::EVENT_TYPE_ENDPOINT_SHARED,
             )));
         }
-        if tombstone_satisfies_message_dep_behavior(
+        if let Some(message_event_id) = deleted_message_purges_dep_behavior(
             &state,
             recorded_by,
             parsed,
             field_name,
             &dep_b64,
         ) {
-            return Ok(DepLoadResult::ready(Some(
-                crate::event_modules::EVENT_TYPE_MESSAGE,
-            )));
+            return Ok(DepLoadResult::purge(message_event_id));
         }
         Ok(DepLoadResult::missing())
     }
@@ -1149,19 +1150,6 @@ impl ProjectionQueries for NodeBehaviorEngine {
             recorded_by,
             key_event_id,
         ))
-    }
-
-    fn message_is_deleted(
-        &self,
-        recorded_by: &str,
-        message_id_b64: &str,
-    ) -> ProjectionQueryResult<bool> {
-        let state = self.state.borrow();
-        Ok(
-            table_rows_for_recorded(&state, "deleted_messages", recorded_by)
-                .into_iter()
-                .any(|row| row_text(row, "message_id") == Some(message_id_b64)),
-        )
     }
 
     fn load_workspace_context(
@@ -1459,10 +1447,7 @@ impl ProjectionQueries for NodeBehaviorEngine {
             signer_user_mismatch_reason_behavior(&state, frame, recorded_by, &message.author_id);
         let mut deletion_intents = table_rows_for_recorded(&state, "deletion_intents", recorded_by)
             .into_iter()
-            .filter(|row| {
-                row_text(row, "target_kind") == Some("message")
-                    && row_text(row, "target_id") == Some(event_id_b64)
-            })
+            .filter(|row| row_text(row, "target_id") == Some(event_id_b64))
             .filter_map(|row| {
                 Some(DeletionIntentInfo {
                     deletion_event_id: row_text(row, "deletion_event_id")?.to_string(),
@@ -1522,20 +1507,10 @@ impl ProjectionQueries for NodeBehaviorEngine {
         reaction: &events::ReactionEvent,
     ) -> ProjectionQueryResult<ContextSnapshot> {
         let state = self.state.borrow();
-        let target_b64 = event_id_to_base64(&reaction.target_event_id);
-        let target_message_deleted = first_row_for_recorded(
-            &state,
-            "deleted_messages",
-            recorded_by,
-            "message_id",
-            &target_b64,
-        )
-        .is_some();
         let signer_user_mismatch_reason =
             signer_user_mismatch_reason_behavior(&state, frame, recorded_by, &reaction.author_id);
         Ok(ContextSnapshot {
             signer_user_mismatch_reason,
-            target_message_deleted,
             ..ContextSnapshot::default()
         })
     }
@@ -1543,24 +1518,11 @@ impl ProjectionQueries for NodeBehaviorEngine {
     fn load_file_context(
         &self,
         _frame: &ProjectionFrameContext,
-        recorded_by: &str,
+        _recorded_by: &str,
         _event_id_b64: &str,
-        file: &events::FileEvent,
+        _file: &events::FileEvent,
     ) -> ProjectionQueryResult<ContextSnapshot> {
-        let state = self.state.borrow();
-        let message_id_b64 = event_id_to_base64(&file.message_id);
-        let target_message_deleted = first_row_for_recorded(
-            &state,
-            "deleted_messages",
-            recorded_by,
-            "message_id",
-            &message_id_b64,
-        )
-        .is_some();
-        Ok(ContextSnapshot {
-            target_message_deleted,
-            ..ContextSnapshot::default()
-        })
+        Ok(ContextSnapshot::default())
     }
 
     fn load_file_slice_context(
@@ -1574,14 +1536,17 @@ impl ProjectionQueries for NodeBehaviorEngine {
         let file_id_b64 = event_id_to_base64(&file_slice.file_id);
         let mut ctx = ContextSnapshot::default();
         if let Some(owner_event_id_b64) = frame.current_owner_event_id.as_deref() {
-            ctx.target_message_deleted = first_row_for_recorded(
+            if first_row_for_recorded(
                 &state,
                 "deleted_messages",
                 recorded_by,
                 "message_id",
                 owner_event_id_b64,
             )
-            .is_some();
+            .is_some()
+            {
+                ctx.purge_message_event_id = Some(owner_event_id_b64.to_string());
+            }
         }
         ctx.file_descriptors = table_rows_for_recorded(&state, "files", recorded_by)
             .into_iter()
@@ -1598,9 +1563,9 @@ impl ProjectionQueries for NodeBehaviorEngine {
                 })
             })
             .collect();
-        if !ctx.target_message_deleted {
-            ctx.target_message_deleted = ctx.file_descriptors.iter().any(|descriptor| {
-                first_row_for_recorded(
+        if ctx.purge_message_event_id.is_none() {
+            for descriptor in &ctx.file_descriptors {
+                if first_row_for_recorded(
                     &state,
                     "deleted_messages",
                     recorded_by,
@@ -1608,7 +1573,11 @@ impl ProjectionQueries for NodeBehaviorEngine {
                     &descriptor.message_id,
                 )
                 .is_some()
-            });
+                {
+                    ctx.purge_message_event_id = Some(descriptor.message_id.clone());
+                    break;
+                }
+            }
         }
         ctx.file_descriptors
             .sort_by(|left, right| left.event_id.cmp(&right.event_id));

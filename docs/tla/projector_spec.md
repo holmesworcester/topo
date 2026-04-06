@@ -95,7 +95,7 @@ signer's user, not an admin event.
 | Code | Projector Function | Projection Table | Special Logic |
 |------|-------------------|------------------|---------------|
 | 1 | project_message | messages | — |
-| 2 | project_reaction | reactions | skip if target deleted |
+| 2 | project_reaction | reactions | owner tombstone purges in shared prereq/context stage |
 | 3 | retired (peer_key) | — | rejected as unknown type |
 | 4 | retired (type4_legacy) | — | rejected as unknown type |
 | 5 | project_encrypted | (dispatches inner) | decrypt → admissibility check → shared dep/signer/dispatch stages |
@@ -117,8 +117,8 @@ signer's user, not an admin event.
 | 21 | retired (unused) | — | rejected as unknown type |
 | 22 | project_secret_shared | secret_shared | wraps to invite recipient; emits deterministic local `key_secret` on successful unwrap |
 | 23 | project_peer | peers_local | local tenant-bound peer identity |
-| 24 | project_message_attachment | message_attachments | — |
-| 25 | project_file_slice | file_slices | signature verification |
+| 24 | project_message_attachment | message_attachments | owner tombstone purges in shared prereq/context stage |
+| 25 | project_file_slice | file_slices | signature verification; deleted owner purges in context loader |
 | 26 | (none) | valid_events | dependency benchmark event; no projection table side effects |
 | 27 | project_local_signer_secret | local_signer_material | UPSERT by signer_event_id; emits ApplyTransportIdentityIntent for peer_shared signer kind |
 | 28 | project_invite_privkey | invite_privkeys | deterministic local invite unwrap key material |

@@ -33,7 +33,7 @@ pub fn build_projector_context(
 
 /// Pure projector: MessageDeletion -> two-stage deletion intent + tombstone model.
 ///
-/// 1. Always emits an idempotent deletion_intent write keyed by (recorded_by, "message", target_id).
+/// 1. Always emits an idempotent deletion_intent write keyed by (recorded_by, target_id).
 /// 2. If target exists in projected state (ctx.target_message_author is Some), verifies
 ///    author match and emits tombstone + cascade writes.
 /// 3. If target doesn't exist yet (None), only records intent - the message projector
@@ -84,7 +84,6 @@ pub fn project_pure(
             table: "deletion_intents",
             columns: vec![
                 "recorded_by",
-                "target_kind",
                 "target_id",
                 "deletion_event_id",
                 "author_id",
@@ -93,7 +92,6 @@ pub fn project_pure(
             ],
             values: vec![
                 SqlVal::Text(recorded_by.to_string()),
-                SqlVal::Text("message".to_string()),
                 SqlVal::Text(target_b64.clone()),
                 SqlVal::Text(event_id_b64.to_string()),
                 SqlVal::Text(intent_author_id),
@@ -114,7 +112,6 @@ pub fn project_pure(
         table: "deletion_intents",
         columns: vec![
             "recorded_by",
-            "target_kind",
             "target_id",
             "deletion_event_id",
             "author_id",
@@ -123,7 +120,6 @@ pub fn project_pure(
         ],
         values: vec![
             SqlVal::Text(recorded_by.to_string()),
-            SqlVal::Text("message".to_string()),
             SqlVal::Text(target_b64.clone()),
             SqlVal::Text(event_id_b64.to_string()),
             SqlVal::Text(intent_author_id.clone()),
@@ -156,22 +152,6 @@ pub fn project_pure(
                 SqlVal::Text(event_id_b64.to_string()),
                 SqlVal::Text(msg_author.clone()),
                 SqlVal::Int(del.created_at_ms as i64),
-            ],
-        });
-
-        // Cascade: delete message and its reactions (explicit write ops, not hidden side effects)
-        ops.push(WriteOp::Delete {
-            table: "messages",
-            where_clause: vec![
-                ("recorded_by", SqlVal::Text(recorded_by.to_string())),
-                ("message_id", SqlVal::Text(target_b64.clone())),
-            ],
-        });
-        ops.push(WriteOp::Delete {
-            table: "reactions",
-            where_clause: vec![
-                ("recorded_by", SqlVal::Text(recorded_by.to_string())),
-                ("target_event_id", SqlVal::Text(target_b64.clone())),
             ],
         });
 

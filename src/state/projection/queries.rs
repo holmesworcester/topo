@@ -23,6 +23,7 @@ pub enum ContextLoadResult {
     Ready(ContextSnapshot),
     Block { missing: Vec<EventId> },
     Reject { reason: String },
+    Purge { message_event_id: String },
 }
 
 impl ContextLoadResult {
@@ -45,12 +46,19 @@ impl ContextLoadResult {
             reason: reason.into(),
         }
     }
+
+    pub fn purge(message_event_id: impl Into<String>) -> Self {
+        Self::Purge {
+            message_event_id: message_event_id.into(),
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum DepLoadResult {
     Ready { semantic_type_code: Option<u8> },
     Missing,
+    Purge { message_event_id: String },
 }
 
 impl DepLoadResult {
@@ -60,6 +68,12 @@ impl DepLoadResult {
 
     pub fn missing() -> Self {
         Self::Missing
+    }
+
+    pub fn purge(message_event_id: impl Into<String>) -> Self {
+        Self::Purge {
+            message_event_id: message_event_id.into(),
+        }
     }
 }
 
@@ -84,12 +98,6 @@ pub trait ProjectionQueries {
         recorded_by: &str,
         key_event_id: &[u8; 32],
     ) -> ProjectionQueryResult<Option<[u8; 32]>>;
-
-    fn message_is_deleted(
-        &self,
-        recorded_by: &str,
-        message_id_b64: &str,
-    ) -> ProjectionQueryResult<bool>;
 
     fn load_workspace_context(
         &self,
@@ -322,13 +330,13 @@ fn dep_is_satisfied_for_scope(
     global_endpoint_shared_is_valid(conn, dep_b64)
 }
 
-fn tombstone_satisfies_message_dep(
+fn deleted_message_purges_dep(
     conn: &Connection,
     recorded_by: &str,
     parsed: &ParsedEvent,
     field_name: &str,
     dep_b64: &str,
-) -> Result<bool, rusqlite::Error> {
+) -> Result<Option<String>, rusqlite::Error> {
     let is_deleted_message_target = matches!(
         (parsed, field_name),
         (ParsedEvent::Reaction(_), "target_event_id")
@@ -336,15 +344,16 @@ fn tombstone_satisfies_message_dep(
             | (ParsedEvent::Encrypted(_), "owner_event_id")
     );
     if !is_deleted_message_target {
-        return Ok(false);
+        return Ok(None);
     }
-    conn.query_row(
+    let deleted: bool = conn.query_row(
         "SELECT COUNT(*) > 0
          FROM deleted_messages
          WHERE recorded_by = ?1 AND message_id = ?2",
         rusqlite::params![recorded_by, dep_b64],
         |row| row.get(0),
-    )
+    )?;
+    Ok(deleted.then(|| dep_b64.to_string()))
 }
 
 fn load_bootstrap_context_snapshot(
@@ -606,10 +615,10 @@ impl ProjectionQueries for Connection {
                 &dep_b64,
             )?));
         }
-        if tombstone_satisfies_message_dep(self, recorded_by, parsed, field_name, &dep_b64)? {
-            return Ok(DepLoadResult::ready(Some(
-                crate::event_modules::EVENT_TYPE_MESSAGE,
-            )));
+        if let Some(message_event_id) =
+            deleted_message_purges_dep(self, recorded_by, parsed, field_name, &dep_b64)?
+        {
+            return Ok(DepLoadResult::purge(message_event_id));
         }
         Ok(DepLoadResult::missing())
     }
@@ -636,20 +645,6 @@ impl ProjectionQueries for Connection {
         let mut out = [0u8; 32];
         out.copy_from_slice(&key_bytes);
         Ok(Some(out))
-    }
-
-    fn message_is_deleted(
-        &self,
-        recorded_by: &str,
-        message_id_b64: &str,
-    ) -> ProjectionQueryResult<bool> {
-        Ok(self.query_row(
-            "SELECT COUNT(*) > 0
-             FROM deleted_messages
-             WHERE recorded_by = ?1 AND message_id = ?2",
-            rusqlite::params![recorded_by, message_id_b64],
-            |row| row.get(0),
-        )?)
     }
 
     fn load_workspace_context(
@@ -951,7 +946,6 @@ impl ProjectionQueries for Connection {
             "SELECT deletion_event_id, author_id, authorized_by_admin, created_at
              FROM deletion_intents
              WHERE recorded_by = ?1
-               AND target_kind = 'message'
                AND target_id = ?2
              ORDER BY deletion_event_id",
         )?;
@@ -1022,18 +1016,11 @@ impl ProjectionQueries for Connection {
         _event_id_b64: &str,
         reaction: &ReactionEvent,
     ) -> ProjectionQueryResult<ContextSnapshot> {
-        let target_b64 = event_id_to_base64(&reaction.target_event_id);
-        let target_message_deleted = self.query_row(
-            "SELECT COUNT(*) > 0 FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
-            rusqlite::params![recorded_by, &target_b64],
-            |row| row.get(0),
-        )?;
         let signer_user_mismatch_reason =
             signer_user_mismatch_reason(self, frame, recorded_by, &reaction.author_id)?;
 
         Ok(ContextSnapshot {
             signer_user_mismatch_reason,
-            target_message_deleted,
             ..ContextSnapshot::default()
         })
     }
@@ -1041,23 +1028,11 @@ impl ProjectionQueries for Connection {
     fn load_file_context(
         &self,
         _frame: &ProjectionFrameContext,
-        recorded_by: &str,
+        _recorded_by: &str,
         _event_id_b64: &str,
-        file: &FileEvent,
+        _file: &FileEvent,
     ) -> ProjectionQueryResult<ContextSnapshot> {
-        let message_id_b64 = event_id_to_base64(&file.message_id);
-        let target_message_deleted: bool = self.query_row(
-            "SELECT COUNT(*) > 0
-             FROM deleted_messages
-             WHERE recorded_by = ?1 AND message_id = ?2",
-            rusqlite::params![recorded_by, &message_id_b64],
-            |row| row.get(0),
-        )?;
-
-        Ok(ContextSnapshot {
-            target_message_deleted,
-            ..ContextSnapshot::default()
-        })
+        Ok(ContextSnapshot::default())
     }
 
     fn load_file_slice_context(
@@ -1071,13 +1046,16 @@ impl ProjectionQueries for Connection {
         let file_id_b64 = event_id_to_base64(&file_slice.file_id);
 
         if let Some(owner_event_id_b64) = frame.current_owner_event_id.as_deref() {
-            ctx.target_message_deleted = self.query_row(
+            let owner_deleted: bool = self.query_row(
                 "SELECT COUNT(*) > 0
                  FROM deleted_messages
                  WHERE recorded_by = ?1 AND message_id = ?2",
                 rusqlite::params![recorded_by, owner_event_id_b64],
                 |row| row.get(0),
             )?;
+            if owner_deleted {
+                ctx.purge_message_event_id = Some(owner_event_id_b64.to_string());
+            }
         }
 
         let mut desc_stmt = self.prepare(
@@ -1105,7 +1083,7 @@ impl ProjectionQueries for Connection {
             })?
             .collect::<Result<Vec<_>, _>>()?;
 
-        if !ctx.target_message_deleted {
+        if ctx.purge_message_event_id.is_none() {
             for descriptor in &ctx.file_descriptors {
                 let message_deleted: bool = self.query_row(
                     "SELECT COUNT(*) > 0
@@ -1115,7 +1093,7 @@ impl ProjectionQueries for Connection {
                     |row| row.get(0),
                 )?;
                 if message_deleted {
-                    ctx.target_message_deleted = true;
+                    ctx.purge_message_event_id = Some(descriptor.message_id.clone());
                     break;
                 }
             }

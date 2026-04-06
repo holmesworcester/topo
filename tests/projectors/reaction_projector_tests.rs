@@ -2,7 +2,6 @@
 //!
 //! TLA+ guards tested:
 //!   SPEC_RXN_SIGNER_01 — InvSigner (signer-user mismatch reject + pass)
-//!   CHK_RXN_SKIP_DELETED — post-tombstone skip behavior
 
 #[cfg(test)]
 mod tests {
@@ -10,7 +9,6 @@ mod tests {
     use topo::event_modules::reaction::ReactionEvent;
     use topo::event_modules::reaction::{build_projector_context, project_pure};
     use topo::event_modules::ParsedEvent;
-    use topo::projection::contract::EmitCommand;
     use topo::projection::queries::ProjectionFrameContext;
 
     const PEER: &str = "peer_alice";
@@ -59,31 +57,6 @@ mod tests {
         )
         .unwrap();
         assert_context_reject_contains(&result, "signer peer not linked to author user");
-    }
-
-    // ── CHK_RXN_SKIP_DELETED: pass (valid but no write) ──
-
-    #[test]
-    fn test_reaction_skips_when_target_deleted() {
-        let parsed = make_reaction();
-        let ctx = topo::projection::contract::ContextSnapshot {
-            target_message_deleted: true,
-            current_owner_event_id: Some(b64(&[1u8; 32])),
-            ..Default::default()
-        };
-
-        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
-        assert_valid(&result);
-        assert!(
-            result.write_ops.is_empty(),
-            "should produce no write ops when target deleted"
-        );
-        assert_emits_command(&result, "HardPurgeMessageGraph", |cmd| {
-            matches!(
-                cmd,
-                EmitCommand::HardPurgeMessageGraph { message_event_id } if message_event_id == &b64(&[1u8; 32])
-            )
-        });
     }
 
     #[test]

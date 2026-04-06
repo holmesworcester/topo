@@ -49,14 +49,6 @@ pub mod fixtures {
             Ok(None)
         }
 
-        fn message_is_deleted(
-            &self,
-            _recorded_by: &str,
-            _message_id_b64: &str,
-        ) -> Result<bool, Box<dyn std::error::Error>> {
-            Ok(false)
-        }
-
         fn load_workspace_context(
             &self,
             _frame: &ProjectionFrameContext,
@@ -203,26 +195,10 @@ pub mod fixtures {
         }
     }
 
-    /// ContextSnapshot for message deletion with target message author.
-    pub fn ctx_with_target_author(author_b64: &str) -> ContextSnapshot {
-        ContextSnapshot {
-            target_message_author: Some(author_b64.to_string()),
-            ..Default::default()
-        }
-    }
-
     /// ContextSnapshot with file descriptors.
     pub fn ctx_with_file_descriptors(descriptors: Vec<FileDescriptorInfo>) -> ContextSnapshot {
         ContextSnapshot {
             file_descriptors: descriptors,
-            ..Default::default()
-        }
-    }
-
-    /// ContextSnapshot with target message deletion state set.
-    pub fn ctx_with_target_message_deleted() -> ContextSnapshot {
-        ContextSnapshot {
-            target_message_deleted: true,
             ..Default::default()
         }
     }
@@ -375,6 +351,15 @@ pub mod fixtures {
                 );
             }
             other => panic!("expected ContextLoadResult::Reject, got {:?}", other),
+        }
+    }
+
+    pub fn assert_context_purge(result: &ContextLoadResult, message_event_id: &str) {
+        match result {
+            ContextLoadResult::Purge {
+                message_event_id: actual,
+            } => assert_eq!(actual, message_event_id),
+            other => panic!("expected ContextLoadResult::Purge, got {:?}", other),
         }
     }
 

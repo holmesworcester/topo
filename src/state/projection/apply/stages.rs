@@ -5,10 +5,7 @@ use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::queue::current_timestamp_ms;
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::encrypted::NO_OWNER_EVENT_ID;
-use crate::event_modules::{
-    registry, ParsedEvent, TransportPrivacy, EVENT_TYPE_FILE, EVENT_TYPE_FILE_SLICE,
-    EVENT_TYPE_REACTION,
-};
+use crate::event_modules::{registry, ParsedEvent, TransportPrivacy};
 use crate::projection::contract::EmitCommand;
 use crate::projection::queries::{ContextLoadResult, DepLoadResult, ProjectionFrameContext};
 use crate::state::live_hints::source_peer_id_from_source_tag;
@@ -17,30 +14,6 @@ use rusqlite::{Connection, OptionalExtension};
 use super::dispatch::dispatch_pure_projector;
 
 const MAX_PROJECTION_ENVELOPE_DEPTH: usize = 4;
-
-fn encrypted_owner_deleted_fast_path<B: ProjectionBackend>(
-    backend: &B,
-    recorded_by: &str,
-    parsed: &ParsedEvent,
-) -> ProjectionApplyResult<Option<String>> {
-    let ParsedEvent::Encrypted(enc) = parsed else {
-        return Ok(None);
-    };
-    if enc.owner_event_id == NO_OWNER_EVENT_ID {
-        return Ok(None);
-    }
-    if !matches!(
-        enc.inner_type_code,
-        EVENT_TYPE_REACTION | EVENT_TYPE_FILE | EVENT_TYPE_FILE_SLICE
-    ) {
-        return Ok(None);
-    }
-    let owner_event_id_b64 = event_id_to_base64(&enc.owner_event_id);
-    if backend.message_is_deleted(recorded_by, &owner_event_id_b64)? {
-        return Ok(Some(owner_event_id_b64));
-    }
-    Ok(None)
-}
 
 fn check_transport_privacy(
     parsed: &ParsedEvent,
@@ -149,27 +122,40 @@ fn load_context_with_prereqs<B: ProjectionBackend>(
 
     let deps = parsed.dep_field_values();
     let mut missing = Vec::new();
+    let mut ready_deps = Vec::new();
+    let mut purge_message_event_id = None;
     for (idx, (field_name, dep_id)) in deps.iter().enumerate() {
         match backend.load_dep_result(recorded_by, parsed, field_name, dep_id)? {
             DepLoadResult::Missing => missing.push(*dep_id),
             DepLoadResult::Ready { semantic_type_code } => {
-                let allowed = meta.dep_field_type_codes.get(idx).copied().unwrap_or(&[]);
-                if allowed.is_empty() {
-                    continue;
-                }
-                let Some(actual) = semantic_type_code else {
-                    return Ok(ContextLoadResult::reject(format!(
-                        "dep {} missing tenant-scoped semantic type record",
-                        field_name
-                    )));
-                };
-                if !allowed.contains(&actual) {
-                    return Ok(ContextLoadResult::reject(format!(
-                        "dep {} has semantic type code {} but expected one of {:?}",
-                        field_name, actual, allowed
-                    )));
-                }
+                ready_deps.push((idx, *field_name, semantic_type_code))
             }
+            DepLoadResult::Purge { message_event_id } => {
+                purge_message_event_id.get_or_insert(message_event_id);
+            }
+        }
+    }
+
+    if let Some(message_event_id) = purge_message_event_id {
+        return Ok(ContextLoadResult::purge(message_event_id));
+    }
+
+    for (idx, field_name, semantic_type_code) in ready_deps {
+        let allowed = meta.dep_field_type_codes.get(idx).copied().unwrap_or(&[]);
+        if allowed.is_empty() {
+            continue;
+        }
+        let Some(actual) = semantic_type_code else {
+            return Ok(ContextLoadResult::reject(format!(
+                "dep {} missing tenant-scoped semantic type record",
+                field_name
+            )));
+        };
+        if !allowed.contains(&actual) {
+            return Ok(ContextLoadResult::reject(format!(
+                "dep {} has semantic type code {} but expected one of {:?}",
+                field_name, actual, allowed
+            )));
         }
     }
 
@@ -278,18 +264,6 @@ fn apply_projection_frame<B: ProjectionBackend>(
         return Ok((ProjectionDecision::Reject { reason }, None));
     }
 
-    if let Some(owner_event_id_b64) =
-        encrypted_owner_deleted_fast_path(backend, recorded_by, parsed)?
-    {
-        backend.execute_emit_commands(
-            recorded_by,
-            &[EmitCommand::HardPurgeMessageGraph {
-                message_event_id: owner_event_id_b64,
-            }],
-        )?;
-        return Ok((ProjectionDecision::Valid, None));
-    }
-
     // Generic prerequisite reads now live at the context-load boundary:
     // declared deps, dep semantic types, and module-local context all return
     // through the same tri-state result.
@@ -304,6 +278,13 @@ fn apply_projection_frame<B: ProjectionBackend>(
             }
             ContextLoadResult::Reject { reason } => {
                 return Ok((ProjectionDecision::Reject { reason }, None));
+            }
+            ContextLoadResult::Purge { message_event_id } => {
+                backend.execute_emit_commands(
+                    recorded_by,
+                    &[EmitCommand::HardPurgeMessageGraph { message_event_id }],
+                )?;
+                return Ok((ProjectionDecision::Valid, None));
             }
         };
     ctx.current_transport_key_event_id = frame.current_transport_key_event_id.clone();

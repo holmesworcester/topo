@@ -41,8 +41,8 @@ mod tests {
         assert_writes_to_table(&result, "deletion_intents");
         assert_writes_to_table(&result, "deleted_messages");
         assert!(
-            result.write_ops.len() >= 3,
-            "expected intent + tombstone + cascade ops"
+            result.write_ops.len() >= 2,
+            "expected intent + tombstone writes before purge command"
         );
         assert_emits_command(&result, "HardPurgeMessageGraph", |cmd| {
             matches!(

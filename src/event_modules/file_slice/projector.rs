@@ -2,15 +2,27 @@ use super::super::ParsedEvent;
 use super::wire::{unpack_bao_payload, FILE_SLICE_CIPHERTEXT_BYTES};
 use crate::crypto::bao_verify;
 use crate::crypto::event_id_to_base64;
-use crate::projection::contract::{ContextSnapshot, EmitCommand, ProjectorResult, SqlVal, WriteOp};
-use crate::projection::queries::define_query_context_loader;
+use crate::projection::contract::{ContextSnapshot, ProjectorResult, SqlVal, WriteOp};
+use crate::projection::queries::{ContextLoadResult, ProjectionFrameContext, ProjectionQueries};
 
-define_query_context_loader!(
-    build_projector_context,
-    FileSlice,
-    load_file_slice_context,
-    "file_slice"
-);
+pub fn build_projector_context(
+    queries: &dyn ProjectionQueries,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+    event_id_b64: &str,
+    parsed: &ParsedEvent,
+) -> Result<ContextLoadResult, Box<dyn std::error::Error>> {
+    let file_slice = match parsed {
+        ParsedEvent::FileSlice(file_slice) => file_slice,
+        _ => return Err("file_slice context loader called for non-file_slice event".into()),
+    };
+
+    let ctx = queries.load_file_slice_context(frame, recorded_by, event_id_b64, file_slice)?;
+    if let Some(message_event_id) = &ctx.purge_message_event_id {
+        return Ok(ContextLoadResult::purge(message_event_id.clone()));
+    }
+    Ok(ContextLoadResult::ready(ctx))
+}
 
 /// Pure projector: FileSlice → file_slices table insert.
 ///
@@ -38,17 +50,6 @@ pub fn project_pure(
     };
     let slice_signer_b64 = current_signer.event_id.clone();
 
-    if ctx.target_message_deleted {
-        if let Some(message_event_id) = owner_event_id_b64 {
-            return ProjectorResult::valid_with_commands(
-                Vec::new(),
-                vec![EmitCommand::HardPurgeMessageGraph {
-                    message_event_id: message_event_id.to_string(),
-                }],
-            );
-        }
-    }
-
     if ctx.file_descriptors.is_empty() {
         // No descriptor yet — block on file_id as a synthetic dep.
         // When the File event projects, cascade resolves events blocked
@@ -65,15 +66,6 @@ pub fn project_pure(
     }
 
     let descriptor = &ctx.file_descriptors[0];
-    if ctx.target_message_deleted {
-        let message_event_id = owner_event_id_b64
-            .map(str::to_owned)
-            .unwrap_or_else(|| descriptor.message_id.clone());
-        return ProjectorResult::valid_with_commands(
-            Vec::new(),
-            vec![EmitCommand::HardPurgeMessageGraph { message_event_id }],
-        );
-    }
     if let Some(owner_event_id_b64) = owner_event_id_b64 {
         if descriptor.message_id != owner_event_id_b64 {
             return ProjectorResult::reject(format!(

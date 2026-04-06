@@ -28,13 +28,12 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
 
         CREATE TABLE IF NOT EXISTS deletion_intents (
             recorded_by TEXT NOT NULL,
-            target_kind TEXT NOT NULL,
             target_id TEXT NOT NULL,
             deletion_event_id TEXT NOT NULL,
             author_id TEXT NOT NULL,
             authorized_by_admin INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
-            PRIMARY KEY (recorded_by, target_kind, target_id, deletion_event_id)
+            PRIMARY KEY (recorded_by, target_id, deletion_event_id)
         );
         CREATE INDEX IF NOT EXISTS idx_deletion_intents_target
             ON deletion_intents(recorded_by, target_id);

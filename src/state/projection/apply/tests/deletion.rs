@@ -142,7 +142,7 @@ fn test_deletion_intent_only_on_missing_target() {
     // Verify deletion_intent was written
     let target_b64 = event_id_to_base64(&fake_target);
     let intent_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM deletion_intents WHERE recorded_by = ?1 AND target_kind = 'message' AND target_id = ?2",
+        "SELECT COUNT(*) FROM deletion_intents WHERE recorded_by = ?1 AND target_id = ?2",
         rusqlite::params![recorded_by, &target_b64],
         |row| row.get(0),
     ).unwrap();
@@ -833,7 +833,7 @@ fn test_deletion_invariant_command_idempotence() {
 
     // Capture deletion_intent identity
     let intent_1: (String, String) = conn.query_row(
-        "SELECT deletion_event_id, author_id FROM deletion_intents WHERE recorded_by = ?1 AND target_kind = 'message'",
+        "SELECT deletion_event_id, author_id FROM deletion_intents WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],
         |row| Ok((row.get(0)?, row.get(1)?)),
     ).unwrap();
@@ -849,7 +849,7 @@ fn test_deletion_invariant_command_idempotence() {
 
     // Intent identity must be stable (same event_id, same author)
     let intent_2: (String, String) = conn.query_row(
-        "SELECT deletion_event_id, author_id FROM deletion_intents WHERE recorded_by = ?1 AND target_kind = 'message'",
+        "SELECT deletion_event_id, author_id FROM deletion_intents WHERE recorded_by = ?1",
         rusqlite::params![recorded_by],
         |row| Ok((row.get(0)?, row.get(1)?)),
     ).unwrap();
@@ -1055,7 +1055,7 @@ fn test_hard_purge_removes_message_graph_and_auxiliary_rows() {
     let intent_count: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM deletion_intents
-             WHERE recorded_by = ?1 AND target_kind = 'message' AND target_id = ?2",
+             WHERE recorded_by = ?1 AND target_id = ?2",
             rusqlite::params![recorded_by, &msg_b64],
             |row| row.get(0),
         )
@@ -1333,8 +1333,8 @@ fn test_replaying_deletion_on_existing_tombstone_repurges_legacy_material() {
     .unwrap();
     conn.execute(
         "INSERT INTO deletion_intents
-         (recorded_by, target_kind, target_id, deletion_event_id, author_id, created_at)
-         VALUES (?1, 'message', ?2, ?3, ?4, 1)",
+         (recorded_by, target_id, deletion_event_id, author_id, created_at)
+         VALUES (?1, ?2, ?3, ?4, 1)",
         rusqlite::params![recorded_by, &msg_b64, &legacy_del_b64, &author_b64],
     )
     .unwrap();

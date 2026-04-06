@@ -589,17 +589,17 @@ Deterministic emitted-event exception (still under this rule):
 Two-stage model so deletes stay deterministic when events arrive out of order:
 
 1. `MessageDeletion` projector emits an idempotent `deletion_intent` write keyed by
-   `(recorded_by, target_kind="message", target_id)`.
-2. If target exists in projected state, projector also emits tombstone + live-view cleanup
-   WriteOps plus a `HardPurgeMessageGraph` follow-up in the same projection transaction.
+   `(recorded_by, target_id)`.
+2. If target exists in projected state, projector also emits the tombstone WriteOps plus a
+   `HardPurgeMessageGraph` follow-up in the same projection transaction.
 3. If target does not exist yet, projector only records intent; no imperative retries.
 4. Target-creation projectors check for matching `deletion_intent` rows in their
    `ContextSnapshot` and immediately tombstone on first materialization, using the
    original deletion event's identity for replay invariance.
-5. Cleanup work (message delete → live `messages`/`reactions` deletes) is explicit `Delete` WriteOps.
+5. Hard purge owns all live-state cleanup for the deleted message graph.
 6. Deletion state is monotonic: `active → tombstoned` allowed, `tombstoned → active` forbidden.
 7. Hard purge removes deleted event blobs and dependent rows in the same projection transaction; only minimal tombstones remain (`deletion_intents`, `deleted_messages`).
-8. Late `reaction` / `file` arrivals on tombstoned messages bypass only the deleted message dep edge, emit `HardPurgeMessageGraph`, and purge themselves atomically.
+8. Late `reaction` / `file` arrivals on tombstoned messages return a terminal prereq/context purge outcome instead of entering their projectors.
 9. Late encrypted `file_slice` arrivals purge by the same owner-message rule: the wrapper carries `owner_event_id = root_message_id`, and purge finds those recorded blobs through `recorded_event_owners` instead of scanning or decrypting tenant event storage.
 10. If hard purge or verification fails, the whole projection transaction rolls back and the normal queue retry path handles it later.
 
