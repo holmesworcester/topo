@@ -112,6 +112,7 @@ fn request_sync_all(db: &str, timeout: Duration) {
 
 fn generate_messages_with_span(db: &str, count: usize, history_span: &str) {
     ensure_active_peer(db, Duration::from_secs(10));
+    let peer_id = cli_harness::active_tenant_peer_id(db).expect("active tenant peer id");
     let chunk_size = std::env::var("TOPO_TEST_GENERATE_CHUNK_SIZE")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -120,22 +121,13 @@ fn generate_messages_with_span(db: &str, count: usize, history_span: &str) {
     let mut remaining = count;
     while remaining > 0 {
         let next = remaining.min(chunk_size);
-        let output = topo_cmd(
+        topo::event_modules::message::commands::generate_for_peer(
             db,
-            &[
-                "generate",
-                "--count",
-                &next.to_string(),
-                "--history-span",
-                history_span,
-            ],
-        );
-        assert!(
-            output.status.success(),
-            "generate --history-span failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+            &peer_id,
+            next,
+            Some(history_span),
+        )
+        .expect("generate synthetic messages with span");
         remaining -= next;
     }
 }

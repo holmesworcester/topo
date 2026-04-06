@@ -229,6 +229,8 @@ fn real_pair_sync_is_required_for_replication_between_virtual_daemon_nodes() {
         workspace_name: "sim".into(),
         username: "alice".into(),
         device_name: "laptop".into(),
+        message_count: 0,
+        network_age: None,
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
     let alice_peer = active_peer_id(&alice);
@@ -271,6 +273,8 @@ fn planner_drives_hop_by_hop_message_and_key_shared_propagation() {
         workspace_name: "sim".into(),
         username: "alice".into(),
         device_name: "phone".into(),
+        message_count: 0,
+        network_age: None,
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
     let phone_peer = active_peer_id(&phone);

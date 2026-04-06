@@ -259,8 +259,24 @@ fn emit_peer_secret(
     signer_event_id: &EventId,
     signing_key: &SigningKey,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    emit_peer_secret_at(
+        db,
+        recorded_by,
+        signer_event_id,
+        signing_key,
+        current_timestamp_ms_u64(),
+    )
+}
+
+fn emit_peer_secret_at(
+    db: &Connection,
+    recorded_by: &str,
+    signer_event_id: &EventId,
+    signing_key: &SigningKey,
+    created_at_ms: u64,
+) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
     let evt = ParsedEvent::PeerSecret(PeerSecretEvent {
-        created_at_ms: current_timestamp_ms_u64(),
+        created_at_ms,
         signer_event_id: *signer_event_id,
         private_key_bytes: signing_key.to_bytes(),
     });
@@ -278,7 +294,57 @@ pub struct CreateWorkspaceResult {
     pub peer_shared_key: SigningKey,
 }
 
-// ─── 1. Start workspace ───
+#[derive(Debug, Clone, Copy, Default)]
+pub struct CreateWorkspaceOptions {
+    pub message_count: usize,
+    pub network_age_ms: Option<u64>,
+    pub end_at_ms: Option<u64>,
+}
+
+impl CreateWorkspaceOptions {
+    fn resolved_network_age_ms(self) -> Option<u64> {
+        match self.network_age_ms.filter(|age| *age > 0) {
+            Some(age) => Some(age),
+            None if self.message_count > 0 => {
+                Some(crate::event_modules::message::commands::DEFAULT_GENERATE_HISTORY_SPAN_MS)
+            }
+            None => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct TimestampCursor {
+    next_ms: u64,
+    end_ms: u64,
+}
+
+impl TimestampCursor {
+    fn new(start_ms: u64, end_ms: u64) -> Self {
+        let end_ms = end_ms.max(start_ms);
+        Self {
+            next_ms: start_ms,
+            end_ms,
+        }
+    }
+
+    fn take(&mut self) -> u64 {
+        let ts = self.next_ms;
+        self.next_ms = self.next_ms.saturating_add(1).min(self.end_ms);
+        ts
+    }
+
+    fn peek(&self) -> u64 {
+        self.next_ms.min(self.end_ms)
+    }
+}
+
+fn next_created_at(cursor: &mut Option<TimestampCursor>) -> u64 {
+    cursor
+        .as_mut()
+        .map(|timestamps| timestamps.take())
+        .unwrap_or_else(current_timestamp_ms_u64)
+}
 
 /// Create a new workspace with a full identity chain.
 ///
@@ -297,6 +363,24 @@ pub fn create_workspace(
     workspace_name: &str,
     username: &str,
     device_name: &str,
+) -> Result<CreateWorkspaceResult, Box<dyn std::error::Error + Send + Sync>> {
+    create_workspace_with_options(
+        db,
+        recorded_by,
+        workspace_name,
+        username,
+        device_name,
+        CreateWorkspaceOptions::default(),
+    )
+}
+
+pub fn create_workspace_with_options(
+    db: &Connection,
+    recorded_by: &str,
+    workspace_name: &str,
+    username: &str,
+    device_name: &str,
+    options: CreateWorkspaceOptions,
 ) -> Result<CreateWorkspaceResult, Box<dyn std::error::Error + Send + Sync>> {
     // Idempotent check: direct callers can reuse an explicit tenant scope by
     // passing its recorded_by. User-facing create-workspace paths pass an
@@ -358,7 +442,7 @@ pub fn create_workspace(
         .into());
     }
 
-    create_workspace_inner(db, workspace_name, username, device_name)
+    create_workspace_inner(db, workspace_name, username, device_name, options)
 }
 
 fn create_workspace_inner(
@@ -366,8 +450,13 @@ fn create_workspace_inner(
     workspace_name: &str,
     username: &str,
     device_name: &str,
+    options: CreateWorkspaceOptions,
 ) -> Result<CreateWorkspaceResult, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
+    let end_at_ms = options.end_at_ms.unwrap_or_else(current_timestamp_ms_u64);
+    let mut timestamps = options
+        .resolved_network_age_ms()
+        .map(|age| TimestampCursor::new(end_at_ms.saturating_sub(age), end_at_ms));
     let _ = ensure_daemon_identity(db)?;
     let endpoint_shared_event_id =
         crate::event_modules::endpoint_shared::load_local_endpoint_shared(db)?
@@ -388,7 +477,7 @@ fn create_workspace_inner(
     // 1. Pre-compute workspace event_id for the local self-accept flow.
     let workspace_key = SigningKey::generate(&mut rng);
     let ws = ParsedEvent::Workspace(WorkspaceEvent {
-        created_at_ms: current_timestamp_ms_u64(),
+        created_at_ms: next_created_at(&mut timestamps),
         public_key: workspace_key.verifying_key().to_bytes(),
         name: workspace_name.to_string(),
     });
@@ -401,11 +490,16 @@ fn create_workspace_inner(
     assert_eq!(ws_eid, ws_eid2, "pre-computed workspace event_id mismatch");
 
     // 3. Ensure tenant root chain exists: tenant root, peer depends on tenant.
-    let tenant_event_id = ops::ensure_local_tenant_event(db, &derived_peer_id, &peer_shared_key)?;
+    let tenant_event_id = ops::ensure_local_tenant_event_at(
+        db,
+        &derived_peer_id,
+        &peer_shared_key,
+        next_created_at(&mut timestamps),
+    )?;
 
     // 4. InviteAccepted (local event — becomes authoritative workspace binding).
     let ia = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-        created_at_ms: current_timestamp_ms_u64(),
+        created_at_ms: next_created_at(&mut timestamps),
         tenant_event_id,
         invite_event_id: ws_eid,
         workspace_id: ws_eid,
@@ -417,7 +511,7 @@ fn create_workspace_inner(
     // 5. UserInvite (signed by workspace_key)
     let invite_key = SigningKey::generate(&mut rng);
     let uib = ParsedEvent::UserInvite(UserInviteEvent {
-        created_at_ms: current_timestamp_ms_u64(),
+        created_at_ms: next_created_at(&mut timestamps),
         public_key: invite_key.verifying_key().to_bytes(),
         workspace_id: ws_eid,
         authority_event_id: ws_eid,
@@ -428,7 +522,7 @@ fn create_workspace_inner(
     // 7. User (signed by invite_key)
     let user_key = SigningKey::generate(&mut rng);
     let ub = ParsedEvent::User(UserEvent {
-        created_at_ms: current_timestamp_ms_u64(),
+        created_at_ms: next_created_at(&mut timestamps),
         public_key: user_key.verifying_key().to_bytes(),
         username: username.to_string(),
     });
@@ -436,7 +530,7 @@ fn create_workspace_inner(
 
     // 8. Admin (bootstrap grant for creator user; signed by workspace_key)
     let admin_evt = ParsedEvent::Admin(AdminEvent {
-        created_at_ms: current_timestamp_ms_u64(),
+        created_at_ms: next_created_at(&mut timestamps),
         public_key: user_key.verifying_key().to_bytes(),
         user_event_id: ub_eid,
     });
@@ -446,7 +540,7 @@ fn create_workspace_inner(
     // 9. DeviceInvite (signed by user_key)
     let device_invite_key = SigningKey::generate(&mut rng);
     let dif = ParsedEvent::DeviceInvite(DeviceInviteEvent {
-        created_at_ms: current_timestamp_ms_u64(),
+        created_at_ms: next_created_at(&mut timestamps),
         public_key: device_invite_key.verifying_key().to_bytes(),
         authority_event_id: ub_eid,
     });
@@ -454,7 +548,7 @@ fn create_workspace_inner(
 
     // 10. PeerShared (signed by device_invite_key; key pre-generated above)
     let psf = ParsedEvent::PeerShared(PeerSharedEvent {
-        created_at_ms: current_timestamp_ms_u64(),
+        created_at_ms: next_created_at(&mut timestamps),
         public_key: peer_shared_key.verifying_key().to_bytes(),
         user_event_id: ub_eid,
         endpoint_shared_event_id,
@@ -466,10 +560,34 @@ fn create_workspace_inner(
 
     // 11. Emit peer_secret for peer_shared signer key only.
     // Transport identity is already installed, so all writes use derived_peer_id.
-    emit_peer_secret(db, &derived_peer_id, &psf_eid, &peer_shared_key)?;
+    emit_peer_secret_at(
+        db,
+        &derived_peer_id,
+        &psf_eid,
+        &peer_shared_key,
+        next_created_at(&mut timestamps),
+    )?;
 
     // 12. Seed deterministic local content-key material.
-    let _ = ops::ensure_content_key_for_peer(db, &derived_peer_id)?;
+    let _ = ops::ensure_content_key_for_peer_at(
+        db,
+        &derived_peer_id,
+        next_created_at(&mut timestamps),
+    )?;
+
+    if options.message_count > 0 {
+        let start_at_ms = timestamps
+            .as_ref()
+            .map(TimestampCursor::peek)
+            .unwrap_or(end_at_ms);
+        let _ = crate::event_modules::message::commands::generate_messages_for_recorded_by_between(
+            db,
+            &derived_peer_id,
+            options.message_count,
+            start_at_ms,
+            end_at_ms,
+        )?;
+    }
 
     Ok(CreateWorkspaceResult {
         workspace_id: ws_eid,
@@ -907,9 +1025,10 @@ pub(super) fn load_local_peer_signer(
 
 pub use super::commands_api::{
     accept_device_link, accept_invite, create_device_link_for_peer, create_invite_for_db,
-    create_invite_for_peer, create_invite_with_spki, create_workspace_for_db, rotate_key_for_db,
-    rotate_key_for_peer, AcceptDeviceLinkResponse, AcceptInviteResponse, CreateInviteResponse,
-    CreateWorkspaceResponse, RotateKeyResponse,
+    create_invite_for_peer, create_invite_with_spki, create_workspace_for_db,
+    create_workspace_for_db_with_seed, rotate_key_for_db, rotate_key_for_peer,
+    AcceptDeviceLinkResponse, AcceptInviteResponse, CreateInviteResponse, CreateWorkspaceResponse,
+    RotateKeyResponse,
 };
 
 #[cfg(test)]

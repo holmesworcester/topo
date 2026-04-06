@@ -190,6 +190,8 @@ fn planner_runner_executes_no_sessions_without_real_connect_targets() {
             workspace_name: "sim".into(),
             username: "user".into(),
             device_name: "laptop".into(),
+            message_count: 0,
+            network_age: None,
         });
         assert!(created.ok, "workspace creation failed: {:?}", created.error);
     }
@@ -228,6 +230,8 @@ fn nearest_neighbor_no_auth_uses_fake_topology_for_event_layer_valid_peers() {
         workspace_name: "sim".into(),
         username: "alice".into(),
         device_name: "laptop".into(),
+        message_count: 0,
+        network_age: None,
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
 
@@ -328,6 +332,8 @@ fn planner_runner_propagates_only_through_planned_pair_sessions() {
         workspace_name: "sim".into(),
         username: "alice".into(),
         device_name: "phone".into(),
+        message_count: 0,
+        network_age: None,
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
     let phone_peer = active_peer_id(&phone);
@@ -471,6 +477,8 @@ fn nearest_neighbor_no_auth_propagates_key_shared_along_chain() {
         workspace_name: "sim".into(),
         username: "alice".into(),
         device_name: "phone".into(),
+        message_count: 0,
+        network_age: None,
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
     wait_for_authoring_ready(&phone, &[phone_db.to_string_lossy().into_owned()]);
@@ -567,6 +575,8 @@ fn fake_star_message_reaches_all_peers_in_one_round() {
         workspace_name: "sim".into(),
         username: "alice".into(),
         device_name: "laptop".into(),
+        message_count: 0,
+        network_age: None,
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
 
@@ -648,6 +658,8 @@ fn planner_runner_reimports_same_db_new_tenant_on_next_round() {
         workspace_name: "sim".into(),
         username: "alice".into(),
         device_name: "laptop".into(),
+        message_count: 0,
+        network_age: None,
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
 

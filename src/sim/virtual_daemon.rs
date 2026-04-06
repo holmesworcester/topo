@@ -89,14 +89,10 @@ mod tests {
             workspace_name: "sim".to_string(),
             username: "alice".to_string(),
             device_name: "laptop".to_string(),
+            message_count: 5,
+            network_age: Some("1d".to_string()),
         });
         assert!(created.ok, "create workspace failed: {:?}", created.error);
-
-        let generated = daemon.call(RpcMethod::Generate {
-            count: 5,
-            history_span: Some("1d".to_string()),
-        });
-        assert!(generated.ok, "generate failed: {:?}", generated.error);
 
         let stats = daemon
             .call_ok_value(RpcMethod::Stats)

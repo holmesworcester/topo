@@ -431,6 +431,8 @@ mod tests {
             workspace_name: "snapshot".into(),
             username: "alice".into(),
             device_name: "laptop".into(),
+            message_count: 3,
+            network_age: Some("1d".into()),
         });
         let _creator_peer_id = create.expect("workspace creation through RPC")["peer_id"]
             .as_str()
@@ -453,12 +455,6 @@ mod tests {
             client_op_id: None,
         });
         assert!(reacted.ok, "react failed: {:?}", reacted.error);
-
-        let generate = source_daemon.call(RpcMethod::Generate {
-            count: 3,
-            history_span: Some("1d".into()),
-        });
-        assert!(generate.ok, "generate failed: {:?}", generate.error);
 
         let invite = source_daemon.call(RpcMethod::CreateInvite {
             public_addr: None,
@@ -584,6 +580,8 @@ mod tests {
                 workspace_name: "sim".into(),
                 username: "alice".into(),
                 device_name: "laptop".into(),
+                message_count: 0,
+                network_age: None,
             })
             .expect("creator workspace");
         let creator_transport_peer_id = daemon_transport_peer_id(&creator);
@@ -676,6 +674,8 @@ mod tests {
                 workspace_name: "snapshot".into(),
                 username: "alice".into(),
                 device_name: "laptop".into(),
+                message_count: 0,
+                network_age: None,
             })
             .expect("workspace creation through RPC");
         let creator_transport_peer_id = daemon_transport_peer_id(&source_daemon);

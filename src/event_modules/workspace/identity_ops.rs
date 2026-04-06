@@ -52,6 +52,15 @@ pub(crate) fn ensure_local_tenant_event(
     recorded_by: &str,
     peer_key: &SigningKey,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    ensure_local_tenant_event_at(conn, recorded_by, peer_key, current_timestamp_ms_u64())
+}
+
+pub(crate) fn ensure_local_tenant_event_at(
+    conn: &Connection,
+    recorded_by: &str,
+    peer_key: &SigningKey,
+    created_at_ms: u64,
+) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
     let existing: Option<String> = conn
         .query_row(
             "SELECT event_id
@@ -67,7 +76,7 @@ pub(crate) fn ensure_local_tenant_event(
         event_id_from_base64(&eid_b64).ok_or("invalid tenants.event_id base64")?
     } else {
         let tenant_evt = ParsedEvent::Tenant(TenantEvent {
-            created_at_ms: current_timestamp_ms_u64(),
+            created_at_ms,
             public_key: peer_key.verifying_key().to_bytes(),
         });
         event_id_or_blocked(create_event_synchronous(conn, recorded_by, &tenant_evt))?
@@ -285,11 +294,12 @@ fn latest_content_key_for_frontier(
         .transpose()
 }
 
-fn ensure_rotation_for_key_frontier(
+fn ensure_rotation_for_key_frontier_at(
     conn: &Connection,
     recorded_by: &str,
     key_event_id: &EventId,
     frontier_refs: &[EventId],
+    created_at_ms: u64,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
     let key_event_id_b64 = event_id_to_base64(key_event_id);
     let slots = slotted_frontier_refs(frontier_refs)?;
@@ -328,7 +338,7 @@ fn ensure_rotation_for_key_frontier(
     let authoring =
         crate::event_modules::workspace::load_local_authoring_context(conn, recorded_by)?;
     let event = ParsedEvent::KeyRotation(KeyRotationEvent {
-        created_at_ms: current_timestamp_ms_u64(),
+        created_at_ms,
         key_event_id: *key_event_id,
         frontier_count: frontier_refs.len() as u8,
         frontier_ref_1: slots[0],
@@ -590,14 +600,27 @@ pub(crate) fn rotate_content_key_for_peer(
     conn: &Connection,
     recorded_by: &str,
 ) -> Result<RotateContentKeyResult, Box<dyn std::error::Error + Send + Sync>> {
+    rotate_content_key_for_peer_at(conn, recorded_by, current_timestamp_ms_u64())
+}
+
+pub(crate) fn rotate_content_key_for_peer_at(
+    conn: &Connection,
+    recorded_by: &str,
+    created_at_ms: u64,
+) -> Result<RotateContentKeyResult, Box<dyn std::error::Error + Send + Sync>> {
     let frontier_refs = current_removal_frontier_for_peer(conn, recorded_by)?;
     let mut rng = rand::thread_rng();
     let mut content_key_bytes = [0u8; 32];
     rand::RngCore::fill_bytes(&mut rng, &mut content_key_bytes);
 
     let key_event_id = create_deterministic_key_secret_event(conn, recorded_by, content_key_bytes)?;
-    let rotation_event_id =
-        ensure_rotation_for_key_frontier(conn, recorded_by, &key_event_id, &frontier_refs)?;
+    let rotation_event_id = ensure_rotation_for_key_frontier_at(
+        conn,
+        recorded_by,
+        &key_event_id,
+        &frontier_refs,
+        created_at_ms,
+    )?;
     let authoring =
         crate::event_modules::workspace::load_local_authoring_context(conn, recorded_by)?;
     let proactive_share_count = emit_proactive_key_shares_for_active_invites(
@@ -684,17 +707,32 @@ pub(crate) fn ensure_content_key_for_peer(
     conn: &Connection,
     recorded_by: &str,
 ) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+    ensure_content_key_for_peer_at(conn, recorded_by, current_timestamp_ms_u64())
+}
+
+pub(crate) fn ensure_content_key_for_peer_at(
+    conn: &Connection,
+    recorded_by: &str,
+    created_at_ms: u64,
+) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
     let frontier_refs = current_removal_frontier_for_peer(conn, recorded_by)?;
     if let Some(existing) = latest_content_key_for_frontier(conn, recorded_by, &frontier_refs)? {
         return Ok(existing);
     }
     if frontier_refs.is_empty() {
         if let Some(existing) = latest_materialized_key_for_peer(conn, recorded_by)? {
-            let _ = ensure_rotation_for_key_frontier(conn, recorded_by, &existing, &[])?;
+            let _ = ensure_rotation_for_key_frontier_at(
+                conn,
+                recorded_by,
+                &existing,
+                &[],
+                created_at_ms,
+            )?;
             return Ok(existing);
         }
     }
-    create_content_key(conn, recorded_by)
+    rotate_content_key_for_peer_at(conn, recorded_by, created_at_ms)
+        .map(|result| result.key_event_id)
 }
 
 /// Emit the most recent capped key history for an invite target.
@@ -952,11 +990,3 @@ fn create_device_link_invite_events_with_signer(
 // ---------------------------------------------------------------------------
 // Private helpers
 // ---------------------------------------------------------------------------
-
-/// Generate a random 32-byte content secret key and create a local Secret event.
-fn create_content_key(
-    conn: &Connection,
-    recorded_by: &str,
-) -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
-    Ok(rotate_content_key_for_peer(conn, recorded_by)?.key_event_id)
-}

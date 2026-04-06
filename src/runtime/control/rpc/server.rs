@@ -27,6 +27,7 @@ use crate::transport::TransportEndpoint;
 const MAX_CONCURRENT_CONNECTIONS: usize = 64;
 const INVITE_RELAY_WAIT_TIMEOUT: Duration = Duration::from_secs(5);
 const INVITE_RELAY_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
+const CREATE_WORKSPACE_CREATED_EVENTS_CAP: usize = 32;
 
 #[derive(Debug, Clone)]
 struct TenantScope {
@@ -648,12 +649,16 @@ fn dispatch(
             workspace_name,
             username,
             device_name,
+            message_count,
+            network_age,
         } => {
-            match workspace::commands::create_workspace_for_db(
+            match workspace::commands::create_workspace_for_db_with_seed(
                 db_path,
                 &workspace_name,
                 &username,
                 &device_name,
+                message_count,
+                network_age.as_deref(),
             ) {
                 Ok(resp) => {
                     // Creating a workspace establishes a new local tenant.
@@ -665,6 +670,12 @@ fn dispatch(
                     // addresses are only embedded when the caller asks for
                     // them explicitly via `--public-addr`.
                     let mut resp_json = serde_json::to_value(&resp).unwrap();
+                    if message_count > 0 {
+                        resp_json["seeded_message_count"] = serde_json::json!(message_count);
+                    }
+                    if let Some(ref network_age) = network_age {
+                        resp_json["network_age"] = serde_json::json!(network_age);
+                    }
                     let relay_url = runtime_relay_url(state);
                     match workspace::commands::create_invite_for_peer(
                         db_path,
@@ -691,13 +702,18 @@ fn dispatch(
                         }
                     }
                     let mut rpc_resp = RpcResponse::success(resp_json);
-                    // Inject all created identity chain events for the new peer.
                     if let Ok((recorded_by, db)) = service::open_db_for_peer(db_path, &resp.peer_id)
                     {
-                        if let Ok(list_resp) = service::svc_event_list(&db, &recorded_by) {
+                        if let Ok(list_resp) = service::svc_event_list_head(
+                            &db,
+                            &recorded_by,
+                            CREATE_WORKSPACE_CREATED_EVENTS_CAP,
+                        ) {
                             if let Some(ref mut data) = rpc_resp.data {
                                 if let Ok(events_json) = serde_json::to_value(&list_resp.events) {
                                     data["created_events"] = events_json;
+                                    data["created_events_cap"] =
+                                        serde_json::json!(CREATE_WORKSPACE_CREATED_EVENTS_CAP);
                                 }
                             }
                         }
@@ -785,22 +801,6 @@ fn dispatch(
                 Err(e) => RpcResponse::error(e.to_string()),
             }
         }),
-        RpcMethod::Generate {
-            count,
-            history_span,
-        } => match state.require_active_peer() {
-            Ok(peer_id) => {
-                match message::generate_for_peer(db_path, &peer_id, count, history_span.as_deref())
-                {
-                    Ok(data) => {
-                        state.notify_runtime_recheck();
-                        RpcResponse::success(data)
-                    }
-                    Err(e) => RpcResponse::error(e.to_string()),
-                }
-            }
-            Err(e) => RpcResponse::error(e),
-        },
         RpcMethod::GenerateFiles { count, size_mib } => match state.require_active_peer() {
             Ok(peer_id) => {
                 match message::generate_files_for_peer(db_path, &peer_id, count, size_mib) {

@@ -23,9 +23,9 @@ fn generate_progress_logging_enabled() -> bool {
     std::env::var_os("TOPO_GENERATE_PROGRESS_LOG").is_some()
 }
 
-const DEFAULT_GENERATE_HISTORY_SPAN_MS: u64 = 3 * 365 * 24 * 60 * 60 * 1000;
+pub(crate) const DEFAULT_GENERATE_HISTORY_SPAN_MS: u64 = 3 * 365 * 24 * 60 * 60 * 1000;
 
-fn parse_history_span_ms(spec: &str) -> Option<u64> {
+pub(crate) fn parse_history_span_ms(spec: &str) -> Option<u64> {
     let trimmed = spec.trim().to_ascii_lowercase();
     if trimmed.is_empty() {
         return None;
@@ -69,6 +69,94 @@ fn resolve_generate_history_span_ms(history_span: Option<&str>) -> u64 {
         .and_then(parse_history_span_ms)
         .or_else(generate_message_spread_ms)
         .unwrap_or(DEFAULT_GENERATE_HISTORY_SPAN_MS)
+}
+
+pub(crate) fn generate_messages_for_recorded_by_between(
+    db: &Connection,
+    recorded_by: &str,
+    count: usize,
+    start_at_ms: u64,
+    end_at_ms: u64,
+) -> Result<GenerateResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let log_progress = generate_progress_logging_enabled();
+    let generate_start = Instant::now();
+    let ctx = workspace::load_local_authoring_context(db, recorded_by)?;
+    let (start_at_ms, end_at_ms) = if start_at_ms <= end_at_ms {
+        (start_at_ms, end_at_ms)
+    } else {
+        (end_at_ms, start_at_ms)
+    };
+    let span_ms = end_at_ms.saturating_sub(start_at_ms);
+    let timestamp_for_index = |index: usize| -> u64 {
+        if count <= 1 {
+            return start_at_ms;
+        }
+        let numerator = (index as u128).saturating_mul(span_ms as u128);
+        let step = numerator / u128::try_from(count - 1).unwrap_or(1);
+        start_at_ms.saturating_add(u64::try_from(step).unwrap_or(u64::MAX))
+    };
+
+    const BATCH_SIZE: usize = 1000;
+    if log_progress {
+        eprintln!(
+            "[generate] start kind=messages count={} batch_size={} recorded_by={}",
+            count, BATCH_SIZE, recorded_by
+        );
+    }
+    let mut i = 0;
+    while i < count {
+        let batch_end = (i + BATCH_SIZE).min(count);
+        let batch_start = Instant::now();
+        begin_immediate_with_retry(db)?;
+        for j in i..batch_end {
+            create(
+                db,
+                recorded_by,
+                &ctx.signer_event_id,
+                &ctx.signing_key,
+                timestamp_for_index(j),
+                CreateMessageCmd {
+                    workspace_id: ctx.workspace_id,
+                    author_id: ctx.author_id,
+                    content: format!("Message {}", j),
+                },
+            )
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("create event error: {}", e).into()
+            })?;
+        }
+        db.execute("COMMIT", [])?;
+        i = batch_end;
+        if log_progress && (i == count || i % 10_000 == 0 || i == BATCH_SIZE) {
+            eprintln!(
+                "[generate] progress kind=messages committed={} remaining={} batch_ms={} total_ms={}",
+                i,
+                count.saturating_sub(i),
+                batch_start.elapsed().as_millis(),
+                generate_start.elapsed().as_millis()
+            );
+        }
+    }
+    if log_progress {
+        eprintln!(
+            "[generate] done kind=messages count={} total_ms={}",
+            count,
+            generate_start.elapsed().as_millis()
+        );
+    }
+
+    Ok(GenerateResponse { count })
+}
+
+pub(crate) fn generate_messages_for_recorded_by(
+    db: &Connection,
+    recorded_by: &str,
+    count: usize,
+    history_span_ms: u64,
+    end_at_ms: u64,
+) -> Result<GenerateResponse, Box<dyn std::error::Error + Send + Sync>> {
+    let start_at_ms = end_at_ms.saturating_sub(history_span_ms);
+    generate_messages_for_recorded_by_between(db, recorded_by, count, start_at_ms, end_at_ms)
 }
 
 fn begin_immediate_with_retry(
@@ -323,77 +411,14 @@ pub fn generate_for_peer(
     history_span: Option<&str>,
 ) -> Result<GenerateResponse, Box<dyn std::error::Error + Send + Sync>> {
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
-    let log_progress = generate_progress_logging_enabled();
-    let generate_start = Instant::now();
-    let ctx = workspace::load_local_authoring_context(&db, &recorded_by)?;
-    let spread_ms = Some(resolve_generate_history_span_ms(history_span));
-    let end_at_ms = current_timestamp_ms_u64();
-    let start_at_ms = spread_ms.map(|spread| end_at_ms.saturating_sub(spread));
-    let timestamp_for_index = |index: usize| -> u64 {
-        match (start_at_ms, spread_ms, count) {
-            (Some(start_at_ms), Some(spread_ms), count) if count > 1 => {
-                let numerator = (index as u128).saturating_mul(spread_ms as u128);
-                let step = numerator / u128::try_from(count - 1).unwrap_or(1);
-                start_at_ms.saturating_add(u64::try_from(step).unwrap_or(u64::MAX))
-            }
-            (Some(start_at_ms), _, _) => start_at_ms,
-            _ => current_timestamp_ms_u64(),
-        }
-    };
-
-    // Break into smaller batches to avoid holding the write lock too long.
-    // A single long transaction causes SQLITE_BUSY for the sync engine's
-    // runtime manager, which treats it as a fatal error.
-    const BATCH_SIZE: usize = 1000;
-    if log_progress {
-        eprintln!(
-            "[generate] start kind=messages count={} batch_size={} db={} peer={}",
-            count, BATCH_SIZE, db_path, peer_id
-        );
-    }
-    let mut i = 0;
-    while i < count {
-        let batch_end = (i + BATCH_SIZE).min(count);
-        let batch_start = Instant::now();
-        begin_immediate_with_retry(&db)?;
-        for j in i..batch_end {
-            create(
-                &db,
-                &recorded_by,
-                &ctx.signer_event_id,
-                &ctx.signing_key,
-                timestamp_for_index(j),
-                CreateMessageCmd {
-                    workspace_id: ctx.workspace_id,
-                    author_id: ctx.author_id,
-                    content: format!("Message {}", j),
-                },
-            )
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("create event error: {}", e).into()
-            })?;
-        }
-        db.execute("COMMIT", [])?;
-        i = batch_end;
-        if log_progress && (i == count || i % 10_000 == 0 || i == BATCH_SIZE) {
-            eprintln!(
-                "[generate] progress kind=messages committed={} remaining={} batch_ms={} total_ms={}",
-                i,
-                count.saturating_sub(i),
-                batch_start.elapsed().as_millis(),
-                generate_start.elapsed().as_millis()
-            );
-        }
-    }
-    if log_progress {
-        eprintln!(
-            "[generate] done kind=messages count={} total_ms={}",
-            count,
-            generate_start.elapsed().as_millis()
-        );
-    }
-
-    Ok(GenerateResponse { count })
+    let history_span_ms = resolve_generate_history_span_ms(history_span);
+    generate_messages_for_recorded_by(
+        &db,
+        &recorded_by,
+        count,
+        history_span_ms,
+        current_timestamp_ms_u64(),
+    )
 }
 
 /// Generate N synthetic files as a specific peer.

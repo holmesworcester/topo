@@ -320,6 +320,8 @@ fn run_key_repair_benchmark(policy: KeyResponsePolicy) -> RepairBenchmark {
         workspace_name: "sim".into(),
         username: "alice".into(),
         device_name: "laptop".into(),
+        message_count: 0,
+        network_age: None,
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
 
@@ -616,6 +618,8 @@ fn removed_peer_does_not_receive_key_shared_response_for_frontier() {
         workspace_name: "sim".into(),
         username: "alice".into(),
         device_name: "laptop".into(),
+        message_count: 0,
+        network_age: None,
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
 
@@ -815,6 +819,8 @@ fn holder_with_request_before_removal_emits_no_response_until_frontier_arrives()
         workspace_name: "sim".into(),
         username: "alice".into(),
         device_name: "laptop".into(),
+        message_count: 0,
+        network_age: None,
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
 

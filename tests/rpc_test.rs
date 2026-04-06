@@ -195,10 +195,6 @@ fn rpc_all_methods_serialize() {
             target: "1".into(),
             output_path: "/tmp/out.bin".into(),
         },
-        RpcMethod::Generate {
-            count: 10,
-            history_span: Some("3y".into()),
-        },
         RpcMethod::AssertNow {
             predicate: "message_count == 0".into(),
         },
@@ -230,6 +226,8 @@ fn rpc_all_methods_serialize() {
             workspace_name: "test".into(),
             username: "user".into(),
             device_name: "device".into(),
+            message_count: 0,
+            network_age: None,
         },
         RpcMethod::CreateInvite {
             public_addr: Some("127.0.0.1:4433".to_string()),
@@ -2133,7 +2131,6 @@ fn catalog_drift_test_method_count_matches_protocol() {
         "SendFile",
         "Files",
         "SaveFile",
-        "Generate",
         "GenerateFiles",
         "AssertNow",
         "AssertEventually",

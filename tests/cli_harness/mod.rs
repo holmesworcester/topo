@@ -1011,19 +1011,39 @@ pub fn create_workspace_with_details(
     username: &str,
     device_name: &str,
 ) {
+    create_workspace_with_seeded_history(db, workspace_name, username, device_name, 0, None);
+}
+
+pub fn create_workspace_with_seeded_history(
+    db: &str,
+    workspace_name: &str,
+    username: &str,
+    device_name: &str,
+    message_count: usize,
+    network_age: Option<&str>,
+) {
     let mut tmp_daemon = start_daemon(db);
+    let mut args = vec![
+        "create-workspace".to_string(),
+        "--db".to_string(),
+        db.to_string(),
+        "--workspace-name".to_string(),
+        workspace_name.to_string(),
+        "--username".to_string(),
+        username.to_string(),
+        "--device-name".to_string(),
+        device_name.to_string(),
+    ];
+    if message_count > 0 {
+        args.push("--message-count".to_string());
+        args.push(message_count.to_string());
+    }
+    if let Some(network_age) = network_age {
+        args.push("--network-age".to_string());
+        args.push(network_age.to_string());
+    }
     let out = Command::new(bin())
-        .args([
-            "create-workspace",
-            "--db",
-            db,
-            "--workspace-name",
-            workspace_name,
-            "--username",
-            username,
-            "--device-name",
-            device_name,
-        ])
+        .args(&args)
         .output()
         .expect("create-workspace");
     assert!(
@@ -2401,6 +2421,7 @@ pub fn wait_for_pending_bootstrap_trust_cleared_and_endpoint_observation(
 
 pub fn generate_messages(db: &str, count: usize) {
     ensure_active_peer(db, Duration::from_secs(10));
+    let peer_id = active_tenant_peer_id(db).expect("active tenant peer id");
     let chunk_size = std::env::var("TOPO_TEST_GENERATE_CHUNK_SIZE")
         .ok()
         .and_then(|value| value.parse::<usize>().ok())
@@ -2409,13 +2430,8 @@ pub fn generate_messages(db: &str, count: usize) {
     let mut remaining = count;
     while remaining > 0 {
         let next = remaining.min(chunk_size);
-        let output = topo_cmd(db, &["generate", "--count", &next.to_string()]);
-        assert!(
-            output.status.success(),
-            "generate failed: stdout={} stderr={}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
+        topo::event_modules::message::commands::generate_for_peer(db, &peer_id, next, None)
+            .expect("generate synthetic messages");
         remaining -= next;
     }
 }
