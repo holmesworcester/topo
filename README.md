@@ -77,13 +77,17 @@ $ topo --db alice.db view --limit 8
 ### Running Tests
 
 The test suite seeks to prove that the proof-of-concept meets correctness and performance requirements.  
+This repo defaults each `cargo test` invocation to one harness thread so a single
+run stays memory-bounded without preventing separate workstreams from launching
+different test commands in parallel. Override per run with
+`RUST_TEST_THREADS=<n> cargo test ...` if needed.
 
 ```bash
 # Full test suite
-cargo test
+cargo test -- --test-threads=1
 
 # Performance tests
-cargo test --release --test perf_test -- --nocapture
+cargo test --release --test perf_test -- --nocapture --test-threads=1
 
 # Sync graph tests (serial required)
 cargo test --release --test sync_graph_test -- --nocapture --test-threads=1

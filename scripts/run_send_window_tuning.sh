@@ -11,6 +11,7 @@ mkdir -p "$TMPDIR_DEFAULT"
 
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-$TARGET_DIR_DEFAULT}"
 export TMPDIR="${TMPDIR:-$TMPDIR_DEFAULT}"
+export RUST_TEST_THREADS="${RUST_TEST_THREADS:-1}"
 
 run_perf_case() {
   local label="$1"

@@ -7,3 +7,9 @@ perf-topo = "test --release --test topo_cascade_test -- --nocapture"
 perf-topo-all = "test --release --test topo_cascade_test -- --nocapture --include-ignored"
 perf-lowmem = "test --release --test low_mem_test -- --nocapture"
 perf-lowmem-all = "test --release --test low_mem_test -- --nocapture --include-ignored"
+
+[env]
+# Default each cargo test invocation to one harness thread. Separate workstreams
+# can still run distinct cargo test commands in parallel, and callers can
+# override per run with `RUST_TEST_THREADS=<n> cargo test ...`.
+RUST_TEST_THREADS = "1"

@@ -3,6 +3,7 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$ROOT"
+export RUST_TEST_THREADS="${RUST_TEST_THREADS:-1}"
 
 extract_msgs_per_sec() {
   awk '/Msgs\/s:/ { print $2 }' | tail -n1

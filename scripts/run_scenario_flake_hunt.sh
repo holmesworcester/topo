@@ -9,6 +9,7 @@ fi
 REPEATS="$1"
 TEST_NAME="${2:-test_mdns_multitenant_self_filtering_and_sync}"
 LOG_DIR="${3:-target/flake-logs}"
+export RUST_TEST_THREADS="${RUST_TEST_THREADS:-1}"
 
 if ! [[ "$REPEATS" =~ ^[0-9]+$ ]] || [[ "$REPEATS" -lt 1 ]]; then
   echo "repeats must be a positive integer"

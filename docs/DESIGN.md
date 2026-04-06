@@ -579,7 +579,7 @@ Test the feature with both local integration tests and Linux netns NAT simulatio
 
 1. `cargo test --test cli_test -- --test-threads=1`
 2. `cargo test --test cli_observability_test test_parallel_device_links_converge -- --test-threads=1`
-3. `cargo test test_record_endpoint_observation`
+3. `cargo test test_record_endpoint_observation -- --test-threads=1`
 4. `cargo build --release`
 5. `sudo tests/netns_nat_test.sh --cone` (expected pass)
 6. `sudo tests/netns_nat_test.sh --symmetric` (expected pass via relay fallback)

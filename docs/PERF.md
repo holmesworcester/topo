@@ -11,6 +11,11 @@
 
 ## Running Performance Tests
 
+Direct `cargo test` commands below assume one harness thread per invocation.
+That keeps each run memory-bounded without preventing separate workstreams from
+launching different `cargo test` commands in parallel. Override per run with
+`RUST_TEST_THREADS=<n> cargo test ...` if needed.
+
 ```bash
 # Preferred: strict serial runner (prevents cross-test interference)
 # Also auto-updates this doc's "Latest Results" section.
@@ -67,15 +72,15 @@ PERF_LOWMEM_POC_FILE_SIZE_MIB=1 \
 python3 scripts/run_perf_serial.py lowmem
 
 # Core sync benchmarks (real daemons, warm-start timing, per-daemon VmHWM)
-cargo test --release --test daemon_perf_test -- --nocapture
-cargo test --release --test daemon_perf_test -- --nocapture --include-ignored
+cargo test --release --test daemon_perf_test -- --nocapture --test-threads=1
+cargo test --release --test daemon_perf_test -- --nocapture --include-ignored --test-threads=1
 
 # Star topology: hub + N leaves (daemon-managed invite acceptance)
 env STAR_TOPOLOGY_LEAVES=50 STAR_TOPOLOGY_HUB_MESSAGES=1 STAR_TOPOLOGY_MESSAGES_PER_LEAF=1 \
-  cargo test --release --test daemon_perf_test perf_star_topology_capacity -- --ignored --nocapture
+  cargo test --release --test daemon_perf_test perf_star_topology_capacity -- --ignored --nocapture --test-threads=1
 
 # File attachment throughput
-cargo test --release --test file_throughput_test -- --nocapture --include-ignored
+cargo test --release --test file_throughput_test -- --nocapture --include-ignored --test-threads=1
 
 # Topo-sort cascade benchmark
 cargo test --release --test topo_cascade_test topo_cascade_10k -- --nocapture --test-threads=1
@@ -87,7 +92,7 @@ cargo test --release --test topo_cascade_test -- --nocapture --include-ignored -
 LOW_MEM_IOS=1 cargo test --release --test topo_cascade_test topo_cascade_lowmem_10k -- --nocapture --test-threads=1
 
 # Low-memory budget tests
-cargo test --release --test low_mem_test -- --nocapture
+cargo test --release --test low_mem_test -- --nocapture --test-threads=1
 
 # Low-memory RSS-sampling tests (ignored by default)
 cargo test --release --test low_mem_test -- --ignored --nocapture --test-threads=1

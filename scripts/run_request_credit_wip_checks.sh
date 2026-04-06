@@ -3,6 +3,7 @@ set -euo pipefail
 
 REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 cd "$REPO_ROOT"
+export RUST_TEST_THREADS="${RUST_TEST_THREADS:-1}"
 
 echo "[1/9] cargo test -q"
 cargo test -q

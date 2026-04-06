@@ -2,6 +2,7 @@
 set -euo pipefail
 
 cd "$(dirname "$0")/.."
+export RUST_TEST_THREADS="${RUST_TEST_THREADS:-1}"
 
 cargo fmt --manifest-path Cargo.toml
 

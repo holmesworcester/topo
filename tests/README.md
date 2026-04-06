@@ -2,19 +2,24 @@
 
 ## Running tests
 
+The repo default is one harness thread per `cargo test` invocation. That keeps
+each run bounded while still allowing separate workstreams to launch different
+test commands in parallel. Override per run with
+`RUST_TEST_THREADS=<n> cargo test ...` if needed.
+
 Standard Rust integration tests:
 
 ```bash
-cargo test              # all tests (excluding feature-gated)
-cargo test --all-features  # include mDNS discovery tests
+cargo test -- --test-threads=1              # all tests (excluding feature-gated)
+cargo test --all-features -- --test-threads=1  # include mDNS discovery tests
 ```
 
 Individual test binaries:
 
 ```bash
-cargo test --test cli_test
-cargo test --test rpc_test
-cargo test --test projectors
+cargo test --test cli_test -- --test-threads=1
+cargo test --test rpc_test -- --test-threads=1
+cargo test --test projectors -- --test-threads=1
 ```
 
 ## Test organization

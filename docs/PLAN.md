@@ -1490,7 +1490,7 @@ Topology reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) sections `2` (one
 Topology reference: [DESIGN_DIAGRAMS.md](./DESIGN_DIAGRAMS.md) section `4` (threads/queues/DB topology) for interpreting runtime memory shape during these tests.
 
 1. Fast default lowmem lane:
-   - `cargo test --release --test low_mem_test -- --nocapture` (functional lowmem smoke, no RSS gate),
+   - `cargo test --release --test low_mem_test -- --nocapture --test-threads=1` (functional lowmem smoke, no RSS gate),
    - `scripts/run_perf_serial.sh lowmem` (fast cgroup-enforced matrix).
 2. RSS-sampling sanity lane (ignored by default):
    - `cargo test --release --test low_mem_test -- --ignored --nocapture --test-threads=1`

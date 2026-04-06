@@ -7,6 +7,7 @@ MANIFEST="$ROOT/Cargo.toml"
 export TMPDIR="${TMPDIR:-/home/holmes/tmp-rust}"
 export CARGO_TARGET_DIR="${CARGO_TARGET_DIR:-/home/holmes/poc-7-hot-cold-sync-target}"
 export CARGO_INCREMENTAL="${CARGO_INCREMENTAL:-0}"
+export RUST_TEST_THREADS="${RUST_TEST_THREADS:-1}"
 
 run() {
     echo
