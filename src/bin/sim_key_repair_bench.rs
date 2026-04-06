@@ -128,6 +128,7 @@ fn run_key_repair_benchmark(policy: KeyResponsePolicy) -> RepairBenchmark {
         device_name: "laptop".into(),
         message_count: 0,
         network_age: None,
+        device_chain_length: 0,
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
 

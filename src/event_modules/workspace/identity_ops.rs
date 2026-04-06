@@ -413,7 +413,7 @@ fn key_shared_exists_for_delivery_target(
     Ok(exists)
 }
 
-fn emit_key_shared_for_invite_target(
+fn emit_key_shared_for_invite_target_at(
     conn: &Connection,
     recorded_by: &str,
     sender_peer_shared_key: &SigningKey,
@@ -423,6 +423,7 @@ fn emit_key_shared_for_invite_target(
     recipient_event_id: &EventId,
     unwrap_key_event_id: &EventId,
     recipient_public_key: &[u8; 32],
+    created_at_ms: u64,
 ) -> Result<Option<EventId>, Box<dyn std::error::Error + Send + Sync>> {
     let plaintext_key = load_key_secret_bytes(conn, recorded_by, key_event_id)?;
     let recipient_vk = VerifyingKey::from_bytes(recipient_public_key)
@@ -448,7 +449,7 @@ fn emit_key_shared_for_invite_target(
     let wrapped = wrap_key_for_recipient(sender_peer_shared_key, &recipient_vk, &plaintext_key);
     let slots = slotted_frontier_refs(frontier_refs)?;
     let event = ParsedEvent::KeyShared(KeySharedEvent {
-        created_at_ms: current_timestamp_ms_u64(),
+        created_at_ms,
         key_event_id: *key_event_id,
         frontier_count: frontier_refs.len() as u8,
         frontier_ref_1: slots[0],
@@ -471,6 +472,31 @@ fn emit_key_shared_for_invite_target(
         sender_peer_shared_key,
     ))?;
     Ok(Some(created))
+}
+
+fn emit_key_shared_for_invite_target(
+    conn: &Connection,
+    recorded_by: &str,
+    sender_peer_shared_key: &SigningKey,
+    sender_peer_shared_event_id: &EventId,
+    key_event_id: &EventId,
+    frontier_refs: &[EventId],
+    recipient_event_id: &EventId,
+    unwrap_key_event_id: &EventId,
+    recipient_public_key: &[u8; 32],
+) -> Result<Option<EventId>, Box<dyn std::error::Error + Send + Sync>> {
+    emit_key_shared_for_invite_target_at(
+        conn,
+        recorded_by,
+        sender_peer_shared_key,
+        sender_peer_shared_event_id,
+        key_event_id,
+        frontier_refs,
+        recipient_event_id,
+        unwrap_key_event_id,
+        recipient_public_key,
+        current_timestamp_ms_u64(),
+    )
 }
 
 fn collect_active_invite_targets_from_table(
@@ -536,7 +562,7 @@ fn active_invite_targets_with_local_secrets(
     Ok(out)
 }
 
-fn emit_recent_key_history_for_invite(
+fn emit_recent_key_history_for_invite_at(
     conn: &Connection,
     recorded_by: &str,
     sender_peer_shared_key: &SigningKey,
@@ -545,10 +571,11 @@ fn emit_recent_key_history_for_invite(
     invite_public_key: &[u8; 32],
     unwrap_key_event_id: &EventId,
     history_cap: usize,
+    created_at_ms: u64,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let mut emitted = 0usize;
     for rotation in recent_key_rotations_for_peer(conn, recorded_by, history_cap)? {
-        if emit_key_shared_for_invite_target(
+        if emit_key_shared_for_invite_target_at(
             conn,
             recorded_by,
             sender_peer_shared_key,
@@ -558,6 +585,7 @@ fn emit_recent_key_history_for_invite(
             invite_event_id,
             unwrap_key_event_id,
             invite_public_key,
+            created_at_ms,
         )?
         .is_some()
         {
@@ -741,18 +769,19 @@ pub(crate) fn ensure_content_key_for_peer_at(
 /// Emit the most recent capped key history for an invite target.
 /// The invite's deterministic invite_secret is stored locally first, then
 /// recent frontier-bound `key_shared` deliveries are emitted as separate events.
-pub(crate) fn wrap_content_key_for_invite(
+pub(crate) fn wrap_content_key_for_invite_at(
     conn: &Connection,
     recorded_by: &str,
     sender_peer_shared_key: &SigningKey,
     sender_peer_shared_event_id: &EventId,
     invite_key: &SigningKey,
     invite_event_id: &EventId,
+    created_at_ms: u64,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    let _ = ensure_content_key_for_peer(conn, recorded_by)?;
+    let _ = ensure_content_key_for_peer_at(conn, recorded_by, created_at_ms)?;
     let invite_secret_event_id =
         store_invite_secret(conn, recorded_by, invite_event_id, invite_key)?;
-    let _ = emit_recent_key_history_for_invite(
+    let _ = emit_recent_key_history_for_invite_at(
         conn,
         recorded_by,
         sender_peer_shared_key,
@@ -761,8 +790,28 @@ pub(crate) fn wrap_content_key_for_invite(
         &invite_key.verifying_key().to_bytes(),
         &invite_secret_event_id,
         INVITE_HISTORY_KEY_CAP,
+        created_at_ms,
     )?;
     Ok(())
+}
+
+pub(crate) fn wrap_content_key_for_invite(
+    conn: &Connection,
+    recorded_by: &str,
+    sender_peer_shared_key: &SigningKey,
+    sender_peer_shared_event_id: &EventId,
+    invite_key: &SigningKey,
+    invite_event_id: &EventId,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    wrap_content_key_for_invite_at(
+        conn,
+        recorded_by,
+        sender_peer_shared_key,
+        sender_peer_shared_event_id,
+        invite_key,
+        invite_event_id,
+        current_timestamp_ms_u64(),
+    )
 }
 
 /// Persist local invite private key material as deterministic invite_secret.
@@ -918,7 +967,29 @@ pub(crate) fn create_device_link_invite_events_for_user(
     workspace_id: &EventId,
     bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
 ) -> Result<InviteData, Box<dyn std::error::Error + Send + Sync>> {
-    create_device_link_invite_events_with_signer(
+    create_device_link_invite_events_for_user_at(
+        conn,
+        recorded_by,
+        peer_shared_key,
+        peer_shared_event_id,
+        user_event_id,
+        workspace_id,
+        current_timestamp_ms_u64(),
+        bootstrap_ctx,
+    )
+}
+
+pub(crate) fn create_device_link_invite_events_for_user_at(
+    conn: &Connection,
+    recorded_by: &str,
+    peer_shared_key: &SigningKey,
+    peer_shared_event_id: &EventId,
+    user_event_id: &EventId,
+    workspace_id: &EventId,
+    created_at_ms: u64,
+    bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
+) -> Result<InviteData, Box<dyn std::error::Error + Send + Sync>> {
+    create_device_link_invite_events_with_signer_at(
         conn,
         recorded_by,
         peer_shared_key,
@@ -927,11 +998,12 @@ pub(crate) fn create_device_link_invite_events_for_user(
         5,
         user_event_id,
         workspace_id,
+        created_at_ms,
         bootstrap_ctx,
     )
 }
 
-fn create_device_link_invite_events_with_signer(
+fn create_device_link_invite_events_with_signer_at(
     conn: &Connection,
     recorded_by: &str,
     signer_key: &SigningKey,
@@ -940,6 +1012,7 @@ fn create_device_link_invite_events_with_signer(
     signer_type: u8,
     user_event_id: &EventId,
     workspace_id: &EventId,
+    created_at_ms: u64,
     bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
 ) -> Result<InviteData, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
@@ -947,7 +1020,7 @@ fn create_device_link_invite_events_with_signer(
     let device_invite_pub = device_invite_key.verifying_key().to_bytes();
 
     let evt = ParsedEvent::DeviceInvite(DeviceInviteEvent {
-        created_at_ms: current_timestamp_ms_u64(),
+        created_at_ms,
         public_key: device_invite_pub,
         authority_event_id: *authority_event_id,
         signed_by: *signer_event_id,
@@ -964,15 +1037,14 @@ fn create_device_link_invite_events_with_signer(
         bootstrap_ctx,
     )?;
 
-    // Linked devices need the same workspace content key as user invitees so
-    // they can decrypt preexisting encrypted content immediately after replay.
-    wrap_content_key_for_invite(
+    wrap_content_key_for_invite_at(
         conn,
         recorded_by,
         signer_key,
         signer_event_id,
         &device_invite_key,
         &invite_event_id,
+        created_at_ms,
     )?;
 
     Ok(InviteData {

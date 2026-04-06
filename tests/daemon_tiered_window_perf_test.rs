@@ -7,6 +7,7 @@
 mod cli_harness;
 mod perf_network_shaper;
 
+use std::collections::HashSet;
 use std::net::{Ipv4Addr, SocketAddr};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -40,6 +41,12 @@ struct NewestMessageTiming {
 struct AuthoringDepTiming {
     user_created_at_ms: i64,
     peer_shared_created_at_ms: i64,
+}
+
+struct NewestSignerChainTiming {
+    signer_created_at_ms: i64,
+    signer_chain_depth: usize,
+    authored_message_count: i64,
 }
 
 fn current_timestamp_ms() -> i64 {
@@ -226,6 +233,65 @@ fn authoring_dep_timing_sql(db: &str) -> AuthoringDepTiming {
     .expect("query authoring_dep_timing")
 }
 
+fn signer_chain_depth(conn: &rusqlite::Connection, event_id_b64: &str) -> usize {
+    let mut seen = HashSet::new();
+    let mut current = Some(event_id_b64.to_string());
+    let mut depth = 0usize;
+
+    while let Some(event_id_b64) = current {
+        assert!(
+            seen.insert(event_id_b64.clone()),
+            "unexpected cycle in signer chain at {}",
+            event_id_b64
+        );
+        depth = depth.saturating_add(1);
+        let blob: Vec<u8> = conn
+            .query_row(
+                "SELECT blob FROM events WHERE event_id = ?1",
+                rusqlite::params![&event_id_b64],
+                |row| row.get(0),
+            )
+            .unwrap_or_else(|_| panic!("load signer chain blob for {}", event_id_b64));
+        let parsed = topo::event_modules::parse_event(&blob)
+            .unwrap_or_else(|err| panic!("parse signer chain event {}: {}", event_id_b64, err));
+        current = parsed
+            .signer_fields()
+            .map(|(event_id, _)| topo::crypto::event_id_to_base64(&event_id));
+    }
+
+    depth
+}
+
+fn newest_message_signer_chain_timing_sql(db: &str) -> NewestSignerChainTiming {
+    let conn = topo::db::open_connection(db).expect("open db for newest_message_signer_chain");
+    let peer_id = cli_harness::active_tenant_peer_id(db).expect("active tenant peer id");
+    let (signer_event_id_b64, signer_recorded_by, signer_created_at_ms): (String, String, i64) =
+        conn.query_row(
+            "SELECT ps.event_id, ps.recorded_by, e.created_at
+             FROM peers_shared ps
+             JOIN events e ON e.event_id = ps.event_id
+             WHERE ps.recorded_by <> ?1
+             ORDER BY e.created_at DESC, ps.event_id DESC
+             LIMIT 1",
+            rusqlite::params![&peer_id],
+            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+        )
+        .expect("load newest seeded signer");
+    let authored_message_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+            rusqlite::params![&signer_recorded_by],
+            |row| row.get(0),
+        )
+        .expect("count newest signer messages");
+
+    NewestSignerChainTiming {
+        signer_created_at_ms,
+        signer_chain_depth: signer_chain_depth(&conn, &signer_event_id_b64),
+        authored_message_count,
+    }
+}
+
 fn elapsed_secs(metric_start_ms: i64, ts_ms: Option<i64>) -> f64 {
     ts_ms
         .unwrap_or(metric_start_ms)
@@ -295,6 +361,7 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool)
 
     let total_messages = total_messages_override
         .unwrap_or_else(|| env_i64("TOPO_TIERED_SYNC_TOTAL_MESSAGES", 50_000));
+    let device_chain_length = env_i64("TOPO_TIERED_SYNC_DEVICE_CHAIN_LENGTH", 0).max(0) as usize;
     let network_profile = join_catchup_network_profile_from_env();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
@@ -307,6 +374,7 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool)
         "desktop",
         total_messages as usize,
         Some("3y"),
+        device_chain_length,
     );
     let inherited_env = inherited_tier_env();
     let mut alice_daemon = start_daemon_with_options(
@@ -325,6 +393,7 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool)
 
     let measurement_now_ms = current_timestamp_ms();
     let authoring_dep_timing = authoring_dep_timing_sql(&alice_db);
+    let newest_signer_chain = newest_message_signer_chain_timing_sql(&alice_db);
     let today_start_ms = utc_day_start_ms(measurement_now_ms);
     let yesterday_start_ms = today_start_ms - DAY_MS;
     let week_start_ms = today_start_ms - WEEK_MS;
@@ -342,8 +411,30 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool)
         authoring_dep_timing.peer_shared_created_at_ms,
         yesterday_start_ms
     );
+    assert!(
+        newest_signer_chain.signer_created_at_ms < yesterday_start_ms,
+        "newest message signer should be outside the hot today/yesterday window: signer_created_at_ms={} yesterday_start_ms={}",
+        newest_signer_chain.signer_created_at_ms,
+        yesterday_start_ms
+    );
+    assert_eq!(
+        newest_signer_chain.signer_chain_depth,
+        5 + device_chain_length.saturating_mul(2),
+        "latest peer_shared signer chain depth should reflect the seeded device chain"
+    );
+    assert_eq!(
+        newest_signer_chain.authored_message_count, total_messages,
+        "seeded messages should be authored by the tip of the device chain"
+    );
     let _expected_today = message_count_in_range_sql(&alice_db, today_start_ms, tomorrow_start_ms);
     let expected_hot = message_count_since_sql(&alice_db, yesterday_start_ms);
+    assert!(
+        expected_hot > 0,
+        "benchmark requires at least one hot today/yesterday message: total_messages={} end_at_ms={} yesterday_start_ms={}",
+        total_messages,
+        measurement_now_ms,
+        yesterday_start_ms
+    );
     let expected_week = message_count_in_range_sql(&alice_db, week_start_ms, yesterday_start_ms);
     let expected_twelve_weeks =
         message_count_in_range_sql(&alice_db, twelve_week_start_ms, week_start_ms);
@@ -417,6 +508,7 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool)
   Messages preloaded on inviter: {total_messages}
   Network profile: {}
   Generated spread: 3 years
+  Linked devices seeded: {} (dependency depth {}, tip_created_at={}, tip_authored_messages={})
   Aged auth deps: user={} peer_shared={}
   Metric start: invite accept on running joiner daemon
   Today:         {} msgs durable in {:.2}s projected in {:.2}s
@@ -428,6 +520,10 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool)
             network_profile
                 .map(|profile| profile.slug)
                 .unwrap_or("loopback"),
+            device_chain_length,
+            newest_signer_chain.signer_chain_depth,
+            newest_signer_chain.signer_created_at_ms,
+            newest_signer_chain.authored_message_count,
             authoring_dep_timing.user_created_at_ms,
             authoring_dep_timing.peer_shared_created_at_ms,
             today_timing.count,
@@ -446,7 +542,12 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool)
             full_wall_secs,
         );
         summary_key = format!(
-            "daemon_tiered_window_perf_test.hot_only_{}_{}",
+            "daemon_tiered_window_perf_test.hot_only{}_{}_{}",
+            if device_chain_length > 0 {
+                format!("_chain{}_", device_chain_length)
+            } else {
+                "_".to_string()
+            },
             total_messages,
             network_profile
                 .map(|profile| profile.slug)
@@ -486,6 +587,7 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool)
   Messages preloaded on inviter: {total_messages}
   Network profile: {}
   Generated spread: 3 years
+  Linked devices seeded: {} (dependency depth {}, tip_created_at={}, tip_authored_messages={})
   Aged auth deps: user={} peer_shared={}
   Metric start: invite accept on running joiner daemon
   Today:         {} msgs durable in {:.2}s projected in {:.2}s
@@ -499,6 +601,10 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool)
             network_profile
                 .map(|profile| profile.slug)
                 .unwrap_or("loopback"),
+            device_chain_length,
+            newest_signer_chain.signer_chain_depth,
+            newest_signer_chain.signer_created_at_ms,
+            newest_signer_chain.authored_message_count,
             authoring_dep_timing.user_created_at_ms,
             authoring_dep_timing.peer_shared_created_at_ms,
             today_timing.count,
@@ -536,7 +642,12 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool)
             full_wall_secs,
         );
         summary_key = format!(
-            "daemon_tiered_window_perf_test.disjoint_{}_{}",
+            "daemon_tiered_window_perf_test.disjoint{}_{}_{}",
+            if device_chain_length > 0 {
+                format!("_chain{}_", device_chain_length)
+            } else {
+                "_".to_string()
+            },
             total_messages,
             network_profile
                 .map(|profile| profile.slug)
@@ -573,4 +684,27 @@ fn perf_tiered_window_100k_parallel() {
 #[ignore]
 fn perf_hot_only_window_100k_parallel() {
     run_tiered_window_bench(Some(100_000), true);
+}
+
+#[test]
+fn hot_only_window_syncs_32_linked_devices() {
+    let prev = std::env::var("TOPO_TIERED_SYNC_DEVICE_CHAIN_LENGTH").ok();
+    std::env::set_var("TOPO_TIERED_SYNC_DEVICE_CHAIN_LENGTH", "32");
+    run_tiered_window_bench(Some(256), true);
+    match prev {
+        Some(value) => std::env::set_var("TOPO_TIERED_SYNC_DEVICE_CHAIN_LENGTH", value),
+        None => std::env::remove_var("TOPO_TIERED_SYNC_DEVICE_CHAIN_LENGTH"),
+    }
+}
+
+#[test]
+#[ignore]
+fn perf_hot_only_window_chain_64_parallel() {
+    let prev = std::env::var("TOPO_TIERED_SYNC_DEVICE_CHAIN_LENGTH").ok();
+    std::env::set_var("TOPO_TIERED_SYNC_DEVICE_CHAIN_LENGTH", "64");
+    run_tiered_window_bench(Some(256), true);
+    match prev {
+        Some(value) => std::env::set_var("TOPO_TIERED_SYNC_DEVICE_CHAIN_LENGTH", value),
+        None => std::env::remove_var("TOPO_TIERED_SYNC_DEVICE_CHAIN_LENGTH"),
+    }
 }

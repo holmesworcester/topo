@@ -7,6 +7,14 @@ use std::time::Duration;
 
 use crate::rpc::protocol::*;
 
+fn timeout_secs_from_env(name: &str, default_secs: u64) -> u64 {
+    std::env::var(name)
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .filter(|value| *value > 0)
+        .unwrap_or(default_secs)
+}
+
 /// Send an RPC request to the daemon and return the response.
 pub fn rpc_call(socket_path: &Path, method: RpcMethod) -> Result<RpcResponse, RpcClientError> {
     let mut stream = connect_stream(socket_path)?;
@@ -52,8 +60,14 @@ fn connect_stream(socket_path: &Path) -> Result<UnixStream, RpcClientError> {
         }
     })?;
 
-    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
-    stream.set_write_timeout(Some(Duration::from_secs(30)))?;
+    stream.set_read_timeout(Some(Duration::from_secs(timeout_secs_from_env(
+        "TOPO_RPC_READ_TIMEOUT_SECS",
+        120,
+    ))))?;
+    stream.set_write_timeout(Some(Duration::from_secs(timeout_secs_from_env(
+        "TOPO_RPC_WRITE_TIMEOUT_SECS",
+        30,
+    ))))?;
 
     Ok(stream)
 }

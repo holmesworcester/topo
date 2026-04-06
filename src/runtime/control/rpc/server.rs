@@ -714,6 +714,7 @@ fn dispatch(
             device_name,
             message_count,
             network_age,
+            device_chain_length,
         } => {
             match workspace::commands::create_workspace_for_db_with_seed(
                 db_path,
@@ -722,6 +723,7 @@ fn dispatch(
                 &device_name,
                 message_count,
                 network_age.as_deref(),
+                device_chain_length,
             ) {
                 Ok(resp) => {
                     // Creating a workspace establishes a new local tenant.
@@ -743,6 +745,10 @@ fn dispatch(
                     }
                     if let Some(ref network_age) = network_age {
                         resp_json["network_age"] = serde_json::json!(network_age);
+                    }
+                    if device_chain_length > 0 {
+                        resp_json["seeded_device_chain_length"] =
+                            serde_json::json!(device_chain_length);
                     }
                     let relay_url = runtime_relay_url(state);
                     let bootstrap_addrs = match autodetect_bootstrap_addrs(state, listen_addr) {

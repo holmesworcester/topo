@@ -383,6 +383,7 @@ fn materialize_corridor_peers(
         device_name: "device".into(),
         message_count: 0,
         network_age: None,
+        device_chain_length: 0,
     });
     if !created.ok {
         return Err(format!("sender workspace creation failed: {:?}", created.error).into());

@@ -576,6 +576,7 @@ mod tests {
             device_name: "laptop".into(),
             message_count: 0,
             network_age: None,
+            device_chain_length: 0,
         });
         assert!(create.ok, "workspace creation failed: {:?}", create.error);
 

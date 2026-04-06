@@ -301,6 +301,7 @@ mod tests {
             device_name: "laptop".into(),
             message_count: 3,
             network_age: Some("1d".into()),
+            device_chain_length: 0,
         });
         let creator_peer_id = create.expect("workspace creation through RPC")["peer_id"]
             .as_str()
@@ -440,6 +441,7 @@ mod tests {
                 device_name: "laptop".into(),
                 message_count: 0,
                 network_age: None,
+                device_chain_length: 0,
             })
             .expect("creator workspace");
         let creator_peer_id = created["peer_id"]
@@ -537,6 +539,7 @@ mod tests {
                 device_name: "laptop".into(),
                 message_count: 0,
                 network_age: None,
+                device_chain_length: 0,
             })
             .expect("workspace creation through RPC");
         let creator_peer_id = created["peer_id"]

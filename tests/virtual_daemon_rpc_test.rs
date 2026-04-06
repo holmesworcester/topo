@@ -18,6 +18,7 @@ fn in_process_rpc_path_can_create_seed_send_and_query_state() {
         device_name: "laptop".into(),
         message_count: 3,
         network_age: Some("1d".into()),
+        device_chain_length: 0,
     });
     assert!(create.ok, "workspace creation failed: {:?}", create.error);
     assert!(create.data.is_some(), "create workspace should return data");
@@ -67,6 +68,7 @@ fn create_workspace_caps_created_events_oldest_first() {
         device_name: "laptop".into(),
         message_count: 128,
         network_age: Some("30d".into()),
+        device_chain_length: 6,
     });
     assert!(create.ok, "workspace creation failed: {:?}", create.error);
 
@@ -80,6 +82,17 @@ fn create_workspace_caps_created_events_oldest_first() {
     assert_eq!(cap, 32);
     assert_eq!(created_events.len(), cap);
     assert_eq!(data["seeded_message_count"].as_u64(), Some(128));
+    assert_eq!(data["seeded_device_chain_length"].as_u64(), Some(6));
+
+    let conn = topo::db::open_connection(&db_path).expect("open db for seeded device chain count");
+    let tenant_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT recorded_by) FROM invites_accepted",
+            [],
+            |row| row.get(0),
+        )
+        .expect("count seeded device chain tenants");
+    assert_eq!(tenant_count, 7);
 
     let mut previous_created_at = None;
     for event in created_events {

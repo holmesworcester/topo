@@ -48,6 +48,10 @@ pub(crate) enum Commands {
         /// Historical age for the initial auth graph + seeded messages (for example 30d, 12w, 3y)
         #[arg(long)]
         network_age: Option<String>,
+        /// Additional linked devices to seed before generating messages.
+        /// Each extra device is created through the real device-link flow and chained from the previous device.
+        #[arg(long, default_value_t = 0)]
+        device_chain_length: usize,
         /// Public address to embed in auto-generated invite link
         #[arg(long)]
         public_addr: Option<String>,

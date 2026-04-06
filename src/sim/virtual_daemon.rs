@@ -91,6 +91,7 @@ mod tests {
             device_name: "laptop".to_string(),
             message_count: 5,
             network_age: Some("1d".to_string()),
+            device_chain_length: 0,
         });
         assert!(created.ok, "create workspace failed: {:?}", created.error);
 

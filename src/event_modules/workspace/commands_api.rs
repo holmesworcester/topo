@@ -136,7 +136,7 @@ pub fn create_workspace_for_db(
     username: &str,
     device_name: &str,
 ) -> Result<CreateWorkspaceResponse, Box<dyn std::error::Error + Send + Sync>> {
-    create_workspace_for_db_with_seed(db_path, workspace_name, username, device_name, 0, None)
+    create_workspace_for_db_with_seed(db_path, workspace_name, username, device_name, 0, None, 0)
 }
 
 pub fn create_workspace_for_db_with_seed(
@@ -146,6 +146,7 @@ pub fn create_workspace_for_db_with_seed(
     device_name: &str,
     message_count: usize,
     network_age: Option<&str>,
+    device_chain_length: usize,
 ) -> Result<CreateWorkspaceResponse, Box<dyn std::error::Error + Send + Sync>> {
     use crate::db::{open_connection, schema::create_tables};
 
@@ -172,6 +173,7 @@ pub fn create_workspace_for_db_with_seed(
             message_count,
             network_age_ms,
             end_at_ms: Some(crate::state::db::queue::current_timestamp_ms_u64()),
+            device_chain_length,
         },
     )?;
     let peer_id = hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(

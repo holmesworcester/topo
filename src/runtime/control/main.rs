@@ -322,6 +322,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             device_name,
             message_count,
             network_age,
+            device_chain_length,
             public_addr,
         } => {
             let device_name = device_name.unwrap_or_else(system_hostname);
@@ -334,6 +335,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                     device_name,
                     message_count,
                     network_age,
+                    device_chain_length,
                 },
             )?;
             println!(

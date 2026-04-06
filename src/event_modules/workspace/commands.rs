@@ -262,6 +262,192 @@ fn emit_peer_secret_at(
         .map_err(|e| format!("emit peer_secret failed: {}", e).into())
 }
 
+fn peer_id_for_signing_key(signing_key: &SigningKey) -> String {
+    hex::encode(crate::crypto::spki_fingerprint_from_ed25519_pubkey(
+        &signing_key.verifying_key().to_bytes(),
+    ))
+}
+
+struct SeededAuthoringPeer {
+    recorded_by: String,
+    signer_event_id: EventId,
+    signing_key: SigningKey,
+}
+
+fn create_device_link_invite_raw_at(
+    db: &Connection,
+    recorded_by: &str,
+    peer_shared_key: &SigningKey,
+    peer_shared_event_id: &EventId,
+    user_event_id: &EventId,
+    workspace_id: &EventId,
+    created_at_ms: u64,
+) -> Result<super::identity_ops::InviteData, Box<dyn std::error::Error + Send + Sync>> {
+    ops::create_device_link_invite_events_for_user_at(
+        db,
+        recorded_by,
+        peer_shared_key,
+        peer_shared_event_id,
+        user_event_id,
+        workspace_id,
+        created_at_ms,
+        None,
+    )
+}
+
+fn add_device_to_workspace_at(
+    db: &Connection,
+    recorded_by: &str,
+    device_invite_key: &SigningKey,
+    device_invite_event_id: &EventId,
+    workspace_id: EventId,
+    user_event_id: EventId,
+    device_name: &str,
+    peer_shared_key: SigningKey,
+    invite_accepted_created_at_ms: u64,
+    peer_shared_created_at_ms: u64,
+) -> Result<LinkChain, Box<dyn std::error::Error + Send + Sync>> {
+    let _ = ensure_daemon_identity(db)?;
+    let endpoint_shared_event_id =
+        crate::event_modules::endpoint_shared::load_local_endpoint_shared(db)?
+            .ok_or("endpoint_shared missing after ensure_daemon_identity")?
+            .event_id;
+    let endpoint_shared_event_id = crate::crypto::event_id_from_base64(&endpoint_shared_event_id)
+        .ok_or("invalid endpoint_shared event_id")?;
+    let tenant_event_id = ops::ensure_local_tenant_event(db, recorded_by, &peer_shared_key)?;
+
+    let _ = ops::store_invite_secret(db, recorded_by, device_invite_event_id, device_invite_key)?;
+
+    let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
+        created_at_ms: invite_accepted_created_at_ms,
+        tenant_event_id,
+        invite_event_id: *device_invite_event_id,
+        workspace_id,
+    });
+    let invite_accepted_event_id = create_event_synchronous(db, recorded_by, &ia_evt)?;
+
+    let _ = replay_existing_workspace_shared_events_for_tenant(db, recorded_by, &workspace_id)?;
+
+    let psf_evt = ParsedEvent::PeerShared(PeerSharedEvent {
+        created_at_ms: peer_shared_created_at_ms,
+        public_key: peer_shared_key.verifying_key().to_bytes(),
+        user_event_id,
+        endpoint_shared_event_id,
+        device_name: device_name.to_string(),
+        signed_by: *device_invite_event_id,
+        signer_type: 3,
+        signature: [0u8; 64],
+    });
+    let peer_shared_event_id = event_id_or_blocked(create_signed_event_synchronous(
+        db,
+        recorded_by,
+        &psf_evt,
+        device_invite_key,
+    ))?;
+    index_endpoint_shared_for_workspace(db, recorded_by, &workspace_id, &endpoint_shared_event_id)?;
+
+    Ok(LinkChain {
+        endpoint_shared_event_id,
+        peer_shared_event_id,
+        peer_shared_key,
+        invite_accepted_event_id,
+    })
+}
+
+fn persist_link_peer_secret_at(
+    db: &Connection,
+    recorded_by: &str,
+    link: &LinkChain,
+    created_at_ms: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    emit_peer_secret_at(
+        db,
+        recorded_by,
+        &link.peer_shared_event_id,
+        &link.peer_shared_key,
+        created_at_ms,
+    )?;
+    Ok(())
+}
+
+fn record_seed_invite_link_workspace_binding(
+    db: &Connection,
+    recorded_by: &str,
+    invite_event_id: &EventId,
+    workspace_id: &EventId,
+    invite_key: &SigningKey,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let bootstrap_spki = ops::expected_invite_bootstrap_spki_from_invite_key(invite_key)?;
+    crate::db::transport_trust::append_bootstrap_context(
+        db,
+        recorded_by,
+        &event_id_to_base64(invite_event_id),
+        &event_id_to_base64(workspace_id),
+        "",
+        &bootstrap_spki,
+    )?;
+    Ok(())
+}
+
+fn seed_linked_devices(
+    db: &Connection,
+    workspace_id: EventId,
+    user_event_id: EventId,
+    initial_recorded_by: &str,
+    initial_signer_event_id: &EventId,
+    initial_signing_key: &SigningKey,
+    device_chain_length: usize,
+    timestamps: &mut Option<TimestampCursor>,
+) -> Result<String, Box<dyn std::error::Error + Send + Sync>> {
+    let mut rng = rand::thread_rng();
+    let mut current = SeededAuthoringPeer {
+        recorded_by: initial_recorded_by.to_string(),
+        signer_event_id: *initial_signer_event_id,
+        signing_key: SigningKey::from_bytes(&initial_signing_key.to_bytes()),
+    };
+
+    for index in 0..device_chain_length {
+        let invite = create_device_link_invite_raw_at(
+            db,
+            &current.recorded_by,
+            &current.signing_key,
+            &current.signer_event_id,
+            &user_event_id,
+            &workspace_id,
+            next_created_at(timestamps),
+        )?;
+        let next_peer_shared_key = SigningKey::generate(&mut rng);
+        let next_recorded_by = peer_id_for_signing_key(&next_peer_shared_key);
+        record_seed_invite_link_workspace_binding(
+            db,
+            &next_recorded_by,
+            &invite.invite_event_id,
+            &workspace_id,
+            &invite.invite_key,
+        )?;
+        let link = add_device_to_workspace_at(
+            db,
+            &next_recorded_by,
+            &invite.invite_key,
+            &invite.invite_event_id,
+            workspace_id,
+            user_event_id,
+            &format!("seed-device-{}", index + 1),
+            next_peer_shared_key,
+            next_created_at(timestamps),
+            next_created_at(timestamps),
+        )?;
+        persist_link_peer_secret_at(db, &next_recorded_by, &link, next_created_at(timestamps))?;
+        current = SeededAuthoringPeer {
+            recorded_by: next_recorded_by,
+            signer_event_id: link.peer_shared_event_id,
+            signing_key: link.peer_shared_key,
+        };
+    }
+
+    Ok(current.recorded_by)
+}
+
 // ─── Result types ───
 
 /// Result of creating a new workspace (full identity chain bootstrap).
@@ -277,6 +463,7 @@ pub struct CreateWorkspaceOptions {
     pub message_count: usize,
     pub network_age_ms: Option<u64>,
     pub end_at_ms: Option<u64>,
+    pub device_chain_length: usize,
 }
 
 impl CreateWorkspaceOptions {
@@ -566,6 +753,21 @@ fn create_workspace_inner(
         next_created_at(&mut timestamps),
     )?;
 
+    let message_recorded_by = if options.device_chain_length > 0 {
+        seed_linked_devices(
+            db,
+            ws_eid,
+            ub_eid,
+            &derived_peer_id,
+            &psf_eid,
+            &peer_shared_key,
+            options.device_chain_length,
+            &mut timestamps,
+        )?
+    } else {
+        derived_peer_id.clone()
+    };
+
     if options.message_count > 0 {
         let start_at_ms = timestamps
             .as_ref()
@@ -573,7 +775,7 @@ fn create_workspace_inner(
             .unwrap_or(end_at_ms);
         let _ = crate::event_modules::message::commands::generate_messages_for_recorded_by_between(
             db,
-            &derived_peer_id,
+            &message_recorded_by,
             options.message_count,
             start_at_ms,
             end_at_ms,
@@ -789,57 +991,18 @@ pub fn add_device_to_workspace(
     device_name: &str,
     peer_shared_key: SigningKey,
 ) -> Result<LinkChain, Box<dyn std::error::Error + Send + Sync>> {
-    let _ = ensure_daemon_identity(db)?;
-    let endpoint_shared_event_id =
-        crate::event_modules::endpoint_shared::load_local_endpoint_shared(db)?
-            .ok_or("endpoint_shared missing after ensure_daemon_identity")?
-            .event_id;
-    let endpoint_shared_event_id = crate::crypto::event_id_from_base64(&endpoint_shared_event_id)
-        .ok_or("invalid endpoint_shared event_id")?;
-    let tenant_event_id = ops::ensure_local_tenant_event(db, recorded_by, &peer_shared_key)?;
-
-    // Persist deterministic invite_secret material so invite_accepted projection
-    // can install bootstrap transport identity through the normal command path.
-    let _ = ops::store_invite_secret(db, recorded_by, device_invite_event_id, device_invite_key)?;
-
-    // 1. InviteAccepted (local event) — binds accepted workspace, triggers guard cascade
-    let ia_evt = ParsedEvent::InviteAccepted(InviteAcceptedEvent {
-        created_at_ms: current_timestamp_ms_u64(),
-        tenant_event_id,
-        invite_event_id: *device_invite_event_id,
-        workspace_id,
-    });
-    let invite_accepted_event_id = create_event_synchronous(db, recorded_by, &ia_evt)?;
-
-    let _ = replay_existing_workspace_shared_events_for_tenant(db, recorded_by, &workspace_id)?;
-
-    // 2. PeerShared (signed by device_invite_key) — may block if device invite
-    // event not yet synced. Tolerates Blocked: the event is stored and will project
-    // via cascade when prerequisites arrive.
-    let psf_evt = ParsedEvent::PeerShared(PeerSharedEvent {
-        created_at_ms: current_timestamp_ms_u64(),
-        public_key: peer_shared_key.verifying_key().to_bytes(),
-        user_event_id,
-        endpoint_shared_event_id,
-        device_name: device_name.to_string(),
-        signed_by: *device_invite_event_id,
-        signer_type: 3,
-        signature: [0u8; 64],
-    });
-    let peer_shared_event_id = event_id_or_blocked(create_signed_event_synchronous(
+    add_device_to_workspace_at(
         db,
         recorded_by,
-        &psf_evt,
         device_invite_key,
-    ))?;
-    index_endpoint_shared_for_workspace(db, recorded_by, &workspace_id, &endpoint_shared_event_id)?;
-
-    Ok(LinkChain {
-        endpoint_shared_event_id,
-        peer_shared_event_id,
+        device_invite_event_id,
+        workspace_id,
+        user_event_id,
+        device_name,
         peer_shared_key,
-        invite_accepted_event_id,
-    })
+        current_timestamp_ms_u64(),
+        current_timestamp_ms_u64(),
+    )
 }
 
 /// Persist signer secrets for a device link.
@@ -850,13 +1013,7 @@ pub fn persist_link_peer_secret(
     recorded_by: &str,
     link: &LinkChain,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    emit_peer_secret(
-        db,
-        recorded_by,
-        &link.peer_shared_event_id,
-        &link.peer_shared_key,
-    )?;
-    Ok(())
+    persist_link_peer_secret_at(db, recorded_by, link, current_timestamp_ms_u64())
 }
 
 // ─── 4. Create user invite ───
@@ -998,14 +1155,14 @@ pub fn create_device_link_invite_raw(
     user_event_id: &EventId,
     workspace_id: &EventId,
 ) -> Result<super::identity_ops::InviteData, Box<dyn std::error::Error + Send + Sync>> {
-    ops::create_device_link_invite_events_for_user(
+    create_device_link_invite_raw_at(
         db,
         recorded_by,
         peer_shared_key,
         peer_shared_event_id,
         user_event_id,
         workspace_id,
-        None,
+        current_timestamp_ms_u64(),
     )
 }
 

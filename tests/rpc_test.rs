@@ -237,6 +237,7 @@ fn rpc_all_methods_serialize() {
             device_name: "device".into(),
             message_count: 0,
             network_age: None,
+            device_chain_length: 0,
         },
         RpcMethod::CreateInvite {
             public_addr: Some("127.0.0.1:4433".to_string()),

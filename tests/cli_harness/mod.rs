@@ -1007,7 +1007,7 @@ pub fn create_workspace_with_details(
     username: &str,
     device_name: &str,
 ) {
-    create_workspace_with_seeded_history(db, workspace_name, username, device_name, 0, None);
+    create_workspace_with_seeded_history(db, workspace_name, username, device_name, 0, None, 0);
 }
 
 pub fn create_workspace_with_seeded_history(
@@ -1017,6 +1017,7 @@ pub fn create_workspace_with_seeded_history(
     device_name: &str,
     message_count: usize,
     network_age: Option<&str>,
+    device_chain_length: usize,
 ) {
     let mut tmp_daemon = start_daemon(db);
     let mut args = vec![
@@ -1038,7 +1039,13 @@ pub fn create_workspace_with_seeded_history(
         args.push("--network-age".to_string());
         args.push(network_age.to_string());
     }
+    if device_chain_length > 0 {
+        args.push("--device-chain-length".to_string());
+        args.push(device_chain_length.to_string());
+    }
     let out = Command::new(bin())
+        .env("TOPO_RPC_READ_TIMEOUT_SECS", "600")
+        .env("TOPO_RPC_WRITE_TIMEOUT_SECS", "120")
         .args(&args)
         .output()
         .expect("create-workspace");

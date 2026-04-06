@@ -125,6 +125,7 @@ fn planner_runner_executes_no_sessions_without_real_connect_targets() {
             device_name: "laptop".into(),
             message_count: 0,
             network_age: None,
+            device_chain_length: 0,
         });
         assert!(created.ok, "workspace creation failed: {:?}", created.error);
     }
@@ -165,6 +166,7 @@ fn nearest_neighbor_no_auth_uses_fake_topology_for_event_layer_valid_peers() {
         device_name: "laptop".into(),
         message_count: 0,
         network_age: None,
+        device_chain_length: 0,
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
 
@@ -259,6 +261,7 @@ fn planner_runner_propagates_only_through_planned_pair_sessions() {
         device_name: "phone".into(),
         message_count: 0,
         network_age: None,
+        device_chain_length: 0,
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
     let phone_peer = active_peer_id(&phone);
@@ -373,6 +376,7 @@ fn nearest_neighbor_no_auth_propagates_key_shared_along_chain() {
         device_name: "phone".into(),
         message_count: 0,
         network_age: None,
+        device_chain_length: 0,
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
 
@@ -454,6 +458,7 @@ fn fake_star_message_reaches_all_peers_in_one_round() {
         device_name: "laptop".into(),
         message_count: 0,
         network_age: None,
+        device_chain_length: 0,
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
 
@@ -532,6 +537,7 @@ fn planner_runner_reimports_same_db_new_tenant_on_next_round() {
         device_name: "laptop".into(),
         message_count: 0,
         network_age: None,
+        device_chain_length: 0,
     });
     assert!(created.ok, "workspace creation failed: {:?}", created.error);
 

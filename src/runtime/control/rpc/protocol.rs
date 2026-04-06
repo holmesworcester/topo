@@ -120,6 +120,8 @@ pub enum RpcMethod {
         message_count: usize,
         #[serde(default)]
         network_age: Option<String>,
+        #[serde(default)]
+        device_chain_length: usize,
     },
     /// List all known peers with local/remote status and endpoint info.
     Peers,

@@ -164,6 +164,7 @@ fn main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         device_name: "sim-daemon".to_string(),
         message_count: config.messages,
         network_age: Some("365d".to_string()),
+        device_chain_length: 0,
     });
     let create_workspace_ms = create_started.elapsed().as_millis();
     if !create_workspace.ok {

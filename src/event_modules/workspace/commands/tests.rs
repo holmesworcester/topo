@@ -81,6 +81,31 @@ fn encrypted_wrapper_key_event_id(
     }
 }
 
+fn signer_chain_depth(conn: &rusqlite::Connection, event_id: &EventId) -> usize {
+    let mut depth = 0usize;
+    let mut current = Some(*event_id);
+    let mut seen = std::collections::HashSet::new();
+
+    while let Some(event_id) = current {
+        assert!(
+            seen.insert(event_id),
+            "unexpected signer cycle in test chain"
+        );
+        depth = depth.saturating_add(1);
+        let blob: Vec<u8> = conn
+            .query_row(
+                "SELECT blob FROM events WHERE event_id = ?1",
+                rusqlite::params![event_id_to_base64(&event_id)],
+                |row| row.get(0),
+            )
+            .expect("load signer chain blob");
+        let parsed = parse_event(&blob).expect("parse signer chain event");
+        current = parsed.signer_fields().map(|(signed_by, _)| signed_by);
+    }
+
+    depth
+}
+
 #[test]
 fn create_workspace_with_seeded_history_ages_auth_chain_and_messages() {
     let conn = open_in_memory().expect("open in-memory db");
@@ -98,6 +123,7 @@ fn create_workspace_with_seeded_history_ages_auth_chain_and_messages() {
             message_count: 4,
             network_age_ms: Some(network_age_ms),
             end_at_ms: Some(end_at_ms),
+            device_chain_length: 0,
         },
     )
     .expect("create workspace with seeded history");
@@ -174,6 +200,97 @@ fn create_workspace_with_seeded_history_ages_auth_chain_and_messages() {
         "peer_shared event should be near network start: peer_shared_created_at_ms={} network_start_ms={}",
         peer_shared_created_at_ms,
         network_start_ms
+    );
+}
+
+#[test]
+fn create_workspace_with_seeded_device_chain_authors_messages_from_latest_link() {
+    let conn = open_in_memory().expect("open in-memory db");
+    create_tables(&conn).expect("create tables");
+
+    let end_at_ms = 90_u64 * 24 * 60 * 60 * 1000;
+    let network_age_ms = 30_u64 * 24 * 60 * 60 * 1000;
+    let device_chain_length = 8usize;
+    let workspace = create_workspace_with_options(
+        &conn,
+        "bootstrap",
+        "ws",
+        "alice",
+        "laptop",
+        CreateWorkspaceOptions {
+            message_count: 4,
+            network_age_ms: Some(network_age_ms),
+            end_at_ms: Some(end_at_ms),
+            device_chain_length,
+        },
+    )
+    .expect("create workspace with seeded device chain");
+    let creator_peer_id = peer_id_for_signing_key(&workspace.peer_shared_key);
+
+    let tenant_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(DISTINCT recorded_by)
+             FROM invites_accepted
+             WHERE workspace_id = ?1",
+            rusqlite::params![event_id_to_base64(&workspace.workspace_id)],
+            |row| row.get(0),
+        )
+        .expect("count seeded device tenants");
+    assert_eq!(tenant_count, (device_chain_length + 1) as i64);
+
+    let latest_peer_shared_event_id: EventId = conn
+        .query_row(
+            "SELECT ps.event_id
+             FROM peers_shared ps
+             JOIN events e ON e.event_id = ps.event_id
+             WHERE ps.recorded_by <> ?1
+             ORDER BY e.created_at DESC, ps.event_id DESC
+             LIMIT 1",
+            rusqlite::params![&creator_peer_id],
+            |row| row.get::<_, String>(0),
+        )
+        .ok()
+        .and_then(|b64| crate::crypto::event_id_from_base64(&b64))
+        .expect("latest seeded peer_shared");
+    let latest_peer_shared_created_at_ms: i64 = conn
+        .query_row(
+            "SELECT created_at FROM events WHERE event_id = ?1",
+            rusqlite::params![event_id_to_base64(&latest_peer_shared_event_id)],
+            |row| row.get(0),
+        )
+        .expect("load latest seeded peer_shared timestamp");
+    let oldest_message_created_at_ms: i64 = conn
+        .query_row(
+            "SELECT MIN(created_at) FROM messages WHERE recorded_by = ?1",
+            rusqlite::params![&creator_peer_id],
+            |row| row.get(0),
+        )
+        .expect("load oldest seeded message timestamp");
+    assert!(
+        latest_peer_shared_created_at_ms < oldest_message_created_at_ms,
+        "seeded device chain should complete before seeded message generation"
+    );
+
+    let latest_peer_recorded_by: String = conn
+        .query_row(
+            "SELECT recorded_by FROM peers_shared WHERE event_id = ?1",
+            rusqlite::params![event_id_to_base64(&latest_peer_shared_event_id)],
+            |row| row.get(0),
+        )
+        .expect("load latest seeded peer tenant");
+    let latest_peer_message_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM messages WHERE recorded_by = ?1",
+            rusqlite::params![&latest_peer_recorded_by],
+            |row| row.get(0),
+        )
+        .expect("count latest seeded peer messages");
+
+    assert_eq!(latest_peer_message_count, 4);
+    assert_eq!(
+        signer_chain_depth(&conn, &latest_peer_shared_event_id),
+        5 + device_chain_length * 2,
+        "latest peer_shared signer chain depth should track the seeded device chain"
     );
 }
 
