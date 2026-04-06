@@ -345,7 +345,11 @@ fn write_summary(summary_key: &str, summary: &str) {
         .expect("write benchmark summary file");
 }
 
-fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool) {
+fn run_tiered_window_bench(
+    total_messages_override: Option<i64>,
+    hot_only: bool,
+    device_chain_length: usize,
+) {
     std::env::set_var(
         "TOPO_GENERATE_MESSAGE_SPREAD_MS",
         THREE_YEARS_MS.to_string(),
@@ -361,7 +365,6 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool)
 
     let total_messages = total_messages_override
         .unwrap_or_else(|| env_i64("TOPO_TIERED_SYNC_TOTAL_MESSAGES", 50_000));
-    let device_chain_length = env_i64("TOPO_TIERED_SYNC_DEVICE_CHAIN_LENGTH", 0).max(0) as usize;
     let network_profile = join_catchup_network_profile_from_env();
     let tmpdir = tempfile::tempdir().unwrap();
     let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
@@ -498,6 +501,17 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool)
     let today_timing = range_timing_sql(&bob_db, Some(today_start_ms), Some(tomorrow_start_ms));
     let hot_timing = range_timing_sql(&bob_db, Some(yesterday_start_ms), Some(tomorrow_start_ms));
     let newest_timing = newest_message_timing_sql(&bob_db);
+    let linked_device_summary = if device_chain_length > 0 {
+        format!(
+            "  Linked devices seeded: {} (dependency depth {}, tip_created_at={}, tip_authored_messages={})\n",
+            device_chain_length,
+            newest_signer_chain.signer_chain_depth,
+            newest_signer_chain.signer_created_at_ms,
+            newest_signer_chain.authored_message_count,
+        )
+    } else {
+        String::new()
+    };
 
     if hot_only {
         full_wall_secs = bench_start.elapsed().as_secs_f64();
@@ -508,8 +522,7 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool)
   Messages preloaded on inviter: {total_messages}
   Network profile: {}
   Generated spread: 3 years
-  Linked devices seeded: {} (dependency depth {}, tip_created_at={}, tip_authored_messages={})
-  Aged auth deps: user={} peer_shared={}
+{}  Aged auth deps: user={} peer_shared={}
   Metric start: invite accept on running joiner daemon
   Today:         {} msgs durable in {:.2}s projected in {:.2}s
   Hot (2 days):  {} msgs durable in {:.2}s projected in {:.2}s
@@ -520,10 +533,7 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool)
             network_profile
                 .map(|profile| profile.slug)
                 .unwrap_or("loopback"),
-            device_chain_length,
-            newest_signer_chain.signer_chain_depth,
-            newest_signer_chain.signer_created_at_ms,
-            newest_signer_chain.authored_message_count,
+            linked_device_summary,
             authoring_dep_timing.user_created_at_ms,
             authoring_dep_timing.peer_shared_created_at_ms,
             today_timing.count,
@@ -587,8 +597,7 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool)
   Messages preloaded on inviter: {total_messages}
   Network profile: {}
   Generated spread: 3 years
-  Linked devices seeded: {} (dependency depth {}, tip_created_at={}, tip_authored_messages={})
-  Aged auth deps: user={} peer_shared={}
+{}  Aged auth deps: user={} peer_shared={}
   Metric start: invite accept on running joiner daemon
   Today:         {} msgs durable in {:.2}s projected in {:.2}s
   Hot (2 days):  {} msgs durable in {:.2}s projected in {:.2}s
@@ -601,10 +610,7 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool)
             network_profile
                 .map(|profile| profile.slug)
                 .unwrap_or("loopback"),
-            device_chain_length,
-            newest_signer_chain.signer_chain_depth,
-            newest_signer_chain.signer_created_at_ms,
-            newest_signer_chain.authored_message_count,
+            linked_device_summary,
             authoring_dep_timing.user_created_at_ms,
             authoring_dep_timing.peer_shared_created_at_ms,
             today_timing.count,
@@ -671,40 +677,28 @@ fn run_tiered_window_bench(total_messages_override: Option<i64>, hot_only: bool)
 #[test]
 #[ignore]
 fn perf_tiered_window_50k_parallel() {
-    run_tiered_window_bench(None, false);
+    run_tiered_window_bench(None, false, 0);
 }
 
 #[test]
 #[ignore]
 fn perf_tiered_window_100k_parallel() {
-    run_tiered_window_bench(Some(100_000), false);
+    run_tiered_window_bench(Some(100_000), false, 0);
 }
 
 #[test]
 #[ignore]
 fn perf_hot_only_window_100k_parallel() {
-    run_tiered_window_bench(Some(100_000), true);
+    run_tiered_window_bench(Some(100_000), true, 0);
 }
 
 #[test]
 fn hot_only_window_syncs_32_linked_devices() {
-    let prev = std::env::var("TOPO_TIERED_SYNC_DEVICE_CHAIN_LENGTH").ok();
-    std::env::set_var("TOPO_TIERED_SYNC_DEVICE_CHAIN_LENGTH", "32");
-    run_tiered_window_bench(Some(256), true);
-    match prev {
-        Some(value) => std::env::set_var("TOPO_TIERED_SYNC_DEVICE_CHAIN_LENGTH", value),
-        None => std::env::remove_var("TOPO_TIERED_SYNC_DEVICE_CHAIN_LENGTH"),
-    }
+    run_tiered_window_bench(Some(256), true, 32);
 }
 
 #[test]
 #[ignore]
-fn perf_hot_only_window_chain_64_parallel() {
-    let prev = std::env::var("TOPO_TIERED_SYNC_DEVICE_CHAIN_LENGTH").ok();
-    std::env::set_var("TOPO_TIERED_SYNC_DEVICE_CHAIN_LENGTH", "64");
-    run_tiered_window_bench(Some(256), true);
-    match prev {
-        Some(value) => std::env::set_var("TOPO_TIERED_SYNC_DEVICE_CHAIN_LENGTH", value),
-        None => std::env::remove_var("TOPO_TIERED_SYNC_DEVICE_CHAIN_LENGTH"),
-    }
+fn perf_hot_only_window_64_linked_devices_parallel() {
+    run_tiered_window_bench(Some(256), true, 64);
 }
