@@ -106,6 +106,7 @@ fn golden_bytes_encrypted() {
     let enc = ParsedEvent::Encrypted(EncryptedEvent {
         created_at_ms: 3000,
         key_event_id: [0x77; 32],
+        owner_event_id: [0x66; 32],
         inner_type_code: 2,
         nonce: [0x88; 12],
         ciphertext: vec![0x99; ct_size],
@@ -116,10 +117,11 @@ fn golden_bytes_encrypted() {
     assert_eq!(blob.len(), expected_size);
     assert_eq!(blob[0], 5);
     assert_eq!(&blob[9..41], &[0x77; 32]);
-    assert_eq!(blob[41], 2); // inner_type_code
-    assert_eq!(&blob[42..54], &[0x88; 12]); // nonce
-    assert_eq!(&blob[54..54 + ct_size], &vec![0x99; ct_size]); // ciphertext
-    let tag_start = 54 + ct_size;
+    assert_eq!(&blob[41..73], &[0x66; 32]);
+    assert_eq!(blob[73], 2); // inner_type_code
+    assert_eq!(&blob[74..86], &[0x88; 12]); // nonce
+    assert_eq!(&blob[86..86 + ct_size], &vec![0x99; ct_size]); // ciphertext
+    let tag_start = 86 + ct_size;
     assert_eq!(&blob[tag_start..tag_start + 16], &[0xAA; 16]); // auth_tag
 }
 
@@ -296,6 +298,7 @@ fn truncation_encrypted() {
     let enc = ParsedEvent::Encrypted(EncryptedEvent {
         created_at_ms: 100,
         key_event_id: [0u8; 32],
+        owner_event_id: [0u8; 32],
         inner_type_code: 1,
         nonce: [0u8; 12],
         ciphertext: vec![0u8; ct_size],
@@ -510,7 +513,7 @@ fn encrypted_unknown_inner_type_code() {
     // Minimal: just enough for the parser to read the header and reject
     let mut buf = vec![0u8; header_size + 1]; // +1 so TooShort isn't the error
     buf[0] = 5; // EVENT_TYPE_ENCRYPTED
-    buf[41] = 200; // unknown inner_type_code
+    buf[73] = 200; // unknown inner_type_code
     let err = events::parse_event(&buf).unwrap_err();
     assert!(matches!(err, EventError::InvalidEncryptedInnerType(200)));
 }
@@ -691,6 +694,7 @@ fn idempotent_encrypted() {
     assert_idempotent(&ParsedEvent::Encrypted(EncryptedEvent {
         created_at_ms: 400,
         key_event_id: [11u8; 32],
+        owner_event_id: [10u8; 32],
         inner_type_code: 1,
         nonce: [12u8; 12],
         ciphertext: vec![13u8; ct_size],

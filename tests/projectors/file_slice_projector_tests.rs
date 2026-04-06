@@ -1,7 +1,7 @@
 //! Pure projector conformance tests for FileSlice (type 25).
 //!
 //! TLA+ guards tested:
-//!   SPEC_FILE_AUTH_01 — InvFileSliceAuth (guard-block on no descriptor)
+//!   SPEC_FILE_AUTH_01 — InvFileSliceAuth (dep-block on no descriptor)
 //!   SPEC_FILE_AUTH_02 — InvFileSliceAuth (signer mismatch reject + valid)
 //!   CHK_FS_SLOT_CONFLICT — slot uniqueness (conflict reject)
 //!   CHK_FS_IDEMPOTENT — idempotent replay
@@ -26,12 +26,29 @@ mod tests {
         })
     }
 
+    fn descriptor(
+        message_id: &str,
+        signer_event_id: &str,
+        key_event_id: &str,
+    ) -> FileDescriptorInfo {
+        FileDescriptorInfo {
+            event_id: "desc_1".to_string(),
+            message_id: message_id.to_string(),
+            signer_event_id: signer_event_id.to_string(),
+            key_event_id: key_event_id.to_string(),
+            root_hash: [0u8; 32],
+            blob_bytes: 0,
+            slice_bytes: 0,
+        }
+    }
+
     // ── SPEC_FILE_AUTH_01: break (no descriptor → guard block) ──
 
     #[test]
     fn test_file_slice_blocks_no_descriptor() {
         let parsed = make_file_slice([1u8; 32]);
         let mut ctx = empty_ctx(); // no file_descriptors
+        ctx.current_owner_event_id = Some(b64(&[9u8; 32]));
         ctx.current_signer = Some(topo::projection::contract::CurrentSignerInfo {
             event_id: b64(&[3u8; 32]),
             semantic_type_code: EVENT_TYPE_FILE_SLICE,
@@ -48,10 +65,19 @@ mod tests {
     }
 
     #[test]
-    fn test_file_slice_skips_when_file_graph_deleted() {
+    fn test_file_slice_skips_when_owner_message_deleted() {
         let parsed = make_file_slice([1u8; 32]);
         let root_message = b64(&[9u8; 32]);
-        let ctx = ctx_with_deleted_file_message(&root_message);
+        let ctx = topo::projection::contract::ContextSnapshot {
+            target_message_deleted: true,
+            file_descriptors: vec![descriptor(&root_message, &b64(&[3u8; 32]), "key_1")],
+            current_owner_event_id: Some(root_message.clone()),
+            current_signer: Some(topo::projection::contract::CurrentSignerInfo {
+                event_id: b64(&[3u8; 32]),
+                semantic_type_code: EVENT_TYPE_FILE_SLICE,
+            }),
+            ..Default::default()
+        };
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
@@ -66,13 +92,6 @@ mod tests {
                     if message_event_id == &root_message
             )
         });
-        assert!(
-            !result
-                .emit_commands
-                .iter()
-                .any(|c| matches!(c, EmitCommand::RecordFileSliceGuardBlock { .. })),
-            "deleted-file fast path should not emit guard blocks"
-        );
     }
 
     // ── SPEC_FILE_AUTH_02: pass ──
@@ -81,12 +100,10 @@ mod tests {
     fn test_file_slice_valid() {
         let signer = [3u8; 32];
         let signer_b64 = b64(&signer);
+        let owner_b64 = b64(&[9u8; 32]);
         let parsed = make_file_slice([1u8; 32]);
-        let mut ctx = ctx_with_file_descriptors(vec![FileDescriptorInfo {
-            event_id: "desc_1".to_string(),
-            signer_event_id: signer_b64,
-            key_event_id: "key_1".to_string(),
-        }]);
+        let mut ctx = ctx_with_file_descriptors(vec![descriptor(&owner_b64, &signer_b64, "key_1")]);
+        ctx.current_owner_event_id = Some(owner_b64);
         ctx.current_signer = Some(topo::projection::contract::CurrentSignerInfo {
             event_id: b64(&signer),
             semantic_type_code: EVENT_TYPE_FILE_SLICE,
@@ -102,12 +119,11 @@ mod tests {
     #[test]
     fn test_file_slice_rejects_signer_mismatch() {
         let different_signer_b64 = b64(&[99u8; 32]);
+        let owner_b64 = b64(&[9u8; 32]);
         let parsed = make_file_slice([1u8; 32]);
-        let mut ctx = ctx_with_file_descriptors(vec![FileDescriptorInfo {
-            event_id: "desc_1".to_string(),
-            signer_event_id: different_signer_b64,
-            key_event_id: "key_1".to_string(),
-        }]);
+        let mut ctx =
+            ctx_with_file_descriptors(vec![descriptor(&owner_b64, &different_signer_b64, "key_1")]);
+        ctx.current_owner_event_id = Some(owner_b64);
         ctx.current_signer = Some(topo::projection::contract::CurrentSignerInfo {
             event_id: b64(&[3u8; 32]),
             semantic_type_code: EVENT_TYPE_FILE_SLICE,
@@ -118,16 +134,31 @@ mod tests {
     }
 
     #[test]
-    fn test_file_slice_rejects_wrapper_key_mismatch() {
+    fn test_file_slice_rejects_owner_mismatch() {
         let signer = [3u8; 32];
         let signer_b64 = b64(&signer);
         let parsed = make_file_slice([1u8; 32]);
+        let mut ctx =
+            ctx_with_file_descriptors(vec![descriptor(&b64(&[8u8; 32]), &signer_b64, "key_1")]);
+        ctx.current_owner_event_id = Some(b64(&[9u8; 32]));
+        ctx.current_signer = Some(topo::projection::contract::CurrentSignerInfo {
+            event_id: b64(&signer),
+            semantic_type_code: EVENT_TYPE_FILE_SLICE,
+        });
+
+        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        assert_reject_contains(&result, "owner_event_id");
+    }
+
+    #[test]
+    fn test_file_slice_rejects_wrapper_key_mismatch() {
+        let signer = [3u8; 32];
+        let signer_b64 = b64(&signer);
+        let owner_b64 = b64(&[9u8; 32]);
+        let parsed = make_file_slice([1u8; 32]);
         let ctx = topo::projection::contract::ContextSnapshot {
-            file_descriptors: vec![FileDescriptorInfo {
-                event_id: "desc_1".to_string(),
-                signer_event_id: signer_b64,
-                key_event_id: "key_expected".to_string(),
-            }],
+            file_descriptors: vec![descriptor(&owner_b64, &signer_b64, "key_expected")],
+            current_owner_event_id: Some(owner_b64),
             current_signer: Some(topo::projection::contract::CurrentSignerInfo {
                 event_id: b64(&signer),
                 semantic_type_code: EVENT_TYPE_FILE_SLICE,
@@ -146,13 +177,11 @@ mod tests {
     fn test_file_slice_rejects_slot_conflict() {
         let signer = [3u8; 32];
         let signer_b64 = b64(&signer);
+        let owner_b64 = b64(&[9u8; 32]);
         let parsed = make_file_slice([1u8; 32]);
         let ctx = topo::projection::contract::ContextSnapshot {
-            file_descriptors: vec![FileDescriptorInfo {
-                event_id: "desc_1".to_string(),
-                signer_event_id: signer_b64,
-                key_event_id: "key_1".to_string(),
-            }],
+            file_descriptors: vec![descriptor(&owner_b64, &signer_b64, "key_1")],
+            current_owner_event_id: Some(owner_b64),
             current_signer: Some(topo::projection::contract::CurrentSignerInfo {
                 event_id: b64(&signer),
                 semantic_type_code: EVENT_TYPE_FILE_SLICE,
@@ -171,13 +200,11 @@ mod tests {
     fn test_file_slice_idempotent_replay() {
         let signer = [3u8; 32];
         let signer_b64 = b64(&signer);
+        let owner_b64 = b64(&[9u8; 32]);
         let parsed = make_file_slice([1u8; 32]);
         let ctx = topo::projection::contract::ContextSnapshot {
-            file_descriptors: vec![FileDescriptorInfo {
-                event_id: "desc_1".to_string(),
-                signer_event_id: signer_b64,
-                key_event_id: "key_1".to_string(),
-            }],
+            file_descriptors: vec![descriptor(&owner_b64, &signer_b64, "key_1")],
+            current_owner_event_id: Some(owner_b64),
             current_signer: Some(topo::projection::contract::CurrentSignerInfo {
                 event_id: b64(&signer),
                 semantic_type_code: EVENT_TYPE_FILE_SLICE,

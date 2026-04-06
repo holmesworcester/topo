@@ -4,7 +4,7 @@ use rusqlite::{Connection, ErrorCode, OptionalExtension, Result as SqliteResult}
 ///
 /// This prototype intentionally does not support backward migration from older
 /// schema layouts. Existing DBs from prior epochs must be recreated.
-const PROTOTYPE_SCHEMA_EPOCH: i64 = 7;
+const PROTOTYPE_SCHEMA_EPOCH: i64 = 9;
 
 fn table_exists(conn: &Connection, table_name: &str) -> SqliteResult<bool> {
     conn.query_row(
@@ -114,6 +114,7 @@ mod tests {
 
         // Infra-owned tables
         assert!(tables.contains(&"events".to_string()));
+        assert!(tables.contains(&"recorded_event_owners".to_string()));
         assert!(tables.contains(&"shared_event_index".to_string()));
         assert!(tables.contains(&"project_queue".to_string()));
         assert!(tables.contains(&"bootstrap_context".to_string()));
@@ -124,7 +125,6 @@ mod tests {
         assert!(tables.contains(&"messages".to_string()));
         assert!(tables.contains(&"reactions".to_string()));
         assert!(tables.contains(&"deletion_intents".to_string()));
-        assert!(tables.contains(&"deleted_files".to_string()));
 
         // Epoch-only startup guard
         assert!(tables.contains(&"schema_epoch".to_string()));

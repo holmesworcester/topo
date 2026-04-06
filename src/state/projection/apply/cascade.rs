@@ -20,9 +20,9 @@ fn event_is_valid_for_peer(
 
 /// After projecting an event, cascade-unblock dependents using Kahn's algorithm.
 ///
-/// Guard retries (InviteAccepted → workspace retries, File →
-/// file_slice retries) are now handled by EmitCommand execution in the pure
-/// projector apply engine, so this cascade only handles dependency unblocking.
+/// Explicit retry commands are limited to policy-driven cases such as
+/// InviteAccepted → workspace retries. This cascade handles dependency
+/// unblocking, including synthetic blockers like `file_id` for file_slices.
 pub(crate) fn cascade_unblocked(
     conn: &Connection,
     recorded_by: &str,
@@ -154,7 +154,7 @@ fn cascade_unblocked_inner(
 
             // 4. Project this event via project_one_step (no recursive cascade).
             //    apply_projection (called by project_one_step) executes emit_commands,
-            //    which handles guard retries (RetryWorkspaceEvent).
+            //    which handles explicit retries such as RetryWorkspaceEvent.
             if let Some(event_id) = event_id_from_base64(eid_b64) {
                 let (decision, _parsed) =
                     super::project_one::project_one_step(conn, recorded_by, &event_id)?;
@@ -184,8 +184,8 @@ fn cascade_unblocked_inner(
         )?
         .execute(rusqlite::params![recorded_by])?;
         // Clean up orphaned dep edges for events whose blocked_events header was
-        // removed (all deps satisfied) but that didn't reach valid_events — e.g.,
-        // file_slices that were dep-unblocked then guard-blocked by the pure projector.
+        // removed (all deps satisfied) but that did not reach valid/rejected state
+        // in the same step.
         conn.prepare_cached(
             "DELETE FROM blocked_event_deps WHERE peer_id = ?1
              AND event_id NOT IN (SELECT event_id FROM blocked_events WHERE peer_id = ?1)",

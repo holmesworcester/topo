@@ -270,10 +270,10 @@ fn test_invite_accepted_guard_retry_on_workspace() {
 }
 
 #[test]
-fn test_file_slice_guard_retry_after_cascaded_attachment() {
-    // FileSlice is guard-blocked waiting for descriptor (File).
-    // File is dep-blocked on a message. When the message projects,
-    // it cascades the attachment, which triggers guard retry on the file_slice.
+fn test_file_slice_dep_unblocks_after_cascaded_attachment() {
+    // FileSlice blocks on the synthetic file_id dependency until the
+    // descriptor (File) projects. File itself is dep-blocked on the
+    // message, so projecting the message must eventually unblock both.
     let conn = setup();
     let recorded_by = "peer1";
     let (signer_eid, signing_key) = make_identity_chain(&conn, recorded_by);
@@ -314,7 +314,7 @@ fn test_file_slice_guard_retry_after_cascaded_attachment() {
         r1
     );
 
-    // Create file_slice — guard-blocked (no descriptor yet)
+    // Create file_slice — dep-blocked on file_id (no descriptor yet)
     let (_fs, fs_blob) = make_file_slice(&signing_key, &signer_eid, file_id, 0, b"slice data");
     let fs_eid = insert_event_raw(&conn, recorded_by, &fs_blob);
     let r2 = project_one(&conn, recorded_by, &fs_eid).unwrap();
@@ -578,7 +578,7 @@ fn test_source_isomorphism_deletion_cascade() {
     let msg_eid_a = insert_event_raw(&conn_a, recorded_by, &msg_blob_a);
     project_one(&conn_a, recorded_by, &msg_eid_a).unwrap();
 
-    let (_del_a, del_blob_a) = make_deletion_signed(&key_a, &signer_a, &msg_eid_a, [2u8; 32]);
+    let (_del_a, del_blob_a) = make_deletion_signed(&key_a, &signer_a, &msg_eid_a);
     let del_eid_a = insert_event_raw(&conn_a, recorded_by, &del_blob_a);
     project_one(&conn_a, recorded_by, &del_eid_a).unwrap();
 
@@ -588,7 +588,7 @@ fn test_source_isomorphism_deletion_cascade() {
     let (_msg_b, msg_blob_b) = make_message_signed(&key_b, &signer_b, "to delete");
     let msg_eid_b = insert_event_raw(&conn_b, recorded_by, &msg_blob_b);
 
-    let (_del_b, del_blob_b) = make_deletion_signed(&key_b, &signer_b, &msg_eid_b, [2u8; 32]);
+    let (_del_b, del_blob_b) = make_deletion_signed(&key_b, &signer_b, &msg_eid_b);
     let del_eid_b = insert_event_raw(&conn_b, recorded_by, &del_blob_b);
     let r = project_one(&conn_b, recorded_by, &del_eid_b).unwrap();
     assert_eq!(
@@ -641,7 +641,7 @@ fn test_source_isomorphism_reverse_order_replay() {
     let rxn_eid_a = insert_event_raw(&conn_a, recorded_by, &rxn_blob_a);
     project_one(&conn_a, recorded_by, &rxn_eid_a).unwrap();
 
-    let (_del_a, del_blob_a) = make_deletion_signed(&key_a, &signer_a, &msg_eid_a, [2u8; 32]);
+    let (_del_a, del_blob_a) = make_deletion_signed(&key_a, &signer_a, &msg_eid_a);
     let del_eid_a = insert_event_raw(&conn_a, recorded_by, &del_blob_a);
     project_one(&conn_a, recorded_by, &del_eid_a).unwrap();
 
@@ -661,7 +661,7 @@ fn test_source_isomorphism_reverse_order_replay() {
     let (_rxn_b, rxn_blob_b) = make_reaction_signed(&key_b, &signer_b, &msg_eid_b, "star");
     let rxn_eid_b = insert_event_raw(&conn_b, recorded_by, &rxn_blob_b);
 
-    let (_del_b, del_blob_b) = make_deletion_signed(&key_b, &signer_b, &msg_eid_b, [2u8; 32]);
+    let (_del_b, del_blob_b) = make_deletion_signed(&key_b, &signer_b, &msg_eid_b);
     let del_eid_b = insert_event_raw(&conn_b, recorded_by, &del_blob_b);
 
     // Project in reverse: deletion, reaction, message, then identity chain in reverse
@@ -713,7 +713,7 @@ fn test_source_isomorphism_multi_event_deep_cascade() {
     let rxn_eid_a = insert_event_raw(&conn_a, recorded_by, &rxn_blob_a);
     project_one(&conn_a, recorded_by, &rxn_eid_a).unwrap();
 
-    let (_del_a, del_blob_a) = make_deletion_signed(&key_a, &signer_a, &msg_eid_a, [2u8; 32]);
+    let (_del_a, del_blob_a) = make_deletion_signed(&key_a, &signer_a, &msg_eid_a);
     let del_eid_a = insert_event_raw(&conn_a, recorded_by, &del_blob_a);
     project_one(&conn_a, recorded_by, &del_eid_a).unwrap();
 
@@ -727,7 +727,7 @@ fn test_source_isomorphism_multi_event_deep_cascade() {
     let (_rxn_b, rxn_blob_b) = make_reaction_signed(&key_b, &signer_b, &msg_eid_b, "fire");
     let _rxn_eid_b = insert_event_raw(&conn_b, recorded_by, &rxn_blob_b);
 
-    let (_del_b, del_blob_b) = make_deletion_signed(&key_b, &signer_b, &msg_eid_b, [2u8; 32]);
+    let (_del_b, del_blob_b) = make_deletion_signed(&key_b, &signer_b, &msg_eid_b);
     let _del_eid_b = insert_event_raw(&conn_b, recorded_by, &del_blob_b);
 
     // Project reaction and deletion first (both block on message)

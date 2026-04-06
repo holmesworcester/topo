@@ -3,7 +3,7 @@ use crate::event_modules::{
     endpoint_shared::load_endpoint_shared_by_event_id, parse_event, AdminEvent, DeviceInviteEvent,
     FileEvent, FileSliceEvent, InviteAcceptedEvent, KeySharedEvent, MessageDeletionEvent,
     MessageEvent, ParsedEvent, PeerSharedEvent, ReactionEvent, UserInviteEvent, WorkspaceEvent,
-    EVENT_TYPE_DEVICE_INVITE, EVENT_TYPE_PEER_SHARED, EVENT_TYPE_WORKSPACE,
+    EVENT_TYPE_ADMIN, EVENT_TYPE_DEVICE_INVITE, EVENT_TYPE_PEER_SHARED, EVENT_TYPE_WORKSPACE,
 };
 use crate::projection::contract::{
     BootstrapContextSnapshot, ContextSnapshot, CurrentSignerInfo, DeletionIntentInfo,
@@ -66,6 +66,7 @@ impl DepLoadResult {
 #[derive(Debug, Clone, Default)]
 pub struct ProjectionFrameContext {
     pub current_transport_key_event_id: Option<String>,
+    pub current_owner_event_id: Option<String>,
     pub current_signer: Option<CurrentSignerInfo>,
 }
 
@@ -83,6 +84,12 @@ pub trait ProjectionQueries {
         recorded_by: &str,
         key_event_id: &[u8; 32],
     ) -> ProjectionQueryResult<Option<[u8; 32]>>;
+
+    fn message_is_deleted(
+        &self,
+        recorded_by: &str,
+        message_id_b64: &str,
+    ) -> ProjectionQueryResult<bool>;
 
     fn load_workspace_context(
         &self,
@@ -324,7 +331,9 @@ fn tombstone_satisfies_message_dep(
 ) -> Result<bool, rusqlite::Error> {
     let is_deleted_message_target = matches!(
         (parsed, field_name),
-        (ParsedEvent::Reaction(_), "target_event_id") | (ParsedEvent::File(_), "message_id")
+        (ParsedEvent::Reaction(_), "target_event_id")
+            | (ParsedEvent::File(_), "message_id")
+            | (ParsedEvent::Encrypted(_), "owner_event_id")
     );
     if !is_deleted_message_target {
         return Ok(false);
@@ -402,6 +411,63 @@ fn signer_user_mismatch_reason(
     }
 
     Ok(None)
+}
+
+fn deletion_signer_context(
+    conn: &Connection,
+    frame: &ProjectionFrameContext,
+    recorded_by: &str,
+) -> Result<(Option<String>, bool, Option<String>), rusqlite::Error> {
+    let Some(current_signer) = frame.current_signer.as_ref() else {
+        return Ok((
+            None,
+            false,
+            Some("missing current signer envelope".to_string()),
+        ));
+    };
+
+    match current_signer.semantic_type_code {
+        EVENT_TYPE_ADMIN => Ok((None, true, None)),
+        EVENT_TYPE_PEER_SHARED => {
+            let signed_by_b64 = current_signer.event_id.clone();
+            let peer_user_eid: String = match conn.query_row(
+                "SELECT COALESCE(user_event_id, '') FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
+                rusqlite::params![recorded_by, &signed_by_b64],
+                |row| row.get::<_, String>(0),
+            ) {
+                Ok(v) => v,
+                Err(rusqlite::Error::QueryReturnedNoRows) => {
+                    return Ok((
+                        None,
+                        false,
+                        Some(format!("no peers_shared entry for signer {}", signed_by_b64)),
+                    ))
+                }
+                Err(e) => return Err(e),
+            };
+
+            if peer_user_eid.is_empty() {
+                return Ok((
+                    None,
+                    false,
+                    Some(format!(
+                        "peers_shared entry for signer {} has no user_event_id (legacy row)",
+                        signed_by_b64
+                    )),
+                ));
+            }
+
+            Ok((Some(peer_user_eid), false, None))
+        }
+        other => Ok((
+            None,
+            false,
+            Some(format!(
+                "message_deletion signer must be peer_shared or admin, got semantic type {}",
+                other
+            )),
+        )),
+    }
 }
 
 fn load_valid_event_blob(
@@ -570,6 +636,20 @@ impl ProjectionQueries for Connection {
         let mut out = [0u8; 32];
         out.copy_from_slice(&key_bytes);
         Ok(Some(out))
+    }
+
+    fn message_is_deleted(
+        &self,
+        recorded_by: &str,
+        message_id_b64: &str,
+    ) -> ProjectionQueryResult<bool> {
+        Ok(self.query_row(
+            "SELECT COUNT(*) > 0
+             FROM deleted_messages
+             WHERE recorded_by = ?1 AND message_id = ?2",
+            rusqlite::params![recorded_by, message_id_b64],
+            |row| row.get(0),
+        )?)
     }
 
     fn load_workspace_context(
@@ -868,7 +948,7 @@ impl ProjectionQueries for Connection {
             signer_user_mismatch_reason(self, frame, recorded_by, &message.author_id)?;
 
         let mut stmt = self.prepare_cached(
-            "SELECT deletion_event_id, author_id, created_at
+            "SELECT deletion_event_id, author_id, authorized_by_admin, created_at
              FROM deletion_intents
              WHERE recorded_by = ?1
                AND target_kind = 'message'
@@ -880,7 +960,8 @@ impl ProjectionQueries for Connection {
                 Ok(DeletionIntentInfo {
                     deletion_event_id: row.get(0)?,
                     author_id: row.get(1)?,
-                    created_at: row.get(2)?,
+                    authorized_by_admin: row.get::<_, i64>(2)? != 0,
+                    created_at: row.get(3)?,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
@@ -900,8 +981,11 @@ impl ProjectionQueries for Connection {
         message_deletion: &MessageDeletionEvent,
     ) -> ProjectionQueryResult<ContextSnapshot> {
         let mut ctx = ContextSnapshot::default();
-        ctx.signer_user_mismatch_reason =
-            signer_user_mismatch_reason(self, frame, recorded_by, &message_deletion.author_id)?;
+        let (deletion_signer_user_id, deletion_signer_is_admin, deletion_signer_reject_reason) =
+            deletion_signer_context(self, frame, recorded_by)?;
+        ctx.deletion_signer_user_id = deletion_signer_user_id;
+        ctx.deletion_signer_is_admin = deletion_signer_is_admin;
+        ctx.deletion_signer_reject_reason = deletion_signer_reject_reason;
 
         let target_b64 = event_id_to_base64(&message_deletion.target_event_id);
         ctx.target_tombstone_author = self
@@ -969,26 +1053,16 @@ impl ProjectionQueries for Connection {
             rusqlite::params![recorded_by, &message_id_b64],
             |row| row.get(0),
         )?;
-        let deleted_file_message_id = self
-            .query_row(
-                "SELECT message_id
-                 FROM deleted_files
-                 WHERE recorded_by = ?1 AND file_id = ?2",
-                rusqlite::params![recorded_by, event_id_to_base64(&file.file_id)],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
 
         Ok(ContextSnapshot {
             target_message_deleted,
-            deleted_file_message_id,
             ..ContextSnapshot::default()
         })
     }
 
     fn load_file_slice_context(
         &self,
-        _frame: &ProjectionFrameContext,
+        frame: &ProjectionFrameContext,
         recorded_by: &str,
         _event_id_b64: &str,
         file_slice: &FileSliceEvent,
@@ -996,39 +1070,56 @@ impl ProjectionQueries for Connection {
         let mut ctx = ContextSnapshot::default();
         let file_id_b64 = event_id_to_base64(&file_slice.file_id);
 
-        ctx.deleted_file_message_id = self
-            .query_row(
-                "SELECT message_id
-                 FROM deleted_files
-                 WHERE recorded_by = ?1 AND file_id = ?2",
-                rusqlite::params![recorded_by, &file_id_b64],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?;
+        if let Some(owner_event_id_b64) = frame.current_owner_event_id.as_deref() {
+            ctx.target_message_deleted = self.query_row(
+                "SELECT COUNT(*) > 0
+                 FROM deleted_messages
+                 WHERE recorded_by = ?1 AND message_id = ?2",
+                rusqlite::params![recorded_by, owner_event_id_b64],
+                |row| row.get(0),
+            )?;
+        }
 
         let mut desc_stmt = self.prepare(
-            "SELECT event_id, signer_event_id, key_event_id, root_hash, blob_bytes, slice_bytes
+            "SELECT event_id, message_id, signer_event_id, key_event_id, root_hash, blob_bytes, slice_bytes
              FROM files
              WHERE recorded_by = ?1 AND file_id = ?2
              ORDER BY created_at ASC, event_id ASC",
         )?;
         ctx.file_descriptors = desc_stmt
             .query_map(rusqlite::params![recorded_by, &file_id_b64], |row| {
-                let root_hash_blob: Vec<u8> = row.get(3)?;
+                let root_hash_blob: Vec<u8> = row.get(4)?;
                 let mut root_hash = [0u8; 32];
                 if root_hash_blob.len() == 32 {
                     root_hash.copy_from_slice(&root_hash_blob);
                 }
                 Ok(FileDescriptorInfo {
                     event_id: row.get::<_, String>(0)?,
-                    signer_event_id: row.get::<_, String>(1)?,
-                    key_event_id: row.get::<_, String>(2)?,
+                    message_id: row.get::<_, String>(1)?,
+                    signer_event_id: row.get::<_, String>(2)?,
+                    key_event_id: row.get::<_, String>(3)?,
                     root_hash,
-                    blob_bytes: row.get::<_, i64>(4)? as u64,
-                    slice_bytes: row.get::<_, i64>(5)? as u32,
+                    blob_bytes: row.get::<_, i64>(5)? as u64,
+                    slice_bytes: row.get::<_, i64>(6)? as u32,
                 })
             })?
             .collect::<Result<Vec<_>, _>>()?;
+
+        if !ctx.target_message_deleted {
+            for descriptor in &ctx.file_descriptors {
+                let message_deleted: bool = self.query_row(
+                    "SELECT COUNT(*) > 0
+                     FROM deleted_messages
+                     WHERE recorded_by = ?1 AND message_id = ?2",
+                    rusqlite::params![recorded_by, &descriptor.message_id],
+                    |row| row.get(0),
+                )?;
+                if message_deleted {
+                    ctx.target_message_deleted = true;
+                    break;
+                }
+            }
+        }
 
         ctx.existing_file_slice = match self.query_row(
             "SELECT event_id, descriptor_event_id

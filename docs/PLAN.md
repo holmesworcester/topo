@@ -519,10 +519,10 @@ enum WriteOp {
 }
 
 enum EmitCommand {
+    HardPurgeMessageGraph { message_event_id },
     RetryWorkspaceEvent { workspace_id },
-    RetryFileSliceGuards { file_id },
-    RecordFileSliceGuardBlock { file_id, event_id },
-    ApplyTransportIdentityIntent { intent },
+    MaterializeTransportIdentity { spec },
+    EmitDeterministicBlob { blob },
 }
 ```
 
@@ -598,9 +598,9 @@ Two-stage model so deletes stay deterministic when events arrive out of order:
    original deletion event's identity for replay invariance.
 5. Cleanup work (message delete → live `messages`/`reactions` deletes) is explicit `Delete` WriteOps.
 6. Deletion state is monotonic: `active → tombstoned` allowed, `tombstoned → active` forbidden.
-7. Hard purge removes deleted event blobs and dependent rows in the same projection transaction; only minimal tombstones remain (`deletion_intents`, `deleted_messages`, `deleted_files`).
+7. Hard purge removes deleted event blobs and dependent rows in the same projection transaction; only minimal tombstones remain (`deletion_intents`, `deleted_messages`).
 8. Late `reaction` / `file` arrivals on tombstoned messages bypass only the deleted message dep edge, emit `HardPurgeMessageGraph`, and purge themselves atomically.
-9. Late `file_slice` arrivals rely on the persisted `deleted_files(file_id -> message_id)` mapping so they still purge after the original file descriptor row has already been removed.
+9. Late encrypted `file_slice` arrivals purge by the same owner-message rule: the wrapper carries `owner_event_id = root_message_id`, and purge finds those recorded blobs through `recorded_event_owners` instead of scanning or decrypting tenant event storage.
 10. If hard purge or verification fails, the whole projection transaction rolls back and the normal queue retry path handles it later.
 
 Deletion invariants validated by tests:
@@ -1720,7 +1720,7 @@ automatically detect and respond to such behavior.
 
 ### Phase 1: Wrong-author deletion intent cleanup
 - GC `deletion_intent` rows where the referenced deletion event was rejected
-- Prevents unbounded storage growth from wrong-author deletion spam
+- Prevents unbounded storage growth from wrong-author peer deletion spam
 
 ### Phase 2: Misbehavior flagging
 - When `MessageDeletion` projector detects author mismatch, record the

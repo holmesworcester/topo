@@ -5,10 +5,7 @@ use std::cell::Cell;
 
 use rusqlite::{params, Connection};
 
-use crate::crypto::{decrypt_event_blob, event_id_from_base64, event_id_to_base64, EventId};
-use crate::event_modules::{
-    self as events, ParsedEvent, EVENT_TYPE_FILE, EVENT_TYPE_FILE_SLICE, EVENT_TYPE_REACTION,
-};
+use crate::crypto::{event_id_from_base64, EventId};
 
 #[derive(Debug, Default, Clone)]
 struct PurgeManifest {
@@ -61,69 +58,6 @@ fn test_checkpoint(label: &str) -> Result<(), Box<dyn std::error::Error>> {
 fn event_id_bytes(event_id_b64: &str) -> Result<EventId, Box<dyn std::error::Error>> {
     event_id_from_base64(event_id_b64)
         .ok_or_else(|| format!("invalid base64 event id: {}", event_id_b64).into())
-}
-
-fn inspect_relevant_event(
-    conn: &Connection,
-    recorded_by: &str,
-    blob: &[u8],
-) -> Result<Option<ParsedEvent>, Box<dyn std::error::Error>> {
-    let Some(semantic_type) = events::outer_semantic_type_code(blob) else {
-        return Ok(None);
-    };
-    if !matches!(
-        semantic_type,
-        EVENT_TYPE_REACTION | EVENT_TYPE_FILE | EVENT_TYPE_FILE_SLICE
-    ) {
-        return Ok(None);
-    }
-
-    let parsed = events::parse_event(blob)?;
-    inspect_relevant_parsed_event(conn, recorded_by, parsed)
-}
-
-fn inspect_relevant_parsed_event(
-    conn: &Connection,
-    recorded_by: &str,
-    parsed: ParsedEvent,
-) -> Result<Option<ParsedEvent>, Box<dyn std::error::Error>> {
-    match parsed {
-        ParsedEvent::Reaction(_) | ParsedEvent::File(_) | ParsedEvent::FileSlice(_) => {
-            Ok(Some(parsed))
-        }
-        ParsedEvent::Signed(signed) => {
-            let inner = events::parse_event(&signed.payload)?;
-            inspect_relevant_parsed_event(conn, recorded_by, inner)
-        }
-        ParsedEvent::Encrypted(enc) => {
-            let key_id_b64 = event_id_to_base64(&enc.key_event_id);
-            let key_bytes: Option<Vec<u8>> = conn
-                .query_row(
-                    "SELECT key_bytes
-                     FROM key_secrets
-                     WHERE recorded_by = ?1 AND event_id = ?2",
-                    params![recorded_by, &key_id_b64],
-                    |row| row.get(0),
-                )
-                .ok();
-            let Some(key_bytes) = key_bytes else {
-                return Ok(None);
-            };
-            if key_bytes.len() != 32 {
-                return Ok(None);
-            }
-            let mut key_arr = [0u8; 32];
-            key_arr.copy_from_slice(&key_bytes);
-            let plaintext =
-                decrypt_event_blob(&key_arr, &enc.nonce, &enc.ciphertext, &enc.auth_tag).ok();
-            let Some(plaintext) = plaintext else {
-                return Ok(None);
-            };
-            let inner = events::parse_event(&plaintext)?;
-            inspect_relevant_parsed_event(conn, recorded_by, inner)
-        }
-        _ => Ok(None),
-    }
 }
 
 fn collect_projection_dependents(
@@ -190,18 +124,6 @@ fn collect_projection_dependents(
         for row in rows {
             changed |= manifest.add_event_id(row?);
         }
-        // Legacy: also check old guard table for pre-migration data.
-        let mut stmt = conn.prepare(
-            "SELECT event_id
-             FROM file_slice_guard_blocks
-             WHERE peer_id = ?1 AND file_id = ?2",
-        )?;
-        let rows = stmt.query_map(params![recorded_by, &file_id], |row| {
-            row.get::<_, String>(0)
-        })?;
-        for row in rows {
-            changed |= manifest.add_event_id(row?);
-        }
     }
 
     Ok(changed)
@@ -214,41 +136,19 @@ fn collect_recorded_dependents(
     manifest: &mut PurgeManifest,
 ) -> Result<bool, Box<dyn std::error::Error>> {
     let mut changed = false;
+    let root_message_event_bytes = event_id_bytes(root_message_event_id)?;
     let mut stmt = conn.prepare(
-        "SELECT re.event_id, e.blob
-         FROM recorded_events re
-         JOIN events e ON e.event_id = re.event_id
-         WHERE re.peer_id = ?1",
+        "SELECT event_id
+         FROM recorded_event_owners
+         WHERE peer_id = ?1 AND owner_event_id = ?2",
     )?;
-    let rows = stmt.query_map(params![recorded_by], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })?;
+    let rows = stmt.query_map(
+        params![recorded_by, root_message_event_bytes.as_slice()],
+        |row| row.get::<_, String>(0),
+    )?;
 
-    let file_ids = manifest.file_ids.clone();
     for row in rows {
-        let (event_id, blob) = row?;
-        let Some(parsed) = inspect_relevant_event(conn, recorded_by, &blob)? else {
-            continue;
-        };
-        match parsed {
-            ParsedEvent::Reaction(rxn)
-                if event_id_to_base64(&rxn.target_event_id) == root_message_event_id =>
-            {
-                changed |= manifest.add_event_id(event_id);
-            }
-            ParsedEvent::File(file)
-                if event_id_to_base64(&file.message_id) == root_message_event_id =>
-            {
-                changed |= manifest.add_event_id(event_id);
-                changed |= manifest.add_file_id(event_id_to_base64(&file.file_id));
-            }
-            ParsedEvent::FileSlice(file_slice)
-                if file_ids.contains(&event_id_to_base64(&file_slice.file_id)) =>
-            {
-                changed |= manifest.add_event_id(event_id);
-            }
-            _ => {}
-        }
+        changed |= manifest.add_event_id(row?);
     }
 
     Ok(changed)
@@ -286,19 +186,6 @@ fn build_manifest(
 
     loop {
         let mut changed = false;
-        {
-            let mut stmt = conn.prepare(
-                "SELECT file_id
-                 FROM deleted_files
-                 WHERE recorded_by = ?1 AND message_id = ?2",
-            )?;
-            let rows = stmt.query_map(params![recorded_by, root_message_event_id], |row| {
-                row.get::<_, String>(0)
-            })?;
-            for row in rows {
-                changed |= manifest.add_file_id(row?);
-            }
-        }
         changed |=
             collect_projection_dependents(conn, recorded_by, root_message_event_id, &mut manifest)?;
         changed |=
@@ -310,22 +197,6 @@ fn build_manifest(
     }
 
     Ok(manifest)
-}
-
-fn persist_deleted_file_mappings(
-    conn: &Connection,
-    recorded_by: &str,
-    root_message_event_id: &str,
-    manifest: &PurgeManifest,
-) -> Result<(), Box<dyn std::error::Error>> {
-    for file_id in &manifest.file_ids {
-        conn.execute(
-            "INSERT OR IGNORE INTO deleted_files (recorded_by, file_id, message_id)
-             VALUES (?1, ?2, ?3)",
-            params![recorded_by, file_id, root_message_event_id],
-        )?;
-    }
-    Ok(())
 }
 
 fn delete_subscription_feed_rows(
@@ -474,19 +345,11 @@ fn delete_tenant_scoped_rows(
             "DELETE FROM file_slices WHERE recorded_by = ?1 AND file_id = ?2",
             params![recorded_by, file_id],
         )?;
-        conn.execute(
-            "DELETE FROM file_slice_guard_blocks WHERE peer_id = ?1 AND file_id = ?2",
-            params![recorded_by, file_id],
-        )?;
     }
 
     for event_id in &manifest.event_ids {
         conn.execute(
             "DELETE FROM file_slices WHERE recorded_by = ?1 AND event_id = ?2",
-            params![recorded_by, event_id],
-        )?;
-        conn.execute(
-            "DELETE FROM file_slice_guard_blocks WHERE peer_id = ?1 AND event_id = ?2",
             params![recorded_by, event_id],
         )?;
     }
@@ -559,6 +422,17 @@ fn verify_purge(
             return Err(format!("purge left recorded_events row for {}", event_id).into());
         }
 
+        let owner_indexed: bool = conn.query_row(
+            "SELECT COUNT(*) > 0
+             FROM recorded_event_owners
+             WHERE peer_id = ?1 AND event_id = ?2",
+            params![recorded_by, event_id],
+            |row| row.get(0),
+        )?;
+        if owner_indexed {
+            return Err(format!("purge left recorded_event_owners row for {}", event_id).into());
+        }
+
         let valid: bool = conn.query_row(
             "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
             params![recorded_by, event_id],
@@ -597,21 +471,6 @@ fn verify_purge(
     }
 
     for file_id in &manifest.file_ids {
-        let deleted_file_mapping: bool = conn.query_row(
-            "SELECT COUNT(*) > 0
-             FROM deleted_files
-             WHERE recorded_by = ?1 AND file_id = ?2 AND message_id = ?3",
-            params![recorded_by, file_id, root_message_event_id],
-            |row| row.get(0),
-        )?;
-        if !deleted_file_mapping {
-            return Err(format!(
-                "purge left no deleted_files mapping for file_id {}",
-                file_id
-            )
-            .into());
-        }
-
         let slices_left: bool = conn.query_row(
             "SELECT COUNT(*) > 0 FROM file_slices WHERE recorded_by = ?1 AND file_id = ?2",
             params![recorded_by, file_id],
@@ -619,15 +478,6 @@ fn verify_purge(
         )?;
         if slices_left {
             return Err(format!("purge left file_slices for file_id {}", file_id).into());
-        }
-
-        let guard_left: bool = conn.query_row(
-            "SELECT COUNT(*) > 0 FROM file_slice_guard_blocks WHERE peer_id = ?1 AND file_id = ?2",
-            params![recorded_by, file_id],
-            |row| row.get(0),
-        )?;
-        if guard_left {
-            return Err(format!("purge left file_slice_guard_blocks for {}", file_id).into());
         }
     }
 
@@ -666,48 +516,20 @@ fn verify_purge(
         }
     }
 
-    let mut stmt = conn.prepare(
-        "SELECT re.event_id, e.blob
-         FROM recorded_events re
-         JOIN events e ON e.event_id = re.event_id
-         WHERE re.peer_id = ?1",
+    let root_message_event_bytes = event_id_bytes(root_message_event_id)?;
+    let indexed_owner_left: bool = conn.query_row(
+        "SELECT COUNT(*) > 0
+         FROM recorded_event_owners
+         WHERE peer_id = ?1 AND owner_event_id = ?2",
+        params![recorded_by, root_message_event_bytes.as_slice()],
+        |row| row.get(0),
     )?;
-    let rows = stmt.query_map(params![recorded_by], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-    })?;
-    for row in rows {
-        let (event_id, blob) = row?;
-        let Some(parsed) = inspect_relevant_event(conn, recorded_by, &blob)? else {
-            continue;
-        };
-        match parsed {
-            ParsedEvent::Reaction(rxn)
-                if event_id_to_base64(&rxn.target_event_id) == root_message_event_id =>
-            {
-                return Err(format!(
-                    "purge left dependent reaction event {} targeting {}",
-                    event_id, root_message_event_id
-                )
-                .into());
-            }
-            ParsedEvent::File(file)
-                if event_id_to_base64(&file.message_id) == root_message_event_id =>
-            {
-                return Err(format!(
-                    "purge left dependent file event {} targeting {}",
-                    event_id, root_message_event_id
-                )
-                .into());
-            }
-            ParsedEvent::FileSlice(file_slice)
-                if manifest
-                    .file_ids
-                    .contains(&event_id_to_base64(&file_slice.file_id)) =>
-            {
-                return Err(format!("purge left dependent file_slice event {}", event_id).into());
-            }
-            _ => {}
-        }
+    if indexed_owner_left {
+        return Err(format!(
+            "purge left recorded_event_owners rows for owner {}",
+            root_message_event_id
+        )
+        .into());
     }
 
     Ok(())
@@ -738,8 +560,6 @@ pub(crate) fn hard_purge_deleted_message_graph(
 
     let manifest = build_manifest(conn, recorded_by, root_message_event_id)?;
     test_checkpoint("after_manifest_build")?;
-    persist_deleted_file_mappings(conn, recorded_by, root_message_event_id, &manifest)?;
-    test_checkpoint("after_deleted_file_mapping")?;
     delete_tenant_scoped_rows(conn, recorded_by, &manifest)?;
     test_checkpoint("after_tenant_scoped_delete")?;
     let orphaned_event_ids = delete_global_rows(conn, &manifest)?;

@@ -30,7 +30,10 @@ mod tests {
     #[test]
     fn test_reaction_valid() {
         let parsed = make_reaction();
-        let ctx = empty_ctx();
+        let ctx = topo::projection::contract::ContextSnapshot {
+            current_owner_event_id: Some(b64(&[1u8; 32])),
+            ..Default::default()
+        };
 
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
@@ -65,6 +68,7 @@ mod tests {
         let parsed = make_reaction();
         let ctx = topo::projection::contract::ContextSnapshot {
             target_message_deleted: true,
+            current_owner_event_id: Some(b64(&[1u8; 32])),
             ..Default::default()
         };
 
@@ -80,5 +84,17 @@ mod tests {
                 EmitCommand::HardPurgeMessageGraph { message_event_id } if message_event_id == &b64(&[1u8; 32])
             )
         });
+    }
+
+    #[test]
+    fn test_reaction_rejects_owner_mismatch() {
+        let parsed = make_reaction();
+        let ctx = topo::projection::contract::ContextSnapshot {
+            current_owner_event_id: Some(b64(&[9u8; 32])),
+            ..Default::default()
+        };
+
+        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        assert_reject_contains(&result, "owner_event_id");
     }
 }

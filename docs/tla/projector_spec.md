@@ -100,7 +100,7 @@ signer's user, not an admin event.
 | 4 | retired (type4_legacy) | — | rejected as unknown type |
 | 5 | project_encrypted | (dispatches inner) | decrypt → admissibility check → shared dep/signer/dispatch stages |
 | 6 | project_secret | secret_keys | — |
-| 7 | project_message_deletion | deleted_messages | author auth + cascade |
+| 7 | project_message_deletion | deleted_messages | signer-derived auth + cascade |
 | 8 | project_workspace | workspaces | TrustAnchorMatch guard |
 | 9 | project_invite_accepted | invites_accepted | rejects when external accept lacks a matching local invite-link workspace binding; writes accepted-binding row; emits RetryWorkspaceEvent + WriteAcceptedBootstrapTrust |
 | 10 | project_user_invite | user_invites | bootstrap requires workspace signer+authority; peer-signed requires signer peer to resolve to claimed admin identity; emits WritePendingBootstrapTrust (gated by is_local_create) |

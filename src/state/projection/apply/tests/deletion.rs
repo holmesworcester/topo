@@ -7,10 +7,9 @@ fn make_deletion(
     conn: &Connection,
     recorded_by: &str,
     target: &EventId,
-    author_id: [u8; 32],
 ) -> (ParsedEvent, Vec<u8>) {
     let (signer_eid, signing_key) = make_identity_chain(conn, recorded_by);
-    make_deletion_signed(&signing_key, &signer_eid, target, author_id)
+    make_deletion_signed(&signing_key, &signer_eid, target)
 }
 
 #[test]
@@ -29,7 +28,7 @@ fn test_project_message_deletion_valid() {
     assert_eq!(r, ProjectionDecision::Valid);
 
     // Create and project the deletion
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]); // author_id matches message
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
     let result = project_one(&conn, recorded_by, &del_eid).unwrap();
     assert_eq!(result, ProjectionDecision::Valid);
@@ -101,7 +100,7 @@ fn test_deletion_cascades_reactions() {
     assert_eq!(rxn_count, 2);
 
     // Delete the message
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
     let result = project_one(&conn, recorded_by, &del_eid).unwrap();
     assert_eq!(result, ProjectionDecision::Valid);
@@ -133,7 +132,7 @@ fn test_deletion_intent_only_on_missing_target() {
     let recorded_by = "peer1";
 
     let fake_target = [77u8; 32];
-    let (_del, del_blob) = make_deletion(&conn, recorded_by, &fake_target, [2u8; 32]);
+    let (_del, del_blob) = make_deletion(&conn, recorded_by, &fake_target);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
 
     // Deletion no longer dep-blocks on target — writes intent and returns Valid
@@ -177,7 +176,7 @@ fn test_deletion_intent_then_target_arrives() {
     let msg_eid = canonical_test_event_id(&conn, recorded_by, &msg_blob);
 
     // Create deletion first (before message exists) — writes intent, returns Valid
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
     let result = project_one(&conn, recorded_by, &del_eid).unwrap();
     assert_eq!(
@@ -238,8 +237,9 @@ fn test_deletion_wrong_author_rejects() {
     let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
     project_one(&conn, recorded_by, &msg_eid).unwrap();
 
-    // Create deletion with different author_id
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [99u8; 32]); // wrong author
+    // Create deletion from a different peer_shared signer
+    let (wrong_signer_eid, wrong_signing_key) = make_identity_chain(&conn, recorded_by);
+    let (_del, del_blob) = make_deletion_signed(&wrong_signing_key, &wrong_signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
 
     let result = project_one(&conn, recorded_by, &del_eid).unwrap();
@@ -270,13 +270,13 @@ fn test_deletion_idempotent() {
     project_one(&conn, recorded_by, &msg_eid).unwrap();
 
     // First deletion
-    let (_del1, del1_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del1, del1_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del1_eid = insert_event_raw(&conn, recorded_by, &del1_blob);
     let r1 = project_one(&conn, recorded_by, &del1_eid).unwrap();
     assert_eq!(r1, ProjectionDecision::Valid);
 
     // Second deletion (same target, different event) — also signed
-    let (_del2, del2_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del2, del2_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del2_eid = insert_event_raw(&conn, recorded_by, &del2_blob);
     let r2 = project_one(&conn, recorded_by, &del2_eid).unwrap();
     // Second deletion finds tombstone already exists → AlreadyProcessed from projector,
@@ -316,7 +316,7 @@ fn test_reaction_after_deletion_skipped() {
     project_one(&conn, recorded_by, &msg_eid).unwrap();
 
     // Delete message
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
     project_one(&conn, recorded_by, &del_eid).unwrap();
 
@@ -358,7 +358,7 @@ fn test_deletion_convergence() {
     let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
     project_one(&conn, recorded_by, &rxn_eid).unwrap();
 
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
     project_one(&conn, recorded_by, &del_eid).unwrap();
 
@@ -502,7 +502,7 @@ fn test_deletion_invariant_duplicate_replay_unchanged() {
     project_one(&conn, recorded_by, &msg_eid).unwrap();
 
     // Delete once
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
     project_one(&conn, recorded_by, &del_eid).unwrap();
 
@@ -587,7 +587,7 @@ fn test_deletion_invariant_order_convergence_identical_state() {
     // Pre-compute message and deletion blobs
     let (_msg, msg_blob) = make_message_signed(&signing_key, &signer_eid, "order convergence");
     let msg_eid = canonical_test_event_id(&conn, recorded_by, &msg_blob);
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del_eid = canonical_test_event_id(&conn, recorded_by, &del_blob);
 
     // === Order A: create → delete ===
@@ -714,8 +714,9 @@ fn test_deletion_invariant_auth_deterministic() {
     let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
     project_one(&conn, recorded_by, &msg_eid).unwrap();
 
-    // Create deletion with wrong author
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [99u8; 32]);
+    // Create deletion from a different peer_shared signer
+    let (wrong_signer_eid, wrong_signing_key) = make_identity_chain(&conn, recorded_by);
+    let (_del, del_blob) = make_deletion_signed(&wrong_signing_key, &wrong_signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
 
     // First attempt
@@ -775,7 +776,7 @@ fn test_deletion_invariant_cleanup_complete() {
     assert_eq!(rxn_pre, 3);
 
     // Delete the message
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
     project_one(&conn, recorded_by, &del_eid).unwrap();
 
@@ -826,7 +827,7 @@ fn test_deletion_invariant_command_idempotence() {
     project_one(&conn, recorded_by, &msg_eid).unwrap();
 
     // Delete
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
     project_one(&conn, recorded_by, &del_eid).unwrap();
 
@@ -884,7 +885,7 @@ fn test_deletion_invariant_monotonic() {
     let msg_eid = canonical_test_event_id(&conn, recorded_by, &msg_blob);
 
     // Delete first (intent-only)
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
     project_one(&conn, recorded_by, &del_eid).unwrap();
 
@@ -1028,19 +1029,13 @@ fn test_hard_purge_removes_message_graph_and_auxiliary_rows() {
     )
     .unwrap();
     conn.execute(
-        "INSERT INTO file_slice_guard_blocks (peer_id, file_id, event_id)
-         VALUES (?1, ?2, ?3)",
-        rusqlite::params![recorded_by, &file_id_b64, &slice_b64],
-    )
-    .unwrap();
-    conn.execute(
         "INSERT INTO blocked_event_deps (peer_id, event_id, blocker_event_id)
          VALUES (?1, ?2, ?3)",
         rusqlite::params![recorded_by, &rxn_b64, &msg_b64],
     )
     .unwrap();
 
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
     let del_b64 = event_id_to_base64(&del_eid);
     assert_eq!(
@@ -1166,15 +1161,6 @@ fn test_hard_purge_removes_message_graph_and_auxiliary_rows() {
         .unwrap();
     assert_eq!(slice_rows, 0);
 
-    let guard_rows: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM file_slice_guard_blocks WHERE peer_id = ?1 AND file_id = ?2",
-            rusqlite::params![recorded_by, &file_id_b64],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(guard_rows, 0);
-
     let client_ops_left: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM local_client_ops WHERE recorded_by = ?1",
@@ -1261,7 +1247,7 @@ fn test_delete_before_create_hard_purges_arriving_message_event() {
     let msg_eid = canonical_test_event_id(&conn, recorded_by, &msg_blob);
     let msg_b64 = event_id_to_base64(&msg_eid);
 
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
     project_one(&conn, recorded_by, &del_eid).unwrap();
 
@@ -1353,7 +1339,7 @@ fn test_replaying_deletion_on_existing_tombstone_repurges_legacy_material() {
     )
     .unwrap();
 
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
     project_one(&conn, recorded_by, &del_eid).unwrap();
 
@@ -1402,7 +1388,7 @@ fn test_reaction_arriving_after_tombstone_is_hard_purged() {
     let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
     project_one(&conn, recorded_by, &msg_eid).unwrap();
 
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
     project_one(&conn, recorded_by, &del_eid).unwrap();
 
@@ -1443,7 +1429,7 @@ fn test_reaction_arriving_after_tombstone_is_hard_purged() {
 }
 
 #[test]
-fn test_file_arriving_after_tombstone_is_hard_purged_and_tracks_deleted_file() {
+fn test_file_arriving_after_tombstone_is_hard_purged() {
     let conn = setup();
     let recorded_by = "peer-late-file";
     let _workspace_eid = setup_workspace_event(&conn, recorded_by);
@@ -1454,17 +1440,12 @@ fn test_file_arriving_after_tombstone_is_hard_purged_and_tracks_deleted_file() {
     let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
     project_one(&conn, recorded_by, &msg_eid).unwrap();
 
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
     project_one(&conn, recorded_by, &del_eid).unwrap();
 
-    let (file_event, file_blob) =
+    let (_file_event, file_blob) =
         make_attachment_signed(&signing_key, &signer_eid, &msg_eid, &key_event_id);
-    let file_id = match &file_event {
-        ParsedEvent::File(file) => file.file_id,
-        other => panic!("expected file event, got {:?}", other),
-    };
-    let file_id_b64 = event_id_to_base64(&file_id);
     let file_eid = insert_event_raw(&conn, recorded_by, &file_blob);
     let file_b64 = event_id_to_base64(&file_eid);
     assert_eq!(
@@ -1498,23 +1479,10 @@ fn test_file_arriving_after_tombstone_is_hard_purged_and_tracks_deleted_file() {
         )
         .unwrap();
     assert!(!file_global, "late file blob must be purged");
-
-    let deleted_file_mapping: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM deleted_files
-             WHERE recorded_by = ?1 AND file_id = ?2 AND message_id = ?3",
-            rusqlite::params![recorded_by, &file_id_b64, event_id_to_base64(&msg_eid)],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        deleted_file_mapping, 1,
-        "late file purge must persist deleted_files mapping"
-    );
 }
 
 #[test]
-fn test_file_slice_dependents_of_deleted_message_are_hard_purged_before_and_after_mapping() {
+fn test_file_slice_dependents_of_deleted_message_are_hard_purged_by_owner() {
     let conn = setup();
     let recorded_by = "peer-late-file-slice";
     let _workspace_eid = setup_workspace_event(&conn, recorded_by);
@@ -1525,7 +1493,7 @@ fn test_file_slice_dependents_of_deleted_message_are_hard_purged_before_and_afte
     let msg_eid = insert_event_raw(&conn, recorded_by, &msg_blob);
     project_one(&conn, recorded_by, &msg_eid).unwrap();
 
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
     project_one(&conn, recorded_by, &del_eid).unwrap();
 
@@ -1537,16 +1505,21 @@ fn test_file_slice_dependents_of_deleted_message_are_hard_purged_before_and_afte
     };
     let file_id_b64 = event_id_to_base64(&file_id);
 
-    let (_early_slice, early_slice_blob) =
-        make_file_slice(&signing_key, &signer_eid, file_id, 0, b"slice-before-file");
+    let (_early_slice, early_slice_blob) = make_file_slice_with_owner(
+        &signing_key,
+        &signer_eid,
+        &msg_eid,
+        file_id,
+        0,
+        b"slice-before-file",
+    );
     let early_slice_eid = insert_event_raw(&conn, recorded_by, &early_slice_blob);
-    assert!(matches!(
+    assert_eq!(
         project_one(&conn, recorded_by, &early_slice_eid).unwrap(),
-        ProjectionDecision::Block { .. }
-    ));
+        ProjectionDecision::Valid
+    );
     let early_slice_b64 = event_id_to_base64(&early_slice_eid);
 
-    // File slice should be dep-blocked on file_id (no descriptor yet)
     let dep_blocked_before: i64 = conn
         .query_row(
             "SELECT COUNT(*) FROM blocked_event_deps WHERE peer_id = ?1 AND blocker_event_id = ?2",
@@ -1555,8 +1528,8 @@ fn test_file_slice_dependents_of_deleted_message_are_hard_purged_before_and_afte
         )
         .unwrap();
     assert_eq!(
-        dep_blocked_before, 1,
-        "late slice should be dep-blocked on file_id before descriptor exists"
+        dep_blocked_before, 0,
+        "owner-tombstoned slice should purge immediately instead of blocking on file_id"
     );
 
     let file_eid = insert_event_raw(&conn, recorded_by, &file_blob);
@@ -1564,19 +1537,6 @@ fn test_file_slice_dependents_of_deleted_message_are_hard_purged_before_and_afte
     assert_eq!(
         project_one(&conn, recorded_by, &file_eid).unwrap(),
         ProjectionDecision::Valid
-    );
-
-    let deleted_file_mapping: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM deleted_files
-             WHERE recorded_by = ?1 AND file_id = ?2 AND message_id = ?3",
-            rusqlite::params![recorded_by, &file_id_b64, event_id_to_base64(&msg_eid)],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        deleted_file_mapping, 1,
-        "purge must retain deleted_files map"
     );
 
     for event_id in [&file_b64, &early_slice_b64] {
@@ -1620,20 +1580,14 @@ fn test_file_slice_dependents_of_deleted_message_are_hard_purged_before_and_afte
         );
     }
 
-    let guard_rows_after_file: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM file_slice_guard_blocks WHERE peer_id = ?1 AND file_id = ?2",
-            rusqlite::params![recorded_by, &file_id_b64],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        guard_rows_after_file, 0,
-        "late file purge must clear existing file_slice guard blocks"
+    let (_late_slice, late_slice_blob) = make_file_slice_with_owner(
+        &signing_key,
+        &signer_eid,
+        &msg_eid,
+        file_id,
+        1,
+        b"slice-after-file",
     );
-
-    let (_late_slice, late_slice_blob) =
-        make_file_slice(&signing_key, &signer_eid, file_id, 1, b"slice-after-file");
     let late_slice_eid = insert_event_raw(&conn, recorded_by, &late_slice_blob);
     let late_slice_b64 = event_id_to_base64(&late_slice_eid);
     assert_eq!(
@@ -1650,7 +1604,7 @@ fn test_file_slice_dependents_of_deleted_message_are_hard_purged_before_and_afte
         .unwrap();
     assert!(
         !late_slice_recorded,
-        "late file_slice after deleted_files mapping must be hard-purged"
+        "late file_slice owned by a deleted message must be hard-purged"
     );
 
     let late_slice_valid: bool = conn
@@ -1662,7 +1616,7 @@ fn test_file_slice_dependents_of_deleted_message_are_hard_purged_before_and_afte
         .unwrap();
     assert!(
         !late_slice_valid,
-        "late file_slice after deleted_files mapping must not survive in valid_events"
+        "late file_slice owned by a deleted message must not survive in valid_events"
     );
 
     let late_slice_global: bool = conn
@@ -1674,19 +1628,7 @@ fn test_file_slice_dependents_of_deleted_message_are_hard_purged_before_and_afte
         .unwrap();
     assert!(
         !late_slice_global,
-        "late file_slice after deleted_files mapping must be purged from events"
-    );
-
-    let guard_rows_final: i64 = conn
-        .query_row(
-            "SELECT COUNT(*) FROM file_slice_guard_blocks WHERE peer_id = ?1 AND file_id = ?2",
-            rusqlite::params![recorded_by, &file_id_b64],
-            |row| row.get(0),
-        )
-        .unwrap();
-    assert_eq!(
-        guard_rows_final, 0,
-        "deleted-file fast path must not create new guard blocks"
+        "late file_slice owned by a deleted message must be purged from events"
     );
 }
 
@@ -1705,7 +1647,7 @@ fn test_hard_purge_failure_rolls_back_and_retries_from_project_queue() {
     let rxn_eid = insert_event_raw(&conn, recorded_by, &rxn_blob);
     project_one(&conn, recorded_by, &rxn_eid).unwrap();
 
-    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid, [2u8; 32]);
+    let (_del, del_blob) = make_deletion_signed(&signing_key, &signer_eid, &msg_eid);
     let del_eid = insert_event_raw(&conn, recorded_by, &del_blob);
     let del_b64 = event_id_to_base64(&del_eid);
     let msg_b64 = event_id_to_base64(&msg_eid);

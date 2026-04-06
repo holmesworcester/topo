@@ -4,7 +4,12 @@ use super::backend::{ProjectionApplyResult, ProjectionBackend};
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::queue::current_timestamp_ms;
 use crate::db::timeline::EventTimeline;
-use crate::event_modules::{registry, ParsedEvent, TransportPrivacy};
+use crate::event_modules::encrypted::NO_OWNER_EVENT_ID;
+use crate::event_modules::{
+    registry, ParsedEvent, TransportPrivacy, EVENT_TYPE_FILE, EVENT_TYPE_FILE_SLICE,
+    EVENT_TYPE_REACTION,
+};
+use crate::projection::contract::EmitCommand;
 use crate::projection::queries::{ContextLoadResult, DepLoadResult, ProjectionFrameContext};
 use crate::state::live_hints::source_peer_id_from_source_tag;
 use rusqlite::{Connection, OptionalExtension};
@@ -12,6 +17,30 @@ use rusqlite::{Connection, OptionalExtension};
 use super::dispatch::dispatch_pure_projector;
 
 const MAX_PROJECTION_ENVELOPE_DEPTH: usize = 4;
+
+fn encrypted_owner_deleted_fast_path<B: ProjectionBackend>(
+    backend: &B,
+    recorded_by: &str,
+    parsed: &ParsedEvent,
+) -> ProjectionApplyResult<Option<String>> {
+    let ParsedEvent::Encrypted(enc) = parsed else {
+        return Ok(None);
+    };
+    if enc.owner_event_id == NO_OWNER_EVENT_ID {
+        return Ok(None);
+    }
+    if !matches!(
+        enc.inner_type_code,
+        EVENT_TYPE_REACTION | EVENT_TYPE_FILE | EVENT_TYPE_FILE_SLICE
+    ) {
+        return Ok(None);
+    }
+    let owner_event_id_b64 = event_id_to_base64(&enc.owner_event_id);
+    if backend.message_is_deleted(recorded_by, &owner_event_id_b64)? {
+        return Ok(Some(owner_event_id_b64));
+    }
+    Ok(None)
+}
 
 fn check_transport_privacy(
     parsed: &ParsedEvent,
@@ -80,7 +109,7 @@ pub(crate) fn record_block_rows(
     // Clean stale dep edges from prior blocks before recording new ones.
     // This prevents deps_remaining from desyncing with the actual edge set
     // when an event is re-blocked with a different set of missing deps
-    // (e.g., dep-unblock → guard-block → re-dep-block via retry command).
+    // after projector context changes.
     conn.execute(
         "DELETE FROM blocked_event_deps WHERE peer_id = ?1 AND event_id = ?2",
         rusqlite::params![recorded_by, event_id_b64],
@@ -249,6 +278,18 @@ fn apply_projection_frame<B: ProjectionBackend>(
         return Ok((ProjectionDecision::Reject { reason }, None));
     }
 
+    if let Some(owner_event_id_b64) =
+        encrypted_owner_deleted_fast_path(backend, recorded_by, parsed)?
+    {
+        backend.execute_emit_commands(
+            recorded_by,
+            &[EmitCommand::HardPurgeMessageGraph {
+                message_event_id: owner_event_id_b64,
+            }],
+        )?;
+        return Ok((ProjectionDecision::Valid, None));
+    }
+
     // Generic prerequisite reads now live at the context-load boundary:
     // declared deps, dep semantic types, and module-local context all return
     // through the same tri-state result.
@@ -266,6 +307,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
             }
         };
     ctx.current_transport_key_event_id = frame.current_transport_key_event_id.clone();
+    ctx.current_owner_event_id = frame.current_owner_event_id.clone();
     ctx.current_signer = frame.current_signer.clone();
 
     if let ParsedEvent::Signed(signed) = parsed {
@@ -445,6 +487,11 @@ fn apply_projection_frame<B: ProjectionBackend>(
         let transport_key_event_id_b64 = event_id_to_base64(&enc.key_event_id);
         let mut next_frame = frame.clone();
         next_frame.current_transport_key_event_id = Some(transport_key_event_id_b64.clone());
+        if enc.owner_event_id != NO_OWNER_EVENT_ID {
+            next_frame.current_owner_event_id = Some(event_id_to_base64(&enc.owner_event_id));
+        } else {
+            next_frame.current_owner_event_id = None;
+        }
         let (decision, _) = apply_projection_frame(
             backend,
             recorded_by,
@@ -460,6 +507,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
     }
 
     ctx.current_transport_key_event_id = frame.current_transport_key_event_id.clone();
+    ctx.current_owner_event_id = frame.current_owner_event_id.clone();
     ctx.current_signer = frame.current_signer.clone();
 
     // Dispatch to pure projector

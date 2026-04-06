@@ -19,8 +19,15 @@ pub fn project_pure(
     };
 
     let message_id_b64 = event_id_to_base64(&att.message_id);
-    let file_id_b64 = event_id_to_base64(&att.file_id);
     let key_event_id_b64 = event_id_to_base64(&att.key_event_id);
+    if let Some(owner_event_id_b64) = ctx.current_owner_event_id.as_deref() {
+        if owner_event_id_b64 != message_id_b64 {
+            return ProjectorResult::reject(format!(
+                "file owner_event_id {} does not match message_id {}",
+                owner_event_id_b64, message_id_b64
+            ));
+        }
+    }
     let Some(current_signer) = ctx.current_signer.as_ref() else {
         return ProjectorResult::reject("file missing current signer envelope".to_string());
     };
@@ -28,15 +35,7 @@ pub fn project_pure(
 
     if ctx.target_message_deleted {
         return ProjectorResult::valid_with_commands(
-            vec![WriteOp::InsertOrIgnore {
-                table: "deleted_files",
-                columns: vec!["recorded_by", "file_id", "message_id"],
-                values: vec![
-                    SqlVal::Text(recorded_by.to_string()),
-                    SqlVal::Text(file_id_b64),
-                    SqlVal::Text(message_id_b64.clone()),
-                ],
-            }],
+            Vec::new(),
             vec![EmitCommand::HardPurgeMessageGraph {
                 message_event_id: message_id_b64,
             }],
@@ -64,7 +63,7 @@ pub fn project_pure(
             SqlVal::Text(recorded_by.to_string()),
             SqlVal::Text(event_id_b64.to_string()),
             SqlVal::Text(message_id_b64),
-            SqlVal::Text(file_id_b64.clone()),
+            SqlVal::Text(event_id_to_base64(&att.file_id)),
             SqlVal::Int(att.blob_bytes as i64),
             SqlVal::Int(att.total_slices as i64),
             SqlVal::Int(att.slice_bytes as i64),

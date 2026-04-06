@@ -118,12 +118,13 @@ mod tests {
             filename: "test.txt".to_string(),
             mime_type: "text/plain".to_string(),
         });
-        let ctx = ctx_with_current_signer(EVENT_ID, EVENT_TYPE_FILE);
+        let mut ctx = ctx_with_current_signer(EVENT_ID, EVENT_TYPE_FILE);
+        ctx.current_owner_event_id = Some(b64(&[1u8; 32]));
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
         assert_writes_to_table(&result, "files");
         // File_slice unblocking is now handled by cascade_file_id_if_file
-        // in cascade.rs, not by a RetryFileSliceGuards command.
+        // in cascade.rs via the synthetic file_id dependency blocker.
         assert!(
             result.emit_commands.is_empty(),
             "File projector should not emit commands (cascade handles file_slice unblocking)"
@@ -152,10 +153,10 @@ mod tests {
             event_id: EVENT_ID.to_string(),
             semantic_type_code: EVENT_TYPE_FILE,
         });
+        ctx.current_owner_event_id = Some(b64(&message_id));
         let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
         assert_valid(&result);
         assert_no_write_to_table(&result, "files");
-        assert_writes_to_table(&result, "deleted_files");
         assert_emits_command(&result, "HardPurgeMessageGraph", |cmd| {
             matches!(
                 cmd,
@@ -163,6 +164,28 @@ mod tests {
                     if message_event_id == &b64(&message_id)
             )
         });
+    }
+
+    #[test]
+    fn test_file_rejects_owner_mismatch() {
+        use topo::event_modules::file::{project_pure, FileEvent};
+        let parsed = ParsedEvent::File(FileEvent {
+            created_at_ms: 8000,
+            message_id: [1u8; 32],
+            file_id: [2u8; 32],
+            blob_bytes: 1024,
+            total_slices: 1,
+            slice_bytes: 262144,
+            root_hash: [3u8; 32],
+            key_event_id: [4u8; 32],
+            filename: "test.txt".to_string(),
+            mime_type: "text/plain".to_string(),
+        });
+        let mut ctx = ctx_with_current_signer(EVENT_ID, EVENT_TYPE_FILE);
+        ctx.current_owner_event_id = Some(b64(&[9u8; 32]));
+
+        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        assert_reject_contains(&result, "owner_event_id");
     }
 
     #[test]

@@ -42,6 +42,14 @@ pub fn project_pure(
     }
 
     let target_id_b64 = event_id_to_base64(&rxn.target_event_id);
+    if let Some(owner_event_id_b64) = ctx.current_owner_event_id.as_deref() {
+        if owner_event_id_b64 != target_id_b64 {
+            return ProjectorResult::reject(format!(
+                "reaction owner_event_id {} does not match target_event_id {}",
+                owner_event_id_b64, target_id_b64
+            ));
+        }
+    }
 
     // Check deletion state — skip if target is tombstoned or has deletion intent
     if ctx.target_message_deleted {

@@ -32,6 +32,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
             target_id TEXT NOT NULL,
             deletion_event_id TEXT NOT NULL,
             author_id TEXT NOT NULL,
+            authorized_by_admin INTEGER NOT NULL DEFAULT 0,
             created_at INTEGER NOT NULL,
             PRIMARY KEY (recorded_by, target_kind, target_id, deletion_event_id)
         );

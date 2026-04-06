@@ -69,6 +69,7 @@ mod tests {
             deletion_intents: vec![DeletionIntentInfo {
                 deletion_event_id: "del_event_1".to_string(),
                 author_id: author_b64,
+                authorized_by_admin: false,
                 created_at: 2500,
             }],
             ..Default::default()
@@ -97,6 +98,7 @@ mod tests {
             deletion_intents: vec![DeletionIntentInfo {
                 deletion_event_id: "del_event_2".to_string(),
                 author_id: b64(&[99u8; 32]), // different author
+                authorized_by_admin: false,
                 created_at: 2500,
             }],
             ..Default::default()
@@ -106,5 +108,17 @@ mod tests {
         assert_valid(&result);
         assert_writes_to_table(&result, "messages");
         assert_no_write_to_table(&result, "deleted_messages");
+    }
+
+    #[test]
+    fn test_message_rejects_outer_owner_event_id() {
+        let parsed = make_message([2u8; 32]);
+        let ctx = topo::projection::contract::ContextSnapshot {
+            current_owner_event_id: Some(b64(&[9u8; 32])),
+            ..Default::default()
+        };
+
+        let result = project_pure(PEER, EVENT_ID, &parsed, &ctx);
+        assert_reject_contains(&result, "owner_event_id");
     }
 }

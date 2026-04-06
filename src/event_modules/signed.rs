@@ -1,5 +1,5 @@
 use super::registry::{EventTypeMeta, ShareScope};
-use super::{EventError, ParsedEvent, EVENT_TYPE_SIGNED};
+use super::{EventError, ParsedEvent, EVENT_TYPE_ADMIN, EVENT_TYPE_SIGNED};
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SignedEvent {
@@ -128,7 +128,7 @@ pub static SIGNED_META: EventTypeMeta = crate::event_modules::registry::event_ty
     projection_table: "",
     share_scope: ShareScope::Shared,
     dep_fields: &["signer_event_id"],
-    dep_field_type_codes: &[&[8, 10, 12, 14, 16]],
+    dep_field_type_codes: &[&[8, 10, 12, 14, 16, EVENT_TYPE_ADMIN]],
     signer_required: false,
     signature_byte_len: 0,
     encryptable: false,

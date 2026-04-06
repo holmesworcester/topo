@@ -49,11 +49,11 @@ pub fn project_pure(
 mod projector_tests {
     use super::*;
     use crate::db::{open_in_memory, schema::create_tables};
+    use crate::event_modules::EVENT_TYPE_WORKSPACE;
     use crate::event_modules::{AdminEvent, ParsedEvent, WorkspaceEvent};
     use crate::projection::contract::CurrentSignerInfo;
     use crate::projection::queries::ContextLoadResult;
     use crate::projection::queries::ProjectionFrameContext;
-    use crate::event_modules::EVENT_TYPE_WORKSPACE;
 
     fn admin_event() -> ParsedEvent {
         ParsedEvent::Admin(AdminEvent {
@@ -116,6 +116,7 @@ mod projector_tests {
         };
         let frame = ProjectionFrameContext {
             current_transport_key_event_id: None,
+            current_owner_event_id: None,
             current_signer: Some(CurrentSignerInfo {
                 event_id: crate::crypto::event_id_to_base64(&[3u8; 32]),
                 semantic_type_code: EVENT_TYPE_WORKSPACE,

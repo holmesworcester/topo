@@ -96,8 +96,8 @@ pub fn project_pure(
 mod projector_tests {
     use super::*;
     use crate::db::{open_in_memory, schema::create_tables};
-    use crate::event_modules::EVENT_TYPE_DEVICE_INVITE;
     use crate::event_modules::ShareScope;
+    use crate::event_modules::EVENT_TYPE_DEVICE_INVITE;
     use crate::event_modules::{encode_event, DeviceInviteEvent};
     use crate::event_modules::{ParsedEvent, PeerSharedEvent, WorkspaceEvent};
     use crate::projection::contract::CurrentSignerInfo;
@@ -197,6 +197,7 @@ mod projector_tests {
 
         let frame = ProjectionFrameContext {
             current_transport_key_event_id: None,
+            current_owner_event_id: None,
             current_signer: Some(CurrentSignerInfo {
                 event_id: signer_event_id_b64.clone(),
                 semantic_type_code: EVENT_TYPE_DEVICE_INVITE,

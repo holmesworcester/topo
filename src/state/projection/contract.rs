@@ -43,10 +43,6 @@ pub enum EmitCommand {
     /// Emitted by invite_accepted when it knows the workspace_id.
     /// Flows through normal projection + cascade.
     RetryWorkspaceEvent { workspace_id: String },
-    /// Retry file_slice guard-blocked events for a specific file_id.
-    RetryFileSliceGuards { file_id: String },
-    /// Record a guard-block for a file_slice awaiting its descriptor.
-    RecordFileSliceGuardBlock { file_id: String, event_id: String },
     /// Materialise a transport identity transition via the materializer boundary.
     /// Replaces the former ad-hoc RefreshTransportCreds marker.
     MaterializeTransportIdentity {
@@ -66,9 +62,7 @@ pub enum EmitCommand {
 /// They are only applied when `decision` is `Valid`.
 ///
 /// `emit_commands` are follow-on actions to run after write_ops commit.
-/// They are executed for:
-/// - `Valid` decisions (normal post-write follow-ons), and
-/// - `Block` decisions (block-side effects such as file-slice guard rows).
+/// They are executed for both `Valid` and `Block` decisions.
 #[derive(Debug, Clone)]
 pub struct ProjectorResult {
     pub decision: super::decision::ProjectionDecision,
@@ -128,12 +122,14 @@ impl ProjectorResult {
 pub struct DeletionIntentInfo {
     pub deletion_event_id: String,
     pub author_id: String,
+    pub authorized_by_admin: bool,
     pub created_at: i64,
 }
 
 #[derive(Debug, Clone)]
 pub struct FileDescriptorInfo {
     pub event_id: String,
+    pub message_id: String,
     pub signer_event_id: String,
     pub key_event_id: String,
     /// BLAKE3 bao root hash for content verification ([0;32] = no verification).
@@ -184,6 +180,12 @@ pub struct ContextSnapshot {
     pub target_message_author: Option<String>,
     /// For MessageDeletion: the author_id from an existing tombstone (if any).
     pub target_tombstone_author: Option<String>,
+    /// For MessageDeletion: resolved user identity for a peer_shared signer.
+    pub deletion_signer_user_id: Option<String>,
+    /// For MessageDeletion: whether the current signer is an admin event.
+    pub deletion_signer_is_admin: bool,
+    /// For MessageDeletion: signer-family or signer-resolution failure.
+    pub deletion_signer_reject_reason: Option<String>,
     /// For MessageDeletion: true if the target event_id is in valid_events but is NOT
     /// a message (no row in messages or deleted_messages). This means the deletion
     /// references a non-message event and should be rejected.
@@ -192,7 +194,7 @@ pub struct ContextSnapshot {
     /// For Message: pre-existing deletion intents for this message_id.
     /// Multiple intents may exist (one per deletion event targeting this message).
     /// Used for delete-before-create convergence — the message projector finds the
-    /// first intent whose author matches the message author.
+    /// first intent whose author matches the message author, or an admin-auth intent.
     pub deletion_intents: Vec<DeletionIntentInfo>,
 
     /// For Reaction: whether the target message has been tombstoned
@@ -200,20 +202,18 @@ pub struct ContextSnapshot {
     /// included — an unverified intent does not mean the message is deleted.
     pub target_message_deleted: bool,
 
-    /// For File/FileSlice: if the file_id is already known to belong to a
-    /// tombstoned message graph, this carries the root message event id.
-    pub deleted_file_message_id: Option<String>,
-
     /// For KeyShared: DH-unwrapped key material, if available.
     pub unwrapped_secret_material: Option<UnwrappedSecretMaterial>,
 
     /// For FileSlice: descriptor info for the file_id.
-    /// Empty vec means no descriptor exists yet (guard-block).
+    /// Empty vec means no descriptor exists yet (dep-block on file_id).
     pub file_descriptors: Vec<FileDescriptorInfo>,
     /// For FileSlice: existing slice info (event_id, descriptor_event_id) if slot occupied.
     pub existing_file_slice: Option<(String, String)>,
     /// For encrypted events: outer wrapper key_event_id, if present.
     pub current_transport_key_event_id: Option<String>,
+    /// For encrypted dependent events: outer wrapper owner_event_id, if present.
+    pub current_owner_event_id: Option<String>,
     /// For signed events: currently verified outer signer, if present.
     pub current_signer: Option<CurrentSignerInfo>,
 

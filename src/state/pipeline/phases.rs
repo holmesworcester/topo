@@ -231,6 +231,7 @@ mod tests {
         let blob = event_modules::encode_event(&ParsedEvent::Encrypted(EncryptedEvent {
             created_at_ms: 123,
             key_event_id: [7u8; 32],
+            owner_event_id: event_modules::encrypted::NO_OWNER_EVENT_ID,
             inner_type_code: EVENT_TYPE_FILE_SLICE,
             nonce: [8u8; 12],
             ciphertext: vec![0u8; event_modules::file_slice::FILE_SLICE_WIRE_SIZE],

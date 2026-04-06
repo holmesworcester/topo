@@ -17,15 +17,19 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_IA_RETRY_GUARDS | event_modules/invite_accepted::project_pure | InvWorkspaceAnchor | projector_local |
 | CHK_IA_BOOTSTRAP_TRUST | event_modules/invite_accepted::project_pure | InvBootstrapTrustSource | projector_local |
 | CHK_MSG_SIGNER_USER_MISMATCH | event_modules/message::project_pure | InvSigner | projector_local |
+| CHK_MSG_OUTER_OWNER_ABSENT | event_modules/message::project_pure | NON_MODELED::encrypted_owner_wrapper | projector_local |
 | CHK_MSG_DELETE_BEFORE_CREATE | event_modules/message::project_pure | InvDeleteIntentNoLiveMessage | projector_local |
 | CHK_MSG_HARD_PURGE | event_modules/message::project_pure | InvDeletePurgeAtomic | projector_local |
 | CHK_MSG_INSERT | event_modules/message::project_pure | InvMessageWorkspace | projector_local |
 | CHK_FILE_HARD_PURGE | event_modules/file::project_pure | InvDeletedMessagePurgesLiveGraph | projector_local |
+| CHK_FILE_OWNER_MATCH | event_modules/file::project_pure | NON_MODELED::encrypted_owner_wrapper | projector_local |
 | CHK_RXN_SIGNER_USER_MISMATCH | event_modules/reaction::project_pure | InvSigner | projector_local |
 | CHK_RXN_SKIP_DELETED | event_modules/reaction::project_pure | InvDeletedMessagePurgesLiveGraph | projector_local |
 | CHK_RXN_HARD_PURGE | event_modules/reaction::project_pure | InvDeletedMessagePurgesLiveGraph | projector_local |
+| CHK_RXN_OWNER_MATCH | event_modules/reaction::project_pure | NON_MODELED::encrypted_owner_wrapper | projector_local |
 | CHK_RXN_INSERT | event_modules/reaction::project_pure | InvDeps | projector_local |
-| CHK_DEL_SIGNER_USER_MISMATCH | event_modules/message_deletion::project_pure | InvSigner | projector_local |
+| CHK_DEL_SIGNER_AUTH | event_modules/message_deletion::build_projector_context | InvSigner | projector_local |
+| CHK_DEL_OUTER_OWNER_ABSENT | event_modules/message_deletion::project_pure | NON_MODELED::encrypted_owner_wrapper | projector_local |
 | CHK_DEL_NON_MESSAGE | event_modules/message_deletion::project_pure | NON_MODELED::type_constraint | projector_local |
 | CHK_DEL_WRONG_AUTHOR | event_modules/message_deletion::project_pure | NON_MODELED::author_constraint | projector_local |
 | CHK_DEL_INTENT | event_modules/message_deletion::project_pure | InvDeleteIntentSource | projector_local |
@@ -44,14 +48,14 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_KROT_SIGNER_BINDING | event_modules/key_rotation::project_pure | NON_MODELED::rotation_self_binding | projector_local |
 | CHK_KROT_FRONTIER_HASH | event_modules/key_rotation::project_pure | NON_MODELED::rotation_frontier_hash | projector_local |
 | CHK_KROT_FRONTIER_ORDER | event_modules/key_rotation::project_pure | NON_MODELED::rotation_frontier_canonical_order | projector_local |
-| CHK_FS_GUARD_BLOCK | event_modules/file_slice::project_pure | InvFileSliceAuth | projector_local |
+| CHK_FS_DEP_BLOCK | event_modules/file_slice::project_pure | InvFileSliceAuth | projector_local |
 | CHK_FS_HARD_PURGE | event_modules/file_slice::project_pure | InvDeletedFilePurgesLiveSlice | projector_local |
+| CHK_FS_OWNER_MATCH | event_modules/file_slice::project_pure | NON_MODELED::encrypted_owner_wrapper | projector_local |
 | CHK_FS_SIGNER_MISMATCH | event_modules/file_slice::project_pure | InvFileSliceAuth | projector_local |
 | CHK_FS_SLOT_CONFLICT | event_modules/file_slice::project_pure | NON_MODELED::slot_uniqueness | projector_local |
 | CHK_FS_IDEMPOTENT | event_modules/file_slice::project_pure | NON_MODELED::idempotent_replay | projector_local |
 | CHK_FS_INSERT | event_modules/file_slice::project_pure | InvFileSliceAuth | projector_local |
-| CHK_MA_INSERT | event_modules/message_attachment::project_pure | InvDeps | projector_local |
-| CHK_MA_RETRY_GUARD | event_modules/message_attachment::project_pure | InvFileSliceAuth | projector_local |
+| CHK_MA_INSERT | event_modules/file::project_pure | InvDeps | projector_local |
 | CHK_UI_INSERT | event_modules/user_invite::project_pure | InvUserInviteChain | projector_local |
 | CHK_UI_AUTHORITY | event_modules/user_invite::project_pure + build_projector_context | InvUserInviteChain | projector_local |
 | CHK_UI_PENDING_TRUST | event_modules/user_invite::project_pure | InvPendingTrustOnlyOnInviter | projector_local |
@@ -96,8 +100,8 @@ an explicit `NON_MODELED::<reason>` waiver.
 |----------|-------|-------------|----------|
 | CHK_DEP_PRESENCE | projection/apply/stages::check_deps_and_block | InvDeps | pipeline_shared |
 | CHK_DEP_TYPE | projection/apply/stages::check_dep_types | InvDeps | pipeline_shared |
-| CHK_FILE_TOMBSTONE_DEP_OK | projection/apply/stages::check_deps_and_block + check_dep_types | InvAttachmentTombstoneBypass | pipeline_shared |
-| CHK_RXN_TOMBSTONE_DEP_OK | projection/apply/stages::check_deps_and_block + check_dep_types | InvReactionTombstoneBypass | pipeline_shared |
+| CHK_FILE_TOMBSTONE_DEP_OK | projection/apply/stages::load_context_with_prereqs + apply_projection_frame | InvAttachmentTombstoneBypass | pipeline_shared |
+| CHK_RXN_TOMBSTONE_DEP_OK | projection/apply/stages::load_context_with_prereqs + apply_projection_frame | InvReactionTombstoneBypass | pipeline_shared |
 | CHK_SIGNER_RESOLVE | projection/signer::resolve_signer_key | InvSigner | pipeline_shared |
 | CHK_SIGNER_VERIFY | projection/apply/stages::apply_projection | InvSigner | pipeline_shared |
 | CHK_REJECTION_RECORD | projection/apply/stages::record_rejection | NON_MODELED::durable_rejection | pipeline_shared |
@@ -107,7 +111,7 @@ an explicit `NON_MODELED::<reason>` waiver.
 | CHK_ENCRYPTED_TYPE_MATCH | projection/encrypted::project_encrypted | NON_MODELED::wire_integrity | pipeline_shared |
 | CHK_ENCRYPTED_NESTED | projection/encrypted::project_encrypted | NON_MODELED::structural_prohibition | pipeline_shared |
 | CHK_ENCRYPTED_ADMISSIBLE | projection/encrypted::project_encrypted | NON_MODELED::admissibility_gate | pipeline_shared |
-| CHK_ENCRYPTED_DEP_OUTER_KEY | projection/encrypted::project_encrypted | InvEncryptedKey | pipeline_shared |
+| CHK_ENCRYPTED_DEP_OUTER_KEY | projection/apply/stages::load_context_with_prereqs | InvEncryptedKey | pipeline_shared |
 | CHK_CASCADE_UNBLOCK | projection/apply/cascade::cascade_unblocked | InvDeps | pipeline_shared |
 | CHK_DISPATCH_UNKNOWN_TYPE | projection/apply/dispatch::dispatch_pure_projector | NON_MODELED::registry_safety | pipeline_shared |
 | CHK_WS_DEP_REQUIRED | projection/apply/stages::check_deps_and_block | InvAllValidRequireWorkspace | pipeline_shared |

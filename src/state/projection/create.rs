@@ -8,6 +8,7 @@ use crate::db::store::{
     insert_event, insert_recorded_event, insert_shared_event_index_entry_if_shared,
     lookup_workspace_id,
 };
+use crate::event_modules::encrypted::NO_OWNER_EVENT_ID;
 use crate::event_modules::{self as events, registry, ParsedEvent, TransportPrivacy};
 use crate::event_modules::{EncryptedEvent, SignedEvent};
 use crate::projection::encrypted::encrypt_event_blob;
@@ -490,6 +491,27 @@ pub fn create_encrypted_event_synchronous(
     inner_event: &ParsedEvent,
     signer: Option<(&EventId, &SigningKey)>,
 ) -> Result<EventId, CreateEventError> {
+    create_encrypted_event_synchronous_with_owner(
+        conn,
+        recorded_by,
+        key_event_id,
+        None,
+        inner_event,
+        signer,
+    )
+}
+
+/// Create an encrypted event with optional outer owner linkage for convergent
+/// dependent deletion. `owner_event_id` is carried in wrapper metadata and may
+/// be zero/absent for root content or delete intents.
+pub fn create_encrypted_event_synchronous_with_owner(
+    conn: &Connection,
+    recorded_by: &str,
+    key_event_id: &EventId,
+    owner_event_id: Option<&EventId>,
+    inner_event: &ParsedEvent,
+    signer: Option<(&EventId, &SigningKey)>,
+) -> Result<EventId, CreateEventError> {
     let inner_meta = events::registry()
         .lookup(inner_event.event_type_code())
         .ok_or_else(|| CreateEventError::EncodeError("unknown event type".to_string()))?;
@@ -540,6 +562,7 @@ pub fn create_encrypted_event_synchronous(
         // content by the user-visible event time without decrypting first.
         created_at_ms: inner_event.created_at_ms(),
         key_event_id: *key_event_id,
+        owner_event_id: owner_event_id.copied().unwrap_or(NO_OWNER_EVENT_ID),
         inner_type_code: inner_event.event_type_code(),
         nonce,
         ciphertext,

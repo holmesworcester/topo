@@ -362,6 +362,14 @@ mod tests {
             Ok(None)
         }
 
+        fn message_is_deleted(
+            &self,
+            _recorded_by: &str,
+            _message_id_b64: &str,
+        ) -> ProjectionQueryResult<bool> {
+            Ok(false)
+        }
+
         fn load_workspace_context(
             &self,
             _frame: &crate::projection::queries::ProjectionFrameContext,

@@ -239,6 +239,7 @@ mod tests {
         let wrapper = ParsedEvent::Encrypted(EncryptedEvent {
             created_at_ms: 42,
             key_event_id,
+            owner_event_id: crate::event_modules::encrypted::NO_OWNER_EVENT_ID,
             inner_type_code: EVENT_TYPE_MESSAGE,
             nonce,
             ciphertext,

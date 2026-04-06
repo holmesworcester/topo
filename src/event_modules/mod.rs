@@ -220,7 +220,13 @@ impl ParsedEvent {
                 ]
             }
             ParsedEvent::Signed(s) => vec![("signed_by", s.signer_event_id)],
-            ParsedEvent::Encrypted(e) => vec![("key_event_id", e.key_event_id)],
+            ParsedEvent::Encrypted(e) => {
+                let mut deps = vec![("key_event_id", e.key_event_id)];
+                if e.owner_event_id != encrypted::NO_OWNER_EVENT_ID {
+                    deps.push(("owner_event_id", e.owner_event_id));
+                }
+                deps
+            }
             ParsedEvent::KeySecret(_) => vec![],
             ParsedEvent::MessageDeletion(_) => vec![],
             ParsedEvent::Workspace(_) => vec![],

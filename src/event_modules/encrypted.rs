@@ -10,13 +10,16 @@ mod encrypted_offsets {
     pub const TYPE_CODE: usize = 0;
     pub const CREATED_AT: usize = 1;
     pub const KEY_EVENT_ID: usize = 9;
-    pub const INNER_TYPE_CODE: usize = 41;
-    pub const NONCE: usize = 42;
-    pub const CIPHERTEXT: usize = 54;
+    pub const OWNER_EVENT_ID: usize = 41;
+    pub const INNER_TYPE_CODE: usize = 73;
+    pub const NONCE: usize = 74;
+    pub const CIPHERTEXT: usize = 86;
     // auth_tag follows ciphertext at CIPHERTEXT + ciphertext_size
 }
 
 use encrypted_offsets as off;
+
+pub const NO_OWNER_EVENT_ID: [u8; 32] = [0u8; 32];
 
 pub fn outer_inner_type_code(blob: &[u8]) -> Option<u8> {
     if blob.first().copied() != Some(EVENT_TYPE_ENCRYPTED) {
@@ -25,10 +28,21 @@ pub fn outer_inner_type_code(blob: &[u8]) -> Option<u8> {
     blob.get(off::INNER_TYPE_CODE).copied()
 }
 
+pub fn outer_owner_event_id(blob: &[u8]) -> Option<[u8; 32]> {
+    if blob.first().copied() != Some(EVENT_TYPE_ENCRYPTED) {
+        return None;
+    }
+    let owner = blob.get(off::OWNER_EVENT_ID..off::INNER_TYPE_CODE)?;
+    let mut out = [0u8; 32];
+    out.copy_from_slice(owner);
+    Some(out)
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct EncryptedEvent {
     pub created_at_ms: u64,
     pub key_event_id: [u8; 32],
+    pub owner_event_id: [u8; 32],
     pub inner_type_code: u8,
     pub nonce: [u8; 12],
     pub ciphertext: Vec<u8>,
@@ -42,10 +56,14 @@ impl super::Describe for EncryptedEvent {
             .lookup(self.inner_type_code)
             .map(|m| m.type_name)
             .unwrap_or("unknown");
-        vec![
+        let mut fields = vec![
             ("inner_type", inner_name.to_string()),
             ("ciphertext", super::trunc_hex(&self.ciphertext, 40)),
-        ]
+        ];
+        if self.owner_event_id != NO_OWNER_EVENT_ID {
+            fields.push(("owner", super::short_id_b64(&self.owner_event_id)));
+        }
+        fields
     }
 }
 
@@ -53,12 +71,13 @@ impl super::Describe for EncryptedEvent {
 /// [0]             type_code = 5
 /// [1..9]          created_at_ms (u64 LE)
 /// [9..41]         key_event_id (32B)
-/// [41]            inner_type_code (1B)
-/// [42..54]        nonce (12B, AES-256-GCM)
-/// [54..54+N]      ciphertext (N = inner type's fixed wire size)
-/// [54+N..54+N+16] auth_tag (16B)
+/// [41..73]        owner_event_id (32B, zero = ownerless/root content)
+/// [73]            inner_type_code (1B)
+/// [74..86]        nonce (12B, AES-256-GCM)
+/// [86..86+N]      ciphertext (N = inner type's fixed wire size)
+/// [86+N..86+N+16] auth_tag (16B)
 ///
-/// Total size = 70 + inner_wire_size, deterministic by inner_type_code.
+/// Total size = 102 + inner_wire_size, deterministic by inner_type_code.
 /// No ciphertext_len field; size is derived from inner_type_code lookup.
 pub fn parse_encrypted(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     // Need at least the header to read inner_type_code
@@ -99,7 +118,10 @@ pub fn parse_encrypted(blob: &[u8]) -> Result<ParsedEvent, EventError> {
         u64::from_le_bytes(blob[off::CREATED_AT..off::KEY_EVENT_ID].try_into().unwrap());
 
     let mut key_event_id = [0u8; 32];
-    key_event_id.copy_from_slice(&blob[off::KEY_EVENT_ID..off::INNER_TYPE_CODE]);
+    key_event_id.copy_from_slice(&blob[off::KEY_EVENT_ID..off::OWNER_EVENT_ID]);
+
+    let mut owner_event_id = [0u8; 32];
+    owner_event_id.copy_from_slice(&blob[off::OWNER_EVENT_ID..off::INNER_TYPE_CODE]);
 
     let mut nonce = [0u8; 12];
     nonce.copy_from_slice(&blob[off::NONCE..off::CIPHERTEXT]);
@@ -113,6 +135,7 @@ pub fn parse_encrypted(blob: &[u8]) -> Result<ParsedEvent, EventError> {
     Ok(ParsedEvent::Encrypted(EncryptedEvent {
         created_at_ms,
         key_event_id,
+        owner_event_id,
         inner_type_code,
         nonce,
         ciphertext,
@@ -141,7 +164,8 @@ pub fn encode_encrypted(event: &ParsedEvent) -> Result<Vec<u8>, EventError> {
 
     buf[off::TYPE_CODE] = EVENT_TYPE_ENCRYPTED;
     buf[off::CREATED_AT..off::KEY_EVENT_ID].copy_from_slice(&enc.created_at_ms.to_le_bytes());
-    buf[off::KEY_EVENT_ID..off::INNER_TYPE_CODE].copy_from_slice(&enc.key_event_id);
+    buf[off::KEY_EVENT_ID..off::OWNER_EVENT_ID].copy_from_slice(&enc.key_event_id);
+    buf[off::OWNER_EVENT_ID..off::INNER_TYPE_CODE].copy_from_slice(&enc.owner_event_id);
     buf[off::INNER_TYPE_CODE] = enc.inner_type_code;
     buf[off::NONCE..off::CIPHERTEXT].copy_from_slice(&enc.nonce);
     buf[off::CIPHERTEXT..off::CIPHERTEXT + expected_ct_size].copy_from_slice(&enc.ciphertext);
@@ -171,8 +195,8 @@ pub static ENCRYPTED_META: EventTypeMeta = EventTypeMeta {
     type_name: "encrypted",
     projection_table: "",
     share_scope: ShareScope::Shared,
-    dep_fields: &["key_event_id"],
-    dep_field_type_codes: &[&[6]],
+    dep_fields: &["key_event_id", "owner_event_id"],
+    dep_field_type_codes: &[&[6], &[1]],
     signer_required: false,
     signature_byte_len: 0,
     encryptable: false,
