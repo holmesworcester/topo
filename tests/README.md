@@ -64,9 +64,21 @@ next to the code they exercise.
 | `sync_graph_test.rs` | Legacy in-process chain and catchup benchmarks |
 | `topo_cascade_test.rs` | SQLite topo-sort cascade performance |
 | `file_throughput_test.rs` | File-slice insertion throughput |
+| `cli_large_file_rss_test.rs` | Release-only 1 GiB single-peer send RSS regression |
 | `low_mem_test.rs` | RSS budget tests |
 | `low_mem_large_trustset_test.rs` | Trust-set churn under memory constraints |
 | `mdns_smoke_test.rs` | Library-level mDNS advertisement smoke tests |
+
+## Large file RSS regression
+
+Run the 1 GiB single-peer file-send RSS gate explicitly in release:
+
+```bash
+cargo perf-file-rss
+```
+
+The test is compiled only for release builds so a plain debug `cargo test`
+won't accidentally exercise the crypto-heavy path.
 
 ## Shell tests (require sudo)
 

@@ -1,4 +1,9 @@
+#![cfg(not(debug_assertions))]
+
 mod cli_harness;
+
+// Run explicitly in release via:
+// `cargo perf-file-rss`
 
 use cli_harness::*;
 use std::io::{Seek, SeekFrom, Write};
@@ -8,7 +13,7 @@ const ONE_GIB: u64 = 1024 * 1024 * 1024;
 const MAX_DAEMON_RSS_DELTA_MIB: f64 = 192.0;
 
 #[test]
-#[ignore = "large 1 GiB local-send RSS regression"]
+#[ignore = "large 1 GiB local-send RSS regression; run explicitly via cargo perf-file-rss"]
 fn rss_1gib_send_stays_bounded_single_peer() {
     let tmpdir = tempfile::tempdir().unwrap();
     let db = tmpdir.path().join("single-peer-1gib.db");
