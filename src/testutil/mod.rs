@@ -1695,7 +1695,9 @@ impl Peer {
     /// descriptor) and then batch-creates the slices. Returns the file_id
     /// used for all slices. Requires identity chain (use new_with_identity).
     pub fn batch_create_file_slices(&self, total_slices: usize) -> [u8; 32] {
-        use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
+        use crate::event_modules::file_slice::{
+            FILE_SLICE_CIPHERTEXT_BYTES, FILE_SLICE_DATA_BYTES,
+        };
 
         let db = open_connection(&self.db_path).expect("failed to open db");
         let workspace_id = crate::db::store::lookup_workspace_id(&db, &self.identity)
@@ -1724,7 +1726,7 @@ impl Peer {
             fid
         };
 
-        let slice_size = FILE_SLICE_CIPHERTEXT_BYTES;
+        let slice_size = FILE_SLICE_DATA_BYTES;
         let file_bytes = total_slices * slice_size;
 
         // Message attachment descriptor
@@ -1735,7 +1737,7 @@ impl Peer {
             blob_bytes: file_bytes as u64,
             total_slices: total_slices as u32,
             slice_bytes: slice_size as u32,
-            root_hash: [0xAA; 32],
+            root_hash: [0u8; 32],
             key_event_id,
             filename: format!("bench-{}.bin", self.name),
             mime_type: "application/octet-stream".to_string(),

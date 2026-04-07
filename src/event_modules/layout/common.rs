@@ -252,7 +252,7 @@ mod tests {
         assert_eq!(MESSAGE_WIRE_SIZE, 1097);
         assert_eq!(REACTION_WIRE_SIZE, 137);
         assert_eq!(FILE_WIRE_SIZE, 536);
-        assert_eq!(FILE_SLICE_WIRE_SIZE, 262189);
+        assert_eq!(FILE_SLICE_WIRE_SIZE, 279597);
         assert_eq!(BENCH_DEP_WIRE_SIZE, 345);
         assert_eq!(WORKSPACE_WIRE_SIZE, 105);
         assert_eq!(USER_WIRE_SIZE, 105);

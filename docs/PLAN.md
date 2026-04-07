@@ -1071,11 +1071,13 @@ Note: wrapping all projection writes in a single transaction was attempted first
 Recommended initial size policy:
 - `EVENT_MAX_BLOB_BYTES = 1_048_576` (1 MiB soft cap)
 - `FILE_SLICE_TARGET_BYTES = 262_144` (256 KiB)
-- `FILE_SLICE_MAX_BYTES = 1_048_430` (`EVENT_MAX_BLOB_BYTES(1_048_576) - wire_overhead(146)`)
+- `FILE_SLICE_CIPHERTEXT_BYTES = 279_552` (fixed payload: 256 KiB logical slice data + bao proof budget sized for files up to 10 GiB)
+- `FILE_SLICE_MAX_BYTES = 279_552`
 
 `file_slice` events can be much larger than legacy simulator limits and are signed/verified like other events.
-The `FILE_SLICE_MAX_BYTES` constant is derived so that the maximum encoded `file_slice` event
-(ciphertext + type byte + timestamps + file_id + slice_number + signer trailer) fits within
+The `FILE_SLICE_CIPHERTEXT_BYTES` constant is derived so a full 256 KiB logical slice plus the
+worst-case bao proof for a 10 GiB file fits in a fixed slot, while the maximum encoded
+`file_slice` event still fits comfortably within
 `EVENT_MAX_BLOB_BYTES`.
 
 ### 10.1 File attachment event types

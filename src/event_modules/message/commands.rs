@@ -1,3 +1,5 @@
+use std::fs::File;
+use std::io::{Seek, Write};
 use std::path::Path;
 use std::thread;
 use std::time::Duration;
@@ -5,7 +7,9 @@ use std::time::Instant;
 
 use crate::crypto::bao_verify;
 use crate::crypto::EventId;
-use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
+use crate::event_modules::file_slice::{
+    BAO_PLAINTEXT_CAPACITY, FILE_SLICE_CIPHERTEXT_BYTES, FILE_SLICE_DATA_BYTES, MAX_FILE_BYTES,
+};
 use crate::projection::create::{
     create_encrypted_event_synchronous, create_encrypted_event_synchronous_with_owner,
 };
@@ -349,7 +353,7 @@ fn slices_for_file_size_mib(file_size_mib: usize) -> Result<usize, String> {
     let file_size_bytes = file_size_mib
         .checked_mul(1024 * 1024)
         .ok_or_else(|| "file_size_mib overflow".to_string())?;
-    Ok(file_size_bytes.div_ceil(FILE_SLICE_CIPHERTEXT_BYTES))
+    Ok(file_size_bytes.div_ceil(FILE_SLICE_DATA_BYTES))
 }
 
 /// Send a message as a specific peer (daemon provides the peer_id).
@@ -441,7 +445,7 @@ pub fn generate_files_for_peer(
     let ctx = workspace::load_local_authoring_context(&db, &recorded_by)?;
     // Generated files use sentinel root_hash [0;32] → skip bao verification.
     // Payload uses encoding_len=0 so unpack_bao_payload returns raw data.
-    let effective_cap = crate::event_modules::file_slice::wire::BAO_PLAINTEXT_CAPACITY;
+    let effective_cap = BAO_PLAINTEXT_CAPACITY;
     let slice_bytes_u32 = effective_cap as u32;
     let ciphertext: Vec<u8> = {
         let mut payload = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
@@ -603,8 +607,8 @@ fn mime_from_extension(ext: &str) -> &'static str {
 /// time, the reassembled file is verified against this root hash, catching
 /// any corruption or tampering in the slice data.
 ///
-/// The per-slice wire format is unchanged: each slice carries
-/// `FILE_SLICE_CIPHERTEXT_BYTES` of zero-padded file data.
+/// Each file slice carries 256 KiB of logical plaintext plus bao proof bytes
+/// in a larger fixed payload slot.
 pub fn send_file_for_peer(
     db_path: &str,
     peer_id: &str,
@@ -612,12 +616,30 @@ pub fn send_file_for_peer(
     file_path: &str,
     add_bad_slices: usize,
 ) -> Result<SendFileResponse, Box<dyn std::error::Error + Send + Sync>> {
+    send_file_for_peer_inner(db_path, peer_id, content, file_path, add_bad_slices, None)
+}
+
+fn send_file_for_peer_inner(
+    db_path: &str,
+    peer_id: &str,
+    content: &str,
+    file_path: &str,
+    add_bad_slices: usize,
+    fail_after_successful_slices: Option<usize>,
+) -> Result<SendFileResponse, Box<dyn std::error::Error + Send + Sync>> {
     let path = Path::new(file_path);
-    let file_data =
-        std::fs::read(path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-            format!("failed to read {}: {}", file_path, e).into()
-        })?;
-    let file_size = file_data.len() as u64;
+    let file_size = std::fs::metadata(path)
+        .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+            format!("failed to stat {}: {}", file_path, e).into()
+        })?
+        .len();
+    if file_size > MAX_FILE_BYTES {
+        return Err(format!(
+            "file too large: {} bytes exceeds {} byte limit",
+            file_size, MAX_FILE_BYTES
+        )
+        .into());
+    }
     let filename = path
         .file_name()
         .map(|n| n.to_string_lossy().to_string())
@@ -631,40 +653,43 @@ pub fn send_file_for_peer(
     let (recorded_by, db) = open_db_for_peer(db_path, peer_id)?;
     let ctx = workspace::load_local_authoring_context(&db, &recorded_by)?;
 
-    let message_event_id = create(
-        &db,
-        &recorded_by,
-        &ctx.signer_event_id,
-        &ctx.signing_key,
-        current_timestamp_ms_u64(),
-        CreateMessageCmd {
-            workspace_id: ctx.workspace_id,
-            author_id: ctx.author_id,
-            content: content.to_string(),
-        },
-    )?;
-
-    let key_event_id = workspace::identity_ops::ensure_content_key_for_peer(&db, &recorded_by)?;
-
     let file_id = rand::random::<[u8; 32]>();
 
-    // Compute bao outboard + root hash over plaintext for per-slice verification.
-    // The outboard is needed to extract per-slice proofs below.
-    let (root_hash, outboard) = if file_size > 0 {
-        bao_verify::compute_outboard(&file_data).map_err(
-            |e| -> Box<dyn std::error::Error + Send + Sync> {
+    // Compute bao outboard + root hash over plaintext for per-slice verification
+    // without buffering the whole file in memory.
+    let (root_hash, mut outboard_file) = if file_size > 0 {
+        let mut source =
+            File::open(path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("failed to open {}: {}", file_path, e).into()
+            })?;
+        let mut outboard_file =
+            tempfile::tempfile().map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("failed to create temporary bao outboard: {}", e).into()
+            })?;
+        let root_hash = bao_verify::compute_outboard_to_writer(&mut source, &mut outboard_file)
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
                 format!("bao outboard computation failed: {}", e).into()
-            },
-        )?
+            })?;
+        outboard_file
+            .flush()
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("failed to flush bao outboard: {}", e).into()
+            })?;
+        outboard_file
+            .rewind()
+            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("failed to rewind bao outboard: {}", e).into()
+            })?;
+        (root_hash, Some(outboard_file))
     } else {
-        ([0u8; 32], Vec::new())
+        ([0u8; 32], None)
     };
 
-    let effective_capacity = crate::event_modules::file_slice::wire::BAO_PLAINTEXT_CAPACITY;
+    let effective_capacity = BAO_PLAINTEXT_CAPACITY;
     let num_slices = if file_size == 0 {
         1usize
     } else {
-        usize::try_from((file_size as usize).div_ceil(effective_capacity)).map_err(
+        usize::try_from(file_size.div_ceil(effective_capacity as u64)).map_err(
             |_| -> Box<dyn std::error::Error + Send + Sync> {
                 "file too large: slice count exceeds usize".into()
             },
@@ -675,90 +700,137 @@ pub fn send_file_for_peer(
             "file too large: slice count exceeds u32".into()
         })?;
 
-    create_encrypted_event_synchronous_with_owner(
+    let mut source_for_slices = if file_size > 0 {
+        Some(
+            File::open(path).map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
+                format!("failed to reopen {} for slicing: {}", file_path, e).into()
+            })?,
+        )
+    } else {
+        None
+    };
+
+    let message_event_id = crate::state::db::queue::with_immediate_tx_result(
         &db,
-        &recorded_by,
-        &key_event_id,
-        Some(&message_event_id),
-        &ParsedEvent::File(FileEvent {
-            created_at_ms: current_timestamp_ms_u64(),
-            message_id: message_event_id,
-            file_id,
-            blob_bytes: file_size,
-            total_slices: total_slices_u32,
-            slice_bytes: effective_capacity as u32,
-            root_hash,
-            key_event_id,
-            filename: filename.clone(),
-            mime_type,
-        }),
-        Some((&ctx.signer_event_id, &ctx.signing_key)),
+        || -> Result<EventId, Box<dyn std::error::Error + Send + Sync>> {
+            let message_event_id = create(
+                &db,
+                &recorded_by,
+                &ctx.signer_event_id,
+                &ctx.signing_key,
+                current_timestamp_ms_u64(),
+                CreateMessageCmd {
+                    workspace_id: ctx.workspace_id,
+                    author_id: ctx.author_id,
+                    content: content.to_string(),
+                },
+            )?;
+
+            let key_event_id =
+                workspace::identity_ops::ensure_content_key_for_peer(&db, &recorded_by)?;
+
+            create_encrypted_event_synchronous_with_owner(
+                &db,
+                &recorded_by,
+                &key_event_id,
+                Some(&message_event_id),
+                &ParsedEvent::File(FileEvent {
+                    created_at_ms: current_timestamp_ms_u64(),
+                    message_id: message_event_id,
+                    file_id,
+                    blob_bytes: file_size,
+                    total_slices: total_slices_u32,
+                    slice_bytes: effective_capacity as u32,
+                    root_hash,
+                    key_event_id,
+                    filename: filename.clone(),
+                    mime_type: mime_type.clone(),
+                }),
+                Some((&ctx.signer_event_id, &ctx.signing_key)),
+            )?;
+
+            let mut remaining_bytes = file_size;
+            let mut successful_slices = 0usize;
+            for slice_number in 0..num_slices {
+                let bytes_this_slice = remaining_bytes.min(effective_capacity as u64) as usize;
+                let data_start = slice_number * effective_capacity;
+
+                let proof = if file_size > 0 {
+                    bao_verify::extract_slice_proof_from_readers(
+                        source_for_slices
+                            .as_mut()
+                            .expect("source file must exist for non-empty input"),
+                        outboard_file
+                            .as_mut()
+                            .expect("outboard file must exist for non-empty input"),
+                        data_start as u64,
+                        bytes_this_slice as u64,
+                    )
+                    .map_err(
+                        |e| -> Box<dyn std::error::Error + Send + Sync> {
+                            format!("bao slice proof extraction failed: {}", e).into()
+                        },
+                    )?
+                } else {
+                    Vec::new()
+                };
+
+                let ciphertext =
+                    crate::event_modules::file_slice::wire::pack_bao_payload(&proof, &[]).map_err(
+                        |e| -> Box<dyn std::error::Error + Send + Sync> {
+                            format!("bao slice payload packing failed: {}", e).into()
+                        },
+                    )?;
+                remaining_bytes = remaining_bytes.saturating_sub(bytes_this_slice as u64);
+
+                create_encrypted_event_synchronous_with_owner(
+                    &db,
+                    &recorded_by,
+                    &key_event_id,
+                    Some(&message_event_id),
+                    &ParsedEvent::FileSlice(FileSliceEvent {
+                        created_at_ms: current_timestamp_ms_u64(),
+                        file_id,
+                        slice_number: slice_number as u32,
+                        ciphertext,
+                    }),
+                    Some((&ctx.signer_event_id, &ctx.signing_key)),
+                )?;
+                successful_slices += 1;
+                if fail_after_successful_slices == Some(successful_slices) {
+                    return Err(format!(
+                        "injected send-file failure after {} slices",
+                        successful_slices
+                    )
+                    .into());
+                }
+            }
+            for bad_idx in 0..add_bad_slices {
+                let slice_number = total_slices_u32.checked_add(bad_idx as u32).ok_or_else(
+                    || -> Box<dyn std::error::Error + Send + Sync> {
+                        "too many bad slices: slice number exceeds u32".into()
+                    },
+                )?;
+                let ciphertext =
+                    vec![(bad_idx as u8).wrapping_add(0xA5); FILE_SLICE_CIPHERTEXT_BYTES];
+                create_encrypted_event_synchronous_with_owner(
+                    &db,
+                    &recorded_by,
+                    &key_event_id,
+                    Some(&message_event_id),
+                    &ParsedEvent::FileSlice(FileSliceEvent {
+                        created_at_ms: current_timestamp_ms_u64(),
+                        file_id,
+                        slice_number,
+                        ciphertext,
+                    }),
+                    Some((&ctx.signer_event_id, &ctx.signing_key)),
+                )?;
+            }
+
+            Ok(message_event_id)
+        },
     )?;
-
-    let mut remaining_bytes = file_size;
-    for slice_number in 0..num_slices {
-        let bytes_this_slice = remaining_bytes.min(effective_capacity as u64) as usize;
-        let data_start = slice_number * effective_capacity;
-
-        // Extract bao slice proof for this byte range.
-        let proof = if file_size > 0 {
-            bao_verify::extract_slice_proof(
-                &file_data,
-                &outboard,
-                data_start as u64,
-                bytes_this_slice as u64,
-            )
-            .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> {
-                format!("bao slice proof extraction failed: {}", e).into()
-            })?
-        } else {
-            Vec::new()
-        };
-
-        let plaintext = if bytes_this_slice > 0 {
-            &file_data[data_start..data_start + bytes_this_slice]
-        } else {
-            &[]
-        };
-        let ciphertext =
-            crate::event_modules::file_slice::wire::pack_bao_payload(&proof, plaintext);
-        remaining_bytes = remaining_bytes.saturating_sub(bytes_this_slice as u64);
-
-        create_encrypted_event_synchronous_with_owner(
-            &db,
-            &recorded_by,
-            &key_event_id,
-            Some(&message_event_id),
-            &ParsedEvent::FileSlice(FileSliceEvent {
-                created_at_ms: current_timestamp_ms_u64(),
-                file_id,
-                slice_number: slice_number as u32,
-                ciphertext,
-            }),
-            Some((&ctx.signer_event_id, &ctx.signing_key)),
-        )?;
-    }
-    for bad_idx in 0..add_bad_slices {
-        let slice_number = total_slices_u32.checked_add(bad_idx as u32).ok_or_else(
-            || -> Box<dyn std::error::Error + Send + Sync> {
-                "too many bad slices: slice number exceeds u32".into()
-            },
-        )?;
-        let ciphertext = vec![(bad_idx as u8).wrapping_add(0xA5); FILE_SLICE_CIPHERTEXT_BYTES];
-        create_encrypted_event_synchronous_with_owner(
-            &db,
-            &recorded_by,
-            &key_event_id,
-            Some(&message_event_id),
-            &ParsedEvent::FileSlice(FileSliceEvent {
-                created_at_ms: current_timestamp_ms_u64(),
-                file_id,
-                slice_number,
-                ciphertext,
-            }),
-            Some((&ctx.signer_event_id, &ctx.signing_key)),
-        )?;
-    }
 
     Ok(SendFileResponse {
         content: content.to_string(),
@@ -771,6 +843,8 @@ pub fn send_file_for_peer(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::open_connection;
+    use crate::event_modules::workspace::commands::create_workspace_for_db;
     use std::sync::{Mutex, OnceLock};
 
     fn env_guard() -> std::sync::MutexGuard<'static, ()> {
@@ -808,5 +882,44 @@ mod tests {
             7 * 24 * 60 * 60 * 1000
         );
         std::env::remove_var("TOPO_GENERATE_MESSAGE_SPREAD_MS");
+    }
+
+    #[test]
+    fn send_file_rolls_back_all_rows_on_mid_send_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        let db_path = tmp.path().join("send-file-rollback.db");
+        let db_path = db_path.to_str().unwrap();
+        let source_path = tmp.path().join("payload.bin");
+        std::fs::write(&source_path, vec![0x5Au8; FILE_SLICE_DATA_BYTES * 2]).unwrap();
+
+        let created = create_workspace_for_db(db_path, "ws", "alice", "laptop").unwrap();
+        let err = send_file_for_peer_inner(
+            db_path,
+            &created.peer_id,
+            "rollback me",
+            source_path.to_str().unwrap(),
+            0,
+            Some(1),
+        )
+        .unwrap_err();
+        assert!(
+            err.to_string().contains("injected send-file failure"),
+            "unexpected error: {err}"
+        );
+
+        let conn = open_connection(db_path).unwrap();
+        let (messages, files, file_slices): (i64, i64, i64) = conn
+            .query_row(
+                "SELECT
+                     (SELECT COUNT(*) FROM messages),
+                     (SELECT COUNT(*) FROM files),
+                     (SELECT COUNT(*) FROM file_slices)",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(messages, 0, "message row must roll back");
+        assert_eq!(files, 0, "file descriptor must roll back");
+        assert_eq!(file_slices, 0, "file slices must roll back");
     }
 }

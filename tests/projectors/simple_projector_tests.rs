@@ -5,6 +5,7 @@
 #[cfg(test)]
 mod tests {
     use crate::harness::fixtures::*;
+    use topo::event_modules::file_slice::FILE_SLICE_DATA_BYTES;
     use topo::event_modules::ParsedEvent;
     use topo::event_modules::EVENT_TYPE_FILE;
 
@@ -111,7 +112,7 @@ mod tests {
             file_id: [2u8; 32],
             blob_bytes: 1024,
             total_slices: 1,
-            slice_bytes: 262144,
+            slice_bytes: FILE_SLICE_DATA_BYTES as u32,
             root_hash: [3u8; 32],
             key_event_id: [4u8; 32],
             filename: "test.txt".to_string(),
@@ -139,7 +140,7 @@ mod tests {
             file_id: [2u8; 32],
             blob_bytes: 1024,
             total_slices: 1,
-            slice_bytes: 262144,
+            slice_bytes: FILE_SLICE_DATA_BYTES as u32,
             root_hash: [3u8; 32],
             key_event_id: [4u8; 32],
             filename: "test.txt".to_string(),

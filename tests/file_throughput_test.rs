@@ -13,8 +13,10 @@ use tempfile::NamedTempFile;
 use topo::crypto::{event_id_to_base64, hash_event, EventId};
 use topo::db::{open_connection, schema::create_tables};
 use topo::event_modules::{
-    self as events, file_slice::FILE_SLICE_CIPHERTEXT_BYTES, FileEvent, FileSliceEvent,
-    KeySecretEvent, MessageEvent, ParsedEvent, PeerSharedEvent, UserEvent, WorkspaceEvent,
+    self as events,
+    file_slice::{FILE_SLICE_CIPHERTEXT_BYTES, FILE_SLICE_DATA_BYTES},
+    FileEvent, FileSliceEvent, KeySecretEvent, MessageEvent, ParsedEvent, PeerSharedEvent,
+    UserEvent, WorkspaceEvent,
 };
 use topo::projection::apply::project_one;
 use topo::projection::create::create_encrypted_event_synchronous;
@@ -177,8 +179,8 @@ fn run_file_throughput(file_size_bytes: usize) {
 
     let (msg_eid, sk_eid, signer_eid, signing_key) = create_prereqs(&conn, recorded_by);
 
-    // All file slices use canonical fixed ciphertext size (256 KiB)
-    let slice_size = FILE_SLICE_CIPHERTEXT_BYTES;
+    // Each file slice carries 256 KiB of logical file data in a larger fixed payload.
+    let slice_size = FILE_SLICE_DATA_BYTES;
     let total_slices = (file_size_bytes + slice_size - 1) / slice_size;
     let file_id = [0xF0; 32];
 

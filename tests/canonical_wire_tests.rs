@@ -555,7 +555,7 @@ fn file_slice_wrong_ciphertext_size_rejected() {
         created_at_ms: 100,
         file_id: [0u8; 32],
         slice_number: 0,
-        ciphertext: vec![0u8; 1024], // not canonical 262144
+        ciphertext: vec![0u8; 1024], // not the canonical fixed payload size
     });
     assert!(events::encode_event(&fs).is_err());
 }

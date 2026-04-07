@@ -9,8 +9,8 @@
 #[cfg(test)]
 mod tests {
     use crate::harness::fixtures::*;
-    use topo::event_modules::file_slice::{build_projector_context, project_pure};
     use topo::event_modules::file_slice::FileSliceEvent;
+    use topo::event_modules::file_slice::{build_projector_context, project_pure};
     use topo::event_modules::{ParsedEvent, EVENT_TYPE_FILE_SLICE};
     use topo::projection::contract::FileDescriptorInfo;
     use topo::projection::queries::ProjectionFrameContext;
@@ -23,7 +23,7 @@ mod tests {
             created_at_ms: 7000,
             file_id,
             slice_number: 0,
-            ciphertext: vec![0u8; 262144],
+            ciphertext: vec![0u8; topo::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES],
         })
     }
 
