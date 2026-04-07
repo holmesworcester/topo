@@ -3623,13 +3623,13 @@ fn test_cli_delete_message_purges_file_and_file_slice_from_event_commands() {
         (msg_eid, file_eid)
     };
 
-    let (file_id, slice_eid) = {
+    let slice_eid = {
         let deadline = Instant::now() + Duration::from_secs(30);
         loop {
             let conn = open_connection(&db).unwrap();
             let row = conn
                 .query_row(
-                    "SELECT f.file_id, s.event_id
+                    "SELECT s.event_id
                      FROM files f
                      JOIN file_slices s
                        ON s.recorded_by = f.recorded_by AND s.file_id = f.file_id
@@ -3637,7 +3637,7 @@ fn test_cli_delete_message_purges_file_and_file_slice_from_event_commands() {
                      ORDER BY s.slice_number ASC
                      LIMIT 1",
                     rusqlite::params![&recorded_by, &file_eid],
-                    |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+                    |row| row.get::<_, String>(0),
                 )
                 .ok();
             if let Some(row) = row {

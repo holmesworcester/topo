@@ -13,14 +13,11 @@ use tempfile::NamedTempFile;
 use topo::crypto::{event_id_to_base64, hash_event, EventId};
 use topo::db::{open_connection, schema::create_tables};
 use topo::event_modules::{
-    self as events, file_slice::FILE_SLICE_CIPHERTEXT_BYTES, DeviceInviteEvent, FileEvent,
-    FileSliceEvent, InviteAcceptedEvent, KeySecretEvent, MessageEvent, ParsedEvent,
-    PeerSharedEvent, TenantEvent, UserEvent, UserInviteEvent, WorkspaceEvent,
+    self as events, file_slice::FILE_SLICE_CIPHERTEXT_BYTES, FileEvent, FileSliceEvent,
+    KeySecretEvent, MessageEvent, ParsedEvent, PeerSharedEvent, UserEvent, WorkspaceEvent,
 };
 use topo::projection::apply::project_one;
 use topo::projection::create::create_encrypted_event_synchronous;
-use topo::projection::create::create_signed_event_synchronous;
-use topo::projection::signer::sign_event_bytes;
 
 fn now_ms() -> u64 {
     std::time::SystemTime::now()
@@ -84,13 +81,6 @@ fn insert_event_raw(
     .unwrap();
 
     event_id
-}
-
-/// Helper: sign a blob in-place (overwrite last 64 bytes with Ed25519 signature).
-fn sign_blob(key: &SigningKey, blob: &mut Vec<u8>) {
-    let len = blob.len();
-    let sig = sign_event_bytes(key, &blob[..len - 64]);
-    blob[len - 64..].copy_from_slice(&sig);
 }
 
 /// Bootstrap a minimal workspace bootstrap path. Returns

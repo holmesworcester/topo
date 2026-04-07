@@ -1305,15 +1305,6 @@ impl ProjectionQueries for NodeBehaviorEngine {
                 })
             }
         };
-        let endpoint_shared_event_id_b64 =
-            event_id_to_base64(&peer_shared.endpoint_shared_event_id);
-        let endpoint_shared_row = first_row_for_table(
-            &state,
-            "endpoints_shared",
-            "event_id",
-            &endpoint_shared_event_id_b64,
-        );
-
         let expected_user = Some(event_id_to_base64(&device_invite.authority_event_id));
 
         let peer_shared_user_mismatch_reason = match expected_user {
@@ -1335,11 +1326,12 @@ impl ProjectionQueries for NodeBehaviorEngine {
 
         let endpoint_shared_event_id_b64 =
             event_id_to_base64(&peer_shared.endpoint_shared_event_id);
-        let endpoint_shared_row = state.tables.get("endpoints_shared").and_then(|rows| {
-            rows.iter().find(|row| {
-                row_text(row, "event_id") == Some(endpoint_shared_event_id_b64.as_str())
-            })
-        });
+        let endpoint_shared_row = first_row_for_table(
+            &state,
+            "endpoints_shared",
+            "event_id",
+            &endpoint_shared_event_id_b64,
+        );
 
         Ok(ContextSnapshot {
             peer_shared_user_mismatch_reason,
@@ -2003,41 +1995,6 @@ mod tests {
     use crate::event_modules::EVENT_TYPE_ENCRYPTED;
     use crate::rpc::protocol::RpcMethod;
     use crate::sim::{import_peer_state, snapshot_replayed_peer_to_path, VirtualDaemon};
-
-    fn subset_summary(summary: &NodeBehaviorSummary, tables: &[&str]) -> NodeBehaviorSummary {
-        let wanted = tables
-            .iter()
-            .map(|table| (*table).to_string())
-            .collect::<BTreeSet<_>>();
-        NodeBehaviorSummary {
-            recorded_by: summary.recorded_by.clone(),
-            tables: summary
-                .tables
-                .iter()
-                .filter(|(table, _)| wanted.contains(*table))
-                .map(|(table, rows)| (table.clone(), rows.clone()))
-                .collect(),
-        }
-    }
-
-    fn normalized_behavior_subset(
-        summary: &NodeBehaviorSummary,
-        tables: &[&str],
-    ) -> NodeBehaviorSummary {
-        let mut subset = subset_summary(summary, tables);
-        for (table, rows) in &mut subset.tables {
-            match table.as_str() {
-                "user_invites" | "device_invites" | "key_rotations" => {
-                    for row in rows.iter_mut() {
-                        row.values.remove("event_id");
-                    }
-                }
-                _ => {}
-            }
-            rows.sort();
-        }
-        subset
-    }
 
     fn projected_table(
         summary: &NodeBehaviorSummary,

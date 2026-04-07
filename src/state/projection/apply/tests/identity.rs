@@ -326,7 +326,6 @@ fn test_ingest_endpoint_shared_normalizes_to_endpoint_scope() {
 fn test_unsupported_signer_type_rejects() {
     let conn = setup();
     let recorded_by = "peer1";
-    let mut rng = rand::thread_rng();
 
     let unsupported_signer = ParsedEvent::BenchDep(BenchDepEvent {
         created_at_ms: now_ms(),

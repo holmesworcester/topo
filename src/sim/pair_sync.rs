@@ -518,18 +518,6 @@ fn stored_event_ids(conn: &rusqlite::Connection) -> Result<BTreeSet<String>, rus
     rows.collect::<Result<BTreeSet<_>, _>>()
 }
 
-fn event_blob_by_id(
-    conn: &rusqlite::Connection,
-    event_id: &str,
-) -> Result<Option<Vec<u8>>, rusqlite::Error> {
-    conn.query_row(
-        "SELECT blob FROM events WHERE event_id = ?1 LIMIT 1",
-        rusqlite::params![event_id],
-        |row| row.get::<_, Vec<u8>>(0),
-    )
-    .optional()
-}
-
 fn source_transport_peer_id(
     conn: &rusqlite::Connection,
     recorded_by: &str,
