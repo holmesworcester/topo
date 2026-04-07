@@ -29,6 +29,25 @@ pub(crate) enum DispatchAction {
     Reconnect,
 }
 
+/// Bootstrap dial planning decision from a single query snapshot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum BootstrapDialPlan {
+    /// The workspace is already present locally under another tenant, so link
+    /// bootstrap endpoint/address data must be ignored.
+    IgnoreAlreadyLocalWorkspace,
+    UseBootstrapTarget,
+}
+
+pub(crate) fn decide_bootstrap_dial_plan(
+    target: &crate::db::transport_trust::InviteBootstrapTarget,
+) -> BootstrapDialPlan {
+    if target.workspace_already_local_elsewhere {
+        BootstrapDialPlan::IgnoreAlreadyLocalWorkspace
+    } else {
+        BootstrapDialPlan::UseBootstrapTarget
+    }
+}
+
 /// Tracks outbound targets and manages cancellation of stale connect loops.
 pub(crate) struct PeerDispatcher {
     pub(crate) known: HashMap<
@@ -117,6 +136,12 @@ pub(crate) fn load_bootstrap_targets(
 
     for tenant_id in tenant_ids {
         for target in list_active_invite_bootstrap_targets(&db, tenant_id)? {
+            if matches!(
+                decide_bootstrap_dial_plan(&target),
+                BootstrapDialPlan::IgnoreAlreadyLocalWorkspace
+            ) {
+                continue;
+            }
             if bootstrap_target_superseded_by_observed_endpoint(
                 &db,
                 tenant_id,
@@ -342,6 +367,9 @@ pub(crate) fn dispatch_known_peer_target(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::db::transport_trust::{record_invite_bootstrap_trust, InviteBootstrapTarget};
+    use crate::db::{open_connection, schema::create_tables};
+    use rusqlite::params;
 
     #[test]
     fn dispatcher_reconnects_when_target_address_changes() {
@@ -368,5 +396,131 @@ mod tests {
     fn bootstrap_lookup_key_is_stable_without_address() {
         let key = bootstrap_dispatch_key("tenant", "peer", None, None);
         assert_eq!(key, "tenant@bootstrap:peer@lookup");
+    }
+
+    #[test]
+    fn bootstrap_dial_plan_ignores_already_local_workspace_regardless_of_endpoint() {
+        let direct = InviteBootstrapTarget {
+            invite_event_id: "invite-1".to_string(),
+            transport_peer_id: "peer-1".to_string(),
+            bootstrap_addr: "127.0.0.1:7777".to_string(),
+            workspace_already_local_elsewhere: true,
+        };
+        let relay = InviteBootstrapTarget {
+            invite_event_id: "invite-1".to_string(),
+            transport_peer_id: "peer-1".to_string(),
+            bootstrap_addr: "https://relay.example".to_string(),
+            workspace_already_local_elsewhere: true,
+        };
+
+        assert_eq!(
+            decide_bootstrap_dial_plan(&direct),
+            BootstrapDialPlan::IgnoreAlreadyLocalWorkspace
+        );
+        assert_eq!(
+            decide_bootstrap_dial_plan(&direct),
+            decide_bootstrap_dial_plan(&relay),
+            "already-local workspaces must ignore attacker-controlled bootstrap endpoints"
+        );
+    }
+
+    #[test]
+    fn load_bootstrap_targets_skips_already_local_workspace() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("already-local-bootstrap.db");
+        let conn = open_connection(db_path.to_str().unwrap()).unwrap();
+        create_tables(&conn).unwrap();
+
+        record_invite_bootstrap_trust(
+            &conn,
+            "tenant-a",
+            "accepted-a",
+            "invite-a",
+            "workspace-shared",
+            "127.0.0.1:17777",
+            &[0xAB; 32],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO invites_accepted
+                 (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "tenant-a",
+                "accepted-a",
+                "tenant-event-a",
+                "invite-a",
+                "workspace-shared",
+                1i64
+            ],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO invites_accepted
+                 (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "tenant-b",
+                "accepted-b",
+                "tenant-event-b",
+                "invite-b",
+                "workspace-shared",
+                1i64
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let targets =
+            load_bootstrap_targets(db_path.to_str().unwrap(), &["tenant-a".to_string()]).unwrap();
+        assert!(
+            targets.is_empty(),
+            "bootstrap targets must be suppressed when the workspace is already local elsewhere"
+        );
+    }
+
+    #[test]
+    fn load_bootstrap_targets_keeps_nonlocal_workspace() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("nonlocal-bootstrap.db");
+        let conn = open_connection(db_path.to_str().unwrap()).unwrap();
+        create_tables(&conn).unwrap();
+
+        record_invite_bootstrap_trust(
+            &conn,
+            "tenant-a",
+            "accepted-a",
+            "invite-a",
+            "workspace-a",
+            "127.0.0.1:17778",
+            &[0xAC; 32],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO invites_accepted
+                 (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                "tenant-a",
+                "accepted-a",
+                "tenant-event-a",
+                "invite-a",
+                "workspace-a",
+                1i64
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        let targets =
+            load_bootstrap_targets(db_path.to_str().unwrap(), &["tenant-a".to_string()]).unwrap();
+        assert_eq!(
+            targets.len(),
+            1,
+            "nonlocal workspaces must retain bootstrap targets"
+        );
+        assert_eq!(targets[0].0, "tenant-a");
+        assert_eq!(targets[0].1, hex::encode([0xAC; 32]));
+        assert_eq!(targets[0].2, "invite-a");
     }
 }

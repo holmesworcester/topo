@@ -26,6 +26,8 @@ pub mod persist_phase;
 // Security proofs
 pub mod session_auth;
 pub mod transport_trust;
+pub mod bootstrap_dialer;
+pub mod sync_admission;
 pub mod sync_protocol;
 pub mod connection_security;
 pub mod data_ingestion;

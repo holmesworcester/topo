@@ -2,12 +2,10 @@
 
 use std::time::{Duration, Instant};
 
-use crate::db::{
-    open_connection,
-    store::{lookup_workspace_id, Store},
-};
+use crate::db::{open_connection, store::Store};
 use crate::protocol::{neg_id_to_event_id, Frame};
 use crate::runtime::peering::loops::live_session_peer_ids;
+use crate::runtime::sync_engine::session::admission::resolve_sync_admission;
 use crate::runtime::SyncStats;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::range_session::{
@@ -98,12 +96,7 @@ where
     drain_manual_commands(&mut command_rx, &mut pending_round_replies);
 
     let db = open_connection(db_path)?;
-    let ws_id = lookup_workspace_id(&db, recorded_by).ok_or_else(|| {
-        format!(
-            "no accepted workspace binding for peer_id={}, cannot start sync",
-            recorded_by
-        )
-    })?;
+    let ws_id = resolve_sync_admission(&db, recorded_by)?;
     let live_peer_ids = live_session_peer_ids(db_path, recorded_by);
     let range = select_outbound_window(
         db_path,

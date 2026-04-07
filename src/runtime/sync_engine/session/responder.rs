@@ -2,11 +2,9 @@
 
 use std::time::{Duration, Instant};
 
-use crate::db::{
-    open_connection,
-    store::{lookup_workspace_id, Store},
-};
+use crate::db::{open_connection, store::Store};
 use crate::protocol::{neg_id_to_event_id, Frame};
+use crate::runtime::sync_engine::session::admission::resolve_sync_admission;
 use crate::runtime::SyncStats;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::range_session::{
@@ -120,12 +118,7 @@ where
     }
 
     let db = open_connection(db_path)?;
-    let ws_id = lookup_workspace_id(&db, recorded_by).ok_or_else(|| {
-        format!(
-            "no accepted workspace binding for peer_id={}, cannot start sync",
-            recorded_by
-        )
-    })?;
+    let ws_id = resolve_sync_admission(&db, recorded_by)?;
     let storage = load_shared_event_index_slice(&db, &ws_id, range)?;
     let mut neg = Negentropy::borrowed(&storage, NEGENTROPY_FRAME_SIZE_LIMIT)?;
 

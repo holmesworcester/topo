@@ -282,4 +282,148 @@ proof fn proof_auth_path_correctly_tagged()
 {
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// Query-Snapshot Planner Proofs
+// ═══════════════════════════════════════════════════════════════════
+
+pub enum BootstrapTenantDecision {
+    RejectMissing,
+    Accept,
+    RejectAmbiguous,
+}
+
+/// Bootstrap tenant resolution planner driven by a query snapshot that has
+/// already deduplicated candidate tenants.
+pub open spec fn bootstrap_tenant_decision(candidate_tenant_count: nat) -> BootstrapTenantDecision {
+    if candidate_tenant_count == 0 {
+        BootstrapTenantDecision::RejectMissing
+    } else if candidate_tenant_count == 1 {
+        BootstrapTenantDecision::Accept
+    } else {
+        BootstrapTenantDecision::RejectAmbiguous
+    }
+}
+
+proof fn proof_bootstrap_tenant_resolution_rejects_missing()
+    ensures bootstrap_tenant_decision(0) == BootstrapTenantDecision::RejectMissing,
+{
+}
+
+proof fn proof_bootstrap_tenant_resolution_accepts_unique()
+    ensures bootstrap_tenant_decision(1) == BootstrapTenantDecision::Accept,
+{
+}
+
+proof fn proof_bootstrap_tenant_resolution_rejects_ambiguous(count: nat)
+    requires count > 1
+    ensures bootstrap_tenant_decision(count) == BootstrapTenantDecision::RejectAmbiguous,
+{
+}
+
+pub enum RequestedSessionAuthPlan {
+    PeerShared,
+    InviteBootstrap,
+}
+
+pub enum ResolvedSessionAuthPlan {
+    PeerShared,
+    InviteBootstrap,
+}
+
+/// Outbound auth planner from a fixed context snapshot.
+pub open spec fn outbound_auth_plan_from_snapshot(
+    requested: RequestedSessionAuthPlan,
+    peer_route_admitted: bool,
+    exact_bootstrap_invite_available: bool,
+    bootstrap_auth_still_valid: bool,
+    bound_daemon_matches_remote: bool,
+    remote_session_peer_authorized: bool,
+) -> ResolvedSessionAuthPlan {
+    match requested {
+        RequestedSessionAuthPlan::PeerShared => {
+            if peer_route_admitted {
+                ResolvedSessionAuthPlan::PeerShared
+            } else if exact_bootstrap_invite_available {
+                ResolvedSessionAuthPlan::InviteBootstrap
+            } else {
+                ResolvedSessionAuthPlan::PeerShared
+            }
+        }
+        RequestedSessionAuthPlan::InviteBootstrap => {
+            if bootstrap_auth_still_valid {
+                ResolvedSessionAuthPlan::InviteBootstrap
+            } else if bound_daemon_matches_remote && remote_session_peer_authorized {
+                ResolvedSessionAuthPlan::PeerShared
+            } else {
+                ResolvedSessionAuthPlan::InviteBootstrap
+            }
+        }
+    }
+}
+
+proof fn proof_outbound_peer_shared_stays_peer_shared_when_route_admitted(
+    bootstrap_fallback: bool,
+)
+    ensures
+        outbound_auth_plan_from_snapshot(
+            RequestedSessionAuthPlan::PeerShared,
+            true,
+            bootstrap_fallback,
+            false,
+            false,
+            false,
+        ) == ResolvedSessionAuthPlan::PeerShared,
+{
+}
+
+proof fn proof_outbound_peer_shared_falls_back_to_bootstrap_when_needed()
+    ensures
+        outbound_auth_plan_from_snapshot(
+            RequestedSessionAuthPlan::PeerShared,
+            false,
+            true,
+            false,
+            false,
+            false,
+        ) == ResolvedSessionAuthPlan::InviteBootstrap,
+{
+}
+
+proof fn proof_outbound_bootstrap_stays_bootstrap_while_active(
+    bound_ok: bool,
+    remote_authorized: bool,
+)
+    ensures
+        outbound_auth_plan_from_snapshot(
+            RequestedSessionAuthPlan::InviteBootstrap,
+            false,
+            false,
+            true,
+            bound_ok,
+            remote_authorized,
+        ) == ResolvedSessionAuthPlan::InviteBootstrap,
+{
+}
+
+proof fn proof_outbound_bootstrap_upgrades_only_after_bootstrap_lapses()
+    ensures
+        outbound_auth_plan_from_snapshot(
+            RequestedSessionAuthPlan::InviteBootstrap,
+            false,
+            false,
+            false,
+            true,
+            true,
+        ) == ResolvedSessionAuthPlan::PeerShared,
+        outbound_auth_plan_from_snapshot(
+            RequestedSessionAuthPlan::InviteBootstrap,
+            false,
+            false,
+            false,
+            false,
+            true,
+        ) == ResolvedSessionAuthPlan::InviteBootstrap,
+{
+}
+
 } // verus!
