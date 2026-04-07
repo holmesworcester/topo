@@ -320,6 +320,61 @@ proof fn proof_bootstrap_tenant_resolution_rejects_ambiguous(count: nat)
 {
 }
 
+pub enum BootstrapFallbackInviteDecision {
+    RejectMissing,
+    UseInvite,
+    RejectAmbiguous,
+    RejectAlreadyLocalWorkspaceCandidate,
+}
+
+pub open spec fn bootstrap_fallback_invite_decision(
+    candidate_invite_count: nat,
+    unique_candidate_workspace_already_local_before_candidate: bool,
+) -> BootstrapFallbackInviteDecision {
+    if candidate_invite_count == 0 {
+        BootstrapFallbackInviteDecision::RejectMissing
+    } else if candidate_invite_count == 1 {
+        if unique_candidate_workspace_already_local_before_candidate {
+            BootstrapFallbackInviteDecision::RejectAlreadyLocalWorkspaceCandidate
+        } else {
+            BootstrapFallbackInviteDecision::UseInvite
+        }
+    } else {
+        BootstrapFallbackInviteDecision::RejectAmbiguous
+    }
+}
+
+pub open spec fn bootstrap_fallback_invite_allowed(
+    decision: BootstrapFallbackInviteDecision,
+) -> bool {
+    match decision {
+        BootstrapFallbackInviteDecision::UseInvite => true,
+        _ => false,
+    }
+}
+
+proof fn proof_bootstrap_fallback_rejects_unique_same_workspace_skip_candidate()
+    ensures
+        bootstrap_fallback_invite_decision(1, true)
+            == BootstrapFallbackInviteDecision::RejectAlreadyLocalWorkspaceCandidate,
+        !bootstrap_fallback_invite_allowed(bootstrap_fallback_invite_decision(1, true)),
+{
+}
+
+proof fn proof_bootstrap_fallback_accepts_unique_nonlocal_candidate()
+    ensures
+        bootstrap_fallback_invite_decision(1, false) == BootstrapFallbackInviteDecision::UseInvite,
+        bootstrap_fallback_invite_allowed(bootstrap_fallback_invite_decision(1, false)),
+{
+}
+
+proof fn proof_bootstrap_fallback_rejects_ambiguous_or_missing(count: nat)
+    requires count == 0 || count > 1
+    ensures
+        !bootstrap_fallback_invite_allowed(bootstrap_fallback_invite_decision(count, false)),
+{
+}
+
 pub enum RequestedSessionAuthPlan {
     PeerShared,
     InviteBootstrap,
@@ -330,31 +385,59 @@ pub enum ResolvedSessionAuthPlan {
     InviteBootstrap,
 }
 
-/// Outbound auth planner from a fixed context snapshot.
-pub open spec fn outbound_auth_plan_from_snapshot(
+pub enum ResolvedSessionAuthDecision {
+    KeepRequested,
+    KeepBootstrapWhileStillActiveWithSteadyStateBinding,
+    UpgradeToPeerSharedAfterRouteAdmission,
+    UpgradeToPeerSharedAfterBootstrapLapse,
+}
+
+/// Outbound auth planner decision from a fixed context snapshot.
+pub open spec fn outbound_auth_decision_from_snapshot(
     requested: RequestedSessionAuthPlan,
     bootstrap_auth_still_valid: bool,
     daemon_connection_admits_route: bool,
     bound_daemon_matches_remote: bool,
     remote_session_peer_authorized: bool,
-) -> ResolvedSessionAuthPlan {
+) -> ResolvedSessionAuthDecision {
     match requested {
-        RequestedSessionAuthPlan::PeerShared => ResolvedSessionAuthPlan::PeerShared,
+        RequestedSessionAuthPlan::PeerShared => ResolvedSessionAuthDecision::KeepRequested,
         RequestedSessionAuthPlan::InviteBootstrap => {
             if bootstrap_auth_still_valid {
                 if daemon_connection_admits_route
                     && bound_daemon_matches_remote
                     && remote_session_peer_authorized
                 {
-                    ResolvedSessionAuthPlan::PeerShared
+                    ResolvedSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission
+                } else if bound_daemon_matches_remote {
+                    ResolvedSessionAuthDecision::KeepBootstrapWhileStillActiveWithSteadyStateBinding
                 } else {
-                    ResolvedSessionAuthPlan::InviteBootstrap
+                    ResolvedSessionAuthDecision::KeepRequested
                 }
             } else if bound_daemon_matches_remote && remote_session_peer_authorized {
-                ResolvedSessionAuthPlan::PeerShared
+                ResolvedSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse
             } else {
-                ResolvedSessionAuthPlan::InviteBootstrap
+                ResolvedSessionAuthDecision::KeepRequested
             }
+        }
+    }
+}
+
+pub open spec fn outbound_auth_plan_from_decision(
+    requested: RequestedSessionAuthPlan,
+    decision: ResolvedSessionAuthDecision,
+) -> ResolvedSessionAuthPlan {
+    match decision {
+        ResolvedSessionAuthDecision::KeepRequested => match requested {
+            RequestedSessionAuthPlan::PeerShared => ResolvedSessionAuthPlan::PeerShared,
+            RequestedSessionAuthPlan::InviteBootstrap => ResolvedSessionAuthPlan::InviteBootstrap,
+        },
+        ResolvedSessionAuthDecision::KeepBootstrapWhileStillActiveWithSteadyStateBinding => {
+            ResolvedSessionAuthPlan::InviteBootstrap
+        }
+        ResolvedSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission
+        | ResolvedSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse => {
+            ResolvedSessionAuthPlan::PeerShared
         }
     }
 }
@@ -366,58 +449,100 @@ proof fn proof_outbound_peer_shared_request_is_preserved(
     remote_session_peer_authorized: bool,
 )
     ensures
-        outbound_auth_plan_from_snapshot(
+        outbound_auth_plan_from_decision(
             RequestedSessionAuthPlan::PeerShared,
-            bootstrap_auth_still_valid,
-            daemon_connection_admits_route,
-            bound_daemon_matches_remote,
-            remote_session_peer_authorized,
+            outbound_auth_decision_from_snapshot(
+                RequestedSessionAuthPlan::PeerShared,
+                bootstrap_auth_still_valid,
+                daemon_connection_admits_route,
+                bound_daemon_matches_remote,
+                remote_session_peer_authorized,
+            ),
         ) == ResolvedSessionAuthPlan::PeerShared,
 {
 }
 
-proof fn proof_outbound_bootstrap_stays_bootstrap_while_active_without_admitted_route(
-    bound_ok: bool,
+proof fn proof_outbound_bootstrap_keeps_bound_bootstrap_while_active_without_admitted_route(
     remote_authorized: bool,
 )
     ensures
-        outbound_auth_plan_from_snapshot(
+        outbound_auth_decision_from_snapshot(
             RequestedSessionAuthPlan::InviteBootstrap,
             true,
             false,
-            bound_ok,
+            true,
             remote_authorized,
+        ) == ResolvedSessionAuthDecision::KeepBootstrapWhileStillActiveWithSteadyStateBinding,
+        outbound_auth_plan_from_decision(
+            RequestedSessionAuthPlan::InviteBootstrap,
+            outbound_auth_decision_from_snapshot(
+                RequestedSessionAuthPlan::InviteBootstrap,
+                true,
+                false,
+                true,
+                remote_authorized,
+            ),
         ) == ResolvedSessionAuthPlan::InviteBootstrap,
 {
 }
 
 proof fn proof_outbound_bootstrap_upgrades_after_admitted_route()
     ensures
-        outbound_auth_plan_from_snapshot(
+        outbound_auth_decision_from_snapshot(
             RequestedSessionAuthPlan::InviteBootstrap,
             true,
             true,
             true,
             true,
+        ) == ResolvedSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission,
+        outbound_auth_plan_from_decision(
+            RequestedSessionAuthPlan::InviteBootstrap,
+            outbound_auth_decision_from_snapshot(
+                RequestedSessionAuthPlan::InviteBootstrap,
+                true,
+                true,
+                true,
+                true,
+            ),
         ) == ResolvedSessionAuthPlan::PeerShared,
 {
 }
 
 proof fn proof_outbound_bootstrap_upgrades_only_after_bootstrap_lapses_when_not_admitted()
     ensures
-        outbound_auth_plan_from_snapshot(
+        outbound_auth_decision_from_snapshot(
             RequestedSessionAuthPlan::InviteBootstrap,
             false,
             false,
             true,
             true,
+        ) == ResolvedSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse,
+        outbound_auth_plan_from_decision(
+            RequestedSessionAuthPlan::InviteBootstrap,
+            outbound_auth_decision_from_snapshot(
+                RequestedSessionAuthPlan::InviteBootstrap,
+                false,
+                false,
+                true,
+                true,
+            ),
         ) == ResolvedSessionAuthPlan::PeerShared,
-        outbound_auth_plan_from_snapshot(
+        outbound_auth_decision_from_snapshot(
             RequestedSessionAuthPlan::InviteBootstrap,
             false,
             false,
             false,
             true,
+        ) == ResolvedSessionAuthDecision::KeepRequested,
+        outbound_auth_plan_from_decision(
+            RequestedSessionAuthPlan::InviteBootstrap,
+            outbound_auth_decision_from_snapshot(
+                RequestedSessionAuthPlan::InviteBootstrap,
+                false,
+                false,
+                false,
+                true,
+            ),
         ) == ResolvedSessionAuthPlan::InviteBootstrap,
 {
 }
