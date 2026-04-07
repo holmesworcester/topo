@@ -117,6 +117,12 @@ These are required, not optional:
 12. Transport fingerprint bridge.
    - `peer_shared` projection materializes deterministic `peers_shared.transport_fingerprint` and indexes `(recorded_by, transport_fingerprint)`.
    - trust lookup paths use projected `transport_fingerprint` rows and do not fallback to runtime scan+derive over `peers_shared.public_key`.
+13. Context-query planner seam for proof-bearing runtime policy.
+   - security-sensitive runtime behavior should be structured as `context query -> pure planner -> executor`.
+   - the context query is responsible for loading and normalizing the SQL snapshot that determines behavior.
+   - the planner must be side-effect free and emit an explicit plan enum/flags.
+   - the executor must perform only the side effects authorized by that plan.
+   - when we want Verus/TLA coverage, prove the planner over the query snapshot and model temporal/runtime composition around it instead of proving directly over interleaved SQL and network code.
 
 ## 2.1 Strict Endpoint/Auth Target
 
@@ -160,6 +166,7 @@ Every CLI instance is a real peer-to-peer device. All user-facing commands go th
    - known drawback: anyone who knows the daemon's `iroh` address or relay-reachable endpoint can hit the pre-proof `iroh/topo` surface and exercise timeout/parser/admission paths. Membership proof is still required before any workspace-scoped sync is allowed.
 5. **Shared batch writer**: all tenants on a device share one batch writer for projection, grouped by `recorded_by`.
 6. **Same-workspace shared-DB convergence**: if multiple local tenants share one DB and one workspace, shared events must fan out locally across sibling tenant scopes after local create or wire ingest, and newly accepted tenants/devices must replay already-present shared workspace history into their own scope.
+7. **Already-local workspace bootstrap isolation**: if invite acceptance targets a workspace that is already present locally anywhere in the DB, the accept path must treat that join as local-only. Link-supplied bootstrap endpoint/address/relay data must not create bootstrap trust rows, bootstrap dial targets, or outbound sync authority for that workspace. Regression coverage for this rule must prove that local fanout/replay stays intra-DB and that forged or stale bootstrap link data does not cause raw shared events from the already-local workspace to be sent outward.
 
 ## 2.4 Rejected Alternative: Fully Sessionless Signed Control
 

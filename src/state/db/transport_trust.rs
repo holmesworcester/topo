@@ -786,6 +786,10 @@ pub struct InviteBootstrapTarget {
     pub invite_event_id: String,
     pub transport_peer_id: String,
     pub bootstrap_addr: String,
+    /// True when another local tenant is already bound to the same workspace.
+    /// Runtime bootstrap dial planning must ignore attacker-controlled
+    /// bootstrap endpoint/address info in that case.
+    pub workspace_already_local_elsewhere: bool,
 }
 
 /// List active invite bootstrap targets for a tenant, keyed by invite_event_id.
@@ -801,7 +805,16 @@ pub fn list_active_invite_bootstrap_targets(
 ) -> Result<Vec<InviteBootstrapTarget>, Box<dyn std::error::Error + Send + Sync>> {
     let now = current_timestamp_ms();
     let mut stmt = conn.prepare(
-        "SELECT t.invite_event_id, t.bootstrap_spki_fingerprint, t.bootstrap_addr
+        "SELECT
+             t.invite_event_id,
+             t.bootstrap_spki_fingerprint,
+             t.bootstrap_addr,
+             EXISTS(
+                 SELECT 1
+                   FROM invites_accepted ia
+                  WHERE ia.workspace_id = t.workspace_id
+                    AND ia.recorded_by <> t.recorded_by
+             ) AS workspace_already_local_elsewhere
            FROM invite_bootstrap_trust t
           WHERE t.recorded_by = ?1
             AND t.expires_at > ?2
@@ -832,6 +845,7 @@ pub fn list_active_invite_bootstrap_targets(
                 invite_event_id: row.get(0)?,
                 transport_peer_id,
                 bootstrap_addr: row.get(2)?,
+                workspace_already_local_elsewhere: row.get(3)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
