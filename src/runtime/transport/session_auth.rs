@@ -1,7 +1,6 @@
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use ed25519_dalek::SigningKey;
-use rusqlite::{params, Connection, OptionalExtension};
+use super::{load_daemon_identity_from_db, DaemonConnection};
 use crate::contracts::peering_contract::TransportSessionIo;
 use crate::crypto::{
     event_id_to_base64, sign_event_bytes, spki_fingerprint_from_ed25519_pubkey,
@@ -13,13 +12,31 @@ use crate::event_modules::{parse_event, ParsedEvent};
 use crate::protocol::{
     encode_frame, parse_frame, Frame, OpenSessionAuthAck, OpenSessionAuthInvite, OpenSessionRoute,
 };
-use super::{load_daemon_identity_from_db, DaemonConnection};
+use crate::runtime::repeated_warning::should_emit_globally;
+use ed25519_dalek::SigningKey;
+use rusqlite::{params, Connection, OptionalExtension};
+use tracing::debug;
 
 pub const MAX_SESSION_AUTH_TTL_MS: u64 = 5 * 60 * 1000;
 const SESSION_AUTH_CLOCK_SKEW_MS: u64 = 30 * 1000;
 const MAX_SESSION_AUTH_FRAME_BYTES: usize = 4096;
 
 const INVITE_SIGNING_DOMAIN: &[u8] = b"poc7-session-auth-v1-invite";
+
+fn short_value(value: &str) -> &str {
+    &value[..16.min(value.len())]
+}
+
+fn describe_outbound_session_auth_plan(plan: &OutboundSessionAuthPlan) -> String {
+    match plan {
+        OutboundSessionAuthPlan::PeerShared { target_peer_id } => {
+            format!("peer_shared(peer={})", short_value(target_peer_id))
+        }
+        OutboundSessionAuthPlan::InviteBootstrap { invite_event_id } => {
+            format!("invite_bootstrap(invite={})", short_value(invite_event_id))
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboundSessionAuthPlan {
@@ -56,6 +73,27 @@ enum BootstrapSessionTenantDecision {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct BootstrapFallbackInviteCandidate {
+    invite_event_id: String,
+    workspace_already_local_before_candidate: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BootstrapFallbackInviteContext {
+    Candidates {
+        candidates: Vec<BootstrapFallbackInviteCandidate>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum BootstrapFallbackInviteDecision {
+    RejectMissing,
+    UseInvite { invite_event_id: String },
+    RejectAmbiguous,
+    RejectAlreadyLocalWorkspaceCandidate,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct OutboundSessionAuthContext {
     requested_plan: OutboundSessionAuthPlan,
     remote_session_peer_id: String,
@@ -63,6 +101,14 @@ struct OutboundSessionAuthContext {
     daemon_connection_admits_route: bool,
     bound_daemon_matches_remote: bool,
     remote_session_peer_authorized: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum OutboundSessionAuthDecision {
+    KeepRequested,
+    KeepBootstrapWhileStillActiveWithSteadyStateBinding,
+    UpgradeToPeerSharedAfterRouteAdmission,
+    UpgradeToPeerSharedAfterBootstrapLapse,
 }
 
 fn decide_bootstrap_session_tenant(
@@ -84,31 +130,80 @@ fn decide_bootstrap_session_tenant(
     }
 }
 
-fn decide_outbound_session_auth_plan(
+fn decide_bootstrap_fallback_invite(
+    context: &BootstrapFallbackInviteContext,
+) -> BootstrapFallbackInviteDecision {
+    match context {
+        BootstrapFallbackInviteContext::Candidates { candidates } => {
+            let mut candidates = candidates.clone();
+            candidates.sort_by(|a, b| a.invite_event_id.cmp(&b.invite_event_id));
+            let mut normalized: Vec<BootstrapFallbackInviteCandidate> = Vec::new();
+            for candidate in candidates {
+                if let Some(last) = normalized.last_mut() {
+                    if last.invite_event_id == candidate.invite_event_id {
+                        last.workspace_already_local_before_candidate |=
+                            candidate.workspace_already_local_before_candidate;
+                        continue;
+                    }
+                }
+                normalized.push(candidate);
+            }
+            match normalized.as_slice() {
+                [] => BootstrapFallbackInviteDecision::RejectMissing,
+                [candidate] if candidate.workspace_already_local_before_candidate => {
+                    BootstrapFallbackInviteDecision::RejectAlreadyLocalWorkspaceCandidate
+                }
+                [candidate] => BootstrapFallbackInviteDecision::UseInvite {
+                    invite_event_id: candidate.invite_event_id.clone(),
+                },
+                _ => BootstrapFallbackInviteDecision::RejectAmbiguous,
+            }
+        }
+    }
+}
+
+fn decide_outbound_session_auth_decision(
     context: &OutboundSessionAuthContext,
-) -> OutboundSessionAuthPlan {
+) -> OutboundSessionAuthDecision {
     match &context.requested_plan {
-        OutboundSessionAuthPlan::PeerShared { .. } => context.requested_plan.clone(),
+        OutboundSessionAuthPlan::PeerShared { .. } => OutboundSessionAuthDecision::KeepRequested,
         OutboundSessionAuthPlan::InviteBootstrap { .. } => {
             if context.bootstrap_auth_still_valid {
                 if context.daemon_connection_admits_route
                     && context.bound_daemon_matches_remote
                     && context.remote_session_peer_authorized
                 {
-                    return OutboundSessionAuthPlan::PeerShared {
-                        target_peer_id: context.remote_session_peer_id.clone(),
-                    };
+                    return OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission;
                 }
-                return context.requested_plan.clone();
+                if context.bound_daemon_matches_remote {
+                    return OutboundSessionAuthDecision::KeepBootstrapWhileStillActiveWithSteadyStateBinding;
+                }
+                return OutboundSessionAuthDecision::KeepRequested;
             }
 
             if context.bound_daemon_matches_remote && context.remote_session_peer_authorized {
-                return OutboundSessionAuthPlan::PeerShared {
-                    target_peer_id: context.remote_session_peer_id.clone(),
-                };
+                return OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse;
             }
 
+            OutboundSessionAuthDecision::KeepRequested
+        }
+    }
+}
+
+fn plan_for_outbound_session_auth_decision(
+    context: &OutboundSessionAuthContext,
+    decision: &OutboundSessionAuthDecision,
+) -> OutboundSessionAuthPlan {
+    match decision {
+        OutboundSessionAuthDecision::KeepRequested
+        | OutboundSessionAuthDecision::KeepBootstrapWhileStillActiveWithSteadyStateBinding => {
             context.requested_plan.clone()
+        }
+        OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission
+        | OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse => {
+            OutboundSessionAuthPlan::PeerShared {
+                target_peer_id: context.remote_session_peer_id.clone(),
+            }
         }
     }
 }
@@ -684,30 +779,67 @@ pub fn resolve_bootstrap_fallback_invite_for_daemon(
     let now = now_ms()? as i64;
     let remote_daemon_peer_id =
         decode_hex32(actual_remote_daemon_peer_id, "actual remote daemon peer id")?;
-    let mut invite_event_ids = conn
+    let candidates = conn
         .prepare(
-            "SELECT invite_event_id
-             FROM pending_invite_bootstrap_trust
+            "SELECT
+                 t.invite_event_id,
+                 EXISTS(
+                     SELECT 1
+                     FROM invites_accepted sibling
+                     WHERE sibling.workspace_id = t.workspace_id
+                       AND sibling.recorded_by <> t.recorded_by
+                       AND (
+                           sibling.created_at < t.created_at
+                           OR (
+                               sibling.created_at = t.created_at
+                               AND sibling.event_id < t.invite_event_id
+                           )
+                       )
+                 ) AS workspace_already_local_elsewhere
+             FROM pending_invite_bootstrap_trust t
              WHERE recorded_by = ?1
                AND expected_bootstrap_spki_fingerprint = ?2
                AND expires_at > ?3
              UNION ALL
-             SELECT invite_event_id
-             FROM invite_bootstrap_trust
+             SELECT
+                 t.invite_event_id,
+                 EXISTS(
+                     SELECT 1
+                     FROM invites_accepted sibling
+                     WHERE sibling.workspace_id = t.workspace_id
+                       AND sibling.recorded_by <> t.recorded_by
+                       AND (
+                           sibling.created_at < t.accepted_at
+                           OR (
+                               sibling.created_at = t.accepted_at
+                               AND sibling.event_id < t.invite_accepted_event_id
+                           )
+                       )
+                 ) AS workspace_already_local_elsewhere
+             FROM invite_bootstrap_trust t
              WHERE recorded_by = ?1
                AND bootstrap_spki_fingerprint = ?2
                AND expires_at > ?3",
         )?
         .query_map(
             params![recorded_by, remote_daemon_peer_id.as_slice(), now],
-            |row| row.get::<_, String>(0),
+            |row| {
+                Ok(BootstrapFallbackInviteCandidate {
+                    invite_event_id: row.get(0)?,
+                    workspace_already_local_before_candidate: row.get(1)?,
+                })
+            },
         )?
         .collect::<Result<Vec<_>, _>>()?;
-    invite_event_ids.sort();
-    invite_event_ids.dedup();
-    Ok(match invite_event_ids.as_slice() {
-        [invite_event_id] => Some(invite_event_id.clone()),
-        _ => None,
+
+    let decision = decide_bootstrap_fallback_invite(&BootstrapFallbackInviteContext::Candidates {
+        candidates,
+    });
+    Ok(match decision {
+        BootstrapFallbackInviteDecision::UseInvite { invite_event_id } => Some(invite_event_id),
+        BootstrapFallbackInviteDecision::RejectMissing
+        | BootstrapFallbackInviteDecision::RejectAmbiguous
+        | BootstrapFallbackInviteDecision::RejectAlreadyLocalWorkspaceCandidate => None,
     })
 }
 
@@ -773,7 +905,61 @@ pub fn resolve_outbound_session_auth_plan(
         actual_remote_daemon_peer_id,
         requested_plan,
     )?;
-    Ok(decide_outbound_session_auth_plan(&context))
+    let decision = decide_outbound_session_auth_decision(&context);
+    let resolved_plan = plan_for_outbound_session_auth_decision(&context, &decision);
+
+    match decision {
+        OutboundSessionAuthDecision::KeepRequested => {}
+        OutboundSessionAuthDecision::KeepBootstrapWhileStillActiveWithSteadyStateBinding => {
+            let key = format!(
+                "outbound-auth-keep-bootstrap:{}:{}:{}",
+                recorded_by, remote_session_peer_id, actual_remote_daemon_peer_id
+            );
+            if should_emit_globally(key) {
+                debug!(
+                    "Outbound auth plan kept bootstrap tenant={} peer={} daemon={} requested={} because bootstrap trust is still active even though a steady-state daemon binding exists",
+                    short_value(recorded_by),
+                    short_value(remote_session_peer_id),
+                    short_value(actual_remote_daemon_peer_id),
+                    describe_outbound_session_auth_plan(requested_plan)
+                );
+            }
+        }
+        OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission => {
+            let key = format!(
+                "outbound-auth-upgrade-admitted:{}:{}:{}",
+                recorded_by, remote_session_peer_id, actual_remote_daemon_peer_id
+            );
+            if should_emit_globally(key) {
+                debug!(
+                    "Outbound auth plan changed tenant={} peer={} daemon={} requested={} resolved={} because this daemon connection already admitted the steady-state route",
+                    short_value(recorded_by),
+                    short_value(remote_session_peer_id),
+                    short_value(actual_remote_daemon_peer_id),
+                    describe_outbound_session_auth_plan(requested_plan),
+                    describe_outbound_session_auth_plan(&resolved_plan)
+                );
+            }
+        }
+        OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse => {
+            let key = format!(
+                "outbound-auth-upgrade:{}:{}:{}",
+                recorded_by, remote_session_peer_id, actual_remote_daemon_peer_id
+            );
+            if should_emit_globally(key) {
+                debug!(
+                    "Outbound auth plan changed tenant={} peer={} daemon={} requested={} resolved={} because the steady-state daemon binding is now authorized",
+                    short_value(recorded_by),
+                    short_value(remote_session_peer_id),
+                    short_value(actual_remote_daemon_peer_id),
+                    describe_outbound_session_auth_plan(requested_plan),
+                    describe_outbound_session_auth_plan(&resolved_plan)
+                );
+            }
+        }
+    }
+
+    Ok(resolved_plan)
 }
 
 pub fn resolve_bootstrap_inviter_peer_id(
@@ -1048,8 +1234,23 @@ mod tests {
     }
 
     #[test]
+    fn bootstrap_fallback_invite_decision_rejects_candidate_created_after_workspace_was_local() {
+        let decision =
+            decide_bootstrap_fallback_invite(&BootstrapFallbackInviteContext::Candidates {
+                candidates: vec![BootstrapFallbackInviteCandidate {
+                    invite_event_id: "invite-1".to_string(),
+                    workspace_already_local_before_candidate: true,
+                }],
+            });
+        assert_eq!(
+            decision,
+            BootstrapFallbackInviteDecision::RejectAlreadyLocalWorkspaceCandidate
+        );
+    }
+
+    #[test]
     fn outbound_session_auth_planner_keeps_active_bootstrap_without_admitted_route() {
-        let plan = decide_outbound_session_auth_plan(&OutboundSessionAuthContext {
+        let context = OutboundSessionAuthContext {
             requested_plan: OutboundSessionAuthPlan::InviteBootstrap {
                 invite_event_id: "invite-1".to_string(),
             },
@@ -1058,9 +1259,14 @@ mod tests {
             daemon_connection_admits_route: false,
             bound_daemon_matches_remote: true,
             remote_session_peer_authorized: true,
-        });
+        };
+        let decision = decide_outbound_session_auth_decision(&context);
         assert_eq!(
-            plan,
+            decision,
+            OutboundSessionAuthDecision::KeepBootstrapWhileStillActiveWithSteadyStateBinding
+        );
+        assert_eq!(
+            plan_for_outbound_session_auth_decision(&context, &decision),
             OutboundSessionAuthPlan::InviteBootstrap {
                 invite_event_id: "invite-1".to_string(),
             }
@@ -1069,7 +1275,7 @@ mod tests {
 
     #[test]
     fn outbound_session_auth_planner_upgrades_only_when_binding_and_auth_hold() {
-        let plan = decide_outbound_session_auth_plan(&OutboundSessionAuthContext {
+        let context = OutboundSessionAuthContext {
             requested_plan: OutboundSessionAuthPlan::InviteBootstrap {
                 invite_event_id: "invite-1".to_string(),
             },
@@ -1078,15 +1284,20 @@ mod tests {
             daemon_connection_admits_route: false,
             bound_daemon_matches_remote: true,
             remote_session_peer_authorized: true,
-        });
+        };
+        let decision = decide_outbound_session_auth_decision(&context);
         assert_eq!(
-            plan,
+            decision,
+            OutboundSessionAuthDecision::UpgradeToPeerSharedAfterBootstrapLapse
+        );
+        assert_eq!(
+            plan_for_outbound_session_auth_decision(&context, &decision),
             OutboundSessionAuthPlan::PeerShared {
                 target_peer_id: "peer-1".to_string(),
             }
         );
 
-        let no_upgrade = decide_outbound_session_auth_plan(&OutboundSessionAuthContext {
+        let no_upgrade_context = OutboundSessionAuthContext {
             requested_plan: OutboundSessionAuthPlan::InviteBootstrap {
                 invite_event_id: "invite-1".to_string(),
             },
@@ -1095,9 +1306,11 @@ mod tests {
             daemon_connection_admits_route: false,
             bound_daemon_matches_remote: false,
             remote_session_peer_authorized: true,
-        });
+        };
+        let no_upgrade = decide_outbound_session_auth_decision(&no_upgrade_context);
+        assert_eq!(no_upgrade, OutboundSessionAuthDecision::KeepRequested);
         assert_eq!(
-            no_upgrade,
+            plan_for_outbound_session_auth_decision(&no_upgrade_context, &no_upgrade),
             OutboundSessionAuthPlan::InviteBootstrap {
                 invite_event_id: "invite-1".to_string(),
             }
@@ -1106,7 +1319,7 @@ mod tests {
 
     #[test]
     fn outbound_session_auth_planner_upgrades_active_bootstrap_after_route_admission() {
-        let plan = decide_outbound_session_auth_plan(&OutboundSessionAuthContext {
+        let context = OutboundSessionAuthContext {
             requested_plan: OutboundSessionAuthPlan::InviteBootstrap {
                 invite_event_id: "invite-1".to_string(),
             },
@@ -1115,9 +1328,14 @@ mod tests {
             daemon_connection_admits_route: true,
             bound_daemon_matches_remote: true,
             remote_session_peer_authorized: true,
-        });
+        };
+        let decision = decide_outbound_session_auth_decision(&context);
         assert_eq!(
-            plan,
+            decision,
+            OutboundSessionAuthDecision::UpgradeToPeerSharedAfterRouteAdmission
+        );
+        assert_eq!(
+            plan_for_outbound_session_auth_decision(&context, &decision),
             OutboundSessionAuthPlan::PeerShared {
                 target_peer_id: "peer-1".to_string(),
             }
@@ -1539,6 +1757,139 @@ mod tests {
                 .unwrap();
 
         assert_eq!(invite.as_deref(), Some("pending-bootstrap"));
+    }
+
+    #[test]
+    fn resolve_bootstrap_fallback_invite_for_daemon_skips_pending_same_workspace_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("client.sqlite3");
+        let _daemon_peer_id = store_test_daemon_identity(db_path.to_str().unwrap());
+
+        let recorded_by = hex::encode([0xB3; 32]);
+        let sibling_tenant = hex::encode([0xB4; 32]);
+        let remote_daemon_peer_id = hex::encode([0xB5; 32]);
+
+        let db = open_connection(db_path.to_str().unwrap()).unwrap();
+        db.execute(
+            "INSERT INTO invites_accepted
+                 (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                sibling_tenant,
+                "accepted-sibling",
+                "tenant-sibling",
+                "invite-sibling",
+                "ws-1",
+                1i64
+            ],
+        )
+        .unwrap();
+        record_pending_invite_bootstrap_trust(
+            &db,
+            &recorded_by,
+            "pending-bootstrap",
+            "ws-1",
+            &[0xB5; 32],
+        )
+        .unwrap();
+
+        let invite =
+            resolve_bootstrap_fallback_invite_for_daemon(&db, &recorded_by, &remote_daemon_peer_id)
+                .unwrap();
+
+        assert_eq!(invite, None);
+    }
+
+    #[test]
+    fn resolve_bootstrap_fallback_invite_for_daemon_skips_accepted_same_workspace_candidate() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("client.sqlite3");
+        let _daemon_peer_id = store_test_daemon_identity(db_path.to_str().unwrap());
+
+        let recorded_by = hex::encode([0xB6; 32]);
+        let sibling_tenant = hex::encode([0xB7; 32]);
+        let remote_daemon_peer_id = hex::encode([0xB8; 32]);
+
+        let db = open_connection(db_path.to_str().unwrap()).unwrap();
+        db.execute(
+            "INSERT INTO invites_accepted
+                 (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                sibling_tenant,
+                "accepted-sibling",
+                "tenant-sibling",
+                "invite-sibling",
+                "ws-1",
+                1i64
+            ],
+        )
+        .unwrap();
+        record_invite_bootstrap_trust(
+            &db,
+            &recorded_by,
+            "accepted-bootstrap",
+            "invite-bootstrap",
+            "ws-1",
+            "127.0.0.1:1",
+            &[0xB8; 32],
+        )
+        .unwrap();
+
+        let invite =
+            resolve_bootstrap_fallback_invite_for_daemon(&db, &recorded_by, &remote_daemon_peer_id)
+                .unwrap();
+
+        assert_eq!(invite, None);
+    }
+
+    #[test]
+    fn resolve_bootstrap_fallback_invite_for_daemon_keeps_older_accepted_candidate_after_later_sibling(
+    ) {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("client.sqlite3");
+        let _daemon_peer_id = store_test_daemon_identity(db_path.to_str().unwrap());
+
+        let recorded_by = hex::encode([0xB9; 32]);
+        let sibling_tenant = hex::encode([0xBA; 32]);
+        let remote_daemon_peer_id = hex::encode([0xBB; 32]);
+
+        let db = open_connection(db_path.to_str().unwrap()).unwrap();
+        record_invite_bootstrap_trust(
+            &db,
+            &recorded_by,
+            "accepted-bootstrap",
+            "invite-bootstrap",
+            "ws-1",
+            "127.0.0.1:1",
+            &[0xBB; 32],
+        )
+        .unwrap();
+        let later_created_at = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_millis() as i64
+            + 60_000;
+        db.execute(
+            "INSERT INTO invites_accepted
+                 (recorded_by, event_id, tenant_event_id, invite_event_id, workspace_id, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            params![
+                sibling_tenant,
+                "zz-accepted-sibling",
+                "tenant-sibling",
+                "invite-sibling",
+                "ws-1",
+                later_created_at
+            ],
+        )
+        .unwrap();
+
+        let invite =
+            resolve_bootstrap_fallback_invite_for_daemon(&db, &recorded_by, &remote_daemon_peer_id)
+                .unwrap();
+
+        assert_eq!(invite.as_deref(), Some("invite-bootstrap"));
     }
 
     #[tokio::test]
