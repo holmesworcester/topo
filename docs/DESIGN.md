@@ -70,6 +70,25 @@ The design goal is to keep protocol behavior auditable while still supporting re
 3. projection logic is deterministic and convergent,
 4. CLI workflows remain synchronous enough for imperative command chains.
 
+## Context Queries And Pure Planners
+
+For security-sensitive runtime behavior, the preferred shape is:
+
+1. one context query loads a transactionally consistent snapshot of the relevant SQL state,
+2. one pure planner maps that snapshot to an explicit plan,
+3. one executor performs only the side effects named by that plan.
+
+The context query should collapse live runtime state into the smallest stable snapshot that still determines behavior. Avoid planners that reach back into SQLite, inspect the network directly, or depend on hidden ambient state after the snapshot is loaded.
+
+This shape is important for proofs. Verus can prove local planner properties such as noninterference, rejection on ambiguity, or "already-local means no bootstrap" directly over the snapshot-to-plan function. TLA can then model retries, refresh loops, cancellation, and cross-component composition around that planner without needing to model SQL internals in full detail.
+
+Design guidance:
+
+1. context queries should deduplicate and normalize rows before returning them to the planner,
+2. planner outputs should be explicit enums/flags rather than implicit control flow,
+3. executors should not add extra authority decisions beyond the emitted plan,
+4. when a behavior needs a proof, prefer introducing a context-query seam rather than proving over ad-hoc interleaved SQL and network logic.
+
 ## How it Works (Narrative Overview)
 
 ### Daemon Start
@@ -164,6 +183,8 @@ This is intentionally the simplest robust strategy. There is no durable ownershi
 Sync is range-owned and durable-first. Bulk sync no longer uses durable `wanted` rows, `ResponseCredit`, or a shared ingest channel to keep the wire busy.
 
 For same-workspace sibling tenants sharing one DB, there is one extra local step after canonical persistence: shared events created locally or ingested from the network are fanned out to sibling tenant scopes with the same `workspace_id`, then projected through those tenants' normal queue/drain path. This is not a transport shortcut and it does not bypass projectors; it is local fanout of already-canonical shared blobs so one shared DB converges the same way multiple separate daemons would.
+
+Security requirement: that local fanout must remain strictly intra-DB. If invite acceptance targets a workspace that is already present locally under any tenant in the same DB, bootstrap endpoint/address/relay material from the invite link must be ignored. In that already-local case, acceptance is local-only: it may replay already-canonical shared workspace history into the new tenant scope, but it must not create bootstrap trust, bootstrap dial targets, or any external sync/export path derived from the link. Local fanout is allowed to widen visibility across sibling tenant scopes inside one DB; it must never cause already-local workspace history to be re-exported to a link-supplied bootstrap peer.
 
 ### Steady-State Repeats The Same Loop
 
