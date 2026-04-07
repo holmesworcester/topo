@@ -81,6 +81,7 @@ pub fn ensure_schema_epoch(conn: &Connection) -> SqliteResult<()> {
 
 /// Ensure all schema owned by infra and event modules in a deterministic order.
 pub fn ensure_all_schema(conn: &Connection) -> SqliteResult<()> {
+    super::ensure_storage_pragmas(conn)?;
     ensure_schema_epoch(conn)?;
     super::ensure_infra_schema(conn)?;
     crate::event_modules::ensure_schema(conn)?;

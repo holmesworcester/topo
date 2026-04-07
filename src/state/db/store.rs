@@ -41,7 +41,11 @@ pub fn shared_event_shard_u8(event_id: &EventId) -> i64 {
     event_id[0] as i64
 }
 
-fn insert_event_deps(conn: &Connection, event_id_b64: &str, blob: &[u8]) -> SqliteResult<()> {
+pub fn index_event_deps_from_blob(
+    conn: &Connection,
+    event_id_b64: &str,
+    blob: &[u8],
+) -> SqliteResult<()> {
     let Ok(parsed) = events::parse_event(blob) else {
         return Ok(());
     };
@@ -175,7 +179,7 @@ pub fn insert_event(
             inserted_at_ms
         ],
     )?;
-    insert_event_deps(conn, &event_id_b64, blob)?;
+    index_event_deps_from_blob(conn, &event_id_b64, blob)?;
     Ok(())
 }
 

@@ -128,8 +128,8 @@ pub(crate) fn bootstrap_dispatch_key_prefix(tenant_id: &str, transport_peer_id: 
     format!("{tenant_id}@bootstrap:{transport_peer_id}@")
 }
 
-pub(crate) fn known_peer_dispatch_key(tenant_id: &str, transport_peer_id: &str) -> String {
-    format!("{tenant_id}@peer:{transport_peer_id}")
+pub(crate) fn known_peer_dispatch_key(tenant_id: &str, remote_peer_id: &str) -> String {
+    format!("{tenant_id}@peer:{remote_peer_id}")
 }
 
 fn short_value(value: &str) -> &str {
@@ -255,8 +255,8 @@ pub(crate) fn load_observed_endpoint_targets(
 ) -> Result<Vec<(String, String, SocketAddr)>, Box<dyn std::error::Error + Send + Sync>> {
     Ok(load_known_peer_targets(db_path, tenant_ids)?
         .into_iter()
-        .filter_map(|(tenant_id, transport_peer_id, remote)| {
-            remote.map(|remote| (tenant_id, transport_peer_id, remote))
+        .filter_map(|(tenant_id, _peer_id, daemon_peer_id, remote)| {
+            remote.map(|remote| (tenant_id, daemon_peer_id, remote))
         })
         .collect())
 }
@@ -264,7 +264,7 @@ pub(crate) fn load_observed_endpoint_targets(
 pub(crate) fn load_known_peer_targets(
     db_path: &str,
     tenant_ids: &[String],
-) -> Result<Vec<(String, String, Option<SocketAddr>)>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<(String, String, String, Option<SocketAddr>)>, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
     let now_ms = SystemTime::now().duration_since(UNIX_EPOCH)?.as_millis() as i64;
     let mut seen: HashSet<(String, String)> = HashSet::new();
@@ -273,6 +273,17 @@ pub(crate) fn load_known_peer_targets(
     let mut stmt = db.prepare(
         "SELECT
              lower(hex(ps.transport_fingerprint)) AS peer_id,
+             COALESCE(
+                 ps.endpoint_id,
+                 (
+                     SELECT lower(hex(b.spki_fingerprint))
+                     FROM peer_transport_bindings b
+                     WHERE b.recorded_by = ps.recorded_by
+                       AND b.peer_id = lower(hex(ps.transport_fingerprint))
+                     ORDER BY b.bound_at DESC
+                     LIMIT 1
+                 )
+             ) AS daemon_peer_id,
              (
                  SELECT e.origin_ip
                  FROM peer_endpoint_observations e
@@ -306,13 +317,14 @@ pub(crate) fn load_known_peer_targets(
         let rows = stmt.query_map(rusqlite::params![tenant_id, now_ms], |row| {
             Ok((
                 row.get::<_, String>(0)?,
-                row.get::<_, Option<String>>(1)?,
-                row.get::<_, Option<i64>>(2)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, Option<String>>(2)?,
+                row.get::<_, Option<i64>>(3)?,
             ))
         })?;
 
         for row in rows {
-            let (peer_id, origin_ip, origin_port) = row?;
+            let (peer_id, daemon_peer_id, origin_ip, origin_port) = row?;
             if !seen.insert((tenant_id.clone(), peer_id.clone())) {
                 continue;
             }
@@ -323,7 +335,7 @@ pub(crate) fn load_known_peer_targets(
                 }
                 _ => None,
             };
-            out.push((tenant_id.clone(), peer_id, remote));
+            out.push((tenant_id.clone(), peer_id, daemon_peer_id, remote));
         }
     }
 
@@ -332,7 +344,7 @@ pub(crate) fn load_known_peer_targets(
 
 pub(crate) fn collect_all_known_peer_targets(
     db_path: &str,
-) -> Result<Vec<(String, String, Option<SocketAddr>)>, Box<dyn std::error::Error + Send + Sync>> {
+) -> Result<Vec<(String, String, String, Option<SocketAddr>)>, Box<dyn std::error::Error + Send + Sync>> {
     let db = open_connection(db_path)?;
     let mut tenant_ids: Vec<String> = discover_local_tenants(&db)?
         .into_iter()
@@ -393,10 +405,10 @@ pub(crate) fn bootstrap_dispatch_action(
 pub(crate) fn dispatch_known_peer_target(
     dispatcher: &mut PeerDispatcher,
     tenant_id: &str,
-    transport_peer_id: &str,
+    remote_peer_id: &str,
     remote: Option<SocketAddr>,
 ) -> bool {
-    let key = known_peer_dispatch_key(tenant_id, transport_peer_id);
+    let key = known_peer_dispatch_key(tenant_id, remote_peer_id);
     let (action, _cancel_rx) = dispatcher.dispatch(&key, remote, None);
     matches!(action, DispatchAction::Connect | DispatchAction::Reconnect)
 }

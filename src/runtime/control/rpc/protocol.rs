@@ -199,6 +199,9 @@ pub enum RpcMethod {
     /// Trigger a negentropy round for all connected peers.
     SyncRoundAll,
 
+    /// Return currently live authenticated session peers for the active tenant.
+    LiveSessions,
+
     /// Return all projection table counts for the active tenant.
     Stats,
     /// Run a replay pass (forward/idempotent/reverse/shuffle) and return the fingerprint.

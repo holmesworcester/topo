@@ -93,7 +93,6 @@ impl DaemonState {
     pub fn new(db_path: &str) -> Self {
         let active = match crate::db::open_connection(db_path) {
             Ok(conn) => {
-                let _ = crate::db::schema::create_tables(&conn);
                 let _ = crate::transport::ensure_daemon_identity(&conn);
                 match discover_tenant_scopes(&conn) {
                     Ok(tenants) if tenants.len() == 1 => Some(tenants[0].tenant_id.clone()),
@@ -134,7 +133,6 @@ impl DaemonState {
         // Discover current tenant scopes from invites_accepted projection state.
         // This keeps control-plane tenant selection independent from transport creds.
         let discovered = if let Ok(conn) = crate::db::open_connection(&self.db_path) {
-            let _ = crate::db::schema::create_tables(&conn);
             discover_tenant_scopes(&conn).ok()
         } else {
             None
@@ -199,7 +197,7 @@ where
     F: FnOnce(&str, &str, &rusqlite::Connection) -> RpcResponse,
 {
     match state.require_active_peer() {
-        Ok(peer_id) => match service::open_db_for_peer(&state.db_path, &peer_id) {
+        Ok(peer_id) => match service::open_existing_db_for_peer(&state.db_path, &peer_id) {
             Ok((recorded_by, db)) => f(&peer_id, &recorded_by, &db),
             Err(e) => RpcResponse::error(e.to_string()),
         },
@@ -396,7 +394,6 @@ fn runtime_status_value(state: &DaemonState) -> Option<serde_json::Value> {
         value["endpoint_id"] = serde_json::json!(endpoint_id);
         value["endpoint_shared_id"] = serde_json::Value::Null;
         if let Ok(db) = crate::db::open_connection(&state.db_path) {
-            let _ = crate::db::schema::create_tables(&db);
             if let Ok(Some(secret_row)) =
                 crate::event_modules::endpoint_secret::load_local_endpoint_secret(&db)
             {
@@ -419,7 +416,6 @@ fn runtime_status_value(state: &DaemonState) -> Option<serde_json::Value> {
         "endpoint_shared_id": serde_json::Value::Null,
     });
     if let Ok(db) = crate::db::open_connection(&state.db_path) {
-        let _ = crate::db::schema::create_tables(&db);
         if let Ok(Some(secret_row)) =
             crate::event_modules::endpoint_secret::load_local_endpoint_secret(&db)
         {
@@ -584,7 +580,6 @@ fn dispatch(
         // ----- Tenant management (daemon state) -----
         RpcMethod::Tenants => match crate::db::open_connection(db_path) {
             Ok(conn) => {
-                let _ = crate::db::schema::create_tables(&conn);
                 let active = state.active_peer.read().unwrap().clone();
                 match workspace::list_tenants_for_display(&conn, active.as_deref().unwrap_or("")) {
                     Ok(tenants) => {
@@ -610,7 +605,6 @@ fn dispatch(
 
         RpcMethod::UseTenant { index } => match crate::db::open_connection(db_path) {
             Ok(conn) => {
-                let _ = crate::db::schema::create_tables(&conn);
                 let active = state.active_peer.read().unwrap().clone();
                 match workspace::list_tenants_for_display(&conn, active.as_deref().unwrap_or("")) {
                     Ok(tenants) => {
@@ -849,9 +843,6 @@ fn dispatch(
         // ----- Read-only commands (call event modules directly) -----
         RpcMethod::TransportKeys => match crate::db::open_connection(db_path) {
             Ok(db) => {
-                if let Err(e) = crate::db::schema::create_tables(&db) {
-                    return RpcResponse::error(e.to_string());
-                }
                 match crate::state::db::transport_creds::list_local_peers_with_source(&db) {
                     Ok(keys) => RpcResponse::success(serde_json::json!(keys)),
                     Err(e) => RpcResponse::error(e.to_string()),
@@ -890,7 +881,7 @@ fn dispatch(
             };
 
             match state.require_active_peer() {
-                Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
+                Ok(peer_id) => match service::open_existing_db_for_peer(db_path, &peer_id) {
                     Ok((recorded_by, db)) => {
                         let data = workspace::status(&db, &recorded_by);
                         with_runtime_state(data)
@@ -899,7 +890,6 @@ fn dispatch(
                 },
                 Err(no_active_err) => match crate::db::open_connection(db_path) {
                     Ok(db) => {
-                        let _ = crate::db::schema::create_tables(&db);
                         let tenant_count: i64 = db
                             .query_row(
                                 "SELECT COUNT(DISTINCT recorded_by) FROM invites_accepted",
@@ -1071,7 +1061,6 @@ fn dispatch(
         }
         RpcMethod::Workspaces => match crate::db::open_connection(db_path) {
             Ok(db) => {
-                let _ = crate::db::schema::create_tables(&db);
                 match workspace::list_all_items(&db) {
                     Ok(data) => RpcResponse::success(data),
                     Err(e) => RpcResponse::error(e.to_string()),
@@ -1281,6 +1270,14 @@ fn dispatch(
             Err(e) => RpcResponse::error(e),
         },
 
+        RpcMethod::LiveSessions => match state.require_active_peer() {
+            Ok(peer_id) => RpcResponse::success(crate::runtime::peering::loops::live_session_peer_ids(
+                db_path,
+                &peer_id,
+            )),
+            Err(e) => RpcResponse::error(e),
+        },
+
         RpcMethod::EventBlocked => match state.require_active_peer() {
             Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {
                 Ok((recorded_by, db)) => {
@@ -1420,9 +1417,6 @@ fn dispatch(
                 Ok(db) => db,
                 Err(e) => return RpcResponse::error(e.to_string()),
             };
-            if let Err(e) = crate::db::schema::create_tables(&db) {
-                return RpcResponse::error(e.to_string());
-            }
 
             let rt = match tokio::runtime::Builder::new_current_thread()
                 .enable_all()
@@ -1485,9 +1479,6 @@ fn dispatch(
 
         RpcMethod::EventList => match crate::db::open_connection(db_path) {
             Ok(db) => {
-                if let Err(e) = crate::db::schema::create_tables(&db) {
-                    return RpcResponse::error(e.to_string());
-                }
                 let scopes = match discover_tenant_scopes(&db) {
                     Ok(s) => s,
                     Err(e) => return RpcResponse::error(e.to_string()),

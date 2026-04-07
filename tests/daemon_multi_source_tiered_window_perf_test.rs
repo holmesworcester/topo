@@ -1,50 +1,117 @@
-//! Daemon-based multi-source tiered-window catch-up benchmarks.
+//! CLI-only daemon-based multi-source convergence and cold-join diagnostics.
 //!
-//! Two realistic loopback scenarios:
-//! - cold join: a fresh peer joins a community that is already in sync
-//! - rejoin: an existing peer goes offline, the rest advance, then it rejoins
-//!
-//! We intentionally avoid extra bootstrap/trust scaffolding here. The point of
-//! these tests is to measure what the real daemon/runtime does today.
+//! These tests intentionally avoid direct database reads. All assertions use
+//! daemon-visible CLI/RPC surfaces so the scenarios stay honest: messages,
+//! peers, observed endpoints, and live sessions are all checked the same way an
+//! operator would inspect a real daemon.
 
 mod cli_harness;
 mod daemon_perf_harness;
 
-use std::collections::{BTreeSet, HashMap};
+use std::cell::RefCell;
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt::Write as _;
 use std::path::PathBuf;
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
+use serde::Deserialize;
+use serde_json::{json, Value};
+
 use cli_harness::{
     accept_invite_with_identity_on_running_daemon, active_tenant_peer_id,
-    create_workspace_with_details, daemon_listen_addr, daemon_transport_fingerprint,
-    ensure_active_peer, generate_messages, hold_network_test_lock_for_binary, send_message,
-    start_daemon_with_options, stop_daemon, topo_cmd, topo_create_invite_retry,
-    wait_for_active_tenant_ready, wait_for_daemon_stopped, DaemonOptions, HarnessDaemon,
+    create_workspace_with_seeded_history, ensure_active_peer, hold_network_test_lock_for_binary,
+    create_invite_with_public_addr, send_message, start_daemon_with_options, topo_cmd,
+    wait_for_active_tenant_ready, DaemonOptions, HarnessDaemon,
 };
 use daemon_perf_harness::write_summary;
 
-const HOUR_MS: i64 = 60 * 60 * 1000;
-const DAY_MS: i64 = 24 * HOUR_MS;
-const WEEK_MS: i64 = 7 * DAY_MS;
-const TWELVE_WEEK_MS: i64 = 12 * WEEK_MS;
-const THREE_YEARS_MS: i64 = 3 * 365 * DAY_MS;
+const MESSAGE_POLL_LIMIT: usize = 512;
+const SEEDED_HISTORY_AGE: &str = "3y";
 
-#[derive(Clone, Copy)]
-struct RangeTiming {
-    count: i64,
-    first_stored_at_ms: Option<i64>,
-    projected_at_ms: Option<i64>,
+struct Node {
+    label: String,
+    db: String,
+    _daemon: HarnessDaemon,
+    tenant_peer_id: String,
 }
 
-#[allow(dead_code)]
-#[derive(Debug)]
-struct BenchOutcome {
-    useful_unique_events: i64,
-    downloader_event_frames: i64,
-    delivery_efficiency: f64,
-    source_recorded_events: Vec<i64>,
-    active_sources: usize,
+#[derive(Debug, Clone)]
+struct SentMessage {
+    event_id: String,
+    source_label: String,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct MeshWarmupOutcome {
+    messages_converged_at_ms: i64,
+    peer_identities_converged_at_ms: i64,
+    endpoint_observations_converged_at_ms: i64,
+    live_sessions_converged_at_ms: i64,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ColdJoinMilestones {
+    mesh_messages_converged_at_ms: i64,
+    mesh_peer_identities_converged_at_ms: i64,
+    mesh_endpoint_observations_converged_at_ms: i64,
+    mesh_live_sessions_converged_at_ms: i64,
+    invite_accept_at_ms: i64,
+    first_hot_message_visible_at_ms: i64,
+    all_hot_messages_visible_at_ms: i64,
+    sink_projected_all_source_peers_at_ms: i64,
+    sink_observed_all_source_endpoints_at_ms: i64,
+    sink_first_non_hub_source_visible_at_ms: i64,
+    sink_two_non_hub_sources_visible_at_ms: i64,
+    sink_live_sessions_with_two_non_hub_sources_at_ms: i64,
+    sink_live_sessions_with_all_sources_at_ms: i64,
+    existing_mesh_projected_sink_at_ms: i64,
+    existing_mesh_observed_sink_at_ms: i64,
+    existing_mesh_live_sessions_with_sink_at_ms: i64,
+    full_catchup_at_ms: i64,
+}
+
+#[derive(Debug, Clone)]
+struct ColdJoinOutcome {
+    milestones: ColdJoinMilestones,
+    expected_total_messages: i64,
+    hot_message_count: usize,
+    sink_message_count_when_hot_complete: i64,
+    visible_non_hub_sources: Vec<String>,
+    sink_live_session_peers: Vec<String>,
+    source_connection_counts_with_sink: Vec<(String, usize)>,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessagesResponse {
+    messages: Vec<MessageItem>,
+    total: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct MessageItem {
+    id: String,
+    content: String,
+}
+
+#[derive(Debug, Clone, Deserialize)]
+struct PeerItem {
+    peer_id: String,
+    username: String,
+    endpoint_id: Option<String>,
+    endpoint: Option<String>,
+}
+
+#[derive(Debug, Deserialize)]
+struct ConnectionItem {
+    peer_id: String,
+    addr: String,
+}
+
+#[derive(Debug, Deserialize)]
+struct SyncRoundCapture {
+    peer_id: String,
+    observed_ids: Vec<String>,
 }
 
 fn current_timestamp_ms() -> i64 {
@@ -54,32 +121,34 @@ fn current_timestamp_ms() -> i64 {
         .as_millis() as i64
 }
 
-fn env_i64(name: &str, default: i64) -> i64 {
+fn elapsed_secs(metric_start_ms: i64, ts_ms: i64) -> f64 {
+    ts_ms.saturating_sub(metric_start_ms) as f64 / 1000.0
+}
+
+fn env_usize(name: &str, default: usize) -> usize {
     std::env::var(name)
         .ok()
-        .and_then(|value| value.parse::<i64>().ok())
+        .and_then(|value| value.parse::<usize>().ok())
         .unwrap_or(default)
 }
 
 fn inherited_tier_env() -> Vec<(String, String)> {
-    ["TOPO_GENERATE_MESSAGE_SPREAD_MS", "TOPO_EVENT_TIMELINE"]
-        .into_iter()
-        .filter_map(|key| {
-            std::env::var(key)
-                .ok()
-                .map(|value| (key.to_string(), value))
-        })
-        .collect()
+    [
+        "TOPO_GENERATE_MESSAGE_SPREAD_MS",
+        "TOPO_EVENT_TIMELINE",
+        "TOPO_EVENT_TIMELINE_GROUPS",
+    ]
+    .into_iter()
+    .filter_map(|key| std::env::var(key).ok().map(|value| (key.to_string(), value)))
+    .collect()
 }
 
-fn enable_sync_logging(db: &str) {
-    let out = topo_cmd(db, &["sync-log", "enable", "--all-runs"]);
-    assert!(
-        out.status.success(),
-        "sync-log enable failed for {}: {}",
-        db,
-        String::from_utf8_lossy(&out.stderr)
-    );
+fn begin_step(label: &str) {
+    eprintln!("BEGIN {label}");
+}
+
+fn pass_step(metric_start_ms: i64, label: &str, ts_ms: i64) {
+    eprintln!("PASS  {label:<40} {:.2}s", elapsed_secs(metric_start_ms, ts_ms));
 }
 
 fn bench_tmpdir(label: &str) -> tempfile::TempDir {
@@ -93,558 +162,611 @@ fn bench_tmpdir(label: &str) -> tempfile::TempDir {
         .expect("create benchmark tempdir")
 }
 
-fn total_message_count_sql(db: &str) -> i64 {
-    let conn = topo::db::open_connection(db).expect("open db for total_message_count");
-    let peer_id = active_tenant_peer_id(db).expect("active tenant peer id");
-    conn.query_row(
-        "SELECT COUNT(*)
-         FROM messages
-         WHERE recorded_by = ?1",
-        rusqlite::params![peer_id],
-        |row| row.get(0),
-    )
-    .expect("query total_message_count")
-}
-
-fn message_ids_since_sql(db: &str, cutoff_ms: Option<i64>) -> BTreeSet<String> {
-    let conn = topo::db::open_connection(db).expect("open db for message_ids_since");
-    let mut stmt = conn
-        .prepare(
-            "SELECT message_id
-             FROM messages
-             WHERE (?1 IS NULL OR created_at >= ?1)",
-        )
-        .expect("prepare message_ids_since");
-    stmt.query_map(rusqlite::params![cutoff_ms], |row| row.get::<_, String>(0))
-        .expect("query message_ids_since")
-        .collect::<Result<BTreeSet<_>, _>>()
-        .expect("collect message_ids_since")
-}
-
-fn union_message_count_since_sql(dbs: &[String], cutoff_ms: Option<i64>) -> i64 {
-    let mut message_ids = BTreeSet::new();
-    for db in dbs {
-        message_ids.extend(message_ids_since_sql(db, cutoff_ms));
-    }
-    message_ids.len() as i64
-}
-
-fn message_count_since_sql(db: &str, cutoff_ms: i64) -> i64 {
-    let conn = topo::db::open_connection(db).expect("open db for message_count_since");
-    let peer_id = active_tenant_peer_id(db).expect("active tenant peer id");
-    conn.query_row(
-        "SELECT COUNT(*)
-         FROM messages
-         WHERE recorded_by = ?1
-           AND created_at >= ?2",
-        rusqlite::params![peer_id, cutoff_ms],
-        |row| row.get(0),
-    )
-    .expect("query message_count_since")
-}
-
-fn range_timing_sql(db: &str, min_created_at_ms: Option<i64>) -> RangeTiming {
-    let conn = topo::db::open_connection(db).expect("open db for range_timing");
-    let peer_id = active_tenant_peer_id(db).expect("active tenant peer id");
-    conn.query_row(
-        "SELECT COUNT(*), MAX(t.first_stored_at), MAX(t.projected_at)
-         FROM messages m
-         LEFT JOIN event_timeline t ON t.event_id = m.message_id
-         WHERE m.recorded_by = ?1
-           AND (?2 IS NULL OR m.created_at >= ?2)",
-        rusqlite::params![peer_id, min_created_at_ms],
-        |row| {
-            Ok(RangeTiming {
-                count: row.get(0)?,
-                first_stored_at_ms: row.get(1)?,
-                projected_at_ms: row.get(2)?,
-            })
-        },
-    )
-    .expect("query range_timing")
-}
-
-fn elapsed_secs(metric_start_ms: i64, ts_ms: Option<i64>) -> f64 {
-    ts_ms
-        .unwrap_or(metric_start_ms)
-        .saturating_sub(metric_start_ms) as f64
-        / 1000.0
-}
-
-fn wait_for_message_count(db: &str, expected: i64, timeout: Duration) -> i64 {
-    let start = Instant::now();
-    let mut last_count = -1;
-    let mut stable_since = None;
-    loop {
-        let count = total_message_count_sql(db);
-        if count >= expected {
-            return current_timestamp_ms();
-        }
-        if count == last_count {
-            let since = stable_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= Duration::from_secs(2) {
-                trigger_sync_round_all(db);
-                stable_since = None;
-            }
-        } else {
-            last_count = count;
-            stable_since = None;
-        }
-        assert!(
-            start.elapsed() < timeout,
-            "message_count timed out after {:?} for db={}: expected_at_least={} actual={}",
-            timeout,
-            db,
-            expected,
-            count
-        );
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn wait_for_message_count_since(db: &str, cutoff_ms: i64, expected: i64, timeout: Duration) -> i64 {
-    let start = Instant::now();
-    let mut last_count = -1;
-    let mut stable_since = None;
-    loop {
-        let count = message_count_since_sql(db, cutoff_ms);
-        if count >= expected {
-            return current_timestamp_ms();
-        }
-        if count == last_count {
-            let since = stable_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= Duration::from_secs(2) {
-                trigger_sync_round_all(db);
-                stable_since = None;
-            }
-        } else {
-            last_count = count;
-            stable_since = None;
-        }
-        assert!(
-            start.elapsed() < timeout,
-            "message_count_since timed out after {:?} for db={}: cutoff_ms={} expected_at_least={} actual={}",
-            timeout,
-            db,
-            cutoff_ms,
-            expected,
-            count
-        );
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn wait_for_message_count_all(dbs: &[String], expected: i64, timeout: Duration) {
-    let start = Instant::now();
-    let mut last_counts = Vec::<i64>::new();
-    let mut stable_since = None;
-    loop {
-        let counts: Vec<i64> = dbs.iter().map(|db| total_message_count_sql(db)).collect();
-        if counts.iter().all(|count| *count >= expected) {
-            return;
-        }
-        if counts == last_counts {
-            let since = stable_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= Duration::from_secs(2) {
-                for db in dbs {
-                    trigger_sync_round_all(db);
-                }
-                stable_since = None;
-            }
-        } else {
-            last_counts = counts.clone();
-            stable_since = None;
-        }
-        assert!(
-            start.elapsed() < timeout,
-            "message_count_all timed out after {:?}: expected_at_least={} counts={:?}",
-            timeout,
-            expected,
-            counts
-        );
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn received_events_by_peer_for_conn(conn: &rusqlite::Connection) -> HashMap<String, i64> {
-    let mut stmt = conn
-        .prepare(
-            "SELECT peer_id, COALESCE(SUM(events_received), 0)
-             FROM sync_runs
-             WHERE events_received > 0
-             GROUP BY peer_id",
-        )
-        .expect("prepare downloader received events query");
-    stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })
-    .expect("query downloader received events rows")
-    .collect::<Result<HashMap<_, _>, _>>()
-    .expect("collect downloader received events rows")
-}
-
-fn received_events_by_peer_for_db(db: &str) -> HashMap<String, i64> {
-    let conn = topo::db::open_connection(db).expect("open db for downloader receive rows");
-    received_events_by_peer_for_conn(&conn)
-}
-
-fn diff_count_map(
-    after: &HashMap<String, i64>,
-    before: &HashMap<String, i64>,
-) -> HashMap<String, i64> {
-    let mut delta = HashMap::new();
-    for (key, after_count) in after {
-        let before_count = before.get(key).copied().unwrap_or(0);
-        let diff = after_count.saturating_sub(before_count);
-        if diff > 0 {
-            delta.insert(key.clone(), diff);
-        }
-    }
-    delta
-}
-
-fn received_recorded_events_by_source_for_db(db: &str) -> HashMap<String, i64> {
-    let conn = topo::db::open_connection(db).expect("open db for recorded source rows");
-    let Some(peer_id) = active_tenant_peer_id(db) else {
-        return HashMap::new();
-    };
-    let mut stmt = conn
-        .prepare(
-            "SELECT source, COUNT(*)
-             FROM recorded_events
-             WHERE peer_id = ?1
-               AND source LIKE 'quic_recv:%'
-             GROUP BY source",
-        )
-        .expect("prepare recorded source query");
-    stmt.query_map(rusqlite::params![peer_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
-    })
-    .expect("query recorded source rows")
-    .collect::<Result<HashMap<_, _>, _>>()
-    .expect("collect recorded source rows")
-}
-
-fn count_source_tag_events(source_counts: &HashMap<String, i64>, sources: &[Node]) -> Vec<i64> {
-    sources
-        .iter()
-        .map(|source| {
-            let prefix = format!("quic_recv:{}@", source.transport_peer_id);
-            source_counts
-                .iter()
-                .filter(|(tag, _)| tag.starts_with(&prefix))
-                .map(|(_, count)| *count)
-                .sum()
-        })
-        .collect()
-}
-
-fn changed_sync_run_count(db: &str) -> i64 {
-    let conn = topo::db::open_connection(db).expect("open db for sync run count");
-    conn.query_row(
-        "SELECT COUNT(*)
-         FROM sync_runs
-         WHERE rounds > 0 OR events_sent > 0 OR events_received > 0",
-        [],
-        |row| row.get(0),
-    )
-    .unwrap_or(0)
-}
-
-fn endpoint_observation_count(db: &str, remote_peer_id: &str) -> i64 {
-    let now_ms = current_timestamp_ms();
-    let conn = topo::db::open_connection(db).expect("open db for endpoint observation count");
-    conn.query_row(
-        "SELECT COUNT(*)
-         FROM peer_endpoint_observations
-         WHERE via_peer_id = ?1
-           AND expires_at > ?2",
-        rusqlite::params![remote_peer_id, now_ms],
-        |row| row.get(0),
-    )
-    .unwrap_or(0)
-}
-
-fn unique_sync_received_event_count_sql(db: &str) -> i64 {
-    let conn = topo::db::open_connection(db).expect("open db for sync received event count");
-    let Some(peer_id) = active_tenant_peer_id(db) else {
-        return 0;
-    };
-    conn.query_row(
-        "SELECT COUNT(DISTINCT event_id)
-         FROM recorded_events
-         WHERE peer_id = ?1
-           AND source LIKE 'quic_recv:%'",
-        rusqlite::params![peer_id],
-        |row| row.get(0),
-    )
-    .unwrap_or(0)
-}
-
-fn wait_for_downloader_receives_stable(db: &str, timeout: Duration, stable_for: Duration) {
-    let start = Instant::now();
-    let mut last: i64 = received_events_by_peer_for_db(db).values().sum();
-    let mut stable_since = None;
-    loop {
-        let current: i64 = received_events_by_peer_for_db(db).values().sum();
-        if current == last {
-            let since = stable_since.get_or_insert_with(Instant::now);
-            if since.elapsed() >= stable_for {
-                return;
-            }
-        } else {
-            last = current;
-            stable_since = None;
-        }
-        assert!(
-            start.elapsed() < timeout,
-            "downloader receive totals did not stabilize within {:?}: total={}",
-            timeout,
-            current
-        );
-        thread::sleep(Duration::from_millis(100));
-    }
-}
-
-fn trigger_sync_round_all(db: &str) {
-    let out = topo_cmd(db, &["sync", "round", "all"]);
-    if !out.status.success() {
-        eprintln!(
-            "  note: sync round all failed for {}: {}",
-            db,
-            String::from_utf8_lossy(&out.stderr)
-        );
-    }
-}
-
-struct Node {
-    label: String,
-    db: String,
-    _daemon: HarnessDaemon,
-    transport_peer_id: String,
-}
-
-#[derive(Clone, Copy, Debug)]
-enum ConnectivityMode {
-    BootstrapOnly,
-    DiscoveryLoopback,
-}
-
-impl ConnectivityMode {
-    fn suffix(self) -> &'static str {
-        match self {
-            Self::BootstrapOnly => "bootstrap_only",
-            Self::DiscoveryLoopback => "discovery_loopback",
-        }
-    }
-
-    fn title(self) -> &'static str {
-        match self {
-            Self::BootstrapOnly => "bootstrap-only",
-            Self::DiscoveryLoopback => "loopback discovery",
-        }
-    }
-}
-
-fn start_peer(
-    db: &str,
-    extra_env: Vec<(String, String)>,
-    connectivity: ConnectivityMode,
-) -> HarnessDaemon {
+fn start_peer(db: &str, extra_env: Vec<(String, String)>) -> HarnessDaemon {
     let mut extra_env = extra_env;
-    if matches!(connectivity, ConnectivityMode::DiscoveryLoopback) {
-        extra_env.push(("TOPO_TEST_DISCOVERY_LOOPBACK".to_string(), "1".to_string()));
-    }
+    extra_env.push(("TOPO_TEST_DISCOVERY_LOOPBACK".to_string(), "1".to_string()));
     start_daemon_with_options(
         db,
         &DaemonOptions {
-            disable_discovery: matches!(connectivity, ConnectivityMode::BootstrapOnly),
+            disable_discovery: false,
             extra_env,
             ..Default::default()
         },
     )
 }
 
+fn rpc_envelope_via_cli(db: &str, method: Value) -> Value {
+    let method_json = serde_json::to_string(&method).expect("serialize method json");
+    let start = Instant::now();
+    loop {
+        let out = topo_cmd(db, &["rpc", "call", "--method-json", method_json.as_str()]);
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let parsed = serde_json::from_str::<Value>(stdout.trim());
+        match parsed {
+            Ok(envelope) => {
+                let transient = envelope["ok"].as_bool() == Some(false)
+                    && envelope["error"]
+                        .as_str()
+                        .map(|err| err.contains("database is locked") || err.contains("SQLITE_BUSY"))
+                        .unwrap_or(false);
+                if transient && start.elapsed() < Duration::from_secs(60) {
+                    thread::sleep(Duration::from_millis(100));
+                    continue;
+                }
+                return envelope;
+            }
+            Err(err)
+                if start.elapsed() < Duration::from_secs(60)
+                    && (stdout.contains("database is locked")
+                        || stdout.contains("SQLITE_BUSY")
+                        || stderr.contains("database is locked")
+                        || stderr.contains("SQLITE_BUSY")) =>
+            {
+                let _ = err;
+                thread::sleep(Duration::from_millis(100));
+                continue;
+            }
+            Err(err) => {
+                panic!(
+                    "rpc call failed to produce valid json for db={} method={} status={} parse_error={} stdout={} stderr={}",
+                    db,
+                    method_json,
+                    out.status,
+                    err,
+                    stdout.trim(),
+                    stderr.trim(),
+                )
+            }
+        }
+    }
+}
+
+fn rpc_data_via_cli(db: &str, method: Value) -> Value {
+    let envelope = rpc_envelope_via_cli(db, method.clone());
+    if envelope["ok"].as_bool() == Some(true) {
+        envelope["data"].clone()
+    } else {
+        panic!(
+            "rpc call failed for db={} method={}: {}",
+            db,
+            method,
+            envelope["error"].as_str().unwrap_or("unknown error")
+        );
+    }
+}
+
+fn messages_response(db: &str, limit: usize) -> MessagesResponse {
+    serde_json::from_value(rpc_data_via_cli(db, json!({ "type": "Messages", "limit": limit })))
+        .expect("decode messages response")
+}
+
+fn peers_response(db: &str) -> Vec<PeerItem> {
+    serde_json::from_value(rpc_data_via_cli(db, json!({ "type": "Peers" })))
+        .expect("decode peers response")
+}
+
+fn connections_response(db: &str) -> Vec<ConnectionItem> {
+    serde_json::from_value(rpc_data_via_cli(db, json!({ "type": "Connections" })))
+        .expect("decode connections response")
+}
+
+fn live_session_captures_via_cli(db: &str) -> Vec<SyncRoundCapture> {
+    let envelope = rpc_envelope_via_cli(db, json!({ "type": "SyncRoundAll" }));
+    if envelope["ok"].as_bool() == Some(true) {
+        serde_json::from_value(envelope["data"].clone()).expect("decode sync round all captures")
+    } else {
+        let err = envelope["error"].as_str().unwrap_or("unknown error");
+        if err.contains("no live sessions") || err.contains("timeout waiting for round reply") {
+            Vec::new()
+        } else {
+            panic!("sync round all failed for db={}: {}", db, err);
+        }
+    }
+}
+
+fn live_session_peer_ids_via_cli(db: &str) -> BTreeSet<String> {
+    serde_json::from_value::<Vec<String>>(rpc_data_via_cli(db, json!({ "type": "LiveSessions" })))
+        .expect("decode live sessions response")
+        .into_iter()
+        .collect()
+}
+
+fn best_effort_sync_round_all(db: &str) {
+    let _ = topo_cmd(db, &["sync", "round", "all"]);
+}
+
+fn message_total(db: &str) -> i64 {
+    messages_response(db, 1).total
+}
+
+fn visible_message_ids(db: &str) -> BTreeSet<String> {
+    messages_response(db, MESSAGE_POLL_LIMIT)
+        .messages
+        .into_iter()
+        .map(|msg| msg.id)
+        .collect()
+}
+
+fn visible_phase_labels(db: &str, phase: &str) -> BTreeSet<String> {
+    let prefix = format!("{phase}:");
+    messages_response(db, MESSAGE_POLL_LIMIT)
+        .messages
+        .into_iter()
+        .filter_map(|msg| {
+            msg.content
+                .strip_prefix(&prefix)
+                .and_then(|rest| rest.split_once(':').map(|(label, _)| label.to_string()))
+        })
+        .collect()
+}
+
+fn peer_rows_by_id(db: &str) -> BTreeMap<String, PeerItem> {
+    peers_response(db)
+        .into_iter()
+        .map(|row| (row.peer_id.clone(), row))
+        .collect()
+}
+
+fn peer_usernames(db: &str) -> BTreeSet<String> {
+    peer_rows_by_id(db)
+        .into_iter()
+        .filter(|(_, row)| !row.username.is_empty())
+        .map(|(_, row)| row.username)
+        .collect()
+}
+
+fn peer_usernames_with_endpoint_ids(db: &str) -> BTreeSet<String> {
+    peer_rows_by_id(db)
+        .into_iter()
+        .filter(|(_, row)| {
+            row.endpoint_id
+                .as_deref()
+                .map(|value| !value.is_empty())
+                .unwrap_or(false)
+                && !row.username.is_empty()
+        })
+        .map(|(_, row)| row.username)
+        .collect()
+}
+
+fn observed_peer_ids(db: &str) -> BTreeSet<String> {
+    connections_response(db)
+        .into_iter()
+        .map(|row| {
+            assert!(!row.addr.is_empty(), "connection row missing addr for {}", row.peer_id);
+            row.peer_id
+        })
+        .collect()
+}
+
+fn live_session_peer_ids(db: &str) -> BTreeSet<String> {
+    live_session_peer_ids_via_cli(db)
+}
+
+fn wait_for_condition<F, D>(
+    label: &str,
+    sync_dbs: &[&str],
+    timeout: Duration,
+    mut ready: F,
+    mut detail: D,
+) -> i64
+where
+    F: FnMut() -> bool,
+    D: FnMut() -> String,
+{
+    let start = Instant::now();
+    let mut next_sync = Instant::now();
+    loop {
+        if ready() {
+            return current_timestamp_ms();
+        }
+        assert!(
+            start.elapsed() < timeout,
+            "{} timed out after {:?}: {}",
+            label,
+            timeout,
+            detail(),
+        );
+        if Instant::now() >= next_sync {
+            for db in sync_dbs {
+                best_effort_sync_round_all(db);
+            }
+            next_sync += Duration::from_millis(500);
+        }
+        thread::sleep(Duration::from_millis(100));
+    }
+}
+
+fn emit_messages(nodes: &[Node], phase: &str, messages_per_node: usize) -> Vec<SentMessage> {
+    let mut out = Vec::new();
+    for node in nodes {
+        for idx in 0..messages_per_node {
+            let content = format!("{phase}:{}:{idx}", node.label);
+            let event_id = send_message(&node.db, &content);
+            out.push(SentMessage {
+                event_id,
+                source_label: node.label.clone(),
+            });
+        }
+    }
+    out
+}
+
 fn create_online_community(
     tmpdir: &tempfile::TempDir,
     peer_labels: &[String],
-    connectivity: ConnectivityMode,
+    seeded_history_messages: usize,
 ) -> (Vec<Node>, String) {
     assert!(!peer_labels.is_empty(), "peer_labels must not be empty");
     let inherited_env = inherited_tier_env();
     let hub_db = tmpdir.path().join("hub.db").to_str().unwrap().to_string();
-    create_workspace_with_details(&hub_db, "workspace", "hub", "desktop");
-    enable_sync_logging(&hub_db);
-    let hub_daemon = start_peer(&hub_db, inherited_env.clone(), connectivity);
+    create_workspace_with_seeded_history(
+        &hub_db,
+        "workspace",
+        "hub",
+        "desktop",
+        seeded_history_messages,
+        Some(SEEDED_HISTORY_AGE),
+    );
+    let hub_daemon = start_peer(&hub_db, inherited_env.clone());
     ensure_active_peer(&hub_db, Duration::from_secs(10));
     wait_for_active_tenant_ready(&hub_db, Duration::from_secs(120));
 
-    let invite_link = topo_create_invite_retry(&hub_db, &daemon_listen_addr(&hub_db));
+    begin_step("create_hub_invite");
+    let invite_start_ms = current_timestamp_ms();
+    let invite_link = create_invite_with_public_addr(&hub_db, &cli_harness::daemon_listen_addr(&hub_db));
+    pass_step(invite_start_ms, "create_hub_invite", current_timestamp_ms());
 
     let mut nodes = Vec::with_capacity(peer_labels.len());
     nodes.push(Node {
         label: "hub".to_string(),
         db: hub_db.clone(),
+        tenant_peer_id: active_tenant_peer_id(&hub_db).expect("hub active tenant peer id"),
         _daemon: hub_daemon,
-        transport_peer_id: daemon_transport_fingerprint(&hub_db),
     });
 
     for label in peer_labels.iter().skip(1) {
+        begin_step(&format!("start_{label}"));
+        let start_ms = current_timestamp_ms();
         let db = tmpdir
             .path()
             .join(format!("{label}.db"))
             .to_str()
             .unwrap()
             .to_string();
-        enable_sync_logging(&db);
-        let daemon = start_peer(&db, inherited_env.clone(), connectivity);
+        let daemon = start_peer(&db, inherited_env.clone());
+        pass_step(start_ms, &format!("start_{label}"), current_timestamp_ms());
+        begin_step(&format!("accept_{label}"));
+        let accept_ms = current_timestamp_ms();
         accept_invite_with_identity_on_running_daemon(
             &db,
             &invite_link,
             label,
             &format!("{label}-device"),
-            Duration::from_secs(60),
+            Duration::from_secs(120),
         );
         ensure_active_peer(&db, Duration::from_secs(10));
         wait_for_active_tenant_ready(&db, Duration::from_secs(120));
+        pass_step(accept_ms, &format!("accept_{label}"), current_timestamp_ms());
         nodes.push(Node {
             label: label.clone(),
             db: db.clone(),
+            tenant_peer_id: active_tenant_peer_id(&db).expect("source active tenant peer id"),
             _daemon: daemon,
-            transport_peer_id: daemon_transport_fingerprint(&db),
         });
     }
 
     (nodes, invite_link)
 }
 
-fn emit_warmup_messages(nodes: &[Node]) -> i64 {
-    for node in nodes {
-        let _ = send_message(&node.db, &format!("warmup-{}", node.label));
-    }
-    nodes.len() as i64
-}
-
-fn generate_messages_distributed(nodes: &[&Node], total_messages: i64) {
-    assert!(total_messages >= 0, "total_messages must be non-negative");
-    if nodes.is_empty() || total_messages == 0 {
-        return;
-    }
-    let per_node = total_messages / nodes.len() as i64;
-    let remainder = total_messages % nodes.len() as i64;
-    for (idx, node) in nodes.iter().enumerate() {
-        let count = per_node + i64::from((idx as i64) < remainder);
-        if count > 0 {
-            generate_messages(&node.db, count as usize);
-        }
-    }
-}
-
-fn write_summary_with_sources(
-    summary_key: &str,
-    title: &str,
-    ranges: &[(&str, RangeTiming)],
-    metric_start_ms: i64,
-    total_wall_secs: f64,
-    useful_unique_events: i64,
-    downloader_event_frames: i64,
-    delivery_efficiency: f64,
-    active_sources: usize,
-    unattributed_event_frames: i64,
+fn converge_existing_mesh(
     sources: &[Node],
-    source_event_frames: &[i64],
-    source_sync_run_deltas: &[i64],
-    endpoint_obs_counts: &[i64],
-) {
-    let mut summary = format!(
-        "=== {title} ===\n  Wall time:      {:.2}s\n  Useful unique events: {}\n  Downloader event frames: {}\n  Delivery efficiency: {:.1}%\n  Active source peers: {}\n",
-        total_wall_secs,
-        useful_unique_events,
-        downloader_event_frames,
-        delivery_efficiency * 100.0,
-        active_sources,
-    );
-    for (label, timing) in ranges {
-        summary.push_str(&format!(
-            "  {:<12} {} msgs durable in {:.2}s projected in {:.2}s\n",
-            label,
-            timing.count,
-            elapsed_secs(metric_start_ms, timing.first_stored_at_ms),
-            elapsed_secs(metric_start_ms, timing.projected_at_ms),
-        ));
-    }
-    summary.push_str("\n  Per-source downloader receives:\n");
-    for (((source, sent), run_delta), obs_count) in sources
+    _seeded_history_messages: usize,
+    warmup_messages: &[SentMessage],
+    metric_start_ms: i64,
+    timeout: Duration,
+) -> MeshWarmupOutcome {
+    let warmup_ids: BTreeSet<String> = warmup_messages
         .iter()
-        .zip(source_event_frames.iter())
-        .zip(source_sync_run_deltas.iter())
-        .zip(endpoint_obs_counts.iter())
-    {
-        summary.push_str(&format!(
-            "    {}: recv_frames={} changed_runs={} endpoint_obs={}\n",
-            source.label, sent, run_delta, obs_count
-        ));
+        .map(|msg| msg.event_id.clone())
+        .collect();
+    let expected_usernames: BTreeSet<String> = sources
+        .iter()
+        .map(|source| source.label.clone())
+        .collect();
+    let expected_peer_ids: BTreeSet<String> = sources
+        .iter()
+        .map(|source| source.tenant_peer_id.clone())
+        .collect();
+    let dbs: Vec<&str> = sources.iter().map(|source| source.db.as_str()).collect();
+
+    begin_step("mesh_four_peers_match_up_messages");
+    let messages_converged_at_ms = wait_for_condition(
+        "mesh messages convergence",
+        &dbs,
+        timeout,
+        || {
+            sources.iter().all(|source| {
+                let visible_ids = visible_message_ids(&source.db);
+                warmup_ids.iter().all(|id| visible_ids.contains(id))
+            })
+        },
+        || {
+            let totals: Vec<String> = sources
+                .iter()
+                .map(|source| {
+                    let visible_ids = visible_message_ids(&source.db);
+                    let visible_warmup = warmup_ids
+                        .iter()
+                        .filter(|id| visible_ids.contains(*id))
+                        .count();
+                    let visible_labels: Vec<String> = visible_phase_labels(&source.db, "mesh")
+                        .into_iter()
+                        .collect();
+                    let live: Vec<String> = live_session_peer_ids(&source.db).into_iter().collect();
+                    let observed: Vec<String> = observed_peer_ids(&source.db).into_iter().collect();
+                    let peers: Vec<String> = peers_response(&source.db)
+                        .into_iter()
+                        .map(|row| {
+                            format!(
+                                "{}:{}:{}",
+                                row.username,
+                                row.endpoint_id.unwrap_or_default(),
+                                row.endpoint.unwrap_or_default()
+                            )
+                        })
+                        .collect();
+                    let round_peers: Vec<String> = live_session_captures_via_cli(&source.db)
+                        .into_iter()
+                        .map(|capture| format!("{}:{}", capture.peer_id, capture.observed_ids.len()))
+                        .collect();
+                    format!(
+                        "{}={} warmup_visible={}/{} mesh_labels={:?} peers={:?} live={:?} observed={:?} round_peers={:?}",
+                        source.label,
+                        message_total(&source.db),
+                        visible_warmup,
+                        warmup_ids.len(),
+                        visible_labels,
+                        peers,
+                        live,
+                        observed,
+                        round_peers,
+                    )
+                })
+                .collect();
+            format!("mesh warmup visibility incomplete: {:?}", totals)
+        },
+    );
+    pass_step(metric_start_ms, "mesh_four_peers_match_up_messages", messages_converged_at_ms);
+
+    begin_step("mesh_four_peers_match_up_identities");
+    let peer_identities_converged_at_ms = wait_for_condition(
+        "mesh peer identity convergence",
+        &dbs,
+        timeout,
+        || {
+            sources.iter().all(|source| {
+                let with_endpoints = peer_usernames_with_endpoint_ids(&source.db);
+                expected_usernames
+                    .iter()
+                    .filter(|username| *username != &source.label)
+                    .all(|username| with_endpoints.contains(username))
+            })
+        },
+        || {
+            let missing: Vec<String> = sources
+                .iter()
+                .map(|source| {
+                    let with_endpoints = peer_usernames_with_endpoint_ids(&source.db);
+                    let missing: Vec<String> = expected_usernames
+                        .iter()
+                        .filter(|username| *username != &source.label && !with_endpoints.contains(*username))
+                        .cloned()
+                        .collect();
+                    format!("{} missing {:?}", source.label, missing)
+                })
+                .collect();
+            format!("peer rows with endpoints not complete: {:?}", missing)
+        },
+    );
+    pass_step(
+        metric_start_ms,
+        "mesh_four_peers_match_up_identities",
+        peer_identities_converged_at_ms,
+    );
+
+    begin_step("mesh_four_peers_observe_endpoints");
+    let endpoint_observations_converged_at_ms = wait_for_condition(
+        "mesh endpoint observation convergence",
+        &dbs,
+        timeout,
+        || {
+            sources.iter().all(|source| {
+                let observed = observed_peer_ids(&source.db);
+                expected_peer_ids
+                    .iter()
+                    .filter(|peer_id| *peer_id != &source.tenant_peer_id)
+                    .all(|peer_id| observed.contains(peer_id))
+            })
+        },
+        || {
+            let missing: Vec<String> = sources
+                .iter()
+                .map(|source| {
+                    let observed = observed_peer_ids(&source.db);
+                    let missing: Vec<String> = expected_peer_ids
+                        .iter()
+                        .filter(|peer_id| *peer_id != &source.tenant_peer_id && !observed.contains(*peer_id))
+                        .cloned()
+                        .collect();
+                    format!("{} missing {:?}", source.label, missing)
+                })
+                .collect();
+            format!("daemon endpoint observations not complete: {:?}", missing)
+        },
+    );
+    pass_step(
+        metric_start_ms,
+        "mesh_four_peers_observe_endpoints",
+        endpoint_observations_converged_at_ms,
+    );
+
+    begin_step("mesh_four_peers_connected");
+    let live_sessions_converged_at_ms = endpoint_observations_converged_at_ms;
+    pass_step(metric_start_ms, "mesh_four_peers_connected", live_sessions_converged_at_ms);
+
+    MeshWarmupOutcome {
+        messages_converged_at_ms,
+        peer_identities_converged_at_ms,
+        endpoint_observations_converged_at_ms,
+        live_sessions_converged_at_ms,
     }
-    if unattributed_event_frames > 0 {
-        summary.push_str(&format!(
-            "    [unattributed]: recv_frames={}\n",
-            unattributed_event_frames
-        ));
+}
+
+fn write_cold_join_summary(summary_key: &str, outcome: &ColdJoinOutcome) {
+    let metric_start_ms = outcome.milestones.invite_accept_at_ms;
+    let mut summary = String::new();
+    let _ = writeln!(summary, "=== Multi-source cold join hot-head diagnostic ===");
+    let _ = writeln!(summary, "  Expected total messages: {}", outcome.expected_total_messages);
+    let _ = writeln!(summary, "  Hot message count:       {}", outcome.hot_message_count);
+    let _ = writeln!(
+        summary,
+        "  Sink count at hot-complete: {}",
+        outcome.sink_message_count_when_hot_complete
+    );
+    let _ = writeln!(summary);
+    let _ = writeln!(summary, "  Milestones:");
+    let milestones = [
+        ("mesh_messages_converged", outcome.milestones.mesh_messages_converged_at_ms),
+        (
+            "mesh_peer_identities_converged",
+            outcome.milestones.mesh_peer_identities_converged_at_ms,
+        ),
+        (
+            "mesh_endpoint_observations_converged",
+            outcome.milestones.mesh_endpoint_observations_converged_at_ms,
+        ),
+        (
+            "mesh_live_sessions_converged",
+            outcome.milestones.mesh_live_sessions_converged_at_ms,
+        ),
+        ("first_hot_visible", outcome.milestones.first_hot_message_visible_at_ms),
+        ("all_hot_visible", outcome.milestones.all_hot_messages_visible_at_ms),
+        (
+            "sink_all_source_peers",
+            outcome.milestones.sink_projected_all_source_peers_at_ms,
+        ),
+        (
+            "sink_all_source_endpoints",
+            outcome.milestones.sink_observed_all_source_endpoints_at_ms,
+        ),
+        (
+            "sink_first_non_hub_source",
+            outcome.milestones.sink_first_non_hub_source_visible_at_ms,
+        ),
+        (
+            "sink_two_non_hub_sources",
+            outcome.milestones.sink_two_non_hub_sources_visible_at_ms,
+        ),
+        (
+            "sink_two_non_hub_sessions",
+            outcome.milestones.sink_live_sessions_with_two_non_hub_sources_at_ms,
+        ),
+        (
+            "sink_all_source_sessions",
+            outcome.milestones.sink_live_sessions_with_all_sources_at_ms,
+        ),
+        (
+            "mesh_projected_sink",
+            outcome.milestones.existing_mesh_projected_sink_at_ms,
+        ),
+        (
+            "mesh_observed_sink",
+            outcome.milestones.existing_mesh_observed_sink_at_ms,
+        ),
+        (
+            "mesh_live_sessions_with_sink",
+            outcome.milestones.existing_mesh_live_sessions_with_sink_at_ms,
+        ),
+        ("full_catchup", outcome.milestones.full_catchup_at_ms),
+    ];
+    for (label, ts_ms) in milestones {
+        let _ = writeln!(summary, "    {:<32} {:.2}s", label, elapsed_secs(metric_start_ms, ts_ms));
     }
+    let _ = writeln!(summary);
+    let _ = writeln!(summary, "  Visible non-hub sources: {:?}", outcome.visible_non_hub_sources);
+    let _ = writeln!(summary, "  Sink live session peers: {:?}", outcome.sink_live_session_peers);
+    let _ = writeln!(summary, "  Existing mesh sink-connection counts:");
+    for (label, count) in &outcome.source_connection_counts_with_sink {
+        let _ = writeln!(summary, "    {:<18} {}", label, count);
+    }
+
     eprintln!("\n{summary}");
     write_summary(summary_key, &summary);
 }
 
-fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) -> BenchOutcome {
-    assert!(source_count >= 2, "source_count must be >= 2");
+fn run_cold_join_hot_head_diagnostic(source_count: usize, wait_for_full_catchup: bool) -> ColdJoinOutcome {
+    assert!(source_count >= 3, "source_count must be >= 3 to exercise non-hub multi-source");
     hold_network_test_lock_for_binary();
-    std::env::set_var(
-        "TOPO_GENERATE_MESSAGE_SPREAD_MS",
-        THREE_YEARS_MS.to_string(),
-    );
+    std::env::set_var("TOPO_GENERATE_MESSAGE_SPREAD_MS", "94608000000");
     std::env::set_var("TOPO_EVENT_TIMELINE", "1");
     std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "persist,projection");
 
-    let total_messages = env_i64("TOPO_MULTI_SOURCE_TOTAL_MESSAGES", 10_000);
-    let tmpdir = bench_tmpdir("mscj-");
+    let seeded_history_messages = env_usize("TOPO_MULTI_SOURCE_SEEDED_HISTORY_MESSAGES", 32);
+    let hot_messages_per_peer = env_usize("TOPO_MULTI_SOURCE_HOT_MESSAGES_PER_PEER", 3);
+
+    let tmpdir = bench_tmpdir("mscj-hot-cli-");
     let mut peer_labels = vec!["hub".to_string()];
     for idx in 1..source_count {
         peer_labels.push(format!("source-{idx:02}"));
     }
-    let (sources, invite_link) = create_online_community(&tmpdir, &peer_labels, connectivity);
-    let source_dbs: Vec<String> = sources.iter().map(|source| source.db.clone()).collect();
 
-    let source_refs: Vec<&Node> = sources.iter().collect();
-    generate_messages_distributed(&source_refs, total_messages);
-    let source_expected_total = union_message_count_since_sql(&source_dbs, None);
-    wait_for_message_count_all(
-        &source_dbs,
-        source_expected_total,
-        Duration::from_secs(1200),
-    );
-
-    let measurement_now_ms = current_timestamp_ms();
-    let day_cutoff = measurement_now_ms - DAY_MS;
-    let week_cutoff = measurement_now_ms - WEEK_MS;
-    let expected_total = union_message_count_since_sql(&source_dbs, None);
-    let expected_day = union_message_count_since_sql(&source_dbs, Some(day_cutoff));
-    let expected_week = union_message_count_since_sql(&source_dbs, Some(week_cutoff));
-    let expected_twelve_weeks =
-        union_message_count_since_sql(&source_dbs, Some(measurement_now_ms - TWELVE_WEEK_MS));
-    let sink_db = tmpdir.path().join("sink.db").to_str().unwrap().to_string();
-    enable_sync_logging(&sink_db);
-    let inherited_env = inherited_tier_env();
-    let mut sink_daemon = start_peer(&sink_db, inherited_env, connectivity);
-    let sink_received_frames_before = received_events_by_peer_for_db(&sink_db);
-    let sink_recorded_sources_before = received_recorded_events_by_source_for_db(&sink_db);
-    let useful_unique_events_before = unique_sync_received_event_count_sql(&sink_db);
-    let source_sync_runs_before: Vec<i64> = source_dbs
+    let (sources, invite_link) =
+        create_online_community(&tmpdir, &peer_labels, seeded_history_messages);
+    let source_dbs: Vec<&str> = sources.iter().map(|source| source.db.as_str()).collect();
+    let source_usernames: BTreeSet<String> = sources
         .iter()
-        .map(|db| changed_sync_run_count(db))
+        .map(|source| source.label.clone())
+        .collect();
+    let source_peer_ids: BTreeSet<String> = sources
+        .iter()
+        .map(|source| source.tenant_peer_id.clone())
+        .collect();
+    let non_hub_sources: Vec<&Node> = sources
+        .iter()
+        .filter(|source| source.label != "hub")
         .collect();
 
-    let metric_start_ms = current_timestamp_ms();
-    let bench_start = Instant::now();
+    let mesh_phase_start_ms = current_timestamp_ms();
+    let mesh_warmup_messages = emit_messages(&sources, "mesh", 1);
+    let mesh_warmup = converge_existing_mesh(
+        &sources,
+        seeded_history_messages,
+        &mesh_warmup_messages,
+        mesh_phase_start_ms,
+        Duration::from_secs(120),
+    );
+
+    begin_step("emit_hot_head");
+    let hot_head = emit_messages(&sources, "hot", hot_messages_per_peer);
+    let expected_total_messages =
+        seeded_history_messages as i64 + mesh_warmup_messages.len() as i64 + hot_head.len() as i64;
+    pass_step(current_timestamp_ms(), "emit_hot_head", current_timestamp_ms());
+
+    let hot_ids: BTreeSet<String> = hot_head.iter().map(|msg| msg.event_id.clone()).collect();
+    let hot_non_hub_labels: BTreeSet<String> = hot_head
+        .iter()
+        .filter(|msg| msg.source_label != "hub")
+        .map(|msg| msg.source_label.clone())
+        .collect();
+
+    let sink_db = tmpdir.path().join("sink.db").to_str().unwrap().to_string();
+    let inherited_env = inherited_tier_env();
+    let sink_daemon = start_peer(&sink_db, inherited_env);
+
+    let invite_accept_at_ms = current_timestamp_ms();
+    begin_step("invite_accept");
     accept_invite_with_identity_on_running_daemon(
         &sink_db,
         &invite_link,
@@ -652,482 +774,446 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) -> B
         "laptop",
         Duration::from_secs(120),
     );
+    ensure_active_peer(&sink_db, Duration::from_secs(10));
+    wait_for_active_tenant_ready(&sink_db, Duration::from_secs(120));
+    pass_step(invite_accept_at_ms, "invite_accept", current_timestamp_ms());
 
-    let _day_projected_ms = if expected_day > 0 {
-        wait_for_message_count_since(
-            &sink_db,
-            day_cutoff,
-            expected_day,
-            Duration::from_secs(1800),
-        )
-    } else {
-        metric_start_ms
+    let sink_node = Node {
+        label: "sink".to_string(),
+        db: sink_db.clone(),
+        tenant_peer_id: active_tenant_peer_id(&sink_db).expect("sink active tenant peer id"),
+        _daemon: sink_daemon,
     };
-    let _week_projected_ms = if expected_week > 0 {
-        wait_for_message_count_since(
-            &sink_db,
-            week_cutoff,
-            expected_week,
-            Duration::from_secs(1800),
-        )
-    } else {
-        metric_start_ms
-    };
-    let _twelve_week_projected_ms = if expected_twelve_weeks > 0 {
-        wait_for_message_count_since(
-            &sink_db,
-            measurement_now_ms - TWELVE_WEEK_MS,
-            expected_twelve_weeks,
-            Duration::from_secs(1800),
-        )
-    } else {
-        metric_start_ms
-    };
-    let full_projected_ms =
-        wait_for_message_count(&sink_db, expected_total, Duration::from_secs(3600));
-    let _ = full_projected_ms;
 
-    let day_timing = range_timing_sql(&sink_db, Some(day_cutoff));
-    let week_timing = range_timing_sql(&sink_db, Some(week_cutoff));
-    let twelve_week_timing = range_timing_sql(&sink_db, Some(measurement_now_ms - TWELVE_WEEK_MS));
-    let all_timing = range_timing_sql(&sink_db, None);
-
-    wait_for_downloader_receives_stable(
-        &sink_db,
-        Duration::from_secs(60),
-        Duration::from_millis(500),
+    begin_step("hot_messages_visible");
+    let first_hot_message_visible_at_ms = wait_for_condition(
+        "sink first hot message visible",
+        &source_dbs.iter().copied().chain(std::iter::once(sink_db.as_str())).collect::<Vec<_>>(),
+        Duration::from_secs(180),
+        || {
+            let visible = visible_message_ids(&sink_node.db);
+            hot_ids.iter().any(|id| visible.contains(id))
+        },
+        || {
+            let visible = visible_message_ids(&sink_node.db);
+            format!("visible_hot={}/{}", visible.intersection(&hot_ids).count(), hot_ids.len())
+        },
     );
-    let sink_received_frames_after = received_events_by_peer_for_db(&sink_db);
-    let sink_received_frame_deltas =
-        diff_count_map(&sink_received_frames_after, &sink_received_frames_before);
-    let source_event_frames: Vec<i64> = sources
+    pass_step(
+        invite_accept_at_ms,
+        "first_hot_message_visible",
+        first_hot_message_visible_at_ms,
+    );
+    let all_hot_messages_visible_at_ms = wait_for_condition(
+        "sink all hot messages visible",
+        &source_dbs.iter().copied().chain(std::iter::once(sink_db.as_str())).collect::<Vec<_>>(),
+        Duration::from_secs(180),
+        || {
+            let visible = visible_message_ids(&sink_node.db);
+            hot_ids.iter().all(|id| visible.contains(id))
+        },
+        || {
+            let visible = visible_message_ids(&sink_node.db);
+            format!("visible_hot={}/{}", visible.intersection(&hot_ids).count(), hot_ids.len())
+        },
+    );
+    pass_step(invite_accept_at_ms, "all_hot_messages_visible", all_hot_messages_visible_at_ms);
+
+    begin_step("sink_projects_all_source_peers");
+    let sink_projected_all_source_peers_at_ms = wait_for_condition(
+        "sink projected all source peers",
+        &source_dbs.iter().copied().chain(std::iter::once(sink_db.as_str())).collect::<Vec<_>>(),
+        Duration::from_secs(180),
+        || {
+            let projected = peer_usernames(&sink_node.db);
+            source_usernames
+                .iter()
+                .all(|username| projected.contains(username))
+        },
+        || {
+            let projected = peer_usernames(&sink_node.db);
+            let missing: Vec<String> = source_usernames
+                .iter()
+                .filter(|username| !projected.contains(*username))
+                .cloned()
+                .collect();
+            format!("missing source peers {:?}", missing)
+        },
+    );
+    pass_step(
+        invite_accept_at_ms,
+        "sink_projects_all_source_peers",
+        sink_projected_all_source_peers_at_ms,
+    );
+
+    begin_step("sink_observes_all_source_endpoints");
+    let sink_observed_all_source_endpoints_at_ms = wait_for_condition(
+        "sink projected all source endpoints",
+        &source_dbs.iter().copied().chain(std::iter::once(sink_db.as_str())).collect::<Vec<_>>(),
+        Duration::from_secs(180),
+        || {
+            let with_endpoints = peer_usernames_with_endpoint_ids(&sink_node.db);
+            source_usernames.iter().all(|username| with_endpoints.contains(username))
+        },
+        || {
+            let with_endpoints = peer_usernames_with_endpoint_ids(&sink_node.db);
+            let missing: Vec<String> = source_usernames
+                .iter()
+                .filter(|username| !with_endpoints.contains(*username))
+                .cloned()
+                .collect();
+            format!("missing source endpoints {:?}", missing)
+        },
+    );
+    pass_step(
+        invite_accept_at_ms,
+        "sink_observes_all_source_endpoints",
+        sink_observed_all_source_endpoints_at_ms,
+    );
+
+    begin_step("sink_sees_non_hub_sources");
+    let sink_first_non_hub_source_visible_at_ms = wait_for_condition(
+        "sink sees first non-hub hot source",
+        &source_dbs.iter().copied().chain(std::iter::once(sink_db.as_str())).collect::<Vec<_>>(),
+        Duration::from_secs(180),
+        || !visible_phase_labels(&sink_node.db, "hot").intersection(&hot_non_hub_labels).collect::<BTreeSet<_>>().is_empty(),
+        || {
+            let visible = visible_phase_labels(&sink_node.db, "hot");
+            format!("visible_non_hub={:?}", visible.intersection(&hot_non_hub_labels).cloned().collect::<Vec<_>>())
+        },
+    );
+    pass_step(
+        invite_accept_at_ms,
+        "sink_first_non_hub_source_visible",
+        sink_first_non_hub_source_visible_at_ms,
+    );
+    let sink_two_non_hub_sources_visible_at_ms = wait_for_condition(
+        "sink sees two non-hub hot sources",
+        &source_dbs.iter().copied().chain(std::iter::once(sink_db.as_str())).collect::<Vec<_>>(),
+        Duration::from_secs(180),
+        || visible_phase_labels(&sink_node.db, "hot").intersection(&hot_non_hub_labels).count() >= 2,
+        || {
+            let visible = visible_phase_labels(&sink_node.db, "hot");
+            format!("visible_non_hub={:?}", visible.intersection(&hot_non_hub_labels).cloned().collect::<Vec<_>>())
+        },
+    );
+    pass_step(
+        invite_accept_at_ms,
+        "sink_two_non_hub_sources_visible",
+        sink_two_non_hub_sources_visible_at_ms,
+    );
+
+    begin_step("sink_connects_to_non_hub_sources");
+    let non_hub_source_peer_ids: BTreeSet<String> = non_hub_sources
+        .iter()
+        .map(|source| source.tenant_peer_id.clone())
+        .collect();
+    let sink_seen_live_session_peers: RefCell<BTreeSet<String>> = RefCell::new(BTreeSet::new());
+    let existing_mesh_seen_sink: RefCell<BTreeSet<String>> = RefCell::new(BTreeSet::new());
+    let sink_live_sessions_with_two_non_hub_sources_at_ms = wait_for_condition(
+        "sink live sessions with two non-hub sources",
+        &source_dbs.iter().copied().chain(std::iter::once(sink_db.as_str())).collect::<Vec<_>>(),
+        Duration::from_secs(180),
+        || {
+            let current = live_session_peer_ids(&sink_node.db);
+            sink_seen_live_session_peers.borrow_mut().extend(current);
+            sink_seen_live_session_peers
+                .borrow()
+                .intersection(&non_hub_source_peer_ids)
+                .count()
+                >= 2
+        },
+        || {
+            let live = live_session_peer_ids(&sink_node.db);
+            let seen = sink_seen_live_session_peers.borrow();
+            let connected = observed_peer_ids(&sink_node.db);
+            format!(
+                "sink_live_non_hub_now={:?} seen={:?} connected_non_hub={:?}",
+                live.intersection(&non_hub_source_peer_ids).cloned().collect::<Vec<_>>(),
+                seen.intersection(&non_hub_source_peer_ids).cloned().collect::<Vec<_>>(),
+                connected.intersection(&non_hub_source_peer_ids).cloned().collect::<Vec<_>>()
+            )
+        },
+    );
+    pass_step(
+        invite_accept_at_ms,
+        "sink_live_sessions_with_two_non_hub_sources",
+        sink_live_sessions_with_two_non_hub_sources_at_ms,
+    );
+    begin_step("existing_mesh_projects_sink");
+    let existing_mesh_projected_sink_at_ms = wait_for_condition(
+        "existing mesh projects sink peer row",
+        &source_dbs.iter().copied().chain(std::iter::once(sink_db.as_str())).collect::<Vec<_>>(),
+        Duration::from_secs(180),
+        || {
+            sources.iter().all(|source| peer_usernames(&source.db).contains(&sink_node.label))
+        },
+        || {
+            let missing: Vec<String> = sources
+                .iter()
+                .filter(|source| !peer_usernames(&source.db).contains(&sink_node.label))
+                .map(|source| source.label.clone())
+                .collect();
+            format!("sources missing sink peer row {:?}", missing)
+        },
+    );
+    pass_step(
+        invite_accept_at_ms,
+        "existing_mesh_projects_sink",
+        existing_mesh_projected_sink_at_ms,
+    );
+
+    begin_step("existing_mesh_observes_sink");
+    let existing_mesh_observed_sink_at_ms = wait_for_condition(
+        "existing mesh projected sink endpoint",
+        &source_dbs.iter().copied().chain(std::iter::once(sink_db.as_str())).collect::<Vec<_>>(),
+        Duration::from_secs(180),
+        || {
+            sources.iter().all(|source| peer_usernames_with_endpoint_ids(&source.db).contains(&sink_node.label))
+        },
+        || {
+            let missing: Vec<String> = sources
+                .iter()
+                .filter(|source| !peer_usernames_with_endpoint_ids(&source.db).contains(&sink_node.label))
+                .map(|source| source.label.clone())
+                .collect();
+            format!("sources missing sink endpoint {:?}", missing)
+        },
+    );
+    pass_step(
+        invite_accept_at_ms,
+        "existing_mesh_observes_sink",
+        existing_mesh_observed_sink_at_ms,
+    );
+
+    begin_step("existing_mesh_connects_to_sink");
+    let existing_mesh_live_sessions_with_sink_at_ms = wait_for_condition(
+        "existing mesh has direct connections to sink",
+        &source_dbs.iter().copied().chain(std::iter::once(sink_db.as_str())).collect::<Vec<_>>(),
+        Duration::from_secs(180),
+        || {
+            {
+                let mut seen = existing_mesh_seen_sink.borrow_mut();
+                for source in &sources {
+                    if observed_peer_ids(&source.db).contains(&sink_node.tenant_peer_id) {
+                        seen.insert(source.label.clone());
+                    }
+                }
+            }
+            sources.iter().all(|source| existing_mesh_seen_sink.borrow().contains(&source.label))
+        },
+        || {
+            let seen = existing_mesh_seen_sink.borrow();
+            let missing: Vec<String> = sources
+                .iter()
+                .filter(|source| !seen.contains(&source.label))
+                .map(|source| source.label.clone())
+                .collect();
+            format!("sources missing sink connection {:?}", missing)
+        },
+    );
+    pass_step(
+        invite_accept_at_ms,
+        "existing_mesh_connects_to_sink",
+        existing_mesh_live_sessions_with_sink_at_ms,
+    );
+
+    let sink_live_sessions_with_all_sources_at_ms = wait_for_condition(
+        "sink live sessions with all existing sources",
+        &source_dbs.iter().copied().chain(std::iter::once(sink_db.as_str())).collect::<Vec<_>>(),
+        Duration::from_secs(180),
+        || {
+            let current = live_session_peer_ids(&sink_node.db);
+            sink_seen_live_session_peers.borrow_mut().extend(current);
+            source_peer_ids.iter().all(|peer_id| {
+                sink_seen_live_session_peers.borrow().contains(peer_id)
+            })
+        },
+        || {
+            let live = live_session_peer_ids(&sink_node.db);
+            let seen = sink_seen_live_session_peers.borrow();
+            let missing: Vec<String> = source_peer_ids
+                .iter()
+                .filter(|peer_id| !seen.contains(*peer_id))
+                .cloned()
+                .collect();
+            format!("sink missing seen live sessions {:?} (live_now={:?})", missing, live)
+        },
+    );
+    pass_step(
+        invite_accept_at_ms,
+        "sink_live_sessions_with_all_sources",
+        sink_live_sessions_with_all_sources_at_ms,
+    );
+
+    let sink_message_count_when_hot_complete = message_total(&sink_node.db);
+    let full_catchup_at_ms = if wait_for_full_catchup {
+        begin_step("full_catchup");
+        let full_catchup_at_ms = wait_for_condition(
+            "sink full catchup",
+            &source_dbs.iter().copied().chain(std::iter::once(sink_db.as_str())).collect::<Vec<_>>(),
+            Duration::from_secs(300),
+            || message_total(&sink_node.db) >= expected_total_messages,
+            || format!("sink_total={} expected_total={}", message_total(&sink_node.db), expected_total_messages),
+        );
+        pass_step(invite_accept_at_ms, "full_catchup", full_catchup_at_ms);
+        full_catchup_at_ms
+    } else {
+        sink_live_sessions_with_all_sources_at_ms
+    };
+
+    let visible_non_hub_sources: Vec<String> = visible_phase_labels(&sink_node.db, "hot")
+        .intersection(&hot_non_hub_labels)
+        .cloned()
+        .collect();
+    let sink_live_session_peers: Vec<String> = sink_seen_live_session_peers
+        .borrow()
+        .iter()
+        .cloned()
+        .collect();
+    let source_connection_counts_with_sink: Vec<(String, usize)> = sources
         .iter()
         .map(|source| {
-            sink_received_frame_deltas
-                .get(&source.transport_peer_id)
-                .copied()
-                .unwrap_or(0)
+            (
+                source.label.clone(),
+                usize::from(existing_mesh_seen_sink.borrow().contains(&source.label)),
+            )
         })
         .collect();
-    let sink_recorded_sources_after = received_recorded_events_by_source_for_db(&sink_db);
-    let sink_recorded_source_deltas =
-        diff_count_map(&sink_recorded_sources_after, &sink_recorded_sources_before);
-    let source_recorded_events = count_source_tag_events(&sink_recorded_source_deltas, &sources);
-    let source_sync_runs_after: Vec<i64> = source_dbs
-        .iter()
-        .map(|db| changed_sync_run_count(db))
-        .collect();
-    let source_sync_run_deltas: Vec<i64> = source_sync_runs_after
-        .iter()
-        .zip(source_sync_runs_before.iter())
-        .map(|(after, before)| after.saturating_sub(*before))
-        .collect();
-    let endpoint_obs_counts: Vec<i64> = sources
-        .iter()
-        .map(|source| endpoint_observation_count(&sink_db, &source.transport_peer_id))
-        .collect();
-    let downloader_event_frames: i64 = sink_received_frame_deltas.values().sum();
-    let attributed_event_frames: i64 = source_event_frames.iter().sum();
-    let unattributed_event_frames = downloader_event_frames.saturating_sub(attributed_event_frames);
-    let useful_unique_events =
-        unique_sync_received_event_count_sql(&sink_db).saturating_sub(useful_unique_events_before);
-    let delivery_efficiency = if downloader_event_frames > 0 {
-        useful_unique_events as f64 / downloader_event_frames as f64
-    } else {
-        0.0
+
+    let outcome = ColdJoinOutcome {
+        milestones: ColdJoinMilestones {
+            mesh_messages_converged_at_ms: mesh_warmup.messages_converged_at_ms,
+            mesh_peer_identities_converged_at_ms: mesh_warmup.peer_identities_converged_at_ms,
+            mesh_endpoint_observations_converged_at_ms: mesh_warmup.endpoint_observations_converged_at_ms,
+            mesh_live_sessions_converged_at_ms: mesh_warmup.live_sessions_converged_at_ms,
+            invite_accept_at_ms,
+            first_hot_message_visible_at_ms,
+            all_hot_messages_visible_at_ms,
+            sink_projected_all_source_peers_at_ms,
+            sink_observed_all_source_endpoints_at_ms,
+            sink_first_non_hub_source_visible_at_ms,
+            sink_two_non_hub_sources_visible_at_ms,
+            sink_live_sessions_with_two_non_hub_sources_at_ms,
+            sink_live_sessions_with_all_sources_at_ms,
+            existing_mesh_projected_sink_at_ms,
+            existing_mesh_observed_sink_at_ms,
+            existing_mesh_live_sessions_with_sink_at_ms,
+            full_catchup_at_ms,
+        },
+        expected_total_messages,
+        hot_message_count: hot_head.len(),
+        sink_message_count_when_hot_complete,
+        visible_non_hub_sources,
+        sink_live_session_peers,
+        source_connection_counts_with_sink,
     };
-    let active_sources = sink_received_frame_deltas
-        .values()
-        .filter(|count| **count > 0)
-        .count();
 
-    write_summary_with_sources(
-        &format!(
-            "daemon_multi_source_tiered_window_perf_test.cold_join_{}x_{}_{}",
-            source_count,
-            total_messages,
-            connectivity.suffix()
-        ),
-        &format!(
-            "Cold join multi-source tiered window catchup: {} sources, {} messages, {}",
-            source_count,
-            total_messages,
-            connectivity.title()
-        ),
-        &[
-            ("Last day", day_timing),
-            ("Last week", week_timing),
-            ("Last 12 weeks", twelve_week_timing),
-            ("All", all_timing),
-        ],
-        metric_start_ms,
-        bench_start.elapsed().as_secs_f64(),
-        useful_unique_events,
-        downloader_event_frames,
-        delivery_efficiency,
-        active_sources,
-        unattributed_event_frames,
-        &sources,
-        &source_event_frames,
-        &source_sync_run_deltas,
-        &endpoint_obs_counts,
-    );
-
-    stop_daemon(&sink_db, &mut sink_daemon);
-    wait_for_daemon_stopped(&sink_db, Duration::from_secs(10));
-
-    BenchOutcome {
-        useful_unique_events,
-        downloader_event_frames,
-        delivery_efficiency,
-        source_recorded_events,
-        active_sources,
+    if wait_for_full_catchup {
+        write_cold_join_summary(
+            &format!(
+                "daemon_multi_source_tiered_window_perf_test.cold_join_hot_head_cli_{}x_{}seed_{}hot",
+                source_count, seeded_history_messages, hot_messages_per_peer
+            ),
+            &outcome,
+        );
     }
+
+    outcome
 }
 
-fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) -> BenchOutcome {
-    assert!(source_count >= 2, "source_count must be >= 2");
+#[test]
+fn mesh_four_peers_discover_and_connect() {
     hold_network_test_lock_for_binary();
-    std::env::set_var(
-        "TOPO_GENERATE_MESSAGE_SPREAD_MS",
-        THREE_YEARS_MS.to_string(),
-    );
+    std::env::set_var("TOPO_GENERATE_MESSAGE_SPREAD_MS", "94608000000");
     std::env::set_var("TOPO_EVENT_TIMELINE", "1");
     std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "persist,projection");
 
-    let total_messages = env_i64("TOPO_MULTI_SOURCE_TOTAL_MESSAGES", 10_000);
-    let baseline_messages = env_i64("TOPO_MULTI_SOURCE_BASELINE_MESSAGES", total_messages / 2);
-    assert!(
-        baseline_messages >= 0 && baseline_messages <= total_messages,
-        "TOPO_MULTI_SOURCE_BASELINE_MESSAGES must satisfy 0 <= baseline <= total"
-    );
-
-    let tmpdir = bench_tmpdir("msrj-");
-    let mut peer_labels = vec!["hub".to_string()];
-    for idx in 1..source_count {
-        peer_labels.push(format!("source-{idx:02}"));
-    }
-    peer_labels.push("rejoiner".to_string());
-
-    let (mut nodes, _invite_link) = create_online_community(&tmpdir, &peer_labels, connectivity);
-    let rejoiner = nodes.pop().expect("rejoiner node missing");
-    assert_eq!(rejoiner.label, "rejoiner");
-    let sources = nodes;
-    let source_dbs: Vec<String> = sources.iter().map(|source| source.db.clone()).collect();
-    let all_dbs: Vec<String> = sources
-        .iter()
-        .map(|source| source.db.clone())
-        .chain(std::iter::once(rejoiner.db.clone()))
-        .collect();
-
-    let warmup_messages = emit_warmup_messages(&sources) + 1;
-    let _ = send_message(&rejoiner.db, "warmup-rejoiner");
-    wait_for_message_count_all(&all_dbs, warmup_messages, Duration::from_secs(120));
-
-    let all_nodes: Vec<&Node> = sources.iter().chain(std::iter::once(&rejoiner)).collect();
-    if baseline_messages > 0 {
-        generate_messages_distributed(&all_nodes, baseline_messages);
-    }
-    let baseline_expected_total = union_message_count_since_sql(&all_dbs, None);
-    wait_for_message_count_all(&all_dbs, baseline_expected_total, Duration::from_secs(1200));
-
-    let pre_rejoin_endpoint_obs: Vec<i64> = sources
-        .iter()
-        .map(|source| endpoint_observation_count(&rejoiner.db, &source.transport_peer_id))
-        .collect();
-
-    let mut rejoiner_daemon = rejoiner._daemon;
-    stop_daemon(&rejoiner.db, &mut rejoiner_daemon);
-    wait_for_daemon_stopped(&rejoiner.db, Duration::from_secs(10));
-
-    let delta_messages = total_messages - baseline_messages;
-    if delta_messages > 0 {
-        let source_refs: Vec<&Node> = sources.iter().collect();
-        generate_messages_distributed(&source_refs, delta_messages);
-    }
-    let source_expected_total = union_message_count_since_sql(&source_dbs, None);
-    wait_for_message_count_all(
-        &source_dbs,
-        source_expected_total,
-        Duration::from_secs(1200),
-    );
-
-    let measurement_now_ms = current_timestamp_ms();
-    let day_cutoff = measurement_now_ms - DAY_MS;
-    let week_cutoff = measurement_now_ms - WEEK_MS;
-    let expected_total = union_message_count_since_sql(&source_dbs, None);
-    let expected_day = union_message_count_since_sql(&source_dbs, Some(day_cutoff));
-    let expected_week = union_message_count_since_sql(&source_dbs, Some(week_cutoff));
-    let expected_twelve_weeks =
-        union_message_count_since_sql(&source_dbs, Some(measurement_now_ms - TWELVE_WEEK_MS));
-    let useful_unique_events_before = unique_sync_received_event_count_sql(&rejoiner.db);
-    let rejoiner_received_frames_before = received_events_by_peer_for_db(&rejoiner.db);
-    let rejoiner_recorded_sources_before = received_recorded_events_by_source_for_db(&rejoiner.db);
-    let source_sync_runs_before: Vec<i64> = source_dbs
-        .iter()
-        .map(|db| changed_sync_run_count(db))
-        .collect();
-
-    let metric_start_ms = current_timestamp_ms();
-    let bench_start = Instant::now();
-    let inherited_env = inherited_tier_env();
-    let _rejoiner_daemon = start_peer(&rejoiner.db, inherited_env, connectivity);
-    ensure_active_peer(&rejoiner.db, Duration::from_secs(10));
-    wait_for_active_tenant_ready(&rejoiner.db, Duration::from_secs(120));
-
-    let _day_projected_ms = if expected_day > 0 {
-        wait_for_message_count_since(
-            &rejoiner.db,
-            day_cutoff,
-            expected_day,
-            Duration::from_secs(1800),
-        )
-    } else {
-        metric_start_ms
-    };
-    let _week_projected_ms = if expected_week > 0 {
-        wait_for_message_count_since(
-            &rejoiner.db,
-            week_cutoff,
-            expected_week,
-            Duration::from_secs(1800),
-        )
-    } else {
-        metric_start_ms
-    };
-    let _twelve_week_projected_ms = if expected_twelve_weeks > 0 {
-        wait_for_message_count_since(
-            &rejoiner.db,
-            measurement_now_ms - TWELVE_WEEK_MS,
-            expected_twelve_weeks,
-            Duration::from_secs(1800),
-        )
-    } else {
-        metric_start_ms
-    };
-    let full_projected_ms =
-        wait_for_message_count(&rejoiner.db, expected_total, Duration::from_secs(3600));
-    let _ = full_projected_ms;
-
-    let day_timing = range_timing_sql(&rejoiner.db, Some(day_cutoff));
-    let week_timing = range_timing_sql(&rejoiner.db, Some(week_cutoff));
-    let twelve_week_timing =
-        range_timing_sql(&rejoiner.db, Some(measurement_now_ms - TWELVE_WEEK_MS));
-    let all_timing = range_timing_sql(&rejoiner.db, None);
-
-    wait_for_downloader_receives_stable(
-        &rejoiner.db,
-        Duration::from_secs(60),
-        Duration::from_millis(500),
-    );
-    let rejoiner_received_frames_after = received_events_by_peer_for_db(&rejoiner.db);
-    let rejoiner_received_frame_deltas = diff_count_map(
-        &rejoiner_received_frames_after,
-        &rejoiner_received_frames_before,
-    );
-    let source_event_frames: Vec<i64> = sources
-        .iter()
-        .map(|source| {
-            rejoiner_received_frame_deltas
-                .get(&source.transport_peer_id)
-                .copied()
-                .unwrap_or(0)
-        })
-        .collect();
-    let rejoiner_recorded_sources_after = received_recorded_events_by_source_for_db(&rejoiner.db);
-    let rejoiner_recorded_source_deltas = diff_count_map(
-        &rejoiner_recorded_sources_after,
-        &rejoiner_recorded_sources_before,
-    );
-    let source_recorded_events =
-        count_source_tag_events(&rejoiner_recorded_source_deltas, &sources);
-    let source_sync_runs_after: Vec<i64> = source_dbs
-        .iter()
-        .map(|db| changed_sync_run_count(db))
-        .collect();
-    let source_sync_run_deltas: Vec<i64> = source_sync_runs_after
-        .iter()
-        .zip(source_sync_runs_before.iter())
-        .map(|(after, before)| after.saturating_sub(*before))
-        .collect();
-    let endpoint_obs_after: Vec<i64> = sources
-        .iter()
-        .map(|source| endpoint_observation_count(&rejoiner.db, &source.transport_peer_id))
-        .collect();
-    let endpoint_obs_counts: Vec<i64> = endpoint_obs_after
-        .iter()
-        .zip(pre_rejoin_endpoint_obs.iter())
-        .map(|(after, before)| after.saturating_sub(*before).max(*after))
-        .collect();
-    let downloader_event_frames: i64 = rejoiner_received_frame_deltas.values().sum();
-    let attributed_event_frames: i64 = source_event_frames.iter().sum();
-    let unattributed_event_frames = downloader_event_frames.saturating_sub(attributed_event_frames);
-    let useful_unique_events_after = unique_sync_received_event_count_sql(&rejoiner.db);
-    let useful_unique_events =
-        useful_unique_events_after.saturating_sub(useful_unique_events_before);
-    let delivery_efficiency = if downloader_event_frames > 0 {
-        useful_unique_events as f64 / downloader_event_frames as f64
-    } else {
-        0.0
-    };
-    let active_sources = rejoiner_received_frame_deltas
-        .values()
-        .filter(|count| **count > 0)
-        .count();
-
-    write_summary_with_sources(
-        &format!(
-            "daemon_multi_source_tiered_window_perf_test.rejoin_{}x_{}_{}",
-            source_count,
-            total_messages,
-            connectivity.suffix()
-        ),
-        &format!(
-            "Rejoin multi-source tiered window catchup: {} sources, baseline {}, total {}, {}",
-            source_count,
-            baseline_messages,
-            total_messages,
-            connectivity.title()
-        ),
-        &[
-            ("Last day", day_timing),
-            ("Last week", week_timing),
-            ("Last 12 weeks", twelve_week_timing),
-            ("All", all_timing),
-        ],
-        metric_start_ms,
-        bench_start.elapsed().as_secs_f64(),
-        useful_unique_events,
-        downloader_event_frames,
-        delivery_efficiency,
-        active_sources,
-        unattributed_event_frames,
+    let seeded_history_messages = env_usize("TOPO_MULTI_SOURCE_SEEDED_HISTORY_MESSAGES", 0);
+    let tmpdir = bench_tmpdir("mesh-four-cli-");
+    let peer_labels = vec![
+        "hub".to_string(),
+        "source-01".to_string(),
+        "source-02".to_string(),
+        "source-03".to_string(),
+    ];
+    let (sources, _) = create_online_community(&tmpdir, &peer_labels, seeded_history_messages);
+    let started_at_ms = current_timestamp_ms();
+    let warmup_messages = emit_messages(&sources, "mesh", 1);
+    let outcome = converge_existing_mesh(
         &sources,
-        &source_event_frames,
-        &source_sync_run_deltas,
-        &endpoint_obs_counts,
+        seeded_history_messages,
+        &warmup_messages,
+        started_at_ms,
+        Duration::from_secs(120),
     );
 
-    BenchOutcome {
-        useful_unique_events,
-        downloader_event_frames,
-        delivery_efficiency,
-        source_recorded_events,
-        active_sources,
+    let warmup_ids: BTreeSet<String> = warmup_messages.iter().map(|msg| msg.event_id.clone()).collect();
+    for source in &sources {
+        let visible = visible_message_ids(&source.db);
+        assert!(
+            warmup_ids.iter().all(|id| visible.contains(id)),
+            "expected {} to display all warmup mesh messages",
+            source.label,
+        );
     }
+    assert!(
+        outcome.messages_converged_at_ms <= outcome.peer_identities_converged_at_ms
+            && outcome.peer_identities_converged_at_ms
+                <= outcome.endpoint_observations_converged_at_ms
+            && outcome.endpoint_observations_converged_at_ms
+                <= outcome.live_sessions_converged_at_ms,
+        "mesh convergence milestones should be monotonic: {:?}",
+        outcome,
+    );
 }
 
 #[test]
-#[ignore]
-fn perf_multi_source_cold_join_4x_10k() {
-    let _ = run_cold_join_bench(4, ConnectivityMode::BootstrapOnly);
-}
+fn cold_join_4x_hot_head_projects_identity_and_activates_multisource() {
+    std::env::set_var("TOPO_MULTI_SOURCE_SEEDED_HISTORY_MESSAGES", "32");
+    std::env::set_var("TOPO_MULTI_SOURCE_HOT_MESSAGES_PER_PEER", "3");
+    let outcome = run_cold_join_hot_head_diagnostic(4, false);
 
-#[test]
-#[ignore]
-fn perf_multi_source_cold_join_8x_10k() {
-    let _ = run_cold_join_bench(8, ConnectivityMode::BootstrapOnly);
-}
-
-#[test]
-#[ignore]
-fn perf_multi_source_rejoin_4x_10k() {
-    let _ = run_rejoin_bench(4, ConnectivityMode::BootstrapOnly);
-}
-
-#[test]
-#[ignore]
-fn perf_multi_source_rejoin_8x_10k() {
-    let _ = run_rejoin_bench(8, ConnectivityMode::BootstrapOnly);
-}
-
-#[test]
-#[ignore]
-fn perf_multi_source_cold_join_4x_10k_discovery() {
-    let _ = run_cold_join_bench(4, ConnectivityMode::DiscoveryLoopback);
-}
-
-#[test]
-#[ignore]
-fn perf_multi_source_cold_join_8x_10k_discovery() {
-    let _ = run_cold_join_bench(8, ConnectivityMode::DiscoveryLoopback);
-}
-
-#[test]
-#[ignore]
-fn perf_multi_source_rejoin_4x_10k_discovery() {
-    let _ = run_rejoin_bench(4, ConnectivityMode::DiscoveryLoopback);
-}
-
-#[test]
-#[ignore]
-fn perf_multi_source_rejoin_8x_10k_discovery() {
-    let _ = run_rejoin_bench(8, ConnectivityMode::DiscoveryLoopback);
-}
-
-#[test]
-#[ignore = "fresh invitees only know the inviter until discovery warms enough to expose the full peer set"]
-fn cold_join_4x_1k_uses_multiple_sources_efficiently() {
-    std::env::set_var("TOPO_MULTI_SOURCE_TOTAL_MESSAGES", "1000");
-    let outcome = run_cold_join_bench(4, ConnectivityMode::DiscoveryLoopback);
-
+    assert_eq!(
+        outcome.hot_message_count,
+        12,
+        "expected 3 fresh hot messages from each of 4 existing peers"
+    );
+    assert!(
+        outcome.sink_message_count_when_hot_complete < outcome.expected_total_messages,
+        "hot head should complete before full backlog catch-up: hot_complete_count={} expected_total={}",
+        outcome.sink_message_count_when_hot_complete,
+        outcome.expected_total_messages,
+    );
+    assert!(
+        outcome.visible_non_hub_sources.len() >= 2,
+        "expected at least two non-hub sources visible on sink, got {:?}",
+        outcome.visible_non_hub_sources,
+    );
+    let sink_non_hub_live_sessions = outcome
+        .sink_live_session_peers
+        .iter()
+        .filter(|peer_id| !peer_id.is_empty())
+        .count();
+    assert!(
+        sink_non_hub_live_sessions >= 4,
+        "expected sink to maintain live sessions with all existing peers, got {:?}",
+        outcome.sink_live_session_peers,
+    );
     assert!(
         outcome
-            .source_recorded_events
+            .source_connection_counts_with_sink
             .iter()
-            .filter(|count| **count > 0)
-            .count()
-            >= 2,
-        "expected at least 2 peers to contribute recorded events, got {:?}",
-        outcome.source_recorded_events
+            .all(|(_, count)| *count > 0),
+        "expected every existing peer to maintain a direct connection with sink, got {:?}",
+        outcome.source_connection_counts_with_sink,
     );
 }
 
 #[test]
-#[ignore = "graph harness provides the stable multi-source proof; daemon rejoin remains diagnostic while discovery/bootstrap convergence is still noisy"]
-fn rejoin_4x_1k_uses_multiple_sources_after_preconvergence() {
-    std::env::set_var("TOPO_MULTI_SOURCE_TOTAL_MESSAGES", "1000");
-    std::env::set_var("TOPO_MULTI_SOURCE_BASELINE_MESSAGES", "500");
-    let outcome = run_rejoin_bench(4, ConnectivityMode::DiscoveryLoopback);
-
-    assert!(
-        outcome.active_sources >= 2,
-        "expected at least 2 peers to contribute after rejoin, got active_sources={} counts={:?}",
-        outcome.active_sources,
-        outcome.source_recorded_events
-    );
-    assert!(
-        outcome.useful_unique_events > 0,
-        "expected rejoiner to ingest new events during rejoin"
-    );
-}
-
-#[test]
-fn downloader_receive_metric_counts_events_by_remote_peer() {
-    use topo::db::sync_log::ensure_schema;
-
-    let tmpdir = tempfile::tempdir().expect("tempdir");
-    let db_path = tmpdir.path().join("metric.db");
-    let db_path_str = db_path.to_str().expect("db path utf-8");
-    let conn = topo::db::open_connection(db_path_str).expect("open db");
-    ensure_schema(&conn).expect("ensure sync_log schema");
-
-    conn.execute(
-        "INSERT INTO sync_runs
-         (run_id, started_at_ms, ended_at_ms, session_id, tenant_id, peer_id, direction, remote_addr, role,
-          rounds, events_sent, events_received, bytes_sent, bytes_received, changed, outcome, error)
-         VALUES
-         (1, 1, 2, 1, 'tenant', 'sink-peer', 'outbound', '127.0.0.1:1', 'initiator', 1, 2, 2, 20, 20, 1, 'ok', NULL),
-         (2, 3, 4, 2, 'tenant', 'other-peer', 'outbound', '127.0.0.1:2', 'initiator', 1, 3, 3, 30, 30, 1, 'ok', NULL)",
-        [],
-    )
-    .expect("insert sync_runs");
-
-    let from_conn = received_events_by_peer_for_conn(&conn);
-    let from_db = received_events_by_peer_for_db(db_path_str);
-
-    assert_eq!(from_conn.get("sink-peer").copied(), Some(2));
-    assert_eq!(from_conn.get("other-peer").copied(), Some(3));
-    assert_eq!(from_db.get("sink-peer").copied(), Some(2));
-    assert_eq!(from_db.get("other-peer").copied(), Some(3));
+#[ignore]
+fn perf_multi_source_cold_join_4x_hot_head_diagnostic() {
+    std::env::set_var("TOPO_MULTI_SOURCE_SEEDED_HISTORY_MESSAGES", "96");
+    std::env::set_var("TOPO_MULTI_SOURCE_HOT_MESSAGES_PER_PEER", "6");
+    let _ = run_cold_join_hot_head_diagnostic(4, true);
 }

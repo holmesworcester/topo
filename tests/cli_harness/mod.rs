@@ -1359,7 +1359,9 @@ pub fn send_message(db: &str, content: &str) -> String {
         let retryable = stderr.contains("no identity")
             || stderr.contains("no active tenant")
             || stderr.contains("workspace has not completed initial sync yet")
-            || stderr.contains("blocked on");
+            || stderr.contains("blocked on")
+            || stderr.contains("database is locked")
+            || stderr.contains("SQLITE_BUSY");
         if retryable && start.elapsed() < send_timeout {
             if stderr.contains("no active tenant") {
                 ensure_active_peer(db, Duration::from_secs(5));

@@ -386,7 +386,7 @@ async fn run_known_peer_refresher(
         match collect_all_known_peer_targets(&db_path) {
             Ok(targets) => {
                 warning_gate.clear();
-                for (tenant_id, peer_id, remote) in targets {
+                for (tenant_id, peer_id, daemon_peer_id, remote) in targets {
                     if discovery_disabled && remote.is_none() {
                         continue;
                     }
@@ -395,7 +395,10 @@ async fn run_known_peer_refresher(
                             tenant_id,
                             remote,
                             relay_url: None,
-                            source: TargetIngressSource::KnownPeer { peer_id },
+                            source: TargetIngressSource::KnownPeer {
+                                peer_id,
+                                daemon_peer_id,
+                            },
                         })
                         .is_err()
                     {

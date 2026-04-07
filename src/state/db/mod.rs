@@ -17,10 +17,10 @@ pub mod transport_trust;
 use rusqlite::{Connection, Result as SqliteResult};
 use std::path::Path;
 
-/// Open database connection with WAL mode and performance pragmas
+/// Open database connection with connection-local performance pragmas
 pub fn open_connection<P: AsRef<Path>>(path: P) -> SqliteResult<Connection> {
     let conn = Connection::open(path)?;
-    apply_pragmas(&conn)?;
+    apply_connection_pragmas(&conn)?;
     Ok(conn)
 }
 
@@ -64,16 +64,14 @@ pub fn friendly_db_error<P: AsRef<Path>>(path: P, e: rusqlite::Error) -> String 
 #[cfg(test)]
 pub fn open_in_memory() -> SqliteResult<Connection> {
     let conn = Connection::open_in_memory()?;
-    apply_pragmas(&conn)?;
+    apply_connection_pragmas(&conn)?;
     Ok(conn)
 }
 
-fn apply_pragmas(conn: &Connection) -> SqliteResult<()> {
+fn apply_connection_pragmas(conn: &Connection) -> SqliteResult<()> {
     if low_mem_mode() {
         conn.execute_batch(
             "
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
             PRAGMA cache_size = -256;
             PRAGMA cache_spill = ON;
             PRAGMA temp_store = FILE;
@@ -81,22 +79,34 @@ fn apply_pragmas(conn: &Connection) -> SqliteResult<()> {
             PRAGMA wal_autocheckpoint = 64;
             PRAGMA journal_size_limit = 262144;
             PRAGMA soft_heap_limit = 2097152;
-            PRAGMA busy_timeout = 5000;
+            PRAGMA busy_timeout = 30000;
             PRAGMA foreign_keys = OFF;
             ",
         )?;
     } else {
         conn.execute_batch(
             "
-            PRAGMA journal_mode = WAL;
-            PRAGMA synchronous = NORMAL;
             PRAGMA cache_size = -64000;
-            PRAGMA busy_timeout = 5000;
+            PRAGMA busy_timeout = 30000;
             PRAGMA foreign_keys = OFF;
             PRAGMA temp_store = MEMORY;
             ",
         )?;
     }
+    Ok(())
+}
+
+/// Apply persistent storage pragmas that may need write coordination.
+///
+/// Keep this off hot read paths. Read-only RPCs should be able to open a
+/// connection without competing for schema/write-level locks.
+pub fn ensure_storage_pragmas(conn: &Connection) -> SqliteResult<()> {
+    conn.execute_batch(
+        "
+        PRAGMA journal_mode = WAL;
+        PRAGMA synchronous = NORMAL;
+        "
+    )?;
     Ok(())
 }
 

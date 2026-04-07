@@ -372,6 +372,12 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"SyncRoundAll"}"#,
     },
     MethodInfo {
+        name: "LiveSessions",
+        purpose: "List currently live authenticated session peers for the active tenant",
+        params: PARAM_NONE,
+        example_json: r#"{"type":"LiveSessions"}"#,
+    },
+    MethodInfo {
         name: "Stats",
         purpose: "Return all projection table counts for the active tenant",
         params: PARAM_NONE,

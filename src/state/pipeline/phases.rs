@@ -5,7 +5,7 @@ use rusqlite::Connection;
 use crate::contracts::event_pipeline_contract::IngestItem;
 use crate::crypto::{event_id_to_base64, EventId};
 use crate::db::queue::current_timestamp_ms;
-use crate::db::store::lookup_workspace_id;
+use crate::db::store::{index_event_deps_from_blob, lookup_workspace_id, shared_event_shard_u8};
 use crate::db::timeline::EventTimeline;
 use crate::event_modules::{self as events, registry::EventRegistry, ShareScope};
 use crate::state::shared_workspace_fanout::SharedEventFanout;
@@ -83,6 +83,7 @@ pub(super) fn run_persist_phase(
                             if let Err(e) = shared_event_index_stmt.execute(rusqlite::params![
                                 &ws_id,
                                 created_at_ms as i64,
+                                shared_event_shard_u8(event_id),
                                 event_id.as_slice()
                             ]) {
                                 // Non-fatal: shared_event_index is a reconciliation cache;
@@ -106,6 +107,9 @@ pub(super) fn run_persist_phase(
                     ]) {
                         tracing::warn!("events insert error for {}: {}", event_id_b64, e);
                         continue;
+                    }
+                    if let Err(e) = index_event_deps_from_blob(db, &event_id_b64, blob) {
+                        tracing::warn!("event_deps insert error for {}: {}", event_id_b64, e);
                     }
 
                     let recorded_at = current_timestamp_ms();
@@ -195,6 +199,151 @@ mod tests {
         store::{SQL_INSERT_EVENT, SQL_INSERT_RECORDED_EVENT, SQL_INSERT_SHARED_EVENT_INDEX_ENTRY},
     };
     use crate::event_modules::{self, EncryptedEvent, ParsedEvent, EVENT_TYPE_FILE_SLICE};
+
+    #[test]
+    fn run_persist_phase_indexes_shared_workspace_event_with_shard() {
+        let db = open_in_memory().unwrap();
+        create_tables(&db).unwrap();
+
+        let mut shared_event_index_stmt = db.prepare(SQL_INSERT_SHARED_EVENT_INDEX_ENTRY).unwrap();
+        let mut recorded_stmt = db.prepare(SQL_INSERT_RECORDED_EVENT).unwrap();
+        let mut events_stmt = db.prepare(SQL_INSERT_EVENT).unwrap();
+        let mut enqueue_stmt = db
+            .prepare(
+                "INSERT OR IGNORE INTO project_queue
+                 (peer_id, event_id, available_at, priority_lane, priority_ts)
+                 SELECT ?1, ?2, ?3, ?4, ?5
+                 WHERE NOT EXISTS (SELECT 1 FROM valid_events WHERE peer_id=?1 AND event_id=?2)
+                 AND NOT EXISTS (SELECT 1 FROM rejected_events WHERE peer_id=?1 AND event_id=?2)
+                 AND NOT EXISTS (SELECT 1 FROM blocked_event_deps WHERE peer_id=?1 AND event_id=?2)",
+            )
+            .unwrap();
+        let mut workspace_cache = HashMap::new();
+        let blob = event_modules::encode_event(&ParsedEvent::Workspace(
+            crate::event_modules::workspace::WorkspaceEvent {
+                created_at_ms: 123,
+                public_key: [7u8; 32],
+                name: "workspace".to_string(),
+            },
+        ))
+        .unwrap();
+        let event_id = hash_event(&blob);
+        let batch = vec![(
+            event_id,
+            blob,
+            "peer-alpha".to_string(),
+            "sync".to_string(),
+            0,
+            0,
+        )];
+
+        let output = run_persist_phase(
+            &db,
+            &batch,
+            event_modules::registry(),
+            &mut workspace_cache,
+            &mut shared_event_index_stmt,
+            &mut recorded_stmt,
+            &mut events_stmt,
+            &mut enqueue_stmt,
+        );
+
+        assert_eq!(output.persisted_event_ids, vec![event_id]);
+        let (workspace_id, shard_u8, indexed_id): (String, i64, Vec<u8>) = db
+            .query_row(
+                "SELECT workspace_id, shard_u8, id FROM shared_event_index",
+                [],
+                |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?)),
+            )
+            .unwrap();
+        assert_eq!(workspace_id, event_id_to_base64(&event_id));
+        assert_eq!(shard_u8, super::shared_event_shard_u8(&event_id));
+        assert_eq!(indexed_id, event_id.to_vec());
+    }
+
+    #[test]
+    fn run_persist_phase_indexes_peer_shared_dependencies() {
+        let db = open_in_memory().unwrap();
+        create_tables(&db).unwrap();
+
+        let mut shared_event_index_stmt = db.prepare(SQL_INSERT_SHARED_EVENT_INDEX_ENTRY).unwrap();
+        let mut recorded_stmt = db.prepare(SQL_INSERT_RECORDED_EVENT).unwrap();
+        let mut events_stmt = db.prepare(SQL_INSERT_EVENT).unwrap();
+        let mut enqueue_stmt = db
+            .prepare(
+                "INSERT OR IGNORE INTO project_queue
+                 (peer_id, event_id, available_at, priority_lane, priority_ts)
+                 SELECT ?1, ?2, ?3, ?4, ?5
+                 WHERE NOT EXISTS (SELECT 1 FROM valid_events WHERE peer_id=?1 AND event_id=?2)
+                 AND NOT EXISTS (SELECT 1 FROM rejected_events WHERE peer_id=?1 AND event_id=?2)
+                 AND NOT EXISTS (SELECT 1 FROM blocked_event_deps WHERE peer_id=?1 AND event_id=?2)",
+            )
+            .unwrap();
+        let mut workspace_cache = HashMap::new();
+        workspace_cache.insert("peer-alpha".to_string(), "workspace-1".to_string());
+
+        let user_event_id = [0x11u8; 32];
+        let endpoint_shared_event_id = [0x22u8; 32];
+        let blob = event_modules::encode_event(&ParsedEvent::PeerShared(
+            crate::event_modules::peer_shared::PeerSharedEvent {
+                created_at_ms: 123,
+                public_key: [7u8; 32],
+                user_event_id,
+                endpoint_shared_event_id,
+                device_name: "device".to_string(),
+            },
+        ))
+        .unwrap();
+        let event_id = hash_event(&blob);
+        let batch = vec![(
+            event_id,
+            blob,
+            "peer-alpha".to_string(),
+            "sync".to_string(),
+            0,
+            0,
+        )];
+
+        let output = run_persist_phase(
+            &db,
+            &batch,
+            event_modules::registry(),
+            &mut workspace_cache,
+            &mut shared_event_index_stmt,
+            &mut recorded_stmt,
+            &mut events_stmt,
+            &mut enqueue_stmt,
+        );
+
+        assert_eq!(output.persisted_event_ids, vec![event_id]);
+        let deps: Vec<(String, String)> = db
+            .prepare(
+                "SELECT dep_field_name, dep_event_id
+                 FROM event_deps
+                 WHERE event_id = ?1
+                 ORDER BY dep_field_name, dep_event_id",
+            )
+            .unwrap()
+            .query_map([event_id_to_base64(&event_id)], |row| {
+                Ok((row.get(0)?, row.get(1)?))
+            })
+            .unwrap()
+            .collect::<Result<Vec<_>, _>>()
+            .unwrap();
+        assert_eq!(
+            deps,
+            vec![
+                (
+                    "endpoint_shared_event_id".to_string(),
+                    event_id_to_base64(&endpoint_shared_event_id),
+                ),
+                (
+                    "user_event_id".to_string(),
+                    event_id_to_base64(&user_event_id),
+                ),
+            ]
+        );
+    }
 
     #[test]
     fn run_persist_phase_enqueues_encrypted_file_slice_as_bulk() {

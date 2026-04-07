@@ -100,7 +100,21 @@ pub fn open_db_load(
     Ok((endpoint_id, conn))
 }
 
-/// Open DB for a specific peer_id (used when daemon provides the active peer).
+/// Open an existing DB for a specific peer_id without re-running schema DDL.
+///
+/// Running schema ensure on every daemon RPC read path increases SQLITE_BUSY
+/// pressure because those calls may need schema/write locks even though the
+/// daemon already initialized the database at startup.
+pub fn open_existing_db_for_peer(
+    db_path: &str,
+    peer_id: &str,
+) -> Result<(String, rusqlite::Connection), Box<dyn std::error::Error + Send + Sync>> {
+    let conn = open_connection(db_path)?;
+    Ok((peer_id.to_string(), conn))
+}
+
+/// Open DB for a specific peer_id (used when commands may need first-touch
+/// schema initialization on a database that was not daemon-initialized yet).
 pub fn open_db_for_peer(
     db_path: &str,
     peer_id: &str,

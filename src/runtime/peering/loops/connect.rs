@@ -13,7 +13,6 @@ use crate::db::open_connection;
 use crate::db::transport_trust::record_transport_binding;
 use crate::runtime::build_mismatch::note_build_mismatch;
 use crate::runtime::repeated_warning::{should_emit_globally, RepeatedWarningGate};
-use crate::sync::session::windowing::reset_outbound_window_state;
 use crate::sync::SyncConnectionHandler;
 use crate::transport::session_factory::extract_build_mismatch_reason;
 use crate::transport::{
@@ -224,7 +223,7 @@ async fn connect_loop_inner(
     let mut announced_connecting = false;
     let mut consecutive_stale_dial_failures: u32 = 0;
     let mut warning_gate = RepeatedWarningGate::new(REPEATED_WARNING_WINDOW);
-    let mut last_outbound_window_scope = None;
+    let mut last_authenticated_remote_peer_id: Option<String> = None;
     let mut live_session_peer_registration = None;
     let mut next_auth_plan_override: Option<OutboundSessionAuthPlan> = None;
 
@@ -481,19 +480,17 @@ async fn connect_loop_inner(
                 ));
             }
 
-            // Preserve range-window progress across repeated logical sessions on
-            // the same daemon connection. Reset only when this tenant starts
-            // using a different daemon connection or authenticates as a
-            // different remote session peer.
-            let should_reset_outbound_window = last_outbound_window_scope
+            // Keep sync-task progress attached to the remote session peer, not
+            // to an individual daemon connection instance. Reconnect churn is
+            // normal in swarms; resetting here strands later shard groups.
+            if last_authenticated_remote_peer_id
                 .as_ref()
-                .map(|(last_connection_id, last_peer_id)| {
-                    *last_connection_id != connection_id || last_peer_id != &peer_id
-                })
-                .unwrap_or(true);
-            if should_reset_outbound_window {
-                reset_outbound_window_state(db_path, recorded_by, &peer_id);
-                last_outbound_window_scope = Some((connection_id, peer_id.clone()));
+                .map(|last_peer_id| last_peer_id != &peer_id)
+                .unwrap_or(false)
+            {
+                last_authenticated_remote_peer_id = Some(peer_id.clone());
+            } else if last_authenticated_remote_peer_id.is_none() {
+                last_authenticated_remote_peer_id = Some(peer_id.clone());
             }
             record_authenticated_outbound_session(
                 db_path,
