@@ -116,7 +116,8 @@ fn load_context_with_prereqs<B: ProjectionBackend>(
         .lookup(parsed.event_type_code())
         .ok_or_else(|| format!("unknown type code {}", parsed.event_type_code()))?;
 
-    let deps = parsed.dep_field_values();
+    let deps = parsed.blocking_dep_field_values();
+    let dep_type_codes = parsed.blocking_dep_field_type_codes();
     let mut missing = Vec::new();
     let mut ready_deps = Vec::new();
     let mut purge_message_event_id = None;
@@ -137,7 +138,7 @@ fn load_context_with_prereqs<B: ProjectionBackend>(
     }
 
     for (idx, field_name, semantic_type_code) in ready_deps {
-        let allowed = meta.dep_field_type_codes.get(idx).copied().unwrap_or(&[]);
+        let allowed = dep_type_codes.get(idx).copied().unwrap_or(&[]);
         if allowed.is_empty() {
             continue;
         }
@@ -321,6 +322,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
     ctx.current_transport_key_event_id = frame.current_transport_key_event_id.clone();
     ctx.current_owner_event_id = frame.current_owner_event_id.clone();
     ctx.current_signer = frame.current_signer.clone();
+    ctx.current_outer_dep_event_ids = frame.current_outer_dep_event_ids.clone();
 
     if let ParsedEvent::Signed(signed) = parsed {
         if envelope_depth >= MAX_PROJECTION_ENVELOPE_DEPTH {
@@ -504,6 +506,13 @@ fn apply_projection_frame<B: ProjectionBackend>(
         } else {
             next_frame.current_owner_event_id = None;
         }
+        next_frame.current_outer_dep_event_ids = if enc.outer_dep_event_id
+            != crate::event_modules::encrypted::NO_OUTER_DEP_EVENT_ID
+        {
+            vec![event_id_to_base64(&enc.outer_dep_event_id)]
+        } else {
+            Vec::new()
+        };
         let (decision, _) = apply_projection_frame(
             backend,
             recorded_by,
@@ -521,6 +530,7 @@ fn apply_projection_frame<B: ProjectionBackend>(
     ctx.current_transport_key_event_id = frame.current_transport_key_event_id.clone();
     ctx.current_owner_event_id = frame.current_owner_event_id.clone();
     ctx.current_signer = frame.current_signer.clone();
+    ctx.current_outer_dep_event_ids = frame.current_outer_dep_event_ids.clone();
 
     // Dispatch to pure projector
     let result = dispatch_pure_projector(recorded_by, event_id_b64, parsed, &ctx);

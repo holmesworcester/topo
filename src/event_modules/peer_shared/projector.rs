@@ -198,6 +198,7 @@ mod projector_tests {
         let frame = ProjectionFrameContext {
             current_transport_key_event_id: None,
             current_owner_event_id: None,
+            current_outer_dep_event_ids: Vec::new(),
             current_signer: Some(CurrentSignerInfo {
                 event_id: signer_event_id_b64.clone(),
                 semantic_type_code: EVENT_TYPE_DEVICE_INVITE,

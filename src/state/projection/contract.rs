@@ -213,6 +213,8 @@ pub struct ContextSnapshot {
     pub current_transport_key_event_id: Option<String>,
     /// For encrypted dependent events: outer wrapper owner_event_id, if present.
     pub current_owner_event_id: Option<String>,
+    /// For encrypted events: additional outer dependency event_ids, if present.
+    pub current_outer_dep_event_ids: Vec<String>,
     /// For signed events: currently verified outer signer, if present.
     pub current_signer: Option<CurrentSignerInfo>,
 

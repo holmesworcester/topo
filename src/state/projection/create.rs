@@ -437,6 +437,40 @@ pub fn project_event_staged(
     event_id_or_blocked(project_event(conn, recorded_by, event_id))
 }
 
+fn resolve_outer_dep_event_id(
+    conn: &Connection,
+    recorded_by: &str,
+    inner_event: &ParsedEvent,
+) -> Result<EventId, CreateEventError> {
+    match inner_event {
+        ParsedEvent::Message(message) => Ok(message.author_id),
+        ParsedEvent::Reaction(reaction) => Ok(reaction.author_id),
+        ParsedEvent::MessageDeletion(deletion) => Ok(deletion.target_event_id),
+        ParsedEvent::FileSlice(file_slice) => {
+            let file_id_b64 = crate::crypto::event_id_to_base64(&file_slice.file_id);
+            let descriptor_event_id_b64: String = conn
+                .query_row(
+                    "SELECT event_id FROM files WHERE recorded_by = ?1 AND file_id = ?2 LIMIT 1",
+                    rusqlite::params![recorded_by, &file_id_b64],
+                    |row| row.get(0),
+                )
+                .map_err(|e| {
+                    CreateEventError::DbError(format!(
+                        "file slice descriptor lookup for {}: {}",
+                        file_id_b64, e
+                    ))
+                })?;
+            crate::crypto::event_id_from_base64(&descriptor_event_id_b64).ok_or_else(|| {
+                CreateEventError::EncodeError(format!(
+                    "invalid file descriptor event id {} for file {}",
+                    descriptor_event_id_b64, file_id_b64
+                ))
+            })
+        }
+        _ => Ok(crate::event_modules::encrypted::NO_OUTER_DEP_EVENT_ID),
+    }
+}
+
 /// Create an encrypted event: encode inner event, optionally sign it,
 /// resolve encryption key from key_secrets, encrypt, build EncryptedEvent
 /// wrapper, then store and project.
@@ -515,6 +549,7 @@ pub fn create_encrypted_event_synchronous_with_owner(
         .map_err(|e| CreateEventError::EncodeError(e.to_string()))?;
 
     // 4. Build EncryptedEvent wrapper
+    let outer_dep_event_id = resolve_outer_dep_event_id(conn, recorded_by, inner_event)?;
     let wrapper = ParsedEvent::Encrypted(EncryptedEvent {
         // Preserve the inner event's logical timestamp on the wrapper so
         // recency-based discovery/sync policies can prioritize encrypted
@@ -522,6 +557,7 @@ pub fn create_encrypted_event_synchronous_with_owner(
         created_at_ms: inner_event.created_at_ms(),
         key_event_id: *key_event_id,
         owner_event_id: owner_event_id.copied().unwrap_or(NO_OWNER_EVENT_ID),
+        outer_dep_event_id,
         inner_type_code: inner_event.event_type_code(),
         nonce,
         ciphertext,

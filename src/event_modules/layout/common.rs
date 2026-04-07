@@ -32,13 +32,13 @@ pub const IDENTITY_PUBKEY_SIGNED_WIRE_SIZE: usize =
 
 /// Encrypted (type 5) header before ciphertext:
 ///   type(1) + created_at(8) + key_event_id(32) + owner_event_id(32)
-///   + inner_type_code(1) + nonce(12) = 86
-pub const ENCRYPTED_HEADER_BYTES: usize = COMMON_HEADER_BYTES + 32 + 32 + 1 + 12;
+///   + outer_dep_event_id(32) + inner_type_code(1) + nonce(12) = 118
+pub const ENCRYPTED_HEADER_BYTES: usize = COMMON_HEADER_BYTES + 32 + 32 + 32 + 1 + 12;
 
 /// Encrypted (type 5) auth_tag after ciphertext: 16 bytes
 pub const ENCRYPTED_AUTH_TAG_BYTES: usize = 16;
 
-/// Encrypted (type 5) overhead around ciphertext: header(86) + auth_tag(16) = 102
+/// Encrypted (type 5) overhead around ciphertext: header(118) + auth_tag(16) = 134
 pub const ENCRYPTED_OVERHEAD_BYTES: usize = ENCRYPTED_HEADER_BYTES + ENCRYPTED_AUTH_TAG_BYTES;
 
 /// Compute the total encrypted event wire size for a given inner type wire size.
@@ -156,7 +156,7 @@ mod tests {
 
     #[test]
     fn test_encrypted_overhead() {
-        assert_eq!(ENCRYPTED_OVERHEAD_BYTES, 102);
+        assert_eq!(ENCRYPTED_OVERHEAD_BYTES, 134);
     }
 
     #[test]
@@ -301,7 +301,7 @@ mod tests {
     fn test_encrypted_wire_size_message() {
         use super::super::super::message::wire::MESSAGE_WIRE_SIZE;
         use super::super::super::reaction::REACTION_WIRE_SIZE;
-        assert_eq!(encrypted_wire_size(MESSAGE_WIRE_SIZE), 1167);
-        assert_eq!(encrypted_wire_size(REACTION_WIRE_SIZE), 207);
+        assert_eq!(encrypted_wire_size(MESSAGE_WIRE_SIZE), 1199);
+        assert_eq!(encrypted_wire_size(REACTION_WIRE_SIZE), 271);
     }
 }

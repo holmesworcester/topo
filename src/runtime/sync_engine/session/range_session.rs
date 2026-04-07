@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -5,7 +6,7 @@ use negentropy::{Id, NegentropyStorageVector};
 use rusqlite::Connection;
 
 use crate::crypto::{event_id_to_base64, hash_event, EventId};
-use crate::db::store::{Store, SHARED_PRIORITY_LANE_AUTH, SHARED_PRIORITY_LANE_KEY};
+use crate::db::store::Store;
 use crate::protocol::neg_id_to_event_id;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::receive_log::ReceiveLogWriter;
@@ -14,6 +15,7 @@ use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
 
 const RANGE_DATA_RECORD_PREFIX_LEN: usize = 4;
+const CLOSURE_QUERY_BATCH: usize = 256;
 
 pub struct RangeReceiveResult {
     pub events_received: u64,
@@ -21,116 +23,158 @@ pub struct RangeReceiveResult {
     pub path: Option<PathBuf>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SharedIndexLoadPlan {
-    PriorityLane(&'static str),
-    TimeWindow,
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum SharedSendOrderPolicy {
-    PreserveInput,
-    OldestFirst,
-    NewestFirst,
-}
-
-fn decide_shared_index_load_plan(kind: SyncWindowKind) -> SharedIndexLoadPlan {
-    match kind {
-        SyncWindowKind::AuthGraph => SharedIndexLoadPlan::PriorityLane(SHARED_PRIORITY_LANE_AUTH),
-        SyncWindowKind::KeyGraph => SharedIndexLoadPlan::PriorityLane(SHARED_PRIORITY_LANE_KEY),
-        SyncWindowKind::Full
-        | SyncWindowKind::LastDay
-        | SyncWindowKind::LastWeek
-        | SyncWindowKind::LastTwelveWeeks => SharedIndexLoadPlan::TimeWindow,
-    }
-}
-
-fn decide_shared_send_order_policy(kind: SyncWindowKind) -> SharedSendOrderPolicy {
-    match kind {
-        SyncWindowKind::AuthGraph => SharedSendOrderPolicy::OldestFirst,
-        SyncWindowKind::KeyGraph | SyncWindowKind::LastDay => SharedSendOrderPolicy::NewestFirst,
-        SyncWindowKind::Full | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks => {
-            SharedSendOrderPolicy::PreserveInput
-        }
-    }
-}
-
-fn load_shared_index_entries(
+fn load_range_root_entries(
     conn: &Connection,
     workspace_id: &str,
     range: SyncWindow,
 ) -> Result<Vec<(i64, EventId)>, String> {
+    let mut stmt = conn
+        .prepare(
+            "SELECT ts, id
+             FROM shared_event_index
+             WHERE workspace_id = ?1
+               AND (?2 IS NULL OR ts >= ?2)
+               AND (?3 IS NULL OR ts < ?3)
+             ORDER BY ts, id",
+        )
+        .map_err(|e| format!("prepare shared index query: {e}"))?;
+    let mut rows = stmt
+        .query(rusqlite::params![
+            workspace_id,
+            range.ts_min(),
+            range.ts_max_exclusive()
+        ])
+        .map_err(|e| format!("query shared index rows: {e}"))?;
     let mut entries = Vec::new();
+    while let Some(row) = rows
+        .next()
+        .map_err(|e| format!("iterate shared index rows: {e}"))?
+    {
+        let ts: i64 = row
+            .get(0)
+            .map_err(|e| format!("read shared index ts: {e}"))?;
+        let id_blob: Vec<u8> = row
+            .get(1)
+            .map_err(|e| format!("read shared index id: {e}"))?;
+        if id_blob.len() != 32 {
+            continue;
+        }
+        let mut event_id = [0u8; 32];
+        event_id.copy_from_slice(&id_blob);
+        entries.push((ts, event_id));
+    }
+    Ok(entries)
+}
 
-    match decide_shared_index_load_plan(range.kind) {
-        SharedIndexLoadPlan::PriorityLane(lane) => {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT ts, id
-                     FROM shared_priority_event_index
-                     WHERE workspace_id = ?1
-                       AND lane = ?2
-                     ORDER BY ts, id",
-                )
-                .map_err(|e| format!("prepare shared priority index query: {e}"))?;
-            let mut rows = stmt
-                .query(rusqlite::params![workspace_id, lane])
-                .map_err(|e| format!("query shared priority index rows: {e}"))?;
-            while let Some(row) = rows
-                .next()
-                .map_err(|e| format!("iterate shared priority index rows: {e}"))?
-            {
-                let ts: i64 = row
-                    .get(0)
-                    .map_err(|e| format!("read shared priority index ts: {e}"))?;
-                let id_blob: Vec<u8> = row
-                    .get(1)
-                    .map_err(|e| format!("read shared priority index id: {e}"))?;
-                if id_blob.len() != 32 {
-                    continue;
-                }
-                let mut event_id = [0u8; 32];
-                event_id.copy_from_slice(&id_blob);
-                entries.push((ts, event_id));
+fn expand_transitive_shared_deps(
+    conn: &Connection,
+    seed_ids: &[EventId],
+) -> Result<Vec<(i64, EventId)>, String> {
+    if seed_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let mut discovered = Vec::new();
+    let mut visited: HashSet<EventId> = seed_ids.iter().copied().collect();
+    let mut frontier: Vec<EventId> = seed_ids.to_vec();
+
+    while !frontier.is_empty() {
+        let batch: Vec<EventId> = frontier
+            .drain(..frontier.len().min(CLOSURE_QUERY_BATCH))
+            .collect();
+        let placeholders = batch.iter().map(|_| "?").collect::<Vec<_>>().join(",");
+        let batch_ids: Vec<String> = batch.iter().map(event_id_to_base64).collect();
+
+        let sql = format!(
+            "SELECT d.dep_event_id, e.created_at
+             FROM event_deps d
+             JOIN events e ON e.event_id = d.dep_event_id
+             WHERE d.event_id IN ({})
+               AND e.share_scope = 'shared'
+             ORDER BY e.created_at ASC, d.dep_event_id ASC",
+            placeholders
+        );
+        let mut stmt = conn
+            .prepare(&sql)
+            .map_err(|e| format!("prepare dep closure query: {e}"))?;
+        let mut rows = stmt
+            .query(rusqlite::params_from_iter(batch_ids.iter()))
+            .map_err(|e| format!("query dep closure rows: {e}"))?;
+        while let Some(row) = rows
+            .next()
+            .map_err(|e| format!("iterate dep closure rows: {e}"))?
+        {
+            let dep_b64: String = row
+                .get(0)
+                .map_err(|e| format!("read dep closure dep_event_id: {e}"))?;
+            let created_at: i64 = row
+                .get(1)
+                .map_err(|e| format!("read dep closure created_at: {e}"))?;
+            let Some(dep_id) = crate::crypto::event_id_from_base64(&dep_b64) else {
+                continue;
+            };
+            if visited.insert(dep_id) {
+                frontier.push(dep_id);
+                discovered.push((created_at, dep_id));
             }
         }
-        SharedIndexLoadPlan::TimeWindow => {
-            let mut stmt = conn
-                .prepare(
-                    "SELECT ts, id
-                     FROM shared_event_index
-                     WHERE workspace_id = ?1
-                       AND (?2 IS NULL OR ts >= ?2)
-                       AND (?3 IS NULL OR ts < ?3)
-                     ORDER BY ts, id",
-                )
-                .map_err(|e| format!("prepare shared index query: {e}"))?;
-            let mut rows = stmt
-                .query(rusqlite::params![
-                    workspace_id,
-                    range.ts_min(),
-                    range.ts_max_exclusive()
-                ])
-                .map_err(|e| format!("query shared index rows: {e}"))?;
-            while let Some(row) = rows
-                .next()
-                .map_err(|e| format!("iterate shared index rows: {e}"))?
-            {
-                let ts: i64 = row
-                    .get(0)
-                    .map_err(|e| format!("read shared index ts: {e}"))?;
-                let id_blob: Vec<u8> = row
-                    .get(1)
-                    .map_err(|e| format!("read shared index id: {e}"))?;
-                if id_blob.len() != 32 {
-                    continue;
-                }
-                let mut event_id = [0u8; 32];
-                event_id.copy_from_slice(&id_blob);
-                entries.push((ts, event_id));
+
+        let carrier_sql = format!(
+            "SELECT DISTINCT ks.event_id, carrier.created_at
+             FROM event_deps d
+             JOIN key_shared ks ON ks.key_event_id = d.dep_event_id
+             JOIN events carrier ON carrier.event_id = ks.event_id
+             WHERE d.event_id IN ({})
+               AND d.dep_field_name = 'key_event_id'
+               AND carrier.share_scope = 'shared'
+             ORDER BY carrier.created_at ASC, ks.event_id ASC",
+            placeholders
+        );
+        let mut carrier_stmt = conn
+            .prepare(&carrier_sql)
+            .map_err(|e| format!("prepare key carrier closure query: {e}"))?;
+        let mut carrier_rows = carrier_stmt
+            .query(rusqlite::params_from_iter(batch_ids.iter()))
+            .map_err(|e| format!("query key carrier closure rows: {e}"))?;
+        while let Some(row) = carrier_rows
+            .next()
+            .map_err(|e| format!("iterate key carrier closure rows: {e}"))?
+        {
+            let carrier_b64: String = row
+                .get(0)
+                .map_err(|e| format!("read key carrier event_id: {e}"))?;
+            let created_at: i64 = row
+                .get(1)
+                .map_err(|e| format!("read key carrier created_at: {e}"))?;
+            let Some(carrier_id) = crate::crypto::event_id_from_base64(&carrier_b64) else {
+                continue;
+            };
+            if visited.insert(carrier_id) {
+                frontier.push(carrier_id);
+                discovered.push((created_at, carrier_id));
             }
         }
     }
+
+    Ok(discovered)
+}
+
+fn load_shared_window_entries(
+    conn: &Connection,
+    workspace_id: &str,
+    range: SyncWindow,
+) -> Result<Vec<(i64, EventId)>, String> {
+    let roots = load_range_root_entries(conn, workspace_id, range)?;
+    let root_ids: Vec<EventId> = roots.iter().map(|(_, id)| *id).collect();
+    let deps = expand_transitive_shared_deps(conn, &root_ids)?;
+    let mut all_by_id: HashMap<EventId, i64> = HashMap::with_capacity(roots.len() + deps.len());
+    for (ts, event_id) in roots.into_iter().chain(deps.into_iter()) {
+        all_by_id.entry(event_id).or_insert(ts);
+    }
+    let mut entries: Vec<(i64, EventId)> = all_by_id.into_iter().map(|(id, ts)| (ts, id)).collect();
+    entries.sort_by(|(left_ts, left_id), (right_ts, right_id)| {
+        left_ts.cmp(right_ts).then_with(|| left_id.cmp(right_id))
+    });
     Ok(entries)
 }
 
@@ -140,7 +184,7 @@ pub fn load_shared_event_index_slice(
     range: SyncWindow,
 ) -> Result<NegentropyStorageVector, String> {
     let mut storage = NegentropyStorageVector::new();
-    for (ts, event_id) in load_shared_index_entries(conn, workspace_id, range)? {
+    for (ts, event_id) in load_shared_window_entries(conn, workspace_id, range)? {
         storage
             .insert(ts.max(0) as u64, Id::from_byte_array(event_id))
             .map_err(|e| format!("insert negentropy vector item: {e}"))?;
@@ -174,36 +218,68 @@ pub fn load_shared_send_batch(
     Ok(ordered)
 }
 
+fn dependency_rank(
+    event_id: EventId,
+    ids_in_batch: &HashSet<EventId>,
+    edges: &HashMap<EventId, Vec<EventId>>,
+    memo: &mut HashMap<EventId, usize>,
+    visiting: &mut HashSet<EventId>,
+) -> usize {
+    if let Some(rank) = memo.get(&event_id) {
+        return *rank;
+    }
+    if !visiting.insert(event_id) {
+        return 0;
+    }
+    let mut rank = 0usize;
+    if let Some(deps) = edges.get(&event_id) {
+        for dep_id in deps {
+            if !ids_in_batch.contains(dep_id) {
+                continue;
+            }
+            rank = rank.max(1 + dependency_rank(*dep_id, ids_in_batch, edges, memo, visiting));
+        }
+    }
+    visiting.remove(&event_id);
+    memo.insert(event_id, rank);
+    rank
+}
+
 fn prioritize_send_order(
     store: &Store<'_>,
     range: SyncWindow,
     ids: &[EventId],
 ) -> Result<Vec<EventId>, String> {
-    let order_policy = decide_shared_send_order_policy(range.kind);
-    if matches!(order_policy, SharedSendOrderPolicy::PreserveInput) {
-        return Ok(ids.to_vec());
+    if ids.is_empty() {
+        return Ok(Vec::new());
     }
 
     let created_at_by_id = store
         .get_shared_created_at_batch(ids)
         .map_err(|e| format!("load shared created_at batch: {e}"))?;
+    let edges = store
+        .get_shared_dep_edges_batch(ids)
+        .map_err(|e| format!("load shared dep edges batch: {e}"))?;
+    let ids_in_batch: HashSet<EventId> = ids.iter().copied().collect();
+    let mut memo = HashMap::new();
     let mut ordered: Vec<EventId> = ids
         .iter()
         .filter(|event_id| created_at_by_id.contains_key(*event_id))
         .copied()
         .collect();
     ordered.sort_by(|left, right| {
+        let left_rank = dependency_rank(*left, &ids_in_batch, &edges, &mut memo, &mut HashSet::new());
+        let right_rank = dependency_rank(*right, &ids_in_batch, &edges, &mut memo, &mut HashSet::new());
         let left_ts = created_at_by_id.get(left).copied().unwrap_or_default();
         let right_ts = created_at_by_id.get(right).copied().unwrap_or_default();
-        match order_policy {
-            SharedSendOrderPolicy::OldestFirst => {
-                left_ts.cmp(&right_ts).then_with(|| left.cmp(right))
-            }
-            SharedSendOrderPolicy::NewestFirst => {
-                right_ts.cmp(&left_ts).then_with(|| right.cmp(left))
-            }
-            SharedSendOrderPolicy::PreserveInput => left.cmp(right),
-        }
+        left_rank
+            .cmp(&right_rank)
+            .then_with(|| match range.kind {
+                SyncWindowKind::LastDay => right_ts.cmp(&left_ts).then_with(|| right.cmp(left)),
+                SyncWindowKind::Full | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks => {
+                    left_ts.cmp(&right_ts).then_with(|| left.cmp(right))
+                }
+            })
     });
     Ok(ordered)
 }
@@ -328,358 +404,271 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::crypto::hash_event;
+    use crate::crypto::{hash_event, spki_fingerprint_from_ed25519_pubkey};
     use crate::db::open_in_memory;
     use crate::db::schema::create_tables;
     use crate::db::store::{insert_event, insert_shared_event_index_entry_if_shared};
-    use crate::event_modules::{
-        encode_event, endpoint_shared, registry::ShareScope, removal::frontier_hash_from_refs,
-        KeyRotationEvent, MessageEvent, ParsedEvent, PeerSharedEvent, RemovalEvent,
+    use crate::event_modules::message::{create as create_message, CreateMessageCmd};
+    use crate::event_modules::workspace::{
+        commands::{create_workspace_with_options, CreateWorkspaceOptions},
+        identity_ops::{create_user_invite_events_as_admin_at, ensure_content_key_for_peer},
+        load_local_authoring_context,
     };
+    use crate::event_modules::{encode_event, BenchDepEvent, ParsedEvent, ShareScope};
+
+    fn insert_shared_bench_dep(
+        conn: &Connection,
+        workspace_id: &str,
+        created_at_ms: i64,
+        dep_ids: Vec<EventId>,
+        payload_byte: u8,
+    ) -> EventId {
+        let event = ParsedEvent::BenchDep(BenchDepEvent {
+            created_at_ms: created_at_ms as u64,
+            dep_ids,
+            payload: [payload_byte; 16],
+        });
+        let blob = encode_event(&event).unwrap();
+        let event_id = hash_event(&blob);
+        insert_event(
+            conn,
+            &event_id,
+            "bench_dep_perf_testing",
+            &blob,
+            ShareScope::Shared,
+            created_at_ms,
+            created_at_ms,
+        )
+        .unwrap();
+        insert_shared_event_index_entry_if_shared(
+            conn,
+            ShareScope::Shared,
+            created_at_ms,
+            &event_id,
+            workspace_id,
+            &blob,
+        )
+        .unwrap();
+        event_id
+    }
+    const DAY_MS: i64 = 24 * 60 * 60 * 1000;
+
+    struct HotMessageFixture {
+        workspace_id_b64: String,
+        message_event_id: EventId,
+        signer_event_id: EventId,
+        author_event_id: EventId,
+        key_event_id: EventId,
+        key_shared_event_id: EventId,
+        message_created_at_ms: i64,
+    }
+
+    fn event_created_at(conn: &Connection, event_id: &EventId) -> i64 {
+        conn.query_row(
+            "SELECT created_at FROM events WHERE event_id = ?1",
+            rusqlite::params![crate::crypto::event_id_to_base64(event_id)],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn first_admin_event_id(conn: &Connection, recorded_by: &str) -> EventId {
+        let event_id_b64: String = conn
+            .query_row(
+                "SELECT a.event_id
+                 FROM admins a
+                 JOIN events e ON e.event_id = a.event_id
+                 WHERE a.recorded_by = ?1
+                 ORDER BY e.created_at ASC, a.event_id ASC
+                 LIMIT 1",
+                rusqlite::params![recorded_by],
+                |row| row.get(0),
+            )
+            .unwrap();
+        crate::crypto::event_id_from_base64(&event_id_b64).unwrap()
+    }
+
+    fn first_key_shared_for_key(conn: &Connection, recorded_by: &str, key_event_id: &EventId) -> EventId {
+        let event_id_b64: String = conn
+            .query_row(
+                "SELECT ks.event_id
+                 FROM key_shared ks
+                 JOIN events e ON e.event_id = ks.event_id
+                 WHERE ks.recorded_by = ?1
+                   AND ks.key_event_id = ?2
+                 ORDER BY e.created_at ASC, ks.event_id ASC
+                 LIMIT 1",
+                rusqlite::params![
+                    recorded_by,
+                    crate::crypto::event_id_to_base64(key_event_id),
+                ],
+                |row| row.get(0),
+            )
+            .unwrap();
+        crate::crypto::event_id_from_base64(&event_id_b64).unwrap()
+    }
+
+    fn seed_hot_message_with_old_key_share(conn: &Connection) -> HotMessageFixture {
+        let end_at_ms = crate::db::queue::current_timestamp_ms().max(31 * DAY_MS) as u64;
+        let create = create_workspace_with_options(
+            conn,
+            "bootstrap",
+            "workspace",
+            "alice",
+            "laptop",
+            CreateWorkspaceOptions {
+                message_count: 0,
+                network_age_ms: Some((30 * DAY_MS) as u64),
+                end_at_ms: Some(end_at_ms),
+            },
+        )
+        .unwrap();
+        let recorded_by = hex::encode(spki_fingerprint_from_ed25519_pubkey(
+            &create.peer_shared_key.verifying_key().to_bytes(),
+        ));
+        let ctx = load_local_authoring_context(conn, &recorded_by).unwrap();
+        let key_event_id = ensure_content_key_for_peer(conn, &recorded_by).unwrap();
+        let admin_event_id = first_admin_event_id(conn, &recorded_by);
+        let invite_created_at_ms = end_at_ms.saturating_sub((20 * DAY_MS) as u64);
+        let _invite = create_user_invite_events_as_admin_at(
+            conn,
+            &recorded_by,
+            &create.peer_shared_key,
+            &create.peer_shared_event_id,
+            &admin_event_id,
+            &create.workspace_id,
+            invite_created_at_ms,
+            None,
+        )
+        .unwrap();
+        let key_shared_event_id = first_key_shared_for_key(conn, &recorded_by, &key_event_id);
+        let message_event_id = create_message(
+            conn,
+            &recorded_by,
+            &ctx.signer_event_id,
+            &ctx.signing_key,
+            end_at_ms,
+            CreateMessageCmd {
+                workspace_id: ctx.workspace_id,
+                author_id: ctx.author_id,
+                content: "fresh hot message".to_string(),
+            },
+        )
+        .unwrap();
+
+        HotMessageFixture {
+            workspace_id_b64: crate::crypto::event_id_to_base64(&create.workspace_id),
+            message_event_id,
+            signer_event_id: ctx.signer_event_id,
+            author_event_id: ctx.author_id,
+            key_event_id,
+            key_shared_event_id,
+            message_created_at_ms: end_at_ms as i64,
+        }
+    }
 
     #[test]
-    fn shared_send_batch_returns_requested_events_only() {
+    fn load_shared_send_batch_returns_requested_events_only() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
-
-        let endpoint_event = endpoint_shared::deterministic_endpoint_shared_event([0x11; 32]);
-        let endpoint_blob = encode_event(&endpoint_event).unwrap();
-        let endpoint_event_id = hash_event(&endpoint_blob);
-        insert_event(
-            &conn,
-            &endpoint_event_id,
-            "endpoint_shared",
-            &endpoint_blob,
-            ShareScope::Shared,
-            1,
-            1,
-        )
-        .unwrap();
-
-        let peer_shared_event = ParsedEvent::PeerShared(PeerSharedEvent {
-            created_at_ms: 2,
-            public_key: [0x22; 32],
-            user_event_id: [0x33; 32],
-            endpoint_shared_event_id: endpoint_event_id,
-            device_name: "device".to_string(),
-        });
-        let peer_shared_blob = encode_event(&peer_shared_event).unwrap();
-        let peer_shared_event_id = hash_event(&peer_shared_blob);
-        insert_event(
-            &conn,
-            &peer_shared_event_id,
-            "peer_shared",
-            &peer_shared_blob,
-            ShareScope::Shared,
-            2,
-            2,
-        )
-        .unwrap();
-
         let store = Store::new(&conn);
-        let ordered = load_shared_send_batch(&store, &[peer_shared_event_id]).unwrap();
+        let workspace_id = "ws-1";
 
+        let dep_id = insert_shared_bench_dep(&conn, workspace_id, 10, vec![], 0x11);
+        let root_id = insert_shared_bench_dep(&conn, workspace_id, 20, vec![dep_id], 0x22);
+
+        let ordered = load_shared_send_batch(&store, &[root_id]).unwrap();
         assert_eq!(ordered.len(), 1);
-        assert_eq!(ordered[0].0, peer_shared_event_id);
+        assert_eq!(ordered[0].0, root_id);
     }
 
     #[test]
-    fn shared_send_batch_preserves_requested_order_without_extra_deps() {
+    fn load_shared_window_entries_include_transitive_deps_outside_root_range() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
+        let workspace_id = "ws-1";
 
-        let endpoint_event = endpoint_shared::deterministic_endpoint_shared_event([0x55; 32]);
-        let endpoint_blob = encode_event(&endpoint_event).unwrap();
-        let endpoint_event_id = hash_event(&endpoint_blob);
-        insert_event(
+        let dep_id = insert_shared_bench_dep(&conn, workspace_id, 10, vec![], 0x11);
+        let mid_id = insert_shared_bench_dep(&conn, workspace_id, 20, vec![dep_id], 0x22);
+        let root_id = insert_shared_bench_dep(&conn, workspace_id, 100, vec![mid_id], 0x33);
+
+        let entries = load_shared_window_entries(
             &conn,
-            &endpoint_event_id,
-            "endpoint_shared",
-            &endpoint_blob,
-            ShareScope::Shared,
-            1,
-            1,
+            workspace_id,
+            SyncWindow {
+                kind: SyncWindowKind::LastDay,
+                ts_min_inclusive_ms: Some(90),
+                ts_max_exclusive_ms: None,
+            },
         )
         .unwrap();
+        let ids: HashSet<EventId> = entries.into_iter().map(|(_, id)| id).collect();
+        assert!(ids.contains(&root_id));
+        assert!(ids.contains(&mid_id));
+        assert!(ids.contains(&dep_id));
+    }
 
-        let peer_shared_event = ParsedEvent::PeerShared(PeerSharedEvent {
-            created_at_ms: 2,
-            public_key: [0x66; 32],
-            user_event_id: [0x77; 32],
-            endpoint_shared_event_id: endpoint_event_id,
-            device_name: "device".to_string(),
-        });
-        let peer_shared_blob = encode_event(&peer_shared_event).unwrap();
-        let peer_shared_event_id = hash_event(&peer_shared_blob);
-        insert_event(
-            &conn,
-            &peer_shared_event_id,
-            "peer_shared",
-            &peer_shared_blob,
-            ShareScope::Shared,
-            2,
-            2,
-        )
-        .unwrap();
-
+    #[test]
+    fn prioritize_send_order_puts_deps_before_dependents() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let workspace_id = "ws-1";
         let store = Store::new(&conn);
-        let ordered =
-            load_shared_send_batch(&store, &[endpoint_event_id, peer_shared_event_id]).unwrap();
 
-        assert_eq!(ordered.len(), 2);
-        assert_eq!(ordered[0].0, endpoint_event_id);
-        assert_eq!(ordered[1].0, peer_shared_event_id);
-    }
+        let dep_id = insert_shared_bench_dep(&conn, workspace_id, 10, vec![], 0x11);
+        let root_id = insert_shared_bench_dep(&conn, workspace_id, 100, vec![dep_id], 0x22);
 
-    #[test]
-    fn priority_index_entries_split_auth_and_key_preflight_lanes() {
-        assert_eq!(
-            decide_shared_index_load_plan(SyncWindowKind::AuthGraph),
-            SharedIndexLoadPlan::PriorityLane(SHARED_PRIORITY_LANE_AUTH)
-        );
-        assert_eq!(
-            decide_shared_index_load_plan(SyncWindowKind::KeyGraph),
-            SharedIndexLoadPlan::PriorityLane(SHARED_PRIORITY_LANE_KEY)
-        );
-
-        let conn = open_in_memory().unwrap();
-        create_tables(&conn).unwrap();
-        let workspace_id = "workspace-auth-key";
-
-        let endpoint_event = endpoint_shared::deterministic_endpoint_shared_event([0x10; 32]);
-        let endpoint_blob = encode_event(&endpoint_event).unwrap();
-        let endpoint_event_id = hash_event(&endpoint_blob);
-        insert_event(
-            &conn,
-            &endpoint_event_id,
-            "endpoint_shared",
-            &endpoint_blob,
-            ShareScope::Shared,
-            10,
-            10,
-        )
-        .unwrap();
-        insert_shared_event_index_entry_if_shared(
-            &conn,
-            ShareScope::Shared,
-            10,
-            &endpoint_event_id,
-            workspace_id,
-            &endpoint_blob,
-        )
-        .unwrap();
-
-        let removal_event = ParsedEvent::Removal(RemovalEvent {
-            created_at_ms: 15,
-            removed_member_ref: [0x15; 32],
-            parent_count: 0,
-            parent_1: [0; 32],
-            parent_2: [0; 32],
-            parent_3: [0; 32],
-            parent_4: [0; 32],
-            frontier_hash: frontier_hash_from_refs(&[]),
-            removed_by: [0x16; 32],
-        });
-        let removal_blob = encode_event(&removal_event).unwrap();
-        let removal_event_id = hash_event(&removal_blob);
-        insert_event(
-            &conn,
-            &removal_event_id,
-            "removal",
-            &removal_blob,
-            ShareScope::Shared,
-            15,
-            15,
-        )
-        .unwrap();
-        insert_shared_event_index_entry_if_shared(
-            &conn,
-            ShareScope::Shared,
-            15,
-            &removal_event_id,
-            workspace_id,
-            &removal_blob,
-        )
-        .unwrap();
-
-        let key_rotation_event = ParsedEvent::KeyRotation(KeyRotationEvent {
-            created_at_ms: 20,
-            key_event_id: [0x20; 32],
-            frontier_count: 0,
-            frontier_ref_1: [0; 32],
-            frontier_ref_2: [0; 32],
-            frontier_ref_3: [0; 32],
-            frontier_ref_4: [0; 32],
-            frontier_hash: [0; 32],
-            rotated_by: [0x21; 32],
-        });
-        let key_rotation_blob = encode_event(&key_rotation_event).unwrap();
-        let key_rotation_event_id = hash_event(&key_rotation_blob);
-        insert_event(
-            &conn,
-            &key_rotation_event_id,
-            "key_rotation",
-            &key_rotation_blob,
-            ShareScope::Shared,
-            20,
-            20,
-        )
-        .unwrap();
-        insert_shared_event_index_entry_if_shared(
-            &conn,
-            ShareScope::Shared,
-            20,
-            &key_rotation_event_id,
-            workspace_id,
-            &key_rotation_blob,
-        )
-        .unwrap();
-
-        let message_event = ParsedEvent::Message(MessageEvent {
-            created_at_ms: 30,
-            workspace_id: [0x30; 32],
-            author_id: [0x31; 32],
-            content: "hello".to_string(),
-        });
-        let message_blob = encode_event(&message_event).unwrap();
-        let message_event_id = hash_event(&message_blob);
-        insert_event(
-            &conn,
-            &message_event_id,
-            "message",
-            &message_blob,
-            ShareScope::Shared,
-            30,
-            30,
-        )
-        .unwrap();
-        insert_shared_event_index_entry_if_shared(
-            &conn,
-            ShareScope::Shared,
-            30,
-            &message_event_id,
-            workspace_id,
-            &message_blob,
-        )
-        .unwrap();
-
-        let auth_entries = load_shared_index_entries(
-            &conn,
-            workspace_id,
-            SyncWindow {
-                kind: SyncWindowKind::AuthGraph,
-                ts_min_inclusive_ms: None,
-                ts_max_exclusive_ms: None,
-            },
-        )
-        .unwrap();
-        let key_entries = load_shared_index_entries(
-            &conn,
-            workspace_id,
-            SyncWindow {
-                kind: SyncWindowKind::KeyGraph,
-                ts_min_inclusive_ms: None,
-                ts_max_exclusive_ms: None,
-            },
-        )
-        .unwrap();
-
-        assert_eq!(
-            auth_entries,
-            vec![(10, endpoint_event_id), (15, removal_event_id)]
-        );
-        assert_eq!(key_entries, vec![(20, key_rotation_event_id)]);
-    }
-
-    #[test]
-    fn prioritize_send_order_matches_lane_policy() {
-        assert_eq!(
-            decide_shared_send_order_policy(SyncWindowKind::AuthGraph),
-            SharedSendOrderPolicy::OldestFirst
-        );
-        assert_eq!(
-            decide_shared_send_order_policy(SyncWindowKind::KeyGraph),
-            SharedSendOrderPolicy::NewestFirst
-        );
-        assert_eq!(
-            decide_shared_send_order_policy(SyncWindowKind::Full),
-            SharedSendOrderPolicy::PreserveInput
-        );
-
-        let conn = open_in_memory().unwrap();
-        create_tables(&conn).unwrap();
-
-        let first = ParsedEvent::Message(MessageEvent {
-            created_at_ms: 10,
-            workspace_id: [0x41; 32],
-            author_id: [0x42; 32],
-            content: "first".to_string(),
-        });
-        let second = ParsedEvent::Message(MessageEvent {
-            created_at_ms: 20,
-            workspace_id: [0x41; 32],
-            author_id: [0x42; 32],
-            content: "second".to_string(),
-        });
-        let first_blob = encode_event(&first).unwrap();
-        let second_blob = encode_event(&second).unwrap();
-        let first_id = hash_event(&first_blob);
-        let second_id = hash_event(&second_blob);
-        insert_event(
-            &conn,
-            &first_id,
-            "message",
-            &first_blob,
-            ShareScope::Shared,
-            10,
-            10,
-        )
-        .unwrap();
-        insert_event(
-            &conn,
-            &second_id,
-            "message",
-            &second_blob,
-            ShareScope::Shared,
-            20,
-            20,
-        )
-        .unwrap();
-
-        let store = Store::new(&conn);
-        let auth_order = prioritize_send_order(
-            &store,
-            SyncWindow {
-                kind: SyncWindowKind::AuthGraph,
-                ts_min_inclusive_ms: None,
-                ts_max_exclusive_ms: None,
-            },
-            &[second_id, first_id],
-        )
-        .unwrap();
-        let key_order = prioritize_send_order(
-            &store,
-            SyncWindow {
-                kind: SyncWindowKind::KeyGraph,
-                ts_min_inclusive_ms: None,
-                ts_max_exclusive_ms: None,
-            },
-            &[first_id, second_id],
-        )
-        .unwrap();
-        let hot_order = prioritize_send_order(
+        let ordered = prioritize_send_order(
             &store,
             SyncWindow {
                 kind: SyncWindowKind::LastDay,
-                ts_min_inclusive_ms: Some(0),
+                ts_min_inclusive_ms: Some(90),
                 ts_max_exclusive_ms: None,
             },
-            &[first_id, second_id],
+            &[root_id, dep_id],
         )
         .unwrap();
+        assert_eq!(ordered, vec![dep_id, root_id]);
+    }
 
-        assert_eq!(auth_order, vec![first_id, second_id]);
-        assert_eq!(key_order, vec![second_id, first_id]);
-        assert_eq!(hot_order, vec![second_id, first_id]);
+    #[test]
+    fn last_day_range_includes_old_auth_and_key_share_deps_for_hot_message() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let fixture = seed_hot_message_with_old_key_share(&conn);
+        let cutoff = fixture.message_created_at_ms - DAY_MS;
+
+        assert!(event_created_at(&conn, &fixture.message_event_id) >= cutoff);
+        assert!(event_created_at(&conn, &fixture.signer_event_id) < cutoff);
+        assert!(event_created_at(&conn, &fixture.author_event_id) < cutoff);
+        assert!(event_created_at(&conn, &fixture.key_shared_event_id) < cutoff);
+
+        let range = SyncWindow {
+            kind: SyncWindowKind::LastDay,
+            ts_min_inclusive_ms: Some(cutoff),
+            ts_max_exclusive_ms: None,
+        };
+        let entries = load_shared_window_entries(&conn, &fixture.workspace_id_b64, range).unwrap();
+        let ids: Vec<EventId> = entries.iter().map(|(_, id)| *id).collect();
+        let id_set: HashSet<EventId> = ids.iter().copied().collect();
+
+        assert!(id_set.contains(&fixture.message_event_id));
+        assert!(id_set.contains(&fixture.signer_event_id));
+        assert!(id_set.contains(&fixture.author_event_id));
+        assert!(id_set.contains(&fixture.key_shared_event_id));
+        assert!(!id_set.contains(&fixture.key_event_id));
+
+        let store = Store::new(&conn);
+        let ordered = prioritize_send_order(&store, range, &ids).unwrap();
+        let pos = |event_id: EventId| {
+            ordered
+                .iter()
+                .position(|candidate| *candidate == event_id)
+                .unwrap()
+        };
+
+        assert!(pos(fixture.author_event_id) < pos(fixture.signer_event_id));
+        assert!(pos(fixture.signer_event_id) < pos(fixture.message_event_id));
+        assert!(pos(fixture.key_shared_event_id) < pos(fixture.message_event_id));
     }
 }

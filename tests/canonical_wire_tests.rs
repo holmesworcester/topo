@@ -107,6 +107,7 @@ fn golden_bytes_encrypted() {
         created_at_ms: 3000,
         key_event_id: [0x77; 32],
         owner_event_id: [0x66; 32],
+        outer_dep_event_id: [0x55; 32],
         inner_type_code: 2,
         nonce: [0x88; 12],
         ciphertext: vec![0x99; ct_size],
@@ -118,10 +119,11 @@ fn golden_bytes_encrypted() {
     assert_eq!(blob[0], 5);
     assert_eq!(&blob[9..41], &[0x77; 32]);
     assert_eq!(&blob[41..73], &[0x66; 32]);
-    assert_eq!(blob[73], 2); // inner_type_code
-    assert_eq!(&blob[74..86], &[0x88; 12]); // nonce
-    assert_eq!(&blob[86..86 + ct_size], &vec![0x99; ct_size]); // ciphertext
-    let tag_start = 86 + ct_size;
+    assert_eq!(&blob[73..105], &[0x55; 32]);
+    assert_eq!(blob[105], 2); // inner_type_code
+    assert_eq!(&blob[106..118], &[0x88; 12]); // nonce
+    assert_eq!(&blob[118..118 + ct_size], &vec![0x99; ct_size]); // ciphertext
+    let tag_start = 118 + ct_size;
     assert_eq!(&blob[tag_start..tag_start + 16], &[0xAA; 16]); // auth_tag
 }
 
@@ -299,6 +301,7 @@ fn truncation_encrypted() {
         created_at_ms: 100,
         key_event_id: [0u8; 32],
         owner_event_id: [0u8; 32],
+        outer_dep_event_id: [0u8; 32],
         inner_type_code: 1,
         nonce: [0u8; 12],
         ciphertext: vec![0u8; ct_size],
@@ -695,6 +698,7 @@ fn idempotent_encrypted() {
         created_at_ms: 400,
         key_event_id: [11u8; 32],
         owner_event_id: [10u8; 32],
+        outer_dep_event_id: [9u8; 32],
         inner_type_code: 1,
         nonce: [12u8; 12],
         ciphertext: vec![13u8; ct_size],

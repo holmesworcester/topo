@@ -154,6 +154,7 @@ pub(super) fn wrap_test_content_blob(conn: &Connection, recorded_by: &str, blob:
         key_event_id,
         owner_event_id: owner_event_id
             .unwrap_or(crate::event_modules::encrypted::NO_OWNER_EVENT_ID),
+        outer_dep_event_id: crate::event_modules::encrypted::NO_OUTER_DEP_EVENT_ID,
         inner_type_code: type_code,
         nonce,
         ciphertext,
@@ -691,6 +692,7 @@ pub(super) fn make_encrypted_event_with_owner(
         owner_event_id: owner_event_id
             .copied()
             .unwrap_or(crate::event_modules::encrypted::NO_OWNER_EVENT_ID),
+        outer_dep_event_id: crate::event_modules::encrypted::NO_OUTER_DEP_EVENT_ID,
         inner_type_code,
         nonce,
         ciphertext,

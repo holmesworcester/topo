@@ -117,6 +117,7 @@ mod projector_tests {
         let frame = ProjectionFrameContext {
             current_transport_key_event_id: None,
             current_owner_event_id: None,
+            current_outer_dep_event_ids: Vec::new(),
             current_signer: Some(CurrentSignerInfo {
                 event_id: crate::crypto::event_id_to_base64(&[3u8; 32]),
                 semantic_type_code: EVENT_TYPE_WORKSPACE,

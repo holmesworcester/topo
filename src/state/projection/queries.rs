@@ -81,6 +81,7 @@ impl DepLoadResult {
 pub struct ProjectionFrameContext {
     pub current_transport_key_event_id: Option<String>,
     pub current_owner_event_id: Option<String>,
+    pub current_outer_dep_event_ids: Vec<String>,
     pub current_signer: Option<CurrentSignerInfo>,
 }
 

@@ -422,6 +422,32 @@ fn emit_key_shared_for_invite_target(
     unwrap_key_event_id: &EventId,
     recipient_public_key: &[u8; 32],
 ) -> Result<Option<EventId>, Box<dyn std::error::Error + Send + Sync>> {
+    emit_key_shared_for_invite_target_at(
+        conn,
+        recorded_by,
+        sender_peer_shared_key,
+        sender_peer_shared_event_id,
+        key_event_id,
+        frontier_refs,
+        recipient_event_id,
+        unwrap_key_event_id,
+        recipient_public_key,
+        current_timestamp_ms_u64(),
+    )
+}
+
+fn emit_key_shared_for_invite_target_at(
+    conn: &Connection,
+    recorded_by: &str,
+    sender_peer_shared_key: &SigningKey,
+    sender_peer_shared_event_id: &EventId,
+    key_event_id: &EventId,
+    frontier_refs: &[EventId],
+    recipient_event_id: &EventId,
+    unwrap_key_event_id: &EventId,
+    recipient_public_key: &[u8; 32],
+    created_at_ms: u64,
+) -> Result<Option<EventId>, Box<dyn std::error::Error + Send + Sync>> {
     let plaintext_key = load_key_secret_bytes(conn, recorded_by, key_event_id)?;
     let recipient_vk = VerifyingKey::from_bytes(recipient_public_key)
         .map_err(|err| format!("invalid invite public key: {err}"))?;
@@ -446,7 +472,7 @@ fn emit_key_shared_for_invite_target(
     let wrapped = wrap_key_for_recipient(sender_peer_shared_key, &recipient_vk, &plaintext_key);
     let slots = slotted_frontier_refs(frontier_refs)?;
     let event = ParsedEvent::KeyShared(KeySharedEvent {
-        created_at_ms: current_timestamp_ms_u64(),
+        created_at_ms,
         key_event_id: *key_event_id,
         frontier_count: frontier_refs.len() as u8,
         frontier_ref_1: slots[0],
@@ -532,7 +558,7 @@ fn active_invite_targets_with_local_secrets(
     Ok(out)
 }
 
-fn emit_recent_key_history_for_invite(
+fn emit_recent_key_history_for_invite_at(
     conn: &Connection,
     recorded_by: &str,
     sender_peer_shared_key: &SigningKey,
@@ -540,11 +566,12 @@ fn emit_recent_key_history_for_invite(
     invite_event_id: &EventId,
     invite_public_key: &[u8; 32],
     unwrap_key_event_id: &EventId,
+    created_at_ms: u64,
     history_cap: usize,
 ) -> Result<usize, Box<dyn std::error::Error + Send + Sync>> {
     let mut emitted = 0usize;
     for rotation in recent_key_rotations_for_peer(conn, recorded_by, history_cap)? {
-        if emit_key_shared_for_invite_target(
+        if emit_key_shared_for_invite_target_at(
             conn,
             recorded_by,
             sender_peer_shared_key,
@@ -554,6 +581,7 @@ fn emit_recent_key_history_for_invite(
             invite_event_id,
             unwrap_key_event_id,
             invite_public_key,
+            created_at_ms,
         )?
         .is_some()
         {
@@ -746,10 +774,30 @@ pub(crate) fn wrap_content_key_for_invite(
     invite_key: &SigningKey,
     invite_event_id: &EventId,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    wrap_content_key_for_invite_at(
+        conn,
+        recorded_by,
+        sender_peer_shared_key,
+        sender_peer_shared_event_id,
+        invite_key,
+        invite_event_id,
+        current_timestamp_ms_u64(),
+    )
+}
+
+pub(crate) fn wrap_content_key_for_invite_at(
+    conn: &Connection,
+    recorded_by: &str,
+    sender_peer_shared_key: &SigningKey,
+    sender_peer_shared_event_id: &EventId,
+    invite_key: &SigningKey,
+    invite_event_id: &EventId,
+    created_at_ms: u64,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     let _ = ensure_content_key_for_peer(conn, recorded_by)?;
     let invite_secret_event_id =
         store_invite_secret(conn, recorded_by, invite_event_id, invite_key)?;
-    let _ = emit_recent_key_history_for_invite(
+    let _ = emit_recent_key_history_for_invite_at(
         conn,
         recorded_by,
         sender_peer_shared_key,
@@ -757,6 +805,7 @@ pub(crate) fn wrap_content_key_for_invite(
         invite_event_id,
         &invite_key.verifying_key().to_bytes(),
         &invite_secret_event_id,
+        created_at_ms,
         INVITE_HISTORY_KEY_CAP,
     )?;
     Ok(())
@@ -849,7 +898,29 @@ pub(crate) fn create_user_invite_events_as_admin(
     workspace_id: &EventId,
     bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
 ) -> Result<InviteData, Box<dyn std::error::Error + Send + Sync>> {
-    create_user_invite_events_with_signer(
+    create_user_invite_events_as_admin_at(
+        conn,
+        recorded_by,
+        admin_peer_shared_key,
+        admin_peer_shared_event_id,
+        admin_event_id,
+        workspace_id,
+        current_timestamp_ms_u64(),
+        bootstrap_ctx,
+    )
+}
+
+pub(crate) fn create_user_invite_events_as_admin_at(
+    conn: &Connection,
+    recorded_by: &str,
+    admin_peer_shared_key: &SigningKey,
+    admin_peer_shared_event_id: &EventId,
+    admin_event_id: &EventId,
+    workspace_id: &EventId,
+    created_at_ms: u64,
+    bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
+) -> Result<InviteData, Box<dyn std::error::Error + Send + Sync>> {
+    create_user_invite_events_with_signer_at(
         conn,
         recorded_by,
         admin_peer_shared_key,
@@ -858,11 +929,12 @@ pub(crate) fn create_user_invite_events_as_admin(
         workspace_id,
         Some(admin_peer_shared_key),
         Some(admin_peer_shared_event_id),
+        created_at_ms,
         bootstrap_ctx,
     )
 }
 
-fn create_user_invite_events_with_signer(
+fn create_user_invite_events_with_signer_at(
     conn: &Connection,
     recorded_by: &str,
     signer_key: &SigningKey,
@@ -871,6 +943,7 @@ fn create_user_invite_events_with_signer(
     workspace_id: &EventId,
     sender_peer_shared_key: Option<&SigningKey>,
     sender_peer_shared_event_id: Option<&EventId>,
+    created_at_ms: u64,
     bootstrap_ctx: Option<&InviteBootstrapContext<'_>>,
 ) -> Result<InviteData, Box<dyn std::error::Error + Send + Sync>> {
     let mut rng = rand::thread_rng();
@@ -878,7 +951,7 @@ fn create_user_invite_events_with_signer(
     let invite_pub = invite_key.verifying_key().to_bytes();
 
     let evt = ParsedEvent::UserInvite(UserInviteEvent {
-        created_at_ms: current_timestamp_ms_u64(),
+        created_at_ms,
         public_key: invite_pub,
         workspace_id: *workspace_id,
         authority_event_id: *authority_event_id,
@@ -895,13 +968,14 @@ fn create_user_invite_events_with_signer(
     )?;
 
     if let (Some(ps_key), Some(ps_eid)) = (sender_peer_shared_key, sender_peer_shared_event_id) {
-        wrap_content_key_for_invite(
+        wrap_content_key_for_invite_at(
             conn,
             recorded_by,
             ps_key,
             ps_eid,
             &invite_key,
             &invite_event_id,
+            created_at_ms,
         )?;
     }
 

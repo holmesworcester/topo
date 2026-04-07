@@ -777,6 +777,7 @@ mod tests {
             created_at_ms: created_at_ms as u64,
             key_event_id: wrapper_key_event_id,
             owner_event_id: crate::event_modules::encrypted::NO_OWNER_EVENT_ID,
+            outer_dep_event_id: crate::event_modules::encrypted::NO_OUTER_DEP_EVENT_ID,
             inner_type_code: crate::event_modules::EVENT_TYPE_FILE_SLICE,
             nonce,
             ciphertext,

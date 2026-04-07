@@ -357,6 +357,7 @@ fn test_encrypted_inner_type_mismatch_rejects() {
         created_at_ms: now_ms(),
         key_event_id: sk_eid,
         owner_event_id: crate::event_modules::encrypted::NO_OWNER_EVENT_ID,
+        outer_dep_event_id: crate::event_modules::encrypted::NO_OUTER_DEP_EVENT_ID,
         inner_type_code: EVENT_TYPE_REACTION, // declares reaction
         nonce,
         ciphertext, // 234 bytes, matches reaction wire size

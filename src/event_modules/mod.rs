@@ -175,6 +175,48 @@ pub enum ParsedEvent {
     EndpointShared(EndpointSharedEvent),
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventDepMode {
+    Blocking,
+    SyncOnly,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EventDepRef {
+    pub field_name: &'static str,
+    pub event_id: [u8; 32],
+    pub allowed_type_codes: &'static [u8],
+    pub mode: EventDepMode,
+}
+
+impl EventDepRef {
+    pub const fn blocking(
+        field_name: &'static str,
+        event_id: [u8; 32],
+        allowed_type_codes: &'static [u8],
+    ) -> Self {
+        Self {
+            field_name,
+            event_id,
+            allowed_type_codes,
+            mode: EventDepMode::Blocking,
+        }
+    }
+
+    pub const fn sync_only(
+        field_name: &'static str,
+        event_id: [u8; 32],
+        allowed_type_codes: &'static [u8],
+    ) -> Self {
+        Self {
+            field_name,
+            event_id,
+            allowed_type_codes,
+            mode: EventDepMode::SyncOnly,
+        }
+    }
+}
+
 impl ParsedEvent {
     pub fn created_at_ms(&self) -> u64 {
         match self {
@@ -206,45 +248,82 @@ impl ParsedEvent {
         }
     }
 
-    /// Extract dependency event IDs from schema-marked fields.
-    /// Returns (field_name, raw_32_byte_id) pairs.
-    ///
-    /// Ordering is semantic: the most structural dep is listed first.
-    pub fn dep_field_values(&self) -> Vec<(&'static str, [u8; 32])> {
+    /// Extract dependency refs for this event payload or outer wrapper.
+    /// For signed events this returns only the outer signer dep; callers that
+    /// want the full visible outer graph should recurse into the signed payload.
+    pub fn dep_refs(&self) -> Vec<EventDepRef> {
         match self {
-            ParsedEvent::Message(m) => vec![("author_id", m.author_id)],
-            ParsedEvent::Reaction(r) => {
-                vec![
-                    ("target_event_id", r.target_event_id),
-                    ("author_id", r.author_id),
-                ]
-            }
-            ParsedEvent::Signed(s) => vec![("signed_by", s.signer_event_id)],
+            ParsedEvent::Message(m) => vec![EventDepRef::blocking("author_id", m.author_id, &[14, 15])],
+            ParsedEvent::Reaction(r) => vec![
+                EventDepRef::blocking("target_event_id", r.target_event_id, &[EVENT_TYPE_MESSAGE]),
+                EventDepRef::blocking("author_id", r.author_id, &[14, 15]),
+            ],
+            ParsedEvent::Signed(s) => vec![EventDepRef::blocking(
+                "signed_by",
+                s.signer_event_id,
+                &[EVENT_TYPE_WORKSPACE, EVENT_TYPE_USER_INVITE, EVENT_TYPE_DEVICE_INVITE, EVENT_TYPE_USER, EVENT_TYPE_PEER_SHARED, EVENT_TYPE_ADMIN],
+            )],
             ParsedEvent::Encrypted(e) => {
-                let mut deps = vec![("key_event_id", e.key_event_id)];
+                let mut deps = vec![EventDepRef::blocking(
+                    "key_event_id",
+                    e.key_event_id,
+                    &[EVENT_TYPE_KEY_SECRET],
+                )];
                 if e.owner_event_id != encrypted::NO_OWNER_EVENT_ID {
-                    deps.push(("owner_event_id", e.owner_event_id));
+                    deps.push(EventDepRef::blocking(
+                        "owner_event_id",
+                        e.owner_event_id,
+                        &[EVENT_TYPE_MESSAGE],
+                    ));
+                }
+                if e.outer_dep_event_id != encrypted::NO_OUTER_DEP_EVENT_ID {
+                    if let Some(spec) = encrypted::outer_dep_spec(e.inner_type_code) {
+                        let dep = match spec.mode {
+                            EventDepMode::Blocking => EventDepRef::blocking(
+                                spec.field_name,
+                                e.outer_dep_event_id,
+                                spec.allowed_type_codes,
+                            ),
+                            EventDepMode::SyncOnly => EventDepRef::sync_only(
+                                spec.field_name,
+                                e.outer_dep_event_id,
+                                spec.allowed_type_codes,
+                            ),
+                        };
+                        deps.push(dep);
+                    }
                 }
                 deps
             }
             ParsedEvent::KeySecret(_) => vec![],
-            ParsedEvent::MessageDeletion(_) => vec![],
+            ParsedEvent::MessageDeletion(d) => vec![EventDepRef::sync_only(
+                "target_event_id",
+                d.target_event_id,
+                &[EVENT_TYPE_MESSAGE],
+            )],
             ParsedEvent::Workspace(_) => vec![],
-            ParsedEvent::InviteAccepted(a) => vec![("tenant_event_id", a.tenant_event_id)],
+            ParsedEvent::InviteAccepted(a) => vec![EventDepRef::blocking(
+                "tenant_event_id",
+                a.tenant_event_id,
+                &[EVENT_TYPE_TENANT],
+            )],
             ParsedEvent::Removal(r) => {
                 let slots = [r.parent_1, r.parent_2, r.parent_3, r.parent_4];
-                let deps = removal::frontier_refs_from_slots(r.parent_count, &slots)
+                removal::frontier_refs_from_slots(r.parent_count, &slots)
                     .unwrap_or_default()
                     .into_iter()
                     .enumerate()
-                    .map(|(idx, id)| match idx {
-                        0 => ("parent_1", id),
-                        1 => ("parent_2", id),
-                        2 => ("parent_3", id),
-                        _ => ("parent_4", id),
-                    })
-                    .collect::<Vec<_>>();
-                deps
+                    .map(|(idx, id)| EventDepRef::blocking(
+                        match idx {
+                            0 => "parent_1",
+                            1 => "parent_2",
+                            2 => "parent_3",
+                            _ => "parent_4",
+                        },
+                        id,
+                        &[],
+                    ))
+                    .collect()
             }
             ParsedEvent::KeyRotation(k) => {
                 let slots = [
@@ -253,30 +332,47 @@ impl ParsedEvent {
                     k.frontier_ref_3,
                     k.frontier_ref_4,
                 ];
-                let deps = removal::frontier_refs_from_slots(k.frontier_count, &slots)
+                removal::frontier_refs_from_slots(k.frontier_count, &slots)
                     .unwrap_or_default()
                     .into_iter()
                     .enumerate()
-                    .map(|(idx, id)| match idx {
-                        0 => ("frontier_ref_1", id),
-                        1 => ("frontier_ref_2", id),
-                        2 => ("frontier_ref_3", id),
-                        _ => ("frontier_ref_4", id),
-                    })
-                    .collect::<Vec<_>>();
-                deps
+                    .map(|(idx, id)| EventDepRef::blocking(
+                        match idx {
+                            0 => "frontier_ref_1",
+                            1 => "frontier_ref_2",
+                            2 => "frontier_ref_3",
+                            _ => "frontier_ref_4",
+                        },
+                        id,
+                        &[],
+                    ))
+                    .collect()
             }
             ParsedEvent::KeyRequest(_) => vec![],
-            ParsedEvent::UserInvite(u) => vec![("authority_event_id", u.authority_event_id)],
-            ParsedEvent::DeviceInvite(d) => vec![("authority_event_id", d.authority_event_id)],
+            ParsedEvent::UserInvite(u) => vec![EventDepRef::blocking(
+                "authority_event_id",
+                u.authority_event_id,
+                &[EVENT_TYPE_WORKSPACE, EVENT_TYPE_ADMIN],
+            )],
+            ParsedEvent::DeviceInvite(d) => vec![EventDepRef::blocking(
+                "authority_event_id",
+                d.authority_event_id,
+                &[EVENT_TYPE_USER],
+            )],
             ParsedEvent::User(_) => vec![],
-            ParsedEvent::PeerShared(p) => {
-                vec![
-                    ("user_event_id", p.user_event_id),
-                    ("endpoint_shared_event_id", p.endpoint_shared_event_id),
-                ]
-            }
-            ParsedEvent::Admin(a) => vec![("user_event_id", a.user_event_id)],
+            ParsedEvent::PeerShared(p) => vec![
+                EventDepRef::blocking("user_event_id", p.user_event_id, &[EVENT_TYPE_USER]),
+                EventDepRef::blocking(
+                    "endpoint_shared_event_id",
+                    p.endpoint_shared_event_id,
+                    &[EVENT_TYPE_ENDPOINT_SHARED],
+                ),
+            ],
+            ParsedEvent::Admin(a) => vec![EventDepRef::blocking(
+                "user_event_id",
+                a.user_event_id,
+                &[EVENT_TYPE_USER],
+            )],
             ParsedEvent::KeyShared(s) => {
                 let slots = [
                     s.frontier_ref_1,
@@ -284,33 +380,88 @@ impl ParsedEvent {
                     s.frontier_ref_3,
                     s.frontier_ref_4,
                 ];
-                let mut deps = vec![("recipient_event_id", s.recipient_event_id)];
+                let mut deps = vec![EventDepRef::blocking(
+                    "recipient_event_id",
+                    s.recipient_event_id,
+                    &[EVENT_TYPE_USER_INVITE, EVENT_TYPE_DEVICE_INVITE],
+                )];
                 deps.extend(
                     removal::frontier_refs_from_slots(s.frontier_count, &slots)
                         .unwrap_or_default()
                         .into_iter()
                         .enumerate()
-                        .map(|(idx, id)| match idx {
-                            0 => ("frontier_ref_1", id),
-                            1 => ("frontier_ref_2", id),
-                            2 => ("frontier_ref_3", id),
-                            _ => ("frontier_ref_4", id),
-                        }),
+                        .map(|(idx, id)| EventDepRef::blocking(
+                            match idx {
+                                0 => "frontier_ref_1",
+                                1 => "frontier_ref_2",
+                                2 => "frontier_ref_3",
+                                _ => "frontier_ref_4",
+                            },
+                            id,
+                            &[],
+                        )),
                 );
                 deps
             }
             ParsedEvent::Tenant(_) => vec![],
             ParsedEvent::File(a) => vec![
-                ("message_id", a.message_id),
-                ("key_event_id", a.key_event_id),
+                EventDepRef::blocking("message_id", a.message_id, &[EVENT_TYPE_MESSAGE]),
+                EventDepRef::blocking("key_event_id", a.key_event_id, &[EVENT_TYPE_KEY_SECRET]),
             ],
             ParsedEvent::FileSlice(_) => vec![],
-            ParsedEvent::BenchDep(b) => b.dep_ids.iter().map(|id| ("dep_id", *id)).collect(),
-            ParsedEvent::PeerSecret(p) => vec![("signer_event_id", p.signer_event_id)],
+            ParsedEvent::BenchDep(b) => b
+                .dep_ids
+                .iter()
+                .copied()
+                .map(|id| EventDepRef::blocking("dep_id", id, &[]))
+                .collect(),
+            ParsedEvent::PeerSecret(p) => vec![EventDepRef::blocking(
+                "signer_event_id",
+                p.signer_event_id,
+                &[EVENT_TYPE_PEER_SHARED],
+            )],
             ParsedEvent::InviteSecret(_) => vec![],
             ParsedEvent::EndpointSecret(_) => vec![],
             ParsedEvent::EndpointShared(_) => vec![],
         }
+    }
+
+    pub fn blocking_dep_refs(&self) -> Vec<EventDepRef> {
+        self.dep_refs()
+            .into_iter()
+            .filter(|dep| dep.mode == EventDepMode::Blocking)
+            .collect()
+    }
+
+    pub fn dep_field_values(&self) -> Vec<(&'static str, [u8; 32])> {
+        self.dep_refs()
+            .into_iter()
+            .map(|dep| (dep.field_name, dep.event_id))
+            .collect()
+    }
+
+    pub fn blocking_dep_field_values(&self) -> Vec<(&'static str, [u8; 32])> {
+        self.blocking_dep_refs()
+            .into_iter()
+            .map(|dep| (dep.field_name, dep.event_id))
+            .collect()
+    }
+
+    pub fn blocking_dep_field_type_codes(&self) -> Vec<&'static [u8]> {
+        self.blocking_dep_refs()
+            .into_iter()
+            .map(|dep| dep.allowed_type_codes)
+            .collect()
+    }
+
+    pub fn outer_sync_dep_refs_recursive(&self) -> Vec<EventDepRef> {
+        let mut deps = self.dep_refs();
+        if let ParsedEvent::Signed(signed) = self {
+            if let Ok(inner) = parse_event(&signed.payload) {
+                deps.extend(inner.outer_sync_dep_refs_recursive());
+            }
+        }
+        deps
     }
 
     pub fn event_type_code(&self) -> u8 {

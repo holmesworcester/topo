@@ -1784,6 +1784,7 @@ impl Peer {
                 created_at_ms: current_timestamp_ms_u64(),
                 key_event_id,
                 owner_event_id: msg_eid,
+                outer_dep_event_id: crate::event_modules::encrypted::NO_OUTER_DEP_EVENT_ID,
                 inner_type_code: crate::event_modules::EVENT_TYPE_FILE_SLICE,
                 nonce,
                 ciphertext,
