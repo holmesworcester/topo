@@ -1213,7 +1213,11 @@ fn cold_join_4x_hot_head_projects_identity_and_activates_multisource() {
 #[test]
 #[ignore]
 fn perf_multi_source_cold_join_4x_hot_head_diagnostic() {
-    std::env::set_var("TOPO_MULTI_SOURCE_SEEDED_HISTORY_MESSAGES", "96");
-    std::env::set_var("TOPO_MULTI_SOURCE_HOT_MESSAGES_PER_PEER", "6");
+    if std::env::var_os("TOPO_MULTI_SOURCE_SEEDED_HISTORY_MESSAGES").is_none() {
+        std::env::set_var("TOPO_MULTI_SOURCE_SEEDED_HISTORY_MESSAGES", "96");
+    }
+    if std::env::var_os("TOPO_MULTI_SOURCE_HOT_MESSAGES_PER_PEER").is_none() {
+        std::env::set_var("TOPO_MULTI_SOURCE_HOT_MESSAGES_PER_PEER", "6");
+    }
     let _ = run_cold_join_hot_head_diagnostic(4, true);
 }
