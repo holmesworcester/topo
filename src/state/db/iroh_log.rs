@@ -29,7 +29,7 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
     conn.execute_batch(
         "CREATE TABLE IF NOT EXISTS iroh_log_config (
              id INTEGER PRIMARY KEY CHECK (id = 1),
-             mode TEXT NOT NULL DEFAULT 'show',
+             mode TEXT NOT NULL DEFAULT 'suppress',
              updated_at_ms INTEGER NOT NULL DEFAULT 0
          )",
     )?;
@@ -44,7 +44,7 @@ pub fn load_mode(conn: &Connection) -> SqliteResult<IrohLogMode> {
         .optional()?;
     Ok(mode_str
         .and_then(|s| IrohLogMode::from_str(&s))
-        .unwrap_or(IrohLogMode::Show))
+        .unwrap_or(IrohLogMode::Suppress))
 }
 
 pub fn save_mode(conn: &Connection, mode: IrohLogMode) -> SqliteResult<()> {
@@ -71,9 +71,9 @@ mod tests {
     }
 
     #[test]
-    fn test_default_mode_is_show() {
+    fn test_default_mode_is_suppress() {
         let conn = setup();
-        assert_eq!(load_mode(&conn).unwrap(), IrohLogMode::Show);
+        assert_eq!(load_mode(&conn).unwrap(), IrohLogMode::Suppress);
     }
 
     #[test]
@@ -95,6 +95,6 @@ mod tests {
         let conn = setup();
         ensure_schema(&conn).unwrap();
         ensure_schema(&conn).unwrap();
-        assert_eq!(load_mode(&conn).unwrap(), IrohLogMode::Show);
+        assert_eq!(load_mode(&conn).unwrap(), IrohLogMode::Suppress);
     }
 }
