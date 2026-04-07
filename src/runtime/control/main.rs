@@ -21,14 +21,13 @@ use topo::tuning::{apply_low_mem_allocator_tuning, low_mem_mode};
 mod cli;
 mod commands;
 mod format;
-mod logging;
 mod runtime_manager;
 
 use cli::*;
 use commands::*;
 use format::*;
-use logging::build_start_subscriber;
 use runtime_manager::*;
+use topo::runtime::control::logging::build_start_subscriber;
 
 // ---------------------------------------------------------------------------
 // Low-mem allocator re-exec
@@ -143,7 +142,8 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             let conn = open_connection(db).map_err(|e| friendly_db_error(db, e))?;
             create_tables(&conn)?;
             let iroh_log_mode = topo::db::iroh_log::load_mode(&conn)?;
-            let subscriber = build_start_subscriber(iroh_log_mode);
+            let topo_log_level = topo::db::topo_log::load_level(&conn)?;
+            let subscriber = build_start_subscriber(iroh_log_mode, topo_log_level);
             let _ = tracing::subscriber::set_global_default(subscriber);
         }
         _ => {}
@@ -1152,6 +1152,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::IrohLog { action } => {
             let action = action.unwrap_or(IrohLogAction::Config);
             run_iroh_log_action(db, action)?;
+        }
+
+        Commands::TopoLog { action } => {
+            let action = action.unwrap_or(TopoLogAction::Config);
+            run_topo_log_action(db, socket_override.as_deref(), action)?;
         }
 
         // ---------------------------------------------------------------

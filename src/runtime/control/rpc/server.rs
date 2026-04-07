@@ -925,6 +925,50 @@ fn dispatch(
                 },
             }
         }
+        RpcMethod::GetTopoLogConfig => match crate::db::open_connection(db_path) {
+            Ok(db) => {
+                if let Err(e) = crate::db::schema::create_tables(&db) {
+                    return RpcResponse::error(e.to_string());
+                }
+                match crate::state::db::topo_log::load_level(&db) {
+                    Ok(level) => RpcResponse::success(serde_json::json!({
+                        "level": level.as_str(),
+                        "effective_now": crate::runtime::control::logging::topo_log_reload_is_active(),
+                    })),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                }
+            }
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
+        RpcMethod::SetTopoLogLevel { level } => match crate::db::open_connection(db_path) {
+            Ok(db) => {
+                if let Err(e) = crate::db::schema::create_tables(&db) {
+                    return RpcResponse::error(e.to_string());
+                }
+                let Some(level) = crate::state::db::topo_log::TopoLogLevel::from_str(&level) else {
+                    return RpcResponse::error(format!(
+                        "invalid topo log level `{}`; expected one of: error, warn, info, debug, trace",
+                        level
+                    ));
+                };
+                if let Err(e) = crate::state::db::topo_log::save_level(&db, level) {
+                    return RpcResponse::error(e.to_string());
+                }
+                let iroh_log_mode = match crate::state::db::iroh_log::load_mode(&db) {
+                    Ok(mode) => mode,
+                    Err(e) => return RpcResponse::error(e.to_string()),
+                };
+                match crate::runtime::control::logging::reload_topo_log_level(level, iroh_log_mode)
+                {
+                    Ok(()) => RpcResponse::success(serde_json::json!({
+                        "level": level.as_str(),
+                        "effective_now": true,
+                    })),
+                    Err(e) => RpcResponse::error(e),
+                }
+            }
+            Err(e) => RpcResponse::error(e.to_string()),
+        },
         RpcMethod::ContentKeys { summary } => with_active_peer_db(
             state,
             |_peer_id, recorded_by, db| match workspace::content_keys(db, recorded_by, summary) {

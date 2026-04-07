@@ -32,7 +32,7 @@ use tokio_util::sync::CancellationToken;
 use tracing::warn;
 
 use crate::contracts::peering_contract::{
-    PeerFingerprint, SessionDirection, SessionHandler, SessionMeta, TenantId, TransportSessionIo,
+    PeerFingerprint, SessionDirection, SessionMeta, TenantId, TransportSessionIo,
 };
 use crate::runtime::repeated_warning::should_emit_globally;
 use crate::sync::SyncConnectionHandler;
@@ -253,6 +253,22 @@ pub(crate) fn claim_live_daemon_connection_slot(
                 };
                 LiveDaemonConnectionClaim::Acquired(LiveDaemonConnectionLease { key, claim_id })
             }
+            Some(existing)
+                if preferred_direction == Some(direction) && existing.direction != direction =>
+            {
+                let released = Arc::new(tokio::sync::Notify::new());
+                replaced = Some((
+                    existing.daemon_connection.clone(),
+                    existing.released.clone(),
+                ));
+                *existing = LiveDaemonConnectionSlot {
+                    claim_id,
+                    direction,
+                    daemon_connection,
+                    released,
+                };
+                LiveDaemonConnectionClaim::Acquired(LiveDaemonConnectionLease { key, claim_id })
+            }
             Some(existing) => LiveDaemonConnectionClaim::Occupied(LiveDaemonConnectionOccupied {
                 preferred_direction,
                 active_direction: existing.direction,
@@ -374,7 +390,7 @@ pub(super) async fn run_session(
     remote_addr: String,
     direction: SessionDirection,
     _db_path: &str,
-) -> bool {
+) -> Option<crate::runtime::SyncStats> {
     let meta = SessionMeta {
         session_id,
         tenant: TenantId(tenant_id.to_string()),
@@ -384,30 +400,36 @@ pub(super) async fn run_session(
     };
     let cancel = CancellationToken::new();
 
-    if let Err(e) = handler.on_session(meta, io, cancel.clone()).await {
-        let label = match direction {
-            SessionDirection::Outbound => "Initiator",
-            SessionDirection::Inbound => "Responder",
-        };
-        if let Some(reason) = extract_build_mismatch_reason(&e) {
-            let peer_id = hex::encode(peer_fp);
-            let key = format!("session-build-mismatch:{label}:{peer_id}:{direction:?}");
-            if should_emit_globally(key) {
-                warn!(
-                    "{} session rejected by peer {}: {}",
-                    label,
-                    &peer_id[..16.min(peer_id.len())],
-                    reason
-                );
+    let stats = match handler
+        .on_session_with_stats(meta, io, cancel.clone())
+        .await
+    {
+        Ok(stats) => stats,
+        Err(e) => {
+            let label = match direction {
+                SessionDirection::Outbound => "Initiator",
+                SessionDirection::Inbound => "Responder",
+            };
+            if let Some(reason) = extract_build_mismatch_reason(&e) {
+                let peer_id = hex::encode(peer_fp);
+                let key = format!("session-build-mismatch:{label}:{peer_id}:{direction:?}");
+                if should_emit_globally(key) {
+                    warn!(
+                        "{} session rejected by peer {}: {}",
+                        label,
+                        &peer_id[..16.min(peer_id.len())],
+                        reason
+                    );
+                }
+            } else {
+                warn!("{} session error: {}", label, e);
             }
-        } else {
-            warn!("{} session error: {}", label, e);
+            cancel.cancel();
+            return None;
         }
-        cancel.cancel();
-        return false;
-    }
+    };
     cancel.cancel();
-    true
+    Some(stats)
 }
 
 pub(super) use crate::tuning::drain_batch_size;
@@ -591,6 +613,110 @@ mod tests {
         client_ep_a.close(0u32.into(), b"test close");
         client_ep_b.close(0u32.into(), b"test close");
         server_ep.close(0u32.into(), b"test close");
+    }
+
+    #[tokio::test]
+    async fn preferred_inbound_connection_replaces_existing_outbound_slot() {
+        let temp = tempfile::tempdir().expect("tempdir");
+        let db_a = temp.path().join("a.sqlite3");
+        let db_b = temp.path().join("b.sqlite3");
+        let ep_a = create_runtime_endpoint_for_tenants(
+            "127.0.0.1:0".parse().unwrap(),
+            db_a.to_str().unwrap(),
+        )
+        .await
+        .expect("endpoint a");
+        let ep_b = create_runtime_endpoint_for_tenants(
+            "127.0.0.1:0".parse().unwrap(),
+            db_b.to_str().unwrap(),
+        )
+        .await
+        .expect("endpoint b");
+        let peer_a = load_daemon_identity_from_db(db_a.to_str().unwrap())
+            .expect("daemon identity a")
+            .0;
+        let peer_b = load_daemon_identity_from_db(db_b.to_str().unwrap())
+            .expect("daemon identity b")
+            .0;
+
+        let (local_peer_id, remote_peer_id, local_ep, remote_ep) = if peer_a > peer_b {
+            (peer_a.clone(), peer_b.clone(), ep_a.clone(), ep_b.clone())
+        } else {
+            (peer_b.clone(), peer_a.clone(), ep_b.clone(), ep_a.clone())
+        };
+
+        assert_eq!(
+            preferred_connection_direction(&local_peer_id, &remote_peer_id),
+            Some(SessionDirection::Inbound)
+        );
+
+        let local_addr = local_ep.local_addr().expect("local addr");
+        let remote_addr = remote_ep.local_addr().expect("remote addr");
+        let local_sni = transport_sni(&local_peer_id);
+        let remote_sni = transport_sni(&remote_peer_id);
+        let db_path = temp.path().join("preferred-slot.db");
+        let db_str = db_path.to_str().expect("db path");
+
+        let (accepted_remote, dialed_local) = tokio::join!(
+            accept_daemon_connection(&remote_ep),
+            dial_daemon_connection(&local_ep, remote_addr, &remote_sni),
+        );
+        let _accepted_remote = accepted_remote
+            .expect("accept remote")
+            .expect("accepted remote daemon connection");
+        let dialed_local = dialed_local.expect("dial local");
+        let outbound_lease = match claim_live_daemon_connection_slot(
+            db_str,
+            &local_peer_id,
+            &remote_peer_id,
+            SessionDirection::Outbound,
+            dialed_local.clone(),
+        ) {
+            LiveDaemonConnectionClaim::Acquired(lease) => lease,
+            LiveDaemonConnectionClaim::Occupied(_) => {
+                panic!("initial outbound connection should acquire slot")
+            }
+        };
+
+        let (accepted_local, dialed_remote) = tokio::join!(
+            accept_daemon_connection(&local_ep),
+            dial_daemon_connection(&remote_ep, local_addr, &local_sni),
+        );
+        let accepted_local = accepted_local
+            .expect("accept local")
+            .expect("accepted local daemon connection");
+        let _dialed_remote = dialed_remote.expect("dial remote");
+        let inbound_lease = match claim_live_daemon_connection_slot(
+            db_str,
+            &local_peer_id,
+            &remote_peer_id,
+            SessionDirection::Inbound,
+            accepted_local.clone(),
+        ) {
+            LiveDaemonConnectionClaim::Acquired(lease) => lease,
+            LiveDaemonConnectionClaim::Occupied(_) => {
+                panic!("preferred inbound connection should replace outbound slot")
+            }
+        };
+
+        let live = live_daemon_connection(db_str, &remote_peer_id).expect("live slot");
+        assert_eq!(live.remote_addr(), accepted_local.remote_addr());
+
+        tokio::time::timeout(Duration::from_secs(1), async {
+            loop {
+                if dialed_local.connection().close_reason().is_some() {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("replaced outbound connection closed");
+
+        drop(outbound_lease);
+        drop(inbound_lease);
+        local_ep.close(0u32.into(), b"test close");
+        remote_ep.close(0u32.into(), b"test close");
     }
 
     #[tokio::test]

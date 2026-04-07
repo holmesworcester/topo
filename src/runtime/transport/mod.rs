@@ -35,7 +35,8 @@ pub use peering_boundary::{
 pub(crate) use session_auth::send_inbound_session_auth_ack;
 pub use session_auth::{
     read_inbound_session_auth, read_inbound_session_auth_for_connection,
-    resolve_bootstrap_inviter_peer_id, resolve_bound_daemon_peer_id,
+    resolve_bootstrap_fallback_invite_for_daemon, resolve_bootstrap_inviter_peer_id,
+    resolve_bound_daemon_peer_id,
     resolve_outbound_session_auth_plan, send_outbound_session_auth, InboundSessionAuthContext,
     OutboundSessionAuthPlan, OutboundSessionAuthResult, MAX_SESSION_AUTH_TTL_MS,
 };

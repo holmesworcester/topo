@@ -12,7 +12,7 @@ use std::time::Duration;
 
 use tokio::sync::mpsc;
 use tokio_util::sync::CancellationToken;
-use tracing::{info, warn};
+use tracing::{debug, info, warn};
 
 use super::bootstrap_auth::{
     is_tenant_in_bootstrap_phase, resolve_active_bootstrap_session_fallback,
@@ -101,17 +101,9 @@ fn select_outbound_session_auth_plan(
                 invite_event_id: fallback.invite_event_id.clone(),
             }
         }
-        TargetIngressSource::KnownPeer { peer_id } => {
-            if let Some(fallback) = bootstrap_session_fallback {
-                OutboundSessionAuthPlan::InviteBootstrap {
-                    invite_event_id: fallback.invite_event_id.clone(),
-                }
-            } else {
-                OutboundSessionAuthPlan::PeerShared {
-                    target_peer_id: peer_id.clone(),
-                }
-            }
-        }
+        TargetIngressSource::KnownPeer { peer_id } => OutboundSessionAuthPlan::PeerShared {
+            target_peer_id: peer_id.clone(),
+        },
     }
 }
 
@@ -377,7 +369,7 @@ pub(super) async fn run_target_dispatcher(
                     bootstrap_phase
                 );
                 if should_emit_globally(key) {
-                    warn!(
+                    debug!(
                         "Known-peer target tenant={} peer={} target={} selected {} because bootstrap fallback invite={} daemon={} remains active (bootstrap_phase={})",
                         short_peer_id(&event.tenant_id),
                         short_peer_id(&remote_peer_id),
@@ -544,6 +536,47 @@ async fn run_connect_worker(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn bootstrap_source_uses_invite_bootstrap_auth() {
+        let fallback = BootstrapSessionFallback {
+            daemon_peer_id: "daemon".to_string(),
+            invite_event_id: "invite".to_string(),
+        };
+        let plan = select_outbound_session_auth_plan(
+            &TargetIngressSource::Bootstrap {
+                daemon_peer_id: "daemon".to_string(),
+                invite_event_id: "invite".to_string(),
+            },
+            Some(&fallback),
+        );
+        assert_eq!(
+            plan,
+            OutboundSessionAuthPlan::InviteBootstrap {
+                invite_event_id: "invite".to_string(),
+            }
+        );
+    }
+
+    #[test]
+    fn known_peer_requests_peer_shared_even_with_bootstrap_fallback() {
+        let fallback = BootstrapSessionFallback {
+            daemon_peer_id: "daemon".to_string(),
+            invite_event_id: "invite".to_string(),
+        };
+        let plan = select_outbound_session_auth_plan(
+            &TargetIngressSource::KnownPeer {
+                peer_id: "peer".to_string(),
+            },
+            Some(&fallback),
+        );
+        assert_eq!(
+            plan,
+            OutboundSessionAuthPlan::PeerShared {
+                target_peer_id: "peer".to_string(),
+            }
+        );
+    }
 
     #[test]
     fn known_peer_targets_follow_preferred_side_gate() {

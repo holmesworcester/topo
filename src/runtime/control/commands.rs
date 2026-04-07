@@ -6,10 +6,12 @@ use topo::rpc::client::{rpc_call, RpcClientError};
 use topo::rpc::protocol::RpcMethod;
 use topo::service;
 
-use crate::cli::{EventAction, IrohLogAction, SubAction, SyncLogAction, TenantAction};
+use crate::cli::{
+    EventAction, IrohLogAction, SubAction, SyncLogAction, TenantAction, TopoLogAction,
+};
 use crate::format::{
     group_runs_by_peer, print_iroh_log_config, print_sync_log_config, print_sync_trace_run,
-    print_sync_tree_groups, short_id,
+    print_sync_tree_groups, print_topo_log_config, short_id,
 };
 
 // ---------------------------------------------------------------------------
@@ -985,6 +987,77 @@ pub(crate) fn run_iroh_log_action(
             topo::db::iroh_log::save_mode(&conn, topo::db::iroh_log::IrohLogMode::Suppress)?;
             print_iroh_log_config(topo::db::iroh_log::IrohLogMode::Suppress);
             Ok(())
+        }
+    }
+}
+
+fn topo_log_level_for_action(action: TopoLogAction) -> Option<topo::db::topo_log::TopoLogLevel> {
+    match action {
+        TopoLogAction::Config => None,
+        TopoLogAction::Error => Some(topo::db::topo_log::TopoLogLevel::Error),
+        TopoLogAction::Warn => Some(topo::db::topo_log::TopoLogLevel::Warn),
+        TopoLogAction::Info => Some(topo::db::topo_log::TopoLogLevel::Info),
+        TopoLogAction::Debug => Some(topo::db::topo_log::TopoLogLevel::Debug),
+        TopoLogAction::Trace => Some(topo::db::topo_log::TopoLogLevel::Trace),
+    }
+}
+
+pub(crate) fn run_topo_log_action(
+    db: &str,
+    socket: Option<&str>,
+    action: TopoLogAction,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let sock = target_socket_path(db, socket);
+    if let Some(level) = topo_log_level_for_action(action) {
+        match rpc_call(
+            &sock,
+            RpcMethod::SetTopoLogLevel {
+                level: level.as_str().to_string(),
+            },
+        ) {
+            Ok(resp) if resp.ok => {
+                let data = resp.data.unwrap_or(serde_json::Value::Null);
+                let effective_now = data["effective_now"].as_bool().unwrap_or(true);
+                print_topo_log_config(level, effective_now);
+                Ok(())
+            }
+            Ok(resp) => Err(resp
+                .error
+                .unwrap_or_else(|| "set topo log level failed".to_string())
+                .into()),
+            Err(RpcClientError::DaemonNotRunning(_)) => {
+                let conn = open_connection(db).map_err(|e| friendly_db_error(db, e))?;
+                create_tables(&conn)?;
+                topo::db::topo_log::save_level(&conn, level)?;
+                print_topo_log_config(level, false);
+                Ok(())
+            }
+            Err(e) => Err(e.to_string().into()),
+        }
+    } else {
+        match rpc_call(&sock, RpcMethod::GetTopoLogConfig) {
+            Ok(resp) if resp.ok => {
+                let data = resp.data.unwrap_or(serde_json::Value::Null);
+                let level = data["level"]
+                    .as_str()
+                    .and_then(topo::db::topo_log::TopoLogLevel::from_str)
+                    .ok_or_else(|| "unexpected topo log config response shape".to_string())?;
+                let effective_now = data["effective_now"].as_bool().unwrap_or(true);
+                print_topo_log_config(level, effective_now);
+                Ok(())
+            }
+            Ok(resp) => Err(resp
+                .error
+                .unwrap_or_else(|| "get topo log config failed".to_string())
+                .into()),
+            Err(RpcClientError::DaemonNotRunning(_)) => {
+                let conn = open_connection(db).map_err(|e| friendly_db_error(db, e))?;
+                create_tables(&conn)?;
+                let level = topo::db::topo_log::load_level(&conn)?;
+                print_topo_log_config(level, false);
+                Ok(())
+            }
+            Err(e) => Err(e.to_string().into()),
         }
     }
 }

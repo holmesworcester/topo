@@ -1,7 +1,6 @@
 use topo::db::{open_connection, sync_log};
+use topo::runtime::control::logging::IROH_LOG_SUPPRESSION_DIRECTIVES;
 use topo::service;
-
-use crate::logging::IROH_LOG_SUPPRESSION_DIRECTIVES;
 
 // ---------------------------------------------------------------------------
 // Display helpers — delegated to display module
@@ -59,6 +58,12 @@ pub(crate) fn print_iroh_log_config(mode: topo::db::iroh_log::IrohLogMode) {
         "suppression_targets={}",
         IROH_LOG_SUPPRESSION_DIRECTIVES.join(",")
     );
+}
+
+pub(crate) fn print_topo_log_config(level: topo::db::topo_log::TopoLogLevel, effective_now: bool) {
+    println!("topo-log level={}", level.as_str());
+    println!("effective_now={}", effective_now);
+    println!("effective_on_next_start=true");
 }
 
 fn short_sync_id(raw: &str) -> String {
