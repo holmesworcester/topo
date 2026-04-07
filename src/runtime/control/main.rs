@@ -14,7 +14,7 @@ use tracing_subscriber::FmtSubscriber;
 use topo::db::{friendly_db_error, open_connection, schema::create_tables};
 use topo::rpc::catalog;
 use topo::rpc::client::{rpc_call, rpc_call_raw, RpcClientError};
-use topo::rpc::protocol::{ForwardAction, RpcMethod, PROTOCOL_VERSION};
+use topo::rpc::protocol::{RpcMethod, PROTOCOL_VERSION};
 use topo::rpc::server::{run_rpc_server, DaemonState};
 use topo::service;
 use topo::tuning::{apply_low_mem_allocator_tuning, low_mem_mode};
@@ -200,8 +200,6 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             // and the daemon keeps its chosen port even while idle.
             let (idle_bind_reservation, resolved_bind) =
                 reserve_idle_bind(bind, start_uses_default_bind)?;
-
-            topo::state::live_hints::init_forward_on_have_from_env();
 
             let shutdown = Arc::new(AtomicBool::new(false));
             let shutdown_notify = Arc::new(tokio::sync::Notify::new());
@@ -1313,24 +1311,6 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
             }
         },
 
-        Commands::Forward { action } => {
-            let action = match action.unwrap_or(ForwardCommand::Status) {
-                ForwardCommand::Enable => ForwardAction::Enable,
-                ForwardCommand::Disable => ForwardAction::Disable,
-                ForwardCommand::Status => ForwardAction::Status,
-            };
-            let data = rpc_require_daemon(
-                db,
-                socket_override.as_deref(),
-                RpcMethod::Forward { action },
-            )?;
-            let enabled = data["forward_on_have"].as_bool().unwrap_or(false);
-            println!(
-                "forward-on-have: {}",
-                if enabled { "enabled" } else { "disabled" }
-            );
-        }
-
         Commands::Connections { json } => {
             let data = rpc_require_daemon(db, socket_override.as_deref(), RpcMethod::Connections)?;
             if json {
@@ -1400,55 +1380,6 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
         Commands::Sync { action } => {
             let sock_ref = socket_override.as_deref();
             match action {
-                SyncAction::Policy {
-                    action: SyncPolicyAction::Show,
-                } => {
-                    let data = rpc_require_daemon(db, sock_ref, RpcMethod::SyncPolicyShow)?;
-                    println!("SYNC POLICY:");
-                    println!(
-                        "  requests:        {}",
-                        data["requests"].as_str().unwrap_or("auto")
-                    );
-                    println!(
-                        "  responses:       {}",
-                        data["responses"].as_str().unwrap_or("auto")
-                    );
-                    println!(
-                        "  forward_on_have: {}",
-                        data["forward_on_have"].as_str().unwrap_or("auto")
-                    );
-                }
-                SyncAction::Policy {
-                    action:
-                        SyncPolicyAction::Set {
-                            requests,
-                            responses,
-                            forward_on_have,
-                        },
-                } => {
-                    let data = rpc_require_daemon(
-                        db,
-                        sock_ref,
-                        RpcMethod::SyncPolicySet {
-                            requests,
-                            responses,
-                            forward_on_have,
-                        },
-                    )?;
-                    println!("SYNC POLICY (updated):");
-                    println!(
-                        "  requests:        {}",
-                        data["requests"].as_str().unwrap_or("auto")
-                    );
-                    println!(
-                        "  responses:       {}",
-                        data["responses"].as_str().unwrap_or("auto")
-                    );
-                    println!(
-                        "  forward_on_have: {}",
-                        data["forward_on_have"].as_str().unwrap_or("auto")
-                    );
-                }
                 SyncAction::Round { target } => match target {
                     SyncTarget::Peer { peer } => {
                         let data =
@@ -1463,23 +1394,6 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                             }
                         } else {
                             print_round_capture(&data);
-                        }
-                    }
-                },
-                SyncAction::Request { target } => match target {
-                    SyncTarget::Peer { peer } => {
-                        let data =
-                            rpc_require_daemon(db, sock_ref, RpcMethod::SyncRequestPeer { peer })?;
-                        print_request_result(&data);
-                    }
-                    SyncTarget::All => {
-                        let data = rpc_require_daemon(db, sock_ref, RpcMethod::SyncRequestAll)?;
-                        if let Some(arr) = data.as_array() {
-                            for item in arr {
-                                print_request_result(item);
-                            }
-                        } else {
-                            print_request_result(&data);
                         }
                     }
                 },

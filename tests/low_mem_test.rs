@@ -91,16 +91,16 @@ fn wait_for_message_count_since(db: &str, cutoff_ms: i64, expected: i64, timeout
     }
 }
 
-fn request_sync_all(db: &str, timeout: Duration) {
+fn sync_round_all(db: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
-        let out = topo_cmd(db, &["sync", "request", "all"]);
+        let out = topo_cmd(db, &["sync", "round", "all"]);
         if out.status.success() {
             return;
         }
         assert!(
             Instant::now() < deadline,
-            "sync request all timed out after {:?} for db={}: stdout={} stderr={}",
+            "sync round all timed out after {:?} for db={}: stdout={} stderr={}",
             timeout,
             db,
             String::from_utf8_lossy(&out.stdout),
@@ -191,8 +191,8 @@ fn run_lowmem_delta_budget_case(
     wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
     wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
     wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
-    request_sync_all(&alice_db, Duration::from_secs(60));
-    request_sync_all(&bob_db, Duration::from_secs(60));
+    sync_round_all(&alice_db, Duration::from_secs(60));
+    sync_round_all(&bob_db, Duration::from_secs(60));
 
     generate_messages_with_span(&alice_db, baseline_events, "365d");
     let baseline_timeout = timeout_for_events(baseline_events, 300);
@@ -208,16 +208,16 @@ fn run_lowmem_delta_budget_case(
     wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
     wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
     wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
-    request_sync_all(&alice_db, Duration::from_secs(60));
-    request_sync_all(&bob_db, Duration::from_secs(60));
+    sync_round_all(&alice_db, Duration::from_secs(60));
+    sync_round_all(&bob_db, Duration::from_secs(60));
 
     let week_cutoff_ms = current_timestamp_ms() - WEEK_MS;
     let alice_recent_before_delta = message_count_since_sql(&alice_db, week_cutoff_ms);
     let bob_recent_before_delta = message_count_since_sql(&bob_db, week_cutoff_ms);
 
     generate_messages_with_span(&alice_db, delta_events, "6d");
-    request_sync_all(&alice_db, Duration::from_secs(60));
-    request_sync_all(&bob_db, Duration::from_secs(60));
+    sync_round_all(&alice_db, Duration::from_secs(60));
+    sync_round_all(&bob_db, Duration::from_secs(60));
 
     let expected_total = baseline_events as i64 + delta_events as i64;
     let expected_alice_recent = alice_recent_before_delta + delta_events as i64;
@@ -315,8 +315,8 @@ fn run_lowmem_fresh_sync(label: &str, events: usize, history_span: &str) -> f64 
     wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
     wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
     wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
-    request_sync_all(&alice_db, Duration::from_secs(60));
-    request_sync_all(&bob_db, Duration::from_secs(60));
+    sync_round_all(&alice_db, Duration::from_secs(60));
+    sync_round_all(&bob_db, Duration::from_secs(60));
 
     // For events within the lowmem sync range (LastDay + LastWeek), Bob should
     // sync them all.  For events outside that range, Bob won't see them.
@@ -386,8 +386,8 @@ fn run_lowmem_delta_sync(label: &str, baseline_events: usize, delta_events: usiz
     wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
     wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
     wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
-    request_sync_all(&alice_db, Duration::from_secs(60));
-    request_sync_all(&bob_db, Duration::from_secs(60));
+    sync_round_all(&alice_db, Duration::from_secs(60));
+    sync_round_all(&bob_db, Duration::from_secs(60));
     wait_for_message_count(
         &bob_db,
         baseline_events as i64,
@@ -403,13 +403,13 @@ fn run_lowmem_delta_sync(label: &str, baseline_events: usize, delta_events: usiz
     wait_for_active_tenant_ready(&bob_db, Duration::from_secs(60));
     wait_for_live_sync_session(&alice_db, Duration::from_secs(60));
     wait_for_live_sync_session(&bob_db, Duration::from_secs(60));
-    request_sync_all(&alice_db, Duration::from_secs(60));
-    request_sync_all(&bob_db, Duration::from_secs(60));
+    sync_round_all(&alice_db, Duration::from_secs(60));
+    sync_round_all(&bob_db, Duration::from_secs(60));
 
     // Generate delta events within the lowmem sync window.
     generate_messages_with_span(&alice_db, delta_events, "6d");
-    request_sync_all(&alice_db, Duration::from_secs(60));
-    request_sync_all(&bob_db, Duration::from_secs(60));
+    sync_round_all(&alice_db, Duration::from_secs(60));
+    sync_round_all(&bob_db, Duration::from_secs(60));
     let expected_total = (baseline_events + delta_events) as i64;
     wait_for_message_count(
         &alice_db,

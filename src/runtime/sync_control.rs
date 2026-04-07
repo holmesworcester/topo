@@ -1,38 +1,15 @@
 //! Sync control runtime: registry, session commands, and capture types.
 
 use serde::Serialize;
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
-
-use crate::shared::sync_control::{SyncPolicyMode, TenantSyncPolicy};
-
-// ---------------------------------------------------------------------------
-// Capture types (returned to CLI callers)
-// ---------------------------------------------------------------------------
-
-/// A single frame event observed during a manual sync operation.
-#[derive(Debug, Clone, Serialize)]
-pub struct ManualFrameEvent {
-    pub direction: String,
-    pub frame_type: String,
-    pub size_bytes: usize,
-}
 
 /// Result of a manually-triggered negentropy round.
 #[derive(Debug, Clone, Serialize)]
 pub struct ManualSyncRoundCapture {
     pub peer_id: String,
     pub observed_ids: Vec<String>,
-}
-
-/// Result of a manually-triggered request refill.
-#[derive(Debug, Clone, Serialize)]
-pub struct ManualSyncRequestResult {
-    pub peer_id: String,
-    pub requested_ids: Vec<String>,
-    #[serde(skip_serializing_if = "Option::is_none")]
-    pub reason: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -42,9 +19,6 @@ pub struct ManualSyncRequestResult {
 pub enum SessionCommand {
     ForceRound {
         reply: std::sync::mpsc::Sender<Result<ManualSyncRoundCapture, String>>,
-    },
-    ForceRequest {
-        reply: std::sync::mpsc::Sender<Result<ManualSyncRequestResult, String>>,
     },
 }
 
@@ -71,70 +45,15 @@ struct SessionEntry {
 // ---------------------------------------------------------------------------
 
 pub struct SyncControlRegistry {
-    db_path: String,
     sessions: Mutex<HashMap<u64, SessionEntry>>,
     next_id: Mutex<u64>,
-    policy_watchers: Mutex<HashMap<String, Vec<tokio::sync::watch::Sender<TenantSyncPolicy>>>>,
 }
 
 impl SyncControlRegistry {
-    pub fn new(db_path: String) -> Self {
+    pub fn new() -> Self {
         SyncControlRegistry {
-            db_path,
             sessions: Mutex::new(HashMap::new()),
             next_id: Mutex::new(1),
-            policy_watchers: Mutex::new(HashMap::new()),
-        }
-    }
-
-    // -- Policy delegation --
-
-    pub fn load_policy(&self, tenant_id: &str) -> Result<TenantSyncPolicy, String> {
-        let conn = crate::db::open_connection(&self.db_path).map_err(|e| e.to_string())?;
-        crate::db::sync_control::ensure_schema(&conn).map_err(|e| e.to_string())?;
-        crate::db::sync_control::load_policy(&conn, tenant_id).map_err(|e| e.to_string())
-    }
-
-    pub fn save_policy(
-        &self,
-        tenant_id: &str,
-        policy: &TenantSyncPolicy,
-    ) -> Result<TenantSyncPolicy, String> {
-        let conn = crate::db::open_connection(&self.db_path).map_err(|e| e.to_string())?;
-        crate::db::sync_control::ensure_schema(&conn).map_err(|e| e.to_string())?;
-        let saved = crate::db::sync_control::save_policy(&conn, tenant_id, policy)
-            .map_err(|e| e.to_string())?;
-        self.notify_policy_watchers(tenant_id, &saved);
-        Ok(saved)
-    }
-
-    pub fn update_policy(
-        &self,
-        tenant_id: &str,
-        requests: Option<SyncPolicyMode>,
-        responses: Option<SyncPolicyMode>,
-        forward_on_have: Option<SyncPolicyMode>,
-    ) -> Result<TenantSyncPolicy, String> {
-        let conn = crate::db::open_connection(&self.db_path).map_err(|e| e.to_string())?;
-        crate::db::sync_control::ensure_schema(&conn).map_err(|e| e.to_string())?;
-        let updated = crate::db::sync_control::update_policy(
-            &conn,
-            tenant_id,
-            requests,
-            responses,
-            forward_on_have,
-        )
-        .map_err(|e| e.to_string())?;
-        self.notify_policy_watchers(tenant_id, &updated);
-        Ok(updated)
-    }
-
-    fn notify_policy_watchers(&self, tenant_id: &str, policy: &TenantSyncPolicy) {
-        let watchers = self.policy_watchers.lock().unwrap();
-        if let Some(senders) = watchers.get(tenant_id) {
-            for tx in senders {
-                let _ = tx.send(*policy);
-            }
         }
     }
 
@@ -147,8 +66,6 @@ impl SyncControlRegistry {
         role: SessionRole,
     ) -> RegisteredSession {
         let (command_tx, command_rx) = tokio::sync::mpsc::channel::<SessionCommand>(4);
-        let initial_policy = self.load_policy(tenant_id).unwrap_or_default();
-        let (policy_tx, policy_rx) = tokio::sync::watch::channel(initial_policy);
 
         let session_id = {
             let mut next = self.next_id.lock().unwrap();
@@ -168,13 +85,6 @@ impl SyncControlRegistry {
             let mut sessions = self.sessions.lock().unwrap();
             sessions.insert(session_id, entry);
         }
-        {
-            let mut watchers = self.policy_watchers.lock().unwrap();
-            watchers
-                .entry(tenant_id.to_string())
-                .or_default()
-                .push(policy_tx);
-        }
 
         let guard = SessionRegistrationGuard {
             registry: Arc::clone(self),
@@ -184,7 +94,6 @@ impl SyncControlRegistry {
 
         RegisteredSession {
             command_rx,
-            policy_rx,
             _guard: SessionGuard(guard),
         }
     }
@@ -251,127 +160,6 @@ impl SyncControlRegistry {
         }
     }
 
-    pub fn trigger_request_for_peer(
-        &self,
-        tenant_id: &str,
-        peer_prefix: &str,
-    ) -> Result<ManualSyncRequestResult, String> {
-        self.trigger_request_for_peer_with_timeout(tenant_id, peer_prefix, Duration::from_secs(30))
-    }
-
-    fn trigger_request_for_peer_with_timeout(
-        &self,
-        tenant_id: &str,
-        peer_prefix: &str,
-        timeout: Duration,
-    ) -> Result<ManualSyncRequestResult, String> {
-        // Check policy first
-        let policy = self.load_policy(tenant_id).unwrap_or_default();
-        if policy.requests == SyncPolicyMode::Disabled {
-            return Ok(ManualSyncRequestResult {
-                peer_id: peer_prefix.to_string(),
-                requested_ids: vec![],
-                reason: Some("requests lane is disabled by policy".to_string()),
-            });
-        }
-
-        let sessions = self.find_sessions(tenant_id, Some(peer_prefix), false);
-        if sessions.is_empty() {
-            return Ok(ManualSyncRequestResult {
-                peer_id: peer_prefix.to_string(),
-                requested_ids: vec![],
-                reason: None,
-            });
-        }
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        for entry in &sessions {
-            let _ = entry.command_tx.try_send(SessionCommand::ForceRequest {
-                reply: reply_tx.clone(),
-            });
-        }
-        drop(reply_tx);
-        match reply_rx.recv_timeout(timeout) {
-            Ok(result) => result,
-            Err(_) => Ok(Self::empty_request_result(&sessions[0].peer_id)),
-        }
-    }
-
-    pub fn trigger_request_for_all(
-        &self,
-        tenant_id: &str,
-    ) -> Result<Vec<ManualSyncRequestResult>, String> {
-        self.trigger_request_for_all_with_timeout(tenant_id, Duration::from_secs(30))
-    }
-
-    fn trigger_request_for_all_with_timeout(
-        &self,
-        tenant_id: &str,
-        timeout: Duration,
-    ) -> Result<Vec<ManualSyncRequestResult>, String> {
-        let policy = self.load_policy(tenant_id).unwrap_or_default();
-        let sessions = self.find_sessions(tenant_id, None, false);
-        if policy.requests == SyncPolicyMode::Disabled {
-            if sessions.is_empty() {
-                return Ok(vec![ManualSyncRequestResult {
-                    peer_id: "(no peers)".to_string(),
-                    requested_ids: vec![],
-                    reason: Some("requests are disabled for this tenant".to_string()),
-                }]);
-            }
-            return Ok(sessions
-                .iter()
-                .map(|s| ManualSyncRequestResult {
-                    peer_id: s.peer_id.clone(),
-                    requested_ids: vec![],
-                    reason: Some("requests are disabled for this tenant".to_string()),
-                })
-                .collect());
-        }
-        if sessions.is_empty() {
-            return Ok(vec![ManualSyncRequestResult {
-                peer_id: "(no live sessions)".to_string(),
-                requested_ids: vec![],
-                reason: None,
-            }]);
-        }
-        let (reply_tx, reply_rx) = std::sync::mpsc::channel();
-        for entry in &sessions {
-            let _ = entry.command_tx.try_send(SessionCommand::ForceRequest {
-                reply: reply_tx.clone(),
-            });
-        }
-        drop(reply_tx);
-        let mut results_by_peer = HashMap::<String, ManualSyncRequestResult>::new();
-        let mut expected_peers = HashSet::<String>::new();
-        for session in &sessions {
-            expected_peers.insert(session.peer_id.clone());
-        }
-        let deadline = std::time::Instant::now() + timeout;
-        loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if remaining.is_zero() {
-                break;
-            }
-            match reply_rx.recv_timeout(remaining) {
-                Ok(Ok(result)) => {
-                    let peer_id = result.peer_id.clone();
-                    results_by_peer.insert(peer_id, result);
-                    if results_by_peer.len() >= expected_peers.len() {
-                        break;
-                    }
-                }
-                Ok(Err(_)) => {}
-                Err(_) => break,
-            }
-        }
-        for peer_id in expected_peers {
-            results_by_peer
-                .entry(peer_id.clone())
-                .or_insert_with(|| Self::empty_request_result(&peer_id));
-        }
-        Ok(results_by_peer.into_values().collect())
-    }
-
     // -- Internal helpers --
 
     fn find_sessions(
@@ -403,26 +191,9 @@ impl SyncControlRegistry {
     }
 
     fn remove_session(&self, session_id: u64, tenant_id: &str) {
-        {
-            let mut sessions = self.sessions.lock().unwrap();
-            sessions.remove(&session_id);
-        }
-        // Clean up policy watchers that have been dropped
-        let mut watchers = self.policy_watchers.lock().unwrap();
-        if let Some(senders) = watchers.get_mut(tenant_id) {
-            senders.retain(|tx| !tx.is_closed());
-            if senders.is_empty() {
-                watchers.remove(tenant_id);
-            }
-        }
-    }
-
-    fn empty_request_result(peer_id: &str) -> ManualSyncRequestResult {
-        ManualSyncRequestResult {
-            peer_id: peer_id.to_string(),
-            requested_ids: vec![],
-            reason: None,
-        }
+        let _ = tenant_id;
+        let mut sessions = self.sessions.lock().unwrap();
+        sessions.remove(&session_id);
     }
 }
 
@@ -432,19 +203,12 @@ impl SyncControlRegistry {
 
 pub struct RegisteredSession {
     pub command_rx: tokio::sync::mpsc::Receiver<SessionCommand>,
-    pub policy_rx: tokio::sync::watch::Receiver<TenantSyncPolicy>,
     pub _guard: SessionGuard,
 }
 
 impl RegisteredSession {
-    pub fn into_parts(
-        self,
-    ) -> (
-        tokio::sync::mpsc::Receiver<SessionCommand>,
-        tokio::sync::watch::Receiver<TenantSyncPolicy>,
-        SessionGuard,
-    ) {
-        (self.command_rx, self.policy_rx, self._guard)
+    pub fn into_parts(self) -> (tokio::sync::mpsc::Receiver<SessionCommand>, SessionGuard) {
+        (self.command_rx, self._guard)
     }
 }
 
@@ -469,77 +233,9 @@ impl Drop for SessionRegistrationGuard {
 mod tests {
     use super::*;
 
-    fn temp_db_path() -> (tempfile::TempDir, String) {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("test.db").to_string_lossy().to_string();
-        // Ensure schema
-        let conn = crate::db::open_connection(&path).unwrap();
-        crate::db::sync_control::ensure_schema(&conn).unwrap();
-        drop(conn);
-        (dir, path)
-    }
-
-    #[test]
-    fn registry_policy_roundtrip() {
-        let (_dir, path) = temp_db_path();
-        let registry = SyncControlRegistry::new(path);
-
-        // Default
-        let p = registry.load_policy("t1").unwrap();
-        assert_eq!(p, TenantSyncPolicy::default());
-
-        // Update
-        let p2 = registry
-            .update_policy("t1", Some(SyncPolicyMode::Manual), None, None)
-            .unwrap();
-        assert_eq!(p2.requests, SyncPolicyMode::Manual);
-        assert_eq!(p2.responses, SyncPolicyMode::Auto);
-    }
-
-    #[tokio::test]
-    async fn register_session_and_receive_command() {
-        let (_dir, path) = temp_db_path();
-        let registry = Arc::new(SyncControlRegistry::new(path));
-
-        let mut session =
-            registry.register_session("tenant1", "abcd1234peer", SessionRole::Initiator);
-
-        // Spawn a thread to simulate session loop receiving the command
-        let handle = std::thread::spawn(move || {
-            // Use blocking recv on mpsc (tokio channel inside sync thread)
-            let rt = tokio::runtime::Runtime::new().unwrap();
-            rt.block_on(async {
-                match session.command_rx.recv().await {
-                    Some(SessionCommand::ForceRequest { reply }) => {
-                        let _ = reply.send(Ok(ManualSyncRequestResult {
-                            peer_id: "abcd1234peer".to_string(),
-                            requested_ids: vec!["event1".to_string()],
-                            reason: None,
-                        }));
-                    }
-                    _ => panic!("expected ForceRequest"),
-                }
-            });
-            session // return session to keep guard alive
-        });
-
-        // Small delay to let thread start
-        tokio::time::sleep(Duration::from_millis(50)).await;
-
-        // Trigger from registry
-        let result = registry
-            .trigger_request_for_peer("tenant1", "abcd")
-            .unwrap();
-        assert_eq!(result.peer_id, "abcd1234peer");
-        assert_eq!(result.requested_ids.len(), 1);
-
-        let _session = handle.join().unwrap();
-    }
-
     #[tokio::test]
     async fn registry_session_deregisters_on_drop() {
-        let (_dir, path) = temp_db_path();
-        let registry = Arc::new(SyncControlRegistry::new(path));
+        let registry = Arc::new(SyncControlRegistry::new());
 
         {
             let _session =
@@ -555,39 +251,4 @@ mod tests {
         assert!(result.unwrap_err().contains("no live session"));
     }
 
-    #[test]
-    fn request_peer_timeout_falls_back_to_empty_result() {
-        let (_dir, path) = temp_db_path();
-        let registry = Arc::new(SyncControlRegistry::new(path));
-
-        let _session = registry.register_session("tenant1", "abcd1234peer", SessionRole::Initiator);
-
-        let result = registry
-            .trigger_request_for_peer_with_timeout("tenant1", "abcd", Duration::from_millis(1))
-            .unwrap();
-        assert_eq!(result.peer_id, "abcd1234peer");
-        assert!(result.requested_ids.is_empty());
-        assert!(result.reason.is_none());
-    }
-
-    #[test]
-    fn request_all_timeout_synthesizes_empty_results_for_live_sessions() {
-        let (_dir, path) = temp_db_path();
-        let registry = Arc::new(SyncControlRegistry::new(path));
-
-        let _a = registry.register_session("tenant1", "peer_a", SessionRole::Initiator);
-        let _b = registry.register_session("tenant1", "peer_b", SessionRole::Responder);
-
-        let mut results = registry
-            .trigger_request_for_all_with_timeout("tenant1", Duration::from_millis(1))
-            .unwrap();
-        results.sort_by(|a, b| a.peer_id.cmp(&b.peer_id));
-        assert_eq!(results.len(), 2);
-        assert_eq!(results[0].peer_id, "peer_a");
-        assert!(results[0].requested_ids.is_empty());
-        assert!(results[0].reason.is_none());
-        assert_eq!(results[1].peer_id, "peer_b");
-        assert!(results[1].requested_ids.is_empty());
-        assert!(results[1].reason.is_none());
-    }
 }

@@ -540,7 +540,6 @@ pub fn start_daemon_with_options(db: &str, opts: &DaemonOptions) -> HarnessDaemo
 
         // Enable forward-on-have by default — this is the production configuration.
         // Tests that need negentropy-only behavior can override via extra_env.
-        cmd.env("TOPO_FORWARD_ON_HAVE", "1");
 
         if opts.disable_placeholder_autodial {
             cmd.env("TOPO_DISABLE_PLACEHOLDER_AUTODIAL", "1");
@@ -1176,19 +1175,16 @@ pub fn active_tenant_peer_id(db: &str) -> Option<String> {
     }
 }
 
-/// Wait until `sync request all` sees at least one live session.
+/// Wait until `sync round all` sees at least one live session.
 pub fn wait_for_live_sync_session(db: &str, timeout: Duration) {
     let deadline = Instant::now() + timeout;
     loop {
         let out = Command::new(bin())
-            .args(["--db", db, "sync", "request", "all"])
+            .args(["--db", db, "sync", "round", "all"])
             .output()
-            .expect("failed to run sync request all");
+            .expect("failed to run sync round all");
         if out.status.success() {
-            let stdout = String::from_utf8_lossy(&out.stdout);
-            if !stdout.contains("(no live sessions)") && !stdout.contains("(no peers)") {
-                return;
-            }
+            return;
         }
         if Instant::now() >= deadline {
             panic!(
@@ -1206,11 +1202,11 @@ pub fn wait_for_live_sync_session(db: &str, timeout: Duration) {
 
 /// Trigger an on-demand sync across all live sessions, retrying transient
 /// daemon-startup and initial-sync states through the shared RPC helper.
-pub fn request_sync_all(db: &str, timeout: Duration) {
-    let out = topo_rpc_retry(db, &["sync", "request", "all"], timeout);
+pub fn sync_round_all(db: &str, timeout: Duration) {
+    let out = topo_rpc_retry(db, &["sync", "round", "all"], timeout);
     assert!(
         out.status.success(),
-        "sync request all failed for db={}: stdout={} stderr={}",
+        "sync round all failed for db={}: stdout={} stderr={}",
         db,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)

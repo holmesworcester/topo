@@ -7,7 +7,6 @@ pub mod project_queue;
 pub mod queue;
 pub mod schema;
 pub mod store;
-pub mod sync_control;
 pub mod sync_log;
 pub mod timeline;
 pub mod transport_creds;
@@ -113,7 +112,6 @@ pub fn ensure_infra_schema(conn: &Connection) -> SqliteResult<()> {
     transport_creds::ensure_schema(conn)?;
     need_queue::ensure_schema(conn)?;
     local_client_ops::ensure_schema(conn)?;
-    sync_control::ensure_schema(conn)?;
     crate::state::shared_workspace_fanout::ensure_schema(conn)?;
     Ok(())
 }

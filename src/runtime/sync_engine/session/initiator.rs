@@ -27,19 +27,8 @@ use negentropy::{Id, Negentropy};
 
 type ManualRoundReply =
     std::sync::mpsc::Sender<Result<crate::runtime::sync_control::ManualSyncRoundCapture, String>>;
-type ManualRequestReply =
-    std::sync::mpsc::Sender<Result<crate::runtime::sync_control::ManualSyncRequestResult, String>>;
-
-fn manual_request_not_supported(peer_id: &str, reply: ManualRequestReply) {
-    let _ = reply.send(Ok(crate::runtime::sync_control::ManualSyncRequestResult {
-        peer_id: peer_id.to_string(),
-        requested_ids: Vec::new(),
-        reason: None,
-    }));
-}
 
 fn drain_manual_commands(
-    peer_id: &str,
     command_rx: &mut Option<
         tokio::sync::mpsc::Receiver<crate::runtime::sync_control::SessionCommand>,
     >,
@@ -52,9 +41,6 @@ fn drain_manual_commands(
         match cmd {
             crate::runtime::sync_control::SessionCommand::ForceRound { reply } => {
                 pending_round_replies.push(reply);
-            }
-            crate::runtime::sync_control::SessionCommand::ForceRequest { reply } => {
-                manual_request_not_supported(peer_id, reply);
             }
         }
     }
@@ -109,7 +95,7 @@ where
     let activity_timeout = Duration::from_secs(timeout_secs);
 
     let mut pending_round_replies = Vec::new();
-    drain_manual_commands(peer_id, &mut command_rx, &mut pending_round_replies);
+    drain_manual_commands(&mut command_rx, &mut pending_round_replies);
 
     let db = open_connection(db_path)?;
     let ws_id = lookup_workspace_id(&db, recorded_by).ok_or_else(|| {
@@ -191,7 +177,7 @@ where
     have_ids.dedup();
     need_ids.sort_unstable();
     need_ids.dedup();
-    drain_manual_commands(peer_id, &mut command_rx, &mut pending_round_replies);
+    drain_manual_commands(&mut command_rx, &mut pending_round_replies);
     reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);
 
     let hot_receive = is_priority_ingest_window(range.kind);
@@ -230,7 +216,7 @@ where
     if let Some(path) = received.path.clone() {
         enqueue_receive_log_ingest(db_path, path);
     }
-    drain_manual_commands(peer_id, &mut command_rx, &mut pending_round_replies);
+    drain_manual_commands(&mut command_rx, &mut pending_round_replies);
     reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);
 
     let _ = mark_outbound_window_completed(db_path, recorded_by, peer_id, range);

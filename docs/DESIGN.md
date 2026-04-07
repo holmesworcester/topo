@@ -161,9 +161,7 @@ When multiple peers are connected, the scheduler uses the same simple rule every
 
 This is intentionally the simplest robust strategy. There is no durable ownership table, no per-event planner, and no sticky assignment state to repair after a peer disappears. If a peer drops mid-download, the next round sees a smaller live peer set and the remaining peers automatically widen their assigned historical slices. While a hot `LastDay` receive is active for a DB, background receive-log ingest stays paused so download/store remains the priority path.
 
-Dependency repair is a separate fast path. Projection blocking emits direct dependency requests keyed by source peer, and dependency replies are ingested immediately through the same canonical/projector path used by local creation and replay. This preserves one convergence contract across source types while keeping bulk transfer durable-first and blocker repair latency-first.
-
-Legacy `forward_on_have` controls are no longer part of the active range-owned sync design. The tested path is range sessions plus immediate dependency repair; bulk sync no longer uses durable `wanted` rows, `ResponseCredit`, or a shared ingest channel to keep the wire busy.
+Sync is range-owned and durable-first. Bulk sync no longer uses durable `wanted` rows, `ResponseCredit`, or a shared ingest channel to keep the wire busy.
 
 For same-workspace sibling tenants sharing one DB, there is one extra local step after canonical persistence: shared events created locally or ingested from the network are fanned out to sibling tenant scopes with the same `workspace_id`, then projected through those tenants' normal queue/drain path. This is not a transport shortcut and it does not bypass projectors; it is local fanout of already-canonical shared blobs so one shared DB converges the same way multiple separate daemons would.
 

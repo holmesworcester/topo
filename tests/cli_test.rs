@@ -2435,8 +2435,8 @@ fn test_cli_live_daemon_accept_second_workspace_can_switch_back_and_sync_origina
 
     let home_msg = "home-space/home-followup";
     let home_eid = send_message_as_username(&owner_db, "home", home_msg);
-    request_sync_all(&owner_db, Duration::from_secs(30));
-    request_sync_all(&home_guest.db, Duration::from_secs(30));
+    sync_round_all(&owner_db, Duration::from_secs(30));
+    sync_round_all(&home_guest.db, Duration::from_secs(30));
     assert_event_visible_on_all(&[&home_guest.db], &home_eid, timeout_ms);
 
     let home_guest_view = get_view_raw(&home_guest.db);
@@ -2574,15 +2574,15 @@ fn test_cli_live_daemon_accept_second_workspace_from_same_remote_daemon_stays_is
 
     let beta_reply = "beta-space/bob-reply";
     let beta_reply_eid = send_message_as_username(&bob.db, "bob-beta", beta_reply);
-    request_sync_all(&bob.db, Duration::from_secs(30));
-    request_sync_all(&owner_db, Duration::from_secs(30));
+    sync_round_all(&bob.db, Duration::from_secs(30));
+    sync_round_all(&owner_db, Duration::from_secs(30));
     assert_event_visible_for_username(&owner_db, "beta-owner", &beta_reply_eid, timeout_ms);
 
     let beta_owner_followup = "beta-space/owner-second";
     let beta_owner_followup_eid =
         send_message_as_username(&owner_db, "beta-owner", beta_owner_followup);
-    request_sync_all(&owner_db, Duration::from_secs(30));
-    request_sync_all(&bob.db, Duration::from_secs(30));
+    sync_round_all(&owner_db, Duration::from_secs(30));
+    sync_round_all(&bob.db, Duration::from_secs(30));
     assert_event_visible_for_username(&bob.db, "bob-beta", &beta_owner_followup_eid, timeout_ms);
 
     use_tenant_for_username(&bob.db, "bob-alpha");

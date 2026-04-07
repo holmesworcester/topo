@@ -249,12 +249,6 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"Peers"}"#,
     },
     MethodInfo {
-        name: "Forward",
-        purpose: "Enable, disable, or inspect forward-on-have live hint delivery",
-        params: params!["action", "ForwardAction", false, Some("\"status\"")],
-        example_json: r#"{"type":"Forward","action":"status"}"#,
-    },
-    MethodInfo {
         name: "View",
         purpose: "Combined view: sidebar + messages with inline reactions",
         params: params!["limit", "usize", false, Some("50")],
@@ -354,22 +348,6 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"EventTimeline","event_id":"<base64>"}"#,
     },
     MethodInfo {
-        name: "SyncPolicyShow",
-        purpose: "Show the current sync policy for the active tenant",
-        params: PARAM_NONE,
-        example_json: r#"{"type":"SyncPolicyShow"}"#,
-    },
-    MethodInfo {
-        name: "SyncPolicySet",
-        purpose: "Set sync policy fields for the active tenant",
-        params: params![
-            "requests", "string?", false, Some("unchanged");
-            "responses", "string?", false, Some("unchanged");
-            "forward_on_have", "string?", false, Some("unchanged")
-        ],
-        example_json: r#"{"type":"SyncPolicySet","requests":"auto","responses":"manual","forward_on_have":"disabled"}"#,
-    },
-    MethodInfo {
         name: "SyncRoundPeer",
         purpose: "Trigger a negentropy round for a specific peer",
         params: params!["peer", "string", true, None],
@@ -380,18 +358,6 @@ static CATALOG: &[MethodInfo] = &[
         purpose: "Trigger a negentropy round for all connected peers",
         params: PARAM_NONE,
         example_json: r#"{"type":"SyncRoundAll"}"#,
-    },
-    MethodInfo {
-        name: "SyncRequestPeer",
-        purpose: "Trigger a request refill for a specific peer",
-        params: params!["peer", "string", true, None],
-        example_json: r#"{"type":"SyncRequestPeer","peer":"peer-id"}"#,
-    },
-    MethodInfo {
-        name: "SyncRequestAll",
-        purpose: "Trigger a request refill for all connected peers",
-        params: PARAM_NONE,
-        example_json: r#"{"type":"SyncRequestAll"}"#,
     },
     MethodInfo {
         name: "Stats",

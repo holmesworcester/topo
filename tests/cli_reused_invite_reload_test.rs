@@ -60,15 +60,11 @@ fn assert_event_visible_on_all(db_paths: &[&str], event_id: &str, timeout_ms: u6
     }
 }
 
-fn request_sync_all(db_path: &str) {
-    let out = topo_rpc_retry(
-        db_path,
-        &["sync", "request", "all"],
-        Duration::from_secs(30),
-    );
+fn sync_round_all(db_path: &str) {
+    let out = topo_rpc_retry(db_path, &["sync", "round", "all"], Duration::from_secs(30));
     assert!(
         out.status.success(),
-        "sync request all failed for db={}: stdout={} stderr={}",
+        "sync round all failed for db={}: stdout={} stderr={}",
         db_path,
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
@@ -190,7 +186,7 @@ fn test_cli_reused_invite_live_daemon_reloads_bootstrap_transport_identity() {
 
     let carol_eid = send_message(&carol_db, "reuse-live/carol-final");
     for db_path in [&carol_db, &bob_db, &alice_db] {
-        request_sync_all(db_path);
+        sync_round_all(db_path);
     }
     assert_event_visible_on_all(&[&alice_db, &bob_db, &carol_db], &carol_eid, timeout_ms);
 

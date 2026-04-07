@@ -112,9 +112,7 @@ impl DaemonState {
             resolved_bind_addr: RwLock::new(None),
             runtime_recheck: Notify::new(),
             invite_refs: RwLock::new(Vec::new()),
-            sync_control: Arc::new(crate::runtime::sync_control::SyncControlRegistry::new(
-                db_path.to_string(),
-            )),
+            sync_control: Arc::new(crate::runtime::sync_control::SyncControlRegistry::new()),
         }
     }
 
@@ -1223,49 +1221,6 @@ fn dispatch(
             },
             Err(e) => RpcResponse::error(e),
         },
-
-        // ----- Sync control -----
-        RpcMethod::SyncPolicyShow => match state.require_active_peer() {
-            Ok(tenant_id) => match state.sync_control.load_policy(&tenant_id) {
-                Ok(policy) => RpcResponse::success(policy),
-                Err(e) => RpcResponse::error(e),
-            },
-            Err(e) => RpcResponse::error(e),
-        },
-
-        RpcMethod::SyncPolicySet {
-            requests,
-            responses,
-            forward_on_have,
-        } => match state.require_active_peer() {
-            Ok(tenant_id) => {
-                use crate::shared::sync_control::SyncPolicyMode;
-                let parse = |s: Option<String>| -> Result<Option<SyncPolicyMode>, String> {
-                    match s {
-                        None => Ok(None),
-                        Some(v) => v.parse::<SyncPolicyMode>().map(Some),
-                    }
-                };
-                let r = match parse(requests) {
-                    Ok(v) => v,
-                    Err(e) => return RpcResponse::error(e),
-                };
-                let resp = match parse(responses) {
-                    Ok(v) => v,
-                    Err(e) => return RpcResponse::error(e),
-                };
-                let foh = match parse(forward_on_have) {
-                    Ok(v) => v,
-                    Err(e) => return RpcResponse::error(e),
-                };
-                match state.sync_control.update_policy(&tenant_id, r, resp, foh) {
-                    Ok(policy) => RpcResponse::success(policy),
-                    Err(e) => RpcResponse::error(e),
-                }
-            }
-            Err(e) => RpcResponse::error(e),
-        },
-
         RpcMethod::SyncRoundPeer { peer } => match state.require_active_peer() {
             Ok(tenant_id) => match state.sync_control.trigger_round_for_peer(&tenant_id, &peer) {
                 Ok(capture) => RpcResponse::success(capture),
@@ -1281,45 +1236,6 @@ fn dispatch(
             },
             Err(e) => RpcResponse::error(e),
         },
-
-        RpcMethod::SyncRequestPeer { peer } => match state.require_active_peer() {
-            Ok(tenant_id) => {
-                match state
-                    .sync_control
-                    .trigger_request_for_peer(&tenant_id, &peer)
-                {
-                    Ok(result) => RpcResponse::success(result),
-                    Err(e) => RpcResponse::error(e),
-                }
-            }
-            Err(e) => RpcResponse::error(e),
-        },
-
-        RpcMethod::SyncRequestAll => match state.require_active_peer() {
-            Ok(tenant_id) => match state.sync_control.trigger_request_for_all(&tenant_id) {
-                Ok(results) => RpcResponse::success(results),
-                Err(e) => RpcResponse::error(e),
-            },
-            Err(e) => RpcResponse::error(e),
-        },
-
-        RpcMethod::Forward { action } => {
-            use crate::state::live_hints;
-            match action {
-                ForwardAction::Enable => {
-                    live_hints::set_forward_on_have(true);
-                    RpcResponse::success(serde_json::json!({ "forward_on_have": true }))
-                }
-                ForwardAction::Disable => {
-                    live_hints::set_forward_on_have(false);
-                    RpcResponse::success(serde_json::json!({ "forward_on_have": false }))
-                }
-                ForwardAction::Status => {
-                    let enabled = live_hints::forward_on_have_enabled();
-                    RpcResponse::success(serde_json::json!({ "forward_on_have": enabled }))
-                }
-            }
-        }
 
         RpcMethod::EventBlocked => match state.require_active_peer() {
             Ok(peer_id) => match service::open_db_for_peer(db_path, &peer_id) {

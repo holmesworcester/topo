@@ -10,7 +10,6 @@ pub fn neg_id_to_event_id(id: &Id) -> EventId {
 /// Sync message types
 pub const MSG_TYPE_NEG_OPEN: u8 = 0x10; // Initial negentropy message
 pub const MSG_TYPE_NEG_MSG: u8 = 0x11; // Negentropy response
-pub const MSG_TYPE_DISCOVERY_HINTS: u8 = 0x14; // Discovery hint: peer is missing these IDs
 pub const MSG_TYPE_RANGE_POLICY_REJECT: u8 = 0x15; // Peer explicitly rejects a sync window policy
 pub const MSG_TYPE_EVENT: u8 = 0x03; // Event blob (variable length)
 pub const MSG_TYPE_OPEN_SESSION_AUTH_INVITE: u8 = 0x31;
@@ -22,17 +21,6 @@ pub const MSG_TYPE_OPEN_SESSION_ROUTE: u8 = 0x33;
 /// (e.g. 500k items ≈ 18 MB of IdLists in worst case).  128 MiB leaves ample
 /// headroom without risking OOM from a single malformed frame.
 const MAX_NEG_MSG_BYTES: usize = 128 * 1024 * 1024;
-/// Max number of IDs or discovery hints carried in one control-plane frame.
-const MAX_ID_LIST_ENTRIES: usize = 100_000;
-const DISCOVERY_HINT_WIRE_BYTES: usize = 32 + 1 + 4 + 8;
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct DiscoveryHint {
-    pub event_id: EventId,
-    pub semantic_type_code: u8,
-    pub encoded_size_bytes: u32,
-    pub created_at_ms: u64,
-}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OpenSessionAuthInvite {
@@ -66,11 +54,6 @@ pub enum Frame {
     /// Negentropy reconciliation response
     NegMsg {
         msg: Vec<u8>,
-    },
-    /// Discovery hints describing events the peer appears to be missing.
-    DiscoveryHints {
-        priority_lane: u8,
-        hints: Vec<DiscoveryHint>,
     },
     /// Peer explicitly rejected the requested sync window and advertises the
     /// oldest window kind it is willing to accept.
@@ -122,56 +105,6 @@ pub fn parse_frame(input: &[u8]) -> Result<(Frame, usize), ParseError> {
                 Frame::NegMsg { msg }
             };
             Ok((sync_msg, total_size))
-        }
-        MSG_TYPE_DISCOVERY_HINTS => {
-            if input.len() < 6 {
-                return Err(ParseError::InsufficientData);
-            }
-            let priority_lane = input[1];
-            let count = u32::from_le_bytes([input[2], input[3], input[4], input[5]]) as usize;
-            if count > MAX_ID_LIST_ENTRIES {
-                return Err(ParseError::TooManyIds(count));
-            }
-            let total_size = 6 + count * DISCOVERY_HINT_WIRE_BYTES;
-            if input.len() < total_size {
-                return Err(ParseError::InsufficientData);
-            }
-            let mut hints = Vec::with_capacity(count);
-            for i in 0..count {
-                let start = 6 + i * DISCOVERY_HINT_WIRE_BYTES;
-                let mut event_id = [0u8; 32];
-                event_id.copy_from_slice(&input[start..start + 32]);
-                let semantic_type_code = input[start + 32];
-                let encoded_size_bytes = u32::from_le_bytes([
-                    input[start + 33],
-                    input[start + 34],
-                    input[start + 35],
-                    input[start + 36],
-                ]);
-                let created_at_ms = u64::from_le_bytes([
-                    input[start + 37],
-                    input[start + 38],
-                    input[start + 39],
-                    input[start + 40],
-                    input[start + 41],
-                    input[start + 42],
-                    input[start + 43],
-                    input[start + 44],
-                ]);
-                hints.push(DiscoveryHint {
-                    event_id,
-                    semantic_type_code,
-                    encoded_size_bytes,
-                    created_at_ms,
-                });
-            }
-            Ok((
-                Frame::DiscoveryHints {
-                    priority_lane,
-                    hints,
-                },
-                total_size,
-            ))
         }
         MSG_TYPE_RANGE_POLICY_REJECT => {
             const RANGE_POLICY_REJECT_SIZE: usize = 3;
@@ -296,22 +229,6 @@ pub fn encode_frame(msg: &Frame) -> Vec<u8> {
             buf.push(MSG_TYPE_NEG_MSG);
             buf.extend_from_slice(&(data.len() as u32).to_le_bytes());
             buf.extend_from_slice(data);
-            buf
-        }
-        Frame::DiscoveryHints {
-            priority_lane,
-            hints,
-        } => {
-            let mut buf = Vec::with_capacity(6 + hints.len() * DISCOVERY_HINT_WIRE_BYTES);
-            buf.push(MSG_TYPE_DISCOVERY_HINTS);
-            buf.push(*priority_lane);
-            buf.extend_from_slice(&(hints.len() as u32).to_le_bytes());
-            for hint in hints {
-                buf.extend_from_slice(&hint.event_id);
-                buf.push(hint.semantic_type_code);
-                buf.extend_from_slice(&hint.encoded_size_bytes.to_le_bytes());
-                buf.extend_from_slice(&hint.created_at_ms.to_le_bytes());
-            }
             buf
         }
         Frame::RangePolicyReject {
@@ -538,31 +455,6 @@ mod tests {
         let (msg, consumed) = parse_frame(&buf).unwrap();
         assert_eq!(consumed, 5 + MAX_NEG_MSG_BYTES);
         assert!(matches!(msg, Frame::NegOpen { .. }));
-    }
-
-    #[test]
-    fn test_discovery_hints_roundtrip() {
-        let msg = Frame::DiscoveryHints {
-            priority_lane: 3,
-            hints: vec![
-                DiscoveryHint {
-                    event_id: [0x11; 32],
-                    semantic_type_code: 7,
-                    encoded_size_bytes: 144,
-                    created_at_ms: 1_000,
-                },
-                DiscoveryHint {
-                    event_id: [0x22; 32],
-                    semantic_type_code: 14,
-                    encoded_size_bytes: 262_214,
-                    created_at_ms: 2_000,
-                },
-            ],
-        };
-        let encoded = encode_frame(&msg);
-        let (parsed, consumed) = parse_frame(&encoded).unwrap();
-        assert_eq!(consumed, encoded.len());
-        assert_eq!(parsed, msg);
     }
 
     #[test]

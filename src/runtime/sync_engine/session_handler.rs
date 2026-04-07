@@ -243,7 +243,7 @@ impl SessionHandler for SyncConnectionHandler {
             .map(|sc| sc.register_session(&tenant_id, &peer_id, sc_role));
         let (mut manual_cmd_rx, _sc_guard) = match registered {
             Some(rs) => {
-                let (crx, _prx, guard) = rs.into_parts();
+                let (crx, guard) = rs.into_parts();
                 (Some(crx), Some(guard))
             }
             None => (None, None),

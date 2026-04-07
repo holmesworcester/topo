@@ -62,18 +62,14 @@ fn env_i64(name: &str, default: i64) -> i64 {
 }
 
 fn inherited_tier_env() -> Vec<(String, String)> {
-    [
-        "TOPO_GENERATE_MESSAGE_SPREAD_MS",
-        "TOPO_FORWARD_ON_HAVE",
-        "TOPO_EVENT_TIMELINE",
-    ]
-    .into_iter()
-    .filter_map(|key| {
-        std::env::var(key)
-            .ok()
-            .map(|value| (key.to_string(), value))
-    })
-    .collect()
+    ["TOPO_GENERATE_MESSAGE_SPREAD_MS", "TOPO_EVENT_TIMELINE"]
+        .into_iter()
+        .filter_map(|key| {
+            std::env::var(key)
+                .ok()
+                .map(|value| (key.to_string(), value))
+        })
+        .collect()
 }
 
 fn enable_sync_logging(db: &str) {
@@ -606,7 +602,6 @@ fn run_cold_join_bench(source_count: usize, connectivity: ConnectivityMode) -> B
         "TOPO_GENERATE_MESSAGE_SPREAD_MS",
         THREE_YEARS_MS.to_string(),
     );
-    std::env::set_var("TOPO_FORWARD_ON_HAVE", "0");
     std::env::set_var("TOPO_EVENT_TIMELINE", "1");
     std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "persist,projection");
 
@@ -797,7 +792,6 @@ fn run_rejoin_bench(source_count: usize, connectivity: ConnectivityMode) -> Benc
         "TOPO_GENERATE_MESSAGE_SPREAD_MS",
         THREE_YEARS_MS.to_string(),
     );
-    std::env::set_var("TOPO_FORWARD_ON_HAVE", "0");
     std::env::set_var("TOPO_EVENT_TIMELINE", "1");
     std::env::set_var("TOPO_EVENT_TIMELINE_GROUPS", "persist,projection");
 

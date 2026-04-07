@@ -127,18 +127,18 @@ async fn exercise_roundtrip_sessions(
             }
         );
 
-        let discovery_hints = encode_frame(&Frame::DiscoveryHints {
-            priority_lane: 0,
-            hints: vec![],
+        let range_reject = encode_frame(&Frame::RangePolicyReject {
+            rejected_window_kind: 3,
+            oldest_allowed_window_kind: 2,
         });
-        server_parts.control.send(&discovery_hints).await?;
+        server_parts.control.send(&range_reject).await?;
         server_parts.control.flush().await?;
         let received = client_parts.control.recv().await?;
         assert_eq!(
             parse_frame(&received)?.0,
-            Frame::DiscoveryHints {
-                priority_lane: 0,
-                hints: vec![],
+            Frame::RangePolicyReject {
+                rejected_window_kind: 3,
+                oldest_allowed_window_kind: 2,
             }
         );
 

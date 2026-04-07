@@ -314,19 +314,14 @@ for nearby peers on clean links.
 
 # Live Message Delivery Latency
 
-Two discovery modes, tested independently and together. 2 msg/s × 15 s, in-process loopback, no preload.
+Round-based discovery latency. 2 msg/s × 15 s, in-process loopback, no preload.
 
 | Discovery mode | avg | p50 | p95 | worst |
 |----------------|-----|-----|-----|-------|
-| forward-on-have only | 2.7 ms | 3 ms | 4 ms | 5 ms |
 | negentropy only (5 s rounds) | 2,561 ms | 2,805 ms | 4,813 ms | 4,833 ms |
-| **both (production)** | **3.2 ms** | **3 ms** | **4 ms** | **5 ms** |
 
-- Forward-on-have pushes hints to peers immediately via broadcast channel — 1,000× faster than round-based discovery at production cadence
 - Negentropy avg ≈ half the round gap (~2.5 s at 5 s rounds) — expected
-- Production mode tracks the forward path; negentropy is invisible unless hints are lost
-- Gate assertion: worst ≤ 50 ms at 2 msg/s (actual: 4 ms)
-- `topo forward enable/disable` toggles hint delivery at runtime for A/B testing
+- Gate assertion: worst ≤ 5 s at 2 msg/s (actual: 4,833 ms)
 
 ---
 

@@ -29,7 +29,6 @@ The intended end state is:
 Large uncommitted refactor work is already present here. The important slices already changed are:
 
 - `Frame::HaveList` -> `Frame::RequestIds`
-- `Frame::NeedList` -> `Frame::DiscoveryHints`
 - `Frame::RequestCredit` -> `Frame::ResponseCredit`
 - `DiscoveryHint` now carries:
   - `event_id`
@@ -224,7 +223,6 @@ The following simplification cleanup should remain true:
 - no reintroduction of SQLite egress queue for live sync
 - no backsliding on frame renames:
   - `RequestIds`
-  - `DiscoveryHints`
   - `ResponseCredit`
 
 ### Worktree hygiene

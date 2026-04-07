@@ -434,14 +434,9 @@ mod tests {
     #[tokio::test]
     async fn session_io_encodes_decodes_control_and_data_frames() {
         let (mut parts, control_state, data_send_state) = build_io(
-            vec![Ok(Frame::DiscoveryHints {
-                priority_lane: 2,
-                hints: vec![crate::protocol::DiscoveryHint {
-                    event_id: [0x11; 32],
-                    semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
-                    encoded_size_bytes: 144,
-                    created_at_ms: 1_234,
-                }],
+            vec![Ok(Frame::RangePolicyReject {
+                rejected_window_kind: 3,
+                oldest_allowed_window_kind: 2,
             })],
             vec![Ok(encode_frame(&Frame::Event {
                 blob: vec![1, 2, 3],
@@ -453,14 +448,9 @@ mod tests {
         assert_eq!(consumed, control_frame.len());
         assert_eq!(
             control_msg,
-            Frame::DiscoveryHints {
-                priority_lane: 2,
-                hints: vec![crate::protocol::DiscoveryHint {
-                    event_id: [0x11; 32],
-                    semantic_type_code: crate::event_modules::EVENT_TYPE_MESSAGE,
-                    encoded_size_bytes: 144,
-                    created_at_ms: 1_234,
-                }],
+            Frame::RangePolicyReject {
+                rejected_window_kind: 3,
+                oldest_allowed_window_kind: 2,
             }
         );
 

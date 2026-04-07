@@ -125,11 +125,6 @@ pub enum RpcMethod {
     },
     /// List all known peers with local/remote status and endpoint info.
     Peers,
-    /// Enable, disable, or inspect forward-on-have live hint delivery.
-    Forward {
-        #[serde(default = "default_forward_action")]
-        action: ForwardAction,
-    },
     /// Combined view: sidebar (workspace, users, tenants) + messages with inline reactions.
     View {
         #[serde(default = "default_view_limit")]
@@ -191,29 +186,12 @@ pub enum RpcMethod {
     EventTimeline {
         event_id: String,
     },
-    /// Show the current sync policy for the active tenant.
-    SyncPolicyShow,
-    /// Set sync policy fields for the active tenant.
-    SyncPolicySet {
-        #[serde(default)]
-        requests: Option<String>,
-        #[serde(default)]
-        responses: Option<String>,
-        #[serde(default)]
-        forward_on_have: Option<String>,
-    },
     /// Trigger a negentropy round for a specific peer.
     SyncRoundPeer {
         peer: String,
     },
     /// Trigger a negentropy round for all connected peers.
     SyncRoundAll,
-    /// Trigger a request refill for a specific peer.
-    SyncRequestPeer {
-        peer: String,
-    },
-    /// Trigger a request refill for all connected peers.
-    SyncRequestAll,
 
     /// Return all projection table counts for the active tenant.
     Stats,
@@ -231,18 +209,6 @@ pub enum RpcMethod {
         #[serde(default = "default_discover_timeout_ms")]
         timeout_ms: u64,
     },
-}
-
-#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
-#[serde(rename_all = "snake_case")]
-pub enum ForwardAction {
-    Enable,
-    Disable,
-    Status,
-}
-
-fn default_forward_action() -> ForwardAction {
-    ForwardAction::Status
 }
 
 #[cfg(feature = "discovery")]

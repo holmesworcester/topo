@@ -340,12 +340,6 @@ pub(crate) enum Commands {
         action: RpcAction,
     },
 
-    /// Enable, disable, or query forward-on-have live hint delivery.
-    Forward {
-        #[command(subcommand)]
-        action: Option<ForwardCommand>,
-    },
-
     /// List recent/active peer connections
     Connections {
         /// Output as JSON
@@ -364,10 +358,10 @@ pub(crate) enum Commands {
         json: bool,
     },
 
-    /// Manual sync controls: policy, round, request
+    /// Manual sync controls
     #[command(
         name = "sync",
-        after_help = "Examples:\n  topo sync policy show\n  topo sync policy set --requests manual\n  topo sync round peer abc123\n  topo sync round all\n  topo sync request peer abc123\n  topo sync request all"
+        after_help = "Examples:\n  topo sync round peer abc123\n  topo sync round all"
     )]
     Sync {
         #[command(subcommand)]
@@ -412,29 +406,9 @@ pub(crate) enum RpcAction {
 }
 
 #[derive(Subcommand)]
-pub(crate) enum ForwardCommand {
-    /// Enable forward-on-have live hint delivery.
-    Enable,
-    /// Disable forward-on-have live hint delivery.
-    Disable,
-    /// Show the current forward-on-have status.
-    Status,
-}
-
-#[derive(Subcommand)]
 pub(crate) enum SyncAction {
-    /// Manage sync policy (show or set)
-    Policy {
-        #[command(subcommand)]
-        action: SyncPolicyAction,
-    },
     /// Trigger a negentropy discovery round
     Round {
-        #[command(subcommand)]
-        target: SyncTarget,
-    },
-    /// Trigger a request refill
-    Request {
         #[command(subcommand)]
         target: SyncTarget,
     },
@@ -449,24 +423,6 @@ pub(crate) enum SyncTarget {
     },
     /// Target all connected peers
     All,
-}
-
-#[derive(Subcommand)]
-pub(crate) enum SyncPolicyAction {
-    /// Show the current sync policy
-    Show,
-    /// Set sync policy fields
-    Set {
-        /// Requests lane mode (auto, manual, disabled)
-        #[arg(long)]
-        requests: Option<String>,
-        /// Responses lane mode (auto, manual, disabled)
-        #[arg(long)]
-        responses: Option<String>,
-        /// Forward-on-have lane mode (auto, manual, disabled)
-        #[arg(long)]
-        forward_on_have: Option<String>,
-    },
 }
 
 #[derive(Subcommand)]

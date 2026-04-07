@@ -282,8 +282,6 @@ Defer for later: memory-first processing (Idea 1), hash-chain batching
 
 ## What's Already Merged (on master)
 
-- Forward-on-have live hint bus (sub-second live delivery)
-- Bidirectional DiscoveryHints with real byte sizes (vendored negentropy)
 - Credit watermarks tuned for file slices (2 MiB high, 512 KiB low)
 - Configurable timeline recording (`TOPO_EVENT_TIMELINE` env var)
 - Batched recorded_events check in observe_many_for_peer

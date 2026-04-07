@@ -279,12 +279,11 @@ Policy for future transport work:
 
 Sync keeps one long-lived request/response lane set per authenticated connection.
 
-1. discovery remains round-scoped (`NegOpen` / `NegMsg` / `DiscoveryHints`),
+1. discovery remains round-scoped (`NegOpen` / `NegMsg`),
 2. in tiered mode, outbound rounds cycle `last hour -> last day -> last week -> last month -> full`, then repeat; discovered events keep both a window-derived lane and `created_at_ms`,
-3. both sides send `DiscoveryHints` with real `encoded_size_bytes` so byte-credit accounting uses actual event sizes rather than a conservative floor,
-4. the data stream carries only `Event` blobs for the active range,
-5. auth/removal-frontier and key ranges are scheduled ahead of hot message ranges,
-6. there is no per-round `Done` / `DataDone` / `DoneAck` completion handshake in live sync.
+3. the data stream carries only `Event` blobs for the active range,
+4. auth/removal-frontier and key ranges are scheduled ahead of hot message ranges,
+5. there is no per-round `Done` / `DataDone` / `DoneAck` completion handshake in live sync.
 
 ### Range-fingerprint security note
 
@@ -1053,26 +1052,6 @@ The projection drain path (`drain_project_queue_on_connection` + `drain_with_lim
 Profiling evidence: 500k one-way sync improved from 170.93s (2,925 msgs/s) to 106.75s (4,684 msgs/s) — 37.5% wall time reduction, 60% throughput improvement. Core suite (10k, 50k) showed no regressions.
 
 Note: wrapping all projection writes in a single transaction was attempted first but abandoned — it caused ~0.06% of events to be left unprojected at 500k scale due to cascade_unblocked bulk cleanup interacting with the transaction scope.
-
-### 10.0.2 Implemented: forward-on-have live hint bus
-
-**Problem.** Negentropy discovery runs on a periodic interval (default 100 ms, tunable via `TOPO_DISCOVERY_ROUND_GAP_MS`). Even with tiered discovery active, a freshly created message would otherwise wait for the next scheduled round before the remote peer discovers it.
-
-**Design.** Each time the persist phase newly inserts a shared canonical event it publishes a `LiveHint { event_id, source_peer_id, tenant_id }` entry to a per-`(db_path, tenant_id)` tokio broadcast channel (`src/state/live_hints.rs`). Active initiator and responder sessions subscribe on startup. Each control-loop tick (1 ms poll) the session drains up to `need_chunk()` hints from its receiver and emits `DiscoveryHints` immediately on the control stream. Those hints are grouped by the same age-derived priority lanes used by tiered discovery, so a new message lands in the hour/day/week/month/full ordering naturally. Self-hint filtering: hints tagged with the receiving peer's own ID are skipped. Drain cap: the loop tracks `drained` (total items consumed, including filtered ones) and breaks at `need_chunk()` so a backlog of self-hints or duplicates cannot stall the control loop.
-
-**Measured delivery latency** (in-process loopback, `TOPO_FORWARD_ON_HAVE=1`, no preload):
-
-| Discovery mode | avg | p95 | worst |
-|----------------|-----|-----|-------|
-| forward-on-have only | 2.7 ms | 4 ms | 5 ms |
-| negentropy only (5 s rounds) | 2,561 ms | 4,813 ms | 4,833 ms |
-| **both (production)** | **3.2 ms** | **4 ms** | **5 ms** |
-
-**Key files:**
-- `src/state/live_hints.rs` — broadcast bus, `LiveHint` type, `subscribe()`, `publish_from_connection()`
-- `src/runtime/sync_engine/session/control_plane.rs` — `send_forward_on_have_hints()`, `send_discovery_hints_for_event_ids()`
-- `src/testutil/mod.rs` — `start_peers_runtime_affine()`
-- `tests/multi_peer_delivery_latency_perf_test.rs` — perf harness with per-event stage timing
 
 `low_mem_ios` requirements:
 - target steady-state RSS at or below `24 MiB` during sustained sync/projection.

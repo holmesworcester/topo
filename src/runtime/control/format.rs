@@ -102,37 +102,6 @@ fn summarize_sync_event_detail(frame_type: &str, detail_json: Option<&str>) -> S
                 )
             }
         }
-        "DiscoveryHints" => {
-            let count = v["hint_count"].as_u64().unwrap_or(0);
-            let ids = v["ids"]
-                .as_array()
-                .map(|arr| {
-                    arr.iter()
-                        .filter_map(|x| x.as_str())
-                        .map(short_sync_id)
-                        .collect::<Vec<_>>()
-                })
-                .unwrap_or_default();
-            let truncated = v["hints_truncated"].as_bool().unwrap_or(false);
-            if ids.is_empty() {
-                format!(" detail=hints(count={} truncated={})", count, truncated)
-            } else {
-                let shown = ids.join(",");
-                let shown_count = ids.len() as u64;
-                let more = count.saturating_sub(shown_count);
-                let extra = if more > 0 {
-                    format!(" (+{} more)", more)
-                } else if truncated {
-                    " ...".to_string()
-                } else {
-                    String::new()
-                };
-                format!(
-                    " detail=hints(count={} truncated={} ids=[{}]{})",
-                    count, truncated, shown, extra
-                )
-            }
-        }
         "RangePolicyReject" => {
             let rejected = v["rejected_window_kind"].as_u64().unwrap_or(0);
             let oldest_allowed = v["oldest_allowed_window_kind"].as_u64().unwrap_or(0);
@@ -1173,34 +1142,6 @@ pub(crate) fn print_round_capture(data: &serde_json::Value) {
     } else {
         println!("SYNC ROUND peer={}", short_peer);
         println!("  Newly observed: nothing new learned");
-    }
-}
-
-pub(crate) fn print_request_result(data: &serde_json::Value) {
-    let peer = data["peer_id"].as_str().unwrap_or("?");
-    let short_peer = &peer[..16.min(peer.len())];
-
-    if let Some(reason) = data["reason"].as_str() {
-        println!("SYNC REQUEST peer={}: {}", short_peer, reason);
-        return;
-    }
-
-    let ids = data["requested_ids"].as_array();
-    let count = ids.map(|a| a.len()).unwrap_or(0);
-
-    println!(
-        "SYNC REQUEST peer={}: {} event(s) requested",
-        short_peer, count
-    );
-    if let Some(ids) = ids {
-        for id in ids {
-            if let Some(s) = id.as_str() {
-                println!("  {}", s);
-            }
-        }
-    }
-    if count == 0 {
-        println!("  (no events eligible for request)");
     }
 }
 
