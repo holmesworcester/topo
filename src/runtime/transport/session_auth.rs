@@ -2,7 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
 use rusqlite::{params, Connection, OptionalExtension};
-use tracing::warn;
+use tracing::debug;
 
 use crate::contracts::peering_contract::TransportSessionIo;
 use crate::crypto::{
@@ -251,7 +251,7 @@ async fn send_session_route(
     .await
 }
 
-fn peer_route_is_admitted_for_daemon(
+fn peer_route_is_authorized_for_daemon(
     conn: &Connection,
     daemon_connection: Option<&DaemonConnection>,
     tenant_id: &str,
@@ -353,7 +353,7 @@ pub async fn send_outbound_session_auth(
                 )
                 .into());
             }
-            if !peer_route_is_admitted_for_daemon(
+            if !peer_route_is_authorized_for_daemon(
                 &db,
                 daemon_connection,
                 recorded_by,
@@ -451,7 +451,7 @@ async fn read_inbound_session_auth_inner(
         Frame::OpenSessionRoute { route } => {
             let tenant_id = hex::encode(route.target_tenant_id);
             let remote_peer_id = hex::encode(route.source_peer_id);
-            if !peer_route_is_admitted_for_daemon(
+            if !peer_route_is_authorized_for_daemon(
                 &db,
                 daemon_connection,
                 &tenant_id,
@@ -625,7 +625,7 @@ fn has_active_local_bootstrap_session_auth(
     Ok(has_accepted)
 }
 
-fn resolve_exact_bootstrap_invite_for_daemon(
+pub fn resolve_bootstrap_fallback_invite_for_daemon(
     conn: &Connection,
     recorded_by: &str,
     actual_remote_daemon_peer_id: &str,
@@ -636,11 +636,16 @@ fn resolve_exact_bootstrap_invite_for_daemon(
     let mut invite_event_ids = conn
         .prepare(
             "SELECT invite_event_id
+             FROM pending_invite_bootstrap_trust
+             WHERE recorded_by = ?1
+               AND expected_bootstrap_spki_fingerprint = ?2
+               AND expires_at > ?3
+             UNION ALL
+             SELECT invite_event_id
              FROM invite_bootstrap_trust
              WHERE recorded_by = ?1
                AND bootstrap_spki_fingerprint = ?2
-               AND expires_at > ?3
-             ORDER BY accepted_at DESC, invite_accepted_event_id DESC, invite_event_id ASC",
+               AND expires_at > ?3",
         )?
         .query_map(
             params![recorded_by, remote_daemon_peer_id.as_slice(), now],
@@ -657,53 +662,20 @@ fn resolve_exact_bootstrap_invite_for_daemon(
 
 pub fn resolve_outbound_session_auth_plan(
     conn: &Connection,
+    daemon_connection: Option<&DaemonConnection>,
     recorded_by: &str,
     remote_session_peer_id: &str,
     actual_remote_daemon_peer_id: &str,
     requested_plan: &OutboundSessionAuthPlan,
 ) -> Result<OutboundSessionAuthPlan, Box<dyn std::error::Error + Send + Sync>> {
     match requested_plan {
-        OutboundSessionAuthPlan::PeerShared { .. } => {
-            if peer_route_is_admitted_for_daemon(
-                conn,
-                None,
-                recorded_by,
-                remote_session_peer_id,
-                actual_remote_daemon_peer_id,
-            )? {
-                return Ok(requested_plan.clone());
-            }
-
-            if let Some(invite_event_id) = resolve_exact_bootstrap_invite_for_daemon(
-                conn,
-                recorded_by,
-                actual_remote_daemon_peer_id,
-            )? {
-                let resolved_plan = OutboundSessionAuthPlan::InviteBootstrap {
-                    invite_event_id: invite_event_id.clone(),
-                };
-                let key = format!(
-                    "outbound-auth-fallback:{}:{}:{}",
-                    recorded_by, remote_session_peer_id, actual_remote_daemon_peer_id
-                );
-                if should_emit_globally(key) {
-                    warn!(
-                        "Outbound auth plan changed tenant={} peer={} daemon={} requested={} resolved={} because no admitted steady-state route exists for this daemon yet",
-                        short_value(recorded_by),
-                        short_value(remote_session_peer_id),
-                        short_value(actual_remote_daemon_peer_id),
-                        describe_outbound_session_auth_plan(requested_plan),
-                        describe_outbound_session_auth_plan(&resolved_plan)
-                    );
-                }
-                return Ok(resolved_plan);
-            }
-
-            Ok(requested_plan.clone())
-        }
+        OutboundSessionAuthPlan::PeerShared { .. } => Ok(requested_plan.clone()),
         OutboundSessionAuthPlan::InviteBootstrap { invite_event_id } => {
             let bound_daemon_peer_id =
                 resolve_bound_daemon_peer_id(conn, recorded_by, remote_session_peer_id)?;
+            let daemon_connection_admits_route = daemon_connection
+                .map(|conn| conn.admits_session_route(recorded_by, remote_session_peer_id))
+                .unwrap_or(false);
             let has_active_bootstrap = has_active_local_bootstrap_session_auth(
                 conn,
                 recorded_by,
@@ -711,13 +683,43 @@ pub fn resolve_outbound_session_auth_plan(
                 actual_remote_daemon_peer_id,
             )?;
             if has_active_bootstrap {
+                if daemon_connection_admits_route
+                    && bound_daemon_peer_id.as_deref() == Some(actual_remote_daemon_peer_id)
+                {
+                    let Ok(remote_session_peer_id_raw) =
+                        decode_hex32(remote_session_peer_id, "remote session peer id")
+                    else {
+                        return Ok(requested_plan.clone());
+                    };
+                    if !is_authorized_for_tenant(conn, recorded_by, &remote_session_peer_id_raw)? {
+                        return Ok(requested_plan.clone());
+                    }
+                    let resolved_plan = OutboundSessionAuthPlan::PeerShared {
+                        target_peer_id: remote_session_peer_id.to_string(),
+                    };
+                    let key = format!(
+                        "outbound-auth-upgrade-admitted:{}:{}:{}",
+                        recorded_by, remote_session_peer_id, actual_remote_daemon_peer_id
+                    );
+                    if should_emit_globally(key) {
+                        debug!(
+                            "Outbound auth plan changed tenant={} peer={} daemon={} requested={} resolved={} because this daemon connection already admitted the steady-state route",
+                            short_value(recorded_by),
+                            short_value(remote_session_peer_id),
+                            short_value(actual_remote_daemon_peer_id),
+                            describe_outbound_session_auth_plan(requested_plan),
+                            describe_outbound_session_auth_plan(&resolved_plan)
+                        );
+                    }
+                    return Ok(resolved_plan);
+                }
                 if bound_daemon_peer_id.as_deref() == Some(actual_remote_daemon_peer_id) {
                     let key = format!(
                         "outbound-auth-keep-bootstrap:{}:{}:{}",
                         recorded_by, remote_session_peer_id, actual_remote_daemon_peer_id
                     );
                     if should_emit_globally(key) {
-                        warn!(
+                        debug!(
                             "Outbound auth plan kept bootstrap tenant={} peer={} daemon={} requested={} because bootstrap trust is still active even though a steady-state daemon binding exists",
                             short_value(recorded_by),
                             short_value(remote_session_peer_id),
@@ -752,7 +754,7 @@ pub fn resolve_outbound_session_auth_plan(
                 recorded_by, remote_session_peer_id, actual_remote_daemon_peer_id
             );
             if should_emit_globally(key) {
-                warn!(
+                debug!(
                     "Outbound auth plan changed tenant={} peer={} daemon={} requested={} resolved={} because the steady-state daemon binding is now authorized",
                     short_value(recorded_by),
                     short_value(remote_session_peer_id),
@@ -1113,6 +1115,7 @@ mod tests {
 
         let plan = resolve_outbound_session_auth_plan(
             &db,
+            None,
             &recorded_by,
             &remote_session_peer_id,
             &remote_daemon_peer_id,
@@ -1153,6 +1156,7 @@ mod tests {
 
         let plan = resolve_outbound_session_auth_plan(
             &db,
+            None,
             &recorded_by,
             &remote_session_peer_id,
             &remote_daemon_peer_id,
@@ -1170,8 +1174,81 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn resolve_outbound_session_auth_plan_upgrades_after_daemon_route_is_admitted() {
+        let server_temp = tempfile::tempdir().unwrap();
+        let client_temp = tempfile::tempdir().unwrap();
+        let server_db_path = server_temp.path().join("server.sqlite3");
+        let client_db_path = client_temp.path().join("client.sqlite3");
+
+        let server_daemon_peer_id = store_test_daemon_identity(server_db_path.to_str().unwrap());
+        let server_daemon_peer_id_raw =
+            decode_hex32(&server_daemon_peer_id, "server daemon peer id").unwrap();
+        let _client_daemon_peer_id = store_test_daemon_identity(client_db_path.to_str().unwrap());
+
+        let recorded_by = hex::encode([0xA4; 32]);
+        let remote_session_peer_id = hex::encode([0xA5; 32]);
+
+        insert_authorized_peer_shared(
+            client_db_path.to_str().unwrap(),
+            &recorded_by,
+            &[0xA6; 32],
+            &[0xA7; 32],
+            &[0xA5; 32],
+        );
+
+        let client_db = open_connection(client_db_path.to_str().unwrap()).unwrap();
+        record_transport_binding(
+            &client_db,
+            &recorded_by,
+            &remote_session_peer_id,
+            &server_daemon_peer_id_raw,
+        )
+        .unwrap();
+        record_invite_bootstrap_trust(
+            &client_db,
+            &recorded_by,
+            "accepted-1",
+            "invite-bootstrap",
+            "ws-1",
+            "127.0.0.1:1",
+            &server_daemon_peer_id_raw,
+        )
+        .unwrap();
+        drop(client_db);
+
+        let (_server_ep, _client_ep, _server_daemon, client_daemon, _server_addr) =
+            connect_test_daemons(
+                server_db_path.to_str().unwrap(),
+                client_db_path.to_str().unwrap(),
+            )
+            .await
+            .expect("connect daemon endpoints");
+        client_daemon.remember_admitted_session_route(&recorded_by, &remote_session_peer_id);
+
+        let client_db = open_connection(client_db_path.to_str().unwrap()).unwrap();
+        let plan = resolve_outbound_session_auth_plan(
+            &client_db,
+            Some(&client_daemon),
+            &recorded_by,
+            &remote_session_peer_id,
+            &server_daemon_peer_id,
+            &OutboundSessionAuthPlan::InviteBootstrap {
+                invite_event_id: "invite-bootstrap".to_string(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan,
+            OutboundSessionAuthPlan::PeerShared {
+                target_peer_id: remote_session_peer_id,
+            }
+        );
+    }
+
     #[test]
-    fn resolve_outbound_session_auth_plan_falls_back_to_exact_bootstrap_for_peer_shared_request() {
+    fn resolve_outbound_session_auth_plan_keeps_peer_shared_when_exact_bootstrap_exists() {
         let temp = tempfile::tempdir().unwrap();
         let db_path = temp.path().join("client.sqlite3");
         let _daemon_peer_id = store_test_daemon_identity(db_path.to_str().unwrap());
@@ -1194,6 +1271,7 @@ mod tests {
 
         let plan = resolve_outbound_session_auth_plan(
             &db,
+            None,
             &recorded_by,
             &remote_session_peer_id,
             &remote_daemon_peer_id,
@@ -1205,10 +1283,130 @@ mod tests {
 
         assert_eq!(
             plan,
-            OutboundSessionAuthPlan::InviteBootstrap {
-                invite_event_id: "invite-bootstrap".to_string(),
+            OutboundSessionAuthPlan::PeerShared {
+                target_peer_id: remote_session_peer_id,
             }
         );
+    }
+
+    #[test]
+    fn resolve_outbound_session_auth_plan_keeps_peer_shared_until_connection_route_is_admitted() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("client.sqlite3");
+        let _daemon_peer_id = store_test_daemon_identity(db_path.to_str().unwrap());
+
+        let recorded_by = hex::encode([0x97; 32]);
+        let remote_session_peer_id = hex::encode([0x98; 32]);
+        let remote_daemon_peer_id = hex::encode([0x99; 32]);
+
+        insert_authorized_peer_shared(
+            db_path.to_str().unwrap(),
+            &recorded_by,
+            &[0x9A; 32],
+            &[0x9B; 32],
+            &[0x98; 32],
+        );
+
+        let db = open_connection(db_path.to_str().unwrap()).unwrap();
+        record_transport_binding(&db, &recorded_by, &remote_session_peer_id, &[0x99; 32]).unwrap();
+        record_invite_bootstrap_trust(
+            &db,
+            &recorded_by,
+            "accepted-1",
+            "invite-bootstrap",
+            "ws-1",
+            "127.0.0.1:1",
+            &[0x99; 32],
+        )
+        .unwrap();
+
+        let plan = resolve_outbound_session_auth_plan(
+            &db,
+            None,
+            &recorded_by,
+            &remote_session_peer_id,
+            &remote_daemon_peer_id,
+            &OutboundSessionAuthPlan::PeerShared {
+                target_peer_id: remote_session_peer_id.clone(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan,
+            OutboundSessionAuthPlan::PeerShared {
+                target_peer_id: remote_session_peer_id,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_outbound_session_auth_plan_keeps_peer_shared_when_pending_bootstrap_exists() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("client.sqlite3");
+        let _daemon_peer_id = store_test_daemon_identity(db_path.to_str().unwrap());
+
+        let recorded_by = hex::encode([0x94; 32]);
+        let remote_session_peer_id = hex::encode([0x95; 32]);
+        let remote_daemon_peer_id = hex::encode([0x96; 32]);
+
+        let db = open_connection(db_path.to_str().unwrap()).unwrap();
+        record_pending_invite_bootstrap_trust(
+            &db,
+            &recorded_by,
+            "pending-bootstrap",
+            "ws-1",
+            &[0x96; 32],
+        )
+        .unwrap();
+
+        let plan = resolve_outbound_session_auth_plan(
+            &db,
+            None,
+            &recorded_by,
+            &remote_session_peer_id,
+            &remote_daemon_peer_id,
+            &OutboundSessionAuthPlan::PeerShared {
+                target_peer_id: remote_session_peer_id.clone(),
+            },
+        )
+        .unwrap();
+
+        assert_eq!(
+            plan,
+            OutboundSessionAuthPlan::PeerShared {
+                target_peer_id: remote_session_peer_id,
+            }
+        );
+    }
+
+    #[test]
+    fn resolve_bootstrap_fallback_invite_for_daemon_finds_exact_pending_match() {
+        let temp = tempfile::tempdir().unwrap();
+        let db_path = temp.path().join("client.sqlite3");
+        let _daemon_peer_id = store_test_daemon_identity(db_path.to_str().unwrap());
+
+        let recorded_by = hex::encode([0xB1; 32]);
+        let remote_daemon_peer_id = hex::encode([0xB2; 32]);
+
+        let db = open_connection(db_path.to_str().unwrap()).unwrap();
+        record_pending_invite_bootstrap_trust(
+            &db,
+            &recorded_by,
+            "pending-bootstrap",
+            "ws-1",
+            &[0xB2; 32],
+        )
+        .unwrap();
+
+        let invite = resolve_bootstrap_fallback_invite_for_daemon(
+            &db,
+            &recorded_by,
+            &remote_daemon_peer_id,
+        )
+        .unwrap();
+
+        assert_eq!(invite.as_deref(), Some("pending-bootstrap"));
     }
 
     #[tokio::test]

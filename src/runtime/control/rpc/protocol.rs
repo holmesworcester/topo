@@ -110,6 +110,12 @@ pub enum RpcMethod {
     },
     /// Return the currently active tenant.
     ActiveTenant,
+    /// Return the current topo log config for the running daemon.
+    GetTopoLogConfig,
+    /// Update topo log level for the running daemon and persist it.
+    SetTopoLogLevel {
+        level: String,
+    },
     /// Create a new workspace + identity chain.
     CreateWorkspace {
         #[serde(default = "default_workspace_name")]

@@ -18,8 +18,9 @@ use crate::sync::SyncConnectionHandler;
 use crate::transport::session_factory::extract_build_mismatch_reason;
 use crate::transport::{
     dial_daemon_connection_target, load_daemon_identity_from_db,
-    resolve_outbound_session_auth_plan, send_outbound_session_auth, ConnectionLifecycleError,
-    DaemonConnection, OutboundSessionAuthPlan, SessionClass, TransportEndpoint,
+    resolve_bootstrap_fallback_invite_for_daemon, resolve_outbound_session_auth_plan,
+    send_outbound_session_auth, ConnectionLifecycleError, DaemonConnection,
+    OutboundSessionAuthPlan, SessionClass, TransportEndpoint,
 };
 
 use super::supervisor::{run_startup_preflight, supervise_inbound_daemon_connection};
@@ -32,6 +33,7 @@ use super::{
 pub(crate) const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
 const STALE_DIAL_FAILURE_THRESHOLD: u32 = 8;
 const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
+const QUIESCENT_SESSION_RETRY_DELAY: Duration = Duration::from_secs(15);
 
 fn describe_outbound_session_auth_plan(plan: &OutboundSessionAuthPlan) -> String {
     match plan {
@@ -58,7 +60,8 @@ fn should_evict_closed_daemon_connection(
     daemon_connection: &DaemonConnection,
     message: &str,
 ) -> bool {
-    is_connection_lost_message(message) && daemon_connection.connection().close_reason().is_some()
+    let _ = daemon_connection;
+    is_connection_lost_message(message)
 }
 
 pub struct ConnectLoopConfig {
@@ -128,6 +131,7 @@ async fn connect_loop_inner(
     let mut warning_gate = RepeatedWarningGate::new(REPEATED_WARNING_WINDOW);
     let mut last_outbound_window_scope = None;
     let mut live_session_peer_registration = None;
+    let mut next_auth_plan_override: Option<OutboundSessionAuthPlan> = None;
 
     let remote_target = describe_remote_target(remote, relay_url, expected_remote_daemon_peer_id);
 
@@ -265,19 +269,39 @@ async fn connect_loop_inner(
                 }
             };
 
-            let effective_auth_plan = open_connection(db_path)
-                .ok()
-                .and_then(|conn| {
-                    resolve_outbound_session_auth_plan(
-                        &conn,
-                        recorded_by,
-                        remote_session_peer_id,
-                        daemon_connection.remote_daemon_peer_id(),
-                        &auth_plan,
-                    )
-                    .ok()
-                })
-                .unwrap_or_else(|| auth_plan.clone());
+            let db = open_connection(db_path).ok();
+            let effective_auth_plan = next_auth_plan_override.take().unwrap_or_else(|| {
+                db.as_ref()
+                    .and_then(|conn| {
+                        resolve_outbound_session_auth_plan(
+                            conn,
+                            Some(&daemon_connection),
+                            recorded_by,
+                            remote_session_peer_id,
+                            daemon_connection.remote_daemon_peer_id(),
+                            &auth_plan,
+                        )
+                        .ok()
+                    })
+                    .unwrap_or_else(|| auth_plan.clone())
+            });
+            let bootstrap_retry_invite = match &effective_auth_plan {
+                OutboundSessionAuthPlan::PeerShared { .. }
+                    if !daemon_connection.admits_session_route(recorded_by, remote_session_peer_id) =>
+                {
+                    db.as_ref()
+                        .and_then(|conn| {
+                            resolve_bootstrap_fallback_invite_for_daemon(
+                                conn,
+                                recorded_by,
+                                daemon_connection.remote_daemon_peer_id(),
+                            )
+                            .ok()
+                        })
+                        .flatten()
+                }
+                _ => None,
+            };
 
             let auth_result = match send_outbound_session_auth(
                 session.io.as_mut(),
@@ -290,8 +314,16 @@ async fn connect_loop_inner(
             )
             .await
             {
-                Ok(auth_result) => auth_result,
+                Ok(auth_result) => {
+                    next_auth_plan_override = None;
+                    auth_result
+                }
                 Err(e) => {
+                    if let Some(invite_event_id) = bootstrap_retry_invite {
+                        next_auth_plan_override = Some(OutboundSessionAuthPlan::InviteBootstrap {
+                            invite_event_id,
+                        });
+                    }
                     if should_evict_closed_daemon_connection(&daemon_connection, &e.to_string()) {
                         daemon_connection
                             .connection()
@@ -364,7 +396,7 @@ async fn connect_loop_inner(
             );
             let session_remote_label = session.remote_label.clone();
 
-            let session_ok = super::run_session(
+            let session_stats = super::run_session(
                 &initiator_handler,
                 session.session_id,
                 session.io,
@@ -376,12 +408,19 @@ async fn connect_loop_inner(
             )
             .await;
 
-            if !session_ok {
+            let session_retry_delay = match session_stats {
+                Some(stats) if stats.events_sent == 0 && stats.events_received == 0 => {
+                    QUIESCENT_SESSION_RETRY_DELAY
+                }
+                Some(_) => Duration::ZERO,
+                None => Duration::from_millis(250),
+            };
+            if !session_retry_delay.is_zero() {
                 tokio::select! {
                     _ = shutdown.cancelled() => {
                         break;
                     }
-                    _ = tokio::time::sleep(std::time::Duration::from_millis(250)) => {}
+                    _ = tokio::time::sleep(session_retry_delay) => {}
                 }
             }
         }

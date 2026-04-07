@@ -311,7 +311,7 @@ pub(super) async fn supervise_inbound_daemon_connection(
         let session_start = std::time::Instant::now();
         let connection_id = connection.stable_id();
         tokio::task::spawn_local(async move {
-            let session_ok = run_session(
+            let session_stats = run_session(
                 &handler,
                 session.session_id,
                 session.io,
@@ -331,7 +331,7 @@ pub(super) async fn supervise_inbound_daemon_connection(
                 short_peer_id(&remote_peer_id)
             );
 
-            if !session_ok {
+            if session_stats.is_none() {
                 tokio::time::sleep(std::time::Duration::from_millis(250)).await;
             }
         });

@@ -231,6 +231,18 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"ActiveTenant"}"#,
     },
     MethodInfo {
+        name: "GetTopoLogConfig",
+        purpose: "Return the current topo log config for the running daemon",
+        params: PARAM_NONE,
+        example_json: r#"{"type":"GetTopoLogConfig"}"#,
+    },
+    MethodInfo {
+        name: "SetTopoLogLevel",
+        purpose: "Update topo log level for the running daemon and persist it",
+        params: params!["level", "string", true, None],
+        example_json: r#"{"type":"SetTopoLogLevel","level":"debug"}"#,
+    },
+    MethodInfo {
         name: "CreateWorkspace",
         purpose: "Create a new workspace + identity chain (auto-creates invite)",
         params: params![

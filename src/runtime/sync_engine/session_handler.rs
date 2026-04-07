@@ -183,16 +183,13 @@ impl SyncConnectionHandler {
         self.sync_control = sync_control;
         self
     }
-}
 
-#[async_trait(?Send)]
-impl SessionHandler for SyncConnectionHandler {
-    async fn on_session(
+    pub async fn on_session_with_stats(
         &self,
         meta: SessionMeta,
         io: Box<dyn TransportSessionIo>,
         cancel: CancellationToken,
-    ) -> Result<(), String> {
+    ) -> Result<crate::runtime::SyncStats, String> {
         if cancel.is_cancelled() {
             return Err(format!(
                 "session {} cancelled before start",
@@ -334,6 +331,24 @@ impl SessionHandler for SyncConnectionHandler {
             let outcome = if error_msg.is_some() { "error" } else { "ok" };
             let _ = logger.finalize(stats.as_ref(), outcome, error_msg);
         }
-        result
+
+        match result {
+            Ok(()) => stats.ok_or_else(|| "session completed without sync stats".to_string()),
+            Err(err) => Err(err),
+        }
+    }
+}
+
+#[async_trait(?Send)]
+impl SessionHandler for SyncConnectionHandler {
+    async fn on_session(
+        &self,
+        meta: SessionMeta,
+        io: Box<dyn TransportSessionIo>,
+        cancel: CancellationToken,
+    ) -> Result<(), String> {
+        self.on_session_with_stats(meta, io, cancel)
+            .await
+            .map(|_| ())
     }
 }

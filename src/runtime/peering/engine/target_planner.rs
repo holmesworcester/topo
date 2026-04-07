@@ -13,7 +13,7 @@ use std::collections::{HashMap, HashSet};
 use std::net::SocketAddr;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use tracing::warn;
+use tracing::{debug, warn};
 
 use crate::db::open_connection;
 use crate::db::transport_creds::discover_local_tenants;
@@ -133,7 +133,7 @@ pub(crate) fn load_bootstrap_targets(
                     tenant_id, target.transport_peer_id, target.invite_event_id
                 );
                 if should_emit_globally(key) {
-                    warn!(
+                    debug!(
                         "Skipping bootstrap target tenant={} daemon={} invite={} because a live observed endpoint for the inviter is already present",
                         short_value(tenant_id),
                         short_value(&target.transport_peer_id),
