@@ -199,36 +199,156 @@ pub fn temp_db() -> (tempfile::TempDir, String) {
     (dir, db)
 }
 
-fn hold_network_test_binary_lock() {
-    static LOCK_HELD: OnceLock<()> = OnceLock::new();
-    LOCK_HELD.get_or_init(|| {
-        let mut hasher = std::collections::hash_map::DefaultHasher::new();
-        use std::hash::Hash;
-        use std::hash::Hasher;
-        git_common_dir().hash(&mut hasher);
-        let lock_path =
-            std::env::temp_dir().join(format!("topo-network-tests-{:016x}.lock", hasher.finish()));
-        let file = std::fs::OpenOptions::new()
-            .create(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)
-            .unwrap_or_else(|err| {
-                panic!(
-                    "failed to open cross-process network test lock {}: {}",
-                    lock_path.display(),
-                    err
-                )
-            });
-        let rc = unsafe { libc::flock(std::os::fd::AsRawFd::as_raw_fd(&file), libc::LOCK_EX) };
-        if rc != 0 {
-            let err = std::io::Error::last_os_error();
-            panic!(
+fn network_test_lock_path() -> PathBuf {
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    use std::hash::Hash;
+    use std::hash::Hasher;
+    git_common_dir().hash(&mut hasher);
+    std::env::temp_dir().join(format!("topo-network-tests-{:016x}.lock", hasher.finish()))
+}
+
+fn network_test_lock_timeout() -> Duration {
+    match std::env::var("TOPO_TEST_NETWORK_LOCK_TIMEOUT_SECS") {
+        Ok(raw) => Duration::from_secs(
+            raw.parse::<u64>()
+                .unwrap_or_else(|_| panic!("invalid TOPO_TEST_NETWORK_LOCK_TIMEOUT_SECS `{raw}`")),
+        ),
+        Err(_) => Duration::from_secs(60),
+    }
+}
+
+fn describe_lock_holders(lock_path: &std::path::Path) -> String {
+    #[cfg(target_os = "linux")]
+    {
+        let target = lock_path.to_string_lossy().to_string();
+        let mut holders = Vec::new();
+        if let Ok(proc_entries) = std::fs::read_dir("/proc") {
+            for proc_entry in proc_entries.flatten() {
+                let file_name = proc_entry.file_name();
+                let pid_text = file_name.to_string_lossy();
+                let Ok(pid) = pid_text.parse::<u32>() else {
+                    continue;
+                };
+                let fd_dir = proc_entry.path().join("fd");
+                let Ok(fd_entries) = std::fs::read_dir(fd_dir) else {
+                    continue;
+                };
+                let mut matched = false;
+                for fd_entry in fd_entries.flatten() {
+                    let Ok(link_target) = std::fs::read_link(fd_entry.path()) else {
+                        continue;
+                    };
+                    if link_target.to_string_lossy() != target {
+                        continue;
+                    }
+                    matched = true;
+                    break;
+                }
+                if !matched {
+                    continue;
+                }
+                let cmdline_path = proc_entry.path().join("cmdline");
+                let cmdline_raw = std::fs::read(cmdline_path).unwrap_or_default();
+                let cmdline = String::from_utf8_lossy(&cmdline_raw)
+                    .replace(' ', " ")
+                    .trim()
+                    .to_string();
+                if cmdline.is_empty() {
+                    holders.push(format!("pid={pid}"));
+                } else {
+                    holders.push(format!("pid={pid} cmd={cmdline}"));
+                }
+            }
+        }
+        if holders.is_empty() {
+            String::new()
+        } else {
+            format!(" holders=[{}]", holders.join(" | "))
+        }
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        let _ = lock_path;
+        String::new()
+    }
+}
+
+fn acquire_advisory_lock_or_timeout(
+    lock_path: &std::path::Path,
+    timeout: Duration,
+) -> Result<std::fs::File, String> {
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .read(true)
+        .write(true)
+        .open(lock_path)
+        .map_err(|err| {
+            format!(
+                "failed to open cross-process network test lock {}: {}",
+                lock_path.display(),
+                err
+            )
+        })?;
+    let start = Instant::now();
+    let mut next_log_at = start + Duration::from_secs(5);
+    loop {
+        let rc = unsafe {
+            libc::flock(
+                std::os::fd::AsRawFd::as_raw_fd(&file),
+                libc::LOCK_EX | libc::LOCK_NB,
+            )
+        };
+        if rc == 0 {
+            return Ok(file);
+        }
+
+        let err = std::io::Error::last_os_error();
+        let raw = err.raw_os_error();
+        let would_block = raw == Some(libc::EWOULDBLOCK) || raw == Some(libc::EAGAIN);
+        if !would_block {
+            return Err(format!(
                 "failed to acquire cross-process network test lock {}: {}",
                 lock_path.display(),
                 err
-            );
+            ));
         }
+
+        if start.elapsed() >= timeout {
+            return Err(format!(
+                "timed out waiting {:?} for cross-process network test lock {}{}",
+                timeout,
+                lock_path.display(),
+                describe_lock_holders(lock_path),
+            ));
+        }
+
+        if Instant::now() >= next_log_at {
+            eprintln!(
+                "waiting for cross-process network test lock {}{}",
+                lock_path.display(),
+                describe_lock_holders(lock_path),
+            );
+            next_log_at += Duration::from_secs(5);
+        }
+        std::thread::sleep(Duration::from_millis(100));
+    }
+}
+
+pub fn acquire_network_test_lock_for_test(
+    lock_path: &std::path::Path,
+    timeout: Duration,
+) -> Result<(), String> {
+    let file = acquire_advisory_lock_or_timeout(lock_path, timeout)?;
+    drop(file);
+    Ok(())
+}
+
+fn hold_network_test_binary_lock() {
+    static LOCK_HELD: OnceLock<()> = OnceLock::new();
+    LOCK_HELD.get_or_init(|| {
+        let lock_path = network_test_lock_path();
+        let file = acquire_advisory_lock_or_timeout(&lock_path, network_test_lock_timeout())
+            .unwrap_or_else(|err| panic!("{err}"));
 
         // Intentionally leak the locked file so the advisory lock is held for
         // the lifetime of this test binary. This prevents other daemon-heavy
