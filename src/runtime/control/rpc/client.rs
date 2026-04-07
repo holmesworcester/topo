@@ -9,7 +9,7 @@ use crate::rpc::protocol::*;
 
 /// Send an RPC request to the daemon and return the response.
 pub fn rpc_call(socket_path: &Path, method: RpcMethod) -> Result<RpcResponse, RpcClientError> {
-    let mut stream = connect_stream(socket_path)?;
+    let mut stream = connect_stream(socket_path, rpc_read_timeout(&method))?;
 
     let req = RpcRequest {
         version: PROTOCOL_VERSION,
@@ -30,7 +30,7 @@ pub fn rpc_call_raw(
     socket_path: &Path,
     request: &serde_json::Value,
 ) -> Result<RpcResponse, RpcClientError> {
-    let mut stream = connect_stream(socket_path)?;
+    let mut stream = connect_stream(socket_path, Duration::from_secs(120))?;
 
     let frame = encode_frame(request).map_err(RpcClientError::Json)?;
     stream.write_all(&frame)?;
@@ -41,7 +41,10 @@ pub fn rpc_call_raw(
     Ok(resp)
 }
 
-fn connect_stream(socket_path: &Path) -> Result<UnixStream, RpcClientError> {
+fn connect_stream(
+    socket_path: &Path,
+    read_timeout: Duration,
+) -> Result<UnixStream, RpcClientError> {
     let stream = UnixStream::connect(socket_path).map_err(|e| {
         if e.kind() == std::io::ErrorKind::NotFound
             || e.kind() == std::io::ErrorKind::ConnectionRefused
@@ -52,10 +55,19 @@ fn connect_stream(socket_path: &Path) -> Result<UnixStream, RpcClientError> {
         }
     })?;
 
-    stream.set_read_timeout(Some(Duration::from_secs(120)))?;
+    stream.set_read_timeout(Some(read_timeout))?;
     stream.set_write_timeout(Some(Duration::from_secs(30)))?;
 
     Ok(stream)
+}
+
+fn rpc_read_timeout(method: &RpcMethod) -> Duration {
+    match method {
+        // Large file sends are synchronous daemon work and can legitimately
+        // take minutes in debug builds or on slower disks.
+        RpcMethod::SendFile { .. } => Duration::from_secs(10 * 60),
+        _ => Duration::from_secs(120),
+    }
 }
 
 #[derive(Debug)]

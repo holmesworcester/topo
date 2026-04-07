@@ -786,6 +786,7 @@ pub(super) fn make_valid_file_slice_ciphertext(
     )
     .expect("deterministic test file slice proof should extract");
     crate::event_modules::file_slice::wire::pack_bao_payload(&proof, &plaintext)
+        .expect("deterministic test file slice payload should fit")
 }
 
 pub(super) fn make_file_slice(

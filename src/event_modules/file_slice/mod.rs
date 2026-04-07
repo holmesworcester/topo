@@ -6,8 +6,9 @@ pub mod wire;
 pub use projector::{build_projector_context, project_pure};
 pub use stats::{file_slice_event_count, file_slice_event_counts_by_source};
 pub use wire::{
-    encode_file_slice, parse_file_slice, FileSliceEvent, FILE_SLICE_CIPHERTEXT_BYTES,
-    FILE_SLICE_MAX_BYTES, FILE_SLICE_META, FILE_SLICE_WIRE_SIZE,
+    encode_file_slice, parse_file_slice, BaoPayloadTooLarge, FileSliceEvent,
+    BAO_PLAINTEXT_CAPACITY, FILE_SLICE_CIPHERTEXT_BYTES, FILE_SLICE_DATA_BYTES,
+    FILE_SLICE_MAX_BYTES, FILE_SLICE_META, FILE_SLICE_WIRE_SIZE, MAX_FILE_BYTES,
 };
 
 use rusqlite::Connection;

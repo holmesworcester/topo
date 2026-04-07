@@ -82,7 +82,7 @@ fn test_cli_live_message_during_large_file_sync() {
     let expected_total_file_slices = std::fs::metadata(&source_path)
         .unwrap()
         .len()
-        .div_ceil(topo::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES as u64)
+        .div_ceil(topo::event_modules::file_slice::FILE_SLICE_DATA_BYTES as u64)
         as i64;
     let send_file_child = Command::new(bin())
         .args([

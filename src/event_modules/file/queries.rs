@@ -719,7 +719,7 @@ mod tests {
     use super::*;
     use crate::crypto::{hash_event, EventId};
     use crate::db::schema::create_tables;
-    use crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES;
+    use crate::event_modules::file_slice::{FILE_SLICE_CIPHERTEXT_BYTES, FILE_SLICE_DATA_BYTES};
     use crate::event_modules::{encode_event, EncryptedEvent, FileSliceEvent, ParsedEvent};
 
     fn approx_eq(left: f64, right: f64) {
@@ -762,9 +762,7 @@ mod tests {
         payload: &[u8],
     ) -> String {
         let mut ciphertext = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
-        let copy_len = payload
-            .len()
-            .min(FILE_SLICE_CIPHERTEXT_BYTES.saturating_sub(4));
+        let copy_len = payload.len().min(FILE_SLICE_DATA_BYTES);
         ciphertext[4..4 + copy_len].copy_from_slice(&payload[..copy_len]);
         let inner = ParsedEvent::FileSlice(FileSliceEvent {
             created_at_ms: created_at_ms as u64,
@@ -865,7 +863,7 @@ mod tests {
                 &file_id_b64,
                 524288,
                 2,
-                262144,
+                FILE_SLICE_DATA_BYTES as i64,
                 &[0u8; 32] as &[u8],
                 &key_event_id_b64,
                 "big.bin",
@@ -880,7 +878,7 @@ mod tests {
             file_id,
             0,
             1001,
-            &[11u8; 262144],
+            &[11u8; FILE_SLICE_DATA_BYTES],
         );
         db.execute(
             "INSERT INTO file_slices
@@ -894,7 +892,7 @@ mod tests {
         assert_eq!(result.len(), 1);
         assert_eq!(result[0].total_slices, 2);
         assert_eq!(result[0].slices_received, 1);
-        assert_eq!(result[0].downloaded_bytes, 262144);
+        assert_eq!(result[0].downloaded_bytes, FILE_SLICE_DATA_BYTES as i64);
         assert_eq!(result[0].download_rate_mib_s, None);
 
         let slice_evt2 = insert_encrypted_slice_event(
@@ -904,7 +902,7 @@ mod tests {
             file_id,
             1,
             1002,
-            &[12u8; 262144],
+            &[12u8; FILE_SLICE_DATA_BYTES],
         );
         db.execute(
             "INSERT INTO file_slices
@@ -955,7 +953,7 @@ mod tests {
                 &file_id_b64,
                 524288i64,
                 2i64,
-                262144i64,
+                FILE_SLICE_DATA_BYTES as i64,
                 &[0u8; 32] as &[u8],
                 &key_event_id_b64,
                 "big.bin",
@@ -971,7 +969,7 @@ mod tests {
             file_id,
             0,
             base + 2000,
-            &[21u8; 262144],
+            &[21u8; FILE_SLICE_DATA_BYTES],
         );
         db.execute(
             "INSERT INTO file_slices
@@ -994,7 +992,7 @@ mod tests {
             file_id,
             1,
             base + 3000,
-            &[22u8; 262144],
+            &[22u8; FILE_SLICE_DATA_BYTES],
         );
         db.execute(
             "INSERT INTO file_slices
@@ -1039,7 +1037,7 @@ mod tests {
             events_sent: 0,
             events_received: 1,
             bytes_sent: 0,
-            bytes_received: 262144,
+            bytes_received: FILE_SLICE_DATA_BYTES as u64,
             changed: true,
             outcome: "in_progress".to_string(),
             error: None,
@@ -1068,7 +1066,7 @@ mod tests {
             events_sent: 0,
             events_received: 1,
             bytes_sent: 0,
-            bytes_received: 262144,
+            bytes_received: FILE_SLICE_DATA_BYTES as u64,
             changed: true,
             outcome: "in_progress".to_string(),
             error: None,
@@ -1118,7 +1116,7 @@ mod tests {
                 &file_id_b64,
                 300000i64,
                 2i64,
-                262144i64,
+                FILE_SLICE_DATA_BYTES as i64,
                 &[0u8; 32] as &[u8],
                 &key_event_id_b64,
                 "odd.bin",
@@ -1134,7 +1132,7 @@ mod tests {
             file_id,
             0,
             1001,
-            &[31u8; 262144],
+            &[31u8; FILE_SLICE_DATA_BYTES],
         );
         db.execute(
             "INSERT INTO file_slices
@@ -1219,7 +1217,7 @@ mod tests {
                 &file_id_b64,
                 payload.len() as i64,
                 1i64,
-                FILE_SLICE_CIPHERTEXT_BYTES as i64,
+                FILE_SLICE_DATA_BYTES as i64,
                 &[0u8; 32] as &[u8],
                 &key_event_id_b64,
                 "payload.bin",
@@ -1297,7 +1295,7 @@ mod tests {
                 &file_id_b64,
                 8i64,
                 1i64,
-                FILE_SLICE_CIPHERTEXT_BYTES as i64,
+                FILE_SLICE_DATA_BYTES as i64,
                 &[0u8; 32] as &[u8],
                 &descriptor_key_event_id_b64,
                 "payload.bin",
