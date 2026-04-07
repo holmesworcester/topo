@@ -1,6 +1,8 @@
 use topo::db::{open_connection, sync_log};
 use topo::service;
 
+use crate::logging::IROH_LOG_SUPPRESSION_DIRECTIVES;
+
 // ---------------------------------------------------------------------------
 // Display helpers — delegated to display module
 // ---------------------------------------------------------------------------
@@ -47,6 +49,15 @@ pub(crate) fn print_sync_log_config(cfg: &sync_log::SyncLogConfig) {
     println!(
         "sync-log enabled={} changed_only={} capture_full_ids={} max_runs={} max_age_days={}",
         cfg.enabled, cfg.changed_only, cfg.capture_full_ids, cfg.max_runs, cfg.max_age_days
+    );
+}
+
+pub(crate) fn print_iroh_log_config(mode: topo::db::iroh_log::IrohLogMode) {
+    println!("iroh-log mode={}", mode.as_str());
+    println!("effective_on_next_start=true");
+    println!(
+        "suppression_targets={}",
+        IROH_LOG_SUPPRESSION_DIRECTIVES.join(",")
     );
 }
 

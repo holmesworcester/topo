@@ -331,6 +331,16 @@ pub(crate) enum Commands {
         action: Option<SyncLogAction>,
     },
 
+    /// Show or suppress noisy iroh/noq transport logs on the next daemon start
+    #[command(
+        name = "iroh-log",
+        after_help = "Examples:\n  topo iroh-log           # show current iroh log mode\n  topo iroh-log show      # allow iroh/noq transport logs on next start\n  topo iroh-log suppress  # suppress iroh/noq transport logs on next start\n  topo iroh-log config    # show current iroh log mode"
+    )]
+    IrohLog {
+        #[command(subcommand)]
+        action: Option<IrohLogAction>,
+    },
+
     /// Raw RPC demo surface: list methods, describe parameters, submit raw JSON calls
     #[command(
         after_help = "Examples:\n  # List all available RPC methods\n  topo rpc methods\n  topo rpc methods --json\n\n  # Describe a method and its parameters\n  topo rpc describe Status\n  topo rpc describe Send --json\n\n  # Call an RPC method (inline JSON)\n  topo rpc call --method-json '{\"type\":\"Status\"}'\n  topo rpc call --method-json '{\"type\":\"Send\",\"content\":\"hello\"}'\n  topo rpc call --method-json '{\"type\":\"Messages\",\"limit\":20}'\n  topo rpc call --method-json '{\"type\":\"View\",\"limit\":10}'\n\n  # Call with a full request envelope\n  topo rpc call --request-json '{\"version\":1,\"method\":{\"type\":\"Status\"}}'\n\n  # Call from a file or stdin\n  topo rpc call --file request.json\n  echo '{\"type\":\"Peers\"}' | topo rpc call --stdin"
@@ -632,4 +642,14 @@ pub(crate) enum SyncLogAction {
     Disable,
     /// Show sync logging configuration
     Config,
+}
+
+#[derive(Subcommand)]
+pub(crate) enum IrohLogAction {
+    /// Show iroh log mode configuration
+    Config,
+    /// Allow iroh/noq transport logs on startup
+    Show,
+    /// Suppress iroh/noq transport logs on startup
+    Suppress,
 }

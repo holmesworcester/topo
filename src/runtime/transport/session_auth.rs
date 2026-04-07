@@ -2,6 +2,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use ed25519_dalek::SigningKey;
 use rusqlite::{params, Connection, OptionalExtension};
+use tracing::warn;
 
 use crate::contracts::peering_contract::TransportSessionIo;
 use crate::crypto::{
@@ -14,6 +15,7 @@ use crate::event_modules::{parse_event, ParsedEvent};
 use crate::protocol::{
     encode_frame, parse_frame, Frame, OpenSessionAuthAck, OpenSessionAuthInvite, OpenSessionRoute,
 };
+use crate::runtime::repeated_warning::should_emit_globally;
 
 use super::{load_daemon_identity_from_db, DaemonConnection};
 
@@ -22,6 +24,21 @@ const SESSION_AUTH_CLOCK_SKEW_MS: u64 = 30 * 1000;
 const MAX_SESSION_AUTH_FRAME_BYTES: usize = 4096;
 
 const INVITE_SIGNING_DOMAIN: &[u8] = b"poc7-session-auth-v1-invite";
+
+fn short_value(value: &str) -> &str {
+    &value[..16.min(value.len())]
+}
+
+fn describe_outbound_session_auth_plan(plan: &OutboundSessionAuthPlan) -> String {
+    match plan {
+        OutboundSessionAuthPlan::PeerShared { target_peer_id } => {
+            format!("peer_shared(peer={})", short_value(target_peer_id))
+        }
+        OutboundSessionAuthPlan::InviteBootstrap { invite_event_id } => {
+            format!("invite_bootstrap(invite={})", short_value(invite_event_id))
+        }
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum OutboundSessionAuthPlan {
@@ -662,24 +679,57 @@ pub fn resolve_outbound_session_auth_plan(
                 recorded_by,
                 actual_remote_daemon_peer_id,
             )? {
-                return Ok(OutboundSessionAuthPlan::InviteBootstrap { invite_event_id });
+                let resolved_plan = OutboundSessionAuthPlan::InviteBootstrap {
+                    invite_event_id: invite_event_id.clone(),
+                };
+                let key = format!(
+                    "outbound-auth-fallback:{}:{}:{}",
+                    recorded_by, remote_session_peer_id, actual_remote_daemon_peer_id
+                );
+                if should_emit_globally(key) {
+                    warn!(
+                        "Outbound auth plan changed tenant={} peer={} daemon={} requested={} resolved={} because no admitted steady-state route exists for this daemon yet",
+                        short_value(recorded_by),
+                        short_value(remote_session_peer_id),
+                        short_value(actual_remote_daemon_peer_id),
+                        describe_outbound_session_auth_plan(requested_plan),
+                        describe_outbound_session_auth_plan(&resolved_plan)
+                    );
+                }
+                return Ok(resolved_plan);
             }
 
             Ok(requested_plan.clone())
         }
         OutboundSessionAuthPlan::InviteBootstrap { invite_event_id } => {
-            if has_active_local_bootstrap_session_auth(
+            let bound_daemon_peer_id =
+                resolve_bound_daemon_peer_id(conn, recorded_by, remote_session_peer_id)?;
+            let has_active_bootstrap = has_active_local_bootstrap_session_auth(
                 conn,
                 recorded_by,
                 invite_event_id,
                 actual_remote_daemon_peer_id,
-            )? {
+            )?;
+            if has_active_bootstrap {
+                if bound_daemon_peer_id.as_deref() == Some(actual_remote_daemon_peer_id) {
+                    let key = format!(
+                        "outbound-auth-keep-bootstrap:{}:{}:{}",
+                        recorded_by, remote_session_peer_id, actual_remote_daemon_peer_id
+                    );
+                    if should_emit_globally(key) {
+                        warn!(
+                            "Outbound auth plan kept bootstrap tenant={} peer={} daemon={} requested={} because bootstrap trust is still active even though a steady-state daemon binding exists",
+                            short_value(recorded_by),
+                            short_value(remote_session_peer_id),
+                            short_value(actual_remote_daemon_peer_id),
+                            describe_outbound_session_auth_plan(requested_plan)
+                        );
+                    }
+                }
                 return Ok(requested_plan.clone());
             }
 
-            let Some(bound_daemon_peer_id) =
-                resolve_bound_daemon_peer_id(conn, recorded_by, remote_session_peer_id)?
-            else {
+            let Some(bound_daemon_peer_id) = bound_daemon_peer_id else {
                 return Ok(requested_plan.clone());
             };
             if bound_daemon_peer_id != actual_remote_daemon_peer_id {
@@ -694,9 +744,24 @@ pub fn resolve_outbound_session_auth_plan(
             if !is_authorized_for_tenant(conn, recorded_by, &remote_session_peer_id_raw)? {
                 return Ok(requested_plan.clone());
             }
-            Ok(OutboundSessionAuthPlan::PeerShared {
+            let resolved_plan = OutboundSessionAuthPlan::PeerShared {
                 target_peer_id: remote_session_peer_id.to_string(),
-            })
+            };
+            let key = format!(
+                "outbound-auth-upgrade:{}:{}:{}",
+                recorded_by, remote_session_peer_id, actual_remote_daemon_peer_id
+            );
+            if should_emit_globally(key) {
+                warn!(
+                    "Outbound auth plan changed tenant={} peer={} daemon={} requested={} resolved={} because the steady-state daemon binding is now authorized",
+                    short_value(recorded_by),
+                    short_value(remote_session_peer_id),
+                    short_value(actual_remote_daemon_peer_id),
+                    describe_outbound_session_auth_plan(requested_plan),
+                    describe_outbound_session_auth_plan(&resolved_plan)
+                );
+            }
+            Ok(resolved_plan)
         }
     }
 }

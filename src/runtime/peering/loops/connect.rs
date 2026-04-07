@@ -33,6 +33,18 @@ pub(crate) const STALE_DIAL_TARGET_MARKER: &str = "stale_dial_target";
 const STALE_DIAL_FAILURE_THRESHOLD: u32 = 8;
 const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
 
+fn describe_outbound_session_auth_plan(plan: &OutboundSessionAuthPlan) -> String {
+    match plan {
+        OutboundSessionAuthPlan::PeerShared { target_peer_id } => {
+            format!("peer_shared(peer={})", super::short_peer_id(target_peer_id))
+        }
+        OutboundSessionAuthPlan::InviteBootstrap { invite_event_id } => {
+            let short_invite = &invite_event_id[..16.min(invite_event_id.len())];
+            format!("invite_bootstrap(invite={short_invite})")
+        }
+    }
+}
+
 fn is_connection_lost_message(message: &str) -> bool {
     let lower = message.to_ascii_lowercase();
     lower.contains("connection lost")
@@ -290,8 +302,13 @@ async fn connect_loop_inner(
                             connection_id,
                         );
                     }
-                    let message =
-                        describe_session_auth_failure(&remote_target, remote_session_peer_id, &*e);
+                    let message = format!(
+                        "{} [auth_plan={}, expected_daemon={}, actual_daemon={}]",
+                        describe_session_auth_failure(&remote_target, remote_session_peer_id, &*e),
+                        describe_outbound_session_auth_plan(&effective_auth_plan),
+                        super::short_peer_id(expected_remote_daemon_peer_id),
+                        super::short_peer_id(daemon_connection.remote_daemon_peer_id()),
+                    );
                     if warning_gate.should_emit(message.clone())
                         && should_emit_globally(format!("connect:{message}"))
                     {

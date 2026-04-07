@@ -167,6 +167,18 @@ fn format_target(
     }
 }
 
+fn describe_outbound_session_auth_plan(plan: &OutboundSessionAuthPlan) -> String {
+    match plan {
+        OutboundSessionAuthPlan::PeerShared { target_peer_id } => {
+            format!("peer_shared(peer={})", short_peer_id(target_peer_id))
+        }
+        OutboundSessionAuthPlan::InviteBootstrap { invite_event_id } => {
+            let short_invite = &invite_event_id[..16.min(invite_event_id.len())];
+            format!("invite_bootstrap(invite={short_invite})")
+        }
+    }
+}
+
 async fn cancel_bootstrap_workers_for_prefix(
     active_workers: &mut HashMap<String, ActiveConnectWorker>,
     dispatcher: &mut PeerDispatcher,
@@ -353,6 +365,31 @@ pub(super) async fn run_target_dispatcher(
             event.relay_url.as_deref(),
             Some(&expected_remote_daemon_peer_id),
         );
+
+        if matches!(event.source, TargetIngressSource::KnownPeer { .. }) {
+            if let Some(fallback) = bootstrap_session_fallback.as_ref() {
+                let bootstrap_phase = is_tenant_in_bootstrap_phase(&db_path, &event.tenant_id);
+                let key = format!(
+                    "known-peer-bootstrap-fallback:{}:{}:{}:{}",
+                    event.tenant_id,
+                    remote_peer_id,
+                    expected_remote_daemon_peer_id,
+                    bootstrap_phase
+                );
+                if should_emit_globally(key) {
+                    warn!(
+                        "Known-peer target tenant={} peer={} target={} selected {} because bootstrap fallback invite={} daemon={} remains active (bootstrap_phase={})",
+                        short_peer_id(&event.tenant_id),
+                        short_peer_id(&remote_peer_id),
+                        target_label,
+                        describe_outbound_session_auth_plan(&auth_plan),
+                        &fallback.invite_event_id[..16.min(fallback.invite_event_id.len())],
+                        short_peer_id(&fallback.daemon_peer_id),
+                        bootstrap_phase
+                    );
+                }
+            }
+        }
 
         if matches!(event.source, TargetIngressSource::KnownPeer { .. })
             && !is_tenant_in_bootstrap_phase(&db_path, &event.tenant_id)

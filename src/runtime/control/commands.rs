@@ -6,10 +6,10 @@ use topo::rpc::client::{rpc_call, RpcClientError};
 use topo::rpc::protocol::RpcMethod;
 use topo::service;
 
-use crate::cli::{EventAction, SubAction, SyncLogAction, TenantAction};
+use crate::cli::{EventAction, IrohLogAction, SubAction, SyncLogAction, TenantAction};
 use crate::format::{
-    group_runs_by_peer, print_sync_log_config, print_sync_trace_run, print_sync_tree_groups,
-    short_id,
+    group_runs_by_peer, print_iroh_log_config, print_sync_log_config, print_sync_trace_run,
+    print_sync_tree_groups, short_id,
 };
 
 // ---------------------------------------------------------------------------
@@ -959,6 +959,31 @@ pub(crate) fn run_sync_log_action(
             create_tables(&conn)?;
             let cfg = sync_log::load_config(&conn)?;
             print_sync_log_config(&cfg);
+            Ok(())
+        }
+    }
+}
+
+pub(crate) fn run_iroh_log_action(
+    db: &str,
+    action: IrohLogAction,
+) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
+    let conn = open_connection(db).map_err(|e| friendly_db_error(db, e))?;
+    create_tables(&conn)?;
+    match action {
+        IrohLogAction::Config => {
+            let mode = topo::db::iroh_log::load_mode(&conn)?;
+            print_iroh_log_config(mode);
+            Ok(())
+        }
+        IrohLogAction::Show => {
+            topo::db::iroh_log::save_mode(&conn, topo::db::iroh_log::IrohLogMode::Show)?;
+            print_iroh_log_config(topo::db::iroh_log::IrohLogMode::Show);
+            Ok(())
+        }
+        IrohLogAction::Suppress => {
+            topo::db::iroh_log::save_mode(&conn, topo::db::iroh_log::IrohLogMode::Suppress)?;
+            print_iroh_log_config(topo::db::iroh_log::IrohLogMode::Suppress);
             Ok(())
         }
     }

@@ -245,10 +245,13 @@ pub(super) async fn supervise_inbound_daemon_connection(
             send_inbound_session_auth_ack(session.io.as_mut(), &auth_context.tenant_id).await
         {
             warn!(
-                "Inbound session {} ack failed on connection {} daemon={}: {}",
+                "Inbound session {} ack failed on connection {} daemon={} tenant={} peer={} bootstrap_auth={}: {}",
                 session.session_id,
                 connection.stable_id(),
                 short_peer_id(&remote_daemon_peer_id),
+                short_peer_id(&auth_context.tenant_id),
+                short_peer_id(&auth_context.remote_peer_id),
+                auth_context.used_bootstrap_auth,
                 err
             );
             continue;

@@ -19,6 +19,7 @@ use crate::db::open_connection;
 use crate::db::transport_creds::discover_local_tenants;
 use crate::db::transport_trust::list_active_invite_bootstrap_targets;
 use crate::event_modules::workspace::invite_link::parse_bootstrap_address;
+use crate::runtime::repeated_warning::should_emit_globally;
 use crate::transport::resolve_bootstrap_inviter_peer_id;
 
 /// Dispatch decision for an outbound target.
@@ -103,6 +104,10 @@ pub(crate) fn known_peer_dispatch_key(tenant_id: &str, transport_peer_id: &str) 
     format!("{tenant_id}@peer:{transport_peer_id}")
 }
 
+fn short_value(value: &str) -> &str {
+    &value[..16.min(value.len())]
+}
+
 pub(crate) fn load_bootstrap_targets(
     db_path: &str,
     tenant_ids: &[String],
@@ -123,6 +128,18 @@ pub(crate) fn load_bootstrap_targets(
                 &target.invite_event_id,
                 now_ms,
             )? {
+                let key = format!(
+                    "bootstrap-target-superseded:{}:{}:{}",
+                    tenant_id, target.transport_peer_id, target.invite_event_id
+                );
+                if should_emit_globally(key) {
+                    warn!(
+                        "Skipping bootstrap target tenant={} daemon={} invite={} because a live observed endpoint for the inviter is already present",
+                        short_value(tenant_id),
+                        short_value(&target.transport_peer_id),
+                        short_value(&target.invite_event_id)
+                    );
+                }
                 continue;
             }
 

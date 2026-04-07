@@ -8,8 +8,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use clap::{parser::ValueSource, CommandFactory, FromArgMatches};
-use tracing::{info, Level};
-use tracing_subscriber::FmtSubscriber;
+use tracing::info;
 
 use topo::db::{friendly_db_error, open_connection, schema::create_tables};
 use topo::rpc::catalog;
@@ -22,11 +21,13 @@ use topo::tuning::{apply_low_mem_allocator_tuning, low_mem_mode};
 mod cli;
 mod commands;
 mod format;
+mod logging;
 mod runtime_manager;
 
 use cli::*;
 use commands::*;
 use format::*;
+use logging::build_start_subscriber;
 use runtime_manager::*;
 
 // ---------------------------------------------------------------------------
@@ -139,14 +140,10 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
     // Init tracing for commands that need it
     match &cli.command {
         Commands::Start { .. } => {
-            let level = match std::env::var("RUST_LOG").ok().as_deref() {
-                Some("trace") => Level::TRACE,
-                Some("debug") => Level::DEBUG,
-                Some("info") => Level::INFO,
-                Some("error") => Level::ERROR,
-                _ => Level::WARN,
-            };
-            let subscriber = FmtSubscriber::builder().with_max_level(level).finish();
+            let conn = open_connection(db).map_err(|e| friendly_db_error(db, e))?;
+            create_tables(&conn)?;
+            let iroh_log_mode = topo::db::iroh_log::load_mode(&conn)?;
+            let subscriber = build_start_subscriber(iroh_log_mode);
             let _ = tracing::subscriber::set_global_default(subscriber);
         }
         _ => {}
@@ -1150,6 +1147,11 @@ async fn async_main() -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
                 all,
             });
             run_sync_log_action(db, action)?;
+        }
+
+        Commands::IrohLog { action } => {
+            let action = action.unwrap_or(IrohLogAction::Config);
+            run_iroh_log_action(db, action)?;
         }
 
         // ---------------------------------------------------------------
