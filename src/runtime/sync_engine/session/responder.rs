@@ -98,11 +98,11 @@ where
     let Frame::NegOpen { msg } = initial else {
         return Err("responder expected NegOpen".into());
     };
-    let (range, neg_msg) = decode_initial_neg_open(&msg)?;
-    if low_mem_mode() && !is_low_mem_allowed_window(range.kind) {
+    let (task, neg_msg) = decode_initial_neg_open(&msg)?;
+    if low_mem_mode() && !is_low_mem_allowed_window(task.window.kind) {
         control
             .send(&Frame::RangePolicyReject {
-                rejected_window_kind: encode_sync_window_kind(range.kind),
+                rejected_window_kind: encode_sync_window_kind(task.window.kind),
                 oldest_allowed_window_kind: encode_sync_window_kind(SyncWindowKind::LastWeek),
             })
             .await?;
@@ -119,7 +119,7 @@ where
 
     let db = open_connection(db_path)?;
     let ws_id = resolve_sync_admission(&db, recorded_by)?;
-    let storage = load_shared_event_index_slice(&db, &ws_id, range)?;
+    let storage = load_shared_event_index_slice(&db, &ws_id, task)?;
     let mut neg = Negentropy::borrowed(&storage, NEGENTROPY_FRAME_SIZE_LIMIT)?;
 
     let mut have_ids = Vec::<Id>::new();
@@ -150,7 +150,7 @@ where
     drain_manual_commands(&mut command_rx, &mut pending_round_replies);
     reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);
 
-    let hot_receive = is_priority_ingest_window(range.kind);
+    let hot_receive = is_priority_ingest_window(task.window.kind);
     if hot_receive {
         note_hot_receive_started(db_path);
     }
@@ -166,7 +166,7 @@ where
 
     let store = Store::new(&db);
     let (events_sent, bytes_sent) =
-        send_have_events(&store, &mut data_send, &have_ids, range).await?;
+        send_have_events(&store, &mut data_send, &have_ids, task).await?;
     drop(data_send);
 
     let received = match receive_task.await {

@@ -9,7 +9,7 @@ pub const SQL_INSERT_EVENT: &str =
     "INSERT OR IGNORE INTO events (event_id, event_type, blob, share_scope, created_at, inserted_at)
      VALUES (?1, ?2, ?3, ?4, ?5, ?6)";
 pub const SQL_INSERT_SHARED_EVENT_INDEX_ENTRY: &str =
-    "INSERT OR IGNORE INTO shared_event_index (workspace_id, ts, id) VALUES (?1, ?2, ?3)";
+    "INSERT OR IGNORE INTO shared_event_index (workspace_id, ts, shard_u8, id) VALUES (?1, ?2, ?3, ?4)";
 pub const SQL_INSERT_RECORDED_EVENT: &str =
     "INSERT OR IGNORE INTO recorded_events (peer_id, event_id, recorded_at, source)
      VALUES (?1, ?2, ?3, ?4)";
@@ -35,6 +35,10 @@ fn classify_shared_priority_lane(semantic_type_code: Option<u8>) -> Option<&'sta
         ) => Some(SHARED_PRIORITY_LANE_KEY),
         _ => None,
     }
+}
+
+pub fn shared_event_shard_u8(event_id: &EventId) -> i64 {
+    event_id[0] as i64
 }
 
 fn insert_event_deps(conn: &Connection, event_id_b64: &str, blob: &[u8]) -> SqliteResult<()> {
@@ -113,9 +117,12 @@ pub fn ensure_schema(conn: &Connection) -> SqliteResult<()> {
         CREATE TABLE IF NOT EXISTS shared_event_index (
             workspace_id TEXT NOT NULL,
             ts INTEGER NOT NULL,
+            shard_u8 INTEGER NOT NULL,
             id BLOB NOT NULL,
             PRIMARY KEY (workspace_id, ts, id)
         ) WITHOUT ROWID;
+        CREATE INDEX IF NOT EXISTS idx_shared_event_index_shard
+            ON shared_event_index(workspace_id, shard_u8, ts, id);
 
         CREATE TABLE IF NOT EXISTS shared_priority_event_index (
             workspace_id TEXT NOT NULL,
@@ -183,7 +190,7 @@ pub fn insert_shared_event_index_entry_if_shared(
     if share_scope == ShareScope::Shared {
         conn.execute(
             SQL_INSERT_SHARED_EVENT_INDEX_ENTRY,
-            params![workspace_id, created_at_ms, event_id.as_slice()],
+            params![workspace_id, created_at_ms, shared_event_shard_u8(event_id), event_id.as_slice()],
         )?;
         if let Some(lane) =
             classify_shared_priority_lane(crate::event_modules::outer_semantic_type_code(blob))

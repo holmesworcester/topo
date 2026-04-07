@@ -180,7 +180,8 @@ async fn initiator_clamps_future_windows_after_explicit_last_week_policy_reject(
             other => panic!("expected NegOpen frame, got {other:?}"),
         })
         .expect("decode first NegOpen header");
-        assert_eq!(first_window.kind, SyncWindowKind::LastTwelveWeeks);
+        assert_eq!(first_window.window.kind, SyncWindowKind::LastTwelveWeeks);
+        assert!(first_window.shard_span() < topo::sync::session::windowing::VIRTUAL_SHARD_COUNT);
         peer_1
             .send_control_msg(&Frame::RangePolicyReject {
                 rejected_window_kind: encode_sync_window_kind(SyncWindowKind::LastTwelveWeeks),
@@ -216,11 +217,11 @@ async fn initiator_clamps_future_windows_after_explicit_last_week_policy_reject(
         .expect("decode second NegOpen header");
         assert!(
             matches!(
-                second_window.kind,
+                second_window.window.kind,
                 SyncWindowKind::LastDay | SyncWindowKind::LastWeek
             ),
             "after explicit last-week policy reject, initiator should only request day/week windows, got {:?}",
-            second_window.kind
+            second_window.window.kind
         );
 
         cancel.cancel();

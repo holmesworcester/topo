@@ -10,7 +10,7 @@ use crate::db::store::Store;
 use crate::protocol::neg_id_to_event_id;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::receive_log::ReceiveLogWriter;
-use crate::sync::session::windowing::{SyncWindow, SyncWindowKind};
+use crate::sync::session::windowing::{SyncTask, SyncWindowKind};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
 
@@ -26,7 +26,7 @@ pub struct RangeReceiveResult {
 fn load_range_root_entries(
     conn: &Connection,
     workspace_id: &str,
-    range: SyncWindow,
+    task: SyncTask,
 ) -> Result<Vec<(i64, EventId)>, String> {
     let mut stmt = conn
         .prepare(
@@ -35,14 +35,18 @@ fn load_range_root_entries(
              WHERE workspace_id = ?1
                AND (?2 IS NULL OR ts >= ?2)
                AND (?3 IS NULL OR ts < ?3)
+               AND shard_u8 >= ?4
+               AND shard_u8 < ?5
              ORDER BY ts, id",
         )
         .map_err(|e| format!("prepare shared index query: {e}"))?;
     let mut rows = stmt
         .query(rusqlite::params![
             workspace_id,
-            range.ts_min(),
-            range.ts_max_exclusive()
+            task.window.ts_min(),
+            task.window.ts_max_exclusive(),
+            task.shard_min_inclusive as i64,
+            task.shard_max_exclusive as i64
         ])
         .map_err(|e| format!("query shared index rows: {e}"))?;
     let mut entries = Vec::new();
@@ -162,9 +166,9 @@ fn expand_transitive_shared_deps(
 fn load_shared_window_entries(
     conn: &Connection,
     workspace_id: &str,
-    range: SyncWindow,
+    task: SyncTask,
 ) -> Result<Vec<(i64, EventId)>, String> {
-    let roots = load_range_root_entries(conn, workspace_id, range)?;
+    let roots = load_range_root_entries(conn, workspace_id, task)?;
     let root_ids: Vec<EventId> = roots.iter().map(|(_, id)| *id).collect();
     let deps = expand_transitive_shared_deps(conn, &root_ids)?;
     let mut all_by_id: HashMap<EventId, i64> = HashMap::with_capacity(roots.len() + deps.len());
@@ -181,10 +185,10 @@ fn load_shared_window_entries(
 pub fn load_shared_event_index_slice(
     conn: &Connection,
     workspace_id: &str,
-    range: SyncWindow,
+    task: SyncTask,
 ) -> Result<NegentropyStorageVector, String> {
     let mut storage = NegentropyStorageVector::new();
-    for (ts, event_id) in load_shared_window_entries(conn, workspace_id, range)? {
+    for (ts, event_id) in load_shared_window_entries(conn, workspace_id, task)? {
         storage
             .insert(ts.max(0) as u64, Id::from_byte_array(event_id))
             .map_err(|e| format!("insert negentropy vector item: {e}"))?;
@@ -247,7 +251,7 @@ fn dependency_rank(
 
 fn prioritize_send_order(
     store: &Store<'_>,
-    range: SyncWindow,
+    task: SyncTask,
     ids: &[EventId],
 ) -> Result<Vec<EventId>, String> {
     if ids.is_empty() {
@@ -274,7 +278,7 @@ fn prioritize_send_order(
         let right_ts = created_at_by_id.get(right).copied().unwrap_or_default();
         left_rank
             .cmp(&right_rank)
-            .then_with(|| match range.kind {
+            .then_with(|| match task.window.kind {
                 SyncWindowKind::LastDay => right_ts.cmp(&left_ts).then_with(|| right.cmp(left)),
                 SyncWindowKind::Full | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks => {
                     left_ts.cmp(&right_ts).then_with(|| left.cmp(right))
@@ -288,7 +292,7 @@ pub async fn send_have_events<S>(
     store: &Store<'_>,
     data_send: &mut S,
     have_ids: &[Id],
-    range: SyncWindow,
+    task: SyncTask,
 ) -> Result<(u64, u64), String>
 where
     S: StreamSend,
@@ -300,7 +304,7 @@ where
     let mut events_sent = 0u64;
     let mut bytes_sent = 0u64;
     let event_ids: Vec<EventId> = have_ids.iter().map(neg_id_to_event_id).collect();
-    let event_ids = prioritize_send_order(store, range, &event_ids)?;
+    let event_ids = prioritize_send_order(store, task, &event_ids)?;
     for chunk in event_ids.chunks(64) {
         let ordered = load_shared_send_batch(store, chunk)?;
         let mut payload = Vec::new();
@@ -595,17 +599,58 @@ mod tests {
         let entries = load_shared_window_entries(
             &conn,
             workspace_id,
-            SyncWindow {
+            SyncTask::full_window(crate::sync::session::windowing::SyncWindow {
                 kind: SyncWindowKind::LastDay,
                 ts_min_inclusive_ms: Some(90),
                 ts_max_exclusive_ms: None,
-            },
+            }),
         )
         .unwrap();
         let ids: HashSet<EventId> = entries.into_iter().map(|(_, id)| id).collect();
         assert!(ids.contains(&root_id));
         assert!(ids.contains(&mid_id));
         assert!(ids.contains(&dep_id));
+    }
+
+    #[test]
+    fn shard_task_filters_roots_but_keeps_selected_root_deps() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let workspace_id = "ws-1";
+
+        let mut roots = Vec::new();
+        for payload_byte in 0u8..=255 {
+            let root_id = insert_shared_bench_dep(&conn, workspace_id, 100, vec![], payload_byte);
+            let shard = root_id[0];
+            if roots.iter().all(|(existing_shard, _)| *existing_shard != shard) {
+                roots.push((shard, root_id));
+            }
+            if roots.len() >= 2 {
+                break;
+            }
+        }
+        assert_eq!(roots.len(), 2, "expected two roots in distinct shards");
+        let (shard_a, root_a) = roots[0];
+        let (shard_b, root_b) = roots[1];
+        let dep_id = insert_shared_bench_dep(&conn, workspace_id, 10, vec![], 0xF0);
+        let dependent_a = insert_shared_bench_dep(&conn, workspace_id, 110, vec![dep_id], shard_a);
+        let task = SyncTask {
+            window: crate::sync::session::windowing::SyncWindow {
+                kind: SyncWindowKind::LastDay,
+                ts_min_inclusive_ms: Some(90),
+                ts_max_exclusive_ms: None,
+            },
+            shard_min_inclusive: u16::from(dependent_a[0]),
+            shard_max_exclusive: u16::from(dependent_a[0]) + 1,
+        };
+
+        let entries = load_shared_window_entries(&conn, workspace_id, task).unwrap();
+        let ids: HashSet<EventId> = entries.into_iter().map(|(_, id)| id).collect();
+        assert!(ids.contains(&dependent_a));
+        assert!(ids.contains(&dep_id));
+        assert!(!ids.contains(&root_a));
+        assert!(!ids.contains(&root_b));
+        assert_ne!(shard_a, shard_b);
     }
 
     #[test]
@@ -620,11 +665,11 @@ mod tests {
 
         let ordered = prioritize_send_order(
             &store,
-            SyncWindow {
+            SyncTask::full_window(crate::sync::session::windowing::SyncWindow {
                 kind: SyncWindowKind::LastDay,
                 ts_min_inclusive_ms: Some(90),
                 ts_max_exclusive_ms: None,
-            },
+            }),
             &[root_id, dep_id],
         )
         .unwrap();
@@ -643,12 +688,12 @@ mod tests {
         assert!(event_created_at(&conn, &fixture.author_event_id) < cutoff);
         assert!(event_created_at(&conn, &fixture.key_shared_event_id) < cutoff);
 
-        let range = SyncWindow {
+        let task = SyncTask::full_window(crate::sync::session::windowing::SyncWindow {
             kind: SyncWindowKind::LastDay,
             ts_min_inclusive_ms: Some(cutoff),
             ts_max_exclusive_ms: None,
-        };
-        let entries = load_shared_window_entries(&conn, &fixture.workspace_id_b64, range).unwrap();
+        });
+        let entries = load_shared_window_entries(&conn, &fixture.workspace_id_b64, task).unwrap();
         let ids: Vec<EventId> = entries.iter().map(|(_, id)| *id).collect();
         let id_set: HashSet<EventId> = ids.iter().copied().collect();
 
@@ -659,7 +704,7 @@ mod tests {
         assert!(!id_set.contains(&fixture.key_event_id));
 
         let store = Store::new(&conn);
-        let ordered = prioritize_send_order(&store, range, &ids).unwrap();
+        let ordered = prioritize_send_order(&store, task, &ids).unwrap();
         let pos = |event_id: EventId| {
             ordered
                 .iter()

@@ -398,9 +398,9 @@ fn copy_shared_event_index(
             ],
         )?;
         dest.execute(
-            "INSERT OR IGNORE INTO shared_event_index (workspace_id, ts, id)
-             VALUES (?1, ?2, ?3)",
-            rusqlite::params![workspace_id, ts, id],
+            "INSERT OR IGNORE INTO shared_event_index (workspace_id, ts, shard_u8, id)
+             VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![workspace_id, ts, i64::from(id[0]), id],
         )?;
     }
     Ok(())

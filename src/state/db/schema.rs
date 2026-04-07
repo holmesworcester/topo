@@ -4,7 +4,7 @@ use rusqlite::{Connection, ErrorCode, OptionalExtension, Result as SqliteResult}
 ///
 /// This prototype intentionally does not support backward migration from older
 /// schema layouts. Existing DBs from prior epochs must be recreated.
-const PROTOTYPE_SCHEMA_EPOCH: i64 = 11;
+const PROTOTYPE_SCHEMA_EPOCH: i64 = 12;
 
 fn table_exists(conn: &Connection, table_name: &str) -> SqliteResult<bool> {
     conn.query_row(
@@ -158,8 +158,8 @@ mod tests {
 
         let err = conn
             .execute(
-                "INSERT INTO shared_event_index (ts, id) VALUES (?1, zeroblob(32))",
-                rusqlite::params![0i64],
+                "INSERT INTO shared_event_index (ts, shard_u8, id) VALUES (?1, ?2, zeroblob(32))",
+                rusqlite::params![0i64, 0i64],
             )
             .unwrap_err();
         let msg = err.to_string();

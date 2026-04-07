@@ -15,9 +15,9 @@ use crate::sync::session::receive_log::{
     enqueue_receive_log_ingest, note_hot_receive_finished, note_hot_receive_started,
 };
 use crate::sync::session::windowing::{
-    decode_sync_window_kind, encode_initial_neg_open, is_low_mem_allowed_window,
-    is_priority_ingest_window, mark_outbound_window_completed,
-    restrict_outbound_windows_to_last_week, select_outbound_window, SyncWindowKind,
+    decode_sync_window_kind, encode_initial_neg_open_task, is_low_mem_allowed_window,
+    is_priority_ingest_window, mark_outbound_task_completed,
+    restrict_outbound_windows_to_last_week, select_outbound_task, SyncWindowKind,
 };
 use crate::sync::session::{INITIAL_CONTROL_PROGRESS_TIMEOUT, NEGENTROPY_FRAME_SIZE_LIMIT};
 use crate::transport::{DualConnection, StreamConn, StreamRecv, StreamSend};
@@ -98,16 +98,16 @@ where
     let db = open_connection(db_path)?;
     let ws_id = resolve_sync_admission(&db, recorded_by)?;
     let live_peer_ids = live_session_peer_ids(db_path, recorded_by);
-    let range = select_outbound_window(
+    let task = select_outbound_task(
         db_path,
         recorded_by,
         peer_id,
         &live_peer_ids,
         crate::db::queue::current_timestamp_ms(),
     );
-    let storage = load_shared_event_index_slice(&db, &ws_id, range)?;
+    let storage = load_shared_event_index_slice(&db, &ws_id, task)?;
     let mut neg = Negentropy::borrowed(&storage, NEGENTROPY_FRAME_SIZE_LIMIT)?;
-    let initial_msg = encode_initial_neg_open(range, neg.initiate()?);
+    let initial_msg = encode_initial_neg_open_task(task, neg.initiate()?);
 
     control.send(&Frame::NegOpen { msg: initial_msg }).await?;
     control.flush().await?;
@@ -129,9 +129,9 @@ where
                     .map_err(|e| {
                         format!("initiator received invalid oldest allowed window kind: {e}")
                     })?;
-                if rejected_kind == range.kind
+                if rejected_kind == task.window.kind
                     && oldest_allowed_kind == SyncWindowKind::LastWeek
-                    && !is_low_mem_allowed_window(range.kind)
+                    && !is_low_mem_allowed_window(task.window.kind)
                 {
                     restrict_outbound_windows_to_last_week(db_path, recorded_by, peer_id);
                     return Ok(SyncStats {
@@ -145,7 +145,7 @@ where
                 }
                 return Err(format!(
                     "initiator received unsupported range policy reject: rejected={rejected_kind:?} oldest_allowed={oldest_allowed_kind:?} current={:?}",
-                    range.kind
+                    task.window.kind
                 )
                 .into());
             }
@@ -173,7 +173,7 @@ where
     drain_manual_commands(&mut command_rx, &mut pending_round_replies);
     reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);
 
-    let hot_receive = is_priority_ingest_window(range.kind);
+    let hot_receive = is_priority_ingest_window(task.window.kind);
     if hot_receive {
         note_hot_receive_started(db_path);
     }
@@ -189,7 +189,7 @@ where
 
     let store = Store::new(&db);
     let (events_sent, bytes_sent) =
-        send_have_events(&store, &mut data_send, &have_ids, range).await?;
+        send_have_events(&store, &mut data_send, &have_ids, task).await?;
     drop(data_send);
 
     let received = match receive_task.await {
@@ -212,7 +212,7 @@ where
     drain_manual_commands(&mut command_rx, &mut pending_round_replies);
     reply_manual_rounds(peer_id, &need_ids, &mut pending_round_replies);
 
-    let _ = mark_outbound_window_completed(db_path, recorded_by, peer_id, range);
+    let _ = mark_outbound_task_completed(db_path, recorded_by, peer_id, task);
 
     Ok(SyncStats {
         events_sent,

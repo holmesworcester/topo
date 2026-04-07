@@ -70,8 +70,8 @@ fn insert_event_raw(
             workspace_id.expect("shared event insert requires workspace_id")
         };
         conn.execute(
-            "INSERT OR IGNORE INTO shared_event_index (workspace_id, ts, id) VALUES (?1, ?2, ?3)",
-            rusqlite::params![ws_id, ts as i64, event_id.as_slice()],
+            "INSERT OR IGNORE INTO shared_event_index (workspace_id, ts, shard_u8, id) VALUES (?1, ?2, ?3, ?4)",
+            rusqlite::params![ws_id, ts as i64, i64::from(event_id[0]), event_id.as_slice()],
         )
         .unwrap();
     }
