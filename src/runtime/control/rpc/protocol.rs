@@ -192,6 +192,11 @@ pub enum RpcMethod {
     EventTimeline {
         event_id: String,
     },
+    /// Summarize message delivery timelines for messages matching a content prefix.
+    EventTimelineReport {
+        content_prefix: Option<String>,
+        limit: usize,
+    },
     /// Trigger a negentropy round for a specific peer.
     SyncRoundPeer {
         peer: String,

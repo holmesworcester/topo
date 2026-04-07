@@ -360,6 +360,12 @@ static CATALOG: &[MethodInfo] = &[
         example_json: r#"{"type":"EventTimeline","event_id":"<base64>"}"#,
     },
     MethodInfo {
+        name: "EventTimelineReport",
+        purpose: "Summarize message delivery timelines for messages matching a content prefix",
+        params: params!["content_prefix", "string", false, None; "limit", "usize", true, Some("20")],
+        example_json: r#"{"type":"EventTimelineReport","content_prefix":"hot:","limit":12}"#,
+    },
+    MethodInfo {
         name: "SyncRoundPeer",
         purpose: "Trigger a negentropy round for a specific peer",
         params: params!["peer", "string", true, None],

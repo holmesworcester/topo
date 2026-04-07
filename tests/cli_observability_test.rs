@@ -820,6 +820,73 @@ fn test_event_timeline_shows_delivery_timestamps() {
     );
 }
 
+#[test]
+fn test_event_timeline_report_summarizes_matching_messages() {
+    let tmpdir = tempfile::tempdir().unwrap();
+    let timeout_ms = 120000;
+    let (alice_db, bob_db, _alice, _bob) = setup_two_peers(&tmpdir);
+
+    send_message(&alice_db, "timeline-report: newest");
+    send_message(&alice_db, "timeline-report: older");
+    send_message(&alice_db, "other-prefix: ignored");
+
+    assert_eventually(&bob_db, "message_count >= 3", timeout_ms);
+
+    let out = Command::new(bin())
+        .args([
+            "--db",
+            &bob_db,
+            "event",
+            "timeline-report",
+            "--content-prefix",
+            "timeline-report:",
+            "--limit",
+            "8",
+            "--json",
+        ])
+        .output()
+        .expect("event timeline-report failed");
+    assert!(
+        out.status.success(),
+        "event timeline-report should succeed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let data: serde_json::Value = serde_json::from_str(stdout.trim()).unwrap();
+    assert_eq!(data["content_prefix"].as_str(), Some("timeline-report:"));
+    assert!(
+        data["match_count"].as_i64().unwrap_or(0) >= 2,
+        "expected at least two matching messages: {}",
+        stdout
+    );
+    assert!(
+        data["projected_count"].as_i64().unwrap_or(0) >= 2,
+        "expected projected rows for matching messages: {}",
+        stdout
+    );
+    assert!(
+        data["stage_stats"]["recv_to_project_ms"]["count"]
+            .as_i64()
+            .unwrap_or(0)
+            >= 1,
+        "expected recv_to_project stage stats: {}",
+        stdout
+    );
+    let sample_rows = data["sample_rows"]
+        .as_array()
+        .expect("sample_rows should be an array");
+    assert!(
+        sample_rows.iter().any(|row| {
+            row["content"]
+                .as_str()
+                .unwrap_or("")
+                .starts_with("timeline-report:")
+        }),
+        "expected matching message in sample rows: {}",
+        stdout
+    );
+}
+
 // ---------------------------------------------------------------------------
 // Large-scale sync (scaled down for CI, full scale as #[ignore])
 // ---------------------------------------------------------------------------

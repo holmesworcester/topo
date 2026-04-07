@@ -30,6 +30,154 @@ const INVITE_RELAY_WAIT_POLL_INTERVAL: Duration = Duration::from_millis(100);
 const CREATE_WORKSPACE_CREATED_EVENTS_CAP: usize = 32;
 
 #[derive(Debug, Clone)]
+struct TimelineReportRow {
+    event_id: String,
+    content: String,
+    created_at_ms: i64,
+    first_received_at_ms: Option<i64>,
+    first_stored_at_ms: Option<i64>,
+    blocked_at_ms: Option<i64>,
+    unblocked_at_ms: Option<i64>,
+    unblocked_by_event_id: Option<String>,
+    projected_at_ms: Option<i64>,
+}
+
+fn timeline_delta(start: Option<i64>, end: Option<i64>) -> Option<i64> {
+    match (start, end) {
+        (Some(start), Some(end)) if end >= start => Some(end - start),
+        _ => None,
+    }
+}
+
+fn timeline_stage_stats(values: &[i64]) -> serde_json::Value {
+    if values.is_empty() {
+        return serde_json::json!({
+            "count": 0,
+            "avg_ms": serde_json::Value::Null,
+            "p50_ms": serde_json::Value::Null,
+            "p95_ms": serde_json::Value::Null,
+            "max_ms": serde_json::Value::Null,
+        });
+    }
+    let mut sorted = values.to_vec();
+    sorted.sort_unstable();
+    let p50_idx = (sorted.len() - 1) * 50 / 100;
+    let p95_idx = (sorted.len() - 1) * 95 / 100;
+    let sum: i128 = sorted.iter().map(|value| *value as i128).sum();
+    serde_json::json!({
+        "count": sorted.len(),
+        "avg_ms": sum as f64 / sorted.len() as f64,
+        "p50_ms": sorted[p50_idx],
+        "p95_ms": sorted[p95_idx],
+        "max_ms": sorted[sorted.len() - 1],
+    })
+}
+
+fn build_event_timeline_report(
+    db: &rusqlite::Connection,
+    recorded_by: &str,
+    content_prefix: Option<&str>,
+    limit: usize,
+) -> Result<serde_json::Value, rusqlite::Error> {
+    let prefix_like = content_prefix.map(|prefix| format!("{prefix}%"));
+    let mut stmt = db.prepare(
+        "SELECT m.message_id,
+                m.content,
+                m.created_at,
+                t.first_received_at,
+                t.first_stored_at,
+                t.blocked_at,
+                t.unblocked_at,
+                t.unblocked_by_event_id,
+                t.projected_at
+         FROM messages m
+         LEFT JOIN event_timeline t ON t.event_id = m.message_id
+         WHERE m.recorded_by = ?1
+           AND (?2 IS NULL OR m.content LIKE ?2)
+         ORDER BY m.created_at DESC, m.message_id DESC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![recorded_by, prefix_like], |row| {
+            Ok(TimelineReportRow {
+                event_id: row.get(0)?,
+                content: row.get(1)?,
+                created_at_ms: row.get(2)?,
+                first_received_at_ms: row.get(3)?,
+                first_stored_at_ms: row.get(4)?,
+                blocked_at_ms: row.get(5)?,
+                unblocked_at_ms: row.get(6)?,
+                unblocked_by_event_id: row.get(7)?,
+                projected_at_ms: row.get(8)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+
+    let recv_to_store: Vec<i64> = rows
+        .iter()
+        .filter_map(|row| timeline_delta(row.first_received_at_ms, row.first_stored_at_ms))
+        .collect();
+    let store_to_project: Vec<i64> = rows
+        .iter()
+        .filter_map(|row| timeline_delta(row.first_stored_at_ms, row.projected_at_ms))
+        .collect();
+    let recv_to_project: Vec<i64> = rows
+        .iter()
+        .filter_map(|row| timeline_delta(row.first_received_at_ms, row.projected_at_ms))
+        .collect();
+    let blocked_to_unblocked: Vec<i64> = rows
+        .iter()
+        .filter_map(|row| timeline_delta(row.blocked_at_ms, row.unblocked_at_ms))
+        .collect();
+    let unblocked_to_project: Vec<i64> = rows
+        .iter()
+        .filter_map(|row| timeline_delta(row.unblocked_at_ms, row.projected_at_ms))
+        .collect();
+
+    let sample_rows: Vec<serde_json::Value> = rows
+        .iter()
+        .take(limit)
+        .map(|row| {
+            serde_json::json!({
+                "event_id": row.event_id,
+                "content": row.content,
+                "created_at_ms": row.created_at_ms,
+                "first_received_at_ms": row.first_received_at_ms,
+                "first_stored_at_ms": row.first_stored_at_ms,
+                "blocked_at_ms": row.blocked_at_ms,
+                "unblocked_at_ms": row.unblocked_at_ms,
+                "unblocked_by_event_id": row.unblocked_by_event_id,
+                "projected_at_ms": row.projected_at_ms,
+                "recv_to_store_ms": timeline_delta(row.first_received_at_ms, row.first_stored_at_ms),
+                "store_to_project_ms": timeline_delta(row.first_stored_at_ms, row.projected_at_ms),
+                "recv_to_project_ms": timeline_delta(row.first_received_at_ms, row.projected_at_ms),
+                "blocked_to_unblocked_ms": timeline_delta(row.blocked_at_ms, row.unblocked_at_ms),
+                "unblocked_to_project_ms": timeline_delta(row.unblocked_at_ms, row.projected_at_ms),
+            })
+        })
+        .collect();
+
+    Ok(serde_json::json!({
+        "content_prefix": content_prefix,
+        "match_count": rows.len(),
+        "sample_limit": limit,
+        "sample_count": sample_rows.len(),
+        "received_count": rows.iter().filter(|row| row.first_received_at_ms.is_some()).count(),
+        "stored_count": rows.iter().filter(|row| row.first_stored_at_ms.is_some()).count(),
+        "blocked_count": rows.iter().filter(|row| row.blocked_at_ms.is_some()).count(),
+        "unblocked_count": rows.iter().filter(|row| row.unblocked_at_ms.is_some()).count(),
+        "projected_count": rows.iter().filter(|row| row.projected_at_ms.is_some()).count(),
+        "stage_stats": {
+            "recv_to_store_ms": timeline_stage_stats(&recv_to_store),
+            "store_to_project_ms": timeline_stage_stats(&store_to_project),
+            "recv_to_project_ms": timeline_stage_stats(&recv_to_project),
+            "blocked_to_unblocked_ms": timeline_stage_stats(&blocked_to_unblocked),
+            "unblocked_to_project_ms": timeline_stage_stats(&unblocked_to_project),
+        },
+        "sample_rows": sample_rows,
+    }))
+}
+
+#[derive(Debug, Clone)]
 struct TenantScope {
     tenant_id: String,
 }
@@ -1327,6 +1475,17 @@ fn dispatch(
                         Err(e) => RpcResponse::error(e.to_string()),
                     }
                 }
+                Err(e) => RpcResponse::error(e.to_string()),
+            },
+            Err(e) => RpcResponse::error(e),
+        },
+
+        RpcMethod::EventTimelineReport { content_prefix, limit } => match state.require_active_peer() {
+            Ok(peer_id) => match service::open_existing_db_for_peer(db_path, &peer_id) {
+                Ok((recorded_by, db)) => match build_event_timeline_report(&db, &recorded_by, content_prefix.as_deref(), limit) {
+                    Ok(report) => RpcResponse::success(report),
+                    Err(e) => RpcResponse::error(e.to_string()),
+                },
                 Err(e) => RpcResponse::error(e.to_string()),
             },
             Err(e) => RpcResponse::error(e),

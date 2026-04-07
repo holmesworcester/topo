@@ -592,6 +592,19 @@ pub(crate) enum EventAction {
         #[arg(long)]
         json: bool,
     },
+    /// Summarize pipeline timelines for messages matching a content prefix
+    #[command(name = "timeline-report")]
+    TimelineReport {
+        /// Restrict to messages whose content starts with this prefix
+        #[arg(long)]
+        content_prefix: Option<String>,
+        /// Include up to this many newest matching messages in the sample output
+        #[arg(long, default_value = "20")]
+        limit: usize,
+        /// Output as JSON
+        #[arg(long)]
+        json: bool,
+    },
     /// Show details for events matching an ID prefix
     Show {
         /// Event ID prefix (first few characters of base64 ID)

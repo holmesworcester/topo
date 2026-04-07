@@ -80,6 +80,7 @@ struct ColdJoinOutcome {
     visible_non_hub_sources: Vec<String>,
     sink_live_session_peers: Vec<String>,
     source_connection_counts_with_sink: Vec<(String, usize)>,
+    sink_hot_timeline_report: String,
 }
 
 #[derive(Debug, Deserialize)]
@@ -701,9 +702,52 @@ fn write_cold_join_summary(summary_key: &str, outcome: &ColdJoinOutcome) {
     for (label, count) in &outcome.source_connection_counts_with_sink {
         let _ = writeln!(summary, "    {:<18} {}", label, count);
     }
+    let _ = writeln!(summary);
+    let _ = writeln!(summary, "  Sink hot timeline report:");
+    for line in outcome.sink_hot_timeline_report.lines() {
+        let _ = writeln!(summary, "    {}", line);
+    }
 
     eprintln!("\n{summary}");
     write_summary(summary_key, &summary);
+}
+
+fn event_timeline_report_cli(db: &str, content_prefix: &str, limit: usize) -> String {
+    let start = Instant::now();
+    loop {
+        let limit_arg = limit.to_string();
+        let out = topo_cmd(
+            db,
+            &[
+                "event",
+                "timeline-report",
+                "--content-prefix",
+                content_prefix,
+                "--limit",
+                limit_arg.as_str(),
+            ],
+        );
+        if out.status.success() {
+            return String::from_utf8_lossy(&out.stdout).trim().to_string();
+        }
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        let busy = stdout.contains("database is locked")
+            || stdout.contains("SQLITE_BUSY")
+            || stderr.contains("database is locked")
+            || stderr.contains("SQLITE_BUSY");
+        if busy && start.elapsed() < Duration::from_secs(60) {
+            thread::sleep(Duration::from_millis(100));
+            continue;
+        }
+        panic!(
+            "event timeline-report failed for db={}: status={} stdout={} stderr={}",
+            db,
+            out.status,
+            stdout.trim(),
+            stderr.trim()
+        );
+    }
 }
 
 fn run_cold_join_hot_head_diagnostic(source_count: usize, wait_for_full_catchup: bool) -> ColdJoinOutcome {
@@ -1080,6 +1124,7 @@ fn run_cold_join_hot_head_diagnostic(source_count: usize, wait_for_full_catchup:
             )
         })
         .collect();
+    let sink_hot_timeline_report = event_timeline_report_cli(&sink_node.db, "hot:", 12);
 
     let outcome = ColdJoinOutcome {
         milestones: ColdJoinMilestones {
@@ -1107,6 +1152,7 @@ fn run_cold_join_hot_head_diagnostic(source_count: usize, wait_for_full_catchup:
         visible_non_hub_sources,
         sink_live_session_peers,
         source_connection_counts_with_sink,
+        sink_hot_timeline_report,
     };
 
     if wait_for_full_catchup {

@@ -840,6 +840,118 @@ pub(crate) fn run_event_action(
             }
             Ok(())
         }
+        EventAction::TimelineReport {
+            content_prefix,
+            limit,
+            json,
+        } => {
+            let data = rpc_require_daemon(
+                db,
+                socket,
+                RpcMethod::EventTimelineReport {
+                    content_prefix,
+                    limit,
+                },
+            )?;
+            if json {
+                println!(
+                    "{}",
+                    serde_json::to_string_pretty(&data).unwrap_or_default()
+                );
+            } else {
+                let content_prefix = data["content_prefix"].as_str().unwrap_or("(all)");
+                println!("TIMELINE REPORT ({content_prefix})");
+                println!(
+                    "  Matched:   {}",
+                    data["match_count"].as_i64().unwrap_or(0)
+                );
+                println!(
+                    "  Received:  {}",
+                    data["received_count"].as_i64().unwrap_or(0)
+                );
+                println!(
+                    "  Stored:    {}",
+                    data["stored_count"].as_i64().unwrap_or(0)
+                );
+                println!(
+                    "  Blocked:   {}",
+                    data["blocked_count"].as_i64().unwrap_or(0)
+                );
+                println!(
+                    "  Unblocked: {}",
+                    data["unblocked_count"].as_i64().unwrap_or(0)
+                );
+                println!(
+                    "  Projected: {}",
+                    data["projected_count"].as_i64().unwrap_or(0)
+                );
+                println!();
+                println!("  Stage stats:");
+                for (label, key) in [
+                    ("recv -> store", "recv_to_store_ms"),
+                    ("store -> project", "store_to_project_ms"),
+                    ("recv -> project", "recv_to_project_ms"),
+                    ("blocked -> unblocked", "blocked_to_unblocked_ms"),
+                    ("unblocked -> project", "unblocked_to_project_ms"),
+                ] {
+                    let stats = &data["stage_stats"][key];
+                    let avg = stats["avg_ms"]
+                        .as_f64()
+                        .map(|v| format!("{v:.1}"))
+                        .unwrap_or_else(|| "-".to_string());
+                    let p50 = stats["p50_ms"]
+                        .as_i64()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    let p95 = stats["p95_ms"]
+                        .as_i64()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    let max = stats["max_ms"]
+                        .as_i64()
+                        .map(|v| v.to_string())
+                        .unwrap_or_else(|| "-".to_string());
+                    println!(
+                        "    {:<22} count={:<4} avg={}ms p50={}ms p95={}ms max={}ms",
+                        label,
+                        stats["count"].as_i64().unwrap_or(0),
+                        avg,
+                        p50,
+                        p95,
+                        max
+                    );
+                }
+                if let Some(rows) = data["sample_rows"].as_array() {
+                    println!();
+                    println!("  Newest {} matching messages:", rows.len());
+                    for row in rows {
+                        let eid = row["event_id"].as_str().unwrap_or("?");
+                        let content = row["content"].as_str().unwrap_or("");
+                        let recv_to_project = row["recv_to_project_ms"]
+                            .as_i64()
+                            .map(|v| format!("{v}ms"))
+                            .unwrap_or_else(|| "-".to_string());
+                        let store_to_project = row["store_to_project_ms"]
+                            .as_i64()
+                            .map(|v| format!("{v}ms"))
+                            .unwrap_or_else(|| "-".to_string());
+                        let blocked_to_unblocked = row["blocked_to_unblocked_ms"]
+                            .as_i64()
+                            .map(|v| format!("{v}ms"))
+                            .unwrap_or_else(|| "-".to_string());
+                        println!(
+                            "    {:<12} recv->proj {:<8} store->proj {:<8} blocked->unblocked {:<8} {}",
+                            &eid[..eid.len().min(12)],
+                            recv_to_project,
+                            store_to_project,
+                            blocked_to_unblocked,
+                            content
+                        );
+                    }
+                }
+            }
+            Ok(())
+        }
         EventAction::Show { prefix } => {
             let data = rpc_require_daemon(db, socket, RpcMethod::EventShow { prefix })?;
             let resp: service::EventListResponse = serde_json::from_value(data)?;
