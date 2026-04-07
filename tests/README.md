@@ -64,14 +64,14 @@ next to the code they exercise.
 | `sync_graph_test.rs` | Legacy in-process chain and catchup benchmarks |
 | `topo_cascade_test.rs` | SQLite topo-sort cascade performance |
 | `file_throughput_test.rs` | File-slice insertion throughput |
-| `cli_large_file_rss_test.rs` | Release-only 1 GiB single-peer send RSS regression |
+| `cli_large_file_rss_test.rs` | Release-only 1 GiB single-peer send wall-time + RSS regression |
 | `low_mem_test.rs` | RSS budget tests |
 | `low_mem_large_trustset_test.rs` | Trust-set churn under memory constraints |
 | `mdns_smoke_test.rs` | Library-level mDNS advertisement smoke tests |
 
-## Large file RSS regression
+## Large file send regression
 
-Run the 1 GiB single-peer file-send RSS gate explicitly in release:
+Run the 1 GiB single-peer file-send wall-time + RSS gate explicitly in release:
 
 ```bash
 cargo perf-file-rss
