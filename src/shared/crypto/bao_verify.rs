@@ -4,26 +4,23 @@
 //! proofs, and verifies incoming slices independently (in any order) at
 //! receive time.
 
-use std::io::{self, Cursor, Read, Write};
+use std::io::{self, Cursor, Read, Seek, SeekFrom, Write};
 
 /// Compute the bao root hash and outboard for given data.
 /// Returns (root_hash, outboard_bytes).
 pub fn compute_outboard(data: &[u8]) -> io::Result<([u8; 32], Vec<u8>)> {
     let mut outboard = Vec::new();
-    let mut encoder = bao::encode::Encoder::new_outboard(Cursor::new(&mut outboard));
-    encoder.write_all(data)?;
-    let hash = encoder.finalize()?;
-    Ok((*hash.as_bytes(), outboard))
+    let hash = compute_outboard_to_writer(&mut Cursor::new(data), Cursor::new(&mut outboard))?;
+    Ok((hash, outboard))
 }
 
-/// Compute the bao root hash by streaming from a reader.
-///
-/// Reads in 64 KiB chunks to keep memory bounded.  The outboard is built
-/// in memory but is much smaller than the data (~0.4% overhead), so for a
-/// 100 MiB file the outboard is only ~400 KiB.
-pub fn compute_root_hash_streaming(reader: &mut impl Read) -> io::Result<[u8; 32]> {
-    let mut outboard = Vec::new();
-    let mut encoder = bao::encode::Encoder::new_outboard(Cursor::new(&mut outboard));
+/// Compute the bao root hash while streaming the outboard into an arbitrary
+/// writer.
+pub fn compute_outboard_to_writer<W: Read + Write + Seek>(
+    reader: &mut impl Read,
+    writer: W,
+) -> io::Result<[u8; 32]> {
+    let mut encoder = bao::encode::Encoder::new_outboard(writer);
     let mut buf = [0u8; 65536];
     loop {
         let n = reader.read(&mut buf)?;
@@ -36,6 +33,14 @@ pub fn compute_root_hash_streaming(reader: &mut impl Read) -> io::Result<[u8; 32
     Ok(*hash.as_bytes())
 }
 
+/// Compute the bao root hash by streaming from a reader.
+///
+/// Reads in 64 KiB chunks to keep memory bounded and discards the outboard.
+pub fn compute_root_hash_streaming(reader: &mut impl Read) -> io::Result<[u8; 32]> {
+    let mut outboard = tempfile::tempfile()?;
+    compute_outboard_to_writer(reader, &mut outboard)
+}
+
 /// Extract a bao slice proof for the given byte range.
 pub fn extract_slice_proof(
     data: &[u8],
@@ -43,12 +48,28 @@ pub fn extract_slice_proof(
     slice_start: u64,
     slice_len: u64,
 ) -> io::Result<Vec<u8>> {
-    let mut extractor = bao::encode::SliceExtractor::new_outboard(
+    extract_slice_proof_from_readers(
         Cursor::new(data),
         Cursor::new(outboard),
         slice_start,
         slice_len,
-    );
+    )
+}
+
+/// Extract a bao slice proof from seekable data + outboard readers.
+pub fn extract_slice_proof_from_readers<R: Read + Seek, O: Read + Seek>(
+    mut data: R,
+    mut outboard: O,
+    slice_start: u64,
+    slice_len: u64,
+) -> io::Result<Vec<u8>> {
+    // SliceExtractor expects to start at the beginning so it can read the
+    // bao header before seeking deeper into the tree. Real send-file paths
+    // reuse the same file handles across slices, so reset them explicitly.
+    data.seek(SeekFrom::Start(0))?;
+    outboard.seek(SeekFrom::Start(0))?;
+    let mut extractor =
+        bao::encode::SliceExtractor::new_outboard(data, outboard, slice_start, slice_len);
     let mut proof = Vec::new();
     extractor.read_to_end(&mut proof)?;
     Ok(proof)
@@ -128,7 +149,7 @@ mod tests {
     #[test]
     fn measure_proof_overhead() {
         use crate::event_modules::file_slice::wire::{
-            BAO_PLAINTEXT_CAPACITY, FILE_SLICE_CIPHERTEXT_BYTES,
+            BAO_MAX_ENCODING_BYTES, BAO_PLAINTEXT_CAPACITY,
         };
 
         // Test with various file sizes to measure overhead scaling
@@ -140,7 +161,7 @@ mod tests {
             let len = file_data.len().min(chunk);
             let proof = extract_slice_proof(&file_data, &outboard, 0, len as u64).unwrap();
             let overhead = proof.len() - len;
-            let fits = proof.len() <= FILE_SLICE_CIPHERTEXT_BYTES - 4;
+            let fits = proof.len() <= BAO_MAX_ENCODING_BYTES;
             eprintln!(
                 "  file={:.0}MB chunk={} proof={} overhead={} fits={}",
                 file_size as f64 / 1e6,
@@ -160,7 +181,7 @@ mod tests {
     #[test]
     fn roundtrip_packed_payload() {
         // Simulate the real send/receive flow: file data → outboard → per-slice
-        // bao encoding → pack into 262144-byte payload → unpack → verify.
+        // bao encoding → pack into the fixed payload → unpack → verify.
         use crate::event_modules::file_slice::wire::*;
 
         let eff_cap = BAO_PLAINTEXT_CAPACITY;
@@ -180,7 +201,7 @@ mod tests {
             let plaintext = &file_data[data_start..data_start + bytes_this];
 
             // Pack into fixed-size field
-            let packed = pack_bao_payload(&encoding, plaintext);
+            let packed = pack_bao_payload(&encoding, plaintext).unwrap();
             assert_eq!(packed.len(), FILE_SLICE_CIPHERTEXT_BYTES);
 
             // Unpack and verify (mirrors the projector + save path)
@@ -199,5 +220,53 @@ mod tests {
         let proof = extract_slice_proof(data, &outboard, 0, 0).unwrap();
         let verified = verify_slice(&root_hash, &proof, 0, 0).unwrap();
         assert!(verified.is_empty());
+    }
+
+    #[test]
+    fn streaming_outboard_writer_roundtrip() {
+        let data: Vec<u8> = (0..1_000_000).map(|i| (i % 251) as u8).collect();
+        let mut outboard = Vec::new();
+        let root_hash =
+            compute_outboard_to_writer(&mut Cursor::new(&data), Cursor::new(&mut outboard))
+                .unwrap();
+
+        let proof = extract_slice_proof_from_readers(
+            Cursor::new(&data),
+            Cursor::new(&outboard),
+            128 * 1024,
+            256 * 1024,
+        )
+        .unwrap();
+        let verified = verify_slice(&root_hash, &proof, 128 * 1024, 256 * 1024).unwrap();
+        assert_eq!(verified, data[128 * 1024..384 * 1024]);
+    }
+
+    #[test]
+    fn streaming_file_handle_reuse_roundtrip() {
+        let data: Vec<u8> = (0..600_000).map(|i| (i % 251) as u8).collect();
+        let mut data_file = tempfile::tempfile().unwrap();
+        data_file.write_all(&data).unwrap();
+        data_file.rewind().unwrap();
+
+        let mut outboard_file = tempfile::tempfile().unwrap();
+        let root_hash = compute_outboard_to_writer(&mut data_file, &mut outboard_file).unwrap();
+
+        for (slice_start, slice_len) in [
+            (0u64, 256 * 1024u64),
+            (256 * 1024u64, 600_000u64 - 256 * 1024u64),
+        ] {
+            let proof = extract_slice_proof_from_readers(
+                &mut data_file,
+                &mut outboard_file,
+                slice_start,
+                slice_len,
+            )
+            .unwrap();
+            let verified = verify_slice(&root_hash, &proof, slice_start, slice_len).unwrap();
+            assert_eq!(
+                verified,
+                data[slice_start as usize..(slice_start + slice_len) as usize]
+            );
+        }
     }
 }

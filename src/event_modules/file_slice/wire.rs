@@ -3,26 +3,41 @@ use super::super::layout::field_spec::{
 };
 use super::super::registry::{EventTypeMeta, ShareScope};
 use super::super::{EventError, ParsedEvent, EVENT_TYPE_FILE_SLICE};
+use std::fmt;
 
 // --- Layout (owned by this module) ---
 
-/// FileSlice: canonical fixed ciphertext size (256 KiB)
-pub const FILE_SLICE_CIPHERTEXT_BYTES: usize = 262_144;
+/// Maximum supported attachment size for bao-verified file sends.
+pub const MAX_FILE_BYTES: u64 = 10 * 1024 * 1024 * 1024;
+
+/// Logical plaintext bytes carried by each file slice.
+pub const FILE_SLICE_DATA_BYTES: usize = 256 * 1024;
+
+/// Bytes reserved at the front of the payload for the bao encoding length.
+pub const BAO_PAYLOAD_LEN_BYTES: usize = 4;
+
+/// Maximum bao payload bytes per slice, including the 4-byte length prefix.
+///
+/// With a 10 GiB file cap and 256 KiB logical slices, the worst-case bao
+/// overhead for a full slice is 17_352 bytes. We round that up to 17 KiB for a
+/// small alignment margin while keeping the field size fixed and predictable.
+pub const BAO_ENCODING_BUDGET: usize = 17 * 1024;
+
+/// FileSlice: canonical fixed payload size (256 KiB data + bao proof budget).
+pub const FILE_SLICE_CIPHERTEXT_BYTES: usize = FILE_SLICE_DATA_BYTES + BAO_ENCODING_BUDGET;
 
 pub const FILE_SLICE_FIELDS: &[FieldSpec] = &[
     FieldSpec::Timestamp("created_at_ms"),
     FieldSpec::EventId("file_id"),
     FieldSpec::U32("slice_number"),
-    FieldSpec::FixedBytes("ciphertext", 262_144),
+    FieldSpec::FixedBytes("ciphertext", FILE_SLICE_CIPHERTEXT_BYTES),
 ];
 
 /// FileSlice (type 25): type(1) + created_at(8) + file_id(32) + slice_number(4)
-///   + ciphertext(262144) = 262189
+///   + payload(FILE_SLICE_CIPHERTEXT_BYTES)
 pub const FILE_SLICE_WIRE_SIZE: usize = wire_size_for_fields(FILE_SLICE_FIELDS);
 
-/// Maximum ciphertext size per file slice: canonical fixed 256 KiB.
-/// Final plaintext chunks are zero-padded before encryption.
-/// Receiver uses blob_bytes from File for final truncation.
+/// Maximum stored payload size per file slice.
 pub const FILE_SLICE_MAX_BYTES: usize = FILE_SLICE_CIPHERTEXT_BYTES;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -99,28 +114,52 @@ pub static FILE_SLICE_META: EventTypeMeta = crate::event_modules::registry::even
     context_loader: super::projector::build_projector_context,
 };
 
-/// Maximum bao encoding overhead per slice (tree nodes interleaved with data).
-///
-/// For plaintext ≤ 245 KiB, the overhead is ≤ ~16 KiB.  We budget 17 KiB
-/// to leave margin for large files with deep trees.
-pub const BAO_ENCODING_BUDGET: usize = 17 * 1024;
+/// Maximum encoded bao slice bytes excluding the 4-byte length prefix.
+pub const BAO_MAX_ENCODING_BYTES: usize = FILE_SLICE_CIPHERTEXT_BYTES - BAO_PAYLOAD_LEN_BYTES;
 
-/// Plaintext capacity per slice after reserving room for the bao encoding
-/// header (4 bytes) and tree overhead.
-pub const BAO_PLAINTEXT_CAPACITY: usize = FILE_SLICE_CIPHERTEXT_BYTES - 4 - BAO_ENCODING_BUDGET;
+/// Plaintext capacity per slice after enlarging the wire payload to hold the
+/// bao proof budget.
+pub const BAO_PLAINTEXT_CAPACITY: usize = FILE_SLICE_DATA_BYTES;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaoPayloadTooLarge {
+    pub actual: usize,
+    pub max: usize,
+}
+
+impl fmt::Display for BaoPayloadTooLarge {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "bao encoding too large: {} bytes > {} bytes",
+            self.actual, self.max
+        )
+    }
+}
+
+impl std::error::Error for BaoPayloadTooLarge {}
 
 /// Pack a bao slice encoding into the fixed-size ciphertext field.
 ///
 /// Format: `[encoding_len: u32 LE][bao slice encoding, zero-padded]`.
 /// The bao slice encoding contains the plaintext data interleaved with
 /// BLAKE3 tree verification nodes (~6% overhead).
-pub fn pack_bao_payload(bao_encoding: &[u8], _plaintext: &[u8]) -> Vec<u8> {
+pub fn pack_bao_payload(
+    bao_encoding: &[u8],
+    _plaintext: &[u8],
+) -> Result<Vec<u8>, BaoPayloadTooLarge> {
+    if bao_encoding.len() > BAO_MAX_ENCODING_BYTES {
+        return Err(BaoPayloadTooLarge {
+            actual: bao_encoding.len(),
+            max: BAO_MAX_ENCODING_BYTES,
+        });
+    }
     let enc_len = bao_encoding.len() as u32;
     let mut payload = vec![0u8; FILE_SLICE_CIPHERTEXT_BYTES];
-    payload[0..4].copy_from_slice(&enc_len.to_le_bytes());
-    let copy_len = bao_encoding.len().min(FILE_SLICE_CIPHERTEXT_BYTES - 4);
-    payload[4..4 + copy_len].copy_from_slice(&bao_encoding[..copy_len]);
-    payload
+    payload[0..BAO_PAYLOAD_LEN_BYTES].copy_from_slice(&enc_len.to_le_bytes());
+    payload[BAO_PAYLOAD_LEN_BYTES..BAO_PAYLOAD_LEN_BYTES + bao_encoding.len()]
+        .copy_from_slice(bao_encoding);
+    Ok(payload)
 }
 
 /// Unpack a bao payload.  Returns (bao_encoding, raw_data_fallback).
@@ -128,15 +167,22 @@ pub fn pack_bao_payload(bao_encoding: &[u8], _plaintext: &[u8]) -> Vec<u8> {
 /// If `encoding_len == 0`, the payload has no bao encoding and the raw
 /// plaintext starts at offset 4 (legacy/generated data).
 pub fn unpack_bao_payload(payload: &[u8]) -> (Vec<u8>, Vec<u8>) {
-    if payload.len() < 4 {
+    if payload.len() < BAO_PAYLOAD_LEN_BYTES {
         return (Vec::new(), payload.to_vec());
     }
     let enc_len = u32::from_le_bytes([payload[0], payload[1], payload[2], payload[3]]) as usize;
     if enc_len == 0 {
-        return (Vec::new(), payload[4..].to_vec());
+        let raw_len = payload
+            .len()
+            .saturating_sub(BAO_PAYLOAD_LEN_BYTES)
+            .min(FILE_SLICE_DATA_BYTES);
+        return (
+            Vec::new(),
+            payload[BAO_PAYLOAD_LEN_BYTES..BAO_PAYLOAD_LEN_BYTES + raw_len].to_vec(),
+        );
     }
-    let end = (4 + enc_len).min(payload.len());
-    let encoding = payload[4..end].to_vec();
+    let end = (BAO_PAYLOAD_LEN_BYTES + enc_len).min(payload.len());
+    let encoding = payload[BAO_PAYLOAD_LEN_BYTES..end].to_vec();
     (encoding, Vec::new())
 }
 

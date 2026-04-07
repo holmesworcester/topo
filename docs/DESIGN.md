@@ -1751,7 +1751,7 @@ Operational payload caps for this prototype (wire-format specifics in section 1.
 
 1. `EVENT_MAX_BLOB_BYTES = 1 MiB` soft cap,
 2. `FILE_SLICE_TARGET_BYTES = 256 KiB`,
-3. `FILE_SLICE_CIPHERTEXT_BYTES = 262_144` (fixed canonical ciphertext payload per file-slice event).
+3. `FILE_SLICE_CIPHERTEXT_BYTES = 279_552` (fixed canonical payload per file-slice event: 256 KiB logical slice data + bao proof budget for files up to 10 GiB).
 
 `file_slice` events (type 25, signed) are signed and validated like other canonical events, but in normal operation they are carried inside `encrypted` wrappers whose `key_event_id` must match the parent file descriptor's `key_event_id`.
 `file` events (type 24, signed) are encrypted file descriptors with deps on `message_id`, `key_event_id`, and `signed_by`.

@@ -30,7 +30,7 @@ Changes to this document require TLA+ model re-verification.
 | 22 | SecretShared | SecretShared | 234B | Shared | No | Yes | 64 | 5 (peer_shared) |
 | 23 | Peer | Peer | 73B | Local | No | No | 0 | — |
 | 24 | MessageAttachment | — | 633B | Shared | Yes | Yes | 64 | runtime (1..5) |
-| 25 | FileSlice | — | 262286B | Shared | Yes | Yes | 64 | runtime (1..5) |
+| 25 | FileSlice | — | 279694B | Shared | Yes | Yes | 64 | runtime (1..5) |
 | 26 | BenchDep | — | 345B | Shared | No | No | 0 | — |
 | 27 | LocalSignerSecret | PeerPrivkey | 74B | Local | No | No | 0 | — |
 | 28 | InvitePrivkey | InvitePrivkey | 73B | Local | No | No | 0 | — |
@@ -223,11 +223,11 @@ MessageAttachment (24): type_code(1) | created_at_ms(8) | message_id(32) | file_
 - filename: fixed 255-byte UTF-8 slot, zero-padded after text
 - mime_type: fixed 128-byte UTF-8 slot, zero-padded after text
 
-### 262286B fixed signed (FileSlice)
+### 279694B fixed signed (FileSlice)
 ```
-FileSlice (25): type_code(1) | created_at_ms(8) | file_id(32) | slice_number(4) | ciphertext(262144) | signed_by(32) | signer_type(1) | signature(64) = 262286B
+FileSlice (25): type_code(1) | created_at_ms(8) | file_id(32) | slice_number(4) | ciphertext(279552) | signed_by(32) | signer_type(1) | signature(64) = 279694B
 ```
-- ciphertext: canonical fixed 262144-byte (256 KiB) slot
+- ciphertext: canonical fixed 279552-byte slot carrying 256 KiB logical slice data plus bao proof budget
 - final plaintext chunk is zero-padded before encryption; receiver uses `blob_bytes` from MessageAttachment for truncation
 
 ### 345B fixed unsigned (BenchDep)

@@ -870,11 +870,13 @@ fn test_encrypted_parity_deletion_intent_only() {
 
     // Verify deletion_intent was written
     let target_b64 = event_id_to_base64(&fake_target);
-    let intent_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM deletion_intents WHERE recorded_by = ?1 AND target_id = ?2",
-        rusqlite::params![recorded_by, &target_b64],
-        |row| row.get(0),
-    ).unwrap();
+    let intent_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM deletion_intents WHERE recorded_by = ?1 AND target_id = ?2",
+            rusqlite::params![recorded_by, &target_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(
         intent_count, 1,
         "deletion_intent must be written through encrypted layer"
@@ -981,9 +983,9 @@ fn test_encrypted_file_slice_rejects_wrapper_key_mismatch() {
         created_at_ms: now_ms(),
         message_id: msg_eid,
         file_id,
-        blob_bytes: crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES as u64,
+        blob_bytes: crate::event_modules::file_slice::FILE_SLICE_DATA_BYTES as u64,
         total_slices: 1,
-        slice_bytes: crate::event_modules::file_slice::FILE_SLICE_CIPHERTEXT_BYTES as u32,
+        slice_bytes: crate::event_modules::file_slice::FILE_SLICE_DATA_BYTES as u32,
         root_hash: [0u8; 32],
         key_event_id: sk_a_eid,
         filename: "mismatch.bin".to_string(),
