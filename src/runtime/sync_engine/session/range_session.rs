@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::path::PathBuf;
 use std::time::Duration;
 
@@ -5,11 +6,14 @@ use negentropy::{Id, NegentropyStorageVector};
 use rusqlite::Connection;
 
 use crate::crypto::{event_id_to_base64, hash_event, EventId};
-use crate::db::store::{Store, SHARED_PRIORITY_LANE_AUTH, SHARED_PRIORITY_LANE_KEY};
+use crate::db::store::{
+    SharedEventSummary, Store, SHARED_PRIORITY_LANE_AUTH, SHARED_PRIORITY_LANE_KEY,
+};
 use crate::protocol::neg_id_to_event_id;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::receive_log::ReceiveLogWriter;
 use crate::sync::session::windowing::{SyncWindow, SyncWindowKind};
+use crate::tuning::{sync_dep_send_byte_cap, sync_dep_send_event_cap};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
 
@@ -19,6 +23,39 @@ pub struct RangeReceiveResult {
     pub events_received: u64,
     pub bytes_received: u64,
     pub path: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SharedDepSendBudget {
+    remaining_dep_events: usize,
+    remaining_dep_bytes: usize,
+}
+
+impl SharedDepSendBudget {
+    fn new() -> Self {
+        Self {
+            remaining_dep_events: sync_dep_send_event_cap(),
+            remaining_dep_bytes: sync_dep_send_byte_cap(),
+        }
+    }
+
+    fn try_take_dep(&mut self, summary: SharedEventSummary) -> bool {
+        let encoded_size = summary.encoded_size_bytes as usize;
+        if self.remaining_dep_events == 0 || encoded_size > self.remaining_dep_bytes {
+            return false;
+        }
+        self.remaining_dep_events -= 1;
+        self.remaining_dep_bytes -= encoded_size;
+        true
+    }
+
+    #[cfg(test)]
+    fn new_for_tests(remaining_dep_events: usize, remaining_dep_bytes: usize) -> Self {
+        Self {
+            remaining_dep_events,
+            remaining_dep_bytes,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -208,10 +245,180 @@ fn prioritize_send_order(
     Ok(ordered)
 }
 
+fn load_shared_summary_cached(
+    store: &Store<'_>,
+    event_id: &EventId,
+    summary_cache: &mut HashMap<EventId, Option<SharedEventSummary>>,
+) -> Result<Option<SharedEventSummary>, String> {
+    if let Some(summary) = summary_cache.get(event_id) {
+        return Ok(*summary);
+    }
+    let summary = store
+        .get_shared_summary(event_id)
+        .map_err(|e| format!("load shared summary: {e}"))?;
+    summary_cache.insert(*event_id, summary);
+    Ok(summary)
+}
+
+fn load_ordered_shared_dep_ids(
+    conn: &Connection,
+    store: &Store<'_>,
+    workspace_id: &str,
+    event_id: &EventId,
+    dep_cache: &mut HashMap<EventId, Vec<EventId>>,
+    summary_cache: &mut HashMap<EventId, Option<SharedEventSummary>>,
+) -> Result<Vec<EventId>, String> {
+    if let Some(dep_ids) = dep_cache.get(event_id) {
+        return Ok(dep_ids.clone());
+    }
+
+    let mut dep_ids = crate::db::dep_index::list_shared_event_deps(conn, workspace_id, event_id)
+        .map_err(|e| format!("load shared event deps: {e}"))?;
+    dep_ids.retain(|dep_id| {
+        matches!(
+            load_shared_summary_cached(store, dep_id, summary_cache),
+            Ok(Some(_))
+        )
+    });
+    dep_ids.sort_by(|left, right| {
+        let left_ts = load_shared_summary_cached(store, left, summary_cache)
+            .ok()
+            .flatten()
+            .map(|summary| summary.created_at_ms)
+            .unwrap_or_default();
+        let right_ts = load_shared_summary_cached(store, right, summary_cache)
+            .ok()
+            .flatten()
+            .map(|summary| summary.created_at_ms)
+            .unwrap_or_default();
+        left_ts.cmp(&right_ts).then_with(|| left.cmp(right))
+    });
+    dep_cache.insert(*event_id, dep_ids.clone());
+    Ok(dep_ids)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn visit_send_closure(
+    conn: &Connection,
+    store: &Store<'_>,
+    workspace_id: &str,
+    event_id: EventId,
+    root_ids: &HashSet<EventId>,
+    emitted: &mut HashSet<EventId>,
+    visiting: &mut HashSet<EventId>,
+    ordered: &mut Vec<EventId>,
+    dep_cache: &mut HashMap<EventId, Vec<EventId>>,
+    summary_cache: &mut HashMap<EventId, Option<SharedEventSummary>>,
+    budget: &mut SharedDepSendBudget,
+) -> Result<(), String> {
+    if emitted.contains(&event_id) {
+        return Ok(());
+    }
+    if !visiting.insert(event_id) {
+        return Ok(());
+    }
+
+    for dep_id in load_ordered_shared_dep_ids(
+        conn,
+        store,
+        workspace_id,
+        &event_id,
+        dep_cache,
+        summary_cache,
+    )? {
+        if emitted.contains(&dep_id) || visiting.contains(&dep_id) {
+            continue;
+        }
+        if !root_ids.contains(&dep_id) {
+            let Some(summary) = load_shared_summary_cached(store, &dep_id, summary_cache)? else {
+                continue;
+            };
+            if !budget.try_take_dep(summary) {
+                continue;
+            }
+        }
+        visit_send_closure(
+            conn,
+            store,
+            workspace_id,
+            dep_id,
+            root_ids,
+            emitted,
+            visiting,
+            ordered,
+            dep_cache,
+            summary_cache,
+            budget,
+        )?;
+    }
+
+    visiting.remove(&event_id);
+    emitted.insert(event_id);
+    ordered.push(event_id);
+    Ok(())
+}
+
+fn expand_requested_ids_with_shared_deps(
+    conn: &Connection,
+    store: &Store<'_>,
+    workspace_id: &str,
+    range: SyncWindow,
+    requested_ids: &[EventId],
+) -> Result<Vec<EventId>, String> {
+    expand_requested_ids_with_shared_deps_and_budget(
+        conn,
+        store,
+        workspace_id,
+        range,
+        requested_ids,
+        SharedDepSendBudget::new(),
+    )
+}
+
+fn expand_requested_ids_with_shared_deps_and_budget(
+    conn: &Connection,
+    store: &Store<'_>,
+    workspace_id: &str,
+    range: SyncWindow,
+    requested_ids: &[EventId],
+    mut budget: SharedDepSendBudget,
+) -> Result<Vec<EventId>, String> {
+    if requested_ids.is_empty() {
+        return Ok(Vec::new());
+    }
+
+    let ordered_roots = prioritize_send_order(store, range, requested_ids)?;
+    let root_ids: HashSet<EventId> = ordered_roots.iter().copied().collect();
+    let mut ordered = Vec::new();
+    let mut emitted = HashSet::new();
+    let mut visiting = HashSet::new();
+    let mut dep_cache = HashMap::new();
+    let mut summary_cache = HashMap::new();
+
+    for event_id in ordered_roots {
+        visit_send_closure(
+            conn,
+            store,
+            workspace_id,
+            event_id,
+            &root_ids,
+            &mut emitted,
+            &mut visiting,
+            &mut ordered,
+            &mut dep_cache,
+            &mut summary_cache,
+            &mut budget,
+        )?;
+    }
+    Ok(ordered)
+}
+
 pub async fn send_have_events<S>(
+    conn: &Connection,
     store: &Store<'_>,
     data_send: &mut S,
     have_ids: &[Id],
+    workspace_id: &str,
     range: SyncWindow,
 ) -> Result<(u64, u64), String>
 where
@@ -224,7 +431,8 @@ where
     let mut events_sent = 0u64;
     let mut bytes_sent = 0u64;
     let event_ids: Vec<EventId> = have_ids.iter().map(neg_id_to_event_id).collect();
-    let event_ids = prioritize_send_order(store, range, &event_ids)?;
+    let event_ids =
+        expand_requested_ids_with_shared_deps(conn, store, workspace_id, range, &event_ids)?;
     for chunk in event_ids.chunks(64) {
         let ordered = load_shared_send_batch(store, chunk)?;
         let mut payload = Vec::new();
@@ -328,14 +536,93 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::contracts::event_pipeline_contract::IngestItem;
+    use crate::db::dep_index::replace_shared_event_deps;
     use crate::crypto::hash_event;
-    use crate::db::open_in_memory;
+    use crate::db::{open_connection, open_in_memory};
     use crate::db::schema::create_tables;
     use crate::db::store::{insert_event, insert_shared_event_index_entry_if_shared};
     use crate::event_modules::{
         encode_event, endpoint_shared, registry::ShareScope, removal::frontier_hash_from_refs,
-        KeyRotationEvent, MessageEvent, ParsedEvent, PeerSharedEvent, RemovalEvent,
+        BenchDepEvent, KeyRotationEvent, MessageEvent, ParsedEvent, PeerSharedEvent,
+        RemovalEvent,
     };
+    use crate::state::pipeline::ingest_now;
+
+    fn insert_shared_bench_dep(
+        conn: &Connection,
+        workspace_id: &str,
+        created_at_ms: i64,
+        dep_ids: Vec<EventId>,
+        marker: u8,
+    ) -> EventId {
+        let blob = encode_event(&ParsedEvent::BenchDep(BenchDepEvent {
+            created_at_ms: created_at_ms as u64,
+            dep_ids,
+            payload: [marker; 16],
+        }))
+        .unwrap();
+        let event_id = hash_event(&blob);
+        insert_event(
+            conn,
+            &event_id,
+            "bench_dep_perf_testing",
+            &blob,
+            ShareScope::Shared,
+            created_at_ms,
+            created_at_ms,
+        )
+        .unwrap();
+        insert_shared_event_index_entry_if_shared(
+            conn,
+            ShareScope::Shared,
+            created_at_ms,
+            &event_id,
+            workspace_id,
+            &blob,
+        )
+        .unwrap();
+        event_id
+    }
+
+    fn make_ingest_batch(
+        recorded_by: &str,
+        source_tag: &str,
+        ordered: &[(EventId, Vec<u8>)],
+    ) -> Vec<IngestItem> {
+        ordered
+            .iter()
+            .enumerate()
+            .map(|(idx, (event_id, blob))| {
+                (
+                    *event_id,
+                    blob.clone(),
+                    recorded_by.to_string(),
+                    source_tag.to_string(),
+                    idx as i64,
+                    idx as i64,
+                )
+            })
+            .collect()
+    }
+
+    fn valid_event_count(conn: &Connection, recorded_by: &str) -> i64 {
+        conn.query_row(
+            "SELECT COUNT(*) FROM valid_events WHERE peer_id = ?1",
+            rusqlite::params![recorded_by],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
+
+    fn is_valid(conn: &Connection, recorded_by: &str, event_id: &EventId) -> bool {
+        conn.query_row(
+            "SELECT COUNT(*) > 0 FROM valid_events WHERE peer_id = ?1 AND event_id = ?2",
+            rusqlite::params![recorded_by, crate::crypto::event_id_to_base64(event_id)],
+            |row| row.get(0),
+        )
+        .unwrap()
+    }
 
     #[test]
     fn shared_send_batch_returns_requested_events_only() {
@@ -681,5 +968,126 @@ mod tests {
         assert_eq!(auth_order, vec![first_id, second_id]);
         assert_eq!(key_order, vec![second_id, first_id]);
         assert_eq!(hot_order, vec![second_id, first_id]);
+    }
+
+    #[test]
+    fn expand_requested_ids_includes_recursive_shared_deps_before_root() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let workspace_id = "workspace-bench-chain";
+
+        let root = insert_shared_bench_dep(&conn, workspace_id, 1, vec![], 1);
+        let mid = insert_shared_bench_dep(&conn, workspace_id, 2, vec![root], 2);
+        let leaf = insert_shared_bench_dep(&conn, workspace_id, 3, vec![mid], 3);
+        replace_shared_event_deps(&conn, workspace_id, &mid, &[root]).unwrap();
+        replace_shared_event_deps(&conn, workspace_id, &leaf, &[mid]).unwrap();
+
+        let store = Store::new(&conn);
+        let ordered = expand_requested_ids_with_shared_deps(
+            &conn,
+            &store,
+            workspace_id,
+            SyncWindow {
+                kind: SyncWindowKind::LastDay,
+                ts_min_inclusive_ms: Some(0),
+                ts_max_exclusive_ms: None,
+            },
+            &[leaf],
+        )
+        .unwrap();
+
+        assert_eq!(ordered, vec![root, mid, leaf]);
+    }
+
+    #[test]
+    fn expand_requested_ids_respects_dep_send_event_cap() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let workspace_id = "workspace-bench-cap";
+
+        let root = insert_shared_bench_dep(&conn, workspace_id, 1, vec![], 1);
+        let dep_2 = insert_shared_bench_dep(&conn, workspace_id, 2, vec![root], 2);
+        let dep_3 = insert_shared_bench_dep(&conn, workspace_id, 3, vec![dep_2], 3);
+        let leaf = insert_shared_bench_dep(&conn, workspace_id, 4, vec![dep_3], 4);
+        replace_shared_event_deps(&conn, workspace_id, &dep_2, &[root]).unwrap();
+        replace_shared_event_deps(&conn, workspace_id, &dep_3, &[dep_2]).unwrap();
+        replace_shared_event_deps(&conn, workspace_id, &leaf, &[dep_3]).unwrap();
+
+        let store = Store::new(&conn);
+        let ordered = expand_requested_ids_with_shared_deps_and_budget(
+            &conn,
+            &store,
+            workspace_id,
+            SyncWindow {
+                kind: SyncWindowKind::LastDay,
+                ts_min_inclusive_ms: Some(0),
+                ts_max_exclusive_ms: None,
+            },
+            &[leaf],
+            SharedDepSendBudget::new_for_tests(2, 1024 * 1024),
+        )
+        .unwrap();
+
+        assert_eq!(ordered, vec![dep_2, dep_3, leaf]);
+    }
+
+    #[test]
+    fn expanded_dep_send_projects_full_chain_in_one_round() {
+        let dir = tempfile::tempdir().unwrap();
+        let source_db_path = dir.path().join("source.db");
+        let dest_db_path = dir.path().join("dest.db");
+
+        let source_conn = open_connection(&source_db_path).unwrap();
+        let dest_conn = open_connection(&dest_db_path).unwrap();
+        create_tables(&source_conn).unwrap();
+        create_tables(&dest_conn).unwrap();
+
+        let workspace_id = "workspace-one-round";
+        let mut all_ids = Vec::new();
+        let mut prior = None;
+        for idx in 0..128i64 {
+            let dep_ids = prior.into_iter().collect::<Vec<_>>();
+            let event_id = insert_shared_bench_dep(
+                &source_conn,
+                workspace_id,
+                idx + 1,
+                dep_ids.clone(),
+                (idx % 251) as u8,
+            );
+            if let Some(dep_id) = dep_ids.first() {
+                replace_shared_event_deps(&source_conn, workspace_id, &event_id, &[*dep_id])
+                    .unwrap();
+            }
+            all_ids.push(event_id);
+            prior = Some(event_id);
+        }
+        let leaf = *all_ids.last().unwrap();
+
+        let store = Store::new(&source_conn);
+        let ordered_ids = expand_requested_ids_with_shared_deps(
+            &source_conn,
+            &store,
+            workspace_id,
+            SyncWindow {
+                kind: SyncWindowKind::LastDay,
+                ts_min_inclusive_ms: Some(0),
+                ts_max_exclusive_ms: None,
+            },
+            &[leaf],
+        )
+        .unwrap();
+        assert_eq!(ordered_ids.len(), all_ids.len());
+
+        let ordered = load_shared_send_batch(&store, &ordered_ids).unwrap();
+        let dest_path = dest_db_path.to_string_lossy().to_string();
+        let persisted = ingest_now(
+            &dest_path,
+            make_ingest_batch("tenant-a", "quic_recv:peer-z@test", &ordered),
+        )
+        .unwrap();
+
+        assert_eq!(persisted, all_ids.len());
+        assert_eq!(valid_event_count(&dest_conn, "tenant-a"), all_ids.len() as i64);
+        assert!(is_valid(&dest_conn, "tenant-a", &leaf));
     }
 }
