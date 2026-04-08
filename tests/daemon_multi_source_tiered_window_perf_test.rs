@@ -625,7 +625,7 @@ fn converge_existing_mesh(
     }
 }
 
-fn write_cold_join_summary(summary_key: &str, outcome: &ColdJoinOutcome) {
+fn write_cold_join_summary(summary_key: Option<&str>, outcome: &ColdJoinOutcome) {
     let metric_start_ms = outcome.milestones.invite_accept_at_ms;
     let mut summary = String::new();
     let _ = writeln!(summary, "=== Multi-source cold join hot-head diagnostic ===");
@@ -709,10 +709,17 @@ fn write_cold_join_summary(summary_key: &str, outcome: &ColdJoinOutcome) {
     }
 
     eprintln!("\n{summary}");
-    write_summary(summary_key, &summary);
+    if let Some(summary_key) = summary_key {
+        write_summary(summary_key, &summary);
+    }
 }
 
-fn event_timeline_report_cli(db: &str, content_prefix: &str, limit: usize) -> String {
+fn event_timeline_report_cli(
+    db: &str,
+    content_prefix: &str,
+    limit: usize,
+    metric_start_ms: i64,
+) -> String {
     let start = Instant::now();
     loop {
         let limit_arg = limit.to_string();
@@ -725,10 +732,103 @@ fn event_timeline_report_cli(db: &str, content_prefix: &str, limit: usize) -> St
                 content_prefix,
                 "--limit",
                 limit_arg.as_str(),
+                "--json",
             ],
         );
         if out.status.success() {
-            return String::from_utf8_lossy(&out.stdout).trim().to_string();
+            let stdout = String::from_utf8_lossy(&out.stdout);
+            let data: Value = serde_json::from_str(stdout.trim())
+                .expect("decode event timeline report json");
+            let mut report = String::new();
+            let matched = data["match_count"].as_i64().unwrap_or(0);
+            let received = data["received_count"].as_i64().unwrap_or(0);
+            let stored = data["stored_count"].as_i64().unwrap_or(0);
+            let blocked = data["blocked_count"].as_i64().unwrap_or(0);
+            let unblocked = data["unblocked_count"].as_i64().unwrap_or(0);
+            let projected = data["projected_count"].as_i64().unwrap_or(0);
+            let _ = writeln!(
+                report,
+                "counts matched={} received={} stored={} blocked={} unblocked={} projected={}",
+                matched, received, stored, blocked, unblocked, projected
+            );
+
+            let rows = data["sample_rows"].as_array().cloned().unwrap_or_default();
+            let stored_times: Vec<i64> = rows
+                .iter()
+                .filter_map(|row| row["first_stored_at_ms"].as_i64())
+                .collect();
+            let projected_times: Vec<i64> = rows
+                .iter()
+                .filter_map(|row| row["projected_at_ms"].as_i64())
+                .collect();
+
+            let fmt_secs = |ts: Option<i64>| {
+                ts.map(|value| format!("{:.2}s", elapsed_secs(metric_start_ms, value)))
+                    .unwrap_or_else(|| "-".to_string())
+            };
+            let rate = |count: i64, ts: Option<i64>| {
+                ts.and_then(|value| {
+                    let secs = elapsed_secs(metric_start_ms, value);
+                    (secs > 0.0).then(|| format!("{:.2}", count as f64 / secs))
+                })
+                .unwrap_or_else(|| "-".to_string())
+            };
+            let first_stored = stored_times.iter().min().copied();
+            let all_stored = stored_times.iter().max().copied();
+            let first_projected = projected_times.iter().min().copied();
+            let all_projected = projected_times.iter().max().copied();
+            let _ = writeln!(
+                report,
+                "throughput durable first={} all={} rate={} msg/s",
+                fmt_secs(first_stored),
+                fmt_secs(all_stored),
+                rate(stored, all_stored)
+            );
+            let _ = writeln!(
+                report,
+                "throughput visible first={} all={} rate={} msg/s",
+                fmt_secs(first_projected),
+                fmt_secs(all_projected),
+                rate(projected, all_projected)
+            );
+
+            let _ = writeln!(report, "stage stats:");
+            for (label, key) in [
+                ("recv -> store", "recv_to_store_ms"),
+                ("store -> project", "store_to_project_ms"),
+                ("recv -> project", "recv_to_project_ms"),
+                ("blocked -> unblocked", "blocked_to_unblocked_ms"),
+                ("unblocked -> project", "unblocked_to_project_ms"),
+            ] {
+                let stats = &data["stage_stats"][key];
+                let avg = stats["avg_ms"]
+                    .as_f64()
+                    .map(|v| format!("{v:.1}"))
+                    .unwrap_or_else(|| "-".to_string());
+                let p50 = stats["p50_ms"]
+                    .as_i64()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let p95 = stats["p95_ms"]
+                    .as_i64()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let max = stats["max_ms"]
+                    .as_i64()
+                    .map(|v| v.to_string())
+                    .unwrap_or_else(|| "-".to_string());
+                let _ = writeln!(
+                    report,
+                    "  {:<22} count={:<4} avg={}ms p50={}ms p95={}ms max={}ms",
+                    label,
+                    stats["count"].as_i64().unwrap_or(0),
+                    avg,
+                    p50,
+                    p95,
+                    max
+                );
+            }
+            return report.trim_end().to_string();
         }
         let stdout = String::from_utf8_lossy(&out.stdout);
         let stderr = String::from_utf8_lossy(&out.stderr);
@@ -1124,7 +1224,12 @@ fn run_cold_join_hot_head_diagnostic(source_count: usize, wait_for_full_catchup:
             )
         })
         .collect();
-    let sink_hot_timeline_report = event_timeline_report_cli(&sink_node.db, "hot:", 12);
+    let sink_hot_timeline_report = event_timeline_report_cli(
+        &sink_node.db,
+        "hot:",
+        hot_head.len(),
+        invite_accept_at_ms,
+    );
 
     let outcome = ColdJoinOutcome {
         milestones: ColdJoinMilestones {
@@ -1155,15 +1260,17 @@ fn run_cold_join_hot_head_diagnostic(source_count: usize, wait_for_full_catchup:
         sink_hot_timeline_report,
     };
 
-    if wait_for_full_catchup {
-        write_cold_join_summary(
-            &format!(
-                "daemon_multi_source_tiered_window_perf_test.cold_join_hot_head_cli_{}x_{}seed_{}hot",
-                source_count, seeded_history_messages, hot_messages_per_peer
-            ),
-            &outcome,
-        );
-    }
+    write_cold_join_summary(
+        wait_for_full_catchup
+            .then(|| {
+                format!(
+                    "daemon_multi_source_tiered_window_perf_test.cold_join_hot_head_cli_{}x_{}seed_{}hot",
+                    source_count, seeded_history_messages, hot_messages_per_peer
+                )
+            })
+            .as_deref(),
+        &outcome,
+    );
 
     outcome
 }
