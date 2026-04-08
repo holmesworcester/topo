@@ -1382,6 +1382,104 @@ fn test_cli_lowmem_receiver_restart_catches_offline_delta_and_resumes_sync() {
     stop_daemon(&alice_db, &mut alice_daemon);
 }
 
+/// TODO(invite-reuse): a single invite should support consecutive pure-CLI
+/// joins without stranding one peer at 2/3 probe messages.
+#[test]
+#[ignore = "TODO(invite-reuse): same invite reused by multiple joiners can stall third-peer propagation"]
+fn test_cli_todo_multi_use_invite_reuse_three_peer_probe_propagation() {
+    const ATTEMPTS: usize = 5;
+    let timeout_ms = 10_000;
+
+    for attempt in 0..ATTEMPTS {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let workspace_name = format!("reuse-fast-three-peer-{attempt}");
+
+        let alice_db = tmpdir.path().join("alice.db").to_str().unwrap().to_string();
+        create_workspace_with_details(&alice_db, &workspace_name, "alice", "alice-root");
+        let alice = StartedCliPeer {
+            db: alice_db,
+            username: "alice".to_string(),
+            device_name: "alice-root".to_string(),
+            _daemon: start_daemon(
+                tmpdir
+                    .path()
+                    .join("alice.db")
+                    .to_str()
+                    .expect("alice db path"),
+            ),
+        };
+        let reused_invite = create_invite(&alice.db, &daemon_listen_addr(&alice.db));
+
+        let bob_db = tmpdir.path().join("bob.db").to_str().unwrap().to_string();
+        let carol_db = tmpdir.path().join("carol.db").to_str().unwrap().to_string();
+        let bob = StartedCliPeer {
+            db: bob_db.clone(),
+            username: "bob".to_string(),
+            device_name: "bob-box".to_string(),
+            _daemon: start_daemon(&bob_db),
+        };
+        let carol = StartedCliPeer {
+            db: carol_db.clone(),
+            username: "carol".to_string(),
+            device_name: "carol-box".to_string(),
+            _daemon: start_daemon(&carol_db),
+        };
+
+        std::thread::scope(|scope| {
+            let invite_for_bob = reused_invite.clone();
+            let bob_db = bob.db.clone();
+            scope.spawn(move || {
+                accept_invite_with_identity_on_running_daemon(
+                    &bob_db,
+                    &invite_for_bob,
+                    "bob",
+                    "bob-box",
+                    Duration::from_secs(10),
+                );
+                wait_for_active_tenant_ready(&bob_db, Duration::from_secs(120));
+            });
+
+            let invite_for_carol = reused_invite.clone();
+            let carol_db = carol.db.clone();
+            scope.spawn(move || {
+                accept_invite_with_identity_on_running_daemon(
+                    &carol_db,
+                    &invite_for_carol,
+                    "carol",
+                    "carol-box",
+                    Duration::from_secs(10),
+                );
+                wait_for_active_tenant_ready(&carol_db, Duration::from_secs(120));
+            });
+        });
+
+        wait_for_username_peer_id(&bob.db, "bob", 30_000);
+        wait_for_username_peer_id(&carol.db, "carol", 30_000);
+        assert_identity_eventually_materialized(&bob.db, 30_000);
+        assert_identity_eventually_materialized(&carol.db, 30_000);
+
+        send_message(&alice.db, &format!("reuse-fast-three-peer/{attempt}/alice-probe"));
+        send_message(&bob.db, &format!("reuse-fast-three-peer/{attempt}/bob-probe"));
+        send_message(&carol.db, &format!("reuse-fast-three-peer/{attempt}/carol-probe"));
+
+        for (label, db) in [("alice", &alice.db), ("bob", &bob.db), ("carol", &carol.db)] {
+            let output = topo_assert_eventually(db, "message_count >= 3", timeout_ms);
+            assert!(
+                output.status.success(),
+                "attempt {} {} did not reach 3 messages in {}ms\nstdout={}\nmessages=\n{}\npeers=\n{}\nstatus=\n{}\nconnections=\n{}",
+                attempt,
+                label,
+                timeout_ms,
+                String::from_utf8_lossy(&output.stdout),
+                String::from_utf8_lossy(&topo_cmd(db, &["messages", "--limit", "10"]).stdout),
+                String::from_utf8_lossy(&topo_cmd(db, &["peers"]).stdout),
+                String::from_utf8_lossy(&topo_cmd(db, &["status"]).stdout),
+                String::from_utf8_lossy(&topo_cmd(db, &["connections"]).stdout),
+            );
+        }
+    }
+}
+
 #[test]
 fn test_cli_send_and_messages() {
     // Basic test: create workspace, start daemon, send/messages work
