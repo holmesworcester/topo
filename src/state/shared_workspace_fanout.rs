@@ -95,6 +95,56 @@ pub(crate) struct SharedEventFanout {
     pub event_id: EventId,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SharedFanoutSiblingContext {
+    sibling_peer_id: String,
+    sibling_removed: bool,
+    event_predates_removal: bool,
+    removal_targets_sibling: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SharedFanoutContext {
+    origin_rejected: bool,
+    origin_removed: bool,
+    removal_event: bool,
+    siblings: Vec<SharedFanoutSiblingContext>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SharedFanoutPlan {
+    SkipOriginRejected,
+    SkipOriginRemoved,
+    NoTargets,
+    FanoutTo { sibling_peer_ids: Vec<String> },
+}
+
+fn decide_shared_fanout_plan(context: &SharedFanoutContext) -> SharedFanoutPlan {
+    if context.origin_rejected {
+        return SharedFanoutPlan::SkipOriginRejected;
+    }
+    if context.origin_removed && !context.removal_event {
+        return SharedFanoutPlan::SkipOriginRemoved;
+    }
+
+    let sibling_peer_ids: Vec<String> = context
+        .siblings
+        .iter()
+        .filter(|sibling| {
+            !sibling.sibling_removed
+                || sibling.event_predates_removal
+                || sibling.removal_targets_sibling
+        })
+        .map(|sibling| sibling.sibling_peer_id.clone())
+        .collect();
+
+    if sibling_peer_ids.is_empty() {
+        SharedFanoutPlan::NoTargets
+    } else {
+        SharedFanoutPlan::FanoutTo { sibling_peer_ids }
+    }
+}
+
 fn sibling_tenants_in_workspace(
     conn: &Connection,
     origin_peer_id: &str,
@@ -374,30 +424,7 @@ pub(crate) fn fanout_shared_event_immediate(
     workspace_id: &str,
     event_id: &EventId,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync>> {
-    // Skip fanout for events the origin tenant rejected (bad signature, etc.)
-    if is_origin_rejected(conn, origin_peer_id, event_id) {
-        return Ok(());
-    }
     let siblings = sibling_tenants_in_workspace(conn, origin_peer_id, workspace_id)?;
-    // Skip fanout from removed tenants — a removed local tenant must not
-    // inject new shared events into sibling scopes. Removal events are
-    // exempt so self-removal propagates to siblings.
-    // Check all workspace scopes (origin + siblings) because another tenant
-    // may have projected the removal before the origin scope has.
-    if !is_removal_event(conn, event_id) {
-        let all_scopes: Vec<&str> = siblings
-            .iter()
-            .map(|s| s.as_str())
-            .chain(std::iter::once(origin_peer_id))
-            .collect();
-        if is_sibling_removed(conn, origin_peer_id, &all_scopes) {
-            return Ok(());
-        }
-    }
-    if siblings.is_empty() {
-        return Ok(());
-    }
-
     let now_ms = std::time::SystemTime::now()
         .duration_since(std::time::UNIX_EPOCH)?
         .as_millis() as i64;
@@ -409,24 +436,41 @@ pub(crate) fn fanout_shared_event_immediate(
         .map(|s| s.as_str())
         .chain(std::iter::once(origin_peer_id))
         .collect();
-    let active_siblings: Vec<&String> = siblings
-        .iter()
-        .filter(|s| {
-            if !is_sibling_removed(conn, s, &check_scopes) {
-                return true;
-            }
-            // Allow pre-removal events that arrived out-of-order.
-            if event_predates_sibling_removal(conn, event_id, s, &check_scopes) {
-                return true;
-            }
-            // Only exempt the specific sibling targeted by this removal event.
-            removal && is_removal_targeting_sibling(conn, event_id, s, origin_peer_id)
-        })
-        .collect();
-    for sibling in &active_siblings {
+    let plan = decide_shared_fanout_plan(&SharedFanoutContext {
+        origin_rejected: is_origin_rejected(conn, origin_peer_id, event_id),
+        origin_removed: is_sibling_removed(conn, origin_peer_id, &check_scopes),
+        removal_event: removal,
+        siblings: siblings
+            .iter()
+            .map(|sibling_peer_id| SharedFanoutSiblingContext {
+                sibling_peer_id: sibling_peer_id.clone(),
+                sibling_removed: is_sibling_removed(conn, sibling_peer_id, &check_scopes),
+                event_predates_removal: event_predates_sibling_removal(
+                    conn,
+                    event_id,
+                    sibling_peer_id,
+                    &check_scopes,
+                ),
+                removal_targets_sibling: removal
+                    && is_removal_targeting_sibling(
+                        conn,
+                        event_id,
+                        sibling_peer_id,
+                        origin_peer_id,
+                    ),
+            })
+            .collect(),
+    });
+    let sibling_peer_ids = match plan {
+        SharedFanoutPlan::SkipOriginRejected
+        | SharedFanoutPlan::SkipOriginRemoved
+        | SharedFanoutPlan::NoTargets => return Ok(()),
+        SharedFanoutPlan::FanoutTo { sibling_peer_ids } => sibling_peer_ids,
+    };
+    for sibling in &sibling_peer_ids {
         insert_recorded_event(conn, sibling, event_id, now_ms, &source)?;
     }
-    for sibling in &active_siblings {
+    for sibling in &sibling_peer_ids {
         let _ = project_one(conn, sibling, event_id)
             .map_err(|e| -> Box<dyn std::error::Error + Send + Sync> { e.to_string().into() })?;
     }
@@ -438,31 +482,8 @@ pub(crate) fn fanout_shared_event_enqueue(
     conn: &Connection,
     fanout: &SharedEventFanout,
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
-    // Skip fanout for events the origin tenant rejected (bad signature, etc.)
-    if is_origin_rejected(conn, &fanout.origin_peer_id, &fanout.event_id) {
-        return Ok(Vec::new());
-    }
-    // Check origin removal across all workspace scopes. For wire-ingested
-    // events origin_peer_id is the local ingesting tenant (should never be
-    // removed while actively ingesting). For local-create pending entries
-    // surviving a crash, the removal may have been projected after the
-    // pending entry was written — re-check here to prevent post-removal
-    // event leakage during startup recovery.
     let siblings =
         sibling_tenants_in_workspace(conn, &fanout.origin_peer_id, &fanout.workspace_id)?;
-    if !is_removal_event(conn, &fanout.event_id) {
-        let all_scopes: Vec<&str> = siblings
-            .iter()
-            .map(|s| s.as_str())
-            .chain(std::iter::once(fanout.origin_peer_id.as_str()))
-            .collect();
-        if is_sibling_removed(conn, &fanout.origin_peer_id, &all_scopes) {
-            return Ok(Vec::new());
-        }
-    }
-    if siblings.is_empty() {
-        return Ok(Vec::new());
-    }
 
     let pq = ProjectQueue::new(conn);
     let event_id_b64 = event_id_to_base64(&fanout.event_id);
@@ -478,25 +499,40 @@ pub(crate) fn fanout_shared_event_enqueue(
         .map(|s| s.as_str())
         .chain(std::iter::once(fanout.origin_peer_id.as_str()))
         .collect();
-
-    let mut fanned = Vec::new();
-    for sibling in &siblings {
-        if is_sibling_removed(conn, sibling, &check_scopes) {
-            // Allow pre-removal events that arrived out-of-order.
-            let predates =
-                event_predates_sibling_removal(conn, &fanout.event_id, sibling, &check_scopes);
-            // Only exempt the specific sibling targeted by this removal.
-            let targeted_removal = removal
-                && is_removal_targeting_sibling(
+    let plan = decide_shared_fanout_plan(&SharedFanoutContext {
+        origin_rejected: is_origin_rejected(conn, &fanout.origin_peer_id, &fanout.event_id),
+        origin_removed: is_sibling_removed(conn, &fanout.origin_peer_id, &check_scopes),
+        removal_event: removal,
+        siblings: siblings
+            .iter()
+            .map(|sibling_peer_id| SharedFanoutSiblingContext {
+                sibling_peer_id: sibling_peer_id.clone(),
+                sibling_removed: is_sibling_removed(conn, sibling_peer_id, &check_scopes),
+                event_predates_removal: event_predates_sibling_removal(
                     conn,
                     &fanout.event_id,
-                    sibling,
-                    &fanout.origin_peer_id,
-                );
-            if !predates && !targeted_removal {
-                continue;
-            }
-        }
+                    sibling_peer_id,
+                    &check_scopes,
+                ),
+                removal_targets_sibling: removal
+                    && is_removal_targeting_sibling(
+                        conn,
+                        &fanout.event_id,
+                        sibling_peer_id,
+                        &fanout.origin_peer_id,
+                    ),
+            })
+            .collect(),
+    });
+    let sibling_peer_ids = match plan {
+        SharedFanoutPlan::SkipOriginRejected
+        | SharedFanoutPlan::SkipOriginRemoved
+        | SharedFanoutPlan::NoTargets => return Ok(Vec::new()),
+        SharedFanoutPlan::FanoutTo { sibling_peer_ids } => sibling_peer_ids,
+    };
+
+    let mut fanned = Vec::new();
+    for sibling in &sibling_peer_ids {
         insert_recorded_event(conn, sibling, &fanout.event_id, now_ms, &source)?;
         let _ = pq.enqueue(sibling, &event_id_b64)?;
         fanned.push(sibling.clone());
@@ -509,6 +545,43 @@ pub(crate) fn fanout_shared_event_enqueue(
 mod tests {
     use super::*;
     use crate::db::{open_in_memory, schema::create_tables};
+
+    #[test]
+    fn shared_fanout_plan_skips_removed_origin_for_non_removal_events() {
+        let plan = decide_shared_fanout_plan(&SharedFanoutContext {
+            origin_rejected: false,
+            origin_removed: true,
+            removal_event: false,
+            siblings: vec![SharedFanoutSiblingContext {
+                sibling_peer_id: "sibling".to_string(),
+                sibling_removed: false,
+                event_predates_removal: false,
+                removal_targets_sibling: false,
+            }],
+        });
+        assert_eq!(plan, SharedFanoutPlan::SkipOriginRemoved);
+    }
+
+    #[test]
+    fn shared_fanout_plan_keeps_targeted_removal_for_removed_sibling() {
+        let plan = decide_shared_fanout_plan(&SharedFanoutContext {
+            origin_rejected: false,
+            origin_removed: false,
+            removal_event: true,
+            siblings: vec![SharedFanoutSiblingContext {
+                sibling_peer_id: "sibling".to_string(),
+                sibling_removed: true,
+                event_predates_removal: false,
+                removal_targets_sibling: true,
+            }],
+        });
+        assert_eq!(
+            plan,
+            SharedFanoutPlan::FanoutTo {
+                sibling_peer_ids: vec!["sibling".to_string()],
+            }
+        );
+    }
 
     fn setup() -> Connection {
         let conn = open_in_memory().unwrap();

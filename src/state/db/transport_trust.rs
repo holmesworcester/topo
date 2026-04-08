@@ -792,6 +792,16 @@ pub struct InviteBootstrapTarget {
     pub workspace_already_local_elsewhere: bool,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BootstrapSessionFallbackCandidate {
+    pub daemon_peer_id: String,
+    pub invite_event_id: String,
+    /// True when this fallback row was created after another tenant for the
+    /// same workspace was already local. Such rows must not drive planner
+    /// behavior because they can be introduced by a later malicious click.
+    pub workspace_already_local_before_candidate: bool,
+}
+
 /// List active invite bootstrap targets for a tenant, keyed by invite_event_id.
 ///
 /// Returns all non-expired bootstrap targets. The address may be empty, in
@@ -846,6 +856,55 @@ pub fn list_active_invite_bootstrap_targets(
                 transport_peer_id,
                 bootstrap_addr: row.get(2)?,
                 workspace_already_local_elsewhere: row.get(3)?,
+            })
+        })?
+        .collect::<Result<Vec<_>, _>>()?;
+    Ok(rows)
+}
+
+pub fn list_active_bootstrap_session_fallback_candidates(
+    conn: &Connection,
+    recorded_by: &str,
+) -> Result<Vec<BootstrapSessionFallbackCandidate>, Box<dyn std::error::Error + Send + Sync>> {
+    let now = current_timestamp_ms();
+    let mut stmt = conn.prepare(
+        "SELECT
+             t.bootstrap_spki_fingerprint,
+             t.invite_event_id,
+             EXISTS(
+                 SELECT 1
+                 FROM invites_accepted sibling
+                 WHERE sibling.workspace_id = t.workspace_id
+                   AND sibling.recorded_by <> t.recorded_by
+                   AND (
+                       sibling.created_at < t.accepted_at
+                       OR (
+                           sibling.created_at = t.accepted_at
+                           AND sibling.event_id < t.invite_accepted_event_id
+                       )
+                   )
+             ) AS workspace_already_local_before_candidate
+         FROM invite_bootstrap_trust t
+         WHERE t.recorded_by = ?1
+           AND t.expires_at > ?2
+         ORDER BY t.accepted_at DESC, t.invite_accepted_event_id DESC",
+    )?;
+    let rows = stmt
+        .query_map(rusqlite::params![recorded_by, now], |row| {
+            let bootstrap_spki_fingerprint: Vec<u8> = row.get(0)?;
+            let daemon_peer_id = decode_32_byte_blob(bootstrap_spki_fingerprint)
+                .map(hex::encode)
+                .ok_or_else(|| {
+                    rusqlite::Error::FromSqlConversionFailure(
+                        0,
+                        rusqlite::types::Type::Blob,
+                        "bootstrap_spki_fingerprint is not 32 bytes".into(),
+                    )
+                })?;
+            Ok(BootstrapSessionFallbackCandidate {
+                daemon_peer_id,
+                invite_event_id: row.get(1)?,
+                workspace_already_local_before_candidate: row.get(2)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;

@@ -236,12 +236,72 @@ pub open spec fn should_terminate_dial(consecutive_stale: nat) -> bool {
     consecutive_stale >= MAX_STALE_DIALS
 }
 
+pub open spec fn dial_failure_should_warn(
+    has_connected_once: bool,
+    stale_dial_failure: bool,
+    warn_on_startup_stale_failure: bool,
+) -> bool {
+    has_connected_once || !stale_dial_failure || warn_on_startup_stale_failure
+}
+
 proof fn proof_stale_dial_terminates()
     ensures
         should_terminate_dial(8),
         should_terminate_dial(100),
         !should_terminate_dial(7),
         !should_terminate_dial(0),
+{
+}
+
+proof fn proof_startup_stale_bootstrap_warning_is_preserved()
+    ensures dial_failure_should_warn(false, true, true),
+{
+}
+
+proof fn proof_nonstale_failures_always_warn_after_first_attempt()
+    ensures
+        dial_failure_should_warn(true, false, false),
+        dial_failure_should_warn(true, true, false),
+{
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// SESSION FAILURE / RETRY PLANNING
+// ═══════════════════════════════════════════════════════════════════
+
+pub open spec fn session_auth_failure_plan(
+    connection_lost: bool,
+    has_bootstrap_retry_invite: bool,
+) -> (bool, bool) {
+    (connection_lost, has_bootstrap_retry_invite)
+}
+
+proof fn proof_auth_failure_keeps_bootstrap_retry_and_evicts_lost_connection()
+    ensures
+        session_auth_failure_plan(true, true) == (true, true),
+        session_auth_failure_plan(false, true) == (false, true),
+{
+}
+
+pub open spec fn session_retry_delay_kind(
+    session_stats_present: bool,
+    sent_any_events: bool,
+    received_any_events: bool,
+) -> nat {
+    if !session_stats_present {
+        250
+    } else if !sent_any_events && !received_any_events {
+        15000
+    } else {
+        0
+    }
+}
+
+proof fn proof_quiescent_sessions_back_off()
+    ensures
+        session_retry_delay_kind(true, false, false) == 15000,
+        session_retry_delay_kind(true, true, false) == 0,
+        session_retry_delay_kind(false, false, false) == 250,
 {
 }
 

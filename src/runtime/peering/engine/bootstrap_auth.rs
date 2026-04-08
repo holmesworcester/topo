@@ -7,6 +7,7 @@
 
 use crate::db::open_connection;
 use crate::db::transport_creds::{resolve_tenant_transport_target, CRED_SOURCE_BOOTSTRAP};
+use crate::db::transport_trust::list_active_bootstrap_session_fallback_candidates;
 
 use super::target_dispatch::{should_initiate_connect_for_source, TargetIngressSource};
 
@@ -14,6 +15,75 @@ use super::target_dispatch::{should_initiate_connect_for_source, TargetIngressSo
 pub(super) struct BootstrapSessionFallback {
     pub(super) daemon_peer_id: String,
     pub(super) invite_event_id: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BootstrapSessionFallbackContext {
+    Candidates {
+        require_local_bootstrap_phase: bool,
+        local_bootstrap_phase: bool,
+        candidates: Vec<crate::db::transport_trust::BootstrapSessionFallbackCandidate>,
+    },
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum BootstrapSessionFallbackDecision {
+    RejectRequiresLocalBootstrapPhase,
+    RejectMissing,
+    UseFallback(BootstrapSessionFallback),
+    RejectAmbiguous,
+    RejectAlreadyLocalWorkspaceCandidate,
+}
+
+fn decide_bootstrap_session_fallback(
+    context: &BootstrapSessionFallbackContext,
+) -> BootstrapSessionFallbackDecision {
+    match context {
+        BootstrapSessionFallbackContext::Candidates {
+            require_local_bootstrap_phase,
+            local_bootstrap_phase,
+            candidates,
+        } => {
+            if *require_local_bootstrap_phase && !*local_bootstrap_phase {
+                return BootstrapSessionFallbackDecision::RejectRequiresLocalBootstrapPhase;
+            }
+
+            let mut candidates = candidates.clone();
+            candidates.sort_by(|a, b| {
+                a.invite_event_id
+                    .cmp(&b.invite_event_id)
+                    .then_with(|| a.daemon_peer_id.cmp(&b.daemon_peer_id))
+            });
+            let mut normalized: Vec<crate::db::transport_trust::BootstrapSessionFallbackCandidate> =
+                Vec::new();
+            for candidate in candidates {
+                if let Some(last) = normalized.last_mut() {
+                    if last.invite_event_id == candidate.invite_event_id
+                        && last.daemon_peer_id == candidate.daemon_peer_id
+                    {
+                        last.workspace_already_local_before_candidate |=
+                            candidate.workspace_already_local_before_candidate;
+                        continue;
+                    }
+                }
+                normalized.push(candidate);
+            }
+
+            match normalized.as_slice() {
+                [] => BootstrapSessionFallbackDecision::RejectMissing,
+                [candidate] if candidate.workspace_already_local_before_candidate => {
+                    BootstrapSessionFallbackDecision::RejectAlreadyLocalWorkspaceCandidate
+                }
+                [candidate] => {
+                    BootstrapSessionFallbackDecision::UseFallback(BootstrapSessionFallback {
+                        daemon_peer_id: candidate.daemon_peer_id.clone(),
+                        invite_event_id: candidate.invite_event_id.clone(),
+                    })
+                }
+                _ => BootstrapSessionFallbackDecision::RejectAmbiguous,
+            }
+        }
+    }
 }
 
 pub(super) fn local_transport_target_is_bootstrap(
@@ -39,53 +109,19 @@ pub(super) fn resolve_active_bootstrap_session_fallback(
     tenant_id: &str,
     require_local_bootstrap_phase: bool,
 ) -> Option<BootstrapSessionFallback> {
-    if require_local_bootstrap_phase && !is_tenant_in_bootstrap_phase(db_path, tenant_id) {
-        return None;
-    }
-
     let conn = open_connection(db_path).ok()?;
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .ok()
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
-    let mut stmt = conn
-        .prepare(
-            "SELECT invite_event_id, bootstrap_spki_fingerprint
-             FROM invite_bootstrap_trust
-             WHERE recorded_by = ?1
-               AND expires_at > ?2
-             ORDER BY accepted_at DESC, invite_accepted_event_id DESC",
-        )
-        .ok()?;
-    let mut fallbacks = stmt
-        .query_map(rusqlite::params![tenant_id, now_ms], |row| {
-            let invite_event_id: String = row.get(0)?;
-            let fp_bytes: Vec<u8> = row.get(1)?;
-            if fp_bytes.len() != 32 {
-                return Err(rusqlite::Error::FromSqlConversionFailure(
-                    1,
-                    rusqlite::types::Type::Blob,
-                    "bootstrap_spki_fingerprint is not 32 bytes".into(),
-                ));
-            }
-            Ok(BootstrapSessionFallback {
-                daemon_peer_id: hex::encode(fp_bytes),
-                invite_event_id,
-            })
-        })
-        .ok()?
-        .collect::<Result<Vec<_>, _>>()
-        .ok()?;
-    fallbacks.sort_by(|a, b| {
-        a.invite_event_id
-            .cmp(&b.invite_event_id)
-            .then_with(|| a.daemon_peer_id.cmp(&b.daemon_peer_id))
-    });
-    fallbacks.dedup();
-    match fallbacks.as_slice() {
-        [fallback] => Some(fallback.clone()),
-        _ => None,
+    let decision =
+        decide_bootstrap_session_fallback(&BootstrapSessionFallbackContext::Candidates {
+            require_local_bootstrap_phase,
+            local_bootstrap_phase: local_transport_target_is_bootstrap(&conn, tenant_id),
+            candidates: list_active_bootstrap_session_fallback_candidates(&conn, tenant_id).ok()?,
+        });
+    match decision {
+        BootstrapSessionFallbackDecision::UseFallback(fallback) => Some(fallback),
+        BootstrapSessionFallbackDecision::RejectRequiresLocalBootstrapPhase
+        | BootstrapSessionFallbackDecision::RejectMissing
+        | BootstrapSessionFallbackDecision::RejectAmbiguous
+        | BootstrapSessionFallbackDecision::RejectAlreadyLocalWorkspaceCandidate => None,
     }
 }
 
@@ -254,6 +290,109 @@ mod tests {
 
         assert_eq!(
             resolve_active_bootstrap_session_fallback(db_path.to_str().unwrap(), "tenant-a", false),
+            None
+        );
+    }
+
+    #[test]
+    fn bootstrap_session_fallback_skips_same_workspace_candidate_created_after_sibling() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("bootstrap-same-workspace-skip.db");
+        let conn = open_connection(db_path.to_str().unwrap()).unwrap();
+        create_tables(&conn).unwrap();
+        conn.execute(
+            "INSERT INTO invites_accepted
+                 (event_id, tenant_event_id, invite_event_id, workspace_id, recorded_by, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "accepted-sibling",
+                "tenant-event-sibling",
+                "invite-sibling",
+                "ws-1",
+                "tenant-b",
+                1_000i64
+            ],
+        )
+        .unwrap();
+        record_invite_bootstrap_trust(
+            &conn,
+            "tenant-a",
+            "accepted-a",
+            "invite-a",
+            "ws-1",
+            "127.0.0.1:1",
+            &[0xAB; 32],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            resolve_active_bootstrap_session_fallback(db_path.to_str().unwrap(), "tenant-a", false),
+            None
+        );
+    }
+
+    #[test]
+    fn bootstrap_session_fallback_keeps_older_candidate_after_later_sibling() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("bootstrap-older-candidate-kept.db");
+        let conn = open_connection(db_path.to_str().unwrap()).unwrap();
+        create_tables(&conn).unwrap();
+        record_invite_bootstrap_trust(
+            &conn,
+            "tenant-a",
+            "accepted-a",
+            "invite-a",
+            "ws-1",
+            "127.0.0.1:1",
+            &[0xAB; 32],
+        )
+        .unwrap();
+        conn.execute(
+            "INSERT INTO invites_accepted
+                 (event_id, tenant_event_id, invite_event_id, workspace_id, recorded_by, created_at)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            rusqlite::params![
+                "accepted-sibling",
+                "tenant-event-sibling",
+                "invite-sibling",
+                "ws-1",
+                "tenant-b",
+                crate::db::queue::current_timestamp_ms() + 60_000
+            ],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            resolve_active_bootstrap_session_fallback(db_path.to_str().unwrap(), "tenant-a", false),
+            Some(BootstrapSessionFallback {
+                daemon_peer_id: hex::encode([0xAB; 32]),
+                invite_event_id: "invite-a".to_string(),
+            })
+        );
+    }
+
+    #[test]
+    fn bootstrap_session_fallback_requires_local_bootstrap_phase_when_requested() {
+        let tmpdir = tempfile::tempdir().unwrap();
+        let db_path = tmpdir.path().join("bootstrap-phase-required.db");
+        let conn = open_connection(db_path.to_str().unwrap()).unwrap();
+        create_tables(&conn).unwrap();
+        record_invite_bootstrap_trust(
+            &conn,
+            "tenant-a",
+            "accepted-a",
+            "invite-a",
+            "ws-1",
+            "127.0.0.1:1",
+            &[0xAB; 32],
+        )
+        .unwrap();
+        drop(conn);
+
+        assert_eq!(
+            resolve_active_bootstrap_session_fallback(db_path.to_str().unwrap(), "tenant-a", true),
             None
         );
     }

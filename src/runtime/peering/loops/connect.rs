@@ -35,6 +35,44 @@ const STALE_DIAL_FAILURE_THRESHOLD: u32 = 8;
 const REPEATED_WARNING_WINDOW: Duration = Duration::from_secs(300);
 const QUIESCENT_SESSION_RETRY_DELAY: Duration = Duration::from_secs(15);
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct DialFailureContext {
+    has_connected_once: bool,
+    stale_dial_failure: bool,
+    consecutive_stale_dial_failures: u32,
+    warn_on_startup_stale_failure: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum DialFailurePlan {
+    ReturnStaleTarget {
+        should_warn: bool,
+        next_consecutive_stale_dial_failures: u32,
+    },
+    Retry {
+        should_warn: bool,
+        next_consecutive_stale_dial_failures: u32,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionOpenFailurePlan {
+    Break,
+    EvictAndBreak,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct SessionAuthFailurePlan {
+    next_auth_plan_override: Option<OutboundSessionAuthPlan>,
+    evict_live_connection: bool,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum SessionRetryPlan {
+    NoDelay,
+    Delay(Duration),
+}
+
 fn describe_outbound_session_auth_plan(plan: &OutboundSessionAuthPlan) -> String {
     match plan {
         OutboundSessionAuthPlan::PeerShared { target_peer_id } => {
@@ -62,6 +100,63 @@ fn should_evict_closed_daemon_connection(
 ) -> bool {
     let _ = daemon_connection;
     is_connection_lost_message(message)
+}
+
+fn decide_dial_failure_plan(context: &DialFailureContext) -> DialFailurePlan {
+    let should_warn = should_warn_for_connect_failure(
+        context.has_connected_once,
+        context.stale_dial_failure,
+        context.warn_on_startup_stale_failure,
+    );
+    let next_consecutive_stale_dial_failures = if context.stale_dial_failure {
+        context.consecutive_stale_dial_failures + 1
+    } else {
+        0
+    };
+    if context.stale_dial_failure
+        && next_consecutive_stale_dial_failures >= STALE_DIAL_FAILURE_THRESHOLD
+    {
+        DialFailurePlan::ReturnStaleTarget {
+            should_warn,
+            next_consecutive_stale_dial_failures,
+        }
+    } else {
+        DialFailurePlan::Retry {
+            should_warn,
+            next_consecutive_stale_dial_failures,
+        }
+    }
+}
+
+fn decide_session_open_failure_plan(connection_lost: bool) -> SessionOpenFailurePlan {
+    if connection_lost {
+        SessionOpenFailurePlan::EvictAndBreak
+    } else {
+        SessionOpenFailurePlan::Break
+    }
+}
+
+fn decide_session_auth_failure_plan(
+    connection_lost: bool,
+    bootstrap_retry_invite: Option<String>,
+) -> SessionAuthFailurePlan {
+    SessionAuthFailurePlan {
+        next_auth_plan_override: bootstrap_retry_invite
+            .map(|invite_event_id| OutboundSessionAuthPlan::InviteBootstrap { invite_event_id }),
+        evict_live_connection: connection_lost,
+    }
+}
+
+fn decide_session_retry_plan(
+    session_stats: Option<&crate::runtime::SyncStats>,
+) -> SessionRetryPlan {
+    match session_stats {
+        Some(stats) if stats.events_sent == 0 && stats.events_received == 0 => {
+            SessionRetryPlan::Delay(QUIESCENT_SESSION_RETRY_DELAY)
+        }
+        Some(_) => SessionRetryPlan::NoDelay,
+        None => SessionRetryPlan::Delay(Duration::from_millis(250)),
+    }
 }
 
 pub struct ConnectLoopConfig {
@@ -168,34 +263,42 @@ async fn connect_loop_inner(
                 Ok(outcome) => outcome,
                 Err(e) => {
                     let message = describe_connect_failure(&remote_target, &e);
-                    let warn_on_startup_stale_failure =
-                        matches!(auth_plan, OutboundSessionAuthPlan::InviteBootstrap { .. });
-                    if (should_warn_for_connect_failure(has_connected_once, &e)
-                        || warn_on_startup_stale_failure)
+                    let dial_failure_plan = decide_dial_failure_plan(&DialFailureContext {
+                        has_connected_once,
+                        stale_dial_failure: is_stale_dial_failure(&e),
+                        consecutive_stale_dial_failures,
+                        warn_on_startup_stale_failure: matches!(
+                            auth_plan,
+                            OutboundSessionAuthPlan::InviteBootstrap { .. }
+                        ),
+                    });
+                    let (should_warn, next_consecutive_stale_dial_failures, terminal_stale_target) =
+                        match dial_failure_plan {
+                            DialFailurePlan::ReturnStaleTarget {
+                                should_warn,
+                                next_consecutive_stale_dial_failures,
+                            } => (should_warn, next_consecutive_stale_dial_failures, true),
+                            DialFailurePlan::Retry {
+                                should_warn,
+                                next_consecutive_stale_dial_failures,
+                            } => (should_warn, next_consecutive_stale_dial_failures, false),
+                        };
+                    if should_warn
                         && warning_gate.should_emit(message.clone())
                         && should_emit_globally(format!("connect:{message}"))
                     {
                         warn!("{}", message);
                     }
-                    if is_stale_dial_failure(&e) {
-                        consecutive_stale_dial_failures += 1;
-                        if consecutive_stale_dial_failures >= STALE_DIAL_FAILURE_THRESHOLD {
-                            if warning_gate.should_emit(message.clone())
-                                && should_emit_globally(format!("connect:{message}"))
-                            {
-                                warn!("{}", message);
-                            }
-                            return Err(std::io::Error::other(format!(
-                                "{} remote={} failures={} last_error={}",
-                                STALE_DIAL_TARGET_MARKER,
-                                remote_target,
-                                consecutive_stale_dial_failures,
-                                e
-                            ))
-                            .into());
-                        }
-                    } else {
-                        consecutive_stale_dial_failures = 0;
+                    consecutive_stale_dial_failures = next_consecutive_stale_dial_failures;
+                    if terminal_stale_target {
+                        return Err(std::io::Error::other(format!(
+                            "{} remote={} failures={} last_error={}",
+                            STALE_DIAL_TARGET_MARKER,
+                            remote_target,
+                            consecutive_stale_dial_failures,
+                            e
+                        ))
+                        .into());
                     }
                     tokio::select! {
                         _ = shutdown.cancelled() => break,
@@ -255,7 +358,10 @@ async fn connect_loop_inner(
                     if let Some(reason) = extract_build_mismatch_reason(&err.to_string()) {
                         note_build_mismatch(daemon_connection.remote_daemon_peer_id(), reason);
                     }
-                    if should_evict_closed_daemon_connection(&daemon_connection, &err.to_string()) {
+                    let plan = decide_session_open_failure_plan(
+                        should_evict_closed_daemon_connection(&daemon_connection, &err.to_string()),
+                    );
+                    if matches!(plan, SessionOpenFailurePlan::EvictAndBreak) {
                         daemon_connection
                             .connection()
                             .close(0u32.into(), b"outbound session open lost connection");
@@ -287,7 +393,8 @@ async fn connect_loop_inner(
             });
             let bootstrap_retry_invite = match &effective_auth_plan {
                 OutboundSessionAuthPlan::PeerShared { .. }
-                    if !daemon_connection.admits_session_route(recorded_by, remote_session_peer_id) =>
+                    if !daemon_connection
+                        .admits_session_route(recorded_by, remote_session_peer_id) =>
                 {
                     db.as_ref()
                         .and_then(|conn| {
@@ -319,12 +426,12 @@ async fn connect_loop_inner(
                     auth_result
                 }
                 Err(e) => {
-                    if let Some(invite_event_id) = bootstrap_retry_invite {
-                        next_auth_plan_override = Some(OutboundSessionAuthPlan::InviteBootstrap {
-                            invite_event_id,
-                        });
-                    }
-                    if should_evict_closed_daemon_connection(&daemon_connection, &e.to_string()) {
+                    let plan = decide_session_auth_failure_plan(
+                        should_evict_closed_daemon_connection(&daemon_connection, &e.to_string()),
+                        bootstrap_retry_invite,
+                    );
+                    next_auth_plan_override = plan.next_auth_plan_override.clone();
+                    if plan.evict_live_connection {
                         daemon_connection
                             .connection()
                             .close(0u32.into(), b"outbound session auth lost connection");
@@ -408,12 +515,10 @@ async fn connect_loop_inner(
             )
             .await;
 
-            let session_retry_delay = match session_stats {
-                Some(stats) if stats.events_sent == 0 && stats.events_received == 0 => {
-                    QUIESCENT_SESSION_RETRY_DELAY
-                }
-                Some(_) => Duration::ZERO,
-                None => Duration::from_millis(250),
+            let session_retry_plan = decide_session_retry_plan(session_stats.as_ref());
+            let session_retry_delay = match session_retry_plan {
+                SessionRetryPlan::NoDelay => Duration::ZERO,
+                SessionRetryPlan::Delay(delay) => delay,
             };
             if !session_retry_delay.is_zero() {
                 tokio::select! {
@@ -597,9 +702,10 @@ fn is_stale_dial_failure(err: &ConnectionLifecycleError) -> bool {
 
 fn should_warn_for_connect_failure(
     has_connected_once: bool,
-    err: &ConnectionLifecycleError,
+    stale_dial_failure: bool,
+    warn_on_startup_stale_failure: bool,
 ) -> bool {
-    has_connected_once || !is_stale_dial_failure(err)
+    has_connected_once || !stale_dial_failure || warn_on_startup_stale_failure
 }
 
 struct DialOutcome {
@@ -614,4 +720,55 @@ async fn dial_daemon_ongoing_first(
 ) -> Result<DialOutcome, ConnectionLifecycleError> {
     let daemon_connection = dial_daemon_connection_target(endpoint, remote, relay_url, sni).await?;
     Ok(DialOutcome { daemon_connection })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::runtime::SyncStats;
+
+    #[test]
+    fn dial_failure_plan_terminates_after_threshold_stale_failures() {
+        assert_eq!(
+            decide_dial_failure_plan(&DialFailureContext {
+                has_connected_once: false,
+                stale_dial_failure: true,
+                consecutive_stale_dial_failures: STALE_DIAL_FAILURE_THRESHOLD - 1,
+                warn_on_startup_stale_failure: false,
+            }),
+            DialFailurePlan::ReturnStaleTarget {
+                should_warn: false,
+                next_consecutive_stale_dial_failures: STALE_DIAL_FAILURE_THRESHOLD,
+            }
+        );
+    }
+
+    #[test]
+    fn session_auth_failure_plan_preserves_bootstrap_retry_override() {
+        assert_eq!(
+            decide_session_auth_failure_plan(true, Some("invite-1".to_string())),
+            SessionAuthFailurePlan {
+                next_auth_plan_override: Some(OutboundSessionAuthPlan::InviteBootstrap {
+                    invite_event_id: "invite-1".to_string(),
+                }),
+                evict_live_connection: true,
+            }
+        );
+    }
+
+    #[test]
+    fn session_retry_plan_quiescent_sessions_back_off() {
+        let stats = SyncStats {
+            events_sent: 0,
+            events_received: 0,
+            neg_rounds: 0,
+            bytes_sent: 0,
+            bytes_received: 0,
+            duration_ms: 0,
+        };
+        assert_eq!(
+            decide_session_retry_plan(Some(&stats)),
+            SessionRetryPlan::Delay(QUIESCENT_SESSION_RETRY_DELAY)
+        );
+    }
 }
