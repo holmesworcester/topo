@@ -12,9 +12,10 @@ use crate::protocol::neg_id_to_event_id;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::receive_log::ReceiveLogWriter;
 use crate::sync::session::windowing::{SyncWindow, SyncWindowKind};
-use crate::tuning::{sync_dep_send_byte_cap, sync_dep_send_event_cap};
+use crate::tuning::{sync_dep_check_cap, sync_dep_send_byte_cap, sync_dep_send_event_cap};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
+use tracing::warn;
 
 const RANGE_DATA_RECORD_PREFIX_LEN: usize = 4;
 
@@ -28,6 +29,10 @@ pub struct RangeReceiveResult {
 struct SharedDepSendBudget {
     remaining_dep_events: usize,
     remaining_dep_bytes: usize,
+    remaining_dep_checks: usize,
+    dep_event_budget_hit: bool,
+    dep_byte_budget_hit: bool,
+    dep_check_budget_hit: bool,
 }
 
 impl SharedDepSendBudget {
@@ -35,12 +40,21 @@ impl SharedDepSendBudget {
         Self {
             remaining_dep_events: sync_dep_send_event_cap(),
             remaining_dep_bytes: sync_dep_send_byte_cap(),
+            remaining_dep_checks: sync_dep_check_cap(),
+            dep_event_budget_hit: false,
+            dep_byte_budget_hit: false,
+            dep_check_budget_hit: false,
         }
     }
 
     fn try_take_dep(&mut self, summary: SharedEventSummary) -> bool {
         let encoded_size = summary.encoded_size_bytes as usize;
-        if self.remaining_dep_events == 0 || encoded_size > self.remaining_dep_bytes {
+        if self.remaining_dep_events == 0 {
+            self.dep_event_budget_hit = true;
+            return false;
+        }
+        if encoded_size > self.remaining_dep_bytes {
+            self.dep_byte_budget_hit = true;
             return false;
         }
         self.remaining_dep_events -= 1;
@@ -48,11 +62,39 @@ impl SharedDepSendBudget {
         true
     }
 
+    fn remaining_dep_checks(&self) -> usize {
+        self.remaining_dep_checks
+    }
+
+    fn take_dep_checks(&mut self, count: usize) {
+        let taken = count.min(self.remaining_dep_checks);
+        self.remaining_dep_checks -= taken;
+        if taken < count {
+            self.dep_check_budget_hit = true;
+        }
+    }
+
+    fn note_dep_check_budget_hit(&mut self) {
+        self.dep_check_budget_hit = true;
+    }
+
+    fn any_budget_hit(&self) -> bool {
+        self.dep_event_budget_hit || self.dep_byte_budget_hit || self.dep_check_budget_hit
+    }
+
     #[cfg(test)]
-    fn new_for_tests(remaining_dep_events: usize, remaining_dep_bytes: usize) -> Self {
+    fn new_for_tests(
+        remaining_dep_events: usize,
+        remaining_dep_bytes: usize,
+        remaining_dep_checks: usize,
+    ) -> Self {
         Self {
             remaining_dep_events,
             remaining_dep_bytes,
+            remaining_dep_checks,
+            dep_event_budget_hit: false,
+            dep_byte_budget_hit: false,
+            dep_check_budget_hit: false,
         }
     }
 }
@@ -61,6 +103,13 @@ impl SharedDepSendBudget {
 enum SharedSendOrderPolicy {
     PreserveInput,
     NewestFirst,
+}
+
+fn should_expand_shared_deps(kind: SyncWindowKind) -> bool {
+    matches!(
+        kind,
+        SyncWindowKind::LastDay | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks
+    )
 }
 
 fn decide_shared_send_order_policy(kind: SyncWindowKind) -> SharedSendOrderPolicy {
@@ -232,7 +281,11 @@ fn load_associated_shared_key_event_ids(
     recorded_by: &str,
     store: &Store<'_>,
     event_id: &EventId,
+    limit: usize,
 ) -> Result<Vec<EventId>, String> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let Some(key_event_id) = encrypted_wrapper_key_event_id(store, event_id)? else {
         return Ok(Vec::new());
     };
@@ -244,12 +297,17 @@ fn load_associated_shared_key_event_ids(
              WHERE ks.recorded_by = ?1
                AND ks.key_event_id = ?2
                AND e.share_scope = 'shared'
-             ORDER BY e.created_at, ks.event_id",
+             ORDER BY e.created_at, ks.event_id
+             LIMIT ?3",
         )
         .map_err(|e| format!("prepare associated key_shared query: {e}"))?;
     let rows = stmt
         .query_map(
-            rusqlite::params![recorded_by, crate::crypto::event_id_to_base64(&key_event_id)],
+            rusqlite::params![
+                recorded_by,
+                crate::crypto::event_id_to_base64(&key_event_id),
+                limit as i64
+            ],
             |row| row.get::<_, String>(0),
         )
         .map_err(|e| format!("query associated key_shared rows: {e}"))?;
@@ -271,21 +329,39 @@ fn load_ordered_shared_dep_ids(
     event_id: &EventId,
     dep_cache: &mut HashMap<EventId, Vec<EventId>>,
     summary_cache: &mut HashMap<EventId, Option<SharedEventSummary>>,
+    budget: &mut SharedDepSendBudget,
 ) -> Result<Vec<EventId>, String> {
     if let Some(dep_ids) = dep_cache.get(event_id) {
         return Ok(dep_ids.clone());
     }
 
-    let mut dep_ids = crate::db::dep_index::list_shared_event_deps(conn, workspace_id, event_id)
-        .map_err(|e| format!("load shared event deps: {e}"))?;
-    dep_ids.extend(load_associated_shared_key_event_ids(
+    let dep_limit = budget.remaining_dep_checks();
+    if dep_limit == 0 {
+        budget.note_dep_check_budget_hit();
+        dep_cache.insert(*event_id, Vec::new());
+        return Ok(Vec::new());
+    }
+
+    let mut dep_ids = load_associated_shared_key_event_ids(
         conn,
         recorded_by,
         store,
         event_id,
-    )?);
+        dep_limit,
+    )?;
+    let direct_limit = dep_limit.saturating_sub(dep_ids.len());
+    dep_ids.extend(
+        crate::db::dep_index::list_shared_event_deps_limited(
+            conn,
+            workspace_id,
+            event_id,
+            direct_limit,
+        )
+        .map_err(|e| format!("load shared event deps: {e}"))?,
+    );
     dep_ids.sort_unstable();
     dep_ids.dedup();
+    budget.take_dep_checks(dep_ids.len());
     dep_ids.retain(|dep_id| {
         matches!(
             load_shared_summary_cached(store, dep_id, summary_cache),
@@ -339,6 +415,7 @@ fn visit_send_closure(
         &event_id,
         dep_cache,
         summary_cache,
+        budget,
     )? {
         if emitted.contains(&dep_id) || visiting.contains(&dep_id) {
             continue;
@@ -406,6 +483,9 @@ fn expand_requested_ids_with_shared_deps_and_budget(
     }
 
     let ordered_roots = prioritize_send_order(store, range, requested_ids)?;
+    if !should_expand_shared_deps(range.kind) {
+        return Ok(ordered_roots);
+    }
     let root_ids: HashSet<EventId> = ordered_roots.iter().copied().collect();
     let mut ordered = Vec::new();
     let mut emitted = HashSet::new();
@@ -414,6 +494,13 @@ fn expand_requested_ids_with_shared_deps_and_budget(
     let mut summary_cache = HashMap::new();
 
     for event_id in ordered_roots {
+        if budget.remaining_dep_checks() == 0 {
+            budget.note_dep_check_budget_hit();
+            if emitted.insert(event_id) {
+                ordered.push(event_id);
+            }
+            continue;
+        }
         visit_send_closure(
             conn,
             store,
@@ -428,6 +515,16 @@ fn expand_requested_ids_with_shared_deps_and_budget(
             &mut summary_cache,
             &mut budget,
         )?;
+    }
+    if budget.any_budget_hit() {
+        warn!(
+            ?range.kind,
+            requested_roots = requested_ids.len(),
+            dep_check_budget_hit = budget.dep_check_budget_hit,
+            dep_event_budget_hit = budget.dep_event_budget_hit,
+            dep_byte_budget_hit = budget.dep_byte_budget_hit,
+            "shared dep expansion hit budget"
+        );
     }
     Ok(ordered)
 }
@@ -838,6 +935,68 @@ mod tests {
     }
 
     #[test]
+    fn full_window_does_not_expand_shared_deps() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let recorded_by = "tenant-a";
+        let workspace_id = "workspace-full-no-deps";
+
+        let root = insert_shared_bench_dep(&conn, workspace_id, 1, vec![], 1);
+        let mid = insert_shared_bench_dep(&conn, workspace_id, 2, vec![root], 2);
+        let leaf = insert_shared_bench_dep(&conn, workspace_id, 3, vec![mid], 3);
+        replace_shared_event_deps(&conn, workspace_id, &mid, &[root]).unwrap();
+        replace_shared_event_deps(&conn, workspace_id, &leaf, &[mid]).unwrap();
+
+        let store = Store::new(&conn);
+        let ordered = expand_requested_ids_with_shared_deps(
+            &conn,
+            &store,
+            recorded_by,
+            workspace_id,
+            SyncWindow {
+                kind: SyncWindowKind::Full,
+                ts_min_inclusive_ms: Some(0),
+                ts_max_exclusive_ms: Some(10_000),
+            },
+            &[leaf],
+        )
+        .unwrap();
+
+        assert_eq!(ordered, vec![leaf]);
+    }
+
+    #[test]
+    fn last_twelve_weeks_window_expands_shared_deps() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let recorded_by = "tenant-a";
+        let workspace_id = "workspace-last12-expands";
+
+        let root = insert_shared_bench_dep(&conn, workspace_id, 1, vec![], 1);
+        let mid = insert_shared_bench_dep(&conn, workspace_id, 2, vec![root], 2);
+        let leaf = insert_shared_bench_dep(&conn, workspace_id, 3, vec![mid], 3);
+        replace_shared_event_deps(&conn, workspace_id, &mid, &[root]).unwrap();
+        replace_shared_event_deps(&conn, workspace_id, &leaf, &[mid]).unwrap();
+
+        let store = Store::new(&conn);
+        let ordered = expand_requested_ids_with_shared_deps(
+            &conn,
+            &store,
+            recorded_by,
+            workspace_id,
+            SyncWindow {
+                kind: SyncWindowKind::LastTwelveWeeks,
+                ts_min_inclusive_ms: Some(0),
+                ts_max_exclusive_ms: Some(10_000),
+            },
+            &[leaf],
+        )
+        .unwrap();
+
+        assert_eq!(ordered, vec![root, mid, leaf]);
+    }
+
+    #[test]
     fn expand_requested_ids_respects_dep_send_event_cap() {
         let conn = open_in_memory().unwrap();
         create_tables(&conn).unwrap();
@@ -864,11 +1023,43 @@ mod tests {
                 ts_max_exclusive_ms: None,
             },
             &[leaf],
-            SharedDepSendBudget::new_for_tests(2, 1024 * 1024),
+            SharedDepSendBudget::new_for_tests(2, 1024 * 1024, 32),
         )
         .unwrap();
 
         assert_eq!(ordered, vec![dep_2, dep_3, leaf]);
+    }
+
+    #[test]
+    fn expand_requested_ids_respects_dep_check_cap() {
+        let conn = open_in_memory().unwrap();
+        create_tables(&conn).unwrap();
+        let recorded_by = "tenant-a";
+        let workspace_id = "workspace-dep-check-cap";
+
+        let root = insert_shared_bench_dep(&conn, workspace_id, 1, vec![], 1);
+        let mid = insert_shared_bench_dep(&conn, workspace_id, 2, vec![root], 2);
+        let leaf = insert_shared_bench_dep(&conn, workspace_id, 3, vec![mid], 3);
+        replace_shared_event_deps(&conn, workspace_id, &mid, &[root]).unwrap();
+        replace_shared_event_deps(&conn, workspace_id, &leaf, &[mid]).unwrap();
+
+        let store = Store::new(&conn);
+        let ordered = expand_requested_ids_with_shared_deps_and_budget(
+            &conn,
+            &store,
+            recorded_by,
+            workspace_id,
+            SyncWindow {
+                kind: SyncWindowKind::LastTwelveWeeks,
+                ts_min_inclusive_ms: Some(0),
+                ts_max_exclusive_ms: Some(10_000),
+            },
+            &[leaf],
+            SharedDepSendBudget::new_for_tests(32, 1024 * 1024, 1),
+        )
+        .unwrap();
+
+        assert_eq!(ordered, vec![mid, leaf]);
     }
 
     #[test]

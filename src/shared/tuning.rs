@@ -109,6 +109,17 @@ pub fn sync_dep_send_byte_cap() -> usize {
     }
 }
 
+pub fn sync_dep_check_cap() -> usize {
+    if let Some(v) = read_usize_env("TOPO_SYNC_DEP_CHECK_CAP") {
+        return v;
+    }
+    if low_mem_mode() {
+        512
+    } else {
+        8192
+    }
+}
+
 // -- Sync sessions --
 pub fn session_ingest_cap() -> usize {
     if low_mem_mode() {

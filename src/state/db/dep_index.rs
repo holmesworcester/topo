@@ -54,15 +54,28 @@ pub fn list_shared_event_deps(
     workspace_id: &str,
     event_id: &EventId,
 ) -> SqliteResult<Vec<EventId>> {
+    list_shared_event_deps_limited(conn, workspace_id, event_id, usize::MAX)
+}
+
+pub fn list_shared_event_deps_limited(
+    conn: &Connection,
+    workspace_id: &str,
+    event_id: &EventId,
+    limit: usize,
+) -> SqliteResult<Vec<EventId>> {
+    if limit == 0 {
+        return Ok(Vec::new());
+    }
     let event_id_b64 = event_id_to_base64(event_id);
     let mut stmt = conn.prepare(
         "SELECT dep_event_id
          FROM shared_event_deps
          WHERE workspace_id = ?1
            AND event_id = ?2
-         ORDER BY dep_event_id",
+         ORDER BY dep_event_id
+         LIMIT ?3",
     )?;
-    let rows = stmt.query_map(params![workspace_id, event_id_b64], |row| {
+    let rows = stmt.query_map(params![workspace_id, event_id_b64, limit as i64], |row| {
         row.get::<_, String>(0)
     })?;
     let mut dep_ids = Vec::new();
