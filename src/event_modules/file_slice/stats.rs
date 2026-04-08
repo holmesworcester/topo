@@ -28,7 +28,10 @@ pub fn file_slice_event_counts_by_source(
         .expect("failed to prepare file_slice_event_counts_by_source");
     let rows = stmt
         .query_map(rusqlite::params![recorded_by], |row: &rusqlite::Row<'_>| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            Ok((
+                crate::db::sql_types::get_text(row, 0)?,
+                crate::db::sql_types::get_blob(row, 1)?,
+            ))
         })
         .expect("failed to query file_slice_event_counts_by_source");
 
@@ -52,7 +55,7 @@ pub fn file_slice_event_count(conn: &Connection, recorded_by: &str) -> i64 {
         )
         .expect("failed to prepare file_slice_event_count");
     stmt.query_map(rusqlite::params![recorded_by], |row: &rusqlite::Row<'_>| {
-        row.get::<_, Vec<u8>>(0)
+        crate::db::sql_types::get_blob(row, 0)
     })
     .expect("failed to query file_slice_event_count")
     .filter_map(Result::ok)

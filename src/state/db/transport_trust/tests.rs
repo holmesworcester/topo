@@ -467,7 +467,12 @@ fn test_invite_bootstrap_trust_insert_idempotent() {
             "SELECT bootstrap_addr, workspace_id FROM invite_bootstrap_trust
              WHERE recorded_by = ?1 AND invite_accepted_event_id = ?2",
             rusqlite::params![recorded_by, "ia1"],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok((
+                    crate::db::sql_types::get_text(row, 0)?,
+                    crate::db::sql_types::get_text(row, 1)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(addr, "127.0.0.1:4433", "original value preserved");
@@ -533,7 +538,7 @@ fn test_pending_invite_bootstrap_trust_insert_idempotent() {
             "SELECT workspace_id FROM pending_invite_bootstrap_trust
              WHERE recorded_by = ?1 AND invite_event_id = ?2",
             rusqlite::params![recorded_by, "invite1"],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .unwrap();
     assert_eq!(ws, "workspace1", "original value preserved");
@@ -544,7 +549,7 @@ fn test_pending_invite_bootstrap_trust_insert_idempotent() {
             "SELECT expected_bootstrap_spki_fingerprint FROM pending_invite_bootstrap_trust
              WHERE recorded_by = ?1 AND invite_event_id = ?2",
             rusqlite::params![recorded_by, "invite1"],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_blob(row, 0),
         )
         .unwrap();
     assert_eq!(fp_blob, spki.to_vec(), "original SPKI preserved");

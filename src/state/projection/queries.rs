@@ -288,7 +288,7 @@ fn load_valid_semantic_type_code(
                 .query_row(
                     "SELECT blob FROM events WHERE event_id = ?1",
                     rusqlite::params![dep_b64],
-                    |row| row.get(0),
+                    |row| crate::db::sql_types::get_blob(row, 0),
                 )
                 .optional()?;
             let Some(blob) = blob else {
@@ -393,7 +393,7 @@ fn signer_user_mismatch_reason(
     let peer_user_eid: String = match conn.query_row(
         "SELECT COALESCE(user_event_id, '') FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
         rusqlite::params![recorded_by, &signed_by_b64],
-        |row| row.get::<_, String>(0),
+        |row| crate::db::sql_types::get_text(row, 0),
     ) {
         Ok(v) => v,
         Err(rusqlite::Error::QueryReturnedNoRows) => {
@@ -442,7 +442,7 @@ fn deletion_signer_context(
             let peer_user_eid: String = match conn.query_row(
                 "SELECT COALESCE(user_event_id, '') FROM peers_shared WHERE recorded_by = ?1 AND event_id = ?2",
                 rusqlite::params![recorded_by, &signed_by_b64],
-                |row| row.get::<_, String>(0),
+                |row| crate::db::sql_types::get_text(row, 0),
             ) {
                 Ok(v) => v,
                 Err(rusqlite::Error::QueryReturnedNoRows) => {
@@ -633,7 +633,7 @@ impl ProjectionQueries for Connection {
             .query_row(
                 "SELECT key_bytes FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
                 rusqlite::params![recorded_by, key_b64],
-                |row| row.get(0),
+                |row| crate::db::sql_types::get_blob(row, 0),
             )
             .optional()?;
         let Some(key_bytes) = key_bytes else {
@@ -661,7 +661,7 @@ impl ProjectionQueries for Connection {
              ORDER BY created_at ASC, event_id ASC
              LIMIT 1",
             rusqlite::params![recorded_by],
-            |row| row.get::<_, String>(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         ) {
             Ok(v) => Some(v),
             Err(rusqlite::Error::QueryReturnedNoRows) => None,
@@ -708,7 +708,7 @@ impl ProjectionQueries for Connection {
             .query_row(
                 "SELECT public_key FROM users WHERE recorded_by = ?1 AND event_id = ?2",
                 rusqlite::params![recorded_by, &user_event_id_b64],
-                |row| row.get(0),
+                |row| crate::db::sql_types::get_blob(row, 0),
             )
             .optional()?;
 
@@ -856,7 +856,7 @@ impl ProjectionQueries for Connection {
         ctx.is_local_create = match self.query_row(
             "SELECT source FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, event_id_b64],
-            |row| row.get::<_, String>(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         ) {
             Ok(source) => source == "local" || source == "local_create",
             Err(_) => false,
@@ -903,7 +903,7 @@ impl ProjectionQueries for Connection {
         ctx.is_local_create = match self.query_row(
             "SELECT source FROM recorded_events WHERE peer_id = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, event_id_b64],
-            |row| row.get::<_, String>(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         ) {
             Ok(source) => source == "local" || source == "local_create",
             Err(_) => false,
@@ -952,8 +952,8 @@ impl ProjectionQueries for Connection {
         let deletion_intents = stmt
             .query_map(rusqlite::params![recorded_by, event_id_b64], |row| {
                 Ok(DeletionIntentInfo {
-                    deletion_event_id: row.get(0)?,
-                    author_id: row.get(1)?,
+                    deletion_event_id: crate::db::sql_types::get_text(row, 0)?,
+                    author_id: crate::db::sql_types::get_text(row, 1)?,
                     authorized_by_admin: row.get::<_, i64>(2)? != 0,
                     created_at: row.get(3)?,
                 })
@@ -986,7 +986,7 @@ impl ProjectionQueries for Connection {
             .query_row(
                 "SELECT author_id FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
                 rusqlite::params![recorded_by, &target_b64],
-                |row| row.get::<_, String>(0),
+                |row| crate::db::sql_types::get_text(row, 0),
             )
             .optional()?;
 
@@ -994,7 +994,7 @@ impl ProjectionQueries for Connection {
             .query_row(
                 "SELECT author_id FROM messages WHERE recorded_by = ?1 AND message_id = ?2",
                 rusqlite::params![recorded_by, &target_b64],
-                |row| row.get::<_, String>(0),
+                |row| crate::db::sql_types::get_text(row, 0),
             )
             .optional()?;
 
@@ -1066,16 +1066,16 @@ impl ProjectionQueries for Connection {
         )?;
         ctx.file_descriptors = desc_stmt
             .query_map(rusqlite::params![recorded_by, &file_id_b64], |row| {
-                let root_hash_blob: Vec<u8> = row.get(4)?;
+                let root_hash_blob = crate::db::sql_types::get_blob(row, 4)?;
                 let mut root_hash = [0u8; 32];
                 if root_hash_blob.len() == 32 {
                     root_hash.copy_from_slice(&root_hash_blob);
                 }
                 Ok(FileDescriptorInfo {
-                    event_id: row.get::<_, String>(0)?,
-                    message_id: row.get::<_, String>(1)?,
-                    signer_event_id: row.get::<_, String>(2)?,
-                    key_event_id: row.get::<_, String>(3)?,
+                    event_id: crate::db::sql_types::get_text(row, 0)?,
+                    message_id: crate::db::sql_types::get_text(row, 1)?,
+                    signer_event_id: crate::db::sql_types::get_text(row, 2)?,
+                    key_event_id: crate::db::sql_types::get_text(row, 3)?,
                     root_hash,
                     blob_bytes: row.get::<_, i64>(5)? as u64,
                     slice_bytes: row.get::<_, i64>(6)? as u32,
@@ -1104,7 +1104,12 @@ impl ProjectionQueries for Connection {
              FROM file_slices
              WHERE recorded_by = ?1 AND file_id = ?2 AND slice_number = ?3",
             rusqlite::params![recorded_by, &file_id_b64, file_slice.slice_number as i64],
-            |row| Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)),
+            |row| {
+                Ok((
+                    crate::db::sql_types::get_text(row, 0)?,
+                    crate::db::sql_types::get_text(row, 1)?,
+                ))
+            },
         ) {
             Ok(v) => Some(v),
             Err(rusqlite::Error::QueryReturnedNoRows) => None,
@@ -1182,7 +1187,7 @@ impl ProjectionQueries for Connection {
                    AND invite_event_id = ?3
                  LIMIT 1",
                 rusqlite::params![recorded_by, &unwrap_key_b64, &recipient_b64],
-                |row| row.get(0),
+                |row| crate::db::sql_types::get_blob(row, 0),
             )
             .optional()?;
 

@@ -231,7 +231,7 @@ fn resolve_assert_recorded_by(
         let mut stmt =
             db.prepare("SELECT DISTINCT recorded_by FROM invites_accepted ORDER BY recorded_by")?;
         let peers = stmt
-            .query_map([], |row| row.get::<_, String>(0))?
+            .query_map([], |row| crate::db::sql_types::get_text(row, 0))?
             .collect::<Result<Vec<_>, _>>()?;
         peers
     };

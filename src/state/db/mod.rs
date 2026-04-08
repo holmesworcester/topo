@@ -8,6 +8,7 @@ pub mod need_queue;
 pub mod project_queue;
 pub mod queue;
 pub mod schema;
+pub mod sql_types;
 pub mod store;
 pub mod sync_log;
 pub mod timeline;
@@ -124,13 +125,14 @@ pub fn ensure_infra_schema(conn: &Connection) -> SqliteResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::sql_types::get_text;
     use super::*;
 
     #[test]
     fn test_open_in_memory() {
         let conn = open_in_memory().unwrap();
         let journal_mode: String = conn
-            .query_row("PRAGMA journal_mode", [], |row| row.get(0))
+            .query_row("PRAGMA journal_mode", [], |row| get_text(row, 0))
             .unwrap();
         // In-memory databases may report "memory" instead of "wal"
         assert!(journal_mode == "wal" || journal_mode == "memory");

@@ -28,8 +28,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 mod cascade;
 mod core_projection;
-mod dep_sync;
 mod deletion;
+mod dep_sync;
 mod encryption;
 mod file_slice;
 mod identity;
@@ -264,7 +264,7 @@ pub(super) fn setup_tenant_event(conn: &Connection, recorded_by: &str) -> EventI
         .query_row(
             "SELECT event_id FROM tenants WHERE recorded_by = ?1 ORDER BY created_at ASC, event_id ASC LIMIT 1",
             rusqlite::params![recorded_by],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .ok();
     if let Some(eid_b64) = existing {

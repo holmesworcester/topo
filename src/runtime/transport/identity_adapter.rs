@@ -49,7 +49,7 @@ impl TransportIdentityMaterializer for ConcreteTransportIdentityMaterializer {
                          ORDER BY created_at DESC, event_id DESC
                          LIMIT 1",
                         rusqlite::params![recorded_by, invite_eid_b64],
-                        |row| row.get(0),
+                        |row| crate::db::sql_types::get_opt_blob(row, 0),
                     )
                     .optional()
                     .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))?
@@ -83,7 +83,7 @@ impl TransportIdentityMaterializer for ConcreteTransportIdentityMaterializer {
                          ORDER BY created_at DESC, event_id DESC
                          LIMIT 1",
                         rusqlite::params![recorded_by, signer_eid_b64],
-                        |row| row.get(0),
+                        |row| crate::db::sql_types::get_opt_blob(row, 0),
                     )
                     .optional()
                     .map_err(|e| TransportIdentityError::InstallFailed(e.to_string()))?
@@ -157,7 +157,7 @@ mod tests {
             .query_row(
                 "SELECT source FROM local_transport_creds LIMIT 1",
                 [],
-                |row| row.get(0),
+                |row| crate::db::sql_types::get_text(row, 0),
             )
             .unwrap();
         assert_eq!(source, "bootstrap");

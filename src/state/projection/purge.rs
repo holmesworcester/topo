@@ -95,7 +95,7 @@ fn collect_projection_dependents(
              WHERE recorded_by = ?1 AND target_event_id = ?2",
         )?;
         let rows = stmt.query_map(params![recorded_by, root_message_event_id], |row| {
-            row.get::<_, String>(0)
+            crate::db::sql_types::get_text(row, 0)
         })?;
         for event_id in rows {
             changed |= manifest.add_event_id(event_id?);
@@ -109,7 +109,10 @@ fn collect_projection_dependents(
              WHERE recorded_by = ?1 AND message_id = ?2",
         )?;
         let rows = stmt.query_map(params![recorded_by, root_message_event_id], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?))
+            Ok((
+                crate::db::sql_types::get_text(row, 0)?,
+                crate::db::sql_types::get_text(row, 1)?,
+            ))
         })?;
         for row in rows {
             let (event_id, file_id) = row?;
@@ -125,7 +128,7 @@ fn collect_projection_dependents(
              WHERE recorded_by = ?1 AND file_id = ?2",
         )?;
         let rows = stmt.query_map(params![recorded_by, &file_id], |row| {
-            row.get::<_, String>(0)
+            crate::db::sql_types::get_text(row, 0)
         })?;
         for row in rows {
             changed |= manifest.add_event_id(row?);
@@ -139,7 +142,7 @@ fn collect_projection_dependents(
              WHERE peer_id = ?1 AND blocker_event_id = ?2",
         )?;
         let rows = stmt.query_map(params![recorded_by, &file_id], |row| {
-            row.get::<_, String>(0)
+            crate::db::sql_types::get_text(row, 0)
         })?;
         for row in rows {
             changed |= manifest.add_event_id(row?);
@@ -164,7 +167,7 @@ fn collect_recorded_dependents(
     )?;
     let rows = stmt.query_map(
         params![recorded_by, root_message_event_bytes.as_slice()],
-        |row| row.get::<_, String>(0),
+        |row| crate::db::sql_types::get_text(row, 0),
     )?;
 
     for row in rows {
@@ -187,7 +190,7 @@ fn collect_blocked_dependents(
              WHERE peer_id = ?1 AND blocker_event_id = ?2",
         )?;
         let rows = stmt.query_map(params![recorded_by, &blocker_event_id], |row| {
-            row.get::<_, String>(0)
+            crate::db::sql_types::get_text(row, 0)
         })?;
         for row in rows {
             changed |= manifest.add_event_id(row?);
@@ -232,7 +235,7 @@ fn delete_subscription_feed_rows(
              WHERE recorded_by = ?1 AND event_id = ?2",
         )?;
         let rows = stmt.query_map(params![recorded_by, event_id], |row| {
-            row.get::<_, String>(0)
+            crate::db::sql_types::get_text(row, 0)
         })?;
         for row in rows {
             affected_subscriptions.insert(row?);

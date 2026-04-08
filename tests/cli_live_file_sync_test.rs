@@ -169,7 +169,10 @@ fn test_cli_live_message_during_large_file_sync() {
             .expect("prepare raw file-slice scan");
         let slice_rows = slice_stmt
             .query_map(rusqlite::params![&bob_recorded_by], |row| {
-                Ok((row.get::<_, i64>(0)?, row.get::<_, Vec<u8>>(1)?))
+                Ok((
+                    row.get::<_, i64>(0)?,
+                    topo::db::sql_types::get_blob(row, 1)?,
+                ))
             })
             .expect("query raw file-slice scan");
         let mut last_file_slice_recorded_rowid = None;

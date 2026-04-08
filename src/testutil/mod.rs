@@ -158,9 +158,9 @@ async fn wait_for_materialized_local_peer_signer(
                 .and_then(|mut stmt| {
                     stmt.query_map(rusqlite::params![scoped_peer_id], |row| {
                         Ok((
-                            row.get::<_, String>(0)?,
-                            row.get::<_, String>(1)?,
-                            row.get::<_, String>(2)?,
+                            crate::db::sql_types::get_text(row, 0)?,
+                            crate::db::sql_types::get_text(row, 1)?,
+                            crate::db::sql_types::get_text(row, 2)?,
                         ))
                     })?
                     .collect::<Result<Vec<_>, _>>()
@@ -321,8 +321,10 @@ fn list_shared_event_ids_for_tenant(db: &rusqlite::Connection, tenant_id: &str) 
          ORDER BY e.created_at ASC, re.event_id ASC",
     )
     .and_then(|mut stmt| {
-        stmt.query_map(rusqlite::params![tenant_id], |row| row.get::<_, String>(0))?
-            .collect::<Result<Vec<_>, _>>()
+        stmt.query_map(rusqlite::params![tenant_id], |row| {
+            crate::db::sql_types::get_text(row, 0)
+        })?
+        .collect::<Result<Vec<_>, _>>()
     })
     .expect("failed to list shared events")
     .into_iter()
@@ -682,7 +684,7 @@ impl Peer {
                  ORDER BY event_id ASC
                  LIMIT 1",
                 rusqlite::params![&creator.identity],
-                |row| row.get::<_, String>(0),
+                |row| crate::db::sql_types::get_text(row, 0),
             )
             .ok()
             .and_then(|b64| event_id_from_base64(&b64))
@@ -745,7 +747,7 @@ impl Peer {
             .query_row(
                 "SELECT blob FROM events WHERE event_id = ?1",
                 rusqlite::params![&creator_peer_b64],
-                |row| row.get(0),
+                |row| crate::db::sql_types::get_blob(row, 0),
             )
             .expect("failed to load creator peer_shared blob");
         let creator_device_invite_eid =
@@ -756,7 +758,7 @@ impl Peer {
             .query_row(
                 "SELECT blob FROM events WHERE event_id = ?1",
                 rusqlite::params![&creator_user_b64],
-                |row| row.get(0),
+                |row| crate::db::sql_types::get_blob(row, 0),
             )
             .expect("failed to load creator user blob");
         let creator_user_invite_eid =
@@ -996,7 +998,7 @@ impl Peer {
             .query_row(
                 "SELECT blob FROM events WHERE event_id = ?1",
                 rusqlite::params![&creator_peer_b64],
-                |row| row.get(0),
+                |row| crate::db::sql_types::get_blob(row, 0),
             )
             .expect("failed to load creator peer_shared blob");
         let creator_device_invite_eid =
@@ -1007,7 +1009,7 @@ impl Peer {
             .query_row(
                 "SELECT blob FROM events WHERE event_id = ?1",
                 rusqlite::params![&creator_user_b64],
-                |row| row.get(0),
+                |row| crate::db::sql_types::get_blob(row, 0),
             )
             .expect("failed to load creator user blob");
         let creator_user_invite_eid =
@@ -1438,7 +1440,7 @@ impl Peer {
             .query_row(
                 "SELECT event_id FROM tenants WHERE recorded_by = ?1 ORDER BY created_at ASC, event_id ASC LIMIT 1",
                 rusqlite::params![&self.identity],
-                |row| row.get(0),
+                |row| crate::db::sql_types::get_text(row, 0),
             )
             .ok();
         if let Some(eid_b64) = existing {
@@ -1772,7 +1774,7 @@ impl Peer {
                 .query_row(
                     "SELECT key_bytes FROM key_secrets WHERE recorded_by = ?1 AND event_id = ?2",
                     rusqlite::params![&self.identity, event_id_to_base64(&key_event_id)],
-                    |row| row.get(0),
+                    |row| crate::db::sql_types::get_blob(row, 0),
                 )
                 .expect("failed to load content key bytes");
             let mut key_arr = [0u8; 32];
@@ -1911,7 +1913,7 @@ impl Peer {
             Err(_) => return 0,
         };
         let rows = match stmt.query_map(rusqlite::params![&self.identity], |row| {
-            row.get::<_, Vec<u8>>(0)
+            crate::db::sql_types::get_blob(row, 0)
         }) {
             Ok(rows) => rows,
             Err(_) => return 0,
@@ -2021,7 +2023,7 @@ impl Peer {
             .expect("prepare source histogram query");
 
         stmt.query_map(rusqlite::params![&self.identity, event_type, like], |row| {
-            let source: String = row.get(0)?;
+            let source = crate::db::sql_types::get_text(row, 0)?;
             let count: i64 = row.get(1)?;
             Ok((source, count))
         })
@@ -2045,7 +2047,7 @@ impl Peer {
             return stmt
                 .query_map(
                     rusqlite::params![&self.identity, i64::from(meta.type_code)],
-                    |row| row.get::<_, String>(0),
+                    |row| crate::db::sql_types::get_text(row, 0),
                 )
                 .expect("query")
                 .collect::<Result<std::collections::BTreeSet<_>, _>>()
@@ -2055,10 +2057,12 @@ impl Peer {
         let mut stmt = db
             .prepare("SELECT event_id FROM events WHERE event_type = ?1 ORDER BY event_id")
             .expect("prepare");
-        stmt.query_map(rusqlite::params![event_type], |row| row.get::<_, String>(0))
-            .expect("query")
-            .collect::<Result<std::collections::BTreeSet<_>, _>>()
-            .expect("collect")
+        stmt.query_map(rusqlite::params![event_type], |row| {
+            crate::db::sql_types::get_text(row, 0)
+        })
+        .expect("query")
+        .collect::<Result<std::collections::BTreeSet<_>, _>>()
+        .expect("collect")
     }
 
     /// Return recorded message event IDs using the encrypted wrapper's
@@ -2075,7 +2079,10 @@ impl Peer {
             )
             .expect("prepare");
         stmt.query_map(rusqlite::params![&self.identity], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+            Ok((
+                crate::db::sql_types::get_text(row, 0)?,
+                crate::db::sql_types::get_blob(row, 1)?,
+            ))
         })
         .expect("query")
         .filter_map(Result::ok)
@@ -2173,7 +2180,7 @@ impl Peer {
             .prepare("SELECT event_id FROM events ORDER BY RANDOM() LIMIT ?1")
             .expect("prepare");
         stmt.query_map(rusqlite::params![count as i64], |row| {
-            row.get::<_, String>(0)
+            crate::db::sql_types::get_text(row, 0)
         })
         .expect("query")
         .collect::<Result<Vec<_>, _>>()
@@ -2193,7 +2200,7 @@ impl Peer {
             )
             .expect("prepare");
         stmt.query_map(rusqlite::params![count as i64], |row| {
-            row.get::<_, String>(0)
+            crate::db::sql_types::get_text(row, 0)
         })
         .expect("query")
         .collect::<Result<Vec<_>, _>>()
@@ -2635,7 +2642,7 @@ fn replay_and_fingerprint(
     let mut stmt = db.prepare(&query).expect("failed to prepare events query");
     let event_ids: Vec<String> = stmt
         .query_map(rusqlite::params![recorded_by], |row| {
-            row.get::<_, String>(0)
+            crate::db::sql_types::get_text(row, 0)
         })
         .expect("failed to query events")
         .collect::<Result<Vec<_>, _>>()
@@ -2664,7 +2671,7 @@ fn replay_no_clear_and_fingerprint(
     let mut stmt = db.prepare(query).expect("failed to prepare events query");
     let event_ids: Vec<String> = stmt
         .query_map(rusqlite::params![recorded_by], |row| {
-            row.get::<_, String>(0)
+            crate::db::sql_types::get_text(row, 0)
         })
         .expect("failed to query events")
         .collect::<Result<Vec<_>, _>>()
@@ -2696,7 +2703,7 @@ fn replay_shuffled_and_fingerprint(
     let mut stmt = db.prepare(query).expect("failed to prepare events query");
     let mut event_ids: Vec<String> = stmt
         .query_map(rusqlite::params![recorded_by], |row| {
-            row.get::<_, String>(0)
+            crate::db::sql_types::get_text(row, 0)
         })
         .expect("failed to query events")
         .collect::<Result<Vec<_>, _>>()
@@ -3528,7 +3535,7 @@ impl SharedDbNode {
                  ORDER BY event_id ASC
                  LIMIT 1",
                 rusqlite::params![&creator_identity],
-                |row| row.get::<_, String>(0),
+                |row| crate::db::sql_types::get_text(row, 0),
             )
             .ok()
             .and_then(|b64| event_id_from_base64(&b64))
@@ -3559,7 +3566,7 @@ impl SharedDbNode {
             .query_row(
                 "SELECT blob FROM events WHERE event_id = ?1",
                 rusqlite::params![&creator_peer_b64],
-                |row| row.get(0),
+                |row| crate::db::sql_types::get_blob(row, 0),
             )
             .expect("failed to load creator peer_shared blob");
         let creator_device_invite_eid =
@@ -3570,7 +3577,7 @@ impl SharedDbNode {
             .query_row(
                 "SELECT blob FROM events WHERE event_id = ?1",
                 rusqlite::params![&creator_user_b64],
-                |row| row.get(0),
+                |row| crate::db::sql_types::get_blob(row, 0),
             )
             .expect("failed to load creator user blob");
         let creator_user_invite_eid =
@@ -3755,7 +3762,7 @@ pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_workspaces: &[(Strin
             .prepare("SELECT event_id FROM recorded_events WHERE peer_id = ?1")
             .expect("failed to prepare stmt");
         let events: std::collections::HashSet<String> = stmt
-            .query_map([tid], |row| row.get::<_, String>(0))
+            .query_map([tid], |row| crate::db::sql_types::get_text(row, 0))
             .expect("failed to query")
             .collect::<Result<std::collections::HashSet<_>, _>>()
             .expect("failed to collect");
@@ -3791,7 +3798,7 @@ pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_workspaces: &[(Strin
             .prepare("SELECT event_id FROM valid_events WHERE peer_id = ?1")
             .expect("failed to prepare stmt");
         let events: std::collections::HashSet<String> = stmt
-            .query_map([tid], |row| row.get::<_, String>(0))
+            .query_map([tid], |row| crate::db::sql_types::get_text(row, 0))
             .expect("failed to query")
             .collect::<Result<std::collections::HashSet<_>, _>>()
             .expect("failed to collect");
@@ -3823,7 +3830,7 @@ pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_workspaces: &[(Strin
         let query = format!("SELECT DISTINCT peer_id FROM {}", table);
         let mut stmt = db.prepare(&query).expect("failed to prepare");
         let found_ids: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([], |row| crate::db::sql_types::get_text(row, 0))
             .expect("failed to query")
             .collect::<Result<Vec<_>, _>>()
             .expect("failed to collect");
@@ -3842,7 +3849,7 @@ pub fn assert_no_cross_tenant_leakage(db_path: &str, tenant_workspaces: &[(Strin
         let query = format!("SELECT DISTINCT recorded_by FROM {}", table);
         let mut stmt = db.prepare(&query).expect("failed to prepare");
         let found_ids: Vec<String> = stmt
-            .query_map([], |row| row.get::<_, String>(0))
+            .query_map([], |row| crate::db::sql_types::get_text(row, 0))
             .expect("failed to query")
             .collect::<Result<Vec<_>, _>>()
             .expect("failed to collect");
@@ -3881,10 +3888,10 @@ pub fn clone_events_to(source: &Peer, targets: &[&Peer]) {
     let events: Vec<(String, String, Vec<u8>, String, i64, i64)> = events_stmt
         .query_map([], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-                row.get::<_, String>(3)?,
+                crate::db::sql_types::get_text(row, 0)?,
+                crate::db::sql_types::get_text(row, 1)?,
+                crate::db::sql_types::get_blob(row, 2)?,
+                crate::db::sql_types::get_text(row, 3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
             ))
@@ -3899,9 +3906,9 @@ pub fn clone_events_to(source: &Peer, targets: &[&Peer]) {
             Ok(mut neg_stmt) => neg_stmt
                 .query_map([], |row| {
                     Ok((
-                        row.get::<_, String>(0)?,
+                        crate::db::sql_types::get_text(row, 0)?,
                         row.get::<_, i64>(1)?,
-                        row.get::<_, Vec<u8>>(2)?,
+                        crate::db::sql_types::get_blob(row, 2)?,
                     ))
                 })
                 .expect("failed to query neg_items")

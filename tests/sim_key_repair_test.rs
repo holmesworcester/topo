@@ -114,7 +114,7 @@ fn distinct_key_request_events(db_paths: &[String], blocked_event_id_b64: &str) 
             .expect("prepare key_requests query");
         let rows = stmt
             .query_map(rusqlite::params![blocked_event_id_b64], |row| {
-                row.get::<_, String>(0)
+                topo::db::sql_types::get_text(row, 0)
             })
             .expect("query key_requests");
         for row in rows {
@@ -137,7 +137,7 @@ fn distinct_key_shared_events_for_key(db_paths: &[String], key_event_id_b64: &st
             .expect("prepare key_shared query");
         let rows = stmt
             .query_map(rusqlite::params![key_event_id_b64], |row| {
-                row.get::<_, String>(0)
+                topo::db::sql_types::get_text(row, 0)
             })
             .expect("query key_shared");
         for row in rows {
@@ -190,7 +190,7 @@ fn distinct_key_shared_events_for_recipient(
             .expect("prepare key_shared recipient query");
         let rows = stmt
             .query_map(rusqlite::params![key_event_id_b64, &recipient_b64], |row| {
-                row.get::<_, String>(0)
+                topo::db::sql_types::get_text(row, 0)
             })
             .expect("query key_shared recipient");
         for row in rows {
@@ -251,7 +251,7 @@ fn source_event_ids_in_dependency_order(
             .query_row(
                 "SELECT blob FROM events WHERE event_id = ?1",
                 rusqlite::params![&event_id_b64],
-                |row| row.get::<_, Vec<u8>>(0),
+                |row| topo::db::sql_types::get_blob(row, 0),
             )
             .ok();
         let Some(blob) = blob else {

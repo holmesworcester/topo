@@ -13,7 +13,7 @@ pub fn list_event_ids(db: &Connection, recorded_by: &str) -> Result<Vec<String>,
     let mut stmt = db.prepare("SELECT event_id FROM admins WHERE recorded_by = ?1")?;
     let rows = stmt
         .query_map(rusqlite::params![recorded_by], |row| {
-            row.get::<_, String>(0)
+            crate::db::sql_types::get_text(row, 0)
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(rows)

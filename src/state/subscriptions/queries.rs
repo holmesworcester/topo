@@ -72,13 +72,13 @@ pub fn list_subscriptions(
 
     let rows = stmt
         .query_map(rusqlite::params![recorded_by], |row| {
-            let spec_json: String = row.get(5)?;
-            let delivery_str: String = row.get(4)?;
+            let spec_json = crate::db::sql_types::get_text(row, 5)?;
+            let delivery_str = crate::db::sql_types::get_text(row, 4)?;
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
+                crate::db::sql_types::get_text(row, 0)?,
+                crate::db::sql_types::get_text(row, 1)?,
                 row.get::<_, bool>(2)?,
-                row.get::<_, String>(3)?,
+                crate::db::sql_types::get_text(row, 3)?,
                 delivery_str,
                 spec_json,
                 row.get::<_, i64>(6)?,
@@ -125,10 +125,10 @@ pub fn load_active_subscriptions_for_type(
     let rows = stmt
         .query_map(rusqlite::params![recorded_by, event_type], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
-                row.get::<_, String>(3)?,
+                crate::db::sql_types::get_text(row, 0)?,
+                crate::db::sql_types::get_text(row, 1)?,
+                crate::db::sql_types::get_text(row, 2)?,
+                crate::db::sql_types::get_text(row, 3)?,
                 row.get::<_, i64>(4)?,
                 row.get::<_, i64>(5)?,
             ))
@@ -378,11 +378,11 @@ pub fn poll_feed(
         .query_map(
             rusqlite::params![recorded_by, subscription_id, after_seq, limit as i64],
             |row| {
-                let payload_json: String = row.get(4)?;
+                let payload_json = crate::db::sql_types::get_text(row, 4)?;
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
+                    crate::db::sql_types::get_text(row, 1)?,
+                    crate::db::sql_types::get_text(row, 2)?,
                     row.get::<_, i64>(3)?,
                     payload_json,
                     row.get::<_, i64>(5)?,
@@ -427,7 +427,7 @@ pub fn ack_feed(
             "SELECT delivery_mode FROM local_subscriptions
              WHERE recorded_by = ?1 AND subscription_id = ?2",
             rusqlite::params![recorded_by, subscription_id],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .map_err(|e| format!("subscription not found: {}", e))?;
 
@@ -530,7 +530,7 @@ pub fn get_state(
                 next_seq: row.get(0)?,
                 pending_count: row.get(1)?,
                 dirty: row.get::<_, i64>(2)? != 0,
-                latest_event_id: row.get(3)?,
+                latest_event_id: crate::db::sql_types::get_text(row, 3)?,
                 latest_created_at_ms: row.get(4)?,
                 updated_at_ms: row.get(5)?,
             })
@@ -553,7 +553,7 @@ pub fn resolve_event_created_at(conn: &Connection, event_id_b64: &str) -> Result
         .query_row(
             "SELECT blob FROM events WHERE event_id = ?1",
             rusqlite::params![event_id_b64],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_blob(row, 0),
         )
         .map_err(|e| format!("event not found: {}", e))?;
 

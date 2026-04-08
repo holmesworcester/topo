@@ -55,7 +55,7 @@ pub fn first_event_id(
     db.query_row(
         "SELECT event_id FROM users WHERE recorded_by = ?1 LIMIT 1",
         rusqlite::params![recorded_by],
-        |row| row.get::<_, String>(0),
+        |row| crate::db::sql_types::get_text(row, 0),
     )
     .optional()
 }

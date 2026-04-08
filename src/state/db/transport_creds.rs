@@ -1,6 +1,8 @@
 use rusqlite::{Connection, OptionalExtension};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use super::sql_types::{get_blob, get_text};
+
 pub const CRED_SOURCE_UNKNOWN: &str = "unknown";
 pub const CRED_SOURCE_RANDOM: &str = "random";
 pub const CRED_SOURCE_BOOTSTRAP: &str = "bootstrap";
@@ -36,7 +38,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
         let mut rows = stmt.query([])?;
         let mut found = false;
         while let Some(row) = rows.next()? {
-            let name: String = row.get(1)?;
+            let name = get_text(row, 1)?;
             if name == "source" {
                 found = true;
                 break;
@@ -58,7 +60,7 @@ pub fn ensure_schema(conn: &Connection) -> rusqlite::Result<()> {
                AND name = 'local_transport_targets'
              LIMIT 1",
             [],
-            |row| row.get(0),
+            |row| get_text(row, 0),
         )
         .optional()?;
     if target_table_sql
@@ -135,7 +137,7 @@ pub fn set_local_transport_target(
                       tenant_id ASC
              LIMIT 1",
             rusqlite::params![transport_peer_id, tenant_id],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| Ok((get_text(row, 0)?, get_text(row, 1)?)),
         )
         .optional()?;
     if let Some((existing_tenant_id, existing_source)) = conflicting_owner {
@@ -166,7 +168,7 @@ pub fn set_local_transport_target(
                  WHERE transport_peer_id = ?1
                  LIMIT 1",
                 rusqlite::params![transport_peer_id],
-                |row| Ok((row.get(0)?, row.get(1)?)),
+                |row| Ok((get_text(row, 0)?, get_text(row, 1)?)),
             )
             .optional()?;
         if let Some((existing_tenant_id, existing_source)) = existing {
@@ -218,9 +220,9 @@ pub fn resolve_local_transport_targets(
     let rows = stmt
         .query_map(rusqlite::params![transport_peer_id], |row| {
             Ok(LocalTransportTarget {
-                tenant_id: row.get(0)?,
-                transport_peer_id: row.get(1)?,
-                source: row.get(2)?,
+                tenant_id: get_text(row, 0)?,
+                transport_peer_id: get_text(row, 1)?,
+                source: get_text(row, 2)?,
             })
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -240,9 +242,9 @@ pub fn resolve_tenant_transport_target(
             rusqlite::params![tenant_id],
             |row| {
                 Ok(LocalTransportTarget {
-                    tenant_id: row.get(0)?,
-                    transport_peer_id: row.get(1)?,
-                    source: row.get(2)?,
+                    tenant_id: get_text(row, 0)?,
+                    transport_peer_id: get_text(row, 1)?,
+                    source: get_text(row, 2)?,
                 })
             },
         )
@@ -320,7 +322,7 @@ pub fn load_local_creds(
     match conn.query_row(
         "SELECT cert_der, key_der FROM local_transport_creds WHERE peer_id = ?1",
         rusqlite::params![peer_id],
-        |row| Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, Vec<u8>>(1)?)),
+        |row| Ok((get_blob(row, 0)?, get_blob(row, 1)?)),
     ) {
         Ok(pair) => Ok(Some(pair)),
         Err(rusqlite::Error::QueryReturnedNoRows) => Ok(None),
@@ -351,13 +353,7 @@ pub fn load_sole_local_creds(
     match conn.query_row(
         "SELECT peer_id, cert_der, key_der FROM local_transport_creds LIMIT 1",
         [],
-        |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, Vec<u8>>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-            ))
-        },
+        |row| Ok((get_text(row, 0)?, get_blob(row, 1)?, get_blob(row, 2)?)),
     ) {
         Ok(triple) => Ok(Some(triple)),
         Err(e) => Err(e.into()),
@@ -370,7 +366,7 @@ pub fn list_local_peers(
 ) -> Result<Vec<String>, Box<dyn std::error::Error + Send + Sync>> {
     let mut stmt = conn.prepare("SELECT peer_id FROM local_transport_creds ORDER BY created_at")?;
     let peers = stmt
-        .query_map([], |row| row.get::<_, String>(0))?
+        .query_map([], |row| get_text(row, 0))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(peers)
 }
@@ -384,8 +380,8 @@ pub fn list_local_peers_with_source(
     let keys = stmt
         .query_map([], |row| {
             Ok(serde_json::json!({
-                "peer_id": row.get::<_, String>(0)?,
-                "source": row.get::<_, String>(1)?,
+                "peer_id": get_text(row, 0)?,
+                "source": get_text(row, 1)?,
             }))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -430,11 +426,11 @@ pub fn discover_local_tenants(
     )?;
     let rows = stmt.query_map([], |row| {
         Ok(TenantInfo {
-            peer_id: row.get(0)?,
-            workspace_id: row.get(1)?,
-            transport_peer_id: row.get(2)?,
-            cert_der: row.get(3)?,
-            key_der: row.get(4)?,
+            peer_id: get_text(row, 0)?,
+            workspace_id: get_text(row, 1)?,
+            transport_peer_id: get_text(row, 2)?,
+            cert_der: get_blob(row, 3)?,
+            key_der: get_blob(row, 4)?,
         })
     })?;
     let mut tenants = Vec::new();
@@ -863,7 +859,7 @@ mod tests {
         let mut rows = stmt.query([]).unwrap();
         let mut has_source = false;
         while let Some(row) = rows.next().unwrap() {
-            let name: String = row.get(1).unwrap();
+            let name = get_text(row, 1).unwrap();
             if name == "source" {
                 has_source = true;
                 break;

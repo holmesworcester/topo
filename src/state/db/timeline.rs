@@ -3,6 +3,7 @@ use std::sync::OnceLock;
 use rusqlite::{params, Connection, OptionalExtension, Result as SqliteResult};
 
 use super::queue::with_sqlite_busy_retry;
+use super::sql_types::{get_opt_text, get_text};
 
 #[derive(Clone, Copy)]
 enum TimelineGroup {
@@ -231,16 +232,16 @@ impl<'a> EventTimeline<'a> {
                          unblocked_by_event_id,
                          projected_at
                      FROM event_timeline
-                     WHERE event_id = ?1",
+                    WHERE event_id = ?1",
                     params![event_id_b64],
                     |row| {
                         Ok(EventTimelineRow {
-                            event_id: row.get(0)?,
+                            event_id: get_text(row, 0)?,
                             first_received_at: row.get(1)?,
                             first_stored_at: row.get(2)?,
                             blocked_at: row.get(3)?,
                             unblocked_at: row.get(4)?,
-                            unblocked_by_event_id: row.get(5)?,
+                            unblocked_by_event_id: get_opt_text(row, 5)?,
                             projected_at: row.get(6)?,
                         })
                     },
@@ -312,7 +313,7 @@ fn fmt_opt(value: Option<i64>) -> String {
 
 fn column_exists(conn: &Connection, column: &str) -> SqliteResult<bool> {
     let mut stmt = conn.prepare("PRAGMA table_info(event_timeline)")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(1))?;
+    let rows = stmt.query_map([], |row| get_text(row, 1))?;
     for row in rows {
         if row? == column {
             return Ok(true);

@@ -1,9 +1,11 @@
 use rusqlite::{params, Connection, Result as SqliteResult};
 
+use super::sql_types::{get_blob, get_text};
+
 fn valid_events_has_semantic_type_column(conn: &Connection) -> SqliteResult<bool> {
     let mut stmt = conn.prepare("PRAGMA table_info(valid_events)")?;
     let names = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
+        .query_map([], |row| get_text(row, 1))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(names.iter().any(|name| name == "semantic_type_code"))
 }
@@ -11,7 +13,7 @@ fn valid_events_has_semantic_type_column(conn: &Connection) -> SqliteResult<bool
 fn project_queue_has_column(conn: &Connection, column: &str) -> SqliteResult<bool> {
     let mut stmt = conn.prepare("PRAGMA table_info(project_queue)")?;
     let names = stmt
-        .query_map([], |row| row.get::<_, String>(1))?
+        .query_map([], |row| get_text(row, 1))?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(names.iter().any(|name| name == column))
 }
@@ -21,32 +23,22 @@ fn load_project_priority(
     event_id_b64: &str,
     default_created_at: i64,
 ) -> (i64, i64) {
-    let (event_type, created_at, encrypted_inner_type) = conn
+    let (event_type, created_at, event_blob) = conn
         .query_row(
             "SELECT event_type,
                     created_at,
-                    CASE
-                        WHEN event_type = 'encrypted' THEN substr(blob, 42, 1)
-                        ELSE NULL
-                    END
+                    blob
              FROM events
              WHERE event_id = ?1",
             params![event_id_b64],
-            |row| {
-                Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, i64>(1)?,
-                    row.get::<_, Option<Vec<u8>>>(2)?,
-                ))
-            },
+            |row| Ok((get_text(row, 0)?, row.get::<_, i64>(1)?, get_blob(row, 2)?)),
         )
-        .unwrap_or_else(|_| ("unknown".to_string(), default_created_at, None));
+        .unwrap_or_else(|_| ("unknown".to_string(), default_created_at, Vec::new()));
+    let semantic_type_code =
+        derive_semantic_type_code_from_blob(&event_blob).and_then(|value| u8::try_from(value).ok());
     let lane = match event_type.as_str() {
         "file_slice" => super::queue::PRIORITY_LANE_BULK,
-        "encrypted"
-            if encrypted_inner_type.and_then(|bytes| bytes.first().copied())
-                == Some(crate::event_modules::EVENT_TYPE_FILE_SLICE) =>
-        {
+        "encrypted" if semantic_type_code == Some(crate::event_modules::EVENT_TYPE_FILE_SLICE) => {
             super::queue::PRIORITY_LANE_BULK
         }
         _ => super::queue::PRIORITY_LANE_FOREGROUND,
@@ -72,11 +64,7 @@ fn backfill_valid_event_semantic_types(conn: &Connection) -> SqliteResult<()> {
     )?;
     let rows = stmt
         .query_map([], |row| {
-            Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, Vec<u8>>(2)?,
-            ))
+            Ok((get_text(row, 0)?, get_text(row, 1)?, get_blob(row, 2)?))
         })?
         .collect::<Result<Vec<_>, _>>()?;
 
@@ -274,7 +262,7 @@ impl<'a> ProjectQueue<'a> {
         )?;
         let event_ids: Vec<String> = select_stmt
             .query_map(params![peer_id, head_lane, now, limit as i64], |row| {
-                row.get::<_, String>(0)
+                get_text(row, 0)
             })?
             .collect::<Result<Vec<_>, _>>()?;
 

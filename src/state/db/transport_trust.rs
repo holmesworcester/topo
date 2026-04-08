@@ -3,6 +3,7 @@ use serde::{Deserialize, Serialize};
 use std::collections::HashSet;
 
 use super::queue::current_timestamp_ms;
+use super::sql_types::{get_blob32, get_opt_text, get_text};
 use crate::crypto::spki_fingerprint_from_ed25519_pubkey;
 
 /// Pending bootstrap trust from locally-created invites is temporary.
@@ -303,15 +304,6 @@ const NODE_AUTHORIZING_TENANT_SQL: &str = concat!(
     LIMIT 1"
 );
 
-fn decode_32_byte_blob(blob: Vec<u8>) -> Option<[u8; 32]> {
-    if blob.len() != 32 {
-        return None;
-    }
-    let mut fp = [0u8; 32];
-    fp.copy_from_slice(&blob);
-    Some(fp)
-}
-
 pub fn ensure_schema(conn: &Connection) -> Result<(), rusqlite::Error> {
     conn.execute_batch(
         "
@@ -446,14 +438,12 @@ pub fn read_bootstrap_context(
     let mut addrs = Vec::new();
     let mut seen = std::collections::HashSet::new();
     while let Some(row) = rows.next()? {
-        let ws: String = row.get(0)?;
-        let addr: String = row.get(1)?;
-        let blob: Vec<u8> = row.get(2)?;
+        let ws = get_text(row, 0)?;
+        let addr = get_text(row, 1)?;
+        let blob = get_blob32(row, 2)?;
         if workspace_id.is_none() {
             workspace_id = Some(ws);
-            spki = Some(
-                decode_32_byte_blob(blob).ok_or("bootstrap_spki_fingerprint is not 32 bytes")?,
-            );
+            spki = Some(blob);
         }
         if seen.insert(addr.clone()) {
             addrs.push(addr);
@@ -645,8 +635,7 @@ pub fn authorized_fingerprints_from_db(
     let mut stmt = conn.prepare(TENANT_AUTHORIZED_FINGERPRINTS_SQL)?;
     let fps: HashSet<[u8; 32]> = stmt
         .query_map(rusqlite::params![recorded_by, now], |row| {
-            let blob: Vec<u8> = row.get(0)?;
-            Ok(decode_32_byte_blob(blob))
+            Ok(Some(get_blob32(row, 0)?))
         })?
         .collect::<Result<Vec<_>, _>>()?
         .into_iter()
@@ -683,7 +672,7 @@ pub fn resolve_authorizing_tenant(
         .query_row(
             NODE_AUTHORIZING_TENANT_SQL,
             rusqlite::params![spki_fingerprint.as_slice(), now],
-            |row| row.get(0),
+            |row| get_text(row, 0),
         )
         .optional()?;
     Ok(tenant_id)
@@ -742,14 +731,14 @@ pub fn list_authorized_transport_rows(
     let rows = stmt
         .query_map(rusqlite::params![recorded_by, now], |row| {
             Ok(AuthorizedTransportRow {
-                source: row.get(0)?,
-                transport_peer_id: row.get(1)?,
-                peer_shared_event_id: row.get(2)?,
-                user_event_id: row.get(3)?,
-                device_name: row.get(4)?,
-                invite_event_id: row.get(5)?,
-                invite_accepted_event_id: row.get(6)?,
-                workspace_id: row.get(7)?,
+                source: get_text(row, 0)?,
+                transport_peer_id: get_text(row, 1)?,
+                peer_shared_event_id: get_opt_text(row, 2)?,
+                user_event_id: get_opt_text(row, 3)?,
+                device_name: get_opt_text(row, 4)?,
+                invite_event_id: get_opt_text(row, 5)?,
+                invite_accepted_event_id: get_opt_text(row, 6)?,
+                workspace_id: get_opt_text(row, 7)?,
                 expires_at: row.get(8)?,
             })
         })?
@@ -841,20 +830,11 @@ pub fn list_active_invite_bootstrap_targets(
     )?;
     let rows = stmt
         .query_map(rusqlite::params![recorded_by, now], |row| {
-            let bootstrap_spki_fingerprint: Vec<u8> = row.get(1)?;
-            let transport_peer_id = decode_32_byte_blob(bootstrap_spki_fingerprint)
-                .map(hex::encode)
-                .ok_or_else(|| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        1,
-                        rusqlite::types::Type::Blob,
-                        "bootstrap_spki_fingerprint is not 32 bytes".into(),
-                    )
-                })?;
+            let transport_peer_id = hex::encode(get_blob32(row, 1)?);
             Ok(InviteBootstrapTarget {
-                invite_event_id: row.get(0)?,
+                invite_event_id: get_text(row, 0)?,
                 transport_peer_id,
-                bootstrap_addr: row.get(2)?,
+                bootstrap_addr: get_text(row, 2)?,
                 workspace_already_local_elsewhere: row.get(3)?,
             })
         })?
@@ -891,19 +871,10 @@ pub fn list_active_bootstrap_session_fallback_candidates(
     )?;
     let rows = stmt
         .query_map(rusqlite::params![recorded_by, now], |row| {
-            let bootstrap_spki_fingerprint: Vec<u8> = row.get(0)?;
-            let daemon_peer_id = decode_32_byte_blob(bootstrap_spki_fingerprint)
-                .map(hex::encode)
-                .ok_or_else(|| {
-                    rusqlite::Error::FromSqlConversionFailure(
-                        0,
-                        rusqlite::types::Type::Blob,
-                        "bootstrap_spki_fingerprint is not 32 bytes".into(),
-                    )
-                })?;
+            let daemon_peer_id = hex::encode(get_blob32(row, 0)?);
             Ok(BootstrapSessionFallbackCandidate {
                 daemon_peer_id,
-                invite_event_id: row.get(1)?,
+                invite_event_id: get_text(row, 1)?,
                 workspace_already_local_before_candidate: row.get(2)?,
             })
         })?

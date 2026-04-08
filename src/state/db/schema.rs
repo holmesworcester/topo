@@ -94,6 +94,7 @@ pub fn create_tables(conn: &Connection) -> SqliteResult<()> {
 
 #[cfg(test)]
 mod tests {
+    use super::super::sql_types::get_text;
     use super::*;
     use crate::db::open_in_memory;
     use std::fs;
@@ -107,7 +108,7 @@ mod tests {
         let tables: Vec<String> = conn
             .prepare("SELECT name FROM sqlite_master WHERE type='table' ORDER BY name")
             .unwrap()
-            .query_map([], |row| row.get(0))
+            .query_map([], |row| get_text(row, 0))
             .unwrap()
             .collect::<Result<Vec<_>, _>>()
             .unwrap();

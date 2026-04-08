@@ -3,11 +3,7 @@ use super::*;
 // ===== Message deletion helpers =====
 
 /// Convenience: create identity chain + signed deletion.
-fn make_deletion(
-    conn: &Connection,
-    recorded_by: &str,
-    target: &EventId,
-) -> (ParsedEvent, Vec<u8>) {
+fn make_deletion(conn: &Connection, recorded_by: &str, target: &EventId) -> (ParsedEvent, Vec<u8>) {
     let (signer_eid, signing_key) = make_identity_chain(conn, recorded_by);
     make_deletion_signed(&signing_key, &signer_eid, target)
 }
@@ -141,11 +137,13 @@ fn test_deletion_intent_only_on_missing_target() {
 
     // Verify deletion_intent was written
     let target_b64 = event_id_to_base64(&fake_target);
-    let intent_count: i64 = conn.query_row(
-        "SELECT COUNT(*) FROM deletion_intents WHERE recorded_by = ?1 AND target_id = ?2",
-        rusqlite::params![recorded_by, &target_b64],
-        |row| row.get(0),
-    ).unwrap();
+    let intent_count: i64 = conn
+        .query_row(
+            "SELECT COUNT(*) FROM deletion_intents WHERE recorded_by = ?1 AND target_id = ?2",
+            rusqlite::params![recorded_by, &target_b64],
+            |row| row.get(0),
+        )
+        .unwrap();
     assert_eq!(
         intent_count, 1,
         "deletion_intent must be written for missing target"
@@ -603,7 +601,7 @@ fn test_deletion_invariant_order_convergence_identical_state() {
     let tombstone_a: Option<(String, String)> = conn.query_row(
         "SELECT deletion_event_id, author_id FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
         rusqlite::params![recorded_by, &msg_b64],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((crate::db::sql_types::get_text(row, 0)?, crate::db::sql_types::get_text(row, 1)?)),
     ).ok();
     let msg_count_a: i64 = conn
         .query_row(
@@ -676,7 +674,7 @@ fn test_deletion_invariant_order_convergence_identical_state() {
     let tombstone_b: Option<(String, String)> = conn.query_row(
         "SELECT deletion_event_id, author_id FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
         rusqlite::params![recorded_by, &msg_b64],
-        |row| Ok((row.get(0)?, row.get(1)?)),
+        |row| Ok((crate::db::sql_types::get_text(row, 0)?, crate::db::sql_types::get_text(row, 1)?)),
     ).ok();
     let msg_count_b: i64 = conn
         .query_row(
@@ -832,11 +830,18 @@ fn test_deletion_invariant_command_idempotence() {
     project_one(&conn, recorded_by, &del_eid).unwrap();
 
     // Capture deletion_intent identity
-    let intent_1: (String, String) = conn.query_row(
-        "SELECT deletion_event_id, author_id FROM deletion_intents WHERE recorded_by = ?1",
-        rusqlite::params![recorded_by],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).unwrap();
+    let intent_1: (String, String) = conn
+        .query_row(
+            "SELECT deletion_event_id, author_id FROM deletion_intents WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| {
+                Ok((
+                    crate::db::sql_types::get_text(row, 0)?,
+                    crate::db::sql_types::get_text(row, 1)?,
+                ))
+            },
+        )
+        .unwrap();
 
     // Re-run by clearing valid status and re-projecting
     let del_b64 = event_id_to_base64(&del_eid);
@@ -848,11 +853,18 @@ fn test_deletion_invariant_command_idempotence() {
     project_one(&conn, recorded_by, &del_eid).unwrap();
 
     // Intent identity must be stable (same event_id, same author)
-    let intent_2: (String, String) = conn.query_row(
-        "SELECT deletion_event_id, author_id FROM deletion_intents WHERE recorded_by = ?1",
-        rusqlite::params![recorded_by],
-        |row| Ok((row.get(0)?, row.get(1)?)),
-    ).unwrap();
+    let intent_2: (String, String) = conn
+        .query_row(
+            "SELECT deletion_event_id, author_id FROM deletion_intents WHERE recorded_by = ?1",
+            rusqlite::params![recorded_by],
+            |row| {
+                Ok((
+                    crate::db::sql_types::get_text(row, 0)?,
+                    crate::db::sql_types::get_text(row, 1)?,
+                ))
+            },
+        )
+        .unwrap();
 
     assert_eq!(
         intent_1, intent_2,
@@ -1188,7 +1200,14 @@ fn test_hard_purge_removes_message_graph_and_auxiliary_rows() {
              FROM local_subscription_state
              WHERE recorded_by = ?1 AND subscription_id = 'purge-sub'",
             rusqlite::params![recorded_by],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
+            |row| {
+                Ok((
+                    row.get(0)?,
+                    row.get(1)?,
+                    row.get(2)?,
+                    crate::db::sql_types::get_text(row, 3)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(sub_state.0, 5, "purge must not rewind next_seq");
@@ -1227,7 +1246,7 @@ fn test_hard_purge_removes_message_graph_and_auxiliary_rows() {
         .query_row(
             "SELECT unblocked_by_event_id FROM event_timeline WHERE event_id = 'other-event'",
             [],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_opt_text(row, 0),
         )
         .unwrap();
     assert_eq!(

@@ -1012,7 +1012,7 @@ fn create_workspace_on_running_active_daemon_switches_active_tenant() {
              ORDER BY event_id DESC
              LIMIT 1",
             rusqlite::params!["beta-space"],
-            |row| row.get(0),
+            |row| topo::db::sql_types::get_text(row, 0),
         )
         .expect("query beta workspace peer");
 
@@ -1495,7 +1495,7 @@ fn accept_invite_on_running_active_daemon_with_existing_workspace_succeeds() {
                  ORDER BY created_at DESC, event_id DESC
                  LIMIT 1",
                 rusqlite::params![&invited_ws_b64],
-                |row| row.get(0),
+                |row| topo::db::sql_types::get_text(row, 0),
             )
             .ok();
         if let Some(peer_id) = maybe_peer {
@@ -1609,7 +1609,7 @@ fn peer_secret_events_do_not_pass_shared_egress_gate() {
         .query_row(
             "SELECT event_id FROM events WHERE event_type = 'peer_secret' LIMIT 1",
             [],
-            |row| row.get(0),
+            |row| topo::db::sql_types::get_text(row, 0),
         )
         .unwrap();
     let local_event_id =

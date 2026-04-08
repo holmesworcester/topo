@@ -59,7 +59,7 @@ pub fn name(db: &Connection, recorded_by: &str) -> Result<String, rusqlite::Erro
         .query_row(
             "SELECT COALESCE(name, '') FROM workspaces WHERE recorded_by = ?1 LIMIT 1",
             rusqlite::params![recorded_by],
-            |row| row.get::<_, String>(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .optional()?
         .unwrap_or_default())
@@ -118,8 +118,8 @@ pub fn list_all_items(db: &Connection) -> Result<Vec<WorkspaceItem>, rusqlite::E
          ORDER BY MIN(event_id)",
     )?;
     let rows = stmt.query_map([], |row| {
-        let workspace_id: String = row.get(1)?;
-        let name: String = row.get(2)?;
+        let workspace_id = crate::db::sql_types::get_text(row, 1)?;
+        let name = crate::db::sql_types::get_text(row, 2)?;
         Ok(WorkspaceItem {
             event_id: row.get(0)?,
             workspace_id: workspace_id.clone(),
@@ -240,7 +240,7 @@ pub fn content_keys(
     )?;
     let keys = stmt
         .query_map(rusqlite::params![recorded_by], |row| {
-            row.get::<_, String>(0)
+            crate::db::sql_types::get_text(row, 0)
         })?
         .collect::<Result<Vec<_>, _>>()?;
     let latest_key_event_id = keys.first().cloned();
@@ -337,7 +337,7 @@ fn list_view_tenant_scopes(db: &Connection) -> Result<Vec<ViewTenantScopeRow>, r
     let mut scopes = Vec::new();
     let mut seen = std::collections::HashSet::new();
     while let Some(row) = rows.next()? {
-        let peer_id: String = row.get(0)?;
+        let peer_id = crate::db::sql_types::get_text(row, 0)?;
         if !seen.insert(peer_id.clone()) {
             continue;
         }
@@ -363,7 +363,7 @@ fn tenant_workspace_name(
                AND workspace_id = ?2
              LIMIT 1",
             rusqlite::params![recorded_by, workspace_id],
-            |row| row.get::<_, String>(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .optional()?
         .unwrap_or_default())
@@ -384,7 +384,7 @@ fn tenant_local_username(db: &Connection, recorded_by: &str) -> Result<String, r
              ORDER BY ps.event_id ASC
              LIMIT 1",
             rusqlite::params![recorded_by],
-            |row| row.get::<_, String>(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .optional()?
     {
@@ -399,7 +399,7 @@ fn tenant_local_username(db: &Connection, recorded_by: &str) -> Result<String, r
              ORDER BY event_id ASC
              LIMIT 1",
             rusqlite::params![recorded_by],
-            |row| row.get::<_, String>(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .optional()?
         .unwrap_or_default())

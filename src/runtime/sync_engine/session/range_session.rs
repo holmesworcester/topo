@@ -12,9 +12,9 @@ use crate::protocol::neg_id_to_event_id;
 use crate::sync::session::logging::SyncRunRxCapture;
 use crate::sync::session::receive_log::ReceiveLogWriter;
 use crate::sync::session::windowing::{SyncWindow, SyncWindowKind};
-use crate::tuning::{sync_dep_check_cap, sync_dep_send_byte_cap, sync_dep_send_event_cap};
 use crate::transport::connection::ConnectionError;
 use crate::transport::{StreamRecv, StreamSend};
+use crate::tuning::{sync_dep_check_cap, sync_dep_send_byte_cap, sync_dep_send_event_cap};
 use tracing::warn;
 
 const RANGE_DATA_RECORD_PREFIX_LEN: usize = 4;
@@ -115,8 +115,9 @@ fn should_expand_shared_deps(kind: SyncWindowKind) -> bool {
 fn decide_shared_send_order_policy(kind: SyncWindowKind) -> SharedSendOrderPolicy {
     match kind {
         SyncWindowKind::LastDay => SharedSendOrderPolicy::NewestFirst,
-        SyncWindowKind::Full | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks =>
-            SharedSendOrderPolicy::PreserveInput,
+        SyncWindowKind::Full | SyncWindowKind::LastWeek | SyncWindowKind::LastTwelveWeeks => {
+            SharedSendOrderPolicy::PreserveInput
+        }
     }
 }
 
@@ -308,7 +309,7 @@ fn load_associated_shared_key_event_ids(
                 crate::crypto::event_id_to_base64(&key_event_id),
                 limit as i64
             ],
-            |row| row.get::<_, String>(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .map_err(|e| format!("query associated key_shared rows: {e}"))?;
     let mut dep_ids = Vec::new();
@@ -342,13 +343,8 @@ fn load_ordered_shared_dep_ids(
         return Ok(Vec::new());
     }
 
-    let mut dep_ids = load_associated_shared_key_event_ids(
-        conn,
-        recorded_by,
-        store,
-        event_id,
-        dep_limit,
-    )?;
+    let mut dep_ids =
+        load_associated_shared_key_event_ids(conn, recorded_by, store, event_id, dep_limit)?;
     let direct_limit = dep_limit.saturating_sub(dep_ids.len());
     dep_ids.extend(
         crate::db::dep_index::list_shared_event_deps_limited(
@@ -548,8 +544,14 @@ where
     let mut events_sent = 0u64;
     let mut bytes_sent = 0u64;
     let event_ids: Vec<EventId> = have_ids.iter().map(neg_id_to_event_id).collect();
-    let event_ids =
-        expand_requested_ids_with_shared_deps(conn, store, recorded_by, workspace_id, range, &event_ids)?;
+    let event_ids = expand_requested_ids_with_shared_deps(
+        conn,
+        store,
+        recorded_by,
+        workspace_id,
+        range,
+        &event_ids,
+    )?;
     for chunk in event_ids.chunks(64) {
         let ordered = load_shared_send_batch(store, chunk)?;
         let mut payload = Vec::new();
@@ -654,18 +656,17 @@ where
 mod tests {
     use super::*;
     use crate::contracts::event_pipeline_contract::IngestItem;
-    use crate::db::dep_index::replace_shared_event_deps;
     use crate::crypto::hash_event;
-    use crate::db::{open_connection, open_in_memory};
+    use crate::db::dep_index::replace_shared_event_deps;
     use crate::db::schema::create_tables;
     use crate::db::store::{insert_event, insert_shared_event_index_entry_if_shared};
+    use crate::db::{open_connection, open_in_memory};
+    use crate::event_modules::removal::frontier_hash_from_refs;
     use crate::event_modules::{
-        encode_event, endpoint_shared, encrypted::NO_OWNER_EVENT_ID, registry::ShareScope,
-        BenchDepEvent, EncryptedEvent, KeySharedEvent, MessageEvent, ParsedEvent,
-        PeerSharedEvent,
+        encode_event, encrypted::NO_OWNER_EVENT_ID, endpoint_shared, registry::ShareScope,
+        BenchDepEvent, EncryptedEvent, KeySharedEvent, MessageEvent, ParsedEvent, PeerSharedEvent,
     };
     use crate::projection::encrypted::encrypt_event_blob;
-    use crate::event_modules::removal::frontier_hash_from_refs;
     use crate::state::pipeline::ingest_now;
 
     fn insert_shared_bench_dep(
@@ -1235,7 +1236,10 @@ mod tests {
         .unwrap();
 
         assert_eq!(persisted, all_ids.len());
-        assert_eq!(valid_event_count(&dest_conn, "tenant-a"), all_ids.len() as i64);
+        assert_eq!(
+            valid_event_count(&dest_conn, "tenant-a"),
+            all_ids.len() as i64
+        );
         assert!(is_valid(&dest_conn, "tenant-a", &leaf));
     }
 }

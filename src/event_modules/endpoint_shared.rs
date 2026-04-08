@@ -143,7 +143,7 @@ pub fn load_local_endpoint_shared(
              LIMIT 2",
         )?;
         let mapped = stmt.query_map([], |row| {
-            let public_key: Vec<u8> = row.get(2)?;
+            let public_key = crate::db::sql_types::get_blob(row, 2)?;
             let public_key: [u8; 32] = public_key.as_slice().try_into().map_err(|_| {
                 rusqlite::Error::FromSqlConversionFailure(
                     2,
@@ -198,7 +198,7 @@ pub fn load_endpoint_shared_by_event_id(
              LIMIT 1",
             rusqlite::params![event_id],
             |row| {
-                let public_key: Vec<u8> = row.get(2)?;
+                let public_key = crate::db::sql_types::get_blob(row, 2)?;
                 let public_key: [u8; 32] = public_key.as_slice().try_into().map_err(|_| {
                     rusqlite::Error::FromSqlConversionFailure(
                         2,

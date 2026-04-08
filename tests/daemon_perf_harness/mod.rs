@@ -572,15 +572,15 @@ fn format_bench_diagnostics(db: &str) -> String {
             .query_map([], |row| {
                 Ok((
                     row.get::<_, i64>(0)?,
-                    row.get::<_, String>(1)?,
-                    row.get::<_, String>(2)?,
+                    topo::db::sql_types::get_text(row, 1)?,
+                    topo::db::sql_types::get_text(row, 2)?,
                     row.get::<_, i64>(3)?,
                     row.get::<_, i64>(4)?,
                     row.get::<_, i64>(5)?,
                     row.get::<_, i64>(6)?,
                     row.get::<_, i64>(7)?,
-                    row.get::<_, String>(8)?,
-                    row.get::<_, String>(9)?,
+                    topo::db::sql_types::get_text(row, 8)?,
+                    topo::db::sql_types::get_text(row, 9)?,
                 ))
             })
             .ok();
@@ -610,8 +610,8 @@ fn format_bench_diagnostics(db: &str) -> String {
         let rows = stmt
             .query_map([], |row| {
                 Ok((
-                    row.get::<_, String>(0)?,
-                    row.get::<_, String>(1)?,
+                    topo::db::sql_types::get_text(row, 0)?,
+                    topo::db::sql_types::get_text(row, 1)?,
                     row.get::<_, i64>(2)?,
                 ))
             })
@@ -644,8 +644,8 @@ fn format_bench_diagnostics(db: &str) -> String {
                 Ok((
                     row.get::<_, i64>(0)?,
                     row.get::<_, i64>(1)?,
-                    row.get::<_, String>(2)?,
-                    row.get::<_, Option<String>>(3)?,
+                    topo::db::sql_types::get_text(row, 2)?,
+                    topo::db::sql_types::get_opt_text(row, 3)?,
                 ))
             })
             .ok();

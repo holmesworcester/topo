@@ -35,7 +35,7 @@ pub fn list_for_message(
     )?;
     let emojis = stmt
         .query_map(rusqlite::params![recorded_by, target_event_id_b64], |row| {
-            row.get::<_, String>(0)
+            crate::db::sql_types::get_text(row, 0)
         })?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(emojis)

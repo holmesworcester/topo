@@ -978,7 +978,10 @@ fn deletion_signer_context_behavior(
                 return (
                     None,
                     false,
-                    Some(format!("no peers_shared entry for signer {}", signed_by_b64)),
+                    Some(format!(
+                        "no peers_shared entry for signer {}",
+                        signed_by_b64
+                    )),
                 );
             };
             let Some(peer_user_eid) = row_text(peer_row, "user_event_id") else {
@@ -1128,13 +1131,9 @@ impl ProjectionQueries for NodeBehaviorEngine {
                 crate::event_modules::EVENT_TYPE_ENDPOINT_SHARED,
             )));
         }
-        if let Some(message_event_id) = deleted_message_purges_dep_behavior(
-            &state,
-            recorded_by,
-            parsed,
-            field_name,
-            &dep_b64,
-        ) {
+        if let Some(message_event_id) =
+            deleted_message_purges_dep_behavior(&state, recorded_by, parsed, field_name, &dep_b64)
+        {
             return Ok(DepLoadResult::purge(message_event_id));
         }
         Ok(DepLoadResult::missing())
@@ -1927,7 +1926,7 @@ fn sqlite_rows_for_peer(
 ) -> Result<Vec<BehaviorRow>, Box<dyn std::error::Error>> {
     let mut pragma = conn.prepare(&format!("PRAGMA table_info({table})"))?;
     let columns = pragma
-        .query_map([], |row| row.get::<_, String>(1))?
+        .query_map([], |row| crate::db::sql_types::get_text(row, 1))?
         .collect::<Result<Vec<_>, _>>()?;
     if columns.is_empty() {
         return Ok(Vec::new());

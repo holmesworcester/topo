@@ -419,7 +419,7 @@ fn repaired_key_ids_for_local_recipient(
     )?;
     let rows = stmt.query_map(
         rusqlite::params![recorded_by, &recipient_event_id_b64],
-        |row| row.get::<_, String>(0),
+        |row| crate::db::sql_types::get_text(row, 0),
     )?;
     let mut out = BTreeSet::new();
     for row in rows {
@@ -444,7 +444,10 @@ fn blocked_encrypted_events(
          ORDER BY e.created_at ASC, e.event_id ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        Ok((
+            crate::db::sql_types::get_text(row, 0)?,
+            crate::db::sql_types::get_blob(row, 1)?,
+        ))
     })?;
 
     let mut out = Vec::new();
@@ -472,7 +475,7 @@ fn local_repair_recipient_material(
          ORDER BY created_at ASC, event_id ASC
          LIMIT 1",
         rusqlite::params![recorded_by],
-        |row| row.get(0),
+        |row| crate::db::sql_types::get_text(row, 0),
     )?;
     let invite_secret_event_id_b64: String = conn.query_row(
         "SELECT event_id
@@ -482,7 +485,7 @@ fn local_repair_recipient_material(
          ORDER BY created_at ASC, event_id ASC
          LIMIT 1",
         rusqlite::params![recorded_by, &invite_event_id_b64],
-        |row| row.get(0),
+        |row| crate::db::sql_types::get_text(row, 0),
     )?;
     let recipient_event_id =
         event_id_from_base64(&invite_event_id_b64).ok_or("invalid invite_event_id base64")?;
@@ -501,11 +504,11 @@ fn known_key_requests(conn: &Connection, recorded_by: &str) -> SimResult<Vec<Req
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, String>(2)?,
-            row.get::<_, String>(3)?,
-            row.get::<_, String>(4)?,
+            crate::db::sql_types::get_text(row, 0)?,
+            crate::db::sql_types::get_text(row, 1)?,
+            crate::db::sql_types::get_text(row, 2)?,
+            crate::db::sql_types::get_text(row, 3)?,
+            crate::db::sql_types::get_text(row, 4)?,
         ))
     })?;
     let mut out = Vec::new();
@@ -551,7 +554,10 @@ fn known_key_shared_summaries(
          ORDER BY re.id ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        Ok((
+            crate::db::sql_types::get_text(row, 0)?,
+            crate::db::sql_types::get_blob(row, 1)?,
+        ))
     })?;
     let mut out = Vec::new();
     for row in rows {
@@ -624,7 +630,7 @@ fn build_key_shared_response(
          WHERE recorded_by = ?1 AND event_id = ?2
          LIMIT 1",
         rusqlite::params![recorded_by, &key_event_id_b64],
-        |row| row.get(0),
+        |row| crate::db::sql_types::get_blob(row, 0),
     )?;
     if key_bytes.len() != 32 {
         return Err("corrupt key_bytes in key_secrets".into());
@@ -675,7 +681,7 @@ fn request_recipient_verifying_key(
     let blob: Vec<u8> = conn.query_row(
         "SELECT blob FROM events WHERE event_id = ?1",
         rusqlite::params![&recipient_event_id_b64],
-        |row| row.get(0),
+        |row| crate::db::sql_types::get_blob(row, 0),
     )?;
     let parsed = parse_semantic_event(&blob)?;
     let public_key = match parsed {
@@ -798,12 +804,12 @@ fn local_rotation_frontier(
             rusqlite::params![recorded_by, &key_event_id_b64],
             |row| {
                 Ok((
-                    row.get(0)?,
+                    crate::db::sql_types::get_text(row, 0)?,
                     row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
+                    crate::db::sql_types::get_text(row, 2)?,
+                    crate::db::sql_types::get_text(row, 3)?,
+                    crate::db::sql_types::get_text(row, 4)?,
+                    crate::db::sql_types::get_text(row, 5)?,
                 ))
             },
         )
@@ -895,12 +901,12 @@ fn removal_row(
             rusqlite::params![recorded_by, &removal_event_id_b64],
             |row| {
                 Ok((
-                    row.get(0)?,
+                    crate::db::sql_types::get_text(row, 0)?,
                     row.get(1)?,
-                    row.get(2)?,
-                    row.get(3)?,
-                    row.get(4)?,
-                    row.get(5)?,
+                    crate::db::sql_types::get_text(row, 2)?,
+                    crate::db::sql_types::get_text(row, 3)?,
+                    crate::db::sql_types::get_text(row, 4)?,
+                    crate::db::sql_types::get_text(row, 5)?,
                 ))
             },
         )

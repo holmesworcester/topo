@@ -17,7 +17,12 @@ fn test_endpoint_secret_projects_under_endpoint_scope() {
         .query_row(
             "SELECT endpoint_id, event_id FROM endpoint_secrets LIMIT 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok((
+                    crate::db::sql_types::get_text(row, 0)?,
+                    crate::db::sql_types::get_text(row, 1)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(stored.0, endpoint_id);
@@ -73,7 +78,12 @@ fn test_endpoint_shared_projects_under_endpoint_scope() {
         .query_row(
             "SELECT endpoint_id, event_id FROM endpoints_shared LIMIT 1",
             [],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok((
+                    crate::db::sql_types::get_text(row, 0)?,
+                    crate::db::sql_types::get_text(row, 1)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(stored.0, endpoint_id);
@@ -243,7 +253,12 @@ fn test_peer_shared_unblocks_after_endpoint_shared_projects() {
              WHERE recorded_by = ?1
                AND event_id = ?2",
             rusqlite::params![recorded_by, &peer_shared_eid_b64],
-            |row| Ok((row.get(0)?, row.get(1)?)),
+            |row| {
+                Ok((
+                    crate::db::sql_types::get_text(row, 0)?,
+                    crate::db::sql_types::get_text(row, 1)?,
+                ))
+            },
         )
         .unwrap();
     assert_eq!(projected.0, endpoint_id);
@@ -315,7 +330,7 @@ fn test_ingest_endpoint_shared_normalizes_to_endpoint_scope() {
              FROM endpoints_shared
              WHERE event_id = ?1",
             rusqlite::params![&endpoint_eid_b64],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .optional()
         .unwrap();
@@ -1415,8 +1430,7 @@ fn test_post_tombstone_wrong_author_deletion_rejects() {
 
     // Second deletion from a different peer_shared signer
     let (wrong_signer_eid, wrong_signing_key) = make_identity_chain(&conn, recorded_by);
-    let (_del2, del2_blob) =
-        make_deletion_signed(&wrong_signing_key, &wrong_signer_eid, &msg_eid);
+    let (_del2, del2_blob) = make_deletion_signed(&wrong_signing_key, &wrong_signer_eid, &msg_eid);
     let del2_eid = insert_event_raw(&conn, recorded_by, &del2_blob);
     let r2 = project_one(&conn, recorded_by, &del2_eid).unwrap();
 
@@ -1499,7 +1513,7 @@ fn test_admin_signer_can_delete_other_users_message() {
         .query_row(
             "SELECT author_id FROM deleted_messages WHERE recorded_by = ?1 AND message_id = ?2",
             rusqlite::params![recorded_by, &msg_b64],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .unwrap();
     assert_eq!(
@@ -1516,7 +1530,10 @@ fn test_admin_signer_can_delete_other_users_message() {
             |row| row.get(0),
         )
         .unwrap();
-    assert_eq!(admin_intent_count, 1, "admin delete should record wildcard intent");
+    assert_eq!(
+        admin_intent_count, 1,
+        "admin delete should record wildcard intent"
+    );
 }
 
 #[test]
@@ -1542,7 +1559,7 @@ fn test_rejected_events_recorded_for_invalid_sig() {
         .query_row(
             "SELECT reason FROM rejected_events WHERE peer_id = ?1 AND event_id = ?2",
             rusqlite::params![recorded_by, &msg_b64],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .unwrap();
     assert!(

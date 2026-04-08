@@ -345,7 +345,7 @@ fn load_invite_secret_key(
          ORDER BY created_at DESC, event_id DESC
          LIMIT 1",
         params![recorded_by, invite_event_id_b64],
-        |row| row.get(0),
+        |row| crate::db::sql_types::get_blob(row, 0),
     )?;
     let key_arr: [u8; 32] = key_bytes
         .try_into()
@@ -363,7 +363,7 @@ fn load_invite_public_key(
          WHERE event_id = ?1
          LIMIT 1",
         params![invite_event_id_b64],
-        |row| row.get(0),
+        |row| crate::db::sql_types::get_blob(row, 0),
     )?;
     match parse_event(&blob)? {
         ParsedEvent::Signed(signed) => match parse_event(&signed.payload)? {
@@ -407,7 +407,7 @@ fn load_bootstrap_session_tenant_context(
         )?
         .query_map(
             params![invite_event_id_b64, remote_daemon_peer_id.as_slice(), now],
-            |row| row.get::<_, String>(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )?
         .collect::<Result<Vec<_>, _>>()?;
     Ok(BootstrapSessionTenantContext::CandidateTenants { tenant_ids })
@@ -703,17 +703,18 @@ async fn read_inbound_session_auth_inner(
             let claimed_peer_matches_key = auth.source_peer_id == derived_source_peer_id;
             let invite_event_id_b64 = event_id_to_base64(&auth.target_invite_event_id);
             let remote_peer_id = hex::encode(auth.source_peer_id);
-            let (tenant_resolution, tenant_resolution_error) = match resolve_bootstrap_session_tenant(
-                &db,
-                &invite_event_id_b64,
-                &actual_remote_daemon_peer_id_raw,
-            ) {
-                Ok(tenant_id) => (BootstrapSessionTenantDecision::Accept { tenant_id }, None),
-                Err(err) => (
-                    BootstrapSessionTenantDecision::RejectMissing,
-                    Some(err.to_string()),
-                ),
-            };
+            let (tenant_resolution, tenant_resolution_error) =
+                match resolve_bootstrap_session_tenant(
+                    &db,
+                    &invite_event_id_b64,
+                    &actual_remote_daemon_peer_id_raw,
+                ) {
+                    Ok(tenant_id) => (BootstrapSessionTenantDecision::Accept { tenant_id }, None),
+                    Err(err) => (
+                        BootstrapSessionTenantDecision::RejectMissing,
+                        Some(err.to_string()),
+                    ),
+                };
             let invite_public_key = load_invite_public_key(&db, &invite_event_id_b64)?;
             let signing_bytes = encode_invite_signing_bytes(&auth);
             let invite_signature_valid =
@@ -825,7 +826,7 @@ pub fn resolve_bound_daemon_peer_id(
                  )
              )",
             params![recorded_by, peer_id],
-            |row| row.get::<_, Option<String>>(0),
+            |row| crate::db::sql_types::get_opt_text(row, 0),
         )
         .optional()?
         .flatten();
@@ -930,7 +931,7 @@ pub fn resolve_bootstrap_fallback_invite_for_daemon(
             params![recorded_by, remote_daemon_peer_id.as_slice(), now],
             |row| {
                 Ok(BootstrapFallbackInviteCandidate {
-                    invite_event_id: row.get(0)?,
+                    invite_event_id: crate::db::sql_types::get_text(row, 0)?,
                     workspace_already_local_before_candidate: row.get(1)?,
                 })
             },
@@ -1079,7 +1080,7 @@ pub fn resolve_bootstrap_inviter_peer_id(
              WHERE event_id = ?1
              LIMIT 1",
             params![invite_event_id_b64],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_blob(row, 0),
         )
         .optional()?;
     let Some(invite_blob) = invite_blob else {
@@ -1113,7 +1114,7 @@ pub fn resolve_bootstrap_inviter_peer_id(
              WHERE event_id = ?1
              LIMIT 1",
             params![signer_event_id_b64],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_blob(row, 0),
         )
         .optional()?;
     if let Some(signer_blob) = signer_blob {
@@ -1148,7 +1149,7 @@ pub fn resolve_bootstrap_inviter_peer_id(
                AND length(transport_fingerprint) = 32
              LIMIT 1",
             params![recorded_by, signer_event_id_b64],
-            |row| row.get(0),
+            |row| crate::db::sql_types::get_text(row, 0),
         )
         .optional()?;
     Ok(projected_transport_peer_id)

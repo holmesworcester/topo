@@ -477,9 +477,9 @@ fn daemon_scope_annotations(
     let rows = stmt
         .query_map(rusqlite::params![daemon_fp], |row| {
             Ok((
-                row.get::<_, String>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, String>(2)?,
+                crate::db::sql_types::get_text(row, 0)?,
+                crate::db::sql_types::get_text(row, 1)?,
+                crate::db::sql_types::get_text(row, 2)?,
             ))
         })?
         .collect::<Result<Vec<_>, _>>()?;
@@ -1295,9 +1295,9 @@ fn dispatch(
                     let rows = stmt
                         .query_map(rusqlite::params![&recorded_by], |row| {
                             Ok(serde_json::json!({
-                                "event_id": row.get::<_, String>(0)?,
-                                "blocker_event_id": row.get::<_, String>(1)?,
-                                "dep": row.get::<_, String>(2)?,
+                                "event_id": crate::db::sql_types::get_text(row, 0)?,
+                                "blocker_event_id": crate::db::sql_types::get_text(row, 1)?,
+                                "dep": crate::db::sql_types::get_text(row, 2)?,
                             }))
                         })
                         .unwrap()

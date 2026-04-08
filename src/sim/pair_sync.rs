@@ -246,9 +246,9 @@ fn collect_shared_events_one_way(
     )?;
     let rows = stmt.query_map(rusqlite::params![source_recorded_by], |row| {
         Ok((
-            row.get::<_, String>(0)?,
-            row.get::<_, String>(1)?,
-            row.get::<_, Vec<u8>>(2)?,
+            crate::db::sql_types::get_text(row, 0)?,
+            crate::db::sql_types::get_text(row, 1)?,
+            crate::db::sql_types::get_blob(row, 2)?,
         ))
     })?;
 
@@ -432,7 +432,10 @@ fn winning_key_shared_event_ids(
          ORDER BY re.id ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        Ok((
+            crate::db::sql_types::get_text(row, 0)?,
+            crate::db::sql_types::get_blob(row, 1)?,
+        ))
     })?;
 
     let mut best_by_target = HashMap::<RepairTarget, ([u8; 32], [u8; 32], String)>::new();
@@ -475,7 +478,7 @@ fn observed_key_shared_targets(
          ORDER BY re.id ASC",
     )?;
     let rows = stmt.query_map(rusqlite::params![recorded_by], |row| {
-        row.get::<_, Vec<u8>>(0)
+        crate::db::sql_types::get_blob(row, 0)
     })?;
 
     let mut out = BTreeSet::new();
@@ -514,7 +517,7 @@ fn apply_prepared_direction(direction: &PreparedPairSyncDirection) -> PairSyncRe
 
 fn stored_event_ids(conn: &rusqlite::Connection) -> Result<BTreeSet<String>, rusqlite::Error> {
     let mut stmt = conn.prepare("SELECT event_id FROM events")?;
-    let rows = stmt.query_map([], |row| row.get::<_, String>(0))?;
+    let rows = stmt.query_map([], |row| crate::db::sql_types::get_text(row, 0))?;
     rows.collect::<Result<BTreeSet<_>, _>>()
 }
 

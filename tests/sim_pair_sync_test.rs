@@ -117,7 +117,10 @@ fn event_ids_of_type(daemon: &VirtualDaemon, event_type: &str) -> BTreeSet<Strin
         )
         .expect("prepare raw event scan");
     stmt.query_map(rusqlite::params![recorded_by], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
+        Ok((
+            topo::db::sql_types::get_text(row, 0)?,
+            topo::db::sql_types::get_blob(row, 1)?,
+        ))
     })
     .expect("query raw event scan")
     .filter_map(|row| {

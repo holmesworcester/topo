@@ -115,10 +115,12 @@ fn message_ids_since_sql(db: &str, cutoff_ms: Option<i64>) -> BTreeSet<String> {
              WHERE (?1 IS NULL OR created_at >= ?1)",
         )
         .expect("prepare message_ids_since");
-    stmt.query_map(rusqlite::params![cutoff_ms], |row| row.get::<_, String>(0))
-        .expect("query message_ids_since")
-        .collect::<Result<BTreeSet<_>, _>>()
-        .expect("collect message_ids_since")
+    stmt.query_map(rusqlite::params![cutoff_ms], |row| {
+        topo::db::sql_types::get_text(row, 0)
+    })
+    .expect("query message_ids_since")
+    .collect::<Result<BTreeSet<_>, _>>()
+    .expect("collect message_ids_since")
 }
 
 fn union_message_count_since_sql(dbs: &[String], cutoff_ms: Option<i64>) -> i64 {
@@ -276,7 +278,10 @@ fn received_events_by_peer_for_conn(conn: &rusqlite::Connection) -> HashMap<Stri
         )
         .expect("prepare downloader received events query");
     stmt.query_map([], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        Ok((
+            topo::db::sql_types::get_text(row, 0)?,
+            row.get::<_, i64>(1)?,
+        ))
     })
     .expect("query downloader received events rows")
     .collect::<Result<HashMap<_, _>, _>>()
@@ -318,7 +323,10 @@ fn received_recorded_events_by_source_for_db(db: &str) -> HashMap<String, i64> {
         )
         .expect("prepare recorded source query");
     stmt.query_map(rusqlite::params![peer_id], |row| {
-        Ok((row.get::<_, String>(0)?, row.get::<_, i64>(1)?))
+        Ok((
+            topo::db::sql_types::get_text(row, 0)?,
+            row.get::<_, i64>(1)?,
+        ))
     })
     .expect("query recorded source rows")
     .collect::<Result<HashMap<_, _>, _>>()

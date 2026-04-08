@@ -122,7 +122,7 @@ pub fn load_local_endpoint_secret(
              LIMIT 2",
         )?;
         let mapped = stmt.query_map([], |row| {
-            let private_key: Vec<u8> = row.get(2)?;
+            let private_key = crate::db::sql_types::get_blob(row, 2)?;
             let private_key_bytes: [u8; 32] = private_key.as_slice().try_into().map_err(|_| {
                 rusqlite::Error::FromSqlConversionFailure(
                     2,
